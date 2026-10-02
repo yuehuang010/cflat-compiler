@@ -181,6 +181,7 @@ struct GenericTemplateState
         std::string originFile;
         size_t originLine = 0;
         size_t originColumn = 0;
+        antlr4::ParserRuleContext* site = nullptr;
     };
 
     // The record ProcessPendingInstantiations is draining right now, when it has at least one
@@ -860,6 +861,9 @@ public:
         // C++ pointer result whose innermost POINTEE is const (`const T*`, `const T*&`,
         // `T const *const &`, `const T *const *`). Internal only: overload ranking and receivers.
         bool IsCxxPointeeConst = false;
+        // Declared std::nullptr_t (CFlat spells it void*): only such a value, a nullptr literal
+        // or 0 binds a C++ nullptr_t parameter. Internal only: overload viability.
+        bool IsCxxNullptrT = false;
         bool IsCxxConstField = false;
         // C++ mutable field; the member object ignores constness of its parent.
         bool IsCxxMutableField = false;
@@ -1260,6 +1264,7 @@ public:
         bool IsCxxRefToPointer = false;
         bool IsCxxConstRef = false;
         bool IsCxxPointeeConst = false;
+        bool IsCxxNullptrT = false;
         bool IsCxxConstField = false;
         bool IsCxxMutableField = false;
         bool IsOwningSink = false;
@@ -1327,6 +1332,7 @@ public:
             s.IsCxxRefToPointer = t.IsCxxRefToPointer;
             s.IsCxxConstRef = t.IsCxxConstRef;
             s.IsCxxPointeeConst = t.IsCxxPointeeConst;
+            s.IsCxxNullptrT = t.IsCxxNullptrT;
             s.IsCxxConstField = t.IsCxxConstField;
             s.IsCxxMutableField = t.IsCxxMutableField;
             s.IsOwningSink = t.IsOwningSink;
@@ -1395,6 +1401,7 @@ public:
             t.IsCxxRefToPointer = IsCxxRefToPointer;
             t.IsCxxConstRef = IsCxxConstRef;
             t.IsCxxPointeeConst = IsCxxPointeeConst;
+            t.IsCxxNullptrT = IsCxxNullptrT;
             t.IsCxxConstField = IsCxxConstField;
             t.IsCxxMutableField = IsCxxMutableField;
             t.IsOwningSink = IsOwningSink;
@@ -1676,6 +1683,12 @@ public:
         std::vector<std::string> LambdaCaptureNames;
         // By-reference lambda captures that point at non-static storage.
         std::vector<std::string> LambdaReferenceCaptureNames;
+        // Set when a CFlat closure was handed to C++ as a `void*` to its {code, env} pair: the
+        // `__typeof__(R (*)(A...))` signature the generated __cflat_closure<> wrapper takes.
+        std::string CxxClosureSignature;
+        // A named closure crosses as an lvalue that borrows the variable (C++ copies it if it
+        // wants a copy); otherwise the C++ wrapper object owns the env.
+        bool CxxClosureBorrowed = false;
         bool IsBorrowed = false;         // compile-time: true for non-move pointer parameters and locals that alias one - 'delete' is forbidden
         // Range-for variables borrow the current collection element. The slot is rebound for each
         // iteration, so it must never be treated as an owning value or a movable whole-local.
@@ -1742,6 +1755,9 @@ public:
         bool OwningLocalBorrowAfterRebind = false;
         llvm::Value* RefCountStorage = nullptr; // lazy i32 alloca at function entry; non-null only when pointer escaped to a field
         std::string CallerName;          // the variable's name at the call site, for move tracking
+        // An explicit generic instantiation named without a call (`dbl<int>`): CallerName is its
+        // mangled name. Read only by LowerNonCapturingClosureForCxx; not cached by --init.
+        bool GenericFunctionValue = false;
         bool DeferMovedMark = false;     // operator lowering applies the move after result formation
         bool ForceOperatorConsume = false;
         std::vector<ConditionalMoveSource> ConditionalMoveSources;
@@ -2142,6 +2158,10 @@ public:
     // Returning a struct by value hands its member pointers to the caller; running the local's
     // dtor on the return path would dangle them. EmitDestructorsForScope skips this alloca.
     llvm::Value* returnedStructDtorSkipAlloca = nullptr;
+    // A returned local with a C++-field shell is destroyed at its normal scope slot by
+    // EmitDestructorsForScope, after later-declared locals (for example lock guards).
+    llvm::Value* returnedStructDtorShellAlloca = nullptr;
+    llvm::Function* returnedStructDtorShellFunction = nullptr;
 
     // Unnamed ReturnsOwned string intermediates (e.g. a+b in a+b+c). Invisible to
     // EmitDestructorsForScope; freed at end-of-full-expression by FlushOwnedStringTemps.
@@ -3119,6 +3139,9 @@ private:
     void EmitError(std::string message, std::string sourceMessage = {}) const;
     void LogErrorMessage(std::string englishTemplate,
                          std::vector<std::string> arguments = {}) const;
+    // "'Box' is a generic type; type arguments are required ..." for bare `Box` and `Box<>`.
+    void LogGenericTypeArgsRequired(const std::string& displayName,
+                                    const std::vector<std::string>& parameterNames) const;
 
     // A type the template body formed only after substituting an array-view argument cannot be
     // looked up. Re-report it at the user's argument site instead of a line inside the template.
@@ -3234,6 +3257,21 @@ private:
     // redefinition. Transient per compile, never serialized.
     std::unordered_map<std::string, std::unordered_set<std::string>> enumDeclSites_;
     std::unordered_map<std::string, std::string> typeAliases;
+    // C++ aliases of std::nullptr_t (std.nullptr_t, `using Nil = std::nullptr_t`): typeAliases
+    // spells them void*, this keeps their identity for IsCxxNullptrT. Cleared with typeAliases.
+    std::unordered_set<std::string> cxxNullptrTAliases_;
+public:
+    bool IsCxxNullptrTAlias(const std::string& name) const { return cxxNullptrTAliases_.count(name) != 0; }
+    // A value of the C++ null type: marked std::nullptr_t, or the bare `nullptr` constant.
+    static bool IsCxxNullTypedArgument(const NamedVariable& arg);
+    // A __cflat_tpl_ deduction wrapper's parameter was made for another argument type: a null
+    // value vs a pointer (either way), or pointers whose C++ spellings differ.
+    bool CxxDeductionWrapperDeducesOther(const NamedVariable& arg, const TypeAndValue& param,
+                                         bool paramSpelledNullptrT) const;
+    // __cflat_tpl_ wrappers RequestCxxFunctionTemplate made from deduced argument spellings (a
+    // brace constructor / brace function bridge shares the prefix but keeps fixed parameters).
+    std::unordered_set<std::string> cxxDeductionWrappers_;
+private:
     // FILE-scope pure-rename `using` aliases (`using MyInt = int;`) - alias -> bare target name.
     // Written by ForwardRefScanner::PreRegisterRenameAliases before either pass walks the file, and
     // read only by MangleTypeArg. Kept out of typeAliases because that map fills in progressively as
@@ -3862,6 +3900,13 @@ private:
         bool isFloatConstant = false;
         double floatValue = 0.0;
         bool isCxxConstexpr = false;
+        // Declaring header; with line/col it tells one declaration reached through two import
+        // groups from two same-name declarations.
+        std::string file;
+        // C++ internal linkage: one object per import group, whether or not it folded.
+        bool isInternalLinkage = false;
+        // Internal const object: hash of the evaluated initializer (0 = unknown).
+        uint64_t constInitHash = 0;
         int line = 1;
         int col = 0;
     };
@@ -3934,6 +3979,7 @@ private:
         bool hasBases = false;
         bool hasVirtualBases = false;
         bool isAbstract = false;
+        bool hasFriendOperators = false;   // a friend operator: ADL may find what was not registered
         std::vector<cflat_cinterop::RawCxxBase> bases;
         std::vector<cflat_cinterop::RawCxxBase> virtualBases;   // see RawRecord::virtualBases
         std::string layoutRefusal;
@@ -3956,6 +4002,7 @@ private:
         bool hasDefaultCtor = false;
         bool hasCopyCtor = false;
         bool hasCtorTemplate = false;
+        bool hasAssignTemplate = false;
         bool isAggregate = false;
         std::vector<cflat_cinterop::RawCxxCtorTemplate> ctorTemplates;
         std::vector<cflat_cinterop::RawCxxMember> members;
@@ -4328,7 +4375,7 @@ private:
     // Basenames under runtimeDir/core, built lazily for the root-is-core cache guard.
     mutable std::unordered_set<std::string> coreFileNames_;
 
-    llvm::Function* currentFunction;
+    llvm::Function* currentFunction = nullptr;
     std::string sourceFileName;
     std::string currentSourceFilePath_;
     std::vector<ManifestFragment> manifestFragments_;
@@ -5465,6 +5512,8 @@ private:
                                          const std::string& ifaceName);
 
     llvm::Function* GetOrCreateFullDestructor(const std::string& typeName, bool membersOnly = false);
+    // A lowered struct moved out field by field: destroys only the moved-from C++ objects.
+    llvm::Function* GetOrCreateMovedFromShellDestructor(const std::string& typeName);
     void EmitCflatOwnedFieldsDestruction(llvm::IRBuilder<>& b, const std::string& typeName,
                                          llvm::Value* self);
 
@@ -5627,6 +5676,8 @@ private:
     // This is what makes a closure OWN its captured strings/containers (independent lifetime),
     // so a captured owning value survives after its source is destructed and is freed exactly
     // once. Returns null when there are no owning fields (the scalar-only fast path).
+    // `i8* __closure_env_move(i8** slot)`: move an owned env out of *slot like a C++ lambda move.
+    llvm::Function* GetOrCreateClosureEnvMove();
     llvm::Function* GenerateClosureCaptureCleanup(const std::string& name, llvm::StructType* capTy,
         const std::vector<std::pair<unsigned, std::string>>& owningFields);
 
@@ -5822,7 +5873,7 @@ private:
         std::string cxxSpelling;
         bool needDefinitions = true;
         bool explicitInstantiation = true;
-        // An incomplete [cpp] struct argument: full explicit instantiation surfaces it.
+        // Request member instantiation to check incomplete arguments when C++ requires it.
         bool instantiateMembers = false;
     };
     // Spelling of the specialization RequestCxxType is requesting over an incomplete argument.
@@ -5910,6 +5961,7 @@ private:
         const std::string& fileForLsp);
     bool HasCxxFunctionTemplate(const std::string& qualifiedName) const;
     bool HasCxxForwardingReferenceTemplate(const std::string& qualifiedName) const;
+    bool IsCxxNamespacePath(const std::string& name) const;
     bool IsCxxNamespace(const std::string& name) const;
     bool HasCxxFunctionTemplateMember(const std::string& owner,
                                       const std::string& memberName) const;
@@ -5941,7 +5993,8 @@ private:
                                 std::string& error,
                                 const std::string& infixOperator = {},
                                 const std::string& infixLhsName = {},
-                                const std::string& infixRhsName = {});
+                                const std::string& infixRhsName = {},
+                                bool adlCall = false);
     bool RequestCxxBraceFunction(const std::string& functionName,
                                  const std::string& ownerType,
                                  const std::string& memberName,
@@ -5984,7 +6037,8 @@ private:
                                      const std::string& spelling,
                                      const std::vector<size_t>& deps, std::string& error,
                                      const std::string& prefixSource = {},
-                                     bool retryable = false);
+                                     bool retryable = false,
+                                     bool deferIncompleteCodegen = false);
     // RAII: the group every request made while it is alive compiles against.
     struct CxxRequestGroupScope
     {
@@ -6011,7 +6065,8 @@ private:
                                const std::string& extraSource = {},
                                const std::string& prefixSource = {},
                                bool persistOnSuccess = false,
-                               bool ownershipProbe = false);
+                               bool ownershipProbe = false,
+                               bool deferIncompleteCodegen = false);
     bool RequestGeneratedCxxType(const std::string& cflatName,
                                  const std::string& cxxSpelling,
                                  const std::string& source,
@@ -6115,7 +6170,8 @@ private:
                                   const std::unordered_set<std::string>* localEnums = nullptr);
     void RequestCxxSignatureTypes(const std::vector<CSigEntry>& sigs);
     bool RequestCxxType(const std::string& baseName, const std::vector<std::string>& typeArgs,
-                        const std::string& cflatName, std::string& error);
+                        const std::string& cflatName, std::string& error,
+                        bool deferIncompleteCodegen = false);
     bool CxxTemplateDefineMismatch(const std::string& cxxBase, const std::string& spelling,
                                    const std::string& cflatName, size_t ownerGroup,
                                    const std::vector<size_t>& deps, std::string& error);
@@ -6140,7 +6196,15 @@ private:
      * failed and the caller should report it.
      */
     bool TryRequestCxxType(const std::string& baseName, const std::vector<std::string>& typeArgs,
-                           const std::string& cflatName, std::string& error);
+                           const std::string& cflatName, std::string& error,
+                           bool deferIncompleteCodegen = false);
+    // Binds a constant C++ namespace-scope variable (or variable-template specialization)
+    // `baseName<typeArgs>` (dotted CFlat path) as the constexpr global `cflatName`; true when bound.
+    // `notConstant`: the variable exists but its initializer is not a constant initialization.
+    bool TryBindCxxNamespaceConstant(const std::string& cflatName, const std::string& baseName,
+                                     const std::vector<std::string>& typeArgs = {},
+                                     bool* notConstant = nullptr);
+    std::unordered_set<std::string> cxxNotConstantVariables_;
     std::string GeneratedCxxPrefixForSpelling(const std::string& cxxSpelling) const;
     bool DecodeCxxIncompleteTemplateError(const std::string& error,
                                           std::string& spelling, std::string& typeName,
@@ -6151,6 +6215,51 @@ private:
         return name == "std.function" || name.ends_with(".function")
             || name.starts_with("std.function$");
     }
+    // The thin closure signature a std.function specialization wraps (its encoded type
+    // argument), or nullptr when the name is not one: a lambda bound to it takes this signature.
+    const TypeAndValue* StdFunctionClosureSignature(const std::string& name) const;
+    // `__typeof__(R (*)(A...))` for a thin CFlat function<> value, so a C++ wrapper can take it
+    // as a parameter and a deduced template parameter sees a function pointer. False otherwise.
+    bool CxxThinFunctionPointerSpelling(const TypeAndValue& type, std::string& out) const;
+    // A lambda VALUE is always a fat closure; one that provably captures nothing crosses into
+    // C++ as the thin function pointer it is (the function<> path). Rewrites `arg` in place and
+    // returns true only when it did; a capturing closure is left for the caller to refuse.
+    // `target` is the std.function signature being initialized, when known: a function name whose
+    // signature differs is refused there (C++ refuses it; a bound pointer would be miscalled).
+    bool LowerNonCapturingClosureForCxx(NamedVariable& arg, const TypeAndValue* target = nullptr);
+    // A function bound to a std.function whose signature differs only by arithmetic conversions
+    // (or a discarded return) goes through an internal thunk of the target signature. Sets
+    // `refusal` when the call could not be valid (arity, pointer/class component); nullptr when
+    // no thunk is needed.
+    llvm::Function* StdFunctionConvertingThunk(const std::string& name, llvm::Function* fn,
+                                               const TypeAndValue& fnSig, const TypeAndValue& target,
+                                               std::string& refusal);
+    /*
+     * A fat closure still left after LowerNonCapturingClosureForCxx (it captures, or is a
+     * Lambda<> value) crosses into C++ as a generated __cflat_closure<> object owning the env:
+     * `arg` becomes a `void*` to a {code, env} slot tagged with CxxClosureSignature. A named
+     * closure needs provably trivial captures (C++ may copy it), else `move` it. Returns
+     * the refusal text when it cannot cross: by-reference or move-only captures, a signature
+     * with no C++ spelling. Empty when `arg` is not a fat closure or was wrapped. A named closure
+     * is passed as a borrowing lvalue (C++ `F&&` sees the caller's object, a copy deep-copies).
+     */
+    // `signatureHint` (a std.function target's) types an `auto` closure that carries none; the
+    // invoker stored in its slot must have exactly that lowered signature.
+    std::string CxxClosureArgumentRefusal(NamedVariable& arg, const std::string& target,
+                                          const TypeAndValue* signatureHint = nullptr);
+    // True when `arg` is a fat closure value or type not yet handed to C++.
+    bool IsUnwrappedFatClosure(const NamedVariable& arg) const;
+    // `__cflat_closure<SIG>(pN)` for a wrapped closure argument, empty otherwise.
+    static std::string CxxClosureCallArgument(const NamedVariable& arg, const std::string& param);
+    // The C++ definition of __cflat_closure<> (include-guarded), prepended to any wrapper source
+    // that names it.
+    static const char* CxxClosureWrapperPreamble();
+    // True when every value stored into the closure slot is a fat closure whose env is null or
+    // carries no capture-cleanup function (scalar-only captures): a copy is a byte copy.
+    bool ClosureSlotHasOnlyTrivialCaptures(llvm::Value* slot) const;
+    // External `__cflat_closure_env_copy` / `__cflat_closure_env_destroy`: the C++ wrapper's copy
+    // constructor and destructor, through __closure_fat_ptr.copy / .dtor.
+    void EnsureCxxClosureEnvHelpers();
     // True once any `import cpp` header has been bound in this analysis: the only situation in
     // which an unknown dotted type name is worth resolving as a C++ type.
     bool HasCxxImportGroup() const { return !cxxImportGroups_.empty(); }
@@ -6455,6 +6564,7 @@ private:
     bool MakeOpaqueFieldBlob(const CRecordFieldEntry& f, DeclTypeAndValue& out) const;
 
     void RegisterCGlobals(const std::vector<CGlobalEntry>& globals, const std::string& fileForLsp);
+    bool NoteCxxGroupStatic(const CGlobalEntry& e, bool folded, const std::string& importHeader);
 
     void RegisterCRecords(std::vector<CRecordEntry>& records, const std::string& fileForLsp);
 
@@ -8505,6 +8615,22 @@ public:
     // the enclosing C++ record refuses with the detail.
     std::map<std::string, std::string> cxxAnonLayoutRefusals_;
     std::map<std::string, std::string> cxxBindingRefusals_;
+    // Per-import-group C++ statics (folded or __cflat_sv_) bound by name: where the bound one is
+    // declared and which import brought it. A second, different one makes the name ambiguous.
+    struct CxxGroupStaticOrigin
+    {
+        std::string declFile;
+        int line = 0;
+        int col = 0;
+        std::string linkageName;
+        bool folded = false;
+        bool isConst = false;
+        int64_t constantValue = 0;
+        double floatValue = 0.0;
+        uint64_t constInitHash = 0;
+        std::string importHeader;
+    };
+    std::unordered_map<std::string, CxxGroupStaticOrigin> cxxGroupStatics_;
     // Registration refusal of the LAST implicit-conversion wrapper attempted by the current
     // TryBindCxxImplicitArgumentConversions call; cleared on entry, taken by the caller.
     std::string cxxImplicitConversionRefusal_;
@@ -8556,6 +8682,8 @@ public:
         bool hasDefaultCtor = false;
         bool hasCopyCtor = false;
         bool hasCtorTemplate = false;
+        bool hasAssignTemplate = false;
+        bool hasDeletedMoveCtor = false;   // a user-declared `T(T&&) = delete`
         bool isAggregate = false;
         // Field name -> access, for the "is private" diagnostic on member access.
         std::map<std::string, int> fieldAccess;
@@ -8586,6 +8714,7 @@ public:
             bool isCopyCtor = false;
             bool isMoveCtor = false;
             bool isDeleted = false;
+            bool isConstReceiver = false;   // a const-qualified assignment operator
             bool needsLocalDefinition = false;
             bool isNoexcept = false;
             int refQualifier = cflat_cinterop::CxxRefQualifierNone;
@@ -8604,6 +8733,8 @@ public:
         };
         std::vector<Method> directMethods;
         std::vector<Structor> constructors;
+        // Generated xvalue construct / assign wrappers ("init", "assign", "|const" suffix).
+        std::map<std::string, Structor> xvalueTransfers;
         bool hasDtor = false;
         Structor destructor;
         // Copy / move assignment, captured out of the instance-method list so `y = x` and
@@ -8659,6 +8790,8 @@ public:
     void RecordCppStructBase(const std::string& structName, const std::string& baseName);
     void RegisterCppStructName(const std::string& structName);
     bool IsCppStructName(const std::string& structName) const;
+    std::string CanonicalGeneratedCxxIdentity(const std::string& identity) const;
+    std::string CanonicalCxxForeignIdentity(const std::string& spelling) const;
     void RegisterCppStructProtectedBaseMembers(const std::string& structName);
     bool GetCppStructBase(const std::string& structName, std::string& baseName) const;
     bool GetCxxTypeOwnerGroup(const std::string& typeName, size_t& group) const;
@@ -8675,6 +8808,19 @@ public:
                                                 const std::string& methodName,
                                                 const std::vector<TypeAndValue>& params);
     bool IsCxxRecord(const std::string& typeName) const { return cxxRecords_.count(typeName) != 0; }
+    // True when `cflatName` was bound as a specialization of the C++ class template spelled
+    // `baseName` (`std.barrier` -> `std::barrier<>`), false for a plain record or a typedef.
+    bool IsCxxTemplateSpecializationOf(const std::string& cflatName, const std::string& baseName) const
+    {
+        auto it = cxxCflatToCxxSpelling_.find(ResolveTypeAlias(cflatName));
+        if (it == cxxCflatToCxxSpelling_.end()) return false;
+        std::string cxxBase = baseName;
+        for (size_t pos = 0; (pos = cxxBase.find('.', pos)) != std::string::npos; pos += 2)
+            cxxBase.replace(pos, 1, "::");
+        std::string spelling = it->second;
+        if (spelling.starts_with("::")) spelling.erase(0, 2);
+        return spelling.starts_with(cxxBase + "<");
+    }
     bool IsCxxContiguousViewSource(const NamedVariable& arg,
                                    const TypeAndValue& param,
                                    bool* useConstData = nullptr,
@@ -8789,6 +8935,9 @@ public:
                                      bool deferElementCopySink = false);
     // A C++ class identity spelled for a user-facing message (a specialization key is mangled).
     std::string DisplayCxxClassName(const std::string& typeName) const;
+    // True when C++ lookup on this class may find an operator the import never registered: a
+    // template specialization, or a class declared outside the bound header scope.
+    bool CxxClassMayHaveUnregisteredOperators(const std::string& typeName) const;
     bool RejectCxxReferenceFieldStore(const std::string& typeName, const std::string& memberName);
     bool CxxProtectedAccessAllowed(const std::string& typeName,
                                    bool accessedThroughCurrentObject) const;
@@ -9275,6 +9424,13 @@ public:
                                  bool gateSpecialMembersOnly = false);
     bool RegisterCxxMembersForProjectedRecord(const std::string& typeName);
     bool EnsureCxxMemberProjected(const std::string& typeName, const std::string& memberName);
+    // C++ static member function of an imported class, bound as "<typeName>.<memberName>";
+    // `staticOnly`: and no non-static overload shares the name.
+    bool IsCxxStaticMethod(const std::string& typeName, const std::string& memberName,
+                           bool staticOnly = false);
+    // C++ class member lookup for `name` in typeName or a base ([stmt.ranged] asks whether
+    // begin/end are members at all, before access or viability); any member kind counts.
+    bool CxxClassHasMemberNamed(const std::string& typeName, const std::string& name);
     void EnsureCxxGateSpecialMembersProjected(const std::string& typeName);
     // R1: define the deferred special members of a header record (and its pending bases) in
     // its group's live Interpreter, then fold the member facts into the retained record.
@@ -9482,6 +9638,36 @@ public:
     // C++ calls also classify address-less literals and expression results as rvalues. Keep this
     // broader predicate gated to C++ callees so native CFlat overload selection is unchanged.
     bool IsCxxRvalueReferenceArgument(const NamedVariable& arg) const;
+    // A C++ call result of type `T&&` to a C++ class (std::move, std::forward, any T&& return):
+    // the referent's address as an xvalue. Keyed on the result type, never on the callee name.
+    bool IsCxxRvalueRefClassResult(const NamedVariable& nv) const;
+    // Clang-selected construction / assignment of C++ class T from a `[const] T&&` xvalue: a
+    // two-pointer (dest, src) wrapper structor, or null with clang's refusal in `refusal`.
+    const CxxClassInfo::Structor* RequestCxxXvalueTransfer(const std::string& typeName,
+                                                           bool constSource, bool assignment,
+                                                           std::string& refusal);
+    // Emit that transfer into `dest` from the referent `src`; false with the full use-site
+    // message in `refusal` when clang refuses it.
+    bool EmitCxxXvalueTransfer(const std::string& typeName, llvm::Value* dest, llvm::Value* src,
+                               bool constSource, bool assignment, std::string& refusal);
+    std::string CxxXvalueRefusal(const std::string& typeName, bool constSource, bool assignment,
+                                 const std::string& cause) const;
+    // CFlat `move x` of a C++ class: true when clang must select the member (const source, or no
+    // bound move ctor / move assignment); false keeps the direct-member path.
+    bool CxxExplicitMoveNeedsTransfer(const std::string& typeName, bool constSource,
+                                      bool assignment);
+    // The subset that applies to a trivially copyable class too (templates, explicit or deleted
+    // move, const-qualified assignment).
+    bool CxxTrivialMoveNeedsTransfer(const std::string& typeName, bool constSource,
+                                     bool assignment);
+    // Constructs that pick into a temporary `nv` then names; false when it does not apply or
+    // with `refusal` set when clang refuses.
+    bool MaterializeTrivialCxxExplicitMove(NamedVariable& nv, const std::string& sourceName,
+                                           std::string& refusal);
+    // That transfer from the lvalue `src` named `sourceName`; false with the use-site refusal.
+    bool EmitCxxExplicitMoveTransfer(const std::string& typeName, llvm::Value* dest,
+                                     llvm::Value* src, bool constSource, bool assignment,
+                                     const std::string& sourceName, std::string& refusal);
     bool CxxReferenceArgumentMatches(const TypeAndValue& param, const NamedVariable& arg) const;
     // An lvalue of a C++ class whose copy constructor is deleted (every [cpp] struct): binding
     // it to a C++ parameter that copies, or to an rvalue reference, is ill-formed in C++.
@@ -9825,11 +10011,13 @@ public:
 
     /*
      * One argument's C++ implicit conversion sequence ([over.ics.rank]) against an imported C++
-     * candidate: rank 0 exact, 1 promotion, 2 conversion, 3 user-defined, -1 not judged. A
+     * candidate: rank 0 exact, 1 promotion, 2 conversion, 3 user-defined, 4 an argument the
+     * ellipsis receives ([over.ics.ellipsis], kCxxEllipsisRank), -1 not judged. A
      * user-defined sequence names its conversion function and ranks its second standard
      * conversion; an empty name is an ambiguous conversion sequence. `cxxViable` is set only
      * where C++ provably accepts the binding whatever CFlat's own call rules say.
      */
+    static constexpr int kCxxEllipsisRank = 4;
     struct CxxConversionRank
     {
         int rank = -1;
@@ -10525,8 +10713,8 @@ public:
         return IsCxxBaseOf(to.TypeName, from.TypeName);
     }
     /*
-     * Pointee-const relation of a C++ record pointer argument to a C++ record pointer parameter
-     * at the level IsCxxPointeeConst describes. Single level: same class or derived-to-base.
+     * Pointee-const relation of a C++ record (or same-primitive) pointer argument to a C++ pointer
+     * parameter at the level IsCxxPointeeConst describes. Single level: same class or derived-to-base.
      * Pointer-to-pointer: same class only; C++ forbids adding or dropping the inner const there.
      */
     enum class CxxPointeeConstRelation { Unrelated, Same, Adds, Drops };
@@ -10535,10 +10723,22 @@ public:
     {
         if (!from.Pointer || !to.Pointer || from.ElemPointer != to.ElemPointer
             || from.IsFunctionPointer || to.IsFunctionPointer || from.IsArrayView || to.IsArrayView
-            || from.PointerDepth > 2 || to.PointerDepth > 2
-            || !IsCxxRecord(from.TypeName) || !IsCxxRecord(to.TypeName))
+            || from.PointerDepth > 2 || to.PointerDepth > 2)
             return CxxPointeeConstRelation::Unrelated;
-        if (from.TypeName != to.TypeName
+        /*
+         * A primitive pointee (`const char*` from c_str()) relates to a primitive parameter. Its
+         * name may be unrecorded (only InferSourceTypeName carries it); CFlat's own match already
+         * proved the pointee types agree, so only the const is judged here.
+         */
+        if (!IsCxxRecord(from.TypeName) || !IsCxxRecord(to.TypeName))
+        {
+            if (IsCxxRecord(from.TypeName) || !IsPrimitiveTypeName(to.TypeName)
+                || (!from.TypeName.empty()
+                    && CanonicalPrimitiveTypeName(from.TypeName)
+                           != CanonicalPrimitiveTypeName(to.TypeName)))
+                return CxxPointeeConstRelation::Unrelated;
+        }
+        else if (from.TypeName != to.TypeName
             && (from.ElemPointer || !IsCxxBaseOf(to.TypeName, from.TypeName)))
             return CxxPointeeConstRelation::Unrelated;
         if (from.IsCxxPointeeConst == to.IsCxxPointeeConst)
@@ -11136,7 +11336,21 @@ public:
     //      (__cflat_sv_<group>_...); static inline body keys fold reached statics.
     // 163: C++ demand companions translate per-group internal variable names back to Clang names
     //      when selecting definitions, then emit storage under the matching group alias.
-    static constexpr int kCHeaderCacheVersion = 163;
+    // 164: records carry whether the class declares a friend operator ("fop").
+    // 165: a type request answers an enum (type head + enumerators) or a `decltype(var)`
+    //      constant; older entries cached both as "does not name a C++ class type".
+    // 166: a bare all-default class template redirects to `<>` (negative entries held a refusal);
+    //      member templates of a partial specialization (unique_ptr<T[]>::reset<U>) are harvested.
+    // 167: a C++ record field `const T* f` carries its const pointee (IsCxxPointeeConst).
+    // 170: anonymous struct members of a C++ class carry clang's triviality flags.
+    // 171: member templates of partial-specialization instantiations, operator() templates, auto member returns.
+    // 172: a C++ record carries hasAssignTemplate ("hat") for the explicit-move shortcut.
+    // 173: globals carry their declaring file ("fl"), real internal linkage ("il") and an
+    //      internal const's evaluated-value hash ("ci", none when the value holds an address),
+    //      so a same-name internal static from two import groups is refused as ambiguous.
+    // 174: null-type arguments spell decltype(nullptr) in deduction wrappers; nullptr_t
+    //      signatures register instead of deferring for a type request.
+    static constexpr int kCHeaderCacheVersion = 174;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

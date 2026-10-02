@@ -5,7 +5,9 @@
 int main()
 {
     int failures = 0;
-    std::barrier sync{1};
+    std::barrier<> sync{1};
     sync.arrive_and_wait();
+    std::barrier bare{1};
+    bare.arrive_and_wait();
     return failures;
 }

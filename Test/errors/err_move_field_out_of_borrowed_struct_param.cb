@@ -210,6 +210,16 @@ expect_error("cannot return owning struct 'CrOwned' through pointer") {
     CrOwned badGenericReturnCall(CrOwned* o) { return badGenericReturnDeref(o); }
 }
 
+// The receiver is a borrow too: a non-copyable `return *this` is refused like `return *o`.
+expect_error("cannot return owning struct 'CrSelf' through pointer; use 'return move *this;'") {
+    struct CrSelf
+    {
+        int* p = nullptr;
+        ~CrSelf() { if (p != nullptr) { delete p; } }
+        CrSelf self() { return *this; }
+    };
+}
+
 // Explicit transfer remains legal; a POD struct read through a borrowed pointer is harmless.
 CrOwned goodReturnMoveDeref(CrOwned* o) { return move *o; }
 CrOwned goodReturnOwnedPointerDeref(move CrOwned* o) { return move *o; }

@@ -2,6 +2,7 @@
 // FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
 import cpp "atomic";
 import cpp "condition_variable";
+import cpp "functional";
 import cpp "future";
 import cpp "mutex";
 import cpp "thread";

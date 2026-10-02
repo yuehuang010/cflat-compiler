@@ -1,6 +1,5 @@
 // GUARDS: C++14 integer_sequence and make_index_sequence size
 // FROM: internal/plan/std-library-smoke-suite.md (C++14 coverage map)
-// DISABLED: internal/issue/p3/std-index-sequence-size.md
 import cpp "utility";
 extern int main()
 {

@@ -1,0 +1,16 @@
+// std::nullptr_t maps to void*, but C++ converts only a null pointer constant to it: a non-null
+// pointer argument must never bind a nullptr_t parameter (unique_ptr<T[]>::reset(nullptr_t) once
+// took a replacement pointer, leaving get() null and leaking it).
+import cpp "cpp_interop_tpl.h";
+
+extern int main()
+{
+    cppt.arr.NullSink sink = default;
+    int value = 3;
+    int* p = &value;
+    expect_error("no overload of 'take' matches the given arguments") {
+        sink.take(p);
+    }
+    sink.take(nullptr);
+    return sink.hits == 1 ? 0 : 1;
+}

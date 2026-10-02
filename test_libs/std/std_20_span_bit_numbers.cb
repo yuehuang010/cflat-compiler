@@ -3,6 +3,7 @@
 import cpp "span";
 import cpp "vector";
 import cpp "bit";
+import cpp "cmath";
 import cpp "cstdint";
 import cpp "numeric";
 import cpp "array";

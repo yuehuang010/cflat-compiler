@@ -1,0 +1,38 @@
+// A C++ internal-linkage variable has one object per import group. When two groups own two
+// objects of one name, a CFlat use is refused as ambiguous and names the declaring headers.
+// The first group's front header (cpp_group_shared.hpp) does not define cpp_group_k.
+import cpp {"cpp_group_shared.hpp", "cpp_inline_static_a.hpp"};
+import cpp "cpp_inline_static_b.hpp";
+// An external variable from a third group must not bind the refused name again.
+import cpp "cpp_group_third.hpp";
+
+extern int main()
+{
+    // Control: a folded constant and a const object of one shared declaration with equal values,
+    // an external inline constant both groups define, and a name only one group defines.
+    int shared = cpp_group_shared_k + cpp_group_shared_q.b + cpp_group_inline_k + cpp_group_only_a;
+    // The same NaN bits from one declaration bind.
+    double nan = cpp_group_shared_nan;
+    expect_error("'cpp_group_k' is ambiguous: C++ internal-linkage variable 'cpp_group_k' is defined in both 'cpp_inline_static_a.hpp' and 'cpp_inline_static_b.hpp'") {
+        int k = cpp_group_k;
+    }
+    expect_error("'cpp_inline_static_calls' is ambiguous:") {
+        int calls = cpp_inline_static_calls;
+    }
+    expect_error("'cpp_group_ns.counter' is ambiguous:") {
+        cpp_group_ns.counter = 3;
+    }
+    // One shared declaration whose value differs per group (a define) is two objects.
+    expect_error("'cpp_group_shared_p' is ambiguous: C++ internal-linkage variable 'cpp_group_shared_p' from 'cpp_group_shared.hpp' has one copy per import group, and the imports of 'cpp_group_shared.hpp' and 'cpp_inline_static_b.hpp' each reach it") {
+        int b = cpp_group_shared_p.b;
+    }
+    // A pointer constant addresses each group's own object.
+    expect_error("'cpp_group_shared_ptr' is ambiguous: C++ internal-linkage variable 'cpp_group_shared_ptr' from 'cpp_group_shared.hpp' has one copy per import group") {
+        int* p = cpp_group_shared_ptr;
+    }
+    // 0.0 and -0.0 compare equal but are different constants.
+    expect_error("'cpp_group_shared_z' is ambiguous:") {
+        double z = cpp_group_shared_z;
+    }
+    return shared;
+}

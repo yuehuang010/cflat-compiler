@@ -1,12 +1,13 @@
 // GUARDS: C++20 barrier construction and phase completion
 // FROM: internal/plan/std-library-smoke-suite.md (C++20 coverage map)
-// DISABLED: internal/issue/p2/cpp-std-barrier-type-unavailable.md
 import cpp "barrier";
 extern int main()
 {
     int failures = 0;
-    std.barrier sync = std.barrier(1);
+    std.barrier<> sync = std.barrier<>(1);
     sync.arrive_and_wait();
+    std.barrier bare = std.barrier(1);   // the bare name stays legal and means the same
+    bare.arrive_and_wait();
     if (failures == 0) printf("PASS std_20_96_barrier\n");
     return failures;
 }

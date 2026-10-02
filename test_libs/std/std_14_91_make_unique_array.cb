@@ -1,6 +1,5 @@
 // GUARDS: C++14 make_unique array overload
 // FROM: internal/plan/std-library-smoke-suite.md (C++14 coverage map)
-// DISABLED: internal/issue/p3/std-make-unique-array.md
 import cpp "memory";
 extern int main()
 {

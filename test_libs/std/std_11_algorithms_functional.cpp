@@ -1,6 +1,7 @@
 // C++20 equivalent of std_11_algorithms_functional.cb (compile-time parity baseline)
 #include <algorithm>
 #include <functional>
+#include <iterator>
 #include <numeric>
 #include <string>
 #include <vector>

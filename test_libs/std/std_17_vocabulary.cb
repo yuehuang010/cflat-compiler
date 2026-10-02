@@ -16,6 +16,8 @@ extern int main()
     int* ptr = std.get_if<int>(&v);
     std.function<int(int)> visitor = std.function<int(int)>(plus_one);
     int visited = std.visit(visitor, v);
+    std.function<int(int)> lambdaVisitor = (int x) => { return x + 2; };
+    int lambdaVisited = std.visit(lambdaVisitor, v);
     std.any av = std.any(41);
     int anyv = std.any_cast<int>(av);
     bool anyhas = av.has_value();
@@ -25,7 +27,7 @@ extern int main()
     sv.remove_prefix(1);
     bool cmp = sv == std.string("bcdef");
     if (ov != 23 || !empty) { printf("FAIL optional\n"); failures |= 1; }
-    if (ix != 0 || !holds || ptr == nullptr || *ptr != 37 || visited != 38) { printf("FAIL variant_state\n"); failures |= 2; }
+    if (ix != 0 || !holds || ptr == nullptr || *ptr != 37 || visited != 38 || lambdaVisited != 39) { printf("FAIL variant_state\n"); failures |= 2; }
     if (anyv != 41 || !anyhas) { printf("FAIL any\n"); failures |= 8; }
     if (sub != "cde" || pos != 2 || !cmp) { printf("FAIL string_view\n"); failures |= 16; }
     if (failures == 0) printf("PASS std_17_vocabulary\n");

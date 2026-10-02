@@ -179,6 +179,34 @@ static bool IsNullPointerConstantArgument(const LLVMBackend::NamedVariable& arg)
     return constant != nullptr && constant->isZero();
 }
 
+// An expression of the null type: a bare `nullptr`, a `?:` of nullptr arms, `auto v = nullptr`.
+// It has no CFlat type and no pointer declarator, yet a pointer value.
+static bool IsNullptrLiteralArgument(const LLVMBackend::NamedVariable& arg)
+{
+    return !arg.TypeAndValue.Pointer && arg.TypeAndValue.TypeName.empty()
+        && arg.Primary != nullptr && arg.Primary->getType()->isPointerTy();
+}
+
+// `std::nullptr_t` / `decltype(nullptr)` with any cv and reference decoration.
+static bool CxxSpellingIsNullptrT(std::string spelled)
+{
+    if (spelled.empty()) return false;
+    std::erase_if(spelled, [](unsigned char c) { return std::isspace(c) != 0; });
+    while (spelled.ends_with('&')) spelled.pop_back();
+    for (bool again = true; again;)
+    {
+        again = false;
+        for (std::string_view w : { "const", "volatile" })
+        {
+            if (spelled.starts_with(w)) { spelled.erase(0, w.size()); again = true; }
+            if (spelled.ends_with(w)) { spelled.resize(spelled.size() - w.size()); again = true; }
+        }
+    }
+    if (spelled.starts_with("::")) spelled.erase(0, 2);
+    return spelled == "std::nullptr_t" || spelled == "nullptr_t" || spelled == "decltype(nullptr)"
+        || spelled == "std::__1::nullptr_t";
+}
+
 // CFlat spells an lvalue reference argument as `&value`; that address is the referred object,
 // not a pointer value being converted to the reference's scalar type.
 static bool IsCxxAddressOfObjectArgument(const LLVMBackend::NamedVariable& arg)
@@ -636,6 +664,38 @@ bool LLVMBackend::FindCxxClassConversionPair(const std::string& source, const st
         return false;
 }
 
+bool LLVMBackend::CxxDeductionWrapperDeducesOther(const NamedVariable& arg, const TypeAndValue& param,
+                                                  bool paramSpelledNullptrT) const
+{
+        const bool paramNull = param.IsCxxNullptrT || paramSpelledNullptrT;
+        const bool argNull = IsCxxNullTypedArgument(arg);
+        if (argNull || paramNull) return argNull != paramNull;
+        const TypeAndValue& a = arg.TypeAndValue;
+        auto plainPointer = [](const TypeAndValue& t) {
+            return t.Pointer && !t.IsFunctionPointer && !t.IsArrayView && !t.IsInterface
+                && t.ConstArraySize == 0;
+        };
+        if (!plainPointer(a) || !plainPointer(param)) return false;
+        // A primitive pointer argument keeps its pointee only in InferSourceTypeName (the
+        // request spells it from there); unknown -> no verdict. A void* parameter has no name.
+        // A decayed fixed array (`char[4]` binds a `char**`-shaped parameter) or any other
+        // depth disagreement is not a pointee question: no verdict, scoring judges it.
+        if (llvm::isa_and_nonnull<llvm::ArrayType>(arg.BaseType) || a.ElemPointer != param.ElemPointer)
+            return false;
+        const std::string argPointee = !a.TypeName.empty() ? a.TypeName : arg.InferSourceTypeName;
+        if (argPointee.empty()) return false;
+        auto spell = [&](const std::string& pointee, bool elemPointer, std::string& out) {
+            std::string cflat = pointee + "*";
+            if (elemPointer) cflat += "*";
+            return CxxSpellingForCflatType(cflat, out);
+        };
+        std::string argSpelling, paramSpelling;
+        return spell(argPointee, a.ElemPointer, argSpelling)
+            && spell(param.TypeName.empty() ? std::string("void") : param.TypeName,
+                     param.ElemPointer, paramSpelling)
+            && argSpelling != paramSpelling;
+}
+
 std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequences(
         const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate)
 {
@@ -716,11 +776,13 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 && !param.IsCxxRefToPointer && param.PointerDepth <= 1)
             {
                 const TypeAndValue& pt = arg.TypeAndValue;
-                // `nullptr`: a null pointer conversion to any pointer type, no tie-breaker.
-                if (!pt.Pointer && pt.TypeName.empty()
-                    && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(arg.Primary))
+                // `nullptr` (or a std::nullptr_t value): identity at a std::nullptr_t parameter, a
+                // null pointer conversion to any other pointer type, no tie-breaker.
+                if (IsCxxNullTypedArgument(arg))
                 {
-                    out.rank = 2;
+                    const bool nullptrParam = param.IsCxxNullptrT
+                        || CxxSpellingIsNullptrT(CxxReferenceParameterSpelling(candidate, i));
+                    out.rank = nullptrParam ? 0 : 2;
                     out.cxxViable = true;
                     out.from = "nullptr";
                     continue;
@@ -959,6 +1021,9 @@ int LLVMBackend::CompareCxxConversionRanks(const std::vector<CxxConversionRank>&
             }
             else if (x.rank < 0 || y.rank < 0)
                 return 2;
+            // An ellipsis conversion is worse than every other sequence; two are equal.
+            else if (x.rank == kCxxEllipsisRank || y.rank == kCxxEllipsisRank)
+                order = x.rank - y.rank;
             else if (x.rank < 3 || y.rank < 3)
                 order = x.rank != y.rank ? x.rank - y.rank : tieBreak(x, y);
             // Two sequences through the SAME conversion function rank by the second standard
@@ -1030,6 +1095,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         // A variadic candidate that drops a record pointee const: C++ keeps it only when
         // nothing else is viable, so it never displaces the tiers (see cxxPointeeConstNotViable).
         const std::pair<std::vector<NamedVariable>, FunctionSymbol>* variadicConstDropFallback = nullptr;
+        // C++ variadics whose ellipsis receives an argument: ranked pairwise with the C++ set below.
+        std::vector<const std::pair<std::vector<NamedVariable>, FunctionSymbol>*> cxxEllipsisCandidates;
         auto isStringLiteralValue = [&](llvm::Value* value) {
             auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(
                 value == nullptr ? nullptr : value->stripPointerCasts());
@@ -1149,6 +1216,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     // candidate overrides it. A C++ ellipsis loses to every viable sibling.
                     variadicFallback = &pair;
                     if (!candidate.IsCxx) possible.clear();
+                    else cxxEllipsisCandidates.push_back(&pair);
                     continue;
                 }
             }
@@ -1239,6 +1307,30 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     || cxxParamSpelling.find("&&") != std::string::npos;
                 const bool cxxConstReference = candidateParamItr->IsCxxConstRef
                     || cxxParamSpelling.rfind("const ", 0) == 0;
+                // std::nullptr_t maps to void*, but only a null pointer constant converts to it
+                // ([conv.ptr]): a non-null pointer never binds `reset(nullptr_t)`.
+                if (candidate.IsCxx && CxxSpellingIsNullptrT(cxxParamSpelling)
+                    && !IsNullptrLiteralArgument(arg) && !IsNullPointerConstantArgument(arg)
+                    && !arg.TypeAndValue.IsCxxNullptrT)
+                {
+                    perfectMatch = false;
+                    promotionMatch = false;
+                    implicitMatch = false;
+                    break;
+                }
+                // A deduction wrapper IS the specialization for the argument types it was made
+                // for: `nullptr` after `int*` (or `void*` after `int*`) deduces another one in
+                // C++, never converts into this one. No match, so the call requests its own.
+                if (candidate.IsCxx && cxxDeductionWrappers_.count(candidate.UniqueName) != 0
+                    && !(candidate.IsMethod && paramIndex == 0)
+                    && CxxDeductionWrapperDeducesOther(arg, *candidateParamItr,
+                                                       CxxSpellingIsNullptrT(cxxParamSpelling)))
+                {
+                    perfectMatch = false;
+                    promotionMatch = false;
+                    implicitMatch = false;
+                    break;
+                }
                 if (candidateParamItr->IsRvalueRef
                     && !(candidate.IsCxx ? argIsCxxRvalue : IsRvalueReferenceArgument(arg)))
                 {
@@ -1269,11 +1361,27 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     break;
                 }
 
+                // A value of the null type: [conv.bool] converts it to bool only by direct-
+                // initialization, never at a call; at a std::nullptr_t parameter it is identity.
+                const bool cxxNullArgument = candidate.IsCxx && IsCxxNullTypedArgument(arg);
+                if (cxxNullArgument && !candidateParamItr->Pointer && !candidateParamItr->IsAlias
+                    && candidateParamItr->TypeName == "bool")
+                {
+                    perfectMatch = false;
+                    promotionMatch = false;
+                    implicitMatch = false;
+                    break;
+                }
+                if (cxxNullArgument && !candidateParamItr->IsFunctionPointer
+                    && (candidateParamItr->IsCxxNullptrT || CxxSpellingIsNullptrT(cxxParamSpelling)))
+                {
+                    result = 0;
+                }
                 // function<T> parameter: accept any function-compatible argument (named function,
                 // lambda fat struct, or stored function<T> variable). Type fidelity is checked at codegen.
                 // An encoded closure param (list<Lambda<...>>::add's `T value`, gap a) accepts the same
                 // arguments; an encoded closure arg satisfies a function<T> param likewise.
-                if (candidate.IsCxx && candidateParamItr->IsFunctionPointer
+                else if (candidate.IsCxx && candidateParamItr->IsFunctionPointer
                     && IsNullPointerConstantArgument(arg))
                 {
                     result = 1;
@@ -2092,11 +2200,17 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
          * survivors each better at some argument are ambiguous. The tiers alone cannot see this:
          * they count conversions per candidate, and a floating position is never ranked in them.
          */
-        const bool cxxRanking = tiedOut != nullptr && variadicFallback == nullptr
-            && !candidates.empty()
+        const bool cxxRanking = tiedOut != nullptr && !candidates.empty()
             && std::all_of(candidates.begin(), candidates.end(), [](const auto& c) {
-                   return c.second.IsCxx && !c.second.Variadic; });
+                   return c.second.IsCxx; });
         std::map<const Result*, std::vector<CxxConversionRank>> cxxRanks;
+        // A variadic whose ellipsis receives an argument joins the ranking: its declared
+        // parameters rank as usual, every argument past them is an ellipsis conversion.
+        std::vector<Ranked> ellipsisRanked;
+        ellipsisRanked.reserve(cxxEllipsisCandidates.size());
+        for (const Result* pair : cxxEllipsisCandidates)
+            ellipsisRanked.push_back(Ranked{ .pair = pair });
+        const Ranked* ellipsisWinner = ellipsisRanked.empty() ? nullptr : &ellipsisRanked.back();
         auto fullyRanked = [](const std::vector<CxxConversionRank>& ranks) {
             return std::none_of(ranks.begin(), ranks.end(),
                                 [](const CxxConversionRank& r) { return r.rank == -1; });
@@ -2106,8 +2220,18 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             std::vector<const Ranked*> viable;
             for (const Ranked& r : perfect) viable.push_back(&r);
             for (const Ranked& r : possible) viable.push_back(&r);
+            for (const Ranked& r : ellipsisRanked) viable.push_back(&r);
             for (const Ranked* r : viable)
-                cxxRanks[r->pair] = RankCxxConversionSequences(r->pair->first, r->pair->second);
+            {
+                auto ranks = RankCxxConversionSequences(r->pair->first, r->pair->second);
+                if (r->pair->second.Variadic)
+                    for (size_t i = r->pair->second.Parameters.size(); i < ranks.size(); ++i)
+                    {
+                        ranks[i].rank = kCxxEllipsisRank;
+                        ranks[i].cxxViable = true;
+                    }
+                cxxRanks[r->pair] = std::move(ranks);
+            }
             // [over.match.best] 2.4: on equal conversion sequences a non-template beats a function
             // template specialization (a deduction wrapper or a demangled `name<...>`).
             auto isTemplateCandidate = [&](const FunctionSymbol& f) {
@@ -2197,6 +2321,11 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             {
                 std::erase_if(perfect, [&](const Ranked& r) { return dominated.count(r.pair) != 0; });
                 std::erase_if(possible, [&](const Ranked& r) { return dominated.count(r.pair) != 0; });
+                // The undominated ellipsis candidate declared last stands in as the fallback.
+                ellipsisWinner = nullptr;
+                for (const Ranked& r : ellipsisRanked)
+                    if (dominated.count(r.pair) == 0)
+                        ellipsisWinner = &r;
             }
         }
 
@@ -2378,7 +2507,10 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             return finish(settle(best, /*legacyLastWins=*/true));
         }
 
-        if (variadicFallback != nullptr)
+        // A C++ ellipsis winner still loses to a candidate C++ prefers but CFlat refuses.
+        if (cxxRanking && ellipsisWinner != nullptr)
+            return finish(ellipsisWinner);
+        if (variadicFallback != nullptr && !cxxRanking)
             return *variadicFallback;
         // Nothing viable: the const-dropping variadic reaches the selected-candidate guard.
         if (variadicConstDropFallback != nullptr)
@@ -3394,6 +3526,54 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         }
         const auto& candidates = *candidateSet;
 
+        /*
+         * `obj.f(args)` where the C++ class declares f both static and non-static: C++ selects
+         * over both sets, the static's implicit object matching any receiver. Score each static
+         * overload with the receiver's own `this` slot prepended (a tie on that argument); a
+         * static winner is the qualified call `Owner.f(args)` - the receiver, already evaluated,
+         * is dropped as the implicit object.
+         */
+        if (postfixMemberCall && !arguments.empty() && !receiverType.empty()
+            && functionName == bareMemberName && IsCxxStaticMethod(receiverType, bareMemberName))
+        {
+            const std::string staticName = receiverType + "." + bareMemberName;
+            const auto staticSet = functionTable.find(staticName);
+            const FunctionSymbol* thisShape = nullptr;
+            for (const auto& c : candidates)
+                if (c.IsMethod && !c.Parameters.empty()) { thisShape = &c; break; }
+            if (staticSet != functionTable.end() && thisShape != nullptr)
+            {
+                std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> mixed;
+                std::unordered_set<std::string> staticLinkage;
+                auto score = [&](const FunctionSymbol& sym) {
+                    auto matched = MatchFunction(arguments, sym.Parameters, sym.Variadic, true,
+                                                 &sym.DefaultArguments);
+                    if (!matched.empty()) mixed.emplace_back(std::move(matched), sym);
+                };
+                for (const auto& c : candidates) score(c);
+                for (const FunctionSymbol& s : staticSet->second)
+                {
+                    FunctionSymbol shaped = s;
+                    shaped.Parameters.insert(shaped.Parameters.begin(), thisShape->Parameters.front());
+                    if (!shaped.DefaultArguments.empty())
+                        shaped.DefaultArguments.insert(shaped.DefaultArguments.begin(),
+                                                       cflat_cinterop::RawDefaultArg{});
+                    staticLinkage.insert(s.UniqueName);
+                    score(shaped);
+                }
+                if (!mixed.empty())
+                {
+                    const auto winner = ComputeOverloadFunction(mixed).second;
+                    if (!winner.Parameters.empty() && staticLinkage.count(winner.UniqueName) != 0)
+                    {
+                        std::vector<NamedVariable> rest(arguments.begin() + 1, arguments.end());
+                        return CreateOverloadedFunctionCall(staticName, rest, forceRoot, displayName,
+                                                            {}, false, enclosingFunctionName);
+                    }
+                }
+            }
+        }
+
         std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> resolvedCandidate;
 
         for (const auto& candidate : candidates)
@@ -3539,6 +3719,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     spelled = "const " + spelled;
                 paramList += (paramList.empty() ? "" : ", ") + spelled;
             }
+            if (c.Variadic)
+                paramList += paramList.empty() ? "..." : ", ...";
             const std::string name = StripCxxConstTwin(
                 c.SourceName.empty() ? shownFunctionName : c.SourceName);
             return std::format("{}({})", name, paramList);
@@ -4517,6 +4699,21 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     "cannot store an 'alias' value '{}' into an owning parameter; it borrows storage it does not own and would dangle. Use '.copy()' for an independent owned copy.",
                     { sourceName });
             }
+        }
+        // `move x` into a by-value parameter of a trivially copyable C++ class: clang's pick for
+        // std::move(x) constructs a temporary the byte-copying argument path then passes.
+        for (size_t i = 0; i < matched.size() && i < candidate.Parameters.size(); ++i)
+        {
+            const auto& param = candidate.Parameters[i];
+            if (!matched[i].IsExplicitMove || param.Pointer || param.IsAlias || param.IsRvalueRef
+                || param.TypeName != matched[i].TypeAndValue.TypeName)
+                continue;
+            std::string refusal;
+            const std::string sourceName = matched[i].CallerName.empty()
+                ? matched[i].TypeAndValue.VariableName : matched[i].CallerName;
+            if (!MaterializeTrivialCxxExplicitMove(matched[i], sourceName, refusal)
+                && !refusal.empty())
+                LogError(refusal);
         }
         std::vector<llvm::Value*> argList;
         // A by-value param an 'alias' return can hand back is passed as a pointer to a caller-owned
@@ -5518,8 +5715,25 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                                    diagnosticFunctionName, /*moveRemedy*/ true));
                     continue;
                 }
-                if (!EmitCxxByValueParamConstruct(pn, temp, matched[i].Storage, useMove,
-                                                  "into a by-value parameter")) continue;
+                // `move x` into a by-value C++ class parameter is std::move(x) (ruling 2026-10-01).
+                const bool moveConstSource = matched[i].IsExplicitMove
+                    && CxxConstReceiverKind(matched[i]) != 0;
+                if (matched[i].IsExplicitMove && matched[i].TypeAndValue.TypeName == pn
+                    && IsForeignNontrivialCxxClass(pn)
+                    && CxxExplicitMoveNeedsTransfer(pn, moveConstSource, false))
+                {
+                    std::string refusal;
+                    const std::string sourceName = matched[i].CallerName.empty()
+                        ? matched[i].TypeAndValue.VariableName : matched[i].CallerName;
+                    if (!EmitCxxExplicitMoveTransfer(pn, temp, matched[i].Storage,
+                            moveConstSource, false, sourceName, refusal))
+                    {
+                        LogError(refusal);
+                        continue;
+                    }
+                }
+                else if (!EmitCxxByValueParamConstruct(pn, temp, matched[i].Storage, useMove,
+                                                       "into a by-value parameter")) continue;
                 if (cxxObject && !IsCxxParamDestroyedInCallee(pn))
                     RegisterOwnedStructTemp(temp, pn);
                 cxxIndirectArgAddrs.resize(candidate.Recipe.paramSlots.size(), nullptr);

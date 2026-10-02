@@ -3428,3 +3428,24 @@ Rule for briefs and reviews: when a fix changes WHICH path an input takes, name 
 other clients. The brief lists them as the accept set, and the review runs a master-vs-branch diff
 over them (B17's 1056-cell native matrix, B18's 129 probes). A "0 diff vs master" line in the
 report is what makes such a fix landable.
+
+## Ruling 2026-10-01: std::move is kept beside the CFlat `move` keyword (landed with ST8)
+
+Maintainer: KEEP `std::move`. The `move` keyword is CFlat's own (Rust-style, tracked by the ownership
+analysis); `std.move(x)` is the C++ operation with C++ semantics. Both stay.
+
+1. A C++ call whose result is an rvalue reference `T&&` to a C++ class (std::move, and by return type
+   alone boost::move, eastl::move, MoveTemp, ...) is a move source in declaration init, assignment
+   and `return`. Key on the return type, never on the name. The 3-argument algorithm
+   `std::move(first, last, dest)` returns an iterator and is unaffected. As landed, clang selects the
+   special member: a generated wrapper constructs / assigns from `static_cast<[const] T&&>(*src)`,
+   cached per class and kind (RequestCxxXvalueTransfer / EmitCxxXvalueTransfer); never hand-roll
+   the selection.
+2. C++ semantics for the source: valid but unspecified, still readable (`unique_ptr` null). No
+   CFlat "use of moved variable" diagnostic for `std.move` - that stays the `move` keyword's.
+3. Specific diagnostics: `std.move` on a CFlat (non-C++) value is refused with a `move x` hint; a
+   non-class `T&&` init refusal names the rvalue-reference result.
+
+Companion ruling (2026-10-01 18:25, issue p2/cflat-move-of-cpp-class-mimics-std-move): CFlat
+`D b = move a;` on a C++ class mimics `D b = std::move(a);` - same special member clang selects,
+refused when deleted, const -> copy.

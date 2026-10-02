@@ -245,12 +245,13 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         // argument list exists; this hop is the scanner's copy of the old shape.
                         const std::string spelledBase = baseName;
                         std::vector<std::string> typeArgs;
-                    for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
-                    {
-                        // Route every arg through ResolveForwardTypeArg so scanner and codegen share canonical
-                        // spellings for closures, nested generics, values, qualifiers, and plain types.
-                        typeArgs.push_back(ResolveForwardTypeArg(entry));
-                    }
+                        // `T<>` follows the bare-name path: an empty list carries no explicit args.
+                        auto* parameterList = genParams->typeParameterList();
+                        for (auto* entry : parameterList->typeParameterEntry())
+                            {
+                                // Keep scanner and codegen argument spellings in sync.
+                                typeArgs.push_back(ResolveForwardTypeArg(entry));
+                            }
                     // A C++ alias template names its target with its OWN argument pattern, which
                     // may fix, reorder or partially bind the target's parameters.
                     baseName = spelledBase;
@@ -266,7 +267,8 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         // Re-mangle through ResolveForwardTypeArg so a nested generic argument
                         // (Container<Box<int>>) matches the main pass's Container$Box$int.
                         std::vector<std::string> interfaceArgs;
-                        for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
+                        auto* parameterList = genParams->typeParameterList();
+                        for (auto* entry : parameterList->typeParameterEntry())
                             interfaceArgs.push_back(ResolveForwardTypeArg(entry));
                         std::string interfaceBase = spelledBase;
                         compiler->ResolveGenericAliasSpelling(interfaceBase, interfaceArgs, false);
@@ -335,6 +337,8 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         std::string cxxError;
                         compiler->TryRequestCxxType(specText, {}, specText, cxxError);
                     }
+                    // A std::nullptr_t alias keeps its identity; alias expansion spells it void*.
+                    if (compiler->IsCxxNullptrTAlias(specText)) declType.IsCxxNullptrT = true;
                     declType.TypeName = compiler->ResolveQualifiedName(specText);
                     // Resolve type aliases (e.g. user-defined aliases)
                     declType.TypeName = compiler->ResolveTypeAlias(declType.TypeName);

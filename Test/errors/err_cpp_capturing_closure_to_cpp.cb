@@ -1,0 +1,101 @@
+// A capturing CFlat closure crosses into C++ (std::function, a deduced C++ callable) as a
+// generated wrapper owning or borrowing its env (N50 ruling; Test/test_cpp_interop_bridge.cb
+// 644-656). Refused: a by-reference capture (the C++ callable can outlive the local), a
+// move-only unique<T> capture (C++ refuses a move-only lambda in std::function), and an implicit
+// copy of a named closure whose captures are not provably trivial (`move` hands it over).
+// Pre-N50 every leg below failed with "a capturing closure cannot be passed to C++". A
+// non-capturing lambda, a function<...> value and a named function bind as a function pointer
+// (bridge 620-628). Scoped blocks: each leg is armed alone.
+import cpp "cpp_interop_basic.h";
+import cpp "functional";
+
+struct CapturedBox { int v = default; };
+
+int bump_alias(alias int x) { x += 1; return x; }
+T bump_alias_generic<T>(alias T x) { x += 1; return x; }
+// Signature-mismatch sources: a plain name, a generic instantiation, a last-wins generic pair
+// whose surviving template takes two parameters, and a move-sink generic.
+int deref_plain(int* x) { return *x; }
+int ident_plain(int x) { return x; }
+int zero_plain() { return 3; }
+struct DropDtor { int v = default; ~DropDtor() { v = 0; } };
+DropDtor make_drop(int x) { DropDtor d; d.v = x; return d; }
+T deref_generic<T>(T* x) { return *x; }
+T two_generic<T>(T x) { return x * 2; }
+T two_generic<T>(T x, T y) { return x + y; }
+int consume_generic<T>(move T* p) { int n = (int)*p; delete p; return n; }
+
+// A Lambda<> parameter may hold any closure: its captures are not provably trivial.
+expect_error("cannot be copied into C++ 'cppi.apply_n' implicitly; pass 'move l'") {
+    int pass_lambda_param(Lambda<int(int)> l) { return cppi.apply_n(l, 2); }
+}
+
+extern int main()
+{
+    string s = "ab";
+    CapturedBox box = default;
+    box.v = 4;
+    unique<CapturedBox> owned = new CapturedBox();
+    // A named closure with an owning (string) capture: C++ would copy it - `move` hands it over.
+    expect_error("a closure that may own non-trivial captures cannot be copied into C++ 'std.function<int(int)>' implicitly; pass 'move l'") {
+        Lambda<int(int)> l = (int x) => { return x + s.length(); };
+        std.function<int(int)> f = l;
+    }
+    // A struct value is reference-captured: the bonded closure must not reach a C++ parameter.
+    expect_error("a closure that captures by reference ('box') cannot be passed to C++ 'cppi.apply_fn'") {
+        int r = cppi.apply_fn((int x) => { return x + box.v; }, 1);
+    }
+    // A captured unique<T>: move-only state, as C++ refuses a move-only lambda in std::function.
+    expect_error("a closure capturing the move-only 'owned' cannot be passed to C++ 'std.function<int(int)>'") {
+        std.function<int(int)> f = (int x) => { return x + owned->v; };
+    }
+    // A function NAME with an `alias` param has no function-pointer spelling: refused, never
+    // passed by value to a callee that would read it as an address.
+    expect_error("cannot be used as a function pointer") {
+        std.function<int(int)> f = bump_alias;
+    }
+    // The same guard for an explicit generic instantiation named as a value.
+    expect_error("function 'bump_alias_generic<int>' cannot be used as a function pointer") {
+        std.function<int(int)> f = bump_alias_generic<int>;
+    }
+    expect_error("function 'bump_alias_generic<int>' cannot be used as a function pointer") {
+        int r = cppi.apply_n(bump_alias_generic<int>, 2);
+    }
+    // A function name binds a std.function when the call is valid with implicit conversions
+    // (clang++'s rule); a pointer or arity mismatch is refused. Pre-fix the plain name bound and
+    // f(4) read 4 as an address (SIGSEGV), and `int zero()` bound and ran.
+    expect_error("cannot bind function 'deref_plain' to a C++ callable of type 'int(int)'") {
+        std.function<int(int)> f = deref_plain;
+    }
+    expect_error("cannot bind function 'deref_generic<int>' to a C++ callable of type 'int(int)'") {
+        std.function<int(int)> f = deref_generic<int>;
+    }
+    expect_error("cannot bind function 'deref_generic<int>' to a C++ callable of type 'int(int)'") {
+        std.function<int(int)> f = std.function<int(int)>(deref_generic<int>);
+    }
+    expect_error("'two_generic<int>' is 'int(int, int)' - it takes 2 parameter(s) but the call supplies 1") {
+        std.function<int(int)> f = two_generic<int>;
+    }
+    expect_error("'zero_plain' is 'int()' - it takes 0 parameter(s) but the call supplies 1") {
+        std.function<int(int)> f = zero_plain;
+    }
+    // A void target drops the return value; one that needs destruction is refused, not leaked.
+    expect_error("the discarded return value needs destruction") {
+        std.function<void(int)> f = make_drop;
+    }
+    expect_error("cannot bind function 'deref_generic<int>' to a C++ callable of type 'int(int)'") {
+        int r = cppi.apply_fn(deref_generic<int>, 1);
+    }
+    // The CFlat function<> declarator and assignment keep their own checked generic path.
+    expect_error("cannot bind function 'deref_generic<int>' to function-pointer type 'int(int)'") {
+        function<int(int)> f = deref_generic<int>;
+    }
+    expect_error("cannot bind function 'deref_generic<int>' to function-pointer type 'int(int)'") {
+        function<int(int)> f = ident_plain;
+        f = deref_generic<int>;
+    }
+    expect_error("has no overload matching the 'move' modifiers of function pointer signature") {
+        function<int(int*)> f = consume_generic<int>;
+    }
+    return 0;
+}

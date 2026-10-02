@@ -5289,6 +5289,8 @@ int rawDeleteParamRebound(Resource* p)
 struct OaiBox
 {
     unique Resource* item = nullptr;
+    // A non-copyable `return *this` is refused (the receiver is a borrow); `move` transfers.
+    OaiBox take() { return move *this; }
 };
 
 OaiBox oaiMake(int id)
@@ -5324,6 +5326,8 @@ struct OaiCopyBox
         r.item->id = (item == nullptr) ? -1 : item->id;
         return r;
     }
+    OaiCopyBox self() { return *this; }
+    OaiCopyBox take() { return move *this; }
 };
 
 struct OaiCopyWrap { OaiCopyBox b; };
@@ -5639,6 +5643,24 @@ int testOwningAssignFromIndirectSource()
         passed += Test("oai_stringowner_declinit_deref_value", o2.s, "abef");
         passed += Test("oai_stringowner_declinit_deref_source_live", ap2->s, "abef");
     }
+
+    // 14. `return *this`: a copyable owner copies (receiver live), `return move *this` moves out.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox o = a.take();
+        passed += Test("oai_this_move_value", oaiId(o), 5);
+        passed += Test("oai_this_move_source_nulled", a.item == nullptr, true);
+        OaiCopyBox c;
+        c.item = new Resource();
+        c.item->id = 6;
+        OaiCopyBox c1 = c.self();
+        passed += Test("oai_this_copy_distinct", c1.item != c.item && c.item != nullptr, true);
+        OaiCopyBox c2 = c.take();
+        passed += Test("oai_this_copy_move_value", c2.item->id + c1.item->id, 12);
+        passed += Test("oai_this_copy_move_source_nulled", c.item == nullptr, true);
+    }
+    passed += Test("oai_this_freed_once_each", dtorCount, 3);
 
     return passed;
 }
@@ -12727,7 +12749,7 @@ extern int main()
     total += 29;
 
     passed += testOwningAssignFromIndirectSource();
-    total += 76;
+    total += 82;
 
     passed += testOwningAssignIntoFixedArrayElement();
     total += 92;

@@ -31,7 +31,7 @@ extern int main()
     std.stack<int> st = default; st.push(11);
     std.queue<int> q = default; q.push(12);
     std.priority_queue<int> pq = default; pq.push(13);
-    if (d.front() != 1 || l.back() != 9 || fl.front() != 3 || m[2] != 20 || mm.count(1) != 2 || s.count(5) != 1 || ms.count(2) != 2 || um[7] != 70 || us.count(9) != 1 || st.top() != 11 || q.front() != 12 || pq.top() != 13 || std.hash<int>()(42) != 42)
+    if (d.front() != 1 || l.back() != 9 || fl.front() != 3 || m[2] != 20 || mm.count(1) != 2 || s.count(5) != 1 || ms.count(2) != 2 || um[7] != 70 || us.count(9) != 1 || st.top() != 11 || q.front() != 12 || pq.top() != 13 || std.hash<int>()(42) != std.hash<int>()(42) || std.hash<int>()(42) == std.hash<int>()(43))
     { printf("FAIL associative/adaptor/hash\n"); failures |= 2; }
     if (failures == 0) printf("PASS std_11_containers\n");
     return failures;

@@ -1,6 +1,5 @@
 // GUARDS: std::function constructed from a typed CFlat lambda
 // FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
-// DISABLED: internal/issue/p2/std-cflat-lambda-to-std-function.md
 import cpp "functional";
 extern int main()
 {

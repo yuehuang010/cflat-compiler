@@ -57,7 +57,24 @@ void MainListener::ApplyVectorizeFpTier(LLVMBackend* compiler, VectorizeFpTier t
         compiler->builder->setFastMathFlags(f);
     }
 
+/*
+ * CFlat represents std::nullptr_t as void*, but C++ template identity distinguishes the two
+ * (is_null_pointer<nullptr_t> vs <void*>). A bare written nullptr_t argument keeps its spelling,
+ * which still resolves to void* wherever CFlat needs the type itself. Shared by every
+ * type-argument site, both declaration-specifier passes included.
+ */
 std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryContext* entry) {
+        std::string resolved = ResolveTypeArgEntryRaw(entry);
+        if (resolved == "void*" && entry->typeSpecifier() != nullptr && entry->pointer() == nullptr
+            && entry->arrayTypeSuffix() == nullptr)
+        {
+            const std::string written = entry->typeSpecifier()->getText();
+            if (written == "std.nullptr_t" || written == "nullptr_t") return written;
+        }
+        return resolved;
+}
+
+std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntryContext* entry) {
         if (entry->shiftExpression() != nullptr && entry->typeSpecifier() == nullptr)
         {
             auto folded = FoldCompileTimeInt(Compiler(entry), entry->shiftExpression());
@@ -903,18 +920,33 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     const std::string spelledBase = baseName;
                     baseName = Compiler(declSpecs)->ResolveGenericBaseAlias(baseName);
                     std::vector<std::string> typeArgs;
-                    for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
-                    {
-                        // `tuple` is a plain aggregate with no destructor, so a `unique` element would
-                        // never be freed - reject it rather than silently drop the ownership.
-                        if (baseName == "tuple" && TypeArgHasUnique(entry))
-                            LogErrorContext(entry, "unique is not supported as a tuple element type");
-                        typeArgs.push_back(ResolveTypeArgEntry(entry));
-                    }
+                    // `T<>` is the same all-defaulted instantiation as bare `T`.
+                    auto* parameterList = genParams->typeParameterList();
+                    for (auto* entry : parameterList->typeParameterEntry())
+                        {
+                            // `tuple` is a plain aggregate with no destructor, so a `unique` element would
+                            // never be freed - reject it rather than silently drop the ownership.
+                            if (baseName == "tuple" && TypeArgHasUnique(entry))
+                                LogErrorContext(entry, "unique is not supported as a tuple element type");
+                            typeArgs.push_back(ResolveTypeArgEntry(entry));
+                        }
                     // A C++ alias template names its target with its OWN argument pattern, which
                     // may fix, reorder or partially bind the target's parameters.
                     baseName = spelledBase;
                     Compiler(declSpecs)->ResolveGenericAliasSpelling(baseName, typeArgs);
+                    if (typeArgs.empty())
+                    {
+                        std::vector<std::string> requiredParams;
+                        if (NativeTemplateNeedsTypeArgs(baseName, requiredParams))
+                            RejectMissingNativeTemplateTypeArgs(genParams, spelledBase, requiredParams);
+                        const std::string resolvedType = Compiler(declSpecs)->ResolveTypeAlias(baseName);
+                        if (!Compiler(declSpecs)->AnyGenericTypeTemplateNamed(baseName)
+                            && Compiler(declSpecs)->IsDataStructure(resolvedType)
+                            && !Compiler(declSpecs)->IsCxxRecord(baseName)
+                            && !Compiler(declSpecs)->IsCxxForeignTypeRegistered(resolvedType))
+                            LogErrorContext(genParams,
+                                std::format("'{}' is not a generic type", spelledBase));
+                    }
                     std::string mangledName = MangledGenericName(baseName, typeArgs);
                     if (IsCoreUniqueArrayViewInstantiation(Compiler(declSpecs), mangledName, typeArgs))
                         LogErrorContext(genParams, CoreUniqueArrayViewMessage(typeArgs));
@@ -943,6 +975,13 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         // a type argument) is registered as an alias of the first: declare the
                         // local with the registration's own name so its members resolve.
                         declType.TypeName = Compiler(declSpecs)->ResolveTypeAlias(mangledName);
+                        // `<>` needs a class template, as in C++ ("is not a template").
+                        if (typeArgs.empty() && cxxError.empty()
+                            && (cxxType || Compiler(declSpecs)->IsCxxRecord(baseName)
+                                || Compiler(declSpecs)->IsCxxForeignTypeRegistered(declType.TypeName))
+                            && !Compiler(declSpecs)->IsCxxTemplateSpecializationOf(declType.TypeName, baseName))
+                            LogErrorContext(genParams,
+                                std::format("'{}' is not a generic type", spelledBase));
                     }
                     // Queue instantiation of nested generic types discovered during field/param parsing.
                     // Only do this when inside an active instantiation context (substitutions are set),
@@ -1050,6 +1089,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     }
                     // Resolve namespace-qualified type names (alias expansion + parent namespace search).
                     // forceRoot on a substituted name: the outward walk would re-bind it here.
+                    // A std::nullptr_t alias keeps its identity; alias expansion spells it void*.
+                    if (Compiler(declSpecs)->IsCxxNullptrTAlias(typeName)) declType.IsCxxNullptrT = true;
                     typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName, wasSubstituted);
                     // If still unresolved, try qualifying with the enclosing struct scope (e.g. Inner -> Outer.Inner).
                     // The !wasSubstituted guard is DEFENSIVE and inert today: removing it changed no leg or probe.
@@ -2116,6 +2157,59 @@ MainListener::MainListener(CFlatParser* parser, LLVMBackend* compilerLLVM, const
 
 void MainListener::SetImportNamespace(const std::string& ns) { importNamespace_ = ns; }
 
+bool MainListener::NativeTemplateNeedsTypeArgs(const std::string& spelledBase,
+    std::vector<std::string>& parameterNames)
+{
+    auto* compiler = Compiler();
+    const std::string base = compiler->ResolveGenericTemplateBase(spelledBase);
+    const std::vector<std::string>* params = nullptr;
+    const std::vector<std::string>* valueParams = nullptr;
+    const std::vector<std::string>* defaults = nullptr;
+    auto structParams = compiler->gts.genericStructTypeParams.find(base);
+    if (structParams != compiler->gts.genericStructTypeParams.end())
+    {
+        params = &structParams->second;
+        auto values = compiler->gts.genericStructValueParams.find(base);
+        if (values != compiler->gts.genericStructValueParams.end()) valueParams = &values->second;
+        auto defs = compiler->gts.genericStructValueDefaults.find(base);
+        if (defs != compiler->gts.genericStructValueDefaults.end()) defaults = &defs->second;
+    }
+    else
+    {
+        auto interfaceParams = compiler->gts.genericInterfaceTypeParams.find(base);
+        if (interfaceParams != compiler->gts.genericInterfaceTypeParams.end())
+        {
+            params = &interfaceParams->second;
+            auto values = compiler->gts.genericInterfaceValueParams.find(base);
+            if (values != compiler->gts.genericInterfaceValueParams.end()) valueParams = &values->second;
+            auto defs = compiler->gts.genericInterfaceValueDefaults.find(base);
+            if (defs != compiler->gts.genericInterfaceValueDefaults.end()) defaults = &defs->second;
+        }
+    }
+    if (params == nullptr || params->empty()) return false;
+    parameterNames = *params;
+    for (size_t i = 0; i < params->size(); ++i)
+    {
+        const bool isValue = valueParams != nullptr && i < valueParams->size()
+            && !(*valueParams)[i].empty();
+        const bool hasDefault = defaults != nullptr && i < defaults->size()
+            && !(*defaults)[i].empty();
+        if (!isValue || !hasDefault) return true;
+    }
+    return false;
+}
+
+void MainListener::RejectMissingNativeTemplateTypeArgs(antlr4::ParserRuleContext* site,
+    const std::string& spelledBase, const std::vector<std::string>& parameterNames)
+{
+    LLVMBackend::TypeAndValue displayType;
+    displayType.TypeName = spelledBase;
+    const std::string displayName = SpellType(*Compiler(), displayType);
+    Compiler(site)->currentLine = static_cast<int>(site->getStart()->getLine());
+    Compiler(site)->currentColumn = static_cast<int>(site->getStart()->getCharPositionInLine());
+    Compiler(site)->LogGenericTypeArgsRequired(displayName, parameterNames);
+}
+
 antlr4::BufferedTokenStream* MainListener::GetTokens() const {
         return parser ? dynamic_cast<antlr4::BufferedTokenStream*>(parser->getTokenStream()) : nullptr;
     }
@@ -2151,6 +2245,8 @@ void MainListener::ParseInterfaceDefinition(CFlatParser::InterfaceDefinitionCont
         // Generic interface template - store for on-demand instantiation
         if (nameGid->genericTypeParameters() != nullptr)
         {
+            if (nameGid->genericTypeParameters()->typeParameterList()->typeParameterEntry().empty())
+                LogErrorContext(ctx, "generic definition needs at least one type parameter");
             if (Compiler()->gts.scannedGenericStructNames.count(name) != 0
                 || genericStructTemplates.count(name) != 0
                 || genericClassTemplates.count(name) != 0)
@@ -3133,6 +3229,8 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // If this is a generic function template definition (not an instantiation), store it and return.
         if (nameOverride.empty() && func->genericTypeParameters() != nullptr)
         {
+            if (func->genericTypeParameters()->typeParameterList()->typeParameterEntry().empty())
+                LogErrorContext(func, "generic definition needs at least one type parameter");
             std::vector<std::string> valueParams;
             std::vector<std::string> valueDefaults;
             auto typeParams = ParseGenericTypeParameters(func->genericTypeParameters(), &valueParams,
@@ -4064,6 +4162,10 @@ CFlatParser::ArgumentExpressionListContext* MainListener::ForeignCxxConstructArg
             && callee.find('<', lt + 1) == std::string::npos)
         {
             std::string base = callee.substr(0, lt);
+            // `<>` on a plain class: leave it to the call path, which refuses it.
+            if (callee.size() == lt + 2
+                && !Compiler(pf)->IsCxxTemplateSpecializationOf(typeName, base))
+                return nullptr;
             // Function-type arguments use the registered CFlat specialization identity.
             if (base == MangledBase(typeName)) return args[0];
             std::string inner = callee.substr(lt + 1, callee.size() - lt - 2);
@@ -4104,6 +4206,12 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         if (compiler->RejectUnsupportedCxxLayout(typeName)) return true;
         if (compiler->RejectAbstractCxxClass(typeName, "declare a local of")) return true;
 
+        // A std.function's signature reaches a lambda in its initializer or constructor
+        // argument, as a function<> declarator's does (`std.function<int(int)> f = (int x) => x;`).
+        LambdaExpectedTypeRestoreGuard stdFunctionLambdaRestore(&lambdaExpectedType);
+        if (const auto* signature = compiler->StdFunctionClosureSignature(typeName))
+            lambdaExpectedType = *signature;
+
         auto* initializer = initDeclarator->initializer();
         auto* assign = initializer != nullptr ? initializer->assignmentExpression() : nullptr;
         // Depending on the initializer alternative selected by ANTLR, `default` may be exposed
@@ -4141,6 +4249,21 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
                 compiler->DisplayCxxClassName(typeName),
                 compiler->DisplayCxxClassName(typeName),
                 compiler->DisplayCxxClassName(typeName),
+                compiler->DisplayCxxClassName(typeName)));
+        };
+        // Item 3 of the std.move ruling: a `U&&` result that cannot build T names the reference.
+        auto badRvalueRefInit = [&](antlr4::ParserRuleContext* where,
+                                    const LLVMBackend::NamedVariable& source) {
+            LLVMBackend::TypeAndValue referent = source.TypeAndValue;
+            referent.IsRvalueRef = false;
+            if (referent.Pointer && !referent.ElemPointer) referent.Pointer = false;
+            else if (referent.ElemPointer) referent.ElemPointer = false;
+            LogErrorContext(where, std::format(
+                "cannot initialize C++ class '{}' from the rvalue reference '{}&&' this call "
+                "returns; only a '{}&&' result move-constructs it - use '{}(args)' or "
+                "'move <{}> lvalue'",
+                compiler->DisplayCxxClassName(typeName), SpellDiagnosticType(*compiler, referent),
+                compiler->DisplayCxxClassName(typeName), compiler->DisplayCxxClassName(typeName),
                 compiler->DisplayCxxClassName(typeName)));
         };
         if (initializer != nullptr && assign == nullptr && !isDefaultForm)
@@ -4317,6 +4440,41 @@ cxx_dtor_ready:
                 }
                 compiler->lastCxxRetTemp_ = nullptr;
                 auto nv = ParseAssignmentExpressionNamed(argAssign);
+                compiler->LowerNonCapturingClosureForCxx(
+                    nv, compiler->StdFunctionClosureSignature(typeName));
+                if (std::string refusal = compiler->CxxClosureArgumentRefusal(
+                        nv, compiler->DisplayCxxClassName(typeName),
+                        compiler->StdFunctionClosureSignature(typeName));
+                    !refusal.empty())
+                {
+                    LogErrorContext(argAssign, refusal);
+                    return true;
+                }
+                // A wrapped closure is no overload candidate (its void* marker could bind the copy
+                // ctor): build the class through its converting ctor, then rank that temporary.
+                if (!nv.CxxClosureSignature.empty())
+                {
+                    // The sole argument: construct the declared object in place (no temp to copy).
+                    const bool soleArgument = ctorArgs->argumentNamedExpression().size() == 1;
+                    if (soleArgument)
+                    {
+                        compiler->SetCurrentDebugLocation(line);
+                        ctorArgumentPostfix.Flush();
+                    }
+                    std::string conversionRefusal;
+                    if (compiler->ConvertThroughCxxConvertingCtor(nv, typeName,
+                                                                  soleArgument ? slot : nullptr,
+                                                                  conversionRefusal)
+                        != LLVMBackend::CxxConvertingCtorResult::Converted)
+                    {
+                        LogErrorContext(argAssign, std::format(
+                            "cannot construct C++ '{}' from this closure{}",
+                            compiler->DisplayCxxClassName(typeName),
+                            conversionRefusal.empty() ? std::string() : "; " + conversionRefusal));
+                        return true;
+                    }
+                    if (soleArgument) return true;
+                }
                 // Same literal identity the call-argument builder records (integer -> enum refusal).
                 bool suffixedLiteral = false;
                 if (nv.LiteralIdentity.empty())
@@ -4514,6 +4672,15 @@ cxx_dtor_ready:
                     && !sourceNV.TypeAndValue.Pointer
                     && sourceNV.TypeAndValue.TypeName == typeName)
                 {
+                    const bool constSource = compiler->CxxConstReceiverKind(sourceNV) != 0;
+                    std::string refusal;
+                    if (compiler->CxxExplicitMoveNeedsTransfer(typeName, constSource, false))
+                    {
+                        if (!compiler->EmitCxxExplicitMoveTransfer(typeName, slot,
+                                sourceNV.Storage, constSource, false, srcName, refusal))
+                            LogErrorContext(moveExpr, refusal);
+                        return true;
+                    }
                     compiler->EmitCxxCopyOrMoveConstruct(
                         typeName, slot, sourceNV.Storage, /*useMove*/ true,
                         std::format("into local '{}'", name).c_str(), declType.DiagnosticTypeName);
@@ -4542,6 +4709,19 @@ cxx_dtor_ready:
                 return true;
             }
             auto* srcNV = compiler->FindLiveNamedVariable(srcName);
+            // `std.function<...> f = move l;` with a CFlat closure: the C++ object takes the env.
+            if (srcNV != nullptr && srcNV->Storage != nullptr && !srcNV->TypeAndValue.Pointer
+                && compiler->IsUnwrappedFatClosure(*srcNV))
+            {
+                auto movedNV = ParseMoveExpression(moveExpr);
+                if (std::string refusal = compiler->CxxClosureArgumentRefusal(
+                        movedNV, compiler->DisplayCxxClassName(typeName),
+                        compiler->StdFunctionClosureSignature(typeName));
+                    !refusal.empty())
+                    LogErrorContext(moveExpr, refusal);
+                if (!convertInto(movedNV)) badInit(assign);
+                return true;
+            }
             if (srcNV != nullptr && srcNV->Storage != nullptr && srcNV->TypeAndValue.Pointer)
             {
                 LLVMBackend::NamedVariable rawSource = *srcNV;
@@ -4590,9 +4770,15 @@ cxx_dtor_ready:
                 return true;
             }
             compiler->SetCurrentDebugLocation(line);
-            compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, srcNV->Storage, /*useMove*/ true,
-                                                 std::format("into local '{}'", name).c_str(),
-                                                 declType.DiagnosticTypeName);
+            const bool constSource = compiler->CxxConstReceiverKind(*srcNV) != 0;
+            std::string moveRefusal;
+            if (!compiler->CxxExplicitMoveNeedsTransfer(typeName, constSource, false))
+                compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, srcNV->Storage, /*useMove*/ true,
+                                                     std::format("into local '{}'", name).c_str(),
+                                                     declType.DiagnosticTypeName);
+            else if (!compiler->EmitCxxExplicitMoveTransfer(typeName, slot, srcNV->Storage,
+                         constSource, false, srcName, moveRefusal))
+                LogErrorContext(moveExpr, moveRefusal);
             // RULING: the moved-from object is compile-time consumed but STILL destroyed at scope
             // exit - C++ has no null state to leave behind, so its destructor must run.
             compiler->MarkVariableMoved(srcName);
@@ -4604,7 +4790,19 @@ cxx_dtor_ready:
         llvm::Value* parsedArrayRetTemp = nullptr;
         llvm::Value* parsedArrayRetValue = nullptr;
         auto parseInitializerOnce = [&]() {
-            if (!hasParsedArrayInitializer) return ParseAssignmentExpressionNamed(assign);
+            if (!hasParsedArrayInitializer)
+            {
+                auto parsed = ParseAssignmentExpressionNamed(assign);
+                compiler->LowerNonCapturingClosureForCxx(
+                    parsed, compiler->StdFunctionClosureSignature(typeName));
+                // LogErrorContext throws, so a refused closure never reaches the slot.
+                if (std::string refusal = compiler->CxxClosureArgumentRefusal(
+                        parsed, compiler->DisplayCxxClassName(typeName),
+                        compiler->StdFunctionClosureSignature(typeName));
+                    !refusal.empty())
+                    LogErrorContext(assign, refusal);
+                return parsed;
+            }
             compiler->lastCxxRetTemp_ = parsedArrayRetTemp;
             compiler->lastCxxRetValue_ = parsedArrayRetValue;
             return parsedArrayInitializer;
@@ -4790,8 +4988,24 @@ cxx_dtor_ready:
                 compiler->builder->CreateStore(rightNV.Primary, slot);   // returned in registers
                 return true;
             }
+            // A `T&&` / `const T&&` result (std.move(x)) is an xvalue: clang selects the
+            // constructor; the referent keeps its C++ moved-from state and its own destructor.
+            if (compiler->IsCxxRvalueRefClassResult(rightNV)
+                && rightNV.TypeAndValue.TypeName == typeName)
+            {
+                std::string refusal;
+                if (!compiler->EmitCxxXvalueTransfer(typeName, slot, rightNV.Primary,
+                        rightNV.TypeAndValue.IsCxxConstRef, false, refusal))
+                    LogErrorContext(assign, refusal);
+                return true;
+            }
             if (adoptRaw(rightNV)) return true;
             if (convertInto(rightNV)) return true;
+            if (rightNV.TypeAndValue.IsRvalueRef)
+            {
+                badRvalueRefInit(assign, rightNV);
+                return true;
+            }
             badInit(assign);
             return true;
         }
@@ -4915,9 +5129,11 @@ bool MainListener::TryDeclareForeignCxxAutoLocal(CFlatParser::DirectDeclaratorCo
 {
         auto* compiler = Compiler(direct);
         const std::string typeName = sourceNV.TypeAndValue.TypeName;
+        // A `T&&` / `const T&&` class result: clang selects the constructor into the slot.
+        const bool xvalue = compiler->IsCxxRvalueRefClassResult(sourceNV);
         // `alias auto` keeps its borrow; a prvalue (sret temp) keeps the elision path.
         if (autoType.IsAlias || autoType.Pointer || autoType.staticStorage
-            || sourceNV.TypeAndValue.Pointer || sourceNV.Storage == nullptr
+            || (!xvalue && (sourceNV.TypeAndValue.Pointer || sourceNV.Storage == nullptr))
             || sourceCxxRetTemp != nullptr
             || (compiler->lastCxxRetTemp_ != nullptr && sourceNV.Storage == compiler->lastCxxRetTemp_)
             || !compiler->IsForeignCxxClassWithConstructors(typeName)
@@ -4954,6 +5170,16 @@ bool MainListener::TryDeclareForeignCxxAutoLocal(CFlatParser::DirectDeclaratorCo
         if (constQualified && compiler->IsCxxRecord(typeName))
             compiler->MarkCxxConstFieldAccess(slot);
 
+        if (xvalue)
+        {
+            compiler->SetCurrentDebugLocation(line);
+            std::string refusal;
+            if (!compiler->EmitCxxXvalueTransfer(typeName, slot, sourceNV.Primary,
+                    sourceNV.TypeAndValue.IsCxxConstRef, false, refusal))
+                LogErrorContext(assign != nullptr ? static_cast<antlr4::ParserRuleContext*>(assign)
+                                                  : direct, refusal);
+            return true;
+        }
         const std::string srcText = assign != nullptr ? assign->getText() : std::string();
         const bool explicitMove = sourceNV.TypeAndValue.IsMove || sourceNV.IsExplicitMove;
         const bool implicitLastUse = !explicitMove
@@ -4964,16 +5190,26 @@ bool MainListener::TryDeclareForeignCxxAutoLocal(CFlatParser::DirectDeclaratorCo
             && compiler->FindCxxCopyCtor(typeName) == nullptr
             && compiler->FindCxxMoveCtor(typeName) != nullptr;
         compiler->SetCurrentDebugLocation(line);
-        compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, sourceNV.Storage,
-                                             explicitMove || implicitLastUse || onlyMovable
-                                                 || rvalueJoin,
-                                             std::format("into local '{}'", name).c_str());
+        // A named source is consumed (still destroyed at its own scope exit, as for the typed
+        // `T x = move u;`). An indirect source stays with its owner, as in C++.
+        const std::string srcName = !sourceNV.CallerName.empty() ? sourceNV.CallerName
+            : explicitMove && srcText.starts_with("move") ? srcText.substr(4) : srcText;
+        const bool constSource = explicitMove && compiler->CxxConstReceiverKind(sourceNV) != 0;
+        if (explicitMove && compiler->CxxExplicitMoveNeedsTransfer(typeName, constSource, false))
+        {
+            std::string refusal;
+            if (!compiler->EmitCxxExplicitMoveTransfer(typeName, slot, sourceNV.Storage,
+                    constSource, false, srcName, refusal))
+                LogErrorContext(assign != nullptr ? static_cast<antlr4::ParserRuleContext*>(assign)
+                                                  : direct, refusal);
+        }
+        else
+            compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, sourceNV.Storage,
+                                                 explicitMove || implicitLastUse || onlyMovable
+                                                     || rvalueJoin,
+                                                 std::format("into local '{}'", name).c_str());
         if (explicitMove || implicitLastUse)
         {
-            // A named source is consumed (still destroyed at its own scope exit, as for the typed
-            // `T x = move u;`). An indirect source stays with its owner, as in C++.
-            const std::string srcName = !sourceNV.CallerName.empty() ? sourceNV.CallerName
-                : explicitMove && srcText.starts_with("move") ? srcText.substr(4) : srcText;
             auto* named = IsBareIdentifierText(srcName) ? compiler->FindLiveNamedVariable(srcName)
                                                         : nullptr;
             if (named != nullptr && named->Storage == sourceNV.Storage)
@@ -5918,6 +6154,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // C++ pointee const of a pointer initializer: `auto p = constPtrResult();` keeps it
                 // for C++ overload ranking, as C++ deduces `const T*`.
                 bool srcCxxPointeeConst = false;
+                // `auto v = cxxReturnsNullptrT();` keeps the std::nullptr_t identity, as C++ deduces.
+                bool srcCxxNullptrT = false;
                 // Fixed-array shape of the initializer (`int[3] a` -> 3). Drives the `auto`
                 // array-view deduction and the fixed-array-to-fixed-array copy below.
                 uint64_t srcConstArraySize = 0;
@@ -6366,7 +6604,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && !typeAndValue.Pointer && !global_scope
                                     && assignmentExpression->conditionalExpression() != nullptr
                                     && assignmentExpression->conditionalExpression()->Question() != nullptr;
+                                if (typeAndValue.TypeName == "auto" && !typeAndValue.Pointer
+                                    && !typeAndValue.IsAlias && !global_scope)
+                                    trivialCxxMoveSite_ = TopLevelMoveExpression(assignmentExpression);
                                 auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
+                                trivialCxxMoveSite_ = nullptr;
                                 autoDeclTernaryInit_ = false;
                                 if (compiler->lastCxxRetTemp_ != nullptr
                                     && rightNV.Storage == compiler->lastCxxRetTemp_
@@ -6392,6 +6634,40 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && compiler->IsOwnedTempValue(rightNV))
                                     srcCxxRetTemp = rightNV.Storage;
                                 ApplyCallResultBorrowProvenance(compiler, rightNV);
+                                // A `T&&` class result (std.move(x)) initializing a T or `auto`
+                                // value is an xvalue: read the referent as a moved-from source.
+                                // A nontrivial class under `auto` is constructed in place by
+                                // TryDeclareForeignCxxAutoLocal instead.
+                                if (!global_scope && !typeAndValue.Pointer && !typeAndValue.IsAlias
+                                    && compiler->IsCxxRvalueRefClassResult(rightNV)
+                                    && !compiler->IsForeignNontrivialCxxClass(
+                                        rightNV.TypeAndValue.TypeName)
+                                    && (typeAndValue.TypeName == "auto"
+                                        || typeAndValue.TypeName == rightNV.TypeAndValue.TypeName))
+                                {
+                                    // A trivially copyable T: clang's selected constructor (a
+                                    // template may win over the trivial copy) builds a temporary
+                                    // whose bytes then initialize the variable.
+                                    std::string refusal;
+                                    const bool constSource = rightNV.TypeAndValue.IsCxxConstRef;
+                                    auto* valueType = compiler->GetType(LLVMBackend::TypeAndValue{
+                                        .TypeName = rightNV.TypeAndValue.TypeName });
+                                    llvm::Value* built = compiler->AllocaAtEntry(valueType, nullptr,
+                                                                                 "xvalue.tmp");
+                                    if (!compiler->EmitCxxXvalueTransfer(
+                                            rightNV.TypeAndValue.TypeName, built, rightNV.Primary,
+                                            constSource, false, refusal))
+                                        LogErrorContext(assignmentExpression, refusal);
+                                    rightNV.Primary = built;
+                                    rightNV.Storage = rightNV.Primary;
+                                    rightNV.Primary = nullptr;
+                                    rightNV.TypeAndValue.Pointer = false;
+                                    rightNV.TypeAndValue.IsRvalueRef = false;
+                                    rightNV.BaseType = compiler->GetType(LLVMBackend::TypeAndValue{
+                                        .TypeName = rightNV.TypeAndValue.TypeName });
+                                    rightNV.IsExplicitMove = false;
+                                    rightNV.IsRvalue = true;
+                                }
                                 initializerSourceNV = rightNV;
                                 haveInitializerSourceNV = true;
                                 if (global_scope)
@@ -6802,6 +7078,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcInferredElemPointer = rightNV.TypeAndValue.ElemPointer;
                                 srcCxxPointeeConst = rightNV.TypeAndValue.IsCxxPointeeConst
                                     && rightNV.TypeAndValue.Pointer;
+                                srcCxxNullptrT = rightNV.TypeAndValue.IsCxxNullptrT;
                                 srcConstArraySize = rightNV.TypeAndValue.ConstArraySize;
                                 srcConstInnerDimensions = rightNV.TypeAndValue.ConstInnerDimensions;
                                 srcIsArrayView = rightNV.TypeAndValue.IsArrayView;
@@ -7527,10 +7804,15 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         typeAndValue.Pointer = srcInferredPointer;
                         typeAndValue.ElemPointer = srcInferredElemPointer;
                         typeAndValue.IsCxxPointeeConst = srcCxxPointeeConst && srcInferredPointer;
+                        typeAndValue.IsCxxNullptrT = srcCxxNullptrT;
                     }
                 }
                 if (typeAndValue.Pointer && srcCxxPointeeConst)
                     typeAndValue.IsCxxPointeeConst = true;
+                // `auto v = nullptr;` declares a std::nullptr_t (C++ deduction), not a void*.
+                if (typeAndValue.TypeName == "auto" && srcInferredTypeName.empty()
+                    && !srcInferredPointer && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(right))
+                    typeAndValue.IsCxxNullptrT = true;
 
                 if (global_scope)
                 {
@@ -10432,7 +10714,9 @@ bool MainListener::EmitLoweredValueIntoSlot(LLVMBackend* compiler, const std::st
         auto* dtor = compiler->GetOrCreateFullDestructor(typeName);
         if (fromTemp)
         {
-            if (dtor != nullptr) compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { source });
+            // The moved-from temporary drops only its C++ fields, never the user destructor.
+            if (auto* shell = compiler->GetOrCreateMovedFromShellDestructor(typeName))
+                compiler->builder->CreateCall(shell->getFunctionType(), shell, { source });
             return true;
         }
         if (!movedDetached) return true;

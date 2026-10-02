@@ -1,0 +1,65 @@
+// CFlat `move x` of a C++ class object is `std::move(x)` (ruling 2026-10-01): clang selects the
+// member, so a deleted move constructor / move assignment is refused with clang's reason instead
+// of silently copying, and a const source selects the copy members. clang++ rejects every leg.
+import cpp "cpp_interop_basic.h";
+
+expect_error("cannot move-construct C++ class 'cppi.XvNoMove' from 'move a' (std::move of a 'cppi.XvNoMove'): clang: call to deleted constructor of 'cppi::XvNoMove'") {
+    cppi.XvNoMove mv_return_deleted() { cppi.XvNoMove a = cppi.XvNoMove(1); return move a; }
+}
+
+// A trivially copyable class with a deleted move: every sink refuses, not only the typed
+// spelling (pre-fix `auto`, return and argument byte-copied it).
+expect_error("cannot move-construct C++ class 'cppi.XvTrivialNoMove' from 'move a' (std::move of a 'cppi.XvTrivialNoMove'): clang: call to deleted constructor of 'cppi::XvTrivialNoMove'") {
+    cppi.XvTrivialNoMove mv_return_trivial_deleted() { cppi.XvTrivialNoMove a = cppi.XvTrivialNoMove(1); return move a; }
+}
+
+extern int main()
+{
+    expect_error("cannot move-construct C++ class 'cppi.XvTrivialNoMove' from 'move a' (std::move of a 'cppi.XvTrivialNoMove'): clang: call to deleted constructor of 'cppi::XvTrivialNoMove'") {
+        cppi.XvTrivialNoMove a = cppi.XvTrivialNoMove(2);
+        auto b = move a;
+    }
+    expect_error("cannot move-construct C++ class 'cppi.XvTrivialNoMove' from 'move a' (std::move of a 'cppi.XvTrivialNoMove'): clang: call to deleted constructor of 'cppi::XvTrivialNoMove'") {
+        cppi.XvTrivialNoMove a = cppi.XvTrivialNoMove(3);
+        cppi.XvTrivialNoMove b = move a;
+    }
+    expect_error("cannot move-construct C++ class 'cppi.XvTrivialNoMove' from 'move a' (std::move of a 'cppi.XvTrivialNoMove'): clang: call to deleted constructor of 'cppi::XvTrivialNoMove'") {
+        cppi.XvTrivialNoMove a = cppi.XvTrivialNoMove(4);
+        int r = cppi.xv_take_trivial_nomove(move a);
+    }
+    expect_error("cannot move-construct C++ class 'cppi.XvNoMove' from 'move a' (std::move of a 'cppi.XvNoMove'): clang: call to deleted constructor of 'cppi::XvNoMove'") {
+        cppi.XvNoMove a = cppi.XvNoMove(2);
+        cppi.XvNoMove b = move a;
+    }
+    expect_error("cannot move-construct C++ class 'cppi.XvNoMove' from 'move a' (std::move of a 'cppi.XvNoMove'): clang: call to deleted constructor of 'cppi::XvNoMove'") {
+        cppi.XvNoMove a = cppi.XvNoMove(3);
+        auto b = move a;
+    }
+    expect_error("cannot move-assign C++ class 'cppi.XvNoMove' from 'move a' (std::move of a 'cppi.XvNoMove'): clang: overload resolution selected deleted operator '='") {
+        cppi.XvNoMove a = cppi.XvNoMove(4);
+        cppi.XvNoMove b = cppi.XvNoMove(5);
+        b = move a;
+    }
+    expect_error("cannot move-construct C++ class 'cppi.XvNoMove' from 'move a' (std::move of a 'cppi.XvNoMove'): clang: call to deleted constructor of 'cppi::XvNoMove'") {
+        cppi.XvNoMove a = cppi.XvNoMove(6);
+        int r = cppi.xv_take_nomove(move a);
+    }
+    // A const source of a move-only class: only the deleted copy is viable.
+    expect_error("cannot move-construct C++ class 'cppi.XvMoveOnly' from 'move a' (std::move of a const 'cppi.XvMoveOnly'): clang: call to deleted constructor of 'cppi::XvMoveOnly'") {
+        const cppi.XvMoveOnly a = cppi.XvMoveOnly(7);
+        cppi.XvMoveOnly b = move a;
+    }
+    // A const source selects the deleted `const T&&` overload.
+    expect_error("cannot move-assign C++ class 'cppi.XvMultiMove' from 'move a' (std::move of a const 'cppi.XvMultiMove'): clang: overload resolution selected deleted operator '='") {
+        const cppi.XvMultiMove a = cppi.XvMultiMove(8);
+        cppi.XvMultiMove b = cppi.XvMultiMove(9);
+        b = move a;
+    }
+    // Controls: a move-only class moves; XvNoMove copies from a const source.
+    cppi.XvMoveOnly m = cppi.XvMoveOnly(10);
+    cppi.XvMoveOnly n = move m;
+    const cppi.XvNoMove c = cppi.XvNoMove(11);
+    cppi.XvNoMove d = move c;
+    if (n.v != 10 || d.v != 11) return 1;
+    return 0;
+}

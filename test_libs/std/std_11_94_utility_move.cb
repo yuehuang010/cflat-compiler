@@ -1,14 +1,17 @@
 // GUARDS: std::move transfers a unique_ptr without copying its owner
 // FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
-// DISABLED: internal/issue/p2/std-utility-move-cannot-bind.md
 import cpp "memory";
 import cpp "utility";
+import cpp "string";
 extern int main()
 {
     int failures = 0;
     std.unique_ptr<int> p = std.unique_ptr<int>(new int(7));
     std.unique_ptr<int> moved = std.move(p);
     if (p != nullptr || *moved != 7) { printf("FAIL std::move\n"); failures |= 1; }
+    std.string s = std.string("hello");
+    std.string t = std.move(s);
+    if (t != "hello") { printf("FAIL std::move string\n"); failures |= 2; }
     if (failures == 0) printf("PASS std_11_94_utility_move\n");
     return failures;
 }

@@ -1330,6 +1330,46 @@ int sharedGlobal = 42;
 extern int strcmp(const char* a, const char* b);
 int cbAdd(int a, int b) { return a + b; }
 int cbTwice(int x) { return x * 2; }
+// Counts every call that reaches a CFlat callable from C++ (std::function or a deduced F).
+int cbCallableCalls = 0;
+int cbCountedTwice(int x) { cbCallableCalls++; return x * 2; }
+// Converting signatures into std.function (clang++ accepts each): widened return, discarded
+// return, widened parameter.
+int cbIncInt(int x) { cbCallableCalls++; return x + 1; }
+int cbIncLong(long x) { cbCallableCalls++; return (int)x + 1; }
+// Explicit generic instantiations named as VALUES (`cbCountedTriple<int>`, `cbgen.quad<int>`).
+T cbCountedTriple<T>(T x) { cbCallableCalls++; return x * 3; }
+namespace cbgen { T quad<T>(T x) { return x * 4; } }
+// A returned lambda and a field initializer take the std.function's signature too.
+std.function<int(int)> bridge_return_lambda()
+{
+    return (int x) => { cbCallableCalls++; return x * 7; };
+}
+struct BridgeFnHolder { std.function<int(int)> fn; };
+// Capturing closures returned as std.function: a literal (its write to `n` persists per call)
+// and a named Lambda<> (the C++ object copies it; the local is destroyed at return).
+std.function<int(int)> bridge_make_adder(int n)
+{
+    return (int x) => { n++; return x + n; };
+}
+std.function<int(int)> bridge_make_scaler(int n)
+{
+    Lambda<int(int)> l = (int x) => { return x * n; };
+    return l;
+}
+// An owning-return generic bound to function<>: the result stays owned (destroyed once).
+int cbBoxDestroyed = 0;
+struct CbBox { int x = 0; ~CbBox() { cbBoxDestroyed++; } };
+move CbBox* cbMakeBox<T>(T x) { CbBox* b = new CbBox(); b->x = (int)x; return b; }
+namespace cbgen { move CbBox* makeBox<T>(T x) { CbBox* b = new CbBox(); b->x = (int)x + 1; return b; } }
+int cbRunMakeBox()
+{
+    function<CbBox*(int)> f = cbMakeBox<int>;
+    CbBox* b = f(7);
+    function<CbBox*(int)> g = cbgen.makeBox<int>;
+    CbBox* c = g(7);
+    return b->x * 10 + c->x;
+}
 
 // Callables handed to C++ through std::function.
 int stdfn_twice(int x) { return x * 2; }
@@ -2194,6 +2234,158 @@ int bridge_tracked_range_balanced()
     if (cpptw.tracked_range_bad_dtor_count() != 0) return 0;
     if (cpptw.tracked_range_live_count() != 0) return 0;
     return 1;
+}
+
+// [stmt.ranged] lookup (cpp_interop_twin.h): free begin/end by ADL when the class has no
+// begin/end member, members when it has one, and a view-shaped PRIVATE nested iterator.
+// Expected values come from the same loops compiled by clang++ -std=c++20.
+int bridge_range_free_tracked()
+{
+    cpptw.FreeTrackedRange values = default;
+    int sum = 0;
+    for (int x in values) sum = sum + x;
+    return sum;
+}
+
+int bridge_range_free_tracked_break()
+{
+    cpptw.FreeTrackedRange values = default;
+    int sum = 0;
+    for (int x in values)
+    {
+        sum = sum + x;
+        if (x == 4) break;
+    }
+    return sum;
+}
+
+int bridge_range_self_iter_int()
+{
+    cpptw.SelfRangeIter entries = cpptw.SelfRangeIter(3, 6);
+    int sum = 0;
+    for (int v in entries) sum = sum + v;
+    return sum;
+}
+
+int bridge_range_self_iter_auto()
+{
+    cpptw.SelfRangeIter entries = cpptw.SelfRangeIter(3, 6);
+    int sum = 0;
+    for (auto v in entries) sum = sum + v;
+    return sum;
+}
+
+int bridge_range_self_iter_alias()
+{
+    cpptw.SelfRangeIter entries = cpptw.SelfRangeIter(3, 6);
+    int sum = 0;
+    for (alias int v in entries) sum = sum + v;
+    return sum;
+}
+
+int bridge_range_self_iter_temporary()
+{
+    int sum = 0;
+    for (int v in cpptw.SelfRangeIter(1, 3)) sum = sum + v;
+    return sum;
+}
+
+int bridge_range_friend_begin_end()
+{
+    cpptw.FriendRange values = default;
+    int sum = 0;
+    for (int v in values) sum = sum + v;
+    return sum;
+}
+
+int bridge_range_member_wins()
+{
+    cpptw.MemberWinsRange values = default;
+    int sum = 0;
+    for (int v in values) sum = sum + v;
+    return sum;
+}
+
+int bridge_range_begin_only_member()
+{
+    cpptw.BeginOnlyRange values = default;
+    int sum = 0;
+    for (int v in values) sum = sum + v;
+    return sum;
+}
+
+int bridge_range_end_only_member()
+{
+    cpptw.EndOnlyRange values = default;
+    int sum = 0;
+    for (int v in values) sum = sum + v;
+    return sum;
+}
+
+cpptw.ValueCategoryRange bridge_make_value_category_range()
+{
+    return cpptw.ValueCategoryRange();
+}
+
+int bridge_range_temporary_lvalue_overload()
+{
+    int sum = 0;
+    for (int v in cpptw.ValueCategoryRange()) sum = sum + v;
+    return sum;
+}
+
+int bridge_range_returned_lvalue_overload()
+{
+    int sum = 0;
+    for (int v in bridge_make_value_category_range()) sum = sum + v;
+    return sum;
+}
+
+int bridge_range_global_namespace_adl()
+{
+    GlobalScopeRange values = default;
+    int sum = 0;
+    for (int v in values) sum = sum + v;
+    return sum;
+}
+
+// Binding a private nested iterator must not relax access for the decisions its members make.
+int bridge_private_iter_access_probe()
+{
+    cpptw.AccessProbeSeq<int> values = cpptw.AccessProbeSeq<int>();
+    auto it = values.begin();
+    return it.requires_result() * 1000 + it.ctor_result() * 100 + it.sfinae_result() * 10
+        + it.noexcept_result() + cpptw.access_probe_later<long>() * 10000;
+}
+
+int bridge_range_private_iter_int()
+{
+    cpptw.PrivateIterSeq<int> values = cpptw.PrivateIterSeq<int>(1, 4);
+    int sum = 0;
+    for (int v in values) sum = sum + v;
+    return sum;
+}
+
+int bridge_range_private_iter_auto()
+{
+    cpptw.PrivateIterSeq<int> values = cpptw.PrivateIterSeq<int>(1, 4);
+    int sum = 0;
+    for (auto v in values) sum = sum + v;
+    return sum;
+}
+
+int bridge_range_private_iter_manual()
+{
+    cpptw.PrivateIterSeq<int> values = cpptw.PrivateIterSeq<int>(2, 5);
+    int sum = 0;
+    auto it = values.begin();
+    auto last = values.end();
+    while (it != last)
+    {
+        sum = sum + *it;
+        it++;
+    }
+    return sum;
 }
 
 BridgeConditionalBox bridge_opaque_return(int value);
@@ -3149,6 +3341,27 @@ extern int main(int argc, char** argv)
     bridge_check("range-for tracked temporary value", bridge_tracked_range_temporary(), 15);
     bridge_check("range-for tracked temporary resources", bridge_tracked_range_balanced(), 1);
     bridge_check("range-for custom prvalue by value", bridge_range_prvalue_by_value(), 3);
+    cpptw.reset_tracked_range_counts();
+    bridge_check("range-for free begin/end value", bridge_range_free_tracked(), 12);
+    bridge_check("range-for free begin/end resources", bridge_tracked_range_balanced(), 1);
+    cpptw.reset_tracked_range_counts();
+    bridge_check("range-for free begin/end break value", bridge_range_free_tracked_break(), 6);
+    bridge_check("range-for free begin/end break resources", bridge_tracked_range_balanced(), 1);
+    bridge_check("range-for by-value free begin int", bridge_range_self_iter_int(), 12);
+    bridge_check("range-for by-value free begin auto", bridge_range_self_iter_auto(), 12);
+    bridge_check("range-for by-value free begin alias", bridge_range_self_iter_alias(), 12);
+    bridge_check("range-for by-value free begin temporary", bridge_range_self_iter_temporary(), 3);
+    bridge_check("range-for hidden friend begin/end", bridge_range_friend_begin_end(), 15);
+    bridge_check("range-for member begin/end beats free", bridge_range_member_wins(), 30);
+    bridge_check("range-for private nested iterator int", bridge_range_private_iter_int(), 6);
+    bridge_check("range-for private nested iterator auto", bridge_range_private_iter_auto(), 6);
+    bridge_check("private nested iterator stepped by hand", bridge_range_private_iter_manual(), 9);
+    bridge_check("range-for begin member only uses free pair", bridge_range_begin_only_member(), 6);
+    bridge_check("range-for end member only uses free pair", bridge_range_end_only_member(), 6);
+    bridge_check("range-for temporary binds begin(R&)", bridge_range_temporary_lvalue_overload(), 6);
+    bridge_check("range-for returned value binds begin(R&)", bridge_range_returned_lvalue_overload(), 6);
+    bridge_check("range-for global-namespace class by ADL", bridge_range_global_namespace_adl(), 11);
+    bridge_check("private iterator keeps access checks", bridge_private_iter_access_probe(), 0);
 
     // ---- generic CFlat-defined [cpp] structs ----------------------------------------------------
     cppt.tplbase.reset_holder_int_dtors();
@@ -3219,6 +3432,123 @@ extern int main(int argc, char** argv)
     using F = std.function<int(int)>;
     F revFAlias = std.function<int(int)>(cbTwice);
     if (revFAlias(7) != 14)                         return 615;
+
+    // ---- a CFlat callable crossing into C++: std::function target and deduced F ----------------
+    // Pre-fix none of these compiled: "cannot infer the return type of lambda" (no signature
+    // reached the lambda), "cannot initialize C++ class" (function name), "an argument type
+    // cannot be spelled in C++" (deduced F). Values and the call count match clang++ -std=c++20
+    // on the same calls with C++ lambdas / function names.
+    cbCallableCalls = 0;
+    std.function<int(int)> revFLambda = (int x) => { cbCallableCalls++; return x + 3; };
+    if (revFLambda(4) != 7)                         return 620;
+    std.function<int(int)> revFCtorLambda =
+        std.function<int(int)>((int x) => { cbCallableCalls++; return x * 5; });
+    if (revFCtorLambda(2) != 10)                    return 621;
+    std.function<int(int)> revFName = cbCountedTwice;
+    if (revFName(8) != 16)                          return 622;
+    if (cppi.apply_fn((int x) => { cbCallableCalls++; return x - 1; }, 5) != 4) return 623;
+    function<int(int)> revThin = (int x) => { cbCallableCalls++; return x + 1; };
+    if (cppi.apply_n(revThin, 4) != 10)             return 624;   // F&& from a function<> value
+    if (cppi.apply_n(cbCountedTwice, 3) != 6)       return 625;   // F&& from a function name
+    if (cppi.apply_copy(revThin, 5) != 12)          return 626;   // by-value F, copied once
+    if (cppi.apply_n(revFLambda, 2) != 7)           return 627;   // std.function lvalue as F
+    std.function<int(int)> revFReturned = bridge_return_lambda();
+    if (revFReturned(3) != 21)                      return 629;
+    BridgeFnHolder revFHolder = { fn = (int x) => { cbCallableCalls++; return x + 50; } };
+    if (revFHolder.fn(1) != 51)                     return 630;
+    if (cbCallableCalls != 17)                      return 628;
+    // A generic instantiation named as a value binds like a function name. Pre-fix: "cannot
+    // initialize C++ class" (declarator), compiler crash in Upconvert (explicit constructor),
+    // "could not be bound" (deduced F), "does not name a value here" (namespaced). Values and call
+    // count match clang++ -std=c++20 with dbl<int>-style template-ids.
+    cbCallableCalls = 0;
+    std.function<int(int)> revFGeneric = cbCountedTriple<int>;
+    if (revFGeneric(2) != 6)                        return 631;
+    std.function<int(int)> revFGenericCtor = std.function<int(int)>(cbCountedTriple<int>);
+    if (revFGenericCtor(3) != 9)                    return 632;
+    if (cppi.apply_n(cbCountedTriple<int>, 3) != 9) return 633;   // F&& from a template-id
+    if (cppi.apply_copy(cbCountedTriple<int>, 2) != 12) return 634;
+    std.function<int(int)> revFGenericNs = cbgen.quad<int>;
+    if (revFGenericNs(5) != 20)                     return 635;
+    if (cbCallableCalls != 7)                       return 636;
+    // Owning return through a function<> bound to a generic (bare and namespaced): value and one
+    // destructor each. Pre-fix (round 1) the hidden out-pointer was null (SIGSEGV).
+    cbBoxDestroyed = 0;
+    if (cbRunMakeBox() != 78)                       return 637;
+    if (cbBoxDestroyed != 2)                        return 638;
+    // A function whose signature converts to the std.function's binds through a converting
+    // thunk. Pre-fix (master) the function was handed over as the TARGET pointer type, so
+    // f(-5) read an int return as long (4294967292) and an int argument as long; values match
+    // clang++ -std=c++20 (-4, -4, discarded return, dbl<int> as long(long) 8).
+    cbCallableCalls = 0;
+    std.function<long(long)> revConvRet = cbIncInt;
+    if (revConvRet(-5) != -4)                       return 639;
+    std.function<void(int)> revConvVoid = cbIncInt;
+    revConvVoid(9);
+    std.function<int(int)> revConvParam = cbIncLong;
+    if (revConvParam(-5) != -4)                     return 640;
+    std.function<long(long)> revConvGeneric = cbCountedTriple<int>;
+    if (revConvGeneric(-3) != -9)                   return 641;
+    std.function<long(long)> revConvCtor = std.function<long(long)>(cbIncInt);
+    if (revConvCtor(-2) != -1)                      return 642;
+    if (cbCallableCalls != 5)                       return 643;
+
+    // ---- a CAPTURING CFlat closure crossing into C++ (N50 ruling) -----------------------------
+    // The closure crosses as a generated __cflat_closure<> object owning (or, for a named closure,
+    // borrowing) the env; its copy/destroy run the CFlat closure copy/dtor. Pre-fix each leg was
+    // refused: "a capturing closure cannot be passed to C++". Values match clang++ -std=c++20 on
+    // the same calls with `[k](int x) mutable {...}` lambdas (a CFlat closure write persists).
+    int capK = 3;
+    std.function<int(int)> capF = (int x) => { capK++; return x + capK; };
+    int capA = capF(1);
+    int capB = capF(1);
+    if (capA != 5 || capB != 6)                     return 644;   // state persists per call
+    std.function<int(int)> capG = capF;                           // std::function copy
+    int capC = capF(1);
+    int capD = capG(1);
+    if (capC != 7 || capD != 7 || capK != 3)        return 645;   // each copy has its own env
+    int capBase = 10;
+    Lambda<int(int)> capH = (int x) => { capBase++; return x + capBase; };
+    std.function<int(int)> capHH = capH;                          // a named closure is copied
+    int capH1 = capHH(1);
+    int capH2 = capHH(1);
+    int capH3 = capH(1);
+    if (capH1 != 12 || capH2 != 13 || capH3 != 12)  return 646;
+    // Deduced F: `F&&` borrows the caller's closure (its writes stay), by-value `F` copies it.
+    if (cppi.apply_n(capH, 3) != 42)                return 647;
+    if (cppi.apply_copy(capH, 5) != 40)             return 648;
+    // An `auto` closure takes the std.function's signature (its invoker must match it).
+    int capHits = 0;
+    int* capHp = &capHits;
+    auto capV = () => { *capHp = *capHp + 1; };
+    std.function<void()> capVV = capV;
+    capVV();
+    capVV();
+    if (capHits != 2)                               return 649;
+    if (cppi.apply_fn((int x) => { return x + capK; }, 5) != 8) return 650;
+    std.function<int(int)> capAdder = bridge_make_adder(10);
+    int capAd1 = capAdder(1);
+    int capAd2 = capAdder(1);
+    if (capAd1 != 12 || capAd2 != 13)               return 651;
+    std.function<int(int)> capScaler = bridge_make_scaler(3);
+    if (capScaler(4) != 12)                         return 652;
+    int capK2 = 7;
+    BridgeFnHolder capHolder = { fn = (int x) => { capK2++; return x + capK2; } };
+    int capHo1 = capHolder.fn(1);
+    int capHo2 = capHolder.fn(1);
+    if (capHo1 != 9 || capHo2 != 10)                return 653;
+    std.function<int(int)> capCtor = std.function<int(int)>((int x) => { return x - capK2; });
+    if (capCtor(10) != 3)                           return 654;
+    // An owning (string) capture crosses with `move`; the env and string are destroyed once each.
+    string capS = "abcdefghijklmnopqrstuvwxyz0123456789";
+    Lambda<int(int)> capL = (int x) => { return x + capS.length(); };
+    std.function<int(int)> capMoved = move capL;
+    std.function<int(int)> capMovedCopy = capMoved;
+    if (capMoved(1) != 37 || capMovedCopy(2) != 38) return 655;
+    if (cppi.apply_fn(capMoved, 3) != 39)           return 656;
+    // `move` into a deduced F: the C++ copy owns its env, the drained local destroys nothing.
+    Lambda<int(int)> capL2 = (int x) => { return x + capS.length(); };
+    if (cppi.apply_copy(move capL2, 1) != 74)       return 657;
     std.vector<char*> revPv = default;
     char* revS = "vector-pointer";
     revPv.push_back(revS);
@@ -3987,6 +4317,18 @@ extern int main(int argc, char** argv)
     if (stdfnM(4) != 9)                                                   return 1917;
     std.function<int(int)> stdfnS = cppfn.Plain.make_scaler(3);
     if (stdfnS(4) != 12)                                                  return 1918;
+    // A std::function nested in a template argument is part of that class type: the parameter
+    // binds as the vector itself, never as the inner std::function.
+    std.vector<std.function<int(int)>> stdfnVec = default;
+    stdfnVec.push_back(std.function<int(int)>(stdfn_twice));
+    stdfnVec.push_back(std.function<int(int)>(stdfn_twice));
+    cppfn.NestedHolder stdfnNested = cppfn.NestedHolder();
+    if (stdfnNested.take_vec(stdfnVec) != 2)                              return 1970;
+    if (cppfn.take_vec_free(stdfnVec) != 3)                               return 1973;
+    auto stdfnVecRet = cppfn.vec_of_fn();
+    if (stdfnVecRet.size() != 0)                                          return 1971;
+    auto stdfnVecGet = stdfnNested.get_vec();
+    if (stdfnVecGet.size() != 0)                                          return 1972;
 
     cppfn.Holder stdfnH = cppfn.Holder();
     stdfn_install(stdfnH);

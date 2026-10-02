@@ -1,6 +1,5 @@
 // GUARDS: std::not_fn wraps a callable and negates its result
 // FROM: internal/plan/std-library-smoke-suite.md (C++17 coverage map)
-// DISABLED: internal/issue/p2/std-not-fn-return-type.md
 import cpp "functional";
 bool is_zero(int x) { return x == 0; }
 extern int main()

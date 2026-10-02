@@ -1993,6 +1993,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.IsCxxRefToPointer) j["crp"] = true;
         if (s.IsCxxConstRef) j["ccr"] = true;
         if (s.IsCxxPointeeConst) j["cpc"] = true;
+        if (s.IsCxxNullptrT) j["cnt"] = true;
         if (s.IsCxxConstField) j["ccf"] = true;
         if (s.IsCxxMutableField) j["cmf"] = true;
         if (s.IsOwningSink)   j["osk"] = true;
@@ -2064,6 +2065,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsCxxRefToPointer = j.value("crp", false);
         s.IsCxxConstRef = j.value("ccr", false);
         s.IsCxxPointeeConst = j.value("cpc", false);
+        s.IsCxxNullptrT = j.value("cnt", false);
         s.IsCxxConstField = j.value("ccf", false);
         s.IsCxxMutableField = j.value("cmf", false);
         s.IsOwningSink = j.value("osk", false);
@@ -2371,6 +2373,9 @@ nlohmann::json LLVMBackend::GlobalToJson(const CGlobalEntry& g)
                 j["cv"] = g.constantValue;
         }
         if (g.isCxxConstexpr) j["cxce"] = true;
+        if (!g.file.empty()) j["fl"] = g.file;
+        if (g.isInternalLinkage) j["il"] = true;
+        if (g.constInitHash != 0) j["ci"] = g.constInitHash;
         return j;
 }
 
@@ -2391,6 +2396,9 @@ LLVMBackend::CGlobalEntry LLVMBackend::GlobalFromJson(const SjVal& j)
         }
         g.constantValue = j.value("cv", (int64_t)0);
         g.isCxxConstexpr = j.value("cxce", false);
+        g.file = j.value("fl", std::string{});
+        g.isInternalLinkage = j.value("il", false);
+        g.constInitHash = j.value("ci", uint64_t{0});
         g.line = j.value("ln", 1);
         g.col  = j.value("co", 0);
         return g;
@@ -2633,11 +2641,13 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
         if (r.hasDefaultCtor)        j["hdc"] = true;
         if (r.hasCopyCtor)           j["hcc"] = true;
         if (r.hasCtorTemplate)       j["hct"] = true;
+        if (r.hasAssignTemplate)     j["hat"] = true;
         if (r.isAggregate)           j["ag"] = true;
         // M6 - inheritance surface. Base offsets drive every derived-to-base adjustment and the
         // abstract/virtual-base gates; a warm cache that lost them would emit unadjusted pointers.
         if (r.hasVirtualBases)       j["hvb"] = true;
         if (r.isAbstract)            j["abs"] = true;
+        if (r.hasFriendOperators)    j["fop"] = true;
         if (!r.layoutRefusal.empty()) j["lref"] = r.layoutRefusal;
         // The canonical C++ spelling: a template argument naming this class needs it, so a warm
         // cache that dropped it would refuse `cppt.Box<cppi.Tracked>` the second time around.
@@ -2728,9 +2738,11 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
         r.hasDefaultCtor        = j.value("hdc", false);
         r.hasCopyCtor           = j.value("hcc", false);
         r.hasCtorTemplate       = j.value("hct", false);
+        r.hasAssignTemplate     = j.value("hat", false);
         r.isAggregate           = j.value("ag", false);
         r.hasVirtualBases       = j.value("hvb", false);
         r.isAbstract            = j.value("abs", false);
+        r.hasFriendOperators    = j.value("fop", false);
         r.layoutRefusal         = j.value("lref", std::string{});
         r.canonicalCtype        = j.value("can", std::string{});
         if (j.contains("bs"))

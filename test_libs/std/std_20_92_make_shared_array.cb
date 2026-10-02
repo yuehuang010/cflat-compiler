@@ -1,6 +1,5 @@
 // GUARDS: C++20 make_shared<T[]> allocation and array element access
 // FROM: internal/plan/std-library-smoke-suite.md (C++20 coverage map)
-// DISABLED: internal/issue/p3/std-make-unique-array.md
 import cpp "memory";
 extern int main()
 {

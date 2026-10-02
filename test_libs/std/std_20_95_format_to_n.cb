@@ -1,6 +1,5 @@
 // GUARDS: C++20 bounded format_to_n output and returned size
 // FROM: internal/plan/std-library-smoke-suite.md (C++20 coverage map)
-// DISABLED: internal/issue/p3/cpp-std-format-to-n-unreachable.md
 import cpp "format";
 import cpp "string";
 extern int main()

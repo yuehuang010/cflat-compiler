@@ -407,27 +407,10 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
 
                     if (typeParams != nullptr && !typeParams->empty())
                     {
-                        std::string parameterNames;
-                        std::string exampleArgs;
-                        for (size_t i = 0; i < typeParams->size(); i++)
-                        {
-                            if (i != 0)
-                            {
-                                parameterNames += ", ";
-                                exampleArgs += ", ";
-                            }
-                            parameterNames += (*typeParams)[i];
-                            exampleArgs += "int";
-                        }
-                        std::string count = std::format("{} type parameter{}", typeParams->size(),
-                            typeParams->size() == 1 ? "" : "s");
                         TypeAndValue displayType;
                         displayType.TypeName = resolvedTypeName;
                         const std::string displayName = SpellType(*this, displayType);
-                        LogErrorMessage("'{}' is a generic type; type arguments are required "
-                            "(expects {}: {}), e.g. {}",
-                            { displayName, count, parameterNames,
-                              displayName + "<" + exampleArgs + ">" });
+                        LogGenericTypeArgsRequired(displayName, *typeParams);
                     }
                     else
                     {
@@ -721,6 +704,15 @@ bool LLVMBackend::IsCxxElementCopySinkRefusal(const std::string& receiverType,
         return false;
 }
 
+bool LLVMBackend::IsCxxRvalueRefClassResult(const NamedVariable& nv) const
+{
+        const TypeAndValue& t = nv.TypeAndValue;
+        if (!t.IsRvalueRef || !t.Pointer || t.ElemPointer || t.IsCxxRefToPointer) return false;
+        if (nv.Storage != nullptr || nv.Primary == nullptr || !nv.Primary->getType()->isPointerTy())
+            return false;
+        return IsCxxRecord(t.TypeName);
+}
+
 bool LLVMBackend::IsCxxRvalueReferenceArgument(const NamedVariable& arg) const
 {
         // Rvalue-ness must be PROVEN. Without argument provenance nothing is proven, and an
@@ -758,6 +750,9 @@ bool LLVMBackend::IsProvenCxxScalarLvalue(const NamedVariable& arg) const
 {
         if (arg.CxxLvalueKind == 0 || arg.CxxLvalueKind == 3 || arg.IsExplicitMove) return false;
         if (IsRvalueReferenceArgument(arg)) return false;
+        // A function<> value crosses into C++ as a function pointer VALUE: the callee gets a
+        // copy of the code address, and the extractor has no mapping for `R (*&)(A)`.
+        if (arg.TypeAndValue.IsThinFnPtr()) return false;
         /*
          * A call is an lvalue only through a `T&` result (its IsRvalue marks the call itself):
          * an alias, or a value loaded from the very pointer the call returned.
@@ -1276,3 +1271,25 @@ std::string LLVMBackend::DescribeCodeValueAsCompoundOperand(const std::string& s
             destIsPointer ? "a code address is not an offset"
                           : "a code address is not a value of that type");
     }
+
+void LLVMBackend::LogGenericTypeArgsRequired(const std::string& displayName,
+                                             const std::vector<std::string>& parameterNames) const
+{
+    std::string names;
+    std::string exampleArgs;
+    for (size_t i = 0; i < parameterNames.size(); ++i)
+    {
+        if (i != 0)
+        {
+            names += ", ";
+            exampleArgs += ", ";
+        }
+        names += parameterNames[i];
+        exampleArgs += "int";
+    }
+    const std::string count = std::format("{} type parameter{}", parameterNames.size(),
+        parameterNames.size() == 1 ? "" : "s");
+    LogErrorMessage("'{}' is a generic type; type arguments are required "
+        "(expects {}: {}), e.g. {}",
+        { displayName, count, names, displayName + "<" + exampleArgs + ">" });
+}

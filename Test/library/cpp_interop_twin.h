@@ -333,4 +333,200 @@ namespace cpptw
         int value() const { return field; }
         void set(int value) { field = value; }
     };
+    /*
+     * [stmt.ranged] lookup shapes. FreeTrackedRange has no begin/end members: its namespace-scope
+     * begin/end are found by argument-dependent lookup only. SelfRangeIter is the
+     * std::filesystem::directory_iterator shape: the iterator is its own range, free begin/end take
+     * it BY VALUE, and end() is a default-constructed iterator. FriendRange's begin/end are hidden
+     * friends. MemberWinsRange has members AND namespace-scope begin/end: the members win.
+     */
+    class FreeTrackedRange
+    {
+    public:
+        FreeTrackedRange() { data_[0] = 2; data_[1] = 4; data_[2] = 6; }
+        int* data() { return data_; }
+
+    private:
+        int data_[3];
+    };
+    inline TrackedRangeIterator begin(FreeTrackedRange& range)
+    {
+        return TrackedRangeIterator(range.data(), range.data() + 3);
+    }
+    inline TrackedRangeIterator end(FreeTrackedRange& range)
+    {
+        return TrackedRangeIterator(range.data() + 3, range.data() + 3);
+    }
+
+    class SelfRangeIter
+    {
+    public:
+        SelfRangeIter() : value_(0), finish_(0) {}
+        SelfRangeIter(int first, int finish) : value_(first), finish_(finish) {}
+        const int& operator*() const { return value_; }
+        SelfRangeIter& operator++()
+        {
+            ++value_;
+            if (value_ == finish_) value_ = finish_ = 0;
+            return *this;
+        }
+
+    private:
+        int value_;
+        int finish_;
+        friend bool operator==(const SelfRangeIter& a, const SelfRangeIter& b)
+        {
+            return a.value_ == b.value_ && a.finish_ == b.finish_;
+        }
+    };
+    inline SelfRangeIter begin(SelfRangeIter iter) { return iter; }
+    inline SelfRangeIter end(SelfRangeIter) { return SelfRangeIter(); }
+
+    class FriendRange
+    {
+    public:
+        FriendRange() { data_[0] = 7; data_[1] = 8; }
+        friend int* begin(FriendRange& range) { return range.data_; }
+        friend int* end(FriendRange& range) { return range.data_ + 2; }
+
+    private:
+        int data_[2];
+    };
+
+    class MemberWinsRange
+    {
+    public:
+        MemberWinsRange() { data_[0] = 10; data_[1] = 20; other_[0] = 1; other_[1] = 2; }
+        int* begin() { return data_; }
+        int* end() { return data_ + 2; }
+        int* other() { return other_; }
+
+    private:
+        int data_[2];
+        int other_[2];
+    };
+    inline int* begin(MemberWinsRange& range) { return range.other(); }
+    inline int* end(MemberWinsRange& range) { return range.other() + 2; }
+
+    /*
+     * A range view's shape: the iterator classes are PRIVATE nested classes of a class template
+     * (filter_view::__iterator, transform_view::__iterator<Const>), so no code outside the view
+     * can name them. Equality is a hidden friend; != is the C++20 rewrite of ==.
+     */
+    template <class T>
+    class PrivateIterSeq
+    {
+        template <bool Const>
+        class Iter
+        {
+        public:
+            explicit Iter(T value) : value_(value) {}
+            T operator*() const { return Const ? value_ * 100 : value_; }
+            Iter& operator++() { ++value_; return *this; }
+            friend bool operator==(const Iter& a, const Iter& b) { return a.value_ == b.value_; }
+
+        private:
+            T value_;
+        };
+
+    public:
+        PrivateIterSeq(T first, T last) : first_(first), last_(last) {}
+        Iter<false> begin() { return Iter<false>(first_); }
+        Iter<false> end() { return Iter<false>(last_); }
+        Iter<true> begin() const { return Iter<true>(first_); }
+        Iter<true> end() const { return Iter<true>(last_); }
+
+    private:
+        T first_;
+        T last_;
+    };
+    // [stmt.ranged] uses members only when BOTH begin and end are members: one member name
+    // alone still iterates through the namespace-scope pair (ADL).
+    struct BeginOnlyRange
+    {
+        int values[2] = { 2, 4 };
+        int* begin() { return values; }
+    };
+    inline int* begin(BeginOnlyRange& range) { return range.values; }
+    inline int* end(BeginOnlyRange& range) { return range.values + 2; }
+    struct EndOnlyRange
+    {
+        int values[2] = { 2, 4 };
+        int* end() { return values + 2; }
+    };
+    inline int* begin(EndOnlyRange& range) { return range.values; }
+    inline int* end(EndOnlyRange& range) { return range.values + 2; }
+
+    // __range is a named reference: a temporary collection still selects begin(R&), not R&&.
+    struct ValueCategoryRange
+    {
+        int values[3] = { 1, 2, 3 };
+    };
+    inline int* begin(ValueCategoryRange& range) { return range.values; }
+    inline int* begin(ValueCategoryRange&& range) { return range.values + 1; }
+    inline int* end(ValueCategoryRange& range) { return range.values + 3; }
+    inline int* end(ValueCategoryRange&& range) { return range.values + 3; }
+
+    // A private nested iterator whose members evaluate access-dependent template decisions on
+    // a private member and a private constructor: binding the iterator must not make them pass.
+    template <class T>
+    class AccessProbeSecret
+    {
+        AccessProbeSecret() {}
+        int hidden() { return 7; }
+    };
+    template <class T>
+    concept AccessProbeReachable = requires(T& t) { t.hidden(); };
+    template <class T>
+    class AccessProbeSeq
+    {
+        template <bool B>
+        class Iter
+        {
+            int n_;
+
+        public:
+            Iter() : n_(1) {}
+            int requires_result() const noexcept(AccessProbeReachable<AccessProbeSecret<Iter>>)
+            {
+                return AccessProbeReachable<AccessProbeSecret<Iter>>;
+            }
+            int ctor_result() const noexcept(__is_constructible(AccessProbeSecret<Iter>))
+            {
+                return __is_constructible(AccessProbeSecret<Iter>);
+            }
+            int noexcept_result() const { return noexcept(requires_result()); }
+            template <class U>
+            static constexpr auto sfinae(U* u, int) -> decltype(u->hidden(), bool()) { return true; }
+            template <class U>
+            static constexpr bool sfinae(U*, ...) { return false; }
+            int sfinae_result() const noexcept(sfinae((AccessProbeSecret<Iter>*)nullptr, 0))
+            {
+                return sfinae((AccessProbeSecret<Iter>*)nullptr, 0);
+            }
+        };
+
+    public:
+        AccessProbeSeq() {}
+        Iter<false> begin() { return Iter<false>(); }
+    };
+    template <class T>
+    int access_probe_later() { return AccessProbeReachable<AccessProbeSecret<T>>; }
+
+    // begin/end at GLOBAL scope are not associated with cpptw: range-for must not find them.
+    struct OrdinaryLookupRange
+    {
+        int values[2] = { 3, 7 };
+    };
 }
+
+// Global-scope begin/end: ordinary unqualified lookup would find these, [stmt.ranged] does not
+// (cpptw::OrdinaryLookupRange). GlobalScopeRange lives in the global namespace, so ADL does.
+inline int* begin(cpptw::OrdinaryLookupRange& range) { return range.values; }
+inline int* end(cpptw::OrdinaryLookupRange& range) { return range.values + 2; }
+struct GlobalScopeRange
+{
+    int values[2] = { 5, 6 };
+};
+inline int* begin(GlobalScopeRange& range) { return range.values; }
+inline int* end(GlobalScopeRange& range) { return range.values + 2; }

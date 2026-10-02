@@ -1,6 +1,5 @@
 // GUARDS: chrono duration_cast across distinct duration periods
 // FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
-// DISABLED: internal/issue/p2/std-chrono-duration-cast.md
 import cpp "chrono";
 extern int main()
 {

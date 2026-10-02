@@ -1371,6 +1371,62 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
         return fn;
     }
 
+/*
+ * Destruction of a lowered struct after EmitLoweredMemberwiseMove moved it out: its CFlat leaves
+ * were nulled, so only the moved-from C++ objects remain to destroy. The user ~T is NOT run - the
+ * value's ownership went with the move, as a plain CFlat struct moved out of a return or a
+ * temporary never runs its destructor on the husk. Null when nothing needs destroying.
+ */
+llvm::Function* LLVMBackend::GetOrCreateMovedFromShellDestructor(const std::string& typeName)
+{
+        if (!IsLoweredCFlatOnlyStruct(typeName)) return GetOrCreateFullDestructor(typeName);
+        const std::string cacheKey = typeName + "#shell";
+        if (auto it = fullDestructorCache_.find(cacheKey); it != fullDestructorCache_.end())
+            return it->second;
+        auto dsIt = dataStructures.find(typeName);
+        if (dsIt == dataStructures.end() || dsIt->second.StructType == nullptr) return nullptr;
+        if (!fullDestructorInProgress_.insert(cacheKey).second) return nullptr;
+        std::vector<std::pair<unsigned, llvm::Function*>> work;
+        for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
+        {
+            const auto& f = dsIt->second.StructFields[i];
+            if (f.IsAlias || f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd
+                || f.IsBitfield || f.IsPadding)
+                continue;
+            llvm::Function* dtor = nullptr;
+            if (IsCxxRecord(f.TypeName))
+                dtor = GetOrCreateFullDestructor(f.TypeName);
+            else if (IsLoweredCFlatOnlyStruct(f.TypeName))
+                dtor = GetOrCreateMovedFromShellDestructor(f.TypeName);
+            if (dtor != nullptr) work.push_back({ i, dtor });
+        }
+        fullDestructorInProgress_.erase(cacheKey);
+        dsIt = dataStructures.find(typeName);
+        if (work.empty() || dsIt == dataStructures.end()) return nullptr;
+
+        auto* structTy = dsIt->second.StructType;
+        auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(*context),
+                                             { cflat_llvm::PointerTo(structTy) }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                          typeName + ".dtorshell", *module);
+        fn->arg_begin()->setName("self");
+        fullDestructorCache_[cacheKey] = fn;
+        auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
+        llvm::IRBuilder<> b(entry);
+        auto* self = &*fn->arg_begin();
+        for (const auto& [index, dtor] : work)
+        {
+            const unsigned element = CxxFieldElementIndex(dsIt->second, index);
+            auto* fieldPtr = CreateCxxFieldGEP(b, dsIt->second, self, index, "fld");
+            auto* fieldTy = element == std::numeric_limits<unsigned>::max()
+                ? GetType(dsIt->second.StructFields[index])
+                : structTy->getElementType(element);
+            EmitFullDestructorOverStorage(b, fieldPtr, fieldTy, dtor);
+        }
+        b.CreateRetVoid();
+        return fn;
+}
+
 void LLVMBackend::EmitCflatOwnedFieldsDestruction(llvm::IRBuilder<>& b,
                                                    const std::string& typeName,
                                                    llvm::Value* self)
@@ -2019,6 +2075,19 @@ bool LLVMBackend::TypeHasMember(const std::string& typeName, const std::string& 
         return GetWinrtSlot(typeName, memberName) != nullptr;
     }
 
+bool LLVMBackend::IsCxxStaticMethod(const std::string& typeName, const std::string& memberName,
+                                    bool staticOnly)
+{
+        EnsureCxxMemberProjected(typeName, memberName);
+        const CxxClassInfo* info = GetCxxClassInfo(typeName);
+        auto has = [&](const std::vector<std::string>& names) {
+            return std::find(names.begin(), names.end(), memberName) != names.end();
+        };
+        return info != nullptr && has(info->staticMethodNames)
+            && !(staticOnly && has(info->instanceMethodNames))
+            && GetFunction(typeName + "." + memberName) != nullptr;
+    }
+
 bool LLVMBackend::HasOnlyCxxDefaultWrappers(const std::string& typeName,
                                             const std::string& memberName,
                                             bool isStatic) const
@@ -2247,6 +2316,59 @@ llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeNa
         return fn;
     }
 
+/*
+ * i8* __closure_env_move(i8** slot): move the env in *slot out, returning the env for the
+ * destination; *slot keeps a valid moved-from env. Null or borrowed (untagged): shared as is.
+ * Scalar-only env (null cleanup): the destination gets a clone, the source keeps its env.
+ * Otherwise the destination takes the env and the source gets a byte copy on which the
+ * per-closure cleanup fn runs MOVE (mode 2) field by field (scalars kept, owning fields nulled
+ * in the source, captured closures moved recursively).
+ */
+llvm::Function* LLVMBackend::GetOrCreateClosureEnvMove()
+{
+        if (llvm::Function* existing = module->getFunction("__closure_env_move")) return existing;
+        llvm::Function* envNew = GetFunction("__closure_env_new");
+        if (envNew == nullptr) return nullptr;
+        auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
+        auto* fnTy = llvm::FunctionType::get(i8PtrTy, { cflat_llvm::PointerTo(i8PtrTy) }, false);
+        // weak_odr: modules that each emitted it (core cache, C++ wrappers) merge to one.
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::WeakODRLinkage,
+                                          "__closure_env_move", *module);
+        auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
+        auto* share = llvm::BasicBlock::Create(*context, "share", fn);
+        auto* owned = llvm::BasicBlock::Create(*context, "owned", fn);
+        auto* clone = llvm::BasicBlock::Create(*context, "clone", fn);
+        auto* transfer = llvm::BasicBlock::Create(*context, "transfer", fn);
+        llvm::IRBuilder<> b(entry);
+        auto* i64Ty = b.getInt64Ty();
+        auto untag = [&](llvm::Value* tagged) {
+            return b.CreateIntToPtr(b.CreateAnd(b.CreatePtrToInt(tagged, i64Ty),
+                                                b.getInt64(~uint64_t(1))), i8PtrTy);
+        };
+        llvm::Value* slot = fn->getArg(0);
+        llvm::Value* env = b.CreateLoad(i8PtrTy, slot);
+        llvm::Value* bits = b.CreatePtrToInt(env, i64Ty);
+        b.CreateCondBr(b.CreateICmpEQ(b.CreateAnd(bits, 1), b.getInt64(0)), share, owned);
+        b.SetInsertPoint(share);
+        b.CreateRet(env);
+        b.SetInsertPoint(owned);
+        llvm::Value* captures = untag(env);
+        llvm::Value* size = b.CreateLoad(i64Ty, b.CreateConstGEP1_64(b.getInt8Ty(), captures, -16));
+        llvm::Value* cleanup = b.CreateLoad(i8PtrTy, b.CreateConstGEP1_64(b.getInt8Ty(), captures, -8));
+        llvm::Value* fresh = b.CreateCall(envNew->getFunctionType(), envNew, { size, cleanup });
+        llvm::Value* freshCaptures = untag(fresh);
+        b.CreateMemCpy(freshCaptures, llvm::MaybeAlign(1), captures, llvm::MaybeAlign(1), size);
+        b.CreateCondBr(b.CreateICmpEQ(cleanup, llvm::ConstantPointerNull::get(i8PtrTy)), clone, transfer);
+        b.SetInsertPoint(clone);
+        b.CreateRet(fresh);
+        b.SetInsertPoint(transfer);
+        auto* cleanupTy = llvm::FunctionType::get(b.getVoidTy(), { i8PtrTy, i8PtrTy, b.getInt32Ty() }, false);
+        b.CreateCall(cleanupTy, cleanup, { captures, freshCaptures, b.getInt32(2) });
+        b.CreateStore(fresh, slot);
+        b.CreateRet(env);
+        return fn;
+}
+
 llvm::Function* LLVMBackend::GenerateClosureCaptureCleanup(const std::string& name, llvm::StructType* capTy,
         const std::vector<std::pair<unsigned, std::string>>& owningFields)
 {
@@ -2257,14 +2379,47 @@ llvm::Function* LLVMBackend::GenerateClosureCaptureCleanup(const std::string& na
         auto* fnTy = llvm::FunctionType::get(voidTy, { i8PtrTy, i8PtrTy, i32Ty }, false);
         auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, name, module.get());
 
+        // Created first: it may emit its own body, and needs no builder position.
+        llvm::Function* envMove = GetOrCreateClosureEnvMove();
         auto savedIP  = builder->saveIP();
         auto* entry   = llvm::BasicBlock::Create(*context, "entry", fn);
+        auto* notMoveBB = llvm::BasicBlock::Create(*context, "notmove", fn);
+        auto* moveBB  = llvm::BasicBlock::Create(*context, "move", fn);
         auto* cloneBB = llvm::BasicBlock::Create(*context, "clone", fn);
         auto* freeBB  = llvm::BasicBlock::Create(*context, "free", fn);
         builder->SetInsertPoint(entry);
         auto* dstCaps = builder->CreateBitCast(fn->getArg(0), cflat_llvm::PointerTo(capTy), "dstcaps");
+        builder->CreateCondBr(builder->CreateICmpEQ(fn->getArg(2), builder->getInt32(2)),
+                              moveBB, notMoveBB);
+        builder->SetInsertPoint(notMoveBB);
         auto* isClone = builder->CreateICmpEQ(fn->getArg(2), builder->getInt32(1));
         builder->CreateCondBr(isClone, cloneBB, freeBB);
+
+        /*
+         * MOVE: dst (handed over) and src (kept by the moved-from closure) hold the same bytes.
+         * Like a C++ lambda move, field by field: scalars stay in both; an owning value moves to
+         * dst and src's field is left in CFlat's moved-from (null) state; a captured closure
+         * keeps its code in both and moves its own env recursively (__closure_env_move).
+         */
+        builder->SetInsertPoint(moveBB);
+        {
+            auto* srcCaps = builder->CreateBitCast(fn->getArg(1), cflat_llvm::PointerTo(capTy), "srccaps");
+            for (const auto& [idx, tn] : owningFields)
+            {
+                llvm::Type* fieldTy = capTy->getElementType(idx);
+                auto* srcField = builder->CreateStructGEP(capTy, srcCaps, idx);
+                if (fieldTy == GetClosureFatPtrType() && envMove != nullptr)
+                {
+                    auto* srcEnv = builder->CreateStructGEP(capTy->getElementType(idx), srcField, 1);
+                    auto* moved = builder->CreateCall(envMove->getFunctionType(), envMove, { srcEnv });
+                    auto* dstField = builder->CreateStructGEP(capTy, dstCaps, idx);
+                    builder->CreateStore(moved, builder->CreateStructGEP(fieldTy, dstField, 1));
+                    continue;
+                }
+                builder->CreateStore(llvm::Constant::getNullValue(fieldTy), srcField);
+            }
+            builder->CreateRetVoid();
+        }
 
         // CLONE: dst currently aliases src's owning handles (byte copy); replace each with a
         // deep copy so dst owns independent buffers.

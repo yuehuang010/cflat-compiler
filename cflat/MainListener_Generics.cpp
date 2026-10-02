@@ -800,6 +800,7 @@ void MainListener::QueuePendingInstantiation(const std::string& templateName,
             record.originFile = sourceFileName;
             record.originLine = site->getStart()->getLine();
             record.originColumn = site->getStart()->getCharPositionInLine();
+            record.site = site;
         }
         pendingInstantiations.push_back(std::move(record));
     }
@@ -888,17 +889,25 @@ void MainListener::ProcessPendingInstantiations() {
 
             const auto& typeParams = genericStructTypeParams[pending.templateName];
             const auto& valueParams = genericStructValueParams[pending.templateName];
+            const size_t providedTypeArgCount = pending.typeArgs.size();
             // Omitted TRAILING value arguments come from the declared defaults. The mangled name
             // was canonicalized the same way (a spelled default is stripped), so the filled list
             // and the name always describe the same instantiation.
             if (!FillGenericValueDefaults(*Compiler(), pending.templateName,
                                           typeParams.size(), pending.typeArgs)
-                && TemplateHasGenericDefaults(*Compiler(), pending.templateName))
+                && (TemplateHasGenericDefaults(*Compiler(), pending.templateName)
+                    || pending.typeArgs.size() < typeParams.size()))
             {
-                Compiler()->LogError(std::format(
+                std::vector<std::string> parameterNames;
+                if (providedTypeArgCount == 0 && pending.site != nullptr
+                    && NativeTemplateNeedsTypeArgs(pending.templateName, parameterNames))
+                    RejectMissingNativeTemplateTypeArgs(pending.site, pending.templateName, parameterNames);
+                const std::string message = std::format(
                     "generic '{}' expects {} type argument(s), but {} were provided and the "
                     "remaining parameter(s) have no default",
-                    pending.templateName, typeParams.size(), pending.typeArgs.size()));
+                    pending.templateName, typeParams.size(), pending.typeArgs.size());
+                if (pending.site != nullptr) LogErrorContext(pending.site, message);
+                else Compiler()->LogError(message);
                 continue;
             }
 

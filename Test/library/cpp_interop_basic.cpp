@@ -129,6 +129,18 @@ namespace cppi
     int variadic_exact_rank(long x) noexcept { return 2; }
     int variadic_exact_rank_rev(long x) noexcept { return 2; }
     int variadic_exact_rank_rev(int x, ...) noexcept { return 1; }
+    int variadic_pair_rank(int x, ...) noexcept { return 1; }
+    int variadic_pair_rank(long x, ...) noexcept { return 2; }
+    int variadic_pair_rank_rev(long x, ...) noexcept { return 2; }
+    int variadic_pair_rank_rev(int x, ...) noexcept { return 1; }
+    int variadic_conv_rank(int x, ...) noexcept { return 1; }
+    int variadic_conv_rank(int x, double y) noexcept { return 2; }
+    int variadic_ptr_rank(ConstPointerRankValue* value, ...) noexcept { return 1; }
+    int variadic_ptr_rank(ConstPointerRankValue* value, int a) noexcept { return 2; }
+    int variadic_ambig(int x, ...) noexcept { return 1; }
+    int variadic_ambig(long x, int y) noexcept { return 2; }
+    int variadic_ambig_ptr(ConstPointerRankValue* value, ...) noexcept { return 1; }
+    int variadic_ambig_ptr(const ConstPointerRankValue* value, long a) noexcept { return 2; }
     int sum_varargs(int count, ...) noexcept
     {
         va_list args;

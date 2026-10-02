@@ -3337,7 +3337,8 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
                     compiler->ResolveGenericAliasSpelling(baseName, typeArgs, false);
                     baseIdentity = MangleGenericInstance(*compiler, baseName, typeArgs);
                     std::string cxxError;
-                    compiler->TryRequestCxxType(baseName, typeArgs, baseIdentity, cxxError);
+                    compiler->TryRequestCxxType(baseName, typeArgs, baseIdentity, cxxError,
+                                                /*deferIncompleteCodegen*/ true);
                 }
                 else
                     baseIdentity = compiler->ResolveTypeAlias(baseIdentity);
@@ -4084,6 +4085,9 @@ private:
     // it (and clears it) before any operand is parsed, so no nested expression sees it.
     bool autoDeclTernaryInit_ = false;
     bool autoDeclTernaryActive_ = false;
+    // The whole `move x` initializer of an `auto` local / operand of a register return: a
+    // trivially copyable C++ class there is built through clang's pick for std::move(x).
+    CFlatParser::MoveExpressionContext* trivialCxxMoveSite_ = nullptr;
     struct CallArgumentScope {
         bool& slot;
         int& ternaryDepth;
@@ -4165,6 +4169,7 @@ private:
     // Recursively resolve a typeParameterEntry to its mangled string,
     // applying activeTypeSubstitutions and handling nested generics like Box<Box<T>>.
     std::string ResolveTypeArgEntry(CFlatParser::TypeParameterEntryContext* entry);
+    std::string ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntryContext* entry);
 
     // Queue a generic instantiation for a known template (dedup via instantiatedGenerics).
     // For struct/class templates the struct shell + default-ctor declaration are created
@@ -6351,6 +6356,21 @@ public:
         const std::function<LLVMBackend::TypedValue(size_t)>& parseOperand,
         size_t operandCount);
 
+    // > 0 while a C++20 rewrite re-enters TryBinaryOperatorOverload; the ADL infix request is
+    // made only for the operator as written, where clang applies the rewrites itself.
+    int cxxOperatorRewriteDepth_ = 0;
+    // > 0 while a compound assignment tries CFlat's `a = a op b` desugaring: that fallback keeps
+    // the registered-operator / builtin-conversion resolution and never asks clang.
+    int cxxAdlSuppressDepth_ = 0;
+    struct AdlSuppressScope
+    {
+        int* depth = nullptr;
+        AdlSuppressScope(int& d, bool active) { if (active) { depth = &d; ++d; } }
+        ~AdlSuppressScope() { Release(); }
+        void Release() { if (depth != nullptr) { --*depth; depth = nullptr; } }
+        AdlSuppressScope(const AdlSuppressScope&) = delete;
+        AdlSuppressScope& operator=(const AdlSuppressScope&) = delete;
+    };
     llvm::Value* TryBinaryOperatorOverload(
         llvm::Value* lvalue, const std::string& op, llvm::Value* rvalue,
         antlr4::ParserRuleContext* ctx, llvm::Type* lhsElemType = nullptr,
@@ -7453,6 +7473,10 @@ public:
     void LogErrorContext(antlr4::tree::TerminalNode* ctx, std::string errorMessage);
 
     void LogErrorContext(antlr4::ParserRuleContext* ctx, std::string errorMessage);
+    bool NativeTemplateNeedsTypeArgs(const std::string& spelledBase,
+                                    std::vector<std::string>& parameterNames);
+    void RejectMissingNativeTemplateTypeArgs(antlr4::ParserRuleContext* site,
+        const std::string& spelledBase, const std::vector<std::string>& parameterNames);
 
     void LogCxxErrorContext(antlr4::ParserRuleContext* ctx, const std::string& errorMessage)
     {

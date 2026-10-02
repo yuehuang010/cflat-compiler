@@ -376,20 +376,22 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
 
         const auto rawAnnotations = ExtractAnnotations(ctx->annotationList());
         const auto baseClauses = BaseClauseIdentifiers(ctx);
+        const bool hasCppAnnotation = std::any_of(rawAnnotations.begin(), rawAnnotations.end(),
+            [](const auto& ann) { return ann.Name == "cpp"; });
         if (baseClauses.size() > 1)
         {
             Compiler(ctx)->LogErrorMessage("multiple bases are not supported yet");
             return;
         }
         const bool hasCppBase = !baseClauses.empty();
-        const bool isCppStruct = hasCppBase
-            || std::any_of(rawAnnotations.begin(), rawAnnotations.end(),
-                           [](const auto& ann) { return ann.Name == "cpp"; });
+        const bool isCppStruct = hasCppBase || hasCppAnnotation;
 
         // A generic template is stored without emitting a C++ class. Its concrete instantiation
         // carries the substitutions and nameOverride used by the generated class path below.
         if (nameOverride.empty() && ctx->genericTypeParameters() != nullptr)
         {
+            if (ctx->genericTypeParameters()->typeParameterList()->typeParameterEntry().empty())
+                LogErrorContext(ctx, "generic definition needs at least one type parameter");
             if (Compiler()->gts.scannedGenericInterfaceNames.count(structName) != 0
                 || genericInterfaceTemplates.count(structName) != 0)
                 LogErrorContext(ctx, std::format(
@@ -438,6 +440,25 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             {
                 for (auto* entry : generic->typeParameterList()->typeParameterEntry())
                     typeArgs.push_back(ResolveTypeArgEntry(entry));
+                for (const std::string& rawArg : typeArgs)
+                {
+                    const std::string arg = compiler->ResolveTypeAlias(rawArg);
+                    std::string cxxArgSpelling;
+                    if (arg == structName && !hasCppAnnotation)
+                    {
+                        Compiler(ctx)->LogErrorMessage(
+                            "C++ template base '{}' uses CFlat type '{}'; declare it as a '[cpp] struct' to use it as a C++ template argument",
+                            { baseSpelling, arg });
+                        return;
+                    }
+                    if (compiler->CxxSpellingForCflatType(arg, cxxArgSpelling)
+                        || (!compiler->IsKnownTypeName(arg) && arg != structName))
+                        continue;
+                    Compiler(ctx)->LogErrorMessage(
+                        "C++ template base '{}' uses CFlat type '{}'; declare it as a '[cpp] struct' to use it as a C++ template argument",
+                        { baseSpelling, arg });
+                    return;
+                }
                 // A C++ alias template substitutes into its own argument pattern; the request
                 // must then name the TARGET, because the arguments are now the target's.
                 std::string aliasError;
@@ -460,7 +481,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             compiler->RecordCppStructBase(structName, cppBaseName);
             std::string baseError;
             if (baseSpelling.empty()
-                || !compiler->TryRequestCxxType(baseRequestName, typeArgs, cppBaseName, baseError)
+                || !compiler->TryRequestCxxType(baseRequestName, typeArgs, cppBaseName, baseError,
+                                                /*deferIncompleteCodegen*/ true)
                 || !compiler->IsCxxRecord(cppBaseName))
             {
                 Compiler(ctx)->LogErrorMessage(
@@ -1677,6 +1699,10 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 // monomorphized body resolves the owner's fields like any other member.
                 if (func->genericTypeParameters() != nullptr)
                 {
+                    if (func->genericTypeParameters()->typeParameterList()
+                        ->typeParameterEntry().empty())
+                        LogErrorContext(func->genericTypeParameters(),
+                            "generic definition needs at least one type parameter");
                     std::string qualifiedName = structName + "." + funcName;
                     genericFunctionTemplates[qualifiedName] = func;
                     // Declaring NAMESPACE of the owner, recorded not derived: the key's last dot
@@ -3953,6 +3979,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         // If this is a generic template definition (not an instantiation), store it and return.
         if (nameOverride.empty() && ctx->genericTypeParameters() != nullptr)
         {
+            if (ctx->genericTypeParameters()->typeParameterList()->typeParameterEntry().empty())
+                LogErrorContext(ctx, "generic definition needs at least one type parameter");
             if (Compiler()->gts.scannedGenericInterfaceNames.count(structName) != 0
                 || genericInterfaceTemplates.count(structName) != 0)
                 LogErrorContext(ctx, std::format(

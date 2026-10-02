@@ -736,6 +736,17 @@ namespace
         {
             std::vector<const clang::FunctionDecl*> found;
             bool shouldVisitImplicitCode() const { return true; }
+            // Unevaluated operands (decltype in a local typedef - MSVC ppltasks - sizeof, noexcept)
+            // call nothing; instantiating their callee can fire std::declval's static_assert.
+            bool TraverseTypeLoc(clang::TypeLoc, bool = true) { return true; }
+            bool TraverseUnaryExprOrTypeTraitExpr(clang::UnaryExprOrTypeTraitExpr*,
+                                                  DataRecursionQueue* = nullptr) { return true; }
+            bool TraverseCXXNoexceptExpr(clang::CXXNoexceptExpr*,
+                                         DataRecursionQueue* = nullptr) { return true; }
+            bool TraverseRequiresExpr(clang::RequiresExpr*,
+                                      DataRecursionQueue* = nullptr) { return true; }
+            bool TraverseConceptSpecializationExpr(clang::ConceptSpecializationExpr*,
+                                                   DataRecursionQueue* = nullptr) { return true; }
             void Note(const clang::FunctionDecl* fd) { if (fd != nullptr) found.push_back(fd); }
             std::vector<clang::VarDecl*> storage;
             bool VisitDeclRefExpr(clang::DeclRefExpr* e)
@@ -1865,6 +1876,13 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
     // Macro probes are one independent line each: a body that is no expression drops only itself.
     const bool recoverDeclarations = (!typeKey.empty() && !wrapperBatch) || !req.cxxMacroProbes.empty();
     std::string chunk = source;
+    // A request for a type named through the call returning it: its markers and member uses
+    // print private nested names; alias each one (see AliasCxxNestedSpecializationNames).
+    if (std::any_of(req.cxxTypeRequests.begin(), req.cxxTypeRequests.end(),
+                    [](const auto& request) {
+                        return cflat_cinterop::IsCxxAccessFreeSpelling(request.cxxSpelling);
+                    }))
+        chunk = cflat_cinterop::AliasCxxNestedSpecializationNames(chunk);
     /*
      * An earlier batch chunk may already define this wrapper (a default-argument wrapper whose
      * member was refused at the time, or a std::function bridge ctor). Parse under a fresh name,

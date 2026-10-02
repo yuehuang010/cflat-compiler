@@ -1,0 +1,53 @@
+// A `T&&` / `const T&&` call result constructs or assigns a C++ class through clang's own overload
+// resolution: a selected deleted member is refused with clang's reason, never replaced by another
+// member (no silent copy for a deleted move, no move for a deleted `const T&&`). clang++ rejects
+// every leg here.
+import cpp "cpp_interop_basic.h";
+
+expect_error("cannot initialize C++ class 'cppi.XvNoMove' from the rvalue reference 'cppi.XvNoMove&&' this call returns: clang: call to deleted constructor of 'cppi::XvNoMove'") {
+    cppi.XvNoMove xv_return_deleted(cppi.XvNoMove* p) { return cppi.xv_move(*p); }
+}
+
+extern int main()
+{
+    expect_error("cannot initialize C++ class 'cppi.XvNoMove' from the rvalue reference 'cppi.XvNoMove&&' this call returns: clang: call to deleted constructor of 'cppi::XvNoMove'") {
+        cppi.XvNoMove a = cppi.XvNoMove(1);
+        cppi.XvNoMove b = cppi.xv_move(a);
+    }
+    expect_error("cannot initialize C++ class 'cppi.XvNoMove' from the rvalue reference 'cppi.XvNoMove&&' this call returns: clang: call to deleted constructor of 'cppi::XvNoMove'") {
+        cppi.XvNoMove a = cppi.XvNoMove(2);
+        auto b = cppi.xv_move(a);
+    }
+    expect_error("cannot assign to C++ class 'cppi.XvNoMove' from the rvalue reference 'cppi.XvNoMove&&' this call returns: clang: overload resolution selected deleted operator '='") {
+        cppi.XvNoMove a = cppi.XvNoMove(3);
+        cppi.XvNoMove b = cppi.XvNoMove(4);
+        b = cppi.xv_move(a);
+    }
+    // A const xvalue of a move-only class: the copy is the only candidate, and it is deleted.
+    expect_error("cannot initialize C++ class 'cppi.XvMoveOnly' from the rvalue reference 'const cppi.XvMoveOnly&&' this call returns: clang: call to deleted constructor of 'cppi::XvMoveOnly'") {
+        const cppi.XvMoveOnly a = cppi.XvMoveOnly(5);
+        cppi.XvMoveOnly b = cppi.xv_move(a);
+    }
+    expect_error("cannot assign to C++ class 'cppi.XvMoveOnly' from the rvalue reference 'const cppi.XvMoveOnly&&' this call returns: clang: overload resolution selected deleted operator '='") {
+        const cppi.XvMoveOnly a = cppi.XvMoveOnly(6);
+        cppi.XvMoveOnly b = cppi.XvMoveOnly(7);
+        b = cppi.xv_move(a);
+    }
+    // A const xvalue selects the deleted `const T&&` overload (master refused; round 2 copied).
+    expect_error("cannot initialize C++ class 'cppi.XvMultiMove' from the rvalue reference 'const cppi.XvMultiMove&&' this call returns: clang: call to deleted constructor of 'cppi::XvMultiMove'") {
+        const cppi.XvMultiMove a = cppi.XvMultiMove(8);
+        auto b = cppi.xv_move(a);
+    }
+    expect_error("cannot assign to C++ class 'cppi.XvMultiMove' from the rvalue reference 'const cppi.XvMultiMove&&' this call returns: clang: overload resolution selected deleted operator '='") {
+        const cppi.XvMultiMove a = cppi.XvMultiMove(9);
+        cppi.XvMultiMove b = cppi.XvMultiMove(10);
+        b = cppi.xv_move(a);
+    }
+    // Controls: a non-const xvalue of a move-only class moves; XvNoMove copies from a const one.
+    cppi.XvMoveOnly m = cppi.XvMoveOnly(11);
+    cppi.XvMoveOnly n = cppi.xv_move(m);
+    const cppi.XvNoMove c = cppi.XvNoMove(12);
+    cppi.XvNoMove d = cppi.xv_move(c);
+    if (m.v != -1 || n.v != 11 || d.v != 12) return 1;
+    return 0;
+}

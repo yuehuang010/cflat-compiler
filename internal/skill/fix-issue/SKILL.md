@@ -288,8 +288,9 @@ spends the round finding pre-existing siblings that then get filed, and the trac
 while the fix waits. Tell the reviewer what kind of change it is reviewing and, for a small one,
 that findings outside the changed rule are to be fixed in place if one-site or reported in one
 line for the queue, not probed further.
-**Alternate the reviewer each round, starting with codex**: round 1 = codex
-CLI, round 2 = claude (opus agent), round 3 = codex CLI again.
+**The reviewer is always the other model family from the implementer** (maintainer,
+2026-10-01): a Codex implementer gets the opus agent for every round, an opus implementer
+gets the codex CLI. When an escalation changes the implementer, the reviewer flips with it.
 
 **Availability fallback.** Before round 1, check `codex --version` (or
 `which codex`). If codex is not on PATH or the check fails, use the opus agent
@@ -312,7 +313,8 @@ path.
 For an opus round: spawn (round 1 under fallback, or round 2) or continue via
 SendMessage (any later opus round) a code-review agent at **opus** in the
 worktree. For a codex round: run, in the worktree,
-`codex exec -c model="gpt-6-luna" -c model_reasoning_effort="high" "<prompt>"`.
+`codex exec -m gpt-6.1-sol -c model_reasoning_effort="medium" "<prompt>"` - codex
+reviews always use Sol 6.1 at medium effort (maintainer, 2026-10-01); Luna is for codex implementers only.
 Either way, the reviewer for that round reviews `git diff master...HEAD` in
 that worktree for correctness bugs, and for the CLAUDE.md constraints listed
 above. Give it the fix agent's coverage matrix and ask it to audit the matrix,

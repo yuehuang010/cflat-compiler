@@ -1,6 +1,5 @@
 // GUARDS: filesystem path slash join
 // FROM: internal/plan/std-library-smoke-suite.md (C++17 coverage map)
-// DISABLED: internal/issue/p3/std-filesystem-path-join.md
 import cpp "filesystem";
 extern int main()
 {

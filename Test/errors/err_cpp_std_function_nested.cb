@@ -1,7 +1,8 @@
 // A spelling that merely CONTAINS `std::function<` is not a std::function: only a TOP-LEVEL one
-// binds as the std.function specialization. `std::vector<std::function<int(int)>>` has no CFlat
-// mapping in any of these three positions, and binding it as the inner std::function passed a
-// callable where a vector was expected (silent wrong value) or crashed on the return.
+// binds as the std.function specialization. Binding `std::vector<std::function<int(int)>>` as the
+// inner std::function passed a callable where a vector was expected (silent wrong value) or crashed
+// on the return. The member parameter and both returns now bind as the vector itself, so a callable
+// is refused where the vector is expected and the vector is refused where a callable is.
 // The last leg pins that a `std::function&&` CONSTRUCTOR parameter is refused by CFlat's own
 // overload matching, not by an LLVM module verifier failure.
 import cpp "functional";
@@ -11,21 +12,20 @@ int nested_twice(int x) { return x * 2; }
 
 extern int main()
 {
-    expect_error("member 'take_vec' of C++ class 'cppfn.NestedHolder' takes unsupported type") {
+    expect_error("no viable conversion from 'std::function<int (int)>' to 'std::vector") {
         cppfn.NestedHolder h = cppfn.NestedHolder();
         int r = h.take_vec(std.function<int(int)>(nested_twice));
     }
-    expect_error("'cppfn.vec_of_fn' was not bound: return type") {
+    expect_error("cannot initialize C++ class 'std.function<int(int)>' from this expression") {
         std.function<int(int)> f = cppfn.vec_of_fn();
     }
-    expect_error("member 'get_vec' of C++ class 'cppfn.NestedHolder' returns unsupported type") {
+    expect_error("cannot initialize C++ class 'std.function<int(int)>' from this expression") {
         cppfn.NestedHolder h2 = cppfn.NestedHolder();
         std.function<int(int)> g = h2.get_vec();
     }
     // The FREE-parameter position of the same shape. It used to bind as the inner std::function
-    // and hand a callable where a vector was expected (the -292 measurement in the issue file was
-    // taken on its own repro); now the vector by value is refused on its ABI arrangement.
-    expect_error("C++ function 'cppfn.take_vec_free' uses a calling convention cflat cannot express") {
+    // and hand a callable where a vector was expected; it now binds as the vector by value.
+    expect_error("no viable conversion from 'std::function<int (int)>' to 'std::vector") {
         int rv = cppfn.take_vec_free(std.function<int(int)>(nested_twice));
     }
     return 0;

@@ -301,6 +301,7 @@ import cpp "library/cpp_interop_list.h";
 import cpp "library/cpp_interop_assign.h";
 import cpp "library/cpp_interop_proxy_assign.h";
 import cpp "library/cpp_interop_refbinding.h";
+import cpp "library/cpp_interop_opaque_return.hpp";
 
 int cppListTakeValue = 0;
 void take<T>(list<T>* values, int expectedCount)
@@ -352,6 +353,13 @@ struct UnwHolder
     int v = 0;
     cppunw.Tr t = default;
 };
+// A lent named closure that C++ moves into a returned holder: the holder owns a clone of the env.
+cppi.ClosureHolder ClosureEscapeMaker()
+{
+    int k = 40;
+    Lambda<int(int)> f = (int x) => { k++; return k + x; };
+    return cppi.move_hold(f);
+}
 int UnwOneFrame(int x)
 {
     cppunw.Tr t = default;
@@ -912,6 +920,26 @@ static bool near(double actual, double expected, double tol)
 }
 // Nontrivial-lifetime helpers. Each holds a nontrivial C++ local and leaves through a DIFFERENT exit edge, so
 // the counters below prove the existing cleanup paths (not a second mechanism) destroy it.
+// A global C++ destination assigned from a `T&&` result: master read the reference as a
+// conversion source and stored garbage (silent wrong value); now one move-assignment.
+std.string xvGlobal = default;
+
+// A `T&&` class result returned by value: one move-construction into the return slot, the
+// referent left moved-from (payload -1) and destroyed by its own owner.
+cppi.Tracked xv_return_through(cppi.Tracked* p) { return cppi.xv_move(*p); }
+cppi.Tracked xv_return_local() { cppi.Tracked local = cppi.Tracked(66); return cppi.xv_move(local); }
+cppi.Tracked xv_return_const(cppi.Tracked* p) { return cppi.xv_cmove(*p); }
+cppi.Tracked xv_return_const_local() { const cppi.Tracked local = cppi.Tracked(67); return cppi.xv_move(local); }
+cppi.XvConstMove xv_return_cm(cppi.XvConstMove* p) { return cppi.xv_move(*p); }
+cppi.XvMultiMove xv_return_mm(cppi.XvMultiMove* p) { return cppi.xv_move(*p); }
+// CFlat `return move t;` of a const C++ class local is `return std::move(t);`: a copy.
+cppi.Tracked mv_return_const_local() { const cppi.Tracked t = cppi.Tracked(68); return move t; }
+cppi.XvTrivialTemplate mv_return_trivial() { cppi.XvTrivialTemplate t = cppi.XvTrivialTemplate(3); return move t; }
+cppi.XvExplicitMove mv_return_explicit() { cppi.XvExplicitMove t = cppi.XvExplicitMove(4); return move t; }
+cppi.XvTrivialTemplate xv_return_tt(cppi.XvTrivialTemplate* p) { return cppi.xv_move(*p); }
+cppi.XvTrivialAssign xv_return_ta(cppi.XvTrivialAssign* p) { return cppi.xv_move(*p); }
+cppi.XvDefaultedMove xv_return_dm(cppi.XvDefaultedMove* p) { return cppi.xv_move(*p); }
+
 int life_early_return(int k)
 {
     cppi.Tracked t = cppi.Tracked(k);
@@ -1359,12 +1387,17 @@ int W11OrderProbe(long x, int y) { return 1; }
 
 extern int main()
 {
+    // Two groups spell the declaring header differently (`..` include, `\` on Windows): one entity.
     if (cppinl.shared_const.value != 37) return 7890;
     if (cpp_inline_static_a(0) != 10 || cpp_inline_static_b(0) != 20) return 7890;
     if (cpp_inline_static_count_a() != 1 || cpp_inline_static_count_b() != 1) return 7890;
     if (cpp_inline_const_table_a(2) != 3 || cpp_inline_const_table_b(2) != 9) return 7890;
     // Same-named static f calling a different static g per header: never merged.
     if (cpp_inline_static_fa(0) != 10 || cpp_inline_static_fb(0) != 20) return 7890;
+    // A folded constant and a const object of one shared declaration with equal values, an
+    // external inline constant both groups define, and a name only one group defines all bind.
+    if (cpp_group_shared_k != 5 || cpp_group_shared_q.b != 8 || cpp_group_inline_k != 6 || cpp_group_only_a != 41) return 7890;
+    if (!(cpp_group_shared_nan != cpp_group_shared_nan)) return 7890;
     w1demand.Q<int> ctorBodyAccept = w1demand.Q<int>(2.5);
     if (ctorBodyAccept.v != 11) return 7890;
 
@@ -1474,6 +1507,56 @@ extern int main()
     cppi.ld_store(7.125, &cppDout);
     if (cppDout != 7.125)                        return 150;
 
+    // Complete class returns stay opaque even with a reserved name and a reference member.
+    int opaqueValue = 7;
+    std.function<int(int)> opaqueFunction = std.function<int(int)>(fnptr_add_one);
+    if (cppinterop.callable_destructions() != 0) return 9030;
+    {
+        auto callable = cppinterop.make_callable(opaqueValue, opaqueFunction);
+        if (callable(5) != 13) return 9031;
+    }
+    if (cppinterop.callable_destructions() != 1) return 9032;
+    // Hidden friend operators of a class template resolve by ADL (nothing at namespace scope).
+    auto adlA = cppinterop.make_adl_path(4);
+    auto adlB = cppinterop.make_adl_path(2);
+    auto adlJoined = adlA / adlB;
+    if (adlJoined.depth != 42)                                  return 9033;
+    if ((adlA | cppinterop.make_adl_scale(3)) != 19)            return 9035;
+    if ((adlA ^ cppinterop.make_adl_scale(5)) != 29)            return 9036;
+    // Every compound kind calls the written hidden-friend compound operator in place.
+    { auto c = cppinterop.make_adl_path(4); c += 3; if (c.depth != 431) return 9040; }
+    { int n = 3; n += adlB; if (n != 321) return 9050; }
+    { auto c = cppinterop.make_adl_path(4); c -= 3; if (c.depth != 432) return 9041; }
+    { int n = 3; n -= adlB; if (n != 322) return 9051; }
+    { auto c = cppinterop.make_adl_path(4); c *= 3; if (c.depth != 433) return 9042; }
+    { int n = 3; n *= adlB; if (n != 323) return 9052; }
+    { auto c = cppinterop.make_adl_path(4); c /= 3; if (c.depth != 434) return 9043; }
+    { int n = 3; n /= adlB; if (n != 324) return 9053; }
+    { auto c = cppinterop.make_adl_path(4); c %= 3; if (c.depth != 435) return 9044; }
+    { int n = 3; n %= adlB; if (n != 325) return 9054; }
+    { auto c = cppinterop.make_adl_path(4); c <<= 3; if (c.depth != 436) return 9045; }
+    { int n = 3; n <<= adlB; if (n != 326) return 9055; }
+    { auto c = cppinterop.make_adl_path(4); c >>= 3; if (c.depth != 437) return 9046; }
+    { int n = 3; n >>= adlB; if (n != 327) return 9056; }
+    { auto c = cppinterop.make_adl_path(4); c &= 3; if (c.depth != 438) return 9047; }
+    { int n = 3; n &= adlB; if (n != 328) return 9057; }
+    { auto c = cppinterop.make_adl_path(4); c |= 3; if (c.depth != 439) return 9048; }
+    { int n = 3; n |= adlB; if (n != 329) return 9058; }
+    { auto c = cppinterop.make_adl_path(4); c ^= 3; if (c.depth != 440) return 9049; }
+    { int n = 3; n ^= adlB; if (n != 330) return 9059; }
+    // ADL reaches the base class's namespace operator and the base's hidden friend.
+    { auto d = cppinterop_adl_derived.make_from_ns(4); if (d + 3 != 307) return 9060; }
+    { auto d = cppinterop_adl_derived.make_from_friend(4); if (d + 3 != 407) return 9061; }
+    // An exact-match hidden friend beats the builtin reached through operator int().
+    {
+        auto box = cppinterop.make_conv_box(4);
+        if (box + 3 != 707) return 9062;
+        int n = 3;
+        n += box;
+        if (n != 807) return 9063;
+        if (cppinterop.conv_box_conversion_count() != 0) return 9064;
+    }
+
     // ---- C++ interop via `import cpp`: namespaced and overloaded declarations -------------------
     // Namespaced call under the dotted CFlat spelling, bound to the Itanium/MSVC
     // mangled symbol. The double overload adds 1000, so the return value alone
@@ -1516,6 +1599,12 @@ extern int main()
     if (cppi.const_variadic_rank(constRankPointer, 1) != 2) return 9016;
     // Unused ellipsis: the variadic's declared `int` is exact and beats `long`, either order.
     if (cppi.variadic_exact_rank(1) != 1 || cppi.variadic_exact_rank_rev(1) != 1) return 9021;
+    // Ellipsis receiving an argument ranks pairwise (clang): the declared `int` beats `long`
+    // whatever the declaration order; an ellipsis conversion loses to a declared parameter.
+    if (cppi.variadic_pair_rank(1, 2) != 1 || cppi.variadic_pair_rank_rev(1, 2) != 1) return 9022;
+    if (cppi.variadic_conv_rank(1, 2.5) != 2 || cppi.variadic_conv_rank(1, 2, 3) != 1) return 9023;
+    if (cppi.variadic_ptr_rank(mutableRankPointer, 1) != 2
+        || cppi.variadic_ptr_rank(mutableRankPointer, 1, 2) != 1) return 9024;
     // Template beside non-template: const pointer deduces T = const Rec / takes const T*.
     if (cppi.const_tpl_rank(constRankPointer) != 1) return 9017;
     if (cppi.const_tpl_rank(mutableRankPointer) != 2) return 9018;
@@ -3376,6 +3465,46 @@ extern int main()
     if (cppi.nsobj.kOld != 7)                         return 1612;
     if (cppi.nsobj.kRed.r != 1 || cppi.nsobj.kRed.b != 3) return 1613;
     if (cppi.nsobj.kName[0] != 'm')                   return 1614;
+
+    // ---- C++ entity lookup forms (values from a clang++ -std=c++20 oracle) ---------------------
+    // Pre-fix: 32001/32002/32004 "'y' is not a member of namespace", 32005-32006 "Unknown
+    // identifier 'K'", 32007-32008 "Unknown identifier 'size'/'twice'", 32009 "cannot find the
+    // type", 32010-32011 "no imported C++ header declares", 32012 "is a C++ variable, not a class
+    // template", 32013 read FALSE (nullptr_t spelled void*). 32003 is accept-set (worked before).
+    if (cppi_entity.StaticData.origin.y != 9)                   return 32001;
+    cppi_entity.StaticData.origin.x = 3;
+    if (cppi_entity.StaticData.origin.x != 3)                   return 32002;
+    if ((cppi_entity.StaticData.origin).y != 9)                 return 32003;
+    cppi_entity.StaticData.origin.x = 8;
+    if (cppi_entity.StaticData.origin.x != 8)                   return 32004;
+    cppi_entity.OutOfLine entityObj = default;
+    if (entityObj.K != 17)                                      return 32005;
+    entityObj.K = 23;
+    if (cppi_entity.OutOfLine.K != 23)                          return 32006;
+    cppi_entity.OutOfLine.K = 17;
+    cppi_entity.Seq<int, 4, 5, 6> entitySeq = default;
+    if (entitySeq.size() != 3)                                  return 32007;
+    cppi_entity.Counted entityCounted = default;
+    if (entityCounted.twice(21) != 42)                          return 32008;
+    cppi_entity.byte_like entityByte = (cppi_entity.byte_like)200;
+    if (cppi_entity.to_int<int>(entityByte) != 200)             return 32009;
+    double entityE = cppi_entity.e_v<double>;
+    if (!(entityE > 2.718281 && entityE < 2.718282))            return 32010;
+    float entityEf = cppi_entity.e_v<float>;
+    if (!(entityEf > 2.71828f && entityEf < 2.71829f))          return 32011;
+    if (cppi_entity.width_v<short> != 21)                       return 32012;
+    if (!cppi_entity.is_null_ptr<std.nullptr_t>.value
+        || cppi_entity.is_null_ptr<void*>.value)                return 32013;
+    // 32014: a non-constexpr side-effect initializer runs once, never folded.
+    // 32015/32016: static + non-static overloads of one name through an object.
+    // 32017: a declared trait specialization keeps the std::nullptr_t identity.
+    if (cppi_entity.dyn_const != 27 || cppi_entity.dynCount() != 1) return 32014;
+    cppi_entity.Mixed entityMixed = default;
+    if (entityMixed.f(2.0) != 202)                              return 32015;
+    if (entityMixed.f(2) != 101)                                return 32016;
+    cppi_entity.is_null_ptr<std.nullptr_t> entityNullTrait = default;
+    cppi_entity.is_null_ptr<void*> entityPtrTrait = default;
+    if (!entityNullTrait.value || entityPtrTrait.value)         return 32017;
 
     // ---- C++ scoped-enum overload identity ------------------------------------------------------
     cppi_scope.Module senumModule = default;
@@ -6119,6 +6248,51 @@ extern int main()
         heapBase = (int)HeapAudit.reportLeaks();
         r = cppunw.guarded(UnwTempAfterCall, 5); // its call returned; a later call throws
         if (r != -5 || (int)HeapAudit.reportLeaks() != heapBase) return 3198;
+        // A CAPTURING CFlat closure in std::function (N50): `move` hands the owning env (and its
+        // deep-copied string capture) to the C++ object, a std::function copy deep-copies it, and
+        // every copy is destroyed once. The live-block count while two std::functions hold it is
+        // twice one closure's, and back to the base after scope exit - as clang++ -std=c++20
+        // counts live owning `Counted` captures (1 per closure, 2 live, 0 after). Pre-fix: refused.
+        heapBase = (int)HeapAudit.reportLeaks();
+        {
+            string capText = "abcdefghijklmnopqrstuvwxyz0123456789";
+            int capBefore = (int)HeapAudit.reportLeaks();
+            Lambda<int(int)> capLambda = (int x) => { return x + capText.length(); };
+            int capOne = (int)HeapAudit.reportLeaks() - capBefore;
+            std.function<int(int)> capFn = move capLambda;
+            std.function<int(int)> capFnCopy = capFn;
+            if (capOne <= 0 || (int)HeapAudit.reportLeaks() - capBefore != 2 * capOne) return 3242;
+            if (capFn(1) != 37 || capFnCopy(2) != 38) return 3243;
+        }
+        if ((int)HeapAudit.reportLeaks() != heapBase) return 3244;
+        // Escape: the holder outlives ClosureEscapeMaker's closure; clang oracle 42, 43, one live env.
+        {
+            cppi.ClosureHolder capEsc = ClosureEscapeMaker();
+            if ((int)HeapAudit.reportLeaks() - heapBase != 1) return 3245;
+            if (capEsc.run(1) != 42 || capEsc.run(1) != 43) return 3246;
+        }
+        if ((int)HeapAudit.reportLeaks() != heapBase) return 3247;
+        // Moved-from reuse (clang oracle): a scalar capture is copied by the move (126); an owning
+        // string capture moves, the source is left empty (37 + 38 + 3 = 78). No env is read freed.
+        {
+            int capN = 40;
+            Lambda<int(int)> capR = (int x) => { return capN + x; };
+            if (cppi.reuse_moved(move capR) != 126) return 3248;
+            string capRs = "abcdefghijklmnopqrstuvwxyz0123456789";
+            Lambda<int(int)> capRS = (int x) => { return capRs.length() + x; };
+            if (cppi.reuse_moved(move capRS) != 78) return 3249;
+            // Per-field move: a captured closure keeps its code and moves its own env (nested
+            // int 126, nested string 78); mixed int + string keeps n, empties s (198).
+            Lambda<int(int)> capIn = (int x) => { return capN + x; };
+            Lambda<int(int)> capNest = (int x) => { return capIn(x); };
+            if (cppi.reuse_moved(move capNest) != 126) return 3251;
+            Lambda<int(int)> capInS = (int x) => { return capRs.length() + x; };
+            Lambda<int(int)> capNestS = (int x) => { return capInS(x); };
+            if (cppi.reuse_moved(move capNestS) != 78) return 3252;
+            Lambda<int(int)> capMix = (int x) => { return capN + capRs.length() + x; };
+            if (cppi.reuse_moved(move capMix) != 198) return 3253;
+        }
+        if ((int)HeapAudit.reportLeaks() != heapBase) return 3250;
         // ARRAY partial construction: a throw at element i destroys elements [0, i) only; a
         // `new T[n]` also frees its block (HeapAudit: CFlat operator new/delete).
         cppunw.reset();
@@ -8248,6 +8422,244 @@ extern int main()
     auto rrefAuto = cppi.rref_long();
     if (rrefAuto != 101 || (long)cppi.rref_long() != 101) return 7015;
     if (cppi.rref_optional().value() != 31) return 7016;
+    // A C++ call returning `T&&` to a class (std.move shape, keyed on the result type, not the
+    // name) is an xvalue: exactly one move-construct / move-assign, the source left in its C++
+    // moved-from state (-1, no CFlat use-after-move), still destroyed exactly once. Counts match
+    // the clang++ -std=c++20 oracle. Master refused every leg here ("cannot initialize C++ class").
+    cppi.reset_counts();
+    {
+        cppi.Tracked xvA = cppi.Tracked(7);
+        cppi.Tracked xvB = cppi.xv_move(xvA);
+        if (xvA.value() != -1 || xvB.value() != 7) return 7017;
+        cppi.Tracked xvC = cppi.xv_forward<cppi.Tracked>(xvB);
+        cppi.Tracked xvD = cppi.xv_pass(xvC);
+        if (xvB.value() != -1 || xvC.value() != -1 || xvD.value() != 7) return 7018;
+        cppi.Tracked xvE = (cppi.xv_move(xvD));
+        if (xvD.value() != -1 || xvE.value() != 7) return 7019;
+    }
+    if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 4
+        || cppi.dtor_count() != 5) return 7020;
+    cppi.reset_counts();
+    {
+        cppi.Tracked xvA = cppi.Tracked(8);
+        cppi.Tracked xvB = cppi.Tracked(1);
+        xvB = cppi.xv_move(xvA);
+        if (xvA.value() != -1 || xvB.value() != 8) return 7021;
+        cppi.XvHolder xvH = cppi.XvHolder();
+        xvH.item = cppi.xv_move(xvB);
+        if (xvB.value() != -1 || xvH.item.value() != 8) return 7022;
+    }
+    if (cppi.ctor_count() != 3 || cppi.copy_count() != 0 || cppi.move_count() != 0
+        || cppi.move_assign_count() != 2 || cppi.copy_assign_count() != 0
+        || cppi.dtor_count() != 3) return 7023;
+    cppi.reset_counts();
+    {
+        cppi.Tracked xvA = cppi.Tracked(9);
+        cppi.Tracked xvB = xv_return_through(&xvA);
+        cppi.Tracked xvC = xv_return_local();
+        if (xvA.value() != -1 || xvB.value() != 9 || xvC.value() != 66) return 7024;
+    }
+    if (cppi.ctor_count() != 2 || cppi.copy_count() != 0 || cppi.move_count() != 2
+        || cppi.dtor_count() != 4) return 7025;
+    // `auto` deduces the class (as C++ does), not a borrowed pointer: master aliased xvA.
+    cppi.reset_counts();
+    {
+        cppi.Tracked xvA = cppi.Tracked(4);
+        auto xvB = cppi.xv_move(xvA);
+        xvB.payload = 5;
+        if (xvA.value() != -1 || xvB.value() != 5) return 7026;
+    }
+    if (cppi.ctor_count() != 1 || cppi.move_count() != 1 || cppi.dtor_count() != 2) return 7027;
+    // A trivially copyable class copies the referent: master refused the typed spelling and
+    // aliased the source under `auto`.
+    cppi.Mixed xvM = default;
+    xvM.d = 1.5;
+    xvM.i = 3;
+    cppi.Mixed xvN = cppi.xv_move(xvM);
+    auto xvO = cppi.xv_move(xvM);
+    xvO.i = 9;
+    if (xvN.i != 3 || xvN.d != 1.5 || xvM.i != 3 || xvO.i != 9) return 7028;
+    std.string xvText = std.string("global target text long enough for the heap");
+    xvGlobal = cppi.xv_move(xvText);
+    if (xvGlobal != std.string("global target text long enough for the heap") || xvText.size() != 0)
+        return 7029;
+    // A `const T&&` result (xv_cmove, or xv_move of a const object) binds only the copy members,
+    // as clang++ selects T(const T&) / operator=(const T&): the source keeps its value. The
+    // first branch move-constructed and move-assigned, mutating the const referent.
+    cppi.reset_counts();
+    {
+        cppi.Tracked xvA = cppi.Tracked(5);
+        cppi.Tracked xvB = cppi.xv_cmove(xvA);
+        const cppi.Tracked xvC = cppi.Tracked(6);
+        cppi.Tracked xvD = cppi.xv_move(xvC);
+        auto xvE = cppi.xv_move(xvC);
+        if (xvA.value() != 5 || xvB.value() != 5 || xvC.value() != 6 || xvD.value() != 6
+            || xvE.value() != 6) return 7030;
+        xvB = cppi.xv_cmove(xvC);
+        xvD = cppi.xv_move(xvC);
+        if (xvC.value() != 6 || xvB.value() != 6 || xvD.value() != 6) return 7031;
+        cppi.Tracked xvF = xv_return_const(&xvA);
+        cppi.Tracked xvG = xv_return_const_local();
+        if (xvA.value() != 5 || xvF.value() != 5 || xvG.value() != 67) return 7032;
+    }
+    if (cppi.ctor_count() != 3 || cppi.copy_count() != 5 || cppi.move_count() != 0
+        || cppi.copy_assign_count() != 2 || cppi.move_assign_count() != 0
+        || cppi.dtor_count() != 8) return 7033;
+    // Clang selects the special member for the xvalue (counts = clang++ -std=c++20 oracle): a
+    // viable `const T&&` member beside a deleted copy, the valid `T&&` beside a deleted
+    // `const T&&`, and a defaulted move deleted by its member, which C++ ignores (copy).
+    cppi.xv_reset();
+    {
+        const cppi.XvConstMove cmA = cppi.XvConstMove(1);
+        cppi.XvConstMove cmB = cppi.xv_move(cmA);
+        auto cmC = cppi.xv_move(cmA);
+        cppi.XvConstMove cmD = cppi.XvConstMove(2);
+        cmD = cppi.xv_move(cmA);
+        cppi.XvConstMove cmE = xv_return_cm(&cmD);
+        if (cmA.v != 1 || cmB.v != 1 || cmC.v != 1 || cmD.v != 1 || cmE.v != 1) return 7034;
+        cppi.XvMultiMove mmA = cppi.XvMultiMove(3);
+        cppi.XvMultiMove mmB = cppi.xv_move(mmA);
+        cppi.XvMultiMove mmC = cppi.XvMultiMove(4);
+        mmC = cppi.xv_move(mmB);
+        cppi.XvMultiMove mmD = xv_return_mm(&mmC);
+        if (mmA.v != -1 || mmB.v != -1 || mmC.v != -1 || mmD.v != 3) return 7035;
+        cppi.XvDefaultedMove dmA = cppi.XvDefaultedMove(5);
+        cppi.XvDefaultedMove dmB = cppi.xv_move(dmA);
+        auto dmC = cppi.xv_move(dmA);
+        dmB = cppi.xv_move(dmA);
+        cppi.XvDefaultedMove dmD = xv_return_dm(&dmA);
+        if (dmA.item.v != 5 || dmB.item.v != 5 || dmC.item.v != 5 || dmD.item.v != 5) return 7036;
+    }
+    if (cppi.xv_move_count() != 7 || cppi.xv_copy_count() != 4) return 7037;
+    // std.move of a const object binds its own `const T&` wrapper even when the mutable one is
+    // already bound (and the reverse order): the const source is copied, never moved from.
+    cppi.reset_counts();
+    {
+        cppi.Tracked rmA = cppi.Tracked(1);
+        cppi.Tracked rmB = std.move(rmA);
+        const cppi.Tracked rmC = cppi.Tracked(2);
+        cppi.Tracked rmD = std.move(rmC);
+        auto rmE = std.move(rmC);
+        rmB = std.move(rmC);
+        if (rmA.value() != -1 || rmB.value() != 2 || rmC.value() != 2 || rmD.value() != 2
+            || rmE.value() != 2) return 7038;
+    }
+    if (cppi.ctor_count() != 2 || cppi.move_count() != 1 || cppi.copy_count() != 2
+        || cppi.copy_assign_count() != 1 || cppi.move_assign_count() != 0
+        || cppi.dtor_count() != 5) return 7039;
+    cppi.reset_counts();
+    {
+        const cppi.TrackedHolder rhA = cppi.TrackedHolder(3);
+        cppi.TrackedHolder rhB = std.move(rhA);
+        cppi.TrackedHolder rhC = std.move(rhB);
+        if (rhA.t.value() != 3 || rhB.t.value() != -1 || rhC.t.value() != 3) return 7040;
+    }
+    if (cppi.copy_count() != 1 || cppi.move_count() != 1) return 7041;
+    // A trivially copyable class whose constructor template clang selects for the xvalue: the
+    // selected constructor runs (clang++: -1 / 107 / 207), not a byte copy.
+    cppi.xv_reset();
+    cppi.XvTrivialTemplate ttA = cppi.XvTrivialTemplate(7);
+    cppi.XvTrivialTemplate ttB = std.move(ttA);
+    auto ttC = std.move(ttB);
+    if (ttA.v != -1 || ttB.v != -1 || ttC.v != 207 || cppi.xv_move_count() != 2) return 7042;
+    // CFlat `move x` of a C++ class object is std::move(x) (ruling 2026-10-01): clang's pick at
+    // init, auto, assignment, return and a by-value argument; a const source copies (counts =
+    // clang++ -std=c++20 oracle). Pre-fix every const leg moved from the const object.
+    cppi.reset_counts();
+    {
+        cppi.Tracked mvA = cppi.Tracked(1);
+        cppi.Tracked mvB = move mvA;
+        const cppi.Tracked mvC = cppi.Tracked(2);
+        cppi.Tracked mvD = move mvC;
+        const cppi.Tracked mvE = cppi.Tracked(3);
+        auto mvF = move mvE;
+        const cppi.Tracked mvG = cppi.Tracked(4);
+        mvB = move mvG;
+        cppi.Tracked mvH = mv_return_const_local();
+        cppi.Tracked mvI = cppi.Tracked(5);
+        const int mvArgA = cppi.take_tracked(move mvI);
+        const cppi.Tracked mvJ = cppi.Tracked(6);
+        const int mvArgB = cppi.take_tracked(move mvJ);
+        if (mvB.value() != 4 || mvD.value() != 2 || mvF.value() != 3 || mvH.value() != 68
+            || mvArgA != 5 || mvArgB != 6) return 7043;
+    }
+    if (cppi.ctor_count() != 7 || cppi.copy_count() != 4 || cppi.move_count() != 2
+        || cppi.copy_assign_count() != 1 || cppi.move_assign_count() != 0
+        || cppi.dtor_count() != 13) return 7044;
+    // Clang picks the member for `move x` as for std::move: a sole `const T&&`, `T&&` beside a
+    // deleted `const T&&`, a defaulted move deleted by its member (copy), a constructor template
+    // on a trivially copyable class (pre-fix: byte copy, ttE.v == 8).
+    cppi.xv_reset();
+    {
+        cppi.XvConstMove mcA = cppi.XvConstMove(1);
+        cppi.XvConstMove mcB = move mcA;
+        cppi.XvMultiMove mmE = cppi.XvMultiMove(3);
+        cppi.XvMultiMove mmF = move mmE;
+        cppi.XvDefaultedMove mdA = cppi.XvDefaultedMove(5);
+        cppi.XvDefaultedMove mdB = move mdA;
+        cppi.XvDefaultedMove mdC = cppi.XvDefaultedMove(6);
+        mdB = move mdC;
+        cppi.XvTrivialTemplate ttD = cppi.XvTrivialTemplate(8);
+        cppi.XvTrivialTemplate ttE = move ttD;
+        if (mcB.v != 1 || mmF.v != 3 || mdB.item.v != 6 || ttE.v != 108) return 7045;
+    }
+    if (cppi.xv_move_count() != 3 || cppi.xv_copy_count() != 2) return 7046;
+    // `move x` mimics std::move at every sink (clang++ -std=c++20 oracle values): the
+    // trivially copyable class's constructor template at auto / return / by-value argument
+    // (pre-fix: byte copy, 2 / 3 / 4 and no count), copy-initialization skipping an explicit
+    // move constructor (pre-fix: 101 / 102 / 104 / 104), the assignment template over a const
+    // `operator=(T&&) const` (pre-fix: 17).
+    cppi.xv_reset();
+    {
+        cppi.XvTrivialTemplate tvA = cppi.XvTrivialTemplate(2);
+        auto tvB = move tvA;
+        cppi.XvTrivialTemplate tvC = mv_return_trivial();
+        cppi.XvTrivialTemplate tvD = cppi.XvTrivialTemplate(4);
+        const int tvArg = cppi.xv_take_trivial(move tvD);
+        if (tvB.v != 102 || tvC.v != 103 || tvArg != 104 || cppi.xv_move_count() != 3) return 7047;
+    }
+    cppi.xv_reset();
+    {
+        cppi.XvExplicitMove exA = cppi.XvExplicitMove(1);
+        cppi.XvExplicitMove exB = move exA;
+        cppi.XvExplicitMove exC = cppi.XvExplicitMove(2);
+        auto exD = move exC;
+        cppi.XvExplicitMove exE = mv_return_explicit();
+        cppi.XvExplicitMove exF = cppi.XvExplicitMove(4);
+        const int exArg = cppi.xv_take_explicit(move exF);
+        if (exB.v != 11 || exD.v != 12 || exE.v != 14 || exArg != 14) return 7048;
+    }
+    if (cppi.xv_copy_count() != 4 || cppi.xv_move_count() != 0) return 7049;
+    cppi.xv_reset();
+    {
+        cppi.XvConstAssign caA = cppi.XvConstAssign(7);
+        cppi.XvConstAssign caB = cppi.XvConstAssign(1);
+        caB = move caA;
+        if (caB.v != 107 || cppi.xv_move_count() != 1 || cppi.xv_copy_count() != 0) return 7050;
+    }
+    // A trivially copyable class at `t = xv_move(x)`, `return xv_move(x)` and `t = move x`
+    // (clang++ oracle): the trivial pick byte-copies, an assignment / constructor template
+    // runs. Pre-fix: refused as a pointer store / pointer return; `move` byte-copied (7 0).
+    cppi.xv_reset();
+    {
+        cppi.XvTrivialTemplate tpA = cppi.XvTrivialTemplate(5);
+        cppi.XvTrivialTemplate tpB = cppi.XvTrivialTemplate(1);
+        tpB = cppi.xv_move(tpA);
+        cppi.XvTrivialTemplate tpC = xv_return_tt(&tpA);
+        if (tpB.v != 5 || tpC.v != 105 || tpA.v != -1 || cppi.xv_move_count() != 1) return 7051;
+    }
+    cppi.xv_reset();
+    {
+        cppi.XvTrivialAssign taA = cppi.XvTrivialAssign(7);
+        cppi.XvTrivialAssign* taP = &taA;
+        cppi.XvTrivialAssign taB = cppi.XvTrivialAssign(8);
+        taB = move taA;
+        cppi.XvTrivialAssign taC = cppi.XvTrivialAssign(2);
+        taC = cppi.xv_move(taB);
+        cppi.XvTrivialAssign taD = xv_return_ta(&taC);
+        if (taB.v != 107 || taP->v != 7 || taC.v != 207 || taD.v != 207
+            || cppi.xv_move_count() != 2) return 7052;
+    }
     // std.format checks companion emission of libc++ inline variables and ctor-initializer
     // callees, including std::to_address reached from basic_string_view construction.
     std.string fmtText = "ab";
@@ -9153,6 +9565,8 @@ extern int main()
     }
     int opMoveRc = OpMoveNontrivialLegs();
     if (opMoveRc != 0) return opMoveRc;
+    int loweredDtorRc = LoweredUserDtorAssignLegs(1);
+    if (loweredDtorRc != 0) return loweredDtorRc;
     // Joined temporaries match direct `new` when a retaining C++ call throws.
     {
         cppon.reset();
@@ -9353,6 +9767,102 @@ int OpMoveNontrivialLegs()
         cUse &= move dUse;
         int after = dUse.v;
     }
+    return 0;
+}
+
+// Legs 31730-31737: assignment into a CFlat struct with a user destructor AND a C++ field
+// (DESTROY + REBUILD, ruled 2026-10-01): the user ~T runs exactly once per assignment from a
+// prvalue - the old value - as for a plain CFlat struct; moved-from husks (the callee's returned
+// local, the call temporary) run only their C++ field destructors. C++ MO dtor counts husks.
+int g_ldtUser = 0;
+struct LdtHolder
+{
+    cppi_opmv.MO m = default;
+    int id = 0;
+    ~LdtHolder() { g_ldtUser++; }
+};
+struct LdtOuter { LdtHolder h; int k = 0; };
+int g_ldtGuardSeen = -1;
+struct LdtGuard { ~LdtGuard() { g_ldtGuardSeen = cppi_opmv.MO.DT(); } };
+[Capability(ILockable)]
+struct LdtLockable
+{
+    void acquire() { cppi.q5_return_acquire(); }
+    void release() { cppi.q5_return_release(); }
+};
+struct LdtLockHolder
+{
+    cppi.Q5ReturnProbe probe = default;
+    ~LdtLockHolder() {}
+};
+LdtHolder LdtMake(int id) { LdtHolder r; r.id = id; r.m.v = id; return r; }
+LdtHolder LdtPick(int id, bool early)
+{
+    LdtHolder r; r.id = id;
+    if (early) return r;
+    LdtHolder s; s.id = id + 100;
+    return s;
+}
+LdtOuter LdtMakeOuter(int id) { LdtOuter o; o.h.id = id; o.k = id; return o; }
+LdtHolder LdtMakeParen()
+{
+    LdtHolder w; w.id = 7; w.m.v = 7; return (w);
+}
+LdtHolder LdtMakeExplicit()
+{
+    LdtHolder w; w.id = 7; w.m.v = 7; return move w;
+}
+LdtHolder LdtMakeGuarded()
+{
+    LdtHolder w; LdtGuard guard; return w;
+}
+LdtLockHolder LdtMakeLocked()
+{
+    LdtLockable m; LdtLockHolder w;
+    lock (m) { return w; }
+}
+int LoweredUserDtorAssignLegs(int argc)
+{
+    LdtHolder a; a.id = 1;
+    g_ldtUser = 0; cppi_opmv.MO.reset();
+    a = LdtMake(2);
+    if (g_ldtUser != 1 || a.id != 2 || a.m.v != 2) return 31730;
+    // Old a.m, the callee's returned local and the call temporary: three C++ husks.
+    if (cppi_opmv.MO.DT() != 3 || cppi_opmv.MO.MV() != 2) return 31731;
+    g_ldtUser = 0;
+    a = argc > 99 ? LdtMake(3) : LdtMake(4);
+    if (g_ldtUser != 1 || a.id != 4) return 31732;
+    g_ldtUser = 0;
+    a = LdtPick(5, true);
+    if (g_ldtUser != 1 || a.id != 5) return 31733;
+    // The early-returned local is not destroyed; the late path destroys its unreturned `r`.
+    g_ldtUser = 0;
+    a = LdtPick(6, false);
+    if (g_ldtUser != 2 || a.id != 106) return 31734;
+    LdtOuter o; o.h.id = 7;
+    g_ldtUser = 0;
+    o = LdtMakeOuter(8);
+    if (g_ldtUser != 1 || o.h.id != 8) return 31735;
+    g_ldtUser = 0;
+    o.h = LdtMake(9);
+    if (g_ldtUser != 1 || o.h.id != 9) return 31736;
+    LdtHolder* slot = (LdtHolder*)malloc((i64)sizeof(LdtHolder));
+    g_ldtUser = 0;
+    construct_at(slot, LdtMake(10));
+    if (g_ldtUser != 0 || slot->id != 10) return 31737;
+    free(slot);
+    g_ldtUser = 0; cppi_opmv.MO.reset();
+    a = LdtMakeParen();
+    if (g_ldtUser != 1 || a.id != 7 || a.m.v != 7) return 31738;
+    g_ldtUser = 0; cppi_opmv.MO.reset();
+    a = LdtMakeExplicit();
+    if (g_ldtUser != 1 || a.id != 7 || a.m.v != 7) return 31739;
+    g_ldtUser = 0; cppi_opmv.MO.reset(); g_ldtGuardSeen = -1;
+    a = LdtMakeGuarded();
+    if (g_ldtUser != 1 || g_ldtGuardSeen != 0) return 31740;
+    cppi.q5_return_reset();
+    { LdtLockHolder locked = LdtMakeLocked(); }
+    if (!cppi.q5_return_ready()) return 31741;
     return 0;
 }
 

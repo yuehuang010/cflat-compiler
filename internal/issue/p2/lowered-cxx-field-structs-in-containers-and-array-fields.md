@@ -27,4 +27,8 @@ V1b r5 review (2026-10-01, V1b landed 52a77168). These also crash on master; pro
 
 RULED 2026-10-01 (maintainer): Test/test_move.cb recv_temp_snapshot: the asserted leak count MAY go down when the V1b machinery removes that leak (the leg encodes a known leak, not desired behaviour).
 
-RULED 2026-10-01 (maintainer): V1b assignment into a CFlat struct with a user-written destructor keeps DESTROY + REBUILD (CFlat `=` runs the old value's destructor); member-wise C++ operator= stays for structs without a user destructor. Defect found while checking (scratch/q5/q5.cb): with a C++ field, `a = make(3)` runs the user destructor 3 times - old value once + twice on empty moved-from shells (id=0); a plain CFlat struct (scratch/q5/q5b.cb) runs it exactly once. Fix: the user destructor runs exactly once per assignment from a prvalue (build the result in place after destroying the old value; no shell temps).
+RULED 2026-10-01 (maintainer): V1b assignment into a CFlat struct with a user-written destructor keeps DESTROY + REBUILD (CFlat `=` runs the old value's destructor); member-wise C++ operator= stays for structs without a user destructor.
+
+## Q5 leftover (Opus r2 review, 2026-10-01; master is worse, not a regression)
+Returning a by-value PARAMETER of a struct with a user destructor and a copy-only C++ field still runs the user destructor on the moved-from parameter: `return w;` / `return (w);` users=2 (plain-struct control 1), `return move w;` 3 (plain 2). MainListener_Statements.cpp finishReturnedLocal(..., parameter=true) skips the shell substitution. Repros scratch/repro_keep/q5_rv2/{lv,params_trace}.cb with _plain controls.
+Pre-existing (plain struct too): `W shadow(W w){ {W w; return move w;} }` never destroys the caller's argument temporary (users=1, expected 2).

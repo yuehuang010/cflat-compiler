@@ -1,6 +1,5 @@
 // GUARDS: C++20 std::numbers constants import and value access
 // FROM: internal/plan/std-library-smoke-suite.md (C++20 coverage map)
-// DISABLED: internal/issue/p3/cpp-namespace-inline-constexpr-variable-lookup.md
 import cpp "numbers";
 extern int main()
 {

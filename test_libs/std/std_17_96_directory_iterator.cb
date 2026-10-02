@@ -1,6 +1,5 @@
 // GUARDS: directory_iterator counts directory entries
 // FROM: internal/plan/std-library-smoke-suite.md (C++17 coverage map)
-// DISABLED: internal/issue/p2/std-filesystem-directory-iterator.md
 import cpp {"filesystem", "fstream"};
 extern int main()
 {

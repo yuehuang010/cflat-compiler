@@ -4700,6 +4700,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxLazyAliasSpecializations_.clear();
     cxxLazyGlobalTypedefs_.clear();
     cxxForeignRequests_.clear();
+    cxxNotConstantVariables_.clear();
     generatedCxxRecords_.clear();
     cppStructNames_.clear();
     cppStructBases_.clear();
@@ -4807,6 +4808,8 @@ void LLVMBackend::ResetForReanalysis()
     // exception between set and restore would leave a dangling alloca pointer that the next file's
     // EmitDestructorsForScope compares against (and could wrongly skip a destructor).
     returnedStructDtorSkipAlloca = nullptr;
+    returnedStructDtorShellAlloca = nullptr;
+    returnedStructDtorShellFunction = nullptr;
 
     functionTable.clear();
     annotationRegistry.clear();
@@ -4819,6 +4822,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxRecords_.clear();
     cxxAnonLayoutRefusals_.clear();
     cxxBindingRefusals_.clear();
+    cxxGroupStatics_.clear();
     cxxImplicitConversionRefusal_.clear();
     cxxTriviallyCopyableRecords_.clear();
     cxxNontrivialRecords_.clear();
@@ -4918,6 +4922,8 @@ void LLVMBackend::ResetForReanalysis()
     enumPromotedTypes_.clear();
     enumDeclSites_.clear();
     typeAliases.clear();
+    cxxNullptrTAliases_.clear();
+    cxxDeductionWrappers_.clear();
     aliasScopeStack_.clear();
     aggregateAliasScopes_.clear();
     manglingAliases_.clear();
@@ -6812,6 +6818,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.IsCxxRefToPointer)      o["crp"] = true;
     if (s.IsCxxConstRef)          o["ccr"] = true;
     if (s.IsCxxPointeeConst)      o["cpc"] = true;
+    if (s.IsCxxNullptrT)          o["cnt"] = true;
     if (s.IsCxxConstField)        o["ccf"] = true;
     if (s.IsCxxMutableField)      o["cmf"] = true;
     if (s.IsOwningSink)           o["osk"] = true;
@@ -6897,6 +6904,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("crp")) s.IsCxxRefToPointer = *v;
     if (auto v = o.getBoolean("ccr")) s.IsCxxConstRef = *v;
     if (auto v = o.getBoolean("cpc")) s.IsCxxPointeeConst = *v;
+    if (auto v = o.getBoolean("cnt")) s.IsCxxNullptrT = *v;
     if (auto v = o.getBoolean("ccf")) s.IsCxxConstField = *v;
     if (auto v = o.getBoolean("cmf")) s.IsCxxMutableField = *v;
     if (auto v = o.getBoolean("osk")) s.IsOwningSink = *v;
@@ -7338,8 +7346,9 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     // Each version added tables an older cache lacks, so an older cache must be rejected rather
     // than silently reused (v6 includes the LSP core-variable replay state; v8 is the non-pointer
     // `alias T` parameter reference ABI - such a parameter is now passed as a pointer to the
-    // caller's object, so cached v7 core bitcode has the wrong calling convention for it).
-    root["version"]   = 10;
+    // caller's object, so cached v7 core bitcode has the wrong calling convention for it; v11:
+    // closure capture-cleanup fns gained MOVE mode 2 - a v10 one would run FREE for it).
+    root["version"]   = 11;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
 #if defined(__APPLE__)
@@ -7383,6 +7392,12 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
         llvm::json::Object obj;
         for (auto& [k, v] : typeAliases) obj[k] = v;
         root["type_aliases"] = std::move(obj);
+    }
+    // cxxNullptrTAliases_ - type aliases spelled void* that name std::nullptr_t.
+    {
+        llvm::json::Array arr;
+        for (const auto& name : cxxNullptrTAliases_) arr.push_back(name);
+        root["cxx_nullptr_t_aliases"] = std::move(arr);
     }
 
     // manglingAliases_ - pure-rename `using` aliases MangleTypeArg folds. A warm cache never
@@ -7810,7 +7825,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 10) return false;  // v9 used the pre-dollar type and function mangling
+    if (!ver || *ver != 11) return false;  // v10 cleanup fns lack closure MOVE mode 2
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != coreHash) return false;
 #if defined(__APPLE__)
@@ -7894,6 +7909,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     applicationLine_ = 0;
     namespaceTable.clear();
     typeAliases.clear();
+    cxxNullptrTAliases_.clear();
     manglingAliases_.clear();
     manglingPointerAliases_.clear();
     enumBackingTypes.clear();
@@ -7932,6 +7948,9 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     if (auto* obj = root->getObject("type_aliases"))
         for (auto& kv : *obj)
             if (auto v = kv.second.getAsString()) typeAliases[kv.first.str()] = v->str();
+    if (auto* arr = root->getArray("cxx_nullptr_t_aliases"))
+        for (auto& elem : *arr)
+            if (auto v = elem.getAsString()) cxxNullptrTAliases_.insert(v->str());
 
     // manglingAliases_ - pure-rename aliases the mangler folds (see the write side).
     if (auto* obj = root->getObject("mangling_aliases"))

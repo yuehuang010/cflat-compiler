@@ -4,7 +4,9 @@
 // exists to prove. It adds one inline function of its own so the group is not identical bitcode.
 #pragma once
 
-#include "cpp_interop_inline.h"
+// Spelled through `..` on purpose: the shared declaration's file then differs textually from the
+// first group's spelling, and cppinl.shared_const must still read as one entity.
+#include "../library/cpp_interop_inline.h"
 
 namespace cppinl2
 {

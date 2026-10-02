@@ -9,6 +9,9 @@ int main() {
     std::unique_ptr<int> p(new int(7));
     std::unique_ptr<int> moved = std::move(p);
     if (p != nullptr || *moved != 7) { std::printf("FAIL std::move\n"); failures |= 1; }
+    std::string s = std::string("hello");
+    std::string t = std::move(s);
+    if (t != "hello") { std::printf("FAIL std::move string\n"); failures |= 2; }
     if (!failures) std::printf("PASS std_11_94_utility_move\n");
     return failures;
 }

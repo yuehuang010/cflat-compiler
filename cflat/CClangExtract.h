@@ -37,11 +37,27 @@ namespace llvm
 
 namespace cflat_cinterop
 {
+    // Tail of the refusal for a C++ variable read by value whose initializer is not a constant
+    // initialization: folding would skip the initializer, and no live binding exists on this path.
+    inline constexpr const char* kCxxNotConstantVariableRefusal =
+        "is not initialized by a constant expression, so CFlat cannot read it by value";
+
     // CFLAT_CXX_EAGER_BODIES selects a different C++ group parse, so it is part of cache identity.
     inline bool CxxEagerBodies() { return std::getenv("CFLAT_CXX_EAGER_BODIES") != nullptr; }
 
     // One CFlat identity for every canonical C++ spelling used by extraction and backend lookup.
     std::string CxxForeignIdentity(const std::string& spelling);
+    // A requested type named by the member call that returns it, because its own name is
+    // private to a class (a range view's nested __iterator).
+    inline constexpr std::string_view kCxxAccessFreeSpellingPrefix = "__remove_cvref(decltype(";
+    inline bool IsCxxAccessFreeSpelling(const std::string& spelling)
+    {
+        return spelling.starts_with(kCxxAccessFreeSpellingPrefix);
+    }
+    // Rewrites every class nested in a specialization (`A<...>::B`, `A<...>::B<...>`) in
+    // generated source to an alias declared through an explicit instantiation, where access
+    // is not checked ([temp.spec.general]). Access semantics of everything else are unchanged.
+    std::string AliasCxxNestedSpecializationNames(const std::string& source);
 
     // Split a canonical std::function<R(P...)> spelling into its return and parameter spellings.
     bool SplitStdFunctionSpelling(const std::string& spelling, std::string& ret,
@@ -400,6 +416,7 @@ namespace cflat_cinterop
         bool hasBases = false;              // any base class
         bool hasVirtualBases = false;       // virtual inheritance: rejected, the VTT is not modelled
         bool isAbstract = false;            // has an unoverridden pure virtual: cannot be created
+        bool hasFriendOperators = false;    // declares a friend operator (found only by ADL)
         std::vector<RawCxxBase> bases;      // DIRECT bases, in declaration order
         // EVERY virtual base, direct or indirect, at its offset in THIS class's complete-object
         // layout - the only place a shared virtual base's offset is fixed.
@@ -424,6 +441,8 @@ namespace cflat_cinterop
         // A public, non-deleted constructor TEMPLATE. Its specializations are never listed as
         // members, so only a clang-resolved `T(args)` wrapper can reach them.
         bool hasCtorTemplate = false;
+        // A non-deleted `operator=` TEMPLATE: it can beat the bound copy / move assignment.
+        bool hasAssignTemplate = false;
         bool isAggregate = false;
         std::vector<RawCxxCtorTemplate> ctorTemplates;
         std::vector<RawCxxMember> members;
@@ -514,6 +533,8 @@ namespace cflat_cinterop
         bool isFloatConstant = false;
         double floatValue = 0.0;
         bool isCxxConstexpr = false;
+        bool isInternalLinkage = false;  // C++ internal linkage: one object per import group
+        uint64_t constInitHash = 0;      // internal const object: hash of its evaluated value
         std::string file;
         int line = 1;
         int col = 0;

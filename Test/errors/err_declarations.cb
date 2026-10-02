@@ -45,6 +45,58 @@ expect_error("is a generic type; type arguments are required") {
     }
 }
 
+struct EmptyArgField<T> { T value = default; };
+expect_error("is a generic type; type arguments are required") {
+    struct BareGenericFieldUse { EmptyArgField<> value = default; };
+}
+
+struct EmptyArgLocal<T> { T value = default; };
+expect_error("is a generic type; type arguments are required") {
+    int test_empty_generic_type()
+    {
+        EmptyArgLocal<> value = default;
+        return 0;
+    }
+}
+
+struct PlainTypeArgProbe { int value = 0; };
+expect_error("is not a generic type") {
+    int test_empty_plain_type_arg()
+    {
+        PlainTypeArgProbe<> value = default;
+        return 0;
+    }
+}
+
+expect_error("is not a generic type") {
+    int take_empty_plain_type_arg(PlainTypeArgProbe<>* value) { return 0; }
+}
+
+expect_error("generic definition needs at least one type parameter") {
+    struct EmptyGenericStruct<> { int value = 0; };
+}
+
+expect_error("generic definition needs at least one type parameter") {
+    interface EmptyGenericInterface<> { int f(); };
+}
+
+expect_error("generic definition needs at least one type parameter") {
+    int emptyGenericFunction<>() { return 0; }
+}
+
+expect_error("generic definition needs at least one type parameter") {
+    struct EmptyGenericMethodDefinitionProbe { int m<>() { return 0; } };
+}
+
+expect_error("generic function 'm' expects 1 type argument(s), but the call provides 0") {
+    struct EmptyGenericMethodProbe { int m<T>(T value) { return 0; } };
+    int test_empty_generic_method_call()
+    {
+        EmptyGenericMethodProbe value = default;
+        return value.m<>(1);
+    }
+}
+
 expect_error("does not implement") {
     class Foo : IGreet
     {

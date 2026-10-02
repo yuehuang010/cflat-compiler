@@ -584,6 +584,17 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             lambdaExpectedType = compiler->currentFunctionReturnTV;
             returnFnPtrTV = compiler->currentFunctionReturnTV;
         }
+        // A std.function return type types a returned lambda the same way; the lambda then
+        // converts through the function-pointer constructor like a returned function<> value.
+        std::string stdFunctionReturnType;
+        if (!compiler->currentFunctionReturnTV.IsFunctionPointer
+            && !compiler->currentFunctionReturnTV.Pointer)
+            if (const auto* signature = compiler->StdFunctionClosureSignature(
+                    compiler->currentFunctionReturnTV.TypeName))
+            {
+                lambdaExpectedType = *signature;
+                stdFunctionReturnType = compiler->currentFunctionReturnTV.TypeName;
+            }
         // Inbound alloc-align channel for `return new T[n];`: a function whose return
         // type declares `alignas(_, N)` hands the allocation alignment down to a DIRECT
         // `new` in the return, exactly as a decl-init does. Indirect return shapes are
@@ -637,7 +648,52 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             compiler->lastLoweredRetValue_ = nullptr;
         }
         if (assignExpr != nullptr)
+        {
+            if (!cxxSretReturn && !compiler->currentFunctionReturnTV.Pointer)
+                trivialCxxMoveSite_ = TopLevelMoveExpression(assignExpr);
             returnNV = ParseAssignmentExpressionNamed(assignExpr, ResultUse::ReturnOperand);
+            trivialCxxMoveSite_ = nullptr;
+            // `return std.move(x)` of a trivially copyable C++ class returned in registers: the
+            // referent's bytes (the trivial pick), or a temporary built by clang's pick.
+            if (!cxxSretReturn && !compiler->currentFunctionReturnTV.Pointer
+                && compiler->IsCxxRvalueRefClassResult(returnNV)
+                && returnNV.TypeAndValue.TypeName == compiler->currentFunctionReturnTypeName
+                && !compiler->IsForeignNontrivialCxxClass(returnNV.TypeAndValue.TypeName))
+            {
+                const std::string tn = returnNV.TypeAndValue.TypeName;
+                const bool constSource = returnNV.TypeAndValue.IsCxxConstRef;
+                llvm::Type* recordType = compiler->GetType(LLVMBackend::TypeAndValue{ .TypeName = tn });
+                llvm::Value* source = returnNV.Primary;
+                if (recordType != nullptr && compiler->CxxTrivialMoveNeedsTransfer(tn, constSource, false))
+                {
+                    auto* temp = compiler->AllocaAtEntry(recordType, nullptr, "cxx.xvalue.ret",
+                        compiler->module->getDataLayout().getABITypeAlign(recordType).value());
+                    std::string refusal;
+                    if (!compiler->EmitCxxXvalueTransfer(tn, temp, source, constSource, false, refusal))
+                        LogErrorContext(assignExpr, refusal);
+                    source = temp;
+                }
+                if (recordType != nullptr)
+                {
+                    LLVMBackend::NamedVariable value;
+                    value.TypeAndValue.TypeName = tn;
+                    value.Primary = compiler->builder->CreateLoad(recordType, source);
+                    value.BaseType = recordType;
+                    value.IsRvalue = true;
+                    returnNV = std::move(value);
+                }
+            }
+            if (!stdFunctionReturnType.empty())
+            {
+                compiler->LowerNonCapturingClosureForCxx(
+                    returnNV, compiler->StdFunctionClosureSignature(stdFunctionReturnType));
+                if (std::string refusal = compiler->CxxClosureArgumentRefusal(
+                        returnNV, compiler->DisplayCxxClassName(stdFunctionReturnType),
+                        compiler->StdFunctionClosureSignature(stdFunctionReturnType));
+                    !refusal.empty())
+                    LogErrorContext(assignExpr, refusal);
+            }
+        }
         else if (defaultValue)
         {
             // `return default;` - the same emitter `T x = default;` and a `default` ternary arm
@@ -657,7 +713,13 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && returnStorageGep != nullptr
             && returnStorageGep->getNumIndices() == 1
             && returnStorageGep->getSourceElementType()->isStructTy();
-        const bool returnReadsPointerPointee = returnIsPointerDeref || returnIsPointerIndex;
+        // `return *this` reads the receiver, a borrow like `*o`: a non-copyable owner is refused
+        // (ruled 2026-10-01); a copyable one keeps the copy() arm below.
+        const bool returnIsThisDeref = returnStorageGep == nullptr
+            && returnNV.CallerName == "this" && returnNV.FieldName.empty()
+            && !compiler->IsCopyableType(returnNV.TypeAndValue.TypeName);
+        const bool returnReadsPointerPointee = returnIsPointerDeref || returnIsPointerIndex
+            || returnIsThisDeref;
         if (!defaultValue && assignExpr != nullptr
             && returnNV.Storage != nullptr
             && !compiler->currentFunctionReturnTV.IsAlias
@@ -702,8 +764,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         /*
          * A classified CFlat struct (a C++ field that is not trivially relocatable) returns through
          * sret. A call or `default` builds straight into the slot; a named local is moved field by
-         * field (C++ move constructors for the C++ fields) and still destroyed at its scope exit,
-         * like C++ without NRVO. Every other shape keeps the by-value path below, which stores
+         * field (C++ move constructors for the C++ fields); its husk then destroys only the moved-from
+         * C++ fields, never the user destructor (the value went to the caller). Every other shape keeps the by-value path below, which stores
          * the value into the slot (plan cflat-struct-nontrivial-cxx-fields phase 3).
          */
         bool loweredValueReturn = false;
@@ -757,21 +819,28 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             // A local or by-value parameter owns addressable storage. Parameters are moved too:
             // the callee then destroys the moved-from parameter after filling the return slot.
             bool namedLocal = false;
+            bool namedParam = false;
             llvm::Value* localStorage = nullptr;
-            if (!defaultValue && IsBareIdentifierText(retText))
+            std::string returnedLocalName = retText;
+            while (returnedLocalName.size() >= 2 && returnedLocalName.front() == '('
+                   && returnedLocalName.back() == ')')
+                returnedLocalName = returnedLocalName.substr(1, returnedLocalName.size() - 2);
+            if (!defaultValue && IsBareIdentifierText(returnedLocalName))
             {
                 for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
                 {
-                    if (auto it = frame.functionArgument.find(retText);
+                    if (auto it = frame.functionArgument.find(returnedLocalName);
                         it != frame.functionArgument.end())
                     {
                         namedLocal = !it->second.TypeAndValue.Pointer
                             && it->second.TypeAndValue.TypeName == returnTypeName
                             && it->second.Storage != nullptr;
+                        namedParam = true;
                         localStorage = it->second.Storage;
                         break;
                     }
-                    if (auto it = frame.namedVariable.find(retText); it != frame.namedVariable.end())
+                    if (auto it = frame.namedVariable.find(returnedLocalName);
+                        it != frame.namedVariable.end())
                     {
                         namedLocal = !it->second.TypeAndValue.Pointer
                             && it->second.TypeAndValue.TypeName == returnTypeName
@@ -781,6 +850,22 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     }
                 }
             }
+            auto finishReturnedLocal = [&](llvm::Value* storage, bool parameter) {
+                llvm::Value* prevSkip = compiler->returnedStructDtorSkipAlloca;
+                llvm::Value* prevShellStorage = compiler->returnedStructDtorShellAlloca;
+                llvm::Function* prevShell = compiler->returnedStructDtorShellFunction;
+                if (!parameter)
+                {
+                    compiler->returnedStructDtorSkipAlloca = storage;
+                    compiler->returnedStructDtorShellAlloca = storage;
+                    compiler->returnedStructDtorShellFunction =
+                        compiler->GetOrCreateMovedFromShellDestructor(returnTypeName);
+                }
+                finishLoweredReturn();
+                compiler->returnedStructDtorSkipAlloca = prevSkip;
+                compiler->returnedStructDtorShellAlloca = prevShellStorage;
+                compiler->returnedStructDtorShellFunction = prevShell;
+            };
             auto* structType = compiler->GetDataStructure(returnTypeName).StructType;
             if (namedLocal && structType != nullptr)
             {
@@ -788,7 +873,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 if (compiler->EmitLoweredMemberwiseMove(returnTypeName, structType, cxxSretDest,
                                                         localStorage, "into the return slot"))
                 {
-                    finishLoweredReturn();
+                    // Parameters retain their ordinary teardown; a returned local replaces
+                    // its normal scope destructor with a moved-from C++ shell destructor.
+                    finishReturnedLocal(localStorage, namedParam);
                     return;
                 }
             }
@@ -822,7 +909,30 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                                                             cxxSretDest, source,
                                                             "into the return slot"))
                     {
-                        finishLoweredReturn();
+                        bool movedParameter = false;
+                        for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
+                        {
+                            for (const auto& [name, variable] : frame.namedVariable)
+                                if (variable.Storage == source && !variable.TypeAndValue.Pointer
+                                    && variable.TypeAndValue.TypeName == returnTypeName)
+                                {
+                                    localStorage = source;
+                                    namedLocal = true;
+                                    break;
+                                }
+                            if (namedLocal) break;
+                            for (const auto& [name, variable] : frame.functionArgument)
+                                if (variable.Storage == source && !variable.TypeAndValue.Pointer
+                                    && variable.TypeAndValue.TypeName == returnTypeName)
+                                {
+                                    movedParameter = true;
+                                    localStorage = source;
+                                    break;
+                                }
+                            if (movedParameter) break;
+                        }
+                        finishReturnedLocal(localStorage == nullptr ? source : localStorage,
+                                            movedParameter);
                         return;
                     }
                 }
@@ -880,6 +990,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 ? moveExpr->unaryExpression()->getText() : std::string();
             LLVMBackend::NamedVariable source = returnNV;
             bool useMove = false;
+            bool xvalueReturn = false;
+            bool xvalueConstSource = false;
             std::string sourceName;
             if (explicitMove && IsBareIdentifierText(moveName))
             {
@@ -911,6 +1023,17 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 source = compiler->GetScopedLocalOrArgument(retText);
                 sourceName = retText;
                 useMove = true;
+            }
+            else if (!explicitMove && compiler->IsCxxRvalueRefClassResult(returnNV)
+                && returnNV.TypeAndValue.TypeName == typeName)
+            {
+                // A `T&&` / `const T&&` result (std.move(x)) is an xvalue: clang selects the
+                // constructor into the return slot.
+                xvalueConstSource = returnNV.TypeAndValue.IsCxxConstRef;
+                xvalueReturn = true;
+                source.Storage = returnNV.Primary;
+                source.TypeAndValue.Pointer = false;
+                source.TypeAndValue.IsRvalueRef = false;
             }
             else if (compiler->lastCxxRetTemp_ != nullptr
                 && returnNV.TypeAndValue.TypeName == typeName
@@ -1010,16 +1133,48 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             if (source.Storage == nullptr || source.TypeAndValue.TypeName != typeName
                 || source.TypeAndValue.Pointer)
             {
+                if (returnNV.TypeAndValue.IsRvalueRef)
+                {
+                    LLVMBackend::TypeAndValue referent = returnNV.TypeAndValue;
+                    referent.IsRvalueRef = false;
+                    if (referent.ElemPointer) referent.ElemPointer = false;
+                    else referent.Pointer = false;
+                    LogErrorContext(errCtx, std::format(
+                        "cannot return C++ class '{}' from the rvalue reference '{}&&' this call "
+                        "returns; only a '{}&&' result move-constructs it",
+                        compiler->DisplayCxxClassName(CurrentReturnTypeSpelling(compiler)),
+                        SpellDiagnosticType(*compiler, referent),
+                        compiler->DisplayCxxClassName(CurrentReturnTypeSpelling(compiler))));
+                    return;
+                }
                 LogErrorContext(errCtx, std::format(
                     "cannot return C++ class '{}': the expression has no constructible source",
                     compiler->DisplayCxxClassName(CurrentReturnTypeSpelling(compiler))));
                 return;
             }
             compiler->SetCurrentDebugLocation(errCtx->getStart()->getLine());
-            compiler->EmitCxxCopyOrMoveConstruct(typeName, cxxSretDest, source.Storage,
-                                                 useMove,
-                                                 useMove ? "into the return slot"
-                                                         : "into the return slot");
+            if (xvalueReturn)
+            {
+                std::string refusal;
+                if (!compiler->EmitCxxXvalueTransfer(typeName, cxxSretDest, source.Storage,
+                                                     xvalueConstSource, false, refusal))
+                    LogErrorContext(errCtx, refusal);
+                finishCxxSretReturn();
+                return;
+            }
+            const bool constMoveSource = explicitMove && !sourceName.empty()
+                && compiler->CxxConstReceiverKind(source) != 0;
+            if (explicitMove && !sourceName.empty()
+                && compiler->CxxExplicitMoveNeedsTransfer(typeName, constMoveSource, false))
+            {
+                std::string refusal;
+                if (!compiler->EmitCxxExplicitMoveTransfer(typeName, cxxSretDest, source.Storage,
+                        constMoveSource, false, sourceName, refusal))
+                    LogErrorContext(errCtx, refusal);
+            }
+            else
+                compiler->EmitCxxCopyOrMoveConstruct(typeName, cxxSretDest, source.Storage,
+                                                     useMove, "into the return slot");
             if (useMove && !sourceName.empty()) compiler->MarkVariableMoved(sourceName);
             finishCxxSretReturn();
             return;
@@ -3105,22 +3260,105 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     // Imported C++ containers use the C++ range protocol directly. In
                     // particular, do not route them through CFlat's count()/get() protocol:
                     // begin/end also covers containers whose only indexing shape is an iterator.
-                    if (compiler->IsCxxRecord(collNV.TypeAndValue.TypeName))
+                    /*
+                     * [stmt.ranged]: a class with members named begin AND end iterates through
+                     * __range.begin() / __range.end(); any other class through begin(__range) /
+                     * end(__range) found by argument-dependent lookup only (directory_iterator).
+                     */
+                    const std::string collTypeName = collNV.TypeAndValue.TypeName;
+                    const bool cxxRangeCandidate = !isFaceType && !isFixedArray && !isArrayView
+                        && compiler->IsCxxRecord(collTypeName);
+                    const bool cxxMemberRange = cxxRangeCandidate
+                        && compiler->CxxClassHasMemberNamed(collTypeName, "begin")
+                        && compiler->CxxClassHasMemberNamed(collTypeName, "end");
+                    if (cxxRangeCandidate)
                     {
-                        compiler->EnsureCxxMemberProjected(collNV.TypeAndValue.TypeName, "begin");
-                        compiler->EnsureCxxMemberProjected(collNV.TypeAndValue.TypeName, "end");
+                        compiler->EnsureCxxMemberProjected(collTypeName, "begin");
+                        compiler->EnsureCxxMemberProjected(collTypeName, "end");
                     }
-                    const auto* foreignInfo = compiler->GetCxxClassInfo(collNV.TypeAndValue.TypeName);
-                    const bool hasBegin = foreignInfo != nullptr
-                        && std::find(foreignInfo->instanceMethodNames.begin(),
-                                     foreignInfo->instanceMethodNames.end(), "begin")
-                               != foreignInfo->instanceMethodNames.end();
-                    const bool hasEnd = foreignInfo != nullptr
-                        && std::find(foreignInfo->instanceMethodNames.begin(),
-                                     foreignInfo->instanceMethodNames.end(), "end")
-                               != foreignInfo->instanceMethodNames.end();
+                    auto hasMethod = [&](const char* name) {
+                        const auto* info = compiler->GetCxxClassInfo(collTypeName);
+                        return info != nullptr
+                            && std::find(info->instanceMethodNames.begin(),
+                                         info->instanceMethodNames.end(), name)
+                                   != info->instanceMethodNames.end();
+                    };
+                    // A member whose return type is not registered yet (a view's nested
+                    // iterator) is requested the way a written `r.begin()` call requests it.
+                    if (cxxMemberRange)
+                        for (const char* name : { "begin", "end" })
+                            if (!hasMethod(name))
+                                compiler->TryBindRefusedCxxMember(collTypeName, name);
+                    const auto* foreignInfo = compiler->GetCxxClassInfo(collTypeName);
+                    const bool hasBegin = hasMethod("begin");
+                    const bool hasEnd = hasMethod("end");
+                    std::string freeBeginName;
+                    std::string freeEndName;
+                    std::string freeError;
+                    if (cxxRangeCandidate && !cxxMemberRange && !collNV.TypeAndValue.Pointer)
+                    {
+                        const std::string base = collTypeName.substr(0, collTypeName.find('$'));
+                        const size_t dot = base.rfind('.');
+                        const std::string adlScope =
+                            dot == std::string::npos ? std::string("__cxx_free") : base.substr(0, dot);
+                        auto requestFree = [&](const char* name) {
+                            // __range is a named reference: begin/end see an LVALUE even for a
+                            // temporary collection. Only the type and value category matter here.
+                            LLVMBackend::NamedVariable rangeArg = collNV;
+                            rangeArg.TypeAndValue.VariableName.clear();
+                            rangeArg.Primary = nullptr;
+                            rangeArg.Storage = nullptr;
+                            rangeArg.TypeAndValue.IsAlias = true;
+                            rangeArg.IsRvalue = false;
+                            rangeArg.IsExplicitMove = false;
+                            rangeArg.CallerName.clear();
+                            std::vector<LLVMBackend::NamedVariable> args{ rangeArg };
+                            std::string registeredName;
+                            std::string error;
+                            if (!compiler->RequestCxxFreeFunction(adlScope + "." + name, {}, args,
+                                                                  registeredName, error, {}, {}, {},
+                                                                  /*adlCall*/ true))
+                            {
+                                if (freeError.empty()) freeError = error;
+                                return std::string();
+                            }
+                            return registeredName;
+                        };
+                        freeBeginName = requestFree("begin");
+                        if (!freeBeginName.empty()) freeEndName = requestFree("end");
+                        if (freeEndName.empty()) freeBeginName.clear();
+                    }
+                    // No member pair and no ADL begin/end: as C++ refuses it, unless the class
+                    // offers CFlat's count() protocol.
+                    if (cxxRangeCandidate && !cxxMemberRange && !collNV.TypeAndValue.Pointer
+                        && freeBeginName.empty() && !hasMethod("count")
+                        && !compiler->CxxClassHasMemberNamed(collTypeName, "count"))
+                    {
+                        LogErrorContext(iterationStatement, std::format(
+                            "cannot range-for over C++ class '{}': it has no begin and end members, "
+                            "and argument-dependent lookup finds no usable begin/end ({})",
+                            compiler->DisplayCxxClassName(collTypeName),
+                            freeError.empty() ? std::string("no C++ import declares them")
+                                              : freeError));
+                        return;
+                    }
+                    if (cxxMemberRange && (!hasBegin || !hasEnd) && !hasMethod("count"))
+                    {
+                        const char* missing = !hasBegin ? "begin" : "end";
+                        std::string reason;
+                        if (foreignInfo != nullptr)
+                            if (auto refused = foreignInfo->refusedMembers.find(missing);
+                                refused != foreignInfo->refusedMembers.end())
+                                reason = ": " + refused->second;
+                        LogErrorContext(iterationStatement, std::format(
+                            "cannot range-for over C++ class '{}': its member '{}' cannot be "
+                            "called from CFlat{}",
+                            compiler->DisplayCxxClassName(collTypeName), missing, reason));
+                        return;
+                    }
+                    const bool freeRange = !freeBeginName.empty();
                     const bool isForeignRangeClass = !isFaceType && !isFixedArray && !isArrayView
-                        && foreignInfo != nullptr && hasBegin && hasEnd;
+                        && ((foreignInfo != nullptr && hasBegin && hasEnd) || freeRange);
 
                     if (isForeignRangeClass)
                     {
@@ -3128,6 +3366,9 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                             LLVMBackend::NamedVariable receiver = collNV;
                             receiver.TypeAndValue.VariableName.clear();
                             receiver.Primary = nullptr;
+                            // begin/end are called on the named __range: an lvalue.
+                            receiver.IsRvalue = false;
+                            receiver.IsExplicitMove = false;
                             return receiver;
                         };
 
@@ -3182,11 +3423,37 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                             collNV.Primary = nullptr;
                             collNV.TypeAndValue = collectionType;
                         }
+                        else if (collNV.Storage != nullptr && !collNV.TypeAndValue.Pointer
+                                 && compiler->IsOwnedTempValue(collNV))
+                        {
+                            // A constructed temporary (`for (x in R())`) is the object __range
+                            // names: adopt its slot as the hidden local, destroyed once at exit.
+                            auto collectionType = collNV.TypeAndValue;
+                            collectionType.VariableName = "__cflat_range_collection";
+                            auto& collectionVariable =
+                                compiler->GetOrCreateStackVariable(collectionType.VariableName);
+                            collectionVariable.Storage = collNV.Storage;
+                            collectionVariable.Primary = nullptr;
+                            collectionVariable.BaseType = compiler->GetType(collectionType);
+                            collectionVariable.TypeAndValue = collectionType;
+                            compiler->RecordMoveGenBind(collectionType.VariableName);
+                            compiler->UnregisterOwnedStructTemp(collNV.Storage);
+                            collNV.Primary = nullptr;
+                            collNV.TypeAndValue = collectionType;
+                        }
 
                         auto materializeIterator = [&](const std::string& name,
                                                        const char* method) -> LLVMBackend::NamedVariable {
                             std::optional<LLVMBackend::TypeAndValue> expectedResult;
-                            if (foreignInfo != nullptr)
+                            const std::string& freeName =
+                                std::string(method) == "begin" ? freeBeginName : freeEndName;
+                            if (freeRange)
+                            {
+                                if (auto fit = compiler->functionTable.find(freeName);
+                                    fit != compiler->functionTable.end() && fit->second.size() == 1)
+                                    expectedResult = fit->second.front().ReturnType;
+                            }
+                            else if (foreignInfo != nullptr)
                             {
                                 for (const auto& methodInfo : foreignInfo->directMethods)
                                     if (methodInfo.raw.name == method && methodInfo.params.size() == 1)
@@ -3217,8 +3484,10 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                                 compiler->pendingCxxSretDest_ = storage;
                                 compiler->pendingCxxSretTypeName_ = expectedResult->TypeName;
                             }
-                            auto* result = compiler->CreateOverloadedFunctionCall(
-                                method, { makeReceiver() }, false, {}, collNV.TypeAndValue.TypeName);
+                            auto* result = freeRange
+                                ? compiler->CreateOverloadedFunctionCall(freeName, { makeReceiver() }, true)
+                                : compiler->CreateOverloadedFunctionCall(
+                                      method, { makeReceiver() }, false, {}, collNV.TypeAndValue.TypeName);
                             auto resultType = compiler->lastCallReturnType;
                             auto* resultTemp = compiler->lastCxxRetTemp_;
                             auto* resultMarker = compiler->lastCxxRetValue_;
@@ -3257,7 +3526,16 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         if (!beginNV.TypeAndValue.Pointer
                             && compiler->IsCxxRecord(beginNV.TypeAndValue.TypeName))
                             for (const char* op : { "operator*", "operator++", "operator!=" })
-                                compiler->EnsureCxxMemberProjected(beginNV.TypeAndValue.TypeName, op);
+                            {
+                                const std::string& iteratorType = beginNV.TypeAndValue.TypeName;
+                                compiler->EnsureCxxMemberProjected(iteratorType, op);
+                                // A refused operator (operator* returning a reference to a class
+                                // not registered yet) is retried as a written `*it` retries it.
+                                const auto* iteratorInfo = compiler->GetCxxClassInfo(iteratorType);
+                                if (iteratorInfo != nullptr
+                                    && iteratorInfo->refusedMembers.count(op) != 0)
+                                    compiler->TryBindRefusedCxxMember(iteratorType, op);
+                            }
 
                         // Keep loop control in an empty frame. The iterator and collection locals
                         // live in the outer init frame, so break reaches resume without cleaning

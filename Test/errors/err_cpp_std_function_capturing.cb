@@ -1,11 +1,14 @@
 import cpp "cpp_interop_basic.h";
 import cpp "functional";
 
+// A named closure with an owning (string) capture reaching the explicit std.function
+// constructor: C++ would copy it, so it must be handed over with `move` (N50 ruling). A
+// scalar-capturing closure is accepted (Test/test_cpp_interop_bridge.cb 644-656).
 extern int main()
 {
-    int base = 1;
-    Lambda<int(int)> captured = (int x) => x + base;
-    expect_error("a capturing closure cannot be passed to C++; pass a plain function") {
+    string text = "abc";
+    Lambda<int(int)> captured = (int x) => x + text.length();
+    expect_error("cannot be copied into C++ 'std.function<int(int)>' implicitly; pass 'move captured'") {
         std.function<int(int)> f = std.function<int(int)>(captured);
     }
     return 0;

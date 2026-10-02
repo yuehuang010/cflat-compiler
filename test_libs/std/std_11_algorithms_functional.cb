@@ -2,6 +2,7 @@
 // FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
 import cpp "algorithm";
 import cpp "functional";
+import cpp "iterator";
 import cpp "numeric";
 import cpp "vector";
 int twice(int x) { return x * 2; }

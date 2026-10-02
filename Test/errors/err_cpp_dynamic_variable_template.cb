@@ -1,0 +1,10 @@
+// A C++ variable template whose initializer has side effects is not a constant; CFlat refuses
+// to read it by value instead of folding it and skipping the initializer.
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    expect_error("is not initialized by a constant expression, so CFlat cannot read it by value");
+    int v = cppi_entity.dyn_tmpl<int>;
+    return 0;
+}

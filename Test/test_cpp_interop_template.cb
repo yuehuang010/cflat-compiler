@@ -165,6 +165,12 @@
 //   `std.min` / `std.max` / `std.clamp` deduction with named variables and integer, negative, floating,
 //     character, bool, unsigned, and long literals; same-type controls, floating-literal identity,
 //     and an own-header `const T&` function-template control (2620-2640).
+//   A char* VALUE argument reaches C++ as writable char* (charconv/format_to_n shapes, hidden
+//     friend overloads char* vs const char*), a literal as const char* (2790-2796); a C++
+//     const char* result keeps its const pointee and never binds a C++ char* (2797-2800).
+//   MSVC STL shapes: an `auto` member of a class template, an inherited static operator(),
+//     ref-qualified operator() templates, operator= templates on a partial specialization, a
+//     variadic constructor argument from another import, an unevaluated declval (2652, 2654-2659).
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_basic.cpp";
@@ -231,6 +237,12 @@ cppi.DefArgNonConst defArgGlobal = default;
 
 expect_error("cppt_rev2_local.Thing") {
     cppt_rev2_local.Thing invisible = default;
+}
+expect_error("declare it as a '[cpp] struct'") {
+    struct PlainCflatBase : cppi_crtp.Counted<PlainCflatBase>
+    {
+        int tag() { return 13; }
+    };
 }
 
 namespace cppt_rev2_al1.deep { struct Thing { int value() { return 33; } }; }
@@ -336,6 +348,16 @@ int veciter_direct_array_param(std.array<int, 4> value)
     return cppi.array_total(value);
 }
 [cpp] struct AlnPatBase : alna.NBdef<int> { };
+[cpp] struct CrtpCounted : cppi_crtp.Counted<CrtpCounted> { int tag() { return 13; } };
+// A CRTP base naming its own derived type in a field and in by-value returns. The explicit
+// spelling `WeakHandle<CrtpSelfHandles>` and the base's `WeakHandle<Self>` are ONE type.
+[cpp] struct CrtpSelfHandles : cppi_crtp.SelfHandles<CrtpSelfHandles> { int value = default; };
+[cpp] struct CrtpEsfOwned : std.enable_shared_from_this<CrtpEsfOwned>
+{
+    cppi_crtp.StrongHandle<int> tracked = default;
+    int value = default;
+};
+int crtp_peek_handle(cppi_crtp.WeakHandle<CrtpSelfHandles>* handle) { return handle->get()->value; }
 
 // A C++ alias template in a FILE-SCOPE CFlat signature: the parameter and return types are
 // resolved by the ForwardRefScanner copy of the declaration path, not by the codegen copy.
@@ -471,7 +493,11 @@ char chs_char_source() { return 67; }
 int fopTwice(int v) { return v * 2; }
 
 struct TrrHolder { int f = default; };
+
+// A CFlat function returning a C++ std::nullptr_t alias (leg 2784): the value keeps its identity.
+cppt.arr.Nil cpptNilSource() { return nullptr; }
 int trrGeneric<T>(T v) { return cpptrr.bump(v); }
+long n63GatePointerArrive(cppt.dflt.Gate<>* gate) { return gate->arrive(); }
 
 extern int main()
 {
@@ -2495,6 +2521,45 @@ extern int main()
         AlnPatBase alnBase = default;
         if (alnBase.v != 7)                                                  return 2229;  // was 4
 
+        int crtpDestroyedBefore = cppi_crtp.destruction_count();
+        {
+            CrtpCounted crtp = default;
+            if (crtp.id() != 13)                                             return 2230;
+        }
+        if (cppi_crtp.destruction_count() != crtpDestroyedBefore + 1)         return 2231;
+
+        // Explicit locals of the CRTP base's self-typed handles (std::enable_shared_from_this
+        // shape). Pre-fix: the parameter's get() was a second, member-less spelling of the struct
+        // ("Undefined variable value") and std.weak_ptr<CrtpEsfOwned> had no destructor.
+        int crtpLiveBefore = cppi_crtp.live_handle_count();
+        {
+            CrtpSelfHandles selfHandles = default;
+            selfHandles.value = 41;
+            cppi_crtp.WeakHandle<CrtpSelfHandles> selfWeak = selfHandles.weak_from_this();
+            cppi_crtp.StrongHandle<CrtpSelfHandles> selfStrong = selfHandles.shared_from_this();
+            if (crtp_peek_handle(&selfWeak) != 41 || selfStrong.get()->value != 41) return 2232;
+            if (cppi_crtp.live_handle_count() != crtpLiveBefore + 3)          return 2233;
+        }
+        if (cppi_crtp.live_handle_count() != crtpLiveBefore)                 return 2234;
+        std.weak_ptr<CrtpEsfOwned> esfWeak = default;
+        {
+            std.shared_ptr<CrtpEsfOwned> esfOwner = std.make_shared<CrtpEsfOwned>();
+            esfOwner->value = 52;
+            std.weak_ptr<CrtpEsfOwned> esfEarly = esfOwner->weak_from_this();
+            if (esfEarly.use_count() != 1 || esfEarly.expired())             return 2235;
+            esfWeak = esfOwner->weak_from_this();
+            {
+                std.shared_ptr<CrtpEsfOwned> esfAgain = esfOwner->shared_from_this();
+                std.shared_ptr<CrtpEsfOwned> esfLocked = esfEarly.lock();
+                if (esfAgain->value != 52 || esfLocked->value != 52)       return 2236;
+                if (esfOwner.use_count() != 3 || esfWeak.use_count() != 3)  return 2237;
+            }
+            if (esfOwner.use_count() != 1)                                  return 2238;
+            if (cppi_crtp.live_handle_count() != crtpLiveBefore + 1)          return 2239;
+        }
+        if (!esfWeak.expired() || esfWeak.use_count() != 0)                 return 2240;
+        if (cppi_crtp.live_handle_count() != crtpLiveBefore)                 return 2241;
+
         // ---- C++ SCOPED-ENUM non-type template arguments. Pre-fix the argument was rendered as
         // its bare integer, so the request reaching clang ('cppi_scope::HueBox<2>') was ill-formed
         // for a scoped-enum parameter and the diagnostic blamed the class, not the argument.
@@ -3344,6 +3409,105 @@ extern int main()
         long long ctorMsN = 42;
         std.chrono.milliseconds ctorMs = std.chrono.milliseconds(ctorMsN);
         if (ctorMs.count() != 42)                                           return 2555;
+        // Explicit template argument on a function template of a nested std namespace. Passes
+        // here even pre-fix: cpp_interop_basic.h's TU publishes duration_cast; legs 2771/2772.
+        std.chrono.milliseconds castMs = std.chrono.milliseconds(4500);
+        std.chrono.seconds castS = std.chrono.duration_cast<std.chrono.seconds>(castMs);
+        if (castS.count() != 4)                                             return 2769;
+        std.chrono.milliseconds backMs = std.chrono.duration_cast<std.chrono.milliseconds>(castS);
+        if (backMs.count() != 4000)                                         return 2770;
+        // Same shape in a NON-std nested namespace whose template no harvest publishes (a
+        // std-only import's case): master parsed unit_cast<Whole, 1000> as a class type.
+        cppt.units.Milli unitMs = cppt.units.Milli(4500);
+        cppt.units.Whole unitS = cppt.units.unit_cast<cppt.units.Whole, 1000>(unitMs);
+        if (unitS.count() != 4)                                             return 2771;
+        if (cppt.units.unit_cast<cppt.units.Whole, 500>(unitMs).count() != 9) return 2772;
+        // A bare all-default class template names its `<>` specialization (std.barrier shape);
+        // master: "cannot find the type 'cppt.dflt.Gate'".
+        cppt.dflt.Gate gate = cppt.dflt.Gate(2);
+        if (gate.arrive() != 1 || cppt.dflt.done_calls() != 0)              return 2773;
+        if (gate.arrive() != 0 || cppt.dflt.done_calls() != 1)              return 2774;
+        cppt.dflt.Gate<> explicitGate = cppt.dflt.Gate<>(2);
+        if (n63GatePointerArrive(&explicitGate) != 1)                       return 2780;
+        auto inferredGate = cppt.dflt.Gate<>(1);
+        if (inferredGate.arrive() != 0 || cppt.dflt.done_calls() != 2)      return 2781;
+        // `T[]` template argument (make_unique<int[]> / unique_ptr<int[]> shape); master: "has an
+        // explicit type argument that cannot be spelled in C++", then the [[no_unique_address]]
+        // Deleter<int[]> field refused the record.
+        {
+            auto owned = cppt.arr.make_owner<int[]>(3);
+            owned[0] = 4; owned[2] = 6;
+            if (owned[0] + owned[1] + owned[2] != 10)                       return 2775;
+            cppt.arr.Owner<int[]> adopted = cppt.arr.Owner<int[]>(new int[2]);
+            adopted[1] = 7;
+            if (adopted[1] != 7)                                            return 2776;
+        }
+        if (cppt.arr.array_delete_count() != 2 || cppt.arr.scalar_delete_count() != 0) return 2777;
+        // reset<U>(p) lives on the PARTIAL specialization Owner<T[]> (unique_ptr<T[]> shape); the
+        // record alone offers reset(nullptr_t), which a non-null int* must never bind (it did:
+        // get() null, the replacement leaked).
+        {
+            cppt.arr.Owner<int[]> resettable = cppt.arr.Owner<int[]>(cppt.arr.raw_ints(2));
+            int* replacement = cppt.arr.raw_ints(3);
+            replacement[2] = 8;
+            resettable.reset(replacement);
+            if (resettable.get() != replacement || resettable[2] != 8)      return 2778;
+            if (cppt.arr.array_delete_count() != 3)                         return 2779;
+            resettable.reset(nullptr);
+            if (resettable.get() != nullptr || cppt.arr.array_delete_count() != 4) return 2780;
+            cppt.arr.NullSink sink = default;
+            sink.take(nullptr);
+            if (sink.hits != 1)                                             return 2781;
+            // Every std::nullptr_t-typed expression still binds: a ?: of nullptrs, a nullptr
+            // local (std.nullptr_t, the C++ alias, auto), and a CFlat call returning the alias.
+            bool nullFlag = sink.hits == 1;
+            sink.take(nullFlag ? nullptr : nullptr);
+            std.nullptr_t stdNil = nullptr;
+            sink.take(stdNil);
+            cppt.arr.Nil aliasNil = nullptr;
+            sink.take(aliasNil);
+            auto autoNil = nullptr;
+            sink.take(autoNil);
+            if (sink.hits != 5)                                             return 2783;
+            sink.take(cpptNilSource());
+            if (sink.hits != 6)                                             return 2784;
+            cppt.arr.Owner<int[]> ternaryReset = cppt.arr.Owner<int[]>(cppt.arr.raw_ints(1));
+            ternaryReset.reset(nullFlag ? nullptr : nullptr);
+            if (ternaryReset.get() != nullptr || cppt.arr.array_delete_count() != 5) return 2785;
+            // A C++ std::nullptr_t result binds and keeps its identity (auto included); a
+            // const std::nullptr_t& parameter takes nullptr; nullptr deduces std::nullptr_t
+            // (clang), never void*, while an int* still deduces int*.
+            sink.take(cppt.arr.make_nil());
+            auto madeNil = cppt.arr.make_nil_alias();
+            sink.take(madeNil);
+            if (sink.hits != 8 || cppt.arr.make_nil() != nullptr)          return 2786;
+            if (sink.take_ref(nullptr) != 7 || sink.take_ref(aliasNil) != 7) return 2787;
+            if (cppt.arr.nil_ref(nullptr) != 8 || cppt.arr.nil_ref(madeNil) != 8) return 2788;
+            if (cppt.arr.nil_kind(nullptr) != 1 || cppt.arr.nil_kind(stdNil) != 1) return 2789;
+            int nilProbe = 4;
+            if (cppt.arr.nil_kind(&nilProbe) != 2 || sink.kind(&nilProbe) != 2) return 2870;
+            if (sink.kind(nullptr) != 1 || sink.kind(aliasNil) != 1)        return 2871;
+            if (cppt.arr.nil_kind_fwd(nullptr) != 1 || cppt.arr.nil_kind_fwd(madeNil) != 1) return 2872;
+            if (sink.take_default() != 9 || sink.take_default(nullptr) != 9) return 2873;
+            if (cppt.arr.nil_kind(autoNil) != 1)                            return 2874;
+            // A pointer expression is never the null type. `p + 1` and `f ? p : nullptr` carry no
+            // pointee type yet, so deduction refuses them (clang: int*) - never std::nullptr_t.
+            int* nilPtr = &nilProbe;
+            expect_error("cannot be spelled in C++") { int arithKind = cppt.arr.nil_kind(nilPtr + 1); }
+            expect_error("cannot be spelled in C++") { int mixKind = cppt.arr.nil_kind(nullFlag ? nilPtr : nullptr); }
+            if (cppt.arr.nil_order(nilPtr) != 2 || cppt.arr.nil_order(nullptr) != 1
+                || cppt.arr.nil_order(stdNil) != 1 || cppt.arr.nil_order((void*)nilPtr) != 3) return 2876;
+            if (sink.order(nilPtr) != 2 || sink.order(nullptr) != 1 || sink.order(aliasNil) != 1) return 2877;
+            if (cppt.arr.nil_ov(nullptr) != 11 || cppt.arr.nil_ov(nilPtr) != 10
+                || cppt.arr.nil_ov(stdNil) != 11)                           return 2878;
+            // nullptr_t -> nullptr_t is identity; nullptr_t -> bool is not a call conversion.
+            if (cppt.arr.nil_direct(stdNil) != 1 || cppt.arr.nil_direct(aliasNil) != 1
+                || cppt.arr.nil_direct(autoNil) != 1 || cppt.arr.nil_direct(nullptr) != 1
+                || cppt.arr.nil_direct(madeNil) != 1)                       return 2879;
+            void* nilVoid = nilPtr;
+            if (cppt.arr.nil_order(nilVoid) != 3 || cppt.arr.nil_order(nilPtr) != 2) return 2880;
+        }
+        if (cppt.arr.array_delete_count() != 5)                             return 2782;
         std.tuple<int, int> ctorTup = std.tuple<int, int>(7, 8);
         if (std.get<0>(ctorTup) != 7)                                       return 2556;
         if (std.get<1>(ctorTup) != 8)                                       return 2557;
@@ -3602,6 +3766,74 @@ extern int main()
         int mmExprOther = 5;
         if (std.min(mmInt, mmExprOther + 1) != 3)                           return 2635;
         if (std.max(mmInt + 1, mmExprOther) != 5)                           return 2636;
+    }
+
+    // A char* VALUE reaches C++ as writable char*: charconv-shaped first/last + int& out, and a
+    // format_to_n-shaped output iterator beside a consteval format-string parameter.
+    {
+        char[16] st5Buf = {};
+        auto st5Conv = cppst5.to_text(&st5Buf[0], &st5Buf[15], 1234);
+        if (st5Conv.ec != 0 || (int)(st5Conv.ptr - &st5Buf[0]) != 4)     return 2790;
+        int st5Parsed = 0;
+        auto st5Parse = cppst5.from_text(&st5Buf[0], st5Conv.ptr, st5Parsed);
+        if (st5Parse.ec != 0 || st5Parsed != 1234)                         return 2791;
+        char[3] st5Small = {};
+        if (cppst5.to_text(&st5Small[0], &st5Small[2], 1234).ec != 75)    return 2792;
+        char[16] st5Out = default;
+        auto st5Written = cppst5.fmt_n(&st5Out[0], (i64)15, "v={{}}", 42);
+        st5Out[st5Written.size] = 0;
+        if (strcmp(&st5Out[0], "v=42") != 0 || st5Written.size != 4
+            || (int)(st5Written.out - &st5Out[0]) != 4)                     return 2793;
+        char[8] st5Trunc = default;
+        auto st5Cut = cppst5.fmt_n(&st5Trunc[0], (i64)3, "v={{}}", 4200);
+        if (st5Cut.size != 6 || st5Trunc[2] != '4' || st5Trunc[3] != 0)    return 2794;
+        // Free-function wrapper (ADL hidden friends): char* value -> char* overload, literal -> const.
+        cppst5.Sink st5Sink = default;
+        char[4] st5Cell = {};
+        st5Cell[0] = 'a';
+        if ((st5Sink << &st5Cell[0]) != 2 || st5Cell[0] != 'W')             return 2795;
+        if ((st5Sink << "lit") != 1 || st5Sink.last != 1)                  return 2796;
+        // A C++ `const char*` result keeps its const pointee: the const overload, a const T
+        // deduction, the const overload of an overload set, and no write through a char* friend.
+        cppst5.Deduce st5Deduce = default;
+        cppst5.Text st5Text = default;
+        if ((st5Sink << st5Text.c_str()) != 1 || st5Text.buf[0] != 'a')    return 2797;
+        if ((st5Deduce << st5Text.c_str()) != 52)                          return 2798;
+        if ((st5Sink << cppst5.find_in(st5Text.c_str(), 'b')) != 1
+            || st5Text.buf[1] != 'b')                                       return 2799;
+        if ((st5Deduce << cppst5.find_in(&st5Text.buf[0], 'b')) != 51)     return 2800;
+        cppst5.ConstField st5Field = default;
+        if ((st5Sink << st5Field.p) != 1 || (st5Deduce << st5Field.p) != 52) return 2801;
+        cppst5.WriteOnly st5WriteOnly = default;
+        expect_error("cannot pass C++ const pointer argument") {
+            int st5Refused = st5WriteOnly << st5Text.c_str();
+        }
+    }
+    // ---- MSVC STL shapes (std tier on Windows) ---------------------------------------------------
+    {
+        int[4] win = default;
+        win[0] = 5; win[1] = 6; win[2] = 7; win[3] = 8;
+        cppmsvc.Window<int> w = cppmsvc.Window<int>(&win[0], 4);
+        // `auto` member of a class template: the return type is deduced at binding.
+        if (w.drop(1).size() != 3 || w.drop(2).front() != 7)               return 2657;
+        // Inherited static operator(), on a temporary and on a named value.
+        if (cppmsvc.Hasher<int>()(4) != 13)                                 return 2658;
+        cppmsvc.Hasher<int> hasher = default;
+        if (hasher(5) != 16)                                                return 2652;
+        // operator() templates (ref-qualified) behind a private base.
+        auto notSeven = cppmsvc.negate_seven();
+        if (!notSeven(6) || notSeven(7))                                    return 2659;
+        // Converting operator= template declared on a partial specialization.
+        int tx = 0; int ty = 0;
+        auto tsource = cppmsvc.pair_of(3, 9);
+        cppmsvc.tie_all(tx, ty) = tsource;
+        if (tx != 3 || ty != 9)                                             return 2654;
+        // A variadic constructor argument whose type lives in another import's header.
+        cppbv.BraceTmpNoStd argPair = cppbv.BraceTmpNoStd(1, 2);
+        cppmsvc.ArgCount counted = cppmsvc.ArgCount(argPair);
+        if (counted.n != 1)                                                 return 2655;
+        // A callee named only in an unevaluated decltype is never instantiated.
+        if (cppmsvc.run_seven() != 7)                                       return 2656;
     }
 
     return 0;

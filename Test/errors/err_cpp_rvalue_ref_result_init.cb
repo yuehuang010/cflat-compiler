@@ -1,0 +1,25 @@
+// A C++ call returning `U&&` is an xvalue of U. It move-constructs / move-assigns a C++ class T
+// only when U is T; any other U&& (a scalar, another class) is refused with a message that names
+// the rvalue-reference result rather than the generic "cannot initialize from this expression".
+import cpp "cpp_interop_basic.h";
+
+expect_error("cannot return C++ class 'cppi.ConvertTarget' from the rvalue reference 'cppi.Tracked&&' this call returns") {
+    cppi.ConvertTarget rref_return_other(cppi.Tracked* t) { return cppi.xv_pass(*t); }
+}
+
+extern int main()
+{
+    expect_error("cannot initialize C++ class 'cppi.ConvertTarget' from the rvalue reference 'long&&' this call returns") {
+        cppi.ConvertTarget fromScalar = cppi.rref_long();
+    }
+    expect_error("cannot initialize C++ class 'cppi.ConvertTarget' from the rvalue reference 'cppi.Tracked&&' this call returns") {
+        cppi.Tracked t = cppi.Tracked(1);
+        cppi.ConvertTarget fromOther = cppi.xv_pass(t);
+    }
+    expect_error("cannot assign to C++ class 'cppi.ConvertTarget' from the rvalue reference 'long&&' this call returns") {
+        cppi.ConvertSource source = cppi.ConvertSource(2);
+        cppi.ConvertTarget target = cppi.ConvertTarget(source);
+        target = cppi.rref_long();
+    }
+    return 0;
+}

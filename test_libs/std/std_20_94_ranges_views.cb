@@ -1,6 +1,5 @@
 // GUARDS: C++20 iota/filter/transform/take views compose and run with CFlat callables
 // FROM: internal/plan/std-library-smoke-suite.md (C++20 coverage map)
-// DISABLED: internal/issue/p2/cpp-ranges-view-callable-argument-unspellable.md
 import cpp "ranges";
 import cpp "functional";
 bool is_even(int value) { return value % 2 == 0; }

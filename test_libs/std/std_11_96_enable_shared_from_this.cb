@@ -1,8 +1,7 @@
 // GUARDS: enable_shared_from_this returns another shared owner of the current object
 // FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
-// DISABLED: internal/issue/p2/std-enable-shared-from-this-base.md
 import cpp "memory";
-struct SelfShared : std.enable_shared_from_this<SelfShared>
+[cpp] struct SelfShared : std.enable_shared_from_this<SelfShared>
 {
     int value = default;
 };
@@ -11,6 +10,8 @@ extern int main()
     int failures = 0;
     std.shared_ptr<SelfShared> owner = std.make_shared<SelfShared>();
     owner->value = 17;
+    std.weak_ptr<SelfShared> weak = owner->weak_from_this();
+    if (weak.use_count() != 1 || weak.expired()) { printf("FAIL enable_shared_from_this weak\n"); failures |= 1; }
     std.shared_ptr<SelfShared> again = owner->shared_from_this();
     if (again->value != 17 || owner.use_count() != 2) { printf("FAIL enable_shared_from_this\n"); failures |= 1; }
     if (failures == 0) printf("PASS std_11_96_enable_shared_from_this\n");

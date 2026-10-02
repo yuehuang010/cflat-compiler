@@ -677,6 +677,10 @@
     "cppstructconstructor...erarg0hasnocspelling21dc1cbbde141cfe": [
       "function<void()>"
     ],
+    "ctemplatebasearg0use...asactemplateargumentfb39b4fa4c203230": [
+      "cppi_crtp.Counted",
+      "PlainCflatBase"
+    ],
     "doesnotoverridearg0a...g2arg3candidatesarg4b305bda17139c1a7": [
       "cpppoly.Shape",
       "area",
@@ -2025,6 +2029,7 @@
     "cppstructcannotbeaunion": "[cpp] struct cannot be a union",
     "cppstructconstructor...erarg0hasnocspelling21dc1cbbde141cfe": "[cpp] struct constructor parameter '{0}' has no C++ spelling",
     "crashhandlersourcenotfoundarg0": "crash handler source not found: '{0}'.",
+    "ctemplatebasearg0use...asactemplateargumentfb39b4fa4c203230": "C++ template base '{0}' uses CFlat type '{1}'; declare it as a '[cpp] struct' to use it as a C++ template argument",
     "defaultargumentforpa...hasanunsupportedtype5d022dd279a3e61f": "default argument for parameter '{0}' of '{1}' has an unsupported type",
     "defaultnullptrforpar...0ofarg1isnotapointer87bfc7d94fc952b0": "default nullptr for parameter '{0}' of '{1}' is not a pointer",
     "doesnotoverridearg0a...g2arg3candidatesarg4b305bda17139c1a7": "does not override '{0}.{1}' (expected {2}({3}); candidates: {4})",

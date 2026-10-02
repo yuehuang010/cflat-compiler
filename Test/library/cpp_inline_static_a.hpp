@@ -1,3 +1,4 @@
+#include "cpp_group_shared.hpp"
 static int cpp_inline_static_calls = 0;
 static const int cpp_inline_const_table[3] = {1, 2, 3};
 static inline void cpp_record_static_call() { ++cpp_inline_static_calls; }
@@ -8,3 +9,7 @@ inline int cpp_inline_static_count_a() { return cpp_inline_static_calls; }
 static inline int cpp_same_static_g(int x) { return x + 1; }
 static inline int cpp_same_static_f(int x) { return cpp_same_static_g(x); }
 inline int cpp_inline_static_fa(int x) { return cpp_same_static_f(x) * 10; }
+constexpr int cpp_group_k = 1;
+namespace cpp_group_ns { static int counter = 10; }
+constexpr int cpp_group_only_a = 41;
+inline constexpr int cpp_group_inline_k = 6;

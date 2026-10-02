@@ -17,5 +17,11 @@ extern int main()
     expect_error("inline array field of a temporary") {
         cpptw.Twin spilled = move make_twin_spill_box().values[0];
     }
+    // [stmt.ranged] looks begin/end up by ADL only: global begin/end for a cpptw class do not count.
+    expect_error("argument-dependent lookup finds no usable begin/end (clang: no matching function for call to 'begin')") {
+        cpptw.OrdinaryLookupRange values = default;
+        int sum = 0;
+        for (int v in values) sum = sum + v;
+    }
     return 0;
 }

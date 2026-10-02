@@ -5,6 +5,12 @@ import cpp "../library/cpp_interop_define_special.h" define "CFLAT_DEFINE_SPECIA
 
 extern int main()
 {
+    expect_error("is not a generic type") {
+        cppt.dflt.CountDone<> value = default;
+    }
+    expect_error("is not a generic type") {
+        cppt.dflt.CountDone made = cppt.dflt.CountDone<>();
+    }
     expect_error("call to consteval function") {
         char* format = "runtime";
         cppceval.first(format, 7);

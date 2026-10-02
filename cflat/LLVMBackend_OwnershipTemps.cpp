@@ -5269,6 +5269,11 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
                 && (IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName)
                     || HasForeignNontrivialCxxField(namedVar.TypeAndValue.TypeName))
                 && namedVar.ConditionalDropFlag == nullptr) return;
+            if (namedVar.Storage == returnedStructDtorShellAlloca)
+            {
+                EmitConditionalFullDestructor(namedVar, returnedStructDtorShellFunction);
+                return;
+            }
             // Skip the struct value being moved out via `return` - the caller now owns it.
             if (namedVar.Storage == returnedStructDtorSkipAlloca) return;
             // A fixed-array local (`T[N] a;`) owns every element - destruct all N.

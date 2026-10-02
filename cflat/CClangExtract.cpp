@@ -86,6 +86,83 @@ namespace cflat_cinterop
 {
     using namespace clang;
 
+    std::string AliasCxxNestedSpecializationNames(const std::string& source)
+    {
+        auto identChar = [](char c) { return std::isalnum((unsigned char)c) != 0 || c == '_'; };
+        uint64_t hash = 14695981039346656037ULL;
+        for (unsigned char c : source) hash = (hash ^ c) * 1099511628211ULL;
+        const std::string tag = std::format("{:016x}", hash);
+        const std::string key = "__cflat_ax_key_" + tag;
+        const std::string set = "__cflat_ax_set_" + tag;
+        const std::string get = "__cflat_ax_get_" + tag;
+        std::string out = source;
+        std::map<std::string, std::string> aliases;
+        std::string decls;
+        size_t firstUse = std::string::npos;
+        size_t from = 0;
+        for (size_t pos; (pos = out.find(">::", from)) != std::string::npos; )
+        {
+            // The specialization's '<' (an arrow is not a closing angle).
+            int depth = 0;
+            size_t open = std::string::npos;
+            for (size_t i = pos + 1; i-- > 0; )
+            {
+                if (out[i] == '>' && !(i > 0 && out[i - 1] == '-')) ++depth;
+                else if (out[i] == '<' && --depth == 0) { open = i; break; }
+            }
+            size_t start = open;
+            while (start != std::string::npos && start > 0
+                   && (identChar(out[start - 1]) || out[start - 1] == ':'))
+                --start;
+            const size_t nameBegin = pos + 3;
+            size_t end = nameBegin;
+            while (end < out.size() && identChar(out[end])) ++end;
+            const std::string name = out.substr(nameBegin, end - nameBegin);
+            if (open == std::string::npos || start == open || name.empty() || name == "operator"
+                || name == "template" || std::isdigit((unsigned char)name[0]))
+            {
+                from = pos + 3;
+                continue;
+            }
+            if (end < out.size() && out[end] == '<')
+            {
+                int args = 0;
+                size_t close = end;
+                for (; close < out.size(); ++close)
+                {
+                    if (out[close] == '<') ++args;
+                    else if (out[close] == '>' && out[close - 1] != '-' && --args == 0) break;
+                }
+                if (close == out.size()) { from = pos + 3; continue; }
+                end = close + 1;
+            }
+            const std::string spelled = out.substr(start, end - start);
+            auto [it, inserted] = aliases.emplace(spelled, std::string());
+            if (inserted)
+            {
+                const std::string index = std::to_string(aliases.size() - 1);
+                it->second = "__cflat_ax_" + tag + "_" + index;
+                const std::string tagName = "__cflat_ax_tag_" + tag + "_" + index;
+                decls += "struct " + tagName + ";\n";
+                decls += "template struct " + set + "<" + tagName + ", " + spelled + ">;\n";
+                decls += "typedef __remove_pointer(decltype(" + get + "(" + key + "<" + tagName
+                    + ">{}))) " + it->second + ";\n";
+            }
+            out.replace(start, end - start, it->second);
+            firstUse = std::min(firstUse, start);
+            from = start;
+        }
+        if (decls.empty()) return source;
+        size_t lineStart = out.rfind('\n', firstUse == 0 ? 0 : firstUse - 1);
+        lineStart = (lineStart == std::string::npos || firstUse == 0) ? 0 : lineStart + 1;
+        const std::string prologue =
+            "template <class> struct " + key + " { friend auto " + get + "(" + key + "); };\n"
+            "template <class Tag, class T> struct " + set + " { friend auto " + get + "(" + key
+            + "<Tag>) { return (T *)nullptr; } };\n";
+        out.insert(lineStart, prologue + decls);
+        return out;
+    }
+
     std::string CxxForeignIdentity(const std::string& spelling)
     {
         // Keep multi-word primitive template arguments aligned with the CFlat spellings emitted
@@ -372,6 +449,33 @@ namespace cflat_cinterop
                 }
             }
             return key;
+        }
+
+        // True when a constant value is or contains an address (pointer, reference, member
+        // pointer, label difference) - something no two import groups can share by value.
+        bool ApValueHoldsAddress(const clang::APValue& v)
+        {
+            switch (v.getKind())
+            {
+            case clang::APValue::LValue:
+            case clang::APValue::MemberPointer:
+            case clang::APValue::AddrLabelDiff:
+                return true;
+            case clang::APValue::Struct:
+                for (unsigned i = 0; i < v.getStructNumBases(); ++i)
+                    if (ApValueHoldsAddress(v.getStructBase(i))) return true;
+                for (unsigned i = 0; i < v.getStructNumFields(); ++i)
+                    if (ApValueHoldsAddress(v.getStructField(i))) return true;
+                return false;
+            case clang::APValue::Union:
+                return v.getUnionField() != nullptr && ApValueHoldsAddress(v.getUnionValue());
+            case clang::APValue::Array:
+                for (unsigned i = 0; i < v.getArrayInitializedElts(); ++i)
+                    if (ApValueHoldsAddress(v.getArrayInitializedElt(i))) return true;
+                return v.hasArrayFiller() && ApValueHoldsAddress(v.getArrayFiller());
+            default:
+                return false;
+            }
         }
 
         std::string StaticCxxGlobalAlias(const std::string& importGroupKey,
@@ -1332,7 +1436,11 @@ namespace cflat_cinterop
                 const bool isMemberAssignmentOperatorTemplate = md != nullptr
                     && md->getOverloadedOperator() == OO_Equal
                     && !md->isCopyAssignmentOperator() && !md->isMoveAssignmentOperator();
+                // A member operator() template (MSVC STL _Not_fn) is CFlat's `obj(args)`.
+                const bool isMemberCallOperatorTemplate = md != nullptr
+                    && md->getOverloadedOperator() == OO_Call;
                 if (!fd->getIdentifier() && !isFreeBinaryOperatorTemplate
+                    && !isMemberCallOperatorTemplate
                     && !isMemberAssignmentOperatorTemplate) return true;
 
                 unsigned typeParameterCount = 0;
@@ -1377,8 +1485,29 @@ namespace cflat_cinterop
                 result.kind = md == nullptr ? RawFunctionTemplate::Free
                     : md->isStatic() ? RawFunctionTemplate::StaticMember
                                      : RawFunctionTemplate::InstanceMember;
+                // A member of a PARTIAL specialization's pattern (`unique_ptr<_Tp[], _Dp>`) is
+                // named through its primary template: clang prints the partial's arguments.
+                const auto* partialOwner = md != nullptr
+                    ? llvm::dyn_cast<ClassTemplatePartialSpecializationDecl>(md->getParent()) : nullptr;
+                // A member template of an instantiation of a PARTIAL specialization (the MSVC
+                // STL's tuple<_This, _Rest...>; only its instantiations reach this visitor)
+                // answers to its class template's name, as the primary's members do.
+                const auto* specOwner = md == nullptr || partialOwner != nullptr ? nullptr
+                    : llvm::dyn_cast<ClassTemplateSpecializationDecl>(md->getParent());
+                if (specOwner != nullptr
+                    && (specOwner->getSpecializationKind() != TSK_ImplicitInstantiation
+                        || !llvm::isa<ClassTemplatePartialSpecializationDecl*>(
+                               specOwner->getSpecializedTemplateOrPartial())))
+                    specOwner = nullptr;
+                const std::string ownerName = partialOwner != nullptr
+                    ? CxxQualifiedName(partialOwner->getSpecializedTemplate()->getTemplatedDecl())
+                    : specOwner != nullptr ? CxxQualifiedName(specOwner->getSpecializedTemplate())
+                    : md != nullptr ? CxxQualifiedName(md->getParent()) : std::string();
                 result.name = isFreeBinaryOperatorTemplate
-                    ? CxxEnclosingNamespaceName(fd) : CxxQualifiedName(fd);
+                    ? CxxEnclosingNamespaceName(fd)
+                    : partialOwner != nullptr || specOwner != nullptr
+                        ? ownerName + "." + fd->getNameAsString()
+                        : CxxQualifiedName(fd);
                 // An operator's name is never a dotted identifier ("std.operator+"); the
                 // namespace prefix it carries is validated instead.
                 if (isFreeBinaryOperatorTemplate)
@@ -1389,12 +1518,12 @@ namespace cflat_cinterop
                         && !IsValidDottedName(result.name.substr(0, dot)))
                         return true;
                 }
-                else if (isMemberAssignmentOperatorTemplate
-                    ? !IsValidDottedName(CxxQualifiedName(md->getParent()))
+                else if (isMemberAssignmentOperatorTemplate || isMemberCallOperatorTemplate
+                    ? !IsValidDottedName(ownerName)
                     : !IsValidDottedName(result.name)) return true;
                 if (md != nullptr)
                 {
-                    result.owner = CxxQualifiedName(md->getParent());
+                    result.owner = ownerName;
                     result.memberName = fd->getNameAsString();
                 }
                 result.cxxSpelling = "::" + result.name;
@@ -1986,6 +2115,29 @@ namespace cflat_cinterop
                             RawRecord nested;
                             nested.name = synTag;
                             nested.isUnion = isUnion;
+                            // Inside a C++ class it is C++ too: an unmappable member (libc++'s
+                            // compressed-pair padding) still embeds as opaque bytes.
+                            nested.isCxx = st.req.cxxMode;
+                            // A C++ record also carries clang's triviality verdict, or a trivially
+                            // copyable member reads as nontrivial with no copy constructor.
+                            if (const auto* anonCxx = llvm::dyn_cast<CXXRecordDecl>(anon);
+                                anonCxx != nullptr && st.req.cxxMode)
+                            {
+                                nested.isTrivial = anonCxx->isTrivial();
+                                nested.isTriviallyCopyable = anonCxx->isTriviallyCopyable()
+                                    && !anonCxx->hasNonTrivialDestructor()
+                                    && !anonCxx->isPolymorphic();
+                                nested.isTriviallyRelocatable = st.ci != nullptr
+                                    && st.ci->hasSema()
+                                    && st.ci->getSema().IsCXXTriviallyRelocatableType(*anonCxx);
+                                nested.hasTrivialDefaultCtor = anonCxx->hasTrivialDefaultConstructor();
+                                nested.hasTrivialCopyCtor = anonCxx->hasTrivialCopyConstructor();
+                                nested.hasTrivialCopyAssign = anonCxx->hasSimpleCopyAssignment()
+                                    && anonCxx->hasTrivialCopyAssignment();
+                                nested.hasTrivialMoveAssign = anonCxx->hasSimpleMoveAssignment()
+                                    && anonCxx->hasTrivialMoveAssignment();
+                                nested.hasTrivialDtor = !anonCxx->hasNonTrivialDestructor();
+                            }
                             // A synthetic anonymous member is never independently in-scope; it is
                             // pulled into the kept set only when its enclosing record is (via the
                             // "struct <tag>__anon<N>" field reference the closure walk follows).
@@ -2133,6 +2285,14 @@ namespace cflat_cinterop
                 rec.hasBases = cxx->getNumBases() > 0 || cxx->getNumVBases() > 0;
                 rec.hasVirtualBases = cxx->getNumVBases() > 0;
                 rec.isAbstract = cxx->isAbstract();
+                for (const FriendDecl* fr : cxx->friends())
+                    if (const auto* named = fr->getFriendDecl())
+                        if (const auto* fn = named->getAsFunction();
+                            fn != nullptr && fn->getOverloadedOperator() != OO_None)
+                        {
+                            rec.hasFriendOperators = true;
+                            break;
+                        }
                 rec.hasTrivialDefaultCtor = cxx->hasTrivialDefaultConstructor();
                 rec.hasTrivialCopyCtor = cxx->hasTrivialCopyConstructor();
                 rec.hasTrivialCopyAssign = cxx->hasSimpleCopyAssignment()
@@ -2148,6 +2308,11 @@ namespace cflat_cinterop
                 for (const Decl* d : cxx->decls())
                 {
                     const auto* ftd = llvm::dyn_cast<FunctionTemplateDecl>(d);
+                    if (const auto* assign = ftd != nullptr
+                            ? llvm::dyn_cast<CXXMethodDecl>(ftd->getTemplatedDecl()) : nullptr;
+                        assign != nullptr && assign->getOverloadedOperator() == OO_Equal
+                        && !assign->isDeleted())
+                        rec.hasAssignTemplate = true;
                     const auto* ctor = ftd != nullptr
                         ? llvm::dyn_cast<CXXConstructorDecl>(ftd->getTemplatedDecl()) : nullptr;
                     if (ctor == nullptr) continue;
@@ -2193,7 +2358,12 @@ namespace cflat_cinterop
                 if (const auto* spec = llvm::dyn_cast<ClassTemplateSpecializationDecl>(cxx);
                     spec != nullptr && spec->getSpecializedTemplate() != nullptr)
                 {
-                    const CXXRecordDecl* pattern = spec->getSpecializedTemplate()->getTemplatedDecl();
+                    // Instantiated from a partial specialization (unique_ptr<T[]>): its members.
+                    const auto from = spec->getSpecializedTemplateOrPartial();
+                    const CXXRecordDecl* pattern =
+                        from.is<ClassTemplatePartialSpecializationDecl*>()
+                            ? from.get<ClassTemplatePartialSpecializationDecl*>()
+                            : spec->getSpecializedTemplate()->getTemplatedDecl();
                     for (const Decl* d : pattern->decls())
                         if (const auto* ftd = llvm::dyn_cast<FunctionTemplateDecl>(d))
                             VisitFunctionTemplateDecl(const_cast<FunctionTemplateDecl*>(ftd));
@@ -2393,6 +2563,22 @@ namespace cflat_cinterop
                     if (ctor == nullptr && dtor == nullptr && md->getIdentifier() == nullptr
                         && !isAssignSpecial && !isBindableOperator)
                         continue;
+                    // An `auto` member of a class template instantiation (MSVC STL span::subspan)
+                    // has no return type until its body is instantiated: deduce it as a call would.
+                    if (st.req.RecordsDefinitionDemand() && st.ci != nullptr && st.ci->hasSema()
+                        && md->getReturnType()->isUndeducedType() && !md->isInvalidDecl()
+                        && !md->isDependentContext()
+                        && md->getTemplateInstantiationPattern() != nullptr)
+                    {
+                        Sema& sema = st.ci->getSema();
+                        clang::Scope tuScope(nullptr, clang::Scope::DeclScope,
+                                             st.ci->getDiagnostics());
+                        const bool lendScope = sema.TUScope == nullptr;
+                        if (lendScope) sema.TUScope = &tuScope;
+                        sema.DeduceReturnType(const_cast<CXXMethodDecl*>(md), md->getLocation(),
+                                              /*Diagnose*/ false);
+                        if (lendScope) sema.TUScope = nullptr;
+                    }
 
                     RawCxxMember m;
                     if (ctor != nullptr)
@@ -3191,6 +3377,64 @@ namespace cflat_cinterop
              * only producer of records. A ClassTemplateSpecializationDecl is not a child of its
              * DeclContext, which is why the typedef (a real top-level decl) is the handle.
              */
+            /*
+             * A `decltype(<variable>)` request marker: publish the variable's constant value under
+             * the marker name. A variable-template specialization is instantiated first (decltype
+             * is unevaluated, so Sema has not done it). Non-constant or non-scalar -> nothing.
+             */
+            // constexpr, or a const whose initializer is a side-effect-free constant initializer.
+            bool IsFoldableConstantInit(const VarDecl* vd, const Expr* init) const
+            {
+                if (vd->isConstexpr()) return true;
+                return !init->HasSideEffects(ctx)
+                    && init->isConstantInitializer(ctx, vd->getType()->isReferenceType());
+            }
+
+            void EmitRequestedConstant(const DecltypeType* dt, const TypedefNameDecl* td,
+                                       const std::string& marker)
+            {
+                const auto* ref = llvm::dyn_cast_or_null<DeclRefExpr>(
+                    dt->getUnderlyingExpr() != nullptr ? dt->getUnderlyingExpr()->IgnoreParens() : nullptr);
+                auto* vd = ref != nullptr ? llvm::dyn_cast<VarDecl>(const_cast<ValueDecl*>(ref->getDecl())) : nullptr;
+                if (vd == nullptr || !vd->isFileVarDecl() || vd->isStaticDataMember()) return;
+                if (!vd->getType().isConstQualified() && !vd->isConstexpr()) return;
+                if (vd->getAnyInitializer() == nullptr && st.ci != nullptr && st.ci->hasSema()
+                    && llvm::isa<VarTemplateSpecializationDecl>(vd))
+                    st.ci->getSema().InstantiateVariableDefinition(td->getLocation(), vd);
+                const VarDecl* def = vd->getDefinition();
+                const Expr* init = def != nullptr ? def->getInit() : vd->getAnyInitializer();
+                if (init == nullptr || init->containsErrors() || init->isValueDependent()) return;
+                // Folding skips the initializer, so only a constant initialization may fold
+                // (`inline const int v = (++counter, 27);` must run). No live binding here.
+                if (!IsFoldableConstantInit(vd, init))
+                {
+                    st.out.invalidCxxTypeRequestError = std::format(
+                        "C++ variable '{}' {}", CxxQualifiedName(vd), kCxxNotConstantVariableRefusal);
+                    return;
+                }
+                Expr::EvalResult result;
+                if (!init->EvaluateAsRValue(result, ctx)) return;
+                RawGlobalVar g;
+                g.name = marker;
+                g.qualifiedName = marker;
+                g.ctype = CanonicalSpelling(ctx, vd->getType().getUnqualifiedType());
+                g.isConst = true;
+                g.isCompileTimeConstant = true;
+                g.isCxxConstexpr = true;
+                if (result.Val.isInt())
+                    g.constantValue = ApsIntToLongLong(result.Val.getInt());
+                else if (result.Val.isFloat())
+                {
+                    bool losesInfo = false;
+                    g.isFloatConstant = true;
+                    g.floatValue = ApFloatToDouble(result.Val.getFloat(), &losesInfo);
+                }
+                else
+                    return;
+                LocOfRaw(vd, g.file, g.line, g.col);
+                st.out.globals.push_back(std::move(g));
+            }
+
             bool ProcessTypeRequests(TranslationUnitDecl* root)
             {
                 // A completion request names header records by CFlat identity; its markers are
@@ -3297,10 +3541,51 @@ namespace cflat_cinterop
                         if (cand != nullptr && cand->getNameAsString() == marker) { td = cand; break; }
                     }
                     if (td == nullptr) continue;
+                    // `decltype(ns::v)` / `decltype(ns::v_t<T>)`: a namespace-scope constant
+                    // (std::numbers::pi), folded to its value; never bound as a type.
+                    if (const auto* dt = llvm::dyn_cast<DecltypeType>(
+                            td->getUnderlyingType().getTypePtr()))
+                    {
+                        EmitRequestedConstant(dt, td, marker);
+                        if (!st.out.invalidCxxTypeRequestError.empty()) return false;
+                        continue;
+                    }
                     QualType canon = td->getUnderlyingType().getCanonicalType();
                     auto* cxx = canon->getAsCXXRecordDecl();
                     if (cxx == nullptr)
                     {
+                        /*
+                         * An enum (std::byte, std::endian): a head entry named by the marker carries
+                         * the type, then every enumerator as "<marker>.<name>". The enum may live
+                         * outside the header's in-scope region, so no in-scope gate applies here.
+                         */
+                        if (const auto* et = canon->getAs<EnumType>();
+                            et != nullptr && !canon->isDependentType())
+                        {
+                            const EnumDecl* ed = et->getDecl()->getDefinition();
+                            if (ed != nullptr && !ed->getIntegerType().isNull())
+                            {
+                                RawEnum head;
+                                head.name = marker;
+                                head.enumType = CxxQualifiedName(ed);
+                                head.underlyingType = CanonicalSpelling(ctx, ed->getIntegerType());
+                                if (!ed->isScoped() && !ed->getPromotionType().isNull())
+                                    head.promotedType = CanonicalSpelling(ctx, ed->getPromotionType());
+                                head.isScoped = ed->isScoped();
+                                LocOfRaw(ed, head.file, head.line, head.col);
+                                st.out.enums.push_back(head);
+                                for (const EnumConstantDecl* ec : ed->enumerators())
+                                {
+                                    if (!ec->getIdentifier()) continue;
+                                    RawEnum e = head;
+                                    e.name = marker + "." + ec->getNameAsString();
+                                    e.value = ApsIntToLongLong(ec->getInitVal());
+                                    LocOfRaw(ec, e.file, e.line, e.col);
+                                    st.out.enums.push_back(std::move(e));
+                                }
+                            }
+                            continue;
+                        }
                         // A typedef of a builtin or a pointer to one (::uint32_t, ::intptr_t):
                         // return clang's canonical spelling for the caller to map.
                         QualType leaf = canon;
@@ -3674,6 +3959,11 @@ namespace cflat_cinterop
                 };
                 if (!IsValidDottedName(qualified))
                 { skipVar("name is not a valid CFlat qualified name"); return true; }
+                // A variable template's pattern (or a specialization of it) is no object of its
+                // own name; `ns.v<T>` binds the specialization on use (decltype request).
+                if (vd->getDescribedVarTemplate() != nullptr
+                    || llvm::isa<VarTemplateSpecializationDecl>(vd))
+                { skipVar("it is a variable template, bound per specialization on use"); return true; }
                 // A thread_local object is reached through a TLS access sequence, not a plain
                 // load of its symbol, so binding it would link wrong or not at all.
                 if (vd->getTSCSpec() != TSCS_unspecified)
@@ -3690,9 +3980,13 @@ namespace cflat_cinterop
                 g.ctype = CanonicalSpelling(ctx, vd->getType().getUnqualifiedType());
                 g.isConst = isConst;
                 g.file = file; g.line = line; g.col = col;
+                // One object per TU (per import group), folded or not.
+                g.isInternalLinkage = !vd->hasExternalFormalLinkage()
+                    || vd->getStorageClass() == SC_Static;
 
                 // A folded scalar needs no storage, so it works whatever the linkage is.
-                if (isConst && init != nullptr && !init->containsErrors() && !init->isValueDependent())
+                if (isConst && init != nullptr && !init->containsErrors() && !init->isValueDependent()
+                    && IsFoldableConstantInit(vd, init))
                 {
                     Expr::EvalResult result;
                     const bool evaluated = init->EvaluateAsRValue(result, ctx);
@@ -3746,6 +4040,18 @@ namespace cflat_cinterop
                         : originalLinkage;
                     if (internalStorage && st.req.demandPlan != nullptr)
                         st.req.demandPlan->renamed[g.linkageName] = originalLinkage;
+                    // Value identity of a const object: two groups' copies of one declaration
+                    // read alike only when the evaluated initializers match (defines may differ).
+                    // An address names a per-group entity even when it prints alike: no hash.
+                    if (internalStorage && isConst)
+                        if (const APValue* value = const_cast<VarDecl*>(def)->evaluateValue();
+                            value != nullptr && !ApValueHoldsAddress(*value))
+                        {
+                            uint64_t key = 14695981039346656037ULL;
+                            for (unsigned char c : value->getAsString(ctx, def->getType()))
+                                key = (key ^ c) * 1099511628211ULL;
+                            g.constInitHash = key == 0 ? 1 : key;
+                        }
                     // An internal-linkage definition is invisible outside the companion module.
                     if (internalStorage)
                     {
@@ -6895,7 +7201,11 @@ namespace cflat_cinterop
             for (const llvm::GlobalValue& gv : mod->global_values())
                 if (!gv.isDeclaration()) ++stats.definitions;
             for (const std::string& name : want)
-                if (const llvm::GlobalValue* gv = mod->getNamedValue(name);
+                if (const llvm::GlobalValue* gv = mod->getNamedValue(
+                        std::find(plan.weakPromotePerGroupSymbols.begin(),
+                                  plan.weakPromotePerGroupSymbols.end(), name)
+                                != plan.weakPromotePerGroupSymbols.end()
+                            ? StaticCxxGlobalAlias(plan.cxxImportGroupKey, name) : name);
                     gv == nullptr || gv->isDeclaration())
                 {
                     ++stats.unresolved;

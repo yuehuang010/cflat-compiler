@@ -11,6 +11,7 @@
 #include <initializer_list>
 #include <memory>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -21,6 +22,39 @@
 
 namespace cppi
 {
+    inline std::mutex& q5_return_mutex() noexcept
+    {
+        static std::mutex value;
+        return value;
+    }
+    inline bool& q5_return_after_unlock() noexcept
+    {
+        static bool value = false;
+        return value;
+    }
+    inline bool& q5_return_seen_locked() noexcept
+    {
+        static bool value = false;
+        return value;
+    }
+    inline void q5_return_reset() noexcept { q5_return_after_unlock() = false; q5_return_seen_locked() = false; }
+    inline void q5_return_acquire() noexcept { q5_return_mutex().lock(); }
+    inline void q5_return_release() noexcept { q5_return_mutex().unlock(); }
+    // Sticky: one destruction while the lock is held fails the probe, whatever runs later.
+    inline bool q5_return_ready() noexcept { return q5_return_after_unlock() && !q5_return_seen_locked(); }
+    struct Q5ReturnProbe
+    {
+        ~Q5ReturnProbe() noexcept
+        {
+            if (q5_return_mutex().try_lock())
+            {
+                q5_return_after_unlock() = true;
+                q5_return_mutex().unlock();
+            }
+            else q5_return_seen_locked() = true;
+        }
+    };
+
     struct IntrinsicMemberNames
     {
         bool is_string() const noexcept { return true; }
@@ -723,6 +757,20 @@ namespace cppi
     int variadic_exact_rank(long x) noexcept;
     int variadic_exact_rank_rev(long x) noexcept;
     int variadic_exact_rank_rev(int x, ...) noexcept;
+    // Ellipsis receiving arguments: clang ranks it pairwise against every sibling.
+    int variadic_pair_rank(int x, ...) noexcept;
+    int variadic_pair_rank(long x, ...) noexcept;
+    int variadic_pair_rank_rev(long x, ...) noexcept;
+    int variadic_pair_rank_rev(int x, ...) noexcept;
+    int variadic_conv_rank(int x, ...) noexcept;
+    int variadic_conv_rank(int x, double y) noexcept;
+    int variadic_ptr_rank(ConstPointerRankValue* value, ...) noexcept;
+    int variadic_ptr_rank(ConstPointerRankValue* value, int a) noexcept;
+    // Ambiguous in clang: each is better at one argument (err_cpp_variadic_overload_ambiguous).
+    int variadic_ambig(int x, ...) noexcept;
+    int variadic_ambig(long x, int y) noexcept;
+    int variadic_ambig_ptr(ConstPointerRankValue* value, ...) noexcept;
+    int variadic_ambig_ptr(const ConstPointerRankValue* value, long a) noexcept;
 
     class Counter
     {
@@ -1050,6 +1098,15 @@ namespace cppi
     Hfa apply_hfa(HfaOp op, Hfa v) noexcept;
     int visit_tracked(TrackedVisitor cb, void* ctx, int payload) noexcept;
     int apply_fn(const std::function<int(int)>& f, int v) noexcept;
+    // A DEDUCED callable parameter (the std::erase_if / std::jthread shape): F is whatever the
+    // caller's callable is, so a CFlat callable must arrive as a type clang can deduce.
+    template <class F> int apply_n(F&& f, int n) { int total = 0; for (int i = 0; i < n; ++i) total += f(i); return total; }
+    template <class F> int apply_copy(F f, int v) { F second = f; return f(v) + second(v); }
+    // F&& that std::move()s the callable into storage outliving the call (N50 escape shape).
+    struct ClosureHolder { std::function<int(int)> f; int run(int x) { return f(x); } };
+    template <class F> ClosureHolder move_hold(F&& f) { return {std::move(f)}; }
+    // Calls F again after std::move()ing it into a std::function: a moved-from callable stays usable.
+    template <class F> int reuse_moved(F&& f) { int a = f(1); { std::function<int(int)> g(std::move(f)); a += g(2); } return a + f(3); }
     int apply_mixed_out(MixedOut cb, Mixed v, char** out) noexcept;
     int apply_tracked_by_value(TrackedByValueCb cb) noexcept;
     int apply_tracked_rvalue(TrackedRvalueCb cb) noexcept;
@@ -1700,6 +1757,133 @@ namespace cppi
     };
     inline long RrefScalar::staticValue = 53;
     inline RrefScalar rref_make_scalar() { return RrefScalar(); }
+
+    // std::move / std::forward shapes over an in-repo trait (no <utility>): a `T&&` CLASS result
+    // is an xvalue at declaration init, assignment and return (keyed on the result type).
+    template <class U> struct xv_remove_ref { using type = U; };
+    template <class U> struct xv_remove_ref<U&> { using type = U; };
+    template <class U> struct xv_remove_ref<U&&> { using type = U; };
+    template <class U> inline typename xv_remove_ref<U>::type&& xv_move(U&& value) noexcept
+    { return static_cast<typename xv_remove_ref<U>::type&&>(value); }
+    template <class U> inline U&& xv_forward(typename xv_remove_ref<U>::type& value) noexcept
+    { return static_cast<U&&>(value); }
+    inline Tracked&& xv_pass(Tracked& t) noexcept { return static_cast<Tracked&&>(t); }
+    struct XvHolder { Tracked item; XvHolder() noexcept : item(0) {} };
+    // `const T&&` binds only the copy members; a declared-deleted move never falls back to copy.
+    inline const Tracked&& xv_cmove(const Tracked& t) noexcept { return static_cast<const Tracked&&>(t); }
+    inline int xv_copies = 0, xv_moves = 0;
+    inline void xv_reset() noexcept { xv_copies = xv_moves = 0; }
+    inline int xv_copy_count() noexcept { return xv_copies; }
+    inline int xv_move_count() noexcept { return xv_moves; }
+    struct XvNoMove
+    {
+        int v;
+        explicit XvNoMove(int x) noexcept : v(x) {}
+        XvNoMove(const XvNoMove& o) noexcept : v(o.v) { ++xv_copies; }
+        XvNoMove(XvNoMove&&) = delete;
+        XvNoMove& operator=(const XvNoMove& o) noexcept { v = o.v; ++xv_copies; return *this; }
+        XvNoMove& operator=(XvNoMove&&) = delete;
+        ~XvNoMove() noexcept {}
+    };
+    inline int xv_take_nomove(XvNoMove x) noexcept { return x.v; }
+    struct XvMoveOnly
+    {
+        int v;
+        explicit XvMoveOnly(int x) noexcept : v(x) {}
+        XvMoveOnly(const XvMoveOnly&) = delete;
+        XvMoveOnly(XvMoveOnly&& o) noexcept : v(o.v) { o.v = -1; }
+        XvMoveOnly& operator=(const XvMoveOnly&) = delete;
+        XvMoveOnly& operator=(XvMoveOnly&& o) noexcept { v = o.v; o.v = -1; return *this; }
+        ~XvMoveOnly() noexcept {}
+    };
+    // Clang's overload resolution, not cflat's, picks the member: a viable `const T&&` beside a
+    // deleted copy, a deleted `const T&&` beside a valid `T&&`, a defaulted move deleted by a
+    // member (ignored, so the copy runs).
+    struct XvConstMove
+    {
+        int v;
+        explicit XvConstMove(int x) noexcept : v(x) {}
+        XvConstMove(const XvConstMove&) = delete;
+        XvConstMove(const XvConstMove&& o) noexcept : v(o.v) { ++xv_moves; }
+        XvConstMove& operator=(const XvConstMove&) = delete;
+        XvConstMove& operator=(const XvConstMove&& o) noexcept { v = o.v; ++xv_moves; return *this; }
+        ~XvConstMove() noexcept {}
+    };
+    struct XvMultiMove
+    {
+        int v;
+        explicit XvMultiMove(int x) noexcept : v(x) {}
+        XvMultiMove(const XvMultiMove& o) noexcept : v(o.v) { ++xv_copies; }
+        XvMultiMove(XvMultiMove&& o) noexcept : v(o.v) { o.v = -1; ++xv_moves; }
+        XvMultiMove(const XvMultiMove&&) = delete;
+        XvMultiMove& operator=(const XvMultiMove& o) noexcept { v = o.v; ++xv_copies; return *this; }
+        XvMultiMove& operator=(XvMultiMove&& o) noexcept { v = o.v; o.v = -1; ++xv_moves; return *this; }
+        XvMultiMove& operator=(const XvMultiMove&&) = delete;
+        ~XvMultiMove() noexcept {}
+    };
+    // Trivially copyable, yet clang selects the constructor template for a `T&&` source.
+    struct XvTrivialTemplate
+    {
+        int v;
+        explicit XvTrivialTemplate(int x) noexcept : v(x) {}
+        XvTrivialTemplate(const XvTrivialTemplate&) = default;
+        template <class U> XvTrivialTemplate(U&& x) noexcept : v(x.v + 100) { x.v = -1; ++xv_moves; }
+    };
+    inline int xv_take_trivial(XvTrivialTemplate x) noexcept { return x.v; }
+    // Trivially copyable with a deleted move: `std::move(x)` selects the deleted constructor.
+    struct XvTrivialNoMove
+    {
+        int v;
+        explicit XvTrivialNoMove(int x) noexcept : v(x) {}
+        XvTrivialNoMove(const XvTrivialNoMove&) = default;
+        XvTrivialNoMove(XvTrivialNoMove&&) = delete;
+    };
+    inline int xv_take_trivial_nomove(XvTrivialNoMove x) noexcept { return x.v; }
+    // Trivially copyable, yet clang selects the assignment template for a `T&&` source.
+    struct XvTrivialAssign
+    {
+        int v;
+        explicit XvTrivialAssign(int x) noexcept : v(x) {}
+        XvTrivialAssign(const XvTrivialAssign&) = default;
+        XvTrivialAssign& operator=(const XvTrivialAssign&) = default;
+        template <class U> XvTrivialAssign& operator=(U&& x) noexcept
+        { v = x.v + 100; ++xv_moves; return *this; }
+    };
+    // Copy-initialization from an xvalue skips an `explicit` move constructor: the copy runs.
+    struct XvExplicitMove
+    {
+        int v;
+        explicit XvExplicitMove(int x) noexcept : v(x) {}
+        XvExplicitMove(const XvExplicitMove& o) noexcept : v(o.v + 10) { ++xv_copies; }
+        explicit XvExplicitMove(XvExplicitMove&& o) noexcept : v(o.v + 100) { ++xv_moves; }
+        ~XvExplicitMove() noexcept {}
+    };
+    inline int xv_take_explicit(XvExplicitMove x) noexcept { return x.v; }
+    // A non-const assignment template beats a const-qualified `operator=(T&&) const`.
+    struct XvConstAssign
+    {
+        mutable int v;
+        explicit XvConstAssign(int x) noexcept : v(x) {}
+        XvConstAssign(const XvConstAssign& o) noexcept : v(o.v) {}
+        XvConstAssign(XvConstAssign&& o) noexcept : v(o.v) {}
+        const XvConstAssign& operator=(XvConstAssign&& o) const noexcept
+        { v = o.v + 10; ++xv_copies; return *this; }
+        template <class U> XvConstAssign& operator=(U&& o) noexcept
+        { v = o.v + 100; ++xv_moves; return *this; }
+        ~XvConstAssign() noexcept {}
+    };
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdefaulted-function-deleted"
+    struct XvDefaultedMove
+    {
+        XvNoMove item;
+        explicit XvDefaultedMove(int x) noexcept : item(x) {}
+        XvDefaultedMove(const XvDefaultedMove&) = default;
+        XvDefaultedMove(XvDefaultedMove&&) = default;
+        XvDefaultedMove& operator=(const XvDefaultedMove&) = default;
+        XvDefaultedMove& operator=(XvDefaultedMove&&) = default;
+    };
+#pragma clang diagnostic pop
 }
 
 namespace cppi_inh
@@ -2483,4 +2667,36 @@ namespace cppi_opmv
 #undef CPPI_OPMV_COUNTS
 #undef CPPI_OPMV_MEMBER
 #undef CPPI_OPMV_FREE
+}
+
+// ST4 - naming C++ entities from CFlat: static data members through a chained path, a
+// parenthesized path and an instance; a static member FUNCTION called through an instance;
+// a field-less scoped enum (std::byte shape) named as a type; a variable template read as a
+// value (std::numbers::pi_v shape); a trait specialized for decltype(nullptr) vs void*.
+namespace cppi_entity
+{
+    struct Point { int x = 0; int y = 0; };
+    struct StaticData { inline static Point origin{8, 9}; };
+    struct OutOfLine { int pad = 0; static int K; };
+    inline int OutOfLine::K = 17;
+    template <class T, T... I>
+    struct Seq { static constexpr unsigned long size() noexcept { return sizeof...(I); } };
+    struct Counted { int pad = 0; static int twice(int v) noexcept { return v * 2; } };
+    enum class byte_like : unsigned char {};
+    template <class I> constexpr I to_int(byte_like b) noexcept { return static_cast<I>(b); }
+    template <class T> inline constexpr T e_v = T(2.718281828459045);
+    template <class T> inline constexpr int width_v = (int)sizeof(T) * 10 + 1;
+    template <class T> struct is_null_ptr { static constexpr bool value = false; };
+    template <> struct is_null_ptr<decltype(nullptr)> { static constexpr bool value = true; };
+    // Side-effect initializers: never folded, read as the live object (or refused for templates).
+    inline int dyn_counter = 0;
+    inline const int dyn_const = (++dyn_counter, 27);
+    template <class T> inline const int dyn_tmpl = (++dyn_counter, 27);
+    inline int dynCount() noexcept { return dyn_counter; }
+    // Same name as a static and a non-static overload.
+    struct Mixed
+    {
+        static int f(int) noexcept { return 101; }
+        int f(double) const noexcept { return 202; }
+    };
 }

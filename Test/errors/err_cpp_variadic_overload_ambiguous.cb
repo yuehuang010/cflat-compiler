@@ -1,0 +1,24 @@
+// C++ ranks a variadic pairwise against its siblings ([over.match.best]): an argument the
+// ellipsis receives is the worst conversion, so a variadic better at a declared parameter and a
+// sibling better at the ellipsis position are ambiguous, as clang reports.
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    cppi.ConstPointerRankValue value = default;
+    cppi.ConstPointerRankValue* mutablePointer = &value;
+    // int exact at argument 1, int into the ellipsis at argument 2 vs int -> long, int exact.
+    expect_error("ambiguous call to 'cppi.variadic_ambig': no candidate ranks better than the others: cppi.variadic_ambig(long, int), cppi.variadic_ambig(int, ...)") {
+        int a = cppi.variadic_ambig(1, 2);
+    }
+    // Identity pointer vs const-added pointer at argument 1, ellipsis vs int -> long at argument 2.
+    expect_error("ambiguous call to 'cppi.variadic_ambig_ptr'") {
+        int b = cppi.variadic_ambig_ptr(mutablePointer, 1);
+    }
+    // C++ calls the declared `double` sibling over the ellipsis; CFlat makes no int -> double
+    // conversion at a call (ruling 2026-09-30), so the call names it instead of taking `...`.
+    expect_error("call to 'cppi.variadic_conv_rank' resolves in C++ to cppi.variadic_conv_rank(int, double)") {
+        int c = cppi.variadic_conv_rank(1, 2);
+    }
+    return 0;
+}

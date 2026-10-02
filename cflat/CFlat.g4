@@ -409,7 +409,7 @@ genericTypeParameters
     ;
 
 typeParameterList
-    : typeParameterEntry (',' typeParameterEntry)*
+    : (typeParameterEntry (',' typeParameterEntry)*)?
     ;
 
 typeParameterEntry

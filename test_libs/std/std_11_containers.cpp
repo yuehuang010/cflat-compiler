@@ -2,6 +2,7 @@
 #include <array>
 #include <deque>
 #include <forward_list>
+#include <functional>
 #include <list>
 #include <map>
 #include <queue>
@@ -22,7 +23,7 @@ int main() {
     std::map<int, int> m{{1, 10}}; m.emplace(2, 20); std::multimap<int, int> mm{{1, 4}, {1, 5}};
     std::set<int> s{3, 5}; std::multiset<int> ms{2, 2}; std::unordered_map<int, int> um{{7, 70}}; std::unordered_set<int> us{9};
     std::stack<int> st; st.push(11); std::queue<int> q; q.push(12); std::priority_queue<int> pq; pq.push(13);
-    if (d.front() != 1 || l.back() != 9 || fl.front() != 3 || m[2] != 20 || mm.count(1) != 2 || s.count(5) != 1 || ms.count(2) != 2 || um[7] != 70 || us.count(9) != 1 || st.top() != 11 || q.front() != 12 || pq.top() != 13 || std::hash<int>{}(42) != 42) { std::printf("FAIL containers\n"); failures |= 2; }
+    if (d.front() != 1 || l.back() != 9 || fl.front() != 3 || m[2] != 20 || mm.count(1) != 2 || s.count(5) != 1 || ms.count(2) != 2 || um[7] != 70 || us.count(9) != 1 || st.top() != 11 || q.front() != 12 || pq.top() != 13 || std::hash<int>{}(42) != std::hash<int>{}(42) || std::hash<int>{}(42) == std::hash<int>{}(43)) { std::printf("FAIL containers\n"); failures |= 2; }
     if (!failures) std::printf("PASS std_11_containers\n");
     return failures;
 }

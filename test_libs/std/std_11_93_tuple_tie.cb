@@ -1,6 +1,5 @@
 // GUARDS: tuple tie assigns values through a tuple of references
 // FROM: internal/plan/std-library-smoke-suite.md (C++11 coverage map)
-// DISABLED: internal/issue/p2/std-tie-cannot-bind.md
 import cpp "tuple";
 extern int main()
 {

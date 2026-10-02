@@ -1,0 +1,10 @@
+import cpp "../library/cpp_interop_tpl.h";
+
+expect_error("declare it as a '[cpp] struct'") {
+    struct PlainCflatBase : cppi_crtp.Counted<PlainCflatBase>
+    {
+        int tag() { return 13; }
+    };
+}
+
+extern int main() { return 0; }

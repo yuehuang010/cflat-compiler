@@ -523,7 +523,16 @@ std::string PrintTypeSpelling(const LLVMBackend& compiler, const TypeSpelling& s
 
     std::string result = spelling.alias ? "alias " : "";
     result += spelling.base == "longdouble" ? "long double" : spelling.base;
-    if (!spelling.args.empty())
+    // std.function's argument is a FUNCTION TYPE (`std.function<int(int)>`), encoded as a thin
+    // callable: print the signature itself, not a nested `function<...>`.
+    if (spelling.base == "std.function" && spelling.args.size() == 1
+        && spelling.args.front().closure && spelling.args.front().thinClosure
+        && spelling.args.front().pointerDepth <= 0 && !spelling.args.front().view)
+    {
+        const std::string callable = PrintTypeSpelling(compiler, spelling.args.front());
+        result += callable.substr(std::string("function").size());
+    }
+    else if (!spelling.args.empty())
     {
         result += "<";
         for (size_t i = 0; i < spelling.args.size(); i++)

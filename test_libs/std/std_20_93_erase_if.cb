@@ -1,6 +1,5 @@
 // GUARDS: C++20 std::erase_if with a CFlat native callable (function<> lambda) as the deduced predicate
 // FROM: internal/plan/std-library-smoke-suite.md (C++20 coverage map)
-// DISABLED: internal/issue/p2/cpp-cflat-callable-to-deduced-template-param.md
 import cpp "set";
 import cpp "unordered_set";
 import cpp "functional";

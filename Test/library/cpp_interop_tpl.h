@@ -15,6 +15,7 @@
 #include <memory>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -334,6 +335,100 @@ namespace cppt
 
     using TaggedInt = Tagged<int>;
     namespace deep { using TaggedLong = Tagged<long>; }
+    // Nested-namespace function template the header harvest does not publish (a non-defaulted
+    // `auto` parameter): an explicit-argument call must defer to clang, like std::chrono's
+    // duration_cast from a std-only import (a request catalog publishes no templates).
+    namespace units
+    {
+        struct Milli { long long v; Milli(long long x) : v(x) {} long long count() const { return v; } };
+        struct Whole { long long v; Whole(long long x) : v(x) {} long long count() const { return v; } };
+        template <class To, auto Den> To unit_cast(const Milli& m) { return To(m.v / Den); }
+    }
+    // Shaped like std::barrier: a class template whose every parameter is defaulted, named bare.
+    namespace dflt
+    {
+        struct CountDone { static inline int calls = 0; void operator()() noexcept { ++calls; } };
+        template <class F = CountDone> class Gate
+        {
+        public:
+            explicit Gate(long n, F f = F()) : n_(n), f_(f) {}
+            long arrive() { if (--n_ == 0) f_(); return n_; }
+        private:
+            long n_;
+            F f_;
+        };
+        inline int done_calls() noexcept { return CountDone::calls; }
+    }
+    // Shaped like std::unique_ptr<T[]> / make_unique<T[]>: a `T[]` template argument, a partial
+    // specialization on it, and a [[no_unique_address]] deleter whose type spells `T[]`.
+    namespace arr
+    {
+        inline int scalar_deletes = 0;
+        inline int array_deletes = 0;
+        template <class T> struct Deleter
+        { void operator()(T* p) const noexcept { ++scalar_deletes; delete p; } };
+        template <class T> struct Deleter<T[]>
+        { void operator()(T* p) const noexcept { ++array_deletes; delete[] p; } };
+        template <class T> class Owner;
+        template <class T> class Owner<T[]>
+        {
+        public:
+            explicit Owner(T* p) noexcept : p_(p) {}
+            Owner(Owner&& o) noexcept : p_(o.p_) { o.p_ = nullptr; }
+            Owner(const Owner&) = delete;
+            Owner& operator=(const Owner&) = delete;
+            ~Owner() { if (p_ != nullptr) d_(p_); }
+            T& operator[](std::size_t i) const noexcept { return p_[i]; }
+            T* get() const noexcept { return p_; }
+            // libc++ unique_ptr<T[]>::reset shape: a pointer member template beside nullptr_t.
+            template <class U, std::enable_if_t<std::is_same_v<U, T*>, int> = 0>
+            void reset(U p) noexcept { T* old = p_; p_ = p; if (old != nullptr) d_(old); }
+            void reset(std::nullptr_t = nullptr) noexcept { T* old = p_; p_ = nullptr; if (old != nullptr) d_(old); }
+        private:
+            T* p_;
+            [[no_unique_address]] Deleter<T[]> d_;
+        };
+        template <class T> Owner<T> make_owner(std::size_t n)
+        { return Owner<T>(new std::remove_extent_t<T>[n]()); }
+        inline int scalar_delete_count() noexcept { return scalar_deletes; }
+        inline int array_delete_count() noexcept { return array_deletes; }
+        inline int* raw_ints(std::size_t n) { return new int[n](); }
+        // Only a null pointer constant converts to std::nullptr_t: a non-null int* never binds.
+        struct NullSink
+        {
+            int hits = 0;
+            void take(std::nullptr_t) noexcept { ++hits; }
+            int take_ref(const std::nullptr_t& p) noexcept { return p == nullptr ? 7 : 90; }
+            int take_default(std::nullptr_t = nullptr) noexcept { return 9; }
+            template<class T> int kind(T) noexcept { return std::is_same_v<T, std::nullptr_t> ? 1 : 2; }
+            template<class T> int order(T) noexcept
+            {
+                return std::is_same_v<T, std::nullptr_t> ? 1 : std::is_same_v<T, int*> ? 2 : 3;
+            }
+        };
+        using Nil = std::nullptr_t;
+        // std::nullptr_t results, const& parameters and deduction (decltype(nullptr) at the call).
+        inline std::nullptr_t make_nil() noexcept { return nullptr; }
+        inline Nil make_nil_alias() noexcept { return nullptr; }
+        inline int nil_ref(const std::nullptr_t& p) noexcept { return p == nullptr ? 8 : 90; }
+        template<class T> int nil_kind(T) noexcept { return std::is_same_v<T, std::nullptr_t> ? 1 : 2; }
+        // Instantiation order must not matter: int* first, then nullptr / void* (fresh templates).
+        template<class T> int nil_order(T) noexcept
+        {
+            return std::is_same_v<T, std::nullptr_t> ? 1 : std::is_same_v<T, int*> ? 2 : 3;
+        }
+        // nullptr -> std::nullptr_t is the identity conversion: it beats int* ([over.ics.rank]).
+        inline int nil_ov(int*) noexcept { return 10; }
+        inline int nil_ov(std::nullptr_t) noexcept { return 11; }
+        // A std::nullptr_t value is identity at nullptr_t; it never converts to bool at a call.
+        inline int nil_direct(std::nullptr_t) noexcept { return 1; }
+        inline int nil_direct(bool) noexcept { return 2; }
+        inline int nil_direct(void*) noexcept { return 3; }
+        template<class T> int nil_kind_fwd(T&&) noexcept
+        {
+            return std::is_same_v<std::remove_cvref_t<T>, std::nullptr_t> ? 1 : 2;
+        }
+    }
     // Used only as a temporary built straight into a call argument (never declared first).
     using TaggedReal = Tagged<double>;
     using TaggedShort = Tagged<short>;
@@ -869,6 +964,55 @@ namespace cppt
         return std::make_unique<Loader<Dataset, Sampler>>(
             std::move(dataset), Sampler(batch_count));
     }
+}
+
+namespace cppi_crtp
+{
+    inline int destroyed = 0;
+    inline int destruction_count() noexcept { return destroyed; }
+    template<class D> struct Counted
+    {
+        int id() { return static_cast<D*>(this)->tag(); }
+        ~Counted() { ++destroyed; }
+    };
+
+    // enable_shared_from_this shape: the base holds a handle to its own derived type by value
+    // and hands out more handles; every handle has an inline (header-only) destructor.
+    inline int live_handles = 0;
+    inline int live_handle_count() noexcept { return live_handles; }
+    template<class D> struct WeakHandle
+    {
+        D* target = nullptr;
+        WeakHandle() noexcept { ++live_handles; }
+        WeakHandle(const WeakHandle& other) noexcept : target(other.target) { ++live_handles; }
+        WeakHandle& operator=(const WeakHandle& other) noexcept { target = other.target; return *this; }
+        ~WeakHandle();
+        bool expired() const noexcept { return target == nullptr; }
+        D* get() const noexcept { return target; }
+    };
+    // Out of line, as libc++ defines ~weak_ptr: no body until the specialization is complete.
+    template<class D> WeakHandle<D>::~WeakHandle() { --live_handles; }
+    template<class D> struct StrongHandle
+    {
+        D* target = nullptr;
+        StrongHandle() noexcept { ++live_handles; }
+        StrongHandle(const StrongHandle& other) noexcept : target(other.target) { ++live_handles; }
+        StrongHandle& operator=(const StrongHandle& other) noexcept { target = other.target; return *this; }
+        ~StrongHandle() { --live_handles; }
+        D* get() const noexcept { return target; }
+    };
+    template<class D> struct SelfHandles
+    {
+        WeakHandle<D> weak_this;
+        SelfHandles() noexcept { weak_this.target = static_cast<D*>(this); }
+        WeakHandle<D> weak_from_this() noexcept { return weak_this; }
+        StrongHandle<D> shared_from_this() noexcept
+        {
+            StrongHandle<D> out;
+            out.target = weak_this.target;
+            return out;
+        }
+    };
 }
 
 // Top-level alias of the SAME target as cppt.via_alias: the shape that already resolved
@@ -2056,4 +2200,161 @@ namespace cpptrr
     template <size_t N> int lit_len(const char (&)[N]) { return (int)N; }
     struct Pk { int base = 0; template <class U> const U& pick(const U& a, const U& b) const { return b < a ? b : a; }
                 template <class U> const U& first_of(const U& a, int) const { return a; } };
+}
+
+// charconv- and format_to_n-shaped free functions: a char* VALUE argument is writable C++ char*,
+// never `const char *` (a template output iterator or `char* first` must accept it).
+namespace cppst5
+{
+    struct conv_result { char* ptr; int ec; };
+    template <class T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
+    conv_result to_text(char* first, char* last, T value)
+    {
+        char tmp[24]; int n = 0; long long v = (long long)value; bool neg = v < 0;
+        if (neg) v = -v;
+        do { tmp[n++] = (char)('0' + v % 10); v /= 10; } while (v != 0);
+        if (neg) tmp[n++] = '-';
+        if (last - first < n) return conv_result{ last, 75 };
+        for (int i = 0; i < n; ++i) first[i] = tmp[n - 1 - i];
+        return conv_result{ first + n, 0 };
+    }
+    conv_result to_text(char*, char*, bool) = delete;
+    struct parse_result { const char* ptr; int ec; };
+    inline parse_result from_text(const char* first, const char* last, int& value)
+    {
+        int v = 0; const char* p = first;
+        while (p != last && *p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+        if (p == first) return parse_result{ first, 22 };
+        value = v; return parse_result{ p, 0 };
+    }
+    template <class... A> struct fmt_text
+    {
+        const char* text;
+        template <class S> consteval fmt_text(const S& s) : text(s) {}
+    };
+    // Hidden friends (ADL-only, reached through the free-function wrapper): a char* value picks
+    // the writable overload, a literal the const one - as clang ranks them.
+    struct Sink
+    {
+        int last = 0;
+        friend int operator<<(Sink& s, const char*) { s.last = 1; return 1; }
+        friend int operator<<(Sink& s, char* p) { p[0] = 'W'; s.last = 2; return 2; }
+    };
+    // A C++ `const char*` result (c_str(), strchr(const char*)) keeps its const pointee.
+    struct Deduce
+    {
+        template <class T> friend int operator<<(Deduce&, T*) { return std::is_const<T>::value ? 52 : 51; }
+    };
+    // A `const char*` FIELD keeps its const pointee too (2801).
+    struct ConstField { const char* p = "abc"; };
+    struct WriteOnly
+    {
+        friend int operator<<(WriteOnly&, char* p) { p[0] = 'W'; return 3; }
+    };
+    struct Text
+    {
+        char buf[4] = { 'a', 'b', 'c', 0 };
+        const char* c_str() const { return buf; }
+    };
+    inline const char* find_in(const char* s, char c) { while (*s && *s != c) ++s; return s; }
+    inline char* find_in(char* s, char c) { while (*s && *s != c) ++s; return s; }
+    template <class T> struct type_is { using type = T; };
+    template <class Out> struct fmt_n_result { Out out; long long size; };
+    // Writes `fmt` with each "{}" replaced by the next integer, truncated to n chars.
+    template <class Out, class... A>
+    fmt_n_result<Out> fmt_n(Out out, long long n, fmt_text<typename type_is<A>::type...> fmt, A&&... args)
+    {
+        long long vals[] = { (long long)args..., 0 }; int k = 0; long long size = 0;
+        for (const char* p = fmt.text; *p; ++p)
+        {
+            char tmp[24]; int m = 0;
+            if (p[0] == '{' && p[1] == '}') { long long v = vals[k++]; do { tmp[m++] = (char)('0' + v % 10); v /= 10; } while (v); ++p; }
+            else tmp[m++] = *p;
+            while (m > 0) { char c = tmp[--m]; if (size < n) *out++ = c; ++size; }
+        }
+        return fmt_n_result<Out>{ out, size };
+    }
+}
+
+// Shapes the MSVC STL uses where libc++ does not (test_libs std tier on Windows).
+namespace cppmsvc
+{
+    // span::subspan: a non-template `auto` member of a class template.
+    template <class T> struct Window
+    {
+        T* p; int n;
+        Window(T* p_, int n_) : p(p_), n(n_) {}
+        int size() const { return n; }
+        auto drop(int k) const { return Window<T>(p + k, n - k); }
+        auto front() const { return p[0]; }
+    };
+    // std::hash<int>: a C++23 static operator() inherited from a base.
+    template <class K> struct Hasher;
+    template <class K, bool On> struct HasherBase
+    {
+        static int operator()(const K& k) noexcept { return Hasher<K>::mix(k); }
+    };
+    template <class K> struct Hasher : HasherBase<K, true>
+    {
+        static int mix(const K& k) noexcept { return (int)k * 3 + 1; }
+    };
+    // std::not_fn's _Not_fn: ref-qualified operator() templates behind a private base.
+    template <class D> class Holder
+    {
+        D d;
+    public:
+        explicit Holder(D v) : d(v) {}
+        D& get() { return d; }
+        const D& get() const { return d; }
+    };
+    template <class D> class Negate : private Holder<D>
+    {
+    public:
+        explicit Negate(D v) : Holder<D>(v) {}
+        template <class... A> decltype(auto) operator()(A&&... a) & { return !this->get()(static_cast<A&&>(a)...); }
+        template <class... A> decltype(auto) operator()(A&&... a) const& { return !this->get()(static_cast<A&&>(a)...); }
+    };
+    struct IsSeven { bool operator()(int v) const { return v == 7; } };
+    inline Negate<IsSeven> negate_seven() { return Negate<IsSeven>(IsSeven{}); }
+    // std::tuple: members on a PARTIAL specialization tuple<This, Rest...> (recursive base),
+    // converting operator= a template, the copy assignment a deleted `const volatile` one.
+    template <class... T> class Tup;
+    template <> class Tup<>
+    {
+    public:
+        Tup() = default;
+        Tup& operator=(const Tup&) = default;
+    };
+    template <class This, class... Rest> class Tup<This, Rest...> : private Tup<Rest...>
+    {
+    public:
+        This first;
+        Tup(This f, Rest... r) : Tup<Rest...>(r...), first(f) {}
+        Tup(const Tup&) = default;
+        Tup& operator=(const volatile Tup&) = delete;
+        Tup<Rest...>& rest() noexcept { return *this; }
+        const Tup<Rest...>& rest() const noexcept { return *this; }
+        template <class... O, std::enable_if_t<sizeof...(O) == sizeof...(Rest) + 1, int> = 0>
+        Tup& operator=(const Tup<O...>& r) { first = r.first; rest() = r.rest(); return *this; }
+        template <class... O> friend class Tup;
+    };
+    template <class... T> Tup<T&...> tie_all(T&... t) { return Tup<T&...>(t...); }
+    inline Tup<int, int> pair_of(int a, int b) { return Tup<int, int>(a, b); }
+    // std::async through ppltasks: a body names a static_assert-ing declval only inside a
+    // local typedef's decltype, so nothing may instantiate it.
+    template <class T> T&& fake_declval() noexcept { static_assert(sizeof(T) == 0, "never called"); }
+    template <class F> struct Runner
+    {
+        F f;
+        int run() { typedef decltype(fake_declval<F>()()) Result; return (int)(Result)f(); }
+    };
+    struct Seven { int operator()() const { return 7; } };
+    inline int run_seven() { Runner<Seven> r{Seven{}}; return r.run(); }
+    // std::thread(std::function): a variadic constructor whose argument type comes from a
+    // header this one does not include (cppbv::BraceTmpNoStd, cpp_interop_by_value.h).
+    struct ArgCount
+    {
+        int n = 0;
+        template <class... A> explicit ArgCount(A&&...) : n((int)sizeof...(A)) {}
+    };
 }
