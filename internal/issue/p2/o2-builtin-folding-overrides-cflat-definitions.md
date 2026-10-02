@@ -36,3 +36,8 @@ Attempt (W5, 2026-09-30, item 2): marking global operator new/delete declaration
 new/delete-expression call sites `builtin` + allocsize/noalias/nonnull/nounwind (clang's O0 IR
 shape) did NOT make the O2 probe match clang (`clang++ -O2` prints `Plain 14 1 1 3`, CFlat exits 3,
 allocation effects optimized away). Reverted; patch + matrix in scratch/repro_keep/w5/.
+
+Item 1 LANDED 2026-10-01 as V11 52a77168: a user (non-core) C-linkage definition whose name and
+signature TargetLibraryInfo recognizes gets `nobuiltin`; regression leg userLibcAtollWins in
+Test/test_operators.cb (-O2 twin). A caller inside an imported .c is folded by clang before
+linking (same as clang across TUs without LTO). Item 2 (new[] elision) remains open.

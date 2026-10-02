@@ -15,3 +15,5 @@ double etc. at calls), for type safety - NOT clang's arithmetic conversions. `n1
 `n1(cp, 5.0)` or `n1(cp, (double)n)` (verified). Item 4 (user-defined conversions) is unaffected:
 it is about class conversions, not arithmetic ones. Item 1 (ambiguity in variadic sets) awaits a
 ruling after the splash measurement.
+
+RULED 2026-10-01 (maintainer): item 1 - run clang's pairwise ranking over overload sets that contain a C++ variadic and report ambiguity like clang, even where code compiles today.

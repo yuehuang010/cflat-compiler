@@ -29,3 +29,16 @@ aliases, `&param...` escaping to a callee), `queue<T>.copy()`, and the tracked q
     `_`-prefixed container internals (`_grow`, `_rehash`, `_releaseAt`, ...) are callable from
     outside and not in the mutator allowlist (`b.xs._grow()` rc 139). Allowlist entry queue
     `free` is dead (no such method).
+
+12. **V16 LANDED 19018a0c (2026-10-01).** Items 10-11 are fixed: whole-param and field-path aliases, alias-of-alias, `this` aliases, getter chains, free helpers taking the receiver pointer, `&elem` escapes at top level, postfix ++/--, hashset, and `_x` methods. Still missed after V16 r2; all master-equal, rc 133 or a corrupted caller. Probes are in scratch/repro_keep/v16/rv16b/ (selectors in each file).
+    - Generic method calls `b.put<int>(1)`: isOwnMethod (~9779) does not see generic method bodies.
+    - `->` is not split in splitLvaluePath/splitPath (o3 `l->add` via `&q->xs`, a14 `p->xs[0]=99`). Treat `->` as `.`.
+    - Index stores through a whole-param alias (b1 `p.xs[0]=99`, c3): NameShadowedByEnclosingLocal (~10039) rejects alias roots. Skip it for wholeParamAliases roots.
+    - Postfix ++ through an alias (a8, b2, o4): markContainerPath resolves only parameter roots.
+    - A `this` alias passed to a helper (a5 `fillBox2(0, me)`).
+    - Escaped element addresses beyond `int* q=&b.xs[0]; *q=v` (a9-a13, a15, a16). Robust rule: taking `&<param container path>[..]` counts as a write.
+    - Index store into a direct `list<int>` by-value param, `l[0]=99` and `l[0]++` (separate from the struct-field cases).
+    - FP nit: f6, an implicit `this` to a read-only free `peek(Box*)`, copies once.
+13. **V17 LANDED 19018a0c (2026-10-01).** Item 12 is fixed: generic own methods, `->` paths, alias index stores, ++/--, field-path aliases (o4), `this` passed to helpers, element-address escapes, and direct-param index stores. Still open, master-equal; probes are in scratch/repro_keep/v17/rv17/:
+    - x7: `list<int>*[1] arr; arr[0] = &b.xs; arr[0]->add(i)` gives rc 133. A container pointer stored into a local array is not tracked; element addresses are.
+    - An unqualified `inner<T>(v)` inside a method gives "unknown generic function"; only `this->inner<T>(v)` builds. This is a separate resolution gap.

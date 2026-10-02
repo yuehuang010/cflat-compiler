@@ -38,7 +38,10 @@ chain with `git merge-tree` / `commit-tree`, so nothing is checked out until `--
    ]}
    ```
    Every commit in the range must appear exactly once. Order inside a group does not matter;
-   the tool replays each group in original order.
+   the tool replays each group in original order. Optional top-level
+   `"reword": {"<hash prefix>": "<message>"}` replaces a commit's bullet text (fixes a landing
+   that carried the wrong message). A single-commit group titled with its own subject keeps its
+   message verbatim - use it for an earlier unpushed headline that should stay as is.
 
 4. **Dry run:** `python3 internal/skill/squash-headlines/squash.py scratch/squash_<date>/plan.json`.
    It prints one line per new commit, the files whose hashes it remapped, and the diff vs master.

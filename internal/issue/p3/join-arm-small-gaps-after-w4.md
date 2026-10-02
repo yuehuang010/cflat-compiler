@@ -10,3 +10,11 @@ scratch/repro_keep/w4/rev/ (probe.h counting header).
    leaves live=1; the `??` join form frees it (join is right, direct path is the outlier).
 3. Arrow on a parenthesized `?:` join: `(c ? a : n)->v` -> "Undefined variable v." W4 fixed
    only the `??` form (MainListener_PostfixExpression.cpp ~1255).
+
+## From V13 (2026-10-01, f62b7ad0)
+A CFlat callee defined LATER in the file is now treated as retaining for a join-arm `new` argument
+(PreserveRetainedJoinArmTempsBeforeCall no longer returns early on a declaration; ParameterRetainsArgument
+answers "retains" for an incomplete body). The direct `new` form instead records and resolves the gate
+after the walk (ResolveOwnedReleaseGates). Residual: a late-defined callee that does NOT retain and
+throws leaks the joined arm on the unwind edge, where the direct form frees it. Fix: record the join
+arm like the direct path and resolve after the walk.

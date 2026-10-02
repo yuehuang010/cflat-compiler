@@ -72,7 +72,7 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 |-----|----------|------|-------|
 | B5 | p3/cpp-const-twin-overloads-collapse | C++ class member registration (const / non-const twins share one CFlat signature) | NEW 2026-09-28 (B1 matrix, OUT cells C1/C4, E1-E5, F1/F4, H1/H4/H9, L10) |
 | B12 | p3/cflat-extern-definition-abi-leftovers | function<> to >16B-struct C fn crossing C: reverse-thunk design (RULING) | OPEN (return-ext part landed 2cd2bb58) |
-| B13 | p2/owning-struct-borrowed-deref-and-byvalue-param-double-free | `return *o` through a borrowed pointer: refuse like h->f or move like T t = *o | PARKED (RULING); by-value part landed 059d1f42 |
+| B13 | p2/owning-struct-borrowed-deref-and-byvalue-param-double-free | `return *o` through a borrowed pointer: refuse like h->f or move like T t = *o; `return *this` refusal RULED 2026-10-01 | PARKED (RULING); by-value part landed 059d1f42 |
 | B14 | p3/c-flexible-array-member-leftovers | move a->data (RULING: explicit move of a raw pointer) + 3 pre-existing P3 | OPEN (sizeof/alignof landed 118c2769) |
 | B16 | p3/cpp-operator-move-operand-leftovers | template U&&, elision, move into const&-only ruling | NEW 2026-09-28 (D8 report) |
 | B18 | p3/cpp-assignment-result-leftovers-after-b9 | extra copies (paren call arms, arr elem init) + bare scalar/nested ternary refusals + 3 unrelated | OPEN (P2 landed 1955bd95) |
@@ -176,6 +176,19 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 | N37 | p3/cpp-signature-registration-projects-records | Registration projects every record a signature names; -3.6% torch only by skipping projection, which breaks overload order (D4) | NEW 2026-09-30 perf |
 | N38 | p2/cpp-static-inline-member-failed-initializer-reads-zero | Static inline member whose initializer fails static_assert reads 0 silently (pre-existing, D8 review) | NEW 2026-09-30 perf |
 
+## Ruled 2026-10-01 - ready to schedule (rulings recorded in each issue file)
+
+| Ruling | Issue | Work |
+|---|---|---|
+| Q1 | p2/owning-struct-borrowed-deref-and-byvalue-param-double-free | refuse non-copyable `return *this`, suggest `return move *this;` / copy() |
+| Q2 | p3/alias-return-byvalue-param-leftovers-after-b21 | item 5 ratified (extern C callee owns by-value params) - no code |
+| Q3 | p2/integer-pointee-pointer-conversion-accepted | char family: stage 1 retype core text APIs to char*, stage 2 block i8* <-> char* |
+| Q4 | p2/lowered-cxx-field-structs-in-containers-and-array-fields | test_move recv_temp_snapshot leak count may go down |
+| Q5 | p2/lowered-cxx-field-structs-in-containers-and-array-fields | keep destroy + rebuild; FIX user destructor running 3x on prvalue assign with a C++ field (scratch/q5) |
+| Q6 | p3/cpp-per-group-static-same-name-binds-first | refuse as ambiguous, name both headers |
+| Q7 | p3/cpp-overload-variadic-and-conversion-gaps | item 1: pairwise ranking like clang over variadic sets |
+| Q8 | p4/immovable-attribute | `[immovable]` surface approved as proposed - buildable |
+
 ## Parked - needs a maintainer ruling before any work
 
 | Issue | Question |
@@ -183,7 +196,6 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 | p4/string-functional-construction-spelling | p4: spelling ruling needed |
 | p3/cpp-constructor-call-accepts-implicit-narrowing | scalar conversion table at C++ call arguments (ctor AND free function): master's free path refuses widening like int -> double / short -> double / bool -> double for C++ callees while the 2026-09-04 ruling refuses only narrowing; ctor and free differ in 80/160 cells (scratch/c1_matrix_r3.md). Rule: accept widening everywhere, or keep exact-group only? |
 | p3/cpp-unscoped-enum-to-double-param-refused | joins the scalar conversion table ruling above: CFlat refuses int -> double at every call argument (native too), so enum -> double would be a new rule; also `P4(0)` (C++ ambiguous int -> long vs pointer) (D1, 2026-09-28) |
-| p2/l-suffix-incoherent-on-llp64 | what `5L` is on LLP64 (i64 vs C++ `long` = 32-bit) |
 | P0 remaining cold cost | eager define passes: keep eager or rule a demand-only bindable surface |
 
 ## Conflict map (never concurrent)
@@ -207,3 +219,14 @@ function values.
 Windows gate: scratch/win_gate.ps1, ship `git bundle create x <branch> ^26b8647e`; baseline
 test.bat all pass, test_example 94/4/42 (4 = SSH-env GUI failures). Treat Windows timings as
 pass/fail only (the maintainer games on that machine; cold header cache after a version flip).
+
+## Timebox 2026-10-01 - rulings burn-down (22:33 2026-09-30 to 10:33 - extended 4 h at 03:15, land-only from 09:00)
+
+Rulings from 2026-09-30 evening (memory rulings-2026-09-30-p2-batch). Max 3 implementers, Codex
+Luna; escalation Codex r1-3 -> Opus -> Fable. Windows box shared with the maintainer: timings
+pass/fail only.
+
+| Run | Issue | Worktree / branch | State |
+|---|---|---|---|
+
+Landed: V20 52a77168 (field initializer in a no-arg user ctor built in place, single-call initializers only so a ternary takes the selected arm (also fixes the synthesized-ctor ternary); nested no-default-ctor refusal for `W w;`; Codex r1 + main-session r2 after the review caught a ternary wrong-value regression; leftovers p2/cpp-class-field-default-construction-leftovers-after-v20), V15 52a77168 (common expression statements at C++ header namespace scope give a clean clang: error instead of a Sema crash; per-statement extension switch-off, never in system headers, RAII; Codex r1-r3 + Opus r4 (r3's 18 "regressions" were a stale same-version cheaders cache); 9 remaining forms stay in the p2 issue), V18 52a77168 (C++ class field with no initializer default-constructed in place on every construction path incl. user ctors; no-callable-default-ctor refused lazily at the use site; 2 Codex rounds; follow-ups p2/cpp-class-field-default-construction-leftovers-after-v20), V19 91aeff46 (crash handler: SA_NODEFER + _exit on re-entry, so a fault in the state dump no longer spins at 100% CPU; dump kept, registry lock via try_lock; Codex r1 root cause (deadlock) was wrong, main-session sample found the refault loop), V17 19018a0c (classifier item 12: generic own methods, `->` paths, alias index/++ stores, field-path aliases, this to helpers, element-address escapes, direct-param index stores; follow-ups item 13), V14 52a77168 (C++ internal-linkage namespace variables, constants included, one copy per import group: __cflat_sv_<group>_ names, demand companions map back, COFF comdat moves with the rename; cache 163; 3 Codex rounds + main-session conflict-identity and comdat fixes; follow-up p3/cpp-per-group-static-same-name-binds-first), V16 19018a0c (copy-on-entry classifier items 10-11: aliases, this-alias, getter chains, escapes, ++/--, hashset, parse-tree call detection; 2 rounds; leftovers item 12 -> V17), V1b 52a77168 (W8 phase 3: lowered C++-field structs copied/moved/assigned like C++, construct into released, list slots in place; cache 161; 5 rounds, r4 Opus, r5 Fable; leftovers p2/lowered-cxx-field-structs-in-containers-and-array-fields; ruling note: test_move recv_temp_snapshot leg encodes a removable leak), V13 19018a0c (join-arm new into a late-defined or function-value CFlat callee survives unwind; residual in p3/join-arm-small-gaps-after-w4), V12 19018a0c (`return *o` / `*h->q` / `a[0]` of an owning struct through a borrow refused, suggest `return move`; owned `move T*` param implicit move; ruling question on non-copyable `return *this` in the p2 issue), V5b 52a77168 (off MSVC an address-only plain C inline is not requested: fixes cold-cache double parse of c_macro_helpers.h), V5 52a77168 (C/C++ header inline bodies emitted on demand like clang: static-inline thunks with comdat, private call copies, &fn on the real symbol, MSVC comdat body; cache 160, c-inline-v9; 5 rounds, r5 Fable; follow-ups p2/cpp-internal-static-var-merged-across-imports, p3/c-inline-bodies-no-debug-info), V11 52a77168 (user C-linkage definition of a libc name is nobuiltin: wins at -O2; follow-up p3/core-libc-prototype-types-mismatch), V10 19018a0c (owning return of a not-yet-complete type: bare discard refused at the call, explicit discard destroyed; limit: expect_error scope sees the error late when the struct is defined after the block), V9 19018a0c (generic T* from a fixed array; brace lists of pointers refuse integer-pointee mismatch), V8 19018a0c (L = target long, LL = i64), V4b 19018a0c (integer-pointee gaps: array decay, view ternary arm, brace field, global init), V1 19018a0c (W8 phases 1-2: sret + in-place construction for structs with non-relocatable C++ fields; phase 3 = V1b), V7 19018a0c (lambda by-value captures persist), V2 19018a0c (alias-return leftovers; extern C callee owns by-value params - ratification item 5 in the p3 issue), V6 closed without code (profile: copy-on-entry walks 11 ms = 1.3% of test_collection_leaks CodeGen, within the 2% target; log scratch/repro_keep/v6), V4 19018a0c (stage 1; issue stays open for gaps + char family), V3 52a77168 (define-group ODR error; follow-up p3/cpp-define-odr-error-signature-positions).

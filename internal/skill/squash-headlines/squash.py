@@ -106,10 +106,14 @@ def remap_text(s, remap):
     return re.sub(r"\b[0-9a-f]{7,40}\b", sub, s)
 
 
-def message(title, commits, remap):
+def message(title, commits, remap, reword=None):
+    if len(commits) == 1 and title == out("log", "-1", "--format=%s", commits[0]).strip():
+        # an earlier headline kept as its own group: message verbatim
+        return remap_text(out("log", "-1", "--format=%B", commits[0]).rstrip(), remap) + "\n"
     lines = [title, ""]
     for c in commits:
-        body = out("log", "-1", "--format=%B", c)
+        body = next((v for k, v in (reword or {}).items() if c.startswith(k)), None) \
+            or out("log", "-1", "--format=%B", c)
         body = " ".join(l.strip() for l in body.splitlines()
                         if l.strip() and not l.startswith("Co-Authored-By:"))
         lines.append("- %s (was %s)" % (remap_text(body, remap), c[:8]))
@@ -188,7 +192,7 @@ def main():
         changed = []
         if g.get("bookkeeping"):
             tree, changed = remapped_tree(tree, remap)
-        parent = out("commit-tree", tree, "-p", parent, inp=message(g["title"], cs, remap))
+        parent = out("commit-tree", tree, "-p", parent, inp=message(g["title"], cs, remap, plan.get("reword")))
         for c in cs:
             remap[c] = parent
         print("%s %2d commits  %s" % (parent[:8], len(cs), g["title"][:110]))

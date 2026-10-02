@@ -1,23 +1,29 @@
-# C++ header with an expression statement inside a namespace crashes clang Sema
+# C++ header: some expression statements at namespace scope still crash clang Sema
 
-Found 2026-09-30 by W3 round 3 (pre-existing on master; W3 fixed the hang class, not this crash).
+V15 (52a77168, 2026-10-01) fixed the common forms: `namespace n { 1 + ; }`, assignments, calls,
+literals (15 of 17 probes in scratch/repro_keep/v15/rv15/m give a clean "clang:" error; master crashed).
+Mechanism: a token watcher in cflat/CxxIncrementalGroup.cpp (`expressionStart` list + identifier
+look-ahead) switches clang's IncrementalExtensions off for that one statement, never inside system
+headers, restored by an RAII guard.
 
-## Repro
-scratch/repro_keep/w3/w3r/p_h_stmt.cb + h_stmt.h:
-```cpp
-// h_stmt.h
-#pragma once
-namespace n { 1 + ; }
-```
-`import cpp "h_stmt.h"; int main() { return 0; }` -> SIGSEGV in `Sema::HandleDeclarator`.
-clang++ reports a parse error.
+## Still crashing (SIGSEGV rc 139 with V15; master crashes or hangs) - probes scratch/repro_keep/v15/rv15c/n*.h
+Each one is wrapped as `namespace n { ... }`:
+- `n::x = 5;` (n01), `::n::x = 1;` (n12): an identifier followed by `::`, or a leading `::`
+- `*p = 5;` (n02), `&x;` (n06)
+- `sizeof(x);` (n04), `[]{}();` (n05), `static_cast<int>(x);` (n10)
+- `#define S x = 5;` then `S` (n03): the identifier comes from a macro expansion
+- a header ending in `int x; x` (n17): the look-ahead hits end of input
 
-## Root cause (partial)
-With clang IncrementalExtensions on, a statement inside a namespace goes through
-`ParseTopLevelStmtDecl`; the crash happens before any parse diagnostic is emitted, so W3's
-diagnostic-triggered switch-off (CxxIncrementalGroup.cpp header parse) never fires.
+Also out of scope: statements at global (file) scope (m09, m17).
 
-## Fix direction
-Catch the statement-in-namespace path before Sema (e.g. disable IncrementalExtensions for the
-header parse without losing std::function binding - W3 round 3 found a whole-parse toggle loses
-it downstream in CFlat import binding, cause untraced), or diagnose it up front.
+## Fix direction - and the traps
+- The reviewer's suggestion is to switch the extension off at EVERY statement start in a non-system
+  namespace body. CAUTION: V15 r2 did that at declaration starts and clang looped forever in error
+  recovery on `namespace tt { int broken( }` (Test/library/cpp_transitive_syntax_inner.h).
+  Any widening must keep err_cpp_transitive_header_syntax_error.cb fast, with test.sh Elapsed normal.
+- Switching the extension off for a WHOLE header, system headers included, loses std::function
+  binding (W3 trap, cause untraced).
+- Alternative: guard the crash site in Sema, or detect ParseTopLevelStmtDecl in a namespace context and
+  diagnose there instead of predicting it from tokens.
+- After any change, clear `cheaders`: entries a buggy round wrote at the same cache version show up as
+  false regressions.

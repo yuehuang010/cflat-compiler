@@ -90,6 +90,8 @@ if /I "!CFG_root_win!"=="testlibs" (
 ) else if /I "!CFG_root_win!"=="deps" (
     if defined CFLAT_VCPKG_INSTALLED (set "ROOT=%CFLAT_VCPKG_INSTALLED%") else set "ROOT=%USERPROFILE%\.cflat-compiler-deps\vcpkg_installed"
     set "ROOT=!ROOT!\x64-windows-static"
+) else if /I "!CFG_root_win!"=="system" (
+    set "ROOT=%REPO%test_libs"
 ) else if /I "!CFG_root_win!"=="sdk" (
     call :sdk_root
 ) else if /I "!CFG_root_win:~0,4!"=="env:" (

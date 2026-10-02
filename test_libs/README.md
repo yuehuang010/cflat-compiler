@@ -18,7 +18,7 @@ The Windows runner does not enforce the per-case `timeout` value: cmd.exe has no
 Each library directory has a plain `lib.cfg`, with one `key=value` per line. Lines beginning with `#` are comments; do not add spaces around `=` or quotes. Values may contain space-separated paths.
 
 - `tier=1|2|3` selects the test cadence.
-- `root_mac=deps` uses `${CFLAT_VCPKG_INSTALLED:-$HOME/.cflat-compiler-deps/vcpkg_installed}/arm64-osx`; `root_mac=brew:<formula>` uses `brew --prefix <formula>`. `root_win=deps` uses `%CFLAT_VCPKG_INSTALLED%` (or `%USERPROFILE%\.cflat-compiler-deps\vcpkg_installed`) plus `x64-windows-static`; `root_win=env:<VAR>` uses that environment variable, and an unset variable skips the library. `root_win=testlibs` uses `test_libs/vcpkg_installed/x64-windows`, installed from `test_libs/vcpkg.json`; `CFLAT_TESTLIB_<LIBNAME>` (or the variable named by `env_win=<VAR>`) overrides that root when set. `root_mac=none` marks a library that has no macOS root (it skips). `root_win=sdk` uses the newest Windows SDK include directory (`Include\<version>` under the registry's `KitsRoot10`), for system headers such as `windows.h`.
+- `root_mac=deps` uses `${CFLAT_VCPKG_INSTALLED:-$HOME/.cflat-compiler-deps/vcpkg_installed}/arm64-osx`; `root_mac=brew:<formula>` uses `brew --prefix <formula>`. `root_win=deps` uses `%CFLAT_VCPKG_INSTALLED%` (or `%USERPROFILE%\.cflat-compiler-deps\vcpkg_installed`) plus `x64-windows-static`; `root_win=env:<VAR>` uses that environment variable, and an unset variable skips the library. `root_win=testlibs` uses `test_libs/vcpkg_installed/x64-windows`, installed from `test_libs/vcpkg.json`; `CFLAT_TESTLIB_<LIBNAME>` (or the variable named by `env_win=<VAR>`) overrides that root when set. `root_mac=none` marks a library that has no macOS root (it skips). `root_mac=system` / `root_win=system` is for libraries that ship with the toolchain (the C++ standard library): no install root, no probe needed, no include or lib arguments. `root_win=sdk` uses the newest Windows SDK include directory (`Include\<version>` under the registry's `KitsRoot10`), for system headers such as `windows.h`.
 - `probe=<relative path>` must exist below the root or the library is skipped (or failed with `--strict`).
 - `include=<dirs>` lists include directories below the root. `lib_mac=<files>` and `lib_win=<files>` list libraries below it.
 - `runpath_mac=<dir>` and `runpath_win=<dir>` add a runtime library directory when needed.
@@ -55,6 +55,6 @@ When a fix lands for a disabled case, remove its `DISABLED` marker in the same c
 
 | Tier | Cadence | Libraries |
 | --- | --- | --- |
-| 1 | Smoke: required before landing, runs in `buildci.sh` / `buildci.bat`; not in the dev loop | json, fmt, simdjson, and the Windows-only vcpkg libraries curl, openblas, sdl3, sqlite3, zlib |
+| 1 | Smoke: required before landing, runs in `buildci.sh` / `buildci.bat`; not in the dev loop | std (C++11-C++20 feature sets, `std_<SS>_<topic>`), json, fmt, simdjson, and the Windows-only vcpkg libraries curl, openblas, sdl3, sqlite3, zlib |
 | 2 | On request (`-t 2`); cadence not decided yet | eigen |
 | 3 | On request (`-t 3`); giant, minutes per case | torch |

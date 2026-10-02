@@ -72,6 +72,7 @@ resolve_root() {
   spec="$1"
   case "$spec" in
     none) printf '' ;;
+    system) printf '%s/test_libs' "$ROOT" ;;
     deps) printf '%s/arm64-osx' "${CFLAT_VCPKG_INSTALLED:-$HOME/.cflat-compiler-deps/vcpkg_installed}" ;;
     brew:*) brew --prefix "${spec#brew:}" 2>/dev/null ;;
     env:*) printenv "${spec#env:}" 2>/dev/null || true ;;

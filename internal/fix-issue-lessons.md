@@ -748,6 +748,16 @@ in most cases already attempted and reverted once.
   code-VALUE-into-ANY-data-parameter record, the code-value-evidence join-ledger record, and the
   temp-unique-field-escape record).
   Equalize (or freshly rebuild) the cache on both sides before reading a single diff.
+- **A header cache written by a DIFFERENT build at the same cache version is a false regression.**
+  Cache keys carry no build stamp, so a branch build reuses `cheaders/v<N>` entries written by an
+  earlier (buggy) round or another branch. Hit twice on 2026-10-01: the shared Windows gate tree
+  (master itself "failed" test_cpp_interop, ~25 min lost) and V15 r3 (18 "regressed" C++ error tests
+  were r2's cached bindings; cold they passed). Clear `cheaders` / `--init-clear-local` before
+  trusting any C++-interop failure from a worktree that ran an earlier round.
+- **`git reset --soft master` squashes onto the CURRENT master.** If master moved since the branch
+  forked, the commit silently reverts every landing in between (V15 squash, 2026-10-01: -759 lines).
+  Squash with `git reset --soft $(git merge-base HEAD master)`, then rebase; check
+  `git diff --stat master` before gating.
 - **A COPIED exe is not a PRE binary.** The non-aggregate-global-brace-list record's first core sweep used a copied PRE
   binary whose `.cflat` cache still pointed at the other tree and produced 25 bogus
   circular-import/redeclaration diffs. Build a detached worktree at the merge base.

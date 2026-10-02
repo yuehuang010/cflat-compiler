@@ -22,3 +22,5 @@ this item is about declaring a type that may not be moved at all.
 - `is_unique` / `is_copyable` style trait (`is_movable`) answers false for the type.
 
 Needs a maintainer ruling on the surface (spelling, propagation, the C++ mapping) before build.
+
+RULED 2026-10-01 (maintainer): surface APPROVED as proposed: spelling `[immovable]` (lowercase, like the language-semantics attributes `[unique]`, `[cpp]`, `[winrt]`; PascalCase is for library metadata such as `[JsonName]`), every move operation an error at the operation, propagates to containing structs, a C++ class with deleted move AND copy maps to it, `is_movable` trait. Buildable; move to a plan or p2 run when scheduled.
