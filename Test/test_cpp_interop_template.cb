@@ -3507,6 +3507,7 @@ extern int main()
             void* nilVoid = nilPtr;
             if (cppt.arr.nil_order(nilVoid) != 3 || cppt.arr.nil_order(nilPtr) != 2) return 2880;
         }
+        if (pf1u.run() != 7)                                                return 2881;
         if (cppt.arr.array_delete_count() != 5)                             return 2782;
         std.tuple<int, int> ctorTup = std.tuple<int, int>(7, 8);
         if (std.get<0>(ctorTup) != 7)                                       return 2556;

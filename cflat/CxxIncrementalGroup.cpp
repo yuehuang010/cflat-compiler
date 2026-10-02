@@ -2,6 +2,7 @@
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
+#include "clang/AST/CXXInheritance.h"
 #include "clang/AST/Mangle.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
@@ -465,6 +466,7 @@ namespace
         // `<name>` -> the header the first `#include <name>` found; resolves a root such as the
         // request prologue's `<new>`.
         std::unordered_map<std::string, const clang::FileEntry*> angled;
+        uint64_t version = 0;   // bumped per recorded #include; keys reachability memos
     };
 
     class IncludeCollector : public clang::PPCallbacks
@@ -498,6 +500,7 @@ namespace
         {
             if (!file) return;
             const clang::FileEntry* target = &file->getFileEntry();
+            ++graph.version;
             graph.targets.insert(target);
             clang::SourceManager& sm = pp.getSourceManager();
             if (auto includer = sm.getFileEntryRefForID(sm.getFileID(sm.getExpansionLoc(hashLoc))))
@@ -776,6 +779,20 @@ namespace
                 Note(e->getConstructor());
                 return true;
             }
+            // A delete CodeGen devirtualizes (non-virtual or final destructor) calls it directly.
+            bool VisitCXXDeleteExpr(clang::CXXDeleteExpr* e)
+            {
+                Note(e->getOperatorDelete());
+                const clang::QualType destroyed = e->getDestroyedType();
+                const auto* record = destroyed.isNull() ? nullptr
+                    : destroyed->getBaseElementTypeUnsafe()->getAsCXXRecordDecl();
+                if (record == nullptr || !record->hasDefinition()) return true;
+                const clang::CXXDestructorDecl* dtor = record->getDefinition()->getDestructor();
+                if (dtor != nullptr && (!dtor->isVirtual() || dtor->hasAttr<clang::FinalAttr>()
+                                        || record->getDefinition()->isEffectivelyFinal()))
+                    Note(dtor);
+                return true;
+            }
             bool VisitCXXBindTemporaryExpr(clang::CXXBindTemporaryExpr* e)
             {
                 Note(e->getTemporary()->getDestructor());
@@ -898,6 +915,7 @@ namespace
             // Bodies this walk reaches before failing: forgotten, so a later walk through
             // them (another wrapper into the same inheriting constructor) fails again.
             std::vector<const clang::FunctionDecl*> walkedNow;
+            std::vector<clang::FunctionDecl*> addNow;
             clang::Scope tuScope(nullptr, clang::Scope::DeclScope, sema->getDiagnostics());
             const bool lendScope = sema->TUScope == nullptr;
             if (lendScope) sema->TUScope = &tuScope;
@@ -921,6 +939,15 @@ namespace
                 if (key != nullptr && !key->isDefined(keyDef)) return;   // the library's vtable
                 for (const clang::CXXMethodDecl* method : record->methods())
                     if (method->isVirtual()) work.push_back(method);
+                // The vtable also holds the base members this record does not override.
+                clang::CXXFinalOverriderMap overriders;
+                record->getFinalOverriders(overriders);
+                for (const auto& entry : overriders)
+                    for (const auto& subobject : entry.second)
+                        for (const clang::UniqueVirtualMethod& final : subobject.second)
+                            if (final.Method != nullptr && final.Method->getParent() != record
+                                && !final.Method->isPureVirtual())
+                                work.push_back(final.Method);
             };
             while (!work.empty())
             {
@@ -986,6 +1013,11 @@ namespace
                         continue;
                     }
                     work.insert(work.end(), walk.found.begin(), walk.found.end());
+                    // CodeGen finds an in-class definition through its record; any other reached
+                    // definition is shown up front, or the demand closure adds it a round later.
+                    if (!llvm::isa<clang::CXXRecordDecl>(target->getLexicalDeclContext())
+                        && !target->isDependentContext() && !target->isInvalidDecl())
+                        addNow.push_back(target);
                     // A variable that body names must be shown to CodeGen, or it stays external.
                     for (clang::VarDecl* var : walk.storage)
                         if (clang::VarDecl* def = var->getDefinition(); def != nullptr && plan != nullptr)
@@ -1007,6 +1039,20 @@ namespace
                                 poisonDiagnostic = cause->second;
                     }
                     addRecord(ctor->getParent(), true);
+                    // A constructor's EH cleanups destroy the subobjects it already built, and
+                    // [class.base.init] makes those destructors potentially invoked anyway.
+                    if (!ctor->isDelegatingConstructor())
+                    {
+                        const clang::CXXRecordDecl* record = ctor->getParent();
+                        for (const clang::CXXBaseSpecifier& base : record->bases())
+                            addRecord(base.getType()->getAsCXXRecordDecl(), false);
+                        // Variant members are never destroyed implicitly: a union (named or
+                        // anonymous) does not odr-use its members' destructors.
+                        if (!record->isUnion())
+                            for (const clang::FieldDecl* field : record->fields())
+                                addRecord(ctx.getBaseElementType(field->getType())->getAsCXXRecordDecl(),
+                                          false);
+                    }
                 }
                 if (const auto* dtor = llvm::dyn_cast<clang::CXXDestructorDecl>(target))
                 {
@@ -1014,13 +1060,16 @@ namespace
                     addRecord(record, true);
                     for (const clang::CXXBaseSpecifier& base : record->bases())
                         addRecord(base.getType()->getAsCXXRecordDecl(), false);
-                    for (const clang::FieldDecl* field : record->fields())
-                        addRecord(ctx.getBaseElementType(field->getType())->getAsCXXRecordDecl(),
-                                  false);
+                    if (!record->isUnion())
+                        for (const clang::FieldDecl* field : record->fields())
+                            addRecord(ctx.getBaseElementType(field->getType())->getAsCXXRecordDecl(),
+                                      false);
                 }
             }
             if (!failure.empty())
                 for (const clang::FunctionDecl* fd : walkedNow) walked.erase(fd);
+            else if (plan != nullptr)
+                for (clang::FunctionDecl* fd : addNow) plan->Add(fd);
             return parsed;
         }
     };
@@ -1288,6 +1337,80 @@ namespace
         return llvm::toString(std::move(error));
     }
 
+    /*
+     * The file a plain `#include "x"` / `#include <x>` line names, resolved the way the group's
+     * preprocessor resolves an include written in an incremental input (no includer file: search
+     * paths only, plus the main file's directory when it has one). Null when it does not resolve.
+     */
+    clang::OptionalFileEntryRef ResolveIncludeLine(clang::Preprocessor& pp, std::string_view line)
+    {
+        if (!line.starts_with("#include")) return std::nullopt;
+        size_t open = line.find_first_not_of(" \t", 8);
+        if (open == std::string_view::npos || (line[open] != '"' && line[open] != '<'))
+            return std::nullopt;
+        const bool angled = line[open] == '<';
+        const size_t close = line.find(angled ? '>' : '"', open + 1);
+        if (close == std::string_view::npos || close == open + 1) return std::nullopt;
+        clang::SourceManager& sources = pp.getSourceManager();
+        llvm::SmallVector<std::pair<clang::OptionalFileEntryRef, clang::DirectoryEntryRef>, 1>
+            includers;
+        if (auto main = sources.getFileEntryRefForID(sources.getMainFileID()))
+            if (auto cwd = pp.getFileManager().getOptionalDirectoryRef("."))
+                includers.push_back({*main, *cwd});
+        clang::ConstSearchDirIterator curDir = nullptr;
+        return pp.getHeaderSearchInfo().LookupFile(
+            line.substr(open + 1, close - open - 1), clang::SourceLocation(), angled, nullptr,
+            &curDir, includers, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    }
+
+    /*
+     * `text` without the `#include` lines whose header this Interpreter already included, under
+     * any spelling or transitively. One group is one TU: a guarded header made a re-include a
+     * no-op anyway; an unguarded one (per-group statics) redeclared every entity, and whichever
+     * redeclaration a later body bound decided cold vs warm-replay results.
+     * Only an include-only prelude (what CFlat generates) is filtered: any other directive
+     * (#if, #define, #undef, #pragma, ...) can make an include inactive or give a re-include
+     * different meaning (X-macros), so such a prelude is returned unchanged for clang to run.
+     */
+    std::string UnseenIncludeLines(clang::Preprocessor& pp, const std::string& text)
+    {
+        for (size_t pos = 0; pos < text.size();)
+        {
+            size_t end = text.find('\n', pos);
+            if (end == std::string::npos) end = text.size();
+            const std::string_view line(text.data() + pos, end - pos);
+            pos = end + 1;
+            if (line.find_first_not_of(" \t\r") == std::string_view::npos) continue;
+            // Exactly `#include "x"` / `#include <x>` and nothing after it: a trailing comment
+            // opener or a `\` splice could turn the next physical line into comment text.
+            if (!line.starts_with("#include")) return text;
+            const size_t open = line.find_first_not_of(" \t", 8);
+            if (open == std::string_view::npos || (line[open] != '"' && line[open] != '<'))
+                return text;
+            const size_t close = line.find(line[open] == '<' ? '>' : '"', open + 1);
+            if (close == std::string_view::npos
+                || line.find_first_not_of(" \t\r", close + 1) != std::string_view::npos)
+                return text;
+        }
+        std::string result;
+        llvm::SmallPtrSet<const clang::FileEntry*, 4> taken;   // repeats within `text`
+        size_t pos = 0;
+        while (pos < text.size())
+        {
+            size_t end = text.find('\n', pos);
+            if (end == std::string::npos) end = text.size();
+            const std::string_view line(text.data() + pos, end - pos);
+            pos = end + 1;
+            if (line.empty()) continue;
+            if (auto file = ResolveIncludeLine(pp, line))
+                if (pp.alreadyIncluded(*file) || !taken.insert(&file->getFileEntry()).second)
+                    continue;
+            result.append(line);
+            result += '\n';
+        }
+        return result;
+    }
+
     std::vector<std::string> InterpreterArgs(const std::vector<std::string>& args)
     {
         std::vector<std::string> result;
@@ -1372,6 +1495,14 @@ struct CxxIncrementalGroup::Impl
     std::vector<std::string> includedFiles;
     std::vector<clang::FileID> includedFileIds;   // parallel to includedFiles
     IncludeGraph includeGraph;
+    // Files reached from a request's include roots, per roots; valid while the graph's version holds.
+    struct Reach
+    {
+        uint64_t version = 0;
+        bool ok = false;
+        std::unordered_set<const clang::FileEntry*> reached;
+    };
+    std::unordered_map<std::string, Reach> reachMemo;
     std::unordered_set<std::string> prefixSources;
     bool verbose = false;
     std::unordered_map<std::string, cflat_cinterop::ExtractResult> wrapperResults;
@@ -1966,17 +2097,24 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
             auto known = impl_->preludeRoots.find(prelude);
             if (known == impl_->preludeRoots.end())
             {
-                DiagnosticScope diagnostics(
-                    impl_->interpreter->getCompilerInstance()->getDiagnostics());
-                auto ptu = impl_->interpreter->Parse(prelude);
-                if (!ptu)
+                const std::string unseen = UnseenIncludeLines(
+                    impl_->interpreter->getCompilerInstance()->getPreprocessor(), prelude);
+                clang::TranslationUnitDecl* root = nullptr;
+                if (!unseen.empty())
                 {
-                    const std::string parseError = ErrorText(ptu.takeError());
-                    error = diagnostics.consumer.firstError;
-                    if (error.empty()) error = parseError;
-                    return false;
+                    DiagnosticScope diagnostics(
+                        impl_->interpreter->getCompilerInstance()->getDiagnostics());
+                    auto ptu = impl_->interpreter->Parse(unseen);
+                    if (!ptu)
+                    {
+                        const std::string parseError = ErrorText(ptu.takeError());
+                        error = diagnostics.consumer.firstError;
+                        if (error.empty()) error = parseError;
+                        return false;
+                    }
+                    root = (*ptu).TUPart;
                 }
-                known = impl_->preludeRoots.emplace(prelude, (*ptu).TUPart).first;
+                known = impl_->preludeRoots.emplace(prelude, root).first;
             }
             preludeRoot = known->second;
             chunk.erase(0, bodyStart);
@@ -2414,7 +2552,9 @@ int CxxIncrementalGroup::CheckDemand(const std::string& symbol, std::string& err
 bool CxxIncrementalGroup::EmitDemandCompanion(const std::vector<std::string>& demand,
                                               std::string& bitcode,
                                               cflat_cinterop::CxxDemandStats& stats,
-                                              std::string& error)
+                                              std::string& error,
+                                              llvm::LLVMContext* targetContext,
+                                              std::unique_ptr<llvm::Module>* moduleOut)
 {
     DiagnosticScope diagnostics(impl_->interpreter->getCompilerInstance()->getDiagnostics());
     LazyBodies& lazy = impl_->lazy;
@@ -2447,7 +2587,7 @@ bool CxxIncrementalGroup::EmitDemandCompanion(const std::vector<std::string>& de
     const auto companionStart = std::chrono::steady_clock::now();
     const bool ok = cflat_cinterop::EmitCxxDemandCompanion(
         *impl_->interpreter->getCompilerInstance(), impl_->plan, demand, &impl_->poisoned,
-        impl_->verbose, bitcode, stats, error);
+        impl_->verbose, bitcode, stats, error, targetContext, moduleOut);
     lazy.MarkPending(/*forCodeGen*/ false);
     impl_->plan.materializeBody = nullptr;
     impl_->plan.materializeReachable = nullptr;
@@ -2507,8 +2647,17 @@ std::unordered_set<std::string> CxxIncrementalGroup::UnreachableFiles(
 {
     std::unordered_set<std::string> result;
     clang::FileManager& fm = impl_->interpreter->getCompilerInstance()->getFileManager();
-    std::unordered_set<const clang::FileEntry*> reached;
-    if (!ReachFromRoots(impl_->includeGraph, fm, roots, reached)) return result;
+    std::string key;
+    for (const std::string& root : roots) key += root + '\n';
+    Impl::Reach& memo = impl_->reachMemo[key];
+    if (memo.version != impl_->includeGraph.version || impl_->includeGraph.version == 0)
+    {
+        memo.reached.clear();
+        memo.ok = ReachFromRoots(impl_->includeGraph, fm, roots, memo.reached);
+        memo.version = impl_->includeGraph.version;
+    }
+    if (!memo.ok) return result;
+    const std::unordered_set<const clang::FileEntry*>& reached = memo.reached;
     for (const std::string& file : files)
     {
         auto ref = fm.getOptionalFileRef(file);

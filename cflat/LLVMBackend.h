@@ -3198,6 +3198,7 @@ private:
     bool optimizedViewWasIncremental_ = false;
     // Names present when a core bitcode cache was loaded; later functions are user IR.
     std::optional<std::unordered_set<std::string>> cachedFunctionNames_;
+    std::unordered_set<std::string> companionFunctionNames_;
 
     std::vector<StackState> stackNamedVariable;
     uint64_t nextDeclSequence = 1;
@@ -3695,12 +3696,15 @@ private:
      * Blobs arrive from the extractor or from the header cache; identical blobs are dropped, and
      * whatever survives merges by ODR at link time.
      */
-    std::vector<std::string> cxxCompanionBitcode_;
+    // `module`, when set, is the blob already in this context (a live demand pass).
+    struct CxxCompanionBlob { std::string bitcode; std::unique_ptr<llvm::Module> module; };
+    std::vector<CxxCompanionBlob> cxxCompanionBitcode_;
     std::unordered_set<uint64_t> cxxCompanionSeen_;   // FNV-1a of an adopted blob, for dedup
     // Set when a companion link internalized definitions, so the DCE that removes the dead
     // ones runs whatever -O level the program is built at.
     bool cxxCompanionInternalized_ = false;
-    void AdoptCxxCompanionBitcode(const std::string& bitcode);
+    void AdoptCxxCompanionBitcode(const std::string& bitcode,
+                                  std::unique_ptr<llvm::Module> module = nullptr);
     std::vector<std::string> CxxProgramDemand() const;
     bool EmitCxxDemandCompanions();
     bool LinkCxxCompanionModules();
@@ -11350,7 +11354,12 @@ public:
     //      so a same-name internal static from two import groups is refused as ambiguous.
     // 174: null-type arguments spell decltype(nullptr) in deduction wrappers; nullptr_t
     //      signatures register instead of deferring for a type request.
-    static constexpr int kCHeaderCacheVersion = 174;
+    // 175: demand verdicts walk inherited vtable overriders, devirtualized deletes and a
+    //      constructor's subobject destructors (one demand round instead of two or three).
+    // 176: a C++ request prelude skips an include of a header the group already included
+    //      (resolved file identity), so the extracted prelude roots differ.
+    // 177: header content hashes are xxh3 instead of byte-loop FNV-1a.
+    static constexpr int kCHeaderCacheVersion = 177;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

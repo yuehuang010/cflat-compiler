@@ -44,7 +44,9 @@ public:
     void RestorePoisonedBodies(const std::vector<std::pair<std::string, std::string>>& verdicts);
     // The group's demand pass: bitcode defining what of `demand` this group can provide.
     bool EmitDemandCompanion(const std::vector<std::string>& demand, std::string& bitcode,
-                             cflat_cinterop::CxxDemandStats& stats, std::string& error);
+                             cflat_cinterop::CxxDemandStats& stats, std::string& error,
+                             llvm::LLVMContext* targetContext = nullptr,
+                             std::unique_ptr<llvm::Module>* moduleOut = nullptr);
     // The bytes clang read for each entry of the harvested includedFiles, same order; a null
     // data() marks a file whose buffer is unavailable. Valid while this group lives.
     std::vector<std::string_view> IncludedFileBuffers() const;

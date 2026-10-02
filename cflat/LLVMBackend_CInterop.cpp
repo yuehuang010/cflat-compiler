@@ -4,6 +4,7 @@
 #include <thread>
 #include <fstream>
 #include <iterator>
+#include <llvm/Support/xxhash.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -309,15 +310,12 @@ static void CollectHeaderNamespaceNames(const std::string& path,
         ScanHeaderNamespaceNames(std::string_view(text.data(), text.size()), out, out2, out3);
 }
 
+// File content hash; must equal LLVMBackend::HashFileFnv1a over the same bytes (xxh3, not FNV:
+// a byte-loop FNV cost ~6 ms per compile on the 6 MB simdjson.h).
 static uint64_t Fnv1aBytes(std::string_view bytes)
 {
-        uint64_t h = 1469598103934665603ULL; // FNV offset basis
-        for (unsigned char c : bytes)
-        {
-            h ^= c;
-            h *= 1099511628211ULL;
-        }
-        return h;
+        return llvm::xxh3_64bits(llvm::ArrayRef<uint8_t>(
+            reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()));
 }
 
 /*
@@ -863,13 +861,15 @@ bool LLVMBackend::VerifyModule()
 {
         std::string errors;
         llvm::raw_string_ostream errorStream(errors);
-        if (cachedFunctionNames_)
+        if (cachedFunctionNames_ || !companionFunctionNames_.empty())
         {
-            // Cached module-level artifacts are not checked here; cold compiles still use verifyModule.
+            // Cached artifacts and clang-generated companion bodies are not checked here.
             for (auto& function : module->functions())
             {
                 if (function.isDeclaration()
-                    || cachedFunctionNames_->contains(function.getName().str()))
+                    || (cachedFunctionNames_
+                        && cachedFunctionNames_->contains(function.getName().str()))
+                    || companionFunctionNames_.contains(function.getName().str()))
                     continue;
                 if (llvm::verifyFunction(function, &errorStream))
                 {
@@ -2320,13 +2320,8 @@ bool LLVMBackend::HashFileFnv1a(const std::string& path, uint64_t& outHash)
         llvm::TimeTraceScope hashScope("CHeaderFileHash", path);
         auto bufOrErr = llvm::MemoryBuffer::getFile(path);
         if (!bufOrErr) return false;
-        uint64_t h = 1469598103934665603ULL; // FNV offset basis
-        for (unsigned char c : (*bufOrErr)->getBuffer())
-        {
-            h ^= c;
-            h *= 1099511628211ULL; // FNV prime
-        }
-        outHash = h;
+        const llvm::StringRef bytes = (*bufOrErr)->getBuffer();
+        outHash = Fnv1aBytes(std::string_view(bytes.data(), bytes.size()));
         return true;
     }
 

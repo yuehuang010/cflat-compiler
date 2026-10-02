@@ -3884,6 +3884,11 @@ void LLVMBackend::PruneCxxTypeRequestDiskCache(const std::filesystem::path& cach
         const std::string owner = CxxRequestGroupMarker(group.ownerHeaders, group.ownerDefines);
         const std::string current = CxxRequestEntryValidity(mtime, contentHash);
         const std::string scope = CxxRequestPruneScope(group.pruneScope);
+        // Dead entries predate this process (its own writes are live), so one scan per directory,
+        // owner, scope and validity is enough. Callers hold gCHeaderDiskCachePublishMutex.
+        static std::unordered_set<std::string> pruned;
+        if (!pruned.insert(cacheDir.string() + "\n" + owner + "\n" + current + "\n" + scope).second)
+            return;
         const auto now = fs::file_time_type::clock::now();
         constexpr auto grace = std::chrono::minutes(10);
         for (const auto& file : fs::directory_iterator(cacheDir, ec))

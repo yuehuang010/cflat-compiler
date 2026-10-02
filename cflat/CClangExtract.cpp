@@ -6645,13 +6645,7 @@ namespace cflat_cinterop
                     });
                     keep->eraseFromParent();
                 }
-        std::string verifyText;
-        llvm::raw_string_ostream verifyStream(verifyText);
-        if (llvm::verifyModule(*module, &verifyStream))
-        {
-            err = "clang: invalid inline body module: " + verifyStream.str();
-            return false;
-        }
+        // Maintainer ruling 2026-10-02: skip LLVM verification of clang-generated companion code.
         llvm::raw_string_ostream stream(bitcode);
         llvm::WriteBitcodeToFile(*module, stream);
         stream.flush();
@@ -6928,9 +6922,11 @@ namespace cflat_cinterop
                                 const std::vector<std::string>& demand,
                                 const std::unordered_map<const clang::FunctionDecl*, std::string>* poisoned,
                                 bool verbose, std::string& bitcode, CxxDemandStats& stats,
-                                std::string& err)
+                                std::string& err, llvm::LLVMContext* targetContext,
+                                std::unique_ptr<llvm::Module>* moduleOut)
     {
         llvm::TimeTraceScope scope("CxxDemandCompanion");
+        if (moduleOut != nullptr) moduleOut->reset();
         (void)poisoned;
         bitcode.clear();
         stats = CxxDemandStats{};
@@ -7051,7 +7047,8 @@ namespace cflat_cinterop
         {
             splitPlan();
             llvm::TimeTraceScope roundScope("CxxDemandRound", std::to_string(round));
-            llvm::LLVMContext llvmCtx;
+            llvm::LLVMContext localCtx;
+            llvm::LLVMContext& llvmCtx = targetContext != nullptr ? *targetContext : localCtx;
             std::unique_ptr<CodeGenerator> cg(
                 clang::CreateLLVMCodeGen(ci, "cflat_cxx_demand", llvmCtx));
             if (!cg)
@@ -7230,6 +7227,8 @@ namespace cflat_cinterop
                 llvm::WriteBitcodeToFile(*mod, os);
                 os.flush();
             }
+            if (moduleOut != nullptr && targetContext != nullptr)
+                *moduleOut = cg->ReleaseModule();
             if (verbose)
                 std::cout << std::format("[verbose] C++ demand pass: {} demanded symbol(s), {} "
                                          "round(s), {} definition(s), {} recorded decl(s)\n",

@@ -1916,6 +1916,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // Batch (--check) loads the cache too: ResetForReanalysis leaves each file in the same
     // state a fresh backend is in at this point, and the load replaces context/module wholesale.
     cachedFunctionNames_.reset();
+    companionFunctionNames_.clear();
     bool bitcodeLoaded = false;
     // Isolated mode reparses core sources so import gating sees source import statements;
     // warm-path capability gating is deferred to a later stage.
@@ -4773,6 +4774,7 @@ void LLVMBackend::ResetForReanalysis()
     pendingNullIfaceGlobal_.clear();
     DropModuleEscapeMemo();
     cachedFunctionNames_.reset();
+    companionFunctionNames_.clear();
 
     module.reset();
     coreBitcodeBuffer_.reset();

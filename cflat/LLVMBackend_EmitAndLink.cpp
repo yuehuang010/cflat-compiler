@@ -2667,7 +2667,8 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
 
 // Take one companion module (M5 C++ definition emission). Identical blobs - the same header bound
 // twice under the same configuration - are dropped here; distinct ones merge by ODR at link time.
-void LLVMBackend::AdoptCxxCompanionBitcode(const std::string& bitcode)
+void LLVMBackend::AdoptCxxCompanionBitcode(const std::string& bitcode,
+                                           std::unique_ptr<llvm::Module> module)
 {
     llvm::TimeTraceScope scope("AdoptCxxCompanionBitcode",
                                std::to_string(bitcode.size()));
@@ -2675,7 +2676,7 @@ void LLVMBackend::AdoptCxxCompanionBitcode(const std::string& bitcode)
     uint64_t hash = 14695981039346656037ULL;
     for (unsigned char c : bitcode) { hash ^= c; hash *= 1099511628211ULL; }
     if (!cxxCompanionSeen_.insert(hash).second) return;
-    cxxCompanionBitcode_.push_back(bitcode);
+    cxxCompanionBitcode_.push_back({ bitcode, std::move(module) });
 }
 
 /*
@@ -3024,8 +3025,12 @@ bool LLVMBackend::EmitCxxDemandCompanions()
         }
         std::string bitcode, error;
         cflat_cinterop::CxxDemandStats stats;
+        // Generated in this context: the link takes the module as is, the bitcode is for the cache.
+        std::unique_ptr<llvm::Module> companionModule;
         // Nothing recorded: the empty companion is still cached so a warm run finds it.
-        if (group->DemandChunks() > 0 && !group->EmitDemandCompanion(demand, bitcode, stats, error))
+        if (group->DemandChunks() > 0
+            && !group->EmitDemandCompanion(demand, bitcode, stats, error, context.get(),
+                                           &companionModule))
         {
             LogErrorMessage("{}: the C++ definitions this program uses could not be "
                             "generated: {}", { "import cpp", error });
@@ -3055,7 +3060,7 @@ bool LLVMBackend::EmitCxxDemandCompanions()
             if (!written || ec) std::filesystem::remove(tmpPath, ec);
             PruneStaleCxxDemandCompanions(companionPath, groupPrefix);
         }
-        AdoptCxxCompanionBitcode(bitcode);
+        AdoptCxxCompanionBitcode(bitcode, std::move(companionModule));
     }
     return true;
 }
@@ -3129,25 +3134,30 @@ bool LLVMBackend::LinkCxxCompanionModules()
     companions->setDataLayout(module->getDataLayout());
     size_t blobCount = 0;
     auto mergeAdoptedBlobs = [&]() -> bool {
-        std::vector<std::string> blobs;
+        std::vector<CxxCompanionBlob> blobs;
         blobs.swap(cxxCompanionBitcode_);
         blobCount += blobs.size();
-        for (const std::string& blob : blobs)
+        for (CxxCompanionBlob& adopted : blobs)
         {
-            llvm::MemoryBufferRef buffer(blob, "cflat_cxx_companion");
-            auto parsed = [&] {
-                llvm::TimeTraceScope parseScope("CxxCompanionBitcodeParse",
-                                                 std::to_string(blob.size()));
-                return llvm::parseBitcodeFile(buffer, *context);
-            }();
-            if (!parsed)
+            const std::string& blob = adopted.bitcode;
+            std::unique_ptr<llvm::Module> companion = std::move(adopted.module);
+            if (companion == nullptr)
             {
-                LogErrorMessage("{}: the C++ definitions emitted for an imported header could not be "
-                                "read back: {}",
-                                { "import cpp", llvm::toString(parsed.takeError()) });
-                return false;
+                llvm::MemoryBufferRef buffer(blob, "cflat_cxx_companion");
+                auto parsed = [&] {
+                    llvm::TimeTraceScope parseScope("CxxCompanionBitcodeParse",
+                                                     std::to_string(blob.size()));
+                    return llvm::parseBitcodeFile(buffer, *context);
+                }();
+                if (!parsed)
+                {
+                    LogErrorMessage("{}: the C++ definitions emitted for an imported header could "
+                                    "not be read back: {}",
+                                    { "import cpp", llvm::toString(parsed.takeError()) });
+                    return false;
+                }
+                companion = std::move(*parsed);
             }
-            std::unique_ptr<llvm::Module> companion = std::move(*parsed);
 
             /*
              * Same target, spelled with more precision on Clang's side (an OS version, extra pointer
@@ -3196,6 +3206,15 @@ bool LLVMBackend::LinkCxxCompanionModules()
             if (verbose)
                 std::cout << std::format("[verbose] linking C++ companion module ({} bytes of bitcode)\n",
                                          blob.size());
+            // The first blob IS the scratch module: merging it into an empty one only copies it.
+            if (companions->empty() && companions->global_empty() && companions->alias_empty()
+                && companions->ifunc_empty() && companions->named_metadata_empty())
+            {
+                companion->setTargetTriple(companions->getTargetTriple());
+                companion->setDataLayout(companions->getDataLayout());
+                companions = std::move(companion);
+                continue;
+            }
             DeclareLinkOnceDefinitions(*companions, *companion);
             if (llvm::Linker::linkModules(*companions, std::move(companion), llvm::Linker::Flags::None))
             {
@@ -3230,6 +3249,9 @@ bool LLVMBackend::LinkCxxCompanionModules()
                         { "import cpp" });
         return false;
     }
+    for (const llvm::Function& function : module->functions())
+        if (!function.isDeclaration() && !programOrigin.contains(function.getName().str()))
+            companionFunctionNames_.insert(function.getName().str());
     if (verbose)
         std::cout << std::format("[verbose] C++ companion link: {} blob(s), {} merged "
                                  "definition(s), {} linked into the program\n",

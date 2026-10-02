@@ -2358,3 +2358,18 @@ namespace cppmsvc
         template <class... A> explicit ArgCount(A&&...) : n((int)sizeof...(A)) {}
     };
 }
+
+// A union's inactive member is never destroyed implicitly: its ill-formed template destructor must
+// not be instantiated when the union's constructor or destructor is pulled in (PF1 review).
+namespace pf1u
+{
+    template <class T> struct Bad { ~Bad() { T::missing(); } };
+    union U
+    {
+        int active;
+        Bad<int> inactive;
+        U() : active(7) {}
+        ~U() {}
+    };
+    inline int run() { U* p = new U; int v = p->active; delete p; return v; }
+}

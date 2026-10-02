@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -32,6 +33,7 @@ namespace clang
 
 namespace llvm
 {
+    class LLVMContext;
     class Module;
 }
 
@@ -858,11 +860,14 @@ namespace cflat_cinterop
      * The group's single demand CodeGen pass: replay `plan` through one CodeGenerator, request
      * exactly the recorded entities named in `demand` (the program's used-but-undefined
      * symbols), and return the finalized module as bitcode. Empty bitcode with true means the
-     * program needs nothing from this group.
+     * program needs nothing from this group. With `targetContext`, CodeGen runs in that context
+     * and the module itself is handed back through `moduleOut` as well, so the caller can link
+     * it without reading the bitcode back.
      */
     bool EmitCxxDemandCompanion(clang::CompilerInstance& ci, CxxDemandPlan& plan,
                                 const std::vector<std::string>& demand,
                                 const std::unordered_map<const clang::FunctionDecl*, std::string>* poisoned,
                                 bool verbose, std::string& bitcode, CxxDemandStats& stats,
-                                std::string& err);
+                                std::string& err, llvm::LLVMContext* targetContext = nullptr,
+                                std::unique_ptr<llvm::Module>* moduleOut = nullptr);
 }
