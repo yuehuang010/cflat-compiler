@@ -3,7 +3,7 @@
 A cast null passed as a binary-operator operand ranks as if it were a plain `T*` of the wrong pointee/cv:
 `(int**)nullptr` picks the `int*` overload (CFlat 2, clang 4), `(const int*)nullptr` picks `int*` (2 vs 5),
 `(const R*)nullptr` picks `R*` (7 vs 8). `char*`, a null `int*` local, `Ref*` and bare `nullptr` match clang.
-Same on master 72dcd9d7 and after T8 (pre-existing; silent wrong overload, so p3 only because typed-null
+Same on master 33866560 and after T8 (pre-existing; silent wrong overload, so p3 only because typed-null
 operator operands are rare).
 
 ## Repro

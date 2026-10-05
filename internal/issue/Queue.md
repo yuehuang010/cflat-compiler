@@ -72,16 +72,21 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 |-----|----------|------|-------|
 | B5 | p3/cpp-const-twin-overloads-collapse | C++ class member registration (const / non-const twins share one CFlat signature) | NEW 2026-09-28 (B1 matrix, OUT cells C1/C4, E1-E5, F1/F4, H1/H4/H9, L10) |
 | B5b | p3/cpp-constrained-twin-default-argument-ranking | C++ class member registration (constrained same-signature twins with a default argument share one CFlat signature) | NEW 2026-10-03 (T22 review rounds 2-4; pre-existing on master) |
+| B5c | p1/cpp-virtual-base-pointer-argument-unadjusted | C++ derived-to-base pointer argument conversion (LLVMBackend_Overloads.cpp ~6160) | NEW 2026-10-03 (T26 Sol review r2, pre-existing on master): pointer to a class with a virtual base passed to a const V* param is not adjusted - wrong value; refuse the selected unproven conversion or read the vbase offset |
+| B5d | p3/cpp-user-header-virtual-base-class-unsized-load | user-header record with a virtual base loaded by value on base conversion (opaque layout) | NEW 2026-10-03 (T26 Opus review r4, pre-existing on master): Module verification failed instead of a diagnostic |
+| B5e | p2/cpp-reference-member-reads-as-pointer | C++ record field of reference type (pair<const int&,...>.first) | NEW 2026-10-03 (T31 r3, pre-existing on master): reads the address - wrong code in printf |
+| B5f | p3/cpp-conversion-operator-copy-init-gaps | C++ copy-init through operator T(): trivial target + ctor/operator ambiguity | NEW 2026-10-03 (T35 Opus review, pre-existing on master) |
+| B5g | p3/cpp-callback-pointee-const-ranking-gaps | function-pointer values lose pointee const; clang-refused callback sets accepted | NEW 2026-10-03 (T25 rounds 3-5, pre-existing on master) |
+| B5h | p3/cpp-nested-member-class-free-return-and-call-result-assign | free function returning a nested member class; assignment to a class result of operator()/operator* | NEW 2026-10-03 (T30 review 2, pre-existing on master) |
+| B5i | p2/cpp-forwarded-fnptr-variable-or-closure-dangles-in-wrapper-frame | function-pointer variable or closure forwarded to a C++ `T&&` whose reference escapes through the result (wrapper-frame slot) | NEW 2026-10-03 (T28, sibling of the fixed literal case) |
+| B5j | p3/cpp-pointer-ref-overload-ctor-and-direct-member-ranking | `const char *const &` overloads: constructor wrapper path and direct non-template ranking; literal at a `const char *&&` template refused | NEW 2026-10-05 (T28 round 5 matrix, pre-existing on master) |
 | B12 | p3/cflat-extern-definition-abi-leftovers | function<> to >16B-struct C fn crossing C: reverse-thunk design (RULING) | OPEN (return-ext part landed 2cd2bb58) |
-| B13 | p2/owning-struct-borrowed-deref-and-byvalue-param-double-free | `return *o` through a borrowed pointer: refuse like h->f or move like T t = *o; `return *this` refusal RULED 2026-10-01 | PARKED (RULING); by-value part landed 059d1f42 |
 | B14 | p3/c-flexible-array-member-leftovers | move a->data (RULING: explicit move of a raw pointer) + 3 pre-existing P3 | OPEN (sizeof/alignof landed 118c2769) |
 | B16 | p3/cpp-operator-move-operand-leftovers | template U&&, elision, move into const&-only ruling | NEW 2026-09-28 (D8 report) |
 | B18 | p3/cpp-assignment-result-leftovers-after-b9 | extra copies (paren call arms, arr elem init) + bare scalar/nested ternary refusals + 3 unrelated | OPEN (P2 landed 1955bd95) |
-| B21b | p2/alias-return-byvalue-param-leftovers-after-b21 | named alias into sink, array-element store, chained decl consume, C-linkage definitions, prototype link error, stale shallow copy | W12 landed mixed named+temp + fn-value message 2026-09-30; rest open |
 | W13b | p3/cpp-overload-variadic-and-conversion-gaps | variadic-set ambiguity, defaulted param before ellipsis, member variadics, user conversions at C++ call args, inline variadic link, non-record const pointers | NEW 2026-09-30 (W13 reviews) |
 | G6 | p3/header-cache-residual-growth | in-version prune age rule (sigbase, dead request configs, cxxdemand) | NEW 2026-09-29 (split from G5) |
 | B2 | PARKED 2026-09-28 after 3 Codex rounds (scratch/b2_parked.patch): p3/cpp-string-literal-template-deduction-and-unspellable-char-args + p3/cpp-std-min-long-and-pointer-arguments-refused. Free-array issue closed (premise disproved, [over.ics.rank]/3.2.1). Restart from master on opus with the narrower design in the issue files | RequestCxxFunctionTemplate argument spelling (CxxStringLiteralSpelling, InferImplicitCxxArgumentType) | NEW. One mechanism: spell array / literal lvalues as `*reinterpret_cast<E (*)[N]>(p)` like the member path (e6c60220); give `long` arithmetic, `char*` and pointer-arithmetic rvalues a C++ spelling |
-| B2b | p2/l-suffix-incoherent-on-llp64 | literal `L` typing vs C++ `long` identity | NEW 2026-09-28 (Windows). Same family as B2 (long spelling); may need a ruling on what `5L` means on LLP64 - ask before starting |
 | B3 | p3/cpp-pointer-argument-prefers-char-pointer-over-converting-ctor + p3/cpp-single-level-pointer-unproven-at-call-argument + p3/cpp-operator-address-of-operand-not-converted | IsProvenPrimitiveSinglePointerArg / CompareUpconvert | old bucket 2b (2a landed as AT). Pointer-is-not-a-number ruling |
 
 ## C - wrongly accepted (adds a rejection)
@@ -139,13 +144,8 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 | Run | Issue | Summary | Status |
 |---|---|---|---|
 | N1 | p2/byvalue-param-owning-leftovers-after-b13 | By-value owning param leftovers after B13 | NEW 2026-09-29 |
-| N2 | p2/cpp-arm-temp-stored-then-throw-freed-on-unwind | [P2] C++ arm temp stored then throw is freed during unwind | NEW 2026-09-29 |
 | N3 | p2/cpp-const-object-nonconst-member-call-writes-readonly | loop back-edge const-pointer dataflow, virtual-base twin | W13 landed const auto copy, const globals, const-pointer overload selection 2026-09-30; rest open |
-| N4 | p2/cpp-conversion-operator-multiword-silent-mispick | C++ multi-word conversion operators (`operator unsigned`, `long long`, `signed char`, `long double`) silently  | NEW 2026-09-29 |
-| N5 | p2/cpp-conversion-operator-on-destroyed-ternary-temporary | C++ conversion operator runs after ternary temporary destruction | NEW 2026-09-29 |
-| N6 | p2/cpp-explicit-specialization-separate-import-gets-primary-layout | Explicit specialization in a separately imported header gets the primary template's layout | NEW 2026-09-29 |
 | N7 | p2/o2-builtin-folding-overrides-cflat-definitions | test_cpp_interop.cb still fails at -O2 (non-unwind leftovers) | NEW 2026-09-29 |
-| N8 | p3/coalesce-nested-ternary-arm-new-verifier-failure | [P3] Coalesce containing nested ternary arm new fails verification | NEW 2026-09-29 |
 | N9 | p3/cpp-assign-operator-route-leftovers | C++ assignment operator route leftovers | NEW 2026-09-29 |
 | N10 | p3/cpp-brace-argument-backing-remaining-shapes | Brace-list backing: optional constructor parameter case remains | NEW 2026-09-29 |
 | N11 | p3/cpp-constructor-call-accepts-implicit-narrowing | Bucket: C (ruling needed: scalar conversion table at C++ calls) | NEW 2026-09-29 |
@@ -165,8 +165,6 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 | N26 | p3/return-keep-rule-later-defined-callee-leaks | Bucket: p3 (ownership temporaries; left by E2, fix/coalesce-arm-temp-gaps, 2026-09-29) | NEW 2026-09-29 |
 | N27 | p3/cpp-default-wrapper-tie-list-shows-wrapper-shape | Ambiguous call through a default-argument wrapper lists wrapper shapes, not declarations (R3 review) | NEW 2026-09-29 perf |
 | N28 | p3/cpp-deferred-special-members-mid-size-harvest-cost | R1 deferral costs +1-2% cold on 64..~500-record harvests (interop fixtures); cutoff adjustable later (maintainer) | NEW 2026-09-29 perf |
-| N29 | p2/cpp-copy-of-class-with-ill-formed-copy-ctor-compiles | Copy of a C++ class whose implicit copy ctor is ill-formed compiles; now exit 139 in clang CodeGen, implicit or defaulted (pre-existing, R1 + D8 reviews) | NEW 2026-09-29 perf |
-| N30 | p2/cpp-import-transitive-syntax-error-hangs | Syntax error in a transitively included C++ header hangs the compile (pre-existing, H1 review) | NEW 2026-09-29 perf |
 | N31 | p3/cpp-interpreter-drops-cc1-only-flags | -Xclang cc1-only flags silently dropped by the Interpreter driver (pre-existing, H1 review) | NEW 2026-09-29 perf |
 | N32b | p3/cpp-ctor-refusal-text-gaps-after-w11 | default-member-init refusal lacks clang: prefix, ctor template names wrong overload (W11 landed the body-failure fix 2026-09-30) | NEW 2026-09-30 |
 | N33 | p3/cpp-invalid-virtual-body-link-failure | Invalid virtual body of a C++ class template = link failure, not a use-site error (pre-existing, R4 review) | NEW 2026-09-29 perf |
@@ -174,21 +172,18 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 | N35 | p3/cpp-demand-bodies-torch-cold-cost | R4 costs +4.4% cold instructions on torch (json -28%); verdict writes batched in 93b361f6 (-0.55%), rest is clang instantiation | PART 2026-09-29d |
 | N36 | p3/cpp-demand-second-use-of-failed-helper-generic-text | Second use through an already-failed helper refused without clang's text (R4 review) | NEW 2026-09-29 perf |
 | N37 | p3/cpp-signature-registration-projects-records | Registration projects every record a signature names; -3.6% torch only by skipping projection, which breaks overload order (D4) | NEW 2026-09-30 perf |
-| N38 | p2/cpp-static-inline-member-failed-initializer-reads-zero | Static inline member whose initializer fails static_assert reads 0 silently (pre-existing, D8 review) | NEW 2026-09-30 perf |
 | N39 | p2/cpp-global-initializer-from-xvalue-call-crashes | global C++ class var initialized from std.move(...) (C++ call result) = compiler crash 139 (ST8 review, pre-existing) | NEW 2026-10-01 |
 | N40 | p2/cpp-unique-ptr-get-dispatches-to-pointee-member | unique_ptr<M>.get() binds M::get through forwarding when M has get(): null deref at run time (ST8 review, pre-existing) | NEW 2026-10-01 |
 | N41 | p3/cpp-variadic-alias-template-refused | in-repo `template<auto... I> using A = S<I...>` refused (alias machinery has no pack support) (ST4, pre-existing) | NEW 2026-10-01 |
 | N42 | p2/cpp-const-global-side-effect-initializer-skipped | C++ `inline const int x = (++c, 27);` folded, initializer never runs (ST4 review, pre-existing; same mechanism as ST4 r3 item 1) | NEW 2026-10-01 |
 | N43 | p3/unsigned-enum-cast-case-label-sign-extended | native `enum E : u8`, `case (E)200:` becomes -56 (ST4 review, pre-existing) | NEW 2026-10-01 |
 | N45 | p2/cpp-nullptr-value-typed-void-pointer | nullptr values spelled void* at C++ calls: void* overload wins, nullptr_t params refuse (ST4 review, pre-existing) | NEW 2026-10-01 |
-| N46 | p2/cpp-header-edit-warm-cache-inline-body-fails | edit an imported header after a warm build -> next compile fails an inline body; cold passes (ST4 + main session, pre-existing) | NEW 2026-10-01 |
 | N47 | p3/cpp-constant-fold-and-const-static-twin-leftovers | constexpr-call initializer refused by the fold guard; const receiver + static twin overload refused (ST4 re-review leftovers) | NEW 2026-10-01 |
 | N52 | p3/cpp-range-for-member-name-lookup-and-count-probe | range-for member lookup misses enum/nested-type begin/end (accepts invalid); count/get clients pay a failed ADL probe; ST6 follow-up | NEW 2026-10-01 |
 | N54 | p3/cpp-nullptr-t-returns-and-deduction | nullptr_t returns, const& params, deduction, defaults refused (master too); ST3 follow-up | NEW 2026-10-01 |
 | N57 | p3/lowered-struct-byvalue-pass-no-moved-diagnostic | lowered struct passed by value: later read not diagnosed as moved; Q5 follow-up | NEW 2026-10-01 |
 | N58 | p3/cpp-struct-identity-underscore-namespace | [cpp] identity: ns_ namespace decode, global name collision, CRTP base reading a derived field (master too); N51 follow-up | NEW 2026-10-01 |
 | N59 | p3/cpp-struct-self-return-by-value | [cpp] struct self() by value: POD source zeroed, copyable [cpp] field refused as deleted copy ctor (master too); Q1 review follow-up | NEW 2026-10-01 |
-| N62 | p1/win-per-group-static-path-separator | Windows-only: Q6 compares declaring-file strings raw; `library\x.h` vs `library/x.h` reads as two entities -> shared_const refused (test_cpp_interop); + err_cpp_sink_blame_precise fails on Windows (uninvestigated) | NEW 2026-10-01 22:50, root cause known, fix not started |
 
 ## std smoke suite gaps 2026-10-01 (test_libs/std DISABLED cases; group at the next queue build)
 
@@ -203,44 +198,17 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 | Issue | DISABLED case | Summary |
 |---|---|---|
-| p2/cpp-address-of-pointer-local-argument-typed-single-pointer | 11_901_address_of_pointer_arg | `&p` of a pointer local passed to a C++ `T**` parameter is spelled `T*` |
-| p2/cpp-c-anonymous-typedef-struct-return-unsupported | 11_910_div_struct_return | C functions returning an anonymous-typedef struct (div_t, ldiv_t, lldiv_t, imaxdiv_t) are not bound |
-| p2/cpp-char-pointer-to-void-pointer-ctor-argument-refused | 17_903_char_ptr_to_void_ptr_ctor | CFlat refuses char* for a void* C++ constructor parameter |
 | p2/cpp-pointer-argument-converting-ctor-into-reference-refused | (none) | pointer argument to a C++ `X&&` / `const X&` param via a converting ctor (`strTwo(char*)`, `push_back(mp)`) refused "from ''" |
-| p2/cpp-cwrapper-header-macros-not-imported | 11_908_cwrapper_macros, 11_944 (DISABLED_WIN) | Object-like macros of the C++ wrapper headers (<climits>, <cfloat>, <cstdint>, <cstdlib>) are not imported |
-| p2/cpp-errno-and-assert-macros-not-importable | 11_912_errno_assert_macros | `errno` and `assert` (function-like / lvalue macros) cannot be used after import cpp |
-| p2/cpp-free-function-ctor-refuse-fixed-char-array-argument | 11_904_char_array_arg | Fixed `char[N]` local passed to a C++ free function or converting constructor is refused |
-| p2/cpp-function-pointer-typedef-unspellable-and-auto | 11_913_function_pointer_typedef | A typedef'd function pointer (std::new_handler) cannot be named, and `auto` of it fails |
-| p2/cpp-libcxx-version-header-macros-not-imported | 20_906_feature_test_macros | libc++ feature-test macros defined by <version> are not imported |
-| p2/cpp-min-max-brace-list-function-not-known | 11_922_min_max_brace_list | `std.max({3, 9, 4})` / `std.min({..})` / `std.minmax({..})`: "the function 'std.max' is not known" |
-| p2/cpp-forward-as-tuple-literal-dangles-in-wrapper-frame | 11_931_tag_objects | `std.forward_as_tuple("abc")` deduces `const char*&` to the generated wrapper's by-value slot (dangles); forwarding-ref literal deduction |
-| p2/cpp-namespace-scope-object-member-call-refused | 11_907_cout_rdbuf | Member calls on namespace-scope C++ objects are refused |
-| p2/cpp-pointer-arithmetic-argument-has-no-cpp-type | 11_926_pointer_arith_arg | Pointer arithmetic expression passed directly as a C++ argument has no C++ type |
-| p2/cpp-std-qsort-const-void-comparator-mismatch | 11_927_qsort_comparator | std.qsort / std.bsearch reject a CFlat comparator written with const void* params; bare qsort accepts it |
-| p2/cpp-valarray-subscript-overload-order-dependent-rvalue-pick | 11_939_valarray_mask_index_order, 11_947 (DISABLED_WIN) | Valarray mask and indirect subscript bind order-dependently to rvalue-reference overloads |
-| p2/std-ios-copyfmt-overload | 11_917_ios_copyfmt | CFlat cannot bind ostream::copyfmt from an ostream-derived source |
-| p2/std-ios-seekdir-enumerator | 11_930_streambuf_pubseekoff | CFlat cannot bind ios_base::beg for stream buffer seeking |
-| p2/std-ranges-empty-view | 20_905_empty_view | views::empty<int> variable template not bound as a value (extend T13 real-object path) |
 | p2/pointer-difference-parenthesized-lhs-byte-count | - | (ip + 2) - ip is 8 for int* (silent wrong value) |
 | p2/cpp-pointer-arithmetic-result-type-not-propagated | - | p + 1 ranks as void* (clang char*); ctor refuses it; template leg needs ruling |
 | p2/std-ranges-istream-view-sentinel | (none; 20_907 passes) | NARROWED: `std.views.istream<int>(input)` (variable-template CPO) resolves `istream` as the std::istream type; `ranges.istream_view<int>` works |
-| p2/std-regex-constants-enumerator | 11_928_regex_format_first_only | CFlat cannot bind regex_constants enumerators |
 | p2/cpp-nullptr-lone-class-reference-skips-converting-ctor | (C++ interop) | nullptr into a lone `const C&` param with a `C(nullptr_t)` ctor is refused (was a crash before T12); clang builds the temporary |
-| p2/cpp-msvc-valarray-binary-plus-minus-hidden | 11_940, 11_936 (DISABLED_WIN) | MSVC: member unary +/- hides binary valarray +/- |
-| p2/cpp-const-nonconst-member-overload-declaration-order | 11_941 (DISABLED_WIN) | MSVC bitset `d[2] = true` refused as not an lvalue (declaration-order guess disproved on Mac 2026-10-02; MSVC-specific cause) |
-| p2/cpp-ucrt-inline-feraiseexcept-raises-nothing | 11_942 (DISABLED_WIN) | UCRT inline `feraiseexcept` sets no flag from CFlat |
-| p2/cpp-stringbuf-base-member-lookup-after-stringstream | 11_943 (DISABLED_WIN) | `stringbuf.sputc` unknown after a stringstream use (MSVC) |
-| p2/cpp-msvc-global-type-info-reference-unmapped | 11_946 (DISABLED_WIN) | `any::type()` returning `const type_info&` refused (MSVC global `::type_info`) |
-| p3/cpp-allocator-traits-two-arg-allocate-not-bound | 11_902_allocator_traits_allocate | `std.allocator_traits<std.allocator<int>>.allocate(alloc, 4)` (two-argument overload) is not bound |
 | p3/cpp-enum-cast-operand-and-optional-enum-assign | (none) | `mk == (std.errc)22` refused with an internal wrapper name; optional<enum> assignment; std.numbers message |
-| p3/cpp-enum-value-construction-hides-enumerators | 17_901_enum_ctor_then_enumerator | After `std.errc()` is used, `std.errc.invalid_argument` in the same function: "Undefined variable invalid_argu |
-| p3/cpp-expression-template-implicit-init-refused | 11_935_valarray_expr_init | `std.valarray<int> x = w * two;` (initializer from an expression-template result) is refused |
 | p3/cpp-member-typedef-not-nameable | 11_921_member_typedef | Member typedefs / nested type names of a C++ class are not spellable (std.vector<int>.value_type, iterator_tra |
 | p3/cpp-offsetof-macro-not-importable | 11_923_offsetof_macro | offsetof(S, member) is not available after import cpp "cstddef" / "stddef.h" |
 | p3/cpp-operator-new-delete-not-callable-by-name | 11_924_operator_new_calls | The global allocation functions operator new / operator delete cannot be called by name |
 | p3/cpp-owner-before-member-template-and-operator-arg-conversion | 11_929_smart_ptr_member_templates | `shared_ptr::owner_before` is not callable, and `map<weak_ptr,...>[shared_ptr]` refuses the implicit conversio |
 | p3/cpp-pointer-to-member-function-not-spellable | 11_920_mem_fn | `&std.string.size` (pointer to an imported C++ member function) cannot be written |
-| p3/cpp-std-function-swap-member-signature-not-bound | 11_914_function_swap_member | `std.function<int(int)>::swap` member is "a std::function signature that could not be bound" |
 | p3/u8-string-literal-typed-char-pointer | 11_933_u8_literal | `u8"..."` literal is typed `char*`, cannot initialize `std::u8string` |
 
 ## Ruled 2026-10-01 - ready to schedule (rulings recorded in each issue file)
@@ -257,6 +225,7 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 | Issue | Question |
 |-------|----------|
+| p3/cpp-enum-class-enumerators-usable-unqualified | scoped C++ enumerators accepted bare (T34, 2026-10-03): refuse like C++, or keep as a CFlat convenience? |
 | p4/string-functional-construction-spelling | p4: spelling ruling needed |
 | p3/cpp-constructor-call-accepts-implicit-narrowing | scalar conversion table at C++ call arguments (ctor AND free function): master's free path refuses widening like int -> double / short -> double / bool -> double for C++ callees while the 2026-09-04 ruling refuses only narrowing; ctor and free differ in 80/160 cells (scratch/c1_matrix_r3.md). Rule: accept widening everywhere, or keep exact-group only? |
 | p3/cpp-unscoped-enum-to-double-param-refused | joins the scalar conversion table ruling above: CFlat refuses int -> double at every call argument (native too), so enum -> double would be a new rule; also `P4(0)` (C++ ambiguous int -> long vs pointer) (D1, 2026-09-28) |

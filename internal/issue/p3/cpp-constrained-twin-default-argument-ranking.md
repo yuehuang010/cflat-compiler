@@ -5,7 +5,7 @@ Two same-signature C++ members that differ only by a trailing requires-clause, w
 has a default argument, are bound as one CFlat overload: RegisterCxxClassMembers
 (LLVMBackend_CInterop.cpp, `instanceBySig`) dedupes by CFlat signature and keeps the first
 declared. clang picks the more constrained twin whenever both are viable; CFlat calls the
-first. Same on master 1280a5f2 and after T22 (T22 prunes the less constrained twin ONLY when
+first. Same on master 33866560 and after T22 (T22 prunes the less constrained twin ONLY when
 neither twin has a default argument and both agree on the ellipsis).
 
 ## Repro (Test/library/cpp_t22_constrained_members.hpp shapes; clang++ -std=c++20 oracle)

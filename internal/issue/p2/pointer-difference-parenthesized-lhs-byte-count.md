@@ -1,7 +1,7 @@
 # Pointer difference with a parenthesized pointer-arithmetic LHS yields a byte count (silent wrong value)
 
 `(ip + 2) - ip` evaluates to 8 for `int* ip`; `ip + 2 - ip` gives 2 (C: 2 in both). Pre-existing on master
-f4a43aef, found by the T24 review (2026-10-03).
+33866560, found by the T24 review (2026-10-03).
 
 ## Repro
 

@@ -58,3 +58,13 @@ Constructor: reuse the extractor's `calleeIdentity` / literal pointer temporary 
 the constructor wrapper's parameter as `const char *const &` (caller slot). Direct binding: rank
 `X *const &` from an `X *` / literal as an exact match ahead of user-defined conversions; refuse the
 array-reference / by-value-pointer ties as clang does.
+
+## Also (main-session review of t28 round 5, 2026-10-05)
+
+- A literal at a template `const char *&&` parameter that keeps the address
+  (`template<class U> const char* const* rr(const char*&& p, const U&) { return &p; }`,
+  `consume(rr("abc", 1), scribble())`): clang accepts and prints 3. Master SIGSEGVs; t28 refuses
+  ("... cannot keep that pointer alive in the calling frame for the same overload"), because the
+  caller-slot re-spelling is `X *const &` only. Safe, but a refusal clang does not make.
+- Free path: the caller-slot re-spelling is skipped when the operator scalar retarget already
+  fired (`retarget.empty()` guard in RequestCxxFreeFunction); not probed.

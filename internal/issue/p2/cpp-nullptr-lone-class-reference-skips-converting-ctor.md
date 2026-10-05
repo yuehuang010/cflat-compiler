@@ -14,7 +14,7 @@ CanImplicitlyConstructCxxClass about nullptr_t ctors) so these compile with clan
 
 ## Repro
 
-scratch/repro_keep/t8_conv/rv.hpp + conv.cb / conv2.cb (master 72dcd9d7 and the T8 branch alike).
+scratch/repro_keep/t8_conv/rv.hpp + conv.cb / conv2.cb (master 33866560 and the T8 branch alike).
 
 ## Root cause (GUESS)
 
