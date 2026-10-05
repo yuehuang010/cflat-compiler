@@ -1,0 +1,36 @@
+// C++20 equivalent of std_full_11_bitset.cb (compile-time parity baseline)
+#include <string>
+#include <bitset>
+#include <functional>
+#include <cstdio>
+
+int main() {
+    int failures = 0;
+    std::bitset<8> a(0b1010);
+    std::bitset<8> b(std::string("0110"));
+    std::bitset<8> z;
+    if (a.to_ulong() != 10 || b.to_ulong() != 6 || z.to_ulong() != 0 || a.size() != 8 || !z.none()) { printf("FAIL construction\n"); failures |= 1; }
+    std::bitset<8> c;
+    c.set(0); c.set(3); c.set(5, true); c.set(3, false);
+    if (!c.test(0) || c.test(3) || !c.test(5) || c.count() != 2 || c.to_ulong() != 33) { printf("FAIL set test\n"); failures |= 2; }
+    c.reset(0); c.flip(1); c.flip();
+    if (c.to_ulong() != 0xDD) { printf("FAIL reset flip\n"); failures |= 4; }
+    c.reset();
+    c.set();
+    if (!c.all() || c.count() != 8 || !c.any() || c.none()) { printf("FAIL set all\n"); failures |= 8; }
+    if (a.to_string() != "00001010" || b.to_string() != "00000110" || a.to_string('.', '#') != "....#.#." || std::bitset<4>(9).to_string() != "1001")
+    { printf("FAIL to_string\n"); failures |= 32; }
+    std::bitset<8> x = a & b, o = a | b, e = a ^ b, n = ~a, l = a << 2, r = a >> 1;
+    if (x.to_ulong() != 2 || o.to_ulong() != 14 || e.to_ulong() != 12 || n.to_ulong() != 0xF5 || l.to_ulong() != 40 || r.to_ulong() != 5)
+    { printf("FAIL bitwise ops\n"); failures |= 64; }
+    std::bitset<8> cp = a;
+    cp &= b; cp |= std::bitset<8>(1); cp ^= std::bitset<8>(3); cp <<= 1; cp >>= 2;
+    if (cp.to_ulong() != 0 || a == b || a != std::bitset<8>(10) || !(a == std::bitset<8>(10))) { printf("FAIL compound ops\n"); failures |= 128; }
+    std::bitset<70> wide;
+    wide.set(69); wide.set(0);
+    if (wide.count() != 2 || !wide.test(69) || wide.size() != 70 || wide.to_string().size() != 70) { printf("FAIL wide\n"); failures |= 256; }
+    std::hash<std::bitset<8>> hb;
+    if (hb(a) != hb(std::bitset<8>(10))) { printf("FAIL hash\n"); failures |= 512; }
+    if (failures == 0) printf("PASS std_full_11_bitset\n");
+    return failures;
+}

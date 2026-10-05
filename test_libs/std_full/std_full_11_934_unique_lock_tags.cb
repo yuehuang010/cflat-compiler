@@ -1,0 +1,21 @@
+// GUARDS: unique_lock defer_lock and try_to_lock constructor tags
+// FROM: internal/plan/std-library-tier2-suite.md (C++11 concurrency coverage)
+import cpp "mutex";
+extern int main()
+{
+    int failures = 0;
+    std.mutex a = default; std.mutex b = default;
+    std.unique_lock<std.mutex> deferred = std.unique_lock<std.mutex>(a, std.defer_lock);
+    std.unique_lock<std.mutex> attempted = std.unique_lock<std.mutex>(b, std.try_to_lock);
+    if (deferred.owns_lock() || !attempted.owns_lock()) { printf("FAIL defer/try tags\n"); failures |= 1; }
+    std.mutex c = default; std.mutex d = default;
+    std.unique_lock<std.mutex> left = std.unique_lock<std.mutex>(c, std.defer_lock);
+    std.unique_lock<std.mutex> right = std.unique_lock<std.mutex>(d, std.defer_lock);
+    std.lock(left, right);
+    if (!left.owns_lock() || !right.owns_lock()) { printf("FAIL lock tags\n"); failures |= 2; }
+    left.unlock(); right.unlock();
+    deferred.lock();
+    if (!deferred.owns_lock()) { printf("FAIL deferred lock\n"); failures |= 4; }
+    if (failures == 0) printf("PASS std_full_11_934_unique_lock_tags\n");
+    return failures;
+}

@@ -1,0 +1,69 @@
+// GUARDS: iostream capture, formatting manipulators, input extraction, character reads, and stream state
+// FROM: internal/plan/std-library-tier2-suite.md (C++11 iostream coverage)
+import cpp {"ctime", "iostream", "iomanip", "sstream", "string", "ios"};
+extern int main()
+{
+    int failures = 0;
+    std.ostringstream manip = default;
+    manip << "x" << std.hex << 26 << std.boolalpha << true << std.endl;
+    if (manip.str() != "x1atrue\n") { printf("FAIL endl/hex/boolalpha\n"); failures |= 256; }
+    std.ostringstream upper = default;
+    upper << std.showbase << std.hex << std.uppercase << 255;
+    if (upper.str() != "0XFF") { printf("FAIL uppercase\n"); failures |= 512; }
+    std.ostringstream formatted = default;
+    formatted << std.showbase << std.hex << 16 << ' ' << std.fixed << std.setprecision(2) << 1.5;
+    if (formatted.str() != "0x10 1.50") { printf("FAIL ostream formatting\n"); failures |= 1; }
+    std.ostringstream padded = default;
+    padded << std.setfill('0') << std.setw(4) << 12;
+    if (padded.str() != "0012" || padded.tellp() != 4) { printf("FAIL width fill tellp\n"); failures |= 2; }
+
+    std.ostringstream putwrite = default;
+    putwrite.write("xy", 2); putwrite.put('z');
+    if (putwrite.str() != "xyz" || putwrite.tellp() != 3) { printf("FAIL ostream put/write/tellp\n"); failures |= 16; }
+    std.ostringstream sourcefmt = default;
+    sourcefmt << std.showpos;
+    sourcefmt.precision(3); sourcefmt.width(5); sourcefmt.fill('_');
+    bool fmt_state = sourcefmt.precision() == 3 && sourcefmt.width() == 5 && sourcefmt.fill() == '_';
+    sourcefmt << 12;
+    if (!fmt_state || sourcefmt.str() != "__+12") { printf("FAIL ios_base flags/precision/width/fill\n"); failures |= 32; }
+
+    std.tm date = default;
+    date.tm_year = 124; date.tm_mon = 1; date.tm_mday = 3;
+    std.ostringstream dateout = default;
+    dateout << std.put_time(&date, "%Y-%m-%d");
+    std.tm parsed = default;
+    std.istringstream datein = std.istringstream("2024-02-03");
+    datein >> std.get_time(&parsed, "%Y-%m-%d");
+    if (dateout.str() != "2024-02-03" || parsed.tm_year != 124 || parsed.tm_mon != 1 || parsed.tm_mday != 3)
+    { printf("FAIL put_time/get_time C locale\n"); failures |= 64; }
+
+    std.istringstream input = std.istringstream("12 alpha\nbeta");
+    int n = 0;
+    std.string word = default;
+    std.string line = default;
+    input >> n >> word;
+    input.get();
+    std.getline(input, line);
+    if (n != 12 || word != "alpha" || line != "beta") { printf("FAIL formatted input getline\n"); failures |= 4; }
+    input.clear();
+    input.str("xy");
+    char ch = 0;
+    input.get(ch);
+    int peeked = input.peek();
+    input.ignore();
+    i64 ignored = input.gcount();
+    input.get(ch);
+    if (ch != 'x' || peeked != 'y' || ignored != 1 || !input.eof()) { printf("FAIL get peek ignore gcount state\n"); failures |= 8; }
+    input.clear(); input.seekg(1); input.get(ch); input.unget(); input.get(ch);
+    if (ch != 'y') { printf("FAIL unget/clear\n"); failures |= 128; }
+    std.istringstream bad_input = std.istringstream("word");
+    int invalid = 0; bad_input >> invalid;
+    bool fail_state = bad_input.fail() && !bad_input.bad() && (bad_input.rdstate() & std.ios.failbit) != 0 && !bad_input;
+    bad_input.clear(); bad_input.setstate(std.ios.badbit);
+    bool bad_state = bad_input.bad() && (bad_input.rdstate() & std.ios.badbit) != 0 && !bad_input;
+    bad_input.clear();
+    if (!fail_state || !bad_state || bad_input.rdstate() != 0 || !bad_input) { printf("FAIL stream state\n"); failures |= 256; }
+
+    if (failures == 0) printf("PASS std_full_11_iostreams\n");
+    return failures;
+}

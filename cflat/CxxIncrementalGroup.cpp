@@ -656,6 +656,8 @@ namespace
         Body* capturing = nullptr;
         unsigned depth = 0;
         std::unordered_map<clang::FunctionDecl*, Body> bodies;
+        std::unordered_set<std::string> noDeferBodyKeys;
+        std::vector<std::string> lookupTaintedBodyKeys;
         cflat_cinterop::CxxDemandPlan* plan = nullptr;   // the group's, for the demand pass
         const std::unordered_map<const clang::FunctionDecl*, std::string>* poisoned = nullptr;
         const std::unordered_map<const clang::FunctionDecl*, std::string>* causes = nullptr;
@@ -687,6 +689,8 @@ namespace
                 || fd->getParentFunctionOrMethod() != nullptr || fd->hasAttr<clang::UsedAttr>()
                 || fd->isMultiVersion())
                 return false;
+            if (!noDeferBodyKeys.empty() && noDeferBodyKeys.count(StableFunctionKey(fd)) != 0)
+                return false;
             // A ctor-initializer or function-try-block is not a plain brace run; parse those.
             const clang::Token& open = parser->getCurToken();
             if (!open.is(clang::tok::l_brace)) return false;
@@ -709,6 +713,144 @@ namespace
             }
             if (depth != 0) capturing = &body;
             return true;
+        }
+
+        /*
+         * Stable across parses and across Skip() vs replay: qualified name, parameter types and
+         * method qualifiers. Not the function type - an implicit destructor's noexcept is
+         * computed after Skip() sees it, so the type spelling differs between the two.
+         */
+        std::string StableFunctionKey(const clang::FunctionDecl* fd) const
+        {
+            const clang::FunctionDecl* first = fd->getFirstDecl();
+            const clang::PrintingPolicy& policy = sema->getASTContext().getPrintingPolicy();
+            std::string key = first->getQualifiedNameAsString() + "|(";
+            for (unsigned i = 0; i < first->getNumParams(); ++i)
+            {
+                if (i != 0) key += ", ";
+                key += first->getParamDecl(i)->getType().getCanonicalType().getAsString(policy);
+            }
+            key += ")";
+            if (first->isVariadic()) key += "...";
+            if (const auto* method = llvm::dyn_cast<clang::CXXMethodDecl>(first))
+            {
+                if (method->isConst()) key += " const";
+                if (method->isVolatile()) key += " volatile";
+                if (method->getRefQualifier() == clang::RQ_LValue) key += " &";
+                if (method->getRefQualifier() == clang::RQ_RValue) key += " &&";
+            }
+            return key;
+        }
+
+        /*
+         * A replayed body is lookup-tainted when a non-dependent call or function reference in it
+         * resolved to a declaration clang could not have seen at the body's point of definition.
+         * That point is the body's `{`, except inside a class: member and friend bodies are
+         * complete-class contexts, parsed at the outermost enclosing class's closing `}`.
+         * The callee position is its earliest explicit redeclaration (forward and friend
+         * declarations count); builtins and implicit declarations are never tainted.
+         */
+        bool FindLookupTaint(clang::FunctionDecl* fd, const Body& body)
+        {
+            if (body.tokens.empty() || fd->isTemplated()
+                || fd->getTemplateSpecializationKind() != clang::TSK_Undeclared)
+                return false;
+            clang::SourceManager& sources = sema->getSourceManager();
+            clang::SourceLocation reference = body.tokens.front().getLocation();
+            const clang::CXXRecordDecl* outermost = nullptr;
+            for (const clang::DeclContext* dc = fd->getLexicalDeclContext();
+                 dc != nullptr && dc->isRecord(); dc = dc->getLexicalParent())
+                outermost = llvm::dyn_cast<clang::CXXRecordDecl>(dc);
+            if (outermost != nullptr) reference = outermost->getBraceRange().getEnd();
+            if (reference.isInvalid()) return false;
+            reference = sources.getExpansionLoc(reference);
+            const clang::SourceLocation bodyEnd = sources.getExpansionLoc(body.tokens.back().getLocation());
+            // Declared inside this body (a lambda, local class, block-scope using) precedes its use.
+            auto later = [&](clang::SourceLocation loc) {
+                if (loc.isInvalid()) return false;
+                loc = sources.getExpansionLoc(loc);
+                return loc != reference && sources.isBeforeInTranslationUnit(reference, loc)
+                    && !sources.isBeforeInTranslationUnit(loc, bodyEnd);
+            };
+            std::vector<clang::Stmt*> work;
+            if (fd->getBody() != nullptr) work.push_back(fd->getBody());
+            bool found = false;
+            auto inspect = [&](const clang::FunctionDecl* target) {
+                if (target == nullptr || found || target->getBuiltinID() != 0) return;
+                clang::SourceLocation earliest;
+                auto note = [&](const clang::Decl* redecl) {
+                    if (redecl->isImplicit() || redecl->getLocation().isInvalid()) return;
+                    const clang::SourceLocation loc = sources.getExpansionLoc(redecl->getLocation());
+                    if (earliest.isInvalid() || sources.isBeforeInTranslationUnit(loc, earliest))
+                        earliest = loc;
+                };
+                for (const clang::FunctionDecl* redecl : target->redecls()) note(redecl);
+                // A specialization sits where its pattern was defined; the template or member
+                // it came from was declared (and visible) at its earliest declaration.
+                for (const clang::FunctionTemplateDecl* primary = target->getPrimaryTemplate();
+                     primary != nullptr; primary = primary->getInstantiatedFromMemberTemplate())
+                    for (const clang::RedeclarableTemplateDecl* redecl : primary->redecls())
+                        note(redecl);
+                for (const clang::FunctionDecl* pattern = target->getInstantiatedFromMemberFunction();
+                     pattern != nullptr; pattern = pattern->getInstantiatedFromMemberFunction())
+                    for (const clang::FunctionDecl* redecl : pattern->redecls()) note(redecl);
+                if (later(earliest)) found = true;
+            };
+            while (!work.empty() && !found)
+            {
+                clang::Stmt* stmt = work.back();
+                work.pop_back();
+                if (auto* call = llvm::dyn_cast<clang::CallExpr>(stmt))
+                {
+                    if (!call->isTypeDependent() && !call->isValueDependent())
+                        inspect(call->getDirectCallee());
+                }
+                else if (auto* ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+                {
+                    if (!ref->isTypeDependent() && !ref->isValueDependent())
+                    {
+                        inspect(llvm::dyn_cast<clang::FunctionDecl>(ref->getDecl()));
+                        // A later using-declaration brings in an earlier function (f3 shape).
+                        if (auto* shadow = llvm::dyn_cast<clang::UsingShadowDecl>(ref->getFoundDecl()))
+                            if (llvm::isa<clang::FunctionDecl>(ref->getDecl())
+                                && later(shadow->getIntroducer()->getLocation()))
+                                found = true;
+                    }
+                }
+                else if (auto* local = llvm::dyn_cast<clang::DeclStmt>(stmt))
+                {
+                    // Member bodies of a local class are not statement children of this body.
+                    std::vector<const clang::DeclContext*> records;
+                    for (clang::Decl* decl : local->decls())
+                        if (auto* record = llvm::dyn_cast<clang::CXXRecordDecl>(decl))
+                            records.push_back(record);
+                    while (!records.empty())
+                    {
+                        const clang::DeclContext* record = records.back();
+                        records.pop_back();
+                        for (clang::Decl* member : record->decls())
+                        {
+                            if (auto* nested = llvm::dyn_cast<clang::CXXRecordDecl>(member))
+                                records.push_back(nested);
+                            else if (auto* method = llvm::dyn_cast<clang::FunctionDecl>(member))
+                                if (method->getBody() != nullptr) work.push_back(method->getBody());
+                        }
+                    }
+                }
+                for (clang::Stmt* child : stmt->children())
+                    if (child != nullptr) work.push_back(child);
+            }
+            if (found)
+            {
+                // Always reported, even when Skip() was told not to defer it: the caller must
+                // see every tainted replay, never a silent one.
+                const std::string key = StableFunctionKey(fd);
+                noDeferBodyKeys.insert(key);
+                if (std::find(lookupTaintedBodyKeys.begin(), lookupTaintedBodyKeys.end(), key)
+                    == lookupTaintedBodyKeys.end())
+                    lookupTaintedBodyKeys.push_back(key);
+            }
+            return found;
         }
 
         // A still-skipped function's lazy body, or null.
@@ -892,7 +1034,13 @@ namespace
             }
             sema->PerformPendingInstantiations();
             fd->setLateTemplateParsed(false);
-            if (!trap.hasErrorOccurred() && fd->getBody() != nullptr) return true;
+            if (!trap.hasErrorOccurred() && fd->getBody() != nullptr)
+            {
+                // A tainted body compiled; it is recorded for the caller's recovery parse, which
+                // discards this group, so it is not a body failure here.
+                FindLookupTaint(fd, body);
+                return true;
+            }
             fd->setBody(nullptr);
             fd->setHasSkippedBody(true);
             fd->setInvalidDecl();
@@ -1588,10 +1736,11 @@ CxxIncrementalGroup::CxxIncrementalGroup(std::unique_ptr<Impl> impl)
 CxxIncrementalGroup::~CxxIncrementalGroup() = default;
 
 std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
-    const std::vector<std::string>& args, const std::string& headerSource,
-    bool verbose, std::string& error, bool tolerateDiagnostics,
-    const cflat_cinterop::ExtractRequest* macroReq,
-    cflat_cinterop::ExtractResult* macroOut)
+        const std::vector<std::string>& args, const std::string& headerSource,
+        bool verbose, std::string& error, bool tolerateDiagnostics,
+        const cflat_cinterop::ExtractRequest* macroReq,
+        cflat_cinterop::ExtractResult* macroOut,
+        const std::vector<std::string>& noDeferBodyKeys, bool forceEagerBodies)
 {
     std::optional<llvm::TimeTraceScope> setupScope;
     setupScope.emplace("CxxGroupSetup");
@@ -1671,6 +1820,7 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
         clang::LangOptions& langOpts = ci.getLangOpts();
         const bool incrementalExtensions = langOpts.IncrementalExtensions;
         LazyBodies& lazy = impl->lazy;
+        lazy.noDeferBodyKeys.insert(noDeferBodyKeys.begin(), noDeferBodyKeys.end());
         const bool trackHeaderScope = macroReq != nullptr && macroOut != nullptr
             && macroReq->cxxMode;
         std::function<void()> stopMacroCollector;
@@ -1681,7 +1831,7 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
         lazy.poisoned = &impl->poisoned;
         lazy.causes = &impl->causes;
         // CFLAT_CXX_EAGER_BODIES=1 parses every body up front (A/B and bisecting a late body).
-        if (lazy.parser != nullptr && !cflat_cinterop::CxxEagerBodies())
+        if (lazy.parser != nullptr && !cflat_cinterop::CxxEagerBodies() && !forceEagerBodies)
         {
             lazy.parser->*AccessPrivate(ParserSkipBodiesTag{}) = true;
             lazy.active = true;
@@ -1890,6 +2040,39 @@ bool CxxIncrementalGroup::HarvestHeader(const cflat_cinterop::ExtractRequest& re
     if (harvested && out.demandRecorded) impl_->demandHeaderHarvested = true;
     out.includedFiles = impl_->includedFiles;
     return harvested;
+}
+
+bool CxxIncrementalGroup::LookupMacro(const std::string& name, MacroLookup& out) const
+{
+    if (impl_ == nullptr || name.empty()) return false;
+    clang::Preprocessor& pp = impl_->interpreter->getCompilerInstance()->getPreprocessor();
+    auto found = pp.getIdentifierTable().find(name);
+    if (found == pp.getIdentifierTable().end()) return false;
+    const clang::IdentifierInfo* ii = found->getValue();
+    if (ii == nullptr || !ii->hasMacroDefinition()) return false;
+    const clang::MacroInfo* mi = pp.getMacroInfo(ii);
+    if (mi == nullptr || mi->isBuiltinMacro()) return false;
+    const clang::SourceManager& sm = pp.getSourceManager();
+    const clang::SourceLocation loc = mi->getDefinitionLoc();
+    out = MacroLookup{};
+    out.functionLike = mi->isFunctionLike();
+    out.variadic = mi->isVariadic();
+    out.systemHeader = loc.isValid() && sm.isInSystemHeader(loc);
+    const clang::PresumedLoc pl = sm.getPresumedLoc(loc);
+    if (pl.isValid())
+    {
+        out.file = pl.getFilename() != nullptr ? pl.getFilename() : "";
+        out.line = (int)pl.getLine();
+        out.col = (int)pl.getColumn();
+    }
+    for (const clang::IdentifierInfo* p : mi->params())
+        out.params.push_back(p->getName().str());
+    for (const clang::Token& tok : mi->tokens())
+    {
+        if (!out.body.empty()) out.body += ' ';
+        out.body += pp.getSpelling(tok);
+    }
+    return true;
 }
 
 std::vector<std::string_view> CxxIncrementalGroup::IncludedFileBuffers() const
@@ -2321,6 +2504,9 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
             }
         }
         replay.typeRequests = req.cxxTypeRequests;
+        replay.noDeferBodyKeys.assign(impl_->lazy.noDeferBodyKeys.begin(),
+                                      impl_->lazy.noDeferBodyKeys.end());
+        std::sort(replay.noDeferBodyKeys.begin(), replay.noDeferBodyKeys.end());
         replay.markerPrefix = req.cxxRequestMarkerPrefix;
         replay.thunkSuffix = req.cxxThunkSuffix;
         replay.wrapperNames = req.cxxFunctionWrapperNames;
@@ -2478,6 +2664,13 @@ unsigned CxxIncrementalGroup::DemandChunks() const
     return impl_->plan.recordedChunks;
 }
 
+std::vector<std::string> CxxIncrementalGroup::TakeLookupTaintedBodyKeys()
+{
+    std::vector<std::string> keys = std::move(impl_->lazy.lookupTaintedBodyKeys);
+    impl_->lazy.lookupTaintedBodyKeys.clear();
+    return keys;
+}
+
 void CxxIncrementalGroup::RestorePoisonedBodies(
     const std::vector<std::pair<std::string, std::string>>& verdicts)
 {
@@ -2591,6 +2784,12 @@ bool CxxIncrementalGroup::EmitDemandCompanion(const std::vector<std::string>& de
     lazy.MarkPending(/*forCodeGen*/ false);
     impl_->plan.materializeBody = nullptr;
     impl_->plan.materializeReachable = nullptr;
+    // The caller takes the keys (TakeLookupTaintedBodyKeys) and re-parses the group.
+    if (!lazy.lookupTaintedBodyKeys.empty())
+    {
+        error = "lookup-tainted inline bodies need the group parsed in place";
+        return false;
+    }
     if (impl_->verbose)
     {
         const double companionMs = std::chrono::duration<double, std::milli>(

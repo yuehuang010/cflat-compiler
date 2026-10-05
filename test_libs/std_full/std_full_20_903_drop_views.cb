@@ -1,0 +1,14 @@
+// GUARDS: begin and dereference on drop_view and drop_while_view
+// FROM: internal/plan/std-library-tier2-suite.md (C++20 ranges coverage)
+import cpp {"functional", "ranges", "vector"};
+bool less_than_two(int x) { return x < 2; }
+extern int main()
+{
+    std.vector<int> values = default; values.push_back(1); values.push_back(2); values.push_back(3);
+    auto drop = std.views.drop(values, 1);
+    auto drop_while = std.views.drop_while(values, std.function<bool(int)>(less_than_two));
+    auto take_while = std.views.take_while(values, std.function<bool(int)>(less_than_two));
+    if (*drop.begin() != 2 || *drop_while.begin() != 2 || *take_while.begin() != 1) { printf("FAIL drop view begins\n"); return 1; }
+    printf("PASS std_full_20_903_drop_views\n");
+    return 0;
+}

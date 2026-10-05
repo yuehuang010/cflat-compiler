@@ -1,0 +1,20 @@
+// GUARDS: valarray mask subscript and scalar reads of the result after scalar writes and a slice subscript
+// FROM: internal/plan/std-library-tier2-suite.md (std_full_11_complex_valarray, moved out for Windows MSVC 2026-10-02)
+import cpp "string";
+import cpp "complex";
+import cpp "valarray";
+extern int main()
+{
+    int failures = 0;
+    std.valarray<int> big = std.valarray<int>(8);
+    for (int i = 0; i < 8; i++) big[i] = i;
+    std.valarray<int> sl = big[std.slice(1, 3, 2)];
+    if (sl.size() != 3 || sl[0] != 1 || sl[1] != 3 || sl[2] != 5) { printf("FAIL slice\n"); failures |= 128; }
+    int four = 4;
+    std.valarray<bool> mask = default;
+    mask = big > four;
+    std.valarray<int> ms = big[mask];
+    if (ms.size() != 3 || ms[0] != 5 || ms[2] != 7) { printf("FAIL mask\n"); failures |= 512; }
+    if (failures == 0) printf("PASS std_full_11_947_valarray_mask_after_slice\n");
+    return failures;
+}

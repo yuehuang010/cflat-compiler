@@ -1,0 +1,28 @@
+// GUARDS: std::deque members that take or return its iterator by value across the bridge
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp "deque";
+import cpp "vector";
+extern int main()
+{
+    int failures = 0;
+    std.deque<int> d = std.deque<int>({1, 2, 3, 4});
+    d.insert(d.begin() + 2, 99);
+    if (d.size() != 5 || d[2] != 99) { printf("FAIL deque_insert\n"); failures |= 1; }
+    d.erase(d.begin() + 2);
+    if (d.size() != 4 || d[2] != 3) { printf("FAIL deque_erase\n"); failures |= 2; }
+    auto rb = d.rbegin();
+    if (*rb != 4) { printf("FAIL deque_rbegin\n"); failures |= 4; }
+    std.deque<std.vector<int>> nested = std.deque<std.vector<int>>();
+    nested.push_back(std.vector<int>({1}));
+    nested.push_back(std.vector<int>({2, 2}));
+    nested.push_back(std.vector<int>({3, 3, 3}));
+    nested.erase(nested.begin() + 1);
+    if (nested.size() != 2 || nested[1].size() != 3) { printf("FAIL deque_vector_erase\n"); failures |= 8; }
+    nested.insert(nested.begin() + 1, std.vector<int>({9, 9, 9, 9}));
+    if (nested.size() != 3 || nested[1].size() != 4) { printf("FAIL deque_vector_insert\n"); failures |= 16; }
+    auto nestedRb = nested.rbegin();
+    auto nestedLast = *nestedRb;
+    if (nestedLast.size() != 3 || nestedLast[0] != 3) { printf("FAIL deque_vector_rbegin\n"); failures |= 32; }
+    if (failures == 0) printf("PASS std_full_11_909_deque_iterator_args\n");
+    return failures;
+}

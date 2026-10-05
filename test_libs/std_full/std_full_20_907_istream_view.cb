@@ -1,0 +1,11 @@
+// GUARDS: ranges::istream_view over an input stream
+// FROM: internal/plan/std-library-tier2-suite.md (C++20 ranges coverage)
+import cpp {"ranges", "sstream"};
+extern int main()
+{
+    std.istringstream input = std.istringstream("4 5 6");
+    i64 sum = 0; for (int x in std.ranges.istream_view<int>(input)) sum += x;
+    if (sum != 15) { printf("FAIL istream view\n"); return 1; }
+    printf("PASS std_full_20_907_istream_view\n");
+    return 0;
+}

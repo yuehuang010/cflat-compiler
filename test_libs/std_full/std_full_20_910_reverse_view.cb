@@ -1,0 +1,12 @@
+// GUARDS: reverse a vector range view
+// FROM: internal/plan/std-library-tier2-suite.md (C++20 ranges coverage)
+import cpp {"ranges", "vector"};
+extern int main()
+{
+    std.vector<int> values = default; values.push_back(1); values.push_back(2);
+    auto reversed = std.views.reverse(values);
+    int first = *reversed.begin();
+    if (first != 2) { printf("FAIL reverse view first\n"); return 1; }
+    printf("PASS std_full_20_910_reverse_view\n");
+    return 0;
+}

@@ -516,6 +516,8 @@ inline std::vector<std::string> ImportFilenames(CFlatParser::ImportDeclarationCo
 // arbitrarily long and may nest, so both a single condition and the composed nesting chain are
 // bounded - a multi-kilobyte single-line error message helps nobody.
 inline constexpr size_t kIfConstConditionTextLimit = 120;
+// Companion function attribute: clang emitted it optnone (source pragma), not cflat's O0 barrier.
+inline constexpr const char* kCflatSourceOptNoneAttr = "cflat.source-optnone";
 
 // Cut `text` to at most `limit` bytes, appending "...". The cut backs off any UTF-8 continuation
 // byte, so a sliced comment inside a condition cannot leave half a character behind.
@@ -861,6 +863,9 @@ public:
         // C++ pointer result whose innermost POINTEE is const (`const T*`, `const T*&`,
         // `T const *const &`, `const T *const *`). Internal only: overload ranking and receivers.
         bool IsCxxPointeeConst = false;
+        // Spelled `const T*` (pointee const). CFlat drops const; only the C++ spelling of a CFlat
+        // function's type reads it, so `int f(const void*)` crosses as clang spells it.
+        bool IsSpelledPointeeConst = false;
         // Declared std::nullptr_t (CFlat spells it void*): only such a value, a nullptr literal
         // or 0 binds a C++ nullptr_t parameter. Internal only: overload viability.
         bool IsCxxNullptrT = false;
@@ -952,6 +957,7 @@ public:
             bool IsReturnInferredSink = false;
             bool IsWriteInferredSink = false;
             bool IsRvalueRef = false;
+            bool IsPointeeConst = false;  // spelled `const T*`; see IsSpelledPointeeConst
             int PointerDepth = 0;   // 0 = not recorded; see FuncPtrReturnPointerDepth
             std::string ResolvedTypeKey;  // "" = not recorded; see FuncPtrReturnResolvedKey
         };
@@ -1264,6 +1270,7 @@ public:
         bool IsCxxRefToPointer = false;
         bool IsCxxConstRef = false;
         bool IsCxxPointeeConst = false;
+        bool IsSpelledPointeeConst = false;
         bool IsCxxNullptrT = false;
         bool IsCxxConstField = false;
         bool IsCxxMutableField = false;
@@ -1296,6 +1303,7 @@ public:
             bool IsReturnInferredSink = false;
             bool IsWriteInferredSink = false;
             bool IsRvalueRef = false;
+            bool IsPointeeConst = false;
             int PointerDepth = 0;
             std::string ResolvedTypeKey;
         };
@@ -1332,6 +1340,7 @@ public:
             s.IsCxxRefToPointer = t.IsCxxRefToPointer;
             s.IsCxxConstRef = t.IsCxxConstRef;
             s.IsCxxPointeeConst = t.IsCxxPointeeConst;
+            s.IsSpelledPointeeConst = t.IsSpelledPointeeConst;
             s.IsCxxNullptrT = t.IsCxxNullptrT;
             s.IsCxxConstField = t.IsCxxConstField;
             s.IsCxxMutableField = t.IsCxxMutableField;
@@ -1365,6 +1374,7 @@ public:
                 q.IsReturnInferredSink = p.IsReturnInferredSink;
                 q.IsWriteInferredSink = p.IsWriteInferredSink;
                 q.IsRvalueRef = p.IsRvalueRef;
+                q.IsPointeeConst = p.IsPointeeConst;
                 q.PointerDepth = p.PointerDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
                 s.FuncPtrParams.push_back(std::move(q));
@@ -1401,6 +1411,7 @@ public:
             t.IsCxxRefToPointer = IsCxxRefToPointer;
             t.IsCxxConstRef = IsCxxConstRef;
             t.IsCxxPointeeConst = IsCxxPointeeConst;
+            t.IsSpelledPointeeConst = IsSpelledPointeeConst;
             t.IsCxxNullptrT = IsCxxNullptrT;
             t.IsCxxConstField = IsCxxConstField;
             t.IsCxxMutableField = IsCxxMutableField;
@@ -1434,6 +1445,7 @@ public:
                 q.IsReturnInferredSink = p.IsReturnInferredSink;
                 q.IsWriteInferredSink = p.IsWriteInferredSink;
                 q.IsRvalueRef = p.IsRvalueRef;
+                q.IsPointeeConst = p.IsPointeeConst;
                 q.PointerDepth = p.PointerDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
                 t.FuncPtrParams.push_back(std::move(q));
@@ -2923,7 +2935,9 @@ private:
     // FlushOwnedStructTemps. Struct analog of the string/closure temp lists. Block = dominance guard.
     // LiveFlag (hoisted join-arm temps only): an i1 slot cleared at the branch and set in the arm,
     // so the later destructor runs ONLY when the arm ran - a user dtor body is not null-safe.
-    struct PendingOwnedStructTemp { llvm::Value* Alloca; std::string TypeName; llvm::BasicBlock* Block; llvm::Value* LiveFlag = nullptr; };
+    // ArrayCount (C++ brace-list backing only): Alloca is an entry `TypeName[ArrayCount]` whose
+    // elements are destroyed in reverse; see RegisterOwnedBraceListTemp.
+    struct PendingOwnedStructTemp { llvm::Value* Alloca; std::string TypeName; llvm::BasicBlock* Block; llvm::Value* LiveFlag = nullptr; uint64_t ArrayCount = 0; };
     std::vector<PendingOwnedStructTemp> pendingOwnedStructTemps;
 
     // Owning-POINTER call results (`move R*`) consumed as a SUBEXPRESSION operand, so no named
@@ -3515,6 +3529,13 @@ private:
         // Own headers plus their transitive includes, normalized: what a probe may claim to own.
         std::unordered_set<std::string> reachableFiles;
         unsigned headerParseCount = 0;
+        /*
+         * The ruled lookup-taint recovery: at most one re-parse of this group per compile,
+         * armed by RecoverCxxLookupTaint for exactly the parse it starts. Counted in
+         * headerParseCount but exempt from the parse budget; any other reparse is not.
+         */
+        unsigned lookupRecoveryParses = 0;
+        bool lookupRecoveryArmed = false;
         // Content hash per closure file (normalized path -> FNV-1a), taken from the harvest
         // entry's dependency list; folded by CxxGroupClosureHash, memoized until it grows.
         std::map<std::string, uint64_t> closureContent;
@@ -3554,9 +3575,12 @@ private:
     {
         std::set<uint64_t> hashes;   // content hash x full cache key of every entry noted
         std::vector<cflat_cinterop::ExtractResult::DemandReplayChunk> replayChunks;
+        std::vector<std::string> noDeferBodyKeys;
+        std::vector<std::string> pendingLookupTaintBodyKeys;
         bool replayIncomplete = false;   // a served demand entry carried no replay chunk
         bool served = false;
         bool demand = false;   // an entry's definitions belong to the group companion
+        bool forceEagerBodies = false;
     };
     std::map<std::string, CxxDemandGroupUse> cxxDemandGroups_;
     std::unordered_map<std::string, CxxRequestGroup> cxxDemandRequestGroups_;
@@ -3582,7 +3606,16 @@ private:
     void NoteCxxDemandReplayChunk(
         const CxxRequestGroup& group,
         const cflat_cinterop::ExtractResult::DemandReplayChunk& chunk);
+    void PersistCxxLookupTaint(const std::string& groupKey,
+                              const std::vector<std::string>& bodyKeys);
     bool ReplayCxxDemandChunks(const std::string& groupKey, std::string& error);
+    /*
+     * Lazy-body lookup taint (a replayed body bound a declaration written after it): persist
+     * the no-defer keys, discard the group and re-parse it once with bodies in place. Fails
+     * when the group already took its recovery parse this compile.
+     */
+    bool RecoverCxxLookupTaint(const std::string& groupKey, const std::vector<std::string>& tainted,
+                               CxxIncrementalGroup*& group, std::string& error);
     // Base C++ spelling -> the import group that answered in this compile.
     std::unordered_map<std::string, size_t> cxxTemplateOwnerGroup_;
     std::unordered_map<std::string, std::vector<cflat_cinterop::RawFunctionTemplate>>
@@ -3815,6 +3848,14 @@ private:
         // record-pointer parameter can be retyped from void* once the record is registered.
         std::vector<std::string> paramSpellings;
         std::string retSpelling;  // canonical C++ return spelling, replays specialization requests on a cache hit
+        // RawSig::paramTemporaryTypes of a generated wrapper (round-trips through the cache).
+        std::vector<std::string> paramTemporarySpellings;
+        // RawSig::resultBorrowsBraceList of a generated wrapper (round-trips through the cache).
+        bool resultBorrowsBraceList = false;
+        // RawSig::braceListElementTypes (round-trips through the cache).
+        std::vector<std::string> braceListElementSpellings;
+        // RawSig::calleeIdentity (round-trips through the cache).
+        std::string calleeIdentity;
         std::string name;
         std::string linkageName; // C++ ABI symbol; empty for C
         TypeAndValue ret;
@@ -3911,6 +3952,8 @@ private:
         bool isInternalLinkage = false;
         // Internal const object: hash of the evaluated initializer (0 = unknown).
         uint64_t constInitHash = 0;
+        // MS ABI dllimport data (MSVC's std::cout): the declaration is DLLImport.
+        bool isDllImport = false;
         int line = 1;
         int col = 0;
     };
@@ -3982,6 +4025,7 @@ private:
         bool isPolymorphic = false;
         bool hasBases = false;
         bool hasVirtualBases = false;
+        bool isFinal = false;
         bool isAbstract = false;
         bool hasFriendOperators = false;   // a friend operator: ADL may find what was not registered
         std::vector<cflat_cinterop::RawCxxBase> bases;
@@ -4099,6 +4143,7 @@ private:
         std::string cxxDemandGroupKey;
         cflat_cinterop::ExtractResult::DemandReplayChunk cxxDemandReplayChunk;
         std::vector<std::pair<std::string, std::string>> cxxBodyChecks;
+        std::vector<std::string> cxxLookupTaintedBodies;
         uint64_t lastUse = 0;  // cFileSigCacheClock_ stamp of the last hit or insert
         size_t rows = 0;       // summed size of every vector above, for the row budget
     };
@@ -5230,6 +5275,18 @@ private:
     // Register a by-value owning-struct temp (already spilled to `alloca`) for full destruction at
     // the end of the current full expression. The dtor takes a T*, so no spill is needed at flush.
     void RegisterOwnedStructTemp(llvm::Value* alloca, const std::string& typeName);
+    /*
+     * A C++ brace list's caller-frame backing array `typeName[count]` (an ENTRY alloca) as ONE
+     * full-expression temporary: elements destroyed in reverse, lists in reverse creation order
+     * (entered ahead of every earlier list in the ledger). Being an entry alloca it is hoisted
+     * with a live flag out of a '?:' arm, and out of a '&&' / '||' operand by
+     * HoistBraceListTempsSince, so a conditionally created list still dies at statement end.
+     */
+    void RegisterOwnedBraceListTemp(llvm::Value* array, const std::string& typeName, uint64_t count);
+    void RestoreOwnedStructTemps(std::vector<PendingOwnedStructTemp> temps)
+    {
+        for (auto& t : temps) pendingOwnedStructTemps.push_back(std::move(t));
+    }
 
     void RegisterAliasReturnTempSlot(llvm::Value* result, llvm::Value* slot,
                                      std::vector<llvm::Value*> ancestors = {}, const std::string& callee = {});
@@ -5323,6 +5380,8 @@ private:
     void FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* keep,
                               llvm::BasicBlock* hoistTo = nullptr,
                               bool preserveReturnedPtrTemps = false);
+    std::vector<PendingOwnedStructTemp> HoistBraceListTempsSince(const OwnedTempMark& mark,
+                                                                 llvm::BasicBlock* hoistTo);
 
     // Zero `temp`'s storage in `hoistTo` (before its terminator) and re-key it there. False when
     // the temp is not an entry-block alloca of that function, i.e. cannot be hoisted.
@@ -5759,6 +5818,7 @@ private:
         std::filesystem::file_time_type stamp{};
         CxxRequestGroup group;
         std::map<std::string, std::string> known;   // loaded from disk plus this compile's
+        std::vector<std::string> lookupTaintedBodies;
         bool dirty = false;
     };
     std::map<std::string, CxxVerdictFile> cxxVerdictFiles_;                     // by request key
@@ -5921,7 +5981,9 @@ private:
      */
     std::optional<unsigned> TuParseBudget() const;
     // Logs the parse under -v ("clang parse:"), then errors when `count` exceeds the budget.
-    bool NoteTuParse(const std::string& kind, const std::string& label, unsigned count, const char* stage);
+    // `exempt` parses (the ruled lookup recovery) are logged in `count` but not charged.
+    bool NoteTuParse(const std::string& kind, const std::string& label, unsigned count, const char* stage,
+                     unsigned exempt = 0);
     bool CountTuParse(const std::string& kind, const std::string& key, const std::string& label,
                       const char* stage);
     void ReportCxxHeaderParseSummary(const CxxRequestGroup& group) const;
@@ -5966,21 +6028,41 @@ private:
     bool HasCxxFunctionTemplate(const std::string& qualifiedName) const;
     bool HasCxxForwardingReferenceTemplate(const std::string& qualifiedName) const;
     bool IsCxxNamespacePath(const std::string& name) const;
+    // IsCxxNamespacePath, also taking a nested segment a user header's namespace scan recorded as
+    // a lead (`t26.regex_constants` when nothing of that header was harvested at import).
+    bool IsCxxNamespacePathOrScanned(const std::string& name) const;
     bool IsCxxNamespace(const std::string& name) const;
     bool HasCxxFunctionTemplateMember(const std::string& owner,
                                       const std::string& memberName) const;
+    bool HasCxxFunctionTemplateMemberName(const std::string& memberName) const;
     bool IsCxxStaticOnlyFunctionTemplateMember(const std::string& owner,
                                                const std::string& memberName) const;
     // A bound C++ symbol that is a recorded specialization of a function template.
     bool IsCxxTemplateSpecializationSymbol(const FunctionSymbol& symbol) const;
+    bool CxxNullCannotBindClassReference(const FunctionSymbol& candidate, const TypeAndValue& param,
+                                         const NamedVariable& arg);
     bool HasCxxForwardingReferenceTemplateMember(const std::string& owner,
                                                  const std::string& memberName) const;
     std::string ResolveCxxFunctionTemplateName(const std::string& owner,
                                                const std::string& memberName) const;
+    bool IsCxxFunctionDesignatorArgument(const NamedVariable& arg) const;
     bool CxxStringLiteralSpelling(const NamedVariable& arg, std::string& spelling) const;
+    std::string CxxStringLiteralArrayLvalue(const NamedVariable& arg, size_t parameterIndex) const;
+    bool CxxNonTemplateOverloadsTakePointerConstRef(const std::string& name,
+                                                    const std::string& owner, size_t arity,
+                                                    size_t index) const;
+    bool RetargetCxxLiteralPointerTemporaries(
+        CSigEntry& bound, const std::vector<size_t>& literalParams,
+        std::vector<std::string>& parameterSpellings, std::vector<std::string>& calls,
+        const std::function<std::string(const std::vector<std::string>&, std::string&)>& makeInput,
+        const std::function<bool(const std::string&, const std::string&, CSigEntry&,
+                                 std::string&)>& request,
+        const std::string& displayName, std::string& wrapperName, std::string& error);
     // True when the newest failed RequestCxxFunctionTemplate / RequestCxxFreeFunction error is
     // clang's own rejection of the call (its wrapper compiled the full C++ overload set).
     bool LastCxxRequestClangRejected() const { return lastCxxRequestClangRejected_; }
+    // True when the newest RequestCxxFreeBraceCall refused because the list would die early.
+    bool LastCxxBraceLifetimeRefused() const { return lastCxxBraceLifetimeRefused_; }
     bool RequestCxxFunctionTemplate(const std::string& functionName,
                                     const std::string& ownerType,
                                     const std::vector<std::string>& explicitArgs,
@@ -5998,7 +6080,38 @@ private:
                                 const std::string& infixOperator = {},
                                 const std::string& infixLhsName = {},
                                 const std::string& infixRhsName = {},
-                                bool adlCall = false);
+                                bool adlCall = false,
+                                const std::vector<std::pair<size_t, size_t>>& braceGroups = {});
+    /*
+     * A free C++ call with brace-list arguments and no bound declaration (std.max({3, 9, 4})):
+     * each list's elements become wrapper parameters and the wrapper writes the list back as
+     * `{p0, p1, ...}`, so clang deduces against initializer_list<T> and ranks the overloads.
+     * On success `arguments` holds the expanded elements.
+     */
+    bool RequestCxxFreeBraceCall(const std::string& functionName,
+                                 const std::vector<std::string>& explicitArgs,
+                                 std::vector<NamedVariable>& arguments,
+                                 const std::vector<CxxBraceArgument>& braceArguments,
+                                 std::string& registeredName,
+                                 std::string& error);
+    /*
+     * An operator wrapper whose arithmetic operand clang converted into a wrapper-frame temporary
+     * for a `const S&` parameter (RawSig::paramTemporaryTypes) is re-spelled to take `const S&`,
+     * and the caller converts into its own slot, which lives through the full expression.
+     */
+    struct CxxScalarRetarget
+    {
+        size_t index = 0;
+        std::string spelling;  // canonical C++ S
+        TypeAndValue target;   // S in CFlat
+    };
+    // Plans the retarget; a conversion CFlat's call rules refuse is logged. False: none needed.
+    bool PlanCxxOperatorScalarRetarget(const CSigEntry& bound,
+                                       const std::vector<NamedVariable>& arguments,
+                                       const std::string& infixOperator,
+                                       std::vector<CxxScalarRetarget>& plan);
+    void StageCxxOperatorScalarArguments(std::vector<NamedVariable>& arguments,
+                                         const std::vector<CxxScalarRetarget>& plan);
     bool RequestCxxBraceFunction(const std::string& functionName,
                                  const std::string& ownerType,
                                  const std::string& memberName,
@@ -6210,7 +6323,36 @@ private:
     bool TryBindCxxNamespaceConstant(const std::string& cflatName, const std::string& baseName,
                                      const std::vector<std::string>& typeArgs = {},
                                      bool* notConstant = nullptr);
+    // `ns.v` (dotted) names a class-typed C++ namespace-scope object (std.chrono.February,
+    // std.nullopt), binding it on first ask: an lvalue of its class, never an enumerator.
+    bool IsCxxNamespaceClassObject(const std::string& qualifiedName);
     std::unordered_set<std::string> cxxNotConstantVariables_;
+    // Bare names already asked of the import groups' preprocessors this compile.
+    std::unordered_set<std::string> cxxSystemMacroLookups_;
+    bool TryBindCxxSystemMacro(const std::string& name);
+    // Function-like system macros (`assert`) bound per call by RequestCxxFreeFunction.
+    std::unordered_set<std::string> cxxFunctionMacros_;
+    bool IsCxxFunctionMacro(const std::string& name) const { return cxxFunctionMacros_.count(name) != 0; }
+    // Those whose replacement list names no parameter: a call evaluates no argument.
+    std::unordered_set<std::string> cxxArgumentFreeMacros_;
+    bool IsCxxArgumentFreeMacro(const std::string& name) const { return cxxArgumentFreeMacros_.count(name) != 0; }
+    std::string RequestCxxArgumentFreeMacroCall(const std::string& name, size_t argc, std::string& error);
+    // Lvalue system macros (`errno`) -> the wrapper returning their address.
+    struct CxxLvalueMacro
+    {
+        std::string wrapper;
+        TypeAndValue type;   // the lvalue's own type (the wrapper returns a pointer to it)
+    };
+    std::unordered_map<std::string, CxxLvalueMacro> cxxLvalueMacros_;
+    bool BindCxxLvalueMacro(const CxxRequestGroup& group, const std::string& name,
+                            const std::string& file);
+    const CxxLvalueMacro* GetCxxLvalueMacro(const std::string& name) const
+    {
+        auto it = cxxLvalueMacros_.find(name);
+        return it == cxxLvalueMacros_.end() ? nullptr : &it->second;
+    }
+    // Names IsCxxNamespaceClassObject re-asked as an object after a failed type request.
+    std::unordered_set<std::string> cxxNamespaceObjectProbed_;
     std::string GeneratedCxxPrefixForSpelling(const std::string& cxxSpelling) const;
     bool DecodeCxxIncompleteTemplateError(const std::string& error,
                                           std::string& spelling, std::string& typeName,
@@ -6301,6 +6443,7 @@ private:
     llvm::TargetLibraryInfoImpl MakeStdioSafeTLII(const llvm::Triple& triple) const;
 
     void RunModulePasses(llvm::ModulePassManager& MPM);
+    void RunCoroutinePassesIfNeeded();
     void RunBaselinePasses();
     void RunGlobalDCE();
     void MaterializeCoreIfLazy();
@@ -6852,6 +6995,9 @@ public:
 
     // Look up a closure alias using the same innermost-namespace-first rules as named types.
     const TypeAndValue* FindFunctionTypeAlias(const std::string& name) const;
+    // FindFunctionTypeAlias, else a dotted name a C++ import binds as a function-pointer typedef
+    // (std.new_handler), requested on demand.
+    const TypeAndValue* FindOrRequestFunctionTypeAlias(const std::string& name);
 
     // A pure-rename `using` alias is transparent the way a C typedef is, so it must not produce its
     // own monomorphization: list<MyInt> and list<int> are ONE instantiation. Registered ahead of
@@ -8653,6 +8799,7 @@ public:
         bool isPolymorphic = false;
         bool hasBases = false;
         bool hasVirtualBases = false;
+        bool isFinal = false;
         bool isAbstract = false;
         // Non-empty when the C++ layout could not be flattened (virtual inheritance, or a
         // bitfield / anonymous member inside a hierarchy). The type stays an opaque shell.
@@ -8667,6 +8814,8 @@ public:
             bool isVirtual = false;
         };
         std::vector<BaseRef> bases;
+        // EVERY virtual base, at its offset in this class's complete-object layout.
+        std::vector<BaseRef> virtualBases;
         // Every instance method name callable on this class, own and inherited. Used to clone a
         // base's methods onto a derived class.
         std::vector<std::string> instanceMethodNames;
@@ -8876,6 +9025,30 @@ public:
     // (`whyNot` then says whether it was found behind a non-public base at all).
     bool FindCxxBaseOffset(const std::string& derived, const std::string& base,
                            uint64_t& offsetOut, bool& foundButInaccessible) const;
+    /*
+     * FindCxxBaseOffset for a class VALUE (an object, not a pointer): a VIRTUAL base (libc++
+     * basic_ios under basic_ostringstream) also converts, at its offset in `derived`'s own
+     * complete-object layout - sound only when `source` provably IS a complete `derived`
+     * (IsCxxCompleteObjectValue). Otherwise refused, with the reason kept for the diagnostic.
+     */
+    bool FindCxxValueBaseOffset(const std::string& derived, const std::string& base,
+                                uint64_t& offsetOut, bool& foundButInaccessible,
+                                const NamedVariable* source) const;
+    // A local, global or by-value temporary: its dynamic type is its static type. A reference
+    // result, a dereferenced pointer or an alias parameter may be a more-derived object.
+    bool IsCxxCompleteObjectValue(const NamedVariable& value) const;
+    // Opaque `void&` structor parameter: its harvested referent spelling, and the offset of
+    // that referent inside a value of `derived` (false + refusal when a virtual base is unproven).
+    std::string CxxStructorReferentSpelling(const std::string& owner, const std::string& linkage,
+                                            size_t paramIndex, size_t paramCount) const;
+    bool FindCxxReferentSpellingOffset(const std::string& derived, const std::string& referent,
+                                       uint64_t& offsetOut, const NamedVariable* source) const;
+    // Why the last value conversion to a virtual base was refused (consumed by the diagnostic).
+    mutable std::string cxxVirtualBaseRefusal_;
+    // Lowering twin of FindCxxValueBaseOffset: the selected conversion needs the source's proof,
+    // and an unproven virtual-base hop is a LogError (ranking passes no source and stays C++).
+    bool LowerCxxValueBaseOffset(const std::string& derived, const std::string& base,
+                                 uint64_t& offsetOut, const NamedVariable& source);
     bool IsCxxBaseOf(const std::string& base, const std::string& derived) const
     {
         uint64_t off = 0; bool inacc = false;
@@ -8951,6 +9124,7 @@ public:
     // True when C++ lookup on this class may find an operator the import never registered: a
     // template specialization, or a class declared outside the bound header scope.
     bool CxxClassMayHaveUnregisteredOperators(const std::string& typeName) const;
+    bool CxxClassDeclaresFriendOperators(const std::string& typeName) const;
     bool RejectCxxReferenceFieldStore(const std::string& typeName, const std::string& memberName);
     bool CxxProtectedAccessAllowed(const std::string& typeName,
                                    bool accessedThroughCurrentObject) const;
@@ -9145,12 +9319,14 @@ public:
     }
     bool CanImplicitlyConstructCxxClass(const NamedVariable& arg,
                                          const TypeAndValue& param,
-                                         bool cxxByValueParam = false);
+                                         bool cxxByValueParam = false,
+                                         bool allowTemplateClassConversion = false);
     // `intoSlot` non-null: construct straight into that slot (a declared local, a return slot)
     // instead of an owned end-of-statement temporary.
     bool MaterializeImplicitCxxClassArgument(NamedVariable& arg,
                                              const TypeAndValue& param,
-                                             llvm::Value* intoSlot = nullptr);
+                                             llvm::Value* intoSlot = nullptr,
+                                             bool allowTemplateClassConversion = false);
     // Construct `targetType` through the generated C++ constructor wrapper `wrapperName` fed
     // `source`; `arg` becomes the built object (an owned temporary, or `intoSlot` when given).
     void ConstructThroughCxxCtorWrapper(NamedVariable& arg, const NamedVariable& source,
@@ -9169,6 +9345,9 @@ public:
                                                             const std::string& targetType,
                                                             llvm::Value* intoSlot,
                                                             std::string& refusal);
+    // A C++ record with a non-explicit conversion operator to a non-primitive type (libc++
+    // `__val_expr::operator valarray<T>()`): copy-initializing a class from it is clang's call.
+    bool HasImplicitClassConversionOperator(const std::string& sourceType);
     // Materialize (once per module) the llvm::Function for one structor / assignment operator,
     // typed from clang's own arrangement. Returns null after LogError when the plan is
     // inexpressible. `recipeOut` receives the recipe the call site must lower with.
@@ -9337,7 +9516,8 @@ public:
     enum class CxxArgConversion { NotApplicable, Convertible, ExplicitCtor, NonConstLvalueRef };
     CxxArgConversion ClassifyCxxImplicitArgument(const NamedVariable& arg,
                                                  const TypeAndValue& param,
-                                                 bool cxxByValueParam);
+                                                 bool cxxByValueParam,
+                                                 bool allowTemplateClassConversion = false);
     // Text of the failure note for that verdict, empty unless the conversion is what refused the
     // argument. Shares ClassifyCxxImplicitArgument with the ranking predicate by construction.
     std::string DescribeCxxImplicitArgumentBlock(const NamedVariable& arg,
@@ -9437,6 +9617,15 @@ public:
                                  bool gateSpecialMembersOnly = false);
     bool RegisterCxxMembersForProjectedRecord(const std::string& typeName);
     bool EnsureCxxMemberProjected(const std::string& typeName, const std::string& memberName);
+    bool EnsureCxxMemberProjectedImpl(const std::string& typeName, const std::string& memberName);
+    /*
+     * A member refused because a by-value member class of a class template specialization was
+     * still incomplete (clang instantiates it lazily: MSVC bitset<N>::reference) is retried once
+     * per signature when that member name is resolved, so ranking sees it beside its const twin.
+     */
+    void RetryLazyNestedCxxMemberRefusal(const std::string& typeName,
+                                         const std::string& memberName);
+    std::set<std::string> cxxLazyNestedRetried_;
     // C++ static member function of an imported class, bound as "<typeName>.<memberName>";
     // `staticOnly`: and no non-static overload shares the name.
     bool IsCxxStaticMethod(const std::string& typeName, const std::string& memberName,
@@ -9477,8 +9666,11 @@ public:
     // static data members, and the constructor/destructor table used by lifetime codegen.
     void RegisterCxxClassMembers(const CRecordEntry& r, const std::string& fileForLsp,
                                  const std::string& memberFilter = {});
+    // `lazyNestedOnly`: request just these lazily completable nested-class spellings (each a
+    // refused signature's lazyNestedSpelling), whatever the name's stored refusal text says.
     bool TryBindRefusedCxxMember(const std::string& typeName, const std::string& memberName,
-                                 size_t constructorArgumentCount = static_cast<size_t>(-1));
+                                 size_t constructorArgumentCount = static_cast<size_t>(-1),
+                                 const std::set<std::string>* lazyNestedOnly = nullptr);
     // A by-value std specialization field kept as opaque bytes: request its class at first member
     // access and return the field typed as that class (owner layout unchanged).
     bool BindLazyCxxStdField(llvm::StructType* owner, const TypeAndValue& stored,
@@ -9491,6 +9683,10 @@ public:
     bool TryBindRefusedCxxBaseMember(const std::string& typeName, const std::string& memberName);
     std::string ResolveCxxBaseIdentity(const cflat_cinterop::RawCxxBase& base) const;
     std::string ResolveCxxBaseIdentity(const CxxClassInfo::BaseRef& base) const;
+    // The cxxRecordEntries_ key a base's record registered under (may still be pending).
+    std::string ResolveCxxBaseRecordName(const cflat_cinterop::RawCxxBase& base) const;
+    // An unqualified identifier spelling no CFlat type maps: a global-namespace C++ class.
+    bool IsUnmappedGlobalCxxClassSpelling(const std::string& spelling);
     // Re-entry guard for retrying a specialization's refused signature after registration.
     std::set<std::string> cxxRefusedMemberRebindInFlight_;
     // Re-entry guard for the inherited-member rebind above (a diamond can reach one base twice).
@@ -9698,6 +9894,7 @@ public:
     std::string pendingCxxWrapperCause_;
     // Set only where a generated call wrapper failed under clang; CFlat-side refusals leave it off.
     bool lastCxxRequestClangRejected_ = false;
+    bool lastCxxBraceLifetimeRefused_ = false;
     // True when one line of `diagnostics` names the copy constructor of the class spelled
     // `cxxSpelling` (or a deleted constructor of it): the failure really was that copy.
     bool CxxDiagnosticBlamesCopyOf(const std::string& diagnostics,
@@ -10086,7 +10283,8 @@ public:
                                     CxxClassConversionPair& out) const;
     bool CxxConversionOperatorBindsBetter(const std::string& source, const std::string& target) const;
     std::vector<CxxConversionRank> RankCxxConversionSequences(
-        const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate);
+        const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate,
+        bool allowTemplateClassConversion = false);
     // [over.match.best] per-argument comparison: -1 `a` better, 1 `b` better, 0 neither
     // (indistinguishable, or `crossing` when each is better somewhere), 2 not judged.
     int CompareCxxConversionRanks(const std::vector<CxxConversionRank>& a,
@@ -10721,7 +10919,8 @@ public:
     // A pointer to a C++ class binds to a parameter/slot of a PUBLIC base of that class, with the
     // base subobject offset added. Non-public bases are refused at the conversion site.
     // A C++ class VALUE slices to a by-value/by-reference parameter of a PUBLIC base of it.
-    bool IsCxxDerivedToBaseValue(const TypeAndValue& from, const TypeAndValue& to) const;
+    bool IsCxxDerivedToBaseValue(const TypeAndValue& from, const TypeAndValue& to,
+                                 const NamedVariable* source) const;
     bool IsCxxSharedPtrUpcast(const TypeAndValue& from, const TypeAndValue& to) const;
     bool IsCxxDerivedToBasePointer(const TypeAndValue& from, const TypeAndValue& to) const
     {
@@ -10986,6 +11185,13 @@ public:
     std::string GetEnumBackingType(const std::string& enumName) const;
     void RegisterScopedEnumType(const std::string& enumName);
     bool IsScopedEnumTypeName(const std::string& name) const;
+    // A global holding an integer (an imported enumerator constant), never a class object.
+    bool IsIntegerGlobal(const std::string& name) const
+    {
+        auto it = globalNamedVariable.find(name);
+        return it != globalNamedVariable.end() && it->second != nullptr
+            && it->second->getValueType()->isIntegerTy();
+    }
     bool IsScopedEnumMatch(const TypeAndValue& from, const TypeAndValue& to) const;
     // C++ has no implicit integer -> enumeration conversion; see the definition for the proof.
     bool CxxEnumParameterRefusesArgument(const NamedVariable& arg, const TypeAndValue& argType,
@@ -11375,7 +11581,22 @@ public:
     //      (resolved file identity), so the extracted prelude roots differ.
     // 177: header content hashes are xxh3 instead of byte-loop FNV-1a.
     // 178: function<> template arguments use C++ function-pointer spelling.
-    static constexpr int kCHeaderCacheVersion = 178;
+    // 179: demand replay chunks persist lookup-tainted declarations that must parse in place.
+    // 180: a `decltype(ns::v)` request of a class-typed const object binds it (symbol, class
+    //      spelling marker, definitions-stage bitcode) instead of caching a negative.
+    // 181: generated operator wrappers record which parameter clang bound through a temporary.
+    // 182: members with unsatisfied or less-constrained requires-clauses are dropped.
+    // 186: re-landed after the MSVC type_info vftable skip; drops v182 entries from the reverted build.
+    // 191: twins with a default argument are no longer pruned (drops v186-v190 entries).
+    // 198: type_info's vtable is left to the C++ runtime; unqualified global-class member
+    //      signatures are requested at the use site.
+    // 205: `decltype(ns::v)` binds unscoped enumerators and non-const extern objects; bound
+    //      globals record MS ABI dllimport; records carry the class `final` fact.
+    // 208: by-value C-like record returns, function-pointer typedef requests, pointee const.
+    // 210: members refused for a lazily completable nested class record its spelling.
+    // 211: free-function wrapper signatures record whether the result can refer into a brace list
+    //      and which brace arguments became non-trivial array/aggregate/container temporaries.
+    static constexpr int kCHeaderCacheVersion = 212;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

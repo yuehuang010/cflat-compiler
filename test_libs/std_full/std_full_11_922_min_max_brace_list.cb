@@ -1,0 +1,13 @@
+// GUARDS: std::max / min / minmax with a bare brace list
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp "algorithm";
+extern int main()
+{
+    int failures = 0;
+    auto mx = std.max({3, 9, 4});
+    auto mn = std.min({3, 9, 4});
+    auto mm = std.minmax({3, 9, 4});
+    if (mx != 9 || mn != 3 || mm.first != 3 || mm.second != 9) { printf("FAIL min_max_brace_list\n"); failures |= 1; }
+    if (failures == 0) printf("PASS std_full_11_922_min_max_brace_list\n");
+    return failures;
+}

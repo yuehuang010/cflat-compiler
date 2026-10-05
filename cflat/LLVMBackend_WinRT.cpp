@@ -2239,12 +2239,10 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg,
         // which is a copy, exactly as binding a C++ const-reference to a converted value is.
         if (arg.Storage != nullptr && !arg.TypeAndValue.Pointer
             && !arg.TypeAndValue.IsInterface
-            && IsCxxDerivedToBaseValue(arg.TypeAndValue, param))
+            && IsCxxDerivedToBaseValue(arg.TypeAndValue, param, nullptr))
         {
             uint64_t offset = 0;
-            bool inaccessible = false;
-            if (FindCxxBaseOffset(arg.TypeAndValue.TypeName, param.TypeName,
-                                  offset, inaccessible))
+            if (LowerCxxValueBaseOffset(arg.TypeAndValue.TypeName, param.TypeName, offset, arg))
                 return EmitCxxBaseAdjust(arg.Storage, offset);
         }
         if (arg.Storage != nullptr && arg.BaseType == paramTy && sameReferentType

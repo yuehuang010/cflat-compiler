@@ -1,0 +1,36 @@
+#include <string>
+#include <locale>
+#include <clocale>
+#include <sstream>
+#include <cstring>
+#include <cstdio>
+int main()
+{
+    int failures = 0;
+    const char* sl = std::setlocale(LC_ALL, "C");
+    std::lconv* lc = std::localeconv();
+    if (sl == nullptr || std::strcmp(sl, "C") != 0 || lc == nullptr || std::strcmp(lc->decimal_point, ".") != 0)
+    { printf("FAIL clocale\n"); failures |= 1; }
+    std::locale classic = std::locale::classic();
+    std::locale def;
+    std::locale c2("C");
+    if (classic.name() != "C" || !(classic == c2) || classic != std::locale("C") || def.name().empty())
+    { printf("FAIL locale objects\n"); failures |= 2; }
+    const std::ctype<char>& ct = std::use_facet<std::ctype<char>>(classic);
+    const std::numpunct<char>& np = std::use_facet<std::numpunct<char>>(classic);
+    if (ct.toupper('a') != 'A' || ct.tolower('Q') != 'q' || !ct.is(std::ctype_base::digit, '5') || ct.is(std::ctype_base::digit, 'x') || np.decimal_point() != '.' || np.thousands_sep() != ',' || np.truename() != "true" || np.falsename() != "false")
+    { printf("FAIL facets\n"); failures |= 4; }
+    if (!std::has_facet<std::ctype<char>>(classic) || !std::has_facet<std::numpunct<char>>(classic)) { printf("FAIL has_facet\n"); failures |= 8; }
+    if (!std::isdigit('5', classic) || std::isdigit('x', classic) || std::toupper('a', classic) != 'A' || std::tolower('Z', classic) != 'z' || !std::isalpha('q', classic) || !std::isspace(' ', classic) || !std::isupper('A', classic))
+    { printf("FAIL convenience\n"); failures |= 16; }
+    std::ostringstream oss;
+    std::locale old = oss.imbue(classic);
+    oss << 1234.5;
+    std::string out = oss.str();
+    if (out != "1234.5" || oss.getloc() != classic || old.name().empty()) { printf("FAIL imbue\n"); failures |= 32; }
+    std::string s = "hello";
+    ct.toupper(s.data(), s.data() + s.size());
+    if (s != "HELLO") { printf("FAIL ctype range toupper\n"); failures |= 64; }
+    if (failures == 0) printf("PASS std_full_11_locale\n");
+    return failures;
+}

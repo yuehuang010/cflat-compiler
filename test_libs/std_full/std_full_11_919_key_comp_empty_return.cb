@@ -1,0 +1,18 @@
+// GUARDS: members returning an empty class by value (key_comp) cross the bridge
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp "map";
+import cpp "set";
+extern int main()
+{
+    int failures = 0;
+    std.set<int> s = default;
+    s.insert(1); s.insert(2);
+    auto kc = s.key_comp();
+    if (!kc(1, 2) || kc(2, 1)) { printf("FAIL set_key_comp\n"); failures |= 1; }
+    std.map<int, int> m = default;
+    m.emplace(1, 1); m.emplace(2, 2);
+    auto mkc = m.key_comp();
+    if (!mkc(1, 2)) { printf("FAIL map_key_comp\n"); failures |= 2; }
+    if (failures == 0) printf("PASS std_full_11_919_key_comp_empty_return\n");
+    return failures;
+}

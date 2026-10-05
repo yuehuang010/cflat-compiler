@@ -2,6 +2,7 @@
 // literal has no address, so the reference would point at a temporary that dies at once.
 import cpp "cpp_interop_ctorref.h";
 import cpp "cpp_interop_unique_deleter.hpp";
+import cpp "cpp_t28_fwdref.hpp";
 
 void CrDeleteWrongParam(int x) { }
 int CrDeleteWrongReturn(move int* p) { delete p; return 1; }
@@ -88,6 +89,15 @@ extern int main()
     expect_error("C++ class 'cppt.NoMoveFnUniquePtr<int, function<void(int*)>>' has no constructor") {
         cppt.NoMoveFnUniquePtr<int, function<void(int*)>> bad =
             cppt.NoMoveFnUniquePtr<int, function<void(int*)>>(new int(2), CrDeleteWrongReturn);
+    }
+    // A string literal is an array lvalue; its decayed pointer is a prvalue, so a C++ `char *&`
+    // parameter cannot bind it, exactly as clang refuses.
+    expect_error("no overload of 't28.retarget' matches") {
+        int n = t28.retarget("abc");
+    }
+    // A pointer-reference template and an array-reference template tie for a literal.
+    expect_error("call to 'amb' is ambiguous") {
+        auto p = t28.amb("abc", 1);
     }
     return 0;
 }

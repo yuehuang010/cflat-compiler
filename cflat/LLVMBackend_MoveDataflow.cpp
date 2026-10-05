@@ -1288,6 +1288,8 @@ llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, st
             StoreCoerceAt(slot, builder->CreateExtractValue(ci, 1), 8);
             return builder->CreateLoad(recipe.retSlot.structTy, slot);
         }
+        if (recipe.retSlot.kind == AbiSlot::Ignore)
+            return llvm::Constant::getNullValue(GetCCompatibleType(candidate.ReturnType));
         return ci; // Direct return
     }
 

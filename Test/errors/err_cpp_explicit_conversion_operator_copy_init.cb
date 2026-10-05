@@ -1,0 +1,12 @@
+// Explicit conversion operators do not participate in C++ copy-initialization.
+import cpp "cpp_t35_ownerexpr.hpp";
+
+extern int main()
+{
+    cpi_t35x.Vec<int> source = cpi_t35x.Vec<int>(3);
+    int factor = 4;
+    expect_error("cannot initialize C++ class 'cpi_t35x.Vec<int>'") {
+        cpi_t35x.Vec<int> result = source % factor;
+    }
+    return 0;
+}

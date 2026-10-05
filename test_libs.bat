@@ -176,6 +176,7 @@ set "MODE=run"
 set "DISABLED_PATHS="
 findstr /b /c:"// MODE: check" "%CASE_FILE%" >nul && set "MODE=check"
 for /f "tokens=1,* delims=:" %%A in ('findstr /b /c:"// DISABLED:" "%CASE_FILE%"') do for /f "tokens=*" %%D in ("%%B") do set "DISABLED_PATHS=%%D"
+for /f "tokens=1,* delims=:" %%A in ('findstr /b /c:"// DISABLED_WIN:" "%CASE_FILE%"') do for /f "tokens=*" %%D in ("%%B") do set "DISABLED_PATHS=!DISABLED_PATHS! %%D"
 echo !LIBNAME! tier !CFG_tier! !CASE! mode=!MODE! disabled=!DISABLED_PATHS!
 exit /b 0
 
@@ -187,6 +188,7 @@ set "MODE=run"
 set "DISABLED_PATHS="
 findstr /b /c:"// MODE: check" "%CASE_FILE%" >nul && set "MODE=check"
 for /f "tokens=1,* delims=:" %%A in ('findstr /b /c:"// DISABLED:" "%CASE_FILE%"') do for /f "tokens=*" %%D in ("%%B") do set "DISABLED_PATHS=%%D"
+for /f "tokens=1,* delims=:" %%A in ('findstr /b /c:"// DISABLED_WIN:" "%CASE_FILE%"') do for /f "tokens=*" %%D in ("%%B") do set "DISABLED_PATHS=!DISABLED_PATHS! %%D"
 if defined DISABLED_PATHS (
     if not "%INCLUDE_DISABLED%"=="1" (
         if not "%WARM_PASS%"=="1" (echo DISABLED !CASE! & set /a DISABLED+=1)
@@ -257,6 +259,9 @@ set "CASE_FILE=%~1"
 for %%N in ("%CASE_FILE%") do set "CASE=%%~nN"
 set "DISABLED_PATHS="
 for /f "tokens=1,* delims=:" %%A in ('findstr /b /c:"// DISABLED:" "%CASE_FILE%"') do for /f "tokens=*" %%D in ("%%B") do set "DISABLED_PATHS=%%D"
+REM DISABLED_MAC is ignored here except for this stale-path check.
+for /f "tokens=1,* delims=:" %%A in ('findstr /b /c:"// DISABLED_WIN:" "%CASE_FILE%"') do for /f "tokens=*" %%D in ("%%B") do set "DISABLED_PATHS=!DISABLED_PATHS! %%D"
+for /f "tokens=1,* delims=:" %%A in ('findstr /b /c:"// DISABLED_MAC:" "%CASE_FILE%"') do for /f "tokens=*" %%D in ("%%B") do set "DISABLED_PATHS=!DISABLED_PATHS! %%D"
 for %%P in (!DISABLED_PATHS!) do call :stale_one "%%P"
 exit /b 0
 

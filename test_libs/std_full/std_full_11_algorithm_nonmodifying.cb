@@ -1,0 +1,73 @@
+// GUARDS: non-modifying algorithms: for_each(_n), count/find families, find_end/first_of, adjacent_find, search, lexicographical compare, permutations
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp "algorithm";
+import cpp "functional";
+import cpp "iterator";
+import cpp "vector";
+import cpp "compare";
+bool is_even(int x) { return x % 2 == 0; }
+bool is_three(int x) { return x == 3; }
+int sum_acc = 0;
+void add_to_sum(int x) { sum_acc += x; }
+extern int main()
+{
+    int failures = 0;
+    std.vector<int> v = std.vector<int>({1, 2, 3, 2, 3, 3, 4});
+    std.function<bool(int)> even = std.function<bool(int)>(is_even);
+    std.function<bool(int)> three = std.function<bool(int)>(is_three);
+    std.function<void(int)> adder = std.function<void(int)>(add_to_sum);
+    std.for_each(v.begin(), v.end(), adder);
+    std.for_each_n(v.begin(), 3, adder);
+    if (sum_acc != 18 + 6) { printf("FAIL for_each\n"); failures |= 1; }
+    auto fin = std.find_if_not(v.begin(), v.end(), even);
+    auto fi3 = std.find_if(v.begin(), v.end(), three);
+    auto ff = std.find(v.begin(), v.end(), 9);
+    i64 c3 = std.count(v.begin(), v.end(), 3);
+    i64 ce = std.count_if(v.begin(), v.end(), even);
+    i64 fi3pos = std.distance(v.begin(), fi3);
+    if (c3 != 3 || ce != 3 || *fin != 1 || fi3pos != 2 || ff != v.end()) { printf("FAIL count_find\n"); failures |= 2; }
+    std.vector<int> hay = std.vector<int>({1, 2, 3, 1, 2, 3});
+    std.vector<int> needle = std.vector<int>({2, 3});
+    std.vector<int> any_of_set = std.vector<int>({9, 3});
+    auto fe = std.find_end(hay.begin(), hay.end(), needle.begin(), needle.end());
+    auto ffo = std.find_first_of(hay.begin(), hay.end(), any_of_set.begin(), any_of_set.end());
+    auto aj = std.adjacent_find(v.begin(), v.end(), std.equal_to<int>());
+    std.vector<int> nodup = std.vector<int>({1, 2, 3});
+    auto aj2 = std.adjacent_find(nodup.begin(), nodup.end());
+    i64 fepos = std.distance(hay.begin(), fe); i64 ffopos = std.distance(hay.begin(), ffo); i64 ajpos = std.distance(v.begin(), aj);
+    if (fepos != 4 || ffopos != 2 || ajpos != 4 || aj2 != nodup.end()) { printf("FAIL find_end_first_of_adjacent\n"); failures |= 4; }
+    auto se = std.search(hay.begin(), hay.end(), needle.begin(), needle.end());
+    auto sn = std.search_n(v.begin(), v.end(), 2, 3);
+    auto sn0 = std.search_n(v.begin(), v.end(), 4, 3);
+    i64 sepos = std.distance(hay.begin(), se); i64 snpos = std.distance(v.begin(), sn);
+    if (sepos != 1 || snpos != 4 || sn0 != v.end()) { printf("FAIL search\n"); failures |= 8; }
+    std.vector<int> a = std.vector<int>({1, 2, 3});
+    std.vector<int> b = std.vector<int>({1, 2, 4});
+    std.vector<int> c = std.vector<int>({1, 2});
+    bool lex = std.lexicographical_compare(a.begin(), a.end(), b.begin(), b.end());
+    bool lex2 = std.lexicographical_compare(b.begin(), b.end(), a.begin(), a.end());
+    bool lex3 = std.lexicographical_compare(c.begin(), c.end(), a.begin(), a.end());
+    auto cmp = std.lexicographical_compare_three_way(a.begin(), a.end(), b.begin(), b.end());
+    auto cmp_eq = std.lexicographical_compare_three_way(a.begin(), a.end(), a.begin(), a.end());
+    if (!lex || lex2 || !lex3 || !std.is_lt(cmp) || !std.is_eq(cmp_eq)) { printf("FAIL lexicographical\n"); failures |= 16; }
+    std.vector<int> p1 = std.vector<int>({1, 2, 3, 4});
+    std.vector<int> p2 = std.vector<int>({4, 3, 2, 1});
+    std.vector<int> p3 = std.vector<int>({1, 2, 3, 5});
+    bool perm = std.is_permutation(p1.begin(), p1.end(), p2.begin(), p2.end());
+    bool notperm = std.is_permutation(p1.begin(), p1.end(), p3.begin(), p3.end());
+    std.vector<int> np = std.vector<int>({1, 2, 3});
+    bool n1 = std.next_permutation(np.begin(), np.end());
+    bool n1ok = np[0] == 1 && np[1] == 3 && np[2] == 2;
+    bool n2 = std.prev_permutation(np.begin(), np.end());
+    bool n2ok = np[0] == 1 && np[1] == 2 && np[2] == 3;
+    std.vector<int> last = std.vector<int>({3, 2, 1});
+    bool wrapped = std.next_permutation(last.begin(), last.end());
+    if (!perm || notperm || !n1 || !n1ok || !n2 || !n2ok || wrapped || last[0] != 1 || last[2] != 3) { printf("FAIL permutations\n"); failures |= 32; }
+    if (!std.equal(a.begin(), a.end(), a.begin()) || std.equal(a.begin(), a.end(), b.begin()) || std.all_of(a.begin(), a.end(), three) || !std.any_of(a.begin(), a.end(), three) || std.none_of(a.begin(), a.end(), even)) { printf("FAIL equal_all_none\n"); failures |= 64; }
+    auto mm = std.mismatch(a.begin(), a.end(), b.begin());
+    i64 mpos = std.distance(a.begin(), mm.first);
+    auto mm2 = mm.second;
+    if (mpos != 2 || *mm2 != 4) { printf("FAIL mismatch\n"); failures |= 128; }
+    if (failures == 0) printf("PASS std_full_11_algorithm_nonmodifying\n");
+    return failures;
+}

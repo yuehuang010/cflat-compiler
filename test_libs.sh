@@ -115,13 +115,16 @@ for lib in "${LIBS[@]}"; do
   for casefile in "$dir"/*.cb; do
     [ -f "$casefile" ] || continue
     name="${casefile##*/}"; name="${name%.cb}"
-    mode=run; marker=; from_marker=; disabled=0
+    mode=run; marker=; other=; from_marker=; disabled=0
     while IFS= read -r line; do
-      case "$line" in '// MODE: check'*) mode=check ;; '// DISABLED: '*) marker="${line#// DISABLED: }"; disabled=1 ;; esac
+      # DISABLED_MAC applies here; DISABLED_WIN only gets the stale-path check.
+      case "$line" in '// MODE: check'*) mode=check ;; '// DISABLED: '*) marker="$marker ${line#// DISABLED: }"; disabled=1 ;;
+        '// DISABLED_MAC: '*) marker="$marker ${line#// DISABLED_MAC: }"; disabled=1 ;; '// DISABLED_WIN: '*) other="$other ${line#// DISABLED_WIN: }" ;; esac
     done < "$casefile"
-    if [ "$disabled" -eq 1 ]; then for issue in $marker; do
+    marker="${marker# }"
+    for issue in $marker $other; do
       if [ ! -f "$ROOT/$issue" ]; then echo "FAIL $lib/$name: stale DISABLED marker $issue"; stale_count=$((stale_count + 1)); failures=$((failures + 1)); fi
-    done; fi
+    done
     if [ "$LIST" -eq 1 ]; then
       printf '%-12s tier=%s %-32s mode=%s%s\n' "$lib" "$CFG_TIER" "$name" "$mode" "$([ "$disabled" -eq 1 ] && printf ' DISABLED: %s' "$marker")"
       continue

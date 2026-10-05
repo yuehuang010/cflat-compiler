@@ -1,0 +1,18 @@
+// GUARDS: a fixed char[N] local passed directly to a C++ free function or converting constructor
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp "string";
+import cpp "cstring";
+extern int main()
+{
+    int failures = 0;
+    char[8] buf = default;
+    buf[0] = 'a'; buf[1] = 'b';
+    if (std.strlen(buf) != 2) { printf("FAIL strlen(array)\n"); failures |= 1; }
+    if (std.string(buf) != "ab") { printf("FAIL string(array)\n"); failures |= 2; }
+    char[3] part = {}; part[0] = 'a'; part[1] = 'b';
+    std.string counted = std.string(part, 3);
+    if (counted != std.string("ab\0", 3)) { printf("FAIL string(array, length)\n"); failures |= 8; }
+    if (std.strcmp(buf, "ab") != 0) { printf("FAIL strcmp(array)\n"); failures |= 4; }
+    if (failures == 0) printf("PASS std_full_11_904_char_array_arg\n");
+    return failures;
+}

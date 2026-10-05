@@ -52,6 +52,8 @@ bool testBuiltinIdentifiers()
     return result;
 }
 
+int[4] t6PointerGlobal = { 10, 20, 30, 40 };
+
 bool testPointerToIntegerAccepts()
 {
     int[2] values = {13, 29};
@@ -3801,6 +3803,46 @@ bool testPointerScalarAcceptSet()
     int* next = decay + 1;
     result &= Test("ptr_scalar_pointer_add", (int)(next - decay), 1);
     result &= Test("ptr_scalar_pointer_compare", next > decay, true);
+
+    // `fixedArray + n` steps by the element size, not by one byte.
+    int[4] arith = { 3, 5, 7, 9 };
+    int* arithAt = arith + 2;
+    result &= Test("ptr_array_add_int", *arithAt, 7);
+    int* arithBack = (arith + 3) - 2;
+    result &= Test("ptr_array_add_sub_int", *arithBack, 5);
+    double[3] arithD = { 1.5, 2.5, 3.5 };
+    double* arithDAt = arithD + 2;
+    result &= Test("ptr_array_add_double", (int)(*arithDAt * 2.0), 7);
+    AliasNode[3] arithN = default;
+    arithN[2].v = 42;
+    AliasNode* arithNAt = arithN + 2;
+    result &= Test("ptr_array_add_struct", arithNAt->v, 42);
+    auto arithAuto = arith + 1;
+    result &= Test("ptr_array_add_auto", *arithAuto, 5);
+    result &= Test("ptr_array_add_compare", (arith + 2) == &arith[2], true);
+    int* globalAt = t6PointerGlobal + 2;
+    result &= Test("ptr_array_add_global", *globalAt, 30);
+    auto globalAuto = t6PointerGlobal + 3;
+    result &= Test("ptr_array_add_global_auto", *globalAuto, 40);
+    int[3][4] arithRows = default;
+    arithRows[1][1] = 77;
+    int* rowAt = arithRows[1] + 1;
+    result &= Test("ptr_array_add_row", *rowAt, 77);
+    auto rowAuto = arithRows[1] + 1;
+    result &= Test("ptr_array_add_row_auto", *rowAuto, 77);
+    auto commuted = 2 + arith;
+    result &= Test("ptr_array_add_commuted", *commuted, 7);
+    int* pointerBase = arith;
+    int* pointerCommuted = 2 + pointerBase;
+    result &= Test("ptr_array_add_pointer_commuted", *pointerCommuted, 7);
+    int pointeeA = 11; int pointeeB = 22; int pointeeC = 33;
+    int*[3] pointerArray = { &pointeeA, &pointeeB, &pointeeC };
+    auto pointerAt = pointerArray + 2;
+    result &= Test("ptr_array_add_pointer_elements", **pointerAt, 33);
+    auto boolAt = arith + (pointeeB > pointeeA);
+    result &= Test("ptr_array_add_bool_index", *boolAt, 5);
+    int* pointerBoolAt = pointerBase + (pointeeB > pointeeA);
+    result &= Test("ptr_array_add_pointer_bool_index", *pointerBoolAt, 5);
     return result;
 }
 

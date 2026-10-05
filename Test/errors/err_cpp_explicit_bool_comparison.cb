@@ -1,0 +1,41 @@
+import cpp "system_error";
+import cpp "cpp_interop_freeoptpl.h";
+extern int main()
+{
+    std.error_code code = std.make_error_code(std.errc.invalid_argument);
+    std.error_condition condition = std.make_error_condition(std.errc.invalid_argument);
+    int value = 22;
+    cppfopun.EB explicitBool = default;
+    // MSVC STL declares the error_code/error_condition operator== differently: same refusal, other text.
+    if const (__WINDOWS__)
+    {
+        expect_error("no overload of 'std.operator==' matches") {
+            bool rejected = code == 22;
+        }
+        expect_error("no overload of 'std.operator==' matches") {
+            bool rejected = code == value;
+        }
+        expect_error("no overload of 'std.operator==' matches") {
+            bool rejected = condition == 22;
+        }
+    }
+    else
+    {
+        expect_error("invalid operands to binary expression") {
+            bool rejected = code == 22;
+        }
+        expect_error("invalid operands to binary expression") {
+            bool rejected = code == value;
+        }
+        expect_error("invalid operands to binary expression") {
+            bool rejected = condition == 22;
+        }
+    }
+    expect_error("invalid operands to binary expression") {
+        bool rejected = explicitBool == true;
+    }
+    expect_error("invalid operands to binary expression") {
+        bool rejected = explicitBool != false;
+    }
+    return 0;
+}

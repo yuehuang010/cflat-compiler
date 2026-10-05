@@ -1,0 +1,58 @@
+// GUARDS: filesystem path operations, status queries, local file mutations, iteration, and error_code overloads
+// FROM: internal/plan/std-library-tier2-suite.md (C++17 filesystem coverage)
+import cpp {"filesystem", "fstream", "string"};
+extern int main()
+{
+    int failures = 0;
+    std.filesystem.path root = std.filesystem.path("scratch/std_full_C2/filesystem");
+    std.filesystem.remove_all(root);
+    std.filesystem.create_directories(root / "sub" / "deep");
+    std.filesystem.path file = root / "sub" / "item.txt";
+    std.ofstream out = std.ofstream(file);
+    out << "abcdef";
+    out.close();
+    std.filesystem.path renamed = file;
+    renamed.replace_extension(".dat");
+    if (file.stem().string() != "item" || file.extension().string() != ".txt" || renamed.extension().string() != ".dat")
+    { printf("FAIL path decomposition/extension\n"); failures |= 1; }
+    std.filesystem.path normalized = (root / "sub" / ".." / "sub" / "item.txt").lexically_normal();
+    std.filesystem.path relative = file.lexically_relative(root);
+    if (normalized != file.lexically_normal() || relative.generic_string() != "sub/item.txt" || file.generic_string().empty())
+    { printf("FAIL lexical path operations\n"); failures |= 2; }
+
+    std.error_code ec = default;
+    bool directory = std.filesystem.is_directory(root, ec);
+    bool clean_dir = !ec;
+    bool regular = std.filesystem.is_regular_file(file, ec);
+    clean_dir = clean_dir && !ec;
+    std.filesystem.file_status st = std.filesystem.status(file, ec);
+    clean_dir = clean_dir && !ec && std.filesystem.exists(st);
+    std.filesystem.file_time_type stamp = std.filesystem.last_write_time(file, ec);
+    if (!directory || !regular || !clean_dir || ec) { printf("FAIL filesystem status/clock\n"); failures |= 4; }
+
+    std.filesystem.path copy = root / "copy.txt";
+    std.filesystem.copy_file(file, copy, ec);
+    i64 copied_size = std.filesystem.file_size(copy, ec);
+    bool copied_ok = !ec && copied_size == 6;
+    std.filesystem.resize_file(copy, 3, ec);
+    copied_ok = copied_ok && !ec && std.filesystem.file_size(copy) == 3;
+    std.filesystem.path moved = root / "moved.txt";
+    std.filesystem.rename(copy, moved, ec);
+    copied_ok = copied_ok && !ec && std.filesystem.exists(moved);
+    int count = 0;
+    for (std.filesystem.recursive_directory_iterator i = std.filesystem.recursive_directory_iterator(root), end = std.filesystem.recursive_directory_iterator(); i != end; i++) count += 1;
+    if (!copied_ok) { printf("FAIL copy/resize/rename\n"); failures |= 8; }
+    if (count != 4) { printf("FAIL recursive iteration count\n"); failures |= 16; }
+
+    ec.clear();
+    bool missing_exists = std.filesystem.exists(root / "missing", ec);
+    bool missing_ok = !missing_exists && !ec;
+    i64 missing_size = std.filesystem.file_size(root / "missing", ec);
+    if (!ec) missing_ok = false;
+    if (!missing_ok) { printf("FAIL error_code overloads\n"); failures |= 32; }
+    if (std.filesystem.temp_directory_path().empty() || std.filesystem.current_path().empty())
+    { printf("FAIL filesystem paths\n"); failures |= 64; }
+    std.filesystem.remove_all(root);
+    if (failures == 0) printf("PASS std_full_17_filesystem\n");
+    return failures;
+}

@@ -1,0 +1,23 @@
+// GUARDS: the errno lvalue macro (cerrno) and the assert macro (cassert)
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp "cerrno";
+import cpp "cassert";
+import cpp "cstdlib";
+import cpp "errno.h";
+import cpp "assert.h";
+extern int main()
+{
+    int failures = 0;
+    int x = 1;
+    assert(x == 1);
+    errno = 0;
+    i64 big = std.strtol("99999999999999999999999", nullptr, 10);
+    int err = errno;
+    errno = 0;
+    if (err != ERANGE || errno != 0 || big == 0) { printf("FAIL errno ERANGE\n"); failures |= 1; }
+    errno = EINVAL;
+    if (errno != EINVAL) { printf("FAIL errno assign\n"); failures |= 2; }
+    errno = 0;
+    if (failures == 0) printf("PASS std_full_11_912_errno_assert_macros\n");
+    return failures;
+}

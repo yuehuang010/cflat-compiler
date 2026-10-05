@@ -1,0 +1,12 @@
+// GUARDS: a scoped C++ enumerator is still found after the enum's value-construction was spelled earlier
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp "system_error";
+extern int main()
+{
+    int failures = 0;
+    std.errc zero = std.errc();
+    std.errc inv = std.errc.invalid_argument;
+    if (zero == inv || zero != std.errc()) { printf("FAIL enum_ctor_then_enumerator\n"); failures |= 1; }
+    if (failures == 0) printf("PASS std_full_17_901_enum_ctor_then_enumerator\n");
+    return failures;
+}

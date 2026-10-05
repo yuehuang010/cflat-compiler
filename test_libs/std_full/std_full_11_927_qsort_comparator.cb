@@ -1,0 +1,22 @@
+// GUARDS: a CFlat comparator passed to std.qsort / std.bsearch (spelled through the std namespace)
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp "cstdlib";
+int cmp_int(const void* a, const void* b)
+{
+    int* pa = (int*)a; int* pb = (int*)b; int x = *pa; int y = *pb;
+    if (x > y) return 1;
+    if (x < y) return -1;
+    return 0;
+}
+extern int main()
+{
+    int failures = 0;
+    int[4] arr = { 4, 2, 8, 6 };
+    std.qsort(&arr[0], 4, 4, cmp_int);
+    if (arr[0] != 2 || arr[1] != 4 || arr[2] != 6 || arr[3] != 8) { printf("FAIL std qsort\n"); failures |= 1; }
+    int key = 6;
+    int* found = (int*)std.bsearch(&key, &arr[0], 4, 4, cmp_int);
+    if (found == nullptr || *found != 6) { printf("FAIL std bsearch\n"); failures |= 2; }
+    if (failures == 0) printf("PASS std_full_11_927_qsort_comparator\n");
+    return failures;
+}

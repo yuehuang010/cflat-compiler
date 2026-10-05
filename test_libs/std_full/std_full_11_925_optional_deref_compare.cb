@@ -1,0 +1,14 @@
+// GUARDS: *optional<string> compared with a string literal and a std::string
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp "string";
+import cpp "optional";
+extern int main()
+{
+    int failures = 0;
+    std.optional<std.string> o = std.optional<std.string>(std.string("abc"));
+    std.string lit = std.string("abc");
+    if (!(*o == "abc") || *o != "abc") { printf("FAIL deref == literal\n"); failures |= 1; }
+    if (!(*o == lit)) { printf("FAIL deref == string\n"); failures |= 2; }
+    if (failures == 0) printf("PASS std_full_11_925_optional_deref_compare\n");
+    return failures;
+}

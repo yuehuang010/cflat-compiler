@@ -1,0 +1,17 @@
+// GUARDS: C++20 coroutine awaiters, null coroutine handles, and source_location defaults
+// FROM: internal/plan/std-library-tier2-suite.md (C++20 coroutine/source_location coverage)
+import cpp {"coroutine", "source_location"};
+extern int main()
+{
+    int failures = 0;
+    std.suspend_always always = default;
+    std.suspend_never never = default;
+    if (always.await_ready() || !never.await_ready()) { printf("FAIL awaiters\n"); failures |= 1; }
+    std.coroutine_handle<void> null_handle = default;
+    auto from_null = std.coroutine_handle<void>.from_address(nullptr);
+    if (null_handle || from_null || from_null.address() != nullptr) { printf("FAIL null coroutine handle\n"); failures |= 4; }
+    std.source_location location = default;
+    if (location.line() != 0 || location.column() != 0 || location.file_name()[0] != 0) { printf("FAIL source_location default\n"); failures |= 8; }
+    if (failures == 0) printf("PASS std_full_20_coroutine_source_location_version\n");
+    return failures;
+}

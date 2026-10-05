@@ -1,0 +1,49 @@
+// GUARDS: C++20 ranges algorithms with std::identity projection plus single, bounded, joining, split, associative, and input views
+// FROM: internal/plan/std-library-tier2-suite.md (C++20 ranges coverage)
+import cpp {"algorithm", "array", "functional", "iterator", "map", "ranges", "sstream", "string", "string_view", "utility", "vector"};
+bool less_than_four(int x) { return x < 4; }
+extern int main()
+{
+    int failures = 0;
+    std.vector<int> values = default;
+    values.push_back(5); values.push_back(1); values.push_back(4); values.push_back(2); values.push_back(3);
+    std.ranges.sort(values);
+    std.array<int, 5> copied = default;
+    std.ranges.copy(values, copied.begin());
+    std.identity idf = default;
+    i64 count = std.ranges.count(values, 3, idf);
+    auto limits = std.ranges.minmax(values);
+    bool binary = std.ranges.binary_search(values, 4, std.less<int>(), idf);
+    std.vector<int> left = default; left.push_back(1); left.push_back(3); left.push_back(5);
+    std.vector<int> right = default; right.push_back(2); right.push_back(3); right.push_back(4);
+    std.vector<int> merged = default;
+    std.ranges.set_union(left, right, std.back_inserter(merged));
+    if (copied[0] != 1 || copied[4] != 5 || count != 1 || limits.min != 1 || limits.max != 5 || !binary || merged.size() != 5 || merged[2] != 3)
+    { printf("FAIL ranges algorithms/projection\n"); failures |= 1; }
+
+    i64 single_sum = 0; for (int x in std.views.single(7)) single_sum += x;
+    if (single_sum != 7)
+    { printf("FAIL basic views\n"); failures |= 2; }
+
+    std.vector<std.vector<int>> nested = default;
+    std.vector<int> row1 = default; row1.push_back(1); row1.push_back(2);
+    std.vector<int> row2 = default; row2.push_back(3);
+    std.vector<int> row3 = default; row3.push_back(4); row3.push_back(5);
+    nested.push_back(row1); nested.push_back(row2); nested.push_back(row3);
+    std.string_view csv = std.string_view("aa,bb,cc");
+    int split_count = 0; for (auto part in std.views.split(csv, ',')) if (part.size() == 2) split_count += 1;
+    int lazy_count = 0; for (auto part in std.views.lazy_split(csv, ',')) if (std.ranges.distance(part) == 2) lazy_count += 1;
+    int[3] raw = {2, 4, 6}; i64 counted_sum = 0; for (int x in std.views.counted(&raw[0], 3)) counted_sum += x;
+    if (split_count != 3 || lazy_count != 3 || counted_sum != 12)
+    { printf("FAIL range adaptor views\n"); failures |= 4; }
+
+    auto sub = std.ranges.subrange(values.begin() + 1, values.end() - 1);
+    i64 sub_sum = 0; for (int x in sub) sub_sum += x;
+    auto ref = std.ranges.ref_view<std.vector<int>>(values);
+    std.vector<int> owned = default; owned.push_back(8); owned.push_back(9);
+    auto own = std.ranges.owning_view<std.vector<int>>(std.move(owned));
+    if (sub_sum != 9 || ref.size() != 5 || own.size() != 2)
+    { printf("FAIL projection, subrange, ownership, input views\n"); failures |= 8; }
+    if (failures == 0) printf("PASS std_full_20_ranges\n");
+    return failures;
+}

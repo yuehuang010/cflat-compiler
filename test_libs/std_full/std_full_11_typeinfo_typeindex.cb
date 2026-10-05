@@ -1,0 +1,13 @@
+// GUARDS: bad_cast/bad_typeid/bad_any_cast construction and what()
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp {"any", "functional", "map", "string", "typeindex", "typeinfo"};
+extern int main()
+{
+    int failures = 0;
+    std.bad_cast bc = default; std.bad_typeid bt = default;
+    if (bc.what() == nullptr || bt.what() == nullptr) { printf("FAIL bad_cast what\n"); failures |= 32; }
+    std.bad_any_cast bac = default;
+    if (bac.what() == nullptr) { printf("FAIL bad_any_cast\n"); failures |= 64; }
+    if (failures == 0) printf("PASS std_full_11_typeinfo_typeindex\n");
+    return failures;
+}

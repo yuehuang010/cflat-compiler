@@ -1,0 +1,12 @@
+// GUARDS: noop coroutine state, address, and resume
+// FROM: internal/plan/std-library-tier2-suite.md (C++20 coroutine coverage)
+import cpp "coroutine";
+extern int main()
+{
+    auto noop = std.noop_coroutine();
+    bool ok = !noop.done() && noop.address() != nullptr;
+    noop.resume();
+    if (!ok || noop.done()) { printf("FAIL noop coroutine\n"); return 1; }
+    printf("PASS std_full_20_909_noop_coroutine\n");
+    return 0;
+}

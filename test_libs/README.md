@@ -49,6 +49,8 @@ Each `.cb` case begins with comment markers before code:
 
 Keep each case independent. It must assert each value it prints, check all legs without early returns, print a clear failing leg, and return zero only when all checks pass. Use `i64` for C++ template arguments representing CFlat 64-bit integers. Add a new case by placing a numbered `<lib>_NN_<topic>.cb` file in its library directory and documenting its behavior in the header markers. `lib.cfg` controls where its library headers and binaries are found.
 
+`// DISABLED_WIN: <paths>` and `// DISABLED_MAC: <paths>` behave exactly like `DISABLED`, but only on that platform (`test_libs.bat` honors `DISABLED_WIN`, `test_libs.sh` honors `DISABLED_MAC`); on the other platform the case runs as an enabled case. Use them for a gap that only one host STL exposes, so the leg keeps running where it passes. Both runners check every marker's paths for staleness on every platform.
+
 When a fix lands for a disabled case, remove its `DISABLED` marker in the same change. The case should then pass normally; stale marker paths are reported as failures.
 
 ## Tiers
@@ -56,5 +58,5 @@ When a fix lands for a disabled case, remove its `DISABLED` marker in the same c
 | Tier | Cadence | Libraries |
 | --- | --- | --- |
 | 1 | Smoke: required before landing, runs in `buildci.sh` / `buildci.bat`; not in the dev loop | std (C++11-C++20 feature sets, `std_<SS>_<topic>`), json, fmt, simdjson, and the Windows-only vcpkg libraries curl, openblas, sdl3, sqlite3, zlib |
-| 2 | On request (`-t 2`); cadence not decided yet | eigen |
+| 2 | On request (`-t 2`) and nightly (`buildci.sh --nightly`) | eigen, std_full (every C++11-C++20 header and API family, `std_full_<SS>_<topic>`) |
 | 3 | On request (`-t 3`); giant, minutes per case | torch |

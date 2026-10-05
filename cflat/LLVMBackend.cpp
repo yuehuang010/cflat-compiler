@@ -11,12 +11,17 @@
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Linker/Linker.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/Analysis/LoopInfo.h>
+#include <llvm/IR/PassInstrumentation.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/IPO/GlobalDCE.h>
+#include <llvm/Transforms/Coroutines/CoroCleanup.h>
+#include <llvm/Transforms/Coroutines/CoroEarly.h>
+#include <llvm/Transforms/Coroutines/CoroSplit.h>
 #include <llvm/Transforms/Instrumentation/AddressSanitizer.h>
 #include <llvm/Object/COFF.h>
 #include <llvm/Object/Binary.h>
@@ -2492,6 +2497,11 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     FinalizeGlobalConstructorOrder();
     StampProgramTargetAttributes();
 
+    // The default O1/O2 and incremental-view pipelines already lower coroutines. Our O0
+    // and --no-opt paths are custom, so lower linked companion IR there before codegen.
+    if (args.hasFlag("no-opt") || args.getOptimizationLevel() == 0)
+        RunCoroutinePassesIfNeeded();
+
     {
         llvm::TimeTraceScope verifyScope("VerifyModule");
         if (verbose) std::cout << "[verbose] verifying module\n";
@@ -3771,9 +3781,33 @@ void LLVMBackend::ProcessPendingMacroSources()
 
 // Build fresh analysis managers, wire the standard proxies, and run the given
 // module pass manager. Shared by RunBaselinePasses and RunGlobalDCE.
+/*
+ * Clang marks a body optnone for `#pragma optimize("", off)` (UCRT's inline feraiseexcept, whose
+ * dead `num / denom` exists only to raise an FP flag). cflat's pass managers carry no
+ * StandardInstrumentations, so their optional passes would still rewrite it; companion linking
+ * tags those source-authored bodies, and this gate skips them. The O0 debug barrier cflat adds
+ * itself is not tagged, so it keeps today's baseline cleanup.
+ */
+static void SkipSourceOptNoneBodies(llvm::PassInstrumentationCallbacks& callbacks)
+{
+    callbacks.registerShouldRunOptionalPassCallback([](llvm::StringRef, llvm::Any ir) {
+        const llvm::Function* const* function = llvm::any_cast<const llvm::Function*>(&ir);
+        if (function == nullptr)
+        {
+            const llvm::Loop* const* loop = llvm::any_cast<const llvm::Loop*>(&ir);
+            if (loop == nullptr) return true;
+            const llvm::Function* parent = (*loop)->getHeader()->getParent();
+            return !parent->hasFnAttribute(kCflatSourceOptNoneAttr);
+        }
+        return !(*function)->hasFnAttribute(kCflatSourceOptNoneAttr);
+    });
+}
+
 void LLVMBackend::RunModulePasses(llvm::ModulePassManager& MPM)
 {
-    llvm::PassBuilder PB;
+    llvm::PassInstrumentationCallbacks callbacks;
+    SkipSourceOptNoneBodies(callbacks);
+    llvm::PassBuilder PB(nullptr, llvm::PipelineTuningOptions(), std::nullopt, &callbacks);
     llvm::LoopAnalysisManager LAM;
     llvm::FunctionAnalysisManager FAM;
     llvm::CGSCCAnalysisManager CGAM;
@@ -3794,6 +3828,26 @@ void LLVMBackend::RunModulePasses(llvm::ModulePassManager& MPM)
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
     MPM.run(*module, MAM);
+}
+
+void LLVMBackend::RunCoroutinePassesIfNeeded()
+{
+    if (!module)
+        return;
+
+    const bool hasCoroutineIntrinsic = std::any_of(
+        module->functions().begin(), module->functions().end(),
+        [](const llvm::Function& function) {
+            return function.isIntrinsic() && function.getName().starts_with("llvm.coro.");
+        });
+    if (!hasCoroutineIntrinsic)
+        return;
+
+    llvm::ModulePassManager MPM;
+    MPM.addPass(llvm::CoroEarlyPass());
+    MPM.addPass(llvm::createModuleToPostOrderCGSCCPassAdaptor(llvm::CoroSplitPass()));
+    MPM.addPass(llvm::CoroCleanupPass());
+    RunModulePasses(MPM);
 }
 
 void LLVMBackend::RunBaselinePasses()
@@ -4129,7 +4183,9 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
     pto.LoopVectorization = true;
     pto.SLPVectorization = true;
 
-    llvm::PassBuilder PB(TM.get(), pto);
+    llvm::PassInstrumentationCallbacks callbacks;
+    SkipSourceOptNoneBodies(callbacks);
+    llvm::PassBuilder PB(TM.get(), pto, std::nullopt, &callbacks);
     llvm::LoopAnalysisManager LAM;
     llvm::FunctionAnalysisManager FAM;
     llvm::CGSCCAnalysisManager CGAM;
@@ -4702,6 +4758,11 @@ void LLVMBackend::ResetForReanalysis()
     cxxLazyGlobalTypedefs_.clear();
     cxxForeignRequests_.clear();
     cxxNotConstantVariables_.clear();
+    cxxSystemMacroLookups_.clear();
+    cxxLvalueMacros_.clear();
+    cxxFunctionMacros_.clear();
+    cxxArgumentFreeMacros_.clear();
+    cxxNamespaceObjectProbed_.clear();
     generatedCxxRecords_.clear();
     cppStructNames_.clear();
     cppStructBases_.clear();
@@ -4834,6 +4895,7 @@ void LLVMBackend::ResetForReanalysis()
     pendingCxxRecordProjections_.clear();
     pendingCxxMemberProjections_.clear();
     projectedCxxMemberNames_.clear();
+    cxxLazyNestedRetried_.clear();
     projectingCxxMemberNames_.clear();
     projectingCxxRecords_.clear();
     registeringCxxProjection_ = false;
@@ -5051,6 +5113,7 @@ void LLVMBackend::ResetForReanalysis()
     lastCallReturnsAllocAlign = 0;
     lastCallIsBonded = false;
     lastCxxRequestClangRejected_ = false;
+    lastCxxBraceLifetimeRefused_ = false;
     // Left non-zero by an aborted compile mid-ternary, this would wrongly suppress the deref
     // guard for the next file's straight-line code.
     suppressExplicitNullDerefGuard_ = 0;
@@ -6820,6 +6883,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.IsCxxRefToPointer)      o["crp"] = true;
     if (s.IsCxxConstRef)          o["ccr"] = true;
     if (s.IsCxxPointeeConst)      o["cpc"] = true;
+    if (s.IsSpelledPointeeConst)  o["spc"] = true;
     if (s.IsCxxNullptrT)          o["cnt"] = true;
     if (s.IsCxxConstField)        o["ccf"] = true;
     if (s.IsCxxMutableField)      o["cmf"] = true;
@@ -6857,6 +6921,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
             if (p.IsReturnInferredSink) po["ris"] = true;
             if (p.IsWriteInferredSink) po["wis"] = true;
             if (p.IsRvalueRef) po["rr"] = true;
+            if (p.IsPointeeConst) po["pc"] = true;
             if (p.PointerDepth > 1) po["pd"] = static_cast<int64_t>(p.PointerDepth);
             if (!p.ResolvedTypeKey.empty()) po["rk"] = p.ResolvedTypeKey;
             fps.push_back(std::move(po));
@@ -6906,6 +6971,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("crp")) s.IsCxxRefToPointer = *v;
     if (auto v = o.getBoolean("ccr")) s.IsCxxConstRef = *v;
     if (auto v = o.getBoolean("cpc")) s.IsCxxPointeeConst = *v;
+    if (auto v = o.getBoolean("spc")) s.IsSpelledPointeeConst = *v;
     if (auto v = o.getBoolean("cnt")) s.IsCxxNullptrT = *v;
     if (auto v = o.getBoolean("ccf")) s.IsCxxConstField = *v;
     if (auto v = o.getBoolean("cmf")) s.IsCxxMutableField = *v;
@@ -6944,6 +7010,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
                     if (auto v = po->getBoolean("ris")) p.IsReturnInferredSink = *v;
                     if (auto v = po->getBoolean("wis")) p.IsWriteInferredSink = *v;
                     if (auto v = po->getBoolean("rr")) p.IsRvalueRef = *v;
+                    if (auto v = po->getBoolean("pc")) p.IsPointeeConst = *v;
                     if (p.Pointer) p.PointerDepth = 1;
                     if (auto v = po->getInteger("pd")) p.PointerDepth = static_cast<int>(*v);
                     if (auto v = po->getString("rk")) p.ResolvedTypeKey = v->str();

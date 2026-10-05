@@ -1,0 +1,49 @@
+// GUARDS: <bit> ops across widths, <numbers> constants, <compare> orderings and helpers, span extents/subviews/as_bytes
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp {"array", "bit", "compare", "cstddef", "numbers", "span", "vector"};
+extern int main()
+{
+    int failures = 0;
+    unsigned int u = 5;
+    if (std.bit_ceil(u) != 8 || std.bit_floor(u) != 4 || std.bit_ceil((unsigned int)8) != 8 || std.rotr((unsigned int)1, 1) != 0x80000000 || std.rotl((unsigned int)0x80000000, 1) != 1 || std.countl_zero((unsigned int)1) != 31 || std.countl_one((unsigned int)0xF0000000) != 4 || std.countr_zero((unsigned int)8) != 3 || std.countr_one((unsigned int)7) != 3 || std.popcount((unsigned int)255) != 8 || std.bit_width((unsigned int)8) != 4 || std.has_single_bit((unsigned int)6)) { printf("FAIL bit_ops\n"); failures |= 1; }
+    if (std.countl_zero((unsigned char)1) != 7 || std.countr_zero((unsigned long long)0) != 64 || std.bit_floor((unsigned int)0) != 0 || std.rotr((unsigned char)1, 1) != 128) { printf("FAIL bit_widths\n"); failures |= 2; }
+    double ne = std.numbers.e; double np = std.numbers.pi; double ns2 = std.numbers.sqrt2; double nl2 = std.numbers.ln2; double nphi = std.numbers.phi;
+    if (!(ne > 2.7182 && ne < 2.7183) || !(np > 3.14159 && np < 3.1416) || !(ns2 > 1.4142 && ns2 < 1.4143) || !(nl2 > 0.6931 && nl2 < 0.6932) || !(nphi > 1.6180 && nphi < 1.6181)) { printf("FAIL numbers_double\n"); failures |= 4; }
+    double ninv = std.numbers.inv_pi; double ns3 = std.numbers.sqrt3; double nl10 = std.numbers.ln10; double nlog2e = std.numbers.log2e; double nlog10e = std.numbers.log10e; double neg = std.numbers.egamma; double nis3 = std.numbers.inv_sqrt3; double nisp = std.numbers.inv_sqrtpi;
+    if (!(ninv > 0.3183 && ninv < 0.3184) || !(ns3 > 1.7320 && ns3 < 1.7321) || !(nl10 > 2.3025 && nl10 < 2.3026) || !(nlog2e > 1.4426 && nlog2e < 1.4427) || !(nlog10e > 0.4342 && nlog10e < 0.4343) || !(neg > 0.5772 && neg < 0.5773) || !(nis3 > 0.5773 && nis3 < 0.5774) || !(nisp > 0.5641 && nisp < 0.5642)) { printf("FAIL numbers_more\n"); failures |= 8; }
+    float pf = std.numbers.pi_v<float>;
+    float ef = std.numbers.e_v<float>;
+    if (!(pf > 3.14159f && pf < 3.1416f) || !(ef > 2.7182f && ef < 2.7183f)) { printf("FAIL numbers_float\n"); failures |= 16; }
+    std.compare_three_way ctw = default;
+    auto c1 = ctw(1, 2);
+    auto c2 = std.strong_order(2.0, 1.0);
+    auto c3 = std.weak_order(1.0, 1.0);
+    auto c4 = std.partial_order(1.0, 2.0);
+    auto c5 = ctw(3, 3);
+    if (!std.is_lt(c1) || !std.is_lteq(c1) || !std.is_gt(c2) || !std.is_gteq(c2) || !std.is_eq(c3) || !std.is_lt(c4) || !std.is_eq(c5) || std.is_neq(c5) || !std.is_neq(c1)) { printf("FAIL compare_three_way\n"); failures |= 32; }
+    std.strong_ordering slt = std.strong_ordering.less;
+    std.strong_ordering seq = std.strong_ordering.equal;
+    std.strong_ordering sgt = std.strong_ordering.greater;
+    std.weak_ordering wlt = std.weak_ordering.less;
+    std.weak_ordering weq = std.weak_ordering.equivalent;
+    std.partial_ordering pun = std.partial_ordering.unordered;
+    std.partial_ordering peq = std.partial_ordering.equivalent;
+    if (!std.is_lt(slt) || !std.is_eq(seq) || !std.is_gt(sgt) || !std.is_lt(wlt) || !std.is_eq(weq) || std.is_lt(pun) || std.is_gteq(pun) || std.is_eq(pun) || !std.is_eq(peq) || c1 != slt || c5 != seq || c2 != sgt) { printf("FAIL ordering_values\n"); failures |= 512; }
+    std.vector<int> vec = std.vector<int>({1, 2, 3, 4});
+    std.span<int, 4> fixed = std.span<int, 4>(vec.data(), 4);
+    std.span<int> dyn = std.span<int>(vec);
+    std.span<int> cs = std.span<int>(vec);
+    if (fixed.size() != 4 || fixed.extent != 4 || dyn.size() != 4 || fixed.size_bytes() != 16 || dyn.size_bytes() != 16 || cs[2] != 3 || fixed.front() != 1 || dyn.back() != 4 || dyn.empty() || !(std.dynamic_extent > 1000000)) { printf("FAIL span_extent\n"); failures |= 64; }
+    auto fs = fixed.first<2>();
+    auto ls = dyn.last(2);
+    auto ss = dyn.subspan(1, 2);
+    int* dd = dyn.data();
+    int* vd = vec.data();
+    if (fs.size() != 2 || fs[1] != 2 || ls[0] != 3 || ss[0] != 2 || ss.size() != 2 || dd != vd) { printf("FAIL span_subviews\n"); failures |= 128; }
+    auto rb = std.as_bytes(dyn);
+    auto wb = std.as_writable_bytes(dyn);
+    wb[0] = (std.byte)9;
+    if (rb.size() != 16 || vec[0] != 9 || rb.size_bytes() != 16) { printf("FAIL as_bytes\n"); failures |= 256; }
+    if (failures == 0) printf("PASS std_full_20_bit_numbers_compare_span\n");
+    return failures;
+}

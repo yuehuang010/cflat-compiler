@@ -1,0 +1,13 @@
+// GUARDS: vector::get_allocator returning an empty allocator class by value
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp {"string", "scoped_allocator", "vector", "memory"};
+extern int main()
+{
+    int failures = 0;
+    std.scoped_allocator_adaptor<std.allocator<std.string>> a = default;
+    std.vector<std.string, std.scoped_allocator_adaptor<std.allocator<std.string>>> v = std.vector<std.string, std.scoped_allocator_adaptor<std.allocator<std.string>>>(a);
+    std.scoped_allocator_adaptor<std.allocator<std.string>> got = v.get_allocator();
+    if (got != a || !(got == a)) { printf("FAIL get_allocator compare\n"); failures |= 1; }
+    if (failures == 0) printf("PASS std_full_11_915_get_allocator_empty_return\n");
+    return failures;
+}

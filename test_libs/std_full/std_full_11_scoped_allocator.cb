@@ -1,0 +1,38 @@
+// GUARDS: scoped_allocator_adaptor over vector<string>: allocator propagation, inner/outer_allocator, construct/destroy
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp {"string", "scoped_allocator", "vector", "memory"};
+extern int main()
+{
+    int failures = 0;
+    std.scoped_allocator_adaptor<std.allocator<std.string>> a = default;
+    std.vector<std.string, std.scoped_allocator_adaptor<std.allocator<std.string>>> v = std.vector<std.string, std.scoped_allocator_adaptor<std.allocator<std.string>>>(a);
+    v.push_back("alpha"); v.emplace_back("beta"); v.push_back(std.string("gamma"));
+    if (v.size() != 3 || v[0] != "alpha" || v[1] != "beta" || v[2] != "gamma") { printf("FAIL vector push\n"); failures |= 1; }
+    std.scoped_allocator_adaptor<std.allocator<std.string>> other = default;
+    if (other != a || !(other == a)) { printf("FAIL adaptor compare\n"); failures |= 2; }
+    auto outer = a.outer_allocator();
+    std.string* raw = outer.allocate(2);
+    outer.deallocate(raw, 2);
+    auto inner = a.inner_allocator();
+    if (inner != a) { printf("FAIL inner allocator\n"); failures |= 4; }
+    std.string* p = a.allocate(2);
+    std.string* p1 = &p[1];
+    a.construct(p, "xyz");
+    a.construct(p1, 3, (char)'q');
+    bool cons_ok = p[0] == "xyz" && p[1] == "qqq";
+    a.destroy(p);
+    a.destroy(p1);
+    a.deallocate(p, 2);
+    if (!cons_ok || a.max_size() < 1000) { printf("FAIL adaptor allocate construct\n"); failures |= 8; }
+    std.vector<std.string, std.scoped_allocator_adaptor<std.allocator<std.string>>> copy = std.vector<std.string, std.scoped_allocator_adaptor<std.allocator<std.string>>>(v);
+    std.vector<std.string, std.scoped_allocator_adaptor<std.allocator<std.string>>> moved = std.vector<std.string, std.scoped_allocator_adaptor<std.allocator<std.string>>>(move copy);
+    if (moved.size() != 3 || moved[2] != "gamma") { printf("FAIL copy move\n"); failures |= 16; }
+    std.scoped_allocator_adaptor<std.allocator<int>> ia = std.scoped_allocator_adaptor<std.allocator<int>>(a);
+    int* ip = ia.allocate(3);
+    ia.construct(ip, 5);
+    bool ir = ip[0] == 5;
+    ia.deallocate(ip, 3);
+    if (!ir) { printf("FAIL rebind conversion\n"); failures |= 32; }
+    if (failures == 0) printf("PASS std_full_11_scoped_allocator\n");
+    return failures;
+}

@@ -71,6 +71,7 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 | Run | Issue(s) | Site | Notes |
 |-----|----------|------|-------|
 | B5 | p3/cpp-const-twin-overloads-collapse | C++ class member registration (const / non-const twins share one CFlat signature) | NEW 2026-09-28 (B1 matrix, OUT cells C1/C4, E1-E5, F1/F4, H1/H4/H9, L10) |
+| B5b | p3/cpp-constrained-twin-default-argument-ranking | C++ class member registration (constrained same-signature twins with a default argument share one CFlat signature) | NEW 2026-10-03 (T22 review rounds 2-4; pre-existing on master) |
 | B12 | p3/cflat-extern-definition-abi-leftovers | function<> to >16B-struct C fn crossing C: reverse-thunk design (RULING) | OPEN (return-ext part landed 2cd2bb58) |
 | B13 | p2/owning-struct-borrowed-deref-and-byvalue-param-double-free | `return *o` through a borrowed pointer: refuse like h->f or move like T t = *o; `return *this` refusal RULED 2026-10-01 | PARKED (RULING); by-value part landed 059d1f42 |
 | B14 | p3/c-flexible-array-member-leftovers | move a->data (RULING: explicit move of a raw pointer) + 3 pre-existing P3 | OPEN (sizeof/alignof landed 118c2769) |
@@ -191,10 +192,56 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 ## std smoke suite gaps 2026-10-01 (test_libs/std DISABLED cases; group at the next queue build)
 
-Fixing a row removes the DISABLED marker of its case(s) in the same commit (`./test_libs.sh std --include-disabled` shows XPASS).
+`DISABLED_WIN` / `DISABLED_MAC` disable a case on one platform only (MSVC-only / libc++-only gaps). Fixing a row removes the DISABLED marker of its case(s) in the same commit (`./test_libs.sh std --include-disabled` shows XPASS).
 
 | Run | Issue | DISABLED case | Summary |
 |---|---|---|---|
+
+## std_full tier-2 gaps 2026-10-02 (test_libs/std_full DISABLED cases; plan internal/plan/std-library-tier2-suite.md)
+
+`DISABLED_WIN` / `DISABLED_MAC` disable a case on one platform only (MSVC-only / libc++-only gaps). Fixing a row removes the DISABLED marker of its case(s) in the same commit (`./test_libs.sh -t 2 std_full --include-disabled` shows XPASS). Wrong-code / crash rows first: valarray literal operand, valarray ptr ctor, optional<string> deref compare, errc conversion, insert_iterator copy, wcs* recursion, char[N] verifier failure, noop_coroutine LLVM fatal.
+
+| Issue | DISABLED case | Summary |
+|---|---|---|
+| p2/cpp-address-of-pointer-local-argument-typed-single-pointer | 11_901_address_of_pointer_arg | `&p` of a pointer local passed to a C++ `T**` parameter is spelled `T*` |
+| p2/cpp-c-anonymous-typedef-struct-return-unsupported | 11_910_div_struct_return | C functions returning an anonymous-typedef struct (div_t, ldiv_t, lldiv_t, imaxdiv_t) are not bound |
+| p2/cpp-char-pointer-to-void-pointer-ctor-argument-refused | 17_903_char_ptr_to_void_ptr_ctor | CFlat refuses char* for a void* C++ constructor parameter |
+| p2/cpp-pointer-argument-converting-ctor-into-reference-refused | (none) | pointer argument to a C++ `X&&` / `const X&` param via a converting ctor (`strTwo(char*)`, `push_back(mp)`) refused "from ''" |
+| p2/cpp-cwrapper-header-macros-not-imported | 11_908_cwrapper_macros, 11_944 (DISABLED_WIN) | Object-like macros of the C++ wrapper headers (<climits>, <cfloat>, <cstdint>, <cstdlib>) are not imported |
+| p2/cpp-errno-and-assert-macros-not-importable | 11_912_errno_assert_macros | `errno` and `assert` (function-like / lvalue macros) cannot be used after import cpp |
+| p2/cpp-free-function-ctor-refuse-fixed-char-array-argument | 11_904_char_array_arg | Fixed `char[N]` local passed to a C++ free function or converting constructor is refused |
+| p2/cpp-function-pointer-typedef-unspellable-and-auto | 11_913_function_pointer_typedef | A typedef'd function pointer (std::new_handler) cannot be named, and `auto` of it fails |
+| p2/cpp-libcxx-version-header-macros-not-imported | 20_906_feature_test_macros | libc++ feature-test macros defined by <version> are not imported |
+| p2/cpp-min-max-brace-list-function-not-known | 11_922_min_max_brace_list | `std.max({3, 9, 4})` / `std.min({..})` / `std.minmax({..})`: "the function 'std.max' is not known" |
+| p2/cpp-forward-as-tuple-literal-dangles-in-wrapper-frame | 11_931_tag_objects | `std.forward_as_tuple("abc")` deduces `const char*&` to the generated wrapper's by-value slot (dangles); forwarding-ref literal deduction |
+| p2/cpp-namespace-scope-object-member-call-refused | 11_907_cout_rdbuf | Member calls on namespace-scope C++ objects are refused |
+| p2/cpp-pointer-arithmetic-argument-has-no-cpp-type | 11_926_pointer_arith_arg | Pointer arithmetic expression passed directly as a C++ argument has no C++ type |
+| p2/cpp-std-qsort-const-void-comparator-mismatch | 11_927_qsort_comparator | std.qsort / std.bsearch reject a CFlat comparator written with const void* params; bare qsort accepts it |
+| p2/cpp-valarray-subscript-overload-order-dependent-rvalue-pick | 11_939_valarray_mask_index_order, 11_947 (DISABLED_WIN) | Valarray mask and indirect subscript bind order-dependently to rvalue-reference overloads |
+| p2/std-ios-copyfmt-overload | 11_917_ios_copyfmt | CFlat cannot bind ostream::copyfmt from an ostream-derived source |
+| p2/std-ios-seekdir-enumerator | 11_930_streambuf_pubseekoff | CFlat cannot bind ios_base::beg for stream buffer seeking |
+| p2/std-ranges-empty-view | 20_905_empty_view | views::empty<int> variable template not bound as a value (extend T13 real-object path) |
+| p2/pointer-difference-parenthesized-lhs-byte-count | - | (ip + 2) - ip is 8 for int* (silent wrong value) |
+| p2/cpp-pointer-arithmetic-result-type-not-propagated | - | p + 1 ranks as void* (clang char*); ctor refuses it; template leg needs ruling |
+| p2/std-ranges-istream-view-sentinel | (none; 20_907 passes) | NARROWED: `std.views.istream<int>(input)` (variable-template CPO) resolves `istream` as the std::istream type; `ranges.istream_view<int>` works |
+| p2/std-regex-constants-enumerator | 11_928_regex_format_first_only | CFlat cannot bind regex_constants enumerators |
+| p2/cpp-nullptr-lone-class-reference-skips-converting-ctor | (C++ interop) | nullptr into a lone `const C&` param with a `C(nullptr_t)` ctor is refused (was a crash before T12); clang builds the temporary |
+| p2/cpp-msvc-valarray-binary-plus-minus-hidden | 11_940, 11_936 (DISABLED_WIN) | MSVC: member unary +/- hides binary valarray +/- |
+| p2/cpp-const-nonconst-member-overload-declaration-order | 11_941 (DISABLED_WIN) | MSVC bitset `d[2] = true` refused as not an lvalue (declaration-order guess disproved on Mac 2026-10-02; MSVC-specific cause) |
+| p2/cpp-ucrt-inline-feraiseexcept-raises-nothing | 11_942 (DISABLED_WIN) | UCRT inline `feraiseexcept` sets no flag from CFlat |
+| p2/cpp-stringbuf-base-member-lookup-after-stringstream | 11_943 (DISABLED_WIN) | `stringbuf.sputc` unknown after a stringstream use (MSVC) |
+| p2/cpp-msvc-global-type-info-reference-unmapped | 11_946 (DISABLED_WIN) | `any::type()` returning `const type_info&` refused (MSVC global `::type_info`) |
+| p3/cpp-allocator-traits-two-arg-allocate-not-bound | 11_902_allocator_traits_allocate | `std.allocator_traits<std.allocator<int>>.allocate(alloc, 4)` (two-argument overload) is not bound |
+| p3/cpp-enum-cast-operand-and-optional-enum-assign | (none) | `mk == (std.errc)22` refused with an internal wrapper name; optional<enum> assignment; std.numbers message |
+| p3/cpp-enum-value-construction-hides-enumerators | 17_901_enum_ctor_then_enumerator | After `std.errc()` is used, `std.errc.invalid_argument` in the same function: "Undefined variable invalid_argu |
+| p3/cpp-expression-template-implicit-init-refused | 11_935_valarray_expr_init | `std.valarray<int> x = w * two;` (initializer from an expression-template result) is refused |
+| p3/cpp-member-typedef-not-nameable | 11_921_member_typedef | Member typedefs / nested type names of a C++ class are not spellable (std.vector<int>.value_type, iterator_tra |
+| p3/cpp-offsetof-macro-not-importable | 11_923_offsetof_macro | offsetof(S, member) is not available after import cpp "cstddef" / "stddef.h" |
+| p3/cpp-operator-new-delete-not-callable-by-name | 11_924_operator_new_calls | The global allocation functions operator new / operator delete cannot be called by name |
+| p3/cpp-owner-before-member-template-and-operator-arg-conversion | 11_929_smart_ptr_member_templates | `shared_ptr::owner_before` is not callable, and `map<weak_ptr,...>[shared_ptr]` refuses the implicit conversio |
+| p3/cpp-pointer-to-member-function-not-spellable | 11_920_mem_fn | `&std.string.size` (pointer to an imported C++ member function) cannot be written |
+| p3/cpp-std-function-swap-member-signature-not-bound | 11_914_function_swap_member | `std.function<int(int)>::swap` member is "a std::function signature that could not be bound" |
+| p3/u8-string-literal-typed-char-pointer | 11_933_u8_literal | `u8"..."` literal is typed `char*`, cannot initialize `std::u8string` |
 
 ## Ruled 2026-10-01 - ready to schedule (rulings recorded in each issue file)
 
@@ -204,6 +251,7 @@ Fixing a row removes the DISABLED marker of its case(s) in the same commit (`./t
 | Q3 | p2/integer-pointee-pointer-conversion-accepted | char family: stage 1 retype core text APIs to char*, stage 2 block i8* <-> char* |
 | Q4 | p2/lowered-cxx-field-structs-in-containers-and-array-fields | test_move recv_temp_snapshot leak count may go down |
 | Q8 | p4/immovable-attribute | `[immovable]` surface approved as proposed - buildable |
+| Q9 | p4/three-way-comparison-operator | `<=>` in the CFlat language RULED 2026-10-02, plus defaulted member-wise `==` - buildable (result type without <compare> follows C++ unless told otherwise) |
 
 ## Parked - needs a maintainer ruling before any work
 

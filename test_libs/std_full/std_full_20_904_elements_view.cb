@@ -1,0 +1,14 @@
+// GUARDS: views::elements<1>, keys, and values over pairs/map
+// FROM: internal/plan/std-library-tier2-suite.md (C++20 ranges coverage)
+import cpp {"map", "ranges", "utility", "vector"};
+extern int main()
+{
+    std.vector<std.pair<int, int>> values = default; values.push_back(std.pair<int, int>(1, 2));
+    i64 sum = 0; for (int x in std.views.elements<1>(values)) sum += x;
+    std.map<int, int> mapping = default; mapping[1] = 10; mapping[2] = 20;
+    i64 key_sum = 0; for (int x in std.views.keys(mapping)) key_sum += x;
+    i64 value_sum = 0; for (int x in std.views.values(mapping)) value_sum += x;
+    if (sum != 2 || key_sum != 3 || value_sum != 30) { printf("FAIL elements/keys/values views\n"); return 1; }
+    printf("PASS std_full_20_904_elements_view\n");
+    return 0;
+}

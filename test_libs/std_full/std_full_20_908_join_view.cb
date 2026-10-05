@@ -1,0 +1,12 @@
+// GUARDS: flatten a nested vector with views::join
+// FROM: internal/plan/std-library-tier2-suite.md (C++20 ranges coverage)
+import cpp {"ranges", "vector"};
+extern int main()
+{
+    std.vector<std.vector<int>> values = default;
+    std.vector<int> row = default; row.push_back(4); values.push_back(row);
+    i64 sum = 0; for (int x in std.views.join(values)) sum += x;
+    if (sum != 4) { printf("FAIL join view\n"); return 1; }
+    printf("PASS std_full_20_908_join_view\n");
+    return 0;
+}

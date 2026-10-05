@@ -1009,7 +1009,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         }
                     }
                 }
-                else if (auto* fit = Compiler(declSpecs)->FindFunctionTypeAlias(typeSpec->getText());
+                else if (auto* fit = Compiler(declSpecs)->FindOrRequestFunctionTypeAlias(typeSpec->getText());
                          fit != nullptr)
                 {
                     // Function-type alias (using Cb = function<R(Args)> | Lambda<R(Args)>): expand
@@ -1386,6 +1386,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 hasConstQualifier = true;
         if (hasConstQualifier && declType.Pointer && Compiler(declSpecs)->IsCxxRecord(declType.TypeName))
             declType.IsCxxPointeeConst = true;
+        declType.IsSpelledPointeeConst = hasConstQualifier && declType.Pointer;
 
         return declType;
     }
@@ -4257,6 +4258,7 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         const bool directCallReturn = !directCallText.empty()
             && directCallText.back() == ')'
             && std::count(directCallText.begin(), directCallText.end(), '(') == 1;
+        std::string enumInitializerType;
         if (ctorArgs == nullptr && moveExpr == nullptr
             && !compiler->IsForeignNontrivialCxxClass(typeName)
             && !(directCallReturn
@@ -4267,7 +4269,61 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
                 && trivial->hasTrivialCopyCtor && trivial->hasTrivialDtor
                 && !trivial->hasDeletedDefaultCtor
                 && !compiler->HasNonPublicCxxDefaultCtor(typeName);
-            if (fullyTrivial || (initializer != nullptr && !isDefaultForm))
+            bool enumConvertingInitializer = false;
+            if (assign != nullptr)
+            {
+                auto isForeignEnum = [&](const std::string& name) {
+                    return !name.empty() && (compiler->IsScopedEnumTypeName(name)
+                        || !compiler->ResolveEnumTypeName(name).empty()
+                        || compiler->enumBackingTypes.count(name) != 0);
+                };
+                const std::string spelling = assign->getText();
+                if (IsBareIdentifierText(spelling))
+                {
+                    if (const auto* source = compiler->FindLiveNamedVariable(spelling);
+                        source != nullptr)
+                    {
+                        enumInitializerType = source->TypeAndValue.TypeName;
+                        enumConvertingInitializer = isForeignEnum(enumInitializerType);
+                    }
+                }
+                if (!enumConvertingInitializer)
+                {
+                    const size_t call = spelling.find('(');
+                    const size_t end = call == std::string::npos ? spelling.rfind('.') : call;
+                    if (end != std::string::npos && end != 0)
+                    {
+                        std::string enumName = spelling.substr(0, end);
+                        while (enumName.starts_with('(')) enumName.erase(enumName.begin());
+                        enumConvertingInitializer = isForeignEnum(enumName);
+                        if (!enumConvertingInitializer && call == std::string::npos)
+                        {
+                            int64_t enumValue = 0;
+                            enumConvertingInitializer = compiler->TryGetEnumMemberInt(
+                                enumName, spelling.substr(end + 1), enumValue);
+                            if (!enumConvertingInitializer)
+                            {
+                                const std::string member = enumName + "." + spelling.substr(end + 1);
+                                enumConvertingInitializer =
+                                    compiler->IsIntegerGlobal(member);
+                            }
+                            // libc++ enumerators can publish without a resolvable enum type;
+                            // keep the std-qualified identity and let clang decide.
+                            // A namespace-scope class object (std.chrono.February) is an
+                            // lvalue of its class, never an enumerator.
+                            if (!enumConvertingInitializer && enumName.starts_with("std.")
+                                && !compiler->IsForeignCxxClassWithConstructors(enumName)
+                                && !compiler->IsCxxNamespaceClassObject(
+                                    enumName + "." + spelling.substr(end + 1)))
+                                enumConvertingInitializer = true;
+                        }
+                        if (enumConvertingInitializer) enumInitializerType = enumName;
+                    }
+                }
+            }
+            if ((fullyTrivial && (initializer == nullptr || isDefaultForm))
+                || (initializer != nullptr && !isDefaultForm
+                    && !enumConvertingInitializer))
                 return false;
         }
 
@@ -4822,6 +4878,46 @@ cxx_dtor_ready:
             if (!hasParsedArrayInitializer)
             {
                 auto parsed = ParseAssignmentExpressionNamed(assign);
+                if (enumInitializerType.empty())
+                {
+                    const std::string spelling = assign->getText();
+                    const size_t open = spelling.find('(');
+                    if (open != std::string::npos && open != 0
+                        && spelling.back() == ')')
+                    {
+                        const std::string castType = spelling.substr(0, open);
+                        if (compiler->IsScopedEnumTypeName(castType)
+                            || !compiler->ResolveEnumTypeName(castType).empty()
+                            || compiler->enumBackingTypes.count(castType) != 0)
+                            enumInitializerType = castType;
+                    }
+                    const size_t dot = spelling.rfind('.');
+                    if (dot != std::string::npos && dot != 0
+                        && spelling.find('(') == std::string::npos)
+                    {
+                        const std::string enumName = spelling.substr(0, dot);
+                        const std::string member = enumName + "." + spelling.substr(dot + 1);
+                        if (compiler->IsScopedEnumTypeName(enumName)
+                            || !compiler->ResolveEnumTypeName(enumName).empty()
+                            || compiler->enumBackingTypes.count(enumName) != 0
+                            || compiler->IsIntegerGlobal(member))
+                            enumInitializerType = enumName;
+                    }
+                }
+                // Some imported C enums expose constants but no type declaration in CFlat. Keep
+                // the qualified enum identity for clang's converting-constructor copy-init.
+                if (!enumInitializerType.empty() && parsed.Primary != nullptr
+                    && parsed.Primary->getType()->isIntegerTy())
+                {
+                    parsed.TypeAndValue.TypeName = enumInitializerType;
+                    parsed.TypeAndValue.IsScopedEnum = true;
+                    if (parsed.Storage == nullptr)
+                    {
+                        parsed.Storage = compiler->CreateAlloca(parsed.Primary->getType());
+                        compiler->builder->CreateStore(parsed.Primary, parsed.Storage);
+                        parsed.Primary = nullptr;
+                    }
+                }
                 compiler->LowerNonCapturingClosureForCxx(
                     parsed, compiler->StdFunctionClosureSignature(typeName));
                 // LogErrorContext throws, so a refused closure never reaches the slot.
@@ -5114,6 +5210,15 @@ cxx_dtor_ready:
             && compiler->IsForeignNontrivialCxxClass(typeName))
         {
             compiler->SetCurrentDebugLocation(line);
+            if (rightNV.TypeAndValue.IsRvalueRef)
+            {
+                // `*opt_temp()` (operator*() &&) is an xvalue: clang selects the constructor.
+                std::string refusal;
+                if (!compiler->EmitCxxXvalueTransfer(typeName, slot, rightNV.Storage,
+                        rightNV.TypeAndValue.IsCxxConstRef, false, refusal))
+                    LogErrorContext(assign, refusal);
+                return true;
+            }
             compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, rightNV.Storage,
                                                  /*useMove*/ false,
                                                  std::format("into local '{}'", name).c_str(),
@@ -6180,6 +6285,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 std::string srcInferredTypeName;
                 bool srcInferredPointer = false;
                 bool srcInferredElemPointer = false;
+                // Thin function-pointer initializer (`auto p = signal(...)`): its signature.
+                std::optional<LLVMBackend::TypeAndValue> srcThinFnPtr;
                 // C++ pointee const of a pointer initializer: `auto p = constPtrResult();` keeps it
                 // for C++ overload ranking, as C++ deduces `const T*`.
                 bool srcCxxPointeeConst = false;
@@ -7105,6 +7212,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcInferredTypeName = rightNV.TypeAndValue.TypeName;
                                 srcInferredPointer = rightNV.TypeAndValue.Pointer;
                                 srcInferredElemPointer = rightNV.TypeAndValue.ElemPointer;
+                                if (rightNV.TypeAndValue.IsThinFnPtr() && !rightNV.TypeAndValue.Pointer
+                                    && !rightNV.TypeAndValue.FuncPtrReturnTypeName.empty())
+                                    srcThinFnPtr = rightNV.TypeAndValue;
                                 srcCxxPointeeConst = rightNV.TypeAndValue.IsCxxPointeeConst
                                     && rightNV.TypeAndValue.Pointer;
                                 srcCxxNullptrT = rightNV.TypeAndValue.IsCxxNullptrT;
@@ -7820,7 +7930,21 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // when the name-based type matches the value's actual type, leaving simd /
                 // function-pointer / array-view / generic 'auto' vars (which infer their
                 // LLVM type directly from the value) untouched.
-                if (typeAndValue.TypeName == "auto" && right != nullptr
+                if (typeAndValue.TypeName == "auto" && right != nullptr && srcThinFnPtr)
+                {
+                    // C++ deduces the plain function pointer type; adopt only the signature.
+                    typeAndValue.IsFunctionPointer = true;
+                    typeAndValue.TypeName = srcThinFnPtr->TypeName;
+                    typeAndValue.Pointer = false;
+                    typeAndValue.FuncPtrReturnTypeName = srcThinFnPtr->FuncPtrReturnTypeName;
+                    typeAndValue.FuncPtrReturnPointer = srcThinFnPtr->FuncPtrReturnPointer;
+                    typeAndValue.FuncPtrReturnOwned = srcThinFnPtr->FuncPtrReturnOwned;
+                    typeAndValue.FuncPtrReturnAlias = srcThinFnPtr->FuncPtrReturnAlias;
+                    typeAndValue.FuncPtrReturnPointerDepth = srcThinFnPtr->FuncPtrReturnPointerDepth;
+                    typeAndValue.FuncPtrReturnResolvedKey = srcThinFnPtr->FuncPtrReturnResolvedKey;
+                    typeAndValue.FuncPtrParams = srcThinFnPtr->FuncPtrParams;
+                }
+                else if (typeAndValue.TypeName == "auto" && right != nullptr
                     && !srcInferredTypeName.empty() && srcInferredTypeName != "auto")
                 {
                     LLVMBackend::TypeAndValue probe = typeAndValue;

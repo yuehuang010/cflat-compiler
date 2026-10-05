@@ -15,7 +15,8 @@ public:
         const std::vector<std::string>& args, const std::string& headerSource,
         bool verbose, std::string& error, bool tolerateDiagnostics = false,
         const cflat_cinterop::ExtractRequest* macroReq = nullptr,
-        cflat_cinterop::ExtractResult* macroOut = nullptr);
+        cflat_cinterop::ExtractResult* macroOut = nullptr,
+        const std::vector<std::string>& noDeferBodyKeys = {}, bool forceEagerBodies = false);
 
     ~CxxIncrementalGroup();
 
@@ -47,9 +48,23 @@ public:
                              cflat_cinterop::CxxDemandStats& stats, std::string& error,
                              llvm::LLVMContext* targetContext = nullptr,
                              std::unique_ptr<llvm::Module>* moduleOut = nullptr);
+    std::vector<std::string> TakeLookupTaintedBodyKeys();
     // The bytes clang read for each entry of the harvested includedFiles, same order; a null
     // data() marks a file whose buffer is unavailable. Valid while this group lives.
     std::vector<std::string_view> IncludedFileBuffers() const;
+    // The macro `name` as this TU's preprocessor currently defines it; false when undefined.
+    struct MacroLookup
+    {
+        bool functionLike = false;
+        bool variadic = false;
+        bool systemHeader = false;   // defined in a system header (clang's file characteristic)
+        std::string file;
+        int line = 1;
+        int col = 0;
+        std::vector<std::string> params;
+        std::string body;            // spelled tokens, space separated
+    };
+    bool LookupMacro(const std::string& name, MacroLookup& out) const;
     // Of `files`, those an #include in this TU brought in that no header in `roots` reaches: what
     // a TU of `roots` alone would not declare. A root is a path, or `<name>` for an angled
     // include (the request prologue's `<new>`). Empty when a root is not a header of this TU.

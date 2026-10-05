@@ -230,6 +230,10 @@ import cpp "library/cpp_interop_nest2.h";
 import cpp "library/cpp_interop_tmplctor.h";
 import cpp "library/cpp_interop_global_scope.h";
 import cpp "library/cpp_interop_global_collision.h";
+// T23: assert from an NDEBUG group (this file has no other assert definition).
+import cpp "cassert" define "NDEBUG";
+int t23NdebugCalls = 0;
+bool t23NdebugSide() { t23NdebugCalls += 1; return false; }
 
 int s7DeleterCalls = 0;
 void s7DeleteInt(move int* p) { delete p; s7DeleterCalls += 1; }
@@ -325,6 +329,12 @@ int stdfree_standard()
     if (std.gcd(84, 30) != 6) return 1781;
     if (std.printf("") != 0) return 1782;
     if (std.toupper('a') != 65) return 1783;
+    // Brace lists of strings: a std::string result binds directly; a const char* result (it
+    // can point into an element) binds over caller-frame list storage.
+    std.string t31pear = std.string("pear"); std.string t31apple = std.string("apple");
+    std.string t31best = std.max({t31pear, t31apple});
+    if (!(t31best == "pear") || !(std.min({t31pear, t31apple}) == "apple")) return 31016;
+    if (std.max({"a", "a"})[0] != 'a') return 31017;
 
     auto pair = std.make_pair(7, 9);
     if (pair.first != 7 || pair.second != 9) return 1784;
@@ -522,6 +532,11 @@ extern int main()
     if const (__WINDOWS__) {
         return 0;
     }
+
+    // T23: under NDEBUG assert expands to ((void)0) and evaluates nothing, as in C++.
+    assert(t23NdebugSide());
+    assert(t23NdebugSide() && t23NdebugSide());
+    if (t23NdebugCalls != 0) return 37011;
 
     n65CppDeleteCount = 0;
     cppt.n65_call_overloaded_fn(new int(1), n65CppDelete);
@@ -3426,6 +3441,9 @@ extern int main()
         double ctorIm = 2.0;
         std.complex<double> ctorC = std.complex<double>(ctorRe, ctorIm);
         if (ctorC.real() != 1.0 || ctorC.imag() != 2.0)                     return 2554;
+        std.complex<double> parenComplex = std.complex<double>(1.0, 0.0);
+        std.complex<double> parenProduct = parenComplex * (2.0);
+        if (parenProduct.real() != 2.0 || parenProduct.imag() != 0.0)       return 2556;
         long long ctorMsN = 42;
         std.chrono.milliseconds ctorMs = std.chrono.milliseconds(ctorMsN);
         if (ctorMs.count() != 42)                                           return 2555;

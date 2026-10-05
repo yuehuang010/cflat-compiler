@@ -1,0 +1,11 @@
+// GUARDS: iterate an empty C++20 view
+// FROM: internal/plan/std-library-tier2-suite.md (C++20 ranges coverage)
+import cpp "ranges";
+extern int main()
+{
+    int count = 0;
+    for (int x in std.views.empty<int>) count += x;
+    if (count != 0) { printf("FAIL empty view count\n"); return 1; }
+    printf("PASS std_full_20_905_empty_view\n");
+    return 0;
+}

@@ -1,0 +1,20 @@
+// GUARDS: valarray binary + with a scalar and a valarray operand (scalar ops leg of std_full_11_complex_valarray)
+// FROM: internal/plan/std-library-tier2-suite.md (std_full_11_complex_valarray, moved out for Windows MSVC 2026-10-02)
+import cpp "string";
+import cpp "valarray";
+extern int main()
+{
+    int failures = 0;
+    std.valarray<int> w = std.valarray<int>(4);
+    w[0] = 4; w[1] = 1; w[2] = 3; w[3] = 2;
+    int one = 1; int two_i = 2;
+    std.valarray<int> x = default;
+    x = w * two_i;
+    std.valarray<int> y = default;
+    y = w + one;
+    std.valarray<int> z = default;
+    z = w + w;
+    if (x[0] != 8 || x[3] != 4 || y[1] != 2 || z[2] != 6 || x.sum() != 20) { printf("FAIL valarray ops\n"); failures |= 16; }
+    if (failures == 0) printf("PASS std_full_11_940_valarray_binary_plus_minus\n");
+    return failures;
+}

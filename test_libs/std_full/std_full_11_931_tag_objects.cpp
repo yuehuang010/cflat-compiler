@@ -1,0 +1,26 @@
+// C++20 equivalent of std_full_11_931_tag_objects.cb (compile-time parity baseline)
+#include <string>
+#include <utility>
+#include <tuple>
+#include <optional>
+#include <variant>
+#include <any>
+#include <cstdio>
+
+int main() {
+    int failures = 0;
+    std::pair<std::string, int> pw(std::piecewise_construct, std::forward_as_tuple("abc"), std::forward_as_tuple(7));
+    if (pw.first != "abc" || pw.second != 7) { printf("FAIL piecewise_construct\n"); failures |= 1; }
+    std::optional<std::string> o(std::in_place, 3, 'x');
+    std::variant<int, std::string> v(std::in_place_index<1>, "idx");
+    std::variant<int, std::string> v2(std::in_place_type<int>, 9);
+    std::any an(std::in_place_type<std::string>, "any");
+    if (!o.has_value() || *o != "xxx" || v.index() != 1 || std::get<1>(v) != "idx" || v2.index() != 0 || std::get<0>(v2) != 9 || std::any_cast<std::string>(an) != "any")
+    { printf("FAIL in_place\n"); failures |= 2; }
+    int x = 0, y = 0; std::string s;
+    std::tie(x, std::ignore, s) = std::make_tuple(4, 5, std::string("tie"));
+    std::tie(y, std::ignore) = std::make_tuple(6, 7);
+    if (x != 4 || s != "tie" || y != 6) { printf("FAIL tie ignore\n"); failures |= 4; }
+    if (failures == 0) printf("PASS std_full_11_931_tag_objects\n");
+    return failures;
+}

@@ -1,0 +1,11 @@
+// GUARDS: range-for over bounded iota_view<int,int>
+// FROM: internal/plan/std-library-tier2-suite.md (C++20 ranges coverage)
+import cpp "ranges";
+extern int main()
+{
+    i64 sum = 0; for (int x in std.views.common(std.views.iota(1, 4))) sum += x;
+    i64 plain_sum = 0; for (int x in std.views.iota(1, 4)) plain_sum += x;
+    if (sum != 6 || plain_sum != 6) { printf("FAIL bounded iota view\n"); return 1; }
+    printf("PASS std_full_20_901_common_iota\n");
+    return 0;
+}

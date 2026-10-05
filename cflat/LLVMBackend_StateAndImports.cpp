@@ -1993,6 +1993,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.IsCxxRefToPointer) j["crp"] = true;
         if (s.IsCxxConstRef) j["ccr"] = true;
         if (s.IsCxxPointeeConst) j["cpc"] = true;
+        if (s.IsSpelledPointeeConst) j["spc"] = true;
         if (s.IsCxxNullptrT) j["cnt"] = true;
         if (s.IsCxxConstField) j["ccf"] = true;
         if (s.IsCxxMutableField) j["cmf"] = true;
@@ -2029,6 +2030,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
                 if (p.IsReturnInferredSink) pj["ris"] = true;
                 if (p.IsWriteInferredSink) pj["wis"] = true;
                 if (p.IsRvalueRef) pj["rr"] = true;
+                if (p.IsPointeeConst) pj["pc"] = true;
                 if (p.PointerDepth > 1) pj["pd"] = p.PointerDepth;
                 if (!p.ResolvedTypeKey.empty()) pj["rk"] = p.ResolvedTypeKey;
                 fps.push_back(pj);
@@ -2065,6 +2067,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsCxxRefToPointer = j.value("crp", false);
         s.IsCxxConstRef = j.value("ccr", false);
         s.IsCxxPointeeConst = j.value("cpc", false);
+        s.IsSpelledPointeeConst = j.value("spc", false);
         s.IsCxxNullptrT = j.value("cnt", false);
         s.IsCxxConstField = j.value("ccf", false);
         s.IsCxxMutableField = j.value("cmf", false);
@@ -2101,6 +2104,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
                     p.IsReturnInferredSink = pj.value("ris", false);
                     p.IsWriteInferredSink = pj.value("wis", false);
                     p.IsRvalueRef = pj.value("rr", false);
+                    p.IsPointeeConst = pj.value("pc", false);
                     p.PointerDepth = pj.value("pd", p.PointerDepth);
                     p.ResolvedTypeKey = pj.value("rk", std::string{});
                     s.FuncPtrParams.push_back(std::move(p));
@@ -2211,6 +2215,10 @@ nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e, CCachePathTable* files
         // Raw parameter spellings: RegisterCSignatures retypes a C++ record-pointer parameter out
         // of void* using these, and a warm cache never sees a clang session to re-derive them.
         if (!e.paramSpellings.empty()) j["pspell"] = e.paramSpellings;
+        if (!e.paramTemporarySpellings.empty()) j["ptemp"] = e.paramTemporarySpellings;
+        if (e.resultBorrowsBraceList) j["rbl"] = true;
+        if (!e.braceListElementSpellings.empty()) j["blel"] = e.braceListElementSpellings;
+        if (!e.calleeIdentity.empty()) j["callee"] = e.calleeIdentity;
         // paramNames repeats the names already serialized into "ps" for almost every C signature.
         // Compare against the SERIALIZED slot, so "pnq" means exactly what the reader rebuilds.
         bool namesMatchSlots = !e.paramNames.empty() && e.paramNames.size() == ps.size();
@@ -2264,6 +2272,10 @@ LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j, const CCachePath
         if (j.contains("ps")) for (const auto& p : j["ps"]) e.params.push_back(TvFromJson(p));
         if (j.contains("abi")) e.abi = AbiFromJson(j["abi"]);
         if (j.contains("pspell")) e.paramSpellings = j["pspell"].to_string_vector();
+        if (j.contains("ptemp")) e.paramTemporarySpellings = j["ptemp"].to_string_vector();
+        e.resultBorrowsBraceList = j.value("rbl", false);
+        if (j.contains("blel")) e.braceListElementSpellings = j["blel"].to_string_vector();
+        e.calleeIdentity = j.value("callee", std::string());
         if (j.value("pnq", false))
         {
             if (j.contains("ps"))
@@ -2376,6 +2388,7 @@ nlohmann::json LLVMBackend::GlobalToJson(const CGlobalEntry& g)
         if (!g.file.empty()) j["fl"] = g.file;
         if (g.isInternalLinkage) j["il"] = true;
         if (g.constInitHash != 0) j["ci"] = g.constInitHash;
+        if (g.isDllImport) j["dli"] = true;
         return j;
 }
 
@@ -2399,6 +2412,7 @@ LLVMBackend::CGlobalEntry LLVMBackend::GlobalFromJson(const SjVal& j)
         g.file = j.value("fl", std::string{});
         g.isInternalLinkage = j.value("il", false);
         g.constInitHash = j.value("ci", uint64_t{0});
+        g.isDllImport = j.value("dli", false);
         g.line = j.value("ln", 1);
         g.col  = j.value("co", 0);
         return g;
@@ -2475,6 +2489,7 @@ nlohmann::json LLVMBackend::CxxMemberToJson(
         if (m.needsLocalDefinition) j["nd"] = true;
         if (m.definitionAssumed)    j["da"] = true;
         if (!m.bindRefusal.empty()) j["br"] = m.bindRefusal;
+        if (!m.lazyNestedSpelling.empty()) j["lzn"] = m.lazyNestedSpelling;
         if (!m.refusalCause.empty())
         {
             const std::string cause = CxxRefusalCauseForCache(m.refusalCause);
@@ -2535,6 +2550,7 @@ cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(
         m.needsLocalDefinition = j.value("nd", false);
         m.definitionAssumed = j.value("da", false);
         m.bindRefusal = j.value("br", std::string());
+        m.lazyNestedSpelling = j.value("lzn", std::string());
         m.refusalCause = j.value("rcs", std::string());
         m.returnsThis          = j.value("rth", false);
         m.isCopyCtor           = j.value("cc", false);
@@ -2646,6 +2662,7 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
         // M6 - inheritance surface. Base offsets drive every derived-to-base adjustment and the
         // abstract/virtual-base gates; a warm cache that lost them would emit unadjusted pointers.
         if (r.hasVirtualBases)       j["hvb"] = true;
+        if (r.isFinal)               j["fin"] = true;
         if (r.isAbstract)            j["abs"] = true;
         if (r.hasFriendOperators)    j["fop"] = true;
         if (!r.layoutRefusal.empty()) j["lref"] = r.layoutRefusal;
@@ -2741,6 +2758,7 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
         r.hasAssignTemplate     = j.value("hat", false);
         r.isAggregate           = j.value("ag", false);
         r.hasVirtualBases       = j.value("hvb", false);
+        r.isFinal               = j.value("fin", false);
         r.isAbstract            = j.value("abs", false);
         r.hasFriendOperators    = j.value("fop", false);
         r.layoutRefusal         = j.value("lref", std::string{});
@@ -3237,6 +3255,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                 for (const auto& body : j["cxxbodies"])
                     entry.cxxBodyChecks.emplace_back(body.value("symbol", std::string{}),
                                                      body.value("verdict", std::string{}));
+            if (j.contains("cxxlookup"))
+                entry.cxxLookupTaintedBodies = j["cxxlookup"].to_string_vector();
             auto readReplayChunk = [](const SjVal& replay,
                                       cflat_cinterop::ExtractResult::DemandReplayChunk& chunk) {
                 chunk.order = replay.value("order", uint64_t{0});
@@ -3246,6 +3266,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                     for (const auto& body : replay["poisoned"])
                         chunk.poisonedBodies.emplace_back(body.value("key", std::string{}),
                                                          body.value("verdict", std::string{}));
+                if (replay.contains("noDefer"))
+                    chunk.noDeferBodyKeys = replay["noDefer"].to_string_vector();
                 const int64_t prefixAt = replay.value("prefixat", int64_t{-1});
                 chunk.prefixOffset = prefixAt < 0 ? std::string::npos : size_t(prefixAt);
                 chunk.markerPrefix = replay.value("marker", std::string{});
@@ -3714,6 +3736,8 @@ void LLVMBackend::WriteCHeaderDiskCache(
             for (const auto& [symbol, verdict] : entry.cxxBodyChecks)
                 j["cxxbodies"].push_back({{"symbol", symbol}, {"verdict", verdict}});
         }
+        if (!entry.cxxLookupTaintedBodies.empty())
+            j["cxxlookup"] = entry.cxxLookupTaintedBodies;
         if (entry.cxxDemandReplayChunk.headerHarvest
             || !entry.cxxDemandReplayChunk.source.empty())
         {
@@ -3721,6 +3745,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
                 nlohmann::json poisoned = nlohmann::json::array();
                 for (const auto& [key, verdict] : chunk.poisonedBodies)
                     poisoned.push_back({{"key", key}, {"verdict", verdict}});
+                nlohmann::json noDefer = chunk.noDeferBodyKeys;
                 nlohmann::json types = nlohmann::json::array();
                 for (const auto& type : chunk.typeRequests)
                     types.push_back({{"cxx", type.cxxSpelling}, {"cflat", type.cflatName}});
@@ -3732,6 +3757,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
                 return nlohmann::json{
                     {"order", chunk.order}, {"source", chunk.source},
                     {"poisoned", std::move(poisoned)},
+                    {"noDefer", std::move(noDefer)},
                     {"prefix", chunk.prefixSource}, {"marker", chunk.markerPrefix},
                     {"prefixat", chunk.prefixOffset == std::string::npos
                                      ? int64_t{-1} : int64_t(chunk.prefixOffset)},

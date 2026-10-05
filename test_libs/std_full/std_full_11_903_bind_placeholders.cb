@@ -1,0 +1,11 @@
+// GUARDS: std::bind with std::placeholders::_1/_2 (namespace-scope placeholder objects)
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp "functional";
+extern int main()
+{
+    int failures = 0;
+    auto b3 = std.bind(std.plus<int>(), std.placeholders._1, 100);
+    if (b3(5) != 105) { printf("FAIL bind\n"); failures |= 1; }
+    if (failures == 0) printf("PASS std_full_11_903_bind_placeholders\n");
+    return failures;
+}

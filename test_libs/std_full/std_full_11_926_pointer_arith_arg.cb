@@ -1,0 +1,14 @@
+// GUARDS: pointer arithmetic expression (p + 1) as an argument to a C++ free function
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp "cstring";
+extern int main()
+{
+    int failures = 0;
+    char[8] m_ = default; char* m = m_;
+    std.memset(m, 'q', 8);
+    m[0] = 'a';
+    std.memmove(m + 1, m, 4);
+    if (m[1] != 'a' || m[2] != 'q') { printf("FAIL memmove(p + 1)\n"); failures |= 1; }
+    if (failures == 0) printf("PASS std_full_11_926_pointer_arith_arg\n");
+    return failures;
+}

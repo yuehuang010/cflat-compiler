@@ -1,0 +1,12 @@
+// GUARDS: calling a temporary of a non-template functor class (std::compare_three_way()(a, b))
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp "compare";
+extern int main()
+{
+    int failures = 0;
+    auto c1 = std.compare_three_way()(1, 2);
+    auto c2 = std.compare_three_way()(2, 2);
+    if (!std.is_lt(c1) || !std.is_eq(c2)) { printf("FAIL compare_three_way_temporary\n"); failures |= 1; }
+    if (failures == 0) printf("PASS std_full_20_902_compare_three_way_temporary\n");
+    return failures;
+}

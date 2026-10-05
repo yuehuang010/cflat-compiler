@@ -1,0 +1,16 @@
+// GUARDS: offsetof(S, member) on a plain struct through <cstddef>
+// FROM: internal/plan/std-library-tier2-suite.md
+// DISABLED: internal/issue/p3/cpp-offsetof-macro-not-importable.md
+import cpp "cstddef";
+struct Layout { char tag = default; double value = default; int count = default; };
+extern int main()
+{
+    int failures = 0;
+    i64 off_tag = offsetof(Layout, tag);
+    i64 off_value = offsetof(Layout, value);
+    i64 off_count = offsetof(Layout, count);
+    if (off_tag != 0 || off_value < 1 || off_value % 8 != 0) { printf("FAIL offsetof\n"); failures |= 1; }
+    if (off_count <= off_value) { printf("FAIL offsetof order\n"); failures |= 2; }
+    if (failures == 0) printf("PASS std_full_11_923_offsetof_macro\n");
+    return failures;
+}

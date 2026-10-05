@@ -26,9 +26,17 @@ struct RefOwner { int v; RefOwner(Ex& e) : v(++e.v) {} };
 template <class U> int tbump(U& x) { x = x + 1; return (int)x; }
 template <class U> int tbump_ex(U& x) { return ++x.v; }
 template <class U> int tout(U v, int& out) { out = (int)v; return 1; }
+template <class U> int literal_cref_size(const U& value) { return (int)sizeof(U) + (int)value; }
+template <class U> int literal_value_size(U value) { return (int)sizeof(U) + (int)value; }
+template <class U> int literal_size(const U&) { return (int)sizeof(U); }
+inline int literal_concrete_cref(const int& value) { return value; }
 template <class... A> int tpack(A&... a) { return (int)sizeof...(a); }
 inline int tval(int v) { return v; }
 struct TMember { template <class U> int bump(U& x) { x = x + 1; return (int)x; } };
+template <class U> struct LiteralRefMember {
+    using value_type = U;
+    int cref(const value_type& value) { return (int)sizeof(value_type) + (int)value; }
+};
 // Own namespace: no non-template operator+ sibling (Ex's) that could take the rvalue instead.
 namespace tsink {
 struct TSink { int t = 0; };

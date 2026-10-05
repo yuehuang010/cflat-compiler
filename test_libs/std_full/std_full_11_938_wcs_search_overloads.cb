@@ -1,0 +1,13 @@
+// GUARDS: wcschr / wcsstr dual-overload wide search functions through the bridge
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp "cwchar";
+extern int main()
+{
+    int failures = 0;
+    wchar_t[16] w_ = default; wchar_t* w = w_;
+    std.wcscpy(w, L"wide");
+    if (std.wcschr(w, L'd') != w + 2) { printf("FAIL wcschr\n"); failures |= 1; }
+    if (std.wcsstr(w, L"id") != w + 1) { printf("FAIL wcsstr\n"); failures |= 2; }
+    if (failures == 0) printf("PASS std_full_11_938_wcs_search_overloads\n");
+    return failures;
+}

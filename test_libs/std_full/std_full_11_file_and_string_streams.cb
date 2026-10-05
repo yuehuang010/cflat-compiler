@@ -1,0 +1,53 @@
+// GUARDS: string streams, iterator reads, and local binary file streams
+// FROM: internal/plan/std-library-tier2-suite.md (C++11 file and string streams coverage)
+import cpp {"filesystem", "fstream", "iterator", "sstream", "string"};
+extern int main()
+{
+    int failures = 0;
+    std.ostringstream explicit_out = default;
+    explicit_out << "output";
+    if (explicit_out.str() != "output") { printf("FAIL ostringstream\n"); failures |= 16; }
+    std.stringstream ss = default;
+    ss << "first";
+    if (ss.str() != "first") { printf("FAIL stringstream output\n"); failures |= 1; }
+    ss.str("second");
+    std.string value = default;
+    ss >> value;
+    if (value != "second") { printf("FAIL stringstream reset/input\n"); failures |= 1; }
+
+    std.string source = "iterator";
+    std.istringstream input = std.istringstream(source);
+    std.string copied = std.string(std.istreambuf_iterator<char>(input), std.istreambuf_iterator<char>());
+    if (copied != source) { printf("FAIL istreambuf_iterator\n"); failures |= 4; }
+
+    std.filesystem.create_directories("scratch/std_full_C2");
+    std.string path = "scratch/std_full_C2/streams.bin";
+    std.ofstream out = std.ofstream(path, std.ios.binary | std.ios.trunc);
+    out.write("abcdef", 6);
+    bool opened = out.is_open();
+    out.close();
+    if (!opened || out.is_open()) { printf("FAIL ofstream open/close\n"); failures |= 8; }
+    std.fstream io = std.fstream(path, std.ios.in | std.ios.out | std.ios.binary);
+    char[3] part = {};
+    io.read(part, 3);
+    i64 read_count = io.gcount();
+    i64 position = io.tellg();
+    io.seekg(0);
+    char first = 0;
+    io.get(first);
+    if (!io.is_open() || read_count != 3 || part[0] != 'a' || part[1] != 'b' || part[2] != 'c' || position != 3 || first != 'a')
+    { printf("FAIL fstream binary read/seek\n"); failures |= 8; }
+    io.close();
+    std.ofstream append = std.ofstream(path, std.ios.app | std.ios.binary);
+    append.put('g');
+    append.close();
+    std.ifstream fin = default;
+    fin.open(path, std.ios.binary);
+    std.string all = std.string(std.istreambuf_iterator<char>(fin), std.istreambuf_iterator<char>());
+    fin.close();
+    if (all != "abcdefg") { printf("FAIL app/readback\n"); failures |= 8; }
+    std.remove(path.c_str());
+
+    if (failures == 0) printf("PASS std_full_11_file_and_string_streams\n");
+    return failures;
+}

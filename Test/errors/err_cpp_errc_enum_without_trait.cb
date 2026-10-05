@@ -1,0 +1,26 @@
+import cpp "ios";
+import cpp "system_error";
+import cpp "cpp_interop_errc.h";
+extern int main()
+{
+    cpp_errc_probe.ErrorCondition condition = default;
+    expect_error("std.io_errc' and cannot be implicitly converted") {
+        bool invalid = condition == std.io_errc.stream;
+    }
+    expect_error("cpp_errc_probe.UnregisteredEnum' and cannot be implicitly converted") {
+        bool invalid = condition == cpp_errc_probe.UnregisteredEnum.rejected;
+    }
+    expect_error("no overload") {
+        bool invalid = condition == std.errc(22);
+    }
+    cpp_errc_probe.ErrorCode code = default;
+    expect_error("no operator '<'") {
+        bool invalid = code < cpp_errc_probe.ConditionEnum.accepted;
+    }
+    expect_error("no operator '<'") {
+        bool invalid = cpp_errc_probe.ConditionEnum.accepted < code;
+    }
+    expect_error("cannot initialize C++ class 'cpp_errc_probe.ErrorCondition'") {
+        cpp_errc_probe.ErrorCondition invalid = cpp_errc_probe.UnregisteredEnum.rejected;
+    }
+}

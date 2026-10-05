@@ -299,6 +299,24 @@ bool LLVMBackend::ArgumentConvertsToBoolParameter(const NamedVariable& arg, cons
 std::string LLVMBackend::LiteralIdentityForOverload(std::string_view text, bool* suffixedInteger)
 {
         if (suffixedInteger != nullptr) *suffixedInteger = false;
+        while (text.size() >= 2 && text.front() == '(' && text.back() == ')')
+        {
+            int depth = 0;
+            bool enclosesAll = true;
+            for (size_t i = 0; i < text.size(); ++i)
+            {
+                if (text[i] == '(') ++depth;
+                else if (text[i] == ')' && --depth == 0 && i + 1 != text.size())
+                {
+                    enclosesAll = false;
+                    break;
+                }
+            }
+            if (!enclosesAll || depth != 0) break;
+            text.remove_prefix(1);
+            text.remove_suffix(1);
+        }
+        if (text == "true" || text == "false") return "bool";
         if (text.size() >= 3 && text.back() == '\'')
         {
             if (text.front() == '\'') return "char";
@@ -697,7 +715,8 @@ bool LLVMBackend::CxxDeductionWrapperDeducesOther(const NamedVariable& arg, cons
 }
 
 std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequences(
-        const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate)
+        const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate,
+        bool allowTemplateClassConversion)
 {
         auto integerBits = [](const std::string& name) {
             TypeAndValue probe;
@@ -774,13 +793,34 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 }
                 continue;
             }
+            const bool fixedArrayArgument = candidate.IsCxx
+                && !arg.TypeAndValue.IsArrayView
+                && (arg.TypeAndValue.ConstArraySize > 0
+                    || llvm::isa_and_nonnull<llvm::ArrayType>(arg.BaseType));
+            if (fixedArrayArgument && !param.Pointer && param.ConstArraySize == 0
+                && param.TypeName != "bool")
+            {
+                // C++ array-to-pointer decay cannot make an array argument scalar.
+                out.rank = kCxxNonViableRank;
+                out.from = arg.TypeAndValue.TypeName;
+                continue;
+            }
             // A pointer argument to a single-level pointer parameter: identity or qualification
             // (exact match), derived-to-base or to `void*` (conversion). Anything else unjudged.
             if (param.Pointer && !param.IsAlias && !param.IsRvalueRef && !param.ElemPointer
                 && !param.IsArrayView && !param.IsFunctionPointer && !param.IsInterface
                 && !param.IsCxxRefToPointer && param.PointerDepth <= 1)
             {
-                const TypeAndValue& pt = arg.TypeAndValue;
+                TypeAndValue pt = arg.TypeAndValue;
+                if (fixedArrayArgument)
+                {
+                    pt.PointerDepth = pt.PointerDepth > 0 ? pt.PointerDepth + 1
+                        : (pt.Pointer ? 2 : 1);
+                    pt.ElemPointer = pt.ElemPointer || pt.Pointer;
+                    pt.Pointer = true;
+                    pt.ConstArraySize = 0;
+                    pt.ConstInnerDimensions.clear();
+                }
                 // `nullptr` (or a std::nullptr_t value): identity at a std::nullptr_t parameter, a
                 // null pointer conversion to any other pointer type, no tie-breaker.
                 if (IsCxxNullTypedArgument(arg))
@@ -880,6 +920,16 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 }
                 if (pointee.empty())
                     continue;
+                if (IsCxxReferenceParameter(candidate, i)
+                    && param.TypeName == "bool"
+                    && CxxReferenceParameterSpelling(candidate, i).rfind("const ", 0) == 0)
+                {
+                    out.rank = 2;
+                    out.boolConversion = true;
+                    out.cxxViable = true;
+                    out.from = pointee;
+                    continue;
+                }
                 if (pointee == CanonicalPrimitiveTypeName(param.TypeName))
                 {
                     out.rank = 0;
@@ -927,7 +977,8 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 && param.TypeName == "bool" && !IsCxxNullTypedArgument(arg)
                 && !IsNullPointerConstantArgument(arg)
                 && (arg.TypeAndValue.Pointer || arg.TypeAndValue.ElemPointer
-                    || arg.TypeAndValue.IsFunctionPointer || arg.IsStringLiteral))
+                    || arg.TypeAndValue.IsFunctionPointer || arg.IsStringLiteral
+                    || fixedArrayArgument))
             {
                 out.rank = 2;
                 out.boolConversion = true;
@@ -948,14 +999,21 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
 
             const TypeAndValue& at = arg.TypeAndValue;
             const size_t paramIndex = i;
+            const size_t sourceTemplate = at.TypeName.find('$');
+            const size_t targetTemplate = param.TypeName.find('$');
+            const bool bothTemplateSpecializations = sourceTemplate != std::string::npos
+                && targetTemplate != std::string::npos;
             const bool cxxByValueParam = candidate.IsCxx
-                && paramIndex < candidate.Recipe.paramSlots.size()
-                && candidate.Recipe.paramSlots[paramIndex].kind == AbiSlot::ByVal;
+                && ((paramIndex < candidate.Recipe.paramSlots.size()
+                     && candidate.Recipe.paramSlots[paramIndex].kind == AbiSlot::ByVal)
+                    || (allowTemplateClassConversion && bothTemplateSpecializations
+                        && !param.Pointer && !param.IsAlias && !param.IsRvalueRef
+                        && IsCxxRecord(param.TypeName)));
             const bool cxxIndirectValueParam = candidate.IsCxx
                 && candidate.CxxAbi.valid
                 && paramIndex < candidate.CxxAbi.params.size()
                 && candidate.CxxAbi.params[paramIndex].kind == cflat_cinterop::RawAbiSlot::Indirect;
-            if (IsCxxRecord(at.TypeName) && IsCxxDerivedToBaseValue(at, param))
+            if (IsCxxRecord(at.TypeName) && IsCxxDerivedToBaseValue(at, param, nullptr))
             {
                 out.rank = 2;
                 out.cxxViable = true;
@@ -970,7 +1028,8 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
             }
             if (IsCxxRecord(param.TypeName)
                 && CanImplicitlyConstructCxxClass(arg, param,
-                                                  cxxByValueParam || cxxIndirectValueParam))
+                                                  cxxByValueParam || cxxIndirectValueParam,
+                                                  allowTemplateClassConversion))
             {
                 out.rank = 3;
                 out.cxxViable = true;
@@ -983,6 +1042,24 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 if (((!reference && !param.Pointer) || constReference) && !at.Pointer
                     && IsCxxRecord(at.TypeName))
                     out.ambiguousOperators = CxxClassConversionTies(at.TypeName, param.TypeName);
+                continue;
+            }
+            // nullptr has no class identity to bind through a reference directly. If the class
+            // has a converting constructor, the user-defined sequence was ranked above; otherwise
+            // this candidate is non-viable even though LLVM represents nullptr as a raw pointer.
+            if (candidate.IsCxx && IsCxxNullTypedArgument(arg) && reference
+                && IsCxxRecord(param.TypeName))
+            {
+                out.rank = kCxxNonViableRank;
+                out.from = "nullptr";
+                continue;
+            }
+            // A raw pointer binds no reference except through a converting constructor (above);
+            // ranking-only non-viable, so a lone such candidate keeps CFlat's fallback.
+            if (candidate.IsCxx && at.Pointer && reference)
+            {
+                out.rank = kCxxNonViableRank;
+                out.from = at.TypeName.empty() ? arg.InferSourceTypeName : at.TypeName;
                 continue;
             }
             if (!at.Pointer && !at.ElemPointer && !at.TypeName.empty() && IsCxxRecord(at.TypeName))
@@ -1164,6 +1241,12 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             int constRefMaterializations = 0;
             // Prefer matching C++ record-pointer pointee constness (adding const ranks worse).
             int cxxPointeeConstMismatches = 0;
+            // Callback parameters whose pointee const disagrees with the argument's; read only
+            // between candidates identical up to that const (preferCallbackConstSpelling).
+            int callbackConstMismatches = 0;
+            // An argument reaching a C++ callback parameter whose pointee const is not proven
+            // (not a named function's signature): preferCallbackConstSpelling declines.
+            bool callbackConstUnproven = false;
             // Not viable in C++ (dropped pointee const); removed while any other candidate is
             // viable, else kept so the selected-candidate guard refuses it.
             bool cxxPointeeConstNotViable = false;
@@ -1323,6 +1406,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             int constAddedConversions = 0;
             int refPtrConstMismatches = 0;
             int cxxPointeeConstMismatches = 0;
+            int callbackConstMismatches = 0;
+            bool callbackConstUnproven = false;
             bool cxxPointeeConstNotViable = false;
             // Arguments bound through a user-defined conversion; the extra fields describe
             // conversion operators (see Ranked for the aggregate fallback).
@@ -1350,11 +1435,35 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                             && arg.TypeAndValue.ElemPointer))
                         cxxPointeeConstNotViable = true;
                 }
+                // C++ overloads on a callback's pointee const (`int(*)(const void*)` vs
+                // `int(*)(void*)`) are one CFlat signature: prefer the matching spelling.
+                if (candidate.IsCxx && candidateParamItr != candidate.Parameters.end()
+                    && candidateParamItr->IsFunctionPointer)
+                {
+                    // Only a named function's symbol records its spelled pointee const; a
+                    // function-pointer value's signature may have dropped it.
+                    TypeAndValue argSig;
+                    if (!arg.TypeAndValue.IsFunctionPointer && arg.TypeAndValue.TypeName.empty()
+                        && !arg.CallerName.empty())
+                        if (auto* fn = llvm::dyn_cast_or_null<llvm::Function>(arg.Primary))
+                            argSig = FuncPtrSigOfBoundFunction(arg.CallerName, fn);
+                    const auto& want = candidateParamItr->FuncPtrParams;
+                    if (argSig.IsFunctionPointer && argSig.FuncPtrParams.size() == want.size())
+                    {
+                        for (size_t k = 0; k < want.size(); ++k)
+                            if (argSig.FuncPtrParams[k].IsPointeeConst != want[k].IsPointeeConst)
+                                callbackConstMismatches += 1;
+                    }
+                    else
+                        callbackConstUnproven = true;
+                }
                 // Set ONLY by the two `const T&` scalar arms below, so the integer-identity
                 // ranking reads the REFERENT for candidates only those arms make viable.
                 std::string constRefReferentIdentity;
                 // True when one of those arms bound this argument, integer referent or not.
                 bool constRefReferentArm = false;
+                bool cxxUserCtorConversion = false;
+                bool userConversionForArgument = false;
                 // Neither direction converts: a scoped enum to anything but itself, nor an integer to
                 // any C++ enum parameter (scoped or unscoped).
                 const bool scopedEnumMismatch = candidate.IsCxx
@@ -1459,6 +1568,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     implicitMatch = false;
                     break;
                 }
+                if (cxxNullArgument && CxxNullCannotBindClassReference(candidate, *candidateParamItr, arg))
+                {
+                    perfectMatch = false;
+                    promotionMatch = false;
+                    implicitMatch = false;
+                    break;
+                }
                 if (cxxNullArgument && !candidateParamItr->IsFunctionPointer
                     && (candidateParamItr->IsCxxNullptrT || CxxSpellingIsNullptrT(cxxParamSpelling)))
                 {
@@ -1528,8 +1644,18 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         && MangledGenericArgument(*this, tmpParam.TypeName) == tmpArg.TypeName;
                     const size_t paramIndex = std::distance(candidate.Parameters.begin(), candidateParamItr);
                     const bool cxxByValueParam = candidate.IsCxx
-                        && paramIndex < candidate.Recipe.paramSlots.size()
-                        && candidate.Recipe.paramSlots[paramIndex].kind == AbiSlot::ByVal;
+                        && ((paramIndex < candidate.Recipe.paramSlots.size()
+                             && candidate.Recipe.paramSlots[paramIndex].kind == AbiSlot::ByVal)
+                            || (candidates.size() > 1
+                                && [&] {
+                                    const size_t sourceTemplate = arg.TypeAndValue.TypeName.find('$');
+                                    const size_t targetTemplate = candidateParamItr->TypeName.find('$');
+                                    return sourceTemplate != std::string::npos
+                                        && targetTemplate != std::string::npos
+                                        && !candidateParamItr->Pointer && !candidateParamItr->IsAlias
+                                        && !candidateParamItr->IsRvalueRef
+                                        && IsCxxRecord(candidateParamItr->TypeName);
+                                }()));
                     const bool cxxIndirectValueParam = candidate.IsCxx
                         && candidate.CxxAbi.valid
                         && paramIndex < candidate.CxxAbi.params.size()
@@ -1539,13 +1665,18 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     // convert x into some other class that happens to have a `slice` member.
                     const bool cxxReceiverParam = candidate.IsCxx && candidate.IsMethod
                                                && paramIndex == 0;
-                    if (!cxxReceiverParam && !pointerShadowedByBool(arg, paramIndex)
+                    cxxUserCtorConversion = !cxxReceiverParam
+                        && !pointerShadowedByBool(arg, paramIndex)
                         && CanImplicitlyConstructCxxClass(arg, *candidateParamItr,
-                                                        cxxByValueParam || cxxIndirectValueParam))
+                            cxxByValueParam || cxxIndirectValueParam, candidates.size() > 1);
+                    if (cxxUserCtorConversion)
                     {
                         result = 1;
                         if (candidate.IsCxx)
+                        {
                             ++userConversions;
+                            userConversionForArgument = true;
+                        }
                     }
                     // Mirror of the line above in the conversion-OPERATOR direction: a class
                     // value with an implicit 'operator bool' / 'operator int' binds a scalar
@@ -1619,7 +1750,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     // derived lvalue binds to a public base reference by a standard conversion;
                     // lower it from the derived object's storage with the base offset.
                     else if (tmpParam.IsAlias && !tmpParam.ElemPointer
-                             && IsCxxDerivedToBaseValue(tmpArg, tmpParam))
+                             && IsCxxDerivedToBaseValue(tmpArg, tmpParam, nullptr))
                         result = 1;
                     // M6 - a pointer to a C++ class binds to a parameter typed as a PUBLIC base
                     // of it, with the base subobject offset added at the call. Scored as an
@@ -1815,8 +1946,18 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         result = 0;
                     const size_t paramIndex = std::distance(candidate.Parameters.begin(), candidateParamItr);
                     const bool cxxByValueParam = candidate.IsCxx
-                        && paramIndex < candidate.Recipe.paramSlots.size()
-                        && candidate.Recipe.paramSlots[paramIndex].kind == AbiSlot::ByVal;
+                        && ((paramIndex < candidate.Recipe.paramSlots.size()
+                             && candidate.Recipe.paramSlots[paramIndex].kind == AbiSlot::ByVal)
+                            || (candidates.size() > 1
+                                && [&] {
+                                    const size_t sourceTemplate = arg.TypeAndValue.TypeName.find('$');
+                                    const size_t targetTemplate = candidateParamItr->TypeName.find('$');
+                                    return sourceTemplate != std::string::npos
+                                        && targetTemplate != std::string::npos
+                                        && !candidateParamItr->Pointer && !candidateParamItr->IsAlias
+                                        && !candidateParamItr->IsRvalueRef
+                                        && IsCxxRecord(candidateParamItr->TypeName);
+                                }()));
                     const bool cxxIndirectValueParam = candidate.IsCxx
                         && candidate.CxxAbi.valid
                         && paramIndex < candidate.CxxAbi.params.size()
@@ -1828,11 +1969,14 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                                                && paramIndex == 0;
                     if (!cxxReceiverParam && !pointerShadowedByBool(arg, paramIndex)
                         && CanImplicitlyConstructCxxClass(arg, *candidateParamItr,
-                                                        cxxByValueParam || cxxIndirectValueParam))
+                            cxxByValueParam || cxxIndirectValueParam, candidates.size() > 1))
                     {
                         result = 1;
                         if (candidate.IsCxx)
+                        {
                             ++userConversions;
+                            userConversionForArgument = true;
+                        }
                     }
                     // Opaque pointers scored the class REFERENCE a match above; with a `bool`
                     // sibling C++ takes the standard conversion, so this candidate is not it.
@@ -2008,6 +2152,14 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 // pointer/reference mismatch rejected above.
                 if (pointerToBoolReference || pointerToNonConstClassReference)
                     result = -1;
+                // A string literal is an array lvalue: its decayed pointer is a prvalue, which a
+                // C++ `T *&` cannot bind (clang refuses); only `T *const &` takes a temporary.
+                // A generated wrapper's own `T *&` is a CFlat-side caller slot, not C++'s.
+                if (result >= 0 && candidate.IsCxx && !candidate.UniqueName.starts_with("__cflat_")
+                    && candidateParamItr->IsCxxRefToPointer
+                    && !candidateParamItr->IsCxxConstRef
+                    && (arg.IsStringLiteral || isStringLiteralValue(arg.Primary)))
+                    result = -1;
 
                 // Implicit integer NARROWING at a call argument is not legal (ruling 2026-09-04):
                 // reject it here so the caller reports "no overload ... matches", the same answer
@@ -2040,14 +2192,31 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     && !candidateParamItr->Pointer && !candidateParamItr->IsAlias
                     && !candidateParamItr->IsRvalueRef && candidateParamItr->TypeName == "bool"
                     && (arg.TypeAndValue.Pointer || arg.TypeAndValue.ElemPointer
-                        || arg.TypeAndValue.IsFunctionPointer || arg.IsStringLiteral);
+                        || arg.TypeAndValue.IsFunctionPointer || arg.IsStringLiteral
+                        || (!arg.TypeAndValue.IsArrayView
+                            && (arg.TypeAndValue.ConstArraySize > 0
+                                || llvm::isa_and_nonnull<llvm::ArrayType>(arg.BaseType))));
                 if (!scopedEnumMismatch && result < 0
                     && (ArgumentConvertsToBoolParameter(arg, *candidateParamItr) || cxxPointerToBool))
                 {
                     result = 1;
                     boolCoercions++;
                 }
-                if (scopedEnumMismatch) result = -1;
+                // C++ has no implicit conversion from void* to an object pointer. The generic
+                // type matcher treats two unrecognized pointer spellings as equivalent, so close
+                // that path after all standard-conversion arms have been considered.
+                const std::string argumentPointerName = arg.TypeAndValue.TypeName.empty()
+                    ? arg.InferSourceTypeName : arg.TypeAndValue.TypeName;
+                const bool argumentIsPointer = arg.TypeAndValue.Pointer
+                    || (arg.BaseType != nullptr && arg.BaseType->isPointerTy());
+                if (candidate.IsCxx && !IsCxxNullTypedArgument(arg)
+                    && !IsNullPointerConstantArgument(arg)
+                    && argumentIsPointer && argumentPointerName == "void"
+                    && candidateParamItr->Pointer && candidateParamItr->TypeName != "void")
+                    result = -1;
+                // A scoped enum has no standard conversion here, but a clang-proved converting
+                // ctor keeps the candidate viable; the mismatch only blocks the fallbacks above.
+                if (scopedEnumMismatch && !cxxUserCtorConversion) result = -1;
 
                 // Integer identity ranking (ruling 2026-09-10): only an identity-exact integer is a
                 // perfect match. Never widens the viable set - it re-ranks what already binds.
@@ -2120,6 +2289,42 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         || relation == CxxPointeeConstRelation::Drops)
                         result = std::max(result, 1);
                 }
+                // CFlat permits a raw pointer to stand for the address of its pointee at a
+                // C++ lvalue-reference parameter. Keep only the matching referent candidate.
+                const bool pointerToReferent = originalArgType.Pointer
+                    ? !originalArgType.ElemPointer && originalArgType.PointerDepth <= 1
+                    : originalArgType.ConstArraySize > 0 && !originalArgType.ElemPointer;
+                if (candidate.IsCxx && !candidate.IsMethod && pointerToReferent
+                    && !userConversionForArgument)
+                {
+                    const std::string referenceSpelling = CxxReferenceParameterSpelling(
+                        candidate, paramIndex);
+                    const bool cxxReferenceParam = candidateParamItr->IsAlias
+                        || candidateParamItr->IsRvalueRef
+                        || referenceSpelling.find('&') != std::string::npos;
+                    if (cxxReferenceParam && referenceSpelling.find("&&") == std::string::npos
+                        && referenceSpelling.find('[') == std::string::npos
+                        && referenceSpelling.find('*') == std::string::npos)
+                    {
+                        const std::string pointee = !originalArgType.TypeName.empty()
+                            ? originalArgType.TypeName : arg.InferSourceTypeName;
+                        if (!pointee.empty())
+                        {
+                            const std::string referent = candidateParamItr->TypeName;
+                            const bool same = CanonicalPrimitiveTypeName(pointee)
+                                == CanonicalPrimitiveTypeName(referent);
+                            const bool derivedToBase = IsCxxRecord(pointee) && IsCxxRecord(referent)
+                                && IsCxxBaseOf(referent, pointee);
+                            const bool pointerToConstBool = referent == "bool"
+                                && referenceSpelling.rfind("const ", 0) == 0;
+                            if (!pointerToConstBool)
+                            {
+                                if (!same && !derivedToBase)
+                                    result = -1;
+                            }
+                        }
+                    }
+                }
                 integerCosts.push_back(integerCost);
                 standardCosts.push_back(integerCost);
                 if (standardCosts.back() < 0 && IsNullPointerConstantArgument(arg)
@@ -2160,6 +2365,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 ranked.constAddedConversions = constAddedConversions;
                 ranked.refPtrConstMismatches = refPtrConstMismatches;
                 ranked.cxxPointeeConstMismatches = cxxPointeeConstMismatches;
+                ranked.callbackConstMismatches = callbackConstMismatches;
+                ranked.callbackConstUnproven = callbackConstUnproven;
                 ranked.cxxPointeeConstNotViable = cxxPointeeConstNotViable;
                 ranked.userConversions = userConversions;
                 ranked.userConversionCost = userConversionCost;
@@ -2318,7 +2525,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             for (const Ranked& r : ellipsisRanked) viable.push_back(&r);
             for (const Ranked* r : viable)
             {
-                auto ranks = RankCxxConversionSequences(r->pair->first, r->pair->second);
+                auto ranks = RankCxxConversionSequences(r->pair->first, r->pair->second,
+                                                        candidates.size() > 1);
                 if (r->pair->second.Variadic)
                     for (size_t i = r->pair->second.Parameters.size(); i < ranks.size(); ++i)
                     {
@@ -2461,7 +2669,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     || (failedDefault && CxxDeclarationLinkageName(pair.second.UniqueName)
                         == CxxDeclarationLinkageName(winner->pair->second.UniqueName)))
                     continue;
-                const auto ranks = RankCxxConversionSequences(pair.first, pair.second);
+                const auto ranks = RankCxxConversionSequences(pair.first, pair.second,
+                                                              candidates.size() > 1);
                 // A ranked by-value class parameter is viable even though cxxViable only proves
                 // const-reference bindings for candidates CFlat could not itself match.
                 if (failedDefault && cxxRanks.count(&pair) != 0 ? !fullyRanked(ranks)
@@ -2504,6 +2713,68 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             return *winner->pair;
         };
 
+        /*
+         * C++ overloads that differ ONLY in a callback parameter's pointee const
+         * (`int(*)(const void*)` vs `int(*)(void*)`) are one CFlat signature and tie through every
+         * filter above. Only among such a family, prefer the spelling matching the argument's.
+         * The mapped signature keeps only the INNERMOST pointee const of a single-level pointer;
+         * a callback returning a pointer, or any deeper pointer, could hide a const difference,
+         * so equality is unprovable there and the preference declines; so it does when an
+         * argument reaching a callback parameter is not a named function (const unproven).
+         */
+        auto preferCallbackConstSpelling = [&](std::vector<const Ranked*>& best) {
+            if (best.size() < 2) return;
+            auto sameComponent = [](const TypeAndValue& a, const TypeAndValue& b) {
+                return a.TypeName == b.TypeName && a.Pointer == b.Pointer
+                    && a.ElemPointer == b.ElemPointer && a.ValuePointerDepth() == b.ValuePointerDepth()
+                    && a.IsAlias == b.IsAlias && a.IsRvalueRef == b.IsRvalueRef
+                    && a.IsCxxConstRef == b.IsCxxConstRef && a.IsCxxPointeeConst == b.IsCxxPointeeConst
+                    && a.IsFunctionPointer == b.IsFunctionPointer;
+            };
+            auto lossless = [](const TypeAndValue& t) { return t.ValuePointerDepth() <= 1; };
+            auto sameModuloCallbackConst = [&](const FunctionSymbol& a, const FunctionSymbol& b) {
+                if (!a.IsCxx || !b.IsCxx || a.IsMethod != b.IsMethod
+                    || a.CxxVolatile != b.CxxVolatile || !sameComponent(a.ReturnType, b.ReturnType)
+                    || !lossless(a.ReturnType) || a.Parameters.size() != b.Parameters.size())
+                    return false;
+                bool differs = false;
+                for (size_t i = 0; i < a.Parameters.size(); ++i)
+                {
+                    const TypeAndValue& p = a.Parameters[i];
+                    const TypeAndValue& q = b.Parameters[i];
+                    if (!sameComponent(p, q)) return false;
+                    if (!p.IsFunctionPointer)
+                    {
+                        if (!lossless(p)) return false;
+                        continue;
+                    }
+                    if (p.FuncPtrReturnPointer || q.FuncPtrReturnPointer
+                        || p.FuncPtrReturnTypeName != q.FuncPtrReturnTypeName
+                        || p.FuncPtrReturnPointer != q.FuncPtrReturnPointer
+                        || p.FuncPtrReturnPointerDepth != q.FuncPtrReturnPointerDepth
+                        || p.FuncPtrParams.size() != q.FuncPtrParams.size())
+                        return false;
+                    for (size_t k = 0; k < p.FuncPtrParams.size(); ++k)
+                    {
+                        const auto& x = p.FuncPtrParams[k];
+                        const auto& y = q.FuncPtrParams[k];
+                        if (x.TypeName != y.TypeName || x.Pointer != y.Pointer
+                            || x.PointerDepth != y.PointerDepth || x.IsRvalueRef != y.IsRvalueRef
+                            || x.PointerDepth > 1)
+                            return false;
+                        differs = differs || x.IsPointeeConst != y.IsPointeeConst;
+                    }
+                }
+                return differs;
+            };
+            for (size_t i = 1; i < best.size(); ++i)
+                if (!sameModuloCallbackConst(best[0]->pair->second, best[i]->pair->second))
+                    return;
+            for (const Ranked* r : best)
+                if (r->callbackConstUnproven) return;
+            keepLowest(best, [](const Ranked& r) { return r.callbackConstMismatches; });
+        };
+
         auto preferCxxDefaultWrapperForSameDeclaration = [&](std::vector<const Ranked*>& best) {
             if (!cxxRanking)
             {
@@ -2534,6 +2805,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             keepLowest(best, [](const Ranked& r) { return r.mutableRefPreference; });
             keepLowest(best, [](const Ranked& r) { return -r.moveScore; });
             keepLowest(best, [](const Ranked& r) { return (int)r.pair->second.CxxVolatile; });
+            preferCallbackConstSpelling(best);
             preferCxxDefaultWrapperForSameDeclaration(best);
             return finish(settle(best, /*legacyLastWins=*/false));
         }
@@ -2599,6 +2871,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     tiedOut->push_back(r->pair->second);
                 return Result{};
             }
+            preferCallbackConstSpelling(best);
             return finish(settle(best, /*legacyLastWins=*/true));
         }
 
@@ -3146,6 +3419,23 @@ bool LLVMBackend::RejectArrayViewParamBinding(const NamedVariable& arg, const Ty
         return rejected;
 }
 
+/*
+ * nullptr never binds a C++ class reference directly - only through a converting constructor,
+ * and never into a function template specialization, whose class parameter was deduced (a
+ * harvested `operator==<int, int>(const sp<int>&, const sp<int>&)`); the call then asks clang
+ * for the template set instead.
+ */
+bool LLVMBackend::CxxNullCannotBindClassReference(const FunctionSymbol& candidate,
+                                                  const TypeAndValue& param,
+                                                  const NamedVariable& arg)
+{
+        if (!candidate.IsCxx || !(param.IsAlias || param.IsRvalueRef) || param.IsCxxRefToPointer
+            || param.ElemPointer || !IsCxxRecord(param.TypeName))
+            return false;
+        return IsCxxTemplateSpecializationSymbol(candidate)
+            || !CanImplicitlyConstructCxxClass(arg, param, false);
+}
+
 bool LLVMBackend::IsCxxTemplateSpecializationSymbol(const FunctionSymbol& symbol) const
 {
         const std::string declared = CxxDeclarationLinkageName(symbol.UniqueName);
@@ -3236,6 +3526,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // later non-C++ call cannot make a chained result reuse an earlier sret temporary.
         lastCxxRetTemp_ = nullptr;
         lastCxxRetValue_ = nullptr;
+        cxxVirtualBaseRefusal_.clear();
         std::string functionName = ResolveQualifiedName(functionNameIn, forceRoot);
         const bool inGlobalInitThunk = currentFunction != nullptr
             && (currentFunction->getName().starts_with("__global")
@@ -3634,8 +3925,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             const std::string staticName = receiverType + "." + bareMemberName;
             const auto staticSet = functionTable.find(staticName);
             const FunctionSymbol* thisShape = nullptr;
+            // The receiver's own `this` slot: the name's set also holds other classes' methods.
             for (const auto& c : candidates)
-                if (c.IsMethod && !c.Parameters.empty()) { thisShape = &c; break; }
+                if (c.IsMethod && !c.Parameters.empty()
+                    && c.Parameters.front().TypeName == receiverType) { thisShape = &c; break; }
+            for (const auto& c : candidates)
+                if (thisShape == nullptr && c.IsMethod && !c.Parameters.empty()) thisShape = &c;
             if (staticSet != functionTable.end() && thisShape != nullptr)
             {
                 std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> mixed;
@@ -4441,7 +4736,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         && c.Recipe.paramSlots[i].kind == AbiSlot::ByVal;
                     const bool indirectValueParam = c.IsCxx && c.CxxAbi.valid
                         && i < c.CxxAbi.params.size()
-                        && c.CxxAbi.params[i].kind == cflat_cinterop::RawAbiSlot::Indirect;
+                        && c.CxxAbi.params[i].kind
+                            == cflat_cinterop::RawAbiSlot::Indirect;
                     std::string note = DescribeCxxImplicitArgumentBlock(
                         arguments[i], *pi, byValueParam || indirectValueParam);
                     if (note.empty()) continue;
@@ -4780,22 +5076,29 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         }
         for (size_t i = 0; i < matched.size() && i < candidate.Parameters.size(); ++i)
         {
+            const auto& param = candidate.Parameters[i];
+            const size_t sourceTemplate = matched[i].TypeAndValue.TypeName.find('$');
+            const size_t targetTemplate = param.TypeName.find('$');
+            const bool bothTemplateSpecializations = sourceTemplate != std::string::npos
+                && targetTemplate != std::string::npos;
             const bool cxxByValueParam = candidate.IsCxx
-                && i < candidate.Recipe.paramSlots.size()
-                && candidate.Recipe.paramSlots[i].kind == AbiSlot::ByVal;
+                && ((i < candidate.Recipe.paramSlots.size()
+                     && candidate.Recipe.paramSlots[i].kind == AbiSlot::ByVal)
+                    || (candidates.size() > 1 && bothTemplateSpecializations && !param.Pointer
+                        && !param.IsAlias && !param.IsRvalueRef && IsCxxRecord(param.TypeName)));
             const bool cxxIndirectValueParam = candidate.IsCxx
                 && candidate.CxxAbi.valid
                 && i < candidate.CxxAbi.params.size()
-                && candidate.CxxAbi.params[i].kind == cflat_cinterop::RawAbiSlot::Indirect;
+                && candidate.CxxAbi.params[i].kind
+                    == cflat_cinterop::RawAbiSlot::Indirect;
             if (candidate.IsCxx && candidate.IsMethod && i == 0) continue;  // receiver: no UDC
-            const auto& param = candidate.Parameters[i];
             const auto& arg = matched[i];
             if (param.Pointer && !param.IsAlias && !param.IsCxxRefToPointer && !param.IsCxxConstRef
                 && !param.IsRvalueRef && !arg.TypeAndValue.Pointer
                 && IsCxxRecord(param.TypeName) && IsCxxRecord(arg.TypeAndValue.TypeName))
                 continue;
             if (!CanImplicitlyConstructCxxClass(matched[i], candidate.Parameters[i],
-                                                cxxByValueParam || cxxIndirectValueParam))
+                cxxByValueParam || cxxIndirectValueParam, candidates.size() > 1))
             {
                 // Conversion-OPERATOR direction, selected by the same rank above.
                 if (!matched[i].TypeAndValue.Pointer
@@ -4806,7 +5109,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                     { diagnosticFunctionName });
                 continue;
             }
-            if (!MaterializeImplicitCxxClassArgument(matched[i], candidate.Parameters[i]))
+            if (!MaterializeImplicitCxxClassArgument(matched[i], candidate.Parameters[i], nullptr,
+                                                      candidates.size() > 1))
                 LogErrorMessage("cannot materialize implicit C++ class argument for '{}'",
                                 { diagnosticFunctionName });
         }
@@ -5077,7 +5381,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 argList.push_back(temporary);
             }
             else if (!inVariadicRange && candidate.IsCxx
-                     && (arg.TypeAndValue.Pointer || arg.IsStringLiteral)
+                     && (arg.TypeAndValue.Pointer || arg.IsStringLiteral
+                         || (!arg.TypeAndValue.IsArrayView
+                             && (arg.TypeAndValue.ConstArraySize > 0
+                                 || llvm::isa_and_nonnull<llvm::ArrayType>(arg.BaseType))))
                      && candParamItr->TypeName == "bool" && !candParamItr->Pointer
                      && !candParamItr->IsAlias && !candParamItr->IsRvalueRef)
             {
@@ -5959,8 +6266,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         argList[i] = EmitCxxBaseAdjust(argList[i], off);
                 }
                 else if (!at.Pointer && pt.IsAlias && pt.Pointer && !pt.ElemPointer
-                         && IsCxxDerivedToBaseValue(at, pt)
-                         && FindCxxBaseOffset(at.TypeName, pt.TypeName, off, inaccessible))
+                         && IsCxxDerivedToBaseValue(at, pt, nullptr)
+                         && LowerCxxValueBaseOffset(at.TypeName, pt.TypeName, off, matched[i]))
                 {
                     argList[i] = EmitCxxBaseAdjust(argList[i], off);
                 }

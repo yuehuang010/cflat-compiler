@@ -3449,3 +3449,15 @@ analysis); `std.move(x)` is the C++ operation with C++ semantics. Both stay.
 Companion ruling (2026-10-01 18:25, issue p2/cflat-move-of-cpp-class-mimics-std-move): CFlat
 `D b = move a;` on a C++ class mimics `D b = std::move(a);` - same special member clang selects,
 refused when deleted, const -> copy.
+
+## Ruling 2026-10-02: lazy C++ bodies keep point-of-definition lookup by recovery parse (option b, landed with T3b)
+
+LazyBodies (CxxIncrementalGroup) replays deferred inline bodies after the whole header, so a non-dependent call
+could bind an overload declared AFTER the body's `{` (libc++ `__libcpp_wcschr` recursed into the later C++
+`wcschr` overload). Rejected: (a) a per-body lookup view (too invasive), and rebinding calls in emitted IR (broke
+template ADL and hidden friends). Ruled (b): detect the taint at replay, re-parse the group ONCE with every body in
+place (exempt from the reparse budget - only that parse), persist the tainted keys in the import cache keyed by
+header content so later compiles parse just those bodies in place on their first parse; warm = 0 parses.
+Detector rules that matter: member bodies are measured from the outermost class `}`; builtins / implicit decls
+and declarations inside the body itself never count; a callee's position is its earliest redeclaration
+(primary template / member pattern); a later using-declaration counts.

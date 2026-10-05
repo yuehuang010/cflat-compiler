@@ -1,0 +1,37 @@
+// GUARDS: binary_semaphore, barrier arrive_and_wait, stop_source/stop_callback, and stop-aware condition_variable_any wait
+// FROM: internal/plan/std-library-tier2-suite.md (C++20 synchronization coverage)
+import cpp {"barrier", "condition_variable", "functional", "mutex", "semaphore", "stop_token"};
+int completion_count = 0;
+extern int main()
+{
+    int failures = 0;
+    std.binary_semaphore sem = std.binary_semaphore(1);
+    sem.acquire(); bool first = true;
+    bool second = sem.try_acquire();
+    sem.release();
+    sem.acquire(); bool third = true;
+    if (!first || second || !third) { printf("FAIL binary_semaphore\n"); failures |= 1; }
+    sem.release();
+
+    completion_count = 0;
+    std.barrier<> gate = std.barrier<>(1);
+    gate.arrive_and_wait();
+
+    std.stop_source source = default;
+    std.stop_token token = source.get_token();
+    function<void()> on_stop = () => { completion_count += 10; };
+    std.stop_callback<std.function<void()>> callback = std.stop_callback<std.function<void()>>(token, std.function<void()>(on_stop));
+    bool requested = source.request_stop();
+    if (!requested || !token.stop_requested() || completion_count != 10) { printf("FAIL stop callback\n"); failures |= 4; }
+
+    std.stop_source stopped = default;
+    stopped.request_stop();
+    std.condition_variable_any cv = default;
+    std.mutex mutex = default;
+    std.unique_lock<std.mutex> lk = std.unique_lock<std.mutex>(mutex);
+    function<bool()> never_ready = () => { return false; };
+    bool wait_result = cv.wait(lk, stopped.get_token(), std.function<bool()>(never_ready));
+    if (wait_result || !stopped.stop_requested()) { printf("FAIL stop-aware condition wait\n"); failures |= 8; }
+    if (failures == 0) printf("PASS std_full_20_sync_primitives\n");
+    return failures;
+}

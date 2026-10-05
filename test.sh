@@ -749,6 +749,43 @@ if [ "$RUN_MODE" -eq 0 ]; then
       cc_fail="(9) program b replayed program a's poisoned body verdict from a shared entry"
     fi
   fi
+  # (10) Two programs with different function demand sets share one cache. Their values must
+  # match clang++ on cold and warm compiles.
+  if [ -z "$cc_fail" ]; then
+    mkdir -p "$cc_dir/dup/cache"
+    [ -d "$cc_dir/cache/runtime" ] && cp -R "$cc_dir/cache/runtime" "$cc_dir/dup/cache/"
+    printf '%s\n' '#pragma once' 'namespace cctwoprog {' \
+      'int f() { return 40; }' 'int g() { return 2; }' '}' >"$cc_dir/dup/shared.h"
+    printf '%s\n' 'import cpp "shared.h";' 'extern int main() {' \
+      '    printf("%d\n", cctwoprog.f() + 1);' '    return 0;' '}' >"$cc_dir/dup/a.cb"
+    printf '%s\n' 'import cpp "shared.h";' 'extern int main() {' \
+      '    printf("%d\n", cctwoprog.f() + cctwoprog.g());' '    return 0;' '}' >"$cc_dir/dup/b.cb"
+    printf '%s\n' '#include <cstdio>' 'namespace cctwoprog {' \
+      'int f() { return 40; }' 'int g() { return 2; }' '}' \
+      'int a_value() { return cctwoprog::f() + 1; }' \
+      'int b_value() { return cctwoprog::f() + cctwoprog::g(); }' \
+      'int main() { std::printf("%d\n%d\n", a_value(), b_value()); }' >"$cc_dir/dup/twin.cpp"
+    cc_dup_run() {
+      CFLAT_CACHE_DIR="$cc_dir/dup/cache" $TIMEOUT "$CFLAT" "$cc_dir/dup/$1.cb" -i "$cc_dir/dup" -B -v \
+        -o "$cc_dir/dup/$1.bin" >"$cc_dir/dup/$1.compile.log" 2>&1 || return 1
+      "$cc_dir/dup/$1.bin" >"$cc_dir/dup/$1.out" || return 1
+    }
+    if ! clang++ -std=c++20 "$cc_dir/dup/twin.cpp" -o "$cc_dir/dup/twin" \
+        >"$cc_dir/dup/twin.compile.log" 2>&1 || ! "$cc_dir/dup/twin" >"$cc_dir/dup/twin.out"; then
+      cc_fail="(10) clang++ twin did not compile or run"
+    elif ! head -n 1 "$cc_dir/dup/twin.out" >"$cc_dir/dup/a.expected" \
+        || ! tail -n 1 "$cc_dir/dup/twin.out" >"$cc_dir/dup/b.expected"; then
+      cc_fail="(10) could not read clang++ twin values"
+    elif ! cc_dup_run a || ! cc_dup_run b || ! cc_dup_run a || ! cc_dup_run b; then
+      cc_fail="(10) shared-cache A/B/A/B compile or execution failed"
+    elif ! grep -q "C++ demand companion cache hit" "$cc_dir/dup/a.compile.log" \
+        || ! grep -q "C++ demand companion cache hit" "$cc_dir/dup/b.compile.log"; then
+      cc_fail="(10) repeated A/B compiles did not hit their cached companions"
+    elif ! cmp -s "$cc_dir/dup/a.out" "$cc_dir/dup/a.expected" \
+        || ! cmp -s "$cc_dir/dup/b.out" "$cc_dir/dup/b.expected"; then
+      cc_fail="(10) CFlat results did not match the clang++ twin values"
+    fi
+  fi
   cat "$cc_dir"/*.log >"$cc_log" 2>/dev/null
   if [ -z "$cc_fail" ]; then
     write_result "$cc_name" "PASS" "$cc_t0"

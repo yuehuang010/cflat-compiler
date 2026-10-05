@@ -2765,10 +2765,27 @@ static bool ContainsIdentifiedStruct(const llvm::Type* type)
  * "mapping to a source type", e.g. on `std::piecewise_construct`). The declaration is replaced
  * by the definition the link brings over, so a neutral placeholder type changes nothing else.
  */
-static void DeclareLinkOnceDefinitions(llvm::Module& destination, const llvm::Module& source)
+static void DeclareDuplicateDefinitions(llvm::Module& destination, llvm::Module& source,
+                                       bool dropExistingDefinitions,
+                                       llvm::StringSet<>* functionDefinitions,
+                                       llvm::StringSet<>* globalDefinitions)
 {
     auto& context = destination.getContext();
-    for (const llvm::Function& f : source.functions())
+    for (llvm::Function& f : source.functions())
+    {
+        // A cached blob repeats a stored header body; fresh blobs can be separate TUs.
+        // Keep duplicate strong definitions from fresh-only TUs as ODR errors.
+        if (!f.isDeclaration() && !f.hasLocalLinkage())
+        {
+            if (functionDefinitions != nullptr)
+            {
+                // Only strong definitions conflict; linkonce/weak copies merge in the linker.
+                if (dropExistingDefinitions && f.hasExternalLinkage()
+                    && functionDefinitions->contains(f.getName()))
+                    f.deleteBody();
+                functionDefinitions->insert(f.getName());
+            }
+        }
         if (!f.isDeclaration() && f.hasLinkOnceLinkage()
             && destination.getNamedValue(f.getName()) == nullptr)
             llvm::Function::Create(ContainsIdentifiedStruct(f.getFunctionType())
@@ -2776,7 +2793,19 @@ static void DeclareLinkOnceDefinitions(llvm::Module& destination, const llvm::Mo
                                        : f.getFunctionType(),
                                    llvm::GlobalValue::ExternalLinkage, f.getAddressSpace(),
                                    f.getName(), &destination);
-    for (const llvm::GlobalVariable& gv : source.globals())
+    }
+    for (llvm::GlobalVariable& gv : source.globals())
+    {
+        if (!gv.isDeclaration() && !gv.hasLocalLinkage() && !gv.hasAppendingLinkage())
+        {
+            if (globalDefinitions != nullptr)
+            {
+                if (dropExistingDefinitions && gv.hasExternalLinkage()
+                    && globalDefinitions->contains(gv.getName()))
+                    gv.setInitializer(nullptr);
+                globalDefinitions->insert(gv.getName());
+            }
+        }
         if (!gv.isDeclaration() && gv.hasLinkOnceLinkage()
             && destination.getNamedValue(gv.getName()) == nullptr)
             new llvm::GlobalVariable(destination,
@@ -2785,6 +2814,7 @@ static void DeclareLinkOnceDefinitions(llvm::Module& destination, const llvm::Mo
                                      gv.isConstant(), llvm::GlobalValue::ExternalLinkage, nullptr,
                                      gv.getName(), nullptr, gv.getThreadLocalMode(),
                                      gv.getAddressSpace());
+    }
 }
 
 static size_t CountDefinitions(const llvm::Module& m)
@@ -3027,14 +3057,56 @@ bool LLVMBackend::EmitCxxDemandCompanions()
         cflat_cinterop::CxxDemandStats stats;
         // Generated in this context: the link takes the module as is, the bitcode is for the cache.
         std::unique_ptr<llvm::Module> companionModule;
+        /*
+         * Lookup taint: a body replayed after the whole header bound a later declaration.
+         * Demand checks earlier in this compile leave theirs pending; the companion's own
+         * replays report theirs on a failed emit. Either way the group is re-parsed once, in
+         * place (RecoverCxxLookupTaint), and the companion is generated from that parse.
+         */
+        auto recoverLookupTaint = [&](std::vector<std::string> tainted) {
+            if (auto pending = cxxDemandGroups_.find(key); pending != cxxDemandGroups_.end())
+                for (const auto& bodyKey : pending->second.pendingLookupTaintBodyKeys)
+                    if (std::find(tainted.begin(), tainted.end(), bodyKey) == tainted.end())
+                        tainted.push_back(bodyKey);
+            if (tainted.empty()) return true;
+            std::string recoveryError;
+            if (RecoverCxxLookupTaint(key, tainted, group, recoveryError))
+            {
+                live = true;
+                return true;
+            }
+            LogErrorMessage("{}: the C++ definitions this program uses could not be "
+                            "generated: {}", { "import cpp", recoveryError });
+            return false;
+        };
+        if (!recoverLookupTaint(group->TakeLookupTaintedBodyKeys())) return false;
         // Nothing recorded: the empty companion is still cached so a warm run finds it.
         if (group->DemandChunks() > 0
             && !group->EmitDemandCompanion(demand, bitcode, stats, error, context.get(),
                                            &companionModule))
         {
-            LogErrorMessage("{}: the C++ definitions this program uses could not be "
-                            "generated: {}", { "import cpp", error });
-            return false;
+            std::vector<std::string> tainted = group->TakeLookupTaintedBodyKeys();
+            if (tainted.empty())
+            {
+                LogErrorMessage("{}: the C++ definitions this program uses could not be "
+                                "generated: {}", { "import cpp", error });
+                return false;
+            }
+            if (!recoverLookupTaint(std::move(tainted))) return false;
+            bitcode.clear();
+            error.clear();
+            companionModule.reset();
+            stats = cflat_cinterop::CxxDemandStats();
+            if (group->DemandChunks() > 0
+                && !group->EmitDemandCompanion(demand, bitcode, stats, error, context.get(),
+                                               &companionModule))
+            {
+                // In place, nothing is replayed, so no key can remain: a real body failure.
+                group->TakeLookupTaintedBodyKeys();
+                LogErrorMessage("{}: the C++ definitions this program uses could not be "
+                                "generated: {}", { "import cpp", error });
+                return false;
+            }
         }
         if (verbose)
             std::cout << std::format("[verbose] C++ demand companion: {} of {} program "
@@ -3132,6 +3204,18 @@ bool LLVMBackend::LinkCxxCompanionModules()
     auto companions = std::make_unique<llvm::Module>("cflat_cxx_companions", *context);
     companions->setTargetTriple(module->getTargetTriple());
     companions->setDataLayout(module->getDataLayout());
+    llvm::StringSet<> companionFunctionDefinitions;
+    llvm::StringSet<> companionGlobalDefinitions;
+    bool companionDefinitionsIndexed = false;
+    bool adoptedCachedCompanion = false;
+    auto rememberDefinitions = [&](const llvm::Module& source) {
+        for (const llvm::Function& f : source.functions())
+            if (!f.isDeclaration() && !f.hasLocalLinkage())
+                companionFunctionDefinitions.insert(f.getName());
+        for (const llvm::GlobalVariable& gv : source.globals())
+            if (!gv.isDeclaration() && !gv.hasLocalLinkage() && !gv.hasAppendingLinkage())
+                companionGlobalDefinitions.insert(gv.getName());
+    };
     size_t blobCount = 0;
     auto mergeAdoptedBlobs = [&]() -> bool {
         std::vector<CxxCompanionBlob> blobs;
@@ -3141,6 +3225,7 @@ bool LLVMBackend::LinkCxxCompanionModules()
         {
             const std::string& blob = adopted.bitcode;
             std::unique_ptr<llvm::Module> companion = std::move(adopted.module);
+            const bool cachedCompanion = companion == nullptr;
             if (companion == nullptr)
             {
                 llvm::MemoryBufferRef buffer(blob, "cflat_cxx_companion");
@@ -3213,9 +3298,23 @@ bool LLVMBackend::LinkCxxCompanionModules()
                 companion->setTargetTriple(companions->getTargetTriple());
                 companion->setDataLayout(companions->getDataLayout());
                 companions = std::move(companion);
+                if (cachedCompanion)
+                {
+                    adoptedCachedCompanion = true;
+                    companionDefinitionsIndexed = true;
+                    rememberDefinitions(*companions);
+                }
                 continue;
             }
-            DeclareLinkOnceDefinitions(*companions, *companion);
+            if (cachedCompanion) adoptedCachedCompanion = true;
+            if (adoptedCachedCompanion && !companionDefinitionsIndexed)
+            {
+                rememberDefinitions(*companions);
+                companionDefinitionsIndexed = true;
+            }
+            DeclareDuplicateDefinitions(*companions, *companion, cachedCompanion,
+                                        companionDefinitionsIndexed ? &companionFunctionDefinitions : nullptr,
+                                        companionDefinitionsIndexed ? &companionGlobalDefinitions : nullptr);
             if (llvm::Linker::linkModules(*companions, std::move(companion), llvm::Linker::Flags::None))
             {
                 LogErrorMessage("{}: the C++ definitions emitted for an imported header could not be "
@@ -3236,11 +3335,23 @@ bool LLVMBackend::LinkCxxCompanionModules()
     // companions contributed. What the link below adds on top is companion-origin, and only
     // those get the internalize treatment (see the loop after the link).
     std::unordered_set<std::string> programOrigin;
+    llvm::StringSet<> programFunctionDefinitions;
+    llvm::StringSet<> programGlobalDefinitions;
     for (const llvm::GlobalValue& gv : module->global_values())
-        if (!gv.isDeclaration() && gv.hasName()) programOrigin.insert(gv.getName().str());
+        if (!gv.isDeclaration() && gv.hasName())
+        {
+            programOrigin.insert(gv.getName().str());
+            if (adoptedCachedCompanion && llvm::isa<llvm::Function>(gv))
+                programFunctionDefinitions.insert(gv.getName());
+            else if (adoptedCachedCompanion && llvm::isa<llvm::GlobalVariable>(gv))
+                programGlobalDefinitions.insert(gv.getName());
+        }
 
     const size_t companionDefinitions = CountDefinitions(*companions);
     const size_t programDefinitionsBefore = CountDefinitions(*module);
+    if (adoptedCachedCompanion)
+        DeclareDuplicateDefinitions(*module, *companions, true,
+                                    &programFunctionDefinitions, &programGlobalDefinitions);
     if (llvm::Linker::linkModules(*module, std::move(companions),
                                   llvm::Linker::Flags::LinkOnlyNeeded))
     {
@@ -3270,6 +3381,9 @@ bool LLVMBackend::LinkCxxCompanionModules()
         // Harvest and program functions share the same CPU/features baseline. Keep any extra
         // target features declared on an individual companion function so LLVM respects its ISA
         // requirements and only inlines it into callers that support them.
+        // A body clang already marked optnone (source pragma) stays untouched by every level.
+        if (function.hasFnAttribute(llvm::Attribute::OptimizeNone))
+            function.addFnAttr(kCflatSourceOptNoneAttr);
         if (cOptLevel_ == 0 && !function.hasFnAttribute(llvm::Attribute::AlwaysInline))
         {
             function.addFnAttr(llvm::Attribute::OptimizeNone);

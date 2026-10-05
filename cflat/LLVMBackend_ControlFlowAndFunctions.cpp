@@ -483,6 +483,8 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
             fp.IsReturnInferredSink = p.IsReturnInferredSink;
             fp.IsWriteInferredSink = p.IsWriteInferredSink;
             fp.PointerDepth = p.ValuePointerDepth();
+            fp.IsPointeeConst = p.IsSpelledPointeeConst
+                || (chosen->IsCxx && p.IsCxxPointeeConst);
             tv.FuncPtrParams.push_back(fp);
         }
         return tv;
@@ -1612,6 +1614,11 @@ bool LLVMBackend::BuildAbiRecipeFromClangPlan(const std::string& functionName,
             case RS::Ignore:
                 if (!isReturn) { slot.kind = AbiSlot::Ignore; return true; }
                 if (!tv.Pointer && tv.TypeName == "void") { slot.kind = AbiSlot::Direct; return true; }
+                if (!tv.Pointer && IsCxxRecord(tv.TypeName))
+                {
+                    slot.kind = AbiSlot::Ignore;
+                    return true;
+                }
                 return refuse("an ignored non-void result");
 
             case RS::Direct:

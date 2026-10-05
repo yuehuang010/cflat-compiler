@@ -1,0 +1,13 @@
+// GUARDS: inspect shared C++20 __cpp_lib_* feature test macros
+// FROM: internal/plan/std-library-tier2-suite.md (C++20 feature macro coverage)
+import cpp {"version", "coroutine", "source_location", "ranges", "format"};
+extern int main()
+{
+    int failures = 0;
+    if (__cpp_lib_coroutine <= 0) { printf("FAIL coroutine macro\n"); failures |= 1; }
+    if (__cpp_lib_source_location <= 0) { printf("FAIL source_location macro\n"); failures |= 2; }
+    if (__cpp_lib_ranges <= 0) { printf("FAIL ranges macro\n"); failures |= 4; }
+    if (__cpp_lib_format <= 0) { printf("FAIL format macro\n"); failures |= 8; }
+    if (failures == 0) printf("PASS std_full_20_906_feature_test_macros\n");
+    return failures;
+}

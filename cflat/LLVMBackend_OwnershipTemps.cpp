@@ -4395,6 +4395,42 @@ void LLVMBackend::RegisterOwnedStructTemp(llvm::Value* alloca, const std::string
         pendingOwnedStructTemps.push_back({ alloca, typeName, builder->GetInsertBlock() });
     }
 
+void LLVMBackend::RegisterOwnedBraceListTemp(llvm::Value* array, const std::string& typeName,
+                                             uint64_t count)
+{
+        if (array == nullptr || typeName.empty() || count == 0) return;
+        pendingOwnedStructTemps.push_back({ array, typeName, builder->GetInsertBlock(), nullptr, count });
+    }
+
+// Brace lists die in reverse creation order: permute them among their own ledger slots only.
+template <class Temp>
+static void ReverseBraceListTemps(std::vector<Temp>& temps, size_t from)
+{
+        std::vector<size_t> slots;
+        for (size_t i = from; i < temps.size(); ++i)
+            if (temps[i].ArrayCount != 0) slots.push_back(i);
+        for (size_t a = 0, b = slots.size(); a + 1 < b; ++a, --b)
+            std::swap(temps[slots[a]], temps[slots[b - 1]]);
+    }
+
+std::vector<LLVMBackend::PendingOwnedStructTemp> LLVMBackend::HoistBraceListTempsSince(
+    const OwnedTempMark& mark, llvm::BasicBlock* hoistTo)
+{
+        std::vector<PendingOwnedStructTemp> hoisted;
+        for (size_t i = mark.Structs; i < pendingOwnedStructTemps.size(); )
+        {
+            auto& t = pendingOwnedStructTemps[i];
+            if (t.ArrayCount != 0 && HoistOwnedStructTempTo(t, hoistTo))
+            {
+                hoisted.push_back(t);
+                pendingOwnedStructTemps.erase(pendingOwnedStructTemps.begin() + static_cast<long>(i));
+                continue;
+            }
+            ++i;
+        }
+        return hoisted;
+    }
+
 void LLVMBackend::RegisterAliasReturnTempSlot(llvm::Value* result, llvm::Value* slot,
                                                std::vector<llvm::Value*> ancestors, const std::string& callee)
 {
@@ -4510,6 +4546,7 @@ void LLVMBackend::FlushOwnedStructTemps()
 
         auto temps = std::move(pendingOwnedStructTemps);
         pendingOwnedStructTemps.clear();
+        ReverseBraceListTemps(temps, 0);
         // ONE pass in ledger order. A guarded free opens blocks, so the insert block is re-read
         // per temp and the dominator tree is dropped after one - batching the guarded temps last
         // instead would silently reverse two temps' destruction order within a statement.
@@ -4738,9 +4775,21 @@ void LLVMBackend::EmitOwnedStructTempFree(const PendingOwnedStructTemp& temp)
 {
         auto* dtor = GetOrCreateFullDestructor(temp.TypeName);
         if (dtor == nullptr || temp.Alloca == nullptr) return;
+        auto destroy = [&] {
+            auto* array = temp.ArrayCount != 0 ? llvm::dyn_cast<llvm::AllocaInst>(temp.Alloca) : nullptr;
+            if (array == nullptr)
+            {
+                builder->CreateCall(dtor->getFunctionType(), dtor, { temp.Alloca });
+                return;
+            }
+            for (uint64_t k = temp.ArrayCount; k-- > 0;)
+                builder->CreateCall(dtor->getFunctionType(), dtor, { builder->CreateInBoundsGEP(
+                    array->getAllocatedType(), array, { builder->getInt64(0), builder->getInt64(k) },
+                    "brace.list.element") });
+        };
         if (temp.LiveFlag == nullptr)
         {
-            builder->CreateCall(dtor->getFunctionType(), dtor, { temp.Alloca });
+            destroy();
             return;
         }
         // A hoisted temp is destructed here on EVERY path, so the flag is what says the arm
@@ -4751,7 +4800,7 @@ void LLVMBackend::EmitOwnedStructTempFree(const PendingOwnedStructTemp& temp)
         auto* flag    = builder->CreateLoad(builder->getInt1Ty(), temp.LiveFlag);
         builder->CreateCondBr(flag, liveBB, afterBB);
         builder->SetInsertPoint(liveBB);
-        builder->CreateCall(dtor->getFunctionType(), dtor, { temp.Alloca });
+        destroy();
         builder->CreateBr(afterBB);
         builder->SetInsertPoint(afterBB);
     }
@@ -4891,6 +4940,7 @@ void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* k
                 if (!OwnedTempDominatesHere(bb, curBlock, domTree)) continue;
                 EmitOwnedClosureTempFree(value);
             }
+            ReverseBraceListTemps(pendingOwnedStructTemps, mark.Structs);
             // Ledger order, guarded and unguarded alike. A guarded free opens blocks, so the
             // insert block is re-read per temp and the cached tree dropped after one; batching
             // the guarded ones last instead would reverse two temps' destruction order.

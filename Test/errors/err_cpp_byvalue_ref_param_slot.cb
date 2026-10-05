@@ -1,0 +1,9 @@
+// The nontrivial by-value slot must not make the following reference a value parameter.
+import cpp "t20_ref_param_slots.hpp";
+extern int main()
+{
+    t20slot.H h = default;
+    expect_error("a user-defined conversion cannot bind to the non-const reference parameter");
+    h.refafter(t20slot.Big(1), 5);
+    return 0;
+}

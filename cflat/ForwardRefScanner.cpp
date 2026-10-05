@@ -296,7 +296,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     }
                     declType.TypeName = mangledName;
                 }
-                else if (auto* fit = compiler->FindFunctionTypeAlias(typeSpec->getText());
+                else if (auto* fit = compiler->FindOrRequestFunctionTypeAlias(typeSpec->getText());
                          fit != nullptr)
                 {
                     // Function-type alias (using Cb = function<R(Args)> | Lambda<R(Args)>): expand
@@ -545,6 +545,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                 hasConstQualifier = true;
         if (hasConstQualifier && declType.Pointer && compiler->IsCxxRecord(declType.TypeName))
             declType.IsCxxPointeeConst = true;
+        declType.IsSpelledPointeeConst = hasConstQualifier && declType.Pointer;
         return declType;
     }
 

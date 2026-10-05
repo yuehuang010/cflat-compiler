@@ -129,6 +129,41 @@ struct LRef {
 inline int by_ref_free(Cnt& c) { c.v += 100; return c.v; }
 struct Mem { int bump(Cnt& c) { c.v += 1000; return c.v; } };
 
+struct PtrRankCtorConst {
+    int chosen;
+    int seen;
+    PtrRankCtorConst(const int* p, int) : chosen(1), seen(p[1]) {}
+    PtrRankCtorConst(const int& v, int) : chosen(2), seen(v) {}
+};
+struct PtrRankCtorMutable {
+    int chosen;
+    int seen;
+    PtrRankCtorMutable(int* p, int) : chosen(1), seen(p[1]) {}
+    PtrRankCtorMutable(const int& v, int) : chosen(2), seen(v) {}
+};
+struct PtrRankCtorOnly {
+    int chosen;
+    int seen;
+    PtrRankCtorOnly(const int& v, int) : chosen(3), seen(v) {}
+};
+struct PtrRankRecord { int v; };
+struct PtrRankRecordCtor {
+    int chosen;
+    int seen;
+    PtrRankRecordCtor(const PtrRankRecord* p, int) : chosen(1), seen(p->v) {}
+    PtrRankRecordCtor(const PtrRankRecord& v, int) : chosen(2), seen(v.v) {}
+};
+inline int ptr_rank_free(const int* p) { return p[1] + 100; }
+inline int ptr_rank_free(const int& v) { return v + 200; }
+struct PtrRankMember {
+    int pick(const int* p) const { return p[1] + 300; }
+    int pick(const int& v) const { return v + 400; }
+};
+struct PtrRankOperator {
+    int operator()(const int* p) const { return p[1] + 500; }
+    int operator()(const int& v) const { return v + 600; }
+};
+
 inline Cnt make_cnt(int v) { Cnt c; c.v = v; return c; }
 inline int make_int(int v) { return v; }
 inline int* make_ptr(int* p) { return p; }
@@ -696,4 +731,31 @@ struct ExprIntRvalue { int chosen; int value;
     ExprIntRvalue(int&& x) : chosen(1), value(x) {}
     ExprIntRvalue(const long& x) : chosen(2), value((int)x) {}
 };
+struct PtrRefS { int v; };
+struct PtrRefT { long v; };
+struct PtrRefBase { int v; };
+struct PtrRefDerived : PtrRefBase { int extra; };
+struct PtrRefOther { int v; };
+inline int ptrref_two(int& x) { return x + 10; }
+inline int ptrref_two(double& x) { return (int)x + 20; }
+inline int ptrref_intlong(int& x) { return x + 30; }
+inline int ptrref_intlong(long& x) { return (int)x + 40; }
+inline int ptrref_const(const int& x) { return x + 60; }
+inline int ptrref_const(double& x) { return (int)x + 70; }
+inline int ptrref_struct(PtrRefS& x) { return x.v + 80; }
+inline int ptrref_struct(PtrRefT& x) { return (int)x.v + 90; }
+inline int ptrref_double(double& x) { return (int)x + 50; }
+inline int ptrref_base(PtrRefBase& x) { return x.v + 100; }
+inline int ptrref_base(PtrRefOther& x) { return x.v + 110; }
+inline int ptrref_mismatch(double& x) { return (int)x + 51; }
+inline int ptrref_mismatch(long& x) { return (int)x + 52; }
+struct PtrRefCtor { int which; int seen;
+    PtrRefCtor(int& x) : which(1), seen(x) {}
+    PtrRefCtor(double& x) : which(2), seen((int)x) {}
+};
+struct PtrRefStr { int seen; PtrRefStr(const char* p) : seen((unsigned char)p[0]) {} };
+inline int ptrref_str(const PtrRefStr& x) { return x.seen; }
+inline int ptrref_cbool(const bool& x) { return x ? 1 : 3; }
+inline int ptrref_cbool(int& x) { return 2; }
+
 }

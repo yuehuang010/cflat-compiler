@@ -1745,7 +1745,34 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             if (abiReturnsValue)
                 returnTy = compiler->currentFunctionAbiRecipe.retSlot.structTy;
             auto* stringTy = llvm::StructType::getTypeByName(*compiler->context, "string");
+            const bool cxxClassReturn = compiler->IsCxxRecord(
+                compiler->currentFunctionReturnTV.TypeName);
+            if (cxxClassReturn && returnTy->isStructTy()
+                && !right->getType()->isStructTy() && !right->getType()->isPointerTy()
+                && compiler->IsCxxTriviallyCopyableRecord(
+                    compiler->currentFunctionReturnTV.TypeName))
+            {
+                const std::string targetType = compiler->currentFunctionReturnTV.TypeName;
+                auto* convertedSlot = compiler->CreateAlloca(returnTy);
+                auto convertedSource = returnNV;
+                std::string refusal;
+                compiler->SetCurrentDebugLocation(errCtx->getStart()->getLine());
+                const auto verdict = compiler->ConvertThroughCxxConvertingCtor(
+                    convertedSource, targetType, convertedSlot, refusal);
+                if (verdict == LLVMBackend::CxxConvertingCtorResult::Converted)
+                {
+                    right = compiler->builder->CreateLoad(returnTy, convertedSlot);
+                    returnNV.TypeAndValue = compiler->currentFunctionReturnTV;
+                    returnNV.Primary = right;
+                    returnNV.Storage = convertedSlot;
+                }
+                else if (verdict == LLVMBackend::CxxConvertingCtorResult::Refused)
+                    LogErrorContext(errCtx, std::format(
+                        "cannot return C++ class '{}' from this expression; {}",
+                        compiler->DisplayCxxClassName(targetType), refusal));
+            }
             bool aggregateFromScalar = returnTy->isStructTy() && returnTy != stringTy
+                && !cxxClassReturn
                 && !right->getType()->isStructTy() && !right->getType()->isPointerTy();
             bool scalarFromPointer = returnTy->isIntegerTy() && right->getType()->isPointerTy();
             if (aggregateFromScalar || scalarFromPointer)
@@ -3276,12 +3303,18 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         compiler->EnsureCxxMemberProjected(collTypeName, "begin");
                         compiler->EnsureCxxMemberProjected(collTypeName, "end");
                     }
+                    // A STATIC begin/end (empty_view's) is still `__range.begin()` in C++.
+                    auto isStaticOnly = [&](const char* name) {
+                        return cxxRangeCandidate
+                            && compiler->IsCxxStaticMethod(collTypeName, name, /*staticOnly*/ true);
+                    };
                     auto hasMethod = [&](const char* name) {
                         const auto* info = compiler->GetCxxClassInfo(collTypeName);
                         return info != nullptr
-                            && std::find(info->instanceMethodNames.begin(),
-                                         info->instanceMethodNames.end(), name)
-                                   != info->instanceMethodNames.end();
+                            && (std::find(info->instanceMethodNames.begin(),
+                                          info->instanceMethodNames.end(), name)
+                                    != info->instanceMethodNames.end()
+                                || (std::string_view(name) != "count" && isStaticOnly(name)));
                     };
                     // A member whose return type is not registered yet (a view's nested
                     // iterator) is requested the way a written `r.begin()` call requests it.
@@ -3486,6 +3519,9 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                             }
                             auto* result = freeRange
                                 ? compiler->CreateOverloadedFunctionCall(freeName, { makeReceiver() }, true)
+                                : isStaticOnly(method)
+                                ? compiler->CreateOverloadedFunctionCall(
+                                      collNV.TypeAndValue.TypeName + "." + method, {}, true)
                                 : compiler->CreateOverloadedFunctionCall(
                                       method, { makeReceiver() }, false, {}, collNV.TypeAndValue.TypeName);
                             auto resultType = compiler->lastCallReturnType;

@@ -547,6 +547,294 @@ namespace cflat_cinterop
             return s;
         }
 
+        /*
+         * A generated wrapper's arithmetic parameter that clang CONVERTS into a temporary bound
+         * to a `const S&` parameter of the callee it selected: that temporary lives in the
+         * wrapper frame, so a result keeping the reference dangles once the wrapper returns.
+         * Returns S per wrapper parameter ("" where none); empty when no parameter is converted.
+         */
+        std::vector<std::string> WrapperConvertedTemporaryTypes(const ASTContext& ctx,
+                                                                const FunctionDecl* fd)
+        {
+            std::vector<std::string> out;
+            const Stmt* body = fd != nullptr ? fd->getBody() : nullptr;
+            if (body == nullptr) return out;
+            auto visit = [&](auto&& self, const Stmt* s) -> void {
+                if (s == nullptr) return;
+                if (const auto* temp = llvm::dyn_cast<MaterializeTemporaryExpr>(s);
+                    temp != nullptr && temp->isBoundToLvalueReference()
+                    && temp->getType()->isArithmeticType() && !temp->getType()->isEnumeralType())
+                {
+                    const Expr* e = temp->getSubExpr();
+                    bool converted = false;
+                    while (e != nullptr)
+                    {
+                        e = e->IgnoreParens();
+                        const auto* cast = llvm::dyn_cast<CastExpr>(e);
+                        if (cast == nullptr) break;
+                        const CastKind kind = cast->getCastKind();
+                        if (kind == CK_IntegralCast || kind == CK_IntegralToFloating
+                            || kind == CK_FloatingToIntegral || kind == CK_FloatingCast
+                            || kind == CK_IntegralToBoolean || kind == CK_FloatingToBoolean)
+                            converted = true;
+                        else if (kind != CK_LValueToRValue && kind != CK_NoOp)
+                            break;
+                        e = cast->getSubExpr();
+                    }
+                    const auto* ref = llvm::dyn_cast_or_null<DeclRefExpr>(e);
+                    const auto* parm = ref != nullptr
+                        ? llvm::dyn_cast<ParmVarDecl>(ref->getDecl()) : nullptr;
+                    if (converted && parm != nullptr && parm->getDeclContext() == fd
+                        && parm->getType().getNonReferenceType()->isArithmeticType())
+                    {
+                        const unsigned index = parm->getFunctionScopeIndex();
+                        if (out.size() < fd->getNumParams()) out.resize(fd->getNumParams());
+                        if (index < out.size())
+                            out[index] = CanonicalSpelling(ctx,
+                                temp->getType().getUnqualifiedType());
+                    }
+                }
+                for (const Stmt* child : s->children()) self(self, child);
+            };
+            visit(visit, body);
+            return out;
+        }
+
+        // The selected callee, exactly: qualified name, specialized type, and primary pattern.
+        std::string CalleeIdentity(const ASTContext& ctx, const FunctionDecl* callee)
+        {
+            if (callee == nullptr) return {};
+            std::string identity = callee->getQualifiedNameAsString() + "|"
+                + CanonicalSpelling(ctx, callee->getType());
+            if (const FunctionTemplateDecl* primary = callee->getPrimaryTemplate())
+                identity += "|" + CanonicalSpelling(ctx, primary->getTemplatedDecl()->getType());
+            return identity;
+        }
+
+        /*
+         * A generated wrapper passing a string literal as its own array lvalue
+         * (`*reinterpret_cast<const char (*)[N]>(pK)`) to a callee whose `X *const &` (or `X *&&`)
+         * binds the DECAYED pointer: that temporary lives in the wrapper frame, where C++ keeps it
+         * to the end of the caller's full-expression. Reports the temporary's type in
+         * `temporaries[K]` (beside WrapperConvertedTemporaryTypes) and the selected callee's
+         * identity. A wrapper passing a reference-to-pointer parameter straight to a call reports
+         * that callee's identity too, so a re-spelled wrapper can prove it selects the same one.
+         */
+        void WrapperLiteralPointerTemporaries(const ASTContext& ctx, const FunctionDecl* fd,
+                                              std::vector<std::string>& temporaries,
+                                              std::string& identity)
+        {
+            const Stmt* body = fd != nullptr ? fd->getBody() : nullptr;
+            if (body == nullptr) return;
+            auto wrapperParameter = [&](const Expr* e) -> const ParmVarDecl* {
+                const auto* ref = llvm::dyn_cast_or_null<DeclRefExpr>(e);
+                const auto* parm = ref != nullptr ? llvm::dyn_cast<ParmVarDecl>(ref->getDecl()) : nullptr;
+                return parm != nullptr && parm->getDeclContext() == fd ? parm : nullptr;
+            };
+            // The wrapper parameter K a decayed literal temporary was made from, or null.
+            auto decayedLiteral = [&](const MaterializeTemporaryExpr* temp) -> const ParmVarDecl* {
+                if (!temp->getType()->isPointerType()) return nullptr;
+                const Expr* e = temp->getSubExpr();
+                bool decayed = false;
+                while (e != nullptr)
+                {
+                    e = e->IgnoreParens();
+                    const auto* cast = llvm::dyn_cast<ImplicitCastExpr>(e);
+                    if (cast == nullptr) break;
+                    if (cast->getCastKind() == CK_ArrayToPointerDecay) decayed = true;
+                    else if (cast->getCastKind() != CK_NoOp && cast->getCastKind() != CK_BitCast)
+                        return nullptr;
+                    e = cast->getSubExpr();
+                }
+                const auto* deref = llvm::dyn_cast_or_null<UnaryOperator>(e);
+                if (!decayed || deref == nullptr || deref->getOpcode() != UO_Deref) return nullptr;
+                e = deref->getSubExpr()->IgnoreParens();
+                const auto* reinterpret = llvm::dyn_cast<CXXReinterpretCastExpr>(e);
+                if (reinterpret == nullptr) return nullptr;
+                e = reinterpret->getSubExpr()->IgnoreParenImpCasts();
+                const ParmVarDecl* parm = wrapperParameter(e);
+                return parm != nullptr && parm->getType()->isPointerType() ? parm : nullptr;
+            };
+            auto inspect = [&](const FunctionDecl* callee, const Expr* const* args, unsigned count) {
+                for (unsigned i = 0; i < count; ++i)
+                {
+                    const Expr* arg = args[i];
+                    if (arg == nullptr) continue;
+                    // IgnoreImplicit would strip the MaterializeTemporaryExpr itself.
+                    const Expr* inner = arg->IgnoreParens();
+                    if (const auto* temp = llvm::dyn_cast<MaterializeTemporaryExpr>(inner))
+                        if (const ParmVarDecl* parm = decayedLiteral(temp))
+                        {
+                            const unsigned index = parm->getFunctionScopeIndex();
+                            if (temporaries.size() < fd->getNumParams())
+                                temporaries.resize(fd->getNumParams());
+                            if (index < temporaries.size())
+                                temporaries[index] = CanonicalSpelling(ctx,
+                                    temp->getType().getUnqualifiedType());
+                            identity = CalleeIdentity(ctx, callee);
+                            continue;
+                        }
+                    if (const ParmVarDecl* parm = wrapperParameter(arg->IgnoreParenImpCasts());
+                        parm != nullptr && parm->getType()->isReferenceType()
+                        && parm->getType().getNonReferenceType()->isPointerType()
+                        && identity.empty())
+                        identity = CalleeIdentity(ctx, callee);
+                }
+            };
+            auto visit = [&](auto&& self, const Stmt* s) -> void {
+                if (s == nullptr) return;
+                if (const auto* call = llvm::dyn_cast<CallExpr>(s))
+                    inspect(call->getDirectCallee(), call->getArgs(), call->getNumArgs());
+                else if (const auto* construct = llvm::dyn_cast<CXXConstructExpr>(s))
+                    inspect(construct->getConstructor(), construct->getArgs(),
+                            construct->getNumArgs());
+                for (const Stmt* child : s->children()) self(self, child);
+            };
+            visit(visit, body);
+        }
+
+        /*
+         * A generated wrapper that materializes a brace list (`std::max({p0, p1})`) owns what
+         * the list became - an initializer_list's backing array, an aggregate or array temporary,
+         * a converted container - and all of it dies when the wrapper returns, where C++ keeps it
+         * to the end of the caller's full-expression. Whether a result refers into it is not
+         * decidable from its type (a pointer to an element's member, a c_str() of a string
+         * element, a view with a user-written destructor), so the result is flagged when it can
+         * carry any address: a pointer, reference, member pointer, or a class with such a field
+         * or base at any depth, a vptr, or an incomplete / too-deep layout. Arithmetic, enum,
+         * classes proven pointer-free (pair<int, int>), and std::string (a deep owner) are not.
+         * The caller consults the flag for brace-list wrappers only. Any brace wrapper reports,
+         * per argument of its returned call, the element type of an initializer_list passed
+         * there DIRECTLY ("" otherwise), so the caller can back those lists in its own frame
+         * (always when flagged; for a non-trivial element type otherwise).
+         */
+        /*
+         * A brace-list argument that became an array, aggregate or converted container temporary
+         * (not a direct initializer_list) whose elements are non-trivially destructible or
+         * copyable: it would die in the wrapper, observably early. Reported as this marker.
+         */
+        constexpr const char* kBraceTemporaryNontrivialMarker = "#nontrivial-brace-temporary";
+        bool BraceTemporaryHasNontrivialElements(const ASTContext& ctx, const Expr* argument)
+        {
+            auto nontrivial = [&](QualType type) {
+                if (type.isNull() || type->isDependentType()) return false;
+                type = ctx.getBaseElementType(type.getNonReferenceType());
+                return type.isDestructedType() != QualType::DK_none
+                    || !type.isTriviallyCopyableType(ctx);
+            };
+            const Expr* inner = argument->IgnoreImplicit();
+            if (llvm::isa<InitListExpr>(inner)) return nontrivial(inner->getType());
+            const auto* construct = llvm::dyn_cast<CXXConstructExpr>(inner);
+            if (construct == nullptr || !construct->isListInitialization()) return false;
+            if (construct->getNumArgs() == 0 || nontrivial(construct->getType()) == false)
+                return false;
+            // A container built over an initializer_list: its elements decide.
+            for (const Expr* arg : construct->arguments())
+                if (const auto* il = llvm::dyn_cast<CXXStdInitializerListExpr>(arg->IgnoreImplicit()))
+                    if (const auto* spec = llvm::dyn_cast_or_null<ClassTemplateSpecializationDecl>(
+                            il->getType()->getAsCXXRecordDecl());
+                        spec != nullptr && spec->getTemplateArgs().size() == 1
+                        && spec->getTemplateArgs()[0].getKind() == TemplateArgument::Type)
+                        return nontrivial(spec->getTemplateArgs()[0].getAsType());
+            // A class list-initialized from its members' values directly.
+            return nontrivial(construct->getType());
+        }
+
+        bool WrapperResultBorrowsBraceList(const ASTContext& ctx, const FunctionDecl* fd,
+                                           std::vector<std::string>& elementSpellings)
+        {
+            elementSpellings.clear();
+            const auto* body = llvm::dyn_cast_or_null<CompoundStmt>(fd != nullptr ? fd->getBody()
+                                                                                   : nullptr);
+            if (body == nullptr) return false;
+            bool braced = false;
+            auto findBraces = [&](auto&& self, const Stmt* st) -> void {
+                if (st == nullptr || braced) return;
+                const auto* construct = llvm::dyn_cast<CXXConstructExpr>(st);
+                if (llvm::isa<InitListExpr>(st) || llvm::isa<CXXStdInitializerListExpr>(st)
+                    || (construct != nullptr && construct->isListInitialization()))
+                {
+                    braced = true;
+                    return;
+                }
+                for (const Stmt* child : st->children()) self(self, child);
+            };
+            findBraces(findBraces, body);
+            if (!braced) return false;
+            std::unordered_set<const Type*> proven;
+            auto mayCarryAddress = [&](auto&& self, QualType type, int depth) -> bool {
+                if (type.isNull()) return false;
+                type = ctx.getCanonicalType(type);
+                if (depth > 8) return true;
+                if (type->isVoidType() || type->isArithmeticType() || type->isEnumeralType()
+                    || type->isNullPtrType())
+                    return false;
+                if (const auto* array = ctx.getAsArrayType(type))
+                    return self(self, array->getElementType(), depth + 1);
+                const auto* record = type->getAsCXXRecordDecl();
+                if (record == nullptr) return true;
+                // A std::basic_string of an integer character type with the standard allocator owns
+                // its storage: its pointers never refer outside the object, however it was built.
+                if (const auto* spec = llvm::dyn_cast<ClassTemplateSpecializationDecl>(record);
+                    spec != nullptr && spec->isInStdNamespace() && spec->getName() == "basic_string")
+                {
+                    const TemplateArgumentList& args = spec->getTemplateArgs();
+                    const auto* alloc = args.size() == 3 && args[2].getKind() == TemplateArgument::Type
+                        ? llvm::dyn_cast_or_null<ClassTemplateSpecializationDecl>(
+                              args[2].getAsType()->getAsCXXRecordDecl())
+                        : nullptr;
+                    if (alloc != nullptr && alloc->isInStdNamespace()
+                        && alloc->getName() == "allocator"
+                        && args[0].getKind() == TemplateArgument::Type
+                        && args[0].getAsType()->isIntegerType())
+                        return false;
+                }
+                if (!record->hasDefinition() || record->isDependentType()) return true;
+                record = record->getDefinition();
+                if (record->isDynamicClass() || record->getNumVBases() != 0) return true;
+                if (proven.count(type.getTypePtr()) != 0) return false;
+                for (const CXXBaseSpecifier& base : record->bases())
+                    if (self(self, base.getType(), depth + 1)) return true;
+                for (const FieldDecl* field : record->fields())
+                    if (self(self, field->getType(), depth + 1)) return true;
+                proven.insert(type.getTypePtr());
+                return false;
+            };
+            for (const Stmt* statement : body->body())
+            {
+                const auto* ret = llvm::dyn_cast<ReturnStmt>(statement);
+                const Expr* value = ret != nullptr ? ret->getRetValue() : nullptr;
+                const auto* call = value != nullptr
+                    ? llvm::dyn_cast<CallExpr>(value->IgnoreImplicit()) : nullptr;
+                if (call == nullptr) continue;
+                for (const Expr* argument : call->arguments())
+                {
+                    const auto* list = llvm::dyn_cast<CXXStdInitializerListExpr>(
+                        argument->IgnoreImplicit());
+                    if (list == nullptr && BraceTemporaryHasNontrivialElements(ctx, argument))
+                    {
+                        elementSpellings.push_back(kBraceTemporaryNontrivialMarker);
+                        continue;
+                    }
+                    const auto* spec = list != nullptr
+                        ? llvm::dyn_cast_or_null<ClassTemplateSpecializationDecl>(
+                              list->getType()->getAsCXXRecordDecl())
+                        : nullptr;
+                    elementSpellings.push_back(
+                        spec != nullptr && spec->getTemplateArgs().size() == 1
+                                && spec->getTemplateArgs()[0].getKind() == TemplateArgument::Type
+                            ? CanonicalSpelling(ctx, spec->getTemplateArgs()[0].getAsType()
+                                                         .getUnqualifiedType())
+                            : std::string());
+                }
+                break;
+            }
+            if (std::all_of(elementSpellings.begin(), elementSpellings.end(),
+                            [](const std::string& e) { return e.empty(); }))
+                elementSpellings.clear();
+            return mayCarryAddress(mayCarryAddress, fd->getReturnType(), 0);
+        }
+
         std::string CxxQualifiedName(const NamedDecl* d)
         {
             std::string n = d->getQualifiedNameAsString();
@@ -832,6 +1120,78 @@ namespace cflat_cinterop
             const auto* rhs = param->getPointeeType()->getAsCXXRecordDecl();
             return rhs != nullptr
                 && rhs->getCanonicalDecl() == md->getParent()->getCanonicalDecl();
+        }
+
+        // False only when Sema PROVES the trailing requires-clause unsatisfied.
+        static bool ConstrainedMemberSatisfied(Sema& sema, const CXXMethodDecl* md)
+        {
+            if (md == nullptr || !md->getTrailingRequiresClause() || md->isDependentContext())
+                return true;
+            clang::ConstraintSatisfaction satisfaction;
+            if (sema.CheckFunctionConstraints(md, satisfaction))
+                return true;
+            return satisfaction.IsSatisfied;
+        }
+
+        /*
+         * Two satisfied non-template members with the same parameter list and object qualifiers
+         * differ only by constraints: overload resolution always picks the more constrained one
+         * ([over.match.best]), so the other is never callable. iota_view's constrained end()
+         * returning the iterator hides the one returning its sentinel. MSVC does not mangle the
+         * constraint, so there the two also share one symbol name (elements_view's operator*).
+         * Only twins with no default argument and the same ellipsis are pruned: a default the
+         * winner lacks leaves the loser callable when it is omitted, and an ellipsis difference
+         * has no constraint tiebreak (both stay, as before this rule).
+         */
+        static bool LosesToMoreConstrainedTwin(Sema& sema, const CXXMethodDecl* md,
+                                               const std::vector<const CXXMethodDecl*>& methods)
+        {
+            if (md == nullptr || md->isDependentContext() || md->getDescribedFunctionTemplate() != nullptr
+                || md->getPrimaryTemplate() != nullptr)
+                return false;
+            auto sameShape = [](const CXXMethodDecl* a, const CXXMethodDecl* b) {
+                if (a->getDeclName() != b->getDeclName() || a->isStatic() != b->isStatic()
+                    || a->getNumParams() != b->getNumParams()
+                    || a->getMethodQualifiers() != b->getMethodQualifiers()
+                    || a->getRefQualifier() != b->getRefQualifier() || a->isVariadic() != b->isVariadic()
+                    || a->getMinRequiredArguments() != a->getNumParams()
+                    || b->getMinRequiredArguments() != b->getNumParams())
+                    return false;
+                const ASTContext& astCtx = a->getASTContext();
+                for (unsigned i = 0; i < a->getNumParams(); ++i)
+                    if (!astCtx.hasSameType(a->getParamDecl(i)->getType(),
+                                            b->getParamDecl(i)->getType()))
+                        return false;
+                return true;
+            };
+            for (const CXXMethodDecl* other : methods)
+            {
+                if (other == md || other == nullptr || other->getDescribedFunctionTemplate() != nullptr
+                    || other->getPrimaryTemplate() != nullptr
+                    || (!md->getTrailingRequiresClause() && !other->getTrailingRequiresClause())
+                    || !sameShape(md, other) || !ConstrainedMemberSatisfied(sema, other))
+                    continue;
+                const FunctionDecl* winner = sema.getMoreConstrainedFunction(
+                    const_cast<CXXMethodDecl*>(md), const_cast<CXXMethodDecl*>(other));
+                if (winner == other) return true;
+            }
+            return false;
+        }
+
+        /*
+         * A member overload resolution can never select (constraint unsatisfied, or the less
+         * constrained of two same-signature twins). Deducing its `decltype(auto)` return still
+         * instantiates its body, and handing that body to the demand pass beside the selected
+         * twin defines one symbol twice.
+         */
+        static bool IsNonViableConstrainedMember(Sema& sema, const Decl* d)
+        {
+            const auto* md = llvm::dyn_cast_or_null<CXXMethodDecl>(d);
+            if (md == nullptr || md->isDependentContext()) return false;
+            if (!ConstrainedMemberSatisfied(sema, md)) return true;
+            std::vector<const CXXMethodDecl*> siblings;
+            for (const CXXMethodDecl* sibling : md->getParent()->methods()) siblings.push_back(sibling);
+            return LosesToMoreConstrainedTwin(sema, md, siblings);
         }
 
         /*
@@ -1297,6 +1657,28 @@ namespace cflat_cinterop
             return CanonicalSpelling(ctx, t);
         }
 
+        /*
+         * True when the incomplete record `qt` names is a member class (or a member class template
+         * specialization) whose pattern HAS a definition, so clang instantiates it on demand. A
+         * merely declared nested class cannot be completed by any request.
+         */
+        bool LazyCompletableMemberClass(QualType qt)
+        {
+            QualType t = qt.getCanonicalType();
+            const auto* rd = t->getAsCXXRecordDecl();
+            if (rd == nullptr || !llvm::isa<CXXRecordDecl>(rd->getDeclContext())) return false;
+            if (const CXXRecordDecl* pattern = rd->getInstantiatedFromMemberClass())
+                return pattern->getDefinition() != nullptr;
+            if (const auto* spec = llvm::dyn_cast<ClassTemplateSpecializationDecl>(rd))
+            {
+                const ClassTemplateDecl* tpl = spec->getSpecializedTemplate();
+                while (const ClassTemplateDecl* from = tpl->getInstantiatedFromMemberTemplate())
+                    tpl = from;
+                return tpl->getTemplatedDecl()->getDefinition() != nullptr;
+            }
+            return false;
+        }
+
         const CXXRecordDecl* CompleteNonDependentCxxRecord(const CXXRecordDecl* rd)
         {
             if (rd == nullptr || rd->isInvalidDecl() || rd->isDependentType()) return nullptr;
@@ -1729,6 +2111,27 @@ namespace cflat_cinterop
                     || fd->getExceptionSpecType() == EST_NoThrow;
                 sig.file = file; sig.line = line; sig.col = col;
                 sig.physicalFile = PhysicalFileOf(fd, file);
+                /*
+                 * A C-like record returned by value (std::div's div_t: anonymous on libc,
+                 * `struct _div_t` on MSVC) may live outside the import scope: bind it so the
+                 * signature maps - an anonymous one under its typedef spelling.
+                 */
+                if (st.req.cxxMode)
+                    if (const RecordType* rt =
+                            fd->getReturnType().getCanonicalType()->getAs<RecordType>())
+                    {
+                        RecordDecl* rd = rt->getDecl()->getDefinition();
+                        const auto* cxx = llvm::dyn_cast_or_null<CXXRecordDecl>(rd);
+                        std::string recordName;
+                        if (rd != nullptr && (cxx == nullptr || cxx->isCLike()))
+                        {
+                            if (const TypedefNameDecl* td = rd->getTypedefNameForAnonDecl())
+                                recordName = td->getNameAsString();
+                            else if (rd->getIdentifier() != nullptr)
+                                recordName = CxxQualifiedName(rd);
+                        }
+                        if (!recordName.empty()) EmitDefinedRecord(rd, recordName);
+                    }
                 QueueIncompleteCxxType(st, ctx, fd->getReturnType());
                 for (const ParmVarDecl* p : fd->parameters())
                 {
@@ -1739,6 +2142,14 @@ namespace cflat_cinterop
                     QueueFunctionPointerAbi(st, ctx, p->getType());
                 }
                 QueueFunctionPointerAbi(st, ctx, fd->getReturnType());
+                if (st.req.cxxMode && !st.req.cxxFunctionWrapperNames.empty())
+                {
+                    sig.paramTemporaryTypes = WrapperConvertedTemporaryTypes(ctx, fd);
+                    WrapperLiteralPointerTemporaries(ctx, fd, sig.paramTemporaryTypes,
+                                                     sig.calleeIdentity);
+                    sig.resultBorrowsBraceList = WrapperResultBorrowsBraceList(
+                        ctx, fd, sig.braceListElementTypes);
+                }
                 // An immediate ('consteval') function is evaluated by the C++ front end and gets
                 // no runtime symbol, so binding it would only fail at link time with a mangled name.
                 if (st.req.cxxMode && fd->isConsteval())
@@ -2272,6 +2683,19 @@ namespace cflat_cinterop
              * `outDecls` is filled in lockstep with rec.members so the ABI pass can revisit each
              * declaration once a single CodeGenerator exists.
              */
+            bool MemberConstraintsSatisfied(const CXXMethodDecl* md)
+            {
+                return st.ci == nullptr || !st.ci->hasSema()
+                    || ConstrainedMemberSatisfied(st.ci->getSema(), md);
+            }
+
+            bool IsLessConstrainedTwin(const CXXMethodDecl* md,
+                                       const std::vector<const CXXMethodDecl*>& methods)
+            {
+                return st.ci != nullptr && st.ci->hasSema()
+                    && LosesToMoreConstrainedTwin(st.ci->getSema(), md, methods);
+            }
+
             void CollectCxxMembers(const CXXRecordDecl* cxx, RawRecord& rec,
                                    std::vector<const CXXMethodDecl*>& outDecls)
             {
@@ -2284,6 +2708,7 @@ namespace cflat_cinterop
                     st.vtableWork.push_back(cxx);
                 rec.hasBases = cxx->getNumBases() > 0 || cxx->getNumVBases() > 0;
                 rec.hasVirtualBases = cxx->getNumVBases() > 0;
+                rec.isFinal = cxx->hasAttr<FinalAttr>();
                 rec.isAbstract = cxx->isAbstract();
                 for (const FriendDecl* fr : cxx->friends())
                     if (const auto* named = fr->getFriendDecl())
@@ -2470,6 +2895,10 @@ namespace cflat_cinterop
                     // all-defaulted member templates selected above.
                     if (md->getDescribedFunctionTemplate() != nullptr && !templateExtra) continue;
                     if (md->getPrimaryTemplate() != nullptr && !templateExtra) continue;
+                    // A member whose requires-clause this class does not satisfy is never viable
+                    // ([over.match.viable]); of two same-signature twins only the more constrained is.
+                    if (!MemberConstraintsSatisfied(md)) continue;
+                    if (IsLessConstrainedTwin(md, methodList)) continue;
                     const auto* ctor = llvm::dyn_cast<CXXConstructorDecl>(md);
                     const auto* dtor = llvm::dyn_cast<CXXDestructorDecl>(md);
                     // A trivial destructor does nothing and clang never emits one (CodeGen asserts
@@ -2747,6 +3176,7 @@ namespace cflat_cinterop
                         m.bindRefusal = "takes '" + bad + "' by value, whose definition this "
                                         "translation unit does not have (include the header that "
                                         "defines it alongside this one)";
+                        if (LazyCompletableMemberClass(p->getType())) m.lazyNestedSpelling = bad;
                         break;
                     }
                     // A signature holding an error node (an incomplete element's sizeof in a
@@ -2761,9 +3191,13 @@ namespace cflat_cinterop
                     {
                         std::string bad = IncompleteByValueRecord(ctx, md->getReturnType());
                         if (!bad.empty())
+                        {
                             m.bindRefusal = "returns '" + bad + "' by value, whose definition this "
                                             "translation unit does not have (include the header "
                                             "that defines it alongside this one)";
+                            if (LazyCompletableMemberClass(md->getReturnType()))
+                                m.lazyNestedSpelling = bad;
+                        }
                     }
 
                     // With definition emission on, an inline / defaulted / implicit member is a
@@ -3390,19 +3824,96 @@ namespace cflat_cinterop
                     && init->isConstantInitializer(ctx, vd->getType()->isReferenceType());
             }
 
+            /*
+             * A class-typed constant: published under the marker with the symbol a CFlat use
+             * links to. `def` set = header-owned storage (inline / constexpr), which the request's
+             * definitions stage emits (linkonce_odr; an internal one gets the per-group alias the
+             * header harvest uses); null = an `extern` object the library exports.
+             */
+            void PublishRequestedClassConstant(const VarDecl* vd, const VarDecl* def,
+                                               const std::string& marker)
+            {
+                RawGlobalVar g;
+                g.name = marker;
+                g.qualifiedName = marker;
+                g.ctype = CanonicalSpelling(ctx, vd->getType().getUnqualifiedType());
+                g.isConst = vd->getType().isConstQualified() || vd->isConstexpr();
+                g.isDllImport = def == nullptr && vd->hasAttr<DLLImportAttr>();
+                LocOfRaw(vd, g.file, g.line, g.col);
+                const std::string originalLinkage = CxxLinkageName(ctx, vd);
+                g.linkageName = originalLinkage;
+                if (def != nullptr)
+                {
+                    g.isCxxConstexpr = true;
+                    if (!vd->hasExternalFormalLinkage() || vd->getStorageClass() == SC_Static)
+                    {
+                        g.linkageName = StaticCxxGlobalAlias(st.req.cxxImportGroupKey, originalLinkage);
+                        if (st.req.demandPlan != nullptr)
+                            st.req.demandPlan->renamed[g.linkageName] = originalLinkage;
+                        st.out.weakPromoteSymbols.push_back(originalLinkage);
+                        st.out.weakPromotePerGroupSymbols.push_back(originalLinkage);
+                    }
+                    if (st.req.RecordsDefinitionDemand()) st.varEmitWork.push_back(def);
+                }
+                st.out.globals.push_back(std::move(g));
+            }
+
             void EmitRequestedConstant(const DecltypeType* dt, const TypedefNameDecl* td,
                                        const std::string& marker)
             {
                 const auto* ref = llvm::dyn_cast_or_null<DeclRefExpr>(
                     dt->getUnderlyingExpr() != nullptr ? dt->getUnderlyingExpr()->IgnoreParens() : nullptr);
+                // An unscoped enumerator reached through its parent scope: name the enum type so
+                // the CFlat side binds that enum and the enumerator under the requested path.
+                if (const auto* ec = ref != nullptr ? llvm::dyn_cast<EnumConstantDecl>(ref->getDecl()) : nullptr)
+                {
+                    const auto* ed = llvm::dyn_cast<EnumDecl>(ec->getDeclContext());
+                    if (ed == nullptr || ed->isScoped() || ed->getIdentifier() == nullptr
+                        || ed->isDependentContext())
+                        return;
+                    RawGlobalVar g;
+                    g.name = marker;
+                    g.qualifiedName = marker;
+                    g.ctype = CanonicalSpelling(ctx, ec->getType().getUnqualifiedType());
+                    g.isConst = true;
+                    g.isCompileTimeConstant = true;
+                    g.isEnumerator = true;
+                    g.constantValue = ApsIntToLongLong(ec->getInitVal());
+                    LocOfRaw(ec, g.file, g.line, g.col);
+                    st.out.globals.push_back(std::move(g));
+                    return;
+                }
                 auto* vd = ref != nullptr ? llvm::dyn_cast<VarDecl>(const_cast<ValueDecl*>(ref->getDecl())) : nullptr;
                 if (vd == nullptr || !vd->isFileVarDecl() || vd->isStaticDataMember()) return;
+                // A non-const `extern` class object the library exports (std::cout): an lvalue
+                // of its class, bound by its symbol like an extern class constant.
+                if (!vd->getType().isConstQualified() && !vd->isConstexpr()
+                    && !vd->getType()->isDependentType()
+                    && vd->getType().getCanonicalType()->getAsCXXRecordDecl() != nullptr
+                    && vd->getDefinition() == nullptr && vd->getAnyInitializer() == nullptr
+                    && vd->hasExternalFormalLinkage() && !vd->isInline()
+                    && vd->getStorageClass() == SC_Extern)
+                {
+                    PublishRequestedClassConstant(vd, nullptr, marker);
+                    return;
+                }
                 if (!vd->getType().isConstQualified() && !vd->isConstexpr()) return;
                 if (vd->getAnyInitializer() == nullptr && st.ci != nullptr && st.ci->hasSema()
                     && llvm::isa<VarTemplateSpecializationDecl>(vd))
                     st.ci->getSema().InstantiateVariableDefinition(td->getLocation(), vd);
                 const VarDecl* def = vd->getDefinition();
                 const Expr* init = def != nullptr ? def->getInit() : vd->getAnyInitializer();
+                // A class-typed constant (std::chrono::February, std::nullopt, a tag object) has
+                // no scalar to fold: the real object is bound by its symbol.
+                const bool classTyped = !vd->getType()->isDependentType()
+                    && vd->getType().getCanonicalType()->getAsCXXRecordDecl() != nullptr;
+                if (classTyped && def == nullptr && init == nullptr)
+                {
+                    // `extern const __ph<1> _1;`: the library exports the object.
+                    if (vd->hasExternalFormalLinkage() && !vd->isInline() && !vd->isConstexpr())
+                        PublishRequestedClassConstant(vd, nullptr, marker);
+                    return;
+                }
                 if (init == nullptr || init->containsErrors() || init->isValueDependent()) return;
                 // Folding skips the initializer, so only a constant initialization may fold
                 // (`inline const int v = (++counter, 27);` must run). No live binding here.
@@ -3410,6 +3921,11 @@ namespace cflat_cinterop
                 {
                     st.out.invalidCxxTypeRequestError = std::format(
                         "C++ variable '{}' {}", CxxQualifiedName(vd), kCxxNotConstantVariableRefusal);
+                    return;
+                }
+                if (classTyped)
+                {
+                    if (def != nullptr) PublishRequestedClassConstant(vd, def, marker);
                     return;
                 }
                 Expr::EvalResult result;
@@ -3586,11 +4102,12 @@ namespace cflat_cinterop
                             }
                             continue;
                         }
-                        // A typedef of a builtin or a pointer to one (::uint32_t, ::intptr_t):
-                        // return clang's canonical spelling for the caller to map.
+                        // A typedef of a builtin or a pointer to one (::uint32_t, ::intptr_t), or
+                        // a function pointer (std::new_handler): clang's canonical spelling.
                         QualType leaf = canon;
                         while (leaf->isPointerType()) leaf = leaf->getPointeeType().getCanonicalType();
-                        if (!canon->isDependentType() && leaf->isBuiltinType())
+                        if (!canon->isDependentType()
+                            && (leaf->isBuiltinType() || canon->isFunctionPointerType()))
                         {
                             RawTypedef t;
                             t.name = marker;
@@ -4110,7 +4627,10 @@ namespace cflat_cinterop
                 if (nm == kHeaderScopeSentinel) return true;
                 if (!nm.starts_with(kProbePrefix)) return HarvestGlobalVar(vd);
                 unsigned idx = 0;
-                if (nm.drop_front(sizeof(kProbePrefix) - 1).getAsInteger(10, idx)) return true;
+                // `__cflat_macro_<i>` or `__cflat_macro_<i>_<tag>`: a lazy single-macro probe is
+                // tagged so a later probe chunk in the same incremental TU never redeclares it.
+                StringRef slot = nm.drop_front(sizeof(kProbePrefix) - 1).split('_').first;
+                if (slot.getAsInteger(10, idx)) return true;
                 if (idx >= st.probes.size()) return true;
                 const CxxMacroProbe& mp = st.probes[idx];
                 RawMacro m;
@@ -5946,6 +6466,23 @@ namespace cflat_cinterop
                 const CXXRecordDecl* def = rd != nullptr ? rd->getDefinition() : nullptr;
                 if (def == nullptr || !def->isDynamicClass() || def->isDependentContext()) continue;
                 if (ctx.getCurrentKeyFunction(def) != nullptr) continue;   // anchored elsewhere
+                // The C++ runtime owns type_info's vtable (vcruntime / libc++abi); clang's own RTTI
+                // descriptors reference that external symbol. The Microsoft ABI has no key
+                // function to say so, and a local copy splits the name on the way into the program.
+                if (def->getIdentifier() != nullptr && def->getName() == "type_info"
+                    && (def->getDeclContext()->getRedeclContext()->isTranslationUnit()
+                        || def->getDeclContext()->getRedeclContext()->isStdNamespace()))
+                    continue;
+                /*
+                 * MSVC's ::type_info has no key function under the Microsoft ABI, yet its vftable
+                 * lives in vcruntime and Sema never marks it used. CodeGen's RTTI descriptors
+                 * declare `??_7type_info@@6B@` as a plain global, so handing the class over makes
+                 * the vftable emitter treat that declaration as its RTTI alias and crash.
+                 */
+                if (ctx.getTargetInfo().getCXXABI().isMicrosoft() && def->getIdentifier() != nullptr
+                    && def->getName() == "type_info"
+                    && def->getDeclContext()->getRedeclContext()->isTranslationUnit())
+                    continue;
                 /*
                  * `extern template class X<char>;` (libc++ does this for basic_ios, basic_istream,
                  * basic_ostream, basic_streambuf, ...) is an explicit instantiation DECLARATION: a
@@ -6945,6 +7482,7 @@ namespace cflat_cinterop
             {
                 Decl* d = plan.decls[splitDone];
                 if (d == nullptr || d->isInvalidDecl()) continue;
+                if (ci.hasSema() && IsNonViableConstrainedMember(ci.getSema(), d)) continue;
                 const bool codeDecl = llvm::isa<FunctionDecl>(d) || llvm::isa<VarDecl>(d);
                 if (!codeDecl || !ctx.DeclMustBeEmitted(d))
                 {

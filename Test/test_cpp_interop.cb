@@ -227,6 +227,13 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
+import cpp "library/t20_abi_records.hpp";
+import cpp "library/cpp_interop_cwrapper_macros.hpp";
+import cpp "functional";
+import cpp "compare";
+import cpp "library/t25_csurface.hpp";
+import cpp "library/cpp_t14_template_functor.hpp";
+import cpp "library/cpp_t22_constrained_members.hpp";
 import cpp "library/cpp_interop_demand_fail.h";
 import cpp "library/cpp_interop_anon.h";
 import cpp "library/cpp_interop_explicit.h";
@@ -234,6 +241,9 @@ import cpp "library/cpp_interop_refgate.h";
 import cpp "library/cpp_interop_basic.cpp";
 import cpp "library/cpp_interop_member_shadow.h";
 import cpp "library/cpp_interop_twin.h";
+import cpp "library/cpp_t24_argconv.hpp";
+import cpp "library/cpp_t35_ownerexpr.hpp";
+import cpp "library/cpp_t28_fwdref.hpp";
 import cpp "library/cpp_interop_lastuse.h";
 import cpp "library/cpp_interop_demand_fail.h";
 // Inheritance and virtual dispatch. Definitions are out-of-line on purpose - every
@@ -248,10 +258,19 @@ import cpp "library/cpp_interop_inline.h";
 import cpp "library/cpp_interop_inline_again.h";
 import cpp "library/cpp_inline_static_a.hpp";
 import cpp "library/cpp_inline_static_b.hpp";
+import cpp "library/cpp_derefcopy.hpp";
+import cpp "coroutine";
+import cpp "library/t7_coroutine_generator.hpp";
 // The `T&` constructor-parameter checks lock a CFlat-owned std.mutex through std.lock_guard / std.unique_lock.
 import cpp "mutex";
 import cpp "library/cpp_interop_throw.h";
 import cpp "library/cpp_interop_scoped_enum.h";
+import cpp "library/cpp_interop_errc.h";
+import cpp "future";
+import cpp "system_error";
+struct CxxDerefLocalHolder { cpp_derefcopy.Cursor16 cursor; };
+void CxxDerefParam(cpp_derefcopy.Cursor16 value, int x) { *value = x; *value = x + 1; }
+void CxxDerefPointer(cpp_derefcopy.Cursor16* value, int x) { **value = x; **value = x + 1; }
 // C++ REFERENCE data members - bound as pointer fields, never reseatable.
 import cpp "library/cpp_interop_ref_member.h";
 import cpp "library/cpp_interop_field.h";
@@ -273,11 +292,28 @@ import cpp "library/cpp_interop_c2_repeat.h";
 import cpp "library/cpp_interop_ctorref.h";
 import cpp "library/cpp_interop_varctor.h";
 import cpp "library/cpp_interop_freeoptpl.h";
+import cpp "library/cpp_interop_fixedarray.hpp";
+import cpp "library/cpp_interop_arraybool.hpp";
 // `explicit` constructors are not implicit conversions at a call argument; the non-explicit
 // converting constructor in the same header is the accept set. Rejections: err_cpp_explicit_ctor.cb.
 import cpp "library/cpp_interop_explicit.h";
 import cpp "string";
+import cpp "optional";
+import cpp "utility";
+import cpp "library/cpp_rvref_return.hpp";
+import cpp "array";
+import cpp "deque";
+import cpp "iterator";
+import cpp "valarray";
+import cpp "complex";
+import cpp "library/cpp_t10_refexpr.hpp";
 import cpp "vector";
+import cpp "library/cpp_interop_iterdiff.hpp";
+import cpp "functional";
+import cpp "unordered_map";
+import cpp "set";
+import cpp "library/cpp_late_lookup.hpp";
+import cpp "cwchar";
 // std.format bodies reach libc++ inline variables and ctor-initializer callees (legs 7400-7403).
 import cpp "format";
 import cpp "library/cpp_interop_strop.h";
@@ -300,8 +336,14 @@ import cpp "library/cpp_interop_list.h";
 // Assignment into a live object from a temporary: instrumented, header-only.
 import cpp "library/cpp_interop_assign.h";
 import cpp "library/cpp_interop_proxy_assign.h";
+import cpp "library/t29_valarray_subscript.hpp";
 import cpp "library/cpp_interop_refbinding.h";
 import cpp "library/cpp_interop_opaque_return.hpp";
+import cpp "library/cpp_t34_traits_static.hpp";
+import cpp "library/t17_empty_return.hpp";
+
+std.optional<std.string> t9MakeStringOptional()
+{ return std.optional<std.string>(std.string("xyz")); }
 
 int cppListTakeValue = 0;
 void take<T>(list<T>* values, int expectedCount)
@@ -338,6 +380,21 @@ import cpp "library/cpp_interop_fnptr.h";
 import cpp "library/cpp_interop_cglobals.h";
 import cpp "library/c_macro_helpers.h";
 import cpp "cstdint";
+import cpp "library/t8_declorder.hpp";
+import cpp "library/t12_msvc_shapes.hpp";
+import cpp "library/t15_friendptr.hpp";
+import cpp "library/cpp_namespace_class_constants.hpp";
+import cpp "library/cpp_var_template_views.hpp";
+import cpp "library/t32_msvc_std_shapes.hpp";
+import cpp "library/cpp_t26_ios_shapes.hpp";
+import cpp "library/cpp_t26_ios_shapes.cpp";
+import cpp "library/cpp_t26_vbase.hpp";
+int t26FinalAliasRead(alias t26v.final_shift value)
+{
+    t26v.final_shift_sink sink = t26v.final_shift_sink(value);
+    return sink.saved;
+}
+import cpp "library/t31_minmax_brace.hpp";
 int cppcg_add(int a, int b) { return a + b; }
 
 // A C++ exception unwinding THROUGH CFlat frames (the C++ `guarded` catch sits above them): every
@@ -871,6 +928,10 @@ int readGlobalConstCppScoped(cppi_scope.Hue value) { return (int)value; }
 
 // CFlat structs whose FIELD is a fixed array of a C++ class - `= default`, and a non-empty
 // brace list over an element with a trivial and with a nontrivial destructor.
+struct T6ArrayFieldHolder { char[4] text; };
+char[4] t6GlobalText = { 'a', 'b', 'c', 0 };
+struct T16ArrayFieldHolder { int[3] values; };
+int[3] t16GlobalInts = { 1, 2, 3 };
 struct ArrElemHost { cppa.Trk[2] cells = default; };
 
 // A CFlat struct argument, the untouched neighbour of the C++ implicit-conversion path.
@@ -1099,6 +1160,7 @@ int RpUnwind(int x)
 }
 int fnptr_add_one(int x) { return x + 1; }
 int fnptr_add_two_double(double x) { return (int)x + 2; }
+int fnptr_times_ten(int x) { return x * 10; }
 int apply_fnptr(function<int(int)> f, int x) { return f(x); }
 void fnptr_noop() {}
 // A C++ reference return and a derived pointer at a RETURN statement (3370-3389). Each helper
@@ -1384,9 +1446,362 @@ const cppi.CrReceiverValue w13ConstGlobal = default;
 const cppi.CrReceiverValue[2] w13ConstGlobalArray;
 int W11OrderProbe(w11round3.Q<int> q, char* s) { return 100; }
 int W11OrderProbe(long x, int y) { return 1; }
+int T10ValarrayShortRight(short scalar)
+{
+    std.valarray<int> values = std.valarray<int>(1);
+    values[0] = 4;
+    values = values + scalar;
+    return values[0];
+}
+int T10ValarrayShortLeft(short scalar)
+{
+    std.valarray<int> values = std.valarray<int>(1);
+    values[0] = 4;
+    values = scalar + values;
+    return values[0];
+}
+
+namespace t5ns { cpp_errc_probe.ErrorCondition gcond = default; }
+struct T24Record { int value = 0; };
+cpp_errc_probe.ErrorCondition T5ReturnCondition(cpp_errc_probe.ConditionEnum value)
+{
+    return value;
+}
+
+int t25surfaceCalls = 0;
+void t25surface_handler() { t25surfaceCalls++; }
+void t25surface_signal(int s) { t25surfaceCalls += s; }
+int t25surface_mutable(void* a, void* b) { return 0; }
+int t25surface_compare(const void* a, const void* b)
+{
+    int* pa = (int*)a;
+    int* pb = (int*)b;
+    int x = *pa;
+    int y = *pb;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
 
 extern int main()
 {
+    // T35: member-template names defer to the receiver.
+    cpi_t35.shared_ptr<int> t35a = default; t35a.owner = 1;
+    cpi_t35.shared_ptr<int> t35b = default; t35b.owner = 2;
+    cpi_t35.weak_ptr<int> t35w = default; t35w.owner = 1;
+    if (!t35a.owner_before(t35b) || !t35w.owner_before(t35b)
+        || t35b.owner_before(t35a) || t35b.owner_before(t35w)) return 3529;
+    // T35 round 2: class-to-class conversion templates apply to const references, never T* or T&.
+    cpi_t35x.X<int> t35x = default; t35x.v = 5;
+    expect_error("no overload of 'cpi_t35x.fp' matches the given arguments") {
+        int t35Pointer = cpi_t35x.fp(t35x);
+    }
+    expect_error("no overload of 'cpi_t35x.fr' matches the given arguments") {
+        int t35LvalueRef = cpi_t35x.fr(t35x);
+    }
+    if (cpi_t35x.fc(t35x) != 105 || cpi_t35x.fk(t35x) != 2) return 3530;
+    // A dependent-alias conversion operator copy-initializes a non-trivial target; explicit stays out.
+    cpi_t35x.Vec<int> t35Vec = cpi_t35x.Vec<int>(3);
+    int t35Factor = 4;
+    cpi_t35x.Vec<int> t35Product = t35Vec * t35Factor;
+    if (t35Product.v != 12) return 3531;
+    // T23: system-header macros reached through a C++ import resolve as C++ sees them
+    // (cpp_interop_cwrapper_macros.hpp includes the C wrapper headers). Platform-neutral values.
+    if (CHAR_BIT != 8 || INT_MAX != 2147483647) return 37001;
+    if (DBL_DIG != 15 || FLT_RADIX != 2) return 37002;
+    if (INT64_MAX != 9223372036854775807 || UINT8_MAX != 255) return 37003;
+    if (RAND_MAX < 32767 || EXIT_FAILURE == EXIT_SUCCESS) return 37004;
+    if (FP_NORMAL == FP_ZERO || FP_NAN == FP_INFINITE || FE_TONEAREST != 0 || EOF != -1) return 37005;
+    if (LC_ALL == LC_NUMERIC || CLOCKS_PER_SEC <= 0) return 37006;
+    if (__cpp_lib_transparent_operators < 201210) return 37007;   // <version> via <functional>
+    {
+        int BUFSIZ = 7;   // a CFlat local outranks the system macro of the same name
+        if (BUFSIZ != 7) return 37008;
+    }
+    // errno is an lvalue macro (read and assigned), assert a function-like one.
+    errno = EDOM;
+    if (errno != EDOM) return 37009;
+    errno = 0;
+    assert(errno == 0);
+    if (errno != 0) return 37010;
+    // T22: C++20 view shapes. Members whose requires-clause fails are absent, the more
+    // constrained of two same-signature members wins, an empty [[no_unique_address]] pair keeps
+    // clang's size, and static begin/end iterate.
+    int[3] t22Seven = {7, 8, 9};
+    int[4] t22Tens = {10, 20, 30, 40};
+    int* t22First = &t22Tens[0];
+    int* t22Last = t22First + 4;
+    cflat_t22.Bounded<int, int> t22Bounded = default;
+    t22Bounded.first = &t22Seven[0];
+    t22Bounded.count = 3;
+    i64 t22BoundedSum = 0; for (int x in t22Bounded) t22BoundedSum += x;
+    if (t22BoundedSum != 24) return 9520;
+    cflat_t22.IntSpan t22Span = default;
+    t22Span.first = t22First;
+    t22Span.last = t22Last;
+    cflat_t22.Pick<cflat_t22.IntSpan> t22Pick = default;
+    cflat_t22.Pick<int> t22PickInt = default;
+    if (t22Pick.which() != 2 || t22PickInt.which() != 1) return 9521;
+    cflat_t22.Elements<cflat_t22.IntSpan, true> t22Elements = default;
+    t22Elements.base = t22Span;
+    i64 t22ElementsSum = 0; for (int x in t22Elements) t22ElementsSum += x;
+    const int* t22ElementsFirst = t22Elements.begin();
+    if (t22ElementsSum != 100 || *t22ElementsFirst != 10) return 9522;
+    auto t22Drop = cflat_t22.Drop<cflat_t22.NoDefault>(cflat_t22.NoDefault(t22First, t22Last), 1);
+    i64 t22DropSum = 0; for (int x in t22Drop) t22DropSum += x;
+    const int* t22DropFirst = t22Drop.begin();
+    if (*t22DropFirst != 20 || t22DropSum != 90) return 9523;
+    auto t22Joined = cflat_t22.make_joined(t22First, 3);
+    i64 t22JoinedSum = 0; for (int x in t22Joined) t22JoinedSum += x;
+    if (sizeof(cflat_t22.Joined) != 24 || t22JoinedSum != 60) return 9524;
+    i64 t22StaticTempSum = 0; for (int x in cflat_t22.StaticDigits<char>()) t22StaticTempSum += x;
+    if (t22StaticTempSum != 6) return 9525;
+    // Naming MSVC's ::type_info must not hand its vftable (vcruntime's) to the demand pass,
+    // which crashed beside any inline polymorphic class's RTTI.
+    std.type_info* t22TypeInfo = nullptr;
+    if (t22TypeInfo != nullptr) return 9526;
+    // A twin pair with a default argument is not pruned: with the default omitted only the
+    // unconstrained member is viable. MSVC (twins share one symbol, the constrained body is
+    // emitted) and full-arity ranking: p3 cpp-constrained-twin-default-argument-ranking.
+    if const (!__WINDOWS__)
+    {
+        cflat_t22.DefaultOnLoser<int> t22DefLoser = default;
+        if (t22DefLoser.pick() != 11) return 9527;
+        cflat_t22.DefaultPrefix<int> t22Prefix = default;
+        if (t22Prefix.pick() != 13) return 9530;
+    }
+    cflat_t22.InstanceF t22InstanceF = default;
+    if (t22InstanceF.f(1) != 2) return 9531;
+
+    // T14: member-template call operators bind for named transparent functors and temporaries.
+    std.plus<void> t14Plus = default;
+    std.less<void> t14Less = default;
+    std.greater<void> t14Greater = default;
+    std.multiplies<void> t14Multiplies = default;
+    if (t14Plus(1, 2) != 3 || t14Plus(1.5, 2.0) != 3.5) return 9480;
+    if (!t14Less(1, 2) || t14Less(2, 1) || !t14Greater(2, 1)) return 9481;
+    if (t14Multiplies(2, 3.5) != 7.0) return 9482;
+    if (std.identity()(5) != 5) return 9483;
+    if (std.less<void>()(2, 1)) return 9484;
+    auto t14Order = std.compare_three_way()(1, 2);
+    if (!std.is_lt(t14Order)) return 9485;
+    cflat_t14.GenericFunctor<void> t14GenericFunctor = default;
+    int t14Lvalue = 3;
+    if (t14GenericFunctor(2, 3) != 23 || t14GenericFunctor(t14Lvalue, 4) != 34)
+        return 9486;
+
+    auto t17FreeEmpty = t17.free_value();
+    auto t17MemberEmpty = t17.Owner().member();
+    if (t17FreeEmpty(1, 2) != 1 || t17MemberEmpty(1, 2) != 1
+        || t17.free_value()(2, 1) != 0 || t17.Owner().member()(2, 1) != 0
+        || t17.consume(t17.free_value()) != 1) return 17001;
+    std.set<int> t17Set = default;
+    t17Set.insert(1);
+    t17Set.insert(2);
+    if (!t17Set.key_comp()(1, 2) || t17Set.key_comp()(2, 1)) return 17002;
+    std.vector<int> t17Vector = default;
+    int* t17Allocation = t17Vector.get_allocator().allocate(1);
+    t17Vector.get_allocator().deallocate(t17Allocation, 1);
+    std.unordered_map<int, int> t17Map = default;
+    t17Map.emplace(17, 19);
+    auto t17Hash = t17Map.hash_function();
+    auto t17Equal = t17Map.key_eq();
+    if (t17Hash(17) != std.hash<int>()(17) || !t17Equal(17, 17)
+        || t17Equal(17, 18) || t17Map.hash_function()(17) != t17Hash(17)) return 17003;
+    auto noopCoroutine = std.noop_coroutine();
+    if (noopCoroutine.done() || noopCoroutine.address() == nullptr) return 9090;
+    noopCoroutine.resume();
+    if (noopCoroutine.done()) return 9091;
+    std.noop_coroutine_handle noopCoroutineHandle = std.noop_coroutine();
+    noopCoroutineHandle.destroy();
+    if (t7coro.gen_sum(5) != 15) return 9092;
+    std.coroutine_handle<> nullCoroutine;
+    if (nullCoroutine || nullCoroutine.address() != nullptr) return 9093;
+    auto fromNullAddress = std.coroutine_handle<>.from_address(nullptr);
+    if (fromNullAddress.address() != nullptr) return 9094;
+    cpp_errc_probe.ConditionEnum t5ScopedEnum = cpp_errc_probe.ConditionEnum.accepted;
+    cpp_errc_probe.PlainConditionEnum t5PlainEnum = cpp_errc_probe.plain_accepted;
+    cpp_errc_probe.ErrorCondition t5Condition = t5ScopedEnum;
+    if (t5Condition.value() != 41 || !(t5Condition == t5ScopedEnum)
+        || !(t5ScopedEnum == t5Condition) || t5Condition != t5ScopedEnum
+        || t5ScopedEnum != t5Condition) return 24001;
+    t5Condition = t5PlainEnum;
+    if (t5Condition.value() != 43 || !(t5Condition == t5PlainEnum)
+        || !(t5PlainEnum == t5Condition) || t5Condition != t5PlainEnum
+        || t5PlainEnum != t5Condition) return 24002;
+    if (cpp_errc_probe.by_const_ref(t5ScopedEnum) != 41
+        || cpp_errc_probe.by_value(t5PlainEnum) != 43) return 24003;
+    if (T5ReturnCondition(t5ScopedEnum).value() != 41) return 24004;
+    cpp_errc_probe.ErrorCondition t5Low = t5ScopedEnum;
+    if (!(t5Low < t5PlainEnum) || !(t5ScopedEnum < t5Condition)) return 24005;
+    cpp_errc_probe.ErrorCode t5Code = default;
+    t5Code.value_ = true;
+    if (!(t5Code == t5ScopedEnum) || !(t5ScopedEnum == t5Code)
+        || t5Code != t5ScopedEnum || t5ScopedEnum != t5Code) return 24006;
+    std.error_condition t5StdCondition = std.errc.invalid_argument;
+    if (t5StdCondition.value() == 0
+        || !(t5StdCondition == std.errc.invalid_argument)) return 24007;
+    std.error_code t5FutureCode = std.future_errc.broken_promise;
+    if (t5FutureCode.value() == 0
+        || !(t5FutureCode == std.future_errc.broken_promise)) return 24008;
+    std.error_condition t5MadeCondition = std.make_error_condition(std.errc.invalid_argument);
+    if (t5MadeCondition.value() == 0
+        || !(t5MadeCondition == std.errc.invalid_argument)) return 24009;
+    // A namespaced class-typed global is a class source, never an enum constant.
+    t5ns.gcond.value_ = 44;
+    cpp_errc_probe.ErrorCondition t5FromGlobal = t5ns.gcond;
+    cpp_errc_probe.ErrorCondition t5AssignGlobal = default;
+    t5AssignGlobal = t5ns.gcond;
+    if (t5FromGlobal.value() != 44 || t5AssignGlobal.value() != 44) return 24010;
+    // T34: a scoped enum's value-construction leaves the enum name a type; the later
+    // qualified enumerator reads 41, not the same-named local (clang: 0 41).
+    {
+        int accepted = 7;
+        cpp_errc_probe.ConditionEnum t34Zero = cpp_errc_probe.ConditionEnum();
+        int t34Accepted = (int)cpp_errc_probe.ConditionEnum.accepted;
+        if ((int)t34Zero != 0 || t34Accepted != 41 || accepted != 7) return 24011;
+    }
+    // T34: a static non-template member beside same-name static member templates binds by
+    // arity (allocator_traits::allocate(a, n)); clang: 104 1104 2109.
+    {
+        t34traits.Alloc t34Alloc = default;
+        int t34Two = t34traits.traits<t34traits.Alloc>.allocate(t34Alloc, 4);
+        int t34Three = t34traits.traits<t34traits.Alloc>.allocate(t34Alloc, 4, nullptr);
+        int t34Four = t34traits.traits<t34traits.Alloc>.allocate(t34Alloc, 4, nullptr, 5);
+        if (t34Two != 104 || t34Three != 1104 || t34Four != 2109) return 34020;
+    }
+    // T24: C++ pointer arguments retain their source type and standard conversions.
+    char[4] t24Chars = "abc";
+    char* t24CharPointer = t24Chars;
+    int[2] t24Ints = { 31, 0 };
+    int t24Scalar = 27;
+    int* t24IntPointer = &t24Scalar;
+    if (t24arg.take_char(t24Chars) != 11 || t24arg.take_const_char(t24CharPointer) != 12)
+        return 24100;
+    if (t24arg.take_const_char("abc") != 12 || t24arg.take_bool(t24Chars) != 14)
+        return 24109;
+    if (t24arg.take_int_pointer(&t24Scalar) != 27
+        || t24arg.take_int_pointer(&t24Ints[0]) != 31) return 24101;
+    if (t24arg.take_int_pointer_pointer(&t24IntPointer) != 27) return 24102;
+    if (t24arg.take_char(t24CharPointer + 1) != 11) return 24103;
+    if (t24arg.pick_char_or_void(t24CharPointer) != 2
+        || t24arg.pick_void_or_bool(t24IntPointer) != 3) return 24104;
+    if (t24arg.take_bool(t24IntPointer) != 14) return 24105;
+    if (t24arg.take_char(nullptr) != 0 || t24arg.take_void(nullptr) != 0) return 24106;
+    T24Record t24Record = default;
+    t24Record.value = 29;
+    if (t24arg.take_void(&t24Record) != 13) return 24107;
+    t24arg.VoidCtor t24Ctor = t24arg.VoidCtor(t24CharPointer);
+    if (t24Ctor.get() != 1) return 24108;
+    // t28: a forwarded literal / function name is not a reference into the wrapper's frame.
+    auto t28Ref = t28.fwd1(t28.triple);
+    t28.scribble();
+    if (t28.call5(t28Ref) != 15) return 28001;
+    const char* t28Lref = t28.id_lref("klm");
+    if (strcmp(t28Lref, "klm") != 0) return 28002;
+    if (std.cflat_t28.len(std.cflat_t28.fwd("abcd")) != 4) return 28003;
+    if (std.cflat_t28.len(std.cflat_t28.fwd("abcdef", 2)) != 6) return 28004;
+    if (std.cflat_t28.call5(std.cflat_t28.fwd(std.cflat_t28.triple)) != 15) return 28005;
+    std.cflat_t28.LitRef t28Escaped = T28Escape();
+    t28.scribble();
+    if (std.cflat_t28.len(t28Escaped) != 4) return 28006;
+    auto t28Kept = std.cflat_t28.fwd("abc");
+    if (std.cflat_t28.advance("abc") != 3 || std.cflat_t28.advanced != 2) return 28007;
+    if (std.cflat_t28.len(t28Kept) != 3) return 28008;
+    if (std.cflat_t28.cref("hello") != 5) return 28009;
+    const char* t28Named = "zz";
+    if (t28.pick("abc") != 2 || t28.pick(t28Named) != 1) return 28010;
+    if (std.cflat_t28.consume(std.cflat_t28.capture("abc"), std.cflat_t28.scribble()) != 3) return 28011;
+    if (std.cflat_t28.consume(std.cflat_t28.capture_t("abcd", 1), std.cflat_t28.scribble()) != 4) return 28012;
+    // Mixed overload sets: clang picks over the literal's array, the caller keeps the pointer.
+    if (std.cflat_t28.consume(std.cflat_t28.mixed_cref("abc"), std.cflat_t28.scribble()) != 3
+        || std.cflat_t28.chosen != 1) return 29001;
+    if (std.cflat_t28.consume(std.cflat_t28.mixed_fwd("abcd"), std.cflat_t28.scribble()) != 4
+        || std.cflat_t28.chosen != 1) return 29002;
+    if (std.cflat_t28.consume(t28.mixed_t("abc", 1), std.cflat_t28.scribble()) != 3
+        || std.cflat_t28.chosen != 1) return 29003;
+    if (std.cflat_t28.consume(t28.mixed_tf("abcde", 1), std.cflat_t28.scribble()) != 5
+        || std.cflat_t28.chosen != 1) return 29004;
+    std.cflat_t28.arraywinner("abc", 1);
+    if (std.cflat_t28.chosen != 2) return 29005;
+    t28.arraywinner("abc", 1);
+    if (std.cflat_t28.chosen != 2) return 29006;
+    t28.Mixed t28Mixed = t28.Mixed();
+    t28Mixed.aw("abc", 1);
+    if (std.cflat_t28.chosen != 2) return 29007;
+    if (std.cflat_t28.consume(t28Mixed.mt("abc", 1), std.cflat_t28.scribble()) != 3
+        || std.cflat_t28.chosen != 1) return 29008;
+    if (t28.consume2(t28.two("abc", "defgh"), std.cflat_t28.scribble()) != 35
+        || std.cflat_t28.chosen != 1) return 29009;
+    if (t3lookup.f1() != 1) return 13001;
+    if (t3lookup.f2() != 1) return 13002;
+    if (t3lookup.f3() != 1) return 13003;
+    if (t3lookup.f4() != 1) return 13004;
+    if (t3lookup.f5() != 3) return 13005;
+    if (t3lookup.f6("x") != 6) return 13006;
+    if (t3lookup.f7() != 1) return 13007;
+    if (t3lookup.f8() != 3) return 13008;
+    if (t3lookup.fp() != 2) return 13009;
+    if (t3lookup.fp2() != 2) return 13010;
+    if (t3lookup.f9() != 1 || t3lookup.f10() != 1) return 13011;
+    if (t3lookup.f11() != 1 || t3lookup.f12() != 2) return 13012;
+    wchar_t[16] lookupWide_ = default;
+    wchar_t* lookupWide = lookupWide_;
+    std.wcscpy(lookupWide, L"wideid");
+    if (std.wcschr(lookupWide, L'd') != lookupWide + 2) return 13011;
+    if (std.wcsrchr(lookupWide, L'i') != lookupWide + 4) return 13012;
+    if (std.wcsstr(lookupWide, L"id") != lookupWide + 1) return 13013;
+    if (std.wcspbrk(lookupWide, L"ix") != lookupWide + 1) return 13014;
+    if (std.wmemchr(lookupWide, L'i', 6) != lookupWide + 1) return 13015;
+
+    int[2] deref8 = default;
+    auto deref8Cursor = cpp_derefcopy.make8(&deref8[0]);
+    *deref8Cursor = 81; *deref8Cursor = 82;
+    if (deref8[0] != 81 || deref8[1] != 82) return 11800;
+    int[2] deref16 = default;
+    auto deref16Cursor = cpp_derefcopy.make16(&deref16[0]);
+    *deref16Cursor = 161; *deref16Cursor = 162;
+    if (deref16[0] != 161 || deref16[1] != 162 || deref16Cursor.count_value() != 2) return 11801;
+    int[2] deref24 = default;
+    auto deref24Cursor = cpp_derefcopy.make24(&deref24[0]);
+    *deref24Cursor = 241; *deref24Cursor = 242;
+    if (deref24[0] != 241 || deref24[1] != 242 || deref24Cursor.size_marker() != 24) return 11802;
+    int[2] derefNontrivial = default;
+    auto derefNontrivialCursor = cpp_derefcopy.make_nontrivial(&derefNontrivial[0]);
+    *derefNontrivialCursor = 301; *derefNontrivialCursor = 302;
+    if (derefNontrivial[0] != 301 || derefNontrivial[1] != 302) return 11803;
+
+    cpp_derefcopy.Node[2] derefNodes = default;
+    auto derefArrow = cpp_derefcopy.make_arrow(&derefNodes[0]);
+    derefArrow->value = 351; derefArrow->value = 352;
+    if (derefNodes[0].value != 351 || derefNodes[1].value != 352) return 11808;
+    int[2] derefPointerData = default;
+    cpp_derefcopy.Cursor16 derefPointer = cpp_derefcopy.make16(&derefPointerData[0]);
+    CxxDerefPointer(&derefPointer, 361);
+    if (derefPointerData[0] != 361 || derefPointerData[1] != 362) return 11809;
+
+    int[2] derefFieldData = default;
+    CxxDerefLocalHolder derefField = default;
+    derefField.cursor = cpp_derefcopy.make16(&derefFieldData[0]);
+    *derefField.cursor = 401; *derefField.cursor = 402;
+    if (derefFieldData[0] != 401 || derefFieldData[1] != 402) return 11804;
+    int[2] derefGlobalData = default;
+    cpp_derefcopy.global_cursor = cpp_derefcopy.make16(&derefGlobalData[0]);
+    *cpp_derefcopy.global_cursor = 501; *cpp_derefcopy.global_cursor = 502;
+    if (derefGlobalData[0] != 501 || derefGlobalData[1] != 502) return 11805;
+    int[2] derefArrayData = default;
+    cpp_derefcopy.Cursor16[1] derefObjects = default;
+    derefObjects[0] = cpp_derefcopy.make16(&derefArrayData[0]);
+    *derefObjects[0] = 601; *derefObjects[0] = 602;
+    if (derefArrayData[0] != 601 || derefArrayData[1] != 602) return 11806;
+    int[2] derefParamData = default;
+    CxxDerefParam(cpp_derefcopy.make16(&derefParamData[0]), 701);
+    if (derefParamData[0] != 701 || derefParamData[1] != 702) return 11807;
+    // Ref-qualified operator* (&, const&, &&) on an lvalue yields the referent, not a pointer.
+    cpp_derefcopy.RefBox derefBox = cpp_derefcopy.RefBox(42);
+    cpp_derefcopy.Tag derefTag = cpp_derefcopy.Tag(42);
+    if (!(*derefBox == 42) || !(*derefBox == derefTag) || (*derefBox).value != 42) return 11810;
+    *derefBox = derefTag; (*derefBox).value = 43;
+    if (derefBox.peek() != 43 || cpp_derefcopy.refbox_last() != 1) return 11811;
+
     // Two groups spell the declaring header differently (`..` include, `\` on Windows): one entity.
     if (cppinl.shared_const.value != 37) return 7890;
     if (cpp_inline_static_a(0) != 10 || cpp_inline_static_b(0) != 20) return 7890;
@@ -1516,6 +1931,13 @@ extern int main()
         if (callable(5) != 13) return 9031;
     }
     if (cppinterop.callable_destructions() != 1) return 9032;
+    // T34: std::function's own named method swap(function&) binds (clang: a(4) == 40, b(4) == 5).
+    {
+        std.function<int(int)> t34SwapA = std.function<int(int)>(fnptr_add_one);
+        std.function<int(int)> t34SwapB = std.function<int(int)>(fnptr_times_ten);
+        t34SwapA.swap(t34SwapB);
+        if (t34SwapA(4) != 40 || t34SwapB(4) != 5) return 34010;
+    }
     // Hidden friend operators of a class template resolve by ADL (nothing at namespace scope).
     auto adlA = cppinterop.make_adl_path(4);
     auto adlB = cppinterop.make_adl_path(2);
@@ -1857,6 +2279,64 @@ extern int main()
 
     // By-value and by-pointer records in the same signature.
     if (cppi.pair_and_small(&recPair, recSmall) != 237) return 322;
+
+    // Clang-coerced aggregate arguments keep its exact coercion type: one argument for
+    // array coercions, including HFA, and target-selected indirect passing for 16-byte Win64 rows.
+    int t20First = 1; int t20Second = 2;
+    t20abi.PtrPair t20PtrPair = default;
+    t20PtrPair.first = &t20First; t20PtrPair.second = &t20Second;
+    if (!t20abi.check_ptr_pair(t20PtrPair)) return 20940;
+    if (!t20abi.check_ptr_pair(t20abi.make_ptr_pair(&t20First, &t20Second))) return 20941;
+
+    t20abi.PtrLong t20PtrLong = default;
+    t20PtrLong.first = &t20First; t20PtrLong.second = 42;
+    if (t20abi.check_ptr_long(t20PtrLong) != 42) return 20942;
+    if (t20abi.check_ptr_long(t20abi.make_ptr_long(&t20First, 42)) != 42) return 20943;
+
+    t20abi.LongPair t20LongPair = default;
+    t20LongPair.first = 19; t20LongPair.second = 23;
+    if (t20abi.sum_long_pair(t20LongPair) != 42) return 20944;
+    if (t20abi.sum_long_pair(t20abi.make_long_pair(20, 22)) != 42) return 20945;
+
+    t20abi.I64Pair t20I64Pair = default;
+    t20I64Pair.first = 20; t20I64Pair.second = 22;
+    if (t20abi.sum_i64_pair(t20I64Pair) != 42) return 20946;
+    if (t20abi.sum_i64_pair(t20abi.make_i64_pair(19, 23)) != 42) return 20947;
+
+    t20abi.DoublePair t20DoublePair = default;
+    t20DoublePair.first = 1.25; t20DoublePair.second = 2.5;
+    if (t20abi.sum_double_pair(t20DoublePair) != 3.75) return 20948;
+    if (t20abi.sum_double_pair(t20abi.make_double_pair(1.5, 2.25)) != 3.75) return 20949;
+
+    t20abi.Float4 t20Float4 = default;
+    t20Float4.a = 1.0f; t20Float4.b = 2.0f; t20Float4.c = 3.0f; t20Float4.d = 4.0f;
+    if (t20abi.sum_float4(t20Float4) != 10.0f) return 20950;
+    if (t20abi.sum_float4(t20abi.make_float4(4.0f, 3.0f, 2.0f, 1.0f)) != 10.0f) return 20951;
+
+    t20abi.Large t20Large = default;
+    t20Large.a = 10; t20Large.b = 12; t20Large.c = 20;
+    if (t20abi.sum_large(t20Large) != 42) return 20952;
+    if (t20abi.sum_large(t20abi.make_large(20, 10, 12)) != 42) return 20953;
+
+    t20abi.MemberProbe t20Member = default;
+    if (t20Member.sum(t20LongPair) != 42) return 20954;
+    if (t20Member.sum(t20abi.make_long_pair(20, 22)) != 42) return 20955;
+    if (t20Member.sum(t20DoublePair) != 3.75) return 20960;
+    if (t20Member.sum(t20abi.make_double_pair(1.5, 2.25)) != 3.75) return 20961;
+    if (t20Member.sum(t20Float4) != 10.0f) return 20962;
+    if (t20Member.sum(t20abi.make_float4(4.0f, 3.0f, 2.0f, 1.0f)) != 10.0f) return 20963;
+    t20abi.CtorProbe t20Ctor = t20abi.CtorProbe(t20LongPair);
+    if (t20Ctor.get() != 42) return 20956;
+    t20abi.CtorProbe t20CtorTemp = t20abi.CtorProbe(t20abi.make_long_pair(19, 23));
+    if (t20CtorTemp.get() != 42) return 20957;
+    t20abi.FriendProbe t20Friend = default;
+    t20Friend.bias = 10;
+    if (t20Friend + t20LongPair != 52) return 20958;
+    if (t20Friend + t20abi.make_long_pair(20, 22) != 52) return 20959;
+
+    t20abi.InsertProbe t20Insert = default;
+    auto t20Position = t20Insert.begin();
+    if (t20Insert.insert(t20Position, 99) != 119) return 20964;
 
     // ---- C++ class members ----------------------------------------------------------------------
     // A trivially copyable class carries no lifetime obligations, so these checks isolate
@@ -3131,6 +3611,59 @@ extern int main()
     if (!(freeopNestedA == freeopNestedA))                 return 806;
 
     // ---- fixed-array pointer ABI and class-typed member defaults --------------------------------
+    char[4] t6Text = { 'a', 'b', 'c', 0 };
+    const char[4] t6ConstText = { 'a', 'b', 'c', 0 };
+    int[3] t6Ints = { 4, 5, 6 };
+    wchar_t[4] t6WideText = { L'a', L'b', L'c', 0 };
+    double[2] t6Doubles = { 2.5, 3.5 };
+    cflat_t6.Record[1] t6Records = default;
+    t6Records[0].value = 9;
+    T6ArrayFieldHolder t6FieldHolder = default;
+    t6FieldHolder.text[0] = 'a'; t6FieldHolder.text[1] = 'b'; t6FieldHolder.text[2] = 'c';
+    int[2][3] t6Matrix = { { 1, 2, 3 }, { 4, 5, 6 } };
+    if (cflat_t6.char_count(t6Text, 2) != 5) return 2300;
+    if (cflat_t6.char_count(t6ConstText, 2) != 5) return 2301;
+    if (cflat_t6.char_count(t6GlobalText, 1) != 4) return 2302;
+    if (cflat_t6.char_count(t6FieldHolder.text, 1) != 4) return 2303;
+    if (cflat_t6.int_first(t6Ints, 1) != 5) return 2304;
+    if (cflat_t6.int_first(t6Matrix[1], 1) != 5) return 2305;
+    if (cflat_t6.record_first(t6Records) != 9) return 2306;
+    if (cflat_t6.pointer_element_size(t6Ints) != sizeof(int)) return 2307;
+    if (cflat_t6.array_extent(t6Ints) != 3) return 2308;
+    if (!cflat_t6.by_value_pointer(t6Ints)) return 2315;
+    if (cflat_t6.wide_count(t6WideText) != 3) return 2312;
+    if (cflat_t6.double_first(t6Doubles) != 2.5) return 2313;
+    if (cflat_t6.range_count(t6Ints, t6Ints + 3) != 3) return 2314;
+    // Fixed arrays prefer pointer overloads; scalar overloads return negative sentinels.
+    if (cflat_t6.pointer_preferred(t6Ints) != 2) return 2316;
+    cflat_t6.IntPointerPreferred t6IntChoice = cflat_t6.IntPointerPreferred(t6Ints);
+    cflat_t6.CharPointerPreferred t6CharChoice = cflat_t6.CharPointerPreferred(t6Text);
+    cflat_t6.CountedCharPointerPreferred t6CountedChoice =
+        cflat_t6.CountedCharPointerPreferred(t6Text, 2);
+    if (t6IntChoice.value != 6 || t6CharChoice.value != 'b'
+        || t6CountedChoice.value != 'c') return 2317;
+    cflat_t6.ArrayText t6ArrayText = cflat_t6.ArrayText(t6Text);
+    cflat_t6.ArrayText t6CountedText = cflat_t6.ArrayText(t6Text, 3);
+    std.string t6ImplicitText = t6Text;
+    if (t6ArrayText.size() != 3 || t6CountedText.size() != 3
+        || t6ImplicitText.size() != 3) return 2309;
+    if (t6ArrayText.copy(t6Text, 3) != 3) return 2310;
+    if (t6ArrayText + t6Text != 6 || !(t6ArrayText == t6Text)) return 2311;
+    int[3] t16Ints = { 1, 2, 3 };
+    char[4] t16Text = { 'a', 'b', 'c', 0 };
+    T16ArrayFieldHolder t16Field = default;
+    t16Field.values[0] = 1; t16Field.values[1] = 2; t16Field.values[2] = 3;
+    cflat_t16.Member t16Member = default;
+    cflat_t16.Operator t16Operator = default;
+    if (cflat_t16.free_bi(t16Ints) != 1) return 16001;
+    if (cflat_t16.free_bs(t16Text) != 3) return 16002;
+    if (cflat_t16.free_lone(t16GlobalInts) != 11) return 16003;
+    if (cflat_t16.free_bv(t16Ints) != 6 || cflat_t16.free_bc(t16Text) != 8) return 16004;
+    if (t16Member.choose(t16Field.values) != 21) return 16005;
+    cflat_t16.Constructed t16Constructed = cflat_t16.Constructed(t16GlobalInts);
+    if (t16Constructed.value != 31) return 16006;
+    if (t16Operator + t16Field.values != 41) return 16007;
+
     if const (__WINDOWS__)
     {
         i64[2] arrabiDims = {17, 18};   // LLP64: `long` is 32 bits, the pointee must be 64
@@ -4259,6 +4792,37 @@ extern int main()
     cppcr.IntRef ctorrefIr = cppcr.IntRef(ctorrefLv);
     if (ctorrefLv != 42 || ctorrefIr.get() != 42)                              return 1969;
 
+    // A raw pointer stays legal for a lone CFlat constructor reference candidate, but C++
+    // overload ranking prefers an actual pointer parameter whenever that candidate is present.
+    int[2] ptrRankData = { 4, 17 };
+    int* ptrRankP = &ptrRankData[0];
+    const int* ptrRankConst = ptrRankP;
+    int* ptrRankNew = new int[4];
+    ptrRankNew[0] = 4; ptrRankNew[1] = 1; ptrRankNew[2] = 3; ptrRankNew[3] = 2;
+    cppcr.PtrRankCtorConst ptrRankCc = cppcr.PtrRankCtorConst(ptrRankP, 2);
+    cppcr.PtrRankCtorConst ptrRankAddr = cppcr.PtrRankCtorConst(&ptrRankData[0], 2);
+    cppcr.PtrRankCtorConst ptrRankCp = cppcr.PtrRankCtorConst(ptrRankConst, 2);
+    cppcr.PtrRankCtorMutable ptrRankCm = cppcr.PtrRankCtorMutable(ptrRankP, 2);
+    cppcr.PtrRankCtorOnly ptrRankCo = cppcr.PtrRankCtorOnly(ptrRankP, 2);
+    cppcr.PtrRankCtorConst ptrRankHeap = cppcr.PtrRankCtorConst(ptrRankNew, 4);
+    cppcr.PtrRankRecord ptrRankRecord = default;
+    ptrRankRecord.v = 29;
+    cppcr.PtrRankRecord* ptrRankRecordP = &ptrRankRecord;
+    cppcr.PtrRankRecordCtor ptrRankRecordCtor = cppcr.PtrRankRecordCtor(ptrRankRecordP, 1);
+    delete ptrRankNew;
+    if (ptrRankCc.chosen != 1 || ptrRankCc.seen != 17
+        || ptrRankAddr.chosen != 1 || ptrRankAddr.seen != 17
+        || ptrRankCp.chosen != 1 || ptrRankCp.seen != 17
+        || ptrRankCm.chosen != 1 || ptrRankCm.seen != 17
+        || ptrRankCo.chosen != 3 || ptrRankCo.seen != 4
+        || ptrRankHeap.chosen != 1 || ptrRankHeap.seen != 1
+        || ptrRankRecordCtor.chosen != 1 || ptrRankRecordCtor.seen != 29
+        || cppcr.ptr_rank_free(ptrRankP) != 117)                         return 1970;
+    cppcr.PtrRankMember ptrRankMember = default;
+    cppcr.PtrRankOperator ptrRankOperator = default;
+    if (ptrRankMember.pick(ptrRankP) != 317 || ptrRankOperator(ptrRankP) != 517)
+                                                                            return 1971;
+
     // M103: a scalar reaching a C++ class through the ctor thunk (the class has a ctor template)
     // binds `const T&` / `T&&` to CALLER storage. Pre-fix each read a dead, clobbered thunk slot.
     cppcr.ThkUser thkU = cppcr.ThkUser(0);
@@ -4403,6 +4967,23 @@ extern int main()
     cppcr.CastWrite* ctorrefCastNew = new cppcr.CastWrite((long)ctorrefCastSrc);
     if (ctorrefCastNew->chosen != 2 || ctorrefCastSrc != 4) return 7143;
     delete ctorrefCastNew;
+
+    // C++ templates deduce a literal's source type, not the width of its lowered constant.
+    if (cppref.literal_cref_size(100) != 104
+        || cppref.literal_cref_size(-100) != -96
+        || cppref.literal_cref_size(2.0) != 10
+        || cppref.literal_cref_size((2.0)) != 10
+        || cppref.literal_cref_size(2.0f) != 6
+        || cppref.literal_cref_size('A') != 66
+        || cppref.literal_cref_size(true) != 2) return 7180;
+    if (cppref.literal_size(2147483648) != 8
+        || cppref.literal_size(100u) != 4
+        || cppref.literal_size(nullptr) != 8) return 7183;
+    if (cppref.literal_value_size(100) != 104
+        || cppref.literal_value_size(2.0) != 10
+        || cppref.literal_concrete_cref(100) != 100) return 7181;
+    cppref.LiteralRefMember<int> literalRefMember;
+    if (literalRefMember.cref(100) != 104) return 7182;
     // A cast into a ctor-template-only class binds the converting thunk's own slot (the
     // pre-fix path took the operand as an lvalue and crashed).
     if (thkU.any((long long)ctorrefCastSrc) != 4) return 7144;
@@ -4856,6 +5437,8 @@ extern int main()
     std.string fopRight = fopA + " there";
     char* fopRightP = fopRight.c_str();
     if ((int)fopRight.size() != 11 || fopRightP[5] != ' ' || fopRightP[10] != 'e') return 2102;
+    std.string fopRaw = fopA + fopB.c_str();
+    if ((int)fopRaw.size() != 11 || fopRaw.c_str()[10] != 'd')               return 10134;
     std.string fopLeft = "say " + fopA;
     char* fopLeftP = fopLeft.c_str();
     if ((int)fopLeft.size() != 9 || fopLeftP[0] != 's' || fopLeftP[4] != 'h')  return 2103;
@@ -4886,6 +5469,123 @@ extern int main()
     std.string fopPlusEq2 = std.string("hi");
     fopPlusEq2 += fopNum1;
     if ((int)fopPlusEq2.size() != 3)                                           return 2115;
+
+    // Scalar conversions for lazy C++ expression templates happen in this caller frame, so
+    // valarray's stored reference remains live until assignment consumes the expression.
+    std.valarray<int> t10Values = std.valarray<int>(1);
+    t10Values[0] = 4;
+    short t10Short = 100;
+    char t10Char = 'A';
+    unsigned char t10Uchar = 5;
+    bool t10Bool = true;
+    t10Values[0] = 4; t10Values = t10Short * t10Values;
+    if (t10Values[0] != 400)                                                   return 10156;
+    t10Values[0] = 4; t10Values = t10Short / t10Values;
+    if (t10Values[0] != 25)                                                    return 10157;
+    t10Values[0] = 4; t10Values = t10Values * t10Short;
+    if (t10Values[0] != 400)                                                  return 10143;
+    t10Values[0] = 4; t10Values = t10Values / t10Short;
+    if (t10Values[0] != 0)                                                    return 10144;
+    t10Values[0] = 4; t10Values = t10Values + t10Short;
+    if (t10Values[0] != 104)                                                  return 10135;
+    if (T10ValarrayShortRight(100) != 104 || T10ValarrayShortLeft(100) != 104) return 10154;
+    t10Values[0] = 4; t10Values = t10Short - t10Values;
+    if (t10Values[0] != 96)                                                    return 10155;
+    t10Values[0] = 4; t10Values = t10Values + 'A';
+    if (t10Values[0] != 69)                                                   return 10136;
+    t10Values[0] = 4; t10Values = t10Values + t10Char;
+    if (t10Values[0] != 69)                                                   return 10137;
+    t10Values[0] = 4; t10Values = t10Values + (short)100;
+    if (t10Values[0] != 104)                                                  return 10138;
+    t10Values[0] = 4; t10Values = t10Values + t10Uchar;
+    if (t10Values[0] != 9)                                                    return 10139;
+    t10Values[0] = 4; t10Values = t10Values + t10Bool;
+    if (t10Values[0] != 5)                                                    return 10140;
+    t10Values[0] = 4; t10Values = t10Short + t10Values;
+    if (t10Values[0] != 104)                                                  return 10141;
+    t10Values[0] = 4; t10Values = t10Values - t10Short;
+    if (t10Values[0] != -96)                                                  return 10142;
+    t10Values[0] = 4; t10Values = t10Values + t10Short + t10Short;
+    if (t10Values[0] != 204)                                                  return 10145;
+    std.valarray<int> t10Other = std.valarray<int>(1); t10Other[0] = 3;
+    t10Values = t10Values + t10Other;
+    if (t10Values[0] != 207)                                                  return 10146;
+    std.valarray<double> t10Doubles = std.valarray<double>(1); t10Doubles[0] = 3.0;
+    float t10Float = 2.5;
+    t10Doubles = t10Doubles + t10Float;
+    if (t10Doubles[0] != 5.5)                                                 return 10147;
+
+    std.complex<double> t10Complex = std.complex<double>(3.0, 0.0);
+    t10Complex = t10Complex + 2.0;
+    if (t10Complex.real() != 5.0)                                             return 10148;
+    t10Complex = t10Complex - 2.0;
+    if (t10Complex.real() != 3.0)                                             return 10149;
+    t10Complex = t10Complex * 2.0;
+    if (t10Complex.real() != 6.0)                                             return 10150;
+    t10Complex = t10Complex / 2.0;
+    if (t10Complex.real() != 3.0)                                             return 10151;
+    t10Complex = 2.0 + t10Complex;
+    if (t10Complex.real() != 5.0)                                             return 10152;
+    t10Complex = std.complex<double>(3.0, 0.0);
+    t10Complex = 2.0 - t10Complex;
+    if (t10Complex.real() != -1.0)                                            return 10158;
+    t10Complex = 2.0 * t10Complex;
+    if (t10Complex.real() != -2.0)                                            return 10159;
+    t10Complex = std.complex<double>(3.0, 0.0);
+    t10Complex = 2.0 / t10Complex;
+    if (t10Complex.real() < 0.6666666666 || t10Complex.real() > 0.6666666667) return 10160;
+
+    t10_refexpr.X t10X = default; t10X.value = 4;
+    if ((t10X + t10Short).eval() != 104)                                      return 10153;
+    // Round 3: the wrapper formal is the selected operator's `const S&` (clang's own pick),
+    // never the result's value_type. Scalar-left iterator arithmetic takes difference_type by
+    // value and Box takes `double` by value: master's wrapper (and clang's values) stand.
+    std.vector<double> t10Vd = default;
+    t10Vd.push_back(1.5); t10Vd.push_back(2.5); t10Vd.push_back(3.5); t10Vd.push_back(4.5);
+    long long t10N = 2;
+    auto t10ItLl = t10N + t10Vd.begin();
+    if (*t10ItLl != 3.5)                                                       return 33100;
+    auto t10ItLit = 1 + t10Vd.begin();
+    if (*t10ItLit != 2.5)                                                      return 33101;
+    auto t10ItRev = t10N + t10Vd.rbegin();
+    if (*t10ItRev != 2.5)                                                      return 33102;
+    std.string t10Hello = std.string("hello");
+    auto t10ItStr = t10N + t10Hello.begin();
+    if (*t10ItStr != 'l')                                                      return 33103;
+    std.vector<char> t10Vc = default;
+    for (int t10J = 0; t10J < 300; t10J++) t10Vc.push_back((char)(t10J % 100));
+    int t10I = 260;
+    auto t10ItChar = t10I + t10Vc.begin();
+    if ((int)*t10ItChar != 60)                                                 return 33104;
+    auto t10ItCharLit = 260 + t10Vc.begin();
+    if ((int)*t10ItCharLit != 60)                                              return 33105;
+    t10_refexpr.Box<int> t10Box = default; t10Box.v = 10;
+    t10_refexpr.Box<int> t10BoxR = default;
+    t10BoxR = t10Box - 2.5;
+    if (t10BoxR.v != 95)                                                       return 33106;
+    // Widening into the selected `const S&` for other element types (clang values; master
+    // read a dangling wrapper temporary for every one of these).
+    std.valarray<short> t10Vs = std.valarray<short>(1); t10Vs[0] = 7;
+    std.valarray<short> t10Rs = default;
+    t10Rs = t10Vs + 1;
+    if ((int)t10Rs[0] != 8)                                                    return 33107;
+    t10Rs = 3 * t10Vs;
+    if ((int)t10Rs[0] != 21)                                                   return 33108;
+    std.valarray<long long> t10Vl = std.valarray<long long>(1); t10Vl[0] = 10000000000;
+    std.valarray<long long> t10Rl = default;
+    t10Rl = t10Vl + t10I;
+    if (t10Rl[0] != 10000000260)                                               return 33109;
+    t10Rl = t10Short * t10Vl;
+    if (t10Rl[0] != 1000000000000)                                             return 33110;
+    std.valarray<float> t10Vf = std.valarray<float>(1); t10Vf[0] = 1.0;
+    std.valarray<float> t10Rf = default;
+    t10Rf = t10Vf + 2.5;
+    if (t10Rf[0] != 3.5)                                                       return 33111;
+    unsigned short t10Ushort = 7;
+    t10Values[0] = 4; t10Values = t10Values + t10Ushort;
+    if (t10Values[0] != 11)                                                    return 33112;
+    t10Values[0] = 4; t10Values = t10Values + t10Values * t10Short;
+    if (t10Values[0] != 404)                                                   return 33113;
 
     // The same binding on a class template in a header the fixture owns, so the path is not
     // std::string specific. Each cppfop operator adds its own tag to the result, so a leg tells
@@ -7804,6 +8504,31 @@ extern int main()
         if (subDIL[3] != 1 || subDIL[se] != 1 || subDIL[sb] != 1 || subDLI[se] != 1) return 31769;
     }
 
+    // Valarray-shaped template index overloads: scalar-first projection must retain the later
+    // const-lvalue candidate, in both libc++ and MSVC declaration orders (clang++ oracle).
+    {
+        t29sub.LibcScalarFirst<int> libcScalarFirst = default;
+        if (libcScalarFirst[0] != 10) return 31770;
+        t29sub.LibcScalarFirst<bool> libcMask = default;
+        if (libcScalarFirst[libcMask] != 20) return 31770;
+
+        t29sub.LibcMaskFirst<int> libcMaskFirst = default;
+        t29sub.LibcMaskFirst<bool> libcMaskFirstArg = default;
+        if (libcMaskFirst[libcMaskFirstArg] != 20 || libcMaskFirst[0] != 10) return 31771;
+
+        t29sub.MsvcScalarFirst<int> msvcScalarFirst = default;
+        if (msvcScalarFirst[0] != 10) return 31772;
+        t29sub.MsvcScalarFirst<bool> msvcMask = default;
+        if (msvcScalarFirst[msvcMask] != 20) return 31772;
+
+        t29sub.MsvcMaskFirst<int> msvcMaskFirst = default;
+        t29sub.MsvcMaskFirst<bool> msvcMaskFirstArg = default;
+        if (msvcMaskFirst[msvcMaskFirstArg] != 20 || msvcMaskFirst[0] != 10) return 31773;
+        // An rvalue index still picks the T&& overload once the const& one is bound.
+        if (libcScalarFirst[t29sub.LibcScalarFirst<bool>()] != 30) return 31774;
+        if (msvcScalarFirst[move msvcMask] != 30) return 31775;
+    }
+
     // Reference arms carry the selected referent's address through each pointer sink.
     bool trDeclChoice = true;
     ternref.C* trDecl = trDeclChoice ? ternref.ref_a() : ternref.ref_b();
@@ -9563,6 +10288,24 @@ extern int main()
         int mrpResult = ~*mrp;
         if (mrpResult != 23 || mr.v != 23) return 31935;
     }
+    // Explicit operator bool is contextual in conditions and logical operators, never a
+    // comparison conversion. The implicit bool/int and declared comparison paths stay viable.
+    {
+        cppfopun.EB explicitBool = default;
+        if (!explicitBool || !(explicitBool && true) || !(false || explicitBool)) return 31950;
+        int selected = explicitBool ? 4 : 5;
+        if (!(bool)explicitBool || selected != 4) return 31951;
+        std.optional<int> present = std.optional<int>(7);
+        std.unique_ptr<cppfopun.EB> empty = default;
+        std.function<int(int)> callable = fnptr_add_one;
+        if (!present || empty || !callable || callable(1) != 2) return 31952;
+        cppfopun.B implicitBool = default;
+        cppfopun.I implicitInt = default;
+        if (!(implicitBool == true) || !(implicitInt == 7)) return 31953;
+        cppi.Ops declared = default;
+        declared.value = 7;
+        if (!(declared == 7) || !(8 == declared)) return 31954;
+    }
     int opMoveRc = OpMoveNontrivialLegs();
     if (opMoveRc != 0) return opMoveRc;
     int loweredDtorRc = LoweredUserDtorAssignLegs(1);
@@ -9598,6 +10341,132 @@ extern int main()
         w4R = W4NestedJoin(0);
         if (w4R != -1 || cppon.live() != 0 || cppon.dtors() != 0
             || cppon.clsNew() != 0 || cppon.clsDel() != 0) return 3204;
+    }
+    // Pointer-to-reference ranking keeps only candidates whose referent matches the pointee.
+    int[2] ptrRefData = { 7, 19 };
+    int* ptrRefP = &ptrRefData[0];
+    int ptrRefLocal = 7;
+    // A named int* never binds int& (lone or in a set, like clang); &x and array decay do.
+    expect_error("no overload") { cppcr.ptrref_two(ptrRefP); }
+    expect_error("no overload") { cppcr.ptrref_intlong(ptrRefP); }
+    expect_error("no overload") { cppcr.ptrref_const(ptrRefP); }
+    if (cppcr.ptrref_two(&ptrRefData[0]) != 17 || cppcr.ptrref_two(&ptrRefLocal) != 17
+        || cppcr.ptrref_two(ptrRefData) != 17 || cppcr.ptrref_const(&ptrRefLocal) != 67
+        || cppcr.ptrref_cbool(ptrRefP) != 1) return 3205;
+    cppcr.PtrRefS ptrRefS = default; ptrRefS.v = 23;
+    cppcr.PtrRefS* ptrRefSP = &ptrRefS;
+    if (cppcr.ptrref_struct(ptrRefSP) != 103) return 3206;
+    cppcr.PtrRefDerived ptrRefDerived = default; ptrRefDerived.v = 29; ptrRefDerived.extra = 31;
+    cppcr.PtrRefBase* ptrRefBaseP = &ptrRefDerived;
+    if (cppcr.ptrref_base(ptrRefBaseP) != 129) return 3207;
+    double[1] ptrRefDoubles = { 7.0 };
+    double* ptrRefDP = &ptrRefDoubles[0];
+    if (cppcr.ptrref_double(ptrRefDP) != 57) return 3208;
+    expect_error("no overload") { cppcr.ptrref_double(ptrRefP); }
+    cppcr.PtrRefCtor ptrRefCtor = cppcr.PtrRefCtor(ptrRefP);
+    char[2] ptrRefChars = { 81, 0 }; char* ptrRefCP = &ptrRefChars[0];
+    if (ptrRefCtor.which != 1 || ptrRefCtor.seen != 7 || cppcr.ptrref_str(ptrRefCP) != 81)
+        return 3209;
+    expect_error("no overload") { cppcr.ptrref_mismatch(ptrRefP); }
+    // Iterator difference is a hidden friend template beside the member offset overload.
+    cppitdiff.Iter<int> t19Begin = default; t19Begin.position = 2;
+    cppitdiff.Iter<int> t19End = default; t19End.position = 7;
+    if (t19End - t19Begin != 5) return 19210;
+    cppitdiff.Iter<long> t19ConstEnd = default; t19ConstEnd.position = 7;
+    if (t19ConstEnd - t19Begin != 5) return 19211;
+    if (cppitdiff.makeIter(9) - cppitdiff.makeIter(4) != 5) return 19212;
+    std.vector<int> t19Vector = std.vector<int>({1, 2, 3, 4});
+    auto t19VectorBegin = t19Vector.begin(); auto t19VectorEnd = t19Vector.end();
+    if (t19VectorEnd - t19VectorBegin != 4) return 19213;
+    if (t19Vector.end() - t19Vector.begin() != 4) return 19214;
+    if (*(t19VectorEnd - 1) != 4 || *(t19VectorBegin + 2) != 3
+        || *(2 + t19VectorBegin) != 3) return 19215;
+    t19VectorBegin += 1;
+    if (t19VectorBegin != t19Vector.begin() + 1 || !(t19VectorBegin < t19VectorEnd)) return 19216;
+    if (t19Vector.cbegin() - t19VectorBegin != -1
+        || t19Vector.cend() - t19VectorBegin != 3) return 19217;
+    if (t19Vector.rbegin() - t19Vector.rend() != -4) return 19218;
+    if (std.distance(t19Vector.begin(), t19Vector.end()) != 4) return 19219;
+    std.deque<int> t19Deque = std.deque<int>({1, 2, 3, 4});
+    if (t19Deque.end() - t19Deque.begin() != 4) return 19220;
+    std.string t19String = std.string("abc");
+    if (t19String.end() - t19String.begin() != 3) return 19221;
+    std.array<int, 4> t19Array = default;
+    if (t19Array.end() - t19Array.begin() != 4) return 19222;
+    // T31: a brace list deduces T only against initializer_list<T>; the (const T&, const T&)
+    // templates drop out (clang++ -std=c++20: value, which() = 3 list / 2 pair / 4 list+compare).
+    // std.* names take the unbound free-function route; t31u.big the registered-template route.
+    int t31x = 3; int t31y = 11;
+    if (std.t31.mx({3, 9, 4}) != 9 || std.t31.which() != 3)                     return 31001;
+    if (std.t31.mx(2, 7) != 7 || std.t31.which() != 2)                          return 31002;
+    if (std.t31.mx({t31x, t31y, 4}) != 11 || std.t31.which() != 3)              return 31003;
+    if (std.t31.mx<int>({t31x, 1}) != 3 || std.t31.which() != 3)                return 31004;
+    if (std.t31.mx({3, 9, 4}, std.t31.greater()) != 3 || std.t31.which() != 4) return 31005;
+    auto t31m = std.t31.mnmx({t31x, t31y, 7});
+    if (t31m.first != 3 || t31m.second != 11 || std.t31.which() != 3)           return 31006;
+    if (std.t31.count({1, 2, 3}) != 3)                                          return 31007;
+    if (std.t31.mx<double>({2.5, 1}) != 2.5 || std.t31.which() != 3)            return 31008;
+    if (std.t31.mx<short>({3, 9}) != 9 || std.t31.which() != 3)                 return 31009;
+    if (t31u.big({3, 9, 4}) != 9 || t31u.which() != 3)                          return 31010;
+    if (t31u.big(2, 7) != 7 || t31u.which() != 2)                               return 31011;
+    if (t31u.big<int>({t31x, t31y}) != 11 || t31u.which() != 3)                 return 31012;
+    // Mixed elements: clang's deduction fails, so the call is refused, never ranked.
+    expect_error("could not be bound") { int t31a = std.t31.mx({3, 2.5}); }
+    expect_error("accepts these argument types") { int t31b = t31u.big({3, 2.5}); }
+    expect_error("accepts these argument types") { int t31c = t31u.big<int>({t31x, 2.5}); }
+    // Round 3: a result that can hold an address (pointer or reference into an element, a view,
+    // a pointer to an element's member) binds over CALLER-frame list storage whose elements
+    // live to the end of the statement, as C++'s full-expression: values match clang++.
+    if (std.t31.first({4, 5})[0] != 4)                                          return 31013;
+    auto t31t = std.t31.sum_of({4, 5, t31x});
+    if (t31t.sum != 12 || t31t.n != 3)                                          return 31014;
+    long t31l1 = 1; long t31l2 = 2;
+    if (std.t31.stable({t31l1, t31l2}) != 42 || std.t31.stable({1, 2}) != 42) return 31015;
+    auto t31o = std.t31.owner_of({4, 5});
+    if (*t31o.data != 5)                                                        return 31016;
+    if (std.t31.pick({"x", "y"})[0] != 'y')                                     return 31017;
+    if (std.t31.view_of({4, 5}).at[0] != 5)                                     return 31018;
+    std.t31.cell t31c4 = std.t31.cell(4); std.t31.cell t31c5 = std.t31.cell(5);
+    int t31d0 = std.t31.dead();
+    // Consumed inside the statement: no list element destroyed yet; both die at its end.
+    if (std.t31.observe(std.t31.cleanup({t31c4, t31c5})) - t31d0 * 100 != 5)   return 31019;
+    if (std.t31.dead() - t31d0 != 2)                                            return 31020;
+    if (std.t31.observe_value(std.t31.member_of({t31c4, t31c5})) - (t31d0 + 2) * 100 != 4)
+        return 31021;
+    if (std.t31.dead() - t31d0 != 4)                                            return 31022;
+    // Round 4: lists built in a '?:' arm or a '&&' / '||' operand, and lists of non-trivial
+    // elements behind a pointer-free result, die at the END of the statement (clang values).
+    bool t31on = std.t31.dead() >= 0;
+    int t31d1 = std.t31.dead();
+    if (std.t31.get(t31on ? std.t31.at({t31c4, t31c5}) : std.t31.at({t31c5, t31c4})) - t31d1 * 100 != 4)
+        return 31023;
+    if (std.t31.dead() - t31d1 != 2)                                            return 31024;
+    if (!(std.t31.number({t31c5, t31c4}) - (t31d1 + 2) * 100 == 5 && std.t31.dead() == t31d1 + 2))
+        return 31025;
+    if (!(t31on && std.t31.get(std.t31.at({t31c4, t31c5})) > 0 && std.t31.dead() == t31d1 + 4))
+        return 31026;
+    if (!(!t31on || std.t31.get(std.t31.at({t31c4, t31c5})) == 0 || std.t31.dead() == t31d1 + 6))
+        return 31027;
+    if (!t31on && std.t31.get(std.t31.at({t31c4, t31c5})) > 0)                 return 31028;
+    if (std.t31.dead() - t31d1 != 8)                                            return 31029;
+    std.t31.ocell t31o1 = std.t31.ocell(1); std.t31.ocell t31o2 = std.t31.ocell(2);
+    std.t31.ocell t31o3 = std.t31.ocell(3);
+    int t31ol = std.t31.olog();
+    if (std.t31.oget(std.t31.oat({std.t31.oref(std.t31.oat({t31o1, t31o2})), t31o3})) != 1)
+        return 31030;
+    if (std.t31.olog() != 3121)                                                 return 31031;
+    // A list that becomes an array or aggregate temporary of the wrapper cannot be kept alive
+    // by the caller: an address-carrying result is refused (clang would keep it to the end).
+    expect_error("only when it reaches the callee as its") { int t31r = std.t31.arr_first({4, 5})[1]; }
+    expect_error("only when it reaches the callee as its") { int t31u2 = std.t31.duo_b({4, 5})[0]; }
+    // Round 5: with a pointer-free result, trivial elements still bind; NON-trivial elements
+    // would be destroyed in the wrapper before the end of the expression, so they are refused.
+    if (std.t31.arr_two<int>({4, 5}) != 2)                                      return 31032;
+    expect_error("would destroy them before the end of the expression") {
+        int t31n1 = std.t31.arr_two<std.t31.cell>({t31c4, t31c5});
+    }
+    expect_error("would destroy them before the end of the expression") {
+        int t31n2 = std.t31.pair_two<std.t31.cell>({t31c4, t31c5});
     }
     return 0;
 }
@@ -9767,6 +10636,77 @@ int OpMoveNontrivialLegs()
         cUse &= move dUse;
         int after = dUse.v;
     }
+    // A C++ class T&& call result is a CFlat class xvalue backed by the referent address.
+    std.optional<std.string> t9StringOptional = std.optional<std.string>(std.string("xyz"));
+    if (*std.optional<std.string>(std.string("xyz")) != "xyz") return 31901;
+    if (*std.optional<std.string>(std.string("xyz")) != std.string("xyz")) return 31902;
+    if (*t9MakeStringOptional() != "xyz") return 31912;
+    if (std.move(t9StringOptional).value() != "xyz" || !t9StringOptional.has_value()
+        || t9StringOptional.value() != "xyz") return 31903;
+    std.optional<std.string> t9AssignOptional = std.optional<std.string>(std.string("abc"));
+    std.string t9AssignedString = std.string("old");
+    t9AssignedString = std.move(t9AssignOptional).value();
+    if (t9AssignedString != "abc" || !t9AssignOptional.has_value()
+        || t9AssignOptional.value().size() != 0) return 31917;
+    std.string t9MoveSource = std.string("xyz");
+    std.string t9ForwardSource = std.string("xyz");
+    if (std.move(t9MoveSource) != "xyz" || std.forward<std.string>(t9ForwardSource) != "xyz"
+        || t9MoveSource != "xyz" || t9ForwardSource != "xyz") return 31911;
+    std.string t9StringCopy = *t9MakeStringOptional();
+    if (t9StringCopy != "xyz" || std.move(t9StringOptional).value().size() != 3) return 31904;
+    cppi_rvref.reset_counts();
+    {
+        auto t9CountedOptional = cppi_rvref.make_optional(39);
+        int t9Read = std.move(t9CountedOptional).value().value();
+        if (t9Read != 39 || !t9CountedOptional.has_value()
+            || t9CountedOptional.value().value() != 39 || cppi_rvref.moves != 0
+            || cppi_rvref.copies != 0) return 31909;
+    }
+    if (cppi_rvref.moves != 0 || cppi_rvref.copies != 0
+        || cppi_rvref.destructors != 1) return 31910;
+    cppi_rvref.reset_counts();
+    {
+        cppi_rvref.Owner t9Owner = cppi_rvref.Owner(41);
+        cppi_rvref.Counted t9Moved = std.move(t9Owner).value();
+        if (t9Owner.peek() != -1 || t9Moved.value() != 41
+            || cppi_rvref.moves != 1 || cppi_rvref.copies != 0) return 31905;
+    }
+    if (cppi_rvref.constructors != 1 || cppi_rvref.copies != 0
+        || cppi_rvref.moves != 1 || cppi_rvref.destructors != 2) return 31906;
+    cppi_rvref.reset_counts();
+    {
+        const cppi_rvref.Counted t9ConstSource = cppi_rvref.Counted(47);
+        cppi_rvref.Counted t9Copied = cppi_rvref.copy_result(t9ConstSource);
+        if (t9ConstSource.value() != 47 || t9Copied.value() != 47
+            || cppi_rvref.copies != 1 || cppi_rvref.moves != 0) return 31907;
+    }
+    if (cppi_rvref.constructors != 1 || cppi_rvref.copies != 1
+        || cppi_rvref.moves != 0 || cppi_rvref.destructors != 2) return 31908;
+    cppi_rvref.reset_counts();
+    {
+        cppi_rvref.Owner t9ByValueOwner = cppi_rvref.Owner(53);
+        if (cppi_rvref.by_value(std.move(t9ByValueOwner).value()) != 53
+            || t9ByValueOwner.peek() != -1 || cppi_rvref.moves != 1) return 31913;
+    }
+    if (cppi_rvref.destructors != 2 || cppi_rvref.copies != 0) return 31914;
+    cppi_rvref.reset_counts();
+    {
+        cppi_rvref.Owner t9ConstRefOwner = cppi_rvref.Owner(59);
+        cppi_rvref.Owner t9RvalueRefOwner = cppi_rvref.Owner(61);
+        if (cppi_rvref.by_const_ref(std.move(t9ConstRefOwner).value()) != 59
+            || cppi_rvref.by_rvalue_ref(std.move(t9RvalueRefOwner).value()) != 161
+            || t9ConstRefOwner.peek() != 59 || t9RvalueRefOwner.peek() != 61
+            || cppi_rvref.copies != 0 || cppi_rvref.moves != 0) return 31915;
+    }
+    if (cppi_rvref.destructors != 2) return 31916;
+    // `*optional_temp()` is an xvalue: copy-init move-constructs like clang (was a copy).
+    cppi_rvref.reset_counts();
+    {
+        cppi_rvref.Counted t9DerefMoved = *cppi_rvref.make_optional(43);
+        if (t9DerefMoved.value() != 43 || cppi_rvref.moves != 1
+            || cppi_rvref.copies != 0) return 31918;
+    }
+    if (cppi_rvref.destructors != 2) return 31919;
     return 0;
 }
 
@@ -9821,6 +10761,7 @@ LdtLockHolder LdtMakeLocked()
     LdtLockable m; LdtLockHolder w;
     lock (m) { return w; }
 }
+t26v.left t26GlobalLeft = default;
 int LoweredUserDtorAssignLegs(int argc)
 {
     LdtHolder a; a.id = 1;
@@ -9863,6 +10804,227 @@ int LoweredUserDtorAssignLegs(int argc)
     cppi.q5_return_reset();
     { LdtLockHolder locked = LdtMakeLocked(); }
     if (!cppi.q5_return_ready()) return 31741;
+    // T8: MSVC and libc++ candidate declaration orders have the same C++20 winners.
+    t8.msvc.Shared<int> t8MsvcShared = t8.msvc.Shared<int>(nullptr);
+    t8.libcxx.Shared<int> t8LibcxxShared = t8.libcxx.Shared<int>(nullptr);
+    if ((t8MsvcShared == nullptr) != 102 || (t8LibcxxShared == nullptr) != 102) return 31750;
+    if ((t8MsvcShared != nullptr) != 107 || (t8LibcxxShared != nullptr) != 107) return 31751;
+    if ((t8MsvcShared < nullptr) != 110 || (t8LibcxxShared < nullptr) != 110) return 31752;
+    if ((t8.msvc.ref == nullptr) != 102 || (t8.libcxx.ref == nullptr) != 102) return 31742;
+    if ((t8.msvc.ref != nullptr) != 107 || (t8.libcxx.ref != nullptr) != 107) return 31743;
+    if ((t8.msvc.ref < nullptr) != 110 || (t8.libcxx.ref < nullptr) != 110) return 31744;
+    if ((t8.msvc.ref == (int*)nullptr) != 112 || (t8.libcxx.ref == (int*)nullptr) != 112) return 31748;
+    if (t8.msvc.f(nullptr) != 121 || t8.libcxx.f(nullptr) != 121
+        || t8.ctorPick.tag != 150) return 31745;
+    if (t8.mutableMsvc.get() != 131 || t8.mutableLibcxx.get() != 141
+        || t8.mutableMsvc.begin() != 131 || t8.mutableLibcxx.begin() != 141
+        || t8.mutableMsvc[0] != 131 || t8.mutableLibcxx[0] != 141
+        || *t8.mutableMsvc != 131 || *t8.mutableLibcxx != 141
+        || t8.mutableMsvc->n != 41 || t8.mutableLibcxx->n != 41) return 31746;
+    if (t8.constMsvc.get() != 130 || t8.constLibcxx.get() != 140
+        || t8.constMsvc.begin() != 130 || t8.constLibcxx.begin() != 140
+        || t8.constMsvc[0] != 130 || t8.constLibcxx[0] != 140
+        || *t8.constMsvc != 130 || *t8.constLibcxx != 140
+        || t8.constMsvc->n != 40 || t8.constLibcxx->n != 40) return 31747;
+    if (t8.constHolder.msvc.get() != 130 || t8.constHolder.libcxx.get() != 140
+        || t8.constHolder.msvc.begin() != 130 || t8.constHolder.libcxx.begin() != 140
+        || t8.constHolder.msvc[0] != 130 || t8.constHolder.libcxx[0] != 140
+        || *t8.constHolder.msvc != 130 || *t8.constHolder.libcxx != 140
+        || t8.constHolder.msvc->n != 40 || t8.constHolder.libcxx->n != 40) return 31749;
+    // T12: a harvested operator==<int, int> never binds nullptr (the nullptr_t template wins),
+    // and a mixed-type hidden friend comparison is found by ADL.
+    t12.Sp<int> t12Sp = t12.makeSp();
+    t12.Sp<int> t12Empty;
+    if (t12Sp == t12Empty || t12Sp == nullptr || !(t12Empty == nullptr) || t12.makeSp() == nullptr
+        || nullptr == t12Sp || !(t12Sp != nullptr) || t12Empty != nullptr) return 31770;
+    t12.CodeT<int> t12Code = t12.makeCode(1);
+    t12.Cond t12Cond = t12.Ec.a;
+    if (!(t12Code == t12.Ec.a) || t12Code == t12.Ec.b || !(t12Cond == t12.Ec.a)
+        || t12Cond.value() != 101 || t12Code != t12.Ec.a || !(t12.Ec.a == t12Code)) return 31771;
+    // MSVC bitset shape: the non-const operator[] returns a member class of the template by value;
+    // pre-fix that member stayed incomplete, the overload was refused and the const one won.
+    t12.Bits<8> t12Bits = default;
+    t12Bits[2] = true; t12Bits[4] = true; t12Bits[2].flip(); t12Bits[6] = t12Bits[4];
+    bool t12Bit2 = t12Bits[2]; bool t12Bit6 = t12Bits[6]; bool t12Inv = ~t12Bits[0];
+    if (t12Bit2 || !t12Bit6 || !t12Inv || t12Bits.word != 80) return 31776;
+    // operator() and unary * return the same lazily completed proxy: the non-const one must win.
+    t12.Bits<8> t12Call = default;
+    t12Call(3).flip(); t12Call(5).flip(); t12Call(3).flip();
+    if (t12Call.word != 32 || !t12Call(5)) return 31777;
+    t12.Bits<8> t12Deref = default;
+    (*t12Deref).flip();
+    if (t12Deref.word != 1 || !(*t12Deref)) return 31778;
+    // The proxy still wins when clang spells the owner with an apostrophe (CharBox<'a'>), and when
+    // an unrelated sibling of the name was refused first (incomplete return, deleted, private).
+    t12.CharBox<97> t12Chars = default;
+    t12Chars(0).flip();
+    if (t12Chars.word != 1 || t12Chars(0).tag() != 97) return 31779;
+    t12.Mask<5> t12Mask = default;
+    t12Mask(0).flip();
+    if (t12Mask.word != 1 || t12Mask(0).tag() != 5) return 31782;
+    t12Mask[0].flip();
+    if (t12Mask.word != 0 || t12Mask[0].tag() != 5) return 31783;
+    t12Mask.at(0).flip();
+    if (t12Mask.word != 1 || t12Mask.at(0).tag() != 5) return 31784;
+    // Top-level cv on a parameter (`const int` vs `int`, `int *const` vs `int *`) still ties.
+    t12.CvBox<1> t12Cv = default;
+    int t12CvArg = 0;
+    int t12CvCall = t12Cv(0); int t12CvIndex = t12Cv[&t12CvArg];
+    if (t12CvCall != 7 || t12CvIndex != 7) return 31785;
+    // T15: rejecting a pointer-to-W(int) friend conversion keeps viable scalar and pointer overloads.
+    t15.W t15W = t15.W(1);
+    short t15Short = 1;
+    char t15Char = 1;
+    bool t15Bool = true;
+    long t15Long = 1;
+    if (!(t15W == 1) || !(t15W == t15Short) || !(t15W == t15Char)
+        || !(t15W == t15Bool) || !(t15W == t15Long) || !(t15W == t15W)
+        || (t15W != 1) || (t15W < 1) || t15.W(1) + 1 != 102) return 31780;
+    t15.PointerW t15PointerW = t15.PointerW(1);
+    char* t15CharPointer = nullptr;
+    int t15PointerResult = t15PointerW == t15CharPointer;
+    if (t15PointerResult != 31) return 31781;
+    // T13: namespace-scope class constants bind as the real C++ object: copy-init, by value,
+    // by const&, address identity, tag dispatch, and `o = nscc.none` runs operator=(none_t).
+    nscc.Month nsccFeb = nscc.February;
+    nscc.Month nsccMar = nscc.March;
+    if (nsccFeb.value() != 2u || nsccMar.value() != 3u || nscc.April.value() != 4u) return 31790;
+    if (&nscc.February != nscc.addr_feb() || nscc.month_value(nscc.February) != 2u
+        || nscc.month_ref(nscc.February) != 2u) return 31791;
+    nscc.Opt nsccOpt = nscc.Opt(5);
+    if (nsccOpt == nscc.none || !nsccOpt.has_value()) return 31792;
+    nscc.Opt nsccNone = nscc.Opt(nscc.none);
+    nsccOpt = nscc.none;
+    if (nsccOpt.has_value() || nsccNone.has_value() || !(nsccOpt == nscc.none)) return 31793;
+    nscc.Lock nsccLock = nscc.Lock(1, nscc.defer);
+    if (nsccLock.mode != 2) return 31794;
+    // T32 MSVC stringbuf shape: a derived buffer reached first as a stream's field still sees the
+    // members of its explicitly instantiated base; pre-fix "Unknown identifier 'sputc'".
+    t32.sstream t32Stream = default;
+    t32.strbuf t32Buf = t32.strbuf(3);
+    if (t32Buf.sputc('d') != 101 || t32Buf.last != 'd' || t32Buf.x != 3 || t32Stream.y != 0) return 32320;
+    // T32 type_info by reference (MSVC: unqualified global type_info, vftable owned by the
+    // runtime); pre-fix Windows refused type() as "a reference to unsupported type".
+    t32.Typed t32TypedA = default; t32.Typed t32TypedB = default; t32TypedB.k = 1;
+    if (!(t32TypedA.type() == t32TypedA.type()) || t32TypedA.type() == t32TypedB.type()
+        || t32TypedA.type().before(t32TypedB.type()) == t32TypedB.type().before(t32TypedA.type()))
+        return 32321;
+    // T32 optnone inline body (UCRT feraiseexcept): its dead divide must survive cflat's passes
+    // to raise the flag; pre-fix the baseline passes deleted it and no flag was set.
+    t32.clearFpFlags();
+    t32.raiseDivByZero(t32.feDivByZero());
+    if (t32.divByZeroRaised() != 1 || t32.invalidRaised() != 0) return 32322;
+    t32.clearFpFlags();
+    if (t32.divByZeroRaised() != 0) return 32323;
+    // T32 MSVC valarray shape: a member unary operator+/- must not hide the binary templates;
+    // pre-fix `w + one` matched the CFlat char* concatenation and was refused.
+    t32.Va<int> t32W = t32.Va<int>(4);
+    t32W[0] = 4; t32W[1] = 1; t32W[2] = 3; t32W[3] = 2;
+    int t32One = 1;
+    t32.Va<int> t32Sum = default; t32Sum = t32W + t32One;
+    t32.Va<int> t32Lit = default; t32Lit = t32W + 100;
+    t32.Va<int> t32Pair = default; t32Pair = t32W + t32W;
+    t32.Va<int> t32Diff = default; t32Diff = t32W - t32One;
+    t32.Va<int> t32Neg = default; t32Neg = -t32W;
+    t32.Va<int> t32Gap = default; t32Gap = t32Pair - t32W;
+    if (t32Sum[1] != 2 || t32Lit[0] != 104 || t32Pair[2] != 6 || t32Diff[0] != 3 || t32Neg[1] != -1
+        || t32Gap[3] != 2) return 32324;
+    // Variable templates bind lazily: inline (linkonce) and internal (per-group) storage.
+    nscc.Month nsccDbl = nscc.month_v<double>;
+    nscc.Month nsccInt = nscc.month_v<int>;
+    nscc.Month nsccShort = nscc.cmonth_v<short>;
+    if (nsccDbl.value() != 8u || nsccInt.value() != 4u || nsccShort.value() != 3u) return 31795;
+    if (&nscc.month_v<int> != nscc.addr_month_int()
+        || nscc.month_ref(nscc.month_v<short>) != 2u) return 31796;
+    nscc.Picker nsccPick = nscc.Picker(nscc.type_tag_v<double>);
+    if (nsccPick.k != 8) return 31797;
+    if (nscc.kPrim != 7 || nscc.kHalf != 0.5 || nscc.size_v<short> != 2
+        || nscc.Red != 1 || nscc.Green != 2) return 31798;
+    // T33: a class-typed variable template is the real C++ object: range-for over STATIC
+    // begin/end (views::empty<T>), `v<T>.member()` (not a class template), address identity.
+    int vtvSum = 0;
+    for (int x in vtv.empty<int>) vtvSum += x + 1;
+    if (vtvSum != 0) return 33310;
+    if (vtv.empty<int>.size() != 0 || !vtv.empty<int>.is_empty()
+        || vtv.empty<double>.begin() != nullptr) return 33311;
+    vtv.Box<int> vtvBox = vtv.box<int>;
+    if (vtvBox.get() != 40 || vtv.box<double>.get() != 80 || vtv.box_ref(vtv.box<int>) != 40)
+        return 33312;
+    if ((void*)&vtv.box<int> != vtv.addr_box_int()
+        || (void*)&vtv.empty<int> != vtv.addr_empty_int()) return 33313;
+    // T26: unharvested (system-like) names bound on demand - enumerators via namespace / class,
+    // copyfmt through a VIRTUAL base, member calls on non-const extern objects (std::cout).
+    if (t26.flag_bits(t26.regex_constants.format_first_only) != 1024) return 26001;
+    if (t26.seek_to(5, t26.ios_base.beg) != 5 || t26.seek_to(5, t26.ios_base.cur) != 105) return 26002;
+    t26.ostringstream t26Src = default;
+    t26Src.precision(3); t26Src.fill('_'); t26Src.width(5);
+    t26.ostringstream t26Dst = default;
+    t26Dst.copyfmt(t26Src);
+    if (t26Dst.precision() != 3 || t26Dst.fill() != '_' || t26Dst.width() != 5) return 26003;
+    t26.out.flush();
+    t26.out.flush();
+    int t26OldBuf = t26.out.rdbuf(7);
+    if (t26OldBuf != 0 || t26.out.rdbuf() != 7 || t26.out.flushes != 2) return 26004;
+    // A virtual-base conversion uses the static offset only from a complete object: a local,
+    // a CFlat global, a temporary; it outranks the user-defined operator int.
+    t26v.left t26Left = default;
+    t26v.sink t26Sink = default;
+    if (t26v.read(t26Left) != 731 || t26Sink.read(t26Left) != 731
+        || t26v.pick(t26Left) != 1731 || t26Sink.pick(t26Left) != 1731) return 26005;
+    t26v.sink t26FromLocal = t26v.sink(t26Left);
+    if (t26FromLocal.saved != 731 || t26.inner.probe.get() != 73) return 26006;
+    if (t26Sink.read(t26GlobalLeft) != 731 || t26Sink.read(t26v.left()) != 731
+        || t26v.read(t26v.held()) != 731) return 26007;
+    t26v.final_zero_sink t26FinalZeroCtor = t26v.final_zero_sink(t26v.held_final_zero());
+    if (t26FinalZeroCtor.saved != 731
+        || t26FinalZeroCtor.read(t26v.held_final_zero()) != 731) return 26008;
+    t26v.final_shift_sink t26FinalShiftSink =
+        t26v.final_shift_sink(t26v.held_final_shift());
+    if (t26FinalShiftSink.read(t26v.held_final_shift()) != 742) return 26009;
+    t26v.final_shift* t26FinalShiftPtr = &t26v.held_final_shift();
+    if (t26FinalShiftSink.read(*t26FinalShiftPtr) != 742
+        || t26FinalAliasRead(t26v.held_final_shift()) != 742) return 26010;
+    if (t26FinalShiftSink.saved != 742) return 26011;
+    // T25: C surfaces through a C++ namespace (anonymous typedef record by value,
+    // function-pointer typedef + auto of a returned function pointer, const void* comparator).
+    t25surface.Pair surfacePair = t25surface.pair(17, 5);
+    if (surfacePair.quot != 3 || surfacePair.rem != 2) return 25001;
+    auto surfaceWide = t25surface.wide_pair(-17, 5);
+    if (surfaceWide.quot != -3 || surfaceWide.rem != -2) return 25002;
+    t25surfaceCalls = 0;
+    t25surface.Handler surfaceOld = t25surface.set_handler(t25surface_handler);
+    auto surfaceCur = t25surface.get_handler();
+    surfaceCur();
+    t25surface.set_handler(surfaceOld);
+    if (t25surfaceCalls != 1 || t25surface.get_handler() != surfaceOld) return 25003;
+    auto surfacePrev = t25surface.set_signal(2, t25surface_signal);
+    if (surfacePrev != nullptr) return 25004;
+    auto surfaceMine = t25surface.set_signal(2, surfacePrev);
+    surfaceMine(5);
+    if (t25surfaceCalls != 6) return 25005;
+    int[4] surfaceValues = { 4, 2, 8, 6 };
+    t25surface.sort(&surfaceValues[0], 4, 4, t25surface_compare);
+    if (surfaceValues[0] != 2 || surfaceValues[1] != 4
+        || surfaceValues[2] != 6 || surfaceValues[3] != 8) return 25006;
+    int surfaceKey = 6;
+    int* surfaceFound = (int*)t25surface.search(&surfaceKey, &surfaceValues[0],
+                                                4, 4, t25surface_compare);
+    if (surfaceFound == nullptr || *surfaceFound != 6) return 25007;
+    int[4] surfaceTyped = { 9, 3, 7, 1 };
+    t25surface.sort_typed(&surfaceTyped[0], 4, t25surface_compare);
+    if (surfaceTyped[0] != 1 || surfaceTyped[1] != 3
+        || surfaceTyped[2] != 7 || surfaceTyped[3] != 9) return 25008;
+    auto surfaceTagged = t25surface.tagged_pair(23, 4);
+    if (surfaceTagged.quot != 5 || surfaceTagged.rem != 3) return 25009;
+    if (t25surface.pick(t25surface_compare) != 1 || t25surface.pick(t25surface_mutable) != 2)
+        return 25010;
+    if (t25surface.choose(t25surface_compare) != 1 || t25surface.choose(t25surface_mutable) != 2)
+        return 25011;
+    // Named imported C++ callbacks (free and static member) keep their spelled pointee const.
+    if (t25surface.pick(t25surface.cb_const) != 1 || t25surface.pick(t25surface.cb_mutable) != 2
+        || t25surface.pick(t25surface.Callbacks.by_const) != 1
+        || t25surface.pick(t25surface.Callbacks.by_mutable) != 2)
+        return 25012;
     return 0;
 }
 
@@ -9959,6 +11121,9 @@ int UnwKeepCoalesce(int x)
     cppon.Esc* empty = nullptr;
     return cppon.escThrowKeep(empty ?? new cppon.Esc(x), x);
 }
+
+// t28: a literal-backed reference returned out of a function keeps its static storage.
+std.cflat_t28.LitRef T28Escape() { std.cflat_t28.LitRef t = std.cflat_t28.fwd("abcd"); return t; }
 
 int W4JoinRead(cppon.Esc* p) { return p == nullptr ? -1 : p->v; }
 int W4NestedJoin(int c)

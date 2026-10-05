@@ -1,0 +1,30 @@
+// GUARDS: format specifiers, positional fields, format_to, formatted_size, vformat, and vformat_to
+// FROM: internal/plan/std-library-tier2-suite.md (C++20 format coverage)
+import cpp {"format", "string"};
+extern int main()
+{
+    int failures = 0;
+    if (std.format("{{:*<6}}", "x") != "x*****") { printf("FAIL fill/align\n"); failures |= 1; }
+    if (std.format("{{:+d}} {{:#x}}", 42, 42) != "+42 0x2a") { printf("FAIL sign/alternate hex\n"); failures |= 2; }
+    if (std.format("{{:.3f}} {{:.1e}}", 1.25, 12.0) != "1.250 1.2e+01") { printf("FAIL float precision\n"); failures |= 4; }
+    if (std.format("{{1}}:{{0}}", "left", "right") != "right:left") { printf("FAIL positional arguments\n"); failures |= 8; }
+    if (std.format("{{}} {{}}", true, 'Q') != "true Q") { printf("FAIL bool/char format\n"); failures |= 16; }
+    char[16] output = {};
+    char* end = std.format_to(&output[0], "{{:04d}}", 7);
+    *end = 0;
+    std.string written = std.string(&output[0]);
+    i64 size = std.formatted_size("{{}}!", "ok");
+    if (written != "0007" || size != 3) { printf("FAIL format_to/formatted_size\n"); failures |= 32; }
+    std.string fmt = "fmt";
+    int nine = 9;
+    auto args = std.make_format_args(fmt, nine);
+    if (std.vformat("{{}}:{{}}", args) != "fmt:9") { printf("FAIL vformat\n"); failures |= 64; }
+    char[16] vbuf = {};
+    int eleven = 11;
+    auto eleven_args = std.make_format_args(eleven);
+    char* vend = std.vformat_to(&vbuf[0], "{{}}", eleven_args);
+    *vend = 0;
+    if (std.string(&vbuf[0]) != "11") { printf("FAIL vformat_to\n"); failures |= 128; }
+    if (failures == 0) printf("PASS std_full_20_format\n");
+    return failures;
+}

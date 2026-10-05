@@ -1,0 +1,11 @@
+// GUARDS: views::all applied to an rvalue vector
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp {"ranges", "utility", "vector"};
+extern int main()
+{
+    std.vector<int> owned = std.vector<int>({1, 2, 3});
+    auto view = std.views.all(std.move(owned));
+    if (view.size() != 3) { printf("FAIL views_all_rvalue\n"); return 1; }
+    printf("PASS std_full_20_911_views_all_rvalue\n");
+    return 0;
+}

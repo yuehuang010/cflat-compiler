@@ -1108,6 +1108,8 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
             fp.IsReturnInferredSink = p.IsReturnInferredSink;
             fp.IsWriteInferredSink = p.IsWriteInferredSink;
             fp.PointerDepth = p.ValuePointerDepth();
+            // A C++ member's mapped pointee const is recorded only as IsCxxPointeeConst.
+            fp.IsPointeeConst = p.IsSpelledPointeeConst || (sym.IsCxx && p.IsCxxPointeeConst);
             sig.FuncPtrParams.push_back(fp);
         }
         return sig;

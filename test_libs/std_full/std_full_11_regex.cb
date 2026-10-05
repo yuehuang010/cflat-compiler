@@ -1,0 +1,27 @@
+// GUARDS: regex captures, match result context, iterators, token splitting, and case-insensitive match
+// FROM: internal/plan/std-library-tier2-suite.md (C++11 regex coverage)
+import cpp {"regex", "string", "vector"};
+extern int main()
+{
+    int failures = 0;
+    std.string text = "xx12yy345zz";
+    std.regex digits = std.regex("([0-9]+)");
+    std.smatch match = default;
+    bool found = std.regex_search(text, match, digits);
+    if (!found || match.size() != 2 || match.position(1) != 2 || match.str(1) != "12" || match.prefix().str() != "xx" || match.suffix().str() != "yy345zz")
+    { printf("FAIL match results context\n"); failures |= 1; }
+    std.regex word = std.regex("[a-z]+");
+    int count = 0;
+    for (std.sregex_iterator i = std.sregex_iterator(text.begin(), text.end(), word), end = std.sregex_iterator(); i != end; i++) count += 1;
+    if (count != 3) { printf("FAIL regex iterator count\n"); failures |= 2; }
+    std.string csv = "one,two,three";
+    std.regex comma = std.regex(",");
+    std.vector<std.string> fields = default;
+    for (std.sregex_token_iterator i = std.sregex_token_iterator(csv.begin(), csv.end(), comma, -1), end = std.sregex_token_iterator(); i != end; i++) fields.push_back((*i).str());
+    if (fields.size() != 3 || fields[0] != "one" || fields[1] != "two" || fields[2] != "three")
+    { printf("FAIL token iterator split\n"); failures |= 4; }
+    std.regex lower = std.regex("abc", std.regex.icase);
+    if (!std.regex_match(std.string("AbC"), lower)) { printf("FAIL regex icase\n"); failures |= 8; }
+    if (failures == 0) printf("PASS std_full_11_regex\n");
+    return failures;
+}

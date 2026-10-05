@@ -1,0 +1,13 @@
+#include <valarray>
+#include <cstdio>
+int main()
+{
+    int failures = 0;
+    int arr[4] = {4, 1, 3, 2};
+    std::valarray<int> w(arr, 4);
+    int two = 2;
+    std::valarray<int> x = w * two;
+    if (x[0] != 8 || x[3] != 4) { printf("FAIL valarray expr init\n"); failures |= 1; }
+    if (failures == 0) printf("PASS std_full_11_935_valarray_expr_init\n");
+    return failures;
+}

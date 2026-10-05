@@ -1,0 +1,83 @@
+// GUARDS: thread state, mutex variants and lock APIs, call_once, timed condition waits, futures, and atomic families
+// FROM: internal/plan/std-library-tier2-suite.md (C++11 concurrency coverage)
+import cpp {"atomic", "chrono", "condition_variable", "functional", "future", "mutex", "thread"};
+std.once_flag once = default;
+int once_count = 0;
+void increment_once() { once_count += 1; }
+void no_work() {}
+void once_worker() { std.call_once(once, std.function<void()>(increment_once)); }
+std.mutex gate = default;
+std.condition_variable cv = default;
+std.atomic<bool> ready = default;
+void notify_ready() { ready.store(true); cv.notify_all(); }
+bool is_ready() { return ready.load(); }
+int triple(int x) { return x * 3; }
+int return_fifteen() { return 15; }
+int object = 3;
+extern int main()
+{
+    int failures = 0;
+    std.thread empty = default;
+    std.thread worker = std.thread(std.function<void()>(no_work));
+    bool thread_state = !empty.joinable() && worker.joinable() && worker.get_id() != empty.get_id();
+    std.thread.hardware_concurrency();
+    worker.join();
+    if (!thread_state || worker.joinable()) { printf("FAIL thread state\n"); failures |= 1; }
+    std.mutex lock_a = default; std.mutex lock_b = default;
+    std.lock(lock_a, lock_b);
+    lock_a.unlock(); lock_b.unlock();
+    std.mutex lock_c = default; std.mutex lock_d = default;
+    std.scoped_lock<std.mutex, std.mutex> both = std.scoped_lock<std.mutex, std.mutex>(lock_c, lock_d);
+    std.recursive_mutex recursive = default;
+    recursive.lock(); recursive.lock(); recursive.unlock(); recursive.unlock();
+    std.recursive_timed_mutex recursive_timed = default;
+    bool recursive_timed_ok = recursive_timed.try_lock_for(std.chrono.milliseconds(20));
+    if (recursive_timed_ok) recursive_timed.unlock();
+    std.this_thread.yield(); std.this_thread.sleep_for(std.chrono.milliseconds(1));
+    bool thread_api_ok = std.this_thread.get_id() != empty.get_id();
+    std.timed_mutex timed = default;
+    bool timed_ok = timed.try_lock_for(std.chrono.milliseconds(20));
+    if (timed_ok) timed.unlock();
+    if (!timed_ok || !recursive_timed_ok || !thread_api_ok) { printf("FAIL timed mutex/this_thread\n"); failures |= 2; }
+
+    std.thread o1 = std.thread(std.function<void()>(once_worker));
+    std.thread o2 = std.thread(std.function<void()>(once_worker));
+    o1.join(); o2.join();
+    if (once_count != 1) { printf("FAIL call_once\n"); failures |= 4; }
+    std.thread notifier = std.thread(std.function<void()>(notify_ready));
+    std.unique_lock<std.mutex> wait_lock = std.unique_lock<std.mutex>(gate);
+    bool notified = cv.wait_for(wait_lock, std.chrono.seconds(5), std.function<bool()>(is_ready));
+    wait_lock.unlock(); notifier.join();
+    if (!notified || !ready.load()) { printf("FAIL condition_variable wait_for\n"); failures |= 8; }
+
+    std.packaged_task<int(int)> task = std.packaged_task<int(int)>(std.function<int(int)>(triple));
+    std.future<int> result = task.get_future();
+    task(7);
+    std.promise<int> promise = default;
+    std.shared_future<int> shared = promise.get_future().share();
+    promise.set_value(9);
+    std.future<int> async_result = std.async(std.launch.async, std.function<int()>(return_fifteen));
+    if (result.get() != 21 || shared.get() != 9 || async_result.get() != 15) { printf("FAIL futures\n"); failures |= 16; }
+
+    std.atomic<int> value = std.atomic<int>(4);
+    int expected = 4;
+    bool exchanged = value.compare_exchange_strong(expected, 8);
+    int old = value.exchange(10);
+    int[3] ptr_values = {3, 6, 9};
+    std.atomic<int*> ptr = std.atomic<int*>(&ptr_values[0]);
+    int* prior = ptr.fetch_add(1);
+    int* after_fetch = ptr.load();
+    ptr++; int* next = ptr.load();
+    std.atomic<float> f = std.atomic<float>(1.5f);
+    float oldf = f.fetch_add(0.5f);
+    std.atomic_flag flag = default;
+    flag.clear();
+    bool first = flag.test_and_set();
+    bool observed = flag.test();
+    bool second = flag.test_and_set();
+    std.atomic_thread_fence(std.memory_order.seq_cst);
+    if (!exchanged || expected != 4 || old != 8 || value.load() != 10 || prior != &ptr_values[0] || *prior != 3 || after_fetch != &ptr_values[1] || *after_fetch != 6 || next != &ptr_values[2] || *next != 9 || oldf != 1.5f || f.load() != 2.0f || first || !observed || !second)
+    { printf("FAIL atomic operations\n"); failures |= 32; }
+    if (failures == 0) printf("PASS std_full_11_concurrency_full\n");
+    return failures;
+}

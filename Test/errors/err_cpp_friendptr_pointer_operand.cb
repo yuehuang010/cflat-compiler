@@ -1,0 +1,11 @@
+import cpp "t15_friendptr.hpp";
+
+extern int main()
+{
+    t15.W w = t15.W(1);
+    char* cp = nullptr;
+    expect_error("no overload") {
+        bool invalid = cp == w;
+    }
+    return 0;
+}

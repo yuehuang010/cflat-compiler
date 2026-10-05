@@ -1,0 +1,11 @@
+// GUARDS: seek a stringbuf using pubseekoff
+// FROM: internal/plan/std-library-tier2-suite.md (C++11 file and string stream coverage)
+import cpp {"ios", "sstream"};
+extern int main()
+{
+    std.stringbuf buf = std.stringbuf("abc", std.ios.in);
+    i64 pos = buf.pubseekoff(1, std.ios_base.beg, std.ios.in);
+    if (pos != 1 || buf.sgetc() != 'b') { printf("FAIL streambuf pubseekoff\n"); return 1; }
+    printf("PASS std_full_11_930_streambuf_pubseekoff\n");
+    return 0;
+}

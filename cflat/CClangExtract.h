@@ -183,6 +183,17 @@ namespace cflat_cinterop
         std::vector<std::string> paramTypes;
         std::vector<std::string> paramNames;   // aligned with paramTypes (may be empty strings)
         std::vector<RawDefaultArg> defaultArgs;
+        // Generated wrappers only: per parameter, the arithmetic type clang converts it into
+        // for a `const S&` of the selected callee ("" if none; empty if no parameter is).
+        std::vector<std::string> paramTemporaryTypes;
+        // Generated wrappers only: the wrapper materializes a brace list and its result can
+        // carry an address, so it may refer into the dead list (WrapperResultBorrowsBraceList).
+        bool resultBorrowsBraceList = false;
+        // With resultBorrowsBraceList: each materialized list's element type, in source order.
+        std::vector<std::string> braceListElementTypes;
+        // Generated wrappers only: the callee that receives a literal's decayed pointer temporary
+        // or a reference-to-pointer parameter (WrapperLiteralPointerTemporaries).
+        std::string calleeIdentity;
         bool variadic = false;
         bool isCxx = false;
         bool isInline = false;
@@ -327,6 +338,12 @@ namespace cflat_cinterop
          * arrangement is even attempted.
          */
         std::string bindRefusal;
+        /*
+         * Set with an incomplete-by-value bindRefusal when that type is a member class (or member
+         * class template specialization) clang has a definition to instantiate on demand (MSVC
+         * bitset<N>::reference): its clang spelling, so the use site can request just it.
+         */
+        std::string lazyNestedSpelling;
         // The clang diagnostic lines behind a refusal, when one is known (never displayed).
         std::string refusalCause;
         // Copy / move constructor and copy / move assignment recognition, so the backend can
@@ -417,6 +434,7 @@ namespace cflat_cinterop
         bool isPolymorphic = false;         // has a virtual function or a virtual base
         bool hasBases = false;              // any base class
         bool hasVirtualBases = false;       // virtual inheritance: rejected, the VTT is not modelled
+        bool isFinal = false;               // final class: a reference to it names a complete object
         bool isAbstract = false;            // has an unoverridden pure virtual: cannot be created
         bool hasFriendOperators = false;    // declares a friend operator (found only by ADL)
         std::vector<RawCxxBase> bases;      // DIRECT bases, in declaration order
@@ -537,6 +555,11 @@ namespace cflat_cinterop
         bool isCxxConstexpr = false;
         bool isInternalLinkage = false;  // C++ internal linkage: one object per import group
         uint64_t constInitHash = 0;      // internal const object: hash of its evaluated value
+        // decltype request of an ENUMERATOR (ns::format_first_only, ios_base::beg): ctype names
+        // its enum type, constantValue its value. Request-only; never cached as a global.
+        bool isEnumerator = false;
+        // MS ABI: the object is __declspec(dllimport) data (MSVC's std::cout) - reached via __imp_.
+        bool isDllImport = false;
         std::string file;
         int line = 1;
         int col = 0;
@@ -787,6 +810,7 @@ namespace cflat_cinterop
             std::vector<CxxMacroProbe> macroProbes;
             // Failed helper bodies from this request must keep their original replay verdict.
             std::vector<std::pair<std::string, std::string>> poisonedBodies;
+            std::vector<std::string> noDeferBodyKeys;
             std::string scopeHeaderPath;
             bool headerHarvest = false;
             bool wantMacros = false;

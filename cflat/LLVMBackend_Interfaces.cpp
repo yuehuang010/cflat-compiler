@@ -239,6 +239,19 @@ const LLVMBackend::TypeAndValue* LLVMBackend::FindFunctionTypeAlias(const std::s
         return nullptr;
     }
 
+const LLVMBackend::TypeAndValue* LLVMBackend::FindOrRequestFunctionTypeAlias(
+    const std::string& name)
+{
+        if (const TypeAndValue* found = FindFunctionTypeAlias(name)) return found;
+        if (!HasCxxImportGroup() || name.find('.') == std::string::npos
+            || name.find_first_of("<>$*[ ") != std::string::npos || IsKnownTypeName(name))
+            return nullptr;
+        const std::string resolved = ResolveQualifiedName(name);
+        std::string error;
+        if (!TryRequestCxxType(resolved, {}, resolved, error)) return nullptr;
+        return FindFunctionTypeAlias(resolved);
+    }
+
 void LLVMBackend::PushAliasScope()
 {
         aliasScopeStack_.emplace_back();

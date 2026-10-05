@@ -1,0 +1,16 @@
+// GUARDS: copy formatting flags, precision, width, and fill between output streams
+// FROM: internal/plan/std-library-tier2-suite.md (C++11 iostream coverage)
+import cpp {"iostream", "sstream"};
+extern int main()
+{
+    std.ostringstream source = default;
+    source << std.showpos;
+    source.precision(3); source.width(5); source.fill('_');
+    std.ostringstream target = default;
+    target.copyfmt(source);
+    bool state = target.precision() == 3 && target.width() == 5 && target.fill() == '_';
+    target << 12;
+    if (!state || target.str() != "__+12") { printf("FAIL ios_base copyfmt state\n"); return 1; }
+    printf("PASS std_full_11_917_ios_copyfmt\n");
+    return 0;
+}

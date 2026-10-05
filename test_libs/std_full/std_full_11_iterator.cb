@@ -1,0 +1,66 @@
+// GUARDS: iterator adaptors and free functions: advance/distance/next/prev, inserters, reverse and move iterators, stream iterators, traits
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp {"algorithm", "deque", "iterator", "list", "set", "sstream", "string", "type_traits", "vector"};
+extern int main()
+{
+    int failures = 0;
+    std.vector<int> v = std.vector<int>({10, 20, 30, 40, 50});
+    auto it = v.begin();
+    std.advance(it, 2);
+    i64 dist = std.distance(v.begin(), v.end());
+    auto nx = std.next(v.begin());
+    auto nx3 = std.next(v.begin(), 3);
+    auto pv = std.prev(v.end());
+    auto pv2 = std.prev(v.end(), 2);
+    if (*it != 30 || dist != 5 || *nx != 20 || *nx3 != 40 || *pv != 50 || *pv2 != 40) { printf("FAIL advance_distance_next_prev\n"); failures |= 1; }
+    auto mutate_it = v.begin(); mutate_it++; *mutate_it = 21;
+    if (v[1] != 21) { printf("FAIL vector_iterator_local_deref_assign\n"); failures |= 128; }
+    std.list<int> l = std.list<int>({1, 2, 3, 4});
+    auto li = l.begin();
+    std.advance(li, 3);
+    i64 ld = std.distance(l.begin(), l.end());
+    std.advance(li, -2);
+    if (*li != 2 || ld != 4) { printf("FAIL bidirectional_advance\n"); failures |= 2; }
+    std.deque<int> dq = default;
+    auto fi = std.front_inserter(dq);
+    *fi = 1; *fi = 2;
+    std.vector<int> ins = std.vector<int>({1, 4});
+    std.copy(l.begin(), l.end(), std.inserter(ins, ins.begin() + 1));
+    std.vector<int> bk = default;
+    std.copy(l.begin(), l.end(), std.back_inserter(bk));
+    std.vector<int> direct_back = default;
+    auto back_it = std.back_inserter(direct_back); *back_it = 8; *back_it = 9;
+    std.set<int> sset = default;
+    std.copy(l.begin(), l.end(), std.inserter(sset, sset.end()));
+    if (dq.size() != 2 || dq[0] != 2 || dq[1] != 1 || ins.size() != 6 || ins[1] != 1 || ins[3] != 3 || ins[5] != 4 || bk.size() != 4 || sset.size() != 4 || direct_back.size() != 2 || direct_back[0] != 8 || direct_back[1] != 9) { printf("FAIL inserters\n"); failures |= 4; }
+    auto rv = std.make_reverse_iterator(v.end());
+    auto rv_end = std.make_reverse_iterator(v.begin());
+    auto base_it = rv.base();
+    int rsum = 0; int rn = 0;
+    for (auto r = rv; r != rv_end; r++) { rsum = rsum * 10 + (*r / 10); rn++; }
+    auto rv1 = rv + 1;
+    if (*rv != 50 || base_it != v.end() || rsum != 54321 || rn != 5 || *rv1 != 40 || rv[2] != 30) { printf("FAIL reverse_iterator\n"); failures |= 8; }
+    std.vector<std.string> src = default;
+    src.push_back(std.string("alpha")); src.push_back(std.string("beta"));
+    std.vector<std.string> dst = default;
+    std.copy(std.make_move_iterator(src.begin()), std.make_move_iterator(src.end()), std.back_inserter(dst));
+    if (dst.size() != 2 || dst[0] != "alpha" || dst[1] != "beta") { printf("FAIL move_iterator\n"); failures |= 16; }
+    std.istringstream isin = std.istringstream(std.string("3 5 7 9"));
+    std.istream_iterator<int> in_it = std.istream_iterator<int>(isin);
+    std.istream_iterator<int> in_end = default;
+    std.vector<int> parsed = std.vector<int>(in_it, in_end);
+    std.ostringstream out = default;
+    std.ostream_iterator<int> out_it = std.ostream_iterator<int>(out, ",");
+    std.copy(parsed.begin(), parsed.end(), out_it);
+    std.ostringstream direct_out = default;
+    std.ostream_iterator<int> direct_out_it = std.ostream_iterator<int>(direct_out, ",");
+    *direct_out_it = 1; *direct_out_it = 2;
+    std.istringstream advance_in = std.istringstream(std.string("6 7 8"));
+    std.istream_iterator<int> advance_it = std.istream_iterator<int>(advance_in);
+    advance_it++;
+    if (parsed.size() != 4 || parsed[3] != 9 || out.str() != "3,5,7,9," || direct_out.str() != "1,2," || *advance_it != 7) { printf("FAIL stream_iterators\n"); failures |= 32; }
+    int* vd = std.data(v);
+    if (std.empty(v) || *vd != 10 || std.size(v) != 5) { printf("FAIL data_empty_size\n"); failures |= 64; }
+    if (failures == 0) printf("PASS std_full_11_iterator\n");
+    return failures;
+}

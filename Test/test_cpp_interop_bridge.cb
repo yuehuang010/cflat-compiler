@@ -6588,5 +6588,16 @@ extern int main(int argc, char** argv)
     if (bridge_passed - bridgeDictStartPassed != bridge_checks - bridgeDictStartChecks)
         return 3648;
 
+    // T35: owner_before is a member function template, called by name on shared_ptr and weak_ptr
+    // (was "Undefined variable owner_before"). Exactly one of two distinct owners orders first.
+    std.shared_ptr<int> ownerA = std.make_shared<int>(1);
+    std.shared_ptr<int> ownerB = std.make_shared<int>(2);
+    std.weak_ptr<int> ownerW = ownerA;
+    if (ownerA.owner_before(ownerB) == ownerB.owner_before(ownerA) || ownerA.owner_before(ownerA))
+        return 3650;
+    if (ownerW.owner_before(ownerA) || ownerA.owner_before(ownerW)
+        || ownerB.owner_before(ownerW) != ownerB.owner_before(ownerA))
+        return 3651;
+
     return 0;
 }

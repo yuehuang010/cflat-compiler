@@ -1,0 +1,18 @@
+// GUARDS: member calls on namespace-scope cout (flush and rdbuf capture)
+// FROM: internal/plan/std-library-tier2-suite.md (C++11 iostream coverage)
+import cpp {"iostream", "sstream", "string"};
+extern int main()
+{
+    std.cout.flush();
+    std.ostringstream captured = default;
+    std.streambuf* old = std.cout.rdbuf(captured.rdbuf());
+    std.cout << "x";
+    std.cout.rdbuf(old);
+    std.ostringstream err = default;
+    std.streambuf* old_err = std.cerr.rdbuf(err.rdbuf());
+    std.cerr << "y";
+    std.cerr.rdbuf(old_err);
+    if (captured.str() != "x" || err.str() != "y") { printf("FAIL cout rdbuf capture\n"); return 1; }
+    printf("PASS std_full_11_907_cout_rdbuf\n");
+    return 0;
+}

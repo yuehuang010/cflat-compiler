@@ -1,0 +1,53 @@
+// GUARDS: chrono duration floor/ceil/round/abs, time_point_cast, to_time_t, file_clock, calendar types, chrono format, ctime time/gmtime/strftime
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp "string";
+import cpp "chrono";
+import cpp "ctime";
+import cpp "format";
+extern int main()
+{
+    int failures = 0;
+    std.chrono.milliseconds ms = std.chrono.milliseconds(1550);
+    std.chrono.milliseconds nms = std.chrono.milliseconds(-1550);
+    if (std.chrono.floor<std.chrono.seconds>(ms).count() != 1 || std.chrono.ceil<std.chrono.seconds>(ms).count() != 2 || std.chrono.round<std.chrono.seconds>(ms).count() != 2
+        || std.chrono.floor<std.chrono.seconds>(nms).count() != -2 || std.chrono.ceil<std.chrono.seconds>(nms).count() != -1 || std.chrono.round<std.chrono.seconds>(nms).count() != -2 || std.chrono.abs(nms).count() != 1550)
+    { printf("FAIL floor/ceil/round/abs\n"); failures |= 1; }
+    std.chrono.time_point<std.chrono.system_clock, std.chrono.milliseconds> tp = std.chrono.time_point<std.chrono.system_clock, std.chrono.milliseconds>(std.chrono.milliseconds(5500));
+    auto ts = std.chrono.time_point_cast<std.chrono.seconds>(tp);
+    std.chrono.time_point<std.chrono.system_clock, std.chrono.milliseconds> tp2 = std.chrono.time_point<std.chrono.system_clock, std.chrono.milliseconds>(std.chrono.milliseconds(500));
+    if (ts.time_since_epoch().count() != 5 || (tp - tp2).count() != 5000)
+    { printf("FAIL time_point_cast\n"); failures |= 2; }
+    auto epoch = std.chrono.system_clock.from_time_t(0);
+    auto later = epoch + std.chrono.hours(1);
+    i64 back = std.chrono.system_clock.to_time_t(later);
+    i64 rt = std.chrono.system_clock.to_time_t(std.chrono.system_clock.from_time_t(86400));
+    if (back != 3600 || rt != 86400) { printf("FAIL to_time_t\n"); failures |= 4; }
+    auto fnow = std.chrono.file_clock.now();
+    auto fnow2 = std.chrono.file_clock.now();
+    if (!(fnow2 >= fnow)) { printf("FAIL file_clock\n"); failures |= 8; }
+    if (!std.chrono.year(2024).is_leap() || std.chrono.year(2023).is_leap() || !std.chrono.year(2000).is_leap() || std.chrono.year(1900).is_leap()) { printf("FAIL year::is_leap\n"); failures |= 16; }
+    std.chrono.month_day_last mdl = std.chrono.month_day_last(std.chrono.month(2));
+    std.chrono.year_month_day_last ymdl = std.chrono.year_month_day_last(std.chrono.year(2024), std.chrono.month_day_last(std.chrono.month(2)));
+    std.chrono.year_month_day_last ymdl2 = std.chrono.year_month_day_last(std.chrono.year(2023), std.chrono.month_day_last(std.chrono.month(2)));
+    if (!mdl.ok() || (unsigned)ymdl.day() != 29u || (unsigned)ymdl2.day() != 28u) { printf("FAIL month_day_last\n"); failures |= 32; }
+    std.chrono.year_month_day ymd = std.chrono.year_month_day(std.chrono.year(2024), std.chrono.month(3), std.chrono.day(15));
+    if (!ymd.ok() || (int)ymd.year() != 2024 || (unsigned)ymd.month() != 3u || (unsigned)ymd.day() != 15u) { printf("FAIL year_month_day\n"); failures |= 64; }
+    std.string f1 = std.format("{{:%Y-%m-%d}}", ymd);
+    std.string f2 = std.format("{{:%H:%M:%S}}", std.chrono.seconds(3725));
+    if (f1 != "2024-03-15" || f2 != "01:02:05") { printf("FAIL chrono format\n"); failures |= 128; }
+    i64 t0 = std.time(nullptr);
+    i64 c0 = std.clock();
+    if (t0 <= 0 || c0 < 0 || std.difftime(t0 + 10, t0) != 10.0) { printf("FAIL time/clock/difftime\n"); failures |= 256; }
+    std.time_t fixed = 951782400;
+    std.tm* g = std.gmtime(&fixed);
+    if (g.tm_year != 100 || g.tm_mon != 1 || g.tm_mday != 29 || g.tm_hour != 0 || g.tm_min != 0 || g.tm_sec != 0 || g.tm_wday != 2 || g.tm_yday != 59)
+    { printf("FAIL gmtime\n"); failures |= 512; }
+    char[32] buf_ = default; char* buf = buf_;
+    u64 n = std.strftime(buf, 32, "%Y-%m-%d %H:%M:%S", g);
+    if (n != 19 || std.string(buf) != "2000-02-29 00:00:00") { printf("FAIL strftime\n"); failures |= 1024; }
+    std.tm tmv = default;
+    tmv.tm_year = 100; tmv.tm_mon = 0; tmv.tm_mday = 1;
+    if (std.mktime(&tmv) == -1) { printf("FAIL mktime\n"); failures |= 2048; }
+    if (failures == 0) printf("PASS std_full_11_chrono_ctime\n");
+    return failures;
+}

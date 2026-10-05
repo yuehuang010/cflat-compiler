@@ -1,0 +1,11 @@
+// GUARDS: regex replacement using the format_first_only enumerator
+// FROM: internal/plan/std-library-tier2-suite.md (C++11 regex coverage)
+import cpp {"regex", "string"};
+extern int main()
+{
+    std.regex digits = std.regex("([0-9]+)");
+    std.string replaced = std.regex_replace(std.string("ab12cd34"), digits, "<$1>", std.regex_constants.format_first_only);
+    if (replaced != "ab<12>cd34") { printf("FAIL format_first_only\n"); return 1; }
+    printf("PASS std_full_11_928_regex_format_first_only\n");
+    return 0;
+}

@@ -1,0 +1,61 @@
+// GUARDS: pmr resources (monotonic, pools, new_delete, null), polymorphic_allocator, pmr containers, default resource
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp {"map", "memory_resource", "string", "vector"};
+extern int main()
+{
+    int failures = 0;
+    std.pmr.monotonic_buffer_resource mono = default;
+    std.pmr.memory_resource* monop = &mono;
+    std.pmr.vector<int> pv = std.pmr.vector<int>(monop);
+    for (int i = 0; i < 100; i++) pv.push_back(i);
+    if (pv.size() != 100 || pv[99] != 99) { printf("FAIL pmr_vector_monotonic\n"); failures |= 1; }
+    char[1024] backing = {};
+    std.pmr.monotonic_buffer_resource fixed = std.pmr.monotonic_buffer_resource((void*)&backing[0], 1024, std.pmr.null_memory_resource());
+    std.pmr.memory_resource* fixedp = &fixed;
+    std.pmr.vector<int> fv = std.pmr.vector<int>(fixedp);
+    fv.push_back(1); fv.push_back(2);
+    if (fv.size() != 2 || fv[1] != 2) { printf("FAIL pmr_vector_fixed_buffer\n"); failures |= 2; }
+    std.pmr.unsynchronized_pool_resource upool = default;
+    std.pmr.synchronized_pool_resource spool = default;
+    void* p1 = upool.allocate(24, 8);
+    void* p2 = spool.allocate(64, 16);
+    bool pool_ok = p1 != nullptr && p2 != nullptr && p1 != p2;
+    upool.deallocate(p1, 24, 8);
+    spool.deallocate(p2, 64, 16);
+    pool_ok = pool_ok && upool.is_equal(upool) && !upool.is_equal(spool);
+    if (!pool_ok) { printf("FAIL pool_resources\n"); failures |= 4; }
+    std.pmr.memory_resource* nd = std.pmr.new_delete_resource();
+    std.pmr.memory_resource* nm = std.pmr.null_memory_resource();
+    void* q = nd.allocate(32, 8);
+    bool res_ok = q != nullptr && nd.is_equal(*nd) && !nd.is_equal(*nm);
+    nd.deallocate(q, 32, 8);
+    if (!res_ok) { printf("FAIL new_delete_null_resources\n"); failures |= 8; }
+    std.pmr.polymorphic_allocator<int> pa = std.pmr.polymorphic_allocator<int>(monop);
+    int* arr = pa.allocate(4);
+    arr[0] = 5; arr[3] = 8;
+    bool pa_ok = arr[0] == 5 && arr[3] == 8 && pa.resource() == monop;
+    pa.deallocate(arr, 4);
+    int* obj = pa.new_object<int>(42);
+    pa_ok = pa_ok && *obj == 42;
+    pa.delete_object(obj);
+    int* raw = pa.allocate_object<int>(3);
+    raw[2] = 7;
+    pa_ok = pa_ok && raw[2] == 7;
+    pa.deallocate_object(raw, 3);
+    if (!pa_ok) { printf("FAIL polymorphic_allocator\n"); failures |= 16; }
+    std.pmr.string ps = std.pmr.string("hello pmr", monop);
+    std.pmr.map<int, int> pm = std.pmr.map<int, int>(monop);
+    pm[1] = 10; pm[2] = 20;
+    if (ps.size() != 9 || ps != "hello pmr" || pm.size() != 2 || pm[2] != 20) { printf("FAIL pmr_string_map\n"); failures |= 32; }
+    std.pmr.memory_resource* before = std.pmr.get_default_resource();
+    std.pmr.memory_resource* old = std.pmr.set_default_resource(monop);
+    bool def_ok = old == before && std.pmr.get_default_resource() == monop;
+    std.pmr.vector<int> dv = default;
+    dv.push_back(3);
+    def_ok = def_ok && dv.get_allocator().resource() == monop;
+    std.pmr.set_default_resource(old);
+    def_ok = def_ok && std.pmr.get_default_resource() == before;
+    if (!def_ok) { printf("FAIL default_resource\n"); failures |= 64; }
+    if (failures == 0) printf("PASS std_full_17_memory_resource\n");
+    return failures;
+}

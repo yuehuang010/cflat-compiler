@@ -1,0 +1,38 @@
+// C++20 equivalent of std_full_11_language_support.cb (compile-time parity baseline)
+#include <string>
+#include <cstddef>
+#include <cfloat>
+#include <climits>
+#include <cstdint>
+#include <cinttypes>
+#include <cmath>
+#include <limits>
+#include <cstdio>
+
+int main() {
+    int failures = 0;
+    std::byte b = std::byte{0x0F};
+    std::byte shifted = b << 4;
+    std::byte orred = b | std::byte{0x30};
+    std::byte anded = b & std::byte{0x03};
+    std::byte xored = b ^ std::byte{0xFF};
+    std::byte inv = ~std::byte{0x0F};
+    if (std::to_integer<int>(shifted) != 240 || std::to_integer<int>(orred) != 63 || std::to_integer<int>(anded) != 3 || std::to_integer<int>(xored) != 240 || std::to_integer<int>(inv) != 240)
+    { printf("FAIL byte ops\n"); failures |= 1; }
+    std::nullptr_t np = nullptr;
+    int* ip = np;
+    if (ip != nullptr || np != nullptr) { printf("FAIL nullptr_t\n"); failures |= 2; }
+    if (FLT_RADIX != 2 || DBL_DIG != 15 || FLT_DIG != 6 || DBL_MANT_DIG != 53 || FLT_MANT_DIG != 24 || DBL_EPSILON != 2.220446049250313e-16 || FLT_EPSILON != 1.1920929e-07f || DBL_MAX <= 1.0e300 || FLT_MAX <= 1.0e38f)
+    { printf("FAIL cfloat\n"); failures |= 8; }
+    char* end = nullptr; char** endp = &end;
+    intmax_t sv = std::strtoimax("12345xyz", endp, 10);
+    uintmax_t uv = std::strtoumax("ff", nullptr, 16);
+    if (sv != 12345 || *end != 'x' || uv != 255 || std::imaxabs(-7) != 7) { printf("FAIL inttypes conv\n"); failures |= 128; }
+    double inf = std::numeric_limits<double>::infinity();
+    double nan = std::numeric_limits<double>::quiet_NaN();
+    double dm = std::numeric_limits<double>::denorm_min();
+    if (!std::numeric_limits<double>::has_infinity || !std::numeric_limits<double>::has_quiet_NaN || !std::isinf(inf) || !std::isnan(nan) || !(dm > 0.0) || dm >= std::numeric_limits<double>::min() || std::numeric_limits<int>::has_infinity || -inf >= std::numeric_limits<double>::lowest() || !std::numeric_limits<double>::is_iec559 || std::numeric_limits<float>::epsilon() != FLT_EPSILON)
+    { printf("FAIL limits specials\n"); failures |= 1024; }
+    if (failures == 0) printf("PASS std_full_11_language_support\n");
+    return failures;
+}

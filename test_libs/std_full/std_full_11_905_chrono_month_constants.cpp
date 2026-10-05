@@ -1,0 +1,11 @@
+#include <chrono>
+#include <cstdio>
+int main()
+{
+    int failures = 0;
+    std::chrono::month m = std::chrono::February;
+    std::chrono::weekday w = std::chrono::Monday;
+    if ((unsigned)m != 2u || w.c_encoding() != 1u) { printf("FAIL month constants\n"); failures |= 1; }
+    if (failures == 0) printf("PASS std_full_11_905_chrono_month_constants\n");
+    return failures;
+}

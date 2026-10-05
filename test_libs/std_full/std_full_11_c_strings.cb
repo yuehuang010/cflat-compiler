@@ -1,0 +1,70 @@
+// GUARDS: C cstring, cctype, cwctype and cwchar families through the C++ bridge (ASCII, "C" locale)
+// FROM: internal/plan/std-library-tier2-suite.md
+import cpp "string";
+import cpp "cstring";
+import cpp "cctype";
+import cpp "cwctype";
+import cpp "cwchar";
+extern int main()
+{
+    int failures = 0;
+    char[32] d_ = default;
+    char* d = d_;
+    std.strcpy(d, "foo");
+    std.strcat(d, "bar");
+    char[8] d2_ = default;
+    char* d2 = d2_;
+    std.strncpy(d2, "abcdef", 3);
+    char* hay = "hello world hello";
+    if (std.strlen(d) != 6 || std.strcmp(d, "foobar") != 0 || std.strncmp(d, "fooxyz", 3) != 0 || std.strcmp(d2, "abc") != 0
+        || std.strchr(hay, 'w') != hay + 6 || std.strrchr(hay, 'h') != hay + 12 || std.strstr(hay, "world") != hay + 6 || std.strchr(hay, 'z') != nullptr)
+    { printf("FAIL str*\n"); failures |= 1; }
+    char[8] tokbuf_ = default;
+    char* tokbuf = tokbuf_;
+    std.strcpy(tokbuf, "a,b;c");
+    int ntok = 0;
+    char* t = std.strtok(tokbuf, ",;");
+    std.string joined = default;
+    while (t != nullptr) { ntok++; joined += t; t = std.strtok(nullptr, ",;"); }
+    if (ntok != 3 || joined != "abc") { printf("FAIL strtok\n"); failures |= 2; }
+    char[8] m1_ = default; char[8] m2_ = default;
+    char* m1 = m1_; char* m2 = m2_;
+    std.memset(m1, 'q', 8);
+    std.memcpy(m2, m1, 8);
+    char* m2p = m2 + 1;
+    std.memmove(m2p, m2, 4);
+    m2[0] = 'a';
+    if (std.memcmp(m1, m2, 8) == 0 || std.memcmp(m1, m1, 8) != 0 || std.memchr(m2, 'a', 8) != m2 || std.memchr(m1, 'z', 8) != nullptr || m2[1] != 'q')
+    { printf("FAIL mem*\n"); failures |= 4; }
+    if (std.strerror(1) == nullptr) { printf("FAIL strerror\n"); failures |= 8; }
+    if (std.isalpha('a') == 0 || std.isalpha('1') != 0 || std.isdigit('7') == 0 || std.isdigit('x') != 0 || std.isalnum('z') == 0 || std.isspace(' ') == 0 || std.isspace('x') != 0
+        || std.ispunct('!') == 0 || std.ispunct('a') != 0 || std.isxdigit('f') == 0 || std.isxdigit('g') != 0 || std.isupper('A') == 0 || std.isupper('a') != 0 || std.islower('a') == 0
+        || std.isprint('a') == 0 || std.isprint('\n') != 0 || std.iscntrl('\n') == 0 || std.isgraph('a') == 0 || std.isgraph(' ') != 0 || std.isblank('\t') == 0 || std.isblank('x') != 0
+        || std.tolower('Q') != 'q' || std.toupper('q') != 'Q' || std.toupper('1') != '1')
+    { printf("FAIL cctype\n"); failures |= 16; }
+    if (std.iswalpha(L'a') == 0 || std.iswalpha(L'1') != 0 || std.iswdigit(L'5') == 0 || std.iswspace(L' ') == 0 || std.towupper(L'a') != L'A' || std.towlower(L'Z') != L'z'
+        || std.iswctype(L'a', std.wctype("alpha")) == 0 || std.iswctype(L'1', std.wctype("alpha")) != 0)
+    { printf("FAIL cwctype\n"); failures |= 32; }
+    wchar_t[16] w1_ = default;
+    wchar_t* w1 = w1_;
+    std.wcscpy(w1, L"wide");
+    wchar_t* endp = nullptr;
+    wchar_t** pendp = &endp;
+    long wl = std.wcstol(L"123xyz", pendp, 10);
+    double wd = std.wcstod(L"2.5", nullptr);
+    wchar_t[8] wbuf_ = default;
+    wchar_t* wbuf = wbuf_;
+    std.wmemset(wbuf, L'k', 8);
+    if (std.wcslen(w1) != 4 || std.wcscmp(w1, L"wide") != 0 || std.wcscmp(L"a", L"b") >= 0 || wl != 123 || *endp != L'x' || wd != 2.5 || wbuf[7] != L'k')
+    { printf("FAIL wcs*\n"); failures |= 64; }
+    wchar_t[16] wout_ = default; wchar_t* wout = wout_;
+    u64 mb = std.mbstowcs(wout, "abc", 16);
+    char[16] nout_ = default; char* nout = nout_;
+    u64 wb = std.wcstombs(nout, L"xyz", 16);
+    wchar_t[16] sw_ = default; wchar_t* sw = sw_;
+    int swn = std.swprintf(sw, 16, L"n=%d", 42);
+    if (mb != 3 || std.wcscmp(wout, L"abc") != 0 || wb != 3 || std.strcmp(nout, "xyz") != 0 || swn != 4 || std.wcscmp(sw, L"n=42") != 0)
+    { printf("FAIL conversions\n"); failures |= 128; }
+    if (failures == 0) printf("PASS std_full_11_c_strings\n");
+    return failures;
+}

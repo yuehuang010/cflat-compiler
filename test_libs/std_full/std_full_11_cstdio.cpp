@@ -1,0 +1,62 @@
+#include <string>
+#include <cstdio>
+#include <cstring>
+int main()
+{
+    int failures = 0;
+    char buf[64] = {0};
+    int n = std::snprintf(buf, sizeof(buf), "%d-%s-%.2f-%c", 42, "ab", 1.5, 'z');
+    if (n != 12 || std::strcmp(buf, "42-ab-1.50-z") != 0) { printf("FAIL snprintf\n"); failures |= 1; }
+    char small[4] = {0};
+    int need = std::snprintf(small, sizeof(small), "%s", "abcdefgh");
+    if (need != 8 || std::strcmp(small, "abc") != 0) { printf("FAIL snprintf truncation\n"); failures |= 2; }
+    int a = 0; double d = 0.0; char word[16] = {0};
+    int matched = std::sscanf("17 2.5 hello", "%d %lf %15s", &a, &d, word);
+    if (matched != 3 || a != 17 || d != 2.5 || std::strcmp(word, "hello") != 0) { printf("FAIL sscanf\n"); failures |= 4; }
+    const char* path = "std_full_11_cstdio.tmp";
+    std::FILE* f = std::fopen(path, "wb");
+    bool opened = f != nullptr;
+    size_t w = 0;
+    int ps = 0;
+    if (f != nullptr) { w = std::fwrite("abcdef", 1, 6, f); ps = std::fputs("\nline2\n", f); std::fclose(f); }
+    char rb[32] = {0};
+    size_t r = 0;
+    long sz = -1;
+    bool line_ok = false;
+    bool c_ok = false;
+    if (opened)
+    {
+        std::FILE* g = std::fopen(path, "rb");
+        if (g != nullptr)
+        {
+            r = std::fread(rb, 1, 6, g);
+            std::fseek(g, 0, SEEK_END);
+            sz = std::ftell(g);
+            std::rewind(g);
+            char line[32] = {0};
+            std::fgets(line, sizeof(line), g);
+            line_ok = std::strcmp(line, "abcdef\n") == 0;
+            int c = std::fgetc(g);
+            c_ok = c == 'l';
+            std::fclose(g);
+        }
+    }
+    if (!opened || w != 6 || ps < 0 || r != 6 || std::memcmp(rb, "abcdef", 6) != 0 || sz != 13 || !line_ok || !c_ok) { printf("FAIL file io\n"); failures |= 8; }
+    int rm = std::remove(path);
+    std::FILE* gone = std::fopen(path, "rb");
+    if (rm != 0 || gone != nullptr) { printf("FAIL remove\n"); failures |= 16; }
+    std::FILE* t = std::tmpfile();
+    bool tmpok = t != nullptr;
+    char tb[8] = {0};
+    if (tmpok)
+    {
+        std::fputs("xyz", t);
+        std::rewind(t);
+        std::fread(tb, 1, 3, t);
+        std::fclose(t);
+    }
+    if (!tmpok || std::strcmp(tb, "xyz") != 0) { printf("FAIL tmpfile\n"); failures |= 32; }
+    if (EOF != -1 || BUFSIZ <= 0) { printf("FAIL macros\n"); failures |= 64; }
+    if (failures == 0) printf("PASS std_full_11_cstdio\n");
+    return failures;
+}
