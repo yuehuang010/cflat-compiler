@@ -1840,19 +1840,20 @@ bool LLVMBackend::CacheBuildStampEnabled()
     }
 
 // Removes sibling cheaders/v<M> (M != current) directories whose newest mtime, over the directory
-// and its immediate children, is older than 7 days. One listing of cheaders/ plus a stat per
-// sibling; only stale candidates are opened. Symlinks and non-"v<digits>" names are never touched;
-// every error is ignored (another process may be pruning the same directory).
+// and its immediate children, is older than 24 hours (a second build sharing the cache dir keeps
+// its version while in use). Symlinks and non-"v<digits>" names are never touched; every error is
+// ignored (another process may be pruning the same directory).
 static void PruneOldCHeaderVersions(const std::filesystem::path& cheadersRoot, const std::string& keepName)
 {
     namespace fs = std::filesystem;
     std::error_code ec;
-    const auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(24 * 7);
+    const auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(24);
     fs::directory_iterator it(cheadersRoot, ec), end;
     if (ec) return;
+    std::vector<fs::path> dead;
     for (; it != end; it.increment(ec))
     {
-        if (ec) return;
+        if (ec) break;
         std::error_code e;
         const std::string name = it->path().filename().string();
         if (name.size() < 2 || name[0] != 'v' || name == keepName) continue;
@@ -1871,8 +1872,12 @@ static void PruneOldCHeaderVersions(const std::filesystem::path& cheadersRoot, c
             auto t = fs::last_write_time(child->path(), te);
             if (!te && t >= cutoff) { stale = false; break; }
         }
-        if (!stale) continue;
-        fs::remove_all(it->path(), e);
+        if (stale) dead.push_back(it->path());
+    }
+    for (const auto& path : dead)
+    {
+        std::error_code e;
+        fs::remove_all(path, e);
     }
 }
 
@@ -1880,7 +1885,7 @@ std::string LLVMBackend::GetCHeaderCacheDir()
 {
         std::string base = GetCflatCacheDir();
         if (base.empty()) return {};
-        // First use of this version in the process: drop long-dead sibling version directories.
+        // First use of this version in the process: drop dead sibling version directories.
         static std::once_flag pruneOnce;
         std::call_once(pruneOnce, [&]() {
             PruneOldCHeaderVersions(std::filesystem::path(base) / "cheaders",

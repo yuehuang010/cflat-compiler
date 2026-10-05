@@ -932,9 +932,10 @@ else
 fi
 fi
 
-# Header cache: a dead cheaders/v<M> directory whose newest mtime is over 7 days old is removed on
+# Header cache: a dead cheaders/v<M> directory whose newest mtime is over 24 hours old is removed on
 # the first header import of a process; a fresh one, a non-numeric name, a symlink (and its target)
-# and the live version stay. Private cache dir; fake dirs back-dated with touch -t.
+# and the live version stay. Private cache dir (core cache copied, header cache not); fake dirs
+# back-dated with touch -t.
 if [ "$RUN_MODE" -eq 0 ]; then
   pv_name="cheader_version_prune"
   pv_dir="$RES/$pv_name.d"
@@ -942,7 +943,11 @@ if [ "$RUN_MODE" -eq 0 ]; then
   pv_t0=$(now_ms)
   rm -rf "$pv_dir"; mkdir -p "$pv_dir/cache/cheaders/v1" "$pv_dir/cache/cheaders/v2" \
     "$pv_dir/cache/cheaders/vX" "$pv_dir/outside"
-  [ -d "$(dirname "$CFLAT")/.cflat" ] && cp -R "$(dirname "$CFLAT")/.cflat/." "$pv_dir/cache/"
+  if [ -d "$(dirname "$CFLAT")/.cflat" ]; then
+    for pv_e in "$(dirname "$CFLAT")/.cflat"/*; do
+      [ "$(basename "$pv_e")" = cheaders ] || cp -R "$pv_e" "$pv_dir/cache/"
+    done
+  fi
   touch "$pv_dir/cache/cheaders/v1/f" "$pv_dir/cache/cheaders/v2/f" "$pv_dir/cache/cheaders/vX/f" \
     "$pv_dir/outside/f"
   ln -s "$pv_dir/outside" "$pv_dir/cache/cheaders/v3"
@@ -954,7 +959,7 @@ if [ "$RUN_MODE" -eq 0 ]; then
       >"$pv_log" 2>&1; then
     write_result "$pv_name" "FAIL: header import did not compile" "$pv_t0"
   elif [ -e "$pv_dir/cache/cheaders/v1" ]; then
-    write_result "$pv_name" "FAIL: a dead version directory older than 7 days survived" "$pv_t0"
+    write_result "$pv_name" "FAIL: a dead version directory older than 24 hours survived" "$pv_t0"
   elif [ ! -e "$pv_dir/cache/cheaders/v2/f" ]; then
     write_result "$pv_name" "FAIL: a fresh version directory was removed" "$pv_t0"
   elif [ ! -e "$pv_dir/cache/cheaders/vX/f" ]; then
