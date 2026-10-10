@@ -222,8 +222,113 @@ std::string LLVMBackend::ResolveTypeAlias(const std::string& name) const
         if (!cxxLazyGlobalTypedefs_.empty() && cxxLazyGlobalTypedefs_.count(name) != 0
             && const_cast<LLVMBackend*>(this)->MaterializeCxxGlobalTypedef(name))
             if (const std::string* found = FindFirstVisibleScoped(typeAliases, name)) return *found;
+        // `Owner.name` naming a `using` member of a CFlat aggregate (`Plain.Id`, `ns.Box$int.T`).
+        // Only an owner that saved an alias frame qualifies, so a C++ or namespace path is a miss.
+        if (!aggregateAliasScopes_.empty())
+            if (size_t dot = name.rfind('.'); dot != std::string::npos && dot > 0 && dot + 1 < name.size()
+                && aggregateAliasMemberNames_.count(name.substr(dot + 1)) != 0)
+            {
+                std::string owner = name.substr(0, dot);
+                auto frame = aggregateAliasScopes_.find(owner);
+                if (frame == aggregateAliasScopes_.end())
+                {
+                    owner = ResolveQualifiedName(ResolveTypeAlias(owner));
+                    frame = aggregateAliasScopes_.find(owner);
+                }
+                if (frame != aggregateAliasScopes_.end())
+                    if (auto it = frame->second.typeAliases.find(name.substr(dot + 1));
+                        it != frame->second.typeAliases.end())
+                        return it->second;
+            }
         return name;
     }
+
+std::string LLVMBackend::ResolveMemberType(const std::string& owner, const std::string& member,
+                                           MemberTypeResult& result)
+{
+        result = MemberTypeResult::Found;
+        const std::string key = owner + "." + member;
+        const bool cxxOwner = IsCxxForeignTypeRegistered(owner);
+        if (!cxxOwner)
+        {
+            // A nested aggregate (`Outer.Inner`) is registered under its dotted key.
+            if (dataStructures.count(key) != 0 || HasInterface(key)) return key;
+            auto frame = aggregateAliasScopes_.find(owner);
+            if ((frame == aggregateAliasScopes_.end() || provisionalAggregateAliasScopes_.count(owner) != 0)
+                && ensureAggregateAliases_ && ensureAggregateAliases_(owner))
+                frame = aggregateAliasScopes_.find(owner);
+            if (frame != aggregateAliasScopes_.end())
+                if (auto it = frame->second.typeAliases.find(member); it != frame->second.typeAliases.end())
+                    return it->second;
+            auto ds = dataStructures.find(owner);
+            if (ds == dataStructures.end() && frame == aggregateAliasScopes_.end())
+            {
+                result = MemberTypeResult::NotARecord;
+                return {};
+            }
+            bool isValueMember = functionTable.count(key) != 0;
+            if (auto names = aggregateValueMembers_.find(owner); names != aggregateValueMembers_.end())
+                isValueMember = isValueMember || names->second.count(member) != 0;
+            if (ds != dataStructures.end())
+                for (const auto& field : ds->second.StructFields)
+                    if (field.VariableName == member) isValueMember = true;
+            result = isValueMember ? MemberTypeResult::NotAType : MemberTypeResult::NotFound;
+            return {};
+        }
+        // C++ record: a member typedef / nested type, requested once under `owner.member`.
+        // A nested enum binds as an enum type (backing type registered, no record).
+        if (IsCxxForeignTypeRegistered(key) || dataStructures.count(key) != 0
+            || enumBackingTypes.count(key) != 0)
+            return key;
+        if (std::string aliased = ResolveTypeAlias(key); aliased != key)
+            return aliased;
+        if (auto seen = cxxForeignRequests_.find(key); seen != cxxForeignRequests_.end())
+        {
+            if (seen->second.empty())
+                return key;   // an earlier request bound it (empty entry = success)
+            result = MemberTypeResult::NotFound;
+            return {};
+        }
+        const std::string spelling = cxxCflatToCxxSpelling_.at(owner) + "::" + member;
+        std::string error;
+        bool bound = false;
+        if (auto group = cxxTypeOwnerGroup_.find(owner); group != cxxTypeOwnerGroup_.end())
+        {
+            CxxRequestGroup request = MakeCxxRequestGroup(group->second, {});
+            if (!request.headers.empty())
+            {
+                CxxRequestGroupScope scope(*this, &request);
+                bound = RequestCxxForeignType(key, spelling, error);
+            }
+        }
+        else if (activeCxxRequestGroup_ != nullptr)
+            bound = RequestCxxForeignType(key, spelling, error);
+        if (!bound)
+        {
+            cxxForeignRequests_[key] = error.empty() ? "unresolved" : error;
+            result = MemberTypeResult::NotFound;
+            return {};
+        }
+        if (std::string aliased = ResolveTypeAlias(key); aliased != key)
+            return aliased;
+        return key;
+}
+
+std::string LLVMBackend::MemberTypeErrorMessage(const std::string& ownerDisplay,
+                                                const std::string& member,
+                                                MemberTypeResult result)
+{
+        switch (result)
+        {
+        case MemberTypeResult::NotAType:
+            return LocalizeMessage("'{}' is a member of '{}' but not a type", { member, ownerDisplay });
+        case MemberTypeResult::NotARecord:
+            return LocalizeMessage("'{}' is not a struct or class, so '{}.{}' does not name a member type",
+                                   { ownerDisplay, ownerDisplay, member });
+        default:
+            return LocalizeMessage("'{}' has no member type named '{}'", { ownerDisplay, member });
+        }
+}
 
 const LLVMBackend::TypeAndValue* LLVMBackend::FindFunctionTypeAlias(const std::string& name) const
 {
@@ -274,10 +379,18 @@ void LLVMBackend::PushAggregateAliasScope(const std::string& aggregateName)
             aliasScopeStack_.push_back(it->second);
     }
 
-void LLVMBackend::SaveAggregateAliasScope(const std::string& aggregateName)
+void LLVMBackend::SaveAggregateAliasScope(const std::string& aggregateName, bool provisional)
 {
-        if (!aliasScopeStack_.empty())
-            aggregateAliasScopes_[aggregateName] = aliasScopeStack_.back();
+        if (aliasScopeStack_.empty()) return;
+        // A provisional (scan) frame never replaces an authoritative one.
+        if (provisional && aggregateAliasScopes_.count(aggregateName) != 0
+            && provisionalAggregateAliasScopes_.count(aggregateName) == 0)
+            return;
+        aggregateAliasScopes_[aggregateName] = aliasScopeStack_.back();
+        for (const auto& [alias, target] : aliasScopeStack_.back().typeAliases)
+            aggregateAliasMemberNames_.insert(alias);
+        if (provisional) provisionalAggregateAliasScopes_.insert(aggregateName);
+        else provisionalAggregateAliasScopes_.erase(aggregateName);
     }
 
 bool LLVMBackend::AliasInCurrentScope(const std::string& alias) const

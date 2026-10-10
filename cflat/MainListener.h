@@ -940,6 +940,17 @@ static std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler, antl
         }
         if (auto* n = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node))
         {
+            if (n->offsetofFieldPath() != nullptr
+                && n->getStart()->getText() == "__builtin_offsetof")
+            {
+                if (compiler == nullptr) return std::nullopt;
+                std::vector<std::string> path;
+                for (auto* part : n->offsetofFieldPath()->Identifier()) path.push_back(part->getText());
+                int64_t offset = 0;
+                if (!compiler->TryGetScanTimeFieldOffset(n->typeName()->getText(), path, offset))
+                    return std::nullopt;
+                return InScannerInt32Range(offset) ? std::optional<int64_t>(offset) : std::nullopt;
+            }
             // `sizeof '(' typeName ')'` - exactly four children, so `sizeof alignof(T)` and the
             // expression form are not mistaken for it. Aggregates answer undecidable.
             if (n->typeName() != nullptr && n->children.size() == 4 && !n->Sizeof().empty())
@@ -970,6 +981,38 @@ static std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler, antl
         }
         if (auto* n = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
         {
+            if (compiler != nullptr && n->primaryExpression() != nullptr
+                && n->primaryExpression()->genericIdentifier() != nullptr
+                && n->primaryExpression()->genericIdentifier()->Identifier() != nullptr
+                && n->primaryExpression()->genericIdentifier()->Identifier()->getText() == "offsetof"
+                && n->children.size() == 4 && n->argumentExpressionList().size() == 1
+                && compiler->GetScopedLocalOrArgument("offsetof").Storage == nullptr
+                && compiler->GetFunctionArgument("offsetof").GetValue() == nullptr
+                && compiler->GetMemberVariable("offsetof").Storage == nullptr
+                && compiler->GetGlobalVariableNV("offsetof").Storage == nullptr
+                && compiler->GetFunction("offsetof") == nullptr)
+            {
+                auto args = n->argumentExpressionList(0)->argumentNamedExpression();
+                if (args.size() == 2 && args[0]->assignmentExpression() != nullptr
+                    && args[1]->assignmentExpression() != nullptr)
+                {
+                    const std::string typeText = args[0]->assignmentExpression()->getText();
+                    const std::string pathText = args[1]->assignmentExpression()->getText();
+                    std::vector<std::string> path;
+                    size_t begin = 0;
+                    while (begin < pathText.size())
+                    {
+                        const size_t dot = pathText.find('.', begin);
+                        path.push_back(pathText.substr(begin,
+                            dot == std::string::npos ? std::string::npos : dot - begin));
+                        if (dot == std::string::npos) break;
+                        begin = dot + 1;
+                    }
+                    int64_t offset = 0;
+                    if (compiler->TryGetScanTimeFieldOffset(typeText, path, offset))
+                        return InScannerInt32Range(offset) ? std::optional<int64_t>(offset) : std::nullopt;
+                }
+            }
             // Only a bare primary folds - a call, index or non-enum member access does not.
             if (n->children.size() == 1) return FoldCompileTimeIntLeaf(compiler, n->primaryExpression());
             // `Dir.Back`: an enum member is a compile-time constant, registered in both passes.
@@ -3399,6 +3442,9 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
 
         LLVMBackend::AliasScopeGuard aliasScope(compiler);
         ScanAggregateAliases(ctx->aggregateMember());
+        // `Owner.name` from outside the body resolves through this frame until the main pass
+        // walks the aggregate and saves its authoritative one.
+        compiler->SaveAggregateAliasScope(typeName, /*provisional*/ true);
 
         // Pre-declare member functions (and detect constructor overloads).
         // Ctor signatures seen so far in this body, keyed by mangled name -> declaring line.
@@ -3653,6 +3699,26 @@ public:
     LLVMBackend::TypeAndValue BuildFuncPtrAliasType(CFlatParser::FunctionPointerSpecifierContext* fpSpec);
 
     void ScanUsingDeclaration(CFlatParser::UsingDeclarationContext* ctx);
+    // `Spec<args>.name` in type position: the member type's spelling, or the written text when
+    // the scan cannot resolve it yet (the main pass reports).
+    std::string ResolveMemberTypeSpecifier(CFlatParser::MemberTypeSpecifierContext* ctx);
+    // Collects the `using` members of the CFlat generic instantiation `owner` (template `base`,
+    // arguments `args`) as a provisional frame, binding the template parameters textually.
+    bool ScanTemplateAggregateAliases(const std::string& owner, const std::string& base,
+                                      const std::vector<std::string>& args);
+    // Template parameter -> argument while ScanTemplateAggregateAliases evaluates a body's aliases.
+    std::unordered_map<std::string, std::string> scanTypeSubstitutions_;
+    // Generic struct/class templates of this file by qualified name, from the name scan, and
+    // the namespace each is declared in (its alias targets resolve there).
+    std::unordered_map<std::string, antlr4::ParserRuleContext*> scannedGenericAggregates_;
+    std::unordered_map<std::string, std::string> scannedGenericAggregateNs_;
+    // Owners given a provisional alias frame during ScanGenericTypeUses, before record shells
+    // exist; RefreshProvisionalAggregateAliases re-collects them once every shell is registered.
+    struct ProvisionalAliasOwner { std::string owner, base; std::vector<std::string> args; };
+    std::vector<ProvisionalAliasOwner> provisionalAliasOwners_;
+    // Set while ScanTemplateAggregateAliases runs: the template's namespace ("" = file scope).
+    std::optional<std::string> provisionalAliasNs_;
+    void RefreshProvisionalAggregateAliases();
 
     void ScanProgramDefinition(CFlatParser::ProgramDefinitionContext* ctx);
 
@@ -3680,6 +3746,7 @@ private:
     LLVMBackend* compilerLLVM;
     std::string sourceFileName;
     std::string importNamespace_;
+    unsigned addressOfOperandDepth_ = 0;
 
     LLVMBackend* Compiler(antlr4::ParserRuleContext* ctx);
     inline LLVMBackend* Compiler() { return compilerLLVM; }
@@ -4077,6 +4144,7 @@ private:
     // Marks an expression position where a ternary owning temp may need per-arm cleanup
     // before its value is joined with a borrowed consumer.
     bool inCallArgument_ = false;
+    bool inCxxCallArgument_ = false;
     // The one postfix expression whose flexible-array member stays an array (the direct operand
     // of `sizeof` or unary `&`); every other value context decays it to `T*`, as C does.
     std::vector<antlr4::ParserRuleContext*> flexibleArrayKeep_;
@@ -4114,6 +4182,12 @@ private:
             ternaryDepth = 0;
         }
         ~CallArgumentSuspendScope() { ternaryDepth = savedTernaryDepth; slot = saved; }
+    };
+    struct CxxCallArgumentScope {
+        bool& slot;
+        bool saved;
+        CxxCallArgumentScope(bool& s, bool active) : slot(s), saved(s) { slot = active; }
+        ~CxxCallArgumentScope() { slot = saved; }
     };
 
     // A destination type describes the WHOLE expression, never one operand of it: `string s =
@@ -4417,6 +4491,33 @@ public:
     LLVMBackend::TypeAndValue BuildFuncPtrAliasType(CFlatParser::FunctionPointerSpecifierContext* fpSpec);
 
     void ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* ctx);
+    // `Spec<args>.name[.name...]` in type position: instantiates the owner and returns the
+    // member type's spelling; reports a name that is not a member type of the owner.
+    std::string ResolveMemberTypeSpecifier(CFlatParser::MemberTypeSpecifierContext* ctx);
+    // The shared walk: instantiate `base<ownerArgs>`, then resolve each member in turn. Returns ""
+    // when a member is not a member type (reported only when `report`).
+    std::string ResolveMemberTypeChain(
+        std::string base, CFlatParser::GenericTypeParametersContext* ownerArgs, const std::string& ownerText,
+        const std::vector<std::pair<std::string, antlr4::ParserRuleContext*>>& members,
+        antlr4::ParserRuleContext* site, bool report);
+    // A sizeof/typeof operand the parser read as an expression (`Spec<args>.name`): the member
+    // type it names by lookup, or "" when it names none (it then stays a value expression).
+    std::string TryPostfixAsMemberType(CFlatParser::PostfixExpressionContext* postfix);
+    // True when `Spec<args>.name` names a member type (no diagnostics; a value member is false).
+    bool MemberTypeSpecifierNamesType(CFlatParser::MemberTypeSpecifierContext* ctx);
+    // `Owner.name` written as a dotted name (`Plain.Id`, `T.value_type` in a generic body) that
+    // the ordinary lookup left unknown. Returns the member type's spelling, "" when `text` does
+    // not start with a known record; reports a member that is missing or not a type.
+    std::string ResolveDottedMemberType(const std::string& text, antlr4::ParserRuleContext* site, bool report = true);
+    // Collects the `using` members of a queued generic struct/class instantiation `owner` under
+    // its template substitutions (the backend's ensureAggregateAliases_ hook).
+    bool EnsureAggregateAliases(const std::string& owner);
+    std::unordered_set<std::string> aggregateAliasesInProgress_;
+    // > 0 inside the generic-use pre-scan: member-type misses stay silent there, the real
+    // walk reports them inside whatever expect_error scope the spelling sits in.
+    int memberTypeSilentDepth_ = 0;
+    void RecordAggregateValueMembers(const std::string& owner,
+        const std::vector<CFlatParser::AggregateMemberContext*>& members);
 
     void ParseAnnotationDefinition(CFlatParser::AnnotationDefinitionContext* ctx);
 
@@ -6026,6 +6127,26 @@ public:
     LLVMBackend::TypedValue ParseAndExpression(CFlatParser::AndExpressionContext* ctx,
                                                 ResultUse use = ResultUse::Value);
 
+    /*
+     * C reads `(X) op y` as a cast only when X names a TYPE; the grammar has no symbol table, so
+     * `(s.x) + 1`, `(Spec<int>.value) * 2` parse as a cast of the unary `op y`. Lookup decides:
+     * when X names a value, the and-expression is re-parsed from its own tokens with `(X)` wrapped
+     * as `((X))` (a parenthesized expression), so every binary operator keeps C precedence.
+     */
+    struct ValueCastReparse {
+        std::unique_ptr<antlr4::ListTokenSource> source;
+        std::unique_ptr<antlr4::CommonTokenStream> tokens;
+        std::unique_ptr<CFlatParser> parser;
+        CFlatParser::AndExpressionContext* root = nullptr;
+        CFlatParser::CastExpressionContext* hazard = nullptr;
+        std::string text;   // the original and-expression text, guards a recycled ctx address
+    };
+    std::unordered_map<const antlr4::ParserRuleContext*, std::unique_ptr<ValueCastReparse>> valueCastReparses_;
+    CFlatParser::CastExpressionContext* FindValueCastHazard(antlr4::tree::ParseTree* node);
+    bool CastTypeNameNamesValue(CFlatParser::TypeNameContext* typeName);
+    CFlatParser::AndExpressionContext* ReparseValueCast(CFlatParser::AndExpressionContext* ctx,
+                                                        CFlatParser::CastExpressionContext* hazard);
+
     // Interface comparisons use the data pointer: against nullptr, or between two fat values.
     // This keeps aggregate interface values out of LLVM icmp while preserving object identity.
     void LowerInterfaceNullCompare(antlr4::ParserRuleContext* ctx,
@@ -6236,7 +6357,7 @@ public:
     ShiftPairResult ParseShiftPair(const ShiftOperand& lhs, const ShiftOperand& rhs,
                                    const std::string& op,
                                    CFlatParser::ShiftExpressionContext* ctx,
-                                   ResultUse use);
+                                   ResultUse use, bool moreOperands);
 
     LLVMBackend::TypedValue ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx,
                                                   ResultUse use = ResultUse::Value);
@@ -6350,7 +6471,7 @@ public:
     // C++ classes may overload && and ||; both operands are evaluated (C++ drops short-circuit
     // for an overloaded operator too) and the chain folds left to right. Null when the first
     // operand is not a C++ class carrying that operator.
-    llvm::Value* TryClassLogicalOperatorChain(
+    LLVMBackend::TypedValue TryClassLogicalOperatorChain(
         const std::string& op, antlr4::ParserRuleContext* ctx,
         const LLVMBackend::TypedValue& first,
         const std::function<LLVMBackend::TypedValue(size_t)>& parseOperand,
@@ -6433,6 +6554,9 @@ public:
     LLVMBackend::NamedVariable SizeOrAlignOfAutoVariable(const std::string& name, bool isSizeof);
     LLVMBackend::NamedVariable SizeOrAlignOfType(const LLVMBackend::TypeAndValue& typeValue,
                                                  llvm::Type* llvmType, bool isSizeof);
+    LLVMBackend::NamedVariable ParseOffsetofText(antlr4::ParserRuleContext* errCtx,
+                                                  const std::string& typeText,
+                                                  const std::vector<std::string>& path);
 
     std::string ParseTypeSpecifierName(CFlatParser::TypeSpecifierContext* ctx,
                                        CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);

@@ -38,6 +38,7 @@ primaryExpression
     | Default                                    // 'default' as a VALUE: type comes from the destination
     | Identifier DoubleColon genericIdentifier   // global:: scope-escape qualifier ('global' is a contextual soft keyword, checked in the listener)
     | simdTypeSpecifier                          // static methods on the simd type: simd<T,N>.load(...) / .store(...)
+    | operatorCallName
     | genericIdentifier
     | StringLiteral+
     | lambdaExpression
@@ -109,7 +110,8 @@ argumentNamedExpression
     ;
 
 unaryExpression
-    : 'sizeof' '(' typeName ')'
+    : '__builtin_offsetof' '(' typeName ',' offsetofFieldPath ')'
+    | 'sizeof' '(' typeName ')'
     | ('sizeof')+ (
         postfixExpression
         | unaryOperator castExpression
@@ -127,6 +129,10 @@ unaryExpression
     | deleteExpression
     | moveExpression
     | operatorStringExpression
+    ;
+
+offsetofFieldPath
+    : Identifier ('.' Identifier)*
     ;
 
 operatorStringExpression
@@ -336,6 +342,7 @@ typeSpecifier
     | 'auto'
     | Move                           // soft keyword - ownership modifier on parameters
     | qualifiedGenericIdentifier     // namespace-qualified type (e.g. MathAdv.MyNumber, Windows.Foundation.IReference<int>)
+    | memberTypeSpecifier            // member type of a generic instantiation (e.g. std.vector<int>.value_type)
     | genericIdentifier
     | functionPointerSpecifier
     | simdTypeSpecifier
@@ -905,6 +912,18 @@ qualifiedGenericIdentifier
     : Identifier ('.' memberNameToken)+ genericTypeParameters?
     ;
 
+// `Spec<args>.name` - a member type (C++ member typedef / nested type, CFlat struct `using`) of a
+// generic instantiation. The owner must end in `<...>`, so this never overlaps
+// qualifiedGenericIdentifier; the non-generic `Owner.name` spelling is a qualifiedGenericIdentifier
+// and is resolved by lookup. Type positions only (in an expression, `a<b>.c` is member access).
+memberTypeSpecifier
+    : memberTypeOwner ('.' memberNameToken)+
+    ;
+
+memberTypeOwner
+    : Identifier ('.' memberNameToken)* genericTypeParameters
+    ;
+
 memberNameToken
     : Identifier
     | Auto
@@ -1025,6 +1044,10 @@ operatorFunctionId
                | Arrow
                | Not | Tilde
                | typeName)
+    ;
+
+operatorCallName
+    : Operator (New | Delete) (LeftBracket RightBracket)?
     ;
 
 interfaceDefinition

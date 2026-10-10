@@ -2647,6 +2647,15 @@ sizeof(x)                     // 4 - same as sizeof(int)
 On a name collision the type meaning wins, matching C. The result is typed
 `i64`.
 
+`offsetof(Type, field)` returns the byte offset of a record member as `u64`.
+Nested value fields use dotted paths; a path cannot pass through a pointer.
+Offsets for imported C and C++ records use clang's record layout.
+
+```c
+struct Header { char tag = default; double value = default; };
+const u64 value_offset = offsetof(Header, value);  // 8
+```
+
 ---
 
 ### `embed("path")`

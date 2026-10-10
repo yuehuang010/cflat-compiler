@@ -1939,7 +1939,7 @@ bool testStringLiteral()
     c32* utf32 = U"A\U0001f600";
     c16* utf16Pair = u"\U0001f600";
     string narrowUcn = "\u263a";
-    char* utf8Ucn = u8"\u263a";
+    c8* utf8Ucn = u8"\u263a";
     result &= Test("utf16_literal_smile", utf16[1], (c16)0x263a);
     result &= Test("utf32_literal_non_bmp", utf32[1], (c32)0x1f600);
     result &= Test("utf16_literal_surrogate_high", utf16Pair[0], (c16)0xd83d);
@@ -1947,6 +1947,8 @@ bool testStringLiteral()
     result &= Test("narrow_ucn_utf8_length", narrowUcn.length(), 3);
     result &= (u8)narrowUcn.data()[0] == (u8)0xe2;
     result &= (u8)utf8Ucn[0] == (u8)0xe2;
+    c8* utf8Literal = u8"xyz";
+    result &= utf8Literal[0] == (c8)'x';
     result &= Test("wide_character_literal", (wchar)L'b', (wchar)'b');
     result &= Test("utf16_character_literal", (c16)u'\u263a', (c16)0x263a);
     result &= Test("utf32_character_literal", (c32)U'\U0001f600', (c32)0x1f600);
@@ -4568,6 +4570,7 @@ bool testStructDefaultZeroFill()
 namespace NamespaceStaticChecks
 {
     struct Utility { static int add(int x) { return x + 1; } int value = 8; };
+    int global = 19;
     using LocalInt = int;
     using LocalUtility = Utility;
 
@@ -4596,6 +4599,11 @@ bool testAliasAndStaticResolution()
     bool result = NamespaceStaticChecks.run() == 11;
     result &= Test("qualified_namespace_alias", q, 4);
     result &= Test("namespace_static_qualified", NamespaceStaticChecks.Utility.add(10), 11);
+    NamespaceStaticChecks.LocalUtility addressObject = default;
+    auto objectFieldAddress = &addressObject.value;
+    auto namespaceGlobalAddress = &NamespaceStaticChecks.global;
+    result &= Test("address_of_object_field", *objectFieldAddress, 8);
+    result &= Test("address_of_namespace_global", *namespaceGlobalAddress, 19);
     result &= Test("pointer_alias_chain", (p == nullptr && pp == nullptr) ? 1 : 0, 1);
     return result;
 }
@@ -4801,6 +4809,7 @@ extern int main()
     total++; passed += testPostfixInDeclaration()          ? 1 : 0;
     total++; passed += testPostfixConditional()            ? 1 : 0;
     total++; passed += testPostfixGenericInstantiation()   ? 1 : 0;
+    total++; passed += testOffsetofIntrinsic() ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -6756,5 +6765,51 @@ bool testPostfixGenericInstantiation()
     { PfgBox<int> b; b.v = 5; int c = 1; long r = c++ + b.conv<long>(); int d = c; result &= Test("pfg_generic_struct_generic_method", (int)r * 10 + d, 62); }
     // The field default `pfgGenField<T>(3)` is itself instantiated inside the struct's instantiation.
     { int c = 1; int r = c++ + pfgMkDef<int>(5).v; int d = c; result &= Test("pfg_field_default_generic", r * 10 + d, 42); }
+    return result;
+}
+
+struct T38Padded { char c = default; double d = default; };
+struct T38Nested { char c = default; T38Padded inner = default; };
+struct T38Box<T> { char c = default; T value = default; };
+struct T38OffsetNameField { int offsetof = default; };
+struct alignas(32) T38Aligned { char c = default; double d = default; };
+namespace T38Ns { struct Record { char c = default; double d = default; }; }
+namespace T38OffsetUser
+{
+    int offsetof(int a, int b) { return a * 10 + b; }
+    int Invoke() { return offsetof(2, 3); }
+}
+int t38OffsetParamName(int offsetof) { return offsetof * 2; }
+using T38PaddedAlias = T38Padded;
+
+bool testOffsetofIntrinsic()
+{
+    bool result = true;
+    const u64 padded = offsetof(T38Padded, d);
+    int[offsetof(T38Padded, d)] arr;
+    result &= Test("offsetof_cflat_padding", padded, (u64)8);
+    result &= Test("offsetof_cflat_nested", offsetof(T38Nested, inner.d), (u64)16);
+    result &= Test("offsetof_cflat_generic", offsetof(T38Box<double>, value), (u64)8);
+    result &= Test("offsetof_cflat_union", offsetof(UnionIntFloat, f), (u64)0);
+    result &= Test("offsetof_cflat_aligned", offsetof(T38Aligned, d), (u64)8);
+    result &= Test("offsetof_cflat_namespace", offsetof(T38Ns.Record, d), (u64)8);
+    result &= Test("offsetof_cflat_alias", offsetof(T38PaddedAlias, d), (u64)8);
+    result &= Test("offsetof_builtin_spelling", __builtin_offsetof(T38Padded, d), (u64)8);
+    result &= Test("offsetof_builtin_const_spelling", __builtin_offsetof(const T38Padded, d), (u64)8);
+    {
+        int offsetof = 3;
+        result &= Test("offsetof_variable_name", offsetof, 3);
+    }
+    {
+        T38OffsetNameField named;
+        named.offsetof = 4;
+        result &= Test("offsetof_field_name", named.offsetof, 4);
+    }
+    result &= Test("offsetof_parameter_name", t38OffsetParamName(5), 10);
+    result &= Test("offsetof_user_function", T38OffsetUser.Invoke(), 23);
+    if const (offsetof(T38Padded, d) == 8)
+        result &= Test("offsetof_if_const", 1, 1);
+    if const (offsetof(T38Box<double>, value) == 8)
+        result &= Test("offsetof_generic_if_const", 1, 1);
     return result;
 }

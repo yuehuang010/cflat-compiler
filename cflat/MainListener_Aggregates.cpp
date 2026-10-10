@@ -539,6 +539,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         LLVMBackend::AliasScopeGuard aliasScope(compiler);
         CollectAggregateAliases(ctx, structName);
         compiler->SaveAggregateAliasScope(structName);
+        RecordAggregateValueMembers(structName, ResolveAggregateMembers(ctx));
 
         // Process nested struct/class definitions before fields so their types are available
         for (auto* nestedStruct : MemberStructDefinitions(ctx))
@@ -4082,6 +4083,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         LLVMBackend::AliasScopeGuard aliasScope(compiler);
         CollectAggregateAliases(ctx, structName);
         compiler->SaveAggregateAliasScope(structName);
+        RecordAggregateValueMembers(structName, ResolveAggregateMembers(ctx));
 
         // Process nested struct/class definitions before fields so their types are available
         for (auto* nestedStruct : MemberStructDefinitions(ctx))

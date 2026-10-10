@@ -1,0 +1,7 @@
+extern int main()
+{
+    expect_error("cannot convert 'c8*' to 'char*'") {
+        char* text = u8"wrong type";
+    }
+    return 0;
+}

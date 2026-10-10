@@ -1,6 +1,5 @@
 // GUARDS: u8"..." literal as a char8_t const pointer into std::u8string
 // FROM: internal/plan/std-library-tier2-suite.md
-// DISABLED: internal/issue/p3/u8-string-literal-typed-char-pointer.md
 import cpp "string";
 extern int main()
 {

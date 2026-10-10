@@ -1,0 +1,51 @@
+import cpp "string";
+import cpp "../library/cpp_interop_basic.h";
+
+struct MemberPtrLocal
+{
+    int value = 7;
+    int get() { return value; }
+};
+
+struct MemberPtrBox<T>
+{
+    T value = default;
+    int get() { return 8; }
+};
+
+namespace MemberPtrNs
+{
+    struct S
+    {
+        int get() { return 9; }
+    };
+}
+
+expect_error("pointers to members are not supported in CFlat") {
+    auto p = &MemberPtrLocal.value;
+};
+
+expect_error("pointers to members are not supported in CFlat") {
+    auto p = &MemberPtrLocal.get;
+};
+
+expect_error("pointers to members are not supported in CFlat") {
+    auto p = &MemberPtrBox<int>.get;
+};
+
+expect_error("pointers to members are not supported in CFlat") {
+    auto p = &MemberPtrNs.S.get;
+};
+
+expect_error("pointers to members are not supported in CFlat") {
+    auto p = &cppi.Ops.value;
+};
+
+expect_error("pointers to members are not supported in CFlat") {
+    auto p = &std.string.size;
+};
+
+// The rejection above unwinds out of the `&` operand; a later non-`&` read keeps its own diagnostic.
+expect_error("does not name a value here") {
+    int y = MemberPtrLocal.value;
+};

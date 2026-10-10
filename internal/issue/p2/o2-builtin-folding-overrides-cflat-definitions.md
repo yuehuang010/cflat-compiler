@@ -41,3 +41,13 @@ Item 1 LANDED 2026-10-01 as V11 52a77168: a user (non-core) C-linkage definition
 signature TargetLibraryInfo recognizes gets `nobuiltin`; regression leg userLibcAtollWins in
 Test/test_operators.cb (-O2 twin). A caller inside an imported .c is folded by clang before
 linking (same as clang across TUs without LTO). Item 2 (new[] elision) remains open.
+
+## T51 investigation 2026-10-05 (no code change) - item 2 needs a ruling
+
+CFlat -O2 omitting the replaceable global operator new[] / delete[] calls for `new C[n]` is PERMITTED by C++
+([expr.new]/14 allocation omission; [expr.delete]/6.3 then no deallocation call); clang keeping them is also
+permitted. Class-scope allocators (leg 3362) keep their counts at -O2; values and destructor counts are preserved.
+So the counter legs 3359-3363/3401-3409 encode implementation-defined behaviour: ruling needed - rewrite them to
+not count global allocation calls at -O2 (or keep -O0-only), or make CFlat match clang's IR shape anyway.
+Separately the full test_cpp_interop.cb at -O2 exits 31 with heap-audit closure/string leaks, NOT localized.
+Matrix + report: scratch/repro_keep/t51/.

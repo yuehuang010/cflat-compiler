@@ -193,6 +193,7 @@ cppfop.FoldRef d5_return_temporary_fold(cppfop.FoldRef* a, cppfop.FoldRef* b,
 // libc++ headers are the fixture, reached by the SYSTEM header spelling below.
 import cpp "library/cpp_interop_tpl.h";
 import cpp "library/cpp_interop_unique_deleter.hpp";
+import cpp "library/cpp_t37_member_types.hpp";
 import cpp "library/cpp_interop_by_value.h";
 import cpp "library/cpp_interop_proxy.h";
 import cpp "library/cpp_interop_define_primary.h";
@@ -524,6 +525,21 @@ void n65CppDelete(move int* value)
     delete value;
     n65CppDeleteCount += 1;
 }
+
+// T37: member typedefs, using-aliases, nested classes and enums of imported classes and class
+// template specializations name types as `Spec.name`; dependent through CFlat generic params.
+t37.vec<int>.value_type t37Global = 9;
+struct T37Holder { t37.vec<int>.value_type f = default; };
+t37.vec<int>.value_type t37Twice(t37.vec<int>.value_type x) { return x * 2; }
+using T37Vt = t37.vec<int>.value_type;
+struct T37Wrap<T> { T w = default; };
+T.value_type t37FirstOf<T>(T v) { T.value_type r = v.at(0); return r; }
+bool t37IsInt<T>() { return t37.same<t37.traits<T>.value_type, int>.value; }
+// A value in parentheses before a binary operator keeps the by-value param's final use a move.
+int t37Take(t37.track x) { return x.v; }
+int t37Forward(t37.track x) { return (t37.vec<int>.kind) + t37Take(x); }
+int t37Apply(function<int(int)> f, int n) { return f(n); }
+int t37ForwardLambda(t37.track x) { return (t37.vec<int>.kind) + t37Apply((int n) => { return n * 2; }, 1) + t37Take(x); }
 
 extern int main()
 {
@@ -3528,11 +3544,13 @@ extern int main()
             if (cppt.arr.nil_kind_fwd(nullptr) != 1 || cppt.arr.nil_kind_fwd(madeNil) != 1) return 2872;
             if (sink.take_default() != 9 || sink.take_default(nullptr) != 9) return 2873;
             if (cppt.arr.nil_kind(autoNil) != 1)                            return 2874;
-            // A pointer expression is never the null type. `p + 1` and `f ? p : nullptr` carry no
-            // pointee type yet, so deduction refuses them (clang: int*) - never std::nullptr_t.
+            // A pointer expression is never the null type. `p + 1` carries no pointee type.
             int* nilPtr = &nilProbe;
             expect_error("cannot be spelled in C++") { int arithKind = cppt.arr.nil_kind(nilPtr + 1); }
-            expect_error("cannot be spelled in C++") { int mixKind = cppt.arr.nil_kind(nullFlag ? nilPtr : nullptr); }
+            int mixKind = cppt.arr.nil_kind(nullFlag ? nilPtr : nullptr);
+            if (mixKind != 2) return 2885;
+            int reverseMixKind = cppt.arr.nil_kind(nullFlag ? nullptr : nilPtr);
+            if (reverseMixKind != 2) return 2886;
             if (cppt.arr.nil_order(nilPtr) != 2 || cppt.arr.nil_order(nullptr) != 1
                 || cppt.arr.nil_order(stdNil) != 1 || cppt.arr.nil_order((void*)nilPtr) != 3) return 2876;
             if (sink.order(nilPtr) != 2 || sink.order(nullptr) != 1 || sink.order(aliasNil) != 1) return 2877;
@@ -4026,5 +4044,57 @@ extern int main()
     }
     if (cppt.FunctionTypeTag<int(int)>.arity()
         + cppt.FunctionTypeTag<function<int(int)>>.arity() != 102) return 2818;
+    // T37: member types of C++ classes and specializations in every type position.
+    {
+        t37.vec<int>.value_type a = 5;
+        t37.vec<int>.size_type b = 6;
+        t37.plain.id_type c = 7;
+        t37.plain.label d = 8;
+        t37.dict<int, float>.mapped_type e = 1.5;
+        if (a + (int)b + (int)c + d != 26 || e != 1.5) return 2950;
+        if (!t37.same<t37.vec<int>.value_type, int>.value) return 2951;
+        if (!t37.same<t37.traits<t37.vec<int>.iterator>.iterator_category, t37.rand_tag>.value) return 2952;
+        if (!t37.same<t37.traits<int*>.value_type, int>.value) return 2953;
+        if (t37.same<t37.vec<int>.value_type, long>.value) return 2954;
+        t37.vec<int>.iterator.value_type iv = 3;
+        t37.plain.inner.type s = 4;
+        t37.plain.inner ii; ii.z = 5;
+        t37.vec<int>.node.type nt = 6;
+        if (iv + (int)s + ii.z + nt != 18) return 2955;
+        t37.vec<int> v; v.push(9);
+        if (t37FirstOf<t37.vec<int>>(v) != 9 || !t37IsInt<int*>()) return 2956;
+        T37Holder h; h.f = 1;
+        t37.vec<int>.value_type* p = &t37Global;
+        t37.vec<int>.value_type[3] arr = {1, 2, 3};
+        if (h.f != 1 || t37Twice(5) != 10 || *p != 9 || arr[2] != 3) return 2957;
+        if (sizeof(t37.plain.id_type) != sizeof(long) || sizeof(t37.vec<short>.value_type) != 2) return 2958;
+        long big = 300;
+        if ((t37.vec<int>.value_type)big != 300) return 2959;
+        t37.vec<int>.value_type* hp = new t37.vec<int>.value_type;
+        *hp = 11;
+        bool newOk = *hp == 11;
+        delete hp;
+        if (!newOk) return 2960;
+        T37Vt va = 12;
+        T37Wrap<t37.vec<int>.value_type> w; w.w = 13;
+        if (va + w.w != 25) return 2961;
+        // A nested scoped enum of a specialization, and enumerator values of a template pattern.
+        t37.vec<int>.mode m = t37.vec<int>.mode.mode_b;
+        if ((int)m != 2) return 2962;
+        if ((int)t37.vec.mode.mode_a != 1 || (int)t37.vec.mode.mode_b != 2) return 2963;
+        // Value side unchanged: a static data member and a trait value read as values.
+        if (t37.vec<int>.kind != 7 || !t37.same<int, int>.value) return 2964;
+        if (sizeof(t37.vec<int>.kind) != 4) return 2965;
+        // A static value member in parentheses is a parenthesized value, not a cast (C reading).
+        int k1 = (t37.vec<int>.kind) + 1;
+        if (k1 != 8 || (t37.vec<int>.kind) * 2 != 14 || (t37.vec<int>.kind) - 1 * 3 != 4) return 2966;
+        if (((t37.vec<int>.kind) & 1) != 1 || (t37.vec<int>.value_type) -big != -300) return 2967;
+        t37.track tk = t37.track(3);
+        t37.track_reset();
+        int fw = t37Forward(tk);
+        if (fw != 10 || t37.track_copy_count() != 1 || t37.track_move_count() != 1) return 2968;
+        t37.track_reset();
+        if (t37ForwardLambda(tk) != 12 || t37.track_copy_count() != 1 || t37.track_move_count() != 1) return 2969;
+    }
     return 0;
 }

@@ -1157,7 +1157,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 structVar.BondedSources = namedVar.BondedSources;
             };
             auto ForwardOperatorArrow = [&](LLVMBackend::NamedVariable& receiver,
-                                            antlr4::tree::ParseTree* memberToken) -> bool
+                                            antlr4::tree::ParseTree* memberToken,
+                                            bool forceArrow) -> bool
             {
                 auto* compiler = Compiler(ctx);
                 if (receiver.TypeAndValue.Pointer
@@ -1169,10 +1170,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 std::string memberName = NextMemberName(ctx, memberToken);
                 int arrowGuard = 0;
                 bool forwarded = false;
+                // `->` on a C++ class always calls operator-> (C++ rule); a CFlat struct keeps
+                // the flexible own-member-first `->` (test_operators "Box-> own field").
                 while (!memberName.empty()
                        && !receiver.TypeAndValue.Pointer
                        && !receiver.TypeAndValue.TypeName.empty()
-                       && !compiler->TypeHasMember(receiver.TypeAndValue.TypeName, memberName))
+                       && ((forceArrow && compiler->IsCxxRecord(receiver.TypeAndValue.TypeName))
+                           || !compiler->TypeHasMember(receiver.TypeAndValue.TypeName, memberName)))
                 {
                     if (!compiler->HasArrowOverloadFor(receiver.TypeAndValue.TypeName)
                         && compiler->IsCxxRecord(receiver.TypeAndValue.TypeName))
@@ -1452,12 +1456,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
                                 namedVar = structVar;
                                 structVar = {};
-                                ForwardOperatorArrow(namedVar, parseTree);
+                                ForwardOperatorArrow(namedVar, parseTree,
+                                    tokenType == CFlatParser::Arrow);
                                 DerefPointerReceiver();
                             }
                             else
                             {
-                                const bool forwarded = ForwardOperatorArrow(namedVar, parseTree);
+                                const bool forwarded = ForwardOperatorArrow(namedVar, parseTree,
+                                    tokenType == CFlatParser::Arrow);
                                 if (forwarded && namedVar.TypeAndValue.Pointer
                                     && !namedVar.TypeAndValue.IsInterface)
                                 {
@@ -1716,10 +1722,17 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // the exact member first, then resolve a nominated namespace.
                                 qualifiedName = Compiler(ctx)->ResolveQualifiedName(qualifiedName);
                             }
-                            const std::string owner = Compiler(ctx)->IsDataStructure(namespaceContext)
+                            std::string owner = Compiler(ctx)->IsDataStructure(namespaceContext)
                                 ? namespaceContext : Compiler(ctx)->ResolveTypeAlias(namespaceContext);
+                            const bool isAddressOf = addressOfOperandDepth_ != 0;
                             if (Compiler(ctx)->IsCxxRecord(owner))
                                 Compiler(ctx)->EnsureCxxMemberProjected(owner, memberName);
+                            if (isAddressOf && Compiler(ctx)->IsNonStaticMember(owner, memberName))
+                            {
+                                LogErrorContext(ctx,
+                                    "pointers to members are not supported in CFlat; use a lambda");
+                                break;
+                            }
                             const bool onlyDefaultWrappers = Compiler(ctx)->IsDataStructure(owner)
                                 && Compiler(ctx)->HasOnlyCxxDefaultWrappers(owner, memberName, true);
                             if (onlyDefaultWrappers)
@@ -2031,6 +2044,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 namespaceName, memberName, false, true);
                                         if (!inaccessibleStatic)
                                         {
+                                            if (isAddressOf
+                                                && Compiler(ctx)->IsNonStaticMember(owner, memberName))
+                                            {
+                                                LogErrorContext(ctx,
+                                                    "pointers to members are not supported in CFlat; use a lambda");
+                                                break;
+                                            }
                                             if (std::string refusal = Compiler(ctx)->GetCxxBindingRefusal(qualifiedName);
                                                 !refusal.empty())
                                                 LogErrorContext(ctx, refusal);
@@ -2039,12 +2059,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             else if (!Compiler(ctx)->IsDataStructure(namespaceName)
                                                      || !Compiler(ctx)->ReportCxxMemberThroughNonPublicBase(
                                                          namespaceName, memberName))
+                                            {
                                                 // The owner may be a C++ class-template
                                                 // specialization; name it in source spelling.
                                                 LogErrorContext(ctx, std::format(
                                                     "'{}' is not a member of namespace '{}'.",
                                                     memberName, SpellType(*Compiler(ctx),
                                                         LLVMBackend::TypeAndValue{ .TypeName = namespaceName })));
+                                            }
                                         }
                                     }
                                 }
@@ -3143,6 +3165,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (quote == std::string::npos || quote == 0) continue;
                                     std::string prefix = literalText.substr(0, quote);
                                     if (prefix == "L") namedVar.TypeAndValue.TypeName = "wchar";
+                                    else if (prefix == "u8") namedVar.TypeAndValue.TypeName = "c8";
                                     else if (prefix == "u") namedVar.TypeAndValue.TypeName = "c16";
                                     else if (prefix == "U") namedVar.TypeAndValue.TypeName = "c32";
                                 }
@@ -3439,6 +3462,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 idxNV.Primary  = rvalue;
                                 idxNV.BaseType = rvalue->getType();
                                 // A non-empty VariableName is a NAMED-argument request.
+                                idxNV.TypeAndValue.VariableName = "";
+                            }
+                            // A POINTER index keeps its pointee type too: `m[cp]` with `char* cp`
+                            // converts through `string(const char*)` like a call argument does.
+                            else if (rvalue->getType()->isPointerTy() && idxNamed.TypeAndValue.Pointer
+                                     && !idxNamed.TypeAndValue.TypeName.empty())
+                            {
+                                idxNV = idxNamed;
+                                idxNV.Primary  = rvalue;
+                                idxNV.BaseType = rvalue->getType();
                                 idxNV.TypeAndValue.VariableName = "";
                             }
                             // An INTEGER index carries the identity a call argument does (declared
@@ -4009,6 +4042,45 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         }
 
                         auto argumentList = ctx->argumentExpressionList();
+
+                        // `offsetof` is an ordinary identifier. Only an unshadowed bare call
+                        // uses the intrinsic path; declarations and C++ macros keep normal lookup.
+                        auto* compiler = Compiler(ctx);
+                        const bool offsetofShadowed = namedVar.Storage != nullptr || namedVar.Primary != nullptr
+                            || structVar.BaseType != nullptr
+                            || compiler->GetScopedLocalOrArgument("offsetof").Storage != nullptr
+                            || compiler->GetFunctionArgument("offsetof").GetValue() != nullptr
+                            || compiler->HasMemberVariable("offsetof")
+                            || compiler->GetGlobalVariableNV("offsetof").Storage != nullptr
+                            || compiler->GetFunction("offsetof") != nullptr;
+                        if (functionName == "offsetof" && !offsetofShadowed
+                            && ctx->children.size() == 4 && argumentList.size() == 1
+                            && functionArgCounter == 0)
+                        {
+                            auto args = argumentList[functionArgCounter]->argumentNamedExpression();
+                            if (args.size() == 2 && args[0]->Identifier() == nullptr
+                                && args[0]->assignmentExpression() != nullptr
+                                && args[1]->assignmentExpression() != nullptr)
+                            {
+                                const std::string typeText = CollapsedSourceText(args[0]->assignmentExpression());
+                                const std::string pathText = args[1]->assignmentExpression()->getText();
+                                std::vector<std::string> path;
+                                size_t begin = 0;
+                                while (begin < pathText.size())
+                                {
+                                    const size_t dot = pathText.find('.', begin);
+                                    path.push_back(pathText.substr(begin,
+                                        dot == std::string::npos ? std::string::npos : dot - begin));
+                                    if (dot == std::string::npos) break;
+                                    begin = dot + 1;
+                                }
+                                namedVar = ParseOffsetofText(ctx, typeText, path);
+                                structVar = {};
+                                interfaceVar = {};
+                                functionArgCounter++;
+                                break;
+                            }
+                        }
 
                         // A C++ macro naming no parameter (assert under NDEBUG): C++ evaluates
                         // none of its arguments, so neither does this call.
@@ -6955,6 +7027,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argExpectedScope.emplace(&declExpectedType, argExpectedDest);
                                     CallArgumentScope callArgumentScope(
                                         inCallArgument_, ternaryCallArgumentDepth_);
+                                    CxxCallArgumentScope cxxCallArgumentScope(
+                                        inCxxCallArgument_, funcSym != nullptr ? funcSym->IsCxx
+                                            : Compiler(ctx)->HasCxxFunctionTemplate(functionName)
+                                                || (structVar.BaseType != nullptr && Compiler(ctx)->HasCxxFunctionTemplateMember(
+                                                    structVar.TypeAndValue.TypeName, primaryIdentifier)));
                                     auto argNV = ParseCallArgument([&] {
                                         return this->ParseAssignmentExpressionNamed(
                                             namedArgument->assignmentExpression());
@@ -8734,6 +8811,8 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                     param->typeSpecifier(), param->multiWordTypeSuffix(), false, &canonicalError);
                 if (HasPrimitiveTypeError(canonicalError))
                     LogErrorContext(param, LocalizePrimitiveTypeError(compiler, canonicalError));
+                if (auto* memberType = param->typeSpecifier()->memberTypeSpecifier())
+                    p.TypeName = ResolveMemberTypeSpecifier(memberType);
                 p.TypeName = compiler->ResolveTypeAlias(p.TypeName);
                 p.Pointer = param->pointer() != nullptr;
                 // `(move T p) => ...` - the literal's half of the `Lambda<void(move T)>` spelling.
@@ -9598,6 +9677,15 @@ llvm::Value* MainListener::ParseElementExpression(CFlatParser::ElementExpression
 llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpressionContext* ctx, ResultUse use) {
         auto* compiler = Compiler(ctx);
 
+        if (auto* operatorCall = ctx->operatorCallName())
+        {
+            const std::string name = operatorCall->New() != nullptr
+                ? "operator new" : "operator delete";
+            LogErrorContext(ctx, std::format(
+                "calling '{}' by name is not supported; use new, malloc or std.allocator", name));
+            return nullptr;
+        }
+
         if (auto* tupleCtx = ctx->tupleExpression())
             return ParseTupleExpression(tupleCtx).Primary;
 
@@ -9655,6 +9743,17 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
                     compiler->ResolveQualifiedName(primitiveType));
             else if (compiler->GetDataStructure(expressionText).StructType != nullptr)
                 type.TypeName = expressionText;
+            // `Spec<args>.name` / `Owner.name` naming a member type (lookup decides, not syntax).
+            if (type.TypeName.empty())
+                if (auto* ue = tryGetUnaryExpression(expressionCtx);
+                    ue != nullptr && ue->postfixExpression() != nullptr && ue->children.size() == 1)
+                    type.TypeName = TryPostfixAsMemberType(ue->postfixExpression());
+            if (type.TypeName.empty() && expressionText.find('.') != std::string::npos
+                && expressionText.find_first_of("<>()[]-") == std::string::npos
+                && !NamesVisibleVariable(compiler, expressionText.substr(0, expressionText.find('.'))))
+                if (std::string aliased = compiler->ResolveTypeAlias(expressionText);
+                    aliased != expressionText && compiler->IsKnownTypeName(aliased))
+                    type.TypeName = aliased;
 
             if (type.TypeName.empty())
             {
@@ -10080,7 +10179,25 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
         if (compiler->TryBindCxxSystemMacro(name))
             return ParseIdentifier(node);
 
-        if (std::string refusal = compiler->GetCxxBindingRefusal(name); !refusal.empty())
+        // The postfix call path decides whether an unresolved `offsetof(...)` callee is the
+        // intrinsic; any other unresolved use is an undefined name.
+        if (name == "offsetof")
+        {
+            antlr4::tree::ParseTree* up = node->parent;
+            while (up != nullptr && dynamic_cast<CFlatParser::PostfixExpressionContext*>(up) == nullptr)
+                up = up->parent;
+            auto* call = dynamic_cast<CFlatParser::PostfixExpressionContext*>(up);
+            if (call != nullptr && call->children.size() == 4 && call->argumentExpressionList().size() == 1
+                && call->primaryExpression() != nullptr && call->primaryExpression()->getStart() == node->getSymbol())
+                return {};
+        }
+        // C++ never declares a scoped enumerator in the enclosing scope; name the enum as a hint.
+        if (const std::string enumName = compiler->GetScopedCppEnumeratorHint(name); !enumName.empty())
+        {
+            LogErrorContext(node, std::format(
+                "'{}' is an enumerator of scoped enum '{}'; write '{}.{}'", name, enumName, enumName, name));
+        }
+        else if (std::string refusal = compiler->GetCxxBindingRefusal(name); !refusal.empty())
             LogErrorContext(node, refusal);
         else
             LogErrorContext(node, std::format("Undefined variable {}.", name));
@@ -10376,6 +10493,8 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
         // is gone before the real walk registers it - the queued type argument still folds to it.
         std::optional<LLVMBackend::AliasScopeGuard> scanAliasScope;
         if (topLevel) scanAliasScope.emplace(Compiler());
+        ++memberTypeSilentDepth_;
+        struct SilentExit { int& d; ~SilentExit() { --d; } } silentExit{memberTypeSilentDepth_};
         for (auto* child : ctx->children)
         {
             auto* ruleCtx = dynamic_cast<antlr4::RuleContext*>(child);

@@ -417,7 +417,9 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                                                 if (adds.size() == 1)
                                                 {
                                                     auto muls = adds[0]->castExpression();
-                                                    if (muls.size() == 1)
+                                                    // A `(value) op y` cast hazard re-parses at the
+                                                    // and-expression level, below.
+                                                    if (muls.size() == 1 && FindValueCastHazard(muls[0]) == nullptr)
                                                     {
                                                         // Pure single-child passthrough all the way down:
                                                         // this fast path IS the only shape where a bare
@@ -7068,6 +7070,19 @@ bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContex
                 trueIsUnsigned = falseIsUnsigned = false;
             }
         }
+        const bool trueNullptr = (trueShape.hasSourceType
+                && trueShape.sourceType.IsCxxNullptrT)
+            || llvm::isa_and_nonnull<llvm::ConstantPointerNull>(trueValue);
+        const bool falseNullptr = (falseShape.hasSourceType
+                && falseShape.sourceType.IsCxxNullptrT)
+            || llvm::isa_and_nonnull<llvm::ConstantPointerNull>(falseValue);
+        if (inCxxCallArgument_ && trueNullptr && falseValue->getType()->isPointerTy())
+            trueValue = llvm::ConstantPointerNull::get(
+                llvm::cast<llvm::PointerType>(falseValue->getType()));
+        else if (inCxxCallArgument_ && falseNullptr && trueValue->getType()->isPointerTy())
+            falseValue = llvm::ConstantPointerNull::get(
+                llvm::cast<llvm::PointerType>(trueValue->getType()));
+
         if (trueValue->getType() == falseValue->getType())
             return true;
 
@@ -8431,6 +8446,19 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         PropagateTernaryViewElement(ctx, trueValue, trueStorage, falseValue, falseStorage, phi);
         if (phi->getType()->isPointerTy() && pointerJoinDest.Pointer)
             compiler->RegisterValueElementTypeName(phi, pointerJoinDest.TypeName);
+        if (inCxxCallArgument_ && phi->getType()->isPointerTy())
+        {
+            const bool trueNullptr = (trueShape.hasSourceType
+                    && trueShape.sourceType.IsCxxNullptrT)
+                || llvm::isa_and_nonnull<llvm::ConstantPointerNull>(trueValue);
+            const bool falseNullptr = (falseShape.hasSourceType
+                    && falseShape.sourceType.IsCxxNullptrT)
+                || llvm::isa_and_nonnull<llvm::ConstantPointerNull>(falseValue);
+            auto pointerArm = trueNullptr
+                ? InferTernaryArmType(falseShape) : InferTernaryArmType(trueShape);
+            if ((trueNullptr || falseNullptr) && pointerArm.Pointer)
+                compiler->RegisterValueElementTypeName(phi, pointerArm.TypeName);
+        }
         llvm::Value* resultValue = CloneTernaryClosureValue(phi, ctx);
         LLVMBackend::TypedValue result{ resultValue, joinUnsigned };
         result.isAlias = trueAlias || falseAlias;
@@ -9027,19 +9055,19 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
  * null when the first operand is not a class with that operator, which keeps every other
  * expression on the short-circuiting path below.
  */
-llvm::Value* MainListener::TryClassLogicalOperatorChain(
+LLVMBackend::TypedValue MainListener::TryClassLogicalOperatorChain(
         const std::string& op, antlr4::ParserRuleContext* ctx,
         const LLVMBackend::TypedValue& first,
         const std::function<LLVMBackend::TypedValue(size_t)>& parseOperand,
         size_t operandCount) {
         auto* compiler = Compiler(ctx);
-        if (first.value == nullptr || !first.value->getType()->isStructTy()) return nullptr;
+        if (first.value == nullptr || !first.value->getType()->isStructTy()) return {};
         auto* structTy = llvm::cast<llvm::StructType>(first.value->getType());
         if (structTy->isLiteral() || !structTy->hasName()) return nullptr;
         const std::string typeName = structTy->getName().str();
         if (!compiler->IsCxxRecord(typeName)
             || !HasOperatorOverloadForFirstParam("operator" + op, typeName))
-            return nullptr;
+            return {};
 
         llvm::Value* accumulator = first.value;
         llvm::Value* accumulatorStorage = first.receiverStorage;
@@ -9082,7 +9110,13 @@ llvm::Value* MainListener::TryClassLogicalOperatorChain(
                                        accumulatorStorage, accumulatorIsRvalue,
                                        accumulatorRefType, accumulatorSourceTypeName);
         }
-        return accumulator;
+        LLVMBackend::TypedValue result{ accumulator, false };
+        result.receiverStorage = accumulatorStorage;
+        result.cxxRefValueType = accumulatorRefType;
+        result.isRvalue = accumulatorIsRvalue;
+        result.sourceTypeName = accumulatorSourceTypeName;
+        result.isAlias = accumulatorRefType != nullptr && compiler->lastCallReturnType.IsAlias;
+        return result;
     }
 
 LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::LogicalOrExpressionContext* ctx, ResultUse use) {
@@ -9108,11 +9142,11 @@ LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::Logi
             });
             firstPostfix->Flush();
             firstPostfix.reset();
-            if (llvm::Value* classChain = TryClassLogicalOperatorChain(
+            if (LLVMBackend::TypedValue classChain = TryClassLogicalOperatorChain(
                     "||", ctx, firstOperand,
                     [&](size_t i) { return ParseLogicalAndExpression(logicCtxs[i], ResultUse::Value); },
                     logicCtxs.size()))
-                return { classChain, false };
+                return classChain;
 
             LLVMBackend::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
             auto resultStorage = compiler->CreateAlloca(compiler->GetType(boolValue));
@@ -9189,13 +9223,13 @@ LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::Log
             });
             firstPostfix->Flush();
             firstPostfix.reset();
-            if (llvm::Value* classChain = TryClassLogicalOperatorChain(
+            if (LLVMBackend::TypedValue classChain = TryClassLogicalOperatorChain(
                     "&&", ctx, firstOperand,
                     [&](size_t i) { return ParseCxxFoldOperand(compiler, [&] {
                         return ParseInclusiveOrExpression(inclusiveCtxs[i], ResultUse::Value);
                     }); },
                     inclusiveCtxs.size()))
-                return { classChain, false };
+                return classChain;
 
             LLVMBackend::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
             auto resultStorage = compiler->CreateAlloca(compiler->GetType(boolValue));
@@ -9428,7 +9462,139 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
         return {};
     }
 
+bool MainListener::CastTypeNameNamesValue(CFlatParser::TypeNameContext* typeName) {
+        if (typeName == nullptr || typeName->abstractDeclarator() != nullptr) return false;
+        auto* specList = typeName->specifierQualifierList();
+        if (specList == nullptr || specList->children.size() != 1 || specList->typeSpecifier().size() != 1)
+            return false;
+        auto* typeSpec = specList->typeSpecifier()[0];
+        auto* compiler = Compiler();
+        // `Spec<args>.name`: a value exactly when the member lookup says it is not a type.
+        if (auto* memberType = typeSpec->memberTypeSpecifier())
+            return !MemberTypeSpecifierNamesType(memberType);
+        std::string text;
+        if (auto* gid = typeSpec->genericIdentifier(); gid != nullptr && gid->genericTypeParameters() == nullptr)
+            text = gid->getText();
+        else if (auto* qid = typeSpec->qualifiedGenericIdentifier();
+                 qid != nullptr && qid->genericTypeParameters() == nullptr)
+            text = qid->getText();
+        if (text.empty()
+            || activeTypeSubstitutions.count(text) != 0 || activePackSubstitutions.count(text) != 0
+            || compiler->IsTypeArgTypeKey(text))
+            return false;
+        const size_t dot = text.find('.');
+        // A visible variable heads a member access (`(s.x)`); a bare name that is also a type
+        // stays on the cast path, which reports the ambiguity.
+        if (NamesVisibleVariable(compiler, text.substr(0, dot)))
+            return dot != std::string::npos || !compiler->IsKnownTypeName(text);
+        if (dot == std::string::npos) return false;
+        // A dotted global: a namespace constant (`ns.K`) or an enumerator (`E.v`).
+        if (compiler->GetGlobalVariableNV(text).Storage != nullptr
+            || compiler->GetGlobalVariableNV(compiler->ResolveQualifiedName(text)).Storage != nullptr)
+            return true;
+        const std::string owner = text.substr(0, text.rfind('.'));
+        if (!compiler->GetEnumBackingType(compiler->ResolveTypeAlias(owner)).empty())
+            return !compiler->IsKnownTypeName(text);
+        return false;
+}
+
+CFlatParser::CastExpressionContext* MainListener::FindValueCastHazard(antlr4::tree::ParseTree* node) {
+        // Only the expression levels an and-expression owns down to its casts and unary operands;
+        // a parenthesized sub-expression, call or index is its own and-expression.
+        if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
+        {
+            if (cast->typeName() != nullptr && cast->castExpression() != nullptr)
+            {
+                auto* operand = cast->castExpression()->unaryExpression();
+                auto* op = operand != nullptr ? operand->unaryOperator() : nullptr;
+                if (op != nullptr)
+                {
+                    const std::string opText = op->getText();
+                    if ((opText == "+" || opText == "-" || opText == "*" || opText == "&")
+                        && CastTypeNameNamesValue(cast->typeName()))
+                        return cast;
+                }
+            }
+            if (cast->castExpression() != nullptr) return FindValueCastHazard(cast->castExpression());
+            return cast->unaryExpression() != nullptr ? FindValueCastHazard(cast->unaryExpression()) : nullptr;
+        }
+        if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node))
+            return unary->unaryOperator() != nullptr && unary->castExpression() != nullptr
+                ? FindValueCastHazard(unary->castExpression()) : nullptr;
+        if (dynamic_cast<CFlatParser::EqualityExpressionContext*>(node) == nullptr
+            && dynamic_cast<CFlatParser::TypeCheckExpressionContext*>(node) == nullptr
+            && dynamic_cast<CFlatParser::RelationalExpressionContext*>(node) == nullptr
+            && dynamic_cast<CFlatParser::ShiftExpressionContext*>(node) == nullptr
+            && dynamic_cast<CFlatParser::AdditiveExpressionContext*>(node) == nullptr
+            && dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(node) == nullptr
+            && dynamic_cast<CFlatParser::AndExpressionContext*>(node) == nullptr)
+            return nullptr;
+        for (auto* child : node->children)
+            if (auto* found = FindValueCastHazard(child)) return found;
+        return nullptr;
+}
+
+static void CollectValueCastTokens(antlr4::tree::ParseTree* node, CFlatParser::CastExpressionContext* hazard,
+                                   std::vector<std::unique_ptr<antlr4::Token>>& out, bool& clean)
+{
+        if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(node))
+        {
+            if (dynamic_cast<antlr4::tree::ErrorNode*>(node) != nullptr) { clean = false; return; }
+            const bool open = !hazard->children.empty() && hazard->children.front() == node;
+            const bool close = hazard->children.size() > 2 && hazard->children[2] == node;
+            // The extra parenthesis copies the original one, so every position stays exact.
+            if (open) out.push_back(std::make_unique<antlr4::CommonToken>(terminal->getSymbol()));
+            out.push_back(std::make_unique<antlr4::CommonToken>(terminal->getSymbol()));
+            if (close) out.push_back(std::make_unique<antlr4::CommonToken>(terminal->getSymbol()));
+            return;
+        }
+        for (auto* child : node->children)
+            CollectValueCastTokens(child, hazard, out, clean);
+}
+
+CFlatParser::AndExpressionContext* MainListener::ReparseValueCast(CFlatParser::AndExpressionContext* ctx,
+                                                                  CFlatParser::CastExpressionContext* hazard) {
+        const std::string text = ctx->getText();
+        if (auto it = valueCastReparses_.find(ctx); it != valueCastReparses_.end()
+            && it->second->hazard == hazard && it->second->text == text)
+            return it->second->root;
+        std::vector<std::unique_ptr<antlr4::Token>> copied;
+        bool clean = true;
+        CollectValueCastTokens(ctx, hazard, copied, clean);
+        if (!clean) return nullptr;
+        // The token stream renumbers its tokens from zero; analyses keyed on the token index
+        // (last use of a C++ param, shadowing, container aliases) need the original index back.
+        std::vector<std::pair<antlr4::CommonToken*, size_t>> originalIndex;
+        originalIndex.reserve(copied.size());
+        for (auto& token : copied)
+            originalIndex.emplace_back(static_cast<antlr4::CommonToken*>(token.get()), token->getTokenIndex());
+        auto entry = std::make_unique<ValueCastReparse>();
+        entry->source = std::make_unique<antlr4::ListTokenSource>(std::move(copied));
+        entry->tokens = std::make_unique<antlr4::CommonTokenStream>(entry->source.get());
+        entry->parser = std::make_unique<CFlatParser>(entry->tokens.get());
+        entry->parser->removeErrorListeners();
+        entry->parser->setErrorHandler(std::make_shared<antlr4::BailErrorStrategy>());
+        CFlatParser::AndExpressionContext* root = nullptr;
+        try { root = entry->parser->andExpression(); }
+        catch (const antlr4::ParseCancellationException&) { return nullptr; }
+        if (root == nullptr || entry->parser->getNumberOfSyntaxErrors() != 0
+            || entry->tokens->LA(1) != cflat::kTokenEOF)
+            return nullptr;
+        for (auto& [token, index] : originalIndex) token->setTokenIndex(index);
+        // Upward walks (enclosing statement, function, return) see the original context.
+        root->parent = ctx->parent;
+        entry->root = root;
+        entry->hazard = hazard;
+        entry->text = text;
+        valueCastReparses_[ctx] = std::move(entry);
+        return root;
+}
+
 LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpressionContext* ctx, ResultUse use) {
+        // `(value) op y` read as a cast: evaluate the C reading instead (see ValueCastReparse).
+        if (auto* hazard = FindValueCastHazard(ctx))
+            if (auto* reparsed = ReparseValueCast(ctx, hazard))
+                return ParseAndExpression(reparsed, use);
         CallPostfixScope operatorPostfix(this);
         DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto nextCtxs = ctx->equalityExpression();
@@ -9670,7 +9836,17 @@ LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::Equal
             }
             llvm::Value* result = overload ? overload
                                            : Compiler(ctx)->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned);
-            return { result, false };  // == != result is bool, not unsigned
+            LLVMBackend::TypedValue typedResult{ result, false };
+            if (overload && Compiler(ctx)->lastCallReturnType.IsAlias
+                && Compiler(ctx)->IsCxxRecord(Compiler(ctx)->lastCallReturnType.TypeName))
+            {
+                CarryCxxOperatorResult(ctx, overload, false, typedResult.value,
+                    typedResult.receiverStorage, typedResult.isRvalue,
+                    typedResult.cxxRefValueType, typedResult.sourceTypeName);
+                typedResult.isAlias = true;
+                typedResult.storage = typedResult.receiverStorage;
+            }
+            return typedResult;
         }
 
         LogErrorContext(ctx, "Equality expression has unexpected operand count.");
@@ -10426,7 +10602,17 @@ LLVMBackend::TypedValue MainListener::ParseRelationalExpression(CFlatParser::Rel
             }
             llvm::Value* result = overload ? overload
                                            : Compiler(ctx)->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned);
-            return { result, false };  // comparison result is bool, not unsigned
+            LLVMBackend::TypedValue typedResult{ result, false };
+            if (overload && Compiler(ctx)->lastCallReturnType.IsAlias
+                && Compiler(ctx)->IsCxxRecord(Compiler(ctx)->lastCallReturnType.TypeName))
+            {
+                CarryCxxOperatorResult(ctx, overload, false, typedResult.value,
+                    typedResult.receiverStorage, typedResult.isRvalue,
+                    typedResult.cxxRefValueType, typedResult.sourceTypeName);
+                typedResult.isAlias = true;
+                typedResult.storage = typedResult.receiverStorage;
+            }
+            return typedResult;
         }
 
         LogErrorContext(ctx, "Relational expression has unexpected operand count.");
@@ -10943,7 +11129,7 @@ llvm::Value* MainListener::TryCxxInfixShift(CFlatParser::ShiftExpressionContext*
 
 MainListener::ShiftPairResult MainListener::ParseShiftPair(
     const ShiftOperand& lhs, const ShiftOperand& rhs, const std::string& op,
-    CFlatParser::ShiftExpressionContext* ctx, ResultUse use) {
+    CFlatParser::ShiftExpressionContext* ctx, ResultUse use, bool moreOperands) {
         auto* compiler = Compiler(ctx);
         const auto& lv = lhs.value;
         const auto& rv = rhs.value;
@@ -11072,10 +11258,20 @@ MainListener::ShiftPairResult MainListener::ParseShiftPair(
                     DiagnoseVoidResultConsumed(ctx, resultNV, use,
                                                std::format("'operator{}'", op));
                     ShiftPairResult result;
-                    result.value = { overload, resultNV.TypeAndValue.IsUnsignedInteger() != -1 };
-                    result.value.receiverStorage = resultNV.Storage;
-                    result.value.isRvalue = !resultNV.TypeAndValue.IsAlias;
-                    result.value.cxxRefValueType = CxxReferenceResultType(ctx, resultNV, overload);
+                    llvm::Value* carriedValue = nullptr;
+                    llvm::Value* carriedStorage = nullptr;
+                    bool carriedIsRvalue = false;
+                    llvm::Type* carriedRefType = nullptr;
+                    std::string carriedSourceType;
+                    CarryCxxOperatorResult(ctx, overload, moreOperands, carriedValue,
+                        carriedStorage, carriedIsRvalue, carriedRefType, carriedSourceType);
+                    result.value = { carriedValue,
+                        resultNV.TypeAndValue.IsUnsignedInteger() != -1 };
+                    result.value.receiverStorage = carriedStorage;
+                    result.value.isRvalue = carriedIsRvalue;
+                    result.value.cxxRefValueType = carriedRefType;
+                    result.value.sourceTypeName = carriedSourceType;
+                    result.value.isAlias = resultNV.TypeAndValue.IsAlias;
                     result.named = resultNV;
                     return result;
                 }
@@ -11226,7 +11422,8 @@ LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExp
                 rhs.expr = nextCtxs[i];
             }
             auto pair = ParseShiftPair(lhs, rhs, operators[i - 1], ctx,
-                                       i + 1 == nextCtxs.size() ? use : ResultUse::Value);
+                                       i + 1 == nextCtxs.size() ? use : ResultUse::Value,
+                                       i + 1 < nextCtxs.size());
             if (pair.value.value == nullptr) return {};
             lhs.value = pair.value;
             lhs.named = pair.named;
@@ -14335,6 +14532,12 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(CFlatParser::TypeNameConte
                     if (compilerLLVM->GetDataStructure(typeValue.TypeName).StructType == nullptr)
                         compilerLLVM->InstantiateWinrtGenericInterface(baseName, typeArgs, typeValue.TypeName);
                 }
+                else if (auto* memberType = typeSpec->memberTypeSpecifier())
+                {
+                    typeValue.TypeName = compilerLLVM->ResolveTypeAlias(ResolveMemberTypeSpecifier(memberType));
+                    if (PeelAliasPointerStars(typeValue.TypeName) > 0)
+                        typeValue.Pointer = true;
+                }
                 else
                 {
                     std::vector<std::string> words;
@@ -14556,6 +14759,13 @@ LLVMBackend::NamedVariable MainListener::TrySizeofPostfixAsType(CFlatParser::Una
                 }
             }
             if (!knownGenericType) likelyType = false;
+        }
+        // `Spec<args>.name` is a type exactly when the lookup says the member is one.
+        if (std::string memberType = TryPostfixAsMemberType(postFixCtx); !memberType.empty())
+        {
+            postfixText = memberType;
+            likelyType = true;
+            knownGenericType = false;
         }
 
         if (likelyType)
@@ -14868,6 +15078,104 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
         return ParseUnaryExpressionImpl(ctx, use, ctx->Sizeof().size());
     }
 
+LLVMBackend::NamedVariable MainListener::ParseOffsetofText(antlr4::ParserRuleContext* errCtx,
+                                                             const std::string& typeText,
+                                                             const std::vector<std::string>& path)
+{
+    auto* compiler = Compiler(errCtx);
+    antlr4::ANTLRInputStream input(typeText);
+    CFlatLexer lexer(&input);
+    antlr4::CommonTokenStream tokens(&lexer);
+    CFlatParser parser(&tokens);
+    lexer.removeErrorListeners();
+    parser.removeErrorListeners();
+    auto* typeCtx = parser.typeName();
+    if (parser.getNumberOfSyntaxErrors() != 0 || tokens.LA(1) != -1)
+    {
+        LogErrorContext(errCtx, "offsetof: type must be a record type");
+        return {};
+    }
+    auto typeValue = ParseTypeName(typeCtx);
+    if (typeValue.Pointer || typeValue.TypeName.empty())
+    {
+        LogErrorContext(errCtx, "offsetof: type must be a record type");
+        return {};
+    }
+    uint64_t totalOffset = 0;
+    std::string currentType = typeValue.TypeName;
+    for (size_t part = 0; part < path.size(); ++part)
+    {
+        auto found = compiler->dataStructures.find(currentType);
+        if (found == compiler->dataStructures.end())
+        {
+            LogErrorContext(errCtx, std::format("offsetof: type '{}' is not a record", currentType));
+            return {};
+        }
+        auto& record = found->second;
+        if (!record.CxxOffsetLayout && !compiler->IsCxxRecord(currentType)
+            && (record.StructType == nullptr || record.StructType->isOpaque()))
+        {
+            LogErrorContext(errCtx, std::format("offsetof: type '{}' is incomplete", currentType));
+            return {};
+        }
+        const std::string& fieldName = path[part];
+        auto bitfield = std::find_if(record.Bitfields.begin(), record.Bitfields.end(),
+            [&](const auto& field) { return field.Name == fieldName; });
+        if (bitfield != record.Bitfields.end())
+        {
+            LogErrorContext(errCtx, std::format("offsetof: bitfield member '{}' is not allowed", fieldName));
+            return {};
+        }
+        auto field = std::find_if(record.StructFields.begin(), record.StructFields.end(),
+            [&](const auto& candidate) { return candidate.VariableName == fieldName; });
+        if (field == record.StructFields.end())
+        {
+            compiler->EnsureCxxMemberProjected(currentType, fieldName);
+            found = compiler->dataStructures.find(currentType);
+            if (found != compiler->dataStructures.end())
+                field = std::find_if(found->second.StructFields.begin(), found->second.StructFields.end(),
+                    [&](const auto& candidate) { return candidate.VariableName == fieldName; });
+        }
+        if (found == compiler->dataStructures.end() || field == found->second.StructFields.end())
+        {
+            LogErrorContext(errCtx, std::format("offsetof: unknown field '{}' in '{}'", fieldName, currentType));
+            return {};
+        }
+        const size_t index = static_cast<size_t>(field - found->second.StructFields.begin());
+        if (!found->second.IsUnion)
+        {
+            if (found->second.CxxOffsetLayout && index < found->second.CxxFieldOffsets.size())
+                totalOffset += found->second.CxxFieldOffsets[index];
+            else if (found->second.StructType != nullptr && !found->second.StructType->isOpaque())
+                totalOffset += compiler->module->getDataLayout().getStructLayout(
+                    found->second.StructType)->getElementOffset(index);
+        }
+        if (part + 1 < path.size())
+        {
+            if (field->ConstArraySize > 0 || field->AliasArraySize > 0)
+            {
+                LogErrorContext(errCtx, std::format("offsetof: field path cannot pass through array field '{}'", fieldName));
+                return {};
+            }
+            if (field->Pointer || field->IsArrayView)
+            {
+                LogErrorContext(errCtx, std::format("offsetof: field path cannot pass through pointer field '{}'", fieldName));
+                return {};
+            }
+            currentType = field->TypeName;
+            if (currentType.empty())
+            {
+                LogErrorContext(errCtx, std::format("offsetof: field '{}' is not a record", fieldName));
+                return {};
+            }
+        }
+    }
+    LLVMBackend::NamedVariable result;
+    result.Primary = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*compiler->context), totalOffset);
+    result.TypeAndValue.TypeName = "u64";
+    return result;
+}
+
 LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::UnaryExpressionContext* ctx,
                                                     ResultUse use, size_t sizeofs) {
         auto* compiler = Compiler(ctx);
@@ -14885,6 +15193,14 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
             value.TypeAndValue.VariableName.clear();
             value.TypeAndValue.ParentVariableName.clear();
         };
+
+        if (ctx->offsetofFieldPath() != nullptr
+            && ctx->getStart()->getText() == "__builtin_offsetof")
+        {
+            std::vector<std::string> path;
+            for (auto* part : ctx->offsetofFieldPath()->Identifier()) path.push_back(part->getText());
+            return ParseOffsetofText(ctx, CollapsedSourceText(typeNameCtx), path);
+        }
 
         if (ctx->getStart()->getText() == "alignof" && ctx->unaryExpression() != nullptr)
         {
@@ -15017,7 +15333,59 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
 
             std::optional<FlexibleArrayKeepScope> addressKeep;
             if (opText == "&") addressKeep.emplace(flexibleArrayKeep_, DirectOperandPostfixes(castExpCtx));
+            if (opText == "&")
+            {
+                const std::string operandText = castExpCtx->getText();
+                const size_t dot = operandText.rfind('.');
+                if (dot != std::string::npos)
+                {
+                    const std::string owner = operandText.substr(0, dot);
+                    const std::string memberName = operandText.substr(dot + 1);
+                    const size_t genericOpen = owner.find('<');
+                    if (genericOpen != std::string::npos)
+                    {
+                        std::string templateName = owner.substr(0, genericOpen);
+                        if (const size_t nsDot = templateName.rfind('.'); nsDot != std::string::npos)
+                            templateName = templateName.substr(nsDot + 1);
+                        CFlatParser::StructDefinitionContext* structTemplate = nullptr;
+                        if (auto it = genericStructTemplates.find(templateName);
+                            it != genericStructTemplates.end())
+                            structTemplate = it->second;
+                        CFlatParser::ClassDefinitionContext* classTemplate = nullptr;
+                        if (auto it = genericClassTemplates.find(templateName);
+                            it != genericClassTemplates.end())
+                            classTemplate = it->second;
+                        auto hasInstanceMethod = [&](auto* definition) {
+                            if (definition == nullptr) return false;
+                            for (auto* aggregateMember : definition->aggregateMember())
+                            {
+                                auto* function = aggregateMember->functionDefinition();
+                                if (function != nullptr && function->directDeclarator() != nullptr
+                                    && function->directDeclarator()->getText() == memberName)
+                                    return function->declarationSpecifiers() == nullptr
+                                        || function->declarationSpecifiers()->getText().find("static")
+                                            == std::string::npos;
+                            }
+                            return false;
+                        };
+                        if (hasInstanceMethod(structTemplate) || hasInstanceMethod(classTemplate))
+                        {
+                            LogErrorContext(ctx,
+                                "pointers to members are not supported in CFlat; use a lambda");
+                            return {};
+                        }
+                    }
+                }
+            }
+            // RAII: ExpectedErrorReceived can unwind out of the operand and must not leak the depth.
+            struct AddressOfDepthScope
+            {
+                unsigned* depth;
+                ~AddressOfDepthScope() { if (depth) --*depth; }
+            } addressDepth{ opText == "&" ? &addressOfOperandDepth_ : nullptr };
+            if (addressDepth.depth) ++*addressDepth.depth;
             auto namedVar = ParseCastExpression(castExpCtx);
+            if (addressDepth.depth) { --*addressDepth.depth; addressDepth.depth = nullptr; }
             addressKeep.reset();
             const bool cxxReferenceResult = namedVar.TypeAndValue.IsAlias
                 && !namedVar.TypeAndValue.Pointer
@@ -15581,6 +15949,14 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                                 resolvesAsType = true;
                                 break;
                             }
+                            // `Spec<args>.name`: a type exactly when the lookup says so; a static
+                            // value member (`sizeof(S<int>.value)`) reparses as an expression below.
+                            if (auto* memberType = typeSpec->memberTypeSpecifier())
+                            {
+                                resolvesAsType = MemberTypeSpecifierNamesType(memberType);
+                                if (resolvesAsType) break;
+                                continue;
+                            }
                             std::string genericBase;
                             auto* genericSpec = GenericSpecOf(typeSpec, genericBase);
                             if (genericSpec == nullptr) continue;
@@ -15912,6 +16288,8 @@ std::string MainListener::ParseTypeSpecifierName(
             Compiler(ctx)->ResolveGenericAliasSpelling(base, args);
             return MangledGenericName(base, args);
         }
+        if (auto* memberType = ctx->memberTypeSpecifier())
+            return ResolveMemberTypeSpecifier(memberType);
         PrimitiveTypeError canonicalError;
         std::string name = CanonicalTypeSpecifierText(ctx, suffix, false, &canonicalError);
         if (HasPrimitiveTypeError(canonicalError))

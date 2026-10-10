@@ -39,3 +39,12 @@ pointer type.
 
 Map a C++ `T&` / `const T&` data member to an alias-like field: reads load through the stored pointer, writes
 (non-const) store through it, `&obj.member` gives the referent's address - as clang does.
+
+## Ruling needed (T47, 2026-10-05) - blocks the fix
+
+Existing tests pin the 2026-09-16 stopgap (3e5f2260: reference member bound as a POINTER field):
+Test/test_cpp_interop.cb reference-member section asserts `*refmemH.r`, `int* refmemP = refmemH.r`, writes through
+`*`; Test/errors/err_cpp_reference_member_reseat.cb refuses `h.r = &y` / `h.r++`. C++ semantics (read the
+referent, `h.r = 5` writes through) make those legs fail, so the fix needs an explicit authorization to rewrite
+exactly those legs. T47 (Luna) stopped before implementing; PRE matrix + per-site audit in worktree
+cflat-fix-t47-reffield scratch/t47_matrix.md, scratch/briefs/t47_report.md.

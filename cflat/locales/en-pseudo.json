@@ -58,6 +58,10 @@
       "list",
       "int[]"
     ],
+    "arg0hasnomembertypenamedarg1": [
+      "P",
+      "Nope"
+    ],
     "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": [
       "MyClass",
       "1 type parameter",
@@ -68,11 +72,20 @@
       "c16",
       "c16"
     ],
+    "arg0isamemberofarg1butnotatype": [
+      "x",
+      "P"
+    ],
     "arg0isareservedkeywo...notbeusedasanamehere8eb9aa9365db701f": [
       "class"
     ],
     "arg0isareservedwordi...beusedasanidentifiera2a00aed272d893f": [
       "class"
+    ],
+    "arg0isnotastructorcl...esnotnameamembertypef06529c0f2d65e5a": [
+      "I",
+      "I",
+      "x"
     ],
     "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": [
       "--asan"
@@ -1906,11 +1919,14 @@
     "arg0failedtocreatejitarg1": "{0}: failed to create JIT: {1}",
     "arg0failedtodefinearg1arg2": "{0}: failed to define {1}: {2}",
     "arg0failedtoinstallp...sssymbolresolverarg1fc80b8f9f6712b7c": "{0}: failed to install process symbol resolver: {1}",
+    "arg0hasnomembertypenamedarg1": "'{0}' has no member type named '{1}'",
     "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": "'{0}' is a generic type; type arguments are required (expects {1}: {2}), e.g. {3}",
     "arg0isambiguousarg1n...sorrenamethevariable10b0bb33b930b563": "'({0})' is ambiguous: '{1}' names both a variable and a type; remove the parentheses or rename the variable",
+    "arg0isamemberofarg1butnotatype": "'{0}' is a member of '{1}' but not a type",
     "arg0isareservedkeywo...notbeusedasanamehere8eb9aa9365db701f": "'{0}' is a reserved keyword and cannot be used as a name here",
     "arg0isareservedwordi...beusedasanidentifiera2a00aed272d893f": "'{0}' is a reserved word in CFlat and cannot be used as an identifier",
     "arg0isneverused": "'{0}' is never used",
+    "arg0isnotastructorcl...esnotnameamembertypef06529c0f2d65e5a": "'{0}' is not a struct or class, so '{1}.{2}' does not name a member type",
     "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": "{0}: MSVC lib directory not found, cannot locate the asan runtime (clang_rt.asan_dynamic). Ensure Visual Studio with the C++ AddressSanitizer component is installed.",
     "arg0mustfollowthecompletetypearg1": "'{0}' must follow the complete type '{1}'",
     "arg0needsthecomplete...estructbeforethisuse7711d1ec2f176e02": "'{0}' needs the complete definition of [cpp] struct '{1}'; define the struct before this use",

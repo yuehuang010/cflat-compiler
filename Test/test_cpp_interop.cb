@@ -227,6 +227,11 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_u8_literal.hpp";
+import cpp "library/cpp_t43_char_types.hpp";
+import cpp "library/cpp_t43_ref_ops.hpp";
+import cpp "library/t38_offsetof.hpp";
+import cpp "library/cpp_interop_scoped_enum_collide.h";
 import cpp "library/t20_abi_records.hpp";
 import cpp "library/cpp_interop_cwrapper_macros.hpp";
 import cpp "functional";
@@ -243,6 +248,7 @@ import cpp "library/cpp_interop_member_shadow.h";
 import cpp "library/cpp_interop_twin.h";
 import cpp "library/cpp_t24_argconv.hpp";
 import cpp "library/cpp_t35_ownerexpr.hpp";
+import cpp "library/cpp_t42_convref.hpp";
 import cpp "library/cpp_t28_fwdref.hpp";
 import cpp "library/cpp_interop_lastuse.h";
 import cpp "library/cpp_interop_demand_fail.h";
@@ -341,6 +347,8 @@ import cpp "library/cpp_interop_refbinding.h";
 import cpp "library/cpp_interop_opaque_return.hpp";
 import cpp "library/cpp_t34_traits_static.hpp";
 import cpp "library/t17_empty_return.hpp";
+import cpp "memory";
+import cpp "library/cpp_t46_smartdot.hpp";
 
 std.optional<std.string> t9MakeStringOptional()
 { return std.optional<std.string>(std.string("xyz")); }
@@ -1481,8 +1489,98 @@ int t25surface_compare(const void* a, const void* b)
     return x < y ? -1 : (x > y ? 1 : 0);
 }
 
+int T40ScopedDefault(cppi_scope.Hue value = cppi_scope.Hue.Red) { return (int)value; }
+using T40Hue = cppi_scope.Hue;
+namespace cppu_decl_e { int T40UsingEnumValue() { return (int)Hi; } }
+namespace cppu_decl_b { int T40UnscopedBareValue() { return (int)EU_B; } }
+// Same-named CFlat functions stay callable beside a scoped C++ enumerator's bare name.
+int Pos() { return 42; }
+namespace t40ns { int Neg() { return 41; } int CallNeg() { return Neg(); } }
+// A CFlat global may share a scoped C++ enumerator's bare name (C++ never declares it there).
+int T40CfVar = 33;
+
+int T46GenericDot<T>(T p) { return p.get() == nullptr ? 1 : 0; }
+int T46RefDot(cpp_t46.Ptr<cpp_t46.Item>* p) { return p.get() == nullptr ? 1 : 0; }
+int T46ConstRefDot(const cpp_t46.Ptr<cpp_t46.Item>* p) { return p.get() == nullptr ? 1 : 0; }
+int T46GenericUniqueDot<T>(T* p) { return p.get() == nullptr ? 1 : 0; }
+int T46UniqueRefDot(std.unique_ptr<cpp_t46.Item>* p) { return p.get() == nullptr ? 1 : 0; }
+int T46UniqueConstRefDot(const std.unique_ptr<cpp_t46.Item>* p) { return p.get() == nullptr ? 1 : 0; }
+
 extern int main()
 {
+    c8* t43c8 = u8"x";
+    c16* t43c16 = (c16*)0;
+    c32* t43c32 = (c32*)0;
+    if (t43_over_char("x") != 1 || t43_over_char(u8"x") != 2
+        || t43_over_char(t43c8) != 2 || t43_over_char(t43c16) != 3
+        || t43_over_char(t43c32) != 4 || t43_over_c16(t43c16) != 6
+        || t43_over_c32(t43c32) != 7) return 3912;
+    t43.RefOps t43a = t43.RefOps(10);
+    t43.RefOps t43c = t43.RefOps(1);
+    t43.RefOps t43shift = t43c * t43c << t43a;
+    if (t43shift.value != 10) return 3913;
+    t43.RefOps t43shiftRight = t43c * t43c >> t43a;
+    if (t43shiftRight.value != 10) return 3917;
+    t43.RefOps t43logical = t43c + t43c && t43a;
+    if (t43logical.value != 10) return 3914;
+    t43.RefOps t43logicalOr = t43c + t43c || t43a;
+    if (t43logicalOr.value != 10) return 3918;
+    t43.RefOps t43equal = t43c == t43a;
+    if (t43equal.value != 10) return 3915;
+    t43.RefOps t43less = t43c < t43a;
+    if (t43less.value != 10) return 3916;
+    // First use of each template: no prior int* instantiation to fall back on.
+    int* t43ptr = &t43a.value;
+    bool t43flag = t43ptr != nullptr;
+    if (t43.ptr_kind(t43flag ? t43ptr : nullptr) != 2 || t43.ptr_kind(t43flag ? nullptr : t43ptr) != 2) return 3919;
+    t43.Kinder t43kinder = default;
+    if (t43kinder.mk(t43flag ? t43ptr : nullptr) != 3) return 3920;
+    if (cflat_u8_literal_size(u8"xyz") != 3) return 3910;
+    std.u8string u8Constructed = std.u8string(u8"xyz");
+    std.u8string u8Assigned = u8"xyz";
+    if (u8Constructed.size() != 3 || u8Assigned.size() != 3) return 3911;
+    if (offsetof(cpp_t38.Derived, own) != 8) return 7990;
+    if (offsetof(cpp_t38.NonStandard, value) != 8) return 7991;
+    cpp_t38.MemberNamed namedOffset;
+    namedOffset.offsetof = 42;
+    if (namedOffset.offsetof != 42) return 7992;
+    // T40 accept-set: qualified scoped values, an enum type alias, defaults, template arguments,
+    // comparisons, and C++ `using enum` in its containing namespace keep their C++ spellings.
+    T40Hue t40Hue = cppi_scope.Hue.Deep;
+    if ((int)t40Hue != 200 || t40Hue != cppi_scope.Hue.Deep
+        || T40ScopedDefault() != 1 || cppu_decl_e.T40UsingEnumValue() != 9
+        || cppu_decl_b.T40UnscopedBareValue() != 11) return 40001;
+    // A qualified scoped enumerator as a non-type template argument reaches clang as the enum value.
+    cppi_scope.HueBox<cppi_scope.Hue.Red> t40Box = default;
+    if (t40Box.get() != 1) return 40002;
+    if (Pos() != 42 || t40ns.CallNeg() != 41) return 40003;
+    // Scoped enumerators register only qualified, so same-named unscoped enumerators, C++ and
+    // CFlat globals bind with their own values; a global `using enum` re-exports bare names.
+    if ((int)T40Collide != 77 || t40c.choose(T40Collide) != 10 || t40c.choose(t40c.S.T40Collide) != 11
+        || (int)T40GlobalUse != 2 || t40g.pick(T40GlobalUse) != 21 || T40CppVar != 88 || T40CfVar != 33)
+        return 40004;
+
+    // T46: dot prefers the C++ holder's own member; arrow always follows operator->.
+    std.unique_ptr<cpp_t46.Item> t46Unique = default;
+    if (t46Unique.get() != nullptr || T46GenericUniqueDot(&t46Unique) != 1
+        || T46UniqueRefDot(&t46Unique) != 1 || T46UniqueConstRefDot(&t46Unique) != 1)
+        return 46001;
+    auto t46UniqueLive = cpp_t46.make_unique();
+    if (t46UniqueLive.get() == nullptr || t46UniqueLive->get() != 461) return 46006;
+    // Item::get is bound now; the null unique_ptr's own get() still wins over the pointee borrow.
+    if (t46Unique.get() != nullptr) return 46007;
+    auto t46Holder = cpp_t46.make();
+    if (t46Holder.get() == nullptr || t46Holder.inherited() != 472
+        || T46GenericDot(t46Holder) != 0 || T46RefDot(&t46Holder) != 0
+        || T46ConstRefDot(&t46Holder) != 0) return 46002;
+    if (t46Holder->get() != 461 || t46Holder->get(0) != 462) return 46003;
+    auto t46ResetHolder = cpp_t46.make();
+    auto t46ArrowResetHolder = cpp_t46.make();
+    if (t46ResetHolder.reset() != 471 || t46ArrowResetHolder->reset() != 463) return 46004;
+    if (cpp_t46.item_get_calls() != 3 || cpp_t46.item_reset_calls() != 1
+        || cpp_t46.holder_get_calls() != 4 || cpp_t46.holder_reset_calls() != 1)
+        return 46005;
+
     // T35: member-template names defer to the receiver.
     cpi_t35.shared_ptr<int> t35a = default; t35a.owner = 1;
     cpi_t35.shared_ptr<int> t35b = default; t35b.owner = 2;
@@ -1503,6 +1601,65 @@ extern int main()
     int t35Factor = 4;
     cpi_t35x.Vec<int> t35Product = t35Vec * t35Factor;
     if (t35Product.v != 12) return 3531;
+    // T42: a converting-ctor temporary binds C++ `const X&` / `X&&` (clang++ oracle values).
+    char* t42Cp = "A";
+    cpi_t42.Src t42Src = cpi_t42.Src(5);
+    int t42Made = cpi_t42.made;
+    int t42Gone = cpi_t42.gone;
+    if (cpi_t42.fc("B") != 100066 || cpi_t42.fc(t42Cp) != 100065 || cpi_t42.fc(t42Src) != 101005
+        || cpi_t42.fc(cpi_t42.mkSrc(6)) != 101006)                                   return 4201;
+    if (cpi_t42.fr("B") != 200066 || cpi_t42.fr(t42Cp) != 200065
+        || cpi_t42.fr(t42Src) != 201005)                                             return 4202;
+    // The overloaded pair picks `X&&` for every converted temporary, lvalue source or not.
+    if (cpi_t42.two("B") != 500066 || cpi_t42.two(t42Cp) != 500065
+        || cpi_t42.two(t42Src) != 501005)                                            return 4203;
+    // One temporary per reference binding, each destroyed exactly once.
+    if (cpi_t42.made - t42Made != 10 || cpi_t42.gone - t42Gone != 10)                return 4204;
+    if (cpi_t42.fv(t42Cp) != 300065 || cpi_t42.fv(t42Src) != 301005)                 return 4205;
+    if (cpi_t42.made - cpi_t42.gone != t42Made - t42Gone)                            return 4206;
+    cpi_t42.Holder t42H = default;
+    if (t42H.mc(t42Cp) != 600065 || t42H.mr(t42Src) != 701005 || t42H[t42Cp] != 800065
+        || t42H[t42Src] != 801005)                                                   return 4207;
+    t42H += t42Cp;
+    if (t42H.last != 1070)                                                           return 4208;
+    t42H -= t42Src;
+    if (t42H.last != 1005 || t42H(t42Cp) != 115)                                     return 4209;
+    cpi_t42.Wrap t42W = cpi_t42.Wrap(t42Cp);
+    if (t42W.v != 900065)                                                            return 4210;
+    cpi_t42.Table<cpi_t42.Box> t42Tb = default;
+    t42Tb[t42Cp] = 4;
+    if (t42Tb[t42Cp] != 4 || t42Tb.lastRef != 2 || t42Tb.n != 1)                     return 4211;
+    t42Tb.push_back(t42Src);
+    if (t42Tb.lastRef != 2 || t42Tb.at(1005) != 2)                                   return 4212;
+    cpi_t42.shared<int> t42A = default; t42A.owner = 3;
+    cpi_t42.shared<int> t42B = default; t42B.owner = 4;
+    cpi_t42.Table<cpi_t42.weak<int>> t42Tw = default;
+    t42Tw[t42A] = 10; t42Tw[t42B] = 20;
+    if (t42Tw[t42A] != 10 || t42Tw[t42B] != 20 || t42Tw.n != 2 || t42Tw.lastRef != 2) return 4213;
+    if (t42Tw.insert(t42A) != 2 || t42Tw.at(3) != 3)                                 return 4214;
+    // A lone candidate binds the template-class temporary too (const& and &&).
+    if (cpi_t42.wc(t42A) != 13 || cpi_t42.wr(t42B) != 24)                            return 4216;
+    // Clang decides the binding: an `operator X()`-only source converts (const& and &&); a ctor
+    // AND an operator is ambiguous; a genuine C++ const source never feeds a `T(S&)` ctor.
+    cpi_t42.OpSource t42Op = default;
+    if (cpi_t42.takeOp(t42Op) != 77 || cpi_t42.takeOpC(t42Op) != 1077)              return 4217;
+    if (cpi_t42.takeCv(cpi_t42.cvMutable()) != 8)                                    return 4218;
+    cpi_t42.AmbSource t42Amb = default;
+    expect_error("reference initialization of type 'cpi_t42::AmbTarget &&' with initializer of type 'cpi_t42::AmbSource' is ambiguous") {
+        int t42Ambiguous = cpi_t42.takeAmb(t42Amb);
+    }
+    expect_error("no viable conversion from 'const cpi_t42::CvSource' to 'cpi_t42::CvTarget'") {
+        int t42CvLoss = cpi_t42.takeCv(cpi_t42.cvSource());
+    }
+    if (cpi_t42.made - cpi_t42.gone != t42Made - t42Gone)                            return 4215;
+    // An explicit converting ctor never binds `X&&` implicitly; a same-class lvalue needs `move`.
+    expect_error("is declared explicit, so it is not offered as an implicit conversion") {
+        int t42Explicit = cpi_t42.exr(t42Cp);
+    }
+    cpi_t42.Box t42Lv = cpi_t42.Box("C");
+    expect_error("is an rvalue reference; pass 'move <arg>' or a temporary") {
+        int t42Lvalue = cpi_t42.fr(t42Lv);
+    }
     // T23: system-header macros reached through a C++ import resolve as C++ sees them
     // (cpp_interop_cwrapper_macros.hpp includes the C wrapper headers). Platform-neutral values.
     if (CHAR_BIT != 8 || INT_MAX != 2147483647) return 37001;
@@ -4004,6 +4161,8 @@ extern int main()
     // identifier 'K'", 32007-32008 "Unknown identifier 'size'/'twice'", 32009 "cannot find the
     // type", 32010-32011 "no imported C++ header declares", 32012 "is a C++ variable, not a class
     // template", 32013 read FALSE (nullptr_t spelled void*). 32003 is accept-set (worked before).
+    auto entityOriginAddress = &cppi_entity.StaticData.origin;
+    if (entityOriginAddress->y != 9)                          return 32000;
     if (cppi_entity.StaticData.origin.y != 9)                   return 32001;
     cppi_entity.StaticData.origin.x = 3;
     if (cppi_entity.StaticData.origin.x != 3)                   return 32002;

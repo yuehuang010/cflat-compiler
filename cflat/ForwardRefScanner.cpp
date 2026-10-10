@@ -330,6 +330,8 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                 {
                     std::string specText = canonicalTypeName.empty()
                         ? typeSpec->getText() : canonicalTypeName;
+                    if (auto* memberType = typeSpec->memberTypeSpecifier())
+                        specText = ResolveMemberTypeSpecifier(memberType);
                     // Resolve namespace-scope C++ using-directives before a lazy foreign-type
                     // request so `using namespace inner; outer.Type` requests the real type.
                     specText = compiler->ResolveQualifiedName(specText);
@@ -1211,7 +1213,11 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
         {
             // Same namespace walk as the main pass's ResolveTypeArgEntry (no active substitutions
             // during the scan), so a bare 'Item' inside 'namespace A' names A.Item in both passes.
-            resolved = Compiler(entry)->ResolveTypeArgBaseName(CanonicalTemplateTypeArgument(entry));
+            resolved = typeSpec != nullptr && typeSpec->memberTypeSpecifier() != nullptr
+                ? ResolveMemberTypeSpecifier(typeSpec->memberTypeSpecifier())
+                : Compiler(entry)->ResolveTypeArgBaseName(CanonicalTemplateTypeArgument(entry));
+            if (auto subst = scanTypeSubstitutions_.find(resolved); subst != scanTypeSubstitutions_.end())
+                resolved = subst->second;
             if (entry->pointer() == nullptr && entry->arrayTypeSuffix() == nullptr
                 && entry->Identifier() == nullptr && typeSpec != nullptr
                 && ((typeSpec->genericIdentifier() != nullptr
@@ -1308,6 +1314,8 @@ std::string ForwardRefScanner::ResolveSigComponentScanner(
                 args.push_back(ResolveForwardTypeArg(entry));
             return MangleGenericInstance(*compilerLLVM, mangled, args);
         }
+        if (auto* memberType = ts->memberTypeSpecifier(); memberType != nullptr)
+            return compilerLLVM->ResolveTypeAlias(ResolveMemberTypeSpecifier(memberType));
         PrimitiveTypeError error;
         std::string result = CanonicalTypeSpecifierText(ts, suffix, false, &error);
         if (HasPrimitiveTypeError(error))
@@ -1504,6 +1512,8 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
                 recordTypeName(tn);
                 if (sd->genericTypeParameters() != nullptr && !tn.empty())
                 {
+                    if (certain) scannedGenericAggregates_[QualifyName(ns, tn)] = sd;
+                    if (certain) scannedGenericAggregateNs_[QualifyName(ns, tn)] = ns;
                     if (certain) RecordScannedGenericStructName(QualifyName(ns, tn));
                     else compiler->gts.scannedGenericStructNamesUncertain.insert(QualifyName(ns, tn));
                 }
@@ -1518,6 +1528,8 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
                 recordTypeName(tn);
                 if (cd->genericTypeParameters() != nullptr && !tn.empty())
                 {
+                    if (certain) scannedGenericAggregates_[QualifyName(ns, tn)] = cd;
+                    if (certain) scannedGenericAggregateNs_[QualifyName(ns, tn)] = ns;
                     if (certain) RecordScannedGenericStructName(QualifyName(ns, tn));
                     else compiler->gts.scannedGenericStructNamesUncertain.insert(QualifyName(ns, tn));
                 }
@@ -1806,6 +1818,14 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx) {
                         if (typeSpec->qualifiedGenericIdentifier() != nullptr
                             && Compiler(typeSpec)->IsGenericTemplateKey(qBase))
                             tryPreDeclare(qBase, qParams);
+                    // `Other<int>.Id` in a field / local of a non-generic body, the template declared
+                    // later: shell + provisional alias frame now (CFlat owners only, no clang request).
+                    if (auto* memberType = typeSpec->memberTypeSpecifier())
+                    {
+                        const std::string ownerText = memberType->memberTypeOwner()->getText();
+                        if (Compiler(typeSpec)->AnyGenericTypeTemplateNamed(ownerText.substr(0, ownerText.find('<'))))
+                            ResolveMemberTypeSpecifier(memberType);
+                    }
 
                     // Tuple type sugar: (T1, T2) -> pre-declare tuple__T1__T2
                     if (typeSpec->tupleTypeSpecifier() != nullptr)
@@ -1917,6 +1937,10 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
             typeSpec, ctx->multiWordTypeSuffix(), false, &canonicalError);
         if (HasPrimitiveTypeError(canonicalError))
             compiler->LogError(LocalizePrimitiveTypeError(compiler, canonicalError));
+        if (auto* memberType = typeSpec->memberTypeSpecifier())
+            target = ResolveMemberTypeSpecifier(memberType);
+        else if (auto subst = scanTypeSubstitutions_.find(target); subst != scanTypeSubstitutions_.end())
+            target = subst->second;
         // A pointer alias (using Handle = void*) stores its trailing stars in the alias string;
         // they are peeled back onto the pointer flags at the resolution site (GetType /
         // ParseDeclarationSpecifiers). Storage stays string-shaped - no descriptor struct.
@@ -1998,6 +2022,16 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
         if (compiler->IsInterfaceType(targetBase) || compiler->dataStructures.count(targetBase) > 0
             || LLVMBackend::IsPrimitiveTypeName(targetBase) || compiler->IsWinrtFullName(targetBase))
             compiler->RegisterTypeAlias(alias, targetDecorated + suffix);
+        else if (provisionalAliasNs_.has_value())
+        {
+            // A template member alias naming a record declared later in the file: the name scan
+            // knows it, its shell comes with ScanExternalDeclaration (namespace sibling first).
+            const std::string sibling = QualifyName(*provisionalAliasNs_, targetBase);
+            const std::string known = compiler->gts.scannedTypeNames.count(sibling) != 0 ? sibling
+                : compiler->gts.scannedTypeNames.count(targetBase) != 0 ? targetBase : std::string{};
+            if (!known.empty())
+                compiler->RegisterTypeAlias(alias, known + targetDecorated.substr(targetBase.size()) + suffix);
+        }
     }
 
 void ForwardRefScanner::ScanAggregateAliases(
@@ -2422,3 +2456,112 @@ void ForwardRefScanner::PrepareWinrtClasses(antlr4::RuleContext* ctx, const std:
                 PrepareWinrtClasses(nested, typeName);
         }
     }
+
+std::string ForwardRefScanner::ResolveMemberTypeSpecifier(CFlatParser::MemberTypeSpecifierContext* ctx) {
+        auto* compiler = Compiler(ctx);
+        auto* ownerCtx = ctx->memberTypeOwner();
+        const std::string ownerText = ownerCtx->getText();
+        std::string base = ownerText.substr(0, ownerText.find('<'));
+        std::vector<std::string> args;
+        for (auto* entry : ownerCtx->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+            args.push_back(ResolveForwardTypeArg(entry));
+        compiler->ResolveGenericAliasSpelling(base, args, false);
+        std::string owner = MangleGenericInstance(*compiler, base, args);
+        // Mirror of ScanUsingDeclaration's generic RHS: a CFlat template gets its shell (the main
+        // pass queues the instantiation), a C++ specialization is requested for its layout.
+        if (compiler->AnyGenericTypeTemplateNamed(base))
+        {
+            if (compiler->GetDataStructure(owner).StructType == nullptr)
+            {
+                compiler->CreateStructType(owner, {});
+                LLVMBackend::TypeAndValue returnType{ .TypeName = owner };
+                compiler->CreateFunctionDeclaration(owner, returnType, {});
+            }
+        }
+        else
+        {
+            std::string cxxError;
+            compiler->TryRequestCxxType(base, args, owner, cxxError);
+            owner = compiler->ResolveTypeAlias(owner);
+        }
+        // Opportunistic like the rest of the scan: a member the scan cannot see keeps the
+        // written text; the main pass reports.
+        std::string resolvedBase = compiler->AnyGenericTypeTemplateNamed(base)
+            ? compiler->ResolveGenericTemplateBase(base) : std::string{};
+        for (auto* member : ctx->memberNameToken())
+        {
+            LLVMBackend::MemberTypeResult result;
+            std::string next = compiler->ResolveMemberType(owner, member->getText(), result);
+            if (next.empty() && !resolvedBase.empty()
+                && ScanTemplateAggregateAliases(owner, resolvedBase, args))
+                next = compiler->ResolveMemberType(owner, member->getText(), result);
+            if (next.empty()) return ctx->getText();
+            resolvedBase.clear();
+            owner = next;
+        }
+        return owner;
+}
+
+bool ForwardRefScanner::ScanTemplateAggregateAliases(const std::string& owner, const std::string& base,
+                                                     const std::vector<std::string>& args) {
+        auto* compiler = compilerLLVM;
+        // A template of this file was recorded by the name scan; an imported (core) one is
+        // materialized from its cached source.
+        antlr4::ParserRuleContext* templateCtx = nullptr;
+        if (auto it = scannedGenericAggregates_.find(base); it != scannedGenericAggregates_.end())
+            templateCtx = it->second;
+        else if (auto* sd = compiler->MaterializeGenericStruct(base))
+            templateCtx = sd;
+        else
+            templateCtx = compiler->MaterializeGenericClass(base);
+        auto* structCtx = dynamic_cast<CFlatParser::StructDefinitionContext*>(templateCtx);
+        auto* classCtx = dynamic_cast<CFlatParser::ClassDefinitionContext*>(templateCtx);
+        if (structCtx == nullptr && classCtx == nullptr) return false;
+        auto* generic = structCtx != nullptr ? structCtx->genericTypeParameters()
+                                             : classCtx->genericTypeParameters();
+        if (generic == nullptr) return false;
+        // Plain `<T, U>` parameter lists only: a value or pack parameter is left to the main pass.
+        std::vector<std::string> params;
+        for (auto* entry : generic->typeParameterList()->typeParameterEntry())
+        {
+            auto* gid = entry->typeSpecifier() != nullptr ? entry->typeSpecifier()->genericIdentifier() : nullptr;
+            if (entry->valueParameterDeclaration() != nullptr || entry->Ellipsis() != nullptr
+                || gid == nullptr || gid->genericTypeParameters() != nullptr)
+                return false;
+            params.push_back(gid->Identifier()->getText());
+        }
+        if (params.size() != args.size()) return false;
+        if (std::none_of(provisionalAliasOwners_.begin(), provisionalAliasOwners_.end(),
+                         [&](const auto& seen) { return seen.owner == owner; }))
+            provisionalAliasOwners_.push_back({ owner, base, args });
+        std::string ns;
+        if (auto it = scannedGenericAggregateNs_.find(base); it != scannedGenericAggregateNs_.end())
+            ns = it->second;
+        else if (auto it = compiler->gts.genericTemplateNamespace.find(base);
+                 it != compiler->gts.genericTemplateNamespace.end())
+            ns = it->second;
+        auto saved = scanTypeSubstitutions_;
+        for (size_t i = 0; i < args.size(); i++)
+            scanTypeSubstitutions_[params[i]] = args[i];
+        {
+            // Alias targets name the template's namespace siblings first (`using Id = Payload;`).
+            LLVMBackend::NamespaceScope nsScope(compiler, ns);
+            LLVMBackend::AliasScopeGuard aliasScope(compiler);
+            auto savedNs = std::exchange(provisionalAliasNs_, ns);
+            ScanAggregateAliases(structCtx != nullptr ? structCtx->aggregateMember()
+                                                      : classCtx->aggregateMember());
+            provisionalAliasNs_ = std::move(savedNs);
+            compiler->SaveAggregateAliasScope(owner, /*provisional*/ true);
+        }
+        scanTypeSubstitutions_ = std::move(saved);
+        return true;
+}
+
+void ForwardRefScanner::RefreshProvisionalAggregateAliases() {
+        // A record alias target (`using Id = Payload;`, `Later<Payload>`) is only a known type once
+        // ScanExternalDeclaration registered its shell; re-collect each still-provisional frame.
+        auto owners = provisionalAliasOwners_;
+        for (const auto& entry : owners)
+            if (compilerLLVM->provisionalAggregateAliasScopes_.count(entry.owner) != 0)
+                ScanTemplateAggregateAliases(entry.owner, entry.base, entry.args);
+}

@@ -1,0 +1,14 @@
+struct OffsetErr { int value = default; };
+expect_error("offsetof: unknown field 'missing'") {
+    u64 value = offsetof(OffsetErr, missing);
+}
+expect_error("offsetof: type 'OffsetLate' is incomplete") {
+    u64 late = offsetof(OffsetLate, b);
+}
+struct OffsetLate { char a = default; double b = default; };
+extern int OffsetBareName()
+{
+    expect_error("Undefined variable offsetof.");
+    u64 bare = offsetof;
+    return (int)bare;
+}

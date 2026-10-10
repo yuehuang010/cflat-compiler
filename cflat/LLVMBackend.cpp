@@ -2357,6 +2357,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                 // Second pass: register non-generic struct shells and function signatures.
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanExternalDeclaration(decl);
+                scanner.RefreshProvisionalAggregateAliases();
                 scanner.PrepareWinrtClasses(tu);
             }
         }
@@ -3632,6 +3633,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 scanner.ScanGenericTypeUses(decl);
             for (auto* decl : tu->externalDeclaration())
                 scanner.ScanExternalDeclaration(decl);
+            scanner.RefreshProvisionalAggregateAliases();
             scanner.PrepareWinrtClasses(tu);
         }
     }
@@ -4609,6 +4611,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     scanner.ScanGenericTypeUses(decl);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanExternalDeclaration(decl);
+                scanner.RefreshProvisionalAggregateAliases();
                 scanner.PrepareWinrtClasses(tu);
             }
         }
@@ -4732,6 +4735,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxFunctionTemplateOwnerGroup_.clear();
     cxxFunctionSignatures_.clear();
     cxxDefaultWrapperRequests_.clear();
+    cxxRvalueRefBindVerdicts_.clear();
     cxxFunctionBindAttempts_.clear();
     cxxLazyStdFunctionMemberBinds_.clear();
     cxxNamespaceEntities_.clear();
@@ -4983,6 +4987,7 @@ void LLVMBackend::ResetForReanalysis()
     programTable.clear();
     enumBackingTypes.clear();
     scopedEnumTypes_.clear();
+    scopedCppEnumeratorHints_.clear();
     enumPromotedTypes_.clear();
     enumDeclSites_.clear();
     typeAliases.clear();
@@ -4990,6 +4995,9 @@ void LLVMBackend::ResetForReanalysis()
     cxxDeductionWrappers_.clear();
     aliasScopeStack_.clear();
     aggregateAliasScopes_.clear();
+    provisionalAggregateAliasScopes_.clear();
+    aggregateAliasMemberNames_.clear();
+    aggregateValueMembers_.clear();
     manglingAliases_.clear();
     manglingPointerAliases_.clear();
     genericBaseAliases_.clear();
@@ -7983,6 +7991,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     manglingPointerAliases_.clear();
     enumBackingTypes.clear();
     scopedEnumTypes_.clear();
+    scopedCppEnumeratorHints_.clear();
     enumPromotedTypes_.clear();
     enumDeclSites_.clear();
     // strConcatRegistered / stringDtorRegistered: will be set below after deserialization

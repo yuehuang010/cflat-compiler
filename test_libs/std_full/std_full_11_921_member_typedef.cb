@@ -1,6 +1,5 @@
 // GUARDS: member typedefs of C++ classes named in type position and as template arguments
 // FROM: internal/plan/std-library-tier2-suite.md
-// DISABLED: internal/issue/p3/cpp-member-typedef-not-nameable.md
 import cpp {"iterator", "type_traits", "vector"};
 extern int main()
 {

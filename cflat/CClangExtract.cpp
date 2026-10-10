@@ -2402,6 +2402,25 @@ namespace cflat_cinterop
                 return true;
             }
 
+            std::optional<long long> DependentEnumeratorValue(const EnumDecl* ed, const EnumConstantDecl* target)
+            {
+                long long next = 0;
+                for (const EnumConstantDecl* ec : ed->enumerators())
+                {
+                    long long value = next;
+                    if (const Expr* init = ec->getInitExpr())
+                    {
+                        if (init->isValueDependent() || init->isTypeDependent()) return std::nullopt;
+                        std::optional<llvm::APSInt> folded = init->getIntegerConstantExpr(ctx);
+                        if (!folded) return std::nullopt;
+                        value = ApsIntToLongLong(*folded);
+                    }
+                    if (ec == target) return value;
+                    next = value + 1;
+                }
+                return std::nullopt;
+            }
+
             // The enumerator's own record (type, value, source position) under its bare name.
             bool FillRawEnum(EnumConstantDecl* ec, RawEnum& e)
             {
@@ -2434,7 +2453,16 @@ namespace cflat_cinterop
                     e.enumType = td->getNameAsString();
                     e.underlyingType = CanonicalSpelling(ctx, ed->getIntegerType());
                 }
-                e.value = ApsIntToLongLong(ec->getInitVal());
+                if (ed != nullptr && ed->isDependentContext())
+                {
+                    // Inside a template pattern clang never computes the value; fold it from the
+                    // initializers, and skip an enumerator whose value depends on a parameter.
+                    std::optional<long long> value = DependentEnumeratorValue(ed, ec);
+                    if (!value) return false;
+                    e.value = *value;
+                }
+                else
+                    e.value = ApsIntToLongLong(ec->getInitVal());
                 e.file = file; e.line = line; e.col = col;
                 e.physicalFile = PhysicalFileOf(ec, file);
                 return true;
@@ -2447,8 +2475,8 @@ namespace cflat_cinterop
                 const auto* ed = llvm::dyn_cast<EnumDecl>(ec->getDeclContext());
                 // C++ mode also publishes the QUALIFIED spelling, so a scoped or class-nested
                 // enumerator is reachable as it is written in C++ ("ns.Cls.Kind.One") rather than
-                // only under a bare name that could collide across namespaces. The unqualified
-                // form stays registered as well - first writer wins downstream.
+                // only under a bare name that could collide across namespaces. An unscoped
+                // enumerator's bare form stays registered as well - first writer wins downstream.
                 if (st.req.cxxMode)
                 {
                     std::string qualified = CxxQualifiedName(ec);
@@ -2485,6 +2513,9 @@ namespace cflat_cinterop
                             st.out.enums.push_back(std::move(q));
                         }
                     }
+                    // A scoped enumerator is not in its enclosing scope ([dcl.enum]/11): only the
+                    // qualified spellings above (and `using enum` shadows) publish it.
+                    if (ed != nullptr && ed->isScoped()) return true;
                 }
                 st.out.enums.push_back(std::move(e));
                 return true;
@@ -4078,6 +4109,12 @@ namespace cflat_cinterop
                         if (const auto* et = canon->getAs<EnumType>();
                             et != nullptr && !canon->isDependentType())
                         {
+                            // A scoped member enum of a class template specialization is not
+                            // instantiated with its class; complete it on demand, as a use would.
+                            if (et->getDecl()->getDefinition() == nullptr
+                                && et->getDecl()->getInstantiatedFromMemberEnum() != nullptr)
+                                st.ci->getSema().RequireCompleteEnumDecl(
+                                    const_cast<EnumDecl*>(et->getDecl()), td->getLocation());
                             const EnumDecl* ed = et->getDecl()->getDefinition();
                             if (ed != nullptr && !ed->getIntegerType().isNull())
                             {

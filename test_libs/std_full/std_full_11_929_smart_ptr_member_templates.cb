@@ -1,6 +1,5 @@
 // GUARDS: shared_ptr::owner_before (member template) and implicit shared_ptr -> weak_ptr at an operator[] argument
 // FROM: internal/plan/std-library-tier2-suite.md
-// DISABLED: internal/issue/p3/cpp-owner-before-member-template-and-operator-arg-conversion.md
 import cpp {"memory", "map"};
 extern int main()
 {

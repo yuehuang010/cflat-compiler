@@ -1,6 +1,5 @@
 // GUARDS: offsetof(S, member) on a plain struct through <cstddef>
 // FROM: internal/plan/std-library-tier2-suite.md
-// DISABLED: internal/issue/p3/cpp-offsetof-macro-not-importable.md
 import cpp "cstddef";
 struct Layout { char tag = default; double value = default; int count = default; };
 extern int main()

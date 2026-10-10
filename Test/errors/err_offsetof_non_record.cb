@@ -1,0 +1,3 @@
+expect_error("offsetof: type 'int' is not a record") {
+    u64 value = __builtin_offsetof(int, value);
+}

@@ -10411,8 +10411,9 @@ std::string LLVMBackend::CxxStringLiteralArrayLvalue(const NamedVariable& arg,
         if (constant == nullptr) return {};
         auto length = stringLiteralLenByPtr.find(constant);
         if (length == stringLiteralLenByPtr.end()) return {};
-        return std::format("(*reinterpret_cast<const char (*)[{}]>(p{}))", length->second + 1,
-                           parameterIndex);
+        const char* elementType = arg.TypeAndValue.TypeName == "c8" ? "char8_t" : "char";
+        return std::format("(*reinterpret_cast<const {} (*)[{}]>(p{}))", elementType,
+                           length->second + 1, parameterIndex);
 }
 
 /*
@@ -10527,6 +10528,7 @@ bool LLVMBackend::CxxStringLiteralSpelling(const NamedVariable& arg, std::string
                 break;
             }
         }
+        if (arg.TypeAndValue.TypeName == "c8") spelling = "u8" + spelling;
         spelling += '"';
         return true;
 }
@@ -17998,6 +18000,10 @@ void LLVMBackend::RegisterCEnums(const std::vector<CEnumEntry>& enums, const std
                                              e.name, e.enumType);
                 continue;
             }
+            // `E.v` spelling of a scoped enumerator: remember the bare name for the undefined-name hint.
+            if (cxxBoundary && e.isScoped && e.name.size() > e.enumType.size()
+                && e.name.compare(0, e.enumType.size(), e.enumType) == 0 && e.name[e.enumType.size()] == '.')
+                scopedCppEnumeratorHints_.try_emplace(e.name.substr(e.enumType.size() + 1), e.enumType);
             // First writer wins: a hand-written declaration or an earlier header takes
             // precedence over a duplicate constant name.
             if (globalNamedVariable.count(e.name)) continue;
@@ -19046,11 +19052,12 @@ bool LLVMBackend::EnsureCxxMemberProjectedImpl(const std::string& typeName,
         const std::string stableTypeName = typeName;
         const std::string stableMemberName = memberName;
         if (stableMemberName.empty()) return false;
-        // A std::unique_ptr receiver converts to its pointee at a member call, so the pointee's
-        // overloads of this name are candidates too.
+        // Dot sees the unique_ptr's own members first; project to the pointee only for names
+        // it does not own (`->` follows operator-> in the postfix listener).
         if (stableTypeName.starts_with("std.unique_ptr$"))
             if (const std::string pointee = CxxUniquePtrPointee(stableTypeName);
-                !pointee.empty() && pointee != stableTypeName)
+                !pointee.empty() && pointee != stableTypeName
+                && !CxxClassHasMemberNamed(stableTypeName, stableMemberName))
                 EnsureCxxMemberProjected(pointee, stableMemberName);
         EnsureCxxRecordProjected(stableTypeName, false);
         auto entry = cxxRecordEntries_.find(stableTypeName);
@@ -26562,8 +26569,9 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
         const size_t targetTemplate = param.TypeName.find('$');
         const bool bothTemplateSpecializations = sourceTemplate != std::string::npos
             && targetTemplate != std::string::npos;
-        if (allowTemplateClassConversion && bothTemplateSpecializations
-            && IsCxxRecord(argType.TypeName)
+        // A lone candidate's `const X&` / `X&&` binds the converted temporary too ([dcl.init.ref]).
+        if ((allowTemplateClassConversion || param.IsRvalueRef || param.IsCxxConstRef)
+            && bothTemplateSpecializations && IsCxxRecord(argType.TypeName)
             && (cxxByValueParam || param.IsRvalueRef || param.IsCxxConstRef))
         {
             const CxxClassInfo* target = GetCxxClassInfoWithConstructors(param.TypeName);
@@ -26629,6 +26637,19 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
             return answer(CxxArgConversion::Convertible);
         if (!ExplicitCxxConstructorBlocking(param.TypeName, { argType }).empty())
             return answer(CxxArgConversion::ExplicitCtor);
+        // A class source whose only route is its `operator X()` into a `const X&` / `X&&`:
+        // clang copy-initializes the temporary (an ambiguous or explicit route refuses there).
+        if ((param.IsRvalueRef || param.IsCxxConstRef) && !argType.Pointer
+            && IsCxxRecord(argType.TypeName) && HasImplicitClassConversionOperator(argType.TypeName))
+        {
+            NamedVariable probe = arg;
+            probe.TypeAndValue = argType;
+            std::string wrapperName;
+            std::string wrapperError;
+            if (RequestCxxVariadicConstructor(param.TypeName, { probe }, wrapperName, wrapperError,
+                                              /*copyInit*/ true))
+                return CxxArgConversion::Convertible;
+        }
         // Past this point only a speculative clang request could answer, and it re-registers the
         // class - never run it for a parameter that could not have taken the conversion anyway.
         if (nonConstLvalueRef) return CxxArgConversion::NotApplicable;
@@ -26680,6 +26701,105 @@ bool LLVMBackend::CanImplicitlyConstructCxxClass(const NamedVariable& arg,
         return ClassifyCxxImplicitArgument(arg, param, cxxByValueParam,
                                            allowTemplateClassConversion)
             == CxxArgConversion::Convertible;
+}
+
+bool LLVMBackend::IsCxxConvertingTemporaryForRvalueRef(const NamedVariable& arg,
+                                                       const TypeAndValue& param,
+                                                       bool allowTemplateClassConversion)
+{
+        if (!param.IsRvalueRef || !param.Pointer || param.ElemPointer || param.IsCxxRefToPointer
+            || param.TypeName.empty() || !IsCxxRecord(param.TypeName))
+            return false;
+        const TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
+        // A reference-related lvalue (same class or a derived one) binds directly or not at all.
+        if (!argType.Pointer && !argType.TypeName.empty()
+            && (argType.TypeName == param.TypeName
+                || (IsCxxRecord(argType.TypeName) && IsCxxBaseOf(param.TypeName, argType.TypeName))))
+            return false;
+        // Cheap filter: some listed converting ctor or conversion operator could make the temp.
+        const bool viaCtor = CanImplicitlyConstructCxxClass(arg, param, /*cxxByValueParam*/ false,
+                                                            allowTemplateClassConversion);
+        TypeAndValue referent = param;
+        referent.Pointer = referent.IsAlias = referent.IsRvalueRef = false;
+        referent.PointerDepth = 0;
+        if (!viaCtor && (argType.Pointer || argType.TypeName.empty()
+                         || CxxConversionOperatorTo(argType.TypeName, referent, false).empty()))
+            return false;
+        // Clang decides: `X&& r = source;` on the source's real cv and category (ambiguity between
+        // a ctor and an operator, a const source into a `T(S&)` ctor, explicit, constraints).
+        std::string parameter;
+        std::string targetSpelling;
+        const std::string key = CxxRvalueRefBindKey(arg, param, parameter, targetSpelling);
+        if (key.empty()) return false;
+        if (auto known = cxxRvalueRefBindVerdicts_.find(key); known != cxxRvalueRefBindVerdicts_.end())
+            return known->second.first;
+        bool verdict = false;
+        std::string error;
+        auto groupIt = cxxTypeOwnerGroup_.find(param.TypeName);
+        if (groupIt != cxxTypeOwnerGroup_.end())
+        {
+            std::string generatedTypeSource;
+            std::set<size_t> dependencySet;
+            std::unordered_set<std::string> incompleteTypes;
+            GeneratedCxxDefinitionsFor({ param.TypeName, argType.TypeName }, generatedTypeSource,
+                                       dependencySet, incompleteTypes);
+            if (auto owner = cxxTypeOwnerGroup_.find(argType.TypeName);
+                owner != cxxTypeOwnerGroup_.end() && owner->second != groupIt->second)
+                dependencySet.insert(owner->second);
+            const std::vector<size_t> dependencies(dependencySet.begin(), dependencySet.end());
+            CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, dependencies);
+            if (!group.headers.empty())
+            {
+                const std::string wrapperName = std::format("__cflat_rrbind_{:016x}",
+                    HashWrapperKey("rrbind|" + key));
+                const std::string wrapperSource = "extern \"C\" __attribute__((weak)) void "
+                    + wrapperName + "(" + parameter + " p0) { " + targetSpelling
+                    + " && r = p0; (void)r; }\n";
+                CxxRequestGroupScope groupScope(*this, &group);
+                CSigEntry bound;
+                verdict = RequestGeneratedCxxWrapper(group, generatedTypeSource + wrapperSource,
+                                                     wrapperName, "RVALUE_REF_BIND", bound, error,
+                                                     incompleteTypes.empty());
+                if (verbose)
+                    std::cout << std::format("[verbose]   rvalue-ref bind probe {} -> {}\n", key,
+                                             verdict ? "binds" : "refused");
+            }
+        }
+        cxxRvalueRefBindVerdicts_.emplace(key, std::pair{ verdict, verdict ? std::string()
+                                                                  : FirstCxxErrorLine(error) });
+        return verdict;
+}
+
+// "<source parameter spelling>|<target spelling>", or empty when either has no C++ spelling.
+std::string LLVMBackend::CxxRvalueRefBindKey(const NamedVariable& arg, const TypeAndValue& param,
+                                             std::string& parameter, std::string& targetSpelling)
+{
+        const TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
+        std::string sourceSpelling;
+        if (!CxxSpellingForCflatType(argType.TypeName, sourceSpelling)
+            || !CxxSpellingForCflatType(param.TypeName, targetSpelling))
+            return {};
+        if (argType.Pointer)
+            parameter = (argType.IsCxxPointeeConst ? "const " : "") + sourceSpelling
+                + (argType.ElemPointer ? " **" : " *");
+        else
+            parameter = (CxxConstReceiverKind(arg) != 0 ? "const " : "") + sourceSpelling + " &";
+        return parameter + "|" + targetSpelling;
+}
+
+std::string LLVMBackend::CxxRvalueRefBindRefusal(const NamedVariable& arg, const TypeAndValue& param)
+{
+        std::string parameter;
+        std::string targetSpelling;
+        const std::string key = CxxRvalueRefBindKey(arg, param, parameter, targetSpelling);
+        auto known = cxxRvalueRefBindVerdicts_.find(key);
+        if (key.empty() || known == cxxRvalueRefBindVerdicts_.end() || known->second.first
+            || known->second.second.empty())
+            return {};
+        std::string source = parameter.substr(0, parameter.size() - 2);
+        return std::format("no implicit conversion from '{}' binds '{} &&' (clang: {})",
+                           parameter.ends_with(" &") ? source : parameter, targetSpelling,
+                           known->second.second);
 }
 
 std::string LLVMBackend::DescribeCxxImplicitArgumentBlock(const NamedVariable& arg,
@@ -26999,12 +27119,17 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
             && CxxConversionOperatorBindsBetter(argType.TypeName, param.TypeName);
         const size_t sourceTemplate = argType.TypeName.find('$');
         const size_t targetTemplate = param.TypeName.find('$');
-        const bool classTemplateConversion = allowTemplateClassConversion
+        const bool classTemplateConversion
+            = (allowTemplateClassConversion || param.IsRvalueRef || param.IsCxxConstRef)
             && info != nullptr && info->hasCtorTemplate
             && sourceTemplate != std::string::npos && targetTemplate != std::string::npos
             && IsCxxRecord(argType.TypeName);
+        // Only an `operator X()` converts a class source into a reference parameter (above).
+        const bool operatorOnly = ctor == nullptr && !slicesToBase && !argType.Pointer
+            && (param.IsRvalueRef || param.IsCxxConstRef) && IsCxxRecord(argType.TypeName)
+            && HasImplicitClassConversionOperator(argType.TypeName);
         const bool wrapped = info != nullptr
-            && (operatorBindsBetter || classTemplateConversion
+            && (operatorBindsBetter || classTemplateConversion || operatorOnly
                 || ((ctor == nullptr || clangResolves)
                     && (info->constructors.empty()
                         || (info->hasCtorTemplate && !IsCxxRecord(argType.TypeName))

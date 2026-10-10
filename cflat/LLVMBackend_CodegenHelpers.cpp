@@ -2107,6 +2107,57 @@ bool LLVMBackend::HasOnlyCxxDefaultWrappers(const std::string& typeName,
         return sawWrapper;
 }
 
+bool LLVMBackend::IsNonStaticMember(const std::string& typeName, const std::string& memberName)
+{
+        if (IsCxxRecord(typeName))
+        {
+            EnsureCxxMemberProjected(typeName, memberName);
+            if (TypeHasMember(typeName, memberName)) return true;
+            std::set<std::string> visited;
+            std::function<bool(const std::string&)> hasInstanceMember = [&](const std::string& owner) {
+                if (!visited.insert(owner).second) return false;
+                auto record = cxxRecordEntries_.find(owner);
+                if (record != cxxRecordEntries_.end())
+                {
+                    if (std::any_of(record->second.fields.begin(), record->second.fields.end(),
+                        [&](const auto& field) { return field.name == memberName; }))
+                        return true;
+                }
+                if (const CxxClassInfo* info = GetCxxClassInfo(owner))
+                {
+                    if (info->fieldAccess.count(memberName) != 0) return true;
+                    if (std::any_of(info->directMethods.begin(), info->directMethods.end(),
+                        [&](const auto& method) {
+                            return method.raw.name == memberName
+                                && method.raw.kind == cflat_cinterop::RawCxxMember::Instance;
+                        }))
+                        return true;
+                    for (const auto& base : info->bases)
+                        if (hasInstanceMember(base.name)) return true;
+                }
+                return false;
+            };
+            return hasInstanceMember(typeName);
+        }
+
+        if (auto record = dataStructures.find(typeName); record != dataStructures.end())
+        {
+            if (std::any_of(record->second.StructFields.begin(), record->second.StructFields.end(),
+                [&](const auto& field) { return field.VariableName == memberName; }))
+                return true;
+            if (std::any_of(record->second.Bitfields.begin(), record->second.Bitfields.end(),
+                [&](const auto& field) { return field.Name == memberName; }))
+                return true;
+        }
+        auto functions = functionTable.find(memberName);
+        if (functions != functionTable.end())
+            for (const auto& function : functions->second)
+                if (function.IsMethod && !function.Parameters.empty()
+                    && function.Parameters.front().TypeName == typeName)
+                    return true;
+        return false;
+}
+
 llvm::Function* LLVMBackend::GetOrCreateMemberwiseCopy(const std::string& typeName)
 {
         if (auto it = memberwiseCopyCache_.find(typeName); it != memberwiseCopyCache_.end())

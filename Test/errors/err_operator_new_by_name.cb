@@ -1,0 +1,21 @@
+extern int main()
+{
+    expect_error("calling 'operator new' by name is not supported") {
+        void* p = operator new(16);
+    }
+    expect_error("calling 'operator delete' by name is not supported") {
+        operator delete(nullptr);
+    }
+    expect_error("calling 'operator new' by name is not supported") {
+        void* p = operator new[](16);
+    }
+    expect_error("calling 'operator delete' by name is not supported") {
+        operator delete[](nullptr);
+    }
+    int* supported = new int;
+    *supported = 73;
+    bool valueOk = *supported == 73;
+    delete supported;
+    if (!valueOk) return 1;
+    return 0;
+}

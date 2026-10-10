@@ -870,7 +870,13 @@ bool LLVMBackend::IsScopedEnumTypeName(const std::string& name) const
 {
         const std::string key = ResolveEnumTypeName(name);
         return !key.empty() && scopedEnumTypes_.count(key) != 0;
-    }
+}
+
+std::string LLVMBackend::GetScopedCppEnumeratorHint(const std::string& name) const
+{
+        auto it = scopedCppEnumeratorHints_.find(name);
+        return it != scopedCppEnumeratorHints_.end() ? it->second : std::string{};
+}
 
 bool LLVMBackend::IsScopedEnumMatch(const TypeAndValue& from, const TypeAndValue& to) const
 {
@@ -927,6 +933,17 @@ bool LLVMBackend::CxxEnumParameterRefusesArgument(const NamedVariable& arg,
         if (!arg.InferSourceTypeName.empty()) return primitiveName(arg.InferSourceTypeName);
         return arg.BaseType != nullptr
             && (arg.BaseType->isIntegerTy() || arg.BaseType->isFloatingPointTy());
+}
+
+bool LLVMBackend::CxxDistinctEnumArgument(const TypeAndValue& arg, const TypeAndValue& param) const
+{
+        if (arg.Pointer || arg.ElemPointer || param.ElemPointer || param.IsArrayView || param.IsFunctionPointer)
+            return false;
+        if (param.Pointer && !(param.IsAlias || param.IsRvalueRef || param.IsCxxConstRef)) return false;
+        if (!param.IsScopedEnum && !IsScopedEnumTypeName(param.TypeName)) return false;
+        const std::string argKey = ResolveEnumTypeName(arg.TypeName);
+        const std::string paramKey = ResolveEnumTypeName(param.TypeName);
+        return !argKey.empty() && !paramKey.empty() && argKey != paramKey;
 }
 
 std::string LLVMBackend::GetEnumBackingType(const std::string& enumName) const
@@ -1308,6 +1325,41 @@ bool LLVMBackend::IsDataStructure(const std::string& name) const
 static size_t UsingDirectiveWorklistCap(size_t directiveCount)
 {
         return 4096 + 8 * directiveCount;
+}
+
+bool LLVMBackend::TryGetScanTimeFieldOffset(const std::string& typeName,
+                                           const std::vector<std::string>& path,
+                                           int64_t& out) const
+{
+    if (typeName.empty() || path.empty()) return false;
+    std::string currentType = ResolveTypeAlias(typeName);
+    uint64_t total = 0;
+    for (size_t part = 0; part < path.size(); ++part)
+    {
+        auto found = dataStructures.find(currentType);
+        if (found == dataStructures.end()) return false;
+        const auto& record = found->second;
+        auto field = std::find_if(record.StructFields.begin(), record.StructFields.end(),
+            [&](const auto& candidate) { return candidate.VariableName == path[part]; });
+        if (field == record.StructFields.end()) return false;
+        const size_t index = static_cast<size_t>(field - record.StructFields.begin());
+        if (!record.IsUnion)
+        {
+            if (record.CxxOffsetLayout && index < record.CxxFieldOffsets.size())
+                total += record.CxxFieldOffsets[index];
+            else if (record.StructType != nullptr && !record.StructType->isOpaque())
+                total += module->getDataLayout().getStructLayout(record.StructType)->getElementOffset(index);
+            else return false;
+        }
+        if (part + 1 < path.size())
+        {
+            if (field->Pointer || field->IsArrayView || field->ConstArraySize > 0 || field->AliasArraySize > 0)
+                return false;
+            currentType = ResolveTypeAlias(field->TypeName);
+        }
+    }
+    out = static_cast<int64_t>(total);
+    return true;
 }
 
 std::string LLVMBackend::ResolveNamespaceAliasExact(const std::string& name) const

@@ -3265,6 +3265,8 @@ private:
     std::unordered_map<std::string, ProgramData> programTable;
     std::unordered_map<std::string, std::string> enumBackingTypes;
     std::unordered_set<std::string> scopedEnumTypes_;
+    // Bare enumerator name -> its imported C++ scoped enum; diagnostic hint only, never bound.
+    std::unordered_map<std::string, std::string> scopedCppEnumeratorHints_;
     // Unscoped C++ enum -> CFlat name of its integral promotion type ([conv.prom]/3-4).
     std::unordered_map<std::string, std::string> enumPromotedTypes_;
     // Declaration sites (file:line:col) an enum key was registered from. Both passes and a
@@ -3911,6 +3913,8 @@ private:
         std::string error;
     };
     std::unordered_map<std::string, CxxDefaultWrapperRequest> cxxDefaultWrapperRequests_;
+    // `X&& r = source;` verdicts from clang, keyed "<source param spelling>|<X spelling>".
+    std::unordered_map<std::string, std::pair<bool, std::string>> cxxRvalueRefBindVerdicts_;
     void RememberCxxDefaultWrapper(const std::string& owner, const std::string& linkage,
                                   size_t arity, bool member);
     bool EnsureCxxDefaultWrapper(const std::string& name);
@@ -6988,6 +6992,24 @@ public:
     void RegisterFunctionTypeAlias(const std::string& alias, const TypeAndValue& target);
 
     std::string ResolveTypeAlias(const std::string& name) const;
+    /*
+     * `Owner.name` in type position: the member type `name` of record `owner` - a CFlat
+     * aggregate's `using` alias or nested aggregate, or a C++ record's member typedef / nested
+     * type (requested lazily from clang, once per name). `owner` is a resolved type key
+     * (`Box$int`, `t37.vec$int`). Returns the resolved type spelling, or "" with `result` saying why.
+     */
+    enum class MemberTypeResult { Found, NotFound, NotAType, NotARecord };
+    std::string ResolveMemberType(const std::string& owner, const std::string& member,
+                                  MemberTypeResult& result);
+    // The diagnostic for a failed ResolveMemberType; `ownerDisplay` is the owner as written.
+    std::string MemberTypeErrorMessage(const std::string& ownerDisplay, const std::string& member,
+                                       MemberTypeResult result);
+    // Collects the `using` members of a CFlat aggregate whose body was not walked yet (a queued
+    // generic instantiation); installed by the pass that owns the template contexts.
+    std::function<bool(const std::string&)> ensureAggregateAliases_;
+    // Field / method names of an aggregate collected by that hook before its body is walked, so a
+    // value member still reads "not a type" rather than "no member type".
+    std::unordered_map<std::string, std::unordered_set<std::string>> aggregateValueMembers_;
     bool IsImplicitIntegerPointeePointerConversion(const TypeAndValue& from,
                                                     const TypeAndValue& to) const;
     void RejectImplicitIntegerPointeePointerConversion(const TypeAndValue& from,
@@ -7044,7 +7066,13 @@ public:
     void PushAliasScope();
     AliasScopeFrame PopAliasScope();
     void PushAggregateAliasScope(const std::string& aggregateName);
-    void SaveAggregateAliasScope(const std::string& aggregateName);
+    // `provisional`: saved by the forward-ref scan; ResolveMemberType re-collects it through
+    // ensureAggregateAliases_ when the main pass can (an authoritative save clears the mark).
+    void SaveAggregateAliasScope(const std::string& aggregateName, bool provisional = false);
+    std::unordered_set<std::string> provisionalAggregateAliasScopes_;
+    // Every member name some saved aggregate frame defines: the dotted ResolveTypeAlias fallback
+    // runs only for those, so ordinary dotted misses (C++ paths) stay as cheap as before.
+    std::unordered_set<std::string> aggregateAliasMemberNames_;
     bool AliasInCurrentScope(const std::string& alias) const;
 
     class AliasScopeGuard
@@ -9317,6 +9345,14 @@ public:
             return param.IsCxxConstRef || param.IsRvalueRef;
         return !param.Pointer;
     }
+    // A non-rvalue argument of a type NOT reference-related to the `X&&` parameter's class that
+    // converts through a non-explicit converting ctor: the bound temporary is the rvalue.
+    bool IsCxxConvertingTemporaryForRvalueRef(const NamedVariable& arg, const TypeAndValue& param,
+                                              bool allowTemplateClassConversion);
+    std::string CxxRvalueRefBindKey(const NamedVariable& arg, const TypeAndValue& param,
+                                    std::string& parameter, std::string& targetSpelling);
+    // Clang's refusal of a probed `X&& r = source;`, empty when not probed or it binds.
+    std::string CxxRvalueRefBindRefusal(const NamedVariable& arg, const TypeAndValue& param);
     bool CanImplicitlyConstructCxxClass(const NamedVariable& arg,
                                          const TypeAndValue& param,
                                          bool cxxByValueParam = false,
@@ -9630,6 +9666,7 @@ public:
     // `staticOnly`: and no non-static overload shares the name.
     bool IsCxxStaticMethod(const std::string& typeName, const std::string& memberName,
                            bool staticOnly = false);
+    bool IsNonStaticMember(const std::string& typeName, const std::string& memberName);
     // C++ class member lookup for `name` in typeName or a base ([stmt.ranged] asks whether
     // begin/end are members at all, before access or viability); any member kind counts.
     bool CxxClassHasMemberNamed(const std::string& typeName, const std::string& name);
@@ -11185,6 +11222,7 @@ public:
     std::string GetEnumBackingType(const std::string& enumName) const;
     void RegisterScopedEnumType(const std::string& enumName);
     bool IsScopedEnumTypeName(const std::string& name) const;
+    std::string GetScopedCppEnumeratorHint(const std::string& name) const;
     // A global holding an integer (an imported enumerator constant), never a class object.
     bool IsIntegerGlobal(const std::string& name) const
     {
@@ -11194,6 +11232,8 @@ public:
     }
     bool IsScopedEnumMatch(const TypeAndValue& from, const TypeAndValue& to) const;
     // C++ has no implicit integer -> enumeration conversion; see the definition for the proof.
+    // Another enum's value for a C++ scoped-enum parameter: C++ has no such conversion.
+    bool CxxDistinctEnumArgument(const TypeAndValue& arg, const TypeAndValue& param) const;
     bool CxxEnumParameterRefusesArgument(const NamedVariable& arg, const TypeAndValue& argType,
                                          const TypeAndValue& param) const;
     // Renders '<enum>.<member>' as a C++ template argument; see the definition for the two rules.
@@ -11220,6 +11260,8 @@ public:
     bool TryGetEnumMemberInt(const std::string& enumSpelling, const std::string& member,
                              int64_t& out) const;
     bool TryGetScanTimeTypeSize(const std::string& typeName, int64_t& out) const;
+    bool TryGetScanTimeFieldOffset(const std::string& typeName, const std::vector<std::string>& path,
+                                   int64_t& out) const;
     bool TryGetScanTimeIntegerCast(const std::string& typeName, int64_t value, int64_t& out) const;
     bool IsNamespace(const std::string& name) const;
     bool IsImportAlias(const std::string& name) const;
@@ -11596,7 +11638,10 @@ public:
     // 210: members refused for a lazily completable nested class record its spelling.
     // 211: free-function wrapper signatures record whether the result can refer into a brace list
     //      and which brace arguments became non-trivial array/aggregate/container temporaries.
-    static constexpr int kCHeaderCacheVersion = 212;
+    // 215: enumerators of an enum in a template pattern fold from their initializers; a scoped
+    //      member enum of a specialization is completed on request (member types, T37).
+    // 217: scoped enumerators are stored only under their qualified name (T40).
+    static constexpr int kCHeaderCacheVersion = 217;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

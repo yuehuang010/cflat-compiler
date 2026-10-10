@@ -1,0 +1,10 @@
+struct OffsetTarget { int value = default; };
+struct OffsetPointer { OffsetTarget* ptr = nullptr; };
+expect_error("offsetof: field path cannot pass through pointer field 'ptr'") {
+    u64 value = offsetof(OffsetPointer, ptr.value);
+}
+struct OffsetArrayInner { char c = default; double d = default; };
+struct OffsetArray { char tag = default; OffsetArrayInner[3] items; };
+expect_error("offsetof: field path cannot pass through array field 'items'") {
+    u64 through = offsetof(OffsetArray, items.d);
+}

@@ -1470,7 +1470,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     && (((arg.TypeAndValue.IsScopedEnum
                             || IsScopedEnumTypeName(arg.TypeAndValue.TypeName))
                         && !IsScopedEnumMatch(arg.TypeAndValue, *candidateParamItr))
-                        || CxxEnumParameterRefusesArgument(arg, arg.TypeAndValue, *candidateParamItr));
+                        || CxxEnumParameterRefusesArgument(arg, arg.TypeAndValue, *candidateParamItr)
+                        || CxxDistinctEnumArgument(arg.TypeAndValue, *candidateParamItr));
 
                 // A C++ rvalue-reference parameter is address-passed like an alias, but an
                 // lvalue cannot bind it. Keep the candidate visible for the move diagnostic.
@@ -1527,8 +1528,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     implicitMatch = false;
                     break;
                 }
+                // An lvalue of an UNRELATED type binds `X&&` through the temporary a non-explicit
+                // converting constructor of X makes ([dcl.init.ref]); the temporary is the rvalue.
                 if (candidateParamItr->IsRvalueRef
-                    && !(candidate.IsCxx ? argIsCxxRvalue : IsRvalueReferenceArgument(arg)))
+                    && !(candidate.IsCxx ? argIsCxxRvalue : IsRvalueReferenceArgument(arg))
+                    && !(candidate.IsCxx && !(candidate.IsMethod && paramIndex == 0)
+                         && IsCxxConvertingTemporaryForRvalueRef(arg, *candidateParamItr,
+                                                              candidates.size() > 1)))
                 {
                     perfectMatch = false;
                     promotionMatch = false;
@@ -2325,6 +2331,14 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         }
                     }
                 }
+                // C++20 char8_t is a distinct pointer type: its UTF-8 literal exception above
+                // must not make it a char* match, and opaque LLVM pointers erase that mismatch.
+                const std::string cxxPointerArgumentType = !originalArgType.TypeName.empty()
+                    ? ResolveTypeAlias(originalArgType.TypeName) : arg.InferSourceTypeName;
+                if (candidate.IsCxx && originalArgType.Pointer && candidateParamItr->Pointer
+                    && cxxPointerArgumentType == "c8"
+                    && ResolveTypeAlias(candidateParamItr->TypeName) == "char")
+                    result = -1;
                 integerCosts.push_back(integerCost);
                 standardCosts.push_back(integerCost);
                 if (standardCosts.back() < 0 && IsNullPointerConstantArgument(arg)
@@ -3825,9 +3839,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             && !candidate.Parameters.empty()
                             && candidate.Parameters.front().TypeName == receiverType;
                     });
+            // A unique_ptr receiver borrows to its pointee, so a bound same-named pointee method
+            // would also fit `this`; the receiver's own member wins, like clang (T46).
             if (!receiverMemberCandidates.empty()
                 && (currentFreeFunctionIsCandidate || enclosingFreeFunctionIsCandidate
-                    || (receiverHasCxxMember && receiverFirstFreeFunctionIsCandidate)))
+                    || (receiverHasCxxMember && receiverFirstFreeFunctionIsCandidate)
+                    || (receiverHasCxxMember && !CxxUniquePtrPointee(receiverType).empty())))
                 candidateSet = &receiverMemberCandidates;
         }
         std::vector<FunctionSymbol> cxxOperatorCandidates;
@@ -4262,10 +4279,18 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         else if (!sibling.empty())
                             LogError(sibling);
                     }
+                    // An explicit converting ctor is the refusal, not the argument's category.
                     if (param.IsRvalueRef && !rvalue)
-                        LogErrorMessage(
-                            "parameter '{}' of '{}' is an rvalue reference; pass 'move <arg>' or a temporary",
-                            { param.VariableName, shownFunctionName });
+                    {
+                        std::string block = DescribeCxxImplicitArgumentBlock(arguments[i], param, false);
+                        if (block.empty()) block = CxxRvalueRefBindRefusal(arguments[i], param);
+                        if (!block.empty())
+                            LogError(std::format("argument {} of '{}': {}", i, shownFunctionName, block));
+                        else
+                            LogErrorMessage(
+                                "parameter '{}' of '{}' is an rvalue reference; pass 'move <arg>' or a temporary",
+                                { param.VariableName, shownFunctionName });
+                    }
                     if (param.IsAlias && !param.IsRvalueRef && !param.IsCxxConstRef && rvalue)
                         LogErrorMessage(
                             "parameter '{}' of '{}' is a non-const lvalue reference and cannot bind an rvalue; pass an lvalue",
@@ -4945,9 +4970,17 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         else if (!sibling.empty())
                             LogError(sibling);
                     }
-                    LogErrorMessage(
-                        "parameter '{}' of '{}' is an rvalue reference; pass 'move <arg>' or a temporary",
-                        { rvalueSym.Parameters[i].VariableName, shownFunctionName });
+                    std::string block = rvalueSym.IsCxx
+                        ? DescribeCxxImplicitArgumentBlock(rvalueArgs[i], rvalueSym.Parameters[i], false)
+                        : std::string();
+                    if (block.empty() && rvalueSym.IsCxx)
+                        block = CxxRvalueRefBindRefusal(rvalueArgs[i], rvalueSym.Parameters[i]);
+                    if (!block.empty())
+                        LogError(std::format("argument {} of '{}': {}", i, shownFunctionName, block));
+                    else
+                        LogErrorMessage(
+                            "parameter '{}' of '{}' is an rvalue reference; pass 'move <arg>' or a temporary",
+                            { rvalueSym.Parameters[i].VariableName, shownFunctionName });
                 }
             }
 

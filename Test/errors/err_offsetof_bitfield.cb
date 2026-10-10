@@ -1,0 +1,4 @@
+struct OffsetBits { u32 ready : 1; };
+expect_error("offsetof: bitfield member 'ready' is not allowed") {
+    u64 value = offsetof(OffsetBits, ready);
+}

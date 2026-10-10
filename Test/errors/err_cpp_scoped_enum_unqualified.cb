@@ -1,0 +1,24 @@
+import cpp "cpp_interop_scoped_enum.h";
+
+extern int main()
+{
+    expect_error("'Red' is an enumerator of scoped enum 'cppi_scope.Hue'") {
+        int bad = (int)Red;
+    }
+
+    expect_error("'Off' is an enumerator of scoped enum 'cppi_scope.Mode'") {
+        switch (0) {
+            case Off: break;
+            default: break;
+        }
+    }
+
+    expect_error("'Neg' is an enumerator of scoped enum 'cppi_scope.Sign'") {
+        cppi_scope.Sign bad = Neg;
+    }
+
+    // sizeof/alignof take the type-or-expression path; the leaked bare name used to bind there.
+    expect_error("unknown type 'Red'") {
+        int size = sizeof(Red);
+    }
+}

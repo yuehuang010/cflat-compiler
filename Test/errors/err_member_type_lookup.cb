@@ -1,0 +1,28 @@
+// `Owner.name` / `Spec<args>.name` in type position names a member TYPE: a struct `using` alias,
+// a nested aggregate, or a C++ member typedef / nested type. Lookup decides; these spellings
+// name something that is not a member type and are refused by name. Each leg is scoped.
+import cpp "cpp_t37_member_types.hpp";
+
+struct P { using Id = int; int x = default; int f() { return 1; } };
+struct Box<T> { using value_type = T; T v = default; T get() { return v; } };
+using I = int;
+
+extern int main()
+{
+    // A field and a method of a plain struct.
+    expect_error("'x' is a member of 'P' but not a type") { P.x a = 1; }
+    expect_error("'f' is a member of 'P' but not a type") { P.f b = 1; }
+    // A field and a method of a generic instantiation whose body is not walked yet.
+    expect_error("'v' is a member of 'Box<long>' but not a type") { Box<long>.v c = 1; }
+    expect_error("'get' is a member of 'Box<short>' but not a type") { Box<short>.get d = 1; }
+    // No member of that name at all.
+    expect_error("'P' has no member type named 'Nope'") { P.Nope e = 1; }
+    expect_error("'Box<int>' has no member type named 'nope'") { Box<int>.nope g = 1; }
+    // The owner is a type but not a record.
+    expect_error("'I' is not a struct or class, so 'I.x' does not name a member type") { I.x h = 1; }
+    // A C++ static data member is a value, never a type.
+    expect_error("'t37.vec<int>' has no member type named 'kind'") { t37.vec<int>.kind k = 1; }
+    // Generic argument position reports the same way.
+    expect_error("'Box<int>' has no member type named 'nope'") { Box<Box<int>.nope> m; }
+    return 0;
+}

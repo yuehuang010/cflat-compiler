@@ -727,7 +727,7 @@ static bool IsSymbolLineKeyword(const std::string& name)
         "continue", "return", "int", "float", "double", "bool", "char", "void",
         "const", "struct", "class", "interface", "enum", "true", "false", "nullptr",
         "new", "move", "import", "extern", "namespace", "static", "public", "private",
-        "protected", "sizeof", "as", "is", "in", "where"
+        "protected", "sizeof", "__builtin_offsetof", "as", "is", "in", "where"
     };
     return keywords.contains(name);
 }

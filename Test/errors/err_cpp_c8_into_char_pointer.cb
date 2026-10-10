@@ -1,0 +1,13 @@
+import cpp "cpp_t43_char_types.hpp";
+
+extern int main()
+{
+    expect_error("no overload") { int literal = t43_take_char(u8"x"); }
+    c8* p = u8"x";
+    expect_error("no overload") { int pointer = t43_take_char(p); }
+    c16* p16 = (c16*)0;
+    c32* p32 = (c32*)0;
+    expect_error("no overload") { int pointer16 = t43_take_char(p16); }
+    expect_error("no overload") { int pointer32 = t43_take_char(p32); }
+    return 0;
+}
