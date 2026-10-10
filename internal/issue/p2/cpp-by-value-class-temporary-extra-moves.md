@@ -57,3 +57,19 @@ deferred (or re-derived from the argument expression, as `ForeignCxxConstructArg
 Also (N67 review): a prvalue of a class with a DELETED move ctor (`r2.take(r2.DelMove(4))`) is refused
 on master and branch; clang accepts via guaranteed elision. Same root as above (wrapper must build the
 temporary itself).
+
+## Merged 2026-10-09: brace elements, non-template by-value calls, by-value param return (was p3)
+
+Maintainer ruling 2026-10-09: raise to p2 (clang-parity bug, not a deferral). Same root - CFlat
+materializes the prvalue in its own slot, then the wrapper moves it; C++17 elision builds it in
+place. Shapes from T63 review 2 (scratch/repro_keep/t63_rev/r2/):
+```cflat
+std.vector<pr.C> v{pr.C(30), pr.C(40)};   // clang++: 2 ctor, 2 copy, 0 move, 2 dtor
+                                          // cflat (T63): 2 ctor, 2 copy, 2 move, 4 dtor
+pr.byVal(pr.C(3));                        // non-template by-value call: clang 0 move, cflat 1
+```
+T70 review 1: `Tracked h = nid(x)` where CFlat `nid` returns its by-value C++ class parameter makes
+one extra copy (C++ implicitly moves the param into the return). Probes: scratch/repro_keep/t70_rev/
+p2.cb, p3.cb. T63's brace thunk and the by-value call wrapper share the fix (pass the ctor arguments
+through, construct inside the wrapper). Leg 9306 (test_cpp_interop.cb) deliberately does not assert
+moves - tighten it when fixed.

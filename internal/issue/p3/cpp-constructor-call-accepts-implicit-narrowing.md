@@ -40,3 +40,10 @@ See `scratch/c1_matrix_r3.md` in the main checkout. Measured on all 160 cells: m
 
 Related (T59 review 2, 2026-10-06, pre-existing): `pp.P * 3` against a free `operator*(const P&, double)` is
 refused ("no overload"); clang++ binds it (int -> double) and returns 13. Same scalar-conversion-table ruling.
+
+## Ruling (maintainer, 2026-10-09)
+Scalar conversion table at C++ call arguments, constructor AND free function alike: implicit
+WIDENING is accepted everywhere (int / short / bool / unscoped enum -> double, int -> long, ...);
+implicit NARROWING is refused (2026-09-04 rule; int -> bool the one exception). Overload
+ambiguity stays C++'s: `P4(0)` (int -> long vs pointer) remains ambiguous. Integer narrowing at
+`new` (C6 review 4) is refused under the same rule.

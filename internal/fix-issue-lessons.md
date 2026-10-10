@@ -99,6 +99,13 @@ file. `internal/testing-notes.md` holds the mechanics of the suites.
 - Cost: one round-trip each, after the fact, on work already believed finished. Requiring a
   measured pre/post pair with every equivalence claim is cheaper than any of them.
 
+- **A cached C++ request FAILURE outlives the build that wrote it.** The cheaders cache key carries
+  no build stamp, so a failed-request entry written by a work-in-progress build is replayed by every
+  later build, master included. T70 (2026-10-07): one such entry made a whole Luna isolation round
+  vacuous (every hunk "ruled out", nothing measured) and hid a real dropped `IsMove`. Bisects,
+  isolation builds and master-vs-branch comparisons on C++ interop run with a fresh empty
+  `CFLAT_CACHE_DIR`, or the comparison is meaningless.
+
 ## On changing approach vs. patching
 
 - **When site enumeration misses twice, change the method - do not add two more sites.** The
@@ -3482,3 +3489,11 @@ a more-derived object. T50 routes those conversions through a clang-generated wr
 C++. Ruled: delete Test/errors/err_cpp_virtual_base_conversion_unknown_dynamic_type.cb; its five
 shapes are positive legs 50017/50018 in Test/test_cpp_interop.cb with clang's values. The
 refusal text stays as the fallback where no wrapper can be generated (opaque member binding).
+
+## Ruling 2026-10-09: C++ entities follow C++ qualified lookup under a CFlat-extended namespace (kept from T61)
+
+`w` a C++ namespace, CFlat declares `namespace w.ext { ... }`: `w.ext.P` does NOT find C++ `w::P`
+("cannot find the type 'w.ext.P'"), matching clang (`w::ext::P` is an error when ext lacks P). Under a
+C++-rooted prefix only the exact member counts for C++ entities; CFlat entities under the same prefix
+still walk outward. A CFlat-declared segment never re-enables the outward walk for C++ entities.
+Spell it `w.P`. Never relax this to restore the pre-T61 walk.

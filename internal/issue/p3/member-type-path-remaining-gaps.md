@@ -1,6 +1,6 @@
 # Member type paths (`Spec.name`): spellings T37 left out
 
-T37 (5f7831c0, 2026-10-05) made `Spec.name` name C++ member typedefs / nested types and CFlat struct `using`
+T37 (5837c4fa, 2026-10-05) made `Spec.name` name C++ member typedefs / nested types and CFlat struct `using`
 members in every type position. These spellings still fail (all fail on master before T37 too):
 
 - Member template in the tail: `Outer<int>.Inner<long>.type`.

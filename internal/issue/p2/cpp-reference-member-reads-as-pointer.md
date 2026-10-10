@@ -48,3 +48,13 @@ Test/test_cpp_interop.cb reference-member section asserts `*refmemH.r`, `int* re
 referent, `h.r = 5` writes through) make those legs fail, so the fix needs an explicit authorization to rewrite
 exactly those legs. T47 (Luna) stopped before implementing; PRE matrix + per-site audit in worktree
 cflat-fix-t47-reffield scratch/t47_matrix.md, scratch/briefs/t47_report.md.
+
+## Ruling (maintainer, 2026-10-09) - unblocks the fix
+A C++ `T&` / `const T&` data member maps to an `alias T` field, the same as C++ `T&` returns and
+params already do (probe 2026-10-09: `q9.ref() = 5` writes through, `bump(int& v)` changes the
+caller's v; only the member was `int*`). `int a = h.r;` reads the referent, `h.r = 5;` writes
+through, `&h.r` is the referent's address; reseating stays impossible (`h.r = &y` is a type error).
+Authorized: rewrite the 3e5f2260 stopgap legs (test_cpp_interop.cb reference-member section: the
+`*refmemH.r` / `int* refmemP = refmemH.r` forms) and Test/errors/err_cpp_reference_member_reseat.cb
+to the alias semantics. Native `alias` fields are out of scope. T47 worktree cflat-fix-t47-reffield
+keeps the PRE matrix.

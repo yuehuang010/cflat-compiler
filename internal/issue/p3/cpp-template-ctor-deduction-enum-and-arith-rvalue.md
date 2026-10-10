@@ -20,7 +20,7 @@ identity `int` needs the call to widen the value to i32 before the wrapper, so i
 spelling change (CxxScalarArithmeticIdentity in MainListener_Expressions.cpp answers `int` but
 refuses it because the value is i8/i16).
 Ternary: owned by T55 (ParseTernaryBranches / ParseAssignmentExpressionNamed); re-check the cell
-(T55 landed e2970f82). T58 round 5 (b0bce9cb) now carries CxxArithIdentity through `?:` arms - re-measure.
+(T55 landed 393f0bd9). T58 round 5 (393f0bd9) now carries CxxArithIdentity through `?:` arms - re-measure.
 
 ## After T58 review 1 (2026-10-06)
 

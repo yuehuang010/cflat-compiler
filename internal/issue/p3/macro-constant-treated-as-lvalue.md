@@ -13,3 +13,7 @@ Repros: scratch/repro_keep/t52_rev/rev4_t52_p/ and rev2_t52_p/.
 Fix direction: carry the macro provenance (T52 rounds 2-4, set in ParseIdentifier) into lvalue
 checks: refuse `&` and assignment on a macro, and treat a macro as an rvalue for C++ reference
 binding (IsCxxRvalueReferenceArgument) - by identity, never by spelling (shadowing locals!).
+
+Also (T52 review 6, 2026-10-06): a ternary of zero macros is an int lvalue - `iref(c ? Z0 : Z0)`
+binds (10), `fwd(c ? Z0 : Z0)` gives 80, `lp(c ? Z0 : Z0)` passes the macro global's address (6);
+clang refuses / 90 / refuses. Probes: scratch/rev6_t52_p/.

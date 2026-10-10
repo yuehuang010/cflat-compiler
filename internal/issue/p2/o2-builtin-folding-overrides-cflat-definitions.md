@@ -51,3 +51,8 @@ So the counter legs 3359-3363/3401-3409 encode implementation-defined behaviour:
 not count global allocation calls at -O2 (or keep -O0-only), or make CFlat match clang's IR shape anyway.
 Separately the full test_cpp_interop.cb at -O2 exits 31 with heap-audit closure/string leaks, NOT localized.
 Matrix + report: scratch/repro_keep/t51/.
+
+## Ruling (maintainer, 2026-10-09) - item 2
+The optimizer may omit replaceable global operator new[] / delete[] calls ([expr.new]/14). Rewrite
+counter legs 3359-3363 / 3401-3409 so they do not count GLOBAL allocation calls at -O2 (class-scope
+allocator counts, values and destructor counts stay asserted). No change to CFlat's IR shape.

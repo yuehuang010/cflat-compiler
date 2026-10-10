@@ -17,3 +17,8 @@ extern int main() { int x = 1; g(&x); return 0; }   // compiles, prints garbage;
 Same safety ground as the 2026-09-30 integer-pointee ruling (p2/integer-pointee-pointer-conversion-accepted):
 refuse, explicit cast is the workaround. Confirm the ruling extends to integer <-> floating pointees before
 building; sweep assignment / init / return / ternary arms too (the integer-pointee issue lists the sites).
+
+## Ruling (maintainer, 2026-10-09)
+Confirmed: the 2026-09-30 integer-pointee block extends to floating pointees. `int*` -> `double*`
+(and every unrelated primitive pointee pair) is refused on the single-candidate path too; explicit
+cast is the workaround.

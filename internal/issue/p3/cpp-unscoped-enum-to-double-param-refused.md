@@ -9,3 +9,7 @@ Related (T57 review, 2026-10-06, pre-existing): native calls accept an imported 
 (`SC` variable, and after T57 also `(SC)200`) into an int / u8 / C++ unscoped-enum / native-enum
 parameter; clang++ refuses implicit conversion from a scoped enum. Calls into C++ refuse it on master
 and T57. Belongs to the same scalar-conversion-table ruling.
+
+## Ruling (maintainer, 2026-10-09)
+Covered by the scalar conversion table ruling in p3/cpp-constructor-call-accepts-implicit-narrowing:
+widening accepted, so unscoped enum -> double binds. Fix together with that issue.
