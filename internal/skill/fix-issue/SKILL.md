@@ -277,9 +277,9 @@ If the agent fails or flails at `sonnet`, escalate ONCE to `opus` with the failu
 context appended - do not retry the same tier verbatim, and do not absorb the work
 into the main session.
 
-## Step 3 - Review loop (max 3 rounds, alternating reviewer)
+## Step 3 - Review loop (escalate on recurrence, alternating reviewer)
 
-After the fix agent reports success, review the diff for up to 3 rounds (batch mode: one
+After the fix agent reports success, review the diff until no blocking finding remains (batch mode: one
 round, scoped as described under "Two modes").
 
 **Scope the reviewer to the change's blast radius.** The neighbour-axis probe matrix is the
@@ -312,9 +312,10 @@ path.
 
 For an opus round: spawn (round 1 under fallback, or round 2) or continue via
 SendMessage (any later opus round) a code-review agent at **opus** in the
-worktree. For a codex round: run, in the worktree,
-`codex exec -m gpt-6.1-sol -c model_reasoning_effort="medium" "<prompt>"` - codex
-reviews always use Sol 6.1 at medium effort (maintainer, 2026-10-01); Luna is for codex implementers only.
+worktree. Reviewer pairing (maintainer, 2026-10-05, token cost): Luna implements -> opus reviews;
+opus implements (escalation) -> a fresh opus reviews. No Sol reviews unless the maintainer asks for
+one on a specific item; then run `codex exec -m gpt-6.1-sol -c model_reasoning_effort="medium"
+"<prompt>"` in the worktree. Luna never reviews.
 Either way, the reviewer for that round reviews `git diff master...HEAD` in
 that worktree for correctness bugs, and for the CLAUDE.md constraints listed
 above. Give it the fix agent's coverage matrix and ask it to audit the matrix,
@@ -419,9 +420,15 @@ Reviewer-applied fixes and their verification rounds count against the same
   (`git diff --stat` shows no `.h`/`.cpp`/`.cb` touched), the bar re-run is
   skipped, same as in Step 2 - say so in the report. Correctness findings and
   false claims in a tracked record follow the non-trivial path above.
-- Repeat until the review is clean or 3 rounds have elapsed.
-- If still not clean after 3 rounds, STOP. Do not merge. Report the outstanding
-  findings and leave the worktree in place for the user.
+- **Classify every finding** (ruling 2026-10-05): REGRESSION (master right, branch wrong),
+  INCOMPLETE (the change's own claimed shape still wrong), or PRE-EXISTING (master equally
+  wrong, adjacent shape). Only the first two go back to the branch. PRE-EXISTING is filed as an
+  issue and does not block landing, unless it is a one-site twin of the fix.
+- Repeat until the review has no blocking finding. No fixed round cap: escalate on RECURRENCE,
+  not round count. A finding that survives one fix round -> the main session adds a fix sketch
+  (sites, direction) to the next brief, same implementer; or escalates to opus if the root
+  cause is unclear. A finding that survives two fix rounds -> STOP: park it (issue file
+  status) or escalate; do not dispatch the same implementer again on it.
 
 ## Step 4 - Merge back to master (single parent)
 
@@ -456,12 +463,20 @@ force anything.
   tracked, include the deletion in the merge - if the fix agent did not delete
   it, do it before the fast-forward. If it was untracked, just `rm` it from the
   main checkout now.
-- Remove the worktree and branch:
+- Remove the worktree and branch - MANDATORY, in the same turn as the ff-merge and the Queue
+  bookkeeping commit, before dispatching the next run (2026-10-06: 33 merged worktrees had piled
+  up and filled the disk). First copy anything worth keeping (reviewer probes cited by an issue
+  file) to `scratch/repro_keep/<prefix>/` in the main checkout. A dropped batch member's or a
+  parked run's worktree stays until the item lands or is abandoned; note it in the resume file.
 
 ```bash
 git worktree remove ../cflat-fix-<slug>
 git branch -d fix/<slug>
 ```
+
+  Stale check at every box start/resume: `git worktree list`; a `cflat-fix-*` tree whose
+  branch is not In flight or parked in Queue.md is removed (verify it landed by grepping the
+  tests its tip commit added on master - after a squash its commits are not ancestors).
 
 - **Rebuild the main checkout at the merged HEAD and re-run the full bar there**
   (`./cmake_build.sh release && ./test.sh Release && bash test_example.sh Release`).

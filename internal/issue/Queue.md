@@ -204,6 +204,7 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 | p3/cpp-enum-cast-operand-and-optional-enum-assign | (none) | `mk == (std.errc)22` refused with an internal wrapper name; optional<enum> assignment; std.numbers message |
 | p2/pointer-to-unrelated-primitive-pointee-accepted | (none) | single g(double*) accepts int* silently (clang refuses); confirm integer-pointee ruling extends to floating pointees |
 | p3/cpp-template-deduction-identifier-with-e-read-as-double | (C++ interop) | `1 + abcer + 1` deduces double (text-classified literal); fix by source type, never text |
+| p3/cpp-template-deduction-from-signed-enum-deduces-int | (C++ interop) | `deduce(rv.U.v)` with `enum U : int` deduces T=int (clang: U); deduce from source enum identity |
 | p3/float-literal-plus-variable-computed-in-float | (C++ interop) | `i + 1.0` / `f + 1.0` typed float (clang double); check CFlat literal rule first |
 | p3/generic-overload-not-joining-concrete-overload-set | (none) | generic f<T>(T*) never joins concrete overloads; 12 clang-valid calls refused |
 | p3/cpp-scoped-enumerator-case-label-if-const-alias | (C++ interop) | qualified scoped C++ enumerators fail in case labels / if const / via enum alias |

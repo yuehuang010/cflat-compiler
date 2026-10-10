@@ -3461,3 +3461,14 @@ header content so later compiles parse just those bodies in place on their first
 Detector rules that matter: member bodies are measured from the outermost class `}`; builtins / implicit decls
 and declarations inside the body itself never count; a callee's position is its earliest redeclaration
 (primary template / member pattern); a later using-declaration counts.
+
+## Ruling 2026-10-05: review findings are classified; escalate on recurrence, not round count
+
+Replaces the fixed "after round 3, opus finishes" ladder. Fix box 2026-10-05 evidence: most NOT
+CLEAN verdicts were adjacent gaps master shares (T50 P1/P2s, T49 P2, T45 third P2), not defects
+in the fix; sending them back added rounds, and a tier switch cannot help with those.
+Every finding is REGRESSION, INCOMPLETE (the change's claimed shape) or PRE-EXISTING. Only the
+first two block; PRE-EXISTING is filed (unless a one-site twin of the fix). Same implementer
+keeps going while each round clears its findings; from round 2 the main session adds a fix
+sketch to the brief. A finding surviving one fix round -> sketch or opus (root cause unclear);
+surviving two -> park or escalate. Reviewers state the class per finding.
