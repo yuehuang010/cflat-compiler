@@ -1936,6 +1936,10 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
                     bool expressionStart = token.is(clang::tok::numeric_constant)
                         || token.is(clang::tok::string_literal)
                         || token.is(clang::tok::char_constant)
+                        || token.is(clang::tok::coloncolon)
+                        || token.is(clang::tok::star)
+                        || token.is(clang::tok::amp)
+                        || token.is(clang::tok::l_square)
                         || token.is(clang::tok::plusplus)
                         || token.is(clang::tok::minusminus)
                         || token.is(clang::tok::l_paren)
@@ -1944,6 +1948,14 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
                         || token.is(clang::tok::kw_true)
                         || token.is(clang::tok::kw_false)
                         || token.is(clang::tok::kw_nullptr)
+                        || token.is(clang::tok::kw_sizeof)
+                        || token.is(clang::tok::kw_static_cast)
+                        || token.is(clang::tok::kw_dynamic_cast)
+                        || token.is(clang::tok::kw_reinterpret_cast)
+                        || token.is(clang::tok::kw_const_cast)
+                        || token.is(clang::tok::kw_typeid)
+                        || token.is(clang::tok::kw_alignof)
+                        || token.is(clang::tok::kw_noexcept)
                         || token.is(clang::tok::kw_new)
                         || token.is(clang::tok::kw_delete)
                         || token.is(clang::tok::kw_throw)
@@ -1955,6 +1967,9 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
                         || token.is(clang::tok::kw_do)
                         || token.is(clang::tok::kw_try)
                         || token.is(clang::tok::kw_goto);
+                    // Macro expansions can start an expression without exposing its spelling at
+                    // this location; use standard parsing for that namespace-scope construct.
+                    if (token.getLocation().isMacroID()) expressionStart = true;
                     if (token.is(clang::tok::identifier) && token.getLocation().isFileID())
                     {
                         clang::SourceManager& sourceManager = pp.getSourceManager();
@@ -1967,13 +1982,14 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
                                && (rest.front() == ' ' || rest.front() == '\t'
                                    || rest.front() == '\r' || rest.front() == '\n'))
                             rest = rest.drop_front();
-                        expressionStart = !rest.empty()
-                            && (rest.front() == '(' || rest.front() == '[' || rest.front() == '.'
+                        expressionStart = rest.empty() || rest.front() == ':'
+                            || (rest.front() == '(' || rest.front() == '[' || rest.front() == '.'
                                 || rest.front() == '?' || rest.front() == '=' || rest.front() == '+'
                                 || rest.front() == '-'
                                 || rest.front() == '*' || rest.front() == '/' || rest.front() == '%'
                                 || rest.front() == '&' || rest.front() == '|'
-                                || rest.front() == '^');
+                                || rest.front() == '^' || rest.front() == '!' || rest.front() == ','
+                                || rest.front() == '}');
                     }
                     if (expressionStart)
                     {

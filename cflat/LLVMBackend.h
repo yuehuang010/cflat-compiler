@@ -12111,6 +12111,7 @@ public:
 
     bool Analyze(const std::string& filePath, const std::vector<std::string>& importDirs, const std::string& runtimeDirPath);
     void ResetForReanalysis();
+    void DiscardOptimizedViewState();
     bool PrintModuleView(std::string& out, const std::string& kind, int optLevel,
                          const std::string& functionName,
                          bool wholeModule = false,

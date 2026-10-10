@@ -4691,6 +4691,13 @@ bool LLVMBackend::LastOptimizedViewWasIncremental() const
     return optimizedViewWasIncremental_;
 }
 
+void LLVMBackend::DiscardOptimizedViewState()
+{
+    optimizedViewCache_ = OptimizedViewCache{};
+    incrementalViewSnapshot_.reset();
+    optimizedViewWasIncremental_ = false;
+}
+
 void LLVMBackend::ResetForReanalysis()
 {
     JoinCHeaderDiskCacheWriters();

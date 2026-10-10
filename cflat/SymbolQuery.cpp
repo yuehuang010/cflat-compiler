@@ -1352,10 +1352,15 @@ int RunSymbolDumpIrQuery(ArgParser& args, const std::string& runtimeDir)
         compiler.SetSymbolSink(nullptr);
         const std::string analyzedFile = compiler.GetSourceFilePath();
         if (!analysisOk)
+        {
             ++failures;
+            compiler.DiscardOptimizedViewState();
+        }
 
         for (const auto& parsed : parsedQueries)
         {
+            if (!analysisOk && parsed.query.optionName == "--symbol-dump-opt")
+                continue;
             for (size_t selectorIndex = 0; selectorIndex < parsed.selectors.size(); ++selectorIndex)
             {
                 const auto& selector = parsed.selectors[selectorIndex];

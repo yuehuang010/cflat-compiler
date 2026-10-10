@@ -1,0 +1,3 @@
+// Expression-shaped namespace statements must produce clang diagnostics rather than a Sema crash.
+expect_error("clang:");
+import cpp "cpp_namespace_stmt_crash_shapes.h";

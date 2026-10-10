@@ -822,6 +822,23 @@ else
 fi
 fi
 
+# --symbol-dump-opt over a file that fails analysis, then a clean file: rc 1, never a crash (T65).
+if [ "$RUN_MODE" -eq 0 ]; then
+dumpopt_name="symbol_dump_opt_after_error"
+dumpopt_log="$RES/$dumpopt_name.log"
+dumpopt_t0=$(now_ms)
+$TIMEOUT "$CFLAT" "$SRC/errors/err_switch_case_range.cb" "$SRC/test_basic.cb" -i "$LIB" \
+    --locale-dir "$LOCALE_DIR" --symbol-dump-opt module >"$dumpopt_log" 2>&1
+dumpopt_rc=$?
+if [ "$dumpopt_rc" -ne 1 ]; then
+  write_result "$dumpopt_name" "FAIL: rc $dumpopt_rc (expected 1)" "$dumpopt_t0"
+elif ! grep -q "define" "$dumpopt_log"; then
+  write_result "$dumpopt_name" "FAIL: clean file printed no optimized IR" "$dumpopt_t0"
+else
+  write_result "$dumpopt_name" "PASS" "$dumpopt_t0"
+fi
+fi
+
 # Darwin debug-info tooling: -g must leave source lines reachable through either a dSYM
 # or the retained object when dsymutil is unavailable.
 if [ "$RUN_MODE" -eq 0 ] && [ "$(uname -s)" = "Darwin" ] \
