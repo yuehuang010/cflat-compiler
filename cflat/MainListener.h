@@ -34,6 +34,7 @@
 #include <cmath>
 #include <charconv>
 #include <cassert>
+#include <vector>
 
 #include "platform/GeneratedParser.h"
 #include "LLVMBackend.h"
@@ -3778,7 +3779,13 @@ private:
 
     // amount, pointer-stride element type, and (union member only) the type to load/store the
     // storage as - a union member's Storage is the union alloca, so the inferred type is wrong.
-    struct IncrementWork { int Amount = 0; llvm::Type* ElemType = nullptr; llvm::Type* LoadType = nullptr; };
+    struct IncrementWork
+    {
+        int Amount = 0;
+        llvm::Type* ElemType = nullptr;
+        llvm::Type* LoadType = nullptr;
+        std::vector<int> FloatingSteps;
+    };
     std::unordered_map<llvm::Value*, IncrementWork> PlusPlus;
     /*
      * Isolates postfix work created while lowering a conditional operand or user call arguments.
@@ -3806,6 +3813,8 @@ private:
             {
                 auto& outer = self->PlusPlus[destination];
                 outer.Amount += w.Amount;
+                outer.FloatingSteps.insert(outer.FloatingSteps.end(),
+                                           w.FloatingSteps.begin(), w.FloatingSteps.end());
                 if (outer.ElemType == nullptr) outer.ElemType = w.ElemType;
                 if (outer.LoadType == nullptr) outer.LoadType = w.LoadType;
             }
@@ -4349,7 +4358,6 @@ private:
     llvm::Value* GenerateDefaultValue(const LLVMBackend::DeclTypeAndValue& typeValue);
     bool EmitNontrivialCxxDefaultAt(llvm::Value* destination,
                                    const LLVMBackend::DeclTypeAndValue& typeValue);
-    bool HasUnavailableNestedCxxDefault(const std::string& typeName);
 
     // Constant value of a type's default construction, or nullptr when it is not constant.
     llvm::Constant* TryFoldGlobalDefaultConstruction(const LLVMBackend::DeclTypeAndValue& typeValue);
@@ -6362,6 +6370,7 @@ public:
     LLVMBackend::TypedValue ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx,
                                                   ResultUse use = ResultUse::Value);
 
+    void LogVoidPointerArithmetic(antlr4::ParserRuleContext* ctx);
     LLVMBackend::TypedValue ParseAdditiveExpression(CFlatParser::AdditiveExpressionContext* ctx,
                                                      ResultUse use = ResultUse::Value);
 
@@ -6508,7 +6517,11 @@ public:
         const std::string& rhsFieldName = std::string(), bool rhsIsElementAccess = false,
         const std::vector<LLVMBackend::ConditionalMoveSource>& lhsConditionalMoves = {},
         const std::vector<LLVMBackend::ConditionalMoveSource>& rhsConditionalMoves = {},
-        bool rhsCxxPointeeConst = false);
+        bool rhsCxxPointeeConst = false,
+        // NamedVariable::CxxArithIdentity of each operand (`1e3 + 1` is C++ double), for
+        // operator-template deduction.
+        const std::string& lhsArithIdentity = std::string(),
+        const std::string& rhsArithIdentity = std::string());
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);
@@ -6545,6 +6558,7 @@ public:
     struct UnevaluatedOperandType
     {
         LLVMBackend::TypeAndValue Type;
+        std::string SourceTypeName;
         llvm::Type* ValueType = nullptr;  // type of the operand's value (Primary), if any
         llvm::Type* BaseType = nullptr;
         bool HasValue = false;
@@ -6980,8 +6994,23 @@ public:
     // is in the set. This restricts if-const folding to true compile-time constants (const scalars,
     // enum members) and excludes mutable globals. When null, any global with a const-int initializer
     // folds (the original behavior, used by EvalGlobalArrayDim).
+    // Where a speculative constant evaluation starts emitting, so the IR it emitted can be audited.
+    struct EmissionMark
+    {
+        llvm::BasicBlock* Block = nullptr;
+        llvm::Instruction* Last = nullptr;       // last instruction of Block before the evaluation
+        llvm::BasicBlock* LastBlock = nullptr;   // last block of the function before the evaluation
+        llvm::Instruction* EntryFirst = nullptr; // entry-block front; AllocaAtEntry inserts above it
+    };
+    static EmissionMark MarkEmission(llvm::IRBuilderBase& builder);
+    // True when the IR emitted since `mark` writes memory that outlives the evaluation (a global,
+    // a pre-existing local) or calls a function: a constant expression has neither.
+    static bool EmittedSideEffect(const EmissionMark& mark);
+
+    // extraGlobals (optional): a second admitted set (imported C/C++ enumerator globals).
     static bool TryFoldConstInt(llvm::Value* v, uint64_t& out,
-                                const std::unordered_set<std::string>* constGlobals = nullptr);
+                                const std::unordered_set<std::string>* constGlobals = nullptr,
+                                const std::unordered_set<std::string>* extraGlobals = nullptr);
 
     // Resolve a GLOBAL array dimension to a compile-time constant. The size IR is built inside
     // a throwaway function so its loads/arithmetic never leak into the program-init block, then

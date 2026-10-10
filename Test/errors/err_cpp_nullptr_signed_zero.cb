@@ -1,0 +1,18 @@
+// +0 / -0 are expressions, not null pointer constants: clang refuses them for a nullptr_t ctor.
+import cpp "cpp_t48_nullptr.hpp";
+extern int main()
+{
+    expect_error("no overload") {
+        int a = cpi_t48.rn(+0);
+    }
+    expect_error("no overload") {
+        int b = cpi_t48.rn(-0);
+    }
+    expect_error("no overload") {
+        int c = cpi_t48.fp(+0);
+    }
+    expect_error("no overload") {
+        int d = cpi_t48.fp(-0);
+    }
+    return 0;
+}

@@ -580,8 +580,18 @@ llvm::Value* LLVMBackend::CreateIncrement(llvm::Value* destination, int amount, 
             return builder->CreateStore(newPtr, destination);
         }
 
-        auto value = llvm::ConstantInt::getSigned(loadInst->getType(), amount);
-        auto newValue = CreateOperation(Operation::Add, loadInst, value);
+        llvm::Value* newValue = nullptr;
+        if (loadInst->getType()->isFloatingPointTy())
+        {
+            const auto magnitude = amount < 0 ? -static_cast<int64_t>(amount) : amount;
+            auto* value = llvm::ConstantFP::get(loadInst->getType(), static_cast<double>(magnitude));
+            newValue = CreateOperation(amount < 0 ? Operation::Subtract : Operation::Add, loadInst, value);
+        }
+        else
+        {
+            auto* value = llvm::ConstantInt::getSigned(loadInst->getType(), amount);
+            newValue = CreateOperation(Operation::Add, loadInst, value);
+        }
         return builder->CreateStore(newValue, destination);
     }
 

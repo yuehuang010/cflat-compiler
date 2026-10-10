@@ -1,0 +1,21 @@
+// T45 round 2: an enum initializer that assigns a global folds to a value but writes memory -
+// not a constant expression (it used to compile and silently drop the store).
+int t45Written = 0;
+expect_error("enum value must be a constant integer expression")
+{
+    enum T45Assign : int { Value = (t45Written = 5) };
+}
+
+// Round 3: a local enum assigning a local declared before it is not constant either.
+int T45ExistingLocalEnum()
+{
+    int x;
+    expect_error("enum value must be a constant integer expression");
+    enum T45LocalAssign : int { Value = (x = 5) };
+    return x;
+}
+
+extern int main()
+{
+    return t45Written;
+}

@@ -1,6 +1,7 @@
 // Grouped C++ import: the group form accepts lib/define clauses like the single form.
 import cpp { "cpp_interop_tpl.h", "vector" };
 import cpp "cpp_interop_ctorref.h";
+import cpp "cpp_t63_brace_decl.hpp";
 
 expect_error("no instantiation of C++ function template 'cppt.twice' accepts these argument types") {
     extern int main()
@@ -56,5 +57,49 @@ expect_error("no C++ constructor of 'cppcr.BrcDfOnly<long>' accepts this brace l
     int default_deduce_probe()
     {
         return cppcr.BrcDfOnly<long>({2, 3}).which;
+    }
+}
+
+// A declaration brace list obeys C++ list-init narrowing (clang -Wc++11-narrowing is an error).
+expect_error("C++ brace constructor call 'std.vector<int>' does not match (clang: type 'double' cannot be narrowed") {
+    int decl_double_probe()
+    {
+        std.vector<int> v{1.7, 2};
+        return v[0];
+    }
+}
+
+// i64, not long: CFlat long is 32-bit on Windows, where long -> int does not narrow.
+expect_error("non-constant-expression cannot be narrowed from type") {
+    int decl_long_variable_probe(i64 l)
+    {
+        std.vector<int> v{l, 2};
+        return v[0];
+    }
+}
+
+// A constant element narrows only when its value does not fit (70000 into short).
+expect_error("constant expression evaluates to 70000 which cannot be narrowed") {
+    int decl_constant_probe()
+    {
+        std.vector<short> v{70000, 2};
+        return v[0];
+    }
+}
+
+expect_error("constant expression evaluates to 5000000000 which cannot be narrowed") {
+    int decl_long_literal_probe()
+    {
+        std.vector<int> v{5000000000L};
+        return v[0];
+    }
+}
+
+// `T v = {..}` is copy-list-init: an explicit selected constructor is refused (direct `T v{..}` is not).
+expect_error("chosen constructor is explicit in copy-initialization") {
+    int decl_copy_list_explicit_probe()
+    {
+        t63.ExplicitOnly e = {2, 5};
+        return e.first;
     }
 }

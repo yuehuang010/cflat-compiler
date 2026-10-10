@@ -318,15 +318,26 @@ void MainListener::CollectCasesFromStatement(CFlatParser::StatementContext* stmt
                 if (ctx.isTypeSwitch)
                     LogErrorContext(labeled, "cannot mix constant cases with type cases in a switch");
 
-                auto typedVal = ParseConditionalExpression(constExpr->conditionalExpression());
+                const EmissionMark caseMark = MarkEmission(*compiler->builder);
+                bool pendingPostfix = false;
+                LLVMBackend::TypedValue typedVal;
+                {
+                    // A postfix ++/-- is deferred to the statement's end; isolate it so it is seen.
+                    PendingPostfixScope postfixScope(this);
+                    typedVal = ParseConditionalExpression(constExpr->conditionalExpression());
+                    pendingPostfix = !PlusPlus.empty();
+                }
                 llvm::Value* rawVal = typedVal.value;
-                auto* val = llvm::dyn_cast<llvm::ConstantInt>(rawVal);
+                // `case (int)E.A++:` folds to the old value but writes the enumerator: not constant.
+                if (pendingPostfix || EmittedSideEffect(caseMark)) rawVal = nullptr;
+                auto* val = llvm::dyn_cast_or_null<llvm::ConstantInt>(rawVal);
                 // An enum member (or a const global) reads back as a load from a constant global,
                 // not a ConstantInt; fold it with the same lookup `if const` uses.
                 if (!val && rawVal != nullptr && rawVal->getType()->isIntegerTy())
                 {
                     uint64_t folded = 0;
-                    if (TryFoldConstInt(rawVal, folded, &constFoldableGlobals_))
+                    if (TryFoldConstInt(rawVal, folded, &constFoldableGlobals_,
+                                        &compiler->ImportedEnumeratorGlobals()))
                     {
                         val = llvm::cast<llvm::ConstantInt>(llvm::ConstantInt::get(
                             llvm::cast<llvm::IntegerType>(rawVal->getType()), folded, true));
@@ -347,7 +358,7 @@ void MainListener::CollectCasesFromStatement(CFlatParser::StatementContext* stmt
                 llvm::Constant* strLit = nullptr;
                 if (!val)
                 {
-                    strLit = llvm::dyn_cast<llvm::Constant>(rawVal);
+                    strLit = llvm::dyn_cast_or_null<llvm::Constant>(rawVal);
                     if (strLit && compiler->IsStringLiteralConstant(strLit))
                         ctx.isStringSwitch = true;
                     else
@@ -2536,6 +2547,14 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 || returnedFatFrameSlot != nullptr))
         {
             const std::string& ifaceName = compiler->currentFunctionReturnTypeName;
+            // An interface return takes the boxed object over; a pointer-arithmetic result names
+            // no object of its own. Refused before boxing (LogErrorContext throws).
+            if (returnNV.IsPointerArithmeticResult)
+                LogErrorContext(errCtx, std::format(
+                    "cannot convert this expression to interface '{}': a pointer arithmetic "
+                    "result is not returned as an interface; bind it to a local variable of "
+                    "the class type first", SpellType(*compiler,
+                        LLVMBackend::TypeAndValue{ .TypeName = ifaceName })));
             std::string structName = ReturnUpcastStructName(returnNV);
 
             if (returnedFatFrameSlot != nullptr)
@@ -2650,7 +2669,10 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         compiler->RejectImplicitIntegerPointeePointerConversion(
             returnNV.TypeAndValue, compiler->currentFunctionReturnTV);
         compiler->CreateReturnCall(right, retStorage, interfaceReturnStructName,
-                                   returnNV.TypeAndValue.IsUnsignedInteger() != -1);
+                                   returnNV.TypeAndValue.IsUnsignedInteger() != -1,
+                                   returnNV.InferSourceTypeName.empty()
+                                       ? returnNV.TypeAndValue.TypeName
+                                       : returnNV.InferSourceTypeName);
     }
 
 void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
@@ -4912,6 +4934,71 @@ IfConstEvaluator MainListener::SinkIfConstEvaluator() {
         return [this](CFlatParser::ExpressionContext* e) { return EvaluateIfConstForSink(e); };
     }
 
+MainListener::EmissionMark MainListener::MarkEmission(llvm::IRBuilderBase& builder) {
+        // O(1): positions only, so an audit costs the size of the region, never the function.
+        EmissionMark mark;
+        mark.Block = builder.GetInsertBlock();
+        if (mark.Block == nullptr || mark.Block->getParent() == nullptr) return mark;
+        mark.Last = mark.Block->empty() ? nullptr : &mark.Block->back();
+        llvm::Function* fn = mark.Block->getParent();
+        mark.LastBlock = &fn->back();
+        llvm::BasicBlock& entry = fn->getEntryBlock();
+        mark.EntryFirst = entry.empty() ? nullptr : &entry.front();
+        return mark;
+    }
+
+bool MainListener::EmittedSideEffect(const EmissionMark& mark) {
+        if (mark.Block == nullptr || mark.Block->getParent() == nullptr) return false;
+        llvm::Function* fn = mark.Block->getParent();
+        // The region: Block after Last, every block appended after LastBlock, and the allocas
+        // AllocaAtEntry put at the entry front (above EntryFirst) while the region was open.
+        std::vector<llvm::Instruction*> region;
+        auto from = mark.Last != nullptr ? std::next(mark.Last->getIterator()) : mark.Block->begin();
+        for (auto it = from; it != mark.Block->end(); ++it) region.push_back(&*it);
+        if (mark.LastBlock != nullptr)
+            for (auto bb = std::next(mark.LastBlock->getIterator()); bb != fn->end(); ++bb)
+                if (&*bb != mark.Block)
+                    for (auto& inst : *bb) region.push_back(&inst);
+        std::unordered_set<const llvm::AllocaInst*> created;
+        if (mark.EntryFirst != nullptr && mark.EntryFirst->getParent() == &fn->getEntryBlock())
+            for (auto& inst : fn->getEntryBlock())
+            {
+                if (&inst == mark.EntryFirst) break;
+                if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(&inst)) created.insert(slot);
+            }
+        for (auto* inst : region)
+            if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(inst)) created.insert(slot);
+        std::unordered_set<const llvm::Instruction*> inRegion(region.begin(), region.end());
+        // Scratch = a slot the evaluation itself created (never a local declared before it, whose
+        // later uses are not emitted yet), every user inside the region.
+        auto isScratchSlot = [&](const llvm::Value* ptr) {
+            auto* slot = llvm::dyn_cast<llvm::AllocaInst>(ptr->stripPointerCasts());
+            if (slot == nullptr || !created.count(slot)) return false;
+            for (const auto* user : slot->users())
+            {
+                auto* ui = llvm::dyn_cast<llvm::Instruction>(user);
+                if (ui == nullptr || (!inRegion.count(ui) && !llvm::isa<llvm::IntrinsicInst>(ui)))
+                    return false;
+            }
+            return true;
+        };
+        for (auto* inst : region)
+        {
+            if (!inst->mayHaveSideEffects()) continue;
+            if (auto* store = llvm::dyn_cast<llvm::StoreInst>(inst))
+            {
+                if (isScratchSlot(store->getPointerOperand())) continue;
+                return true;
+            }
+            if (auto* intrinsic = llvm::dyn_cast<llvm::IntrinsicInst>(inst))
+                if (intrinsic->isLifetimeStartOrEnd() || llvm::isa<llvm::DbgInfoIntrinsic>(intrinsic)
+                    || intrinsic->getIntrinsicID() == llvm::Intrinsic::assume)
+                    continue;
+            return true;
+        }
+        return false;
+    }
+
 std::optional<int64_t> MainListener::EmitAndFoldIfConstLeaf(antlr4::tree::ParseTree* node, bool forceScratch, bool suppress) {
         if (node == nullptr) return std::nullopt;
         auto* compiler = Compiler();
@@ -4934,10 +5021,19 @@ std::optional<int64_t> MainListener::EmitAndFoldIfConstLeaf(antlr4::tree::ParseT
         // still points at the last, already-terminated block of the previously emitted function.
         if (!forceScratch && compiler->IsInsertBlockLive())
         {
-            llvm::Value* v = EmitIfConstLeafValue(node);
+            const EmissionMark mark = MarkEmission(*compiler->builder);
+            llvm::Value* v = nullptr;
+            bool pendingPostfix = false;
+            {
+                PendingPostfixScope postfixScope(this);
+                v = EmitIfConstLeafValue(node);
+                pendingPostfix = !PlusPlus.empty();
+            }
+            if (pendingPostfix || EmittedSideEffect(mark)) return std::nullopt;
             admitConstGlobal(v);
             uint64_t folded = 0;
-            if (v && TryFoldConstInt(v, folded, &constFoldableGlobals_))
+            if (v && TryFoldConstInt(v, folded, &constFoldableGlobals_,
+                                             &compiler->ImportedEnumeratorGlobals()))
                 return (int64_t)folded;
             return std::nullopt;
         }
@@ -4961,10 +5057,18 @@ std::optional<int64_t> MainListener::EmitAndFoldIfConstLeaf(antlr4::tree::ParseT
         std::optional<int64_t> result = std::nullopt;
         try
         {
-            llvm::Value* v = EmitIfConstLeafValue(node);
+            llvm::Value* v = nullptr;
+            bool pendingPostfix = false;
+            {
+                PendingPostfixScope postfixScope(this);
+                v = EmitIfConstLeafValue(node);
+                pendingPostfix = !PlusPlus.empty();
+            }
             admitConstGlobal(v);
             uint64_t folded = 0;
-            if (v && TryFoldConstInt(v, folded, &constFoldableGlobals_))
+            if (v && !pendingPostfix && !EmittedSideEffect(EmissionMark{ tmpBB, nullptr, tmpBB, nullptr })
+                && TryFoldConstInt(v, folded, &constFoldableGlobals_,
+                                   &compiler->ImportedEnumeratorGlobals()))
                 result = (int64_t)folded;
         }
         catch (const SpeculativeEvalAbort&) {}

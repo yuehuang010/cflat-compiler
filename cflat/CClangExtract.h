@@ -524,6 +524,7 @@ namespace cflat_cinterop
         std::string name;
         Kind kind = Skip;
         long long intValue = 0;
+        bool isIntegerLiteralZero = false;
         double floatValue = 0.0;
         std::string stringValue;     // decoded characters (string kind)
         std::string naturalType;     // canonical type spelling of the folded expression

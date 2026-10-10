@@ -1,0 +1,31 @@
+import cpp "cpp_t68_intptr.hpp";
+extern int main() {
+    expect_error("no overload of 'cpi_t68.only' matches") {
+        int rejected = cpi_t68.only(2 + 3);
+    }
+    expect_error("no overload of 'cpi_t68.only' matches") {
+        int rejected = cpi_t68.only(0 + 0);
+    }
+    expect_error("no overload of 'cpi_t68.only' matches") {
+        int rejected = cpi_t68.only((int)0);
+    }
+    expect_error("no overload of 'cpi_t68.only' matches") {
+        int rejected = cpi_t68.only(T68_ZERO + 0);
+    }
+    expect_error("no overload of 'cpi_t68.only' matches") {
+        int rejected = cpi_t68.only(T68_NONZERO > 0 ? T68_NONZERO : T68_NONZERO);
+    }
+    expect_error("no overload of 'cpi_t68.only' matches") {
+        int rejected = cpi_t68.only(~T68_ZERO);
+    }
+    expect_error("no overload of 'cpi_t68.only' matches") {
+        int rejected = cpi_t68.only(-T68_ZERO);
+    }
+    expect_error("no overload of 'cpi_t68.only' matches") {
+        int rejected = cpi_t68.only(+T68_ZERO);
+    }
+    expect_error("no overload") {
+        cpi_t68.FnBox rejected = cpi_t68.FnBox(0 + 0);
+    }
+    return 0;
+}

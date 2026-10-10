@@ -1,0 +1,13 @@
+// T45: a file-scope global initialized from a C++ T&& call result (std.move) is a call, not a
+// constant - CFlat globals are constant-initialized, so it is the constant-initializer error.
+import cpp "utility";
+import cpp "cpp_t45_global_xvalue.hpp";
+
+cpp_t45.Movable t45Source = default;
+expect_error("global variable initializer must be a compile-time constant");
+cpp_t45.Movable t45Global = std.move(t45Source);
+
+extern int main()
+{
+    return t45Global.v;
+}

@@ -1,0 +1,18 @@
+// T45 round 2: a case label that post-increments an imported C++ enumerator is not constant.
+import cpp "cpp_t45_global_xvalue.hpp";
+
+extern int main()
+{
+    expect_error("case value must be a constant integer or string literal");
+    switch (3) { case (int)cpp_t45.three++: return 0; }
+    return 1;
+}
+
+// Round 3: a case label assigning a local declared before the switch is not constant.
+int T45ExistingLocalCase()
+{
+    int x;
+    expect_error("case value must be a constant integer or string literal");
+    switch (5) { case (x = 5): break; }
+    return x;
+}

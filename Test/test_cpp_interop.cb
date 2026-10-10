@@ -227,6 +227,8 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_t68_intptr.hpp";
+import cpp "library/cpp_t62_static_auto.hpp";
 import cpp "library/cpp_u8_literal.hpp";
 import cpp "library/cpp_t43_char_types.hpp";
 import cpp "library/cpp_t43_ref_ops.hpp";
@@ -249,7 +251,10 @@ import cpp "library/cpp_interop_twin.h";
 import cpp "library/cpp_t24_argconv.hpp";
 import cpp "library/cpp_t35_ownerexpr.hpp";
 import cpp "library/cpp_t42_convref.hpp";
+import cpp "library/cpp_t48_nullptr.hpp";
+import cpp "library/cpp_t52_refnull.hpp";
 import cpp "library/cpp_t28_fwdref.hpp";
+import cpp "library/cpp_t27_ptrdiff.hpp";
 import cpp "library/cpp_interop_lastuse.h";
 import cpp "library/cpp_interop_demand_fail.h";
 // Inheritance and virtual dispatch. Definitions are out-of-line on purpose - every
@@ -272,6 +277,21 @@ import cpp "mutex";
 import cpp "library/cpp_interop_throw.h";
 import cpp "library/cpp_interop_scoped_enum.h";
 import cpp "library/cpp_interop_errc.h";
+import cpp "library/cpp_t49_enum_args.hpp";
+enum T49Own : int { T49V = 6 };
+enum T64U8 : u8 { T64U8Hi = 200 };
+enum T64U16 : u16 { T64U16Hi = 40000 };
+enum T64U32 : u32 { T64U32Hi = 3000000000 };
+enum T64S8 : i8 { T64S8Hi = 100 };
+struct T64EnumFields { T64U8 u8Value; T64U16 u16Value; T64U32 u32Value; };
+int t64TakeInt(int value) { return value; }
+long t64TakeLong(long value) { return value; }
+i64 t64TakeI64(i64 value) { return value; }
+int t64Forward<T>(T value) { return t64TakeInt(value); }
+i64 t64ForwardI64<T>(T value) { return t64TakeI64(value); }
+int t64PrintU8<T>(T value) { return printf("%u", value); }
+int t64PrintU16<T>(T value) { return printf("%u", value); }
+extern int abs(int value);
 import cpp "future";
 import cpp "system_error";
 struct CxxDerefLocalHolder { cpp_derefcopy.Cursor16 cursor; };
@@ -305,8 +325,10 @@ import cpp "library/cpp_interop_arraybool.hpp";
 import cpp "library/cpp_interop_explicit.h";
 import cpp "string";
 import cpp "optional";
+import cpp "numbers";
 import cpp "utility";
 import cpp "library/cpp_rvref_return.hpp";
+import cpp "library/cpp_t45_global_xvalue.hpp";
 import cpp "array";
 import cpp "deque";
 import cpp "iterator";
@@ -314,6 +336,7 @@ import cpp "valarray";
 import cpp "complex";
 import cpp "library/cpp_t10_refexpr.hpp";
 import cpp "vector";
+import cpp "library/cpp_t67_postinc.hpp";
 import cpp "library/cpp_interop_iterdiff.hpp";
 import cpp "functional";
 import cpp "unordered_map";
@@ -365,6 +388,7 @@ struct CppListHolder { cpplist.Plain item = default; int tag = 0; };
 struct CppResultHolder { cppexp.cppresult.Result<cppexp.cppresult.Middle> item = default; };
 struct CppResultBox<T> { T item = default; };
 struct CppListValue { int value = 0; };
+struct T67PostincNode { int value = 0; };
 struct CppAssignHost { cppas.Life l = cppas.Life(1); std.string s; };
 struct CppTallyHost { cppas.Tally t = default; };
 struct CppAssignRouteHost { cppas.AssignRouteTrivial item; };
@@ -393,6 +417,7 @@ import cpp "library/t12_msvc_shapes.hpp";
 import cpp "library/t15_friendptr.hpp";
 import cpp "library/cpp_namespace_class_constants.hpp";
 import cpp "library/cpp_var_template_views.hpp";
+import cpp "library/cpp_t61_var_template_cpo.hpp";
 import cpp "library/t32_msvc_std_shapes.hpp";
 import cpp "library/cpp_t26_ios_shapes.hpp";
 import cpp "library/cpp_t26_ios_shapes.cpp";
@@ -402,7 +427,19 @@ int t26FinalAliasRead(alias t26v.final_shift value)
     t26v.final_shift_sink sink = t26v.final_shift_sink(value);
     return sink.saved;
 }
+// An alias parameter bound to a held `both` converts to its virtual base by dynamic type.
+int t26AliasHeldRead(alias t26v.left left)
+{
+    t26v.sink sink = default;
+    return sink.read(left);
+}
+import cpp "library/cpp_t50_vbase.hpp";
+import cpp "library/cpp_t50_vbase_sys.hpp";
+// T50: a derived-to-virtual-base pointer converts at a return and at a CFlat parameter too.
+t50v.V* t50Up(t50v.L* p) { return p; }
+int t50Take(t50v.V* v) { return v == nullptr ? -1 : v.value; }
 import cpp "library/t31_minmax_brace.hpp";
+import cpp "library/cpp_t63_brace_decl.hpp";
 int cppcg_add(int a, int b) { return a + b; }
 
 // A C++ exception unwinding THROUGH CFlat frames (the C++ `guarded` catch sits above them): every
@@ -1167,6 +1204,7 @@ int RpUnwind(int x)
     return p.v + cppunw.thrower(x);
 }
 int fnptr_add_one(int x) { return x + 1; }
+function<int(int)> T56GlobalFn = fnptr_add_one;
 int fnptr_add_two_double(double x) { return (int)x + 2; }
 int fnptr_times_ten(int x) { return x * 10; }
 int apply_fnptr(function<int(int)> f, int x) { return f(x); }
@@ -1359,6 +1397,14 @@ int testLongDoubleNativeInterop()
     return 0;
 }
 
+int testT71PostfixFloatConstRef()
+{
+    float value = 1.5f;
+    int observed = cppi.crefscalar.t71_take_float_ref(value++);
+    if (value != 2.5f || observed != 725) return 7110;
+    return 0;
+}
+
 // Brace temporary argument carrying an address into a `new` temporary (leg 3635).
 struct EscAddrRef { int* p = nullptr; };
 
@@ -1498,6 +1544,138 @@ int Pos() { return 42; }
 namespace t40ns { int Neg() { return 41; } int CallNeg() { return Neg(); } }
 // A CFlat global may share a scoped C++ enumerator's bare name (C++ never declares it there).
 int T40CfVar = 33;
+// T45: imported C++ enumerators fold as constants at file scope (enum initializers), in case
+// labels and in `if const`, qualified or through an enum type alias.
+enum T45Fold : int { Scoped = (int)cppi_scope.Hue.Deep, Unscoped = cppi_scope.PN_TWO + 1,
+                     Aliased = (int)T40Hue.Green * 3, Nested = cppi_scope.PlainN.PN_TWO };
+int T45HueCase(cppi_scope.Hue h)
+{
+    switch (h) { case cppi_scope.Hue.Red: return 1; case T40Hue.Deep: return 2; }
+    return 0;
+}
+int T45IntCase(int v)
+{
+    switch (v) { case cppi_scope.PN_TWO: return 5; case (int)cppi_scope.Hue.Green + 1: return 6; }
+    return 0;
+}
+// A `static` local initialized from a T&& result is move-constructed on first entry, like clang.
+int T45StaticXvalue(int seed)
+{
+    cppi_rvref.Counted src = cppi_rvref.Counted(seed);
+    static cppi_rvref.Counted kept = std.move(src);
+    return kept.value() * 10 + (src.value() == -1 ? 1 : 0);
+}
+// Round 2: signed division / remainder fold at the operand's width and signedness (clang: -2 -1).
+enum T45NegCf : int { Five = -5 };
+enum T45Div : int { CppQuot = cpp_t45.neg_five / 2, CppRem = cpp_t45.neg_five % 2,
+                    CfQuot = T45NegCf.Five / 2, CfRem = T45NegCf.Five % 2,
+                    Shift = cpp_t45.neg_five >> 1, Mixed = (cpp_t45.three - 7) / 3 };
+// A nontrivial class in a `static` local is built in the static's own storage (address kept).
+int T45StaticSelfAddr(int seed)
+{
+    cpp_t45.SelfAddr src = cpp_t45.SelfAddr(seed);
+    static cpp_t45.SelfAddr kept = std.move(src);
+    return kept.ok() * 1000 + kept.get() * 10 + (src.get() == -1 ? 1 : 0);
+}
+// Round 3: `static auto` from an xvalue keeps static storage (built once, in place), and a
+// constant `?:` in a file-scope enum initializer folds.
+int T45StaticAutoSelfAddr(int seed)
+{
+    cpp_t45.SelfAddr src = cpp_t45.SelfAddr(seed);
+    static auto kept = std.move(src);
+    return kept.ok() * 1000 + kept.get() * 10 + (src.get() == -1 ? 1 : 0);
+}
+int T62StaticAutoPrvalue(int seed)
+{
+    static auto kept = cpp_t45.SelfAddr(seed);
+    return kept.ok() * 1000 + kept.get() * 10;
+}
+int T62StaticAutoCopy(int seed)
+{
+    cpp_t45.SelfAddr src = cpp_t45.SelfAddr(seed);
+    static auto kept = src;
+    return kept.ok() * 1000 + kept.get() * 10 + src.get();
+}
+int T62StaticAutoLoop(int seed)
+{
+    for (int i = 0; i < 2; i++)
+    {
+        static auto kept = cpp_t45.SelfAddr(seed + i);
+        return kept.ok() * 1000 + kept.get() * 10;
+    }
+    return 0;
+}
+int T62StaticAutoTernary(int seed)
+{
+    static auto kept = seed > 0 ? cpp_t45.SelfAddr(seed) : cpp_t45.SelfAddr(-seed);
+    return kept.ok() * 1000 + kept.get() * 10;
+}
+T T62StaticAutoGeneric<T>(T value)
+{
+    static auto kept = value;
+    return kept;
+}
+int T62StaticAutoLambda(int seed)
+{
+    function<int(int)> call = (int value) => {
+        static auto kept = cpp_t45.SelfAddr(value);
+        return kept.ok() * 1000 + kept.get() * 10;
+    };
+    return call(seed);
+}
+int T62StaticAutoString(int seed)
+{
+    static auto kept = cpp_t62.make_string(seed);
+    return kept == std.string("first") ? 1 : 0;
+}
+int T62StaticAutoGlobalCopy()
+{
+    static auto kept = cpp_t62.global_string_ref();
+    return kept == std.string("global") ? 1 : 0;
+}
+int T62StaticAutoVector(int value)
+{
+    static auto kept = cpp_t62.make_vector(value);
+    return kept.size() == 1 ? kept[0] : -1;
+}
+int T62StaticAutoUnique(int value)
+{
+    static auto kept = cpp_t62.make_unique(value);
+    int* ptr = kept.get();
+    return ptr == nullptr ? 0 : *ptr;
+}
+int T62StaticClobberFrame(int seed)
+{
+    int[64] data = default;
+    for (int i = 0; i < 64; i++) data[i] = 0x5a5a + seed;
+    int sum = 0;
+    for (int i = 0; i < 64; i++) sum += data[i];
+    return sum;
+}
+int t62StaticRecDepth = 0;
+int T62StaticTrackedFactory(int seed)
+{
+    static auto kept = r62.make(seed);
+    return kept.ok() * 1000 + kept.get() * 10;
+}
+int T62StaticTrackedCtor(int seed)
+{
+    static auto kept = r62.Trk(seed);
+    return kept.ok() * 1000 + kept.get() * 10;
+}
+int T62StaticTrackedExplicitFactory(int seed)
+{
+    static r62.Trk kept = r62.make(seed);
+    return kept.ok() * 1000 + kept.get() * 10;
+}
+int T62StaticTrackedRecursive(int seed)
+{
+    t62StaticRecDepth++;
+    static auto kept = r62.Trk(t62StaticRecDepth < 3
+        ? T62StaticTrackedRecursive(seed + 1) : seed);
+    return kept.ok() * 1000 + kept.get() * 10;
+}
+enum T45Ternary : int { Picked = true ? 7 : 8, Other = false ? 7 : 8 };
 
 int T46GenericDot<T>(T p) { return p.get() == nullptr ? 1 : 0; }
 int T46RefDot(cpp_t46.Ptr<cpp_t46.Item>* p) { return p.get() == nullptr ? 1 : 0; }
@@ -1505,9 +1683,107 @@ int T46ConstRefDot(const cpp_t46.Ptr<cpp_t46.Item>* p) { return p.get() == nullp
 int T46GenericUniqueDot<T>(T* p) { return p.get() == nullptr ? 1 : 0; }
 int T46UniqueRefDot(std.unique_ptr<cpp_t46.Item>* p) { return p.get() == nullptr ? 1 : 0; }
 int T46UniqueConstRefDot(const std.unique_ptr<cpp_t46.Item>* p) { return p.get() == nullptr ? 1 : 0; }
+// T36: pointer arithmetic over a field, a global and a parameter keeps its pointee at C++
+// template deduction (t27ptr.kind: 2 = int*, clang oracle).
+struct T36Holder { int* p = nullptr; };
+int* t36Global = nullptr;
+int t36ParamKind(int* p) { return t27ptr.kind(p + 1); }
+
+t54.Sink t54ReturnPlain() { return T54_ID(t54.PlainValue); }
+t54.Sink t54ReturnScoped() { return T54_ID(t54.Scoped.ScopedValue); }
+t54.Sink t54ReturnByte() { return T54_ID(t54.ByteValue); }
+int t54IntSource() { return 3; }
+
+int t67CallCount = 0;
+int t67NextValue() { t67CallCount++; return t67CallCount; }
+
+struct T72DefaultLeaf { cppi.FieldDefaulted item; };
+struct T72DefaultWrap { T72DefaultLeaf leaf; };
+struct T72DefaultBox<T> { T item; };
+struct T72InitializedField {
+    cppi.FieldDefaulted item = cppi.FieldDefaulted(11);
+    T72InitializedField() { }
+};
+struct T72UserInitializedField {
+    T72DefaultLeaf leaf;
+    T72UserInitializedField() { leaf = T72DefaultLeaf(); }
+};
+struct T72TrackedFieldTempHolder {
+    cppi.Tracked value = cppi.Tracked(4) + cppi.Tracked(5);
+    T72TrackedFieldTempHolder() { }
+};
+struct T72FieldU9 { cppi.Tracked value = cppi.Tracked(4).twice(); T72FieldU9() { } };
+struct T72FieldU10 { cppi.Tracked value = cppi.Tracked(cppi.Tracked(6).value()); T72FieldU10() { } };
+struct T72FieldU13 { cppi.Tracked value = cppi.make_tracked(cppi.Tracked(8).value()); T72FieldU13() { } };
+struct T72FieldN9 { cppi.Tracked value = cppi.Tracked(4).twice(); };
+struct T73Holder { cpp_t73.Mix mix; };
+struct T73ArrayHolder { cpp_t73.Mix items[2]; };
+struct T73Nested { T73Holder holder; };
+struct T73VirtualHolder { cpp_t73.Virtual value; };
+struct T73DefaultMemberHolder { cpp_t73.DefaultMember value; };
+struct T73TrivialHolder { cpp_t73.Trivial value; };
+struct T73Generic<T> { T item; };
+struct T73GenericHolder { T73Generic<cpp_t73.Mix> generic; };
+struct T73Initialized { cpp_t73.Mix mix = cpp_t73.Mix(); };
+struct T73DefaultedInitializer { cpp_t73.Mix mix = default; };
+T73Holder t73Global = default;
 
 extern int main()
 {
+    t63.VecPick t63BracePick{2, 5};
+    t63.VecPick t63EqualBracePick = {4, 6};
+    t63.VecPick t63SingleBracePick{8};
+    t63.VecPick t63ParenPick = t63.VecPick(2, 5);
+    t63.Aggregate t63Aggregate{7, 9};
+    t63.TwoOnly t63TwoOnly{11, 13};
+    static t63.VecPick t63StaticPick{3, 7};
+    if (t63BracePick.which != 1 || t63BracePick.first != 2 || t63BracePick.second != 5
+        || t63EqualBracePick.which != 1 || t63EqualBracePick.first != 4
+        || t63EqualBracePick.second != 6
+        || t63SingleBracePick.which != 1 || t63SingleBracePick.first != 8
+        || t63ParenPick.which != 2 || t63ParenPick.first != 2 || t63ParenPick.second != 5
+        || t63Aggregate.first != 7 || t63Aggregate.second != 9
+        || t63TwoOnly.first != 11 || t63TwoOnly.second != 13
+        || t63StaticPick.which != 1 || t63StaticPick.first != 3 || t63StaticPick.second != 7)
+        return 9301;
+    std.vector<short> t63Shorts{1, 2};
+    std.vector<char> t63Chars{1, 2};
+    std.vector<unsigned> t63Unsigned{1u, 2};
+    if (t63Shorts.size() != 2 || t63Shorts[0] != 1 || t63Shorts[1] != 2
+        || t63Chars.size() != 2 || t63Chars[0] != 1 || t63Chars[1] != 2
+        || t63Unsigned.size() != 2 || t63Unsigned[0] != 1 || t63Unsigned[1] != 2)
+        return 9302;
+    std.string t63StringA = "x";
+    std.string t63StringB = "yz";
+    std.vector<std.string> t63Strings{t63StringA, t63StringB};
+    std.vector<std.string> t63StringsEq = {t63StringB, t63StringA};
+    if (t63Strings.size() != 2 || t63Strings[0].size() != 1 || t63Strings[1].size() != 2
+        || t63StringsEq.size() != 2 || t63StringsEq[0].size() != 2 || t63StringsEq[1].size() != 1
+        || t63StringA.size() != 1 || t63StringB.size() != 2)
+        return 9303;
+    t63.Counted t63CountA = t63.Counted(10);
+    t63.Counted t63CountB = t63.Counted(20);
+    t63.resetCounted();
+    std.vector<t63.Counted> t63Counted{t63CountA, t63CountB};
+    if (t63.countedCopyCount() != 4 || t63.countedMoveCount() != 0 || t63.countedDtorCount() != 2
+        || t63Counted.size() != 2 || t63Counted[0].value != 10 || t63Counted[1].value != 20
+        || t63CountA.value != 10 || t63CountB.value != 20)
+        return 9304;
+    t63.resetCounted();
+    std.vector<t63.Counted> t63Moved{move t63CountA};
+    if (t63.countedCopyCount() != 1 || t63.countedMoveCount() != 1 || t63.countedDtorCount() != 1
+        || t63Moved.size() != 1 || t63Moved[0].value != 10)
+        return 9305;
+    t63.resetCounted();
+    std.vector<t63.Counted> t63Temps{t63.Counted(30), t63.Counted(40)};
+    // clang elides the temporaries into the list (0 moves); the thunk moves them in.
+    if (t63.countedCopyCount() != 2
+        || t63Temps.size() != 2 || t63Temps[0].value != 30 || t63Temps[1].value != 40)
+        return 9306;
+    t63.ExplicitOnly t63ExplicitDirect{6, 8};
+    if (t63ExplicitDirect.first != 6 || t63ExplicitDirect.second != 8) return 9307;
+    t63.ClassNew t63ClassNew{1, 2, 3};
+    if (t63ClassNew.count != 3) return 9308;
     c8* t43c8 = u8"x";
     c16* t43c16 = (c16*)0;
     c32* t43c32 = (c32*)0;
@@ -1559,6 +1835,86 @@ extern int main()
     if ((int)T40Collide != 77 || t40c.choose(T40Collide) != 10 || t40c.choose(t40c.S.T40Collide) != 11
         || (int)T40GlobalUse != 2 || t40g.pick(T40GlobalUse) != 21 || T40CppVar != 88 || T40CfVar != 33)
         return 40004;
+    if (T45Fold.Scoped != 200 || T45Fold.Unscoped != 3 || T45Fold.Aliased != 6 || T45Fold.Nested != 2)
+        return 45001;
+    if (T45HueCase(cppi_scope.Hue.Red) != 1 || T45HueCase(cppi_scope.Hue.Deep) != 2
+        || T45HueCase(cppi_scope.Hue.Green) != 0 || T45IntCase(2) != 5 || T45IntCase(3) != 6) return 45002;
+    int t45IfConst = 0;
+    if const (T40Hue.Deep == cppi_scope.Hue.Deep && (int)cppi_scope.Hue.Green + cppi_scope.PN_TWO == 4)
+        t45IfConst = 1;
+    if (t45IfConst != 1) return 45003;
+    // Second entry keeps the first value; each entry's source is moved from only once (clang: 91, 90).
+    if (T45StaticXvalue(9) != 91 || T45StaticXvalue(4) != 90) return 45004;
+    if (T45Div.CppQuot != -2 || T45Div.CppRem != -1 || T45Div.CfQuot != -2 || T45Div.CfRem != -1
+        || T45Div.Shift != -3 || T45Div.Mixed != -1) return 45005;
+    int t45DivCase = 0;
+    switch (-2) { case cpp_t45.neg_five / 2: t45DivCase = 1; }
+    if const (cpp_t45.neg_five % 2 == -1) t45DivCase += 10;
+    if (t45DivCase != 11) return 45006;
+    // clang: 1091 then 1090 (built in place; the second entry keeps the first value).
+    if (T45StaticSelfAddr(9) != 1091 || T45StaticSelfAddr(4) != 1090) return 45007;
+    // clang: 1091 then 1090 - a stack slot would read uninitialized memory on the second entry.
+    if (T45StaticAutoSelfAddr(9) != 1091 || T45StaticAutoSelfAddr(4) != 1090) return 45008;
+    // Prvalue and lvalue-copy initializers retain the first object in static storage.
+    int t62001a = T62StaticAutoPrvalue(9); T62StaticClobberFrame(1);
+    int t62001b = T62StaticAutoPrvalue(4); T62StaticClobberFrame(2);
+    int t62001c = T62StaticAutoPrvalue(5);
+    if (t62001a != 1090 || t62001b != 1090 || t62001c != 1090) return 62001;
+    if (T62StaticAutoCopy(9) != 1099 || T62StaticAutoCopy(4) != 1094
+        || T62StaticAutoCopy(5) != 1095) return 62002;
+    int t62003a = T62StaticAutoLoop(9); T62StaticClobberFrame(3);
+    int t62003b = T62StaticAutoLoop(4); T62StaticClobberFrame(4);
+    int t62003c = T62StaticAutoLoop(5);
+    if (t62003a != 1090 || t62003b != 1090 || t62003c != 1090) return 62003;
+    int t62004a = T62StaticAutoTernary(9); T62StaticClobberFrame(5);
+    int t62004b = T62StaticAutoTernary(-4); T62StaticClobberFrame(6);
+    int t62004c = T62StaticAutoTernary(6);
+    if (t62004a != 1090 || t62004b != 1090 || t62004c != 1090) return 62004;
+    if (T62StaticAutoGeneric<int>(9) != 9 || T62StaticAutoGeneric<int>(4) != 9
+        || T62StaticAutoGeneric<int>(5) != 9 || T62StaticAutoGeneric<i64>(7) != 7
+        || T62StaticAutoGeneric<i64>(2) != 7 || T62StaticAutoGeneric<i64>(3) != 7) return 62005;
+    int t62006a = T62StaticAutoLambda(9); T62StaticClobberFrame(7);
+    int t62006b = T62StaticAutoLambda(4); T62StaticClobberFrame(8);
+    int t62006c = T62StaticAutoLambda(5);
+    if (t62006a != 1090 || t62006b != 1090 || t62006c != 1090) return 62006;
+    int t62007a = T62StaticAutoString(9); T62StaticClobberFrame(9);
+    int t62007b = T62StaticAutoString(4); T62StaticClobberFrame(10);
+    int t62007c = T62StaticAutoString(5);
+    if (t62007a != 1 || t62007b != 1 || t62007c != 1) return 62007;
+    int t62008a = T62StaticAutoVector(1); T62StaticClobberFrame(11);
+    int t62008b = T62StaticAutoVector(2); T62StaticClobberFrame(12);
+    int t62008c = T62StaticAutoVector(3);
+    if (t62008a != 1 || t62008b != 1 || t62008c != 1) return 62008;
+    int t62009a = T62StaticAutoUnique(9); T62StaticClobberFrame(13);
+    int t62009b = T62StaticAutoUnique(4); T62StaticClobberFrame(14);
+    int t62009c = T62StaticAutoUnique(5);
+    if (t62009a != 9 || t62009b != 9 || t62009c != 9) return 62009;
+    r62.reset();
+    int t62012a = T62StaticTrackedFactory(9); T62StaticClobberFrame(15);
+    int t62012b = T62StaticTrackedFactory(4); T62StaticClobberFrame(16);
+    int t62012c = T62StaticTrackedFactory(5);
+    if (t62012a != 1090 || t62012b != 1090 || t62012c != 1090 || r62.made != 1
+        || r62.copies != 0 || r62.moves != 0 || r62.dead != 0) return 62012;
+    r62.reset();
+    int t62013a = T62StaticTrackedCtor(9); T62StaticClobberFrame(17);
+    int t62013b = T62StaticTrackedCtor(4); T62StaticClobberFrame(18);
+    int t62013c = T62StaticTrackedCtor(5);
+    if (t62013a != 1090 || t62013b != 1090 || t62013c != 1090 || r62.made != 1
+        || r62.copies != 0 || r62.moves != 0 || r62.dead != 0) return 62013;
+    r62.reset();
+    int t62014a = T62StaticTrackedExplicitFactory(9); T62StaticClobberFrame(19);
+    int t62014b = T62StaticTrackedExplicitFactory(4); T62StaticClobberFrame(20);
+    int t62014c = T62StaticTrackedExplicitFactory(5);
+    if (t62014a != 1090 || t62014b != 1090 || t62014c != 1090 || r62.made != 1
+        || r62.copies != 0 || r62.moves != 0 || r62.dead != 0) return 62014;
+    r62.reset();
+    int t62015 = T62StaticTrackedRecursive(1);
+    if (t62015 != 1000 || r62.made != 1 || r62.copies != 0
+        || r62.moves != 0 || r62.dead != 0) return 62015;
+    if (T62StaticAutoGlobalCopy() != 1) return 62010;
+    cpp_t62.set_global_string("changed");
+    if (T62StaticAutoGlobalCopy() != 1 || T62StaticAutoGlobalCopy() != 1) return 62011;
+    if (T45Ternary.Picked != 7 || T45Ternary.Other != 8) return 45009;
 
     // T46: dot prefers the C++ holder's own member; arrow always follows operator->.
     std.unique_ptr<cpp_t46.Item> t46Unique = default;
@@ -1601,6 +1957,71 @@ extern int main()
     int t35Factor = 4;
     cpi_t35x.Vec<int> t35Product = t35Vec * t35Factor;
     if (t35Product.v != 12) return 3531;
+    // T68: only null pointer constants convert from integer expressions to C++ pointers.
+    int t68Local = 19;
+    int[2] t68Array = { 1, 2 };
+    if (cpi_t68.only(0) != 5 || cpi_t68.only(NULL) != 5
+        || cpi_t68.only(T68_ZERO) != 5 || cpi_t68.only(nullptr) != 5
+        || cpi_t68.only((int*)(&t68Local)) != 6 || cpi_t68.only(&t68Local) != 6
+        || cpi_t68.only(t68Array) != 6 || cpi_t68.over(2 + 3) != 105) return 6801;
+    // T48: a nullptr value keeps decltype(nullptr) at C++ calls (clang++ oracle values).
+    std.nullptr_t t48Null = nullptr;
+    int* t48Ip = nullptr;
+    if (cpi_t48.pa(nullptr) != 12 || cpi_t48.pa(t48Null) != 12 || cpi_t48.pa(t48Ip) != 11) return 4801;
+    if (cpi_t48.pb(nullptr) != 22 || cpi_t48.pb(t48Null) != 22 || cpi_t48.pc(nullptr) != 32
+        || cpi_t48.pc(t48Null) != 32)                                                    return 4802;
+    if (cpi_t48.pt(nullptr) != 7 || cpi_t48.pt(t48Null) != 7 || cpi_t48.pt(t48Ip) != 8)   return 4803;
+    if (cpi_t48.pe(nullptr) != 51 || cpi_t48.pn(nullptr) != 61 || cpi_t48.pn(t48Null) != 61
+        || cpi_t48.pg(nullptr) != 71 || cpi_t48.pg(t48Null) != 72)                      return 4804;
+    // nullptr (and the literal 0) into a class parameter builds the temporary through C(nullptr_t).
+    if (cpi_t48.rn(nullptr) != 101 || cpi_t48.rn(t48Null) != 101 || cpi_t48.rvn(nullptr) != 111
+        || cpi_t48.bvn(nullptr) != 121 || cpi_t48.rn(0) != 101)                          return 4805;
+    // 0L / 0u / 0UL are null pointer constants too; a named nullptr_t binds a nullptr_t& ctor.
+    if (cpi_t48.rn(0L) != 101 || cpi_t48.rn(0u) != 101 || cpi_t48.rn(0UL) != 101
+        || cpi_t48.rl(t48Null) != 704)                                                   return 4809;
+    // A standard null-pointer conversion beats the user-defined class conversion (clang: 2).
+    if (cpi_t48.mx(0) != 2 || cpi_t48.mx(0L) != 2 || cpi_t48.mx(0UL) != 2 || cpi_t48.mx(0ll) != 2
+        || cpi_t48.mx(nullptr) != 2 || cpi_t48.lp(0L) != 5 || cpi_t48.lp(0UL) != 5
+        || cpi_t48.fp(0) != 3 || cpi_t48.fp(0L) != 3)                                    return 4810;
+    // Same ranking at function and multi-level pointer parameters.
+    if (cpi_t48.mf(0) != 2 || cpi_t48.mf(0UL) != 2 || cpi_t48.mf(nullptr) != 2
+        || cpi_t48.mpp(0) != 4 || cpi_t48.mpp(0UL) != 4 || cpi_t48.mpp(nullptr) != 4)   return 4811;
+    // A NAMED std::nullptr_t takes the same pointer conversions (clang: 2 4 6).
+    if (cpi_t48.mf(t48Null) != 2 || cpi_t48.mpp(t48Null) != 4 || cpi_t48.md(t48Null) != 6)  return 4812;
+    // T52: fixed arrays bind by reference without a copy; expanded ZERO stays a null constant.
+    int[2] t52Array = { 14, 16 };
+    if (cpi_t52.av(t52Array) != 15 || t52Array[0] != 15 || cpi_t52.lp(ZERO) != 5
+        || cpi_t52.lp(ALIASZERO) != 5 || cpi_t52.lp(PARENZERO) != 5 || cpi_t52.lp(0L) != 5
+        || cpi_t52.lp(HEXZERO) != 5 || cpi_t52.lp((Z0)) != 5
+        || cpi_t52.lp(((Z0))) != 5 || cpi_t52.lp(p: ((Z0))) != 5) return 5201;
+    std.nullptr_t t52Null = nullptr;
+    if (cpi_t52.pref(0) != 27 || cpi_t52.pref(nullptr) != 27 || cpi_t52.pref(ZERO) != 27
+        || cpi_t52.pref(p: 0) != 27 || cpi_t52.pref(p: ZERO) != 27
+        || cpi_t52.pref(p: nullptr) != 27) return 5202;
+    cpi_t52.dirty();
+    if (cpi_t52.prvalue(0) != 29 || cpi_t52.prvalue(ZERO) != 29
+        || cpi_t52.prvalue((Z0)) != 29 || cpi_t52.prvalue(p: 0) != 29
+        || cpi_t52.prvalue(p: ZERO) != 29 || cpi_t52.prvalue(p: ((Z0))) != 29
+        || cpi_t52.nref(nullptr) != 31 || cpi_t52.nref(t52Null) != 31
+        || cpi_t52.nref(0) != 31 || cpi_t52.nref(ZERO) != 31
+        || cpi_t52.nref(p: nullptr) != 31 || cpi_t52.nref(p: 0) != 31
+        || cpi_t52.nref(p: ZERO) != 31)
+        return 5202;
+    int t52Lvalue = 1;
+    if (cpi_t52.fwd(Z0) != 90 || cpi_t52.fwd(ZERO) != 90 || cpi_t52.fwd(t52Lvalue) != 81) return 5203;
+    if (cpi_t52.tk(0) != 5 || cpi_t52.tk(ZERO) != 5 || cpi_t52.tk(k: (Z0)) != 5) return 5205;
+    // A local or parameter that shadows a zero macro is an ordinary int lvalue, never a null constant.
+    int Z0 = 7;
+    // T68: the int lvalue at lp(int*) is refused (pointer is not a number) - legs in
+    // Test/errors/err_cpp_reference_param_null_constant.cb.
+    if (cpi_t52.iref(Z0) != 17) return 5204;
+    if (cpi_t48.rm(nullptr) != 203 || cpi_t48.rm(0) != 202 || cpi_t48.bvm(nullptr) != 213
+        || cpi_t48.bvm(0) != 212 || cpi_t48.rm(t48Null) != 203)                          return 4806;
+    cpi_t48.H t48H = default;
+    if (cpi_t48.q(nullptr) != 302 || cpi_t48.q(t48Null) != 302 || t48H.w(nullptr) != 401
+        || cpi_t48.H.s(t48Null) != 411)                                                  return 4807;
+    cpi_t48.N t48N = cpi_t48.N(nullptr);
+    if ((t48N == nullptr) != 502 || (nullptr == t48N) != 502) return 4808;
     // T42: a converting-ctor temporary binds C++ `const X&` / `X&&` (clang++ oracle values).
     char* t42Cp = "A";
     cpi_t42.Src t42Src = cpi_t42.Src(5);
@@ -1816,6 +2237,355 @@ extern int main()
         int t34Accepted = (int)cpp_errc_probe.ConditionEnum.accepted;
         if ((int)t34Zero != 0 || t34Accepted != 41 || accepted != 7) return 24011;
     }
+    // T64: unsigned enum backing controls widening at fixed-parameter and C varargs call slots.
+    {
+        T64U8 u8Value = T64U8.T64U8Hi;
+        T64U16 u16Value = T64U16.T64U16Hi;
+        T64U32 u32Value = T64U32.T64U32Hi;
+        T64S8 s8Value = T64S8.T64S8Hi;
+        T64EnumFields fields;
+        fields.u8Value = T64U8.T64U8Hi;
+        fields.u16Value = T64U16.T64U16Hi;
+        fields.u32Value = T64U32.T64U32Hi;
+        if (t64TakeInt(u8Value) != 200 || t64TakeLong(u8Value) != 200
+            || abs(u8Value) != 200
+            || t64TakeInt(T64U8.T64U8Hi) != 200 || t64TakeInt(fields.u8Value) != 200
+            || t64TakeInt(true ? u8Value : T64U8.T64U8Hi) != 200
+            || t64Forward(u8Value) != 200) return 64001;
+        if (t64TakeInt(u16Value) != 40000 || t64TakeInt(T64U16.T64U16Hi) != 40000
+            || t64TakeInt(fields.u16Value) != 40000
+            || t64TakeInt(true ? u16Value : T64U16.T64U16Hi) != 40000
+            || t64Forward(u16Value) != 40000) return 64002;
+        // u32 cells use i64: CFlat long is 32-bit on Windows (LLP64), where 3000000000 does not fit.
+        if (t64TakeI64(u32Value) != 3000000000
+            || t64TakeI64(T64U32.T64U32Hi) != 3000000000
+            || t64TakeI64(fields.u32Value) != 3000000000
+            || t64TakeI64(true ? u32Value : T64U32.T64U32Hi) != 3000000000
+            || t64ForwardI64(u32Value) != 3000000000
+            || t64Forward(u32Value) != -1294967296) return 64003;
+        if (t64TakeInt(s8Value) != 100) return 64004;
+        // `%u` makes a sign-extended byte/short observably longer than its correct promotion.
+        if (printf("%u", u8Value) != 3 || printf("%u", T64U8.T64U8Hi) != 3
+            || printf("%u", fields.u8Value) != 3
+            || printf("%u", true ? u8Value : T64U8.T64U8Hi) != 3
+            || t64PrintU8(u8Value) != 3) return 64005;
+        if (printf("%u", u16Value) != 5 || printf("%u", T64U16.T64U16Hi) != 5
+            || printf("%u", fields.u16Value) != 5
+            || printf("%u", true ? u16Value : T64U16.T64U16Hi) != 5
+            || t64PrintU16(u16Value) != 5) return 64006;
+    }
+    // T49: a signed unscoped C++ enum, an implicitly backed one and a CFlat enum never bind a
+    // different scoped enum parameter (clang: the int overload runs); scoped -> same scoped stays.
+    {
+        if (t49.choose(t49.Signed.SignedVal) != 10 || t49.choose(t49.Neg.N) != 10
+            || t49.choose(T49Own.T49V) != 10 || t49.choose(t49.UnsignedE.UV) != 10
+            || t49.choose(t49.S.Scoped) != 11) return 49001;
+        // Function-template deduction keeps unscoped C++ enum identity after int lowering.
+        t49.Signed t53Signed = t49.Signed.SignedVal;
+        t49.UnsignedE t53Unsigned = t49.UnsignedE.UV;
+        t49.Neg t53Implicit = t49.Neg.N;
+        const t49.Signed t53ConstSigned = t53Signed;
+        if (t49.deduceEnum(t49.Signed.SignedVal) != 7) return 49013;
+        if (t49.deduceEnum(t49.UnsignedE.UV) != 7) return 49016;
+        if (t49.deduceEnum(t49.Neg.N) != 7) return 49017;
+        if (t49.deduceEnum(t49.S.Scoped) != 7) return 49018;
+        if (t49.deduceEnum(T49Own.T49V) != 9) return 49019;
+        if (t49.deduceEnumRef(t53Signed) != 8 || t49.deduceEnumRef(t53Unsigned) != 8
+            || t49.deduceEnumRef(t53Implicit) != 8
+            || t49.deduceEnumCref(t53ConstSigned) != 9
+            || t49.deduceEnumCref(t49.S.Scoped) != 9) return 49014;
+        if (t49.deduceEnumOverload(t49.Signed.SignedVal) != 11
+            || t49.deduceEnumOverload(T49Own.T49V) != 10) return 49015;
+        t49.S t49s = t49.S.Scoped;
+        const t49.S t49c = t49s;
+        if (t49.only(t49s) != 5 || t49.onlyref(t49s) != 5 || t49.only(t49c) != 5
+            || t49.onlyref(t49.S.Scoped) != 5) return 49002;
+        expect_error("no overload of 't49.only' matches") {
+            int t49bad = t49.only(t49.Signed.SignedVal);
+        }
+        expect_error("no overload of 't49.onlyref' matches") {
+            int t49bad = t49.onlyref(t49.Neg.N);
+        }
+        expect_error("no overload of 't49.only' matches") {
+            int t49bad = t49.only(T49Own.T49V);
+        }
+        // Enum cast and functional-cast operands convert like an enumerator (clang: 1 1 22 22 22 3).
+        t49.Cond t49mk = t49.Code.bad;
+        t49.Cond t49f = t49.Code(22);
+        t49.Cond t49k = (t49.Code)22;
+        t49.Cond t49a = default;
+        t49a = (t49.Code)22;
+        if (!(t49mk == (t49.Code)22) || !(t49mk == t49.Code(22))) return 49003;
+        if (t49f.value_ != 22 || t49k.value_ != 22 || t49a.value_ != 22) return 49004;
+        // An inherited (unlisted) copy assignment still assigns a converted enum value.
+        t49.Opt<int> t49o = default;
+        t49o = t49.Code.bad;
+        if (!t49o.has || t49o.v != 22) return 49005;
+        std.error_condition t49std = std.errc.invalid_argument;
+        if (!(t49std == (std.errc)22) || !(t49std == std.errc(22))) return 49006;
+        std.error_condition t49std2 = std.errc(22);
+        std.error_condition t49std3 = (std.errc)22;
+        if (t49std2.value() != 22 || t49std3.value() != 22) return 49007;
+        std.optional<std.errc> t49opt = default;
+        t49opt = std.errc.invalid_argument;
+        if ((int)t49opt.value() != 22) return 49008;
+        std.optional<double> t49pi = default;
+        t49pi = std.numbers.pi;
+        if ((int)t49pi.value() != 3) return 49009;
+        // Round 2: a functional cast with a call operand is still an enum cast, evaluated once.
+        t49.Cond t49call = default;
+        t49call = t49.Code(t49.bump());
+        if (t49call.value_ != 22 || t49.bumps != 1) return 49010;
+        // A quoted paren inside the cast operand must not end the cast early.
+        t49call = t49.Code(t49.charBump(')'));
+        if (t49call.value_ != 22 || t49.bumps != 2) return 49011;
+        t49call = t49.Code(t49.charBump('('));
+        if (t49call.value_ != 22 || t49.bumps != 3) return 49012;
+        // The refusal names the source enum, not int.
+        expect_error("[0] arg=t49.Signed") {
+            int t49bad = t49.only(t49.Signed.SignedVal);
+        }
+    }
+    // T54: evaluated enum identity survives every wrapper for all C++ enum kinds.
+    {
+        t54.Sink plainSink = default;
+        t54.Plain plainLocal = t54.PlainValue;
+        t54.Plain[2] plainArray = default;
+        plainArray[0] = t54.PlainValue;
+        t54.PlainField plainField = default;
+        plainField.value = t54.PlainValue;
+        t54.ctorCalls = 0;
+        plainSink = t54.Plain(t54.plainFrom(3));
+        if (plainSink.value != 103 || t54.ctorCalls != 1) return 54101;
+        t54.ctorCalls = 0;
+        plainSink = (t54.Plain)t54.plainFrom(3);
+        if (plainSink.value != 103 || t54.ctorCalls != 1) return 54102;
+        t54.ctorCalls = 0;
+        plainSink = (t54.Plain(t54.plainFrom(3)));
+        if (plainSink.value != 103 || t54.ctorCalls != 1) return 54103;
+        t54.ctorCalls = 0;
+        plainSink = ((t54.Plain(t54.plainFrom(3))));
+        if (plainSink.value != 103 || t54.ctorCalls != 1) return 54104;
+        t54.ctorCalls = 0;
+        plainSink = (plainLocal);
+        if (plainSink.value != 103 || t54.ctorCalls != 1) return 54105;
+        t54.ctorCalls = 0;
+        plainSink = plainArray[0];
+        if (plainSink.value != 103 || t54.ctorCalls != 1) return 54106;
+        t54.ctorCalls = 0;
+        plainSink = plainField.value;
+        if (plainSink.value != 103 || t54.ctorCalls != 1) return 54107;
+        t54.ctorCalls = 0;
+        plainSink = t54.plainFrom(3);
+        if (plainSink.value != 103 || t54.ctorCalls != 1) return 54108;
+        t54.ctorCalls = 0;
+        plainSink = true ? t54.PlainValue : t54.PlainValue;
+        if (plainSink.value != 103 || t54.ctorCalls != 1) return 54109;
+        t54.ctorCalls = 0;
+        plainSink = T54_ID(t54.PlainValue);
+        if (plainSink.value != 103 || t54.ctorCalls != 1) return 54110;
+        t54.ctorCalls = 0;
+        plainSink = T54_ID(T54_ID(t54.PlainValue));
+        if (plainSink.value != 103 || t54.ctorCalls != 1) return 54111;
+        t54.ctorCalls = 0;
+        plainSink = T54_ID2(t54.PlainValue, 77);
+        if (plainSink.value != 103 || t54.ctorCalls != 1) return 54112;
+        t54.ctorCalls = 0;
+        plainSink = T54_ID(t54.plainFrom(3));
+        if (plainSink.value != 103 || t54.ctorCalls != 1) return 54113;
+        t54.Sink scopedSink = default;
+        t54.Scoped scopedLocal = t54.Scoped.ScopedValue;
+        t54.Scoped[2] scopedArray = default;
+        scopedArray[0] = t54.Scoped.ScopedValue;
+        t54.ScopedField scopedField = default;
+        scopedField.value = t54.Scoped.ScopedValue;
+        t54.ctorCalls = 0;
+        scopedSink = t54.Scoped(t54.scopedFrom(3));
+        if (scopedSink.value != 103 || t54.ctorCalls != 1) return 54114;
+        t54.ctorCalls = 0;
+        scopedSink = (t54.Scoped)t54.scopedFrom(3);
+        if (scopedSink.value != 103 || t54.ctorCalls != 1) return 54115;
+        t54.ctorCalls = 0;
+        scopedSink = (t54.Scoped(t54.scopedFrom(3)));
+        if (scopedSink.value != 103 || t54.ctorCalls != 1) return 54116;
+        t54.ctorCalls = 0;
+        scopedSink = ((t54.Scoped(t54.scopedFrom(3))));
+        if (scopedSink.value != 103 || t54.ctorCalls != 1) return 54117;
+        t54.ctorCalls = 0;
+        scopedSink = (scopedLocal);
+        if (scopedSink.value != 103 || t54.ctorCalls != 1) return 54118;
+        t54.ctorCalls = 0;
+        scopedSink = scopedArray[0];
+        if (scopedSink.value != 103 || t54.ctorCalls != 1) return 54119;
+        t54.ctorCalls = 0;
+        scopedSink = scopedField.value;
+        if (scopedSink.value != 103 || t54.ctorCalls != 1) return 54120;
+        t54.ctorCalls = 0;
+        scopedSink = t54.scopedFrom(3);
+        if (scopedSink.value != 103 || t54.ctorCalls != 1) return 54121;
+        t54.ctorCalls = 0;
+        scopedSink = true ? t54.Scoped.ScopedValue : t54.Scoped.ScopedValue;
+        if (scopedSink.value != 103 || t54.ctorCalls != 1) return 54122;
+        t54.ctorCalls = 0;
+        scopedSink = T54_ID(t54.Scoped.ScopedValue);
+        if (scopedSink.value != 103 || t54.ctorCalls != 1) return 54123;
+        t54.ctorCalls = 0;
+        scopedSink = T54_ID(T54_ID(t54.Scoped.ScopedValue));
+        if (scopedSink.value != 103 || t54.ctorCalls != 1) return 54124;
+        t54.ctorCalls = 0;
+        scopedSink = T54_ID2(t54.Scoped.ScopedValue, 77);
+        if (scopedSink.value != 103 || t54.ctorCalls != 1) return 54125;
+        t54.ctorCalls = 0;
+        scopedSink = T54_ID(t54.scopedFrom(3));
+        if (scopedSink.value != 103 || t54.ctorCalls != 1) return 54126;
+        t54.Sink byteSink = default;
+        t54.Byte byteLocal = t54.ByteValue;
+        t54.Byte[2] byteArray = default;
+        byteArray[0] = t54.ByteValue;
+        t54.ByteField byteField = default;
+        byteField.value = t54.ByteValue;
+        t54.ctorCalls = 0;
+        byteSink = t54.Byte(t54.byteFrom(3));
+        if (byteSink.value != 103 || t54.ctorCalls != 1) return 54127;
+        t54.ctorCalls = 0;
+        byteSink = (t54.Byte)t54.byteFrom(3);
+        if (byteSink.value != 103 || t54.ctorCalls != 1) return 54128;
+        t54.ctorCalls = 0;
+        byteSink = (t54.Byte(t54.byteFrom(3)));
+        if (byteSink.value != 103 || t54.ctorCalls != 1) return 54129;
+        t54.ctorCalls = 0;
+        byteSink = ((t54.Byte(t54.byteFrom(3))));
+        if (byteSink.value != 103 || t54.ctorCalls != 1) return 54130;
+        t54.ctorCalls = 0;
+        byteSink = (byteLocal);
+        if (byteSink.value != 103 || t54.ctorCalls != 1) return 54131;
+        t54.ctorCalls = 0;
+        byteSink = byteArray[0];
+        if (byteSink.value != 103 || t54.ctorCalls != 1) return 54132;
+        t54.ctorCalls = 0;
+        byteSink = byteField.value;
+        if (byteSink.value != 103 || t54.ctorCalls != 1) return 54133;
+        t54.ctorCalls = 0;
+        byteSink = t54.byteFrom(3);
+        if (byteSink.value != 103 || t54.ctorCalls != 1) return 54134;
+        t54.ctorCalls = 0;
+        byteSink = true ? t54.ByteValue : t54.ByteValue;
+        if (byteSink.value != 103 || t54.ctorCalls != 1) return 54135;
+        t54.ctorCalls = 0;
+        byteSink = T54_ID(t54.ByteValue);
+        if (byteSink.value != 103 || t54.ctorCalls != 1) return 54136;
+        t54.ctorCalls = 0;
+        byteSink = T54_ID(T54_ID(t54.ByteValue));
+        if (byteSink.value != 103 || t54.ctorCalls != 1) return 54137;
+        t54.ctorCalls = 0;
+        byteSink = T54_ID2(t54.ByteValue, 77);
+        if (byteSink.value != 103 || t54.ctorCalls != 1) return 54138;
+        t54.ctorCalls = 0;
+        byteSink = T54_ID(t54.byteFrom(3));
+        if (byteSink.value != 103 || t54.ctorCalls != 1) return 54139;
+    }
+    // T54 destination contexts: declaration, CFlat return, and C++ by-value argument.
+    {
+        t54.ctorCalls = 0;
+        t54.Sink plainInit = T54_ID(t54.PlainValue);
+        if (plainInit.value != 103 || t54.ctorCalls != 1) return 54201;
+        t54.ctorCalls = 0;
+        t54.Sink scopedInit = T54_ID(t54.Scoped.ScopedValue);
+        if (scopedInit.value != 103 || t54.ctorCalls != 1) return 54202;
+        t54.ctorCalls = 0;
+        t54.Sink byteInit = T54_ID(t54.ByteValue);
+        if (byteInit.value != 103 || t54.ctorCalls != 1) return 54203;
+        t54.ctorCalls = 0;
+        t54.Sink plainReturn = t54ReturnPlain();
+        if (plainReturn.value != 103 || t54.ctorCalls != 1) return 54204;
+        t54.ctorCalls = 0;
+        t54.Sink scopedReturn = t54ReturnScoped();
+        if (scopedReturn.value != 103 || t54.ctorCalls != 1) return 54205;
+        t54.ctorCalls = 0;
+        t54.Sink byteReturn = t54ReturnByte();
+        if (byteReturn.value != 103 || t54.ctorCalls != 1) return 54206;
+        t54.ctorCalls = 0;
+        if (t54_sink_value(T54_ID(t54.PlainValue)) != 103 || t54.ctorCalls != 1)
+            return 54207;
+        t54.ctorCalls = 0;
+        if (t54_sink_value(T54_ID(t54.Scoped.ScopedValue)) != 103 || t54.ctorCalls != 1)
+            return 54208;
+        t54.ctorCalls = 0;
+        if (t54_sink_value(T54_ID(t54.ByteValue)) != 103 || t54.ctorCalls != 1)
+            return 54209;
+        // Same-class sources stay trivial copies (clang: the one call is copySource's).
+        t54.ctorCalls = 0;
+        t54.Sink copySource = T54_ID(t54.PlainValue);
+        t54.Sink copyDest = default;
+        copyDest = copySource;
+        copyDest = t54.take(copyDest);
+        t54.Sink copyInit = copyDest;
+        if (copyDest.value != 103 || copyInit.value != 103 || t54.ctorCalls != 1) return 54210;
+        // A '?:' of enum values (runtime condition) declares through the converting ctor too.
+        int t54k = t54IntSource();
+        t54.Scoped t54ScopedLocal = t54.Scoped.ScopedValue;
+        t54.ctorCalls = 0;
+        t54.Sink plainTernary = t54k > 0 ? t54.PlainValue : t54.plainFrom(4);
+        if (plainTernary.value != 103 || t54.ctorCalls != 1) return 54211;
+        t54.ctorCalls = 0;
+        t54.Sink scopedTernary = t54k > 5 ? t54.Scoped.ScopedValue : t54ScopedLocal;
+        if (scopedTernary.value != 103 || t54.ctorCalls != 1) return 54212;
+        t54.ctorCalls = 0;
+        t54.Sink byteTernary = t54k > 0 ? t54.ByteValue : t54.byteFrom(4);
+        if (byteTernary.value != 103 || t54.ctorCalls != 1) return 54213;
+        // The same through a plain (non-template) converting ctor: constant, variable, '?:'.
+        t54.Plain sink2Local = t54.PlainValue;
+        t54.ctorCalls = 0;
+        t54.Sink2 sink2Const = t54.PlainValue;
+        if (sink2Const.value != 103 || t54.ctorCalls != 1) return 54214;
+        t54.ctorCalls = 0;
+        t54.Sink2 sink2Var = sink2Local;
+        if (sink2Var.value != 103 || t54.ctorCalls != 1) return 54215;
+        t54.ctorCalls = 0;
+        t54.Sink2 sink2Ternary = t54k > 0 ? t54.PlainValue : sink2Local;
+        if (sink2Ternary.value != 103 || t54.ctorCalls != 1) return 54216;
+        // Same-class element / subscript sources are plain copies (clang: no ctor runs).
+        t54.Sink2 sink2Four = t54.plainFrom(4);
+        t54.Sink2[2] sink2Arr = { sink2Const, sink2Four };
+        t54.Sink2* sink2Ptr = &sink2Four;
+        t54.ctorCalls = 0;
+        t54.Sink2 sink2Elem = sink2Arr[1];
+        t54.Sink2 sink2ElemK = sink2Arr[t54k - 2];
+        t54.Sink2 sink2ElemParen = (sink2Arr[1]);
+        t54.Sink2 sink2Sub = sink2Ptr[0];
+        if (sink2Elem.value != 104 || sink2ElemK.value != 104 || sink2ElemParen.value != 104
+            || sink2Sub.value != 104 || t54.ctorCalls != 0) return 54217;
+        t54.Sink[2] sinkArr = { copySource, plainTernary };
+        t54.Sink* sinkPtr = &copySource;
+        t54.ctorCalls = 0;
+        t54.Sink sinkElem = sinkArr[t54k - 2];
+        t54.Sink sinkSub = sinkPtr[0];
+        if (sinkElem.value != 103 || sinkSub.value != 103 || t54.ctorCalls != 0) return 54218;
+        // A ctor whose trailing parameter has a default converts one argument (clang 110/111).
+        t54.Plain daLocal = t54.plainFrom(4);
+        t54.ctorCalls = 0;
+        t54.SinkDA daConst = t54.PlainValue;
+        if (daConst.value != 110 || t54.ctorCalls != 1) return 54219;
+        t54.ctorCalls = 0;
+        t54.SinkDA daVar = daLocal;
+        if (daVar.value != 111 || t54.ctorCalls != 1) return 54220;
+        t54.ctorCalls = 0;
+        t54.SinkDA daTernary = t54k > 0 ? t54.PlainValue : daLocal;
+        if (daTernary.value != 110 || t54.ctorCalls != 1) return 54221;
+        // An enum element source is evaluated once (clang 103, index 1, one ctor call).
+        t54.Plain[3] plainArr = { t54.PlainValue, t54.plainFrom(4), t54.PlainValue };
+        int t54i = 0;
+        t54.ctorCalls = 0;
+        t54.Sink2 elemOnce = plainArr[t54i++];
+        if (elemOnce.value != 103 || t54i != 1 || t54.ctorCalls != 1) return 54222;
+        // A constructor-template candidate must not turn non-enum sources into conversions.
+        t54.Sink refused = default;
+        expect_error("cannot assign to C++ class") { refused = 3; }
+        expect_error("cannot assign to C++ class") { refused = t54IntSource(); }
+        expect_error("cannot assign to C++ class") { refused = T54_ID(t54IntSource()); }
+        expect_error("cannot assign to C++ class") { refused = t54.Other.OtherValue; }
+    }
+
     // T34: a static non-template member beside same-name static member templates binds by
     // arity (allocator_traits::allocate(a, n)); clang: 104 1104 2109.
     {
@@ -1857,6 +2627,55 @@ extern int main()
     if (std.cflat_t28.len(std.cflat_t28.fwd("abcd")) != 4) return 28003;
     if (std.cflat_t28.len(std.cflat_t28.fwd("abcdef", 2)) != 6) return 28004;
     if (std.cflat_t28.call5(std.cflat_t28.fwd(std.cflat_t28.triple)) != 15) return 28005;
+    // T56: thin function-pointer slots keep caller identity through escaping forwards.
+    function<int(int)> t56Fn = fnptr_add_one;
+    if (t28.call5(t28.fwd1(t56Fn)) != 6) return 56001;
+    if (T56ForwardParam(t56Fn) != 6) return 56004;
+    if (t28.call5(t28.fwd1(T56GlobalFn)) != 6) return 56003;
+    if (std.cflat_t28.category(t56Fn) != 1 || std.cflat_t28.category(move t56Fn) != 2) return 56008;
+    if (std.cflat_t28.call5(std.cflat_t28.fwd(move t56Fn)) != 6) return 56002;
+    function<int(int)> t56Noncapturing = (int v) => v * 3;
+    if (std.cflat_t28.call5(std.cflat_t28.fwd(t56Noncapturing)) != 15) return 56007;
+    bool t69Pick = true;
+    if (t28.call5plain(t69Pick ? t56Fn : t56Noncapturing) != 6) return 69001;
+    t69Pick = false;
+    if (t28.call5plain(t69Pick ? t56Fn : t56Noncapturing) != 15) return 69002;
+    t69Pick = true;
+    if (t28.call5plain(t69Pick ? fnptr_add_one : fnptr_times_ten) != 6) return 69008;
+    t69Pick = false;
+    if (t28.call5plain(t69Pick ? fnptr_add_one : fnptr_times_ten) != 50) return 69009;
+    t69Pick = true;
+    if (t28.call5plain(t69Pick ? t56Fn : fnptr_times_ten) != 6) return 69010;
+    t69Pick = false;
+    if (t28.call5plain(t69Pick ? t56Fn : fnptr_times_ten) != 50) return 69011;
+    auto t69FunctionHolder = t28.hold(t56Fn);
+    if (t69FunctionHolder.run(5) != 6) return 69005;
+    auto t69PointerHolder = t28.holdfwd(t56Fn);
+    if (t69PointerHolder.run(5) != 6) return 69006;
+    auto t69DesignatorHolder = t28.holdfwd(fnptr_add_one);
+    if (t69DesignatorHolder.run(5) != 6) return 69007;
+    HeapAudit.enable();
+    int t69HeapBase = (int)HeapAudit.reportLeaks();
+    {
+        int t69Capture = 4;
+        Lambda<int(int)> t69Closure = (int v) => v * t69Capture;
+        auto t69Holder = t28.hold(t69Closure);
+        if (t69Holder.run(5) != 20) return 69003;
+        auto t69Tag = t28.tagonly(t69Closure);
+        if (t69Tag.run(5) != 5) return 69012;
+    }
+    if ((int)HeapAudit.reportLeaks() != t69HeapBase) return 69004;
+    // A borrowed closure wrapper leaves the owning environment count unchanged.
+    HeapAudit.enable();
+    int t56HeapBase = (int)HeapAudit.reportLeaks();
+    {
+        int t56Capture = 4;
+        Lambda<int(int)> t56Closure = (int v) => v * t56Capture;
+        int t56ClosureLive = (int)HeapAudit.reportLeaks();
+        if (t56ClosureLive <= t56HeapBase || t28.call5plain(t56Closure) != 20
+            || (int)HeapAudit.reportLeaks() != t56ClosureLive) return 56005;
+    }
+    if ((int)HeapAudit.reportLeaks() != t56HeapBase) return 56006;
     std.cflat_t28.LitRef t28Escaped = T28Escape();
     t28.scribble();
     if (std.cflat_t28.len(t28Escaped) != 4) return 28006;
@@ -1888,6 +2707,81 @@ extern int main()
         || std.cflat_t28.chosen != 1) return 29008;
     if (t28.consume2(t28.two("abc", "defgh"), std.cflat_t28.scribble()) != 35
         || std.cflat_t28.chosen != 1) return 29009;
+    char[8] t27Chars = "abcdefg";
+    char* t27CharPointer = t27Chars;
+    if (t27ptr.pick_void_or_char(t27CharPointer + 1) != 2) return 27001;
+    t27ptr.VoidCtor t27Ctor = t27ptr.VoidCtor(t27CharPointer + 1);
+    if (t27Ctor.get() != 1) return 27002;
+    int[8] t27Ints = default;
+    int* t27IntPointer = &t27Ints[0];
+    if ((t27IntPointer + 4) - t27IntPointer != 4) return 27003;
+    if (t27IntPointer + 4 - t27IntPointer != 4) return 27004;
+    if (((t27IntPointer + 4)) - ((t27IntPointer + 1)) != 3) return 27005;
+    if ((t27IntPointer + 6) - (t27IntPointer + 2) != 4) return 27006;
+    double[8] t27Doubles = default;
+    double* t27DoublePointer = &t27Doubles[0];
+    if ((t27DoublePointer + 3) - t27DoublePointer != 3) return 27007;
+    if (t27DoublePointer + 3 - t27DoublePointer != 3) return 27008;
+    T24Record[8] t27Records = default;
+    T24Record* t27RecordPointer = &t27Records[0];
+    if ((t27RecordPointer + 3) - t27RecordPointer != 3) return 27009;
+    if (t27RecordPointer + 3 - t27RecordPointer != 3) return 27010;
+    if ((t27CharPointer + 5) - t27CharPointer != 5) return 27011;
+    if (t27CharPointer + 5 - t27CharPointer != 5) return 27012;
+    i64[5] t27I64s = default;
+    i64* t27I64Pointer = &t27I64s[0];
+    if ((t27I64Pointer + 3) - t27I64Pointer != 3) return 27013;
+    u8[5] t27U8s = default;
+    u8* t27U8Pointer = &t27U8s[0];
+    if ((t27U8Pointer + 3) - t27U8Pointer != 3) return 27014;
+    int* t27IndexedPointer = &t27Ints[1];
+    int* t27IndexedAdvanced = t27IndexedPointer + 2;
+    if (*t27IndexedAdvanced != t27Ints[3]) return 27015;
+    if ((t27IntPointer + 1) - (t27IntPointer + 4) != -3) return 27016;
+    // T36: every spelling of pointer arithmetic keeps its pointee at C++ deduction, member
+    // templates, overloads and constructors (values from a clang++ -std=c++20 oracle).
+    int[4] t36Ints = {10, 20, 30, 40};
+    int* t36P = &t36Ints[1];
+    int* t36Q = &t36Ints[3];
+    if (t27ptr.kind(t36P + 1) != 2 || t27ptr.kind(1 + t36P) != 2 || t27ptr.kind(t36Q - 1) != 2) return 27017;
+    if (t27ptr.kind(&t36Ints[1] + 1) != 2 || t27ptr.kind(t36Ints + 1) != 2) return 27018;
+    if (t27ptr.kind(t27CharPointer + 1) != 3 || t27ptr.kind(t27DoublePointer + 1) != 4) return 27019;
+    t27ptr.Kinds t36Kinds = default;
+    if (t36Kinds.kind(t36P + 1) != 2 || t36Kinds.kind(t27CharPointer + 2) != 3) return 27020;
+    if (t27ptr.pick_void_or_int(t36P + 1) != 2 || t27ptr.pick_void_or_int(1 + t36P) != 2
+        || t27ptr.pick_void_or_int(t36Q - 1) != 2
+        || t27ptr.pick_void_or_int(&t36Ints[1] + 1) != 2) return 27021;
+    t27ptr.IntCtor t36Ctor = t27ptr.IntCtor(t36P + 1);
+    if (t36Ctor.get() != 30) return 27022;
+    T36Holder t36Holder = default;
+    t36Holder.p = &t36Ints[1];
+    t36Global = &t36Ints[1];
+    if (t27ptr.kind(t36Holder.p + 1) != 2 || t27ptr.kind(t36Global + 1) != 2
+        || t36ParamKind(&t36Ints[1]) != 2) return 27023;
+    if (t27ptr.pick_void_or_int(t36Holder.p + 1) != 2 || t27ptr.pick_void_or_int(t36Global + 1) != 2) return 27024;
+    void* t36Void = t36P;
+    if (t27ptr.pick_void_or_int(t36Void) != 1) return 27025;
+    // void* -> int* has no implicit conversion in C++; the detail spells the argument void*.
+    expect_error("arg=void*  param=int*") { int t36Refused = t27ptr.read_int(t36Void); }
+    // T36 round 2: a chain keeps the type of its pointer step, whichever side the pointer is on
+    // (clang oracle: 3/3/4/2/2; master took the leading integer's type and deduced 1).
+    if (t27ptr.kind(t27CharPointer + 1 + 1) != 3) return 27026;
+    if (t27ptr.kind(1 + t36P + 1) != 2 || t27ptr.kind(2 + t36P - 1 - 1) != 2) return 27027;
+    int*[8] t36Rows = default;
+    int** t36RowPointer = &t36Rows[0];
+    if ((1 + t36RowPointer + 4) - t36RowPointer != 5) return 27028;
+    // T36 round 3: arithmetic over literals keeps the C++ type (round 2 deduced float: 2).
+    if (t27ptr.arith_kind(1e3 + 1) != 3 || t27ptr.arith_kind(1.0 * 2) != 3 || t27ptr.arith_kind(1e3 / 2) != 3
+        || t27ptr.arith_kind((1e3 - 1)) != 3) return 27029;
+    if (t27ptr.pick_arith(1e3 + 1) != 3 || t27ptr.pick_arith(2 * (1.0 + 1)) != 3
+        || t27ptr.arith_kind('+') != 1) return 27030;
+    // T58 round 4: literal operands join the usual arithmetic conversions, not the text
+    // (clang oracle 2/2/3/3/2/3; master read `1.0f + 1` as double and `l + 1.0` as float).
+    float t58F = 1.5f;
+    long t58L = 2;
+    if (t27ptr.arith_kind(1.0f + 1) != 2 || t27ptr.arith_kind(1.5f * 2) != 2
+        || t27ptr.arith_kind(t58L + 1.0) != 3 || t27ptr.arith_kind(t58F * 2.0) != 3
+        || t27ptr.pick_arith(1.0f + 1) != 2 || t27ptr.pick_arith(t58F * 2.0) != 3) return 27031;
     if (t3lookup.f1() != 1) return 13001;
     if (t3lookup.f2() != 1) return 13002;
     if (t3lookup.f3() != 1) return 13003;
@@ -1963,6 +2857,30 @@ extern int main()
     if (cppinl.shared_const.value != 37) return 7890;
     if (cpp_inline_static_a(0) != 10 || cpp_inline_static_b(0) != 20) return 7890;
     if (cpp_inline_static_count_a() != 1 || cpp_inline_static_count_b() != 1) return 7890;
+    // C++ int parameters receive the enum value, including field and ternary arguments. The
+    // overload result agrees with clang++: the unsigned-char enum chooses int (10), not long (20).
+    {
+        T64U8 u8Value = T64U8.T64U8Hi;
+        T64U16 u16Value = T64U16.T64U16Hi;
+        T64U32 u32Value = T64U32.T64U32Hi;
+        T64S8 s8Value = T64S8.T64S8Hi;
+        T64EnumFields fields;
+        fields.u8Value = T64U8.T64U8Hi;
+        fields.u16Value = T64U16.T64U16Hi;
+        fields.u32Value = T64U32.T64U32Hi;
+        if (cppi.ptrarg_int(u8Value) != 200 || cppi.ptrarg_int(T64U8.T64U8Hi) != 200
+            || cppi.ptrarg_int(fields.u8Value) != 200
+            || cppi.ptrarg_int(true ? u8Value : T64U8.T64U8Hi) != 200) return 64007;
+        if (cppi.ptrarg_int(u16Value) != 40000 || cppi.ptrarg_int(T64U16.T64U16Hi) != 40000
+            || cppi.ptrarg_int(fields.u16Value) != 40000
+            || cppi.ptrarg_int(true ? u16Value : T64U16.T64U16Hi) != 40000) return 64008;
+        if (cppi.ptrarg_int(u32Value) != -1294967296
+            || cppi.ptrarg_int(T64U32.T64U32Hi) != -1294967296
+            || cppi.ptrarg_int(fields.u32Value) != -1294967296
+            || cppi.ptrarg_int(true ? u32Value : T64U32.T64U32Hi) != -1294967296
+            || cppi.ptrarg_int(s8Value) != 100 || t49.choose(T64U8.T64U8Hi) != 10)
+            return 64009;
+    }
     if (cpp_inline_const_table_a(2) != 3 || cpp_inline_const_table_b(2) != 9) return 7890;
     // Same-named static f calling a different static g per header: never merged.
     if (cpp_inline_static_fa(0) != 10 || cpp_inline_static_fb(0) != 20) return 7890;
@@ -2559,6 +3477,74 @@ extern int main()
     if (cppi.copy_count() != 0)                  return 353;
     if (cppi.move_count() != 0)                  return 354;
     if (cppi.dtor_count() != 1)                  return 355;
+
+    // Nested defaultable C++ fields and generic fields stay accepted with exact ctor counts.
+    cppi.reset_field_default_counts();
+    {
+        T72DefaultWrap nestedDefault = T72DefaultWrap();
+        if (nestedDefault.leaf.item.value != 7 || cppi.field_default_ctor_count != 1
+            || cppi.field_default_arg_count != 0) return 4370;
+    }
+    if (cppi.field_default_dtor_count != 1)       return 4371;
+    cppi.reset_field_default_counts();
+    {
+        T72DefaultBox<T72DefaultLeaf> genericDefault = T72DefaultBox<T72DefaultLeaf>();
+        if (genericDefault.item.item.value != 7 || cppi.field_default_ctor_count != 1
+            || cppi.field_default_arg_count != 0) return 4372;
+    }
+    if (cppi.field_default_dtor_count != 1)       return 4373;
+    cppi.reset_field_default_counts();
+    {
+        T72InitializedField initializedField = T72InitializedField();
+        if (initializedField.item.value != 11 || cppi.field_default_ctor_count != 0
+            || cppi.field_default_arg_count != 1) return 4374;
+    }
+    if (cppi.field_default_dtor_count != 1)       return 4375;
+    cppi.reset_field_default_counts();
+    {
+        T72UserInitializedField initializedLeaf = T72UserInitializedField();
+        if (initializedLeaf.leaf.item.value != 7 || cppi.field_default_ctor_count != 2
+            || cppi.field_default_arg_count != 0) return 4376;
+    }
+    if (cppi.field_default_dtor_count != 2)       return 4377;
+
+    // Field initializer call-argument temporaries are destroyed after the initializer, while
+    // the returned value becomes the field. The overload and value discriminator match clang++.
+    cppi.reset_counts();
+    {
+        T72TrackedFieldTempHolder fieldTemp = T72TrackedFieldTempHolder();
+        if (fieldTemp.value.value() != 9)        return 4380;
+        if (cppi.ctor_count() != 3 || cppi.dtor_count() != 2) return 4381;
+    }
+    if (cppi.dtor_count() != 3)                  return 4382;
+    cppi.reset_counts();
+    {
+        T72FieldU9 value = T72FieldU9();
+        if (value.value.value() != 8 || cppi.ctor_count() != 2 || cppi.dtor_count() != 1)
+            return 4383;
+    }
+    if (cppi.dtor_count() != 2)                  return 4384;
+    cppi.reset_counts();
+    {
+        T72FieldU10 value = T72FieldU10();
+        if (value.value.value() != 6 || cppi.ctor_count() != 2 || cppi.dtor_count() != 1)
+            return 4385;
+    }
+    if (cppi.dtor_count() != 2)                  return 4386;
+    cppi.reset_counts();
+    {
+        T72FieldU13 value = T72FieldU13();
+        if (value.value.value() != 8 || cppi.ctor_count() != 2 || cppi.dtor_count() != 1)
+            return 4387;
+    }
+    if (cppi.dtor_count() != 2)                  return 4388;
+    cppi.reset_counts();
+    {
+        T72FieldN9 value = T72FieldN9();
+        if (value.value.value() != 8 || cppi.ctor_count() != 2 || cppi.dtor_count() != 1)
+            return 4389;
+    }
+    if (cppi.dtor_count() != 2)                  return 4390;
 
     // Nested scopes: the inner object dies at the inner brace, the outer one at the outer brace.
     cppi.reset_counts();
@@ -4258,8 +5244,8 @@ extern int main()
     if (cppi_scope.takeUIntVector(senumUnscopedVector) != 8) return 1635;
     std.map<int, cppi_scope.U1> senumUnscopedMap = default;
     if (cppi_scope.takeUIntMap(senumUnscopedMap) != 8) return 1636;
-    if (cppi_scope.deduceKind(cppi_scope.U1.u) != 1) return 1637;
-    if (senumModule.deduceKind(cppi_scope.U1.u) != 3) return 1638;
+    if (cppi_scope.deduceKind(cppi_scope.U1.u) != 3) return 1637;
+    if (senumModule.deduceKind(cppi_scope.U1.u) != 5) return 1638;
     if ((int)globalConstCppScoped != 2) return 1639;
     if (readGlobalConstCppScoped(globalConstCppScoped) != 2) return 1640;
 
@@ -8591,6 +9577,8 @@ extern int main()
 
     int longDoubleResult = testLongDoubleNativeInterop();
     if (longDoubleResult != 0) return longDoubleResult;
+    int postfixFloatRefResult = testT71PostfixFloatConstRef();
+    if (postfixFloatRefResult != 0) return postfixFloatRefResult;
 
     std.vector<bool> proxyBits = default;
     proxyBits.push_back(false);
@@ -10920,6 +11908,9 @@ LdtLockHolder LdtMakeLocked()
     LdtLockable m; LdtLockHolder w;
     lock (m) { return w; }
 }
+// CFlat members added to a C++ namespace keep CFlat outward lookup (T61 review).
+namespace cpp_t61 { struct T61Cflat { int v = 5; }; int t61CflatFn() { return 2; } }
+namespace cpp_t61.ext { int t61Ext() { return 1; } }
 t26v.left t26GlobalLeft = default;
 int LoweredUserDtorAssignLegs(int argc)
 {
@@ -11144,6 +12135,69 @@ int LoweredUserDtorAssignLegs(int argc)
     if (t26FinalShiftSink.read(*t26FinalShiftPtr) != 742
         || t26FinalAliasRead(t26v.held_final_shift()) != 742) return 26010;
     if (t26FinalShiftSink.saved != 742) return 26011;
+    // T50: a pointer or reference to a class reaching V through a virtual edge converts through
+    // clang (the unadjusted address read vptr bits); null stays null; V* outranks void*.
+    t50v.Sink t50Sink = default;
+    if (t50Sink.pointer(t50v.left_ptr()) != 731 || t50Sink.pointer(t50v.right_ptr()) != 731
+        || t50Sink.pointer(t50v.d_ptr()) != 731 || t50Sink.pointer(t50v.m_ptr()) != 731
+        || t50Sink.pointer(t50v.p_ptr()) != 731 || t50Sink.pointer(t50v.null_left()) != -1)
+        return 50001;
+    t50v.L* t50Left = t50v.left_ptr();
+    if (t50Sink.pointer(t50Left) != 731 || t50v.free_pointer(t50Left) != 731
+        || t50Sink.pick(t50Left) != 1 || t50Sink.pick(t50v.left_ptr()) != 1) return 50002;
+    t50v.V* t50Base = t50Left;
+    t50v.V* t50NullBase = t50v.null_left();
+    if (t50Base.value != 731 || t50NullBase != nullptr) return 50003;
+    t50Base = t50v.right_ptr();
+    if (t50Base.value != 731 || t50Up(t50Left).value != 731 || t50Take(t50Left) != 731
+        || t50Take(t50v.null_left()) != -1) return 50004;
+    if (t50Sink.ref(*t50Left) != 731 || t50Sink.ref(t50v.left_ref()) != 731
+        || t50Sink.ref(t50v.d_ref()) != 731 || t50Sink.byval(*t50Left) != 732) return 50005;
+    t50v.Holder t50Holder = t50v.Holder(t50Left);
+    t50v.RefHolder t50RefHolder = t50v.RefHolder(*t50Left);
+    t50v.RefHolder t50RefResult = t50v.RefHolder(t50v.left_ref());
+    if (t50Holder.saved != 731 || t50RefHolder.saved != 731 || t50RefResult.saved != 731)
+        return 50006;
+    t50v.NSink t50NSink = default;
+    if (t50NSink.pick(t50v.nd_ptr()) != 1) return 50007;
+    // An inline C++ global of a user-header class with a virtual base: its value is never
+    // loaded (opaque layout), only its address binds.
+    if (t50Sink.ref(t50v.object) != 731 || t50Sink.pointer(&t50v.object) != 731) return 50012;
+    // T50 system-header twin: members spell the unrequested V* / L* parameters as void*.
+    t50s.Sink t50sSink = default;
+    if (t50sSink.pointer(t50s.left_ptr()) != 731 || t50sSink.pointer(t50s.right_ptr()) != 731
+        || t50sSink.pointer(t50s.d_ptr()) != 731 || t50sSink.pointer(t50s.m_ptr()) != 731
+        || t50sSink.pointer(t50s.p_ptr()) != 731 || t50sSink.pointer(t50s.null_left()) != -1
+        || t50sSink.pick(t50s.left_ptr()) != 1) return 50008;
+    t50s.L* t50sLeft = t50s.left_ptr();
+    if (t50sSink.ref(*t50sLeft) != 731 || t50sSink.ref(t50s.left_ref()) != 731
+        || t50sSink.byval(*t50sLeft) != 732 || t50sSink.left(t50s.d_ptr()) != 11) return 50009;
+    t50s.Holder t50sHolder = t50s.Holder(t50s.left_ptr());
+    t50s.RefHolder t50sRefResult = t50s.RefHolder(t50s.left_ref());
+    if (t50sHolder.saved != 731 || t50sRefResult.saved != 731) return 50010;
+    // A member of the virtual base called through a non-complete receiver adjusts `this`.
+    if (t50sLeft.vget() != 731 || t50s.left_ref().vget() != 731) return 50011;
+    // A base alias bound to a derived lvalue holds the base subobject's address.
+    alias t50s.V t50sBaseAlias = t50s.left_ref();
+    alias t50s.V t50sBaseAlias2 = *t50sLeft;
+    if (t50sBaseAlias.vget() != 731 || t50sBaseAlias.value != 731
+        || t50sBaseAlias2.vget() != 731) return 50013;
+    // const D2* picks const B2* over B2* and void*; a free twin agrees whatever the call order.
+    t50s.Pick2 t50sPick2 = default;
+    if (t50sPick2.b(t50s.cd2_ptr()) != 4 || t50sPick2.b(t50s.d2_ptr()) != 3) return 50014;
+    if (t50s.fb2(t50s.cd2_ptr()) != 24 || t50s.fb2(t50s.d2_ptr()) != 23
+        || t50s.fb2(t50s.cd2_ptr()) != 24 || t50s.fa2(t50s.cd2_ptr()) != 21) return 50015;
+    // An unrelated class pointer takes the const void* constructor, never const B2*.
+    t50s.Holder2 t50sHolder2 = t50s.Holder2(t50s.u2_ptr());
+    t50s.Holder2 t50sHolder2b = t50s.Holder2(t50s.d2_ptr());
+    if (t50sHolder2.saved != 32 || t50sHolder2b.saved != 31) return 50016;
+    // Ruling 2026-10-05: the T26 unknown-dynamic-type shapes convert through clang (values per clang).
+    t26v.sink t26HeldSink = default;
+    if (t26HeldSink.read(t26v.held()) != 731 || t26HeldSink.pick(t26v.held()) != 1731) return 50017;
+    t26v.sink t26HeldCtor = t26v.sink(t26v.held());
+    t26v.left* t26HeldPtr = &t26v.held();
+    if (t26HeldCtor.saved != 731 || t26HeldSink.read(*t26HeldPtr) != 731
+        || t26AliasHeldRead(t26v.held()) != 731) return 50018;
     // T25: C surfaces through a C++ namespace (anonymous typedef record by value,
     // function-pointer typedef + auto of a returned function pointer, const void* comparator).
     t25surface.Pair surfacePair = t25surface.pair(17, 5);
@@ -11184,6 +12238,211 @@ int LoweredUserDtorAssignLegs(int argc)
         || t25surface.pick(t25surface.Callbacks.by_const) != 1
         || t25surface.pick(t25surface.Callbacks.by_mutable) != 2)
         return 25012;
+    // Inner variable-template CPO named like the outer stream type (std.views.istream<T> shape).
+    cpp_t61.probe t61Input = cpp_t61.probe("4 5 6");
+    i64 t61Sum = 0;
+    for (int value in cpp_t61.views.probe<int>(t61Input)) t61Sum += value;
+    if (t61Sum != 15) return 6101;
+    cpp_t61.probe t61DoubleInput = cpp_t61.probe("1.5 2.5");
+    double t61DoubleSum = 0.0;
+    for (double value in cpp_t61.views.probe<double>(t61DoubleInput)) t61DoubleSum += value;
+    if (t61DoubleSum != 4.0) return 6102;
+    cpp_t61.probe t61StringInput = cpp_t61.probe("a bb");
+    std.string t61Joined;
+    for (std.string value in cpp_t61.views.probe<std.string>(t61StringInput)) t61Joined += value;
+    if (t61Joined.size() != 3) return 6103;
+    cpp_t61.probe t61FullInput = cpp_t61.probe("7 8");
+    i64 t61FullSum = 0;
+    for (int value in cpp_t61.ranges.views.probe<int>(t61FullInput)) t61FullSum += value;
+    if (t61FullSum != 15) return 6104;
+    cpp_t61.ext.T61Cflat t61Outer;
+    if (t61Outer.v + cpp_t61.ext.t61CflatFn() + cpp_t61.ext.t61Ext() != 8) return 6105;
+    int t67j = 0;
+    if (cpp_t67.by_value(t67j++) != 100 || t67j != 1) return 6701;
+    t67j = 0;
+    if (cpp_t67.by_value(t67j--) != 100 || t67j != -1) return 67016;
+    t67j = 0;
+    if (cpp_t67.by_const_ref(t67j++) != 200 || t67j != 1) return 6702;
+    t67j = 0;
+    if (cpp_t67.by_const_ref(t67j--) != 200 || t67j != -1) return 67017;
+    t67j = 0;
+    if (cpp_t67.by_rvalue_ref(t67j++) != 300 || t67j != 1) return 67018;
+    t67j = 0;
+    if (cpp_t67.by_rvalue_ref(t67j--) != 300 || t67j != -1) return 67019;
+    t67j = 0;
+    if (cpp_t67.by_template(t67j++) != 400 || t67j != 1) return 6703;
+    t67j = 0;
+    cpp_t67.Made t67Made = cpp_t67.Made(2, t67j++);
+    if (t67Made.first != 2 || t67Made.second != 0 || t67j != 1) return 6704;
+    int t67i = 0;
+    cpp_t67.Pair t67Direct{t67i++, t67i++};
+    if (t67Direct.first != 0 || t67Direct.second != 1 || t67i != 2) return 6705;
+    t67i = 0;
+    cpp_t67.Pair t67Assigned = {t67i++, t67i++};
+    if (t67Assigned.first != 0 || t67Assigned.second != 1 || t67i != 2) return 6706;
+    t67i = 0;
+    cpp_t67.List t67List{t67i++, t67i++};
+    if (t67List.first != 0 || t67List.second != 1 || t67i != 2) return 6707;
+    t67i = 0;
+    if (cpp_t67.take({t67i++, t67i++}) != 1 || t67i != 2) return 6708;
+    t67j = 0;
+    cpp_t67.Obj t67Obj = cpp_t67.Obj();
+    if (t67Obj.call(t67j++) != 500 || t67j != 1) return 6709;
+    t67j = 0;
+    cpp_t67.Add t67Add = cpp_t67.Add();
+    if (t67Add + t67j++ != 600 || t67j != 1) return 67010;
+    t67j = 0;
+    std.vector<int> t67Vector = std.vector<int>(2, t67j++);
+    if (t67Vector[0] != 0 || t67Vector[1] != 0 || t67j != 1) return 67011;
+    t67i = 0;
+    std.vector<int> t67VectorBrace{t67i++, t67i++, t67i++};
+    if (t67VectorBrace[0] != 0 || t67VectorBrace[1] != 1
+        || t67VectorBrace[2] != 2 || t67i != 3) return 67012;
+    int[4] t67PtrArray = default;
+    int* t67Ptr = &t67PtrArray[0];
+    if (cpp_t67.ptr_const_ref(t67Ptr++, &t67PtrArray[0]) != 0
+        || t67Ptr - &t67PtrArray[0] != 1) return 67020;
+    t67Ptr = &t67PtrArray[2];
+    if (cpp_t67.ptr_const_ref(t67Ptr--, &t67PtrArray[0]) != 2
+        || t67Ptr - &t67PtrArray[0] != 1) return 67021;
+    t67Ptr = &t67PtrArray[0];
+    if (cpp_t67.ptr_rvalue_ref(t67Ptr++, &t67PtrArray[0]) != 0
+        || t67Ptr - &t67PtrArray[0] != 1) return 67022;
+    t67Ptr = &t67PtrArray[2];
+    if (cpp_t67.ptr_rvalue_ref(t67Ptr--, &t67PtrArray[0]) != 2
+        || t67Ptr - &t67PtrArray[0] != 1) return 67023;
+    t67Ptr = &t67PtrArray[0];
+    if (cpp_t67.ptr_value(t67Ptr++, &t67PtrArray[0]) != 0
+        || t67Ptr - &t67PtrArray[0] != 1) return 67024;
+    t67Ptr = &t67PtrArray[2];
+    if (cpp_t67.ptr_value(t67Ptr--, &t67PtrArray[0]) != 2
+        || t67Ptr - &t67PtrArray[0] != 1) return 67025;
+    t67Ptr = &t67PtrArray[0];
+    cpp_t67.PtrMade t67PtrMade = cpp_t67.PtrMade(t67Ptr++);
+    if (t67PtrMade.value != &t67PtrArray[0]
+        || t67Ptr - &t67PtrArray[0] != 1) return 67026;
+    t67Ptr = &t67PtrArray[0];
+    std.vector<int*> t67PtrPush;
+    t67PtrPush.push_back(t67Ptr++);
+    if (t67PtrPush[0] != &t67PtrArray[0]
+        || t67Ptr - &t67PtrArray[0] != 1) return 67027;
+    t67Ptr = &t67PtrArray[0];
+    std.vector<int*> t67PtrEmplace;
+    t67PtrEmplace.emplace_back(t67Ptr++);
+    if (t67PtrEmplace[0] != &t67PtrArray[0]
+        || t67Ptr - &t67PtrArray[0] != 1) return 67028;
+    t67Ptr = &t67PtrArray[0];
+    std.vector<int*> t67PtrBrace{t67Ptr++};
+    if (t67PtrBrace[0] != &t67PtrArray[0]
+        || t67Ptr - &t67PtrArray[0] != 1) return 67029;
+    t67Ptr = &t67PtrArray[0];
+    std.vector<int*> t67PtrAssigned = {t67Ptr++};
+    if (t67PtrAssigned[0] != &t67PtrArray[0]
+        || t67Ptr - &t67PtrArray[0] != 1) return 67030;
+    cpp_t67.PtrOps t67PtrOps = cpp_t67.PtrOps();
+    t67Ptr = &t67PtrArray[0];
+    if (t67PtrOps.member(t67Ptr++, &t67PtrArray[0]) != 0
+        || t67Ptr - &t67PtrArray[0] != 1) return 67031;
+    cpp_t67.postinc_base = &t67PtrArray[0];
+    t67Ptr = &t67PtrArray[0];
+    if (t67PtrOps + t67Ptr++ != 0
+        || t67Ptr - &t67PtrArray[0] != 1) return 67032;
+    t67Ptr = &t67PtrArray[0];
+    int t67DerefPost = *t67Ptr++;
+    if (t67DerefPost != 0 || t67Ptr - &t67PtrArray[0] != 1) return 67033;
+    T67PostincNode[2] t67Nodes = default;
+    t67Nodes[0].value = 42;
+    T67PostincNode* t67NodePtr = &t67Nodes[0];
+    if (t67NodePtr++->value != 42 || t67NodePtr != &t67Nodes[1]) return 67034;
+    t67PtrArray[0] = 11;
+    t67PtrArray[1] = 22;
+    t67Ptr = &t67PtrArray[0];
+    int t67Indexed = t67PtrArray[t67Ptr++ - &t67PtrArray[0]];
+    if (t67Indexed != 11 || t67Ptr - &t67PtrArray[0] != 1) return 67035;
+    t67CallCount = 0;
+    if (cpp_t67.by_value(t67NextValue()) != 101 || t67CallCount != 1) return 67013;
+    t67CallCount = 0;
+    if (cpp_t67.take({t67NextValue(), t67NextValue()}) != 12
+        || t67CallCount != 2) return 67014;
+    t67CallCount = 0;
+    std.vector<int> t67Ordered{t67NextValue(), t67NextValue(), t67NextValue()};
+    if (t67Ordered[0] != 1 || t67Ordered[1] != 2 || t67Ordered[2] != 3
+        || t67CallCount != 3) return 67015;
+    // T73: clang's implicit non-trivial default constructor applies to CFlat fields too.
+    if (cpp_t73.ctor_count != 2 || t73Global.mix.first.value != 7
+        || t73Global.mix.second.value != 7) return 73001;
+    cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
+    {
+        cpp_t73.Mix t73Direct;
+        if (cpp_t73.ctor_count != 2 || t73Direct.first.value != 7) return 73016;
+    }
+    if (cpp_t73.dtor_count != 2) return 73017;
+    cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
+    {
+        T73Holder t73Field;
+        if (cpp_t73.ctor_count != 2 || t73Field.mix.first.value != 7
+            || t73Field.mix.second.value != 7) return 73002;
+    }
+    if (cpp_t73.dtor_count != 2) return 73003;
+    cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
+    {
+        T73Nested t73Nested;
+        if (cpp_t73.ctor_count != 2 || t73Nested.holder.mix.first.value != 7) return 73004;
+    }
+    if (cpp_t73.dtor_count != 2) return 73005;
+    cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
+    {
+        T73ArrayHolder t73Array = default;
+        if (cpp_t73.ctor_count != 4 || t73Array.items[1].second.value != 7) return 73006;
+    }
+    if (cpp_t73.dtor_count != 4) return 73007;
+    cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
+    {
+        T73GenericHolder t73Generic;
+        if (cpp_t73.ctor_count != 2 || t73Generic.generic.item.first.value != 7)
+            return 73008;
+    }
+    if (cpp_t73.dtor_count != 2) return 73009;
+    cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
+    {
+        T73Holder* t73Heap = new T73Holder();
+        if (cpp_t73.ctor_count != 2 || t73Heap.mix.second.value != 7) return 73018;
+        delete t73Heap;
+    }
+    if (cpp_t73.dtor_count != 2) return 73019;
+    cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
+    {
+        T73Holder t73Temporary = T73Holder();
+        if (cpp_t73.ctor_count != 2 || t73Temporary.mix.first.value != 7) return 73020;
+    }
+    if (cpp_t73.dtor_count != 2) return 73021;
+    cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
+    {
+        T73VirtualHolder t73Virtual;
+        if (cpp_t73.ctor_count != 1 || t73Virtual.value.get() != 19) return 73010;
+    }
+    if (cpp_t73.dtor_count != 1) return 73011;
+    {
+        T73DefaultMemberHolder t73DefaultMember;
+        if (t73DefaultMember.value.value != 5) return 73012;
+    }
+    {
+        T73TrivialHolder t73Trivial;
+        if (t73Trivial.value.value != 0) return 73013;
+    }
+    cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
+    {
+        T73Initialized t73Initialized;
+        if (cpp_t73.ctor_count != 2 || t73Initialized.mix.first.value != 7)
+            return 73014;
+    }
+    if (cpp_t73.dtor_count != 2) return 73015;
+    cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
+    {
+        T73DefaultedInitializer t73Defaulted = default;
+        if (cpp_t73.ctor_count != 2 || t73Defaulted.mix.first.value != 7) return 73022;
+    }
+    if (cpp_t73.dtor_count != 2) return 73023;
     return 0;
 }
 
@@ -11283,6 +12542,11 @@ int UnwKeepCoalesce(int x)
 
 // t28: a literal-backed reference returned out of a function keeps its static storage.
 std.cflat_t28.LitRef T28Escape() { std.cflat_t28.LitRef t = std.cflat_t28.fwd("abcd"); return t; }
+
+int T56ForwardParam(function<int(int)> f)
+{
+    return t28.call5(t28.fwd1(f));
+}
 
 int W4JoinRead(cppon.Esc* p) { return p == nullptr ? -1 : p->v; }
 int W4NestedJoin(int c)

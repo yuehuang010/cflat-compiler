@@ -44,3 +44,7 @@ field name (nested too), and global initializers are refused. Brace lists for ar
 The C-import param spelling nit ('i64*' for C long*) is unchanged.
 
 RULED 2026-10-01 (maintainer): char family staged: (1) retype core text APIs (`string.data()`, filesystem `data()`, ...) from `i8*` to `char*`; (2) then block `i8* <-> char*` like the rest (explicit cast is the workaround). Stage 2 only after stage 1 leaves no core-induced sites.
+
+## 2026-10-06 note (T36 round 5, pre-existing on master)
+C++ `cf(const char*)` accepts `int*` (`cf(&x)` -> 2) and `signed char*`; clang++ -std=c++20 refuses
+both. Probes: scratch/repro_keep/t36_rev5/ (cx.cb, h.hpp).

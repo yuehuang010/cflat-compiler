@@ -1,0 +1,7 @@
+int t60CrossFileEnum<T>()
+{
+    enum E : int { V = sizeof(T) };
+    return (int)E.V;
+}
+
+int t60CrossFileEnumFromImport() { return t60CrossFileEnum<i64>(); }

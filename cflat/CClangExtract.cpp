@@ -4699,6 +4699,9 @@ namespace cflat_cinterop
                     return true;
                 }
 
+                if (const auto* integer = llvm::dyn_cast<IntegerLiteral>(init->IgnoreParenImpCasts()))
+                    m.isIntegerLiteralZero = integer->getValue().isZero();
+
                 if (auto* sl = llvm::dyn_cast<StringLiteral>(init->IgnoreParenImpCasts()))
                 {
                     if (sl->isOrdinary())

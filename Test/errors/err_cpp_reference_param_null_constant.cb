@@ -1,0 +1,37 @@
+import cpp "cpp_t52_refnull.hpp";
+
+expect_error("no overload") {
+    int t52ShadowParam(long ZERO) { return cpi_t52.lp(ZERO); }
+}
+expect_error("no overload") {
+    int t52ShadowParamInt(int Z0) { return cpi_t52.lp(Z0); }
+}
+expect_error("no overload") {
+    int t52ShadowLocalInt() { int Z0 = 7; return cpi_t52.lp(Z0); }
+}
+
+extern int main()
+{
+    expect_error("no overload") { cpi_t52.av(nullptr); }
+    expect_error("no overload") { cpi_t52.av(0); }
+    expect_error("no overload") { cpi_t52.fr(0); }
+    expect_error("no overload") { cpi_t52.nested(0); }
+    expect_error("no overload") { cpi_t52.lp(cpi_t52.ez); }
+    expect_error("no overload") { cpi_t52.plref(0); }
+    expect_error("no overload") { long ZERO = 7; cpi_t52.lp(ZERO); }
+    expect_error("no overload") { cpi_t52.lp(CHZERO); }
+    expect_error("no overload") { cpi_t52.lp(M1); }
+    expect_error("no overload") { cpi_t52.lp(M2); }
+    expect_error("no overload") { cpi_t52.lp(M3); }
+    expect_error("no overload") { cpi_t52.lp(M4); }
+    expect_error("no overload") { cpi_t52.lp((N5)); }
+    expect_error("no overload") { cpi_t52.lp(p: (N5)); }
+    expect_error("is an rvalue reference") { int Z0 = 7; cpi_t52.irr(Z0); }
+    expect_error("no overload") { cpi_t52.lp(!Z0); }
+    expect_error("no overload") { cpi_t52.lp(~ZERO64); }
+    expect_error("no overload") { cpi_t52.lp(-ZERO64); }
+    expect_error("no overload") { cpi_t52.lp(+ZERO64); }
+    expect_error("no overload") { cpi_t52.lp((long)ZERO64); }
+    expect_error("no overload") { cpi_t52.lp(move ZERO64); }
+    return 0;
+}

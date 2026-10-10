@@ -444,8 +444,94 @@ int cppUnwindThroughHelperLegs()
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
+struct FloatPostfixPair { float f = 1.5f; double d = 2.5; };
+struct FloatPostfixFloatPair { float a; float b; };
+struct FloatPostfixDoublePair { double a; double b; };
+struct FloatPostfixBox<T> { T value = default; };
+float floatPostfixGeneric<T>(T value) { value++; return (float)value; }
+bool floatPostfixCapture(float a, float b) { return a == 16777216.0f && b == 16777216.0f; }
+float floatPostfixGlobal = 1.5f;
+double doublePostfixGlobal = 2.5;
+long double longDoublePostfixGlobal = 3.5;
+
 extern int main()
 {
+    float postfixFloat = 1.5f;
+    float postfixOldFloat = postfixFloat++;
+    double postfixDouble = 2.5;
+    double postfixOldDouble = postfixDouble--;
+    Test("postfix float old value", postfixOldFloat, 1.5f);
+    Test("postfix float updates local", postfixFloat, 2.5f);
+    Test("postfix double old value", (float)postfixOldDouble, 2.5f);
+    Test("postfix double updates local", (float)postfixDouble, 1.5f);
+    long double postfixLongDouble = 3.5;
+    long double postfixOldLongDouble = postfixLongDouble++;
+    longDoublePostfixGlobal++;
+    Test("postfix long double old value", (float)postfixOldLongDouble, 3.5f);
+    Test("postfix local and global long double", (float)(postfixLongDouble + longDoublePostfixGlobal), 9.0f);
+
+    FloatPostfixPair postfixPair = FloatPostfixPair();
+    postfixPair.f++;
+    postfixPair.d--;
+    FloatPostfixPair* postfixPairPtr = &postfixPair;
+    postfixPairPtr->f++;
+    Test("postfix updates float and double fields", postfixPair.f * 10.0f + (float)postfixPair.d, 36.5f);
+
+    float postfixPointee = 1.5f;
+    float* postfixPointer = &postfixPointee;
+    float pointerOldValue = postfixPointer[0]++;
+    Test("postfix pointer expression old value", pointerOldValue, 1.5f);
+    Test("postfix pointer updates pointee", postfixPointee, 2.5f);
+    float dereferenceOldValue = (*postfixPointer)--;
+    Test("postfix dereference expression old value", dereferenceOldValue, 2.5f);
+    Test("postfix through pointer and dereference", postfixPointee, 1.5f);
+
+    float[2] postfixArray = {1.5f, 2.5f};
+    postfixArray[1]++;
+    Test("postfix array element", postfixArray[1], 3.5f);
+
+    floatPostfixGlobal++;
+    doublePostfixGlobal--;
+    Test("postfix global float and double", floatPostfixGlobal * 10.0f + (float)doublePostfixGlobal, 26.5f);
+
+    double postfixLoopSum = 0.0;
+    for (double postfixLoop = 0.0; postfixLoop < 3.0; postfixLoop++) postfixLoopSum += postfixLoop;
+    Test("postfix double loop control", (float)postfixLoopSum, 3.0f);
+
+    FloatPostfixBox<float> postfixBox = FloatPostfixBox<float>();
+    postfixBox.value = 1.5f;
+    postfixBox.value++;
+    Test("postfix generic float field", postfixBox.value, 2.5f);
+    Test("postfix generic float function", floatPostfixGeneric<float>(1.5f), 2.5f);
+
+    float round2Same = 16777216.0f;
+    FloatPostfixFloatPair round2SameFields = {a = round2Same++, b = round2Same++};
+    Test("postfix float same-sign brace fields", round2SameFields.a == 16777216.0f
+        && round2SameFields.b == 16777216.0f && round2Same == 16777216.0f, true);
+    float round2Mixed = 16777216.0f;
+    FloatPostfixFloatPair round2MixedFields = {a = round2Mixed++, b = round2Mixed--};
+    Test("postfix float mixed-sign brace fields", round2MixedFields.a == 16777216.0f
+        && round2MixedFields.b == 16777216.0f && round2Mixed == 16777215.0f, true);
+    float round2CallSame = 16777216.0f;
+    bool round2CallSameArgs = floatPostfixCapture(round2CallSame++, round2CallSame++);
+    Test("postfix float same-sign call args", round2CallSameArgs
+        && round2CallSame == 16777216.0f, true);
+    float round2CallMixed = 16777216.0f;
+    bool round2CallMixedArgs = floatPostfixCapture(round2CallMixed++, round2CallMixed--);
+    Test("postfix float mixed-sign call args", round2CallMixedArgs
+        && round2CallMixed == 16777215.0f, true);
+    double round2Double = 9007199254740992.0;
+    FloatPostfixDoublePair round2DoubleFields = {a = round2Double++, b = round2Double++};
+    Test("postfix double same-sign fields at 2^53", round2DoubleFields.a == 9007199254740992.0
+        && round2DoubleFields.b == 9007199254740992.0 && round2Double == 9007199254740992.0, true);
+
+    float postfixCompoundFloat = 1.5f;
+    double postfixCompoundDouble = 2.5;
+    postfixCompoundFloat += 1.0f;
+    postfixCompoundDouble -= 1.0;
+    Test("compound float neighbor", postfixCompoundFloat, 2.5f);
+    Test("compound double neighbor", (float)postfixCompoundDouble, 1.5f);
+
     // Vec2 tests
     Vec2 a; a.x = 1.0f; a.y = 2.0f;
     Vec2 b; b.x = 3.0f; b.y = 4.0f;

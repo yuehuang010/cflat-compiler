@@ -52,33 +52,6 @@ std::string CppStructThunkStem(const std::string& name)
 }
 }
 
-bool MainListener::HasUnavailableNestedCxxDefault(const std::string& typeName)
-{
-    auto* compiler = Compiler();
-    if (compiler->IsCxxRecord(typeName) || compiler->GetFunction(typeName) == nullptr)
-        return false;
-    for (const auto& field : compiler->GetDataStructure(typeName).StructFields)
-    {
-        if (field.Pointer || field.BraceInitializer != nullptr
-            || (field.Initializer != nullptr && field.Initializer->Default() == nullptr))
-            continue;
-        if (compiler->IsCxxRecord(field.TypeName))
-        {
-            if (field.ConstArraySize != 0
-                || !(compiler->CxxElementNeedsDefaultConstruction(field.TypeName)
-                    || compiler->HasNonPublicCxxDefaultCtor(field.TypeName)))
-                continue;
-            std::string error;
-            compiler->TryBindCxxImplicitDefaultCtor(field.TypeName, error);
-            if (!error.empty() || compiler->FindCxxDefaultCtor(field.TypeName) == nullptr)
-                return true;
-        }
-        else if (HasUnavailableNestedCxxDefault(field.TypeName))
-            return true;
-    }
-    return false;
-}
-
 void MainListener::PrepareLaterCppStructDefinitions(
     CFlatParser::StructDefinitionContext* ctx, const std::string& namespaceName)
 {
@@ -193,7 +166,7 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                 && fieldDestination != nullptr && fieldType != nullptr && fieldType->isArrayTy())
             {
                 if (fieldCount != SIZE_MAX
-                    || !HasUnavailableNestedCxxDefault(field.TypeName))
+                    || !compiler->HasUnavailableNestedCxxDefault(field.TypeName))
                 {
                     GlobalScopeGuard fieldInitScope(global_scope);
                     EmitFixedArrayDefaultInit(fieldDestination, field);
@@ -209,6 +182,8 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                 // C++ default-initializes a class member even when the field has no `= default`.
                 // A SIZE_MAX fieldCount is the synthesized ctor body, emitted at declaration time;
                 // leave an unavailable member zeroed there and diagnose at a real construction.
+                std::string ctorError;
+                compiler->TryBindCxxImplicitDefaultCtor(field.TypeName, ctorError);
                 if (compiler->FindCxxDefaultCtor(field.TypeName) != nullptr)
                 {
                     GlobalScopeGuard defaultCtorScope(global_scope);
@@ -280,7 +255,7 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
         {
             if (destType->isArrayTy()
                 && (fieldCount != SIZE_MAX
-                    || !HasUnavailableNestedCxxDefault(field.TypeName)))
+                    || !compiler->HasUnavailableNestedCxxDefault(field.TypeName)))
                 rvalue = GenerateDefaultValue(field);
             else if (destType->isArrayTy())
                 continue;
@@ -1513,7 +1488,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                         }
                     }
                     if (rvalue == nullptr && compiler->GetType(typeValue)->isArrayTy()
-                        && !HasUnavailableNestedCxxDefault(typeValue.TypeName))
+                        && !compiler->HasUnavailableNestedCxxDefault(typeValue.TypeName))
                     {
                         GlobalScopeGuard defaultCtorScope(global_scope);
                         rvalue = GenerateDefaultValue(typeValue);
@@ -1527,6 +1502,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                         // The synthesized constructor is emitted at the type declaration, even
                         // when nobody ever default-constructs this type. Defer missing-ctor errors
                         // to GenerateDefaultValue's call site; valid members still get built here.
+                        std::string ctorError;
+                        compiler->TryBindCxxImplicitDefaultCtor(typeValue.TypeName, ctorError);
                         if (compiler->FindCxxDefaultCtor(typeValue.TypeName) != nullptr)
                         {
                             GlobalScopeGuard defaultCtorScope(global_scope);
@@ -5195,6 +5172,8 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                     {
                         // `= default` on a struct-typed field runs that field type's own default
                         // constructor (its field initializers), exactly as the synthetic ctor does.
+                        std::string ctorError;
+                        compiler->TryBindCxxImplicitDefaultCtor(field.TypeName, ctorError);
                         const bool unavailableCxxDefault = !field.Pointer
                             && compiler->IsCxxRecord(field.TypeName)
                             && compiler->FindCxxDefaultCtor(field.TypeName) == nullptr
@@ -5212,7 +5191,7 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                     // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
                     // here would call a same-named sibling type's ctor (layer 3).
                     if (destType->isArrayTy()
-                        && !HasUnavailableNestedCxxDefault(field.TypeName))
+                        && !compiler->HasUnavailableNestedCxxDefault(field.TypeName))
                         fieldVal = GenerateDefaultValue(field);
                     else if (destType->isArrayTy())
                         fieldVal = nullptr;

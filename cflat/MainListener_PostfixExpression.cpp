@@ -1600,6 +1600,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     {
                         if (ApplyStructPostfixOperator("operator++"))
                             break;
+                        // The result is the old value, not the macro's literal.
+                        namedVar.IsCxxMacroGlobal = false;
+                        namedVar.IsCxxNullIntegerMacro = false;
                         if (namedVar.TypeAndValue.IsArrayView)
                             LogErrorContext(ctx, "'++' is not allowed on an array-view 'T[]' - it has no pointer arithmetic; index it with 'a[i]' instead");
                         // A sized, zero-length or flexible array is not a modifiable lvalue (C: cannot increment 'int[]').
@@ -1621,6 +1624,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         RefuseCxxConstReferentWrite(ctx, incrementStorage, "increment");
                         if (incrementStorage)
                         {
+                            namedVar.Primary = namedVar.Primary
+                                ? namedVar.Primary : LoadNamedVariable(namedVar);
+                            if (!namedVar.TypeAndValue.Pointer)
+                            {
+                                namedVar.Storage = nullptr;
+                                namedVar.CallerName.clear();
+                            }
+                            namedVar.IsRvalue = true;
                             llvm::Type* et = nullptr;
                             if (namedVar.TypeAndValue.Pointer)
                             {
@@ -1628,9 +1639,20 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 elemTV.ElemPointer ? (elemTV.ElemPointer = false) : (elemTV.Pointer = false, elemTV.IsInterfacePointer = false);
                                 et = Compiler(ctx)->GetType(elemTV);
                             }
-                            PlusPlus[incrementStorage].Amount++;
-                            PlusPlus[incrementStorage].ElemType = et;
-                            PlusPlus[incrementStorage].LoadType = namedVar.UnionFieldType
+                            if (et != nullptr && et->isVoidTy())
+                            {
+                                LogVoidPointerArithmetic(ctx);
+                                break;
+                            }
+                            auto& increment = PlusPlus[incrementStorage];
+                            increment.Amount++;
+                            llvm::Type* incrementType = namedVar.UnionFieldType
+                                ? namedVar.UnionFieldType : namedVar.BaseType;
+                            if (!namedVar.TypeAndValue.Pointer && incrementType
+                                && incrementType->isFloatingPointTy())
+                                increment.FloatingSteps.push_back(1);
+                            increment.ElemType = et;
+                            increment.LoadType = namedVar.UnionFieldType
                                 ? namedVar.UnionFieldType
                                 : (parenthesizedPostfixStorage ? namedVar.BaseType : nullptr);
                         }
@@ -1644,6 +1666,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     {
                         if (ApplyStructPostfixOperator("operator--"))
                             break;
+                        // The result is the old value, not the macro's literal.
+                        namedVar.IsCxxMacroGlobal = false;
+                        namedVar.IsCxxNullIntegerMacro = false;
                         if (namedVar.TypeAndValue.IsArrayView)
                             LogErrorContext(ctx, "'--' is not allowed on an array-view 'T[]' - it has no pointer arithmetic; index it with 'a[i]' instead");
                         // A sized, zero-length or flexible array is not a modifiable lvalue (C: cannot decrement 'int[]').
@@ -1665,6 +1690,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         RefuseCxxConstReferentWrite(ctx, decrementStorage, "decrement");
                         if (decrementStorage)
                         {
+                            namedVar.Primary = namedVar.Primary
+                                ? namedVar.Primary : LoadNamedVariable(namedVar);
+                            if (!namedVar.TypeAndValue.Pointer)
+                            {
+                                namedVar.Storage = nullptr;
+                                namedVar.CallerName.clear();
+                            }
+                            namedVar.IsRvalue = true;
                             llvm::Type* et = nullptr;
                             if (namedVar.TypeAndValue.Pointer)
                             {
@@ -1672,9 +1705,20 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 elemTV.ElemPointer ? (elemTV.ElemPointer = false) : (elemTV.Pointer = false, elemTV.IsInterfacePointer = false);
                                 et = Compiler(ctx)->GetType(elemTV);
                             }
-                            PlusPlus[decrementStorage].Amount--;
-                            PlusPlus[decrementStorage].ElemType = et;
-                            PlusPlus[decrementStorage].LoadType = namedVar.UnionFieldType
+                            if (et != nullptr && et->isVoidTy())
+                            {
+                                LogVoidPointerArithmetic(ctx);
+                                break;
+                            }
+                            auto& increment = PlusPlus[decrementStorage];
+                            increment.Amount--;
+                            llvm::Type* incrementType = namedVar.UnionFieldType
+                                ? namedVar.UnionFieldType : namedVar.BaseType;
+                            if (!namedVar.TypeAndValue.Pointer && incrementType
+                                && incrementType->isFloatingPointTy())
+                                increment.FloatingSteps.push_back(-1);
+                            increment.ElemType = et;
+                            increment.LoadType = namedVar.UnionFieldType
                                 ? namedVar.UnionFieldType
                                 : (parenthesizedPostfixStorage ? namedVar.BaseType : nullptr);
                         }
@@ -3039,9 +3083,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             std::string idName = prevPrimary->genericIdentifier()->Identifier()->getText();
                             const std::string resolvedTypeAlias = Compiler(ctx)->ResolveTypeAlias(
                                 prevPrimary->getText());
+                            // `using H = Hue; H.Red`: an alias of an enum (CFlat or imported)
+                            // qualifies its enumerators the way the enum's own name does.
                             if (resolvedTypeAlias != prevPrimary->getText()
                                 && IsFollowedByDot(ctx, parseTree)
-                                && Compiler(ctx)->IsDataStructure(resolvedTypeAlias))
+                                && (Compiler(ctx)->IsDataStructure(resolvedTypeAlias)
+                                    || (!Compiler(ctx)->GetEnumBackingType(resolvedTypeAlias).empty()
+                                        && Compiler(ctx)->IsNamespace(resolvedTypeAlias))))
                             {
                                 namespaceContext = resolvedTypeAlias;
                                 primaryIdentifier = namespaceContext;
@@ -3229,6 +3277,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // Parentheses do not turn a temporary into an lvalue: keep the
                                 // inner expression's rvalue-ness (a `?:` join over a temp arm).
                                 if (lastParenExprNamed.IsRvalue) namedVar.IsRvalue = true;
+                                namedVar.IsPointerArithmeticResult = lastParenExprNamed.IsPointerArithmeticResult;
+                                // Nor its arithmetic identity (`(l + 1)` stays C++ `long`).
+                                namedVar.CxxArithIdentity = lastParenExprNamed.CxxArithIdentity;
                                 parenthesizedPostfixStorage = namedVar.Storage;
                             }
                             // Parentheses change the spelling, never the value: hand the ownership
@@ -3254,6 +3305,37 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             lastParenExprCallerName.clear();
                             auto parenInnerNamed = lastParenExprNamed;
                             lastParenExprNamed = {};
+                            if (prevPrimary->expression() != nullptr && parenInnerNamed.IsCxxMacroGlobal)
+                            {
+                                std::string innerText = prevPrimary->expression()->getText();
+                                while (innerText.size() >= 2 && innerText.front() == '(' && innerText.back() == ')')
+                                {
+                                    int depth = 0;
+                                    bool wrapsWholeExpression = true;
+                                    for (size_t i = 0; i < innerText.size(); ++i)
+                                    {
+                                        if (innerText[i] == '(') ++depth;
+                                        else if (innerText[i] == ')' && --depth == 0 && i + 1 != innerText.size())
+                                        {
+                                            wrapsWholeExpression = false;
+                                            break;
+                                        }
+                                    }
+                                    if (!wrapsWholeExpression) break;
+                                    innerText = innerText.substr(1, innerText.size() - 2);
+                                }
+                                const bool isIdentifier = !innerText.empty()
+                                    && (std::isalpha(static_cast<unsigned char>(innerText.front()))
+                                        || innerText.front() == '_')
+                                    && std::all_of(innerText.begin() + 1, innerText.end(), [](unsigned char c) {
+                                        return std::isalnum(c) || c == '_';
+                                    });
+                                if (isIdentifier)
+                                {
+                                    namedVar.IsCxxMacroGlobal = true;
+                                    namedVar.IsCxxNullIntegerMacro = parenInnerNamed.IsCxxNullIntegerMacro;
+                                }
+                            }
                             // A redundant inner paren already spilled the temp and proved the flag;
                             // carry it out, or `((makeBox())).m()` leaks the receiver.
                             bool parenthesizedProducedTemp = prevPrimary->expression() != nullptr
@@ -6257,6 +6339,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         argVar.TypeAndValue.VariableName = argName->getText();
                                     argVar.Primary = argValue;
                                     argVar.BaseType = argValue->getType();
+                                    argVar.IsCxxMacroGlobal = argNV.IsCxxMacroGlobal;
+                                    argVar.IsCxxNullIntegerMacro = argNV.IsCxxNullIntegerMacro;
                                     argVar.TernaryTempAlreadyRegistered = argNV.TernaryTempAlreadyRegistered;
                                     argVar.ConditionalMoveSources = argNV.ConditionalMoveSources;
                                     argVar.Storage = argNV.Storage;
@@ -6342,6 +6426,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
 
                                     // Preserve unsigned-integer TypeName so Upconvert (LowerByValueArg)
                                     // chooses ZExt over SExt - without it a u8 200 arrives as -56.
+                                    argVar.TypeAndValue.EnumBacking = argNV.TypeAndValue.EnumBacking;
                                     if (argNV.TypeAndValue.IsUnsignedInteger() != -1)
                                         argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
 
@@ -6944,6 +7029,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                     elementVar.TypeAndValue.VariableName.clear();
                                                     if (!cxxClassElement) elementVar.IsRvalue = true;
                                                     brace.elements.push_back(std::move(elementVar));
+                                                    ProcessPlusPlus();
                                                 }
                                             if (valid)
                                             {
@@ -7119,6 +7205,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         argVar.TypeAndValue.VariableName = argName->getText();
                                     argVar.Primary = argValue;
                                     argVar.BaseType = argValue->getType();
+                                    argVar.IsCxxMacroGlobal = argNV.IsCxxMacroGlobal;
+                                    argVar.IsCxxNullIntegerMacro = argNV.IsCxxNullIntegerMacro;
                                     argVar.TernaryTempAlreadyRegistered = argNV.TernaryTempAlreadyRegistered;
                                     argVar.ConditionalMoveSources = argNV.ConditionalMoveSources;
                                     // Propagate caller variable name for compile-time move tracking.
@@ -7195,7 +7283,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
 
                                     // The declared element type, for generic inference only: the
                                     // TypeName below stays empty for primitives on purpose.
-                                    argVar.InferSourceTypeName = argNV.TypeAndValue.TypeName;
+                                    const std::string sourceEnum = argNV.InferSourceTypeName.empty()
+                                        ? std::string()
+                                        : Compiler(ctx)->ResolveEnumTypeName(argNV.InferSourceTypeName);
+                                    argVar.InferSourceTypeName = !sourceEnum.empty()
+                                        && (Compiler(ctx)->IsCxxForeignNamespace(sourceEnum)
+                                            || Compiler(ctx)->IsCxxForeignTypeRegistered(sourceEnum))
+                                        ? sourceEnum : argNV.TypeAndValue.TypeName;
+                                    argVar.CxxArithIdentity = argNV.CxxArithIdentity;
                                     if (argVar.InferSourceTypeName.empty() && argNV.BaseType != nullptr)
                                     {
                                         if (argNV.BaseType->isFloatTy()) argVar.InferSourceTypeName = "float";
@@ -7225,7 +7320,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.LiteralIdentity = LLVMBackend::LiteralIdentityForOverload(
                                         namedArgument->assignmentExpression()->getText(),
                                         &argVar.LiteralIdentitySuffixed);
+                                    argVar.LiteralSigned = LLVMBackend::LiteralTextHasSign(
+                                        namedArgument->assignmentExpression()->getText());
                                     // Preserve unsigned-integer TypeName so Upconvert can choose ZExt over SExt.
+                                    argVar.TypeAndValue.EnumBacking = argNV.TypeAndValue.EnumBacking;
                                     if (argNV.TypeAndValue.IsUnsignedInteger() != -1)
                                         argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
 
@@ -7589,10 +7687,19 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 bool clangRejected = false;
                                 if (isTemplate)
                                 {
+                                    const bool hasCxxEnumIdentityArgument = std::any_of(
+                                        arguments.begin(), arguments.end(), [&](const auto& arg) {
+                                            const std::string& source = !arg.InferSourceTypeName.empty()
+                                                ? arg.InferSourceTypeName : arg.TypeAndValue.TypeName;
+                                            return !source.empty()
+                                                && (compiler->IsCxxForeignNamespace(source)
+                                                    || compiler->IsCxxForeignTypeRegistered(source))
+                                                && !compiler->ResolveEnumTypeName(source).empty();
+                                        });
                                     requested = compiler->RequestCxxFunctionTemplate(
                                         memberName, owner, cxxExplicitTemplateArgs,
                                         arguments, cxxBraceArguments, registeredName, templateError,
-                                        {}, deduceBesideSpecializations);
+                                        {}, deduceBesideSpecializations || hasCxxEnumIdentityArgument);
                                     clangRejected = compiler->LastCxxRequestClangRejected();
                                     /*
                                      * The template route spells a list by one element type; clang
@@ -10067,7 +10174,12 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
             if (globalNV.Storage != nullptr)
             {
                 if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(globalNV.Storage))
+                {
                     compiler->ValidateCxxStaticMemberDemandAtUseSite(global->getName().str());
+                    const std::string globalName = global->getName().str();
+                    globalNV.IsCxxMacroGlobal = compiler->cxxMacroGlobalNames_.count(globalName) != 0;
+                    globalNV.IsCxxNullIntegerMacro = compiler->cxxZeroIntegerMacroNames_.count(globalName) != 0;
+                }
                 int64_t constValue = 0;
                 if (compiler->TryGetConstGlobalInt(name, constValue)
                     || (llvm::isa<llvm::GlobalVariable>(globalNV.Storage)
@@ -10481,7 +10593,13 @@ void MainListener::ProcessPlusPlus() {
         if (PlusPlus.size() > 0)
         {
             for (auto& [destination, w] : PlusPlus)
-                Compiler()->CreateIncrement(destination, w.Amount, w.ElemType, w.LoadType);
+            {
+                if (w.FloatingSteps.empty())
+                    Compiler()->CreateIncrement(destination, w.Amount, w.ElemType, w.LoadType);
+                else
+                    for (int step : w.FloatingSteps)
+                        Compiler()->CreateIncrement(destination, step, w.ElemType, w.LoadType);
+            }
 
             PlusPlus.clear();
         }

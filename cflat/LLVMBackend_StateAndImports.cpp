@@ -145,6 +145,36 @@ llvm::Function* LLVMBackend::FinalizeAutoReturnFunction(
         auto* newFnTy = llvm::FunctionType::get(unifiedTy, paramTypes, varargs);
 
         TypeAndValue newReturnType = LlvmTypeToTypeAndValue(unifiedTy);
+        std::string inferredEnumReturn;
+        bool sameEnumReturn = true;
+        for (const auto& site : sites)
+        {
+            if (site.Value == nullptr || site.SourceTypeName.empty())
+            {
+                sameEnumReturn = false;
+                break;
+            }
+            std::string enumName = ResolveEnumTypeName(site.SourceTypeName);
+            if (enumName.empty() && IsScopedEnumTypeName(site.SourceTypeName))
+                enumName = site.SourceTypeName;
+            if (enumName.empty() && enumBackingTypes.count(site.SourceTypeName) != 0)
+                enumName = site.SourceTypeName;
+            if (enumName.empty() || (!inferredEnumReturn.empty() && enumName != inferredEnumReturn))
+            {
+                sameEnumReturn = false;
+                break;
+            }
+            inferredEnumReturn = std::move(enumName);
+        }
+        if (sameEnumReturn && !inferredEnumReturn.empty())
+        {
+            TypeAndValue enumReturn;
+            enumReturn.TypeName = inferredEnumReturn;
+            enumReturn.EnumBacking = GetEnumBackingType(inferredEnumReturn);
+            enumReturn.IsScopedEnum = IsScopedEnumTypeName(inferredEnumReturn);
+            if (GetType(enumReturn) == unifiedTy)
+                newReturnType = std::move(enumReturn);
+        }
         std::string newMangledName = ComputeMangledName(functionName, newReturnType, arguments, varargs);
 
         // If a function with the new mangled name already exists (e.g. another
@@ -891,7 +921,8 @@ bool LLVMBackend::IsScopedEnumMatch(const TypeAndValue& from, const TypeAndValue
             return false;
         if (from.Pointer == to.Pointer)
             return from.ElemPointer == to.ElemPointer;
-        return !from.Pointer && to.Pointer && to.IsAlias && !to.ElemPointer;
+        // An rvalue-reference parameter (`E&&`) binds a by-value enum the same way.
+        return !from.Pointer && to.Pointer && (to.IsAlias || to.IsRvalueRef) && !to.ElemPointer;
 }
 
 /*
@@ -935,13 +966,16 @@ bool LLVMBackend::CxxEnumParameterRefusesArgument(const NamedVariable& arg,
             && (arg.BaseType->isIntegerTy() || arg.BaseType->isFloatingPointTy());
 }
 
-bool LLVMBackend::CxxDistinctEnumArgument(const TypeAndValue& arg, const TypeAndValue& param) const
+bool LLVMBackend::CxxDistinctEnumArgument(const NamedVariable& argVar, const TypeAndValue& param) const
 {
+        const TypeAndValue& arg = argVar.TypeAndValue;
         if (arg.Pointer || arg.ElemPointer || param.ElemPointer || param.IsArrayView || param.IsFunctionPointer)
             return false;
         if (param.Pointer && !(param.IsAlias || param.IsRvalueRef || param.IsCxxConstRef)) return false;
         if (!param.IsScopedEnum && !IsScopedEnumTypeName(param.TypeName)) return false;
-        const std::string argKey = ResolveEnumTypeName(arg.TypeName);
+        // A signed/unscoped source enum keeps its identity only in InferSourceTypeName.
+        std::string argKey = ResolveEnumTypeName(arg.TypeName);
+        if (argKey.empty() && arg.TypeName.empty()) argKey = ResolveEnumTypeName(argVar.InferSourceTypeName);
         const std::string paramKey = ResolveEnumTypeName(param.TypeName);
         return !argKey.empty() && !paramKey.empty() && argKey != paramKey;
 }
@@ -1104,6 +1138,10 @@ void LLVMBackend::RegisterEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx,
         std::string resolvedBacking = ResolveTypeAlias(backingType);
         std::string ns = namespaceName.empty() ? currentNamespace_ : namespaceName;
         std::string scopedName = (enumName.empty() || ns.empty()) ? enumName : ns + "." + enumName;
+        // Local enums in a generic body belong to the active specialization.
+        std::string registryName = scopedName;
+        if (!scopedName.empty() && !activeGenericEnumSpecialization_.empty())
+            registryName = activeGenericEnumSpecialization_ + "." + enumName;
 
         // Type facts go in first and unconditionally - a signature and a qualified spelling need
         // them even when a value does not fold. Registry keeps the RESOLVED backing (`enum AB :
@@ -1112,7 +1150,7 @@ void LLVMBackend::RegisterEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx,
         {
             RegisterNamespace(enumName);
             if (scopedName != enumName) RegisterNamespace(scopedName);
-            RegisterEnumBackingType(scopedName, resolvedBacking);
+            RegisterEnumBackingType(registryName, resolvedBacking);
         }
 
         auto* list = ctx->enumeratorList();
@@ -1120,7 +1158,7 @@ void LLVMBackend::RegisterEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx,
         auto enumerators = list->enumerator();
         if (enumerators.empty()) return;
 
-        std::string prefix = scopedName.empty() ? "" : scopedName + ".";
+        std::string prefix = registryName.empty() ? "" : registryName + ".";
         // Enum members are compile-time constants, foldable in an `if const` condition and in a
         // case label. Recorded before the early-out: the codegen pass owns this set.
         if (constFoldableGlobals)
@@ -1134,7 +1172,7 @@ void LLVMBackend::RegisterEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx,
             + ctx->getStart()->getInputStream()->getSourceName();
         if (!scopedName.empty())
         {
-            auto& sites = enumDeclSites_[scopedName];
+            auto& sites = enumDeclSites_[registryName];
             if (sites.count(site)) return;
             if (!sites.empty())
             {
@@ -1201,8 +1239,8 @@ void LLVMBackend::RegisterEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx,
             TypeAndValue tv;
             // The enum's own name is the member's type so field/member lookup and overload
             // resolution keep the enum identity; EnumBacking carries the width and signedness.
-            tv.TypeName = scopedName.empty() ? resolvedBacking : scopedName;
-            tv.EnumBacking = scopedName.empty() ? std::string() : resolvedBacking;
+            tv.TypeName = registryName.empty() ? resolvedBacking : registryName;
+            tv.EnumBacking = registryName.empty() ? std::string() : resolvedBacking;
             tv.VariableName = prefix + name;
             tv.Pointer = false;
 
@@ -1213,12 +1251,17 @@ void LLVMBackend::RegisterEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx,
                 c = CreateConstant(resolvedBacking, EnumWideToString(value));
             CreateGlobalVariable(tv, c, false, 0, false, isUnsigned);
         }
-        if (!scopedName.empty()) enumDeclSites_[scopedName].insert(site);
+        if (!registryName.empty()) enumDeclSites_[registryName].insert(site);
     }
 
 std::string LLVMBackend::ResolveEnumTypeName(const std::string& spelled) const
 {
         if (spelled.empty()) return {};
+        if (!activeGenericEnumSpecialization_.empty())
+        {
+            const std::string local = activeGenericEnumSpecialization_ + "." + spelled;
+            if (enumBackingTypes.count(local) != 0) return local;
+        }
         // Two hops at most: the written spelling, then one `using D = Dir;` alias step. Each hop
         // walks the enclosing namespaces so a sibling enum resolves unqualified.
         std::string cur = spelled;
@@ -1233,7 +1276,19 @@ std::string LLVMBackend::ResolveEnumTypeName(const std::string& spelled) const
             cur = aliased;
         }
         return {};
-    }
+}
+
+bool LLVMBackend::IsGenericLocalEnumKey(const std::string& key) const
+{
+        auto ownedByInstantiation = [&key](const auto& instantiations)
+        {
+            for (const auto& instantiation : instantiations)
+                if (key.starts_with(instantiation + ".")) return true;
+            return false;
+        };
+        return ownedByInstantiation(gts.instantiatedGenericFunctions)
+            || ownedByInstantiation(gts.instantiatedGenerics);
+}
 
 bool LLVMBackend::TryGetEnumMemberInt(const std::string& enumSpelling, const std::string& member,
                                       int64_t& out) const
@@ -1569,8 +1624,17 @@ std::string LLVMBackend::ResolveQualifiedName(const std::string& name, bool forc
         // Walk up from the (possibly expanded) prefix toward the root. The BARE last component is
         // deliberately not a candidate here: a qualified spelling never falls back to a global of
         // the same tail name, it stays unresolved and is reported verbatim.
+        // C++ qualified lookup never reaches an enclosing namespace: under a C++-rooted prefix an
+        // outer C++ entity is no candidate (`std.views.istream` must not find `std.istream`).
+        const bool cxxRootedPrefix = IsCxxNamespace(nsPrefix);
+        const std::string exactKey = nsPrefix + "." + lastName;
+        const auto isCxxEntity = [&](const std::string& c) {
+            return IsCxxRecord(c) || cxxRecordEntries_.count(c) != 0 || cxxClasses_.count(c) != 0
+                || cxxCflatToCxxSpelling_.count(c) != 0 || cxxFunctionSignatures_.count(c) != 0
+                || isPublishedCxxName(c);
+        };
         std::string key = FirstVisibleScopedKeyIn(nsPrefix, lastName, [&](const std::string& c) {
-            if (c == lastName) return false;
+            if (c == lastName || (cxxRootedPrefix && c != exactKey && isCxxEntity(c))) return false;
             return dataStructures.count(c) != 0 || interfaceTable.count(c) != 0
                 || functionTable.count(c) != 0;
         }, ScopedLookupOptions{ .ResolveFirstComponentAlias = false });
@@ -2865,6 +2929,7 @@ nlohmann::json LLVMBackend::MacroToJson(const CMacroEntry& m, CCachePathTable* f
         nlohmann::json j = {{"n", m.name}, {"v", m.value},
                             {"ln", m.line}, {"co", m.col}};
         PathToJson(j, m.file, files);
+        if (m.isIntegerLiteralZero) j["ilz"] = true;
         if (m.isPointer) j["isp"]  = true;
         // Store the float as its raw IEEE-754 bit pattern, not as a JSON number:
         // nlohmann serializes inf/NaN as JSON `null` (math.h's INFINITY/NAN/HUGE_VAL),
@@ -2890,6 +2955,7 @@ LLVMBackend::CMacroEntry LLVMBackend::MacroFromJson(const SjVal& j, const CCache
         m.file      = PathFromJson(j, files);
         m.line      = j.value("ln",  1);
         m.col       = j.value("co",  0);
+        m.isIntegerLiteralZero = j.value("ilz", false);
         m.isPointer = j.value("isp", false);
         m.isFloat   = j.value("isf", false);
         if (m.isFloat)

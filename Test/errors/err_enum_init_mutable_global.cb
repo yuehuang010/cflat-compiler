@@ -1,0 +1,10 @@
+// T45: an enum initializer reading a MUTABLE global is not a constant. It used to emit a load
+// with no insertion block (compiler crash); it is the enum-constant error.
+int t45Mutable = 3;
+expect_error("enum value must be a constant integer expression");
+enum T45Bad : int { Value = t45Mutable + 1 };
+
+extern int main()
+{
+    return 0;
+}

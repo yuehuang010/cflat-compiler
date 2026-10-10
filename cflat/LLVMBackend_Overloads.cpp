@@ -171,9 +171,60 @@ static int CxxRefToPointerScore(const LLVMBackend::NamedVariable& arg,
     return (argIsLvalue != param.IsCxxConstRef) ? 0 : 1;
 }
 
-static bool IsNullPointerConstantArgument(const LLVMBackend::NamedVariable& arg)
+// A C++ `T (&)[N]` parameter arrives as a plain pointer; only its spelling tells it apart, and no
+// null constant converts to it.
+bool LLVMBackend::CxxArrayReferenceSpelling(const FunctionSymbol& candidate, size_t index) const
 {
-    if (arg.LiteralIdentity != "int")
+    if (!candidate.IsCxx) return false;
+    const std::string spelled = CxxReferenceParameterSpelling(candidate, index);
+    // The declarator group before the bounds decides: `(&)` / `(&&)` is an array reference,
+    // `(* const&)` a reference to an array POINTER (which a null constant does bind).
+    const size_t close = spelled.find(")[");
+    if (close == std::string::npos) return false;
+    const size_t open = spelled.rfind('(', close);
+    if (open == std::string::npos) return false;
+    const std::string group = spelled.substr(open + 1, close - open - 1);
+    return group.find('&') != std::string::npos && group.find('*') == std::string::npos;
+}
+
+// A C++ null pointer constant is an integer literal of value 0 of any integer type, unsigned or
+// suffixed, but never a +0 / -0 expression. Native CFlat keeps the identity-int rule.
+bool LLVMBackend::IsNullPointerConstantArgument(const NamedVariable& arg, bool cxx) const
+{
+    if (cxx)
+    {
+        static const std::set<std::string> kZeroIdentities = { "int", "u32", "long", "ulong", "i64", "u64" };
+        const auto& tv = arg.TypeAndValue;
+        const std::string sourceType = !tv.TypeName.empty() ? tv.TypeName : arg.InferSourceTypeName;
+        if (tv.IsScopedEnum || !tv.EnumBacking.empty() || !ResolveEnumTypeName(sourceType).empty())
+            return false;
+        // `move ZERO` is a new value (std::move of a literal is an xvalue), never a null constant.
+        if (arg.IsExplicitMove) return false;
+        /*
+         * Identity is the provenance flags alone: ParseIdentifier sets them on the macro's own
+         * name, parens and named arguments carry them, every operator / cast / move clears them.
+         * Storage cannot tell `Z0` from `Z0++` or `(move Z0)`, which keep the global as Storage.
+         */
+        const bool isMacro = arg.IsCxxMacroGlobal;
+        const bool isNullMacro = arg.IsCxxNullIntegerMacro;
+        llvm::Value* macroStorage = arg.Storage;
+        if (isMacro)
+        {
+            // The value must still BE the macro: its literal, or a load of its backing global.
+            auto isZeroMacroGlobal = [&](llvm::Value* value) {
+                auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(value);
+                return global != nullptr && cxxZeroIntegerMacroNames_.count(global->getName().str()) != 0;
+            };
+            auto* constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(arg.Primary);
+            auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(arg.Primary);
+            const bool macroValue = (constant != nullptr && constant->isZero())
+                || (load != nullptr && isZeroMacroGlobal(load->getPointerOperand()))
+                || (arg.Primary == nullptr && isZeroMacroGlobal(macroStorage));
+            return isNullMacro && macroValue;
+        }
+        if (arg.LiteralSigned || kZeroIdentities.count(arg.LiteralIdentity) == 0) return false;
+    }
+    else if (arg.LiteralIdentity != "int")
         return false;
     auto* constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(arg.Primary);
     return constant != nullptr && constant->isZero();
@@ -185,6 +236,37 @@ static bool IsNullptrLiteralArgument(const LLVMBackend::NamedVariable& arg)
 {
     return !arg.TypeAndValue.Pointer && arg.TypeAndValue.TypeName.empty()
         && arg.Primary != nullptr && arg.Primary->getType()->isPointerTy();
+}
+
+static bool CxxSpellingIsNullptrT(std::string spelled);
+
+static bool CxxSpellingHasPointerTarget(const std::string& spelling)
+{
+    if (CxxSpellingIsNullptrT(spelling)) return true;
+    const size_t star = spelling.find('*');
+    const size_t amp = spelling.find('&');
+    return star != std::string::npos && (amp == std::string::npos || star < amp);
+}
+
+// A null pointer conversion can bind a reference only when the referent itself is a pointer
+// (or nullptr_t), and the reference can bind the resulting pointer prvalue.
+static bool CxxReferenceAllowsNullPointerConversion(const LLVMBackend::TypeAndValue& param,
+                                                    const std::string& spelling)
+{
+    const size_t amp = spelling.find('&');
+    if (amp == std::string::npos)
+        return !param.IsAlias && !param.IsRvalueRef;
+    if (CxxSpellingIsNullptrT(spelling)) return true;
+    const size_t open = spelling.rfind('(', amp);
+    const std::string declarator = open == std::string::npos
+        ? spelling.substr(0, amp) : spelling.substr(open + 1, amp - open - 1);
+    const size_t star = declarator.find('*');
+    if (star == std::string::npos)
+        return param.IsInteger() != -1 || param.TypeName == "bool"
+            || param.TypeName == "float" || param.TypeName == "double";
+    const bool constPointer = declarator.find("const", star + 1) != std::string::npos;
+    const bool rvalueReference = amp + 1 < spelling.size() && spelling[amp + 1] == '&';
+    return constPointer || rvalueReference;
 }
 
 // `std::nullptr_t` / `decltype(nullptr)` with any cv and reference decoration.
@@ -224,6 +306,13 @@ static bool IsCxxAddressOfReferent(const LLVMBackend::NamedVariable& arg,
 {
     return IsCxxAddressOfObjectArgument(arg)
         && (arg.TypeAndValue.TypeName == referent || arg.InferSourceTypeName == referent);
+}
+
+// Imported object-like macros are C++ prvalues even though CFlat retains their backing global.
+static bool IsCxxNonNullMacroRvalue(const LLVMBackend::NamedVariable& arg)
+{
+    return arg.IsCxxMacroGlobal && !arg.IsCxxNullIntegerMacro
+        && !arg.TypeAndValue.Pointer && !arg.TypeAndValue.ElemPointer;
 }
 
 // A declared signature in CFlat spelling, e.g. "int(char*, ...)". Spells each type the way the
@@ -295,6 +384,17 @@ bool LLVMBackend::ArgumentConvertsToBoolParameter(const NamedVariable& arg, cons
             && !arg.BaseType->isIntegerTy(1);
 }
 
+// True when the literal text (outside redundant parentheses) starts with a unary + or -.
+bool LLVMBackend::LiteralTextHasSign(std::string_view text)
+{
+        while (text.size() >= 2 && text.front() == '(' && text.back() == ')')
+        {
+            text.remove_prefix(1);
+            text.remove_suffix(1);
+        }
+        return !text.empty() && (text.front() == '+' || text.front() == '-');
+}
+
 // Record C++ identities before literal values lose source spelling and narrow during lowering.
 std::string LLVMBackend::LiteralIdentityForOverload(std::string_view text, bool* suffixedInteger)
 {
@@ -345,7 +445,29 @@ std::string LLVMBackend::LiteralIdentityForOverload(std::string_view text, bool*
                 ? floatingDigits.find_first_of("pP") != std::string_view::npos
                 : floatingDigits.find_first_of("eE") != std::string_view::npos);
         if (floatingLiteral)
+        {
+            // The whole text must be ONE floating literal: `1e3+1` or `1.0f*2` is an expression,
+            // whose C++ type comes from its operands (CxxScalarArithmeticIdentity), not its text.
+            std::string_view rest = hexadecimal ? floatingDigits.substr(2) : floatingDigits;
+            auto isDigit = [&](char c) {
+                return hexadecimal ? std::isxdigit((unsigned char)c) != 0
+                                   : std::isdigit((unsigned char)c) != 0;
+            };
+            size_t pos = 0;
+            while (pos < rest.size() && (isDigit(rest[pos]) || rest[pos] == '.')) ++pos;
+            if (pos < rest.size() && (hexadecimal ? (rest[pos] == 'p' || rest[pos] == 'P')
+                                                  : (rest[pos] == 'e' || rest[pos] == 'E')))
+            {
+                ++pos;
+                if (pos < rest.size() && (rest[pos] == '+' || rest[pos] == '-')) ++pos;
+                const size_t exponentStart = pos;
+                while (pos < rest.size() && std::isdigit((unsigned char)rest[pos])) ++pos;
+                if (pos == exponentStart) return "";
+            }
+            if (pos != rest.size() || std::count(rest.begin(), rest.end(), '.') > 1)
+                return "";
             return hasLongFloatSuffix ? "" : hasFloatSuffix ? "float" : "double";
+        }
         if (hasFloatSuffix)
             return "";
         // Integer suffix (u/U, l/L, ll/LL in the grammar's orders): only a canonical spelling has one.
@@ -525,6 +647,10 @@ std::string LLVMBackend::IntegerArgumentIdentity(const NamedVariable& arg, bool 
         if (cxxCandidate && !literalIdentity.empty() && (!tv.TypeName.empty() || !arg.InferSourceTypeName.empty())
             && integerBits(literalIdentity) == loweredBits)
             return literalIdentity;
+        // An arithmetic result ranks as its C++ type (`ul + 1` is `unsigned long`, typed u64).
+        if (cxxCandidate && !arg.CxxArithIdentity.empty() && literalIdentity.empty()
+            && ResolveEnumTypeName(tv.TypeName).empty() && integerBits(arg.CxxArithIdentity) == loweredBits)
+            return arg.CxxArithIdentity;
         for (const std::string* recorded : { &tv.TypeName, &arg.InferSourceTypeName })
         {
             if (recorded->empty())
@@ -682,13 +808,86 @@ bool LLVMBackend::FindCxxClassConversionPair(const std::string& source, const st
         return false;
 }
 
+bool LLVMBackend::CxxDeductionWrapperDeducesOtherForCall(const FunctionSymbol& candidate,
+                                                         const std::vector<NamedVariable>& args) const
+{
+        if (!candidate.IsCxx || cxxDeductionWrappers_.count(candidate.UniqueName) == 0) return false;
+        for (size_t i = 0; i < args.size() && i < candidate.Parameters.size(); ++i)
+        {
+            if (candidate.IsMethod && i == 0) continue;
+            if (CxxDeductionWrapperDeducesOther(args[i], candidate.Parameters[i],
+                    CxxSpellingIsNullptrT(CxxReferenceParameterSpelling(candidate, i)), candidate, i))
+                return true;
+        }
+        return false;
+}
+
 bool LLVMBackend::CxxDeductionWrapperDeducesOther(const NamedVariable& arg, const TypeAndValue& param,
-                                                  bool paramSpelledNullptrT) const
+                                                  bool paramSpelledNullptrT,
+                                                  const FunctionSymbol& candidate,
+                                                  size_t paramIndex) const
 {
         const bool paramNull = param.IsCxxNullptrT || paramSpelledNullptrT;
         const bool argNull = IsCxxNullTypedArgument(arg);
         if (argNull || paramNull) return argNull != paramNull;
         const TypeAndValue& a = arg.TypeAndValue;
+        // A C++ enum keeps its own name; CxxSpellingForCflatType would answer its backing type.
+        auto spellIdentity = [&](const std::string& type, std::string& out) {
+            const std::string enumKey = ResolveEnumTypeName(type);
+            if (enumKey.empty()
+                || !(IsCxxForeignNamespace(enumKey) || IsCxxForeignTypeRegistered(enumKey)))
+                return CxxSpellingForCflatType(type, out);
+            out = enumKey;
+            for (size_t pos = 0; (pos = out.find('.', pos)) != std::string::npos; pos += 2)
+                out.replace(pos, 1, "::");
+            return true;
+        };
+        std::string parameterSpelling = CxxReferenceParameterSpelling(candidate, paramIndex);
+        if (parameterSpelling.empty() && !param.TypeName.empty())
+            spellIdentity(param.TypeName, parameterSpelling);
+        auto scalar = [](llvm::Type* t) {
+            return t != nullptr && (t->isIntegerTy() || t->isFloatingPointTy());
+        };
+        if (!a.Pointer && !param.Pointer && !parameterSpelling.empty()
+            && scalar(arg.BaseType) && scalar(GetType(param)))
+        {
+            // An enum TypeName is the identity; then an arithmetic result's (`ulong` for a
+            // `ul + 1` typed u64), then the declared source, as the request spelled them.
+            const bool enumTypeName = !a.TypeName.empty()
+                && (a.IsScopedEnum || !ResolveEnumTypeName(a.TypeName).empty());
+            // Only an identity that still lowers to the value (`!(l + 1)` is bool, not long).
+            const std::string arith = CxxArithIdentityForArgument(arg,
+                arg.Primary != nullptr ? arg.Primary->getType() : arg.BaseType);
+            std::string sourceType = enumTypeName ? a.TypeName
+                : !arith.empty() ? arith
+                : arg.InferSourceTypeName.empty() ? a.TypeName : arg.InferSourceTypeName;
+            std::string argumentSpelling;
+            if (!sourceType.empty() && spellIdentity(sourceType, argumentSpelling))
+            {
+                // Compare the bare type: no cv, reference or elaborated `enum` keyword.
+                auto canonical = [](std::string spelling) {
+                    std::string out;
+                    std::string word;
+                    auto flush = [&] {
+                        if (word != "const" && word != "volatile" && word != "enum")
+                            out += word;
+                        word.clear();
+                    };
+                    for (char c : spelling)
+                    {
+                        if (std::isalnum((unsigned char)c) || c == '_') word += c;
+                        else
+                        {
+                            flush();
+                            if (!std::isspace((unsigned char)c) && c != '&') out += c;
+                        }
+                    }
+                    flush();
+                    return out;
+                };
+                if (canonical(argumentSpelling) != canonical(parameterSpelling)) return true;
+            }
+        }
         auto plainPointer = [](const TypeAndValue& t) {
             return t.Pointer && !t.IsFunctionPointer && !t.IsArrayView && !t.IsInterface
                 && t.ConstArraySize == 0;
@@ -748,7 +947,9 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
             if (!arg.BaseType->isFloatTy() && !arg.BaseType->isDoubleTy())
                 return "";
             // An unsuffixed floating literal is a C++ `double` even where it lowers as a float.
-            for (const std::string* recorded : { &arg.LiteralIdentity, &tv.TypeName, &arg.InferSourceTypeName })
+            // A built-in arithmetic result ranks as its C++ type (`1e3 + 1` is double, typed float).
+            const std::string arith = CxxArithIdentityForArgument(arg, arg.BaseType);
+            for (const std::string* recorded : { &arg.LiteralIdentity, &arith, &tv.TypeName, &arg.InferSourceTypeName })
                 if (*recorded == "float" || *recorded == "double")
                     return *recorded;
             if (!tv.TypeName.empty() || !arg.InferSourceTypeName.empty())
@@ -768,7 +969,25 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
         for (size_t i = 0; i < arguments.size() && i < candidate.Parameters.size(); ++i)
         {
             const NamedVariable& arg = arguments[i];
-            const TypeAndValue& param = candidate.Parameters[i];
+            // A class pointer parameter bound as `void*` ranks as the class its spelling names.
+            TypeAndValue spelledClassParam;
+            {
+                std::string spelledBase;
+                bool bySpelling = false;
+                const auto relation = CxxVoidParamClassRelation(
+                    candidate, i, candidate.Parameters[i], arg.TypeAndValue, spelledBase, bySpelling);
+                if (relation == CxxSpelledParamRelation::Same
+                    || (relation == CxxSpelledParamRelation::Base && !bySpelling))
+                {
+                    spelledClassParam = candidate.Parameters[i];
+                    spelledClassParam.TypeName = relation == CxxSpelledParamRelation::Same
+                        ? arg.TypeAndValue.TypeName : spelledBase;
+                    spelledClassParam.IsCxxPointeeConst =
+                        CxxReferenceParameterSpelling(candidate, i).rfind("const ", 0) == 0;
+                }
+            }
+            const TypeAndValue& param = spelledClassParam.TypeName.empty()
+                ? candidate.Parameters[i] : spelledClassParam;
             CxxConversionRank& out = ranks[i];
             // Rank the implicit object parameter for imported C++ members.
             if (candidate.IsMethod && i == 0
@@ -805,6 +1024,37 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 out.from = arg.TypeAndValue.TypeName;
                 continue;
             }
+            // `nullptr` / std::nullptr_t: identity at a std::nullptr_t parameter, else a null pointer
+            // conversion (rank 2) at ANY pointer shape, function and multi-level pointers included.
+            const bool cxxPointerShaped = (param.Pointer || param.IsFunctionPointer)
+                && !param.IsAlias && !param.IsRvalueRef && !param.IsArrayView && !param.IsInterface
+                && !param.IsCxxRefToPointer
+                && CxxSpellingHasPointerTarget(CxxReferenceParameterSpelling(candidate, i))
+                && !CxxArrayReferenceSpelling(candidate, i)
+                && (!IsCxxReferenceParameter(candidate, i)
+                    || CxxReferenceAllowsNullPointerConversion(
+                        param, CxxReferenceParameterSpelling(candidate, i)))
+                && (candidate.IsCxx || (!param.ElemPointer && !param.IsFunctionPointer
+                                        && param.PointerDepth <= 1));
+            if (cxxPointerShaped && IsCxxNullTypedArgument(arg))
+            {
+                const bool nullptrParam = param.IsCxxNullptrT
+                    || CxxSpellingIsNullptrT(CxxReferenceParameterSpelling(candidate, i));
+                out.rank = nullptrParam ? 0 : 2;
+                out.cxxViable = true;
+                out.from = "nullptr";
+                continue;
+            }
+            // Literal 0 is a null pointer constant: a standard conversion (rank 2), so it outranks
+            // the user-defined class conversion a converting ctor offers.
+            if (cxxPointerShaped && candidate.IsCxx && !CxxArrayReferenceSpelling(candidate, i)
+                && IsNullPointerConstantArgument(arg, true))
+            {
+                out.rank = 2;
+                out.cxxViable = true;
+                out.from = "0";
+                continue;
+            }
             // A pointer argument to a single-level pointer parameter: identity or qualification
             // (exact match), derived-to-base or to `void*` (conversion). Anything else unjudged.
             if (param.Pointer && !param.IsAlias && !param.IsRvalueRef && !param.ElemPointer
@@ -820,17 +1070,6 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                     pt.Pointer = true;
                     pt.ConstArraySize = 0;
                     pt.ConstInnerDimensions.clear();
-                }
-                // `nullptr` (or a std::nullptr_t value): identity at a std::nullptr_t parameter, a
-                // null pointer conversion to any other pointer type, no tie-breaker.
-                if (IsCxxNullTypedArgument(arg))
-                {
-                    const bool nullptrParam = param.IsCxxNullptrT
-                        || CxxSpellingIsNullptrT(CxxReferenceParameterSpelling(candidate, i));
-                    out.rank = nullptrParam ? 0 : 2;
-                    out.cxxViable = true;
-                    out.from = "nullptr";
-                    continue;
                 }
                 // A narrow string literal is `const char[N]`: `const char*` is its identity after
                 // array-to-pointer, and the deprecated drop to `char*` binds worse.
@@ -890,7 +1129,7 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 }
                 if (pt.Pointer && !pt.ElemPointer && pt.PointerDepth == 1
                     && pointee == "void" && param.TypeName != "void"
-                    && !param.TypeName.empty() && !IsNullPointerConstantArgument(arg))
+                    && !param.TypeName.empty() && !IsNullPointerConstantArgument(arg, candidate.IsCxx))
                 {
                     out.rank = kCxxNonViableRank;
                     out.from = "void";
@@ -899,11 +1138,12 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 if (!pt.Pointer || pt.ElemPointer || pt.IsArrayView || pt.ConstArraySize > 0
                     || pt.IsFunctionPointer || pt.IsInterface || pt.PointerDepth > 1
                     || param.TypeName.empty() || pointee == "void"
-                    || IsNullPointerConstantArgument(arg))
+                    || IsNullPointerConstantArgument(arg, candidate.IsCxx))
                     continue;
                 if (IsCxxRecord(pt.TypeName) && IsCxxRecord(param.TypeName)
                     && (pt.TypeName == param.TypeName
-                        || IsCxxBaseOf(param.TypeName, pt.TypeName)))
+                        || IsCxxBaseOf(param.TypeName, pt.TypeName)
+                        || IsCxxDerivedToClangBasePointer(pt, param)))
                 {
                     const bool derivedToBase = pt.TypeName != param.TypeName;
                     const bool addsOrDropsPointeeConst =
@@ -912,7 +1152,14 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                     // candidate reaches the lowering diagnostic that refuses it.
                     const bool dropsPointeeConst = pt.IsCxxPointeeConst && !param.IsCxxPointeeConst;
                     out.rank = dropsPointeeConst
-                        ? 2 : (derivedToBase ? 2 : 0) + (addsOrDropsPointeeConst ? 1 : 0);
+                        ? 2 : (derivedToBase ? 2 : (addsOrDropsPointeeConst ? 1 : 0));
+                    // An added const on a derived-to-base conversion stays Conversion rank
+                    // ([over.ics.scs]); it only loses the 3.2.5 tie-break to the unqualified base.
+                    if (derivedToBase && !dropsPointeeConst)
+                    {
+                        out.cvBase = param.TypeName;
+                        out.cv = addsOrDropsPointeeConst ? 1 : 0;
+                    }
                     out.cxxViable = pt.PointerDepth == 1 && !dropsPointeeConst;
                     out.from = pt.TypeName;
                     out.toClass = param.TypeName;
@@ -975,7 +1222,7 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
             // than every other standard conversion sequence for the same argument.
             if (candidate.IsCxx && !param.Pointer && !param.IsAlias && !param.IsRvalueRef
                 && param.TypeName == "bool" && !IsCxxNullTypedArgument(arg)
-                && !IsNullPointerConstantArgument(arg)
+                && !IsNullPointerConstantArgument(arg, candidate.IsCxx)
                 && (arg.TypeAndValue.Pointer || arg.TypeAndValue.ElemPointer
                     || arg.TypeAndValue.IsFunctionPointer || arg.IsStringLiteral
                     || fixedArrayArgument))
@@ -1159,8 +1406,10 @@ int LLVMBackend::CompareCxxConversionRanks(const std::vector<CxxConversionRank>&
                 return 0;
             if (x.toClass == "void") return 1;
             if (y.toClass == "void") return -1;
-            if (IsCxxBaseOf(y.toClass, x.toClass)) return -1;
-            if (IsCxxBaseOf(x.toClass, y.toClass)) return 1;
+            if (IsCxxBaseOf(y.toClass, x.toClass)
+                || CollectCxxBaseRoutes(x.toClass, y.toClass, false).viaVirtual) return -1;
+            if (IsCxxBaseOf(x.toClass, y.toClass)
+                || CollectCxxBaseRoutes(y.toClass, x.toClass, false).viaVirtual) return 1;
             return 0;
         };
         bool aBetter = false;
@@ -1221,6 +1470,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Integer -> bool coercions. Without it `sb.append(n)` picked append(bool) over
             // append(int) purely by declaration order.
             int boolCoercions = 0;
+            // Native char-family pointee conversions (u8*/i8* <-> char*): ranked below a void*
+            // conversion so `f(void*)` wins over `f(char*)` for a `u8*` in either order.
+            int charFamilyPointeeConversions = 0;
             // Parameters left to their defaults. An exact-arity overload (the C++ default
             // wrapper `f(a)` next to `f(a, b = expr)`) beats one that would fill defaults in.
             int omitted = 0;
@@ -1250,6 +1502,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Not viable in C++ (dropped pointee const); removed while any other candidate is
             // viable, else kept so the selected-candidate guard refuses it.
             bool cxxPointeeConstNotViable = false;
+            // Native: a floating pointee against an unrelated primitive pointee (int* into double*).
+            // Removed while any other candidate is viable, else kept (legacy accept, master pick).
+            bool unrelatedPointeeNotViable = false;
             // In a C++ overload set containing the same T& and const T& parameter, an
             // lvalue binds to T&. Count only this exact sibling comparison.
             int mutableRefPreference = 0;
@@ -1363,7 +1618,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         && IsImplicitIntegerPointeePointerConversion(originalArgType, *varParamItr))
                         declaredParamRefuses = true;
                     if (candidate.IsCxx
-                        && CxxRecordPointeeConstRelation(arg.TypeAndValue, *varParamItr)
+                        && CxxCandidatePointeeConstRelation(candidate,
+                               (size_t)std::distance(candidate.Parameters.begin(), varParamItr),
+                               arg.TypeAndValue, *varParamItr)
                                == CxxPointeeConstRelation::Drops)
                         variadicDropsPointeeConst = true;
                     ++varParamItr;
@@ -1398,6 +1655,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             int shapeMismatches = 0;
             // Arguments bound to a 'bool' parameter through the integer -> bool coercion.
             int boolCoercions = 0;
+            int charFamilyPointeeConversions = 0;
             int constRefMaterializations = 0;
             int mutableRefPreference = 0;
             std::vector<int> standardCosts;
@@ -1409,6 +1667,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             int callbackConstMismatches = 0;
             bool callbackConstUnproven = false;
             bool cxxPointeeConstNotViable = false;
+            bool unrelatedPointeeNotViable = false;
             // Arguments bound through a user-defined conversion; the extra fields describe
             // conversion operators (see Ranked for the aggregate fallback).
             int userConversions = 0;
@@ -1423,8 +1682,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 int result = -1;
                 if (candidate.IsCxx && candidateParamItr != candidate.Parameters.end())
                 {
-                    const auto relation =
-                        CxxRecordPointeeConstRelation(arg.TypeAndValue, *candidateParamItr);
+                    const auto relation = CxxCandidatePointeeConstRelation(candidate,
+                        (size_t)std::distance(candidate.Parameters.begin(), candidateParamItr),
+                        arg.TypeAndValue, *candidateParamItr);
                     if (relation == CxxPointeeConstRelation::Drops)
                         cxxPointeeConstMismatches += 2;
                     else if (relation == CxxPointeeConstRelation::Adds)
@@ -1471,13 +1731,28 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                             || IsScopedEnumTypeName(arg.TypeAndValue.TypeName))
                         && !IsScopedEnumMatch(arg.TypeAndValue, *candidateParamItr))
                         || CxxEnumParameterRefusesArgument(arg, arg.TypeAndValue, *candidateParamItr)
-                        || CxxDistinctEnumArgument(arg.TypeAndValue, *candidateParamItr));
+                        || CxxDistinctEnumArgument(arg, *candidateParamItr));
 
                 // A C++ rvalue-reference parameter is address-passed like an alias, but an
                 // lvalue cannot bind it. Keep the candidate visible for the move diagnostic.
                 const bool argIsCxxRvalue = candidate.IsCxx
                     && IsCxxRvalueReferenceArgument(arg);
                 const size_t paramIndex = std::distance(candidate.Parameters.begin(), candidateParamItr);
+                const bool cxxPointerValueParam = candidate.IsCxx
+                    && !candidateParamItr->IsAlias && !candidateParamItr->IsRvalueRef
+                    && !candidateParamItr->IsCxxRefToPointer && !candidateParamItr->IsArrayView
+                    && !CxxArrayReferenceSpelling(candidate, paramIndex)
+                    && (candidateParamItr->Pointer || candidateParamItr->IsFunctionPointer);
+                const bool cxxIntegerValue = !arg.TypeAndValue.Pointer && arg.BaseType != nullptr
+                    && arg.BaseType->isIntegerTy();
+                if (cxxPointerValueParam && cxxIntegerValue
+                    && !IsNullPointerConstantArgument(arg, true))
+                {
+                    perfectMatch = false;
+                    promotionMatch = false;
+                    implicitMatch = false;
+                    break;
+                }
                 if (candidate.IsCxx && candidateParamItr->IsCxxConstRef
                     && !IsCxxRvalueReferenceArgument(arg))
                 {
@@ -1507,7 +1782,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 // std::nullptr_t maps to void*, but only a null pointer constant converts to it
                 // ([conv.ptr]): a non-null pointer never binds `reset(nullptr_t)`.
                 if (candidate.IsCxx && CxxSpellingIsNullptrT(cxxParamSpelling)
-                    && !IsNullptrLiteralArgument(arg) && !IsNullPointerConstantArgument(arg)
+                    && !IsNullptrLiteralArgument(arg) && !IsNullPointerConstantArgument(arg, candidate.IsCxx)
                     && !arg.TypeAndValue.IsCxxNullptrT)
                 {
                     perfectMatch = false;
@@ -1521,7 +1796,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 if (candidate.IsCxx && cxxDeductionWrappers_.count(candidate.UniqueName) != 0
                     && !(candidate.IsMethod && paramIndex == 0)
                     && CxxDeductionWrapperDeducesOther(arg, *candidateParamItr,
-                                                       CxxSpellingIsNullptrT(cxxParamSpelling)))
+                                                       CxxSpellingIsNullptrT(cxxParamSpelling),
+                                                       candidate, paramIndex))
                 {
                     perfectMatch = false;
                     promotionMatch = false;
@@ -1591,7 +1867,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 // An encoded closure param (list<Lambda<...>>::add's `T value`, gap a) accepts the same
                 // arguments; an encoded closure arg satisfies a function<T> param likewise.
                 else if (candidate.IsCxx && candidateParamItr->IsFunctionPointer
-                    && IsNullPointerConstantArgument(arg))
+                    && IsNullPointerConstantArgument(arg, candidate.IsCxx))
                 {
                     result = 1;
                     ++nullPointerConversions;
@@ -1750,7 +2026,17 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     if (result < 0 && !candidate.IsCxx
                         && IsCxxContiguousViewSource(arg, *candidateParamItr))
                         result = 1;
-                    if (result < 0 && tmpArg.IsTypeMatch(tmpParam))
+                    // A pointer is not a number (ruling 2026-09-26): the arms below compare only
+                    // the pointee name, so `i8*` must not reach `i128` by integer width.
+                    const bool pointerToArithmetic = (tmpArg.Pointer || tmpArg.ElemPointer)
+                        && !tmpParam.Pointer && !tmpParam.ElemPointer && !tmpParam.IsAlias
+                        && !tmpParam.IsRvalueRef && !tmpParam.IsArrayView && !tmpParam.IsInterface
+                        && !tmpParam.IsFunctionPointer && !tmpParam.IsSimd
+                        && tmpParam.ConstArraySize == 0 && tmpParam.TypeName != "bool"
+                        && (tmpParam.IsInteger() != -1 || tmpParam.IsFloatingPoint() != -1);
+                    if (result < 0 && pointerToArithmetic)
+                        ;
+                    else if (result < 0 && tmpArg.IsTypeMatch(tmpParam))
                         result = 0;
                     // A C++ lvalue reference is represented as an alias value in CFlat. A
                     // derived lvalue binds to a public base reference by a standard conversion;
@@ -1762,6 +2048,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     // of it, with the base subobject offset added at the call. Scored as an
                     // implicit conversion so an exact-type overload always wins.
                     else if (IsCxxDerivedToBasePointer(tmpArg, tmpParam))
+                        result = 1;
+                    // A virtual base is a derived-to-base conversion too; clang lowers it.
+                    else if (IsCxxDerivedToClangBasePointer(tmpArg, tmpParam))
                         result = 1;
                     else if (tmpArg.IsTypePromotion(tmpParam))
                     {
@@ -2004,7 +2293,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     // conversion, below nullptr and pointer identity matches.
                     if (result < 0 && candidateParamItr->Pointer
                         && !candidateParamItr->IsArrayView
-                        && IsNullPointerConstantArgument(arg))
+                        && (!candidate.IsCxx || CxxSpellingHasPointerTarget(
+                            CxxReferenceParameterSpelling(candidate, paramIndex)))
+                        && !CxxArrayReferenceSpelling(candidate, paramIndex)
+                        && (!IsCxxReferenceParameter(candidate, paramIndex)
+                            || CxxReferenceAllowsNullPointerConversion(*candidateParamItr,
+                                CxxReferenceParameterSpelling(candidate, paramIndex)))
+                        && IsNullPointerConstantArgument(arg, candidate.IsCxx))
                     {
                         result = 1;
                         ++nullPointerConversions;
@@ -2134,6 +2429,29 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         result = -1;
                 }
 
+                // A typed zero literal (0UL) is a null pointer constant too: a standard conversion.
+                if (result < 0 && candidate.IsCxx && candidateParamItr->Pointer
+                    && !candidateParamItr->IsArrayView
+                    && CxxSpellingHasPointerTarget(CxxReferenceParameterSpelling(candidate, paramIndex))
+                    && !CxxArrayReferenceSpelling(candidate, paramIndex)
+                    && (!IsCxxReferenceParameter(candidate, paramIndex)
+                        || CxxReferenceAllowsNullPointerConversion(*candidateParamItr,
+                            CxxReferenceParameterSpelling(candidate, paramIndex)))
+                    && IsNullPointerConstantArgument(arg, true))
+                {
+                    result = 1;
+                    ++nullPointerConversions;
+                }
+
+                // Macro values are prvalues in C++, so their CFlat backing global cannot make a
+                // non-null macro viable by taking its address for a pointer parameter.
+                if (result >= 0 && candidate.IsCxx
+                    && candidateParamItr->Pointer && !candidateParamItr->IsArrayView
+                    && CxxSpellingHasPointerTarget(
+                        CxxReferenceParameterSpelling(candidate, paramIndex))
+                    && IsCxxNonNullMacroRvalue(arg))
+                    result = -1;
+
                 /*
                  * Depth OVERRIDES both branches above, because both re-granted a pair the depth
                  * gates refuse: the named branch's numeric fallback scores `int**` against `int*`
@@ -2151,7 +2469,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     depthParam.ElemPointer = false;
                     depthParam.PointerDepth = 1;
                 }
-                if (result >= 0 && arg.TypeAndValue.PointerDepthRefuses(depthParam))
+                if (result >= 0 && !(candidate.IsCxx && IsCxxNullTypedArgument(arg))
+                    && arg.TypeAndValue.PointerDepthRefuses(depthParam))
                     result = -1;
 
                 // Constructor offers and conversion operators cannot re-grant a standard
@@ -2194,7 +2513,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 // Integer -> bool IS legal, and lowers through CoerceToBoolCondition. Implicit
                 // (1), never perfect, so an exactly-typed overload still wins.
                 const bool cxxPointerToBool = candidate.IsCxx
-                    && !IsCxxNullTypedArgument(arg) && !IsNullPointerConstantArgument(arg)
+                    && !IsCxxNullTypedArgument(arg) && !IsNullPointerConstantArgument(arg, candidate.IsCxx)
                     && !candidateParamItr->Pointer && !candidateParamItr->IsAlias
                     && !candidateParamItr->IsRvalueRef && candidateParamItr->TypeName == "bool"
                     && (arg.TypeAndValue.Pointer || arg.TypeAndValue.ElemPointer
@@ -2216,9 +2535,18 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 const bool argumentIsPointer = arg.TypeAndValue.Pointer
                     || (arg.BaseType != nullptr && arg.BaseType->isPointerTy());
                 if (candidate.IsCxx && !IsCxxNullTypedArgument(arg)
-                    && !IsNullPointerConstantArgument(arg)
+                    && !IsNullPointerConstantArgument(arg, candidate.IsCxx)
                     && argumentIsPointer && argumentPointerName == "void"
                     && candidateParamItr->Pointer && candidateParamItr->TypeName != "void")
+                    result = -1;
+                const std::string sourceEnum = !arg.TypeAndValue.TypeName.empty()
+                    ? arg.TypeAndValue.TypeName : arg.InferSourceTypeName;
+                const bool sourceIsEnum = arg.TypeAndValue.IsScopedEnum
+                    || !arg.TypeAndValue.EnumBacking.empty()
+                    || IsScopedEnumTypeName(sourceEnum) || !ResolveEnumTypeName(sourceEnum).empty();
+                if (candidate.IsCxx && sourceIsEnum
+                    && (candidateParamItr->Pointer || candidateParamItr->IsFunctionPointer)
+                    && !candidateParamItr->IsAlias && !candidateParamItr->IsRvalueRef)
                     result = -1;
                 // A scoped enum has no standard conversion here, but a clang-proved converting
                 // ctor keeps the candidate viable; the mismatch only blocks the fallbacks above.
@@ -2264,6 +2592,61 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                                 result = 1;
                         }
                     }
+                    // Native overloads: a typed pointer binding `void*`, or a `void*` binding a typed
+                    // pointer, is a conversion, never exact - the pointee-spelling overload wins.
+                    if (!candidate.IsCxx && result == 0 && candidates.size() > 1
+                        && pointerArg.Pointer && !pointerArg.ElemPointer && pointerArg.PointerDepth <= 1
+                        && !pointerArg.IsFunctionPointer && !pointerArg.IsCxxNullptrT
+                        && pointerParam.Pointer && !pointerParam.ElemPointer
+                        && pointerParam.PointerDepth <= 1 && !pointerParam.IsFunctionPointer
+                        && !pointerArgName.empty() && !pointerParam.TypeName.empty()
+                        && (pointerArgName == "void") != (pointerParam.TypeName == "void"))
+                        result = 1;
+                    // The ruled char-family pointee conversion (u8*/i8* <-> char*) stays viable but
+                    // ranks below the void* conversion, as in master and clang, in either order.
+                    if (!candidate.IsCxx && result >= 0 && candidates.size() > 1
+                        && pointerArg.Pointer && !pointerArg.ElemPointer && pointerArg.PointerDepth <= 1
+                        && pointerParam.Pointer && !pointerParam.ElemPointer
+                        && pointerParam.PointerDepth <= 1)
+                    {
+                        const std::string argBase = ResolveTypeAlias(pointerArgName);
+                        const std::string paramBase = ResolveTypeAlias(pointerParam.TypeName);
+                        if ((argBase == "char" && (paramBase == "i8" || paramBase == "u8"))
+                            || (paramBase == "char" && (argBase == "i8" || argBase == "u8")))
+                        {
+                            // char <-> i8 is same-sign (cost 1); char <-> u8 changes sign (cost 2).
+                            result = std::max(result, 1);
+                            charFamilyPointeeConversions += (argBase == "u8") == (paramBase == "u8")
+                                ? 1 : 2;
+                        }
+                    }
+                    // Native sets: int* into double* is not viable in C++, so f(void*) wins; integer
+                    // pairs go through IsImplicitIntegerPointeePointerConversion.
+                    bool unrelatedPrimitivePointee = false;
+                    if (!candidate.IsCxx && result >= 0 && candidates.size() > 1
+                        && pointerArg.Pointer && !pointerArg.ElemPointer && pointerArg.PointerDepth <= 1
+                        && !pointerArg.IsFunctionPointer && !pointerArg.IsCxxNullptrT
+                        && !pointerArg.IsArrayView && pointerArg.ConstArraySize == 0
+                        && pointerParam.Pointer && !pointerParam.ElemPointer
+                        && pointerParam.PointerDepth <= 1 && !pointerParam.IsFunctionPointer
+                        && !pointerParam.IsAlias && !pointerParam.IsArrayView
+                        && !IsNullPointerConstantArgument(arg)
+                        && !pointerArgName.empty() && !pointerParam.TypeName.empty())
+                    {
+                        TypeAndValue argPointee;
+                        argPointee.TypeName = ResolveTypeAlias(pointerArgName);
+                        TypeAndValue paramPointee;
+                        paramPointee.TypeName = ResolveTypeAlias(pointerParam.TypeName);
+                        const bool argFloat = argPointee.IsFloatingPoint() != -1;
+                        const bool paramFloat = paramPointee.IsFloatingPoint() != -1;
+                        if ((argFloat || paramFloat)
+                            && argPointee.IsPrimitive() && paramPointee.IsPrimitive()
+                            && argPointee.TypeName != "void" && paramPointee.TypeName != "void"
+                            && argPointee.TypeName != paramPointee.TypeName
+                            && !(argFloat && paramFloat
+                                 && argPointee.IsFloatingPoint() == paramPointee.IsFloatingPoint()))
+                            unrelatedPrimitivePointee = true;
+                    }
                     const std::string argIdentity = IntegerArgumentIdentity(arg, candidate.IsCxx);
                     // A reference parameter has no identity of its own; the arms above supply the
                     // referent's, so `const int&` outranks `const long long&` for an int literal.
@@ -2277,6 +2660,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         integerCost = RankIntegerConversion(argIdentity, paramIdentity, candidate.IsCxx);
                         result = integerCost == 0 ? 0 : 1;
                     }
+                    if (unrelatedPrimitivePointee)
+                        unrelatedPointeeNotViable = true;
                 }
                 // RULING: a `const T&` materialization is strictly WORSE than a by-value or
                 // rvalue-ref candidate at the same conversion, and never a perfect match.
@@ -2289,8 +2674,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 if (result >= 0 && candidate.IsCxx
                     && candidateParamItr != candidate.Parameters.end())
                 {
-                    const auto relation =
-                        CxxRecordPointeeConstRelation(arg.TypeAndValue, *candidateParamItr);
+                    const auto relation = CxxCandidatePointeeConstRelation(candidate,
+                        (size_t)std::distance(candidate.Parameters.begin(), candidateParamItr),
+                        arg.TypeAndValue, *candidateParamItr);
                     if (relation == CxxPointeeConstRelation::Adds
                         || relation == CxxPointeeConstRelation::Drops)
                         result = std::max(result, 1);
@@ -2339,10 +2725,31 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     && cxxPointerArgumentType == "c8"
                     && ResolveTypeAlias(candidateParamItr->TypeName) == "char")
                     result = -1;
+                // A class pointer parameter bound as `void*` takes only that class or a class
+                // derived from it; a proven unrelated class is not viable in C++.
+                if (result >= 0 && candidate.IsCxx)
+                {
+                    std::string spelledBase;
+                    bool bySpelling = false;
+                    if (CxxVoidParamClassRelation(candidate,
+                            (size_t)std::distance(candidate.Parameters.begin(), candidateParamItr),
+                            *candidateParamItr, arg.TypeAndValue, spelledBase, bySpelling)
+                        == CxxSpelledParamRelation::Unrelated)
+                        result = -1;
+                }
+                if (candidate.IsCxx && IsCxxReferenceParameter(candidate, paramIndex)
+                    && !userConversionForArgument
+                    && (IsCxxNullTypedArgument(arg) || IsNullPointerConstantArgument(arg, true))
+                    && !CxxReferenceAllowsNullPointerConversion(*candidateParamItr,
+                        CxxReferenceParameterSpelling(candidate, paramIndex)))
+                    result = -1;
                 integerCosts.push_back(integerCost);
                 standardCosts.push_back(integerCost);
-                if (standardCosts.back() < 0 && IsNullPointerConstantArgument(arg)
-                    && candidateParamItr->Pointer && !candidateParamItr->IsArrayView)
+                if (standardCosts.back() < 0 && IsNullPointerConstantArgument(arg, candidate.IsCxx)
+                    && candidateParamItr->Pointer && !candidateParamItr->IsArrayView
+                    && (!IsCxxReferenceParameter(candidate, paramIndex)
+                        || CxxReferenceAllowsNullPointerConversion(*candidateParamItr,
+                            CxxReferenceParameterSpelling(candidate, paramIndex))))
                     standardCosts.back() = kIntegerConversionCost;
 
                 if (result != 0)
@@ -2373,6 +2780,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 ranked.pair = &pair;
                 ranked.shapeMismatches = shapeMismatches;
                 ranked.boolCoercions = boolCoercions;
+                ranked.charFamilyPointeeConversions = charFamilyPointeeConversions;
                 ranked.constRefMaterializations = constRefMaterializations;
                 ranked.mutableRefPreference = mutableRefPreference;
                 ranked.omitted = omitted;
@@ -2382,6 +2790,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 ranked.callbackConstMismatches = callbackConstMismatches;
                 ranked.callbackConstUnproven = callbackConstUnproven;
                 ranked.cxxPointeeConstNotViable = cxxPointeeConstNotViable;
+                ranked.unrelatedPointeeNotViable = unrelatedPointeeNotViable;
                 ranked.userConversions = userConversions;
                 ranked.userConversionCost = userConversionCost;
                 ranked.userConversionNames = userConversionNames;
@@ -2400,6 +2809,15 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         {
             std::erase_if(perfect, [](const Ranked& r) { return r.cxxPointeeConstNotViable; });
             std::erase_if(possible, [](const Ranked& r) { return r.cxxPointeeConstNotViable; });
+        }
+        // Generic templates never join a set with concrete overloads, so an all-unrelated set
+        // keeps its legacy pick rather than failing the call.
+        auto pointeeViable = [](const Ranked& r) { return !r.unrelatedPointeeNotViable; };
+        if (std::any_of(perfect.begin(), perfect.end(), pointeeViable)
+            || std::any_of(possible.begin(), possible.end(), pointeeViable))
+        {
+            std::erase_if(perfect, [](const Ranked& r) { return r.unrelatedPointeeNotViable; });
+            std::erase_if(possible, [](const Ranked& r) { return r.unrelatedPointeeNotViable; });
         }
 
         using Result = std::pair<std::vector<NamedVariable>, FunctionSymbol>;
@@ -2677,6 +3095,10 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 if ((!failedDefault && cxxRanks.count(&pair) != 0)
                     || !receiverRefQualifierMatches(pair.second, pair.first))
                     continue;
+                // A deduction wrapper made for other argument identities is another
+                // specialization C++ never considers for this call (long vs unsigned long).
+                if (CxxDeductionWrapperDeducesOtherForCall(pair.second, pair.first))
+                    continue;
                 // A failed default remains viable even when CFlat's fallback ranks a rival first.
                 // Its full declaration and its exact-arity wrapper are the same candidate.
                 if (pair.second.UniqueName == winner->pair->second.UniqueName
@@ -2840,6 +3262,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Prefer agreeing function-pointer shapes, then fewer integer -> bool coercions.
             keepLowest(best, [](const Ranked& r) { return r.shapeMismatches; });
             keepLowest(best, [](const Ranked& r) { return r.boolCoercions; });
+            keepLowest(best, [](const Ranked& r) { return r.charFamilyPointeeConversions; });
             // An overload over the argument's own specialization beats a const-added one.
             keepLowest(best, [](const Ranked& r) { return r.constAddedConversions; });
             keepLowest(best, [](const Ranked& r) { return r.mutableRefPreference; });
@@ -3542,42 +3965,25 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         lastCxxRetValue_ = nullptr;
         cxxVirtualBaseRefusal_.clear();
         std::string functionName = ResolveQualifiedName(functionNameIn, forceRoot);
-        const bool inGlobalInitThunk = currentFunction != nullptr
-            && (currentFunction->getName().starts_with("__global")
-                || currentFunction->getName().starts_with("__cflat_global"));
         if (!forceRoot && dataStructures.count(functionName) != 0
             && (currentFunction == nullptr || currentFunction->getName() != functionName)
-            && !inGlobalInitThunk
             && !IsCxxRecord(functionName))
         {
             // A CFlat constructor is the first point where an unavailable C++ member default
             // becomes observable. The synthesized body was emitted at the type declaration and
             // intentionally leaves such a member zeroed until this real call is requested.
-            for (const auto& field : GetDataStructure(functionName).StructFields)
+            std::string unavailableType;
+            if (HasUnavailableNestedCxxDefault(functionName, &unavailableType))
             {
-                if (field.Pointer || field.ConstArraySize != 0
-                    || field.BraceInitializer != nullptr
-                    || (field.Initializer != nullptr
-                        && field.Initializer->Default() == nullptr))
-                    continue;
-                auto* fieldType = GetType(field);
-                if (fieldType == nullptr || fieldType->isArrayTy()
-                    || !fieldType->isStructTy() || !IsCxxRecord(field.TypeName)
-                    || !(CxxElementNeedsDefaultConstruction(field.TypeName)
-                        || HasNonPublicCxxDefaultCtor(field.TypeName)))
-                    continue;
                 std::string bindError;
-                TryBindCxxImplicitDefaultCtor(field.TypeName, bindError);
+                TryBindCxxImplicitDefaultCtor(unavailableType, bindError);
                 if (!bindError.empty()) LogErrorMessage("{}", { bindError });
-                if (FindCxxDefaultCtor(field.TypeName) == nullptr)
-                {
-                    const auto* info = GetCxxClassInfo(field.TypeName);
-                    LogErrorMessage(
-                        "C++ class '{}' has no default constructor cflat can call{}",
-                        { DisplayCxxClassName(field.TypeName),
-                          info != nullptr && info->hasDeletedDefaultCtor
-                              ? " (it is deleted)" : "" });
-                }
+                const auto* info = GetCxxClassInfo(unavailableType);
+                LogErrorMessage(
+                    "C++ class '{}' has no default constructor cflat can call{}",
+                    { DisplayCxxClassName(unavailableType),
+                      info != nullptr && info->hasDeletedDefaultCtor
+                          ? " (it is deleted)" : "" });
             }
         }
         std::string shownFunctionName = displayName;
@@ -4628,6 +5034,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             {
                 const auto& arg = arguments[i];
                 std::string typeName = arg.TypeAndValue.TypeName;
+                // A signed/unscoped enum keeps its identity only in InferSourceTypeName.
+                if (typeName.empty() && !ResolveEnumTypeName(arg.InferSourceTypeName).empty())
+                    typeName = arg.InferSourceTypeName;
                 // A string literal argument carries no CFlat type name. Spell the 'char*' it
                 // actually is instead of the lowered 'ptr' its machine type prints as.
                 auto* argConstant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
@@ -4640,6 +5049,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             ? std::string("<unnamed>") : arg.TypeAndValue.VariableName);
                     continue;
                 }
+                // A primitive pointer keeps its pointee in InferSourceTypeName; the opaque
+                // machine type would print as 'ptr'.
+                if (typeName.empty() && arg.TypeAndValue.Pointer)
+                    typeName = arg.InferSourceTypeName;
                 if (typeName.empty() && arg.BaseType)
                 {
                     std::string typeStr;
@@ -4727,6 +5140,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 for (size_t i = 0; i < count; i++)
                 {
                     std::string argDesc = i < resolvedArgs.size() ? resolvedArgs[i].TypeAndValue.TypeName : "<missing>";
+                    if (argDesc.empty() && i < resolvedArgs.size()
+                        && (resolvedArgs[i].TypeAndValue.Pointer
+                            || !ResolveEnumTypeName(resolvedArgs[i].InferSourceTypeName).empty()))
+                        argDesc = resolvedArgs[i].InferSourceTypeName;
                     if (argDesc.empty() && i < resolvedArgs.size() && resolvedArgs[i].BaseType)
                     {
                         std::string typeStr;
@@ -5038,6 +5455,26 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 matched.push_back(std::move(value));
             }
         }
+
+        // A NAMED std::nullptr_t is the null constant: lower it as the bare literal at any
+        // pointer-shaped C++ parameter (function pointer, multi-level pointer) before conversion.
+        if (candidate.IsCxx)
+            for (size_t i = 0; i < matched.size() && i < candidate.Parameters.size(); ++i)
+            {
+                const auto& param = candidate.Parameters[i];
+                auto& arg = matched[i];
+                if (!IsCxxNullTypedArgument(arg)
+                    || llvm::isa_and_nonnull<llvm::ConstantPointerNull>(arg.Primary)
+                    || param.IsCxxNullptrT || param.IsAlias || param.IsRvalueRef
+                    || param.IsCxxRefToPointer || CxxSpellingIsNullptrT(CxxReferenceParameterSpelling(candidate, i))
+                    || !(param.IsFunctionPointer || param.Pointer))
+                    continue;
+                arg.Primary = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(*context));
+                arg.BaseType = arg.Primary->getType();
+                arg.Storage = nullptr;
+                arg.TypeAndValue = {};
+                arg.TypeAndValue.IsCxxNullptrT = true;
+            }
 
         // Materialize a borrowed pointer view only after this CFlat overload has won.
         for (size_t i = 0; i < matched.size() && i < candidate.Parameters.size(); ++i)
@@ -5487,8 +5924,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 // be the wrong type for a pointer parameter.
                 // Guard: if Primary is already a pointer value (e.g. loaded from a global ptr),
                 // use Primary directly - Storage would be the wrong level of indirection.
-                if (IsNullPointerConstantArgument(arg))
+                if (IsNullPointerConstantArgument(arg, candidate.IsCxx)
+                    && (!candidate.IsCxx || CxxSpellingHasPointerTarget(
+                        CxxReferenceParameterSpelling(candidate, argIndex))))
                 {
+                    if (candidate.IsCxx && IsCxxReferenceParameter(candidate, argIndex)
+                        && !CxxReferenceAllowsNullPointerConversion(*candParamItr,
+                            CxxReferenceParameterSpelling(candidate, argIndex)))
+                        LogError("a null pointer constant cannot bind this C++ reference parameter");
                     auto* pointerType = GetType(*candParamItr);
                     if (pointerType == nullptr || !pointerType->isPointerTy())
                     {
@@ -5496,8 +5939,21 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                         { candParamItr->VariableName, diagnosticFunctionName });
                         return nullptr;
                     }
-                    argList.push_back(llvm::ConstantPointerNull::get(
-                        llvm::cast<llvm::PointerType>(pointerType)));
+                    const std::string referenceSpelling = candidate.IsCxx
+                        ? CxxReferenceParameterSpelling(candidate, argIndex) : std::string();
+                    if (candidate.IsCxx && IsCxxReferenceParameter(candidate, argIndex)
+                        && CxxSpellingIsNullptrT(referenceSpelling))
+                    {
+                        auto* temporary = AllocaAtEntry(pointerType, nullptr, "cxx.nullptrref.arg");
+                        builder->CreateStore(llvm::ConstantPointerNull::get(
+                            llvm::cast<llvm::PointerType>(pointerType)), temporary);
+                        argList.push_back(temporary);
+                    }
+                    else
+                    {
+                        argList.push_back(llvm::ConstantPointerNull::get(
+                            llvm::cast<llvm::PointerType>(pointerType)));
+                    }
                 }
                 else if (!arg.TypeAndValue.Pointer && arg.Storage != nullptr
                     && !(arg.Primary != nullptr && arg.Primary->getType()->isPointerTy()))
@@ -5653,8 +6109,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             candParamItr->VariableName, arg.LambdaCaptureNames);
                     }
                     else if (candidate.IsCxx && llvmParamTy->isPointerTy()
-                             && IsNullPointerConstantArgument(arg))
+                             && CxxSpellingHasPointerTarget(
+                                 CxxReferenceParameterSpelling(candidate, argIndex))
+                             && IsNullPointerConstantArgument(arg, candidate.IsCxx))
                     {
+                        if (IsCxxReferenceParameter(candidate, argIndex)
+                            && !CxxReferenceAllowsNullPointerConversion(*candParamItr,
+                                CxxReferenceParameterSpelling(candidate, argIndex)))
+                            LogError("a null pointer constant cannot bind this C++ reference parameter");
                         // Literal 0 matched as a C++ null pointer constant: an integer cannot be
                         // bitcast to ptr (invalid constant cast), so pass the typed null.
                         val = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(llvmParamTy));
@@ -6062,10 +6524,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             {
                 const TypeAndValue& at = matched[i].TypeAndValue;
                 const TypeAndValue& pt = candidate.Parameters[i];
-                uint64_t off = 0;
-                bool inaccessible = false;
-                if (IsCxxDerivedToBasePointer(at, pt)
-                    && FindCxxBaseOffset(at.TypeName, pt.TypeName, off, inaccessible))
+                if ((IsCxxDerivedToBasePointer(at, pt) && !at.ElemPointer)
+                    || IsCxxDerivedToClangBasePointer(at, pt))
+                    argList[i] = LowerCxxPointerToBase(at.TypeName, pt.TypeName, false, argList[i],
+                                                       SpellType(*this, at), SpellType(*this, pt),
+                                                       "the argument");
+                else if (uint64_t off = 0; IsCxxDerivedToBasePointer(at, pt)
+                         && [&] { bool inaccessible = false;
+                                  return FindCxxBaseOffset(at.TypeName, pt.TypeName, off,
+                                                           inaccessible); }())
                     argList[i] = EmitCxxBaseAdjust(argList[i], off);
             }
         llvm::Value* rawReturnCountSlot = nullptr;
@@ -6293,23 +6760,61 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 const TypeAndValue& at = matched[i].TypeAndValue;
                 uint64_t off = 0;
                 bool inaccessible = false;
-                if (IsCxxDerivedToBasePointer(at, pt))
+                if ((IsCxxDerivedToBasePointer(at, pt) && !at.ElemPointer)
+                    || IsCxxDerivedToClangBasePointer(at, pt))
+                {
+                    argList[i] = LowerCxxPointerToBase(at.TypeName, pt.TypeName, false, argList[i],
+                                                       SpellType(*this, at), SpellType(*this, pt),
+                                                       "the argument");
+                }
+                else if (IsCxxDerivedToBasePointer(at, pt))
                 {
                     if (FindCxxBaseOffset(at.TypeName, pt.TypeName, off, inaccessible))
                         argList[i] = EmitCxxBaseAdjust(argList[i], off);
                 }
                 else if (!at.Pointer && pt.IsAlias && pt.Pointer && !pt.ElemPointer
-                         && IsCxxDerivedToBaseValue(at, pt, nullptr)
-                         && LowerCxxValueBaseOffset(at.TypeName, pt.TypeName, off, matched[i]))
+                         && IsCxxDerivedToBaseValue(at, pt, nullptr))
                 {
-                    argList[i] = EmitCxxBaseAdjust(argList[i], off);
+                    LowerCxxReferenceToBase(at.TypeName, pt.TypeName, matched[i], argList[i]);
+                }
+                else if (std::string spelledBase; at.Pointer && pt.Pointer && pt.TypeName == "void")
+                {
+                    // A class pointer bound as `void*` still needs its base subobject.
+                    bool bySpelling = false;
+                    if (CxxVoidParamClassRelation(candidate, i, pt, at, spelledBase, bySpelling)
+                        == CxxSpelledParamRelation::Base)
+                    {
+                        TypeAndValue spelledParam{ .TypeName = spelledBase };
+                        spelledParam.Pointer = true;
+                        argList[i] = LowerCxxPointerToBase(
+                            at.TypeName, spelledBase, bySpelling, argList[i], SpellType(*this, at),
+                            bySpelling ? spelledBase + "*" : SpellType(*this, spelledParam),
+                            "the argument");
+                    }
                 }
             }
             if (candidate.IsMethod && !argList.empty() && !candidate.Parameters.empty())
             {
-                auto adj = cxxThisAdjust_.find(
-                    CxxThisAdjustKey(candidate.Parameters[0].TypeName, candidate.UniqueName));
-                if (adj != cxxThisAdjust_.end())
+                const std::string thisKey =
+                    CxxThisAdjustKey(candidate.Parameters[0].TypeName, candidate.UniqueName);
+                auto adj = cxxThisAdjust_.find(thisKey);
+                auto viaVirtual = cxxThisVirtualBase_.find(thisKey);
+                // The recorded offset of a virtual base holds only in a complete object of the
+                // receiver's class; any other receiver reaches the base through clang.
+                if (viaVirtual != cxxThisVirtualBase_.end() && !matched.empty()
+                    && !IsCxxCompleteObjectValue(matched[0]))
+                {
+                    TypeAndValue receiverType{ .TypeName = candidate.Parameters[0].TypeName };
+                    receiverType.Pointer = true;
+                    TypeAndValue ownerType{ .TypeName = viaVirtual->second.first };
+                    ownerType.Pointer = true;
+                    argList[0] = EmitCxxBaseAdjust(
+                        LowerCxxPointerToBase(receiverType.TypeName, ownerType.TypeName, false,
+                                              argList[0], SpellType(*this, receiverType),
+                                              SpellType(*this, ownerType), "the member call"),
+                        viaVirtual->second.second);
+                }
+                else if (adj != cxxThisAdjust_.end())
                     argList[0] = EmitCxxBaseAdjust(argList[0], adj->second);
                 llvm::Value* adjustedThis = argList[0];
                 cxxVirtualCallee = EmitCxxVirtualCallee(candidate, argList[0], &adjustedThis);

@@ -173,6 +173,7 @@
 //     variadic constructor argument from another import, an unevaluated declval (2652, 2654-2659).
 
 import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_t55_ternary.hpp";
 import cpp "library/cpp_interop_basic.cpp";
 import cpp "library/cpp_interop_freeoptpl.h";
 
@@ -229,6 +230,7 @@ import cpp "library/cpp_interop_nest.h";
 import cpp "library/cpp_interop_nest2.h";
 // Constructor TEMPLATES on user classes (section 2540-2559).
 import cpp "library/cpp_interop_tmplctor.h";
+import cpp "library/cpp_interop_tmpl_identity.h";
 import cpp "library/cpp_interop_global_scope.h";
 import cpp "library/cpp_interop_global_collision.h";
 // T23: assert from an NDEBUG group (this file has no other assert definition).
@@ -547,6 +549,36 @@ extern int main()
     // whole C++-interop surface is verified on the Itanium-ABI hosts only.
     if const (__WINDOWS__) {
         return 0;
+    }
+
+    // C++ usual arithmetic conversions determine the type deduced from a ?: argument.
+    {
+        int k = 1, i = 5;
+        long l = 5;
+        u8 b = 5;
+        char c = 5;
+        unsigned int ui = 5;
+        double d = 0.5;
+        i64 wide = 5;
+        if (t55.tf(k ? 5 : 6) != 2005) return 55001;
+        if (t55.tf(k ? 5 : i) != 2005) return 55002;
+        if (t55.tf(k ? i : l) != 3005) return 55003;
+        if (t55.tf(k ? l : 5) != 3005) return 55004;
+        if (t55.tf(k ? i : b) != 2005) return 55005;
+        if (t55.tf(k ? (char)c : 5) != 2005) return 55006;
+        if (t55.tf(k ? 5 : t55.EA) != 2005) return 55007;
+        if (t55.tf(k ? t55.EA : t55.FA) != 2003) return 55008;
+        if (t55.tf(k ? t55.EA : i) != 2003) return 55009;
+        if (t55.tf(k ? i : d) != 8050) return 55010;
+        if (t55.tf(k ? i : ui) != 5005) return 55011;
+        if (t55.tf(k ? wide : 5) != 4005) return 55012;
+        if (t55.tf(k ? t55.EA : t55.EA) != 6003) return 55013;
+        // Same-type arms are not promoted: short, u8, bool and char stay themselves.
+        short s = 5, s2 = 6;
+        if (t55.tf(k ? s : s2) != 9005) return 55014;
+        if (t55.tf(k ? b : b) != 9005) return 55015;
+        if (t55.tf(k ? true : false) != 9001) return 55016;
+        if (t55.tf(k ? c : c) != 9005) return 55017;
     }
 
     // T23: under NDEBUG assert expands to ((void)0) and evaluates nothing, as in C++.
@@ -3544,9 +3576,10 @@ extern int main()
             if (cppt.arr.nil_kind_fwd(nullptr) != 1 || cppt.arr.nil_kind_fwd(madeNil) != 1) return 2872;
             if (sink.take_default() != 9 || sink.take_default(nullptr) != 9) return 2873;
             if (cppt.arr.nil_kind(autoNil) != 1)                            return 2874;
-            // A pointer expression is never the null type. `p + 1` carries no pointee type.
+            // A pointer expression is never the null type. `p + 1` keeps its int* type and deduces
+            // int* (clang); `f ? p : nullptr` deduces int* too - never std::nullptr_t.
             int* nilPtr = &nilProbe;
-            expect_error("cannot be spelled in C++") { int arithKind = cppt.arr.nil_kind(nilPtr + 1); }
+            if (cppt.arr.nil_kind(nilPtr + 1) != 2) return 2875;
             int mixKind = cppt.arr.nil_kind(nullFlag ? nilPtr : nullptr);
             if (mixKind != 2) return 2885;
             int reverseMixKind = cppt.arr.nil_kind(nullFlag ? nullptr : nilPtr);
@@ -4095,6 +4128,55 @@ extern int main()
         if (fw != 10 || t37.track_copy_count() != 1 || t37.track_move_count() != 1) return 2968;
         t37.track_reset();
         if (t37ForwardLambda(tk) != 12 || t37.track_copy_count() != 1 || t37.track_move_count() != 1) return 2969;
+    }
+    {
+        long tl = 3;
+        long tl2 = 5;
+        ulong tul = 3;
+        i64 tll = 3;
+        tplid.F tf = tplid.f;
+        tplid.M tm = default;
+        // T58: deduction keeps the C++ type an argument has in C++, not its lowered width.
+        // Order axis: the unsigned long specialization comes first, then long ones join it
+        // under the same name; then the reverse. Pre-fix every arithmetic leg was long long.
+        if (tplid.byval(tul + 1) != 63 || tplid.byval(tl) != 43)              return 2970;
+        if (tplid.byval(tl + 1) != 43 || tplid.byval(tul) != 63)              return 2971;
+        if (tplid.byval(tll + 1) != 53 || tplid.byval(tl * tl2) != 43)        return 2972;
+        if (tplid.byval(tl * tul) != 63 || tplid.byval(tul + tll) != 83)      return 2973;
+        if (tplid.byval((tl + 1) * tul) != 63 || tplid.byval(tll + tl) != 53) return 2974;
+        // Constructor template: an arithmetic rvalue takes T&& with T = long.
+        if (tplid.W(tl + 1).id != 42 || tplid.W(tul + 1).id != 62)            return 2975;
+        if (tplid.W(tl).id != 41 || tplid.W(tll).id != 51)                    return 2976;
+        // An enumerator is a prvalue: T&& (pre-fix the T& overload bound its global).
+        if (tplid.W(tplid.e).id != 12 || tm.val(tplid.e) != 12)              return 2977;
+        // Member and forwarding templates, and an unscoped enum promoted in arithmetic.
+        if (tm.val(tl + 1) != 42 || tplid.fwd(tl + 1) != 44)                  return 2978;
+        if (tplid.fwd(tf + 1) != 74 || tplid.byval(tf + 1) != 73)             return 2979;
+        // A cast replaces the arithmetic identity; std.max binds through the free-function path.
+        if (tplid.byval((long)(tul + 1)) != 43 || std.max(tl + 1, tl) != 4)  return 2980;
+        if (tplid.mix(tul + 1) != 63 || tplid.mix(tl + 1) != 1)              return 2981;
+        // `!` makes a bool: the operand's arithmetic identity must not follow it.
+        if (tplid.byval(!(tl + 1)) != 993 || tplid.byval(-(tul + 1)) != 63)  return 2982;
+        // Brace elements `tl + 4` are long and `tll` long long: pre-fix both ranked as long long
+        // (wrong overload), then the two wrappers redefined one shared selector namespace.
+        if (tplid.pick(tplid.Pick({tl + 4, tl + 4})) != 71)                  return 2983;
+        if (tplid.pick(tplid.Pick({tll, tll})) != 32)                        return 2984;
+        if (tplid.pick(tplid.Pick({tll + 4, tll + 4})) != 72)                return 2985;
+        // Operator templates read the operand's arithmetic identity, not its text (clang:
+        // double 12, long 4); round 4 deduced float for `1e3 + 1`, master long long for `tl + 1`.
+        tplid.Op top = default;
+        bool tc = tl > 1;
+        if (top * (1e3 + 1) != 12 || top * (2.0 * 3) != 12 || top * (tl + 1) != 4) return 2986;
+        if ((top < (1e3 + 1)) != 12 || (top << (tl + 1)) != 4)                      return 2987;
+        top *= 1e3 + 1;
+        long t58Mul = top.last;
+        top *= tl + 1;
+        if (t58Mul != 12 || top.last != 4)                                          return 2988;
+        // Ternary arms keep it too and join by the usual arithmetic conversions.
+        if (tplid.ffwd(tc ? 1e3 + 1 : 2.0f) != 12 || tplid.ffwd(tc ? tl + 1 : 2) != 4
+            || tplid.ffwd(tc ? 2 : tl + 1) != 4)                                    return 2989;
+        // An unparenthesized chain (`a + b - top`) carries the left result's identity.
+        if (1e3 + 1 - top != 12 || 2.0 * 3 + 1 - top != 12 || tl + 1 - top != 4)  return 2990;
     }
     return 0;
 }

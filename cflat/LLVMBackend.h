@@ -1572,11 +1572,19 @@ public:
         // call site drops TypeName for a primitive so overload matching stays LLVM-type based.
         // Generic type-argument inference reads it; not part of the --init cache round-trip.
         std::string InferSourceTypeName;
+        // C++ identity of a built-in arithmetic result (`l + 1` is C++ `long`, typed i64 here),
+        // for C++ template deduction only; native typing never reads it. Transient.
+        std::string CxxArithIdentity;
         // compile-time: the C++ literal identity before lowering narrows it (including int and
         // double for suffix-less literals). Not part of the --init cache round-trip.
         std::string LiteralIdentity;
         // compile-time: LiteralIdentity came from an integer suffix (1UL). Not part of the cache round-trip.
         bool LiteralIdentitySuffixed = false;
+        // compile-time: the literal was written with a unary sign (+0, -0). Not cached.
+        bool LiteralSigned = false;
+        // Imported C++ macro provenance survives constant folding of its global value.
+        bool IsCxxMacroGlobal = false;
+        bool IsCxxNullIntegerMacro = false;
         // compile-time: this argument was written 'move x' at a call site and is a VALUE type
         // (string/owning struct/closure). Zeroing is deferred to ApplyMoveParamTransfer so the
         // callee's parameter move-ness is known first. Not part of the --init cache round-trip.
@@ -1584,6 +1592,8 @@ public:
         // True only for a value-producing expression. Named variables, fields, elements, aliases,
         // and dereferences remain lvalues even when their LLVM value has no storage of its own.
         bool IsRvalue = false;
+        // A `p + n` / `p - n` pointer result. Transient; read only by the interface-return refusal.
+        bool IsPointerArithmeticResult = false;
         // Set by the front-end when this expression is the last proven use of a foreign C++
         // by-value parameter. Transient call-site metadata; never cache-serialized.
         bool CxxParamLastUse = false;
@@ -1897,6 +1907,7 @@ public:
         bool         isArrayView = false;   // value came from a thin `int[]` view (pointer arithmetic is banned on it)
         bool         isAlias    = false;    // value is a borrow from an alias result or join
         bool         isRvalue = false;      // value-producing expression; named lvalues keep this false
+        bool         isPointerArithmeticResult = false; // `p + n` / `p - n` pointer result
         llvm::Value* storage    = nullptr;  // lvalue storage for an addressable alias result/join
         llvm::Value* receiverStorage = nullptr; // lvalue storage retained for synthesized method calls
         // Non-null when `value` is the POINTER a C++ operator returned for a `T&` result: the
@@ -1908,6 +1919,9 @@ public:
         bool         elemPointer  = false;
         // Source spelling retained for C++ identity and operator reductions.
         std::string  sourceTypeName;
+        // C++ type of a built-in arithmetic result (`l + 1` is `long` though typed i64), for
+        // C++ template deduction only (NamedVariable::CxxArithIdentity). Transient.
+        std::string  cxxArithIdentity;
         TypeAndValue sourceType;
         bool hasSourceType = false;
         // TypeAndValue::IsCxxPointeeConst of a pointer operand, so a `?:` join keeps it.
@@ -2138,6 +2152,7 @@ public:
         llvm::BasicBlock* Block;
         llvm::Value* Value;      // nullptr for bare 'return;'
         llvm::Instruction* Placeholder; // unreachable inst we inserted; will be replaced by ret
+        std::string SourceTypeName;
     };
 
     private:
@@ -3267,6 +3282,8 @@ private:
     std::unordered_set<std::string> scopedEnumTypes_;
     // Bare enumerator name -> its imported C++ scoped enum; diagnostic hint only, never bound.
     std::unordered_map<std::string, std::string> scopedCppEnumeratorHints_;
+    // Globals created for imported C/C++ enumerators: named constants, foldable like enum members.
+    std::unordered_set<std::string> importedEnumeratorGlobals_;
     // Unscoped C++ enum -> CFlat name of its integral promotion type ([conv.prom]/3-4).
     std::unordered_map<std::string, std::string> enumPromotedTypes_;
     // Declaration sites (file:line:col) an enum key was registered from. Both passes and a
@@ -3281,10 +3298,14 @@ public:
     bool IsCxxNullptrTAlias(const std::string& name) const { return cxxNullptrTAliases_.count(name) != 0; }
     // A value of the C++ null type: marked std::nullptr_t, or the bare `nullptr` constant.
     static bool IsCxxNullTypedArgument(const NamedVariable& arg);
-    // A __cflat_tpl_ deduction wrapper's parameter was made for another argument type: a null
-    // value vs a pointer (either way), or pointers whose C++ spellings differ.
+    // A __cflat_tpl_ deduction wrapper was made for another argument type: null/pointer shapes,
+    // pointer spellings, or scalar/enum identities hidden by the same LLVM lowering.
     bool CxxDeductionWrapperDeducesOther(const NamedVariable& arg, const TypeAndValue& param,
-                                         bool paramSpelledNullptrT) const;
+                                         bool paramSpelledNullptrT,
+                                         const FunctionSymbol& candidate, size_t paramIndex) const;
+    // The same test over every argument of a call, for candidates the C++ ranking revisits.
+    bool CxxDeductionWrapperDeducesOtherForCall(const FunctionSymbol& candidate,
+                                                const std::vector<NamedVariable>& args) const;
     // __cflat_tpl_ wrappers RequestCxxFunctionTemplate made from deduced argument spellings (a
     // brace constructor / brace function bridge shares the prefix but keeps fixed parameters).
     std::unordered_set<std::string> cxxDeductionWrappers_;
@@ -3712,6 +3733,8 @@ private:
     // Temporary layout recipe used while RegisterCRecords replaces __cflat_fields with the
     // original CFlat fields. It is populated before the generated class request is harvested.
     std::unordered_map<std::string, GeneratedCxxRecord> generatedCxxRecords_;
+    // Brace-constructor overload selector namespaces, deduplicated in an incremental TU by text.
+    std::unordered_set<std::string> cxxBraceSelectorSources_;
     std::unordered_set<std::string> cppStructNames_;
     // A layout-only nested type may be upgraded later when CFlat calls one of its methods.
     std::unordered_set<std::string> cxxForeignDefinitions_;
@@ -3990,6 +4013,8 @@ private:
         // Object-like macro whose body is a single identifier (`#define A B`) that did not fold
         // to a constant. Bound by RegisterCMacroAliases once every C entity is registered.
         std::string aliasTarget;
+        // The expanded macro expression is exactly an integer literal zero (parens allowed).
+        bool isIntegerLiteralZero = false;
     };
     // Field types kept as raw C spellings so they can be re-resolved after all records in the
     // TU are registered (handles forward references between structs).
@@ -4158,6 +4183,8 @@ private:
     // Unresolved object-like aliases are retried after later C imports. Unknown aliases stay
     // here until the compile ends and are intentionally never diagnosed.
     std::vector<CMacroEntry> pendingCInteropAliases_;
+    std::unordered_set<std::string> cxxMacroGlobalNames_;
+    std::unordered_set<std::string> cxxZeroIntegerMacroNames_;
     static inline std::mutex cFileSigCacheMutex_;
     // Key: canonical .c path, or for bound headers "<canonical .h>|<include dirs>" so the
     // same header under different --c-include roots does not collide.
@@ -4429,6 +4456,9 @@ private:
     mutable std::unordered_set<std::string> coreFileNames_;
 
     llvm::Function* currentFunction = nullptr;
+    // Active monomorphized source function/type identity for local enum keys. Scoped by
+    // generic body emission and inherited by lambdas emitted from that body.
+    std::string activeGenericEnumSpecialization_;
     std::string sourceFileName;
     std::string currentSourceFilePath_;
     std::vector<ManifestFragment> manifestFragments_;
@@ -6129,6 +6159,12 @@ private:
                                     std::vector<CxxBraceArgument>& braceArguments,
                                     std::string& wrapperName,
                                     std::string& error);
+    bool RequestCxxDirectBraceConstructor(const std::string& typeName,
+                                          const std::vector<NamedVariable>& elements,
+                                          const std::string& initializerList,
+                                          bool copyListInit,
+                                          std::string& wrapperName,
+                                          std::string& error);
     // copyInit: the wrapper copy-initializes (`T t = arg;`), so an explicit constructor is
     // never a candidate - the form every IMPLICIT conversion site must use.
     // Converts each scalar argument of a generated constructor thunk call into the thunk's own
@@ -6309,6 +6345,8 @@ private:
 
     // The operand's DECLARED primitive name, for an argument whose machine type cannot recover
     // its C++ identity (i8 is `char` or `i8`, i32 is `int` or `wchar`, i64 is `long` or `i64`).
+    // NamedVariable::CxxArithIdentity when it lowers to exactly the value's type, else empty.
+    std::string CxxArithIdentityForArgument(const NamedVariable& arg, llvm::Type* valueType) const;
     std::string DeclaredPrimitiveIdentityForCxxArgument(const NamedVariable& arg,
                                                         llvm::Type* valueType) const;
     /*
@@ -6373,6 +6411,9 @@ private:
     // `__typeof__(R (*)(A...))` for a thin CFlat function<> value, so a C++ wrapper can take it
     // as a parameter and a deduced template parameter sees a function pointer. False otherwise.
     bool CxxThinFunctionPointerSpelling(const TypeAndValue& type, std::string& out) const;
+    // True when the projected result record can retain a reference to the generated closure.
+    bool CxxRecordStoresForwardedClosureReference(const std::string& typeName,
+                                                   bool closureProjectionInResult) const;
     // A lambda VALUE is always a fat closure; one that provably captures nothing crosses into
     // C++ as the thin function pointer it is (the function<> path). Rewrites `arg` in place and
     // returns true only when it did; a capturing closure is left for the caller to refuse.
@@ -9077,6 +9118,62 @@ public:
     // and an unproven virtual-base hop is a LogError (ranking passes no source and stays C++).
     bool LowerCxxValueBaseOffset(const std::string& derived, const std::string& base,
                                  uint64_t& offsetOut, const NamedVariable& source);
+    /*
+     * Every inheritance route from C++ class `derived` to `base` (a CFlat class identity, or a
+     * canonical C++ spelling when `bySpelling`). A static offset is sound only for exactly one
+     * public non-virtual route; a virtual edge or a second route is a runtime or ambiguous
+     * conversion that clang performs (EmitCxxClangBaseConversion).
+     */
+    struct CxxBaseRoutes
+    {
+        int nonVirtual = 0;        // routes with no virtual edge
+        bool viaVirtual = false;   // some route crosses a virtual edge
+        bool unknown = false;      // some class on the walk has no recorded bases
+        uint64_t offset = 0;       // offset of the last non-virtual route seen
+        bool offsetPublic = true;  // that route crosses only public edges
+        bool Found() const { return nonVirtual > 0 || viaVirtual; }
+        bool NeedsClang() const { return viaVirtual || nonVirtual > 1; }
+    };
+    CxxBaseRoutes CollectCxxBaseRoutes(const std::string& derived, const std::string& base,
+                                       bool bySpelling) const;
+    // A pointer to C++ class `derived` converted to a pointer to `baseSpelling` by a generated
+    // clang wrapper (null stays null). nullptr with `error` set when clang refuses it.
+    llvm::Value* EmitCxxClangBaseConversion(const std::string& derived,
+                                            const std::string& baseSpelling, llvm::Value* ptr,
+                                            std::string& error);
+    // Lowers a derived-to-base POINTER conversion the overload or store check accepted: the
+    // static offset for one public non-virtual route, clang otherwise. LogError on refusal.
+    llvm::Value* LowerCxxPointerToBase(const std::string& derived, const std::string& base,
+                                       bool bySpelling, llvm::Value* ptr, const std::string& srcDesc,
+                                       const std::string& destDesc, const std::string& what,
+                                       bool* refused = nullptr);
+    // A derived-to-base REFERENCE binding of the C++ object at `address`: the static offset for a
+    // complete object or a single non-virtual route, clang's conversion otherwise. False after a
+    // LogError.
+    bool LowerCxxReferenceToBase(const std::string& derived, const std::string& base,
+                                 const NamedVariable& source, llvm::Value*& address);
+    // A C++ pointer argument whose class reaches the parameter's class only through a virtual
+    // edge (or more than one route): viable like a derived-to-base conversion, lowered by clang.
+    bool IsCxxDerivedToClangBasePointer(const TypeAndValue& from, const TypeAndValue& to) const;
+    /*
+     * A C++ class-pointer parameter CFlat bound as `void*` (its class was not registered when the
+     * signature was): how a C++ class pointer argument relates to the class the parameter's
+     * spelling names. `base` is that class (a CFlat name, or its canonical C++ spelling when
+     * `bySpelling`). Unrelated only when both complete base graphs prove it.
+     */
+    enum class CxxSpelledParamRelation { None, Same, Base, Unrelated };
+    CxxSpelledParamRelation CxxVoidParamClassRelation(const FunctionSymbol& candidate, size_t index,
+                                                      const TypeAndValue& param,
+                                                      const TypeAndValue& arg, std::string& base,
+                                                      bool& bySpelling) const;
+    // The same relation for a parameter's C++ spelling (`const N::V *`).
+    CxxSpelledParamRelation CxxSpelledClassPointerRelation(const std::string& spelling,
+                                                           const TypeAndValue& param,
+                                                           const TypeAndValue& arg,
+                                                           std::string& base,
+                                                           bool& bySpelling) const;
+    // "derived spelling|base spelling" -> generated wrapper name, or {"", clang's refusal}.
+    std::unordered_map<std::string, std::pair<std::string, std::string>> cxxBaseConversionWrappers_;
     bool IsCxxBaseOf(const std::string& base, const std::string& derived) const
     {
         uint64_t off = 0; bool inacc = false;
@@ -9413,6 +9510,9 @@ public:
         // default-initializing at all. Ask so the array path can report it.
         return !info->hasTrivialDefaultCtor || info->hasDeletedDefaultCtor;
     }
+    bool HasUnavailableNestedCxxDefault(const std::string& typeName,
+                                        std::string* unavailableType = nullptr,
+                                        bool checkCxxType = false);
     // Emit one default-constructor call per element over `count` elements at `base`.
     bool EmitCxxArrayDefaultConstruction(const std::string& typeName, llvm::Value* base,
                                          llvm::Type* elemTy, llvm::Value* count,
@@ -10256,6 +10356,9 @@ public:
 
     // Integer identity ranking for overload resolution (C++ order, ruling 2026-09-10).
     // `suffixedInteger` (optional) is set when the identity comes from an integer suffix (1UL, 2LL).
+    bool CxxArrayReferenceSpelling(const FunctionSymbol& candidate, size_t index) const;
+    bool IsNullPointerConstantArgument(const NamedVariable& arg, bool cxx = false) const;
+    static bool LiteralTextHasSign(std::string_view text);
     static std::string LiteralIdentityForOverload(std::string_view text, bool* suffixedInteger = nullptr);
     // `cxxCandidate` false: a suffixed literal keeps master's native identity (only a lone L is `long`).
     std::string IntegerArgumentIdentity(const NamedVariable& arg, bool cxxCandidate = true) const;
@@ -11001,6 +11104,12 @@ public:
         return from.IsCxxPointeeConst ? CxxPointeeConstRelation::Drops
                                       : CxxPointeeConstRelation::Adds;
     }
+    // The relation above for a C++ candidate parameter, also judging a class pointer argument
+    // at a `void*` slot (a real void* or a class pointer bound as void*) by the spelled const.
+    CxxPointeeConstRelation CxxCandidatePointeeConstRelation(const FunctionSymbol& candidate,
+                                                             size_t index,
+                                                             const TypeAndValue& from,
+                                                             const TypeAndValue& to) const;
 
     // Load a value of type coerceTy from byte offset byteOff within an alloca'd struct slot,
     // reinterpreting the underlying bytes (used to read SysV eightbytes out of a struct).
@@ -11083,7 +11192,8 @@ public:
     // (insertvalue) rather than as a single `load %Struct`, which dyn_cast<LoadInst> misses.
     void CreateReturnCall(llvm::Value* value, llvm::Value* returnedLocalStorage = nullptr,
                           const std::string& interfaceReturnStructName = "",
-                          bool srcIsUnsigned = false);
+                          bool srcIsUnsigned = false,
+                          const std::string& sourceTypeName = "");
 
     void BeginAutoReturnCapture();
     std::vector<AutoReturnSite> EndAutoReturnCapture();
@@ -11223,6 +11333,23 @@ public:
     void RegisterScopedEnumType(const std::string& enumName);
     bool IsScopedEnumTypeName(const std::string& name) const;
     std::string GetScopedCppEnumeratorHint(const std::string& name) const;
+    // CFlat name of an unscoped C++ enum's integral promotion type ([conv.prom]), else empty.
+    std::string CxxEnumPromotedTypeName(const std::string& enumName) const
+    {
+        const std::string key = ResolveEnumTypeName(enumName);
+        auto it = enumPromotedTypes_.find(key.empty() ? enumName : key);
+        return it != enumPromotedTypes_.end() ? it->second : std::string();
+    }
+    // The global behind an imported enumerator: a C++ prvalue, never an object to bind.
+    bool IsImportedEnumeratorStorage(const llvm::Value* storage) const
+    {
+        auto* gv = llvm::dyn_cast_or_null<llvm::GlobalVariable>(storage);
+        return gv != nullptr && importedEnumeratorGlobals_.count(std::string(gv->getName())) != 0;
+    }
+    const std::unordered_set<std::string>& ImportedEnumeratorGlobals() const
+    {
+        return importedEnumeratorGlobals_;
+    }
     // A global holding an integer (an imported enumerator constant), never a class object.
     bool IsIntegerGlobal(const std::string& name) const
     {
@@ -11233,7 +11360,7 @@ public:
     bool IsScopedEnumMatch(const TypeAndValue& from, const TypeAndValue& to) const;
     // C++ has no implicit integer -> enumeration conversion; see the definition for the proof.
     // Another enum's value for a C++ scoped-enum parameter: C++ has no such conversion.
-    bool CxxDistinctEnumArgument(const TypeAndValue& arg, const TypeAndValue& param) const;
+    bool CxxDistinctEnumArgument(const NamedVariable& arg, const TypeAndValue& param) const;
     bool CxxEnumParameterRefusesArgument(const NamedVariable& arg, const TypeAndValue& argType,
                                          const TypeAndValue& param) const;
     // Renders '<enum>.<member>' as a C++ template argument; see the definition for the two rules.
@@ -11255,6 +11382,7 @@ public:
     // Resolve a written type spelling to the registered enum key it names (walking the enclosing
     // namespaces and one alias hop), or "" when it names no enum.
     std::string ResolveEnumTypeName(const std::string& spelled) const;
+    bool IsGenericLocalEnumKey(const std::string& key) const;
     // Scan-time constant queries for the pre-pass `if const` folder. Both answer only when the
     // fact is already known without emitting IR or a diagnostic; false means "undecidable here".
     bool TryGetEnumMemberInt(const std::string& enumSpelling, const std::string& member,
@@ -11641,7 +11769,10 @@ public:
     // 215: enumerators of an enum in a template pattern fold from their initializers; a scoped
     //      member enum of a specialization is completed on request (member types, T37).
     // 217: scoped enumerators are stored only under their qualified name (T40).
-    static constexpr int kCHeaderCacheVersion = 217;
+    // 218: virtual-base conversions go through clang wrappers; system-header class pointers bind
+    //      by their spelled class instead of the void* placeholder (T50).
+    // 228: macro entries record whether their expanded body is an integer literal zero (T52).
+    static constexpr int kCHeaderCacheVersion = 228;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

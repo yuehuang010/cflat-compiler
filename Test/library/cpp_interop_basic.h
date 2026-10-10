@@ -1020,6 +1020,21 @@ namespace cppi
 
     private:
     };
+
+    inline int field_default_ctor_count = 0;
+    inline int field_default_arg_count = 0;
+    inline int field_default_dtor_count = 0;
+    struct FieldDefaulted
+    {
+        int value;
+        FieldDefaulted() : value(7) { ++field_default_ctor_count; }
+        explicit FieldDefaulted(int v) : value(v) { ++field_default_arg_count; }
+        ~FieldDefaulted() { ++field_default_dtor_count; }
+    };
+    inline void reset_field_default_counts()
+    {
+        field_default_ctor_count = field_default_arg_count = field_default_dtor_count = 0;
+    }
     inline Tracked operator+(const Tracked& a, const Tracked& b) noexcept
     {
         return Tracked(a.payload + b.payload);
@@ -1607,6 +1622,7 @@ namespace cppi
         inline int take_cint(const int& v) { return v + 1; }
         inline int take_clonglong(const long long& v) { return (int)(v + 2); }
         inline int take_cdouble(const double& v) { return (int)(v * 2.0); }
+        inline int t71_take_float_ref(const float& v) { return 710 + (int)(v * 10.0f); }
         inline int take_cbool(const bool& v) { return v ? 5 : 6; }
         inline int take_cbox(const Box& b) { return b.v + 3; }
         // Non-const: writes through, so only an addressable lvalue may bind it.
@@ -2699,4 +2715,27 @@ namespace cppi_entity
         static int f(int) noexcept { return 101; }
         int f(double) const noexcept { return 202; }
     };
+}
+
+// T73: implicit non-trivial default constructors must run for CFlat struct fields.
+namespace cpp_t73
+{
+    inline int ctor_count = 0;
+    inline int dtor_count = 0;
+    struct Leaf
+    {
+        int value;
+        Leaf() : value(7) { ++ctor_count; }
+        ~Leaf() { ++dtor_count; }
+    };
+    struct Mix { Leaf first; Leaf second; };
+    struct Trivial { int value; };
+    struct Virtual
+    {
+        int value;
+        Virtual() : value(19) { ++ctor_count; }
+        virtual int get() const { return value; }
+        virtual ~Virtual() { ++dtor_count; }
+    };
+    struct DefaultMember { int value = 5; };
 }

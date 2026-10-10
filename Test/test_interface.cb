@@ -5138,6 +5138,25 @@ bool testInterfaceLocalAdoptsBoxOnce()
     return Test("interface_local_adopts_box_once", adoptSinkCount, 5) != 0;
 }
 
+// T36: a pointer arithmetic result keeps its class pointee, so it boxes into an interface at a
+// declaration, an assignment and a call argument exactly like a named Square* (C++: Square* ->
+// IShape*). Master refused all three ("cannot store a pointer value" / "no overload").
+int t36ShapeArea(IShape s) { return s.area(); }
+
+bool testPointerArithmeticBoxesIntoInterface()
+{
+    Square[3] squares = default;
+    squares[1].s = 3;
+    squares[2].s = 4;
+    Square* first = &squares[0];
+    IShape declared = first + 1;
+    IShape assigned = nullptr;
+    assigned = first + 2;
+    bool ok = declared.area() == 9 && assigned.area() == 16 && t36ShapeArea(first + 1) == 9;
+    printf("%s: pointer arithmetic boxes into interface\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -5246,6 +5265,7 @@ extern int main()
     total++; passed += testGiNsBodyKeepsCallerTypeArg()                  ? 1 : 0;
 
     total++; passed += testInterfaceLocalAdoptsBoxOnce()               ? 1 : 0;
+    total++; passed += testPointerArithmeticBoxesIntoInterface()       ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

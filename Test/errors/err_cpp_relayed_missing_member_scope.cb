@@ -1,0 +1,47 @@
+// Relayed clang failures must report the missing member within its declaring scope. The second
+// unrelated import used to replace rv's accurate rejection with a global-scope lookup failure.
+import cpp "cpp_interop_relay.h";
+import cpp "string";
+import cpp "filesystem";
+import cpp "chrono";
+import cpp "cpp_interop_relay_shallow.h";
+
+// A same-named CFlat function keeps the missing member on the C++ class lookup path.
+int nosuch(int x) { return x; }
+
+extern int main()
+{
+    expect_error("clang: no member named 'nosuch' in namespace 'rv'") {
+        int value = rv.nosuch(1);
+    }
+    expect_error("clang: no member named 'nosuch' in namespace 'rv::a::b'") {
+        int value = rv.a.b.nosuch(1);
+    }
+    expect_error("clang: no member named 'presen' in namespace 'rv'") {
+        int value = rv.presen(1);
+    }
+    expect_error("clang: no member named 'nosuch' in namespace 'std::chrono'") {
+        int value = std.chrono.nosuch(1);
+    }
+    // filesystem found the leaf; later groups missing the namespace or the leaf must not win.
+    expect_error("clang: no matching function for call to 'exists'") {
+        int value = std.filesystem.exists(1);
+    }
+
+    // The remaining shapes currently use CFlat's own lookup diagnostics rather than clang text.
+    expect_error("'nosuch' is not a member of namespace 'rv.C'") {
+        int value = rv.C.nosuch(1);
+    }
+    expect_error("C++ class 'rv.C' has no member 'nosuch'") {
+        rv.C object = default;
+        int value = object.nosuch(1);
+    }
+    expect_error("'nosuchvar' is not a member of namespace 'rv'") {
+        int value = rv.nosuchvar;
+    }
+    expect_error("C++ class 'rv.Box<int>' has no member 'nosuch'") {
+        rv.Box<int> object = default;
+        int value = object.nosuch(1);
+    }
+    return 0;
+}

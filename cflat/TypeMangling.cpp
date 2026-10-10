@@ -747,6 +747,17 @@ void RememberMangledArity(const LLVMBackend& compiler, std::string_view mangled,
 std::string SpellType(const LLVMBackend& compiler,
                       const LLVMBackend::TypeAndValue& type)
 {
+    const std::string enumKey = compiler.ResolveEnumTypeName(type.TypeName);
+    if (!enumKey.empty() && enumKey == type.TypeName
+        && !compiler.GetEnumBackingType(enumKey).empty()
+        && compiler.IsGenericLocalEnumKey(enumKey))
+    {
+        const size_t dot = enumKey.rfind('.');
+        std::string shown = dot == std::string::npos ? enumKey : enumKey.substr(dot + 1);
+        if (type.IsArrayView) return shown + "[]";
+        if (type.Pointer) shown.append(type.ValuePointerDepth(), '*');
+        return shown;
+    }
     TypeSpelling spelling;
     if (!DemangleType(compiler, type.TypeName, spelling))
         return type.TypeName;

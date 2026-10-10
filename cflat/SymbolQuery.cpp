@@ -988,6 +988,8 @@ static void DumpSymbolLine(const LspSymbolIndex& index,
                 if (variable && variable->line > 0 && !variable->file.empty())
                     std::cout << std::format("    defined: {}:{}\n", variable->file, variable->line);
                 const SymbolDef* typeDef = type.empty() ? nullptr : index.Lookup(SymbolTypeLookupName(type));
+                // A generic-local enum's type is its instantiation key; the index knows the source name.
+                if (!typeDef && displayType != type) typeDef = index.Lookup(SymbolTypeLookupName(displayType));
                 if (typeDef && !typeDef->signatureMarkdown.empty() &&
                     typeDef->signatureMarkdown != SymbolDisplayName(*typeDef))
                     std::cout << std::format("    {}\n", typeDef->signatureMarkdown);

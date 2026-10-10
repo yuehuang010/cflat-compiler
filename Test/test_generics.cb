@@ -2,6 +2,7 @@ import "test_helper.cb";
 import "list.cb";
 import "dictionary.cb";
 import "tuple.cb";
+import "library/t60_generic_enum.cb";
 
 // =============================================================
 // Generic struct tests (compile-time only monomorphization)
@@ -15,6 +16,83 @@ T closureIdentity<T>(T value) { return value; }
 T countPack<T...>() { return (T)sizeof(T); }
 int zeroValueGeneric<T>() { T value = default; return 7; }
 int doubleValue(int x) { return x * 2; }
+
+int t60LocalEnumSize<T>()
+{
+    enum E : int { V = sizeof(T) };
+    E local = (E)(int)E.V;
+    switch ((int)local)
+    {
+        case (int)E.V: return (int)local;
+    }
+    return 0;
+}
+int t60LocalEnumReverse<T>() { enum E : int { V = sizeof(T) }; return (int)E.V; }
+
+int t60LocalEnumValue<int N>() { enum E : int { V = N }; return (int)E.V; }
+int t60LocalEnumTernary<T>()
+{
+    enum E : int { V = (sizeof(T) == 4) ? sizeof(T) + 3 : sizeof(T) + 9 };
+    return (int)E.V;
+}
+
+int t60LocalEnumNested<U>(U value) { static int n = 0; n++; return n; }
+int t60LocalEnumCallsNested<T>()
+{
+    enum E : int { V = sizeof(T) };
+    return t60LocalEnumNested(E.V);
+}
+
+int t60LocalEnumRecursive<T>()
+{
+    enum E : int { V = sizeof(T) };
+    if const (sizeof(T) == 4) { return (int)E.V + t60LocalEnumRecursive<i64>(); }
+    return (int)E.V;
+}
+
+struct T60EnumMethod<T>
+{
+    int get() { enum E : int { V = sizeof(T) }; return (int)E.V; }
+};
+
+int t60LocalEnumCollisionA<T>() { enum E : int { V = sizeof(T) }; return (int)E.V; }
+int t60LocalEnumCollisionB<T>() { enum E : int { V = sizeof(T) + 10 }; return (int)E.V; }
+int t60LocalEnumIfConst<T>()
+{
+    enum E : int { V = sizeof(T) };
+    if const (E.V == 4) { return 1; }
+    return 2;
+}
+int t60PlainLocalEnum() { enum PlainE : int { V = 13 }; return (int)PlainE.V; }
+
+bool testGenericLocalEnums()
+{
+    bool result = true;
+    result &= Test("generic_local_enum_size_int", t60LocalEnumSize<int>(), 4);
+    result &= Test("generic_local_enum_size_i64", t60LocalEnumSize<i64>(), 8);
+    result &= Test("generic_local_enum_reverse_order", t60LocalEnumReverse<i64>()
+        + t60LocalEnumReverse<int>(), 12);
+    result &= Test("generic_local_enum_value_arg", t60LocalEnumValue<7>(), 7);
+    result &= Test("generic_local_enum_value_arg_other", t60LocalEnumValue<11>(), 11);
+    result &= Test("generic_local_enum_ternary_int", t60LocalEnumTernary<int>(), 7);
+    result &= Test("generic_local_enum_ternary_i64", t60LocalEnumTernary<i64>(), 17);
+    result &= Test("generic_local_enum_nested_int", t60LocalEnumCallsNested<int>(), 1);
+    result &= Test("generic_local_enum_nested_i64", t60LocalEnumCallsNested<i64>(), 1);
+    result &= Test("generic_local_enum_recursive_int", t60LocalEnumRecursive<int>(), 12);
+    result &= Test("generic_local_enum_recursive_i64", t60LocalEnumRecursive<i64>(), 8);
+    T60EnumMethod<int> intMethod = default;
+    T60EnumMethod<i64> i64Method = default;
+    result &= Test("generic_method_local_enum_int", intMethod.get(), 4);
+    result &= Test("generic_method_local_enum_i64", i64Method.get(), 8);
+    result &= Test("generic_local_enum_same_name", t60LocalEnumCollisionA<int>()
+        + t60LocalEnumCollisionB<i64>(), 22);
+    result &= Test("generic_local_enum_if_const_int", t60LocalEnumIfConst<int>(), 1);
+    result &= Test("generic_local_enum_if_const_i64", t60LocalEnumIfConst<i64>(), 2);
+    result &= Test("plain_local_enum_control", t60PlainLocalEnum(), 13);
+    result &= Test("generic_local_enum_cross_file_i64", t60CrossFileEnumFromImport(), 8);
+    result &= Test("generic_local_enum_cross_file_int", t60CrossFileEnum<int>(), 4);
+    return result;
+}
 
 interface FunctionBase<T> { T Get(); };
 interface FunctionDerived<T> : FunctionBase<T> { void Set(T value); };
@@ -5253,9 +5331,9 @@ struct Mt37Box<T> { using value_type = T; T v = default; T get() { return v; } }
 struct Mt37P { using Id = int; };
 struct Mt37Wrap<T> { T w = default; };
 struct Mt37Id { int q = default; };
-struct Mt37Shadow { using Mt37Id = long; int Mt37Idx = default; };
+struct Mt37Shadow { using Mt37Id = i64; int Mt37Idx = default; };
 struct Mt37Outer { struct Inner { using type = int; int z = default; }; };
-namespace Mt37Ns { struct Box<T> { using value_type = T; }; struct P { using Id = long; }; }
+namespace Mt37Ns { struct Box<T> { using value_type = T; }; struct P { using Id = i64; }; }
 Mt37Box<int>.value_type mt37Global = 9;
 Mt37P.Id mt37Global2 = 10;
 struct Mt37Holder { Mt37Box<int>.value_type f = default; Mt37P.Id f2 = default; };
@@ -5276,7 +5354,7 @@ bool testMemberTypeNames()
     Mt37Box<int>.value_type[3] arr = {1, 2, 3};
     Mt37P.Id[2] arr2 = {4, 5};
     if (*p != 9 || arr[2] != 3 || arr2[1] != 5) return false;
-    if (sizeof(Mt37Box<int>.value_type) != 4 || sizeof(Mt37Box<long>.value_type) != 8) return false;
+    if (sizeof(Mt37Box<int>.value_type) != 4 || sizeof(Mt37Box<i64>.value_type) != 8) return false;
     if (sizeof(Mt37P.Id) != 4) return false;
     long big = 300;
     if ((Mt37Box<int>.value_type)big + (Mt37P.Id)big != 600) return false;
@@ -5352,8 +5430,9 @@ struct Mt37RFirst {
 };
 struct Mt37RLater<T> { using Id = T; using Rec = Mt37RPayload; using Last = Mt37RLast; };
 namespace Mt37RNs {
-    struct Mt37RPayload { long x = default; long y = default; };
-    using Mt37RTag = long;
+    // i64, not long: the sizes below must hold on LLP64 (Windows) too.
+    struct Mt37RPayload { i64 x = default; i64 y = default; };
+    using Mt37RTag = i64;
     struct Later<T> { using Id = Mt37RPayload; using Tag = Mt37RTag; };
 }
 struct Mt37RLast { short s = default; short t = default; short u = default; };
@@ -5520,6 +5599,7 @@ extern int main()
     total++; passed += testGnTypeArgKeySpace()                     ? 1 : 0;
     total++; passed += testNamespaceTupleAndGenericAlias()           ? 1 : 0;
     total++; passed += testGenericFunctions()                      ? 1 : 0;
+    total++; passed += testGenericLocalEnums()                       ? 1 : 0;
     total++; passed += testGenericSizeof()                          ? 1 : 0;
     total++; passed += testNsgNamespacedGenericSpellings()          ? 1 : 0;
     total++; passed += testStructScopeUsingAliases()                ? 1 : 0;

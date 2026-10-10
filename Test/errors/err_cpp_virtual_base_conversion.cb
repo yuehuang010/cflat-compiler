@@ -1,0 +1,21 @@
+// T50: a derived-to-base conversion clang refuses is refused here too, never lowered with a
+// guessed offset - an ambiguous base (two A subobjects) took the first path's offset before.
+// A class pointer parameter a lazily bound member spells as void* still names its class, so an
+// unrelated class pointer is not viable (it read the wrong field before).
+import cpp "cpp_t50_vbase.hpp";
+import cpp "cpp_t50_vbase_sys.hpp";
+
+extern int main()
+{
+    expect_error("ambiguous conversion from derived class 't50v::DD' to base class") {
+        int x = t50v.read_a(t50v.dd_ptr());
+    }
+    expect_error("no overload of 'left' matches the given arguments") {
+        t50s.Sink s = default;
+        int y = s.left(t50s.right_ptr());
+    }
+    expect_error("has no constructor whose parameter types match these arguments") {
+        t50s.HolderB2 h = t50s.HolderB2(t50s.u2_ptr());
+    }
+    return 0;
+}

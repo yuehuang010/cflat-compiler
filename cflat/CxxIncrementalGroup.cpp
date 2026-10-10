@@ -1218,7 +1218,41 @@ namespace
                 for (const clang::FunctionDecl* fd : walkedNow) walked.erase(fd);
             else if (plan != nullptr)
                 for (clang::FunctionDecl* fd : addNow) plan->Add(fd);
+            ResolveUsedVTableDeletes();
             return parsed;
+        }
+
+        /*
+         * Sema picks a virtual destructor's operator delete when it finishes the body (or, MS
+         * ABI, when the vtable is used and the destructor is undefined). A skipped body counts as
+         * defined yet never finished, so a used vtable's deleting destructor - which MS CodeGen
+         * emits with the vftable, body or not - found it null. Finish that check for every class
+         * whose vtable Sema marked used, before any CodeGen sees it.
+         */
+        void ResolveUsedVTableDeletes()
+        {
+            if (sema == nullptr) return;
+            std::vector<clang::CXXDestructorDecl*> pending;
+            for (const auto& entry : sema->VTablesUsed)
+            {
+                const clang::CXXRecordDecl* def = entry.first->getDefinition();
+                if (def == nullptr || def->isDependentContext() || def->isInvalidDecl()) continue;
+                clang::CXXDestructorDecl* dtor = def->getDestructor();
+                const clang::FunctionDecl* body = nullptr;
+                if (dtor != nullptr && dtor->isVirtual() && !dtor->isDeleted()
+                    && dtor->getOperatorDelete() == nullptr && dtor->isDefined(body)
+                    && (body->hasSkippedBody()
+                        || bodies.count(const_cast<clang::FunctionDecl*>(body)) != 0)
+                    && !body->isInvalidDecl())
+                    pending.push_back(dtor);
+            }
+            // CheckDestructor may mark more vtables used; never mutate the map mid-walk.
+            for (clang::CXXDestructorDecl* dtor : pending)
+            {
+                clang::Sema::ContextRAII inDtor(*sema, dtor);
+                if (sema->CheckDestructor(dtor) || dtor->getOperatorDelete() == nullptr)
+                    dtor->setInvalidDecl();
+            }
         }
     };
 
@@ -1271,6 +1305,12 @@ namespace
         bool shouldSkipFunctionBody(clang::Decl* decl) override
         {
             return lazyBodies != nullptr && lazyBodies->Skip(decl);
+        }
+
+        // Runs ahead of the Interpreter's CodeGen in the chain (see LazyBodies).
+        void HandleTranslationUnit(clang::ASTContext&) override
+        {
+            if (lazyBodies != nullptr) lazyBodies->ResolveUsedVTableDeletes();
         }
 
         // An implicitly instantiated static data member never reaches HandleTopLevelDecl; the

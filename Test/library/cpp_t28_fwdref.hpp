@@ -1,4 +1,5 @@
 #pragma once
+#include <type_traits>
 // forward_as_tuple-shaped templates whose result refers to their arguments (t28): a string
 // literal or function name forwarded through a generated wrapper must not leave the reference
 // pointing into the wrapper's dead frame.
@@ -6,6 +7,7 @@ namespace t28 {
 template<class T> struct Ref1 { T&& r; };
 template<class T> Ref1<T> fwd1(T&& x) { return Ref1<T>{ static_cast<T&&>(x) }; }
 template<class F> int call5(const Ref1<F>& r) { return r.r(5); }
+template<class F> int call5plain(F&& f) { return f(5); }
 template<class T> T& id_lref(T& x) { return x; }
 // Overwrites the stack region a just-returned wrapper frame used.
 inline int scribble() { volatile char buf[512]; for (int i = 0; i < 512; ++i) buf[i] = (char)0x5a; return buf[7]; }
@@ -27,6 +29,10 @@ template<class T> int len(const T& t)
     return n;
 }
 template<class T> int call5(const T& t) { return t.a(5); }
+// 1 when F deduces an lvalue reference, 2 for an rvalue or xvalue argument.
+template<class T> struct IsLref { static constexpr int v = 2; };
+template<class T> struct IsLref<T&> { static constexpr int v = 1; };
+template<class F> int category(F&&) { return IsLref<F>::v; }
 // What std.cflat_t28.fwd("abcd") returns, as in C++: a reference to the literal's own array.
 using LitRef = Tup<const char(&)[5]>;
 inline int triple(int v) { return v * 3; }
@@ -60,6 +66,19 @@ template<class U> __attribute__((noinline)) const char* const* arraywinner(const
 inline const char* const* arraywinner(const char (&)[4], const int&) { chosen = 2; return other(); }
 } }
 namespace t28 {
+template<class F> struct ClosureHolder { F f; int run(int x) { return f(x); } };
+template<class F> ClosureHolder<F> hold(F f) { return ClosureHolder<F>{ f }; }
+template<class F> ClosureHolder<F> holdfwd(F&& f) { return ClosureHolder<F>{ static_cast<F&&>(f) }; }
+template<class F> struct PointerHolder { F* f; int run(int x) { return (*f)(x); } };
+template<class F> PointerHolder<std::remove_reference_t<F>> holdptr(F&& f) { return { &f }; }
+template<class F> struct ConstRefHolder { const F& f; int run(int x) const { return f(x); } };
+template<class F> ConstRefHolder<std::remove_reference_t<F>> holdcref(F&& f) { return { f }; }
+template<class F> struct Tag { int run(int x) const { return x; } };
+template<class F> Tag<F> tagonly(F&&) { return {}; }
+struct ClosureFactory {
+    template<class F> ClosureHolder<F> holdfwd(F&& f) { return ClosureHolder<F>{ static_cast<F&&>(f) }; }
+};
+inline ClosureFactory closureFactory;
 template<class U> __attribute__((noinline)) const char* const* mixed_t(const char* const& p, const U&) { std::cflat_t28::chosen = 1; return &p; }
 template<class T, class U> const char* const* mixed_t(const T&, const U&) { std::cflat_t28::chosen = 2; return std::cflat_t28::other(); }
 template<class U> __attribute__((noinline)) const char* const* mixed_tf(const char* const& p, const U&) { std::cflat_t28::chosen = 1; return &p; }

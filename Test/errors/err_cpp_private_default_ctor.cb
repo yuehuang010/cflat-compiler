@@ -49,6 +49,57 @@ expect_error("C++ class 'cppa.NoDef' has no default constructor cflat can call (
     }
 }
 
+expect_error("C++ class 'cppa.NoDef' has no default constructor cflat can call (it is deleted)") {
+    struct NestedValueLeaf { cppa.NoDef d; int k = 0; };
+    struct NestedValueWrap { NestedValueLeaf h; int z = 0; };
+    int makeNestedValue() { NestedValueWrap value = NestedValueWrap(); return value.z; }
+}
+
+expect_error("C++ class 'cppa.NoDef' has no default constructor cflat can call (it is deleted)") {
+    struct NestedNewLeaf { cppa.NoDef d; int k = 0; };
+    struct NestedNewWrap { NestedNewLeaf h; int z = 0; };
+    int makeNestedNew() { NestedNewWrap* value = new NestedNewWrap(); delete value; return 0; }
+}
+
+expect_error("C++ class 'cppa.NoDef' has no default constructor cflat can call (it is deleted)") {
+    struct NestedArrayLeaf { cppa.NoDef d; int k = 0; };
+    struct NestedArrayWrap { NestedArrayLeaf[2] h; int z = 0; };
+    int makeNestedArray() { NestedArrayWrap value = NestedArrayWrap(); return value.z; }
+}
+
+expect_error("C++ class 'cppa.NoDef' has no default constructor cflat can call (it is deleted)") {
+    struct NestedLocalArrayLeaf { cppa.NoDef d; int k = 0; };
+    struct NestedLocalArrayWrap { NestedLocalArrayLeaf h; int z = 0; };
+    int makeNestedLocalArray() { NestedLocalArrayWrap[2] value; return value[0].z; }
+}
+
+expect_error("C++ class 'cppa.NoDef' has no default constructor cflat can call (it is deleted)") {
+    struct NestedGlobalLeaf { cppa.NoDef d; int k = 0; };
+    struct NestedGlobalWrap { NestedGlobalLeaf h; int z = 0; };
+    NestedGlobalWrap nestedGlobal;
+}
+
+expect_error("C++ class 'cppa.NoDef' has no default constructor cflat can call (it is deleted)") {
+    struct NestedUserLeaf { cppa.NoDef d; int k = 0; };
+    struct NestedUserWrap { NestedUserLeaf h; int z = 0; NestedUserWrap() { z = 1; } };
+    int makeNestedUser() { NestedUserWrap value = NestedUserWrap(); return value.z; }
+}
+
+expect_error("C++ class 'cppa.NoDef' has no default constructor cflat can call (it is deleted)") {
+    struct NestedArgLeaf { cppa.NoDef d; int k = 0; };
+    struct NestedArgWrap { NestedArgLeaf h; int z = 0; NestedArgWrap(int x) { z = x; } };
+    int makeNestedArg() { NestedArgWrap value = NestedArgWrap(2); return value.z; }
+}
+
+expect_error("C++ class 'cppa.NoDef' has no default constructor cflat can call (it is deleted)") {
+    struct NestedGenericLeaf { cppa.NoDef d; int k = 0; };
+    struct NestedGenericBox<T> { T value; };
+    int makeNestedGeneric() {
+        NestedGenericBox<NestedGenericLeaf> value = NestedGenericBox<NestedGenericLeaf>();
+        return 0;
+    }
+}
+
 struct ExplicitNoDefaultLeaf { cppa.NoDef d; int k = 0; };
 struct ExplicitNoDefaultWrap { ExplicitNoDefaultLeaf h; int z = 0; };
 int makeExplicitNoDefault() {

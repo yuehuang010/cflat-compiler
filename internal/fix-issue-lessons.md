@@ -3472,3 +3472,13 @@ first two block; PRE-EXISTING is filed (unless a one-site twin of the fix). Same
 keeps going while each round clears its findings; from round 2 the main session adds a fix
 sketch to the brief. A finding surviving one fix round -> sketch or opus (root cause unclear);
 surviving two -> park or escalate. Reviewers state the class per finding.
+
+## Ruling 2026-10-05: virtual-base conversions of unknown dynamic type convert (T26 refusal retired, landed with T50)
+
+T26 refused converting a reference result, a dereferenced pointer or an alias parameter to its
+virtual base ("needs the object's dynamic type"), because the static layout offset is wrong for
+a more-derived object. T50 routes those conversions through a clang-generated wrapper
+(__cflat_tobase_<hash>) that reads the vbase offset from the object, so they now convert like
+C++. Ruled: delete Test/errors/err_cpp_virtual_base_conversion_unknown_dynamic_type.cb; its five
+shapes are positive legs 50017/50018 in Test/test_cpp_interop.cb with clang's values. The
+refusal text stays as the fallback where no wrapper can be generated (opaque member binding).

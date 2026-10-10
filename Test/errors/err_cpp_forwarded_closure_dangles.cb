@@ -1,0 +1,42 @@
+import cpp "cpp_t28_fwdref.hpp";
+extern int main()
+{
+    int k = 4;
+    Lambda<int(int)> f = (int v) => v * k;
+    expect_error("caller-owned C++ closure slot") {
+        t28.holdfwd(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        t28.closureFactory.holdfwd(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        t28.holdptr(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        t28.holdcref(f);
+    }
+    auto byValue = t28.hold(f);
+    if (byValue.run(5) != 20) return 1;
+    expect_error("caller-owned C++ closure slot") {
+        t28.holdfwd(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        t28.closureFactory.holdfwd(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        t28.holdptr(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        t28.holdcref(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        t28.fwd1(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        std.cflat_t28.fwd(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        std.cflat_t28.fwd(move f);
+    }
+    return 0;
+}

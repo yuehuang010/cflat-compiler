@@ -1,0 +1,19 @@
+// T45 round 2: an 'if const' condition that post-increments an imported C++ enumerator is not
+// a compile-time constant.
+import cpp "cpp_t45_global_xvalue.hpp";
+
+extern int main()
+{
+    expect_error("'if const' condition must be a compile-time constant expression");
+    if const ((int)cpp_t45.three++ == 3) { return 0; }
+    return 1;
+}
+
+// Round 3: assigning a local declared BEFORE the condition writes visible state (clang rejects).
+int T45ExistingLocalIf()
+{
+    int x;
+    expect_error("'if const' condition must be a compile-time constant expression");
+    if const ((x = 5) == 5) { return x; }
+    return 0;
+}

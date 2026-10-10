@@ -1,0 +1,10 @@
+// T45 round 2: a postfix ++ on an imported C++ enumerator is a write, never a constant.
+import cpp "cpp_t45_global_xvalue.hpp";
+
+expect_error("enum value must be a constant integer expression");
+enum T45Inc : int { Value = (int)cpp_t45.three++ };
+
+extern int main()
+{
+    return 0;
+}

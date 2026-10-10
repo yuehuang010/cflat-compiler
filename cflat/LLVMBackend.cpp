@@ -4768,6 +4768,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxArgumentFreeMacros_.clear();
     cxxNamespaceObjectProbed_.clear();
     generatedCxxRecords_.clear();
+    cxxBraceSelectorSources_.clear();
     cppStructNames_.clear();
     cppStructBases_.clear();
     cppStructOverrideNames_.clear();
@@ -4882,6 +4883,8 @@ void LLVMBackend::ResetForReanalysis()
     annotationRegistry.clear();
     synthesizedReflectFunctions.clear();
     pendingCInteropAliases_.clear();
+    cxxZeroIntegerMacroNames_.clear();
+    cxxMacroGlobalNames_.clear();
     cAbiFunctionThunkCache_.clear();
     dataStructures.clear();
     // C++ record identity/triviality follows dataStructures: a survivor would let the next file
@@ -4914,6 +4917,7 @@ void LLVMBackend::ResetForReanalysis()
     // that no longer needs it, or turn a plain call into a vptr load.
     cxxThisAdjust_.clear();
     cxxThisVirtualBase_.clear();
+    cxxBaseConversionWrappers_.clear();
     cxxVirtualSlotByLinkage_.clear();
     cxxAbiMismatchSink_ = nullptr;
     pendingCxxAbi_ = nullptr;   // an aborted registration must not leak clang's plan forward
@@ -4988,6 +4992,7 @@ void LLVMBackend::ResetForReanalysis()
     enumBackingTypes.clear();
     scopedEnumTypes_.clear();
     scopedCppEnumeratorHints_.clear();
+    importedEnumeratorGlobals_.clear();
     enumPromotedTypes_.clear();
     enumDeclSites_.clear();
     typeAliases.clear();
@@ -5038,6 +5043,7 @@ void LLVMBackend::ResetForReanalysis()
     expectedErrorScopeDepth = SIZE_MAX;
     fileScopeExpectedError_.clear();
     currentFunction = nullptr;
+    activeGenericEnumSpecialization_.clear();
     autoVaListAlloca = nullptr;
     ClearStaticLocalRequest();
     autoReturnCapture = std::nullopt;
@@ -7992,6 +7998,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     enumBackingTypes.clear();
     scopedEnumTypes_.clear();
     scopedCppEnumeratorHints_.clear();
+    importedEnumeratorGlobals_.clear();
     enumPromotedTypes_.clear();
     enumDeclSites_.clear();
     // strConcatRegistered / stringDtorRegistered: will be set below after deserialization

@@ -1477,7 +1477,8 @@ bool LLVMBackend::IsBorrowStringParamStorage(llvm::Value* storage)
 
 void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLocalStorage,
                                    const std::string& interfaceReturnStructName,
-                                   bool srcIsUnsigned)
+                                   bool srcIsUnsigned,
+                                   const std::string& sourceTypeName)
 {
         if (!IsInsertBlockLive())
             return;
@@ -1610,7 +1611,8 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
         if (autoReturnCapture)
         {
             auto* placeholder = builder->CreateUnreachable();
-            autoReturnCapture->push_back({ builder->GetInsertBlock(), value, placeholder });
+            autoReturnCapture->push_back(
+                { builder->GetInsertBlock(), value, placeholder, sourceTypeName });
             return;
         }
 

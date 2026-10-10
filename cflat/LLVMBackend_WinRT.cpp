@@ -2224,7 +2224,8 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg,
         {
             // C++ T*& borrows the caller's T* slot. A plain pointer local already
             // has exactly that slot; expressions and call results need a temporary.
-            if (arg.Storage != nullptr && arg.TypeAndValue.Pointer && arg.BaseType == paramTy)
+            if (arg.Storage != nullptr && arg.TypeAndValue.Pointer && arg.BaseType == paramTy
+                && !arg.IsRvalue)
                 return arg.Storage;
             llvm::Value* value = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
             value = LowerByValueArg(value, param, arg);
@@ -2241,9 +2242,9 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg,
             && !arg.TypeAndValue.IsInterface
             && IsCxxDerivedToBaseValue(arg.TypeAndValue, param, nullptr))
         {
-            uint64_t offset = 0;
-            if (LowerCxxValueBaseOffset(arg.TypeAndValue.TypeName, param.TypeName, offset, arg))
-                return EmitCxxBaseAdjust(arg.Storage, offset);
+            llvm::Value* address = arg.Storage;
+            if (LowerCxxReferenceToBase(arg.TypeAndValue.TypeName, param.TypeName, arg, address))
+                return address;
         }
         if (arg.Storage != nullptr && arg.BaseType == paramTy && sameReferentType
             && !arg.TypeAndValue.IsInterface)
@@ -2270,6 +2271,7 @@ llvm::Value* LLVMBackend::LowerRvalueRefArg(const NamedVariable& arg, const Type
         // `T*&&` receives the pointer VALUE through a temporary T* slot. Passing the value
         // directly would make the C++ callee interpret the pointee address as a T**.
         if (cxxCallee && param.ElemPointer && (arg.TypeAndValue.Pointer
+                                  || IsNullPointerConstantArgument(arg, true)
                                   || (arg.Primary != nullptr && arg.Primary->getType()->isPointerTy())
                                   || llvm::isa_and_nonnull<llvm::ConstantPointerNull>(arg.Primary)))
         {
@@ -2281,7 +2283,10 @@ llvm::Value* LLVMBackend::LowerRvalueRefArg(const NamedVariable& arg, const Type
             referent.IsRvalueRef = false;
             if (llvm::Type* refTy = GetType(referent); refTy != nullptr && refTy->isPointerTy())
             {
-                llvm::Value* value = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
+                llvm::Value* value = IsNullPointerConstantArgument(arg, true)
+                    ? static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(
+                        llvm::cast<llvm::PointerType>(refTy)))
+                    : (arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg));
                 auto* temp = AllocaAtEntry(refTy, nullptr, "cxx.rrefarg");
                 builder->CreateStore(value, temp);
                 return temp;
@@ -2309,7 +2314,9 @@ llvm::Value* LLVMBackend::LowerRvalueRefArg(const NamedVariable& arg, const Type
 
         // A loaded value from an addressable object still borrows that object's slot.
         if (auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(arg.Primary))
-            if (load->getType() == GetType(aliasParam))
+            if (load->getType() == GetType(aliasParam)
+                && (arg.Storage == load->getPointerOperand() || !arg.IsRvalue
+                    || arg.TypeAndValue.IsAlias))
                 return load->getPointerOperand();
 
         return LowerAliasByPointerArg(arg, aliasParam);

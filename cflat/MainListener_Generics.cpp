@@ -13,6 +13,16 @@ struct ActiveOriginScope
     ActiveOriginScope(const ActiveOriginScope&) = delete;
     ActiveOriginScope& operator=(const ActiveOriginScope&) = delete;
 };
+struct ActiveEnumSpecializationScope
+{
+    std::string* slot_;
+    std::string saved_;
+    ActiveEnumSpecializationScope(std::string* slot, std::string next)
+        : slot_(slot), saved_(std::move(*slot)) { *slot_ = std::move(next); }
+    ~ActiveEnumSpecializationScope() { *slot_ = std::move(saved_); }
+    ActiveEnumSpecializationScope(const ActiveEnumSpecializationScope&) = delete;
+    ActiveEnumSpecializationScope& operator=(const ActiveEnumSpecializationScope&) = delete;
+};
 }
 
 
@@ -279,6 +289,10 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
                                  genericFunctionTypeParams[baseName].size(), typeArgs);
         if (instantiatedGenericFunctions.count(mangledName)) return mangledName;
         instantiatedGenericFunctions.insert(mangledName);
+        ActiveEnumSpecializationScope enumSpecializationScope(
+            &compilerLLVM->activeGenericEnumSpecialization_,
+            compilerLLVM->gts.instantiatedGenericFunctions.count(mangledName) != 0
+                ? mangledName : std::string{});
 
         auto templateIt = genericFunctionTemplates.find(baseName);
         if (templateIt == genericFunctionTemplates.end()) return {};
@@ -831,6 +845,10 @@ void MainListener::ProcessPendingInstantiations() {
             for (const auto& arg : pending.typeArgs)
                 if (arg.size() > 2 && arg.ends_with("[]")) origin.viewArgs.push_back(arg);
             ActiveOriginScope originScope(&compilerLLVM->gts.activeInstantiationOrigin, std::move(origin));
+            ActiveEnumSpecializationScope enumSpecializationScope(
+                &compilerLLVM->activeGenericEnumSpecialization_,
+                compilerLLVM->gts.instantiatedGenerics.count(pending.mangledName) != 0
+                    ? pending.mangledName : std::string{});
 
             // Now safe to instantiate
             auto structIt = genericStructTemplates.find(pending.templateName);

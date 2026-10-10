@@ -46,3 +46,8 @@ TryDeclareForeignCxxLocal) has its own argument assembly.
 ## Ruling (maintainer, 2026-10-02 00:10)
 
 Follows the N48 ruling (std::move and the CFlat `move` keyword both stay; std.move mimics C++). So the open row above is decided: a `T*` parameter bound from a `T&&` C++ result is refused like clang refuses it, and every argument door treats the result as an xvalue (move-construct, by-value params, template deduction spells `T`, not `T*`).
+
+## T67 review 1 (2026-10-07)
+- `std.move(x)` passed to a C++ `int&&` parameter is refused, while `move x` works (master same).
+- (T67 review 2) `move m2` into a C++ `int*&&` materializes a temporary instead of binding m2's slot;
+  value right, address differs from clang's std::move (master same).

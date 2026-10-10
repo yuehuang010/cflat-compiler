@@ -1,0 +1,15 @@
+import cpp "filesystem";
+import cpp "cpp_interop_relay_shallow.h";
+import cpp "chrono";
+
+extern int main()
+{
+    expect_error("clang: no member named 'nosuch' in namespace 'std::chrono'") {
+        int value = std.chrono.nosuch(1);
+    }
+    // filesystem found the leaf; later groups missing the namespace or the leaf must not win.
+    expect_error("clang: no matching function for call to 'exists'") {
+        int value = std.filesystem.exists(1);
+    }
+    return 0;
+}

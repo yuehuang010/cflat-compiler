@@ -1,0 +1,54 @@
+// Arithmetic on a 'void*' has no element size. Pre-fix `(p + 3) - p` reached
+// llvm::DataLayout::getTypeSizeInBits on the unsized pointee and trapped, and `p + n`, `p += n`
+// and `p++` failed module verification ("GEP into unsized type") with no source location.
+
+expect_error("pointer arithmetic on 'void*' is not allowed") {
+    long voidArithDifference()
+    {
+        u8[8] bytes = default;
+        void* p = &bytes[0];
+        return (p + 3) - p;
+    }
+}
+
+expect_error("pointer arithmetic on 'void*' is not allowed") {
+    void* voidArithLeadingInteger(void* q)
+    {
+        return 1 + q;
+    }
+}
+
+expect_error("pointer arithmetic on 'void*' is not allowed") {
+    long voidArithSpan()
+    {
+        u8[8] bytes = default;
+        void* a = &bytes[0];
+        void* b = &bytes[2];
+        return b - a;
+    }
+}
+
+expect_error("pointer arithmetic on 'void*' is not allowed") {
+    void voidArithCompound(void* s)
+    {
+        s += 1;
+    }
+}
+
+expect_error("pointer arithmetic on 'void*' is not allowed") {
+    void voidArithIncrement(void* s)
+    {
+        s++;
+    }
+}
+
+expect_error("pointer arithmetic on 'void*' is not allowed") {
+    void voidArithDecrement(void* s)
+    {
+        s--;
+    }
+}
+
+// The accept-set neighbours (a typed u8* walks fine, a void** steps by pointer size) are value
+// legs in Test/test_basic.cb.
+extern int main() { return 0; }
