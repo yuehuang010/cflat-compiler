@@ -254,6 +254,7 @@ import cpp "functional";
 import cpp "compare";
 
 struct T74Wrap { cflat_t74.Track track; int z = 5; };
+struct T131PtrSlot { int* p; };
 T74Wrap[2] t74Global;
 T74Wrap[2][3] t74Grid;
 struct T74Nested { T74Wrap item; };
@@ -1777,6 +1778,8 @@ struct T72FieldN9 { cppi.Tracked value = cppi.Tracked(4).twice(); };
 struct T73Holder { cpp_t73.Mix mix; };
 struct T73ArrayHolder { cpp_t73.Mix items[2]; };
 struct T73Nested { T73Holder holder; };
+struct T134EmptyOnlyFieldHolder { t63.EmptyOnly value = {}; };
+struct T134EmptyOnlyDirectFieldHolder { t63.EmptyOnly value{}; };
 struct T73VirtualHolder { cpp_t73.Virtual value; };
 struct T73DefaultMemberHolder { cpp_t73.DefaultMember value; };
 struct T97Hd { cpp_t97.Dl d; int k = 0; };
@@ -1800,6 +1803,9 @@ struct T129SingleOuter { T129UserCtor h; };
 struct T129Array2DOuter { T129UserCtor[2][2] h; };
 struct T129ThrowUserCtor { cppunw.Tx m; int k = 1; T129ThrowUserCtor() { k = 2; } };
 struct T129ThrowArrayOuter { T129ThrowUserCtor[2] h; };
+struct T130ReturnHolder { cppexp.ConvCnt c; int k = 1; };
+struct T130Generic<T> { T c; int k = 1; };
+struct T130ThrowHolder { cppunw.Tx t; int k = 1; };
 int t117Order = 0;
 int T117Order(int value) { t117Order = t117Order * 10 + value; return value; }
 int T117ThrowCtor(int unused)
@@ -1816,6 +1822,58 @@ int T129ThrowArrayInit(int unused)
 {
     T129ThrowArrayOuter h = { h = { { m = 0 }, { m = 6 } } };
     return h.h[0].m.get() + unused;
+}
+T130ReturnHolder T130Make() { T130ReturnHolder s = { c = 5 }; return s; }
+T125ArrayHolder T130MakeArray() { T125ArrayHolder h = { arr = { 5, 6 } }; return h; }
+T130ReturnHolder T130Same(int choose)
+{
+    T130ReturnHolder s = { c = 5 };
+    if (choose) return s;
+    return s;
+}
+T130ReturnHolder T130Different(int choose)
+{
+    T130ReturnHolder a = { c = 5 };
+    T130ReturnHolder b = { c = 6 };
+    if (choose) return a;
+    return b;
+}
+T130ReturnHolder T130Temporary() { T130ReturnHolder t = { c = 9 }; return t; }
+T130ReturnHolder T130Mixed(int choose)
+{
+    T130ReturnHolder s = { c = 5 };
+    if (choose) return s;
+    return T130Temporary();
+}
+T130ReturnHolder T130Parameter(T130ReturnHolder p) { return p; }
+T130ReturnHolder T130Modified()
+{
+    T130ReturnHolder s = { c = 5 };
+    s.k = 9;
+    return s;
+}
+T130ReturnHolder* t130Escaped;
+T130ReturnHolder T130Escape()
+{
+    T130ReturnHolder s = { c = 5 };
+    t130Escaped = &s;
+    return s;
+}
+T130Generic<cppexp.ConvCnt> T130GenericMake()
+{
+    T130Generic<cppexp.ConvCnt> s = { c = 5 };
+    return s;
+}
+T130ThrowHolder T130ThrowReturn(int x)
+{
+    T130ThrowHolder s = { t = cppunw.Tx(0) };
+    cppunw.thrower(x);
+    return s;
+}
+int T130ThrowWrapper(int x)
+{
+    T130ThrowHolder s = T130ThrowReturn(x);
+    return s.t.get();
 }
 T73Holder t73Global = default;
 // T94 B: a [cpp] struct in a namespace whose name ends in '_'. The generated identity for ns_.Self
@@ -2106,6 +2164,29 @@ extern int main()
     t87.R2* t87L98137 = new t87.R2(0, 0);
     if (t87L98137.v != 11) return 98137;
     delete t87L98137;
+    // T132 acceptance set: an int*-only constructor must receive a real null pointer.
+    t132.K* t132K0 = new t132.K(0);
+    if (t132K0.was_null != 1) return 13201;
+    delete t132K0;
+    // Copy-initialization also preserves a real null for an int*-only constructor.
+    t132.K t132KCopyInit = 0;
+    if (t132KCopyInit.was_null != 1) return 13206;
+    // Exact int wins over the null-pointer conversion.
+    t132.SInt* t132Int0 = new t132.SInt(0);
+    if (t132Int0.v != 11) return 13202;
+    delete t132Int0;
+    // A typed zero and a non-literal zero retain their integral overloads.
+    t132.SLong* t132Long0 = new t132.SLong(0L);
+    if (t132Long0.v != 11) return 13203;
+    delete t132Long0;
+    int t132Zero = 0;
+    t132.SLong* t132LongVar = new t132.SLong(t132Zero);
+    if (t132LongVar.v != 11) return 13204;
+    delete t132LongVar;
+    // nullptr selects the pointer constructor rather than the int constructor.
+    t132.SNull* t132Nullptr = new t132.SNull(nullptr);
+    if (t132Nullptr.v != 22) return 13205;
+    delete t132Nullptr;
     // A scalar-reference constructor beside a pointer one: the null literal reaches the mirror's selector
     // as 0, so the pointer constructor wins (clang: 99).
     t87.NullRef* t87L98138 = new t87.NullRef(0, 1.5);
@@ -2138,6 +2219,39 @@ extern int main()
         || t63Chars.size() != 2 || t63Chars[0] != 1 || t63Chars[1] != 2
         || t63Unsigned.size() != 2 || t63Unsigned[0] != 1 || t63Unsigned[1] != 2)
         return 9302;
+    // T134 accept-set: empty braces keep default-constructor, aggregate, and vector semantics.
+    t63.VecPick t63EmptyBrace{};
+    t63.Aggregate t63EmptyAggregate{};
+    std.vector<int> t63EmptyVector{};
+    if (t63EmptyBrace.which != 0 || t63EmptyBrace.first != -1 || t63EmptyBrace.second != -1
+        || t63EmptyAggregate.first != 0 || t63EmptyAggregate.second != 0
+        || t63EmptyVector.size() != 0)
+        return 9309;
+    t63.resetEmptyOnlyCounts();
+    {
+        t63.EmptyOnly t63EmptyOnly{};
+        t63.EmptyOnly t63EmptyOnlyEq = {};
+        if (t63EmptyOnly.n != 0 || t63EmptyOnlyEq.n != 0
+            || t63.emptyOnlyCtorCount() != 2 || t63.emptyOnlyDtorCount() != 0)
+            return 9310;
+    }
+    if (t63.emptyOnlyCtorCount() != 2 || t63.emptyOnlyDtorCount() != 2) return 9311;
+    t63.resetEmptyOnlyCounts();
+    {
+        T134EmptyOnlyFieldHolder t134EmptyField;
+        if (t134EmptyField.value.n != 0 || t63.emptyOnlyCtorCount() != 1
+            || t63.emptyOnlyDtorCount() != 0)
+            return 9312;
+    }
+    if (t63.emptyOnlyCtorCount() != 1 || t63.emptyOnlyDtorCount() != 1) return 9313;
+    t63.resetEmptyOnlyCounts();
+    {
+        T134EmptyOnlyDirectFieldHolder t134DirectEmptyField;
+        if (t134DirectEmptyField.value.n != 0 || t63.emptyOnlyCtorCount() != 1
+            || t63.emptyOnlyDtorCount() != 0)
+            return 9314;
+    }
+    if (t63.emptyOnlyCtorCount() != 1 || t63.emptyOnlyDtorCount() != 1) return 9315;
     std.string t63StringA = "x";
     std.string t63StringB = "yz";
     std.vector<std.string> t63Strings{t63StringA, t63StringB};
@@ -6095,6 +6209,68 @@ extern int main()
     cppalias.VPCRef vpcH = cppalias.global_vpc();                      // Vv2* const& member
     vpcH.v->set(8);                                                    // pointee writable through the slot
     if (cppalias.gv2_n() != 8 || vpcH.v->get() != 8)    return 1896;
+
+    // T131: ctor wrappers preserve the caller's pointer slot and pointer value category.
+    int t131X = 4; int t131Y = 6; int* t131Ptr = &t131Y;
+    cppalias.CtorPtrRef t131Pr = cppalias.CtorPtrRef(t131Ptr);
+    if (*t131Pr.p != 6)                                 return 1897;
+    *t131Pr.p = 7;
+    if (t131Y != 7)                                      return 1898;
+    t131Pr.p = &t131X;
+    if (t131Ptr != &t131X)                              return 1899;
+
+    int* t131StackPtr = &t131Y;
+    cppalias.CtorPtrRef t131StackPr = cppalias.CtorPtrRef(t131StackPtr);
+    cppalias.t131_clobber_stack();
+    if (t131StackPr.p != &t131Y)                        return 1900;
+
+    int* t131ListPtr = &t131Y;
+    cppalias.CtorPtrRefList t131List = { t131ListPtr };
+    t131List.p = &t131X;
+    if (t131ListPtr != &t131X)                          return 1901;
+
+    int* t131HeapPtr = &t131Y;
+    cppalias.CtorPtrRef* t131Heap = new cppalias.CtorPtrRef(t131HeapPtr);
+    t131Heap->p = &t131X;
+    if (t131HeapPtr != &t131X)                          return 1902;
+    delete t131Heap;
+
+    T131PtrSlot t131Field = default;
+    t131Field.p = &t131Y;
+    cppalias.CtorPtrRef t131FieldPr = cppalias.CtorPtrRef(t131Field.p);
+    t131FieldPr.p = &t131X;
+    if (t131Field.p != &t131X)                          return 1903;
+
+    int*[2] t131Array = { &t131Y, &t131X };
+    cppalias.CtorPtrRef t131ArrayPr = cppalias.CtorPtrRef(t131Array[0]);
+    t131ArrayPr.p = &t131X;
+    if (t131Array[0] != &t131X)                         return 1904;
+
+    const int* t131ConstPtr = &t131Y;
+    cppalias.CtorCPtrRef t131ConstPr = cppalias.CtorCPtrRef(t131ConstPtr);
+    t131ConstPr.p = &t131X;
+    if (t131ConstPtr != &t131X)                         return 1905;
+    const int* t131ConstValPtr = &t131X;
+    cppalias.CtorCPtrRef t131ConstVal = cppalias.CtorCPtrRef(t131ConstValPtr);
+    if (*t131ConstVal.p != 4 || t131ConstVal.p != &t131X) return 1908;
+
+    int* t131ConstRefPtr = &t131Y;
+    cppalias.CtorPtrConstRef t131ConstRef = cppalias.CtorPtrConstRef(t131ConstRefPtr);
+    if (!t131ConstRef.aliases(t131ConstRefPtr) || *t131ConstRef.p != 7) return 1906;
+
+    int t131RrefValue = 6;
+    cppalias.CtorPtrRRefTemplate t131Rref = cppalias.CtorPtrRRefTemplate(&t131RrefValue);
+    if (t131Rref.seen != 6)                            return 1907;
+    // CFlat `&p` at a `T*&` ctor parameter binds p itself (r3): declaration and `new` paths.
+    int* t131AddrPtr = &t131Y;
+    cppalias.CtorPtrRef t131AddrPr = cppalias.CtorPtrRef(&t131AddrPtr);
+    t131AddrPr.p = &t131X;
+    if (t131AddrPtr != &t131X || *t131AddrPr.p != 4)  return 1909;
+    int* t131AddrHeapPtr = &t131Y;
+    cppalias.CtorPtrRef* t131AddrHeap = new cppalias.CtorPtrRef(&t131AddrHeapPtr);
+    t131AddrHeap->p = &t131X;
+    if (t131AddrHeapPtr != &t131X)                     return 1910;
+    delete t131AddrHeap;
 
     // ---- a C++ field whose type is a CLASS ------------------------------------------------------
     // Pre-fix every leg below failed to COMPILE ("Undefined variable ..." / "no overload of
@@ -12814,9 +12990,8 @@ int OpMoveNontrivialLegs()
 }
 
 // Legs 31730-31737: assignment into a CFlat struct with a user destructor AND a C++ field
-// (DESTROY + REBUILD, ruled 2026-10-01): the user ~T runs exactly once per assignment from a
-// prvalue - the old value - as for a plain CFlat struct; moved-from husks (the callee's returned
-// local, the call temporary) run only their C++ field destructors. C++ MO dtor counts husks.
+// (DESTROY + REBUILD, ruled 2026-10-01). Named return locals share sret; other moved-from husks
+// run only their C++ field destructors. C++ MO dtor counts husks.
 int g_ldtUser = 0;
 struct LdtHolder
 {
@@ -12874,8 +13049,8 @@ int LoweredUserDtorAssignLegs(int argc)
     g_ldtUser = 0; cppi_opmv.MO.reset();
     a = LdtMake(2);
     if (g_ldtUser != 1 || a.id != 2 || a.m.v != 2) return 31730;
-    // Old a.m, the callee's returned local and the call temporary: three C++ husks.
-    if (cppi_opmv.MO.DT() != 3 || cppi_opmv.MO.MV() != 2) return 31731;
+    // The old a.m and call temporary remain; NRVO removes the callee's returned-local husk.
+    if (cppi_opmv.MO.DT() != 2 || cppi_opmv.MO.MV() != 1) return 31731;
     g_ldtUser = 0;
     a = argc > 99 ? LdtMake(3) : LdtMake(4);
     if (g_ldtUser != 1 || a.id != 4) return 31732;
@@ -13556,6 +13731,91 @@ int LoweredUserDtorAssignLegs(int argc)
     cppunw.reset();
     if (cppunw.guarded(T129ThrowArrayInit, 0) != -6) return 12912;
     if (cppunw.live() != 0 || cppunw.dtors() != 4) return 12913;
+    // T130: same-local returns of CFlat structs construct into the caller's sret slot.
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T130Make();
+        if (value.c.v != 5 || value.k != 1 || cppexp.conv_ctor_count() != 1
+            || cppexp.conv_dtor_count() != 0) return 13001;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13002;
+    cppexp.conv_reset();
+    {
+        T125ArrayHolder value = T130MakeArray();
+        if (value.arr[0].v != 5 || value.arr[1].v != 6 || value.k != 1
+            || cppexp.conv_ctor_count() != 2 || cppexp.conv_dtor_count() != 0) return 13003;
+    }
+    if (cppexp.conv_dtor_count() != 2) return 13004;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T130Same(1);
+        if (value.c.v != 5 || cppexp.conv_ctor_count() != 1
+            || cppexp.conv_dtor_count() != 0) return 13005;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13006;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T130Different(1);
+        if (value.c.v != 1005 || cppexp.conv_ctor_count() != 3
+            || cppexp.conv_dtor_count() != 2) return 13007;
+    }
+    if (cppexp.conv_dtor_count() != 3) return 13008;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T130Mixed(1);
+        if (value.c.v != 1005 || cppexp.conv_ctor_count() != 2
+            || cppexp.conv_dtor_count() != 1) return 13009;
+    }
+    if (cppexp.conv_dtor_count() != 2) return 13010;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T130Mixed(0);
+        if (value.c.v != 9 || cppexp.conv_ctor_count() != 2
+            || cppexp.conv_dtor_count() != 1) return 13011;
+    }
+    if (cppexp.conv_dtor_count() != 2) return 13012;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder source = { c = 5 };
+        cppexp.conv_reset();
+        {
+            T130ReturnHolder value = T130Parameter(move source);
+            if (value.c.v != 2005 || cppexp.conv_ctor_count() != 2
+                || cppexp.conv_dtor_count() != 1) return 13013;
+        }
+        if (cppexp.conv_dtor_count() != 2) return 13014;
+    }
+    if (cppexp.conv_dtor_count() != 3) return 13015;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T130Modified();
+        if (value.c.v != 5 || value.k != 9 || cppexp.conv_ctor_count() != 1
+            || cppexp.conv_dtor_count() != 0) return 13016;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13017;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T130Escape();
+        if (value.c.v != 5 || t130Escaped != &value || cppexp.conv_ctor_count() != 1
+            || cppexp.conv_dtor_count() != 0) return 13018;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13019;
+    cppexp.conv_reset();
+    {
+        T130Generic<cppexp.ConvCnt> value = T130GenericMake();
+        if (value.c.v != 5 || value.k != 1 || cppexp.conv_ctor_count() != 1
+            || cppexp.conv_dtor_count() != 0) return 13020;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13021;
+    cppunw.reset();
+    if (cppunw.guarded(T130ThrowWrapper, 5) != -5) return 13022;
+    if (cppunw.live() != 0 || cppunw.dtors() != 1) return 13023;
+    cppunw.reset();
+    {
+        T130ThrowHolder value = T130ThrowReturn(0);
+        if (value.t.get() != 0 || cppunw.live() != 1 || cppunw.dtors() != 0) return 13024;
+    }
+    if (cppunw.live() != 0 || cppunw.dtors() != 1) return 13025;
     // T97: a C++ field named by a brace default keeps its value when the CFlat struct has no user ctor.
     // Probe scratch/repro_keep/v20/rv20/d/p.cb (master gave d.v=0 here; the user-ctor form was already right).
     cpp_t97.reset();

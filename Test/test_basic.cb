@@ -1910,6 +1910,7 @@ int pickHexFloat(double x) { return 2; }
 int pickLongDouble(float x) { return 1; }
 int pickLongDouble(double x) { return 2; }
 int pickLongDouble(longdouble x) { return 3; }
+int pickLongDoubleGeneric<T>(T x) { return pickLongDouble(x); }
 // {double, longdouble} only: a float source promotes to double (clang), whatever the declaration order.
 int pickLdOrD(longdouble x) { return 3; }
 int pickLdOrD(double x) { return 2; }
@@ -2118,6 +2119,15 @@ bool testExplicitIntTypes()
     result &= Test("long_double_variable_pick", pickLongDouble(t100Ld), 3);
     result &= Test("long_double_mixed_literal_pick", pickLongDouble(0.25l + 1.0f), 3);
     result &= Test("long_double_mixed_variable_pick", pickLongDouble(t100Ld + 1.0f), 3);
+    result &= Test("long_double_generic_ld_plus_float", pickLongDoubleGeneric(t100Ld + 1.0f), 3);
+    result &= Test("long_double_generic_ld_plus_double", pickLongDoubleGeneric(t100Ld + t100Double), 3);
+    result &= Test("long_double_generic_double_plus_ld", pickLongDoubleGeneric(t100Double + 0.25l), 3);
+    result &= Test("long_double_generic_literal_times_int", pickLongDoubleGeneric(0.25l * 2), 3);
+    bool t100Condition = true;
+    result &= Test("long_double_generic_ternary_literal_arms",
+        pickLongDoubleGeneric(t100Condition ? 0.25l : 1.0f), 3);
+    result &= Test("long_double_generic_ternary_variable_arms",
+        pickLongDoubleGeneric(t100Condition ? t100Ld : 1.0), 3);
     result &= Test("long_double_literal_value", (int)(0.25l * 1024), 256);
     float t100F = 0.5f;
     result &= Test("long_double_float_source_prefers_double", pickLdOrD(t100F) * 10 + pickLdOrD(0.25f), 22);

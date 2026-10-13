@@ -2702,6 +2702,131 @@ static void CollectOwnReturnExpressions(antlr4::tree::ParseTree* node,
         CollectOwnReturnExpressions(child, out);
 }
 
+static void CollectOwnReturnStatements(antlr4::tree::ParseTree* node,
+                                       std::vector<CFlatParser::JumpStatementContext*>& out)
+{
+    if (node == nullptr) return;
+    if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node) != nullptr) return;
+    if (auto* jump = AsRuleCtx<CFlatParser::JumpStatementContext>(node))
+        if (jump->Return() != nullptr) out.push_back(jump);
+    for (auto* child : node->children)
+        CollectOwnReturnStatements(child, out);
+}
+
+static bool HasNonAutomaticStorageClass(CFlatParser::DeclarationSpecifiersContext* declSpecs)
+{
+    if (declSpecs == nullptr) return false;
+    for (auto* spec : declSpecs->declarationSpecifier())
+        if (auto* storage = spec->storageClassSpecifier(); storage != nullptr)
+            if (storage->Static() != nullptr || storage->ThreadLocal() != nullptr
+                || storage->Extern() != nullptr)
+                return true;
+    return false;
+}
+
+static bool DeclarationNamesVariable(CFlatParser::DeclarationContext* declaration,
+                                     const std::string& name)
+{
+    if (declaration == nullptr || declaration->initDeclaratorList() == nullptr) return false;
+    for (auto* init : declaration->initDeclaratorList()->initDeclarator())
+        if (init->declarator() != nullptr
+            && getDirectDeclName(init->declarator()->directDeclarator()) == name)
+            return true;
+    return false;
+}
+
+static bool IsBareReturnIdentifier(const std::string& text)
+{
+    if (text.empty()) return false;
+    auto initial = [](unsigned char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'; };
+    auto subsequent = [&](unsigned char c) { return initial(c) || (c >= '0' && c <= '9'); };
+    if (!initial(static_cast<unsigned char>(text.front()))) return false;
+    return std::all_of(text.begin() + 1, text.end(), [&](char c) {
+        return subsequent(static_cast<unsigned char>(c));
+    });
+}
+
+static bool HasOtherOwnDeclarationNamed(antlr4::tree::ParseTree* node,
+                                        const std::string& name,
+                                        CFlatParser::DeclarationContext* selected)
+{
+    if (node == nullptr) return false;
+    if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node) != nullptr) return false;
+    if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(node);
+        declaration != nullptr && declaration != selected
+        && DeclarationNamesVariable(declaration, name))
+        return true;
+    if (auto* destructuring = dynamic_cast<CFlatParser::DestructuringDeclarationContext*>(node))
+        for (auto* entry : destructuring->destructuringEntry())
+            if (entry->Identifier() != nullptr && entry->Identifier()->getText() == name)
+                return true;
+    if (auto* loop = AsRuleCtx<CFlatParser::IterationStatementContext>(node))
+    {
+        if (loop->In() != nullptr && loop->Identifier() != nullptr
+            && loop->Identifier()->getText() == name)
+            return true;
+        if (loop->forCondition() != nullptr && loop->forCondition()->forDeclaration() != nullptr)
+        {
+            auto* decl = loop->forCondition()->forDeclaration();
+            if (decl->initDeclaratorList() != nullptr)
+                for (auto* init : decl->initDeclaratorList()->initDeclarator())
+                    if (init->declarator() != nullptr
+                        && getDirectDeclName(init->declarator()->directDeclarator()) == name)
+                        return true;
+        }
+    }
+    for (auto* child : node->children)
+        if (HasOtherOwnDeclarationNamed(child, name, selected)) return true;
+    return false;
+}
+
+// Pre-scan the function's returns before codegen. Only a single, function-scope local name used
+// by every return can share the hidden sret slot; all other shapes keep ordinary return lowering.
+static std::string ClassifyNamedLocalReturnCandidate(CFlatParser::FunctionDefinitionContext* func)
+{
+    if (func == nullptr || func->compoundStatement() == nullptr
+        || func->compoundStatement()->blockItemList() == nullptr)
+        return {};
+
+    std::vector<CFlatParser::JumpStatementContext*> returns;
+    CollectOwnReturnStatements(func->compoundStatement(), returns);
+    if (returns.empty()) return {};
+
+    std::string name;
+    for (auto* jump : returns)
+    {
+        if (jump->expression() == nullptr || jump->compoundStatement() != nullptr) return {};
+        std::vector<std::string> wrapperTypes;
+        std::string returned = BareSourceText(jump->expression(), &wrapperTypes);
+        if (!wrapperTypes.empty() || !IsBareReturnIdentifier(returned)) return {};
+        if (name.empty()) name = std::move(returned);
+        else if (name != returned) return {};
+    }
+
+    CFlatParser::DeclarationContext* selected = nullptr;
+    for (auto* item : func->compoundStatement()->blockItemList()->blockItem())
+        if (auto* declaration = item->declaration();
+            declaration != nullptr && DeclarationNamesVariable(declaration, name))
+        {
+            if (selected != nullptr) return {};
+            selected = declaration;
+        }
+    if (selected == nullptr || HasNonAutomaticStorageClass(selected->declarationSpecifiers()))
+        return {};
+
+    const auto declarationToken = selected->getStart()->getTokenIndex();
+    for (auto* jump : returns)
+        if (jump->getStart()->getTokenIndex() < declarationToken) return {};
+
+    if (HasOtherOwnDeclarationNamed(func->compoundStatement(), name, selected)) return {};
+    if (func->parameterTypeList() != nullptr && func->parameterTypeList()->parameterList() != nullptr)
+        for (auto* param : func->parameterTypeList()->parameterList()->parameterDeclaration())
+            if (param->declarator() != nullptr
+                && getDirectDeclName(param->declarator()->directDeclarator()) == name)
+                return {};
+    return name;
+}
+
 enum class ValueStructReturnKind { NotApplicable, AllBorrowedParam, Mixed };
 
 // Classify the by-value STRUCT returns of a function whose return type carries no ownership
@@ -4245,6 +4370,27 @@ private:
     // break/continue - see straightLineJumped_); loops/switch restore it (they fall through).
     bool straightLineReturned_ = false;
     llvm::BasicBlock* expectErrorRecoveryBlock_ = nullptr;
+
+    struct NamedReturnElisionContext
+    {
+        llvm::Function* function = nullptr;
+        std::string variableName;
+        llvm::Value* sretStorage = nullptr;
+        llvm::Value* localStorage = nullptr;
+        size_t functionScopeDepth = 0;
+    } namedReturnElision_;
+
+    struct NamedReturnElisionScope
+    {
+        MainListener& owner;
+        NamedReturnElisionContext saved;
+        NamedReturnElisionScope(MainListener& listener, NamedReturnElisionContext next)
+            : owner(listener), saved(listener.namedReturnElision_)
+        {
+            owner.namedReturnElision_ = std::move(next);
+        }
+        ~NamedReturnElisionScope() { owner.namedReturnElision_ = std::move(saved); }
+    };
 
     // Set by the break/continue handlers. Like a return, a break/continue branch does NOT reach
     // the if's resume block, so its moves must not leak onto the fall-through path. Unlike a
@@ -6941,6 +7087,8 @@ public:
      */
     CFlatParser::InitializerListContext* FieldDefaultBraceList(
         const LLVMBackend::DeclTypeAndValue& field);
+    bool FieldHasEmptyCxxBraceInitializer(
+        const LLVMBackend::DeclTypeAndValue& field);
 
     // inPlaceDest: the field slot an armed C++ sret builds into; the seed consumes it and the list
     // edits it, so a null return means the value is already in place.
@@ -7423,6 +7571,9 @@ public:
         LLVMBackend::NamedVariable& result, bool markRvalue = true);
     void NormalizeCxxRvalueReferenceArgument(
         antlr4::ParserRuleContext* ctx, LLVMBackend::NamedVariable& argument);
+    void BindCxxCtorPointerSlotAddress(
+        antlr4::ParserRuleContext* ctx, LLVMBackend::NamedVariable& argument,
+        const std::string& typeName, size_t index, size_t count);
 
     // Returns the member-name text immediately following `opNode` (a `.`/`->` token) in the
     // postfix child list, or "" if the next child is not an Identifier/`move` name. Used by

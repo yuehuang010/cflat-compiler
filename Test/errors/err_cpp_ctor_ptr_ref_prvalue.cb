@@ -1,0 +1,11 @@
+// A C++ T*& constructor must reject a pointer prvalue, as clang does.
+import cpp "cpp_interop_ref_alias.h";
+
+extern int main()
+{
+    expect_error("is a non-const lvalue reference and cannot bind an rvalue") {
+        int value = 6;
+        cppalias.CtorPtrRef bad = cppalias.CtorPtrRef(&value);
+    }
+    return 0;
+}

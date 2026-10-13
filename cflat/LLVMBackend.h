@@ -1478,6 +1478,9 @@ public:
         // The BARE brace spelling of a field default (`Inner i { x = 1 };`, no '='), which the
         // grammar hangs on initDeclarator itself so `Initializer` is null for it.
         CFlatParser::InitializerListContext* BraceInitializer = nullptr;
+        // The initDeclarator context preserves an empty bare `{}` whose optional list is null.
+        antlr4::ParserRuleContext* BraceInitializerContext = nullptr;
+        bool HasEmptyBareBraceInitializer = false;
 
         // Used for array - first (outer) dimension; extra inner dimensions in ExtraArrayDims
         CFlatParser::AssignmentExpressionContext* ArraySize = nullptr;
@@ -3608,6 +3611,8 @@ private:
         mutable size_t closureHashFiles = static_cast<size_t>(-1);
     };
     std::vector<CxxImportGroup> cxxImportGroups_;
+    // Header guard verdicts are reused across constructor requests within one analysis.
+    std::unordered_map<std::string, bool> cxxHeaderGuardCache_;
     /*
      * The header/define set ONE request compiles against: the owning import group, plus the groups
      * that own the template arguments of the requested spelling (`std::vector<std::string>` from
@@ -6235,7 +6240,8 @@ private:
                                           const std::string& initializerList,
                                           bool copyListInit,
                                           std::string& wrapperName,
-                                          std::string& error);
+                                          std::string& error,
+                                          bool allowIncremental = true);
     // copyInit: the wrapper copy-initializes (`T t = arg;`), so an explicit constructor is
     // never a candidate - the form every IMPLICIT conversion site must use.
     // Converts each scalar argument of a generated constructor thunk call into the thunk's own
@@ -8465,7 +8471,7 @@ public:
 
     // Returns the variable's STORAGE: an alloca normally, or an internal module global when the
     // pending-static request below matches this declaration (a `static` local).
-    llvm::Value* CreateLocalVariable(const TypeAndValue& typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, size_t line = 0, uint64_t userAlign = 0);
+    llvm::Value* CreateLocalVariable(const TypeAndValue& typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, size_t line = 0, uint64_t userAlign = 0, llvm::Value* targetStorage = nullptr);
 
     // Return a live local binding, assigning its declaration sequence on first insertion.
     NamedVariable& GetOrCreateStackVariable(const std::string& name);
@@ -9768,15 +9774,16 @@ public:
                                                              bool allowExplicit,
                                                              bool allowScalarNarrowing = false) const;
     /*
-     * True when `T(args)` must be resolved by clang rather than by SelectCxxConstructor: the
-     * class declares a constructor TEMPLATE (never listed as a member), and the listed pick
-     * `selected` is absent or not an identity match for every argument. A non-template exact
-     * match beats any template in C++, so that pick stands; anything else could lose to a
-     * template specialization CFlat cannot see.
+     * True when `T(args)` must be resolved by clang rather than by SelectCxxConstructor: a
+     * literal zero has a viable pointer-parameter constructor candidate, or an unseen template
+     * candidate could outrank the listed pick. `argVars` carries literal provenance.
      */
     bool CxxConstructorNeedsClangResolution(const std::string& typeName,
                                             const CxxClassInfo::Structor* selected,
-                                            const std::vector<TypeAndValue>& argTypes) const;
+                                            const std::vector<TypeAndValue>& argTypes,
+                                            const std::vector<NamedVariable>* argVars = nullptr,
+                                            bool allowExplicit = true,
+                                            bool* nullPointerCandidate = nullptr) const;
     // Preserve CFlat's explicit single-float to integer refusal when every arity-compatible ctor
     // requires that conversion. Other unresolved constructor sets may be delegated to clang.
     bool CxxCtorSetRequiresFloatToInteger(const std::string& typeName,
@@ -11974,7 +11981,7 @@ public:
     // 240: generated class wrapper requests include recursively owned template argument headers.
     // 241: C++ signatures retain deleted and explicit-specialization status (T116).
     // 242: C++ signatures retain volatile pointee/referent receiver qualification.
-    static constexpr int kCHeaderCacheVersion = 242;
+    static constexpr int kCHeaderCacheVersion = 243;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

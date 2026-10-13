@@ -15,3 +15,13 @@ struct R1 { int v; R1(const int&, double) : v(11) {} R1(int*, const double&) : v
 struct NullRef { int v; NullRef(short, const int&) : v(11) {} NullRef(int*, const double&) : v(99) {} };
 struct R2 { int v; R2(const int&, int*) : v(11) {} R2(int*, double) : v(99) {} };
 }
+
+namespace t132 {
+struct S7 { int v; S7(long) : v(11) {} S7(void*) : v(77) {} };
+struct S8 { int v; S8(long, double) : v(11) {} S8(int*, double) : v(88) {} };
+struct K { int was_null; K(int* p) : was_null(p == nullptr ? 1 : 0) {} };
+struct SInt { int v; SInt(int) : v(11) {} SInt(int*) : v(22) {} };
+struct SLong { int v; SLong(long) : v(11) {} SLong(int*) : v(22) {} };
+struct SNull { int v; SNull(int) : v(11) {} SNull(int*) : v(22) {} };
+struct SVoidBool { int v; SVoidBool(void*) : v(22) {} SVoidBool(bool b) : v(b ? 31 : 30) {} };
+}

@@ -62,8 +62,6 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 | Run | Branch | Issue(s) | Notes |
 |-----|--------|----------|-------|
 | T119 | fix/t119-bracenarrow | BRACENARROW (p3 native brace narrowing constants, adds rejection) | PARKED 13:46 for a maintainer ruling. Luna scan (worktree scratch/t119_*): 7 existing sites clang refuses - Test/test_basic.cb 1020/1022 (100.5 -> u32), 1032-1034 (bool from 2, 256, 0.5), test_initializer_list.cb 899 (1.5 -> int, 7.9 -> i64); those tests assert "brace converts like =". Q: does constant narrowing refusal cover float->int and int/float->bool (rewrite those legs), or only integer range overflow? |
-| T130 | fix/t130-nrvo | NRVO (p3 named local with C++ field returned by move) | Luna xhigh r1 21:38 |
-| T131 | fix/t131-ptrrefctor | PTRREFCTOR (p2 C++ ctor `T*&` param binds a copy) | Luna xhigh r1 22:58 |
 
 
 ## A - crashes, asserts, link failures

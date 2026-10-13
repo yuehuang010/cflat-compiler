@@ -4720,6 +4720,7 @@ void LLVMBackend::ResetForReanalysis()
     cppInteropUsed_ = false;
     cxxProgramEhGuardAttempted_ = false;
     cxxImportGroups_.clear();
+    cxxHeaderGuardCache_.clear();
     tuParseCounts_.clear();
     cInlineBodyRequests_.clear();
     cxxIncrementalGroups_.clear();
@@ -7118,6 +7119,7 @@ static llvm::json::Object SerializeDtav(const DTAV& d)
     if (d.IsBitfieldStorage) o["bfs"] = true;
     if (d.IsPadding)         o["pad"] = true;
     if (d.IsCflatOwned)      o["cfo"] = true;
+    if (d.HasEmptyBareBraceInitializer) o["ebbi"] = true;
     if (d.UserAlignValue > 0) o["ua"] = static_cast<int64_t>(d.UserAlignValue);
     if (!d.Annotations.empty()) o["ann"] = SerializeAnnotations(d.Annotations);
     return o;
@@ -7140,6 +7142,7 @@ static DTAV DeserializeDtav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("bfs")) d.IsBitfieldStorage = *v;
     if (auto v = o.getBoolean("pad")) d.IsPadding = *v;
     if (auto v = o.getBoolean("cfo")) d.IsCflatOwned = *v;
+    if (auto v = o.getBoolean("ebbi")) d.HasEmptyBareBraceInitializer = *v;
     if (auto v = o.getInteger("ua")) d.UserAlignValue = static_cast<uint64_t>(*v);
     d.Annotations = DeserializeAnnotations(o.getArray("ann"));
     return d;

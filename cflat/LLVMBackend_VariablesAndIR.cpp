@@ -404,7 +404,7 @@ void LLVMBackend::SetStackVariable(const std::string& name, NamedVariable namedV
         }
     }
 
-llvm::Value* LLVMBackend::CreateLocalVariable(const TypeAndValue& typeValue, llvm::Type* autoType, llvm::Value* arraySize, size_t line, uint64_t userAlign)
+llvm::Value* LLVMBackend::CreateLocalVariable(const TypeAndValue& typeValue, llvm::Type* autoType, llvm::Value* arraySize, size_t line, uint64_t userAlign, llvm::Value* targetStorage)
 {
         // No enclosing scope means a file-scope declaration reached the local path (a stale
         // global_scope). back() on the empty scope stack is UB - diagnose instead of corrupting.
@@ -489,7 +489,8 @@ llvm::Value* LLVMBackend::CreateLocalVariable(const TypeAndValue& typeValue, llv
         uint64_t abiAlign = (type && type->isSized())
             ? module->getDataLayout().getABITypeAlign(type).value() : 0;
         uint64_t allocaAlign = (effAlign > abiAlign) ? effAlign : 0;
-        auto alloc = AllocaAtEntry(type, arraySize, typeValue.VariableName, allocaAlign);
+        auto alloc = targetStorage != nullptr
+            ? targetStorage : AllocaAtEntry(type, arraySize, typeValue.VariableName, allocaAlign);
         auto& namedVariable = GetOrCreateStackVariable(typeValue.VariableName);
         namedVariable.Storage = alloc;
         namedVariable.TypeAndValue = typeValue;

@@ -35,6 +35,32 @@ struct PtrRef { int*& p; };
 struct PtrPtrRef { int**& pp; };
 struct CPtrRef { const int*& p; };
 struct CPPRef { int* const& p; };
+struct CtorPtrRef {
+    int*& p;
+    explicit CtorPtrRef(int*& x) : p(x) {}
+};
+struct CtorPtrRefList {
+    int*& p;
+    CtorPtrRefList(int*& x) : p(x) {}
+};
+struct CtorCPtrRef {
+    const int*& p;
+    explicit CtorCPtrRef(const int*& x) : p(x) {}
+};
+struct CtorPtrConstRef {
+    int* const& p;
+    explicit CtorPtrConstRef(int* const& x) : p(x) {}
+    bool aliases(int* const& x) const { return &x == &p; }
+};
+struct CtorPtrRRefTemplate {
+    int seen;
+    template<class Dummy = void>
+    explicit CtorPtrRRefTemplate(int*&& x) : seen(*x) {}
+};
+inline void t131_clobber_stack() {
+    volatile int fill[256] = {};
+    for (int i = 0; i < 256; ++i) fill[i] = i;
+}
 struct Vv { int n; int get() const { return n; } void set(int x) { n = x; } };
 struct VPRef { Vv*& v; };
 inline int pw = 6;

@@ -1,6 +1,7 @@
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
 #include <bit>
+#include <cctype>
 #include <thread>
 #include <fstream>
 #include <iterator>
@@ -4915,6 +4916,11 @@ bool LLVMBackend::MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEnt
             if (verbose) std::cout << std::format("[verbose]   skipping global '{}': unsupported type '{}'\n", r.name, r.ctype);
             return false;
         }
+        // A C++ `const int *` global keeps its spelled pointee const, so a ctor wrapper spells the
+        // argument as clang sees it (`const int *&` binds only a const pointee).
+        if (cxxBoundary && e.type.Pointer && !e.type.IsFunctionPointer
+            && CxxSpellingHasConstPointee(r.ctype))
+            e.type.IsSpelledPointeeConst = true;
         e.type.VariableName = r.name;
         return true;
     }
@@ -10550,6 +10556,7 @@ bool LLVMBackend::HasUnavailableNestedCxxDefault(const std::string& typeName,
         for (const auto& field : GetDataStructure(typeName).StructFields)
         {
             if (field.Pointer || field.BraceInitializer != nullptr
+                || field.HasEmptyBareBraceInitializer
                 || (field.Initializer != nullptr && field.Initializer->Default() == nullptr))
                 continue;
             if (HasUnavailableNestedCxxDefault(field.TypeName, unavailableType, true))
@@ -15048,10 +15055,74 @@ std::string LLVMBackend::CxxImportedConstantLiteral(const NamedVariable& element
         return "static_cast<" + spelled + ">(" + (negative ? "(-" + digits + suffix + ")" : digits + suffix) + ")";
 }
 
+static bool CxxHeaderHasIncludeGuard(const std::string& contents)
+{
+        if (contents.find("#pragma once") != std::string::npos) return true;
+        std::vector<std::string> directives;
+        bool inBlockComment = false;
+        size_t offset = 0;
+        while (offset <= contents.size() && directives.size() < 2)
+        {
+            const size_t end = contents.find('\n', offset);
+            const std::string_view line(contents.data() + offset,
+                (end == std::string::npos ? contents.size() : end) - offset);
+            offset = end == std::string::npos ? contents.size() + 1 : end + 1;
+            std::string visible;
+            for (size_t i = 0; i < line.size(); ++i)
+            {
+                if (inBlockComment)
+                {
+                    const size_t close = line.find("*/", i);
+                    if (close == std::string_view::npos) break;
+                    i = close + 1;
+                    inBlockComment = false;
+                    continue;
+                }
+                if (i + 1 < line.size() && line[i] == '/' && line[i + 1] == '/') break;
+                if (i + 1 < line.size() && line[i] == '/' && line[i + 1] == '*')
+                {
+                    inBlockComment = true;
+                    ++i;
+                    continue;
+                }
+                visible += line[i];
+            }
+            const size_t first = visible.find_first_not_of(" \t\r");
+            if (first == std::string::npos) continue;
+            visible.erase(0, first);
+            if (visible.front() != '#') return false;
+            directives.push_back(std::move(visible));
+        }
+        if (directives.size() != 2) return false;
+        auto parseDirective = [](const std::string& line) {
+            std::pair<std::string, std::string> parsed;
+            size_t i = 1;
+            auto skipSpace = [&] {
+                while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+            };
+            auto readToken = [&] {
+                const size_t start = i;
+                while (i < line.size()
+                    && (std::isalnum(static_cast<unsigned char>(line[i])) || line[i] == '_'))
+                    ++i;
+                return line.substr(start, i - start);
+            };
+            skipSpace();
+            parsed.first = readToken();
+            skipSpace();
+            parsed.second = readToken();
+            return parsed;
+        };
+        const auto first = parseDirective(directives[0]);
+        const auto second = parseDirective(directives[1]);
+        return first.first == "ifndef" && second.first == "define"
+            && !first.second.empty() && first.second == second.second;
+}
+
 bool LLVMBackend::RequestCxxDirectBraceConstructor(
         const std::string& typeName, const std::vector<NamedVariable>& elements,
         const std::string& initializerList, bool copyListInit, std::string& wrapperName,
-        std::string& error)
+        std::string& error, bool allowIncremental)
 {
         error.clear();
         wrapperName.clear();
@@ -15073,6 +15144,26 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             error = "the C++ class's import group is unavailable";
             return false;
         }
+        // Incremental requests include the group's headers into one live clang TU. Guardless
+        // user headers must use standalone requests or a later empty-brace spelling redefines them.
+        const bool headersGuarded = std::all_of(group.ownerHeaders.begin(), group.ownerHeaders.end(),
+            [this](const std::string& header) {
+                if (IsSystemCxxHeaderPath(header)) return true;
+                const std::string cacheKey = std::filesystem::path(header).lexically_normal().string();
+                auto cached = cxxHeaderGuardCache_.find(cacheKey);
+                if (cached != cxxHeaderGuardCache_.end()) return cached->second;
+                std::ifstream in(header, std::ios::binary);
+                bool guarded = false;
+                if (in)
+                {
+                    const std::string contents((std::istreambuf_iterator<char>(in)),
+                                               std::istreambuf_iterator<char>());
+                    guarded = CxxHeaderHasIncludeGuard(contents);
+                }
+                cxxHeaderGuardCache_.emplace(cacheKey, guarded);
+                return guarded;
+            });
+        allowIncremental = allowIncremental && headersGuarded;
         std::vector<std::string> parameterTypes{ ownerSpelling + " *" };
         std::string init = initializerList;
         for (size_t i = 0; i < elements.size(); ++i)
@@ -15086,8 +15177,22 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
                 return false;
             }
             if (type.Pointer && spelling.find('*') == std::string::npos) spelling += " *";
+            const bool pointerValue = type.Pointer
+                && (!type.IsAlias || type.IsCxxRefToPointer) && !type.IsFunctionPointer;
+            const bool pointerXvalue = pointerValue && IsCxxRvalueReferenceArgument(elements[i]);
+            if (pointerValue)
+            {
+                if ((type.IsCxxPointeeConst || type.IsSpelledPointeeConst)
+                    && !spelling.starts_with("const "))
+                    spelling = "const " + spelling;
+                if (type.IsCxxPointeeVolatile && !spelling.starts_with("volatile "))
+                    spelling = "volatile " + spelling;
+                if (type.IsCxxRefToPointer && type.IsCxxConstRef && !pointerXvalue)
+                    spelling += " const";
+                spelling += pointerXvalue ? " &&" : " &";
+            }
             // A class element binds by reference: clang copies an lvalue, moves an rvalue.
-            if (!type.Pointer && IsCxxRecord(type.TypeName))
+            else if (!type.Pointer && IsCxxRecord(type.TypeName))
                 spelling += elements[i].IsRvalue || elements[i].IsExplicitMove ? " &&" : " const &";
             parameterTypes.push_back(std::move(spelling));
         }
@@ -15095,6 +15200,10 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
         {
             const std::string marker = "__cflat_arg_" + std::to_string(i) + "__";
             const std::string param = "p" + std::to_string(i + 1);
+            const auto& type = elements[i].TypeAndValue;
+            const bool pointerValue = type.Pointer
+                && (!type.IsAlias || type.IsCxxRefToPointer) && !type.IsFunctionPointer;
+            const bool pointerXvalue = pointerValue && IsCxxRvalueReferenceArgument(elements[i]);
             if (!elements[i].TypeAndValue.Pointer && IsCxxRecord(elements[i].TypeAndValue.TypeName))
             {
                 const std::string replacement = elements[i].IsRvalue || elements[i].IsExplicitMove
@@ -15124,10 +15233,17 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
                 continue;
             }
             size_t at = 0;
+            std::string replacement = param;
+            if (pointerXvalue)
+            {
+                std::string castType = parameterTypes[i + 1];
+                castType.resize(castType.size() - 3);
+                replacement = "static_cast<" + castType + " &&>(" + param + ")";
+            }
             while ((at = init.find(marker, at)) != std::string::npos)
             {
-                init.replace(at, marker.size(), param);
-                at += param.size();
+                init.replace(at, marker.size(), replacement);
+                at += replacement.size();
             }
         }
         // `T v = {..}` is copy-list-init: a never-called lambda makes clang refuse an explicit
@@ -15154,7 +15270,8 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
         CSigEntry bound;
         std::string wrapperError;
         if (!RequestGeneratedCxxWrapper(group, source, wrapperName, "DIRECT_BRACE_CTOR",
-                                        bound, wrapperError))
+                                        bound, wrapperError, /*persistOnSuccess*/ true,
+                                        allowIncremental))
         {
             error = std::format("C++ brace constructor call '{}' does not match (clang: {})",
                                 DisplayCxxClassName(typeName), FirstCxxErrorLine(wrapperError));
@@ -15315,9 +15432,111 @@ std::string LLVMBackend::CxxCtorSelectedNarrowingError(const std::string& typeNa
 
 bool LLVMBackend::CxxConstructorNeedsClangResolution(
         const std::string& typeName, const CxxClassInfo::Structor* selected,
-        const std::vector<TypeAndValue>& argTypes) const
+        const std::vector<TypeAndValue>& argTypes,
+        const std::vector<NamedVariable>* argVars, bool allowExplicit,
+        bool* nullPointerCandidate) const
 {
+        if (nullPointerCandidate != nullptr) *nullPointerCandidate = false;
         if (CxxCtorForwardsScalarReference(typeName, argTypes)) return true;
+        if (selected != nullptr && !selected->isCopyCtor && !selected->isMoveCtor
+            && selected->params.size() >= argTypes.size() + 1)
+            for (size_t i = 0; i < argTypes.size(); ++i)
+            {
+                const TypeAndValue& param = selected->params[i + 1];
+                // Only a reference TO A POINTER needs the slot forwarded through clang; a record
+                // or scalar reference keeps the direct ABI ctor (T131 r3).
+                if (param.IsCxxRefToPointer && !param.IsFunctionPointer)
+                    return true;
+            }
+        if (selected != nullptr && argVars != nullptr && argVars->size() == argTypes.size()
+            && std::any_of(argVars->begin(), argVars->end(), [&](const NamedVariable& arg) {
+                   return IsNullPointerConstantArgument(arg, true);
+               }))
+        {
+            const CxxClassInfo* listed = GetCxxClassInfoWithConstructors(typeName);
+            if (listed != nullptr)
+            {
+                auto* self = const_cast<LLVMBackend*>(this);
+                auto rankCandidate = [&](const CxxClassInfo::Structor& candidate) {
+                    FunctionSymbol symbol;
+                    symbol.IsCxx = true;
+                    symbol.IsMethod = true;
+                    symbol.UniqueName = candidate.linkageName;
+                    symbol.Parameters = candidate.params;
+                    symbol.Parameters[0].VariableName = "this";
+                    symbol.Parameters[0].TypeName = typeName;
+                    std::vector<NamedVariable> args(1);
+                    args[0].TypeAndValue.TypeName = typeName;
+                    args.insert(args.end(), argVars->begin(), argVars->end());
+                    std::vector<CxxConversionRank> ranks = self->RankCxxConversionSequences(args, symbol);
+                    if (ranks.size() != args.size()) return std::vector<CxxConversionRank>{};
+                    ranks.erase(ranks.begin());
+                    for (size_t i = 0; i < argVars->size(); ++i)
+                    {
+                        const TypeAndValue& param = candidate.params[i + 1];
+                        if (!IsNullPointerConstantArgument((*argVars)[i], true)
+                            || param.Pointer || param.IsAlias || param.IsRvalueRef)
+                            continue;
+                        const std::string target = self->CxxIntegerParameterIdentity(symbol, i + 1, param);
+                        TypeAndValue integralTarget;
+                        integralTarget.TypeName = target;
+                        if (target.empty() || (target != "bool" && integralTarget.IsInteger() == -1))
+                            continue;
+                        // This is C++ viability for null-pointer overload ties; it does not relax
+                        // CFlat's separate no-implicit-narrowing rule for ordinary call arguments.
+                        if (!ranks[i].cxxViable)
+                        {
+                            ranks[i].rank = 2;
+                            ranks[i].cxxViable = true;
+                        }
+                    }
+                    return ranks;
+                };
+                std::vector<CxxConversionRank> selectedRanks = rankCandidate(*selected);
+                const bool selectedCxxViable = selectedRanks.size() == argVars->size()
+                    && std::all_of(selectedRanks.begin(), selectedRanks.end(),
+                        [](const CxxConversionRank& rank) { return rank.cxxViable; });
+                bool selectedHasNullPointerParam = false;
+                for (size_t i = 0; i < argVars->size(); ++i)
+                    selectedHasNullPointerParam |= IsNullPointerConstantArgument((*argVars)[i], true)
+                        && (selected->params[i + 1].Pointer || selected->params[i + 1].IsFunctionPointer);
+                for (const CxxClassInfo::Structor& candidate : listed->constructors)
+                {
+                    if (!allowExplicit && candidate.isExplicit) continue;
+                    if (candidate.params.empty()) continue;
+                    const size_t parameterCount = candidate.params.size() - 1;
+                    if (argVars->size() > parameterCount) continue;
+                    bool defaults = true;
+                    for (size_t i = argVars->size(); defaults && i < parameterCount; ++i)
+                        defaults = i + 1 < candidate.defaultArgs.size()
+                            && !candidate.defaultArgs[i + 1].kind.empty();
+                    if (!defaults) continue;
+                    bool hasNullPointerParam = false;
+                    for (size_t i = 0; i < argVars->size(); ++i)
+                        hasNullPointerParam |= IsNullPointerConstantArgument((*argVars)[i], true)
+                            && (candidate.params[i + 1].Pointer || candidate.params[i + 1].IsFunctionPointer);
+                    if (!hasNullPointerParam && !selectedHasNullPointerParam) continue;
+                    if (candidate.linkageName == selected->linkageName) continue;
+                    std::vector<CxxConversionRank> ranks = rankCandidate(candidate);
+                    if (ranks.size() != argVars->size()
+                        || !std::all_of(ranks.begin(), ranks.end(),
+                            [](const CxxConversionRank& rank) { return rank.cxxViable; }))
+                        continue;
+                    if (hasNullPointerParam && !selectedCxxViable)
+                    {
+                        if (nullPointerCandidate != nullptr) *nullPointerCandidate = true;
+                        return true;
+                    }
+                    if (!selectedCxxViable) continue;
+                    bool crossing = false;
+                    if (CompareCxxConversionRanks(ranks, selectedRanks, crossing) != 1)
+                    {
+                        if (nullPointerCandidate != nullptr) *nullPointerCandidate = true;
+                        return true;
+                    }
+                }
+            }
+        }
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
         if (info == nullptr || !info->hasCtorTemplate) return false;
         if (selected == nullptr) return true;
@@ -15549,6 +15768,24 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             return CxxZeroLiteralSpelling(arg.IsCxxMacroGlobal ? arg.TypeAndValue.TypeName
                                                                : arg.LiteralIdentity);
         };
+        // The pointee const a named pointer argument was DECLARED with: its own TypeAndValue
+        // loses it on the identifier path, so a local or a global is read back from its owner.
+        const auto declaredPointeeConst = [&](const NamedVariable& arg) {
+            const auto spelledConst = [](const TypeAndValue& t) {
+                return t.IsCxxPointeeConst || t.IsSpelledPointeeConst;
+            };
+            if (spelledConst(arg.TypeAndValue)) return true;
+            if (!arg.CallerName.empty())
+                if (const NamedVariable* live = FindLiveNamedVariable(arg.CallerName))
+                    return spelledConst(live->TypeAndValue);
+            if (auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(arg.Storage))
+                for (const auto& [name, owner] : globalNamedVariable)
+                    if (owner == global)
+                        if (auto typed = globalVariableTypes.find(name);
+                            typed != globalVariableTypes.end())
+                            return spelledConst(typed->second);
+            return false;
+        };
         for (size_t i = 0; i < arguments.size(); ++i)
         {
             const NamedVariable& arg = arguments[i];
@@ -15633,6 +15870,30 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
                     callArgument = "static_cast<" + spelling + " &&>(" + callArgument + ")";
                     spelling += " &&";
                 }
+            }
+            else if ((arg.TypeAndValue.Pointer
+                      && (!arg.TypeAndValue.IsAlias || arg.TypeAndValue.IsCxxRefToPointer)
+                      && !arg.TypeAndValue.IsFunctionPointer
+                      && !IsCxxFixedArrayArgument(arg))
+                     || stringLiteral)
+            {
+                // Keep a pointer's caller slot or xvalue category across the ctor wrapper.
+                // A named argument's own TypeAndValue drops `const int *` (the identifier path
+                // keeps no pointee const), so its declared variable is the source of truth.
+                if (declaredPointeeConst(arg) && !spelling.starts_with("const "))
+                    spelling = "const " + spelling;
+                if (arg.TypeAndValue.IsCxxPointeeVolatile && !spelling.starts_with("volatile "))
+                    spelling = "volatile " + spelling;
+                const bool xvalue = stringLiteral || IsCxxRvalueReferenceArgument(arg);
+                if (arg.TypeAndValue.IsCxxRefToPointer && arg.TypeAndValue.IsCxxConstRef && !xvalue)
+                    spelling += " const";
+                if (xvalue)
+                {
+                    callArgument = "static_cast<" + spelling + " &&>(" + callArgument + ")";
+                    spelling += " &&";
+                }
+                else
+                    spelling += " &";
             }
             // A null pointer constant keeps its literal in the target call: a forwarded `int` is an
             // integral conversion to clang, so `(int*, double)` would lose to `(short, int)`.
@@ -22706,6 +22967,14 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             }
             CxxReferenceKind refKind = CxxReferenceKind::None;
             CxxSpellingWithoutRef(spelling, &refKind);
+            if (refKind == CxxReferenceKind::RefToPointer && tv.Pointer
+                && !tv.IsFunctionPointer)
+            {
+                if (tv.ElemPointer && !tv.IsCxxRefToPointer) tv.ElemPointer = false;
+                tv.IsCxxRefToPointer = true;
+                tv.IsAlias = true;
+                tv.IsCxxConstRef = CxxParamIsConstRefToPointer(spelling);
+            }
             if (refKind == CxxReferenceKind::Lvalue && tv.Pointer
                 && !tv.ElemPointer && !tv.IsFunctionPointer)
             {
@@ -27502,10 +27771,15 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                 bool sameOpaqueReferent = false;
                 const bool opaqueReferentMismatchForArgument = opaqueReferentMismatch(
                     c, i + 1, want, got, sameOpaqueReferent);
+                const bool samePointerReferenceReferent
+                    = (want.IsCxxRefToPointer || want.IsRvalueRef)
+                    && want.TypeName == got.TypeName && want.Pointer && got.Pointer
+                    && want.ElemPointer == got.ElemPointer;
                 const bool sameReferenceReferent = ((want.TypeName == got.TypeName
                     || sameForeignClass(want.TypeName, got.TypeName))
                     && ((want.ElemPointer && want.Pointer && got.Pointer)
                         || (!want.ElemPointer && !got.Pointer)))
+                    || samePointerReferenceReferent
                     || sameOpaqueReferent
                     || scalarRvalueReference(want, got, rvalue);
                 if (sameReferenceReferent
@@ -27531,8 +27805,9 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     ok = false;
                     break;
                 }
-                if (sameReferenceReferent && want.Pointer && want.IsAlias
-                    && !want.IsRvalueRef && !want.IsCxxConstRef && !want.IsCxxRefToPointer
+                if (sameReferenceReferent && want.Pointer
+                    && (want.IsAlias || want.IsCxxRefToPointer)
+                    && !want.IsRvalueRef && !want.IsCxxConstRef
                     && rvalue)
                 {
                     if (!blocked && !softRefused && !c.needsLocalDefinition && referenceRejection.empty())
@@ -28628,7 +28903,8 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
             const std::vector<NamedVariable> zeroVars = { arg };
             if (SelectCxxConstructor(param.TypeName, { intType }, intWhy,
                                      /*allowNumericConversions*/ true, &zeroVars,
-                                     /*allowExplicit*/ false) == nullptr
+                                     /*allowExplicit*/ false,
+                                     /*allowScalarNarrowing*/ true) == nullptr
                 && ClassifyCxxImplicitArgument(nullArg, param, /*cxxByValueParam*/ true)
                     == CxxArgConversion::Convertible)
                 arg = std::move(nullArg);
@@ -28688,8 +28964,11 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
                                                 /*allowNumericConversions*/ true, &argVars,
                                                 /*allowExplicit*/ false, allowScalarNarrowing);
         // A converting constructor TEMPLATE can outrank a listed non-identity pick.
+        bool nullPointerCandidate = false;
         const bool clangResolves = !slicesToBase
-            && CxxConstructorNeedsClangResolution(param.TypeName, ctor, { argType });
+            && CxxConstructorNeedsClangResolution(param.TypeName, ctor, { argType},
+                                                   &argVars, /*allowExplicit*/ false,
+                                                   &nullPointerCandidate);
         if (const std::string sink = CxxConstructorCopySinkError(ctor, argVars);
             !sink.empty())
             LogError(sink);
@@ -28733,7 +29012,8 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
                 || ((ctor == nullptr || clangResolves)
                     && (info->constructors.empty()
                         || (info->hasCtorTemplate && !IsCxxRecord(argType.TypeName))
-                        || CxxCtorForwardsScalarReference(param.TypeName, { argType }))))
+                        || CxxCtorForwardsScalarReference(param.TypeName, { argType })
+                        || nullPointerCandidate)))
             && RequestCxxVariadicConstructor(param.TypeName, { source }, wrapperName,
                                              wrapperError, /*copyInit*/ true);
         // Clang's pick, or the listed pick called directly, failed to instantiate its body.
@@ -28748,9 +29028,12 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
                 LogError(refusal);
                 return false;
             }
+        if (!wrapped && nullPointerCandidate && !wrapperError.empty())
+            LogError(wrapperError);
         // A scalar-reference overload set has no listed fallback: clang's refusal stands.
         if (!wrapped && (ctor == nullptr || ctor->params.size() < 2
-                         || CxxCtorForwardsScalarReference(param.TypeName, { argType })))
+                         || CxxCtorForwardsScalarReference(param.TypeName, { argType })
+                         || nullPointerCandidate))
             return false;
         if (wrapped)
         {

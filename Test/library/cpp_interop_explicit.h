@@ -3,12 +3,18 @@
 // it; the spelled form `cppexp.Ex(5)` stays legal. The non-explicit `Options(double)` shapes
 // below are the ACCEPT set: they must keep converting at every parameter kind C++ allows.
 #pragma once
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <type_traits>
 #include <vector>
 
 namespace cppexp {
+
+struct ExplicitListOnly {
+    int n;
+    explicit ExplicitListOnly(std::initializer_list<int> values) : n((int)values.size()) {}
+};
 
 struct Ex { int v; explicit Ex(int a) : v(a) {} };
 inline int take_ex(Ex e) { return e.v; }

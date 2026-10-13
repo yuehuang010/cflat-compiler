@@ -3538,6 +3538,28 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         } localEnumFunctionScope(compiler, fn->getName().str());
 
         compiler->InitializeBlock(&fn->front(), false);
+        NamedReturnElisionContext nrvoContext;
+        nrvoContext.function = fn;
+        const std::string nrvoName = ClassifyNamedLocalReturnCandidate(func);
+        if (!nrvoName.empty() && compiler->currentFunction == fn
+            && !returnType.Pointer && !returnType.IsAlias && !returnType.IsMove
+            && compiler->currentFunctionAbiRecipe.hasLowering
+            && compiler->currentFunctionAbiRecipe.retSlot.kind == LLVMBackend::AbiSlot::SRetReturn
+            && !compiler->IsCxxRecord(returnType.TypeName)
+            && compiler->IsDataStructure(returnType.TypeName)
+            && compiler->HasForeignNontrivialCxxField(returnType.TypeName)
+            && !compiler->IsForeignNontrivialCxxReturnClass(returnType.TypeName)
+            && compiler->ReturnsViaCxxSret(returnType.TypeName))
+        {
+            const unsigned sretIndex = compiler->SRetArgIndex(compiler->currentFunctionAbiRecipe);
+            if (compiler->currentFunction->arg_size() > sretIndex)
+            {
+                nrvoContext.variableName = nrvoName;
+                nrvoContext.sretStorage = compiler->currentFunction->getArg(sretIndex);
+                nrvoContext.functionScopeDepth = compiler->stackNamedVariable.size();
+            }
+        }
+        NamedReturnElisionScope nrvoScope(*this, std::move(nrvoContext));
         LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
         // exit so a nested lambda's return does not leak into the surrounding expression.
@@ -3857,6 +3879,12 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseDeclarationList(st
                     // Bare-brace field default (`Inner i { x = 1 };`): the list hangs on initDecl,
                     // not on an initializer, so record it or the spelling is silently dropped.
                     typeAndValue.BraceInitializer = initDecl->initializerList();
+                    if (initDecl->LeftBrace() != nullptr)
+                    {
+                        typeAndValue.BraceInitializerContext = initDecl;
+                        typeAndValue.HasEmptyBareBraceInitializer =
+                            initDecl->initializerList() == nullptr;
+                    }
                     typeAndValue.Annotations = annotations;
 
                     // Bitfield: `int flags : 3 = 0;` - the constantExpression after ':'
@@ -4386,6 +4414,12 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         if (declarationBraceList == nullptr && initializer != nullptr
             && initializer->LeftBrace() != nullptr)
             declarationBraceList = initializer->initializerList();
+        const bool emptyBraceDeclaration =
+            (initDeclarator->LeftBrace() != nullptr
+                && (declarationBraceList == nullptr || declarationBraceList->fieldInit().empty()))
+            || (initializer != nullptr && initializer->LeftBrace() != nullptr
+                && (initializer->initializerList() == nullptr
+                    || initializer->initializerList()->fieldInit().empty()));
         const bool hasNonemptyDeclarationBrace = declarationBraceList != nullptr
             && !declarationBraceList->fieldInit().empty();
         if (!hasCxxConstructors
@@ -4417,8 +4451,7 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         // as the rule token or as a single assignment-expression child.
         bool isDefaultForm = initializer != nullptr
             && (initializer->Default() != nullptr || initializer->getText() == "default");
-        if (declarationBraceList != nullptr && declarationBraceList->fieldInit().empty())
-            isDefaultForm = true;
+        if (emptyBraceDeclaration) isDefaultForm = true;
         auto* ctorArgs = assign != nullptr ? ForeignCxxConstructArgs(assign, typeName) : nullptr;
         auto* moveExpr = assign != nullptr ? TopLevelMoveExpression(assign) : nullptr;
 
@@ -4507,6 +4540,19 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         // Plan converting-constructors.md point 1: `T t = u;` is `T t = T(u);` - the converting
         // constructor builds straight into the slot. False leaves the caller's refusal.
         auto convertInto = [&](LLVMBackend::NamedVariable source) {
+            // This declaration path does not otherwise attach literal identity to the source.
+            if (source.LiteralIdentity.empty() && assign != nullptr)
+            {
+                bool suffixedLiteral = false;
+                const std::string identity = LLVMBackend::LiteralIdentityForOverload(
+                    assign->getText(), &suffixedLiteral);
+                if (!identity.empty())
+                {
+                    source.LiteralIdentity = identity;
+                    source.LiteralIdentitySuffixed = suffixedLiteral;
+                    source.LiteralSigned = LLVMBackend::LiteralTextHasSign(assign->getText());
+                }
+            }
             std::string refusal;
             compiler->SetCurrentDebugLocation(line);
             switch (compiler->ConvertThroughCxxConvertingCtor(source, typeName, slot, refusal,
@@ -4596,8 +4642,11 @@ cxx_dtor_ready:
                     elementNV.BaseType = elementValue->getType();
                     // A C++ class element keeps its storage: the thunk binds it by reference and
                     // clang copies (lvalue) or moves (rvalue, `move x`) it into the list.
-                    if (elementNV.TypeAndValue.Pointer
-                        || !compiler->IsCxxRecord(elementNV.TypeAndValue.TypeName))
+                    if (elementNV.TypeAndValue.Pointer)
+                    {
+                        elementNV.CxxImportedLiteral = compiler->CxxImportedConstantLiteral(elementNV);
+                    }
+                    else if (!compiler->IsCxxRecord(elementNV.TypeAndValue.TypeName))
                     {
                         elementNV.CxxImportedLiteral = compiler->CxxImportedConstantLiteral(elementNV);
                         elementNV.Storage = nullptr;
@@ -4658,10 +4707,45 @@ cxx_dtor_ready:
             const auto* ctor = compiler->FindCxxDefaultCtor(typeName);
             if (ctor == nullptr)
             {
+                if (emptyBraceDeclaration)
+                {
+                    std::vector<LLVMBackend::NamedVariable> braceElements;
+                    std::string wrapperName;
+                    std::string constructorError;
+                    const bool copyListInit = initializer != nullptr
+                        && initializer->LeftBrace() != nullptr;
+                    if (compiler->RequestCxxDirectBraceConstructor(
+                            typeName, braceElements, "{}", copyListInit,
+                            wrapperName, constructorError))
+                    {
+                        LLVMBackend::NamedVariable self;
+                        self.Primary = slot;
+                        self.BaseType = slot->getType();
+                        self.TypeAndValue.TypeName = typeName;
+                        self.TypeAndValue.Pointer = true;
+                        self.IsRvalue = true;
+                        std::vector<LLVMBackend::NamedVariable> wrapperArguments{ self };
+                        compiler->SetCurrentDebugLocation(line);
+                        compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
+                        return true;
+                    }
+                    if (constructorError.find(
+                            "chosen constructor is explicit in copy-initialization") != std::string::npos)
+                        LogErrorContext(direct, constructorError);
+                }
                 std::string ambiguityError;
                 if (compiler->CxxDefaultCtorAmbiguityError(typeName, ambiguityError))
                     LogErrorContext(direct, ambiguityError);
                 const auto* info = compiler->GetCxxClassInfo(typeName);
+                if (emptyBraceDeclaration && initializer != nullptr
+                    && initializer->LeftBrace() != nullptr
+                    && info != nullptr && !info->hasDefaultCtor)
+                {
+                    LogErrorContext(direct, compiler->LocalizeMessage(
+                        "the C++ class '{}' has no default constructor, so cflat cannot call it",
+                        { compiler->DisplayCxxClassName(typeName) }));
+                    return true;
+                }
                 LogErrorContext(direct, std::format(
                     "C++ class '{}' has no default constructor cflat can call{} - initialize it "
                     "with '{}(args)'", compiler->DisplayCxxClassName(typeName),
@@ -4767,6 +4851,8 @@ cxx_dtor_ready:
                 CxxCallArgumentScope cxxCtorArgumentScope(inCxxCallArgument_, true);
                 auto nv = ParseAssignmentExpressionNamed(argAssign);
                 NormalizeCxxRvalueReferenceArgument(argAssign, nv);
+                BindCxxCtorPointerSlotAddress(argAssign, nv, typeName, ctorArguments.size(),
+                                              ctorArgs->argumentNamedExpression().size());
                 compiler->LowerNonCapturingClosureForCxx(
                     nv, compiler->StdFunctionClosureSignature(typeName));
                 if (std::string refusal = compiler->CxxClosureArgumentRefusal(
@@ -4882,8 +4968,7 @@ cxx_dtor_ready:
             const auto* ctor = compiler->SelectCxxConstructor(typeName, argTypes, why, false,
                                                              &ctorArgumentAddresses);
             // A scalar-reference overload set is clang's to resolve: no listed refusal is final.
-            const bool scalarReferenceSet =
-                compiler->CxxCtorForwardsScalarReference(typeName, argTypes);
+            const bool scalarReferenceSet = compiler->CxxCtorForwardsScalarReference(typeName, argTypes);
             bool hardReferenceRejection = !scalarReferenceSet
                 && (why.starts_with("constructor '") || why.starts_with("no overload of '"));
             if (ctor == nullptr && !hardReferenceRejection)
@@ -4896,8 +4981,14 @@ cxx_dtor_ready:
             }
             // A constructor template can outrank the listed pick (or the listed refusal): let
             // clang resolve `T(args)` over every constructor, and keep the listed pick otherwise.
+            bool nullPointerCandidate = false;
             const bool clangResolves =
-                compiler->CxxConstructorNeedsClangResolution(typeName, ctor, argTypes);
+                compiler->CxxConstructorNeedsClangResolution(
+                    typeName, ctor, argTypes, &ctorArgumentAddresses, /*allowExplicit*/ true,
+                    &nullPointerCandidate);
+            const bool clangOnlyConstructorSet = scalarReferenceSet || nullPointerCandidate;
+            hardReferenceRejection = !clangOnlyConstructorSet
+                && (why.starts_with("constructor '") || why.starts_with("no overload of '"));
             if (const std::string sink =
                     compiler->CxxConstructorCopySinkError(ctor, ctorArguments);
                 !sink.empty())
@@ -4966,7 +5057,7 @@ cxx_dtor_ready:
                     LogErrorContext(direct, wrapperError);
                     return true;
                 }
-                if (ctor == nullptr || scalarReferenceSet)
+                if (ctor == nullptr || clangOnlyConstructorSet)
                 {
                     // The listed refusal names the parameter; clang's line stands otherwise.
                     if (!wrapperError.empty() && !why.starts_with("constructor '")) why = wrapperError;
@@ -4978,7 +5069,7 @@ cxx_dtor_ready:
             }
             // A scalar-reference set has no listed fallback: when every constructor narrows it is
             // refused like the `T(args)` and `new T(args)` forms.
-            if (ctor == nullptr || (narrowingRefused && scalarReferenceSet))
+            if (ctor == nullptr || (narrowingRefused && clangOnlyConstructorSet))
             {
                 if (why.empty()) why = compiler->CxxCtorNoMatchReason(argTypes);
                 LogErrorContext(direct, why.starts_with("no overload of '")
@@ -6091,6 +6182,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 }
                 if (explicitlyInitialized || field.Pointer
                     || FieldDefaultBraceList(field) != nullptr
+                    || FieldHasEmptyCxxBraceInitializer(field)
                     || (field.Initializer != nullptr
                         && field.Initializer->Default() == nullptr))
                     continue;
@@ -8738,7 +8830,40 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     if (compiler->stackNamedVariable.back().namedVariable.count(name))
                         LogErrorContext(direct, std::format(
                             "redeclaration of '{}' in the same scope; use a different name or assign to the existing variable", name));
-                    auto alloc = compiler->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr, arraySize, line, typeAndValue.UserAlignValue);
+                    bool nrvoLocal = false;
+                    llvm::Value* nrvoStorage = nullptr;
+                    auto& nrvo = namedReturnElision_;
+                    if (nrvo.function == compiler->currentFunction
+                        && !nrvo.variableName.empty() && nrvo.variableName == name)
+                    {
+                        auto* localType = compiler->GetType(typeAndValue);
+                        const auto& recipe = compiler->currentFunctionAbiRecipe;
+                        const uint64_t abiAlign = localType != nullptr && localType->isSized()
+                            ? compiler->module->getDataLayout().getABITypeAlign(localType).value() : 0;
+                        nrvoLocal = !global_scope && !isStaticLocal
+                            && compiler->stackNamedVariable.size() == nrvo.functionScopeDepth
+                            && !typeAndValue.Pointer && !typeAndValue.IsAlias && !typeAndValue.IsMove
+                            && typeAndValue.ConstArraySize == 0
+                            && typeAndValue.TypeName == compiler->currentFunctionReturnTypeName
+                            && compiler->IsDataStructure(typeAndValue.TypeName)
+                            && compiler->HasForeignNontrivialCxxField(typeAndValue.TypeName)
+                            && !compiler->IsForeignNontrivialCxxReturnClass(typeAndValue.TypeName)
+                            && recipe.hasLowering
+                            && recipe.retSlot.kind == LLVMBackend::AbiSlot::SRetReturn
+                            && recipe.retSlot.structTy == localType
+                            && nrvo.sretStorage != nullptr
+                            && (typeAndValue.UserAlignValue == 0
+                                || typeAndValue.UserAlignValue <= abiAlign);
+                        if (nrvoLocal)
+                            nrvoStorage = nrvo.sretStorage;
+                        else
+                            nrvo.variableName.clear();
+                    }
+                    auto alloc = compiler->CreateLocalVariable(typeAndValue,
+                        right ? right->getType() : nullptr, arraySize, line,
+                        typeAndValue.UserAlignValue, nrvoStorage);
+                    if (nrvoLocal)
+                        nrvo.localStorage = alloc;
                     const bool elideCxxReturn = srcCxxRetTemp != nullptr
                         && !typeAndValue.Pointer
                         && (srcInferredTypeName == typeAndValue.TypeName
@@ -8746,7 +8871,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         && compiler->ReturnsViaCxxSret(typeAndValue.TypeName);
                     if (elideCxxReturn)
                     {
-                        if (isStaticLocal && alloc != srcCxxRetTemp
+                        if (nrvoLocal && alloc != srcCxxRetTemp)
+                        {
+                            // The initializer's prvalue was first aimed at a temporary. Retarget
+                            // its constructor to the same sret storage the named local adopts.
+                            srcCxxRetTemp->replaceAllUsesWith(alloc);
+                        }
+                        else if (isStaticLocal && alloc != srcCxxRetTemp
                             && compiler->IsForeignNontrivialCxxClass(typeAndValue.TypeName))
                         {
                             // The initializer was lowered before auto's type was known, so its
@@ -9336,7 +9467,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 compiler->RejectImplicitIntegerPointeePointerConversion(
                                     initializerSourceNV.TypeAndValue, typeAndValue);
                             auto* initStore = (movedCxxReturn || loweredCopyInitInPlace)
-                                ? nullptr : compiler->CreateAssignment(right, alloc, srcIsUnsigned, nullptr,
+                                ? nullptr : compiler->CreateAssignment(right, alloc, srcIsUnsigned,
+                                    nrvoLocal ? compiler->GetType(typeAndValue) : nullptr,
                                     typeAndValue.IsUnsignedInteger() != -1);
                             if (movedOwningStruct)
                             {

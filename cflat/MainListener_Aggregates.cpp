@@ -159,6 +159,7 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
             && !field.IsAlias && !field.IsArrayView && field.ConstArraySize == 0
             && compiler->ReturnsViaCxxSret(field.TypeName)
             && (FieldDefaultBraceList(field) != nullptr || field.Initializer == nullptr
+                || FieldHasEmptyCxxBraceInitializer(field)
                 || FieldInitializerIsSingleCall(field.Initializer->assignmentExpression()));
         bool initializedArrayInPlace = false;
         if (armFieldSret)
@@ -170,7 +171,8 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
         }
         llvm::Value* rvalue = nullptr;
         bool fieldSrcUnsigned = false;
-        if (auto* braceList = FieldDefaultBraceList(field))
+        auto* braceList = FieldDefaultBraceList(field);
+        if (braceList != nullptr || FieldHasEmptyCxxBraceInitializer(field))
         {
             GlobalScopeGuard fieldInitScope(global_scope);
             rvalue = ParseFieldDefaultBraceInitializer(structName, field, braceList,
@@ -210,6 +212,7 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                 }
             }
             else if (field.Initializer == nullptr && FieldDefaultBraceList(field) == nullptr
+                && !FieldHasEmptyCxxBraceInitializer(field)
                 && !field.Pointer && fieldType != nullptr && fieldType->isStructTy()
                 && compiler->IsCxxRecord(field.TypeName)
                 && (compiler->CxxElementNeedsDefaultConstruction(field.TypeName)
@@ -1578,7 +1581,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     auto initializer = typeValue.Initializer;
                     llvm::Value* rvalue = nullptr;
                     bool fieldSrcUnsigned = false;
-                    if (auto* braceList = FieldDefaultBraceList(typeValue))
+                    auto* braceList = FieldDefaultBraceList(typeValue);
+                    if (braceList != nullptr || FieldHasEmptyCxxBraceInitializer(typeValue))
                     {
                         // Emitting a real function body; clear the stale file-scope global_scope
                         // so the brace list's stores and calls lower as ordinary instructions.
@@ -1911,6 +1915,7 @@ void MainListener::EmitUnionDefaultConstructorBody(
             auto& tv = declList[i];
             if (tv.TypeName == "auto" || tv.IsBitfieldStorage) continue;
             bool explicitInit = FieldDefaultBraceList(tv) != nullptr
+                || FieldHasEmptyCxxBraceInitializer(tv)
                 || (tv.Initializer != nullptr && tv.Initializer->assignmentExpression() != nullptr);
             if (!explicitInit) continue;
             if (sawExplicit)
@@ -1950,7 +1955,8 @@ void MainListener::EmitUnionDefaultConstructorBody(
             // Emitting a real function body; clear the stale file-scope global_scope so the
             // initializer's stores and calls lower as ordinary instructions.
             GlobalScopeGuard defaultCtorScope(global_scope);
-            if (auto* braceList = FieldDefaultBraceList(tv))
+            auto* braceList = FieldDefaultBraceList(tv);
+            if (braceList != nullptr || FieldHasEmptyCxxBraceInitializer(tv))
                 rvalue = ParseFieldDefaultBraceInitializer(structName, tv, braceList);
             else if (tv.Initializer != nullptr && tv.Initializer->assignmentExpression() != nullptr)
                 rvalue = ParseFieldDefaultInitializer(structName, tv,
@@ -3529,7 +3535,8 @@ void MainListener::ParseImportedProgramDefinition(const std::string& name) {
                 bool fieldSrcUnsigned = false;
                 auto* initializer = typeValue.Initializer;
                 // Unreachable today: this emitter's declList is entirely synthetic; wired for symmetry.
-                if (auto* braceList = FieldDefaultBraceList(typeValue))
+                auto* braceList = FieldDefaultBraceList(typeValue);
+                if (braceList != nullptr || FieldHasEmptyCxxBraceInitializer(typeValue))
                 {
                     // Emitting a real function body; clear the stale file-scope global_scope
                     // so the brace list's stores and calls lower as ordinary instructions.
@@ -5003,7 +5010,8 @@ void MainListener::EmitCppStructConstructorThunk(
             llvm::Value* value = nullptr;
             bool valueUnsigned = false;
             bool fromBraceList = false;
-            if (auto* brace = FieldDefaultBraceList(field))
+            auto* brace = FieldDefaultBraceList(field);
+            if (brace != nullptr || FieldHasEmptyCxxBraceInitializer(field))
             {
                 value = ParseFieldDefaultBraceInitializer(structName, field, brace);
                 fromBraceList = true;
@@ -5255,7 +5263,8 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                 bool fieldValSrcUnsigned = false;
                 bool fromBraceList = false;
                 bool fieldInitializedInPlace = false;
-                if (auto* braceList = FieldDefaultBraceList(field))
+                auto* braceList = FieldDefaultBraceList(field);
+                if (braceList != nullptr || FieldHasEmptyCxxBraceInitializer(field))
                 {
                     // Same brace-list field default the synthesized ctors honour; a user-written
                     // no-arg ctor must seed its fields identically before its own body runs.

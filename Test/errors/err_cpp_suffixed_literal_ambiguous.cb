@@ -1,5 +1,6 @@
 import cpp "cpp_interop_explicit.h";
 import cpp "cpp_t87_null_zero.h";
+import cpp "cpp_t132_s7_byval.hpp";
 
 // clang refuses each of these as ambiguous: a suffixed literal has one exact C++ type, and here
 // no overload takes it exactly (long long or long against int / unsigned long).
@@ -32,6 +33,37 @@ extern int main()
     expect_error("call to constructor of 't87::S6' is ambiguous") {
         t87.S6 s6 = t87.S6(0);
         return s6.v;
+    }
+    expect_error("call to constructor of 't132::S7' is ambiguous") {
+        t132.S7* s7New = new t132.S7(0);
+        return s7New.v;
+    }
+    expect_error("call to constructor of 't132::S7' is ambiguous") {
+        t132.S7 s7Init = t132.S7(0);
+        return s7Init.v;
+    }
+    expect_error("call to constructor of 't132::S7' is ambiguous") {
+        int s7Temp = t132.S7(0).v;
+        return s7Temp;
+    }
+    expect_error("is ambiguous") {
+        t132.S7 s7CopyInit = 0;
+        return s7CopyInit.v;
+    }
+    expect_error("is ambiguous") {
+        t132.SC scCopyInit = 0;
+        return scCopyInit.v;
+    }
+    expect_error("is ambiguous") {
+        return t132.takeS7(0);
+    }
+    expect_error("call to constructor of 't132::S8' is ambiguous") {
+        t132.S8* s8 = new t132.S8(0, 1.5);
+        return s8.v;
+    }
+    expect_error("call to constructor of 't132::SVoidBool' is ambiguous") {
+        t132.SVoidBool* voidBool = new t132.SVoidBool(0);
+        return voidBool.v;
     }
     expect_error("call to constructor of 'cppsfx::C5' is ambiguous") {
         return cppsfx.C5(1L).k;

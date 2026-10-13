@@ -1,5 +1,6 @@
 import cpp "cpp_interop_explicit.h";
 import cpp "cpp_interop_arrayelem.h";
+import cpp "cpp_t63_brace_decl.hpp";
 
 expect_error("C++ class 'cppa.NoDef' has no default constructor cflat can call (it is deleted)") {
     struct DeletedDefaultFieldHolder { cppa.NoDef d; int k = 0; };
@@ -21,6 +22,35 @@ expect_error("C++ class 'cppexp.PrivateDefault' has no default constructor cflat
     int makePrivateBrace() {
         cppexp.PrivateDefault value = {};
         return value.get();
+    }
+}
+
+expect_error("chosen constructor is explicit in copy-initialization") {
+    int makeExplicitEmptyCopyList() {
+        cppexp.ExplicitListOnly value = {};
+        return value.n;
+    }
+}
+
+expect_error("no default constructor") {
+    int emptyBraceNoListDirect() {
+        t63.TwoOnly value{};
+        return 0;
+    }
+}
+
+expect_error("no default constructor, so cflat cannot call it") {
+    int emptyBraceNoListCopy() {
+        t63.TwoOnly value = {};
+        return 0;
+    }
+}
+
+expect_error("C++ brace constructor call") {
+    struct EmptyBraceNoListField { t63.TwoOnly value = {}; };
+    int emptyBraceNoListField() {
+        EmptyBraceNoListField value;
+        return 0;
     }
 }
 

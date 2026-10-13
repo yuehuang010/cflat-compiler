@@ -7969,8 +7969,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
                                 // A constructor template can outrank the listed pick: clang
                                 // resolves `T(args)`, the listed pick stays the fallback.
+                                bool nullPointerCandidate = false;
                                 const bool clangResolves = compiler->CxxConstructorNeedsClangResolution(
-                                    functionName, ctor, ctorTypes);
+                                    functionName, ctor, ctorTypes, &arguments,
+                                    /*allowExplicit*/ true, &nullPointerCandidate);
+                                const bool clangOnlyConstructorSet = scalarReferenceSet
+                                    || nullPointerCandidate;
+                                hardReferenceRejection = !clangOnlyConstructorSet
+                                    && (why.starts_with("constructor '")
+                                        || why.starts_with("no overload of '"));
                                 if (const std::string sink =
                                         compiler->CxxConstructorCopySinkError(ctor, arguments);
                                     !sink.empty())
@@ -8005,7 +8012,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // does clang's pick of a body-refused constructor.
                                 const bool bodyRefused = wrapperError.starts_with("clang: ");
                                 if (wrapped || (ctor == nullptr && !hardReferenceRejection)
-                                    || scalarReferenceSet || bodyRefused)
+                                    || clangOnlyConstructorSet || bodyRefused)
                                 {
                                     // Some foreign class constructors are templates or inherited
                                     // variadics, so use the declaration initializer's wrapper path.

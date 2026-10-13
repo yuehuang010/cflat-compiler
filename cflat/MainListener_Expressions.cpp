@@ -46,15 +46,13 @@ static bool FieldInitializerIsSingleCall(CFlatParser::AssignmentExpressionContex
 }
 
 /*
- * The C++ identity of a built-in `a op b` result from its operands' declared CFlat names: the
- * usual arithmetic conversions ([expr.arith.conv]), so `long + 1` stays `long` and `ulong + i64`
- * is `unsigned long long`, though CFlat types all of them by width. Only for C++ deduction; an
- * unnamed operand defers to the named one, and the answer must lower to the result's own type.
+ * The type name of a built-in arithmetic result from its operand names, using the usual
+ * arithmetic conversions. `long + 1` stays `long` even when LLVM shares its type with `i64`.
  */
-static std::string CxxScalarArithmeticIdentity(LLVMBackend* compiler,
-                                                const std::string& left,
-                                                const std::string& right,
-                                                llvm::Type* resultType)
+static std::string ScalarArithmeticResultName(LLVMBackend* compiler,
+                                               const std::string& left,
+                                               const std::string& right,
+                                               llvm::Type* resultType)
 {
     struct Arith { int rank; bool isUnsigned; bool floating; };
     auto classify = [](const std::string& name, Arith& out) {
@@ -9072,25 +9070,28 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             result.sourceTypeName = result.sourceType.TypeName;
             result.hasSourceType = true;
         }
-        if (inCxxCallArgument_ && resultValue != nullptr
+        if (resultValue != nullptr
             && (resultValue->getType()->isIntegerTy()
                 || resultValue->getType()->isFloatingPointTy()))
         {
             auto sourceType = [&](const LLVMBackend::TypedValue& shape, llvm::Value* value,
                                   antlr4::ParserRuleContext* arm) {
-                const std::string literal = LLVMBackend::LiteralIdentityForOverload(arm->getText());
-                if (!literal.empty())
+                if (inCxxCallArgument_)
                 {
-                    LLVMBackend::TypeAndValue type;
-                    type.TypeName = literal;
-                    return type;
-                }
-                // Built-in arithmetic arm (`1e3 + 1` is double, `l + 1` is long).
-                if (!shape.cxxArithIdentity.empty())
-                {
-                    LLVMBackend::TypeAndValue type;
-                    type.TypeName = shape.cxxArithIdentity;
-                    return type;
+                    const std::string literal = LLVMBackend::LiteralIdentityForOverload(arm->getText());
+                    if (!literal.empty())
+                    {
+                        LLVMBackend::TypeAndValue type;
+                        type.TypeName = literal;
+                        return type;
+                    }
+                    // C++ arithmetic identity can differ from the CFlat operand type of a literal.
+                    if (!shape.cxxArithIdentity.empty())
+                    {
+                        LLVMBackend::TypeAndValue type;
+                        type.TypeName = shape.cxxArithIdentity;
+                        return type;
+                    }
                 }
                 if (shape.hasSourceType && !shape.sourceType.TypeName.empty()) return shape.sourceType;
                 if (!shape.sourceTypeName.empty())
@@ -12365,6 +12366,7 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
             llvm::Type* lhsRefType = nullptr;
             std::string lhsSourceTypeName = lv.sourceTypeName;
             std::string lhsArithIdentity = lv.cxxArithIdentity;
+            std::string lhsNativeArithmeticTypeName;
             std::string leftLiteralIdentity = CxxLiteralOperandIdentity(nextCtxs[0]);
             bool lu = lv.isUnsigned;
             llvm::Type* elemType = lv.elemType;
@@ -12395,6 +12397,10 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                 const std::string leftArith = lhsArithIdentity;
                 const std::string leftIdentity = !lhsArithIdentity.empty() ? lhsArithIdentity
                     : !leftLiteralIdentity.empty() ? leftLiteralIdentity : lhsSourceTypeName;
+                const std::string leftNativeIdentity = !lhsNativeArithmeticTypeName.empty()
+                    ? lhsNativeArithmeticTypeName
+                    : !lhsSourceTypeName.empty() ? lhsSourceTypeName
+                    : InferTernaryArmType(lv).TypeName;
                 leftLiteralIdentity.clear();
                 lhsArithIdentity.clear();
 
@@ -12423,6 +12429,7 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                     elemType = nullptr;
                     fixedArrayPointerArithmetic = false;
                     hasPointerArithmeticResultType = false;
+                    lhsNativeArithmeticTypeName.clear();
                 }
                 else if (elemType && lvalue->getType()->isPointerTy()
                     && rvalue && rvalue->getType()->isIntegerTy()
@@ -12446,6 +12453,7 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                     lhsStorage = nullptr;
                     lhsIsRvalue = true;
                     lhsRefType = nullptr;
+                    lhsNativeArithmeticTypeName.clear();
                     // A chained `1 + p + n` keeps the type the earlier step produced; only the
                     // first step on the original left operand reads lv.
                     const bool firstStepOnLeft = !hasPointerArithmeticResultType;
@@ -12482,6 +12490,7 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                     lhsStorage = nullptr;
                     lhsIsRvalue = true;
                     lhsRefType = nullptr;
+                    lhsNativeArithmeticTypeName.clear();
                     lhsSourceTypeName.clear();
                     elemType = rv.elemType;
                     hasPointerArithmeticResultType = true;
@@ -12564,9 +12573,12 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                         DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
                     }
                     if (overload != nullptr)
+                    {
+                        lhsNativeArithmeticTypeName.clear();
                         CarryCxxOperatorResult(ctx, overload, i + 1 < nextCtxs.size(), lvalue,
                                                lhsStorage, lhsIsRvalue, lhsRefType,
                                                lhsSourceTypeName);
+                    }
                     else
                     {
                         lvalue = Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
@@ -12574,12 +12586,17 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                         lhsIsRvalue = true;
                         lhsRefType = nullptr;
                         lhsSourceTypeName.clear();
+                        lhsNativeArithmeticTypeName = lvalue != nullptr
+                            ? ScalarArithmeticResultName(Compiler(ctx), leftNativeIdentity,
+                                InferTernaryArmType(rv).TypeName, lvalue->getType())
+                            : std::string();
+                        lhsSourceTypeName = lhsNativeArithmeticTypeName;
                         if (lvalue != nullptr)
                         {
                             std::string rightIdentity = rv.cxxArithIdentity;
                             if (rightIdentity.empty()) rightIdentity = CxxLiteralOperandIdentity(nextCtxs[i]);
                             if (rightIdentity.empty()) rightIdentity = rv.sourceTypeName;
-                            lhsArithIdentity = CxxScalarArithmeticIdentity(Compiler(ctx), leftIdentity,
+                            lhsArithIdentity = ScalarArithmeticResultName(Compiler(ctx), leftIdentity,
                                 rightIdentity, lvalue->getType());
                         }
                     }
@@ -12602,6 +12619,11 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
             result.storage = result.isAlias ? lhsStorage : nullptr;
             result.sourceTypeName = lhsSourceTypeName;
             result.cxxArithIdentity = lhsArithIdentity;
+            if (!lhsNativeArithmeticTypeName.empty())
+            {
+                result.sourceType.TypeName = lhsNativeArithmeticTypeName;
+                result.hasSourceType = true;
+            }
             if (hasPointerArithmeticResultType
                 && (pointerArithmeticSourceType.Pointer || fixedArrayPointerArithmetic
                     || !pointerArithmeticSourceType.TypeName.empty()
@@ -15317,6 +15339,7 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
             llvm::Type* lhsRefType = nullptr;
             std::string lhsSourceTypeName = firstNV.TypeAndValue.TypeName;
             std::string lhsArithIdentity = firstNV.CxxArithIdentity;
+            std::string lhsNativeArithmeticTypeName;
             std::string leftLiteralIdentity = CxxLiteralOperandIdentity(nextCtxs[0]);
             bool unsignedStorage = false;
 
@@ -15326,6 +15349,8 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
                 const std::string leftArith = lhsArithIdentity;
                 const std::string leftIdentity = !lhsArithIdentity.empty() ? lhsArithIdentity
                     : !leftLiteralIdentity.empty() ? leftLiteralIdentity : lhsSourceTypeName;
+                const std::string leftNativeIdentity = !lhsNativeArithmeticTypeName.empty()
+                    ? lhsNativeArithmeticTypeName : lhsSourceTypeName;
                 leftLiteralIdentity.clear();
                 lhsArithIdentity.clear();
                 auto rightNV = ParseCxxFoldOperand(Compiler(ctx), [&] {
@@ -15364,9 +15389,12 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
                     DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
                 }
                 if (overload != nullptr)
+                {
+                    lhsNativeArithmeticTypeName.clear();
                     CarryCxxOperatorResult(ctx, overload, i + 1 < nextCtxs.size(), lvalue,
                                            lhsStorage, lhsIsRvalue, lhsRefType,
                                            lhsSourceTypeName);
+                }
                 else
                 {
                     lvalue = Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
@@ -15374,12 +15402,17 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
                     lhsIsRvalue = true;
                     lhsRefType = nullptr;
                     lhsSourceTypeName.clear();
+                    lhsNativeArithmeticTypeName = lvalue != nullptr
+                        ? ScalarArithmeticResultName(Compiler(ctx), leftNativeIdentity,
+                            rightNV.TypeAndValue.TypeName, lvalue->getType())
+                        : std::string();
+                    lhsSourceTypeName = lhsNativeArithmeticTypeName;
                     if (lvalue != nullptr)
                     {
                         std::string rightIdentity = rightNV.CxxArithIdentity;
                         if (rightIdentity.empty()) rightIdentity = CxxLiteralOperandIdentity(nextCtxs[i]);
                         if (rightIdentity.empty()) rightIdentity = rightNV.TypeAndValue.TypeName;
-                        lhsArithIdentity = CxxScalarArithmeticIdentity(Compiler(ctx), leftIdentity,
+                        lhsArithIdentity = ScalarArithmeticResultName(Compiler(ctx), leftIdentity,
                             rightIdentity, lvalue->getType());
                     }
                 }
@@ -15398,6 +15431,11 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
             result.storage = result.isAlias ? lhsStorage : nullptr;
             result.sourceTypeName = lhsSourceTypeName;
             result.cxxArithIdentity = lhsArithIdentity;
+            if (!lhsNativeArithmeticTypeName.empty())
+            {
+                result.sourceType.TypeName = lhsNativeArithmeticTypeName;
+                result.hasSourceType = true;
+            }
             result.isUnsignedStorage = unsignedStorage;
             return result;
         }
@@ -19576,7 +19614,28 @@ CFlatParser::InitializerListContext* MainListener::FieldDefaultBraceList(
         if (field.Initializer != nullptr)
             return field.Initializer->initializerList();
         return field.BraceInitializer;
-    }
+}
+
+bool MainListener::FieldHasEmptyCxxBraceInitializer(
+        const LLVMBackend::DeclTypeAndValue& field) {
+        const bool emptyAssignmentBrace = field.Initializer != nullptr
+            && field.Initializer->LeftBrace() != nullptr
+            && field.Initializer->initializerList() == nullptr;
+        const bool emptyBareBrace = field.HasEmptyBareBraceInitializer;
+        const bool emptyBraceList = field.BraceInitializer != nullptr
+            && field.BraceInitializer->fieldInit().empty();
+        if ((!emptyAssignmentBrace && !emptyBareBrace && !emptyBraceList)
+            || field.Pointer || field.ElemPointer
+            || field.IsAlias || field.IsArrayView || field.ConstArraySize != 0
+            || !field.ConstInnerDimensions.empty())
+            return false;
+        auto* context = field.Initializer != nullptr
+            ? static_cast<antlr4::ParserRuleContext*>(field.Initializer)
+            : field.BraceInitializer != nullptr
+                ? static_cast<antlr4::ParserRuleContext*>(field.BraceInitializer)
+                : field.BraceInitializerContext;
+        return Compiler(context)->IsCxxRecord(field.TypeName);
+}
 
 bool MainListener::RejectNestedNamedBraceInitializer(
         CFlatParser::InitializerListContext* list, const std::string& message) {
@@ -19652,7 +19711,61 @@ llvm::Value* MainListener::ParseFieldDefaultBraceInitializer(
         const LLVMBackend::DeclTypeAndValue& field,
         CFlatParser::InitializerListContext* list,
         llvm::Value* inPlaceDest) {
-        auto* compiler = Compiler(list);
+        auto* braceContext = list != nullptr
+            ? static_cast<antlr4::ParserRuleContext*>(list)
+            : field.Initializer != nullptr
+                ? static_cast<antlr4::ParserRuleContext*>(field.Initializer)
+                : field.BraceInitializerContext;
+        if (braceContext == nullptr) return nullptr;
+        auto* compiler = Compiler(braceContext);
+        const bool emptyCxxBrace = compiler->IsCxxRecord(field.TypeName)
+            && !field.Pointer && !field.ElemPointer && !field.IsAlias && !field.IsArrayView
+            && field.ConstArraySize == 0 && field.ConstInnerDimensions.empty()
+            && ((list != nullptr && list->fieldInit().empty())
+                || (list == nullptr && FieldHasEmptyCxxBraceInitializer(field)));
+        if (emptyCxxBrace)
+        {
+            auto* fieldType = compiler->GetDataStructure(field.TypeName).StructType;
+            if (fieldType == nullptr) return nullptr;
+            const bool constructInPlace = inPlaceDest != nullptr
+                && compiler->pendingCxxSretDest_ == inPlaceDest
+                && compiler->pendingCxxSretTypeName_ == field.TypeName;
+            llvm::Value* slot = constructInPlace ? inPlaceDest : compiler->CreateAlloca(fieldType);
+            std::vector<LLVMBackend::NamedVariable> elements;
+            std::string wrapperName;
+            std::string constructorError;
+            const bool copyListInit = field.Initializer != nullptr
+                && field.Initializer->LeftBrace() != nullptr;
+            if (!compiler->RequestCxxDirectBraceConstructor(
+                    field.TypeName, elements, "{}", copyListInit,
+                    wrapperName, constructorError))
+            {
+                if (constructorError.empty())
+                    constructorError = std::format("C++ class '{}' has no constructor accepting an empty brace list",
+                        compiler->DisplayCxxClassName(field.TypeName));
+                LogErrorContext(braceContext, constructorError);
+                return nullptr;
+            }
+            LLVMBackend::NamedVariable self;
+            self.Primary = slot;
+            self.BaseType = slot->getType();
+            self.TypeAndValue.TypeName = field.TypeName;
+            self.TypeAndValue.Pointer = true;
+            self.IsRvalue = true;
+            std::vector<LLVMBackend::NamedVariable> wrapperArguments{ self };
+            compiler->SetCurrentDebugLocation(braceContext->getStart()->getLine());
+            compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
+            if (constructInPlace)
+            {
+                compiler->pendingCxxSretDest_ = nullptr;
+                compiler->pendingCxxSretTypeName_.clear();
+                compiler->pendingCxxSretReturn_ = false;
+                compiler->pendingCxxSretForFixedArray_ = false;
+                return nullptr;
+            }
+            return compiler->builder->CreateLoad(
+                fieldType, slot, structName + "_" + field.VariableName + "_braceinit");
+        }
         const std::string displayStructName = SpellType(*compiler,
             LLVMBackend::TypeAndValue{ .TypeName = structName });
         // A 'T[]' VIEW field: the local spelling infers backing storage a field cannot outlive,
@@ -22010,6 +22123,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     CxxCallArgumentScope cxxNewArgumentScope(inCxxCallArgument_, true);
                     auto nv = ParseAssignmentExpressionNamed(argAssign);
                     NormalizeCxxRvalueReferenceArgument(argAssign, nv);
+                    BindCxxCtorPointerSlotAddress(argAssign, nv, typeName, ctorArgVars.size(),
+                                                  argList->argumentNamedExpression().size());
                     const bool hadSourceTypeName = !nv.TypeAndValue.TypeName.empty();
                     // Same literal identity the call-argument builder records (integer -> enum refusal).
                     bool suffixedLiteral = false;
@@ -22065,12 +22180,15 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             // A constructor template can outrank the listed pick: clang resolves it then.
             std::string wrapperName;
             std::string wrapperError;
-            const bool scalarReferenceSet =
-                compiler->CxxCtorForwardsScalarReference(typeName, ctorArgTypes);
-            const bool hardReferenceRejection = !scalarReferenceSet
-                && (why.starts_with("constructor '") || why.starts_with("no overload of '"));
+            bool nullPointerCandidate = false;
             const bool clangResolves = compiler->CxxConstructorNeedsClangResolution(
-                typeName, ctor, ctorArgTypes);
+                typeName, ctor, ctorArgTypes, &ctorArgVars, /*allowExplicit*/ true,
+                &nullPointerCandidate);
+            const bool clangOnlyConstructorSet =
+                compiler->CxxCtorForwardsScalarReference(typeName, ctorArgTypes)
+                || nullPointerCandidate;
+            const bool hardReferenceRejection = !clangOnlyConstructorSet
+                && (why.starts_with("constructor '") || why.starts_with("no overload of '"));
             if (const std::string sink =
                     compiler->CxxConstructorCopySinkError(ctor, ctorArgVars);
                 !sink.empty())
@@ -22108,7 +22226,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             }
             // A scalar-reference overload set has no listed fallback: clang's refusal stands.
             if (!wrapped && (ctor == nullptr
-                             || scalarReferenceSet))
+                             || clangOnlyConstructorSet))
             {
                 if (!wrapperError.empty() && !why.starts_with("constructor '")) why = wrapperError;
                 // A scalar-reference set whose every constructor narrows has no listed refusal.
@@ -25018,6 +25136,62 @@ void MainListener::NormalizeCxxRvalueReferenceArgument(
         argument.IsRvalue = true;
         if (argument.Storage != nullptr)
             argument.BaseType = Compiler(ctx)->GetType(type);
+}
+
+/*
+ * CFlat spells "bind x by reference" as `&x` at a reference parameter. At a C++ constructor whose
+ * `T*&` / `T* const&` parameter takes this position, `&p` over a `T*` lvalue therefore binds p's
+ * slot: the argument becomes that lvalue (Storage = the computed address), not a `T**` prvalue.
+ */
+void MainListener::BindCxxCtorPointerSlotAddress(
+        antlr4::ParserRuleContext* ctx, LLVMBackend::NamedVariable& argument,
+        const std::string& typeName, size_t index, size_t count) {
+        auto& type = argument.TypeAndValue;
+        if (!type.IsProvenDoublePointer() || argument.Storage != nullptr
+            || argument.Primary == nullptr || !argument.Primary->getType()->isPointerTy())
+            return;
+        // Only a bare `&operand` (single-child chain down to the unary expression).
+        antlr4::tree::ParseTree* node = ctx;
+        CFlatParser::UnaryExpressionContext* unary = nullptr;
+        while (node != nullptr)
+        {
+            if (auto* u = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
+                u != nullptr && u->unaryOperator() != nullptr)
+            {
+                unary = u;
+                break;
+            }
+            if (node->children.size() != 1) return;
+            node = node->children[0];
+        }
+        if (unary == nullptr || unary->unaryOperator()->getText() != "&"
+            || unary->castExpression() == nullptr)
+            return;
+        auto* compiler = Compiler(ctx);
+        const auto* info = compiler->GetCxxClassInfoWithConstructors(typeName);
+        // A constructor template may take the `T**` as written (U&& = T**); leave the pick to clang.
+        if (info == nullptr || info->hasCtorTemplate) return;
+        bool wantsSlot = false;
+        for (const auto& c : info->constructors)
+        {
+            if (c.isDeleted || c.params.size() < count + 1 || index + 1 >= c.params.size())
+                continue;
+            const auto& want = c.params[index + 1];
+            if (!want.Pointer || want.IsFunctionPointer || want.IsRvalueRef) continue;
+            // A `T**` parameter (or `T**&`) takes the address as written.
+            if (want.IsProvenDoublePointer()) return;
+            if (want.IsCxxRefToPointer && want.TypeName == type.TypeName) wantsSlot = true;
+        }
+        if (!wantsSlot) return;
+        type.ElemPointer = false;
+        type.PointerDepth = 1;
+        argument.Storage = argument.Primary;
+        argument.Primary = nullptr;
+        argument.BaseType = compiler->GetType(type);
+        argument.IsRvalue = false;
+        const std::string operand = unary->castExpression()->getText();
+        if (argument.CallerName.empty() && compiler->FindLiveNamedVariable(operand) != nullptr)
+            argument.CallerName = operand;
 }
 
 void MainListener::RefuseCxxConstReferentWrite(antlr4::ParserRuleContext* ctx,

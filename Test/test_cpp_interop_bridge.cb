@@ -178,8 +178,8 @@ PlainListRelocHolder make_plain_list_reloc_holder()
     return result;
 }
 
-// A plain struct whose C++ fields are not trivially relocatable is built in place and returned
-// through sret: special-member counts match clang++ -std=c++20 (no NRVO for the named return).
+// A plain struct whose C++ fields are not trivially relocatable is returned through sret; its
+// named local is elided like clang++ -std=c++20.
 struct PlainTrackedRelocHolder
 {
     std.list<int> values = default;
@@ -6131,13 +6131,13 @@ extern int main(int argc, char** argv)
                      returned.values.front() * 10 + (int)returned.values.size()
                      + returned.tracked.value(), 56);
     }
-    bridge_check("plain tracked relocation sret counts", bridge_tracked_counts(), 1012);
+    bridge_check("plain tracked relocation sret counts", bridge_tracked_counts(), 1001);
     cppi.reset_counts();
     _ = make_plain_tracked_prvalue();
     bridge_check("plain tracked relocation discard counts", bridge_tracked_counts(), 1001);
     cppi.reset_counts();
     _ = make_plain_tracked_reloc_holder();
-    bridge_check("plain tracked relocation discard named counts", bridge_tracked_counts(), 1012);
+    bridge_check("plain tracked relocation discard named counts", bridge_tracked_counts(), 1001);
     cppi.reset_counts();
     g_plain_tracked_udtor = 0;
     _ = make_plain_tracked_user_dtor();
@@ -6204,7 +6204,7 @@ extern int main(int argc, char** argv)
         bridge_check("plain tracked relocation later value",
                      viaGlobal.v * 10 + viaIface.v + viaGlobal.tracked.value(), 60);
     }
-    bridge_check("plain tracked relocation later counts", bridge_tracked_counts(), 2024);
+    bridge_check("plain tracked relocation later counts", bridge_tracked_counts(), 2002);
     cppi.reset_counts();
     bridge_check("plain tracked relocation early call value", plain_later_early(3), 4);
     bridge_check("plain tracked relocation early call ctors", cppi.ctor_count(), 2);

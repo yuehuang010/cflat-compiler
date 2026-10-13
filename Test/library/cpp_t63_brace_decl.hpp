@@ -16,6 +16,17 @@ struct VecPick {
     VecPick(int n, int value) : first(n), second(value), which(2) {}
 };
 
+inline int emptyOnlyCtors = 0;
+inline int emptyOnlyDtors = 0;
+struct EmptyOnly {
+    int n;
+    EmptyOnly(std::initializer_list<int> values) : n((int)values.size()) { ++emptyOnlyCtors; }
+    ~EmptyOnly() { ++emptyOnlyDtors; }
+};
+inline void resetEmptyOnlyCounts() { emptyOnlyCtors = 0; emptyOnlyDtors = 0; }
+inline int emptyOnlyCtorCount() { return emptyOnlyCtors; }
+inline int emptyOnlyDtorCount() { return emptyOnlyDtors; }
+
 struct Aggregate {
     int first;
     int second;

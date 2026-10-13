@@ -916,6 +916,24 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 compiler->returnedStructDtorShellFunction = prevShell;
             };
             auto* structType = compiler->GetDataStructure(returnTypeName).StructType;
+            auto& nrvo = namedReturnElision_;
+            std::string returnedName = retText;
+            while (returnedName.size() >= 2 && returnedName.front() == '(' && returnedName.back() == ')')
+                returnedName = returnedName.substr(1, returnedName.size() - 2);
+            const bool nrvoReturn = !defaultValue && nrvo.function == compiler->currentFunction
+                && !nrvo.variableName.empty() && nrvo.variableName == returnedName
+                && nrvo.localStorage != nullptr && nrvo.localStorage == cxxSretDest
+                && returnNV.Storage == nrvo.localStorage
+                && returnNV.TypeAndValue.TypeName == returnTypeName
+                && !returnNV.TypeAndValue.Pointer;
+            if (nrvoReturn)
+            {
+                llvm::Value* previousSkip = compiler->returnedStructDtorSkipAlloca;
+                compiler->returnedStructDtorSkipAlloca = nrvo.localStorage;
+                finishLoweredReturn();
+                compiler->returnedStructDtorSkipAlloca = previousSkip;
+                return;
+            }
             if (namedLocal && structType != nullptr)
             {
                 compiler->SetCurrentDebugLocation(errCtx->getStart()->getLine());
