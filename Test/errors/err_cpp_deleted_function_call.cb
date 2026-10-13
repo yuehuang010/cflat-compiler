@@ -1,0 +1,142 @@
+import cpp "cpp_interop_deleted.h";
+
+extern int main()
+{
+expect_error("clang: attempt to use a deleted function") {
+    int value = rv.a.del(1);
+}
+
+expect_error("clang: call to deleted function 'free_best'") {
+    int value = cppdel.free_best(1);
+}
+
+expect_error("clang: attempt to use a deleted function") {
+    cppdel.Member value = default;
+    int result = value.call(1);
+}
+
+expect_error("clang: attempt to use a deleted function") {
+    int result = cppdel.Member.stat(1);
+}
+
+expect_error("clang: overload resolution selected deleted operator '+'") {
+    cppdel.FreeOp value = default;
+    int result = value + 1;
+}
+
+expect_error("clang: overload resolution selected deleted operator '+'") {
+    cppdel.MemberOp value = default;
+    cppdel.MemberOp result = value + 1;
+}
+
+expect_error("clang: static_cast from 'cppdel::Conversion' to 'int' uses deleted function") {
+    cppdel.Conversion value = default;
+    int result = (int)value;
+}
+
+expect_error("clang: overload resolution selected deleted operator '='") {
+    cppdel.Assignment lhs = default;
+    cppdel.Assignment rhs = default;
+    lhs = rhs;
+}
+
+expect_error("deleted function") {
+    function<int(int)> pointer = cppdel.free_deleted;
+}
+
+expect_error("clang: call to deleted member function 'call'") {
+    cppdel.MemberRank value = default;
+    int result = value.call(1);
+}
+
+expect_error("clang: call to deleted function 'stat'") {
+    int result = cppdel.MemberRank.stat(1);
+}
+
+expect_error("clang: overload resolution selected deleted operator '+'") {
+    cppdel.MemberOpRank value = default;
+    int result = value + 1;
+}
+
+expect_error("clang: call to deleted function 'templ'") {
+    int result = cppdel.templ(1);
+}
+
+
+expect_error("clang: call to deleted member function 'f'") {
+    cppdel.RvalueSibling sibling = default;
+    cppdel.RvalueArg arg = default;
+    int result = sibling.f(move arg);
+}
+
+expect_error("clang: call to deleted member function 'h'") {
+    cppdel.RvalueSibling sibling = default;
+    cppdel.RvalueArg arg = default;
+    int result = sibling.h(move arg);
+}
+
+// T122: both cv-qualified candidates remain in overload resolution.
+expect_error("clang: call to member function 'f' is ambiguous") {
+    cppdel.VolRecvC value = default;
+    int result = value.f();
+}
+
+expect_error("clang: call to member function 'f' is ambiguous") {
+    cppdel.VolRecvC value = default;
+    int result = cppdel.t122_plain_ptr_VolRecvC(&value).f();
+}
+
+expect_error("clang: call to member function 'f' is ambiguous") {
+    cppdel.VolRecvC value = default;
+    int result = cppdel.t122_plain_ref_VolRecvC(value).f();
+}
+
+expect_error("clang: call to member function 'f' is ambiguous") {
+    int result = cppdel.VolRecvC().f();
+}
+
+expect_error("clang: call to member function 'f' is ambiguous") {
+    cppdel.VolRecvCDeleted value = default;
+    int result = value.f();
+}
+
+expect_error("clang: call to member function 'f' is ambiguous") {
+    cppdel.VolRecvCDeleted value = default;
+    int result = cppdel.t122_plain_ptr_VolRecvCDeleted(&value).f();
+}
+
+expect_error("clang: call to member function 'f' is ambiguous") {
+    cppdel.VolRecvCDeleted value = default;
+    int result = cppdel.t122_plain_ref_VolRecvCDeleted(value).f();
+}
+
+expect_error("clang: call to member function 'f' is ambiguous") {
+    int result = cppdel.VolRecvCDeleted().f();
+}
+
+expect_error("clang: call to deleted member function 'f'") {
+    cppdel.VolRecvBDeleted value = default;
+    int result = cppdel.t122_volatile_object_VolRecvBDeleted(value).f();
+}
+
+expect_error("clang: call to deleted member function 'f'") {
+    cppdel.VolRecvBDeleted value = default;
+    int result = cppdel.t122_volatile_ptr_VolRecvBDeleted(&value).f();
+}
+
+expect_error("clang: call to deleted member function 'f'") {
+    cppdel.VolRecvBDeleted value = default;
+    int result = cppdel.t122_volatile_ref_VolRecvBDeleted(value).f();
+}
+
+expect_error("clang: call to deleted member function 'f'") {
+    cppdel.VolRecvADeleted value = default;
+    const cppdel.VolRecvADeleted cvalue = default;
+    int result = cvalue.f();
+}
+
+expect_error("clang: call to deleted member function 'f'") {
+    int result = cppdel.VolRecvEDeleted().f();
+}
+return 0;
+}

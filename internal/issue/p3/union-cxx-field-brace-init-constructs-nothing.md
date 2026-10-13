@@ -1,0 +1,11 @@
+# Union holding a C++ class field: brace init `{ m = x }` constructs nothing
+
+Summary: `U u = { m = x };` where m is a C++ class member of a CFlat union runs no constructor
+(count 0); clang++ -std=c++20 copy-constructs m from x. The member is then used unconstructed.
+
+Found: T117 review 1 (2026-10-11), pre-existing on master. Probe header: T117 worktree
+scratch/rev_t117_rv.h.
+
+Fix direction: decide whether unions may hold non-trivial C++ classes at all (C++ requires the
+user to manage the active member; a refusal may be the CFlat-correct answer) - needs a ruling; if
+allowed, the named member of a union brace init must be constructed in place.

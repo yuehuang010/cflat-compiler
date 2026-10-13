@@ -145,4 +145,88 @@ inline int operator+(const Tally& t, Pick p) { return t.v + (int)p * 10; }
 // Only a `char**` overload: a `char*` row must be refused, as clang does.
 struct Deep { int v = 0; };
 inline int operator-(const Deep& d, char** pp) { return d.v - (int)(*pp)[0]; }
+// T122: the JSON-shaped subscript - string and integer operator[] overloads, each with a
+// const twin. A literal key must reach the std::string leg through the subscript path.
+struct TinyIndex {
+    int operator[](std::string key) { return (int)key.size() + 10; }
+    int operator[](const std::string& key) const { return (int)key.size() + 20; }
+    int operator[](unsigned long index) { return (int)index + 30; }
+    int operator[](unsigned long index) const { return (int)index + 40; }
+};
+struct TinyStaticTwin {
+    static int s(int value) { return value; }
+    int s() { return 1; }
+    int s() const { return 2; }
+};
+struct TinyConversionTwin {
+    operator int() { return 1; }
+    operator int() const { return 2; }
+};
+struct TinyConstVolatileLRef {
+    int f() const volatile & { return 601; }
+};
+// T122 r4: the valarray subscript shape - integer twins plus by-value and const-ref class-index
+// twins whose index class (a std template instantiation) is not registered before the first call.
+struct TinyProxy { int first; int n; };
+struct TinySliced {
+    int d[4] = {0, 1, 2, 3};
+    const int& operator[](unsigned long i) const { return d[i]; }
+    int& operator[](unsigned long i) { return d[i]; }
+    int operator[](std::u16string_view s) const { return (int)s.size() + 100; }
+    TinyProxy operator[](std::u16string_view s) { TinyProxy p; p.first = d[s.size()]; p.n = 200; return p; }
+    int operator[](const std::u32string_view& m) const { return (int)m.size() + 300; }
+    TinyProxy operator[](const std::u32string_view& m) { TinyProxy p; p.first = d[m.size() + 1]; p.n = 400; return p; }
+};
+
+// T127: the MSVC _Vector_iterator shape - the derived iterator re-exposes the base's const
+// operator- overload set with a using-declaration and declares its own operator-(int) const.
+struct TinyConstIter {
+    int* p;
+    int operator*() const { return *p; }
+    TinyConstIter operator-(int n) const { TinyConstIter r; r.p = p - n; return r; }
+    int operator-(const TinyConstIter& o) const { return (int)(p - o.p); }
+};
+struct TinyIter : TinyConstIter {
+    using TinyConstIter::operator-;
+    TinyIter operator-(int n) const { TinyIter r; r.p = p - n; return r; }
+};
+// T127 r2: ref-qualified base operator- twins re-exposed by a using-declaration; a derived
+// argument needs the derived-to-base conversion, so the call binds through a wrapper.
+struct TinyRefBase {
+    int* p;
+    TinyRefBase operator-(int n) const { return *this; }
+    int operator-(const TinyRefBase& o) & { return 77; }
+    int operator-(const TinyRefBase& o) && { return 78; }
+};
+struct TinyRefIter : TinyRefBase {
+    using TinyRefBase::operator-;
+    TinyRefIter operator-(int n) const { return *this; }
+};
+inline TinyRefIter tinyRefIter() { return TinyRefIter(); }
+struct TinyCRefBase {
+    int* p;
+    TinyCRefBase operator-(int n) const { return *this; }
+    int operator-(const TinyCRefBase& o) const & { return 73; }
+    int operator-(const TinyCRefBase& o) && { return 74; }
+};
+struct TinyCRefIter : TinyCRefBase {
+    using TinyCRefBase::operator-;
+    TinyCRefIter operator-(int n) const { return *this; }
+};
+inline TinyCRefIter tinyCRefIter() { return TinyCRefIter(); }
+// T127 r3: ref-qualified compound assignment twins; the chosen member records itself.
+inline int tinyRefCompoundLast = 0;
+struct TinyRefCompound {
+    int v;
+    void operator-=(int) & { tinyRefCompoundLast = 3; }
+    void operator-=(int) && { tinyRefCompoundLast = 4; }
+    void operator+=(int) & { tinyRefCompoundLast = 5; }
+    void operator+=(int) && { tinyRefCompoundLast = 6; }
+};
+inline TinyRefCompound tinyRefCompound() { return TinyRefCompound(); }
+struct TinyIterVec {
+    int d[5] = {1, 2, 3, 4, 5};
+    TinyIter begin() { TinyIter r; r.p = d; return r; }
+    TinyIter end() { TinyIter r; r.p = d + 5; return r; }
+};
 }

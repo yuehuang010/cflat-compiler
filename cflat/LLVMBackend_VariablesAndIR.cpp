@@ -727,6 +727,33 @@ int LLVMBackend::CxxConstReceiverKind(const NamedVariable& receiver) const
         return 0;
 }
 
+int LLVMBackend::CxxReceiverCv(const NamedVariable& receiver) const
+{
+        int cv = CxxConstReceiverKind(receiver) != 0 ? 1 : 0;
+        if (receiver.TypeAndValue.IsCxxPointeeVolatile
+            && !receiver.TypeAndValue.IsFunctionPointer)
+            cv |= 2;
+        return cv;
+}
+
+bool LLVMBackend::IsCxxObjectRvalue(const NamedVariable& receiver) const
+{
+        if (receiver.FieldPathThroughPointer || receiver.CxxLvalueReceiver) return false;
+        if (receiver.TypeAndValue.Pointer && !receiver.TypeAndValue.IsFunctionPointer
+            && !receiver.TypeAndValue.IsRvalueRef
+            && IsCxxRecord(receiver.TypeAndValue.TypeName))
+        {
+            // A C++ record value return can keep pointer-shaped storage when its ABI type is
+            // imported lazily; an unnamed non-reference result still denotes a temporary.
+            if (receiver.CallerName.empty() && receiver.Storage == nullptr
+                && !receiver.TypeAndValue.IsAlias
+                && !receiver.TypeAndValue.IsCxxRefToPointer)
+                return true;
+            return false;
+        }
+        return IsCxxRvalueReferenceArgument(receiver);
+}
+
 unsigned LLVMBackend::CxxFieldElementIndex(const StructData& data, unsigned index) const
 {
         if (!data.CxxOffsetLayout || index >= data.CxxFieldElements.size()) return index;
@@ -1124,6 +1151,8 @@ llvm::Value* LLVMBackend::CreateCast(llvm::Value* value, llvm::Type* destType, b
         // Return the value unchanged rather than letting LLVM assert.
         if (srcType->isStructTy() && destType->isPointerTy())
         {
+            if (auto* converted = ConvertAggregateViaImplicitConversionOperator(value, destType))
+                return converted;
             LogError("cannot assign a struct value to a pointer variable - use getPtr() or take the address with '&'");
             return value;
         }

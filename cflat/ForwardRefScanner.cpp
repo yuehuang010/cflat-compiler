@@ -192,7 +192,10 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         // For bare 'function', signature inferred from initializer at declaration site
                         // This branch breaks out of the specifier loop, so nothing else consumes a
                         // trailing '[N]' or '*'; capture both here (as the alias branch below does).
-                        declType.Pointer = declSpecWithSuffix->pointer() != nullptr;
+                        const int functionPtrDepth = PointerDepthOf(declSpecWithSuffix->pointer());
+                        declType.Pointer = functionPtrDepth > 0;
+                        declType.ElemPointer = functionPtrDepth >= 2;
+                        declType.PointerDepth = functionPtrDepth;
                         if (auto* fpDimSpec = ArrayDimsOf(declSpecWithSuffix))
                         {
                             auto fpDims = fpDimSpec->assignmentExpression();
@@ -309,7 +312,10 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     declType.FuncPtrReturnAlias = fit->FuncPtrReturnAlias;
                     declType.FuncPtrReturnPointerDepth = fit->FuncPtrReturnPointerDepth;
                     declType.FuncPtrParams         = fit->FuncPtrParams;
-                    declType.Pointer               = declSpecWithSuffix->pointer() != nullptr;
+                    const int functionPtrDepth = PointerDepthOf(declSpecWithSuffix->pointer());
+                    declType.Pointer               = functionPtrDepth > 0;
+                    declType.ElemPointer            = functionPtrDepth >= 2;
+                    declType.PointerDepth           = functionPtrDepth;
                     // Like the functionPointerSpecifier branch, this one breaks out of the
                     // specifier loop, so a trailing '[N]' has to be captured right here.
                     if (auto* fpDimSpec = ArrayDimsOf(declSpecWithSuffix))
@@ -1058,6 +1064,44 @@ void ForwardRefScanner::SeedConstIntGlobals(CFlatParser::TranslationUnitContext*
     }
 }
 
+void ForwardRefScanner::SeedConstFloatingGlobals(CFlatParser::TranslationUnitContext* tu)
+{
+    if (tu == nullptr || compilerLLVM == nullptr) return;
+
+    for (auto* ext : tu->externalDeclaration())
+    {
+        auto* decl = ext != nullptr ? ext->declaration() : nullptr;
+        auto* specs = decl != nullptr ? decl->declarationSpecifiers() : nullptr;
+        auto* list = decl != nullptr ? decl->initDeclaratorList() : nullptr;
+        if (specs == nullptr || list == nullptr) continue;
+        bool isConst = false;
+        bool hasPointer = false;
+        std::string typeName;
+        for (auto* spec : specs->declarationSpecifier())
+        {
+            if (spec->typeQualifier() != nullptr && spec->typeQualifier()->getText() == "const")
+                isConst = true;
+            if (auto* type = spec->typeSpecifier())
+            {
+                if (typeName.empty()) typeName = compilerLLVM->ResolveTypeAlias(type->getText());
+                hasPointer = hasPointer || spec->pointer() != nullptr || spec->arrayTypeSuffix() != nullptr;
+            }
+        }
+        LLVMBackend::TypeAndValue tv{ .TypeName = typeName };
+        if (!isConst || hasPointer || typeName.empty() || tv.IsFloatingPoint() < 0) continue;
+        for (auto* init : list->initDeclarator())
+        {
+            auto* direct = init->declarator() != nullptr ? init->declarator()->directDeclarator() : nullptr;
+            if (direct == nullptr || direct->assignmentExpression() != nullptr) continue;
+            std::string name = getDirectDeclName(direct);
+            if (name.empty() || compilerLLVM->IsReservedMacroName(name)
+                || compilerLLVM->GetCompileTimeMacro(name).value != nullptr)
+                continue;
+            compilerLLVM->SetConstGlobalFP(name);
+        }
+    }
+}
+
 void ForwardRefScanner::ValidateIsolatedIntegralPointerCasts(antlr4::tree::ParseTree* tree)
 {
     if (!compilerLLVM->IsIsolated() || compilerLLVM->currentSourceIsCore_
@@ -1216,8 +1260,26 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
             resolved = typeSpec != nullptr && typeSpec->memberTypeSpecifier() != nullptr
                 ? ResolveMemberTypeSpecifier(typeSpec->memberTypeSpecifier())
                 : Compiler(entry)->ResolveTypeArgBaseName(CanonicalTemplateTypeArgument(entry));
+            bool substituted = false;
             if (auto subst = scanTypeSubstitutions_.find(resolved); subst != scanTypeSubstitutions_.end())
+            {
                 resolved = subst->second;
+                substituted = true;
+            }
+            // Namespace enums are collected before this scan but their backing types are not
+            // registered until ScanExternalDeclaration. Local enum arguments are deferred.
+            if (!substituted)
+            {
+                if (std::string enumKey = Compiler(entry)->ResolveEnumTypeName(resolved);
+                    !enumKey.empty())
+                    resolved = std::move(enumKey);
+                else if (std::string scannedEnum = Compiler(entry)->FirstVisibleScopedKey(
+                             resolved, [compiler = Compiler(entry)](const std::string& candidate) {
+                                 return compiler->gts.scannedNonLocalEnumNames.count(candidate) != 0;
+                             }, ScopedLookupOptions{ .ResolveFirstComponentAlias = false });
+                         !scannedEnum.empty())
+                    resolved = std::move(scannedEnum);
+            }
             if (entry->pointer() == nullptr && entry->arrayTypeSuffix() == nullptr
                 && entry->Identifier() == nullptr && typeSpec != nullptr
                 && ((typeSpec->genericIdentifier() != nullptr
@@ -1502,7 +1564,23 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
             case CFlatParser::RuleEnumSpecifier:
             {
                 auto* es = static_cast<CFlatParser::EnumSpecifierContext*>(ruleCtx);
-                if (es->Identifier() != nullptr) recordEnumName(es->Identifier()->getText());
+                if (es->Identifier() != nullptr)
+                {
+                    recordEnumName(es->Identifier()->getText());
+                    if (certain && !unkeyable)
+                    {
+                        bool insideFunction = false;
+                        for (auto* parent = ruleCtx->parent; parent != nullptr; parent = parent->parent)
+                            if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent) != nullptr)
+                            {
+                                insideFunction = true;
+                                break;
+                            }
+                        if (!insideFunction)
+                            compiler->gts.scannedNonLocalEnumNames.insert(
+                                QualifyName(QualifyName(ns, typePath), es->Identifier()->getText()));
+                    }
+                }
                 continue;
             }
             case CFlatParser::RuleStructDefinition:
@@ -1688,7 +1766,8 @@ void ForwardRefScanner::PreRegisterCppStructNames(antlr4::RuleContext* ctx)
             for (auto* ext : tu->externalDeclaration()) visitExternal(ext, {});
 }
 
-void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx) {
+void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx,
+                                            const std::unordered_set<std::string>* localEnumNames) {
         for (auto* child : ctx->children)
         {
             auto* ruleCtx = dynamic_cast<antlr4::RuleContext*>(child);
@@ -1701,6 +1780,11 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx) {
                 // opaque shell here would suppress the `unknown type` diagnostic the use is owed.
                 if (!compiler->AnyGenericTypeTemplateNamed(spelledBase))
                     return;
+                if (GenericArgumentsNeedFunctionLocalEnumDeferral(
+                        genericParams, localEnumNames, compiler,
+                        &compiler->gts.scannedNonLocalEnumNames,
+                        &compiler->gts.scannedTypeNames))
+                    return;  // The main walk queues this after the local enum declaration registers.
                 // Name the shell after the registered KEY, not the spelling: a bare use inside a
                 // namespace would otherwise leave an opaque 'Box$int' that 'NS.Box$int' never completes.
                 std::string baseName = compiler->ResolveGenericTemplateBase(spelledBase);
@@ -1732,7 +1816,7 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx) {
                 auto* nsCtx = static_cast<CFlatParser::NamespaceDefinitionContext*>(ruleCtx);
                 LLVMBackend::NamespaceScope nsScope(
                     compilerLLVM, NestedNamespaceName(compilerLLVM->GetCurrentNamespace(), nsCtx));
-                ScanGenericTypeUses(ruleCtx);
+                ScanGenericTypeUses(ruleCtx, localEnumNames);
                 continue;
             }
             case CFlatParser::RuleStructDefinition:
@@ -1747,18 +1831,20 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx) {
             case CFlatParser::RuleFunctionDefinition:
             {
                 // Skip generic function template definitions for the same reason.
-                if (static_cast<CFlatParser::FunctionDefinitionContext*>(ruleCtx)->genericTypeParameters() != nullptr)
+                auto* function = static_cast<CFlatParser::FunctionDefinitionContext*>(ruleCtx);
+                if (function->genericTypeParameters() != nullptr)
                     continue;
                 // One alias frame per body, matching the main pass (ParseFunctionDefinition), so a
                 // body-scope `using` names the same instance in both passes and dies with the body.
+                const auto localEnums = CollectFunctionLocalEnumNames(function);
                 LLVMBackend::AliasScopeGuard bodyAliasScope(compilerLLVM);
-                ScanGenericTypeUses(ruleCtx);
+                ScanGenericTypeUses(ruleCtx, &localEnums);
                 continue;
             }
             case CFlatParser::RuleProgramDefinition:
             {
                 LLVMBackend::AliasScopeGuard bodyAliasScope(compilerLLVM);
-                ScanGenericTypeUses(ruleCtx);
+                ScanGenericTypeUses(ruleCtx, localEnumNames);
                 continue;
             }
             case CFlatParser::RuleIfConstDeclaration:
@@ -1767,7 +1853,7 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx) {
                 // Declaration/member `if const`: same reason as the statement form - an alias an
                 // arm declares is confined to a frame of its own and never reaches the file map.
                 LLVMBackend::AliasScopeGuard armAliasScope(compilerLLVM);
-                ScanGenericTypeUses(ruleCtx);
+                ScanGenericTypeUses(ruleCtx, localEnumNames);
                 continue;
             }
             case CFlatParser::RuleSelectionStatement:
@@ -1783,7 +1869,7 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx) {
                         // Undecidable at scan time: no arm's alias may bind, so every arm scans in
                         // a frame of its own - the main pass stays the only one that decides.
                         LLVMBackend::AliasScopeGuard armAliasScope(compilerLLVM);
-                        ScanGenericTypeUses(ruleCtx);
+                        ScanGenericTypeUses(ruleCtx, localEnumNames);
                         continue;
                     }
                     auto arms = sel->statement();
@@ -1791,13 +1877,13 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx) {
                                                 : (arms.size() > 1 ? arms[1] : nullptr);
                     auto* dead = decision != 0 ? (arms.size() > 1 ? arms[1] : nullptr)
                                                : (arms.empty() ? nullptr : arms[0]);
-                    ScanGenericTypeUses(sel->expression());
+                    ScanGenericTypeUses(sel->expression(), localEnumNames);
                     if (dead != nullptr)
                     {
                         LLVMBackend::AliasScopeGuard deadArmAliasScope(compilerLLVM);
-                        ScanGenericTypeUses(dead);
+                        ScanGenericTypeUses(dead, localEnumNames);
                     }
-                    if (taken != nullptr) ScanGenericTypeUses(taken);
+                    if (taken != nullptr) ScanGenericTypeUses(taken, localEnumNames);
                     continue;
                 }
                 break;
@@ -1805,7 +1891,16 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx) {
             case CFlatParser::RuleUsingDeclaration:
                 // Position-dependent, like the main pass: only a `using` already met binds a name.
                 // At file scope PreRegisterRenameAliases has registered it order-independently.
-                RegisterRenameAlias(static_cast<CFlatParser::UsingDeclarationContext*>(ruleCtx));
+                {
+                    auto* usingDecl = static_cast<CFlatParser::UsingDeclarationContext*>(ruleCtx);
+                    std::string usingBase;
+                    auto* usingParams = GenericSpecOf(usingDecl->typeSpecifier(), usingBase);
+                    if (!GenericArgumentsNeedFunctionLocalEnumDeferral(
+                            usingParams, localEnumNames, Compiler(usingDecl),
+                            &Compiler(usingDecl)->gts.scannedNonLocalEnumNames,
+                            &Compiler(usingDecl)->gts.scannedTypeNames))
+                        RegisterRenameAlias(usingDecl);
+                }
                 break;
             case CFlatParser::RuleTypeSpecifier:
                 {
@@ -1823,8 +1918,13 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx) {
                     if (auto* memberType = typeSpec->memberTypeSpecifier())
                     {
                         const std::string ownerText = memberType->memberTypeOwner()->getText();
+                        auto* ownerParams = memberType->memberTypeOwner()->genericTypeParameters();
                         if (Compiler(typeSpec)->AnyGenericTypeTemplateNamed(ownerText.substr(0, ownerText.find('<'))))
-                            ResolveMemberTypeSpecifier(memberType);
+                            if (!GenericArgumentsNeedFunctionLocalEnumDeferral(
+                                    ownerParams, localEnumNames, Compiler(typeSpec),
+                                    &Compiler(typeSpec)->gts.scannedNonLocalEnumNames,
+                                    &Compiler(typeSpec)->gts.scannedTypeNames))
+                                ResolveMemberTypeSpecifier(memberType);
                     }
 
                     // Tuple type sugar: (T1, T2) -> pre-declare tuple__T1__T2
@@ -1872,7 +1972,7 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx) {
                 }
             }
 
-            ScanGenericTypeUses(ruleCtx);
+            ScanGenericTypeUses(ruleCtx, localEnumNames);
         }
     }
 

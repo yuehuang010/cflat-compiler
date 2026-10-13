@@ -17,3 +17,13 @@ See `scratch/b15_matrix.md` and the probe corpus in `scratch/b15_matrix/` for me
 T105 review 1 (pre-existing, reproduce on master and af5afa448):
 - Inherited `operator W()` (struct PD : PB, PB declares it): `W w = pd` is refused; clang gives value 37, one operator call, one ctor, no copy. `HasImplicitClassConversionOperator` (LLVMBackend_CInterop.cpp ~28360) scans only the class's own members. Repro scratch/repro_keep/t105/c_w_inh.cb.
 - Explicit `(W)p` makes one extra copy + dtor (37 1 1 1 0 1 vs clang 37 1 1 0 0 0); earlier "explicit-cast support is not a remaining fix" checked value and op count only. Repro scratch/repro_keep/t105/c_w_cast.cb.
+
+T122 review 2 (2026-10-11, pre-existing on master; class V with `operator int(); operator int() const;`):
+- `(int)(true ? rv.cr(o) : rv.cr(o))` with both arms `const V&`: CFlat 1, clang 2 - the ternary
+  result drops const, so the non-const conversion is picked.
+- `operator long(); operator int() const;` converted to int from a non-const lvalue or prvalue:
+  CFlat 2, clang 1 - clang ranks the implicit object binding before the return-type conversion.
+- Template conversion next to a non-template `operator int()` on a const receiver: since T122 it is
+  refused with the raw "Argument mismatch detail (single resolved candidate: operator int)" (master
+  silently picked the non-const non-template, 1); clang picks the template (7). Replace the raw text
+  when template conversions are instantiated.

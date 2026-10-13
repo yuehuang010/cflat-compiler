@@ -993,6 +993,16 @@ bool LLVMBackend::TryGetConstGlobalInt(const std::string& name, int64_t& out) co
         return true;
     }
 
+void LLVMBackend::SetConstGlobalFP(const std::string& name)
+{
+        if (!name.empty()) constGlobalFPs_.insert(name);
+    }
+
+bool LLVMBackend::IsConstGlobalFP(const std::string& name) const
+{
+        return constGlobalFPs_.count(name) != 0;
+    }
+
 void LLVMBackend::SetPlatformMacros()
 {
         auto i32 = llvm::Type::getInt32Ty(*context);

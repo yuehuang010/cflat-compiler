@@ -4,6 +4,8 @@ void n65Ambiguous(move int* value) {}
 void n65Ambiguous(move double* value) {}
 void n65TakeDouble(function<void(double)> callback) {}
 void n65TakeVoidPointer(function<void(void*)> callback) {}
+int n65DerefOverload(int value) { return value; }
+int n65DerefOverload(double value) { return 50; }
 
 extern int main()
 {
@@ -12,6 +14,9 @@ extern int main()
     }
     expect_error("ambiguous overload of 'n65Ambiguous' matches function type 'void(void*)'") {
         n65TakeVoidPointer(n65Ambiguous);
+    }
+    expect_error("reference to overloaded function could not be resolved") {
+        int value = (*n65DerefOverload)(2);
     }
     return 0;
 }

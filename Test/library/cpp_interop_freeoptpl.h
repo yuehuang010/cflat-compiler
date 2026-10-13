@@ -358,3 +358,8 @@ inline const T1& crefT() { return gT; }
 struct FopunGlobal { int v = 4; };
 inline FopunGlobal operator-(const FopunGlobal& a) { return FopunGlobal{-a.v * 3}; }
 inline int operator!(const FopunGlobal& a) { return a.v + 1000; }
+
+namespace cppdelworse {
+inline int choose(int) { return 116; }
+int choose(long) = delete;
+}

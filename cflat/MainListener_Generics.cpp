@@ -34,12 +34,6 @@ struct LocalEnumScopeParkGuard
     LocalEnumScopeParkGuard& operator=(const LocalEnumScopeParkGuard&) = delete;
 };
 
-static void ResolveEnumTypeArguments(LLVMBackend* compiler, std::vector<std::string>& typeArgs)
-{
-        for (auto& arg : typeArgs)
-            if (std::string enumKey = compiler->ResolveEnumTypeName(arg); !enumKey.empty())
-                arg = std::move(enumKey);
-}
 }
 
 
@@ -152,7 +146,7 @@ void MainListener::InstantiateGenericInterface(const std::string& baseName, cons
             std::vector<std::string> parentArgs;
             for (auto* entry : spec->genericTypeParameters()->typeParameterList()->typeParameterEntry())
                 parentArgs.push_back(ResolveTypeArgEntry(entry));
-            ResolveEnumTypeArguments(Compiler(), parentArgs);
+            ResolveEnumTypeArguments(parentArgs);
             std::string parentMangled = MangledGenericName(parentBase, parentArgs);
             parentNames.push_back(parentMangled);
 
@@ -298,7 +292,7 @@ bool MainListener::IsFollowedByCall(CFlatParser::PostfixExpressionContext* ctx, 
 std::string MainListener::InstantiateGenericFunction(const std::string& baseName,
                                                     const std::vector<std::string>& spelledArgs) {
         std::vector<std::string> typeArgs = spelledArgs;
-        ResolveEnumTypeArguments(compilerLLVM, typeArgs);
+        ResolveEnumTypeArguments(typeArgs);
         if (genericFunctionTemplates.count(baseName) != 0
             && HasLongDoubleTypeArgument(typeArgs)
             && !compilerLLVM->IsCInteropLongDoubleSupported())
@@ -761,7 +755,7 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
                     if (HasPrimitiveTypeError(argError))
                         LogErrorContext(entry, LocalizePrimitiveTypeError(Compiler(declSpec), argError));
                 }
-                ResolveEnumTypeArguments(Compiler(), typeArgs);
+                ResolveEnumTypeArguments(typeArgs);
                 std::string mangledName = MangledGenericName("tuple", typeArgs);
                 tupleTypeArgs[mangledName] = typeArgs;
                 if (!instantiatedGenerics.count(mangledName))
@@ -785,7 +779,7 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
             // instantiate with "unknown type 'T'". No-op for already-concrete args.
             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                 typeArgs.push_back(ResolveTypeArgEntry(entry));
-            ResolveEnumTypeArguments(Compiler(), typeArgs);
+            ResolveEnumTypeArguments(typeArgs);
             // Instantiation PRE-SCAN: opportunistic, so a refused pattern is reported by the
             // declaration path instead, inside whatever scope the spelling actually sits in.
             Compiler()->ResolveGenericAliasSpelling(baseName, typeArgs, false);
@@ -804,9 +798,46 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
 
 std::string MainListener::MangledGenericName(const std::string& baseName, const std::vector<std::string>& typeArgs) {
         std::vector<std::string> resolvedArgs = typeArgs;
-        ResolveEnumTypeArguments(Compiler(), resolvedArgs);
+        ResolveEnumTypeArguments(resolvedArgs);
         return MangleGenericInstance(*Compiler(), baseName, resolvedArgs);
     }
+
+void MainListener::ResolveEnumTypeArguments(std::vector<std::string>& typeArgs)
+{
+        for (auto& arg : typeArgs)
+            if (std::string enumKey = Compiler()->ResolveEnumTypeName(arg); !enumKey.empty())
+                arg = std::move(enumKey);
+}
+
+const std::unordered_set<std::string>& MainListener::FunctionLocalEnumNames(
+    CFlatParser::FunctionDefinitionContext* function)
+{
+        auto [it, inserted] = functionLocalEnumNamesCache_.try_emplace(function);
+        if (inserted) it->second = CollectFunctionLocalEnumNames(function);
+        return it->second;
+}
+
+bool MainListener::QueueAndProcessLocalEnumInstantiation(
+    CFlatParser::GenericTypeParametersContext* params,
+    const std::string& baseName, const std::vector<std::string>& typeArgs,
+    const std::string& mangledName, antlr4::ParserRuleContext* site)
+{
+        bool hasLocalEnumName = false;
+        for (antlr4::tree::ParseTree* parent = site; parent != nullptr; parent = parent->parent)
+            if (auto* function = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent))
+            {
+                hasLocalEnumName = GenericArgumentsNameFunctionLocalEnum(
+                    params, &FunctionLocalEnumNames(function));
+                break;
+            }
+        if (!hasLocalEnumName
+            && !GenericArgumentsUseRegisteredLocalEnum(params, Compiler(site), &activeTypeSubstitutions))
+            return false;
+        QueueGenericInstantiation(baseName, typeArgs, mangledName, site);
+        LLVMBackend::BuilderStateGuard savedState(Compiler(site));
+        ProcessPendingInstantiations();
+        return true;
+}
 
 void MainListener::QueuePendingInstantiation(const std::string& templateName,
     const std::vector<std::string>& typeArgs, const std::string& mangledName,

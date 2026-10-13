@@ -1094,6 +1094,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 structVar.BaseType     = sd.StructType;
                 structVar.TypeAndValue = namedVar.TypeAndValue;
                 structVar.TypeAndValue.Pointer = false;
+                // A class `T&&` result is pointer-shaped until auto-dereference; preserve its xvalue.
+                structVar.IsRvalue = namedVar.TypeAndValue.IsRvalueRef;
                 // Preserve borrow-origin across the auto-deref so 'move param->field'
                 // can detect that the parent pointer is a borrowed parameter.
                 structVar.IsBorrowed      = namedVar.IsBorrowed;
@@ -1957,8 +1959,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 if (globalNV.Storage != nullptr)
                                 {
                                     if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(globalNV.Storage))
+                                    {
                                         Compiler(ctx)->ValidateCxxStaticMemberDemandAtUseSite(
                                             global->getName().str());
+                                        AdmitConstFloatingGlobal(Compiler(ctx), primaryIdentifier, global);
+                                    }
                                     int64_t constValue = 0;
                                     if (Compiler(ctx)->TryGetConstGlobalInt(primaryIdentifier, constValue)
                                         || (llvm::isa<llvm::GlobalVariable>(globalNV.Storage)
@@ -2947,6 +2952,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     LogErrorContext(entry, "unique is not supported as an explicit generic function type argument");
                                 typeArgs.push_back(ResolveTypeArgEntry(entry));
                             }
+                            ResolveEnumTypeArguments(typeArgs);
                             mangledName = MangleGenericInstance(*Compiler(), baseName, typeArgs);
                             bool isFollowedByCall = false;
                             for (size_t i = 0; i + 1 < ctx->children.size(); i++)
@@ -2956,6 +2962,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 isFollowedByCall = next != nullptr && next->getSymbol()->getType() == CFlatParser::LeftParen;
                                 break;
                             }
+                            if (!isGenericFunc && Compiler(ctx)->AnyGenericTypeTemplateNamed(baseName))
+                                QueueAndProcessLocalEnumInstantiation(
+                                    prevPrimary->genericIdentifier()->genericTypeParameters(),
+                                    baseName, typeArgs, mangledName, prevPrimary);
                             // If this is a generic function template (e.g. wrap<int>),
                             // instantiate it and record the mangled name as CallerName so
                             // ParseDeclaration can resolve the correct function pointer.
@@ -3031,6 +3041,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             {
                                 std::string aliasBase = baseName;
                                 std::vector<std::string> aliasArgs = typeArgs;
+                                ResolveEnumTypeArguments(aliasArgs);
                                 Compiler(ctx)->ResolveGenericAliasSpelling(aliasBase, aliasArgs);
                                 std::string aliasMangled =
                                     MangleGenericInstance(*Compiler(), aliasBase, aliasArgs);
@@ -4051,6 +4062,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         CallPostfixScope callArgumentPostfix(this);
                         // Create Function Call
                         std::string functionName = primaryIdentifier;
+                        // Parenthesized `(*namedFunction)` keeps the resolved function value, while
+                        // primaryIdentifier still contains source punctuation that is not a symbol.
+                        if (namedVar.TypeAndValue.TypeName.empty()
+                            && !namedVar.TypeAndValue.IsFunctionPointer
+                            && namedVar.Storage == nullptr && namedVar.Primary != nullptr
+                            && llvm::isa<llvm::Function>(namedVar.Primary)
+                            && !namedVar.CallerName.empty())
+                            functionName = namedVar.CallerName;
                         if (structVar.BaseType && !structVar.TypeAndValue.TypeName.empty()
                             && Compiler(ctx)->IsCxxRecord(structVar.TypeAndValue.TypeName)
                             && !HasCFlatMemberMethod(
@@ -6939,19 +6958,17 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         {
                                             LLVMBackend::DeclTypeAndValue paramType;
                                             paramType.TypeName = structType;
-                                            llvm::Value* defaultVal = GenerateDefaultValue(paramType);
-                                            if (defaultVal)
+                                            auto* initList = namedArgument->initializerList();
+                                            if (initList != nullptr
+                                                && CanFreshBraceInitializeAggregate(structType, initList))
                                             {
-                                                auto* alloca = Compiler(ctx)->CreateAlloca(defaultVal->getType());
-                                                Compiler(ctx)->CreateAssignment(defaultVal, alloca);
+                                                auto* alloca = Compiler(ctx)->CreateAlloca(
+                                                    Compiler(ctx)->GetType(paramType));
+                                                if (!EmitFreshBraceInitializeAggregate(
+                                                        alloca, structType, initList))
+                                                    continue;
                                                 CallArgumentScope braceTernaryScope(
                                                     inCallArgument_, ternaryCallArgumentDepth_);
-                                                // An empty brace has no initializerList() child. It means
-                                                // "the default-initialized value", which GenerateDefaultValue
-                                                // already produced, so there is nothing more to emit. Same
-                                                // null guard the declaration site uses.
-                                                if (namedArgument->initializerList() != nullptr)
-                                                    EmitFieldInitializer(alloca, structType, namedArgument->initializerList());
                                                 llvm::Value* loaded = Compiler(ctx)->CreateLoad(alloca);
                                                 LLVMBackend::NamedVariable argVar;
                                                 argVar.Primary = loaded;
@@ -6959,6 +6976,28 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 argVar.TypeAndValue.TypeName = structType;
                                                 argVar.TypeAndValue.VariableName = namedParam;
                                                 arguments.emplace_back(argVar);
+                                            }
+                                            else
+                                            {
+                                                llvm::Value* defaultVal = GenerateDefaultValue(paramType);
+                                                if (defaultVal)
+                                                {
+                                                    auto* alloca = Compiler(ctx)->CreateAlloca(defaultVal->getType());
+                                                    Compiler(ctx)->CreateAssignment(defaultVal, alloca);
+                                                    CallArgumentScope braceTernaryScope(
+                                                        inCallArgument_, ternaryCallArgumentDepth_);
+                                                    // An empty brace has no initializerList() child. It means
+                                                    // "the default-initialized value", so there is no overlay.
+                                                    if (initList != nullptr)
+                                                        EmitFieldInitializer(alloca, structType, initList);
+                                                    llvm::Value* loaded = Compiler(ctx)->CreateLoad(alloca);
+                                                    LLVMBackend::NamedVariable argVar;
+                                                    argVar.Primary = loaded;
+                                                    argVar.BaseType = loaded->getType();
+                                                    argVar.TypeAndValue.TypeName = structType;
+                                                    argVar.TypeAndValue.VariableName = namedParam;
+                                                    arguments.emplace_back(argVar);
+                                                }
                                             }
                                         }
                                         else
@@ -10241,6 +10280,7 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                     const std::string globalName = global->getName().str();
                     globalNV.IsCxxMacroGlobal = compiler->cxxMacroGlobalNames_.count(globalName) != 0;
                     globalNV.IsCxxNullIntegerMacro = compiler->cxxZeroIntegerMacroNames_.count(globalName) != 0;
+                    AdmitConstFloatingGlobal(compiler, name, global);
                 }
                 int64_t constValue = 0;
                 if (compiler->TryGetConstGlobalInt(name, constValue)
@@ -10667,8 +10707,18 @@ void MainListener::ProcessPlusPlus() {
         }
     }
 
-void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool topLevel) {
+void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool topLevel,
+    const std::unordered_set<std::string>* localEnumNames) {
         if (!ctx) return;
+        std::unordered_set<std::string> discoveredLocalEnumNames;
+        if (localEnumNames == nullptr)
+            for (antlr4::tree::ParseTree* parent = ctx; parent != nullptr; parent = parent->parent)
+                if (auto* function = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent))
+                {
+                    discoveredLocalEnumNames = CollectFunctionLocalEnumNames(function);
+                    localEnumNames = &discoveredLocalEnumNames;
+                    break;
+                }
         // Scratch frame: a body-scope `using` this pre-scan meets binds HERE, in source order, and
         // is gone before the real walk registers it - the queued type argument still folds to it.
         std::optional<LLVMBackend::AliasScopeGuard> scanAliasScope;
@@ -10693,8 +10743,16 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                     continue;
                 break;
             case CFlatParser::RuleUsingDeclaration:
-                RegisterPureRenameAlias(Compiler(),
-                                        static_cast<CFlatParser::UsingDeclarationContext*>(ruleCtx));
+                {
+                    auto* usingDecl = static_cast<CFlatParser::UsingDeclarationContext*>(ruleCtx);
+                    std::string usingBase;
+                    auto* usingParams = GenericSpecOf(usingDecl->typeSpecifier(), usingBase);
+                    if (!GenericArgumentsNeedFunctionLocalEnumDeferral(
+                            usingParams, localEnumNames, Compiler(usingDecl),
+                            &Compiler(usingDecl)->gts.scannedNonLocalEnumNames,
+                            &Compiler(usingDecl)->gts.scannedTypeNames))
+                        RegisterPureRenameAlias(Compiler(), usingDecl);
+                }
                 break;
             case CFlatParser::RuleIfConstDeclaration:
             case CFlatParser::RuleIfConstMember:
@@ -10702,7 +10760,7 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                 // Declaration/member `if const`: same reason as the statement form - an alias an
                 // arm declares is confined to a frame of its own and never reaches the file map.
                 LLVMBackend::AliasScopeGuard armAliasScope(Compiler());
-                ScanAndQueueGenericTypeUses(ruleCtx, /*topLevel*/ false);
+                ScanAndQueueGenericTypeUses(ruleCtx, /*topLevel*/ false, localEnumNames);
                 continue;
             }
             case CFlatParser::RuleSelectionStatement:
@@ -10718,7 +10776,7 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                         // Undecidable at scan time: no arm's alias may bind, so every arm scans in
                         // a frame of its own - the main pass stays the only one that decides.
                         LLVMBackend::AliasScopeGuard armAliasScope(Compiler());
-                        ScanAndQueueGenericTypeUses(ruleCtx, /*topLevel*/ false);
+                        ScanAndQueueGenericTypeUses(ruleCtx, /*topLevel*/ false, localEnumNames);
                         continue;
                     }
                     auto arms = sel->statement();
@@ -10727,13 +10785,14 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                                          : (arms.size() > 1 ? arms[1] : nullptr);
                     auto* dead = isTrue ? (arms.size() > 1 ? arms[1] : nullptr)
                                         : (arms.empty() ? nullptr : arms[0]);
-                    ScanAndQueueGenericTypeUses(sel->expression(), /*topLevel*/ false);
+                    ScanAndQueueGenericTypeUses(sel->expression(), /*topLevel*/ false, localEnumNames);
                     if (dead != nullptr)
                     {
                         LLVMBackend::AliasScopeGuard deadArmAliasScope(Compiler());
-                        ScanAndQueueGenericTypeUses(dead, /*topLevel*/ false);
+                        ScanAndQueueGenericTypeUses(dead, /*topLevel*/ false, localEnumNames);
                     }
-                    if (taken != nullptr) ScanAndQueueGenericTypeUses(taken, /*topLevel*/ false);
+                    if (taken != nullptr)
+                        ScanAndQueueGenericTypeUses(taken, /*topLevel*/ false, localEnumNames);
                     continue;
                 }
                 break;
@@ -10796,11 +10855,17 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                     // GenericSpecOf covers both spellings: bare 'Box<int>' and qualified 'NS.Box<int>'.
                     if (auto* genParams = GenericSpecOf(typeSpec, baseName))
                     {
+                        if (GenericArgumentsNeedFunctionLocalEnumDeferral(
+                                genParams, localEnumNames, Compiler(typeSpec),
+                                &Compiler(typeSpec)->gts.scannedNonLocalEnumNames,
+                                &Compiler(typeSpec)->gts.scannedTypeNames))
+                            continue;  // Queue after the declaration registers the local enum.
                         std::vector<std::string> typeArgs;
                         // ResolveTypeArgEntry applies active substitutions AND recursively
                         // resolves/queues nested generics (e.g. list<int> inside list<list<int>>).
                         for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                             typeArgs.push_back(ResolveTypeArgEntry(entry));
+                        ResolveEnumTypeArguments(typeArgs);
                         auto* compiler = Compiler(typeSpec);
                         bool resolvesAsType = compiler->IsKnownTypeName(baseName)
                             || compiler->AnyGenericTypeTemplateNamed(baseName)
@@ -10832,22 +10897,29 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                     auto* primaryExpr = static_cast<CFlatParser::PrimaryExpressionContext*>(ruleCtx);
                     if (primaryExpr->genericIdentifier() != nullptr && primaryExpr->genericIdentifier()->genericTypeParameters() != nullptr && primaryExpr->genericIdentifier()->Identifier() != nullptr)
                     {
+                        auto* genericParams = primaryExpr->genericIdentifier()->genericTypeParameters();
+                        if (GenericArgumentsNeedFunctionLocalEnumDeferral(
+                                genericParams, localEnumNames, Compiler(primaryExpr),
+                                &Compiler(primaryExpr)->gts.scannedNonLocalEnumNames,
+                                &Compiler(primaryExpr)->gts.scannedTypeNames))
+                            continue;  // Queue after the declaration registers the local enum.
                         std::string baseName =
                             primaryExpr->genericIdentifier()->Identifier()->getText();
                         std::vector<std::string> typeArgs;
-                        for (auto* entry : primaryExpr->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                        for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
                             typeArgs.push_back(ResolveTypeArgEntry(entry));
+                        ResolveEnumTypeArguments(typeArgs);
                         // Queue PRE-SCAN: the declaration path reports a refused pattern.
                         Compiler()->ResolveGenericAliasSpelling(baseName, typeArgs, false);
                         // Same single funnel as the typeSpecifier arm above.
                         QueueGenericInstantiation(baseName, typeArgs,
                             MangledGenericName(baseName, typeArgs),
-                            primaryExpr->genericIdentifier()->genericTypeParameters());
+                            genericParams);
                     }
                     break;
                 }
             }
 
-            ScanAndQueueGenericTypeUses(ruleCtx, /*topLevel*/ false);
+            ScanAndQueueGenericTypeUses(ruleCtx, /*topLevel*/ false, localEnumNames);
         }
     }

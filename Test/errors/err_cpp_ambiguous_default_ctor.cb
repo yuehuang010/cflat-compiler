@@ -51,6 +51,25 @@ expect_error("C++ class 'cppexp.AmbiguousDefault' has ambiguous default construc
 }
 
 expect_error("C++ class 'cppexp.AmbiguousDefault' has ambiguous default construction") {
+    struct AmbiguousImplicitFieldHolder { cppexp.AmbiguousDefault value; };
+    extern int makeAmbiguousImplicitFieldHolder() {
+        AmbiguousImplicitFieldHolder holder;
+        return holder.value.v;
+    }
+}
+
+expect_error("C++ class 'cppexp.AmbiguousDefault' has ambiguous default construction") {
+    struct AmbiguousUserCtorFieldHolder {
+        cppexp.AmbiguousDefault value = default;
+        AmbiguousUserCtorFieldHolder() {}
+    };
+    extern int makeAmbiguousUserCtorFieldHolder() {
+        AmbiguousUserCtorFieldHolder holder;
+        return holder.value.v;
+    }
+}
+
+expect_error("C++ class 'cppexp.AmbiguousDefault' has ambiguous default construction") {
     extern int makeAmbiguousArray() {
         cppexp.AmbiguousDefault[2] values = {};
         return values[0].v;

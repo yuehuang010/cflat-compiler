@@ -3534,7 +3534,16 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                                         e.isCxx ? &abiMismatch : nullptr);
                 CreateFunctionDeclaration(regName, sig.ret, sig.params, /*external=*/true, e.variadic,
                                           /*returnsOwned=*/false, /*isMethod=*/false,
-                                          CallingConv::Cdecl, linkageName, e.isCxx, e.isNoexcept);
+                                          CallingConv::Cdecl, linkageName, e.isCxx, e.isNoexcept,
+                                          cflat_cinterop::CxxRefQualifierNone, e.isDeleted);
+                if (e.isTemplateSpecialization)
+                    if (auto found = functionTable.find(regName); found != functionTable.end())
+                        for (auto it = found->second.rbegin(); it != found->second.rend(); ++it)
+                            if (it->External && it->UniqueName == linkageName)
+                            {
+                                it->IsCxxTemplateSpecialization = true;
+                                break;
+                            }
             }
             if (!abiMismatch.empty())
             {
@@ -3842,6 +3851,31 @@ static bool CxxRvalueReferenceIsConst(const std::string& spelling)
         return CxxParamIsConstLvalueReference(lvalueSpelling);
 }
 
+static bool CxxSpellingHasVolatileTarget(const std::string& spelling)
+{
+        if (spelling.find('(') != std::string::npos) return false;
+        std::string head;
+        int depth = 0;
+        for (char c : spelling)
+        {
+            if (c == '<') ++depth;
+            else if (c == '>') --depth;
+            else if (depth == 0 && (c == '*' || c == '&')) break;
+            else if (depth == 0) head += c;
+        }
+        for (size_t at = head.find("volatile"); at != std::string::npos;
+             at = head.find("volatile", at + 8))
+        {
+            const bool leftOk = at == 0 || !(std::isalnum((unsigned char)head[at - 1])
+                                             || head[at - 1] == '_' || head[at - 1] == ':');
+            const size_t end = at + 8;
+            const bool rightOk = end >= head.size()
+                || !(std::isalnum((unsigned char)head[end]) || head[end] == '_');
+            if (leftOk && rightOk) return true;
+        }
+        return false;
+}
+
 // `T *const &` - const at the POINTER level under one lvalue reference. A distinct overload
 // from `T *&`, and the only one of the pair a pointer rvalue can bind.
 static bool CxxParamIsConstRefToPointer(const std::string& spelling);
@@ -3855,6 +3889,7 @@ void LLVMBackend::MarkCxxReferenceField(const std::string& ctype, TypeAndValue& 
 {
         std::string s = ctype;
         while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+        if (isCxx && CxxSpellingHasVolatileTarget(s)) tv.IsCxxPointeeVolatile = true;
         const size_t arrayRefParen = s.find("(&)");
         const size_t arrayRefOpen = s.find("(&)[");
         const size_t arrayRefAt = arrayRefOpen != std::string::npos
@@ -3945,6 +3980,8 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
         e.isCxx = r.isCxx;
         e.isInline = r.isInline;
         e.isStaticInline = r.isStaticInline;
+        e.isDeleted = r.isDeleted;
+        e.isTemplateSpecialization = r.isTemplateSpecialization;
         e.abi   = r.abi;
         e.isNoexcept = r.isNoexcept;
         e.paramNames = r.paramNames;
@@ -4022,6 +4059,8 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
         if (r.isCxx && e.ret.Pointer && !e.ret.IsFunctionPointer
             && CxxSpellingHasConstPointee(r.retType))
             e.ret.IsCxxPointeeConst = true;
+        if (r.isCxx && CxxSpellingHasVolatileTarget(r.retType))
+            e.ret.IsCxxPointeeVolatile = true;
         for (size_t i = 0; i < r.paramTypes.size(); ++i)
         {
             if (r.isCxx && r.paramTypes[i].find("::*") != std::string::npos)
@@ -4110,6 +4149,8 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
             if (r.isCxx && ptv.Pointer && !ptv.IsFunctionPointer
                 && CxxSpellingHasConstPointee(r.paramTypes[i]))
                 ptv.IsCxxPointeeConst = true;
+            if (r.isCxx && CxxSpellingHasVolatileTarget(r.paramTypes[i]))
+                ptv.IsCxxPointeeVolatile = true;
             // The spelled pointee const rides a named imported function's funcptr signature.
             if (ptv.Pointer && !ptv.IsFunctionPointer && CxxSpellingHasConstPointee(r.paramTypes[i]))
                 ptv.IsSpelledPointeeConst = true;
@@ -4145,6 +4186,8 @@ void LLVMBackend::RebindCxxCachedSignatures(std::vector<CSigEntry>& sigs)
             raw.defaultArgs = cached.defaultArgs;
             raw.variadic = cached.variadic;
             raw.isCxx = true;
+            raw.isDeleted = cached.isDeleted;
+            raw.isTemplateSpecialization = cached.isTemplateSpecialization;
             raw.isNoexcept = cached.isNoexcept;
             raw.bindRefusal = cached.sourceBindRefusal;
             raw.abi = cached.abi;
@@ -10030,9 +10073,10 @@ LLVMBackend::CollectCxxImplicitArgumentCandidates(
             if (candidate.instanceMember && !arguments.empty()
                 && candidate.refQualifier != cflat_cinterop::CxxRefQualifierNone)
             {
-                const bool receiverRvalue = IsCxxRvalueReferenceArgument(arguments.front());
+                const bool receiverRvalue = IsCxxObjectRvalue(arguments.front());
                 if ((candidate.refQualifier == cflat_cinterop::CxxRefQualifierLValue
-                     && receiverRvalue)
+                     && receiverRvalue
+                     && (!candidate.constMember || candidate.volatileMember))
                     || (candidate.refQualifier == cflat_cinterop::CxxRefQualifierRValue
                         && !receiverRvalue))
                     return false;
@@ -10059,6 +10103,7 @@ LLVMBackend::CollectCxxImplicitArgumentCandidates(
             if (type.Pointer && !type.ElemPointer) return type.TypeName;
             return type.TypeName;
         };
+        std::set<std::string> seenLinkage;
         auto addMembers = [&](const std::string& owner, const std::string& memberName,
                               bool staticOnly) {
             std::function<void(const std::string&, std::set<std::string>&)> visit;
@@ -10070,6 +10115,10 @@ LLVMBackend::CollectCxxImplicitArgumentCandidates(
                 if (!CxxSpellingForCflatType(owner, ownerSpelling)) return;
                 for (const auto& member : record->second.members)
                 {
+                    // A using-declaration lists the base member here too; one candidate per member.
+                    if (member.name == memberName && !member.linkageName.empty()
+                        && !seenLinkage.insert(member.linkageName).second)
+                        continue;
                     if (member.name != memberName
                         || member.access != cflat_cinterop::AccessPublic || member.isDeleted
                         || member.variadic || member.kind == cflat_cinterop::RawCxxMember::Constructor
@@ -10086,6 +10135,7 @@ LLVMBackend::CollectCxxImplicitArgumentCandidates(
                     candidate.instanceMember = !staticOnly;
                     candidate.staticMember = staticOnly;
                     candidate.constMember = member.isConst;
+                    candidate.volatileMember = member.isVolatile;
                     candidate.refQualifier = member.refQualifier;
                     candidate.isNoexcept = member.isNoexcept;
                     candidate.file = member.file;
@@ -10100,6 +10150,7 @@ LLVMBackend::CollectCxxImplicitArgumentCandidates(
                     }
             };
             std::set<std::string> seen;
+            seenLinkage.clear();
             visit(owner, seen);
         };
 
@@ -10220,7 +10271,8 @@ bool LLVMBackend::EmitCxxImplicitArgumentConversions(
             {
                 if (candidate.instanceMember && i == 0)
                 {
-                    candidateActuals.push_back({ (candidate.constMember ? "const " : "")
+                    candidateActuals.push_back({ std::string(candidate.constMember ? "const " : "")
+                                                    + (candidate.volatileMember ? "volatile " : "")
                                                     + candidate.ownerSpelling + " *",
                                                 "p0" });
                     continue;
@@ -10236,7 +10288,13 @@ bool LLVMBackend::EmitCxxImplicitArgumentConversions(
             if (candidateActuals.size() != arguments.size()) continue;
 
             std::string target;
-            if (candidate.instanceMember)
+            // An && member is only reachable through an xvalue; `p0->` would name the & twin.
+            if (candidate.instanceMember
+                && candidate.refQualifier == cflat_cinterop::CxxRefQualifierRValue)
+                target = "static_cast<" + std::string(candidate.constMember ? "const " : "")
+                    + (candidate.volatileMember ? "volatile " : "") + candidate.ownerSpelling
+                    + " &&>(*p0)." + candidate.targetName + "(";
+            else if (candidate.instanceMember)
                 target = "p0->" + candidate.targetName + "(";
             else if (candidate.staticMember)
                 target = candidate.ownerSpelling + "::" + candidate.targetName + "(";
@@ -10338,6 +10396,13 @@ bool LLVMBackend::EmitCxxImplicitArgumentConversions(
                     if (symbol.External && symbol.UniqueName == wrapperName)
                     {
                         symbol.CxxRefQualifier = candidate.refQualifier;
+                        // A member wrapper's p0 is the implicit object: rank it by the member's cv.
+                        if (candidate.instanceMember && !symbol.Parameters.empty())
+                        {
+                            symbol.CxxConst = candidate.constMember;
+                            symbol.CxxVolatile = candidate.volatileMember;
+                            symbol.Parameters.front().VariableName = "this";
+                        }
                         registered = true;
                         break;
                     }
@@ -10354,10 +10419,13 @@ bool LLVMBackend::TryBindCxxImplicitArgumentConversions(
         const std::string& functionName, const std::vector<NamedVariable>& arguments)
 {
         cxxImplicitConversionRefusal_.clear();
+        // A const-twin group name (receiver cv redirect) hides the member name the implicit
+        // conversion wrappers are looked up and registered under; bind under the bare name.
+        const std::string bareName = StripCxxConstTwin(functionName);
         std::vector<CxxImplicitArgumentCandidate> candidates =
-            CollectCxxImplicitArgumentCandidates(functionName, arguments);
+            CollectCxxImplicitArgumentCandidates(bareName, arguments);
         if (candidates.empty()) return false;
-        return EmitCxxImplicitArgumentConversions(functionName, arguments, candidates);
+        return EmitCxxImplicitArgumentConversions(bareName, arguments, candidates);
 }
 
 bool LLVMBackend::TryBindCxxImplicitDefaultCtor(const std::string& typeName, std::string& error)
@@ -11361,7 +11429,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             // IsCxxConstRef on a pointer shape (`T *const &`) is the slot, not the object.
             const bool receiverIsConst = CxxConstReceiverKind(receiver) != 0;
             constSpelled = receiverIsConst;
-            const bool receiverIsRvalue = IsCxxRvalueReferenceArgument(receiver);
+            const bool receiverIsRvalue = IsCxxObjectRvalue(receiver);
             const std::string receiverReference = receiverIsRvalue ? " &&" : " &";
             if (receiver.TypeAndValue.Pointer)
             {
@@ -16081,6 +16149,8 @@ bool LLVMBackend::TryBindCxxFunction(const std::string& functionName)
             raw.defaultArgs = stored.defaultArgs;
             raw.variadic = stored.variadic;
             raw.isCxx = stored.isCxx;
+            raw.isDeleted = stored.isDeleted;
+            raw.isTemplateSpecialization = stored.isTemplateSpecialization;
             raw.isNoexcept = stored.isNoexcept;
             // The EXTRACTOR's own refusal (a 'consteval' function, an uninstantiated
             // specialization) is a fact about the declaration, not about type mapping, so the
@@ -20126,25 +20196,33 @@ bool LLVMBackend::EnsureCxxMemberProjectedImpl(const std::string& typeName,
 void LLVMBackend::EnsureCxxConversionOperatorsProjected(const std::string& typeName)
 {
         EnsureCxxRecordProjected(typeName, false);
-        auto record = cxxRecordEntries_.find(typeName);
-        if (record == cxxRecordEntries_.end()) return;
         std::set<std::string> names;
-        for (const auto& member : record->second.members)
-            if (member.isConversion)
-            {
-                TypeAndValue returnType;
-                if (MapCTypeToTypeAndValue(member.retType, returnType, /*cxxBoundary*/ true))
+        std::set<std::string> visited;
+        auto collect = [&](auto&& self, const std::string& name) -> void {
+            auto record = cxxRecordEntries_.find(name);
+            if (record == cxxRecordEntries_.end() || !visited.insert(name).second) return;
+            for (const auto& member : record->second.members)
+                if (member.isConversion)
                 {
-                    std::string spelling = returnType.IsPrimitive()
-                        ? CanonicalPrimitiveTypeName(ResolveTypeAlias(returnType.TypeName))
-                        : SpellType(*this, returnType);
-                    if (!spelling.empty())
-                        spelling = CanonicalPrimitiveTypeName(ResolveTypeAlias(spelling));
-                    names.insert(spelling.empty() ? member.name : "operator " + spelling);
-                }
-                else
                     names.insert(member.name);
+                    TypeAndValue returnType;
+                    if (MapCTypeToTypeAndValue(member.retType, returnType, /*cxxBoundary*/ true))
+                    {
+                        std::string spelling = returnType.IsPrimitive() && !returnType.Pointer
+                            ? CanonicalPrimitiveTypeName(ResolveTypeAlias(returnType.TypeName))
+                            : SpellType(*this, returnType);
+                        names.insert(spelling.empty() ? member.name : "operator " + spelling);
+                    }
+                    else
+                        names.insert(member.name);
+                }
+            for (const auto& base : record->second.bases)
+            {
+                const std::string baseName = ResolveCxxBaseRecordName(base);
+                if (!baseName.empty()) self(self, baseName);
             }
+        };
+        collect(collect, typeName);
         for (const auto& name : names) EnsureCxxMemberProjected(typeName, name);
 }
 
@@ -20811,6 +20889,8 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 if (r.isCxx && tv.Pointer && !tv.IsFunctionPointer
                     && CxxSpellingHasConstPointee(f.ctype))
                     tv.IsCxxPointeeConst = true;
+                if (r.isCxx && CxxSpellingHasVolatileTarget(f.ctype))
+                    tv.IsCxxPointeeVolatile = true;
                 tv.IsCxxConstField = f.isConst && !f.isMutable && !tv.Pointer
                     && !tv.IsCxxRefToPointer && IsCxxRecord(tv.TypeName);
                 const bool incompleteArray = f.ctype.find("[]") != std::string::npos;
@@ -22065,6 +22145,30 @@ bool LLVMBackend::CxxClassDeclaresFriendOperators(const std::string& typeName) c
         return it != cxxRecordEntries_.end() && it->second.hasFriendOperators;
 }
 
+std::string LLVMBackend::CxxDeletedOperatorError(const std::string& typeName,
+                                                 const std::string& operatorName) const
+{
+        auto record = cxxRecordEntries_.find(typeName);
+        if (record == cxxRecordEntries_.end()) return {};
+        const std::string name = "operator" + operatorName;
+        if (std::any_of(record->second.members.begin(), record->second.members.end(),
+                        [&](const auto& member) {
+                            return member.name == name && member.isDeleted;
+                        }))
+            return "clang: overload resolution selected deleted operator '" + operatorName + "'";
+        return {};
+}
+
+bool LLVMBackend::CxxHasDeletedAssignment(const std::string& typeName, bool useMove) const
+{
+        auto record = cxxRecordEntries_.find(typeName);
+        if (record == cxxRecordEntries_.end()) return false;
+        return std::any_of(record->second.members.begin(), record->second.members.end(),
+                           [&](const auto& member) {
+            return member.isDeleted && (useMove ? member.isMoveAssign : member.isCopyAssign);
+        });
+}
+
 std::string LLVMBackend::DisplayCxxClassName(const std::string& typeName) const
 {
         TypeAndValue probe;
@@ -22126,6 +22230,8 @@ bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
             // The call site names the deleted element copy once it has seen the argument.
             if (deferElementCopySink && IsCxxElementCopySinkRefusal(typeName, memberName))
                 return false;
+            if (refusal == "is deleted")
+                LogError("clang: attempt to use a deleted function");
             LogError(std::format("member '{}' of C++ class '{}' {}", memberName,
                                  DisplayCxxClassName(typeName), refusal));
             return true;
@@ -22502,7 +22608,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             if (!m.isConversion) return m.name;
             TypeAndValue convRet;
             if (!mapType(m.retType, convRet)) return m.name;
-            std::string spelling = convRet.IsPrimitive()
+            std::string spelling = convRet.IsPrimitive() && !convRet.Pointer
                 ? CanonicalPrimitiveTypeName(ResolveTypeAlias(convRet.TypeName))
                 : SpellType(*this, convRet);
             return spelling.empty() ? m.name : "operator " + spelling;
@@ -22518,6 +22624,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 // CFlat drops pointee cv from its surface type, but C++ distinguishes `T*`
                 // from `const T*` overloads. Keep both in the candidate set for C++ ranking.
                 if (CxxSpellingHasConstPointee(m.paramTypes[p])) t += "|const-pointee";
+                if (CxxSpellingHasVolatileTarget(m.paramTypes[p])) t += "|volatile-pointee";
                 if (refKind == CxxReferenceKind::Rvalue) t += "|rvalue";
                 else if (refKind == CxxReferenceKind::RefToPointer)
                 {
@@ -22532,6 +22639,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
         };
         auto directMethodKey = [](const Member& m) {
             std::string key = m.name + "|" + m.retType + (m.isConst ? "|const" : "|mut")
+                + (m.isVolatile ? "|volatile" : "")
                 + "|rq=" + std::to_string(m.refQualifier);
             for (const auto& param : m.paramTypes) key += "|" + param;
             return key;
@@ -22676,9 +22784,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             const bool registerConstViewData = m.kind == Member::Instance
                 && m.name == "data" && m.isConst;
             bool constViewDataTwin = false;
-            // A const member whose non-const twin took the CFlat name: registered under
-            // CxxConstTwinName so a const receiver still reaches it (clang's pick).
-            bool constOverloadTwin = false;
+            // A cv-qualified member twin uses the synthetic group name so receiver cv can rank it.
+            bool cvOverloadTwin = false;
             if (m.isConversion && m.isExplicit
                 && implicitConversionNames.count(cflatName) == 0)
                 info.explicitConversions.insert(cflatName);
@@ -22732,7 +22839,10 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             {
                 if (m.kind == Member::Constructor && m.isMoveCtor) info.hasDeletedMoveCtor = true;
                 refuse("is deleted");
-                continue;
+                // Ordinary deleted methods must participate in overload ranking. Special
+                // members use their dedicated constructor/assignment metadata below.
+                if (m.kind == Member::Constructor || m.isCopyAssign || m.isMoveAssign)
+                    continue;
             }
             if (!m.bindRefusal.empty())   { refuse(m.bindRefusal);                       continue; }
             if (!r.layoutRefusal.empty() && m.kind != Member::StaticMethod)
@@ -22816,9 +22926,12 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             // Inline bodies ARE emitted (M7). What is left here is a member with no body at all:
             // an implicit or defaulted special member Sema declined to define, or a template
             // member awaiting instantiation support.
-            if (m.needsLocalDefinition)   { refuse("has no definition cflat can reach: clang emitted no body for it (an implicit, defaulted or template member)"); continue; }
-            if (!m.abi.valid)             { refuse("has a signature clang could not arrange for this target"); continue; }
-            if (m.linkageName.empty())    { refuse("has no external linkage");            continue; }
+            if (m.needsLocalDefinition && !m.isDeleted)
+                                          { refuse("has no definition cflat can reach: clang emitted no body for it (an implicit, defaulted or template member)"); continue; }
+            if (!m.abi.valid && !m.isDeleted)
+                                          { refuse("has a signature clang could not arrange for this target"); continue; }
+            if (m.linkageName.empty() && !m.isDeleted)
+                                          { refuse("has no external linkage");            continue; }
             if (m.kind == Member::Instance && !m.isCopyAssign && !m.isMoveAssign)
             {
                 auto it = instanceBySig.find(cflatSigKey(m));
@@ -22826,9 +22939,9 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 if (constViewDataTwin && !registerConstViewData)
                 {
                     const Member& kept = r.members[it->second];
-                    constOverloadTwin = m.isConst && !kept.isConst
-                        && m.isVolatile == kept.isVolatile && !m.isConversion;
-                    if (!constOverloadTwin)
+                    cvOverloadTwin = (m.isConst != kept.isConst
+                        || m.isVolatile != kept.isVolatile);
+                    if (!cvOverloadTwin)
                         continue;
                 }
             }
@@ -22920,6 +23033,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             if (aliasRefs) asAliasIfRef(m.retType, ret, true);
             if (ret.Pointer && !ret.IsFunctionPointer && CxxSpellingHasConstPointee(m.retType))
                 ret.IsCxxPointeeConst = true;
+            if (CxxSpellingHasVolatileTarget(m.retType))
+                ret.IsCxxPointeeVolatile = true;
             std::vector<TypeAndValue> params;
             bool paramsOk = true;
             size_t unmappableParam = m.paramTypes.size();
@@ -22975,6 +23090,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 if (tv.Pointer && !tv.IsFunctionPointer
                     && CxxSpellingHasConstPointee(m.paramTypes[p]))
                     tv.IsCxxPointeeConst = true;
+                if (CxxSpellingHasVolatileTarget(m.paramTypes[p]))
+                    tv.IsCxxPointeeVolatile = true;
                 // The mapped LLVM type must be a legal function argument (never void, a bare
                 // function type, or a non-first-class type): LLVM asserts, Release miscompiles.
                 if (llvm::Type* lt = GetType(tv); lt == nullptr || !llvm::FunctionType::isValidArgumentType(lt))
@@ -23010,7 +23127,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 // unmappable-parameter path reaches this lambda before that declaration.
                 const std::string wrapperRegName = m.kind == Member::StaticMethod
                     ? r.name + "." + cflatName
-                    : constOverloadTwin ? CxxConstTwinName(cflatName) : cflatName;
+                    : cvOverloadTwin ? CxxConstTwinName(cflatName) : cflatName;
                 if (m.kind == Member::StaticMethod)
                 {
                     NoteCxxForeignNamespace(wrapperRegName);
@@ -23055,6 +23172,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                         if (sym.External && sym.UniqueName == wrapper)
                         {
                             sym.IsCInteropDeclaration = true;
+                            sym.IsCxxTemplateSpecialization = m.isTemplateSpecialization;
                             sym.DefaultArguments.clear();
                             sym.CxxRefQualifier = m.refQualifier;
                             sym.CxxVolatile = m.isVolatile;
@@ -23139,7 +23257,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
 
             const std::string regName = registerConstViewData && constViewDataTwin
                 ? "__cflat_view_decay_const_data"
-                : constOverloadTwin ? CxxConstTwinName(cflatName)
+                : cvOverloadTwin ? CxxConstTwinName(cflatName)
                 : m.kind == Member::StaticMethod ? r.name + "." + cflatName : cflatName;
             if (m.kind == Member::StaticMethod)
             {
@@ -23149,23 +23267,26 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             }
 
             std::string abiMismatch;
+            const std::string registrationLinkage = m.linkageName.empty() && m.isDeleted
+                ? std::format("__cflat_deleted_{}_{}", r.name, i) : m.linkageName;
             {
                 CInteropDeclarationScope declaringFile(*this, m.file.empty() ? fileForLsp : m.file);
-                CxxAbiPlanScope abiPlan(*this, &m.abi, &abiMismatch);
+                CxxAbiPlanScope abiPlan(*this, m.isDeleted ? nullptr : &m.abi, &abiMismatch);
                 CreateFunctionDeclaration(regName, ret, params, /*external=*/true, m.variadic,
                                           /*returnsOwned=*/false,
                                           /*isMethod=*/m.kind == Member::Instance,
-                                          CallingConv::Cdecl, m.linkageName, /*isCxx=*/true,
-                                          m.isNoexcept, m.refQualifier);
+                                          CallingConv::Cdecl, registrationLinkage, /*isCxx=*/true,
+                                          m.isNoexcept, m.refQualifier, m.isDeleted);
             }
             // A member whose lowering clang disagrees with is refused HERE, at registration: the
             // use site reports why, and importing the class stays clean.
             if (!abiMismatch.empty()) { refuse(abiMismatch); continue; }
             if (auto fit = functionTable.find(regName); fit != functionTable.end())
                 for (FunctionSymbol& sym : fit->second)
-                    if (sym.External && sym.UniqueName == m.linkageName)
+                    if (sym.External && sym.UniqueName == registrationLinkage)
                     {
                         sym.IsCInteropDeclaration = true;
+                        sym.IsCxxTemplateSpecialization = m.isTemplateSpecialization;
                         sym.DefaultArguments = m.defaultArgs;
                         sym.CxxRefQualifier = m.refQualifier;
                         sym.CxxVolatile = m.isVolatile;
@@ -23181,11 +23302,10 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 registerDefaultArityWrapper(prefix, n);
             }
             // A virtual member is called through the receiver's vptr at this slot; the
-            // declaration above exists only to carry clang's arrangement and to keep the
-            // callee's LLVM type available. A const twin dispatches the same way.
+            // declaration above exists only to carry clang's arrangement and LLVM type.
             if (m.kind == Member::Instance && m.isVirtual)
                 cxxVirtualSlotByLinkage_[m.linkageName] = { m.vtableIndex, m.vtableOffsetBytes };
-            if (constOverloadTwin) continue;
+            if (cvOverloadTwin) continue;
             if (m.kind == Member::Instance)
                 info.instanceMethodNames.push_back(cflatName);
             else if (m.kind == Member::StaticMethod
@@ -29188,6 +29308,8 @@ bool LLVMBackend::EmitLoweredMemberwiseAssign(const std::string& typeName, llvm:
                     else if (info->hasCopyAssign) op = &info->copyAssign;
                 }
             }
+            if (op != nullptr && op->isDeleted)
+                LogError("clang: overload resolution selected deleted operator '='");
             // Clang's implicit assignment is trivial and not deleted (no symbol): a byte copy,
             // as EmitCxxCopyOrMoveConstruct byte-copies a trivial implicit copy constructor.
             if (op == nullptr && info != nullptr
@@ -29745,11 +29867,11 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
         if (sourceTypeName.empty() || dest.TypeName.empty() || dest.TypeName == "void") return {};
         if (sourceTypeName == dest.TypeName) return {};
         const bool classReferenceTarget = dest.IsAlias && IsCxxRecord(dest.TypeName);
-        if ((dest.Pointer && !classReferenceTarget) || dest.ElemPointer
+        if (dest.ElemPointer
             || dest.IsArrayView || dest.IsInterface
             || dest.IsFunctionPointer)
             return {};
-        if (!dest.IsPrimitive() && !classReferenceTarget) return {};
+        if (!dest.IsPrimitive() && !dest.Pointer && !classReferenceTarget) return {};
         if (IsPrimitiveTypeName(sourceTypeName)) return {};
         // A CFlat-native `operator T` is EXPLICIT-only by ruling (Test/errors/err_operator_
         // conversion.cb pins it), so only an imported C++ record converts implicitly - there
@@ -29759,6 +29881,20 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
         auto* self = const_cast<LLVMBackend*>(this);
         self->EnsureCxxConversionOperatorsProjected(sourceTypeName);
         const CxxClassInfo* info = GetCxxClassInfo(sourceTypeName);
+        if (allowExplicit)
+            if (auto record = cxxRecordEntries_.find(sourceTypeName);
+                record != cxxRecordEntries_.end())
+                for (const auto& member : record->second.members)
+                    if (member.isDeleted && member.name == "operator " + dest.TypeName)
+                    {
+                        std::string sourceSpelling;
+                        if (!CxxSpellingForCflatType(sourceTypeName, sourceSpelling))
+                            sourceSpelling = DisplayCxxClassName(sourceTypeName);
+                        LogError("member 'operator " + dest.TypeName + "' of C++ class '"
+                                 + DisplayCxxClassName(sourceTypeName) + "' is deleted (clang: "
+                                 + "static_cast from '" + sourceSpelling + "' to '"
+                                 + dest.TypeName + "' uses deleted function)");
+                    }
         // A class-reference target takes the same conversion-name lookup and explicit filter
         // as every other target (usable below), so only real conversion operators bind.
         // A conversion operator is published either under the bare name or, when the bare name
@@ -29773,10 +29909,42 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                 return std::vector<std::string>{ "operator " + cflatSpelling,
                                                  sourceTypeName + ".operator " + cflatSpelling };
             }
-            const std::string cflatSpelling =
-                CanonicalPrimitiveTypeName(ResolveTypeAlias(spelling));
-            return std::vector<std::string>{ "operator " + cflatSpelling,
+            TypeAndValue targetType;
+            targetType.TypeName = spelling;
+            targetType.Pointer = dest.Pointer;
+            const std::string cflatSpelling = dest.Pointer
+                ? SpellType(*this, targetType)
+                : CanonicalPrimitiveTypeName(ResolveTypeAlias(spelling));
+            std::vector<std::string> result{ "operator " + cflatSpelling,
                                              sourceTypeName + ".operator " + cflatSpelling };
+            if (!dest.Pointer && !classReferenceTarget)
+            {
+                TypeAndValue refTarget = targetType;
+                refTarget.Pointer = true;
+                refTarget.IsAlias = true;
+                const std::string refSpelling = SpellType(*this, refTarget);
+                result.push_back("operator " + refSpelling);
+                result.push_back(sourceTypeName + ".operator " + refSpelling);
+            }
+            if (auto record = cxxRecordEntries_.find(sourceTypeName);
+                record != cxxRecordEntries_.end())
+                for (const auto& member : record->second.members)
+                {
+                    if (!member.isConversion) continue;
+                    TypeAndValue ret;
+                    if (!self->MapCTypeToTypeAndValue(member.retType, ret, true)
+                        || CanonicalPrimitiveTypeName(ResolveTypeAlias(ret.TypeName))
+                            != CanonicalPrimitiveTypeName(ResolveTypeAlias(spelling))) continue;
+                    const bool referenceResult = member.retType.find('&') != std::string::npos;
+                    const bool shapeMatches = classReferenceTarget
+                        ? ret.Pointer && referenceResult
+                        : dest.Pointer ? ret.Pointer && !referenceResult
+                        : !ret.Pointer || referenceResult;
+                    if (!shapeMatches) continue;
+                    result.push_back(member.name);
+                    result.push_back(sourceTypeName + "." + member.name);
+                }
+            return result;
         };
 
         auto usable = [&](const std::string& opName, std::string& returnTypeName) {
@@ -29810,8 +29978,22 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                     }
                     continue;
                 }
-                if (ret.Pointer || ret.ElemPointer || ret.IsArrayView || !ret.IsPrimitive())
+                bool referenceResult = ret.IsAlias;
+                if (candidate.IsCxx)
+                    if (auto signatures = cxxFunctionSignatures_.find(candidate.SourceName);
+                        signatures != cxxFunctionSignatures_.end())
+                        for (const auto& raw : signatures->second)
+                            if (raw.linkageName == candidate.UniqueName)
+                                referenceResult = raw.retSpelling.find('&') != std::string::npos;
+                const bool scalarReference = !dest.Pointer && ret.Pointer && referenceResult
+                    && CanonicalPrimitiveTypeName(ResolveTypeAlias(ret.TypeName))
+                        == CanonicalPrimitiveTypeName(ResolveTypeAlias(dest.TypeName));
+                if ((!scalarReference && ret.Pointer != dest.Pointer) || ret.ElemPointer
+                    || ret.IsArrayView || (!dest.Pointer && !scalarReference && !ret.IsPrimitive()))
                     continue;
+                if (dest.Pointer
+                    && CanonicalPrimitiveTypeName(ResolveTypeAlias(ret.TypeName))
+                        != CanonicalPrimitiveTypeName(ResolveTypeAlias(dest.TypeName))) continue;
                 returnTypeName = ret.TypeName;
                 return true;
             }
@@ -29834,6 +30016,9 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
             }
 
         if (classReferenceTarget) return {};
+        // Pointer conversions are exact here. Their standard pointer conversions need a richer
+        // ranking than the scalar conversion table below, so do not treat them as scalar casts.
+        if (dest.Pointer) return {};
 
         /*
          * No exact operator: ONE standard conversion may sit on top of the user-defined one.
@@ -29939,6 +30124,15 @@ bool LLVMBackend::ApplyCxxConversionOperator(NamedVariable& nv, const TypeAndVal
         lastOwningResult = savedOwningResult;
         if (result == nullptr) return false;
 
+        if (!dest.Pointer && conversionReturnType.Pointer
+            && conversionReturnType.TypeName == dest.TypeName
+            && result->getType()->isPointerTy())
+        {
+            llvm::Type* referentType = GetType(const_cast<TypeAndValue&>(dest));
+            if (referentType == nullptr) return false;
+            result = builder->CreateLoad(referentType, result, "cxx.conversion.ref");
+        }
+
         if (dest.IsAlias && IsCxxRecord(dest.TypeName)
             && conversionReturnType.IsAlias
             && result->getType()->isPointerTy())
@@ -29996,11 +30190,38 @@ llvm::Value* LLVMBackend::ConvertAggregateViaImplicitConversionOperator(llvm::Va
                                                                         llvm::Type* destType)
 {
         if (destType == nullptr
-            || (!destType->isIntegerTy() && !destType->isFloatingPointTy()))
+            || (!destType->isIntegerTy() && !destType->isFloatingPointTy()
+                && !destType->isPointerTy()))
             return nullptr;
         auto* st = llvm::dyn_cast_or_null<llvm::StructType>(
             value != nullptr ? value->getType() : nullptr);
         if (st == nullptr || st->isLiteral() || !st->hasName()) return nullptr;
+        if (destType->isPointerTy())
+        {
+            const std::string sourceType = st->getName().str();
+            EnsureCxxConversionOperatorsProjected(sourceType);
+            std::set<std::string> visited;
+            auto find = [&](auto&& self, const std::string& owner) -> llvm::Value* {
+                if (!visited.insert(owner).second) return nullptr;
+                if (const auto* info = GetCxxClassInfo(owner))
+                    for (const auto& method : info->directMethods)
+                        if (method.spellable && method.raw.isConversion && !method.raw.isExplicit
+                            && !method.raw.isDeleted && method.raw.bindRefusal.empty()
+                            && method.ret.Pointer && !method.ret.ElemPointer
+                            && GetType(const_cast<TypeAndValue&>(method.ret)) == destType)
+                            if (auto* converted = ConvertViaImplicitConversionOperator(value, method.ret))
+                                return converted;
+                if (auto record = cxxRecordEntries_.find(owner); record != cxxRecordEntries_.end())
+                    for (const auto& base : record->second.bases)
+                    {
+                        const std::string baseName = ResolveCxxBaseRecordName(base);
+                        if (!baseName.empty())
+                            if (auto* converted = self(self, baseName)) return converted;
+                    }
+                return nullptr;
+            };
+            return find(find, sourceType);
+        }
         for (const std::string& spelling : ScalarConversionSpellings())
         {
             TypeAndValue dest;

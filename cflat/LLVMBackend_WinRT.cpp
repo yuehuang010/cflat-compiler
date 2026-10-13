@@ -1652,7 +1652,14 @@ void LLVMBackend::ApplyFuncPtrSinkTransfer(const std::string& functionName,
         bool anySink = false;
         for (const auto& p : params)
             anySink = anySink || p.IsOwningSink || p.IsConsumeInferredSink || p.IsMove;
-        if (!anySink) return;
+        const bool hasDeferredDiagnostic = beforeCall
+            && std::any_of(args.begin(), args.end(), [](const auto& arg) {
+                return std::any_of(arg.ConditionalMoveSources.begin(),
+                    arg.ConditionalMoveSources.end(), [](const auto& source) {
+                        return !source.DeferredDiagnostic.empty();
+                    });
+            });
+        if (!anySink && !hasDeferredDiagnostic) return;
         // A DECLARED `move` param takes the same ApplyMoveParamTransfer path a direct call takes
         // (FuncPtrParamAsTypeAndValue carries IsMove); an INFERRED sink keeps IsMove false.
         std::vector<TypeAndValue> synth;
@@ -1660,6 +1667,18 @@ void LLVMBackend::ApplyFuncPtrSinkTransfer(const std::string& functionName,
             synth.push_back(FuncPtrParamAsTypeAndValue(params[i], i));
         ApplyMoveParamTransfer(functionName, synth, args, /*paramsCarryAllocAlign*/ true,
             /*calleeIsMethod*/ false, beforeCall);
+}
+
+void LLVMBackend::LogBorrowedPointerMoveSinkError(const std::string& sourceDescription,
+        const std::string& parameterName, const std::string& functionName,
+        const std::string& declaredName) const
+{
+        LogErrorMessage(
+            "cannot move {} into move parameter '{}' of '{}' - the caller may still "
+            "own this pointer and will free it on scope exit. Move it out of the "
+            "owning slot instead (e.g. 'move parent->children[i]'), or declare "
+            "'{}' as 'move {}' if this function owns it.",
+            { sourceDescription, parameterName, functionName, declaredName, declaredName });
 }
 
 void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
@@ -1691,6 +1710,42 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
             std::string sourceName = args[i].CallerName;
             if (sourceName.empty() && args[i].FieldName.empty())
                 sourceName = args[i].TypeAndValue.VariableName;
+            const bool paramIsMoveSink = params[i].IsMove
+                || (!params[i].Pointer && !params[i].IsAlias
+                    && IsCoreUniqueType(params[i].TypeName));
+            if (beforeCall)
+            {
+                const auto borrowedArm = std::find_if(args[i].ConditionalMoveSources.begin(),
+                    args[i].ConditionalMoveSources.end(), [](const auto& source) {
+                        return source.MoveParamSinkArgument && source.BorrowedPointer;
+                    });
+                if (paramIsMoveSink && borrowedArm != args[i].ConditionalMoveSources.end())
+                {
+                    const bool directBorrowParam = IsFunctionParameter(borrowedArm->CallerName);
+                    const std::string borrowOrigin = borrowedArm->BorrowedOrigin;
+                    const bool copiedBorrow = !directBorrowParam && !borrowOrigin.empty()
+                        && IsFunctionParameter(borrowOrigin);
+                    if (directBorrowParam || copiedBorrow)
+                    {
+                        const std::string sourceDescription = directBorrowParam
+                            ? std::format("borrowed parameter '{}'", borrowedArm->CallerName)
+                            : std::format("borrowed pointer '{}' (copied from parameter '{}')",
+                                borrowedArm->CallerName.empty() ? borrowOrigin : borrowedArm->CallerName,
+                                borrowOrigin);
+                        const std::string declaredName = directBorrowParam
+                            ? borrowedArm->CallerName : borrowOrigin;
+                        LogBorrowedPointerMoveSinkError(sourceDescription,
+                            params[i].VariableName, SpellFunctionSymbol(*this, functionName),
+                            declaredName);
+                    }
+                }
+                const auto deferred = std::find_if(args[i].ConditionalMoveSources.begin(),
+                    args[i].ConditionalMoveSources.end(), [](const auto& source) {
+                        return !source.DeferredDiagnostic.empty();
+                    });
+                if (deferred != args[i].ConditionalMoveSources.end())
+                    LogErrorMessage("{}", { deferred->DeferredDiagnostic });
+            }
             if (params[i].IsRvalueRef && args[i].IsExplicitMove)
             {
                 // C++ move construction consumes the source only at compile time. The moved-from
@@ -1736,7 +1791,10 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 && (args[i].IsOwning || args[i].IsOwningString || args[i].IsOwningStruct
                     || IsVariableOwning(sourceName) || IsVariableOwningString(sourceName)
                     || IsOwnedClosureTemp(args[i].Primary)
-                    || !args[i].ConditionalMoveSources.empty()
+                    || std::any_of(args[i].ConditionalMoveSources.begin(),
+                        args[i].ConditionalMoveSources.end(), [](const auto& source) {
+                            return !source.BorrowedPointer;
+                        })
                     || IsCoreUniqueType(args[i].TypeAndValue.TypeName)
                     || (!sourceName.empty() && paramOwnsResource));
             bool forcedOperatorConsume = args[i].ForceOperatorConsume && argIsOwner && paramOwnsResource;
@@ -1900,17 +1958,19 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     if (srcBaseTy == nullptr) srcBaseTy = ref.BaseType;
                 }
 
-                // A non-owning-sink `move` param consumes only the owning-local-pointer arms; the
-                // other conditional sources (fields, elements) keep the existing path.
-                bool anyOwningLocalArm = false;
+                // Only sources collected from a call argument feed the declared move-param path.
+                // Assignment joins keep their existing source-ledger behavior.
+                bool anyMoveParamCallArm = false;
                 for (const auto& source : args[i].ConditionalMoveSources)
-                    anyOwningLocalArm = anyOwningLocalArm || source.OwningLocalPointer;
+                    anyMoveParamCallArm = anyMoveParamCallArm
+                        || (source.MoveParamSinkArgument && !source.BorrowedPointer);
                 if (!args[i].ConditionalMoveSources.empty()
-                    && (isOwningSink || (params[i].IsMove && anyOwningLocalArm)))
+                    && (isOwningSink || (params[i].IsMove && anyMoveParamCallArm)))
                 {
                     for (const auto& source : args[i].ConditionalMoveSources)
                     {
-                        if (!isOwningSink && !source.OwningLocalPointer)
+                        if (!isOwningSink
+                            && (!source.MoveParamSinkArgument || source.BorrowedPointer))
                             continue;
                         if (beforeCall)
                         {
@@ -1925,7 +1985,9 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                         else if (!source.CallerName.empty())
                         {
                             if (!source.FieldName.empty())
+                            {
                                 MarkVariableFieldMoved(source.CallerName, source.FieldName);
+                            }
                             else if (!source.IsElementAccess)
                                 MarkVariableMoved(source.CallerName);
                         }

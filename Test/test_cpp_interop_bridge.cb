@@ -4795,28 +4795,28 @@ extern int main(int argc, char** argv)
     cpptw.reset_counts();
     int bridgeBraceFieldCpp = bridge_enclosing_brace_lvalue_cpp();
     bridge_check("bridge enclosing brace lvalue C++ value", bridgeBraceFieldCpp, 4);
-    bridge_check("bridge enclosing brace lvalue C++ ctor", cpptw.ctor_count(), 2);
+    bridge_check("bridge enclosing brace lvalue C++ ctor", cpptw.ctor_count(), 1);
     bridge_check("bridge enclosing brace lvalue C++ copy", cpptw.copy_count(), 1);
     bridge_check("bridge enclosing brace lvalue C++ move", cpptw.move_count(), 0);
-    bridge_check("bridge enclosing brace lvalue C++ dtor", cpptw.dtor_count(), 3);
+    bridge_check("bridge enclosing brace lvalue C++ dtor", cpptw.dtor_count(), 2);
     bridge_check("bridge enclosing brace lvalue C++ live", cpptw.live_allocations(), 0);
 
     cpptw.reset_counts();
     int bridgeBracePrvalueFieldCpp = bridge_enclosing_brace_prvalue_cpp();
     bridge_check("bridge enclosing brace prvalue C++ value", bridgeBracePrvalueFieldCpp, 4);
-    bridge_check("bridge enclosing brace prvalue C++ ctor", cpptw.ctor_count(), 2);
+    bridge_check("bridge enclosing brace prvalue C++ ctor", cpptw.ctor_count(), 1);
     bridge_check("bridge enclosing brace prvalue C++ copy", cpptw.copy_count(), 0);
-    bridge_check("bridge enclosing brace prvalue C++ move", cpptw.move_count(), 1);
-    bridge_check("bridge enclosing brace prvalue C++ dtor", cpptw.dtor_count(), 3);
+    bridge_check("bridge enclosing brace prvalue C++ move", cpptw.move_count(), 0);
+    bridge_check("bridge enclosing brace prvalue C++ dtor", cpptw.dtor_count(), 1);
     bridge_check("bridge enclosing brace prvalue C++ live", cpptw.live_allocations(), 0);
 
     cpptw.reset_counts();
     int bridgeBraceArrayFieldCpp = bridge_enclosing_brace_array_cpp();
     bridge_check("bridge enclosing array-field brace C++ value", bridgeBraceArrayFieldCpp, 7);
-    bridge_check("bridge enclosing array-field brace C++ ctor", cpptw.ctor_count(), 4);
+    bridge_check("bridge enclosing array-field brace C++ ctor", cpptw.ctor_count(), 2);
     bridge_check("bridge enclosing array-field brace C++ copy", cpptw.copy_count(), 1);
     bridge_check("bridge enclosing array-field brace C++ move", cpptw.move_count(), 0);
-    bridge_check("bridge enclosing array-field brace C++ dtor", cpptw.dtor_count(), 5);
+    bridge_check("bridge enclosing array-field brace C++ dtor", cpptw.dtor_count(), 3);
     bridge_check("bridge enclosing array-field brace C++ live", cpptw.live_allocations(), 0);
 
     bridge_check("bridge enclosing std.string field copy", bridge_enclosing_string_copy(), 17);

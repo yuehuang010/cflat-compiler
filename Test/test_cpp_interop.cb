@@ -797,7 +797,8 @@ int UnwNestedField(int x)
 }
 int UnwBracePartial(int x)
 {
-    cppunw.setArm(2);
+    // f1 is built in place from Tx(0) (no default ctor since T117), so f2's is the first.
+    cppunw.setArm(1);
     UnwTx2 u = { f1 = cppunw.Tx(0) };
     return u.f1.get();
 }
@@ -1788,6 +1789,34 @@ struct T73Generic<T> { T item; };
 struct T73GenericHolder { T73Generic<cpp_t73.Mix> generic; };
 struct T73Initialized { cpp_t73.Mix mix = cpp_t73.Mix(); };
 struct T73DefaultedInitializer { cpp_t73.Mix mix = default; };
+struct T117OrderHolder { cpp_t73.Mix anchor; int a; int c; };
+struct T117ThrowHolder { cppunw.Tx a; cppunw.Tx b; cppunw.Tx c; };
+struct T125ArrayHolder { cppexp.ConvCnt[2] arr; int k = 1; };
+struct T125ArrayOuter { T125ArrayHolder h; };
+struct T125ThrowArrayHolder { cppunw.Tx[2] arr; };
+struct T129UserCtor { cppexp.ConvCnt m; int k = 1; T129UserCtor() { k = 2; } };
+struct T129ArrayOuter { T129UserCtor[2] h; int z = 0; };
+struct T129SingleOuter { T129UserCtor h; };
+struct T129Array2DOuter { T129UserCtor[2][2] h; };
+struct T129ThrowUserCtor { cppunw.Tx m; int k = 1; T129ThrowUserCtor() { k = 2; } };
+struct T129ThrowArrayOuter { T129ThrowUserCtor[2] h; };
+int t117Order = 0;
+int T117Order(int value) { t117Order = t117Order * 10 + value; return value; }
+int T117ThrowCtor(int unused)
+{
+    T117ThrowHolder h = { a = cppunw.Tx(0), b = cppunw.Tx(5) };
+    return h.a.get() + unused;
+}
+int T125ThrowArrayInit(int unused)
+{
+    T125ThrowArrayHolder h = { arr = { 0, 5 } };
+    return h.arr[0].get() + unused;
+}
+int T129ThrowArrayInit(int unused)
+{
+    T129ThrowArrayOuter h = { h = { { m = 0 }, { m = 6 } } };
+    return h.h[0].m.get() + unused;
+}
 T73Holder t73Global = default;
 // T94 B: a [cpp] struct in a namespace whose name ends in '_'. The generated identity for ns_.Self
 // is ns___Self; it must decode back to ns_.Self, not ns._Self (clang++ oracle: 0).
@@ -1893,6 +1922,42 @@ extern int main()
     t95d.D[2] t95darr;
     t95darr[0].n = 44;
     if ((*t95darr).n != 44) return 95103;
+    // T123: multidimensional array decay keeps the row dimensions through `*` and indexing.
+    t95d.C[2][3] t123dGrid;
+    t123dGrid[0][1].n = 23;
+    if ((*t123dGrid)[1].n != 23) return 12301;
+    // T123: unary implicit conversions, C++ overload ranking, and preserved lvalue/xvalue storage.
+    t123.BM t123BinaryMember = default;
+    if (-t123BinaryMember != 202) return 12311;
+    t123.NC t123NonConstMember = default;
+    if (-t123NonConstMember != 1) return 12312;
+    if (-t123.RvalueMember() != 4) return 12313;
+    t123.ConstMemberRefFree t123ConstRefFree = default;
+    if (-t123.constRefFree(t123ConstRefFree) != 71) return 12314;
+    if (!t123.constRefFree(t123ConstRefFree) != 72) return 12315;
+    // A const volatile operand: the free const& cannot bind it, the cv member wins (clang).
+    t123.CvMemberConstRefFree t123CvRefFree = default;
+    if (-t123.cvRefFree(t123CvRefFree) != 77) return 12316;
+    if (!t123.cvRefFree(t123CvRefFree) != 78) return 12317;
+    t123.CPointerOnly t123Convert = default;
+    if ((*t123Convert).n != 17) return 12302;
+    t123.C* t123Pointer = t123Convert;
+    if (t123Pointer->n != 17 || t123.readC(t123Convert) != 17) return 12303;
+    t123.Inherited t123Inherited = default;
+    if (+t123Inherited != 31) return 12304;
+    t123.RefResult t123Ref = default;
+    if (+t123Ref != 41 || +t123.atomicRef() != 37) return 12305;
+    t123.PointerOnly t123PointerOnly = default;
+    if ((+t123PointerOnly) != &t123.pointerValue) return 12306;
+    t123.a.value = 1;
+    t123.b.value = 2;
+    if (-(true ? t123.a : t123.b) != 502 || t123.a.value != 2 || t123.b.value != 2) return 12307;
+    t123.Eq t123Eq = default;
+    t123Eq.value = 1;
+    if (!(1 == t123Eq)) return 12308;
+    if (t123.mkV() + 1 != 8) return 12309;
+    std.optional<T123Payload> t123Optional = std.optional<T123Payload>(T123Payload());
+    if ((*move t123Optional).value() != 42) return 12310;
     // T86: a hex float (binary exponent) and a binary suffix reach C++ template deduction and overloads with clang's
     // types (clang++ -std=c++20 oracle: 2 1 1 2 / 3 4 5 6 8 / 7 4).
     if (t86.deduce(0x1p-2) != 2) return 98210;
@@ -7699,11 +7764,11 @@ extern int main()
     cppexp.ConvStr[2] convArr = default;
     convArr[1] = "abc";
     if (convArr[1].n != 103 || convArr[0].n != 0)                              return 2242;
-    // Brace element: the seed field is released, T(5) is moved in (1000 + 5) - exactly the
-    // counts of `{ c = cppexp.ConvCnt(5) }` (3 ctors, 3 dtors; pre-fix the seed leaked).
+    // Brace element: the named field is built in place by the converting ctor (T117), as
+    // clang does: one ctor, one dtor, no seed and no move.
     cppexp.conv_reset();
     { ConvHolder convB = { c = 5, k = 1 }; convOut = convB.c.v; }
-    if (convOut != 1005 || cppexp.conv_ctor_count() != 3 || cppexp.conv_dtor_count() != 3) return 2243;
+    if (convOut != 5 || cppexp.conv_ctor_count() != 1 || cppexp.conv_dtor_count() != 1) return 2243;
     cppexp.conv_reset();
     { cppexp.ConvCnt[2] convBa = { 5, 6 }; convOut = convBa[0].v % 1000 + convBa[1].v % 1000; }
     if (convOut != 11 || cppexp.conv_ctor_count() != cppexp.conv_dtor_count()) return 2244;
@@ -10408,11 +10473,12 @@ extern int main()
         cppas.Life.reset();
         {
             CppAssignHost h = { l = c ? cppas.Life(21) : cppas.Life(22) };
-            if (h.l.value() != expected || cppas.Life.ctors != 2 || cppas.Life.copies != 0
-                || cppas.Life.moves != 1 || cppas.Life.dtors != 2
+            // clang builds the selected arm in place (moves 0); p3 ternary-arm-into-field-moves.
+            if (h.l.value() != expected || cppas.Life.ctors != 1 || cppas.Life.copies != 0
+                || cppas.Life.moves != 1 || cppas.Life.dtors != 1
                 || cppas.Life.last_dtor != -1) return 3571;
         }
-        if (cppas.Life.dtors != 3 || cppas.Life.last_dtor != expected) return 3571;
+        if (cppas.Life.dtors != 2 || cppas.Life.last_dtor != expected) return 3571;
     }
 
     for (int i = 0; i < 2; i++)
@@ -12163,6 +12229,8 @@ extern int main()
         int five = 5;
         int* five_p = &five;
         if (+five != 5 || +*five_p != 5 || -five != -5) return 31919;
+        cppfopun.PtrConv pointerConv = default;
+        if (*pointerConv != pointerConv.v) return 31945;
         cppfopun.M cm = default;
         cppfopun.D cdm = default;
         if ((-cm).v != -50 || (+cm).v != 51 || !cm != 105 || (~cm).v != 53) return 31920;
@@ -13331,6 +13399,163 @@ int LoweredUserDtorAssignLegs(int argc)
         if (cpp_t73.ctor_count != 2 || t73Defaulted.mix.first.value != 7) return 73022;
     }
     if (cpp_t73.dtor_count != 2) return 73023;
+    // T117: a named C++ field is constructed from its initializer without first running
+    // its default constructor; positional array elements use the same field path.
+    cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
+    {
+        cpp_t73.Mix t117Source;
+        cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
+        {
+            T73Holder t117Named = { mix = t117Source };
+            if (cpp_t73.ctor_count != 0 || cpp_t73.dtor_count != 0
+                || t117Named.mix.first.value != 7 || t117Named.mix.second.value != 7)
+                return 73024;
+        }
+        if (cpp_t73.dtor_count != 2) return 73025;
+        cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
+        {
+            T73Holder t117Prvalue = { mix = cpp_t73.Mix() };
+            if (cpp_t73.ctor_count != 2 || cpp_t73.dtor_count != 0
+                || t117Prvalue.mix.first.value != 7 || t117Prvalue.mix.second.value != 7)
+                return 73026;
+        }
+        if (cpp_t73.dtor_count != 2) return 73027;
+        cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
+        {
+            T73Holder[2] t117Positional = {
+                { mix = t117Source }, { mix = t117Source }
+            };
+            if (cpp_t73.ctor_count != 0 || cpp_t73.dtor_count != 0
+                || t117Positional[0].mix.first.value != 7
+                || t117Positional[1].mix.second.value != 7) return 73028;
+        }
+        if (cpp_t73.dtor_count != 4) return 73029;
+    }
+    cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
+    {
+        cpp_t73.Mix t117Source;
+        cpp_t73.ctor_count = 0; cpp_t73.dtor_count = 0;
+        {
+            T73DefaultedInitializer t117Default = { mix = t117Source };
+            if (cpp_t73.ctor_count != 0 || t117Default.mix.first.value != 7)
+                return 73030;
+        }
+        if (cpp_t73.dtor_count != 2) return 73031;
+    }
+    t117Order = 0;
+    {
+        T117OrderHolder t117OrderOut = {
+            c = T117Order(3), a = T117Order(1)
+        };
+        if (t117Order != 13 || t117OrderOut.a != 1 || t117OrderOut.c != 3)
+            return 73032;
+    }
+    cppunw.reset();
+    if (cppunw.guarded(T117ThrowCtor, 0) != -5) return 73033;
+    if (cppunw.live() != 0 || cppunw.dtors() != 1) return 73034;
+    // T125: converting C++ class elements in fresh fixed-array storage use the element slots
+    // directly; values and ctor/dtor counts match clang for fields, locals, nesting and new.
+    cppexp.ConvCnt t125Source = 9;
+    int t125V0 = 0; int t125V1 = 0; int t125K = 0;
+    cppexp.conv_reset();
+    {
+        T125ArrayHolder t125Field = { arr = { 5, t125Source } };
+        t125V0 = t125Field.arr[0].v; t125V1 = t125Field.arr[1].v; t125K = t125Field.k;
+    }
+    if (t125V0 != 5 || t125V1 != 109 || t125K != 1
+        || cppexp.conv_ctor_count() != 2 || cppexp.conv_dtor_count() != 2) return 12501;
+    cppexp.conv_reset();
+    {
+        cppexp.ConvCnt[2] t125Local = { 5, t125Source };
+        t125V0 = t125Local[0].v; t125V1 = t125Local[1].v;
+    }
+    if (t125V0 != 5 || t125V1 != 109
+        || cppexp.conv_ctor_count() != 2 || cppexp.conv_dtor_count() != 2) return 12502;
+    cppexp.conv_reset();
+    {
+        T125ArrayOuter t125Nested = { h = { arr = { 5, 6 } } };
+        t125V0 = t125Nested.h.arr[0].v; t125V1 = t125Nested.h.arr[1].v;
+    }
+    if (t125V0 != 5 || t125V1 != 6
+        || cppexp.conv_ctor_count() != 2 || cppexp.conv_dtor_count() != 2) return 12503;
+    cppexp.conv_reset();
+    {
+        T125ArrayHolder* t125Heap = new T125ArrayHolder { arr = { 5, t125Source } };
+        t125V0 = t125Heap->arr[0].v; t125V1 = t125Heap->arr[1].v; t125K = t125Heap->k;
+        delete t125Heap;
+    }
+    if (t125V0 != 5 || t125V1 != 109 || t125K != 1
+        || cppexp.conv_ctor_count() != 2 || cppexp.conv_dtor_count() != 2) return 12504;
+    cppexp.conv_reset();
+    {
+        T125ArrayHolder t125Partial = { arr = { 5 } };
+        t125V0 = t125Partial.arr[0].v; t125V1 = t125Partial.arr[1].v;
+    }
+    if (t125V0 != 5 || t125V1 != 0
+        || cppexp.conv_ctor_count() != 2 || cppexp.conv_dtor_count() != 2) return 12505;
+    {
+        T125ArrayHolder t125Assign = default;
+        cppexp.conv_reset();
+        t125Assign.arr[0] = 7;
+        if (t125Assign.arr[0].v != 20007
+            || cppexp.conv_ctor_count() != 1 || cppexp.conv_dtor_count() != 1) return 12506;
+    }
+    cppunw.reset();
+    if (cppunw.guarded(T125ThrowArrayInit, 0) != -5) return 12507;
+    if (cppunw.live() != 0 || cppunw.dtors() != 1) return 12508;
+    // T129: braced element overrides edit already-constructed user-ctor array elements in place.
+    // Each replaced C++ member follows the scalar path: destroy its old value, then move-construct.
+    cppexp.conv_reset();
+    int t129V0 = 0; int t129V1 = 0; int t129K0 = 0; int t129K1 = 0;
+    {
+        T129ArrayOuter t129Array = { h = { { m = 5 }, { m = 6 } } };
+        t129V0 = t129Array.h[0].m.v; t129V1 = t129Array.h[1].m.v;
+        t129K0 = t129Array.h[0].k; t129K1 = t129Array.h[1].k;
+    }
+    if (t129V0 != 1005 || t129V1 != 1006 || t129K0 != 2 || t129K1 != 2) return 12901;
+    if (cppexp.conv_ctor_count() != 6 || cppexp.conv_dtor_count() != 6) return 12902;
+    cppexp.conv_reset();
+    {
+        T129SingleOuter t129Single = { h = { m = 5 } };
+        t129V0 = t129Single.h.m.v; t129K0 = t129Single.h.k;
+    }
+    if (t129V0 != 1005 || t129K0 != 2) return 12903;
+    if (cppexp.conv_ctor_count() != 3 || cppexp.conv_dtor_count() != 3) return 12904;
+    cppexp.conv_reset();
+    int t129KSum = 0;
+    {
+        T129Array2DOuter t129TwoD = {
+            h = { { { m = 1 }, { m = 2 } }, { { m = 3 }, { m = 4 } } }
+        };
+        t129V0 = t129TwoD.h[0][0].m.v; t129V1 = t129TwoD.h[0][1].m.v;
+        int t129V2 = t129TwoD.h[1][0].m.v; int t129V3 = t129TwoD.h[1][1].m.v;
+        t129KSum = t129TwoD.h[0][0].k + t129TwoD.h[0][1].k
+            + t129TwoD.h[1][0].k + t129TwoD.h[1][1].k;
+        if (t129V0 != 1001 || t129V1 != 1002 || t129V2 != 1003 || t129V3 != 1004)
+            return 12905;
+    }
+    if (t129KSum != 8) return 12906;
+    if (cppexp.conv_ctor_count() != 12 || cppexp.conv_dtor_count() != 12) return 12907;
+    cppexp.conv_reset();
+    {
+        T129ArrayOuter* t129Heap = new T129ArrayOuter { h = { { m = 5 }, { m = 6 } } };
+        t129V0 = t129Heap->h[0].m.v; t129V1 = t129Heap->h[1].m.v;
+        t129K0 = t129Heap->h[0].k; t129K1 = t129Heap->h[1].k;
+        delete t129Heap;
+    }
+    if (t129V0 != 1005 || t129V1 != 1006 || t129K0 != 2 || t129K1 != 2) return 12908;
+    if (cppexp.conv_ctor_count() != 6 || cppexp.conv_dtor_count() != 6) return 12909;
+    cppexp.conv_reset();
+    {
+        T129ArrayOuter t129Partial = { h = { { m = 5 }, {} } };
+        t129V0 = t129Partial.h[0].m.v; t129V1 = t129Partial.h[1].m.v;
+        t129K0 = t129Partial.h[0].k; t129K1 = t129Partial.h[1].k;
+    }
+    if (t129V0 != 1005 || t129V1 != 0 || t129K0 != 2 || t129K1 != 2) return 12910;
+    if (cppexp.conv_ctor_count() != 4 || cppexp.conv_dtor_count() != 4) return 12911;
+    cppunw.reset();
+    if (cppunw.guarded(T129ThrowArrayInit, 0) != -6) return 12912;
+    if (cppunw.live() != 0 || cppunw.dtors() != 4) return 12913;
     // T97: a C++ field named by a brace default keeps its value when the CFlat struct has no user ctor.
     // Probe scratch/repro_keep/v20/rv20/d/p.cb (master gave d.v=0 here; the user-ctor form was already right).
     cpp_t97.reset();

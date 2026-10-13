@@ -1751,15 +1751,130 @@ std::string LLVMBackend::DescribeImplicitPointerToNumber(
     const TypeAndValue& destTV, const NamedVariable& sourceNV, llvm::Value* value,
     const std::string& action, const std::string& destination) const
 {
+    const auto& sourceTV = sourceNV.TypeAndValue;
     std::string sourceType = sourceNV.IsStringLiteral
-        ? "const char*" : SpellType(*this, sourceNV.TypeAndValue);
+        ? "const char*" : SpellType(*this, sourceTV);
+    if (!sourceType.empty() && !sourceTV.IsArrayView && !sourceTV.Pointer)
+    {
+        std::vector<uint64_t> dimensions;
+        if (sourceTV.ConstArraySize != 0)
+            dimensions.push_back(sourceTV.ConstArraySize);
+        dimensions.insert(dimensions.end(), sourceTV.ConstInnerDimensions.begin(),
+                          sourceTV.ConstInnerDimensions.end());
+        if (dimensions.empty())
+        {
+            auto* arrayType = llvm::dyn_cast_or_null<llvm::ArrayType>(sourceNV.BaseType);
+            while (arrayType != nullptr)
+            {
+                dimensions.push_back(arrayType->getNumElements());
+                arrayType = llvm::dyn_cast<llvm::ArrayType>(arrayType->getElementType());
+            }
+        }
+        for (uint64_t dimension : dimensions)
+            sourceType += std::format("[{}]", dimension);
+    }
+
+    if (sourceType.empty() && value != nullptr && value->getType()->isPointerTy())
+    {
+        if (sourceTV.IsCxxNullptrT
+            || llvm::isa<llvm::ConstantPointerNull>(value))
+            sourceType = "nullptr";
+        else
+        {
+            std::unordered_set<llvm::Value*> seen;
+            std::function<std::string(llvm::Value*)> inferPointerElementType;
+            inferPointerElementType = [&](llvm::Value* candidate) -> std::string {
+                if (candidate == nullptr || !candidate->getType()->isPointerTy()
+                    || !seen.insert(candidate).second)
+                    return {};
+                std::string known = ResolvePointerElementTypeName(candidate);
+                if (!known.empty()) return known;
+                if (llvm::isa<llvm::ConstantPointerNull>(candidate)) return {};
+
+                std::vector<llvm::Value*> incoming;
+                if (auto* phi = llvm::dyn_cast<llvm::PHINode>(candidate))
+                {
+                    for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i)
+                        incoming.push_back(phi->getIncomingValue(i));
+                }
+                else if (auto* select = llvm::dyn_cast<llvm::SelectInst>(candidate))
+                {
+                    incoming = { select->getTrueValue(), select->getFalseValue() };
+                }
+                else if (auto* load = llvm::dyn_cast<llvm::LoadInst>(candidate))
+                {
+                    if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(load->getPointerOperand()))
+                        for (llvm::User* user : slot->users())
+                            if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                                store != nullptr && store->getPointerOperand() == slot)
+                                incoming.push_back(store->getValueOperand());
+                }
+                else if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(candidate))
+                    incoming.push_back(gep->getPointerOperand());
+                else if (auto* cast = llvm::dyn_cast<llvm::BitCastInst>(candidate))
+                    incoming.push_back(cast->getOperand(0));
+
+                std::string joinedType;
+                bool unknownIncoming = false;
+                for (llvm::Value* arm : incoming)
+                {
+                    if (llvm::isa<llvm::ConstantPointerNull>(arm)) continue;
+                    std::string armType = inferPointerElementType(arm);
+                    if (armType.empty())
+                    {
+                        unknownIncoming = true;
+                        continue;
+                    }
+                    if (!joinedType.empty() && joinedType != armType)
+                        return {};
+                    joinedType = std::move(armType);
+                }
+                return unknownIncoming ? std::string() : joinedType;
+            };
+            std::string elementType = inferPointerElementType(value);
+            if (!elementType.empty())
+            {
+                TypeAndValue pointerType;
+                pointerType.TypeName = elementType;
+                pointerType.Pointer = true;
+                sourceType = SpellType(*this, pointerType);
+            }
+        }
+    }
     if (sourceType.empty() && value != nullptr && value->getType()->isPointerTy())
         sourceType = "pointer";
+
+    const std::string destinationType = SpellType(*this, destTV);
+    if (destTV.IsFloatingPoint() >= 0)
+        return std::format(
+            "cannot {} {} of type '{}' from a value of type '{}' - a pointer has no floating conversion",
+            action, destination, destinationType, sourceType);
+
+    std::string referenceMember;
+    if (!sourceNV.OwningStructName.empty() && !sourceNV.FieldName.empty())
+    {
+        auto structData = dataStructures.find(sourceNV.OwningStructName);
+        if (structData != dataStructures.end())
+            for (const auto& field : structData->second.StructFields)
+                if (field.VariableName == sourceNV.FieldName
+                    && field.IsAlias && field.IsCxxRefToPointer)
+                {
+                    referenceMember = sourceNV.FieldPathText.empty()
+                        ? sourceNV.FieldName : sourceNV.FieldPathText;
+                    break;
+                }
+    }
+    if (!referenceMember.empty())
+        return std::format(
+            "cannot {} {} of type '{}' from a value of type '{}' - a pointer is not a number; "
+            "read the pointed-to value with '*{}'",
+            action, destination, destinationType, sourceType, referenceMember);
+
     return std::format(
         "cannot {} {} of type '{}' from a value of type '{}' - a pointer is not a number; "
         "use an explicit cast '({})p' to convert '{}' to '{}'",
-        action, destination, SpellType(*this, destTV), sourceType,
-        SpellType(*this, destTV), sourceType, SpellType(*this, destTV));
+        action, destination, destinationType, sourceType,
+        destinationType, sourceType, destinationType);
 }
 
 std::string LLVMBackend::DescribeStringLiteralIntoStructPointer(const TypeAndValue& destTV,

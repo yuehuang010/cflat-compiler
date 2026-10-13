@@ -2404,7 +2404,7 @@ void LLVMBackend::ReportUnresolvedProvisionalDeclarations()
         }
     }
 
-void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external, bool varargs, bool returnsOwned, bool isMethod, CallingConv callConv, const std::string& linkageName, bool isCxx, bool isNoexcept, int cxxRefQualifier)
+void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external, bool varargs, bool returnsOwned, bool isMethod, CallingConv callConv, const std::string& linkageName, bool isCxx, bool isNoexcept, int cxxRefQualifier, bool isDeleted)
 {
         // ForwardRefScanner registers signatures before any struct BODY exists. An opaque
         // by-value aggregate has no legal FunctionType yet, so the declaration is emitted with a
@@ -2623,6 +2623,7 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
                 .ReturnsAlias = returnType.IsAlias, // 'alias' return: caller must not free the interior
                 .IsMethod = isMethod,
                 .IsCxx = isCxx,
+                .IsDeleted = isDeleted,
                 .IsNoexcept = isNoexcept,
                 .Recipe = recipe,
                 .CxxAbi = (cxxPlan != nullptr && recipe.fromClang) ? *cxxPlan : cflat_cinterop::RawAbi{},

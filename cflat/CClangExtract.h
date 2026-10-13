@@ -198,6 +198,8 @@ namespace cflat_cinterop
         bool isCxx = false;
         bool isInline = false;
         bool isStaticInline = false;
+        bool isDeleted = false;
+        bool isTemplateSpecialization = false;
         bool isNoexcept = false;
         std::string bindRefusal;
         // The clang diagnostic lines behind a refusal, when one is known (never displayed).

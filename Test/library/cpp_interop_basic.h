@@ -2774,3 +2774,60 @@ namespace cpp_t73
     };
     struct DefaultMember { int value = 5; };
 }
+
+namespace t123 {
+struct MemberFree { int operator-() const { return 101; } };
+inline int operator-(const MemberFree&) { return 202; }
+struct ByValueOrRef { int value; };
+inline int operator-(ByValueOrRef v) { return 300 + v.value; }
+inline int operator-(const ByValueOrRef& v) { return 400 + v.value; }
+struct Mutating { int value; };
+inline int operator-(Mutating& v) { ++v.value; return 500 + v.value; }
+inline Mutating a{1};
+inline Mutating b{2};
+
+struct BM { int operator-(const BM&) const { return 101; } };
+inline int operator-(const BM&) { return 202; }
+struct NC {
+    int operator-() { return 1; }
+    int operator-() const { return 2; }
+};
+inline int operator-(const NC&) { return 3; }
+struct RvalueMember { int operator-() const && { return 4; } };
+inline int operator-(const RvalueMember&) { return 5; }
+struct ConstMemberRefFree {
+    int operator-() const { return 71; }
+    int operator!() const { return 72; }
+};
+inline int operator-(ConstMemberRefFree&) { return 73; }
+inline int operator-(ConstMemberRefFree&&) { return 74; }
+inline int operator!(ConstMemberRefFree&) { return 75; }
+inline int operator!(ConstMemberRefFree&&) { return 76; }
+inline const ConstMemberRefFree& constRefFree(ConstMemberRefFree& value) { return value; }
+struct CvMemberConstRefFree {
+    int operator-() const volatile { return 77; }
+    int operator!() const volatile { return 78; }
+};
+inline int operator-(const CvMemberConstRefFree&) { return 79; }
+inline int operator!(const CvMemberConstRefFree&) { return 80; }
+inline const volatile CvMemberConstRefFree& cvRefFree(CvMemberConstRefFree& value) { return value; }
+
+struct Eq { int value; };
+inline bool operator==(const Eq& v, int n) { return v.value == n; }
+inline bool operator==(const Eq& a, const Eq& b) { return a.value == b.value; }
+
+struct V {
+    int value;
+    V(int x) : value(x) {}
+    V(const V& x) : value(x.value) {}
+    ~V() {}
+};
+inline int operator+(V v, int n) { return v.value + n; }
+inline V mkV() { return V(7); }
+}
+
+namespace t123diag {
+struct M { int value; };
+inline int operator-(M& v) { ++v.value; return v.value; }
+inline const M& crefM(M& v) { return v; }
+}

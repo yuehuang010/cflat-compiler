@@ -62,13 +62,8 @@ extern int main()
         auto r = +u;
     }
     // A free unary operator taking T& cannot bind a returned temporary, including an sret result.
-    expect_error("C++ 'operator~' cannot bind its operand because the CFlat expression is an rvalue") {
+    expect_error("'operator~(cppfopun.MR&)' was rejected because the operand is an rvalue") {
         int rejected = ~cppfopun.mkMR();
-    }
-    // Pointer-conversion dereference is rejected cleanly until the converted pointer can be carried as storage.
-    expect_error("cannot dereference C++ value of type 'cppfopun.PtrConv'") {
-        cppfopun.PtrConv p = default;
-        int value = *p;
     }
     expect_error("no operator '-' for type 'cppfopun.N'") {
         cppfopun.N u = default;

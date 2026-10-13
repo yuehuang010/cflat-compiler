@@ -61,8 +61,9 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 | Run | Branch | Issue(s) | Notes |
 |-----|--------|----------|-------|
-| T108 | fix/t108-cachevalid | CACHE-VALID (2 p3) | Luna r1 01:27-02:18 done (both issues, test.sh cache probes) rebased; Opus r1 1 REG (selector-prefixed wrapper rejections no longer cached: warm header parses 2 vs 1) + 1 INC (restored-old-mtime edit still stale; needs ruling); Luna r2 02:41- ; Luna r2 02:41-04:22 done (2c0e867ca); Opus r2 delta 04:24-04:28 CLEAN (INC re-filed p3); squashed + rebased; bar queued after T111 |
-| T116 | fix/t116-cppdel | CPPDEL (1 p3 C++ adds rejection) | PARKED 2026-10-11 07:50. r1 a483570a3 (cache 241): free/static/operator/conversion/assignment deletes refused with clang text, Opus r1 1 blocking INC (deleted MEMBER overloads dropped before ranking, live sibling picked: m.call(1) -> 8, m + 1 -> 7, clang refuses). r2 UNCOMMITTED in worktree (review base refs/review/t116-r2): members registered with IsDeleted, int cases refused, templ leg; REG m.call(1.5) now "cannot choose which call" (must stay 8). Next: fix the ambiguity (literal-identity change in MainListener_Expressions member-operator candidates is the suspect), then copy-assign clang text (minor), Opus r2 delta |
+| T119 | fix/t119-bracenarrow | BRACENARROW (p3 native brace narrowing constants, adds rejection) | PARKED 13:46 for a maintainer ruling. Luna scan (worktree scratch/t119_*): 7 existing sites clang refuses - Test/test_basic.cb 1020/1022 (100.5 -> u32), 1032-1034 (bool from 2, 256, 0.5), test_initializer_list.cb 899 (1.5 -> int, 7.9 -> i64); those tests assert "brace converts like =". Q: does constant narrowing refusal cover float->int and int/float->bool (rewrite those legs), or only integer range overflow? |
+| T130 | fix/t130-nrvo | NRVO (p3 named local with C++ field returned by move) | Luna xhigh r1 21:38 |
+| T131 | fix/t131-ptrrefctor | PTRREFCTOR (p2 C++ ctor `T*&` param binds a copy) | Luna xhigh r1 22:58 |
 
 
 ## A - crashes, asserts, link failures
@@ -160,7 +161,6 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 | Run | Issue | Notes |
 |-----|-------|-------|
-| - | p2/cpp-class-returning-brace-element-extra-destructor | owned-temp ledger at ParseFieldDefaultBraceInitializer | brace element `d = mk()` (C++ class by value): 2 ctors / 3 dtors, clang 1/1 - double destroy (T97 review 1, pre-existing) |
 | E3 | p3/cpp-unwind-cleanup-gaps-ctor-new-temporaries | follow-up list after d59df39b / cpp-unwind2 |
 | E4 | p3/cpp-new-remaining-allocator-gaps | follow-up list after cpp-class-operator-new (5 items) |
 

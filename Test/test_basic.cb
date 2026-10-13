@@ -56,6 +56,12 @@ int[4] t6PointerGlobal = { 10, 20, 30, 40 };
 enum T114Bound : int { T114Two = 2 };
 const int T114ConstBound = 2;
 const int T114ShadowBound = 9;
+const float T118ConstFloat = 1.0f;
+const double T118ConstDouble = 1.0;
+const double T118ConstCastDouble = 2.0;
+float T118MutableFloat = 1.0f;
+double T118MutableDouble = 1.0;
+namespace T118DimNS { const double D = 1.0; }
 int t114MoveSinkDtors = 0;
 struct T114MoveSink
 {
@@ -93,7 +99,39 @@ bool testT114ShadowDimension()
 {
     return Test("array_dim_parameter_shadows_global", t114ShadowParam(3), 4) != 0;
 }
+int t118ShadowLocalDim()
+{
+    double T118ConstDouble = 0.0;
+    int[(T118ConstDouble > 0.0) ? 2 : 1] values = default;
+    return (int)sizeof(values);
+}
+int t118ShadowParameterDim(double T118ConstDouble)
+{
+    int[(T118ConstDouble > 0.0) ? 2 : 1] values = default;
+    return (int)sizeof(values);
+}
+struct T118ShadowField
+{
+    double T118ConstDouble = 0.0;
+    int Dim()
+    {
+        int[(T118ConstDouble > 0.0) ? 2 : 1] values = default;
+        return (int)sizeof(values);
+    }
+};
+int t118MutableFloatDim()
+{
+    int[(T118MutableFloat > 0.0f) ? 2 : 1] values = default;
+    return (int)sizeof(values);
+}
+int t118MutableDoubleDim()
+{
+    int[(T118MutableDouble > 0.0) ? 2 : 1] values = default;
+    return (int)sizeof(values);
+}
 using T114LogicalDimAlias = int[(1 && 1) ? 2 : 1];
+using T118FloatDimAlias = int[(T118ConstFloat > 0.0f) ? 2 : 1];
+using T118DoubleDimAlias = int[(T118ConstDouble > 0.0) ? 2 : 1];
 int[(2.0 > 1.0) ? 2 : 1] t114GlobalDouble = default;
 int[(1 > 0) ? ((3 > 2) ? 3 : 1) : 1] t114GlobalNested = default;
 int[(2 > 1) ? 2 : 1] t114GlobalIntCompare = default;
@@ -102,6 +140,10 @@ int[(1 && 1) ? 2 : 1] t114GlobalAnd = default;
 int[(1 || 0) ? 2 : 1] t114GlobalOr = default;
 int[T114Bound.T114Two] t114GlobalEnum = default;
 int[T114ConstBound] t114GlobalConst = default;
+int[(T118ConstFloat > 0.0f) ? 2 : 1] t118GlobalFloat = default;
+int[(T118ConstDouble > 0.0) ? 2 : 1] t118GlobalDouble = default;
+int[2][(int)T118ConstCastDouble] t118GlobalCastDouble = default;
+int[2][(u32)T118ConstCastDouble] t118GlobalCastUnsignedDouble = default;
 struct T114DimFields
 {
     int[(2.0 > 1.0) ? 2 : 1] doubleCompare;
@@ -109,6 +151,63 @@ struct T114DimFields
     int[(2 > 1) ? 2 : 1] intCompare;
     int[(1 && 1) ? 2 : 1] logicalAnd;
 };
+struct T118DimFields
+{
+    int[(T118ConstFloat > 0.0f) ? 2 : 1] floatBound;
+    int[(T118ConstDouble > 0.0) ? 2 : 1] doubleBound;
+};
+
+bool testT118ConstFloatingDims()
+{
+    bool result = true;
+    int[(T118ConstFloat > 0.0f) ? 2 : 1] localFloat = default;
+    int[(T118ConstDouble > 0.0) ? 2 : 1] localDouble = default;
+    int[2][(int)T118ConstCastDouble] localDoubleCast = default;
+    int[2][(u32)T118ConstCastDouble] localUnsignedDoubleCast = default;
+    result &= Test("t118_local_float_size", (int)sizeof(localFloat), 8);
+    result &= Test("t118_local_double_size", (int)sizeof(localDouble), 8);
+    result &= Test("t118_local_double_cast_size", (int)sizeof(localDoubleCast), 16);
+    result &= Test("t118_local_unsigned_double_cast_size", (int)sizeof(localUnsignedDoubleCast), 16);
+
+    int[2][(T118ConstFloat > 0.0f) ? 2 : 1] innerFloat = default;
+    int[2][(T118ConstDouble > 0.0) ? 2 : 1] innerDouble = default;
+    result &= Test("t118_inner_float_size", (int)sizeof(innerFloat), 16);
+    result &= Test("t118_inner_double_size", (int)sizeof(innerDouble), 16);
+
+    result &= Test("t118_global_float_size", (int)sizeof(t118GlobalFloat), 8);
+    result &= Test("t118_global_double_size", (int)sizeof(t118GlobalDouble), 8);
+    result &= Test("t118_global_double_cast_size", (int)sizeof(t118GlobalCastDouble), 16);
+    result &= Test("t118_global_unsigned_double_cast_size", (int)sizeof(t118GlobalCastUnsignedDouble), 16);
+    T118DimFields fields = default;
+    result &= Test("t118_field_float_size", (int)sizeof(fields.floatBound), 8);
+    result &= Test("t118_field_double_size", (int)sizeof(fields.doubleBound), 8);
+
+    static int[(T118ConstFloat > 0.0f) ? 2 : 1] staticFloat = default;
+    static int[(T118ConstDouble > 0.0) ? 2 : 1] staticDouble = default;
+    result &= Test("t118_static_float_size", (int)sizeof(staticFloat), 8);
+    result &= Test("t118_static_double_size", (int)sizeof(staticDouble), 8);
+
+    int* pointersFloat[(T118ConstFloat > 0.0f) ? 2 : 1] = default;
+    int* pointersDouble[(T118ConstDouble > 0.0) ? 2 : 1] = default;
+    result &= Test("t118_cstyle_pointer_float_size", (int)sizeof(pointersFloat), 16);
+    result &= Test("t118_cstyle_pointer_double_size", (int)sizeof(pointersDouble), 16);
+
+    T118FloatDimAlias aliasFloat = default;
+    T118DoubleDimAlias aliasDouble = default;
+    result &= Test("t118_alias_float_size", (int)sizeof(aliasFloat), 8);
+    result &= Test("t118_alias_double_size", (int)sizeof(aliasDouble), 8);
+
+    int[(T118DimNS.D > 0.0) ? 2 : 1] qualified = default;
+    result &= Test("t118_qualified_global_size", (int)sizeof(qualified), 8);
+    result &= Test("t118_shadow_local_size", t118ShadowLocalDim(), 4);
+    result &= Test("t118_shadow_parameter_size", t118ShadowParameterDim(0.0), 4);
+    T118ShadowField shadow = default;
+    result &= Test("t118_shadow_this_field_size", shadow.Dim(), 4);
+
+    result &= Test("t118_mutable_float_stays_vla", t118MutableFloatDim(), 4);
+    result &= Test("t118_mutable_double_stays_vla", t118MutableDoubleDim(), 4);
+    return result;
+}
 
 // T95: `*arr` on a fixed array decays to the element pointer, native and plain-struct alike.
 // `*s` on a plain struct VALUE is refused (err_deref_plain_struct.cb).
@@ -122,6 +221,13 @@ bool testUnaryDerefDecay()
     if ((*pa).n != 9) return false;
     (*pa).n = 10;
     if (pa[0].n != 10) return false;
+    int[2][3] matrix = default;
+    matrix[0][1] = 17;
+    if ((*matrix)[1] != 17) return false;
+    int[2] pointees = {31, 37};
+    int*[2] pointers = default;
+    pointers[0] = &pointees[0]; pointers[1] = &pointees[1];
+    if (*pointers[1] != 37) return false;
     return true;
 }
 
@@ -251,6 +357,10 @@ int myFunction(int x, int y, int z)
 struct AsaPt { int x = 0; int y = 0; };
 int asaPtSum(AsaPt p) { return p.x * 10 + p.y; }
 int asaApply(function<int(int)> fn, int v) { return fn(v); }
+int t126GenericDerefCall<T>(T f) { return (*f)(4); }
+int t126NamedAdd1(int n) { return n + 1; }
+int t126PointerTarget = 43;
+int* t126GetPointer() { return &t126PointerTarget; }
 
 bool testNamedParameters()
 {
@@ -310,6 +420,46 @@ using FacingAlias = EnumNs.Facing;
 struct EnumHolder { WideU8 band = default; int amount = default; };
 
 struct EnumBox<T> { T value = default; };
+
+struct T120Box<T> { T value = default; };
+struct T120Pair<T, U> { T first = default; U second = default; };
+struct T120StaticBox<T> { static int size() { return (int)sizeof(T); } };
+enum Col : char { A = 4 };
+
+int t120LocalBox() { enum Col : char { A = 5 }; T120Box<Col> b; b.value = Col.A; return (int)sizeof(b) * 10 + (int)b.value; }
+int t120LocalBoxFirst() { enum Col : char { A = 3 }; T120Box<Col> b; b.value = Col.A; return (int)sizeof(b) * 10 + (int)b.value; }
+int t120LocalBoxSecond() { enum Col : i64 { A = 7 }; T120Box<Col> b; b.value = Col.A; return (int)sizeof(b) * 10 + (int)b.value; }
+int t120BlockShadowBox() { int r = 0; { enum Col : i64 { A = 9 }; T120Box<Col> b; b.value = Col.A; r = (int)sizeof(b) * 10 + (int)b.value; } return r; }
+
+namespace T120Ns
+{
+    enum Col : char { A = 3 };
+    int read(T120Box<Col> b) { return (int)sizeof(b) * 10 + (int)b.value; }
+}
+
+struct T120MethodHolder
+{
+    int read() { enum Col : char { A = 3 }; T120Box<Col> b; b.value = Col.A; return (int)sizeof(b) * 10 + (int)b.value; }
+};
+
+int t120NestedBox() { enum Col : char { A = 4 }; T120Box<T120Pair<Col, int>> b; b.value.first = Col.A; b.value.second = 6; return (int)sizeof(b) * 10 + (int)b.value.first + b.value.second; }
+int t120LambdaBox() { enum Col : char { A = 5 }; function<int(int)> f = (int n) => { T120Box<Col> b; b.value = Col.A; return (int)sizeof(b) * 10 + (int)b.value + n; }; return f(1); }
+int t120LocalEnumSizeofTypeName() { enum T120SizeCol : i64 { A = 3 }; return (int)sizeof(T120Box<T120SizeCol>); }
+int t120LocalEnumUsingAlias() { enum T120AliasCol : i64 { A = 3 }; using T120AliasBox = T120Box<T120AliasCol>; T120AliasBox b; b.value = T120AliasCol.A; return (int)sizeof(b) * 10 + (int)b.value; }
+int t120FileEnumSizeofWithLocalShadow() { int r = (int)sizeof(T120Box<Col>); { enum Col : char { A = 1 }; r = r + (int)Col.A * 100; } return r; }
+int t120FileEnumUsingWithLocalShadow() { using T120ColBox = T120Box<Col>; T120ColBox b; b.value = Col.A; int r = (int)sizeof(b) * 10 + (int)b.value; { enum Col : char { A = 1 }; r = r + (int)Col.A * 100; } return r; }
+int t120FileEnumStaticCallWithLocalShadow() { int r = T120StaticBox<Col>.size(); { enum Col : char { A = 1 }; r = r + (int)Col.A * 100; } return r; }
+int t120LocalEnumStaticCall() { enum T120StaticCol : i64 { A = 3 }; return T120StaticBox<T120StaticCol>.size(); }
+int t120LocalEnumFunctionSignature() { enum T120SigCol : i64 { A = 3 }; function<T120Box<T120SigCol>()> g = () => { T120Box<T120SigCol> b; b.value = T120SigCol.A; return b; }; return (int)g().value; }
+struct T120ShadowType { int value = default; };
+int t120FileStructWithLocalEnumShadow() { int r = (int)sizeof(T120Box<T120ShadowType>); { enum T120ShadowType : char { A = 1 }; r = r + (int)T120ShadowType.A * 100; } return r; }
+
+int t120NamespaceBox()
+{
+    T120Box<T120Ns.Col> b;
+    b.value = T120Ns.Col.A;
+    return T120Ns.read(b) + (int)sizeof(b) * 10 + (int)b.value;
+}
 
 int enumUsedBeforeDeclaration()
 {
@@ -430,6 +580,30 @@ bool testEnum()
     result &= Test("local_enum_sibling_blocks", localEnumSiblingBlocks(), 7);
     result &= Test("local_enum_scope_not_captured_by_generic",
         t115GenericEnumCaller(), 11);
+
+    T120Box<Col> fileEnumBox;
+    fileEnumBox.value = Col.A;
+    result &= Test("t120_file_scope_enum_generic_struct",
+        (int)sizeof(fileEnumBox) * 10 + (int)fileEnumBox.value, 14);
+    result &= Test("t120_local_enum_generic_struct", t120LocalBox(), 15);
+    result &= Test("t120_same_local_name_first_type", t120LocalBoxFirst(), 13);
+    result &= Test("t120_same_local_name_second_type", t120LocalBoxSecond(), 87);
+    result &= Test("t120_same_local_name_distinct_instantiations",
+        t120LocalBoxFirst() + t120LocalBoxSecond(), 100);
+    result &= Test("t120_block_enum_shadows_file_enum", t120BlockShadowBox(), 89);
+    result &= Test("t120_namespaced_bare_and_qualified_enum", t120NamespaceBox(), 26);
+    T120MethodHolder t120Holder;
+    result &= Test("t120_method_local_enum_generic_struct", t120Holder.read(), 13);
+    result &= Test("t120_nested_generic_local_enum", t120NestedBox(), 90);
+    result &= Test("t120_lambda_local_enum_generic_struct", t120LambdaBox(), 16);
+    result &= Test("t120_local_enum_sizeof_type_name", t120LocalEnumSizeofTypeName(), 8);
+    result &= Test("t120_local_enum_using_alias", t120LocalEnumUsingAlias(), 83);
+    result &= Test("t120_file_enum_sizeof_with_local_shadow", t120FileEnumSizeofWithLocalShadow(), 101);
+    result &= Test("t120_file_enum_using_with_local_shadow", t120FileEnumUsingWithLocalShadow(), 114);
+    result &= Test("t120_file_enum_static_call_with_local_shadow", t120FileEnumStaticCallWithLocalShadow(), 101);
+    result &= Test("t120_local_enum_static_call", t120LocalEnumStaticCall(), 8);
+    result &= Test("t120_local_enum_function_signature", t120LocalEnumFunctionSignature(), 3);
+    result &= Test("t120_file_struct_with_local_enum_shadow", t120FileStructWithLocalEnumShadow(), 104);
 
     // A narrow unsigned base must zero-extend, a narrow signed base must sign-extend.
     WideU8 big = WideU8.WU8_BIG;
@@ -4239,6 +4413,29 @@ bool testPointerScalarAcceptSet()
     function<int(int)> fn = pointerPositiveFn;
     result &= Test("ptr_scalar_function_pointer", fn(4), 5);
 
+    function<int(int)> t126Fn = (int n) => { return n * 2; };
+    result &= Test("t126_function_deref_call", (*t126Fn)(2), 4);
+    result &= Test("t126_function_double_deref_call", (**t126Fn)(2), 4);
+    Lambda<int(int)> t126Closure = (int n) => { return n + 5; };
+    result &= Test("t126_closure_deref_call", (*t126Closure)(3), 8);
+    result &= Test("t126_closure_double_deref_call", (**t126Closure)(3), 8);
+    function<int(int)> t126GenericFn = (int n) => { return n + 1; };
+    result &= Test("t126_generic_function_deref_call",
+        t126GenericDerefCall<function<int(int)>>(t126GenericFn), 5);
+    result &= Test("t126_generic_lambda_deref_call",
+        t126GenericDerefCall<Lambda<int(int)>>(t126Closure), 9);
+    result &= Test("t126_named_function_deref_call", (*t126NamedAdd1)(1), 2);
+    function<int(int)> t126IndirectFn = t126NamedAdd1;
+    function<int(int)>* t126PF = &t126IndirectFn;
+    function<int(int)>** t126PPF = &t126PF;
+    result &= Test("t126_function_ptrptr_deref_call", (**t126PPF)(5), 6);
+    result &= Test("t126_function_ptrptr_triple_deref_call", (***t126PPF)(3), 4);
+    int[2][2] t126Rows = {{1, 2}, {3, 4}};
+    int* t126Row = t126Rows[1];
+    result &= Test("t126_row_arithmetic_deref", *(t126Rows[1] + 1) * 10 + *t126Row, 43);
+    result &= Test("t126_call_result_pointer_deref", *(t126GetPointer()), 43);
+    result &= Test("t126_direct_call_result_pointer_deref", *t126GetPointer(), 43);
+
     int* next = decay + 1;
     result &= Test("ptr_scalar_pointer_add", (int)(next - decay), 1);
     result &= Test("ptr_scalar_pointer_compare", next > decay, true);
@@ -4639,6 +4836,12 @@ bool testFixedArrays()
     int[2][3] mdDst = mdSrc;
     mdSrc[1][2] = 90;
     result &= Test("fixed_copy_multidim", mdDst[1][2], 9);
+    int[2][2] t126Matrix = {{1, 2}, {3, 4}};
+    result &= Test("t126_deref_parenthesized_row", *(t126Matrix[1]), 3);
+    result &= Test("t126_deref_bare_row", *t126Matrix[0], 1);
+    result &= Test("t126_deref_multidim_array", **t126Matrix, 1);
+    int t126Addressed = 7;
+    result &= Test("t126_deref_address_of", *&t126Addressed, 7);
     // A FULLY SIZED multi-dim declaration stays legal: the reject that bans an empty '[]' among
     // several dimensions ('int[][]', 'int[][3]', 'int[2][]' - see
     // Test/errors/err_multidim_array_view.cb) keys on the bracket count VERSUS the sized-
@@ -5136,6 +5339,7 @@ extern int main()
     int total  = 0;
     total++; passed += testT114MoveDimension() ? 1 : 0;
     total++; passed += testT114ShadowDimension() ? 1 : 0;
+    total++; passed += testT118ConstFloatingDims() ? 1 : 0;
     total++; passed += testPointerToIntegerAccepts() ? 1 : 0;
     total++; passed += testUnaryDerefDecay() ? 1 : 0;
     total++; passed += Test("testArray", testArray(), 460);

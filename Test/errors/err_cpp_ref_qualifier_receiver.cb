@@ -1,4 +1,5 @@
 import cpp "cpp_interop_tpl.h";
+import cpp "cpp_interop_strop.h";
 
 extern int main()
 {
@@ -13,6 +14,10 @@ extern int main()
 
     expect_error("&-qualified and cannot be called on an rvalue receiver") {
         cppt.RefQualMethods(1).onlyL();
+    }
+
+    expect_error("&-qualified and cannot be called on an rvalue receiver") {
+        cppsopd.TinyConstVolatileLRef().f();
     }
     return 0;
 }

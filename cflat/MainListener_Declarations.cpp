@@ -127,6 +127,7 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
             std::vector<std::string> innerArgs;
             for (auto* innerEntry : innerParams->typeParameterList()->typeParameterEntry())
                 innerArgs.push_back(ResolveTypeArgEntry(innerEntry));
+            ResolveEnumTypeArguments(innerArgs);
             Compiler()->ResolveGenericAliasSpelling(innerBase, innerArgs);
             resolved = MangledGenericName(innerBase, innerArgs);
             // A foreign C++ specialization used as a type argument (`list<std.vector<int>>`, or
@@ -171,7 +172,7 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
             if (!hasPointer)
                 return encodedArg;
             RejectFatClosurePointerArg(entry, fpSpec->Function() != nullptr, typeSpec->getText());
-            return encodedArg + "*";
+            return encodedArg + std::string(pointerDepth, '*');
         }
         else if (entry->functionTypeArgument())
         {
@@ -416,8 +417,13 @@ std::string MainListener::ResolveSigComponentCodegen(
             std::vector<std::string> innerArgs;
             for (auto* entry : ts->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
                 innerArgs.push_back(ResolveTypeArgEntry(entry));
+            ResolveEnumTypeArguments(innerArgs);
             std::string mangled = MangledGenericName(baseName, innerArgs);
             QueueGenericInstantiation(baseName, innerArgs, mangled, ts);
+            // A local-enum argument was deferred by the pre-scan; the signature needs the layout now.
+            if (Compiler(ts)->AnyGenericTypeTemplateNamed(baseName))
+                QueueAndProcessLocalEnumInstantiation(ts->genericIdentifier()->genericTypeParameters(),
+                    baseName, innerArgs, mangled, ts);
             return mangled;
         }
         // `Spec<args>.name` in a signature component names a member type, as everywhere else.
@@ -864,7 +870,10 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // For bare 'function', signature inferred from initializer at declaration site
                     // This branch breaks out of the specifier loop, so nothing else consumes a
                     // trailing '[N]' or '*'; capture both here (as the alias branch below does).
-                    declType.Pointer = declSpecWithSuffix->pointer() != nullptr;
+                    const int functionPtrDepth = PointerDepthOf(declSpecWithSuffix->pointer());
+                    declType.Pointer = functionPtrDepth > 0;
+                    declType.ElemPointer = functionPtrDepth >= 2;
+                    declType.PointerDepth = functionPtrDepth;
                     // A fat closure is a by-value struct, so a pointer to one loads the struct
                     // as if it were the address itself and the module fails LLVM verification.
                     if (declType.Pointer && !declType.IsThinFnPtr())
@@ -952,6 +961,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // may fix, reorder or partially bind the target's parameters.
                     baseName = spelledBase;
                     Compiler(declSpecs)->ResolveGenericAliasSpelling(baseName, typeArgs);
+                    ResolveEnumTypeArguments(typeArgs);
                     if (typeArgs.empty())
                     {
                         std::vector<std::string> requiredParams;
@@ -1001,6 +1011,12 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                             LogErrorContext(genParams,
                                 std::format("'{}' is not a generic type", spelledBase));
                     }
+                    // The whole-function pre-scan defers local-enum arguments because their
+                    // registry key does not exist yet. At the declaration, queue and drain now:
+                    // the enum is registered, and this type needs a complete layout immediately.
+                    if (Compiler(declSpecs)->AnyGenericTypeTemplateNamed(baseName))
+                        QueueAndProcessLocalEnumInstantiation(
+                            genParams, baseName, typeArgs, mangledName, genParams);
                     // Queue instantiation of nested generic types discovered during field/param parsing.
                     // Only do this when inside an active instantiation context (substitutions are set),
                     // to avoid treating unresolved type parameters (e.g. "T") as concrete types.
@@ -1037,7 +1053,10 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     declType.FuncPtrReturnAlias = fit->FuncPtrReturnAlias;
                     declType.FuncPtrReturnPointerDepth = fit->FuncPtrReturnPointerDepth;
                     declType.FuncPtrParams         = fit->FuncPtrParams;
-                    declType.Pointer               = declSpecWithSuffix->pointer() != nullptr;
+                    const int functionPtrDepth = PointerDepthOf(declSpecWithSuffix->pointer());
+                    declType.Pointer               = functionPtrDepth > 0;
+                    declType.ElemPointer            = functionPtrDepth >= 2;
+                    declType.PointerDepth           = functionPtrDepth;
                     // Same fat-closure pointer rejection as the functionPointerSpecifier branch.
                     if (declType.Pointer && !declType.IsThinFnPtr())
                         LogErrorContext(declSpec, std::format(
@@ -2516,6 +2535,7 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
             std::vector<std::string> typeArgs;
             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                 typeArgs.push_back(ResolveTypeArgEntry(entry));
+            ResolveEnumTypeArguments(typeArgs);
             compiler->ResolveGenericAliasSpelling(baseName, typeArgs);
             std::string mangledName = MangledGenericName(baseName, typeArgs);
 
@@ -2526,6 +2546,8 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
                 // CFlat generic: enqueue the instantiation (shell + default ctor created
                 // immediately, body emitted by the next ProcessPendingInstantiations).
                 QueueGenericInstantiation(baseName, typeArgs, mangledName, genParams);
+                QueueAndProcessLocalEnumInstantiation(
+                    genParams, baseName, typeArgs, mangledName, genParams);
             }
             // A deferred winmd generic interface (e.g. IAsyncOperationWithProgress<string,
             // HttpProgress>): instantiate the concrete thin interface + PIID on demand, exactly as
@@ -3451,11 +3473,12 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // At this point no basic block is active, so it is safe to emit new functions.
         // Parameter types must be scanned so that e.g. list<string>* params instantiate
         // list$string before the body references its methods.
-        ScanAndQueueGenericTypeUses(func->declarationSpecifiers());
+        const auto& functionLocalEnumNames = FunctionLocalEnumNames(func);
+        ScanAndQueueGenericTypeUses(func->declarationSpecifiers(), true, &functionLocalEnumNames);
         if (auto* paramTypeList = func->parameterTypeList())
-            ScanAndQueueGenericTypeUses(paramTypeList);
+            ScanAndQueueGenericTypeUses(paramTypeList, true, &functionLocalEnumNames);
         if (auto* blockItemList = func->compoundStatement()->blockItemList())
-            ScanAndQueueGenericTypeUses(blockItemList);
+            ScanAndQueueGenericTypeUses(blockItemList, true, &functionLocalEnumNames);
         ProcessPendingInstantiations();
 
         /*
@@ -4310,6 +4333,7 @@ CFlatParser::ArgumentExpressionListContext* MainListener::ForeignCxxConstructArg
                 std::vector<std::string> targs;
                 for (auto* entry : params->typeParameterList()->typeParameterEntry())
                     targs.push_back(ResolveTypeArgEntry(entry));
+                ResolveEnumTypeArguments(targs);
                 const std::string written = MangleGenericInstance(*compiler, base, targs);
                 if (written == typeName) return args[0];
                 // Two CFlat spellings of ONE C++ specialization (a defaulted template argument
@@ -6074,6 +6098,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 if (!compiler->HasUnavailableNestedCxxDefault(
                         field.TypeName, &unavailableType, true))
                     continue;
+                std::string ctorError;
+                compiler->TryBindCxxImplicitDefaultCtor(unavailableType, ctorError);
+                if (!ctorError.empty())
+                    LogErrorContext(at, ctorError);
                 const auto* info = compiler->GetCxxClassInfo(unavailableType);
                 LogErrorContext(at, compiler->LocalizeMessage(
                     "C++ class '{}' has no default constructor cflat can call{}",
@@ -6569,6 +6597,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 }
 
                 llvm::Value* right = nullptr;
+                bool freshBraceInit = false;
                 bool pendingGlobalDefaultConstruction = false;
                 LLVMBackend::NamedVariable interfaceSourceNV;
                 bool haveInterfaceSourceNV = false;
@@ -6696,6 +6725,16 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // Equivalent to T[N] arr = {} / T[N] arr = {field=v,...}.
                 bool barebraceInit = initDecl->LeftBrace() != nullptr;
                 CFlatParser::InitializerListContext* barebraceList = barebraceInit ? initDecl->initializerList() : nullptr;
+                auto* localInitList = initializer != nullptr
+                    ? initializer->initializerList() : barebraceList;
+                freshBraceInit = !global_scope && !typeAndValue.Pointer
+                    && CanFreshBraceInitializeAggregate(typeAndValue.TypeName, localInitList);
+                llvm::Type* declaredValueType = freshBraceInit
+                    ? compiler->GetType(typeAndValue) : nullptr;
+                freshBraceInit = freshBraceInit && declaredValueType != nullptr
+                    && declaredValueType->isStructTy();
+                if (freshBraceInit && initializer != nullptr)
+                    validateDefaultCxxFields(typeAndValue, initializer, localInitList);
 
                 /*
                  * `u8[] a = embed("...")` sizes its own destination: the asset's byte count IS the
@@ -6848,7 +6887,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     compiler->builder->SetInsertPoint(tmpBB);
                 }
 
-                if (initializer != nullptr)
+                if (initializer != nullptr && freshBraceInit)
+                {
+                    // Build named fields directly in the destination. The field pass below
+                    // initializes every omitted field and leaves the named slots unconstructed.
+                    right = llvm::Constant::getNullValue(declaredValueType);
+                }
+                else if (initializer != nullptr)
                 {
                     auto assignmentExpression = initializer->assignmentExpression();
                     if (assignmentExpression != nullptr)
@@ -8073,6 +8118,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             if (right && typeAndValue.Pointer && !typeAndValue.IsFunctionPointer
                                 && right->getType()->isStructTy())
                             {
+                                if (auto* converted = compiler->ConvertViaImplicitConversionOperator(
+                                        right, typeAndValue))
+                                    right = converted;
+                            }
+                            if (right && typeAndValue.Pointer && !typeAndValue.IsFunctionPointer
+                                && right->getType()->isStructTy())
+                            {
                                 // Spell the RIGHT-HAND side's type - printing the destination's
                                 // pointer type made the message contradict its own reason.
                                 LogErrorContext(assignmentExpression, std::format(
@@ -8159,8 +8211,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         compiler->lastLoweredRetValue_ = nullptr;
                         validateDefaultCxxFields(typeAndValue, initializer,
                                                   initializer->initializerList());
-                        right = GenerateDefaultValue(typeAndValue);
-                        adoptDefaultCxxRetTemp();
+                        if (!freshBraceInit)
+                        {
+                            right = GenerateDefaultValue(typeAndValue);
+                            adoptDefaultCxxRetTemp();
+                        }
                     }
                 }
                 else if (barebraceInit)
@@ -8180,8 +8235,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     compiler->lastLoweredRetValue_ = nullptr;
                     validateDefaultCxxFields(typeAndValue, direct,
                         barebraceList);
-                    right = GenerateDefaultValue(typeAndValue);
-                    adoptDefaultCxxRetTemp();
+                    if (!freshBraceInit)
+                    {
+                        right = GenerateDefaultValue(typeAndValue);
+                        adoptDefaultCxxRetTemp();
+                    }
+                    else
+                        right = llvm::Constant::getNullValue(declaredValueType);
                 }
 
                 if (globalInitTempFn != nullptr)
@@ -8232,7 +8292,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 if (global_scope && needsArrayDefaultInit)
                     pendingGlobalDefaultConstruction = true;
 
-                if (right == nullptr && !typeAndValue.Pointer && typeAndValue.ConstArraySize == 0 && !externDeclOnly)
+                if (right == nullptr && !freshBraceInit && !typeAndValue.Pointer
+                    && typeAndValue.ConstArraySize == 0 && !externDeclOnly)
                 {
                     auto structData = compiler->GetDataStructure(typeAndValue.TypeName);
                     if (structData.StructType != nullptr)
@@ -8628,11 +8689,22 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && !HasInterpolation(raw))
                             compiler->RecordCompileTimeStringConstant(name, ProcessRawText(raw));
                     }
-                    // A const-qualified global scalar with a constant-int initializer is foldable
-                    // in an `if const` condition; a mutable global is not (see constFoldableGlobals_).
+                    // Constant scalar globals may fold in compile-time expressions; mutable globals may not.
                     if (!externDeclOnly && DeclSpecHasConst(declSpec)
-                        && llvm::isa_and_nonnull<llvm::ConstantInt>(constant))
+                        && (llvm::isa_and_nonnull<llvm::ConstantInt>(constant)
+                            || llvm::isa_and_nonnull<llvm::ConstantFP>(constant)))
+                    {
                         constFoldableGlobals_.insert(typeAndValue.VariableName);
+                        if (global != nullptr)
+                            constFoldableGlobals_.insert(global->getName().str());
+                    }
+                    if (!externDeclOnly && DeclSpecHasConst(declSpec)
+                        && llvm::isa_and_nonnull<llvm::ConstantFP>(constant))
+                    {
+                        compiler->SetConstGlobalFP(typeAndValue.VariableName);
+                        if (global != nullptr)
+                            compiler->SetConstGlobalFP(global->getName().str());
+                    }
                     // Record the variable's declaration site so LSP go-to-definition
                     // on the variable name lands on the global itself, not on its
                     // (possibly unregistered, e.g. generic-instantiation) type.
@@ -9382,8 +9454,15 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     typeAndValue.TypeName, DescribePointerDeclType(typeAndValue),
                                     CanSuggestAllocation(direct, typeAndValue), typeAndValue.IsUnique);
                             }
-                            else if (!TryEmitContainerInitializer(alloc, typeAndValue, localInitList))
-                                EmitFieldInitializer(alloc, typeAndValue.TypeName, localInitList);
+                            else
+                            {
+                                const bool emittedFreshBrace = freshBraceInit
+                                    && EmitFreshBraceInitializeAggregate(
+                                        alloc, typeAndValue.TypeName, localInitList);
+                                if (!emittedFreshBrace
+                                    && !TryEmitContainerInitializer(alloc, typeAndValue, localInitList))
+                                    EmitFieldInitializer(alloc, typeAndValue.TypeName, localInitList);
+                            }
                         }
 
                         // Taint a string local that borrows an owning string field, so storing it
@@ -11558,7 +11637,7 @@ bool MainListener::RejectMixedOwnershipPointerTernaryJoin(
         llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined,
         llvm::Value* trueStorage, llvm::Value* falseStorage,
         antlr4::ParserRuleContext* trueCtx, antlr4::ParserRuleContext* falseCtx,
-        antlr4::ParserRuleContext* ctx) {
+        antlr4::ParserRuleContext* ctx, std::string* deferredDiagnostic) {
         auto* compiler = Compiler(ctx);
         if (joined == nullptr || !joined->getType()->isPointerTy()) return false;
         // A null arm carries no block at all: `c ? buf : nullptr` allocates nothing on either
@@ -11593,12 +11672,18 @@ bool MainListener::RejectMixedOwnershipPointerTernaryJoin(
         };
         antlr4::ParserRuleContext* owningCtx = trueOwns ? trueCtx : falseCtx;
         antlr4::ParserRuleContext* borrowCtx = trueOwns ? falseCtx : trueCtx;
-        LogErrorContext(ctx, compiler->LocalizeMessage(
+        std::string diagnostic = compiler->LocalizeMessage(
             "'?:' arms differ in ownership: '{}' allocates a value the join cannot own and '{}' "
             "is a borrow of an existing value, so the allocating arm leaks whenever it is taken. "
             "Either 'move' the borrowed side into a fresh value so both arms own, or allocate "
             "into a named owner before the '?:' and make both arms borrows.",
-            { armText(owningCtx), armText(borrowCtx) }));
+            { armText(owningCtx), armText(borrowCtx) });
+        if (deferredDiagnostic != nullptr)
+        {
+            *deferredDiagnostic = std::move(diagnostic);
+            return true;
+        }
+        LogErrorContext(ctx, diagnostic);
         return true;
     }
 

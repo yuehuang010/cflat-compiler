@@ -98,24 +98,59 @@ void MainListener::PrepareLaterCppStructDefinitions(
 }
 
 llvm::Value* MainListener::EmitAggregateFieldInitialization(
-    const std::string& structName,
-    llvm::StructType*& structType,
-    std::vector<LLVMBackend::DeclTypeAndValue>& fields,
-    size_t fieldCount,
-    llvm::Value* destination)
+        const std::string& structName,
+        llvm::StructType*& structType,
+        std::vector<LLVMBackend::DeclTypeAndValue>& fields,
+        size_t fieldCount,
+        llvm::Value* destination,
+        CFlatParser::InitializerListContext* braceOverrides,
+        bool preservePartialScope)
 {
     auto* compiler = Compiler();
     std::vector<llvm::Value*> initializers;
     std::vector<char> initializerUnsigned;
     std::vector<char> initializedInPlace;
+    std::vector<char> skippedOverride;
+    std::unordered_set<std::string> skippedFields;
+    if (braceOverrides != nullptr)
+    {
+        for (auto* fi : braceOverrides->fieldInit())
+        {
+            if (fi->Identifier() == nullptr) continue;
+            const std::string fieldName = fi->Identifier()->getText();
+            if (fi->initializerList() != nullptr)
+            {
+                auto field = std::find_if(fields.begin(), fields.end(), [&](const auto& value) {
+                    return value.VariableName == fieldName;
+                });
+                if (field != fields.end()
+                    && explicitNoArgConstructors_.count(field->TypeName) != 0)
+                    continue;
+            }
+            skippedFields.insert(fieldName);
+        }
+    }
     // In-place construction: fields without an initializer read as 0, like the value seed below.
     if (destination != nullptr)
         compiler->builder->CreateStore(llvm::Constant::getNullValue(structType), destination);
     // A field initializer that unwinds destroys the fields already built.
-    LLVMBackend::UnwindPartialScope partialFields(*compiler);
+    std::optional<LLVMBackend::UnwindPartialScope> partialFields;
+    if (!preservePartialScope)
+        partialFields.emplace(*compiler);
     for (size_t fieldIndex = 0; fieldIndex < fields.size() && fieldIndex < fieldCount; ++fieldIndex)
     {
         auto& field = fields[fieldIndex];
+        if (skippedFields.count(field.VariableName) != 0)
+        {
+            if (destination != nullptr)
+                EmitFieldInitializer(destination, structName, braceOverrides, true,
+                                     &field.VariableName);
+            initializers.push_back(nullptr);
+            initializerUnsigned.push_back(0);
+            initializedInPlace.push_back(0);
+            skippedOverride.push_back(1);
+            continue;
+        }
         llvm::Value* fieldDestination = nullptr;
         if (destination != nullptr && fieldIndex < structType->getNumElements())
             fieldDestination = compiler->builder->CreateStructGEP(
@@ -185,7 +220,8 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                 // leave an unavailable member zeroed there and diagnose at a real construction.
                 std::string ctorError;
                 compiler->TryBindCxxImplicitDefaultCtor(field.TypeName, ctorError);
-                if (compiler->FindCxxDefaultCtor(field.TypeName) != nullptr)
+                if (ctorError.empty()
+                    && compiler->FindCxxDefaultCtor(field.TypeName) != nullptr)
                 {
                     GlobalScopeGuard defaultCtorScope(global_scope);
                     rvalue = GenerateDefaultValue(field);
@@ -220,6 +256,7 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
         initializers.push_back(rvalue);
         initializerUnsigned.push_back(fieldSrcUnsigned ? 1 : 0);
         initializedInPlace.push_back(initializedDirectly ? 1 : 0);
+        skippedOverride.push_back(0);
         if (initializedDirectly)
         {
             if (initializedArrayInPlace)
@@ -240,6 +277,21 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
     }
 
     llvm::Value* structValue = llvm::Constant::getNullValue(structType);
+    auto emitExplicitNoArgNestedOverride = [&](unsigned fieldIndex) {
+        if (destination == nullptr || braceOverrides == nullptr) return;
+        const auto& field = fields[fieldIndex];
+        if (explicitNoArgConstructors_.count(field.TypeName) == 0) return;
+        for (auto* fi : braceOverrides->fieldInit())
+        {
+            if (fi == nullptr || fi->Identifier() == nullptr
+                || fi->Identifier()->getText() != field.VariableName
+                || fi->initializerList() == nullptr)
+                continue;
+            EmitFieldInitializer(destination, structName, braceOverrides, true,
+                                 &field.VariableName);
+            return;
+        }
+    };
     for (unsigned index = 0; index < initializers.size(); ++index)
     {
         if (index >= structType->getNumElements())
@@ -248,8 +300,13 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
         llvm::Value* const firstPassValue = rvalue;
         auto* destType = structType->getTypeAtIndex(index);
         auto& field = fields[index];
-        if (destination != nullptr && initializedInPlace[index])
+        if (index < skippedOverride.size() && skippedOverride[index])
             continue;
+        if (destination != nullptr && initializedInPlace[index])
+        {
+            emitExplicitNoArgNestedOverride(index);
+            continue;
+        }
         llvm::Value* fieldDestination = nullptr;
         if (destination != nullptr)
             fieldDestination = compiler->builder->CreateStructGEP(
@@ -288,6 +345,7 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                 {
                     compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot,
                                                 fieldDestination, field.TypeName);
+                    emitExplicitNoArgNestedOverride(index);
                     continue;
                 }
             }
@@ -326,9 +384,69 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
             if (rvalue != firstPassValue)
                 compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Value, rvalue,
                                             field.TypeName);
+            if (destination != nullptr)
+                emitExplicitNoArgNestedOverride(index);
         }
     }
     return structValue;
+}
+
+bool MainListener::CanFreshBraceInitializeAggregate(
+        const std::string& typeName,
+        CFlatParser::InitializerListContext* list,
+        bool force)
+{
+    if (list == nullptr || list->fieldInit().empty()) return false;
+    const auto fieldInits = list->fieldInit();
+    const bool hasNamedField = std::any_of(fieldInits.begin(), fieldInits.end(),
+        [](auto* fi) { return fi != nullptr && fi->Identifier() != nullptr; });
+    if (!hasNamedField) return false;
+    auto* compiler = Compiler(list);
+    if (explicitNoArgConstructors_.count(typeName) != 0
+        || compiler->IsCxxRecord(typeName)
+        || compiler->GetFunction(typeName) == nullptr)
+        return false;
+    auto data = compiler->GetDataStructure(typeName);
+    if (data.StructType == nullptr || data.IsUnion) return false;
+    if (!force && !compiler->HasForeignNontrivialCxxField(typeName)) return false;
+    return true;
+}
+
+bool MainListener::EmitFreshBraceInitializeAggregate(
+        llvm::Value* destination,
+        const std::string& typeName,
+        CFlatParser::InitializerListContext* list,
+        bool force)
+{
+    if (destination == nullptr || !CanFreshBraceInitializeAggregate(typeName, list, force))
+        return false;
+    auto* compiler = Compiler(list);
+    auto data = compiler->GetDataStructure(typeName);
+    auto fields = data.StructFields;
+    auto* structType = data.StructType;
+    // Keep already-built omitted fields live while the explicit field expressions run.
+    LLVMBackend::UnwindPartialScope building(*compiler);
+    EmitAggregateFieldInitialization(typeName, structType, fields, fields.size(), destination,
+                                     list, true);
+    // Preserve diagnostics for malformed entries that were not handled by a field pass.
+    for (auto* fi : list->fieldInit())
+    {
+        if (fi == nullptr) continue;
+        if (fi->Identifier() == nullptr)
+        {
+            LogErrorContext(fi, std::format(
+                "positional initializers are not supported for struct type '{}'; use 'field = value'",
+                SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName })));
+            continue;
+        }
+        const std::string fieldName = fi->Identifier()->getText();
+        auto field = std::find_if(fields.begin(), fields.end(), [&](const auto& value) {
+            return value.VariableName == fieldName;
+        });
+        if (field == fields.end())
+            EmitFieldInitializer(destination, typeName, list, true, &fieldName);
+    }
+    return true;
 }
 
 void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& nameOverride, const std::string& namespaceName) {
@@ -801,6 +919,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             return false;
         }();
         bool hasExplicitNoArgCtor = !isUnion && (hasBareNoArgCtor || hasAllDefaultedCtor);
+        if (hasExplicitNoArgCtor && !isCppStruct)
+            explicitNoArgConstructors_.insert(structName);
         bool baseHasDefaultCtor = cppBaseName.empty();
         if (!cppBaseName.empty())
         {
@@ -1507,7 +1627,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                         // to GenerateDefaultValue's call site; valid members still get built here.
                         std::string ctorError;
                         compiler->TryBindCxxImplicitDefaultCtor(typeValue.TypeName, ctorError);
-                        if (compiler->FindCxxDefaultCtor(typeValue.TypeName) != nullptr)
+                        if (ctorError.empty()
+                            && compiler->FindCxxDefaultCtor(typeValue.TypeName) != nullptr)
                         {
                             GlobalScopeGuard defaultCtorScope(global_scope);
                             rvalue = GenerateDefaultValue(typeValue);
@@ -4256,6 +4377,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             return false;
         }();
         bool hasExplicitNoArgCtor = hasBareNoArgCtor || hasAllDefaultedCtor;
+        if (hasExplicitNoArgCtor)
+            explicitNoArgConstructors_.insert(structName);
 
         // Create default constructor (skipped when user provides an explicit no-arg ctor)
         if (!hasExplicitNoArgCtor)
@@ -5180,6 +5303,8 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                         // constructor (its field initializers), exactly as the synthetic ctor does.
                         std::string ctorError;
                         compiler->TryBindCxxImplicitDefaultCtor(field.TypeName, ctorError);
+                        if (!ctorError.empty())
+                            LogErrorContext(field.Initializer, ctorError);
                         const bool unavailableCxxDefault = !field.Pointer
                             && compiler->IsCxxRecord(field.TypeName)
                             && compiler->FindCxxDefaultCtor(field.TypeName) == nullptr

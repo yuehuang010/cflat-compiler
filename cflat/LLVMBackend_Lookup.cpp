@@ -739,6 +739,7 @@ bool LLVMBackend::IsCxxRvalueReferenceArgument(const NamedVariable& arg) const
         if (arg.IsCxxMacroGlobal || arg.IsCxxMacroJoin) return true;
         if (arg.IsExplicitMove) return true;
         if (arg.IsRvalue && arg.TypeAndValue.Pointer) return true;
+        if (arg.IsRvalue && arg.TypeAndValue.IsRvalueRef) return true;
         if (arg.IsRvalue && IsConsumableTemporary(arg)) return true;
         if (arg.IsRvalue)
         {

@@ -8,7 +8,7 @@ enum P2iEnum : int { P2I_ZERO = 0, P2I_ONE = 1 };
 int p2iFunction() { return 1; }
 extern void* malloc(i64 size);
 import "c_macro_helpers.h";
-import cpp "cpp_t89_char_pointer.hpp";
+import cpp "cpp_t89_char_pointer.hpp"; import cpp "cpp_interop_ref_member.h";
 void t89TakeI8(i8* value) { }
 void t89TakeCharPP(char** value) { }
 void p2iNativeTakeInt(int* value) {}
@@ -66,7 +66,7 @@ extern int main()
     expect_error("a pointer is not a number") { long x = 0; x |= p; }
     expect_error("a pointer is not a number") { bool c = true; long x = c ? p : q; }
     expect_error("a pointer is not a number") { int* ip = (int*)&n; char x = ip; }
-    expect_error("a pointer is not a number") { int* ip = (int*)&n; double x = ip; }
+    expect_error("a pointer has no floating conversion") { int* ip = (int*)&n; double x = ip; }
     expect_error("a pointer is not a number") { P2iEnum x = p; }
     expect_error("a pointer is not a number") { function<int()>* fp = p2iFunction; long x = fp; }
     expect_error("a pointer is not a number") { int[1] a = {5}; int[] view = a; long x = view; }
@@ -79,7 +79,7 @@ extern int main()
     expect_error("a pointer is not a number") { u32 x = p; }
     expect_error("a pointer is not a number") { i64 x = p; }
     expect_error("a pointer is not a number") { u64 x = p; }
-    expect_error("a pointer is not a number") { float x = p; }
+    expect_error("a pointer has no floating conversion") { float x = p; }
     expect_error("no overload of") { p2iTakeLong(p); }
     expect_error("cannot convert 'i64*' to 'int*' implicitly") {
         int* bad = wp;
@@ -232,6 +232,68 @@ extern int main()
     expect_error("cannot convert 'i8**' to 'char**' implicitly") { i8* t89CPP = nullptr; t89_take_char_pp(&t89CPP); }
     expect_error("cannot convert 'char*' to 'i8*' implicitly") { t89_take_schar(t89CharPtr); }
     expect_error("cannot convert 'i8*' to 'char*' implicitly") { t89_variadic(t89I8Ptr, 1); }
+
+    expect_error("from a value of type 'long*'") { long value = p + 1; }
+    expect_error("from a value of type 'long*'") { long value = q ?? p; }
+    expect_error("from a value of type 'long*'") {
+        bool condition = true; long value = condition ? p : nullptr;
+    }
+    expect_error("from a value of type 'nullptr'") { long value = nullptr; }
+    int[2][2] matrix = default;
+    expect_error("from a value of type 'int[2]'") { int row = matrix[0]; }
+
+    int referent = 4;
+    int* referencedPointer = &referent;
+    cppref.PtrRef h = cppref.PtrRef(&referencedPointer);
+    expect_error("read the pointed-to value with '*h.p'") { int value = h.p; }
+    int valueThroughReference = *h.p;
+
+    expect_error("indirection requires pointer operand ('int' invalid)") {
+        int value = 5;
+        cppref.RefHolder refMember = cppref.make_ref(&value);
+        int bad = *refMember.r;
+    }
+    expect_error("indirection requires pointer operand ('int' invalid)") {
+        int value = 5;
+        cppref.RefHolder refMethod = cppref.make_ref(&value);
+        int bad = *refMethod.ir();
+    }
+    expect_error("indirection requires pointer operand ('int' invalid)") {
+        int x = 3;
+        double d = (double)*x;
+    }
+    expect_error("indirection requires pointer operand ('int' invalid)") {
+        int x = 3;
+        int bad = *x;
+    }
+    expect_error("indirection requires pointer operand ('int' invalid)") {
+        int bad = *5;
+    }
+    expect_error("indirection requires pointer operand ('long' invalid)") {
+        long bad = *5000000000;
+    }
+    expect_error("indirection requires pointer operand ('P2iEnum' invalid)") {
+        P2iEnum value = default;
+        int bad = *value;
+    }
+    expect_error("indirection requires pointer operand ('int' invalid)") {
+        int bad = *p2iFunction();
+    }
+    expect_error("indirection requires pointer operand ('int' invalid)") {
+        int x = 3;
+        i64 bad = sizeof(*x);
+    }
+    expect_error("indirection requires pointer operand ('int' invalid)") {
+        int x = 3;
+        string bad = typeof(*x);
+    }
+    expect_error("indirection requires pointer operand ('int' invalid)") {
+        int x = 3;
+        i64 bad = alignof(*x);
+    }
+
+    expect_error("pointer cannot be cast to type 'double'") { double value = (double)p; }
+    expect_error("pointer cannot be cast to type 'float'") { float value = (float)p; }
     return 0;
 }
 int p2iTakeLong(long value) { return (int)value; }

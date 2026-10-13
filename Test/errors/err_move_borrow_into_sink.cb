@@ -7,6 +7,8 @@ import "unique.cb";
 
 class Ci { int r = 7; ~Ci() { } };
 void sink(move Ci* q) { delete q; }
+struct CiBox { unique Ci* p = nullptr; };
+int identityInt(int value) { return value; }
 
 // 1. The explicit form: `move p` nulls only the callee's copy, so the caller stays sole owner.
 expect_error("cannot move borrowed parameter 'p' into move parameter 'q' of 'sink'") {
@@ -40,6 +42,58 @@ void sinkUnique(unique<IShape> s) { }
 
 expect_error("cannot move borrowed parameter 'borrowed' into move parameter 's' of 'sinkUnique'") {
     void uniqueParamMove(IShape borrowed) { sinkUnique(move borrowed); }
+}
+
+// A ternary PHI has no single source slot, but either borrowed arm would still be freed by the caller.
+expect_error("cannot move borrowed parameter 'borrowed' into move parameter 'q' of 'sink'") {
+    void conditionalBothBorrowed(Ci* borrowed, bool c) { sink(c ? borrowed : borrowed); }
+}
+
+// Defer the mixed ownership join until overload matching so the sink error names the borrowed arm.
+expect_error("cannot move borrowed parameter 'borrowed' into move parameter 'q' of 'sink'") {
+    void conditionalNewAndBorrowed(Ci* borrowed, bool c) { sink(c ? new Ci() : borrowed); }
+}
+
+// A one-hop local copy keeps the same borrowed origin through the join.
+expect_error("cannot move borrowed pointer 'copy' (copied from parameter 'borrowed') into move parameter 'q' of 'sink'") {
+    void conditionalCopiedBorrow(Ci* borrowed, bool c)
+    {
+        Ci* copy = borrowed;
+        sink(c ? copy : copy);
+    }
+}
+
+// Indirect calls and nested argument expressions must deliver the mixed-ownership diagnostic.
+expect_error("borrowed side into a fresh value") {
+    void conditionalFunctionValue(Ci* borrowed, bool c)
+    {
+        function<int(Ci*)> g = (Ci* q) => { return q->r; };
+        g(c ? new Ci() : borrowed);
+    }
+}
+
+expect_error("borrowed side into a fresh value") {
+    int conditionalImmediateLambda(Ci* borrowed, bool c)
+    {
+        return ((Ci* q) => { return q->r; })(c ? new Ci() : borrowed);
+    }
+}
+
+expect_error("borrowed side into a fresh value") {
+    int conditionalArgumentSubexpression(Ci* borrowed, bool c)
+    {
+        return identityInt((c ? new Ci() : borrowed)->r);
+    }
+}
+
+expect_error("use of moved variable 's.p'") {
+    void conditionalFieldMoveThenRead(bool c)
+    {
+        CiBox s;
+        s.p = new Ci();
+        sink(c ? new Ci() : s.p);
+        int value = s.p->r;
+    }
 }
 
 extern int main()

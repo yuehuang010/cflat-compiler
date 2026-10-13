@@ -2347,6 +2347,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             if (auto* tu = computeUnit->translationUnit())
             {
                 scanner.SeedConstIntGlobals(tu);
+                scanner.SeedConstFloatingGlobals(tu);
                 scanner.ScanGenericInterfaceTemplateNames(tu);
                 scanner.PreRegisterCppStructNames(tu);
                 // Type aliases first: MangleTypeArg folds them, and both passes must see the same
@@ -3625,6 +3626,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         if (auto* tu = computeUnit->translationUnit())
         {
             scanner.SeedConstIntGlobals(tu);
+            scanner.SeedConstFloatingGlobals(tu);
             scanner.ScanGenericInterfaceTemplateNames(tu);
             scanner.PreRegisterCppStructNames(tu);
             // Type aliases first (see the main-file scan for why).
@@ -4602,6 +4604,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
             if (auto* tu = computeUnit->translationUnit())
             {
                 scanner.SeedConstIntGlobals(tu);
+                scanner.SeedConstFloatingGlobals(tu);
                 scanner.ScanGenericInterfaceTemplateNames(tu);
                 scanner.PreRegisterCppStructNames(tu);
                 // Type aliases first: MangleTypeArg folds them, and both passes must see the same
@@ -5042,6 +5045,7 @@ void LLVMBackend::ResetForReanalysis()
     returnBlockTable.clear();
     compileTimeMacros.clear();
     constGlobalInts_.clear();
+    constGlobalFPs_.clear();
     stringLiteralLenByPtr.clear();
     strConcatRegistered = false;
     stringDtorRegistered = false;
@@ -6907,6 +6911,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.IsCxxRefToPointer)      o["crp"] = true;
     if (s.IsCxxConstRef)          o["ccr"] = true;
     if (s.IsCxxPointeeConst)      o["cpc"] = true;
+    if (s.IsCxxPointeeVolatile)   o["cpv"] = true;
     if (s.IsSpelledPointeeConst)  o["spc"] = true;
     if (s.IsCxxNullptrT)          o["cnt"] = true;
     if (s.IsCxxConstField)        o["ccf"] = true;
@@ -6995,6 +7000,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("crp")) s.IsCxxRefToPointer = *v;
     if (auto v = o.getBoolean("ccr")) s.IsCxxConstRef = *v;
     if (auto v = o.getBoolean("cpc")) s.IsCxxPointeeConst = *v;
+    if (auto v = o.getBoolean("cpv")) s.IsCxxPointeeVolatile = *v;
     if (auto v = o.getBoolean("spc")) s.IsSpelledPointeeConst = *v;
     if (auto v = o.getBoolean("cnt")) s.IsCxxNullptrT = *v;
     if (auto v = o.getBoolean("ccf")) s.IsCxxConstField = *v;
@@ -7438,10 +7444,9 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
         llvm::TimeTraceScope buildScope("CoreCacheJsonBuild", prefix);
     // Each version added tables an older cache lacks, so an older cache must be rejected rather
     // than silently reused (v6 includes the LSP core-variable replay state; v8 is the non-pointer
-    // `alias T` parameter reference ABI - such a parameter is now passed as a pointer to the
-    // caller's object, so cached v7 core bitcode has the wrong calling convention for it; v11:
-    // closure capture-cleanup fns gained MOVE mode 2 - a v10 one would run FREE for it).
-    root["version"]   = 11;
+    // `alias T` parameter reference ABI; v11 adds closure capture-cleanup MOVE mode 2; v12 adds
+    // const floating global admission names).
+    root["version"]   = 12;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
 #if defined(__APPLE__)
@@ -7640,6 +7645,11 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
             arr.push_back(std::move(go));
         }
         root["globals"] = std::move(arr);
+    }
+    {
+        llvm::json::Array arr;
+        for (const auto& name : constGlobalFPs_) arr.push_back(name);
+        root["const_global_fp_names"] = std::move(arr);
     }
 
     // LSP symbol definitions are emitted by the core listener walk. Keep them in a sidecar so
@@ -7918,7 +7928,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 11) return false;  // v10 cleanup fns lack closure MOVE mode 2
+    if (!ver || *ver != 12) return false;  // v11 lacks const floating global admission names
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != coreHash) return false;
 #if defined(__APPLE__)
@@ -7994,6 +8004,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     annotationRegistry.clear();
     globalNamedVariable.clear();
     globalVariableTypes.clear();
+    constGlobalFPs_.clear();
     globalDeclSite.clear();
     coreSymbolIndex_.Clear();
     manifestFragments_.clear();
@@ -8268,6 +8279,9 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (auto* to = go->getObject("type"))
                 globalVariableTypes[gname->str()] = DeserializeTav(*to);
         }
+    if (auto* arr = root->getArray("const_global_fp_names"))
+        for (auto& elem : *arr)
+            if (auto name = elem.getAsString()) constGlobalFPs_.insert(name->str());
 
     } // end CoreDes:Globals
 

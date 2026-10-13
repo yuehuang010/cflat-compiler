@@ -12,6 +12,7 @@ struct Val { int a; int b; int sum() const { return a + b; } };
 struct RefHolder {
     int& r;
     explicit RefHolder(int& x) : r(x) {}
+    int& ir() { return r; }
     int get() const { return r; }
     void set(int v) { r = v; }
 };

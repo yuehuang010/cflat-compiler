@@ -287,6 +287,9 @@ struct GenericTemplateState
     // would change which key a bare argument spelling resolves to. Read only by the scanner's
     // pointer-alias pre-registration, where enumBackingTypes is still empty.
     std::unordered_set<std::string>                                             scannedEnumNames;
+    // Non-function enum keys are also used to canonicalize namespaced enum arguments in the
+    // generic-use pre-scan, which runs before ScanExternalDeclaration registers their backing types.
+    std::unordered_set<std::string>                                             scannedNonLocalEnumNames;
     // Template key -> the NAMESPACE it was declared in, recorded at registration. It CANNOT be
     // derived from the key: struct nesting and namespace nesting share one dotted key space, so a
     // template nested in `struct Outer` is keyed "Outer.Box" exactly like one in `namespace Outer`.
@@ -863,6 +866,8 @@ public:
         // C++ pointer result whose innermost POINTEE is const (`const T*`, `const T*&`,
         // `T const *const &`, `const T *const *`). Internal only: overload ranking and receivers.
         bool IsCxxPointeeConst = false;
+        // C++ receiver whose innermost pointee or referent is volatile.
+        bool IsCxxPointeeVolatile = false;
         // Spelled `const T*` (pointee const). CFlat drops const; only the C++ spelling of a CFlat
         // function's type reads it, so `int f(const void*)` crosses as clang spells it.
         bool IsSpelledPointeeConst = false;
@@ -1270,6 +1275,7 @@ public:
         bool IsCxxRefToPointer = false;
         bool IsCxxConstRef = false;
         bool IsCxxPointeeConst = false;
+        bool IsCxxPointeeVolatile = false;
         bool IsSpelledPointeeConst = false;
         bool IsCxxNullptrT = false;
         bool IsCxxConstField = false;
@@ -1340,6 +1346,7 @@ public:
             s.IsCxxRefToPointer = t.IsCxxRefToPointer;
             s.IsCxxConstRef = t.IsCxxConstRef;
             s.IsCxxPointeeConst = t.IsCxxPointeeConst;
+            s.IsCxxPointeeVolatile = t.IsCxxPointeeVolatile;
             s.IsSpelledPointeeConst = t.IsSpelledPointeeConst;
             s.IsCxxNullptrT = t.IsCxxNullptrT;
             s.IsCxxConstField = t.IsCxxConstField;
@@ -1411,6 +1418,7 @@ public:
             t.IsCxxRefToPointer = IsCxxRefToPointer;
             t.IsCxxConstRef = IsCxxConstRef;
             t.IsCxxPointeeConst = IsCxxPointeeConst;
+            t.IsCxxPointeeVolatile = IsCxxPointeeVolatile;
             t.IsSpelledPointeeConst = IsSpelledPointeeConst;
             t.IsCxxNullptrT = IsCxxNullptrT;
             t.IsCxxConstField = IsCxxConstField;
@@ -1533,6 +1541,10 @@ public:
         bool IsElementAccess = false;
         // Raw owning local pointer arm: the only source a non-owning-sink `move` param consumes.
         bool OwningLocalPointer = false;
+        bool MoveParamSinkArgument = false;
+        bool BorrowedPointer = false;
+        std::string BorrowedOrigin;
+        std::string DeferredDiagnostic;
     };
 
     struct NamedVariable
@@ -1610,6 +1622,8 @@ public:
         // -1 unknown, 0 not an lvalue, 1 lvalue designator, 2 call (lvalue only via a T& result),
         // 3 assignment (`i = 3`, `i += 3`). Transient call-site metadata; never cache-serialized.
         int8_t CxxLvalueKind = -1;
+        // The unary operator path carries the operand address for either `this` or a free ref arg.
+        bool IsCxxUnaryOperatorReceiver = false;
         // Non-null when Primary is the POINTER a C++ operator returned for a `T&` result: the
         // referenced value type, carried through a parenthesized sub-expression.
         llvm::Type* CxxRefValueType = nullptr;
@@ -1707,6 +1721,7 @@ public:
         std::vector<std::string> BondedSources; // names of bond parameters this value borrows from
         bool ContainsBondedClosure = false; // a field stores a closure borrowing the holder's frame
         bool FieldPathThroughPointer = false; // a field path crossed a pointer or heap object
+        bool CxxLvalueReceiver = false; // operator receiver handed over as the caller's own object
         // The block that established the bond. A rebind in a nested block is conditional at the
         // later source use and must not retire the bond for the whole function.
         llvm::BasicBlock* BondDeclBlock = nullptr;
@@ -2117,8 +2132,10 @@ public:
         bool ReturnsAliasOfByValueParam = false;
         bool IsMethod = false;     // true when registered as a struct/class method (has implicit self pointer)
         bool IsCxx = false;        // declaration came from a C++ header
+        bool IsDeleted = false;    // retained as a C++ overload candidate, rejected if selected
+        bool IsCxxTemplateSpecialization = false;
         int CxxRefQualifier = cflat_cinterop::CxxRefQualifierNone;
-        bool CxxVolatile = false;  // volatile-qualified C++ member; loses to a non-volatile twin
+        bool CxxVolatile = false;  // volatile-qualified C++ member declaration
         bool CxxConst = false;     // const-qualified C++ instance member
         bool IsNoexcept = true;    // potentially throwing C++ calls are gated until EH support
         bool IsCInteropAlias = false;
@@ -3189,6 +3206,10 @@ private:
     void EmitError(std::string message, std::string sourceMessage = {}) const;
     void LogErrorMessage(std::string englishTemplate,
                          std::vector<std::string> arguments = {}) const;
+    void LogBorrowedPointerMoveSinkError(const std::string& sourceDescription,
+                                         const std::string& parameterName,
+                                         const std::string& functionName,
+                                         const std::string& declaredName) const;
     // "'Box' is a generic type; type arguments are required ..." for bare `Box` and `Box<>`.
     void LogGenericTypeArgsRequired(const std::string& displayName,
                                     const std::vector<std::string>& parameterNames) const;
@@ -3707,6 +3728,8 @@ private:
      * through a C++ const reference result. 2 and 3 are read-only storage.
      */
     int CxxConstReceiverKind(const NamedVariable& receiver) const;
+    int CxxReceiverCv(const NamedVariable& receiver) const;
+    bool IsCxxObjectRvalue(const NamedVariable& receiver) const;
     // True when this call shape has only a public non-const member, including one inherited
     // from a single public non-virtual base.
     bool CxxMemberIsOnlyNonConst(const std::string& recordName, const std::string& memberName,
@@ -3912,6 +3935,8 @@ private:
         bool isCxx = false;
         bool isInline = false;
         bool isStaticInline = false;
+        bool isDeleted = false;
+        bool isTemplateSpecialization = false;
         std::vector<std::string> inlineDefines;
         std::vector<std::string> inlineHeaders;
         // Shared by every inline signature of one header group (never copied per signature).
@@ -4342,6 +4367,8 @@ private:
 
     // Fold-only view of file-scope `const` integer globals (see SetConstGlobalInt).
     std::unordered_map<std::string, int64_t> constGlobalInts_;
+    // Names of file-scope `const` floating globals used to re-admit imported declarations.
+    std::set<std::string> constGlobalFPs_;
     // A -D define from the command line. Parsed once at arg time; re-applied by
     // SetPlatformMacros on every (re)analysis since compileTimeMacros is cleared.
     struct UserDefine
@@ -6327,6 +6354,7 @@ private:
         bool instanceMember = false;
         bool staticMember = false;
         bool constMember = false;
+        bool volatileMember = false;
         int refQualifier = cflat_cinterop::CxxRefQualifierNone;
         bool isNoexcept = true;
         std::string file;
@@ -9362,6 +9390,9 @@ public:
     // template specialization, or a class declared outside the bound header scope.
     bool CxxClassMayHaveUnregisteredOperators(const std::string& typeName) const;
     bool CxxClassDeclaresFriendOperators(const std::string& typeName) const;
+    std::string CxxDeletedOperatorError(const std::string& typeName,
+                                        const std::string& operatorName) const;
+    bool CxxHasDeletedAssignment(const std::string& typeName, bool useMove) const;
     bool CxxProtectedAccessAllowed(const std::string& typeName,
                                    bool accessedThroughCurrentObject) const;
 
@@ -10008,7 +10039,7 @@ public:
     // linkageName: optional override of the emitted LLVM symbol for externs. A namespaced
     // extern (namespace os.windows { extern ... Sleep(...); }) registers in the function
     // table under the qualified lookup name but must link against the bare C symbol.
-    void CreateFunctionDeclaration(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, const std::string& linkageName = {}, bool isCxx = false, bool isNoexcept = true, int cxxRefQualifier = cflat_cinterop::CxxRefQualifierNone);
+    void CreateFunctionDeclaration(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, const std::string& linkageName = {}, bool isCxx = false, bool isNoexcept = true, int cxxRefQualifier = cflat_cinterop::CxxRefQualifierNone, bool isDeleted = false);
 
     // Return the FunctionSymbol whose LLVM function pointer matches fn, or nullptr.
     const FunctionSymbol* GetFunctionSymbol(llvm::Function* fn) const;
@@ -10522,15 +10553,17 @@ public:
         std::string userFunction;
         int second = 0;
         bool cxxViable = false;
+        bool implicitObjectCvNonViable = false;
         std::vector<std::string> ambiguousOperators;
         std::string from;   // the argument's type as ranked, for diagnostics
         // Same-rank tie-breakers ([over.ics.rank] 3.2.5 / 3.2.6 / 4.4): a reference or pointer
-        // binding to `cvBase` itself, `cv` 1 when const-qualified; a derived-to-base (or to
-        // `void*`) conversion from `from` to `toClass`; an implicit object's ref-qualifier.
+        // binding to `cvBase` itself, `cv` bit 1 const and bit 2 volatile; a derived-to-base (or
+        // to `void*`) conversion from `from` to `toClass`; an implicit object's ref-qualifier.
         std::string cvBase;
         int cv = 0;
         std::string toClass;
         int objectRef = 0;
+        bool objectIsRvalue = false;
         // [over.ics.rank] 3.2.3: a converting-ctor temporary bound to `refTarget&&` (1)
         // beats one bound to `const refTarget&` (2).
         std::string refTarget;
@@ -11165,6 +11198,8 @@ public:
      */
     void SetConstGlobalInt(const std::string& name, int64_t value);
     bool TryGetConstGlobalInt(const std::string& name, int64_t& out) const;
+    void SetConstGlobalFP(const std::string& name);
+    bool IsConstGlobalFP(const std::string& name) const;
 
     StructData GetDataStructure(const std::string& structName);
 
@@ -11937,7 +11972,9 @@ public:
     //      replayed with the old flag.
     // 239: C++ member signature caches retain whether an inline definition came from the header.
     // 240: generated class wrapper requests include recursively owned template argument headers.
-    static constexpr int kCHeaderCacheVersion = 240;
+    // 241: C++ signatures retain deleted and explicit-specialization status (T116).
+    // 242: C++ signatures retain volatile pointee/referent receiver qualification.
+    static constexpr int kCHeaderCacheVersion = 242;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

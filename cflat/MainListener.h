@@ -1539,6 +1539,147 @@ static CFlatParser::GenericTypeParametersContext* GenericSpecOf(
     return nullptr;
 }
 
+static std::unordered_set<std::string> CollectFunctionLocalEnumNames(
+    CFlatParser::FunctionDefinitionContext* function)
+{
+    std::unordered_set<std::string> names;
+    if (function == nullptr || function->compoundStatement() == nullptr) return names;
+    std::function<void(antlr4::tree::ParseTree*)> visit = [&](antlr4::tree::ParseTree* node)
+    {
+        if (auto* enumSpec = dynamic_cast<CFlatParser::EnumSpecifierContext*>(node);
+            enumSpec != nullptr && enumSpec->Identifier() != nullptr)
+            names.insert(enumSpec->Identifier()->getText());
+        if (!node->children.empty())
+            for (auto* child : node->children) visit(child);
+    };
+    visit(function->compoundStatement());
+    return names;
+}
+
+static bool TypeArgumentNamesFunctionLocalEnum(
+    CFlatParser::TypeParameterEntryContext* entry,
+    const std::unordered_set<std::string>& localEnumNames)
+{
+    if (entry == nullptr || entry->typeSpecifier() == nullptr) return false;
+    auto* typeSpec = entry->typeSpecifier();
+    std::string nestedBase;
+    if (auto* nested = GenericSpecOf(typeSpec, nestedBase))
+        for (auto* nestedEntry : nested->typeParameterList()->typeParameterEntry())
+            if (TypeArgumentNamesFunctionLocalEnum(nestedEntry, localEnumNames)) return true;
+    if (auto* memberType = typeSpec->memberTypeSpecifier())
+        if (auto* ownerParams = memberType->memberTypeOwner()->genericTypeParameters())
+            for (auto* nestedEntry : ownerParams->typeParameterList()->typeParameterEntry())
+                if (TypeArgumentNamesFunctionLocalEnum(nestedEntry, localEnumNames)) return true;
+    // The grammar can represent a plain name through either identifier rule as it grows
+    // qualified type syntax. Match the full plain type spelling after nested args were checked.
+    return localEnumNames.count(typeSpec->getText()) != 0;
+}
+
+static bool GenericArgumentsNameFunctionLocalEnum(
+    CFlatParser::GenericTypeParametersContext* params,
+    const std::unordered_set<std::string>* localEnumNames)
+{
+    if (params == nullptr || localEnumNames == nullptr || localEnumNames->empty()) return false;
+    for (auto* entry : params->typeParameterList()->typeParameterEntry())
+        if (TypeArgumentNamesFunctionLocalEnum(entry, *localEnumNames)) return true;
+    return false;
+}
+
+static bool TypeArgumentNeedsFunctionLocalEnumDeferral(
+    CFlatParser::TypeParameterEntryContext* entry,
+    const std::unordered_set<std::string>& localEnumNames,
+    LLVMBackend* compiler,
+    const std::unordered_set<std::string>* scannedNonLocalEnumNames,
+    const std::unordered_set<std::string>* scannedTypeNames)
+{
+    if (entry == nullptr || entry->typeSpecifier() == nullptr || compiler == nullptr) return false;
+    auto* typeSpec = entry->typeSpecifier();
+    std::string nestedBase;
+    if (auto* nested = GenericSpecOf(typeSpec, nestedBase))
+        for (auto* nestedEntry : nested->typeParameterList()->typeParameterEntry())
+            if (TypeArgumentNeedsFunctionLocalEnumDeferral(nestedEntry, localEnumNames, compiler,
+                    scannedNonLocalEnumNames, scannedTypeNames))
+                return true;
+    if (auto* memberType = typeSpec->memberTypeSpecifier())
+        if (auto* ownerParams = memberType->memberTypeOwner()->genericTypeParameters())
+            for (auto* nestedEntry : ownerParams->typeParameterList()->typeParameterEntry())
+                if (TypeArgumentNeedsFunctionLocalEnumDeferral(
+                        nestedEntry, localEnumNames, compiler,
+                        scannedNonLocalEnumNames, scannedTypeNames))
+                    return true;
+
+    const std::string spelling = typeSpec->getText();
+    if (localEnumNames.count(spelling) == 0) return false;
+    const std::string resolved = compiler->ResolveTypeArgBaseName(spelling);
+    const std::string enumKey = compiler->ResolveEnumTypeName(spelling);
+    if (!enumKey.empty())
+        return enumKey.find('@') != std::string::npos || compiler->IsGenericLocalEnumKey(enumKey);
+    const std::string alias = compiler->ResolveTypeAlias(spelling);
+    if (alias.find('@') != std::string::npos || compiler->IsGenericLocalEnumKey(alias)) return true;
+    if (compiler->IsDataStructure(spelling) || compiler->IsDataStructure(resolved)
+        || compiler->HasInterface(spelling) || compiler->HasInterface(resolved)
+        || (!alias.empty() && alias != spelling && compiler->IsKnownTypeName(alias)))
+        return false;
+    const auto isScannedNonLocalType = [scannedNonLocalEnumNames, scannedTypeNames](
+        const std::string& candidate) {
+        return (scannedNonLocalEnumNames != nullptr
+                && scannedNonLocalEnumNames->count(candidate) != 0)
+            || (scannedTypeNames != nullptr && scannedTypeNames->count(candidate) != 0);
+    };
+    return compiler->FirstVisibleScopedKey(resolved.empty() ? spelling : resolved,
+        isScannedNonLocalType, ScopedLookupOptions{ .ResolveFirstComponentAlias = false }).empty();
+}
+
+static bool GenericArgumentsNeedFunctionLocalEnumDeferral(
+    CFlatParser::GenericTypeParametersContext* params,
+    const std::unordered_set<std::string>* localEnumNames,
+    LLVMBackend* compiler,
+    const std::unordered_set<std::string>* scannedNonLocalEnumNames,
+    const std::unordered_set<std::string>* scannedTypeNames)
+{
+    if (params == nullptr || localEnumNames == nullptr || localEnumNames->empty()) return false;
+    for (auto* entry : params->typeParameterList()->typeParameterEntry())
+        if (TypeArgumentNeedsFunctionLocalEnumDeferral(entry, *localEnumNames, compiler,
+                scannedNonLocalEnumNames, scannedTypeNames))
+            return true;
+    return false;
+}
+
+static bool TypeArgumentUsesRegisteredLocalEnum(
+    CFlatParser::TypeParameterEntryContext* entry,
+    LLVMBackend* compiler,
+    const std::unordered_map<std::string, std::string>* substitutions = nullptr)
+{
+    if (entry == nullptr || entry->typeSpecifier() == nullptr || compiler == nullptr) return false;
+    auto* typeSpec = entry->typeSpecifier();
+    std::string nestedBase;
+    if (auto* nested = GenericSpecOf(typeSpec, nestedBase))
+        for (auto* nestedEntry : nested->typeParameterList()->typeParameterEntry())
+            if (TypeArgumentUsesRegisteredLocalEnum(nestedEntry, compiler, substitutions)) return true;
+    if (auto* memberType = typeSpec->memberTypeSpecifier())
+        if (auto* ownerParams = memberType->memberTypeOwner()->genericTypeParameters())
+            for (auto* nestedEntry : ownerParams->typeParameterList()->typeParameterEntry())
+                if (TypeArgumentUsesRegisteredLocalEnum(nestedEntry, compiler, substitutions))
+                    return true;
+
+    std::string spelling = CanonicalTemplateTypeArgument(entry);
+    if (substitutions != nullptr)
+        if (auto it = substitutions->find(spelling); it != substitutions->end()) spelling = it->second;
+    const std::string enumKey = compiler->ResolveEnumTypeName(spelling);
+    return !enumKey.empty() && compiler->IsGenericLocalEnumKey(enumKey);
+}
+
+static bool GenericArgumentsUseRegisteredLocalEnum(
+    CFlatParser::GenericTypeParametersContext* params,
+    LLVMBackend* compiler,
+    const std::unordered_map<std::string, std::string>* substitutions = nullptr)
+{
+    if (params == nullptr) return false;
+    for (auto* entry : params->typeParameterList()->typeParameterEntry())
+        if (TypeArgumentUsesRegisteredLocalEnum(entry, compiler, substitutions)) return true;
+    return false;
+}
+
 // Build the symbol-safe encoded name for a closure type used as a generic argument (gap a).
 // Length-prefixed components keep it collision-free; the result contains only [A-Za-z0-9_].
 // The type model holds two pointer levels (Pointer + ElemPointer), so a written depth of 3+ can
@@ -3590,6 +3731,7 @@ public:
 
     // Seed file-scope const integer globals into the scanner's compile-time macro set.
     void SeedConstIntGlobals(CFlatParser::TranslationUnitContext* tu);
+    void SeedConstFloatingGlobals(CFlatParser::TranslationUnitContext* tu);
 
     // Resolve a type-argument entry to the same string MainListener::ResolveTypeArgEntry
     // would produce at the top level (no active substitutions during the forward scan),
@@ -3695,7 +3837,8 @@ public:
     // struct type + default constructor for each generic instantiation found.
     // This ensures that Box<MyType> references inside function bodies resolve
     // correctly during the main pass, before ProcessPendingInstantiations runs.
-    void ScanGenericTypeUses(antlr4::RuleContext* ctx);
+    void ScanGenericTypeUses(antlr4::RuleContext* ctx,
+        const std::unordered_set<std::string>* localEnumNames = nullptr);
 
     // Build the function-pointer TypeAndValue for a `function<R(Args)>` spec - the resolved form
     // a `using Cb = function<R(Args)>;` alias stores and that ParseDeclarationSpecifiers expands.
@@ -3758,9 +3901,13 @@ private:
     std::string sourceFileName;
     std::string importNamespace_;
     unsigned addressOfOperandDepth_ = 0;
+    std::unordered_map<CFlatParser::FunctionDefinitionContext*,
+        std::unordered_set<std::string>> functionLocalEnumNamesCache_;
 
     LLVMBackend* Compiler(antlr4::ParserRuleContext* ctx);
     inline LLVMBackend* Compiler() { return compilerLLVM; }
+    const std::unordered_set<std::string>& FunctionLocalEnumNames(
+        CFlatParser::FunctionDefinitionContext* function);
 
 public:
     void enterTranslationUnit(CFlatParser::TranslationUnitContext* ctx) override
@@ -4552,6 +4699,7 @@ public:
     // const-qualified global scalars and enum members. A plain mutable global is excluded, so
     // its initializer is never folded into an if-const decision (it stays a runtime value).
     std::unordered_set<std::string> constFoldableGlobals_;
+    std::unordered_set<std::string> explicitNoArgConstructors_;
 
     // True when a global declaration carries the `const` type qualifier.
     static bool DeclSpecHasConst(CFlatParser::DeclarationSpecifiersContext* declSpec);
@@ -5503,7 +5651,7 @@ public:
         llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined,
         llvm::Value* trueStorage, llvm::Value* falseStorage,
         antlr4::ParserRuleContext* trueCtx, antlr4::ParserRuleContext* falseCtx,
-        antlr4::ParserRuleContext* ctx);
+        antlr4::ParserRuleContext* ctx, std::string* deferredDiagnostic = nullptr);
 
     // Shared declaration/assignment predicate for borrowing a named owning pointer source.
     bool ShouldBorrowPlainPointerBinding(
@@ -6123,6 +6271,9 @@ public:
     bool CollectOwningLocalPointerArm(const LLVMBackend::TypedValue& shape, llvm::Value* value,
         llvm::Value* storage, llvm::BasicBlock* armBlock, antlr4::ParserRuleContext* armCtx,
         std::vector<LLVMBackend::ConditionalMoveSource>& out);
+    bool CollectBorrowedPointerArm(const LLVMBackend::TypedValue& shape, llvm::Value* value,
+        llvm::Value* storage, llvm::BasicBlock* armBlock,
+        std::vector<LLVMBackend::ConditionalMoveSource>& out);
     LLVMBackend::TypedValue ParseTernaryBranches(
         CFlatParser::ConditionalExpressionContext* ctx,
         const LLVMBackend::TypedValue& condTv,
@@ -6547,7 +6698,9 @@ public:
         bool rhsExplicitMove = false,
         bool lhsExplicitMove = false,
         bool lhsCxxNullptrT = false,
-        bool rhsCxxNullptrT = false);
+        bool rhsCxxNullptrT = false,
+        // lhsStorage is a materialized copy of a prvalue left operand, not the caller's lvalue.
+        bool lhsMaterializedPrvalue = false);
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);
@@ -6565,7 +6718,8 @@ public:
                                      LLVMBackend::NamedVariable& namedVar,
                                      const LLVMBackend::TypeAndValue& destTypeName);
 
-    LLVMBackend::TypeAndValue ParseTypeName(CFlatParser::TypeNameContext* ctx, bool allowSizedArray = false);
+    LLVMBackend::TypeAndValue ParseTypeName(CFlatParser::TypeNameContext* ctx,
+        bool allowSizedArray = false, antlr4::ParserRuleContext* useSite = nullptr);
 
     LLVMBackend::NamedVariable ParseUnaryExpression(CFlatParser::UnaryExpressionContext* ctx,
                                                     ResultUse use = ResultUse::Value);
@@ -6651,7 +6805,9 @@ public:
         const std::string& fieldName,
         LLVMBackend::NamedVariable& rightNV,
         const LLVMBackend::OwnedTempMark& ownedTempMark,
-        antlr4::ParserRuleContext* errCtx);
+        antlr4::ParserRuleContext* errCtx,
+        bool destinationIsFresh = false,
+        bool deferForeignReplacementDrop = false);
 
     // A C++ `operator=(U)` on `typeName` for a non-T source; null when none binds. `refusal` is
     // set when C++ would call one that CFlat's call rules refuse.
@@ -6691,7 +6847,9 @@ public:
         llvm::Value* sourceValue,
         const LLVMBackend::OwnedTempMark& ownedTempMark,
         const char* context,
-        antlr4::ParserRuleContext* errCtx);
+        antlr4::ParserRuleContext* errCtx,
+        bool intoFreshSlot = false,
+        bool replaceExistingAfterConversion = false);
     void DestroyForeignCxxRelocationSource(const LLVMBackend::NamedVariable& sourceNV);
     bool EmitForeignCxxFixedArrayIntoSlot(
         const LLVMBackend::DeclTypeAndValue& field,
@@ -6799,7 +6957,19 @@ public:
         llvm::StructType*& structType,
         std::vector<LLVMBackend::DeclTypeAndValue>& fields,
         size_t fieldCount = SIZE_MAX,
-        llvm::Value* destination = nullptr);
+        llvm::Value* destination = nullptr,
+        CFlatParser::InitializerListContext* braceOverrides = nullptr,
+        bool preservePartialScope = false);
+
+    bool CanFreshBraceInitializeAggregate(
+        const std::string& typeName,
+        CFlatParser::InitializerListContext* list,
+        bool force = false);
+    bool EmitFreshBraceInitializeAggregate(
+        llvm::Value* destination,
+        const std::string& typeName,
+        CFlatParser::InitializerListContext* list,
+        bool force = false);
 
     /*
      * The fixed-array arm of the above. The list is POSITIONAL, so the value has to be built
@@ -6893,7 +7063,10 @@ public:
     void EmitFieldInitializer(
         llvm::Value* structPtr,
         const std::string& typeName,
-        CFlatParser::InitializerListContext* ctx);
+        CFlatParser::InitializerListContext* ctx,
+        bool destinationIsFresh = false,
+        const std::string* onlyField = nullptr,
+        bool deferForeignReplacementDrop = false);
 
     bool RejectNestedNamedBraceInitializer(
         CFlatParser::InitializerListContext* list,
@@ -6954,7 +7127,8 @@ public:
         const std::string& name,
         const LLVMBackend::TypeAndValue& tv,
         CFlatParser::InitializerListContext* initList,
-        llvm::Value* arrAlloc);
+        llvm::Value* arrAlloc,
+        bool updateExistingElements = false);
 
     // Name the initializer for a diagnostic hint: "a", "h.d", or a neutral placeholder.
     static std::string DescribeInitializerPath(const std::string& callerName,
@@ -7041,6 +7215,8 @@ public:
     static bool TryFoldConstInt(llvm::Value* v, uint64_t& out,
                                 const std::unordered_set<std::string>* constGlobals = nullptr,
                                 const std::unordered_set<std::string>* extraGlobals = nullptr);
+    void AdmitConstFloatingGlobal(LLVMBackend* compiler, const std::string& sourceName,
+                                  llvm::GlobalVariable* global);
 
     // Resolve a GLOBAL array dimension to a compile-time constant. The size IR is built inside
     // a throwaway function so its loads/arithmetic never leak into the program-init block, then
@@ -7441,7 +7617,8 @@ public:
     // Skips generic template struct definition bodies (contain unbound type parameters).
     // topLevel pushes a scratch alias frame: body-scope `using` renames this pre-scan meets
     // bind in source order and are discarded before the real walk registers them again.
-    void ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool topLevel = true);
+    void ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool topLevel = true,
+        const std::unordered_set<std::string>* localEnumNames = nullptr);
 
     // Check if a declaration uses a generic type and queue it for instantiation if needed.
     // Instantiation is deferred to avoid interrupting code generation in the current context.
@@ -7449,6 +7626,11 @@ public:
 
     // Compute the mangled name for a generic instantiation, e.g. Box<int, float> -> "Box$int$float".
     std::string MangledGenericName(const std::string& baseName, const std::vector<std::string>& typeArgs);
+    void ResolveEnumTypeArguments(std::vector<std::string>& typeArgs);
+    bool QueueAndProcessLocalEnumInstantiation(
+        CFlatParser::GenericTypeParametersContext* params,
+        const std::string& baseName, const std::vector<std::string>& typeArgs,
+        const std::string& mangledName, antlr4::ParserRuleContext* site);
 
     // Process all pending generic instantiations that were queued during parsing.
     // This is called when it's safe to emit code (e.g., after a declaration completes).

@@ -176,6 +176,7 @@ import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_t55_ternary.hpp";
 import cpp "library/cpp_interop_basic.cpp";
 import cpp "library/cpp_interop_freeoptpl.h";
+import cpp "library/cpp_interop_deleted.h";
 
 cppfop.FoldRef d5_return_fold_ref(cppfop.FoldRef* a, cppfop.FoldRef* b,
                                  cppfop.FoldRef* c)
@@ -546,6 +547,16 @@ int t37ForwardLambda(t37.track x) { return (t37.vec<int>.kind) + t37Apply((int n
 
 extern int main()
 {
+    // The deleted overload is viable but worse than the exact int overload (clang: 116).
+    if (cppdelworse.choose(1) != 116) return 1160;
+    cppdel.MemberRank deletedMemberRank = default;
+    if (deletedMemberRank.call(1.5) != 8) return 1161;
+    // An lvalue cannot bind the deleted `T&&` sibling: clang takes the `T&` overload (5), on a
+    // plain and on a ref-qualified receiver.
+    cppdel.RvalueSibling rvalueSibling = default;
+    cppdel.RvalueArg rvalueArg = default;
+    if (rvalueSibling.f(rvalueArg) != 5) return 1168;
+    if (rvalueSibling.h(rvalueArg) != 5) return 1169;
     // Win64 keeps the existing SEH trampoline and does not emit the C++ guard, so the
     // whole C++-interop surface is verified on the Itanium-ABI hosts only.
     if const (__WINDOWS__) {
@@ -4241,5 +4252,156 @@ extern int main()
         // An unparenthesized chain (`a + b - top`) carries the left result's identity.
         if (1e3 + 1 - top != 12 || 2.0 * 3 + 1 - top != 12 || tl + 1 - top != 4)  return 2990;
     }
+    {
+        // T122: every successful receiver cv/access leg checks which C++ overload ran.
+        cppdel.VolRecvA vr_5200 = default;
+        const cppdel.VolRecvA vr_5200_const = default;
+        if (vr_5200.f() != 101) return 5200;
+        if (cppdel.t122_plain_ptr_VolRecvA(&vr_5200).f() != 101) return 5201;
+        if (cppdel.t122_plain_ref_VolRecvA(vr_5200).f() != 101) return 5202;
+        if (cppdel.VolRecvA().f() != 101) return 5203;
+        if (vr_5200_const.f() != 102) return 5204;
+        if (cppdel.t122_const_ptr_VolRecvA(&vr_5200).f() != 102) return 5205;
+        if (cppdel.t122_const_ref_VolRecvA(vr_5200).f() != 102) return 5206;
+
+        cppdel.VolRecvADeleted vr_5207 = default;
+        const cppdel.VolRecvADeleted vr_5207_const = default;
+        if (vr_5207.f() != 101) return 5207;
+        if (cppdel.t122_plain_ptr_VolRecvADeleted(&vr_5207).f() != 101) return 5208;
+        if (cppdel.t122_plain_ref_VolRecvADeleted(vr_5207).f() != 101) return 5209;
+        if (cppdel.VolRecvADeleted().f() != 101) return 5210;
+
+        cppdel.VolRecvB vr_5211 = default;
+        const cppdel.VolRecvB vr_5211_const = default;
+        if (vr_5211.f() != 201) return 5211;
+        if (cppdel.t122_plain_ptr_VolRecvB(&vr_5211).f() != 201) return 5212;
+        if (cppdel.t122_plain_ref_VolRecvB(vr_5211).f() != 201) return 5213;
+        if (cppdel.VolRecvB().f() != 201) return 5214;
+        if (cppdel.t122_volatile_object_VolRecvB(vr_5211).f() != 202) return 5215;
+        if (cppdel.t122_volatile_ptr_VolRecvB(&vr_5211).f() != 202) return 5216;
+        if (cppdel.t122_volatile_ref_VolRecvB(vr_5211).f() != 202) return 5217;
+
+        cppdel.VolRecvBDeleted vr_5218 = default;
+        const cppdel.VolRecvBDeleted vr_5218_const = default;
+        if (vr_5218.f() != 201) return 5218;
+        if (cppdel.t122_plain_ptr_VolRecvBDeleted(&vr_5218).f() != 201) return 5219;
+        if (cppdel.t122_plain_ref_VolRecvBDeleted(vr_5218).f() != 201) return 5220;
+        if (cppdel.VolRecvBDeleted().f() != 201) return 5221;
+
+        cppdel.VolRecvC vr_5222 = default;
+        const cppdel.VolRecvC vr_5222_const = default;
+        if (vr_5222_const.f() != 301) return 5222;
+        if (cppdel.t122_const_ptr_VolRecvC(&vr_5222).f() != 301) return 5223;
+        if (cppdel.t122_const_ref_VolRecvC(vr_5222).f() != 301) return 5224;
+        if (cppdel.t122_volatile_object_VolRecvC(vr_5222).f() != 302) return 5225;
+        if (cppdel.t122_volatile_ptr_VolRecvC(&vr_5222).f() != 302) return 5226;
+        if (cppdel.t122_volatile_ref_VolRecvC(vr_5222).f() != 302) return 5227;
+
+        cppdel.VolRecvCDeleted vr_5228 = default;
+        const cppdel.VolRecvCDeleted vr_5228_const = default;
+        if (vr_5228_const.f() != 301) return 5228;
+        if (cppdel.t122_const_ptr_VolRecvCDeleted(&vr_5228).f() != 301) return 5229;
+        if (cppdel.t122_const_ref_VolRecvCDeleted(vr_5228).f() != 301) return 5230;
+
+        cppdel.VolRecvD vr_5231 = default;
+        const cppdel.VolRecvD vr_5231_const = default;
+        if (vr_5231.f() != 401) return 5231;
+        if (cppdel.t122_plain_ptr_VolRecvD(&vr_5231).f() != 401) return 5232;
+        if (cppdel.t122_plain_ref_VolRecvD(vr_5231).f() != 401) return 5233;
+        if (cppdel.VolRecvD().f() != 401) return 5234;
+        if (vr_5231_const.f() != 401) return 5235;
+        if (cppdel.t122_const_ptr_VolRecvD(&vr_5231).f() != 401) return 5236;
+        if (cppdel.t122_const_ref_VolRecvD(vr_5231).f() != 401) return 5237;
+        if (cppdel.t122_volatile_object_VolRecvD(vr_5231).f() != 401) return 5238;
+        if (cppdel.t122_volatile_ptr_VolRecvD(&vr_5231).f() != 401) return 5239;
+        if (cppdel.t122_volatile_ref_VolRecvD(vr_5231).f() != 401) return 5240;
+        if (cppdel.t122_cv_object_VolRecvD(vr_5231).f() != 401) return 5241;
+        if (cppdel.t122_cv_ptr_VolRecvD(&vr_5231).f() != 401) return 5242;
+        if (cppdel.t122_cv_ref_VolRecvD(vr_5231).f() != 401) return 5243;
+
+        cppdel.VolRecvE vr_5244 = default;
+        const cppdel.VolRecvE vr_5244_const = default;
+        if (vr_5244.f() != 501) return 5244;
+        if (cppdel.t122_plain_ptr_VolRecvE(&vr_5244).f() != 501) return 5245;
+        if (cppdel.t122_plain_ref_VolRecvE(vr_5244).f() != 501) return 5246;
+        if (cppdel.VolRecvE().f() != 502) return 5247;
+        if (vr_5244_const.f() != 502) return 5248;
+        if (cppdel.t122_const_ptr_VolRecvE(&vr_5244).f() != 502) return 5249;
+        if (cppdel.t122_const_ref_VolRecvE(vr_5244).f() != 502) return 5250;
+
+        cppdel.VolRecvEDeleted vr_5251 = default;
+        const cppdel.VolRecvEDeleted vr_5251_const = default;
+        if (vr_5251.f() != 501) return 5251;
+        if (cppdel.t122_plain_ptr_VolRecvEDeleted(&vr_5251).f() != 501) return 5252;
+        if (cppdel.t122_plain_ref_VolRecvEDeleted(vr_5251).f() != 501) return 5253;
+
+    }
+
+        // T122 subscript shape (JSON-like): literal key and integer index, const and non-const.
+        cppsopd.TinyIndex ti_5260 = default;
+        const cppsopd.TinyIndex ti_5260_const = default;
+        if (ti_5260["a"] != 11) return 5260;
+        if (ti_5260_const["a"] != 21) return 5261;
+        if (ti_5260[3] != 33) return 5262;
+        if (ti_5260_const[3] != 43) return 5263;
+
+        // T122 r4 valarray subscript shape: an integer subscript first, then class-index twins.
+        cppsopd.TinySliced ts_5264 = default;
+        const cppsopd.TinySliced ts_5264_const = default;
+        ts_5264[0] = 9;
+        std.u16string_view sv_5264 = std.u16string_view();
+        std.u32string_view sw_5264 = std.u32string_view();
+        cppsopd.TinyProxy tp_5264 = ts_5264[sv_5264];
+        if (tp_5264.first != 9 || tp_5264.n != 200) return 5264;
+        if (ts_5264_const[sv_5264] != 100) return 5265;
+        cppsopd.TinyProxy tp_5266 = ts_5264[sw_5264];
+        if (tp_5266.first != 1 || tp_5266.n != 400) return 5266;
+        if (ts_5264_const[sw_5264] != 300) return 5267;
+
+        cppsopd.TinyStaticTwin st_5268 = default;
+        if (st_5268.s(9) != 9) return 5268;
+
+        cppsopd.TinyConversionTwin cv_5269 = default;
+        const cppsopd.TinyConversionTwin cv_5269_const = default;
+        if ((int)cv_5269 != 1) return 5269;
+        if ((int)cv_5269_const != 2) return 5270;
+        int cv_5271_implicit = cv_5269_const;
+        if (cv_5271_implicit != 2) return 5271;
+
+        cppsopd.TinyConstVolatileLRef cvl_5272 = default;
+        if (cvl_5272.f() != 601) return 5272;
+
+        // T127: a using-declared base operator- is one candidate, not one per lookup path.
+        cppsopd.TinyIterVec iv_5273 = default;
+        cppsopd.TinyIter ib_5273 = iv_5273.begin();
+        cppsopd.TinyIter ie_5273 = iv_5273.end();
+        if (ie_5273 - ib_5273 != 5) return 5273;
+        cppsopd.TinyIter im_5274 = ie_5273 - 2;
+        if (*im_5274 != 4) return 5274;
+
+        // T127 r2: the wrapper keeps the receiver's value category (clang: & on an lvalue, &&
+        // on a prvalue; const& for a const lvalue).
+        cppsopd.TinyRefIter rb_5275 = default;
+        cppsopd.TinyRefIter rl_5275 = default;
+        if (cppsopd.tinyRefIter() - rb_5275 != 78) return 5275;
+        if (rl_5275 - rb_5275 != 77) return 5276;
+        cppsopd.TinyCRefIter cb_5277 = default;
+        cppsopd.TinyCRefIter cl_5277 = default;
+        const cppsopd.TinyCRefIter cc_5277 = default;
+        if (cppsopd.tinyCRefIter() - cb_5277 != 74) return 5277;
+        if (cl_5277 - cb_5277 != 73) return 5278;
+        if (cc_5277 - cb_5277 != 73) return 5279;
+
+        // T127 r3: compound assignment keeps the receiver's value category (clang: & on an
+        // lvalue, && on a prvalue).
+        cppsopd.TinyRefCompound rc_5280 = default;
+        rc_5280 -= 1;
+        if (cppsopd.tinyRefCompoundLast != 3) return 5280;
+        cppsopd.tinyRefCompound() -= 1;
+        if (cppsopd.tinyRefCompoundLast != 4) return 5281;
+        rc_5280 += 1;
+        if (cppsopd.tinyRefCompoundLast != 5) return 5282;
+        cppsopd.tinyRefCompound() += 1;
+        if (cppsopd.tinyRefCompoundLast != 6) return 5283;
     return 0;
 }

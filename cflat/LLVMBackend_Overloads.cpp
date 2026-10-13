@@ -1220,6 +1220,29 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
             probe.TypeName = name;
             return probe.IsInteger();
         };
+        auto spellingCv = [](std::string_view spelling) {
+            int cv = 0;
+            while (!spelling.empty())
+            {
+                while (!spelling.empty() && std::isspace((unsigned char)spelling.front()))
+                    spelling.remove_prefix(1);
+                if (spelling.starts_with("const "))
+                {
+                    cv |= 1;
+                    spelling.remove_prefix(6);
+                }
+                else if (spelling.starts_with("volatile "))
+                {
+                    cv |= 2;
+                    spelling.remove_prefix(9);
+                }
+                else if (spelling.starts_with("class ") || spelling.starts_with("struct "))
+                    spelling.remove_prefix(spelling.starts_with("class ") ? 6 : 7);
+                else
+                    break;
+            }
+            return cv;
+        };
         auto primitiveWidth = [&](const std::string& name) {
             if (name == "float") return 32;
             if (name == "double") return 64;
@@ -1267,7 +1290,27 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
         std::vector<CxxConversionRank> ranks(arguments.size());
         for (size_t i = 0; i < arguments.size() && i < candidate.Parameters.size(); ++i)
         {
-            const NamedVariable& arg = arguments[i];
+            NamedVariable normalizedUnaryObject;
+            const NamedVariable* argument = &arguments[i];
+            const TypeAndValue& declaredParam = candidate.Parameters[i];
+            if (candidate.IsCxx && !candidate.IsMethod && arguments.size() == 1 && i == 0
+                && candidate.SourceName.find("operator") != std::string::npos
+                && (declaredParam.IsAlias || declaredParam.IsRvalueRef)
+                && declaredParam.TypeName == arguments[i].TypeAndValue.TypeName
+                && arguments[i].IsCxxUnaryOperatorReceiver
+                && arguments[i].TypeAndValue.Pointer && arguments[i].CxxLvalueKind >= 0)
+            {
+                // Unary member dispatch carries the operand's address for `this`; the same
+                // value is an object reference when ranked against a free operator candidate.
+                normalizedUnaryObject = arguments[i];
+                normalizedUnaryObject.TypeAndValue.Pointer = false;
+                normalizedUnaryObject.TypeAndValue.IsCxxConstRef =
+                    arguments[i].TypeAndValue.IsCxxPointeeConst
+                    || arguments[i].TypeAndValue.IsCxxConstRef;
+                normalizedUnaryObject.TypeAndValue.IsCxxPointeeConst = false;
+                argument = &normalizedUnaryObject;
+            }
+            const NamedVariable& arg = *argument;
             // A class pointer parameter bound as `void*` ranks as the class its spelling names.
             TypeAndValue spelledClassParam;
             {
@@ -1289,7 +1332,9 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 ? candidate.Parameters[i] : spelledClassParam;
             CxxConversionRank& out = ranks[i];
             // Rank the implicit object parameter for imported C++ members.
-            if (candidate.IsMethod && i == 0
+            const bool memberWrapper = candidate.IsCxx
+                && candidate.UniqueName.starts_with("__cflat_udc_") && param.VariableName == "this";
+            if ((candidate.IsMethod || memberWrapper) && i == 0
                 && (param.VariableName.ends_with("__") || (candidate.IsCxx && param.VariableName == "this")))
             {
                 // Judged for a receiver of the member's class or of a class derived from it; a
@@ -1299,15 +1344,41 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                     || (IsCxxRecord(receiver) && IsCxxRecord(param.TypeName)
                         && IsCxxBaseOf(param.TypeName, receiver)))
                 {
+                    int memberCv = 0;
+                    const bool hasDeclarationCv = candidate.IsCInteropDeclaration
+                        || candidate.IsDeleted || candidate.CxxConst || candidate.CxxVolatile;
+                    if (hasDeclarationCv)
+                    {
+                        if (candidate.CxxConst) memberCv |= 1;
+                        if (candidate.CxxVolatile) memberCv |= 2;
+                    }
+                    else
+                    {
+                        const std::string linkage = CxxDeclarationLinkageName(candidate.UniqueName);
+                        if (linkage.find("@@QEBA") != std::string::npos
+                            || linkage.find("@@UEBA") != std::string::npos)
+                            memberCv |= 1;
+                        if (linkage.find("@@QECA") != std::string::npos
+                            || linkage.find("@@UECA") != std::string::npos)
+                            memberCv |= 2;
+                        size_t cvAt = linkage.starts_with("_ZN") ? 3 : std::string::npos;
+                        while (cvAt != std::string::npos && cvAt < linkage.size()
+                            && (linkage[cvAt] == 'K' || linkage[cvAt] == 'V'))
+                        {
+                            memberCv |= linkage[cvAt] == 'K' ? 1 : 2;
+                            ++cvAt;
+                        }
+                    }
+                    const int receiverCv = CxxReceiverCv(arg);
                     out.rank = -2;
-                    const std::string linkage = CxxDeclarationLinkageName(candidate.UniqueName);
-                    out.second = linkage.starts_with("_ZNK")
-                            || linkage.find("@@QEBA") != std::string::npos
-                            || linkage.find("@@UEBA") != std::string::npos
-                        ? 1 : 0;
+                    out.second = memberCv;
                     out.objectRef = candidate.CxxRefQualifier;
+                    out.objectIsRvalue = IsCxxObjectRvalue(arg);
                     out.from = param.TypeName;
-                    out.cxxViable = true;
+                    out.implicitObjectCvNonViable = (receiverCv & ~memberCv) != 0;
+                    if (out.implicitObjectCvNonViable)
+                        out.rank = kCxxNonViableRank;
+                    out.cxxViable = !out.implicitObjectCvNonViable;
                 }
                 continue;
             }
@@ -1539,9 +1610,11 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 || param.IsCxxRefToPointer || param.IsScopedEnum
                 || enumBackingTypes.count(param.TypeName) != 0 || IsScopedEnumTypeName(param.TypeName))
                 continue;
+            const int referenceCv = spellingCv(CxxReferenceParameterSpelling(candidate, i))
+                | (param.IsCxxConstRef || param.IsCxxPointeeConst ? 1 : 0)
+                | (param.IsCxxPointeeVolatile ? 2 : 0);
             const bool constReference = reference && !param.IsRvalueRef
-                && (param.IsCxxConstRef
-                    || CxxReferenceParameterSpelling(candidate, i).rfind("const ", 0) == 0);
+                && (referenceCv & 1) != 0;
 
             const TypeAndValue& at = arg.TypeAndValue;
             const size_t paramIndex = i;
@@ -1614,13 +1687,22 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 {
                     // Same class: an identity binding. C++ viability is proved only for a
                     // `const T&`, which binds any object of the class.
-                    if (!param.IsRvalueRef)
+                    const int objectCv = CxxReceiverCv(arg);
+                    const bool lvalueObject = arg.CxxLvalueKind == 1
+                        || (arg.CxxLvalueKind == 2 && !arg.IsRvalue);
+                    if (param.IsRvalueRef && (objectCv != 0 || lvalueObject))
+                        out.rank = kCxxNonViableRank;
+                    else if (reference && (objectCv & ~referenceCv) != 0)
+                        out.rank = kCxxNonViableRank;
+                    else if (!param.IsRvalueRef)
                         out.rank = 0;
                     out.cxxViable = constReference;
                     if (reference && !param.IsRvalueRef)
                     {
                         out.cvBase = at.TypeName;
-                        out.cv = constReference ? 1 : 0;
+                        out.cv = referenceCv;
+                        out.refTarget = at.TypeName;
+                        out.refBind = constReference ? 2 : 0;
                     }
                     continue;
                 }
@@ -1699,7 +1781,17 @@ int LLVMBackend::CompareCxxConversionRanks(const std::vector<CxxConversionRank>&
         auto tieBreak = [&](const CxxConversionRank& x, const CxxConversionRank& y) {
             // 3.2.5 / 3.2.6: from one source to one target, the less cv-qualified is better.
             if (!x.cvBase.empty() && x.cvBase == y.cvBase && x.from == y.from)
-                return x.cv - y.cv;
+            {
+                if (x.cv != y.cv)
+                {
+                    if ((x.cv & y.cv) == x.cv) return -1;
+                    if ((x.cv & y.cv) == y.cv) return 1;
+                    return 0;
+                }
+                if (!x.refTarget.empty() && x.refTarget == y.refTarget && x.from == y.from
+                    && x.refBind != 0 && y.refBind != 0)
+                    return x.refBind - y.refBind;
+            }
             // 4.4: from one class, to a more derived base is better, and any base beats void*.
             if (x.toClass.empty() || y.toClass.empty() || x.from != y.from || x.toClass == y.toClass)
                 return 0;
@@ -1718,19 +1810,46 @@ int LLVMBackend::CompareCxxConversionRanks(const std::vector<CxxConversionRank>&
             const CxxConversionRank& x = a[i];
             const CxxConversionRank& y = b[i];
             int order = 0;
-            // Implicit object parameters of one class and ref-qualifier: the non-const binding
-            // is better (3.2.6); other pairs are not judged.
-            if (x.rank == -2 || y.rank == -2)
+            // A known non-viable binding loses, including a cv-incompatible implicit object.
+            const bool xNonViable = x.rank == kCxxNonViableRank || x.implicitObjectCvNonViable;
+            const bool yNonViable = y.rank == kCxxNonViableRank || y.implicitObjectCvNonViable;
+            if (xNonViable || yNonViable)
+                order = xNonViable == yNonViable ? 0 : (xNonViable ? 1 : -1);
+            else if (x.rank == -2 || y.rank == -2)
             {
-                if (x.rank != y.rank || x.from != y.from || x.objectRef != y.objectRef) return 2;
-                order = x.second - y.second;
+                if (x.rank == -2 && y.rank == -2)
+                {
+                    if (x.from != y.from || x.objectIsRvalue != y.objectIsRvalue) return 2;
+                    if (x.objectRef != y.objectRef
+                        && x.objectRef != cflat_cinterop::CxxRefQualifierNone
+                        && y.objectRef != cflat_cinterop::CxxRefQualifierNone)
+                    {
+                        const int preferred = x.objectIsRvalue
+                            ? cflat_cinterop::CxxRefQualifierRValue
+                            : cflat_cinterop::CxxRefQualifierLValue;
+                        order = x.objectRef == preferred ? -1 : 1;
+                    }
+                    else if (x.second == y.second) order = 0;
+                    else if ((x.second & y.second) == x.second) order = -1;
+                    else if ((x.second & y.second) == y.second) order = 1;
+                }
+                else
+                {
+                    const CxxConversionRank& object = x.rank == -2 ? x : y;
+                    const CxxConversionRank& reference = x.rank == -2 ? y : x;
+                    if (reference.rank != 0 || reference.cvBase != object.from) return 2;
+                    if (object.second == reference.cv) order = 0;
+                    else if ((object.second & reference.cv) == object.second) order = -1;
+                    else if ((object.second & reference.cv) == reference.cv) order = 1;
+                    if (object.objectIsRvalue
+                        && object.objectRef == cflat_cinterop::CxxRefQualifierRValue
+                        && reference.refBind == 2)
+                        order = -1;
+                    if (x.rank != -2) order = -order;
+                }
             }
             else if (x.rank < 0 || y.rank < 0)
                 return 2;
-            // Ranking-only markers for conversions C++ rejects. They lose even to ellipsis;
-            // finish() still lets CFlat's matcher decide when no viable C++ candidate wins.
-            else if (x.rank == kCxxNonViableRank || y.rank == kCxxNonViableRank)
-                order = x.rank == y.rank ? 0 : (x.rank == kCxxNonViableRank ? 1 : -1);
             // An ellipsis conversion is worse than every other sequence; two are equal.
             else if (x.rank == kCxxEllipsisRank || y.rank == kCxxEllipsisRank)
                 order = x.rank - y.rank;
@@ -1893,13 +2012,17 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         };
         auto receiverRefQualifierMatches = [&](const FunctionSymbol& candidate,
                                                 const std::vector<NamedVariable>& arguments) {
-            if (!candidate.IsCxx || !candidate.IsMethod
+            // An implicit-conversion member wrapper (p0 named "this") binds its receiver too.
+            const bool memberWrapper = !candidate.Parameters.empty()
+                && candidate.UniqueName.starts_with("__cflat_udc_")
+                && candidate.Parameters.front().VariableName == "this";
+            if (!candidate.IsCxx || !(candidate.IsMethod || memberWrapper)
                 || candidate.CxxRefQualifier == cflat_cinterop::CxxRefQualifierNone
                 || candidate.Parameters.empty() || arguments.empty())
                 return true;
-            const bool receiverRvalue = IsCxxRvalueReferenceArgument(arguments.front());
+            const bool receiverRvalue = IsCxxObjectRvalue(arguments.front());
             if (candidate.CxxRefQualifier == cflat_cinterop::CxxRefQualifierLValue)
-                return !receiverRvalue;
+                return !receiverRvalue || (candidate.CxxConst && !candidate.CxxVolatile);
             if (candidate.CxxRefQualifier == cflat_cinterop::CxxRefQualifierRValue)
                 return receiverRvalue;
             return true;
@@ -3346,6 +3469,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             && std::all_of(candidates.begin(), candidates.end(), [](const auto& c) {
                    return c.second.IsCxx; });
         std::map<const Result*, std::vector<CxxConversionRank>> cxxRanks;
+        std::set<const Result*> receiverCvRejected;
         // A variadic whose ellipsis receives an argument joins the ranking: its declared
         // parameters rank as usual, every argument past them is an ellipsis conversion.
         std::vector<Ranked> ellipsisRanked;
@@ -3375,7 +3499,16 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         ranks[i].rank = kCxxEllipsisRank;
                         ranks[i].cxxViable = true;
                     }
+                if (!ranks.empty() && ranks.front().implicitObjectCvNonViable)
+                    receiverCvRejected.insert(r->pair);
                 cxxRanks[r->pair] = std::move(ranks);
+            }
+            if (!receiverCvRejected.empty())
+            {
+                std::erase_if(viable, [&](const Ranked* r) {
+                    return receiverCvRejected.count(r->pair) != 0;
+                });
+                if (viable.empty()) return Result{};
             }
             // [over.match.best] 2.4: on equal conversion sequences a non-template beats a function
             // template specialization (a deduction wrapper or a demangled `name<...>`).
@@ -3390,12 +3523,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     if (a == b) continue;
                     const int order = CompareCxxConversionRanks(cxxRanks[a->pair], cxxRanks[b->pair],
                                                                 crossing);
-                    // CFlat has no volatile objects: a non-volatile member beats its volatile twin.
                     if (order == -1
                         || (order == 0 && !crossing && isTemplateCandidate(b->pair->second)
-                            && !isTemplateCandidate(a->pair->second))
-                        || (order == 0 && !crossing && b->pair->second.CxxVolatile
-                            && !a->pair->second.CxxVolatile))
+                            && !isTemplateCandidate(a->pair->second)))
                         dominated.insert(b->pair);
                 }
             std::vector<const Ranked*> survivors;
@@ -3432,14 +3562,10 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         return true;
                 return false;
             };
-            auto isTemplateSpecialization = [](const std::string& linkage) {
-                if (linkage.starts_with('?')) return linkage.starts_with("??$");
-                llvm::ItaniumPartialDemangler demangler;
-                if (demangler.partialDemangle(linkage.c_str())) return true;
-                char* name = demangler.getFunctionName(nullptr, nullptr);
-                const bool templated = name == nullptr || std::string_view(name).ends_with('>');
-                std::free(name);
-                return templated;
+            auto isTemplateSpecialization = [&](const FunctionSymbol& symbol) {
+                return symbol.IsCxxTemplateSpecialization
+                    || symbol.UniqueName.starts_with("__cflat_tpl_")
+                    || IsCxxTemplateSpecializationSymbol(symbol);
             };
             std::set<std::string> declarations;
             bool indistinguishable = !anyCrossing && survivors.size() > 1;
@@ -3447,7 +3573,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             {
                 const std::string declared = CxxDeclarationLinkageName(survivors[i]->pair->second.UniqueName);
                 indistinguishable = fullyRanked(cxxRanks[survivors[i]->pair])
-                    && declarations.insert(declared).second && !isTemplateSpecialization(declared);
+                    && declarations.insert(declared).second
+                    && !isTemplateSpecialization(survivors[i]->pair->second);
                 for (size_t j = i + 1; indistinguishable && j < survivors.size(); ++j)
                 {
                     bool crossing = false;
@@ -3472,6 +3599,20 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     if (dominated.count(r.pair) == 0)
                         ellipsisWinner = &r;
             }
+        }
+
+        if (!receiverCvRejected.empty())
+        {
+            std::erase_if(perfect, [&](const Ranked& r) {
+                return receiverCvRejected.count(r.pair) != 0;
+            });
+            std::erase_if(possible, [&](const Ranked& r) {
+                return receiverCvRejected.count(r.pair) != 0;
+            });
+            std::erase_if(ellipsisRanked, [&](const Ranked& r) {
+                return receiverCvRejected.count(r.pair) != 0;
+            });
+            ellipsisWinner = ellipsisRanked.empty() ? nullptr : &ellipsisRanked.back();
         }
 
         /*
@@ -3531,9 +3672,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 if (order == -1 || order == 2)
                     continue;
                 if (failedDefault && order == 0 && !crossing
-                    && ((IsCxxTemplateSpecializationSymbol(pair.second)
-                         && !IsCxxTemplateSpecializationSymbol(winner->pair->second))
-                        || (pair.second.CxxVolatile && !winner->pair->second.CxxVolatile)))
+                    && IsCxxTemplateSpecializationSymbol(pair.second)
+                    && !IsCxxTemplateSpecializationSymbol(winner->pair->second))
                     continue;
                 // Strictly better in C++: report it by name at the first argument CFlat refuses.
                 if (order == 1 && preferredOut != nullptr)
@@ -3650,7 +3790,6 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             keepLowest(best, [](const Ranked& r) { return r.refPtrConstMismatches; });
             keepLowest(best, [](const Ranked& r) { return r.mutableRefPreference; });
             keepLowest(best, [](const Ranked& r) { return -r.moveScore; });
-            keepLowest(best, [](const Ranked& r) { return (int)r.pair->second.CxxVolatile; });
             preferCallbackConstSpelling(best);
             preferCxxDefaultWrapperForSameDeclaration(best);
             return finish(settle(best, /*legacyLastWins=*/false));
@@ -3697,8 +3836,6 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Dominance only compares positions both sides judged, so it can cycle; keep the set then.
             if (!undominated.empty())
                 best = std::move(undominated);
-            // CFlat has no volatile objects: a non-volatile member beats its volatile twin.
-            keepLowest(best, [](const Ranked& r) { return (int)r.pair->second.CxxVolatile; });
             preferCxxDefaultWrapperForSameDeclaration(best);
             // Ruling: at the SAME conversion a by-value or rvalue-ref bind beats materializing a
             // temporary for a `const T&`. After dominance, so an identity match still wins first.
@@ -4531,41 +4668,50 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // Compiler-synthesized member calls (view decay size/data) name lazy C++ members too.
         if ((postfixMemberCall || !cxxMemberReceiver.empty()) && IsCxxRecord(receiverType))
             EnsureCxxMemberProjected(receiverType, bareMemberName);
-        /*
-         * A const receiver (const namespace object, const reference result, pointee-const
-         * pointer) calls the const twin of a const/non-const member pair like clang; the
-         * non-const one would write read-only storage. MainListener::RefuseCxxConstReceiverCall
-         * refuses a named call with no const overload at all.
-         */
+        // Rank the full C++ member set together so all receiver cv-qualifiers participate.
         const std::string constTwinPrefix = CxxConstTwinName("");
         if (!arguments.empty() && !bareMemberName.starts_with(constTwinPrefix)
             && IsCxxRecord(receiverType))
         {
-            const int constKind = CxxConstReceiverKind(arguments.front());
-            if (constKind != 0)
+            EnsureCxxMemberProjected(receiverType, bareMemberName);
+            const std::string twinName = CxxConstTwinName(bareMemberName);
+            if (auto twin = functionTable.find(twinName); twin != functionTable.end())
             {
-                EnsureCxxMemberProjected(receiverType, bareMemberName);
-                const std::string twinName = CxxConstTwinName(bareMemberName);
-                /*
-                 * Twins are registered (or cloned by inheritance) per owning class, and a class
-                 * declaring the name hides the base's, so only the receiver's own twin counts.
-                 * The const receiver ranks the whole const-callable set: its twins plus the
-                 * receiver's unique-signature const members registered under the plain name.
-                 */
                 bool twinFits = false;
-                if (auto twin = functionTable.find(twinName); twin != functionTable.end())
+                for (const auto& candidate : twin->second)
+                    if (candidate.IsCxx && candidate.IsMethod && !candidate.Parameters.empty()
+                        && candidate.Parameters.front().TypeName == receiverType)
+                        twinFits = true;
+                if (twinFits)
                 {
-                    for (const auto& candidate : twin->second)
-                        if (candidate.IsMethod && !candidate.Parameters.empty()
-                            && candidate.Parameters.front().TypeName == receiverType)
-                            twinFits = true;
-                    if (twinFits)
+                    if (IsCxxStaticMethod(receiverType, bareMemberName))
+                    {
+                        std::vector<FunctionSymbol> receiverTwins;
+                        for (const auto& candidate : twin->second)
+                            if (candidate.IsCxx && candidate.IsMethod
+                                && !candidate.Parameters.empty()
+                                && candidate.Parameters.front().TypeName == receiverType)
+                                receiverTwins.push_back(candidate);
+                        auto& plainSet = functionTable[bareMemberName];
+                        for (auto& candidate : receiverTwins)
+                            if (std::none_of(plainSet.begin(), plainSet.end(),
+                                   [&](const FunctionSymbol& plain) {
+                                       return plain.UniqueName == candidate.UniqueName
+                                           && !plain.Parameters.empty()
+                                           && plain.Parameters.front().TypeName == receiverType;
+                                   }))
+                                plainSet.push_back(std::move(candidate));
+                    }
+                    else
+                    {
                         if (auto plain = functionTable.find(bareMemberName);
                             plain != functionTable.end())
                         {
-                            std::vector<FunctionSymbol> constPlain;
+                            std::vector<FunctionSymbol> plainMembers;
                             for (const auto& candidate : plain->second)
-                                if (candidate.IsCxx && candidate.IsMethod && candidate.CxxConst
+                                if (candidate.IsCxx
+                                    && (candidate.IsMethod
+                                        || candidate.UniqueName.starts_with("__cflat_udc_"))
                                     && !candidate.Parameters.empty()
                                     && candidate.Parameters.front().TypeName == receiverType
                                     && std::none_of(twin->second.begin(), twin->second.end(),
@@ -4574,15 +4720,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                                    && !t.Parameters.empty()
                                                    && t.Parameters.front().TypeName == receiverType;
                                            }))
-                                    constPlain.push_back(candidate);
-                            for (auto& candidate : constPlain)
+                                plainMembers.push_back(candidate);
+                            for (auto& candidate : plainMembers)
                                 twin->second.push_back(std::move(candidate));
                         }
+                        return CreateOverloadedFunctionCall(twinName, arguments, forceRoot,
+                            displayName.empty() ? shownFunctionName : displayName,
+                            cxxMemberReceiver, postfixMemberCall, enclosingFunctionName);
+                    }
                 }
-                if (twinFits)
-                    return CreateOverloadedFunctionCall(twinName, arguments, forceRoot,
-                        displayName.empty() ? shownFunctionName : displayName,
-                        cxxMemberReceiver, postfixMemberCall, enclosingFunctionName);
             }
         }
         const bool receiverHasCxxMember = (postfixMemberCall || !cxxMemberReceiver.empty())
@@ -4610,9 +4756,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         if (funcSym == functionTable.end())
         {
             if (TryBindCxxImplicitArgumentConversions(functionName, arguments))
-                return CreateOverloadedFunctionCall(functionName, arguments, forceRoot, displayName,
-                                                    cxxMemberReceiver, postfixMemberCall,
-                                                    enclosingFunctionName);
+                return CreateOverloadedFunctionCall(StripCxxConstTwin(functionName), arguments,
+                                                    forceRoot, displayName, cxxMemberReceiver,
+                                                    postfixMemberCall, enclosingFunctionName);
             if (std::string refusal = GetCxxBindingRefusal(functionName); !refusal.empty())
                 LogErrorMessage(refusal);
             else if (displayName.empty())
@@ -4714,6 +4860,21 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             const bool cxxOperatorReceiver = IsCxxRecord(operatorReceiver);
             for (const FunctionSymbol& candidate : *candidateSet)
             {
+                if (cxxOperatorReceiver && candidate.IsCxx && !candidate.IsMethod
+                    && !candidate.Parameters.empty()
+                    && IsCxxRecord(candidate.Parameters.front().TypeName)
+                    && candidate.Parameters.front().TypeName != operatorReceiver
+                    && !IsCxxBaseOf(candidate.Parameters.front().TypeName, operatorReceiver))
+                {
+                    NamedVariable receiverValue = arguments.front();
+                    receiverValue.TypeAndValue.TypeName = operatorReceiver;
+                    receiverValue.TypeAndValue.Pointer = false;
+                    receiverValue.TypeAndValue.IsAlias = false;
+                    receiverValue.BaseType = GetType(receiverValue.TypeAndValue);
+                    if (!CanImplicitlyConstructCxxClass(receiverValue,
+                                                        candidate.Parameters.front()))
+                        continue;
+                }
                 if (candidate.IsCxx && candidate.IsMethod && !candidate.Parameters.empty()
                     && candidate.Parameters.front().TypeName != operatorReceiver)
                     continue;
@@ -4880,6 +5041,30 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 if (CFlatExternOwnsByValueParam(param))
                     param.IsMove = true;
 
+        // Deleted C++ declarations remain in the candidate set so their rank can make the
+        // call ill-formed. Reject only after clang-compatible overload selection has chosen one.
+        if (candidate.IsCxx && candidate.IsDeleted)
+        {
+            const size_t separator = candidate.SourceName.rfind('.');
+            const std::string name = candidate.SourceName.substr(
+                separator == std::string::npos ? 0 : separator + 1);
+            if (name.starts_with("operator ") && !candidate.Parameters.empty())
+                LogError("clang: static_cast from '"
+                         + DisplayCxxClassName(candidate.Parameters.front().TypeName)
+                         + "' to '" + candidate.ReturnType.TypeName
+                         + "' uses deleted function");
+            if (name.starts_with("operator") && name.size() > 8)
+                LogError("clang: overload resolution selected deleted operator '"
+                         + name.substr(8) + "'");
+            if (candidate.IsMethod && (candidate.IsCxxTemplateSpecialization
+                                       || resolvedCandidate.size() > 1))
+                LogError("clang: call to deleted member function '"
+                         + StripCxxConstTwin(shownFunctionName) + "'");
+            if (candidate.IsCxxTemplateSpecialization || resolvedCandidate.size() > 1)
+                LogError("clang: call to deleted function '" + name + "'");
+            LogError("clang: attempt to use a deleted function");
+        }
+
         if (candidate.IsCxx && candidate.Function != nullptr && tiedCandidates.empty()
             && !cxxPreferred.set)
             if (std::string error = CheckCxxDemand(candidate.Function->getName().str());
@@ -4980,6 +5165,29 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // A tie only integer identity could have decided is ambiguous (ruling 2026-09-10).
         if (!tiedCandidates.empty())
         {
+            bool cvMemberAmbiguity = false;
+            if (!shownFunctionName.starts_with("operator")
+                && std::all_of(tiedCandidates.begin(), tiedCandidates.end(), [](const auto& tied) {
+                    return tied.IsCxx && tied.IsMethod
+                        && !tied.SourceName.starts_with("operator");
+                }))
+                for (size_t i = 0; i < tiedCandidates.size() && !cvMemberAmbiguity; ++i)
+                    for (size_t j = i + 1; j < tiedCandidates.size(); ++j)
+                    {
+                        const int leftCv = (tiedCandidates[i].CxxConst ? 1 : 0)
+                            | (tiedCandidates[i].CxxVolatile ? 2 : 0);
+                        const int rightCv = (tiedCandidates[j].CxxConst ? 1 : 0)
+                            | (tiedCandidates[j].CxxVolatile ? 2 : 0);
+                        const int sharedCv = leftCv & rightCv;
+                        if (sharedCv != leftCv && sharedCv != rightCv)
+                        {
+                            cvMemberAmbiguity = true;
+                            break;
+                        }
+                    }
+            if (cvMemberAmbiguity)
+                LogError("clang: call to member function '"
+                         + StripCxxConstTwin(shownFunctionName) + "' is ambiguous");
             std::string candidateList;
             std::set<std::string> spellings;
             std::set<std::string> withoutConst;
@@ -5079,12 +5287,17 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         };
         if (candidate.Function == nullptr)
         {
+            std::optional<std::pair<std::string, std::string>> deferredRvalueRef;
             if (candidates.empty() && !cxxMemberReceiver.empty())
                 if (auto info = cxxClasses_.find(cxxMemberReceiver); info != cxxClasses_.end())
                     if (auto refusal = info->second.refusedMembers.find(bareMemberName);
                         refusal != info->second.refusedMembers.end())
+                    {
+                        if (refusal->second == "is deleted")
+                            LogError("clang: attempt to use a deleted function");
                         LogError(std::format("member '{}' of C++ class '{}' {}", bareMemberName,
                             DisplayCxxClassName(cxxMemberReceiver), refusal->second));
+                    }
             for (const auto& c : candidates)
             {
                 const bool arityFits = c.Variadic ? arguments.size() >= c.Parameters.size()
@@ -5118,10 +5331,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         if (block.empty()) block = CxxRvalueRefBindRefusal(arguments[i], param);
                         if (!block.empty())
                             LogError(std::format("argument {} of '{}': {}", i, shownFunctionName, block));
-                        else
-                            LogErrorMessage(
-                                "parameter '{}' of '{}' is an rvalue reference; pass 'move <arg>' or a temporary",
-                                { param.VariableName, shownFunctionName });
+                        else if (!deferredRvalueRef)
+                            // Only a refusal if no conversion binds the argument: a `T&&`
+                            // sibling is not viable for an lvalue, so clang may pick a conversion.
+                            deferredRvalueRef = std::pair{ param.VariableName, shownFunctionName };
                     }
                     if (param.IsAlias && !param.IsRvalueRef && !param.IsCxxConstRef && rvalue)
                         LogErrorMessage(
@@ -5146,11 +5359,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     if (!c.IsCxx || !c.IsMethod || c.Parameters.empty()
                         || c.Parameters[0].TypeName != receiverType)
                         continue;
+                    const bool receiverRvalue = IsCxxObjectRvalue(arguments.front());
                     const bool matches = c.CxxRefQualifier == cflat_cinterop::CxxRefQualifierNone
                         || (c.CxxRefQualifier == cflat_cinterop::CxxRefQualifierLValue
-                            && !IsCxxRvalueReferenceArgument(arguments.front()))
+                            && (!receiverRvalue || (c.CxxConst && !c.CxxVolatile)))
                         || (c.CxxRefQualifier == cflat_cinterop::CxxRefQualifierRValue
-                            && IsCxxRvalueReferenceArgument(arguments.front()));
+                            && receiverRvalue);
                     if (matches) hasReceiverCompatible = true;
                     else
                     {
@@ -5162,7 +5376,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 {
                     const char* qualifier = rejectedRefQualifier
                         == cflat_cinterop::CxxRefQualifierLValue ? "&" : "&&";
-                    const char* category = IsCxxRvalueReferenceArgument(arguments.front())
+                    const char* category = IsCxxObjectRvalue(arguments.front())
                         ? "rvalue" : "lvalue";
                     LogRawError(std::format(
                         "C++ member '{}' is {}-qualified and cannot be called on an {} receiver",
@@ -5171,11 +5385,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 }
             }
             if (TryBindCxxImplicitArgumentConversions(functionName, arguments))
-                return CreateOverloadedFunctionCall(functionName, arguments, forceRoot, displayName,
-                                                    cxxMemberReceiver, postfixMemberCall,
-                                                    enclosingFunctionName);
+                return CreateOverloadedFunctionCall(StripCxxConstTwin(functionName), arguments,
+                                                    forceRoot, displayName, cxxMemberReceiver,
+                                                    postfixMemberCall, enclosingFunctionName);
             implicitConversionRefusal = std::move(cxxImplicitConversionRefusal_);
             cxxImplicitConversionRefusal_.clear();
+            if (deferredRvalueRef)
+                LogErrorMessage(
+                    "parameter '{}' of '{}' is an rvalue reference; pass 'move <arg>' or a temporary",
+                    { deferredRvalueRef->first, deferredRvalueRef->second });
             for (const auto& failed : candidates)
             {
                 if (failed.IsCxx) continue;
@@ -5203,8 +5421,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
              * UFCS/extension call is exempt: one of its candidates takes the receiver type itself.
              */
             const size_t receiverMemberDot = functionName.rfind('.');
-            const std::string bareMemberName = receiverMemberDot == std::string::npos
-                ? functionName : functionName.substr(receiverMemberDot + 1);
+            // A receiver-cv twin group name rebinds refusals recorded under the member name.
+            const std::string bareMemberName = StripCxxConstTwin(
+                receiverMemberDot == std::string::npos
+                    ? functionName : functionName.substr(receiverMemberDot + 1));
             // A bound overload hides a refused sibling whose signature type no request had
             // registered yet (set::insert returning pair<iterator, bool>). Retry that bind once.
             // An operator call (`d[1]`, `a + b`) names no receiver, yet a member operator of the
@@ -5221,7 +5441,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     llvm::Value* retried = nullptr;
                     const bool rebound = TryBindRefusedCxxMember(retryReceiver, bareMemberName);
                     if (rebound)
-                        retried = CreateOverloadedFunctionCall(functionName, arguments, forceRoot,
+                        retried = CreateOverloadedFunctionCall(StripCxxConstTwin(functionName),
+                                                               arguments, forceRoot,
                                                                displayName, cxxMemberReceiver,
                                                                postfixMemberCall,
                                                                enclosingFunctionName);
@@ -5560,6 +5781,21 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             ownMembers.push_back(c);
                     if (!ownMembers.empty()) shownCandidates = std::move(ownMembers);
                 }
+            }
+            if (!arguments.empty())
+            {
+                const int receiverCv = CxxReceiverCv(arguments.front());
+                std::vector<const FunctionSymbol*> receiverCompatible;
+                for (const FunctionSymbol* c : shownCandidates)
+                {
+                    if (!c->IsCxx || !c->IsMethod || c->Parameters.empty()) continue;
+                    const bool hasDeclarationCv = c->IsCInteropDeclaration || c->IsDeleted
+                        || c->CxxConst || c->CxxVolatile;
+                    if (!hasDeclarationCv) continue;
+                    const int memberCv = (c->CxxConst ? 1 : 0) | (c->CxxVolatile ? 2 : 0);
+                    if ((receiverCv & ~memberCv) == 0) receiverCompatible.push_back(c);
+                }
+                if (!receiverCompatible.empty()) shownCandidates = std::move(receiverCompatible);
             }
 
             // Candidates
@@ -6028,6 +6264,17 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             {
                 if (!ApplyCxxConversionOperator(matched[i], param, false))
                     LogErrorMessage("cannot bind C++ reference argument for '{}'",
+                                    { diagnosticFunctionName });
+                continue;
+            }
+            const bool pointerConversionOperator = candidate.IsCxx && param.Pointer
+                && !param.IsAlias && !param.IsCxxRefToPointer && !param.IsFunctionPointer
+                && !arg.TypeAndValue.Pointer
+                && !CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param, false).empty();
+            if (pointerConversionOperator)
+            {
+                if (!ApplyCxxConversionOperator(matched[i], param, false))
+                    LogErrorMessage("cannot materialize implicit C++ pointer conversion for '{}'",
                                     { diagnosticFunctionName });
                 continue;
             }
@@ -6948,14 +7195,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                                                  : arg.CallerName,
                                           borrowOrigin);
                         std::string declName = directBorrowParam ? arg.CallerName : borrowOrigin;
-                        LogErrorMessage(
-                            "cannot move {} into move parameter '{}' of '{}' - the caller may still "
-                            "own this pointer and will free it on scope exit. Move it out of the "
-                            "owning slot instead (e.g. 'move parent->children[i]'), or declare "
-                            "'{}' as 'move {}' if this function owns it.",
-                            { sourceName, sinkParam.VariableName,
-                              SpellFunctionSymbol(*this, diagnosticFunctionName),
-                              declName, declName });
+                        LogBorrowedPointerMoveSinkError(sourceName, sinkParam.VariableName,
+                            SpellFunctionSymbol(*this, diagnosticFunctionName), declName);
                     }
                 }
             }
@@ -7841,6 +8082,8 @@ llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int
         const bool bindingFuncPtr = expectedParams != nullptr
             || (destSig != nullptr && !destSig->FuncPtrReturnTypeName.empty());
         auto chosen = [&](const FunctionSymbol* sym) -> llvm::Function* {
+            if (bindingFuncPtr && sym->IsCxx && sym->IsDeleted)
+                LogError("clang: attempt to use a deleted function");
             if (bindingFuncPtr) RejectAliasParamFuncPtrBind(functionName, *sym);
             // Taking the address is as unsafe as calling it - the eventual indirect call has
             // no landing pad either.

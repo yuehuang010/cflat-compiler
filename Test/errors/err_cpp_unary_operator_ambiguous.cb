@@ -1,0 +1,34 @@
+import cpp "cpp_interop_basic.h";
+import cpp "cpp_t105_conversion_operators.hpp";
+
+extern int main()
+{
+expect_error("ambiguous") {
+    t123.IP value = default;
+    int result = +value;
+}
+
+expect_error("ambiguous") {
+    t123.MemberFree memberLvalue = default;
+    int memberLvalueResult = -memberLvalue;
+}
+
+expect_error("ambiguous") {
+    int memberRvalueResult = -t123.MemberFree();
+}
+
+expect_error("ambiguous") {
+    t123.ByValueOrRef refLvalue = default;
+    int refLvalueResult = -refLvalue;
+}
+
+expect_error("ambiguous") {
+    int refRvalueResult = -t123.ByValueOrRef();
+}
+
+expect_error("'operator-(t123diag.M&)' was rejected because the operand is const and requires a non-const lvalue reference") {
+    t123diag.M dropSource = default;
+    int dropResult = -t123diag.crefM(dropSource);
+}
+return 0;
+}

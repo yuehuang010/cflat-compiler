@@ -1283,6 +1283,10 @@ std::string LLVMBackend::ResolveEnumTypeName(const std::string& spelled) const
             if (aliased == cur) break;
             cur = aliased;
         }
+        // Canonical scoped keys can outlive the lexical scope that produced them (generic
+        // instantiations are drained after the function body). Preserve that identity after
+        // ordinary visibility so a qualified enum outranks a same-named global enum.
+        if (enumBackingTypes.count(spelled) != 0) return spelled;
         return {};
 }
 
@@ -2126,6 +2130,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.IsCxxRefToPointer) j["crp"] = true;
         if (s.IsCxxConstRef) j["ccr"] = true;
         if (s.IsCxxPointeeConst) j["cpc"] = true;
+        if (s.IsCxxPointeeVolatile) j["cpv"] = true;
         if (s.IsSpelledPointeeConst) j["spc"] = true;
         if (s.IsCxxNullptrT) j["cnt"] = true;
         if (s.IsCxxConstField) j["ccf"] = true;
@@ -2200,6 +2205,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsCxxRefToPointer = j.value("crp", false);
         s.IsCxxConstRef = j.value("ccr", false);
         s.IsCxxPointeeConst = j.value("cpc", false);
+        s.IsCxxPointeeVolatile = j.value("cpv", false);
         s.IsSpelledPointeeConst = j.value("spc", false);
         s.IsCxxNullptrT = j.value("cnt", false);
         s.IsCxxConstField = j.value("ccf", false);
@@ -2340,6 +2346,8 @@ nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e, CCachePathTable* files
         if (e.isCxx)      j["cx"] = true;
         if (e.isInline)   j["inl"] = true;
         if (e.isStaticInline) j["sinl"] = true;
+        if (e.isDeleted) j["del"] = true;
+        if (e.isTemplateSpecialization) j["ts"] = true;
         if (!e.isNoexcept) j["nx"] = true;
         // Clang's arrangement must round-trip: rebuilding it needs the clang session the warm
         // path deliberately skips, and re-deriving it from CFlat's size heuristic would pass a
@@ -2395,6 +2403,8 @@ LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j, const CCachePath
         e.isCxx    = j.value("cx", false);
         e.isInline = j.value("inl", false);
         e.isStaticInline = j.value("sinl", false);
+        e.isDeleted = j.value("del", false);
+        e.isTemplateSpecialization = j.value("ts", false);
         e.isNoexcept = !j.value("nx", false);
         e.file     = PathFromJson(j, files);
         e.bindRefusal = j.value("br", std::string{});

@@ -2169,6 +2169,8 @@ namespace cflat_cinterop
                 sig.isInline = inlineFunction;
                 sig.isStaticInline = internalInline
                     && fd->getStorageClass() == SC_Static;
+                sig.isDeleted = fd->isDeleted();
+                sig.isTemplateSpecialization = fd->getPrimaryTemplate() != nullptr;
                 sig.isNoexcept = !st.req.cxxMode
                     || fd->getExceptionSpecType() == EST_BasicNoexcept
                     || fd->getExceptionSpecType() == EST_NoexceptTrue

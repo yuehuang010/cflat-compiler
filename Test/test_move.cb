@@ -114,6 +114,11 @@ struct Resource
     int readId(int v) { return v; }
 };
 
+alias Resource* manualResource()
+{
+    return new Resource();
+}
+
 Resource* gChainedAssign = nullptr;
 
 struct ChainedAssignHolder { Resource* item = nullptr; };
@@ -1373,6 +1378,22 @@ int testUniqueAssignmentOwnership()
         passed += Test("unique_field_coalesce_assign_no_early_free", dtorCount, 0);
     }
     passed += Test("unique_field_coalesce_assign_freed_once_each", dtorCount, 2);
+
+    // A non-move coalesce assignment keeps its own source-ledger behavior. The selected
+    // value enters the unique field; the fallback remains readable and is freed at exit.
+    dtorCount = 0;
+    {
+        Resource* a = manualResource();
+        a->id = 81;
+        Resource* n = new Resource();
+        n->id = 82;
+        UniqueBox s;
+        s.item = a ?? n;
+        passed += Test("unique_field_coalesce_assign_local_id", s.item->id, 81);
+        passed += Test("unique_field_coalesce_assign_local_fallback_alive", n->id, 82);
+        passed += Test("unique_field_coalesce_assign_local_no_early_free", dtorCount, 0);
+    }
+    passed += Test("unique_field_coalesce_assign_local_freed_once_each", dtorCount, 2);
 
     // A whole aggregate containing a unique fat-interface field must use the same move
     // classification as its field-level spelling instead of bit-copying the owner.
@@ -12503,6 +12524,74 @@ extern int main()
     passed += Test("ternary_move_both_owners_dtor_twice", dtorCount, 2);
     total += 2;
 
+    // A field arm passed to a declared move sink is consumed only on the selected path.
+    dtorCount = 0;
+    {
+        UniqueBox s;
+        s.item = new Resource();
+        s.item->id = 71;
+        int value = consumeTernaryMove(identityBool(false) ? new Resource() : s.item);
+        passed += Test("ternary_move_field_arm_value", value, 71);
+        passed += Test("ternary_move_field_arm_sink_freed_once", dtorCount, 1);
+    }
+    passed += Test("ternary_move_field_arm_no_double_free", dtorCount, 1);
+    total += 3;
+
+    dtorCount = 0;
+    {
+        UniqueBox s;
+        s.item = new Resource();
+        s.item->id = 72;
+        int value = consumeTernaryMove(identityBool(true) ? new Resource() : s.item);
+        passed += Test("ternary_move_field_untaken_value", value, 0);
+        passed += Test("ternary_move_field_untaken_sink_freed_once", dtorCount, 1);
+    }
+    passed += Test("ternary_move_field_untaken_total_freed_once_each", dtorCount, 2);
+    total += 3;
+
+    // The ?? operands are consumed only along the active path of the move sink argument.
+    dtorCount = 0;
+    {
+        Resource* a = nullptr;
+        Resource* n = new Resource();
+        n->id = 83;
+        int value = consumeTernaryMove(identityBool(false) ? new Resource() : (a ?? n));
+        passed += Test("ternary_move_coalesce_fallback_value", value, 83);
+        passed += Test("ternary_move_coalesce_null_lhs_unchanged", a == nullptr ? 1 : 0, 1);
+        passed += Test("ternary_move_coalesce_fallback_sink_freed_once", dtorCount, 1);
+    }
+    passed += Test("ternary_move_coalesce_fallback_no_double_free", dtorCount, 1);
+    total += 4;
+
+    dtorCount = 0;
+    {
+        Resource* a = new Resource();
+        a->id = 84;
+        Resource* n = new Resource();
+        n->id = 85;
+        int value = consumeTernaryMove(a ?? n);
+        passed += Test("move_coalesce_owning_lhs_value", value, 84);
+        passed += Test("move_coalesce_owning_lhs_sink_freed_once", dtorCount, 1);
+    }
+    passed += Test("move_coalesce_owning_lhs_total_freed_once_each", dtorCount, 2);
+    total += 3;
+
+    dtorCount = 0;
+    {
+        Resource* a = nullptr;
+        Resource* n = new Resource();
+        n->id = 86;
+        Resource* m = new Resource();
+        m->id = 87;
+        int value = consumeTernaryMove(identityBool(false) ? new Resource()
+            : (a ?? (identityBool(false) ? n : m)));
+        passed += Test("move_coalesce_nested_rhs_value", value, 87);
+        passed += Test("move_coalesce_nested_null_lhs_unchanged", a == nullptr ? 1 : 0, 1);
+        passed += Test("move_coalesce_nested_sink_freed_once", dtorCount, 1);
+    }
+    passed += Test("move_coalesce_nested_total_freed_once_each", dtorCount, 2);
+    total += 4;
+
     // A non-move borrow parameter consumes neither owner, so both are freed by their scopes.
     dtorCount = 0;
     {
@@ -12737,7 +12826,7 @@ extern int main()
     total += 68;
 
     passed += testUniqueAssignmentOwnership();
-    total += 21;
+    total += 25;
 
     passed += testParamStringToField();
     total += 1;

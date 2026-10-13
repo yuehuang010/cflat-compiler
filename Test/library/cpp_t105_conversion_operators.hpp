@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <utility>
 #include "t70_xvalue_overloads.h"
 
@@ -75,4 +76,25 @@ struct TemplatePointerSource {
 };
 inline int templatePointerPick(TemplatePointerSource*) { return 1; }
 inline int templatePointerPick(void*) { return 2; }
+}
+
+namespace t123 {
+struct C { int n; };
+inline C pointerObject{17};
+struct CPointerOnly { operator C*() const { return &pointerObject; } };
+inline int readC(C* p) { return p->n; }
+
+inline int pointerValue = 17;
+struct PointerOnly { operator int*() const { return &pointerValue; } };
+struct IP {
+    operator int() const { return 3; }
+    operator int*() const { return &pointerValue; }
+};
+
+struct IntBase { operator int() const { return 31; } };
+struct Inherited : IntBase {};
+inline int refValue = 41;
+struct RefResult { operator const int&() const { return refValue; } };
+inline std::atomic<int> atomicValue{37};
+inline std::atomic<int>& atomicRef() { return atomicValue; }
 }
