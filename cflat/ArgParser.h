@@ -4,6 +4,8 @@
 #include <unordered_map>
 #include <iostream>
 #include <optional>
+#include <fstream>
+#include <sstream>
 
 class ArgParser
 {
@@ -49,6 +51,31 @@ public:
 	{
 		m_errorMsg.clear();
 		m_program = argv[0];
+		// Expand @file response files before "--" so long input lists stay under the
+		// Windows cmd line-length limit.
+		std::vector<std::string> expanded;
+		for (int i = 1; i < argc; ++i)
+		{
+			std::string arg = argv[i];
+			if (arg == "--")
+			{
+				for (int j = i; j < argc; ++j)
+					expanded.push_back(argv[j]);
+				break;
+			}
+			if (arg.size() > 1 && arg[0] == '@')
+			{
+				if (!readResponseFile(arg.substr(1), expanded))
+					return false;
+				continue;
+			}
+			expanded.push_back(std::move(arg));
+		}
+		std::vector<char*> expandedArgv{ argv[0] };
+		for (auto& a : expanded)
+			expandedArgv.push_back(a.data());
+		argc = static_cast<int>(expandedArgv.size());
+		argv = expandedArgv.data();
 		for (int i = 1; i < argc; ++i)
 		{
 			std::string arg = argv[i];
@@ -252,6 +279,37 @@ public:
 			return 0;
 		}
 		return level;
+	}
+
+	// Response file: whitespace-separated arguments; double quotes group a token with spaces.
+	bool readResponseFile(const std::string& path, std::vector<std::string>& out)
+	{
+		std::ifstream in(path, std::ios::binary);
+		if (!in)
+		{
+			m_errorMsg = "Error: cannot read response file '" + path + "'.";
+			return false;
+		}
+		std::stringstream buffer;
+		buffer << in.rdbuf();
+		const std::string text = buffer.str();
+		std::string token;
+		bool inToken = false, inQuotes = false;
+		for (char c : text)
+		{
+			if (c == '"') { inQuotes = !inQuotes; inToken = true; continue; }
+			if (!inQuotes && (c == ' ' || c == '\t' || c == '\r' || c == '\n'))
+			{
+				if (inToken) out.push_back(std::move(token));
+				token.clear();
+				inToken = false;
+				continue;
+			}
+			token.push_back(c);
+			inToken = true;
+		}
+		if (inToken) out.push_back(std::move(token));
+		return true;
 	}
 
 	void printUsage() const

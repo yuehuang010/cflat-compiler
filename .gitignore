@@ -386,3 +386,5 @@ out-linux/
 
 # Generated on demand for the localization team; regenerate with "npm run l10n:xlf".
 vscode-extension/l10n/*.xlf
+# Cross-process lock held while --update-locale merges a catalog.
+cflat/locales/*.lock

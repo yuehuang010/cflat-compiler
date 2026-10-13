@@ -202,14 +202,6 @@ if not errorlevel 1 (
     echo Policy tests skipped - --isolated is not supported on this host platform
 )
 
-REM Discover diagnostic templates from the complete error-test suite before launching
-REM parallel workers. The discovery pass uses pseudo output so expect_error matches source text.
-call "%~dp0test_err.bat" --discover --locale-dir "%CFLAT_LOCALE_DIR%" >"%OUT%\results\locale.log" 2>&1
-if errorlevel 1 (
-    echo FAILED: pseudo-locale diagnostic discovery
-    type "%OUT%\results\locale.log"
-    exit /b 1
-)
 
 REM Pre-build the C-interop fixture library so test_c_package.cb can bind it.
 REM (Uses the clang-cl/lld-link deployed next to cflat.exe for this config.)
@@ -221,8 +213,9 @@ if exist "%SRC%\cinterop\build_mathlib.bat" (
 set /a LAUNCHED=0
 
 REM Launch the error tests as CFLAT_ERR_GROUPS parallel groups - files are distributed
-REM round-robin across the groups by test_err.bat, which reads the same variable.
-if not defined CFLAT_ERR_GROUPS set CFLAT_ERR_GROUPS=4
+REM round-robin across the groups by test_err.bat, which reads the same variable. Each group
+REM also merges its diagnostic templates into en-pseudo.json (no serial discovery pass).
+if not defined CFLAT_ERR_GROUPS set CFLAT_ERR_GROUPS=8
 for /l %%G in (1,1,%CFLAT_ERR_GROUPS%) do (
     set /a LAUNCHED+=1
     start "" /b cmd /c "%SCRIPT% --worker-err %%G"

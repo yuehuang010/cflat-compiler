@@ -24,6 +24,11 @@ variable.
 positionals are treated as additional `.c` inputs to link. See
 [`doc/C_INTEROP.md`](C_INTEROP.md) for the C interop rules.
 
+`@<file>` (before any `--`) is a response file: its whitespace-separated contents are spliced
+in as arguments, and double quotes group a token containing spaces. Use it for long input
+lists, e.g. `cflat --check @files.rsp`, which would overflow the Windows cmd 8191-char line
+limit inline.
+
 ## Output
 
 | Switch | Short | Value | Description |

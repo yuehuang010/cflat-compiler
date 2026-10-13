@@ -10,7 +10,10 @@ set GROUP=0
 if not defined CFLAT_OUT set CFLAT_OUT=out
 set OUT=%CFLAT_OUT%
 if not defined CFLAT_POLICY_SUPPORTED set CFLAT_POLICY_SUPPORTED=1
-REM Every check parses each C/C++ TU at most once (legacy C++ mode reparses by design).
+REM Every check also merges its diagnostic templates into en-pseudo.json (the write is
+REM file-locked, so parallel groups are safe). Every check parses each C/C++ TU at most once.
+set "LOCALE_COLLECT=--update-locale en-pseudo"
+REM Legacy C++ mode reparses by design.
 set "TU_CHECK=--error-on-cpp-reparse"
 if /I "%CFLAT_CPP_INCREMENTAL%"=="0" set "TU_CHECK="
 if /I "%CFLAT_CPP_INCREMENTAL%"=="off" set "TU_CHECK="
@@ -27,7 +30,7 @@ set POLICY_ERRORS=0
 REM Files are distributed round-robin across GROUP_COUNT groups by index modulo
 REM GROUP_COUNT. Adding a new err_*.cb is self-maintaining - no list updates needed.
 REM test.bat exports CFLAT_ERR_GROUPS and launches exactly that many --worker-err workers.
-if not defined CFLAT_ERR_GROUPS set CFLAT_ERR_GROUPS=4
+if not defined CFLAT_ERR_GROUPS set CFLAT_ERR_GROUPS=8
 set GROUP_COUNT=%CFLAT_ERR_GROUPS%
 
 if "%GROUP%"=="0" goto :RunAll
@@ -65,22 +68,30 @@ exit /b
 REM Checks every err_*.cb whose index mod %~2 == %~1 in a SINGLE compiler
 REM invocation (--check) to amortize the per-process spawn cost. Each file is
 REM compiled in its own fresh backend and emits no output; the batch exit code
-REM is non-zero if any file failed its expect_error contract.
+REM is non-zero if any file failed its expect_error contract. The file list goes
+REM through an @response file: inline it would overflow cmd's 8191-char line limit,
+REM and cmd then skips the command without setting ERRORLEVEL.
 set /a MOD_REM=%~1
 set /a MOD_DIV=%~2
 set /a CTR=0
-set "GROUPFILES="
+set "GROUPFILES=0"
+if not exist "%OUT%\results" mkdir "%OUT%\results"
+set "GROUP_RSP=%OUT%\results\err_group_%~1_of_%~2.rsp"
+type nul >"!GROUP_RSP!"
 for %%F in (%SRC%\errors\err_*.cb) do (
     REM A file with a `.cb.flags` sidecar needs its own flags, so it runs alone (see below).
     if not exist "%%F.flags" if /I not "%%~nF"=="err_cpp_header_parse_budget" (
         set /a MOD=CTR %% MOD_DIV
-        if !MOD!==!MOD_REM! set "GROUPFILES=!GROUPFILES! %SRC%\errors\%%~nxF"
+        if !MOD!==!MOD_REM! (
+            echo "%SRC%\errors\%%~nxF">>"!GROUP_RSP!"
+            set /a GROUPFILES+=1
+        )
         set /a CTR+=1
     )
 )
-if defined GROUPFILES (
+if !GROUPFILES! gtr 0 (
     echo === error group %~1 of %~2 ===
-    %COMPILER% --check -i %LIB% --locale pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --nologo %TU_CHECK%!GROUPFILES!
+    %COMPILER% --check -i %LIB% --locale pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --nologo %LOCALE_COLLECT% %TU_CHECK% "@!GROUP_RSP!"
     if !ERRORLEVEL! neq 0 (
         set /a ERRORS+=1
         set /a NORMAL_ERRORS+=1
@@ -93,7 +104,7 @@ set "HEADER_BUDGET_FILE=%SRC%\errors\err_cpp_header_parse_budget.cb"
 if not exist "%HEADER_BUDGET_FILE%" exit /b
 echo === %~n0: err_cpp_header_parse_budget ===
 set CFLAT_CPP_MAX_HEADER_PARSES=0
-%COMPILER% --check -i %LIB% --locale pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --nologo "%HEADER_BUDGET_FILE%"
+%COMPILER% --check -i %LIB% --locale pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --nologo %LOCALE_COLLECT% "%HEADER_BUDGET_FILE%"
 set HEADER_BUDGET_RC=!ERRORLEVEL!
 set CFLAT_CPP_MAX_HEADER_PARSES=
 if !HEADER_BUDGET_RC! neq 0 (
@@ -158,7 +169,7 @@ if /I "!CFLAT_POLICY_SUPPORTED!"=="0" (
 )
 call :LoadPolicyFlags "!POLICY_FILE!"
 set "POLICY_T0=!TIME!"
-%COMPILER% "!POLICY_FILE!" -i %LIB% --locale-dir "%CFLAT_LOCALE_DIR%" --check --nologo %TU_CHECK% !POLICY_FLAGS! >"!POLICY_LOG!" 2>&1
+%COMPILER% "!POLICY_FILE!" -i %LIB% --locale-dir "%CFLAT_LOCALE_DIR%" --check --nologo %LOCALE_COLLECT% %TU_CHECK% !POLICY_FLAGS! >"!POLICY_LOG!" 2>&1
 set "POLICY_RC=!ERRORLEVEL!"
 set "POLICY_PASS=0"
 if /I "!POLICY_EXPECT_EXIT!"=="nonzero" (
@@ -217,9 +228,13 @@ del /q %CIRC_TMP% 2>nul
 exit /b
 
 :Discover
-set "DISCOVERY_FILES="
-for %%F in (%SRC%\errors\err_*.cb) do if not exist "%%F.flags" if /I not "%%~nF"=="err_cpp_header_parse_budget" set "DISCOVERY_FILES=!DISCOVERY_FILES! "%SRC%\errors\%%~nxF""
-%COMPILER% --locale pseudo --update-locale en-pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --check -i %LIB% --nologo !DISCOVERY_FILES!
+REM Standalone catalog regeneration (test.bat does not call this: its parallel groups
+REM collect the same templates). File list via @response file, see :RunModuloGroup.
+if not exist "%OUT%\results" mkdir "%OUT%\results"
+set "DISCOVERY_RSP=%OUT%\results\err_discover.rsp"
+type nul >"!DISCOVERY_RSP!"
+for %%F in (%SRC%\errors\err_*.cb) do if not exist "%%F.flags" if /I not "%%~nF"=="err_cpp_header_parse_budget" echo "%SRC%\errors\%%~nxF">>"!DISCOVERY_RSP!"
+%COMPILER% --locale pseudo --update-locale en-pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --check -i %LIB% --nologo "@!DISCOVERY_RSP!"
 if errorlevel 1 exit /b 1
 set CFLAT_CPP_MAX_HEADER_PARSES=0
 %COMPILER% --locale pseudo --update-locale en-pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --check -i %LIB% --nologo %SRC%\errors\err_cpp_header_parse_budget.cb

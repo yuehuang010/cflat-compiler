@@ -3,9 +3,84 @@
 
 #include <nlohmann/json.hpp>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+
 namespace
 {
 using Json = nlohmann::json;
+
+// Exclusive cross-process lock on "<catalog>.lock", held for the catalog's
+// read-merge-write so parallel test workers running --update-locale do not lose entries.
+class CatalogFileLock
+{
+public:
+    explicit CatalogFileLock(const std::filesystem::path& catalog)
+    {
+        const auto lockPath = std::filesystem::path(catalog).concat(".lock");
+#if defined(_WIN32)
+        handle_ = CreateFileW(lockPath.c_str(), GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        OVERLAPPED overlapped{};
+        if (handle_ != INVALID_HANDLE_VALUE &&
+            !LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &overlapped))
+        {
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+        }
+#else
+        fd_ = open(lockPath.c_str(), O_RDWR | O_CREAT, 0644);
+        if (fd_ >= 0 && flock(fd_, LOCK_EX) != 0)
+        {
+            close(fd_);
+            fd_ = -1;
+        }
+#endif
+    }
+    ~CatalogFileLock()
+    {
+#if defined(_WIN32)
+        if (handle_ != INVALID_HANDLE_VALUE)
+        {
+            OVERLAPPED overlapped{};
+            UnlockFileEx(handle_, 0, 1, 0, &overlapped);
+            CloseHandle(handle_);
+        }
+#else
+        if (fd_ >= 0)
+        {
+            flock(fd_, LOCK_UN);
+            close(fd_);
+        }
+#endif
+    }
+    CatalogFileLock(const CatalogFileLock&) = delete;
+    CatalogFileLock& operator=(const CatalogFileLock&) = delete;
+
+    bool Locked() const
+    {
+#if defined(_WIN32)
+        return handle_ != INVALID_HANDLE_VALUE;
+#else
+        return fd_ >= 0;
+#endif
+    }
+
+private:
+#if defined(_WIN32)
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
+};
 
 bool IsAsciiAlphaNumeric(char c)
 {
@@ -403,6 +478,20 @@ bool DiagnosticLocalization::WriteCollectedCatalog(const std::string& locale,
     std::unordered_map<std::string, std::vector<std::string>> argumentExamples;
     const auto& localeDirectory = localeDirectory_;
     const auto outputPath = localeDirectory / (locale + ".json");
+    std::error_code ec;
+    std::filesystem::create_directories(localeDirectory, ec);
+    if (ec)
+    {
+        std::cerr << std::format("Error: could not create locale directory '{}': {}\n",
+                                 localeDirectory.string(), ec.message());
+        return false;
+    }
+    CatalogFileLock lock(outputPath);
+    if (!lock.Locked())
+    {
+        std::cerr << std::format("Error: could not lock locale '{}'.\n", outputPath.string());
+        return false;
+    }
     if (std::filesystem::exists(outputPath))
     {
         if (!LoadCatalog(outputPath, messages, verbose,
@@ -445,15 +534,6 @@ bool DiagnosticLocalization::WriteCollectedCatalog(const std::string& locale,
             if (!compactArgumentExamples.contains(key) || compactArgumentExamples[key].empty())
                 compactArgumentExamples[key] = examples;
         }
-    }
-
-    std::error_code ec;
-    std::filesystem::create_directories(localeDirectory, ec);
-    if (ec)
-    {
-        std::cerr << std::format("Error: could not create locale directory '{}': {}\n",
-                                 localeDirectory.string(), ec.message());
-        return false;
     }
 
     // Start from the file on disk and replace only the sections written below. The
