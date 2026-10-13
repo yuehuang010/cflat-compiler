@@ -14,7 +14,7 @@ Still open:
 
 See `scratch/b15_matrix.md` and the probe corpus in `scratch/b15_matrix/` for measured results. The full class-result matrix remains incomplete.
 
-T105 review 1 (pre-existing, reproduce on master and af5afa448):
+T105 review 1 (pre-existing, reproduce on master and e4fb27c9a):
 - Inherited `operator W()` (struct PD : PB, PB declares it): `W w = pd` is refused; clang gives value 37, one operator call, one ctor, no copy. `HasImplicitClassConversionOperator` (LLVMBackend_CInterop.cpp ~28360) scans only the class's own members. Repro scratch/repro_keep/t105/c_w_inh.cb.
 - Explicit `(W)p` makes one extra copy + dtor (37 1 1 1 0 1 vs clang 37 1 1 0 0 0); earlier "explicit-cast support is not a remaining fix" checked value and op count only. Repro scratch/repro_keep/t105/c_w_cast.cb.
 
