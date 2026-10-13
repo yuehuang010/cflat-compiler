@@ -45,3 +45,7 @@ change, not a bug fix, so it needs a maintainer ruling first: emit the note ever
 where a field initializer was actually dropped. A non-empty brace list (`= { a = 1 }`) must NOT be
 queued - its field values are written into the same constant afterwards and the retry's
 `setInitializer` would clobber them.
+
+2026-10-12 (T136 r3): T136 merged native + C++ global construction into one declaration-ordered initializer, but a
+native global with a CFlat ctor body spelled `= default` / `= {}` still reads 0 (clang 5); fixing it flips the frozen
+test_initializer_list legs ~588 / ~824, so it stays with this issue.

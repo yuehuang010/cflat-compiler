@@ -1,0 +1,10 @@
+import cpp "cpp_t135_field_brace.hpp";
+
+expect_error("C++ class 't135.ListOnly' has no default constructor cflat can call") {
+    struct T135NestedListHolder { t135.ListOnly v; int a = 5; };
+    struct T135NestedOuter { T135NestedListHolder inner; int z; };
+    int makeNestedEmptyField() {
+        T135NestedOuter value = { inner = {}, z = 2 };
+        return value.z;
+    }
+}

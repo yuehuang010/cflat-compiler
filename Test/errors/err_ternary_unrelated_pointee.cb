@@ -1,0 +1,81 @@
+// A '?:' joining a class pointer with an int pointer has no common pointer type; refused, not ranked.
+struct T141E { int v = 0; };
+int t141EPick(int* p) { return 1; }
+int t141EPick(T141E* p) { return 2; }
+extern int main()
+{
+    int b = 9;
+    int* ip = &b;
+    T141E e;
+    T141E* n = &e;
+    int c = 1;
+    expect_error("cannot join 'T141E*' and 'int*' in a '?:'") {
+        int r = t141EPick(c > 0 ? n : ip);
+    }
+}
+
+// A field address arm (`&n->v`, an int*) against its own object pointer: no common type either.
+struct T141F { int v = 4; };
+int t141FPick(int* p) { return 1; }
+int t141FPick(T141F* p) { return 2; }
+expect_error("cannot join 'int*' and 'T141F*' in a '?:'") {
+    int t141FieldAddr(int c)
+    {
+        T141F* n = new T141F();
+        int r = t141FPick(c > 0 ? &n->v : n);
+        delete n;
+        return r;
+    }
+}
+
+// Two unrelated native structs, even into a void* parameter; generic instances spell demangled.
+struct T141A { int v = 4; };
+struct T141B { int w = 5; };
+struct T141Box<T> { T v = default; };
+void* t141Void(void* p) { return p; }
+expect_error("cannot join 'T141A*' and 'T141B*' in a '?:'") {
+    void* t141TwoStructs(int c, T141A* a, T141B* b) { return t141Void(c > 0 ? a : b); }
+}
+expect_error("cannot join 'T141Box<int>*' and 'T141Box<float>*' in a '?:'") {
+    void* t141TwoBoxes(int c, T141Box<int>* a, T141Box<float>* b) { void* p = c > 0 ? a : b; return p; }
+}
+
+// Two classes implementing one interface, joined into a concrete class-pointer parameter: no
+// interface boxing happens there, so the arms have no common type (clang refuses A*/B* too).
+interface T141I { int val(); };
+class T141IA : T141I { int v = 11; int val() { return v; } };
+class T141IB : T141I { int v = 22; int val() { return v; } };
+int t141ITake(T141IA* a) { return a->v; }
+expect_error("cannot join 'T141IA*' and 'T141IB*' in a '?:'") {
+    int t141IfaceConcrete(int c, T141IA* a, T141IB* b) { return t141ITake(c > 0 ? a : b); }
+}
+// Same arms into a concrete class-pointer declaration and an overload set with an interface twin.
+int t141IOv(T141IA* a) { return 1; }
+int t141IOv(T141I s) { return 4; }
+expect_error("cannot join 'T141IA*' and 'T141IB*' in a '?:'") {
+    int t141IfaceDecl(int c, T141IA* a, T141IB* b) { T141IA* p = c > 0 ? a : b; return p->v; }
+}
+expect_error("cannot join 'T141IA*' and 'T141IB*' in a '?:'") {
+    int t141IfaceOverload(int c, T141IA* a, T141IB* b) { return t141IOv(c > 0 ? a : b); }
+}
+// The unrelated join nested in an arm of a join that lands in a concrete class pointer.
+expect_error("cannot join 'T141IA*' and 'T141IB*' in a '?:'") {
+    int t141IfaceNested(int c, T141IA* a, T141IB* b) { T141IA* p = c > 0 ? (c < 0 ? a : b) : a; return p->v; }
+}
+
+// A class pointer joined with a string literal (a char* arm): no common pointer type, even into void*.
+struct T147S { int v = 0; };
+expect_error("cannot join 'T147S*' and 'char*' in a '?:'") {
+    void* t147StrVoid(int c, T147S* n) { void* p = c > 0 ? n : "abc"; return p; }
+}
+
+// Both f(A*, int) and f(I, int) are viable for the other argument: clang has no common type, so the
+// join stays refused (the interface overload alone would have boxed it).
+interface T147I { int val(); };
+class T147IA : T147I { int v = 11; int val() { return v; } };
+class T147IB : T147I { int v = 22; int val() { return v; } };
+int t147Both(T147IA* a, int n) { return 1; }
+int t147Both(T147I s, int n) { return 2; }
+expect_error("cannot join 'T147IA*' and 'T147IB*' in a '?:'") {
+    int t147BothViable(int c, T147IA* a, T147IB* b) { return t147Both(c > 0 ? a : b, 7); }
+}

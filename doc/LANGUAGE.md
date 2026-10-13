@@ -521,7 +521,8 @@ A *positional* list on a struct (`Point p = {1, 2}`) is a compile error - use na
 Nested named braces work in ordinary struct declarations and initializers too: `Outer o = { inner = { x = 1 } };`.
 
 **Fixed-size arrays `T[N]` - positional** (the size belongs to the type). Fewer elements than `N`
-leaves the trailing slots zero-filled; more than `N` is an error:
+leaves the trailing slots unset: scalar slots are zero-filled, struct slots are constructed like an
+omitted element (field defaults, or the CFlat constructor); more than `N` is an error:
 
 ```c
 int[5] a = {7, 8, 9};       // -> {7, 8, 9, 0, 0}

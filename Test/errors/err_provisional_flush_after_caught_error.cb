@@ -1,0 +1,27 @@
+// T143 r2: a flush diagnostic caught by a file-scope expect_error must not leave the flush
+// flag set or the Late body's alias frame behind. g() is parked after the caught error and must
+// be re-derived when Big completes (24-byte return, sret); a stuck flag leaves it provisional
+// and module end reports "type '<unknown>' is never completed" (r1 failed here).
+expect_error("calling convention cannot be repaired") {
+    extern Late f();
+    int before() { _ = f(); return 0; }
+    struct Late { using A = int; int v = 0; };
+}
+extern Big g();
+struct Big { long a; long b; long c; };
+Big g() { Big b; b.a = 3; b.c = 4; return b; }
+int after() { Big b = g(); return (int)(b.a + b.c); }
+
+// T143 r3: a caught flush error must not drop the parked declarations after it. h() (returns
+// Never by value) is parked behind the caught f() error; completing Never must re-derive h and
+// reject it, not lose it.
+expect_error("calling convention cannot be repaired") {
+    extern Late2 f2();
+    int before2() { _ = f2(); return 0; }
+    extern Never h();
+    int other() { _ = h(); return 0; }
+    struct Late2 { using A = int; int v = 0; };
+}
+expect_error("calling convention cannot be repaired") {
+    struct Never { long a; long b; long c; };
+}

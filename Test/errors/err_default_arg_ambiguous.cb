@@ -1,0 +1,9 @@
+// T142: `default` as a call argument binds a by-value parameter. Two by-value overloads that both take
+// it at that position are ambiguous, and the error names the candidates.
+struct DefArgAmbS { int v = 7; };
+int defArgAmbPick(DefArgAmbS s) { return s.v; }
+int defArgAmbPick(int x) { return x; }
+
+expect_error("'default' argument 1 to 'defArgAmbPick' is ambiguous") {
+    int callAmbiguous() { return defArgAmbPick(default); }
+}

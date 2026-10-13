@@ -112,6 +112,8 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
     std::vector<char> initializedInPlace;
     std::vector<char> skippedOverride;
     std::unordered_set<std::string> skippedFields;
+    // `f = {}` fields the seed builds itself (below), from their type alone.
+    std::unordered_set<std::string> emptyBraceFields;
     if (braceOverrides != nullptr)
     {
         for (auto* fi : braceOverrides->fieldInit())
@@ -127,6 +129,29 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                     && explicitNoArgConstructors_.count(field->TypeName) != 0)
                     continue;
             }
+            // `f = {}` on a plain CFlat struct field: the seed builds it once, like an omitted field.
+            // Every other empty brace stays with the override arm.
+            if (fi->initializerList() == nullptr && fi->assignmentExpression().empty())
+            {
+                auto field = std::find_if(fields.begin(), fields.end(), [&](const auto& value) {
+                    return value.VariableName == fieldName;
+                });
+                if (field != fields.end() && !field->Pointer && !field->ElemPointer
+                    && !field->IsAlias && !field->IsArrayView && !field->IsFunctionPointer
+                    && field->ConstArraySize == 0 && field->ConstInnerDimensions.empty()
+                    && !compiler->IsCxxRecord(field->TypeName)
+                    && !compiler->IsCoreUniqueType(field->TypeName)
+                    && !compiler->HasUnavailableNestedCxxDefault(field->TypeName)
+                    && !compiler->GetDataStructure(structName).IsUnion)
+                {
+                    auto* fieldType = compiler->GetType(*field);
+                    if (fieldType != nullptr && fieldType->isStructTy())
+                    {
+                        emptyBraceFields.insert(fieldName);
+                        continue;
+                    }
+                }
+            }
             skippedFields.insert(fieldName);
         }
     }
@@ -139,7 +164,18 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
         partialFields.emplace(*compiler);
     for (size_t fieldIndex = 0; fieldIndex < fields.size() && fieldIndex < fieldCount; ++fieldIndex)
     {
-        auto& field = fields[fieldIndex];
+        // An `f = {}` override replaces the declaration initializer: work on a copy without it.
+        LLVMBackend::DeclTypeAndValue emptyBraceCopy;
+        auto* fieldSlot = &fields[fieldIndex];
+        if (emptyBraceFields.count(fieldSlot->VariableName) != 0)
+        {
+            emptyBraceCopy = *fieldSlot;
+            emptyBraceCopy.Initializer = nullptr;
+            emptyBraceCopy.BraceInitializer = nullptr;
+            emptyBraceCopy.HasEmptyBareBraceInitializer = false;
+            fieldSlot = &emptyBraceCopy;
+        }
+        auto& field = *fieldSlot;
         if (skippedFields.count(field.VariableName) != 0)
         {
             if (destination != nullptr)
@@ -411,7 +447,11 @@ bool MainListener::CanFreshBraceInitializeAggregate(
         return false;
     auto data = compiler->GetDataStructure(typeName);
     if (data.StructType == nullptr || data.IsUnion) return false;
-    if (!force && !compiler->HasForeignNontrivialCxxField(typeName)) return false;
+    // A named `f = {}` needs the seed to build f once; the value-then-override path would build it twice.
+    const bool hasEmptyFieldBrace = std::any_of(fieldInits.begin(), fieldInits.end(),
+        [](auto* fi) { return fi != nullptr && fi->Identifier() != nullptr
+            && fi->initializerList() == nullptr && fi->assignmentExpression().empty(); });
+    if (!force && !hasEmptyFieldBrace && !compiler->HasForeignNontrivialCxxField(typeName)) return false;
     return true;
 }
 

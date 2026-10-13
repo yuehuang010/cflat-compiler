@@ -176,14 +176,15 @@ expect_error("cannot store a string literal") {
     int litJoinAsDefaultParameter(Point* p = true ? "nn" : "mm") { return 0; }
 }
 
-expect_error("cannot store a string literal") {
+// Since T147 a real pointer arm beside a literal is refused at the join first (clang: no common type).
+expect_error("cannot join 'Point*' and 'char*' in a '?:'") {
     void litMixedPointerArmTrue() {
         Point point = default;
         Point* p = true ? &point : "nn";
     }
 }
 
-expect_error("cannot store a string literal") {
+expect_error("cannot join 'char*' and 'Point*' in a '?:'") {
     void litMixedPointerArmFalse() {
         Point point = default;
         Point* p = false ? "nn" : &point;

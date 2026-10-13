@@ -2376,8 +2376,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             walker.walk(myListener.get(), computeUnit);
             {
                 NoCurrentFunctionScope noCurrent(this);
-                myListener->ResolvePendingGlobalDefaultConstructions();
-                myListener->EmitPendingGlobalCxxConstructions();
+                myListener->EmitPendingGlobalCxxConstructions(
+                    myListener->ResolvePendingGlobalDefaultConstructions());
             }
             // Now that every implementor is registered, emit the interface rebox if-chains.
             // Resolve-created calls can register deferred interface work, so resolve first.
@@ -3648,8 +3648,8 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         antlr4::tree::ParseTreeWalker().walk(myListener.get(), computeUnit);
         {
             NoCurrentFunctionScope noCurrent(this);
-            myListener->ResolvePendingGlobalDefaultConstructions();
-            myListener->EmitPendingGlobalCxxConstructions();
+            myListener->EmitPendingGlobalCxxConstructions(
+                myListener->ResolvePendingGlobalDefaultConstructions());
         }
     }
     if (isCoreImport)
@@ -4627,8 +4627,8 @@ bool LLVMBackend::Analyze(const std::string& filePath,
             walker.walk(myListener.get(), computeUnit);
             {
                 NoCurrentFunctionScope noCurrent(this);
-                myListener->ResolvePendingGlobalDefaultConstructions();
-                myListener->EmitPendingGlobalCxxConstructions();
+                myListener->EmitPendingGlobalCxxConstructions(
+                    myListener->ResolvePendingGlobalDefaultConstructions());
             }
             // Now that every implementor is registered, emit the interface rebox if-chains.
             // Resolve-created calls can register deferred interface work, so resolve first.

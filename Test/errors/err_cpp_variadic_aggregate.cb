@@ -1,0 +1,23 @@
+import cpp "../library/cpp_t110_varlink.hpp";
+
+// A by-value aggregate in the `...` tail of a C++ call is refused: clang passes it in a coerced
+// form this backend does not emit, so the value would be wrong. Scalars in the tail stay legal.
+int main()
+{
+    T144Pod8 p8 = {3, 4};
+    T144Pod16 p16 = {5, 6};
+    T144Big big = {7, 8, 9, 10};
+    expect_error("cannot pass aggregate value of type 'T144Pod8' to the variadic") {
+        int r = t144v.take8(1, p8);
+    }
+    expect_error("cannot pass aggregate value of type 'T144Pod16' to the variadic") {
+        int r = t144v.take8(1, p16);
+    }
+    expect_error("cannot pass aggregate value of type 'T144Big' to the variadic") {
+        T144Big r = t144v.out_sret(9, (i64)11, big, 2.5);
+    }
+    expect_error("cannot pass aggregate value of type 'T144Pod16' to the variadic") {
+        T144Big r = t144v.inl_sret(9, (i64)11, p16, 2.5);
+    }
+    return 0;
+}

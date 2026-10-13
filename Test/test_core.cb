@@ -4766,6 +4766,79 @@ int testApplication()
     return passed;
 }
 
+// T141: a `?:` call argument joining pointers to ONE native class ranks as that class pointer
+// (clang's composite pointer type), so read(P*) wins over read(int*); a null arm adopts the class.
+int t141Tag = 0;
+struct T141P { int v = 0; T141P(int x) { v = x; } };
+interface IT141 { int val(); };
+class T141C : IT141 { int n = 0; int val() { return n; } };
+int t141Read(int* p) { t141Tag = 1; if (p == nullptr) return -1; return *p; }
+int t141Read(T141P* p) { t141Tag = 2; if (p == nullptr) return -1; return p->v; }
+int t141Read(T141P** p) { t141Tag = 3; return (*p)->v; }
+int t141Take(IT141 t) { t141Tag = 4; return t.val(); }
+int t141Take(int* p) { t141Tag = 1; return *p; }
+
+int testT141TernaryClassPointee()
+{
+    int passed = 0;
+    int c = 1;
+    int d = 0;
+    T141P* n = new T141P(21);
+    T141P* m = new T141P(5);
+    int r = t141Read(c > 0 ? m : n);
+    passed += Test("T141 ternary of class pointers picks class overload", t141Tag * 100 + r, 205);
+    r = t141Read(c > 0 ? nullptr : n);
+    passed += Test("T141 ternary null arm picks class overload", t141Tag * 100 + r, 199);
+    r = t141Read(c > 0 ? (d > 0 ? n : m) : n);
+    passed += Test("T141 nested ternary picks class overload", t141Tag * 100 + r, 205);
+    r = t141Read((c > 0 ? n : m));
+    passed += Test("T141 parenthesized ternary picks class overload", t141Tag * 100 + r, 221);
+    T141P** pn = &n;
+    T141P** pm = &m;
+    r = t141Read(c > 0 ? pm : pn);
+    passed += Test("T141 ternary of double pointers keeps depth", t141Tag * 100 + r, 305);
+    T141C* a = new T141C();
+    a.n = 7;
+    T141C* b = new T141C();
+    b.n = 8;
+    r = t141Take(c > 0 ? a : b);
+    passed += Test("T141 ternary of class pointers boxes to interface overload", t141Tag * 100 + r, 407);
+    delete a;
+    delete b;
+    delete n;
+    delete m;
+    return passed;
+}
+
+// T147: a mixed-class `?:` argument boxes into the one interface parameter the OTHER arguments
+// can reach; the pointer overload f(A*, int*) is not viable for 7, so the join is not refused.
+interface IT147 { int val(); };
+class T147A : IT147 { int v = 11; int val() { return v; } };
+class T147B : IT147 { int v = 22; int val() { return v; } };
+int t147Tag = 0;
+int t147F(T147A* a, int* p) { t147Tag = 1; return 1; }
+int t147F(IT147 s, int n) { t147Tag = 2; return s.val() + 100; }
+
+int testT147TernaryJoin()
+{
+    int passed = 0;
+    int c = 0;
+    T147A* a = new T147A();
+    T147B* b = new T147B();
+    int r = t147F(c > 0 ? a : b, 7);
+    passed += Test("T147 mixed-class ternary boxes into the viable interface overload", t147Tag * 10000 + r, 20122);
+    r = t147F((c > 0 ? a : b) as IT147, 7);
+    passed += Test("T147 explicit interface cast of the same ternary picks the same overload", t147Tag * 10000 + r, 20122);
+    // A string literal arm still joins a char pointer arm (only a class pointer arm is refused).
+    char* buf = nullptr;
+    char* s = c > 0 ? buf : "abc";
+    int ch = s[0];
+    passed += Test("T147 char pointer ternary with string literal arm keeps working", ch, 97);
+    delete a;
+    delete b;
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -4818,6 +4891,8 @@ extern int main()
     r = testEmbed();            passed += r; total += 9;
     r = testApplication();      passed += r; total += 6;
     r = testT75StringCasts();   passed += r; total += 4;
+    r = testT141TernaryClassPointee(); passed += r; total += 6;
+    r = testT147TernaryJoin();  passed += r; total += 3;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

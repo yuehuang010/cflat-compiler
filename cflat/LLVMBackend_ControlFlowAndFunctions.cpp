@@ -2259,126 +2259,151 @@ void LLVMBackend::FlushPendingFunctionDeclarations()
         flushingPendingDeclarations_ = true;
         auto parked = std::move(pendingFunctionDeclarations_);
         pendingFunctionDeclarations_.clear();
-        for (auto& d : parked)
+        // Each declaration is re-derived under the alias frames it was parked with; the flush
+        // caller's frames (possibly another aggregate's body) are restored by the guard on every
+        // exit, including a LogError throw that a file-scope expect_error catches.
         {
-            // Still incomplete: park it again, untouched.
-            if (FindIncompleteByValueAggregate(d.ReturnType, d.Arguments, d.External) != nullptr)
+            AliasStackParkGuard callerFrames(this);
+            struct FlushFlagReset
             {
-                pendingFunctionDeclarations_.push_back(std::move(d));
-                continue;
-            }
-
-            AbiRecipe recipe;
-            bool useRecipe = false;
-            if (d.External)
+                bool& flag;
+                ~FlushFlagReset() { flag = false; }
+            } flushFlagReset{ flushingPendingDeclarations_ };
+            // `next` is one past the declaration being processed. A LogError unwinding the loop
+            // re-parks only the unprocessed suffix; the failing declaration is dropped as before.
+            size_t next = 0;
+            struct ReparkUnprocessed
             {
-                recipe = ComputeAbiRecipe(d.ReturnType, d.Arguments);
-                if (!d.ReturnType.Pointer && !d.ReturnType.IsAlias
-                    && ReturnsViaCxxSret(d.ReturnType.TypeName))
+                std::vector<PendingFunctionDeclaration>& parked;
+                const size_t& next;
+                std::vector<PendingFunctionDeclaration>& pending;
+                ~ReparkUnprocessed()
                 {
-                    auto cxxReturn = ComputeCxxReturnAbiRecipe(d.ReturnType, d.Arguments);
-                    if (cxxReturn.retSlot.kind == AbiSlot::SRetReturn)
-                    {
-                        recipe.retSlot = cxxReturn.retSlot;
-                        recipe.hasLowering = true;
-                    }
+                    for (size_t i = next; i < parked.size(); ++i) pending.push_back(std::move(parked[i]));
                 }
-                useRecipe = recipe.hasLowering;
-            }
-            else
+            } reparkUnprocessed{ parked, next, pendingFunctionDeclarations_ };
+            while (next < parked.size())
             {
-                recipe = ComputeCxxReturnAbiRecipe(d.ReturnType, d.Arguments);
-                useRecipe = recipe.hasLowering;
-            }
-            const bool cflatAbiLowering = !d.External && recipe.hasLowering;
-            llvm::FunctionType* wanted = useRecipe
-                ? (cflatAbiLowering
-                    ? BuildCFlatSRetFunctionType(d.ReturnType, d.Arguments, d.Varargs, recipe)
-                    : BuildExternFunctionType(d.ReturnType, d.Arguments, d.Varargs, recipe))
-                : GetFunctionType(d.ReturnType, d.Arguments, d.Varargs, d.External);
-
-            llvm::Function* provisional = module->getFunction(d.MangledName);
-            if (provisional == nullptr || wanted == nullptr
-                || provisional->getFunctionType() == wanted)
-                continue;
-            // Taking the address (`fp = f`) is ABI-neutral under opaque pointers. A direct call
-            // emitted against the provisional type is repaired only when the one change is a
-            // classified return turning into sret (the parameter list is otherwise identical).
-            std::vector<llvm::CallBase*> directCalls;
-            bool unrepairableCall = false;
-            auto markFixupFailed = [this](llvm::CallBase* call) {
-                for (auto& site : opaqueReturnDiscardSites_)
-                    if (static_cast<llvm::Value*>(site.call) == call) site.fixupFailed = true;
-            };
-            // A function-value shim (`fp = f`) forwards with the provisional signature; it is
-            // rebuilt against the repaired one below.
-            llvm::Function* oldShim = module->getFunction("__shim_" + d.MangledName);
-            const bool sretOnlyChange = useRecipe && cflatAbiLowering
-                && recipe.retSlot.kind == AbiSlot::SRetReturn
-                && wanted->getReturnType()->isVoidTy()
-                && wanted->getNumParams() == provisional->getFunctionType()->getNumParams() + 1
-                && !provisional->getFunctionType()->getReturnType()->isVoidTy();
-            for (auto* user : provisional->users())
-                if (auto* call = llvm::dyn_cast<llvm::CallBase>(user);
-                    call != nullptr && call->getCalledOperand() == provisional
-                    && (oldShim == nullptr || call->getFunction() != oldShim))
+                auto& d = parked[next++];
+                aliasScopeStack_ = d.AliasScope;
+                // Still incomplete: park it again, untouched.
+                if (FindIncompleteByValueAggregate(d.ReturnType, d.Arguments, d.External) != nullptr)
                 {
-                    const bool privateCont = !llvm::isa<llvm::InvokeInst>(call)
-                        || llvm::cast<llvm::InvokeInst>(call)->getNormalDest()
-                               ->getSinglePredecessor() != nullptr;
-                    if (!sretOnlyChange || !privateCont)
-                    {
-                        unrepairableCall = true;
-                        markFixupFailed(call);
-                    }
-                    else directCalls.push_back(call);
+                    pendingFunctionDeclarations_.push_back(std::move(d));
+                    continue;
                 }
-            if (FunctionHasDefinition(provisional) || unrepairableCall)
-            {
-                if (FunctionHasDefinition(provisional))
-                    for (auto* user : provisional->users())
-                        if (auto* call = llvm::dyn_cast<llvm::CallBase>(user);
-                            call != nullptr && call->getCalledOperand() == provisional)
+
+                AbiRecipe recipe;
+                bool useRecipe = false;
+                if (d.External)
+                {
+                    recipe = ComputeAbiRecipe(d.ReturnType, d.Arguments);
+                    if (!d.ReturnType.Pointer && !d.ReturnType.IsAlias
+                        && ReturnsViaCxxSret(d.ReturnType.TypeName))
+                    {
+                        auto cxxReturn = ComputeCxxReturnAbiRecipe(d.ReturnType, d.Arguments);
+                        if (cxxReturn.retSlot.kind == AbiSlot::SRetReturn)
+                        {
+                            recipe.retSlot = cxxReturn.retSlot;
+                            recipe.hasLowering = true;
+                        }
+                    }
+                    useRecipe = recipe.hasLowering;
+                }
+                else
+                {
+                    recipe = ComputeCxxReturnAbiRecipe(d.ReturnType, d.Arguments);
+                    useRecipe = recipe.hasLowering;
+                }
+                const bool cflatAbiLowering = !d.External && recipe.hasLowering;
+                llvm::FunctionType* wanted = useRecipe
+                    ? (cflatAbiLowering
+                        ? BuildCFlatSRetFunctionType(d.ReturnType, d.Arguments, d.Varargs, recipe)
+                        : BuildExternFunctionType(d.ReturnType, d.Arguments, d.Varargs, recipe))
+                    : GetFunctionType(d.ReturnType, d.Arguments, d.Varargs, d.External);
+
+                llvm::Function* provisional = module->getFunction(d.MangledName);
+                if (provisional == nullptr || wanted == nullptr
+                    || provisional->getFunctionType() == wanted)
+                    continue;
+                // Taking the address (`fp = f`) is ABI-neutral under opaque pointers. A direct call
+                // emitted against the provisional type is repaired only when the one change is a
+                // classified return turning into sret (the parameter list is otherwise identical).
+                std::vector<llvm::CallBase*> directCalls;
+                bool unrepairableCall = false;
+                auto markFixupFailed = [this](llvm::CallBase* call) {
+                    for (auto& site : opaqueReturnDiscardSites_)
+                        if (static_cast<llvm::Value*>(site.call) == call) site.fixupFailed = true;
+                };
+                // A function-value shim (`fp = f`) forwards with the provisional signature; it is
+                // rebuilt against the repaired one below.
+                llvm::Function* oldShim = module->getFunction("__shim_" + d.MangledName);
+                const bool sretOnlyChange = useRecipe && cflatAbiLowering
+                    && recipe.retSlot.kind == AbiSlot::SRetReturn
+                    && wanted->getReturnType()->isVoidTy()
+                    && wanted->getNumParams() == provisional->getFunctionType()->getNumParams() + 1
+                    && !provisional->getFunctionType()->getReturnType()->isVoidTy();
+                for (auto* user : provisional->users())
+                    if (auto* call = llvm::dyn_cast<llvm::CallBase>(user);
+                        call != nullptr && call->getCalledOperand() == provisional
+                        && (oldShim == nullptr || call->getFunction() != oldShim))
+                    {
+                        const bool privateCont = !llvm::isa<llvm::InvokeInst>(call)
+                            || llvm::cast<llvm::InvokeInst>(call)->getNormalDest()
+                                   ->getSinglePredecessor() != nullptr;
+                        if (!sretOnlyChange || !privateCont)
+                        {
+                            unrepairableCall = true;
                             markFixupFailed(call);
-                LogError(std::format(
-                    "'{}' was used before the by-value type in its signature was complete, so its "
-                    "calling convention cannot be repaired. Define that type before the signature.",
-                    SpellFunctionSymbol(*this, d.FunctionName)));
-                continue;
-            }
-
-            auto conv = provisional->getCallingConv();
-            provisional->setName(d.MangledName + ".provisional");
-            llvm::Function* repaired = createFunctionProto(d.MangledName, wanted);
-            repaired->setCallingConv(conv);
-            if (useRecipe)
-                ApplyAbiAttributes(repaired, recipe);
-            if (oldShim != nullptr)
-            {
-                oldShim->deleteBody();
-                oldShim->setName("__shim_" + d.MangledName + ".provisional");
-            }
-            for (auto* call : directCalls)
-                RewriteCallToSret(call, wanted, repaired, SRetArgIndex(recipe),
-                                  recipe.retSlot.structTy, recipe.retSlot.align);
-            provisional->replaceAllUsesWith(repaired);
-            provisional->eraseFromParent();
-
-            auto it = functionTable.find(d.FunctionName);
-            if (it != functionTable.end())
-                for (auto& sym : it->second)
-                    if (sym.UniqueName == d.MangledName)
-                    {
-                        sym.Function = repaired;
-                        sym.Recipe = recipe;
+                        }
+                        else directCalls.push_back(call);
                     }
-            if (oldShim != nullptr)
-            {
-                oldShim->replaceAllUsesWith(GetOrCreateFunctionShim(repaired));
-                oldShim->eraseFromParent();
+                if (FunctionHasDefinition(provisional) || unrepairableCall)
+                {
+                    if (FunctionHasDefinition(provisional))
+                        for (auto* user : provisional->users())
+                            if (auto* call = llvm::dyn_cast<llvm::CallBase>(user);
+                                call != nullptr && call->getCalledOperand() == provisional)
+                                markFixupFailed(call);
+                    LogError(std::format(
+                        "'{}' was used before the by-value type in its signature was complete, so its "
+                        "calling convention cannot be repaired. Define that type before the signature.",
+                        SpellFunctionSymbol(*this, d.FunctionName)));
+                    continue;
+                }
+
+                auto conv = provisional->getCallingConv();
+                provisional->setName(d.MangledName + ".provisional");
+                llvm::Function* repaired = createFunctionProto(d.MangledName, wanted);
+                repaired->setCallingConv(conv);
+                if (useRecipe)
+                    ApplyAbiAttributes(repaired, recipe);
+                if (oldShim != nullptr)
+                {
+                    oldShim->deleteBody();
+                    oldShim->setName("__shim_" + d.MangledName + ".provisional");
+                }
+                for (auto* call : directCalls)
+                    RewriteCallToSret(call, wanted, repaired, SRetArgIndex(recipe),
+                                      recipe.retSlot.structTy, recipe.retSlot.align);
+                provisional->replaceAllUsesWith(repaired);
+                provisional->eraseFromParent();
+
+                auto it = functionTable.find(d.FunctionName);
+                if (it != functionTable.end())
+                    for (auto& sym : it->second)
+                        if (sym.UniqueName == d.MangledName)
+                        {
+                            sym.Function = repaired;
+                            sym.Recipe = recipe;
+                        }
+                if (oldShim != nullptr)
+                {
+                    oldShim->replaceAllUsesWith(GetOrCreateFunctionShim(repaired));
+                    oldShim->eraseFromParent();
+                }
             }
         }
-        flushingPendingDeclarations_ = false;
         RepairOpaqueReturnDiscardSites();
     }
 
@@ -2645,6 +2670,7 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
                     .Arguments = arguments,
                     .External = external,
                     .Varargs = varargs,
+                    .AliasScope = aliasScopeStack_,
                 });
         }
     }

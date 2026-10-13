@@ -4984,6 +4984,93 @@ bool testLambdaCaptureShadowsGlobal()
     return result;
 }
 
+// ---- auto copy of a closure deduces the closure type (t139) ----------------------------
+// `auto f = lam;` must be the same declared type as `Lambda<..> f = lam;`: callable, own captures.
+struct AclCounter { int value = 0; };
+int aclApply(Lambda<int(int)> f) { return f(2); }
+Lambda<int(int)> aclMake(int k) { return (int x) => x + k; }
+int aclStatic(int a) { Lambda<int(int)> lam = (int x) => x + a; static auto f = lam; return f(1); }
+// `auto b = t ? a : c;` over two closures of one signature keeps the closure type through the join.
+int aclTernary(bool t) { int k = 7; Lambda<int()> a = () => k; Lambda<int()> c = () => k + 1; auto b = t ? a : c; return b(); }
+auto aclAddK<T>(T x) { int k = 1; Lambda<int(int)> f = (int y) => y + k; auto g = f; return g(x); }
+
+int aclCapture()
+{
+    int base = 0;
+    Lambda<int()> c = () => { base = base + 1; return base; };
+    auto d = c;
+    int a = c();
+    int b = c();
+    int e = d();
+    return b * 10 + e;
+}
+
+int aclRef()
+{
+    AclCounter cnt = default;
+    Lambda<void()> inc = () => { cnt.value = cnt.value + 1; };
+    auto inc2 = inc;
+    inc2();
+    inc();
+    return cnt.value;
+}
+
+int aclPassed()
+{
+    int k = 3;
+    Lambda<int(int)> lam = (int x) => x + k;
+    auto f = lam;
+    return aclApply(f);
+}
+
+int aclCallResult()
+{
+    auto f = aclMake(4);
+    return f(1);
+}
+
+int aclChain()
+{
+    int k = 4;
+    Lambda<int(int)> lam = (int x) => x + k;
+    auto f = lam;
+    auto g = f;
+    return g(1) + f(2);
+}
+
+int aclMoveSource()
+{
+    string s = "hi";
+    Lambda<int()> lam = () => s.length();
+    auto f = move lam;
+    return f();
+}
+
+int aclForInit()
+{
+    int k = 4;
+    Lambda<int(int)> lam = (int x) => x + k;
+    int got = 0;
+    for (auto f = lam; got == 0; f = lam) { got = f(1); }
+    return got;
+}
+
+bool testAutoCopyClosure()
+{
+    bool result = true;
+    result &= Test("acl_callable", aclPassed(), 5);
+    result &= Test("acl_capture_copy_state", aclCapture(), 21);
+    result &= Test("acl_ref_capture", aclRef(), 2);
+    result &= Test("acl_generic", aclAddK<int>(4) + aclAddK<int>(3), 9);
+    result &= Test("acl_call_result", aclCallResult(), 5);
+    result &= Test("acl_copy_chain", aclChain(), 11);
+    result &= Test("acl_move_source", aclMoveSource(), 2);
+    result &= Test("acl_for_init", aclForInit(), 5);
+    result &= Test("acl_static", aclStatic(2), 3);
+    result &= Test("acl_ternary", aclTernary(false), 8);
+    return result;
+}
+
 extern int main(int argc, char** argv)
 {
     // The tooling regression harness passes one argument and calls this twice. The second call
@@ -5172,6 +5259,9 @@ extern int main(int argc, char** argv)
 
     // A lambda capturing a local that shadows a same-named global (fix/lambda-capture-scope).
     total++; passed += testLambdaCaptureShadowsGlobal()     ? 1 : 0;
+
+    // `auto` copy of a closure keeps its signature and captures (t139).
+    total++; passed += testAutoCopyClosure()               ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

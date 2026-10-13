@@ -1,0 +1,46 @@
+import "../library/c_array_dim_shadow.h";
+
+// A fixed array whose total element count passes INT32_MAX is refused at every declaration site,
+// although each dimension is in range on its own: the product overflows the byte size (LLVM used
+// to fail with "invalid number of bytes" for a global, and a local hung). Also covers a struct field
+// dimension that depends on a non-constant `&&` (used to segfault in the file-scope folder).
+// Legs T137 (test_c_interop.cb) cover the constant-fold side of the same change.
+
+expect_error("array size exceeds the maximum supported element count") {
+    int[0x7fffffff][2] t137GlobalOverflow;
+}
+
+expect_error("array size exceeds the maximum supported element count") {
+    struct T137OverflowS { int[0x7fffffff][0x7fffffff] f; };
+}
+
+expect_error("array size must be a compile-time constant") {
+    int gv = 3;
+    int gw = 2;
+    struct T137NonConstS { int[(gv > 2) && (gw == 2) ? 2 : 1] f; };
+}
+
+expect_error("array size exceeds the maximum supported element count") {
+    void declLocal() { int[0x7fffffff][2] a = default; }
+}
+
+// T137 r2: an alias supplies the dimensions too, so its product is checked at global and local scope.
+expect_error("array size exceeds the maximum supported element count") {
+    using T137AliasBig = int[1073741824][2];
+    T137AliasBig t137AliasG;
+}
+
+expect_error("array size exceeds the maximum supported element count") {
+    using T137AliasLoc = int[1073741824][2];
+    void declAliasLocal() { T137AliasLoc a = default; }
+}
+
+// An unsigned macro is zero-extended: 0xFFFFFFFFu is past the cap, not a negative size.
+expect_error("array size exceeds the maximum supported element count") {
+    int[ADIM_BIG] t137BigU = default;
+}
+
+// A mutable namespace global shadows the imported macro of the same name: not a constant (clang agrees).
+expect_error("global array size must be a compile-time constant") {
+    namespace T137NsMut { int ADIM_SH = 5; int[ADIM_SH] nsArr = default; }
+}

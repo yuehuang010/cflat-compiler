@@ -1,0 +1,16 @@
+// T142: `default` names no value when every overload at that position is a reference or move/owning
+// sink parameter - the refusal says so instead of reporting a bare "no overload matches".
+struct DefArgRefS { int v = 7; };
+int defArgRefOnly(alias DefArgRefS s) { return s.v; }
+
+expect_error("has no by-value parameter to take its value") {
+    int callRefOnly() { return defArgRefOnly(default); }
+}
+
+// T142 r2: interface dispatch applies the same rule - an alias interface parameter refuses `default`.
+interface DefArgRefIface { int take(alias int x); };
+class DefArgRefImpl : DefArgRefIface { int take(alias int x) { return 7; } };
+
+expect_error("has no by-value parameter to take its value") {
+    int callRefIface() { DefArgRefImpl* h = new DefArgRefImpl(); DefArgRefIface i = h; return i.take(default); }
+}

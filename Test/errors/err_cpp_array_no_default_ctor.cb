@@ -2,6 +2,13 @@
 // is deleted has no array form at all. Pre-fix the declaration compiled to zeroed bytes and then
 // destroyed elements that had never been constructed.
 import cpp "cpp_interop_arrayelem.h";
+import cpp "cpp_t135_field_brace.hpp";
+
+// T136: a class with neither a default nor an initializer_list constructor has no empty-brace array
+// form either. The global `= {}` refusal is immediate, so a scoped block works at file scope.
+expect_error("C++ class 't135.IntOnly' has no default constructor cflat can call") {
+    t135.IntOnly[2] gNeitherEmpty = {};
+}
 
 expect_error("C++ class 'cppa.NoDef' has no default constructor cflat can call (it is deleted)");
 cppa.NoDef[2] badGlobal;
@@ -13,6 +20,10 @@ extern int main()
     }
     expect_error("so an array of it cannot be default-initialized") {
         cppa.NoDef[2] bad2;
+    }
+    // T136: the local `{}`-element spelling of the same neither class is refused as well.
+    expect_error("so an array of it cannot be default-initialized") {
+        t135.IntOnly[2] lNeitherArr = { {}, {} };
     }
     // The per-element brace list and the unlisted TAIL of a short positional list construct too,
     // so each must refuse here rather than zero-fill. Both are separate emission sites.

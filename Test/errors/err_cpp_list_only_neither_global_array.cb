@@ -1,0 +1,8 @@
+// A C++ class with NEITHER a default constructor NOR an initializer_list constructor refuses a
+// global `{}`-element array at startup with the existing array diagnostic (T136).
+import cpp "cpp_t135_field_brace.hpp";
+
+expect_error("C++ class 't135.IntOnly' has no default constructor cflat can call, so an array of it cannot be default-initialized");
+t135.IntOnly[2] gNeitherArr = { {}, {} };
+
+extern int main() { return 0; }

@@ -730,6 +730,35 @@ void MainListener::DiagnoseVoidResultConsumed(antlr4::ParserRuleContext* ctx,
             "call it as a statement", subject));
     }
 
+// T142: `default` names no type; the parameter it binds supplies the type. It is a fresh owned
+// temporary of this full expression (a by-value parameter borrows it), destroyed at its end.
+void MainListener::MaterializeDefaultArgument(antlr4::ParserRuleContext* ctx, LLVMBackend::NamedVariable& argNV,
+    const LLVMBackend::TypeAndValue& dest)
+{
+        argNV.IsDefaultArgument = true;
+        if (argNV.TypeAndValue.TypeName.empty())
+        {
+                argNV.TypeAndValue.TypeName = dest.TypeName;
+                argNV.TypeAndValue.Pointer = dest.Pointer;
+                argNV.TypeAndValue.PointerDepth = dest.PointerDepth;
+        }
+        // A null literal ties every pointer parameter, so route the typed null through a slot.
+        if (dest.Pointer && argNV.Primary != nullptr && llvm::isa<llvm::ConstantPointerNull>(argNV.Primary))
+        {
+                auto* nullSlot = Compiler(ctx)->CreateAlloca(argNV.Primary->getType());
+                Compiler(ctx)->CreateAssignment(argNV.Primary, nullSlot);
+                argNV.Primary = Compiler(ctx)->CreateLoad(nullSlot);
+        }
+        if (argNV.Primary != nullptr && !dest.Pointer && Compiler(ctx)->IsOwningValueType(dest.TypeName))
+        {
+                auto* spill = Compiler(ctx)->CreateAlloca(argNV.Primary->getType());
+                Compiler(ctx)->CreateAssignment(argNV.Primary, spill);
+                Compiler(ctx)->RegisterOwnedStructTemp(spill, dest.TypeName);
+                argNV.Storage = spill;
+                argNV.IsRvalue = true;
+        }
+}
+
 LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser::PostfixExpressionContext* ctx, bool lValue,
                                                        size_t dropTrailingChildren, ResultUse use) {
         /*
@@ -1761,7 +1790,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // An unbound plain name under a C++ namespace (`std.numbers.pi`; a system
                             // header binds nothing at import) may be a constant variable: ask clang.
                             if (!hasQualifiedMember && !isFileAlias
-                                && Compiler(ctx)->IsCxxNamespacePathOrScanned(namespaceContext)
+                                && Compiler(ctx)->IsCxxNamespace(namespaceContext)
                                 && !Compiler(ctx)->IsDataStructure(namespaceContext)
                                 && !IsFollowedByDot(ctx, terminal) && !IsFollowedByCall(ctx, terminal)
                                 && !(childIndex < ctx->children.size()
@@ -1787,7 +1816,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // (`std.ios_base.beg`, libc++ `ios_base::seekdir`): ask clang too.
                             if (!hasQualifiedMember && !isFileAlias
                                 && Compiler(ctx)->IsCxxRecord(owner)
-                                && !IsFollowedByDot(ctx, terminal) && !IsFollowedByCall(ctx, terminal)
+                                && (!IsFollowedByDot(ctx, terminal)
+                                    || (Compiler(ctx)->IsDataStructure(owner)
+                                        && !Compiler(ctx)->IsDataStructure(qualifiedName)
+                                        && !Compiler(ctx)->IsNamespace(qualifiedName)))
+                                && !IsFollowedByCall(ctx, terminal)
                                 && !(childIndex < ctx->children.size()
                                      && dynamic_cast<CFlatParser::GenericTypeParametersContext*>(
                                             ctx->children[childIndex]) != nullptr)
@@ -1805,19 +1838,35 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                              * namespace and not a class may be an extern class OBJECT. Asked only
                              * after the type request (made below anyway, memoized) came back empty.
                              */
+                            auto followedByLazyAliasType = [&]() {
+                                if (childIndex + 2 >= childLimit) return false;
+                                auto* dot = dynamic_cast<antlr4::tree::TerminalNode*>(
+                                    ctx->children[childIndex]);
+                                if (dot == nullptr || dot->getSymbol()->getType() != CFlatParser::Dot
+                                    || dynamic_cast<CFlatParser::GenericTypeParametersContext*>(
+                                        ctx->children[childIndex + 2]) == nullptr)
+                                    return false;
+                                antlr4::tree::ParseTree* memberNode = ctx->children[childIndex + 1];
+                                if (auto* rule = dynamic_cast<antlr4::RuleContext*>(memberNode);
+                                    rule != nullptr && !rule->children.empty())
+                                    memberNode = rule->children.front();
+                                auto* member = dynamic_cast<antlr4::tree::TerminalNode*>(memberNode);
+                                if (member == nullptr) return false;
+                                const std::string nestedName = qualifiedName + "." + member->getText();
+                                return Compiler(ctx)->IsCxxLazyAliasSpecialization(nestedName)
+                                    || Compiler(ctx)->HasCxxAliasTemplate(nestedName);
+                            };
                             if (!hasQualifiedMember && !isFileAlias && IsFollowedByDot(ctx, terminal)
-                                && Compiler(ctx)->IsCxxNamespacePathOrScanned(namespaceContext)
-                                && !Compiler(ctx)->IsCxxNamespacePathOrScanned(qualifiedName)
+                                && Compiler(ctx)->IsCxxNamespace(namespaceContext)
+                                && !Compiler(ctx)->IsDataStructure(namespaceContext)
                                 && !Compiler(ctx)->IsNamespace(qualifiedName)
                                 && !Compiler(ctx)->IsDataStructure(qualifiedName)
-                                && !Compiler(ctx)->IsKnownTypeName(qualifiedName))
+                                && !Compiler(ctx)->IsKnownTypeName(qualifiedName)
+                                && !(qualifiedName.starts_with("std.")
+                                     && Compiler(ctx)->IsCxxNamespacePath(qualifiedName))
+                                && !followedByLazyAliasType())
                             {
-                                std::string cxxError;
-                                Compiler(ctx)->TryRequestCxxType(qualifiedName, {}, qualifiedName, cxxError);
-                                if (!Compiler(ctx)->IsDataStructure(qualifiedName)
-                                    && !Compiler(ctx)->IsDataStructure(
-                                        Compiler(ctx)->ResolveTypeAlias(qualifiedName))
-                                    && Compiler(ctx)->IsCxxNamespaceClassObject(qualifiedName))
+                                if (Compiler(ctx)->IsCxxNamespaceClassObject(qualifiedName))
                                     hasQualifiedMember = true;
                             }
                             const bool qualifiedCxxNamespace = Compiler(ctx)->IsCxxNamespace(qualifiedName);
@@ -3299,6 +3348,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // A parenthesized `?:` joining macro constants stays a prvalue.
                             if (prevPrimary->expression() != nullptr && parenInnerNamed.IsCxxMacroJoin)
                                 namedVar.IsCxxMacroJoin = true;
+                            // And a parenthesized class-pointer `?:` keeps its joined pointee class.
+                            if (prevPrimary->expression() != nullptr && namedVar.Primary == parenInnerNamed.Primary)
+                            {
+                                namedVar.JoinClassPointee = parenInnerNamed.JoinClassPointee;
+                                namedVar.JoinClassPointeeDepth = parenInnerNamed.JoinClassPointeeDepth;
+                            }
                             if (prevPrimary->expression() != nullptr && parenInnerNamed.IsCxxMacroGlobal)
                             {
                                 std::string innerText = prevPrimary->expression()->getText();
@@ -6303,6 +6358,24 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // The matched PARAMETER is the destination context inside this
                                     // argument, so an enclosing declarator's type cannot leak in.
                                     LLVMBackend::TypeAndValue ifaceArgExpectedDest;
+                                    // T142: `default` binds only a plain by-value interface parameter (the same
+                                    // exact-default rule as a direct call); a refusal leaves the argument unbound.
+                                    bool ifaceDefaultArgument = false;
+                                    if (ifaceParams != nullptr && declaredIdx[argIdx] >= 0
+                                        && declaredIdx[argIdx] < (int64_t)ifaceParams->size()
+                                        && namedArgument->assignmentExpression() != nullptr
+                                        && IsDefaultOnlyExpression(namedArgument->assignmentExpression()))
+                                    {
+                                        const auto& dp = (*ifaceParams)[declaredIdx[argIdx]];
+                                        if (std::string refusal = Compiler(ctx)->DefaultArgumentRefusal(dp);
+                                            refusal.empty())
+                                            ifaceDefaultArgument = true;
+                                        else
+                                            LogErrorContext(namedArgument, std::format(
+                                                "'default' argument {} to '{}' has no by-value parameter to take its value: "
+                                                "parameter of type '{}' {}",
+                                                argIdx + 1, primaryIdentifier, SpellType(*Compiler(ctx), dp), refusal));
+                                    }
                                     if (ifaceParams != nullptr && declaredIdx[argIdx] >= 0
                                         && declaredIdx[argIdx] < (int64_t)ifaceParams->size())
                                     {
@@ -6325,6 +6398,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             namedArgument->assignmentExpression());
                                     });
                                     NormalizeCxxReferenceNamed(namedArgument, argNV);
+                                    if (ifaceDefaultArgument)
+                                        MaterializeDefaultArgument(namedArgument, argNV, ifaceArgExpectedDest);
                                     ifaceArgExpectedScope.reset();
                                     lambdaExpectedType = {};
                                     // Use-after-move check: a field access carries a populated Primary, so the
@@ -6389,6 +6464,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
                                     argVar.IsNormalizedCxxXvalue = argNV.IsNormalizedCxxXvalue;
                                     argVar.IsRvalue = argNV.IsRvalue;
+                                    argVar.IsDefaultArgument = argNV.IsDefaultArgument;
                                     argVar.CxxParamLastUse = argNV.CxxParamLastUse;
                                     argVar.CxxLvalueKind =
                                         CxxArgumentLvalueKind(namedArgument->assignmentExpression());
@@ -6507,6 +6583,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             argVar.TypeAndValue.IsInterface = true;
                                             argVar.TypeAndValue.Pointer = false;
                                         }
+                                        else
+                                            RefuseUnboxedClassJoinArgument(namedArgument, argValue);
                                     }
 
                                     argVar.CastOccurrenceId = thisCastOcc;
@@ -6821,6 +6899,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
 
                             std::vector<LLVMBackend::CxxBraceArgument> cxxBraceArguments;
                             bool cxxCallRefused = false;
+                            // Class-pointer '?:' arguments the arg loop could not box yet (see
+                            // BoxDeferredJoinArgument): resolved after every argument is typed.
+                            struct PendingClassJoin
+                            {
+                                size_t argIdx;
+                                antlr4::ParserRuleContext* ctx;
+                                llvm::Value* value;
+                            };
+                            std::vector<PendingClassJoin> pendingJoinArguments;
                             auto evaluateCallArguments = [&]()
                             {
                                 if (argumentList.size() > 0)
@@ -7161,6 +7248,67 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             stdFunctionParameterType = paramTv.TypeName;
                                         }
                                     }
+                                    // T142: `default` names no type, so the by-value parameter it binds supplies the
+                                    // value. Exactly one native overload may take it at this position.
+                                    bool defaultArgument = false;
+                                    if (namedArgument->assignmentExpression() != nullptr
+                                        && IsDefaultOnlyExpression(namedArgument->assignmentExpression()))
+                                    {
+                                        std::vector<std::string> allNames;
+                                        allNames.reserve(namedArgCtx.size());
+                                        for (const auto& na : namedArgCtx)
+                                            allNames.push_back(na->Identifier() ? na->Identifier()->getText()
+                                                                                : std::string());
+                                        auto targets = Compiler(ctx)->ClassifyDefaultArgument(
+                                            functionName, allNames, argIdx, paramOffset,
+                                            structVar.TypeAndValue.TypeName);
+                                        auto spellCandidate = [&](const LLVMBackend::FunctionSymbol& sym)
+                                        {
+                                            std::string params;
+                                            for (size_t pi = 0; pi < sym.Parameters.size(); pi++)
+                                            {
+                                                if (pi > 0) params += ", ";
+                                                params += SpellType(*Compiler(ctx), sym.Parameters[pi]);
+                                            }
+                                            return std::format("{}({})",
+                                                sym.SourceName.empty() ? functionName : sym.SourceName, params);
+                                        };
+                                        std::vector<const LLVMBackend::DefaultArgumentCandidate*> takers;
+                                        std::string refusals;
+                                        for (const auto& t : targets)
+                                        {
+                                            if (t.Refusal.empty())
+                                                takers.push_back(&t);
+                                            else
+                                                refusals += std::format("\n    {}: {}",
+                                                    spellCandidate(*t.Symbol), t.Refusal);
+                                        }
+                                        if (takers.size() > 1)
+                                        {
+                                            std::string list;
+                                            for (const auto* t : takers)
+                                                list += "\n    " + spellCandidate(*t->Symbol);
+                                            LogErrorContext(namedArgument, std::format(
+                                                "'default' argument {} to '{}' is ambiguous: more than one overload takes it:{}",
+                                                argIdx + 1, functionName, list));
+                                            cxxCallRefused = true;
+                                            return;
+                                        }
+                                        if (takers.empty() && !targets.empty())
+                                        {
+                                            LogErrorContext(namedArgument, std::format(
+                                                "'default' argument {} to '{}' has no by-value parameter to take its value:{}",
+                                                argIdx + 1, functionName, refusals));
+                                            cxxCallRefused = true;
+                                            return;
+                                        }
+                                        if (takers.size() == 1)
+                                        {
+                                            argExpectedDest = takers.front()->Symbol->Parameters[
+                                                static_cast<size_t>(takers.front()->Slot)];
+                                            defaultArgument = true;
+                                        }
+                                    }
                                     auto argName = namedArgument->Identifier();
                                     // Occurrence-scope this argument (see codeValueDataCasts_): a
                                     // cast here must not launder a sibling argument's join arm.
@@ -7180,6 +7328,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             namedArgument->assignmentExpression());
                                     });
                                     NormalizeCxxReferenceNamed(namedArgument, argNV);
+                                    if (defaultArgument)
+                                        MaterializeDefaultArgument(namedArgument, argNV, argExpectedDest);
                                     argExpectedScope.reset();
                                     // A lambda for a std::function parameter converts through its
                                     // function-pointer constructor, like a function<> value does.
@@ -7289,6 +7439,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
                                     argVar.IsNormalizedCxxXvalue = argNV.IsNormalizedCxxXvalue;
                                     argVar.IsRvalue = argNV.IsRvalue;
+                                    argVar.IsDefaultArgument = argNV.IsDefaultArgument;
                                     argVar.CxxParamLastUse = argNV.CxxParamLastUse;
                                     argVar.CxxLvalueKind =
                                         CxxArgumentLvalueKind(namedArgument->assignmentExpression());
@@ -7449,6 +7600,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             argVar.TypeAndValue.IsInterface = true;
                                             argVar.TypeAndValue.Pointer = false;
                                         }
+                                        else
+                                            pendingJoinArguments.push_back({ argIdx, namedArgument, argValue });
                                     }
 
                                     // Propagate function-pointer type for lambda arguments
@@ -7482,6 +7635,26 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     Compiler(ctx)->EndCastOccurrence(savedCastOcc);
                                     arguments.emplace_back(argVar);
                                 }
+                                // Every argument is typed now: a deferred class join drops the candidates
+                                // that cannot take the others, then boxes or stays refused.
+                                for (const auto& pending : pendingJoinArguments)
+                                {
+                                    std::string joinIface;
+                                    if (auto* fat = BoxDeferredJoinArgument(arguments, declaredIdx, functionName,
+                                            paramOffset + namedArgCtx.size(), pending.argIdx,
+                                            pending.value, joinIface))
+                                    {
+                                        auto& joined = arguments[pending.argIdx];
+                                        joined.Primary = fat;
+                                        joined.BaseType = fat->getType();
+                                        joined.TypeAndValue.TypeName = joinIface;
+                                        joined.TypeAndValue.IsInterface = true;
+                                        joined.TypeAndValue.Pointer = false;
+                                    }
+                                    else
+                                        RefuseUnboxedClassJoinArgument(pending.ctx, pending.value);
+                                }
+                                pendingJoinArguments.clear();
                             }
                             };
                             bool deferHresultChainArguments = hresultChainPending && winrtSlot != nullptr;

@@ -495,6 +495,23 @@ bool MainListener::IsBondedClosureContainer(
         return contains(contains, type);
     }
 
+// The expression is a whole call argument, possibly parenthesized: `f(c ? a : b)`, `f((c ? a : b))`.
+static bool IsCallArgumentThroughParens(antlr4::ParserRuleContext* ctx)
+{
+    for (auto* node = ctx->parent; node != nullptr; )
+    {
+        if (dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(node) != nullptr)
+            return true;
+        auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+        if (rule == nullptr) return false;
+        const bool parens = rule->children.size() == 3 && rule->children[0]->getText() == "("
+            && rule->children[2]->getText() == ")";
+        if (!parens && rule->children.size() != 1) return false;
+        node = rule->parent;
+    }
+    return false;
+}
+
 LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatParser::AssignmentExpressionContext* ctx,
                                                               ResultUse use) {
         // Snapshot and clear the owned-return flag so FinishAssignmentExpressionNamed
@@ -619,6 +636,8 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                 auto tv = ParseConditionalExpression(condCtx, use);
                 joinShape = tv;
                 result.Primary = tv.value;
+                result.JoinClassPointee = tv.joinClassPointee;
+                result.JoinClassPointeeDepth = tv.joinClassPointeeDepth;
                 result.TypeAndValue.IsAlias = tv.isAlias;
                 result.IsRvalue = tv.isRvalue;
                 result.IsPointerArithmeticResult = tv.isPointerArithmeticResult;
@@ -763,6 +782,17 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                     result.TypeAndValue.Pointer = true;
                     result.TypeAndValue.PointerDepth = joinShape.pointerDepth;
                     result.TypeAndValue.ElemPointer = joinShape.elemPointer;
+                }
+                // Both arms point at one native class: rank the call argument as that class
+                // pointer. Call arguments only - other consumers resolve each arm themselves.
+                else if (joinShape.value == result.Primary && !joinShape.joinClassPointee.empty()
+                         && inCallArgument_ && IsCallArgumentThroughParens(ctx)
+                         && InferTernaryArmType(result.Primary).TypeName.empty())
+                {
+                    result.TypeAndValue.TypeName = joinShape.joinClassPointee;
+                    result.TypeAndValue.Pointer = true;
+                    result.TypeAndValue.PointerDepth = joinShape.joinClassPointeeDepth;
+                    result.TypeAndValue.ElemPointer = joinShape.joinClassPointeeDepth > 1;
                 }
                 else
                 {
@@ -1842,6 +1872,82 @@ llvm::Value* MainListener::UpcastPointerJoinToInterface(llvm::Value* right, cons
                 || (armFailure != nullptr && !armFailure->empty())))
             *joinSpelling = "??";
         return fat;
+    }
+
+// Two classes implementing one interface, inherited ones included (Circle : IDrawable : IShape).
+bool MainListener::ClassesShareInterface(const std::string& a, const std::string& b) const {
+        for (const auto& [iface, methods] : compilerLLVM->interfaceTable)
+            if (compilerLLVM->StructImplementsInterface(a, iface)
+                && compilerLLVM->StructImplementsInterface(b, iface))
+                return true;
+        return false;
+    }
+
+void MainListener::RefuseUnboxedClassJoinArgument(antlr4::ParserRuleContext* ctx, llvm::Value* argValue) {
+        auto* compiler = compilerLLVM;
+        if (!llvm::isa_and_nonnull<llvm::PHINode>(argValue) || !argValue->getType()->isPointerTy())
+            return;
+        std::vector<std::string> armClasses;
+        if (!CollectJoinArmClasses(argValue, armClasses)) return;
+        std::vector<std::string> distinct;
+        for (const auto& cls : armClasses)
+            if (std::find(distinct.begin(), distinct.end(), cls) == distinct.end())
+                distinct.push_back(cls);
+        // Unrelated classes were already refused at the join itself (UnifyTernaryArmTypes).
+        if (distinct.size() < 2 || !ClassesShareInterface(distinct[0], distinct[1])) return;
+        auto spell = [&](const std::string& cls) {
+            return SpellDiagnosticType(*compiler, LLVMBackend::TypeAndValue{
+                .TypeName = cls, .Pointer = true, .PointerDepth = 1 });
+        };
+        LogErrorContext(ctx, std::format("cannot join '{}' and '{}' in a '?:': the pointee types "
+            "differ; use an explicit cast on one arm", spell(distinct[0]), spell(distinct[1])));
+    }
+
+// ComputeOverloadFunction's own test, one parameter at a time: does `cand` take `arg` at `index`.
+static bool CandidateTakesArgument(LLVMBackend* compiler, const LLVMBackend::FunctionSymbol& cand,
+                                   size_t index, const LLVMBackend::NamedVariable& arg)
+{
+        LLVMBackend::FunctionSymbol probe = cand;
+        probe.Parameters = { cand.Parameters[index] };
+        probe.IsMethod = false;
+        probe.UniqueName = "__cflat_join_arg_probe";   // no declared C++ spelling to look up
+        probe.CxxAbi.valid = false;
+        probe.Recipe.paramSlots.clear();
+        const std::vector<std::pair<std::vector<LLVMBackend::NamedVariable>,
+                                    LLVMBackend::FunctionSymbol>> one = { { { arg }, probe } };
+        return !compiler->ComputeOverloadFunction(one).second.Parameters.empty();
+    }
+
+// A class-join argument the arg loop could not box, judged once every argument is typed: a
+// candidate that cannot take the OTHER arguments is dropped, then the join boxes into the one
+// interface the rest share. Nothing viable, or a pointer candidate still viable, returns nullptr.
+llvm::Value* MainListener::BoxDeferredJoinArgument(
+        const std::vector<LLVMBackend::NamedVariable>& arguments,
+        const std::vector<int64_t>& declaredIdx, const std::string& functionName,
+        size_t wantParams, size_t argIdx, llvm::Value* argValue, std::string& ifaceNameOut) {
+        auto* compiler = compilerLLVM;
+        if (arguments.size() != declaredIdx.size() || argIdx >= arguments.size()) return nullptr;
+        const int64_t joinSlot = declaredIdx[argIdx];
+        auto ftIt = compiler->functionTable.find(functionName);
+        if (joinSlot < 0 || ftIt == compiler->functionTable.end()) return nullptr;
+        std::vector<const LLVMBackend::TypeAndValue*> viable;
+        for (const auto& cand : ftIt->second)
+        {
+            if (cand.Parameters.size() != wantParams || joinSlot >= (int64_t)cand.Parameters.size())
+                continue;
+            bool takesRest = true;
+            for (size_t j = 0; j < arguments.size() && takesRest; ++j)
+            {
+                // An unbound named argument keeps the candidate: the conservative side.
+                if (j == argIdx || declaredIdx[j] < 0
+                    || declaredIdx[j] >= (int64_t)cand.Parameters.size())
+                    continue;
+                takesRest = CandidateTakesArgument(compiler, cand, (size_t)declaredIdx[j], arguments[j]);
+            }
+            if (takesRest) viable.push_back(&cand.Parameters[joinSlot]);
+        }
+        if (viable.empty()) return nullptr;
+        return BoxPointerJoinArgument(viable, argValue, ifaceNameOut);
     }
 
 llvm::Value* MainListener::BoxPointerJoinArgument(
@@ -7486,6 +7592,42 @@ static bool BinaryJoinIsUnsigned(bool leftUnsigned, unsigned leftBits,
     return leftUnsigned ? leftBits >= rightBits : rightBits >= leftBits;
 }
 
+// Two pointer arms naming different pointees, one of them a class (or any non-primitive name),
+// have no common pointer type: clang refuses the `?:`, so the join refuses instead of letting
+// overload ranking pick an arbitrary pointee. C++ class pointers keep their own conversions.
+static bool UnrelatedPointeeTernaryArms(LLVMBackend* compiler,
+                                        const LLVMBackend::TypeAndValue& a,
+                                        const LLVMBackend::TypeAndValue& b)
+{
+    // A single-level pointer may leave its depth unrecorded (0); it is depth 1.
+    auto depth = [](const LLVMBackend::TypeAndValue& t) {
+        return t.PointerDepth == 0 && !t.ElemPointer ? 1 : t.PointerDepth;
+    };
+    if (!a.Pointer || !b.Pointer || a.IsInterface || b.IsInterface
+        || a.IsArrayView || b.IsArrayView || a.ElemPointer != b.ElemPointer
+        || depth(a) != depth(b))
+        return false;
+    const std::string an = compiler->ResolveTypeAlias(a.TypeName);
+    const std::string bn = compiler->ResolveTypeAlias(b.TypeName);
+    if (an.empty() || bn.empty() || an == bn || an == "void" || bn == "void") return false;
+    if (compiler->IsCxxRecord(an) || compiler->IsCxxRecord(bn)) return false;
+    return !(LLVMBackend::IsPrimitiveTypeName(an) && LLVMBackend::IsPrimitiveTypeName(bn));
+}
+
+// The interface a `?:` result is boxed into (`IS s = ...`, `unique<IS>`), else empty.
+static std::string TernaryInterfaceDestination(LLVMBackend& compiler,
+                                               const LLVMBackend::TypeAndValue& expected) {
+        if (expected.TypeName.empty()) return {};
+        if (compiler.IsCoreUniqueType(expected.TypeName))
+        {
+            std::string inner = MangledGenericArgument(compiler, expected.TypeName);
+            return compiler.IsInterfaceType(inner) ? inner : std::string{};
+        }
+        std::string name = compiler.ResolveTypeAlias(expected.TypeName);
+        return (expected.IsInterface || compiler.IsInterfaceType(name))
+            && expected.PointerDepth <= 1 && !expected.ElemPointer ? name : std::string{};
+}
+
 bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContext* ctx,
                               llvm::Value*& trueValue, llvm::Value*& falseValue,
                               const LLVMBackend::TypedValue& trueShape,
@@ -7493,7 +7635,8 @@ bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContex
                               const std::function<void()>& atTrue,
                               const std::function<void()>& atFalse,
                               size_t trueOccurrence, size_t falseOccurrence,
-                              bool trueIsUnsigned, bool falseIsUnsigned) {
+                              bool trueIsUnsigned, bool falseIsUnsigned,
+                              const std::string& interfaceDestination, bool destinationPointer) {
         auto* compiler = Compiler(ctx);
         if (!trueValue || !falseValue) return true;
 
@@ -7506,6 +7649,101 @@ bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContex
                 std::swap(trueType, falseType);
             compiler->RejectImplicitIntegerPointeePointerConversion(
                 trueType, falseType);
+            // A pointer arm the ledger cannot type (a field address) keeps the pointee its shape names.
+            auto shapePointee = [](const LLVMBackend::TypedValue& shape, llvm::Value* value,
+                                   LLVMBackend::TypeAndValue inferred) {
+                if (inferred.Pointer || value == nullptr
+                    || !value->getType()->isPointerTy()
+                    || shape.pointerDepth < 1 || shape.sourceTypeName.empty())
+                    return inferred;
+                inferred.Pointer = true;
+                inferred.TypeName = shape.sourceTypeName;
+                inferred.PointerDepth = shape.pointerDepth;
+                inferred.ElemPointer = shape.elemPointer;
+                return inferred;
+            };
+            // A string literal arm is a `char*` (clang's const char*) for the pointee check, so
+            // `P* ?: "abc"` is refused like `P* ?: char*`; a literal into char* still joins.
+            // A null/default other arm carries no pointee: the literal-store gate names that case.
+            auto literalAsChar = [&](llvm::Value* value, LLVMBackend::TypeAndValue named,
+                                     llvm::Value* other) {
+                auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(value);
+                if (named.Pointer || constant == nullptr || !compiler->IsStringLiteralConstant(constant)
+                    || llvm::isa_and_nonnull<llvm::ConstantPointerNull>(other))
+                    return named;
+                named.Pointer = true;
+                named.TypeName = "char";
+                named.PointerDepth = 1;
+                return named;
+            };
+            const auto trueNamed = literalAsChar(trueValue,
+                shapePointee(trueShape, trueValue, InferTernaryArmType(trueShape)), falseValue);
+            const auto falseNamed = literalAsChar(falseValue,
+                shapePointee(falseShape, falseValue, InferTernaryArmType(falseShape)), trueValue);
+            // Per-arm interface boxing (`IS s = c ? circle : square`) has no C++ counterpart: exempt
+            // a join boxed into an interface both arm classes implement. A non-pointer or unknown
+            // destination (`as`, `??` arm; a call argument, checked once its overload is chosen)
+            // defers a shared interface to the consumer.
+            const std::string trueClass = compiler->ResolveTypeAlias(trueNamed.TypeName);
+            const std::string falseClass = compiler->ResolveTypeAlias(falseNamed.TypeName);
+            auto boxable = [&]() {
+                if (trueNamed.PointerDepth > 1 || trueNamed.ElemPointer
+                    || falseNamed.PointerDepth > 1 || falseNamed.ElemPointer)
+                    return false;
+                if (!interfaceDestination.empty())
+                    return compiler->StructImplementsInterface(trueClass, interfaceDestination)
+                        && compiler->StructImplementsInterface(falseClass, interfaceDestination);
+                if (destinationPointer) return false;
+                return ClassesShareInterface(trueClass, falseClass);
+            };
+            if (!trueNamed.IsSimd && !falseNamed.IsSimd && !trueShape.isArrayView
+                && !falseShape.isArrayView && UnrelatedPointeeTernaryArms(compiler, trueNamed, falseNamed)
+                && !boxable())
+            {
+                auto spell = [&](LLVMBackend::TypeAndValue type) {
+                    type.TypeName = compiler->ResolveTypeAlias(type.TypeName);
+                    if (type.PointerDepth == 0 && !type.ElemPointer) type.PointerDepth = 1;
+                    return SpellDiagnosticType(*compiler, type);
+                };
+                LogErrorContext(ctx, std::format("cannot join '{}' and '{}' in a '?:': the "
+                    "pointee types differ; use an explicit cast on one arm",
+                    spell(trueNamed), spell(falseNamed)));
+            }
+            // A nested join arm deferred its shared-interface classes (it had no destination); a
+            // concrete pointer destination here takes it as a raw pointer, so refuse it now.
+            else if (destinationPointer && interfaceDestination.empty()
+                     && (llvm::isa_and_nonnull<llvm::PHINode>(trueValue)
+                         || llvm::isa_and_nonnull<llvm::PHINode>(falseValue)))
+            {
+                std::vector<std::string> leafClasses;
+                auto collect = [&](llvm::Value* value, const LLVMBackend::TypeAndValue& named) {
+                    if (llvm::isa<llvm::PHINode>(value)) return CollectJoinArmClasses(value, leafClasses);
+                    if (llvm::isa<llvm::ConstantPointerNull>(value)) return true;
+                    std::string name = compiler->ResolveTypeAlias(named.TypeName);
+                    if (!named.Pointer || named.PointerDepth > 1 || named.ElemPointer
+                        || !compiler->IsDataStructure(name))
+                        return false;
+                    leafClasses.push_back(name);
+                    return true;
+                };
+                if (collect(trueValue, trueNamed) && collect(falseValue, falseNamed))
+                {
+                    std::vector<std::string> distinct;
+                    for (const auto& cls : leafClasses)
+                        if (std::find(distinct.begin(), distinct.end(), cls) == distinct.end())
+                            distinct.push_back(cls);
+                    if (distinct.size() >= 2 && ClassesShareInterface(distinct[0], distinct[1]))
+                    {
+                        auto spell = [&](const std::string& cls) {
+                            return SpellDiagnosticType(*compiler, LLVMBackend::TypeAndValue{
+                                .TypeName = cls, .Pointer = true, .PointerDepth = 1 });
+                        };
+                        LogErrorContext(ctx, std::format("cannot join '{}' and '{}' in a '?:': the "
+                            "pointee types differ; use an explicit cast on one arm",
+                            spell(distinct[0]), spell(distinct[1])));
+                    }
+                }
+            }
         }
 
         // C integer promotion: mixed-sign sub-int arms both become a signed i32 before the join,
@@ -7794,6 +8032,64 @@ llvm::Value* MainListener::CloneTernaryClosureValue(
         return cloned;
     }
 
+// Two closure signatures are the same only when every spelled and inferred component matches.
+static bool SameClosureSignature(const LLVMBackend::TypeAndValue& a, const LLVMBackend::TypeAndValue& b)
+{
+    if (a.FuncPtrReturnTypeName != b.FuncPtrReturnTypeName
+        || a.FuncPtrReturnPointer != b.FuncPtrReturnPointer
+        || a.FuncPtrReturnPointerDepth != b.FuncPtrReturnPointerDepth
+        || a.FuncPtrReturnOwned != b.FuncPtrReturnOwned
+        || a.FuncPtrReturnAlias != b.FuncPtrReturnAlias
+        || a.FuncPtrReturnResolvedKey != b.FuncPtrReturnResolvedKey
+        || a.FuncPtrParams.size() != b.FuncPtrParams.size())
+        return false;
+    for (size_t i = 0; i < a.FuncPtrParams.size(); i++)
+    {
+        const auto& p = a.FuncPtrParams[i];
+        const auto& q = b.FuncPtrParams[i];
+        if (p.TypeName != q.TypeName || p.Pointer != q.Pointer || p.PointerDepth != q.PointerDepth
+            || p.IsMove != q.IsMove || p.IsRvalueRef != q.IsRvalueRef
+            || p.IsPointeeConst != q.IsPointeeConst || p.ResolvedTypeKey != q.ResolvedTypeKey
+            || p.IsOwningSink != q.IsOwningSink || p.IsConsumeInferredSink != q.IsConsumeInferredSink
+            || p.IsReturnInferredSink != q.IsReturnInferredSink
+            || p.IsWriteInferredSink != q.IsWriteInferredSink)
+            return false;
+    }
+    return true;
+}
+
+/*
+ * `auto b = t ? f : g;` over two closures of ONE signature keeps that signature (the same fat
+ * closure type as `Lambda<..> b = ...`), so the declaration stays callable. Arms that disagree
+ * record nothing and the join stays refused, as before.
+ */
+static void CarryCommonClosureSignature(LLVMBackend* compiler, LLVMBackend::TypedValue& result,
+                                        const LLVMBackend::TypedValue& trueShape,
+                                        const LLVMBackend::TypedValue& falseShape)
+{
+    if (result.value == nullptr || result.value->getType() != compiler->GetClosureFatPtrType()) return;
+    auto isClosure = [](const LLVMBackend::TypedValue& shape) {
+        return shape.hasSourceType && shape.sourceType.TypeName == "__closure_fat_ptr"
+            && shape.sourceType.IsFunctionPointer && !shape.sourceType.Pointer;
+    };
+    if (!isClosure(trueShape) || !isClosure(falseShape)) return;
+    const auto& t = trueShape.sourceType;
+    if (!SameClosureSignature(t, falseShape.sourceType)) return;
+    LLVMBackend::TypeAndValue type;
+    type.TypeName = "__closure_fat_ptr";
+    type.IsFunctionPointer = true;
+    type.FuncPtrReturnTypeName = t.FuncPtrReturnTypeName;
+    type.FuncPtrReturnPointer = t.FuncPtrReturnPointer;
+    type.FuncPtrReturnOwned = t.FuncPtrReturnOwned;
+    type.FuncPtrReturnAlias = t.FuncPtrReturnAlias;
+    type.FuncPtrReturnPointerDepth = t.FuncPtrReturnPointerDepth;
+    type.FuncPtrReturnResolvedKey = t.FuncPtrReturnResolvedKey;
+    type.FuncPtrParams = t.FuncPtrParams;
+    result.sourceType = std::move(type);
+    result.sourceTypeName = "__closure_fat_ptr";
+    result.hasSourceType = true;
+}
+
 /*
  * A `?:` over two pointers of ONE primitive shape (same pointee, same depth) has that shape too,
  * so `s + (c ? a : b)` binds like `s + a`. Arms that disagree leave the join unrecorded; class
@@ -7824,6 +8120,61 @@ void MainListener::JoinTernaryPointerShape(LLVMBackend::TypedValue& result,
         result.pointerDepth = trueArm.pointerDepth;
         result.elemPointer = trueArm.elemPointer;
         result.sourceTypeName = trueArm.sourceTypeName;
+    }
+
+/*
+ * A `?:` over two pointers to ONE native class at one depth (or one such arm and a null arm) has
+ * that class as its pointee, as C++'s composite pointer type. Recorded only on the transient
+ * TypedValue for call-argument overload ranking: the element ledger and sourceTypeName stay
+ * untouched, so interface boxing and ownership guards keep resolving each arm on its own.
+ */
+void MainListener::JoinTernaryClassPointee(LLVMBackend::TypedValue& result,
+                                           const LLVMBackend::TypedValue& trueArm,
+                                           const LLVMBackend::TypedValue& falseArm) {
+        if (result.value == nullptr || !result.value->getType()->isPointerTy()) return;
+        auto* compiler = compilerLLVM;
+        // The arm's class pointee and pointer depth; an empty name = no class pointer.
+        auto armClass = [&](const LLVMBackend::TypedValue& arm, bool& isNull, int& depth) -> std::string {
+            isNull = llvm::isa_and_nonnull<llvm::ConstantPointerNull>(arm.value)
+                || (arm.hasSourceType && arm.sourceType.IsCxxNullptrT);
+            depth = 0;
+            if (isNull || arm.value == nullptr || !arm.value->getType()->isPointerTy()) return {};
+            if (!arm.joinClassPointee.empty())
+            {
+                depth = arm.joinClassPointeeDepth;
+                return arm.joinClassPointee;
+            }
+            if (arm.isArrayView) return {};
+            const auto type = InferTernaryArmType(arm);
+            if (!type.Pointer || type.IsArrayView || type.IsSimd || type.IsInterface
+                || type.IsInterfacePointer || type.IsFunctionPointer || type.ConstArraySize != 0)
+                return {};
+            // A single-level pointer may leave its depth unrecorded (0); a deeper one may not.
+            depth = type.PointerDepth == 0 && !type.ElemPointer ? 1 : type.PointerDepth;
+            if (depth < 1 || type.ElemPointer != (depth > 1)) return {};
+            const std::string name = compiler->ResolveTypeAlias(type.TypeName);
+            if (name.empty() || LLVMBackend::IsPrimitiveTypeName(name)
+                || compiler->IsCxxRecord(name) || compiler->IsInterfaceType(name)
+                || compiler->dataStructures.find(name) == compiler->dataStructures.end())
+                return {};
+            return name;
+        };
+        bool trueNull = false;
+        bool falseNull = false;
+        int trueDepth = 0;
+        int falseDepth = 0;
+        const std::string trueClass = armClass(trueArm, trueNull, trueDepth);
+        const std::string falseClass = armClass(falseArm, falseNull, falseDepth);
+        if (!trueClass.empty() && ((trueClass == falseClass && trueDepth == falseDepth) || falseNull))
+        {
+            result.joinClassPointee = trueClass;
+            result.joinClassPointeeDepth = trueDepth;
+        }
+        else if (!falseClass.empty() && trueNull)
+        {
+            result.joinClassPointee = falseClass;
+            result.joinClassPointeeDepth = falseDepth;
+        }
     }
 
 // Structural: the arm is a `move` expression, possibly parenthesized (no text matching).
@@ -8763,7 +9114,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         }
         if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, trueShape, falseShape,
                 atTrue, atFalse, trueOcc, falseOcc,
-                trueUnsigned, falseUnsigned))
+                trueUnsigned, falseUnsigned, TernaryInterfaceDestination(*compiler, outerExpected),
+                !inCallArgument_ && (outerExpected.Pointer || outerExpected.PointerDepth > 0)))
         {
             atTrue(); compiler->CreateJump(resumeBlock);
             atFalse(); compiler->CreateJump(resumeBlock);
@@ -9027,6 +9379,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             || (trueShape.isRvalue && falseShape.isRvalue
                 && !trueShape.isExplicitMove && !falseShape.isExplicitMove);
         JoinTernaryPointerShape(result, trueShape, falseShape);
+        JoinTernaryClassPointee(result, trueShape, falseShape);
         auto trueType = trueShape.hasSourceType ? trueShape.sourceType : InferTernaryArmType(trueValue);
         auto falseType = falseShape.hasSourceType ? falseShape.sourceType : InferTernaryArmType(falseValue);
         auto recoverFunctionNameType = [&](const LLVMBackend::TypedValue& shape,
@@ -9070,6 +9423,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             result.sourceTypeName = result.sourceType.TypeName;
             result.hasSourceType = true;
         }
+        CarryCommonClosureSignature(compiler, result, trueShape, falseShape);
         if (resultValue != nullptr
             && (resultValue->getType()->isIntegerTy()
                 || resultValue->getType()->isFloatingPointTy()))
@@ -9840,7 +10194,9 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                         ? falseValue->getType()->getIntegerBitWidth() : 0);
                 if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, trueShape, falseShape, here, here,
                         compiler->CurrentCastOccurrence(), compiler->CurrentCastOccurrence(),
-                        trueUnsigned, falseUnsigned))
+                        trueUnsigned, falseUnsigned,
+                        TernaryInterfaceDestination(*compiler, outerExpected),
+                        !inCallArgument_ && (outerExpected.Pointer || outerExpected.PointerDepth > 0)))
                     return {};
 
                 auto pointerJoinDest = cxxPointerJoinDest();
@@ -9891,8 +10247,10 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 LLVMBackend::TypedValue result{ selectValue, joinUnsigned };
                 result.isAlias = compiler->IsAliasValue(selectValue);
                 JoinTernaryPointerShape(result, trueShape, falseShape);
+                JoinTernaryClassPointee(result, trueShape, falseShape);
                 carryCommonThinFunctionPointerType(result, trueShape, falseShape,
                                                     trueValue, falseValue);
+                CarryCommonClosureSignature(compiler, result, trueShape, falseShape);
                 return result;
             }
 
@@ -10767,6 +11125,8 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         result.hasSourceType = true;
         result.cxxPointeeConst = namedVar.TypeAndValue.IsCxxPointeeConst
             && namedVar.TypeAndValue.Pointer;
+        result.joinClassPointee = namedVar.JoinClassPointee;
+        result.joinClassPointeeDepth = namedVar.JoinClassPointeeDepth;
         OperandPointerDepth(namedVar, result.value, result.pointerDepth, result.elemPointer);
         return result;
     }
@@ -17928,14 +18288,22 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                     auto dimExprs = dimSpec->assignmentExpression();
                     for (auto* dimExpr : dimExprs)
                     {
-                        auto* dimValue = ParseAssignmentExpression(dimExpr);
-                        auto* dimConst = dimValue != nullptr
-                            ? llvm::dyn_cast<llvm::ConstantInt>(dimValue) : nullptr;
-                        if (dimConst == nullptr || dimConst->isZero())
+                        // Same folder and range checks as a declared dimension (macros, enumerators).
+                        // A folded value that is zero or oversized was already diagnosed there.
+                        auto* dimConst = TryFoldArrayDim(dimExpr, false);
+                        if (dimConst == nullptr)
                         {
-                            LogErrorContext(dimExpr, "sizeof: array dimensions must be positive constants");
-                            return {};
+                            auto* dimValue = ParseAssignmentExpression(dimExpr);
+                            dimConst = dimValue != nullptr
+                                ? llvm::dyn_cast<llvm::ConstantInt>(dimValue) : nullptr;
+                            if (dimConst == nullptr || dimConst->isZero())
+                            {
+                                LogErrorContext(dimExpr, "sizeof: array dimensions must be positive constants");
+                                return {};
+                            }
                         }
+                        else if (dimConst->isZero() || dimConst->getZExtValue() > (uint64_t)INT32_MAX)
+                            return {};
                         arrayDims.push_back(dimConst->getZExtValue());
                     }
                 }
@@ -19685,8 +20053,12 @@ void MainListener::EmitBraceElementIntoFixedSlot(
         // scope exit still destroyed it. Its own default constructor runs here instead.
         if (seed == nullptr && compiler->CxxElementNeedsDefaultConstruction(elemTypeName))
         {
+            // An empty `{}` element of a list-constructor-only class is that constructor, n == 0.
+            const bool emptyList = list == nullptr || list->fieldInit().empty();
             std::string ctorError;
-            if (!compiler->EmitCxxArrayDefaultConstruction(
+            if (emptyList && compiler->CxxEmptyBraceUsesListCtor(elemTypeName))
+                EmitCxxEmptyBraceConstruct(elemPtr, elemTypeName, fi, true);
+            else if (!compiler->EmitCxxArrayDefaultConstruction(
                     elemTypeName, elemPtr, elemStructTy, compiler->builder->getInt64(1), ctorError))
                 LogErrorContext(fi, ctorError);
         }
@@ -19706,6 +20078,59 @@ void MainListener::EmitBraceElementIntoFixedSlot(
  * seed the slot with the field type's OWN default (so its scalar field defaults survive a
  * partial list), then let the named field-inits / container add() calls overwrite on top.
  */
+/*
+ * Value-initializes the C++ class `typeName` at `slot` from an empty brace: the default
+ * constructor when present, else the initializer_list constructor with n == 0 (clang's `{}`).
+ * copyListInit refuses an explicit constructor, as copy-list-initialization does.
+ */
+bool MainListener::EmitCxxEmptyBraceConstruct(
+        llvm::Value* slot,
+        const std::string& typeName,
+        antlr4::ParserRuleContext* braceContext,
+        bool copyListInit) {
+        auto* compiler = Compiler(braceContext);
+        std::vector<LLVMBackend::NamedVariable> elements;
+        std::string wrapperName;
+        std::string constructorError;
+        if (!compiler->RequestCxxDirectBraceConstructor(
+                typeName, elements, "{}", copyListInit,
+                wrapperName, constructorError))
+        {
+            if (constructorError.empty())
+                constructorError = std::format("C++ class '{}' has no constructor accepting an empty brace list",
+                    compiler->DisplayCxxClassName(typeName));
+            LogErrorContext(braceContext, constructorError);
+            return false;
+        }
+        LLVMBackend::NamedVariable self;
+        self.Primary = slot;
+        self.BaseType = slot->getType();
+        self.TypeAndValue.TypeName = typeName;
+        self.TypeAndValue.Pointer = true;
+        self.IsRvalue = true;
+        std::vector<LLVMBackend::NamedVariable> wrapperArguments{ self };
+        compiler->SetCurrentDebugLocation(braceContext->getStart()->getLine());
+        compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
+        return true;
+}
+
+bool MainListener::IsCxxEmptyBraceArrayInit(
+        const LLVMBackend::TypeAndValue& tv,
+        CFlatParser::InitializerListContext* list) {
+        if (list == nullptr || list->fieldInit().empty()) return false;
+        auto* compiler = Compiler(list);
+        if (!compiler->IsCxxRecord(tv.TypeName) || tv.Pointer || tv.ElemPointer || tv.IsAlias
+            || tv.IsArrayView || tv.ConstArraySize == 0 || !tv.ConstInnerDimensions.empty())
+            return false;
+        for (auto* fi : list->fieldInit())
+        {
+            if (!FieldInitIsBraceElement(fi)) return false;
+            auto* nested = fi->initializerList();
+            if (nested != nullptr && !nested->fieldInit().empty()) return false;
+        }
+        return true;
+}
+
 llvm::Value* MainListener::ParseFieldDefaultBraceInitializer(
         const std::string& structName,
         const LLVMBackend::DeclTypeAndValue& field,
@@ -19731,30 +20156,10 @@ llvm::Value* MainListener::ParseFieldDefaultBraceInitializer(
                 && compiler->pendingCxxSretDest_ == inPlaceDest
                 && compiler->pendingCxxSretTypeName_ == field.TypeName;
             llvm::Value* slot = constructInPlace ? inPlaceDest : compiler->CreateAlloca(fieldType);
-            std::vector<LLVMBackend::NamedVariable> elements;
-            std::string wrapperName;
-            std::string constructorError;
             const bool copyListInit = field.Initializer != nullptr
                 && field.Initializer->LeftBrace() != nullptr;
-            if (!compiler->RequestCxxDirectBraceConstructor(
-                    field.TypeName, elements, "{}", copyListInit,
-                    wrapperName, constructorError))
-            {
-                if (constructorError.empty())
-                    constructorError = std::format("C++ class '{}' has no constructor accepting an empty brace list",
-                        compiler->DisplayCxxClassName(field.TypeName));
-                LogErrorContext(braceContext, constructorError);
+            if (!EmitCxxEmptyBraceConstruct(slot, field.TypeName, braceContext, copyListInit))
                 return nullptr;
-            }
-            LLVMBackend::NamedVariable self;
-            self.Primary = slot;
-            self.BaseType = slot->getType();
-            self.TypeAndValue.TypeName = field.TypeName;
-            self.TypeAndValue.Pointer = true;
-            self.IsRvalue = true;
-            std::vector<LLVMBackend::NamedVariable> wrapperArguments{ self };
-            compiler->SetCurrentDebugLocation(braceContext->getStart()->getLine());
-            compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
             if (constructInPlace)
             {
                 compiler->pendingCxxSretDest_ = nullptr;
@@ -19970,7 +20375,8 @@ void MainListener::EmitArrayValueInitSlots(
         llvm::StructType* elemTy,
         const LLVMBackend::TypeAndValue& tv,
         CFlatParser::InitializerListContext* list,
-        bool forceRoot) {
+        bool forceRoot,
+        antlr4::ParserRuleContext* emptyBraceCtx) {
         auto* compiler = Compiler();
         if (arrAlloc == nullptr || elemTy == nullptr) return;
 
@@ -19984,8 +20390,20 @@ void MainListener::EmitArrayValueInitSlots(
         if (compiler->GetFunction(tv.TypeName) == nullptr
             && compiler->CxxElementNeedsDefaultConstruction(tv.TypeName))
         {
+            // A list-only class has no default constructor: each empty `{}` element takes the
+            // initializer_list constructor with n == 0, as the global and positional forms do.
+            const bool emptyList = list == nullptr || list->fieldInit().empty();
             std::string ctorError;
-            if (!compiler->EmitCxxArrayDefaultConstruction(
+            if (emptyList && compiler->CxxEmptyBraceUsesListCtor(tv.TypeName))
+            {
+                compiler->EmitArrayConstructionWalk(
+                    arrAlloc, elemTy, n, tv.TypeName,
+                    [&](llvm::Value* elemPtr)
+                    {
+                        EmitCxxEmptyBraceConstruct(elemPtr, tv.TypeName, emptyBraceCtx, true);
+                    });
+            }
+            else if (!compiler->EmitCxxArrayDefaultConstruction(
                     tv.TypeName, arrAlloc, elemTy, compiler->builder->getInt64(n), ctorError))
             {
                 if (list != nullptr) LogErrorContext(list, ctorError);
@@ -20040,7 +20458,7 @@ void MainListener::EmitFieldDefaultArraySplat(
             || compiler->CxxElementNeedsDefaultConstruction(field.TypeName)
             || compiler->HasForeignNontrivialCxxField(field.TypeName))
         {
-            EmitArrayValueInitSlots(slot, elemTy, field, list, true);
+            EmitArrayValueInitSlots(slot, elemTy, field, list, true, list);
             return;
         }
 
@@ -20172,6 +20590,125 @@ void MainListener::EmitFieldInitializer(
             if (!seen.insert(fieldName).second)
             {
                 LogErrorContext(fi, std::format("Duplicate field initializer for '{}'", fieldName));
+                continue;
+            }
+
+            // `field = {}`: no initializerList and no expression, so it gets its own arm. Like clang,
+            // a C++ class is value-initialized in place; other fields take their default value.
+            if (fi->initializerList() == nullptr && fi->assignmentExpression().empty())
+            {
+                // Bitfields are not in StructFields: clear the window in the storage word (value 0).
+                if (auto emptyBit = std::find_if(sd.Bitfields.begin(), sd.Bitfields.end(),
+                        [&](const auto& b) { return b.Name == fieldName; });
+                    emptyBit != sd.Bitfields.end())
+                {
+                    const auto& storageField = sd.StructFields[emptyBit->StorageFieldIndex];
+                    auto* storageTy = compiler->GetType(storageField);
+                    auto* wordTy = compiler->GetBitfieldWordType(storageTy);
+                    auto* storagePtr = sd.IsUnion ? structPtr : compiler->builder->CreateStructGEP(
+                        sd.StructType, structPtr, emptyBit->StorageFieldIndex, fieldName + "_bf_empty");
+                    const unsigned w = emptyBit->BitWidth;
+                    const uint64_t valMask = (w == 64) ? ~uint64_t(0) : ((uint64_t(1) << w) - 1);
+                    const uint64_t windowMask = valMask << emptyBit->BitOffset;
+                    auto* word = compiler->LoadBitfieldWord(storagePtr, storageTy);
+                    auto* cleared = compiler->builder->CreateAnd(word,
+                        cflat_llvm::GetIntTruncated(wordTy, ~windowMask));
+                    compiler->StoreBitfieldWord(storagePtr, storageTy, cleared);
+                    continue;
+                }
+                int emptyFieldIndex = -1;
+                for (int i = 0; i < (int)sd.StructFields.size(); ++i)
+                    if (sd.StructFields[i].VariableName == fieldName)
+                    {
+                        emptyFieldIndex = i;
+                        break;
+                    }
+                if (emptyFieldIndex < 0)
+                {
+                    LogErrorContext(fi, std::format("'{}' has no field named '{}'",
+                        spellTypeName(typeName), fieldName));
+                    continue;
+                }
+                const auto& emptyField = sd.StructFields[emptyFieldIndex];
+                const std::string emptyFieldPath = std::format("'{}.{}'",
+                    spellTypeName(typeName), fieldName);
+                llvm::Value* emptyDestination = sd.IsUnion ? structPtr
+                    : compiler->CreateCxxFieldGEP(sd, structPtr, (unsigned)emptyFieldIndex,
+                                                   fieldName + "_empty_init");
+                const bool emptyCxxClass = !emptyField.Pointer && !emptyField.ElemPointer
+                    && !emptyField.IsAlias && !emptyField.IsArrayView
+                    && emptyField.ConstArraySize == 0 && emptyField.ConstInnerDimensions.empty()
+                    && compiler->IsCxxRecord(emptyField.TypeName);
+                if (emptyCxxClass)
+                {
+                    // Copy-list-initialization of the member: an explicit constructor is refused.
+                    if (!EmitCxxEmptyBraceConstruct(emptyDestination, emptyField.TypeName, fi, true))
+                        continue;
+                    if (destinationIsFresh)
+                        compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot,
+                                                    emptyDestination, emptyField.TypeName);
+                    continue;
+                }
+                // A CFlat struct with a C++ member lacking a usable default: refuse like an omitted field.
+                std::string unavailableType;
+                if (!emptyField.Pointer && !emptyField.ElemPointer && !emptyField.IsAlias
+                    && !emptyField.IsArrayView
+                    && compiler->GetDataStructure(emptyField.TypeName).StructType != nullptr
+                    && compiler->HasUnavailableNestedCxxDefault(emptyField.TypeName, &unavailableType))
+                {
+                    const auto* info = compiler->GetCxxClassInfo(unavailableType);
+                    LogErrorContext(fi, std::format(
+                        "C++ class '{}' has no default constructor cflat can call{}",
+                        compiler->DisplayCxxClassName(unavailableType),
+                        info != nullptr && info->hasDeletedDefaultCtor ? " (it is deleted)" : ""));
+                    continue;
+                }
+                if (emptyField.ConstArraySize > 0 && !emptyField.Pointer && !emptyField.ElemPointer
+                    && !emptyField.IsAlias && !emptyField.IsArrayView)
+                {
+                    // Build each slot in place: a temp copy would leave self-pointers at a dead address.
+                    if (compiler->IsCxxRecord(emptyField.TypeName) && emptyField.ConstInnerDimensions.empty())
+                    {
+                        auto* arrTy = llvm::dyn_cast_or_null<llvm::ArrayType>(compiler->GetType(emptyField));
+                        bool built = arrTy != nullptr;
+                        for (uint64_t slot = 0; built && slot < arrTy->getNumElements(); ++slot)
+                        {
+                            auto* slotPtr = compiler->builder->CreateConstInBoundsGEP2_64(
+                                arrTy, emptyDestination, 0, slot);
+                            built = EmitCxxEmptyBraceConstruct(slotPtr, emptyField.TypeName, fi, true);
+                            if (built && destinationIsFresh)
+                                compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot,
+                                                            slotPtr, emptyField.TypeName);
+                        }
+                        if (!built)
+                            continue;
+                    }
+                    else
+                    {
+                        GlobalScopeGuard emptyFieldScope(global_scope);
+                        EmitFixedArrayDefaultInit(emptyDestination, emptyField, fi);
+                        llvm::Type* elemTy = nullptr;
+                        const uint64_t count = compiler->PeelFixedArrayType(
+                            compiler->GetType(emptyField), elemTy);
+                        if (destinationIsFresh)
+                            compiler->NoteUnwindArrayPrefix(emptyDestination, elemTy,
+                                compiler->builder->getInt64(count), emptyField.TypeName);
+                    }
+                    continue;
+                }
+                llvm::Value* emptyValue = nullptr;
+                {
+                    GlobalScopeGuard emptyFieldScope(global_scope);
+                    emptyValue = GenerateDefaultValue(emptyField);
+                }
+                if (emptyValue == nullptr)
+                {
+                    LogErrorContext(fi, std::format(
+                        "empty brace initializer is not supported for field {} of type '{}'",
+                        emptyFieldPath, spellTypeName(emptyField.TypeName)));
+                    continue;
+                }
+                compiler->builder->CreateStore(emptyValue, emptyDestination);
                 continue;
             }
 
@@ -20882,10 +21419,43 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                     arrTy, arrAlloc, { zero, compiler->builder->getInt32((uint32_t)first) },
                     "arrtail");
             std::string ctorError;
-            if (!compiler->EmitCxxArrayDefaultConstruction(
+            if (compiler->CxxEmptyBraceUsesListCtor(tv.TypeName))
+            {
+                // Each unlisted slot is value-initialized from `{}`: the list constructor, n == 0.
+                for (uint64_t slot = first; slot < n; ++slot)
+                {
+                    llvm::Value* slotPtr = multidim
+                        ? elementPtrs[slot]
+                        : compiler->builder->CreateInBoundsGEP(
+                            arrTy, arrAlloc, { zero, compiler->builder->getInt32((uint32_t)slot) },
+                            "arrslot");
+                    EmitCxxEmptyBraceConstruct(slotPtr, tv.TypeName, initList, true);
+                }
+            }
+            else if (!compiler->EmitCxxArrayDefaultConstruction(
                     tv.TypeName, tailBase, elemStructTy,
                     compiler->builder->getInt64(n - first), ctorError))
                 LogErrorContext(initList, ctorError);
+        }
+        /*
+         * A native struct tail takes the element's own default, field defaults or CFlat constructor,
+         * exactly as an omitted element does; the zero fill above would leave `0` where clang keeps
+         * `7`. Update mode keeps the elements the containing aggregate already built.
+         */
+        if (!updateExistingElements && elemStructTy != nullptr && (uint64_t)elements.size() < n
+            && compiler->GetFunction(tv.TypeName) != nullptr)
+        {
+            uint64_t first = (uint64_t)elements.size();
+            llvm::Value* tailBase = multidim
+                ? elementPtrs[first]
+                : compiler->builder->CreateInBoundsGEP(
+                    arrTy, arrAlloc, { zero, compiler->builder->getInt32((uint32_t)first) }, "arrtail");
+            compiler->EmitArrayConstructionWalk(
+                tailBase, elemStructTy, n - first, tv.TypeName,
+                [&](llvm::Value* elemPtr)
+                {
+                    ConstructDefaultArrayElement(compiler, tv.TypeName, elemPtr, false);
+                });
         }
     }
 
@@ -21174,6 +21744,13 @@ void MainListener::EmitGlobalFixedArrayInit(
 
         bool emptyInit = (initList == nullptr || initList->fieldInit().empty());
         llvm::Constant* arrConst = nullptr;
+        // Every element `{}` of a C++ class: the startup walk builds each one through the empty-brace
+        // route (the default ctor, else the list ctor), so the stored constant is only zero storage.
+        // The outer `{}` of a C++-class array is the same thing: every element value-initialized at startup.
+        const bool cxxEmptyBraceElems = emptyInit
+            ? (compiler->IsCxxRecord(tv.TypeName) && !tv.Pointer && !tv.ElemPointer && !tv.IsAlias
+               && !tv.IsArrayView && tv.ConstInnerDimensions.empty())
+            : (positionalArray && IsCxxEmptyBraceArrayInit(tv, initList));
 
         if (emptyInit)
         {
@@ -21182,7 +21759,8 @@ void MainListener::EmitGlobalFixedArrayInit(
                 std::string ctorError;
                 compiler->TryBindCxxImplicitDefaultCtor(tv.TypeName, ctorError);
                 if (!ctorError.empty()) LogErrorContext(errCtx, ctorError);
-                if (compiler->FindCxxDefaultCtor(tv.TypeName) == nullptr)
+                if (compiler->FindCxxDefaultCtor(tv.TypeName) == nullptr
+                    && !compiler->CxxEmptyBraceUsesListCtor(tv.TypeName))
                 {
                     std::string ambiguityError;
                     if (compiler->CxxDefaultCtorAmbiguityError(tv.TypeName, ambiguityError))
@@ -21237,6 +21815,11 @@ void MainListener::EmitGlobalFixedArrayInit(
             for (size_t i = 0; i < elements.size(); i++)
             {
                 auto* fi = elements[i];
+                if (FieldInitIsBraceElement(fi) && cxxEmptyBraceElems)
+                {
+                    elems.push_back(llvm::Constant::getNullValue(elemTy));
+                    continue;
+                }
                 if (FieldInitIsBraceElement(fi))
                 {
                     braceElem = fi;
@@ -21313,7 +21896,24 @@ void MainListener::EmitGlobalFixedArrayInit(
             return;
         }
 
-        compiler->CreateGlobalVariable(tv, arrConst);
+        auto* globalArr = compiler->CreateGlobalVariable(tv, arrConst);
+        // Every element is value-initialized at startup (a zero constant is only the storage).
+        if (cxxEmptyBraceElems && globalArr != nullptr)
+        {
+            LLVMBackend::DeclTypeAndValue declTv;
+            static_cast<LLVMBackend::TypeAndValue&>(declTv) = tv;
+            QueuePendingGlobalConstruction(pendingGlobalCxxConstructions_, {globalArr, declTv, direct, false, true, true});
+        }
+        // A native struct with a default (field defaults or a CFlat constructor): `T[N] g = {};`
+        // default-constructs each element like `T[N] g;`, so the zero constant above is replaced.
+        if (emptyInit && globalArr != nullptr && !compiler->IsCxxRecord(tv.TypeName)
+            && !tv.Pointer && !tv.ElemPointer && !tv.IsAlias && !tv.IsArrayView
+            && compiler->GetFunction(tv.TypeName) != nullptr)
+        {
+            LLVMBackend::DeclTypeAndValue declTv;
+            static_cast<LLVMBackend::TypeAndValue&>(declTv) = tv;
+            QueuePendingGlobalConstruction(pendingGlobalDefaultConstructions_, {globalArr, declTv, direct});
+        }
 
         // Register the global for LSP/--symbol, matching the scalar global path.
         if (auto* s = compiler->GetSymbolSink())
@@ -21613,6 +22213,25 @@ void MainListener::ValidateArrayDimValue(antlr4::ParserRuleContext* expr, llvm::
             LogErrorContext(expr, "array size exceeds the maximum supported element count");
     }
 
+void MainListener::ValidateArrayTotalElements(antlr4::ParserRuleContext* expr, uint64_t outer,
+                                              const std::vector<uint64_t>& inner) {
+        // Each dimension is range-checked on its own; a product past INT32_MAX (the single-dimension
+        // cap) overflows the byte size (LLVM "invalid number of bytes"). A zero or oversized
+        // dimension was already diagnosed, so it is skipped here to avoid a second error.
+        if (inner.empty() || outer == 0 || outer > (uint64_t)INT32_MAX) return;
+        uint64_t total = outer;
+        for (uint64_t d : inner)
+        {
+            if (d == 0 || d > (uint64_t)INT32_MAX) return;
+            if (total > (uint64_t)INT32_MAX / d)
+            {
+                LogErrorContext(expr, "array size exceeds the maximum supported element count");
+                return;
+            }
+            total *= d;
+        }
+    }
+
 llvm::Value* MainListener::FoldArrayDimValue(antlr4::ParserRuleContext* expr, llvm::Value* value) {
         uint64_t folded = 0;
         // Only admitted (immutable) globals fold; a mutable global keeps the run-time size.
@@ -21631,14 +22250,18 @@ llvm::Value* MainListener::FoldArrayDimValue(antlr4::ParserRuleContext* expr, ll
 llvm::ConstantInt* MainListener::TryFoldArrayDim(CFlatParser::AssignmentExpressionContext* expr,
                                                  bool allowEmission) {
         auto* compiler = Compiler(expr);
-        if (auto folded = FoldCompileTimeInt(compiler, expr))
+        // Macros and imported enumerators fold here (and only here), see IsFoldingArrayDim.
+        compiler->SetFoldingArrayDim(true);
+        auto constFold = FoldCompileTimeInt(compiler, expr);
+        compiler->SetFoldingArrayDim(false);
+        if (constFold)
         {
-            if (*folded <= 0)
+            if (*constFold <= 0)
                 LogErrorContext(expr, "array size must be greater than zero");
-            if (*folded > INT32_MAX)
+            if (*constFold > INT32_MAX)
                 LogErrorContext(expr, "array size exceeds the maximum supported element count");
             auto* i64Ty = llvm::Type::getInt64Ty(*compiler->context);
-            return llvm::ConstantInt::get(i64Ty, (uint64_t)*folded);
+            return llvm::ConstantInt::get(i64Ty, (uint64_t)*constFold);
         }
         if (!allowEmission) return nullptr;
         LLVMBackend::BuilderStateGuard savedState(compiler);
@@ -21647,12 +22270,17 @@ llvm::ConstantInt* MainListener::TryFoldArrayDim(CFlatParser::AssignmentExpressi
             voidTy, llvm::Function::PrivateLinkage, "__global_arr_dim_tmp", compiler->module.get());
         auto* tmpBB = llvm::BasicBlock::Create(*compiler->context, "entry", tmpFn);
         compiler->builder->SetInsertPoint(tmpBB);
+        // `&&` and `?:` create blocks in currentFunction; at file scope it is null, which left the
+        // blocks detached (a segfault in the next load). Attach them to the throwaway function.
+        auto* savedFn = compiler->currentFunction;
+        compiler->currentFunction = tmpFn;
 
         llvm::Value* sizeVal = ParseAssignmentExpression(expr);
         uint64_t folded = 0;
         bool ok = sizeVal && TryFoldConstInt(sizeVal, folded, &constFoldableGlobals_,
                                              &compiler->ImportedEnumeratorGlobals());
 
+        compiler->currentFunction = savedFn;
         tmpFn->eraseFromParent();
         savedState.restore();
 

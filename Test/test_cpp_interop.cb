@@ -456,6 +456,8 @@ import cpp "library/cpp_t61_var_template_cpo.hpp";
 import cpp "library/t32_msvc_std_shapes.hpp";
 import cpp "library/cpp_t26_ios_shapes.hpp";
 import cpp "library/cpp_t26_ios_shapes.cpp";
+import cpp "library/cpp_t138_tplglobal.hpp";
+import cpp "library/cpp_t138_tplglobal_r2.hpp";
 import cpp "library/cpp_t26_vbase.hpp";
 int t26FinalAliasRead(alias t26v.final_shift value)
 {
@@ -475,9 +477,11 @@ t50v.V* t50Up(t50v.L* p) { return p; }
 int t50Take(t50v.V* v) { return v == nullptr ? -1 : v.value; }
 import cpp "library/t31_minmax_brace.hpp";
 import cpp "library/cpp_t63_brace_decl.hpp";
+import cpp "library/cpp_t135_field_brace.hpp";
 import cpp "library/cpp_t78_scalar_table.h";
 import cpp "library/cpp_interop_t104_refparam.hpp";
 import cpp "library/cpp_t87_null_zero.h";
+import cpp "library/cpp_t132_s7_byval.hpp";
 import cpp "library/cpp_private_base_shadow.h";
 int cppcg_add(int a, int b) { return a + b; }
 
@@ -1780,6 +1784,51 @@ struct T73ArrayHolder { cpp_t73.Mix items[2]; };
 struct T73Nested { T73Holder holder; };
 struct T134EmptyOnlyFieldHolder { t63.EmptyOnly value = {}; };
 struct T134EmptyOnlyDirectFieldHolder { t63.EmptyOnly value{}; };
+struct T135ListHolder { t135.ListOnly v; int z; };
+struct T135DefHolder { t135.DefList v; int z; };
+struct T135OnlyHolder { t135.ListOnly v; };
+struct T135Outer { T135ListHolder inner; int w; };
+struct T135CflatInner { int a = 5; int b; };
+struct T135CflatHolder { T135CflatInner v; int z; };
+struct T135ScalarHolder { int s; int z; };
+int t135CflatCtors = 0;
+int t135CflatDtors = 0;
+struct T135Counted { int a; T135Counted() { a = 7; t135CflatCtors = t135CflatCtors + 1; } ~T135Counted() { t135CflatDtors = t135CflatDtors + 1; } };
+struct T135CountedHolder { T135Counted inner; int z; };
+struct T135DefInner { t135.DefList v; int a = 5; };
+struct T135DefInnerHolder { T135DefInner inner; int z; };
+struct T135SelfArrayHolder { t135.SelfRef a[2]; int z; };
+struct T135Bits { int b : 3; int z; };
+// A declaration initializer on the field is replaced by `f = {}` (value-initialized, not the declared default).
+struct T135DmiInner { int a = 5; };
+struct T135DmiHolder { T135DmiInner inner = { a = 42 }; int z; };
+struct T135DmiGen<T> { T a = 5; };
+struct T135DmiGenHolder { T135DmiGen<int> inner = { a = 42 }; int z; };
+struct T135DmiJ { int b = 3; };
+struct T135DmiI { T135DmiJ j = { b = 9 }; int a = 5; };
+struct T135DmiTwo { T135DmiI inner = { a = 42 }; int z; };
+struct T135CountedDmi { T135Counted inner = { }; int z; };
+struct T135DmiCxx { t135.DefList v = {}; int z; };
+// T136 file-scope empty braces of a list-only class: `{}`, `= {}`, `{}` elements (partial too),
+// and a default + list class whose default constructor wins for each element.
+t135.T136List t136GlobalBrace{};
+t135.T136List t136GlobalEq = {};
+t135.T136List[2] t136GlobalArr = { {}, {} };
+t135.T136List[3] t136GlobalPartial = { {} };
+t135.DefList[2] t136GlobalDefArr = { {}, {} };
+// The outer `= {}` of an array: every element is value-initialized at startup as well.
+t135.T136List[2] t136GlobalOuter = {};
+t135.DefList[2] t136GlobalDefOuter = {};
+// T136 ORDER: C++ and CFlat globals are constructed in DECLARATION order by one initializer. A
+// native constructor global and a native array of `{}` both sit between two C++ globals.
+import cpp "library/cpp_t136_order.hpp";
+struct T136Ord { int v; T136Ord() { v = t136ord.mark(); } };
+t136ord.Stamp t136OrdBefore = default;
+T136Ord t136OrdOne;
+T136Ord[2] t136OrdArr = {};
+t136ord.Stamp t136OrdAfter = default;
+// T136: a list-only class array FIELD with an empty `= {}` brace: each element is value-initialized.
+struct T136FieldEmpty { t135.T136List[2] a = {}; int z; };
 struct T73VirtualHolder { cpp_t73.Virtual value; };
 struct T73DefaultMemberHolder { cpp_t73.DefaultMember value; };
 struct T97Hd { cpp_t97.Dl d; int k = 0; };
@@ -1910,6 +1959,20 @@ int T103NativeNull(int* value) { return 72; }
 
 extern int main()
 {
+    // T136: the file-scope objects above are constructed at startup, before any other code runs.
+    if (t135.t136CtorCount() != 9 || t136GlobalBrace.n != 0 || t136GlobalEq.n != 0
+        || t136GlobalArr[0].n != 0 || t136GlobalArr[1].n != 0
+        || t136GlobalPartial[0].n != 0 || t136GlobalPartial[2].n != 0
+        || t136GlobalOuter[0].n != 0 || t136GlobalOuter[1].n != 0)
+        return 9336;
+    if (t136GlobalDefArr[0].which != 0 || t136GlobalDefArr[1].which != 0
+        || t136GlobalDefOuter[0].which != 0 || t136GlobalDefOuter[1].which != 0
+        || t135.defListDefaultCount() != 4 || t135.defListListCount() != 0)
+        return 9337;
+    // T136 ORDER: the constructions above ran in declaration order: 1, 2, then 3 and 4, then 5.
+    if (t136OrdBefore.n != 1 || t136OrdOne.v != 2 || t136OrdArr[0].v != 3
+        || t136OrdArr[1].v != 4 || t136OrdAfter.n != 5)
+        return 9348;
     // T103 accept set frozen before C++ constructor-selection changes.
     if (t103.only_int(0) != 11 || t103.only_pointer(0) != 22) return 10301;
     if (t103.pointer_or_long(nullptr) != 31) return 10302;
@@ -2187,6 +2250,27 @@ extern int main()
     t132.SNull* t132Nullptr = new t132.SNull(nullptr);
     if (t132Nullptr.v != 22) return 13205;
     delete t132Nullptr;
+    // T140 NULLLEFT: copy-init and by-value literal 0 skip the explicit EX(long) and take EX(void*)
+    // (clang: 22); a widening pick beside a narrowing tie is clang's (ambiguous, see err_cpp_null_tie).
+    t140.Recv t140Recv{};
+    t140.EX t140ExCopy = 0;
+    if (t140ExCopy.v != 22) return 13207;
+    t140.EX t140ExCopyL = 0L;
+    if (t140ExCopyL.v != 22) return 13208;
+    if (t140Recv.takeEX(0) != 22) return 13209;
+    t140.EX* t140ExDirect = new t140.EX(0L);
+    if (t140ExDirect.v != 11) return 13210;
+    delete t140ExDirect;
+    // Exact and unambiguous picks next to the tie stay where they were (clang: 33, 11, 22, 11, 1).
+    t140.SCL* t140SclLong = new t140.SCL(5L);
+    if (t140SclLong.v != 33) return 13211;
+    delete t140SclLong;
+    t140.SCL* t140SclChar = new t140.SCL('a');
+    if (t140SclChar.v != 11) return 13212;
+    delete t140SclChar;
+    if (t140Recv.takeSC(nullptr) != 22 || t140Recv.takeSC('a') != 11) return 13213;
+    if (t140Recv.takeSCL(5L) != 33) return 13214;
+    if (t140.takeK(0) != 1) return 13215;
     // A scalar-reference constructor beside a pointer one: the null literal reaches the mirror's selector
     // as 0, so the pointer constructor wins (clang: 99).
     t87.NullRef* t87L98138 = new t87.NullRef(0, 1.5);
@@ -2252,6 +2336,128 @@ extern int main()
             return 9314;
     }
     if (t63.emptyOnlyCtorCount() != 1 || t63.emptyOnlyDtorCount() != 1) return 9315;
+    // T135 accept-set: a designated `field = {}` value-initializes the member like clang.
+    t135.resetListOnly();
+    {
+        T135ListHolder t135Designated = { v = {}, z = 2 };
+        if (t135Designated.v.n != 0 || t135Designated.z != 2
+            || t135.listOnlyCtorCount() != 1 || t135.listOnlyDtorCount() != 0)
+            return 9316;
+    }
+    if (t135.listOnlyCtorCount() != 1 || t135.listOnlyDtorCount() != 1) return 9317;
+    t135.resetDefList();
+    {
+        T135DefHolder t135DefDesignated = { v = {}, z = 2 };
+        if (t135DefDesignated.v.n != -1 || t135DefDesignated.v.which != 0
+            || t135DefDesignated.z != 2 || t135.defListDefaultCount() != 1
+            || t135.defListListCount() != 0 || t135.defListDtorCount() != 0)
+            return 9318;
+    }
+    if (t135.defListDtorCount() != 1) return 9319;
+    t135.resetListOnly();
+    {
+        T135OnlyHolder t135Only = { v = {} };
+        T135Outer t135Outer = { inner = { v = {}, z = 2 }, w = 3 };
+        if (t135Only.v.n != 0 || t135Outer.inner.v.n != 0 || t135Outer.inner.z != 2
+            || t135Outer.w != 3 || t135.listOnlyCtorCount() != 2 || t135.listOnlyDtorCount() != 0)
+            return 9320;
+    }
+    if (t135.listOnlyDtorCount() != 2) return 9321;
+    t135.resetListOnly();
+    T135ListHolder* t135Heap = new T135ListHolder{ v = {}, z = 4 };
+    if (t135Heap.v.n != 0 || t135Heap.z != 4 || t135.listOnlyCtorCount() != 1) return 9322;
+    delete t135Heap;
+    if (t135.listOnlyDtorCount() != 1) return 9323;
+    T135CflatHolder t135CflatEmpty = { v = {}, z = 2 };
+    T135ScalarHolder t135ScalarEmpty = { s = {}, z = 2 };
+    if (t135CflatEmpty.v.a != 5 || t135CflatEmpty.v.b != 0 || t135CflatEmpty.z != 2
+        || t135ScalarEmpty.s != 0 || t135ScalarEmpty.z != 2)
+        return 9324;
+    // T135 field `= {}` builds each field once: a CFlat ctor/dtor pair, a C++ member, self-pointing
+    // array elements, and a bitfield stored as 0.
+    t135CflatCtors = 0;
+    t135CflatDtors = 0;
+    {
+        T135CountedHolder t135Counted = { inner = {}, z = 2 };
+        if (t135Counted.inner.a != 7 || t135Counted.z != 2 || t135CflatCtors != 1 || t135CflatDtors != 0)
+            return 9325;
+    }
+    if (t135CflatCtors != 1 || t135CflatDtors != 1) return 9326;
+    t135.resetDefList();
+    {
+        T135DefInnerHolder t135DefInner = { inner = {}, z = 2 };
+        if (t135DefInner.inner.v.n != -1 || t135DefInner.inner.a != 5 || t135DefInner.z != 2
+            || t135.defListDefaultCount() != 1 || t135.defListDtorCount() != 0)
+            return 9327;
+    }
+    if (t135.defListDtorCount() != 1) return 9328;
+    t135.resetSelfRef();
+    {
+        T135SelfArrayHolder t135Self = { a = {}, z = 2 };
+        if (!t135Self.a[0].valid() || !t135Self.a[1].valid() || t135Self.z != 2
+            || t135.selfRefCtorCount() != 2)
+            return 9329;
+    }
+    T135Bits t135Bits = { b = {}, z = 2 };
+    if (t135Bits.b != 0 || t135Bits.z != 2) return 9330;
+    T135DmiHolder t135Dmi = { inner = {}, z = 2 };
+    T135DmiGenHolder t135DmiGen = { inner = {}, z = 2 };
+    T135DmiTwo t135DmiTwo = { inner = {}, z = 2 };
+    if (t135Dmi.inner.a != 5 || t135Dmi.z != 2 || t135DmiGen.inner.a != 5 || t135DmiGen.z != 2
+        || t135DmiTwo.inner.a != 5 || t135DmiTwo.inner.j.b != 9 || t135DmiTwo.z != 2)
+        return 9331;
+    t135CflatCtors = 0;
+    t135CflatDtors = 0;
+    {
+        T135CountedDmi t135CountedDmi = { inner = {}, z = 2 };
+        if (t135CountedDmi.inner.a != 7 || t135CflatCtors != 1 || t135CflatDtors != 0) return 9332;
+    }
+    if (t135CflatCtors != 1 || t135CflatDtors != 1) return 9333;
+    t135.resetDefList();
+    {
+        T135DmiCxx t135DmiCxx = { v = {}, z = 2 };
+        if (t135DmiCxx.v.which != 0 || t135DmiCxx.z != 2 || t135.defListDefaultCount() != 1
+            || t135.defListListCount() != 0 || t135.defListDtorCount() != 0)
+            return 9334;
+    }
+    if (t135.defListDtorCount() != 1) return 9335;
+    // T136 local arrays: each `{}` element and each unlisted tail slot takes the list constructor
+    // (n == 0); every element is destroyed at scope exit.
+    t135.resetT136();
+    {
+        t135.T136List[2] t136Local = { {}, {} };
+        if (t136Local[0].n != 0 || t136Local[1].n != 0 || t135.t136CtorCount() != 2) return 9338;
+    }
+    if (t135.t136DtorCount() != 2) return 9339;
+    t135.resetT136();
+    {
+        t135.T136List[3] t136Short = { {} };
+        if (t136Short[0].n != 0 || t136Short[2].n != 0 || t135.t136CtorCount() != 3) return 9340;
+    }
+    if (t135.t136DtorCount() != 3) return 9341;
+    // T136: a list-only class local `= {}` and a struct field `= {}` value-initialize each element
+    // from the empty list constructor (n == 0), and every element is destroyed with its owner.
+    t135.resetT136();
+    {
+        t135.T136List[2] t136LocalEmpty = {};
+        if (t136LocalEmpty[0].n != 0 || t136LocalEmpty[1].n != 0 || t135.t136CtorCount() != 2) return 9344;
+    }
+    if (t135.t136DtorCount() != 2) return 9345;
+    t135.resetT136();
+    {
+        T136FieldEmpty t136Field = default;
+        if (t136Field.a[0].n != 0 || t136Field.a[1].n != 0 || t135.t136CtorCount() != 2) return 9346;
+    }
+    if (t135.t136DtorCount() != 2) return 9347;
+    // A default + list class: the default constructor wins for every `{}` element.
+    t135.resetDefList();
+    {
+        t135.DefList[2] t136LocalDef = { {}, {} };
+        if (t136LocalDef[0].which != 0 || t136LocalDef[1].which != 0
+            || t135.defListDefaultCount() != 2 || t135.defListListCount() != 0)
+            return 9342;
+    }
+    if (t135.defListDtorCount() != 2) return 9343;
     std.string t63StringA = "x";
     std.string t63StringB = "yz";
     std.vector<std.string> t63Strings{t63StringA, t63StringB};
@@ -7413,6 +7619,27 @@ extern int main()
     // also fails if a global_dtors/atexit entry were ever added.
     if (cppa.gdtor_count() != 0)                                               return 2161;
 
+    // T138: namespace globals whose types are template specializations bind as objects.
+    if (t138.p11.u != 2)                                                       return 13801;
+    if (t138.route(t138.p11, 0) != 1002)                                       return 13802;
+    if (t138.route(t138.p11, 0.0) != 2002)                                     return 13803;
+    t138.p11.u = 5;
+    if (t138.p11.u != 5)                                                       return 13804;
+    if (t138.is_p11(&t138.p11) != 1)                                           return 13805;
+    if (t138.p11.method() != 35)                                               return 13806;
+    if (t138.nested.t.u != 10 || t138.nested.u != 11)                          return 13807;
+    if (t138.aliasP.u != 4 || t138.aliasT.u != 8 || t138.typedefP.u != 6)      return 13808;
+    if (t138.Holder<int>.item.u != 13 || t138.Holder<int>.scalar != 19)        return 13809;
+    if (t138.external.u != 18 || t138.plain.u != 16)                           return 13810;
+    // T138 r2: namespace paths unseen by the text scan stay resolvable; inactive text cannot
+    // hide a live template global from object binding.
+    if (outerAlias.other.value != 18)                                           return 13811;
+    if (outerInline.inner.value != 19)                                          return 13812;
+    if (outerNested.inner.value != 20)                                          return 13816;
+    if (outerMacro.inner.value != 17)                                           return 13813;
+    if (outerTransitive.inner.value != 29)                                      return 13814;
+    if (outerDead.item.v != 24)                                                 return 13815;
+
     // T74: uninitialized global arrays of CFlat structs construct each element before main.
     if (t74Global[1].z != 5 || t74Global[1].track.value != 37)                 return 7410;
     if (t74Grid[1][2].z != 5 || t74Grid[1][2].track.value != 37)               return 7411;
@@ -10927,6 +11154,23 @@ extern int main()
     t110.Overloaded t110Over = t110.Overloaded();
     if (t110Over.ov(3, 4) != 2007) return 3754;
     expect_error("ambiguous call to 'ov'") { t110Over.ov(3); }
+    // T144: sret returns with scalar varargs pass the tail as clang does (inline, non-inline, member);
+    // a non-variadic sret member stays right. Aggregate varargs are refused (err_cpp_variadic_aggregate.cb).
+    T144Big t144Big = t144v.inl_sret0(9);
+    if (t144Big.a != 9 || t144Big.d != 4) return 3970;
+    t144Big = t144v.out_sret0(9);
+    if (t144Big.a != 9 || t144Big.d != 4) return 3971;
+    t144Big = t144v.inl_sret(9, (i64)11, 5, 2.5);
+    if (t144Big.b != 11 || t144Big.c != 5 || t144Big.d != 5) return 3972;
+    t144Big = t144v.out_sret(9, (i64)11, 5, 2.5);
+    if (t144Big.b != 11 || t144Big.c != 5 || t144Big.d != 5) return 3973;
+    t144v.Ret t144Ret = t144v.Ret();
+    t144Big = t144Ret.m0(9);
+    if (t144Big.a != 9 || t144Big.c != 7 || t144Big.d != 4) return 3974;
+    t144Big = t144Ret.m3(9, (i64)11, 5, 2.5);
+    if (t144Big.b != 11 || t144Big.c != 12 || t144Big.d != 5) return 3975;
+    t144Big = t144Ret.plain(9, (i64)11);
+    if (t144Big.b != 11 || t144Big.c != 7) return 3976;
     cppexp.MemRankRref rankRref = cppexp.MemRankRref();
     rankRref.push(10);
     if (rankRref.n != 3710) return 3710;

@@ -5288,6 +5288,43 @@ bool testInterfaceFieldZeroOwnerReturn()
     return ok;
 }
 
+// ---- auto copy of an interface value deduces the interface (t139) ----------------------
+interface IAutoCopy { int get(); void add(int d); };
+class AcImpl : IAutoCopy { int v = 0; int get() { return v; } void add(int d) { v = v + d; } };
+class AcHolder { IAutoCopy g = default; };
+
+IAutoCopy acMake(AcImpl* p) { return p; }
+int acStatic(int a) { AcImpl i; i.v = a; IAutoCopy iv = &i; static auto r = iv; return r.get(); }
+
+bool testAutoCopyInterface()
+{
+    bool result = true;
+    AcImpl impl = default;
+    impl.v = 7;
+    IAutoCopy ic = &impl;
+    auto r = ic;
+    result &= Test("ac_iface_dispatch", r.get(), 7);
+    r.add(5);
+    result &= Test("ac_iface_mutate_shared", ic.get() * 10 + r.get(), 132);
+    auto s = r;
+    result &= Test("ac_iface_chain", s.get(), 12);
+    AcHolder h = default;
+    h.g = &impl;
+    auto hf = h.g;
+    result &= Test("ac_iface_field", hf.get(), 12);
+    IAutoCopy[2] arr = default;
+    arr[1] = &impl;
+    auto ae = arr[1];
+    result &= Test("ac_iface_array_elem", ae.get(), 12);
+    auto viaCall = acMake(&impl);
+    result &= Test("ac_iface_call_result", viaCall.get(), 12);
+    int forGet = 0;
+    for (auto fr = ic; forGet == 0; fr = ic) { forGet = fr.get(); }
+    result &= Test("ac_iface_for_init", forGet, 12);
+    result &= Test("ac_iface_static", acStatic(9), 9);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -5401,6 +5438,8 @@ extern int main()
     total++; passed += testPointerArithmeticBorrowProvenance()         ? 1 : 0;
     total++; passed += testInterfaceReturnAcceptSet()                    ? 1 : 0;
     total++; passed += testInterfaceFieldZeroOwnerReturn()                 ? 1 : 0;
+
+    total++; passed += testAutoCopyInterface()                          ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

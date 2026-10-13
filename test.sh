@@ -71,7 +71,7 @@ TIMEOUT_SECS=240
 # The three cpp-interop files: cold compile measured 197-237 s on 2026-09-16/17 under suite load
 # for the single file they were split from, so each gets its own budget instead of raising the
 # global one (same issue file).
-HEAVY_TIMEOUT_SECS=480
+HEAVY_TIMEOUT_SECS=900
 HEAVY_TESTS=" test_cpp_interop test_cpp_interop_template test_cpp_interop_bridge "
 
 # GNU coreutils timeout: `timeout` on Linux, `gtimeout` on macOS (brew coreutils).

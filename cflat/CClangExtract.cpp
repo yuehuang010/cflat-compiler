@@ -4025,7 +4025,31 @@ namespace cflat_cinterop
                     return;
                 }
                 auto* vd = ref != nullptr ? llvm::dyn_cast<VarDecl>(const_cast<ValueDecl*>(ref->getDecl())) : nullptr;
-                if (vd == nullptr || !vd->isFileVarDecl() || vd->isStaticDataMember()) return;
+                if (vd == nullptr || !vd->isFileVarDecl()) return;
+                const bool mutableClassObject = !vd->getType().isConstQualified()
+                    && !vd->isConstexpr() && !vd->getType()->isDependentType()
+                    && vd->getType().getCanonicalType()->getAsCXXRecordDecl() != nullptr;
+                const VarDecl* definition = vd->getDefinition();
+                if (vd->isStaticDataMember())
+                {
+                    if (mutableClassObject && definition == nullptr && st.ci != nullptr
+                        && st.ci->hasSema()
+                        && vd->getTemplateSpecializationKind() == TSK_ImplicitInstantiation)
+                    {
+                        st.ci->getSema().InstantiateVariableDefinition(td->getLocation(), vd);
+                        definition = vd->getDefinition();
+                    }
+                    if (mutableClassObject && definition != nullptr)
+                        PublishRequestedClassConstant(vd, definition, marker);
+                    return;
+                }
+                // A mutable namespace-scope class object with a header definition is an object,
+                // not a constant-expression candidate; bind its storage on demand.
+                if (mutableClassObject && definition != nullptr)
+                {
+                    PublishRequestedClassConstant(vd, definition, marker);
+                    return;
+                }
                 // A non-const `extern` class object the library exports (std::cout): an lvalue
                 // of its class, bound by its symbol like an extern class constant.
                 if (!vd->getType().isConstQualified() && !vd->isConstexpr()

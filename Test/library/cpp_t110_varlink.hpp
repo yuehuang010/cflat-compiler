@@ -34,3 +34,33 @@ struct Overloaded {
   }
 };
 }
+
+// T144: an sret return with scalar varargs passes the tail as clang does; a by-value aggregate in
+// the `...` tail is refused at the call (err_cpp_variadic_aggregate.cb).
+struct T144Pod8 { int a; int b; };
+struct T144Pod16 { long long a; long long b; };
+struct T144Big { long long a, b, c, d; };
+namespace t144v {
+inline T144Big inl_sret0(int n, ...) { return T144Big{n, 0, 0, 4}; }
+T144Big out_sret0(int n, ...) { return T144Big{n, 0, 0, 4}; }
+inline T144Big inl_sret(int n, ...) {
+  va_list ap; va_start(ap, n); long long x = va_arg(ap, long long); int y = va_arg(ap, int);
+  double z = va_arg(ap, double); va_end(ap); return T144Big{n, x, y, (long long)(z * 2)};
+}
+T144Big out_sret(int n, ...) {
+  va_list ap; va_start(ap, n); long long x = va_arg(ap, long long); int y = va_arg(ap, int);
+  double z = va_arg(ap, double); va_end(ap); return T144Big{n, x, y, (long long)(z * 2)};
+}
+inline int take8(int n, ...) {
+  va_list ap; va_start(ap, n); T144Pod8 p = va_arg(ap, T144Pod8); va_end(ap); return n + p.a * 10 + p.b;
+}
+struct Ret {
+  int k = 7;
+  inline T144Big m0(int n, ...) { return T144Big{n, 0, k, 4}; }
+  inline T144Big m3(int n, ...) {
+    va_list ap; va_start(ap, n); long long x = va_arg(ap, long long); int y = va_arg(ap, int);
+    double z = va_arg(ap, double); va_end(ap); return T144Big{n, x, y + k, (long long)(z * 2)};
+  }
+  T144Big plain(int n, long long x) { return T144Big{n, x, k, 4}; }
+};
+}

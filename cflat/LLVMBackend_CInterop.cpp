@@ -15448,6 +15448,49 @@ bool LLVMBackend::CxxConstructorNeedsClangResolution(
                 if (param.IsCxxRefToPointer && !param.IsFunctionPointer)
                     return true;
             }
+        // CFlat drops a narrowing sibling C++ still ranks (SCL(char) beside SCL(long), int 5).
+        // Only a widening pick can tie with it, so only that pick is checked here.
+        if (selected != nullptr && argVars != nullptr && argVars->size() == argTypes.size()
+            && selected->params.size() >= argTypes.size() + 1)
+        {
+            // An unsuffixed literal lowers at its smallest width; its C++ type is LiteralIdentity.
+            std::vector<NamedVariable> cxxArgs = *argVars;
+            for (NamedVariable& arg : cxxArgs)
+                if (arg.TypeAndValue.TypeName.empty() && !arg.LiteralIdentity.empty())
+                    arg.TypeAndValue.TypeName = arg.LiteralIdentity;
+            // Exact by width is still a conversion when C++ `long` (or `ulong`) meets another
+            // integer type: LLP64 Windows makes long 32 bits, LP64 macOS makes long long 64 bits.
+            bool selectedWidens = false;
+            for (size_t i = 0; i < cxxArgs.size(); ++i)
+            {
+                const TypeAndValue& want = selected->params[i + 1];
+                const std::string& have = cxxArgs[i].TypeAndValue.TypeName;
+                const ScalarArgConversion conv = ClassifyScalarArgConversion(cxxArgs[i], want);
+                const bool longMeetsOther = !have.empty() && have != want.TypeName
+                    && (have == "long" || have == "ulong" || want.TypeName == "long"
+                        || want.TypeName == "ulong");
+                selectedWidens |= conv == ScalarArgConversion::Widen
+                    || (conv == ScalarArgConversion::Exact && longMeetsOther);
+            }
+            const CxxClassInfo* listed = selectedWidens ? GetCxxClassInfoWithConstructors(typeName)
+                                                        : nullptr;
+            if (listed != nullptr)
+                for (const CxxClassInfo::Structor& candidate : listed->constructors)
+                {
+                    if (candidate.params.empty() || candidate.linkageName == selected->linkageName
+                        || (!allowExplicit && candidate.isExplicit)
+                        || cxxArgs.size() > candidate.params.size() - 1)
+                        continue;
+                    for (size_t i = 0; i < cxxArgs.size(); ++i)
+                        if (ClassifyScalarArgConversion(cxxArgs[i], candidate.params[i + 1])
+                            == ScalarArgConversion::Narrow)
+                        {
+                            // Clang-only set: the listed pick is not C++'s; surface its refusal.
+                            if (nullPointerCandidate != nullptr) *nullPointerCandidate = true;
+                            return true;
+                        }
+                }
+        }
         if (selected != nullptr && argVars != nullptr && argVars->size() == argTypes.size()
             && std::any_of(argVars->begin(), argVars->end(), [&](const NamedVariable& arg) {
                    return IsNullPointerConstantArgument(arg, true);
@@ -18549,27 +18592,31 @@ bool LLVMBackend::IsCxxNamespaceClassObject(const std::string& qualifiedName)
 {
         const size_t dot = qualifiedName.rfind('.');
         if (dot == std::string::npos || dot == 0 || !HasCxxImportGroup()) return false;
-        // `std.cout.flush()` asked the name as a class first and that failure shares the memo
-        // keys (plain + per-group): lift them once for the object ask, restore them if it fails.
-        std::vector<std::pair<std::string, std::string>> failedTypeRequests;
-        if (GetGlobalVariableNV(qualifiedName).Storage == nullptr
-            && cxxNamespaceObjectProbed_.insert(qualifiedName).second)
+        if (GetGlobalVariableNV(qualifiedName).Storage != nullptr)
         {
-            const std::string groupPrefix = qualifiedName + "|G";
-            for (auto it = cxxForeignRequests_.begin(); it != cxxForeignRequests_.end(); )
-                if (!it->second.empty()
-                    && (it->first == qualifiedName || it->first.starts_with(groupPrefix)))
-                {
-                    failedTypeRequests.emplace_back(it->first, it->second);
-                    it = cxxForeignRequests_.erase(it);
-                }
-                else
-                    ++it;
+            const auto global = GetGlobalVariableNV(qualifiedName);
+            return !global.TypeAndValue.Pointer && IsDataStructure(global.TypeAndValue.TypeName);
         }
-        if (GetGlobalVariableNV(qualifiedName).Storage == nullptr
-            && (!IsCxxNamespacePathOrScanned(qualifiedName.substr(0, dot))
-                || IsNamespace(qualifiedName) || IsDataStructure(qualifiedName)
-                || !TryBindCxxNamespaceConstant(qualifiedName, qualifiedName, {})))
+        // Cache the class-or-object decision per name; repeated member uses should not re-request it.
+        if (!cxxNamespaceObjectProbed_.insert(qualifiedName).second) return false;
+        std::string cxxError;
+        TryRequestCxxType(qualifiedName, {}, qualifiedName, cxxError);
+        if (IsDataStructure(qualifiedName)
+            || IsDataStructure(ResolveTypeAlias(qualifiedName))) return false;
+
+        // A failed type request shares memo keys (plain + per-group) with the object request.
+        std::vector<std::pair<std::string, std::string>> failedTypeRequests;
+        const std::string groupPrefix = qualifiedName + "|G";
+        for (auto it = cxxForeignRequests_.begin(); it != cxxForeignRequests_.end(); )
+            if (!it->second.empty()
+                && (it->first == qualifiedName || it->first.starts_with(groupPrefix)))
+            {
+                failedTypeRequests.emplace_back(it->first, it->second);
+                it = cxxForeignRequests_.erase(it);
+            }
+            else
+                ++it;
+        if (!TryBindCxxNamespaceConstant(qualifiedName, qualifiedName, {}))
         {
             for (auto& [key, why] : failedTypeRequests)
                 if (cxxForeignRequests_.count(key) == 0 || key == qualifiedName)
@@ -27213,6 +27260,23 @@ bool LLVMBackend::CxxDefaultCtorAmbiguityError(const std::string& typeName,
         return true;
 }
 
+bool LLVMBackend::CxxEmptyBraceUsesListCtor(const std::string& typeName)
+{
+        std::string ambiguity;
+        std::string bindError;
+        TryBindCxxImplicitDefaultCtor(typeName, bindError);
+        if (FindCxxDefaultCtor(typeName) != nullptr) return false;
+        if (CxxDefaultCtorAmbiguityError(typeName, ambiguity)) return false;
+        auto record = cxxRecordEntries_.find(typeName);
+        if (record == cxxRecordEntries_.end()) return false;
+        for (const auto& member : record->second.members)
+            if (member.kind == cflat_cinterop::RawCxxMember::Constructor
+                && member.paramTypes.size() >= 2
+                && CxxBraceContainerKindOf(member.paramTypes[1]) == CxxBraceContainerKind::InitializerList)
+                return true;
+        return false;
+}
+
 /*
  * Default-CONSTRUCT every element of a C++-class array (`T[N] a = default;`, `new T[n]`).
  * The whole-array zeroinitializer these paths used to store skipped the constructor entirely
@@ -28470,15 +28534,16 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
                                  /*allowNumericConversions*/ true, &argVars,
                                  /*allowExplicit*/ false, allowScalarNarrowing) != nullptr)
             return answer(CxxArgConversion::Convertible);
-        if (!ExplicitCxxConstructorBlocking(param.TypeName, { argType }).empty())
-            return answer(CxxArgConversion::ExplicitCtor);
         // The literal 0 with no int-taking ctor: a null pointer constant into a nullptr_t ctor.
+        // Copy-initialization skips explicit constructors, so this route is tried before the block.
         if (NamedVariable nullArg; ZeroLiteralAsNullptrArgument(arg,
                 IsNullPointerConstantArgument(arg, true), *context, nullArg)
             && ClassifyCxxImplicitArgument(nullArg, param, cxxByValueParam,
                                            allowTemplateClassConversion)
                 == CxxArgConversion::Convertible)
             return answer(CxxArgConversion::Convertible);
+        if (!ExplicitCxxConstructorBlocking(param.TypeName, { argType }).empty())
+            return answer(CxxArgConversion::ExplicitCtor);
         // A class source whose only route is its `operator X()` into a `const X&` / `X&&`:
         // clang copy-initializes the temporary (an ambiguous or explicit route refuses there).
         if ((param.IsRvalueRef || param.IsCxxConstRef) && !argType.Pointer
@@ -28960,9 +29025,15 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
         std::string why;
         const std::vector<NamedVariable> argVars = { arg };
         TryBindRefusedCxxMember(param.TypeName, "__ctor", 1);
+        // A literal 0 is no narrowing at all: it fits the char/short ctor, so the null tie is seen.
         const auto* ctor = SelectCxxConstructor(param.TypeName, { argType }, why,
                                                 /*allowNumericConversions*/ true, &argVars,
-                                                /*allowExplicit*/ false, allowScalarNarrowing);
+                                                /*allowExplicit*/ false,
+                                                allowScalarNarrowing
+                                                    || IsNullPointerConstantArgument(arg, true));
+        // A zero-literal tie (SCL(char) beside SCL(long)): clang's copy-init wrapper names it.
+        const bool zeroTie = ctor == nullptr && IsNullPointerConstantArgument(arg, true)
+            && why.starts_with("matches more than one constructor overload");
         // A converting constructor TEMPLATE can outrank a listed non-identity pick.
         bool nullPointerCandidate = false;
         const bool clangResolves = !slicesToBase
@@ -29008,7 +29079,7 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
             && (param.IsRvalueRef || param.IsCxxConstRef) && IsCxxRecord(argType.TypeName)
             && HasImplicitClassConversionOperator(argType.TypeName);
         const bool wrapped = info != nullptr
-            && (operatorBindsBetter || classTemplateConversion || operatorOnly
+            && (operatorBindsBetter || classTemplateConversion || operatorOnly || zeroTie
                 || ((ctor == nullptr || clangResolves)
                     && (info->constructors.empty()
                         || (info->hasCtorTemplate && !IsCxxRecord(argType.TypeName))
@@ -29028,7 +29099,7 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
                 LogError(refusal);
                 return false;
             }
-        if (!wrapped && nullPointerCandidate && !wrapperError.empty())
+        if (!wrapped && (nullPointerCandidate || zeroTie) && !wrapperError.empty())
             LogError(wrapperError);
         // A scalar-reference overload set has no listed fallback: clang's refusal stands.
         if (!wrapped && (ctor == nullptr || ctor->params.size() < 2
@@ -29361,9 +29432,41 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
         std::string why;
         TryBindRefusedCxxMember(targetType, "__ctor", 1);
         if (SelectCxxConstructor(targetType, { argType }, why, /*allowNumericConversions*/ true,
-                                 nullptr, /*allowExplicit*/ false) == nullptr
+                                 nullptr, /*allowExplicit*/ false, allowScalarNarrowing) == nullptr
             && why.starts_with("matches more than one constructor overload"))
         {
+            NamedVariable probe = source;
+            probe.TypeAndValue = argType;
+            probe.TypeAndValue.VariableName.clear();
+            // A tie only narrowing creates (`SCL s = 5;` over SCL(char), SCL(long)) is clang's to
+            // name, as the call path does. An equal-rank widening tie keeps CFlat's refusal below.
+            bool scalarTableTie = false;
+            if (const CxxClassInfo* tieInfo = GetCxxClassInfoWithConstructors(targetType);
+                tieInfo != nullptr)
+                for (const CxxClassInfo::Structor& candidate : tieInfo->constructors)
+                    if (candidate.params.size() == 2 && !candidate.isExplicit && !candidate.isDeleted
+                        && ClassifyScalarArgConversion(probe, candidate.params[1])
+                            == ScalarArgConversion::Narrow)
+                        scalarTableTie = true;
+            std::string widenWhy;
+            if (scalarTableTie && SelectCxxConstructor(targetType, { argType }, widenWhy,
+                    /*allowNumericConversions*/ true, nullptr, /*allowExplicit*/ false,
+                    /*allowScalarNarrowing*/ false) == nullptr
+                && widenWhy.starts_with("matches more than one constructor overload"))
+                scalarTableTie = false;
+            std::string wrapperName;
+            std::string wrapperError;
+            if (scalarTableTie && RequestCxxVariadicConstructor(targetType, { probe }, wrapperName,
+                                                                wrapperError, /*copyInit*/ true))
+            {
+                ConstructThroughCxxCtorWrapper(source, probe, targetType, wrapperName, intoSlot);
+                return CxxConvertingCtorResult::Converted;
+            }
+            if (scalarTableTie && !wrapperError.empty())
+            {
+                refusal = wrapperError;
+                return CxxConvertingCtorResult::Refused;
+            }
             const std::string prefix = "matches more than one constructor overload";
             std::string candidates = why.substr(prefix.size());
             if (candidates.starts_with(" (") && candidates.ends_with(")"))

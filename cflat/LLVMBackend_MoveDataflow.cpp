@@ -1323,6 +1323,11 @@ llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, st
         // MS ABI instance method: the hidden slot was pushed first, the ABI wants it after `this`.
         if (SRetArgIndex(recipe) == 1 && loweredArgs.size() > 1)
             std::swap(loweredArgs[0], loweredArgs[1]);
+        // Variadic tail: scalar varargs follow the declared slots with CreateFunctionCall's default
+        // promotions; aggregate varargs were already refused (LLVMBackend_Overloads variadic gate).
+        if (candidate.Variadic)
+            for (size_t t = recipe.paramSlots.size(); t < argList.size(); ++t)
+                loweredArgs.push_back(PromoteVariadicArgument(argList[t]));
 
         // A virtual member is reached through the pointer loaded out of the receiver's vptr; the
         // SIGNATURE still comes from the declaration, which carries clang's own arrangement.
@@ -1384,6 +1389,34 @@ void LLVMBackend::StoreCoerceAt(llvm::Value* structSlot, llvm::Value* val, uint6
         builder->CreateStore(val, cp);
     }
 
+/*
+ * C default argument promotions for one variadic argument: i1 zero-extends, 8/16-bit ints
+ * sign-extend to i32, float and half widen to double. Every variadic tail goes through here,
+ * the plain call path and the ABI-lowered (sret) path alike.
+ */
+llvm::Value* LLVMBackend::PromoteVariadicArgument(llvm::Value* value)
+{
+        auto valueType = value->getType();
+        // bool (i1) is zero-extended: sign-extending it would pass true as -1.
+        if (valueType->isIntegerTy(1))
+            return builder->CreateZExt(value, builder->getInt32Ty(), "conv");
+        if (valueType->isIntegerTy(8) || valueType->isIntegerTy(16))
+            return builder->CreateSExt(value, builder->getInt32Ty(), "conv");
+        if (valueType->is16bitFPTy() || valueType->isFloatTy())
+            return builder->CreateFPExt(value, builder->getDoubleTy(), "conv");
+        if (valueType->isVectorTy())
+        {
+            // A simd vector has no default argument promotion, so printf would read
+            // whatever the ABI put in the first slot - 1065353216 for a 1.0f splat.
+            auto* fv = llvm::dyn_cast<llvm::FixedVectorType>(valueType);
+            LogError(std::format(
+                "cannot pass simd vector storage with {} lanes to a variadic function - "
+                "pass one lane with 'v[i]', or reduce it with 'simd<T,N>.reduce_add(v)'.",
+                fv != nullptr ? (uint64_t)fv->getNumElements() : (uint64_t)0));
+        }
+        return value;
+}
+
 llvm::Value* LLVMBackend::CreateFunctionCall(llvm::Function* func, const std::vector<llvm::Value*>& arg,
                                             bool mayUnwind)
 {
@@ -1401,28 +1434,7 @@ llvm::Value* LLVMBackend::CreateFunctionCall(llvm::Function* func, const std::ve
                     varArgStart--;
                     continue;
                 }
-                auto valueType = value->getType();
-                // Convert 8/16-bit int to 32-bit and 16-bit/float to double (default argument promotions).
-                // bool (i1) is zero-extended: sign-extending it would pass true as -1.
-                if (valueType->isIntegerTy(1))
-                    callArgs.push_back(builder->CreateZExt(value, builder->getInt32Ty(), "conv"));
-                else if (valueType->isIntegerTy(8) || valueType->isIntegerTy(16))
-                    callArgs.push_back(builder->CreateSExt(value, builder->getInt32Ty(), "conv"));
-                else if (valueType->is16bitFPTy() || valueType->isFloatTy())
-                    callArgs.push_back(builder->CreateFPExt(value, builder->getDoubleTy(), "conv"));
-                else if (valueType->isVectorTy())
-                {
-                    // A simd vector has no default argument promotion, so printf would read
-                    // whatever the ABI put in the first slot - 1065353216 for a 1.0f splat.
-                    auto* fv = llvm::dyn_cast<llvm::FixedVectorType>(valueType);
-                    LogError(std::format(
-                        "cannot pass simd vector storage with {} lanes to a variadic function - "
-                        "pass one lane with 'v[i]', or reduce it with 'simd<T,N>.reduce_add(v)'.",
-                        fv != nullptr ? (uint64_t)fv->getNumElements() : (uint64_t)0));
-                    callArgs.push_back(value);
-                }
-                else
-                    callArgs.push_back(value);
+                callArgs.push_back(PromoteVariadicArgument(value));
             }
         }
         else

@@ -1,0 +1,11 @@
+// A C++ class with NEITHER a default constructor NOR an initializer_list constructor has no
+// empty-brace form: a global `{}` keeps its refusal (T136). The local `{}`-element array refusal
+// lives in err_cpp_array_no_default_ctor.cb; the global array refusal lives in
+// err_cpp_list_only_neither_global_array.cb. Each deferred global door keeps its own fixture: a
+// deferred walk error stops the walk after the first one (see err_cpp_private_default_ctor_global_array.cb).
+import cpp "cpp_t135_field_brace.hpp";
+
+expect_error("C++ class 't135.IntOnly' has no default constructor cflat can call - a global of it cannot be constructed");
+t135.IntOnly gNeither{};
+
+extern int main() { return 0; }

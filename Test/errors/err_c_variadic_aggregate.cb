@@ -1,0 +1,29 @@
+import "../library/c_variadic_aggregate.c";
+
+// A by-value aggregate in the `...` tail of a C callee is refused: clang passes a small struct there
+// in a coerced form this backend does not emit (a native pass loses the second field). Covers an
+// imported C variadic, a hand-written extern prototype, and a C struct value.
+extern int t145_cva_hand(int n, ...);
+
+struct T145Cp { int a; int b; };
+union T145Cu { int a; long long b; };
+
+extern int main()
+{
+    T145Cp cp = {a = 3, b = 4};
+    T145Cu cu = default;
+    expect_error("cannot pass aggregate value of type 'T145Cp' to the variadic '...' slot of C 't145_cva_pair'") {
+        int r = t145_cva_pair(1, cp);
+    }
+    expect_error("cannot pass aggregate value of type 'T145Cp' to the variadic '...' slot of C 't145_cva_hand'") {
+        int r = t145_cva_hand(1, cp);
+    }
+    expect_error("cannot pass aggregate value of type 'T145Cu' to the variadic '...' slot of C 't145_cva_pair'") {
+        int r = t145_cva_pair(1, cu);
+    }
+    T145Pair pr = {a = 3, b = 4};
+    expect_error("cannot pass aggregate value of type 'T145Pair' to the variadic '...' slot of C 't145_cva_pair'") {
+        int r = t145_cva_pair(1, pr);
+    }
+    return 0;
+}

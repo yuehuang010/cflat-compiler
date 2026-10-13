@@ -1,18 +1,11 @@
-# C++ variadic calls: aggregate in `...` position and sret return give silent wrong values
+# Variadic calls: C++ aggregates refused, not arranged; out-of-line variadic members refused
 
-PRE-EXISTING (T110 review 1; master on non-inline variadics). T110 made inline variadic free
-functions and members callable, so the same shapes now reach the inline paths too (they failed to
-link or were refused before T110) - the reach of this wrong-code bug grew.
+NARROWED by T144 (2026-10-12): sret-returning C++ variadic calls now pass their scalar tail with default promotions (was
+dropped: cflat 1 vs clang 11), and a by-value aggregate in a C++ `...` slot is refused (the issue's sanctioned stopgap,
+Test/errors/err_cpp_variadic_aggregate.cb). T145 applied the same refusal to C externs (Test/errors/err_c_variadic_aggregate.cb).
+Remaining:
 
-1. A struct passed by value through `...`: `fstruct(1, p)` with `P2{3,4}` (8-byte POD) gives
-   cflat 31, clang 35 - the second field reads as 0. Master: non-inline `rv2.nstruct` 31 vs 35.
-   Apple arm64 passes small aggregates in variadic position as a coerced i64 on the stack.
-2. An sret-returning variadic call passes the wrong vararg: `Big f(int n, ...)` (32-byte return),
-   `f(9, (i64)11).b` gives cflat 1, clang 11. Master: non-inline `rv2.nbig` 901 vs 911; now also
-   the inline free function `rv2.fbig` and member `s.bigret`. Non-variadic sret members are right.
-
-Repros: scratch/repro_keep/t110/ (h.hpp + cases.txt / cases2.txt; probe shape in the T110
-review). Fix direction: lower variadic C++ calls through clang's ABI arrangement (CodeGenTypes /
-arrangeFreeFunctionCall with the variadic flag) for aggregate args and sret; until then refuse
-aggregate-by-value arguments in `...` position and sret-returning variadic calls with a specific
-error - never emit a call clang would arrange differently.
+2. C++ aggregates in `...` are refused instead of lowered. Lift the refusal by arranging the call through clang's ABI
+   (arrangeFreeFunctionCall with the variadic flag) - the original fix direction.
+3. Out-of-line variadic C++ members (declared in the class, defined outside it) are refused on master and fix; clang
+   accepts. Repro scratch/repro_keep/t144/outmember.cb + oracle.hpp.

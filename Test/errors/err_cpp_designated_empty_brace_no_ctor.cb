@@ -1,0 +1,9 @@
+import cpp "cpp_t135_field_brace.hpp";
+
+expect_error("C++ brace constructor call 't135.IntOnly' does not match") {
+    struct T135IntOnlyHolder { t135.IntOnly v; int z; };
+    int makeIntOnlyEmptyField() {
+        T135IntOnlyHolder value = { v = {}, z = 2 };
+        return value.z;
+    }
+}

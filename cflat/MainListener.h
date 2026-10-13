@@ -1086,7 +1086,33 @@ static std::optional<int64_t> FoldCompileTimeIdentifier(LLVMBackend* compiler,
         return InScannerInt32Range(mv) ? std::optional<int64_t>(mv) : std::nullopt;
     }
     int64_t cv = 0;
-    if (!compiler->TryGetConstGlobalInt(name, cv)) return std::nullopt;
+    if (!compiler->TryGetConstGlobalInt(name, cv))
+    {
+        // Inside an array dimension only, a C macro or an unscoped imported enumerator (`enum { HE = 2 }`)
+        // folds like a constant, so `(DIMQ > 2) && (HE == 2) ? 2 : 1` is a constant size. Elsewhere it
+        // stays undecided, which keeps C++ null-pointer-constant classification unchanged.
+        if (!compiler->IsFoldingArrayDim()) return std::nullopt;
+        // A CFlat global this name resolves to from the current or an enclosing namespace (`N.Q` in
+        // `namespace N`) is the binding the macro would shadow; the emission path folds a const one.
+        if (compiler->ResolveQualifiedName(name) != name) return std::nullopt;
+        auto global = compiler->GetGlobalVariableNV(name);
+        auto* gv = llvm::dyn_cast_or_null<llvm::GlobalVariable>(global.Storage);
+        auto* ci = gv != nullptr && gv->hasInitializer()
+            ? llvm::dyn_cast<llvm::ConstantInt>(gv->getInitializer()) : nullptr;
+        if (ci == nullptr || ci->getBitWidth() > 64)
+            return std::nullopt;
+        const std::string gvName(gv->getName());
+        if (!compiler->IsCMacroGlobal(gvName) && compiler->ImportedEnumeratorGlobals().count(gvName) == 0)
+            return std::nullopt;
+        // An unsigned macro keeps its zero-extended value (0xFFFFFFFFu is 4294967295, not -1).
+        // Returned unclamped so TryFoldArrayDim reports an oversized value as "exceeds the maximum".
+        if (global.TypeAndValue.IsUnsignedInteger() != -1)
+        {
+            const uint64_t z = ci->getZExtValue();
+            return z > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)z;
+        }
+        return ci->getSExtValue();
+    }
     return InScannerInt32Range(cv) ? std::optional<int64_t>(cv) : std::nullopt;
 }
 
@@ -4143,12 +4169,25 @@ private:
         llvm::GlobalVariable* Global = nullptr;
         LLVMBackend::DeclTypeAndValue TypeValue;
         antlr4::ParserRuleContext* Context = nullptr;
+        // `T g{}` / `T g = {}`: an empty brace reaches the list constructor when there is no
+        // default constructor. CopyListInit is the `= {}` spelling (explicit ctors refused).
+        bool EmptyBraceInit = false;
+        bool CopyListInit = false;
+        // C++-class array whose every element is an empty brace `{}` (each element is built
+        // through the same empty-brace route at startup).
+        bool EmptyBraceElements = false;
+        // Declaration order across BOTH queues (native and C++), so one module initializer runs
+        // the constructions in the order the globals were declared.
+        size_t Sequence = 0;
     };
     std::vector<PendingGlobalDefaultConstruction> pendingGlobalDefaultConstructions_;
 
     // File-scope objects (and arrays of them) of a foreign C++ class whose default constructor
     // is nontrivial: the call cannot be a constant initializer, so it runs from a module ctor.
     std::vector<PendingGlobalDefaultConstruction> pendingGlobalCxxConstructions_;
+    size_t pendingGlobalSequence_ = 0;
+    void QueuePendingGlobalConstruction(std::vector<PendingGlobalDefaultConstruction>& queue,
+        PendingGlobalDefaultConstruction item);
     bool HasGlobalCxxFieldDefaultConstruction(const LLVMBackend::TypeAndValue& typeValue);
     void EmitGlobalCxxFieldDefaultConstruction(llvm::Value* slot, llvm::Type* type,
         const LLVMBackend::TypeAndValue& typeValue, antlr4::ParserRuleContext* context);
@@ -4677,11 +4716,14 @@ public:
     MainListener(CFlatParser* parser, LLVMBackend* compilerLLVM, const std::string& filename);
 
     // Retry global default folds after all declarations and deferred instantiations are emitted.
-    void ResolvePendingGlobalDefaultConstructions();
+    // Returns the native constructions that did not fold (run by the emit step below).
+    std::vector<PendingGlobalDefaultConstruction> ResolvePendingGlobalDefaultConstructions();
 
-    // Emit one llvm.global_ctors entry running the C++ default constructors of this file's
-    // globals, in declaration order. No matching global_dtors: globals follow the Rust rule.
-    void EmitPendingGlobalCxxConstructions();
+    // Emit ONE module initializer running this file's runtime global constructions - the native
+    // ones handed in and the C++ ones queued here - merged in declaration order (Sequence). No
+    // matching global_dtors: globals follow the Rust rule.
+    void EmitPendingGlobalCxxConstructions(
+        std::vector<PendingGlobalDefaultConstruction> nativeRuntime);
 
     void SetImportNamespace(const std::string& ns);
 
@@ -6372,7 +6414,20 @@ public:
                               const std::function<void()>& atTrue,
                               const std::function<void()>& atFalse,
                               size_t trueOccurrence, size_t falseOccurrence,
-                              bool trueIsUnsigned = false, bool falseIsUnsigned = false);
+                              bool trueIsUnsigned = false, bool falseIsUnsigned = false,
+                              const std::string& interfaceDestination = {},
+                              bool destinationPointer = false);
+    // A `?:` call argument over two different classes that BoxPointerJoinArgument did not box into
+    // an interface goes in as a raw pointer: refused like clang's unrelated A*/B* join.
+    void RefuseUnboxedClassJoinArgument(antlr4::ParserRuleContext* ctx, llvm::Value* argValue);
+    // Second chance for such a join once every argument is typed: candidates that cannot take the
+    // OTHER arguments are dropped, then the join boxes into the one interface the rest share.
+    llvm::Value* BoxDeferredJoinArgument(const std::vector<LLVMBackend::NamedVariable>& arguments,
+                                         const std::vector<int64_t>& declaredIdx,
+                                         const std::string& functionName, size_t wantParams,
+                                         size_t argIdx, llvm::Value* argValue,
+                                         std::string& ifaceNameOut);
+    bool ClassesShareInterface(const std::string& a, const std::string& b) const;
 
     /*
      * Make one '?:' arm's string value an INDEPENDENT owned buffer inside the arm's own block.
@@ -6409,6 +6464,9 @@ public:
      */
     static void OperandPointerDepth(const LLVMBackend::NamedVariable& namedVar, llvm::Value* value,
                                     int& depth, bool& elemPointer);
+    void JoinTernaryClassPointee(LLVMBackend::TypedValue& result,
+                                 const LLVMBackend::TypedValue& trueArm,
+                                 const LLVMBackend::TypedValue& falseArm);
     static void JoinTernaryPointerShape(LLVMBackend::TypedValue& result,
                                         const LLVMBackend::TypedValue& trueArm,
                                         const LLVMBackend::TypedValue& falseArm);
@@ -7089,6 +7147,13 @@ public:
         const LLVMBackend::DeclTypeAndValue& field);
     bool FieldHasEmptyCxxBraceInitializer(
         const LLVMBackend::DeclTypeAndValue& field);
+    // Value-initializes a C++ class at slot from `{}` (default ctor, else empty initializer_list).
+    bool EmitCxxEmptyBraceConstruct(llvm::Value* slot, const std::string& typeName,
+        antlr4::ParserRuleContext* braceContext, bool copyListInit);
+    // A C++-class fixed array (no inner dimensions) whose list is non-empty and holds only `{}`
+    // elements: every element is value-initialized at startup, never folded to a constant.
+    bool IsCxxEmptyBraceArrayInit(const LLVMBackend::TypeAndValue& tv,
+        CFlatParser::InitializerListContext* list);
 
     // inPlaceDest: the field slot an armed C++ sret builds into; the seed consumes it and the list
     // edits it, so a null return means the value is already in place.
@@ -7134,12 +7199,15 @@ public:
 
     // Per-slot value-init of an array whose element type owns a resource: construct each slot
     // independently and re-apply the named overrides there, instead of splatting one seed.
+    // emptyBraceCtx: the source context for an empty `{}` element's list-constructor call, which
+    // exists even when `list` is null (`T[N] a = {};`).
     void EmitArrayValueInitSlots(
         llvm::Value* arrAlloc,
         llvm::StructType* elemTy,
         const LLVMBackend::TypeAndValue& tv,
         CFlatParser::InitializerListContext* list,
-        bool forceRoot);
+        bool forceRoot,
+        antlr4::ParserRuleContext* emptyBraceCtx);
 
     // Seed-once value-init of an array field: default-construct one element, apply the
     // named overrides, memcpy it into every slot of `slot`. POD elements only - an owning
@@ -7376,6 +7444,9 @@ public:
     llvm::ConstantInt* TryFoldArrayDim(CFlatParser::AssignmentExpressionContext* expr,
                                       bool allowEmission = true);
     void ValidateArrayDimValue(antlr4::ParserRuleContext* expr, llvm::Value* value);
+    // Rejects a fixed array whose total element count (outer x inner dims) passes INT32_MAX.
+    void ValidateArrayTotalElements(antlr4::ParserRuleContext* expr, uint64_t outer,
+                                    const std::vector<uint64_t>& inner);
     llvm::Value* FoldArrayDimValue(antlr4::ParserRuleContext* expr, llvm::Value* value);
 
     // Length-inferred array-view initializer: T[] x = {v0, v1, ...}.
@@ -7720,6 +7791,9 @@ public:
     LLVMBackend::TypedValue ParseTernaryArmExpression(CFlatParser::ExpressionContext* ctx);
 
     bool IsDefaultOnlyExpression(antlr4::ParserRuleContext* ctx) const;
+    // T142: types and owns a `default` call argument for the parameter it binds (direct and interface calls).
+    void MaterializeDefaultArgument(antlr4::ParserRuleContext* ctx, LLVMBackend::NamedVariable& argNV,
+        const LLVMBackend::TypeAndValue& dest);
     LLVMBackend::TypeAndValue InferTernaryArmType(llvm::Value* value);
     LLVMBackend::TypeAndValue InferTernaryArmType(const LLVMBackend::TypedValue& value);
 

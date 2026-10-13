@@ -1978,6 +1978,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             bool unrelatedPointeeNotViable = false;
             // A normalized C++ class xvalue cannot bind a same-class pointer value parameter.
             bool normalizedCxxXvaluePointerNotViable = false;
+            bool defaultArgumentNotViable = false;
             // In a C++ overload set containing the same T& and const T& parameter, an
             // lvalue binds to T&. Count only this exact sibling comparison.
             int mutableRefPreference = 0;
@@ -2146,6 +2147,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             bool cxxPointeeConstNotViable = false;
             bool unrelatedPointeeNotViable = false;
             bool normalizedCxxXvaluePointerNotViable = false;
+            // T142: a `default` argument binds only a by-value parameter.
+            bool defaultArgumentNotViable = false;
             // Arguments bound through a user-defined conversion; the extra fields describe
             // conversion operators (see Ranked for the aggregate fallback).
             int userConversions = 0;
@@ -2158,6 +2161,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             for (const auto& arg : arguments)
             {
                 int result = -1;
+                if (arg.IsDefaultArgument && candidateParamItr != candidate.Parameters.end()
+                    && IsReferenceOrSinkParameter(*candidateParamItr))
+                    defaultArgumentNotViable = true;
                 if (candidateParamItr != candidate.Parameters.end()
                     && arg.IsNormalizedCxxXvalue
                     && !arg.TypeAndValue.Pointer
@@ -3315,6 +3321,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 ranked.cxxPointeeConstNotViable = cxxPointeeConstNotViable;
                 ranked.unrelatedPointeeNotViable = unrelatedPointeeNotViable;
                 ranked.normalizedCxxXvaluePointerNotViable = normalizedCxxXvaluePointerNotViable;
+                ranked.defaultArgumentNotViable = defaultArgumentNotViable;
                 ranked.userConversions = userConversions;
                 ranked.userConversionCost = userConversionCost;
                 ranked.userConversionNames = userConversionNames;
@@ -3351,6 +3358,14 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         {
             std::erase_if(perfect, [](const Ranked& r) { return r.normalizedCxxXvaluePointerNotViable; });
             std::erase_if(possible, [](const Ranked& r) { return r.normalizedCxxXvaluePointerNotViable; });
+        }
+        // T142: a `default` argument leaves every reference/sink overload while a by-value one is viable.
+        auto defaultArgumentViable = [](const Ranked& r) { return !r.defaultArgumentNotViable; };
+        if (std::any_of(perfect.begin(), perfect.end(), defaultArgumentViable)
+            || std::any_of(possible.begin(), possible.end(), defaultArgumentViable))
+        {
+            std::erase_if(perfect, [](const Ranked& r) { return r.defaultArgumentNotViable; });
+            std::erase_if(possible, [](const Ranked& r) { return r.defaultArgumentNotViable; });
         }
 
         using Result = std::pair<std::vector<NamedVariable>, FunctionSymbol>;
@@ -3962,6 +3977,69 @@ LLVMBackend::ArgumentBinding LLVMBackend::ComputeArgumentPositions(const std::ve
         binding.Ok = true;
         return binding;
     }
+
+// T142: a `default` argument never binds a reference, move or owning-sink parameter.
+bool LLVMBackend::IsReferenceOrSinkParameter(const TypeAndValue& param)
+{
+        if (param.IsAlias || param.IsRvalueRef || param.IsCxxRefToPointer || param.IsCxxConstRef) return true;
+        if (param.IsMove || param.IsAdopt || param.IsUnique) return true;
+        // Sink flags are inferred on scalars too; only a sink of an owning type (or pointer) refuses.
+        return (param.IsOwningSink || param.IsConsumeInferredSink)
+            && (param.Pointer || IsOwningValueOrClosureType(param.TypeName));
+}
+
+// T142: the reason a `default` argument cannot bind this parameter; empty when it can (plain by-value).
+std::string LLVMBackend::DefaultArgumentRefusal(const TypeAndValue& param)
+{
+        if (IsReferenceOrSinkParameter(param)) return "is a reference, move or owning-sink parameter";
+        if (param.IsFatInterfaceValue() || param.IsArrayView || param.IsFunctionPointer)
+            return "is not a plain value parameter";
+        if (!IsKnownTypeName(param.TypeName)) return "has no concrete type";
+        if (!param.Pointer && IsCxxRecord(param.TypeName)) return "is a C++ class parameter";
+        return {};
+}
+
+/*
+ * T142: `default` as a call argument names no type; the by-value parameter it binds supplies the
+ * value, the same one `T x = default;` gives (GenerateDefaultValue). Native structs always have one,
+ * so no struct parameter is refused for lacking a constructor.
+ */
+std::vector<LLVMBackend::DefaultArgumentCandidate> LLVMBackend::ClassifyDefaultArgument(
+        const std::string& functionName, const std::vector<std::string>& argNames, size_t argIndex,
+        size_t firstTarget, const std::string& receiverType)
+{
+        std::vector<DefaultArgumentCandidate> result;
+        auto it = functionTable.find(functionName);
+        if (it == functionTable.end()) return result;
+        const size_t totalArgs = firstTarget + argNames.size();
+        for (const auto& cand : it->second)
+        {
+                // C++ overloads keep their own conversion rules; only native overloads take `default` here.
+                if (cand.IsCxx) continue;
+                // A free call never reaches a method, and a method call only its own receiver's methods.
+                if (receiverType.empty() ? cand.IsMethod
+                    : (cand.Parameters.empty() || cand.Parameters.front().TypeName != receiverType))
+                    continue;
+                if (cand.Variadic ? cand.Parameters.size() > totalArgs : cand.Parameters.size() != totalArgs)
+                    continue;
+                auto binding = ComputeArgumentPositions(argNames, cand.Parameters, cand.Variadic, firstTarget);
+                if (!binding.Ok || argIndex >= binding.PosMap.size()) continue;
+                const int64_t slot = binding.PosMap[argIndex];
+                if (slot < 0 || slot >= (int64_t)cand.Parameters.size()) continue;
+                const auto& param = cand.Parameters[slot];
+                DefaultArgumentCandidate entry;
+                entry.Symbol = &cand;
+                entry.Slot = slot;
+                entry.Refusal = DefaultArgumentRefusal(param);
+                result.push_back(std::move(entry));
+        }
+        // A method that can take `default` hides same-named free UFCS takers. When every method refuses,
+        // the free takers stay, as ordinary resolution falls back to them.
+        if (!receiverType.empty() && std::any_of(result.begin(), result.end(),
+                [](const DefaultArgumentCandidate& e) { return e.Symbol->IsMethod && e.Refusal.empty(); }))
+                std::erase_if(result, [](const DefaultArgumentCandidate& e) { return !e.Symbol->IsMethod; });
+        return result;
+}
 
 std::vector<LLVMBackend::NamedVariable> LLVMBackend::MatchFunction(const std::vector<LLVMBackend::NamedVariable>& inputArguments, const std::vector<LLVMBackend::TypeAndValue>& targetArguments, bool isVariadic, bool probe, const std::vector<cflat_cinterop::RawDefaultArg>* defaults)
 {
@@ -6441,6 +6519,23 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 LogErrorMessage(
                     "cannot pass an owning value to the variadic '{}' slot of '{}'; bind the "
                     "value to an owner first", { "...", diagnosticFunctionName });
+                return nullptr;
+            }
+
+            // By-value aggregate in a C or C++ extern `...` slot: no clang arrangement is emitted, so refuse
+            // it (fields are lost). CFlat-bodied variadics and string values (argIsStringValue) are exempt.
+            const bool calleeIsCExtern = candidate.External && !candidate.IsCxx && !candidate.HasCFlatBody;
+            const bool argIsAggregateValue = inVariadicRange && (candidate.IsCxx || calleeIsCExtern)
+                && !arg.TypeAndValue.Pointer && !argIsStringValue && !argCxxClassName.empty()
+                && (IsDataStructure(argCxxClassName)
+                    || (arg.Primary != nullptr && arg.Primary->getType()->isStructTy()));
+            if (argIsAggregateValue)
+            {
+                LogError(std::format(
+                    "cannot pass aggregate value of type '{}' to the variadic '...' slot of {} "
+                    "'{}'; pass a pointer or a scalar instead",
+                    DisplayCxxClassName(argCxxClassName), candidate.IsCxx ? "C++" : "C",
+                    diagnosticFunctionName));
                 return nullptr;
             }
 

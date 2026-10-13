@@ -12463,6 +12463,19 @@ int testMethodUniqueListMove()
     return passed;
 }
 
+// T143 (ALIASSCOPE): generic aggregates with member aliases (`using Q = T*;`, `using R = T;`).
+// Instantiated in main, before the file-scope structs Q and R at the end of this file exist.
+struct Pin<T> { using Q = T*; Q q = default; };
+struct Hold<T> { using R = T; R r = default; };
+
+int t143EarlyUses()
+{
+    unique<int> u = new int(4);
+    Pin<int> pn = default;
+    Hold<int> hd = default;
+    return *u + (pn.q == nullptr ? 0 : 1) + hd.r;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -13000,7 +13013,7 @@ extern int main()
     passed += testAddressIntoNewTemp();
     total += 8;
     passed += testImmovable();
-    total += 10;
+    total += 26;
 
     int c = 1;
     conditionalNewCount = 0;
@@ -13229,6 +13242,12 @@ extern int main()
     passed += Test("conditional_new_nested_decl_arm_freed",
         nestedDeclValue == 24 && conditionalNewCount == 1 && conditionalDtorCount == 1 ? 1 : 0, 1);
     total++;
+
+    // T143: unique<int> and Pin<int>/Hold<int> instantiate here, before the late P/Q/R structs.
+    passed += Test("late_early_unique_pin_hold", t143EarlyUses(), 4);
+    total++;
+    passed += testLateStructPAfterUniqueUse();
+    total += 7;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
@@ -13490,6 +13509,43 @@ struct ImmOuter { ImmPin pin; };
 struct ImmArr { ImmPin items[2]; };
 struct ImmPlain { int v = 0; };
 
+// T142: `default` as a call argument takes its value from the by-value parameter it binds.
+// Refusals (ambiguous, no by-value parameter) live in Test/errors/err_default_arg_*.cb.
+int defArgCtors = 0;
+int defArgDtors = 0;
+struct DefArgS { int v = 7; };
+struct DefArgOwn { int v = 0; DefArgOwn() { v = 3; defArgCtors = defArgCtors + 1; } ~DefArgOwn() { defArgDtors = defArgDtors + 1; } };
+struct DefArgNoCtor { int v; DefArgNoCtor(int a) { v = a; } };
+struct DefArgHolder { int m(DefArgS s) { return s.v; } };
+// Each name has a two-parameter overload declared first, so the arity-blind first candidate is the wrong one.
+int defArgTakeS(int a, int b) { return a + b; }
+int defArgTakeS(DefArgS s) { return s.v; }
+int defArgTakeOwn(int a, int b) { return a + b; }
+int defArgTakeOwn(DefArgOwn s) { return s.v; }
+int defArgTakeInt(DefArgS s, int b) { return s.v + b; }
+int defArgTakeInt(int x) { return x + 4; }
+int defArgTakePtr(int a, int b) { return a + b; }
+int defArgTakePtr(int* p) { return p == nullptr ? 5 : 6; }
+int defArgTakeD(int a, int b) { return a + b; }
+int defArgTakeD(double d) { return d == 0.0 ? 9 : 1; }
+int defArgTakeNoCtor(DefArgNoCtor s) { return s.v; }
+int defArgSecond(int a, DefArgS s) { return a * 100 + s.v; }
+int defArgRef(alias DefArgS s) { return s.v; }
+int defArgRef(DefArgS s) { return s.v + 100; }
+int defArgGen<T>(T s) { return s.v + 1; }
+// T142 r2: a method's own method hides a same-named free function taking the receiver (UFCS).
+struct DefArgPick { int v = 1; int take1(DefArgPick s) { return 11; } };
+int take1(DefArgPick a, DefArgPick b) { return 22; }
+// T142 r3: the method refuses `default` (alias parameter), so the free UFCS taker binds it.
+struct DefArgAliasPick { int v = 1; int take2(alias int x) { return 11; } };
+int take2(DefArgAliasPick a, int* x) { return 22; }
+// T142 r2: `default` through interface dispatch: one constructor and one destructor per temporary.
+int defArgIfaceCtors = 0;
+int defArgIfaceDtors = 0;
+struct DefArgIfaceS { int v = 0; DefArgIfaceS() { v = 7; defArgIfaceCtors = defArgIfaceCtors + 1; } ~DefArgIfaceS() { defArgIfaceDtors = defArgIfaceDtors + 1; } };
+interface DefArgIface { int take(DefArgIfaceS s); };
+class DefArgImpl : DefArgIface { int take(DefArgIfaceS s) { return s.v; } };
+
 struct ImmTraits<T>
 {
     int movable()
@@ -13541,5 +13597,64 @@ int testImmovable()
     d = default;
     ImmOuter o = { pin = default };
     passed += Test("imm_default_assign_and_field", d.x * 10 + o.pin.x, 0);
+
+    // T142: `default` as a call argument (value = the same default a declaration gives).
+    int defOb = defArgCtors;
+    int defOd = defArgDtors;
+    int defOwn = defArgTakeOwn(default);
+    passed += Test("defarg_owned_value", defOwn, 3);
+    passed += Test("defarg_owned_ctor_once", defArgCtors - defOb, 1);
+    passed += Test("defarg_owned_dtor_once", defArgDtors - defOd, 1);
+    passed += Test("defarg_struct_value", defArgTakeS(default), 7);
+    passed += Test("defarg_int_value", defArgTakeInt(default), 4);
+    passed += Test("defarg_pointer_null", defArgTakePtr(default), 5);
+    passed += Test("defarg_double_zero", defArgTakeD(default), 9);
+    passed += Test("defarg_second_position", defArgSecond(2, default), 207);
+    passed += Test("defarg_by_value_beats_alias", defArgRef(default), 107);
+    passed += Test("defarg_explicit_generic", defArgGen<DefArgS>(default), 8);
+    DefArgHolder dh = default;
+    passed += Test("defarg_method_receiver", dh.m(default), 7);
+    passed += Test("defarg_no_ctor_struct_zero", defArgTakeNoCtor(default), 0);
+    DefArgPick dpick = default;
+    passed += Test("defarg_method_beats_ufcs_free", dpick.take1(default), 11);
+    DefArgAliasPick dalias = default;
+    passed += Test("defarg_refused_method_falls_back_to_ufcs", dalias.take2(default), 22);
+    int ifOb = defArgIfaceCtors;
+    int ifOd = defArgIfaceDtors;
+    DefArgImpl* dimpl = new DefArgImpl();
+    DefArgIface dif = dimpl;
+    int ifValue = dif.take(default);
+    delete dif;
+    passed += Test("defarg_iface_value", ifValue, 7);
+    passed += Test("defarg_iface_ctor_dtor_once", (defArgIfaceCtors - ifOb) * 10 + (defArgIfaceDtors - ifOd), 11);
+    return passed;
+}
+
+
+// T143: file-scope structs named like the member aliases above, declared after every
+// instantiation in main. Each name must mean the struct, never unique<T>'s or Pin's alias.
+struct P { int v = 0; };
+struct Q { int v = 0; };
+struct R { int v = 0; };
+
+P t143MakeP(int x) { P p; p.v = x; return p; }
+int t143TakeP(P p) { return p.v; }
+P gT143P = default;
+int t143UniqueOfP() { unique<P> up = new P(); up->v = 9; return up->v; }
+int t143LocalMix() { unique<int> u = new int(4); Q q; q.v = 6; R r = { v = 3 }; return *u + q.v + r.v; }
+
+int testLateStructPAfterUniqueUse()
+{
+    int passed = 0;
+    P local = t143MakeP(7);
+    passed += Test("late_p_return_type", local.v, 7);
+    passed += Test("late_p_param_type", t143TakeP(local), 7);
+    gT143P.v = 5;
+    passed += Test("late_p_global", gT143P.v, 5);
+    passed += Test("late_p_generic_arg_unique", t143UniqueOfP(), 9);
+    P fresh;
+    passed += Test("late_p_default_ctor", fresh.v, 0);
+    passed += Test("late_qr_locals_with_unique", t143LocalMix(), 13);
+    passed += Test("late_unique_alias_inside_body", t143EarlyUses(), 4);
     return passed;
 }

@@ -1604,6 +1604,9 @@ public:
         bool IsCxxNullIntegerMacro = false;
         // A `?:` whose two arms are both imported macro constants: a C++ prvalue. Transient.
         bool IsCxxMacroJoin = false;
+        // Transient: TypedValue::joinClassPointee of a `?:` result, so a nested arm keeps it.
+        std::string JoinClassPointee;
+        int JoinClassPointeeDepth = 0;
         // Transient: an imported enumerator / integer macro's value as a brace-list literal, set before
         // the element loses its storage. Empty when the element is not such a constant.
         std::string CxxImportedLiteral;
@@ -1616,6 +1619,9 @@ public:
         // True only for a value-producing expression. Named variables, fields, elements, aliases,
         // and dereferences remain lvalues even when their LLVM value has no storage of its own.
         bool IsRvalue = false;
+        // T142: the value of a `default` call argument. Overload ranking refuses it for reference and
+        // move/owning-sink parameters (only a by-value parameter takes it).
+        bool IsDefaultArgument = false;
         // A `p + n` / `p - n` pointer result. Transient; read only by the interface-return refusal.
         bool IsPointerArithmeticResult = false;
         // Set by the front-end when this expression is the last proven use of a foreign C++
@@ -1956,6 +1962,10 @@ public:
         bool hasSourceType = false;
         // TypeAndValue::IsCxxPointeeConst of a pointer operand, so a `?:` join keeps it.
         bool         cxxPointeeConst = false;
+        // A `?:` over pointers to ONE native class (a null arm adopts the other): that class. Read
+        // only by call-argument overload ranking; transient, never stamped into the element ledger.
+        std::string  joinClassPointee;
+        int          joinClassPointeeDepth = 0;  // pointer depth of that join (1 = `T*`)
         // Source identity retained while operator reductions carry values without their NamedVariable.
         std::string  sourceCallerName;
         std::string  sourceFieldName;
@@ -2893,6 +2903,9 @@ private:
         std::vector<TypeAndValue> Arguments;
         bool External = false;
         bool Varargs = false;
+        // Alias frames open at park time; re-derivation resolves the signature in THIS scope,
+        // so a body's `using P = T*` cannot rename a file-scope `P` under a later flush.
+        std::vector<AliasScopeFrame> AliasScope;
     };
     std::vector<PendingFunctionDeclaration> pendingFunctionDeclarations_;
     bool flushingPendingDeclarations_ = false;
@@ -4239,6 +4252,7 @@ private:
     // here until the compile ends and are intentionally never diagnosed.
     std::vector<CMacroEntry> pendingCInteropAliases_;
     std::unordered_set<std::string> cxxMacroGlobalNames_;
+    bool foldingArrayDim_ = false;   // see IsFoldingArrayDim (set only around a dimension fold)
     std::unordered_set<std::string> cxxZeroIntegerMacroNames_;
     static inline std::mutex cFileSigCacheMutex_;
     // Key: canonical .c path, or for bound headers "<canonical .h>|<include dirs>" so the
@@ -6134,8 +6148,7 @@ private:
     bool HasCxxFunctionTemplate(const std::string& qualifiedName) const;
     bool HasCxxForwardingReferenceTemplate(const std::string& qualifiedName) const;
     bool IsCxxNamespacePath(const std::string& name) const;
-    // IsCxxNamespacePath, also taking a nested segment a user header's namespace scan recorded as
-    // a lead (`t26.regex_constants` when nothing of that header was harvested at import).
+    // Broader fallback for namespace paths whose declarations were not harvested at import.
     bool IsCxxNamespacePathOrScanned(const std::string& name) const;
     bool IsCxxNamespace(const std::string& name) const;
     bool HasCxxFunctionTemplateMember(const std::string& owner,
@@ -9211,6 +9224,10 @@ public:
     {
         return cxxLazyAliasSpecializations_.count(name) != 0;
     }
+    bool HasCxxAliasTemplate(const std::string& name) const
+    {
+        return cxxAliasPatterns_.count(name) != 0;
+    }
 
     /*
      * ========================= M6 - inheritance and virtual dispatch ==========================
@@ -9673,6 +9690,9 @@ public:
     bool HasUnavailableNestedCxxDefault(const std::string& typeName,
                                         std::string* unavailableType = nullptr,
                                         bool checkCxxType = false);
+    // True when an empty brace must value-initialize `typeName` through its initializer_list
+    // constructor: no usable default constructor, and a list constructor is declared.
+    bool CxxEmptyBraceUsesListCtor(const std::string& typeName);
     // Emit one default-constructor call per element over `count` elements at `base`.
     bool EmitCxxArrayDefaultConstruction(const std::string& typeName, llvm::Value* base,
                                          llvm::Type* elemTy, llvm::Value* count,
@@ -10643,6 +10663,22 @@ public:
         const std::vector<TypeAndValue>& targetArguments, bool isVariadic, size_t firstTarget = 0,
         const std::vector<cflat_cinterop::RawDefaultArg>* defaults = nullptr);
 
+    // T142: one same-arity native overload of a call whose argument at argIndex is `default`.
+    // Refusal is empty when that overload takes the default (plain by-value, default-constructible).
+    struct DefaultArgumentCandidate
+    {
+        const FunctionSymbol* Symbol = nullptr;
+        int64_t Slot = -1;        // declared parameter index bound to the argument
+        std::string Refusal;      // why this overload cannot take `default`; empty = takes it
+    };
+    std::vector<DefaultArgumentCandidate> ClassifyDefaultArgument(const std::string& functionName,
+        const std::vector<std::string>& argNames, size_t argIndex, size_t firstTarget,
+        const std::string& receiverType);
+    // A parameter a `default` argument may not bind: a reference, or a move/owning sink.
+    bool IsReferenceOrSinkParameter(const TypeAndValue& param);
+    // Why a `default` argument cannot bind this parameter (text after "parameter"); empty = it can.
+    std::string DefaultArgumentRefusal(const TypeAndValue& param);
+
     // `probe` = scoring one candidate of an overload set: a mismatch only disqualifies THIS
     // candidate, so it returns {} instead of reporting - a losing candidate must never error.
     std::vector<LLVMBackend::NamedVariable> MatchFunction(const std::vector<LLVMBackend::NamedVariable>& inputArguments, const std::vector<LLVMBackend::TypeAndValue>& targetArguments, bool isVariadic = false, bool probe = false, const std::vector<cflat_cinterop::RawDefaultArg>* defaults = nullptr);
@@ -11319,6 +11355,8 @@ public:
     // bytes (used to scatter SysV eightbytes returned in registers back into a struct).
     void StoreCoerceAt(llvm::Value* structSlot, llvm::Value* val, uint64_t byteOff);
 
+    // C default argument promotions for one variadic argument (shared by every variadic call path).
+    llvm::Value* PromoteVariadicArgument(llvm::Value* value);
     llvm::Value* CreateFunctionCall(llvm::Function* func, const std::vector<llvm::Value*>& arg,
                                     bool mayUnwind = false);
 
@@ -11548,6 +11586,12 @@ public:
         auto* gv = llvm::dyn_cast_or_null<llvm::GlobalVariable>(storage);
         return gv != nullptr && importedEnumeratorGlobals_.count(std::string(gv->getName())) != 0;
     }
+    // True while an array dimension is folded. A C macro or an unscoped imported enumerator is a
+    // constant only there (clang: `int a[DIMQ]`); general constant tracking never sees them, so
+    // C++ null-pointer-constant classification (`T68_ZERO + 0`) is unchanged.
+    bool IsFoldingArrayDim() const { return foldingArrayDim_; }
+    void SetFoldingArrayDim(bool on) { foldingArrayDim_ = on; }
+    bool IsCMacroGlobal(const std::string& name) const { return cxxMacroGlobalNames_.count(name) != 0; }
     const std::unordered_set<std::string>& ImportedEnumeratorGlobals() const
     {
         return importedEnumeratorGlobals_;
@@ -11981,7 +12025,8 @@ public:
     // 240: generated class wrapper requests include recursively owned template argument headers.
     // 241: C++ signatures retain deleted and explicit-specialization status (T116).
     // 242: C++ signatures retain volatile pointee/referent receiver qualification.
-    static constexpr int kCHeaderCacheVersion = 243;
+    // 246: C++ request caches retain lazy binding for class-valued template globals (T138).
+    static constexpr int kCHeaderCacheVersion = 246;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

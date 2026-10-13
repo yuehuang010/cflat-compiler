@@ -1803,12 +1803,21 @@ llvm::Constant* MainListener::TryFoldGlobalDefaultConstruction(
         return folded;
     }
 
-void MainListener::ResolvePendingGlobalDefaultConstructions()
+void MainListener::QueuePendingGlobalConstruction(
+        std::vector<PendingGlobalDefaultConstruction>& queue, PendingGlobalDefaultConstruction item)
+{
+        // One counter for both queues: the declaration order that the merged emit follows.
+        item.Sequence = pendingGlobalSequence_++;
+        queue.push_back(std::move(item));
+}
+
+std::vector<MainListener::PendingGlobalDefaultConstruction>
+MainListener::ResolvePendingGlobalDefaultConstructions()
 {
         auto pending = std::move(pendingGlobalDefaultConstructions_);
         pendingGlobalDefaultConstructions_.clear();
         FoldConstructedValueState foldState;
-        std::vector<const PendingGlobalDefaultConstruction*> runtime;
+        std::vector<PendingGlobalDefaultConstruction> runtime;
         for (const auto& item : pending)
         {
             if (item.Global == nullptr || item.Global->isDeclaration()) continue;
@@ -1854,51 +1863,9 @@ void MainListener::ResolvePendingGlobalDefaultConstructions()
                     SpellType(*compilerLLVM, item.TypeValue)));
                 continue;
             }
-            runtime.push_back(&item);
+            runtime.push_back(item);
         }
-        if (runtime.empty()) return;
-
-        /*
-         * A construction that does not fold (a constructor body, an owning field) runs before main
-         * instead, exactly as the local declarator would run it. RULING: globals follow the Rust
-         * rule - constructed before main, no exit-time destruction. The function joins the C++
-         * global initializers, so FinalizeGlobalConstructorOrder calls it in AOT and --run alike.
-         */
-        auto* compiler = compilerLLVM;
-        auto savedState = compiler->SaveBuilderState();
-        auto* voidTy = llvm::FunctionType::get(compiler->builder->getVoidTy(), false);
-        auto* initFn = llvm::Function::Create(
-            voidTy, llvm::Function::InternalLinkage, "__cflat_global_default_init",
-            compiler->module.get());
-        compiler->builder->SetInsertPoint(llvm::BasicBlock::Create(*compiler->context, "entry", initFn));
-        try
-        {
-            GlobalScopeGuard initScope(global_scope);
-            for (const auto* item : runtime)
-            {
-                if (item->TypeValue.ConstArraySize > 0)
-                {
-                    EmitFixedArrayDefaultInit(item->Global, item->TypeValue, item->Context, true);
-                    continue;
-                }
-                if (compiler->GetFunction(item->TypeValue.TypeName) == nullptr) continue;
-                llvm::Value* constructed =
-                    compiler->CreateOverloadedFunctionCall(item->TypeValue.TypeName, {}, true);
-                if (constructed != nullptr && constructed->getType() == item->Global->getValueType())
-                    compiler->builder->CreateStore(constructed, item->Global);
-            }
-        }
-        catch (...)
-        {
-            // LogError THROWS and expect_error resumes the walk, so the half-built initializer
-            // must go and the builder must be restored before the walk continues.
-            initFn->eraseFromParent();
-            compiler->RestoreBuilderState(savedState);
-            throw;
-        }
-        compiler->builder->CreateRetVoid();
-        compiler->RestoreBuilderState(savedState);
-        compiler->cflatGlobalCxxInitFns_.push_back(initFn);
+        return runtime;
     }
 
 /*
@@ -2011,8 +1978,20 @@ void MainListener::EmitGlobalCxxFieldDefaultConstruction(
         }
 }
 
-void MainListener::EmitPendingGlobalCxxConstructions()
+void MainListener::EmitPendingGlobalCxxConstructions(
+        std::vector<PendingGlobalDefaultConstruction> nativeRuntime)
 {
+        /*
+         * ONE module initializer for the native and the C++ runtime constructions, in declaration
+         * order (Sequence). Two initializers would run every native construction before every C++
+         * one, so `Stamp a; N[3] g = {};` built g first. A native construction that does not fold
+         * (a constructor body, an owning field) runs here as the local declarator would run it.
+         */
+        struct RuntimeConstruction
+        {
+            PendingGlobalDefaultConstruction Item;
+            bool Native = false;
+        };
         auto pending = std::move(pendingGlobalCxxConstructions_);
         pendingGlobalCxxConstructions_.clear();
         pending.erase(std::remove_if(pending.begin(), pending.end(), [&](const auto& item) {
@@ -2020,13 +1999,19 @@ void MainListener::EmitPendingGlobalCxxConstructions()
             if (compilerLLVM->IsCxxRecord(item.TypeValue.TypeName)) return false;
             return !HasGlobalCxxFieldDefaultConstruction(item.TypeValue);
         }), pending.end());
-        if (pending.empty()) return;
+        std::vector<RuntimeConstruction> ordered;
+        for (auto& item : nativeRuntime) ordered.push_back({item, true});
+        for (auto& item : pending) ordered.push_back({item, false});
+        std::stable_sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+            return a.Item.Sequence < b.Item.Sequence;
+        });
+        if (ordered.empty()) return;
 
         auto* compiler = compilerLLVM;
         auto savedState = compiler->SaveBuilderState();
         auto* voidTy = llvm::FunctionType::get(compiler->builder->getVoidTy(), false);
         auto* initFn = llvm::Function::Create(
-            voidTy, llvm::Function::InternalLinkage, "__cflat_global_cxx_init",
+            voidTy, llvm::Function::InternalLinkage, "__cflat_global_init",
             compiler->module.get());
         auto* entry = llvm::BasicBlock::Create(*compiler->context, "entry", initFn);
         compiler->builder->SetInsertPoint(entry);
@@ -2035,8 +2020,25 @@ void MainListener::EmitPendingGlobalCxxConstructions()
         {
             // The constructor calls must lower as ordinary instructions, not as file-scope IR.
             GlobalScopeGuard initScope(global_scope);
-            for (const auto& item : pending)
+            for (const auto& construction : ordered)
             {
+                const auto& item = construction.Item;
+                if (construction.Native)
+                {
+                    // A native global whose default construction did not fold: an array takes
+                    // its per-element default init, a struct its CFlat default constructor.
+                    if (item.TypeValue.ConstArraySize > 0)
+                    {
+                        EmitFixedArrayDefaultInit(item.Global, item.TypeValue, item.Context, true);
+                        continue;
+                    }
+                    if (compiler->GetFunction(item.TypeValue.TypeName) == nullptr) continue;
+                    llvm::Value* constructed =
+                        compiler->CreateOverloadedFunctionCall(item.TypeValue.TypeName, {}, true);
+                    if (constructed != nullptr && constructed->getType() == item.Global->getValueType())
+                        compiler->builder->CreateStore(constructed, item.Global);
+                    continue;
+                }
                 if (item.Global == nullptr || item.Global->isDeclaration()) continue;
                 const std::string& typeName = item.TypeValue.TypeName;
                 if (!compiler->IsCxxRecord(typeName))
@@ -2047,6 +2049,18 @@ void MainListener::EmitPendingGlobalCxxConstructions()
                 }
                 if (item.TypeValue.ConstArraySize > 0)
                 {
+                    // `T[N] g = {{}, ...}` with no default constructor: each `{}` element takes the list ctor.
+                    if (item.EmptyBraceElements && compiler->CxxEmptyBraceUsesListCtor(typeName))
+                    {
+                        auto* arrTy = llvm::cast<llvm::ArrayType>(item.Global->getValueType());
+                        for (uint64_t slot = 0; slot < item.TypeValue.ConstArraySize; ++slot)
+                        {
+                            auto* slotPtr = compiler->builder->CreateConstInBoundsGEP2_64(
+                                arrTy, item.Global, 0, slot);
+                            EmitCxxEmptyBraceConstruct(slotPtr, typeName, item.Context, true);
+                        }
+                        continue;
+                    }
                     EmitFixedArrayDefaultInit(item.Global, item.TypeValue, item.Context);
                     continue;
                 }
@@ -2058,6 +2072,12 @@ void MainListener::EmitPendingGlobalCxxConstructions()
                 const auto* ctor = compiler->FindCxxDefaultCtor(typeName);
                 if (ctor == nullptr)
                 {
+                    // `T g{}` / `T g = {}` with no default constructor: the list constructor, n == 0.
+                    if (item.EmptyBraceInit && compiler->CxxEmptyBraceUsesListCtor(typeName))
+                    {
+                        EmitCxxEmptyBraceConstruct(item.Global, typeName, item.Context, item.CopyListInit);
+                        continue;
+                    }
                     const auto* info = compiler->GetCxxClassInfo(typeName);
                     LogErrorContext(item.Context, std::format(
                         "C++ class '{}' has no default constructor cflat can call{} - a global of "
@@ -2146,7 +2166,21 @@ llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndVa
             {
                 auto* slot = compiler->AllocaAtEntry(llvmType, nullptr, "arrayfielddefault");
                 compiler->builder->CreateStore(llvm::Constant::getNullValue(llvmType), slot);
-                EmitFixedArrayDefaultInit(slot, resolved);
+                // `T[N] a = {};` on a list-only class value-initializes each element from `{}` (the
+                // list constructor, n == 0); the default walk below would demand a default constructor.
+                antlr4::ParserRuleContext* emptyBraceCtx = typeValue.Initializer != nullptr
+                    ? static_cast<antlr4::ParserRuleContext*>(typeValue.Initializer)
+                    : typeValue.BraceInitializerContext;
+                const bool emptyBraceArray = emptyBraceCtx != nullptr
+                    && ((typeValue.Initializer != nullptr && typeValue.Initializer->LeftBrace() != nullptr
+                         && typeValue.Initializer->initializerList() == nullptr)
+                        || typeValue.HasEmptyBareBraceInitializer);
+                if (emptyBraceArray && compiler->GetFunction(resolved.TypeName) == nullptr
+                    && compiler->CxxEmptyBraceUsesListCtor(resolved.TypeName))
+                    EmitArrayValueInitSlots(slot, llvm::cast<llvm::StructType>(element), resolved,
+                                            nullptr, true, emptyBraceCtx);
+                else
+                    EmitFixedArrayDefaultInit(slot, resolved);
                 return compiler->builder->CreateLoad(llvmType, slot, "arrayfielddefault_value");
             }
         }
@@ -3874,6 +3908,8 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseDeclarationList(st
                         if (!typeAndValue.AliasInnerDims.empty())
                             typeAndValue.ConstInnerDimensions = typeAndValue.AliasInnerDims;
                     }
+                    ValidateArrayTotalElements(directDecl, typeAndValue.ConstArraySize,
+                                               typeAndValue.ConstInnerDimensions);
                     typeAndValue.VariableName = name;
                     typeAndValue.Initializer = initializer;
                     // Bare-brace field default (`Inner i { x = 1 };`): the list hangs on initDecl,
@@ -6367,6 +6403,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
         // no brackets of its own. The sizes were folded at registration (see ParseDeclarationSpecifiers).
         if (typeAndValue.ConstInnerDimensions.empty() && !typeAndValue.AliasInnerDims.empty())
             typeAndValue.ConstInnerDimensions = typeAndValue.AliasInnerDims;
+        // The outer size is the bracket's, or the alias's when the declaration has none (`using A = int[N][2]; A a;`).
+        const uint64_t outerDim = llvm::isa_and_nonnull<llvm::ConstantInt>(arraySize)
+            ? llvm::cast<llvm::ConstantInt>(arraySize)->getZExtValue() : typeAndValue.AliasArraySize;
+        if (outerDim > 0)
+            ValidateArrayTotalElements(typeAndValue.ArraySize != nullptr
+                ? static_cast<antlr4::ParserRuleContext*>(typeAndValue.ArraySize) : declSpec,
+                outerDim, typeAndValue.ConstInnerDimensions);
         const auto parsedTypeAndValue = typeAndValue;
 
         for (auto initDecl : initDeclarVec)
@@ -6720,6 +6763,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 bool srcInferredElemPointer = false;
                 // Thin function-pointer initializer (`auto p = signal(...)`): its signature.
                 std::optional<LLVMBackend::TypeAndValue> srcThinFnPtr;
+                // Closure initializer (`auto f = lam;`): its Lambda<> signature. The fat value
+                // keeps TypeName "__closure_fat_ptr" with IsFunctionPointer set.
+                std::optional<LLVMBackend::TypeAndValue> srcClosureFnPtr;
                 // C++ pointee const of a pointer initializer: `auto p = constPtrResult();` keeps it
                 // for C++ overload ranking, as C++ deduces `const T*`.
                 bool srcCxxPointeeConst = false;
@@ -6933,7 +6979,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // (the C++ rule for `S a[N]`), not once for the whole array.
                                 auto* arrAlloc = compiler->CreateLocalVariable(typeAndValue, nullptr, arraySize, line);
                                 allocList.push_back(std::pair(name, llvm::dyn_cast<llvm::AllocaInst>(arrAlloc)));
-                                EmitArrayValueInitSlots(arrAlloc, elemTy, typeAndValue, initList, false);
+                                EmitArrayValueInitSlots(arrAlloc, elemTy, typeAndValue, initList, false, initDecl);
                             }
                         }
                     }
@@ -7747,6 +7793,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 if (rightNV.TypeAndValue.IsThinFnPtr() && !rightNV.TypeAndValue.Pointer
                                     && !rightNV.TypeAndValue.FuncPtrReturnTypeName.empty())
                                     srcThinFnPtr = rightNV.TypeAndValue;
+                                if (rightNV.TypeAndValue.TypeName == "__closure_fat_ptr"
+                                    && rightNV.TypeAndValue.IsFunctionPointer
+                                    && !rightNV.TypeAndValue.Pointer)
+                                    srcClosureFnPtr = rightNV.TypeAndValue;
                                 srcCxxPointeeConst = rightNV.TypeAndValue.IsCxxPointeeConst
                                     && rightNV.TypeAndValue.Pointer;
                                 srcCxxNullptrT = rightNV.TypeAndValue.IsCxxNullptrT;
@@ -8513,6 +8563,21 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     typeAndValue.FuncPtrReturnResolvedKey = srcThinFnPtr->FuncPtrReturnResolvedKey;
                     typeAndValue.FuncPtrParams = srcThinFnPtr->FuncPtrParams;
                 }
+                else if (typeAndValue.TypeName == "auto" && right != nullptr && srcClosureFnPtr)
+                {
+                    // Same declared type as the source closure: a fat value with its own env, so
+                    // the copy below clones the captures (`auto f = lam;` == `Lambda<..> f = lam;`).
+                    typeAndValue.IsFunctionPointer = true;
+                    typeAndValue.TypeName = "__closure_fat_ptr";
+                    typeAndValue.Pointer = false;
+                    typeAndValue.FuncPtrReturnTypeName = srcClosureFnPtr->FuncPtrReturnTypeName;
+                    typeAndValue.FuncPtrReturnPointer = srcClosureFnPtr->FuncPtrReturnPointer;
+                    typeAndValue.FuncPtrReturnOwned = srcClosureFnPtr->FuncPtrReturnOwned;
+                    typeAndValue.FuncPtrReturnAlias = srcClosureFnPtr->FuncPtrReturnAlias;
+                    typeAndValue.FuncPtrReturnPointerDepth = srcClosureFnPtr->FuncPtrReturnPointerDepth;
+                    typeAndValue.FuncPtrReturnResolvedKey = srcClosureFnPtr->FuncPtrReturnResolvedKey;
+                    typeAndValue.FuncPtrParams = srcClosureFnPtr->FuncPtrParams;
+                }
                 else if (typeAndValue.TypeName == "auto" && right != nullptr
                     && !srcInferredTypeName.empty() && srcInferredTypeName != "auto")
                 {
@@ -8525,6 +8590,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         typeAndValue.TypeName = srcInferredTypeName;
                         typeAndValue.Pointer = srcInferredPointer;
                         typeAndValue.ElemPointer = srcInferredElemPointer;
+                        typeAndValue.IsInterface = compiler->IsInterfaceType(srcInferredTypeName);
                         typeAndValue.IsCxxPointeeConst = srcCxxPointeeConst && srcInferredPointer;
                         typeAndValue.IsCxxNullptrT = srcCxxNullptrT;
                     }
@@ -8734,7 +8800,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         && compiler->IsCxxRecord(typeAndValue.TypeName))
                         compiler->MarkCxxConstFieldAccess(global);
                     if (pendingGlobalDefaultConstruction && !externDeclOnly)
-                        pendingGlobalDefaultConstructions_.push_back({global, typeAndValue, direct});
+                        QueuePendingGlobalConstruction(pendingGlobalDefaultConstructions_, {global, typeAndValue, direct});
                     /*
                      * A global of a C++ class with a NONTRIVIAL default constructor (or a fixed
                      * array of one) keeps its zeroinitializer here and gets the constructor call
@@ -8759,7 +8825,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 compiler->DisplayCxxClassName(typeAndValue.TypeName),
                                 SpellType(*compiler, typeAndValue), name));
                         else
-                            pendingGlobalCxxConstructions_.push_back({global, typeAndValue, direct});
+                        {
+                            const bool copyListInit = initializer != nullptr
+                                && initializer->LeftBrace() != nullptr;
+                            QueuePendingGlobalConstruction(pendingGlobalCxxConstructions_,
+                                {global, typeAndValue, direct,
+                                emptyBraceToken && typeAndValue.ConstArraySize == 0, copyListInit, false});
+                        }
                     }
                     bool explicitZeroDefault = initializer != nullptr
                         && (initializer->Default() != nullptr
@@ -8771,7 +8843,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         && global != nullptr && !global->isDeclaration()
                         && !compiler->IsCxxRecord(typeAndValue.TypeName)
                         && compiler->GetDataStructure(typeAndValue.TypeName).StructType != nullptr)
-                        pendingGlobalCxxConstructions_.push_back({global, typeAndValue, direct});
+                        QueuePendingGlobalConstruction(pendingGlobalCxxConstructions_, {global, typeAndValue, direct});
                     if (!externDeclOnly && DeclSpecHasConst(declSpec)
                         && typeAndValue.TypeName == "string" && initializer != nullptr
                         && initializer->assignmentExpression() != nullptr)

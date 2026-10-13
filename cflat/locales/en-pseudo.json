@@ -876,6 +876,9 @@
       "Foo"
     ],
     "switchexpressionmustbeanintegertype": [],
+    "thecclassarg0hasnode...rsocflatcannotcallitd92871eaa171e095": [
+      "t63.TwoOnly"
+    ],
     "unknowntypearg0": [
       "GiDeadOnly__i32"
     ],
@@ -2160,6 +2163,7 @@
     "structclassdefinitionsrequireatrailing": "struct/class definitions require a trailing ';'",
     "structscannotimpleme...facesuseclassinstead717a4040b2a990a4": "structs cannot implement interfaces; use 'class' instead",
     "switchexpressionmustbeanintegertype": "switch expression must be an integer type",
+    "thecclassarg0hasnode...rsocflatcannotcallitd92871eaa171e095": "the C++ class '{0}' has no default constructor, so cflat cannot call it",
     "unclosedcheckforamissingclosingbrace": "unclosed '{{' - check for a missing closing brace",
     "unexpectedcharacterarg0": "unexpected character: {0}",
     "unknownfunctionarg0": "unknown function '{0}'",

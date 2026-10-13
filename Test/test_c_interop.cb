@@ -48,6 +48,7 @@ import "library/c_alias_late_diff_target.h";
 import "library/testmodule.cb";
 import "library/cinterop.c";
 import "library/struct_byval_util.c";
+import "library/c_variadic_aggregate.c";
 import package "cinterop/mathlib.h" lib "cinterop/mathlib.lib" define "ML_EXTRA";
 import "library/c_macro_helpers.h";
 import "library/c_inline_demand_a.h";
@@ -55,6 +56,8 @@ import "library/c_inline_demand_b.h";
 import "library/c_inline_demand_transitive.h";
 import "library/c_inline_demand_source.c";
 import "library/float_macros.h";
+import "library/c_array_dim_macro.h";
+import cpp "library/cpp_array_dim_macro.hpp";
 // Accept side of the conflicting-declaration check: prototypes identical to ones already
 // bound (core putn/printf, and c_add from cinterop.c above) must be a silent no-op.
 import "library/extern_agree_core.h";
@@ -328,6 +331,32 @@ static int t77FnPtrLegs()
     function<i64(T77Big, i64)> cr = t77Pick3 ?? t77Pick3b;
     if (cr(b, 7) != b.a + b.b + b.c + 7) return 8151;
     if (t77CoalesceRet(b) != b.a + b.b + b.c + 7) return 8152;
+    return 0;
+}
+
+// T137: #define macros and an unscoped C enumerator as fixed array dimensions. Each must fold to
+// the constant clang uses at global, struct field and local scope (`int a[ADIM_Q]` has 3 elements).
+int[ADIM_Q] t137AdimG = default;
+int[(ADIM_Q > 2) && (ADIM_HE == 2) ? 2 : 1] t137AdimCond = default;
+struct T137AdimS { int[ADIM_EXPR] f; int[ADIM_Q][ADIM_EXPR] m; };
+int[ADIMC_Q] t137AdimCpp = default;
+using T137AdimAlias = int[ADIM_Q][ADIM_EXPR];
+
+static int t137ArrayDimLegs()
+{
+    if (sizeof(t137AdimG) != 12)            return 9300;
+    if (sizeof(t137AdimCond) != 8)          return 9301;
+    if (sizeof(T137AdimS) != 48)            return 9302;
+    if (sizeof(t137AdimCpp) != 12)          return 9303;
+    int[ADIM_Q] loc = default;
+    if (sizeof(loc) != 12)                  return 9304;
+    int[(ADIM_Q > 2) && (ADIM_HE == 2) ? 2 : 1] loc2 = default;
+    if (sizeof(loc2) != 8)                  return 9305;
+    loc[ADIM_Q - 1] = 7;
+    if (loc[2] != 7)                        return 9306;
+    // T137 r2: a macro dimension inside sizeof(type), and an alias whose dimensions are macros.
+    if (sizeof(int[ADIM_Q]) != 12)          return 9307;
+    if (sizeof(T137AdimAlias) != 36)        return 9308;
     return 0;
 }
 
@@ -1138,6 +1167,12 @@ extern int main()
 
     int t77 = t77FnPtrLegs();
     if (t77 != 0) return t77;
+
+    int t137 = t137ArrayDimLegs();
+    if (t137 != 0) return t137;
+
+    // T145: a scalar in a C variadic `...` slot still passes (only by-value aggregates are refused).
+    if (t145_cva_scalar(1, 5) != 6) return 3980;
 
     return 0;
 }

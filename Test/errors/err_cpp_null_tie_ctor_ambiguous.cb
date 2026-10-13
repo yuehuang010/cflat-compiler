@@ -1,0 +1,38 @@
+import cpp "cpp_t132_s7_byval.hpp";
+
+// clang refuses each of these as ambiguous: a literal 0 or 5 is an integral conversion to every
+// tied constructor (char beside long, or char beside a null pointer), so no candidate is exact.
+extern int main()
+{
+    expect_error("conversion from 'int' to 't132::SC' is ambiguous") {
+        t140.Recv r = default;
+        return r.takeSC(0);
+    }
+    expect_error("call to constructor of 't140::SCL' is ambiguous") {
+        t140.SCL* sclNew = new t140.SCL(5);
+        return sclNew.v;
+    }
+    expect_error("conversion from 'int' to 't140::SCL' is ambiguous") {
+        t140.SCL sclCopy = 5;
+        return sclCopy.v;
+    }
+    expect_error("conversion from 'int' to 't140::SCL' is ambiguous") {
+        t140.Recv r = default;
+        return r.takeSCL(5);
+    }
+    expect_error("conversion from 'int' to 't140::SCL' is ambiguous") {
+        t140.Recv r = default;
+        return r.takeSCL(0);
+    }
+    expect_error("call to constructor of 't140::EX' is ambiguous") {
+        t140.EX* exNew = new t140.EX(0);
+        return exNew.v;
+    }
+    // Mac mirror of the Windows int-to-long leg: a long argument is Exact for long long (both 64-bit).
+    expect_error("call to constructor of 't140::SLL' is ambiguous") {
+        long lvTie = 5;
+        t140.SLL* sllNew = new t140.SLL(lvTie);
+        return sllNew.v;
+    }
+    return 0;
+}
