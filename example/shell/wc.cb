@@ -33,7 +33,7 @@ Counts countFile(char* path) {
         result.lines++;
         result.chars += line.length() + 1;  // +1 for the newline
 
-        i8* p = line.data();
+        char* p = line.data();
         int len = line.length();
         bool inWord = false;
         int j = 0;

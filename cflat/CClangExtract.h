@@ -277,6 +277,7 @@ namespace cflat_cinterop
         uint64_t alignBytes = 0;
         uint64_t bitOffset = 0;     // bitfield only: Clang's absolute bit offset in the record
         int access = AccessPublic;  // C++ only; C records are all public
+        bool inherited = false;     // C++ only: flattened from a base subobject, not declared here
     };
 
     // A constructor TEMPLATE, as declared: the template head and the parameter types as

@@ -22,7 +22,7 @@ int HTTP_READ_TOO_LARGE = 2;   // request exceeded maxBytes -> caller should 413
 int _http_parseContentLength(i8* buf, int headerLen)
 {
     string head = default;
-    head._ptr = buf;
+    head._ptr = (char*)buf;
     head._len = headerLen;
 
     int idx = head.indexOf("Content-Length:");
@@ -100,7 +100,7 @@ int _http_readRequest(Socket* conn, int maxBytes, i8** outBuf, int* outLen)
             if (!haveHeaders)
             {
                 string view = default;
-                view._ptr = buf;
+                view._ptr = (char*)buf;
                 view._len = total;
                 int he = view.indexOf("\r\n\r\n");
                 if (he >= 0)

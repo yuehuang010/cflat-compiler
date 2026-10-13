@@ -4562,6 +4562,7 @@ cxx_dtor_ready:
                     if (elementNV.TypeAndValue.Pointer
                         || !compiler->IsCxxRecord(elementNV.TypeAndValue.TypeName))
                     {
+                        elementNV.CxxImportedLiteral = compiler->CxxImportedConstantLiteral(elementNV);
                         elementNV.Storage = nullptr;
                         elementNV.IsRvalue = true;
                     }

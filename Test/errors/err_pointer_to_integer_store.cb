@@ -3,10 +3,14 @@ struct P2iField { long value = 0; };
 struct P2iDesignated { long value = 0; };
 struct P2iPointerField { int* value = nullptr; };
 struct P80DoubleField { double* value = nullptr; };
+struct P89Field { char* value = nullptr; };
 enum P2iEnum : int { P2I_ZERO = 0, P2I_ONE = 1 };
 int p2iFunction() { return 1; }
 extern void* malloc(i64 size);
 import "c_macro_helpers.h";
+import cpp "cpp_t89_char_pointer.hpp";
+void t89TakeI8(i8* value) { }
+void t89TakeCharPP(char** value) { }
 void p2iNativeTakeInt(int* value) {}
 void p2iSimdInt(simd<int,4>* value) {}
 void p2iSimdLong(simd<i64,4>* value) {}
@@ -194,10 +198,40 @@ extern int main()
     int* sameArrayDecay = sameArray;
     p2iNativeTakeInt(sameView);
     i8* bytePointer = (i8*)&n;
-    char* charPointer = bytePointer;
+    char* charPointer = (char*)bytePointer;
     charPointer = (char*)bytePointer;
     i32* samePrimitive = ip;
     p2iBetter(wp);
+    i8* t89I8Ptr = (i8*)&n;
+    char* t89CharPtr = (char*)&n;
+    u8* t89U8Ptr = (u8*)&n;
+    expect_error("cannot convert 'char*' to 'u8*' implicitly") { u8* t89U = nullptr; t89U = t89CharPtr; }
+    expect_error("cannot convert 'i8*' to 'char*' implicitly") { char* t89A = t89I8Ptr; }
+    expect_error("cannot convert 'u8*' to 'char*' implicitly") { char* t89B = nullptr; t89B = t89U8Ptr; }
+    expect_error("cannot convert 'char*' to 'u8*' implicitly") { u8* t89C = t89CharPtr; }
+    expect_error("cannot convert 'i8*' to 'char*' implicitly") {
+        bool t89Cond = true; char* t89D = t89Cond ? t89I8Ptr : t89CharPtr;
+    }
+    expect_error("cannot convert 'i8*' to 'char*' implicitly") {
+        i8[2] t89ArrI8 = default; char* t89E = t89ArrI8;
+    }
+    expect_error("cannot convert 'i8*' to 'char*' implicitly") {
+        i8[2] t89SrcI8 = default; i8[] t89ViewI8 = t89SrcI8; char* t89F = t89ViewI8;
+    }
+    expect_error("cannot convert 'i8*' to 'char*' implicitly") { P89Field s = {value = t89I8Ptr}; }
+    expect_error("cannot convert 'i8*' to 'char*' implicitly") { t89_take_char(t89I8Ptr); }
+    expect_error("cannot convert 'u8*' to 'char*' implicitly") { t89_take_char(t89U8Ptr); }
+    expect_error("cannot convert 'char*' to 'i8*' implicitly") { t89TakeI8("A"); }
+    expect_error("cannot convert 'char*' to 'u8*' implicitly") { t89_take_uchar("A"); }
+    // Parentheses are transparent: a parenthesized literal is still a char* literal.
+    expect_error("cannot convert 'char*' to 'i8*' implicitly") { t89TakeI8(("A")); }
+    expect_error("cannot convert 'char*' to 'u8*' implicitly") { t89_take_uchar(("A")); }
+    expect_error("cannot convert 'char*' to 'i8*' implicitly") { char[2] t89Decay = default; t89TakeI8(t89Decay); }
+    expect_error("cannot convert 'char*' to 'i8*' implicitly") { char[2] t89CDecay = default; t89_take_schar(t89CDecay); }
+    expect_error("cannot convert 'i8**' to 'char**' implicitly") { i8* t89PP = nullptr; t89TakeCharPP(&t89PP); }
+    expect_error("cannot convert 'i8**' to 'char**' implicitly") { i8* t89CPP = nullptr; t89_take_char_pp(&t89CPP); }
+    expect_error("cannot convert 'char*' to 'i8*' implicitly") { t89_take_schar(t89CharPtr); }
+    expect_error("cannot convert 'i8*' to 'char*' implicitly") { t89_variadic(t89I8Ptr, 1); }
     return 0;
 }
 int p2iTakeLong(long value) { return (int)value; }
@@ -212,6 +246,27 @@ int*[2] p2iGlobalGoodPtrs = { &p2iGlobalInt, &p2iGlobalInt };
 // T80: unrelated primitive pointees (integer <-> floating) refused at every context.
 double p80Double = 0.0;
 int p80Int = 0;
+
+// T89: char family (char <-> i8/u8) refused like the other integer pointee pairs.
+i8* t89GlobalI8 = nullptr;
+u8* t89GlobalU8 = nullptr;
+char* t89GlobalChar = nullptr;
+void t89TakeChar(char* value) { }
+expect_error("cannot convert 'i8*' to 'char*' implicitly") {
+    char* t89BadGlobal = t89GlobalI8;
+}
+expect_error("cannot convert 'char*' to 'u8*' implicitly") {
+    u8* t89BadGlobalU8 = t89GlobalChar;
+}
+expect_error("cannot convert 'i8*' to 'char*' implicitly") {
+    struct T89BadFieldDefault { char* value = t89GlobalI8; };
+}
+expect_error("cannot convert 'i8*' to 'char*' implicitly") {
+    char* t89BadReturn() { return t89GlobalI8; }
+}
+expect_error("cannot convert 'i8*' to 'char*' implicitly") {
+    char* t89BadParamReturn(i8* value) { return value; }
+}
 void p80TakeDouble(double* value) { }
 int p80Pick(double* value) { return 2; }
 int p80Pick(float* value) { return 3; }

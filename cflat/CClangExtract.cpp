@@ -3528,6 +3528,7 @@ namespace cflat_cinterop
                     rf.offsetBytes = baseOff + layout.getFieldOffset(idx) / 8;
                     RecordRawFieldLayout(f->getType(), rf);
                     rf.access = MapAccess(f->getAccess());
+                    rf.inherited = !isOutermost;
                     // Shadowed by a more derived field of the same name: keep the storage, give it
                     // a reserved name nobody can write. Inherited through a non-public base: keep
                     // the real name but mark it private, so naming it says exactly that.
@@ -3559,6 +3560,34 @@ namespace cflat_cinterop
                 int synth = 0;
                 if (!FlattenCxxLayout(cxx, 0, true, ownNames, /*isOutermost*/ true, taken, synth, rec))
                     return false;
+                // `using Base::v;` naming a FIELD declares v in cxx itself; it takes the using's access
+                // only when the hierarchy holds one field v, so the flat slot is surely the target.
+                std::function<int(const CXXRecordDecl*, const std::string&)> countFields =
+                    [&](const CXXRecordDecl* r, const std::string& name) {
+                        int n = 0;
+                        for (const FieldDecl* f : r->fields()) n += f->getNameAsString() == name;
+                        for (const CXXBaseSpecifier& b : r->bases())
+                            if (const auto* brd = b.getType()->getAsCXXRecordDecl())
+                                if (brd->getDefinition() != nullptr)
+                                    n += countFields(brd->getDefinition(), name);
+                        return n;
+                    };
+                for (const Decl* d : cxx->decls())
+                {
+                    const auto* ud = dyn_cast<UsingDecl>(d);
+                    if (ud == nullptr || ud->shadow_size() == 0) continue;
+                    if (!std::all_of(ud->shadow_begin(), ud->shadow_end(), [](const UsingShadowDecl* sh) {
+                            return isa<FieldDecl>(sh->getTargetDecl()); }))
+                        continue;
+                    const std::string name = ud->getNameAsString();
+                    const bool unique = countFields(cxx, name) == 1;
+                    for (RawField& f : rec.fields)
+                        if (f.inherited && f.name == name)
+                        {
+                            f.inherited = false;
+                            if (unique) f.access = MapAccess(ud->getAccess());
+                        }
+                }
                 if (std::none_of(rec.fields.begin(), rec.fields.end(),
                         [](const RawField& f) { return f.isZeroSize; }))
                     std::stable_sort(rec.fields.begin(), rec.fields.end(),

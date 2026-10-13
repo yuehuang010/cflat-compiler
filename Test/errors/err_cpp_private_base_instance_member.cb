@@ -1,0 +1,43 @@
+// Instance spellings of a member of a private base name the base, as clang does: a method, a
+// static through an instance, a field, and the operators (the operator text keeps its prefix).
+import cpp "cpp_private_base_instance.h";
+import cpp "cpp_private_base_shadow.h";
+
+extern int main()
+{
+    expect_error("member 'get' of C++ class 'cppi_pbi.PbiPriv' is inaccessible: 'cppi_pbi.PbiBase' is a private base of 'cppi_pbi.PbiPriv'") {
+        cppi_pbi.PbiPriv p = cppi_pbi.PbiPriv(1);
+        int g = p.get();
+    }
+    expect_error("member 'K' of C++ class 'cppi_pbi.PbiPriv' is inaccessible: 'cppi_pbi.PbiBase' is a private base of 'cppi_pbi.PbiPriv'") {
+        cppi_pbi.PbiPriv p = cppi_pbi.PbiPriv(1);
+        int k = p.K();
+    }
+    expect_error("member 'v' of C++ class 'cppi_pbi.PbiPriv' is inaccessible: 'cppi_pbi.PbiBase' is a private base of 'cppi_pbi.PbiPriv'") {
+        cppi_pbi.PbiPriv p = cppi_pbi.PbiPriv(1);
+        int v = p.v;
+    }
+    expect_error("no operator '+' for type 'cppi_pbi.PbiPriv': member 'operator+' of C++ class 'cppi_pbi.PbiPriv' is inaccessible: 'cppi_pbi.PbiBase' is a private base of 'cppi_pbi.PbiPriv'") {
+        cppi_pbi.PbiPriv p = cppi_pbi.PbiPriv(1);
+        cppi_pbi.PbiPriv q = cppi_pbi.PbiPriv(2);
+        cppi_pbi.PbiPriv s = p + q;
+    }
+    expect_error("no operator '-' for type 'cppi_pbi.PbiPriv': member 'operator-' of C++ class") {
+        cppi_pbi.PbiPriv p = cppi_pbi.PbiPriv(1);
+        cppi_pbi.PbiPriv n = -p;
+    }
+    // A declaration in the derived class hides the base's: the base is not named.
+    expect_error("field 'v' of C++ class 'cppi_pbs.PbsHide' is private") {
+        cppi_pbs.PbsHide h = cppi_pbs.PbsHide();
+        int hv = h.v;
+    }
+    expect_error("no overload of 'get' matches the given arguments.") {
+        cppi_pbs.PbsHide h = cppi_pbs.PbsHide();
+        int hg = h.get();
+    }
+    expect_error("field 'v' of C++ class 'cppi_pbs.PbsUsing' is private") {
+        cppi_pbs.PbsUsing u = cppi_pbs.PbsUsing();
+        int uv = u.v;
+    }
+    return 0;
+}

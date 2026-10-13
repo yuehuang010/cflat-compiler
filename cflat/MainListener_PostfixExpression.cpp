@@ -1543,6 +1543,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     {
                         if (ApplyStructPostfixOperator("operator++"))
                             break;
+                        if (namedVar.IsCxxMacroGlobal || namedVar.IsCxxMacroJoin)
+                            LogErrorContext(ctx, std::format("cannot increment macro constant '{}'",
+                                ctx->getText().substr(0, ctx->getText().size() - 2)));
                         // The result is the old value, not the macro's literal.
                         namedVar.IsCxxMacroGlobal = false;
                         namedVar.IsCxxNullIntegerMacro = false;
@@ -1610,6 +1613,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     {
                         if (ApplyStructPostfixOperator("operator--"))
                             break;
+                        if (namedVar.IsCxxMacroGlobal || namedVar.IsCxxMacroJoin)
+                            LogErrorContext(ctx, std::format("cannot decrement macro constant '{}'",
+                                ctx->getText().substr(0, ctx->getText().size() - 2)));
                         // The result is the old value, not the macro's literal.
                         namedVar.IsCxxMacroGlobal = false;
                         namedVar.IsCxxNullIntegerMacro = false;
@@ -2723,7 +2729,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // base.__anonN.field.
                                 namedVar = anonNV;
                             }
-                            else
+                            // A static member of a private/protected base named through an
+                            // instance: the helper names the base (clang's text).
+                            else if (!Compiler(ctx)->ReportCxxMemberThroughNonPublicBase(
+                                         structVar.TypeAndValue.TypeName, primaryIdentifier))
                             {
                                 LogErrorContext(primaryCtx, std::format("Unknown identifier '{}'.", primaryIdentifier));
                             }
@@ -3267,6 +3276,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             lastParenExprCallerName.clear();
                             auto parenInnerNamed = lastParenExprNamed;
                             lastParenExprNamed = {};
+                            // A parenthesized `?:` joining macro constants stays a prvalue.
+                            if (prevPrimary->expression() != nullptr && parenInnerNamed.IsCxxMacroJoin)
+                                namedVar.IsCxxMacroJoin = true;
                             if (prevPrimary->expression() != nullptr && parenInnerNamed.IsCxxMacroGlobal)
                             {
                                 std::string innerText = prevPrimary->expression()->getText();
@@ -6332,6 +6344,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.BaseType = argValue->getType();
                                     argVar.IsCxxMacroGlobal = argNV.IsCxxMacroGlobal;
                                     argVar.IsCxxNullIntegerMacro = argNV.IsCxxNullIntegerMacro;
+                                    argVar.IsCxxMacroJoin = argNV.IsCxxMacroJoin;
                                     argVar.TernaryTempAlreadyRegistered = argNV.TernaryTempAlreadyRegistered;
                                     argVar.ConditionalMoveSources = argNV.ConditionalMoveSources;
                                     argVar.Storage = argNV.Storage;
@@ -7200,6 +7213,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.BaseType = argValue->getType();
                                     argVar.IsCxxMacroGlobal = argNV.IsCxxMacroGlobal;
                                     argVar.IsCxxNullIntegerMacro = argNV.IsCxxNullIntegerMacro;
+                                    argVar.IsCxxMacroJoin = argNV.IsCxxMacroJoin;
                                     argVar.TernaryTempAlreadyRegistered = argNV.TernaryTempAlreadyRegistered;
                                     argVar.ConditionalMoveSources = argNV.ConditionalMoveSources;
                                     // Propagate caller variable name for compile-time move tracking.

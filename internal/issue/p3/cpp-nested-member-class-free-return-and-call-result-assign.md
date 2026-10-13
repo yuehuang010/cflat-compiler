@@ -53,3 +53,8 @@ Both reproduce cold and warm on macOS and Windows, master and the t30 fix alike.
    specialization with definitions, as TryBindRefusedCxxMember does for members).
 2. The assignment lvalue check should treat a C++ class prvalue from operator()/operator* like the
    operator[] / named-method result: dispatch to the class's operator=.
+
+
+## T102 status (2026-10-10)
+
+Open. The master repros for the free nested-class return and `operator()` / `operator*` class-prvalue assignment were confirmed. Three targeted attempts per gap did not close them; no new regression legs were retained.

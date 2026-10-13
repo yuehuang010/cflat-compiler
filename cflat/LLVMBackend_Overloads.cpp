@@ -110,16 +110,14 @@ bool LLVMBackend::IsImplicitIntegerPointeePointerConversion(
         && (isInteger(toBase) || isFloating(toBase));
     if (!integerPair && !floatingPair) return false;
 
-    const bool charFamily = (fromBase == "char" && (toBase == "i8" || toBase == "u8"))
-        || (toBase == "char" && (fromBase == "i8" || fromBase == "u8"));
-    return !charFamily;
+    // char, i8 and u8 are distinct pointees (char signedness differs by target), so char <-> i8/u8
+    // is refused like every other integer pair (T89 stage 2).
+    return true;
 }
 
-void LLVMBackend::RejectImplicitIntegerPointeePointerConversion(
-    const TypeAndValue& from, const TypeAndValue& to)
+std::string LLVMBackend::ImplicitIntegerPointeeConversionText(
+    const TypeAndValue& from, const TypeAndValue& to) const
 {
-    if (!IsImplicitIntegerPointeePointerConversion(from, to)) return;
-    if (from.IsSimd || to.IsSimd) return;
 
     auto decayed = [](const TypeAndValue& value) {
         TypeAndValue result = value;
@@ -148,8 +146,16 @@ void LLVMBackend::RejectImplicitIntegerPointeePointerConversion(
     const bool toDouble = toPointer.ElemPointer || toPointer.PointerDepth >= 2;
     const std::string fromType = fromBase + (fromDouble ? "**" : "*");
     const std::string toType = toBase + (toDouble ? "**" : "*");
-    LogError(std::format("cannot convert '{}' to '{}' implicitly: the pointee types differ; "
-                         "use an explicit cast '({})p'", fromType, toType, toType));
+    return std::format("cannot convert '{}' to '{}' implicitly: the pointee types differ; "
+                       "use an explicit cast '({})p'", fromType, toType, toType);
+}
+
+void LLVMBackend::RejectImplicitIntegerPointeePointerConversion(
+    const TypeAndValue& from, const TypeAndValue& to)
+{
+    if (!IsImplicitIntegerPointeePointerConversion(from, to)) return;
+    if (from.IsSimd || to.IsSimd) return;
+    LogError(ImplicitIntegerPointeeConversionText(from, to));
 }
 
 #if defined(__APPLE__)
@@ -269,10 +275,31 @@ static bool CxxSpellingHasPointerTarget(const std::string& spelling)
 bool LLVMBackend::IsUnrelatedPointeeArgument(const NamedVariable& arg,
                                              const FunctionSymbol& candidate, size_t index) const
 {
+    TypeAndValue from;
+    TypeAndValue to;
+    return UnrelatedPointeePair(arg, candidate, index, from, to);
+}
+
+bool LLVMBackend::UnrelatedPointeePair(const NamedVariable& arg, const FunctionSymbol& candidate,
+                                       size_t index, TypeAndValue& from, TypeAndValue& to) const
+{
     if (index >= candidate.Parameters.size()) return false;
-    TypeAndValue from = arg.HasOriginalArgumentType ? arg.OriginalArgumentType : arg.TypeAndValue;
+    from = arg.HasOriginalArgumentType ? arg.OriginalArgumentType : arg.TypeAndValue;
     if (from.Pointer && from.TypeName.empty() && !arg.InferSourceTypeName.empty())
         from.TypeName = arg.InferSourceTypeName;
+    // A plain "..." argument is a char array: its decayed pointer is char* whatever the lowered
+    // type says. Only the literal's own text counts, not a variable initialized from one.
+    const bool stringLiteral = arg.IsStringLiteral;
+    if (stringLiteral)
+    {
+        from.Pointer = true;
+        from.TypeName = "char";
+        from.ElemPointer = false;
+        from.PointerDepth = 1;
+        from.IsArrayView = false;
+        from.ConstArraySize = 0;
+        from.ConstInnerDimensions.clear();
+    }
     // A reference-returning call is already stored at the referred pointer's depth.
     if (from.IsCxxRefToPointer)
     {
@@ -280,7 +307,7 @@ bool LLVMBackend::IsUnrelatedPointeeArgument(const NamedVariable& arg,
         from.IsCxxConstRef = false;
         from.IsRvalueRef = false;
     }
-    TypeAndValue to = candidate.Parameters[index];
+    to = candidate.Parameters[index];
     if (candidate.IsCxx && IsCxxReferenceParameter(candidate, index))
     {
         if (!CxxSpellingHasPointerTarget(CxxReferenceParameterSpelling(candidate, index)))
@@ -409,6 +436,8 @@ static int FloatingBitsOfName(const std::string& name)
 {
         if (name == "float") return 32;
         if (name == "double") return 64;
+        // Ranked after double; it lowers at double's width (only the order matters).
+        if (name == "longdouble") return 80;
         return -1;
 }
 
@@ -496,12 +525,21 @@ LLVMBackend::ScalarArgConversion LLVMBackend::ClassifyScalarArgConversion(
         const bool literal = arg.TypeAndValue.TypeName.empty() && arg.BaseType
             && arg.BaseType->isFloatingPointTy();
         if (namedFloat == -1 && !literal) return ScalarArgConversion::NotScalar;
+        // A long double value lowers as double; its identity is the l/L literal, the built-in
+        // arithmetic result type (`0.25l + 1.0f`), or the declared type.
+        const bool longDouble = namedFloat == -1 && arg.BaseType->isDoubleTy()
+            && (arg.LiteralIdentity == "longdouble"
+                || (arg.LiteralIdentity.empty() && (arg.CxxArithIdentity == "longdouble"
+                    || (arg.CxxArithIdentity.empty() && arg.InferSourceTypeName == "longdouble"))));
         const int argFloat = namedFloat != -1 ? namedFloat
+            : longDouble ? FloatingBitsOfName("longdouble")
             : (arg.LiteralIdentity == "double" || arg.BaseType->isDoubleTy() ? 64 : 32);
         if (paramBool || paramBits != -1) return ScalarArgConversion::Narrow;
         if (paramFloat == -1) return ScalarArgConversion::NotScalar;
         if (argFloat == paramFloat) return ScalarArgConversion::Exact;
         if (argFloat < paramFloat) return ScalarArgConversion::Widen;
+        // long double -> double is a conversion, not exact, but loses nothing at CFlat's width.
+        if (argFloat == FloatingBitsOfName("longdouble") && paramFloat == 64) return ScalarArgConversion::Widen;
         return literal ? ScalarArgConversion::Exact : ScalarArgConversion::Narrow;
 }
 
@@ -748,7 +786,7 @@ std::string LLVMBackend::LiteralIdentityForOverload(std::string_view text, bool*
             }
             if (pos != rest.size() || std::count(rest.begin(), rest.end(), '.') > 1)
                 return "";
-            return hasLongFloatSuffix ? "" : hasFloatSuffix ? "float" : "double";
+            return hasLongFloatSuffix ? "longdouble" : hasFloatSuffix ? "float" : "double";
         }
         if (hasFloatSuffix)
             return "";
@@ -1189,7 +1227,7 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
         };
         // Character types promote to their underlying type, not to `int`; leave them unjudged.
         auto arithmeticName = [&](const std::string& name) -> std::string {
-            if (name == "bool" || name == "float" || name == "double") return name;
+            if (name == "bool" || name == "float" || name == "double" || name == "longdouble") return name;
             if (name == "wchar" || name == "c16" || name == "c32" || name == "c8") return "";
             return integerBits(name) > 0 ? CanonicalPrimitiveTypeName(name) : "";
         };
@@ -1210,7 +1248,8 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
             // A built-in arithmetic result ranks as its C++ type (`1e3 + 1` is double, typed float).
             const std::string arith = CxxArithIdentityForArgument(arg, arg.BaseType);
             for (const std::string* recorded : { &arg.LiteralIdentity, &arith, &tv.TypeName, &arg.InferSourceTypeName })
-                if (*recorded == "float" || *recorded == "double")
+                if (*recorded == "float" || *recorded == "double"
+                    || (*recorded == "longdouble" && arg.BaseType->isDoubleTy()))
                     return *recorded;
             if (!tv.TypeName.empty() || !arg.InferSourceTypeName.empty())
                 return "";
@@ -1730,9 +1769,6 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Integer -> bool coercions. Without it `sb.append(n)` picked append(bool) over
             // append(int) purely by declaration order.
             int boolCoercions = 0;
-            // Native char-family pointee conversions (u8*/i8* <-> char*): ranked below a void*
-            // conversion so `f(void*)` wins over `f(char*)` for a `u8*` in either order.
-            int charFamilyPointeeConversions = 0;
             // Parameters left to their defaults. An exact-arity overload (the C++ default
             // wrapper `f(a)` next to `f(a, b = expr)`) beats one that would fill defaults in.
             int omitted = 0;
@@ -1918,7 +1954,6 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             int shapeMismatches = 0;
             // Arguments bound to a 'bool' parameter through the integer -> bool coercion.
             int boolCoercions = 0;
-            int charFamilyPointeeConversions = 0;
             int constRefMaterializations = 0;
             int mutableRefPreference = 0;
             std::vector<int> standardCosts;
@@ -2365,8 +2400,11 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         // gated on the argument's function-ness: `function<T>*` is the ADDRESS of a
                         // slot, i.e. data. The gate that refuses a function-pointer VALUE is in the
                         // empty-TypeName branch below - the shape such a value actually arrives in.
-                        if (result < 0 && arg.TypeAndValue.Pointer &&
-                            candidateParamItr->Pointer && candidateParamItr->TypeName == "void")
+                        if (result < 0
+                            && (arg.TypeAndValue.Pointer
+                                || (arg.TypeAndValue.ConstArraySize > 0 && !arg.TypeAndValue.IsArrayView
+                                    && !arg.TypeAndValue.IsSimd))
+                            && candidateParamItr->Pointer && candidateParamItr->TypeName == "void")
                         {
                             result = 0;
                         }
@@ -2781,6 +2819,11 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 if (result >= 0 && (scalarConv == ScalarArgConversion::Narrow
                                     || scalarConv == ScalarArgConversion::EnumMismatch))
                     result = -1;
+                // double and long double lower alike, so the lowered types scored them perfect;
+                // a floating Widen between them is a conversion, so the exact one wins.
+                if (result == 0 && scalarConv == ScalarArgConversion::Widen
+                    && FloatingBitsOfName(ScalarArgumentReferent(*candidateParamItr).TypeName) != -1)
+                    result = 1;
                 if (candidate.IsCxx && result < 0 && scalarConv == ScalarArgConversion::Widen
                     && !candidateParamItr->Pointer && candidateParamItr->TypeName != "bool")
                     result = 1;
@@ -2895,23 +2938,18 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         && !pointerArgName.empty() && !pointerParam.TypeName.empty()
                         && (pointerArgName == "void") != (pointerParam.TypeName == "void"))
                         result = 1;
-                    // The ruled char-family pointee conversion (u8*/i8* <-> char*) stays viable but
-                    // ranks below the void* conversion, as in master and clang, in either order.
-                    if (!candidate.IsCxx && result >= 0 && candidates.size() > 1
-                        && pointerArg.Pointer && !pointerArg.ElemPointer && pointerArg.PointerDepth <= 1
-                        && pointerParam.Pointer && !pointerParam.ElemPointer
-                        && pointerParam.PointerDepth <= 1)
+                    // C++ candidates: char <-> i8/u8 pointees are refused (clang: char, signed char and
+                    // unsigned char are distinct). Other C++ integer pointee mismatches are unchanged.
+                    if (candidate.IsCxx && result >= 0 && pointerArg.Pointer && !pointerArg.ElemPointer
+                        && pointerArg.PointerDepth <= 1 && pointerParam.Pointer && !pointerParam.ElemPointer
+                        && pointerParam.PointerDepth <= 1 && !pointerArgName.empty()
+                        && !pointerParam.TypeName.empty())
                     {
                         const std::string argBase = ResolveTypeAlias(pointerArgName);
                         const std::string paramBase = ResolveTypeAlias(pointerParam.TypeName);
                         if ((argBase == "char" && (paramBase == "i8" || paramBase == "u8"))
                             || (paramBase == "char" && (argBase == "i8" || argBase == "u8")))
-                        {
-                            // char <-> i8 is same-sign (cost 1); char <-> u8 changes sign (cost 2).
-                            result = std::max(result, 1);
-                            charFamilyPointeeConversions += (argBase == "u8") == (paramBase == "u8")
-                                ? 1 : 2;
-                        }
+                            result = -1;
                     }
                     // Native sets: int* into double* is not viable in C++, so f(void*) wins; integer
                     // pairs go through IsImplicitIntegerPointeePointerConversion (T80: floating too).
@@ -3036,6 +3074,20 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     && !CxxReferenceAllowsNullPointerConversion(*candidateParamItr,
                         CxxReferenceParameterSpelling(candidate, paramIndex)))
                     result = -1;
+                // Native floating pair (double and long double lower alike): exact 0, float -> double a
+                // promotion, any other floating widen a conversion - so {double, longdouble} picks like clang.
+                if (integerCost < 0 && result >= 0 && !candidate.IsCxx && arg.BaseType != nullptr
+                    && arg.BaseType->isFloatingPointTy()
+                    && FloatingBitsOfName(ScalarArgumentReferent(*candidateParamItr).TypeName) != -1)
+                {
+                    const ScalarArgConversion floatConv = ClassifyScalarArgConversion(arg,
+                        ScalarArgumentReferent(*candidateParamItr));
+                    if (floatConv == ScalarArgConversion::Exact) integerCost = 0;
+                    else if (floatConv == ScalarArgConversion::Widen)
+                        integerCost = arg.BaseType->isFloatTy()
+                            && ScalarArgumentReferent(*candidateParamItr).TypeName == "double"
+                            ? 1 : kIntegerConversionCost;
+                }
                 integerCosts.push_back(integerCost);
                 standardCosts.push_back(integerCost);
                 if (standardCosts.back() < 0 && IsNullPointerConstantArgument(arg, candidate.IsCxx)
@@ -3073,7 +3125,6 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 ranked.pair = &pair;
                 ranked.shapeMismatches = shapeMismatches;
                 ranked.boolCoercions = boolCoercions;
-                ranked.charFamilyPointeeConversions = charFamilyPointeeConversions;
                 ranked.constRefMaterializations = constRefMaterializations;
                 ranked.mutableRefPreference = mutableRefPreference;
                 ranked.omitted = omitted;
@@ -3565,7 +3616,6 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Prefer agreeing function-pointer shapes, then fewer integer -> bool coercions.
             keepLowest(best, [](const Ranked& r) { return r.shapeMismatches; });
             keepLowest(best, [](const Ranked& r) { return r.boolCoercions; });
-            keepLowest(best, [](const Ranked& r) { return r.charFamilyPointeeConversions; });
             // An overload over the argument's own specialization beats a const-added one.
             keepLowest(best, [](const Ranked& r) { return r.constAddedConversions; });
             keepLowest(best, [](const Ranked& r) { return r.mutableRefPreference; });
@@ -4779,6 +4829,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             if (std::string error = CheckCxxDemand(candidate.Function->getName().str());
                 !error.empty())
             {
+                // Clang's text keeps its "clang: " form on every path, including a body an
+                // earlier probe already failed (the relay below and this report read the same).
+                if (!error.starts_with("clang: ")) error = "clang: " + error;
                 // R4: the retry only sharpens the refusal (e.g. an rvalue sibling asking for
                 // `move`); if it silently binds another overload, report the winner's body error.
                 RefuseCxxDemandMember(candidate.Function->getName().str(), error);
@@ -4814,7 +4867,17 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 argument.IsRvalue = false;
             }
 
-        auto spellCandidate = [&](const FunctionSymbol& c) {
+        auto spellCandidate = [&](const FunctionSymbol& candidate) {
+            // A default-argument wrapper shows the C++ declaration it forwards to, with its defaults.
+            FunctionSymbol shown = candidate;
+            const bool wrapperShape = candidate.UniqueName.starts_with("__cflat_dflt_");
+            if (wrapperShape)
+                if (auto request = cxxDefaultWrapperRequests_.find(candidate.UniqueName);
+                    request != cxxDefaultWrapperRequests_.end())
+                    for (const auto& entry : functionTable)
+                        for (const FunctionSymbol& s : entry.second)
+                            if (s.UniqueName == request->second.linkage) shown = s;
+            const FunctionSymbol& c = shown;
             std::string paramList;
             for (size_t i = 0; i < c.Parameters.size(); i++)
             {
@@ -4823,6 +4886,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     && (p.VariableName.ends_with("__") || (c.IsCxx && p.VariableName == "this")))
                     continue;   // the implicit 'this'
                 std::string spelled = SpellType(*this, p);
+                const bool defaulted = wrapperShape && i < c.DefaultArguments.size()
+                    && !c.DefaultArguments[i].kind.empty();
                 // A free C++ function's reference parameter keeps its declared spelling.
                 if (c.IsCxx && !c.IsMethod && (p.IsAlias || p.IsRvalueRef))
                     if (std::string declared = CxxReferenceParameterSpelling(c, i); !declared.empty())
@@ -4833,6 +4898,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 if (c.IsCxx && p.Pointer && !p.IsAlias && !p.IsRvalueRef && !spelled.starts_with("const ")
                     && CxxReferenceParameterSpelling(c, i).starts_with("const "))
                     spelled = "const " + spelled;
+                // Last, so the marker follows the reference and every other spelling adjustment.
+                if (defaulted) spelled += " = ...";
                 paramList += (paramList.empty() ? "" : ", ") + spelled;
             }
             if (c.Variadic)
@@ -5136,6 +5203,33 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                         shownReceiver, bareMemberName, shownReceiver, bound));
                 return nullptr;
             }
+            // A lone arity-fitting candidate refused by the pointee rule names the conversion and its
+            // cast instead of "no overload"; other-arity overloads (core helpers) do not count.
+            const FunctionSymbol* loneByArity = nullptr;
+            size_t arityMatches = 0;
+            for (const auto& c : candidates)
+            {
+                const bool fits = c.Variadic ? arguments.size() >= c.Parameters.size()
+                                             : c.Parameters.size() == arguments.size();
+                if (fits) { loneByArity = &c; ++arityMatches; }
+            }
+            if (arityMatches == 1)
+            {
+                for (size_t i = 0; i < arguments.size(); ++i)
+                {
+                    TypeAndValue from;
+                    TypeAndValue to;
+                    if (UnrelatedPointeePair(arguments[i], *loneByArity, i, from, to)
+                        && !from.IsSimd && !to.IsSimd)
+                    {
+                        // The overload failure keeps its name; the cast hint rides on it.
+                        LogError(std::format("no overload of '{}' matches the given arguments.\n  {}",
+                                             shownFunctionName,
+                                             ImplicitIntegerPointeeConversionText(from, to)));
+                        return nullptr;
+                    }
+                }
+            }
             for (const auto& c : candidates)
             {
                 if (c.IsCxx || c.Parameters.size() != arguments.size()) continue;
@@ -5290,6 +5384,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 LogErrorMessage("no overload of '{}' matches function type '{}'",
                     { fnPtrMismatchName, fnPtrMismatchType });
 
+            // A C++ member of a private/protected base reached through the receiver: name the base.
+            if (!receiverType.empty() && IsCxxRecord(receiverType)
+                && ReportCxxMemberThroughNonPublicBase(receiverType, bareMemberName))
+                return nullptr;
             std::string msg = std::format("no overload of '{}' matches the given arguments.\n", shownFunctionName);
 
             // Recover a named-argument diagnostic only from candidates whose parameter names

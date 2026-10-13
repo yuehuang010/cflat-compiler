@@ -221,6 +221,28 @@ static constexpr std::array<std::pair<std::string_view, std::string_view>, 10> k
 
 // The CFlat spelling of a machine type, for an operand that reaches operator lookup as a bare
 // llvm::Value (a literal or a temporary). Empty when the type is not a plain scalar.
+// Expression text that is one string literal, through transparent parentheses: `"A"`, `("A")`.
+static bool IsStringLiteralText(std::string_view text)
+{
+        while (text.size() >= 2 && text.front() == '(' && text.back() == ')')
+        {
+            int depth = 0;
+            bool inString = false;
+            bool wraps = true;
+            for (size_t i = 0; i + 1 < text.size(); ++i)
+            {
+                const char c = text[i];
+                if (inString) { if (c == '\\') ++i; else if (c == '"') inString = false; continue; }
+                if (c == '"') inString = true;
+                else if (c == '(') ++depth;
+                else if (c == ')' && --depth == 0) { wraps = false; break; }
+            }
+            if (!wraps) break;
+            text = text.substr(1, text.size() - 2);
+        }
+        return text.size() >= 2 && text.front() == '"' && text.back() == '"';
+}
+
 static std::string ScalarTypeNameForValue(llvm::Type* type)
 {
     if (type == nullptr) return std::string();
@@ -272,6 +294,38 @@ static bool IsBinaryExpressionRuleWithOperator(antlr4::tree::ParseTree* node)
     if (auto* p = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(node))
         return p->logicalAndExpression().size() > 1;
     return false;
+}
+
+// True when a `?:` arm is an imported macro constant, or a `?:` joining one, through any
+// parentheses. Each leaf is resolved by symbol (IsCxxMacroGlobalName), so a local of the same
+// name is no macro and nested joins compose from the arms, not from the text.
+static bool IsCxxMacroPrvalueArm(LLVMBackend* compiler, antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return false;
+    if (auto* cond = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node);
+        cond != nullptr && cond->Question() != nullptr)
+    {
+        return IsCxxMacroPrvalueArm(compiler, cond->expression())
+            || IsCxxMacroPrvalueArm(compiler, cond->conditionalExpression());
+    }
+    auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+    if (rule == nullptr) return false;
+    if (rule->children.size() == 3 && rule->children[0]->getText() == "("
+        && rule->children[2]->getText() == ")")
+        return IsCxxMacroPrvalueArm(compiler, rule->children[1]);
+    if (rule->children.size() != 1) return false;
+    antlr4::tree::ParseTree* child = rule->children[0];
+    if (dynamic_cast<antlr4::tree::TerminalNode*>(child) != nullptr)
+    {
+        const std::string text = child->getText();
+        if (text.empty() || std::isdigit(static_cast<unsigned char>(text.front()))) return false;
+        for (char c : text)
+        {
+            if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_')) return false;
+        }
+        return compiler->IsCxxMacroGlobalName(text);
+    }
+    return IsCxxMacroPrvalueArm(compiler, child);
 }
 
 static bool TernaryIsBinaryOperand(CFlatParser::ConditionalExpressionContext* ctx)
@@ -521,8 +575,7 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                                                         // takes the fallback below with ResultUse::Value.
                                                         auto passthrough = ParseCastExpression(muls[0], false, use);
                                                         const std::string text = ctx->getText();
-                                                        passthrough.IsStringLiteral = text.size() >= 2
-                                                            && text.front() == '"' && text.back() == '"';
+                                                        passthrough.IsStringLiteral = IsStringLiteralText(text);
                                                         passthrough.CxxParamLastUse = IsLastUseOfForeignCxxParam(
                                                             compilerLLVM, ctx, passthrough);
                                                         return FinishAssignmentExpressionNamed(passthrough, savedOwned);
@@ -563,6 +616,11 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                 result.TypeAndValue.IsAlias = tv.isAlias;
                 result.IsRvalue = tv.isRvalue;
                 result.IsPointerArithmeticResult = tv.isPointerArithmeticResult;
+                // An arm that is a macro constant is a prvalue, so the `?:` joins to a prvalue
+                // ([expr.cond]) whatever the other arm is and whatever the storage holds.
+                result.IsCxxMacroJoin = condCtx->Question() != nullptr
+                    && (IsCxxMacroPrvalueArm(compilerLLVM, condCtx->expression())
+                        || IsCxxMacroPrvalueArm(compilerLLVM, condCtx->conditionalExpression()));
                 // An arithmetic result's C++ type for wrapper deduction; native typing keeps the
                 // width-based TypeName assigned below (e.g. i64). `?:` is not carried here.
                 if (condCtx->Question() == nullptr && condCtx->QuestionQuestion() == nullptr)
@@ -720,8 +778,7 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                     result.TypeAndValue.TypeName = LLVMTypeToTypeName(result.Primary->getType());
             }
             const std::string text = ctx->getText();
-            result.IsStringLiteral = text.size() >= 2
-                && text.front() == '"' && text.back() == '"';
+            result.IsStringLiteral = IsStringLiteralText(text);
             if (text == "nullptr" && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(result.Primary))
                 result.TypeAndValue.IsCxxNullptrT = true;
             result.TernaryTempAlreadyRegistered = inCallArgument_
@@ -2122,6 +2179,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 FlexibleArrayKeepScope keep(flexibleArrayKeep_, DirectOperandPostfixes(unaryCtx));
                 return ParseUnaryExpression(unaryCtx);
             }();
+            if (namedVar.IsCxxMacroGlobal || namedVar.IsCxxMacroJoin)
+                LogErrorContext(unaryCtx, std::format(
+                    "cannot assign to macro constant '{}'", unaryCtx->getText()));
             auto destination = namedVar.Storage;
             if (!namedVar.TypeAndValue.IsCxxMutableField)   // a mutable member is writable
                 RefuseCxxConstReferentWrite(unaryCtx, destination, "assign to");
@@ -2378,8 +2438,21 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             };
             const auto* assignmentClassInfo =
                 compiler->GetCxxClassInfo(namedVar.TypeAndValue.TypeName);
+            const bool convertingCtorCandidate = assignmentClassInfo != nullptr
+                && std::any_of(assignmentClassInfo->constructors.begin(),
+                    assignmentClassInfo->constructors.end(), [](const auto& ctor) {
+                        return ctor.params.size() > 1 && !ctor.isCopyCtor && !ctor.isMoveCtor;
+                    });
+            const bool hasUserDeclaredAssignment = assignmentClassInfo != nullptr
+                && std::any_of(assignmentClassInfo->directMethods.begin(),
+                    assignmentClassInfo->directMethods.end(), [](const auto& method) {
+                        return method.raw.name == "operator=" && !method.raw.isImplicit;
+                    });
             const bool templateCtorCandidate = operatorText == "=" && assignCtx != nullptr
-                && assignmentClassInfo != nullptr && assignmentClassInfo->hasCtorTemplate;
+                && assignmentClassInfo != nullptr
+                && (assignmentClassInfo->hasCtorTemplate
+                    || (convertingCtorCandidate && !hasUserDeclaredAssignment
+                        && !assignmentClassInfo->hasAssignTemplate));
             if (operatorText == "=" && destination != nullptr
                 && !namedVar.TypeAndValue.Pointer
                 && (compiler->IsForeignNontrivialCxxClass(namedVar.TypeAndValue.TypeName)
@@ -13047,6 +13120,12 @@ bool MainListener::ReportMissingUnaryStructOperator(antlr4::ParserRuleContext* c
         std::string shown = typeName.empty() ? std::string() : SpellType(*Compiler(ctx),
             LLVMBackend::TypeAndValue{ .TypeName = typeName });
         if (shown.empty()) shown = typeName;
+        if (std::string note = Compiler(ctx)->CxxMemberThroughNonPublicBaseNote(typeName, "operator" + op);
+            !note.empty())
+        {
+            LogErrorContext(ctx, std::format("no operator '{}' for type '{}': {}", op, shown, note));
+            return true;
+        }
         LogErrorContext(ctx, std::format("no operator '{}' for type '{}'", op, shown));
         return true;
     }
@@ -14149,6 +14228,12 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 std::string shown = SpellType(*compiler,
                     LLVMBackend::TypeAndValue{ .TypeName = typeName });
                 if (shown.empty()) shown = typeName;
+                if (std::string note = compiler->CxxMemberThroughNonPublicBaseNote(typeName, "operator" + op);
+                    !note.empty())
+                {
+                    LogErrorContext(ctx, std::format("no operator '{}' for type '{}': {}", op, shown, note));
+                    return nullptr;
+                }
                 LogErrorContext(ctx, std::format("no operator '{}' for type '{}'", op, shown));
             }
             return nullptr;
@@ -16262,6 +16347,11 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
 
             if (opText == "&")
             {
+                if (namedVar.IsCxxMacroGlobal || namedVar.IsCxxMacroJoin)
+                {
+                    LogErrorContext(ctx, std::format(
+                        "cannot take the address of macro constant '{}'", castExpCtx->getText()));
+                }
                 if (namedVar.BitfieldStorage)
                 {
                     LogErrorContext(ctx, std::format(
@@ -16388,6 +16478,21 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
             }
             else if (opText == "*")
             {
+                // Array-to-pointer decay: `*arr` on a fixed array T[N] reads its first element
+                // (clang). The slot holds the array's address, which is the element pointer.
+                const auto& arrayTv = namedVar.TypeAndValue;
+                if (arrayTv.ConstArraySize > 0 && !arrayTv.Pointer && !arrayTv.ElemPointer
+                    && !arrayTv.IsArrayView && !arrayTv.IsSimd && arrayTv.ConstInnerDimensions.empty()
+                    && !arrayTv.IsInterface && !arrayTv.IsFunctionPointer
+                    && namedVar.Storage != nullptr && namedVar.Storage->getType()->isPointerTy())
+                {
+                    auto* decayedSlot = compiler->CreateAlloca(compiler->builder->getPtrTy());
+                    compiler->builder->CreateStore(namedVar.Storage, decayedSlot);
+                    namedVar.TypeAndValue.ConstArraySize = 0;
+                    namedVar.TypeAndValue.Pointer = true;
+                    namedVar.Storage = decayedSlot;
+                    namedVar.Primary = nullptr;
+                }
                 if (!namedVar.TypeAndValue.Pointer
                     && !compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName))
                 {
@@ -16513,10 +16618,15 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
 
                 // A C++ class value (e.g. a class-reference member) has pointer storage, so `*r` would load
                 // its first field; judge records only (template-substituted pointers lack the Pointer bit).
+                // A plain CFlat struct VALUE is judged too: its storage holds the struct itself, so
+                // `*s` would load a field as a pointer. Fixed arrays already decayed above.
                 const auto& derefTv = namedVar.TypeAndValue;
+                const bool plainStructValue = compiler->dataStructures.count(derefTv.TypeName) != 0
+                    && derefTv.ConstArraySize == 0 && !derefTv.IsInterface
+                    && !derefTv.IsInterfacePointer && !derefTv.IsSimd;
                 if (!derefTv.Pointer && !derefTv.ElemPointer && !derefTv.IsFunctionPointer
                     && !derefTv.IsArrayView && derefTv.PointerDepth < 1
-                    && compiler->IsCxxRecord(derefTv.TypeName))
+                    && (compiler->IsCxxRecord(derefTv.TypeName) || plainStructValue))
                     LogErrorContext(ctx, std::format(
                         "indirection requires a pointer operand ('{}' invalid)",
                         SpellType(*compiler, namedVar.TypeAndValue)));
@@ -18750,7 +18860,8 @@ void MainListener::EmitBraceElementIntoFixedSlot(
 llvm::Value* MainListener::ParseFieldDefaultBraceInitializer(
         const std::string& structName,
         const LLVMBackend::DeclTypeAndValue& field,
-        CFlatParser::InitializerListContext* list) {
+        CFlatParser::InitializerListContext* list,
+        llvm::Value* inPlaceDest) {
         auto* compiler = Compiler(list);
         const std::string displayStructName = SpellType(*compiler,
             LLVMBackend::TypeAndValue{ .TypeName = structName });
@@ -18804,18 +18915,30 @@ llvm::Value* MainListener::ParseFieldDefaultBraceInitializer(
                 field.IsUnique);
         if (fieldType == nullptr) return nullptr;
 
-        llvm::Value* slot = compiler->CreateAlloca(fieldType);
-        llvm::Value* seed = nullptr;
-        // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk here
-        // would call a same-named sibling type's constructor.
-        if (compiler->GetFunction(field.TypeName))
-            seed = compiler->CreateOverloadedFunctionCall(field.TypeName, {}, true);
-        if (seed == nullptr || seed->getType() != fieldType)
-            seed = llvm::Constant::getNullValue(fieldType);
-        compiler->builder->CreateStore(seed, slot);
+        // An armed sret slot: the seed constructor builds straight into it, so the list edits the
+        // field in place. A separate temp here would be dropped by the caller (initializedInPlace).
+        const bool seedInPlace = inPlaceDest != nullptr
+            && compiler->pendingCxxSretDest_ == inPlaceDest
+            && compiler->GetFunction(field.TypeName) != nullptr;
+        llvm::Value* slot = seedInPlace ? inPlaceDest : compiler->CreateAlloca(fieldType);
+        if (seedInPlace)
+            compiler->CreateOverloadedFunctionCall(field.TypeName, {}, true);
+        else
+        {
+            llvm::Value* seed = nullptr;
+            // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk here
+            // would call a same-named sibling type's constructor.
+            if (compiler->GetFunction(field.TypeName))
+                seed = compiler->CreateOverloadedFunctionCall(field.TypeName, {}, true);
+            if (seed == nullptr || seed->getType() != fieldType)
+                seed = llvm::Constant::getNullValue(fieldType);
+            compiler->builder->CreateStore(seed, slot);
+        }
 
         if (!TryEmitContainerInitializer(slot, field, list))
             EmitFieldInitializer(slot, field.TypeName, list);
+        if (seedInPlace)
+            return nullptr;
         return compiler->builder->CreateLoad(
             fieldType, slot, structName + "_" + field.VariableName + "_braceinit");
     }

@@ -228,35 +228,35 @@ LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNu
             // strtod/strtof, NOT stod/stof: the latter throw out_of_range whenever errno is
             // ERANGE, and strtod sets ERANGE on a legal UNDERFLOW to a subnormal even though
             // it returns the correctly-rounded subnormal. Caught by the old blanket handler,
-            // that silently turned a subnormal literal like 1e-320 into 0.0. Only a genuine
-            // overflow (+-inf) is an error here.
+            // that silently turned a subnormal literal like 1e-320 into 0.0. An overflow is +-inf.
             const char* cstr = numberPart.c_str();
             char* end = nullptr;
 
-            // Hex floats keep an overflow as inf (clang: 0x1p2000 is double inf, 0x1p200f is float inf);
-            // a decimal overflow stays 0 as before.
+            // An overflow is +-inf in the suffix type, as clang's IEEE rounding gives (1e400 is double
+            // inf, 1e400f float inf, 0x1p2000 likewise); only a failed parse is 0.
             if (hasF)
             {
                 float f = std::strtof(cstr, &end);   // explicit 'f' suffix -> float
-                if (end == cstr || (!hexFloat && std::isinf(f))) return 0.0;
+                if (end == cstr) return 0.0;
                 return f;
             }
 
             double dval = std::strtod(cstr, &end);
-            if (end == cstr || (!hexFloat && std::isinf(dval))) return 0.0;
+            if (end == cstr) return 0.0;
             if (hasD)
                 return dval;                         // explicit 'd' suffix -> double
-            // Hex float (C: 0x1p-2 is double): unsuffixed -> double. l/L takes the decimal rule below
-            // (CFlat has no long double literal; decimal 0.25l is f32 too).
-            if (hexFloat && lCount == 0)
+            // l/L is long double (clang: 0.25l, 0x1p-2l), which lowers as double; the literal's
+            // longdouble identity is its TypeName (ParseLiteralTypeAndValue). Unsuffixed hex -> double.
+            if (lCount > 0 || hexFloat)
                 return dval;
 
             // No suffix: mirror the integer rule (pick the smallest type that holds the
             // value exactly). Use float if the literal round-trips through float without
             // loss of precision; otherwise fall back to double. So 1.5 -> f32, but a
             // literal like 3.141592653589793 that loses precision in float stays f64.
+            // An overflowed value (inf) stays double, as clang types 1e400 as double.
             float fval = static_cast<float>(dval);
-            if (static_cast<double>(fval) == dval)
+            if (std::isfinite(dval) && static_cast<double>(fval) == dval)
                 return fval;
             return dval;
         }
@@ -430,6 +430,9 @@ LLVMBackend::TypeAndValue MainListener::ParseLiteralTypeAndValue(const std::stri
         const std::string ladderType = LLVMBackend::LiteralIdentityForOverload(rawNumber, &suffixedInteger);
         const bool unsignedRow = ladderType == "u32" || ladderType == "ulong" || ladderType == "u64";
         if (!ladderType.empty() && ladderType != "int" && (suffixedInteger || unsignedRow))
+            type.TypeName = ladderType;
+        // An l/L floating literal is long double (its value lowers as double).
+        if (ladderType == "longdouble")
             type.TypeName = ladderType;
         return type;
     }

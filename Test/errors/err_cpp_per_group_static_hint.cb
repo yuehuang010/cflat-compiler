@@ -1,0 +1,15 @@
+// The ambiguity refusal names the remedy that works: one shared declaration reached through two
+// imports gets the grouped spelling; distinct definitions must be renamed or one removed.
+import cpp {"cpp_group_shared.hpp", "cpp_inline_static_a.hpp"};
+import cpp "cpp_inline_static_b.hpp";
+
+extern int main()
+{
+    expect_error("Rename one of the conflicting declarations or remove one so a single 'cpp_group_k' remains;") {
+        int k = cpp_group_k;
+    }
+    expect_error("Import them in one group so the variable has one copy: import cpp {\"cpp_group_shared.hpp\", \"cpp_inline_static_b.hpp\"};") {
+        int* p = cpp_group_shared_ptr;
+    }
+    return 0;
+}

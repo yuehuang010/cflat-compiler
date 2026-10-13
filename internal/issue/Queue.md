@@ -61,9 +61,9 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 | Run | Branch | Issue(s) | Notes |
 |-----|--------|----------|-------|
-| T89 | fix/t89-charstage2 | p2/integer-pointee-pointer-conversion-accepted (Q3 stage 2) | Haiku r2 (rebased on T85) |
-| T95 | fix/t95-opunary | OPUNARY (deref-after-t47 + xvalue deref; d7 item 10 optional) | Haiku r1 |
-| T96 | fix/t96-literal | LITERAL | Haiku r1 |
+| T101 | fix/t101-topstmt | TOPSTMT (p2 header namespace expression-statement crash + p3 global statement) | Luna r1, Opus reviewer |
+| T104 | fix/t104-refparam | REFPARAM (3 p3) | Luna r1 21:21-, Opus reviewer |
+| T103 | fix/t103-nullctor | NULLCTOR (1 p2 + 3 p3) | Luna r1 self-stopped (2 REG); retry 21:40- |
 
 
 ## A - crashes, asserts, link failures
@@ -76,6 +76,10 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 | Run | Issue(s) | Site | Notes |
 |-----|----------|------|-------|
+| - | p3/cpp-using-declaration-member-access-gaps | C++ record flattening + member lookup | `using` re-exposure through a base, two same-named base fields, shadow + using, method using, virtual base: refused, clang accepts; T99 reviews 2-4, pre-existing |
+| - | p3/cpp-macro-constant-leftovers-after-t98 | macro identity + brace fold | global/function name collisions, anonymous/inline-namespace enums, comma, `auto&&`, deref macros, C errno/INT_MAX; T98 reviews 1-2, pre-existing |
+| - | p3/long-double-identity-lost-in-generic-deduction-and-ternary | generic T deduction + ternary result type | `pick<T>(ld + 1.0f)` and `p(c ? 0.25l : 1.0f)` pick double (clang long double); T100 review 1, pre-existing |
+| - | p3/local-array-ternary-dimension-sizeof-wrong | local declarator constant dimension | `int[(2.0 > 1.0) ? 2 : 1] a` local: sizeof 4 (clang 8); global is right (T96 review 1, pre-existing) |
 | - | p3/cpp-class-xvalue-pointer-conversion-not-invoked | same-class C* door | conversion operator accepted but not called (clang 73, CFlat 31); template C*/void* ambiguity accepted; T70 reviews 3-4, pre-existing |
 | - | p3/cpp-ctor-template-overload-and-copyinit-gaps | C++ ctor-template ranking | unnamed-enum source picks int ctor; non-const trivially-copyable lvalue copy-init skips U&& template (T54 review, pre-existing) |
 | - | p3/cpp-ternary-arith-type-at-ctor-and-assign-operator | ternary typing at C++ ctor arg / operator=(T) | rv.C(k ? 5 : 6) and operator=(T) deduce signed char, clang int (T55 review, pre-existing; AFTER T55) |
@@ -157,6 +161,7 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 | Run | Issue | Notes |
 |-----|-------|-------|
+| - | p2/cpp-class-returning-brace-element-extra-destructor | owned-temp ledger at ParseFieldDefaultBraceInitializer | brace element `d = mk()` (C++ class by value): 2 ctors / 3 dtors, clang 1/1 - double destroy (T97 review 1, pre-existing) |
 | E3 | p3/cpp-unwind-cleanup-gaps-ctor-new-temporaries | follow-up list after d59df39b / cpp-unwind2 |
 | E4 | p3/cpp-new-remaining-allocator-gaps | follow-up list after cpp-class-operator-new (5 items) |
 

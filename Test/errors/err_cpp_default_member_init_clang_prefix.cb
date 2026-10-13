@@ -1,0 +1,21 @@
+// The raw clang text of a default member initializer that fails to instantiate keeps the
+// "clang: " prefix, like every other relayed clang diagnostic.
+import cpp "cpp_dm_body_fail.h";
+
+int ov(cppi_dmf.Q<int> q, char* s) { return 100; }
+int ov(long x, int y) { return 1; }
+
+extern int main()
+{
+    // An overload probe demands the failed Q<int> constructor body first; the later default
+    // member initializer must still relay clang's text with exactly one prefix.
+    expect_error("clang: type 'int' cannot be used prior to '::' because it has no members") {
+        int i = 3;
+        int o = ov(i, 2);
+        int r = cppi_dmf.DM<int>().q.v;
+    }
+    expect_error("clang: type 'int' cannot be used prior to '::' because it has no members") {
+        int r = cppi_dmf.DM<int>().q.v;
+    }
+    return 0;
+}

@@ -1,0 +1,16 @@
+// T98: a macro constant is not assignable, by `=`, `+=` or `++`.
+import cpp "cpp_t98_macro_constant.hpp";
+
+extern int main()
+{
+    expect_error("cannot assign to macro constant 'T98_N5'") {
+        T98_N5 = 6;
+    }
+    expect_error("cannot assign to macro constant 'T98_N5'") {
+        T98_N5 += 1;
+    }
+    expect_error("cannot increment macro constant 'T98_N5'") {
+        T98_N5++;
+    }
+    return 0;
+}

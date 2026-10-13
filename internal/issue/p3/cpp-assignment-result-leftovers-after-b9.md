@@ -14,3 +14,8 @@ From the B18 review (2026-09-29; scratch/repro_keep/b18rv/). B18 routes a parent
 - A bare nested mixed ternary, `N b = f ? (g ? xa : mk(2)) : xb;`, is refused. The parenthesized form works, with one extra copy for `(f ? xa : (g ? xb : mk(2)))`.
 
 (The paren-ternary P2 landed in 1955bd95, B18.)
+
+
+## T102 status (2026-10-10)
+
+Open. Parenthesized ternary/call result and assignment count cases were not changed. The focused converting-constructor assignment was attempted under cpp-assign-operator-route-leftovers.md, but the full interop test exited 140; that item remains open.

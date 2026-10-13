@@ -1,0 +1,17 @@
+// T98: a macro constant is a prvalue, so a non-const `int&` parameter refuses it (clang: no match).
+import cpp "cpp_t98_macro_constant.hpp";
+
+extern int main()
+{
+    expect_error("cannot bind") {
+        int r = cpi_t98.iref(T98_N5);
+    }
+    bool c = true;
+    expect_error("cannot bind") {
+        int r = cpi_t98.iref(c ? T98_N5 : 7);
+    }
+    expect_error("cannot bind") {
+        int r = cpi_t98.iref(c ? T98_N5 : T98_N5);
+    }
+    return 0;
+}

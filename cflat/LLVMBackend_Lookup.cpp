@@ -718,12 +718,25 @@ bool LLVMBackend::IsCxxRvalueRefClassResult(const NamedVariable& nv) const
         return IsCxxRecord(t.TypeName);
 }
 
+bool LLVMBackend::IsCxxMacroGlobalName(const std::string& name)
+{
+        // Identity, not spelling: a local of the same name shadows the macro and is no macro.
+        if (FindVariableStorage(name).Storage != nullptr) return false;
+        // An implicit-this field resolves before globals, so it shadows the macro too.
+        if (HasMemberVariable(name)) return false;
+        auto it = globalNamedVariable.find(name);
+        return it != globalNamedVariable.end() && it->second != nullptr
+            && cxxMacroGlobalNames_.count(it->second->getName().str()) != 0;
+}
+
 bool LLVMBackend::IsCxxRvalueReferenceArgument(const NamedVariable& arg) const
 {
         // Rvalue-ness must be PROVEN. Without argument provenance nothing is proven, and an
         // argument that has addressable storage or came back as a reference is an lvalue.
         // An imported integer-zero macro expands to an integer literal prvalue in C++.
         if (IsNullPointerConstantArgument(arg, true)) return true;
+        // Every imported macro constant, and a `?:` joining two of them, is a C++ prvalue.
+        if (arg.IsCxxMacroGlobal || arg.IsCxxMacroJoin) return true;
         if (arg.IsExplicitMove) return true;
         if (arg.IsRvalue && arg.TypeAndValue.Pointer) return true;
         if (arg.IsRvalue && IsConsumableTemporary(arg)) return true;
@@ -759,6 +772,7 @@ bool LLVMBackend::IsProvenCxxScalarLvalue(const NamedVariable& arg) const
         if (arg.CxxLvalueKind == 0 || arg.CxxLvalueKind == 3 || arg.IsExplicitMove) return false;
         // An imported integer-zero macro is a literal prvalue, as IsCxxRvalueReferenceArgument says.
         if (IsNullPointerConstantArgument(arg, true)) return false;
+        if (arg.IsCxxMacroGlobal || arg.IsCxxMacroJoin) return false;
         if (IsRvalueReferenceArgument(arg)) return false;
         // A function<> value crosses into C++ as a function pointer VALUE: the callee gets a
         // copy of the code address, and the extractor has no mapping for `R (*&)(A)`.

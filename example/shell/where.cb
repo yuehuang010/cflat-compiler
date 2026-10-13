@@ -14,7 +14,7 @@ extern stdcall i32 GetEnvironmentVariableA(const char* name, char* buf, i32 size
 // file in with `import program`, which shares one overload table with the host program.
 string whereMakeString(i8* buf, int len)
 {
-    i8* nb = new i8[len + 1];
+    char* nb = new char[len + 1];
     int i = 0;
     while (i < len) { nb[i] = buf[i]; i++; }
     nb[len] = 0;
@@ -34,7 +34,7 @@ extern int main(int argc, char** argv)
     list<string> dirs;
     dirs.add(Directory.getCurrent());
     i8* pbuf = new i8[32768];
-    i32 plen = GetEnvironmentVariableA("PATH", pbuf, 32768);
+    i32 plen = GetEnvironmentVariableA("PATH", (char*)pbuf, 32768);
     if (plen > 0 && plen < 32768)
     {
         string pathVar = whereMakeString(pbuf, (int)plen);

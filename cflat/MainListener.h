@@ -6774,10 +6774,13 @@ public:
     CFlatParser::InitializerListContext* FieldDefaultBraceList(
         const LLVMBackend::DeclTypeAndValue& field);
 
+    // inPlaceDest: the field slot an armed C++ sret builds into; the seed consumes it and the list
+    // edits it, so a null return means the value is already in place.
     llvm::Value* ParseFieldDefaultBraceInitializer(
         const std::string& structName,
         const LLVMBackend::DeclTypeAndValue& field,
-        CFlatParser::InitializerListContext* list);
+        CFlatParser::InitializerListContext* list,
+        llvm::Value* inPlaceDest = nullptr);
 
     // Build field initialization for a native constructor without a user ctor body. Only the
     // first `fieldCount` fields are initialized (a program's synthetic fields follow its own).

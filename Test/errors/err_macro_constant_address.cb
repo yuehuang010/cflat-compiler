@@ -1,0 +1,9 @@
+// T98: a macro constant has no address; `&M` is refused (clang: cannot take an rvalue's address).
+import cpp "cpp_t98_macro_constant.hpp";
+
+extern int main()
+{
+    expect_error("cannot take the address of macro constant 'T98_N5'");
+    int* p = &T98_N5;
+    return p == nullptr ? 1 : 0;
+}

@@ -7,8 +7,8 @@ extern int main()
 
     // ── 1. GET with two headers ───────────────────────────────────────────────
 
-    i8* raw1 = "GET /api/users HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n";
-    HttpRequest* req1 = parseHttpRequest(raw1, strlen(raw1));
+    char* raw1 = "GET /api/users HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n";
+    HttpRequest* req1 = parseHttpRequest((i8*)raw1, strlen(raw1));
 
     if (!req1->valid)                       { printf("FAIL 1: GET not valid\n");    ok = false; }
     if (req1->method  != "GET")             { printf("FAIL 1: method\n");           ok = false; }
@@ -26,8 +26,8 @@ extern int main()
 
     // ── 2. POST with body ─────────────────────────────────────────────────────
 
-    i8* raw2 = "POST /submit HTTP/1.1\r\nContent-Length: 6\r\nContent-Type: text/plain\r\n\r\nhello!";
-    HttpRequest* req2 = parseHttpRequest(raw2, strlen(raw2));
+    char* raw2 = "POST /submit HTTP/1.1\r\nContent-Length: 6\r\nContent-Type: text/plain\r\n\r\nhello!";
+    HttpRequest* req2 = parseHttpRequest((i8*)raw2, strlen(raw2));
 
     if (!req2->valid)                    { printf("FAIL 2: POST not valid\n");  ok = false; }
     if (req2->method != "POST")          { printf("FAIL 2: method\n");          ok = false; }
@@ -40,22 +40,22 @@ extern int main()
 
     // ── 3. Empty input -> valid=false ─────────────────────────────────────────
 
-    i8* raw3 = "";
-    HttpRequest* req3 = parseHttpRequest(raw3, 0);
+    char* raw3 = "";
+    HttpRequest* req3 = parseHttpRequest((i8*)raw3, 0);
     if (req3->valid) { printf("FAIL 3: empty input should be invalid\n"); ok = false; }
     delete req3;
 
     // ── 4. No CRLF -> valid=false ─────────────────────────────────────────────
 
-    i8* raw4 = "GET / HTTP/1.1";
-    HttpRequest* req4 = parseHttpRequest(raw4, strlen(raw4));
+    char* raw4 = "GET / HTTP/1.1";
+    HttpRequest* req4 = parseHttpRequest((i8*)raw4, strlen(raw4));
     if (req4->valid) { printf("FAIL 4: no CRLF should be invalid\n"); ok = false; }
     delete req4;
 
     // ── 5. No headers, blank line only ───────────────────────────────────────
 
-    i8* raw5 = "GET / HTTP/1.0\r\n\r\n";
-    HttpRequest* req5 = parseHttpRequest(raw5, strlen(raw5));
+    char* raw5 = "GET / HTTP/1.0\r\n\r\n";
+    HttpRequest* req5 = parseHttpRequest((i8*)raw5, strlen(raw5));
 
     if (!req5->valid)                  { printf("FAIL 5: no-header not valid\n"); ok = false; }
     if (req5->method  != "GET")        { printf("FAIL 5: method\n");              ok = false; }
@@ -68,8 +68,8 @@ extern int main()
 
     // ── 6. Header value with leading and trailing whitespace ─────────────────
 
-    i8* raw6 = "GET / HTTP/1.1\r\nX-Pad:   hello   \r\n\r\n";
-    HttpRequest* req6 = parseHttpRequest(raw6, strlen(raw6));
+    char* raw6 = "GET / HTTP/1.1\r\nX-Pad:   hello   \r\n\r\n";
+    HttpRequest* req6 = parseHttpRequest((i8*)raw6, strlen(raw6));
 
     if (!req6->valid) { printf("FAIL 6: not valid\n"); ok = false; }
     if (req6->getHeader("X-Pad") != "hello")
@@ -79,8 +79,8 @@ extern int main()
 
     // ── 7. Header value containing a colon ───────────────────────────────────
 
-    i8* raw7 = "GET / HTTP/1.1\r\nAuthorization: Bearer tok:en\r\n\r\n";
-    HttpRequest* req7 = parseHttpRequest(raw7, strlen(raw7));
+    char* raw7 = "GET / HTTP/1.1\r\nAuthorization: Bearer tok:en\r\n\r\n";
+    HttpRequest* req7 = parseHttpRequest((i8*)raw7, strlen(raw7));
 
     if (!req7->valid) { printf("FAIL 7: not valid\n"); ok = false; }
     if (req7->getHeader("Authorization") != "Bearer tok:en")
@@ -90,8 +90,8 @@ extern int main()
 
     // ── 8. DELETE method and query-string path ────────────────────────────────
 
-    i8* raw8 = "DELETE /res/42?cascade=true HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
-    HttpRequest* req8 = parseHttpRequest(raw8, strlen(raw8));
+    char* raw8 = "DELETE /res/42?cascade=true HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+    HttpRequest* req8 = parseHttpRequest((i8*)raw8, strlen(raw8));
 
     if (!req8->valid)                         { printf("FAIL 8: not valid\n");   ok = false; }
     if (req8->method != "DELETE")             { printf("FAIL 8: method\n");      ok = false; }
@@ -103,8 +103,8 @@ extern int main()
 
     // ── 9. getHeader miss -> "" / not present; missing Content-Length -> 0 ────
 
-    i8* raw9 = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
-    HttpRequest* req9 = parseHttpRequest(raw9, strlen(raw9));
+    char* raw9 = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    HttpRequest* req9 = parseHttpRequest((i8*)raw9, strlen(raw9));
 
     if (req9->hasHeader("X-Missing"))
         { printf("FAIL 9: missing header should not be present\n"); ok = false; }
@@ -117,8 +117,8 @@ extern int main()
 
     // ── 10. PUT with body ─────────────────────────────────────────────────────
 
-    i8* raw10 = "PUT /items/1 HTTP/1.1\r\nContent-Length: 4\r\n\r\ndata";
-    HttpRequest* req10 = parseHttpRequest(raw10, strlen(raw10));
+    char* raw10 = "PUT /items/1 HTTP/1.1\r\nContent-Length: 4\r\n\r\ndata";
+    HttpRequest* req10 = parseHttpRequest((i8*)raw10, strlen(raw10));
 
     if (!req10->valid)               { printf("FAIL 10: not valid\n");  ok = false; }
     if (req10->method != "PUT")      { printf("FAIL 10: method\n");     ok = false; }
@@ -129,8 +129,8 @@ extern int main()
 
     // ── 11. Four headers - all parsed and retrievable ─────────────────────────
 
-    i8* raw11 = "GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\nD: 4\r\n\r\n";
-    HttpRequest* req11 = parseHttpRequest(raw11, strlen(raw11));
+    char* raw11 = "GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\nD: 4\r\n\r\n";
+    HttpRequest* req11 = parseHttpRequest((i8*)raw11, strlen(raw11));
 
     if (!req11->valid)              { printf("FAIL 11: not valid\n");   ok = false; }
     if (req11->headerCount() != 4)  { printf("FAIL 11: headerCount\n"); ok = false; }
@@ -143,8 +143,8 @@ extern int main()
 
     // ── 12. Header with empty value ───────────────────────────────────────────
 
-    i8* raw12 = "GET / HTTP/1.1\r\nX-Empty:\r\n\r\n";
-    HttpRequest* req12 = parseHttpRequest(raw12, strlen(raw12));
+    char* raw12 = "GET / HTTP/1.1\r\nX-Empty:\r\n\r\n";
+    HttpRequest* req12 = parseHttpRequest((i8*)raw12, strlen(raw12));
 
     if (!req12->valid) { printf("FAIL 12: not valid\n"); ok = false; }
     if (!req12->hasHeader("X-Empty"))             { printf("FAIL 12: X-Empty should be present\n"); ok = false; }
@@ -276,8 +276,8 @@ extern int main()
 
     // ── 23. Header with colon in value survives round-trip ───────────────────
 
-    i8* raw23 = "GET / HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz\r\n\r\n";
-    HttpRequest* req23 = parseHttpRequest(raw23, strlen(raw23));
+    char* raw23 = "GET / HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz\r\n\r\n";
+    HttpRequest* req23 = parseHttpRequest((i8*)raw23, strlen(raw23));
 
     HttpResponse* r23 = HttpResponse.ok();
     if (req23->hasHeader("Authorization"))
@@ -292,8 +292,8 @@ extern int main()
 
     // ── 24. PATCH method ─────────────────────────────────────────────────────
 
-    i8* raw24 = "PATCH /doc/7 HTTP/1.1\r\nContent-Length: 3\r\n\r\nfoo";
-    HttpRequest* req24 = parseHttpRequest(raw24, strlen(raw24));
+    char* raw24 = "PATCH /doc/7 HTTP/1.1\r\nContent-Length: 3\r\n\r\nfoo";
+    HttpRequest* req24 = parseHttpRequest((i8*)raw24, strlen(raw24));
 
     if (!req24->valid)              { printf("FAIL 24: not valid\n"); ok = false; }
     if (req24->method != "PATCH")   { printf("FAIL 24: method\n");    ok = false; }
@@ -308,9 +308,9 @@ extern int main()
 
     {
         int bigLen = 200000;
-        i8* big = new i8[bigLen + 1];
+        char* big = new char[bigLen + 1];
         int bi = 0;
-        while (bi < bigLen) { big[bi] = (i8)('A' + (bi % 26)); bi++; }
+        while (bi < bigLen) { big[bi] = (char)('A' + (bi % 26)); bi++; }
         big[bigLen] = 0;
         string bigBody = default;
         bigBody._ptr = big;
@@ -339,8 +339,8 @@ extern int main()
     // mis-copy the body; the length-based copy must preserve all bytes.
 
     {
-        i8* raw26 = "POST /p HTTP/1.1\r\nContent-Length: 10\r\n\r\nab\r\n\r\ncdef";
-        HttpRequest* req26 = parseHttpRequest(raw26, strlen(raw26));
+        char* raw26 = "POST /p HTTP/1.1\r\nContent-Length: 10\r\n\r\nab\r\n\r\ncdef";
+        HttpRequest* req26 = parseHttpRequest((i8*)raw26, strlen(raw26));
 
         if (!req26->valid)              { printf("FAIL 26: not valid\n");  ok = false; }
         if (req26->body.length() != 10) { printf("FAIL 26: body length\n"); ok = false; }

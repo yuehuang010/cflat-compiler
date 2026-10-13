@@ -1,0 +1,13 @@
+// T98: a macro that does not fit the element type is a constant narrowing, refused like clang.
+import cpp "cpp_t98_macro_constant.hpp";
+
+extern int main()
+{
+    expect_error("which cannot be narrowed to type 'short'") {
+        cpi_t98.Shorts s{T98_BIG, 2};
+    }
+    expect_error("cannot be narrowed to type 'int'") {
+        cpi_t98.Ints u{T98_UMAX};
+    }
+    return 0;
+}

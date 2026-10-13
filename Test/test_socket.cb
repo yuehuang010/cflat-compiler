@@ -27,7 +27,7 @@ int serverThread(void* arg)
     if (n > 0)
     {
         buf[n] = 0;
-        client->send(buf, n);
+        client->send((char*)buf, n);
     }
     delete buf;
     delete client;
@@ -117,7 +117,7 @@ extern int main()
     int n = c->recv(reply, 255);
     reply[n] = 0;
 
-    bool ok = strcmp(reply, "hello") == 0;
+    bool ok = strcmp((char*)reply, "hello") == 0;
     delete reply;
     delete c;
 

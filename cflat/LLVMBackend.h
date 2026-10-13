@@ -1585,6 +1585,11 @@ public:
         // Imported C++ macro provenance survives constant folding of its global value.
         bool IsCxxMacroGlobal = false;
         bool IsCxxNullIntegerMacro = false;
+        // A `?:` whose two arms are both imported macro constants: a C++ prvalue. Transient.
+        bool IsCxxMacroJoin = false;
+        // Transient: an imported enumerator / integer macro's value as a brace-list literal, set before
+        // the element loses its storage. Empty when the element is not such a constant.
+        std::string CxxImportedLiteral;
         // compile-time: this argument was written 'move x' at a call site and is a VALUE type
         // (string/owning struct/closure). Zeroing is deferred to ApplyMoveParamTransfer so the
         // callee's parameter move-ness is known first. Not part of the --init cache round-trip.
@@ -4044,6 +4049,7 @@ private:
         bool isZeroSize = false;
         bool isConst = false;
         bool isMutable = false;
+        bool inherited = false;    // C++: flattened from a base subobject, not declared by this record
         unsigned bitWidth = 0;
         uint64_t offsetBytes = 0;
         uint64_t sizeBytes = 0;    // clang's size/alignment of the field type (0 for a bitfield)
@@ -6185,6 +6191,8 @@ private:
                                     std::vector<CxxBraceArgument>& braceArguments,
                                     std::string& wrapperName,
                                     std::string& error);
+    // An imported unscoped enumerator or integer macro as a bare integer literal, else empty.
+    std::string CxxImportedConstantLiteral(const NamedVariable& element) const;
     bool RequestCxxDirectBraceConstructor(const std::string& typeName,
                                           const std::vector<NamedVariable>& elements,
                                           const std::string& initializerList,
@@ -7084,9 +7092,15 @@ public:
                                                     const TypeAndValue& to) const;
     void RejectImplicitIntegerPointeePointerConversion(const TypeAndValue& from,
                                                         const TypeAndValue& to);
+    std::string ImplicitIntegerPointeeConversionText(const TypeAndValue& from,
+                                                     const TypeAndValue& to) const;
     // Call matching: the predicate above on the pointers a C++ argument / parameter refer to.
     bool IsUnrelatedPointeeArgument(const NamedVariable& arg, const FunctionSymbol& candidate,
                                     size_t index) const;
+    // The pointer pair behind that test (reference flags stripped, literal pointee spelled char).
+    // Returns the predicate verdict; `from` and `to` feed RejectImplicitIntegerPointeePointerConversion.
+    bool UnrelatedPointeePair(const NamedVariable& arg, const FunctionSymbol& candidate,
+                              size_t index, TypeAndValue& from, TypeAndValue& to) const;
     bool CxxOperatorDropsUnrelatedPointee(const std::string& lookupName, const NamedVariable& arg,
                                           size_t index, const std::string& receiverType) const;
 
@@ -9308,6 +9322,8 @@ public:
      */
     bool ReportCxxMemberThroughNonPublicBase(const std::string& typeName,
                                              const std::string& memberName);
+    std::string CxxMemberThroughNonPublicBaseNote(const std::string& typeName,
+                                                  const std::string& memberName);
     bool RejectInaccessibleCxxMember(const std::string& typeName, const std::string& memberName,
                                      bool accessedThroughCurrentObject = false,
                                      bool deferElementCopySink = false);
@@ -10063,6 +10079,8 @@ public:
     // C++ calls also classify address-less literals and expression results as rvalues. Keep this
     // broader predicate gated to C++ callees so native CFlat overload selection is unchanged.
     bool IsCxxRvalueReferenceArgument(const NamedVariable& arg) const;
+    // True when `name` resolves to an imported C++ macro's backing global (no local shadows it).
+    bool IsCxxMacroGlobalName(const std::string& name);
     // A C++ call result of type `T&&` to a C++ class (std::move, std::forward, any T&& return):
     // the referent's address as an xvalue. Keyed on the result type, never on the callee name.
     bool IsCxxRvalueRefClassResult(const NamedVariable& nv) const;
@@ -11882,7 +11900,7 @@ public:
     // 228: macro entries record whether their expanded body is an integer literal zero (T52).
     // 232: an anonymous UNION typedef sets "ar" like a struct (T94), so a cached entry must not be
     //      replayed with the old flag.
-    static constexpr int kCHeaderCacheVersion = 232;
+    static constexpr int kCHeaderCacheVersion = 235;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

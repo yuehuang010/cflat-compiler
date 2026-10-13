@@ -1,0 +1,17 @@
+// An ambiguous C++ tie reached through default-argument wrappers lists the real declarations,
+// defaulted parameters included, not the shortened wrapper shapes.
+import cpp "cpp_interop_explicit.h";
+import cpp "cpp_ref_default_tie.hpp";
+
+extern int main()
+{
+    cppexp.AmbHost h = cppexp.AmbHost(1000);
+    expect_error("pick(int, double = ..., std.optional<int> = ...), pick(int, std.optional<int> = ...)") {
+        int r = h.pick(4);
+    }
+    // Defaulted reference parameters keep their "= ..." marker after the reference spelling.
+    expect_error("cppi_rdt.pick(int, const int & = ..., std.optional<int> = ...), cppi_rdt.pick(int, const long & = ..., std.optional<int> = ...)") {
+        int q = cppi_rdt.pick(4);
+    }
+    return 0;
+}

@@ -1,0 +1,10 @@
+// T95: `*s` on a plain CFlat struct VALUE is refused (clang: "indirection requires pointer operand").
+struct T95Val { int n = 35; };
+extern int main()
+{
+    expect_error("indirection requires a pointer operand") {
+        T95Val s;
+        int v = (*s).n;
+    }
+    return 0;
+}

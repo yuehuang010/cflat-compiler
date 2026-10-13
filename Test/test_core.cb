@@ -1740,8 +1740,8 @@ struct OwnedRet {
     string b = default;
     ~OwnedRet() {
         g_owned_ret_dtor++;
-        if (a._ptr != nullptr) { i8* p = move a._ptr; delete p; }
-        if (b._ptr != nullptr) { i8* p = move b._ptr; delete p; }
+        if (a._ptr != nullptr) { char* p = move a._ptr; delete p; }
+        if (b._ptr != nullptr) { char* p = move b._ptr; delete p; }
     }
 };
 
@@ -2447,9 +2447,9 @@ int testStringAPI()
     // bytes after the NUL differ. The heap buffers are owned i8* locals - freed at block
     // exit; the strings are non-owning wrappers over them (no double free).
     {
-        i8* nb1 = new i8[4]; nb1[0] = (i8)'a'; nb1[1] = (i8)0; nb1[2] = (i8)'b'; nb1[3] = (i8)0;
-        i8* nb2 = new i8[4]; nb2[0] = (i8)'a'; nb2[1] = (i8)0; nb2[2] = (i8)'c'; nb2[3] = (i8)0;
-        i8* nb3 = new i8[4]; nb3[0] = (i8)'a'; nb3[1] = (i8)0; nb3[2] = (i8)'b'; nb3[3] = (i8)0;
+        char* nb1 = new char[4]; nb1[0] = (char)'a'; nb1[1] = (char)0; nb1[2] = (char)'b'; nb1[3] = (char)0;
+        char* nb2 = new char[4]; nb2[0] = (char)'a'; nb2[1] = (char)0; nb2[2] = (char)'c'; nb2[3] = (char)0;
+        char* nb3 = new char[4]; nb3[0] = (char)'a'; nb3[1] = (char)0; nb3[2] = (char)'b'; nb3[3] = (char)0;
         string en1 = default; en1._ptr = nb1; en1._len = 3;
         string en2 = default; en2._ptr = nb2; en2._len = 3;
         string en3 = default; en3._ptr = nb3; en3._len = 3;

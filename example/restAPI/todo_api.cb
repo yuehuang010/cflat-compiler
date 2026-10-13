@@ -40,7 +40,7 @@ struct Todo {
     // free it here. `move` makes the ownership transfer out of the field explicit.
     ~Todo()
     {
-        if (title._ptr != nullptr) { i8* p = move title._ptr; delete p; }
+        if (title._ptr != nullptr) { char* p = move title._ptr; delete p; }
     }
 };
 
@@ -120,7 +120,7 @@ HttpResponse* listTodos(HttpRequest* req)
 
     string body = sb.toString();
     HttpResponse* r = HttpResponse.okJson(body);
-    if (body._ptr != nullptr) { i8* p = move body._ptr; delete p; }
+    if (body._ptr != nullptr) { char* p = move body._ptr; delete p; }
     return r;
 }
 
@@ -142,7 +142,7 @@ HttpResponse* createTodo(HttpRequest* req)
 
     HttpResponse* r = HttpResponse.okJson(j);
     r->setStatus(201, "Created");
-    if (j._ptr != nullptr) { i8* p = move j._ptr; delete p; }
+    if (j._ptr != nullptr) { char* p = move j._ptr; delete p; }
     return r;
 }
 
@@ -158,7 +158,7 @@ HttpResponse* getTodo(HttpRequest* req)
         {
             string j = _todoJson(g_todos.get(i));
             r = HttpResponse.okJson(j);
-            if (j._ptr != nullptr) { i8* p = move j._ptr; delete p; }
+            if (j._ptr != nullptr) { char* p = move j._ptr; delete p; }
         }
     }
     if (r == nullptr) r = HttpResponse.notFound();
@@ -187,7 +187,7 @@ HttpResponse* updateTodo(HttpRequest* req)
 
             string j = _todoJson(t);
             r = HttpResponse.okJson(j);
-            if (j._ptr != nullptr) { i8* p = move j._ptr; delete p; }
+            if (j._ptr != nullptr) { char* p = move j._ptr; delete p; }
         }
     }
     if (r == nullptr) r = HttpResponse.notFound();

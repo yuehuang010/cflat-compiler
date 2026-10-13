@@ -54,6 +54,21 @@ bool testBuiltinIdentifiers()
 
 int[4] t6PointerGlobal = { 10, 20, 30, 40 };
 
+// T95: `*arr` on a fixed array decays to the element pointer, native and plain-struct alike.
+// `*s` on a plain struct VALUE is refused (err_deref_plain_struct.cb).
+struct T95Plain { int n = 7; };
+bool testUnaryDerefDecay()
+{
+    int[2] ia = {5, 6};
+    if ((*ia) != 5) return false;
+    T95Plain[2] pa;
+    pa[0].n = 9;
+    if ((*pa).n != 9) return false;
+    (*pa).n = 10;
+    if (pa[0].n != 10) return false;
+    return true;
+}
+
 bool testPointerToIntegerAccepts()
 {
     int[2] values = {13, 29};
@@ -1521,6 +1536,13 @@ int pickHexDigitF(u64 x) { return 2; }
 // T86: a hex float is double unless f/F (float); a binary suffix takes the [lex.icon] ladder row (clang oracle).
 int pickHexFloat(float x) { return 1; }
 int pickHexFloat(double x) { return 2; }
+// T100: an l/L floating literal is long double, a distinct overload from double (clang oracle).
+int pickLongDouble(float x) { return 1; }
+int pickLongDouble(double x) { return 2; }
+int pickLongDouble(longdouble x) { return 3; }
+// {double, longdouble} only: a float source promotes to double (clang), whatever the declaration order.
+int pickLdOrD(longdouble x) { return 3; }
+int pickLdOrD(double x) { return 2; }
 int pickBinarySuffix(u32 x) { return 2; }
 int pickBinarySuffix(long x) { return 3; }
 int pickBinarySuffix(ulong x) { return 4; }
@@ -1707,6 +1729,29 @@ bool testExplicitIntTypes()
     result &= Test("hex_float_overflow_float_inf", 0x1p200f > 3.0e38, true);
     result &= Test("hex_float_overflow_double_pick", pickHexFloat(0x1p2000), 2);
     result &= Test("hex_float_overflow_float_pick", pickHexFloat(0x1p200f), 1);
+    // T96 decimal overflow: 1e400 is inf in its suffix type (clang: double inf, float inf), not 0.
+    result &= Test("decimal_overflow_double_inf", 1e400 > 1.0e308, true);
+    result &= Test("decimal_overflow_neg_inf", -1e400 < -1.0e308, true);
+    result &= Test("decimal_overflow_float_inf", 1e400f > 3.0e38, true);
+    result &= Test("decimal_overflow_double_pick", pickHexFloat(1e400), 2);
+    result &= Test("decimal_overflow_float_pick", pickHexFloat(1e400f), 1);
+    // T100 l/L floating literals are long double (clang oracle: sizeof 8; picks 3 3 3 3 1 2 3 3 3).
+    result &= Test("long_double_literal_sizeof", (int)sizeof(0.25l), 8);
+    result &= Test("long_double_literal_l_pick", pickLongDouble(0.25l), 3);
+    result &= Test("long_double_literal_upper_l_pick", pickLongDouble(0.25L), 3);
+    result &= Test("long_double_literal_hex_pick", pickLongDouble(0x1p-2l), 3);
+    result &= Test("long_double_literal_neg_pick", pickLongDouble(-0.25l), 3);
+    result &= Test("long_double_literal_f_pick", pickLongDouble(0.25f), 1);
+    double t100Double = 0.5;
+    result &= Test("long_double_literal_double_var_pick", pickLongDouble(t100Double), 2);
+    longdouble t100Ld = 0.25;
+    result &= Test("long_double_variable_pick", pickLongDouble(t100Ld), 3);
+    result &= Test("long_double_mixed_literal_pick", pickLongDouble(0.25l + 1.0f), 3);
+    result &= Test("long_double_mixed_variable_pick", pickLongDouble(t100Ld + 1.0f), 3);
+    result &= Test("long_double_literal_value", (int)(0.25l * 1024), 256);
+    float t100F = 0.5f;
+    result &= Test("long_double_float_source_prefers_double", pickLdOrD(t100F) * 10 + pickLdOrD(0.25f), 22);
+    result &= Test("long_double_long_suffix_int_unchanged", sizeof(5l) == 8 && sizeof(5ll) == 8, true);
     // T86 member access stays on an adjacent hex integer: 0x1.to_i32() is int + member call (master prints 1).
     result &= Test("hex_int_adjacent_member_call", 0x1.to_i32(), 1);
     // T86 binary integer suffixes (clang oracle, overload pick on the six integer types).
@@ -4890,6 +4935,7 @@ extern int main()
     int passed = 0;
     int total  = 0;
     total++; passed += testPointerToIntegerAccepts() ? 1 : 0;
+    total++; passed += testUnaryDerefDecay() ? 1 : 0;
     total++; passed += Test("testArray", testArray(), 435);
     total++; passed += testNamedParameters()             ? 1 : 0;
     total++; passed += Test("testTotalByValue", my.TotalByValue(), 5);
@@ -5002,6 +5048,7 @@ extern int main()
     total++; passed += testPostfixConditional()            ? 1 : 0;
     total++; passed += testPostfixGenericInstantiation()   ? 1 : 0;
     total++; passed += testOffsetofIntrinsic() ? 1 : 0;
+    total++; passed += testCharFamilyExplicitCasts() ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -5149,18 +5196,18 @@ bool testPointerArithmetic()
     result &= Test("t80 void* into double* accepted", *t80FromVoid == 2.5, true);
     double* t80Same = &t80Dbl; double* t80SameCopy = t80Same;
     result &= Test("t80 same double* accepted", *t80SameCopy == 2.5, true);
-    i8 t80Byte = 65; i8* t80BytePtr = &t80Byte; char* t80Char = t80BytePtr;
-    result &= Test("t80 i8* into char* accepted", *t80Char == 'A', true);
+    i8 t80Byte = 65; i8* t80BytePtr = &t80Byte; char* t80Char = (char*)t80BytePtr;
+    result &= Test("t80 i8* into char* explicit cast accepted", *t80Char == 'A', true);
     int t80Int = 7;
     result &= Test("t80 explicit int* to double* cast accepted", (double*)&t80Int != nullptr, true);
     // T36 round 5: a pointer never binds an integer `operator string` (round 4 picked i128).
     i8[4] t36Eu = default;
     t36Eu[0] = (i8)0x41; t36Eu[1] = (i8)0x42; t36Eu[2] = (i8)0x43; t36Eu[3] = (i8)0;
-    string t36Euro = (string)&t36Eu[0];
+    string t36Euro = (string)(char*)&t36Eu[0];
     result &= Test("t36 i8 element address casts to string", (int)t36Euro.length(), 3);
-    string t36EuroTail = (string)(&t36Eu[0] + 1);
+    string t36EuroTail = (string)((char*)&t36Eu[0] + 1);
     result &= Test("t36 i8 pointer arithmetic casts to string", (int)t36EuroTail.length(), 2);
-    string t36EuroU8 = (string)(u8*)&t36Eu[0];
+    string t36EuroU8 = (string)(char*)(u8*)&t36Eu[0];
     result &= Test("t36 u8 pointer casts to string", (int)t36EuroU8.length(), 3);
     char literalA = 'a';
     result &= Test("character literal remains character", literalA, 'a');
@@ -7117,5 +7164,26 @@ bool testOffsetofIntrinsic()
         result &= Test("offsetof_if_const", 1, 1);
     if const (offsetof(T38Box<double>, value) == 8)
         result &= Test("offsetof_generic_if_const", 1, 1);
+    return result;
+}
+
+// T89: i8* / u8* <-> char* convert only through an explicit cast (char family stage 2).
+bool testCharFamilyExplicitCasts()
+{
+    bool result = true;
+    i8[4] raw = default;
+    raw[0] = 65;
+    i8* bytes = raw;
+    char* text = (char*)bytes;
+    Assert("char_family_i8_to_char_cast", (int)text[0], 65);
+    i8* back = (i8*)text;
+    Assert("char_family_char_to_i8_cast", (int)back[0], 65);
+    u8* unsignedBytes = (u8*)text;
+    char* fromUnsigned = (char*)unsignedBytes;
+    Assert("char_family_u8_round_trip", (int)fromUnsigned[0], 65);
+    char[4] chars = default;
+    chars[1] = 'B';
+    char* charView = chars;
+    Assert("char_family_same_type_decay", (int)charView[1], 66);
     return result;
 }

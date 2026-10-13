@@ -406,6 +406,14 @@ The recurring failure mode of this whole family, stated once:
   the squash produced a commit that deleted E2 and still ff-merged cleanly (it IS a descendant).
   Caught only by reading `--stat`. **Rebase, then `git merge-base --is-ancestor master HEAD`,
   then squash - in the SAME command**, so a failed or skipped rebase stops the squash.
+- **Never launch a review or bar after `git rebase ... | tail -1` with `&&`/`;`.** The pipe's exit status is
+  `tail`'s, so a conflicted rebase still "succeeds" and the agent/bar runs on a mid-rebase tree with
+  conflict markers. Happened twice on 2026-10-10 (T85 review r4, T95 bar). Rebase in its own command,
+  check `git diff --name-only --diff-filter=U` is empty, then launch.
+- **A test binary's exit code is main's return mod 256, and heap-audit LEAK lines are not failures.**
+  test_cpp_interop prints ~124 `heap-audit: LEAK` reports on master and still exits 0 (legs `new` without
+  delete). A failing run that exits 140 means a leg returned N with N % 256 == 140 (396, 908, 7052...);
+  grep the candidate returns. T102 2026-10-10 lost a whole retry chasing the leak lines.
 
 ## On deciding whether a deferral was correct
 

@@ -138,7 +138,8 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
         if (auto* braceList = FieldDefaultBraceList(field))
         {
             GlobalScopeGuard fieldInitScope(global_scope);
-            rvalue = ParseFieldDefaultBraceInitializer(structName, field, braceList);
+            rvalue = ParseFieldDefaultBraceInitializer(structName, field, braceList,
+                armFieldSret ? fieldDestination : nullptr);
         }
         else if (field.Initializer != nullptr)
         {
@@ -189,6 +190,8 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                     GlobalScopeGuard defaultCtorScope(global_scope);
                     rvalue = GenerateDefaultValue(field);
                 }
+                else if (fieldCount != SIZE_MAX && !ctorError.empty())
+                    compiler->LogErrorMessage("{}", { ctorError });
                 else if (fieldCount != SIZE_MAX)
                 {
                     const auto* cxxInfo = compiler->GetCxxClassInfo(field.TypeName);

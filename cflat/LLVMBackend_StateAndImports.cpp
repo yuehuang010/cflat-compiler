@@ -2547,6 +2547,7 @@ nlohmann::json LLVMBackend::FieldToJson(const CRecordFieldEntry& f)
         if (f.isZeroSize) j["zs"] = true;
         if (f.isConst) j["c"] = true;
         if (f.isMutable) j["mu"] = true;
+        if (f.inherited) j["inh"] = true;
         if (f.offsetBytes != 0) j["ob"] = f.offsetBytes;
         if (f.sizeBytes != 0) j["sz"] = f.sizeBytes;
         if (f.alignBytes != 0) j["al"] = f.alignBytes;
@@ -2565,6 +2566,7 @@ LLVMBackend::CRecordFieldEntry LLVMBackend::FieldFromJson(const SjVal& j)
         f.isZeroSize = j.value("zs", false);
         f.isConst = j.value("c", false);
         f.isMutable = j.value("mu", false);
+        f.inherited = j.value("inh", false);
         f.bitWidth   = j.value("bw", 0u);
         f.offsetBytes = j.value("ob", (uint64_t)0);
         f.sizeBytes = j.value("sz", (uint64_t)0);

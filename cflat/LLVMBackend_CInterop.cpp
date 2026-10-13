@@ -5322,6 +5322,7 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
                 fe.isZeroSize = f.isZeroSize;
                 fe.isConst = f.isConst;
                 fe.isMutable = f.isMutable;
+                fe.inherited = f.inherited;
                 fe.offsetBytes = f.offsetBytes;
                 fe.sizeBytes = f.sizeBytes; fe.alignBytes = f.alignBytes;
                 fe.bitOffset = f.bitOffset;
@@ -8196,6 +8197,7 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
             rawField.isZeroSize = field.isZeroSize;
             rawField.isConst = field.isConst;
             rawField.isMutable = field.isMutable;
+            rawField.inherited = field.inherited;
             rawField.bitWidth = field.bitWidth;
             rawField.offsetBytes = field.offsetBytes;
             rawField.sizeBytes = field.sizeBytes;
@@ -10234,7 +10236,14 @@ bool LLVMBackend::TryBindCxxImplicitDefaultCtor(const std::string& typeName, std
         CSigEntry signature;
         if (!RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName,
                                         "IMPLICIT_DEFAULT_CTOR", signature, error))
+        {
+            // The wrapper's raw clang parse diagnostic keeps the "clang: " form (ruling 2026-09-27).
+            // An already-demanded body reports its full multi-line text, so compare the first line.
+            if (const std::string raw = CxxFirstDiagnosticLine(lastCxxWrapperCause_);
+                !raw.empty() && !error.starts_with("clang: ") && CxxFirstDiagnosticLine(error) == raw)
+                error = "clang: " + error;
             return false;
+        }
         if (signature.params.size() != 1)
         {
             error = "the generated C++ default constructor wrapper has an unexpected signature";
@@ -14708,6 +14717,59 @@ static std::string DirectBraceConstantText(const LLVMBackend::NamedVariable& ele
         return {};
 }
 
+std::string LLVMBackend::CxxImportedConstantLiteral(const NamedVariable& element) const
+{
+        // C++ treats an imported enumerator or integer macro as a constant; CFlat keeps its global.
+        // The literal keeps the constant's own C++ type, so overloads and narrowing see what clang sees.
+        if (element.TypeAndValue.Pointer || element.TypeAndValue.IsScopedEnum || element.Storage == nullptr)
+            return {};
+        if (!element.IsCxxMacroGlobal && !IsImportedEnumeratorStorage(element.Storage)) return {};
+        if (IsImportedEnumeratorStorage(element.Storage))
+        {
+            // An unscoped enumerator is spelled as its qualified name: its C++ type is the
+            // enumeration, not the backing integer. The global is named `ns.A` (`A` at file scope).
+            const std::string name = element.Storage->getName().str();
+            const std::string enumType = element.TypeAndValue.TypeName;
+            const size_t enumDot = enumType.rfind('.');
+            const size_t nameDot = name.rfind('.');
+            const std::string enumScope = enumDot == std::string::npos ? std::string() : enumType.substr(0, enumDot);
+            const std::string nameScope = nameDot == std::string::npos ? std::string() : name.substr(0, nameDot);
+            if (enumScope != nameScope) return {};
+            std::string qualified;
+            for (char c : name)
+            {
+                if (c == '.') qualified += "::";
+                else if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') qualified += c;
+                else return {};
+            }
+            return qualified;
+        }
+        auto* global = llvm::dyn_cast<llvm::GlobalVariable>(element.Storage);
+        if (global == nullptr || !global->hasInitializer()) return {};
+        auto* value = llvm::dyn_cast<llvm::ConstantInt>(global->getInitializer());
+        if (value == nullptr || value->getBitWidth() > 64 || value->getValue().isMinSignedValue())
+            return {};
+        // Signedness and width come from the imported TYPE, not the APInt's high bit: an unsigned
+        // 4294967295U is not -1, and an unsigned ULLONG_MAX stays 2^64-1.
+        const TypeAndValue& tv = element.TypeAndValue;
+        const bool isUnsigned = tv.IsUnsignedInteger() != -1;
+        if (!isUnsigned && tv.IsInteger() == -1) return {};
+        std::string spelled;
+        if (!CxxSpellingForCflatType(tv.TypeName, spelled)) return {};
+        const bool negative = !isUnsigned && value->getValue().isNegative();
+        const std::string digits = isUnsigned ? std::to_string(value->getZExtValue())
+                                              : std::to_string(negative ? -value->getSExtValue() : value->getSExtValue());
+        if (spelled == "int")
+            return negative ? "(-" + digits + ")" : digits;
+        std::string suffix;
+        if (spelled == "unsigned int") suffix = "U";
+        else if (spelled == "long") suffix = "L";
+        else if (spelled == "unsigned long") suffix = "UL";
+        else if (spelled == "long long") suffix = "LL";
+        else if (spelled == "unsigned long long") suffix = "ULL";
+        return "static_cast<" + spelled + ">(" + (negative ? "(-" + digits + suffix + ")" : digits + suffix) + ")";
+}
+
 bool LLVMBackend::RequestCxxDirectBraceConstructor(
         const std::string& typeName, const std::vector<NamedVariable>& elements,
         const std::string& initializerList, bool copyListInit, std::string& wrapperName,
@@ -14769,7 +14831,9 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             }
             // A compile-time constant element goes in as a typed constant, so clang applies the
             // constant-expression narrowing rule (`short{1}` fits) instead of the variable one.
-            const std::string constant = DirectBraceConstantText(elements[i], parameterTypes[i + 1]);
+            std::string constant = elements[i].CxxImportedLiteral;
+            if (constant.empty())
+                constant = DirectBraceConstantText(elements[i], parameterTypes[i + 1]);
             if (!constant.empty())
             {
                 size_t at = 0;
@@ -18803,17 +18867,23 @@ bool LLVMBackend::NoteCxxGroupStatic(const CGlobalEntry& e, bool folded, const s
         auto base = [](const std::string& f) {
             return std::filesystem::path(f).filename().string();
         };
-        // Name the headers that declare it; one shared header is named with the imports reaching it.
-        if (!prev.declFile.empty() && !e.file.empty() && !sameDeclFile)
+        // Grouping imports helps only one declaration reached twice; distinct definitions are a
+        // clang redefinition, so their hint is rename or remove.
+        const bool sharedDecl = sameDeclFile && prev.line == e.line && prev.col == e.col;
+        if (!sharedDecl)
             cxxBindingRefusals_[e.name] = std::format(
-                "{} C++ internal-linkage variable '{}' is defined in both '{}' and '{}', which "
-                "separate import groups bring in; CFlat cannot tell which one is meant.",
-                ambiguityPrefix, e.name, base(prev.declFile), base(e.file));
+                "{} C++ internal-linkage variable '{}' is defined in both '{}' and '{}' as distinct "
+                "definitions; CFlat cannot tell which one is meant. Rename one of the conflicting "
+                "declarations or remove one so a single '{}' remains;",
+                ambiguityPrefix, e.name, base(prev.declFile.empty() ? prev.importHeader : prev.declFile),
+                base(e.file.empty() ? importHeader : e.file), e.name);
         else
             cxxBindingRefusals_[e.name] = std::format(
                 "{} C++ internal-linkage variable '{}' from '{}' has one copy per import group, and "
-                "the imports of '{}' and '{}' each reach it; CFlat cannot tell which one is meant.",
+                "the imports of '{}' and '{}' each reach it; CFlat cannot tell which one is meant. "
+                "Import them in one group so the variable has one copy: import cpp {{\"{}\", \"{}\"}};",
                 ambiguityPrefix, e.name, base(e.file.empty() ? importHeader : e.file),
+                base(prev.importHeader), base(importHeader),
                 base(prev.importHeader), base(importHeader));
         globalNamedVariable.erase(e.name);
         constGlobalInts_.erase(e.name);
@@ -21692,6 +21762,8 @@ bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
             if (f->second == cflat_cinterop::AccessPublic) return false;
             if (f->second == cflat_cinterop::AccessProtected
                 && CxxProtectedAccessAllowed(typeName, accessedThroughCurrentObject)) return false;
+            // An inherited field behind a private/protected base: name the base, as clang does.
+            if (ReportCxxMemberThroughNonPublicBase(typeName, memberName)) return true;
             LogError(std::format("field '{}' of C++ class '{}' is {}",
                                  memberName, DisplayCxxClassName(typeName),
                                  f->second == cflat_cinterop::AccessPrivate ? "private" : "protected"));
@@ -21701,6 +21773,7 @@ bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
             && ma->second == cflat_cinterop::AccessProtected)
         {
             if (CxxProtectedAccessAllowed(typeName, accessedThroughCurrentObject)) return false;
+            if (ReportCxxMemberThroughNonPublicBase(typeName, memberName)) return true;
             LogErrorMessage("member '{}' of C++ class '{}' is protected",
                             { memberName, DisplayCxxClassName(typeName) });
             return true;
@@ -21741,18 +21814,28 @@ bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
  * the inaccessible-base diagnostic and returns true when the name is declared in a base reached
  * only through a private or protected base-specifier.
  */
-bool LLVMBackend::ReportCxxMemberThroughNonPublicBase(const std::string& typeName,
-                                                      const std::string& memberName)
+std::string LLVMBackend::CxxMemberThroughNonPublicBaseNote(const std::string& typeName,
+                                                           const std::string& memberName)
 {
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
-        if (info == nullptr || info->bases.empty()) return false;
+        if (info == nullptr || info->bases.empty()) return {};
         auto declares = [&](const std::string& owner) {
             EnsureCxxMemberProjected(owner, memberName);
             const CxxClassInfo* ownerInfo = GetCxxClassInfo(owner);
             if (ownerInfo == nullptr) return false;
-            if (ownerInfo->fieldAccess.count(memberName) != 0
-                || ownerInfo->memberAccess.count(memberName) != 0)
-                return true;
+            // Declared BY owner: the access maps also hold inherited entries, which must not hide
+            // the base that declares them.
+            if (auto record = cxxRecordEntries_.find(owner); record != cxxRecordEntries_.end())
+            {
+                const CRecordEntry& r = record->second;
+                if (std::any_of(r.fields.begin(), r.fields.end(), [&](const CRecordFieldEntry& f) {
+                        return !f.inherited && f.name == memberName; })
+                    || std::any_of(r.members.begin(), r.members.end(), [&](const auto& m) {
+                        return m.name == memberName; })
+                    || std::any_of(r.staticVars.begin(), r.staticVars.end(), [&](const auto& v) {
+                        return v.name == memberName; }))
+                    return true;
+            }
             if (std::any_of(ownerInfo->directMethods.begin(), ownerInfo->directMethods.end(),
                             [&](const CxxClassInfo::Method& m) { return m.raw.name == memberName; }))
                 return true;
@@ -21788,13 +21871,24 @@ bool LLVMBackend::ReportCxxMemberThroughNonPublicBase(const std::string& typeNam
                 walk(baseName, next);
             }
         };
+        // A declaration directly in typeName hides every base declaration of the name, so the
+        // failure is the derived member's own (private field, unmatched overload), not the base.
+        if (declares(typeName)) return {};
         walk(typeName, std::nullopt);
-        if (publicPath || !found) return false;
-        LogError(std::format("member '{}' of C++ class '{}' is inaccessible: '{}' is a {} base of '{}'",
-                             memberName, DisplayCxxClassName(typeName),
-                             DisplayCxxClassName(found->base),
-                             found->access == cflat_cinterop::AccessPrivate ? "private" : "protected",
-                             DisplayCxxClassName(found->derived)));
+        if (publicPath || !found) return {};
+        return std::format("member '{}' of C++ class '{}' is inaccessible: '{}' is a {} base of '{}'",
+                           memberName, DisplayCxxClassName(typeName),
+                           DisplayCxxClassName(found->base),
+                           found->access == cflat_cinterop::AccessPrivate ? "private" : "protected",
+                           DisplayCxxClassName(found->derived));
+    }
+
+bool LLVMBackend::ReportCxxMemberThroughNonPublicBase(const std::string& typeName,
+                                                      const std::string& memberName)
+{
+        std::string note = CxxMemberThroughNonPublicBaseNote(typeName, memberName);
+        if (note.empty()) return false;
+        LogError(note);
         return true;
     }
 

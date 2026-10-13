@@ -229,15 +229,19 @@
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_interop_t74.h";
 import cpp "library/t70_xvalue_overloads.h";
+import cpp "library/cpp_t97_fieldctor.h";
 import cpp "library/cpp_t68_intptr.hpp";
 import cpp "library/cpp_t62_static_auto.hpp";
 import cpp "library/cpp_t93_static_init.hpp";
 import cpp "library/cpp_u8_literal.hpp";
 import cpp "library/cpp_t43_char_types.hpp";
 import cpp "library/cpp_immovable.hpp";
+import cpp "library/cpp_t89_char_pointer.hpp";
+import cpp "library/cpp_t102_assign_routes.hpp";
 import cpp "library/cpp_t43_ref_ops.hpp";
 import cpp "library/cpp_t85_pointee.hpp";
 import cpp "library/cpp_t94_anon_typedef.hpp";
+import cpp "library/cpp_t95_deref.hpp";
 import cpp "library/t38_offsetof.hpp";
 import cpp "library/cpp_interop_scoped_enum_collide.h";
 import cpp "library/t20_abi_records.hpp";
@@ -273,6 +277,7 @@ import cpp "library/cpp_t35_ownerexpr.hpp";
 import cpp "library/cpp_t42_convref.hpp";
 import cpp "library/cpp_t48_nullptr.hpp";
 import cpp "library/cpp_t52_refnull.hpp";
+import cpp "library/cpp_t98_macro_constant.hpp";
 import cpp "library/cpp_t28_fwdref.hpp";
 import cpp "library/t84_conversion.hpp";
 import cpp "library/cpp_t27_ptrdiff.hpp";
@@ -300,6 +305,7 @@ import cpp "library/cpp_interop_scoped_enum.h";
 import cpp "library/cpp_interop_errc.h";
 import cpp "library/cpp_t49_enum_args.hpp";
 import cpp "library/cpp_t86_literals.hpp";
+import cpp "library/cpp_t100_long_double.hpp";
 enum T49Own : int { T49V = 6 };
 enum T64U8 : u8 { T64U8Hi = 200 };
 enum T64U16 : u16 { T64U16Hi = 40000 };
@@ -465,6 +471,7 @@ import cpp "library/t31_minmax_brace.hpp";
 import cpp "library/cpp_t63_brace_decl.hpp";
 import cpp "library/cpp_t78_scalar_table.h";
 import cpp "library/cpp_t87_null_zero.h";
+import cpp "library/cpp_private_base_shadow.h";
 int cppcg_add(int a, int b) { return a + b; }
 
 // A C++ exception unwinding THROUGH CFlat frames (the C++ `guarded` catch sits above them): every
@@ -1765,6 +1772,11 @@ struct T73ArrayHolder { cpp_t73.Mix items[2]; };
 struct T73Nested { T73Holder holder; };
 struct T73VirtualHolder { cpp_t73.Virtual value; };
 struct T73DefaultMemberHolder { cpp_t73.DefaultMember value; };
+struct T97Hd { cpp_t97.Dl d; int k = 0; };
+struct T97WDefault { T97Hd h = { d = cpp_t97.Dl(5) }; int z = 0; };
+struct T97WUser { T97Hd h = { d = cpp_t97.Dl(6) }; int z = 0; T97WUser() { } };
+struct T97WNest { T97WDefault w; int q = 0; };
+struct T97WArr { T97WDefault items[2]; };
 struct T73TrivialHolder { cpp_t73.Trivial value; };
 struct T73Generic<T> { T item; };
 struct T73GenericHolder { T73Generic<cpp_t73.Mix> generic; };
@@ -1791,8 +1803,27 @@ immt90.Pinned t90Mk() { return default; }
 // Both ternary arms fresh: the join is a prvalue built in the sret slot.
 immt90.Pinned t90MkEither(bool c) { return c ? t90Mk() : t90Mk(); }
 
+// T98: a field named like an imported macro shadows it inside the struct's methods (clang: lvalue).
+struct T98Shadow
+{
+    int T98_N5 = default;
+    int t98Other = default;
+    int Fwd(bool c) { int x = 7; return cpi_t98.fwd(c ? (c ? T98_N5 : x) : x); }
+    int FwdTwin(bool c) { int x = 7; return cpi_t98.fwd(c ? (c ? t98Other : x) : x); }
+};
+
 extern int main()
 {
+    // T95: `*arr` on a fixed array of C++ records decays to its element pointer (clang: builtin deref,
+    // never the element operator*). master: LLVM verification failure / "indirection requires a pointer".
+    t95d.C[2] t95arr;
+    t95arr[0].n = 31;
+    if ((*t95arr).n != 31) return 95101;
+    (*t95arr).n = 40;
+    if (t95arr[0].n != 40) return 95102;
+    t95d.D[2] t95darr;
+    t95darr[0].n = 44;
+    if ((*t95darr).n != 44) return 95103;
     // T86: a hex float (binary exponent) and a binary suffix reach C++ template deduction and overloads with clang's
     // types (clang++ -std=c++20 oracle: 2 1 1 2 / 3 4 5 6 8 / 7 4).
     if (t86.deduce(0x1p-2) != 2) return 98210;
@@ -1808,6 +1839,23 @@ extern int main()
     if (t86.deduce(0b10000000000000000000000000000000) != 4) return 98220;
     if (t86.deduce(0x1p2000) != 2) return 98221;
     if (t86.deduce(0x1p200f) != 1) return 98222;
+    // T100 (clang++ -std=c++20 oracle): an l/L floating literal is long double in C++ overloads and
+    // deduction; double and long double variables, f and unsuffixed literals pick their own overload.
+    if (t100.deduce(0.25l) != 3) return 98223;
+    if (t100.deduce(0.25L) != 3) return 98224;
+    if (t100.deduce(0x1p-2l) != 3) return 98225;
+    if (t100.deduce(0.25f) != 1) return 98226;
+    if (t100.deduce(2.5) != 2) return 98227;
+    if (t100.pick(0.25l) != 3) return 98228;
+    if (t100.pick(2.5) != 2) return 98229;
+    if (t100.size(0.25l) != 8) return 98230;
+    longdouble t100Ld = 0.25;
+    double t100D = 0.5;
+    if (t100.pick(t100Ld) != 3) return 98231;
+    if (t100.deduce(t100Ld) != 3) return 98232;
+    if (t100.pick(t100D) != 2) return 98233;
+    if (t100.deduce(0.25l + 1.0f) != 3) return 98234;
+    if (t100.pick(t100Ld + 1.0f) != 3) return 98235;
     // T78 (ruling 2026-10-09): integer, bool and unscoped enum arguments widen to a C++ double
     // at free, member, constructor and new calls, as clang accepts them.
     if (t78.takeD(3) != 3) return 98101;
@@ -1982,6 +2030,13 @@ extern int main()
         || t43_over_char(t43c8) != 2 || t43_over_char(t43c16) != 3
         || t43_over_char(t43c32) != 4 || t43_over_c16(t43c16) != 6
         || t43_over_c32(t43c32) != 7) return 3912;
+    // T89 round 2: a u8 array decays to void* (clang++ picks 22), never char*; a char array picks char*.
+    // Arguments that only reach the ellipsis stay legal.
+    u8[2] t89Bytes = default;
+    char[2] t89Text = default;
+    i8[2] t89Sb = default;
+    if (t89_pick(t89Bytes) != 22 || t89_pick(t89Text) != 11) return 13401;
+    if (t89_variadic((char*)t89Text, (i8*)t89Sb) != 55) return 13402;
     t43.RefOps t43a = t43.RefOps(10);
     t43.RefOps t43c = t43.RefOps(1);
     t43.RefOps t43shift = t43c * t43c << t43a;
@@ -2234,6 +2289,38 @@ extern int main()
     // T68: the int lvalue at lp(int*) is refused (pointer is not a number) - legs in
     // Test/errors/err_cpp_reference_param_null_constant.cb.
     if (cpi_t52.iref(Z0) != 17) return 5204;
+    // T98: an imported macro constant is a prvalue (no address, no int& bind, `ov` picks int&&).
+    bool t98C = true;
+    if (cpi_t98.ov(T98_N5) != 205 || cpi_t98.ov(t98C ? T98_N5 : T98_N5) != 205) return 98901;
+    if (cpi_t98.irr(T98_N5) != 45 || cpi_t98.cref(T98_N5) != 6) return 98902;
+    if (cpi_t98.fwd(T98_N5) != 95 || cpi_t98.fwd(t98C ? T98_N5 : T98_N5) != 95) return 98903;
+    if (cpi_t98.fwd(t98C ? T98_N5 : Z0) != 95 || T98_N5 + 1 != 6) return 98904;
+    {
+        // A local that shadows a macro name stays an ordinary int lvalue.
+        int T98_N5 = 3;
+        if (cpi_t98.ov(T98_N5) != 103 || cpi_t98.iref(T98_N5) != 13) return 98905;
+        T98_N5 = 8;
+        if (T98_N5 != 8) return 98906;
+    }
+    // T98: imported enumerators and integer macros are constants in a brace list (clang: 1 and 5).
+    cpi_t98.Shorts t98S{cpi_t98.Red, 2};
+    cpi_t98.Shorts t98M{T98_SMALL, 2};
+    cpi_t98.Ints t98I{cpi_t98.Red, 2};
+    if (t98S.first != 1 || t98S.n != 2 || t98M.first != 5 || t98I.first != 1) return 98907;
+    // T98: a folded constant keeps its own C++ type, so the ctor overload is the one clang picks.
+    cpi_t98.Pick t98P1{T98_N5};
+    cpi_t98.Pick t98P2{T98_CH};
+    cpi_t98.Pick t98P3{cpi_t98.Red};
+    if (t98P1.n != 11 || t98P2.n != 33 || t98P3.n != 44) return 98908;
+    cpi_t98.Ulongs t98U{T98_ULLMAX};
+    if (t98U.n != 18446744073709551615ULL) return 98909;
+    // T98: a parenthesized or nested `?:` of macro constants is a prvalue (clang: 50 and 50).
+    if (cpi_t98.fwd((t98C ? T98_N5 : T98_N5)) != 95) return 98910;
+    if (cpi_t98.fwd(t98C ? (t98C ? T98_N5 : T98_N5) : T98_N5) != 95) return 98911;
+    T98Shadow t98Sh = default;
+    t98Sh.T98_N5 = 6;
+    t98Sh.t98Other = 6;
+    if (t98Sh.Fwd(t98C) != 86 || t98Sh.FwdTwin(t98C) != 86) return 98912;
     if (cpi_t48.rm(nullptr) != 203 || cpi_t48.rm(0) != 202 || cpi_t48.bvm(nullptr) != 213
         || cpi_t48.bvm(0) != 212 || cpi_t48.rm(t48Null) != 203)                          return 4806;
     cpi_t48.H t48H = default;
@@ -12193,6 +12280,13 @@ extern int main()
     if (t90p.v != 3)                                                              return 90003;
     immt90.Pinned t90e = t90MkEither(t90p.v == 3);
     if (t90e.v != 3)                                                              return 90004;
+    cppi_pbs.PbsPubUsing t99U = cppi_pbs.PbsPubUsing();
+    if (t99U.v != 7) return 9901;
+    // T102: a scalar assignment uses the converting constructor then implicit copy assignment.
+    t102a.ConvertAssign t102Converted = t102a.ConvertAssign(1);
+    t102Converted = 5;
+    if (t102a.convert_assign_value(t102Converted) != 5
+        || t102a.convert_assign_ctor_count() != 2) return 3289;
     return 0;
 }
 
@@ -13021,6 +13115,25 @@ int LoweredUserDtorAssignLegs(int argc)
         if (cpp_t73.ctor_count != 2 || t73Defaulted.mix.first.value != 7) return 73022;
     }
     if (cpp_t73.dtor_count != 2) return 73023;
+    // T97: a C++ field named by a brace default keeps its value when the CFlat struct has no user ctor.
+    // Probe scratch/repro_keep/v20/rv20/d/p.cb (master gave d.v=0 here; the user-ctor form was already right).
+    cpp_t97.reset();
+    {
+        T97WDefault w;
+        if (w.h.d.v != 5) return 97001;
+        if (w.h.k != 0 || w.z != 0) return 97002;
+        T97WUser u;
+        if (u.h.d.v != 6) return 97003;
+    }
+    if (cpp_t97.made() - cpp_t97.dtor_count != 0) return 97004;
+    cpp_t97.reset();
+    {
+        T97WNest n;
+        if (n.w.h.d.v != 5) return 97005;
+        T97WArr a;
+        if (a.items[0].h.d.v != 5 || a.items[1].h.d.v != 5) return 97006;
+    }
+    if (cpp_t97.made() - cpp_t97.dtor_count != 0) return 97007;
     return 0;
 }
 
