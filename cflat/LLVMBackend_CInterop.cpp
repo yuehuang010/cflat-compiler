@@ -23785,8 +23785,14 @@ bool LLVMBackend::CxxRefusedMemberSignatureKnown(const CRecordEntry& record,
             for (const std::string& raw : spellings)
             {
                 const std::string spelling = CxxMemberValueSpelling(raw);
+                // A generated user record is always known; a C++ specialization merely taking
+                // one as an argument (std::reverse_iterator<__cflat_user::T **>) is not.
+                const bool generatedUserRecord = spelling.find("__cflat_user::") != std::string::npos
+                    && (spelling.find('<') == std::string::npos
+                        || spelling.starts_with("__cflat_user::")
+                        || spelling.starts_with("const __cflat_user::"));
                 if (spelling.find("::") == std::string::npos
-                    || spelling.find("__cflat_user::") != std::string::npos
+                    || generatedUserRecord
                     || spelling.find("type-parameter-") != std::string::npos)
                     continue;
                 const std::string identity = CanonicalCxxForeignIdentity(spelling);

@@ -220,6 +220,27 @@ _SKIP_BY_PREFIX = {
 }
 
 
+_CXX_IMPORT_RE = re.compile(r"^\s*import\s+cpp\b", re.MULTILINE)
+
+
+def order_for_scan(paths: list[Path]) -> list[Path]:
+    """
+    Longest analyses first: a file that imports C++ costs several times any other, so starting
+    it last leaves one worker running it alone at the end. Those files also share std headers,
+    so running them together lets the server's in-memory C++ caches serve each other.
+    Largest file first within that group; everything else keeps collection order.
+    """
+    def is_cxx(p: Path) -> bool:
+        try:
+            return _CXX_IMPORT_RE.search(p.read_text(encoding="utf-8", errors="replace")) is not None
+        except OSError:
+            return False
+    cxx = sorted((p for p in paths if is_cxx(p)), key=lambda p: p.stat().st_size, reverse=True)
+    first = set(cxx)
+    rest = [p for p in paths if p not in first]
+    return cxx + rest
+
+
 def collect_files(include_win32_demo: bool) -> list[Path]:
     files: list[Path] = []
     files += sorted((REPO_ROOT / "Test").glob("*.cb"))
@@ -262,6 +283,7 @@ def run_bulk(exe: str, extra_args: list, show_timings: bool = False,
     if not HOST_IS_MACOS:
         skipped_mac = [p for p in paths if is_macos_only(p)]
         paths = [p for p in paths if not is_macos_only(p)]
+    paths = order_for_scan(paths)
     print(f"Server: {exe}")
     print(f"Files:  {len(paths)}")
     if skipped_win:
