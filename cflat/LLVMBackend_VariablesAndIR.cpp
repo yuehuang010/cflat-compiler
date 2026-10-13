@@ -657,15 +657,15 @@ llvm::Value* LLVMBackend::CreateCxxFieldGEP(llvm::IRBuilder<>& irBuilder, const 
 
 void LLVMBackend::MarkCxxConstReferent(llvm::Value* referenceResult)
 {
-        if (auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(referenceResult))
-            call->setMetadata("cflat.cxx.constref", llvm::MDNode::get(*context, {}));
+        if (auto* inst = llvm::dyn_cast_or_null<llvm::Instruction>(referenceResult))
+            inst->setMetadata("cflat.cxx.constref", llvm::MDNode::get(*context, {}));
 }
 
 bool LLVMBackend::IsCxxConstReferent(llvm::Value* destination) const
 {
         if (destination == nullptr) return false;
-        auto* call = llvm::dyn_cast<llvm::CallBase>(llvm::getUnderlyingObject(destination));
-        return call != nullptr && call->getMetadata("cflat.cxx.constref") != nullptr;
+        auto* inst = llvm::dyn_cast<llvm::Instruction>(llvm::getUnderlyingObject(destination));
+        return inst != nullptr && inst->getMetadata("cflat.cxx.constref") != nullptr;
 }
 
 void LLVMBackend::MarkCxxConstFieldAccess(llvm::Value* fieldAddress)

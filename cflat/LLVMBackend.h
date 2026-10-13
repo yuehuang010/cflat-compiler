@@ -1589,6 +1589,8 @@ public:
         // (string/owning struct/closure). Zeroing is deferred to ApplyMoveParamTransfer so the
         // callee's parameter move-ness is known first. Not part of the --init cache round-trip.
         bool IsExplicitMove = false;
+        // True only for a normalized C++ T&& result, not the CFlat `move` keyword.
+        bool IsNormalizedCxxXvalue = false;
         // True only for a value-producing expression. Named variables, fields, elements, aliases,
         // and dereferences remain lvalues even when their LLVM value has no storage of its own.
         bool IsRvalue = false;
@@ -1907,6 +1909,7 @@ public:
         bool         isArrayView = false;   // value came from a thin `int[]` view (pointer arithmetic is banned on it)
         bool         isAlias    = false;    // value is a borrow from an alias result or join
         bool         isRvalue = false;      // value-producing expression; named lvalues keep this false
+        bool         isExplicitMove = false; // written 'move x' operand; transient, read by operator calls
         bool         isPointerArithmeticResult = false; // `p + n` / `p - n` pointer result
         llvm::Value* storage    = nullptr;  // lvalue storage for an addressable alias result/join
         llvm::Value* receiverStorage = nullptr; // lvalue storage retained for synthesized method calls
@@ -2070,10 +2073,15 @@ public:
         bool sretAfterThis = false;
         bool signExt = false;                // Direct scalar carrying clang's `signext`
         bool zeroExt = false;                // ... or `zeroext`
+        // An explicit i64 raw-array count follows this slot's LLVM params. Set only on a thin
+        // function<> C-ABI recipe (ThinFnPtrUsesCAbi), so caller and reverse thunk agree on it.
+        bool countAfter = false;
     };
     struct AbiRecipe
     {
         bool hasLowering = false;            // true if at least one slot is non-Direct
+        // A pointer to the i64 return count is the LAST LLVM param (thin function<> C-ABI only).
+        bool retCountParam = false;
         // True when the recipe came from clang::CodeGen::arrangeFreeFunctionType rather than
         // CFlat's size heuristic. Such a recipe must never be recomputed (--init restore).
         bool fromClang = false;
@@ -4080,6 +4088,8 @@ private:
         bool hasCopyCtor = false;
         bool hasCtorTemplate = false;
         bool hasAssignTemplate = false;
+        bool moveAssignBindsConstRef = false;
+        bool moveAssignConstSourceBindsConstRef = false;
         bool isAggregate = false;
         std::vector<cflat_cinterop::RawCxxCtorTemplate> ctorTemplates;
         std::vector<cflat_cinterop::RawCxxMember> members;
@@ -6572,6 +6582,8 @@ private:
 
 
     bool MapCTypeToTypeAndValue(std::string ctype, TypeAndValue& out, bool cxxBoundary);
+    // Marks a C++ reference data member's field TypeAndValue (IsAlias, referent depth, const).
+    void MarkCxxReferenceField(const std::string& ctype, TypeAndValue& tv, bool isCxx);
     void SetCInteropTargetFacts(const cflat_cinterop::ExtractResult& raw);
     void SetCInteropTargetFacts(uint64_t longDoubleWidth, bool longDoubleIsIEEEDouble,
                                 const std::string& targetTriple);
@@ -7289,10 +7301,18 @@ public:
     // Adapt an extern function's lowered C ABI to the natural CFlat function-pointer ABI.
     llvm::Function* GetOrCreateCAbiFunctionThunk(const FunctionSymbol& symbol,
                                                   const TypeAndValue& fpTV);
+    // C-ABI entry of a native extern for a thin/fat C-ABI signature: the extern itself when its
+    // LLVM type matches, else a counted reverse thunk over the natural wrapper.
+    llvm::Function* GetOrCreateNativeExternCAbiEntry(llvm::Function* ext,
+                                                     const FunctionSymbol& symbol,
+                                                     const TypeAndValue& ret,
+                                                     const std::vector<TypeAndValue>& params,
+                                                     const AbiRecipe& cAbi);
     llvm::Function* GetOrCreateReverseAbiFunctionThunk(llvm::Function* original,
                                                        const CxxFunctionPointerAbiPlan& plan,
                                                        const std::string& stableName = {},
-                                                       bool externalLinkage = false);
+                                                       bool externalLinkage = false,
+                                                       bool passNullEnv = false);
 
     llvm::Value* WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, const TypeAndValue& fpTV);
 
@@ -7301,6 +7321,10 @@ public:
     // bare function pointer, bitcast to the declared thin signature R(*)(Args). No shim,
     // no env, no fat struct. `fpTV` carries the target thin signature.
     llvm::Value* MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue& fpTV);
+    // A bare named function reaching a thin function<> slot through any producer door: converted
+    // with the destination signature (thinTV) or, when null, the function's own signature. Any other
+    // value is returned unchanged. Every thin store site routes through this, not MakeThinFnPtrValue.
+    llvm::Value* BareFunctionToThinValue(llvm::Value* val, const TypeAndValue* thinTV);
 
     // Extract the bare code pointer from a closure fat-struct value and present it as a thin
     // `function<T>`. Caller must ensure the closure does NOT capture (env null). Relies on the
@@ -7313,6 +7337,9 @@ public:
     // for narrowing a fat closure to a thin `function<T>` - the same env-null signal the extern
     // function-pointer argument path uses.
     bool ClosureIsStaticallyNonCapturing(llvm::Value* fatVal);
+    // The natural forwarder a fat closure calls through (lowered signature), or nullptr. Looks
+    // through the insertvalue chain and a null-selecting code field (a widened runtime pointer).
+    llvm::Function* ClosureForwarderOf(llvm::Value* fatVal);
 
     // Diagnostic for an illegal fat-closure -> thin `function<T>` narrowing. With capture names
     // (a capturing lambda literal) it lists them; with none (a stored Lambda<> value) it points at
@@ -7343,7 +7370,12 @@ public:
     // the thin ptr goes straight into the code slot, env is null. When the resulting Lambda is
     // invoked (env-last ABI), the trailing null env arg is harmlessly ignored by the bare C
     // function (caller-cleanup tolerance). The null env makes .toFunction() round-trip it back.
-    llvm::Value* WidenThinToFat(llvm::Value* thinPtr);
+    llvm::Value* WidenThinToFat(llvm::Value* thinPtr, const TypeAndValue& sigTV);
+    // Cache key of a C-ABI signature: FunctionPointerAbiKey plus every bit that changes the lowered
+    // arity (ownership, hidden raw-array counts, alias). Used by the forwarder and reverse thunks.
+    std::string CAbiSignatureKey(const TypeAndValue& ret, const std::vector<TypeAndValue>& params) const;
+    llvm::Function* GetOrCreateThinToFatForwarder(const TypeAndValue& ret,
+        const std::vector<TypeAndValue>& params, const AbiRecipe& cAbi);
 
     llvm::Value* WrapBareValueAsFatStruct(llvm::Function* original);
 
@@ -8162,7 +8194,7 @@ public:
     // A named function becomes {shim, null} and a thin `function<>` value becomes {code, null};
     // an already-fat value and a non-pointer are returned untouched. Shared by the normal call
     // path and virtual dispatch so the two cannot drift.
-    llvm::Value* WidenBareOrThinToClosureFat(llvm::Value* val);
+    llvm::Value* WidenBareOrThinToClosureFat(llvm::Value* val, const TypeAndValue& sigTV);
 
     // Lower a closure fat struct {code, env} to the bare code pointer that a thin
     // `function<>` / extern-C function-pointer parameter expects. The closure ABI is env-last,
@@ -8698,12 +8730,23 @@ public:
                                        const std::vector<TypeAndValue>& parameters,
                                        bool varargs) const;
 
-    // True when binding this argument to that parameter would truncate an integer.
-    bool ArgumentNarrowsParameter(const NamedVariable& arg, const TypeAndValue& param) const;
+    // The one scalar conversion table. Native calls refuse Narrow and EnumMismatch; C++ calls also
+    // take the ruled Widen. `param` is the referent of a reference parameter (ScalarArgumentReferent).
+    enum class ScalarArgConversion { NotScalar, Exact, Widen, Narrow, EnumMismatch };
+    ScalarArgConversion ClassifyScalarArgConversion(const NamedVariable& arg, const TypeAndValue& param) const;
+    // The value a C++ scalar reference parameter binds (the parameter itself when not a reference).
+    static TypeAndValue ScalarArgumentReferent(const TypeAndValue& param);
 
     // True when this argument is an integer bound to a 'bool' parameter - legal, and lowered
     // by ConvertIntegerCallArgument.
     bool ArgumentConvertsToBoolParameter(const NamedVariable& arg, const TypeAndValue& param) const;
+
+    // Integer width of a call argument (enum backing, else 32 for an unscoped enum; bool 1), or -1.
+    int CallArgumentIntegerBits(const NamedVariable& arg) const;
+    // Every viable constructor of a C++ class is refused by the scalar table (clang must not pick a
+    // narrowing overload silently).
+    bool CxxCtorSetRequiresNarrowing(const std::string& typeName,
+                                     const std::vector<NamedVariable>* argVars) const;
 
     // Short type name for a rejected condition operand.
     std::string DescribeConditionType(llvm::Type* t) const;
@@ -8855,6 +8898,8 @@ public:
     // Registration refusal of the LAST implicit-conversion wrapper attempted by the current
     // TryBindCxxImplicitArgumentConversions call; cleared on entry, taken by the caller.
     std::string cxxImplicitConversionRefusal_;
+    // HasImplicitClassPointerConversion answers, keyed "source|pointee|const".
+    std::unordered_map<std::string, bool> cxxXvaluePointerConversions_;
     std::string cppStructAccessContext_;
 
     /*
@@ -8907,13 +8952,12 @@ public:
         bool hasCopyCtor = false;
         bool hasCtorTemplate = false;
         bool hasAssignTemplate = false;
+        bool moveAssignBindsConstRef = false;        // clang selects a const T& for `dst = move src`
+        bool moveAssignConstSourceBindsConstRef = false;  // ... and for a const source
         bool hasDeletedMoveCtor = false;   // a user-declared `T(T&&) = delete`
         bool isAggregate = false;
         // Field name -> access, for the "is private" diagnostic on member access.
         std::map<std::string, int> fieldAccess;
-        // Fields declared `T&` / `T&&`. They bind as `T*`, but C++ cannot RESEAT a reference,
-        // so a store through the CFlat field name is refused at the use site.
-        std::set<std::string> referenceFields;
         // Member name -> access of the best (most accessible) overload, for method calls whose
         // name resolves to nothing because every candidate was filtered out.
         std::map<std::string, int> memberAccess;
@@ -9250,7 +9294,6 @@ public:
     // template specialization, or a class declared outside the bound header scope.
     bool CxxClassMayHaveUnregisteredOperators(const std::string& typeName) const;
     bool CxxClassDeclaresFriendOperators(const std::string& typeName) const;
-    bool RejectCxxReferenceFieldStore(const std::string& typeName, const std::string& memberName);
     bool CxxProtectedAccessAllowed(const std::string& typeName,
                                    bool accessedThroughCurrentObject) const;
 
@@ -9474,13 +9517,18 @@ public:
      * now the T - an owned temporary, or `intoSlot` when given.
      */
     enum class CxxConvertingCtorResult { NotApplicable, Converted, Refused };
+    // directInit: C++ direct-initialization (a cast); explicit constructors are candidates.
     CxxConvertingCtorResult ConvertThroughCxxConvertingCtor(NamedVariable& source,
                                                             const std::string& targetType,
                                                             llvm::Value* intoSlot,
-                                                            std::string& refusal);
+                                                            std::string& refusal,
+                                                            bool directInit = false);
     // A C++ record with a non-explicit conversion operator to a non-primitive type (libc++
     // `__val_expr::operator valarray<T>()`): copy-initializing a class from it is clang's call.
     bool HasImplicitClassConversionOperator(const std::string& sourceType);
+    // clang's std::is_convertible<S&&, P*> for a class xvalue at a P* parameter; cached per pair.
+    bool HasImplicitClassPointerConversion(const std::string& sourceType,
+                                           const std::string& pointeeType, bool pointeeConst);
     // Materialize (once per module) the llvm::Function for one structor / assignment operator,
     // typed from clang's own arrangement. Returns null after LogError when the plan is
     // inexpressible. `recipeOut` receives the recipe the call site must lower with.
@@ -10360,6 +10408,11 @@ public:
     bool IsNullPointerConstantArgument(const NamedVariable& arg, bool cxx = false) const;
     static bool LiteralTextHasSign(std::string_view text);
     static std::string LiteralIdentityForOverload(std::string_view text, bool* suffixedInteger = nullptr);
+    // [lex.icon] ladder: the single table for an integer literal's type, read by value lowering
+    // (ParseNumberConstant) and overload identity (LiteralIdentityForOverload). None = no row holds it.
+    enum class IntegerLiteralRung { None, Int, UInt, Long, ULong, I64, U64 };
+    static IntegerLiteralRung IntegerLiteralLadderPick(uint64_t magnitude, bool nonDecimal,
+                                                       bool unsignedSuffix, int longSuffix);
     // `cxxCandidate` false: a suffixed literal keeps master's native identity (only a lone L is `long`).
     std::string IntegerArgumentIdentity(const NamedVariable& arg, bool cxxCandidate = true) const;
 
@@ -11050,6 +11103,17 @@ public:
     // `calleeOverride`, when given, is the function POINTER to call instead of candidate.Function
     // (a virtual member loaded out of the receiver's vptr). The signature still comes from
     // candidate.Function, which is the declaration carrying clang's arrangement.
+    // Per-slot argument lowering and register-return decoding shared by EmitAbiLoweredCall and
+    // the thin function<> call site (the C ABI of the signature).
+    void LowerAbiArgs(const AbiRecipe& recipe, const std::vector<llvm::Value*>& argList,
+                      const std::vector<llvm::Value*>* indirectArgAddrs,
+                      const std::vector<llvm::Value*>* rawArrayCounts,
+                      std::vector<llvm::Value*>& loweredArgs);
+    llvm::Value* DecodeAbiRegisterReturn(const AbiRecipe& recipe, llvm::Value* ci);
+    // True when a thin function<> signature is lowered by the C ABI: native CFlat aggregates (not
+    // C++ class ones, which keep the cxx indirect recipe) whose ABI recipe has lowering.
+    bool ThinFnPtrUsesCAbi(const TypeAndValue& ret, const std::vector<TypeAndValue>& params,
+                           AbiRecipe& outRecipe);
     llvm::Value* EmitAbiLoweredCall(const FunctionSymbol& candidate, std::vector<llvm::Value*>& argList,
                                     llvm::Value* sretDest = nullptr,
                                     const std::vector<llvm::Value*>* indirectArgAddrs = nullptr,
@@ -11740,6 +11804,7 @@ public:
     // 170: anonymous struct members of a C++ class carry clang's triviality flags.
     // 171: member templates of partial-specialization instantiations, operator() templates, auto member returns.
     // 172: a C++ record carries hasAssignTemplate ("hat") for the explicit-move shortcut.
+    // 229: a C++ record carries clang's selected-assignment flags ("mab", "mabc").
     // 173: globals carry their declaring file ("fl"), real internal linkage ("il") and an
     //      internal const's evaluated-value hash ("ci", none when the value holds an address),
     //      so a same-name internal static from two import groups is refused as ambiguous.
@@ -11772,7 +11837,7 @@ public:
     // 218: virtual-base conversions go through clang wrappers; system-header class pointers bind
     //      by their spelled class instead of the void* placeholder (T50).
     // 228: macro entries record whether their expanded body is an integer literal zero (T52).
-    static constexpr int kCHeaderCacheVersion = 228;
+    static constexpr int kCHeaderCacheVersion = 230;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

@@ -463,6 +463,10 @@ namespace cflat_cinterop
         bool hasCtorTemplate = false;
         // A non-deleted `operator=` TEMPLATE: it can beat the bound copy / move assignment.
         bool hasAssignTemplate = false;
+        // Clang's overload resolution for `dst = src` on a non-const lvalue dst: true when the
+        // selected operator= binds `const T&` (non-deleted). "c": the source is a const rvalue.
+        bool moveAssignBindsConstRef = false;
+        bool moveAssignConstSourceBindsConstRef = false;
         bool isAggregate = false;
         std::vector<RawCxxCtorTemplate> ctorTemplates;
         std::vector<RawCxxMember> members;

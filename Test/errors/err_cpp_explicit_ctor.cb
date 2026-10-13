@@ -40,13 +40,6 @@ extern int main()
         cppexp.ConvChain assignChain = default;
         assignChain = "abc";
     }
-    // C++ would call `operator=(double)` for an int source; CFlat's call rules refuse int ->
-    // double, so the assignment is refused and NOT rerouted through ConvDblAssign(int).
-    expect_error("C++ resolves this assignment to 'cppexp.ConvDblAssign.operator=(double)', which needs a conversion CFlat does not make implicitly ('int' to 'double')") {
-        cppexp.ConvDblAssign assignDouble = default;
-        int assignInt = 5;
-        assignDouble = assignInt;
-    }
     expect_error("cannot initialize C++ class 'cppexp.ConvCnt' from this expression; use 'cppexp.ConvCnt(args)'") {
         int pointee = 0;
         cppexp.ConvCnt initPointer = &pointee;

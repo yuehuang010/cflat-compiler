@@ -4901,6 +4901,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxBindingRefusals_.clear();
     cxxGroupStatics_.clear();
     cxxImplicitConversionRefusal_.clear();
+    cxxXvaluePointerConversions_.clear();
     cxxTriviallyCopyableRecords_.clear();
     cxxNontrivialRecords_.clear();
     cxxTriviallyRelocatableRecords_.clear();

@@ -1,0 +1,13 @@
+// A class T&& result is an xvalue, not the class pointer slot. The CFlat pointer door rejects it.
+import cpp "utility";
+import cpp "cpp_interop_basic.h";
+
+int t70_take_class_pointer(cppi.Tracked* value) { return value == nullptr ? 0 : 1; }
+
+expect_error("cannot pass C++ class xvalue 'cppi.Tracked' to pointer parameter") {
+    extern int main()
+    {
+        cppi.Tracked source = cppi.Tracked(1);
+        return t70_take_class_pointer(std.move(source));
+    }
+}

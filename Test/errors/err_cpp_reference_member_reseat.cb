@@ -1,35 +1,29 @@
 import cpp "cpp_interop_ref_member.h";
 
 /*
- * A C++ reference data member binds as a pointer field (see the C++ reference data members section of Test/test_cpp_interop.cb),
- * so a STORE to the field would RESEAT the reference - which C++ has no syntax for. Reading the
- * field and storing through it (`*h.r = v`) stay legal; only the direct store is refused. The
- * second leg is the flattened (base-class) field walk, which is a separate collection path.
+ * A C++ reference data member is an ALIAS of its referent (see the C++ reference data members
+ * section of Test/test_cpp_interop.cb), so the field cannot be reseated: assigning a pointer to it
+ * is a type error, the same as C++ refusing `h.r = &y`. The second leg is the flattened (base-class)
+ * field walk, which is a separate collection path. Storing an int through the field is legal.
  */
 extern int main()
 {
-    expect_error("field 'r' of C++ class 'cppref.RefHolder' is a C++ reference and cannot be reseated") {
+    expect_error("cannot assign 'h.r' of type 'int' from a value of type 'int*'") {
         int x = 5;
         int y = 9;
         cppref.RefHolder h = cppref.RefHolder(&x);
         h.r = &y;
     }
 
-    expect_error("field 'r' of C++ class 'cppref.RefDerived' is a C++ reference and cannot be reseated") {
+    expect_error("cannot assign 'd.r' of type 'int' from a value of type 'int*'") {
         int x = 5;
         int y = 9;
         cppref.RefDerived d = cppref.RefDerived(&x, 1);
         d.r = &y;
     }
 
-    // A postfix increment and a parenthesized left-hand side store to the field just the same.
-    expect_error("field 'r' of C++ class 'cppref.RefHolder' is a C++ reference and cannot be reseated") {
-        int x = 5;
-        cppref.RefHolder h = cppref.RefHolder(&x);
-        h.r++;
-    }
-
-    expect_error("field 'r' of C++ class 'cppref.RefHolder' is a C++ reference and cannot be reseated") {
+    // A parenthesized left-hand side is the same destination.
+    expect_error("cannot assign 'h.r' of type 'int' from a value of type 'int*'") {
         int x = 5;
         int y = 9;
         cppref.RefHolder h = cppref.RefHolder(&x);

@@ -3,6 +3,9 @@
 // destroyed elements that had never been constructed.
 import cpp "cpp_interop_arrayelem.h";
 
+expect_error("C++ class 'cppa.NoDef' has no default constructor cflat can call (it is deleted)");
+cppa.NoDef[2] badGlobal;
+
 extern int main()
 {
     expect_error("C++ class 'cppa.NoDef' has no default constructor cflat can call (it is deleted), so an array of it cannot be default-initialized") {

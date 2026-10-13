@@ -95,3 +95,34 @@ int sum_six_pairs(struct Pair a, struct Pair b, struct Pair c,
     return (a.x + a.y) + (b.x + b.y) + (c.x + c.y) +
            (d.x + d.y) + (e.x + e.y) + (f.x + f.y);
 }
+
+/* --- function<> C-ABI legs (T77): a 24-byte aggregate crossing a function pointer. Every call
+   through a function<> uses the C ABI of its signature, so these must agree with clang. --- */
+struct T77Big { long long a, b, c; };
+typedef long long (*t77_fn)(int, struct T77Big, double, short);
+typedef struct T77Big (*t77_mk_fn)(int);
+struct T77Ops { t77_fn cb; int tag; };
+
+long long t77_c_big(int x, struct T77Big s, double d, short sh)
+{
+    return x * 2 + s.a * 3 + s.b * 5 + s.c * 7 + (long long)(d * 11) + sh * 13;
+}
+struct T77Big t77_c_mk(int n) { struct T77Big r; r.a = n; r.b = n + 1; r.c = n + 2; return r; }
+
+t77_fn   t77_get_big(void) { return t77_c_big; }
+t77_mk_fn t77_get_mk(void) { return t77_c_mk; }
+t77_fn   t77_ident_fn(t77_fn f) { return f; }
+long long t77_call_with(t77_fn f, long long a)
+{
+    struct T77Big b; b.a = a; b.b = 2; b.c = 3;
+    return f(4, b, 2.5, (short)-6);
+}
+struct T77Ops t77_make_ops(void) { struct T77Ops o; o.cb = t77_c_big; o.tag = 9; return o; }
+
+/* Round 2 fixtures: a narrow integer argument after a lowered struct, through a C pointer. */
+typedef long long (*t77_sfn)(struct T77Big, short);
+typedef unsigned long long (*t77_ufn)(struct T77Big, unsigned short);
+long long t77_c_short(struct T77Big s, short v) { return (long long)v * 2 + s.a; }
+unsigned long long t77_c_ushort(struct T77Big s, unsigned short v) { return (unsigned long long)v + (unsigned long long)s.a; }
+t77_sfn  t77_get_short(void)  { return t77_c_short; }
+t77_ufn  t77_get_ushort(void) { return t77_c_ushort; }

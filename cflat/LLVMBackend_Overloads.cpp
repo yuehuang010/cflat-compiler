@@ -339,36 +339,214 @@ std::string LLVMBackend::SpellDeclaredSignature(const TypeAndValue& returnType,
         return signature + ")";
     }
 
-bool LLVMBackend::ArgumentNarrowsParameter(const NamedVariable& arg, const TypeAndValue& param) const
+// Bit width of a floating parameter / argument by its C++ spelling, or -1.
+static int FloatingBitsOfName(const std::string& name)
 {
-        if (arg.TypeAndValue.Pointer || param.Pointer) return false;
-
-        auto resolve = [&](const std::string& tn) -> std::string {
-            auto it = enumBackingTypes.find(tn);
-            return (it != enumBackingTypes.end()) ? it->second : tn;
-        };
-        TypeAndValue argType = arg.TypeAndValue;
-        TypeAndValue paramType = param;
-        argType.TypeName = resolve(argType.TypeName);
-        paramType.TypeName = resolve(paramType.TypeName);
-
-        // A 'bool' parameter converts rather than narrows - see ArgumentConvertsToBoolParameter.
-        if (paramType.TypeName == "bool") return false;
-
-        int paramBits = paramType.IsInteger();
-        if (paramBits == -1) return false;
-
-        int argBits = argType.IsInteger();
-        // An unnamed primitive argument carries its width only in the lowered type.
-        if (argBits == -1 && argType.TypeName.empty() && arg.BaseType && arg.BaseType->isIntegerTy()
-            && !arg.BaseType->isIntegerTy(1))
-            argBits = (int)arg.BaseType->getIntegerBitWidth();
-        if (argBits == -1) return false;
-
-        return argBits > paramBits;
+        if (name == "float") return 32;
+        if (name == "double") return 64;
+        return -1;
 }
 
-bool LLVMBackend::ArgumentConvertsToBoolParameter(const NamedVariable& arg, const TypeAndValue& param) const
+int LLVMBackend::CallArgumentIntegerBits(const NamedVariable& arg) const
+{
+        if (arg.TypeAndValue.Pointer || arg.TypeAndValue.ElemPointer) return -1;
+        const std::string& name = arg.TypeAndValue.TypeName;
+        // An enum's backing type is its width (native and C++ alike); bool is one bit.
+        if (auto it = enumBackingTypes.find(name); it != enumBackingTypes.end())
+        {
+            TypeAndValue backing;
+            backing.TypeName = it->second;
+            return backing.TypeName == "bool" ? 1 : backing.IsInteger();
+        }
+        if (name == "bool") return 1;
+        // An unscoped enum without a backing type promotes through int.
+        if (!name.empty() && !ResolveEnumTypeName(name).empty())
+            return IsScopedEnumTypeName(name) ? -1 : 32;
+        const int bits = arg.TypeAndValue.IsInteger();
+        if (bits != -1) return bits;
+        // An unnamed primitive argument carries its width only in the lowered type.
+        if (name.empty() && arg.BaseType && arg.BaseType->isIntegerTy())
+            return arg.BaseType->isIntegerTy(1) ? 1 : (int)arg.BaseType->getIntegerBitWidth();
+        return -1;
+}
+
+LLVMBackend::TypeAndValue LLVMBackend::ScalarArgumentReferent(const TypeAndValue& param)
+{
+        // A C++ scalar reference is the pointer-shaped alias; its referent is the value it binds.
+        if (!param.Pointer || param.ElemPointer || param.IsCxxRefToPointer
+            || !(param.IsAlias || param.IsRvalueRef) || param.IsFunctionPointer
+            || param.IsInterface || param.IsArrayView)
+            return param;
+        TypeAndValue referent = param;
+        referent.Pointer = false;
+        referent.IsAlias = false;
+        referent.IsRvalueRef = false;
+        referent.IsCxxConstRef = false;
+        referent.PointerDepth = 0;
+        return referent;
+}
+
+/*
+ * The one scalar conversion table (ruling 2026-09-04 + 2026-10-09). Native calls refuse exactly
+ * Narrow and EnumMismatch; C++ calls also take Widen (to a by-value or const-reference floating or
+ * integer parameter). `param` is the referent for a reference parameter (ScalarArgumentReferent).
+ */
+LLVMBackend::ScalarArgConversion LLVMBackend::ClassifyScalarArgConversion(
+        const NamedVariable& arg, const TypeAndValue& param) const
+{
+        if (arg.TypeAndValue.Pointer || arg.TypeAndValue.ElemPointer || param.Pointer || param.ElemPointer)
+            return ScalarArgConversion::NotScalar;
+        // Enum identity: an unscoped enum converts to no other enum type, scoped one included.
+        const std::string argEnum = arg.TypeAndValue.IsScopedEnum ? std::string()
+            : ResolveEnumTypeName(arg.TypeAndValue.TypeName);
+        const std::string paramEnum = ResolveEnumTypeName(param.TypeName);
+        if (!argEnum.empty() && !IsScopedEnumTypeName(argEnum) && !paramEnum.empty())
+            return argEnum == paramEnum ? ScalarArgConversion::Exact : ScalarArgConversion::EnumMismatch;
+
+        TypeAndValue paramType = param;
+        if (auto it = enumBackingTypes.find(param.TypeName); it != enumBackingTypes.end())
+            paramType.TypeName = it->second;
+        const bool paramBool = paramType.TypeName == "bool";
+        const int paramBits = paramType.IsInteger();
+        const int paramFloat = FloatingBitsOfName(paramType.TypeName);
+
+        const int argBits = CallArgumentIntegerBits(arg);
+        if (argBits != -1)
+        {
+            // Integer -> bool is the one legal narrowing at a call.
+            if (paramBool) return argBits == 1 ? ScalarArgConversion::Exact : ScalarArgConversion::Widen;
+            if (paramBits != -1)
+            {
+                if (argBits > paramBits) return ScalarArgConversion::Narrow;
+                return argBits == paramBits ? ScalarArgConversion::Exact : ScalarArgConversion::Widen;
+            }
+            if (paramFloat != -1)
+                return argBits <= paramFloat ? ScalarArgConversion::Widen : ScalarArgConversion::Narrow;
+            return ScalarArgConversion::NotScalar;
+        }
+
+        // A floating argument. An unsuffixed literal (no TypeName) is a C++ double even where it
+        // lowers as a float, and native accepts it for a float parameter.
+        const int namedFloat = FloatingBitsOfName(arg.TypeAndValue.TypeName);
+        const bool literal = arg.TypeAndValue.TypeName.empty() && arg.BaseType
+            && arg.BaseType->isFloatingPointTy();
+        if (namedFloat == -1 && !literal) return ScalarArgConversion::NotScalar;
+        const int argFloat = namedFloat != -1 ? namedFloat
+            : (arg.LiteralIdentity == "double" || arg.BaseType->isDoubleTy() ? 64 : 32);
+        if (paramBool || paramBits != -1) return ScalarArgConversion::Narrow;
+        if (paramFloat == -1) return ScalarArgConversion::NotScalar;
+        if (argFloat == paramFloat) return ScalarArgConversion::Exact;
+        if (argFloat < paramFloat) return ScalarArgConversion::Widen;
+        return literal ? ScalarArgConversion::Exact : ScalarArgConversion::Narrow;
+}
+
+// The CFlat scalar name a C++ parameter spelling denotes ("const unsigned short &" -> "short"),
+// or empty when the spelling is dependent, a class, or otherwise not a scalar.
+static std::string CxxScalarNameOfSpelling(const std::string& spelling)
+{
+        std::string key;
+        std::string word;
+        for (const char c : spelling + " ")
+        {
+            if (c != ' ' && c != '&' && c != '\t')
+            {
+                word += c;
+                continue;
+            }
+            if (!word.empty() && word != "const" && word != "volatile")
+                key += (key.empty() ? "" : " ") + word;
+            word.clear();
+        }
+        if (key == "bool" || key == "float" || key == "double") return key;
+        if (key == "char" || key == "signed char" || key == "unsigned char") return "char";
+        if (key == "short" || key == "short int" || key == "signed short" || key == "signed short int"
+            || key == "unsigned short" || key == "unsigned short int") return "short";
+        if (key == "int" || key == "signed" || key == "signed int" || key == "unsigned"
+            || key == "unsigned int") return "int";
+        if (key == "long" || key == "long int" || key == "signed long" || key == "signed long int"
+            || key == "unsigned long" || key == "unsigned long int") return "long";
+        if (key == "long long" || key == "long long int" || key == "signed long long"
+            || key == "unsigned long long" || key == "unsigned long long int") return "i64";
+        return std::string();
+}
+
+/*
+ * True when every viable constructor of the class refuses an argument by the scalar table, so the
+ * call has no table-accepted candidate. Viability is the arity, the defaults the call leaves
+ * unfilled, and the pointer shape. A template is judged by its spelled parameters: a '*' parameter
+ * takes a pointer or a null constant, and a concrete scalar spelling is classified. Clang still selects the
+ * overload; this decides only whether CFlat refuses first.
+ */
+bool LLVMBackend::CxxCtorSetRequiresNarrowing(const std::string& typeName,
+                                              const std::vector<NamedVariable>* argVars) const
+{
+        if (argVars == nullptr || argVars->empty()) return false;
+        const CxxClassInfo* info = GetCxxClassInfoWithConstructors(typeName);
+        if (info == nullptr) return false;
+        const auto isPointerArg = [](const NamedVariable& arg) {
+            return arg.TypeAndValue.Pointer || arg.TypeAndValue.ElemPointer || arg.IsStringLiteral;
+        };
+        bool sawCandidate = false;
+        for (const CxxClassInfo::Structor& ctor : info->constructors)
+        {
+            if (ctor.isDeleted || ctor.params.empty() || ctor.isCopyCtor || ctor.isMoveCtor) continue;
+            const size_t paramCount = ctor.params.size() - 1;
+            if (argVars->size() > paramCount) continue;
+            bool viable = true;
+            for (size_t i = argVars->size(); i < paramCount; ++i)
+                if (i + 1 >= ctor.defaultArgs.size() || ctor.defaultArgs[i + 1].kind.empty())
+                    viable = false;
+            // A pointer parameter takes a pointer or a null pointer constant; a scalar takes a scalar.
+            for (size_t i = 0; viable && i < argVars->size(); ++i)
+            {
+                const bool pointerParam = ScalarArgumentReferent(ctor.params[i + 1]).Pointer;
+                viable = pointerParam == isPointerArg((*argVars)[i])
+                    || (pointerParam && IsNullPointerConstantArgument((*argVars)[i], true));
+            }
+            if (!viable) continue;
+            bool refused = false;
+            for (size_t i = 0; i < argVars->size() && !refused; ++i)
+            {
+                const ScalarArgConversion conv = ClassifyScalarArgConversion((*argVars)[i],
+                    ScalarArgumentReferent(ctor.params[i + 1]));
+                refused = conv == ScalarArgConversion::Narrow || conv == ScalarArgConversion::EnumMismatch;
+            }
+            if (!refused) return false;
+            sawCandidate = true;
+        }
+        // A constructor template is not in the listed set. It is viable when its arity fits and its
+        // '*' parameters meet pointers or null constants; a concrete scalar must not narrow.
+        const auto record = cxxRecordEntries_.find(typeName);
+        if (record != cxxRecordEntries_.end())
+            for (const cflat_cinterop::RawCxxCtorTemplate& ct : record->second.ctorTemplates)
+            {
+                const size_t n = ct.paramTypes.size();
+                if (ct.isDeleted || (argVars->size() > n && !ct.variadic)) continue;
+                bool viable = true;
+                for (size_t i = argVars->size(); viable && i < n; ++i)
+                    viable = i < ct.defaulted.size() && ct.defaulted[i] != 0;
+                for (size_t i = 0; viable && i < argVars->size() && i < n; ++i)
+                    viable = ct.paramTypes[i].find('*') == std::string::npos || isPointerArg((*argVars)[i])
+                        || IsNullPointerConstantArgument((*argVars)[i], true);
+                if (!viable) continue;
+                bool refused = false;
+                for (size_t i = 0; !refused && i < argVars->size() && i < n; ++i)
+                {
+                    const std::string scalar = CxxScalarNameOfSpelling(ct.paramTypes[i]);
+                    if (scalar.empty()) continue;
+                    TypeAndValue spelled;
+                    spelled.TypeName = scalar;
+                    const ScalarArgConversion conv = ClassifyScalarArgConversion((*argVars)[i], spelled);
+                    refused = conv == ScalarArgConversion::Narrow || conv == ScalarArgConversion::EnumMismatch;
+                }
+                if (!refused) return false;
+                sawCandidate = true;
+            }
+        return sawCandidate;
+}
+
+bool LLVMBackend::ArgumentConvertsToBoolParameter(
+const NamedVariable& arg, const TypeAndValue& param) const
 {
         if (param.Pointer || param.TypeName != "bool") return false;
         if (arg.TypeAndValue.Pointer) return false;
@@ -393,6 +571,43 @@ bool LLVMBackend::LiteralTextHasSign(std::string_view text)
             text.remove_suffix(1);
         }
         return !text.empty() && (text.front() == '+' || text.front() == '-');
+}
+
+// [lex.icon] ladder rows in C/C++ order. A signed row needs no 'u' suffix; an unsigned row needs a
+// 'u' suffix or a non-decimal spelling (decimal never takes an unsigned type). maxLongSuffix caps the
+// L count a row can carry (int/uint: none; long/ulong: L; long long/unsigned long long: LL).
+enum class LadderWidth { Bits32, LongBits, Bits64 };
+struct LadderRow
+{
+    LLVMBackend::IntegerLiteralRung rung;
+    bool isUnsigned;
+    int maxLongSuffix;
+    LadderWidth width;
+};
+constexpr LadderRow kIntegerLiteralLadder[] = {
+    { LLVMBackend::IntegerLiteralRung::Int,   false, 0, LadderWidth::Bits32 },
+    { LLVMBackend::IntegerLiteralRung::UInt,  true,  0, LadderWidth::Bits32 },
+    { LLVMBackend::IntegerLiteralRung::Long,  false, 1, LadderWidth::LongBits },
+    { LLVMBackend::IntegerLiteralRung::ULong, true,  1, LadderWidth::LongBits },
+    { LLVMBackend::IntegerLiteralRung::I64,   false, 2, LadderWidth::Bits64 },
+    { LLVMBackend::IntegerLiteralRung::U64,   true,  2, LadderWidth::Bits64 },
+};
+
+LLVMBackend::IntegerLiteralRung LLVMBackend::IntegerLiteralLadderPick(uint64_t magnitude, bool nonDecimal,
+                                                                     bool unsignedSuffix, int longSuffix)
+{
+    for (const LadderRow& row : kIntegerLiteralLadder)
+    {
+        if (row.isUnsigned ? !(unsignedSuffix || nonDecimal) : unsignedSuffix) continue;
+        if (longSuffix > row.maxLongSuffix) continue;
+        const unsigned bits = row.width == LadderWidth::Bits32 ? 32
+            : row.width == LadderWidth::Bits64 ? 64 : static_cast<unsigned>(longBits_);
+        const bool holds = row.isUnsigned
+            ? (bits >= 64 || magnitude < (uint64_t(1) << bits))
+            : magnitude < (uint64_t(1) << (bits - 1));
+        if (holds) return row.rung;
+    }
+    return IntegerLiteralRung::None;
 }
 
 // Record C++ identities before literal values lose source spelling and narrow during lowering.
@@ -436,7 +651,9 @@ std::string LLVMBackend::LiteralIdentityForOverload(std::string_view text, bool*
             return "";
         const bool hexadecimal = digits.size() > 2 && digits[0] == '0'
             && (digits[1] == 'x' || digits[1] == 'X');
-        const bool hasFloatSuffix = digits.back() == 'f' || digits.back() == 'F';
+        // In a hex literal 'f' is a digit (0x7f, 0xFFFFFFFFFFFFFFFF) unless it follows a hex-float exponent.
+        const bool hasFloatSuffix = (digits.back() == 'f' || digits.back() == 'F')
+            && (!hexadecimal || digits.find_first_of("pP") != std::string_view::npos);
         const bool hasLongFloatSuffix = digits.back() == 'l' || digits.back() == 'L';
         std::string_view floatingDigits = digits;
         if (hasFloatSuffix || hasLongFloatSuffix) floatingDigits.remove_suffix(1);
@@ -496,11 +713,9 @@ std::string LLVMBackend::LiteralIdentityForOverload(std::string_view text, bool*
         }
         const bool suffixed = unsignedSuffix || longSuffix > 0;
         int base = 10;
-        bool hex = false;
         if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X'))
         {
             base = 16;
-            hex = true;
             digits.remove_prefix(2);
         }
         else if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'b' || digits[1] == 'B'))
@@ -521,49 +736,29 @@ std::string LLVMBackend::LiteralIdentityForOverload(std::string_view text, bool*
         if (parsed.ec != std::errc() || parsed.ptr != digits.data() + digits.size())
             return "";   // an unsupported suffix, an operator, or out of u64 range
 
-        if (suffixed)
+        if (!negative || suffixed)
         {
-            // C++ [lex.icon]: the first type of the suffix's list that holds the value. A decimal
-            // literal without `u` never takes an unsigned type; the sign of `-1L` is an operator.
-            struct Candidate { const char* name; int valueBits; bool isUnsigned; };
-            const int longValueBits = longBits_ - 1;
-            const Candidate intType{ "int", 31, false }, uintType{ "u32", 32, true };
-            const Candidate longType{ "long", longValueBits, false };
-            const Candidate ulongType{ "ulong", longBits_, true };
-            const Candidate llType{ "i64", 63, false }, ullType{ "u64", 64, true };
-            const bool decimal = base == 10;
-            std::vector<Candidate> list;
-            if (unsignedSuffix)
+            // The sign of a suffixed literal (`-1L`) is an operator; the magnitude takes the ladder.
+            const IntegerLiteralRung rung = IntegerLiteralLadderPick(value, base != 10, unsignedSuffix, longSuffix);
+            if (rung == IntegerLiteralRung::None) return "";
+            if (suffixed && suffixedInteger != nullptr) *suffixedInteger = true;
+            switch (rung)
             {
-                if (longSuffix == 0) list = { uintType, ulongType, ullType };
-                else if (longSuffix == 1) list = { ulongType, ullType };
-                else list = { ullType };
+            case IntegerLiteralRung::Int: return "int";
+            case IntegerLiteralRung::UInt: return "u32";
+            case IntegerLiteralRung::Long: return "long";
+            case IntegerLiteralRung::ULong: return "ulong";
+            case IntegerLiteralRung::I64: return "i64";
+            case IntegerLiteralRung::U64: return "u64";
+            default: return "";
             }
-            else if (decimal)
-                list = longSuffix == 1 ? std::vector<Candidate>{ longType, llType }
-                                       : std::vector<Candidate>{ llType };
-            else
-                list = longSuffix == 1
-                    ? std::vector<Candidate>{ longType, ulongType, llType, ullType }
-                    : std::vector<Candidate>{ llType, ullType };
-            for (const Candidate& candidate : list)
-                if (candidate.valueBits >= 64 || value < (uint64_t(1) << candidate.valueBits))
-                {
-                    if (suffixedInteger != nullptr) *suffixedInteger = true;
-                    return candidate.name;
-                }
-            return "";
         }
-
+        // Unsuffixed negative: a folded signed literal, as before the ladder (int, then long/i64).
         const uint64_t intMax = (uint64_t)std::numeric_limits<int32_t>::max();
-        if (negative ? value <= intMax + 1 : value <= intMax)
+        if (value <= intMax + 1)
             return "int";
-        // A hex literal inside u32 range lowers as an i32 bit pattern; a 64-bit identity would
-        // sign-extend that pattern into the wider parameter.
-        if (hex && !negative && value <= 0xFFFFFFFFull)
-            return "";
         const uint64_t i64Max = (uint64_t)std::numeric_limits<int64_t>::max();
-        if (negative ? value > i64Max + 1 : value > i64Max)
+        if (value > i64Max + 1)
             return "";
         return longBits_ == 64 ? "long" : "i64";
 }
@@ -1505,6 +1700,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Native: a floating pointee against an unrelated primitive pointee (int* into double*).
             // Removed while any other candidate is viable, else kept (legacy accept, master pick).
             bool unrelatedPointeeNotViable = false;
+            // A normalized C++ class xvalue cannot bind a same-class pointer value parameter.
+            bool normalizedCxxXvaluePointerNotViable = false;
             // In a C++ overload set containing the same T& and const T& parameter, an
             // lvalue binds to T&. Count only this exact sibling comparison.
             int mutableRefPreference = 0;
@@ -1610,7 +1807,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         declaredParamRefuses = true;
                     // A DECLARED parameter of a variadic candidate is judged like any other:
                     // narrowing into it has no conversion and reached the module verifier.
-                    if (ArgumentNarrowsParameter(arg, *varParamItr))
+                    if (const ScalarArgConversion conv = ClassifyScalarArgConversion(arg,
+                            ScalarArgumentReferent(*varParamItr));
+                        conv == ScalarArgConversion::Narrow || conv == ScalarArgConversion::EnumMismatch)
                         declaredParamRefuses = true;
                     const auto& originalArgType = arg.HasOriginalArgumentType
                         ? arg.OriginalArgumentType : arg.TypeAndValue;
@@ -1668,6 +1867,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             bool callbackConstUnproven = false;
             bool cxxPointeeConstNotViable = false;
             bool unrelatedPointeeNotViable = false;
+            bool normalizedCxxXvaluePointerNotViable = false;
             // Arguments bound through a user-defined conversion; the extra fields describe
             // conversion operators (see Ranked for the aggregate fallback).
             int userConversions = 0;
@@ -1680,6 +1880,17 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             for (const auto& arg : arguments)
             {
                 int result = -1;
+                if (candidateParamItr != candidate.Parameters.end()
+                    && arg.IsNormalizedCxxXvalue
+                    && !arg.TypeAndValue.Pointer
+                    && IsCxxRecord(arg.TypeAndValue.TypeName)
+                    && candidateParamItr->Pointer && !candidateParamItr->IsAlias
+                    && !candidateParamItr->IsRvalueRef
+                    && candidateParamItr->TypeName == arg.TypeAndValue.TypeName
+                    && !HasImplicitClassPointerConversion(arg.TypeAndValue.TypeName,
+                                                          candidateParamItr->TypeName,
+                                                          candidateParamItr->IsCxxPointeeConst))
+                    normalizedCxxXvaluePointerNotViable = true;
                 if (candidate.IsCxx && candidateParamItr != candidate.Parameters.end())
                 {
                     const auto relation = CxxCandidatePointeeConstRelation(candidate,
@@ -2210,14 +2421,27 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         valueParam.ElemPointer = false;
                         valueParam.PointerDepth = 0;
                         result = CompareUpconvert(arg.BaseType, GetType(valueParam));
+                        // A scalar rvalue reference binds a converted temporary like const T&.
+                        const TypeAndValue rvalueReferent = ScalarArgumentReferent(*candidateParamItr);
+                        if (candidate.IsCxx && result < 0 && rvalueReferent.TypeName != "bool"
+                            && ClassifyScalarArgConversion(arg, rvalueReferent) == ScalarArgConversion::Widen)
+                        {
+                            result = 1;
+                            constRefReferentArm = true;
+                            constRefReferentIdentity = IntegerParameterIdentity(rvalueReferent);
+                        }
                     }
                     else if (TypeAndValue constRefReferent;
                              !arg.TypeAndValue.Pointer
                              && CxxConstScalarRefReferent(*candidateParamItr, constRefReferent))
                     {
-                        // A C++ `const T&` scalar parameter accepts an rvalue: score it against
-                        // the REFERENT, and let argument lowering materialize the temporary.
-                        result = CompareUpconvert(arg.BaseType, GetType(constRefReferent));
+                        // A `const T&` scalar binds a temporary: score the REFERENT by the scalar table.
+                        // Widen is a converted temporary; argument lowering materializes it.
+                        if (const ScalarArgConversion conv = ClassifyScalarArgConversion(arg, constRefReferent);
+                            conv == ScalarArgConversion::Exact || conv == ScalarArgConversion::Widen)
+                            result = conv == ScalarArgConversion::Exact ? 0 : 1;
+                        else
+                            result = -1;
                         if (result >= 0)
                         {
                             constRefReferentArm = true;
@@ -2486,11 +2710,16 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     && (arg.IsStringLiteral || isStringLiteralValue(arg.Primary)))
                     result = -1;
 
-                // Implicit integer NARROWING at a call argument is not legal (ruling 2026-09-04):
-                // reject it here so the caller reports "no overload ... matches", the same answer
-                // an 'int' argument to the same parameter already got.
-                if (result >= 0 && ArgumentNarrowsParameter(arg, *candidateParamItr))
+                // The one scalar table (rulings 2026-09-04, 2026-10-09): Narrow and EnumMismatch are
+                // refused; a C++ by-value parameter also takes Widen. Bool keeps its own arm.
+                const ScalarArgConversion scalarConv = ClassifyScalarArgConversion(arg,
+                    ScalarArgumentReferent(*candidateParamItr));
+                if (result >= 0 && (scalarConv == ScalarArgConversion::Narrow
+                                    || scalarConv == ScalarArgConversion::EnumMismatch))
                     result = -1;
+                if (candidate.IsCxx && result < 0 && scalarConv == ScalarArgConversion::Widen
+                    && !candidateParamItr->Pointer && candidateParamItr->TypeName != "bool")
+                    result = 1;
 
                 const auto& originalArgType = arg.HasOriginalArgumentType
                     ? arg.OriginalArgumentType : arg.TypeAndValue;
@@ -2791,6 +3020,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 ranked.callbackConstUnproven = callbackConstUnproven;
                 ranked.cxxPointeeConstNotViable = cxxPointeeConstNotViable;
                 ranked.unrelatedPointeeNotViable = unrelatedPointeeNotViable;
+                ranked.normalizedCxxXvaluePointerNotViable = normalizedCxxXvaluePointerNotViable;
                 ranked.userConversions = userConversions;
                 ranked.userConversionCost = userConversionCost;
                 ranked.userConversionNames = userConversionNames;
@@ -2818,6 +3048,15 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         {
             std::erase_if(perfect, [](const Ranked& r) { return r.unrelatedPointeeNotViable; });
             std::erase_if(possible, [](const Ranked& r) { return r.unrelatedPointeeNotViable; });
+        }
+        auto normalizedXvaluePointerViable = [](const Ranked& r) {
+            return !r.normalizedCxxXvaluePointerNotViable;
+        };
+        if (std::any_of(perfect.begin(), perfect.end(), normalizedXvaluePointerViable)
+            || std::any_of(possible.begin(), possible.end(), normalizedXvaluePointerViable))
+        {
+            std::erase_if(perfect, [](const Ranked& r) { return r.normalizedCxxXvaluePointerNotViable; });
+            std::erase_if(possible, [](const Ranked& r) { return r.normalizedCxxXvaluePointerNotViable; });
         }
 
         using Result = std::pair<std::vector<NamedVariable>, FunctionSymbol>;
@@ -5650,6 +5889,26 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             // param, which for printf is 'ptr %fmt' - causing all variadic args to be
             // pushed as storage/GEP addresses instead of loaded values).
             bool inVariadicRange = candidate.Variadic && argIndex >= candidate.Parameters.size();
+            if (!inVariadicRange && !(candidate.IsMethod && argIndex == 0)
+                && argIndex < candidate.Parameters.size()
+                && candidate.Parameters[argIndex].Pointer
+                && !candidate.Parameters[argIndex].IsAlias
+                && !candidate.Parameters[argIndex].IsRvalueRef
+                && !candidate.Parameters[argIndex].IsInterface
+                && !arg.TypeAndValue.Pointer && arg.IsNormalizedCxxXvalue
+                && IsCxxRecord(arg.TypeAndValue.TypeName)
+                && arg.TypeAndValue.TypeName == candidate.Parameters[argIndex].TypeName
+                && !HasImplicitClassPointerConversion(arg.TypeAndValue.TypeName,
+                    candidate.Parameters[argIndex].TypeName,
+                    candidate.Parameters[argIndex].IsCxxPointeeConst))
+            {
+                const std::string parameterName = candidate.Parameters[argIndex].VariableName.empty()
+                    ? std::to_string(argIndex) : candidate.Parameters[argIndex].VariableName;
+                LogError(std::format(
+                    "cannot pass C++ class xvalue '{}' to pointer parameter '{}' of '{}'",
+                    DisplayCxxClassName(arg.TypeAndValue.TypeName),
+                    parameterName, diagnosticFunctionName));
+            }
             if (candidate.IsCxx && !inVariadicRange
                 && !(candidate.IsMethod && argIndex == 0 && candidate.CxxConst)
                 && argIndex < candidate.Parameters.size())
@@ -6092,11 +6351,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     {
                         if (escFn->getLinkage() == llvm::Function::InternalLinkage)
                             escFn->setLinkage(llvm::Function::ExternalLinkage);
-                        if (candidate.IsCxx)
-                        {
-                            val = MakeThinFnPtrValue(escFn, *candParamItr);
-                            madeCxxCallback = true;
-                        }
+                        // Every call through a function pointer uses the C ABI of its signature, so
+                        // C and C++ callees both get the thin value (C-ABI thunk when lowered).
+                        val = MakeThinFnPtrValue(escFn, *candParamItr);
+                        madeCxxCallback = true;
                     }
                     if (val && val->getType()->isStructTy())
                     {
@@ -6483,8 +6741,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             // The element slot of a borrowing container is a legal `move` destination: the
             // container keeps the ONLY handle afterwards (manual-free idiom), so the generic
             // "move into a borrow parameter transfers nothing" diagnostic is wrong there.
-            if (!IsBorrowingContainerElementSink(functionName, candidate.Parameters, i,
-                                                 candidate.IsMethod))
+            const bool cxxXvalueBindsConstRef = candidate.IsCxx
+                && candidate.Parameters[i].IsCxxConstRef
+                && matched[i].IsNormalizedCxxXvalue;
+            if (!cxxXvalueBindsConstRef
+                && !IsBorrowingContainerElementSink(functionName, candidate.Parameters, i,
+                                                    candidate.IsMethod))
                 DiagnoseExplicitMoveToBorrowParam(functionName, candidate.Parameters[i], matched[i],
                                                    candidate.IsCxx);
             RejectOwningLocalIntoBorrowingContainer(functionName, candidate.Parameters, i,

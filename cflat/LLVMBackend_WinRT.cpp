@@ -2068,7 +2068,7 @@ llvm::Value* LLVMBackend::WidenToClosureFatChecked(llvm::Value* val, const Named
                 "it with an explicit cast: '{}'.",
                 { action, "function<>", "(function<...>)value" });
         }
-        return WidenBareOrThinToClosureFat(val);
+        return WidenBareOrThinToClosureFat(val, arg.TypeAndValue);
     }
 
 void LLVMBackend::CheckClosureReturnProvenance(llvm::Value* val, const NamedVariable& returnNV,
@@ -2140,12 +2140,12 @@ void LLVMBackend::CheckFatClosureAssignProvenance(llvm::Value* val, const NamedV
         }
     }
 
-llvm::Value* LLVMBackend::WidenBareOrThinToClosureFat(llvm::Value* val)
+llvm::Value* LLVMBackend::WidenBareOrThinToClosureFat(llvm::Value* val, const TypeAndValue& sigTV)
 {
         if (auto* fn = llvm::dyn_cast<llvm::Function>(val))
             return WrapBareValueAsFatStruct(fn);
         if (val && !val->getType()->isStructTy() && val->getType()->isPointerTy())
-            return WidenThinToFat(val);   // thin function<T> -> fat Lambda<T> {code, null}
+            return WidenThinToFat(val, sigTV);   // thin function<T> -> fat Lambda<T> {code, null}
         return val;
     }
 
@@ -2158,6 +2158,10 @@ llvm::Value* LLVMBackend::LowerClosureFatToThinFnPtr(llvm::Value* val, llvm::Typ
             auto* codeField = builder->CreateExtractValue(val, {0u}, "closure_code");
             return builder->CreateBitCast(codeField, targetTy, "noncap_lambda_cfn");
         }
+        // A lowered-signature forwarder closure (a non-capturing literal or named body): its env
+        // is the C-ABI entry itself, so that entry is the C pointer the callee needs.
+        if (ClosureForwarderOf(val) != nullptr)
+            return builder->CreateBitCast(envField, targetTy, "forwarder_cfn");
         if (!captureNames.empty())
         {
             // A capturing lambda literal - name what it captures so the user can see
@@ -2268,8 +2272,16 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg,
 
 llvm::Value* LLVMBackend::LowerRvalueRefArg(const NamedVariable& arg, const TypeAndValue& param, bool cxxCallee)
 {
-        // `T*&&` receives the pointer VALUE through a temporary T* slot. Passing the value
-        // directly would make the C++ callee interpret the pointee address as a T**.
+        // An explicit move of a pointer names the pointer object's slot. Bind T*&& to that slot
+        // directly; only pointer prvalues need the temporary below.
+        if (cxxCallee && param.ElemPointer && arg.TypeAndValue.Pointer && arg.IsExplicitMove)
+        {
+            llvm::Value* slot = arg.Storage;
+            if (slot == nullptr && !arg.CallerName.empty())
+                slot = FindVariableStorage(arg.CallerName).Storage;
+            if (slot != nullptr && slot->getType()->isPointerTy()) return slot;
+        }
+        // A pointer prvalue needs a T* temporary slot; passing its value would be a T** mismatch.
         if (cxxCallee && param.ElemPointer && (arg.TypeAndValue.Pointer
                                   || IsNullPointerConstantArgument(arg, true)
                                   || (arg.Primary != nullptr && arg.Primary->getType()->isPointerTy())

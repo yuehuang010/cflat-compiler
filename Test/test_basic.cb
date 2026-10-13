@@ -1453,6 +1453,17 @@ bool testAssertReturnBlock()
 
 int sumI32(i32 a, i32 b) { return a + b; }
 int sumU32(u32 a, u32 b) { return a + b; }
+// [lex.icon] ladder overload probe: an unsuffixed 32-bit binary literal is unsigned int (clang picks 2).
+int pickBinaryLadder(int x) { return 1; }
+int pickBinaryLadder(u32 x) { return 2; }
+int pickBinaryLadder(long x) { return 3; }
+// Unsuffixed 0x8000000000000000 is unsigned long on LP64 (clang picks 2), unsigned long long on LLP64.
+int pickUnsignedLadder(long x) { return 1; }
+int pickUnsignedLadder(ulong x) { return 2; }
+int pickUnsignedLadder(u64 x) { return 3; }
+// A trailing f in a hex literal is a digit: 0x7f is int (clang picks 1), not a float suffix.
+int pickHexDigitF(int x) { return 1; }
+int pickHexDigitF(u64 x) { return 2; }
 
 // Regression: a negative integer literal in a file-scope initializer used to be
 // sign-dropped (narrowed to the smallest unsigned width, e.g. -150 read back as
@@ -1577,6 +1588,48 @@ bool testExplicitIntTypes()
     result &= Test("hex_with_E_digit",    (u32)0xDEADBEEF, (u32)0xDEADBEEF);
     result &= Test("hex_all_ones",        (u32)0xFFFFFFFF, (u32)0xFFFFFFFF);
     result &= Test("hex_int_min",         (u32)0x80000000, (u32)0x80000000);
+
+    // [lex.icon] ladder (ruling 2026-10-09): an unsuffixed hex/octal/binary literal past int range is
+    // unsigned int, then the 64-bit types; decimal never takes an unsigned type. Oracle: clang++ -std=c++20.
+    u64 hexLadderU64 = 0x80000000;
+    result &= Test("hex_ladder_u64_high_bit", (i64)hexLadderU64, 2147483648);
+    i64 hexLadderI64 = 0xFFFFFFFF;
+    result &= Test("hex_ladder_i64_all_ones", hexLadderI64, 4294967295);
+    auto hexLadderAuto = 0xFFFFFFFF;
+    i64 hexLadderAutoWide = hexLadderAuto;
+    result &= Test("hex_ladder_auto_is_u32", hexLadderAutoWide, 4294967295);
+    u64 hexLadderMasked = 0x1FFFFFFFF;
+    result &= Test("hex_ladder_mask_u32", (i64)(hexLadderMasked & 0xFFFFFFFF), 4294967295);
+    u64 hexLadderShift = 0xFFFFFFFF << 4;
+    result &= Test("hex_ladder_u32_shift_then_widen", (i64)hexLadderShift, 4294967280);
+    result &= Test("hex_ladder_eq_minus_one", 0xFFFFFFFF == -1, true);
+    int hexLadderInt = 0xFFFFFFFF;
+    result &= Test("hex_ladder_int_wraps", hexLadderInt, -1);
+    i8 hexLadderI8 = 0xFF;
+    result &= Test("hex_ladder_i8_wraps", (int)hexLadderI8, -1);
+    i64 hexLadderUSuffix = 0xFFFFFFFFu;
+    result &= Test("hex_ladder_u_suffix_u32", hexLadderUSuffix, 4294967295);
+    i64 hexLadderLSuffix = 0x80000000L;
+    result &= Test("hex_ladder_l_suffix_long", hexLadderLSuffix, 2147483648);
+    u64 hexLadderU64Max = 0xFFFFFFFFFFFFFFFF;
+    result &= Test("hex_ladder_u64_max", (i64)(hexLadderU64Max >> 1), 9223372036854775807);
+    i64 hexLadderPastU32 = 0x100000000;
+    result &= Test("hex_ladder_past_u32_long", hexLadderPastU32, 4294967296);
+    u64 hexLadderOctal = 020000000000;
+    result &= Test("octal_ladder_u32_high", (i64)hexLadderOctal, 2147483648);
+    u64 hexLadderBinary = 0b10000000000000000000000000000000;
+    result &= Test("binary_ladder_u32_high", (i64)hexLadderBinary, 2147483648);
+    result &= Test("hex_digit_f_is_int", pickHexDigitF(0x7f), 1);
+    auto unsignedLadderAuto = 0x8000000000000000;
+    if const (__WINDOWS__) { result &= Test("unsigned_ladder_auto_overload", pickUnsignedLadder(unsignedLadderAuto), 3); }
+    else { result &= Test("unsigned_ladder_auto_overload", pickUnsignedLadder(unsignedLadderAuto), 2); }
+    if const (__WINDOWS__) { result &= Test("unsigned_ladder_literal_overload", pickUnsignedLadder(0x8000000000000000), 3); }
+    else { result &= Test("unsigned_ladder_literal_overload", pickUnsignedLadder(0x8000000000000000), 2); }
+    auto binaryLadderAuto = 0b10000000000000000000000000000000;
+    result &= Test("binary_ladder_auto_overload_u32", pickBinaryLadder(binaryLadderAuto), 2);
+    result &= Test("binary_ladder_literal_overload_u32", pickBinaryLadder(0b10000000000000000000000000000000), 2);
+    if const (0xFFFFFFFF == -1) { result &= Test("hex_ladder_if_const_true", true, true); }
+    else { result &= Test("hex_ladder_if_const_true", false, true); }
 
     return result;
 }

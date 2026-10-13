@@ -1117,11 +1117,13 @@ llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& 
 
 llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
     llvm::Function* original, const CxxFunctionPointerAbiPlan& plan,
-    const std::string& stableName, bool externalLinkage)
+    const std::string& stableName, bool externalLinkage, bool passNullEnv)
 {
+        // passNullEnv: a non-capturing closure body carries a trailing env parameter; the thin
+        // C pointer has none, so the thunk hands the body a null env.
         std::string key = stableName.empty()
             ? "__cflat_reverse_abi_" + original->getName().str() + "_"
-                + FunctionPointerAbiKey(plan.ret, plan.params)
+                + CAbiSignatureKey(plan.ret, plan.params) + (passNullEnv ? "_env" : "")
             : stableName;
         auto* loweredTy = BuildExternFunctionType(plan.ret, plan.params, false, plan.recipe);
         for (char& c : key)
@@ -1129,7 +1131,15 @@ llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
         llvm::Function* thunk = module->getFunction(key);
         if (thunk != nullptr)
         {
-            if (!thunk->isDeclaration()) return thunk;
+            if (!thunk->isDeclaration())
+            {
+                if (thunk->getFunctionType() != loweredTy)
+                {
+                    LogErrorMessage("reverse ABI thunk key '{}' names a different signature", { key });
+                    return nullptr;   // unreachable: LogError above does not return
+                }
+                return thunk;
+            }
             if (thunk->getFunctionType() != loweredTy)
             {
                 LogErrorMessage("reverse ABI thunk declaration has a mismatched function type");
@@ -1222,14 +1232,31 @@ llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
                 value = b.CreateLoad(slot.structTy, storage, "callback.arg");
             }
             naturalArgs.push_back(value);
+            if (ParameterCarriesRawArrayCount(plan.params[i]))
+            {
+                // A function<> C signature carries the caller's count; other C-side shapes have
+                // none and get the unknown-count sentinel.
+                llvm::Value* count = slot.countAfter
+                    ? static_cast<llvm::Value*>(thunk->getArg(loweredIndex++))
+                    : static_cast<llvm::Value*>(b.getInt64(-1));
+                naturalArgs.push_back(count);
+            }
         }
 
+        if (passNullEnv)
+            naturalArgs.push_back(llvm::ConstantPointerNull::get(
+                cflat_llvm::PointerTo(builder->getInt8Ty())));
+        if (ReturnCarriesRawArrayCount(plan.ret))
+            naturalArgs.push_back(plan.recipe.retCountParam
+                ? static_cast<llvm::Value*>(thunk->getArg(thunk->arg_size() - 1))
+                : static_cast<llvm::Value*>(b.CreateAlloca(b.getInt64Ty(), nullptr, "callback.rcount")));
         const bool voidReturn = !plan.ret.Pointer && plan.ret.TypeName == "void";
         if (plan.recipe.retSlot.kind == AbiSlot::Ignore
             || (voidReturn && plan.recipe.retSlot.kind == AbiSlot::Direct))
         {
-            auto* call = b.CreateCall(original->getFunctionType(), original, naturalArgs);
-            ApplyAbiCallAttributes(call, plan.recipe);
+            // The natural body call follows its own CFlat signature; the lowered recipe only
+            // describes the C-side thunk, so no call attributes come from it here.
+            b.CreateCall(original->getFunctionType(), original, naturalArgs);
             b.CreateRetVoid();
             builder->restoreIP(savedIP);
             return thunk;
@@ -1333,6 +1360,43 @@ llvm::Value* LLVMBackend::WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, cons
         return fat;
     }
 
+bool LLVMBackend::ThinFnPtrUsesCAbi(const TypeAndValue& ret, const std::vector<TypeAndValue>& params,
+                                    AbiRecipe& outRecipe)
+{
+        // A signature touching a C++ class keeps its own convention (cxxIndirectRecipe).
+        if (ComputeCxxReturnAbiRecipe(ret, params).hasLowering) return false;
+        outRecipe = ComputeAbiRecipe(ret, params);
+        if (!outRecipe.hasLowering) return false;
+        // Raw-array counts are part of this signature: an explicit i64 after each counted
+        // parameter, and a trailing pointer for a counted return (caller and thunk both read it).
+        for (size_t i = 0; i < params.size() && i < outRecipe.paramSlots.size(); ++i)
+            if (ParameterCarriesRawArrayCount(params[i]))
+                outRecipe.paramSlots[i].countAfter = true;
+        outRecipe.retCountParam = ReturnCarriesRawArrayCount(ret);
+        return true;
+    }
+
+llvm::Function* LLVMBackend::GetOrCreateNativeExternCAbiEntry(
+    llvm::Function* ext, const FunctionSymbol& symbol, const TypeAndValue& ret,
+    const std::vector<TypeAndValue>& params, const AbiRecipe& cAbi)
+{
+    if (ext->getFunctionType() == BuildExternFunctionType(ret, params, false, cAbi))
+        return ext;
+    auto* natural = GetOrCreateCAbiFunctionThunk(symbol, FuncPtrSigOfSymbol(symbol));
+    CxxFunctionPointerAbiPlan plan{ ret, params, cAbi };
+    return GetOrCreateReverseAbiFunctionThunk(natural, plan);
+}
+
+llvm::Value* LLVMBackend::BareFunctionToThinValue(llvm::Value* val, const TypeAndValue* thinTV)
+{
+        auto* fn = llvm::dyn_cast_or_null<llvm::Function>(val);
+        if (fn == nullptr) return val;
+        if (thinTV != nullptr) return MakeThinFnPtrValue(fn, *thinTV);
+        const auto* symbol = FindSymbolForFunction(fn);
+        if (symbol == nullptr) return val;
+        return MakeThinFnPtrValue(fn, FuncPtrSigOfSymbol(*symbol));
+}
+
 llvm::Value* LLVMBackend::MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue& fpTV)
 {
         if (auto* function = llvm::dyn_cast_or_null<llvm::Function>(fn))
@@ -1409,8 +1473,22 @@ llvm::Value* LLVMBackend::MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue
                         }
                     }
                 }
-                if (symbol != nullptr && symbol->External && symbol->Recipe.hasLowering)
-                    fn = GetOrCreateCAbiFunctionThunk(*symbol, fpTV);
+                // Every call through a thin function<> uses the C ABI of its signature. An extern
+                // definition already has that lowering, so its address is stored as is; a
+                // non-extern CFlat callee gets a C-ABI reverse thunk that calls the natural body.
+                AbiRecipe cAbi;
+                if (ThinFnPtrUsesCAbi(ret, params, cAbi))
+                {
+                    if (symbol != nullptr && symbol->External && symbol->Recipe.hasLowering)
+                        fn = GetOrCreateNativeExternCAbiEntry(original, *symbol, ret, params, cAbi);
+                    else if (symbol == nullptr || !symbol->External)
+                    {
+                        CxxFunctionPointerAbiPlan plan{ ret, params, cAbi };
+                        fn = GetOrCreateReverseAbiFunctionThunk(original, plan);
+                    }
+                    if (fn == nullptr)
+                        return llvm::UndefValue::get(BuildThinFnPtrType(fpTV));
+                }
             }
         }
         return builder->CreateBitCast(fn, BuildThinFnPtrType(fpTV), "thinfn");
@@ -1418,12 +1496,63 @@ llvm::Value* LLVMBackend::MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue
 
 llvm::Value* LLVMBackend::CoerceClosureFatToThin(llvm::Value* fatVal, const TypeAndValue& thinTV)
 {
+        if (ClosureForwarderOf(fatVal) != nullptr)
+        {
+            // Forwarder closure: the env slot is the C-ABI entry itself.
+            auto* env = builder->CreateExtractValue(fatVal, {1u}, "clo_env");
+            return builder->CreateBitCast(env, BuildThinFnPtrType(thinTV), "thinfn");
+        }
+        // A constant closure body with a C-ABI signature (native aggregate lowering) gets the same
+        // reverse thunk a named function gets, with the env slot filled by null.
+        TypeAndValue ret;
+        std::vector<TypeAndValue> params;
+        UnpackFuncPtrSignature(thinTV, ret, params);
+        AbiRecipe cAbi;
         auto* code = builder->CreateExtractValue(fatVal, {0u}, "clo_code");
+        if (auto* body = llvm::dyn_cast<llvm::Function>(code->stripPointerCasts());
+            body != nullptr && ThinFnPtrUsesCAbi(ret, params, cAbi))
+        {
+            CxxFunctionPointerAbiPlan plan{ ret, params, cAbi };
+            auto* thunk = GetOrCreateReverseAbiFunctionThunk(body, plan, {}, false, true);
+            if (thunk == nullptr)
+                return llvm::UndefValue::get(BuildThinFnPtrType(thinTV));
+            return builder->CreateBitCast(thunk, BuildThinFnPtrType(thinTV), "thinfn");
+        }
         return builder->CreateBitCast(code, BuildThinFnPtrType(thinTV), "thinfn");
+    }
+
+// The forwarder named by a code value: direct, through a pointer cast, or as one arm of the
+// null-selecting code of a widened runtime thin pointer.
+static llvm::Function* ForwarderInCode(llvm::Value* code)
+{
+        if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(code))
+        {
+            if (auto* f = ForwarderInCode(sel->getTrueValue())) return f;
+            return ForwarderInCode(sel->getFalseValue());
+        }
+        auto* fn = llvm::dyn_cast<llvm::Function>(code->stripPointerCasts());
+        return fn != nullptr && fn->getName().starts_with("__cflat_thin_fwd_") ? fn : nullptr;
+    }
+
+llvm::Function* LLVMBackend::ClosureForwarderOf(llvm::Value* fatVal)
+{
+        // Prefer the code value the fat struct was built from (no extract instruction needed).
+        llvm::Value* agg = fatVal;
+        while (auto* iv = llvm::dyn_cast<llvm::InsertValueInst>(agg))
+        {
+            if (iv->getNumIndices() == 1 && iv->getIndices()[0] == 0)
+                return ForwarderInCode(iv->getInsertedValueOperand());
+            agg = iv->getAggregateOperand();
+        }
+        return ForwarderInCode(builder->CreateExtractValue(fatVal, {0u}, "clo_code_probe"));
     }
 
 bool LLVMBackend::ClosureIsStaticallyNonCapturing(llvm::Value* fatVal)
 {
+        // A forwarder closure (lowered signature) carries its C-ABI entry in env: that entry IS
+        // the thin pointer, so the closure converts to function<> like a non-capturing one.
+        if (ClosureForwarderOf(fatVal) != nullptr)
+            return true;
         auto* envField = builder->CreateExtractValue(fatVal, {1u}, "closure_env_probe");
         return llvm::isa<llvm::ConstantPointerNull>(envField);
     }
@@ -1454,6 +1583,21 @@ llvm::Value* LLVMBackend::EmitFuncToFunctionLowering(llvm::Value* fatVal, const 
         auto* codeThin = builder->CreateBitCast(code, thinTy, "thinfn");
         auto* nullThin = llvm::ConstantPointerNull::get(thinTy);
         auto* i8PtrTy  = cflat_llvm::PointerTo(builder->getInt8Ty());
+        TypeAndValue ret;
+        std::vector<TypeAndValue> params;
+        UnpackFuncPtrSignature(thinTV, ret, params);
+        AbiRecipe cAbi;
+        if (ThinFnPtrUsesCAbi(ret, params, cAbi))
+        {
+            // Lowered signature: a C-ABI entry exists only for a widened thin pointer, whose code
+            // is this signature's forwarder and whose env is the C pointer. Other runtime code has
+            // no C-ABI entry (see the report): such a closure yields null.
+            auto* fwdI8 = builder->CreateBitCast(GetOrCreateThinToFatForwarder(ret, params, cAbi),
+                                                 i8PtrTy, "fwd_i8");
+            auto* isFwd = builder->CreateICmpEQ(code, fwdI8, "is_fwd");
+            auto* envThin = builder->CreateBitCast(env, thinTy, "env_thin");
+            return builder->CreateSelect(isFwd, envThin, nullThin, "tofn_abi");
+        }
         auto* envNull  = builder->CreateICmpEQ(env, llvm::ConstantPointerNull::get(i8PtrTy), "env_isnull");
         return builder->CreateSelect(envNull, codeThin, nullThin, "tofn");
     }
@@ -1499,28 +1643,191 @@ llvm::Value* LLVMBackend::CoerceToFuncPtrReturn(llvm::Value* val, const TypeAndV
         // Same widening the call paths use, behind the same provenance gate. Fat closure values
         // are not pointer-typed, so the gate below is a no-op for them.
         CheckClosureReturnProvenance(val, returnNV, /*thin=*/false);
-        return WidenBareOrThinToClosureFat(val);
+        return WidenBareOrThinToClosureFat(val, retTV);
     }
 
-llvm::Value* LLVMBackend::WidenThinToFat(llvm::Value* thinPtr)
+std::string LLVMBackend::CAbiSignatureKey(const TypeAndValue& ret,
+    const std::vector<TypeAndValue>& params) const
+{
+        // Ownership, the hidden raw-array count and alias each change the lowered arity or slot.
+        auto flags = [this](const TypeAndValue& tv) {
+            return std::string(tv.IsMove ? "m" : "-")
+                + (ParameterCarriesRawArrayCount(tv) ? "c" : "-")
+                + (tv.IsAlias ? "a" : "-");
+        };
+        std::string key = FunctionPointerAbiKey(ret, params) + "|" + flags(ret);
+        for (const auto& p : params) key += "|" + flags(p);
+        return key;
+    }
+
+// Natural-ABI entry for a thin C-ABI pointer of signature (ret, params). A fat closure calls its
+// code with the natural ABI and its env last, so this forwarder takes the C pointer from the env
+// slot and calls it with the lowered recipe. One forwarder per signature, shared by every widen.
+llvm::Function* LLVMBackend::GetOrCreateThinToFatForwarder(const TypeAndValue& ret,
+    const std::vector<TypeAndValue>& params, const AbiRecipe& cAbi)
+{
+        std::string key = "__cflat_thin_fwd_" + CAbiSignatureKey(ret, params);
+        for (char& c : key)
+            if (!std::isalnum((unsigned char)c) && c != '_' && c != '$') c = '_';
+
+        auto* natural = GetFunctionType(ret, params, false, false);
+        const bool retCount = ReturnCarriesRawArrayCount(ret);
+        auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
+        std::vector<llvm::Type*> fwdParams;
+        const unsigned naturalCount = natural->getNumParams();
+        for (unsigned i = 0; i < naturalCount; ++i)
+        {
+            if (retCount && i + 1 == naturalCount) break;
+            fwdParams.push_back(natural->getParamType(i));
+        }
+        fwdParams.push_back(i8PtrTy);   // env: the C pointer
+        if (retCount)
+            fwdParams.push_back(natural->getParamType(naturalCount - 1));
+        auto* fwdTy = llvm::FunctionType::get(natural->getReturnType(), fwdParams, false);
+        // Reuse only an entry of the SAME type: a key collision must never hand back a forwarder
+        // whose hidden counts differ from the caller's.
+        if (llvm::Function* existing = module->getFunction(key))
+        {
+            if (existing->getFunctionType() != fwdTy)
+            {
+                LogErrorMessage("internal: thin-to-fat forwarder key '{}' names a different signature",
+                                { key });
+                return nullptr;   // unreachable: LogError above does not return
+            }
+            return existing;
+        }
+        auto* fwd = llvm::Function::Create(fwdTy, llvm::Function::InternalLinkage, key, *module);
+
+        auto savedIP = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(*context, "entry", fwd);
+        builder->SetInsertPoint(entry);
+        auto& b = *builder;
+
+        std::vector<llvm::Value*> values;
+        std::vector<llvm::Value*> counts;
+        unsigned argIdx = 0;
+        for (size_t i = 0; i < params.size(); ++i)
+        {
+            values.push_back(fwd->getArg(argIdx++));
+            counts.push_back(ParameterCarriesRawArrayCount(params[i]) ? fwd->getArg(argIdx++) : nullptr);
+        }
+        llvm::Value* cPtr = fwd->getArg(argIdx++);
+        llvm::Value* rcount = retCount ? fwd->getArg(argIdx) : nullptr;
+
+        auto* cFnTy = BuildExternFunctionType(ret, params, false, cAbi);
+        auto* fnPtr = b.CreateBitCast(cPtr, cflat_llvm::PointerTo(cFnTy), "fwd_cfn");
+        std::vector<llvm::Value*> loweredArgs;
+        llvm::Value* sretSlot = nullptr;
+        if (cAbi.retSlot.kind == AbiSlot::SRetReturn)
+        {
+            sretSlot = b.CreateAlloca(cAbi.retSlot.structTy, nullptr, "fwd.sret");
+            loweredArgs.push_back(sretSlot);
+        }
+        LowerAbiArgs(cAbi, values, nullptr, &counts, loweredArgs);
+        if (cAbi.retCountParam)
+            loweredArgs.push_back(rcount);
+        auto* call = b.CreateCall(cFnTy, fnPtr, loweredArgs);
+        ApplyAbiCallAttributes(call, cAbi);
+        // A caller extends narrow integers for a clang -O2 C callee, by the declared type.
+        std::vector<std::pair<unsigned, TypeAndValue>> loweredExt;
+        unsigned lowIdx = sretSlot != nullptr ? 1u : 0u;
+        for (size_t i = 0; i < params.size() && i < cAbi.paramSlots.size(); ++i)
+        {
+            const AbiSlot& s = cAbi.paramSlots[i];
+            if (s.kind == AbiSlot::Direct)
+                loweredExt.emplace_back(lowIdx, params[i]);
+            lowIdx += SlotLLVMParamCount(s);
+        }
+        ApplyNarrowIntExtCallAttrs(call, loweredExt);
+        if (natural->getReturnType()->isVoidTy())
+            b.CreateRetVoid();
+        else if (sretSlot != nullptr)
+            b.CreateRet(b.CreateLoad(cAbi.retSlot.structTy, sretSlot));
+        else
+            b.CreateRet(DecodeAbiRegisterReturn(cAbi, call));
+        builder->restoreIP(savedIP);
+        return fwd;
+    }
+
+// sigTV: the function<>/Lambda<> type whose signature the thin pointer carries.
+llvm::Value* LLVMBackend::WidenThinToFat(llvm::Value* thinPtr, const TypeAndValue& sigTV)
 {
         auto* i8PtrTy   = cflat_llvm::PointerTo(builder->getInt8Ty());
         auto* codeI8    = builder->CreateBitCast(thinPtr, i8PtrTy, "thin_code_i8");
-        auto* nullEnv   = llvm::ConstantPointerNull::get(i8PtrTy);
+        llvm::Value* envI8 = llvm::ConstantPointerNull::get(i8PtrTy);
+        TypeAndValue ret;
+        std::vector<TypeAndValue> params;
+        UnpackFuncPtrSignature(sigTV, ret, params);
+        AbiRecipe cAbi;
+        if (ThinFnPtrUsesCAbi(ret, params, cAbi))
+        {
+            // Lowered signature: the thin pointer is a C-ABI entry, so the fat code is the
+            // natural forwarder and the env slot carries the C pointer it calls.
+            // A null thin pointer widens to the null closure ({null, null}), not {forwarder, null}:
+            // the code field decides null, so a null C pointer must leave it null.
+            auto* fwdI8 = builder->CreateBitCast(GetOrCreateThinToFatForwarder(ret, params, cAbi),
+                                                 i8PtrTy, "thin_fwd_i8");
+            auto* isNull = builder->CreateICmpEQ(thinPtr,
+                llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(thinPtr->getType())),
+                "thin_is_null");
+            codeI8 = builder->CreateSelect(isNull, llvm::ConstantPointerNull::get(i8PtrTy), fwdI8, "thin_code_sel");
+            envI8  = builder->CreateBitCast(thinPtr, i8PtrTy, "thin_env_i8");
+        }
         auto* closureTy = GetClosureFatPtrType();
         llvm::Value* fat = llvm::UndefValue::get(closureTy);
         fat = builder->CreateInsertValue(fat, codeI8,  {0u});
-        fat = builder->CreateInsertValue(fat, nullEnv, {1u});
+        fat = builder->CreateInsertValue(fat, envI8, {1u});
         return fat;
     }
 
 llvm::Value* LLVMBackend::WrapBareValueAsFatStruct(llvm::Function* original)
 {
         RecordAliasReturnAddressUse(original);
+        auto* i8PtrTy  = cflat_llvm::PointerTo(builder->getInt8Ty());
         if (const auto* symbol = FindSymbolForFunction(original);
             symbol != nullptr && symbol->External && symbol->Recipe.hasLowering)
+        {
+            // A native extern with a lowered signature IS its C-ABI entry: the closure is the
+            // forwarder with the extern in env, the same form as a lowered CFlat body. An extern
+            // whose LLVM type differs (hidden counts it does not carry) keeps the natural wrapper.
+            TypeAndValue ret;
+            std::vector<TypeAndValue> params;
+            UnpackFuncPtrSignature(FuncPtrSigOfSymbol(*symbol), ret, params);
+            AbiRecipe cAbi;
+            if (ThinFnPtrUsesCAbi(ret, params, cAbi))
+            {
+                llvm::Function* cEntry = GetOrCreateNativeExternCAbiEntry(original, *symbol, ret, params, cAbi);
+                if (cEntry == nullptr)
+                    return llvm::UndefValue::get(GetClosureFatPtrType());
+                auto* fwd = GetOrCreateThinToFatForwarder(ret, params, cAbi);
+                llvm::Value* fat = llvm::UndefValue::get(GetClosureFatPtrType());
+                fat = builder->CreateInsertValue(fat, builder->CreateBitCast(fwd, i8PtrTy), {0u});
+                fat = builder->CreateInsertValue(fat, builder->CreateBitCast(cEntry, i8PtrTy), {1u});
+                return fat;
+            }
             original = GetOrCreateCAbiFunctionThunk(*symbol, FuncPtrSigOfSymbol(*symbol));
-        auto* i8PtrTy  = cflat_llvm::PointerTo(builder->getInt8Ty());
+        }
+        else if (symbol != nullptr && !symbol->External)
+        {
+            // A lowered CFlat body: the fat code is the natural forwarder and the env slot holds
+            // the C-ABI reverse thunk it calls (the same entry a thin function<> value holds).
+            TypeAndValue ret;
+            std::vector<TypeAndValue> params;
+            UnpackFuncPtrSignature(FuncPtrSigOfSymbol(*symbol), ret, params);
+            AbiRecipe cAbi;
+            if (ThinFnPtrUsesCAbi(ret, params, cAbi))
+            {
+                CxxFunctionPointerAbiPlan plan{ ret, params, cAbi };
+                auto* cEntry = GetOrCreateReverseAbiFunctionThunk(original, plan);
+                if (cEntry == nullptr)
+                    return llvm::UndefValue::get(GetClosureFatPtrType());
+                auto* fwd = GetOrCreateThinToFatForwarder(ret, params, cAbi);
+                llvm::Value* fat = llvm::UndefValue::get(GetClosureFatPtrType());
+                fat = builder->CreateInsertValue(fat, builder->CreateBitCast(fwd, i8PtrTy), {0u});
+                fat = builder->CreateInsertValue(fat, builder->CreateBitCast(cEntry, i8PtrTy), {1u});
+                return fat;
+            }
+        }
         auto* shim     = GetOrCreateFunctionShim(original);
         auto* shimAsI8 = builder->CreateBitCast(shim, i8PtrTy, "shim_i8");
         auto* nullEnv  = llvm::ConstantPointerNull::get(i8PtrTy);

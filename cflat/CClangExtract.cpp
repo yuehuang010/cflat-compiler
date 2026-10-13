@@ -39,6 +39,8 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Sema/Sema.h"
+#include "clang/Sema/Lookup.h"
+#include "clang/Sema/Overload.h"
 #include "clang/Sema/TemplateDeduction.h"
 #include "clang/Sema/Scope.h"
 #include "clang/Frontend/CompilerInvocation.h"
@@ -1696,6 +1698,56 @@ namespace cflat_cinterop
         void IndexSpecialMemberRecords(ASTContext& ctx, const DeclContext* dc,
             std::unordered_map<std::string, const CXXRecordDecl*>& index);
 
+        /*
+         * Clang's own overload resolution for `dst = src` with a non-const lvalue dst of record
+         * `cxx` and a (const or non-const) rvalue src. True when the selected operator= is a
+         * non-deleted `const T&`. Implicit members, defaulted-deleted moves and ref-qualifiers are
+         * clang's call. A template operator= or an unresolved set answers false (no refusal).
+         */
+        bool AssignmentSelectsConstRef(Sema& sema, const CXXRecordDecl* cxx, bool constSource)
+        {
+            if (cxx == nullptr || !cxx->hasDefinition() || cxx->isDependentContext()) return false;
+            auto* record = const_cast<CXXRecordDecl*>(cxx);
+            ASTContext& ctx = sema.getASTContext();
+            LookupResult found(sema, ctx.DeclarationNames.getCXXOperatorName(OO_Equal),
+                               SourceLocation(), Sema::LookupOrdinaryName);
+            sema.LookupQualifiedName(found, record);
+            QualType objectType = ctx.getCanonicalTagType(record);
+            QualType argType = constSource ? objectType.withConst() : objectType;
+            OpaqueValueExpr arg(SourceLocation(), argType, VK_XValue);
+            Expr* args[] = { &arg };
+            OverloadCandidateSet candidates(SourceLocation(), OverloadCandidateSet::CSK_Normal);
+            bool any = false;
+            for (NamedDecl* d : found)
+            {
+                const NamedDecl* under = d->getUnderlyingDecl();
+                if (const auto* tmpl = llvm::dyn_cast<FunctionTemplateDecl>(under))
+                {
+                    // A member template operator=: clang deduces it, checks its constraints and
+                    // ref-qualifiers, and the selected specialization's parameter is classified.
+                    if (!llvm::isa<CXXMethodDecl>(tmpl->getTemplatedDecl())) continue;
+                    any = true;
+                    sema.AddMethodTemplateCandidate(const_cast<FunctionTemplateDecl*>(tmpl),
+                        DeclAccessPair::make(d, d->getAccess()), record, nullptr, objectType,
+                        Expr::Classification::makeSimpleLValue(), args, candidates);
+                    continue;
+                }
+                if (!llvm::isa<CXXMethodDecl>(under)) continue;
+                any = true;
+                sema.AddMethodCandidate(DeclAccessPair::make(d, d->getAccess()), objectType,
+                    Expr::Classification::makeSimpleLValue(), args, candidates);
+            }
+            if (!any) return false;
+            OverloadCandidateSet::iterator best;
+            if (candidates.BestViableFunction(sema, SourceLocation(), best) != OR_Success)
+                return false;
+            const FunctionDecl* selected = best->Function;
+            if (selected == nullptr || selected->isDeleted() || selected->getNumParams() != 1)
+                return false;
+            QualType param = selected->getParamDecl(0)->getType();
+            return param->isLValueReferenceType() && param->getPointeeType().isConstQualified();
+        }
+
         struct DeclVisitor : public RecursiveASTVisitor<DeclVisitor>
         {
             ASTContext& ctx;
@@ -2756,6 +2808,13 @@ namespace cflat_cinterop
                 rec.hasTrivialMoveAssign = cxx->hasSimpleMoveAssignment()
                                         && cxx->hasTrivialMoveAssignment();
                 rec.hasTrivialDtor = !cxx->hasNonTrivialDestructor();
+                if (st.ci != nullptr && st.ci->hasSema())
+                {
+                    rec.moveAssignBindsConstRef = AssignmentSelectsConstRef(
+                        st.ci->getSema(), cxx, false);
+                    rec.moveAssignConstSourceBindsConstRef = AssignmentSelectsConstRef(
+                        st.ci->getSema(), cxx, true);
+                }
                 rec.paramDestroyedInCallee = cxx->isParamDestroyedInCallee();
                 rec.hasDefaultCtor = cxx->hasDefaultConstructor();
                 rec.hasCopyCtor = cxx->hasCopyConstructorWithConstParam()
@@ -2784,7 +2843,10 @@ namespace cflat_cinterop
                     head.flush();
                     for (const ParmVarDecl* p : ctor->parameters())
                     {
-                        ct.paramTypes.push_back(p->getType().getAsString(pp));
+                        // Non-dependent parameters are stored canonical: a typedef ("Small") classifies as its scalar.
+                        QualType paramType = p->getType();
+                        if (!paramType->isDependentType()) paramType = paramType.getCanonicalType();
+                        ct.paramTypes.push_back(paramType.getAsString(pp));
                         ct.defaulted.push_back(p->hasDefaultArg() ? 1 : 0);
                     }
                     ct.variadic = ctor->isVariadic();

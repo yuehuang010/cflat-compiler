@@ -11,3 +11,15 @@ extern int main()
     borrows(move a);
     return 0;
 }
+
+// T79: a native CFlat operator's borrowed operand refuses `move` exactly as a call does.
+expect_error("transfers nothing") {
+    struct NvOp { int* p = nullptr; NvOp() { p = new int; *p = 1; } ~NvOp() { if (p != nullptr) { delete p; } } };
+    int operator*(NvOp x, NvOp y) { return *x.p * *y.p; }
+    int nvOpBinary() { NvOp a = NvOp(); NvOp b = NvOp(); return a * move b; }
+}
+expect_error("transfers nothing") {
+    struct NvUn { int* p = nullptr; NvUn() { p = new int; *p = 1; } ~NvUn() { if (p != nullptr) { delete p; } } };
+    int operator-(NvUn x) { return *x.p; }
+    int nvOpUnary() { NvUn a = NvUn(); return -move a; }
+}

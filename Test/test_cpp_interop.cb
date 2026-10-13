@@ -227,6 +227,8 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_interop_t74.h";
+import cpp "library/t70_xvalue_overloads.h";
 import cpp "library/cpp_t68_intptr.hpp";
 import cpp "library/cpp_t62_static_auto.hpp";
 import cpp "library/cpp_u8_literal.hpp";
@@ -238,6 +240,20 @@ import cpp "library/t20_abi_records.hpp";
 import cpp "library/cpp_interop_cwrapper_macros.hpp";
 import cpp "functional";
 import cpp "compare";
+
+struct T74Wrap { cflat_t74.Track track; int z = 5; };
+T74Wrap[2] t74Global;
+T74Wrap[2][3] t74Grid;
+struct T74Nested { T74Wrap item; };
+T74Nested[2] t74Nested;
+T74Wrap t74Scalar;
+namespace T74Ns { T74Wrap[2] values; }
+cflat_t74.Probe[2] t74Direct;  // direct C++ array: exactly one ctor per element (clang: 2)
+int t74StaticLocalArray()
+{
+    static T74Wrap[2] values;
+    return values[1].track.value * 10 + values[1].z;
+}
 import cpp "library/t25_csurface.hpp";
 import cpp "library/cpp_t14_template_functor.hpp";
 import cpp "library/cpp_t22_constrained_members.hpp";
@@ -297,8 +313,9 @@ import cpp "system_error";
 struct CxxDerefLocalHolder { cpp_derefcopy.Cursor16 cursor; };
 void CxxDerefParam(cpp_derefcopy.Cursor16 value, int x) { *value = x; *value = x + 1; }
 void CxxDerefPointer(cpp_derefcopy.Cursor16* value, int x) { **value = x; **value = x + 1; }
-// C++ REFERENCE data members - bound as pointer fields, never reseatable.
+// C++ REFERENCE data members - an alias of the referent (M97/M98), never reseatable.
 import cpp "library/cpp_interop_ref_member.h";
+import cpp "library/cpp_interop_ref_alias.h";
 import cpp "library/cpp_interop_field.h";
 // Array elements of a C++ class.
 import cpp "library/cpp_interop_arrayelem.h";
@@ -440,6 +457,7 @@ t50v.V* t50Up(t50v.L* p) { return p; }
 int t50Take(t50v.V* v) { return v == nullptr ? -1 : v.value; }
 import cpp "library/t31_minmax_brace.hpp";
 import cpp "library/cpp_t63_brace_decl.hpp";
+import cpp "library/cpp_t78_scalar_table.h";
 int cppcg_add(int a, int b) { return a + b; }
 
 // A C++ exception unwinding THROUGH CFlat frames (the C++ `guarded` catch sits above them): every
@@ -1696,6 +1714,11 @@ int t54IntSource() { return 3; }
 
 int t67CallCount = 0;
 int t67NextValue() { t67CallCount++; return t67CallCount; }
+int t70CflatByval(cppi.Tracked value) { return value.value(); }
+
+int t70_cflat_pointer_or_value(cppi.Tracked* value) { return 1; }
+int t70_cflat_pointer_or_value(cppi.Tracked value) { return value.value(); }
+int t70_cflat_pointer_only(cppi.T70Plain* value) { return value.value; }
 
 struct T72DefaultLeaf { cppi.FieldDefaulted item; };
 struct T72DefaultWrap { T72DefaultLeaf leaf; };
@@ -1727,9 +1750,66 @@ struct T73GenericHolder { T73Generic<cpp_t73.Mix> generic; };
 struct T73Initialized { cpp_t73.Mix mix = cpp_t73.Mix(); };
 struct T73DefaultedInitializer { cpp_t73.Mix mix = default; };
 T73Holder t73Global = default;
+char* t75Pick(char* s) { return s; }
 
 extern int main()
 {
+    // T78 (ruling 2026-10-09): integer, bool and unscoped enum arguments widen to a C++ double
+    // at free, member, constructor and new calls, as clang accepts them.
+    if (t78.takeD(3) != 3) return 98101;
+    bool t78Flag = true;
+    if (t78.takeD(t78Flag) != 1) return 98102;
+    t78.UA t78Ua = (t78.UA)3;
+    if (t78.takeD(t78Ua) != 3) return 98103;
+    t78.Fl t78Fl = t78.Fl(5);
+    if (t78Fl.v != 5) return 98104;
+    t78.Mem t78Mem = default;
+    if (t78Mem.m(3) != 3) return 98105;
+    t78.Fl* t78FlNew = new t78.Fl(6);
+    if (t78FlNew.v != 6) return 98106;
+    // Another enum type takes an explicit cast only (clang: refused without the cast).
+    t78.UB t78Ub = (t78.UB)t78Ua;
+    if (t78.takeUB(t78Ub) != 3) return 98107;
+    // Overload picks clang makes once int -> double is accepted at a call (ruling 2026-10-09):
+    // operator=(double) runs for an int source, rank_k(double, int) is C++'s unique pick, and the
+    // declared double sibling beats the ellipsis (clang: v=10 via=3, 51, 2).
+    cppexp.ConvDblAssign t78Cda = default;
+    int t78Ai = 5;
+    t78Cda = t78Ai;
+    if (t78Cda.v != 10 || t78Cda.via != 3) return 98108;
+    int t78I = 1;
+    int t78J = 2;
+    if (cpppa.rank_k(t78I, t78J) != 51) return 98109;
+    if (cppi.variadic_conv_rank(1, 2) != 2) return 98110;
+    // T78 review 1 accepts (clang: 3, 7, 3): a const double& parameter binds a converted int
+    // temporary; a constructor takes the same binding; a declared double before '...' widens.
+    int t78RefArg = 3;
+    if (t78.takeCD(t78RefArg) != 3) return 98111;
+    t78.NC t78Nc = t78.NC(7);
+    if (t78Nc.v != 7) return 98112;
+    if (t78.takeVarD(3, 1) != 3) return 98113;
+    // Round 3: a template parameter without '*' deduces a pointer (clang: template, 1).
+    int t78PtrArg = 7;
+    t78.DeducePtr* t78Dp = new t78.DeducePtr(1.5, &t78PtrArg);
+    if (t78Dp->v != 1) return 98115;
+    delete t78Dp;
+    // Round 3: a concrete short template parameter accepts a short argument (clang: 257).
+    short t78Sh = 257;
+    t78.FixedS t78Fx = t78.FixedS(t78Sh, 1);
+    if (t78Fx.v != 257) return 98116;
+    // Round 3: a scalar rvalue reference binds a widened int temporary (clang: 3).
+    if (t78.takeRvD(3) != 3) return 98117;
+    // Round 3: a short constructor beside a pointer constructor takes a short (clang: 257).
+    short t78PaSh = 257;
+    t78.PtrAlt t78Pa = t78.PtrAlt(t78PaSh);
+    if (t78Pa.v != 257) return 98118;
+    // Round 4: a null pointer constant takes a pointer constructor; the pick itself is not asserted.
+    t78.NullAlt* t78Na = new t78.NullAlt(0, 1.5);
+    delete t78Na;
+    // A template ctor beside a narrowing-only ctor(int) takes the exact double (clang: chosen 1).
+    rv.TT* t78TT = new rv.TT(1.5);
+    if (t78TT->chosen != 1) return 98114;
+    delete t78TT;
     t63.VecPick t63BracePick{2, 5};
     t63.VecPick t63EqualBracePick = {4, 6};
     t63.VecPick t63SingleBracePick{8};
@@ -3637,6 +3717,15 @@ extern int main()
     }
     if (cppi.dtor_count() != 2)                  return 387;
 
+    // A resource-free class whose only operator= takes const T&: `move` transfers nothing to
+    // clang either, and a plain (non-owning) argument is never refused, so this is accepted.
+    {
+        cppi_opcref.CA pa = cppi_opcref.CA(1);
+        cppi_opcref.CA pb = cppi_opcref.CA(4);
+        pa = move pb;
+        if (pa.v != 4)                           return 419;
+    }
+
     // By-value ARGUMENT: the caller copy-constructs a temp, the callee reads it, the temp is
     // destroyed - so one copy and two destructions in total.
     cppi.reset_counts();
@@ -5202,7 +5291,7 @@ extern int main()
     if (cppi_scope.onlyInt((int)cppi_scope.A.x) != 4007) return 1624;
     if (cppi_scope.onlyB((cppi_scope.B)cppi_scope.A.x) != 5007) return 1625;
     if (cppi_scope.unscopedInt(cppi_scope.U1.u) != 9007) return 1626;
-    if (cppi_scope.unscopedOther(cppi_scope.U1.u) != 10007) return 1627;
+    if (cppi_scope.unscopedOther((cppi_scope.U2)cppi_scope.U1.u) != 10007) return 1627;
     if (cppi_scope.pick(cppi_scope.A.x) != 1007) return 1628;
     // C++ has no implicit integer -> enum conversion: an integer (literal or named int) picks the
     // `long long` / converting-constructor overload. Pre-fix both picked the enum (11004, 12504).
@@ -5434,11 +5523,11 @@ extern int main()
     if (refmemH.get() != 5)                             return 1850;
     refmemH.set(7);
     if (refmemX != 7)                                   return 1851;
-    if (*refmemH.r != 7)                                return 1852;   // the field IS the pointer
-    *refmemH.r = 9;                                                     // store to the REFERENT
+    if (refmemH.r != 7)                                 return 1852;   // the field IS the referent
+    refmemH.r = 9;                                                      // store to the REFERENT
     if (refmemX != 9 || refmemH.get() != 9)                return 1853;
-    int* refmemP = refmemH.r;                                              // read the field as T*
-    if (*refmemP != 9)                                  return 1854;
+    int refmemP = refmemH.r;                                               // read the field as int
+    if (refmemP != 9)                                   return 1854;
 
     cppref.RefHolder refmemD = cppref.RefHolder(&refmemX);     // direct construction
     if (refmemD.get() != 9)                             return 1855;
@@ -5471,7 +5560,7 @@ extern int main()
     int refmemB = 19;
     cppref.RefDerived refmemDer = cppref.RefDerived(&refmemB, 3);   // reference member in a BASE
     if (refmemDer.total() != 22)                        return 1864;
-    if (refmemDer.extra != 3 || *refmemDer.r != 19)        return 1865;
+    if (refmemDer.extra != 3 || refmemDer.r != 19)         return 1865;
     if (refmemDer.base_get() != 19)                     return 1866;
 
     int refmemG = 21;
@@ -5483,6 +5572,78 @@ extern int main()
     int refmemE1 = 4; int refmemE2 = 6;                                    // array of such records
     cppref.RefHolder[2] refmemArr = { cppref.RefHolder(&refmemE1), cppref.RefHolder(&refmemE2) };
     if (refmemArr[0].get() != 4 || refmemArr[1].get() != 6) return 1869;
+    if (refmemArr[0].r != 4 || refmemArr[1].r != 6)     return 1869;   // element field reads the referent
+    if (refmemCr.v.b != 4)                              return 1870;   // field of a CLASS referent
+    if (refmemTr.t != 23)                               return 1871;   // class template T& member
+
+    // ---- M98: reference members as aliases of the referent (cppalias) --------------------------
+    int aX = 4; int aY = 6;
+    cppalias.Holder aH = cppalias.Holder(aX, aY);
+    if (aH.r != 4 || aH.c != 6)                         return 1872;   // reads load the referent
+    int aCopy = aH.r;
+    auto aAuto = aH.r;
+    if (aCopy != 4 || aAuto != 4)                       return 1873;
+    aH.r = 43;                                                         // write through the field
+    if (aX != 43)                                       return 1874;
+    aH.r += 2;
+    aH.r++;
+    if (aX != 46)                                       return 1875;   // compound and ++ act on the referent
+    int* aAddr = &aH.r;
+    if (aAddr != &aX)                                   return 1876;   // & is the referent's address
+    if (cppalias.bump_ref(aH.r) != 47 || aX != 47)      return 1877;   // binds an int& parameter
+    if (cppalias.read_const(aH.c) != 6)                 return 1878;   // const int& parameter
+    cppalias.Outer aO = cppalias.Outer(cppalias.Inner(aH));
+    if (aO.inner.h.r != 47)                             return 1879;   // member of a member
+    aO.inner.h.r = 50;
+    if (aX != 50)                                       return 1880;
+    auto aP = cppalias.both(aX, aY);                                   // pair<const int&, const int&>
+    int aPf = aP.first;
+    if (aPf != 50 || aP.first != 50 || aP.second != 6)  return 1881;
+
+    // ---- M98 round 2: pointer referents (int*&, int**&, const int*&, int* const&, C*&) ----------
+    cppalias.reset_pointers();
+    cppalias.PtrRef pH = cppalias.global_pref();                       // int*& member
+    if (*pH.p != 6)                                     return 1882;   // read through the referent pointer
+    int pRead = *pH.p;
+    if (pRead != 6)                                     return 1883;   // a deref is int, not int*
+    *pH.p = 9;                                                         // store to the POINTEE
+    if (cppalias.pw_value() != 9)                       return 1884;
+    pH.p = &cppalias.pv;                                               // retarget the referenced pointer
+    if (*pH.p != 4)                                     return 1885;
+    cppalias.reset_pointers();
+
+    cppalias.PtrPtrRef ppH = cppalias.global_ppref();                  // int**& member
+    if (**ppH.pp != 6)                                  return 1886;
+    **ppH.pp = 8;
+    if (cppalias.pw_value() != 8)                       return 1887;
+    cppalias.reset_pointers();
+
+    cppalias.CPtrRef cpH = cppalias.global_cpref();                    // const int*& member
+    int cpRead = *cpH.p;
+    if (cpRead != 6)                                    return 1888;
+
+    cppalias.CPPRef cppH = cppalias.global_cpp();                      // int* const& member
+    if (*cppH.p != 6)                                   return 1889;
+    *cppH.p = 5;                                                       // the pointee stays writable
+    if (cppalias.pw_value() != 5)                       return 1890;
+    cppalias.reset_pointers();
+
+    cppalias.VPRef vpH = cppalias.global_vpref();                      // C*& member: method through it
+    if (vpH.v->get() != 7)                              return 1891;
+    vpH.v->set(8);
+    if (vpH.v->get() != 8)                              return 1892;
+
+    // ---- M98 round 3: class-template referent with a pointer argument; mutable; C* const& -------
+    cppalias.BoxRef brH = cppalias.global_boxref();                    // Box<int*>& member
+    if (brH.b.get() != 6)                               return 1893;   // a class referent is depth 0
+    brH.b.set(9);
+    if (cppalias.gn_value() != 9)                       return 1894;
+    cppalias.MutRef mrH = cppalias.global_mutref();                    // const MutM& with a mutable field
+    mrH.r.m = 8;                                                       // mutable: writable through const
+    if (cppalias.gmut_m() != 8)                         return 1895;
+    cppalias.VPCRef vpcH = cppalias.global_vpc();                      // Vv2* const& member
+    vpcH.v->set(8);                                                    // pointee writable through the slot
+    if (cppalias.gv2_n() != 8 || vpcH.v->get() != 8)    return 1896;
 
     // ---- a C++ field whose type is a CLASS ------------------------------------------------------
     // Pre-fix every leg below failed to COMPILE ("Undefined variable ..." / "no overload of
@@ -6140,7 +6301,7 @@ extern int main()
     // and a double above INT_MAX into `unsigned` keeps its value.
     bool ctorrefTrue = true;
     double ctorrefBig = 3000000000.5;
-    if (cppcr.ThkDbl(ctorrefTrue).v != 1.0 || (i64)cppcr.ThkUns(ctorrefBig).v != 3000000000) return 7146;
+    if (cppcr.ThkDbl(ctorrefTrue).v != 1.0 || (i64)cppcr.ThkUns((unsigned)(i64)ctorrefBig).v != 3000000000) return 7146;
 
     // Same-width C++ scalar spellings still require a fresh conversion temporary.
     long ctorrefLong = 4;
@@ -6564,6 +6725,15 @@ extern int main()
     // RULING: globals are NOT destroyed at exit, so nothing has run a destructor by now. This
     // also fails if a global_dtors/atexit entry were ever added.
     if (cppa.gdtor_count() != 0)                                               return 2161;
+
+    // T74: uninitialized global arrays of CFlat structs construct each element before main.
+    if (t74Global[1].z != 5 || t74Global[1].track.value != 37)                 return 7410;
+    if (t74Grid[1][2].z != 5 || t74Grid[1][2].track.value != 37)               return 7411;
+    if (t74Nested[1].item.z != 5 || t74Nested[1].item.track.value != 37)       return 7412;
+    if (T74Ns.values[1].track.value != 37 || t74Scalar.track.value != 37)       return 7413;
+    if (cflat_t74.ctor_count() != 13 || cflat_t74.dtor_count() != 0)            return 7414;
+    if (t74StaticLocalArray() != 375 || cflat_t74.ctor_count() != 15)           return 7415;
+    if (cflat_t74.probe_ctor_count() != 2 || t74Direct[1].value != 41)         return 7416;
 
     // ---- C++ FREE OPERATOR TEMPLATES ------------------------------------------------------
     if (sizeof(std.string) == 0) return 2187;
@@ -7097,6 +7267,29 @@ extern int main()
     if ((int)convStd.size() != 4)                                              return 2245;
     convStd = "xy";
     if ((int)convStd.size() != 2 || ConvRetStd().size() != 5)                  return 2246;
+    cpi_t42.Box t75CtorCast = (cpi_t42.Box)"A";
+    if (t75CtorCast.id() != 65)                                                return 2275;
+    char* t75CtorSource = "B";
+    cpi_t42.Box t75CtorCastLocal = (cpi_t42.Box)t75CtorSource;
+    if (t75CtorCastLocal.id() != 66)                                           return 2276;
+    std.string t75StdCast = (std.string)"abc";
+    if ((int)t75StdCast.size() != 3)                                           return 2277;
+    char* t75StdSource = "xyz";
+    std.string t75StdCastLocal = (std.string)t75StdSource;
+    if ((int)t75StdCastLocal.size() != 3)                                      return 2278;
+    cpi_t42.ExplicitOnly t75ExplicitLit = (cpi_t42.ExplicitOnly)"a";
+    if (t75ExplicitLit.v != 97)                                                return 2279;
+    char* t75ExplicitSrc = "b";
+    cpi_t42.ExplicitOnly t75ExplicitLocal = (cpi_t42.ExplicitOnly)t75ExplicitSrc;
+    if (t75ExplicitLocal.v != 98)                                              return 2291;
+    // Explicit char* beats a non-explicit const char* for a char* local; a literal takes const char*.
+    char* t75RankSrc = "c";
+    cpi_t42.RankExplicit t75RankLocal = (cpi_t42.RankExplicit)t75RankSrc;
+    if (t75RankLocal.tag != 3)                                                 return 2292;
+    cpi_t42.RankExplicit t75RankLit = (cpi_t42.RankExplicit)"d";
+    if (t75RankLit.tag != 2)                                                   return 2293;
+    cpi_t42.RankExplicit t75RankRet = (cpi_t42.RankExplicit)t75Pick(t75RankSrc);
+    if (t75RankRet.tag != 3)                                                   return 2294;
     // A class template specialization target; copy-assign from the temporary adds 10 to tag.
     cppexp.ConvBox<int> convBox = 3;
     if (convBox.v != 3 || convBox.tag != 1)                                    return 2247;
@@ -7777,8 +7970,8 @@ extern int main()
         delete c6Rf;
         // Scalar-reference sets resolve through clang (a converted temporary binds).
         double c6DoubleRef = 1.5;
-        c6r3.Rf* c6Rfd = new c6r3.Rf(c6DoubleRef);
-        c6r3.Rr* c6Rrd = new c6r3.Rr(c6DoubleRef);
+        c6r3.Rf* c6Rfd = new c6r3.Rf((int)c6DoubleRef);
+        c6r3.Rr* c6Rrd = new c6r3.Rr((int)c6DoubleRef);
         if (c6Rfd->c != 1 || c6Rrd->c != 1) return 31830;
         delete c6Rfd;
         delete c6Rrd;
@@ -10446,7 +10639,7 @@ extern int main()
         const cppi.Tracked mvE = cppi.Tracked(3);
         auto mvF = move mvE;
         const cppi.Tracked mvG = cppi.Tracked(4);
-        mvB = move mvG;
+        mvB = mvG;
         cppi.Tracked mvH = mv_return_const_local();
         cppi.Tracked mvI = cppi.Tracked(5);
         const int mvArgA = cppi.take_tracked(move mvI);
@@ -10470,7 +10663,7 @@ extern int main()
         cppi.XvDefaultedMove mdA = cppi.XvDefaultedMove(5);
         cppi.XvDefaultedMove mdB = move mdA;
         cppi.XvDefaultedMove mdC = cppi.XvDefaultedMove(6);
-        mdB = move mdC;
+        mdB = mdC;
         cppi.XvTrivialTemplate ttD = cppi.XvTrivialTemplate(8);
         cppi.XvTrivialTemplate ttE = move ttD;
         if (mcB.v != 1 || mmF.v != 3 || mdB.item.v != 6 || ttE.v != 108) return 7045;
@@ -10532,6 +10725,133 @@ extern int main()
         if (taB.v != 107 || taP->v != 7 || taC.v != 207 || taD.v != 207
             || cppi.xv_move_count() != 2) return 7052;
     }
+    // T70 argument doors: a non-const C++ T&& call result is `move *p` at local/new
+    // construction, by-value and template parameters, nested results, and vector emplace.
+    cppi.reset_counts();
+    {
+        cppi.Tracked t70Source = cppi.Tracked(71);
+        cppi.Tracked t70Value = cppi.Tracked(cppi.xv_move(t70Source));
+        if (t70Source.value() != -1 || t70Value.value() != 71
+            || cppi.copy_count() != 0 || cppi.move_count() != 1) return 7060;
+    }
+    if (cppi.ctor_count() != 1 || cppi.dtor_count() != 2) return 7061;
+    cppi.reset_counts();
+    {
+        cppi.Tracked t70Source = cppi.Tracked(72);
+        cppi.Tracked* t70Heap = new cppi.Tracked(cppi.xv_move(t70Source));
+        if (t70Source.value() != -1 || t70Heap.value() != 72
+            || cppi.copy_count() != 0 || cppi.move_count() != 1) return 7062;
+        delete t70Heap;
+    }
+    if (cppi.ctor_count() != 1 || cppi.dtor_count() != 2) return 7063;
+    cppi.reset_counts();
+    {
+        cppi.Tracked t70Source = cppi.Tracked(73);
+        cppi.Tracked t70Nested = cppi.Tracked(std.move(std.move(t70Source)));
+        if (t70Source.value() != -1 || t70Nested.value() != 73
+            || cppi.copy_count() != 0 || cppi.move_count() != 1) return 7064;
+    }
+    if (cppi.ctor_count() != 1 || cppi.dtor_count() != 2) return 7065;
+    cppi.reset_counts();
+    {
+        cppi.Tracked t70Source = cppi.Tracked(74);
+        int t70CppByval = cppi.take_tracked(std.move(t70Source));
+        if (t70CppByval != 74 || t70Source.value() != -1
+            || cppi.copy_count() != 0 || cppi.move_count() != 1) return 7066;
+    }
+    if (cppi.ctor_count() != 1 || cppi.dtor_count() != 2) return 7067;
+    cppi.reset_counts();
+    {
+        cppi.Tracked t70Source = cppi.Tracked(741);
+        int t70CflatByvalValue = t70CflatByval(std.move(t70Source));
+        if (t70CflatByvalValue != 741 || t70Source.value() != -1
+            || cppi.copy_count() != 0 || cppi.move_count() != 1) return 7076;
+    }
+    if (cppi.ctor_count() != 1 || cppi.dtor_count() != 2) return 7077;
+    cppi.reset_counts();
+    {
+        cppi.Tracked t70Source = cppi.Tracked(75);
+        int t70TemplateByval = cppi.t70_byval(std.move(t70Source));
+        if (t70TemplateByval != 75 || t70Source.value() != -1
+            || cppi.copy_count() != 0 || cppi.move_count() != 1) return 7068;
+    }
+    if (cppi.ctor_count() != 1 || cppi.dtor_count() != 2) return 7069;
+    cppi.reset_counts();
+    {
+        cppi.Tracked t70Source = cppi.Tracked(76);
+        int t70Forward = cppi.t70_forward(std.move(t70Source));
+        if (t70Forward != 76 || t70Source.value() != 76
+            || cppi.copy_count() != 0 || cppi.move_count() != 0) return 7070;
+    }
+    if (cppi.ctor_count() != 1 || cppi.dtor_count() != 1) return 7071;
+    cppi.reset_counts();
+    {
+        cppi.Tracked t70Source = cppi.Tracked(77);
+        std.vector<cppi.Tracked> t70Items;
+        t70Items.emplace_back(std.move(t70Source));
+        if (t70Source.value() != -1 || t70Items[0].value() != 77
+            || cppi.copy_count() != 0 || cppi.move_count() != 1) return 7072;
+    }
+    if (cppi.ctor_count() != 1 || cppi.dtor_count() != 2) return 7073;
+    int t70Scalar = 78;
+    if (cppi.t70_scalar_slot(std.move(t70Scalar), &t70Scalar) != 1) return 7074;
+    int t70Pointee = 79;
+    int* t70Pointer = &t70Pointee;
+    if (cppi.t70_pointer_slot(move t70Pointer, &t70Pointer) != 1) return 7075;
+    cppi.reset_counts();
+    {
+        cppi.Tracked t70OverloadSource = cppi.Tracked(7901);
+        if (cppi.t70_pointer_or_const_ref(std.move(t70OverloadSource)) != 2
+            || t70OverloadSource.value() != 7901
+            || cppi.copy_count() != 0 || cppi.move_count() != 0) return 7081;
+    }
+    if (cppi.ctor_count() != 1 || cppi.dtor_count() != 1) return 7082;
+    cppi.reset_counts();
+    {
+        cppi.Tracked t70OverloadSource = cppi.Tracked(7902);
+        if (t70_cflat_pointer_or_value(std.move(t70OverloadSource)) != 7902
+            || t70OverloadSource.value() != -1
+            || cppi.copy_count() != 0 || cppi.move_count() != 1) return 7083;
+    }
+    if (cppi.ctor_count() != 1 || cppi.dtor_count() != 2) return 7084;
+    cppi.T70Plain t70PointerSource = cppi.T70Plain();
+    t70PointerSource.value = 7903;
+    if (t70_cflat_pointer_only(move t70PointerSource) != 7903
+        || t70PointerSource.value != 7903) return 7085;
+    // T70 review 2: a same-class C* parameter takes a class xvalue through the class's own
+    // conversion operator (clang), both ranked against void* and as the sole candidate.
+    cppi.T70Conv t70ConvSource = cppi.T70Conv();
+    if (cppi.t70_conv_pick(std.move(t70ConvSource)) != 31 || t70ConvSource.value != 31) return 7086;
+    if (cppi.t70_conv_only(std.move(t70ConvSource)) != 31 || t70ConvSource.value != 31) return 7087;
+    // T70 review 3: inherited operator C*(), template operator T*(), operator Derived*() then
+    // Derived* -> C*. Tags only (clang runs the conversion, cflat binds the source - pre-existing).
+    cppi.T70Inh t70InhSource = cppi.T70Inh();
+    if (cppi.t70_inh_pick(std.move(t70InhSource)) != 1 || t70InhSource.value != 31) return 7088;
+    if (cppi.t70_inh_only(std.move(t70InhSource)) != 1 || t70InhSource.value != 31) return 7089;
+    cppi.T70Tpl t70TplSource = cppi.T70Tpl();
+    if (cppi.t70_tpl_only(std.move(t70TplSource)) != 1 || t70TplSource.value != 31) return 7090;
+    cppi.T70Der t70DerSource = cppi.T70Der();
+    if (cppi.t70_der_pick(std.move(t70DerSource)) != 1 || t70DerSource.value != 31) return 7091;
+    if (cppi.t70_der_only(std.move(t70DerSource)) != 1 || t70DerSource.value != 31) return 7092;
+    cppi.reset_counts();
+    {
+        cppi.Tracked t70Source = cppi.Tracked(780);
+        cppi.Tracked t70Braced{cppi.xv_move(t70Source)};
+        if (t70Source.value() != -1 || t70Braced.value() != 780
+            || cppi.copy_count() != 0 || cppi.move_count() != 1) return 7078;
+    }
+    if (cppi.ctor_count() != 1 || cppi.dtor_count() != 2) return 7079;
+    // T70 round 2: `move _data[index]` of an owned unique_ptr slot (list.removeAt) frees one.
+    cppon.reset();
+    {
+        list<unique cppon.Cls*> t70Owned = default;
+        t70Owned.add(new cppon.Cls(81));
+        t70Owned.add(new cppon.Cls(82));
+        t70Owned.removeAt(0);
+        if (t70Owned.count() != 1 || t70Owned[0]->get() != 82 || cppon.live() != 1
+            || cppon.clsDel() != 1) return 7080;
+    }
+    if (cppon.live() != 0 || cppon.clsDel() != 2) return 7080;
     // std.format checks companion emission of libc++ inline variables and ctor-initializer
     // callees, including std::to_address reached from basic_string_view construction.
     std.string fmtText = "ab";

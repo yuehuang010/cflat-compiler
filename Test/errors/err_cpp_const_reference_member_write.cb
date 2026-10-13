@@ -1,0 +1,60 @@
+import cpp "cpp_interop_ref_alias.h";
+
+/*
+ * A `const T&` data member reads its referent but may not be written through the field, at any
+ * write door. For `int* const&` the slot itself is read-only, while the pointee stays writable
+ * (`*p = v` is legal and has a value leg in Test/test_cpp_interop.cb).
+ */
+extern int main()
+{
+    expect_error("cannot assign to 'h.c': it is reached through a C++ const reference result") {
+        int x = 4;
+        int y = 6;
+        cppalias.Holder h = cppalias.Holder(x, y);
+        h.c = 5;
+    }
+
+    expect_error("cannot increment 'h.c': it is reached through a C++ const reference result") {
+        int x = 4;
+        int y = 6;
+        cppalias.Holder h = cppalias.Holder(x, y);
+        h.c++;
+    }
+
+    expect_error("cannot assign to 'cp.p': it is reached through a C++ const reference result") {
+        cppalias.CPPRef cp = cppalias.global_cpp();
+        int z = 1;
+        int* zp = &z;
+        cp.p = zp;
+    }
+
+    expect_error("cannot increment 'cp.p': it is reached through a C++ const reference result") {
+        cppalias.CPPRef cp = cppalias.global_cpp();
+        cp.p++;
+    }
+
+    expect_error("cannot decrement 'cp.p': it is reached through a C++ const reference result") {
+        cppalias.CPPRef cp = cppalias.global_cpp();
+        cp.p--;
+    }
+
+    // Round 3: a non-mutable field of a const referent stays read-only; a mutable one is writable.
+    expect_error("cannot assign to 'mr.r.x': it is reached through a C++ const reference result") {
+        cppalias.MutRef mr = cppalias.global_mutref();
+        mr.r.x = 8;
+    }
+
+    // `const T* const&`: the pointee is const, so a non-const method is refused.
+    expect_error("cannot call non-const member 'set' on 'cvpc.v'") {
+        cppalias.CVPCRef cvpc = cppalias.global_cvpc();
+        cvpc.v->set(3);
+    }
+
+    // Round 4: `*` needs a pointer VALUE; a class-reference member is a class value, not a pointer.
+    expect_error("indirection requires a pointer operand ('cppalias.Box") {
+        cppalias.BoxRef br = cppalias.global_boxref();
+        (*br.b).get();
+    }
+
+    return 0;
+}

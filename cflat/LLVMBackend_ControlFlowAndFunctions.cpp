@@ -673,7 +673,15 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             if (ReturnCarriesRawArrayCount(retTV))
                 paramTypes.push_back(cflat_llvm::PointerTo(builder->getInt64Ty()));
             auto* retTy   = cxxSretReturn ? builder->getVoidTy() : GetFunctionReturnABIType(retTV);
-            auto* cFnTy   = llvm::FunctionType::get(retTy, paramTypes, false);
+            // Native aggregates in the signature: the C ABI of the signature (AAPCS / Win64 per
+            // target), the same recipe a C caller would use. Shared lowering: LowerAbiArgs.
+            AbiRecipe thinCRecipe;
+            const bool thinCAbi = ThinFnPtrUsesCAbi(cxxRecipeRet, cxxRecipeParams, thinCRecipe);
+            // The return type is the lowered one; the parameter list is re-derived from the
+            // lowered values at the call (raw array counts ride behind their argument).
+            auto* cFnTy   = thinCAbi
+                ? BuildExternFunctionType(cxxRecipeRet, cxxRecipeParams, false, thinCRecipe)
+                : llvm::FunctionType::get(retTy, paramTypes, false);
             auto* fnPtr   = builder->CreateBitCast(funcPtr, cflat_llvm::PointerTo(cFnTy), "cfn_ptr");
             std::vector<llvm::Value*> abiArgs;
             std::vector<std::pair<unsigned, TypeAndValue>> extParams;
@@ -735,18 +743,82 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 abiArgs.push_back(rawReturnCountSlot);
             }
             lastCallReturnType = retTV;
+            llvm::Value* thinSretSlot = nullptr;
+            if (thinCAbi)
+            {
+                // Conversions above ran on the natural types; now lower each slot (sret first).
+                std::vector<llvm::Value*> loweredArgs;
+                if (thinCRecipe.retSlot.kind == AbiSlot::SRetReturn)
+                {
+                    thinSretSlot = AllocaAtEntry(thinCRecipe.retSlot.structTy, nullptr, "thin.sret",
+                                                 thinCRecipe.retSlot.align);
+                    loweredArgs.push_back(thinSretSlot);
+                }
+                // Each counted parameter's count stays with it: LowerAbiArgs places it after the
+                // slots, and the return count slot goes last (both part of the C-ABI signature).
+                std::vector<llvm::Value*> argsOnly;
+                std::vector<llvm::Value*> countsOnly;
+                size_t k = 0;
+                for (size_t i = 0; i < cxxRecipeParams.size() && k < abiArgs.size(); ++i)
+                {
+                    argsOnly.push_back(abiArgs[k++]);
+                    llvm::Value* count = nullptr;
+                    if (ParameterCarriesRawArrayCount(cxxRecipeParams[i]) && k < abiArgs.size())
+                        count = abiArgs[k++];
+                    countsOnly.push_back(count);
+                }
+                LowerAbiArgs(thinCRecipe, argsOnly, nullptr, &countsOnly, loweredArgs);
+                if (thinCRecipe.retCountParam)
+                    loweredArgs.push_back(rawReturnCountSlot);
+                else
+                    rawReturnCountSlot = nullptr;
+                std::vector<llvm::Type*> loweredTys;
+                loweredTys.reserve(loweredArgs.size());
+                for (auto* v : loweredArgs) loweredTys.push_back(v->getType());
+                cFnTy = llvm::FunctionType::get(cFnTy->getReturnType(), loweredTys, false);
+                abiArgs = std::move(loweredArgs);
+            }
             PreserveRetainedJoinArmTempsBeforeCall(nullptr, abiArgs);
             auto* result = CreateCallOrInvoke(cFnTy, fnPtr, abiArgs, /*mayUnwind=*/true);
             // thin function<> = bare C pointer: the callee may be clang -O2 C code (see the helper).
             if (auto* callBase = llvm::dyn_cast_or_null<llvm::CallBase>(result))
-                ApplyNarrowIntExtCallAttrs(callBase, extParams);
+            {
+                if (thinCAbi)
+                {
+                    ApplyAbiCallAttributes(callBase, thinCRecipe);
+                    // C callers extend narrow integer arguments (AAPCS / Darwin): the DECLARED
+                    // parameter type decides signext/zeroext, at each lowered Direct index.
+                    std::vector<std::pair<unsigned, TypeAndValue>> loweredExt;
+                    unsigned lowIdx = thinSretSlot != nullptr ? 1u : 0u;
+                    for (size_t i = 0; i < thinCRecipe.paramSlots.size() && i < funcPtrType.FuncPtrParams.size(); ++i)
+                    {
+                        const AbiSlot& s = thinCRecipe.paramSlots[i];
+                        if (s.kind == AbiSlot::Direct)
+                        {
+                            TypeAndValue declared;
+                            declared.TypeName = funcPtrType.FuncPtrParams[i].TypeName;
+                            declared.Pointer = funcPtrType.FuncPtrParams[i].Pointer;
+                            loweredExt.emplace_back(lowIdx, declared);
+                        }
+                        lowIdx += SlotLLVMParamCount(s);
+                    }
+                    ApplyNarrowIntExtCallAttrs(callBase, loweredExt);
+                }
+                else ApplyNarrowIntExtCallAttrs(callBase, extParams);
+            }
             // No body to prove the callee borrows: keep `?:` / `??` arm temps it may retain.
             DropRetainedJoinArmPtrTemps(result);
             if (cxxSretRecipe.hasLowering)
                 ApplyAbiCallAttributes(result, cxxSretRecipe);
-            llvm::Value* value = cxxSretReturn
-                ? static_cast<llvm::Value*>(builder->CreateLoad(cxxSret.first, cxxSret.second))
-                : (retTy->isVoidTy() ? nullptr : result);
+            llvm::Value* value = nullptr;
+            if (cxxSretReturn)
+                value = builder->CreateLoad(cxxSret.first, cxxSret.second);
+            else if (thinCAbi && thinSretSlot != nullptr)
+                value = builder->CreateLoad(thinCRecipe.retSlot.structTy, thinSretSlot);
+            else if (thinCAbi)
+                value = retTy->isVoidTy() ? nullptr : DecodeAbiRegisterReturn(thinCRecipe, result);
+            else
+                value = retTy->isVoidTy() ? nullptr : result;
             if (cxxSretReturn) publishIndirectSretValue(retTV, value);
             recordOpaqueReturn(result);
             RegisterRawArrayCallResult(value, rawReturnCountSlot);
@@ -1789,7 +1861,11 @@ llvm::FunctionType* LLVMBackend::BuildExternFunctionType(const TypeAndValue& ret
                 ptypes.push_back(cflat_llvm::PointerTo(GetType(params[i])));
             else
                 ptypes.push_back(GetCCompatibleType(params[i]));
+            if (s.countAfter)
+                ptypes.push_back(builder->getInt64Ty());
         }
+        if (recipe.retCountParam)
+            ptypes.push_back(cflat_llvm::PointerTo(builder->getInt64Ty()));
         if (SRetArgIndex(recipe) == 1 && ptypes.size() > 1) std::swap(ptypes[0], ptypes[1]);
         return llvm::FunctionType::get(loweredRet, ptypes, varargs);
     }
@@ -1953,10 +2029,11 @@ void LLVMBackend::ApplyNarrowIntExtAttrs(llvm::Function* fn, const TypeAndValue&
 
 unsigned LLVMBackend::SlotLLVMParamCount(const AbiSlot& s)
 {
-        if (s.kind == AbiSlot::CoercePair) return 2u;
+        const unsigned count = s.countAfter ? 1u : 0u;
+        if (s.kind == AbiSlot::CoercePair) return 2u + count;
         if (s.kind == AbiSlot::Ignore)     return 0u;
-        if (s.kind == AbiSlot::CoerceFlat) return s.coerceStructTy->getNumElements();
-        return 1u;
+        if (s.kind == AbiSlot::CoerceFlat) return s.coerceStructTy->getNumElements() + count;
+        return 1u + count;
     }
 
 // A file-scope `main` with an entry-point signature IS the program entry point, so it keeps its

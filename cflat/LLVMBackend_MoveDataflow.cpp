@@ -1160,28 +1160,16 @@ void LLVMBackend::ApplyAbiCallAttributes(llvm::CallBase* ci, const AbiRecipe& re
         }
     }
 
-llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, std::vector<llvm::Value*>& argList,
-                                            llvm::Value* sretDest,
-                                            const std::vector<llvm::Value*>* indirectArgAddrs,
-                                            llvm::Value* calleeOverride,
-                                            const std::vector<llvm::Value*>* rawArrayCounts,
-                                            bool mayUnwind)
+/*
+ * Per-slot argument lowering shared by every ABI-lowered call: the extern/C++ symbol door
+ * (EmitAbiLoweredCall) and a call through a thin function<> value (the C ABI of its signature).
+ * Appends the lowered LLVM arguments for argList to loweredArgs; the sret slot is NOT added here.
+ */
+void LLVMBackend::LowerAbiArgs(const AbiRecipe& recipe, const std::vector<llvm::Value*>& argList,
+                               const std::vector<llvm::Value*>* indirectArgAddrs,
+                               const std::vector<llvm::Value*>* rawArrayCounts,
+                               std::vector<llvm::Value*>& loweredArgs)
 {
-        const AbiRecipe& recipe = candidate.Recipe;
-        std::vector<llvm::Value*> loweredArgs;
-        loweredArgs.reserve(argList.size() + (recipe.retSlot.kind == AbiSlot::SRetReturn ? 1 : 0));
-
-        llvm::Value* sretSlot = nullptr;
-        const bool sretIntoCallerSlot = sretDest != nullptr
-            && recipe.retSlot.kind == AbiSlot::SRetReturn;
-        if (recipe.retSlot.kind == AbiSlot::SRetReturn)
-        {
-            sretSlot = sretIntoCallerSlot
-                ? sretDest
-                : AllocaAtEntry(recipe.retSlot.structTy, nullptr, "sret", recipe.retSlot.align);
-            loweredArgs.push_back(sretSlot);
-        }
-
         for (size_t i = 0; i < argList.size() && i < recipe.paramSlots.size(); ++i)
         {
             const AbiSlot& s = recipe.paramSlots[i];
@@ -1189,7 +1177,7 @@ llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, st
             if (s.kind == AbiSlot::Direct)
             {
                 loweredArgs.push_back(v);
-                if (rawArrayCounts != nullptr && i < rawArrayCounts->size()
+                if (!s.countAfter && rawArrayCounts != nullptr && i < rawArrayCounts->size()
                     && (*rawArrayCounts)[i] != nullptr)
                     loweredArgs.push_back((*rawArrayCounts)[i]);
             }
@@ -1244,25 +1232,24 @@ llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, st
                     loweredArgs.push_back(slot);
                 }
             }
+            // The C-ABI count of a counted parameter follows its slots; a missing count is the
+            // unknown-count sentinel, as at every other call that cannot derive one.
+            if (s.countAfter)
+            {
+                llvm::Value* count = rawArrayCounts != nullptr && i < rawArrayCounts->size()
+                    ? (*rawArrayCounts)[i] : nullptr;
+                loweredArgs.push_back(count != nullptr ? count : builder->getInt64(-1));
+            }
         }
 
-        // MS ABI instance method: the hidden slot was pushed first, the ABI wants it after `this`.
-        if (SRetArgIndex(recipe) == 1 && loweredArgs.size() > 1)
-            std::swap(loweredArgs[0], loweredArgs[1]);
+}
 
-        // A virtual member is reached through the pointer loaded out of the receiver's vptr; the
-        // SIGNATURE still comes from the declaration, which carries clang's own arrangement.
-        auto* ci = CreateCallOrInvoke(candidate.Function->getFunctionType(),
-            calleeOverride != nullptr ? calleeOverride : candidate.Function, loweredArgs, mayUnwind);
-        ci->setCallingConv(candidate.Function->getCallingConv());
-        ApplyAbiCallAttributes(ci, recipe);
-
-        if (recipe.retSlot.kind == AbiSlot::SRetReturn)
-        {
-            // Constructed straight into the caller's storage: the slot IS the result.
-            if (sretIntoCallerSlot) return sretSlot;
-            return builder->CreateLoad(recipe.retSlot.structTy, sretSlot);
-        }
+/*
+ * Decodes the register-returned value of an ABI-lowered call into the natural CFlat value. An sret
+ * return is decoded by the caller (its slot is the result); Ignore is decided by the caller too.
+ */
+llvm::Value* LLVMBackend::DecodeAbiRegisterReturn(const AbiRecipe& recipe, llvm::Value* ci)
+{
         if (recipe.retSlot.kind == AbiSlot::CoerceToInt)
         {
             auto* slot = AllocaForCoerce(recipe.retSlot.structTy, recipe.retSlot.coerceTy,
@@ -1288,9 +1275,52 @@ llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, st
             StoreCoerceAt(slot, builder->CreateExtractValue(ci, 1), 8);
             return builder->CreateLoad(recipe.retSlot.structTy, slot);
         }
+        return ci; // Direct return
+}
+
+llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, std::vector<llvm::Value*>& argList,
+                                            llvm::Value* sretDest,
+                                            const std::vector<llvm::Value*>* indirectArgAddrs,
+                                            llvm::Value* calleeOverride,
+                                            const std::vector<llvm::Value*>* rawArrayCounts,
+                                            bool mayUnwind)
+{
+        const AbiRecipe& recipe = candidate.Recipe;
+        std::vector<llvm::Value*> loweredArgs;
+        loweredArgs.reserve(argList.size() + (recipe.retSlot.kind == AbiSlot::SRetReturn ? 1 : 0));
+
+        llvm::Value* sretSlot = nullptr;
+        const bool sretIntoCallerSlot = sretDest != nullptr
+            && recipe.retSlot.kind == AbiSlot::SRetReturn;
+        if (recipe.retSlot.kind == AbiSlot::SRetReturn)
+        {
+            sretSlot = sretIntoCallerSlot
+                ? sretDest
+                : AllocaAtEntry(recipe.retSlot.structTy, nullptr, "sret", recipe.retSlot.align);
+            loweredArgs.push_back(sretSlot);
+        }
+
+        LowerAbiArgs(recipe, argList, indirectArgAddrs, rawArrayCounts, loweredArgs);
+        // MS ABI instance method: the hidden slot was pushed first, the ABI wants it after `this`.
+        if (SRetArgIndex(recipe) == 1 && loweredArgs.size() > 1)
+            std::swap(loweredArgs[0], loweredArgs[1]);
+
+        // A virtual member is reached through the pointer loaded out of the receiver's vptr; the
+        // SIGNATURE still comes from the declaration, which carries clang's own arrangement.
+        auto* ci = CreateCallOrInvoke(candidate.Function->getFunctionType(),
+            calleeOverride != nullptr ? calleeOverride : candidate.Function, loweredArgs, mayUnwind);
+        ci->setCallingConv(candidate.Function->getCallingConv());
+        ApplyAbiCallAttributes(ci, recipe);
+
+        if (recipe.retSlot.kind == AbiSlot::SRetReturn)
+        {
+            // Constructed straight into the caller's storage: the slot IS the result.
+            if (sretIntoCallerSlot) return sretSlot;
+            return builder->CreateLoad(recipe.retSlot.structTy, sretSlot);
+        }
         if (recipe.retSlot.kind == AbiSlot::Ignore)
             return llvm::Constant::getNullValue(GetCCompatibleType(candidate.ReturnType));
-        return ci; // Direct return
+        return DecodeAbiRegisterReturn(recipe, ci);
     }
 
 /*

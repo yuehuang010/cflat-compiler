@@ -6434,7 +6434,7 @@ public:
     llvm::Value* TryUnaryFreeOperatorOverload(
         llvm::Value* operand, const std::string& op,
         antlr4::ParserRuleContext* ctx, llvm::Value* operandStorage,
-        bool operandIsConst = false);
+        bool operandIsConst = false, bool operandExplicitMove = false);
 
     // If an operator overload (e.g. operator+) just returned an owned heap string as an
     // unnamed SSA temporary, register it for end-of-full-expression cleanup. This is the
@@ -6521,7 +6521,11 @@ public:
         // NamedVariable::CxxArithIdentity of each operand (`1e3 + 1` is C++ double), for
         // operator-template deduction.
         const std::string& lhsArithIdentity = std::string(),
-        const std::string& rhsArithIdentity = std::string());
+        const std::string& rhsArithIdentity = std::string(),
+        // The rhs was written `move x`: it reaches the operator as an explicit move, so the
+        // same borrow-parameter diagnostic a call's `move x` gets applies to the operator.
+        bool rhsExplicitMove = false,
+        bool lhsExplicitMove = false);
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);
@@ -6969,7 +6973,8 @@ public:
      * Multi-dimensional arrays are contiguous, so the flat element walk covers `T[N][M]` as well.
      */
     void EmitFixedArrayDefaultInit(llvm::Value* arrAlloc, const LLVMBackend::TypeAndValue& tv,
-                                   antlr4::ParserRuleContext* where = nullptr);
+                                   antlr4::ParserRuleContext* where = nullptr,
+                                   bool forceRoot = false);
 
     // Coerce a folded element constant to the array's element type so ConstantArray::get
     // does not assert. Mirrors CreateGlobalVariable's int/fp-widen/null coercion.
@@ -7206,6 +7211,8 @@ public:
     void PrepareAliasCallResult(
         antlr4::ParserRuleContext* ctx,
         LLVMBackend::NamedVariable& result, bool markRvalue = true);
+    void NormalizeCxxRvalueReferenceArgument(
+        antlr4::ParserRuleContext* ctx, LLVMBackend::NamedVariable& argument);
 
     // Returns the member-name text immediately following `opNode` (a `.`/`->` token) in the
     // postfix child list, or "" if the next child is not an Identifier/`move` name. Used by

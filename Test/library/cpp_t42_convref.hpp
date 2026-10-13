@@ -14,6 +14,10 @@ struct Box {
     int id() const { return v; }
 };
 struct Strict { int v; explicit Strict(const char*) : v(7) {} };
+// T75: a cast direct-initializes, so explicit constructors are candidates (clang ranks them).
+// Non-trivial destructors: a trivially-copyable target is a separate, still-open refusal.
+struct ExplicitOnly { int v; explicit ExplicitOnly(const char* s) : v(s ? (int)s[0] : -1) {} ~ExplicitOnly() {} };
+struct RankExplicit { int tag; explicit RankExplicit(char*) : tag(3) {} RankExplicit(const char*) : tag(2) {} ~RankExplicit() {} };
 inline int fc(const Box& b) { return b.v + 100000; }
 inline int fr(Box&& b) { return b.v + 200000; }
 inline int fv(Box b) { return b.v + 300000; }

@@ -103,3 +103,13 @@ expect_error("chosen constructor is explicit in copy-initialization") {
         return e.first;
     }
 }
+
+// A non-decimal literal past int range is unsigned int ([lex.icon] ladder), so as a braced C++
+// initializer_list<int> element it is a constant that does not fit: clang refuses it too.
+expect_error("brace-list element 1 of 't63.VecPick' narrows to the C++ constructor's 'int'; a C++ initializer list forbids that") {
+    int hex_brace_probe()
+    {
+        t63.VecPick p = t63.VecPick({0xFFFFFFFF, 2});
+        return p.first;
+    }
+}

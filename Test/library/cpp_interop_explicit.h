@@ -309,7 +309,7 @@ struct ConvTplAssign {
     ~ConvTplAssign() {}
 };
 // `operator=(double)` is what C++ calls for an int source (standard conversion); CFlat's call
-// rules refuse int -> double, so the int source is refused rather than silently rerouted.
+// rules accept int -> double too (ruling 2026-10-09), so the int source runs that operator.
 struct ConvDblAssign {
     long v = 0;
     int via = 0;

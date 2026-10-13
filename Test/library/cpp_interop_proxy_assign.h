@@ -134,7 +134,7 @@ inline int rank_sx(float a, long b) { return 92; }
 inline int rank_sx(double a, int b) { return 93; }
 inline int rank_amb(double x) { return 40; }
 inline int rank_amb(char x) { return 41; }
-// C++ picks rank_k(double, int) for (int, int); CFlat refuses int -> double at a call.
+// C++ picks rank_k(double, int) for (int, int); CFlat accepts int -> double at a call too (ruling 2026-10-09).
 inline int rank_k(long a, long b) { return 50; }
 inline int rank_k(double a, int b) { return 51; }
 // Member forms: the implicit object parameter is ranked like any other argument.

@@ -1,4 +1,5 @@
 import cpp "cpp_interop_scoped_enum.h";
+import cpp "cpp_t78_scalar_table.h";
 
 extern int main()
 {
@@ -69,6 +70,55 @@ extern int main()
     }
     expect_error("has no constructor whose parameter types match these arguments") {
         cppi_scope.Dev d3 = cppi_scope.Dev(n);
+    }
+    // An unscoped C++ enum value into a parameter of a DIFFERENT enum type: no implicit conversion
+    // (ruling 2026-10-09). Only the explicit cast '(cppi_scope.U2)' is accepted.
+    expect_error("no overload of 'cppi_scope.unscopedOther' matches") {
+        int r = cppi_scope.unscopedOther(cppi_scope.U1.u);
+    }
+    // T78 review 1 refusals (ruling 2026-10-09, one scalar table). Each names the call the table
+    // refuses: a narrowing constructor argument, a non-const reference binding a converted value,
+    // a variadic declared parameter taking a different enum or a narrowing double, and a
+    // constructor whose only viable overload narrows (the other has no default for its second
+    // parameter). Clang accepts the narrowing ones and picks the narrowing overload.
+    expect_error("C++ class 't78.RefCtor' has no constructor whose parameter types match these arguments") {
+        int t78Big = 257;
+        t78.RefCtor t78Rc = t78.RefCtor(t78Big);
+    }
+    expect_error("C++ class 't78.Tmpl' has no constructor whose parameter types match these arguments") {
+        int t78Big = 257;
+        t78.Tmpl t78Tm = t78.Tmpl(t78Big);
+    }
+    expect_error("C++ class 't78.Arity' has no constructor whose parameter types match these arguments") {
+        int t78Big = 257;
+        t78.Arity t78Ar = t78.Arity(t78Big);
+    }
+    expect_error("no overload of 't78.takeMutD' matches") {
+        int t78Mut = 3;
+        int t78MutR = t78.takeMutD(t78Mut);
+    }
+    expect_error("no overload of 't78.takeTF' matches") {
+        t78.TE t78Te = t78.TE.TEV;
+        int t78TeR = t78.takeTF(t78Te, 1);
+    }
+    expect_error("no overload of 't78.takeShort' matches") {
+        double t78Dbl = 3.5;
+        int t78ShR = t78.takeShort(t78Dbl, 1);
+    }
+    // Round 3: a concrete short template parameter refuses int 257 (narrowing).
+    expect_error("no constructor") {
+        int t78I257 = 257;
+        t78.FixedS t78Fx = t78.FixedS(t78I257, 1);
+    }
+    // Round 3: a pointer constructor is unusable for an int, so the short one narrows and refuses.
+    expect_error("no constructor") {
+        int t78I257b = 257;
+        t78.PtrAlt t78Pa = t78.PtrAlt(t78I257b);
+    }
+    // Round 4: a typedef-spelled short template parameter refuses int 257 (narrowing).
+    expect_error("no constructor") {
+        int t78I257c = 257;
+        t78.AliasS t78As = t78.AliasS(t78I257c, 1);
     }
     return 0;
 }

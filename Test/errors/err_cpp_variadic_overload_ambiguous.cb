@@ -15,10 +15,5 @@ extern int main()
     expect_error("ambiguous call to 'cppi.variadic_ambig_ptr'") {
         int b = cppi.variadic_ambig_ptr(mutablePointer, 1);
     }
-    // C++ calls the declared `double` sibling over the ellipsis; CFlat makes no int -> double
-    // conversion at a call (ruling 2026-09-30), so the call names it instead of taking `...`.
-    expect_error("call to 'cppi.variadic_conv_rank' resolves in C++ to cppi.variadic_conv_rank(int, double)") {
-        int c = cppi.variadic_conv_rank(1, 2);
-    }
     return 0;
 }

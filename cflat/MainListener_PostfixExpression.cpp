@@ -112,64 +112,6 @@ static bool IsIncrementSuffix(antlr4::tree::ParseTree* node)
     return t == "++" || t == "--";
 }
 
-/*
- * True when the member `child` names is the destination of a store: either the postfix expression
- * `ctx` increments it (`obj.r++`), or `child` is the LAST suffix of `ctx` and `ctx` is the whole
- * left-hand side of an assignment. Only parentheses and single-child pass-through rules may sit
- * between `ctx` and that left-hand side, so `(obj.r) = v` counts but `obj.r + 1 == v` does not.
- * A unary operator in front (`*obj.r = v`) makes the assignment's unaryExpression take the
- * operator alternative, so the climb reaches it as a non-value parent and the answer is false.
- */
-static bool MemberIsAssignmentDestination(CFlatParser::PostfixExpressionContext* ctx,
-                                          antlr4::tree::ParseTree* child)
-{
-    if (ctx == nullptr || ctx->children.empty() || child == nullptr) return false;
-    // `child` is the identifier token inside a memberNameToken rule, so climb to the direct
-    // child of ctx first; anything after it must be an increment to still be a store.
-    antlr4::tree::ParseTree* suffix = child;
-    while (suffix != nullptr && suffix->parent != ctx) suffix = suffix->parent;
-    if (suffix == nullptr) return false;
-    if (ctx->children.back() != suffix)
-    {
-        size_t at = 0;
-        while (at < ctx->children.size() && ctx->children[at] != suffix) ++at;
-        for (size_t i = at + 1; i < ctx->children.size(); ++i)
-            if (!IsIncrementSuffix(ctx->children[i])) return false;
-        return true;
-    }
-    // Climb while the node is the WHOLE value of its parent, so only a form that assigns to the
-    // member itself reaches the assignment. `(obj.r)++` increments through the parentheses too.
-    for (antlr4::tree::ParseTree* node = ctx; node->parent != nullptr; node = node->parent)
-    {
-        antlr4::tree::ParseTree* parent = node->parent;
-        auto* assign = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent);
-        if (assign != nullptr && assign->assignmentOperator() != nullptr)
-        {
-            // Only the left-hand side stores; an operator-less assignmentExpression is the
-            // pass-through the rules below climb over.
-            auto* un = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
-            return un != nullptr && assign->unaryExpression() == un;
-        }
-        if (parent->children.size() == 1) continue;
-        if (dynamic_cast<CFlatParser::PostfixExpressionContext*>(parent) != nullptr
-            && parent->children.front() == node)
-        {
-            bool allIncrements = true;
-            for (size_t i = 1; i < parent->children.size(); ++i)
-                if (!IsIncrementSuffix(parent->children[i])) allIncrements = false;
-            if (allIncrements) return true;
-            return false;
-        }
-        // A parenthesized sub-expression - `(obj.r) = v` stores to the member just the same.
-        if (parent->children.size() == 3 && parent->children[1] == node
-            && parent->children.front()->getText() == "("
-            && parent->children.back()->getText() == ")")
-            continue;
-        return false;
-    }
-    return false;
-}
-
 static bool JsonConstIdentifier(const std::string& text)
 {
     if (text.empty() || (!std::isalpha((unsigned char)text[0]) && text[0] != '_')) return false;
@@ -862,6 +804,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     parsed.Storage = retTemp;
                     parsed.IsRvalue = true;
                 }
+                NormalizeCxxRvalueReferenceArgument(ctx, parsed);
                 return parsed;
             };
 
@@ -1621,7 +1564,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         CheckGuardedWrite(ctx, namedVar);
                         llvm::Value* incrementStorage = namedVar.Storage
                             ? namedVar.Storage : parenthesizedPostfixStorage;
-                        RefuseCxxConstReferentWrite(ctx, incrementStorage, "increment");
+                        if (!namedVar.TypeAndValue.IsCxxMutableField)   // a mutable member is writable
+                            RefuseCxxConstReferentWrite(ctx, incrementStorage, "increment");
                         if (incrementStorage)
                         {
                             namedVar.Primary = namedVar.Primary
@@ -1687,7 +1631,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         CheckGuardedWrite(ctx, namedVar);
                         llvm::Value* decrementStorage = namedVar.Storage
                             ? namedVar.Storage : parenthesizedPostfixStorage;
-                        RefuseCxxConstReferentWrite(ctx, decrementStorage, "decrement");
+                        if (!namedVar.TypeAndValue.IsCxxMutableField)   // a mutable member is writable
+                            RefuseCxxConstReferentWrite(ctx, decrementStorage, "decrement");
                         if (decrementStorage)
                         {
                             namedVar.Primary = namedVar.Primary
@@ -2238,13 +2183,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     structVar.TypeAndValue.TypeName, primaryIdentifier,
                                     structVar.TypeAndValue.VariableName == "this", true);
 
-                            // [PFX-2c-ref] A C++ reference member binds as a pointer field, so a
-                            // store to it would reseat the reference - which C++ cannot express.
-                            if (!structVar.TypeAndValue.TypeName.empty()
-                                && MemberIsAssignmentDestination(ctx, terminal))
-                                Compiler(ctx)->RejectCxxReferenceFieldStore(
-                                    structVar.TypeAndValue.TypeName, primaryIdentifier);
-
                             // [PFX-2a] Consumed-COM member sugar: on a thin COM interface pointer - a struct
                             // whose SOLE field `lpVtbl` points at a vtable of function-pointer slots - a name
                             // that is not a field but IS a vtable slot routes through the vtable, so
@@ -2693,6 +2631,30 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         Compiler(ctx)->RegisterOwningTempUniqueField(namedVar.Primary);
                                     // Field declared `alignas(_, N)`: stamp the block alignment onto the
                                     // result so `delete obj->field` / scope-exit free via __delete_aligned.
+                                    // [PFX-2c-ref] A C++ reference member: the slot holds the referent's
+                                    // address, so re-base on it; the referent's depth is the recorded one.
+                                    if (fieldType.IsAlias && fieldType.Pointer && namedVar.Primary != nullptr)
+                                    {
+                                        LLVMBackend::TypeAndValue referent = fieldType;
+                                        referent.Pointer = fieldType.PointerDepth >= 1;
+                                        referent.ElemPointer = fieldType.PointerDepth >= 2;
+                                        referent.IsAlias = false;
+                                        referent.IsCxxRefToPointer = false;
+                                        auto* referentLLVM = Compiler(ctx)->GetType(referent);
+                                        namedVar.Storage = namedVar.Primary;
+                                        namedVar.Primary = Compiler(ctx)->CreateLoad(referentLLVM, namedVar.Storage);
+                                        namedVar.BaseType = referentLLVM;
+                                        namedVar.TypeAndValue.Pointer = referent.Pointer;
+                                        namedVar.TypeAndValue.ElemPointer = referent.ElemPointer;
+                                        namedVar.TypeAndValue.PointerDepth = referent.PointerDepth;
+                                        namedVar.TypeAndValue.IsAlias = false;
+                                        namedVar.TypeAndValue.IsCxxRefToPointer = false;
+                                        // Const is the slot's (refused above); a pointee is const only if its type is.
+                                        namedVar.TypeAndValue.IsCxxConstRef = fieldType.IsCxxConstRef && !referent.Pointer;
+                                        // `const T&` / `T *const &`: the slot is read-only at every write door.
+                                        if (fieldType.IsCxxConstRef)
+                                            Compiler(ctx)->MarkCxxConstReferent(namedVar.Storage);
+                                    }
                                     namedVar.AllocAlignment   = fieldType.AllocAlignValue;
                                     // Propagate borrow-origin so 'move param->field' can detect
                                     // the parent pointer is a borrowed parameter.
@@ -5896,6 +5858,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             argNV.Storage = retTemp;
                                             argNV.IsRvalue = true;
                                         }
+                                        NormalizeCxxRvalueReferenceArgument(
+                                            namedArgument->assignmentExpression(), argNV);
                                         if (argNV.ContainsBondedClosure)
                                             Compiler(ctx)->LogError(
                                                 "cannot pass a holder containing a bonded closure to a function - the callee could stash it beyond the captured local's lifetime");
@@ -6355,6 +6319,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // Explicit 'move' at the call site: drives move-overload selection
                                     // and the borrow-param diagnostic after overload resolution.
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
+                                    argVar.IsNormalizedCxxXvalue = argNV.IsNormalizedCxxXvalue;
                                     argVar.IsRvalue = argNV.IsRvalue;
                                     argVar.CxxParamLastUse = argNV.CxxParamLastUse;
                                     argVar.CxxLvalueKind =
@@ -6973,6 +6938,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                     Compiler(ctx)->lastCxxRetTemp_ = nullptr;
                                                     Compiler(ctx)->lastCxxRetValue_ = nullptr;
                                                     auto elementNV = ParseAssignmentExpressionNamed(expression);
+                                                    NormalizeCxxRvalueReferenceArgument(expression, elementNV);
                                                     llvm::Value* elementValue = elementNV.Primary
                                                         ? elementNV.Primary : LoadNamedVariable(elementNV);
                                                     if (elementValue == nullptr)
@@ -7229,6 +7195,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // Explicit 'move' at the call site: drives move-overload selection
                                     // and the borrow-param diagnostic after overload resolution.
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
+                                    argVar.IsNormalizedCxxXvalue = argNV.IsNormalizedCxxXvalue;
                                     argVar.IsRvalue = argNV.IsRvalue;
                                     argVar.CxxParamLastUse = argNV.CxxParamLastUse;
                                     argVar.CxxLvalueKind =
@@ -7915,7 +7882,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     LogErrorContext(ctx, sink);
                                 std::string wrapperName;
                                 std::string wrapperError;
-                                const bool wrapped = ((ctor == nullptr && !hardReferenceRejection)
+                                // Scalar table (ruling 2026-10-09): every constructor refuses a narrowing
+                                // or other-enum argument, so clang must not pick one of them silently.
+                                const bool narrowingRefused
+                                    = compiler->CxxCtorSetRequiresNarrowing(functionName, &arguments);
+                                const bool wrapped = !narrowingRefused
+                                    && ((ctor == nullptr && !hardReferenceRejection)
                                         || clangResolves)
                                     && compiler->RequestCxxVariadicConstructor(
                                         functionName, arguments, wrapperName, wrapperError);
@@ -9416,13 +9388,34 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         // Build closure fat struct {invoker_as_i8ptr, env_as_i8ptr_or_null}. The env is the
         // tagged heap-env pointer (Option A); null for a non-capturing lambda.
         auto* fnAsI8   = compiler->builder->CreateBitCast(fn, i8PtrTy, "lambda_fn_i8");
+        llvm::Value* codeForFat = fnAsI8;
         llvm::Value* envForFat = envForFatTagged
             ? envForFatTagged
             : static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(i8PtrTy));
+        if (!envForFatTagged)
+        {
+            // A non-capturing literal is compile-time-known code, like a named function: with a
+            // LOWERED signature its fat form is the natural forwarder with the C-ABI reverse thunk
+            // of the body in env, so .toFunction() yields that C entry at run time.
+            LLVMBackend::TypeAndValue sigRet;
+            std::vector<LLVMBackend::TypeAndValue> sigParams;
+            compiler->UnpackFuncPtrSignature(tv, sigRet, sigParams);
+            LLVMBackend::AbiRecipe cAbi;
+            if (compiler->ThinFnPtrUsesCAbi(sigRet, sigParams, cAbi))
+            {
+                LLVMBackend::CxxFunctionPointerAbiPlan plan{ sigRet, sigParams, cAbi };
+                if (auto* cEntry = compiler->GetOrCreateReverseAbiFunctionThunk(fn, plan, {}, false, true))
+                {
+                    codeForFat = compiler->builder->CreateBitCast(
+                        compiler->GetOrCreateThinToFatForwarder(sigRet, sigParams, cAbi), i8PtrTy, "lambda_fwd_i8");
+                    envForFat = compiler->builder->CreateBitCast(cEntry, i8PtrTy, "lambda_cabi_i8");
+                }
+            }
+        }
 
         auto* closureFatTy = compiler->GetClosureFatPtrType();
         llvm::Value* fat = llvm::UndefValue::get(closureFatTy);
-        fat = compiler->builder->CreateInsertValue(fat, fnAsI8,     {0u});
+        fat = compiler->builder->CreateInsertValue(fat, codeForFat, {0u});
         fat = compiler->builder->CreateInsertValue(fat, envForFat,  {1u});
 
         lastLambdaType = tv;
@@ -9971,7 +9964,7 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
             else if (cloVal && cloVal->getType() == compiler->GetClosureFatPtrType())
             { /* already a fat closure value */ }
             else if (cloVal && cloVal->getType()->isPointerTy())
-                cloVal = compiler->WidenThinToFat(cloVal);   // thin function<T>
+                cloVal = compiler->WidenThinToFat(cloVal, nv.TypeAndValue);   // thin function<T>
             else
             {
                 compiler->LogError("winrtDelegate: second argument must be a closure "

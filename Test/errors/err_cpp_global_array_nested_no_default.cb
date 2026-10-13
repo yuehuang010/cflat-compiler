@@ -1,0 +1,7 @@
+import cpp "cpp_interop_arrayelem.h";
+
+struct T74NoDefaultInner { cppa.NoDef value; };
+struct T74NoDefaultOuter { T74NoDefaultInner inner; };
+expect_error("C++ class 'cppa.NoDef' has no default constructor cflat can call (it is deleted)");
+T74NoDefaultOuter[2] badNestedGlobal;
+extern int main() { return 0; }

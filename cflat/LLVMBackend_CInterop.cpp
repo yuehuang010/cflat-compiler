@@ -856,7 +856,11 @@ void LLVMBackend::CheckAliasReturnSlotAddressTaken()
                 for (auto* u : sym.Function->materialized_users())
                 {
                 auto* call = llvm::dyn_cast<llvm::CallBase>(u);
-                if (call != nullptr && call->getCalledOperand() == sym.Function) continue;
+                // A direct call from a C-ABI reverse thunk is the function value escaping, not a
+                // source call: the thunk still cannot provide the caller-owned slot.
+                if (call != nullptr && call->getCalledOperand() == sym.Function
+                    && !call->getFunction()->getName().starts_with("__cflat_reverse_abi_"))
+                    continue;
                 const std::string shown = sym.SourceName.empty() ? name : sym.SourceName;
                 auto useIt = firstAliasReturnAddressUse_.find(sym.Function->getName().str());
                 if (useIt != firstAliasReturnAddressUse_.end())
@@ -3783,6 +3787,34 @@ static bool CxxRvalueReferenceIsConst(const std::string& spelling)
 
 // `T *const &` - const at the POINTER level under one lvalue reference. A distinct overload
 // from `T *&`, and the only one of the pair a pointer rvalue can bind.
+static bool CxxParamIsConstRefToPointer(const std::string& spelling);
+
+/*
+ * A C++ REFERENCE data member (`int& r;`, `const int& r;`, `int&& r;`, `int*& p;`) keeps the
+ * pointer-sized slot the layout needs, and is marked as an alias of the referent: the same
+ * Pointer + IsAlias shape a `T&` parameter has. The field access then reads through the slot.
+ */
+void LLVMBackend::MarkCxxReferenceField(const std::string& ctype, TypeAndValue& tv, bool isCxx)
+{
+        std::string s = ctype;
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+        if (s.empty() || s.back() != '&' || !tv.Pointer || tv.IsFunctionPointer || tv.IsArrayView)
+            return;
+        const bool rvalue = s.size() >= 2 && s[s.size() - 2] == '&';
+        // The referent's OUTER depth, from the mapper (it skips template arguments): a class
+        // referent such as `Box<int *>` is depth 0 and `C *` is 1; the slot's own ElemPointer is not it.
+        const std::string referent = s.substr(0, s.size() - (rvalue ? 2 : 1));
+        TypeAndValue referentTv;
+        const bool mapped = MapCTypeToTypeAndValue(referent, referentTv, isCxx)
+            && !referentTv.IsFunctionPointer;
+        tv.PointerDepth = mapped ? referentTv.ValuePointerDepth() : 0;
+        tv.IsCxxRefToPointer = tv.PointerDepth > 0;
+        tv.IsAlias = true;
+        tv.IsCxxConstRef = rvalue ? CxxRvalueReferenceIsConst(s)
+            : CxxParamIsConstLvalueReference(s)
+            || (tv.IsCxxRefToPointer && CxxParamIsConstRefToPointer(s));
+}
+
 static bool CxxParamIsConstRefToPointer(const std::string& spelling)
 {
         std::string s = spelling;
@@ -5267,6 +5299,8 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
             rec.hasDefaultCtor = r.hasDefaultCtor; rec.hasCopyCtor = r.hasCopyCtor;
             rec.hasCtorTemplate = r.hasCtorTemplate;
             rec.hasAssignTemplate = r.hasAssignTemplate;
+            rec.moveAssignBindsConstRef = r.moveAssignBindsConstRef;
+            rec.moveAssignConstSourceBindsConstRef = r.moveAssignConstSourceBindsConstRef;
             rec.isAggregate = r.isAggregate;
             rec.members = r.members;
             rec.ctorTemplates = r.ctorTemplates;
@@ -8132,6 +8166,8 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
         raw.hasCopyCtor = cached.hasCopyCtor;
         raw.hasCtorTemplate = cached.hasCtorTemplate;
         raw.hasAssignTemplate = cached.hasAssignTemplate;
+        raw.moveAssignBindsConstRef = cached.moveAssignBindsConstRef;
+        raw.moveAssignConstSourceBindsConstRef = cached.moveAssignConstSourceBindsConstRef;
         raw.isAggregate = cached.isAggregate;
         raw.members = cached.members;
         raw.ctorTemplates = cached.ctorTemplates;
@@ -20162,6 +20198,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                         }
                         tv.IsFlexibleArrayMember = f.isZeroSize && !arrDims.empty();
                         tv.IsZeroLengthArrayMember = tv.IsFlexibleArrayMember && zeroLengthArray;
+                        MarkCxxReferenceField(f.ctype, tv, r.isCxx);
                         static_cast<TypeAndValue&>(d) = tv;
                         d.VariableName = f.name;
                         if (f.isBitfield)
@@ -20304,6 +20341,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                     break;
                 }
                 tv.IsCxxMutableField = f.isMutable;
+                MarkCxxReferenceField(f.ctype, tv, r.isCxx);
                 // `const char* p`: the pointee stays const for C++ overload choice.
                 if (r.isCxx && tv.Pointer && !tv.IsFunctionPointer
                     && CxxSpellingHasConstPointee(f.ctype))
@@ -21569,22 +21607,6 @@ std::string LLVMBackend::DisplayCxxClassName(const std::string& typeName) const
         return SpellType(*this, probe);
     }
 
-/*
- * A C++ reference member binds as a pointer field, so a CFlat store through it would RESEAT the
- * reference - which C++ has no syntax for. Refuse the store and point at the referent instead.
- */
-bool LLVMBackend::RejectCxxReferenceFieldStore(const std::string& typeName,
-                                               const std::string& memberName)
-{
-        const CxxClassInfo* info = GetCxxClassInfo(typeName);
-        if (info == nullptr || info->referenceFields.count(memberName) == 0) return false;
-        LogError(std::format(
-            "field '{}' of C++ class '{}' is a C++ reference and cannot be reseated; assign to the "
-            "referent by dereferencing the field instead.",
-            memberName, DisplayCxxClassName(typeName)));
-        return true;
-    }
-
 bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
                                               const std::string& memberName,
                                               bool accessedThroughCurrentObject,
@@ -21899,14 +21921,13 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             info.hasCopyCtor           = r.hasCopyCtor;
             info.hasCtorTemplate       = r.hasCtorTemplate;
             info.hasAssignTemplate     = r.hasAssignTemplate;
+            info.moveAssignBindsConstRef = r.moveAssignBindsConstRef;
+            info.moveAssignConstSourceBindsConstRef = r.moveAssignConstSourceBindsConstRef;
             info.isAggregate           = r.isAggregate;
             for (const auto& f : r.fields)
             {
                 if (f.name.empty()) continue;
                 info.fieldAccess[f.name] = f.access;
-                std::string ct = f.ctype;
-                while (!ct.empty() && std::isspace((unsigned char)ct.back())) ct.pop_back();
-                if (!ct.empty() && ct.back() == '&') info.referenceFields.insert(f.name);
             }
             for (const auto& member : r.members)
             {
@@ -26561,6 +26582,16 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                 || (want.IsInteger() != -1 && got.IsFloatingPoint() != -1))
                 )
                 return true;
+            // Scalar table (ruling 2026-10-09): a narrowing or other-enum argument is not a
+            // match; clang would otherwise take it silently.
+            if (!want.Pointer && !got.Pointer && !want.IsAlias && !got.IsAlias)
+            {
+                NamedVariable probe;
+                probe.TypeAndValue = got;
+                const ScalarArgConversion conv = ClassifyScalarArgConversion(probe, want);
+                if (conv == ScalarArgConversion::Narrow || conv == ScalarArgConversion::EnumMismatch)
+                    return false;
+            }
             return scalarFamily(want) == scalarFamily(got);
         };
 
@@ -28139,9 +28170,48 @@ bool LLVMBackend::HasImplicitClassConversionOperator(const std::string& sourceTy
         return false;
 }
 
+/*
+ * Whether a `sourceType` xvalue implicitly converts to `[const] pointeeType *`, decided by clang:
+ * a wrapper returning the xvalue from a pointer-returning function is copy-initialization, i.e.
+ * std::is_convertible<S&&, P*>. Inherited, templated and derived-pointer conversion operators
+ * (plus the trailing standard conversion) are all clang's lookup; any rejection means "no".
+ */
+bool LLVMBackend::HasImplicitClassPointerConversion(const std::string& sourceType,
+                                                    const std::string& pointeeType,
+                                                    bool pointeeConst)
+{
+        const std::string key = sourceType + "|" + pointeeType + (pointeeConst ? "|const" : "|");
+        if (auto known = cxxXvaluePointerConversions_.find(key);
+            known != cxxXvaluePointerConversions_.end())
+            return known->second;
+        bool& answer = cxxXvaluePointerConversions_[key];
+        answer = false;
+        std::string sourceSpelling;
+        std::string pointeeSpelling;
+        if (!IsCxxRecord(sourceType) || !CxxSpellingForCflatType(sourceType, sourceSpelling)
+            || !CxxSpellingForCflatType(pointeeType, pointeeSpelling))
+            return false;
+        auto groupIt = cxxTypeOwnerGroup_.find(sourceType);
+        if (groupIt == cxxTypeOwnerGroup_.end()) return false;
+        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, {});
+        if (group.headers.empty()) return false;
+        const std::string target = (pointeeConst ? "const " : "") + pointeeSpelling + " *";
+        const std::string wrapperName = std::format("__cflat_xvptr_{:016x}",
+            HashWrapperKey(key + "|xvalue-pointer-conversion|" + sourceSpelling + "|" + target));
+        const std::string wrapperSource = "extern \"C\" __attribute__((weak)) " + target + " "
+            + wrapperName + "(" + sourceSpelling + " * p0) { return static_cast<" + sourceSpelling
+            + " &&>(*p0); }\n";
+        CxxRequestGroupScope groupScope(*this, &group);
+        CSigEntry signature;
+        std::string error;
+        answer = RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName,
+                                            "XVALUE_POINTER_CONVERSION", signature, error);
+        return answer;
+}
+
 LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCtor(
         NamedVariable& source, const std::string& targetType, llvm::Value* intoSlot,
-        std::string& refusal)
+        std::string& refusal, bool directInit)
 {
         refusal.clear();
         if (source.Primary == nullptr && source.Storage != nullptr
@@ -28150,6 +28220,29 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
         if (source.Primary == nullptr) return CxxConvertingCtorResult::NotApplicable;
         // A literal reaches here with only its value; type it the way a call argument is typed.
         if (source.BaseType == nullptr) source.BaseType = source.Primary->getType();
+        // Direct-initialization (`T(x)`, a cast): explicit constructors are candidates and clang
+        // ranks them, so the wrapper is spelled as the constructor call (literals as const char*).
+        if (directInit)
+        {
+            if (!IsForeignCxxClassWithConstructors(targetType))
+                return CxxConvertingCtorResult::NotApplicable;
+            NamedVariable probe = source;
+            // Only a literal is const char*; a mutable char* rvalue keeps its spelling.
+            if (!source.IsStringLiteral) probe.IsRvalue = false;
+            probe.TypeAndValue = InferImplicitCxxArgumentType(source, *this);
+            probe.TypeAndValue.VariableName.clear();
+            std::string wrapperName;
+            std::string wrapperError;
+            if (!RequestCxxVariadicConstructor(targetType, { probe }, wrapperName, wrapperError,
+                                               /*copyInit*/ false))
+            {
+                refusal = wrapperError;
+                return refusal.empty() ? CxxConvertingCtorResult::NotApplicable
+                                       : CxxConvertingCtorResult::Refused;
+            }
+            ConstructThroughCxxCtorWrapper(source, probe, targetType, wrapperName, intoSlot);
+            return CxxConvertingCtorResult::Converted;
+        }
         // A copy-initialized slot is the by-value parameter shape of the call-argument position.
         TypeAndValue param;
         param.TypeName = targetType;

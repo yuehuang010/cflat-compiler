@@ -1804,7 +1804,23 @@ void MainListener::ResolvePendingGlobalDefaultConstructions()
                     info != nullptr && info->hasDeletedDefaultCtor
                         ? " (it is deleted)" : ""));
             }
-            auto* folded = TryFoldGlobalDefaultConstruction(item.TypeValue, foldState);
+            // A direct C++ class element is constructed by pendingGlobalCxxConstructions_; queuing it
+            // here too would run its default constructor twice per element.
+            if (compilerLLVM->IsCxxRecord(item.TypeValue.TypeName)
+                && compilerLLVM->CxxElementNeedsDefaultConstruction(item.TypeValue.TypeName))
+                continue;
+            llvm::Constant* folded = nullptr;
+            if (item.TypeValue.ConstArraySize > 0)
+            {
+                LLVMBackend::DeclTypeAndValue elementType;
+                static_cast<LLVMBackend::TypeAndValue&>(elementType) = item.TypeValue;
+                elementType.ConstArraySize = 0;
+                elementType.ConstInnerDimensions.clear();
+                auto* element = TryFoldGlobalDefaultConstruction(elementType, foldState);
+                folded = SplatConstantOverFixedArray(element, compilerLLVM->GetType(item.TypeValue));
+            }
+            else
+                folded = TryFoldGlobalDefaultConstruction(item.TypeValue, foldState);
             if (folded != nullptr)
             {
                 item.Global->setInitializer(folded);
@@ -1843,7 +1859,7 @@ void MainListener::ResolvePendingGlobalDefaultConstructions()
             {
                 if (item->TypeValue.ConstArraySize > 0)
                 {
-                    EmitFixedArrayDefaultInit(item->Global, item->TypeValue, item->Context);
+                    EmitFixedArrayDefaultInit(item->Global, item->TypeValue, item->Context, true);
                     continue;
                 }
                 if (compiler->GetFunction(item->TypeValue.TypeName) == nullptr) continue;
@@ -4512,6 +4528,7 @@ cxx_dtor_ready:
                     }
                     auto* expression = element->assignmentExpression(0);
                     auto elementNV = ParseAssignmentExpressionNamed(expression);
+                    NormalizeCxxRvalueReferenceArgument(expression, elementNV);
                     llvm::Value* elementValue = elementNV.Primary
                         ? elementNV.Primary : LoadNamedVariable(elementNV);
                     if (elementValue == nullptr)
@@ -4698,6 +4715,7 @@ cxx_dtor_ready:
                 }
                 compiler->lastCxxRetTemp_ = nullptr;
                 auto nv = ParseAssignmentExpressionNamed(argAssign);
+                NormalizeCxxRvalueReferenceArgument(argAssign, nv);
                 compiler->LowerNonCapturingClosureForCxx(
                     nv, compiler->StdFunctionClosureSignature(typeName));
                 if (std::string refusal = compiler->CxxClosureArgumentRefusal(
@@ -4833,7 +4851,10 @@ cxx_dtor_ready:
                     compiler->CxxConstructorCopySinkError(ctor, ctorArguments);
                 !sink.empty())
                 LogErrorContext(direct, sink);
-            if ((ctor == nullptr && !hardReferenceRejection) || clangResolves)
+            // Scalar table (ruling 2026-10-09): clang must not take a narrowing or other-enum argument.
+            const bool narrowingRefused
+                = compiler->CxxCtorSetRequiresNarrowing(typeName, &ctorArguments);
+            if (!narrowingRefused && ((ctor == nullptr && !hardReferenceRejection) || clangResolves))
             {
                 std::string wrapperName;
                 std::string wrapperError;
@@ -7688,7 +7709,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             if (right && typeAndValue.IsFunctionPointer && !typeAndValue.IsThinFnPtr()
                                 && rhsIsThinFnPtr && !right->getType()->isStructTy())
                             {
-                                right = compiler->WidenThinToFat(right);
+                                right = compiler->WidenThinToFat(right, typeAndValue);
                             }
 
                             // Funcptr-to-funcptr declaration init: per-param IsMove flags must agree.
@@ -8067,8 +8088,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // the scalar branch below performs. Emitted after the alloca exists, since the
                 // default is written through the array's slots rather than into `right`.
                 bool needsArrayDefaultInit = right == nullptr && !typeAndValue.Pointer
-                    && typeAndValue.ConstArraySize > 0 && !externDeclOnly && !global_scope
-                    && compiler->GetDataStructure(typeAndValue.TypeName).StructType != nullptr;
+                    && typeAndValue.ConstArraySize > 0 && !externDeclOnly
+                    && compiler->GetDataStructure(typeAndValue.TypeName).StructType != nullptr
+                    && (!global_scope || compiler->GetFunction(typeAndValue.TypeName) != nullptr
+                        || compiler->CxxElementNeedsDefaultConstruction(typeAndValue.TypeName));
+                if (global_scope && needsArrayDefaultInit)
+                    pendingGlobalDefaultConstruction = true;
 
                 if (right == nullptr && !typeAndValue.Pointer && typeAndValue.ConstArraySize == 0 && !externDeclOnly)
                 {

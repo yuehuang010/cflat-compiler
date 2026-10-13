@@ -150,6 +150,187 @@ extern u8 cbf_ext_def_retu(int x) { return (u8)x; }
 enum CbfExtE8 : u8 { Hi = 200, Lo = 7 };
 enum CbfExtS8 : i8 { Neg = -3, Pos = 5 };
 
+// Section T77: every call through function<> uses the C ABI of its signature. The C side
+// (struct_byval_util.c, T77 block) and the CFlat side must agree with clang's values.
+i64 t77_cf_big(int x, T77Big s, double d, short sh)
+{
+    return x * 2 + s.a * 3 + s.b * 5 + s.c * 7 + (i64)(d * 11) + sh * 13;
+}
+T77Big t77_cf_mk(int n) { T77Big r = { a = n, b = n + 1, c = n + 2 }; return r; }
+i64 t77_cf_narrow(i8 c, i16 s) { return (i64)c * 100 + s; }
+double t77_cf_mix(float f, double d, int i) { return f + d * 2.0 + i; }
+i64 t77_gen_big<T>(int x, T s, double d, short sh)
+{
+    return x * 2 + s.a * 3 + s.b * 5 + s.c * 7 + (i64)(d * 11) + sh * 13;
+}
+int t77_cf_pair(Pair p) { return p.x * 10 + p.y; }
+
+int t77ElemDtors = 0;
+int t77VoidHits = 0;
+class T77Elem { int id = 0; ~T77Elem() { t77ElemDtors++; } };
+int t77Sink(T77Big s, move T77Elem* p) { return 0; }
+void t77Void(T77Big s) { t77VoidHits = t77VoidHits + (int)s.a; }
+int t77Borrow(T77Big b, T77Elem* e) { return (int)b.a; }
+int t77Own(T77Big b, move T77Elem* e) { return (int)b.a; }
+extern i64 t77ExternSum(T77Big b) { return b.a + b.b + b.c; }
+extern i64 t77ExternSumCount(T77Big b, move T77Elem* p) { return b.a + b.b + b.c; }
+extern i64 t77ExternSumCountScalar(T77Big b, move T77Elem* p, i64 x) { return b.a + b.b + x; }
+i64 t77Pick3(T77Big b, i64 x) { return b.a + b.b + b.c + x; }
+i64 t77Pick3b(T77Big b, i64 x) { return b.a + b.b + b.c + x + 20; }
+struct T77Box { function<i64(T77Big, i64)> f; };
+struct T77Def { function<i64(T77Big, i64)> f = t77Pick3; };
+function<i64(T77Big, i64)>[2] t77GlobalFnArr = {t77Pick3, t77Pick3b};
+i64 t77CoalesceRet(T77Big b)
+{
+    function<i64(T77Big, i64)>? none = nullptr;
+    function<i64(T77Big, i64)> got = none ?? t77Pick3;
+    return got(b, 7);
+}
+
+static int t77FnPtrLegs()
+{
+    T77Big b = { a = 1, b = 2, c = 3 };                    // clang oracle: -9
+    // (1) C-returned pointer to a C function taking a 24-byte struct.
+    function<i64(int, T77Big, double, short)> cp = t77_get_big();
+    if (cp(4, b, 2.5, (short)-6) != -9) return 8101;
+    // (2) local bind of a CFlat function with the same big signature.
+    function<i64(int, T77Big, double, short)> lb = t77_cf_big;
+    if (lb(4, b, 2.5, (short)-6) != -9) return 8102;
+    // (3) CFlat callback handed to C, which calls it with the big struct.
+    if (t77_call_with(t77_cf_big, 1) != -9) return 8103;
+    // (4) identity roundtrip through C.
+    function<i64(int, T77Big, double, short)> rt = t77_ident_fn(t77_cf_big);
+    if (rt(4, b, 2.5, (short)-6) != -9) return 8104;
+    // (5) sret: C function returning a 24-byte struct through function<>.
+    function<T77Big(int)> mk = t77_get_mk();
+    T77Big m = mk(2);
+    if (m.a != 2 || m.b != 3 || m.c != 4) return 8105;
+    // (6) sret: CFlat function returning a 24-byte struct through a local bind.
+    function<T77Big(int)> mk2 = t77_cf_mk;
+    T77Big m2 = mk2(5);
+    if (m2.c != 7) return 8106;
+    // (7) C struct field holding a callback.
+    T77Ops ops = t77_make_ops();
+    if (ops.cb(4, b, 2.5, (short)-6) != -9) return 8107;
+    // (8) scalar-only signatures: no wrapper, values unchanged.
+    function<i64(i8, i16)> nr = t77_cf_narrow;
+    if (nr((i8)-3, (i16)-5) != -305) return 8108;
+    function<double(float, double, int)> mx = t77_cf_mix;
+    if (mx((float)1.5, 2.0, 3) != 8.5) return 8109;
+    // (9) generic instance bound with explicit type arguments.
+    function<i64(int, T77Big, double, short)> gg = t77_gen_big<T77Big>;
+    if (gg(4, b, 2.5, (short)-6) != -9) return 8110;
+    // (10) non-capturing closure literal bound to function<>: its body takes a trailing env.
+    function<i64(int, T77Big, double, short)> cl =
+        (int x, T77Big s, double d, short sh) => (i64)(x * 2 + s.a * 3 + s.b * 5 + s.c * 7 + (i64)(d * 11) + sh * 13);
+    if (cl(4, b, 2.5, (short)-6) != -9) return 8111;
+    // (11) small aggregate (CoerceToInt on arm64 and Win64) through a bind and a C pointer.
+    function<int(Pair)> sp = t77_cf_pair;
+    Pair q = { x = 3, y = 4 };
+    if (sp(q) != 34) return 8112;
+    // (12) thin -> Lambda -> thin, and Lambda -> toFunction, for a C pointer (widen forwarder).
+    Lambda<i64(int, T77Big, double, short)> wl = cp;
+    if (wl(4, b, 2.5, (short)-6) != -9) return 8113;
+    function<i64(int, T77Big, double, short)> wb = wl.toFunction();
+    if (wb(4, b, 2.5, (short)-6) != -9) return 8114;
+    // (12b) CFlat body -> Lambda -> toFunction: the lowered closure yields its C-ABI entry.
+    Lambda<i64(int, T77Big, double, short)> nl = t77_cf_big;
+    function<i64(int, T77Big, double, short)> nb = nl.toFunction();
+    if (nb(4, b, 2.5, (short)-6) != -9) return 8115;
+    // (13) narrow integer argument after a lowered struct: the C callee reads the declared sign.
+    function<i64(T77Big, short)> sg = t77_get_short();
+    if (sg(b, (short)-6) != -11) return 8116;
+    function<u64(T77Big, u16)> ug = t77_get_ushort();
+    u16 uv = 65530;
+    if (ug(b, uv) != 65531) return 8117;
+    // (14) hidden raw-array count in a lowered signature: the destructor sees all three elements.
+    T77Elem* pe = new T77Elem[3];
+    function<int(T77Big, move T77Elem*)> fe = t77Sink;
+    fe(b, move pe);
+    if (t77ElemDtors != 3) return 8118;
+    // (15) void return through a lowered thin pointer.
+    function<void(T77Big)> fv = t77Void;
+    fv(b);
+    if (t77VoidHits != 1) return 8119;
+    // (16) non-capturing closure literal with a lowered signature: toFunction yields its C entry.
+    Lambda<i64(int, T77Big, double, short)> ll =
+        (int x, T77Big s, double d, short sh) => (i64)(x * 2 + s.a * 3 + s.b * 5 + s.c * 7 + (i64)(d * 11) + sh * 13);
+    function<i64(int, T77Big, double, short)> lf = ll.toFunction();
+    if (lf == nullptr) return 8120;
+    if (lf(4, b, 2.5, (short)-6) != -9) return 8121;
+    // (16b) a capturing literal with the same lowered signature: toFunction yields null.
+    int bias = 10;
+    Lambda<i64(int, T77Big, double, short)> cap =
+        (int x, T77Big s, double d, short sh) => (i64)(x * 2 + s.a * 3 + s.b * 5 + s.c * 7 + (i64)(d * 11) + sh * 13 + bias);
+    if (cap.toFunction() != nullptr) return 8122;
+    if (cap(4, b, 2.5, (short)-6) != 1) return 8123;
+    // (16c) two different literals, same signature: shared forwarder, distinct C entries.
+    Lambda<i64(int, T77Big, double, short)> l2 =
+        (int x, T77Big s, double d, short sh) => (i64)(x * 3 + s.c);
+    function<i64(int, T77Big, double, short)> f2 = l2.toFunction();
+    if (f2 == nullptr) return 8124;
+    if (f2(4, b, 2.5, (short)-6) != 15) return 8125;
+    if (lf(4, b, 2.5, (short)-6) != -9) return 8126;
+    // (17) two lowered signatures that differ only by a hidden count: distinct forwarders, so the
+    // borrowed-element Lambda is not called through the counted one.
+    Lambda<int(T77Big, T77Elem*)> lbor = t77Borrow;
+    Lambda<int(T77Big, move T77Elem*)> lown = t77Own;
+    T77Elem* ea = new T77Elem[3];
+    if (lbor(b, ea) != 1) return 8127;
+    T77Elem* eb = new T77Elem[3];
+    int dtorsBefore = t77ElemDtors;
+    if (lown(b, move eb) != 1) return 8128;
+    if (t77ElemDtors != dtorsBefore + 3) return 8129;
+    // (18) a native extern with a lowered signature: its closure is the extern's own C entry.
+    Lambda<i64(T77Big)> ew = t77ExternSum;
+    function<i64(T77Big)> et = ew.toFunction();
+    if (et == nullptr) return 8130;
+    if (et(b) != 6) return 8131;
+    // (18b) an extern whose signature carries a hidden count: the closure gets a counted C entry.
+    Lambda<i64(T77Big, move T77Elem*)> ec = t77ExternSumCount;
+    if (ec(b, nullptr) != 6) return 8134;
+    function<i64(T77Big, move T77Elem*)> ect = ec.toFunction();
+    if (ect == nullptr) return 8135;
+    if (ect(b, nullptr) != 6) return 8136;
+    // (18c) a direct function<> bind of a counted extern, with a scalar after the count.
+    function<i64(T77Big, move T77Elem*, i64)> fs = t77ExternSumCountScalar;
+    if (fs == nullptr) return 8137;
+    if (fs(b, nullptr, 7) != b.a + b.b + 7) return 8138;
+    // (19) a null thin pointer widens to the null closure, not a non-null Lambda.
+    function<i64(T77Big)> nf = nullptr;
+    Lambda<i64(T77Big)> nw = nf;
+    if (nw != nullptr) return 8132;
+    if (nw.toFunction() != nullptr) return 8133;
+    // (20) a named function reaching a thin function<> slot through each producer door takes the
+    // slot's signature: array brace-init, struct field brace-init, struct default field, ternary.
+    function<i64(T77Big, i64)>[2] pa = {t77Pick3, t77Pick3b};
+    if (pa[0](b, 7) != b.a + b.b + b.c + 7) return 8140;
+    if (pa[1](b, 7) != b.a + b.b + b.c + 27) return 8141;
+    T77Box pbox = {f = t77Pick3};
+    if (pbox.f(b, 7) != b.a + b.b + b.c + 7) return 8142;
+    T77Def pdef;
+    if (pdef.f(b, 7) != b.a + b.b + b.c + 7) return 8143;
+    bool pickA = true;
+    function<i64(T77Big, i64)> pt = pickA ? t77Pick3 : t77Pick3b;
+    if (pt(b, 7) != b.a + b.b + b.c + 7) return 8144;
+    pickA = false;
+    function<i64(T77Big, i64)> pu = pickA ? t77Pick3 : t77Pick3b;
+    if (pu(b, 7) != b.a + b.b + b.c + 27) return 8145;
+    // (21) named functions through a global fixed array, an array view, and the `??` arms.
+    if (t77GlobalFnArr[0](b, 7) != b.a + b.b + b.c + 7) return 8146;
+    if (t77GlobalFnArr[1](b, 7) != b.a + b.b + b.c + 27) return 8147;
+    function<i64(T77Big, i64)>[] pv = {t77Pick3, t77Pick3b};
+    if (pv[0](b, 7) != b.a + b.b + b.c + 7) return 8148;
+    if (pv[1](b, 7) != b.a + b.b + b.c + 27) return 8149;
+    function<i64(T77Big, i64)>? nullFn = nullptr;
+    function<i64(T77Big, i64)> cnl = nullFn ?? t77Pick3b;
+    if (cnl(b, 7) != b.a + b.b + b.c + 27) return 8150;
+    function<i64(T77Big, i64)> cr = t77Pick3 ?? t77Pick3b;
+    if (cr(b, 7) != b.a + b.b + b.c + 7) return 8151;
+    if (t77CoalesceRet(b) != b.a + b.b + b.c + 7) return 8152;
+    return 0;
+}
+
 extern int main()
 {
     if (offsetof(T38CRecord, value) != 8) return 7990;
@@ -951,6 +1132,9 @@ extern int main()
     if (extEnumU(CbfExtE8.Hi) != 200)             return 355;
     function<i64(CbfExtS8)> extEnumS = cbf_ext_get_s8();
     if (extEnumS(CbfExtS8.Neg) != -3)             return 356;
+
+    int t77 = t77FnPtrLegs();
+    if (t77 != 0) return t77;
 
     return 0;
 }

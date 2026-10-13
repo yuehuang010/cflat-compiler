@@ -1,0 +1,226 @@
+// The CFlat `move` keyword does not transfer ownership through a borrowed C++ const reference.
+import cpp "utility";
+import cpp "cpp_interop_basic.h";
+
+expect_error("'move a' transfers nothing") {
+    extern int main()
+    {
+        cppi.Tracked a = cppi.Tracked(2);
+        cppi.take_ref(move a);
+        return 0;
+    }
+}
+
+// T79: a free C++ compound operator taking only `const T&` refuses `move d` as a call would.
+expect_error("'move d' transfers nothing") {
+    int t79_or_const_ref()
+    {
+        cppi_opcref.CR c = cppi_opcref.CR(1);
+        cppi_opcref.CR d = cppi_opcref.CR(4);
+        c |= move d;
+        return c.v;
+    }
+}
+
+// T79: every operator door refuses `move d` into a `const T&` parameter, as a call does.
+expect_error("transfers nothing") {
+    int t79_member_compound()
+    {
+        cppi_opcref.CR c = cppi_opcref.CR(1);
+        cppi_opcref.CR d = cppi_opcref.CR(4);
+        c &= move d;
+        return c.v;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_member_binary()
+    {
+        cppi_opcref.CR c = cppi_opcref.CR(1);
+        cppi_opcref.CR d = cppi_opcref.CR(4);
+        cppi_opcref.CR e = c & move d;
+        return e.v;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_free_binary()
+    {
+        cppi_opcref.CR c = cppi_opcref.CR(1);
+        cppi_opcref.CR d = cppi_opcref.CR(4);
+        cppi_opcref.CR e = c + move d;
+        return e.v;
+    }
+}
+expect_error("transfers nothing") {
+    bool t79_comparison()
+    {
+        cppi_opcref.CR c = cppi_opcref.CR(1);
+        cppi_opcref.CR d = cppi_opcref.CR(4);
+        return c == move d;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_shift()
+    {
+        cppi_opcref.CR c = cppi_opcref.CR(1);
+        cppi_opcref.CR d = cppi_opcref.CR(4);
+        cppi_opcref.CR e = c << move d;
+        return e.v;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_shift_assign()
+    {
+        cppi_opcref.CR c = cppi_opcref.CR(1);
+        cppi_opcref.CR d = cppi_opcref.CR(4);
+        c <<= move d;
+        return c.v;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_assign_const_ref()
+    {
+        cppi_opcref.CO c = cppi_opcref.CO(1);
+        cppi_opcref.CO d = cppi_opcref.CO(4);
+        c = move d;
+        return c.v;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_left_free_binary()
+    {
+        cppi_opcref.CR c = cppi_opcref.CR(4);
+        cppi_opcref.CR d = cppi_opcref.CR(5);
+        cppi_opcref.CR e = move c + d;
+        return e.v;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_cond_both_moves()
+    {
+        cppi_opcref.CR c = cppi_opcref.CR(1);
+        cppi_opcref.CR a = cppi_opcref.CR(4);
+        cppi_opcref.CR b = cppi_opcref.CR(5);
+        bool cond = true;
+        c &= (cond ? move a : move b);
+        return c.v;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_left_or_family()
+    {
+        cppi_opcref.CR c = cppi_opcref.CR(1);
+        cppi_opcref.CR d = cppi_opcref.CR(4);
+        cppi_opcref.CR e = move c | d;
+        return e.v;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_left_mul_family()
+    {
+        cppi_opcref.CR c = cppi_opcref.CR(1);
+        cppi_opcref.CR d = cppi_opcref.CR(4);
+        cppi_opcref.CR e = move c * d;
+        return e.v;
+    }
+}
+expect_error("transfers nothing") {
+    bool t79_rewrite_ne_family()
+    {
+        cppi_opcref.CO o = cppi_opcref.CO(1);
+        cppi_opcref.CO p = cppi_opcref.CO(2);
+        bool e = move o != p;
+        return e;
+    }
+}
+expect_error("transfers nothing") {
+    bool t79_reversed_family()
+    {
+        cppi_opcref.CW cr = cppi_opcref.CW(1);
+        cppi_opcref.CV cv = cppi_opcref.CV(1);
+        bool e = move cr == cv;
+        return e;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_left_free_shift()
+    {
+        cppi_opcref.CR c = cppi_opcref.CR(4);
+        cppi_opcref.CR d = cppi_opcref.CR(5);
+        cppi_opcref.CR e = move c >> d;
+        return e.v;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_assign_with_int_overload()
+    {
+        cppi_opcref.CI c = cppi_opcref.CI(1);
+        cppi_opcref.CI d = cppi_opcref.CI(4);
+        c = move d;
+        return c.v;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_assign_implicit_copy()
+    {
+        cppi_opcref.CN c = cppi_opcref.CN(1);
+        cppi_opcref.CN d = cppi_opcref.CN(4);
+        c = move d;
+        return c.v;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_assign_deleted_ctor()
+    {
+        cppi_opcref.CDc c = cppi_opcref.CDc(1);
+        cppi_opcref.CDc d = cppi_opcref.CDc(4);
+        c = move d;
+        return c.v;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_assign_ref_qualified()
+    {
+        cppi_opcref.CQ c = cppi_opcref.CQ(1);
+        cppi_opcref.CQ d = cppi_opcref.CQ(4);
+        c = move d;
+        return c.v;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_assign_deleted_member_move()
+    {
+        cppi_opcref.CDm c = cppi_opcref.CDm(1);
+        cppi_opcref.CDm d = cppi_opcref.CDm(4);
+        c = move d;
+        return c.m.v;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_assign_const_source()
+    {
+        cppi_opcref.CMv c = cppi_opcref.CMv(1);
+        const cppi_opcref.CMv d = cppi_opcref.CMv(4);
+        c = move d;
+        return c.v;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_assign_borrow_template()
+    {
+        cppi_opcref.CBt c = cppi_opcref.CBt(1);
+        cppi_opcref.CBt d = cppi_opcref.CBt(4);
+        c = move d;
+        return c.v;
+    }
+}
+expect_error("transfers nothing") {
+    int t79_assign_cond_move_copy()
+    {
+        cppi_opcref.CO c = cppi_opcref.CO(1);
+        cppi_opcref.CO d = cppi_opcref.CO(4);
+        cppi_opcref.CO e = cppi_opcref.CO(5);
+        bool cond = true;
+        c = (cond ? move d : move e);
+        return c.v;
+    }
+}

@@ -13,6 +13,15 @@ import "bucket_allocator.cb";
 import "cruntime.cb";
 import "application.cb";
 
+struct T74NativeDefault { int value = 31; };
+T74NativeDefault[2] t74NativeDefault;
+struct T74NativeTrivial { int value; };
+T74NativeTrivial[2] t74NativeTrivial;
+struct T74NativeGeneric<T> { T value; int marker = 41; };
+T74NativeGeneric<int>[2] t74NativeGeneric;
+struct T74NativeOwnedDefault { unique int* item = nullptr; int value = 53; };
+T74NativeOwnedDefault[2] t74NativeOwnedDefault;
+
 // ── array<T> ─────────────────────────────────────────────────────────────────
 
 int g_dtor_count = 0;
@@ -201,6 +210,12 @@ int testArrayNewDesugar()
 int testArray()
 {
     int passed = 0;
+
+    passed += Test("global array primitive field default", t74NativeDefault[1].value, 31);
+    passed += Test("global generic array field default", t74NativeGeneric[1].marker, 41);
+    passed += Test("global trivial array remains zero", t74NativeTrivial[1].value, 0);
+    passed += Test("global owning array field default", t74NativeOwnedDefault[1].value, 53);
+    passed += Test("global owning array unique default", t74NativeOwnedDefault[1].item == nullptr, true);
 
     // delete[n] destructor invocation
     g_dtor_count = 0;
@@ -4712,6 +4727,27 @@ application AppInfo cflatTestApp = {
                     { image = embed("library/app_icon_32.png") } },
 };
 
+string t75CastReturn()
+{
+    return (string)"return";
+}
+
+int t75CastArgumentLength(string value)
+{
+    return (int)value.length();
+}
+
+int testT75StringCasts()
+{
+    int passed = 0;
+    passed += Test("T75 literal string cast", (string)"abc", "abc");
+    passed += Test("T75 empty literal string cast", (string)"", "");
+    passed += Test("T75 literal string cast call argument",
+        t75CastArgumentLength((string)"call"), 4);
+    passed += Test("T75 literal string cast return", t75CastReturn(), "return");
+    return passed;
+}
+
 int testApplication()
 {
     int passed = 0;
@@ -4737,7 +4773,7 @@ extern int main()
 
     int r;
 
-    r = testArray();            passed += r; total += 22;
+    r = testArray();            passed += r; total += 27;
     r = testArrayNewDesugar();  passed += r; total += 14;
     // Two extra legs only exist under --sanitize=ownership (init_capacity poison fill).
     if const (__SANITIZE_OWNERSHIP__) total += 2;
@@ -4781,6 +4817,7 @@ extern int main()
     r = testDefaultAsExpression(); passed += r; total += 89;
     r = testEmbed();            passed += r; total += 9;
     r = testApplication();      passed += r; total += 6;
+    r = testT75StringCasts();   passed += r; total += 4;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

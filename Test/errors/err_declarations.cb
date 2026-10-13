@@ -123,6 +123,26 @@ expect_error("no overload of 'operator string'") {
     }
 }
 
+struct T75NoCharCtor
+{
+    int value = 0;
+};
+
+expect_error("cannot store a pointer value into struct storage") {
+    void t75LiteralCastWithoutCharCtor()
+    {
+        T75NoCharCtor value = (T75NoCharCtor)"abc";
+    }
+}
+
+expect_error("cannot store a pointer value into struct storage") {
+    void t75PointerCastWithoutCharCtor()
+    {
+        char* source = "abc";
+        T75NoCharCtor value = (T75NoCharCtor)source;
+    }
+}
+
 // A raw-pointer left operand with a struct right operand and no matching overload used to
 // fall through to the builtin comparison and emit a malformed icmp (ptr vs struct).
 expect_error("no overload of 'operator==' matches operands 'Point*' and 'Point'") {

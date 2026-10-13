@@ -250,8 +250,17 @@ LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNu
             else
             {
                 size_t consumed = 0;
-                uval = std::stoull(numberPart, &consumed, 0);
-                parsedU64 = consumed == numberPart.size();
+                if (numberPart.size() > 2 && numberPart[0] == '0' && (numberPart[1] == 'b' || numberPart[1] == 'B'))
+                {
+                    // strtoull's base 0 has no 0b prefix: parse the digits in base 2 (overflow -> wide path).
+                    uval = std::stoull(numberPart.substr(2), &consumed, 2);
+                    parsedU64 = consumed == numberPart.size() - 2;
+                }
+                else
+                {
+                    uval = std::stoull(numberPart, &consumed, 0);
+                    parsedU64 = consumed == numberPart.size();
+                }
             }
         }
         catch (...) { parsedU64 = false; }
@@ -295,39 +304,20 @@ LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNu
             uval = 0;
         }
 
-        // If a long/long long suffix is present, prefer 64-bit result.
-        if (lCount >= 1)
-        {
-            // LLP64: a literal whose [lex.icon] type is 'long'/'ulong' lowers at that 32-bit width,
-            // so its value type agrees with the identity overload ranking reads.
-            if (LLVMBackend::longBits_ == 32)
-            {
-                const std::string identity = LLVMBackend::LiteralIdentityForOverload(rawNumber);
-                if (identity == "long" || identity == "ulong")
-                {
-                    if (negative)
-                        return static_cast<int>(-static_cast<long long>(uval));
-                    if (identity == "ulong")
-                        return static_cast<unsigned int>(static_cast<uint32_t>(uval));
-                    return static_cast<int>(uval);
-                }
-            }
-            if (negative)
-            {
-                long long sval = -static_cast<long long>(uval);
-                return static_cast<int64_t>(sval);
-            }
-            if (hasU)
-                return static_cast<uint64_t>(uval);
-            lastNumberLiteralIsBitPattern = !negative;
-            lastNumberLiteralBits = uval;
-            lastNumberLiteralWidth = 64;
-            return static_cast<int64_t>(uval);
-        }
-
-        // No explicit long suffix: pick smallest reasonable signed type unless 'u' forces unsigned semantics
+        // Sign is an operator on the magnitude: a negative literal keeps its existing folding.
         if (negative)
         {
+            if (lCount >= 1)
+            {
+                // LLP64: a literal whose [lex.icon] type is 'long'/'ulong' lowers at that 32-bit width.
+                if (LLVMBackend::longBits_ == 32)
+                {
+                    const std::string identity = LLVMBackend::LiteralIdentityForOverload(rawNumber);
+                    if (identity == "long" || identity == "ulong")
+                        return static_cast<int>(-static_cast<long long>(uval));
+                }
+                return static_cast<int64_t>(-static_cast<long long>(uval));
+            }
             long long sval = -static_cast<long long>(uval);
             if (sval >= std::numeric_limits<int8_t>::min() && sval <= std::numeric_limits<int8_t>::max())
                 return static_cast<char>(sval);
@@ -338,28 +328,51 @@ LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNu
             return static_cast<int64_t>(sval);
         }
 
-        if (hasU)
+        // Unsuffixed value that fits int: CFlat's smallest-type typing (char/short/int).
+        const bool suffixed = hasU || lCount >= 1;
+        if (!suffixed && uval <= static_cast<unsigned long long>(std::numeric_limits<int>::max()))
         {
-            // A plain u suffix is a u32 literal, even when its value fits in signed int.
-            if (uval <= 0xFFFFFFFFull)
-                return static_cast<unsigned int>(static_cast<uint32_t>(uval));
-            return static_cast<uint64_t>(uval);
+            if (uval <= static_cast<unsigned long long>(std::numeric_limits<int8_t>::max()))
+                return static_cast<char>(uval);
+            if (uval <= static_cast<unsigned long long>(std::numeric_limits<int16_t>::max()))
+                return static_cast<short>(uval);
+            return static_cast<int>(uval);
         }
 
-        if (uval <= static_cast<unsigned long long>(std::numeric_limits<int8_t>::max()))
-            return static_cast<char>(uval);
-        if (uval <= static_cast<unsigned long long>(std::numeric_limits<int16_t>::max()))
-            return static_cast<short>(uval);
-        if (uval <= static_cast<unsigned long long>(std::numeric_limits<int>::max()))
-            return static_cast<int>(uval);
-        // C++ rule: a hex literal past i32 range but inside u32 is unsigned; with no 'u' suffix
-        // it stays i32 here, preserving the bit pattern (0xBA63E001 -> i32(-1168474111)).
-        lastNumberLiteralIsBitPattern = !negative;
+        // Everything else takes the [lex.icon] ladder: one table in LLVMBackend, shared with the overload
+        // identity. Lowered width feeds the switch-label bit-pattern match (see CollectCases).
+        const bool nonDecimal = numberPart.size() > 1 && numberPart[0] == '0';   // 0x, 0b, octal
+        const LLVMBackend::IntegerLiteralRung rung = LLVMBackend::IntegerLiteralLadderPick(
+            uval, nonDecimal, hasU, lCount);
+        const bool longIs64 = LLVMBackend::longBits_ == 64;
+        lastNumberLiteralIsBitPattern = true;
         lastNumberLiteralBits = uval;
-        lastNumberLiteralWidth = (isHex && uval <= 0xFFFFFFFFull) ? 32 : 64;
-        if (isHex && uval <= 0xFFFFFFFFull)
+        switch (rung)
+        {
+        case LLVMBackend::IntegerLiteralRung::Int:
+            lastNumberLiteralWidth = 32;
+            return static_cast<int>(uval);
+        case LLVMBackend::IntegerLiteralRung::UInt:
+            lastNumberLiteralWidth = 32;
+            return static_cast<unsigned int>(static_cast<uint32_t>(uval));
+        case LLVMBackend::IntegerLiteralRung::Long:
+            lastNumberLiteralWidth = longIs64 ? 64 : 32;
+            if (longIs64) return static_cast<int64_t>(uval);
             return static_cast<int>(static_cast<uint32_t>(uval));
-        return static_cast<int64_t>(uval);
+        case LLVMBackend::IntegerLiteralRung::ULong:
+            lastNumberLiteralWidth = longIs64 ? 64 : 32;
+            if (longIs64) return static_cast<uint64_t>(uval);
+            return static_cast<unsigned int>(static_cast<uint32_t>(uval));
+        case LLVMBackend::IntegerLiteralRung::U64:
+            lastNumberLiteralWidth = 64;
+            return static_cast<uint64_t>(uval);
+        case LLVMBackend::IntegerLiteralRung::I64:
+        case LLVMBackend::IntegerLiteralRung::None:
+        default:
+            // None: a decimal past i64 max with no suffix (no row holds it). Keeps the bit pattern.
+            lastNumberLiteralWidth = 64;
+            return static_cast<int64_t>(uval);
+        }
     }
 
 LLVMBackend::TypeAndValue MainListener::ParseLiteralTypeAndValue(const std::string& rawNumber) {
@@ -388,11 +401,14 @@ LLVMBackend::TypeAndValue MainListener::ParseLiteralTypeAndValue(const std::stri
             type.TypeName = "u32";
         else if (std::get_if<uint64_t>(&constant) != nullptr)
             type.TypeName = "u64";
+        // The [lex.icon] row names the type of a suffixed literal and of an UNSIGNED unsuffixed one, so an
+        // unsuffixed 0x8000000000000000 is unsigned long, not u64. An unsuffixed signed literal keeps its
+        // untyped int64 form (typeof reports i64), as before the ladder.
         bool suffixedInteger = false;
-        const std::string suffixType = LLVMBackend::LiteralIdentityForOverload(
-            rawNumber, &suffixedInteger);
-        if (suffixedInteger && !suffixType.empty())
-            type.TypeName = suffixType;
+        const std::string ladderType = LLVMBackend::LiteralIdentityForOverload(rawNumber, &suffixedInteger);
+        const bool unsignedRow = ladderType == "u32" || ladderType == "ulong" || ladderType == "u64";
+        if (!ladderType.empty() && ladderType != "int" && (suffixedInteger || unsignedRow))
+            type.TypeName = ladderType;
         return type;
     }
 

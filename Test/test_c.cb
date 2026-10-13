@@ -456,6 +456,18 @@ int switchHexWide(i64 x)
     }
 }
 
+// Unsuffixed hex labels on a u64 switch take the [lex.icon] ladder: 0x80000000 is unsigned int, so it
+// labels the positive value 2^31 (not the sign-extended pattern), and 0x100000000 is a long label.
+int switchHexLadderU64(u64 x)
+{
+    switch (x)
+    {
+        case 0x80000000: return 1;
+        case 0x100000000: return 2;
+        default: return 0;
+    }
+}
+
 int switchHexI32(int x)
 {
     switch (x)
@@ -915,6 +927,9 @@ extern int main(int argc, char** argv)
     result &= Test("switch_hex_u64",      switchHexU64(0xDEADBEEFCAFEBABEu), 1);
     result &= Test("switch_dec_u64_max",  switchHexU64(18446744073709551615u), 2);
     result &= Test("switch_hex_u64_narrow", switchHexU64(0xFFFFFFFFu), 3);
+    result &= Test("switch_hex_ladder_u64_u32_high", switchHexLadderU64(0x80000000u), 1);
+    result &= Test("switch_hex_ladder_u64_past_u32", switchHexLadderU64((u64)0x100000000), 2);
+    result &= Test("switch_hex_ladder_u64_sign_ext_miss", switchHexLadderU64((u64)0xFFFFFFFF80000000), 0);
     result &= Test("switch_hex_i64_max32",  switchHexWide(4294967295), 1);
     result &= Test("switch_hex_i64_bit31",  switchHexWide(2147483648), 2);
     result &= Test("switch_hex_i64_intmin", switchHexWide(-2147483648), 3);

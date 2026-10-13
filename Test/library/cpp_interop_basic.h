@@ -1164,6 +1164,11 @@ namespace cppi
     int take_moved(Tracked t) noexcept;
     int take_rvalue(Tracked&& t) noexcept;
     int take_ref(const Tracked& t) noexcept;
+    inline int t70_tracked_pointer(Tracked* value) noexcept { return value == nullptr ? 0 : 1; }
+    inline int t70_scalar_slot(int&& value, int* slot) noexcept { return &value == slot ? 1 : 0; }
+    inline int t70_pointer_slot(int*&& value, int** slot) noexcept { return &value == slot ? 1 : 0; }
+    template <class T> inline int t70_byval(T value) noexcept { return value.value(); }
+    template <class T> inline int t70_forward(T&& value) noexcept { return value.value(); }
     const Tracked& tracked_ref() noexcept;
     // `auto x = <lvalue>` sources (7300-7329): a mutable reference return, and a holder whose
     // field is reached directly, through a pointer and through reference accessors.
@@ -2683,6 +2688,36 @@ namespace cppi_opmv
 #undef CPPI_OPMV_COUNTS
 #undef CPPI_OPMV_MEMBER
 #undef CPPI_OPMV_FREE
+}
+
+// T79: an owning `const T&` operand is a borrow. `move d` into an operator that takes only
+// `const T&` transfers nothing, refused like `f(move d)` into a `const T&` parameter.
+namespace cppi_opcref
+{
+    struct CR { int v; CR(int x = 0) : v(x) {} ~CR() {}
+        CR& operator&=(const CR& o) { v += o.v; return *this; }
+        CR operator&(const CR& o) const { return CR(v + o.v); }
+        bool operator==(const CR& o) const { return v == o.v; }
+        CR operator<<(const CR& o) const { return CR(v + o.v); }
+        CR& operator<<=(const CR& o) { v += o.v; return *this; } };
+    struct CA { int v; CA(int x = 0) : v(x) {} CA& operator=(const CA& o) { v = o.v; return *this; } };
+    struct CO { int v; CO(int x = 0) : v(x) {} ~CO() {} CO& operator=(const CO& o) { v = o.v; return *this; } };
+    struct CW { int v; CW(int x = 0) : v(x) {} ~CW() {} };
+    struct CV { int v; CV(int x = 0) : v(x) {} ~CV() {} bool operator==(const CW& o) const { return v == o.v; } };
+    inline CR operator|(const CR& a, const CR& b) { return CR(a.v | b.v); }
+    inline CR operator*(const CR& a, const CR& b) { return CR(a.v * b.v); }
+    inline bool operator==(const CO& a, const CO& b) { return a.v == b.v; }
+    inline CR operator>>(const CR& a, const CR& b) { return CR(a.v + b.v); }
+    struct CI { int v; CI(int x = 0) : v(x) {} ~CI() {} CI& operator=(const CI& o) { v = o.v; return *this; } CI& operator=(int x) { v = 1000 + x; return *this; } };
+    struct CN { int v; CN(int x = 0) : v(x) {} ~CN() {} };
+    struct CDc { int v; CDc(int x = 0) : v(x) {} ~CDc() {} CDc(const CDc&) = default; CDc(CDc&&) = delete; CDc& operator=(const CDc& x) { v = 10 * x.v; return *this; } };
+    struct CQ { int v; CQ(int x = 0) : v(x) {} ~CQ() {} CQ& operator=(const CQ& x) & { v = 10 * x.v; return *this; } CQ& operator=(CQ&& x) && { v = 100 * x.v; x.v = 0; return *this; } };
+    struct CNm { int v; CNm(int x = 0) : v(x) {} ~CNm() {} CNm& operator=(const CNm& x) { v = 10 * x.v; return *this; } CNm& operator=(CNm&&) = delete; };
+    struct CDm { CNm m; CDm(int x = 0) : m(x) {} ~CDm() {} };
+    struct CMv { int v; CMv(int x = 0) : v(x) {} ~CMv() {} CMv& operator=(const CMv& x) { v = 10 * x.v; return *this; } CMv& operator=(CMv&& x) { v = 100 * x.v; x.v = 0; return *this; } };
+    struct CBt { int v; CBt(int x = 0) : v(x) {} ~CBt() {} CBt& operator=(const CBt&) && = delete; template <class U> CBt& operator=(const U& x) { v = 10 * x.v; return *this; } };
+    inline CR& operator|=(CR& a, const CR& o) { a.v += o.v; return a; }
+    inline CR operator+(const CR& a, const CR& o) { return CR(a.v + o.v); }
 }
 
 // ST4 - naming C++ entities from CFlat: static data members through a chained path, a

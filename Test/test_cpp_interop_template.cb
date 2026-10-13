@@ -196,6 +196,7 @@ import cpp "library/cpp_interop_tpl.h";
 import cpp "library/cpp_interop_unique_deleter.hpp";
 import cpp "library/cpp_t37_member_types.hpp";
 import cpp "library/cpp_interop_by_value.h";
+import cpp "library/cpp_t76_ladder.hpp";
 import cpp "library/cpp_interop_proxy.h";
 import cpp "library/cpp_interop_define_primary.h";
 import cpp "library/cpp_interop_define_special.h" define "CFLAT_DEFINE_SPECIAL";
@@ -550,6 +551,10 @@ extern int main()
     if const (__WINDOWS__) {
         return 0;
     }
+
+    // [lex.icon] ladder identity survives C++ template deduction (LP64 here): an unsuffixed
+    // 0x8000000000000000 is unsigned long, so deduce() binds pick(unsigned long) (clang: 2).
+    if (t76.deduce(0x8000000000000000) != 2) return 76001;
 
     // C++ usual arithmetic conversions determine the type deduced from a ?: argument.
     {
