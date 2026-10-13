@@ -3220,6 +3220,7 @@ private:
     void LogError(std::string message) const;
     void LogRawError(std::string message) const;
     void EmitError(std::string message, std::string sourceMessage = {}) const;
+    mutable size_t emitErrorCount_ = 0;  // every EmitError; a memoized cleanup region must add none
     void LogErrorMessage(std::string englishTemplate,
                          std::vector<std::string> arguments = {}) const;
     void LogBorrowedPointerMoveSinkError(const std::string& sourceDescription,
@@ -6009,6 +6010,12 @@ private:
         // A cached region: its blocks plus the entry-block scratch allocas it alone uses.
         struct Region { std::vector<llvm::WeakVH> Blocks; std::vector<llvm::WeakVH> Scratch; };
         std::unordered_map<uint64_t, std::vector<Region>> Regions;
+        // Emission memo: a unit's input fingerprint + continuation -> the region it produced,
+        // so a repeat skips emitting (and hashing) instead of emitting then deduping.
+        struct MemoEntry { llvm::WeakVH Result; llvm::WeakVH Target; };
+        // std::hash<std::string> is a byte-at-a-time FNV loop; keys are long and looked up per link.
+        struct MemoKeyHash { size_t operator()(const std::string& key) const; };
+        std::unordered_map<std::string, MemoEntry, MemoKeyHash> Memo;
         // Normal-path chain (CreateReturnCall): returns store a destination id and their value,
         // run the shared chain, and the dispatch switch resumes each return's own tail.
         llvm::WeakVH DestSlot;
@@ -6017,8 +6024,12 @@ private:
         uint32_t NextDest = 0;
     };
     UnwindChainState& ChainStateFor(llvm::Function* fn);
+    // One chain link's emitter plus the fingerprint of everything it reads (empty = never memoized).
+    struct CleanupUnit { std::function<void()> Emit; std::string Key; };
     // Cleanup units of every scope out to the function boundary, in execution order.
-    void CollectScopeCleanupUnits(std::vector<std::function<void()>>& units, bool unwindFloors);
+    void CollectScopeCleanupUnits(std::vector<CleanupUnit>& units, bool unwindFloors);
+    void AppendCleanupKey(std::string& key, const NamedVariable& namedVar) const;
+    void AppendCleanupContextKey(std::string& key) const;
     // Route a return's scope cleanups through the shared chain; false = caller emits inline.
     bool ChainReturnCleanups(llvm::Value*& value);
     // Set while a chain region is emitted: AllocaAtEntry records the scratch slots it creates
@@ -6031,7 +6042,7 @@ private:
     // Returns the region entry, or `target` when the region is empty. `funclet`: the region is
     // its own Windows cleanuppad ending in `cleanupret unwind label target` (null = to caller).
     llvm::BasicBlock* ChainUnwindCleanup(UnwindChainState& chain, llvm::BasicBlock* target,
-                                         const std::function<void()>& emit, bool funclet = false);
+                                         const CleanupUnit& unit, bool funclet = false);
     // A declaration registers its local before the initializer finishes, so an unwind out of that
     // initializer must not destroy it: (scope depth, first DeclSequence) per open declarator.
     std::vector<std::pair<size_t, uint64_t>> unwindInitFloors_;

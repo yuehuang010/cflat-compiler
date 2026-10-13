@@ -17311,9 +17311,10 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             if (probeTarget == nullptr)
                 return fail(std::format("C++ type '{}' was not present in its request result",
                                         cxxSpelling));
-            if (ownershipProbe
-                && CxxDeclaringFileBelongsToOtherImportGroup(probeTarget->file))
-                return fail(kCxxOwnershipProbeRejected);
+            // Decided per analysis from the import set; the clang probe itself is still cached
+            // (memory only), so a re-analysis rejects this candidate without re-parsing its group.
+            const bool ownershipRejected = ownershipProbe
+                && CxxDeclaringFileBelongsToOtherImportGroup(probeTarget->file);
 
             // The member-signature types exposed by this class are known before its stage 2.
             // Batch the owner and those nested requests so one frontend supplies all ODR-uses.
@@ -17336,13 +17337,15 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 if (!probeRecords.empty())
                     StoreCxxTypeRequestCache(group, probeKey, /*emitDefinitions*/ false,
                                              std::move(entry),
-                                             /*allowDisk*/ (!rejectClangErrors
-                                                     || probe.firstError.empty())
+                                             /*allowDisk*/ !ownershipRejected
+                                                 && (!rejectClangErrors || probe.firstError.empty())
                                                  && !probe.records.empty(),
                                              /*allowDiskReason*/
-                                             rejectClangErrors && !probe.firstError.empty()
+                                             ownershipRejected ? "ownership probe rejected"
+                                             : rejectClangErrors && !probe.firstError.empty()
                                                  ? "rejected clang error" : nullptr);
             }
+            if (ownershipRejected) return fail(kCxxOwnershipProbeRejected);
 
             cflat_cinterop::ExtractResult raw;
             if (needDefinitions)

@@ -1,5 +1,6 @@
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
+#include <llvm/Support/xxhash.h>
 #include <llvm/IR/CFG.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
@@ -882,6 +883,7 @@ bool LLVMBackend::ReportArrayViewInstantiationFailure(const std::string& formedT
 
 void LLVMBackend::EmitError(std::string message, std::string sourceMessage) const
 {
+        ++emitErrorCount_;
         // Speculative compile-time evaluation: swallow the diagnostic and unwind. The construct
         // is re-evaluated for real later, where the diagnostic (if any) fires normally.
         if (suppressErrors_)
@@ -5907,8 +5909,10 @@ LLVMBackend::UnwindChainState& LLVMBackend::ChainStateFor(llvm::Function* fn)
  * then its owning arguments and lock releases (EmitDestructorsForScope, one unit per local so a
  * chain shares every suffix). `unwindFloors` skips locals whose declaration is still in progress.
  */
-void LLVMBackend::CollectScopeCleanupUnits(std::vector<std::function<void()>>& units, bool unwindFloors)
+void LLVMBackend::CollectScopeCleanupUnits(std::vector<CleanupUnit>& units, bool unwindFloors)
 {
+        std::string context;
+        AppendCleanupContextKey(context);
         for (auto it = stackNamedVariable.rbegin(); it != stackNamedVariable.rend(); ++it)
         {
             const uint64_t floor = unwindFloors
@@ -5920,11 +5924,84 @@ void LLVMBackend::CollectScopeCleanupUnits(std::vector<std::function<void()>>& u
                 return left->DeclSequence > right->DeclSequence;
             });
             for (const NamedVariable* local : locals)
-                units.push_back([this, local] { DropValue(*local); });
+            {
+                std::string key = context + "L";
+                AppendCleanupKey(key, *local);
+                units.push_back({ [this, local] { DropValue(*local); }, std::move(key) });
+            }
             const StackState* frame = &*it;
-            units.push_back([this, frame] { EmitScopeArgumentAndLockCleanups(*frame); });
+            std::string key = context + "F";
+            for (const auto& [name, arg] : frame->functionArgument) AppendCleanupKey(key, arg);
+            for (const auto& lock : frame->lockCleanups)
+            {
+                key.append(reinterpret_cast<const char*>(&lock.UnlockFn), sizeof(lock.UnlockFn));
+                key.append(reinterpret_cast<const char*>(&lock.MutexPtr), sizeof(lock.MutexPtr));
+            }
+            units.push_back({ [this, frame] { EmitScopeArgumentAndLockCleanups(*frame); }, std::move(key) });
             if (it->isFunction) break;
         }
+    }
+
+namespace
+{
+    template <typename T>
+    void AppendKeyBytes(std::string& key, const T& value)
+    {
+        static_assert(std::is_trivially_copyable_v<T>);
+        key.append(reinterpret_cast<const char*>(&value), sizeof(T));
+    }
+
+    void AppendKeyString(std::string& key, const std::string& value)
+    {
+        AppendKeyBytes(key, value.size());
+        key += value;
+    }
+}
+
+/*
+ * Every NamedVariable input of DropValue / EmitScopeArgumentAndLockCleanups and their emitters.
+ * A field an emitter starts reading must be added here, or a memoized region goes stale;
+ * CFLAT_VERIFY_UNWIND_MEMO=1 re-emits on every hit and aborts on a mismatch.
+ */
+void LLVMBackend::AppendCleanupKey(std::string& key, const NamedVariable& v) const
+{
+        const TypeAndValue& t = v.TypeAndValue;
+        AppendKeyBytes(key, v.DeclSequence);
+        AppendKeyBytes(key, v.BaseType);
+        AppendKeyBytes(key, v.Storage);
+        AppendKeyBytes(key, v.ConditionalDropFlag);
+        AppendKeyBytes(key, v.RefCountStorage);
+        AppendKeyBytes(key, v.RawArrayLength);
+        AppendKeyBytes(key, v.RawArrayLengthStorage);
+        AppendKeyBytes(key, v.OwnFlag);
+        AppendKeyBytes(key, v.AllocAlignment);
+        const bool flags[] = {
+            v.IsStaticLocal, v.IsRangeForBorrow, v.IsOwning, v.OwnsInterfaceBox,
+            v.AllocatedByRawNewArray, v.BorrowsOwnedString, v.IsAliasBorrow, v.IsMoved,
+            v.ExplicitlyMovedNull, v.OwnFlagActive, v.IsOwningString, v.IsOwningStruct,
+            t.Pointer, t.ElemPointer, t.IsInterface, t.IsInterfacePointer, t.IsArrayView,
+            t.IsUnique, t.IsAlias, t.IsNullable };
+        AppendKeyBytes(key, flags);
+        AppendKeyBytes(key, t.PointerDepth);
+        AppendKeyBytes(key, t.ConstArraySize);
+        AppendKeyBytes(key, t.AllocAlignValue);
+        AppendKeyString(key, t.TypeName);
+    }
+
+size_t LLVMBackend::UnwindChainState::MemoKeyHash::operator()(const std::string& key) const
+{
+        return (size_t)llvm::xxh3_64bits(llvm::StringRef(key));
+    }
+
+// Backend state the emitters read beyond the variable, shared by every unit of one chain walk.
+void LLVMBackend::AppendCleanupContextKey(std::string& key) const
+{
+        AppendKeyBytes(key, emittingUnwindCleanup_);
+        AppendKeyBytes(key, returnedStructDtorSkipAlloca);
+        AppendKeyBytes(key, returnedStructDtorShellAlloca);
+        AppendKeyBytes(key, returnedStructDtorShellFunction);
+        // Type epoch: a new struct (an instantiation) can change a destructor answer.
+        AppendKeyBytes(key, dataStructures.size());
     }
 
 /*
@@ -5977,7 +6054,7 @@ bool LLVMBackend::ChainReturnCleanups(llvm::Value*& value)
         if (currentSubprogram)
             builder->SetCurrentDebugLocation(llvm::DILocation::get(
                 *context, currentSubprogram->getLine(), 0, currentSubprogram));
-        std::vector<std::function<void()>> units;
+        std::vector<CleanupUnit> units;
         CollectScopeCleanupUnits(units, /*unwindFloors*/ false);
         auto* dispatch = llvm::cast<llvm::BasicBlock>(chain.Dispatch);
         llvm::BasicBlock* target = dispatch;
@@ -6003,8 +6080,36 @@ bool LLVMBackend::ChainReturnCleanups(llvm::Value*& value)
  * sound: each outside operand dominated every pad that emitted the region, hence the region.
  */
 llvm::BasicBlock* LLVMBackend::ChainUnwindCleanup(UnwindChainState& chain, llvm::BasicBlock* target,
-                                                  const std::function<void()>& emit, bool funclet)
+                                                  const CleanupUnit& unit, bool funclet)
 {
+        static const bool verifyMemo = std::getenv("CFLAT_VERIFY_UNWIND_MEMO") != nullptr;
+        std::string memoKey;
+        llvm::BasicBlock* memoHit = nullptr;
+        if (!unit.Key.empty())
+        {
+            memoKey = unit.Key;
+            AppendKeyBytes(memoKey, target);
+            AppendKeyBytes(memoKey, funclet);
+            AppendKeyBytes(memoKey, builder->getCurrentDebugLocation().get());
+            if (auto it = chain.Memo.find(memoKey); it != chain.Memo.end())
+            {
+                // A result or continuation since erased (or a freed address reused) is no hit.
+                if (it->second.Result != nullptr && (llvm::Value*)it->second.Target == target)
+                    memoHit = llvm::cast<llvm::BasicBlock>((llvm::Value*)it->second.Result);
+                if (memoHit != nullptr && !verifyMemo) return memoHit;
+                if (memoHit == nullptr) chain.Memo.erase(it);
+            }
+        }
+        const size_t errorsBefore = emitErrorCount_;
+        // Records the region this emission resolved to; CFLAT_VERIFY_UNWIND_MEMO checks a hit.
+        auto finish = [&](llvm::BasicBlock* result, bool memoizable) {
+            if (memoHit != nullptr && result != memoHit)
+                llvm::report_fatal_error(llvm::Twine("unwind cleanup memo mismatch in ") + chain.Fn->getName());
+            if (memoizable && memoHit == nullptr && !memoKey.empty() && emitErrorCount_ == errorsBefore)
+                chain.Memo[memoKey] = { result, target };
+            return result;
+        };
+        const std::function<void()>& emit = unit.Emit;
         // Not the insert block: the previous link may have erased it as a duplicate.
         llvm::Function* fn = llvm::cast<llvm::Function>((llvm::Value*)chain.Fn);
         auto* entry = llvm::BasicBlock::Create(*context, "unwind.scope", fn);
@@ -6054,13 +6159,18 @@ llvm::BasicBlock* LLVMBackend::ChainUnwindCleanup(UnwindChainState& chain, llvm:
             }
         }
         // Ends dead (never continues), or leaves its own blocks: keep as is.
-        if (!live || foreign) return keep(entry);
+        if (!live || foreign) return finish(keep(entry), false);
         // A scratch slot must be private to the region to be renamed or erased with it.
         llvm::SmallPtrSet<llvm::BasicBlock*, 8> members(region.begin(), region.end());
         for (llvm::AllocaInst* slot : scratch)
             for (llvm::User* user : slot->users())
                 if (auto* inst = llvm::dyn_cast<llvm::Instruction>(user); inst == nullptr || !members.contains(inst->getParent()))
-                    return keep(entry);
+                    return finish(keep(entry), false);
+        // A nested invoke's pad was built from the whole scope stack, not just this unit's inputs.
+        bool nestedEh = false;
+        for (llvm::BasicBlock* block : region)
+            for (const llvm::Instruction& inst : *block)
+                if (llvm::isa<llvm::InvokeInst>(inst) || (inst.isEHPad() && &inst != pad)) nestedEh = true;
         auto eraseRegion = [&] {
             EraseUnwindRegion(region);
             for (llvm::AllocaInst* slot : scratch)
@@ -6069,7 +6179,7 @@ llvm::BasicBlock* LLVMBackend::ChainUnwindCleanup(UnwindChainState& chain, llvm:
         if (region.size() == 1 && entry->size() == (funclet ? 2u : 1u) && scratch.empty())
         {
             eraseRegion();
-            return target;
+            return finish(target, !nestedEh);
         }
         const UnwindRegionIndex index(region, scratch);
         auto& candidates = chain.Regions[UnwindRegionHash(region, index)];
@@ -6085,10 +6195,10 @@ llvm::BasicBlock* LLVMBackend::ChainUnwindCleanup(UnwindChainState& chain, llvm:
                 || !SameUnwindRegion(region, scratch, index, blocks, slots))
                 continue;
             eraseRegion();
-            return blocks.front();
+            return finish(blocks.front(), !nestedEh);
         }
         candidates.push_back({ { region.begin(), region.end() }, { scratch.begin(), scratch.end() } });
-        return keep(entry);
+        return finish(keep(entry), !nestedEh);
     }
 
 llvm::CallBase* LLVMBackend::CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::Value* callee,
@@ -6197,7 +6307,7 @@ llvm::CallBase* LLVMBackend::CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::
             // Execution order: innermost scope first, each scope's locals newest first, then
             // its owning arguments and lock releases. Chained back to front so each link
             // knows its continuation; a pad then enters at the newest live local.
-            std::vector<std::function<void()>> units;
+            std::vector<CleanupUnit> units;
             CollectScopeCleanupUnits(units, /*unwindFloors*/ true);
             // Cleanup code has no user location; one shared location lets -g share it too.
             if (currentSubprogram)
