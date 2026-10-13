@@ -240,6 +240,15 @@ void LLVMBackend::RunInterfaceReturnDangleCheck(llvm::Function* F)
                     break;
                 }
             }
+            if (rec.AliasOfOwnedLocal)
+            {
+                SetSourceLocation(static_cast<size_t>(rec.Line), static_cast<size_t>(rec.Col));
+                LogError(std::format(
+                    "cannot return a borrow of a local owner as interface '{}' - the owning local "
+                    "is freed when this function returns and a borrow cannot outlive its owner; "
+                    "return the owning local itself ('return t;' from a 'move' function) or a heap "
+                    "object", rec.InterfaceName));
+            }
             if (rec.FrameStorageProvenance && !rec.ProvenanceUnknown && !hasNonFrameWriter)
             {
                 SetSourceLocation(static_cast<size_t>(rec.Line), static_cast<size_t>(rec.Col));
@@ -1491,6 +1500,37 @@ bool LLVMBackend::IsProvablyNonOwningPointerLoad(llvm::Value* value) const
         return false;
     }
 
+bool LLVMBackend::IsOwningFieldAddress(const llvm::GetElementPtrInst* fieldAddr) const
+{
+        auto* st = llvm::dyn_cast<llvm::StructType>(fieldAddr->getSourceElementType());
+        if (st == nullptr || !st->hasName() || fieldAddr->getNumIndices() == 0) return true;
+        // The core `unique<T>` wrapper owns the pointer it holds: a load through it is owning.
+        const std::string name = st->getStructName().str();
+        if (name.rfind("unique", 0) == 0 || IsCoreUniqueType(name)) return true;
+        auto* idx = llvm::dyn_cast<llvm::ConstantInt>(fieldAddr->getOperand(fieldAddr->getNumOperands() - 1));
+        if (idx == nullptr) return true;
+        return IsOwningStructField(name, static_cast<unsigned>(idx->getZExtValue()));
+    }
+
+bool LLVMBackend::IsOwningStructField(const std::string& structName, unsigned index) const
+{
+        auto it = dataStructures.find(structName);
+        if (it == dataStructures.end() || index >= it->second.StructFields.size()) return true;
+        const auto& field = it->second.StructFields[index];
+        if (field.IsAlias) return false;  // a borrowed reference to storage owned elsewhere
+        // `unique T*` owns its pointee (a core `unique<T>` field too); a plain T* is a borrow.
+        return field.IsUnique || IsCoreUniqueType(field.TypeName);
+    }
+
+bool LLVMBackend::IsFunctionArgumentStorage(llvm::Value* storage) const
+{
+        if (storage == nullptr) return false;
+        for (const auto& frame : stackNamedVariable)
+            for (const auto& [varName, nv] : frame.functionArgument)
+                if (nv.Storage == storage) return true;
+        return false;
+    }
+
 bool LLVMBackend::IsBorrowStringParamStorage(llvm::Value* storage)
 {
         if (storage == nullptr) return false;
@@ -1732,7 +1772,8 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
                 rvt != nullptr && !value->getType()->isVectorTy()
                 && (value->getType()->isIntegerTy() || value->getType()->isFloatingPointTy()))
             {
-                value = SplatScalarToVectorType(value, rvt, srcIsUnsigned);
+                value = SplatScalarToVectorType(value, rvt, srcIsUnsigned,
+                    currentFunctionReturnTV.IsUnsignedInteger() != -1);
             }
             value = Upconvert(value, retTy, srcIsUnsigned);
             // Upconvert only widens; handle narrowing int -> bool explicitly (same as CreateAssignment).

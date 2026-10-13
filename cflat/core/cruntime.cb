@@ -33,8 +33,8 @@ if const (__WINDOWS__) {
 // calls these un-namespaced. Types mirror os.posix.cb (win_size == i64 on 64-bit).
 extern void*    fopen(const char* path, const char* mode);
 extern win_int  fclose(void* stream);
-extern win_size fread(i8* buf, win_size size, win_size count, void* stream);
-extern win_size fwrite(const i8* buf, win_size size, win_size count, void* stream);
+extern win_size fread(char* buf, win_size size, win_size count, void* stream);
+extern win_size fwrite(const char* buf, win_size size, win_size count, void* stream);
 extern win_int  feof(void* stream);
 // C spells both offsets `long`: 32-bit on Windows/LLP64, 64-bit on LP64.
 extern win_int  fseek(void* stream, long offset, win_int origin);

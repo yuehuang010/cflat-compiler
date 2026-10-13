@@ -138,7 +138,7 @@ void _proc_close(void* h) {
 }
 
 // Read up to 4096 bytes from a pipe end into buf; returns the count, or <=0 at EOF.
-int _proc_read(void* pipe, i8* buf) {
+int _proc_read(void* pipe, char* buf) {
     if const (__WINDOWS__) {
         i32 nRead = 0;
         if (ReadFile(pipe, buf, 4096, &nRead, nullptr) == 0) return 0;
@@ -160,7 +160,7 @@ void _proc_write(void* pipe, char* buf, i32 len) {
 }
 
 // Heap-copy n bytes of a string as a NUL-terminated C string (for POSIX argv).
-char* _proc_dupcstr(i8* src, int n) {
+char* _proc_dupcstr(char* src, int n) {
     char* b = (char*)malloc((i64)(n + 1));
     memcpy(b, src, n);
     b[n] = 0;
@@ -171,7 +171,7 @@ char* _proc_dupcstr(i8* src, int n) {
 // ctx->callback is always set - we only start this thread when onStdout != nullptr.
 int __process_reader_fn(move void* rawCtx) {
     __ProcessReaderCtx* ctx = (__ProcessReaderCtx*)rawCtx;
-    i8* buf = (i8*)malloc(4096);
+    char* buf = (char*)malloc(4096);
     while (true) {
         int nRead = _proc_read(ctx->pipe, buf);
         if (nRead <= 0) break;
@@ -213,7 +213,7 @@ int __process_writer_fn(move void* rawCtx) {
 char* __process_build_cmdline(string exe, list<string>* pargs) {
     stringbuilder sb;
     bool nq = false;
-    i8* ep = exe.data(); int elen = exe.length(); int k = 0;
+    char* ep = exe.data(); int elen = exe.length(); int k = 0;
     while (k < elen) { if (ep[k] == ' ') { nq = true; break; } k++; }
     if (nq) sb.appendChar('"');
     sb.append(exe);
@@ -223,7 +223,7 @@ char* __process_build_cmdline(string exe, list<string>* pargs) {
         sb.appendChar(' ');
         string arg = pargs->get(i);
         bool q = false;
-        i8* ap = arg.data(); int al = arg.length(); int j = 0;
+        char* ap = arg.data(); int al = arg.length(); int j = 0;
         while (j < al) { if (ap[j] == ' ') { q = true; break; } j++; }
         if (q) sb.appendChar('"');
         sb.append(arg);

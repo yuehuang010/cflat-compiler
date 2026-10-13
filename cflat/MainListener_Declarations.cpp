@@ -3987,12 +3987,18 @@ void MainListener::OpenStaticLocalGuard(StaticLocalGuard& guard, const std::stri
         // Set BEFORE the initializer runs, so a call that recurses into this function observes
         // "already initialized" instead of re-entering the initializer.
         guard.FlagStore = compiler->builder->CreateStore(compiler->builder->getInt8(1), guard.Flag);
+        // An unwind out of the initializer (a throwing C++ constructor) clears the flag again, so the
+        // next entry retries like clang ([stmt.dcl]/4). Popped by CloseStaticLocalGuard.
+        guard.UnwindMark = compiler->unwindPartial_.size();
+        compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::StaticFlag, guard.Flag, "");
     }
 
 void MainListener::CloseStaticLocalGuard(StaticLocalGuard& guard, const std::string& varName) {
         auto* compiler = Compiler();
         compiler->ClearStaticLocalRequest();
         if (guard.Flag == nullptr) return;
+        if (compiler->unwindPartial_.size() > guard.UnwindMark)
+            compiler->unwindPartial_.resize(guard.UnwindMark);
 
         llvm::GlobalVariable* storage = nullptr;
         if (!compiler->stackNamedVariable.empty())
@@ -4466,7 +4472,9 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         auto convertInto = [&](LLVMBackend::NamedVariable source) {
             std::string refusal;
             compiler->SetCurrentDebugLocation(line);
-            switch (compiler->ConvertThroughCxxConvertingCtor(source, typeName, slot, refusal))
+            switch (compiler->ConvertThroughCxxConvertingCtor(source, typeName, slot, refusal,
+                                                              /*directInit*/ false,
+                                                              /*allowScalarNarrowing*/ true))
             {
             case LLVMBackend::CxxConvertingCtorResult::Converted:
                 return true;
@@ -4527,6 +4535,7 @@ cxx_dtor_ready:
                         break;
                     }
                     auto* expression = element->assignmentExpression(0);
+                    CxxCallArgumentScope cxxBraceElementScope(inCxxCallArgument_, true);
                     auto elementNV = ParseAssignmentExpressionNamed(expression);
                     NormalizeCxxRvalueReferenceArgument(expression, elementNV);
                     llvm::Value* elementValue = elementNV.Primary
@@ -4681,6 +4690,7 @@ cxx_dtor_ready:
                             auto* expression = element->assignmentExpression(0);
                             brace.allIntegerLiterals = brace.allIntegerLiterals
                                 && isIntegerLiteral(expression->getText());
+                            CxxCallArgumentScope cxxBraceArgumentScope(inCxxCallArgument_, true);
                             auto elementNV = ParseAssignmentExpressionNamed(expression);
                             llvm::Value* elementValue = elementNV.Primary
                                 ? elementNV.Primary : LoadNamedVariable(elementNV);
@@ -4714,6 +4724,9 @@ cxx_dtor_ready:
                     return true;
                 }
                 compiler->lastCxxRetTemp_ = nullptr;
+                // A C++ constructor argument is a C++ call argument: `?:` arms use the usual
+                // arithmetic conversions (T55), so `rv.C(k ? 5 : 6)` deduces int like clang.
+                CxxCallArgumentScope cxxCtorArgumentScope(inCxxCallArgument_, true);
                 auto nv = ParseAssignmentExpressionNamed(argAssign);
                 NormalizeCxxRvalueReferenceArgument(argAssign, nv);
                 compiler->LowerNonCapturingClosureForCxx(
@@ -5071,7 +5084,11 @@ cxx_dtor_ready:
         auto parseInitializerOnce = [&]() {
             if (!hasParsedArrayInitializer)
             {
-                auto parsed = ParseAssignmentExpressionNamed(assign);
+                auto parsed = [&] {
+                    CxxCallArgumentScope cxxDeclInitScope(inCxxCallArgument_,
+                        !declType.Pointer && compiler->IsCxxRecord(typeName));
+                    return ParseAssignmentExpressionNamed(assign);
+                }();
                 LLVMBackend::TypeAndValue destinationType;
                 destinationType.TypeName = typeName;
                 const bool sameOrDerivedClass = !parsed.TypeAndValue.Pointer
@@ -5140,7 +5157,11 @@ cxx_dtor_ready:
                 compiler->lastCxxRetTemp_ = nullptr;
                 compiler->lastCxxRetValue_ = nullptr;
                 auto elementOwnedTempMark = compiler->MarkOwnedTemps();
-                auto sourceNV = ParseAssignmentExpressionNamed(assign);
+                auto sourceNV = [&] {
+                    CxxCallArgumentScope cxxDeclSourceScope(inCxxCallArgument_,
+                        !declType.Pointer && compiler->IsCxxRecord(typeName));
+                    return ParseAssignmentExpressionNamed(assign);
+                }();
                 auto sourceValue = LoadNamedVariable(sourceNV);
                 if (sourceValue != nullptr && sourceNV.IsElementAccess
                     && sourceNV.Storage != nullptr && !sourceNV.TypeAndValue.Pointer
@@ -5164,7 +5185,11 @@ cxx_dtor_ready:
                 compiler->lastCxxRetTemp_ = nullptr;
                 compiler->lastCxxRetValue_ = nullptr;
                 auto elementOwnedTempMark = compiler->MarkOwnedTemps();
-                auto sourceNV = ParseAssignmentExpressionNamed(assign);
+                auto sourceNV = [&] {
+                    CxxCallArgumentScope cxxDeclSourceScope(inCxxCallArgument_,
+                        !declType.Pointer && compiler->IsCxxRecord(typeName));
+                    return ParseAssignmentExpressionNamed(assign);
+                }();
                 if (sourceNV.IsElementAccess && sourceNV.Storage != nullptr
                     && !sourceNV.TypeAndValue.Pointer
                     && sourceNV.TypeAndValue.TypeName == typeName)
@@ -6438,6 +6463,46 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     staticBraceList = initDecl->initializer()->initializerList();
                 const bool staticHasValues = staticBraceList != nullptr
                     && !staticBraceList->fieldInit().empty();
+                // T88: a `static` local with no initializer is never constructed in place, so a C++
+                // class whose default constructor cflat cannot call is refused here, not zero-filled.
+                if (isStaticLocal && !typeAndValue.Pointer && !staticHasValues
+                    && paramTypeList == nullptr && !hasParens && direct != nullptr
+                    && (initDecl->initializer() == nullptr
+                        || initDecl->initializer()->Default() != nullptr
+                        || initDecl->initializer()->getText() == "default")
+                    && compiler->IsCxxRecord(typeAndValue.TypeName))
+                {
+                    std::string unavailableType;
+                    if (compiler->HasUnavailableNestedCxxDefault(
+                            typeAndValue.TypeName, &unavailableType, true))
+                    {
+                        const auto* info = compiler->GetCxxClassInfo(unavailableType);
+                        LogErrorContext(initDecl, std::format(
+                            "C++ class '{}' has no default constructor cflat can call{} - a 'static' "
+                            "local of it cannot be constructed; hold it through a pointer instead",
+                            compiler->DisplayCxxClassName(unavailableType),
+                            info != nullptr && info->hasDeletedDefaultCtor ? " (it is deleted)" : ""));
+                        allocList.push_back(std::pair(name, nullptr));
+                        continue;
+                    }
+                    // A nontrivial class is constructed in the static's own storage, under the guard
+                    // opened above; it used to stay zero-filled because no constructor ever ran.
+                    if (typeAndValue.ConstArraySize == 0
+                        && compiler->CxxElementNeedsDefaultConstruction(typeAndValue.TypeName))
+                    {
+                        const auto* ctor = compiler->FindCxxDefaultCtor(typeAndValue.TypeName);
+                        llvm::Value* staticSlot = compiler->CreateLocalVariable(
+                            typeAndValue, nullptr, nullptr, line, typeAndValue.UserAlignValue);
+                        allocList.push_back(std::pair(name, nullptr));
+                        if (staticSlot != nullptr && ctor != nullptr)
+                        {
+                            compiler->SetCurrentDebugLocation(line);
+                            compiler->EmitCxxStructorCall(typeAndValue.TypeName, *ctor, staticSlot, {});
+                        }
+                        continue;
+                    }
+                }
+
                 if (!global_scope && paramTypeList == nullptr && !hasParens && direct != nullptr
                     && (!typeAndValue.staticStorage || staticHasValues)
                     && direct->assignmentExpression() == nullptr
@@ -6931,7 +6996,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 compiler->lastCxxRetValue_ = nullptr;
                                 compiler->lastLoweredRetTemp_ = nullptr;
                                 compiler->lastLoweredRetValue_ = nullptr;
-                                autoDeclTernaryInit_ = typeAndValue.TypeName == "auto"
+                                // A `static` C++ class local with an explicit type arms its ternary like
+                                // `auto` does: each arm's constructed temporary is the declaration's value.
+                                autoDeclTernaryInit_ = (typeAndValue.TypeName == "auto"
+                                        || (isStaticLocal && compiler->IsCxxRecord(typeAndValue.TypeName)))
                                     && !typeAndValue.Pointer && !global_scope
                                     && assignmentExpression->conditionalExpression() != nullptr
                                     && assignmentExpression->conditionalExpression()->Question() != nullptr;
@@ -6939,6 +7007,19 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && !typeAndValue.IsAlias && !global_scope)
                                     trivialCxxMoveSite_ = TopLevelMoveExpression(assignmentExpression);
                                 auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
+                                // [immovable]: `T b = a;` / `T b = move a;` copies or moves an existing
+                                // value into a new owner. In-place init (`T b = default;`) and borrows
+                                // (`alias T b = a;`, `T* p = &a;`) stay legal.
+                                if (!typeAndValue.Pointer && !typeAndValue.IsAlias && !rightNV.TypeAndValue.Pointer
+                                    && (rightNV.IsExplicitMove || !compiler->IsImmovableFreshOperand(rightNV))
+                                    && compiler->IsImmovableType(rightNV.TypeAndValue.TypeName))
+                                {
+                                    LogErrorContext(assignmentExpression, std::format(
+                                        "cannot initialize from a value of type '{}': the type is [immovable], "
+                                        "so the value may not be copied or moved into a new owner (initialize in "
+                                        "place, or borrow with 'alias' or a pointer)",
+                                        SpellDiagnosticType(*compiler, rightNV.TypeAndValue)));
+                                }
                                 trivialCxxMoveSite_ = nullptr;
                                 autoDeclTernaryInit_ = false;
                                 if (compiler->lastCxxRetTemp_ != nullptr
@@ -6956,8 +7037,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && compiler->IsLoweredCFlatOnlyStruct(
                                         rightNV.TypeAndValue.TypeName))
                                     srcCxxRetTemp = compiler->lastLoweredRetTemp_;
-                                // `auto x = T(args)`: the constructed temporary is adopted too.
-                                else if (typeAndValue.TypeName == "auto" && !global_scope
+                                // `auto x = T(args)`: the constructed temporary is adopted too. A
+                                // `static T x = T(args)` adopts it the same way (T62 in-place path).
+                                else if ((typeAndValue.TypeName == "auto"
+                                        || (isStaticLocal && typeAndValue.TypeName
+                                            == rightNV.TypeAndValue.TypeName))
+                                    && !global_scope
                                     && llvm::isa_and_nonnull<llvm::AllocaInst>(rightNV.Storage)
                                     && !rightNV.TypeAndValue.Pointer
                                     && compiler->ReturnsViaCxxSret(
@@ -8335,6 +8420,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     "it requires runtime construction (add()/set() calls) that a "
                                     "global's compile-time constant cannot hold; declare it '= default' "
                                     "and populate it in a function", scalarTypeSpelling));
+                            else if (hasPositional && !typeAndValue.Pointer && compiler->IsCxxRecord(scalarTypeName))
+                                LogErrorContext(direct, std::format(
+                                    "brace initializers are not supported for a global of C++ class '{}' - "
+                                    "cflat runs only the default constructor of a global at startup, so a "
+                                    "constructor with arguments cannot be called there; declare it without "
+                                    "the list and construct it in a function", scalarTypeSpelling));
                             else if (hasPositional)
                                 LogErrorContext(direct, std::format(
                                     "positional initializers are not supported for {} '{}'; use 'field = value'",
@@ -9121,7 +9212,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 compiler->RejectImplicitIntegerPointeePointerConversion(
                                     initializerSourceNV.TypeAndValue, typeAndValue);
                             auto* initStore = (movedCxxReturn || loweredCopyInitInPlace)
-                                ? nullptr : compiler->CreateAssignment(right, alloc, srcIsUnsigned);
+                                ? nullptr : compiler->CreateAssignment(right, alloc, srcIsUnsigned, nullptr,
+                                    typeAndValue.IsUnsignedInteger() != -1);
                             if (movedOwningStruct)
                             {
                                 compiler->builder->CreateStore(

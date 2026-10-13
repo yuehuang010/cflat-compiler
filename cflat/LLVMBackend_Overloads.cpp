@@ -97,7 +97,18 @@ bool LLVMBackend::IsImplicitIntegerPointeePointerConversion(
         type.TypeName = name;
         return type.IsInteger() != -1 || type.IsUnsignedInteger() != -1;
     };
-    if (!isInteger(fromBase) || !isInteger(toBase)) return false;
+    // Unrelated floating pointees are refused too (T80). simd pointees keep their own rules, so
+    // the floating widening never reaches them.
+    auto isFloating = [&](const std::string& name) {
+        TypeAndValue type;
+        type.TypeName = name;
+        return type.IsFloatingPoint() != -1;
+    };
+    const bool integerPair = isInteger(fromBase) && isInteger(toBase);
+    const bool floatingPair = !from.IsSimd && !to.IsSimd
+        && (isInteger(fromBase) || isFloating(fromBase))
+        && (isInteger(toBase) || isFloating(toBase));
+    if (!integerPair && !floatingPair) return false;
 
     const bool charFamily = (fromBase == "char" && (toBase == "i8" || toBase == "u8"))
         || (toBase == "char" && (fromBase == "i8" || fromBase == "u8"));
@@ -246,6 +257,60 @@ static bool CxxSpellingHasPointerTarget(const std::string& spelling)
     const size_t star = spelling.find('*');
     const size_t amp = spelling.find('&');
     return star != std::string::npos && (amp == std::string::npos || star < amp);
+}
+
+/*
+ * T85: one normalization for every call-matching use of the pointee predicate. Both sides are
+ * judged as the pointer they refer to: a C++ reference parameter (`T* const&`, `T*&`, `T*&&`) and
+ * a reference-returning argument (`int*& f()`) lose their reference flags, an argument that keeps
+ * its pointee only in InferSourceTypeName (call and operator operands) gets it back. A reference
+ * to a non-pointer (`const bool&`) binds the pointer-to-scalar conversion and is never judged.
+ */
+bool LLVMBackend::IsUnrelatedPointeeArgument(const NamedVariable& arg,
+                                             const FunctionSymbol& candidate, size_t index) const
+{
+    if (index >= candidate.Parameters.size()) return false;
+    TypeAndValue from = arg.HasOriginalArgumentType ? arg.OriginalArgumentType : arg.TypeAndValue;
+    if (from.Pointer && from.TypeName.empty() && !arg.InferSourceTypeName.empty())
+        from.TypeName = arg.InferSourceTypeName;
+    // A reference-returning call is already stored at the referred pointer's depth.
+    if (from.IsCxxRefToPointer)
+    {
+        from.IsCxxRefToPointer = false;
+        from.IsCxxConstRef = false;
+        from.IsRvalueRef = false;
+    }
+    TypeAndValue to = candidate.Parameters[index];
+    if (candidate.IsCxx && IsCxxReferenceParameter(candidate, index))
+    {
+        if (!CxxSpellingHasPointerTarget(CxxReferenceParameterSpelling(candidate, index)))
+            return false;
+        // `T*&&` carries the reference as its second level; a flagged `T**&&` is at referent depth.
+        if (to.IsRvalueRef && to.ElemPointer && !to.IsCxxRefToPointer)
+        {
+            to.ElemPointer = false;
+            to.PointerDepth = 1;
+        }
+        to.IsRvalueRef = false;
+        to.IsCxxConstRef = false;
+        to.IsCxxRefToPointer = false;
+    }
+    return IsImplicitIntegerPointeePointerConversion(from, to);
+}
+
+// T85: some C++ candidate of an operator set is not viable for `arg` at `index` by its pointee, so
+// an operator template beside it must be ranked by clang (an empty receiver matches any first type).
+bool LLVMBackend::CxxOperatorDropsUnrelatedPointee(const std::string& lookupName,
+                                                   const NamedVariable& arg, size_t index,
+                                                   const std::string& receiverType) const
+{
+    auto it = functionTable.find(lookupName);
+    if (it == functionTable.end()) return false;
+    return std::any_of(it->second.begin(), it->second.end(), [&](const FunctionSymbol& candidate) {
+        return candidate.IsCxx && candidate.Parameters.size() == 2
+            && (receiverType.empty() || candidate.Parameters[0].TypeName == receiverType)
+            && IsUnrelatedPointeeArgument(arg, candidate, index);
+    });
 }
 
 // A null pointer conversion can bind a reference only when the referent itself is a pointer
@@ -1811,10 +1876,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                             ScalarArgumentReferent(*varParamItr));
                         conv == ScalarArgConversion::Narrow || conv == ScalarArgConversion::EnumMismatch)
                         declaredParamRefuses = true;
-                    const auto& originalArgType = arg.HasOriginalArgumentType
-                        ? arg.OriginalArgumentType : arg.TypeAndValue;
-                    if (!candidate.IsCxx
-                        && IsImplicitIntegerPointeePointerConversion(originalArgType, *varParamItr))
+                    // T85: C++ declared parameters refuse unrelated primitive pointees too.
+                    if (IsUnrelatedPointeeArgument(arg, candidate,
+                            (size_t)std::distance(candidate.Parameters.begin(), varParamItr)))
                         declaredParamRefuses = true;
                     if (candidate.IsCxx
                         && CxxCandidatePointeeConstRelation(candidate,
@@ -2723,9 +2787,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
 
                 const auto& originalArgType = arg.HasOriginalArgumentType
                     ? arg.OriginalArgumentType : arg.TypeAndValue;
-                if (!candidate.IsCxx
-                    && IsImplicitIntegerPointeePointerConversion(originalArgType,
-                                                                  *candidateParamItr))
+                // T85: the same predicate refuses C++ candidates; a lone candidate is refused too.
+                if (IsUnrelatedPointeeArgument(arg, candidate, (size_t)std::distance(
+                        candidate.Parameters.begin(), candidateParamItr)))
                     result = -1;
                 // `long*` vs the same-width `iN*` is accepted but never perfect, so an exactly
                 // spelled overload (f(long*) vs f(i64*)) still wins.
@@ -2850,7 +2914,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         }
                     }
                     // Native sets: int* into double* is not viable in C++, so f(void*) wins; integer
-                    // pairs go through IsImplicitIntegerPointeePointerConversion.
+                    // pairs go through IsImplicitIntegerPointeePointerConversion (T80: floating too).
                     bool unrelatedPrimitivePointee = false;
                     if (!candidate.IsCxx && result >= 0 && candidates.size() > 1
                         && pointerArg.Pointer && !pointerArg.ElemPointer && pointerArg.PointerDepth <= 1
@@ -6704,6 +6768,19 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 }
             }
 
+            // [immovable]: a by-value or `move` parameter takes the value itself, so passing any
+            // value of an immovable type transfers it (a temporary is copied in too). Pointer/alias borrow.
+            {
+                const auto& p = candidate.Parameters[i];
+                const auto& a = matched[i];
+                const bool byValueSink = !p.Pointer && !p.ElemPointer && !p.IsAlias && !p.IsArrayView
+                    && !p.IsInterface && !p.IsFunctionPointer;
+                if (byValueSink && !a.TypeAndValue.Pointer && (a.IsExplicitMove || !IsImmovableFreshOperand(a))
+                    && IsImmovableType(a.TypeAndValue.TypeName))
+                    LogErrorMessage("parameter '{}': cannot pass a value of type '{}' to a by-value or 'move' "
+                        "parameter of '{}' - the type is [immovable], so its value may not be transferred",
+                        { p.VariableName, SpellDiagnosticType(*this, a.TypeAndValue), SpellFunctionSymbol(*this, diagnosticFunctionName) });
+            }
             if (candidate.Parameters[i].IsMove && matched[i].IsBonded)
                 LogErrorMessage("parameter '{}': cannot pass bonded value to '{}' parameter - bonded values cannot be transferred out of their source's scope",
                     { candidate.Parameters[i].VariableName, "move" });

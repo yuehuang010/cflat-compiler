@@ -1,0 +1,63 @@
+// [immovable] (T90): every operation that transfers a value of the type is refused at the operation.
+// Each leg is a scoped expect_error block whose substring names the operation. Construction in place,
+// pointers, aliases and `new` stay legal (positive legs in Test/test_move.cb). Matches the
+// accept-set and the operation table in scratch/briefs/t90_report.md.
+
+[immovable] struct Node { int x = 0; };
+struct Outer { Node n; int y = 0; };
+
+void takeValue(Node n) { }
+void takeMove(move Node n) { }
+
+expect_error("cannot 'move' a value of type 'Node': the type is [immovable]") {
+    void moveLocal() { Node a = default; Node b = move a; }
+}
+
+expect_error("cannot return a value of [immovable] type 'Node' by value") {
+    Node retLocal() { Node n = default; return n; }
+}
+
+expect_error("cannot return a value of [immovable] type 'Node' by value") {
+    Node retFresh() { return default; }
+}
+
+expect_error("cannot pass a value of type 'Node' to a by-value or 'move' parameter") {
+    void passValue() { Node a = default; takeValue(a); }
+}
+
+expect_error("cannot 'move' a value of type 'Node': the type is [immovable]") {
+    void passMove() { Node a = default; takeMove(move a); }
+}
+
+expect_error("cannot assign a value of type 'Node': the type is [immovable]") {
+    void assignCopy() { Node a = default; Node b = default; a = b; }
+}
+
+expect_error("cannot 'move' a value of type 'Node': the type is [immovable]") {
+    void assignMove() { Node a = default; Node b = default; a = move b; }
+}
+
+expect_error("cannot initialize from a value of type 'Node': the type is [immovable]") {
+    void declCopy() { Node a = default; Node b = a; }
+}
+
+// Copy holes (T90 F2): each form copies or moves an immovable value out of a place.
+expect_error("the type is [immovable]") {
+    void holeDerefInit() { Node a = default; Node* p = &a; Node c = *p; }
+}
+
+expect_error("the type is [immovable]") {
+    void holeDerefArg() { Node a = default; Node* p = &a; takeValue(*p); }
+}
+
+expect_error("the type is [immovable]") {
+    void holeDerefAssign() { Node a = default; Node* p = &a; Node d = default; d = *p; }
+}
+
+expect_error("the type is [immovable]") {
+    void holeBraceField() { Node a = default; Outer o = { n = a }; }
+}
+
+expect_error("the type is [immovable]") {
+    void holeTernary() { Node a = default; Node d = default; bool t = true; Node e = t ? a : d; }
+}

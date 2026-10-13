@@ -1,0 +1,88 @@
+// `return E + k;` into an interface return of a non-'move' function, where E's root is an owning
+// local's heap block. The result is an interior pointer the caller can never free, so it takes the
+// same leak diagnostic as `return t;` (T81). Nesting, operand order and a local alias of the owner
+// do not change that: the decision is made on the root pointer expression.
+interface IThing { int value(); };
+
+class Thing : IThing
+{
+    int n = 0;
+    int value() { return n; }
+};
+
+expect_error("returning a heap object boxed into interface 'IThing' from a non-'move' function") {
+    IThing returnOwnedArithmetic()
+    {
+        Thing* t = new Thing[2];
+        return t + 1;
+    }
+}
+
+expect_error("returning a heap object boxed into interface 'IThing' from a non-'move' function") {
+    IThing returnNestedOwnedArithmetic()
+    {
+        Thing* t = new Thing[3];
+        return (t + 1) + 1;
+    }
+}
+
+expect_error("returning a heap object boxed into interface 'IThing' from a non-'move' function") {
+    IThing returnAliasOwnedArithmetic()
+    {
+        Thing* t = new Thing[3];
+        Thing* b = t;
+        return b + 1;
+    }
+}
+
+expect_error("returning a heap object boxed into interface 'IThing' from a non-'move' function") {
+    IThing returnWrappedOwnedArithmetic()
+    {
+        Thing* t = new Thing[3];
+        return 1 + (t + 1);
+    }
+}
+
+// An owned call result: `return mkT();` is refused by the leak rule, so `mkT() + k` must be too
+// (the callee's ReturnsOwned fact decides it, not the per-call flags).
+move Thing* mkT() { return new Thing[2]; }
+
+expect_error("returning a heap object boxed into interface 'IThing' from a non-'move' function") {
+    IThing returnOwnedCallPlusOne()
+    {
+        return mkT() + 1;
+    }
+}
+
+expect_error("returning a heap object boxed into interface 'IThing' from a non-'move' function") {
+    IThing returnOwnedCallPlusZero()
+    {
+        return mkT() + 0;
+    }
+}
+
+interface IThingFactory { move Thing* make(); };
+class ThingFactory : IThingFactory { move Thing* make() { return mkT(); } };
+ThingFactory gThingFactory = default;
+function<Thing*()> gMakeThing = mkT;
+
+// Indirect calls (interface dispatch, function pointer to a move callee) may return an owned pointer.
+expect_error("returning a heap object boxed into interface 'IThing' from a non-'move' function") {
+    IThing returnDispatchedOwnedPlusOne()
+    {
+        IThingFactory f = &gThingFactory;
+        return f.make() + 1;
+    }
+}
+
+expect_error("returning a heap object boxed into interface 'IThing' from a non-'move' function") {
+    IThing returnFunctionPointerOwnedPlusOne()
+    {
+        return gMakeThing() + 1;
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

@@ -355,13 +355,13 @@ if const (__WINDOWS__) {
 
     // Append the NUL-terminated string `s` to `out` starting at `pos`; returns
     // the new position. Does not write a terminator (caller does).
-    int _str_append(i8* out, int pos, const char* s) {
+    int _str_append(char* out, int pos, const char* s) {
         int i = 0;
         while (s[i] != 0) { out[pos] = s[i]; pos = pos + 1; i = i + 1; }
         return pos;
     }
     // Append the decimal digits of the non-negative int `v` to `out` at `pos`.
-    int _int_append(i8* out, int pos, int v) {
+    int _int_append(char* out, int pos, int v) {
         if (v >= 10) { pos = _int_append(out, pos, v / 10); }
         out[pos] = (i8)('0' + (v % 10));
         return pos + 1;
@@ -390,7 +390,7 @@ if const (__WINDOWS__) {
         }
 
         // Build "hw.perflevelN.<suffix>" into `out` (NUL-terminated).
-        void _perflevel_name(i8* out, int level, const char* suffix) {
+        void _perflevel_name(char* out, int level, const char* suffix) {
             int p = 0;
             p = _str_append(out, p, "hw.perflevel");
             p = _int_append(out, p, level);
@@ -420,9 +420,9 @@ if const (__WINDOWS__) {
             int llcIdx  = 0;
             int level   = 0;
             while (level < nlevels) {
-                i8[64] nameLog  = default;
-                i8[64] namePhys = default;
-                i8[64] nameL2   = default;
+                char[64] nameLog  = default;
+                char[64] namePhys = default;
+                char[64] nameL2   = default;
                 _perflevel_name(&nameLog[0], level, "logicalcpu");
                 _perflevel_name(&namePhys[0], level, "physicalcpu");
                 _perflevel_name(&nameL2[0], level, "cpusperl2");
@@ -480,7 +480,7 @@ if const (__WINDOWS__) {
 
         // Read a small sysfs file into `buf` (NUL-terminated, trailing newline
         // stripped). False if the file is missing or empty.
-        bool _sysfs_read(const char* path, i8* buf, int cap) {
+        bool _sysfs_read(const char* path, char* buf, int cap) {
             void* f = os.posix.fopen(path, "rb");
             if (f == nullptr) { return false; }
             win_size n = os.posix.fread(buf, (win_size)1, (win_size)(cap - 1), f);
@@ -525,7 +525,7 @@ if const (__WINDOWS__) {
         }
 
         // Build "/sys/devices/system/cpu/cpuN/<suffix>".
-        void _cpu_path(i8* out, int cpu, const char* suffix) {
+        void _cpu_path(char* out, int cpu, const char* suffix) {
             int p = 0;
             p = _str_append(out, p, "/sys/devices/system/cpu/cpu");
             p = _int_append(out, p, cpu);
@@ -534,7 +534,7 @@ if const (__WINDOWS__) {
             out[p] = (i8)0;
         }
         // Build "/sys/devices/system/cpu/cpuN/cache/indexK/<suffix>".
-        void _cpu_cache_path(i8* out, int cpu, int idx, const char* suffix) {
+        void _cpu_cache_path(char* out, int cpu, int idx, const char* suffix) {
             int p = 0;
             p = _str_append(out, p, "/sys/devices/system/cpu/cpu");
             p = _int_append(out, p, cpu);
@@ -545,7 +545,7 @@ if const (__WINDOWS__) {
             out[p] = (i8)0;
         }
         // Build "/sys/devices/system/node/nodeN/cpulist".
-        void _node_path(i8* out, int node) {
+        void _node_path(char* out, int node) {
             int p = 0;
             p = _str_append(out, p, "/sys/devices/system/node/node");
             p = _int_append(out, p, node);
@@ -564,9 +564,9 @@ if const (__WINDOWS__) {
             int i = 0;
             while (i < phys) {
                 int firstCpu = _lowest_bit_index(topo->coreMask[i]);
-                i8[256] p = default;
+                char[256] p = default;
                 _cpu_path(&p[0], firstCpu, "cpu_capacity");
-                i8[64] b = default;
+                char[64] b = default;
                 if (!_sysfs_read(&p[0], &b[0], 64)) { haveCaps = false; break; }
                 caps[i] = (i32)_parse_int(&b[0]);
                 i = i + 1;
@@ -592,8 +592,8 @@ if const (__WINDOWS__) {
                 return;
             }
             // (b) Intel hybrid: cpu_core members are perf (1), cpu_atom are eff (0).
-            i8[256] cbuf = default;
-            i8[256] abuf = default;
+            char[256] cbuf = default;
+            char[256] abuf = default;
             bool haveCore = _sysfs_read("/sys/devices/cpu_core/cpus", &cbuf[0], 256);
             bool haveAtom = _sysfs_read("/sys/devices/cpu_atom/cpus", &abuf[0], 256);
             if (haveCore && haveAtom) {
@@ -618,7 +618,7 @@ if const (__WINDOWS__) {
         void _topo_build(CpuTopology* topo) {
             // Enumerate the real online CPU set rather than assuming a dense
             // 0..count-1 range: offline CPUs / isolcpus make sysfs indices sparse.
-            i8[256] onlineBuf = default;
+            char[256] onlineBuf = default;
             u64 onlineMask = (u64)0;
             if (_sysfs_read("/sys/devices/system/cpu/online", &onlineBuf[0], 256)) {
                 onlineMask = _parse_cpu_list(&onlineBuf[0]);
@@ -639,9 +639,9 @@ if const (__WINDOWS__) {
             int cpu = 0;
             while (cpu < 64) {
                 if ((onlineMask & ((u64)1 << cpu)) == (u64)0) { cpu = cpu + 1; continue; }
-                i8[256] path = default;
+                char[256] path = default;
                 _cpu_path(&path[0], cpu, "topology/thread_siblings_list");
-                i8[256] buf = default;
+                char[256] buf = default;
                 u64 sib = (u64)0;
                 if (_sysfs_read(&path[0], &buf[0], 256)) { sib = _parse_cpu_list(&buf[0]) & onlineMask; }
                 if (sib == (u64)0) { sib = (u64)1 << cpu; }
@@ -668,15 +668,15 @@ if const (__WINDOWS__) {
                 u64 bestMask = (u64)0;
                 int idx = 0;
                 while (idx < 5) {
-                    i8[256] lpath = default;
+                    char[256] lpath = default;
                     _cpu_cache_path(&lpath[0], firstCpu, idx, "level");
-                    i8[64] lbuf = default;
+                    char[64] lbuf = default;
                     if (_sysfs_read(&lpath[0], &lbuf[0], 64)) {
                         int lvl = _parse_int(&lbuf[0]);
                         if (lvl >= 2 && lvl > bestLevel) {
-                            i8[256] spath = default;
+                            char[256] spath = default;
                             _cpu_cache_path(&spath[0], firstCpu, idx, "shared_cpu_list");
-                            i8[256] sbuf = default;
+                            char[256] sbuf = default;
                             if (_sysfs_read(&spath[0], &sbuf[0], 256)) {
                                 u64 sm = _parse_cpu_list(&sbuf[0]);
                                 if (sm != (u64)0) { bestLevel = lvl; bestMask = sm; }
@@ -702,7 +702,7 @@ if const (__WINDOWS__) {
 
             // NUMA nodes: prefer the online-node list (tolerates sparse ids from
             // hotplug, e.g. node0 + node2); fall back to sequential scan-until-missing.
-            i8[256] nodeOnlineBuf = default;
+            char[256] nodeOnlineBuf = default;
             u64 nodeMask = (u64)0;
             if (_sysfs_read("/sys/devices/system/node/online", &nodeOnlineBuf[0], 256)) {
                 nodeMask = _parse_cpu_list(&nodeOnlineBuf[0]);
@@ -711,9 +711,9 @@ if const (__WINDOWS__) {
                 int node = 0;
                 while (node < 64 && topo->numaCount < 8) {
                     if ((nodeMask & ((u64)1 << node)) != (u64)0) {
-                        i8[256] npath = default;
+                        char[256] npath = default;
                         _node_path(&npath[0], node);
-                        i8[256] nbuf = default;
+                        char[256] nbuf = default;
                         if (_sysfs_read(&npath[0], &nbuf[0], 256)) {
                             u64 nm = _parse_cpu_list(&nbuf[0]);
                             if (nm != (u64)0) {
@@ -728,9 +728,9 @@ if const (__WINDOWS__) {
             } else {
                 int node = 0;
                 while (node < 8) {
-                    i8[256] npath = default;
+                    char[256] npath = default;
                     _node_path(&npath[0], node);
-                    i8[256] nbuf = default;
+                    char[256] nbuf = default;
                     if (!_sysfs_read(&npath[0], &nbuf[0], 256)) { break; }
                     topo->numaMask[topo->numaCount] = _parse_cpu_list(&nbuf[0]);
                     topo->numaId[topo->numaCount]   = (i32)node;

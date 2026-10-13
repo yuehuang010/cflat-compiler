@@ -1647,6 +1647,8 @@ public:
         bool InterfaceBoxFrameStorage = false;
         bool InterfaceBoxReturnProvenanceUnknown = false;
         std::string InterfaceBoxFrameStorageClassName;
+        // The boxed pointer is a borrow of an owning local of this frame (its owner is freed at return).
+        bool InterfaceBoxAliasOfOwnedLocal = false;
         // Sticky: set once any binding hands this local a box that is NOT proven, and never cleared.
         // From then on the local can never be rejected - walk order over the AST is not control flow.
         bool InterfaceBoxProvenanceUnknown = false;
@@ -2782,6 +2784,7 @@ private:
         bool FrameStorageProvenance = false;
         bool ProvenanceUnknown = true;
         std::string FrameStorageClassName;
+        bool AliasOfOwnedLocal = false;
     };
     std::unordered_map<llvm::Function*, std::vector<PendingReturnDangleCheck>> pendingReturnDangleChecks_;
 
@@ -2789,10 +2792,12 @@ private:
                                         const std::string& ifaceName,
                                         bool frameStorageProvenance,
                                         bool provenanceUnknown,
-                                        const std::string& frameStorageClassName);
+                                        const std::string& frameStorageClassName,
+                                        bool aliasOfOwnedLocal = false);
 
     void SetInterfaceBoxReturnDangleProvenance(const std::string& name, bool frameStorage,
-                                               bool unknown, const std::string& className);
+                                               bool unknown, const std::string& className,
+                                               bool aliasOfOwnedLocal = false);
 
     // Drop a function's pending return-dangle checks without analyzing them (an aborted body
     // has a partial CFG - same rationale as DiscardNullDerefEvents).
@@ -5701,6 +5706,14 @@ private:
     // This is the predicate for the copy-on-assign flip (copyable owners copy, non-copyable move).
     bool IsCopyableType(const std::string& typeNameIn) const;
 
+    // True when a value of `typeName` may never be moved: [immovable] itself, a by-value field
+    // (incl. fixed-array element) of an immovable type, or a C++ class with deleted move AND copy
+    // constructors. Pointers, aliases and `unique` owners are movable. Walks fields per query.
+    bool IsImmovableType(const std::string& typeNameIn) const;
+    // True only when the operand is provably a fresh value (IsRvalue, not an explicit move). Every
+    // other operand (variables, fields, elements, derefs, ternaries) is a place and copies or moves.
+    bool IsImmovableFreshOperand(const NamedVariable& nv) const;
+
     void LogUniqueCopyError(const std::string& typeName,
                             const std::string& uniquePath = {}) const;
 
@@ -5926,7 +5939,8 @@ private:
      */
     struct UnwindPartialEntry
     {
-        enum class Kind { Value, Slot, Members, CxxHeap, CxxHeapArray, CflatHeap, ArrayPrefix } K;
+        // StaticFlag: a static local's run-once flag (V), cleared so the next entry re-runs its initializer.
+        enum class Kind { Value, Slot, Members, CxxHeap, CxxHeapArray, CflatHeap, ArrayPrefix, StaticFlag } K;
         llvm::Value* V;
         std::string TypeName;
         llvm::Function* Fn;
@@ -6105,6 +6119,8 @@ private:
     // True when the newest failed RequestCxxFunctionTemplate / RequestCxxFreeFunction error is
     // clang's own rejection of the call (its wrapper compiled the full C++ overload set).
     bool LastCxxRequestClangRejected() const { return lastCxxRequestClangRejected_; }
+    // That rejection found no viable candidate AT the infix expression itself (not in a body).
+    bool LastCxxRequestNoViableAtRequest() const { return lastCxxRequestNoViableAtRequest_; }
     // True when the newest RequestCxxFreeBraceCall refused because the list would die early.
     bool LastCxxBraceLifetimeRefused() const { return lastCxxBraceLifetimeRefused_; }
     bool RequestCxxFunctionTemplate(const std::string& functionName,
@@ -6766,6 +6782,7 @@ private:
                                     const std::vector<CRecordEntry>& records,
                                     const std::vector<std::string>& classTemplateNames,
                                     const std::vector<std::pair<std::string, std::string>>& classUsings,
+                                    const std::vector<cflat_cinterop::RawFunctionTemplate>& functionTemplates,
                                     const std::string& fileForLsp);
     bool MakeOpaqueFieldBlob(const CRecordFieldEntry& f, DeclTypeAndValue& out) const;
 
@@ -7067,6 +7084,11 @@ public:
                                                     const TypeAndValue& to) const;
     void RejectImplicitIntegerPointeePointerConversion(const TypeAndValue& from,
                                                         const TypeAndValue& to);
+    // Call matching: the predicate above on the pointers a C++ argument / parameter refer to.
+    bool IsUnrelatedPointeeArgument(const NamedVariable& arg, const FunctionSymbol& candidate,
+                                    size_t index) const;
+    bool CxxOperatorDropsUnrelatedPointee(const std::string& lookupName, const NamedVariable& arg,
+                                          size_t index, const std::string& receiverType) const;
 
     // Look up a closure alias using the same innermost-namespace-first rules as named types.
     const TypeAndValue* FindFunctionTypeAlias(const std::string& name) const;
@@ -8421,7 +8443,7 @@ public:
 
     llvm::Value* CreateExtractValue(llvm::Value* structInstance, unsigned int index);
 
-    llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::Value* destination, bool srcIsUnsigned = false, llvm::Type* explicitDestType = nullptr);
+    llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::Value* destination, bool srcIsUnsigned = false, llvm::Type* explicitDestType = nullptr, bool destUnsigned = false);
 
     llvm::LoadInst* CreateLoad(llvm::Value* value);
 
@@ -8456,7 +8478,8 @@ public:
     static std::string DescribeAggregateStorageShape(llvm::Type* type,
                                                      const std::string& elementTypeName = "");
 
-    llvm::Value* CreateCast(llvm::Value* value, llvm::Type* destType, bool isSigned = false);
+    // destUnsigned: destination is an unsigned integer; a float source then lowers to fptoui.
+    llvm::Value* CreateCast(llvm::Value* value, llvm::Type* destType, bool isSigned = false, bool destUnsigned = false);
 
     llvm::Value* CreateCast(llvm::Instruction::CastOps op, llvm::Value* value, llvm::Type* destType);
 
@@ -8597,7 +8620,7 @@ public:
     // The one place a scalar becomes a vector: convert to the lane type, then splat. Every
     // scalar-into-simd rule (declaration, assignment, return, mixed operand) routes through here.
     llvm::Value* SplatScalarToVectorType(llvm::Value* scalar, llvm::FixedVectorType* vecTy,
-                                         bool srcIsUnsigned = false);
+                                         bool srcIsUnsigned = false, bool destUnsigned = false);
 
     /*
      * Convert a scalar to an exact target scalar type, handling both widening (Upconvert)
@@ -8605,7 +8628,7 @@ public:
      * srcIsUnsigned only steers the WIDENING step; the CreateCast leg keeps its long-standing
      * default so threading the flag through cannot change a narrowing or an int<->float cast.
      */
-    llvm::Value* ConvertScalarToType(llvm::Value* scalar, llvm::Type* target, bool srcIsUnsigned = false);
+    llvm::Value* ConvertScalarToType(llvm::Value* scalar, llvm::Type* target, bool srcIsUnsigned = false, bool destUnsigned = false);
 
     // Reverse-map an IR function to its source-level name for diagnostics.
     // Only called on the error path, so the linear scan is fine.
@@ -9502,7 +9525,8 @@ public:
     bool MaterializeImplicitCxxClassArgument(NamedVariable& arg,
                                              const TypeAndValue& param,
                                              llvm::Value* intoSlot = nullptr,
-                                             bool allowTemplateClassConversion = false);
+                                             bool allowTemplateClassConversion = false,
+                                             bool allowScalarNarrowing = false);
     // Construct `targetType` through the generated C++ constructor wrapper `wrapperName` fed
     // `source`; `arg` becomes the built object (an owned temporary, or `intoSlot` when given).
     void ConstructThroughCxxCtorWrapper(NamedVariable& arg, const NamedVariable& source,
@@ -9522,7 +9546,8 @@ public:
                                                             const std::string& targetType,
                                                             llvm::Value* intoSlot,
                                                             std::string& refusal,
-                                                            bool directInit = false);
+                                                            bool directInit = false,
+                                                            bool allowScalarNarrowing = false);
     // A C++ record with a non-explicit conversion operator to a non-primitive type (libc++
     // `__val_expr::operator valarray<T>()`): copy-initializing a class from it is clang's call.
     bool HasImplicitClassConversionOperator(const std::string& sourceType);
@@ -9556,7 +9581,10 @@ public:
         // A DELETED default constructor is "trivial" to clang (it is not user-provided), so the
         // triviality bit alone would let `T[N] a = default;` zero-fill a class C++ forbids
         // default-initializing at all. Ask so the array path can report it.
-        return !info->hasTrivialDefaultCtor || info->hasDeletedDefaultCtor;
+        if (!info->hasTrivialDefaultCtor || info->hasDeletedDefaultCtor) return true;
+        // T88: a PRIVATE or PROTECTED default constructor is refused the same way, trivial or
+        // not - clang refuses default construction from outside the class.
+        return HasNonPublicCxxDefaultCtor(typeName);
     }
     bool HasUnavailableNestedCxxDefault(const std::string& typeName,
                                         std::string* unavailableType = nullptr,
@@ -9652,13 +9680,15 @@ public:
                                                        std::string& why,
                                                        bool allowNumericConversions = false,
                                                        const std::vector<NamedVariable>* argVars = nullptr,
-                                                       bool allowExplicit = true) const;
+                                                       bool allowExplicit = true,
+                                                       bool allowScalarNarrowing = false) const;
     const CxxClassInfo::Structor* SelectCxxConstructorListed(const std::string& typeName,
                                                              const std::vector<TypeAndValue>& argTypes,
                                                              std::string& why,
                                                              bool allowNumericConversions,
                                                              const std::vector<NamedVariable>* argVars,
-                                                             bool allowExplicit) const;
+                                                             bool allowExplicit,
+                                                             bool allowScalarNarrowing = false) const;
     /*
      * True when `T(args)` must be resolved by clang rather than by SelectCxxConstructor: the
      * class declares a constructor TEMPLATE (never listed as a member), and the listed pick
@@ -9701,7 +9731,8 @@ public:
     CxxArgConversion ClassifyCxxImplicitArgument(const NamedVariable& arg,
                                                  const TypeAndValue& param,
                                                  bool cxxByValueParam,
-                                                 bool allowTemplateClassConversion = false);
+                                                 bool allowTemplateClassConversion = false,
+                                                 bool allowScalarNarrowing = false);
     // Text of the failure note for that verdict, empty unless the conversion is what refused the
     // argument. Shares ClassifyCxxImplicitArgument with the ranking predicate by construction.
     std::string DescribeCxxImplicitArgumentBlock(const NamedVariable& arg,
@@ -10077,8 +10108,13 @@ public:
     // The clang errors and notes behind the newest failed RequestGeneratedCxxWrapper.
     std::string lastCxxWrapperCause_;
     std::string pendingCxxWrapperCause_;
+    // The newest failed RequestGeneratedCxxWrapper's first error is "no viable operator" /
+    // "invalid operands" at the wrapper's own expression (round-trips in the NEG request cache).
+    bool lastCxxWrapperNoViableAtRequest_ = false;
+    bool pendingCxxWrapperNoViableAtRequest_ = false;
     // Set only where a generated call wrapper failed under clang; CFlat-side refusals leave it off.
     bool lastCxxRequestClangRejected_ = false;
+    bool lastCxxRequestNoViableAtRequest_ = false;
     bool lastCxxBraceLifetimeRefused_ = false;
     // True when one line of `diagnostics` names the copy constructor of the class spelled
     // `cxxSpelling` (or a deleted constructor of it): the failure really was that copy.
@@ -11249,6 +11285,13 @@ public:
     // alloca (looks like a movable whole-local), but the caller still owns the buffer.
     // A `move string s` param (IsOwningString) or any owning local is excluded.
     bool IsBorrowStringParamStorage(llvm::Value* storage);
+    bool IsFunctionArgumentStorage(llvm::Value* storage) const;
+    // A struct FIELD address (GEP over a CFlat struct): true when that field owns its pointee,
+    // or when the owner cannot be resolved (safe default).
+    bool IsOwningFieldAddress(const llvm::GetElementPtrInst* fieldAddr) const;
+    bool IsOwningStructField(const std::string& structName, unsigned index) const;
+    // The callee's own ReturnsOwned fact, public for provenance queries (see CalleeReturnsOwned).
+    bool CalleeOwnsReturnFact(const llvm::Function* fn) const { return CalleeReturnsOwned(fn); }
 
     // `returnedLocalStorage`, when provided, is the alloca of the named local being
     // returned (the return expression's NamedVariable.Storage). It lets the struct-return
@@ -11837,7 +11880,9 @@ public:
     // 218: virtual-base conversions go through clang wrappers; system-header class pointers bind
     //      by their spelled class instead of the void* placeholder (T50).
     // 228: macro entries record whether their expanded body is an integer literal zero (T52).
-    static constexpr int kCHeaderCacheVersion = 230;
+    // 232: an anonymous UNION typedef sets "ar" like a struct (T94), so a cached entry must not be
+    //      replayed with the old flag.
+    static constexpr int kCHeaderCacheVersion = 232;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

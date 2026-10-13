@@ -1,0 +1,24 @@
+// [immovable] propagation (T90): a struct with a by-value field of an immovable type is itself
+// immovable, through a fixed-array element and through any depth of nesting. A pointer field does
+// not propagate (positive leg in Test/test_move.cb). Each leg is a scoped expect_error block.
+
+[immovable] struct Pin { int x = 0; };
+struct Outer { Pin pin; int y = 0; };
+struct Arr { Pin items[2]; };
+struct Top { Outer o; };
+
+expect_error("cannot 'move' a value of type 'Outer': the type is [immovable]") {
+    void moveOuter() { Outer a = default; Outer b = move a; }
+}
+
+expect_error("cannot 'move' a value of type 'Arr': the type is [immovable]") {
+    void moveArr() { Arr a = default; Arr b = move a; }
+}
+
+expect_error("cannot 'move' a value of type 'Top': the type is [immovable]") {
+    void moveTop() { Top a = default; Top b = move a; }
+}
+
+expect_error("cannot return a value of [immovable] type 'Outer' by value") {
+    Outer retOuter() { Outer o = default; return o; }
+}

@@ -198,8 +198,8 @@ struct Match
         int ge  = groupEnd(g);
         int len = ge - gs;
         if (len < 0) len = 0;
-        i8* src = input.data();
-        i8* buf = new i8[len + 1];
+        char* src = input.data();
+        char* buf = new char[len + 1];
         int i = 0;
         while (i < len) { buf[i] = src[gs + i]; i++; }
         buf[len] = 0;
@@ -229,7 +229,7 @@ class Regex
     int  _gen      = 0;       // generation counter for per-step thread dedup
 
     // transient parse cursor (valid only during compile())
-    i8*  _src = nullptr;
+    char*  _src = nullptr;
     int  _pos = 0;
     int  _len = 0;
 
@@ -731,14 +731,14 @@ class Regex
     }
 
     // True if position i is in bounds and holds a word byte.
-    bool _wordAt(i8* s, int n, int i)
+    bool _wordAt(char* s, int n, int i)
     {
         if (i < 0 || i >= n) return false;
         return _isWordByte(s[i]);
     }
 
     // Evaluate a zero-width assertion (^, $, or \b) at position pos.
-    bool _assertHolds(int ak, int pos, i8* s, int n)
+    bool _assertHolds(int ak, int pos, char* s, int n)
     {
         if (ak == 0) return pos == 0;
         if (ak == 1) return pos == n;
@@ -748,7 +748,7 @@ class Regex
     // Follow epsilon transitions from `st`, recording captures into `caps` (a
     // width-20 working buffer that is mutated and restored), and appending
     // consume/accept threads to (outStates, outCaps) in priority order.
-    void _addThread(int st, int* caps, int pos, i8* s, int n,
+    void _addThread(int st, int* caps, int pos, char* s, int n,
                     list<int>* outStates, int* outCaps, int* stamp)
     {
         if (st < 0) return;
@@ -785,7 +785,7 @@ class Regex
 
     // Run the VM from start position `sp`. On a match, fill matchCaps and return
     // true. Scratch lists/pools are supplied by the caller and reused.
-    bool _runFrom(int sp, i8* s, int n, int* stamp, int* matchCaps,
+    bool _runFrom(int sp, char* s, int n, int* stamp, int* matchCaps,
                   list<int>* cstates, int* ccaps, list<int>* nstates, int* ncaps)
     {
         int[20] init;
@@ -869,7 +869,7 @@ class Regex
     {
         Match r = default;
         if (!_ok) return r;
-        i8* s = input.data();
+        char* s = input.data();
         int n = input.length();
 
         int[] stamp = _newStamp();
@@ -913,7 +913,7 @@ class Regex
     {
         list<Match> out = default;
         if (!_ok) return move out;
-        i8* s = input.data();
+        char* s = input.data();
         int n = input.length();
 
         int[] stamp = _newStamp();
@@ -951,7 +951,7 @@ class Regex
     // -- replace / split -----------------------------------------------------
 
     // Append bytes [a, b) of s to the builder.
-    void _appendRange(stringbuilder* sb, i8* s, int a, int b)
+    void _appendRange(stringbuilder* sb, char* s, int a, int b)
     {
         int i = a;
         while (i < b) { sb->appendChar(s[i]); i++; }
@@ -960,9 +960,9 @@ class Regex
     // Append `repl` with $0..$9 replaced by captured groups and $$ -> '$'.
     void _appendReplacement(stringbuilder* sb, string repl, Match m, string input)
     {
-        i8* r  = repl.data();
+        char* r  = repl.data();
         int rn = repl.length();
-        i8* s  = input.data();
+        char* s  = input.data();
         int i  = 0;
         while (i < rn)
         {
@@ -990,7 +990,7 @@ class Regex
     move string replace(string input, string repl)
     {
         stringbuilder sb;
-        i8* s = input.data();
+        char* s = input.data();
         int n = input.length();
         list<Match> ms = findAll(input);
         int last = 0;
@@ -1008,11 +1008,11 @@ class Regex
     }
 
     // Return an owning string copy of bytes [a, b) of s.
-    move string _substr(i8* s, int a, int b)
+    move string _substr(char* s, int a, int b)
     {
         int len = b - a;
         if (len < 0) len = 0;
-        i8* buf = new i8[len + 1];
+        char* buf = new char[len + 1];
         int i = 0;
         while (i < len) { buf[i] = s[a + i]; i++; }
         buf[len] = 0;
@@ -1023,7 +1023,7 @@ class Regex
     move list<string> split(string input)
     {
         list<string> out = default;
-        i8* s = input.data();
+        char* s = input.data();
         int n = input.length();
         list<Match> ms = findAll(input);
         int last = 0;

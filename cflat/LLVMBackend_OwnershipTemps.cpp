@@ -656,19 +656,21 @@ void LLVMBackend::RecordPendingReturnDangleCheck(llvm::AllocaInst* slot, int lin
                                         const std::string& ifaceName,
                                         bool frameStorageProvenance,
                                         bool provenanceUnknown,
-                                        const std::string& frameStorageClassName)
+                                        const std::string& frameStorageClassName,
+                                        bool aliasOfOwnedLocal)
 {
         if (!slot || !builder) return;
         llvm::BasicBlock* bb = builder->GetInsertBlock();
         if (!bb || !bb->getParent()) return;
         pendingReturnDangleChecks_[bb->getParent()].push_back(
             { bb->getParent(), slot, line, col, ifaceName, frameStorageProvenance,
-              provenanceUnknown, frameStorageClassName });
+              provenanceUnknown, frameStorageClassName, aliasOfOwnedLocal });
 }
 
 void LLVMBackend::SetInterfaceBoxReturnDangleProvenance(const std::string& name,
                                                          bool frameStorage, bool unknown,
-                                                         const std::string& className)
+                                                         const std::string& className,
+                                                         bool aliasOfOwnedLocal)
 {
         if (name.empty()) return;
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
@@ -679,6 +681,7 @@ void LLVMBackend::SetInterfaceBoxReturnDangleProvenance(const std::string& name,
             it->second.InterfaceBoxReturnProvenanceUnknown = unknown;
             it->second.InterfaceBoxFrameStorageClassName =
                 it->second.InterfaceBoxFrameStorage ? className : std::string();
+            it->second.InterfaceBoxAliasOfOwnedLocal = aliasOfOwnedLocal;
             return;
         }
 }
@@ -5648,6 +5651,10 @@ void LLVMBackend::EmitUnwindPartialRelease(const UnwindPartialEntry& e)
         case UnwindPartialEntry::Kind::Members:
             if (llvm::Function* dtor = GetOrCreateFullDestructor(e.TypeName, /*membersOnly=*/true))
                 builder->CreateCall(dtor->getFunctionType(), dtor, { e.V });
+            return;
+        case UnwindPartialEntry::Kind::StaticFlag:
+            // The initializer threw: the object was never completed, so the next entry retries.
+            builder->CreateStore(builder->getInt8(0), e.V);
             return;
         case UnwindPartialEntry::Kind::CxxHeap:
             EmitCxxHeapFree(e.TypeName, e.V);

@@ -1,0 +1,87 @@
+import cpp "cpp_t85_pointee.hpp";
+
+extern int main()
+{
+    int t85Int = 1;
+    long t85Long = 2;
+    float t85Float = 3.0;
+    expect_error("no overload of 't85p.one' matches the given arguments") {
+        int r1 = t85p.one(&t85Int);
+    }
+    expect_error("no overload of 't85p.lw' matches the given arguments") {
+        int r2 = t85p.lw(&t85Long);
+    }
+    expect_error("no overload of 't85p.ff' matches the given arguments") {
+        int r3 = t85p.ff(&t85Float);
+    }
+    expect_error("no overload of 't85p.cc1' matches the given arguments") {
+        int r4 = t85p.cc1(&t85Int);
+    }
+    expect_error("no overload of 't85p.one' matches the given arguments") {
+        int r5 = t85p.one(&t85Long);
+    }
+    expect_error("no overload of 't85p.oi' matches the given arguments") {
+        int r6 = t85p.oi(&t85Long);
+    }
+    expect_error("no overload of 'take' matches the given arguments") {
+        t85p.M t85M = default;
+        int r7 = t85M.take(&t85Int);
+    }
+    expect_error("no overload of 't85p.M3.stake' matches the given arguments") {
+        int r8 = t85p.M3.stake(&t85Int);
+    }
+    expect_error("has no constructor whose parameter types match these arguments") {
+        t85p.C1 t85C = t85p.C1(&t85Int);
+    }
+    expect_error("no overload of 'operator()' matches the given arguments") {
+        t85p.O1 t85O = default;
+        int r9 = t85O(&t85Int);
+    }
+    expect_error("no overload of 'operator+' matches the given arguments") {
+        t85p.MOp t85Mop = default;
+        int r10 = t85Mop + &t85Int;
+    }
+    expect_error("no overload of 't85p.operator+' matches the given arguments") {
+        t85p.FOp t85Fop = default;
+        int r11 = t85Fop + &t85Long;
+    }
+    expect_error("no overload of 't85p.rf' matches the given arguments") {
+        int r12 = t85p.rf(&t85Int);
+    }
+    // Round 3: `double*&&`, a reference-returning `int*&` / `int**&` source, a compound operand.
+    expect_error("no overload of 't85p.rr' matches the given arguments") {
+        int r13 = t85p.rr(&t85Int);
+    }
+    int* t85Ip = &t85Int;
+    int** t85Ipp = &t85Ip;
+    expect_error("no overload of 't85p.takeD' matches the given arguments") {
+        int r14 = t85p.takeD(t85p.src(t85Ip));
+    }
+    expect_error("no overload of 't85p.takeDD' matches the given arguments") {
+        int r15 = t85p.takeDD(t85p.srcpp(t85Ipp));
+    }
+    expect_error("no overload of 'operator+=' matches the given arguments") {
+        t85p.Acc t85Acc = default;
+        t85Acc += &t85Int;
+    }
+    // Round 4: after the double* drop clang finds the rest ambiguous (member vs free template,
+    // two free templates); that refusal stands instead of a CFlat pick of void* / double*.
+    expect_error("clang: use of overloaded operator '+' is ambiguous") {
+        t85p.amb.A t85Amb = default;
+        int r16 = t85Amb + &t85Int;
+    }
+    expect_error("clang: use of overloaded operator '+' is ambiguous") {
+        t85p.amb.F t85FAmb = default;
+        int r17 = t85FAmb + &t85Int;
+    }
+    // Round 5: the selected template's body fails; clang's text is relayed, not CFlat's void*.
+    expect_error("clang: invalid operands to binary expression ('int *' and 'int *')") {
+        t85p.body.A t85BodyA = default;
+        int r18 = t85BodyA + &t85Int;
+    }
+    expect_error("clang: static assertion failed due to requirement 'sizeof(int) == 0': invalid operands") {
+        t85p.body.B t85BodyB = default;
+        int r19 = t85BodyB + &t85Int;
+    }
+    return 0;
+}

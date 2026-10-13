@@ -57,10 +57,10 @@ struct AppInfo {
 
 // Compiler-provided constants. The backend defines these four globals at the end of codegen
 // from the `application` declaration, and to the empty string when there is none.
-extern i8* __cflat_app_name;
-extern i8* __cflat_app_version;
-extern i8* __cflat_app_identifier;
-extern i8* __cflat_app_copyright;
+extern char* __cflat_app_name;
+extern char* __cflat_app_version;
+extern char* __cflat_app_identifier;
+extern char* __cflat_app_copyright;
 // 1 when the program carries an `application` declaration, 0 otherwise.
 extern int __cflat_app_declared;
 

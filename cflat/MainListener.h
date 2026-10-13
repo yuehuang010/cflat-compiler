@@ -3740,6 +3740,13 @@ public:
 
 struct FoldConstructedValueState;
 
+/*
+ * Where a pointer value's storage root sits (MainListener::PointerRootKind). Ordered by how
+ * much the root is a problem for an interface return; Undecided is "cannot tell" (refuses for
+ * arithmetic, accepted by the return-dangle check).
+ */
+enum class PointerValueRootKind { Borrowed, Undecided, Owned, OwnedLocal, AliasOfOwnedLocal, FrameLocal };
+
 class MainListener : public CFlatBaseListener
 {
 private:
@@ -4898,6 +4905,8 @@ public:
         llvm::Instruction* FlagCmp = nullptr;
         llvm::Instruction* CondBr = nullptr;
         llvm::Instruction* FlagStore = nullptr;
+        // Unwind-partial stack depth before this guard's StaticFlag entry; Close pops back to it.
+        size_t UnwindMark = 0;
     };
     void OpenStaticLocalGuard(StaticLocalGuard& guard, const std::string& varName);
     void CloseStaticLocalGuard(StaticLocalGuard& guard, const std::string& varName);
@@ -5813,7 +5822,10 @@ public:
      * frame-local arm is the worse defect and has its own unconditional diagnostic later on the
      * return path, so that shape is handed to it rather than blamed on ownership here.
      */
-    bool ReturnLeaksOwnershipIntoInterface(llvm::Value* right, LLVMBackend* compiler);
+    bool ReturnLeaksOwnershipIntoInterface(llvm::Value* right, LLVMBackend* compiler, bool pointerArithmetic = false);
+    bool PointerArithmeticRootLeaks(llvm::Value* value, LLVMBackend* compiler);
+    // Classifies the storage root of a pointer value (GEPs and casts stripped, aliases followed).
+    PointerValueRootKind PointerRootKind(llvm::Value* value, LLVMBackend* compiler);
 
     // One arm of an interface-bound join: the incoming value and the predecessor block whose
     // terminator the arm's box is emitted before.
@@ -7155,6 +7167,9 @@ public:
         CFlatParser::ConditionalExpressionContext* ctx);
 
     LLVMBackend::NamedVariable ParseMoveExpression(CFlatParser::MoveExpressionContext* ctx);
+    // [immovable] assignment source refusal; true after logging. Shared by the assignment sites.
+    bool RefuseImmovableAssignSource(LLVMBackend* compiler, antlr4::ParserRuleContext* ctx,
+                                     const std::string& operatorText, const LLVMBackend::NamedVariable& rightNV);
 
     LLVMBackend::NamedVariable ParseOperatorStringExpression(CFlatParser::OperatorStringExpressionContext* ctx);
 

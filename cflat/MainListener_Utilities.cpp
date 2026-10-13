@@ -169,11 +169,26 @@ LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNu
 
         // Extract numeric part and suffix carefully.
         size_t suffixPos = s.size();
+        bool hexFloat = false;
         if (isHex)
         {
-            // For hex, scan forward from the "0x" prefix to include all hex digits
+            // Hex digits and '.', then an optional binary exponent (p/P, sign, decimal digits). The
+            // exponent makes the literal floating (C: 0x1p-2f); the rest is the suffix (f/F/l/L).
             size_t idx = 2; // skip 0x
-            while (idx < s.size() && std::isxdigit(static_cast<unsigned char>(s[idx]))) ++idx;
+            while (idx < s.size() && (std::isxdigit(static_cast<unsigned char>(s[idx])) || s[idx] == '.')) ++idx;
+            if (idx < s.size() && (s[idx] == 'p' || s[idx] == 'P'))
+            {
+                hexFloat = true;
+                ++idx;
+                if (idx < s.size() && (s[idx] == '+' || s[idx] == '-')) ++idx;
+                while (idx < s.size() && std::isdigit(static_cast<unsigned char>(s[idx]))) ++idx;
+            }
+            else
+            {
+                // No exponent: integer digits only. A '.' here is refused by the caller (LogError).
+                idx = 2;
+                while (idx < s.size() && std::isxdigit(static_cast<unsigned char>(s[idx]))) ++idx;
+            }
             suffixPos = idx;
         }
         else
@@ -202,9 +217,10 @@ LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNu
 
         // For hex literals, 'e'/'E' are valid hex digits, not exponent markers.
         // Only treat e/E as a float indicator for decimal/non-hex numbers.
-        bool looksFloat = (numberPart.find('.') != std::string::npos) ||
+        bool looksFloat = hexFloat || (numberPart.find('.') != std::string::npos) ||
             (!isHex && numberPart.find('e') != std::string::npos) ||
             (!isHex && numberPart.find('E') != std::string::npos);
+
 
         // Floating point handling
         if (hasF || hasD || looksFloat)
@@ -217,17 +233,23 @@ LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNu
             const char* cstr = numberPart.c_str();
             char* end = nullptr;
 
+            // Hex floats keep an overflow as inf (clang: 0x1p2000 is double inf, 0x1p200f is float inf);
+            // a decimal overflow stays 0 as before.
             if (hasF)
             {
                 float f = std::strtof(cstr, &end);   // explicit 'f' suffix -> float
-                if (end == cstr || std::isinf(f)) return 0.0;
+                if (end == cstr || (!hexFloat && std::isinf(f))) return 0.0;
                 return f;
             }
 
             double dval = std::strtod(cstr, &end);
-            if (end == cstr || std::isinf(dval)) return 0.0;
+            if (end == cstr || (!hexFloat && std::isinf(dval))) return 0.0;
             if (hasD)
                 return dval;                         // explicit 'd' suffix -> double
+            // Hex float (C: 0x1p-2 is double): unsuffixed -> double. l/L takes the decimal rule below
+            // (CFlat has no long double literal; decimal 0.25l is f32 too).
+            if (hexFloat && lCount == 0)
+                return dval;
 
             // No suffix: mirror the integer rule (pick the smallest type that holds the
             // value exactly). Use float if the literal round-trips through float without

@@ -61,20 +61,22 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 | Run | Branch | Issue(s) | Notes |
 |-----|--------|----------|-------|
+| T89 | fix/t89-charstage2 | p2/integer-pointee-pointer-conversion-accepted (Q3 stage 2) | Haiku r2 (rebased on T85) |
+| T95 | fix/t95-opunary | OPUNARY (deref-after-t47 + xvalue deref; d7 item 10 optional) | Haiku r1 |
+| T96 | fix/t96-literal | LITERAL | Haiku r1 |
 
 
 ## A - crashes, asserts, link failures
 
 | Run | Issue(s) | Site | Notes |
 |-----|----------|------|-------|
-| A3 | p3/cpp-incremental-retry-after-failed-parse-crashes | ModuleBuilder / IncrementalAction GenModule | latent (t14-t16, t31 cold retries); known trigger closed. Same subsystem as A1 - run AFTER A1 lands |
+| A3 | p3/cpp-incremental-retry-after-failed-parse-crashes | ModuleBuilder / IncrementalAction GenModule | latent (t14-t16, t31 cold retries); known trigger closed. A1 landed 2026-09-29; run after TOPSTMT (same incremental action) |
 
 ## B - wrong value / wrong overload pick
 
 | Run | Issue(s) | Site | Notes |
 |-----|----------|------|-------|
 | - | p3/cpp-class-xvalue-pointer-conversion-not-invoked | same-class C* door | conversion operator accepted but not called (clang 73, CFlat 31); template C*/void* ambiguity accepted; T70 reviews 3-4, pre-existing |
-| - | p3/ternary-of-int-literals-typed-long | ternary result typing | `k ? 5 : 6` typed long -> template deduces T=long (T54 review 2, pre-existing) |
 | - | p3/cpp-ctor-template-overload-and-copyinit-gaps | C++ ctor-template ranking | unnamed-enum source picks int ctor; non-const trivially-copyable lvalue copy-init skips U&& template (T54 review, pre-existing) |
 | - | p3/cpp-ternary-arith-type-at-ctor-and-assign-operator | ternary typing at C++ ctor arg / operator=(T) | rv.C(k ? 5 : 6) and operator=(T) deduce signed char, clang int (T55 review, pre-existing; AFTER T55) |
 | - | p3/same-named-local-enums-in-two-functions-collide | local enum registry keying (non-generic) | two functions with `enum E` refused as already defined; local shadowing file-scope enum refused (T60 review, pre-existing; AFTER T60) |
@@ -92,12 +94,13 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 | - | p3/cpp-reference-member-leftovers-after-t47 | ref members | designated init refused; const array-ref member write accepted; const C& result ranks C& first (T47 reviews, pre-existing) |
 | - | p3/unary-deref-leftovers-after-t47 | unary `*` | fixed array of C++ records, implicit `operator C*()`, plain CFlat struct (verifier failure) (T47 review 4, pre-existing) |
 | - | p3/function-ptr-c-abi-leftovers-after-t77 | function<> C ABI | short callback return at -O2; extern `move T*` count lost (T77 review 2, pre-existing) |
-| - | p2/cpp-null-constant-ctor-overload-wrong-pick | C++ ctor overload | literal 0 picks (short,int) over (int*,double); clang picks pointer (T78 review 3, pre-existing) |
-| - | p2/double-to-unsigned-above-int-max-wrong-value | casts | (unsigned) of a double > INT_MAX wrong value, likely fptosi (T78 round 2b, pre-existing) |
+| - | p2/cpp-null-constant-ambiguous-ctor-accepted | C++ ctor overload | S7(long)/S7(void*) with literal 0 accepted, clang ambiguous (T87, pre-existing) |
+| - | p3/cpp-nonliteral-zero-to-integral-ctor-refused | scalar-reference mirror | '\0' / false / enum zero / 1-1 / variable zero refused, clang picks integral ctor (T87 review 2, pre-existing) |
+| - | p3/cpp-brace-init-null-constant-pointer-ctor-refused | brace selector | C{0, 1.5} refused, clang picks pointer ctor (T87 review 1, pre-existing) |
 | - | p3/cpp-ctor-template-viability-not-clang-selected | C++ ctor narrowing | template constraints / failed deduction not seen; validate clang-selected ctor (T78 reviews 2-5) |
 | - | p3/cpp-inline-variadic-function-undefined-symbol | C++ interop link | inline variadic header function never emitted (T78 round 2b, pre-existing) |
 | - | p3/cpp-named-scalar-lvalue-to-rvalue-ref-param-refused | C++ call args | int lvalue -> double&& refused by ownership checks (T78 review 3, pre-existing) |
-| - | p3/hex-float-literal-lowered-as-integer | hex float literal (0x1p-2f) | read as the integer before '.'/'p'; clang 0.25, CFlat 1 (T76 review 3, pre-existing) |
+| - | p3/floating-literal-long-double-suffix-and-decimal-overflow | ParseNumberConstant float suffix / overflow | `0.25l` typed float (clang long double); `1e400` folds to 0 (clang inf) (T86, pre-existing) |
 | - | p3/native-brace-init-no-narrowing-check | native brace init | `int[1] a = {0xFFFFFFFF}` / `u8[1] b = {300}` accepted; clang narrowing error (T76, pre-existing) |
 | - | p3/cpp-class-global-brace-initializer-refused | global `std.vector<int> gv{1,2,3};` | refused with misleading message; T63 review 2, pre-existing |
 | - | p3/cpp-variadic-function-inline-body-link-failure | inline C++ variadic fn | `vsum(int, ...)` with inline body fails to link; T58 review 4, pre-existing |
@@ -129,7 +132,9 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 | Run | Issue(s) | Site | Notes |
 |-----|----------|------|-------|
-| - | p2/cpp-global-trivial-private-default-constructor-accepted | CxxElementNeedsDefaultConstruction | direct global C++ array with private trivial default ctor accepted; clang refuses (T74 review 1, pre-existing) |
+| - | p3/cpp-conflict-check-variable-template-and-split-explicit-spec | CheckCxxNamespaceConflicts | struct vs variable template accepted (clang refuses); explicit spec in a second header refused (T94 review 1, pre-existing) |
+| - | p3/cpp-operator-template-set-ambiguity-without-drop-accepted | C++ operator ranking | free-only ambiguous operator template set with no dropped candidate accepted (clang ambiguous); int*/void*/template no-drop case (T85 reviews 3-4, pre-existing) |
+| - | p2/iface-return-dangle-via-calls-aggregates-and-rebinds | interface return provenance | call-returned borrows, alias stored into an aggregate, conditional rebind of an iface local - all UAF (T91 reviews 1-2, pre-existing) |
 | - | p3/cpp-virtual-dtor-invalid-operator-delete-accepted | CxxIncrementalGroup.cpp LazyBodies | deleted/private/ambiguous op delete of a skipped virtual dtor body never diagnosed (T50-win review, pre-existing) |
 | - | p3/macro-constant-treated-as-lvalue | macro provenance / lvalue checks | &M, M = 5, int& binds macro global, ov picks int& (T52 review, pre-existing; run AFTER T52) |
 
@@ -137,7 +142,11 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 | Run | Issue(s) | Site | Mode |
 |-----|----------|------|------|
-| - | p3/binary-literal-integer-suffix-refused | CFlat.g4 BinaryConstant | `0b1u` / `0b1ULL` syntax error; C23/C++14 accept (T76 review 2, pre-existing) |
+| - | p3/cpp-class-assign-from-scalar-narrowing-refused | C++ class assignment RHS conversion | `e = i` through a narrowing converting ctor refused (copy-init accepts since T92); ambiguous copy-init hint misleading (T92 review 2, pre-existing) |
+| - | p3/cpp-static-local-derived-to-base-and-lvalue-ternary-copies | static-local C++ init | derived-to-base static refused with array-decay text; lvalue-arm ternary static skips the copy ctor; temp dtor exception not propagated (T93 review 1, pre-existing) |
+| - | p2/generic-list-add-overload-lost-with-second-instantiation | generic overload registry | list<P>.add refused when list<unique<Res>> is instantiated in the same function (T90 review 2, pre-existing) |
+| - | p3/default-argument-to-by-value-struct-param-no-overload | overload resolution of `default` | take(default) to a by-value struct param finds no overload (T90 review 2, pre-existing) |
+| - | p3/iface-return-arith-on-borrowed-indirect-call-refused | PointerValueDerivesFromOwner | `return i.peek() + 1;` / `fp() + 1` refused (indirect call = unknown ownership), misleading leak text (T81 review 5) |
 | - | p3/cpp-const-char-pointer-explicit-class-cast-refused | cast wrapper spelling | imported const char* spelled char* at an explicit class cast; T75 review 3 |
 | - | p3/cpp-fixed-char-array-explicit-class-cast-refused | explicit cast of char[N] | non-literal fixed char array cast to class refused; clang picks char*; T75 review 1, pre-existing |
 | - | p3/cpp-null-macro-and-nullptr-spellings-refused | null-constant classifier + converting ctor | full; NULL/__null/nullptr macros, nullptr -> std::function (T52 review, pre-existing; AFTER T52) |
@@ -190,7 +199,7 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 |---|---|---|---|
 | N1 | p2/byvalue-param-owning-leftovers-after-b13 | By-value owning param leftovers after B13 | NEW 2026-09-29 |
 | N3 | p2/cpp-const-object-nonconst-member-call-writes-readonly | loop back-edge const-pointer dataflow, virtual-base twin | W13 landed const auto copy, const globals, const-pointer overload selection 2026-09-30; rest open |
-| N7 | p2/o2-builtin-folding-overrides-cflat-definitions | test_cpp_interop.cb still fails at -O2 (non-unwind leftovers) | NEW 2026-09-29 |
+| N7 | p2/o2-builtin-folding-overrides-cflat-definitions | test_cpp_interop.cb still fails at -O2: item 2 legs landed T82; leg 3411 (VrParam move reassignment) exits 83, cause open | NEW 2026-09-29 |
 | N9 | p3/cpp-assign-operator-route-leftovers | C++ assignment operator route leftovers | NEW 2026-09-29 |
 | N10 | p3/cpp-brace-argument-backing-remaining-shapes | Brace-list backing: optional constructor parameter case remains | NEW 2026-09-29 |
 | N12 | p3/cpp-conversion-operator-receiver-leftovers | C++ conversion-operator receiver and class-result leftovers | NEW 2026-09-29 |
@@ -239,7 +248,6 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 | Issue | DISABLED case | Summary |
 |---|---|---|
 | p3/cpp-reference-param-conversion-gaps-after-t42 | (C++ interop) | template ctor from non-template source, inherited operator X(), operator X&/X&& into C++ ref params refused (clang accepts; T42 follow-up) |
-| p2/pointer-to-unrelated-primitive-pointee-accepted | (none) | single g(double*) accepts int* silently (clang refuses); confirm integer-pointee ruling extends to floating pointees |
 | p3/cpp-template-deduction-identifier-with-e-read-as-double | (C++ interop) | `1 + abcer + 1` deduces double (text-classified literal); fix by source type, never text |
 | p3/static-auto-prvalue-and-copy-initializer-storage | (none) | `static auto g = make();` / `= s;` stack storage + per-call destruction (T45 fixed only the xvalue arm) |
 | p3/enum-class-assignment-from-wrapped-enum-cast | (C++ interop) | `o = (E(x))` / `o = g(E(x))` / macro-wrapped refused into a class with an enum ctor; classify by value identity, not text; T53 batch attempt dropped 2026-10-06 (not one-site, more wrappers) - FULL mode |
@@ -256,7 +264,7 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 | Ruling | Issue | Work |
 |---|---|---|
 | Q2 | p3/alias-return-byvalue-param-leftovers-after-b21 | item 5 ratified (extern C callee owns by-value params) - no code |
-| Q3 | p2/integer-pointee-pointer-conversion-accepted | char family: stage 1 retype core text APIs to char*, stage 2 block i8* <-> char* |
+| Q3 | p2/integer-pointee-pointer-conversion-accepted | char family: stage 1 LANDED T83 (core text APIs char*, 0 core sites); stage 2 block i8* <-> char* (43 user sites to cast) |
 | Q4 | p2/lowered-cxx-field-structs-in-containers-and-array-fields | test_move recv_temp_snapshot leak count may go down |
 | Q8 | p4/immovable-attribute | `[immovable]` surface approved as proposed - buildable |
 | Q9 | p4/three-way-comparison-operator | `<=>` in the CFlat language RULED 2026-10-02, plus defaulted member-wise `==` - buildable (result type without <compare> follows C++ unless told otherwise) |
@@ -265,14 +273,60 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 | Issue | Ruling |
 |---|---|
-| p2/pointer-to-unrelated-primitive-pointee-accepted | refuse unrelated primitive pointees (int* -> double*) on the single-candidate path |
-| p2/o2-builtin-folding-overrides-cflat-definitions (item 2) | -O2 may omit global new[]/delete[]; rewrite counter legs, no IR change |
-| p3/iface-return-pointer-arithmetic-refused | accept `return t + 1;` into an interface; edit the backstop leg (T36 follow-up) |
+
+## Grouped runs 2026-10-10 (ranked; source scratch/issue_groups_2026-10-10.md)
+
+Regrouping of every open p1-p3 issue not in flight, parked, plan-owned or ruling-gated. Score = value / (complexity x risk),
+value 1.5 per p2 + 1 per p3; C = S/M/L, R = L/M/H (H = C++ overload / CInterop wrappers / request cache / ownership, or torch).
+Cheap = fits a Haiku implementer (anchored, risk L-M). Sites marked (u) come from issue text only - confirm by grep before the run.
+The A-H sections above stay the per-issue record; schedule from this table.
+
+| # | Run | C/R | Issues | Shared site / root cause | Not concurrent with | Cheap |
+|---|-----|-----|--------|--------------------------|---------------------|-------|
+| 1 | DIAG-TEXT | M/L | p3/cpp-ctor-refusal-text-gaps-after-w11, p3/cpp-private-base-instance-member-diagnostics, p3/cpp-demand-second-use-of-failed-helper-generic-text, p3/cpp-default-wrapper-tie-list-shows-wrapper-shape, p3/cpp-sink-refusal-cause-lost-under-harvest-suppression, p3/cpp-per-group-static-refusal-hint | shared KIND only (relayed clang / refusal text); no shared function (u) - may split into 2 runs | F1 | yes |
+| 2 | STATIC-INIT | M/M | p3/static-local-init-guard-set-before-throwing-initializer, p3/cpp-explicit-static-ctor-call-initializer-refused, p3/global-default-spelling-zeroes-without-the-note, p3/cpp-class-global-brace-initializer-refused | MainListener_Declarations.cpp static/global init arms (EmitCxxStructorCall ~6475, GenerateDefaultValue global arm ~1620) | - | yes |
+| 3 | NULLCTOR | M/H | p2/cpp-null-constant-ambiguous-ctor-accepted, p3/cpp-nonliteral-zero-to-integral-ctor-refused, p3/cpp-brace-init-null-constant-pointer-ctor-refused, p3/cpp-null-macro-and-nullptr-spellings-refused | C++ ctor null-constant selection: scalar-reference mirror (CInterop ~15375), SelectCxxConstructorListed (~26846), RequestCxxBraceConstructor | NULLPTR-T, CTOR-VIABILITY, PTRRANK, CTOR-BRACE, CONSTMACRO | no |
+| 4 | NSLOOKUP | M/M | p3/cpp-anonymous-typedef-struct-in-namespace-not-found, p3/cpp-struct-identity-underscore-namespace, p3/cpp-namespace-conflict-check-leftovers | CheckCxxNamespaceConflicts + struct identity canonicalization (CInterop) | - | yes, careful on identity |
+| 5 | OPUNARY | M/M | p3/cpp-unary-operator-leftovers-after-d7, p3/unary-deref-leftovers-after-t47, p3/cpp-member-call-on-deref-of-xvalue-refused | unary `*` in ParseUnaryExpression (MainListener_PostfixExpression.cpp) | D2/D3 operator dispatch, CONVOP | yes |
+| 6 | MOVEPARAM | M/H | p2/byvalue-param-owning-leftovers-after-b13, p2/unique-field-heap-array-through-move-param, p3/lowered-struct-byvalue-pass-no-moved-diagnostic | move / by-value owning param at the callee boundary (u) | NEWTEMP, BORROW-PROV | no (Opus reviewer) |
+| 7 | NULLPTR-T | M/H | p3/cpp-nullptr-t-free-function-and-void-pointer-gaps, p3/cpp-nullptr-t-variable-free-operator-operand, p3/cpp-nullptr-into-const-nullptr-t-ref-passes-null-reference, p3/cpp-nullptr-t-returns-and-deduction | null classifier IsNullPointerConstantArgument + free-operator operand path | NULLCTOR (run after it) | no |
+| 8 | PTRRANK | M/H | p3/cpp-pointer-argument-prefers-char-pointer-over-converting-ctor, p3/cpp-single-level-pointer-unproven-at-call-argument, p3/cpp-operator-address-of-operand-not-converted, p3/cpp-pointer-depth-and-array-pointer-param-gaps | CompareUpconvert (Overloads), IsProvenPrimitiveSinglePointerArg (CInterop), TryBinaryOperatorOverload (supersedes old B3 row) | T89 in flight (same predicate) - after it lands | no |
+| 9 | FIELDCTOR | M/M | p2/cpp-class-field-default-construction-leftovers-after-v20, p3/cpp-field-given-in-brace-init-also-default-constructed | field initializer lowering, MainListener_Aggregates.cpp (u) | - | yes |
+| 10 | CLIBNAME | M/M | p2/o2-builtin-folding-overrides-cflat-definitions (item 1), p3/core-defines-externally-visible-libc-functions | core defines libc names that LLVM folds as builtins | RULING first (nobuiltin on CFlat bodies) | after ruling |
+| 11 | LITERAL | S/M | p3/floating-literal-long-double-suffix-and-decimal-overflow | ParseNumberConstant | - | yes |
+| 12 | CONSTMACRO | M/M | p3/macro-constant-treated-as-lvalue, p3/cpp-brace-element-enum-and-macro-constants-not-constant | macro provenance (ParseIdentifier) + brace-list constant classification | NULLCTOR (brace selector) | yes |
+| 13 | NEWTEMP | M/H | p3/mixed-ternary-bare-new-call-arg-leaks, p3/ternary-arm-address-into-new-temp-leaks-outside-calls, p3/null-safe-member-on-new-temp-leaks | owned new-temp ledger: FinishTernaryArm, FlushOwnedTempsSince / ClaimOwnedPtrTempsUnder | E3, VIEWJOIN | no (Opus) |
+| 14 | CONVOP | M/H | p3/cpp-conversion-operator-copy-init-gaps, p3/cpp-conversion-operator-receiver-leftovers, p3/cpp-class-xvalue-pointer-conversion-not-invoked | C++ conversion-operator call path (u) | D2/D3, OPUNARY | no |
+| 15 | ASSIGN | M/H | p3/cpp-assign-operator-route-leftovers, p3/cpp-assignment-result-leftovers-after-b9, p3/cpp-nested-member-class-free-return-and-call-result-assign | C++ assignment route + class-result receivers (u) | T92 in flight (operator=(T)) | no |
+| 16 | REFPARAM | M/H | p3/cpp-reference-param-conversion-gaps-after-t42, p3/cpp-named-scalar-lvalue-to-rvalue-ref-param-refused, p3/cpp-reference-member-leftovers-after-t47 | conversions into C++ reference params (u) | REFBIND pair, CTOR-VIABILITY | no |
+| 17 | TOPSTMT | M/H | p2/cpp-header-namespace-expression-statement-segfault, p3/cpp-header-global-statement-accepted | top-level-statement token predictor, CxxIncrementalGroup.cpp | A3, VIRTBODY | no |
+| 18 | CTOR-VIABILITY | L/H | p3/cpp-ctor-template-viability-not-clang-selected, p3/cpp-ctor-ranking-leftovers, p3/cpp-ctor-template-overload-and-copyinit-gaps, p3/cpp-pointer-ref-overload-ctor-and-direct-member-ranking | CxxCtorSetRequiresNarrowing + ctor wrappers | NULLCTOR, REFPARAM | no |
+| 19 | CTOR-BRACE | M/H | p3/cpp-brace-ctor-enum-element-overload-choice, p3/cpp-initializer-list-only-class-empty-braces-refused | brace selector, CxxArithIdentity (CInterop ~9116) | NULLCTOR, T92 | no |
+| 20 | FNWRAP | L/H | p2/cpp-forwarded-fnptr-variable-or-closure-dangles-in-wrapper-frame, p2/cpp-capturing-closure-to-std-function | wrapper-frame slot for fnptr/closure into C++ T&& (RequestCxxFunctionTemplate) | ELIDE (P2 plan) | no |
+| 21 | CACHE-VALID | M/H | p3/cxx-request-cache-trusts-equal-mtime-and-size, p3/cpp-wrapper-rejection-cache-keyed-by-text-only | request-cache validity key | CACHE-KEY | no |
+| 22 | CHUNK | M/H | p3/cpp-demand-chunk-order-numbering-per-interpreter, p3/cpp-default-wrapper-batch-chunk-stores-stripped-prefix | chunk store, CxxIncrementalGroup ParseRequest | CACHE-KEY, TOPSTMT | no |
+| 23 | VIRTBODY | M/H | p3/cpp-virtual-dtor-invalid-operator-delete-accepted, p3/cpp-invalid-virtual-body-link-failure | LazyBodies::Skip (CxxIncrementalGroup.cpp); 2nd site (u) | TOPSTMT | no |
+| 24 | VARLINK | M/H | p3/cpp-inline-variadic-function-undefined-symbol, p3/cpp-variadic-function-inline-body-link-failure | inline variadic definition never emitted (u) | W13b | no |
+| 25 | CONSTTWIN | M/H | p3/cpp-const-twin-overloads-collapse, p3/cpp-constrained-twin-default-argument-ranking | RegisterCxxClassMembers (~22175) dedupe keeps the non-const twin | CONSTPOINTEE pair | no |
+| 26 | SRCTYPE | L/H | p3/cpp-template-deduction-identifier-with-e-read-as-double, p3/auto-local-of-arithmetic-takes-cflat-width-type-at-cpp-calls, p3/cpp-template-ctor-deduction-enum-and-arith-rvalue | source type not propagated into C++ call construction (CxxArithIdentity) | T92 in flight - after it lands | no |
+| 27 | CACHE-KEY | L/H | p3/cpp-wrapper-request-group-omits-type-dependencies, p3/cpp-wrapper-request-misses-template-argument-headers, p3/cpp-candidate-tier-differs-cold-vs-warm | RequestGeneratedCxxWrapperUncached, CandidateCxxGroupsFor; partial patch scratch/repro_keep/t70_groupfix.patch | G2, CACHE-VALID | no |
+| 28 | BORROW-PROV | L/H | p2/delete-borrow-via-named-local, p3/consolidate-named-variable-borrow-provenance | borrow provenance of named variables through helpers (silent UAF) | MOVEPARAM; design first | no |
+
+Pairs (take together when scheduled): CONSTPOINTEE = p3/cpp-callback-pointee-const-ranking-gaps + p3/cpp-typed-null-operand-loses-pointee-const-in-operator-ranking;
+CASTWRAP = p3/cpp-const-char-pointer-explicit-class-cast-refused + p3/cpp-fixed-char-array-explicit-class-cast-refused;
+REFBIND = p2/cpp-pointer-reference-ctor-param-binds-temporary + p3/cpp-ternary-of-pointer-lvalues-at-reference-param-binds-copy (same symptom, different sites - one run, two fixes);
+VIEWJOIN = p3/owning-view-ternary-mixed-arm-flag + p3/raw-pointer-join-into-array-view-param-accepted.
+Cheap singletons (S, risk L): p3/test-err-discover-command-line-overflow, p3/os-abstraction-process-cb-not-converted, p3/native-brace-init-no-narrowing-check,
+p3/pointer-to-number-diagnostic-hint-leftovers, p3/view-element-gate-diagnostic-gaps. Full singleton list with C/R: scratch/issue_groups_2026-10-10.md section 2.
+Overload/ctor selection family (never two at once): NULLCTOR, NULLPTR-T, PTRRANK, CTOR-VIABILITY, CTOR-BRACE, CONSTTWIN, CONSTPOINTEE.
+Stale references found by the regroup: the std_full table names p3/static-auto-prvalue-and-copy-initializer-storage, which has no issue file (fixed or never filed - verify);
+A3's "after A1" condition is met (A1 landed 2026-09-29).
 
 ## Parked - needs a maintainer ruling before any work
 
 | Issue | Question |
 |-------|----------|
+| p3/immovable-cflat-struct-factory-return | Fresh by-value return of an [immovable] CFlat struct with guaranteed in-place construction (C++17-like)? T90 refuses every by-value return; C++ immovable classes accept fresh operands |
 | p3/cflat-unique-dot-dispatches-to-pointee-member | `.` on CFlat unique<T>: prefer unique's own members (like C++ smart pointers after T46) or keep forwarding? |
 | p4/string-functional-construction-spelling | p4: spelling ruling needed |
 

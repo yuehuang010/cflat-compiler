@@ -311,7 +311,7 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                     compiler->LogWarning(std::format(
                         "implicit narrowing to '{}' in field '{}' - use an explicit cast",
                         SpellType(*compiler, field), field.VariableName));
-                rvalue = compiler->CreateCast(rvalue, destType);
+                rvalue = compiler->CreateCast(rvalue, destType, false, field.IsUnsignedInteger() != -1);
             }
         }
         if (rvalue->getType() == destType)
@@ -1579,7 +1579,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                                         "implicit narrowing to '{}' in field '{}' - use an explicit cast",
                                         SpellType(*compiler, declList[structIndex]),
                                         declList[structIndex].VariableName));
-                                rvalue = compiler->CreateCast(rvalue, destType);
+                                rvalue = compiler->CreateCast(rvalue, destType, false,
+                                    declList[structIndex].IsUnsignedInteger() != -1);
                             }
                         }
                         structVal = compiler->CreateInsertValue(structVal, rvalue, structIndex);
@@ -1816,6 +1817,7 @@ void MainListener::EmitUnionDefaultConstructorBody(
         }
 
         bool unionFieldSrcUnsigned = false;
+        bool unionFieldDestUnsigned = false;
         llvm::Value* rvalue = nullptr;
         llvm::Type* fieldType = nullptr;
         if (chosen < declList.size())
@@ -1832,6 +1834,7 @@ void MainListener::EmitUnionDefaultConstructorBody(
             else
                 rvalue = GenerateDefaultValue(tv);
             fieldType = compiler->GetType(tv);
+            unionFieldDestUnsigned = tv.IsUnsignedInteger() != -1;
         }
 
         // A zero value covers every byte the chosen field does not; the field is then written at
@@ -1844,7 +1847,7 @@ void MainListener::EmitUnionDefaultConstructorBody(
         }
         auto* slot = compiler->AllocaAtEntry(structType, nullptr, "uniondef");
         compiler->builder->CreateStore(llvm::Constant::getNullValue(structType), slot);
-        compiler->CreateAssignment(rvalue, slot, unionFieldSrcUnsigned, fieldType);
+        compiler->CreateAssignment(rvalue, slot, unionFieldSrcUnsigned, fieldType, unionFieldDestUnsigned);
         compiler->CreateReturnCall(compiler->CreateLoad(structType, slot));
     }
 
@@ -4897,7 +4900,7 @@ void MainListener::EmitCppStructConstructorThunk(
                 if (destinationType->isStructTy())
                     value = GenerateDefaultValue(field);
                 else
-                    value = compiler->CreateCast(value, destinationType);
+                    value = compiler->CreateCast(value, destinationType, false, field.IsUnsignedInteger() != -1);
             }
             if (value != nullptr && value->getType() == destinationType)
             {
@@ -5236,7 +5239,7 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                                 compiler->LogWarning(std::format(
                                     "implicit narrowing to '{}' in field '{}' - use an explicit cast",
                                     SpellType(*compiler, field), field.VariableName));
-                            fieldVal = compiler->CreateCast(fieldVal, destType);
+                            fieldVal = compiler->CreateCast(fieldVal, destType, false, field.IsUnsignedInteger() != -1);
                         }
                     }
                     if (fieldVal->getType() == destType)

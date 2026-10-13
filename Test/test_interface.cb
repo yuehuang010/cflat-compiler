@@ -6,6 +6,7 @@ import "library/iface_rebox_lib.cb";
 import "library/gi_collide_iface.cb";
 import "library/gi_collide_struct.cb";
 import "function.cb";
+import "diagnostic/heap_audit.cb";
 
 // === Interfaces ===
 
@@ -5157,6 +5158,136 @@ bool testPointerArithmeticBoxesIntoInterface()
     return ok;
 }
 
+// T81: `return <pointer arithmetic>;` into an interface return boxes exactly like `return t;` for
+// the same class pointer. Master refused every spelling here ("a pointer arithmetic result is not
+// returned as an interface"). The borrowed-parameter shape is the one that must not free anything.
+IShape t81Return1(Square* t) { return t + 1; }
+IShape t81Return0(Square* t) { return t + 0; }
+IShape t81Returnr(Square* t) { return 1 + t; }
+IShape t81Nested(Square* t) { return (t + 1) + 1; }
+IShape t81Wrapped(Square* t) { return 1 + (t + 1); }
+
+bool testPointerArithmeticReturnsAsInterface()
+{
+    Square[3] squares = default;
+    squares[0].s = 2;
+    squares[1].s = 3;
+    squares[2].s = 4;
+    IShape one = t81Return1(&squares[0]);
+    IShape zero = t81Return0(&squares[1]);
+    IShape rev = t81Returnr(&squares[0]);
+    IShape two = t81Return1(&squares[1]);
+    IShape nested = t81Nested(&squares[0]);
+    IShape wrapped = t81Wrapped(&squares[0]);
+    bool ok = one.area() == 9 && zero.area() == 9 && rev.area() == 9 && two.area() == 16
+        && nested.area() == 16 && wrapped.area() == 16;
+    printf("%s: pointer arithmetic returns as interface\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// T81 round 3: provenance of a borrowed pointer decides the return. A local alias of a borrowed
+// PARAM, a borrowed pointer FIELD of a param, and a GLOBAL pointer all box; each is a borrow the
+// caller never frees, so each must return the element the arithmetic names.
+struct T81Holder { Square* items = nullptr; };
+Square* t81GlobalSq = nullptr;
+
+IShape t81AliasParam(Square* t) { Square* b = t; return b + 1; }
+IShape t81FieldParam(T81Holder* p) { return p->items + 1; }
+IShape t81GlobalArith() { return t81GlobalSq + 2; }
+Square* t81GetB(Square* t) { return t; }
+IShape t81CallPlus(Square* t) { return t81GetB(t) + 1; }
+IShape t81DeepParam(Square** pp) { return *pp + 1; }
+
+bool testPointerArithmeticBorrowProvenance()
+{
+    Square[3] squares = default;
+    squares[0].s = 2;
+    squares[1].s = 3;
+    squares[2].s = 4;
+    T81Holder h = default;
+    h.items = &squares[0];
+    t81GlobalSq = &squares[0];
+    IShape alias = t81AliasParam(&squares[0]);
+    IShape field = t81FieldParam(&h);
+    IShape global = t81GlobalArith();
+    IShape call = t81CallPlus(&squares[0]);
+    Square* sp = &squares[0];
+    IShape deep = t81DeepParam(&sp);
+    bool ok = alias.area() == 9 && field.area() == 9 && global.area() == 16
+        && call.area() == 9 && deep.area() == 9;
+    printf("%s: pointer arithmetic borrow provenance\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// T91: the accept set of the interface-return dangle check. Each shape compiles and returns the
+// element its arithmetic names; an owned heap box is freed through the caller's interface local.
+struct T91Box { Square[3] arr = default; };
+Square[3] t91GArr = default;
+
+move Square* t91MakeSquare() { return new Square(); }
+move IShape t91OwnedMove() { Square* t = new Square(); t->s = 2; return t; }
+move IShape t91NewMove() { return new Square(); }
+move IShape t91OwnedCall() { return t91MakeSquare(); }
+IShape t91ParamPlain(Square* p) { return p; }
+IShape t91ParamElement(Square* p) { return &p[1]; }
+IShape t91GlobalElement() { return &t91GArr[1]; }
+IShape t91Coalesce(Square* p) { return p ?? p; }
+IShape t91StaticElement() { static Square[3] sarr = default; sarr[1].s = 3; return &sarr[1]; }
+IShape t91FieldElement(T91Box* b) { return &b->arr[1]; }
+
+bool testInterfaceReturnAcceptSet()
+{
+    HeapAudit.enable();
+    int base = (int)HeapAudit.reportLeaks();
+    Square[3] squares = default;
+    squares[0].s = 2;
+    squares[1].s = 3;
+    t91GArr[0].s = 5;
+    t91GArr[1].s = 4;
+    T91Box box = default;
+    box.arr[1].s = 3;
+    IShape owned = t91OwnedMove();
+    int ownedArea = owned.area();
+    delete owned;
+    IShape fresh = t91NewMove();
+    int freshArea = fresh.area();
+    delete fresh;
+    IShape viaCall = t91OwnedCall();
+    int callArea = viaCall.area();
+    delete viaCall;
+    bool heapOk = (int)HeapAudit.reportLeaks() == base;
+    IShape paramPlain = t91ParamPlain(&squares[0]);
+    IShape paramElem = t91ParamElement(&squares[0]);
+    IShape globalElem = t91GlobalElement();
+    IShape coalesced = t91Coalesce(&squares[0]);
+    IShape staticElem = t91StaticElement();
+    IShape fieldElem = t91FieldElement(&box);
+    bool ok = heapOk && ownedArea == 4 && freshArea == 0 && callArea == 0
+        && paramPlain.area() == 4 && paramElem.area() == 9 && globalElem.area() == 16
+        && coalesced.area() == 4 && staticElem.area() == 9 && fieldElem.area() == 9;
+    printf("%s: interface return accept set\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// T91 round 2: a store into FIELD 0 of a local struct consumes the owner (no GEP, the field is the
+// struct itself). The stored field read back is a value the struct carries, so it is accepted; field 1
+// is the GEP form and is accepted too. Both must box the square the owner held.
+struct T91FieldZero { Square* p = nullptr; };
+struct T91FieldOne { int pad = 0; Square* p = nullptr; };
+IShape t91FieldZeroReturn() { Square* t = new Square(); t->s = 3; T91FieldZero h = default; h.p = t; return h.p; }
+IShape t91FieldOneReturn() { Square* t = new Square(); t->s = 3; T91FieldOne h = default; h.p = t; return h.p; }
+IShape t91ArrayZeroReturn() { Square* t = new Square(); t->s = 3; Square*[3] ps = default; ps[0] = t; return ps[0]; }
+
+bool testInterfaceFieldZeroOwnerReturn()
+{
+    IShape zero = t91FieldZeroReturn();
+    IShape one = t91FieldOneReturn();
+    IShape elem = t91ArrayZeroReturn();
+    bool ok = zero.area() == 9 && one.area() == 9 && elem.area() == 9;
+    printf("%s: interface return of a field-0 owner store\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -5266,6 +5397,10 @@ extern int main()
 
     total++; passed += testInterfaceLocalAdoptsBoxOnce()               ? 1 : 0;
     total++; passed += testPointerArithmeticBoxesIntoInterface()       ? 1 : 0;
+    total++; passed += testPointerArithmeticReturnsAsInterface()       ? 1 : 0;
+    total++; passed += testPointerArithmeticBorrowProvenance()         ? 1 : 0;
+    total++; passed += testInterfaceReturnAcceptSet()                    ? 1 : 0;
+    total++; passed += testInterfaceFieldZeroOwnerReturn()                 ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

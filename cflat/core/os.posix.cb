@@ -376,8 +376,8 @@ namespace os.posix
     // so binding the public names is safe, no collision).
     extern void*    fopen(const char* path, const char* mode);
     extern win_int  fclose(void* stream);
-    extern win_size fread(i8* buf, win_size size, win_size count, void* stream);
-    extern win_size fwrite(const i8* buf, win_size size, win_size count, void* stream);
+    extern win_size fread(char* buf, win_size size, win_size count, void* stream);
+    extern win_size fwrite(const char* buf, win_size size, win_size count, void* stream);
     extern win_int  feof(void* stream);
     extern win_int  fseek(void* stream, long offset, win_int origin);
     extern long     ftell(void* stream);
@@ -387,13 +387,13 @@ namespace os.posix
     extern win_int  unlink(const char* path);
     extern win_int  rmdir(const char* path);
     extern win_int  mkdir(const char* path, win_int mode);       // POSIX mkdir takes a mode
-    extern i8*      getcwd(i8* buf, win_size size);
+    extern char*      getcwd(char* buf, win_size size);
     extern win_int  chdir(const char* path);
     extern win_int  rename(const char* oldp, const char* newp);  // replaces dst atomically
     extern win_int  close(i32 fd);
-    extern i8*      getenv(const char* name);
-    extern i8*      realpath(const char* path, i8* resolved);    // resolved needs PATH_MAX bytes
-    extern win_int  mkstemp(i8* templ);                          // templ ends in XXXXXX; opens+creates
+    extern char*      getenv(const char* name);
+    extern char*      realpath(const char* path, char* resolved);    // resolved needs PATH_MAX bytes
+    extern win_int  mkstemp(char* templ);                          // templ ends in XXXXXX; opens+creates
 
     // === Memory-mapped files - fd-based open/resize/seek ==================
     // open() is variadic (mode is only consulted with O_CREAT) and MUST be
@@ -451,10 +451,10 @@ namespace os.posix
     }
 
     // Read the next directory entry's name, or nullptr at the end of the stream.
-    i8* readdir_name(void* dirp) {
+    char* readdir_name(void* dirp) {
         void* ent = os.posix.readdir(dirp);
         if (ent == nullptr) return nullptr;
-        i8* base = (i8*)ent;
+        char* base = (char*)ent;
         return &base[os.posix.DIRENT_NAME_OFF];
     }
 

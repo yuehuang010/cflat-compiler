@@ -231,9 +231,13 @@ import cpp "library/cpp_interop_t74.h";
 import cpp "library/t70_xvalue_overloads.h";
 import cpp "library/cpp_t68_intptr.hpp";
 import cpp "library/cpp_t62_static_auto.hpp";
+import cpp "library/cpp_t93_static_init.hpp";
 import cpp "library/cpp_u8_literal.hpp";
 import cpp "library/cpp_t43_char_types.hpp";
+import cpp "library/cpp_immovable.hpp";
 import cpp "library/cpp_t43_ref_ops.hpp";
+import cpp "library/cpp_t85_pointee.hpp";
+import cpp "library/cpp_t94_anon_typedef.hpp";
 import cpp "library/t38_offsetof.hpp";
 import cpp "library/cpp_interop_scoped_enum_collide.h";
 import cpp "library/t20_abi_records.hpp";
@@ -270,6 +274,7 @@ import cpp "library/cpp_t42_convref.hpp";
 import cpp "library/cpp_t48_nullptr.hpp";
 import cpp "library/cpp_t52_refnull.hpp";
 import cpp "library/cpp_t28_fwdref.hpp";
+import cpp "library/t84_conversion.hpp";
 import cpp "library/cpp_t27_ptrdiff.hpp";
 import cpp "library/cpp_interop_lastuse.h";
 import cpp "library/cpp_interop_demand_fail.h";
@@ -294,6 +299,7 @@ import cpp "library/cpp_interop_throw.h";
 import cpp "library/cpp_interop_scoped_enum.h";
 import cpp "library/cpp_interop_errc.h";
 import cpp "library/cpp_t49_enum_args.hpp";
+import cpp "library/cpp_t86_literals.hpp";
 enum T49Own : int { T49V = 6 };
 enum T64U8 : u8 { T64U8Hi = 200 };
 enum T64U16 : u16 { T64U16Hi = 40000 };
@@ -458,6 +464,7 @@ int t50Take(t50v.V* v) { return v == nullptr ? -1 : v.value; }
 import cpp "library/t31_minmax_brace.hpp";
 import cpp "library/cpp_t63_brace_decl.hpp";
 import cpp "library/cpp_t78_scalar_table.h";
+import cpp "library/cpp_t87_null_zero.h";
 int cppcg_add(int a, int b) { return a + b; }
 
 // A C++ exception unwinding THROUGH CFlat frames (the C++ `guarded` catch sits above them): every
@@ -1693,6 +1700,20 @@ int T62StaticTrackedRecursive(int seed)
         ? T62StaticTrackedRecursive(seed + 1) : seed);
     return kept.ok() * 1000 + kept.get() * 10;
 }
+// T93: a static local whose C++ initializer throws stays incomplete, so the next entry retries it.
+int T93ThrowAuto(int a) { static auto g = t93s.Once(a); return g.get(); }
+int T93ThrowExplicit(int a) { static t93s.Once g = t93s.Once(a); return g.get(); }
+int T93ThrowTernary(int a) { static t93s.Once g = a > 0 ? t93s.Once(a) : t93s.Once(-a); return g.get(); }
+int T93ThrowAutoTernary(int a) { static auto g = a > 0 ? t93s.Once(a) : t93s.Once(-a); return g.get(); }
+int T93ThrowBrace(int a) { static t93s.Once g{a}; return g.get(); }
+// T93: an explicit-type static initialized by a C++ constructor call (or a ternary of them) is built
+// in place: clang makes 1 object, 0 copies, 0 moves; ok() == 1 proves the object sits in its slot.
+int T93TrkExplicit(int a) { static t93s.Trk g = t93s.Trk(a); return g.ok() * 100 + g.get(); }
+int T93TrkTernary(bool c, int x, int y)
+{
+    static t93s.Trk g = c ? t93s.Trk(x) : t93s.Trk(y);
+    return g.ok() * 100 + g.get();
+}
 enum T45Ternary : int { Picked = true ? 7 : 8, Other = false ? 7 : 8 };
 
 int T46GenericDot<T>(T p) { return p.get() == nullptr ? 1 : 0; }
@@ -1750,10 +1771,43 @@ struct T73GenericHolder { T73Generic<cpp_t73.Mix> generic; };
 struct T73Initialized { cpp_t73.Mix mix = cpp_t73.Mix(); };
 struct T73DefaultedInitializer { cpp_t73.Mix mix = default; };
 T73Holder t73Global = default;
+// T94 B: a [cpp] struct in a namespace whose name ends in '_'. The generated identity for ns_.Self
+// is ns___Self; it must decode back to ns_.Self, not ns._Self (clang++ oracle: 0).
+namespace t94u_ { [cpp] struct Self : std.enable_shared_from_this<Self> { int value = default; }; }
 char* t75Pick(char* s) { return s; }
+
+struct T90Traits<T>
+{
+    int movable()
+    {
+        if const (is_movable(T)) return 1;
+        else return 0;
+    }
+};
+T90Traits<immt90.Pinned> immt90PinnedTraits = default;
+T90Traits<immt90.Plain> immt90PlainTraits = default;
+// T90 F1: a C++ immovable class returned by value is a fresh sret result, so the return is accepted.
+immt90.Pinned t90Mk() { return default; }
+// Both ternary arms fresh: the join is a prvalue built in the sret slot.
+immt90.Pinned t90MkEither(bool c) { return c ? t90Mk() : t90Mk(); }
 
 extern int main()
 {
+    // T86: a hex float (binary exponent) and a binary suffix reach C++ template deduction and overloads with clang's
+    // types (clang++ -std=c++20 oracle: 2 1 1 2 / 3 4 5 6 8 / 7 4).
+    if (t86.deduce(0x1p-2) != 2) return 98210;
+    if (t86.deduce(0x1p-2f) != 1) return 98211;
+    if (t86.deduce(0x1.8p3F) != 1) return 98212;
+    if (t86.pick(0x1p-2) != 2) return 98213;
+    if (t86.deduce(0b1) != 3) return 98214;
+    if (t86.deduce(0b1u) != 4) return 98215;
+    if (t86.deduce(0b1L) != 5) return 98216;
+    if (t86.deduce(0b1UL) != 6) return 98217;
+    if (t86.deduce(0b1LL) != 7) return 98218;
+    if (t86.deduce(0b1ULL) != 8) return 98219;
+    if (t86.deduce(0b10000000000000000000000000000000) != 4) return 98220;
+    if (t86.deduce(0x1p2000) != 2) return 98221;
+    if (t86.deduce(0x1p200f) != 1) return 98222;
     // T78 (ruling 2026-10-09): integer, bool and unscoped enum arguments widen to a C++ double
     // at free, member, constructor and new calls, as clang accepts them.
     if (t78.takeD(3) != 3) return 98101;
@@ -1806,6 +1860,63 @@ extern int main()
     // Round 4: a null pointer constant takes a pointer constructor; the pick itself is not asserted.
     t78.NullAlt* t78Na = new t78.NullAlt(0, 1.5);
     delete t78Na;
+    // T87: a literal 0 (any integer suffix, or a zero macro) is a null pointer constant to clang: it
+    // reaches the pointer constructor as a conversion ranked beside the integral one (clang: 99).
+    t87.P* t87P0 = new t87.P(0, 1.5);
+    if (t87P0.v != 99) return 98119;
+    delete t87P0;
+    t87.P* t87L98120 = new t87.P(0u, 1.5);
+    if (t87L98120.v != 99) return 98120;
+    delete t87L98120;
+    t87.P* t87L98121 = new t87.P(0UL, 1.5);
+    if (t87L98121.v != 99) return 98121;
+    delete t87L98121;
+    t87.P* t87L98122 = new t87.P(0L, 1.5);
+    if (t87L98122.v != 99) return 98122;
+    delete t87L98122;
+    t87.P* t87L98123 = new t87.P(0LL, 1.5);
+    if (t87L98123.v != 99) return 98123;
+    delete t87L98123;
+    t87.P* t87L98124 = new t87.P(T87_ZERO, 1.5);
+    if (t87L98124.v != 99) return 98124;
+    delete t87L98124;
+    t87.P* t87L98125 = new t87.P(T87_ZERO_L, 1.5);
+    if (t87L98125.v != 99) return 98125;
+    delete t87L98125;
+    t87.P* t87L98126 = new t87.P(nullptr, 1.5);
+    if (t87L98126.v != 99) return 98126;
+    delete t87L98126;
+    // An int second argument is exact, so a literal 0 first still leaves the integral pick (clang: 11).
+    t87.P* t87L98127 = new t87.P(0, 1);
+    if (t87L98127.v != 11) return 98127;
+    delete t87L98127;
+    t87.P t87V = t87.P(0, 1.5);
+    if (t87V.v != 99) return 98128;
+    t87.S4* t87L98129 = new t87.S4(0, 1.5);
+    if (t87L98129.v != 11) return 98129;
+    delete t87L98129;
+    t87.S2* t87L98130 = new t87.S2(0);
+    if (t87L98130.v != 11) return 98130;
+    delete t87L98130;
+    t87.S2* t87L98131 = new t87.S2(nullptr);
+    if (t87L98131.v != 99) return 98131;
+    delete t87L98131;
+    if (t87.f(0, 1.5) != 99) return 98132;
+    if (t87.f(0, 1) != 11) return 98133;
+    t87.M t87M = default;
+    if (t87M.m(0, 1.5) != 99) return 98134;
+    if (t87.f(T87_ZERO, 1.5) != 99) return 98135;
+    t87.R1* t87L98136 = new t87.R1(0, 1.5);
+    if (t87L98136.v != 11) return 98136;
+    delete t87L98136;
+    t87.R2* t87L98137 = new t87.R2(0, 0);
+    if (t87L98137.v != 11) return 98137;
+    delete t87L98137;
+    // A scalar-reference constructor beside a pointer one: the null literal reaches the mirror's selector
+    // as 0, so the pointer constructor wins (clang: 99).
+    t87.NullRef* t87L98138 = new t87.NullRef(0, 1.5);
+    if (t87L98138.v != 99) return 98138;
+    delete t87L98138;
     // A template ctor beside a narrowing-only ctor(int) takes the exact double (clang: chosen 1).
     rv.TT* t78TT = new rv.TT(1.5);
     if (t78TT->chosen != 1) return 98114;
@@ -1991,6 +2102,34 @@ extern int main()
     int t62015 = T62StaticTrackedRecursive(1);
     if (t62015 != 1000 || r62.made != 1 || r62.copies != 0
         || r62.moves != 0 || r62.dead != 0) return 62015;
+    // T93: a throwing initializer leaves the static unconstructed; the next entry retries (clang: -5, 6).
+    t93s.reset();
+    int t93r1 = t93s.guarded(T93ThrowAuto, 5);
+    int t93r2 = t93s.guarded(T93ThrowAuto, 6);
+    if (t93r1 != -5 || t93r2 != 6) return 93001;
+    t93s.reset();
+    t93r1 = t93s.guarded(T93ThrowExplicit, 5);
+    t93r2 = t93s.guarded(T93ThrowExplicit, 6);
+    if (t93r1 != -5 || t93r2 != 6) return 93002;
+    t93s.reset();
+    t93r1 = t93s.guarded(T93ThrowTernary, 5);
+    t93r2 = t93s.guarded(T93ThrowTernary, 6);
+    if (t93r1 != -5 || t93r2 != 6) return 93003;
+    t93s.reset();
+    t93r1 = t93s.guarded(T93ThrowAutoTernary, 5);
+    t93r2 = t93s.guarded(T93ThrowAutoTernary, 6);
+    if (t93r1 != -5 || t93r2 != 6) return 93004;
+    t93s.reset();
+    t93r1 = t93s.guarded(T93ThrowBrace, 5);
+    t93r2 = t93s.guarded(T93ThrowBrace, 6);
+    if (t93r1 != -5 || t93r2 != 6) return 93005;
+    // Explicit-type static from a constructor call: built in place, one object, no copy or move.
+    t93s.reset();
+    int t93a = T93TrkExplicit(3) + T93TrkExplicit(4);
+    if (t93a != 206 || t93s.made != 1 || t93s.copies != 0 || t93s.moves != 0) return 93006;
+    t93s.reset();
+    int t93b = T93TrkTernary(true, 3, 4) + T93TrkTernary(false, 5, 6);
+    if (t93b != 206 || t93s.made != 1 || t93s.copies != 0 || t93s.moves != 0) return 93007;
     if (T62StaticAutoGlobalCopy() != 1) return 62010;
     cpp_t62.set_global_string("changed");
     if (T62StaticAutoGlobalCopy() != 1 || T62StaticAutoGlobalCopy() != 1) return 62011;
@@ -5800,6 +5939,20 @@ extern int main()
     delete arrelemI;
     if (arrelemOk != 1 || cppa.dtor_count() != 2) return 1878;
 
+    // T88 accept set (controls for the private-default-constructor refusals in
+    // err_cpp_array_no_default_ctor.cb): public trivial, public `= default`, a public
+    // defaulted-argument constructor, and a copy from a factory that needs no default constructor.
+    {
+        cppa.PubDefTriv[2] t88Arr = default;
+        cppa.PubDefArg t88Arg;
+        cppa.PrivFac t88Fac = cppa.PrivFac.make();
+        static cppa.PubDefTriv t88Static;
+        if (t88Arr[1].v != 0 || t88Arg.v != 0 || t88Fac.v != 3 || t88Static.v != 0) return 9501;
+    }
+    // A nontrivial public class in a `static` local is constructed once, in its own storage.
+    cppa.reset();
+    static cppa.CtorOnly t88StaticCtor;
+    if (cppa.ctor_count() != 1 || t88StaticCtor.v != 9) return 9502;
     // Accept set: a FULLY TRIVIAL element keeps the whole-array zeroinitializer, nothing is
     // constructed and nothing is destroyed. This leg passes on the pre-fix binary too - it is
     // here so a future widening of the predicate cannot silently start constructing a trivial
@@ -6302,6 +6455,14 @@ extern int main()
     bool ctorrefTrue = true;
     double ctorrefBig = 3000000000.5;
     if (cppcr.ThkDbl(ctorrefTrue).v != 1.0 || (i64)cppcr.ThkUns((unsigned)(i64)ctorrefBig).v != 3000000000) return 7146;
+    // T84: the same value cast straight to 'unsigned' (no i64 hop) must keep its value too.
+    if ((i64)cppcr.ThkUns((unsigned)ctorrefBig).v != 3000000000) return 7147;
+    // T84 round 2: a C++ operator double() result converts to unsigned by the destination's sign.
+    T84Double t84Conv = T84Double(ctorrefBig);
+    u32 t84ConvAssign = t84Conv;
+    if ((i64)t84ConvAssign != 3000000000) return 7406;
+    if ((i64)(u32)t84Conv != 3000000000) return 7407;
+    if ((i64)t84Take(t84Conv) != 3000000000) return 7408;
 
     // Same-width C++ scalar spellings still require a fresh conversion temporary.
     long ctorrefLong = 4;
@@ -8904,18 +9065,19 @@ extern int main()
             || cppon.dtors() != 4 || (int)HeapAudit.reportLeaks() != heapBase) return 3358;
         cppunw.reset();
         cppon.reset();
+        // Global ::operator new[] / delete[] are checked as a balance (newArrs == deleteArrs): -O2 may omit an allocation with its deallocation ([expr.new]/14).
         cppon.Plain* onSz = new cppon.Plain[3];
         delete[3] onSz;
-        bool onSizedOk = cppunw.newArrs() == 1 && cppunw.deleteArrs() == 1 && cppon.dtors() == 3;
+        bool onSizedOk = cppunw.newArrs() == cppunw.deleteArrs() && cppon.dtors() == 3;
         cppunw.reset();
         cppon.reset();
         cppon.Plain* onRaw = new cppon.Plain[2];
         delete[_] onRaw;                                                  // frees, runs no dtor
-        if (!onSizedOk || cppunw.newArrs() != 1 || cppunw.deleteArrs() != 1 || cppunw.deletes() != 0
+        if (!onSizedOk || cppunw.newArrs() != cppunw.deleteArrs() || cppunw.deletes() != 0
             || cppon.dtors() != 0 || (int)HeapAudit.reportLeaks() != heapBase) return 3359;
         cppunw.reset();
         cppon.reset();
-        if (OnViewScope(1) != 8 || cppunw.newArrs() != 1 || cppunw.deleteArrs() != 1
+        if (OnViewScope(1) != 8 || cppunw.newArrs() != cppunw.deleteArrs()
             || cppon.dtors() != 3 || (int)HeapAudit.reportLeaks() != heapBase) return 3360;
         // `new Cls[n]` looks up operator new[] only: the class's operator new never applies.
         cppunw.reset();
@@ -8923,8 +9085,8 @@ extern int main()
         cppon.Cls[] onCa = new cppon.Cls[2];
         onV = onCa[1].get();
         delete onCa;
-        if (onV != 7 || cppon.clsNew() != 0 || cppon.clsDel() != 0 || cppunw.newArrs() != 1
-            || cppunw.deleteArrs() != 1 || cppon.dtors() != 2) return 3361;
+        if (onV != 7 || cppon.clsNew() != 0 || cppon.clsDel() != 0
+            || cppunw.newArrs() != cppunw.deleteArrs() || cppon.dtors() != 2) return 3361;
         // The class's own operator new[] / sized delete[] (size = n * sizeof).
         cppunw.reset();
         cppon.reset();
@@ -8939,7 +9101,7 @@ extern int main()
         cppon.Poly[] onPa = new cppon.Poly[2];
         onV = onPa[1].get();
         delete onPa;
-        if (onV != 1 || cppon.clsDel() != 0 || cppunw.deleteArrs() != 1 || cppon.dtors() != 2
+        if (onV != 1 || cppon.clsDel() != 0 || cppunw.newArrs() != cppunw.deleteArrs() || cppon.dtors() != 2
             || cppon.live() != 0) return 3363;
         // Over-aligned element: the aligned ::operator new[] / delete[] pair.
         cppon.reset();
@@ -9081,10 +9243,8 @@ extern int main()
         // C++ class elements free through ::operator delete[], never the single-object delete.
         cppunw.reset();
         cppon.reset();
-        int midDel = 0;
-        { cppon.Plain[] v = new cppon.Plain[3]; v = new cppon.Plain[2]; mid = cppon.dtors();
-          midDel = cppunw.deleteArrs(); }
-        if (mid != 3 || midDel != 1 || cppon.dtors() != 5 || cppunw.deleteArrs() != 2
+        { cppon.Plain[] v = new cppon.Plain[3]; v = new cppon.Plain[2]; mid = cppon.dtors(); }
+        if (mid != 3 || cppon.dtors() != 5 || cppunw.newArrs() != cppunw.deleteArrs()
             || cppunw.deletes() != 0 || cppon.live() != 0) return 3401;
         // The class's own operator delete[] (sized: a whole number of elements, else +100).
         cppon.reset();
@@ -9094,7 +9254,7 @@ extern int main()
         cppunw.reset();
         cppon.reset();
         { cppon.Poly[] v = new cppon.Poly[3]; v = new cppon.Poly[2]; mid = cppon.dtors(); }
-        if (mid != 3 || cppon.clsDel() != 0 || cppunw.deleteArrs() != 2 || cppon.live() != 0)
+        if (mid != 3 || cppon.clsDel() != 0 || cppunw.newArrs() != cppunw.deleteArrs() || cppon.live() != 0)
             return 3403;
         // Over-aligned element: the aligned delete[] pair.
         cppon.reset();
@@ -9110,7 +9270,7 @@ extern int main()
         cppon.reset();
         { cppon.Plain[] v = new cppon.Plain[3]; cppon.Plain[] w = new cppon.Plain[2]; v = move w;
           mid = cppon.dtors(); }
-        if (mid != 3 || cppon.dtors() != 5 || cppunw.deleteArrs() != 2 || cppon.live() != 0)
+        if (mid != 3 || cppon.dtors() != 5 || cppunw.newArrs() != cppunw.deleteArrs() || cppon.live() != 0)
             return 3406;
         // Accept-set, passes on both binaries: `v = v` keeps the live block and releases nothing.
         heapBase = (int)HeapAudit.reportLeaks();
@@ -9126,8 +9286,8 @@ extern int main()
         cppunw.reset();
         cppon.reset();
         { cppon.Plain[] v = new cppon.Plain[1]; for (int i = 0; i < 4; i++) v = new cppon.Plain[2];
-          mid = cppon.dtors(); midDel = cppunw.deleteArrs(); }
-        if (mid != 7 || midDel != 4 || cppunw.deleteArrs() != 5 || cppon.live() != 0) return 3409;
+          mid = cppon.dtors(); }
+        if (mid != 7 || cppunw.newArrs() != cppunw.deleteArrs() || cppon.live() != 0) return 3409;
 
         // A null / `default` / moved-from old view frees nothing; `v = default` releases the block.
         vrDtors = 0;
@@ -9204,11 +9364,11 @@ extern int main()
         if (mid != 5 || vrDtors != 9 || (int)HeapAudit.reportLeaks() != heapBase) return 3417;
 
         // A C++ exception after the reassignment: the old block was already released, the new
-        // one is freed by the unwind cleanup - through ::operator delete[] both times.
+        // one is freed by the unwind cleanup; global new[] and delete[] balance (see above).
         cppunw.reset();
         cppon.reset();
-        if (cppunw.guarded(VrUnwind, 5) != -5 || cppon.dtors() != 5 || cppunw.deleteArrs() != 2
-            || cppon.live() != 0 || cppunw.live() != 0) return 3418;
+        if (cppunw.guarded(VrUnwind, 5) != -5 || cppon.dtors() != 5
+            || cppunw.newArrs() != cppunw.deleteArrs() || cppon.live() != 0 || cppunw.live() != 0) return 3418;
 
         // Primitive and string element views: the old block is freed (string buffers included).
         { int[] p = new int[3]; p = new int[2]; string[] s = new string[2]; s[0] = "abc".copy();
@@ -11935,6 +12095,104 @@ extern int main()
     expect_error("would destroy them before the end of the expression") {
         int t31n2 = std.t31.pair_two<std.t31.cell>({t31c4, t31c5});
     }
+    // T94 A: an anonymous struct/union typedef inside a namespace or class is a complete record
+    // (clang++ -std=c++20 oracle: 4 7 8 9 4). The namespace typedef name is the record's name.
+    t94a.TS t94TS = default;
+    t94TS.v = 4;
+    if (t94TS.v != 4)                                                          return 94101;
+    t94b.inner.NTS t94NTS = default;
+    t94NTS.v = 7;
+    if (t94NTS.v != 7)                                                         return 94102;
+    t94c.TU t94TU = default;
+    t94TU.v = 8;
+    if (t94TU.v != 8)                                                          return 94103;
+    t94o.I t94OI = default;
+    t94OI.v = 9;
+    if (t94OI.v != 9)                                                          return 94104;
+    int t94Enum = t94d.EB;
+    if (t94Enum != 4)                                                          return 94105;
+    // T94 B: a weak_ptr to the underscore-namespace [cpp] struct shares its owner (use count 1).
+    std.shared_ptr<t94u_.Self> t94Own = std.make_shared<t94u_.Self>();
+    t94Own->value = 41;
+    std.weak_ptr<t94u_.Self> t94Weak = t94Own->weak_from_this();
+    if (t94Weak.use_count() != 1)                                              return 94106;
+    if (t94Weak.lock()->value != 41)                                           return 94107;
+    // T85: unrelated primitive pointees are refused (err_cpp_unrelated_pointee.cb). An overload set
+    // falls to the void* or template candidate as clang does; the accept-set rows stay accepted.
+    int t85Int = 1;
+    long t85Long = 2;
+    double t85Dbl = 2.5;
+    char t85Chr = 'a';
+    void* t85Void = &t85Int;
+    if (t85p.ov(&t85Int) != 3) return 85101;
+    if (t85p.tmp(&t85Int) != 4) return 85102;
+    if (t85p.tmp(&t85Dbl) != 2) return 85103;
+    if (t85p.cc(&t85Int) != 7) return 85104;
+    if (t85p.cc1(&t85Chr) != 5) return 85105;
+    if (t85p.cw(&t85Int) != 8) return 85106;
+    if (t85p.oi(&t85Int) != 11) return 85107;
+    if (t85p.oi(&t85Dbl) != 12) return 85108;
+    if (t85p.lx(&t85Long) != 13) return 85109;
+    if (t85p.tmp(&t85Long) != 4) return 85110;
+    if (t85p.one(&t85Dbl) != 1) return 85111;
+    if (t85p.ov(t85Void) != 3) return 85112;
+    if (t85p.one(nullptr) != 1) return 85113;
+    t85p.M2 t85M2 = default;
+    if (t85M2.take(&t85Int) != 16) return 85114;
+    t85p.C2 t85C2 = t85p.C2(&t85Int);
+    if (t85C2.k != 20) return 85115;
+    t85p.O2 t85O2 = default;
+    if (t85O2(&t85Int) != 23) return 85116;
+    // Round 2: binary operators (member and free) and pointer-reference parameters keep the
+    // pointee rule; the matching twins take the same pointee and run the right body.
+    int t85Seven = 7;
+    t85p.MOpI t85Mi = default;
+    if (t85Mi + &t85Seven != 7) return 85117;
+    t85p.FOpI t85Fi = default;
+    if (t85Fi + &t85Seven != 7) return 85118;
+    double* t85Dp = &t85Dbl;
+    if (t85p.rf(t85Dp) != 27) return 85119;
+    if (t85p.rf(&t85Dbl) != 27) return 85120;
+    int* t85Sp = &t85Seven;
+    if (t85p.rk(t85Sp) != 7) return 85121;
+    if (t85p.rk(&t85Seven) != 7) return 85122;
+    // Round 3: `T*&&` and reference-returning sources bind like their pointer, a compound operand
+    // keeps its pointee, and a dropped operator leaves the operator TEMPLATE to win (clang values).
+    if (t85p.rri(&t85Seven) != 7) return 85123;
+    if (t85p.takeI(t85p.src(t85Sp)) != 7) return 85124;
+    int** t85Spp = &t85Sp;
+    if (t85p.takeII(t85p.srcpp(t85Spp)) != 7) return 85125;
+    t85p.AccI t85Ai = default;
+    t85Ai += &t85Seven;
+    if (t85Ai.k != 7) return 85126;
+    t85p.Acc t85Ad = default;
+    t85Ad += &t85Dbl;
+    if (t85Ad.k != 33) return 85127;
+    t85p.RT t85Rt = default;
+    if (t85Rt + &t85Seven != 35) return 85128;
+    if (t85Rt + &t85Dbl != 34) return 85129;
+    if (t85Rt + t85Sp != 35) return 85130;
+    t85p.RTV t85Rv = default;
+    if (t85Rv + &t85Seven != 38) return 85131;
+    t85p.AT t85At = default;
+    t85At += &t85Seven;
+    if (t85At.k != 40) return 85132;
+    t85p.AT t85At2 = default;
+    t85At2 += &t85Dbl;
+    if (t85At2.k != 39) return 85133;
+    t85p.FT t85Ft = default;
+    if (t85Ft + &t85Seven != 42) return 85134;
+    if (t85Ft + &t85Dbl != 41) return 85135;
+    // T90 [immovable]: a C++ class with deleted move AND copy ctors maps to the attribute. clang++
+    // -std=c++20 oracle: `Pinned b = std::move(a);` is ill-formed (deleted move ctor); a plain class moves.
+    if (immt90PinnedTraits.movable() != 0)                                        return 90001;
+    if (immt90PlainTraits.movable() != 1)                                         return 90002;
+    expect_error("call to deleted constructor of 'immt90::Pinned'") { immt90.Pinned t90a = default; immt90.Pinned t90b = move t90a; }
+    expect_error("the type is [immovable]") { immt90.Pinned t90c = default; immt90.Pinned t90d = default; t90d = move t90c; }
+    immt90.Pinned t90p = t90Mk();
+    if (t90p.v != 3)                                                              return 90003;
+    immt90.Pinned t90e = t90MkEither(t90p.v == 3);
+    if (t90e.v != 3)                                                              return 90004;
     return 0;
 }
 

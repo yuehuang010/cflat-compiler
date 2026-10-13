@@ -2,6 +2,8 @@
 // T is the POINTEE type: unique<Resource> owns a Resource*.
 annotation unique { };
 annotation cpp { };
+// [immovable]: the value may never be moved (move, by-value return/pass/capture/assign, relocation).
+annotation immovable { };
 
 // ALIGN carries the OVER-alignment of the owned block, so `alignas(0, N) unique T*` is
 // `unique<T, N>`: the deallocator that matches the allocation is part of the type. 0 (and any

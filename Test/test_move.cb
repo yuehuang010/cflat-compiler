@@ -12829,6 +12829,8 @@ extern int main()
     total += 37;
     passed += testAddressIntoNewTemp();
     total += 8;
+    passed += testImmovable();
+    total += 10;
 
     int c = 1;
     conditionalNewCount = 0;
@@ -13308,5 +13310,66 @@ int testAddressIntoNewTemp()
     dtorCount = 0;
     bool intNonZero = (i64)&(new Resource())->id != 0;
     passed += Test("amt_int_compare_freed", intNonZero ? dtorCount : -1, 1);
+    return passed;
+}
+
+// [immovable] (T90): accept-set and the is_movable trait. Refusals live in Test/errors/err_immovable_*.cb.
+[immovable] struct ImmPin { int x = 0; };
+struct ImmHolder { ImmPin* p = nullptr; int y = 0; };
+struct ImmOuter { ImmPin pin; };
+struct ImmArr { ImmPin items[2]; };
+struct ImmPlain { int v = 0; };
+
+struct ImmTraits<T>
+{
+    int movable()
+    {
+        if const (is_movable(T)) return 1;
+        else return 0;
+    }
+};
+
+void immTakePtr(ImmPin* p) { p->x = p->x + 1; }
+void immTakeAlias(alias ImmPin n) { n.x = n.x + 2; }
+
+int testImmovable()
+{
+    int passed = 0;
+    ImmTraits<ImmPin> pinTraits = default;
+    ImmTraits<ImmPlain> plainTraits = default;
+    ImmTraits<ImmPin*> ptrTraits = default;
+    ImmTraits<int> intTraits = default;
+    ImmTraits<ImmOuter> outerTraits = default;
+    ImmTraits<ImmArr> arrTraits = default;
+    ImmTraits<ImmHolder> holderTraits = default;
+    passed += Test("imm_is_movable_immovable", pinTraits.movable(), 0);
+    passed += Test("imm_is_movable_plain_struct", plainTraits.movable(), 1);
+    passed += Test("imm_is_movable_pointer", ptrTraits.movable(), 1);
+    passed += Test("imm_is_movable_primitive", intTraits.movable(), 1);
+    passed += Test("imm_is_movable_propagates_field", outerTraits.movable(), 0);
+    passed += Test("imm_is_movable_propagates_array", arrTraits.movable(), 0);
+    passed += Test("imm_is_movable_pointer_field_stops", holderTraits.movable(), 1);
+
+    // Construction in place, pointers, aliases, use through a pointer, and heap allocation stay legal.
+    ImmPin n = { x = 1 };
+    ImmPin* p = &n;
+    p->x = p->x + 1;
+    alias ImmPin q = n;
+    q.x = q.x + 1;
+    immTakePtr(&n);
+    immTakeAlias(n);
+    ImmPin* h = new ImmPin;
+    h->x = 5;
+    delete h;
+    ImmHolder hd = default;
+    hd.p = &n;
+    passed += Test("imm_accept_in_place_and_borrows", hd.p->x, 6);
+    passed += Test("imm_sizeof_is_field_size", (int)sizeof(ImmPin), 4);
+    // `default` rebuilds in place: assignment and a brace-init field accept it.
+    ImmPin d = default;
+    d.x = 3;
+    d = default;
+    ImmOuter o = { pin = default };
+    passed += Test("imm_default_assign_and_field", d.x * 10 + o.pin.x, 0);
     return passed;
 }

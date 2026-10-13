@@ -1580,7 +1580,7 @@ fragment IntegerConstant
     : DecimalConstant IntegerSuffix?
     | OctalConstant IntegerSuffix?
     | HexadecimalConstant IntegerSuffix?
-    | BinaryConstant
+    | BinaryConstant IntegerSuffix?
     ;
 
 fragment BinaryConstant

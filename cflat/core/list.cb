@@ -38,23 +38,28 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // correct here because the old buffer is discarded immediately after.
     void _grow()
     {
-        int newCap = _capacity == 0 ? 4 : _capacity * 2;
-        T* newData = nullptr;
-        if const (is_pointer(T)) newData = new T[newCap];
-        else newData = (T*)calloc((i64)newCap, (i64)sizeof(T));
-        int i = 0;
-        while (i < _size)
+        if const (!is_movable(T))
+            compile_error("list<T>: element type is [immovable] - growing relocates elements; use list<T*>");
+        else
         {
-            construct_at(&newData[i], move _data[i]);
-            i++;
+            int newCap = _capacity == 0 ? 4 : _capacity * 2;
+            T* newData = nullptr;
+            if const (is_pointer(T)) newData = new T[newCap];
+            else newData = (T*)calloc((i64)newCap, (i64)sizeof(T));
+            int i = 0;
+            while (i < _size)
+            {
+                construct_at(&newData[i], move _data[i]);
+                i++;
+            }
+            if (_data != nullptr)
+            {
+                if const (is_pointer(T)) delete[_] _data;
+                else free((void*)_data);
+            }
+            _data = newData;
+            _capacity = newCap;
         }
-        if (_data != nullptr)
-        {
-            if const (is_pointer(T)) delete[_] _data;
-            else free((void*)_data);
-        }
-        _data = newData;
-        _capacity = newCap;
     }
 
     // A bad index is a program bug, not a recoverable state: get()/operator[] hand back an
@@ -75,7 +80,12 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // value type / string is destructed. `move _data[index]` nulls the moved-from slot.
     void _releaseAt(int index)
     {
-        _ = move _data[index];
+        if const (!is_movable(T))
+            compile_error("list<T>: element type is [immovable] - releasing or removing relocates elements; use list<T*>");
+        else
+        {
+            _ = move _data[index];
+        }
     }
 
     // Append value. The store defers entirely to T, single body, no `if const`: a COPYABLE owner
@@ -96,7 +106,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // ownership there would strand the element (nothing ever frees it), and for `unique T*`
     // the plain parameter is already a synthesized move sink, so a second overload would be
     // redundant. is_pointer(T) covers bare, `unique`, `alias` and interface elements alike.
-    if const (!is_pointer(T))
+    if const (!is_pointer(T) && is_movable(T))
     {
         void add(move T value)
         {
@@ -121,7 +131,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // set()'s transfer counterpart, guarded exactly like add(move T) above. Declaration order
     // relative to the plain set() does not matter: interface conformance accepts the class if
     // any overload satisfies the contract, and dispatch binds the contract-matching overload.
-    if const (!is_pointer(T))
+    if const (!is_pointer(T) && is_movable(T))
     {
         void set(int index, move T value)
         {
@@ -153,15 +163,20 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // (`unique`) or destructed (value type); a bare pointer or interface is just dropped.
     void removeAt(int index)
     {
-        _checkBounds(index, "removeAt");
-        _releaseAt(index);
-        int i = index;
-        while (i < _size - 1)
+        if const (!is_movable(T))
+            compile_error("list<T>: element type is [immovable] - removing, taking or copying relocates elements; use list<T*>");
+        else
         {
-            construct_at(&_data[i], move _data[i + 1]);
-            i++;
+            _checkBounds(index, "removeAt");
+            _releaseAt(index);
+            int i = index;
+            while (i < _size - 1)
+            {
+                construct_at(&_data[i], move _data[i + 1]);
+                i++;
+            }
+            _size--;
         }
-        _size--;
     }
 
     // Remove the element at index and return it, shifting the rest left. Ownership DEFERS to T:
@@ -171,16 +186,22 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // last element, so it is never destructed twice.
     T take(int index)
     {
-        _checkBounds(index, "take");
-        T v = move _data[index];
-        int i = index;
-        while (i < _size - 1)
+        if const (!is_movable(T))
+            compile_error("list<T>: element type is [immovable] - removing, taking or copying relocates elements; use list<T*>");
+        else
         {
-            construct_at(&_data[i], move _data[i + 1]);
-            i++;
+            _checkBounds(index, "take");
+            T v = move _data[index];
+            int i = index;
+            while (i < _size - 1)
+            {
+                construct_at(&_data[i], move _data[i + 1]);
+                i++;
+            }
+            _size--;
+            return v;
         }
-        _size--;
-        return v;
+        while (true) { }
     }
 
     // Remove all elements. The backing buffer is kept - capacity is unchanged.
@@ -204,27 +225,33 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // `.copy()` in a dead `if const` branch so a mere declaration stays legal (fires only if called).
     move list<T> copy()
     {
-        // The result-building lives in the `else` so it is a DEAD if const branch for a `unique`
-        // element type: eager instantiation would otherwise codegen `_data[i].copy()` on an owned
-        // pointer (a deref-copy of the pointee), so keep it out of the unique monomorphization.
-        if const (is_unique(T))
-        {
-            compile_error("cannot copy a list of unique elements; copy the pointees explicitly, or use list<T*> for a borrowing copy");
-            list<T> none;
-            return none;
-        }
+        if const (!is_movable(T))
+            compile_error("list<T>: element type is [immovable] - removing, taking or copying relocates elements; use list<T*>");
         else
         {
-            list<T> result;
-            int i = 0;
-            while (i < _size)
+            // The result-building lives in the `else` so it is a DEAD if const branch for a `unique`
+            // element type: eager instantiation would otherwise codegen `_data[i].copy()` on an owned
+            // pointer (a deref-copy of the pointee), so keep it out of the unique monomorphization.
+            if const (is_unique(T))
             {
-                if const (!is_copyable(T)) compile_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the list instead of copying it");
-                else                       result.add(_data[i]);
-                i++;
+                compile_error("cannot copy a list of unique elements; copy the pointees explicitly, or use list<T*> for a borrowing copy");
+                list<T> none;
+                return none;
             }
-            return result;
+            else
+            {
+                list<T> result;
+                int i = 0;
+                while (i < _size)
+                {
+                    if const (!is_copyable(T)) compile_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the list instead of copying it");
+                    else                       result.add(_data[i]);
+                    i++;
+                }
+                return result;
+            }
         }
+        while (true) { }
     }
 
     // Return an independent copy whose backing array and (string) element buffers are all
@@ -232,36 +259,44 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // the internal `new` allocations through `alloc` by installing it as the active allocator.
     move list<T> copy(IAllocator alloc)
     {
-        // Result-building sits in the `else` so it is a dead if const branch for a `unique` element
-        // type (see the no-arg copy() above for why eager instantiation forces this).
-        if const (is_unique(T))
-        {
-            compile_error("cannot copy a list of unique elements; copy the pointees explicitly, or use list<T*> for a borrowing copy");
-            list<T> none;
-            return none;
-        }
+        if const (!is_movable(T))
+            compile_error("list<T>: element type is [immovable] - removing, taking or copying relocates elements; use list<T*>");
         else
         {
-            IAllocator saved = __active_allocator;
-            __active_allocator = alloc;
-
-            list<T> result;
-            int i = 0;
-            while (i < _size)
+            // Result-building sits in the `else` so it is a dead if const branch for a `unique` element
+            // type (see the no-arg copy() above for why eager instantiation forces this).
+            if const (is_unique(T))
             {
-                // Total copy policy per element (identity for borrows, deep for copyable owners).
-                if const (!is_copyable(T)) compile_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the list instead of copying it");
-                else                       result.add(_data[i]);
-                i++;
+                compile_error("cannot copy a list of unique elements; copy the pointees explicitly, or use list<T*> for a borrowing copy");
+                list<T> none;
+                return none;
             }
+            else
+            {
+                IAllocator saved = __active_allocator;
+                __active_allocator = alloc;
 
-            __active_allocator = saved;
-            return result;
+                list<T> result;
+                int i = 0;
+                while (i < _size)
+                {
+                    // Total copy policy per element (identity for borrows, deep for copyable owners).
+                    if const (!is_copyable(T)) compile_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the list instead of copying it");
+                    else                       result.add(_data[i]);
+                    i++;
+                }
+
+                __active_allocator = saved;
+                return result;
+            }
         }
+        while (true) { }
     }
 
     // Imported move-only C++ values cannot pass by-value comparator arguments.
     // Keep sort available for all CFlat value types, including move-only structs.
+    if const (is_movable(T))
+    {
     if const (!is_cpp_class(T) || is_copyable(T))
     {
         // Lomuto partition: pivot at _data[hi], returns final pivot index.
@@ -317,31 +352,37 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
                 _qsort(0, _size - 1, compare);
         }
     }
+    }
 
     // Insert value at index, shifting [index, count) up by one slot; index == count() appends.
     // The shift is a raw slot move (no copy, no destructor), so it composes with `unique`
     // elements exactly as removeAt() does; the store itself defers to T like add() above.
     void insert(int index, T value)
     {
-        if (index == _size)
+        if const (!is_movable(T))
+            compile_error("list<T>: element type is [immovable] - removing, taking or copying relocates elements; use list<T*>");
+        else
         {
-            add(value);
-            return;
+            if (index == _size)
+            {
+                add(value);
+                return;
+            }
+            _checkBounds(index, "insert");
+            if (_size >= _capacity) _grow();
+            int i = _size;
+            while (i > index)
+            {
+                construct_at(&_data[i], move _data[i - 1]);
+                i--;
+            }
+            construct_at(&_data[index], value);
+            _size++;
         }
-        _checkBounds(index, "insert");
-        if (_size >= _capacity) _grow();
-        int i = _size;
-        while (i > index)
-        {
-            construct_at(&_data[i], move _data[i - 1]);
-            i--;
-        }
-        construct_at(&_data[index], value);
-        _size++;
     }
 
     // Transfer overload, mirroring add(move T) - same `!is_pointer(T)` design rule.
-    if const (!is_pointer(T))
+    if const (!is_pointer(T) && is_movable(T))
     {
         void insert(int index, move T value)
         {
@@ -376,16 +417,21 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // backing buffer only - elements are already released, so no per-element dtor pass.
     ~list()
     {
-        int i = 0;
-        while (i < _size)
+        if const (!is_movable(T))
+            compile_error("list<T>: element type is [immovable] - the container relocates elements; use list<T*>");
+        else
         {
-            _releaseAt(i);
-            i++;
-        }
-        if (_data != nullptr)
-        {
-            if const (is_pointer(T)) delete[_] _data;
-            else free((void*)_data);
+            int i = 0;
+            while (i < _size)
+            {
+                _releaseAt(i);
+                i++;
+            }
+            if (_data != nullptr)
+            {
+                if const (is_pointer(T)) delete[_] _data;
+                else free((void*)_data);
+            }
         }
     }
 };

@@ -563,6 +563,18 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                                         const std::string& retText,
                                         bool defaultValue) {
         auto* compiler = Compiler(errCtx);
+        // [immovable]: a CFlat struct returns by value through a first-class aggregate, not a sret slot,
+        // so every by-value return of it is refused. C++ records are checked after the operand parse.
+        if (!compiler->currentFunctionReturnTV.Pointer && !compiler->currentFunctionReturnTV.IsAlias
+            && !compiler->IsCxxRecord(compiler->currentFunctionReturnTypeName)
+            && compiler->IsImmovableType(compiler->currentFunctionReturnTypeName))
+        {
+            LogErrorContext(errCtx, std::format(
+                "cannot return a value of [immovable] type '{}' by value - the value would be moved "
+                "out of its construction site (return a pointer, or construct it in the caller)",
+                SpellDiagnosticType(*compiler, compiler->currentFunctionReturnTV)));
+            return;
+        }
         if (defaultValue && !compiler->currentFunctionReturnTV.Pointer
             && compiler->IsCxxRecord(compiler->currentFunctionReturnTypeName))
         {
@@ -664,6 +676,18 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 trivialCxxMoveSite_ = TopLevelMoveExpression(assignExpr);
             returnNV = ParseAssignmentExpressionNamed(assignExpr, ResultUse::ReturnOperand);
             trivialCxxMoveSite_ = nullptr;
+            // [immovable] C++ record: C++17 elision builds a fresh prvalue in the sret slot, so only a place
+            // operand (variable, field, element, deref) is refused; a fresh one stays legal.
+            if (cxxSretReturn && !compiler->currentFunctionReturnTV.Pointer && !compiler->currentFunctionReturnTV.IsAlias
+                && !returnNV.TypeAndValue.Pointer && compiler->IsImmovableType(compiler->currentFunctionReturnTypeName)
+                && (returnNV.IsExplicitMove || !compiler->IsImmovableFreshOperand(returnNV)))
+            {
+                LogErrorContext(errCtx, std::format(
+                    "cannot return a place of [immovable] type '{}' by value - returning it would move the "
+                    "value out of its owner (return a pointer, or construct the value in the return statement)",
+                    SpellDiagnosticType(*compiler, compiler->currentFunctionReturnTV)));
+                return;
+            }
             // `return std.move(x)` of a trivially copyable C++ class returned in registers: the
             // referent's bytes (the trivial pick), or a temporary built by clang's pick.
             if (!cxxSretReturn && !compiler->currentFunctionReturnTV.Pointer
@@ -1974,7 +1998,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 CurrentReturnTypeSpelling(compiler)));
         }
 
-        if (ReturnLeaksOwnershipIntoInterface(right, compiler))
+        if (ReturnLeaksOwnershipIntoInterface(right, compiler, returnNV.IsPointerArithmeticResult))
         {
             LogErrorContext(errCtx, std::format(
                 "returning a heap object boxed into interface '{}' from a non-'move' function "
@@ -2537,7 +2561,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                         slotNV != nullptr && slotNV->InterfaceBoxFrameStorage,
                         slotNV == nullptr || slotNV->InterfaceBoxReturnProvenanceUnknown,
                         slotNV == nullptr ? std::string()
-                            : slotNV->InterfaceBoxFrameStorageClassName);
+                            : slotNV->InterfaceBoxFrameStorageClassName,
+                        slotNV != nullptr && slotNV->InterfaceBoxAliasOfOwnedLocal);
                 }
         }
         if (auto* fatTy = compiler->GetFatPtrType();
@@ -2547,14 +2572,6 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 || returnedFatFrameSlot != nullptr))
         {
             const std::string& ifaceName = compiler->currentFunctionReturnTypeName;
-            // An interface return takes the boxed object over; a pointer-arithmetic result names
-            // no object of its own. Refused before boxing (LogErrorContext throws).
-            if (returnNV.IsPointerArithmeticResult)
-                LogErrorContext(errCtx, std::format(
-                    "cannot convert this expression to interface '{}': a pointer arithmetic "
-                    "result is not returned as an interface; bind it to a local variable of "
-                    "the class type first", SpellType(*compiler,
-                        LLVMBackend::TypeAndValue{ .TypeName = ifaceName })));
             std::string structName = ReturnUpcastStructName(returnNV);
 
             if (returnedFatFrameSlot != nullptr)
@@ -2584,6 +2601,28 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             {
                 if (returnNV.TypeAndValue.Pointer)
                 {
+                    // A pointer into this frame (a frame array / by-value struct element or
+                    // field) or a borrow of an owning local is freed at return: refuse. Only
+                    // provable roots refuse; an undecided root is accepted as before.
+                    if (right->getType()->isPointerTy() && !llvm::isa<llvm::Constant>(right))
+                    {
+                        PointerValueRootKind rootKind = PointerRootKind(right, compiler);
+                        // `&hp->first` folds to `hp` in IR (field 0): a member address of an owning local
+                        // is still a borrow of it. `&t[0]` is not a member access and stays a move.
+                        if (rootKind == PointerValueRootKind::OwnedLocal && retText.size() > 1
+                            && retText[0] == '&'
+                            && (retText.find("->") != std::string::npos || retText.find('.') != std::string::npos))
+                            rootKind = PointerValueRootKind::AliasOfOwnedLocal;
+                        if (rootKind == PointerValueRootKind::FrameLocal)
+                            LogInterfaceReturnDangle(errCtx, structName, ifaceName);
+                        else if (rootKind == PointerValueRootKind::AliasOfOwnedLocal)
+                            LogErrorContext(errCtx, std::format(
+                                "cannot return a borrow of a local owner as interface '{}' - the "
+                                "owning local is freed when this function returns and a borrow "
+                                "cannot outlive its owner; return the owning local itself "
+                                "('return t;' from a 'move' function) or a heap object",
+                                SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = ifaceName })));
+                    }
                     // Concrete implementer pointer: defer the boxing to
                     // CreateReturnCall so the owning local's scope-exit free is
                     // suppressed (ownership moves to the caller).

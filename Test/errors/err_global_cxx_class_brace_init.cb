@@ -1,0 +1,11 @@
+// A file-scope brace list for a C++ class is refused with a message naming the global C++ class case.
+// cflat runs only a global's default constructor at startup, so constructor arguments cannot be passed.
+import cpp "cpp_t63_brace_decl.hpp";
+
+expect_error("brace initializers are not supported for a global of C++ class 't63.VecPick'");
+t63.VecPick gp{2, 5};
+
+extern int main()
+{
+    return 0;
+}

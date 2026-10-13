@@ -1,0 +1,7 @@
+// [immovable] (T90) F3: a bare dictionary<Node> declaration of an immovable element is refused by the container
+// itself (a compile_error in the core dictionary relocating method), named at the declaration. File-scope
+// expectation: the core error is deferred past the scoped form, so the declaration sits in main.
+import "dictionary.cb";
+[immovable] struct Node { int x = 0; int hash() { return x; } bool operator==(alias Node o) { return x == o.x; } };
+expect_error("dictionary<K, V>: key or value type is [immovable]");
+extern int main() { dictionary<int, Node> v; return 0; }

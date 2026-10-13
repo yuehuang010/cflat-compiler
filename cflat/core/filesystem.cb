@@ -23,10 +23,10 @@ i8 _fs_sep() { if const (__WINDOWS__) { return '\\'; } else { return '/'; } }
 // Portable C stdio (fopen family) lives in cruntime.cb; call it un-namespaced.
 void* _fs_fopen(const char* path, const char* mode) { return fopen(path, mode); }
 win_int _fs_fclose(void* s) { return fclose(s); }
-i64 _fs_fread(i8* buf, i64 size, i64 count, void* s) {
+i64 _fs_fread(char* buf, i64 size, i64 count, void* s) {
     return (i64)fread(buf, (win_size)size, (win_size)count, s);
 }
-i64 _fs_fwrite(i8* buf, i64 size, i64 count, void* s) {
+i64 _fs_fwrite(char* buf, i64 size, i64 count, void* s) {
     return (i64)fwrite(buf, (win_size)size, (win_size)count, s);
 }
 win_int _fs_feof(void* s) { return feof(s); }
@@ -55,7 +55,7 @@ win_int _fs_unlink(const char* path) { return os.unlink(path); }
 bool _fs_move(const char* src, const char* dst) { return os.rename(src, dst) == 0; }
 win_int _fs_mkdir(const char* path) { return os.mkdir(path); }
 win_int _fs_rmdir(const char* path) { return os.rmdir(path); }
-i8* _fs_getcwd(i8* buf, int size) { return os.getcwd(buf, (i64)size); }
+char* _fs_getcwd(char* buf, int size) { return os.getcwd(buf, (i64)size); }
 win_int _fs_chdir(const char* path) { return os.chdir(path); }
 
 // Copy src -> dst (overwrite) via a portable stdio read/write loop (works on both
@@ -65,7 +65,7 @@ bool _fs_copy(const char* src, const char* dst) {
     if (fin == nullptr) return false;
     void* fout = fopen(dst, "wb");
     if (fout == nullptr) { fclose(fin); return false; }
-    i8* buf = new i8[65536];
+    char* buf = new char[65536];
     bool ok = true;
     while (true) {
         win_size n = fread(buf, (win_size)1, (win_size)65536, fin);
@@ -179,7 +179,7 @@ class File
         i64 isz = _fs_ftell(_handle);
         if (isz < 0 || isz > (i64)2147483647) { _fs_fseek(_handle, 0, 0); return ""; }
         _fs_fseek(_handle, 0, 0);
-        i8* buf = new i8[isz + 1];
+        char* buf = new char[isz + 1];
         _fs_fread(buf, 1, isz, _handle);
         buf[isz] = 0;
         // buf is heap-owned: wrap it as an OWNING string so the dtor frees it (avoids a leak).
@@ -190,7 +190,7 @@ class File
     i64 readBytes(i8* buf, i64 count)
     {
         if (_handle == nullptr) return 0;
-        return _fs_fread(buf, 1, count, _handle);
+        return _fs_fread((char*)buf, 1, count, _handle);
     }
 
     // Write a string to the file. Returns true if all bytes were written.
@@ -215,7 +215,7 @@ class File
     i64 writeBytes(i8* buf, i64 count)
     {
         if (_handle == nullptr) return 0;
-        return _fs_fwrite(buf, 1, count, _handle);
+        return _fs_fwrite((char*)buf, 1, count, _handle);
     }
 
     // Flush write buffers to the OS. Returns true on success.
@@ -473,7 +473,7 @@ class Path
     // Return the filename component (everything after the last separator).
     static move string getFileName(string path)
     {
-        i8* p = path.data();
+        char* p = path.data();
         i32 len = path.length();
         i32 lastSep = -1;
         i32 i = 0;
@@ -484,7 +484,7 @@ class Path
         }
         i32 start = lastSep + 1;
         i32 nameLen = len - start;
-        i8* buf = new i8[nameLen + 1];
+        char* buf = new char[nameLen + 1];
         memcpy(buf, p + start, nameLen + 1);
         return _strOwned(buf, nameLen);
     }
@@ -493,7 +493,7 @@ class Path
     // Returns "" if path contains no separator.
     static move string getDirectory(string path)
     {
-        i8* p = path.data();
+        char* p = path.data();
         i32 len = path.length();
         i32 lastSep = -1;
         i32 i = 0;
@@ -504,7 +504,7 @@ class Path
         }
         if (lastSep < 0) return "";
         i32 dirLen = lastSep == 0 ? 1 : lastSep;
-        i8* buf = new i8[dirLen + 1];
+        char* buf = new char[dirLen + 1];
         memcpy(buf, p, dirLen);
         buf[dirLen] = 0;
         return _strOwned(buf, dirLen);
@@ -513,7 +513,7 @@ class Path
     // Return the extension including the leading dot (e.g. ".txt"), or "" if none.
     static move string getExtension(string path)
     {
-        i8* p = path.data();
+        char* p = path.data();
         i32 len = path.length();
         i32 lastDot = -1;
         i32 i = 0;
@@ -525,7 +525,7 @@ class Path
         }
         if (lastDot < 0) return "";
         i32 extLen = len - lastDot;
-        i8* buf = new i8[extLen + 1];
+        char* buf = new char[extLen + 1];
         memcpy(buf, p + lastDot, extLen + 1);
         return _strOwned(buf, extLen);
     }
@@ -544,7 +544,7 @@ class Path
     // Pass ext="" to strip the extension.
     static move string changeExtension(string path, string ext)
     {
-        i8* p = path.data();
+        char* p = path.data();
         i32 len = path.length();
         i32 lastDot = -1;
         i32 i = 0;
@@ -558,7 +558,7 @@ class Path
         i32 extLen = ext.length();
         bool needDot = extLen > 0 && ext.data()[0] != '.';
         i32 totalLen = baseLen + (needDot ? 1 : 0) + extLen;
-        i8* buf = new i8[totalLen + 1];
+        char* buf = new char[totalLen + 1];
         memcpy(buf, p, baseLen);
         i32 pos = baseLen;
         if (needDot) { buf[pos] = '.'; pos++; }
@@ -572,8 +572,8 @@ class Path
     {
         // os.realpath resolves to absolute form; on failure (path must exist on
         // POSIX) the contract is to return the path unchanged.
-        i8* buf = new i8[4096];
-        i8* result = os.realpath(path.data(), buf);
+        char* buf = new char[4096];
+        char* result = os.realpath(path.data(), buf);
         if (result == nullptr) { delete[] buf; return path.copy(); }
         return _strOwned(buf, strlen(buf));
     }
@@ -582,7 +582,7 @@ class Path
     // Delegates to os.temp_dir (Win GetTempPathA / POSIX $TMPDIR or /tmp).
     static move string getTempPath()
     {
-        i8* buf = new i8[260];
+        char* buf = new char[260];
         i32 len = os.temp_dir(buf, 260);
         if (len == 0) { delete[] buf; return ""; }
         return _strOwned(buf, len);
@@ -594,7 +594,7 @@ class Path
     // Delegates to os.make_temp_file (Win GetTempFileNameA / POSIX mkstemp).
     static move string getTempFile(string prefix)
     {
-        i8* buf = new i8[300];
+        char* buf = new char[300];
         if (!os.make_temp_file(prefix.data(), buf, 300)) { delete[] buf; return ""; }
         return _strOwned(buf, strlen(buf));
     }
@@ -605,7 +605,7 @@ class Path
 // Directory operations, both instance-bound (via init) and as static helpers.
 class Directory
 {
-    i8* _pathPtr = nullptr;
+    char* _pathPtr = nullptr;
     i32 _pathLen = 0;
 
     // Set the directory path this instance operates on.
@@ -614,7 +614,7 @@ class Directory
     {
         if (_pathPtr != nullptr) delete[] _pathPtr;
         i32 len = path.length();
-        i8* buf = new i8[len + 1];
+        char* buf = new char[len + 1];
         memcpy(buf, path.data(), len + 1);
         _pathPtr = buf;
         _pathLen = len;
@@ -667,8 +667,8 @@ class Directory
     // Return the process current working directory.
     static move string getCurrent()
     {
-        i8* buf = new i8[4096];
-        i8* result = _fs_getcwd(buf, 4096);
+        char* buf = new char[4096];
+        char* result = _fs_getcwd(buf, 4096);
         if (result == nullptr)
         {
             delete[] buf;
@@ -717,7 +717,7 @@ class Directory
         if (_fs_exists(path.data())) return true;
 
         i32 len = path.length();
-        i8* buf = new i8[len + 1];
+        char* buf = new char[len + 1];
         memcpy(buf, path.data(), len + 1);
 
         int i = 0;
@@ -760,7 +760,7 @@ class Directory
         void* dir = os.opendir(path.data());
         if (dir == nullptr) return result;
         while (true) {
-            i8* name = os.readdir_name(dir);
+            char* name = os.readdir_name(dir);
             if (name == nullptr) break;
             bool isDot = strcmp(name, ".") == 0 || strcmp(name, "..") == 0;
             if (isDot) continue;
@@ -774,7 +774,7 @@ class Directory
             bool include = filter == 0 || (filter == 1 && !isDir) || (filter == 2 && isDir);
             if (include) {
                 int len = strlen(name);
-                i8* nameBuf = new i8[len + 1];
+                char* nameBuf = new char[len + 1];
                 memcpy(nameBuf, name, len + 1);
                 result->add(_strOwned(nameBuf, len));
             }

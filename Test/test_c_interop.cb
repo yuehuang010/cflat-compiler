@@ -735,7 +735,7 @@ extern int main()
     if (ml_ld_identity(2.5) != 2.5)              return 145;
     if (ml_ld_add(1.25, 2.5) != 3.75)            return 146;
     double dout = 0.0;
-    ml_ld_store(&dout, 7.125);
+    ml_ld_store((longdouble*)&dout, 7.125);
     if (dout != 7.125)                           return 147;
     dout = 0.0;
 

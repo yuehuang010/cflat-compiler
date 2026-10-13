@@ -87,6 +87,26 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
                     initValue = llvm::ConstantInt::get(*context, converted);
                 }
             }
+            else if (auto fpValue = llvm::dyn_cast<llvm::ConstantFP>(initValue);
+                     fpValue != nullptr && destinationType->isIntegerTy())
+            {
+                // A floating literal initializing an integer global (`u32 g = 3000000000.5;`):
+                // truncate toward zero into the destination's signedness, as clang does. A bool
+                // global is a truth test. Out-of-range values saturate here (clang: UB).
+                if (destinationType->isIntegerTy(1))
+                {
+                    initValue = llvm::ConstantInt::getBool(*context, !fpValue->getValueAPF().isZero());
+                }
+                else
+                {
+                    unsigned destBits = destinationType->getIntegerBitWidth();
+                    bool destIsUnsigned = typeValue.IsUnsignedInteger() != -1;
+                    llvm::APSInt converted(destBits, destIsUnsigned);
+                    bool isExact = false;
+                    fpValue->getValueAPF().convertToInteger(converted, llvm::APFloat::rmTowardZero, &isExact);
+                    initValue = llvm::ConstantInt::get(*context, converted);
+                }
+            }
             else if (auto fpValue = llvm::dyn_cast<llvm::ConstantFP>(initValue))
             {
                 // Widen a narrower FP constant to the global's type (float -> double is implicit).
@@ -723,7 +743,7 @@ llvm::Value* LLVMBackend::CreateExtractValue(llvm::Value* structInstance, unsign
         return builder->CreateExtractValue(structInstance, index);
     }
 
-llvm::StoreInst* LLVMBackend::CreateAssignment(llvm::Value* value, llvm::Value* destination, bool srcIsUnsigned, llvm::Type* explicitDestType)
+llvm::StoreInst* LLVMBackend::CreateAssignment(llvm::Value* value, llvm::Value* destination, bool srcIsUnsigned, llvm::Type* explicitDestType, bool destUnsigned)
 {
         auto destType = explicitDestType ? explicitDestType : GetTypeFromStorage(destination);
         if (destType == builder->getInt1Ty())
@@ -754,7 +774,7 @@ llvm::StoreInst* LLVMBackend::CreateAssignment(llvm::Value* value, llvm::Value* 
                 // Scalar into simd<T,N> storage: splat across the lanes, the same rule the
                 // declaration initializer uses. The else arm below casts scalar-to-vector, a
                 // bitcast that wrote the value into every EVEN lane and left the odd ones zero.
-                value = SplatScalarToVectorType(value, dvt, srcIsUnsigned);
+                value = SplatScalarToVectorType(value, dvt, srcIsUnsigned, destUnsigned);
             }
             else
             {
@@ -762,7 +782,7 @@ llvm::StoreInst* LLVMBackend::CreateAssignment(llvm::Value* value, llvm::Value* 
                 // CreateCast handles all other conversions (truncation, int<->float, ptr<->int, etc.).
                 value = Upconvert(value, destType, srcIsUnsigned);
                 if (value->getType() != destType)
-                    value = CreateCast(value, destType);
+                    value = CreateCast(value, destType, false, destUnsigned);
             }
         }
         return builder->CreateStore(value, destination);
@@ -1000,7 +1020,7 @@ std::string LLVMBackend::DescribeAggregateStorageShape(llvm::Type* type,
         return std::format("fixed-array storage with dimensions {}", dims);
     }
 
-llvm::Value* LLVMBackend::CreateCast(llvm::Value* value, llvm::Type* destType, bool isSigned)
+llvm::Value* LLVMBackend::CreateCast(llvm::Value* value, llvm::Type* destType, bool isSigned, bool destUnsigned)
 {
         auto srcType = value->getType();
 
@@ -1049,7 +1069,7 @@ llvm::Value* LLVMBackend::CreateCast(llvm::Value* value, llvm::Type* destType, b
         // Float -> Integer
         if (srcType->isFloatingPointTy() && destType->isIntegerTy())
         {
-            return builder->CreateFPToSI(value, destType);
+            return destUnsigned ? builder->CreateFPToUI(value, destType) : builder->CreateFPToSI(value, destType);
         }
 
         // Pointer -> Integer
@@ -2076,9 +2096,11 @@ llvm::Value* LLVMBackend::CreateVectorOperation(Operation op, llvm::Value* left,
         auto* rvt = llvm::dyn_cast<llvm::FixedVectorType>(right->getType());
         llvm::FixedVectorType* vt = lvt ? lvt : rvt;
 
+        // A scalar splatted into the vector converts to the VECTOR operand's lane signedness.
+        const bool laneUnsigned = lvt ? leftIsUnsigned : rightIsUnsigned;
         auto splat = [&](llvm::Value* scalar, bool srcIsUnsigned) -> llvm::Value*
         {
-            return SplatScalarToVectorType(scalar, vt, srcIsUnsigned);
+            return SplatScalarToVectorType(scalar, vt, srcIsUnsigned, laneUnsigned);
         };
         if (!lvt) left = splat(left, leftIsUnsigned);
         if (!rvt) right = splat(right, rightIsUnsigned);
@@ -2146,21 +2168,21 @@ llvm::Value* LLVMBackend::SplatToSimd(llvm::Value* scalar, const TypeAndValue& t
                 "cannot splat a scalar into '{}' - it does not name simd vector storage", decl));
             return scalar;
         }
-        return SplatScalarToVectorType(scalar, vecTy, srcIsUnsigned);
+        return SplatScalarToVectorType(scalar, vecTy, srcIsUnsigned, tv.IsUnsignedInteger() != -1);
     }
 
 llvm::Value* LLVMBackend::SplatScalarToVectorType(llvm::Value* scalar, llvm::FixedVectorType* vecTy,
-                                                  bool srcIsUnsigned)
+                                                  bool srcIsUnsigned, bool destUnsigned)
 {
-        scalar = ConvertScalarToType(scalar, vecTy->getElementType(), srcIsUnsigned);
+        scalar = ConvertScalarToType(scalar, vecTy->getElementType(), srcIsUnsigned, destUnsigned);
         return builder->CreateVectorSplat(vecTy->getElementCount(), scalar);
     }
 
-llvm::Value* LLVMBackend::ConvertScalarToType(llvm::Value* scalar, llvm::Type* target, bool srcIsUnsigned)
+llvm::Value* LLVMBackend::ConvertScalarToType(llvm::Value* scalar, llvm::Type* target, bool srcIsUnsigned, bool destUnsigned)
 {
         scalar = Upconvert(scalar, target, srcIsUnsigned);
         if (scalar->getType() != target)
-            scalar = CreateCast(scalar, target);
+            scalar = CreateCast(scalar, target, false, destUnsigned);
         return scalar;
     }
 

@@ -134,7 +134,7 @@ class Socket
     {
         if (_handle == nullptr) return false;
         // Convert port int to decimal string for getaddrinfo.
-        i8* portBuf = new i8[8];
+        char* portBuf = new char[8];
         sprintf(portBuf, "%d", port);
 
         _AddrInfo* hints = new _AddrInfo;

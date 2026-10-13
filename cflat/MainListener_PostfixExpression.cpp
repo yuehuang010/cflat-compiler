@@ -5421,6 +5421,33 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             break;
                         }
 
+                        // Compile-time intrinsic: is_movable(T) - returns 0 if T is [immovable] (or
+                        // propagates it), 1 otherwise. Same substitution convention as is_copyable.
+                        if (!postfixMemberCallPending && functionName == "is_movable")
+                        {
+                            bool isMovable = false;
+                            if (argumentList.size() > 0)
+                            {
+                                auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
+                                if (!namedArgCtx.empty())
+                                {
+                                    std::string argText = namedArgCtx[0]->assignmentExpression()->getText();
+                                    auto substIt = activeTypeSubstitutions.find(argText);
+                                    if (substIt != activeTypeSubstitutions.end())
+                                    {
+                                        std::string base = LegacyUniqueSubstitutionSpelling(
+                                            Compiler(ctx), substIt->second);
+                                        StripOwnershipQualifiers(base);
+                                        isMovable = !Compiler(ctx)->IsImmovableType(base);
+                                    }
+                                }
+                            }
+                            namedVar.Primary = llvm::ConstantInt::get(
+                                llvm::Type::getInt1Ty(*Compiler(ctx)->context), isMovable ? 1 : 0);
+                            namedVar.TypeAndValue.TypeName = "int";
+                            break;
+                        }
+
                         // Compile-time intrinsic: is_cpp_class(T) - true for imported C++ records.
                         // Generic container code uses it to isolate C++ ABI restrictions from
                         // CFlat move-only structs, which remain valid value types.
@@ -10219,7 +10246,7 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
 
         // Compiler intrinsics handled at the call site - not in the function table.
         static const std::unordered_set<std::string> kIntrinsics = {
-            "va_start", "va_end", "is_pointer", "is_unique", "is_interface", "is_copyable", "is_cpp_class", "is_primitive", "is_string", "annotationof",
+            "va_start", "va_end", "is_pointer", "is_unique", "is_interface", "is_copyable", "is_movable", "is_cpp_class", "is_primitive", "is_string", "annotationof",
             "compile_error", "construct_at", "embed",
             "reflect", "reflect_set", "json_const", "xml_const", "__rdtscp", "__readcyclecounter", "__lfence", "__pause",
             "__popcount", "__ctz", "__clz", "__prefetch", "__fma", "__likely", "__unlikely",

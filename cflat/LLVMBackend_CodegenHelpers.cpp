@@ -541,7 +541,7 @@ void LLVMBackend::RegisterBuiltinString()
             strTy = llvm::StructType::create(*context, { ptrTy, i32Ty }, "string");
 
         DeclTypeAndValue ptrField;
-        ptrField.TypeName = "i8";
+        ptrField.TypeName = "char";
         ptrField.VariableName = "_ptr";
         ptrField.Pointer = true;
 
@@ -1899,6 +1899,42 @@ bool LLVMBackend::IsCopyableType(const std::string& typeNameIn) const
             return false;
         if (HasCopyOverloadFor(base)) return true;
         return !TypeOwnsUniquePointer(base);
+    }
+
+bool LLVMBackend::IsImmovableFreshOperand(const NamedVariable& nv) const
+{
+        return nv.IsRvalue && !nv.IsExplicitMove;
+}
+
+bool LLVMBackend::IsImmovableType(const std::string& typeNameIn) const
+{
+        std::string base = typeNameIn;
+        if (base.rfind("alias ", 0) == 0) base = base.substr(6);
+        if (base.empty() || base.back() == '*') return false;
+        std::unordered_set<std::string> seen;
+        std::function<bool(const std::string&)> walk = [&](const std::string& name) -> bool {
+            if (!seen.insert(name).second) return false;
+            if (HasTypeAnnotation(name, "immovable")) return true;
+            // A C++ class is immovable only when BOTH move and copy constructors are deleted; the
+            // member projection is the one the by-value gate already uses (no new clang request).
+            if (const CxxClassInfo* info = GetCxxClassInfo(name); info != nullptr && info->hasDeletedCopyCtor)
+            {
+                const CxxClassInfo* withCtors = GetCxxClassInfoWithConstructors(name);
+                if (withCtors != nullptr && withCtors->hasDeletedMoveCtor) return true;
+                return false;
+            }
+            auto it = dataStructures.find(name);
+            if (it == dataStructures.end()) return false;
+            for (const auto& field : it->second.StructFields)
+            {
+                if (field.Pointer || field.ElemPointer || field.IsArrayView || field.IsSimd
+                    || field.IsBitfield || field.IsPadding || field.IsInterface)
+                    continue;
+                if (walk(field.TypeName)) return true;
+            }
+            return false;
+        };
+        return walk(base);
     }
 
 bool LLVMBackend::ParamIsAliasReturnSlot(const TypeAndValue& ret, const TypeAndValue& p) const

@@ -10,8 +10,8 @@
 // helper and all reject an unresolvable arm with this wording. The RETURN leg is the one that used
 // to die on the verifier dump. A separate BACKSTOP on the return path words itself "cannot convert
 // this expression to interface '<I>': its concrete class cannot be determined" - it names no
-// operator, because pointer arithmetic reaches it too - and the last leg in this file pins THAT
-// wording. The two substrings are disjoint, so each leg proves which of the two sites fired.
+// operator, because a nameless pointer expression reaches it too. The last leg in this file pins
+// THAT wording with `(t ?? t) + 0`: the arithmetic on a join whose class cannot be recovered.
 
 interface IThing { int value(); };
 
@@ -71,15 +71,10 @@ expect_error("no overload of 'byValThing' matches the given arguments") {
     }
 }
 
-// The RETURN BACKSTOP - the last-resort guard that stops a raw pointer reaching the module
-// verifier. Reachable by ANY nameless pointer expression, not just a join (pointer arithmetic
-// gets here), so its wording names no operator. It is deliberately DIFFERENT from the per-arm
-// helper's "cannot convert '??' arm ..." above, so a test pinning either wording proves which
-// site fired.
 expect_error("cannot convert this expression to interface 'IThing'") {
     IThing returnPointerArithmetic(Thing* t)
     {
-        return t + 0;
+        return (t ?? t) + 0;
     }
 }
 

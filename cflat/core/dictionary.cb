@@ -85,36 +85,41 @@ struct dictionary<K, V>
     // Rebuild the table at `newCap`, reinserting live entries and dropping tombstones.
     void _rehash(int newCap)
     {
-        K*    oldKeys   = _keys;
-        V*    oldValues = _values;
-        char* oldStatus = _status;
-        int   oldCap    = _capacity;
-
-        _count = 0;
-        _tombstones = 0;
-        _init(newCap);
-
-        int i = 0;
-        while (i < oldCap)
+        if const (!is_movable(K) || !is_movable(V))
+            compile_error("dictionary<K, V>: key or value type is [immovable] - rehashing relocates entries; use dictionary<K*, V*>");
+        else
         {
-            if (oldStatus[i] == 1)
-            {
-                int slot = _slot(oldKeys[i]);
-                while (_status[slot] != 0)
-                    slot = (slot + 1) % _capacity;
-                _keys[slot]   = oldKeys[i];
-                _values[slot] = oldValues[i];
-                _status[slot] = 1;
-                _count++;
-            }
-            i++;
-        }
+            K*    oldKeys   = _keys;
+            V*    oldValues = _values;
+            char* oldStatus = _status;
+            int   oldCap    = _capacity;
 
-        if const (is_pointer(K)) delete[] oldKeys;
-        else free((void*)oldKeys);
-        if const (is_pointer(V)) delete[] oldValues;
-        else free((void*)oldValues);
-        delete[] oldStatus;
+            _count = 0;
+            _tombstones = 0;
+            _init(newCap);
+
+            int i = 0;
+            while (i < oldCap)
+            {
+                if (oldStatus[i] == 1)
+                {
+                    int slot = _slot(oldKeys[i]);
+                    while (_status[slot] != 0)
+                        slot = (slot + 1) % _capacity;
+                    _keys[slot]   = oldKeys[i];
+                    _values[slot] = oldValues[i];
+                    _status[slot] = 1;
+                    _count++;
+                }
+                i++;
+            }
+
+            if const (is_pointer(K)) delete[] oldKeys;
+            else free((void*)oldKeys);
+            if const (is_pointer(V)) delete[] oldValues;
+            else free((void*)oldValues);
+            delete[] oldStatus;
+        }
     }
 
     // Store the key into a slot that holds no live key yet. The total `.copy()` does the right
@@ -125,10 +130,15 @@ struct dictionary<K, V>
     // caller's soon-freed argument, leaving the stored key dangling once that buffer is freed.
     void _placeKeyAt(int index, alias K key)
     {
-        // A `unique` key is policy-rejected on the hash path; keep its .copy() (itself an error on
-        // an owning key) out of the instantiation so that tailored diagnostic is the one reported.
-        if const (is_unique(K)) compile_error("dictionary keys cannot be 'unique'; a lookup reads the key for hashing/equality and would move it out. Use 'dictionary<K*, V>' for a borrowed key, or a primitive/owning-value key, and manage the key lifetime separately.");
-        else _keys[index] = key.copy();
+        if const (!is_movable(K))
+            compile_error("dictionary<K, V>: key or value type is [immovable] - the container relocates entries; use dictionary<K*, V*>");
+        else
+        {
+            // A `unique` key is policy-rejected on the hash path; keep its .copy() (itself an error on
+            // an owning key) out of the instantiation so that tailored diagnostic is the one reported.
+            if const (is_unique(K)) compile_error("dictionary keys cannot be 'unique'; a lookup reads the key for hashing/equality and would move it out. Use 'dictionary<K*, V>' for a borrowed key, or a primitive/owning-value key, and manage the key lifetime separately.");
+            else _keys[index] = key.copy();
+        }
     }
 
     // Release the value in a live slot by moving it into the discard sink and letting that drop:
@@ -137,7 +147,12 @@ struct dictionary<K, V>
     // value type / string is destructed. `move _values[index]` nulls the moved-from slot.
     void _releaseValueAt(int index)
     {
-        _ = move _values[index];
+        if const (!is_movable(V))
+            compile_error("dictionary<K, V>: key or value type is [immovable] - the container relocates entries; use dictionary<K*, V*>");
+        else
+        {
+            _ = move _values[index];
+        }
     }
 
     // Release the key in a live slot the same way as a value: ownership defers to K. An owning
@@ -145,7 +160,12 @@ struct dictionary<K, V>
     // BORROW frees nothing; a primitive key is a no-op. `move _keys[index]` nulls the slot.
     void _releaseKeyAt(int index)
     {
-        _ = move _keys[index];
+        if const (!is_movable(K))
+            compile_error("dictionary<K, V>: key or value type is [immovable] - the container relocates entries; use dictionary<K*, V*>");
+        else
+        {
+            _ = move _keys[index];
+        }
     }
 
     // Locate the slot to insert `key` into, or -1 if the key is already present. Sets up the
@@ -176,27 +196,33 @@ struct dictionary<K, V>
     // by-value copy is a no-op drop and the caller keeps its original either way.
     bool add(alias K key, V value)
     {
-        // A `unique` key cannot be borrowed for hashing; poison the whole body so the defensive
-        // copy below is never instantiated for it (that copy of an owning key is its own error,
-        // and it would preempt this diagnostic).
-        if const (is_unique(K)) compile_error("dictionary keys cannot be 'unique'; a lookup reads the key for hashing/equality and would move it out. Use 'dictionary<K*, V>' for a borrowed key, or a primitive/owning-value key, and manage the key lifetime separately.");
+        if const (!is_movable(K) || !is_movable(V))
+            compile_error("dictionary<K, V>: key or value type is [immovable] - the container relocates entries; use dictionary<K*, V*>");
         else
         {
-            if (_capacity == 0) _init(8);
-            // `key` BORROWS the caller's object, and that object may BE a slot of this dictionary's
-            // own key array (`d.add(d.keyAt(0), v)`). _maybeRehash frees that array, so take the
-            // independent copy FIRST and read only the copy afterwards.
-            K k = key.copy();
-            _maybeRehash();
-            int insertSlot = _insertSlotFor(k);
-            if (insertSlot == -1) return false;
-            _placeKeyAt(insertSlot, k);
-            _values[insertSlot] = value;
-            _status[insertSlot] = 1;
-            _count++;
-            return true;
+            // A `unique` key cannot be borrowed for hashing; poison the whole body so the defensive
+            // copy below is never instantiated for it (that copy of an owning key is its own error,
+            // and it would preempt this diagnostic).
+            if const (is_unique(K)) compile_error("dictionary keys cannot be 'unique'; a lookup reads the key for hashing/equality and would move it out. Use 'dictionary<K*, V>' for a borrowed key, or a primitive/owning-value key, and manage the key lifetime separately.");
+            else
+            {
+                if (_capacity == 0) _init(8);
+                // `key` BORROWS the caller's object, and that object may BE a slot of this dictionary's
+                // own key array (`d.add(d.keyAt(0), v)`). _maybeRehash frees that array, so take the
+                // independent copy FIRST and read only the copy afterwards.
+                K k = key.copy();
+                _maybeRehash();
+                int insertSlot = _insertSlotFor(k);
+                if (insertSlot == -1) return false;
+                _placeKeyAt(insertSlot, k);
+                _values[insertSlot] = value;
+                _status[insertSlot] = 1;
+                _count++;
+                return true;
+            }
+            return false;
         }
-        return false;
+        while (true) { }
     }
 
     // Insert or overwrite the value for key. Store semantics DEFER to V exactly as in add(): a
@@ -208,28 +234,33 @@ struct dictionary<K, V>
     // add() - there is no duplicate-refusal path.
     void set(alias K key, V value)
     {
-        // See add(): the key copy below is its own error on an owning key, so poison the body.
-        if const (is_unique(K)) compile_error("dictionary keys cannot be 'unique'; a lookup reads the key for hashing/equality and would move it out. Use 'dictionary<K*, V>' for a borrowed key, or a primitive/owning-value key, and manage the key lifetime separately.");
+        if const (!is_movable(K) || !is_movable(V))
+            compile_error("dictionary<K, V>: key or value type is [immovable] - the container relocates entries; use dictionary<K*, V*>");
         else
         {
-            if (_capacity == 0) _init(8);
-            // Self-aliasing guard, exactly as in add(): copy before the rehash frees _keys.
-            K k = key.copy();
-            _maybeRehash();
-
-            int updateSlot = _insertSlotFor(k);
-            if (updateSlot == -1)
-            {
-                updateSlot = _findSlot(k);
-                _releaseValueAt(updateSlot);
-            }
+            // See add(): the key copy below is its own error on an owning key, so poison the body.
+            if const (is_unique(K)) compile_error("dictionary keys cannot be 'unique'; a lookup reads the key for hashing/equality and would move it out. Use 'dictionary<K*, V>' for a borrowed key, or a primitive/owning-value key, and manage the key lifetime separately.");
             else
             {
-                _placeKeyAt(updateSlot, k);
-                _status[updateSlot] = 1;
-                _count++;
+                if (_capacity == 0) _init(8);
+                // Self-aliasing guard, exactly as in add(): copy before the rehash frees _keys.
+                K k = key.copy();
+                _maybeRehash();
+
+                int updateSlot = _insertSlotFor(k);
+                if (updateSlot == -1)
+                {
+                    updateSlot = _findSlot(k);
+                    _releaseValueAt(updateSlot);
+                }
+                else
+                {
+                    _placeKeyAt(updateSlot, k);
+                    _status[updateSlot] = 1;
+                    _count++;
+                }
+                _values[updateSlot] = value;
             }
-            _values[updateSlot] = value;
         }
     }
 
@@ -242,7 +273,7 @@ struct dictionary<K, V>
     // check matches the plain ones first.
     // `!is_unique(K)`: a unique key is policy-rejected on the hash path, and these bodies copy
     // the key, which is its own error on an owning key - keep them out of that instantiation.
-    if const (!is_pointer(V) && !is_unique(K))
+    if const (!is_pointer(V) && !is_unique(K) && is_movable(K) && is_movable(V))
     {
         bool add(alias K key, move V value)
         {
@@ -390,29 +421,35 @@ struct dictionary<K, V>
     // or pointer key is copied by value (a pointer key stays borrowed, as everywhere else).
     move list<K> keys()
     {
-        list<K> result;
-        // Both dead branches keep `_keys[i].copy()` out of an instantiation that cannot run it,
-        // so the key-policy / copyability diagnostics of add()/set() still fire first.
-        if const (is_unique(K))
-        {
-            compile_error("dictionary keys cannot be 'unique'; keys() would have to move each key out of its slot");
-            return move result;
-        }
-        else if const (!is_copyable(K))
-        {
-            compile_error("cannot list the keys of this dictionary: its key type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or walk the table with slotCount()/slotOccupied(i)/keyAt(i) instead");
-            return move result;
-        }
+        if const (!is_movable(K))
+            compile_error("dictionary<K, V>: key or value type is [immovable] - the container relocates entries; use dictionary<K*, V*>");
         else
         {
-            int i = 0;
-            while (i < _capacity)
+            list<K> result;
+            // Both dead branches keep `_keys[i].copy()` out of an instantiation that cannot run it,
+            // so the key-policy / copyability diagnostics of add()/set() still fire first.
+            if const (is_unique(K))
             {
-                if (_status[i] == 1) result.add(_keys[i].copy());
-                i++;
+                compile_error("dictionary keys cannot be 'unique'; keys() would have to move each key out of its slot");
+                return move result;
             }
-            return move result;
+            else if const (!is_copyable(K))
+            {
+                compile_error("cannot list the keys of this dictionary: its key type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or walk the table with slotCount()/slotOccupied(i)/keyAt(i) instead");
+                return move result;
+            }
+            else
+            {
+                int i = 0;
+                while (i < _capacity)
+                {
+                    if (_status[i] == 1) result.add(_keys[i].copy());
+                    i++;
+                }
+                return move result;
+            }
         }
+        while (true) { }
     }
 
     // Remove all entries. When V is `unique`, frees each owned value; a value type is
@@ -453,72 +490,83 @@ struct dictionary<K, V>
     //     dictionary of unique values is a compile error (use move or copy elements explicitly).
     move dictionary<K, V> copy()
     {
-        // The whole table walk lives in the `else` so it is a dead if const branch for a `unique`
-        // value type: eager instantiation would otherwise codegen `_values[i].copy()` on an owned
-        // pointer (a deref-copy of the pointee), so keep it out of the unique monomorphization.
-        if const (is_unique(V))
-        {
-            compile_error("cannot copy a dictionary of unique values; use move or copy elements explicitly");
-            dictionary<K, V> none;
-            return move none;
-        }
+        if const (!is_movable(K) || !is_movable(V))
+            compile_error("dictionary<K, V>: key or value type is [immovable] - the container relocates entries; use dictionary<K*, V*>");
         else
         {
-            dictionary<K, V> result;
-            if (_capacity == 0) return move result;
-            result._init(_capacity);
-            int i = 0;
-            while (i < _capacity)
+            // The whole table walk lives in the `else` so it is a dead if const branch for a `unique`
+            // value type: eager instantiation would otherwise codegen `_values[i].copy()` on an owned
+            // pointer (a deref-copy of the pointee), so keep it out of the unique monomorphization.
+            if const (is_unique(V))
             {
-                // Preserve the exact table layout (empty/occupied/deleted) so probe sequences match.
-                result._status[i] = _status[i];
-                if (_status[i] == 1)
-                {
-                    // Total .copy() per slot: identity for a primitive/pointer key or value (the
-                    // pointer is BORROWED - both dictionaries share the pointee, freed once by the real
-                    // owner), deep for a copyable owner. The plain `=` slot store must not turn a deep
-                    // copy into an alias, which is why .copy() produces the independent value first. A
-                    // non-copyable owning value keeps its tailored error, in a dead `if const` branch.
-                    // A `unique` key is policy-rejected on the hash path; keep its .copy() out of this
-                    // eager instantiation (a `unique` element would deref-copy the pointee) with a dead
-                    // if const branch, so the real key-policy error still fires first.
-                    if const (is_unique(K)) compile_error("dictionary keys cannot be 'unique'");
-                    else                    result._keys[i] = _keys[i].copy();
-                    if const (!is_copyable(V)) compile_error("cannot copy this dictionary: its value type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the dictionary instead of copying it");
-                    else                       result._values[i] = _values[i].copy();
-                }
-                i++;
+                compile_error("cannot copy a dictionary of unique values; use move or copy elements explicitly");
+                dictionary<K, V> none;
+                return move none;
             }
-            result._count = _count;
-            result._tombstones = _tombstones;
-            return move result;
+            else
+            {
+                dictionary<K, V> result;
+                if (_capacity == 0) return move result;
+                result._init(_capacity);
+                int i = 0;
+                while (i < _capacity)
+                {
+                    // Preserve the exact table layout (empty/occupied/deleted) so probe sequences match.
+                    result._status[i] = _status[i];
+                    if (_status[i] == 1)
+                    {
+                        // Total .copy() per slot: identity for a primitive/pointer key or value (the
+                        // pointer is BORROWED - both dictionaries share the pointee, freed once by the real
+                        // owner), deep for a copyable owner. The plain `=` slot store must not turn a deep
+                        // copy into an alias, which is why .copy() produces the independent value first. A
+                        // non-copyable owning value keeps its tailored error, in a dead `if const` branch.
+                        // A `unique` key is policy-rejected on the hash path; keep its .copy() out of this
+                        // eager instantiation (a `unique` element would deref-copy the pointee) with a dead
+                        // if const branch, so the real key-policy error still fires first.
+                        if const (is_unique(K)) compile_error("dictionary keys cannot be 'unique'");
+                        else                    result._keys[i] = _keys[i].copy();
+                        if const (!is_copyable(V)) compile_error("cannot copy this dictionary: its value type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the dictionary instead of copying it");
+                        else                       result._values[i] = _values[i].copy();
+                    }
+                    i++;
+                }
+                result._count = _count;
+                result._tombstones = _tombstones;
+                return move result;
+            }
         }
+        while (true) { }
     }
 
     // Free owned (`unique`) values and string keys, then the backing arrays. A bare
     // pointer/interface value is borrowed and never freed here (its real owner frees it).
     ~dictionary()
     {
-        int i = 0;
-        while (i < _capacity)
+        if const (!is_movable(K) || !is_movable(V))
+            compile_error("dictionary<K, V>: key or value type is [immovable] - the container relocates entries; use dictionary<K*, V*>");
+        else
         {
-            if (_status[i] == 1)
+            int i = 0;
+            while (i < _capacity)
             {
-                _releaseValueAt(i);
-                _releaseKeyAt(i);
+                if (_status[i] == 1)
+                {
+                    _releaseValueAt(i);
+                    _releaseKeyAt(i);
+                }
+                i++;
             }
-            i++;
+            if (_keys != nullptr)
+            {
+                if const (is_pointer(K)) delete[_] _keys;
+                else free((void*)_keys);
+            }
+            if (_values != nullptr)
+            {
+                if const (is_pointer(V)) delete[_] _values;
+                else free((void*)_values);
+            }
+            if (_status != nullptr) delete[] _status;
         }
-        if (_keys != nullptr)
-        {
-            if const (is_pointer(K)) delete[_] _keys;
-            else free((void*)_keys);
-        }
-        if (_values != nullptr)
-        {
-            if const (is_pointer(V)) delete[_] _values;
-            else free((void*)_values);
-        }
-        if (_status != nullptr) delete[] _status;
     }
 };

@@ -1962,6 +1962,27 @@ local, an rvalue, and a `unique`-declared owner are all accepted, and `list<uniq
 catch: passing the local to a helper first (`bag.put(p)`), where the add sees a borrowed
 parameter and the object still dies with the caller's local.
 
+#### `[immovable]` structs
+
+`[immovable]` declares that a value of the type may never be moved. Every operation that
+transfers a value of the type is a compile error at the operation: `move x`, a by-value return,
+a by-value or `move` parameter, `a = b` / `a = move b`, and `T b = a;` (copy or move into a new
+owner). A struct with a by-value field of an immovable type (including a fixed-array element) is
+immovable too; a pointer field does not propagate. A C++ class whose move AND copy constructors
+are both deleted behaves the same way.
+
+Construction in place (`T n = { x = 1 };`, `T n = default;`), pointers, `alias T`, member access
+through a pointer or alias, passing `&n`, `new T` and `sizeof` stay legal. `is_movable(T)` is a
+compile-time intrinsic that returns 0 for an immovable type and 1 otherwise:
+
+```c
+[immovable] struct Pin { int x = 0; };
+Pin n = { x = 1 };
+Pin* p = &n;          // legal: a pointer borrows
+alias Pin q = n;      // legal: an alias borrows
+Pin m = n;            // error: 'n' is [immovable], its value may not be copied or moved
+```
+
 #### `is_unique(T)` and `compile_error`
 
 `is_unique(T)` is a compile-time intrinsic, the `unique` counterpart to `is_pointer(T)`:

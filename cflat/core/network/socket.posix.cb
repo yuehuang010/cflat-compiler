@@ -43,7 +43,7 @@ struct _AddrInfo {
     i32        ai_protocol  = 0;
     _net_size  ai_addrlen   = 0;
     i8*        ai_addr      = nullptr;  // Linux offset only; macOS reads via _ai_addr
-    i8*        ai_canonname = nullptr;
+    char*      ai_canonname = nullptr;
     _AddrInfo* ai_next      = nullptr;
 };
 

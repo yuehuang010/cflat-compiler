@@ -1279,6 +1279,7 @@ namespace cflat_cinterop
             unsigned prereqErrors = 0;
             std::string firstPrereqError;
             std::string firstError;
+            bool firstErrorNoViableAtRequest = false;
             // Every error with its presumed location, so a record whose definition failed to
             // compile can name the clang diagnostic that broke it (capped: a broken TU cascades).
             struct ErrorNote
@@ -1301,7 +1302,15 @@ namespace cflat_cinterop
 
                 llvm::SmallString<256> msg;
                 info.FormatDiagnostic(msg);
-                if (firstError.empty()) firstError = msg.str().str();
+                if (firstError.empty())
+                {
+                    firstError = msg.str().str();
+                    firstErrorNoViableAtRequest = (info.getID() == diag::err_ovl_no_viable_oper
+                            || info.getID() == diag::err_typecheck_invalid_operands)
+                        && info.hasSourceManager() && info.getLocation().isValid()
+                        && info.getSourceManager().isInMainFile(
+                               info.getSourceManager().getExpansionLoc(info.getLocation()));
+                }
                 if (errors.size() < 64)
                 {
                     ErrorNote note{ msg.str().str(), std::string(), 0, false };
@@ -4415,7 +4424,7 @@ namespace cflat_cinterop
                 if (const RecordType* rt = u->getAs<RecordType>())
                 {
                     const RecordDecl* rd = rt->getDecl();
-                    t.isAnonymousRecord = rd->isStruct() && !rd->getIdentifier()
+                    t.isAnonymousRecord = (rd->isStruct() || rd->isUnion()) && !rd->getIdentifier()
                                        && rd->getTypedefNameForAnonDecl() == td;
                 }
                 FillTypedefUnderlying(u, t);
@@ -7124,7 +7133,12 @@ namespace cflat_cinterop
             }
             if (outPrereqErrors) *outPrereqErrors = prereqConsumer->prereqErrors;
             if (outFirstPrereqError) *outFirstPrereqError = prereqConsumer->firstPrereqError;
-            if (outTargetFacts) outTargetFacts->firstError = prereqConsumer->firstError;
+            if (outTargetFacts)
+            {
+                outTargetFacts->firstError = prereqConsumer->firstError;
+                outTargetFacts->firstErrorNoViableAtRequest
+                    = prereqConsumer->firstErrorNoViableAtRequest;
+            }
             return true;
         }
 

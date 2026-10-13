@@ -303,8 +303,8 @@ namespace os.windows
         i32 nFileSizeLow = 0;
         i32 dwReserved0 = 0;
         i32 dwReserved1 = 0;
-        i8 cFileName[260] = default;
-        i8 cAlternateFileName[14] = default;
+        char cFileName[260] = default;
+        char cAlternateFileName[14] = default;
     };
 
     // Win32 Filesystem
@@ -313,11 +313,11 @@ namespace os.windows
     // Close a C stdio file stream.
     extern win_int  fclose(void* stream);
     // Read 'count' items of 'size' bytes from a stream into buf.
-    extern win_size fread(i8* buf, win_size size, win_size count, void* stream);
+    extern win_size fread(char* buf, win_size size, win_size count, void* stream);
     // Write 'count' items of 'size' bytes from buf to a stream.
-    extern win_size fwrite(const i8* buf, win_size size, win_size count, void* stream);
+    extern win_size fwrite(const char* buf, win_size size, win_size count, void* stream);
     // Read a line (up to size-1 bytes) from a stream into buf.
-    extern i8*      fgets(i8* buf, win_int size, void* stream);
+    extern char*      fgets(char* buf, win_int size, void* stream);
     // Return nonzero once a stream has reached end-of-file.
     extern win_int  feof(void* stream);
     // Move a stream's file position relative to origin (C `long` offset).
@@ -335,7 +335,7 @@ namespace os.windows
     // Remove an empty directory.
     extern win_int  _rmdir(const char* path);
     // Copy the current working directory into buf.
-    extern i8*      _getcwd(i8* buf, win_int size);
+    extern char*      _getcwd(char* buf, win_int size);
     // Change the current working directory.
     extern win_int  _chdir(const char* path);
     // HANDLE is pointer-sized (void*); INVALID_HANDLE_VALUE = (void*)-1.
@@ -349,11 +349,11 @@ namespace os.windows
     // Copy a file, optionally failing if the destination already exists.
     extern stdcall win_int  CopyFileA(const char* existing, const char* newPath, win_int failIfExists);
     // Get the path of the directory used for temporary files.
-    extern stdcall win_int  GetTempPathA(win_int bufLen, i8* buf);
+    extern stdcall win_int  GetTempPathA(win_int bufLen, char* buf);
     // Create a uniquely named temporary file and return its name.
-    extern stdcall win_int  GetTempFileNameA(const char* pathName, const char* prefix, win_int unique, i8* tmpFileName);
+    extern stdcall win_int  GetTempFileNameA(const char* pathName, const char* prefix, win_int unique, char* tmpFileName);
     // Resolve a path to its absolute, fully qualified form.
-    extern stdcall win_int  GetFullPathNameA(const char* fileName, win_int bufLen, i8* buf, void* filePart);
+    extern stdcall win_int  GetFullPathNameA(const char* fileName, win_int bufLen, char* buf, void* filePart);
 
     // === Memory-mapped files ===============================================
     // CreateFileA -> GetFileSizeEx/SetEndOfFile -> CreateFileMappingA ->

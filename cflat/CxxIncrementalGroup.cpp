@@ -242,6 +242,9 @@ namespace
     public:
         unsigned errors = 0;
         std::string firstError;
+        // firstError is a no-viable-operator / invalid-operands error AT an interpreter input
+        // line (the request's own expression), not inside a header or an instantiated body.
+        bool firstErrorNoViableAtInput = false;
         // First error naming a not-yet-defined CFlat record: no retry can complete that record.
         std::string incompleteRecordError;
         std::string firstErrorLocation;
@@ -291,6 +294,17 @@ namespace
                 if (firstError.empty())
                 {
                     firstError = std::move(message);
+                    if ((info.getID() == clang::diag::err_ovl_no_viable_oper
+                         || info.getID() == clang::diag::err_typecheck_invalid_operands)
+                        && info.getLocation().isValid() && info.hasSourceManager())
+                    {
+                        // Real buffer name, not a #line-presumed one: a header cannot pose as the request.
+                        const clang::PresumedLoc at = info.getSourceManager().getPresumedLoc(
+                            info.getSourceManager().getExpansionLoc(info.getLocation()),
+                            /*UseLineDirectives=*/false);
+                        firstErrorNoViableAtInput = at.isValid()
+                            && std::string_view(at.getFilename()).starts_with("input_line_");
+                    }
                     if (info.getLocation().isValid() && info.hasSourceManager())
                     {
                         const clang::PresumedLoc presumed = info.getSourceManager().getPresumedLoc(
@@ -2369,6 +2383,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
     {
         DiagnosticScope diagnostics(impl_->interpreter->getCompilerInstance()->getDiagnostics());
         diagnostics.consumer.causes = &impl_->causes;
+        out.firstErrorNoViableAtRequest = false;
         // A retry chunk has its explicit instantiations removed (PrepareRetryChunk).
         const bool explicitInstantiation = chunk.starts_with("template class ")
             || chunk.find("\ntemplate class ") != std::string::npos;
@@ -2424,6 +2439,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         // Consume the Expected either way; an unchecked one aborts under LLVM assertions.
         const std::string parseError = ErrorText(ptu.takeError());
         error = diagnostics.consumer.firstError;
+        out.firstErrorNoViableAtRequest = diagnostics.consumer.firstErrorNoViableAtInput;
         if (error.empty()) error = parseError;
         impl_->lastDiagnostics += (impl_->lastDiagnostics.empty() ? "" : "\n")
             + diagnostics.consumer.allText;

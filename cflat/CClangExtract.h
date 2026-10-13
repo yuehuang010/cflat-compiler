@@ -842,6 +842,9 @@ namespace cflat_cinterop
         unsigned prereqErrors = 0;
         std::string firstPrereqError;            // formatted text of the first such error
         std::string firstError;                  // first clang error, including wrapper requests
+        // firstError is "no viable operator" / "invalid operands" raised AT the request's own
+        // expression (main file / interpreter input), not inside a header or an instantiated body.
+        bool firstErrorNoViableAtRequest = false;
         // A requested template specialization whose completion failed. This is separate from
         // firstError because request TUs may contain tolerated errors unrelated to this type.
         std::string invalidCxxTypeRequestError;

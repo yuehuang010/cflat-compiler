@@ -692,6 +692,20 @@ class SeedCastClassUserCtor
     SeedCastClassUserCtor(int q) { p = q; }
 };
 
+// T84: float -> 32-bit unsigned is fptoui. The field, union, bitfield and simd structs below
+// give the brace-init, bitfield and union doors a 'u32' destination.
+// Sources are globals seeded at run time: a literal double folds the out-of-range fptosi to poison,
+// and the compare then passes on the broken compiler too.
+double t84Big;
+double t84Mid;
+double t84Small;
+void t84Seed() { t84Big = 3000000000.5; t84Mid = 2147483648.5; t84Small = 200.5; }
+u32 t84Global = 3000000000.5;
+union T84UnionDefault { u32 f = 3000000000.5; double d; };
+struct T84Field { u32 f; };
+struct T84Bits { u32 a : 12; u32 b : 20; };
+union T84Union { u32 f; double d; };
+
 // Brace-init into a 'bool' field is the third door onto the truth test (after '=' and the
 // explicit cast); 'g' pins that the neighbouring field is not clobbered by a wide store.
 struct BoolBraceInit
@@ -764,6 +778,46 @@ bool testNoArgCtorFieldSeedingCasts()
     result &= Test("boolcast_implicit_2", boolImplicit ? 1 : 0, 1);        // pre-fix: 0
     result &= Test("boolcast_implicit_256", boolImplicitWide ? 1 : 0, 1);  // pre-fix: 0
     result &= Test("boolcast_implicit_double", boolImplicitF ? 1 : 0, 1);  // pre-fix: verifier error
+
+    // T84: a double above INT_MAX into a 32-bit unsigned is fptoui; pre-fix fptosi gave garbage.
+    t84Seed();
+    u32 t84CastU32 = (u32)t84Big;
+    result &= Test("t84_fptoui_cast_u32", (i64)t84CastU32 == (i64)3000000000, true);     // pre-fix: garbage
+    result &= Test("t84_fptoui_cast_2gb", (i64)(u32)t84Mid == (i64)2147483648, true);    // pre-fix: garbage
+    result &= Test("t84_fptoui_cast_literal", (i64)(u32)3000000000.0 == (i64)3000000000, true);  // literal fold: pre-fix poison, not detected here
+    result &= Test("t84_fptoui_cast_u64", (i64)(u64)t84Big == (i64)3000000000, true);  // control: 64-bit already fptosi-correct
+    result &= Test("t84_fptoui_cast_u8", (i64)(u8)t84Small == (i64)200, true);          // control: passes pre-fix
+    result &= Test("t84_fptoui_cast_u16", (i64)(u16)60000.5 == (i64)60000, true);
+    u32 t84Decl = t84Big;
+    result &= Test("t84_fptoui_decl_init", (i64)t84Decl == (i64)3000000000, true);      // pre-fix: garbage
+    u32 t84Assign = 0;
+    t84Assign = t84Big;
+    result &= Test("t84_fptoui_assign", (i64)t84Assign == (i64)3000000000, true);       // pre-fix: garbage
+    u32 t84Compound = 0;
+    t84Compound += t84Big;
+    result &= Test("t84_fptoui_compound", (i64)t84Compound == (i64)3000000000, true);   // pre-fix: garbage
+    T84Field t84F;
+    t84F.f = t84Big;
+    result &= Test("t84_fptoui_field_assign", (i64)t84F.f == (i64)3000000000, true);    // pre-fix: garbage
+    T84Field t84B = { f = t84Big };
+    result &= Test("t84_fptoui_brace_field", (i64)t84B.f == (i64)3000000000, true);     // pre-fix: garbage
+    T84Bits t84Bits;
+    t84Bits.b = t84Big;
+    result &= Test("t84_fptoui_bitfield", (i64)t84Bits.b == (i64)24064, true);          // pre-fix: garbage
+    T84Union t84U = { f = t84Big };
+    result &= Test("t84_fptoui_union_field", (i64)t84U.f == (i64)3000000000, true);     // pre-fix: garbage
+    unsigned[2] t84Arr;
+    t84Arr[0] = t84Big;
+    result &= Test("t84_fptoui_array_elem", (i64)t84Arr[0] == (i64)3000000000, true);   // pre-fix: garbage
+    u32[2] t84ArrBrace = { t84Big, 100.5 };
+    result &= Test("t84_fptoui_array_brace", (i64)t84ArrBrace[0] == (i64)3000000000, true);
+    u32[] t84ViewBrace = { t84Big, 100.5 };
+    result &= Test("t84_fptoui_array_view_brace", (i64)t84ViewBrace[0] == (i64)3000000000, true);
+    T84UnionDefault t84UD;
+    result &= Test("t84_fptoui_union_default", (i64)t84UD.f == (i64)3000000000, true);
+    result &= Test("t84_fptoui_global_init", (i64)t84Global == (i64)3000000000, true);
+    simd<u32,4> t84Vec = t84Big;
+    result &= Test("t84_fptoui_simd_splat", (i64)t84Vec[0] == (i64)3000000000, true);   // pre-fix: garbage
 
     // Brace-init is its own door: it stored the source bytes raw over the i1 slot, so '2' read
     // back as 2 (a poisoned bool, neither true nor false) and a double stored four bytes.
@@ -1464,6 +1518,14 @@ int pickUnsignedLadder(u64 x) { return 3; }
 // A trailing f in a hex literal is a digit: 0x7f is int (clang picks 1), not a float suffix.
 int pickHexDigitF(int x) { return 1; }
 int pickHexDigitF(u64 x) { return 2; }
+// T86: a hex float is double unless f/F (float); a binary suffix takes the [lex.icon] ladder row (clang oracle).
+int pickHexFloat(float x) { return 1; }
+int pickHexFloat(double x) { return 2; }
+int pickBinarySuffix(u32 x) { return 2; }
+int pickBinarySuffix(long x) { return 3; }
+int pickBinarySuffix(ulong x) { return 4; }
+int pickBinarySuffix(i64 x) { return 5; }
+int pickBinarySuffix(u64 x) { return 6; }
 
 // Regression: a negative integer literal in a file-scope initializer used to be
 // sign-dropped (narrowed to the smallest unsigned width, e.g. -150 read back as
@@ -1628,6 +1690,39 @@ bool testExplicitIntTypes()
     auto binaryLadderAuto = 0b10000000000000000000000000000000;
     result &= Test("binary_ladder_auto_overload_u32", pickBinaryLadder(binaryLadderAuto), 2);
     result &= Test("binary_ladder_literal_overload_u32", pickBinaryLadder(0b10000000000000000000000000000000), 2);
+    // T86 hex floats (clang oracle): binary exponent makes the literal floating; f/F float, else double.
+    result &= Test("hex_float_neg_exp_f32", (int)(0x1p-2f * 1024), 256);
+    result &= Test("hex_float_neg_exp_double", (int)(0x1p-2 * 1024), 256);
+    result &= Test("hex_float_fraction", (int)(0x1.fp0 * 16), 31);
+    result &= Test("hex_float_pos_exp_upper", (int)(0X1P+4), 16);
+    result &= Test("hex_float_leading_dot", (int)(0x.8p1 * 8), 8);
+    result &= Test("hex_float_sum_double", (int)((0x1p-2 + 1.0) * 4), 5);
+    result &= Test("hex_float_denormal_nonzero", 0x1p-1074 > 0.0, true);
+    result &= Test("hex_float_f_suffix_upper", (int)(0x1.8p3F * 2), 24);
+    result &= Test("hex_float_overload_double", pickHexFloat(0x1p-2), 2);
+    result &= Test("hex_float_overload_float", pickHexFloat(0x1p-2f), 1);
+    result &= Test("hex_float_overload_float_upper", pickHexFloat(0x1.8p3F), 1);
+    // T86 overflow: a hex float past the range is inf in its suffix-selected type (clang oracle: double inf, float inf).
+    result &= Test("hex_float_overflow_double_inf", 0x1p2000 > 1.0e308, true);
+    result &= Test("hex_float_overflow_float_inf", 0x1p200f > 3.0e38, true);
+    result &= Test("hex_float_overflow_double_pick", pickHexFloat(0x1p2000), 2);
+    result &= Test("hex_float_overflow_float_pick", pickHexFloat(0x1p200f), 1);
+    // T86 member access stays on an adjacent hex integer: 0x1.to_i32() is int + member call (master prints 1).
+    result &= Test("hex_int_adjacent_member_call", 0x1.to_i32(), 1);
+    // T86 binary integer suffixes (clang oracle, overload pick on the six integer types).
+    u64 binSuffixValue = 0b1010ULL;
+    result &= Test("binary_suffix_ull_value", (int)binSuffixValue, 10);
+    result &= Test("binary_suffix_u_pick", pickBinarySuffix(0b1u), 2);
+    result &= Test("binary_suffix_U_pick", pickBinarySuffix(0b1U), 2);
+    result &= Test("binary_suffix_L_pick", pickBinarySuffix(0b1L), 3);
+    result &= Test("binary_suffix_UL_pick", pickBinarySuffix(0b1UL), 4);
+    result &= Test("binary_suffix_ul_pick", pickBinarySuffix(0b1ul), 4);
+    result &= Test("binary_suffix_LL_pick", pickBinarySuffix(0b1LL), 5);
+    result &= Test("binary_suffix_ll_pick", pickBinarySuffix(0b1ll), 5);
+    result &= Test("binary_suffix_ULL_pick", pickBinarySuffix(0b1ULL), 6);
+    result &= Test("binary_suffix_uLL_pick", pickBinarySuffix(0b1uLL), 6);
+    result &= Test("binary_suffix_LLu_pick", pickBinarySuffix(0b1LLu), 6);
+    result &= Test("binary_suffix_u32_high_pick", pickBinarySuffix(0b10000000000000000000000000000000u), 2);
     if const (0xFFFFFFFF == -1) { result &= Test("hex_ladder_if_const_true", true, true); }
     else { result &= Test("hex_ladder_if_const_true", false, true); }
 
@@ -5046,9 +5141,18 @@ bool testPointerArithmetic()
     void*[4] t36VoidSlots = default;
     void** t36VoidSlot = &t36VoidSlots[0];
     result &= Test("t36 void** arithmetic stays legal", (1 + t36VoidSlot + 2) - t36VoidSlot, 3);
-    // T36 round 3: no viable alternative keeps the set (round 2 refused it; generics do not join).
-    result &= Test("t36 all-unrelated pointee set stays accepted", t36TwoFloat(t36P) != 0, true);
     result &= Test("t36 float* exact in a float pair", t36TwoFloat(t36Fp + 0), 3);
+    // T80: unrelated primitive pointees are refused; the accept-set rows stay accepted.
+    long t80Long = 9; i64* t80WidePtr = &t80Long; long* t80LongPtr = t80WidePtr;
+    result &= Test("t80 long* into equal-width i64* accepted", *t80LongPtr, 9);
+    double t80Dbl = 2.5; void* t80Void = &t80Dbl; double* t80FromVoid = t80Void;
+    result &= Test("t80 void* into double* accepted", *t80FromVoid == 2.5, true);
+    double* t80Same = &t80Dbl; double* t80SameCopy = t80Same;
+    result &= Test("t80 same double* accepted", *t80SameCopy == 2.5, true);
+    i8 t80Byte = 65; i8* t80BytePtr = &t80Byte; char* t80Char = t80BytePtr;
+    result &= Test("t80 i8* into char* accepted", *t80Char == 'A', true);
+    int t80Int = 7;
+    result &= Test("t80 explicit int* to double* cast accepted", (double*)&t80Int != nullptr, true);
     // T36 round 5: a pointer never binds an integer `operator string` (round 4 picked i128).
     i8[4] t36Eu = default;
     t36Eu[0] = (i8)0x41; t36Eu[1] = (i8)0x42; t36Eu[2] = (i8)0x43; t36Eu[3] = (i8)0;

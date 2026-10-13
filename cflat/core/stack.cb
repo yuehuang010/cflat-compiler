@@ -26,23 +26,28 @@ class stack<T>
     // correct here because the old buffer is discarded immediately after.
     void _grow()
     {
-        int newCap = _capacity == 0 ? 4 : _capacity * 2;
-        T* newData = nullptr;
-        if const (is_pointer(T)) newData = new T[newCap];
-        else newData = (T*)calloc((i64)newCap, (i64)sizeof(T));
-        int i = 0;
-        while (i < _size)
+        if const (!is_movable(T))
+            compile_error("stack<T>: element type is [immovable] - growing relocates elements; use stack<T*>");
+        else
         {
-            newData[i] = move _data[i];
-            i++;
+            int newCap = _capacity == 0 ? 4 : _capacity * 2;
+            T* newData = nullptr;
+            if const (is_pointer(T)) newData = new T[newCap];
+            else newData = (T*)calloc((i64)newCap, (i64)sizeof(T));
+            int i = 0;
+            while (i < _size)
+            {
+                newData[i] = move _data[i];
+                i++;
+            }
+            if (_data != nullptr)
+            {
+                if const (is_pointer(T)) delete[_] _data;
+                else free((void*)_data);
+            }
+            _data = newData;
+            _capacity = newCap;
         }
-        if (_data != nullptr)
-        {
-            if const (is_pointer(T)) delete[_] _data;
-            else free((void*)_data);
-        }
-        _data = newData;
-        _capacity = newCap;
     }
 
     // Release the element in a live slot by moving it into the discard sink and letting that drop:
@@ -51,7 +56,12 @@ class stack<T>
     // value type / string is destructed. `move _data[index]` nulls the moved-from slot.
     void _releaseAt(int index)
     {
-        _ = move _data[index];
+        if const (!is_movable(T))
+            compile_error("stack<T>: element type is [immovable] - releasing or removing relocates elements; use stack<T*>");
+        else
+        {
+            _ = move _data[index];
+        }
     }
 
     // Push a value. The store defers entirely to T, single body, no `if const`: a COPYABLE owner
@@ -61,9 +71,14 @@ class stack<T>
     // the caller's argument is moved and poisoned with no `move` keyword needed at the call site.
     void push(T value)
     {
-        if (_size >= _capacity) _grow();
-        _data[_size] = value;
-        _size++;
+        if const (!is_movable(T))
+            compile_error("stack<T>: element type is [immovable] - the container relocates elements; use stack<T*>");
+        else
+        {
+            if (_size >= _capacity) _grow();
+            _data[_size] = value;
+            _size++;
+        }
     }
 
     // Transfer overload - the caller writes `move` to give up ownership instead of paying for
@@ -71,7 +86,7 @@ class stack<T>
     // not a workaround: a bare pointer / interface stack BORROWS, so accepting ownership there
     // would strand the element, and for `unique T*` the plain parameter is already a move sink.
     // Declared AFTER the plain push() so conformance matches the plain overload first.
-    if const (!is_pointer(T))
+    if const (!is_pointer(T) && is_movable(T))
     {
         void push(move T value)
         {
@@ -86,9 +101,15 @@ class stack<T>
     // deleting the result), a value transfers because its slot is gone. Mirrors queue.dequeue().
     T pop()
     {
-        _size--;
-        T value = move _data[_size];
-        return value;
+        if const (!is_movable(T))
+            compile_error("stack<T>: element type is [immovable] - popping or relocating elements; use stack<T*>");
+        else
+        {
+            _size--;
+            T value = move _data[_size];
+            return value;
+        }
+        while (true) { }
     }
 
     // Borrow the top element without removing it (caller must not free it).
@@ -110,16 +131,21 @@ class stack<T>
     // Release every live element, then free the backing buffer.
     ~stack()
     {
-        int i = 0;
-        while (i < _size)
+        if const (!is_movable(T))
+            compile_error("stack<T>: element type is [immovable] - the container relocates elements; use stack<T*>");
+        else
         {
-            _releaseAt(i);
-            i++;
-        }
-        if (_data != nullptr)
-        {
-            if const (is_pointer(T)) delete[_] _data;
-            else free((void*)_data);
+            int i = 0;
+            while (i < _size)
+            {
+                _releaseAt(i);
+                i++;
+            }
+            if (_data != nullptr)
+            {
+                if const (is_pointer(T)) delete[_] _data;
+                else free((void*)_data);
+            }
         }
     }
 };

@@ -46,5 +46,13 @@ The C-import param spelling nit ('i64*' for C long*) is unchanged.
 RULED 2026-10-01 (maintainer): char family staged: (1) retype core text APIs (`string.data()`, filesystem `data()`, ...) from `i8*` to `char*`; (2) then block `i8* <-> char*` like the rest (explicit cast is the workaround). Stage 2 only after stage 1 leaves no core-induced sites.
 
 ## 2026-10-06 note (T36 round 5, pre-existing on master)
-C++ `cf(const char*)` accepts `int*` (`cf(&x)` -> 2) and `signed char*`; clang++ -std=c++20 refuses
-both. Probes: scratch/repro_keep/t36_rev5/ (cx.cb, h.hpp).
+C++ `cf(const char*)` accepted `int*` (`cf(&x)` -> 2) and `signed char*`; clang++ -std=c++20 refuses
+both. The `int*` shape is fixed by T85 (unrelated primitive pointees refused at C++ calls). The
+`signed char*` shape stays accepted until the char-family stage above. Probes: scratch/repro_keep/t36_rev5/.
+
+## Char family stage 1 LANDED (T83, 2026-10-10)
+Core text APIs retyped from i8* to char*: string data() and the builtin string `_ptr` field, filesystem, os text
+wrappers (getcwd/realpath/readdir_name/fgets), json, xml, regex, process, wstring, topology. Byte and allocator
+APIs stay i8*/u8*. Probe (char-family refusal forced on, suites + tiers 1-2): core-induced sites 109 -> 0; user
+sites 146 -> 43 (test/example files, incl. 18 direct `._ptr` accesses) - stage 2 edits those with casts when it
+turns the refusal on. Windows-only core edits (os.windows.cb, wstring.cb) were not compiled on the Mac.

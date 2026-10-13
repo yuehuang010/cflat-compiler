@@ -96,14 +96,14 @@ if const (__WINDOWS__) {
         // Nothing: macOS has no per-node memory query or mbind/set_mempolicy lever.
     } else {
         // Append the decimal digits of the non-negative int `v` to `out` at `pos`.
-        int _numa_int_append(i8* out, int pos, int v) {
+        int _numa_int_append(char* out, int pos, int v) {
             if (v >= 10) { pos = _numa_int_append(out, pos, v / 10); }
             out[pos] = (i8)('0' + (v % 10));
             return pos + 1;
         }
 
         // Build "/sys/devices/system/node/node<id>/meminfo" into out (NUL-terminated).
-        void _numa_meminfo_path(i8* out, int id) {
+        void _numa_meminfo_path(char* out, int id) {
             const char* prefix = "/sys/devices/system/node/node";
             int p = 0;
             while (prefix[p] != 0) { out[p] = prefix[p]; p = p + 1; }
@@ -117,7 +117,7 @@ if const (__WINDOWS__) {
         // Value (in bytes) following the first occurrence of `key` in `buf`
         // (e.g. key="MemFree:" against a line "Node 0 MemFree:   12345 kB").
         // -1 if `key` does not appear or is not followed by a digit run.
-        i64 _numa_meminfo_value(i8* buf, const char* key) {
+        i64 _numa_meminfo_value(char* buf, const char* key) {
             int klen = 0;
             while (key[klen] != 0) { klen = klen + 1; }
             int i = 0;
@@ -142,9 +142,9 @@ if const (__WINDOWS__) {
         // `key` ("MemTotal:" / "MemFree:"). -1 on any failure (missing node,
         // unreadable file, key not present).
         i64 _numa_meminfo_read(int id, const char* key) {
-            i8[80] path = default;
+            char[80] path = default;
             _numa_meminfo_path(&path[0], id);
-            i8[2048] buf = default;
+            char[2048] buf = default;
             i64 n = _read_sysfs_line((const char*)&path[0], &buf[0], 2047);
             if (n <= 0) { return -1; }
             buf[(int)n] = 0;
@@ -164,7 +164,7 @@ if const (__WINDOWS__) {
         // the caller does that). -1 on any failure (missing file, zero-byte
         // read). Shared small-sysfs-read shape used by both the NUMA meminfo
         // probe and the THP mode probe below.
-        i64 _read_sysfs_line(const char* path, i8* buf, i64 maxLen) {
+        i64 _read_sysfs_line(const char* path, char* buf, i64 maxLen) {
             void* f = os.posix.fopen(path, "rb");
             if (f == nullptr) { return -1; }
             win_size n = os.posix.fread(buf, (win_size)1, (win_size)maxLen, f);
@@ -174,7 +174,7 @@ if const (__WINDOWS__) {
         }
 
         // True if NUL-terminated `hay` contains `needle` as a substring.
-        bool _buf_contains(const i8* hay, const char* needle) {
+        bool _buf_contains(const char* hay, const char* needle) {
             int nlen = 0;
             while (needle[nlen] != 0) { nlen = nlen + 1; }
             int i = 0;
@@ -439,7 +439,7 @@ namespace os
             _hugePagesState = 2;
             return false;
         } else {
-            i8[64] buf = default;
+            char[64] buf = default;
             i64 n = _read_sysfs_line("/sys/kernel/mm/transparent_hugepage/enabled", &buf[0], 63);
             bool ok = false;
             if (n > 0) {
@@ -1200,7 +1200,7 @@ namespace os
     }
 
     // Copy the current working directory into buf; returns buf or nullptr.
-    i8* getcwd(i8* buf, i64 size) {
+    char* getcwd(char* buf, i64 size) {
         if const (__WINDOWS__) { return os.windows._getcwd(buf, (i32)size); }
         else { return os.posix.getcwd(buf, (i64)size); }
     }
@@ -1219,9 +1219,9 @@ namespace os
             d->_pending = 0;
             d->_valid   = 0;
             // Build the "<path>\*" search pattern.
-            i8[600] pat = default;
+            char[600] pat = default;
             i32 n = 0;
-            const i8* pp = (const i8*)path;
+            const char* pp = (const char*)path;
             while (pp[n] != 0 && n < 596) { pat[n] = pp[n]; n = n + 1; }
             pat[n] = 92; n = n + 1;   // '\'
             pat[n] = 42; n = n + 1;   // '*'
@@ -1237,7 +1237,7 @@ namespace os
     }
 
     // Read the next directory entry name, or nullptr at end-of-stream.
-    i8* readdir_name(void* dir) {
+    char* readdir_name(void* dir) {
         if const (__WINDOWS__) {
             __OsDir* d = (__OsDir*)dir;
             if (d->_valid == 0) return nullptr;
@@ -1265,7 +1265,7 @@ namespace os
 
     // Resolve path to its absolute form, writing into resolved; returns resolved
     // or nullptr. resolved must be large enough (PATH_MAX / MAX_PATH).
-    i8* realpath(const char* path, i8* resolved) {
+    char* realpath(const char* path, char* resolved) {
         if const (__WINDOWS__) {
             if (os.windows.GetFullPathNameA(path, 260, resolved, nullptr) == 0) return nullptr;
             return resolved;
@@ -1287,15 +1287,15 @@ namespace os
 
     // Fill buf with the system temp directory path (no trailing separator).
     // Returns the length written, or 0 on failure.
-    i32 temp_dir(i8* buf, i64 len) {
+    i32 temp_dir(char* buf, i64 len) {
         if const (__WINDOWS__) {
             i32 n = os.windows.GetTempPathA((i32)len, buf);
             if (n > 0 && buf[n - 1] == '\\') { buf[n - 1] = 0; n = n - 1; }
             return n;
         } else {
-            i8* env = os.posix.getenv("TMPDIR");
-            const i8* src = "/tmp";
-            if (env != nullptr && env[0] != 0) src = (const i8*)env;
+            char* env = os.posix.getenv("TMPDIR");
+            const char* src = "/tmp";
+            if (env != nullptr && env[0] != 0) src = (const char*)env;
             i32 n = 0;
             while (src[n] != 0 && (i64)n < len - 1) { buf[n] = src[n]; n = n + 1; }
             buf[n] = 0;
@@ -1306,9 +1306,9 @@ namespace os
     // Create a uniquely named temp file whose name starts with prefix, writing
     // its full path into buf (size len). Returns true on success. The file is
     // left on disk (any opened fd is closed); the caller deletes it when done.
-    bool make_temp_file(const char* prefix, i8* buf, i64 len) {
+    bool make_temp_file(const char* prefix, char* buf, i64 len) {
         if const (__WINDOWS__) {
-            i8[260] dir = default;
+            char[260] dir = default;
             if (os.windows.GetTempPathA(260, &dir[0]) == 0) return false;
             if (os.windows.GetTempFileNameA(&dir[0], prefix, 0, buf) == 0) return false;
             return true;
@@ -1316,7 +1316,7 @@ namespace os
             // Build "<tmpdir>/<prefix>XXXXXX", mkstemp it, then close the fd.
             i32 n = temp_dir(buf, len);
             buf[n] = '/'; n = n + 1;
-            const i8* p = (const i8*)prefix;
+            const char* p = (const char*)prefix;
             i32 i = 0;
             while (p[i] != 0 && (i64)n < len - 7) { buf[n] = p[i]; n = n + 1; i = i + 1; }
             for (i32 j = 0; j < 6; j++) { buf[n] = 'X'; n = n + 1; }

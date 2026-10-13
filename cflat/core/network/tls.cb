@@ -25,7 +25,7 @@ if const (__MACOS__) {
     function<void*(void*, int, int)> __tlsCreateContext = default;
     function<int(void*, function<int(void*, i8*, u64*)>, function<int(void*, i8*, u64*)>)> __tlsSetIOFuncs = default;
     function<int(void*, void*)> __tlsSetConnection = default;
-    function<int(void*, i8*, u64)> __tlsSetPeerDomainName = default;
+    function<int(void*, char*, u64)> __tlsSetPeerDomainName = default;
     function<int(void*)> __tlsHandshake = default;
     function<int(void*, i8*, u64, u64*)> __tlsRead = default;
     function<int(void*, i8*, u64, u64*)> __tlsWrite = default;
@@ -46,7 +46,7 @@ if const (__MACOS__) {
     int __tlsSocketWrite(void* connection, i8* data, u64* length)
     {
         if (connection == nullptr || length == nullptr) return -9800;
-        int n = _wsa_send(connection, data, (int)*length, 0);
+        int n = _wsa_send(connection, (char*)data, (int)*length, 0);
         if (n < 0) { *length = 0; return -9800; }
         *length = (u64)n;
         return 0;
@@ -71,7 +71,7 @@ if const (__MACOS__) {
         __tlsCreateContext = (function<void*(void*, int, int)>)dlsym(__tlsSecurity, "SSLCreateContext");
         __tlsSetIOFuncs = (function<int(void*, function<int(void*, i8*, u64*)>, function<int(void*, i8*, u64*)>)>)dlsym(__tlsSecurity, "SSLSetIOFuncs");
         __tlsSetConnection = (function<int(void*, void*)>)dlsym(__tlsSecurity, "SSLSetConnection");
-        __tlsSetPeerDomainName = (function<int(void*, i8*, u64)>)dlsym(__tlsSecurity, "SSLSetPeerDomainName");
+        __tlsSetPeerDomainName = (function<int(void*, char*, u64)>)dlsym(__tlsSecurity, "SSLSetPeerDomainName");
         __tlsHandshake = (function<int(void*)>)dlsym(__tlsSecurity, "SSLHandshake");
         __tlsRead = (function<int(void*, i8*, u64, u64*)>)dlsym(__tlsSecurity, "SSLRead");
         __tlsWrite = (function<int(void*, i8*, u64, u64*)>)dlsym(__tlsSecurity, "SSLWrite");
@@ -111,7 +111,7 @@ class TlsSocket
     int _windowsHeader = 0;
     int _windowsTrailer = 0;
     int _windowsMaximumMessage = 0;
-    i8* _windowsTargetName = nullptr;
+    char* _windowsTargetName = nullptr;
 
     void fail(string message)
     {
@@ -163,7 +163,7 @@ class TlsSocket
 
             _windowsReceiveCapacity = 16384;
             _windowsReceive = new i8[_windowsReceiveCapacity];
-            _windowsTargetName = new i8[peerName.length() + 1];
+            _windowsTargetName = new char[peerName.length() + 1];
             memcpy(_windowsTargetName, peerName.data(), (i64)peerName.length());
             _windowsTargetName[peerName.length()] = 0;
             _TlsSecHandle* credentials = new _TlsSecHandle;

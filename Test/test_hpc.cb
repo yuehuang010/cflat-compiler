@@ -14,6 +14,7 @@
 import "cruntime.cb";
 import "test_helper.cb";
 import "span.cb";
+import "list.cb";
 import "view.cb";
 import "hpc/btree.cb";
 import "thread.cb";
@@ -1035,9 +1036,9 @@ int testSpanView()
     ss.set(2, 44.0);                     // writes through to dc[4]
     passed += Test("span slice writes through", (float)dc[4], 44.0f);
 
-    int* dcp = move dc; delete[_] dcp;
-    int* dap = move da; delete[_] dap;
-    int* dbp = move db; delete[_] dbp;
+    int* dcp = (int*)move dc; delete[_] dcp;
+    int* dap = (int*)move da; delete[_] dap;
+    int* dbp = (int*)move db; delete[_] dbp;
     return passed;
 }
 
@@ -2343,6 +2344,31 @@ int testFftBluestein()
     return passed;
 }
 
+// T84 round 2: a double above INT_MAX into simd<u32,N> keeps its value on return, in an op
+// splat, and in a declaration splat. The source is a global seeded at run time (see test_basic).
+double t84HpcBig;
+void t84HpcSeed() { t84HpcBig = 3000000000.5; }
+simd<u32,4> t84HpcRet() { return t84HpcBig; }
+
+int testT84SimdConversion(int seed)
+{
+    int passed = 0;
+    t84HpcSeed();
+    simd<u32,4> r = t84HpcRet();
+    passed += Test("t84 simd scalar return lane0", (i64)r[0] == (i64)3000000000, true);
+    passed += Test("t84 simd scalar return lane3", (i64)r[3] == (i64)3000000000, true);
+    simd<u32,4> x = 0;
+    x += t84HpcBig;
+    passed += Test("t84 simd op splat lane0", (i64)x[0] == (i64)3000000000, true);
+    simd<u32,4> d = t84HpcBig;
+    passed += Test("t84 simd decl splat lane2", (i64)d[2] == (i64)3000000000, true);
+    list<u32> t84L = list<u32>();
+    t84L.add(7);
+    t84L[0] = t84HpcBig;
+    passed += Test("t84 list element store", (i64)t84L[0] == (i64)3000000000, true);
+    return passed;
+}
+
 extern int main(int argc, char** argv)
 {
     int passed = 0;
@@ -2359,6 +2385,7 @@ extern int main(int argc, char** argv)
     int seed = argc;   // 1 with no args
 
     passed += testFloatArithmetic(seed);   total += 4;
+    passed += testT84SimdConversion(seed); total += 5;
     passed += testMixedScalarVector(seed); total += 4;
     passed += testSimdScalarReturn(seed);  total += 9;
     passed += testIntegerSimd(seed);       total += 4;

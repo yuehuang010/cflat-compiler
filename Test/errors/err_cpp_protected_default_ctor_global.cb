@@ -1,0 +1,11 @@
+// T88: a PROTECTED default constructor is refused like a deleted one, trivial or not. A deferred
+// global expectation ends the compile, so each global door lives in its own fixture.
+import cpp "cpp_interop_arrayelem.h";
+
+expect_error("a global of it cannot be constructed");
+cppa.ProtTriv badProtGlobal;
+
+extern int main()
+{
+    return 0;
+}

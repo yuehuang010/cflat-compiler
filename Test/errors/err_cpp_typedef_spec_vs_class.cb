@@ -1,0 +1,3 @@
+expect_error("C++ declaration conflicts with a declaration already in scope");
+import cpp "cpp_t94_c2_cls_a.hpp";
+import cpp "cpp_t94_c2_spec_b.hpp";

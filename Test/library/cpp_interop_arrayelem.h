@@ -80,4 +80,17 @@ inline GProbe::GProbe() : saw(g_reg.magic) {}
 // Default constructor DELETED: an array of it has no default initialization in C++ either.
 struct NoDef { int v; NoDef() = delete; NoDef(int a) : v(a) {} ~NoDef() {} };
 
+// T88: a PRIVATE default constructor is refused at every default-construction site, trivial or
+// not (clang: "calling a private constructor"). Public trivial and public = default stay accepted.
+class PrivTriv { PrivTriv() = default; public: int v; };
+class PrivUser { PrivUser() {} public: int v; };
+class ProtTriv { protected: ProtTriv() = default; public: int v; };
+class PubDefTriv { public: PubDefTriv() = default; int v; };
+// A private default constructor beside a public one that takes a defaulted argument: both are
+// default constructors, so default construction is ambiguous (clang) and refused as such.
+class PrivDefArg { PrivDefArg() = default; public: PrivDefArg(int a = 0) : v(a) {} int v; };
+class PubDefArg { public: PubDefArg(int a = 0) : v(a) {} int v; };
+// Copy-from-factory: the static factory builds the private-constructor object inside the class.
+class PrivFac { PrivFac() = default; public: int v; static PrivFac make() { PrivFac f; f.v = 3; return f; } };
+
 }

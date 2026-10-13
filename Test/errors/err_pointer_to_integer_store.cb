@@ -2,6 +2,7 @@
 struct P2iField { long value = 0; };
 struct P2iDesignated { long value = 0; };
 struct P2iPointerField { int* value = nullptr; };
+struct P80DoubleField { double* value = nullptr; };
 enum P2iEnum : int { P2I_ZERO = 0, P2I_ONE = 1 };
 int p2iFunction() { return 1; }
 extern void* malloc(i64 size);
@@ -145,6 +146,40 @@ extern int main()
     expect_error("cannot convert 'i64*' to 'int*' implicitly") {
         i64 wide = 3; P2iPointerField bad = {value = &wide};
     }
+    expect_error("cannot convert 'int*' to 'double*' implicitly") {
+        int t80Single = 1; p80TakeDouble(&t80Single);
+    }
+    expect_error("cannot convert 'int*' to 'double*' implicitly") {
+        int t80Assigned = 1; double* t80Target = nullptr; t80Target = &t80Assigned;
+    }
+    expect_error("cannot convert 'int*' to 'double*' implicitly") {
+        int t80Declared = 1; double* t80Init = &t80Declared;
+    }
+    expect_error("cannot convert 'int*' to 'double*' implicitly") {
+        bool t80Cond = true; int t80Arm = 1; double t80Wide = 2.0;
+        double* t80Chosen = t80Cond ? &t80Arm : &t80Wide;
+    }
+    expect_error("cannot convert 'int*' to 'double*' implicitly") {
+        int t80Field = 1; P80DoubleField t80Struct = { value = &t80Field };
+    }
+    expect_error("cannot convert 'double*' to 'int*' implicitly") {
+        double[2] t80Fixed = {1.0, 2.0}; int* t80Decayed = t80Fixed;
+    }
+    expect_error("cannot convert 'double*' to 'int*' implicitly") {
+        double[2] t80Source = {1.0, 2.0}; double[] t80View = t80Source; int* t80FromView = t80View;
+    }
+    expect_error("cannot convert 'float*' to 'double*' implicitly") {
+        float t80Float = 1.0; double* t80FloatPtr = &t80Float;
+    }
+    expect_error("cannot convert 'double*' to 'i64*' implicitly") {
+        double t80Real = 1.0; i64* t80Bits = &t80Real;
+    }
+    expect_error("cannot convert 'bool*' to 'float*' implicitly") {
+        bool t80Flag = true; float* t80FlagPtr = &t80Flag;
+    }
+    expect_error("no overload of 'p80Pick' matches") {
+        int t80Two = 1; int r80Two = p80Pick(&t80Two);
+    }
     simd<int,4> simdValue;
     p2iSimdInt(&simdValue);
     long cLong = 1; ulong cULong = 2;
@@ -173,3 +208,19 @@ expect_error("cannot convert 'i64*' to 'int*' implicitly") {
 }
 int p2iGlobalInt = 3;
 int*[2] p2iGlobalGoodPtrs = { &p2iGlobalInt, &p2iGlobalInt };
+
+// T80: unrelated primitive pointees (integer <-> floating) refused at every context.
+double p80Double = 0.0;
+int p80Int = 0;
+void p80TakeDouble(double* value) { }
+int p80Pick(double* value) { return 2; }
+int p80Pick(float* value) { return 3; }
+expect_error("cannot convert 'int*' to 'double*' implicitly") {
+    double* p80BadGlobal = &p80Int;
+}
+expect_error("cannot convert 'int*' to 'double*' implicitly") {
+    double* p80BadReturn() { return &p80Int; }
+}
+expect_error("cannot convert 'int*' to 'double*' implicitly") {
+    struct P80BadFieldDefault { double* value = &p80Int; };
+}

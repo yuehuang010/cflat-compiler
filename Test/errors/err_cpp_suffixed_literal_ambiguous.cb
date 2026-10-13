@@ -1,4 +1,5 @@
 import cpp "cpp_interop_explicit.h";
+import cpp "cpp_t87_null_zero.h";
 
 // clang refuses each of these as ambiguous: a suffixed literal has one exact C++ type, and here
 // no overload takes it exactly (long long or long against int / unsigned long).
@@ -26,6 +27,11 @@ extern int main()
     expect_error("call to constructor of 'cppsfx::C5' is ambiguous") {
         cppsfx.C5 c = cppsfx.C5(1L);
         return c.k;
+    }
+    // A literal 0 is a null pointer constant beside the short ctor: clang refuses it as ambiguous.
+    expect_error("call to constructor of 't87::S6' is ambiguous") {
+        t87.S6 s6 = t87.S6(0);
+        return s6.v;
     }
     expect_error("call to constructor of 'cppsfx::C5' is ambiguous") {
         return cppsfx.C5(1L).k;

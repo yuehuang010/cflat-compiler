@@ -1,0 +1,162 @@
+// Interface return of a pointer whose root is frame storage that dies at return (T91). Two shapes:
+// (a) a borrow of an owning local (plain alias, second alias, reassigned alias) - the owner is freed
+// at scope exit, so the borrow cannot outlive it; (b) a pointer into a frame array, a by-value
+// struct, or an element or field of either - it dangles like `return t;` on a by-value local.
+// Accepted shapes (owning local moved, parameter, global, static local) are covered in test_interface.cb.
+interface IThing { int value(); };
+
+class Thing : IThing
+{
+    int n = 0;
+    int value() { return n; }
+};
+
+struct T91Holder
+{
+    Thing[3] arr = default;
+    Thing one = default;
+};
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t91AliasOfOwner()
+    {
+        Thing* t = new Thing[3];
+        Thing* b = t;
+        return b;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t91SecondAliasOfOwner()
+    {
+        Thing* t = new Thing[3];
+        Thing* b = t;
+        Thing* c = b;
+        return c;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t91ReassignedAlias()
+    {
+        Thing* t = new Thing[3];
+        Thing* b = nullptr;
+        b = t;
+        return b;
+    }
+}
+
+expect_error("cannot return local value 'Thing' as interface 'IThing'") {
+    IThing t91ElementAddressOne()
+    {
+        Thing[3] arr = default;
+        return &arr[1];
+    }
+}
+
+expect_error("cannot return local value 'Thing' as interface 'IThing'") {
+    IThing t91ElementAddressZero()
+    {
+        Thing[3] arr = default;
+        return &arr[0];
+    }
+}
+
+expect_error("cannot return local value 'Thing' as interface 'IThing'") {
+    IThing t91ArrayDecay()
+    {
+        Thing[3] arr = default;
+        Thing* p = arr;
+        return p;
+    }
+}
+
+expect_error("cannot return local value 'Thing' as interface 'IThing'") {
+    IThing t91AliasOfElement()
+    {
+        Thing[3] arr = default;
+        Thing* b = &arr[1];
+        return b;
+    }
+}
+
+expect_error("cannot return local value 'Thing' as interface 'IThing'") {
+    IThing t91StructFieldAddress()
+    {
+        T91Holder h = default;
+        return &h.one;
+    }
+}
+
+expect_error("cannot return local value 'Thing' as interface 'IThing'") {
+    IThing t91StructArrayElement()
+    {
+        T91Holder h = default;
+        return &h.arr[1];
+    }
+}
+
+expect_error("cannot return local value 'Thing' as interface 'IThing'") {
+    IThing t91AliasOfStructField()
+    {
+        T91Holder h = default;
+        Thing* b = &h.one;
+        return b;
+    }
+}
+
+struct T91HeapHolder
+{
+    Thing[3] arr = default;
+    Thing one = default;
+};
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t91InteriorElementOfOwner()
+    {
+        Thing* t = new Thing[3];
+        return &t[1];
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t91InteriorFieldOfOwner()
+    {
+        T91HeapHolder* hp = new T91HeapHolder();
+        return &hp->one;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t91AliasBoxedIntoLocal()
+    {
+        Thing* t = new Thing[3];
+        Thing* b = t;
+        IThing i = b;
+        return i;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t91PointerToPointerOfOwner()
+    {
+        Thing* t = new Thing[3];
+        Thing** pp = &t;
+        return *pp;
+    }
+}
+
+struct T91HeldFirst { Thing first = default; int x = 0; };
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t91FieldZeroAddressOfOwner()
+    {
+        T91HeldFirst* hp = new T91HeldFirst();
+        return &hp->first;
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

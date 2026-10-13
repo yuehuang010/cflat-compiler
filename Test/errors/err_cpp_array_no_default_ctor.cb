@@ -19,6 +19,25 @@ extern int main()
     expect_error("so an array of it cannot be default-initialized") {
         cppa.NoDef[3] bad3 = { {v=1} };
     }
+    // T88: every default-construction door refuses a private trivial default constructor.
+    expect_error("so an array of it cannot be default-initialized") {
+        cppa.PrivTriv[2] badPrivLocalArr;
+    }
+    expect_error("so an array of it cannot be default-initialized") {
+        cppa.PrivTriv[] badPrivNewArr = new cppa.PrivTriv[2];
+    }
+    expect_error("a 'static' local of it cannot be constructed") {
+        static cppa.ProtTriv badProtStatic;
+    }
+    expect_error("has no default constructor cflat can call") {
+        cppa.PrivTriv badPrivBraced = {};
+    }
+    expect_error("has no default constructor cflat can call") {
+        cppa.PrivUser badPrivUserLocal;
+    }
+    expect_error("has ambiguous default construction") {
+        cppa.PrivDefArg badAmbiguous;
+    }
     // Accept set: the remedy the message names must compile and run.
     cppa.NoDef*[2] ok = default;
     ok[0] = new cppa.NoDef(3);

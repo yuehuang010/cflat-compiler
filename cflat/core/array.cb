@@ -64,46 +64,61 @@ struct array<T>
     // interface value, so it covers every borrowed spelling.
     void _placeAt(int index, T value)
     {
-        if const (is_unique(T))         _ptr[index] = move value;
-        else if const (is_pointer(T))   _ptr[index] = value;
-        else if const (is_primitive(T)) _ptr[index] = value;
-        else if const (!is_copyable(T)) compile_error("this array element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (a.set(i, move x)) to transfer ownership instead, or give the type a 'copy()' method");
-        else                            _ptr[index] = value.copy();
+        if const (!is_movable(T))
+            compile_error("array<T>: element type is [immovable] - placing an element copies or moves it; use array<T*>");
+        else
+        {
+            if const (is_unique(T))         _ptr[index] = move value;
+            else if const (is_pointer(T))   _ptr[index] = value;
+            else if const (is_primitive(T)) _ptr[index] = value;
+            else if const (!is_copyable(T)) compile_error("this array element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (a.set(i, move x)) to transfer ownership instead, or give the type a 'copy()' method");
+            else                            _ptr[index] = value.copy();
+        }
     }
 
     // Release the element in a slot before overwriting it: `unique` is freed, a value
     // type is destructed, a bare pointer or interface is left to its real owner.
     void _releaseAt(int index)
     {
-        // An owning element is released by moving it into the discard sink: the element is the
-        // library unique<T> wrapper, whose drop frees the pointee exactly once (null is a no-op).
-        if const (is_unique(T))
+        if const (!is_movable(T))
+            compile_error("array<T>: element type is [immovable] - releasing an element moves it; use array<T*>");
+        else
         {
-            _ = move _ptr[index];
+            // An owning element is released by moving it into the discard sink: the element is the
+            // library unique<T> wrapper, whose drop frees the pointee exactly once (null is a no-op).
+            if const (is_unique(T))
+            {
+                _ = move _ptr[index];
+            }
+            else if const (is_pointer(T))   { }
+            else if const (is_primitive(T)) { }
+            else                            _ptr[index].~();
         }
-        else if const (is_pointer(T))   { }
-        else if const (is_primitive(T)) { }
-        else                            _ptr[index].~();
     }
 
     // Free `unique` elements, then the buffer (which destructs value elements as it frees).
     // Bare pointers and bare interface values are left to their real owner.
     ~array()
     {
-        if (_ptr != nullptr)
+        if const (!is_movable(T))
+            compile_error("array<T>: element type is [immovable] - the container relocates elements; use array<T*>");
+        else
         {
-            if const (is_unique(T))
+            if (_ptr != nullptr)
             {
-                int i = 0;
-                while (i < _len)
+                if const (is_unique(T))
                 {
-                    _ = move _ptr[i];
-                    i++;
+                    int i = 0;
+                    while (i < _len)
+                    {
+                        _ = move _ptr[i];
+                        i++;
+                    }
                 }
+                delete[_len] _ptr;
+                _ptr = nullptr;
+                _len = 0;
             }
-            delete[_len] _ptr;
-            _ptr = nullptr;
-            _len = 0;
         }
     }
 
@@ -121,11 +136,16 @@ struct array<T>
     // interface types). The old element is released first.
     void set(int index, T value)
     {
-        if const (!is_copyable(T)) compile_error("this array element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (a.set(i, move x)) to transfer ownership instead, or give the type a 'copy()' method");
+        if const (!is_movable(T))
+            compile_error("array<T>: element type is [immovable] - the container relocates elements; use array<T*>");
         else
         {
-            _releaseAt(index);
-            _placeAt(index, value);
+            if const (!is_copyable(T)) compile_error("this array element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (a.set(i, move x)) to transfer ownership instead, or give the type a 'copy()' method");
+            else
+            {
+                _releaseAt(index);
+                _placeAt(index, value);
+            }
         }
     }
 
@@ -134,7 +154,7 @@ struct array<T>
     // accepting ownership here would strand the element (nothing would ever free it), and
     // for `unique T*` the plain parameter above is already a synthesized move sink.
     // Declared AFTER the plain set() so the interface contract check matches it first.
-    if const (!is_pointer(T))
+    if const (!is_pointer(T) && is_movable(T))
     {
         void set(int index, move T value)
         {

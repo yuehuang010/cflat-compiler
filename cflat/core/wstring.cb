@@ -19,8 +19,8 @@ import "string.cb";
 
 // Windows: kernel32 UTF-8 <-> UTF-16 transcoding. CodePage 65001 = CP_UTF8.
 // (Declared on all platforms but only called on the Windows path below.)
-extern stdcall i32 MultiByteToWideChar(u32 codePage, u32 flags, i8* mbStr, i32 mbBytes, u16* wideStr, i32 wideChars);
-extern stdcall i32 WideCharToMultiByte(u32 codePage, u32 flags, u16* wideStr, i32 wideChars, i8* mbStr, i32 mbBytes, i8* defaultChar, i32* usedDefault);
+extern stdcall i32 MultiByteToWideChar(u32 codePage, u32 flags, char* mbStr, i32 mbBytes, u16* wideStr, i32 wideChars);
+extern stdcall i32 WideCharToMultiByte(u32 codePage, u32 flags, u16* wideStr, i32 wideChars, char* mbStr, i32 mbBytes, char* defaultChar, i32* usedDefault);
 
 // POSIX has no OS transcoder, so do the UTF-8 <-> UTF-16 conversion by hand
 // (surrogate pairs included). Each helper runs in two phases like the kernel32
@@ -28,7 +28,7 @@ extern stdcall i32 WideCharToMultiByte(u32 codePage, u32 flags, u16* wideStr, i3
 // excluding the NUL), or a buffer to FILL.
 
 // UTF-16 code units -> UTF-8 bytes. Returns the byte count.
-i32 _wstr_w2m(u16* src, i32 len, i8* dst) {
+i32 _wstr_w2m(u16* src, i32 len, char* dst) {
     i32 out = 0;
     i32 i   = 0;
     while (i < len) {
@@ -72,7 +72,7 @@ i32 _wstr_w2m(u16* src, i32 len, i8* dst) {
 }
 
 // UTF-8 bytes -> UTF-16 code units. Returns the code-unit count.
-i32 _wstr_m2w(i8* src, i32 len, u16* dst) {
+i32 _wstr_m2w(char* src, i32 len, u16* dst) {
     i32 out = 0;
     i32 i   = 0;
     while (i < len) {
@@ -135,7 +135,7 @@ struct wstring
     {
         if (_ptr == nullptr || _len == 0)
         {
-            i8* empty = new i8[1];
+            char* empty = new char[1];
             empty[0] = (i8)0;
             return _strOwned(move empty, 0);
         }
@@ -144,11 +144,11 @@ struct wstring
         else                   { mbLen = _wstr_w2m(_ptr, _len, nullptr); }
         if (mbLen <= 0)
         {
-            i8* empty = new i8[1];
+            char* empty = new char[1];
             empty[0] = (i8)0;
             return _strOwned(move empty, 0);
         }
-        i8* buf = new i8[mbLen + 1];
+        char* buf = new char[mbLen + 1];
         if const (__WINDOWS__) { WideCharToMultiByte((u32)65001, (u32)0, _ptr, _len, buf, mbLen, nullptr, nullptr); }
         else                   { _wstr_w2m(_ptr, _len, buf); }
         buf[mbLen] = (i8)0;

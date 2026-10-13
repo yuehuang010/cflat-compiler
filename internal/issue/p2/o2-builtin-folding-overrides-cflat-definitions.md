@@ -56,3 +56,9 @@ Matrix + report: scratch/repro_keep/t51/.
 The optimizer may omit replaceable global operator new[] / delete[] calls ([expr.new]/14). Rewrite
 counter legs 3359-3363 / 3401-3409 so they do not count GLOBAL allocation calls at -O2 (class-scope
 allocator counts, values and destructor counts stay asserted). No change to CFlat's IR shape.
+
+Item 2 LANDED 2026-10-10 as T82: legs 3359, 3360, 3361, 3363, 3401, 3403, 3406, 3409, 3418 assert the
+balance `newArrs() == deleteArrs()` per leg instead of exact global new[]/delete[] counts (omission removes
+pairs, so the balance holds at every -O level and still catches a missing delete[] at -O0); 3362 unchanged.
+All ten pass at -O2 in masked runs. Remaining: the full file at -O2 exits 83 at leg 3411 (VrParam move
+reassignment), cause not localized - the file still cannot take `// cflat-twin-args: -O2`.

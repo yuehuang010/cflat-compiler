@@ -1,7 +1,7 @@
 // Core string types.
 //
 // `string` is a value type with a pointer to NUL-terminated bytes and a byte count:
-//   i8* data()   - pointer to the underlying bytes (null-terminated)
+//   char* data()   - pointer to the underlying bytes (null-terminated)
 //   i32 length() - number of bytes, not counting the terminator
 //
 // String literals are automatically wrapped into a `string` by the compiler.
@@ -22,7 +22,7 @@ import "list.cb";
 
 // Wrap a freshly allocated, NUL-terminated buffer of `len` bytes into an OWNING string.
 // The returned string takes ownership of `buf`; it will be freed at scope exit.
-move string _strOwned(move i8* buf, i32 len)
+move string _strOwned(move char* buf, i32 len)
 {
     string result = default;
     result._ptr = buf;            // transfer the owning buffer into the result
@@ -40,7 +40,7 @@ i32 length(string self)
 
 // Pointer to the underlying NUL-terminated bytes. A default/empty string (_ptr == null)
 // returns a pointer to a static empty literal so it stays safe to hand to C as a C string.
-i8* data(string self)
+char* data(string self)
 {
     if (self._ptr == nullptr) return "";
     return self._ptr;
@@ -49,7 +49,7 @@ i8* data(string self)
 // FNV-1a hash over the bytes (basis 0x811C9DC5, prime 0x01000193, byte zero-extended).
 i32 hash(string self)
 {
-    i8* p = self._ptr;
+    char* p = self._ptr;
     i32 len = self.length();
     i32 h = (i32)2166136261;
     i32 i = 0;
@@ -75,7 +75,7 @@ i32 hash(string self)
 // Convert a 32-bit integer to its decimal string. Allocates; caller owns it.
 move string toString(i32 self)
 {
-    i8* buf = new i8[32];
+    char* buf = new char[32];
     i32 len = sprintf(buf, "%d", self);
     return _strOwned(move buf, len);
 }
@@ -83,7 +83,7 @@ move string toString(i32 self)
 // Convert a signed 64-bit integer to its decimal string. Allocates; caller owns it.
 move string toString(i64 self)
 {
-    i8* buf = new i8[24];
+    char* buf = new char[24];
     i32 len = sprintf(buf, "%lld", self);
     return _strOwned(move buf, len);
 }
@@ -91,7 +91,7 @@ move string toString(i64 self)
 // Convert an unsigned 32-bit integer to its decimal string. Allocates; caller owns it.
 move string toString(u32 self)
 {
-    i8* buf = new i8[16];
+    char* buf = new char[16];
     i32 len = sprintf(buf, "%u", self);
     return _strOwned(move buf, len);
 }
@@ -99,7 +99,7 @@ move string toString(u32 self)
 // Convert an unsigned 64-bit integer to its decimal string. Allocates; caller owns it.
 move string toString(u64 self)
 {
-    i8* buf = new i8[24];
+    char* buf = new char[24];
     i32 len = sprintf(buf, "%llu", self);
     return _strOwned(move buf, len);
 }
@@ -121,7 +121,7 @@ move string toString(i128 self)
     }
     if (neg) { pos = pos - 1; tmp[pos] = '-'; }
     i32 len = 130 - pos;
-    i8* buf = new i8[len + 1];
+    char* buf = new char[len + 1];
     i32 i = 0;
     while (i < len) { buf[i] = tmp[pos + i]; i = i + 1; }
     buf[len] = (i8)0;
@@ -142,7 +142,7 @@ move string toString(u128 self)
         self = self / (u128)10;
     }
     i32 len = 128 - pos;
-    i8* buf = new i8[len + 1];
+    char* buf = new char[len + 1];
     i32 i = 0;
     while (i < len) { buf[i] = tmp[pos + i]; i = i + 1; }
     buf[len] = (i8)0;
@@ -152,7 +152,7 @@ move string toString(u128 self)
 // Convert an 8-bit integer to its decimal string. Allocates; caller owns it.
 move string toString(i8 self)
 {
-    i8* buf = new i8[8];
+    char* buf = new char[8];
     i32 len = sprintf(buf, "%d", (i32)self);
     return _strOwned(move buf, len);
 }
@@ -160,7 +160,7 @@ move string toString(i8 self)
 // Convert a double to a string using %g (shortest representation). Allocates; caller owns it.
 move string toString(double self)
 {
-    i8* buf = new i8[32];
+    char* buf = new char[32];
     i32 len = sprintf(buf, "%g", self);
     return _strOwned(move buf, len);
 }
@@ -218,7 +218,7 @@ move string toString(i64 self, i32 base)
     }
 
     i32 len = 66 - pos;
-    i8* buf = new i8[len + 1];
+    char* buf = new char[len + 1];
     i32 i = 0;
     while (i < len) { buf[i] = tmp[pos + i]; i = i + 1; }
     buf[len] = (i8)0;
@@ -334,9 +334,9 @@ string operator+(string a, string b)
     i32 alen  = a.length();
     i32 blen  = b.length();
     i32 total = alen + blen;
-    i8* buf   = new i8[total + 1];
+    char* buf   = new char[total + 1];
 
-    i8* aptr = a.data();
+    char* aptr = a.data();
     i32 i = 0;
     while (i < alen)
     {
@@ -344,7 +344,7 @@ string operator+(string a, string b)
         i++;
     }
 
-    i8* bptr = b.data();
+    char* bptr = b.data();
     i32 j = 0;
     while (j < blen)
     {
@@ -362,9 +362,9 @@ string operator+(string a, const char* b)
     i32 alen  = a.length();
     i32 blen  = strlen(b);
     i32 total = alen + blen;
-    i8* buf   = new i8[total + 1];
+    char* buf   = new char[total + 1];
 
-    i8* aptr = a.data();
+    char* aptr = a.data();
     i32 i = 0;
     while (i < alen)
     {
@@ -390,10 +390,10 @@ string operator+(const char* a, string b)
     i32 alen  = strlen(a);
     i32 blen  = b.length();
     i32 total = alen + blen;
-    i8* buf   = new i8[total + 1];
+    char* buf   = new char[total + 1];
     i32 i = 0;
     while (i < alen) { buf[i] = a[i]; i++; }
-    i8* bptr = b.data();
+    char* bptr = b.data();
     i32 j = 0;
     while (j < blen) { buf[alen + j] = bptr[j]; j++; }
     buf[total] = 0;
@@ -408,7 +408,7 @@ string operator+(const char* a, const char* b)
     i32 alen  = strlen(a);
     i32 blen  = strlen(b);
     i32 total = alen + blen;
-    i8* buf   = new i8[total + 1];
+    char* buf   = new char[total + 1];
     i32 i = 0;
     while (i < alen) { buf[i] = a[i]; i++; }
     i32 j = 0;
@@ -428,8 +428,8 @@ string operator+(string a, IString b)
 move string copy(string self)
 {
     i32 len = self.length();
-    i8* buf = new i8[len + 1];
-    i8* src = self.data();
+    char* buf = new char[len + 1];
+    char* src = self.data();
     i32 i = 0;
     while (i < len)
     {
@@ -448,8 +448,8 @@ move string copy(string self)
 move string copy(string self, IAllocator alloc)
 {
     i32 len  = self.length();
-    i8* buf  = (i8*)alloc.alloc((i64)len + 1);
-    i8* src  = self.data();
+    char* buf  = (char*)alloc.alloc((i64)len + 1);
+    char* src  = self.data();
     i32 i = 0;
     while (i < len)
     {
@@ -554,8 +554,8 @@ i32 indexOf(string self, string needle, i32 startPos)
     i32 nlen = needle.length();
     if (nlen == 0) return startPos < 0 ? 0 : (startPos > slen ? slen : startPos);
     if (startPos < 0) startPos = 0;
-    i8* sp = self._ptr;
-    i8* np = needle._ptr;
+    char* sp = self._ptr;
+    char* np = needle._ptr;
     i32 limit = slen - nlen;
     i32 i = startPos;
     while (i <= limit)
@@ -576,7 +576,7 @@ i32 indexOf(string self, string needle)
 i32 indexOf(string self, i8 c)
 {
     i32 len = self.length();
-    i8* p = self._ptr;
+    char* p = self._ptr;
     i32 i = 0;
     while (i < len)
     {
@@ -593,8 +593,8 @@ i32 lastIndexOf(string self, string needle)
     i32 nlen = needle.length();
     if (nlen == 0) return slen;
     if (nlen > slen) return -1;
-    i8* sp = self._ptr;
-    i8* np = needle._ptr;
+    char* sp = self._ptr;
+    char* np = needle._ptr;
     i32 i = slen - nlen;
     while (i >= 0)
     {
@@ -608,7 +608,7 @@ i32 lastIndexOf(string self, string needle)
 i32 lastIndexOf(string self, i8 c)
 {
     i32 len = self.length();
-    i8* p = self._ptr;
+    char* p = self._ptr;
     i32 i = len - 1;
     while (i >= 0)
     {
@@ -675,11 +675,11 @@ bool operator>(string a, string b)
 // Non-owning view into a string's buffer.  _ptr is borrowed; never freed.
 struct string_view
 {
-    i8* _ptr = nullptr;
+    char* _ptr = nullptr;
     i32 _len = 0;
 
     // Pointer to the borrowed bytes (not NUL-terminated in general).
-    i8* data()      { return _ptr; }
+    char* data()      { return _ptr; }
     // Number of bytes in the view.
     i32 length()    { return _len; }
     // Byte at position i (unchecked).
@@ -687,7 +687,7 @@ struct string_view
 
     // View over `len` borrowed bytes at `ptr` (C++ string_view(ptr, count)).  Nothing is
     // copied and no NUL terminator is required; the caller keeps ownership of the bytes.
-    string_view(i8* ptr, i32 len)
+    string_view(char* ptr, i32 len)
     {
         this->_ptr = ptr;
         this->_len = len;
@@ -730,7 +730,7 @@ string_view* span(bond string* this, i32 start, i32 end)
 // Mutable, growable string buffer.
 struct stringbuilder
 {
-    i8* _data     = nullptr;
+    char* _data     = nullptr;
     i32 _length   = 0;
     i32 _capacity = 0;
 
@@ -740,7 +740,7 @@ struct stringbuilder
         if (_capacity >= needed) return;
         i32 newCap = needed * 2;
         if (newCap < 16) newCap = 16;
-        i8* newData = new i8[newCap];
+        char* newData = new char[newCap];
         int i = 0;
         while (i < _length)
         {
@@ -754,14 +754,14 @@ struct stringbuilder
     }
 
     // Pointer to the current NUL-terminated buffer (may be null when empty).
-    i8* data()   { return _data; }
+    char* data()   { return _data; }
     // Number of bytes accumulated so far.
     i32 length() { return _length; }
 
     // Append the contents of another string.
     void append(string s)
     {
-        i8* src = s.data();
+        char* src = s.data();
         i32 addLen = s.length();
         i32 newLen = _length + addLen;
         _ensure(newLen + 1);
@@ -893,7 +893,7 @@ struct stringbuilder
     // Append a double formatted with %g (shortest decimal representation).
     void append(double d)
     {
-        i8* buf = new i8[32];
+        char* buf = new char[32];
         i32 len = sprintf(buf, "%g", d);
         i32 newLen = _length + len;
         _ensure(newLen + 1);
@@ -911,7 +911,7 @@ struct stringbuilder
         if (addLen == 0) return;
         i32 newLen = _length + addLen;
         _ensure(newLen + 1);
-        i8* src = sv.data();
+        char* src = sv.data();
         int i = 0;
         while (i < addLen) { _data[_length + i] = src[i]; i++; }
         _data[newLen] = 0;
@@ -946,7 +946,7 @@ struct stringbuilder
     // bit as a borrow and leak the buffer.
     move string toString()
     {
-        i8* copy = new i8[_length + 1];
+        char* copy = new char[_length + 1];
         int i = 0;
         while (i < _length) { copy[i] = _data[i]; i++; }
         copy[_length] = 0;
@@ -978,8 +978,8 @@ move string substring(string self, i32 start)
     if (start < 0) start = 0;
     if (start > slen) start = slen;
     i32 len = slen - start;
-    i8* buf = new i8[len + 1];
-    i8* src = self._ptr + start;
+    char* buf = new char[len + 1];
+    char* src = self._ptr + start;
     i32 i = 0;
     while (i < len) { buf[i] = src[i]; i++; }
     buf[len] = 0;
@@ -994,8 +994,8 @@ move string substring(string self, i32 start, i32 len)
     if (start > slen) start = slen;
     if (len < 0) len = 0;
     if (start + len > slen) len = slen - start;
-    i8* buf = new i8[len + 1];
-    i8* src = self._ptr + start;
+    char* buf = new char[len + 1];
+    char* src = self._ptr + start;
     i32 i = 0;
     while (i < len) { buf[i] = src[i]; i++; }
     buf[len] = 0;
@@ -1010,9 +1010,9 @@ move string replace(string self, string oldVal, string newVal)
     i32 olen = oldVal.length();
     if (olen == 0) return self.copy();
     i32 slen = self.length();
-    i8* sp = self._ptr;
-    i8* op = oldVal._ptr;
-    i8* np = newVal._ptr;
+    char* sp = self._ptr;
+    char* op = oldVal._ptr;
+    char* np = newVal._ptr;
     i32 nlen = newVal.length();
     stringbuilder sb;
     i32 pos = 0;
@@ -1032,8 +1032,8 @@ move string replace(string self, string oldVal, string newVal)
     }
     while (pos < slen) { sb.appendChar(sp[pos]); pos++; }
     i32 rlen = sb.length();
-    i8* buf = new i8[rlen + 1];
-    i8* sd = sb.data();
+    char* buf = new char[rlen + 1];
+    char* sd = sb.data();
     i32 i = 0;
     while (i < rlen) { buf[i] = sd[i]; i++; }
     buf[rlen] = 0;
@@ -1044,8 +1044,8 @@ move string replace(string self, string oldVal, string newVal)
 move string toUpper(string self)
 {
     i32 len = self.length();
-    i8* buf = new i8[len + 1];
-    i8* src = self._ptr;
+    char* buf = new char[len + 1];
+    char* src = self._ptr;
     i32 i = 0;
     while (i < len)
     {
@@ -1062,8 +1062,8 @@ move string toUpper(string self)
 move string toLower(string self)
 {
     i32 len = self.length();
-    i8* buf = new i8[len + 1];
-    i8* src = self._ptr;
+    char* buf = new char[len + 1];
+    char* src = self._ptr;
     i32 i = 0;
     while (i < len)
     {
@@ -1080,7 +1080,7 @@ move string toLower(string self)
 move string trimStart(string self)
 {
     i32 len = self.length();
-    i8* src = self._ptr;
+    char* src = self._ptr;
     i32 startIdx = 0;
     while (startIdx < len)
     {
@@ -1089,7 +1089,7 @@ move string trimStart(string self)
         else break;
     }
     i32 newLen = len - startIdx;
-    i8* buf = new i8[newLen + 1];
+    char* buf = new char[newLen + 1];
     i32 i = 0;
     while (i < newLen) { buf[i] = src[startIdx + i]; i++; }
     buf[newLen] = 0;
@@ -1100,7 +1100,7 @@ move string trimStart(string self)
 move string trimEnd(string self)
 {
     i32 len = self.length();
-    i8* src = self._ptr;
+    char* src = self._ptr;
     i32 endIdx = len;
     while (endIdx > 0)
     {
@@ -1108,7 +1108,7 @@ move string trimEnd(string self)
         if (c == ' ' || c == '\t' || c == '\r' || c == '\n') endIdx--;
         else break;
     }
-    i8* buf = new i8[endIdx + 1];
+    char* buf = new char[endIdx + 1];
     i32 i = 0;
     while (i < endIdx) { buf[i] = src[i]; i++; }
     buf[endIdx] = 0;
@@ -1119,7 +1119,7 @@ move string trimEnd(string self)
 move string trim(string self)
 {
     i32 len = self.length();
-    i8* src = self._ptr;
+    char* src = self._ptr;
     i32 startIdx = 0;
     while (startIdx < len)
     {
@@ -1135,7 +1135,7 @@ move string trim(string self)
         else break;
     }
     i32 newLen = endIdx - startIdx;
-    i8* buf = new i8[newLen + 1];
+    char* buf = new char[newLen + 1];
     i32 i = 0;
     while (i < newLen) { buf[i] = src[startIdx + i]; i++; }
     buf[newLen] = 0;
@@ -1149,10 +1149,10 @@ move string padLeft(string self, i32 width)
     i32 len = self.length();
     if (len >= width) return self.copy();
     i32 pad = width - len;
-    i8* buf = new i8[width + 1];
+    char* buf = new char[width + 1];
     i32 i = 0;
     while (i < pad) { buf[i] = ' '; i++; }
-    i8* src = self._ptr;
+    char* src = self._ptr;
     i32 j = 0;
     while (j < len) { buf[pad + j] = src[j]; j++; }
     buf[width] = 0;
@@ -1165,8 +1165,8 @@ move string padRight(string self, i32 width)
 {
     i32 len = self.length();
     if (len >= width) return self.copy();
-    i8* buf = new i8[width + 1];
-    i8* src = self._ptr;
+    char* buf = new char[width + 1];
+    char* src = self._ptr;
     i32 i = 0;
     while (i < len) { buf[i] = src[i]; i++; }
     while (i < width) { buf[i] = ' '; i++; }
@@ -1177,9 +1177,9 @@ move string padRight(string self, i32 width)
 // -- Phase 3: split / join ----------------------------------------------------
 
 // Build an owning string from the byte range [src, src+len).
-move string _str_owned_range(i8* src, i32 len)
+move string _str_owned_range(char* src, i32 len)
 {
-    i8* buf = new i8[len + 1];
+    char* buf = new char[len + 1];
     i32 k = 0;
     while (k < len) { buf[k] = src[k]; k++; }
     buf[len] = 0;
@@ -1201,8 +1201,8 @@ move list<string> split(string self, string sep)
         out.add(self.copy());
         return move out;
     }
-    i8* sp = self._ptr;
-    i8* dp = sep._ptr;
+    char* sp = self._ptr;
+    char* dp = sep._ptr;
     i32 pos = 0;
     while (pos <= slen)
     {
@@ -1234,7 +1234,7 @@ move list<string> split(string self, i8 sep)
 {
     list<string> out = default;
     i32 slen = self.length();
-    i8* sp = self._ptr;
+    char* sp = self._ptr;
     i32 pos = 0;
     while (pos <= slen)
     {
@@ -1265,7 +1265,7 @@ move string join(string sep, list<string> parts)
     i32 count = parts.count();
     if (count == 0)
     {
-        i8* buf = new i8[1];
+        char* buf = new char[1];
         buf[0] = 0;
         return _strOwned(move buf, 0);
     }
@@ -1278,15 +1278,15 @@ move string join(string sep, list<string> parts)
         if (idx < count - 1) total = total + sepLen;
         idx++;
     }
-    i8* buf = new i8[total + 1];
-    i8* sepPtr = sep._ptr;
+    char* buf = new char[total + 1];
+    char* sepPtr = sep._ptr;
     i32 pos = 0;
     idx = 0;
     while (idx < count)
     {
         string part = parts.get(idx);
         i32 plen = part.length();
-        i8* pp = part.data();
+        char* pp = part.data();
         i32 k = 0;
         while (k < plen) { buf[pos] = pp[k]; pos++; k++; }
         if (idx < count - 1)

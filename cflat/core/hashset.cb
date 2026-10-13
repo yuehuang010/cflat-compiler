@@ -76,32 +76,37 @@ struct hashset<T>
     // Rebuild the table at `newCap`, reinserting live elements and dropping tombstones.
     void _rehash(int newCap)
     {
-        T*    oldKeys   = _keys;
-        char* oldStatus = _status;
-        int   oldCap    = _capacity;
-
-        _count = 0;
-        _tombstones = 0;
-        _init(newCap);
-
-        int i = 0;
-        while (i < oldCap)
+        if const (!is_movable(T))
+            compile_error("hashset<T>: element type is [immovable] - rehashing relocates elements; use hashset<T*>");
+        else
         {
-            if (oldStatus[i] == 1)
-            {
-                int slot = _slot(oldKeys[i]);
-                while (_status[slot] != 0)
-                    slot = (slot + 1) % _capacity;
-                _keys[slot]   = oldKeys[i];
-                _status[slot] = 1;
-                _count++;
-            }
-            i++;
-        }
+            T*    oldKeys   = _keys;
+            char* oldStatus = _status;
+            int   oldCap    = _capacity;
 
-        if const (is_pointer(T)) delete[] oldKeys;
-        else free((void*)oldKeys);
-        delete[] oldStatus;
+            _count = 0;
+            _tombstones = 0;
+            _init(newCap);
+
+            int i = 0;
+            while (i < oldCap)
+            {
+                if (oldStatus[i] == 1)
+                {
+                    int slot = _slot(oldKeys[i]);
+                    while (_status[slot] != 0)
+                        slot = (slot + 1) % _capacity;
+                    _keys[slot]   = oldKeys[i];
+                    _status[slot] = 1;
+                    _count++;
+                }
+                i++;
+            }
+
+            if const (is_pointer(T)) delete[] oldKeys;
+            else free((void*)oldKeys);
+            delete[] oldStatus;
+        }
     }
 
     // Insert value. Returns true if added, false if already present. A value-type element is
@@ -111,7 +116,8 @@ struct hashset<T>
         // A `unique` element is key-like and cannot be borrowed for hashing; poison the body so
         // the defensive copy below is never instantiated for it (that copy of an owning element
         // is its own error, and it would preempt this diagnostic).
-        if const (is_unique(T)) compile_error("hashset elements cannot be 'unique'; set elements are key-like and a lookup reads the element for hashing/equality, which would move it out. Use 'hashset<T*>' to hold borrowed elements and manage their lifetime separately.");
+        if const (!is_movable(T)) compile_error("hashset<T>: element type is [immovable] - the container relocates elements; use hashset<T*>");
+        else if const (is_unique(T)) compile_error("hashset elements cannot be 'unique'; set elements are key-like and a lookup reads the element for hashing/equality, which would move it out. Use 'hashset<T*>' to hold borrowed elements and manage their lifetime separately.");
         // Poison the copying overload for a non-copyable T so the class still instantiates and
         // `add(move x)` stays usable; the dead arm emits no call to the poisoned _placeAt.
         else if const (!is_copyable(T)) compile_error("this hashset element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (s.add(move x)) to transfer ownership instead, or give the type a 'copy()' method");
@@ -148,7 +154,7 @@ struct hashset<T>
     // strand it (nothing ever frees it). is_pointer(T) covers bare, `unique`, `alias` and
     // interface elements alike (a `unique` element is separately rejected by _slot). Declared
     // AFTER the plain add() so an interface contract check matches the plain overload first.
-    if const (!is_pointer(T) && !is_unique(T))
+    if const (!is_pointer(T) && !is_unique(T) && is_movable(T))
     {
         bool add(move T value)
         {
@@ -181,13 +187,18 @@ struct hashset<T>
     // every borrowed spelling.
     void _placeAt(int index, alias T value)
     {
-        if const (is_primitive(T))      _keys[index] = value;
-        else if const (is_pointer(T))   _keys[index] = value;
-        // An owning element is policy-rejected on the hash path; keep its .copy() out of the
-        // instantiation so that tailored diagnostic is the one reported.
-        else if const (is_unique(T))    compile_error("hashset elements cannot be 'unique'; set elements are key-like and a lookup reads the element for hashing/equality, which would move it out. Use 'hashset<T*>' to hold borrowed elements and manage their lifetime separately.");
-        else if const (!is_copyable(T)) compile_error("this hashset element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (s.add(move x)) to transfer ownership instead, or give the type a 'copy()' method");
-        else                            _keys[index] = value.copy();
+        if const (!is_movable(T))
+            compile_error("hashset<T>: element type is [immovable] - the container relocates elements; use hashset<T*>");
+        else
+        {
+            if const (is_primitive(T))      _keys[index] = value;
+            else if const (is_pointer(T))   _keys[index] = value;
+            // An owning element is policy-rejected on the hash path; keep its .copy() out of the
+            // instantiation so that tailored diagnostic is the one reported.
+            else if const (is_unique(T))    compile_error("hashset elements cannot be 'unique'; set elements are key-like and a lookup reads the element for hashing/equality, which would move it out. Use 'hashset<T*>' to hold borrowed elements and manage their lifetime separately.");
+            else if const (!is_copyable(T)) compile_error("this hashset element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (s.add(move x)) to transfer ownership instead, or give the type a 'copy()' method");
+            else                            _keys[index] = value.copy();
+        }
     }
 
     // Returns true if value is in the set.
@@ -303,21 +314,26 @@ struct hashset<T>
     // Free owned value-type element copies, then the backing arrays.
     ~hashset()
     {
-        // Free owned deep-copies (string / owning-struct) before freeing the raw buffer; pointer
-        // and primitive elements are borrowed/trivial and are never freed here.
-        int i = 0;
-        while (i < _capacity)
+        if const (!is_movable(T))
+            compile_error("hashset<T>: element type is [immovable] - the container relocates elements; use hashset<T*>");
+        else
         {
-            if (_status[i] == 1)
-                if const (!is_pointer(T))
-                    _keys[i].~();
-            i++;
+            // Free owned deep-copies (string / owning-struct) before freeing the raw buffer; pointer
+            // and primitive elements are borrowed/trivial and are never freed here.
+            int i = 0;
+            while (i < _capacity)
+            {
+                if (_status[i] == 1)
+                    if const (!is_pointer(T))
+                        _keys[i].~();
+                i++;
+            }
+            if (_keys != nullptr)
+            {
+                if const (is_pointer(T)) delete[_] _keys;
+                else free((void*)_keys);
+            }
+            if (_status != nullptr) delete[] _status;
         }
-        if (_keys != nullptr)
-        {
-            if const (is_pointer(T)) delete[_] _keys;
-            else free((void*)_keys);
-        }
-        if (_status != nullptr) delete[] _status;
     }
 };

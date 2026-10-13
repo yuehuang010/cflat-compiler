@@ -584,6 +584,50 @@ extern int main()
         if (t55.tf(k ? b : b) != 9005) return 55015;
         if (t55.tf(k ? true : false) != 9001) return 55016;
         if (t55.tf(k ? c : c) != 9005) return 55017;
+        // T92: a ?: argument of a C++ constructor call, a brace/new/copy-init of a C++ class, and
+        // the right operand of a C++ operator=(T) template use the usual arithmetic conversions.
+        if (t55.tk(k ? 5 : 6) != 1005) return 55018;
+        t55.CtorLeg t92Paren = t55.CtorLeg(k ? 5 : 6);
+        if (t92Paren.c != 1005) return 55019;
+        t55.CtorLeg* t92New = new t55.CtorLeg(k ? 5 : 6);
+        int t92NewValue = t92New->c;
+        delete t92New;
+        if (t92NewValue != 1005) return 55020;
+        t55.CtorLeg t92Brace = {k ? 5 : 6};
+        if (t92Brace.c != 1005) return 55021;
+        t55.CtorLeg t92Copy = k ? 5 : 6;
+        if (t92Copy.c != 1005) return 55022;
+        t55.AssignLeg t92Assign = t55.AssignLeg();
+        t92Assign = k ? 5 : 6;
+        if (t92Assign.last != 1005) return 55023;
+        t55.CtorLeg t92Char = t55.CtorLeg(k ? 'a' : 'b');
+        if (t92Char.c != 3097) return 55024;
+        t55.CtorLeg t92Long = t55.CtorLeg(k ? 5 : 6L);
+        if (t92Long.c != 2005) return 55025;
+        t55.CtorLeg t92Bool = t55.CtorLeg(k ? true : false);
+        if (t92Bool.c != 5001) return 55026;
+        t55.CtorLeg t92Double = t55.CtorLeg(k ? 1.5 : 2);
+        if (t92Double.c != 6015) return 55027;
+        t55.CtorLeg t92Var = t55.CtorLeg(k ? i : 6);
+        if (t92Var.c != 1005) return 55028;
+        t55.AssignLeg t92AssignChar = t55.AssignLeg();
+        t92AssignChar = k ? 'a' : 'b';
+        if (t92AssignChar.last != 3097) return 55029;
+        t55.AssignLeg t92AssignLong = t55.AssignLeg();
+        t92AssignLong = k ? 5 : 6L;
+        if (t92AssignLong.last != 2005) return 55030;
+        t55.CtorLeg t92CopyChar = k ? 'a' : 'b';
+        if (t92CopyChar.c != 3097) return 55031;
+        // Copy-initialization from a subscript keeps the destination's arithmetic type too.
+        i8[1] t92Vals = {5};
+        t55.CtorLeg t92Index = k ? t92Vals[0] : 6;
+        if (t92Index.c != 1005) return 55032;
+        // An explicit int constructor is no copy-initialization candidate: the non-explicit
+        // signed char constructor runs (3005); direct initialization picks the explicit one.
+        t55.ExplicitLeg t92Explicit = k ? 5 : 6;
+        if (t92Explicit.c != 3005) return 55033;
+        t55.ExplicitLeg t92Direct = t55.ExplicitLeg(k ? 5 : 6);
+        if (t92Direct.c != 1005) return 55034;
     }
 
     // T23: under NDEBUG assert expands to ((void)0) and evaluates nothing, as in C++.
