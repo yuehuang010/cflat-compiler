@@ -1760,6 +1760,62 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>>& candidates,
         std::vector<FunctionSymbol>* tiedOut, CxxPreferredOverload* preferredOut)
 {
+        if (!candidates.empty() && candidates.front().first.size() == 1)
+        {
+            const NamedVariable& source = candidates.front().first.front();
+            if (source.IsNormalizedCxxXvalue && !source.TypeAndValue.Pointer
+                && IsCxxRecord(source.TypeAndValue.TypeName))
+            {
+                const std::string sourceType = source.TypeAndValue.TypeName;
+                bool classPointer = false;
+                bool voidPointer = false;
+                std::string sourceName;
+                for (const auto& [args, candidate] : candidates)
+                {
+                    if (!candidate.IsCxx || candidate.IsMethod || args.size() != 1
+                        || candidate.Parameters.size() != 1 || !candidate.Parameters[0].Pointer
+                        || candidate.Parameters[0].IsAlias || candidate.Parameters[0].IsRvalueRef)
+                        continue;
+                    if (candidate.Parameters[0].TypeName == sourceType) classPointer = true;
+                    if (candidate.Parameters[0].TypeName == "void") voidPointer = true;
+                    if (sourceName.empty()) sourceName = candidate.SourceName;
+                }
+                auto owner = cxxTypeOwnerGroup_.find(sourceType);
+                if (classPointer && voidPointer && !sourceName.empty()
+                    && owner != cxxTypeOwnerGroup_.end())
+                {
+                    std::string sourceSpelling;
+                    if (CxxSpellingForCflatType(sourceType, sourceSpelling))
+                    {
+                        CxxRequestGroup group = MakeCxxRequestGroup(owner->second, {});
+                        if (!group.headers.empty())
+                        {
+                            for (size_t pos = 0; (pos = sourceName.find('.', pos)) != std::string::npos;
+                                 pos += 2)
+                                sourceName.replace(pos, 1, "::");
+                            const std::string wrapperName = std::format(
+                                "__cflat_xvptr_overload_{:016x}",
+                                std::hash<std::string>{}(sourceType + "|" + sourceName));
+                            const std::string wrapperSource = "extern \"C\" __attribute__((weak)) void "
+                                + wrapperName + "(" + sourceSpelling + " * p0) { (void)"
+                                + sourceName + "(static_cast<" + sourceSpelling
+                                + " &&>(*p0)); }\n";
+                            CxxRequestGroupScope groupScope(*this, &group);
+                            CSigEntry signature;
+                            std::string error;
+                            if (!RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName,
+                                    "XVALUE_POINTER_OVERLOAD", signature, error)
+                                && error.find("ambiguous") != std::string::npos)
+                            {
+                                if (const size_t newline = error.find('\n'); newline != std::string::npos)
+                                    error.resize(newline);
+                                LogError("clang: " + error);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // One viable candidate and the facts the tie-breaks below read.
         struct Ranked
         {
@@ -5964,6 +6020,17 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     == cflat_cinterop::RawAbiSlot::Indirect;
             if (candidate.IsCxx && candidate.IsMethod && i == 0) continue;  // receiver: no UDC
             const auto& arg = matched[i];
+            const bool referenceConversionOperator = candidate.IsCxx
+                && param.IsAlias && !param.IsCxxRefToPointer
+                && IsCxxRecord(param.TypeName) && !arg.TypeAndValue.Pointer
+                && !CxxConversionOperatorTo(arg.TypeAndValue.TypeName, param, false).empty();
+            if (referenceConversionOperator)
+            {
+                if (!ApplyCxxConversionOperator(matched[i], param, false))
+                    LogErrorMessage("cannot bind C++ reference argument for '{}'",
+                                    { diagnosticFunctionName });
+                continue;
+            }
             if (param.Pointer && !param.IsAlias && !param.IsCxxRefToPointer && !param.IsCxxConstRef
                 && !param.IsRvalueRef && !arg.TypeAndValue.Pointer
                 && IsCxxRecord(param.TypeName) && IsCxxRecord(arg.TypeAndValue.TypeName))
@@ -6164,7 +6231,20 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 return nullptr;
             }
 
-            if (!inVariadicRange && candParamItr->IsRvalueRef)
+            const std::string cxxReferenceSpelling = candidate.IsCxx
+                ? CxxReferenceParameterSpelling(candidate, argIndex) : std::string();
+            const bool cxxNullptrReference = candidate.IsCxx
+                && (candParamItr->IsCxxNullptrT || CxxSpellingIsNullptrT(cxxReferenceSpelling))
+                && cxxReferenceSpelling.find('&') != std::string::npos;
+            if (!inVariadicRange && cxxNullptrReference)
+            {
+                auto nullptrParam = *candParamItr;
+                nullptrParam.IsCxxNullptrT = true;
+                argList.push_back(cxxReferenceSpelling.find("&&") != std::string::npos
+                    ? LowerRvalueRefArg(arg, nullptrParam, true)
+                    : LowerAliasByPointerArg(arg, nullptrParam));
+            }
+            else if (!inVariadicRange && candParamItr->IsRvalueRef)
             {
                 argList.push_back(LowerRvalueRefArg(arg, *candParamItr, candidate.IsCxx));
             }
@@ -6294,6 +6374,20 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 // as an address.
                 argList.push_back(LowerAliasByPointerArg(arg, constRefReferent,
                     /*strictCxxScalarType*/ functionName.starts_with("__cflat_ctor_")));
+            }
+            else if (!inVariadicRange && candidate.IsCxx && candParamItr->Pointer
+                     && !candParamItr->IsAlias && !candParamItr->IsRvalueRef
+                     && !arg.TypeAndValue.Pointer && arg.IsNormalizedCxxXvalue
+                     && IsCxxRecord(arg.TypeAndValue.TypeName)
+                     && arg.TypeAndValue.TypeName == candParamItr->TypeName
+                     && HasImplicitClassPointerConversion(arg.TypeAndValue.TypeName,
+                         candParamItr->TypeName, candParamItr->IsCxxPointeeConst))
+            {
+                llvm::Value* converted = ConvertCxxXvalueToPointer(arg, *candParamItr);
+                if (converted == nullptr)
+                    LogErrorMessage("cannot lower C++ xvalue conversion to pointer parameter '{}' of '{}'",
+                        { candParamItr->VariableName, diagnosticFunctionName });
+                argList.push_back(converted);
             }
             else if (!inVariadicRange && candParamItr->Pointer)
             {
@@ -6950,8 +7044,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             ValidateCxxDemand(candidate.Function->getName().str());
 
         if (candidate.Function != nullptr)
-            firstCallLocation_.emplace(candidate.Function->getName().str(),
-                std::make_pair(currentLine, currentColumn));
+            firstCallLocation_.emplace(candidate.Function->getName().str(), FirstCallSite{
+                currentLine, currentColumn, firstCallLocation_.size()});
 
         // The pointer arm holds for a CFlat callee too: overload scoring accepts a derived C++
         // pointer for any public-base parameter, so the argument must arrive adjusted either way.

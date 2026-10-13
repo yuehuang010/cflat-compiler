@@ -1,0 +1,17 @@
+import cpp "cpp_interop_t104_refparam.hpp";
+
+extern int main()
+{
+    expect_error("no overload") {
+        t104.ConstRefSource s = default;
+        int v = t104.takeMutX(s);
+    }
+    expect_error("no overload") {
+        t104.FakeRefHolder f = default;
+        int v = t104.takeConstX(f);
+    }
+    expect_error("no overload") {
+        t104.ExplicitRefSource e = default;
+        int v = t104.takeConstX(e);
+    }
+}

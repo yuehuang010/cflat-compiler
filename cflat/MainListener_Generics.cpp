@@ -23,6 +23,23 @@ struct ActiveEnumSpecializationScope
     ActiveEnumSpecializationScope(const ActiveEnumSpecializationScope&) = delete;
     ActiveEnumSpecializationScope& operator=(const ActiveEnumSpecializationScope&) = delete;
 };
+struct LocalEnumScopeParkGuard
+{
+    std::vector<std::string>* slot_;
+    std::vector<std::string> saved_;
+    explicit LocalEnumScopeParkGuard(std::vector<std::string>* slot)
+        : slot_(slot), saved_(std::move(*slot)) { slot_->clear(); }
+    ~LocalEnumScopeParkGuard() { *slot_ = std::move(saved_); }
+    LocalEnumScopeParkGuard(const LocalEnumScopeParkGuard&) = delete;
+    LocalEnumScopeParkGuard& operator=(const LocalEnumScopeParkGuard&) = delete;
+};
+
+static void ResolveEnumTypeArguments(LLVMBackend* compiler, std::vector<std::string>& typeArgs)
+{
+        for (auto& arg : typeArgs)
+            if (std::string enumKey = compiler->ResolveEnumTypeName(arg); !enumKey.empty())
+                arg = std::move(enumKey);
+}
 }
 
 
@@ -135,6 +152,7 @@ void MainListener::InstantiateGenericInterface(const std::string& baseName, cons
             std::vector<std::string> parentArgs;
             for (auto* entry : spec->genericTypeParameters()->typeParameterList()->typeParameterEntry())
                 parentArgs.push_back(ResolveTypeArgEntry(entry));
+            ResolveEnumTypeArguments(Compiler(), parentArgs);
             std::string parentMangled = MangledGenericName(parentBase, parentArgs);
             parentNames.push_back(parentMangled);
 
@@ -280,6 +298,7 @@ bool MainListener::IsFollowedByCall(CFlatParser::PostfixExpressionContext* ctx, 
 std::string MainListener::InstantiateGenericFunction(const std::string& baseName,
                                                     const std::vector<std::string>& spelledArgs) {
         std::vector<std::string> typeArgs = spelledArgs;
+        ResolveEnumTypeArguments(compilerLLVM, typeArgs);
         if (genericFunctionTemplates.count(baseName) != 0
             && HasLongDoubleTypeArgument(typeArgs)
             && !compilerLLVM->IsCInteropLongDoubleSupported())
@@ -293,6 +312,7 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
             &compilerLLVM->activeGenericEnumSpecialization_,
             compilerLLVM->gts.instantiatedGenericFunctions.count(mangledName) != 0
                 ? mangledName : std::string{});
+        LocalEnumScopeParkGuard localEnumScopeGuard(&compilerLLVM->activeLocalEnumScopes_);
 
         auto templateIt = genericFunctionTemplates.find(baseName);
         if (templateIt == genericFunctionTemplates.end()) return {};
@@ -741,6 +761,7 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
                     if (HasPrimitiveTypeError(argError))
                         LogErrorContext(entry, LocalizePrimitiveTypeError(Compiler(declSpec), argError));
                 }
+                ResolveEnumTypeArguments(Compiler(), typeArgs);
                 std::string mangledName = MangledGenericName("tuple", typeArgs);
                 tupleTypeArgs[mangledName] = typeArgs;
                 if (!instantiatedGenerics.count(mangledName))
@@ -764,6 +785,7 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
             // instantiate with "unknown type 'T'". No-op for already-concrete args.
             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                 typeArgs.push_back(ResolveTypeArgEntry(entry));
+            ResolveEnumTypeArguments(Compiler(), typeArgs);
             // Instantiation PRE-SCAN: opportunistic, so a refused pattern is reported by the
             // declaration path instead, inside whatever scope the spelling actually sits in.
             Compiler()->ResolveGenericAliasSpelling(baseName, typeArgs, false);
@@ -781,7 +803,9 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
     }
 
 std::string MainListener::MangledGenericName(const std::string& baseName, const std::vector<std::string>& typeArgs) {
-        return MangleGenericInstance(*Compiler(), baseName, typeArgs);
+        std::vector<std::string> resolvedArgs = typeArgs;
+        ResolveEnumTypeArguments(Compiler(), resolvedArgs);
+        return MangleGenericInstance(*Compiler(), baseName, resolvedArgs);
     }
 
 void MainListener::QueuePendingInstantiation(const std::string& templateName,
@@ -833,6 +857,8 @@ void MainListener::ProcessPendingInstantiations() {
                 }
             auto pending = pendingInstantiations[pick];
             pendingInstantiations.erase(pendingInstantiations.begin() + pick);
+            // Nested drains run under the enclosing body's alias frames; this record gets none of them.
+            LLVMBackend::AliasStackParkGuard parkedAliases(compilerLLVM);
 
             // Publish this record's origin for the duration of its instantiation: a body type
             // lookup that fails on a substituted array view is reported at the user's argument.
@@ -849,6 +875,7 @@ void MainListener::ProcessPendingInstantiations() {
                 &compilerLLVM->activeGenericEnumSpecialization_,
                 compilerLLVM->gts.instantiatedGenerics.count(pending.mangledName) != 0
                     ? pending.mangledName : std::string{});
+            LocalEnumScopeParkGuard localEnumScopeGuard(&compilerLLVM->activeLocalEnumScopes_);
 
             // Now safe to instantiate
             auto structIt = genericStructTemplates.find(pending.templateName);

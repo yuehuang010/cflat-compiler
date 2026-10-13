@@ -5052,6 +5052,8 @@ void LLVMBackend::ResetForReanalysis()
     fileScopeExpectedError_.clear();
     currentFunction = nullptr;
     activeGenericEnumSpecialization_.clear();
+    activeLocalEnumFunction_.clear();
+    activeLocalEnumScopes_.clear();
     autoVaListAlloca = nullptr;
     ClearStaticLocalRequest();
     autoReturnCapture = std::nullopt;

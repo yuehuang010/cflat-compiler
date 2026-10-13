@@ -1531,6 +1531,8 @@ public:
         std::string CallerName;
         std::string FieldName;
         bool IsElementAccess = false;
+        // Raw owning local pointer arm: the only source a non-owning-sink `move` param consumes.
+        bool OwningLocalPointer = false;
     };
 
     struct NamedVariable
@@ -3007,7 +3009,8 @@ private:
 
     // Source location of the FIRST emitted call to each function, by mangled name. Lets an
     // end-of-module diagnostic (CheckPoisonedFunctionCalls) point at the real call site.
-    std::unordered_map<std::string, std::pair<size_t, size_t>> firstCallLocation_;
+    struct FirstCallSite { size_t Line = 0; size_t Column = 0; size_t Order = 0; };
+    std::unordered_map<std::string, FirstCallSite> firstCallLocation_;
     struct AliasReturnAddressUse
     {
         std::string File;
@@ -3630,7 +3633,7 @@ private:
     cflat_cinterop::ExtractResult::DemandReplayChunk pendingCxxDemandReplayChunk_;
     // Set by CompileCHeaderGroup around its one extraction: the C++ namespace scan adds the
     // content hash of each included file from clang's buffers, so dependency stamps skip a read.
-    std::unordered_map<std::string, uint64_t>* includeHashSink_ = nullptr;
+    std::unordered_map<std::string, std::pair<uint64_t, int64_t>>* includeHashSink_ = nullptr;
     bool cxxDemandBypass_ = false;   // retry: every C++ cache entry is a miss
     bool cxxDemandRetry_ = false;    // companion missing for a cache-served group
     bool cxxDemandReplayInProgress_ = false;
@@ -4150,7 +4153,8 @@ private:
     {
         std::string path;
         int64_t  mtime = 0;  // file_time_type::time_since_epoch().count()
-        uint64_t hash  = 0;  // FNV-1a of file contents (checked only on mtime drift)
+        uint64_t hash  = 0;  // FNV-1a; checked on mtime drift or a racy hash capture
+        int64_t hashTime = 0; // file_time_type count when the dependency hash was captured
     };
     // Closure deps hashed during a cold header extraction, before its records register.
     std::vector<CHeaderDep> cxxEarlyClosureDeps_;
@@ -4480,6 +4484,10 @@ private:
     // Active monomorphized source function/type identity for local enum keys. Scoped by
     // generic body emission and inherited by lambdas emitted from that body.
     std::string activeGenericEnumSpecialization_;
+    // Local enum identity follows the emitted function and lexical block. Lambdas inherit the
+    // enclosing function identity while their body block gets its own lexical scope.
+    std::string activeLocalEnumFunction_;
+    std::vector<std::string> activeLocalEnumScopes_;
     std::string sourceFileName;
     std::string currentSourceFilePath_;
     std::vector<ManifestFragment> manifestFragments_;
@@ -6085,6 +6093,8 @@ private:
     size_t FindOrAddCxxImportGroup(const std::vector<std::string>& headers,
                                    const std::vector<std::string>& defines);
     CxxRequestGroup MakeCxxRequestGroup(size_t primary, const std::vector<size_t>& deps) const;
+    CxxRequestGroup MakeCxxClassRequestGroup(size_t owner, const std::string& typeName,
+                                            const std::vector<size_t>& deps = {}) const;
     void PublishCxxGroupNames(size_t group, const std::vector<CRecordEntry>& records);
     void RegisterCxxFunctionTemplates(
         const std::vector<cflat_cinterop::RawFunctionTemplate>& templates, size_t group,
@@ -6304,7 +6314,8 @@ private:
                                             CSigEntry& signature,
                                             std::string& error,
                                             bool persistOnSuccess,
-                                            bool allowIncremental);
+                                            bool allowIncremental,
+                                            bool* failureInsideWrapper);
     bool TryBindCxxImplicitDefaultCtor(const std::string& typeName, std::string& error);
     struct CxxImplicitArgumentCandidate
     {
@@ -6645,11 +6656,11 @@ private:
                                     bool cxxBoundary);
 
     void CollectCHeaderDependencies(const std::vector<std::string>& paths,
-                                    const std::unordered_map<std::string, uint64_t>& known,
+                                    const std::unordered_map<std::string, std::pair<uint64_t, int64_t>>& known,
                                     std::vector<CHeaderDep>& deps);
     // Fills each dep's content hash: from `known` when it holds the path, else reads the file.
     static void HashCHeaderDependencies(std::vector<CHeaderDep>& deps,
-                                        const std::unordered_map<std::string, uint64_t>& known);
+                                        const std::unordered_map<std::string, std::pair<uint64_t, int64_t>>& known);
     // FNV-1a 64-bit hash of a file's bytes. Returns false if the file can't be read.
     static bool HashFileFnv1a(const std::string& path, uint64_t& outHash);
     static bool HashCxxHeaderFileContents(const std::string& path, uint64_t& outHash,
@@ -7163,6 +7174,22 @@ public:
     // runs only for those, so ordinary dotted misses (C++ paths) stay as cheap as before.
     std::unordered_set<std::string> aggregateAliasMemberNames_;
     bool AliasInCurrentScope(const std::string& alias) const;
+
+    // A template instantiation drained from INSIDE another aggregate's body (ProcessPendingInstantiations
+    // under ParseStructDefinition) must not see that body's alias frames: unique<T>'s `using P = T*`
+    // would otherwise shadow list<P>'s own `P` parameter. Parks the open frames for its lifetime.
+    class AliasStackParkGuard
+    {
+    public:
+        explicit AliasStackParkGuard(LLVMBackend* compiler)
+            : compiler_(compiler), parked_(std::move(compiler->aliasScopeStack_)) { compiler_->aliasScopeStack_.clear(); }
+        ~AliasStackParkGuard() { compiler_->aliasScopeStack_ = std::move(parked_); }
+        AliasStackParkGuard(const AliasStackParkGuard&) = delete;
+        AliasStackParkGuard& operator=(const AliasStackParkGuard&) = delete;
+    private:
+        LLVMBackend* compiler_;
+        std::vector<AliasScopeFrame> parked_;
+    };
 
     class AliasScopeGuard
     {
@@ -8784,6 +8811,8 @@ public:
     // narrowing overload silently).
     bool CxxCtorSetRequiresNarrowing(const std::string& typeName,
                                      const std::vector<NamedVariable>* argVars) const;
+    // "has no constructor whose parameter types match these arguments ('T', ...)".
+    std::string CxxCtorNoMatchReason(const std::vector<TypeAndValue>& argTypes) const;
 
     // Short type name for a rejected condition operand.
     std::string DescribeConditionType(llvm::Type* t) const;
@@ -9570,6 +9599,8 @@ public:
     // clang's std::is_convertible<S&&, P*> for a class xvalue at a P* parameter; cached per pair.
     bool HasImplicitClassPointerConversion(const std::string& sourceType,
                                            const std::string& pointeeType, bool pointeeConst);
+    llvm::Value* ConvertCxxXvalueToPointer(const NamedVariable& source,
+                                           const TypeAndValue& pointerType);
     // Materialize (once per module) the llvm::Function for one structor / assignment operator,
     // typed from clang's own arrangement. Returns null after LogError when the plan is
     // inexpressible. `recipeOut` receives the recipe the call site must lower with.
@@ -9723,6 +9754,10 @@ public:
     // parameter: clang resolves it through the forwarding thunk, never the listed pick.
     bool CxxCtorForwardsScalarReference(const std::string& typeName,
                                         const std::vector<TypeAndValue>& argTypes) const;
+    // The constructor C++ selects for a clang-resolved call narrows a scalar argument: the
+    // refusal (after "C++ class 'X' "), empty when nothing narrows or the ranking cannot decide.
+    std::string CxxCtorSelectedNarrowingError(const std::string& typeName,
+                                              const std::vector<NamedVariable>& argVars);
     /*
      * Name of the `explicit` constructor of `typeName` that WOULD have taken `argTypes` had it
      * been implicit. Empty when none exists. Drives the diagnostic at a call argument.
@@ -11900,7 +11935,9 @@ public:
     // 228: macro entries record whether their expanded body is an integer literal zero (T52).
     // 232: an anonymous UNION typedef sets "ar" like a struct (T94), so a cached entry must not be
     //      replayed with the old flag.
-    static constexpr int kCHeaderCacheVersion = 235;
+    // 239: C++ member signature caches retain whether an inline definition came from the header.
+    // 240: generated class wrapper requests include recursively owned template argument headers.
+    static constexpr int kCHeaderCacheVersion = 240;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by
@@ -12147,7 +12184,8 @@ public:
     static nlohmann::json TypeAliasToJson(const CTypeAliasEntry& a, CCachePathTable* files);
     static CTypeAliasEntry TypeAliasFromJson(const SjVal& j, const CCachePaths* files);
 
-    static bool CHeaderDepFresh(const CHeaderDep& dep);
+    static bool CHeaderDepFresh(const CHeaderDep& dep,
+                                std::filesystem::file_time_type cacheWriteTime);
 
     // `contentHash` yields the current hash after the entry's format has been validated.
     bool TryLoadCHeaderDiskCache(

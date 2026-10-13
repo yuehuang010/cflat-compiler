@@ -2471,7 +2471,7 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
                     alias));
             for (auto* d : dims)
             {
-                auto* v = ParseAssignmentExpression(d);
+                auto* v = TryFoldArrayDim(d);
                 auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(v);
                 if (ci == nullptr)
                     compiler->LogError(std::format("using alias '{}': array size must be a compile-time constant", alias));
@@ -3502,6 +3502,18 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             || (!fn->empty() && cflat_llvm::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr))
             return;
 
+        struct ActiveLocalEnumFunctionScope
+        {
+            LLVMBackend* backend;
+            std::string saved;
+            ActiveLocalEnumFunctionScope(LLVMBackend* b, const std::string& name)
+                : backend(b), saved(std::move(b->activeLocalEnumFunction_))
+            {
+                backend->activeLocalEnumFunction_ = name;
+            }
+            ~ActiveLocalEnumFunctionScope() { backend->activeLocalEnumFunction_ = std::move(saved); }
+        } localEnumFunctionScope(compiler, fn->getName().str());
+
         compiler->InitializeBlock(&fn->front(), false);
         LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
@@ -3751,7 +3763,7 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseDeclarationList(st
                                  antlr4::ParserRuleContext* errCtx,
                                  const char* msg) -> std::optional<uint64_t>
         {
-            auto* sizeVal = ParseAssignmentExpression(expr);
+            auto* sizeVal = TryFoldArrayDim(expr);
             if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(sizeVal))
                 return ci->getZExtValue();
             LogErrorContext(errCtx, msg);
@@ -4158,8 +4170,9 @@ void MainListener::ParseEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx, co
         std::string scoped = compiler->ResolveEnumTypeName(id->getText());
         if (scoped.empty()) scoped = id->getText();
         const std::string backing = compiler->GetEnumBackingType(scoped);
-        // The registry key includes the active specialization; editor-facing names stay local.
-        if (!compiler->activeGenericEnumSpecialization_.empty())
+        // The registry key includes the active function/block; editor-facing names stay local.
+        if (!compiler->activeLocalEnumScopes_.empty()
+            || !compiler->activeGenericEnumSpecialization_.empty())
             scoped = id->getText();
         const std::string displayBacking = backing.empty() ? "int" : backing;
         std::vector<std::string> memberNames;
@@ -4868,6 +4881,16 @@ cxx_dtor_ready:
             // Scalar table (ruling 2026-10-09): clang must not take a narrowing or other-enum argument.
             const bool narrowingRefused
                 = compiler->CxxCtorSetRequiresNarrowing(typeName, &ctorArguments);
+            // The set keeps a non-narrowing candidate: the one C++ selects must not narrow either.
+            if (!narrowingRefused && ((ctor == nullptr && !hardReferenceRejection) || clangResolves))
+                if (const std::string narrowing
+                        = compiler->CxxCtorSelectedNarrowingError(typeName, ctorArguments);
+                    !narrowing.empty())
+                {
+                    LogErrorContext(direct, std::format("C++ class '{}' {}",
+                        compiler->DisplayCxxClassName(typeName), narrowing));
+                    return true;
+                }
             if (!narrowingRefused && ((ctor == nullptr && !hardReferenceRejection) || clangResolves))
             {
                 std::string wrapperName;
@@ -4929,8 +4952,11 @@ cxx_dtor_ready:
                     return true;
                 }
             }
-            if (ctor == nullptr)
+            // A scalar-reference set has no listed fallback: when every constructor narrows it is
+            // refused like the `T(args)` and `new T(args)` forms.
+            if (ctor == nullptr || (narrowingRefused && scalarReferenceSet))
             {
+                if (why.empty()) why = compiler->CxxCtorNoMatchReason(argTypes);
                 LogErrorContext(direct, why.starts_with("no overload of '")
                     ? why : std::format("C++ class '{}' {}",
                         compiler->DisplayCxxClassName(typeName), why));
@@ -6183,16 +6209,35 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
             // it without leaking IR. Locals keep the live value (supports VLA-style sizing).
             if (global_scope)
                 arraySize = EvalGlobalArrayDim(typeAndValue.ArraySize);
+            else if (typeAndValue.staticStorage)
+            {
+                arraySize = TryFoldArrayDim(typeAndValue.ArraySize);
+                if (arraySize == nullptr)
+                    LogErrorContext(typeAndValue.ArraySize,
+                        "a 'static' local array must have a compile-time constant length");
+            }
             else
-                arraySize = ParseAssignmentExpression(typeAndValue.ArraySize);
+            {
+                arraySize = TryFoldArrayDim(typeAndValue.ArraySize, false);
+                if (arraySize == nullptr)
+                {
+                    arraySize = ParseAssignmentExpression(typeAndValue.ArraySize);
+                    arraySize = FoldArrayDimValue(typeAndValue.ArraySize, arraySize);
+                }
+            }
         }
 
         // Evaluate inner dimensions for multi-dim arrays: T[N][M] -> ConstInnerDimensions = {M}
         typeAndValue.ConstInnerDimensions.clear();
         for (auto* dimExpr : typeAndValue.ExtraArrayDims)
         {
-            auto* dimVal = global_scope ? EvalGlobalArrayDim(dimExpr)
-                                        : ParseAssignmentExpression(dimExpr);
+            llvm::Value* dimVal = global_scope ? EvalGlobalArrayDim(dimExpr)
+                : TryFoldArrayDim(dimExpr, typeAndValue.staticStorage);
+            if (dimVal == nullptr && !typeAndValue.staticStorage)
+            {
+                dimVal = ParseAssignmentExpression(dimExpr);
+                dimVal = FoldArrayDimValue(dimExpr, dimVal);
+            }
             if (auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(dimVal))
                 typeAndValue.ConstInnerDimensions.push_back(ci->getZExtValue());
             else
@@ -6427,7 +6472,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             "C-style array declaration '{}[{}]' is not allowed; use '[{}] {}'",
                             name, direct->assignmentExpression()->getText(),
                             direct->assignmentExpression()->getText(), name));
-                    auto* sizeVal = ParseAssignmentExpression(direct->assignmentExpression());
+                    llvm::Value* sizeVal = TryFoldArrayDim(direct->assignmentExpression(),
+                        typeAndValue.staticStorage);
+                    if (sizeVal == nullptr && !typeAndValue.staticStorage)
+                    {
+                        sizeVal = ParseAssignmentExpression(direct->assignmentExpression());
+                        sizeVal = FoldArrayDimValue(direct->assignmentExpression(), sizeVal);
+                    }
                     if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(sizeVal))
                         typeAndValue.ConstArraySize = ci->getZExtValue();
                 }

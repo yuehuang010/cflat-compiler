@@ -248,6 +248,8 @@ namespace
         // First error naming a not-yet-defined CFlat record: no retry can complete that record.
         std::string incompleteRecordError;
         std::string firstErrorLocation;
+        std::set<std::pair<std::string, unsigned>> errorInputLocations;
+        bool allErrorsInInput = true;
         // Some error names a type built over a not-yet-defined CFlat record.
         bool incompleteRecordInvolved = false;
         // Lines of the newest interpreter input buffer that an error or its notes point at.
@@ -277,6 +279,7 @@ namespace
             groupText.clear();
             AppendGroupLine(info);
             ++errors;
+            BlameError(info);
             Blame(info);
             for (unsigned i = 0; i < info.getNumArgs() && !incompleteRecordInvolved; ++i)
                 if (info.getArgKind(i) == clang::DiagnosticsEngine::ak_qualtype)
@@ -413,6 +416,25 @@ namespace
             }
             blamedLines.insert(presumed.getLine());
         }
+
+        void BlameError(const clang::Diagnostic& info)
+        {
+            if (!info.getLocation().isValid() || !info.hasSourceManager())
+            {
+                allErrorsInInput = false;
+                return;
+            }
+            const clang::SourceManager& sm = info.getSourceManager();
+            const clang::PresumedLoc presumed = sm.getPresumedLoc(
+                sm.getExpansionLoc(info.getLocation()), /*UseLineDirectives=*/false);
+            if (presumed.isInvalid()
+                || !std::string_view(presumed.getFilename()).starts_with("input_line_"))
+            {
+                allErrorsInInput = false;
+                return;
+            }
+            errorInputLocations.emplace(presumed.getFilename(), presumed.getLine());
+        }
     };
 
     struct DiagnosticScope
@@ -483,6 +505,17 @@ namespace
         uint64_t version = 0;   // bumped per recorded #include; keys reachability memos
     };
 
+    // True when loc lies in a file entered through #include (a header). The Interpreter's own
+    // input buffers (input_line_N, CFlat's chunk text) also carry an include location, but it
+    // is the start of the empty main file; a real header's is an #include in another buffer.
+    bool LocInHeaderFile(clang::SourceManager& sm, clang::SourceLocation loc)
+    {
+        if (loc.isInvalid()) return false;
+        const clang::SourceLocation includeLoc
+            = sm.getIncludeLoc(sm.getFileID(sm.getExpansionLoc(loc)));
+        return includeLoc.isValid() && sm.getFileID(includeLoc) != sm.getMainFileID();
+    }
+
     class IncludeCollector : public clang::PPCallbacks
     {
     public:
@@ -490,16 +523,32 @@ namespace
         std::vector<std::string>& files;
         std::vector<clang::FileID>& fileIds;
         IncludeGraph& graph;
+        // Header text never gets the incremental top-level-statement extension; leaving a
+        // header back into chunk text restores it so the input end token still forms.
+        clang::LangOptions& langOptions;
+        const bool incrementalExtensions;
 
         IncludeCollector(clang::Preprocessor& p, std::vector<std::string>& f,
-                         std::vector<clang::FileID>& ids, IncludeGraph& g)
-            : pp(p), files(f), fileIds(ids), graph(g) {}
+                         std::vector<clang::FileID>& ids, IncludeGraph& g,
+                         clang::LangOptions& opts)
+            : pp(p), files(f), fileIds(ids), graph(g), langOptions(opts),
+              incrementalExtensions(opts.IncrementalExtensions) {}
 
         void FileChanged(clang::SourceLocation loc, FileChangeReason reason,
                          clang::SrcMgr::CharacteristicKind, clang::FileID) override
         {
+            // Every Parse call (preludes, bodies, later chunks) sees headers as clang++ does;
+            // entering or returning to an input buffer restores the chunk's extension.
+            clang::SourceManager& sources = pp.getSourceManager();
+            const bool intoMainFile = loc.isValid()
+                && sources.getFileID(sources.getExpansionLoc(loc)) == sources.getMainFileID();
+            // Leaving an input buffer for the empty main file only forms the input-end token;
+            // whatever the buffer decided (eof after a parse error) stands.
+            if ((reason == EnterFile || reason == ExitFile) && !intoMainFile)
+                langOptions.IncrementalExtensions
+                    = LocInHeaderFile(sources, loc) ? false : incrementalExtensions;
             if (reason != EnterFile) return;
-            clang::SourceManager& sm = pp.getSourceManager();
+            clang::SourceManager& sm = sources;
             llvm::StringRef file = sm.getFilename(loc);
             if (file.empty()) return;
             files.push_back(file.str());
@@ -1721,6 +1770,9 @@ struct CxxIncrementalGroup::Impl
     std::unordered_map<const clang::VarDecl*, std::string> failedStaticInitializers;
     // Every error and note the newest ParseRequest reported, across its recovery attempts.
     std::string lastDiagnostics;
+    std::set<std::pair<std::string, unsigned>> lastErrorInputLocations;
+    std::unordered_map<std::string, unsigned> lastInputBufferLineCounts;
+    bool lastErrorsAllInInput = false;
     // Linkage symbols of body-refused constructors the newest ParseRequest / CheckDemand selected.
     std::vector<std::string> refusedConstructors;
 
@@ -1864,7 +1916,8 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
         impl->interpreter->getCompilerInstance()->getPreprocessor().addPPCallbacks(
             std::make_unique<IncludeCollector>(
                 impl->interpreter->getCompilerInstance()->getPreprocessor(),
-                impl->includedFiles, impl->includedFileIds, impl->includeGraph));
+                impl->includedFiles, impl->includedFileIds, impl->includeGraph,
+                impl->interpreter->getCompilerInstance()->getLangOpts()));
         /*
          * Skip the bodies of inline non-template functions, keeping their tokens: the demand
          * pass parses only the ones the program reaches (LazyBodies). Request chunks parse all.
@@ -1891,18 +1944,36 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
             lazy.active = true;
         }
         int headerBraceDepth = 0;
+        // Set by a parse error or an unclosed scope at the sentinel: the input then ends at eof.
+        bool forceEof = false;
         const bool watchTokens = lazy.active || trackHeaderScope;
         IncrementalParseStateRestore parseState(pp, langOpts, diagnostics.consumer);
         // Use standard parsing for namespace statements so they cannot leave Sema in a bad scope.
         if (watchTokens || incrementalExtensions)
-            pp.setTokenWatcher([&lazy, &pp, &headerBraceDepth, macroOut, trackHeaderScope,
-                                &langOpts, incrementalExtensions,
+            pp.setTokenWatcher([&lazy, &pp, &headerBraceDepth, &forceEof, macroOut,
+                                trackHeaderScope, &langOpts, incrementalExtensions,
                                 namespaceBraceDepths = std::vector<int>{}, pendingNamespace = false,
                                 previousKind = clang::tok::unknown,
                                 expressionStatementDepth = -1, restoreAfterStatement = false,
-                                injectedHeaderClosers = false]
+                                injectedHeaderClosers = false, lastInHeader = false,
+                                openDelimiters = std::vector<clang::tok::TokenKind>{}]
                                (const clang::Token& token) mutable {
                 if (lazy.active) lazy.Observe(token);
+                // Header text is parsed as clang++ parses it: no top-level statements. Chunk text
+                // keeps the predictor below. The guard reapplies "off" after the predictor runs.
+                const bool inHeader = LocInHeaderFile(pp.getSourceManager(), token.getLocation());
+                if (lastInHeader && !inHeader) langOpts.IncrementalExtensions = incrementalExtensions;
+                lastInHeader = inHeader;
+                struct HeaderTokenGuard
+                {
+                    clang::LangOptions& options;
+                    bool inHeader;
+                    bool& forceEof;
+                    ~HeaderTokenGuard()
+                    {
+                        if (inHeader || forceEof) options.IncrementalExtensions = false;
+                    }
+                } headerTokenGuard{langOpts, inHeader, forceEof};
                 if (restoreAfterStatement)
                 {
                     langOpts.IncrementalExtensions = incrementalExtensions;
@@ -1910,6 +1981,17 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
                     restoreAfterStatement = false;
                 }
                 if (token.is(clang::tok::kw_namespace)) pendingNamespace = true;
+                if (token.isOneOf(clang::tok::l_paren, clang::tok::l_brace, clang::tok::l_square))
+                    openDelimiters.push_back(token.is(clang::tok::l_paren) ? clang::tok::r_paren
+                        : token.is(clang::tok::l_brace) ? clang::tok::r_brace : clang::tok::r_square);
+                else if (token.isOneOf(clang::tok::r_paren, clang::tok::r_brace, clang::tok::r_square))
+                {
+                    // A mismatched closer drops the openers it skips, as clang's recovery does.
+                    auto match = std::find(openDelimiters.rbegin(), openDelimiters.rend(),
+                                           token.getKind());
+                    if (match != openDelimiters.rend())
+                        openDelimiters.erase(std::prev(match.base()), openDelimiters.end());
+                }
                 if (token.is(clang::tok::l_brace))
                 {
                     ++headerBraceDepth;
@@ -2016,26 +2098,48 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
                     restoreAfterStatement = true;
                 previousKind = token.getKind();
                 if (!trackHeaderScope) return;
-                if (!injectedHeaderClosers && headerBraceDepth != 0
-                         && token.is(clang::tok::identifier)
+                if (!injectedHeaderClosers && token.is(clang::tok::identifier)
                          && token.getIdentifierInfo() != nullptr
                          && token.getIdentifierInfo()->getName()
                             == "__cflat_header_scope_sentinel")
                 {
-                    macroOut->headerScopeOpen = true;
+                    // Clang's namespace nesting also counts: a malformed header can consume its own
+                    // closing brace, so the brace count reads 0 while the namespace stays open.
+                    unsigned semaScopes = 0;
+                    if (lazy.sema != nullptr && lazy.sema->CurContext != nullptr)
+                        for (clang::DeclContext* dc = lazy.sema->CurContext;
+                             dc != nullptr && !dc->isTranslationUnit(); dc = dc->getParent())
+                            ++semaScopes;
+                    if (headerBraceDepth == 0 && semaScopes == 0) return;
                     injectedHeaderClosers = true;
+                    macroOut->headerScopeOpen = true;
                     // A stray extra `}` (depth < 0) needs no closers: clang recovers from it.
                     if (headerBraceDepth < 0) return;
-                    const unsigned count = static_cast<unsigned>(headerBraceDepth);
-                    auto closers = std::make_unique<clang::Token[]>(count);
-                    for (unsigned i = 0; i < count; ++i)
+                    forceEof = true;
+                    // Closers in reverse nesting order; a `;` ends the declaration a `}` cuts off.
+                    std::vector<clang::tok::TokenKind> kinds;
+                    for (auto it = openDelimiters.rbegin(); it != openDelimiters.rend(); ++it)
+                    {
+                        if (*it == clang::tok::r_brace
+                            && (kinds.empty() || kinds.back() != clang::tok::r_brace))
+                            kinds.push_back(clang::tok::semi);
+                        kinds.push_back(*it);
+                    }
+                    if (std::find(kinds.begin(), kinds.end(), clang::tok::r_brace) == kinds.end())
+                    {
+                        kinds.push_back(clang::tok::semi);
+                        kinds.insert(kinds.end(), semaScopes, clang::tok::r_brace);
+                    }
+                    const unsigned total = static_cast<unsigned>(kinds.size());
+                    auto closers = std::make_unique<clang::Token[]>(total);
+                    for (unsigned i = 0; i < total; ++i)
                     {
                         closers[i].startToken();
-                        closers[i].setKind(clang::tok::r_brace);
+                        closers[i].setKind(kinds[i]);
                         closers[i].setLength(1);
                         closers[i].setLocation(token.getLocation());
                     }
-                    pp.EnterTokenStream(std::move(closers), count,
+                    pp.EnterTokenStream(std::move(closers), total,
                                        /*DisableMacroExpansion*/ true,
                                        /*IsReinject*/ false);
                 }
@@ -2044,7 +2148,12 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
             llvm::TimeTraceScope parseScope("CxxGroupHeaderParse");
             // A parse error fails the whole header parse and discards this interpreter, so the
             // non-incremental fallback never reaches a request parse; restored after Parse anyway.
-            diagnostics.consumer.onParseError = [&] { langOpts.IncrementalExtensions = false; };
+            // An open namespace stops only at `}` or eof, never at the incremental input-end
+            // token, so a malformed header always ends at eof (the extension is off there).
+            diagnostics.consumer.onParseError = [&] {
+                forceEof = true;
+                langOpts.IncrementalExtensions = false;
+            };
             auto parsed = impl->interpreter->Parse(headerSource);
             return parsed;
         }();
@@ -2237,7 +2346,20 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
                                        std::string& error)
 {
     impl_->lastDiagnostics.clear();
+    impl_->lastErrorInputLocations.clear();
+    impl_->lastInputBufferLineCounts.clear();
+    impl_->lastErrorsAllInInput = true;
     impl_->refusedConstructors.clear();
+    auto recordErrorLocations = [&](const CountingDiagnosticConsumer& consumer,
+                                    std::string_view parsedText) {
+        if (consumer.errors == 0) return;
+        if (!consumer.allErrorsInInput) impl_->lastErrorsAllInInput = false;
+        impl_->lastErrorInputLocations.insert(consumer.errorInputLocations.begin(),
+                                              consumer.errorInputLocations.end());
+        const unsigned lineCount = 1 + std::count(parsedText.begin(), parsedText.end(), '\n');
+        for (const auto& location : consumer.errorInputLocations)
+            impl_->lastInputBufferLineCounts[location.first] = lineCount;
+    };
     // Bodies already poisoned before this parse; the replay entry records only this parse's own.
     std::unordered_set<const clang::FunctionDecl*> poisonedBefore;
     for (const auto& [function, verdict] : impl_->poisoned) poisonedBefore.insert(function);
@@ -2358,6 +2480,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
                     DiagnosticScope diagnostics(
                         impl_->interpreter->getCompilerInstance()->getDiagnostics());
                     auto ptu = impl_->interpreter->Parse(unseen);
+                    recordErrorLocations(diagnostics.consumer, unseen);
                     if (!ptu)
                     {
                         const std::string parseError = ErrorText(ptu.takeError());
@@ -2394,6 +2517,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
             namespaces = VisibleTopLevelNamespaces(astContext);
         if (impl_->announcer != nullptr) impl_->announcer->sink = &announced;
         auto ptu = impl_->interpreter->Parse(chunk);
+        recordErrorLocations(diagnostics.consumer, chunk);
         if (!ptu && !namespaces.empty()) RestoreTopLevelNamespaces(astContext, namespaces);
         // No longer invalid, so it must be poisoned for a body that already reaches it.
         for (clang::FunctionDecl* failed : diagnostics.consumer.failedFunctions)
@@ -2724,6 +2848,27 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
 const std::string& CxxIncrementalGroup::LastRequestDiagnostics() const
 {
     return impl_->lastDiagnostics;
+}
+
+bool CxxIncrementalGroup::LastRequestErrorsInsideSourceRange(std::string_view source,
+                                                              std::string_view range) const
+{
+    if (!impl_->lastErrorsAllInInput || impl_->lastErrorInputLocations.empty() || range.empty())
+        return false;
+    const size_t start = source.rfind(range);
+    if (start == std::string_view::npos)
+        return false;
+    const unsigned firstLine = 1 + std::count(source.begin(), source.begin() + start, '\n');
+    const unsigned lastLine = firstLine + std::count(range.begin(), range.end(), '\n');
+    for (const auto& [buffer, inputLine] : impl_->lastErrorInputLocations)
+    {
+        auto lineCount = impl_->lastInputBufferLineCounts.find(buffer);
+        if (lineCount == impl_->lastInputBufferLineCounts.end()
+            || inputLine == 0 || inputLine > lineCount->second
+            || inputLine > lastLine - firstLine + 1)
+            return false;
+    }
+    return true;
 }
 
 const std::vector<std::string>& CxxIncrementalGroup::LastRefusedConstructors() const

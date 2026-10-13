@@ -250,7 +250,7 @@ int runClient(int nMsgs)
     int ok = 0;
     int i = 0;
     while (i < nMsgs) {
-        int n = sprintf(&msg[0], "echo #%d from client", i);
+        int n = sprintf((char*)&msg[0], "echo #%d from client", i);
         u32 wrote = 0;
         if (WriteFile(h, (void*)&msg[0], (u32)n, &wrote, nullptr) == 0) {
             printf("client: WriteFile failed (error %u)\n", GetLastError());

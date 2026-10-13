@@ -3,4 +3,20 @@ expect_error("array size must be greater than zero") {
     using Bad = float[0];
 }
 
+expect_error("array size must be greater than zero") {
+    int[(1 > 0) ? -1 : 2] values = default;
+}
+
+expect_error("array size must be greater than zero") {
+    int[(1 > 0) ? 2147483647 * 2 : 1] values = default;
+}
+
+expect_error("array size must be greater than zero") {
+    int[(1 > 0) ? -1 : 2] globalNegative = default;
+}
+
+expect_error("array size must be greater than zero") {
+    int[(1 > 0) ? 2147483647 * 2 : 1] globalOverflow = default;
+}
+
 extern int main() { return 0; }

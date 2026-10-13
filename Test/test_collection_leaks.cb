@@ -367,6 +367,23 @@ move IShapeLeak pickShape(move IShapeLeak a, move IShapeLeak b, int sel)
 
 // Pointer flavor of the same exclusive-return pattern: must compile and free each object once.
 struct PtrLeak { int v = 0; ~PtrLeak() { g_shapeDtor = g_shapeDtor + 1; } };
+int _newTempProbeNews = 0;
+int _newTempProbeDtors = 0;
+struct NewTempProbe
+{
+    int v = 0;
+    NewTempProbe(int x) { v = x; _newTempProbeNews++; }
+    ~NewTempProbe() { _newTempProbeDtors++; }
+    int* pv() { return &v; }
+};
+int _newTempProbeLook(NewTempProbe* p) { return p->v; }
+int _newTempProbeRead(int* p) { return *p; }
+int _newTempProbeReadLive(int* p) { return _newTempProbeDtors == 0 ? *p : -1; }
+move NewTempProbe* _newTempProbeMake(int x)
+{
+    NewTempProbe* p = new NewTempProbe(x);
+    return p;
+}
 
 // An owning-POINTER call result BURIED in a subexpression has no named owner, so nothing used to
 // free it - it leaked. It is now registered as an owned-pointer temp and released at
@@ -4502,6 +4519,88 @@ extern int main()
         NcRowSrc rs; NcRowSrc* rp = &rs;
         int nestedRow = _ncTakeRow(rp?.make("ab"), _ncApply((int x) => { return x; }, 1));
         total++; passed += Test("nc struct temp with nested lambda", nestedRow, 17);
+    }
+
+    // === T106: new temps in ternary and null-safe full expressions ===
+    {
+        NewTempProbe* borrowed = _newTempProbeMake(20);
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        g_armGate = 0;
+        int mixedFalse = _newTempProbeLook(RuntimeTrue() ? new NewTempProbe(22) : borrowed);
+        total++; passed += Test("mixed new ternary call borrow value", mixedFalse, 20);
+        total++; passed += Test("mixed new ternary call skips untaken arm", _newTempProbeNews, 0);
+        total++; passed += Test("mixed new ternary call keeps borrow alive", _newTempProbeDtors, 0);
+
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        g_armGate = 0;
+        int mixedCoalRhs = _newTempProbeLook(
+            (RuntimeTrue() ? new NewTempProbe(25) : (NewTempProbe*)nullptr)
+                ?? new NewTempProbe(26));
+        total++; passed += Test("mixed new ternary coal rhs value", mixedCoalRhs, 26);
+        total++; passed += Test("mixed new ternary coal rhs released", _newTempProbeDtors, 1);
+        total++; passed += Test("mixed new ternary coal rhs allocation", _newTempProbeNews, 1);
+
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        bool addressFalse = (RuntimeTrue() ? &(new NewTempProbe(27))->v : &borrowed->v)
+                            == &borrowed->v;
+        total++; passed += Test("address ternary borrow arm value", addressFalse, true);
+        total++; passed += Test("address ternary skips untaken new arm", _newTempProbeNews, 0);
+        total++; passed += Test("address ternary borrow arm frees nothing", _newTempProbeDtors, 0);
+
+        // Taken new arm address read outside a call: the temp is released once, at the statement end.
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        g_armGate = 1;
+        bool addressTaken = (RuntimeTrue() ? &(new NewTempProbe(35))->v : &borrowed->v)
+                            == &borrowed->v;
+        total++; passed += Test("address ternary new arm value", addressTaken, false);
+        total++; passed += Test("address ternary new arm allocated", _newTempProbeNews, 1);
+        total++; passed += Test("address ternary new arm released once", _newTempProbeDtors, 1);
+
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        g_armGate = 1;
+        int addressValue = _newTempProbeRead(
+            RuntimeTrue() ? &(new NewTempProbe(34))->v : &borrowed->v);
+        total++; passed += Test("address ternary reads new arm before release", addressValue, 34);
+        total++; passed += Test("address ternary read releases new arm", _newTempProbeDtors, 1);
+
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        int safeNew = (new NewTempProbe(29))?.v;
+        total++; passed += Test("null safe new receiver value", safeNew, 29);
+        total++; passed += Test("null safe new receiver allocated", _newTempProbeNews, 1);
+        total++; passed += Test("null safe new receiver released", _newTempProbeDtors, 1);
+
+        // An interior pointer from a '?.' call must not outlive its receiver: no release before use.
+        // The receiver is kept (pre-existing bounded leak); v is its first field, so free it here.
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        int* interiorPtr = (new NewTempProbe(31))?.pv();
+        int interiorValue = _newTempProbeReadLive(interiorPtr);
+        total++; passed += Test("null safe new receiver interior pointer live", interiorValue, 31);
+        delete (NewTempProbe*)interiorPtr;
+
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        NewTempProbe* nullProbe = nullptr;
+        int safeNull = nullProbe?.v;
+        total++; passed += Test("null safe null receiver value", safeNull, 0);
+        total++; passed += Test("null safe null receiver creates nothing", _newTempProbeNews, 0);
+        total++; passed += Test("null safe null receiver frees nothing", _newTempProbeDtors, 0);
+
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        int arrowNew = (new NewTempProbe(30))->v;
+        total++; passed += Test("arrow new receiver value", arrowNew, 30);
+        total++; passed += Test("arrow new receiver allocated", _newTempProbeNews, 1);
+        total++; passed += Test("arrow new receiver released", _newTempProbeDtors, 1);
+
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        g_armGate = 1;
+        {
+            unique NewTempProbe* stored = RuntimeTrue()
+                ? new NewTempProbe(31) : new NewTempProbe(32);
+            total++; passed += Test("stored ternary new value", stored->v, 31);
+            total++; passed += Test("stored ternary new allocates taken arm", _newTempProbeNews, 1);
+            total++; passed += Test("stored ternary new remains owned", _newTempProbeDtors, 0);
+        }
+        total++; passed += Test("stored ternary new released at owner end", _newTempProbeDtors, 1);
+        delete borrowed;
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

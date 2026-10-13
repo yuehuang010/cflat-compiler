@@ -32,6 +32,25 @@ expect_error("enum value must be a constant integer expression") {
     enum BadEnum : int { A = 1, B = "hello" };
 }
 
+expect_error("from a value of type 'T115LocalDiagnostic'") {
+    int t115_local_enum_diagnostic()
+    {
+        enum T115LocalDiagnostic : int { Value = 1 };
+        T115LocalDiagnostic local = T115LocalDiagnostic.Value;
+        int* pointer = local;
+        return 0;
+    }
+}
+
+expect_error("'A' is not a member of namespace 'E'") {
+    int t115_unavailable_enum<T>(T x) { return (int)E.A + (int)x; }
+    int trigger_t115_unavailable_enum()
+    {
+        enum E : int { A = 10 };
+        return t115_unavailable_enum<int>(0);
+    }
+}
+
 expect_error("Generic type parameter must be an identifier, not a built-in type") {
     struct Box<int> { int value = 0; };
 }

@@ -133,7 +133,7 @@ int _http_readRequest(Socket* conn, int maxBytes, i8** outBuf, int* outLen)
 void _http_sendResponse(Socket* conn, HttpResponse* resp)
 {
     string out = resp->build();   // owned; freed at scope exit
-    i8* p     = out.data();
+    char* p   = out.data();
     int total = out.length();
     int sent  = 0;
     while (sent < total)

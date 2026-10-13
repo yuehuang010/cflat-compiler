@@ -1076,6 +1076,9 @@ static std::optional<int64_t> FoldCompileTimeIdentifier(LLVMBackend* compiler,
     if (compiler == nullptr || gid == nullptr) return std::nullopt;
     if (gid->genericTypeParameters() != nullptr || gid->Identifier() == nullptr) return std::nullopt;
     const std::string name = gid->Identifier()->getText();
+    if (compiler->GetScopedLocalOrArgument(name).Storage != nullptr) return std::nullopt;
+    // An implicit-this field shadows a global constant of the same name.
+    if (compiler->FindImplicitThisField(name, nullptr, nullptr) != nullptr) return std::nullopt;
     auto macro = compiler->GetCompileTimeMacro(name);
     if (auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(macro.value); ci != nullptr && macro.type == "int")
     {
@@ -6115,6 +6118,11 @@ public:
     static void JoinTernaryPointerShape(LLVMBackend::TypedValue& result,
                                         const LLVMBackend::TypedValue& trueArm,
                                         const LLVMBackend::TypedValue& falseArm);
+    // Appends a raw owning LOCAL pointer arm of a '?:' / '??' join as a conditional move source.
+    // Returns false (nothing appended) for every other shape, which keeps the existing path.
+    bool CollectOwningLocalPointerArm(const LLVMBackend::TypedValue& shape, llvm::Value* value,
+        llvm::Value* storage, llvm::BasicBlock* armBlock, antlr4::ParserRuleContext* armCtx,
+        std::vector<LLVMBackend::ConditionalMoveSource>& out);
     LLVMBackend::TypedValue ParseTernaryBranches(
         CFlatParser::ConditionalExpressionContext* ctx,
         const LLVMBackend::TypedValue& condTv,
@@ -6537,7 +6545,9 @@ public:
         // The rhs was written `move x`: it reaches the operator as an explicit move, so the
         // same borrow-parameter diagnostic a call's `move x` gets applies to the operator.
         bool rhsExplicitMove = false,
-        bool lhsExplicitMove = false);
+        bool lhsExplicitMove = false,
+        bool lhsCxxNullptrT = false,
+        bool rhsCxxNullptrT = false);
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);
@@ -7037,6 +7047,12 @@ public:
     // folded. On a non-constant size, logs an error and returns 1 as an error-recovery extent
     // (LogError does not abort, so the dimension must stay well-formed to avoid a later crash).
     llvm::ConstantInt* EvalGlobalArrayDim(CFlatParser::AssignmentExpressionContext* expr);
+    // Try the shared compile-time folder for either a local or global dimension. Locals that do
+    // not fold retain their run-time size; globals report the existing constant-size diagnostic.
+    llvm::ConstantInt* TryFoldArrayDim(CFlatParser::AssignmentExpressionContext* expr,
+                                      bool allowEmission = true);
+    void ValidateArrayDimValue(antlr4::ParserRuleContext* expr, llvm::Value* value);
+    llvm::Value* FoldArrayDimValue(antlr4::ParserRuleContext* expr, llvm::Value* value);
 
     // Length-inferred array-view initializer: T[] x = {v0, v1, ...}.
     // `T[]` is a thin T* (IsArrayView + Pointer), so there is no fixed extent in the type.
@@ -7538,9 +7554,10 @@ public:
     // No-ops when the guard is not held: the read-side check has already reported that.
     void CheckGuardedWrite(antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& target);
     // Refuses a store whose target is reached through a C++ const reference result or, for
-    // `++` / `--`, is a const C++ namespace object.
+    // `++` / `--`, is a const C++ namespace object. constElement: the target is an element of a
+    // C++ const array reference (any write operator), refused on its own.
     void RefuseCxxConstReferentWrite(antlr4::ParserRuleContext* ctx, llvm::Value* destination,
-                                     const std::string& operation);
+                                     const std::string& operation, bool constElement = false);
     // Refuses `obj.f()` when obj is read-only C++ storage (const namespace object, const
     // reference result) and every overload of f is non-const. True when it refused.
     bool RefuseCxxConstReceiverCall(antlr4::ParserRuleContext* ctx,

@@ -1,0 +1,3 @@
+// T101: an expression statement in a header is refused at namespace scope, never a Sema crash.
+expect_error("clang:");
+import cpp "cpp_header_namespace_less_than_stmt.h";

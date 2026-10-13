@@ -80,7 +80,7 @@ void writeBmp(char* path, u8* pixels, u32 rowPitch)
 
     void* f = os.windows.fopen(path, "wb");
     if (f == nullptr) { printf("could not open %s\n", path); return; }
-    os.windows.fwrite((i8*)&hdr[0], 1, 54, f);
+    os.windows.fwrite((char*)&hdr[0], 1, 54, f);
 
     // BMP rows run bottom-to-top and store BGR; the GPU buffer is top-down RGBA.
     u8[768] row = default; // W*3, W==256
@@ -96,7 +96,7 @@ void writeBmp(char* path, u8* pixels, u32 rowPitch)
             row[x * 3 + 2] = src[x * 4 + 0]; // R
             x = x + 1;
         }
-        os.windows.fwrite((i8*)&row[0], 1, (i32)rowBytes, f);
+        os.windows.fwrite((char*)&row[0], 1, (i32)rowBytes, f);
         y = y - 1;
     }
     os.windows.fclose(f);

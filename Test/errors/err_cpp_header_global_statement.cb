@@ -1,0 +1,3 @@
+// T101: a top-level statement from a header is an error, like clang++ -fsyntax-only.
+expect_error("clang:");
+import cpp "cpp_header_global_statement.h";

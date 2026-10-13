@@ -227,8 +227,12 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
+import "library/cpp_t103_nullctor_c.h";
+import cpp "library/cpp_t103_nullctor.hpp";
+import cpp "library/cpp_t110_varlink.hpp";
 import cpp "library/cpp_interop_t74.h";
 import cpp "library/t70_xvalue_overloads.h";
+import cpp "library/cpp_t105_conversion_operators.hpp";
 import cpp "library/cpp_t97_fieldctor.h";
 import cpp "library/cpp_t68_intptr.hpp";
 import cpp "library/cpp_t62_static_auto.hpp";
@@ -277,6 +281,7 @@ import cpp "library/cpp_t35_ownerexpr.hpp";
 import cpp "library/cpp_t42_convref.hpp";
 import cpp "library/cpp_t48_nullptr.hpp";
 import cpp "library/cpp_t52_refnull.hpp";
+import cpp "library/cpp_t111_nullptr_t.hpp";
 import cpp "library/cpp_t98_macro_constant.hpp";
 import cpp "library/cpp_t28_fwdref.hpp";
 import cpp "library/t84_conversion.hpp";
@@ -470,6 +475,7 @@ int t50Take(t50v.V* v) { return v == nullptr ? -1 : v.value; }
 import cpp "library/t31_minmax_brace.hpp";
 import cpp "library/cpp_t63_brace_decl.hpp";
 import cpp "library/cpp_t78_scalar_table.h";
+import cpp "library/cpp_interop_t104_refparam.hpp";
 import cpp "library/cpp_t87_null_zero.h";
 import cpp "library/cpp_private_base_shadow.h";
 int cppcg_add(int a, int b) { return a + b; }
@@ -1812,8 +1818,71 @@ struct T98Shadow
     int FwdTwin(bool c) { int x = 7; return cpi_t98.fwd(c ? (c ? t98Other : x) : x); }
 };
 
+int T103NativeNull(int value) { return 71; }
+int T103NativeNull(int* value) { return 72; }
+
 extern int main()
 {
+    // T103 accept set frozen before C++ constructor-selection changes.
+    if (t103.only_int(0) != 11 || t103.only_pointer(0) != 22) return 10301;
+    if (t103.pointer_or_long(nullptr) != 31) return 10302;
+    if (t103.c_header_null(T103_C_NULL) != 41) return 10303;
+    t103.Owners t103Owners = default;
+    if (t103Owners.unique_empty(nullptr) != 52 || t103Owners.shared_empty(nullptr) != 62)
+        return 10304;
+    if (T103NativeNull(nullptr) != 72) return 10305;
+
+    // T103 constructor null provenance: non-literal zeros remain integral, brace selection
+    // keeps literal 0 spelled for clang, and imported null macros reach pointer parameters.
+    t103.NonLiteralZero* t103Char = new t103.NonLiteralZero('\0', 1.5);
+    t103.NonLiteralZero* t103False = new t103.NonLiteralZero(false, 1.5);
+    t103.NonLiteralZero* t103Enum = new t103.NonLiteralZero(t103.E.zero, 1.5);
+    t103.NonLiteralZero* t103Expr = new t103.NonLiteralZero(1 - 1, 1.5);
+    int t103Zero = 0;
+    t103.NonLiteralZero* t103Variable = new t103.NonLiteralZero(t103Zero, 1.5);
+    if (t103Char.v != 11 || t103False.v != 11 || t103Enum.v != 11
+        || t103Expr.v != 11 || t103Variable.v != 11) return 10306;
+    t103.BraceZero t103Brace = { 0, 1.5 };
+    t103.BraceZero t103BraceDirect { 0, 1.5 };
+    if (t103Brace.v != 99 || t103BraceDirect.v != 99) return 10307;
+    if (t103.macro_null(T103_NULL_ALIAS) != 43
+        || t103.macro_nullptr(T103_NULLPTR_MACRO) != 45
+        || t103.c_header_null(T103_C_NULL) != 41) return 10308;
+    // C-header integral zeros ((1-1), ((int)0), '\0') are not C++ null pointer constants: the
+    // integral overload. Suffixed literal zeros in a brace list pick the pointer constructor.
+    if (t103.zero_pick(T103_C_EXPR_ZERO) != 11 || t103.zero_pick(T103_C_CAST_ZERO) != 11
+        || t103.zero_pick(T103_C_CHAR_ZERO) != 11) return 10309;
+    t103.BraceZero t103CopyL = { 0L, 1.5 };
+    t103.BraceZero t103CopyU = { 0u, 1.5 };
+    t103.BraceZero t103CopyUL = { 0UL, 1.5 };
+    t103.BraceZero t103CopyLL = { 0LL, 1.5 };
+    t103.BraceZero t103CopyULL = { 0ULL, 1.5 };
+    if (t103CopyL.v != 99 || t103CopyU.v != 99 || t103CopyUL.v != 99 || t103CopyLL.v != 99
+        || t103CopyULL.v != 99) return 10310;
+    t103.BraceZero t103DirectL { 0L, 1.5 };
+    t103.BraceZero t103DirectU { 0u, 1.5 };
+    t103.BraceZero t103DirectUL { 0UL, 1.5 };
+    t103.BraceZero t103DirectLL { 0LL, 1.5 };
+    t103.BraceZero t103DirectULL { 0ULL, 1.5 };
+    if (t103DirectL.v != 99 || t103DirectU.v != 99 || t103DirectUL.v != 99
+        || t103DirectLL.v != 99 || t103DirectULL.v != 99) return 10311;
+    t103.BraceOuter t103NestedL = { { 0L, 1.5 } };
+    t103.BraceOuter t103NestedU = { { 0u, 1.5 } };
+    t103.BraceOuter t103NestedUL = { { 0UL, 1.5 } };
+    t103.BraceOuter t103NestedLL = { { 0LL, 1.5 } };
+    t103.BraceOuter t103NestedULL = { { 0ULL, 1.5 } };
+    if (t103NestedL.z.v != 99 || t103NestedU.z.v != 99 || t103NestedUL.z.v != 99
+        || t103NestedLL.z.v != 99 || t103NestedULL.z.v != 99) return 10312;
+    // The constructor C++ selects decides: (short, char) promotes into (int, char), no narrowing.
+    short t103Short = 1;
+    char t103Small = 2;
+    if (t103.NarrowRanked(t103Short, t103Small).v != 1) return 10313;
+    delete t103Char;
+    delete t103False;
+    delete t103Enum;
+    delete t103Expr;
+    delete t103Variable;
+
     // T95: `*arr` on a fixed array of C++ records decays to its element pointer (clang: builtin deref,
     // never the element operator*). master: LLVM verification failure / "indirection requires a pointer".
     t95d.C[2] t95arr;
@@ -1872,6 +1941,11 @@ extern int main()
     // Another enum type takes an explicit cast only (clang: refused without the cast).
     t78.UB t78Ub = (t78.UB)t78Ua;
     if (t78.takeUB(t78Ub) != 3) return 98107;
+    // T109: an int-backed enum keeps its identity (and still promotes to int).
+    t78.FB t78Fb = t78.FB.FBV;
+    t78.FA t78Fa = t78.FA.FAV;
+    if (t78.takeFB(t78Fb) != 6 || t78.takeFB(t78.FB.FBV) != 6 || t78.takeFB((t78.FB)t78Fa) != 5
+        || t78.takeFBInt(t78Fa) != 105) return 98190;
     // Overload picks clang makes once int -> double is accepted at a call (ruling 2026-10-09):
     // operator=(double) runs for an int source, rank_k(double, int) is C++'s unique pick, and the
     // declared double sibling beats the ellipsis (clang: v=10 via=3, 51, 2).
@@ -1901,6 +1975,13 @@ extern int main()
     if (t78Fx.v != 257) return 98116;
     // Round 3: a scalar rvalue reference binds a widened int temporary (clang: 3).
     if (t78.takeRvD(3) != 3) return 98117;
+    // T104-A: a scalar conversion materializes a temporary even when its source is named.
+    int t104Int = 3;
+    float t104Float = 4.5;
+    if (t78.takeRvD(t104Int) != 3 || t78.takeRvD(t104Float) != 4) return 98123;
+    if (t104Int != 3 || t104Float != 4.5) return 98124;
+    int t104Exact = 5;
+    expect_error("rvalue reference") { t78.takeRvI(t104Exact); }
     // Round 3: a short constructor beside a pointer constructor takes a short (clang: 257).
     short t78PaSh = 257;
     t78.PtrAlt t78Pa = t78.PtrAlt(t78PaSh);
@@ -2328,6 +2409,35 @@ extern int main()
         || cpi_t48.H.s(t48Null) != 411)                                                  return 4807;
     cpi_t48.N t48N = cpi_t48.N(nullptr);
     if ((t48N == nullptr) != 502 || (nullptr == t48N) != 502) return 4808;
+    {
+        std.nullptr_t t111Null = nullptr;
+        int* t111Pointer = nullptr;
+        if (cpp_t111.pick(nullptr) != 111 || cpp_t111.pick(t111Null) != 111
+            || cpp_t111.pick(t111Pointer) != 112 || cpp_t111.only(nullptr) != 113)
+            return 11101;
+
+        cpp_t111.FromNil t111LiteralCtor = nullptr;
+        cpp_t111.FromNil t111NamedCtor = t111Null;
+        cpp_t111.Implicit t111Implicit = nullptr;
+        if (t111LiteralCtor.tag != 181 || t111NamedCtor.tag != 181
+            || t111Implicit.tag != 7 || cpp_t111.take_implicit(nullptr) != 7)
+            return 11102;
+
+        cpp_t111.Value t111Value = nullptr;
+        if ((t111Value == nullptr) != 510 || (t111Value == t111Null) != 510
+            || (t111Null == t111Value) != 510)
+            return 11103;
+
+        if (cpp_t111.nref(nullptr) != 121 || cpp_t111.nref(p: nullptr) != 121
+            || cpp_t111.nref(t111Null) != 121
+            || cpp_t111.nref_address(nullptr) == 0
+            || cpp_t111.nref_address(p: nullptr) == 0
+            || cpp_t111.nref_address(t111Null) == 0)
+            return 11104;
+        if (cpp_t111.nref_r(nullptr) != 123 || cpp_t111.nref_r_address(nullptr) == 0
+            || cpp_t111.nref_r_address(move t111Null) == 0)
+            return 11105;
+    }
     // T42: a converting-ctor temporary binds C++ `const X&` / `X&&` (clang++ oracle values).
     char* t42Cp = "A";
     cpi_t42.Src t42Src = cpi_t42.Src(5);
@@ -2378,6 +2488,20 @@ extern int main()
     expect_error("no viable conversion from 'const cpi_t42::CvSource' to 'cpi_t42::CvTarget'") {
         int t42CvLoss = cpi_t42.takeCv(cpi_t42.cvSource());
     }
+    // T104-B1: clang accepts a template converting ctor from a non-template class lvalue.
+    t104.Source t104Source = default;
+    if (t104.takeTemplated(t104Source) != 617) return 10401;
+    // T104-B2/B3: inherited value conversions materialize once; reference conversions bind
+    // the original object and perform no copy.
+    int t104Made = t104.made;
+    int t104Gone = t104.gone;
+    t104.OpDerived t104OpDerived = default;
+    if (t104.takeOp(t104OpDerived) != 291) return 10402;
+    if (t104.made - t104Made != 1 || t104.gone - t104Gone != 1) return 10403;
+    int t104Copies = t104.copies;
+    t104.RefSource t104RefSource = default;
+    if (t104.takeConstX(t104RefSource) != 1071) return 10404;
+    if (t104.copies != t104Copies) return 10405;
     if (cpi_t42.made - cpi_t42.gone != t42Made - t42Gone)                            return 4215;
     // An explicit converting ctor never binds `X&&` implicitly; a same-class lvalue needs `move`.
     expect_error("is declared explicit, so it is not offered as an implicit conversion") {
@@ -4944,6 +5068,42 @@ extern int main()
     cppi.Convertible* opcallCp = &opcallC;
     if ((int)(*opcallCp) != 42)                        return 737;
 
+    // T105: copy-initialize a trivially-copyable target and a class result through operators.
+    {
+        t105.trivialHits = 0;
+        t105.TrivialSource source = t105.makeTrivialSource();
+        t105.Trivial fromName = source;
+        if (fromName.value != 11 || t105.trivialHits != 1) return 31700;
+        t105.Trivial fromCall = t105.makeTrivialSource();
+        if (fromCall.value != 11 || t105.trivialHits != 2) return 31701;
+
+        t105.resetW();
+        {
+            t105.P source = t105.makeP();
+            t105.W initialized = source;
+            if (initialized.value != 37 || t105.wOps() != 1 || t105.wCtors() != 1
+                || t105.wCopies() != 0 || t105.wAssigns() != 0) return 31702;
+        }
+        if (t105.wDtors() != 1) return 31703;
+
+        t105.resetW();
+        {
+            t105.W assigned = default;
+            t105.resetW();
+            t105.P source = t105.makeP();
+            assigned = source;
+            if (assigned.value != 37 || t105.wOps() != 1 || t105.wCtors() != 1
+                || t105.wCopies() != 0 || t105.wAssigns() != 1) return 31704;
+        }
+        if (t105.wDtors() != 2) return 31705;
+
+        t105.PointerSource pointerSource = t105.PointerSource();
+        if (t105.pointerPick(std.move(pointerSource)) != 73 || pointerSource.value != 31)
+            return 31706;
+        if (t105.pointerOnly(std.move(pointerSource)) != 73 || pointerSource.value != 31)
+            return 31707;
+    }
+
     // Multiword C++ operator spellings must match CFlat destinations in implicit and cast paths.
     {
         cppas.CvtU32 a = default; cppas.cvLast = 0; u32 a1 = a;
@@ -6508,8 +6668,19 @@ extern int main()
     // temporary and the operand is never written (the pre-fix thunk bound `long&` to it).
     long ctorrefCastSrc = 4;
     cppcr.CastWrite ctorrefCastSame = cppcr.CastWrite((long)ctorrefCastSrc);
-    if (ctorrefCastSame.chosen != 2 || ctorrefCastSame.seen != 4 || ctorrefCastSrc != 4
-        || cppcr.CastWrite((long long)ctorrefCastSrc).chosen != 2 || ctorrefCastSrc != 4) return 7142;
+    if (ctorrefCastSame.chosen != 2 || ctorrefCastSame.seen != 4 || ctorrefCastSrc != 4) return 7142;
+    // `long long` into `const long&`: equal width on LP64; a narrowing argument on Windows (LLP64
+    // `long` is 32-bit), which a C++ call refuses like a native one (ruling 2026-09-04).
+    if const (__WINDOWS__)
+    {
+        expect_error("C++ class 'cppcr.CastWrite' has no constructor whose parameter types match these arguments ('i64')") {
+            cppcr.CastWrite ctorrefCastWide = cppcr.CastWrite((long long)ctorrefCastSrc);
+        }
+    }
+    else
+    {
+        if (cppcr.CastWrite((long long)ctorrefCastSrc).chosen != 2 || ctorrefCastSrc != 4) return 7142;
+    }
     cppcr.CastWrite* ctorrefCastNew = new cppcr.CastWrite((long)ctorrefCastSrc);
     if (ctorrefCastNew->chosen != 2 || ctorrefCastSrc != 4) return 7143;
     delete ctorrefCastNew;
@@ -6536,7 +6707,34 @@ extern int main()
     // A narrowing reference pick (`unsigned&&` over `const long&` for a `long long` prvalue,
     // clang's choice) converts in the CALLER into the pick's type; the general call-site
     // narrowing rule does not apply to the compiler-internal thunk call (refused before).
-    if (cppcr.RvalueOrConst((long long)ctorrefTplInt).chosen != 1 || ctorrefTplInt != 5) return 7145;
+    // On Windows (LLP64) `const long&` narrows too, so every constructor narrows and the call is
+    // refused like any narrowing C++ call argument (ruling 2026-10-09; clang picks `unsigned&&`).
+    if const (__WINDOWS__)
+    {
+        expect_error("C++ class 'cppcr.RvalueOrConst' has no constructor whose parameter types match these arguments ('i64')") {
+            cppcr.RvalueOrConst ctorrefRvcWide = cppcr.RvalueOrConst((long long)ctorrefTplInt);
+        }
+        expect_error("C++ class 'cppcr.RvalueOrConst' has no constructor whose parameter types match these arguments ('i64')") {
+            int ctorrefRvcChosen = cppcr.RvalueOrConst((long long)ctorrefTplInt).chosen;
+        }
+        expect_error("C++ class 'cppcr.RvalueOrConst' has no constructor whose parameter types match these arguments ('i64')") {
+            cppcr.RvalueOrConst* ctorrefRvcNew = new cppcr.RvalueOrConst((long long)ctorrefTplInt);
+        }
+    }
+    else
+    {
+        if (cppcr.RvalueOrConst((long long)ctorrefTplInt).chosen != 1 || ctorrefTplInt != 5) return 7145;
+    }
+    // Every constructor narrows on every target: all three spellings refuse with the same message.
+    expect_error("C++ class 'cppcr.RvalueOrConstInt' has no constructor whose parameter types match these arguments ('i64')") {
+        cppcr.RvalueOrConstInt ctorrefRviEq = cppcr.RvalueOrConstInt((long long)ctorrefTplInt);
+    }
+    expect_error("C++ class 'cppcr.RvalueOrConstInt' has no constructor whose parameter types match these arguments ('i64')") {
+        int ctorrefRviChosen = cppcr.RvalueOrConstInt((long long)ctorrefTplInt).chosen;
+    }
+    expect_error("C++ class 'cppcr.RvalueOrConstInt' has no constructor whose parameter types match these arguments ('i64')") {
+        cppcr.RvalueOrConstInt* ctorrefRviNew = new cppcr.RvalueOrConstInt((long long)ctorrefTplInt);
+    }
     // The caller-side conversion into the pick converts like clang: true -> 1.0, not -1.0,
     // and a double above INT_MAX into `unsigned` keeps its value.
     bool ctorrefTrue = true;
@@ -10476,6 +10674,17 @@ extern int main()
     cppexp.MemRankNonTemplate rankNonTemplate = cppexp.MemRankNonTemplate();
     if (rankNonTemplate.pick(1, 1.0) != 3611) return 3611;
     if (memrank_native(1) != 3612) return 3612;
+    // T110: inline ellipsis bodies are emitted on demand without a forwarding wrapper.
+    int t110Marker = 4;
+    if (t110_global(&t110Marker, 1, (char)2, (short)3, (float)4.0, &t110Marker) != 10010)
+        return 3750;
+    if (t110.namespaced(1.5, (float)2.5, (short)3) != 7.0) return 3751;
+    t110.Worker t110Worker = t110.Worker();
+    if (t110Worker.member(1, (char)2, (short)3) != 6) return 3752;
+    if (t110.Worker.stat(1.5, (float)2.5, (short)3) != 7.0) return 3753;
+    t110.Overloaded t110Over = t110.Overloaded();
+    if (t110Over.ov(3, 4) != 2007) return 3754;
+    expect_error("ambiguous call to 'ov'") { t110Over.ov(3); }
     cppexp.MemRankRref rankRref = cppexp.MemRankRref();
     rankRref.push(10);
     if (rankRref.n != 3710) return 3710;
@@ -11068,18 +11277,25 @@ extern int main()
     // T70 review 2: a same-class C* parameter takes a class xvalue through the class's own
     // conversion operator (clang), both ranked against void* and as the sole candidate.
     cppi.T70Conv t70ConvSource = cppi.T70Conv();
-    if (cppi.t70_conv_pick(std.move(t70ConvSource)) != 31 || t70ConvSource.value != 31) return 7086;
-    if (cppi.t70_conv_only(std.move(t70ConvSource)) != 31 || t70ConvSource.value != 31) return 7087;
+    if (cppi.t70_conv_pick(std.move(t70ConvSource)) != 31 || t70ConvSource.value != 31
+        || cppi.t70_conv_value(std.move(t70ConvSource)) != 31) return 7086;
+    if (cppi.t70_conv_only(std.move(t70ConvSource)) != 31 || t70ConvSource.value != 31
+        || cppi.t70_conv_value(std.move(t70ConvSource)) != 31) return 7087;
     // T70 review 3: inherited operator C*(), template operator T*(), operator Derived*() then
-    // Derived* -> C*. Tags only (clang runs the conversion, cflat binds the source - pre-existing).
+    // Derived* -> C*. The returned pointer targets 73 while each source remains 31.
     cppi.T70Inh t70InhSource = cppi.T70Inh();
-    if (cppi.t70_inh_pick(std.move(t70InhSource)) != 1 || t70InhSource.value != 31) return 7088;
-    if (cppi.t70_inh_only(std.move(t70InhSource)) != 1 || t70InhSource.value != 31) return 7089;
+    if (cppi.t70_inh_pick(std.move(t70InhSource)) != 1 || t70InhSource.value != 31
+        || cppi.t70_inh_value(std.move(t70InhSource)) != 73) return 7088;
+    if (cppi.t70_inh_only(std.move(t70InhSource)) != 1 || t70InhSource.value != 31
+        || cppi.t70_inh_value(std.move(t70InhSource)) != 73) return 7089;
     cppi.T70Tpl t70TplSource = cppi.T70Tpl();
-    if (cppi.t70_tpl_only(std.move(t70TplSource)) != 1 || t70TplSource.value != 31) return 7090;
+    if (cppi.t70_tpl_only(std.move(t70TplSource)) != 1 || t70TplSource.value != 31
+        || cppi.t70_tpl_value(std.move(t70TplSource)) != 73) return 7090;
     cppi.T70Der t70DerSource = cppi.T70Der();
-    if (cppi.t70_der_pick(std.move(t70DerSource)) != 1 || t70DerSource.value != 31) return 7091;
-    if (cppi.t70_der_only(std.move(t70DerSource)) != 1 || t70DerSource.value != 31) return 7092;
+    if (cppi.t70_der_pick(std.move(t70DerSource)) != 1 || t70DerSource.value != 31
+        || cppi.t70_der_value(std.move(t70DerSource)) != 73) return 7091;
+    if (cppi.t70_der_only(std.move(t70DerSource)) != 1 || t70DerSource.value != 31
+        || cppi.t70_der_value(std.move(t70DerSource)) != 73) return 7092;
     cppi.reset_counts();
     {
         cppi.Tracked t70Source = cppi.Tracked(780);

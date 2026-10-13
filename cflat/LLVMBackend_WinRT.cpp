@@ -1900,10 +1900,18 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     if (srcBaseTy == nullptr) srcBaseTy = ref.BaseType;
                 }
 
-                if (!args[i].ConditionalMoveSources.empty() && isOwningSink)
+                // A non-owning-sink `move` param consumes only the owning-local-pointer arms; the
+                // other conditional sources (fields, elements) keep the existing path.
+                bool anyOwningLocalArm = false;
+                for (const auto& source : args[i].ConditionalMoveSources)
+                    anyOwningLocalArm = anyOwningLocalArm || source.OwningLocalPointer;
+                if (!args[i].ConditionalMoveSources.empty()
+                    && (isOwningSink || (params[i].IsMove && anyOwningLocalArm)))
                 {
                     for (const auto& source : args[i].ConditionalMoveSources)
                     {
+                        if (!isOwningSink && !source.OwningLocalPointer)
+                            continue;
                         if (beforeCall)
                         {
                             if (source.Storage == nullptr || source.ValueType == nullptr
@@ -2203,6 +2211,10 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg,
                                                  bool strictCxxScalarType)
 {
         auto* paramTy = GetType(param);
+        // A named nullptr_t lvalue already has the object slot a C++ reference must borrow.
+        if (param.IsCxxNullptrT && arg.TypeAndValue.IsCxxNullptrT
+            && arg.Storage != nullptr)
+            return arg.Storage;
         std::string sourceSpelling;
         std::string paramSpelling;
         auto cxxValueSpelling = [&](std::string typeName, std::string& spelling) {
@@ -2272,6 +2284,21 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg,
 
 llvm::Value* LLVMBackend::LowerRvalueRefArg(const NamedVariable& arg, const TypeAndValue& param, bool cxxCallee)
 {
+        // nullptr_t itself is a pointer-sized value. A reference needs an address to a slot
+        // containing that value; the null pointer value is never the reference address.
+        if (cxxCallee && param.IsCxxNullptrT && IsCxxNullTypedArgument(arg))
+        {
+            if (arg.Storage != nullptr && IsCxxRvalueReferenceArgument(arg))
+                return arg.Storage;
+            llvm::Type* valueType = GetType(param);
+            llvm::Value* value = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
+            if (valueType != nullptr && value != nullptr && value->getType() == valueType)
+            {
+                auto* temporary = AllocaAtEntry(valueType, nullptr, "cxx.nullptr.rrefarg");
+                builder->CreateStore(value, temporary);
+                return temporary;
+            }
+        }
         // An explicit move of a pointer names the pointer object's slot. Bind T*&& to that slot
         // directly; only pointer prvalues need the temporary below.
         if (cxxCallee && param.ElemPointer && arg.TypeAndValue.Pointer && arg.IsExplicitMove)
@@ -2308,6 +2335,28 @@ llvm::Value* LLVMBackend::LowerRvalueRefArg(const NamedVariable& arg, const Type
         // never the slot holding it. Pointers are opaque, so no type test can tell the two apart.
         if (arg.TypeAndValue.Pointer)
             return arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
+
+        if (cxxCallee && param.IsRvalueRef && !param.ElemPointer)
+        {
+            TypeAndValue referent = param;
+            referent.Pointer = referent.IsAlias = referent.IsRvalueRef = false;
+            referent.PointerDepth = 0;
+            if (referent.IsPrimitive() && arg.TypeAndValue.IsPrimitive()
+                && ClassifyScalarArgConversion(arg, referent) == ScalarArgConversion::Widen
+                && IsProvenCxxScalarLvalue(arg))
+            {
+                llvm::Value* value = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
+                llvm::Type* valueType = GetType(referent);
+                if (value != nullptr && valueType != nullptr)
+                {
+                    value = CreateCast(value, valueType, arg.TypeAndValue.IsUnsignedInteger() != -1,
+                                       referent.IsUnsignedInteger() != -1);
+                    auto* temp = AllocaAtEntry(valueType, nullptr, "cxx.rref.converted");
+                    builder->CreateStore(value, temp);
+                    return temp;
+                }
+            }
+        }
 
         // An opaque C++ class reference is still represented by the constructor's pointer result,
         // even when its CFlat argument metadata is a by-value foreign record.

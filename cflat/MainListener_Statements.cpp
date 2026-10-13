@@ -36,6 +36,20 @@ bool MainListener::IsActiveRangeCollectionElement(
     }
 
 void MainListener::ParseBlockItemList(CFlatParser::BlockItemListContext* ctx) {
+        auto* enumBackend = Compiler(ctx);
+        std::string enumScope = enumBackend->activeLocalEnumFunction_;
+        if (!enumScope.empty())
+        {
+            enumScope += "@" + std::to_string(ctx->getStart()->getLine()) + ":"
+                + std::to_string(ctx->getStart()->getCharPositionInLine());
+            enumBackend->activeLocalEnumScopes_.push_back(std::move(enumScope));
+        }
+        struct LocalEnumBlockScope
+        {
+            LLVMBackend* backend;
+            bool active;
+            ~LocalEnumBlockScope() { if (active) backend->activeLocalEnumScopes_.pop_back(); }
+        } localEnumBlockScope{ enumBackend, !enumBackend->activeLocalEnumFunction_.empty() };
         auto blockItems = ctx->blockItem();
 
         // Unreachable-code hint (LSP only): a direct return/break/continue ends the

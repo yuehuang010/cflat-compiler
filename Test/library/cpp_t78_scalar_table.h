@@ -30,8 +30,14 @@ struct DeducePtr { int v; DeducePtr(int, int*) : v(99) {} template <class T> Ded
 struct FixedS { int v; template <class T> FixedS(short x, T) : v(x) {} };
 struct PtrAlt { int v; PtrAlt(short x) : v(x) {} PtrAlt(int*) : v(99) {} };
 inline int takeRvD(double&& x) { return (int)x; }
+inline int takeRvI(int&& x) { return x; }
 // Round 4: a typedef-spelled short template parameter; a null constant takes a pointer constructor.
 using T78Small = short;
 struct AliasS { int v; template <class T> AliasS(T78Small x, T) : v(x) {} };
 struct NullAlt { int v; NullAlt(short, int) : v(11) {} NullAlt(int*, double) : v(99) {} };
+// T109: fixed int-backed unscoped enums (every unscoped enum under MSVC) keep their identity.
+enum FA : int { FAV = 5 };
+enum FB : int { FBV = 6 };
+inline int takeFB(FB b) { return (int)b; }
+inline int takeFBInt(int x) { return x + 100; }
 }

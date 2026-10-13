@@ -100,7 +100,7 @@ extern int main(int argc, char** argv)
     u32 got = 0;
     while (ReadFile(hRead, &buf[0], 4096u, &got, nullptr) != 0) {
         if (got == 0u) break;
-        putn(&buf[0], (int)got);
+        putn((char*)&buf[0], (int)got);
     }
 
     WaitForSingleObject(pi.hProcess, (u32)INFINITE);

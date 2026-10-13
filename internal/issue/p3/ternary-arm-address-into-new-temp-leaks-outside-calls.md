@@ -1,19 +1,16 @@
-# `?:` arm `&(new T(x))->f` outside a call argument leaks the temporary
+# Ternary arm address of a new temp leaks when it comes from a `??` RHS (outside calls)
 
-Bucket: p3 (bounded leak). Pre-existing for plain `?:`; a `??` inside the arm now matches it.
+Leftover after T107 (which fixed the plain shape `bool b = (c ? &(new T(1))->v : np) == np;`).
+Still leaking (master and T107, normal and --asan: one new, zero dtors):
 
-## Repro
+```cflat
+bool b = (c > 0 ? (nil ?? &(new P())->v) : np) == np;
+```
+Repro: scratch/repro_keep/t107/rev_t107_B_rhs.cb.
 
-`bool b = (c > 0 ? &(new T(1))->v : np) == np;` - one new, zero dtors (also with
-`&(new T(2))->v ?? np` as the arm). Stores are refused by err_address_into_new_temp.cb.
-
-## Root cause
-
-FlushOwnedTempsSince claims a temp the kept arm value points into (ClaimOwnedPtrTempsUnder ->
-addrClaimedPtrTemps_) so it outlives the arm, but nothing frees a claimed temp. Inside a call
-argument FinishTernaryArm hoists it into a conditional slot instead (b3a6e009).
-
-## Fix direction
-
-Hoist into the conditional slot for any full expression, not only inCallArgument_, so the
-end-of-statement flush frees it once on the taken path.
+Root cause (T107 review 1): the coalescing RHS path (MainListener_Expressions.cpp ~9420, twin of
+FinishTernaryArm ~7750) still retains the address-derived temp only `if (inCallArgument_)`; its
+flush claims and removes the temp before FinishTernaryArm can hoist it.
+Fix direction: hoist address-derived RHS temps before that flush outside calls too; keep bare-new
+registration limited to its call-argument policy. Extend the T106/T107 block in
+Test/test_collection_leaks.cb with this leg.

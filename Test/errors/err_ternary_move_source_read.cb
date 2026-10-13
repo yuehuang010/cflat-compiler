@@ -1,0 +1,11 @@
+struct P { int v = 0; ~P() {} };
+int mv(move P* p) { int v = p->v; delete p; return v; }
+expect_error("use of moved variable 'n'") {
+    int main() {
+        int c = 0;
+        P* n = new P();
+        mv(c > 0 ? new P() : n);
+        int after = n->v;
+        return after;
+    }
+}

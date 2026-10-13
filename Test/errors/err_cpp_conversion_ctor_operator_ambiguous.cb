@@ -1,0 +1,13 @@
+import cpp "cpp_t105_conversion_operators.hpp";
+import cpp "utility";
+
+extern int main() {
+    expect_error("clang: conversion from 't105::AmbiguousSource' to 't105::AmbiguousTarget' is ambiguous") {
+        t105.AmbiguousTarget target = t105.makeAmbiguousSource();
+    }
+    expect_error("clang: call to 'templatePointerPick' is ambiguous") {
+        t105.TemplatePointerSource source = t105.TemplatePointerSource();
+        t105.templatePointerPick(std.move(source));
+    }
+    return 0;
+}

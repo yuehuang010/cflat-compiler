@@ -3655,9 +3655,23 @@ extern int main()
             if (ptrbool.templ(nilVoid) != 30) return 2892;
             u64 sizeValue = 0;
             u64* sizePointer = &sizeValue;
-            i64 longValue = 0;
-            i64* longPointer = &longValue;
-            if (td.sz(sizePointer) != 1 || td.sl(longPointer) != 2) return 2903;
+            if const (__WINDOWS__)
+            {
+                // LLP64: C `long` is 32-bit, so `i64*` is an unrelated pointee for `long*`.
+                long longValue = 0;
+                long* longPointer = &longValue;
+                if (td.sz(sizePointer) != 1 || td.sl(longPointer) != 2) return 2903;
+                expect_error("no overload of 'td.sl' matches the given arguments") {
+                    i64 wideValue = 0;
+                    int wideR = td.sl(&wideValue);
+                }
+            }
+            else
+            {
+                i64 longValue = 0;
+                i64* longPointer = &longValue;
+                if (td.sz(sizePointer) != 1 || td.sl(longPointer) != 2) return 2903;
+            }
             char* mutableText = (char*)"n64";
             if (ptrbool.text("n64") != 50 || ptrbool.text(mutableText) != 60
                 || ptrbool.vbool(mutableText) != 30 || ptrbool.vbool("n64") != 20) return 2887;

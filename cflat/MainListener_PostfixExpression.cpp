@@ -882,11 +882,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             // The block holding the FIRST '?.' branch: it dominates the merge, so owned temps
             // created inside the chain are re-homed there instead of freed at the merge.
             llvm::BasicBlock* ncHoistBlock = nullptr;
-            auto ncEnterGuard = [&](llvm::Value* testPtr)
+            // releaseNewTemp: only a SCALAR field read may free an owned new-temp receiver at the
+            // merge; a call or non-scalar member can hand out a pointer into it (see PFX-1b).
+            auto ncEnterGuard = [&](llvm::Value* testPtr, bool releaseNewTemp = false)
             {
                 auto* compiler = Compiler(ctx);
                 if (!ncTempMark.has_value())
                     ncTempMark = compiler->MarkOwnedTemps();
+                if (releaseNewTemp && compiler->IsOwnedNewTemp(testPtr))
+                    compiler->RegisterOwnedPtrTemp(testPtr);
                 if (ncHoistBlock == nullptr)
                     ncHoistBlock = compiler->builder->GetInsertBlock();
                 if (ncChainNullBlock == nullptr)
@@ -1567,8 +1571,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         CheckGuardedWrite(ctx, namedVar);
                         llvm::Value* incrementStorage = namedVar.Storage
                             ? namedVar.Storage : parenthesizedPostfixStorage;
-                        if (!namedVar.TypeAndValue.IsCxxMutableField)   // a mutable member is writable
-                            RefuseCxxConstReferentWrite(ctx, incrementStorage, "increment");
+                        const bool constElement = namedVar.IsElementAccess
+                            && namedVar.TypeAndValue.IsCxxPointeeConst;
+                        if (constElement || !namedVar.TypeAndValue.IsCxxMutableField)   // a mutable member is writable
+                            RefuseCxxConstReferentWrite(ctx, incrementStorage, "increment", constElement);
                         if (incrementStorage)
                         {
                             namedVar.Primary = namedVar.Primary
@@ -1637,8 +1643,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         CheckGuardedWrite(ctx, namedVar);
                         llvm::Value* decrementStorage = namedVar.Storage
                             ? namedVar.Storage : parenthesizedPostfixStorage;
-                        if (!namedVar.TypeAndValue.IsCxxMutableField)   // a mutable member is writable
-                            RefuseCxxConstReferentWrite(ctx, decrementStorage, "decrement");
+                        const bool constElement = namedVar.IsElementAccess
+                            && namedVar.TypeAndValue.IsCxxPointeeConst;
+                        if (constElement || !namedVar.TypeAndValue.IsCxxMutableField)   // a mutable member is writable
+                            RefuseCxxConstReferentWrite(ctx, decrementStorage, "decrement", constElement);
                         if (decrementStorage)
                         {
                             namedVar.Primary = namedVar.Primary
@@ -2344,7 +2352,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 {
                                     // An ARRAY field must stay Storage-only here (no load), same as
                                     // the non-guarded arm below - a later '[i]' subscript needs the GEP.
-                                    ncEnterGuard(structVar.Storage);
+                                    ncEnterGuard(structVar.Storage, Compiler(ctx)->MemberIsScalarField(
+                                        structVar.TypeAndValue.TypeName, primaryIdentifier));
 
                                     auto* fieldLLVMType = Compiler(ctx)->GetType(fieldType);
                                     if (dataStructure.IsUnion)
@@ -6432,7 +6441,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // Preserve unsigned-integer TypeName so Upconvert (LowerByValueArg)
                                     // chooses ZExt over SExt - without it a u8 200 arrives as -56.
                                     argVar.TypeAndValue.EnumBacking = argNV.TypeAndValue.EnumBacking;
-                                    if (argNV.TypeAndValue.IsUnsignedInteger() != -1)
+                                    // An enum keeps its identity whatever its backing sign (MSVC
+                                    // fixes every unscoped C++ enum to int) for the enum-mismatch rule.
+                                    if (argNV.TypeAndValue.IsUnsignedInteger() != -1
+                                        || !argNV.TypeAndValue.EnumBacking.empty())
                                         argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
 
                                     // An INTERFACE argument's LLVM type is the shared fat-ptr struct, so the
@@ -7332,7 +7344,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         namedArgument->assignmentExpression()->getText());
                                     // Preserve unsigned-integer TypeName so Upconvert can choose ZExt over SExt.
                                     argVar.TypeAndValue.EnumBacking = argNV.TypeAndValue.EnumBacking;
-                                    if (argNV.TypeAndValue.IsUnsignedInteger() != -1)
+                                    // An enum keeps its identity whatever its backing sign (MSVC
+                                    // fixes every unscoped C++ enum to int) for the enum-mismatch rule.
+                                    if (argNV.TypeAndValue.IsUnsignedInteger() != -1
+                                        || !argNV.TypeAndValue.EnumBacking.empty())
                                         argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
 
                                     // Propagate interface type so overload resolution matches IFoo->IFoo parameters.
@@ -7925,8 +7940,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 std::string wrapperError;
                                 // Scalar table (ruling 2026-10-09): every constructor refuses a narrowing
                                 // or other-enum argument, so clang must not pick one of them silently.
-                                const bool narrowingRefused
+                                bool narrowingRefused
                                     = compiler->CxxCtorSetRequiresNarrowing(functionName, &arguments);
+                                // The one C++ selects must not narrow either; its refusal is `why`.
+                                if (!narrowingRefused
+                                    && ((ctor == nullptr && !hardReferenceRejection) || clangResolves))
+                                    if (std::string narrowing = compiler->CxxCtorSelectedNarrowingError(
+                                            functionName, arguments);
+                                        !narrowing.empty())
+                                    {
+                                        why = std::move(narrowing);
+                                        narrowingRefused = true;
+                                    }
                                 const bool wrapped = !narrowingRefused
                                     && ((ctor == nullptr && !hardReferenceRejection)
                                         || clangResolves)
@@ -7999,6 +8024,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     {
                                         if (!wrapperError.empty() && !why.starts_with("constructor '"))
                                             why = wrapperError;
+                                        // A scalar-reference set whose every constructor narrows
+                                        // reaches here with no listed refusal to name.
+                                        if (why.empty()) why = compiler->CxxCtorNoMatchReason(ctorTypes);
                                         LogErrorContext(primaryCtx, why.starts_with("no overload of '")
                                             ? why : std::format("C++ class '{}' {}",
                                                 compiler->DisplayCxxClassName(functionName), why));

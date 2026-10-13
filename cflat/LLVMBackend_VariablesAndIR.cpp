@@ -760,6 +760,29 @@ llvm::StoreInst* LLVMBackend::CreateAssignment(llvm::Value* value, llvm::Value* 
         }
         else
         {
+            auto* destinationRecord = llvm::dyn_cast_or_null<llvm::StructType>(destType);
+            auto* sourceRecord = llvm::dyn_cast_or_null<llvm::StructType>(value->getType());
+            if (destinationRecord != nullptr && sourceRecord != nullptr
+                && destinationRecord->hasName() && sourceRecord->hasName())
+            {
+                const std::string targetName = destinationRecord->getName().str();
+                const std::string sourceName = sourceRecord->getName().str();
+                if (targetName != sourceName && IsCxxRecord(targetName)
+                    && IsCxxRecord(sourceName) && HasImplicitClassConversionOperator(sourceName))
+                {
+                    NamedVariable source;
+                    source.Primary = value;
+                    source.BaseType = sourceRecord;
+                    source.TypeAndValue.TypeName = sourceName;
+                    source.Storage = StorageOfLoadedCxxObject(value);
+                    std::string refusal;
+                    const auto converted = ConvertThroughCxxConvertingCtor(
+                        source, targetName, destination, refusal, /*directInit*/ false);
+                    if (converted == CxxConvertingCtorResult::Converted) return nullptr;
+                    if (converted == CxxConvertingCtorResult::Refused)
+                        LogError(refusal);
+                }
+            }
             // When assigning a raw ptr (string literal) into a `string` struct variable,
             // wrap it into the { _ptr, _len } struct instead of attempting an invalid bitcast.
             auto* strTy = llvm::StructType::getTypeByName(*context, "string");

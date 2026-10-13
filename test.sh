@@ -678,12 +678,27 @@ if [ "$RUN_MODE" -eq 0 ]; then
                          || [ "$(cc_req MISS z_touch)" -ne "$(cc_req MISS z_same)" ]; then
                       cc_fail="(7a) touching an included header missed the request cache (hit $(cc_req HIT z_touch) vs $(cc_req HIT z_same))"
                     else
+                      # Keep both timestamp and size stable across a content edit. A stamp two
+                      # minutes from now stays inside the recorded dependency-hash race window.
+                      cc_hdr m6 inline 5
+                      perl -e 'my $t = time + 120; utime $t, $t, @ARGV' "$cc_dir/m6/a.h"
+                      cp -p "$cc_dir/m6/a.h" "$cc_dir/m6/a.ref"
+                      if ! cc_inc m6 45 z_racy_seed; then
+                        cc_fail="(7c) racy-stamp seed compile failed"
+                      else
+                        cc_hdr m6 inline 6
+                        touch -m -r "$cc_dir/m6/a.ref" "$cc_dir/m6/a.h"
+                        if [ "$(wc -c <"$cc_dir/m6/a.h")" -ne "$(wc -c <"$cc_dir/m6/a.ref")" ] \
+                           || ! cc_inc m6 46 z_racy_edit; then
+                          cc_fail="(7c) same-mtime same-size included-header edit replayed stale request data"
+                        fi
+                      fi
                       # The strong seed does not link (one TU per import line); it only stores.
                       cc_hdr m7 "" 1; cc_inc m7 41 z_strong
                       sleep 1; cc_hdr m7 inline 1
-                      if ! cc_inc m7 41 z_inline; then
+                      if [ -z "$cc_fail" ] && ! cc_inc m7 41 z_inline; then
                         cc_fail="(7b) strong -> inline edit of an included header failed warm: $(grep -o 'Linking globals[^!]*!' "$cc_dir/z_inline.log" | head -n 1)"
-                      elif ! grep -q "multiply defined" "$cc_dir/z_strong.log"; then
+                      elif [ -z "$cc_fail" ] && ! grep -q "multiply defined" "$cc_dir/z_strong.log"; then
                         cc_fail="(7b) the strong seed linked, so it stored no strong body (leg is vacuous)"
                       fi
                     fi
@@ -784,6 +799,63 @@ if [ "$RUN_MODE" -eq 0 ]; then
     elif ! cmp -s "$cc_dir/dup/a.out" "$cc_dir/dup/a.expected" \
         || ! cmp -s "$cc_dir/dup/b.out" "$cc_dir/dup/b.expected"; then
       cc_fail="(10) CFlat results did not match the clang++ twin values"
+    fi
+    if [ -z "$cc_fail" ]; then
+      # A template-body rejection points into the included header, not the generated wrapper.
+      # It must be re-evaluated on the next compile instead of replayed as a wrapper NEG hit.
+      mkdir -p "$cc_dir/reject/cache"
+      [ -d "$cc_dir/cache/runtime" ] && cp -R "$cc_dir/cache/runtime" "$cc_dir/reject/cache/"
+      printf '%s\n' '#pragma once' 'namespace cctx {' \
+        'template <class T> int bad(T value) { return value.no_such_member; }' '}' \
+        >"$cc_dir/reject/bad.h"
+      printf '%s\n' 'import cpp "bad.h";' 'int main() { return cctx.bad(1); }' \
+        >"$cc_dir/reject/bad.cb"
+      cc_reject_run() { # <log>
+        CFLAT_CACHE_DIR="$cc_dir/reject/cache" $TIMEOUT "$CFLAT" "$cc_dir/reject/bad.cb" \
+          -B -o "$cc_dir/reject/bad.bin" -v >"$cc_dir/reject/$1.log" 2>&1
+        local reject_rc=$?
+        [ "$reject_rc" -eq 1 ] \
+          && grep -q "no instantiation of C++ function template 'cctx.bad'" "$cc_dir/reject/$1.log"
+      }
+      if ! cc_reject_run first || ! cc_reject_run second; then
+        cc_fail="(11) C++ body-rejection cache regression probe did not reject twice"
+      elif ! grep -q "request cache MISS for __cflat_tpl_.*(missing entry)" \
+          "$cc_dir/reject/second.log"; then
+        cc_fail="(11) header-originated clang rejection was replayed from wrapper NEG cache"
+      elif grep -q "request cache HIT for __cflat_tpl_.*(disk)" "$cc_dir/reject/second.log"; then
+        cc_fail="(11) header-originated clang rejection incorrectly hit wrapper NEG cache"
+      fi
+    fi
+    if [ -z "$cc_fail" ]; then
+      # The bridge fixture produces selector-prefixed constructor candidates whose rejected
+      # bool&& wrappers must be cached as NEG entries and hit on the second compile.
+      mkdir -p "$cc_dir/selector/cache"
+      [ -d "$cc_dir/cache/runtime" ] && cp -R "$cc_dir/cache/runtime" "$cc_dir/selector/cache/"
+      if ! CFLAT_CACHE_DIR="$cc_dir/selector/cache" $TIMEOUT "$CFLAT" \
+          "$SRC/test_cpp_interop_bridge.cb" -i "$LIB" -B -o "$cc_dir/selector/cold.bin" -v \
+          >"$cc_dir/selector/cold.log" 2>&1; then
+        cc_fail="(12) selector-prefixed constructor cold compile failed"
+      elif ! CFLAT_CACHE_DIR="$cc_dir/selector/cache" $TIMEOUT "$CFLAT" \
+          "$SRC/test_cpp_interop_bridge.cb" -i "$LIB" -B -o "$cc_dir/selector/warm.bin" -v \
+          >"$cc_dir/selector/warm.log" 2>&1; then
+        cc_fail="(12) selector-prefixed constructor warm compile failed"
+      else
+        cc_selector_names=$(sed -n '/__cflat_sel_/p' "$cc_dir/selector/cold.log" \
+          | grep -o '__cflat_ctor_[[:xdigit:]]*' | sort -u)
+        cc_selector_hit=0
+        for cc_selector_name in $cc_selector_names; do
+          if grep -q "request cache STORE .*|RQ$cc_selector_name.*|NEG2" \
+              "$cc_dir/selector/cold.log" \
+              && grep -q "request cache HIT for $cc_selector_name.*(disk)" \
+              "$cc_dir/selector/warm.log"; then
+            cc_selector_hit=1
+            break
+          fi
+        done
+        if [ "$cc_selector_hit" -ne 1 ]; then
+          cc_fail="(12) selector-prefixed constructor rejection did not hit warm NEG cache"
+        fi
+      fi
     fi
   fi
   cat "$cc_dir"/*.log >"$cc_log" 2>/dev/null

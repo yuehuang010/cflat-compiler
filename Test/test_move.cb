@@ -458,6 +458,18 @@ int delegateProbe(Resource* r)
     return probe(r);
 }
 
+int consumeTernaryMove(move Resource* r)
+{
+    int id = r->id;
+    delete r;
+    return id;
+}
+
+int peekTernaryResource(Resource* r)
+{
+    return r->id;
+}
+
 // Helper for the explicit-move readable-as-null regression below: a plain read/pass of a
 // moved-out pointer (no dereference) must stay legal, so this only compares against nullptr.
 int isNullResource(Resource* r)
@@ -12434,6 +12446,75 @@ extern int main()
 {
     int passed = 0;
     int total  = 0;
+
+    // A named owner selected by either ternary arm transfers to the move sink; an unselected
+    // owner remains live and is still released by its own scope.
+    dtorCount = 0;
+    {
+        Resource* n = new Resource();
+        n->id = 51;
+        int value = consumeTernaryMove(0 > 0 ? new Resource() : n);
+        passed += Test("ternary_move_false_arm_value", value, 51);
+    }
+    passed += Test("ternary_move_false_arm_dtor_once", dtorCount, 1);
+    total += 2;
+
+    dtorCount = 0;
+    {
+        Resource* n = new Resource();
+        n->id = 52;
+        int value = consumeTernaryMove(1 > 0 ? n : new Resource());
+        passed += Test("ternary_move_true_arm_value", value, 52);
+    }
+    passed += Test("ternary_move_true_arm_dtor_once", dtorCount, 1);
+    total += 2;
+
+    // Parenthesized arm, a `move`-prefixed variable name, and two owners on both arms.
+    dtorCount = 0;
+    {
+        Resource* n = new Resource();
+        n->id = 53;
+        int value = consumeTernaryMove(0 > 0 ? new Resource() : (n));
+        passed += Test("ternary_move_paren_arm_value", value, 53);
+    }
+    passed += Test("ternary_move_paren_arm_dtor_once", dtorCount, 1);
+    total += 2;
+
+
+    dtorCount = 0;
+    {
+        Resource* moveCount = new Resource();
+        moveCount->id = 55;
+        int value = consumeTernaryMove(0 > 0 ? new Resource() : moveCount);
+        passed += Test("ternary_move_prefix_name_value", value, 55);
+    }
+    passed += Test("ternary_move_prefix_name_dtor_once", dtorCount, 1);
+    total += 2;
+
+    dtorCount = 0;
+    {
+        Resource* n = new Resource();
+        n->id = 56;
+        Resource* m = new Resource();
+        m->id = 57;
+        int value = consumeTernaryMove(1 > 0 ? n : m);
+        passed += Test("ternary_move_both_owners_value", value, 56);
+    }
+    passed += Test("ternary_move_both_owners_dtor_twice", dtorCount, 2);
+    total += 2;
+
+    // A non-move borrow parameter consumes neither owner, so both are freed by their scopes.
+    dtorCount = 0;
+    {
+        Resource* n = new Resource();
+        n->id = 58;
+        Resource* m = new Resource();
+        m->id = 59;
+        int value = peekTernaryResource(1 > 0 ? n : m);
+        passed += Test("ternary_borrow_param_value", value, 58);
+    }
+    passed += Test("ternary_borrow_param_dtor_twice", dtorCount, 2);
+    total += 2;
 
     // Test 1: move param causes destructor to fire when function returns
     dtorCount = 0;

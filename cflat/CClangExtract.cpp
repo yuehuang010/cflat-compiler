@@ -1387,6 +1387,9 @@ namespace cflat_cinterop
             // cxxMode only: (index into out.sigs, the decl it came from). Resolved after the
             // traversal so a single CodeGenerator serves every declaration.
             std::vector<std::pair<size_t, const FunctionDecl*>> abiWork;
+            // Inline C++ ellipsis calls cannot use a fixed-parameter forwarding wrapper. Keep
+            // their definitions as demand roots without changing the cached ABI signature.
+            std::vector<const FunctionDecl*> inlineVariadicWork;
             std::vector<QualType> functionPointerAbiWork;
             std::unordered_set<std::string> functionPointerAbiSeen;
             std::unordered_set<const FunctionTemplateDecl*> emittedFunctionTemplates;
@@ -2219,6 +2222,10 @@ namespace cflat_cinterop
                           "so cflat cannot call it";
                 if (st.req.cxxMode && !fd->isVariadic() && sig.bindRefusal.empty())
                     st.abiWork.emplace_back(st.out.sigs.size(), fd);
+                else if (st.req.cxxMode && fd->isVariadic() && inlineFunction
+                         && fd->hasExternalFormalLinkage() && sig.bindRefusal.empty()
+                         && fd->hasBody())
+                    st.inlineVariadicWork.push_back(fd);
                 // A C++ static inline is internal to each companion module, like clang's per-TU
                 // copy. The program binds a thunk under a body-keyed name (StaticInlineBodyKey).
                 if (st.req.cxxMode && internalInline && !sig.linkageName.empty())
@@ -3229,6 +3236,7 @@ namespace cflat_cinterop
                     const FunctionDecl* memberDefinition = md->getDefinition();
                     const bool inlineMember = md->isInlined()
                         || (memberDefinition != nullptr && memberDefinition->isInlined());
+                    m.isInline = inlineMember;
                     m.needsLocalDefinition = md->isImplicit() || md->isDefaulted()
                                           || inlineMember
                                           || (pattern != nullptr && pattern->isDefined());
@@ -4801,6 +4809,12 @@ namespace cflat_cinterop
 
                 if (const auto* integer = llvm::dyn_cast<IntegerLiteral>(init->IgnoreParenImpCasts()))
                     m.isIntegerLiteralZero = integer->getValue().isZero();
+                else
+                    // C's null-constant test also takes integer constant expressions ('\0', 1-1,
+                    // ((int)0)); C++ takes only __null and a pointer-typed NULL like ((void*)0).
+                    m.isIntegerLiteralZero = llvm::isa<GNUNullExpr>(init->IgnoreParenImpCasts())
+                        || ((init->getType()->isPointerType() || init->getType()->isNullPtrType())
+                            && init->isNullPointerConstant(ctx, Expr::NPC_ValueDependentIsNotNull));
 
                 if (auto* sl = llvm::dyn_cast<StringLiteral>(init->IgnoreParenImpCasts()))
                 {
@@ -4823,6 +4837,8 @@ namespace cflat_cinterop
                     m.naturalType = CanonicalSpelling(ctx, vd->getType().getUnqualifiedType());
                     const APValue& v = ev.Val;
                     if (v.isInt())        { m.kind = RawMacro::Int; m.intValue = ApsIntToLongLong(v.getInt()); }
+                    else if (m.isIntegerLiteralZero && m.naturalType.find('*') != std::string::npos)
+                    { m.kind = RawMacro::Int; m.intValue = 0; }
                     else if (v.isFloat())
                     {
                         // convertToDouble() asserts unless the APFloat already has IEEEdouble
@@ -5592,7 +5608,8 @@ namespace cflat_cinterop
                 DefineMicrosoftVTableMembers(st, ctx);
                 DefineEmittedVTableMembers(st, ctx);
             }
-            if (st.abiWork.empty() && st.functionPointerAbiWork.empty()
+            if (st.abiWork.empty() && st.inlineVariadicWork.empty()
+                && st.functionPointerAbiWork.empty()
                 && st.memberAbiWork.empty() && !st.req.RecordsDefinitionDemand()) return;
             using namespace clang::CodeGen;
 
@@ -5731,7 +5748,8 @@ namespace cflat_cinterop
                 RawCxxMember& m = rec.members[w.memberIdx];
                 const CXXMethodDecl* md = w.md;
                 if (md == nullptr || md->isInvalidDecl() || md->getType()->isDependentType()
-                    || md->isVariadic() || CompleteNonDependentCxxRecord(md->getParent()) == nullptr)
+                    || (md->isVariadic() && !m.isInline)
+                    || CompleteNonDependentCxxRecord(md->getParent()) == nullptr)
                     continue;
 
                 /*
@@ -6364,6 +6382,10 @@ namespace cflat_cinterop
                 if (fd != nullptr && !declHasErrors(fd) && !fd->getType()->isDependentType()
                     && fd->hasBody())
                     request(GlobalDecl(fd));
+            for (const FunctionDecl* fd : st.inlineVariadicWork)
+                if (fd != nullptr && !declHasErrors(fd) && !fd->getType()->isDependentType()
+                    && fd->hasBody())
+                    request(GlobalDecl(fd));
             for (const auto& w : st.memberAbiWork)
                 if (w.md != nullptr && !declHasErrors(w.md)
                     && !isDependentCodeGenDecl(w.md))
@@ -6860,6 +6882,7 @@ namespace cflat_cinterop
             st.emittedDefinedRecords.clear();
             st.emittedRequestedRecords.clear();
             st.abiWork.clear();
+            st.inlineVariadicWork.clear();
             st.functionPointerAbiWork.clear();
             st.functionPointerAbiSeen.clear();
             st.emittedFunctionTemplates.clear();

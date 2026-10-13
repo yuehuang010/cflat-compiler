@@ -107,13 +107,13 @@ extern int main()
     if (e[100]  != 114.0)  ok = 0;
     if (e[1023] != 1037.0) ok = 0;
 
-    int* ep = move e; delete[_] ep;
-    int* fp = move f; delete[_] fp;
+    double* ep = move e; delete[_] ep;
+    double* fp = move f; delete[_] fp;
 
-    int* cp = move ca; delete[_] cp;
-    int* dp = move d; delete[_] dp;
-    int* ap = move a; delete[_] ap;
-    int* bp = move b; delete[_] bp;
+    double* cp = move ca; delete[_] cp;
+    double* dp = move d; delete[_] dp;
+    double* ap = move a; delete[_] ap;
+    double* bp = move b; delete[_] bp;
 
     printf("span_axpy ok=%d\n", ok);
     return ok == 1 ? 0 : 1;

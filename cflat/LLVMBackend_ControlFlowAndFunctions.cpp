@@ -118,9 +118,19 @@ void LLVMBackend::FinalizeDebugInfo()
         for (auto& p : pendingGlobalDI_)
         {
             auto* diType = GetDIType(p.typeValue);
+            std::string displayName = p.typeValue.VariableName;
+            const std::string enumKey = ResolveEnumTypeName(p.typeValue.TypeName);
+            if (!enumKey.empty() && IsGenericLocalEnumKey(enumKey))
+            {
+                const size_t memberDot = displayName.rfind('.');
+                const size_t enumDot = enumKey.rfind('.');
+                if (memberDot != std::string::npos && enumDot != std::string::npos
+                    && displayName.starts_with(enumKey + "."))
+                    displayName = enumKey.substr(enumDot + 1) + displayName.substr(memberDot);
+            }
             auto* diGVE = diBuilder->createGlobalVariableExpression(
                 p.scope != nullptr ? p.scope : compileUnit,
-                p.typeValue.VariableName, p.gVar->getName(),
+                displayName, p.gVar->getName(),
                 p.file, p.line, diType,
                 p.isLocalToUnit, /*isDefined*/ true);
             p.gVar->addDebugInfo(diGVE);

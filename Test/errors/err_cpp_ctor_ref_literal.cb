@@ -3,6 +3,8 @@
 import cpp "cpp_interop_ctorref.h";
 import cpp "cpp_interop_unique_deleter.hpp";
 import cpp "cpp_t28_fwdref.hpp";
+import "cpp_t103_nullctor_c.h";
+import cpp "cpp_t103_nullctor.hpp";
 
 void CrDeleteWrongParam(int x) { }
 int CrDeleteWrongReturn(move int* p) { delete p; return 1; }
@@ -98,6 +100,66 @@ extern int main()
     // A pointer-reference template and an array-reference template tie for a literal.
     expect_error("call to 'amb' is ambiguous") {
         auto p = t28.amb("abc", 1);
+    }
+    // T103: no implicit narrowing into a scalar-reference constructor set (ruling 2026-09-04),
+    // with no pointer sibling, a usable one, an unusable one (wrong arity) and a pair.
+    expect_error("has no constructor whose parameter types match these arguments ('i64')") {
+        i64 l = 4294967297;
+        t103.NarrowMixed* p = new t103.NarrowMixed(l);
+    }
+    expect_error("has no constructor whose parameter types match these arguments ('double')") {
+        double d = 1.5;
+        t103.NarrowMixed* p = new t103.NarrowMixed(d);
+    }
+    expect_error("has no constructor whose parameter types match these arguments ('i64')") {
+        i64 l = 4294967297;
+        t103.NarrowPointer* p = new t103.NarrowPointer(l);
+    }
+    expect_error("has no constructor whose parameter types match these arguments ('double')") {
+        double d = 1.5;
+        t103.NarrowPointer* p = new t103.NarrowPointer(d);
+    }
+    expect_error("has no constructor whose parameter types match these arguments ('i64')") {
+        i64 l = 4294967297;
+        t103.NarrowDead* p = new t103.NarrowDead(l);
+    }
+    expect_error("has no constructor whose parameter types match these arguments ('double')") {
+        double d = 1.5;
+        t103.NarrowDead* p = new t103.NarrowDead(d);
+    }
+    expect_error("has no constructor whose parameter types match these arguments ('i64', 'int')") {
+        i64 l = 4294967297;
+        t103.NarrowPair* p = new t103.NarrowPair(l, 1);
+    }
+    expect_error("has no constructor whose parameter types match these arguments ('double', 'int')") {
+        double d = 1.5;
+        t103.NarrowPair* p = new t103.NarrowPair(d, 1);
+    }
+    // A non-narrowing candidate exists, but C++ selects (int, char) for (short, int).
+    expect_error("narrows argument 2 from 'int' to 'char'") {
+        short s = 1;
+        int i = 300;
+        t103.NarrowRanked* p = new t103.NarrowRanked(s, i);
+    }
+    expect_error("narrows argument 2 from 'int' to 'char'") {
+        short s = 1;
+        int i = 300;
+        t103.NarrowRanked r = t103.NarrowRanked(s, i);
+    }
+    expect_error("narrows argument 2 from 'int' to 'char'") {
+        short s = 1;
+        int i = 300;
+        int v = t103.NarrowRanked(s, i).v;
+    }
+    // A C-header integral zero expression is not a C++ null pointer constant.
+    expect_error("no overload of 't103.only_pointer' matches") {
+        int v = t103.only_pointer(T103_C_EXPR_ZERO);
+    }
+    expect_error("no overload of 't103.only_pointer' matches") {
+        int v = t103.only_pointer(T103_C_CAST_ZERO);
+    }
+    expect_error("no overload of 't103.only_pointer' matches") {
+        int v = t103.only_pointer(T103_C_CHAR_ZERO);
     }
     return 0;
 }

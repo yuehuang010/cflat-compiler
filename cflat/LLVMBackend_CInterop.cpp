@@ -352,7 +352,7 @@ static void CollectHeaderNamespaceNamesParallel(const std::vector<std::string>& 
                                                 std::unordered_set<std::string>& out,
                                                 std::unordered_set<std::string>* out2 = nullptr,
                                                 const std::vector<std::string_view>* buffers = nullptr,
-                                                std::unordered_map<std::string, uint64_t>* hashes = nullptr)
+                                                std::unordered_map<std::string, std::pair<uint64_t, int64_t>>* hashes = nullptr)
 {
         llvm::TimeTraceScope namespaceScope("CxxNamespaceScan");
         const size_t count = paths.size();
@@ -376,6 +376,7 @@ static void CollectHeaderNamespaceNamesParallel(const std::vector<std::string>& 
         const unsigned workers = work.size() < 64 ? 1u : 4u;
         std::vector<std::unordered_set<std::string>> found(workers);
         std::vector<uint64_t> fileHashes(work.size(), 0);
+        std::vector<int64_t> fileHashTimes(work.size(), 0);
         LLVMBackend::RunParallel(work.size(), workers, [&](size_t w, unsigned worker) {
             const size_t i = work[w];
             const std::string_view text = buffers != nullptr ? (*buffers)[i] : std::string_view();
@@ -385,7 +386,12 @@ static void CollectHeaderNamespaceNamesParallel(const std::vector<std::string>& 
                 return;
             }
             ScanHeaderNamespaceNames(text, found[worker]);
-            if (wantHash[w]) fileHashes[w] = Fnv1aBytes(text);
+            if (wantHash[w])
+            {
+                fileHashTimes[w] = (int64_t)std::filesystem::file_time_type::clock::now()
+                                       .time_since_epoch().count();
+                fileHashes[w] = Fnv1aBytes(text);
+            }
         });
         for (const auto& names : found)
             for (const auto& name : names)
@@ -395,7 +401,8 @@ static void CollectHeaderNamespaceNamesParallel(const std::vector<std::string>& 
             }
         if (hashes != nullptr)
             for (size_t w = 0; w < work.size(); ++w)
-                if (wantHash[w]) hashes->emplace(paths[work[w]], fileHashes[w]);
+                if (wantHash[w]) hashes->emplace(paths[work[w]],
+                    std::pair<uint64_t, int64_t>{fileHashes[w], fileHashTimes[w]});
 }
 
 // Canonical spelling minus a leading record tag, squeezed - the comparison key that decides
@@ -824,6 +831,31 @@ bool LLVMBackend::RejectCxxRecordByValue(const CSigEntry& sig)
 
 void LLVMBackend::CheckPoisonedFunctionCalls()
 {
+        // Report poisoned functions reachable from live code first (a call inside an uncalled
+        // container method is the consequence), then in first-call order - never hash order:
+        // the first error is the one an expect_error sees, and unordered_map iteration differs
+        // between libc++ and MSVC STL.
+        auto reachable = [](llvm::Function* f) {
+            std::vector<llvm::Function*> work{f};
+            std::unordered_set<llvm::Function*> seen{f};
+            while (!work.empty())
+            {
+                llvm::Function* g = work.back();
+                work.pop_back();
+                if (!g->hasLocalLinkage()) return true;
+                for (auto* u : g->materialized_users())
+                {
+                    auto* call = llvm::dyn_cast<llvm::CallBase>(u);
+                    // An address use (vtable, function value) is conservatively live.
+                    if (call == nullptr || call->getCalledOperand() != g) return true;
+                    if (llvm::Function* caller = call->getFunction(); seen.insert(caller).second)
+                        work.push_back(caller);
+                }
+            }
+            return false;
+        };
+        struct Called { const std::string* Name; const std::string* Msg; const FirstCallSite* Site; bool Live; };
+        std::vector<Called> called;
         for (const auto& [name, msg] : poisonedFunctions)
         {
             llvm::Function* f = module->getFunction(name);
@@ -834,14 +866,24 @@ void LLVMBackend::CheckPoisonedFunctionCalls()
             {
                 if (llvm::isa<llvm::CallBase>(u))
                 {
-                    // Point the diagnostic at the call site rather than wherever the walk ended.
                     auto locIt = firstCallLocation_.find(name);
-                    if (locIt != firstCallLocation_.end())
-                        SetSourceLocation(locIt->second.first, locIt->second.second);
-                    LogRawError(msg);
+                    called.push_back({&name, &msg,
+                        locIt != firstCallLocation_.end() ? &locIt->second : nullptr, reachable(f)});
                     break;
                 }
             }
+        }
+        std::sort(called.begin(), called.end(), [](const Called& a, const Called& b) {
+            if (a.Live != b.Live) return a.Live;
+            if ((a.Site == nullptr) != (b.Site == nullptr)) return b.Site == nullptr;
+            if (a.Site != nullptr && a.Site->Order != b.Site->Order) return a.Site->Order < b.Site->Order;
+            return *a.Name < *b.Name;
+        });
+        for (const Called& c : called)
+        {
+            // Point the diagnostic at the call site rather than wherever the walk ended.
+            if (c.Site != nullptr) SetSourceLocation(c.Site->Line, c.Site->Column);
+            LogRawError(*c.Msg);
         }
     }
 
@@ -1129,7 +1171,11 @@ bool LLVMBackend::TryReuseCObject(uint64_t commandKey, const std::string& objPat
         if (cacheDir.empty()) return false;
         const std::filesystem::path base =
             std::filesystem::path(cacheDir) / "objects" / std::format("{:016x}", commandKey);
-        auto stampText = llvm::MemoryBuffer::getFile(base.string() + ".deps.json");
+        const std::filesystem::path depsPath = base.string() + ".deps.json";
+        std::error_code depsTimeError;
+        const auto cacheWriteTime = std::filesystem::last_write_time(depsPath, depsTimeError);
+        if (depsTimeError) return false;
+        auto stampText = llvm::MemoryBuffer::getFile(depsPath.string());
         if (!stampText) return false;
         llvm::Expected<llvm::json::Value> parsed = llvm::json::parse((*stampText)->getBuffer());
         if (!parsed)
@@ -1142,6 +1188,7 @@ bool LLVMBackend::TryReuseCObject(uint64_t commandKey, const std::string& objPat
         if (stamps == nullptr || root->getInteger("version") != kCObjectCacheVersion) return false;
 
         std::vector<CHeaderDep> deps;
+        const int64_t cacheWriteTimeCount = (int64_t)cacheWriteTime.time_since_epoch().count();
         for (const llvm::json::Value& value : *stamps)
         {
             const llvm::json::Object* stamp = value.getAsObject();
@@ -1153,7 +1200,8 @@ bool LLVMBackend::TryReuseCObject(uint64_t commandKey, const std::string& objPat
             if (!path || !mtime || !hash || hash->getAsInteger(16, dep.hash)) return false;
             dep.path = path->str();
             dep.mtime = *mtime;
-            if (!CHeaderDepFresh(dep))
+            dep.hashTime = stamp->getInteger("ht").value_or(cacheWriteTimeCount);
+            if (!CHeaderDepFresh(dep, cacheWriteTime))
             {
                 if (verbose)
                     std::cout << std::format("[verbose] C object cache stale: {} changed\n", dep.path);
@@ -1182,12 +1230,15 @@ void LLVMBackend::StoreCObject(uint64_t commandKey, const std::string& objPath, 
             if (ec || !seen.insert(path).second) continue;
             RecordDependency(path);
             auto mtime = std::filesystem::last_write_time(path, ec);
+            const int64_t hashTime = (int64_t)std::filesystem::file_time_type::clock::now()
+                                         .time_since_epoch().count();
             uint64_t hash = 0;
             if (ec || !HashFileFnv1a(path, hash)) continue;
             stamps.push_back(llvm::json::Object{
                 {"f", path},
                 {"mt", (int64_t)mtime.time_since_epoch().count()},
-                {"h", std::format("{:016x}", hash)}});
+                {"h", std::format("{:016x}", hash)},
+                {"ht", hashTime}});
         }
         // A depfile without inputs cannot validate a reuse, so it is never stored.
         const std::string cacheDir = GetCHeaderCacheDir();
@@ -2399,7 +2450,7 @@ bool LLVMBackend::HashFileFnv1a(const std::string& path, uint64_t& outHash)
 
 // Preserve include order and stamps while sharing buffer hashes with early closure capture.
 void LLVMBackend::CollectCHeaderDependencies(const std::vector<std::string>& paths,
-                                              const std::unordered_map<std::string, uint64_t>& known,
+                                              const std::unordered_map<std::string, std::pair<uint64_t, int64_t>>& known,
                                               std::vector<CHeaderDep>& deps)
 {
         llvm::TimeTraceScope depsScope("CHeaderDependencies");
@@ -2434,17 +2485,23 @@ void LLVMBackend::CollectCHeaderDependencies(const std::vector<std::string>& pat
 
 // Hash only dependencies whose bytes were unavailable in clang's buffers or the primary hash.
 void LLVMBackend::HashCHeaderDependencies(std::vector<CHeaderDep>& deps,
-                                          const std::unordered_map<std::string, uint64_t>& known)
+                                          const std::unordered_map<std::string, std::pair<uint64_t, int64_t>>& known)
 {
         llvm::TimeTraceScope hashScope("CHeaderDependencyHashes");
         std::vector<size_t> unread;
         for (size_t i = 0; i < deps.size(); ++i)
         {
             const auto hit = known.find(deps[i].path);
-            if (hit != known.end()) deps[i].hash = hit->second;
+            if (hit != known.end())
+            {
+                deps[i].hash = hit->second.first;
+                deps[i].hashTime = hit->second.second;
+            }
             else unread.push_back(i);
         }
         RunParallel(unread.size(), unread.size() < 32 ? 1u : 4u, [&](size_t i, unsigned) {
+            deps[unread[i]].hashTime = (int64_t)std::filesystem::file_time_type::clock::now()
+                                           .time_since_epoch().count();
             HashFileFnv1a(deps[unread[i]].path, deps[unread[i]].hash);
         });
 }
@@ -3798,6 +3855,18 @@ void LLVMBackend::MarkCxxReferenceField(const std::string& ctype, TypeAndValue& 
 {
         std::string s = ctype;
         while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+        const size_t arrayRefParen = s.find("(&)");
+        const size_t arrayRefOpen = s.find("(&)[");
+        const size_t arrayRefAt = arrayRefOpen != std::string::npos
+            ? arrayRefOpen : arrayRefParen;
+        if (isCxx && arrayRefAt != std::string::npos
+            && s.substr(0, arrayRefAt).find("const") != std::string::npos)
+            tv.IsCxxPointeeConst = true;
+        if (tv.IsArrayView)
+        {
+            return;
+        }
+        if (arrayRefAt != std::string::npos) return;
         if (s.empty() || s.back() != '&' || !tv.Pointer || tv.IsFunctionPointer || tv.IsArrayView)
             return;
         const bool rvalue = s.size() >= 2 && s[s.size() - 2] == '&';
@@ -5627,7 +5696,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         if (outIncludes) *outIncludes = raw.includedFiles;
         const bool captureClosure = cxxMode && activeCxxRequestGroup_ != nullptr
             && outIncludes != nullptr && !GetCHeaderCacheDir().empty();
-        std::unordered_map<std::string, uint64_t> closureHashes;
+        std::unordered_map<std::string, std::pair<uint64_t, int64_t>> closureHashes;
         auto* includeHashes = includeHashSink_;
         if (captureClosure && includeHashes == nullptr) includeHashes = &closureHashes;
         if (cxxMode && activeCxxRequestGroup_ != nullptr)
@@ -8423,6 +8492,16 @@ size_t LLVMBackend::FindOrAddCxxImportGroup(const std::vector<std::string>& head
         return cxxImportGroups_.size() - 1;
     }
 
+// A class specialization request needs its owner and nested template-argument headers.
+LLVMBackend::CxxRequestGroup LLVMBackend::MakeCxxClassRequestGroup(
+        size_t owner, const std::string& typeName, const std::vector<size_t>& deps) const
+{
+        std::vector<size_t> groups = deps;
+        std::unordered_set<std::string> visited;
+        CollectCxxTypeOwnerGroups(typeName, groups, visited);
+        return MakeCxxRequestGroup(owner, groups);
+}
+
 /*
  * The primary group's headers first, then the headers of the groups that own the requested
  * spelling's template arguments, appended in a canonical (sorted) order so the prologue and the
@@ -9140,6 +9219,7 @@ std::string LLVMBackend::CxxBraceElementSpelling(const CxxBraceArgument& brace,
         // Keep scalar brace arguments matchable when C++ converts them into a record element.
         if (!target.empty() && !(targetIsCxxRecord && brace.allIntegerLiterals)) return target;
         auto cflatTypeOf = [&](const NamedVariable& arg) {
+            if (IsCxxNullTypedArgument(arg)) return std::string("std.nullptr_t");
             std::string type = !arg.LiteralIdentity.empty()
                 ? arg.LiteralIdentity : arg.TypeAndValue.TypeName;
             bool pointer = arg.TypeAndValue.Pointer;
@@ -9207,6 +9287,17 @@ std::string LLVMBackend::CxxBraceElementSpelling(const CxxBraceArgument& brace,
         return spelling;
 }
 
+// C++ spelling of a literal zero by its CFlat literal identity (suffix kept: `0L` is a long zero),
+// empty for any other identity. Callers first check IsNullPointerConstantArgument.
+static std::string CxxZeroLiteralSpelling(const std::string& identity)
+{
+        static const std::map<std::string, std::string> kZeroLiterals = {
+            { "int", "0" }, { "u32", "0u" }, { "long", "0L" }, { "ulong", "0UL" },
+            { "i64", "0LL" }, { "u64", "0ULL" } };
+        const auto it = kZeroLiterals.find(identity);
+        return it != kZeroLiterals.end() ? it->second : std::string();
+}
+
 // One brace element as a C++ expression of its exact source type, for an overload selector: a
 // constant stays a constant expression (narrowing reads as at the source), anything else is a
 // declval. Empty when the element is not a spellable scalar.
@@ -9218,6 +9309,13 @@ std::string LLVMBackend::CxxBraceSelectorElement(
         if (element.TypeAndValue.Pointer || valueType == nullptr
             || (!valueType->isIntegerTy() && !valueType->isFloatingPointTy()))
             return {};
+        if (IsNullPointerConstantArgument(element, true))
+        {
+            if (element.IsCxxMacroGlobal && !element.CallerName.empty())
+                return element.CallerName;
+            if (std::string zero = CxxZeroLiteralSpelling(element.LiteralIdentity); !zero.empty())
+                return zero;
+        }
         std::string type = !element.LiteralIdentity.empty() ? element.LiteralIdentity
                                                             : element.TypeAndValue.TypeName;
         // Same identity CxxBraceElementSpelling keys the wrapper by (`l + 4` is `long`), so two
@@ -9280,8 +9378,10 @@ std::string LLVMBackend::CxxBraceSelectorElement(
             bool lossy = false;
             llvm::APFloat value = constantFp->getValueAPF();
             value.convert(llvm::APFloat::IEEEdouble(), llvm::APFloat::rmNearestTiesToEven, &lossy);
-            return "static_cast<" + spelling + ">(" + std::format("{:a}", value.convertToDouble())
-                .insert(value.isNegative() ? 1 : 0, "0x") + ")";
+            const std::string literal = std::format("{:a}", value.convertToDouble())
+                .insert(value.isNegative() ? 1 : 0, "0x");
+            if (element.LiteralIdentity.empty() && valueType->isFloatTy()) return literal;
+            return "static_cast<" + spelling + ">(" + literal + ")";
         }
         return "declval<" + spelling + ">()";
 }
@@ -9332,9 +9432,51 @@ static const std::string kClassConstantCxxRequestMarker = "__cflat_class_constan
 // A |CONST entry for an unscoped enumerator: its enum's C++ spelling in `file`, value in enums[0].
 static const std::string kEnumeratorCxxRequestMarker = "__cflat_enumerator_request";
 
+static bool CxxErrorsAreInsideWrapper(const std::string& diagnostics,
+                                      const std::string& sourcePath,
+                                      const std::string& source,
+                                      const std::string& wrapperText)
+{
+        if (diagnostics.empty() || sourcePath.empty() || wrapperText.empty()) return false;
+        const size_t start = source.rfind(wrapperText);
+        if (start == std::string::npos) return false;
+        const size_t firstLine = 1 + std::count(source.begin(), source.begin() + start, '\n');
+        const size_t lastLine = firstLine + std::count(wrapperText.begin(), wrapperText.end(), '\n');
+        const std::string expectedPath = std::filesystem::path(sourcePath).lexically_normal().string();
+        bool foundError = false;
+        size_t begin = 0;
+        while (begin < diagnostics.size())
+        {
+            size_t end = diagnostics.find('\n', begin);
+            if (end == std::string::npos) end = diagnostics.size();
+            const std::string line = diagnostics.substr(begin, end - begin);
+            begin = end + 1;
+            size_t errorAt = line.find(": error:");
+            const size_t fatalAt = line.find(": fatal error:");
+            if (fatalAt != std::string::npos
+                && (errorAt == std::string::npos || fatalAt < errorAt))
+                errorAt = fatalAt;
+            if (errorAt == std::string::npos) continue;
+            const size_t colSep = line.rfind(':', errorAt - 1);
+            const size_t rowSep = colSep == std::string::npos ? colSep : line.rfind(':', colSep - 1);
+            if (rowSep == std::string::npos || colSep == std::string::npos) return false;
+            const std::string path = std::filesystem::path(line.substr(0, rowSep))
+                                         .lexically_normal().string();
+            const std::string row = line.substr(rowSep + 1, colSep - rowSep - 1);
+            if (path != expectedPath || row.empty()
+                || !std::all_of(row.begin(), row.end(),
+                                [](unsigned char c) { return std::isdigit(c); }))
+                return false;
+            const size_t lineNumber = std::stoull(row);
+            if (lineNumber < firstLine || lineNumber > lastLine) return false;
+            foundError = true;
+        }
+        return foundError;
+}
+
 /*
- * A wrapper clang rejects is as deterministic as one it accepts: the outcome is a function of the
- * same key. Cache the reason too, so a warm compile (or a repeated use site) does not parse again.
+ * Cache a clang rejection only when every error is located in this wrapper's source range.
+ * Context-dependent or unmapped errors are retried so another TU state can decide them.
  */
 bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
                                              const std::string& requestedSource,
@@ -9356,7 +9498,8 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
         const std::vector<std::string> negativeArgs = BuildCxxRequestClangArgs(group);
         const std::string negativeKey = CxxTypeRequestCacheKey(
             group, wrapperName, negativeSource, negativeArgs, emitDefinitions)
-            + "|" + cacheTag + "|NEG";
+            // NEG2 leaves pre-fix text-only refusals unreadable: they carry no location proof.
+            + "|" + cacheTag + "|NEG2";
         {
             CFileSigCacheEntry negative;
             std::string missReason;
@@ -9367,7 +9510,7 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
                      && TryLoadCxxTypeRequestCache(
                             group, CxxTypeRequestCacheKey(group, wrapperName, negativeSource,
                                                           negativeArgs, /*emitDefinitions*/ true)
-                                       + "|" + cacheTag + "|NEG",
+                                       + "|" + cacheTag + "|NEG2",
                             /*emitDefinitions*/ false, negative, missReason, /*allowDisk*/ true)))
                 && negative.macros.size() == 1
                 && negative.macros.front().name == kNegativeCxxRequestMarker)
@@ -9388,6 +9531,8 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
         pendingCxxWrapperNoViableAtRequest_ = false;
         const unsigned parsesBefore = group.primary < cxxImportGroups_.size()
             ? cxxImportGroups_[group.primary].headerParseCount : 0;
+        bool failureInsideWrapper = false;
+        bool failureIsBodyRefusal = false;
         auto rememberFailure = [&] {
             CFileSigCacheEntry negative;
             CMacroEntry marker;
@@ -9401,7 +9546,7 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
         };
         if (RequestGeneratedCxxWrapperUncached(group, wrapperSource, wrapperName, cacheTag,
                                                signature, error, persistOnSuccess,
-                                               allowIncremental))
+                                               allowIncremental, &failureInsideWrapper))
         {
             // A callee body an earlier demand check already failed raises no error again here.
             const std::string demand = emitDefinitions ? CheckCxxDemand(wrapperName) : std::string();
@@ -9414,8 +9559,9 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
                 !refusal.empty())
             {
                 error = refusal;
-                if (persistOnSuccess) rememberFailure();
+                failureIsBodyRefusal = true;
             }
+            if (persistOnSuccess && failureIsBodyRefusal) rememberFailure();
             return false;
         }
         lastCxxWrapperCause_ = std::move(pendingCxxWrapperCause_);
@@ -9428,6 +9574,7 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
         {
             error = refusal;
             lastCxxWrapperCause_ = refusal.substr(7);
+            failureIsBodyRefusal = true;
         }
         // A budget refusal is about this compile, not the wrapper; never remember it.
         const std::optional<unsigned> parseBudget = TuParseBudget();
@@ -9436,7 +9583,9 @@ bool LLVMBackend::RequestGeneratedCxxWrapper(const CxxRequestGroup& group,
             && cxxImportGroups_[group.primary].headerParseCount > parsesBefore
             && cxxImportGroups_[group.primary].headerParseCount
                    - cxxImportGroups_[group.primary].lookupRecoveryParses > *parseBudget;
-        if (persistOnSuccess && !error.empty() && !budgetRefused) rememberFailure();
+        if (persistOnSuccess && !error.empty() && !budgetRefused
+            && (failureInsideWrapper || failureIsBodyRefusal))
+            rememberFailure();
         return false;
 }
 
@@ -9447,10 +9596,12 @@ bool LLVMBackend::RequestGeneratedCxxWrapperUncached(const CxxRequestGroup& grou
                                                      CSigEntry& signature,
                                                      std::string& error,
                                                      bool persistOnSuccess,
-                                                     bool allowIncremental)
+                                                     bool allowIncremental,
+                                                     bool* failureInsideWrapper)
 {
         llvm::TimeTraceScope scope("RequestGeneratedCxxWrapper", wrapperName);
         error.clear();
+        if (failureInsideWrapper != nullptr) *failureInsideWrapper = false;
         const bool emitDefinitions = symbolSink_ == nullptr;
         std::vector<CSigEntry> requestSigs;
         std::vector<CRecordEntry> requestRecords;
@@ -9489,8 +9640,15 @@ bool LLVMBackend::RequestGeneratedCxxWrapperUncached(const CxxRequestGroup& grou
         if (!cached)
         {
             std::string requestDiagnostics;
+            std::string failedSource;
+            std::string failedSourcePath;
+            std::string failedDiagnostics;
+            bool incrementalLocationChecked = false;
+            bool incrementalErrorsInsideWrapper = false;
             auto runRequest = [&](bool emit, cflat_cinterop::ExtractResult& out,
                                   std::string& runError) {
+                incrementalLocationChecked = false;
+                incrementalErrorsInsideWrapper = false;
                 cflat_cinterop::ExtractRequest req;
                 req.mainFileName = (std::filesystem::absolute("scratch")
                                     / (wrapperName + ".cpp")).string();
@@ -9515,6 +9673,12 @@ bool LLVMBackend::RequestGeneratedCxxWrapperUncached(const CxxRequestGroup& grou
                     out = cflat_cinterop::ExtractResult();
                     const bool parsed = incremental->ParseRequest(req, req.source, out, runError);
                     requestDiagnostics = incremental->LastRequestDiagnostics();
+                    incrementalLocationChecked = true;
+                    incrementalErrorsInsideWrapper = incremental->LastRequestErrorsInsideSourceRange(
+                        req.source, req.source);
+                    failedSource = req.source;
+                    failedSourcePath = req.mainFileName;
+                    failedDiagnostics = requestDiagnostics.empty() ? runError : requestDiagnostics;
                     if (!parsed) return false;
                     if (req.source.find(kCxxWrapperPidDecl) != std::string::npos)
                         incremental->RememberPrefixSource(kCxxWrapperPidDecl);
@@ -9536,6 +9700,9 @@ bool LLVMBackend::RequestGeneratedCxxWrapperUncached(const CxxRequestGroup& grou
                     return false;
                 };
                 const bool ran = cflat_cinterop::ExtractCInterop(req, out, runError);
+                failedSource = req.source;
+                failedSourcePath = req.mainFileName;
+                failedDiagnostics = runError;
                 if (ran && (pch.empty() || wrapperFound())) return ran;
                 if (pch.empty()) return false;
                 // See RunCxxTypeRequests: a PCH may be recovered into an AST that harvests
@@ -9546,6 +9713,9 @@ bool LLVMBackend::RequestGeneratedCxxWrapperUncached(const CxxRequestGroup& grou
                 full.args.resize(full.args.size() - 2);
                 out = cflat_cinterop::ExtractResult();
                 const bool retryRan = cflat_cinterop::ExtractCInterop(full, out, runError);
+                failedSource = full.source;
+                failedSourcePath = full.mainFileName;
+                failedDiagnostics = runError;
                 if (retryRan && (!ran || wrapperFound()))
                     DropCxxRequestPch(pch);
                 return retryRan;
@@ -9558,6 +9728,19 @@ bool LLVMBackend::RequestGeneratedCxxWrapperUncached(const CxxRequestGroup& grou
                 error = FirstCxxErrorLine(probeError);
                 pendingCxxWrapperCause_ = requestDiagnostics;
                 pendingCxxWrapperNoViableAtRequest_ = probe.firstErrorNoViableAtRequest;
+                if (failureInsideWrapper != nullptr)
+                {
+                    *failureInsideWrapper = incrementalLocationChecked
+                        ? incrementalErrorsInsideWrapper
+                        : CxxErrorsAreInsideWrapper(
+                            failedDiagnostics.empty() ? probeError : failedDiagnostics,
+                            failedSourcePath, failedSource, wrapperSource);
+                    // A generated ctor candidate is a closed request: an instantiated ctor-body
+                    // error rejects this exact argument/type pair, and the key includes headers.
+                    if (!*failureInsideWrapper && wrapperName.starts_with("__cflat_ctor_")
+                        && !requestDiagnostics.empty())
+                        *failureInsideWrapper = true;
+                }
                 return false;
             }
             auto findWrapper = [&](const cflat_cinterop::ExtractResult& raw)
@@ -9576,6 +9759,17 @@ bool LLVMBackend::RequestGeneratedCxxWrapperUncached(const CxxRequestGroup& grou
                 pendingCxxWrapperCause_ = requestDiagnostics;
                 pendingCxxWrapperNoViableAtRequest_ = !probe.firstError.empty()
                     && probe.firstErrorNoViableAtRequest;
+                if (failureInsideWrapper != nullptr)
+                {
+                    *failureInsideWrapper = incrementalLocationChecked
+                        ? incrementalErrorsInsideWrapper
+                        : CxxErrorsAreInsideWrapper(
+                            failedDiagnostics.empty() ? probe.firstError : failedDiagnostics,
+                            failedSourcePath, failedSource, wrapperSource);
+                    if (!*failureInsideWrapper && wrapperName.starts_with("__cflat_ctor_")
+                        && !requestDiagnostics.empty())
+                        *failureInsideWrapper = true;
+                }
                 if (probeSig != nullptr && !probeSig->refusalCause.empty())
                     pendingCxxWrapperCause_ += "\n" + probeSig->refusalCause;
                 return false;
@@ -10093,7 +10287,9 @@ bool LLVMBackend::EmitCxxImplicitArgumentConversions(
                 if (groupIt == cxxFunctionOwnerGroup_.end()) continue;
                 groupIndex = groupIt->second;
             }
-            CxxRequestGroup group = MakeCxxRequestGroup(groupIndex, {});
+            CxxRequestGroup group = (candidate.instanceMember || candidate.staticMember)
+                ? MakeCxxClassRequestGroup(groupIndex, candidate.ownerType)
+                : MakeCxxRequestGroup(groupIndex, {});
             if (group.headers.empty()) continue;
             CxxRequestGroupScope groupScope(*this, &group);
             CSigEntry bound;
@@ -10221,7 +10417,7 @@ bool LLVMBackend::TryBindCxxImplicitDefaultCtor(const std::string& typeName, std
             error = "the C++ class's import group is unavailable";
             return false;
         }
-        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, {});
+        CxxRequestGroup group = MakeCxxClassRequestGroup(groupIt->second, typeName);
         if (group.headers.empty())
         {
             error = "the C++ class's import group is unavailable";
@@ -10310,7 +10506,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::TryBindCxxGeneratedMoveC
         if (!CxxSpellingForCflatType(typeName, ownerSpelling)) return nullptr;
         auto groupIt = cxxTypeOwnerGroup_.find(typeName);
         if (groupIt == cxxTypeOwnerGroup_.end()) return nullptr;
-        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, {});
+        CxxRequestGroup group = MakeCxxClassRequestGroup(groupIt->second, typeName);
         if (group.headers.empty()) return nullptr;
 
         const uint64_t hash = HashWrapperKey(typeName + "|generated-move-ctor|" + ownerSpelling);
@@ -10369,7 +10565,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::RequestCxxXvalueTransfer
             return &known->second;
         auto groupIt = cxxTypeOwnerGroup_.find(typeName);
         CxxRequestGroup group = groupIt == cxxTypeOwnerGroup_.end()
-            ? CxxRequestGroup{} : MakeCxxRequestGroup(groupIt->second, {});
+            ? CxxRequestGroup{} : MakeCxxClassRequestGroup(groupIt->second, typeName);
         if (group.headers.empty())
         {
             refusal = "the C++ class's import group is unavailable";
@@ -13836,7 +14032,9 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             error = "the C++ declaration's import group is unavailable";
             return false;
         }
-        CxxRequestGroup group = MakeCxxRequestGroup(groupIndex, {});
+        CxxRequestGroup group = ownerType.empty()
+            ? MakeCxxRequestGroup(groupIndex, {})
+            : MakeCxxClassRequestGroup(groupIndex, ownerType);
         if (group.headers.empty())
         {
             error = "the C++ declaration's import group is unavailable";
@@ -14331,8 +14529,16 @@ bool LLVMBackend::RequestCxxBraceConstructor(
                     std::vector<std::string> candidateTypes;
                     for (const auto& candidate : selectorCandidates)
                         candidateTypes.push_back(TrimCxxBraceType(StripCxxRefAndCv(candidate.params[i])));
-                    one = CxxBraceSelectorElement(arguments[i], candidateTypes);
                     const NamedVariable& arg = arguments[i];
+                    one = CxxBraceSelectorElement(arg, candidateTypes);
+                    if (IsNullPointerConstantArgument(arg, true))
+                    {
+                        if (arg.IsCxxMacroGlobal && !arg.CallerName.empty())
+                            one = arg.CallerName;
+                        else if (std::string zero = CxxZeroLiteralSpelling(arg.LiteralIdentity);
+                                 !zero.empty())
+                            one = zero;
+                    }
                     std::string spelling;
                     auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
                     // A string literal ranks as the `const char[N]` lvalue it is in C++.
@@ -14614,7 +14820,7 @@ bool LLVMBackend::RequestCxxBraceConstructor(
             error = "the C++ class's import group is unavailable";
             return false;
         }
-        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, {});
+        CxxRequestGroup group = MakeCxxClassRequestGroup(groupIt->second, typeName);
         if (group.headers.empty())
         {
             error = "the C++ class's import group is unavailable";
@@ -14688,9 +14894,13 @@ bool LLVMBackend::RequestCxxBraceConstructor(
 
 // Typed C++ constant text for a compile-time constant scalar brace element, else empty.
 static std::string DirectBraceConstantText(const LLVMBackend::NamedVariable& element,
-                                           const std::string& spelling)
+                                           const std::string& spelling, bool nullConstant)
 {
         if (element.TypeAndValue.Pointer || element.Primary == nullptr) return {};
+        if (nullConstant && llvm::isa_and_nonnull<llvm::ConstantInt>(element.Primary)
+            && llvm::cast<llvm::ConstantInt>(element.Primary)->isZero())
+            if (std::string zero = CxxZeroLiteralSpelling(element.LiteralIdentity); !zero.empty())
+                return zero;
         if (auto* constantInt = llvm::dyn_cast<llvm::ConstantInt>(element.Primary))
         {
             const unsigned bits = constantInt->getBitWidth();
@@ -14789,7 +14999,7 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             error = "the C++ class's import group is unavailable";
             return false;
         }
-        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, {});
+        CxxRequestGroup group = MakeCxxClassRequestGroup(groupIt->second, typeName);
         if (group.headers.empty())
         {
             error = "the C++ class's import group is unavailable";
@@ -14833,7 +15043,8 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             // constant-expression narrowing rule (`short{1}` fits) instead of the variable one.
             std::string constant = elements[i].CxxImportedLiteral;
             if (constant.empty())
-                constant = DirectBraceConstantText(elements[i], parameterTypes[i + 1]);
+                constant = DirectBraceConstantText(elements[i], parameterTypes[i + 1],
+                    IsNullPointerConstantArgument(elements[i], true));
             if (!constant.empty())
             {
                 size_t at = 0;
@@ -14919,6 +15130,119 @@ bool LLVMBackend::CxxCtorForwardsScalarReference(const std::string& typeName,
             }
         }
         return false;
+}
+
+/*
+ * Ruling 2026-09-04: no implicit narrowing at a call argument (int -> bool the one exception), also
+ * where clang accepts. A clang-resolved constructor call is judged on the constructor C++ selects:
+ * the listed candidates are ranked by [over.match.best] (the free-function ranking), and when one
+ * wins outright, each scalar argument's conversion into its parameter (for a const T& parameter,
+ * the materialized temporary's) goes through the scalar table. Empty when nothing narrows or the
+ * ranking cannot decide (a template, variadic, inherited or unranked candidate, a tie); clang then
+ * resolves and CxxCtorSetRequiresNarrowing stays the guard.
+ */
+std::string LLVMBackend::CxxCtorSelectedNarrowingError(const std::string& typeName,
+                                                       const std::vector<NamedVariable>& argVars)
+{
+        if (argVars.empty()) return {};
+        const CxxClassInfo* info = GetCxxClassInfoWithConstructors(typeName);
+        if (info == nullptr || info->hasCtorTemplate) return {};
+        const auto raw = cxxRecordEntries_.find(typeName);
+        if (raw == cxxRecordEntries_.end() || !raw->second.ctorTemplates.empty()) return {};
+        for (const auto& member : raw->second.members)
+            if (member.kind == cflat_cinterop::RawCxxMember::Constructor
+                && (member.variadic || member.requiresConstructorWrapper))
+                return {};
+        const auto isPointerArg = [](const NamedVariable& arg) {
+            return arg.TypeAndValue.Pointer || arg.TypeAndValue.ElemPointer || arg.IsStringLiteral;
+        };
+        // The value a scalar reference parameter binds, `const T&` included.
+        const auto referent = [](TypeAndValue param) {
+            if (param.Pointer && !param.ElemPointer && !param.IsCxxRefToPointer && param.IsCxxConstRef)
+                param.IsAlias = true;
+            return ScalarArgumentReferent(param);
+        };
+        struct Ranked
+        {
+            const CxxClassInfo::Structor* ctor = nullptr;
+            std::vector<CxxConversionRank> ranks;
+        };
+        std::vector<Ranked> viable;
+        for (const CxxClassInfo::Structor& ctor : info->constructors)
+        {
+            // A copy/move constructor takes a scalar only through a user-defined conversion,
+            // which never outranks a standard one. A deleted candidate still competes.
+            if (ctor.params.empty() || ctor.isCopyCtor || ctor.isMoveCtor) continue;
+            const size_t paramCount = ctor.params.size() - 1;
+            if (argVars.size() > paramCount) continue;
+            bool fits = true;
+            for (size_t i = argVars.size(); fits && i < paramCount; ++i)
+                fits = i + 1 < ctor.defaultArgs.size() && !ctor.defaultArgs[i + 1].kind.empty();
+            for (size_t i = 0; fits && i < argVars.size(); ++i)
+            {
+                const bool pointerParam = referent(ctor.params[i + 1]).Pointer;
+                fits = pointerParam == isPointerArg(argVars[i])
+                    || (pointerParam && IsNullPointerConstantArgument(argVars[i], true));
+            }
+            if (!fits) continue;
+            FunctionSymbol sym;
+            sym.IsCxx = true;
+            sym.IsMethod = true;
+            sym.UniqueName = ctor.linkageName;
+            sym.Parameters = ctor.params;
+            sym.Parameters[0].VariableName = "this";
+            sym.Parameters[0].TypeName = typeName;
+            // A scalar `const T&` binds the temporary the argument converts into: its sequence
+            // ranks as that conversion ([over.ics.ref]), so the by-value referent stands in.
+            for (size_t i = 1; i < sym.Parameters.size(); ++i)
+            {
+                const TypeAndValue& p = sym.Parameters[i];
+                if (!p.Pointer || p.ElemPointer || p.IsCxxRefToPointer || !p.IsCxxConstRef
+                    || p.IsRvalueRef)
+                    continue;
+                TypeAndValue value = referent(p);
+                if (!value.Pointer && (value.IsInteger() != -1 || value.IsFloatingPoint() != -1
+                                       || value.TypeName == "bool"))
+                    sym.Parameters[i] = std::move(value);
+            }
+            std::vector<NamedVariable> args(1);
+            args[0].TypeAndValue.TypeName = typeName;
+            args.insert(args.end(), argVars.begin(), argVars.end());
+            std::vector<CxxConversionRank> ranks = RankCxxConversionSequences(args, sym);
+            if (ranks.empty()) return {};
+            ranks.erase(ranks.begin());   // the implicit object is common to every candidate
+            if (ranks.size() != argVars.size()) return {};
+            for (const CxxConversionRank& r : ranks)
+                if (r.rank < 0 || r.rank > 2) return {};
+            viable.push_back({ &ctor, std::move(ranks) });
+        }
+        const Ranked* best = nullptr;
+        for (const Ranked& x : viable)
+        {
+            bool wins = true;
+            for (const Ranked& y : viable)
+            {
+                bool crossing = false;
+                if (&x != &y && CompareCxxConversionRanks(x.ranks, y.ranks, crossing) != -1)
+                    wins = false;
+            }
+            if (wins) { best = &x; break; }
+        }
+        if (best == nullptr || best->ctor->isDeleted) return {};
+        for (size_t i = 0; i < argVars.size(); ++i)
+        {
+            const TypeAndValue param = referent(best->ctor->params[i + 1]);
+            const ScalarArgConversion conv = ClassifyScalarArgConversion(argVars[i], param);
+            if (conv != ScalarArgConversion::Narrow && conv != ScalarArgConversion::EnumMismatch)
+                continue;
+            const std::string from = !best->ranks[i].from.empty() ? best->ranks[i].from
+                : !argVars[i].TypeAndValue.TypeName.empty() ? argVars[i].TypeAndValue.TypeName
+                : argVars[i].LiteralIdentity;
+            return std::format("constructor that C++ selects for these arguments narrows argument {} "
+                               "from '{}' to '{}' (no implicit narrowing at a call); cast it explicitly",
+                               i + 1, from, param.TypeName);
+        }
+        return {};
 }
 
 bool LLVMBackend::CxxConstructorNeedsClangResolution(
@@ -15060,6 +15384,11 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         // clang never lists (std::optional's converting ctor). Try the wrapper anyway, but report
         // nothing when it fails so the caller keeps its own overload diagnostic.
         bool declaredWrapperCtor = hasVariadicCtor(typeName, seen);
+        if (!declaredWrapperCtor && copyInit && arguments.size() == 1
+            && !arguments.front().TypeAndValue.Pointer
+            && IsCxxRecord(arguments.front().TypeAndValue.TypeName)
+            && HasImplicitClassConversionOperator(arguments.front().TypeAndValue.TypeName))
+            declaredWrapperCtor = true;
         bool forwardsScalarReference = false;
         auto giveUp = [&](const char* why) {
             if (declaredWrapperCtor) error = why;
@@ -15149,12 +15478,8 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         // type (a zero macro folds to a constant, so its declared type is the key), else empty.
         const auto nullConstantSpelling = [&](const NamedVariable& arg) -> std::string {
             if (!IsNullPointerConstantArgument(arg, true)) return {};
-            static const std::map<std::string, std::string> kZeroLiterals = {
-                { "int", "0" }, { "u32", "0u" }, { "long", "0L" }, { "ulong", "0UL" },
-                { "i64", "0LL" }, { "u64", "0ULL" } };
-            const auto it = kZeroLiterals.find(arg.IsCxxMacroGlobal ? arg.TypeAndValue.TypeName
-                                                                    : arg.LiteralIdentity);
-            return it != kZeroLiterals.end() ? it->second : std::string();
+            return CxxZeroLiteralSpelling(arg.IsCxxMacroGlobal ? arg.TypeAndValue.TypeName
+                                                               : arg.LiteralIdentity);
         };
         for (size_t i = 0; i < arguments.size(); ++i)
         {
@@ -15544,7 +15869,8 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             collectArgumentGroups(collectArgumentGroups, cflatTypeOf(argument));
         std::vector<size_t> dependencyGroups(generatedDependencyGroups.begin(),
                                              generatedDependencyGroups.end());
-        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, dependencyGroups);
+        CxxRequestGroup group = MakeCxxClassRequestGroup(groupIt->second, typeName,
+                                                          dependencyGroups);
         if (group.headers.empty())
         {
             return giveUp("the C++ class's import group is unavailable");
@@ -15654,7 +15980,7 @@ bool LLVMBackend::RequestCxxOperatorArrow(const std::string& typeName, std::stri
             error = "the C++ class's import group is unavailable";
             return false;
         }
-        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, {});
+        CxxRequestGroup group = MakeCxxClassRequestGroup(groupIt->second, typeName);
         if (group.headers.empty())
         {
             error = "the C++ class's import group is unavailable";
@@ -17476,7 +17802,7 @@ bool LLVMBackend::TryRequestCxxType(const std::string& baseName,
                                              cflatName, spellingIt->second);
                 if (ownerIt != cxxTypeOwnerGroup_.end())
                 {
-                    CxxRequestGroup group = MakeCxxRequestGroup(ownerIt->second, {});
+                    CxxRequestGroup group = MakeCxxClassRequestGroup(ownerIt->second, cflatName);
                     if (!group.headers.empty())
                     {
                         CxxRequestGroupScope groupScope(*this, &group);
@@ -17505,7 +17831,7 @@ bool LLVMBackend::TryRequestCxxType(const std::string& baseName,
                 if (spellingIt != cxxCflatToCxxSpelling_.end()
                     && ownerIt != cxxTypeOwnerGroup_.end())
                 {
-                    CxxRequestGroup group = MakeCxxRequestGroup(ownerIt->second, {});
+                    CxxRequestGroup group = MakeCxxClassRequestGroup(ownerIt->second, cflatName);
                     if (!group.headers.empty())
                     {
                         CxxRequestGroupScope groupScope(*this, &group);
@@ -18545,6 +18871,8 @@ bool LLVMBackend::ExtractCSignatures(const std::string& cSourcePath, const std::
             CHeaderDep dep;
             dep.path  = inc;
             dep.mtime = (int64_t)dm.time_since_epoch().count();
+            dep.hashTime = (int64_t)std::filesystem::file_time_type::clock::now()
+                               .time_since_epoch().count();
             HashFileFnv1a(inc, dep.hash);
             entry.deps.push_back(std::move(dep));
         }
@@ -19974,7 +20302,7 @@ void LLVMBackend::CompleteCxxRecordSpecialMembers(const std::string& typeName)
         };
         collect(collect, typeName);
         llvm::TimeTraceScope scope("CxxCompleteSpecialMembersRequest", typeName);
-        CxxRequestGroup group = MakeCxxRequestGroup(ownerGroup, {});
+        CxxRequestGroup group = MakeCxxClassRequestGroup(ownerGroup, typeName);
         CxxRequestGroupScope groupScope(*this, &group);
         // The extractor finds each record by its CFlat identity; the marker is a placeholder.
         std::vector<CxxRequestItem> items;
@@ -21264,7 +21592,7 @@ llvm::Value* LLVMBackend::EmitCxxClangBaseConversion(const std::string& derived,
             std::string refusal;
             auto groupIt = cxxTypeOwnerGroup_.find(derived);
             CxxRequestGroup group = groupIt == cxxTypeOwnerGroup_.end()
-                ? CxxRequestGroup{} : MakeCxxRequestGroup(groupIt->second, {});
+                ? CxxRequestGroup{} : MakeCxxClassRequestGroup(groupIt->second, derived);
             if (group.headers.empty())
                 refusal = "the C++ class's import group is unavailable";
             else
@@ -22198,6 +22526,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 }
                 key += "|" + t;
             }
+            // `f(int)` and `f(int, ...)` are distinct overloads (both reach C++ ranking).
+            if (m.variadic) key += "|va";
             return key;
         };
         auto directMethodKey = [](const Member& m) {
@@ -22285,7 +22615,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
          * the overload rather than on its class.
          */
         auto hasReachableSymbol = [](const Member& m) {
-            return m.bindRefusal.empty() && !m.isDeleted && !m.variadic
+            return m.bindRefusal.empty() && !m.isDeleted && (!m.variadic || m.isInline)
                 && !m.requiresConstructorWrapper && !m.needsLocalDefinition
                 && m.abi.valid && !m.linkageName.empty();
         };
@@ -22433,9 +22763,14 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             }
             // Constructor templates are retained for the on-demand wrapper path. Report them
             // only when they are ordinary members that cannot use that path.
-            if (m.variadic || m.requiresConstructorWrapper)
+            if (m.variadic && !m.isInline)
             {
                 if (m.kind != Member::Constructor) refuse("is variadic");
+                continue;
+            }
+            if (m.requiresConstructorWrapper
+                || (m.variadic && m.kind == Member::Constructor))
+            {
                 continue;
             }
             /*
@@ -22658,7 +22993,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             const auto registerDefaultArityWrapper = [&](const std::vector<TypeAndValue>& prefix,
                                                          size_t n) -> bool
             {
-                if (m.linkageName.empty() || m.defaultArgs.size() != m.paramTypes.size()) return false;
+                if (m.variadic || m.linkageName.empty()
+                    || m.defaultArgs.size() != m.paramTypes.size()) return false;
                 if (m.kind != Member::Instance && m.kind != Member::StaticMethod) return false;
                 if (n >= m.defaultArgs.size() || m.defaultArgs[n].kind == "unsupported") return false;
                 if (!HasNonConstDefaultSuffix(m.defaultArgs, n)) return false;
@@ -22816,7 +23152,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             {
                 CInteropDeclarationScope declaringFile(*this, m.file.empty() ? fileForLsp : m.file);
                 CxxAbiPlanScope abiPlan(*this, &m.abi, &abiMismatch);
-                CreateFunctionDeclaration(regName, ret, params, /*external=*/true, /*varargs=*/false,
+                CreateFunctionDeclaration(regName, ret, params, /*external=*/true, m.variadic,
                                           /*returnsOwned=*/false,
                                           /*isMethod=*/m.kind == Member::Instance,
                                           CallingConv::Cdecl, m.linkageName, /*isCxx=*/true,
@@ -23045,7 +23381,7 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
         {
             auto ownerIt = cxxTypeOwnerGroup_.find(typeName);
             if (ownerIt == cxxTypeOwnerGroup_.end()) return false;
-            CxxRequestGroup group = MakeCxxRequestGroup(ownerIt->second, {});
+            CxxRequestGroup group = MakeCxxClassRequestGroup(ownerIt->second, typeName);
             if (group.headers.empty()) return false;
             CxxRequestGroupScope groupScope(*this, &group);
             std::set<std::string> requestedSpellings;
@@ -23148,7 +23484,7 @@ bool LLVMBackend::TryBindRefusedCxxMember(const std::string& typeName,
             if (spellingIt == cxxCflatToCxxSpelling_.end()
                 || ownerIt == cxxTypeOwnerGroup_.end())
                 return false;
-            CxxRequestGroup group = MakeCxxRequestGroup(ownerIt->second, {});
+            CxxRequestGroup group = MakeCxxClassRequestGroup(ownerIt->second, typeName);
             if (group.headers.empty()) return false;
             CxxRequestGroupScope groupScope(*this, &group);
             // The missing body may return or take a class-template specialization that the
@@ -24373,11 +24709,14 @@ void LLVMBackend::RegisterCMacros(const std::vector<CMacroEntry>& macros)
             }
             CreateGlobalVariable(tv, c);
             cxxMacroGlobalNames_.insert(m.name);
-            // A folded zero is insufficient: C++ requires an integer literal zero here.
+            // The set also tracks imported C pointer-valued NULL macros whose C++ expansion
+            // is not preserved by the C-side value import.
             static const std::set<std::string> kZeroMacroTypes = { "int", "u32", "long", "ulong", "i64", "u64" };
             if (m.isIntegerLiteralZero && !m.isFloat && !m.isString && !m.isPointer && !m.isFuncPtr
                 && kZeroMacroTypes.count(tv.TypeName) != 0
                 && c != nullptr && c->getType()->isIntegerTy() && c->isNullValue())
+                cxxZeroIntegerMacroNames_.insert(m.name);
+            else if (m.isIntegerLiteralZero && m.isPointer && c != nullptr && c->isNullValue())
                 cxxZeroIntegerMacroNames_.insert(m.name);
             ++registered;
 
@@ -25208,7 +25547,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         bool haveHash = false;
         // Content hashes this call already has (the headers below, then the included files the
         // extraction's namespace scan hashed from clang's buffers).
-        std::unordered_map<std::string, uint64_t> knownHashes;
+        std::unordered_map<std::string, std::pair<uint64_t, int64_t>> knownHashes;
         auto hashNow = [&]() -> uint64_t {
             if (!haveHash)
             {
@@ -25219,7 +25558,9 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     const bool hashed = cppMode
                         ? HashCxxHeaderFileContents(rp, h, /*force*/ true)
                         : HashFileContents(rp, h);
-                    if (hashed) knownHashes.emplace(rp, h);
+                    if (hashed) knownHashes.emplace(rp, std::pair<uint64_t, int64_t>{h,
+                        (int64_t)std::filesystem::file_time_type::clock::now()
+                            .time_since_epoch().count()});
                     currentHash ^= h; currentHash *= 1099511628211ULL;
                 }
                 haveHash = true;
@@ -25611,7 +25952,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             cxxEarlyClosureDeps_.clear();
             hashNow();
             includeHashSink_ = wantDeps ? &knownHashes : nullptr;
-            struct SinkReset { std::unordered_map<std::string, uint64_t>*& sink;
+            struct SinkReset { std::unordered_map<std::string, std::pair<uint64_t, int64_t>>*& sink;
                                ~SinkReset() { sink = nullptr; } } sinkReset{includeHashSink_};
             if (!ExtractCHeaderClang(realPaths, sigs, enums, records, macros, funcMacros, globals,
                                      aliases, typeAliases, extraDefines, &includes,
@@ -26578,6 +26919,19 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::FindCxxMoveCtor(const st
  * The listed pick, with every pick whose body fails to instantiate refused and the selection
  * re-run without it, as a request-time refusal did before bodies moved to demand.
  */
+std::string LLVMBackend::CxxCtorNoMatchReason(const std::vector<TypeAndValue>& argTypes) const
+{
+        // Name the argument types: with several same-arity overloads, "no match" alone does not say
+        // which argument is the problem.
+        std::string args;
+        for (const auto& a : argTypes)
+        {
+            if (!args.empty()) args += ", ";
+            args += "'" + SpellType(*this, a) + "'";
+        }
+        return std::format("has no constructor whose parameter types match these arguments ({})", args);
+}
+
 const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
         const std::string& typeName, const std::vector<TypeAndValue>& argTypes,
         std::string& why, bool allowNumericConversions,
@@ -27001,6 +27355,17 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     { ok = false; break; }
                     if (nullptrKind == 1) ++exact;
                     continue;
+                }
+                // std::nullptr_t is represented by void*, but a pointer object is not a null
+                // pointer constant. Preserve an actual nullptr_t variable; reject other pointers.
+                if (spelledNullptrT(c, i + 1) != 0
+                    && argVars != nullptr && i < argVars->size()
+                    && ((*argVars)[i].TypeAndValue.Pointer
+                        || (*argVars)[i].TypeAndValue.IsFunctionPointer)
+                    && !(*argVars)[i].TypeAndValue.IsCxxNullptrT)
+                {
+                    ok = false;
+                    break;
                 }
                 if (want.IsFunctionPointer && !got.IsFunctionPointer && got.IsInteger() != -1)
                 {
@@ -27454,15 +27819,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
             why = blockedWhy;
             return nullptr;
         }
-        // Name the argument types: with several same-arity overloads, "no match" alone does not say
-        // which argument is the problem.
-        std::string args;
-        for (const auto& a : argTypes)
-        {
-            if (!args.empty()) args += ", ";
-            args += "'" + SpellType(*this, a) + "'";
-        }
-        why = std::format("has no constructor whose parameter types match these arguments ({})", args);
+        why = CxxCtorNoMatchReason(argTypes);
         return nullptr;
     }
 
@@ -27643,19 +28000,22 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
         TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
         argType.IsScopedEnum = argType.IsScopedEnum || IsScopedEnumTypeName(argType.TypeName);
         if (argType.TypeName.empty()) return CxxArgConversion::NotApplicable;
-        // Constructor templates are absent from the extracted list, so ask clang to prove this
-        // class-to-class user-defined sequence before ranking a C++ value/rvalue parameter.
         const size_t sourceTemplate = argType.TypeName.find('$');
         const size_t targetTemplate = param.TypeName.find('$');
         const bool bothTemplateSpecializations = sourceTemplate != std::string::npos
             && targetTemplate != std::string::npos;
+        const bool plainClassPair = sourceTemplate == std::string::npos
+            && targetTemplate == std::string::npos;
+        // Constructor templates are absent from the extracted list, so ask clang to prove this
+        // class-to-class user-defined sequence before ranking a C++ value/rvalue parameter.
         // A lone candidate's `const X&` / `X&&` binds the converted temporary too ([dcl.init.ref]).
         if ((allowTemplateClassConversion || param.IsRvalueRef || param.IsCxxConstRef)
-            && bothTemplateSpecializations && IsCxxRecord(argType.TypeName)
+            && IsCxxRecord(argType.TypeName)
             && (cxxByValueParam || param.IsRvalueRef || param.IsCxxConstRef))
         {
             const CxxClassInfo* target = GetCxxClassInfoWithConstructors(param.TypeName);
-            if (target != nullptr && target->hasCtorTemplate)
+            if (target != nullptr && target->hasCtorTemplate
+                && (bothTemplateSpecializations || plainClassPair))
             {
                 NamedVariable probe = arg;
                 probe.TypeAndValue = argType;
@@ -27768,8 +28128,14 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
         // argument (a class argument keeps the C++-side call path) - a speculative clang request
         // re-registers the class. The probe copy-initializes: an explicit ctor never converts.
         const auto* info = GetCxxClassInfoWithConstructors(param.TypeName);
+        const bool plainClassReferenceCtor
+            = (param.IsRvalueRef || param.IsCxxConstRef)
+                && argType.TypeName.find('$') == std::string::npos
+                && param.TypeName.find('$') == std::string::npos;
         if (info == nullptr || (!info->constructors.empty()
-                                && !(info->hasCtorTemplate && !IsCxxRecord(argType.TypeName))))
+                                && !(info->hasCtorTemplate
+                                     && (!IsCxxRecord(argType.TypeName)
+                                         || plainClassReferenceCtor))))
             return CxxArgConversion::NotApplicable;
         NamedVariable probe = arg;
         probe.TypeAndValue = argType;
@@ -27795,9 +28161,17 @@ bool LLVMBackend::IsCxxConvertingTemporaryForRvalueRef(const NamedVariable& arg,
                                                        bool allowTemplateClassConversion)
 {
         if (!param.IsRvalueRef || !param.Pointer || param.ElemPointer || param.IsCxxRefToPointer
-            || param.TypeName.empty() || !IsCxxRecord(param.TypeName))
+            || param.TypeName.empty())
             return false;
         const TypeAndValue argType = InferImplicitCxxArgumentType(arg, *this);
+        TypeAndValue scalarReferent = param;
+        scalarReferent.Pointer = scalarReferent.IsAlias = scalarReferent.IsRvalueRef = false;
+        scalarReferent.PointerDepth = 0;
+        if (!argType.Pointer && scalarReferent.IsPrimitive() && argType.IsPrimitive()
+            && ClassifyScalarArgConversion(arg, scalarReferent) == ScalarArgConversion::Widen
+            && IsProvenCxxScalarLvalue(arg))
+            return true; // standard conversion creates the rvalue; it does not move the source
+        if (!IsCxxRecord(param.TypeName)) return false;
         // A reference-related lvalue (same class or a derived one) binds directly or not at all.
         if (!argType.Pointer && !argType.TypeName.empty()
             && (argType.TypeName == param.TypeName
@@ -28221,10 +28595,14 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
             && CxxConversionOperatorBindsBetter(argType.TypeName, param.TypeName);
         const size_t sourceTemplate = argType.TypeName.find('$');
         const size_t targetTemplate = param.TypeName.find('$');
+        const bool bothTemplateSpecializations = sourceTemplate != std::string::npos
+            && targetTemplate != std::string::npos;
+        const bool plainClassPair = sourceTemplate == std::string::npos
+            && targetTemplate == std::string::npos;
         const bool classTemplateConversion
             = (allowTemplateClassConversion || param.IsRvalueRef || param.IsCxxConstRef)
             && info != nullptr && info->hasCtorTemplate
-            && sourceTemplate != std::string::npos && targetTemplate != std::string::npos
+            && (bothTemplateSpecializations || plainClassPair)
             && IsCxxRecord(argType.TypeName);
         // Only an `operator X()` converts a class source into a reference parameter (above).
         const bool operatorOnly = ctor == nullptr && !slicesToBase && !argType.Pointer
@@ -28354,18 +28732,27 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
 
 bool LLVMBackend::HasImplicitClassConversionOperator(const std::string& sourceType)
 {
-        EnsureCxxRecordProjected(sourceType, false);
-        auto record = cxxRecordEntries_.find(sourceType);
-        if (record == cxxRecordEntries_.end()) return false;
-        for (const auto& member : record->second.members)
-        {
-            if (!member.isConversion || member.isExplicit || member.isDeleted) continue;
-            TypeAndValue returnType;
-            if (MapCTypeToTypeAndValue(member.retType, returnType, /*cxxBoundary*/ true)
-                && !returnType.IsPrimitive() && !returnType.Pointer && !returnType.ElemPointer)
-                return true;
-        }
-        return false;
+        std::set<std::string> visited;
+        auto hasOperator = [&](auto&& self, const std::string& type) -> bool {
+            if (!visited.insert(type).second) return false;
+            EnsureCxxRecordProjected(type, false);
+            auto record = cxxRecordEntries_.find(type);
+            if (record == cxxRecordEntries_.end()) return false;
+            for (const auto& member : record->second.members)
+            {
+                if (!member.isConversion || member.isExplicit || member.isDeleted) continue;
+                TypeAndValue returnType;
+                if (MapCTypeToTypeAndValue(member.retType, returnType, /*cxxBoundary*/ true)
+                    && !returnType.IsPrimitive() && !returnType.ElemPointer
+                    && (!returnType.Pointer || returnType.IsAlias))
+                    return true;
+            }
+            for (const auto& base : record->second.bases)
+                if (base.access == cflat_cinterop::AccessPublic && self(self, base.name))
+                    return true;
+            return false;
+        };
+        return hasOperator(hasOperator, sourceType);
 }
 
 /*
@@ -28391,7 +28778,7 @@ bool LLVMBackend::HasImplicitClassPointerConversion(const std::string& sourceTyp
             return false;
         auto groupIt = cxxTypeOwnerGroup_.find(sourceType);
         if (groupIt == cxxTypeOwnerGroup_.end()) return false;
-        CxxRequestGroup group = MakeCxxRequestGroup(groupIt->second, {});
+        CxxRequestGroup group = MakeCxxClassRequestGroup(groupIt->second, sourceType);
         if (group.headers.empty()) return false;
         const std::string target = (pointeeConst ? "const " : "") + pointeeSpelling + " *";
         const std::string wrapperName = std::format("__cflat_xvptr_{:016x}",
@@ -28405,6 +28792,55 @@ bool LLVMBackend::HasImplicitClassPointerConversion(const std::string& sourceTyp
         answer = RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName,
                                             "XVALUE_POINTER_CONVERSION", signature, error);
         return answer;
+}
+
+llvm::Value* LLVMBackend::ConvertCxxXvalueToPointer(const NamedVariable& source,
+                                                     const TypeAndValue& pointerType)
+{
+        const std::string sourceType = source.TypeAndValue.TypeName;
+        if (source.TypeAndValue.Pointer || !IsCxxRecord(sourceType)
+            || !pointerType.Pointer || pointerType.TypeName.empty())
+            return nullptr;
+        std::string sourceSpelling;
+        std::string pointeeSpelling;
+        if (!CxxSpellingForCflatType(sourceType, sourceSpelling)
+            || !CxxSpellingForCflatType(pointerType.TypeName, pointeeSpelling))
+            return nullptr;
+        const bool pointeeConst = pointerType.IsCxxPointeeConst;
+        const std::string key = sourceType + "|" + pointerType.TypeName
+            + (pointeeConst ? "|const" : "|");
+        auto owner = cxxTypeOwnerGroup_.find(sourceType);
+        if (owner == cxxTypeOwnerGroup_.end()) return nullptr;
+        CxxRequestGroup group = MakeCxxClassRequestGroup(owner->second, sourceType);
+        if (group.headers.empty()) return nullptr;
+        const std::string target = (pointeeConst ? "const " : "") + pointeeSpelling + " *";
+        const std::string wrapperName = std::format("__cflat_xvptr_{:016x}",
+            HashWrapperKey(key + "|xvalue-pointer-conversion|" + sourceSpelling + "|" + target));
+        const std::string wrapperSource = "extern \"C\" __attribute__((weak)) " + target + " "
+            + wrapperName + "(" + sourceSpelling + " * p0) { return static_cast<" + sourceSpelling
+            + " &&>(*p0); }\n";
+        CxxRequestGroupScope groupScope(*this, &group);
+        CSigEntry signature;
+        std::string error;
+        if (!RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName,
+                                        "XVALUE_POINTER_CONVERSION", signature, error))
+            return nullptr;
+        signature.name = wrapperName;
+        RegisterCSignatures({ signature }, group.headers.front());
+        llvm::Function* function = GetFunction(wrapperName);
+        if (function == nullptr) return nullptr;
+        llvm::Value* storage = source.Storage;
+        if (storage == nullptr)
+        {
+            llvm::Type* valueType = source.BaseType != nullptr
+                ? source.BaseType : GetType(source.TypeAndValue);
+            if (valueType == nullptr || !valueType->isSized()) return nullptr;
+            storage = AllocaAtEntry(valueType, nullptr, "cxx.xvalue.pointer");
+            llvm::Value* value = source.Primary != nullptr ? source.Primary : LoadArgStorage(source);
+            if (value == nullptr) return nullptr;
+            builder->CreateStore(value, storage);
+        }
+        return builder->CreateCall(function, { storage }, "cxx.xvalue.pointer.result");
 }
 
 LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCtor(
@@ -28442,6 +28878,31 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
             return CxxConvertingCtorResult::Converted;
         }
         // A copy-initialized slot is the by-value parameter shape of the call-argument position.
+        // When the source has an implicit conversion operator, let clang resolve the whole
+        // copy-initialization sequence before the listed constructor fast path can choose one.
+        const TypeAndValue conversionSourceType = InferImplicitCxxArgumentType(source, *this);
+        if (!source.TypeAndValue.Pointer && IsCxxRecord(conversionSourceType.TypeName)
+            && HasImplicitClassConversionOperator(conversionSourceType.TypeName)
+            && conversionSourceType.TypeName != targetType && IsCxxRecord(targetType))
+        {
+            NamedVariable probe = source;
+            probe.TypeAndValue = conversionSourceType;
+            probe.TypeAndValue.VariableName.clear();
+            std::string wrapperName;
+            std::string wrapperError;
+            if (RequestCxxVariadicConstructor(targetType, { probe }, wrapperName, wrapperError,
+                                              /*copyInit*/ true))
+            {
+                ConstructThroughCxxCtorWrapper(source, probe, targetType, wrapperName, intoSlot);
+                return CxxConvertingCtorResult::Converted;
+            }
+            if (!wrapperError.empty())
+            {
+                refusal = wrapperError;
+                return CxxConvertingCtorResult::Refused;
+            }
+        }
+
         TypeAndValue param;
         param.TypeName = targetType;
         switch (ClassifyCxxImplicitArgument(source, param, /*cxxByValueParam*/ true,
@@ -29283,10 +29744,12 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
         if (ambiguous != nullptr) *ambiguous = false;
         if (sourceTypeName.empty() || dest.TypeName.empty() || dest.TypeName == "void") return {};
         if (sourceTypeName == dest.TypeName) return {};
-        if (dest.Pointer || dest.ElemPointer || dest.IsArrayView || dest.IsInterface
+        const bool classReferenceTarget = dest.IsAlias && IsCxxRecord(dest.TypeName);
+        if ((dest.Pointer && !classReferenceTarget) || dest.ElemPointer
+            || dest.IsArrayView || dest.IsInterface
             || dest.IsFunctionPointer)
             return {};
-        if (!dest.IsPrimitive()) return {};
+        if (!dest.IsPrimitive() && !classReferenceTarget) return {};
         if (IsPrimitiveTypeName(sourceTypeName)) return {};
         // A CFlat-native `operator T` is EXPLICIT-only by ruling (Test/errors/err_operator_
         // conversion.cb pins it), so only an imported C++ record converts implicitly - there
@@ -29296,10 +29759,20 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
         auto* self = const_cast<LLVMBackend*>(this);
         self->EnsureCxxConversionOperatorsProjected(sourceTypeName);
         const CxxClassInfo* info = GetCxxClassInfo(sourceTypeName);
-
+        // A class-reference target takes the same conversion-name lookup and explicit filter
+        // as every other target (usable below), so only real conversion operators bind.
         // A conversion operator is published either under the bare name or, when the bare name
         // is taken by a free conversion, under "<Type>.operator <spelling>".
         auto candidateNames = [&](const std::string& spelling) {
+            if (classReferenceTarget)
+            {
+                // A reference result is projected in pointer shape ("operator T*"), see
+                // EnsureCxxConversionOperatorsProjected.
+                const std::string cflatSpelling =
+                    SpellType(*this, TypeAndValue{ .TypeName = spelling, .Pointer = true });
+                return std::vector<std::string>{ "operator " + cflatSpelling,
+                                                 sourceTypeName + ".operator " + cflatSpelling };
+            }
             const std::string cflatSpelling =
                 CanonicalPrimitiveTypeName(ResolveTypeAlias(spelling));
             return std::vector<std::string>{ "operator " + cflatSpelling,
@@ -29307,9 +29780,11 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
         };
 
         auto usable = [&](const std::string& opName, std::string& returnTypeName) {
+            // "<Type>.operator <spelling>" keeps its spelling, which may hold dots ("t104.X").
+            const size_t qualifier = opName.find(".operator ");
             if (info != nullptr && !allowExplicit
-                && info->explicitConversions.count(opName.find('.') == std::string::npos
-                        ? opName : opName.substr(opName.rfind('.') + 1)) != 0)
+                && info->explicitConversions.count(qualifier == std::string::npos
+                        ? opName : opName.substr(qualifier + 1)) != 0)
                 return false;
             auto it = functionTable.find(opName);
             if (it == functionTable.end()) return false;
@@ -29323,6 +29798,18 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                     || p.TypeName != sourceTypeName)
                     continue;
                 const auto& ret = candidate.ReturnType;
+                if (classReferenceTarget)
+                {
+                    // A const referent (`operator const X&`) never binds a mutable X& or X&&.
+                    if (ret.IsCxxConstRef && !dest.IsCxxConstRef) continue;
+                    if (ret.TypeName == dest.TypeName && !ret.ElemPointer
+                        && ret.IsAlias)
+                    {
+                        returnTypeName = ret.TypeName;
+                        return true;
+                    }
+                    continue;
+                }
                 if (ret.Pointer || ret.ElemPointer || ret.IsArrayView || !ret.IsPrimitive())
                     continue;
                 returnTypeName = ret.TypeName;
@@ -29341,9 +29828,12 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
         for (const std::string& name : candidateNames(dest.TypeName))
             if (usable(name, returnTypeName))
             {
+                if (classReferenceTarget) return name;
                 if (canonical(returnTypeName) == resolvedDestType)
                     return name;
             }
+
+        if (classReferenceTarget) return {};
 
         /*
          * No exact operator: ONE standard conversion may sit on top of the user-defined one.
@@ -29443,10 +29933,25 @@ bool LLVMBackend::ApplyCxxConversionOperator(NamedVariable& nv, const TypeAndVal
         bool savedReturnsOwned = lastCallReturnsOwned;
         bool savedOwningResult = lastOwningResult;
         llvm::Value* result = CreateOverloadedFunctionCall(opName, { argNV });
+        const TypeAndValue conversionReturnType = lastCallReturnType;
         lastCallReturnType = savedReturnType;
         lastCallReturnsOwned = savedReturnsOwned;
         lastOwningResult = savedOwningResult;
         if (result == nullptr) return false;
+
+        if (dest.IsAlias && IsCxxRecord(dest.TypeName)
+            && conversionReturnType.IsAlias
+            && result->getType()->isPointerTy())
+        {
+            nv.Primary = dest.IsRvalueRef ? result : nullptr;
+            nv.Storage = dest.IsRvalueRef ? nullptr : result;
+            nv.BaseType = GetType(const_cast<TypeAndValue&>(dest));
+            nv.TypeAndValue = dest;
+            // The referent stays const through lowering: a const result never reaches a mutable dest.
+            nv.TypeAndValue.IsCxxConstRef = dest.IsCxxConstRef || conversionReturnType.IsCxxConstRef;
+            nv.TypeAndValue.VariableName.clear();
+            return true;
+        }
 
         if (needsStandard)
         {

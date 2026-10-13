@@ -528,7 +528,7 @@ llvm::DIType* LLVMBackend::GetDIType(const TypeAndValue& tv)
 
         // Unknown / opaque - leave as unspecified so the debugger at least knows the name.
         // Do NOT cache: a struct may be opaque now and become real later (e.g. generic before body layout).
-        return diBuilder->createUnspecifiedType(tv.TypeName);
+        return diBuilder->createUnspecifiedType(SpellType(*this, tv));
     }
 
 void LLVMBackend::RegisterBuiltinString()

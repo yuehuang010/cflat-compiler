@@ -263,6 +263,15 @@ The recurring failure mode of this whole family, stated once:
 - Bugs needing 2+ `expect_error` legs in ONE function are a recurring blind spot.
 - **Docs must not sell an unreachable guard as the safety story.** Apply such a correction to
   the COMMIT MESSAGE too, since that outlives the doc.
+- **A `test_cpp_interop` "FAIL compile" whose output stops at a PASSING `expect_error` line is
+  the heavy-test timeout, not the branch.** A header cache version bump makes the first landing
+  bar compile the fixture cold (~430 s at load ~10, limit 480 s in test.sh). T101 and T103 both
+  hit it on 2026-10-11. Confirm with one standalone compile under gtimeout 900 (cold, then warm
+  = 0 s) and its run exit before landing; never weaken the leg or the limit to get green.
+- **`expect_error` matches the `LogError*` format-string text, not the printed message.** The
+  printed line comes from `cflat/locales/en.json` and can differ in wording (T110: printed "cannot
+  choose which 'ov' to call", source "ambiguous call to 'ov'"). Copy the substring from the code,
+  not from the console; a printed-text substring reports FAIL even though it is visible.
 
 ## On agent reports
 

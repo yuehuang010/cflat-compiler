@@ -146,7 +146,7 @@ extern int main(int argc, char** argv)
     i8[4096] buf = default;
     int total = 0;
     while (true) {
-        int got = recv(sock, &buf[0], 4096, 0);
+        int got = recv(sock, (char*)&buf[0], 4096, 0);
         if (got == 0) break;                 // peer closed - done
         if (got == SOCKET_ERROR) {
             printf("\nrecv failed (WSA error %d)\n", WSAGetLastError());
@@ -154,7 +154,7 @@ extern int main(int argc, char** argv)
             WSACleanup();
             return 1;
         }
-        putn(&buf[0], got);
+        putn((char*)&buf[0], got);
         total = total + got;
     }
 

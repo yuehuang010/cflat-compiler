@@ -20,3 +20,20 @@ axis.hpp; run.sh / extra.sh replay them from the T42 worktree layout).
 
 Let the pre-check admit these shapes and leave the verdict to the clang probe; lower reference-valued conversion
 results as the bound reference.
+
+## T104 run (2026-10-10)
+
+Items 1 and 2 pass the added regression legs (617 for the class-template converting constructor; 291 with
+one construction and one destruction for the inherited value conversion). Item 3a (`operator X&`) passes with
+the existing object and no copy. Item 3b (`operator X&&`) remains unresolved after three failed attempts.
+
+## T104 Retry 1 (2026-10-10)
+
+Per retry instructions, all B3b (`operator X&&()`) implementation and coverage were removed; B3b remains open.
+Items 1, 2, and 3a remain implemented and pass their focused regression legs. The T104 header still contains
+the B3a reference source used by `Test/test_cpp_interop.cb`.
+
+T104 review 2 (pre-existing, reproduces on master before T104): an inherited `operator X&()` through
+a PUBLIC base is refused at a `const X&` / `X&` parameter while clang accepts (1071, binds the
+storage). The B3a path finds only the class's own reference conversion operators. Repro
+scratch/repro_keep/t104/rev_t104_ref_public.cb (+ .cpp).

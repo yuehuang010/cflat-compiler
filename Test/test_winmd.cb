@@ -258,7 +258,7 @@ bool testWString()
     // U+20AC EURO SIGN: UTF-8 E2 82 AC (3 bytes) -> one UTF-16 unit 0x20AC -> 3 bytes back.
     i8[4] eu = default;
     eu[0] = (i8)0xE2; eu[1] = (i8)0x82; eu[2] = (i8)0xAC; eu[3] = (i8)0;
-    string euro = (string)&eu[0];
+    string euro = (string)(char*)&eu[0];
     wstring we = euro.toWString();
     result &= Test("wstring_utf8_to_one_unit", we.length(), 1);
     result &= Test("wstring_utf8_unit_value", (int)we.data()[0], 0x20AC);
@@ -299,7 +299,7 @@ bool testWinrtBridge()
 
     i8[4] eu = default;
     eu[0] = (i8)0xE2; eu[1] = (i8)0x82; eu[2] = (i8)0xAC; eu[3] = (i8)0;   // U+20AC euro
-    string euro = (string)&eu[0];
+    string euro = (string)(char*)&eu[0];
     void* he = hstring(euro);
     string backe = fromHString(he);
     freeHString(he);

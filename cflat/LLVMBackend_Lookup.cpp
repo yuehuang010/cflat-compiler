@@ -850,6 +850,15 @@ bool LLVMBackend::CxxReferenceArgumentMatches(const TypeAndValue& param,
             referent.IsRvalueRef = false;
             return arg.BaseType != nullptr && GetType(referent) == arg.BaseType;
         }
+        if (param.IsRvalueRef && !param.ElemPointer && !arg.TypeAndValue.Pointer)
+        {
+            TypeAndValue referent = param;
+            referent.Pointer = referent.IsAlias = referent.IsRvalueRef = false;
+            referent.PointerDepth = 0;
+            if (referent.IsPrimitive() && arg.TypeAndValue.IsPrimitive()
+                && ClassifyScalarArgConversion(arg, referent) == ScalarArgConversion::Widen)
+                return true; // a standard conversion materializes a temporary for T&&
+        }
         // A C++ signature can expand a typedef while the CFlat argument keeps the alias identity.
         // Compare their canonical foreign spellings so the same specialization matches either way.
         if (!arg.TypeAndValue.Pointer && !arg.TypeAndValue.TypeName.empty()

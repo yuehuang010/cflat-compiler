@@ -101,6 +101,14 @@ extern int main()
         t78.TE t78Te = t78.TE.TEV;
         int t78TeR = t78.takeTF(t78Te, 1);
     }
+    // T109: an int-backed enum (fixed `: int`, or any unscoped enum under MSVC) into another enum.
+    expect_error("no overload of 't78.takeFB' matches") {
+        t78.FA t78Fa = t78.FA.FAV;
+        int t78FaR = t78.takeFB(t78Fa);
+    }
+    expect_error("no overload of 't78.takeFB' matches") {
+        int t78FaLit = t78.takeFB(t78.FA.FAV);
+    }
     expect_error("no overload of 't78.takeShort' matches") {
         double t78Dbl = 3.5;
         int t78ShR = t78.takeShort(t78Dbl, 1);

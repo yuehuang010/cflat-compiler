@@ -8,8 +8,20 @@ extern int main()
     expect_error("no overload of 't85p.one' matches the given arguments") {
         int r1 = t85p.one(&t85Int);
     }
-    expect_error("no overload of 't85p.lw' matches the given arguments") {
-        int r2 = t85p.lw(&t85Long);
+    // `long` is the target C long: 64-bit on LP64, an int-width pointee on Windows (LLP64), where
+    // the wider i64 is the unrelated pointee.
+    if const (__WINDOWS__)
+    {
+        expect_error("no overload of 't85p.lw' matches the given arguments") {
+            i64 t85Wide = 2;
+            int r2 = t85p.lw(&t85Wide);
+        }
+    }
+    else
+    {
+        expect_error("no overload of 't85p.lw' matches the given arguments") {
+            int r2 = t85p.lw(&t85Long);
+        }
     }
     expect_error("no overload of 't85p.ff' matches the given arguments") {
         int r3 = t85p.ff(&t85Float);
@@ -20,8 +32,18 @@ extern int main()
     expect_error("no overload of 't85p.one' matches the given arguments") {
         int r5 = t85p.one(&t85Long);
     }
-    expect_error("no overload of 't85p.oi' matches the given arguments") {
-        int r6 = t85p.oi(&t85Long);
+    if const (__WINDOWS__)
+    {
+        expect_error("no overload of 't85p.oi' matches the given arguments") {
+            i64 t85WideOi = 2;
+            int r6 = t85p.oi(&t85WideOi);
+        }
+    }
+    else
+    {
+        expect_error("no overload of 't85p.oi' matches the given arguments") {
+            int r6 = t85p.oi(&t85Long);
+        }
     }
     expect_error("no overload of 'take' matches the given arguments") {
         t85p.M t85M = default;

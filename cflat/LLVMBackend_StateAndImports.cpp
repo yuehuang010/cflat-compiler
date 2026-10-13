@@ -1138,9 +1138,12 @@ void LLVMBackend::RegisterEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx,
         std::string resolvedBacking = ResolveTypeAlias(backingType);
         std::string ns = namespaceName.empty() ? currentNamespace_ : namespaceName;
         std::string scopedName = (enumName.empty() || ns.empty()) ? enumName : ns + "." + enumName;
-        // Local enums in a generic body belong to the active specialization.
+        // A local enum belongs to its lexical block in the active function. The generic
+        // specialization remains part of the key so each instantiation gets a distinct type.
         std::string registryName = scopedName;
-        if (!scopedName.empty() && !activeGenericEnumSpecialization_.empty())
+        if (!scopedName.empty() && !activeLocalEnumScopes_.empty())
+            registryName = activeLocalEnumScopes_.back() + "." + enumName;
+        else if (!scopedName.empty() && !activeGenericEnumSpecialization_.empty())
             registryName = activeGenericEnumSpecialization_ + "." + enumName;
 
         // Type facts go in first and unconditionally - a signature and a qualified spelling need
@@ -1257,6 +1260,11 @@ void LLVMBackend::RegisterEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx,
 std::string LLVMBackend::ResolveEnumTypeName(const std::string& spelled) const
 {
         if (spelled.empty()) return {};
+        for (auto it = activeLocalEnumScopes_.rbegin(); it != activeLocalEnumScopes_.rend(); ++it)
+        {
+            const std::string local = *it + "." + spelled;
+            if (enumBackingTypes.count(local) != 0) return local;
+        }
         if (!activeGenericEnumSpecialization_.empty())
         {
             const std::string local = activeGenericEnumSpecialization_ + "." + spelled;
@@ -1280,6 +1288,10 @@ std::string LLVMBackend::ResolveEnumTypeName(const std::string& spelled) const
 
 bool LLVMBackend::IsGenericLocalEnumKey(const std::string& key) const
 {
+        // Local enum keys include their owner (`fn@line:col.Enum`); keep them out of
+        // source-facing spellings while retaining the key for IR identity.
+        if (key.find('@') != std::string::npos && enumDeclSites_.count(key) != 0)
+            return true;
         auto ownedByInstantiation = [&key](const auto& instantiations)
         {
             for (const auto& instantiation : instantiations)
@@ -2599,6 +2611,7 @@ nlohmann::json LLVMBackend::CxxMemberToJson(
         if (!m.linkageName.empty()) j["lk"] = m.linkageName;
         PathToJson(j, m.file, files);
         if (m.variadic)             j["va"] = true;
+        if (m.isInline)             j["il"] = true;
         if (m.requiresConstructorWrapper) j["cw"] = true;
         if (m.isConst)              j["cn"] = true;
         if (m.isVolatile)           j["vl"] = true;
@@ -2660,6 +2673,7 @@ cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(
         if (j.contains("pt")) m.paramTypes = j["pt"].to_string_vector();
         if (j.contains("pn")) m.paramNames = j["pn"].to_string_vector();
         m.variadic             = j.value("va", false);
+        m.isInline             = j.value("il", false);
         m.requiresConstructorWrapper = j.value("cw", false);
         m.isConst              = j.value("cn", false);
         m.isVolatile           = j.value("vl", false);
@@ -3030,12 +3044,23 @@ LLVMBackend::CTypeAliasEntry LLVMBackend::TypeAliasFromJson(const SjVal& j, cons
         return a;
     }
 
-bool LLVMBackend::CHeaderDepFresh(const CHeaderDep& dep)
+bool LLVMBackend::CHeaderDepFresh(const CHeaderDep& dep,
+                                  std::filesystem::file_time_type cacheWriteTime)
 {
         std::error_code ec;
         auto mt = std::filesystem::last_write_time(dep.path, ec);
         if (ec) return false;
-        if ((int64_t)mt.time_since_epoch().count() == dep.mtime) return true;
+        const auto storedMtime = std::filesystem::file_time_type::duration(dep.mtime);
+        if (mt == std::filesystem::file_time_type(storedMtime))
+        {
+            // A same-stamp edit is possible while the dependency hash is being captured. Use
+            // that time, not the later cache publish, to bound the warm content recheck.
+            const auto hashTime = dep.hashTime != 0
+                ? std::filesystem::file_time_type(
+                    std::filesystem::file_time_type::duration(dep.hashTime))
+                : cacheWriteTime;
+            if (mt + std::chrono::seconds(2) < hashTime) return true;
+        }
         uint64_t h = 0;
         return HashFileFnv1a(dep.path, h) && h == dep.hash;
     }
@@ -3118,6 +3143,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
             return false;
         };
         if (!fs::exists(cachePath, ec)) return cacheMiss("missing entry");
+        const auto cacheWriteTime = fs::last_write_time(cachePath, ec);
+        if (ec) return cacheMiss("cache timestamp");
 
         // parser + jsonBuf own the storage that doc/SjVal reference; keep them alive for the
         // whole function. Reads run through SjVal (simdjson DOM); writes still use nlohmann.
@@ -3281,6 +3308,7 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // v110 records `using ns::C;` of a class for the cross-import conflict check.
         // v111 records namespace-scope class templates for the same check.
         // v129 stamps every entry with the compiler build that wrote it ("cstamp").
+        // v233 records const on a C++ reference to an array field so indexed writes are refused.
         if (version != kCHeaderCacheVersion) return cacheMiss("cache version");
         // Under CacheBuildStampEnabled() an entry is the output of the build that wrote it. The
         // disk key leaves the stamp out so a rebuild overwrites entries in place.
@@ -3496,13 +3524,15 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                     dep.path  = dj.value("f", std::string{});
                     dep.mtime = dj.value("mt", int64_t{0});
                     dep.hash  = dj.value("h",  uint64_t{0});
+                    dep.hashTime = dj.value("ht", cacheWriteTime.time_since_epoch().count());
                     entry.deps.push_back(std::move(dep));
                 }
                 // One stat per include (a hash only on mtime drift), so a few workers share them.
                 std::atomic<bool> stale{false};
                 RunParallel(entry.deps.size(), entry.deps.size() < 64 ? 1u : 4u,
                             [&](size_t i, unsigned) {
-                    if (!stale.load(std::memory_order_relaxed) && !CHeaderDepFresh(entry.deps[i]))
+                    if (!stale.load(std::memory_order_relaxed)
+                        && !CHeaderDepFresh(entry.deps[i], cacheWriteTime))
                         stale.store(true, std::memory_order_relaxed);
                 });
                 if (stale.load()) return cacheMiss("dependency stamp");
@@ -3727,6 +3757,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v110 records `using ns::C;` of a class for the cross-import conflict check.
         // v111 records namespace-scope class templates for the same check.
         // v129 stamps every entry with the compiler build that wrote it ("cstamp").
+        // v233 records const on a C++ reference to an array field so indexed writes are refused.
         j["version"] = kCHeaderCacheVersion;
         if (CacheBuildStampEnabled()) j["cstamp"] = CompilerBuildStamp();
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
@@ -3915,7 +3946,8 @@ void LLVMBackend::WriteCHeaderDiskCache(
         {
             nlohmann::json deps = nlohmann::json::array();
             for (const auto& d : entry.deps)
-                deps.push_back({{"f", d.path}, {"mt", d.mtime}, {"h", d.hash}});
+                deps.push_back({{"f", d.path}, {"mt", d.mtime}, {"h", d.hash},
+                                {"ht", d.hashTime}});
             j["deps"] = std::move(deps);
         }
 

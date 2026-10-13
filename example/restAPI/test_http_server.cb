@@ -197,7 +197,7 @@ string _readAll(Socket* s)
         else
         {
             string view = default;
-            view._ptr = buf;
+            view._ptr = (char*)buf;
             view._len = n;
             sb.append(view);
         }

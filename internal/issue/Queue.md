@@ -61,9 +61,8 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 | Run | Branch | Issue(s) | Notes |
 |-----|--------|----------|-------|
-| T101 | fix/t101-topstmt | TOPSTMT (p2 header namespace expression-statement crash + p3 global statement) | Luna r1, Opus reviewer |
-| T104 | fix/t104-refparam | REFPARAM (3 p3) | Luna r1 21:21-, Opus reviewer |
-| T103 | fix/t103-nullctor | NULLCTOR (1 p2 + 3 p3) | Luna r1 self-stopped (2 REG); retry 21:40- |
+| T108 | fix/t108-cachevalid | CACHE-VALID (2 p3) | Luna r1 01:27-02:18 done (both issues, test.sh cache probes) rebased; Opus r1 1 REG (selector-prefixed wrapper rejections no longer cached: warm header parses 2 vs 1) + 1 INC (restored-old-mtime edit still stale; needs ruling); Luna r2 02:41- ; Luna r2 02:41-04:22 done (2c0e867ca); Opus r2 delta 04:24-04:28 CLEAN (INC re-filed p3); squashed + rebased; bar queued after T111 |
+| T116 | fix/t116-cppdel | CPPDEL (1 p3 C++ adds rejection) | PARKED 2026-10-11 07:50. r1 a483570a3 (cache 241): free/static/operator/conversion/assignment deletes refused with clang text, Opus r1 1 blocking INC (deleted MEMBER overloads dropped before ranking, live sibling picked: m.call(1) -> 8, m + 1 -> 7, clang refuses). r2 UNCOMMITTED in worktree (review base refs/review/t116-r2): members registered with IsDeleted, int cases refused, templ leg; REG m.call(1.5) now "cannot choose which call" (must stay 8). Next: fix the ambiguity (literal-identity change in MainListener_Expressions member-operator candidates is the suspect), then copy-assign clang text (minor), Opus r2 delta |
 
 
 ## A - crashes, asserts, link failures

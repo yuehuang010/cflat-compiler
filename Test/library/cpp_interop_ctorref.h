@@ -100,6 +100,8 @@ struct RefConstOverload {
 };
 // Forwarded exact types let clang rank these as at the source site.
 struct RvalueOrConst { int chosen; long v; RvalueOrConst(unsigned&& r) : chosen(1), v(r) { r = 99; } RvalueOrConst(const long& r) : chosen(2), v(r) {} };
+// Every constructor narrows from 'long long' on every target (LP64 twin of RvalueOrConst on LLP64).
+struct RvalueOrConstInt { int chosen; int v; RvalueOrConstInt(unsigned&& r) : chosen(1), v(r) { r = 99; } RvalueOrConstInt(const int& r) : chosen(2), v(r) {} };
 // A converted pick keeps the C++ value: bool is 0/1, double -> unsigned is fptoui.
 struct ThkDbl { double v; ThkDbl(const double& x) : v(x) {} };
 struct ThkUns { unsigned v; ThkUns(const unsigned& x) : v(x) {} };

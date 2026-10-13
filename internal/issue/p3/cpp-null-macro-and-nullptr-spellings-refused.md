@@ -14,6 +14,16 @@ Fix direction: T52 marks integer-literal-zero macros (CMacroEntry.ilz) as null p
 extend the macro classifier to `__null` / `nullptr` / `((void*)0)` bodies with the same identity
 (never spelling) rule. std::function: the converting-ctor path must offer `nullptr_t` sources.
 
+## T103 status (2026-10-10)
+
+The T103 macro spelling legs now pass in `Test/test_cpp_interop.cb`, including the C header's
+`((void*)0)` macro. `nullptr` into a by-value `std::function<int()>` remains unsupported; its
+fixture leg was removed after three ranking-path attempts, so this issue remains active.
+T103 round 2 (2026-10-10): the `cppcr.NpMutRef(nullptr)` regression is fixed (the variadic wrapper
+spelled a nullptr argument as `std.nullptr_t`, which let clang bind it to `nullptr_t&`; that spelling
+was removed from `RequestCxxVariadicConstructor`). Literal-0 pointer admission was dropped (see the
+p2 `cpp-null-constant-ambiguous-ctor-accepted` file).
+
 Also (T52 round 6, 2026-10-06): a C++ CONSTRUCTOR taking `int*&&` or `int* const&` refuses a zero
 macro (`C(ZERO)`, `D(Z0)`); free functions accept it after T52, clang accepts both.
 

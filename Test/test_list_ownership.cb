@@ -14,6 +14,10 @@ import "list.cb";
 import "dictionary.cb";
 import "queue.cb";
 import "stack.cb";
+// T113: element type named like unique<T>'s `using P = T*` alias.
+int g_t113Dead = 0;
+struct P { int v = 0; };
+struct T113Res { int id = 0; ~T113Res() { g_t113Dead++; } };
 import "hashset.cb";
 import "diagnostic/heap_audit.cb";
 import "test_helper.cb";
@@ -1501,6 +1505,30 @@ int testHelperShapeAcceptSet()
     return passed;
 }
 
+// An element type named like an alias inside unique<T> (`using P = T*`): instantiating
+// list<unique<...>> after list<P> must not resolve list<P>'s P through that alias (T113).
+int testElementNamedLikeUniqueAlias()
+{
+    int passed = 0;
+    g_t113Dead = 0;
+    list<P> lp; P p = default; p.v = 12; lp.add(p);
+    {
+        list<unique<T113Res>> lu;
+        lu.add(unique<T113Res>(new T113Res()));
+        lu.add(unique<T113Res>(new T113Res()));
+        passed += Test("list<P> then list<unique> count", lu.count(), 2);
+    }
+    passed += Test("list<P> keeps its own add", lp[0].v, 12);
+    passed += Test("list<unique> freed each", g_t113Dead, 2);
+    stack<P> sp; sp.push(p);
+    stack<unique<T113Res>> su; su.push(unique<T113Res>(new T113Res()));
+    passed += Test("stack<P> keeps its own push", sp.peek().v, 12);
+    queue<P> qp; qp.enqueue(p);
+    queue<unique<T113Res>> qu; qu.enqueue(unique<T113Res>(new T113Res()));
+    passed += Test("queue<P> keeps its own enqueue", qp.dequeue().v, 12);
+    return passed;
+}
+
 extern int main()
 {
     HeapAudit.enable();
@@ -1509,6 +1537,7 @@ extern int main()
     int total  = 0;
 
     total += 8;  passed += testPrimitives();
+    total += 5;  passed += testElementNamedLikeUniqueAlias();
     total += 9;  passed += testAliasLvalueSemantics();
     total += 16; passed += testAliasParameterBorrows();
     total += 12; passed += testAliasParameterTempsDestruct();

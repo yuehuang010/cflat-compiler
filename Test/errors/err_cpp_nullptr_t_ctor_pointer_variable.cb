@@ -1,0 +1,15 @@
+import cpp "cpp_t111_nullptr_t.hpp";
+
+extern int main()
+{
+    expect_error("cannot initialize C++ class") {
+        void* nullPointer = nullptr;
+        cpp_t111.FromNil rejected = nullPointer;
+    }
+    expect_error("cannot initialize C++ class") {
+        int value = 1;
+        int* pointer = &value;
+        cpp_t111.FromNil rejected = pointer;
+    }
+    return 0;
+}

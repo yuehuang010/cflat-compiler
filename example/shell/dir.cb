@@ -27,7 +27,7 @@ extern int main(int argc, char** argv)
     i64 totalBytes = 0;
 
     do {
-        i8* name  = fd->cFileName;
+        char* name = fd->cFileName;
         bool isDir = (fd->dwFileAttributes & 16) != 0;
         bool isDot = strcmp(name, ".") == 0 || strcmp(name, "..") == 0;
 

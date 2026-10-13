@@ -1,0 +1,4 @@
+// T101: a header with a namespace `<` statement (a Sema SIGSEGV before T101) followed by an
+// unfinished, mixed paren/brace parameter list must fail with a clang error, never hang.
+expect_error("clang:");
+import cpp "cpp_header_unfinished_param.h";
