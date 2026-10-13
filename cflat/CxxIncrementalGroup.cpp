@@ -1956,12 +1956,24 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
                                 previousKind = clang::tok::unknown,
                                 expressionStatementDepth = -1, restoreAfterStatement = false,
                                 injectedHeaderClosers = false, lastInHeader = false,
+                                tokenFid = clang::FileID{}, tokenFidInHeader = false,
                                 openDelimiters = std::vector<clang::tok::TokenKind>{}]
                                (const clang::Token& token) mutable {
                 if (lazy.active) lazy.Observe(token);
                 // Header text is parsed as clang++ parses it: no top-level statements. Chunk text
                 // keeps the predictor below. The guard reapplies "off" after the predictor runs.
-                const bool inHeader = LocInHeaderFile(pp.getSourceManager(), token.getLocation());
+                // One header lookup per run of tokens from one file: the include-site lookup
+                // would otherwise evict clang's FileID cache on every token.
+                clang::SourceManager& tokenSources = pp.getSourceManager();
+                const clang::SourceLocation tokenLoc = token.getLocation();
+                const clang::FileID fid = tokenLoc.isValid()
+                    ? tokenSources.getFileID(tokenSources.getExpansionLoc(tokenLoc)) : clang::FileID{};
+                if (fid != tokenFid)
+                {
+                    tokenFid = fid;
+                    tokenFidInHeader = LocInHeaderFile(tokenSources, tokenLoc);
+                }
+                const bool inHeader = tokenFidInHeader;
                 if (lastInHeader && !inHeader) langOpts.IncrementalExtensions = incrementalExtensions;
                 lastInHeader = inHeader;
                 struct HeaderTokenGuard

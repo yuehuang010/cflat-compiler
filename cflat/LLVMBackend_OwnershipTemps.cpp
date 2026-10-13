@@ -41,6 +41,7 @@
 #include <optional>
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <map>
 #include <set>
 
@@ -4248,49 +4249,49 @@ bool LLVMBackend::IsInsertBlockLive() const
     }
 
 /*
- * Dominance over a CFG that is still being built. llvm::DominatorTree requires a
- * well-formed function - its DFS asserts on a block with no terminator - but these
- * queries run mid-codegen, where the block being emitted has none yet. `bb` dominates
- * `curBlock` exactly when `curBlock` is unreachable from entry once `bb` is removed;
- * a terminator-less block is treated as having no successors, which is what LLVM 22's
- * walk did in effect.
+ * Dominance over a CFG that may still be being built. `bb` dominates `curBlock` exactly when
+ * `curBlock` is unreachable from entry once `bb` is removed; a terminator-less block has no
+ * successors (llvm::predecessors only yields terminator users). Searched BACKWARD from
+ * `curBlock` so the cost is local to the statement, not the function: a dominated block
+ * exhausts the region between `bb` and `curBlock`, and an undominated one soon reaches entry
+ * or a block on `bb`'s single-predecessor chain (each such block dominates `bb`, so reaching
+ * it avoiding `bb` is a path from entry). A forward walk from entry plus a whole-function
+ * DominatorTree rebuild per flush made one large `main` quadratic (test_cpp_interop 80 -> 490 s).
+ * Divergence from DominatorTree: only when `bb` and `curBlock` are both unreachable (dead code).
  */
 static bool DominatesInPartialCfg(llvm::BasicBlock* bb, llvm::BasicBlock* curBlock)
 {
-        llvm::BasicBlock* entry = &curBlock->getParent()->getEntryBlock();
+        llvm::Function* fn = curBlock->getParent();
+        llvm::BasicBlock* entry = &fn->getEntryBlock();
         if (bb == entry) return true;
-        std::unordered_set<llvm::BasicBlock*> seen{ entry };
-        std::vector<llvm::BasicBlock*> work{ entry };
+        // Witnesses: the nearest single-predecessor ancestors of `bb`; capped, early exit only.
+        llvm::SmallPtrSet<llvm::BasicBlock*, 16> above;
+        llvm::BasicBlock* p = bb->getSinglePredecessor();
+        for (int i = 0; i < 64 && p != nullptr && p != bb && p->getParent() == fn
+                        && above.insert(p).second; ++i)
+            p = p->getSinglePredecessor();
+        llvm::SmallPtrSet<llvm::BasicBlock*, 32> seen;
+        llvm::SmallVector<llvm::BasicBlock*, 32> work{ curBlock };
+        seen.insert(curBlock);
         while (!work.empty())
         {
-            llvm::BasicBlock* n = work.back();
-            work.pop_back();
-            if (n == curBlock) return false;
-            if (cflat_llvm::GetTerminatorOrNull(n) == nullptr) continue;
-            for (llvm::BasicBlock* s : llvm::successors(n))
-                if (s != bb && seen.insert(s).second) work.push_back(s);
+            llvm::BasicBlock* n = work.pop_back_val();
+            if (n == entry || above.contains(n)) return false;
+            for (llvm::BasicBlock* pred : llvm::predecessors(n))
+                if (pred != bb && pred->getParent() == fn && seen.insert(pred).second)
+                    work.push_back(pred);
         }
-        return true;
-    }
-
-static bool FunctionIsWellFormed(llvm::Function* f)
-{
-        for (llvm::BasicBlock& bb : *f)
-            if (cflat_llvm::GetTerminatorOrNull(&bb) == nullptr) return false;
         return true;
     }
 
 bool LLVMBackend::OwnedTempDominatesHere(llvm::BasicBlock* bb, llvm::BasicBlock* curBlock,
                                 std::optional<llvm::DominatorTree>& dt) const
 {
+        (void)dt;
         if (bb == nullptr || curBlock == nullptr) return false;
         if (bb == curBlock) return true;
         if (bb->getParent() != curBlock->getParent()) return false;
-        llvm::Function* f = curBlock->getParent();
-        // The tree is only legal once every block is terminated; mid-codegen it is not.
-        if (!FunctionIsWellFormed(f)) return DominatesInPartialCfg(bb, curBlock);
-        if (!dt) dt.emplace(*f);
-        return dt->dominates(bb, curBlock);
+        return DominatesInPartialCfg(bb, curBlock);
     }
 
 void LLVMBackend::EmitOwnedStringTempFree(llvm::Value* value)
@@ -5381,6 +5382,11 @@ void LLVMBackend::EmitDestructorsForScope(const StackState& frame)
             if (namedVar->DeclSequence < unwindSkipSeqFloor_)
                 DropValue(*namedVar);
 
+        EmitScopeArgumentAndLockCleanups(frame);
+    }
+
+void LLVMBackend::EmitScopeArgumentAndLockCleanups(const StackState& frame)
+{
         // Clean up owning function parameters (move params)
         for (const auto& [varName, namedVar] : frame.functionArgument)
         {
@@ -5747,6 +5753,335 @@ bool LLVMBackend::FrameOwesUnwindCleanup()
         return false;
 }
 
+namespace
+{
+    struct UnwindOperandIdentity
+    {
+        enum class Kind { External, Block, Instruction, Scratch } kind = Kind::External;
+        const llvm::Value* external = nullptr;
+        size_t block = 0;
+        size_t instruction = 0;
+        bool operator==(const UnwindOperandIdentity&) const = default;
+    };
+
+    struct UnwindRegionIndex
+    {
+        std::unordered_map<const llvm::BasicBlock*, size_t> blocks;
+        std::unordered_map<const llvm::Instruction*, std::pair<size_t, size_t>> instructions;
+        std::unordered_map<const llvm::Value*, size_t> scratch;
+
+        UnwindRegionIndex(const std::vector<llvm::BasicBlock*>& region,
+                          const std::vector<llvm::AllocaInst*>& scratchAllocas)
+        {
+            for (size_t si = 0; si < scratchAllocas.size(); ++si) scratch.emplace(scratchAllocas[si], si);
+            for (size_t bi = 0; bi < region.size(); ++bi)
+            {
+                blocks.emplace(region[bi], bi);
+                size_t ii = 0;
+                for (const llvm::Instruction& inst : *region[bi])
+                    instructions.emplace(&inst, std::pair{ bi, ii++ });
+            }
+        }
+
+        UnwindOperandIdentity Operand(const llvm::Value* value) const
+        {
+            if (auto* bb = llvm::dyn_cast<llvm::BasicBlock>(value))
+                if (auto it = blocks.find(bb); it != blocks.end())
+                    return { UnwindOperandIdentity::Kind::Block, nullptr, it->second, 0 };
+            if (auto* inst = llvm::dyn_cast<llvm::Instruction>(value))
+                if (auto it = instructions.find(inst); it != instructions.end())
+                    return { UnwindOperandIdentity::Kind::Instruction, nullptr,
+                             it->second.first, it->second.second };
+            if (auto it = scratch.find(value); it != scratch.end())
+                return { UnwindOperandIdentity::Kind::Scratch, nullptr, it->second, 0 };
+            return { UnwindOperandIdentity::Kind::External, value, 0, 0 };
+        }
+    };
+
+    static uint64_t UnwindHashMix(uint64_t hash, uint64_t value)
+    {
+        return hash ^ (value + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2));
+    }
+
+    static uint64_t UnwindRegionHash(const std::vector<llvm::BasicBlock*>& region,
+                                     const std::vector<llvm::AllocaInst*>& scratchAllocas)
+    {
+        UnwindRegionIndex index(region, scratchAllocas);
+        uint64_t hash = region.size();
+        for (const llvm::BasicBlock* bb : region)
+        {
+            hash = UnwindHashMix(hash, 0xb10cULL);
+            for (const llvm::Instruction& inst : *bb)
+            {
+                hash = UnwindHashMix(hash, inst.getOpcode());
+                hash = UnwindHashMix(hash, reinterpret_cast<std::uintptr_t>(inst.getType()));
+                for (const llvm::Use& use : inst.operands())
+                {
+                    const auto operand = index.Operand(use.get());
+                    hash = UnwindHashMix(hash, (uint64_t)operand.kind);
+                    if (operand.kind == UnwindOperandIdentity::Kind::External)
+                        hash = UnwindHashMix(hash, reinterpret_cast<std::uintptr_t>(operand.external));
+                    else
+                    {
+                        hash = UnwindHashMix(hash, operand.block);
+                        hash = UnwindHashMix(hash, operand.instruction);
+                    }
+                }
+                llvm::SmallVector<std::pair<unsigned, llvm::MDNode*>, 4> metadata;
+                inst.getAllMetadata(metadata);
+                for (const auto& item : metadata) hash = UnwindHashMix(hash, item.first);
+                hash = UnwindHashMix(hash, reinterpret_cast<std::uintptr_t>(inst.getDebugLoc().get()));
+            }
+        }
+        return hash;
+    }
+
+    static bool SameUnwindRegion(const std::vector<llvm::BasicBlock*>& left,
+                                 const std::vector<llvm::AllocaInst*>& leftScratch,
+                                 const std::vector<llvm::BasicBlock*>& right,
+                                 const std::vector<llvm::AllocaInst*>& rightScratch)
+    {
+        if (left.size() != right.size() || leftScratch.size() != rightScratch.size()) return false;
+        for (size_t si = 0; si < leftScratch.size(); ++si)
+            if (leftScratch[si]->getAllocatedType() != rightScratch[si]->getAllocatedType()
+                || leftScratch[si]->getAlign() != rightScratch[si]->getAlign())
+                return false;
+        UnwindRegionIndex li(left, leftScratch), ri(right, rightScratch);
+        auto sameOperand = [&](const llvm::Value* a, const llvm::Value* b) {
+            return li.Operand(a) == ri.Operand(b);
+        };
+        for (size_t bi = 0; bi < left.size(); ++bi)
+        {
+            auto ai = left[bi]->begin(), be = right[bi]->begin();
+            for (; ai != left[bi]->end() && be != right[bi]->end(); ++ai, ++be)
+            {
+                const llvm::Instruction& a = *ai;
+                const llvm::Instruction& b = *be;
+                if (!a.isSameOperationAs(&b) || a.getType() != b.getType()
+                    || a.getNumOperands() != b.getNumOperands()
+                    || a.getDebugLoc().get() != b.getDebugLoc().get())
+                    return false;
+                if (auto* ac = llvm::dyn_cast<llvm::CmpInst>(&a))
+                {
+                    auto* bc = llvm::dyn_cast<llvm::CmpInst>(&b);
+                    if (bc == nullptr || ac->getPredicate() != bc->getPredicate()) return false;
+                }
+                auto* acall = llvm::dyn_cast<llvm::CallBase>(&a);
+                auto* bcall = llvm::dyn_cast<llvm::CallBase>(&b);
+                if ((acall == nullptr) != (bcall == nullptr)
+                    || (acall != nullptr && !sameOperand(acall->getCalledOperand(), bcall->getCalledOperand())))
+                    return false;
+                llvm::SmallVector<std::pair<unsigned, llvm::MDNode*>, 4> am, bm;
+                a.getAllMetadata(am);
+                b.getAllMetadata(bm);
+                if (am.size() != bm.size()) return false;
+                for (size_t mi = 0; mi < am.size(); ++mi)
+                    if (am[mi].first != bm[mi].first) return false;
+                for (unsigned oi = 0; oi < a.getNumOperands(); ++oi)
+                    if (!sameOperand(a.getOperand(oi), b.getOperand(oi))) return false;
+            }
+            if (ai != left[bi]->end() || be != right[bi]->end()) return false;
+        }
+        return true;
+    }
+
+    static void EraseUnwindRegion(const std::vector<llvm::BasicBlock*>& region)
+    {
+        std::unordered_set<llvm::BasicBlock*> members(region.begin(), region.end());
+        for (llvm::BasicBlock* block : region)
+        {
+            auto* terminator = block->getTerminator();
+            if (terminator == nullptr) continue;
+            std::unordered_set<llvm::BasicBlock*> successors;
+            for (llvm::BasicBlock* successor : llvm::successors(block))
+                if (!members.count(successor)) successors.insert(successor);
+            for (llvm::BasicBlock* successor : successors)
+                successor->removePredecessor(block, true);
+        }
+        for (llvm::BasicBlock* block : region) block->dropAllReferences();
+        for (llvm::BasicBlock* block : region) block->eraseFromParent();
+    }
+}
+
+LLVMBackend::UnwindChainState& LLVMBackend::ChainStateFor(llvm::Function* fn)
+{
+        UnwindChainState& chain = unwindChains_[fn];
+        // A null handle: a new function, or one reusing a freed function's address.
+        if ((llvm::Value*)chain.Fn != fn) chain = UnwindChainState{ fn };
+        return chain;
+    }
+
+/*
+ * Execution order of a full scope exit: innermost scope first, each scope's locals newest first,
+ * then its owning arguments and lock releases (EmitDestructorsForScope, one unit per local so a
+ * chain shares every suffix). `unwindFloors` skips locals whose declaration is still in progress.
+ */
+void LLVMBackend::CollectScopeCleanupUnits(std::vector<std::function<void()>>& units, bool unwindFloors)
+{
+        for (auto it = stackNamedVariable.rbegin(); it != stackNamedVariable.rend(); ++it)
+        {
+            const uint64_t floor = unwindFloors
+                ? UnwindInitFloorForDepth((size_t)(stackNamedVariable.rend() - it)) : UINT64_MAX;
+            std::vector<const NamedVariable*> locals;
+            for (const auto& entry : it->namedVariable)
+                if (entry.second.DeclSequence < floor) locals.push_back(&entry.second);
+            std::ranges::sort(locals, [](const auto* left, const auto* right) {
+                return left->DeclSequence > right->DeclSequence;
+            });
+            for (const NamedVariable* local : locals)
+                units.push_back([this, local] { DropValue(*local); });
+            const StackState* frame = &*it;
+            units.push_back([this, frame] { EmitScopeArgumentAndLockCleanups(*frame); });
+            if (it->isFunction) break;
+        }
+    }
+
+/*
+ * Normal-path counterpart of the pad chain, clang's cleanup destinations: a large function's
+ * every `return` re-destroying all live locals is O(returns x locals) IR. The return stores its
+ * value in a per-type slot shared by all returns (one slot keeps mem2reg linear) and its id in
+ * `cleanup.dest`, enters the shared chain, and the dispatch switch resumes its own tail, where
+ * the caller lowers the reloaded value exactly as before. Small frames stay inline.
+ */
+bool LLVMBackend::ChainReturnCleanups(llvm::Value*& value)
+{
+        if (autoReturnCapture.has_value() || suppressErrors_ || currentFunction == nullptr
+            || !IsInsertBlockLive() || builder->GetInsertBlock()->getParent() != currentFunction)
+            return false;
+        size_t locals = 0;
+        for (auto it = stackNamedVariable.rbegin(); it != stackNamedVariable.rend(); ++it)
+        {
+            locals += it->namedVariable.size();
+            if (it->isFunction) break;
+        }
+        if (locals < 4) return false;
+
+        llvm::Function* fn = currentFunction;
+        UnwindChainState& chain = ChainStateFor(fn);
+        auto* i32Ty = builder->getInt32Ty();
+        if (chain.Dispatch == nullptr || chain.DestSlot == nullptr)
+        {
+            llvm::AllocaInst* dest = AllocaAtEntry(i32Ty, nullptr, "cleanup.dest");
+            auto* dispatch = llvm::BasicBlock::Create(*context, "return.dispatch", fn);
+            auto* trap = llvm::BasicBlock::Create(*context, "return.dispatch.default", fn);
+            llvm::IRBuilder<> db(dispatch);
+            db.CreateSwitch(db.CreateLoad(i32Ty, dest, "cleanup.dest.v"), trap);
+            llvm::IRBuilder<>(trap).CreateUnreachable();
+            chain.DestSlot = dest;
+            chain.Dispatch = dispatch;
+        }
+        llvm::BasicBlock* origin = builder->GetInsertBlock();
+        llvm::AllocaInst* valueSlot = nullptr;
+        if (value != nullptr)
+        {
+            llvm::WeakVH& handle = chain.ReturnSlots[value->getType()];
+            if (handle == nullptr) handle = AllocaAtEntry(value->getType(), nullptr, "return.value");
+            valueSlot = llvm::cast<llvm::AllocaInst>(handle);
+            builder->CreateStore(value, valueSlot);
+        }
+        const uint32_t id = chain.NextDest++;
+        builder->CreateStore(llvm::ConstantInt::get(i32Ty, id), chain.DestSlot);
+
+        const llvm::DebugLoc savedLoc = builder->getCurrentDebugLocation();
+        if (currentSubprogram)
+            builder->SetCurrentDebugLocation(llvm::DILocation::get(
+                *context, currentSubprogram->getLine(), 0, currentSubprogram));
+        std::vector<std::function<void()>> units;
+        CollectScopeCleanupUnits(units, /*unwindFloors*/ false);
+        auto* dispatch = llvm::cast<llvm::BasicBlock>(chain.Dispatch);
+        llvm::BasicBlock* target = dispatch;
+        for (auto it = units.rbegin(); it != units.rend(); ++it)
+            target = ChainUnwindCleanup(chain, target, *it);
+        builder->SetCurrentDebugLocation(savedLoc);
+
+        builder->SetInsertPoint(origin);
+        builder->CreateBr(target);
+        auto* tail = llvm::BasicBlock::Create(*context, "return.tail", fn);
+        llvm::cast<llvm::SwitchInst>(dispatch->getTerminator())->addCase(
+            llvm::ConstantInt::get(i32Ty, id), tail);
+        builder->SetInsertPoint(tail);
+        if (valueSlot != nullptr) value = builder->CreateLoad(value->getType(), valueSlot, "return.value.v");
+        return true;
+    }
+
+/*
+ * One link of the shared unwind cleanup chain. `emit` runs in a fresh block; the region is every
+ * block reachable from it short of `target`. An identical cached region (same instructions over
+ * the same outside operands, `target` included) replaces it, so a pad reuses the chain suffix of
+ * every still-live local instead of re-emitting it - clang's EH cleanup chaining. Sharing is
+ * sound: each outside operand dominated every pad that emitted the region, hence the region.
+ */
+llvm::BasicBlock* LLVMBackend::ChainUnwindCleanup(UnwindChainState& chain, llvm::BasicBlock* target,
+                                                  const std::function<void()>& emit)
+{
+        // Not the insert block: the previous link may have erased it as a duplicate.
+        llvm::Function* fn = target->getParent();
+        auto* entry = llvm::BasicBlock::Create(*context, "unwind.scope", fn);
+        builder->SetInsertPoint(entry);
+        std::vector<llvm::AllocaInst*> scratch;
+        auto* outerRecorder = unwindScratchAllocas_;
+        unwindScratchAllocas_ = &scratch;
+        emit();
+        unwindScratchAllocas_ = outerRecorder;
+        // A kept region's scratch belongs to an enclosing region's emission too (a normal-path
+        // cleanup whose destructor call grew its own pad chain).
+        auto keep = [&](llvm::BasicBlock* result) {
+            if (outerRecorder != nullptr) outerRecorder->insert(outerRecorder->end(), scratch.begin(), scratch.end());
+            return result;
+        };
+        const bool live = IsInsertBlockLive();
+        if (live) builder->CreateBr(target);
+        // Only blocks this emission appended are the region's; reaching any other block (an
+        // existing chain link of a nested pad, say) makes it unshareable.
+        llvm::SmallPtrSet<llvm::BasicBlock*, 8> created;
+        for (llvm::BasicBlock* b = entry; b != nullptr; b = b->getNextNode()) created.insert(b);
+        std::vector<llvm::BasicBlock*> region;
+        llvm::SmallPtrSet<llvm::BasicBlock*, 8> seen{ entry };
+        region.push_back(entry);
+        bool foreign = false;
+        for (size_t i = 0; i < region.size() && !foreign; ++i)
+        {
+            if (cflat_llvm::GetTerminatorOrNull(region[i]) == nullptr) continue;
+            for (llvm::BasicBlock* succ : llvm::successors(region[i]))
+            {
+                if (succ == target || !seen.insert(succ).second) continue;
+                if (!created.contains(succ)) { foreign = true; break; }
+                region.push_back(succ);
+            }
+        }
+        // Ends dead (never continues), or leaves its own blocks: keep as is.
+        if (!live || foreign) return keep(entry);
+        // A scratch slot must be private to the region to be renamed or erased with it.
+        llvm::SmallPtrSet<llvm::BasicBlock*, 8> members(region.begin(), region.end());
+        for (llvm::AllocaInst* slot : scratch)
+            for (llvm::User* user : slot->users())
+                if (auto* inst = llvm::dyn_cast<llvm::Instruction>(user); inst == nullptr || !members.contains(inst->getParent()))
+                    return keep(entry);
+        auto eraseRegion = [&] {
+            EraseUnwindRegion(region);
+            for (llvm::AllocaInst* slot : scratch)
+                if (slot->use_empty()) slot->eraseFromParent();
+        };
+        if (region.size() == 1 && entry->size() == 1 && scratch.empty()) { eraseRegion(); return target; }
+        auto& candidates = chain.Regions[UnwindRegionHash(region, scratch)];
+        for (auto& candidate : candidates)
+        {
+            std::vector<llvm::BasicBlock*> blocks;
+            for (auto& handle : candidate.Blocks)
+                if (handle != nullptr) blocks.push_back(llvm::cast<llvm::BasicBlock>(handle));
+            std::vector<llvm::AllocaInst*> slots;
+            for (auto& handle : candidate.Scratch)
+                if (handle != nullptr) slots.push_back(llvm::cast<llvm::AllocaInst>(handle));
+            if (blocks.size() != candidate.Blocks.size() || slots.size() != candidate.Scratch.size()
+                || !SameUnwindRegion(region, scratch, blocks, slots))
+                continue;
+            eraseRegion();
+            return blocks.front();
+        }
+        candidates.push_back({ { region.begin(), region.end() }, { scratch.begin(), scratch.end() } });
+        return keep(entry);
+    }
+
 llvm::CallBase* LLVMBackend::CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::Value* callee,
                                                 llvm::ArrayRef<llvm::Value*> args, bool mayUnwind,
                                                 const llvm::Twine& name)
@@ -5764,6 +6099,8 @@ llvm::CallBase* LLVMBackend::CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::
             || !FrameOwesUnwindCleanup())
             return builder->CreateCall(fnTy, callee, args, name);
 
+        UnwindChainState& chain = ChainStateFor(fn);
+
         auto* padBB = llvm::BasicBlock::Create(*context, "unwind.cleanup", fn);
         auto* contBB = llvm::BasicBlock::Create(*context, "invoke.cont", fn);
         auto* invoke = builder->CreateInvoke(fnTy, callee, contBB, padBB, args, name);
@@ -5780,6 +6117,7 @@ llvm::CallBase* LLVMBackend::CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::
         } padStateReset{ *this };
         const bool funclet = targetWindows_;
         llvm::Value* pad = nullptr;
+        llvm::BasicBlock* unwindTarget = nullptr;
         if (funclet)
             pad = builder->CreateCleanupPad(llvm::ConstantTokenNone::get(*context), {}, "unwind.pad");
         else
@@ -5788,6 +6126,17 @@ llvm::CallBase* LLVMBackend::CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::
             auto* lp = builder->CreateLandingPad(lpTy, 0, "unwind.lp");
             lp->setCleanup(true);
             pad = lp;
+            if (chain.ExceptionSlot == nullptr || chain.ResumeBlock == nullptr)
+            {
+                llvm::AllocaInst* slot = AllocaAtEntry(lpTy, nullptr, "unwind.exception");
+                auto* resume = llvm::BasicBlock::Create(*context, "unwind.resume", fn);
+                llvm::IRBuilder<> resumeBuilder(resume);
+                resumeBuilder.CreateResume(resumeBuilder.CreateLoad(lpTy, slot, "unwind.exn"));
+                chain.ExceptionSlot = slot;
+                chain.ResumeBlock = resume;
+            }
+            builder->CreateStore(pad, chain.ExceptionSlot);
+            unwindTarget = llvm::cast<llvm::BasicBlock>(chain.ResumeBlock);
         }
         llvm::IRBuilderBase::OperandBundlesGuard operandBundlesGuard(*builder);
         llvm::SmallVector<llvm::Value*, 1> funcletInputs;
@@ -5803,6 +6152,7 @@ llvm::CallBase* LLVMBackend::CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::
         // constructor's finished subobjects before the full-expression's temporaries.
         for (auto it = unwindPartial_.rbegin(); it != unwindPartial_.rend(); ++it)
             if (it->Fn == fn && IsInsertBlockLive()) EmitUnwindPartialRelease(*it);
+        llvm::BasicBlock* cleanupExitBB = builder->GetInsertBlock();
         if (ownFrame)
         {
             // Then the statement's temps still OWNED at the invoke: in FlushOwnedStructTemps'
@@ -5835,19 +6185,40 @@ llvm::CallBase* LLVMBackend::CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::
                 if (t.ConditionalSlot != nullptr) EmitOwnedConditionalPtrTempFree(t);
                 else EmitOwnedPtrTempFree(t.Value, t.TypeName, t.AllocAlign, t.RawArrayCount, t.ReleaseGate);
             }
-            for (auto it = stackNamedVariable.rbegin(); it != stackNamedVariable.rend(); ++it)
+            cleanupExitBB = builder->GetInsertBlock();
+            if (funclet)
             {
-                unwindSkipSeqFloor_ = UnwindInitFloorForDepth((size_t)(stackNamedVariable.rend() - it));
-                EmitDestructorsForScope(*it);
-                if (it->isFunction) break;
+                for (auto it = stackNamedVariable.rbegin(); it != stackNamedVariable.rend(); ++it)
+                {
+                    unwindSkipSeqFloor_ = UnwindInitFloorForDepth((size_t)(stackNamedVariable.rend() - it));
+                    EmitDestructorsForScope(*it);
+                    if (it->isFunction) break;
+                }
+            }
+            else
+            {
+                // Execution order: innermost scope first, each scope's locals newest first, then
+                // its owning arguments and lock releases. Chained back to front so each link
+                // knows its continuation; a pad then enters at the newest live local.
+                std::vector<std::function<void()>> units;
+                CollectScopeCleanupUnits(units, /*unwindFloors*/ true);
+                // Cleanup code has no user location; one shared location lets -g share it too.
+                if (currentSubprogram)
+                    builder->SetCurrentDebugLocation(llvm::DILocation::get(
+                        *context, currentSubprogram->getLine(), 0, currentSubprogram));
+                for (auto it = units.rbegin(); it != units.rend() && unwindTarget != nullptr; ++it)
+                    unwindTarget = ChainUnwindCleanup(chain, unwindTarget, *it);
             }
         }
+        if (ownFrame && !funclet) builder->SetInsertPoint(cleanupExitBB);
         if (IsInsertBlockLive())
         {
             if (funclet)
                 builder->CreateCleanupRet(llvm::cast<llvm::CleanupPadInst>(pad));
+            else if (unwindTarget != nullptr)
+                builder->CreateBr(unwindTarget);
             else
-                builder->CreateResume(pad);
+                builder->CreateUnreachable();
         }
         builder->SetInsertPoint(contBB);
         builder->SetCurrentDebugLocation(savedLoc);

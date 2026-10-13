@@ -5087,6 +5087,7 @@ void LLVMBackend::ResetForReanalysis()
     pendingOwnedStringTemps.clear();
     pendingOwnedStructTemps.clear();
     emittingUnwindCleanup_ = false;
+    unwindChains_.clear();
     unwindSkipSeqFloor_ = UINT64_MAX;
     unwindInitFloors_.clear();
     unwindPartial_.clear();

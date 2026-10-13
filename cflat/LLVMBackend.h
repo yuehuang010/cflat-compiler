@@ -5973,6 +5973,41 @@ private:
                                        llvm::ArrayRef<llvm::Value*> args, bool mayUnwind,
                                        const llvm::Twine& name = "");
     bool emittingUnwindCleanup_ = false;
+    // Shared Itanium unwind cleanup chain of the active function: one exception slot + resume
+    // block, and emitted cleanup regions keyed by a content hash (continuation included) so
+    // landing pads branch into an existing suffix instead of re-destroying every live local.
+    // Weak handles: trial codegen erases the blocks (or whole function) it created.
+    // Kept per function: out-of-line helpers are emitted between a body's statements.
+    struct UnwindChainState
+    {
+        llvm::WeakVH Fn;
+        llvm::WeakVH ExceptionSlot;
+        llvm::WeakVH ResumeBlock;
+        // A cached region: its blocks plus the entry-block scratch allocas it alone uses.
+        struct Region { std::vector<llvm::WeakVH> Blocks; std::vector<llvm::WeakVH> Scratch; };
+        std::unordered_map<uint64_t, std::vector<Region>> Regions;
+        // Normal-path chain (CreateReturnCall): returns store a destination id and their value,
+        // run the shared chain, and the dispatch switch resumes each return's own tail.
+        llvm::WeakVH DestSlot;
+        llvm::WeakVH Dispatch;
+        std::unordered_map<llvm::Type*, llvm::WeakVH> ReturnSlots;
+        uint32_t NextDest = 0;
+    };
+    UnwindChainState& ChainStateFor(llvm::Function* fn);
+    // Cleanup units of every scope out to the function boundary, in execution order.
+    void CollectScopeCleanupUnits(std::vector<std::function<void()>>& units, bool unwindFloors);
+    // Route a return's scope cleanups through the shared chain; false = caller emits inline.
+    bool ChainReturnCleanups(llvm::Value*& value);
+    // Set while a chain region is emitted: AllocaAtEntry records the scratch slots it creates
+    // (loop counters, spills) so two emissions of the same cleanup compare equal.
+    std::vector<llvm::AllocaInst*>* unwindScratchAllocas_ = nullptr;
+    std::unordered_map<llvm::Function*, UnwindChainState> unwindChains_;
+    // Owning-argument destructors and lock releases of one scope (EmitDestructorsForScope tail).
+    void EmitScopeArgumentAndLockCleanups(const StackState& frame);
+    // Emit `emit` as a region ending in `br target`, reuse an identical cached region instead.
+    // Returns the region entry, or `target` when the region is empty.
+    llvm::BasicBlock* ChainUnwindCleanup(UnwindChainState& chain, llvm::BasicBlock* target,
+                                         const std::function<void()>& emit);
     // A declaration registers its local before the initializer finishes, so an unwind out of that
     // initializer must not destroy it: (scope depth, first DeclSequence) per open declarator.
     std::vector<std::pair<size_t, uint64_t>> unwindInitFloors_;

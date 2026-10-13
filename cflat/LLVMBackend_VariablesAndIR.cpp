@@ -270,6 +270,7 @@ llvm::AllocaInst* LLVMBackend::AllocaAtEntry(llvm::Type* type, llvm::Value* arra
         }
         if (align != 0)
             a->setAlignment(llvm::Align(align));
+        if (unwindScratchAllocas_ != nullptr) unwindScratchAllocas_->push_back(a);
         return a;
     }
 

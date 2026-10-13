@@ -1682,12 +1682,14 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
             }
         }
 
-        // Emit destructors for all scopes from innermost out to the function boundary
-        for (auto it = stackNamedVariable.rbegin(); it != stackNamedVariable.rend(); ++it)
-        {
-            EmitDestructorsForScope(*it);
-            if (it->isFunction) break;
-        }
+        // Emit destructors for all scopes from innermost out to the function boundary, through
+        // the shared cleanup chain when the frame is large enough to pay for it.
+        if (!ChainReturnCleanups(value))
+            for (auto it = stackNamedVariable.rbegin(); it != stackNamedVariable.rend(); ++it)
+            {
+                EmitDestructorsForScope(*it);
+                if (it->isFunction) break;
+            }
 
         // Restore flags (clean state, though the scope is about to be popped anyway).
         // The returned string local was moved out by zeroing its storage (not by toggling
