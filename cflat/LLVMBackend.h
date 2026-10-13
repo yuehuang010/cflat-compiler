@@ -4261,6 +4261,9 @@ private:
     // LRU bookkeeping for the map above. Both mutate only under cFileSigCacheMutex_.
     static inline uint64_t cFileSigCacheClock_ = 0;
     static inline size_t cFileSigCacheRows_ = 0;
+    // Rows of entries no active root pins: the only ones eviction may take. Zero lets
+    // EvictUnpinnedOverBudget return without scanning every entry under the mutex.
+    static inline size_t cFileSigCacheUnpinnedRows_ = 0;
     // Row budget for entries no active root references. One windows.h binding is ~54k rows /
     // ~105 MB, so this keeps roughly two cold large headers; the cache is rebuildable state.
     static constexpr size_t kCFileSigCacheRowBudget = 120000;
@@ -4308,29 +4311,43 @@ private:
         if (activeRootKey_.empty()) return;
         auto root = activeRoots_.find(activeRootKey_);
         if (root == activeRoots_.end()) return;  // in-progress roots are never aged out; defensive
-        if (root->second.headerKeys.insert(key).second) ++pinnedHeaderRefs_[key];
+        if (root->second.headerKeys.insert(key).second && ++pinnedHeaderRefs_[key] == 1)
+            if (auto entry = cFileSigCache_.find(key); entry != cFileSigCache_.end())
+                cFileSigCacheUnpinnedRows_ -= entry->second.rows;
+    }
+    // Caller must hold cFileSigCacheMutex_. Drops one active root's pin on `key`.
+    static void UnpinHeader(const std::string& key)
+    {
+        auto pin = pinnedHeaderRefs_.find(key);
+        if (pin == pinnedHeaderRefs_.end() || --pin->second != 0) return;
+        pinnedHeaderRefs_.erase(pin);
+        if (auto entry = cFileSigCache_.find(key); entry != cFileSigCache_.end())
+            cFileSigCacheUnpinnedRows_ += entry->second.rows;
+    }
+    static bool IsHeaderPinned(const std::string& key)
+    {
+        auto pin = pinnedHeaderRefs_.find(key);
+        return pin != pinnedHeaderRefs_.end() && pin->second > 0;
     }
     // Caller must hold cFileSigCacheMutex_. Evicts the least recently used UNPINNED entries
     // until the row budget is met; `keep` (the entry just inserted) is never a victim.
     static void EvictUnpinnedOverBudget(const std::string& keep, bool verbose)
     {
-        while (cFileSigCacheRows_ > kCFileSigCacheRowBudget)
+        if (cFileSigCacheRows_ <= kCFileSigCacheRowBudget || cFileSigCacheUnpinnedRows_ == 0) return;
+        // One pass, oldest first: a root aging out unpins thousands of entries at once, and a
+        // rescan per victim made that burst O(victims x entries) under the mutex.
+        std::vector<decltype(cFileSigCache_)::iterator> candidates;
+        for (auto it = cFileSigCache_.begin(); it != cFileSigCache_.end(); ++it)
+            if (it->first != keep && !IsHeaderPinned(it->first)) candidates.push_back(it);
+        std::ranges::sort(candidates, {}, [](const auto& it) { return it->second.lastUse; });
+        for (auto victim : candidates)
         {
-            auto victim = cFileSigCache_.end();
-            for (auto it = cFileSigCache_.begin(); it != cFileSigCache_.end(); ++it)
-            {
-                if (it->first == keep) continue;
-                if (auto pin = pinnedHeaderRefs_.find(it->first);
-                    pin != pinnedHeaderRefs_.end() && pin->second > 0)
-                    continue;
-                if (victim == cFileSigCache_.end() || it->second.lastUse < victim->second.lastUse)
-                    victim = it;
-            }
-            if (victim == cFileSigCache_.end()) break;  // everything left is pinned or new
+            if (cFileSigCacheRows_ <= kCFileSigCacheRowBudget) break;
             if (verbose)
                 std::cout << std::format("[verbose] C signatures cache evicted {} ({} rows)\n",
                                          victim->first, victim->second.rows);
             cFileSigCacheRows_ -= victim->second.rows;
+            cFileSigCacheUnpinnedRows_ -= victim->second.rows;
             cFileSigCache_.erase(victim);
         }
     }
@@ -4348,10 +4365,16 @@ private:
         entry.rows = CFileSigEntryRows(entry);
         entry.lastUse = ++cFileSigCacheClock_;
         const size_t addedRows = entry.rows;
+        const bool pinned = IsHeaderPinned(key);
         auto existing = cFileSigCache_.find(key);
-        if (existing != cFileSigCache_.end()) cFileSigCacheRows_ -= existing->second.rows;
+        if (existing != cFileSigCache_.end())
+        {
+            cFileSigCacheRows_ -= existing->second.rows;
+            if (!pinned) cFileSigCacheUnpinnedRows_ -= existing->second.rows;
+        }
         cFileSigCache_[key] = std::move(entry);
         cFileSigCacheRows_ += addedRows;
+        if (!pinned) cFileSigCacheUnpinnedRows_ += addedRows;
         PinHeaderForActiveRoot(key);
         EvictUnpinnedOverBudget(key, verbose);
     }
@@ -6005,9 +6028,10 @@ private:
     // Owning-argument destructors and lock releases of one scope (EmitDestructorsForScope tail).
     void EmitScopeArgumentAndLockCleanups(const StackState& frame);
     // Emit `emit` as a region ending in `br target`, reuse an identical cached region instead.
-    // Returns the region entry, or `target` when the region is empty.
+    // Returns the region entry, or `target` when the region is empty. `funclet`: the region is
+    // its own Windows cleanuppad ending in `cleanupret unwind label target` (null = to caller).
     llvm::BasicBlock* ChainUnwindCleanup(UnwindChainState& chain, llvm::BasicBlock* target,
-                                         const std::function<void()>& emit);
+                                         const std::function<void()>& emit, bool funclet = false);
     // A declaration registers its local before the initializer finishes, so an unwind out of that
     // initializer must not destroy it: (scope depth, first DeclSequence) per open declarator.
     std::vector<std::pair<size_t, uint64_t>> unwindInitFloors_;
@@ -6747,6 +6771,14 @@ private:
     static bool HashFileFnv1a(const std::string& path, uint64_t& outHash);
     static bool HashCxxHeaderFileContents(const std::string& path, uint64_t& outHash,
                                          bool force = false);
+    // CxxGroupHeaderHash: header hash per path for the analysis in progress, so each type
+    // request does not re-stat every group header. Cleared by ResetForReanalysis.
+    mutable std::unordered_map<std::string, uint64_t> cxxGroupHeaderHashMemo_;
+    // CxxGroupHeaderStamp: the same per-analysis memo for header mtimes (nullopt = stat failed).
+    mutable std::unordered_map<std::string, std::optional<std::filesystem::file_time_type>> cxxGroupHeaderStampMemo_;
+    // Type-request disk keys with no cache file this analysis: each later miss skips the probe.
+    // This analysis's own stores land in cFileSigCache_ first, so the memory lookup still hits.
+    std::unordered_set<uint64_t> cxxTypeRequestDiskAbsent_;
     bool HashFileContents(const std::string& path, uint64_t& outHash) const;
 
     void RegisterCSignatures(const std::vector<CSigEntry>& sigs, const std::string& fileForLsp,
@@ -9965,6 +9997,9 @@ public:
     std::map<std::string, std::string> cppStructOverrideNames_;
     // Retained extractor records let a refused member be rebound when its specialization is used.
     std::map<std::string, CRecordEntry> cxxRecordEntries_;
+    // CxxReferenceParameterSpelling: method linkage -> (record key, member index) of its last
+    // match. Re-checked against cxxRecordEntries_ on use, so a stale slot only costs the scan.
+    mutable std::unordered_map<std::string, std::pair<std::string, size_t>> cxxMethodLinkageMemo_;
     std::map<std::string, std::string> pendingCxxRecordProjections_;
     std::map<std::string, std::string> pendingCxxMemberProjections_;
     std::map<std::string, std::set<std::string>> projectedCxxMemberNames_;

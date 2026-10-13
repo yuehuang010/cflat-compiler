@@ -3431,6 +3431,11 @@ inline void ApplyOwningSinkInferenceToBody(const LLVMBackend* compiler,
                                      const IfConstEvaluator& evalIfConst = {})
 {
     if (body == nullptr) return;
+    // The scans only feed eligible parameters; a body with none (`main()`) skips them - their
+    // shadowing checks are quadratic in the statement count of a large function.
+    if (std::none_of(allParams.begin(), allParams.end(), [](const auto& p) {
+            return !p.VariableName.empty() && ParamIsOwningSinkEligible(p); }))
+        return;
     std::unordered_set<std::string> movedNames;
     ReturnScanMemo returnScanMemo;
     CollectUnconditionalMovedNames(body, movedNames, evalIfConst, &returnScanMemo);

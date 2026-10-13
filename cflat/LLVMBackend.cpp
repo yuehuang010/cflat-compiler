@@ -2837,12 +2837,7 @@ void LLVMBackend::BeginActiveRoot(const std::string& rootPath)
                 && (oldest == activeRoots_.end() || it->second.lastUse < oldest->second.lastUse))
                 oldest = it;
         if (oldest == activeRoots_.end()) break;
-        for (const auto& key : oldest->second.headerKeys)
-        {
-            auto pin = pinnedHeaderRefs_.find(key);
-            if (pin == pinnedHeaderRefs_.end()) continue;
-            if (--pin->second == 0) pinnedHeaderRefs_.erase(pin);
-        }
+        for (const auto& key : oldest->second.headerKeys) UnpinHeader(key);
         if (verbose) std::cout << std::format("[verbose] active root aged out: {}\n", oldest->first);
         activeRoots_.erase(oldest);
     }
@@ -4911,6 +4906,10 @@ void LLVMBackend::ResetForReanalysis()
     cxxTriviallyRelocatableRecords_.clear();
     cxxClasses_.clear();
     cxxRecordEntries_.clear();
+    cxxMethodLinkageMemo_.clear();
+    cxxGroupHeaderHashMemo_.clear();
+    cxxGroupHeaderStampMemo_.clear();
+    cxxTypeRequestDiskAbsent_.clear();
     pendingCxxRecordProjections_.clear();
     pendingCxxMemberProjections_.clear();
     projectedCxxMemberNames_.clear();

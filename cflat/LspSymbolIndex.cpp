@@ -38,7 +38,15 @@ void LspSymbolIndex::Register(SymbolKind kind, const std::string& name, const st
             def.docComment = prev.docComment;
     }
 
+    NoteDisplayName(def);
     symbols_[name] = std::move(def);
+}
+
+void LspSymbolIndex::NoteDisplayName(const SymbolDef& def)
+{
+    if (def.displayName.empty() || def.displayName == def.name) return;
+    auto& keys = displayNameKeys_[def.displayName];
+    if (keys.empty() || keys.back() != def.name) keys.push_back(def.name);
 }
 
 void LspSymbolIndex::RemoveFunctionAliases(const std::string& name)
@@ -65,6 +73,7 @@ void LspSymbolIndex::RemoveFunctionAliases(const std::string& name)
 void LspSymbolIndex::RegisterDefinition(const SymbolDef& def)
 {
     if (def.name.empty()) return;
+    NoteDisplayName(def);
     symbols_[def.name] = def;
 }
 
@@ -80,7 +89,10 @@ void LspSymbolIndex::MergeFrom(const LspSymbolIndex& other)
 {
     for (const auto& [name, def] : other.symbols_)
         if (!symbols_.contains(name))
+        {
+            NoteDisplayName(def);
             symbols_.emplace(name, def);
+        }
     for (const auto& [name, info] : other.variables_)
         if (!variables_.contains(name))
             variables_.emplace(name, info);
@@ -92,9 +104,11 @@ const SymbolDef* LspSymbolIndex::Lookup(const std::string& name) const
 {
     auto it = symbols_.find(name);
     if (it != symbols_.end()) return &it->second;
-    for (const auto& [key, def] : symbols_)
-        if (def.displayName == name)
-            return &def;
+    auto keys = displayNameKeys_.find(name);
+    if (keys == displayNameKeys_.end()) return nullptr;
+    for (const auto& key : keys->second)
+        if (auto def = symbols_.find(key); def != symbols_.end() && def->second.displayName == name)
+            return &def->second;
     return nullptr;
 }
 
@@ -112,6 +126,7 @@ std::vector<const SymbolDef*> LspSymbolIndex::LookupPrefix(const std::string& pr
 void LspSymbolIndex::Clear()
 {
     symbols_.clear();
+    displayNameKeys_.clear();
     variables_.clear();
     variableLocations_.clear();
     functionRanges_.clear();

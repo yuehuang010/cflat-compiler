@@ -8160,10 +8160,15 @@ bool LLVMBackend::CxxGroupHeaderStamp(const CxxRequestGroup& group,
         newest = std::filesystem::file_time_type{};
         for (const auto& h : group.headers)
         {
-            std::error_code ec;
-            auto mt = std::filesystem::last_write_time(h, ec);
-            if (ec) return false;
-            if (mt > newest) newest = mt;
+            auto [memo, fresh] = cxxGroupHeaderStampMemo_.try_emplace(h);
+            if (fresh)
+            {
+                std::error_code ec;
+                auto mt = std::filesystem::last_write_time(h, ec);
+                if (!ec) memo->second = mt;
+            }
+            if (!memo->second.has_value()) return false;
+            if (*memo->second > newest) newest = *memo->second;
         }
         return true;
     }
@@ -8249,8 +8254,9 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
         uint64_t combined = 14695981039346656037ULL;
         for (const auto& h : group.headers)
         {
-            uint64_t hash = 0;
-            HashCxxHeaderFileContents(h, hash);
+            auto [memo, fresh] = cxxGroupHeaderHashMemo_.try_emplace(h, 0);
+            if (fresh) HashCxxHeaderFileContents(h, memo->second);
+            const uint64_t hash = memo->second;
             combined ^= hash; combined *= 1099511628211ULL;
         }
         combined ^= CxxGroupClosureHash(group); combined *= 1099511628211ULL;
@@ -8399,6 +8405,13 @@ bool LLVMBackend::TryLoadCxxTypeRequestCache(const CxxRequestGroup& group,
         }
         CFileSigCacheEntry diskEntry;
         std::string diskReason;
+        if (cxxTypeRequestDiskAbsent_.contains(diskKey))
+        {
+            missReason = "missing entry";
+            if (verbose) llvm::errs() << std::format(
+                "[verbose] C++ type request cache MISS for {} ({})\n", requestLabel, missReason);
+            return false;
+        }
         {
             llvm::TimeTraceScope loadScope("CxxTypeRequestJsonLoad", requestKey);
             if (!TryLoadCHeaderDiskCache(cacheDir, diskKey, headerMtime,
@@ -8406,6 +8419,7 @@ bool LLVMBackend::TryLoadCxxTypeRequestCache(const CxxRequestGroup& group,
                                          requestKey, emitDefinitions, &diskReason,
                                          !batchMode_ && !runMode_ && symbolSink_ == nullptr))
             {
+                if (diskReason == "missing entry") cxxTypeRequestDiskAbsent_.insert(diskKey);
                 missReason = diskReason.empty() ? missReason : diskReason;
                 if (verbose) llvm::errs() << std::format(
                     "[verbose] C++ type request cache MISS for {} ({})\n",

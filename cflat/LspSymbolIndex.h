@@ -104,7 +104,11 @@ public:
     std::vector<const FunctionRange*> FunctionsIn(const std::string& file) const;
 
 private:
+    // Records `def` under its displayName for Lookup's fallback; entries are re-checked on use,
+    // so an overwrite or erase in symbols_ needs no bookkeeping here.
+    void NoteDisplayName(const SymbolDef& def);
     std::unordered_map<std::string, SymbolDef> symbols_;
+    std::unordered_map<std::string, std::vector<std::string>> displayNameKeys_;
     std::vector<FunctionRange> functionRanges_;
     std::unordered_map<std::string, VariableInfo> variables_;
     std::unordered_map<std::string, std::vector<VariableInfo>> variableLocations_;

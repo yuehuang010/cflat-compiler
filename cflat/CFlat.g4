@@ -33,6 +33,12 @@
 
 grammar CFlat;
 
+options { contextSuperClass = CFlatRuleContext; }
+
+@parser::header {
+#include "CFlatRuleContext.h"
+}
+
 primaryExpression
     : Constant
     | Default                                    // 'default' as a VALUE: type comes from the destination

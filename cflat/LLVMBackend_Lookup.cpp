@@ -824,11 +824,25 @@ std::string LLVMBackend::CxxReferenceParameterSpelling(const FunctionSymbol& can
                     if (raw.linkageName == *linkage
                         && index < raw.paramSpellings.size())
                         return raw.paramSpellings[index];
+            if (auto memo = cxxMethodLinkageMemo_.find(*linkage); memo != cxxMethodLinkageMemo_.end())
+                if (auto record = cxxRecordEntries_.find(memo->second.first);
+                    record != cxxRecordEntries_.end() && memo->second.second < record->second.members.size())
+                {
+                    const auto& method = record->second.members[memo->second.second];
+                    if (method.linkageName == *linkage && index < method.paramTypes.size())
+                        return method.paramTypes[index];
+                }
             for (const auto& [className, record] : cxxRecordEntries_)
-                for (const auto& method : record.members)
+                for (size_t mi = 0; mi < record.members.size(); ++mi)
+                {
+                    const auto& method = record.members[mi];
                     if (method.linkageName == *linkage
                         && index < method.paramTypes.size())
+                    {
+                        cxxMethodLinkageMemo_[*linkage] = { className, mi };
                         return method.paramTypes[index];
+                    }
+                }
             if (declared == candidate.UniqueName) break;
         }
         return {};
