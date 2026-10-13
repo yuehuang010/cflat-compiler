@@ -480,14 +480,12 @@ std::pair<std::string, std::string> LLVMBackend::ProgramTargetCPUFeatures() cons
 
         // Clang's Darwin driver canonicalizes apple-m1 to apple-a14 in function attrs.
         // Use that canonical CPU for the target machine and harvested request TUs.
-        const std::string cpu = targetMacOS_
-            ? std::string("apple-a14") : llvm::sys::getHostCPUName().str();
         if (targetMacOS_)
-            return { cpu, "+aes,+altnzcv,+ccdp,+ccidx,+ccpp,+complxnum,+crc,+dit,+dotprod,+flagm,+fp-armv8,+fp16fml,+fptoint,+fullfp16,+jsconv,+lse,+neon,+pauth,+perfmon,+predres,+ras,+rcpc,+rdm,+sb,+sha2,+sha3,+specrestrict,+ssbs,+v8.1a,+v8.2a,+v8.3a,+v8.4a,+v8a" };
-        const auto hostFeatures = llvm::sys::getHostCPUFeatures();
-        std::string features;
-        if (!hostFeatures.empty())
-        {
+            return { "apple-a14", "+aes,+altnzcv,+ccdp,+ccidx,+ccpp,+complxnum,+crc,+dit,+dotprod,+flagm,+fp-armv8,+fp16fml,+fptoint,+fullfp16,+jsconv,+lse,+neon,+pauth,+perfmon,+predres,+ras,+rcpc,+rdm,+sb,+sha2,+sha3,+specrestrict,+ssbs,+v8.1a,+v8.2a,+v8.3a,+v8.4a,+v8a" };
+        // The host never changes within a process; the query (cpuid sweep) is hot on C++ requests.
+        static const std::pair<std::string, std::string> hostCpuFeatures = [] {
+            const auto hostFeatures = llvm::sys::getHostCPUFeatures();
+            std::string features;
             std::map<std::string, bool> ordered;
             for (const auto& feature : hostFeatures)
                 ordered.emplace(feature.getKey().str(), feature.getValue());
@@ -497,8 +495,9 @@ std::pair<std::string, std::string> LLVMBackend::ProgramTargetCPUFeatures() cons
                 features += enabled ? '+' : '-';
                 features += name;
             }
-        }
-        return { cpu, features };
+            return std::pair<std::string, std::string>{ llvm::sys::getHostCPUName().str(), features };
+        }();
+        return hostCpuFeatures;
     }
 
 void LLVMBackend::StampProgramTargetAttributes()
