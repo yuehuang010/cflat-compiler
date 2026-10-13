@@ -26,7 +26,7 @@ chain with `git merge-tree` / `commit-tree`, so nothing is checked out until `--
    - C interop ABI
    - issue queue bookkeeping
 
-   Aim for 3-8 groups. Put queue / resume bookkeeping commits in one final group with
+   Aim for 3-8 groups (chronological fallback in step 4 when topics will not separate). Put queue / resume bookkeeping commits in one final group with
    `"bookkeeping": true`.
 
 3. **Write the plan** to `scratch/squash_<date>/plan.json`:
@@ -53,6 +53,16 @@ chain with `git merge-tree` / `commit-tree`, so nothing is checked out until `--
      - merge two interleaved topics under one broader headline;
      - put independent topics first.
      Re-run each time; a dry run takes seconds. Two parts are acceptable, a scatter is not.
+   - **Fallback: chronological chunks.** If no topical plan comes out at 3-8 commits (a long
+     fix box touches the same files every landing: `MainListener.h`, shared tests, issue
+     files), cut the range into 5-10 contiguous runs instead. Cut at timebox breaks (gaps in
+     `--date` order) or every ~20-40 commits, always right after a landing's queue commit. Each run
+     keeps its own code + queue commits, so it replays with no conflicts at all. Only the
+     trailing queue commits after the last landing form the `bookkeeping` group. Headline:
+     `<2-3 dominant topics>, fix box <date> (<T-range>): <key items>`. Do not collapse to one
+     catch-all code commit: 2026-10-12 a topical plan scattered to 13-17 parts, the
+     catch-all came out as 2 commits (too coarse), and 7 chronological chunks + bookkeeping
+     came out clean.
    - `dead end` / `tree mismatch` means stop and regroup. Never apply a plan that did not
      report a clean dry run. A dead end lists the pending commits (and their groups) it
      depends on: move those into its group. Typical case: a code commit deletes an issue
