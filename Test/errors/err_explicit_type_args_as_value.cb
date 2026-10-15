@@ -1,0 +1,68 @@
+// Explicit type arguments on a name that is not a generic function, or with the wrong count,
+// used as a function VALUE (no call). Each spelling compiled on master and crashed at run time.
+
+int nwrap(int a) { return a + 2; }
+int t1(int a) { return a + 1; }
+T gid<T>(T a) { return a + 2; }
+T gid2<T, U>(T a, U b) { return a + 1; }
+int app(function<int(int)> f, int v) { return f(v); }
+
+// A non-generic function with type arguments: refused in every value slot.
+expect_error("'nwrap' is not a generic function") {
+    int useDecl() { function<int(int)> g = nwrap<int>; return g(1); }
+}
+
+expect_error("'nwrap' is not a generic function") {
+    int useAssign() { function<int(int)> g = t1; g = nwrap<int>; return g(1); }
+}
+
+expect_error("'nwrap' is not a generic function") {
+    int useArg() { return app(nwrap<int>, 1); }
+}
+
+expect_error("'nwrap' is not a generic function") {
+    function<int(int)> useRet() { return nwrap<int>; }
+}
+
+expect_error("'nwrap' is not a generic function") {
+    int useTernary(int k) { function<int(int)> g = k ? nwrap<int> : t1; return g(1); }
+}
+
+expect_error("'nwrap' is not a generic function") {
+    bool useBool() { bool b = nwrap<int>; return b; }
+}
+
+expect_error("'nwrap' is not a generic function") {
+    bool useNull() { return nwrap<int> == nullptr; }
+}
+
+expect_error("'nwrap' is not a generic function") {
+    double useMul() { return nwrap<int> * 0.5; }
+}
+
+// A name with no declaration at all is not a generic function either.
+expect_error("'nosuchFn' is not a generic function") {
+    int useUndef() { function<int(int)> g = nosuchFn<int>; return g(1); }
+}
+
+// Too many type arguments for a generic value: refused, never instantiated at the wrong arity.
+expect_error("did not instantiate the generic function template 'gid', so it has no value") {
+    int useDeclMany() { function<int(int)> g = gid<int, int>; return g(1); }
+}
+
+expect_error("did not instantiate the generic function template 'gid', so it has no value") {
+    function<int(int)> useRetMany() { return gid<int, int>; }
+}
+
+expect_error("did not instantiate the generic function template 'gid', so it has no value") {
+    int useTernaryMany(int k) { function<int(int)> g = k ? gid<int, int> : t1; return g(1); }
+}
+
+// Too few type arguments for a generic value.
+expect_error("did not instantiate the generic function template 'gid2', so it has no value") {
+    int useDeclFew() { function<int(int, int)> g = gid2<int>; return g(1, 2); }
+}
+
+expect_error("did not instantiate the generic function template 'gid2', so it has no value") {
+    bool useBoolFew() { bool b = gid2<int>; return b; }
+}

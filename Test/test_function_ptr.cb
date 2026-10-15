@@ -1268,6 +1268,22 @@ bool testCaptureLocalArray()
         result &= Test("capture owning string array move", h(0), 38);
     }
 
+    // T213: a 256-element owning array capture deep-copies every element (a walked copy, past the
+    // unrolled threshold). Rewriting the source afterwards must not reach the copy: a missed or
+    // aliased element would change the sum.
+    {
+        string[256] big;
+        for (int k = 0; k < 256; k++) big[k] = "ab";
+        big[255] = "abcdefg";
+        Lambda<int(int)> sumBig = (int i) => {
+            int total = 0;
+            for (int k = 0; k < 256; k++) total += big[k].length();
+            return total + i;
+        };
+        for (int k = 0; k < 256; k++) big[k] = "x";
+        result &= Test("capture 256 string array deep copy", sumBig(0), 517);
+    }
+
     // Struct arrays follow reference capture, including structs with owning fields.
     lamArrItemDtors = 0;
     {
@@ -1851,6 +1867,105 @@ bool testFuncPtrMoveSignature()
     int got = fp(p);
     // Caller's pointer is auto-nulled by the funcptr's 'move' contract; scope-exit cleanup is a no-op.
     return got == 7 && g_move_fp_dtor_count == 1;
+}
+
+int t208CallArgDtorCount = 0;
+struct T208CallArgPayload
+{
+    int value = 0;
+    ~T208CallArgPayload() { t208CallArgDtorCount++; }
+};
+
+int t208CallArgPlusOne(int x) { return x + 1; }
+int t208CallArgShadow(int x) { return x + 100; }
+int t208CallArgConsumeMove(move T208CallArgPayload* p)
+{
+    int value = p->value;
+    delete p;
+    return value;
+}
+int t208CallArgInvoke(function<int(int)> f, int x) { return f(x); }
+int t208CallArgInvokePtr(function<int(int*)> f, int* p) { return f(p); }
+int t208CallArgInvokeMove(function<int(move T208CallArgPayload*)> f)
+{
+    T208CallArgPayload* p = new T208CallArgPayload();
+    p->value = 7;
+    return f(p);
+}
+
+int t208CallArgOverloadSelected = 0;
+int t208CallArgOverload(int* p)
+{
+    t208CallArgOverloadSelected = 1;
+    return *p;
+}
+int t208CallArgOverload(move int* p)
+{
+    t208CallArgOverloadSelected = 2;
+    int value = *p;
+    delete p;
+    return value;
+}
+
+move T208CallArgPayload* t208CallArgMakeOwned(int value)
+{
+    T208CallArgPayload* p = new T208CallArgPayload();
+    p->value = value;
+    return p;
+}
+T208CallArgPayload* t208CallArgMakeBorrowed(int value)
+{
+    T208CallArgPayload* p = new T208CallArgPayload();
+    p->value = value;
+    return p;
+}
+int t208CallArgInvokeOwnedReturn(function<move T208CallArgPayload*(int)> f)
+{
+    T208CallArgPayload* p = f(7);
+    return p->value;
+}
+int t208CallArgInvokeBorrowedReturn(function<T208CallArgPayload*(int)> f)
+{
+    T208CallArgPayload* p = f(8);
+    int value = p->value;
+    delete p;
+    return value;
+}
+
+bool testT208FunctionArgAcceptSet()
+{
+    bool result = true;
+    result &= Test("t208 matching borrowed callback name", t208CallArgInvoke(t208CallArgPlusOne, 5), 6);
+
+    // A local function-pointer value shadows a same-named global function.
+    function<int(int)> t208CallArgShadow = t208CallArgPlusOne;
+    result &= Test("t208 local callback shadows function name", t208CallArgInvoke(t208CallArgShadow, 5), 6);
+
+    int value = 7;
+    t208CallArgOverloadSelected = 0;
+    result &= Test("t208 borrow overload callback value", t208CallArgInvokePtr(t208CallArgOverload, &value), 7);
+    result &= Test("t208 borrow overload callback selected", t208CallArgOverloadSelected, 1);
+
+    t208CallArgDtorCount = 0;
+    result &= Test("t208 matching move callback value", t208CallArgInvokeMove(t208CallArgConsumeMove), 7);
+    result &= Test("t208 matching move callback dtor once", t208CallArgDtorCount, 1);
+
+    t208CallArgDtorCount = 0;
+    result &= Test("t208 matching owned return callback value", t208CallArgInvokeOwnedReturn(t208CallArgMakeOwned), 7);
+    result &= Test("t208 matching owned return dtor once", t208CallArgDtorCount, 1);
+
+    t208CallArgDtorCount = 0;
+    result &= Test("t208 matching borrowed return callback value", t208CallArgInvokeBorrowedReturn(t208CallArgMakeBorrowed), 8);
+    result &= Test("t208 matching borrowed return dtor once", t208CallArgDtorCount, 1);
+
+    t208CallArgDtorCount = 0;
+    function<T208CallArgPayload*(int)> ownedReturn = t208CallArgMakeOwned;
+    {
+        T208CallArgPayload* p = ownedReturn(9);
+        result &= Test("t208 declarator preserves owned return value", p->value, 9);
+    }
+    result &= Test("t208 declarator owned return dtor once", t208CallArgDtorCount, 1);
+    return result;
 }
 
 // ── Non-capturing lambda across the C ABI ────────────────────────────────────
@@ -5629,6 +5744,28 @@ bool testT196GenericSetterStringCapture()
     return Test("t196 generic setter string capture after scope", b.v(), 5) != 0;
 }
 
+// T201: a generic instantiation named as a function VALUE at the sites a bare function name
+// reaches: a bool declaration, a return into function<>/Lambda<>/generic return types, an argument.
+T t201Twice<T>(T a) { return a * 2; }
+function<int(int)> t201Ret() { return t201Twice<int>; }
+function<T(T)> t201PickT<T>() { return t201Twice<T>; }
+Lambda<int(int)> t201RetL() { return t201Twice<int>; }
+int t201Apply(function<int(int)> f, int v) { return f(v); }
+
+bool testT201GenericValueSites()
+{
+    bool result = true;
+    bool gb = t201Twice<int>;                            // a function value is true, like a named one
+    result &= Test("generic instance to bool is true", gb ? 1 : 0, 1);
+    result &= Test("generic return into function slot", t201Ret()(4), 8);
+    result &= Test("generic return from generic function", t201PickT<int>()(5), 10);
+    result &= Test("generic return into Lambda slot", t201RetL()(6), 12);
+    result &= Test("generic instance as function argument", t201Apply(t201Twice<int>, 7), 14);
+    function<int(int)> g = t201Twice<int>;
+    result &= Test("generic instance in function declaration", g(9), 18);
+    return result;
+}
+
 extern int main(int argc, char** argv)
 {
     // The tooling regression harness passes one argument and calls this twice. The second call
@@ -5707,6 +5844,7 @@ extern int main(int argc, char** argv)
 
     // 'move' in function pointer signatures
     total++; passed += testFuncPtrMoveSignature()      ? 1 : 0;
+    total++; passed += testT208FunctionArgAcceptSet()  ? 1 : 0;
 
     // Non-capturing lambda across the C ABI
     total++; passed += testNonCapturingLambdaToCFuncPtr() ? 1 : 0;
@@ -5846,6 +5984,7 @@ extern int main(int argc, char** argv)
     total++; passed += testT196GenericSetterAlias()        ? 1 : 0;
     total++; passed += testT196GenericSetterStructCapture() ? 1 : 0;
     total++; passed += testT196GenericSetterStringCapture() ? 1 : 0;
+    total++; passed += testT201GenericValueSites() ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

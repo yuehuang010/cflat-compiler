@@ -1,0 +1,5 @@
+// A float variable used as an array dimension is refused at the local dimension site, not left to
+// module verification (the same site as a function name dimension).
+expect_error("array dimension 'f' must have an integer type") {
+    int g() { float f = 3.0f; int[f] a = default; return 0; }
+}

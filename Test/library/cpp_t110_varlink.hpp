@@ -35,8 +35,7 @@ struct Overloaded {
 };
 }
 
-// T144: an sret return with scalar varargs passes the tail as clang does; a by-value aggregate in
-// the `...` tail is refused at the call (err_cpp_variadic_aggregate.cb).
+// T144: an sret return with scalar varargs passes the tail as clang does.
 struct T144Pod8 { int a; int b; };
 struct T144Pod16 { long long a; long long b; };
 struct T144Big { long long a, b, c, d; };
@@ -54,6 +53,14 @@ T144Big out_sret(int n, ...) {
 inline int take8(int n, ...) {
   va_list ap; va_start(ap, n); T144Pod8 p = va_arg(ap, T144Pod8); va_end(ap); return n + p.a * 10 + p.b;
 }
+inline int take16(int n, ...) {
+  va_list ap; va_start(ap, n); T144Pod16 p = va_arg(ap, T144Pod16); va_end(ap);
+  return n + (int)(p.a * 10 + p.b);
+}
+inline int takeBig(int n, ...) {
+  va_list ap; va_start(ap, n); T144Big p = va_arg(ap, T144Big); va_end(ap);
+  return n + (int)(p.a * 1000 + p.b * 100 + p.c * 10 + p.d);
+}
 struct Ret {
   int k = 7;
   inline T144Big m0(int n, ...) { return T144Big{n, 0, k, 4}; }
@@ -64,6 +71,65 @@ struct Ret {
   T144Big plain(int n, long long x) { return T144Big{n, x, k, 4}; }
 };
 }
+
+// T204: by-value aggregate varargs use Clang's call-site ABI arrangement.
+struct T204S1 { unsigned char a; };
+struct T204S8 { int a, b; };
+struct T204S12 { int a, b, c; };
+struct T204S16 { long long a, b; };
+struct T204S24 { long long a, b, c; };
+struct T204Hfa { float a, b, c, d; };
+struct T204Ret { long long a, b, c, d; };
+struct T204Nontrivial {
+  int a;
+  T204Nontrivial() : a(1) {}
+  T204Nontrivial(const T204Nontrivial& x) : a(x.a) {}
+  ~T204Nontrivial() {}
+};
+inline int t204_s1(int n, ...) {
+  va_list ap; va_start(ap, n); T204S1 x = va_arg(ap, T204S1); va_end(ap); return n + x.a;
+}
+inline int t204_s8(int n, ...) {
+  va_list ap; va_start(ap, n); T204S8 x = va_arg(ap, T204S8); va_end(ap); return n + x.a * 10 + x.b;
+}
+inline int t204_s12(int n, ...) {
+  va_list ap; va_start(ap, n); T204S12 x = va_arg(ap, T204S12); int y = va_arg(ap, int);
+  va_end(ap); return n + x.a * 100 + x.b * 10 + x.c + y;
+}
+inline int t204_s16(int n, ...) {
+  va_list ap; va_start(ap, n); T204S16 x = va_arg(ap, T204S16); va_end(ap);
+  return n + (int)(x.a * 10 + x.b);
+}
+inline int t204_s24(int n, ...) {
+  va_list ap; va_start(ap, n); T204S24 x = va_arg(ap, T204S24); va_end(ap);
+  return n + (int)(x.a * 100 + x.b * 10 + x.c);
+}
+inline int t204_hfa(int n, ...) {
+  va_list ap; va_start(ap, n); T204Hfa x = va_arg(ap, T204Hfa); va_end(ap);
+  return n + (int)(x.a * 1000 + x.b * 100 + x.c * 10 + x.d);
+}
+inline T204Ret t204_sret(int n, ...) {
+  va_list ap; va_start(ap, n); T204S12 x = va_arg(ap, T204S12); int y = va_arg(ap, int);
+  va_end(ap); return T204Ret{n, x.a * 100 + x.b * 10 + x.c, y, 4};
+}
+struct T204Member {
+  int k = 7;
+  inline int take(int n, ...) {
+    va_list ap; va_start(ap, n); T204S8 x = va_arg(ap, T204S8); va_end(ap);
+    return n + k + x.a * 10 + x.b;
+  }
+};
+// T210: an ellipsis-only overload has no fixed parameter before its variadic tail.
+inline int t210_none(...) { return 2113; }
+inline int t210_none(int n) { return 2114 + n; }
+template <class T> struct T210TMember {
+  T k;
+  inline long long take(int n, ...) {
+    va_list ap; va_start(ap, n); T204S8 x = va_arg(ap, T204S8); va_end(ap);
+    return n + k + x.a * 10 + x.b;
+  }
+};
+inline int t204_nontrivial(int n, ...) { return n; }
 
 // T161: out-of-line variadic C++ members (declared in the class, defined outside it) bind like
 // their in-class siblings: the scalar tail takes the default promotions and an sret return works.
@@ -80,6 +146,7 @@ struct Out {
   T161Big mix(int n, ...);
   T161Big cmix(int n, ...) const;
   static T161Big s_mix(int n, ...);
+  static T161Big s_agg(int n, ...);
   int ov(int n, long long x);
   int ov(int n, ...);
 };
@@ -103,6 +170,10 @@ T161Big t161::Out::cmix(int n, ...) const {
   return T161Big{n, (long long)(z * 2), k, 6};
 }
 T161Big t161::Out::s_mix(int n, ...) { va_list ap; va_start(ap, n); int x = va_arg(ap, int); va_end(ap); return T161Big{n, x, 5, 6}; }
+T161Big t161::Out::s_agg(int n, ...) {
+  va_list ap; va_start(ap, n); T161Big x = va_arg(ap, T161Big); va_end(ap);
+  return T161Big{n, x.a, x.b, x.c + x.d};
+}
 int t161::Out::ov(int n, long long x) { return (int)(n * 100 + x); }
 int t161::Out::ov(int n, ...) { va_list ap; va_start(ap, n); int x = va_arg(ap, int); va_end(ap); return n + x; }
 template <class T> T161Big t161::Tpl<T>::m(int n, ...) {

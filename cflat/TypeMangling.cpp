@@ -695,15 +695,19 @@ std::string MangleGenericInstance(const LLVMBackend& compiler, std::string_view 
     std::vector<std::string> args = spelledArgs;
     StripDefaultedTrailingArgs(compiler, base, args);
     std::string result = MangleGenericInstanceUnchecked(compiler, base, args);
-    TypeManglingAccess::RememberArity(compiler, result, args.size());
+    if (!args.empty())
+        TypeManglingAccess::RememberArity(compiler, result, args.size());
 #ifndef NDEBUG
-    TypeSpelling spelling;
-    assert(DemangleType(compiler, result, spelling));
-    std::vector<std::string> demangledArgs;
-    demangledArgs.reserve(spelling.args.size());
-    for (const auto& arg : spelling.args)
-        demangledArgs.push_back(MangleTypeFromSpelling(compiler, arg));
-    assert(MangleGenericInstanceUnchecked(compiler, spelling.base, demangledArgs) == result);
+    if (!args.empty())
+    {
+        TypeSpelling spelling;
+        assert(DemangleType(compiler, result, spelling));
+        std::vector<std::string> demangledArgs;
+        demangledArgs.reserve(spelling.args.size());
+        for (const auto& arg : spelling.args)
+            demangledArgs.push_back(MangleTypeFromSpelling(compiler, arg));
+        assert(MangleGenericInstanceUnchecked(compiler, spelling.base, demangledArgs) == result);
+    }
 #endif
     return result;
 }

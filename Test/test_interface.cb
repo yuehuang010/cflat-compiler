@@ -5235,6 +5235,103 @@ IShape t91Coalesce(Square* p) { return p ?? p; }
 IShape t91StaticElement() { static Square[3] sarr = default; sarr[1].s = 3; return &sarr[1]; }
 IShape t91FieldElement(T91Box* b) { return &b->arr[1]; }
 
+struct T198PointerHolder { Square* p = default; };
+T198PointerHolder t198SafePointerHolder = default;
+IShape t198StructSlotGlobal() { T198PointerHolder h = default; h.p = &t91GArr[0]; return h.p; }
+IShape t198StructSlotParam(Square* p) { T198PointerHolder h = default; h.p = p; return h.p; }
+IShape t198ArraySlotGlobal() { Square*[2] ps = default; ps[1] = &t91GArr[1]; return ps[1]; }
+IShape t198ArraySlotParam(Square* p) { Square*[2] ps = default; ps[1] = p; return ps[1]; }
+IShape t198ArrayOtherSlot() { Square* owner = new Square(); Square* alias = owner; Square*[2] ps = default; ps[0] = alias; ps[1] = &t91GArr[1]; return ps[1]; }
+IShape t198ConditionalSafe(Square* p, int k) { IShape i = p; if (k) i = &t91GArr[1]; return i; }
+IShape t198FieldOverwriteViaPointer()
+{
+    Square* owner = new Square();
+    owner->s = 6;
+    Square* alias = owner;
+    T198PointerHolder h = default;
+    h.p = alias;
+    T198PointerHolder* hp = &h;
+    hp->p = &t91GArr[0];
+    return h.p;
+}
+IShape t198StructCopyOver()
+{
+    Square* owner = new Square();
+    owner->s = 6;
+    Square* alias = owner;
+    T198PointerHolder h = default;
+    h.p = alias;
+    t198SafePointerHolder.p = &t91GArr[0];
+    h = t198SafePointerHolder;
+    IShape r = h.p;
+    delete owner;
+    return r;
+}
+IShape t198OverwriteOwnedAlias()
+{
+    Square* owner = new Square();
+    Square* alias = owner;
+    IShape i = alias;
+    i = &t91GArr[0];
+    return i;
+}
+IShape t198OverwriteEveryPath(Square* p, int k)
+{
+    Square* owner = new Square();
+    Square* alias = owner;
+    IShape i = alias;
+    if (k) i = p;
+    else i = &t91GArr[0];
+    return i;
+}
+// T198 round 2: unrelated branches must not multiply reaching-store work.
+IShape t198ManyIfs(int k)
+{
+    int x = 0;
+    IShape i = &t91GArr[0];
+    if (k == 0) x = x + 1;
+    if (k == 1) x = x + 1;
+    if (k == 2) x = x + 1;
+    if (k == 3) x = x + 1;
+    if (k == 4) x = x + 1;
+    if (k == 5) x = x + 1;
+    if (k == 6) x = x + 1;
+    if (k == 7) x = x + 1;
+    if (k == 8) x = x + 1;
+    if (k == 9) x = x + 1;
+    if (k == 10) x = x + 1;
+    if (k == 11) x = x + 1;
+    if (k == 12) x = x + 1;
+    if (k == 13) x = x + 1;
+    if (k == 14) x = x + 1;
+    if (k == 15) x = x + 1;
+    if (k == 16) x = x + 1;
+    if (k == 17) x = x + 1;
+    if (k == 18) x = x + 1;
+    if (k == 19) x = x + 1;
+    if (k == 20) x = x + 1;
+    if (k == 21) x = x + 1;
+    if (k == 22) x = x + 1;
+    if (k == 23) x = x + 1;
+    if (k == 24) x = x + 1;
+    if (k == 25) x = x + 1;
+    if (k == 26) x = x + 1;
+    if (k == 27) x = x + 1;
+    if (k == 28) x = x + 1;
+    if (k == 29) x = x + 1;
+    if (k == 30) x = x + 1;
+    if (k == 31) x = x + 1;
+    if (k == 32) x = x + 1;
+    if (k == 33) x = x + 1;
+    if (k == 34) x = x + 1;
+    if (k == 35) x = x + 1;
+    if (k == 36) x = x + 1;
+    if (k == 37) x = x + 1;
+    if (k == 38) x = x + 1;
+    if (k == 39) x = x + 1;
+    return i;
+}
+
 bool testInterfaceReturnAcceptSet()
 {
     HeapAudit.enable();
@@ -5262,9 +5359,28 @@ bool testInterfaceReturnAcceptSet()
     IShape coalesced = t91Coalesce(&squares[0]);
     IShape staticElem = t91StaticElement();
     IShape fieldElem = t91FieldElement(&box);
+    IShape structGlobal = t198StructSlotGlobal();
+    IShape structParam = t198StructSlotParam(&squares[1]);
+    IShape arrayGlobal = t198ArraySlotGlobal();
+    IShape arrayParam = t198ArraySlotParam(&squares[1]);
+    IShape otherArraySlot = t198ArrayOtherSlot();
+    IShape conditionalSafe = t198ConditionalSafe(&squares[0], 1);
+    IShape overwritten = t198OverwriteOwnedAlias();
+    IShape everyPathGlobal = t198OverwriteEveryPath(&squares[1], 0);
+    IShape everyPathParam = t198OverwriteEveryPath(&squares[1], 1);
+    IShape viaPointerOverwrite = t198FieldOverwriteViaPointer();
+    IShape viaStructCopy = t198StructCopyOver();
+    IShape manyIfs = t198ManyIfs(3);
+    bool rebindHeapOk = (int)HeapAudit.reportLeaks() == base;
     bool ok = heapOk && ownedArea == 4 && freshArea == 0 && callArea == 0
         && paramPlain.area() == 4 && paramElem.area() == 9 && globalElem.area() == 16
-        && coalesced.area() == 4 && staticElem.area() == 9 && fieldElem.area() == 9;
+        && coalesced.area() == 4 && staticElem.area() == 9 && fieldElem.area() == 9
+        && structGlobal.area() == 25 && structParam.area() == 9
+        && arrayGlobal.area() == 16 && arrayParam.area() == 9 && otherArraySlot.area() == 16
+        && conditionalSafe.area() == 16 && overwritten.area() == 25
+        && everyPathGlobal.area() == 25 && everyPathParam.area() == 9
+        && viaPointerOverwrite.area() == 25 && viaStructCopy.area() == 25
+        && manyIfs.area() == 25 && rebindHeapOk;
     printf("%s: interface return accept set\n", ok ? "PASS" : "FAIL");
     return ok;
 }

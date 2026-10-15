@@ -722,6 +722,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 trivialCxxMoveSite_ = TopLevelMoveExpression(assignExpr);
             returnNV = ParseAssignmentExpressionNamed(assignExpr, ResultUse::ReturnOperand);
             trivialCxxMoveSite_ = nullptr;
+            // A generic instantiation returned as a function value (`return dbl<int>;`) is bound to its
+            // instance here, the way a named function value is, before the return slot is checked.
+            ResolveGenericFunctionValueOperand(returnNV, assignExpr);
             // A returned function-pointer VALUE must match the declared return slot (variadic-ness and bind rule).
             if (returnFnPtrTV.IsFunctionPointer && returnNV.TypeAndValue.IsFunctionPointer)
                 if (std::string why = compiler->DescribeFuncPtrValueMismatch(
@@ -1391,11 +1394,81 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         // restore the old broken ABI and returning an alloca would dangle immediately.
         if (aliasRefReturn)
         {
+            if (returnNV.Storage == nullptr && returnNV.TypeAndValue.IsAlias
+                && returnNV.Primary != nullptr && returnNV.Primary->getType()->isPointerTy()
+                && compiler->GetEncodedClosureType(returnNV.TypeAndValue.TypeName) != nullptr)
+            {
+                // A closure alias call returns the address of its caller-owned closure slot.
+                returnNV.Storage = returnNV.Primary;
+            }
             if (returnNV.Storage == nullptr)
                 LogErrorContext(errCtx,
                     "cannot return an 'alias' value without addressable storage; return a live "
                     "lvalue rather than a temporary value");
-            if (PointsIntoStackFrame(returnNV.Storage))
+            std::unordered_set<llvm::Value*> visitedAliasRoots;
+            std::function<bool(llvm::Value*, unsigned)> aliasSourcePointsIntoFrame;
+            aliasSourcePointsIntoFrame = [&](llvm::Value* value, unsigned depth) -> bool {
+                if (value == nullptr || depth > 32) return false;
+                const bool viaGep = llvm::isa<llvm::GEPOperator>(value);
+                value = value->stripPointerCasts();
+                if (!visitedAliasRoots.insert(value).second) return false;
+
+                if (PointsIntoStackFrame(value))
+                {
+                    llvm::Value* root = value;
+                    while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(root))
+                        root = gep->getPointerOperand()->stripPointerCasts();
+                    const auto* binding = compiler->FindVariableByStorage(root);
+                    // Only the param itself is caller-owned; a field of the callee's copy is not.
+                    if (viaGep || root != value || binding == nullptr || !IsBorrowedByValueParamBinding(compiler, *binding))
+                        return true;
+                }
+
+                if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+                {
+                    for (llvm::Value* incoming : phi->incoming_values())
+                        if (aliasSourcePointsIntoFrame(incoming, depth + 1)) return true;
+                    return false;
+                }
+                if (auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+                    return aliasSourcePointsIntoFrame(select->getTrueValue(), depth + 1)
+                        || aliasSourcePointsIntoFrame(select->getFalseValue(), depth + 1);
+                if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
+                    return aliasSourcePointsIntoFrame(gep->getPointerOperand(), depth + 1);
+
+                auto* call = llvm::dyn_cast<llvm::CallBase>(value);
+                if (call == nullptr || call->getCalledFunction() == nullptr) return false;
+                const auto* symbol = compiler->FindSymbolForFunction(call->getCalledFunction());
+                if (symbol == nullptr || symbol->IsCxx || symbol->ReturnType.Pointer
+                    || (!symbol->ReturnType.IsAlias && !symbol->ReturnsAlias))
+                    return false;
+
+                // Method symbols may list the receiver as their first parameter.
+                const unsigned paramOffset = symbol->IsMethod
+                    && symbol->Parameters.size() < call->arg_size() ? 1 : 0;
+                for (unsigned i = 0; i < call->arg_size(); ++i)
+                {
+                    bool mayReturnArgument = symbol->IsMethod && i == 0;
+                    if (i >= paramOffset)
+                    {
+                        const size_t paramIndex = i - paramOffset;
+                        if (paramIndex < symbol->Parameters.size())
+                        {
+                            const auto& param = symbol->Parameters[paramIndex];
+                            mayReturnArgument = mayReturnArgument || param.IsAlias
+                                || (symbol->ReturnsAliasOfByValueParam && !param.Pointer
+                                    && !param.IsMove
+                                    && compiler->ResolveTypeAlias(param.TypeName)
+                                        == compiler->ResolveTypeAlias(symbol->ReturnType.TypeName));
+                        }
+                    }
+                    if (mayReturnArgument
+                        && aliasSourcePointsIntoFrame(call->getArgOperand(i), depth + 1))
+                        return true;
+                }
+                return false;
+            };
+            if (aliasSourcePointsIntoFrame(returnNV.Storage, 0))
             {
                 // An alias LOCAL bound to a frame-local owner is still frame storage, so the
                 // borrow marker cannot excuse it - only a caller-owned by-value param can.
@@ -2665,21 +2738,13 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && right->getType() == compiler->GetFatPtrType()
             && returnedFatFrameSlot == nullptr)
         {
-            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(right))
-                if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(
-                        load->getPointerOperand()->stripPointerCasts()))
-                {
-                    const auto* slotNV = compiler->FindVariableByStorage(slot);
-                    compiler->RecordPendingReturnDangleCheck(
-                        slot, static_cast<int>(errCtx->getStart()->getLine()),
-                        static_cast<int>(errCtx->getStart()->getCharPositionInLine()),
-                        compiler->currentFunctionReturnTypeName,
-                        slotNV != nullptr && slotNV->InterfaceBoxFrameStorage,
-                        slotNV == nullptr || slotNV->InterfaceBoxReturnProvenanceUnknown,
-                        slotNV == nullptr ? std::string()
-                            : slotNV->InterfaceBoxFrameStorageClassName,
-                        slotNV != nullptr && slotNV->InterfaceBoxAliasOfOwnedLocal);
-                }
+                if (auto* load = llvm::dyn_cast<llvm::LoadInst>(right))
+                    if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(
+                            load->getPointerOperand()->stripPointerCasts()))
+                        compiler->RecordPendingReturnDangleCheck(
+                            slot, load, static_cast<int>(errCtx->getStart()->getLine()),
+                            static_cast<int>(errCtx->getStart()->getCharPositionInLine()),
+                            compiler->currentFunctionReturnTypeName);
         }
         if (auto* fatTy = compiler->GetFatPtrType();
             right != nullptr && fatTy != nullptr && compiler->currentFunction != nullptr
@@ -2725,9 +2790,54 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                         PointerValueRootKind rootKind = PointerRootKind(right, compiler);
                         // `&hp->first` folds to `hp` in IR (field 0): a member address of an owning local
                         // is still a borrow of it. `&t[0]` is not a member access and stays a move.
-                        if (rootKind == PointerValueRootKind::OwnedLocal && retText.size() > 1
-                            && retText[0] == '&'
-                            && (retText.find("->") != std::string::npos || retText.find('.') != std::string::npos))
+                        auto addressOfMemberShape = [&]() {
+                            antlr4::tree::ParseTree* node = assignExpr;
+                            CFlatParser::UnaryExpressionContext* unary = nullptr;
+                            while (node != nullptr)
+                            {
+                                if (auto* candidate = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
+                                    candidate != nullptr && candidate->unaryOperator() != nullptr)
+                                {
+                                    unary = candidate;
+                                    break;
+                                }
+                                if (node->children.size() != 1) return false;
+                                node = node->children[0];
+                            }
+                            if (unary == nullptr || unary->unaryOperator()->getText() != "&"
+                                || unary->castExpression() == nullptr)
+                                return false;
+                            std::function<bool(CFlatParser::AssignmentExpressionContext*)> isMemberExpression;
+                            std::function<bool(CFlatParser::UnaryExpressionContext*)> isMemberLvalue =
+                                [&](CFlatParser::UnaryExpressionContext* candidate) {
+                                    if (candidate == nullptr) return false;
+                                    if (auto* postfix = candidate->postfixExpression())
+                                    {
+                                        if (!postfix->memberNameToken().empty()) return true;
+                                        auto* primary = postfix->primaryExpression();
+                                        return primary != nullptr && primary->expression() != nullptr
+                                            && isMemberExpression(primary->expression()->assignmentExpression());
+                                    }
+                                    return candidate->unaryOperator() != nullptr
+                                        && candidate->castExpression() != nullptr
+                                        && candidate->castExpression()->unaryExpression() != nullptr
+                                        && isMemberLvalue(candidate->castExpression()->unaryExpression());
+                                };
+                            isMemberExpression = [&](CFlatParser::AssignmentExpressionContext* expression) {
+                                antlr4::tree::ParseTree* nested = expression;
+                                while (nested != nullptr)
+                                {
+                                    if (auto* candidate = dynamic_cast<CFlatParser::UnaryExpressionContext*>(nested))
+                                        return isMemberLvalue(candidate);
+                                    if (nested->children.size() != 1) return false;
+                                    nested = nested->children[0];
+                                }
+                                return false;
+                            };
+                            return unary->castExpression()->unaryExpression() != nullptr
+                                && isMemberLvalue(unary->castExpression()->unaryExpression());
+                        };
+                        if (rootKind == PointerValueRootKind::OwnedLocal && addressOfMemberShape())
                             rootKind = PointerValueRootKind::AliasOfOwnedLocal;
                         if (rootKind == PointerValueRootKind::FrameLocal)
                             LogInterfaceReturnDangle(errCtx, structName, ifaceName);

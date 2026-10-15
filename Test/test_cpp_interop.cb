@@ -2005,9 +2005,9 @@ int t161Legs()
     t161Big = t161Tpl.m(9, 17);
     if (t161Big.a != 9 || t161Big.b != 17 || t161Big.d != 8) return 3987;
     T161Big t161Agg = {a = 1, b = 2, c = 3, d = 4};
-    expect_error("cannot pass aggregate value of type 'T161Big' to the variadic") {
-        T161Big t161Bad = t161.Out.s_mix(9, t161Agg);
-    }
+    T161Big t161AggRet = t161.Out.s_agg(9, t161Agg);
+    if (t161AggRet.a != 9 || t161AggRet.b != 1 || t161AggRet.c != 2 || t161AggRet.d != 7)
+        return 4112;
     // Out-of-line cppi.Variadic::sum (cpp_interop_basic.cpp) is reached and returns its count.
     cppi.Variadic t161Vs = cppi.Variadic();
     if (t161Vs.sum(5, 1, 2, 3) != 5) return 3988;
@@ -11512,7 +11512,7 @@ extern int main()
     if (t110Over.ov(3, 4) != 2007) return 3754;
     expect_error("ambiguous call to 'ov'") { t110Over.ov(3); }
     // T144: sret returns with scalar varargs pass the tail as clang does (inline, non-inline, member);
-    // a non-variadic sret member stays right. Aggregate varargs are refused (err_cpp_variadic_aggregate.cb).
+    // a non-variadic sret member stays right.
     T144Big t144Big = t144v.inl_sret0(9);
     if (t144Big.a != 9 || t144Big.d != 4) return 3970;
     t144Big = t144v.out_sret0(9);
@@ -11528,6 +11528,38 @@ extern int main()
     if (t144Big.b != 11 || t144Big.c != 12 || t144Big.d != 5) return 3975;
     t144Big = t144Ret.plain(9, (i64)11);
     if (t144Big.b != 11 || t144Big.c != 7) return 3976;
+    T144Pod8 t144Pod8 = {3, 4};
+    if (t144v.take8(1, t144Pod8) != 35) return 4101;
+    T144Pod16 t144Pod16 = {5, 6};
+    if (t144v.take16(1, t144Pod16) != 57) return 4102;
+    T144Big t144Aggregate32 = {7, 8, 9, 10};
+    if (t144v.takeBig(1, t144Aggregate32) != 7901) return 4103;
+    // T204: Clang-arranged by-value aggregate variadic arguments match the C++ oracle.
+    T204S1 t204S1 = {a = 1};
+    T204S8 t204S8 = {a = 2, b = 3};
+    T204S12 t204S12 = {a = 1, b = 2, c = 3};
+    T204S16 t204S16 = {a = 4, b = 5};
+    T204S24 t204S24 = {a = 1, b = 2, c = 3};
+    T204Hfa t204Hfa = {a = 1.0, b = 2.0, c = 3.0, d = 4.0};
+    if (t204_s1(10, t204S1) != 11) return 4104;
+    if (t204_s8(10, t204S8) != 33) return 4105;
+    if (t204_s12(10, t204S12, 4) != 137) return 4106;
+    if (t204_s16(10, t204S16) != 55) return 4107;
+    if (t204_s24(10, t204S24) != 133) return 4108;
+    if (t204_hfa(10, t204Hfa) != 1244) return 4109;
+    T204Ret t204Ret = t204_sret(10, t204S12, 4);
+    if (t204Ret.a != 10 || t204Ret.b != 123 || t204Ret.c != 4 || t204Ret.d != 4)
+        return 4110;
+    T204Member t204Member = T204Member();
+    if (t204Member.take(10, t204S8) != 40) return 4111;
+    T210TMember<int> t210Member = T210TMember<int>();
+    t210Member.k = 5;
+    if (t210Member.take(1, t204S8) != 29) return 4115;
+    if (t210_none() != 2113) return 4116;
+    float t210Float = 2.5;
+    int t210Marker = 0;
+    if (t210_none(1, t210Float, (void*)&t210Marker) != 2113) return 4113;
+    if (t210_none(1, t204S8) != 2113) return 4114;
     int t161Rc = t161Legs();
     if (t161Rc != 0) return t161Rc;
     cppexp.MemRankRref rankRref = cppexp.MemRankRref();
@@ -14653,4 +14685,3 @@ int W4NestedJoin(int c)
     cppon.Esc* empty = nullptr;
     return W4JoinRead(empty ?? (c > 0 ? new cppon.Esc(3) : empty));
 }
-

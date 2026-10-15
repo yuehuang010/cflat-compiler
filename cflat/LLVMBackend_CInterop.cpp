@@ -8051,7 +8051,8 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
                                      const std::vector<CxxRequestItem>& items,
                                      const std::string& extraSource, bool emitDefinitions,
                                      cflat_cinterop::ExtractResult& raw, std::string& error,
-                                     const std::string& prefixSource)
+                                     const std::string& prefixSource,
+                                     const cflat_cinterop::VariadicCallAbiRequest* variadicCallAbi)
 {
         llvm::TimeTraceScope scope("RunCxxTypeRequests", group.label);
         cflat_cinterop::ExtractRequest req;
@@ -8067,6 +8068,8 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
         req.requireInScope = false;
         req.completeCxxSpecialMembers = completingCxxSpecialMembers_;
         req.verbose = verbose;
+        if (variadicCallAbi != nullptr)
+            req.variadicCallAbiRequest = *variadicCallAbi;
         AttachCxxHeaderParseGuard(req, group);
         for (const CxxRequestItem& item : items)
             req.cxxTypeRequests.push_back({ item.cxxSpelling, item.cflatName });
@@ -8190,6 +8193,160 @@ bool LLVMBackend::RunCxxTypeRequests(const CxxRequestGroup& group,
         }
         return ok;
     }
+
+/* Lazily query Clang's call-site ABI only for an aggregate in a selected C++ vararg tail. */
+bool LLVMBackend::RequestCxxVariadicCallAbi(
+        const FunctionSymbol& candidate, const std::vector<NamedVariable>& arguments,
+        cflat_cinterop::RawAbi& abi, std::string& error)
+{
+        error.clear();
+        if (!candidate.IsCxx || !candidate.Variadic || candidate.UniqueName.empty()
+            || arguments.size() <= candidate.Parameters.size())
+            return false;
+
+        size_t primary = static_cast<size_t>(-1);
+        if (candidate.IsMethod && !candidate.Parameters.empty())
+        {
+            auto owner = cxxTypeOwnerGroup_.find(candidate.Parameters.front().TypeName);
+            if (owner != cxxTypeOwnerGroup_.end()) primary = owner->second;
+        }
+        else
+        {
+            const std::string& name = candidate.SourceName.empty()
+                ? candidate.UniqueName : candidate.SourceName;
+            auto owner = cxxFunctionOwnerGroup_.find(name);
+            if (owner != cxxFunctionOwnerGroup_.end()) primary = owner->second;
+            else if (const size_t dot = name.rfind('.'); dot != std::string::npos)
+                if (auto memberOwner = cxxTypeOwnerGroup_.find(name.substr(0, dot));
+                    memberOwner != cxxTypeOwnerGroup_.end())
+                    primary = memberOwner->second;
+        }
+        if (primary >= cxxImportGroups_.size()) return false;
+
+        std::string receiverTypeSpelling;
+        if (candidate.IsMethod && !candidate.Parameters.empty())
+            CxxSpellingForCflatType(candidate.Parameters.front().TypeName,
+                                    receiverTypeSpelling);
+
+        std::vector<size_t> dependencies;
+        std::unordered_set<std::string> visited;
+        std::vector<std::string> tailSpellings;
+        tailSpellings.reserve(arguments.size() - candidate.Parameters.size());
+        uint64_t requestHash = 14695981039346656037ULL;
+        auto hashText = [&](const std::string& text) {
+            for (unsigned char byte : text)
+                requestHash = (requestHash ^ byte) * 1099511628211ULL;
+        };
+        hashText(candidate.UniqueName);
+        if (!receiverTypeSpelling.empty()) hashText(receiverTypeSpelling);
+        for (size_t i = candidate.Parameters.size(); i < arguments.size(); ++i)
+        {
+            const NamedVariable& argument = arguments[i];
+            const TypeAndValue& type = argument.TypeAndValue;
+            if (type.IsFunctionPointer || type.IsArrayView || type.IsInterface || type.ElemPointer)
+                return false;
+
+            llvm::Type* valueType = argument.Primary != nullptr
+                ? argument.Primary->getType() : GetType(type);
+            std::string cflatType = type.TypeName;
+            if (cflatType.empty())
+                if (auto* record = llvm::dyn_cast_or_null<llvm::StructType>(valueType))
+                    cflatType = record->getName().str();
+            std::string spelling;
+            if (valueType != nullptr && (valueType->isFloatTy() || valueType->isHalfTy()))
+            {
+                spelling = "double";
+            }
+            else if (valueType != nullptr && valueType->isIntegerTy()
+                     && valueType->getIntegerBitWidth() < 32)
+            {
+                spelling = "int";
+            }
+            else
+            {
+                if (cflatType.empty())
+                {
+                    if (valueType == nullptr || !valueType->isIntegerTy()) return false;
+                    const unsigned width = valueType->getIntegerBitWidth();
+                    spelling = width <= 32 ? "int" : width <= 64 ? "long long" : "__int128";
+                }
+                else if (!CxxSpellingForCflatType(cflatType, spelling)) return false;
+                if (type.Pointer)
+                {
+                    size_t pointerDepth = type.PointerDepth == 0 ? 1 : type.PointerDepth;
+                    std::string base = cflatType;
+                    while (base.ends_with("*")) { base.pop_back(); if (pointerDepth > 1) --pointerDepth; }
+                    if (base == cflatType)
+                        for (size_t depth = 0; depth < pointerDepth; ++depth) spelling += " *";
+                }
+            }
+            tailSpellings.push_back(spelling);
+            hashText(spelling);
+            if (!cflatType.empty())
+                CollectCxxTypeOwnerGroups(cflatType, dependencies, visited);
+        }
+        if (tailSpellings.empty()) return false;
+
+        CxxRequestGroup group = MakeCxxRequestGroup(primary, dependencies);
+        if (group.headers.empty()) return false;
+
+        const std::string aliasStem = std::format("__cflat_t204_{:016x}_", requestHash);
+        std::string aliasSource;
+        std::vector<std::string> aliases;
+        aliases.reserve(tailSpellings.size());
+        std::string receiverAlias;
+        if (!receiverTypeSpelling.empty())
+        {
+            receiverAlias = aliasStem + "receiver";
+            aliasSource += "using " + receiverAlias + " = " + receiverTypeSpelling + ";\n";
+            aliasSource += "static_assert(sizeof(" + receiverAlias + ") > 0);\n";
+        }
+        for (size_t i = 0; i < tailSpellings.size(); ++i)
+        {
+            std::string alias = aliasStem + std::to_string(i);
+            aliasSource += "using " + alias + " = " + tailSpellings[i] + ";\n";
+            aliases.push_back(std::move(alias));
+        }
+
+        cflat_cinterop::VariadicCallAbiRequest callRequest;
+        callRequest.targetLinkageName = candidate.UniqueName;
+        callRequest.instanceMethod = candidate.IsMethod;
+        callRequest.receiverTypeAlias = receiverAlias;
+        callRequest.argumentTypeAliases = aliases;
+        const std::string requestSource = BuildCxxRequestIncludes(group) + aliasSource;
+        const std::vector<std::string> requestArgs = BuildCxxRequestClangArgs(group);
+
+        const std::string cacheName = "T204 variadic call ABI " + candidate.UniqueName;
+        const std::string cacheKey = CxxTypeRequestCacheKey(
+            group, cacheName, requestSource, requestArgs, /*emitDefinitions*/ false) + "|T204VARABI";
+        CFileSigCacheEntry cached;
+        std::string missReason;
+        if (TryLoadCxxTypeRequestCache(group, cacheKey, /*emitDefinitions*/ false,
+                                       cached, missReason))
+        {
+            if (!cached.sigs.empty() && cached.sigs.front().abi.valid)
+            {
+                abi = cached.sigs.front().abi;
+                return true;
+            }
+        }
+
+        cflat_cinterop::ExtractResult raw;
+        if (!RunCxxTypeRequests(group, {}, aliasSource, /*emitDefinitions*/ false,
+                                raw, error, {}, &callRequest)
+            || !raw.hasVariadicCallAbi)
+        {
+            if (error.empty()) error = raw.firstError;
+            return false;
+        }
+        CFileSigCacheEntry entry;
+        entry.sigs.emplace_back();
+        entry.sigs.back().abi = raw.variadicCallAbi;
+        StoreCxxTypeRequestCache(group, cacheKey, /*emitDefinitions*/ false,
+                                 std::move(entry), group.diskCache);
+        abi = std::move(raw.variadicCallAbi);
+        return true;
+}
 
 /*
  * Identity of a C++ type request: the OWNING import group's headers and defines (never every C++

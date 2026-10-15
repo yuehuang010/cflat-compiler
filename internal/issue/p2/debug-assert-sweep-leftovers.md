@@ -1,9 +1,17 @@
-# Debug cflat asserts left after T192/T194 (Debug sweep of Test/test_*.cb)
+# Debug assertion sweep leftovers
 
-Found by the T194 Debug sweep (2026-10-14; Debug exe with assertions-on LLVM, `x64/Debug/cflat -B Test/<f>.cb -i Test/library -o x`).
-Release silently continues past each. Re-sweep on current master first (T192 fixed the clang point-of-instantiation assert that
-three cpp interop tests hit in that sweep, which branched before T192 landed).
-- Test/test_collection_leaks.cb: SIGTRAP in CopyWrittenCopyableParams (CFlat-side assert or __builtin_trap - get the stack).
-- Test/test_core.cb: LLVM assertion in a constant-expression cast (invalid cast opcode/operand in a ConstantExpr build).
-Fix direction: backtrace each (lldb --batch -o run -o bt), root-cause; a user-reachable bad input gets a LogError, a compiler
-bug gets fixed. Guard: the Debug compile of each file.
+Remaining:
+
+- `Test/errors/err_cpp_header_leaves_scope_open.cb` still asserts in
+  `clang::IncrementalParser::Parse` (`Lexer must be EOF when starting incremental parse!`).
+  Three focused boundary/EOF changes did not resolve it; stop rule reached for this assert.
+- `Test/test_cpp_interop.cb` Debug compilation exceeded 900 seconds three times after the mangle
+  fix. The first attempt stopped near line 3820; later attempts reached line 8694 in the pointer
+  overload negative cases before timeout. The final attempt used the parser code restored to its
+  original state. A 25-second sample could not inspect the process under this sandbox.
+- Global `float[] gz = 0.0;` (zero to array view at file scope) fails LLVM module verification with a fresh,
+  never-initialised cache dir (passes with the local cache and with -B); same zero-to-view bug T200 fixed for
+  locals, at the global-initializer site (T200 review, pre-existing).
+- C++ `template <class T = int> struct Gate`: `Gate<>` and `Gate<int>` are distinct types in overload selection
+  (clang: same type). Pre-existing (T200 review).
+Repro: run each Test/*.cb with x64/Debug/cflat -B (one at a time, gtimeout 900).

@@ -670,38 +670,15 @@ bool LLVMBackend::JoinDeliversDataValue(const llvm::Value* value, size_t occurre
         return false;
     }
 
-void LLVMBackend::RecordPendingReturnDangleCheck(llvm::AllocaInst* slot, int line, int col,
-                                        const std::string& ifaceName,
-                                        bool frameStorageProvenance,
-                                        bool provenanceUnknown,
-                                        const std::string& frameStorageClassName,
-                                        bool aliasOfOwnedLocal)
+void LLVMBackend::RecordPendingReturnDangleCheck(llvm::AllocaInst* slot,
+                                        llvm::LoadInst* returnedLoad, int line, int col,
+                                        const std::string& ifaceName)
 {
-        if (!slot || !builder) return;
+        if (!slot || !returnedLoad || !builder) return;
         llvm::BasicBlock* bb = builder->GetInsertBlock();
         if (!bb || !bb->getParent()) return;
         pendingReturnDangleChecks_[bb->getParent()].push_back(
-            { bb->getParent(), slot, line, col, ifaceName, frameStorageProvenance,
-              provenanceUnknown, frameStorageClassName, aliasOfOwnedLocal });
-}
-
-void LLVMBackend::SetInterfaceBoxReturnDangleProvenance(const std::string& name,
-                                                         bool frameStorage, bool unknown,
-                                                         const std::string& className,
-                                                         bool aliasOfOwnedLocal)
-{
-        if (name.empty()) return;
-        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
-        {
-            auto it = frame.namedVariable.find(name);
-            if (it == frame.namedVariable.end()) continue;
-            it->second.InterfaceBoxFrameStorage = frameStorage && !unknown;
-            it->second.InterfaceBoxReturnProvenanceUnknown = unknown;
-            it->second.InterfaceBoxFrameStorageClassName =
-                it->second.InterfaceBoxFrameStorage ? className : std::string();
-            it->second.InterfaceBoxAliasOfOwnedLocal = aliasOfOwnedLocal;
-            return;
-        }
+            { bb->getParent(), slot, returnedLoad, line, col, ifaceName });
 }
 
 void LLVMBackend::DiscardPendingReturnDangleChecks(llvm::Function* F)
@@ -1173,6 +1150,77 @@ LLVMBackend::NamedVariable* LLVMBackend::FindStackVariableByStorage(const llvm::
             for (auto& [name, nv] : frame.namedVariable)
                 if (nv.Storage == storage) return &nv;
         return nullptr;
+    }
+
+LLVMBackend::NamedVariable* LLVMBackend::FindStackArgumentByStorage(const llvm::Value* storage)
+{
+        if (storage == nullptr) return nullptr;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+            for (auto& [name, nv] : frame.functionArgument)
+                if (nv.Storage == storage) return &nv;
+        return nullptr;
+    }
+
+bool LLVMBackend::IsOwnedAtScopeExit(const NamedVariable& nv) const
+{
+        if (nv.IsOwning) return true;
+        return nv.BorrowSuppressedOwner && nv.OwnFlagActive && nv.OwnFlag != nullptr;
+    }
+
+void LLVMBackend::ActivateParamOwnFlag(NamedVariable& nv)
+{
+        // The init store sits right after the flag's alloca in the entry block, so it runs before any
+        // path that reaches the borrowing store; a move parameter owns its pointee from entry.
+        if (nv.OwnFlagActive || nv.OwnFlag != nullptr || !nv.IsOwning
+            || !llvm::isa_and_nonnull<llvm::AllocaInst>(nv.Storage)) return;
+        nv.OwnFlag = AllocaAtEntry(builder->getInt1Ty(), nullptr,
+                                   nv.TypeAndValue.VariableName + ".owns");
+        {
+            llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+            builder->SetInsertPoint(nv.OwnFlag->getParent(), std::next(nv.OwnFlag->getIterator()));
+            builder->CreateStore(builder->getInt1(true), nv.OwnFlag);
+        }
+        nv.OwnFlagActive = true;
+    }
+
+void LLVMBackend::RearmParamOwner(const std::string& name)
+{
+        // SetVariableOwning searches locals alone, so an owning store into a move parameter re-arms
+        // it here: the compile-time owner bit (when a borrow cleared it) and the runtime flag.
+        if (name.empty()) return;
+        NamedVariable* nv = nullptr;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (frame.namedVariable.find(name) != frame.namedVariable.end()) return;
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+            {
+                nv = &it->second;
+                break;
+            }
+        }
+        if (nv == nullptr || !nv->OwnFlagActive || nv->OwnFlag == nullptr) return;
+        // Re-owned: the suppression is spent (a stale flag let the return path free the returned value).
+        if (nv->BorrowSuppressedOwner) { nv->IsOwning = true; nv->BorrowSuppressedOwner = false; }
+        if (IsInsertBlockLive() && nv->OwnFlag->getFunction() == builder->GetInsertBlock()->getParent())
+            builder->CreateStore(builder->getInt1(true), nv->OwnFlag);
+    }
+
+void LLVMBackend::ArmSuppressedOwnFlag(const std::string& name)
+{
+        if (name.empty() || stackNamedVariable.empty()) return;
+        NamedVariable* nv = nullptr;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                nv = &it->second;
+            else if (auto it2 = frame.functionArgument.find(name); it2 != frame.functionArgument.end())
+                nv = &it2->second;
+            if (nv != nullptr) break;
+        }
+        if (nv == nullptr || !nv->BorrowSuppressedOwner || !nv->OwnFlagActive || nv->OwnFlag == nullptr
+            || !IsInsertBlockLive()
+            || nv->OwnFlag->getFunction() != builder->GetInsertBlock()->getParent()) return;
+        builder->CreateStore(builder->getInt1(true), nv->OwnFlag);
     }
 
 void LLVMBackend::EmitOwnedPtrRelease(const NamedVariable& namedVar, llvm::Value* replacement,
@@ -4463,16 +4511,45 @@ void LLVMBackend::RegisterAliasReturnTempSlot(llvm::Value* result, llvm::Value* 
 bool LLVMBackend::IsAliasReturnResult(llvm::Value* value, std::string* callee) const
 {
         if (value == nullptr) return false;
-        llvm::Value* through = nullptr;
-        if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value)) through = load->getPointerOperand();
-        for (const auto& entry : aliasReturnTempSlots_)
-        {
-            if (entry.Result != value && entry.Result != through) continue;
-            if (callee != nullptr) *callee = entry.Callee;
-            return true;
-        }
-        return false;
-    }
+        std::unordered_set<llvm::Value*> visited;
+        std::function<bool(llvm::Value*)> containsAliasResult;
+        containsAliasResult = [&](llvm::Value* current) -> bool {
+            if (current == nullptr || !visited.insert(current).second) return false;
+            llvm::Value* through = nullptr;
+            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(current))
+                through = load->getPointerOperand();
+            for (const auto& entry : aliasReturnTempSlots_)
+            {
+                if (entry.Result != current && entry.Result != through) continue;
+                if (callee != nullptr) *callee = entry.Callee;
+                return true;
+            }
+
+            if (auto* phi = llvm::dyn_cast<llvm::PHINode>(current))
+            {
+                for (llvm::Value* incoming : phi->incoming_values())
+                    if (containsAliasResult(incoming)) return true;
+            }
+            else if (auto* select = llvm::dyn_cast<llvm::SelectInst>(current))
+            {
+                return containsAliasResult(select->getTrueValue())
+                    || containsAliasResult(select->getFalseValue());
+            }
+            else if (auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(current))
+            {
+                return containsAliasResult(insert->getInsertedValueOperand())
+                    || containsAliasResult(insert->getAggregateOperand());
+            }
+            else if (auto* extract = llvm::dyn_cast<llvm::ExtractValueInst>(current))
+                return containsAliasResult(extract->getAggregateOperand());
+            else if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(current))
+                return containsAliasResult(gep->getPointerOperand());
+            else if (auto* cast = llvm::dyn_cast<llvm::CastInst>(current))
+                return containsAliasResult(cast->getOperand(0));
+            return false;
+        };
+        return containsAliasResult(value);
+}
 
 bool LLVMBackend::IsAliasReturnTempResult(llvm::Value* value, std::string* callee) const
 {
@@ -4709,6 +4786,20 @@ bool LLVMBackend::AdoptTernaryArmStructTemps(llvm::PHINode* join)
         for (auto it = armEntries.rbegin(); it != armEntries.rend(); ++it)
             pendingOwnedStructTemps.erase(pendingOwnedStructTemps.begin() + static_cast<long>(*it));
         return true;
+    }
+
+void LLVMBackend::UnregisterOwnedStructTempsHolding(llvm::Value* value)
+{
+        if (value == nullptr) return;
+        std::erase_if(pendingOwnedStructTemps, [&](const PendingOwnedStructTemp& e) {
+            if (e.Alloca == nullptr) return false;
+            for (auto* user : e.Alloca->users())
+                if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                    store != nullptr && store->getValueOperand() == value
+                    && store->getPointerOperand() == e.Alloca)
+                    return true;
+            return false;
+        });
     }
 
 void LLVMBackend::RegisterBorrowedOwningStructTempAt(const NamedVariable& arg, llvm::Value* slot,
@@ -5285,7 +5376,7 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
         // A plain pointer parameter can be represented by a raw pointer slot even when its
         // TypeAndValue pointer bit was stripped by an lvalue walk. It borrows the pointee and
         // must never fall through to a value destructor.
-        if (!namedVar.IsOwning && namedVar.BaseType != nullptr && namedVar.BaseType->isPointerTy()) return;
+        if (!IsOwnedAtScopeExit(namedVar) && namedVar.BaseType != nullptr && namedVar.BaseType->isPointerTy()) return;
         // An owning interface local owns a heap-boxed object: free it via the vtable dtor slot
         // + operator delete (mirrors the owning-pointer path; data field nulled so a prior delete no-ops).
         if (IsOwningUniqueArray(namedVar))
@@ -5298,7 +5389,7 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
             EmitOwningInterfaceCleanup(namedVar);
             return;
         }
-        if (namedVar.TypeAndValue.Pointer && namedVar.IsOwning)
+        if (namedVar.TypeAndValue.Pointer && IsOwnedAtScopeExit(namedVar))
         {
             if (namedVar.RefCountStorage == nullptr)
             {
@@ -5360,10 +5451,10 @@ bool LLVMBackend::OwnsDroppableResource(const NamedVariable& namedVar) const
 {
         if (namedVar.IsStaticLocal) return false;   // never dropped; see DropValue
         if (namedVar.IsRangeForBorrow) return false;
-        if (!namedVar.IsOwning && namedVar.BaseType != nullptr && namedVar.BaseType->isPointerTy()) return false;
+        if (!IsOwnedAtScopeExit(namedVar) && namedVar.BaseType != nullptr && namedVar.BaseType->isPointerTy()) return false;
         if (IsOwningUniqueArray(namedVar)) return true;
         if (IsOwningInterfaceValue(namedVar)) return true;
-        if (namedVar.TypeAndValue.Pointer && namedVar.IsOwning) return true;
+        if (namedVar.TypeAndValue.Pointer && IsOwnedAtScopeExit(namedVar)) return true;
         if (namedVar.TypeAndValue.Pointer) return false;
         auto it = dataStructures.find(namedVar.TypeAndValue.TypeName);
         if (it == dataStructures.end()) return false;
@@ -5418,7 +5509,7 @@ void LLVMBackend::EmitScopeArgumentAndLockCleanups(const StackState& frame)
                     EmitOwningInterfaceCleanup(namedVar);
                 continue;
             }
-            if (namedVar.IsOwning && namedVar.Storage != nullptr)
+            if (IsOwnedAtScopeExit(namedVar) && namedVar.Storage != nullptr)
                 EmitOwningPtrCleanup(namedVar);
 
             // Clean up move string parameters (move string param - non-pointer ownership)
@@ -5765,7 +5856,7 @@ bool LLVMBackend::FrameOwesUnwindCleanup()
             {
                 if (nv.Storage == nullptr) continue;
                 if (nv.TypeAndValue.IsFatInterfaceValue() ? IsOwningInterfaceValue(nv)
-                        : (nv.IsOwning || nv.IsOwningString || nv.IsOwningStruct))
+                        : (IsOwnedAtScopeExit(nv) || nv.IsOwningString || nv.IsOwningStruct))
                     return true;
             }
             if (it->isFunction) break;

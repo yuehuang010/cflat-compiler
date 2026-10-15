@@ -1311,3 +1311,20 @@ extern int main()
 
     return 0;
 }
+
+/*
+ * T203: `owner = raw = new T()` - a chained '=' whose inner target is a raw local transfers
+ * ownership exactly like `raw = new T(); owner = raw;`, so a later read of `raw` is a use after
+ * move. Before the fix the chain was refused as a borrow of `raw`.
+ */
+struct ChainRawMoveBox { int v = 0; ~ChainRawMoveBox() {} };
+
+expect_error("use of moved variable 'raw'") {
+    void chainRawThenRead()
+    {
+        unique ChainRawMoveBox* owner = nullptr;
+        ChainRawMoveBox* raw = nullptr;
+        owner = raw = new ChainRawMoveBox();
+        int y = raw->v;
+    }
+}

@@ -75,6 +75,123 @@ expect_error("cannot store borrowed parameter 'borrowed' into unique field 'Hold
     }
 }
 
+// T203: the chained spelling of a heap array into a unique local stays refused. unique<T> does not
+// own arrays, so the chain must not reach the transfer path the single-object form is kept off.
+expect_error("cannot reset unique<N> 'arrOwner' from borrowed value 'arrRaw'") {
+    void chainHeapArray()
+    {
+        unique N* arrOwner = nullptr;
+        N* arrRaw = nullptr;
+        arrOwner = arrRaw = new N[2];
+    }
+}
+
+// T207: a raw local that held an OWNED value and is then rebound to a borrowed parameter. The owned
+// bit from the earlier `new` outlived the borrowing store, so the reset adopted the caller's pointee
+// (abort at exit). The reaching assignment is the borrow, so the reset refuses it.
+expect_error("cannot reset unique<N> 'owner' from borrowed value 'borrowed'") {
+    void t207StaleOwnerThenBorrow(N* borrowed)
+    {
+        unique N* owner = nullptr;
+        N* raw = new N;
+        raw = borrowed;
+        owner = raw;
+    }
+}
+
+// Same stale owner, rebound to the address of a stack local: the local is not heap memory.
+expect_error("cannot reset unique<N> 'owner' from borrowed value 'loc'") {
+    void t207StaleOwnerThenAddress()
+    {
+        unique N* owner = nullptr;
+        N loc = default;
+        N* raw = new N;
+        raw = &loc;
+        owner = raw;
+    }
+}
+
+// A raw local assigned the address of a stack local is a borrow of it, and the reset refuses it.
+expect_error("cannot reset unique<N> 'owner' from borrowed value 'loc'") {
+    void t207AddressOfLocal()
+    {
+        unique N* owner = nullptr;
+        N loc = default;
+        N* raw = nullptr;
+        raw = &loc;
+        owner = raw;
+    }
+}
+
+// The same through a field of a stack struct: the root object is named.
+struct T207Box { N inner = default; };
+expect_error("cannot reset unique<N> 'owner' from borrowed value 'box'") {
+    void t207AddressOfField()
+    {
+        unique N* owner = nullptr;
+        T207Box box = default;
+        N* raw = nullptr;
+        raw = &box.inner;
+        owner = raw;
+    }
+}
+
+// Array decay of a stack array is not an owned pointer: the array keeps its elements.
+expect_error("cannot reset unique<N> 'owner' from borrowed value 'arr'") {
+    void t207ArrayDecayAssign()
+    {
+        unique N* owner = nullptr;
+        N[2] arr = default;
+        N* raw = nullptr;
+        raw = arr;
+        owner = raw;
+    }
+}
+
+// The declaration spelling of the same two borrows.
+expect_error("cannot reset unique<N> 'owner' from borrowed value 'raw'") {
+    void t207ArrayDecayDecl()
+    {
+        unique N* owner = nullptr;
+        N[2] arr = default;
+        N* raw = arr;
+        owner = raw;
+    }
+}
+
+expect_error("cannot reset unique<N> 'owner' from borrowed value 'raw'") {
+    void t207AddressOfDecl()
+    {
+        unique N* owner = nullptr;
+        N loc = default;
+        N* raw = &loc;
+        owner = raw;
+    }
+}
+
+// Branches: every reaching assignment must own. A borrowed arm taken on one path makes the reset
+// refuse, whichever arm is the owner in the source order.
+expect_error("cannot reset unique<N> 'owner' from borrowed value 'borrowed'") {
+    void t207BranchNewThenBorrow(N* borrowed, bool c)
+    {
+        unique N* owner = nullptr;
+        N* raw = nullptr;
+        if (c) raw = new N; else raw = borrowed;
+        owner = raw;
+    }
+}
+
+expect_error("cannot reset unique<N> 'owner' from borrowed value 'loc'") {
+    void t207BranchAddressThenNew(bool c)
+    {
+        unique N* owner = nullptr;
+        N loc = default;
+        N* raw = nullptr;
+        if (c) raw = &loc; else raw = new N;
+        owner = raw;
+    }
+}
+
 extern int main()
 {
     return 0;

@@ -3625,6 +3625,9 @@ int runViewPlainNullSpellings()
     int[] vc = (int)0;
     char[] cz = '\0';
     bool[] bz = false;
+    float[] fzAssigned = nullptr;
+    fzAssigned = 0.0;
+    if (fzAssigned != nullptr) return -1;
     float[] fz = 0.0;
     bool runtimeFalse = real[0] > 100;
     int[] vt = runtimeFalse ? nullptr : nullptr;

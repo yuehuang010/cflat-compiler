@@ -21,4 +21,10 @@ void goodDelete(move Node* n) { delete n; }
 // borrow. Its value/resource legs are wcp_delete_paren_* in Test/test_move.cb.
 void goodDeleteParen(move Node* n) { delete (n); }
 
+// T207 sibling: a raw local that held an owned `new` and was then rebound to a borrowed parameter
+// still carried the owned bit, so `delete` freed the caller's object. The borrowing store retires it.
+expect_error("cannot delete 'raw' - it aliases borrowed parameter 'n'") {
+    void t207DeleteAfterBorrow(Node* n) { Node* raw = new Node; raw = n; delete raw; }
+}
+
 extern int main() { return 0; }

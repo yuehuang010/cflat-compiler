@@ -811,9 +811,12 @@ llvm::Value* LLVMBackend::CreateExtractValue(llvm::Value* structInstance, unsign
         return builder->CreateExtractValue(structInstance, index);
     }
 
-llvm::StoreInst* LLVMBackend::CreateAssignment(llvm::Value* value, llvm::Value* destination, bool srcIsUnsigned, llvm::Type* explicitDestType, bool destUnsigned)
+llvm::StoreInst* LLVMBackend::CreateAssignment(llvm::Value* value, llvm::Value* destination, bool srcIsUnsigned, llvm::Type* explicitDestType, bool destUnsigned, bool destIsArrayView)
 {
         auto destType = explicitDestType ? explicitDestType : GetTypeFromStorage(destination);
+        if (destIsArrayView && destType->isPointerTy())
+            if (auto* constant = llvm::dyn_cast<llvm::Constant>(value); constant != nullptr && constant->isNullValue())
+                value = llvm::Constant::getNullValue(destType);
         if (destType == builder->getInt1Ty())
         {
             // A class with an IMPLICIT 'operator bool' (a std::vector<bool> element proxy)
@@ -2359,6 +2362,13 @@ bool LLVMBackend::IsPlainStructOperand(llvm::Value* v)
         if (st->isLiteral() || !st->hasName()) return true;
         std::string n = st->getName().str();
         return n != "__iface_fat_ptr" && n != "__closure_fat_ptr";
+    }
+
+bool LLVMBackend::IsProvableNonHeapAddressSource(const NamedVariable& source)
+{
+        if (source.Primary != nullptr) return IsProvableNonHeapAddress(source.Primary);
+        auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(source.Storage);
+        return slot != nullptr && slot->getAllocatedType()->isArrayTy();
     }
 
 bool LLVMBackend::IsProvableNonHeapAddress(llvm::Value* value)

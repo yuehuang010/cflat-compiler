@@ -335,3 +335,114 @@ expect_error("cannot be used as a function pointer") {
         Lambda<int(AliasReturnProbe)> lam = aliasReturnExternTake;
     }
 }
+
+// The return slot must follow a CFlat alias call back to the source local. `idp(local)` is not
+// address evidence by itself: its resolved alias parameter is the path that points into this frame.
+alias int aliasReturnForwardIntIdentity(alias int value) { return value; }
+expect_error("cannot return an 'alias' value that borrows frame-local storage") {
+    alias int aliasReturnForwardLocalInt()
+    {
+        int local = 37;
+        return aliasReturnForwardIntIdentity(local);
+    }
+}
+
+// Same frame-rooted path for a generic closure value; invoking the result distinguishes a live
+// closure slot from an alias of the local copy `local`.
+alias T aliasReturnForwardIdentity<T>(alias T value) { return value; }
+struct AliasReturnForwardBox<T>
+{
+    T field = default;
+    alias T bad() { T local = field; return aliasReturnForwardIdentity<T>(local); }
+};
+expect_error("cannot return an 'alias' value that borrows frame-local storage") {
+    void aliasReturnForwardLocalClosure()
+    {
+        AliasReturnForwardBox<Lambda<int()>> box = default;
+        box.field = () => { return 41; };
+        box.bad()();
+    }
+}
+
+// The both-alias-arm phi is the value passed to the owning move sink; both arms still borrow.
+expect_error("cannot store an 'alias' value") {
+    void aliasReturnTernarySink()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe b = aliasReturnProbeMake(2);
+        AliasReturnProbe c = aliasReturnProbeMake(3);
+        AliasReturnProbe d = aliasReturnProbeMake(4);
+        bool first = a.get() == 1;
+        aliasReturnProbeSink(first ? aliasReturnProbePick(a, b, true)
+                                  : aliasReturnProbePick(c, d, true));
+    }
+}
+
+// A dereferenced pointer to a fixed-array element must reach the owning-element store check.
+expect_error("cannot store an 'alias' value") {
+    void aliasReturnPointerArrayStore()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe b = aliasReturnProbeMake(2);
+        AliasReturnProbe[2] values;
+        AliasReturnProbe* p = &values[0];
+        *p = aliasReturnProbePick(a, b, true);
+    }
+}
+
+// A dereferenced pointer to an owning local reaches the same reject as a direct local assignment.
+expect_error("cannot store an 'alias' value") {
+    void aliasReturnPointerLocalStore()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe b = aliasReturnProbeMake(2);
+        AliasReturnProbe value = aliasReturnProbeMake(9);
+        AliasReturnProbe* p = &value;
+        *p = aliasReturnProbePick(a, b, true);
+    }
+}
+
+// `list<T>[i]` returns an alias element; the list keeps its own destructor for this slot.
+expect_error("cannot store an 'alias' value") {
+    void aliasReturnListIndexStore()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe b = aliasReturnProbeMake(2);
+        list<AliasReturnProbe> values;
+        values.add(aliasReturnProbeMake(9));
+        values[0] = aliasReturnProbePick(a, b, true);
+    }
+}
+
+// A borrow copied through two locals still cannot be persisted into a list-owned element.
+expect_error("cannot store an 'alias' value") {
+    void aliasReturnListIndexBorrowLocalStore()
+    {
+        AliasReturnProbe a = aliasReturnProbeMake(1);
+        AliasReturnProbe x = aliasReturnProbePick(a, aliasReturnProbeMake(3), false);
+        AliasReturnProbe y = x;
+        list<AliasReturnProbe> values;
+        values.add(aliasReturnProbeMake(9));
+        values[0] = y;
+    }
+}
+
+// A field of a trivially-copied by-value param is the callee's own copy, not the caller's object.
+struct T212Triv { int x = 4; };
+expect_error("borrows frame-local storage") {
+    alias int t212ByValueField(T212Triv t) { return t.x; }
+}
+
+// A local forwarded through an alias-returning METHOD dangles like the free-function form.
+struct T212Fwd { int k = 0; alias int fwd(alias int v) { return v; } };
+expect_error("borrows frame-local storage") {
+    alias int t212MethodFwdPtr(T212Fwd* f) { int l = 2; return f->fwd(l); }
+}
+expect_error("borrows frame-local storage") {
+    struct T212FwdSelf
+    {
+        int k = 0;
+        alias int fwd(alias int v) { return v; }
+        alias int bad() { int l = 3; return this.fwd(l); }
+    };
+}

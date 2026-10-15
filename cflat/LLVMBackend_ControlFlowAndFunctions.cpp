@@ -614,6 +614,9 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         TypeAndValue cxxRecipeRet;
         std::vector<TypeAndValue> cxxRecipeParams;
         UnpackFuncPtrSignature(funcPtrType, cxxRecipeRet, cxxRecipeParams);
+        if (std::string resolved = ResolveTypeAlias(cxxRecipeRet.TypeName);
+            resolved.find('*') == std::string::npos)
+            cxxRecipeRet.TypeName = std::move(resolved);
         const AbiRecipe cxxIndirectRecipe = ComputeCxxReturnAbiRecipe(
             cxxRecipeRet, cxxRecipeParams);
         auto materializeCxxIndirectArgs = [&](const std::vector<TypeAndValue::FuncPtrParam>& params,
@@ -663,7 +666,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         if (funcPtrType.IsThinFnPtr())
         {
             TypeAndValue retTV;
-            retTV.TypeName = funcPtrType.FuncPtrReturnTypeName;
+            retTV.TypeName = cxxRecipeRet.TypeName;
             retTV.Pointer  = funcPtrType.FuncPtrReturnPointer;
             retTV.IsMove   = funcPtrType.FuncPtrReturnOwned;
             retTV.IsAlias  = funcPtrType.FuncPtrReturnAlias;
@@ -873,7 +876,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         }
         paramTypes.push_back(i8PtrTy); // env (trailing)
         TypeAndValue retTV;
-        retTV.TypeName = funcPtrType.FuncPtrReturnTypeName;
+        retTV.TypeName = cxxRecipeRet.TypeName;
         retTV.Pointer  = funcPtrType.FuncPtrReturnPointer;
         retTV.IsMove   = funcPtrType.FuncPtrReturnOwned;
         retTV.IsAlias  = funcPtrType.FuncPtrReturnAlias;

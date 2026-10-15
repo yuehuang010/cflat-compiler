@@ -98,3 +98,43 @@ expect_error("use of moved variable 'p'") {
     struct FmmVal { string s = ""; };
     void fmmDerefMove(move FmmVal p, FmmVal* out) { *out = p; printf("%s", p.s.data()); }
 }
+
+// A named function passed to a thin function<> call parameter must use the same move check as a
+// function-pointer declarator. The pre-fix argument path only checked this for fat Lambda<> slots.
+expect_error("has no overload matching the 'move' modifiers required by parameter") {
+    void t208MoveParam(move int* p) { delete p; }
+    void t208AcceptBorrow(function<void(int*)> f) { }
+    void t208CallBare() { t208AcceptBorrow(t208MoveParam); }
+}
+
+expect_error("has no overload matching the 'move' modifiers required by parameter") {
+    void t208MoveGeneric<T>(move T* p) { delete p; }
+    void t208AcceptGeneric(function<void(int*)> f) { }
+    void t208CallGeneric() { t208AcceptGeneric(t208MoveGeneric<int>); }
+}
+
+expect_error("has no overload matching the 'move' modifiers required by parameter") {
+    namespace T208MoveNs { void consume(move int* p) { delete p; } }
+    void t208AcceptNamespace(function<void(int*)> f) { }
+    void t208CallNamespace() { t208AcceptNamespace(T208MoveNs.consume); }
+}
+
+// A move-returning function has a hidden raw-array-count slot. Passing it to a borrowed return
+// slot made the callback call omit that slot and crash in the JIT.
+expect_error("returns an owning 'move' pointer but the slot's return is borrowed") {
+    move int* t208MoveReturn(int x) { int* p = new int(x); return p; }
+    void t208AcceptReturn(function<int*(int)> f) { int* p = f(1); delete p; }
+    void t208CallReturn() { t208AcceptReturn(t208MoveReturn); }
+}
+
+expect_error("returns an owning 'move' pointer but the slot's return is borrowed") {
+    move int* t208MoveReturnGeneric<T>(T x) { int* p = new int((int)x); return p; }
+    void t208AcceptReturnGeneric(function<int*(int)> f) { int* p = f(1); delete p; }
+    void t208CallReturnGeneric() { t208AcceptReturnGeneric(t208MoveReturnGeneric<int>); }
+}
+
+expect_error("returns an owning 'move' pointer but the slot's return is borrowed") {
+    namespace T208ReturnNs { move int* make(int x) { int* p = new int(x); return p; } }
+    void t208AcceptReturnNs(function<int*(int)> f) { int* p = f(1); delete p; }
+    void t208CallReturnNs() { t208AcceptReturnNs(T208ReturnNs.make); }
+}

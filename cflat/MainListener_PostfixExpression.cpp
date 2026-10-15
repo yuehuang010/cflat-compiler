@@ -2,6 +2,119 @@
 #include <llvm/Support/SaveAndRestore.h>
 #include <functional>
 
+// True when the postfix node is the operand of a unary `*` (through pass-through unary and cast
+// wrappers). Parse-tree shape only; the operator token decides, never the expression text.
+static bool IsDerefOperandChain(antlr4::tree::ParseTree* node)
+{
+    for (antlr4::tree::ParseTree* parent = node->parent; parent != nullptr; parent = parent->parent)
+    {
+        if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(parent))
+        {
+            if (unary->unaryOperator() == nullptr)
+            {
+                if (unary->children.size() != 1) return false;
+                continue;
+            }
+            return unary->Sizeof().empty() && unary->unaryOperator()->getText() == "*";
+        }
+        if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(parent))
+        {
+            if (cast->children.size() != 1) return false;
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
+// True when the node may be what an `alias` declaration binds (`alias int x = mk()->v;`): the
+// bound storage outlives the statement, so the receiver temp must not die here. A subscript index,
+// a ternary test or a binary operand is only read (`alias int x = gArr[mk()->v];`), so it is not.
+static bool InAliasDeclaration(antlr4::tree::ParseTree* node)
+{
+    for (antlr4::tree::ParseTree* child = node, *p = node->parent; p != nullptr; child = p, p = p->parent)
+    {
+        if (dynamic_cast<CFlatParser::PostfixExpressionContext*>(p)
+            && dynamic_cast<CFlatParser::ExpressionContext*>(child))
+            return false;
+        if (auto* cond = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(p))
+        {
+            if (cond->children.size() > 1 && cond->children[0] == child && cond->QuestionQuestion() == nullptr)
+                return false;
+            continue;
+        }
+        if ((dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(p)
+                || dynamic_cast<CFlatParser::AdditiveExpressionContext*>(p)
+                || dynamic_cast<CFlatParser::ShiftExpressionContext*>(p)
+                || dynamic_cast<CFlatParser::RelationalExpressionContext*>(p)
+                || dynamic_cast<CFlatParser::EqualityExpressionContext*>(p)
+                || dynamic_cast<CFlatParser::AndExpressionContext*>(p)
+                || dynamic_cast<CFlatParser::ExclusiveOrExpressionContext*>(p)
+                || dynamic_cast<CFlatParser::InclusiveOrExpressionContext*>(p)
+                || dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(p)
+                || dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(p))
+            && p->children.size() > 1)
+            return false;
+        if (auto* decl = dynamic_cast<CFlatParser::DeclarationContext*>(p))
+        {
+            auto* specs = decl->declarationSpecifiers();
+            if (specs == nullptr) return false;
+            for (auto* spec : specs->declarationSpecifier())
+                if (spec->typeSpecifier() != nullptr && spec->typeSpecifier()->getText() == "alias")
+                    return true;
+            return false;
+        }
+        if (dynamic_cast<CFlatParser::StatementContext*>(p)) return false;
+    }
+    return false;
+}
+
+// True when a value read through a deref may leave the statement: an alias declaration binds it,
+// a return hands it out unless the enclosing function is not an alias function, and a lambda body
+// may run after the statement. Unknown shapes answer true (the pre-existing no-free path).
+static bool DerefResultMayOutlive(antlr4::tree::ParseTree* node)
+{
+    if (InAliasDeclaration(node)) return true;
+    for (antlr4::tree::ParseTree* p = node->parent; p != nullptr; p = p->parent)
+    {
+        if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(p)) return true;
+        if (dynamic_cast<CFlatParser::JumpStatementContext*>(p))
+        {
+            for (antlr4::tree::ParseTree* f = p->parent; f != nullptr; f = f->parent)
+            {
+                if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(f)) return true;
+                if (auto* def = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(f))
+                {
+                    auto* specs = def->declarationSpecifiers();
+                    if (specs == nullptr) return false;
+                    for (auto* spec : specs->declarationSpecifier())
+                        if (spec->typeSpecifier() != nullptr && spec->typeSpecifier()->getText() == "alias")
+                            return true;
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (dynamic_cast<CFlatParser::StatementContext*>(p)) return false;
+    }
+    return true;
+}
+
+// The operand is a single-level pointer to an integer or floating scalar, so a unary `*` reads a
+// plain value out of it. Recorded depth only: depth 0 means not recorded, and that answers false.
+static bool PointsToScalar(LLVMBackend* compiler, const LLVMBackend::NamedVariable& operand)
+{
+    const auto& tv = operand.TypeAndValue;
+    if (tv.PointerDepth != 1 || tv.ElemPointer || tv.IsAlias || tv.IsInterface
+        || tv.IsInterfacePointer || tv.IsCxxRefToPointer || operand.IsAliasBorrow)
+        return false;
+    LLVMBackend::TypeAndValue pointee = tv;
+    pointee.Pointer = false;
+    pointee.PointerDepth = 0;
+    auto* type = compiler->GetType(pointee);
+    return type != nullptr && (type->isIntegerTy() || type->isFloatingPointTy());
+}
+
 static CFlatParser::PostfixExpressionContext* SoleCxxConstructionPostfix(
     antlr4::tree::ParseTree* node)
 {
@@ -669,7 +782,23 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                                        size_t dropTrailingChildren, ResultUse use) {
         for (auto* argumentList : ctx->argumentExpressionList())
             DiagnoseAssignmentArguments(argumentList);
+        const size_t arrowTempMark = arrowOwnedTemps_.size();
         auto namedVar = ParsePostfixExpressionInner(ctx, lValue, dropTrailingChildren, use);
+        // A result that borrows from the receiver temp (pointer, alias) outlives the statement, so
+        // those temps stay unregistered: the pre-existing behaviour, no free. The exception is a
+        // pointer to a scalar that a unary `*` reads in place (`s += *mk()->heap;`): the temp dies
+        // at the end of the statement as for `mk()->v`. An alias binding of any result is a borrow.
+        if (arrowOwnedTemps_.size() > arrowTempMark)
+        {
+            const bool borrows = namedVar.TypeAndValue.Pointer || namedVar.TypeAndValue.IsAlias
+                || namedVar.IsAliasBorrow;
+            const bool readInPlace = borrows && IsDerefOperandChain(ctx)
+                && PointsToScalar(Compiler(ctx), namedVar) && !DerefResultMayOutlive(ctx);
+            if ((borrows || InAliasDeclaration(ctx)) && !readInPlace)
+                for (size_t i = arrowTempMark; i < arrowOwnedTemps_.size(); ++i)
+                    Compiler(ctx)->UnregisterOwnedStructTemp(arrowOwnedTemps_[i]);
+            arrowOwnedTemps_.resize(arrowTempMark);
+        }
         if (namedVar.TypeAndValue.IsFlexibleArrayMember && !lValue && std::find(flexibleArrayKeep_.begin(), flexibleArrayKeep_.end(), ctx) == flexibleArrayKeep_.end())
             DecayFlexibleArrayMember(namedVar);
         if (namedVar.FromOwningTempField && !namedVar.OwningTempParent)
@@ -1639,6 +1768,21 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         auto* temp = compiler->CreateAlloca(sd.StructType);
                         compiler->CreateAssignment(thisNV.Primary, temp);
                         thisNV.Storage = temp;
+                        // An owning rvalue receiver (`mk()->v`) is consumed by this operator-> and
+                        // never reaches a scope dtor: destroy it at the end of the full expression.
+                        const std::string& recvType = receiver.TypeAndValue.TypeName;
+                        // `&mk()->v` is an address that outlives the statement: never free it here.
+                        // C++-lowered receivers (sret / C++ records) keep their own slot's destruction.
+                        if (!receiver.TypeAndValue.IsAlias && !receiver.FromOwningTempField
+                            && addressOfOperandDepth_ == 0
+                            && recvType != "string" && recvType != "__closure_fat_ptr"
+                            && !compiler->IsCxxRecord(recvType) && !compiler->ReturnsViaCxxSret(recvType)
+                            && compiler->IsProducedTempValue(receiver.Primary)
+                            && compiler->IsOwningValueType(recvType))
+                        {
+                            compiler->RegisterOwnedStructTemp(temp, recvType);
+                            arrowOwnedTemps_.push_back(temp);
+                        }
                     }
 
                     if (!compiler->IsCoreUniqueType(receiver.TypeAndValue.TypeName))
@@ -3525,6 +3669,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     LogErrorContext(prevPrimary, std::format(
                                         "generic function '{}' expects {} type argument(s), but the call provides {}",
                                         baseName, typeParams.size(), typeArgs.size()));
+                                // A value (`dbl<int, int>` as a function value) has no call to judge it by:
+                                // refuse the wrong count here and never instantiate the wrong arity.
+                                if (!isFollowedByCall && wrongArity)
+                                {
+                                    LogErrorContext(prevPrimary, std::format(
+                                        "'{}' did not instantiate the generic function template '{}', so it has no value; "
+                                        "check the number and spelling of its type arguments.",
+                                        prevPrimary->getText(), baseName));
+                                    primaryIdentifier = mangledName;
+                                    namedVar = {};
+                                    break;
+                                }
                                 mangledName = MangledGenericName(gfKey, typeArgs);
                                 InstantiateGenericFunction(gfKey, typeArgs);
                                 primaryIdentifier = mangledName;
@@ -3600,6 +3756,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             if (!genericClassTemplates.count(baseName) && !genericStructTemplates.count(baseName)
                                 && isFollowedByCall)
                                 LogErrorContext(prevPrimary, std::format("unknown generic function '{}'", baseName));
+                            // `wrap<int>` on a non-generic `int wrap(int)` reached no generic route: refuse it when it is a
+                            // proven CFlat function, or when no C++ import could own the spelling.
+                            if (!isFollowedByCall && !genericClassTemplates.count(baseName)
+                                && !genericStructTemplates.count(baseName)
+                                && !Compiler(ctx)->AnyGenericTypeTemplateNamed(baseName)
+                                && (!Compiler(ctx)->HasCxxImportGroup()
+                                    || (Compiler(ctx)->functionTable.count(baseName) != 0
+                                        && !Compiler(ctx)->HasCxxFunctionTemplate(baseName))))
+                                LogErrorContext(prevPrimary, std::format("'{}' is not a generic function", baseName));
                             primaryIdentifier = mangledName;
                             namedVar = {};
                             break;
@@ -8130,6 +8295,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // postfix processing, the names land on argNV (the line below covers
                                     // the direct-arg path where they arrive via the side-channel instead).
                                     argVar.LambdaCaptureNames = argNV.LambdaCaptureNames;
+                                    // The by-reference names travel with them: a template argument's
+                                    // refusal names a move-only capture only when they arrive (T213).
+                                    argVar.LambdaReferenceCaptureNames = argNV.LambdaReferenceCaptureNames;
 
                                     // The declared element type, for generic inference only: the
                                     // TypeName below stays empty for primitives on purpose.
@@ -10101,20 +10269,18 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                             elemPtrTy, "closure.arr.src");
                         auto* dstBase = compiler->builder->CreateBitCast(fieldGEP,
                             elemPtrTy, "closure.arr.dst");
-                        for (uint64_t elem = 0; elem < count; ++elem)
-                        {
-                            auto* index = compiler->builder->getInt64(elem);
-                            auto* srcElem = compiler->builder->CreateInBoundsGEP(elemTy, srcBase,
-                                { index }, "closure.arr.src.elem");
-                            auto* dstElem = compiler->builder->CreateInBoundsGEP(elemTy, dstBase,
-                                { index }, "closure.arr.dst.elem");
-                            LLVMBackend::NamedVariable srcNV;
-                            srcNV.Storage = srcElem;
-                            srcNV.BaseType = elemTy;
-                            srcNV.TypeAndValue.TypeName = captures[i].TV.TypeName;
-                            if (auto* copied = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
-                                compiler->builder->CreateStore(copied, dstElem);
-                        }
+                        // Walked, not unrolled: a large owning array stays O(1) in IR (T213).
+                        compiler->EmitFixedArrayElementWalk(*compiler->builder, srcBase, elemTy, count,
+                            [&](llvm::Value* srcElem, llvm::Value* index) {
+                                auto* dstElem = compiler->builder->CreateInBoundsGEP(elemTy, dstBase,
+                                    { index }, "closure.arr.dst.elem");
+                                LLVMBackend::NamedVariable srcNV;
+                                srcNV.Storage = srcElem;
+                                srcNV.BaseType = elemTy;
+                                srcNV.TypeAndValue.TypeName = captures[i].TV.TypeName;
+                                if (auto* copied = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
+                                    compiler->builder->CreateStore(copied, dstElem);
+                            });
                     }
                     else
                     {

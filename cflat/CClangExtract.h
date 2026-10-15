@@ -148,6 +148,14 @@ namespace cflat_cinterop
         std::string fnTypeText;
     };
 
+    struct VariadicCallAbiRequest
+    {
+        std::string targetLinkageName;
+        bool instanceMethod = false;
+        std::string receiverTypeAlias;
+        std::vector<std::string> argumentTypeAliases;
+    };
+
     // ABI arrangement for the function type behind a foreign function pointer. The signature is
     // Clang's canonical function-prototype spelling, so typedefs of the same pointee share it.
     struct RawFunctionPointerAbi
@@ -668,6 +676,8 @@ namespace cflat_cinterop
         bool uuidHarvestCxx = false;
         // Parse the input as C++ and retain C++ qualified names/linkage identity.
         bool cxxMode = false;
+        // One call-site-only ABI query. The aliases name the extra argument types in source.
+        VariadicCallAbiRequest variadicCallAbiRequest;
         /*
          * M5 - run Clang CodeGen over the parsed C++ AST and emit the definitions the bound
          * surface needs (inline functions, inline methods/structors, vtables + RTTI of
@@ -853,6 +863,8 @@ namespace cflat_cinterop
         // firstError because request TUs may contain tolerated errors unrelated to this type.
         std::string invalidCxxTypeRequestError;
         std::vector<std::string> incompleteCxxTypeSpellings;
+        bool hasVariadicCallAbi = false;
+        RawAbi variadicCallAbi;
 
         // Errors clang raised INSIDE one of the headers the caller asked to bind (in-scope
         // dirs only, so neither the in-memory stub's intentional macro-probe/wrapper errors nor

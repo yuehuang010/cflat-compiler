@@ -1682,13 +1682,6 @@ public:
         // Owner slots behind a boxed join. Re-ask PointerRebound at delete time so a later
         // null/rebind retires the stale boxed proof like a raw join.
         std::vector<llvm::Value*> BorrowedInterfaceBoxSlots;
-        // Return-dangle provenance recorded at every interface binding site. A frame box is
-        // actionable only while no later binding site supplied unknown/non-frame provenance.
-        bool InterfaceBoxFrameStorage = false;
-        bool InterfaceBoxReturnProvenanceUnknown = false;
-        std::string InterfaceBoxFrameStorageClassName;
-        // The boxed pointer is a borrow of an owning local of this frame (its owner is freed at return).
-        bool InterfaceBoxAliasOfOwnedLocal = false;
         // Sticky: set once any binding hands this local a box that is NOT proven, and never cleared.
         // From then on the local can never be rejected - walk order over the AST is not control flow.
         bool InterfaceBoxProvenanceUnknown = false;
@@ -1784,7 +1777,15 @@ public:
         // The block a plain '=' recorded this borrow in (null when the borrow came from the
         // DECLARATION). An owned rebind in that same block retires it; see RetireAssignBorrow.
         llvm::BasicBlock* AssignBorrowBlock = nullptr;
-        std::string BorrowedOrigin;      // name of the borrowed parameter this value transitively aliases (for diagnostics)
+        // A plain '=' borrow cleared the owner bit (IsOwning / IsNewAllocated) of this binding. The
+        // runtime OwnFlag keeps the truth; IsOwnedAtScopeExit reads it, so a later owning store in
+        // another block still frees its object at scope exit.
+        bool BorrowSuppressedOwner = false;
+        std::string BorrowedOrigin;     // name of the borrowed parameter this value transitively aliases (for diagnostics)
+        // Transient: on an assignment RESULT, the local slot a direct `new` '=' stored into (and its
+        // name). An outer unique '=' takes that slot as its RHS, as `owner = raw;` does.
+        llvm::Value* ChainedAssignSlot = nullptr;
+        std::string ChainedAssignName;
         // Set to "Struct.field" when the borrow originates from a `unique` field rather than a
         // borrowed parameter, so the delete/store diagnostics can name the real owner (Trap B).
         std::string BorrowedUniqueField;
@@ -2369,6 +2370,8 @@ public:
         InterfaceBoxSource Source = InterfaceBoxSource::Unknown;
         // The owning source was nulled and marked moved at this site, so the box is the sole owner.
         bool OwnershipTransferred = false;
+        // Boxing a pointer alias does not transfer its local owner, which dies at return.
+        bool AliasOfOwnedLocal = false;
         // PROVEN at the boxing site: a nameable OTHER owner frees this object anyway, so deleting
         // the box double-frees. See BindingKeepsOwnershipOfBoxedObject for what does and does not count.
         bool SourceKeepsOwner = false;
@@ -2810,41 +2813,23 @@ private:
     bool JoinDeliversDataValue(const llvm::Value* value, size_t occurrence, int depth = 0) const;
 
     /*
-     * Deferred interface-return-dangle check (the "existential" attempt - see
-     * interface-return-dangle-defeated-by-intermediate-local.md). The emission-time value
-     * walk (FrameLocalDataOfFatValue in MainListener.h) deliberately stops at a load, so
-     * `IShape r = loc as IShape; return r;` reaches the return as a plain load with nothing
-     * to reject. Rather than ask "which store reaches this return" (unanswerable soundly at
-     * emission time - see the issue's abandoned attempts), this asks an EXISTENTIAL question
-     * once the function's CFG is complete: does the returned slot have any writer that is a
-     * frame box, AND no writer/user that proves the slot is not exclusively frame-boxed.
-     * Recorded per llvm::Function* (mirrors nullEventLog_), resolved at the same end-of-body
-     * hook as RunNullDerefDataflow, and dropped (not analyzed) on abort or leftover sweep.
+     * Deferred interface-return check. Once the CFG is complete, follow the definitions that
+     * reach the returned load; writes overwritten on every path do not taint the return.
+     * Recorded per function and dropped (not analyzed) on abort or leftover sweep.
      */
     struct PendingReturnDangleCheck
     {
         llvm::Function* Fn = nullptr;
         llvm::AllocaInst* Slot = nullptr;
+        llvm::LoadInst* ReturnedLoad = nullptr;
         int Line = 0;
         int Col = 0;
         std::string InterfaceName;
-        bool FrameStorageProvenance = false;
-        bool ProvenanceUnknown = true;
-        std::string FrameStorageClassName;
-        bool AliasOfOwnedLocal = false;
     };
     std::unordered_map<llvm::Function*, std::vector<PendingReturnDangleCheck>> pendingReturnDangleChecks_;
 
-    void RecordPendingReturnDangleCheck(llvm::AllocaInst* slot, int line, int col,
-                                        const std::string& ifaceName,
-                                        bool frameStorageProvenance,
-                                        bool provenanceUnknown,
-                                        const std::string& frameStorageClassName,
-                                        bool aliasOfOwnedLocal = false);
-
-    void SetInterfaceBoxReturnDangleProvenance(const std::string& name, bool frameStorage,
-                                               bool unknown, const std::string& className,
-                                               bool aliasOfOwnedLocal = false);
+    void RecordPendingReturnDangleCheck(llvm::AllocaInst* slot, llvm::LoadInst* returnedLoad,
+                                        int line, int col, const std::string& ifaceName);
 
     // Drop a function's pending return-dangle checks without analyzing them (an aborted body
     // has a partial CFG - same rationale as DiscardNullDerefEvents).
@@ -4734,6 +4719,18 @@ private:
     // released at reassignment, and scope exit (refcount-gated) keeps its pre-existing behaviour.
     void ClearOwnFlag(const std::string& varName);
     NamedVariable* FindStackVariableByStorage(const llvm::Value* storage);
+    // The same lookup over the function-argument frames (a parameter's own slot).
+    NamedVariable* FindStackArgumentByStorage(const llvm::Value* storage);
+    // Scope exit releases a pointer binding when its compile-time owner bit is set, or when a
+    // borrow suppressed that bit and the runtime OwnFlag still says it owns (the flag gates the free).
+    bool IsOwnedAtScopeExit(const NamedVariable& nv) const;
+    // Gives a move parameter a runtime OwnFlag (true from entry) at its first borrowing store.
+    void ActivateParamOwnFlag(NamedVariable& nv);
+    // Arms the runtime flag of a borrow-suppressed owner by name (no compile-time owner bit).
+    void ArmSuppressedOwnFlag(const std::string& name);
+    // Re-owns a move parameter at an owning store (SetVariableOwning reads locals only): the owner
+    // bit when a borrow cleared it, and the runtime flag when one is active.
+    void RearmParamOwner(const std::string& name);
 
     // Null-safe reverse-order element destruction shared by scope cleanup and `delete[n]`.
     void EmitCountedArrayDestruction(llvm::Value* ptrVal, const std::string& typeName,
@@ -5499,6 +5496,9 @@ private:
     // is moving into an alias-return copy slot: drop those arm entries so the slot is the one owner.
     // True only when every incoming value of the join had its own entry.
     bool AdoptTernaryArmStructTemps(llvm::PHINode* join);
+    // T197: a closure arm moved into a closure join is owned by the join; drop the struct-temp
+    // entry the per-arm registration made for that same value, or it frees the value a second time.
+    void UnregisterOwnedStructTempsHolding(llvm::Value* value);
 
     // Shared gate: true when `arg` is an unowned produced rvalue of an owning struct type, i.e.
     // one that a borrowing parameter will not free and no named local will either.
@@ -6215,7 +6215,11 @@ private:
                             const std::vector<CxxRequestItem>& items,
                             const std::string& extraSource, bool emitDefinitions,
                             cflat_cinterop::ExtractResult& raw, std::string& error,
-                            const std::string& prefixSource = {});
+                            const std::string& prefixSource = {},
+                            const cflat_cinterop::VariadicCallAbiRequest* variadicCallAbi = nullptr);
+    bool RequestCxxVariadicCallAbi(const FunctionSymbol& candidate,
+                                   const std::vector<NamedVariable>& arguments,
+                                   cflat_cinterop::RawAbi& abi, std::string& error);
     bool CountCxxHeaderParse(const CxxRequestGroup& group, const char* stage);
     /*
      * Per-compile clang parse budget of one translation unit: --error-on-cpp-reparse (1), else
@@ -8676,7 +8680,7 @@ public:
 
     llvm::Value* CreateExtractValue(llvm::Value* structInstance, unsigned int index);
 
-    llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::Value* destination, bool srcIsUnsigned = false, llvm::Type* explicitDestType = nullptr, bool destUnsigned = false);
+    llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::Value* destination, bool srcIsUnsigned = false, llvm::Type* explicitDestType = nullptr, bool destUnsigned = false, bool destIsArrayView = false);
 
     llvm::LoadInst* CreateLoad(llvm::Value* value);
 
@@ -8903,6 +8907,9 @@ public:
      * Named for what it proves ("non-heap"), not "stack": a global is exactly as un-free()-able.
      */
     static bool IsProvableNonHeapAddress(llvm::Value* value);
+    // The same proof for a NAMED source: its Primary when it has one, else a fixed array's storage
+    // (an array name decays to its element pointer without a Primary value of its own).
+    static bool IsProvableNonHeapAddressSource(const NamedVariable& source);
 
     llvm::Value* CreateOperation(std::string oper, llvm::Value* left, llvm::Value* right);
 
@@ -10650,11 +10657,12 @@ public:
      * Component types must agree across the shared prefix either way.
      */
     std::string DescribeFuncPtrBindMismatch(const std::string& functionName,
-        const LLVMBackend::TypeAndValue& fn, const LLVMBackend::TypeAndValue& dest) const;
+        const LLVMBackend::TypeAndValue& fn, const LLVMBackend::TypeAndValue& dest,
+        bool compareReturnOwnership = false) const;
 
     // The reason half of the bind rule above, without the subject. Empty when fn can bind dest.
     std::string FuncPtrBindReason(const LLVMBackend::TypeAndValue& fn,
-        const LLVMBackend::TypeAndValue& dest) const;
+        const LLVMBackend::TypeAndValue& dest, bool compareReturnOwnership = false) const;
 
     /*
      * Value-site check (declaration initializer, assignment, return, brace/field initializer): the
@@ -10919,7 +10927,8 @@ public:
 
     llvm::Function* GetFunctionForFuncPtr(std::string functionName, int expectedParamCount = -1,
                                           const std::vector<TypeAndValue::FuncPtrParam>* expectedParams = nullptr,
-                                          const TypeAndValue* destSig = nullptr);
+                                          const TypeAndValue* destSig = nullptr,
+                                          bool compareReturnOwnership = false);
 
     NamedVariable GetLocalVariable(const std::string& name);
 
@@ -11067,13 +11076,15 @@ public:
 
     /*
      * Drop a borrow that a plain '=' recorded (never a declaration-time one) when a later '='
-     * stores a provably OWNED value into the same binding from the SAME basic block. Same-block is
-     * the whole proof: any path that ran the borrow store also ran this one, so the binding cannot
-     * still hold the borrow. Across blocks the borrow stands - `d = p; if (c) { d = new T(); }`
+     * stores a provably OWNED value into the same binding from the SAME basic block - the block
+     * the storing STATEMENT starts in (statementBlock; the RHS may split blocks internally). Same
+     * block is the whole proof: any path that ran the borrow store also ran this one, so the binding
+     * cannot still hold the borrow. Across blocks the borrow stands - `d = p; if (c) { d = new T(); }`
      * leaves a path where it does not, the hazard tracked as
-     * conditional-store-retires-borrow-facts-unconditionally.
+     * conditional-store-retires-borrow-facts-unconditionally. Returns true when it retired a borrow.
      */
-    void RetireAssignBorrow(const std::string& name);
+    bool RetireAssignBorrow(const std::string& name,
+                            llvm::BasicBlock* statementBlock = nullptr);
 
     // True when `slot` IS a function argument's own storage. Identity, never spelling: a local that
     // merely SHARES a parameter's name is a different binding and must not be classified as one.
@@ -11178,19 +11189,6 @@ public:
     // resulting error still lands inside an enclosing scoped expect_error block. Reports the
     // earliest dereference of a maybe-null explicitly-moved local (LogError).
     void RunNullDerefDataflow(llvm::Function* F);
-
-    /*
-     * A store of null/undef/zero into the returned slot is ACCEPT evidence. Treating it as
-     * merely NEUTRAL was tried and rejected in review: it false-rejects legal programs that
-     * null the slot before returning (`r = probe as IShape; ...; r = nullptr; return r;`
-     * always returns null, yet the slot's only non-null writer is a frame box). That is the
-     * "does a frame box MAY-reach the return" question this design exists to avoid, arriving
-     * through the back door - the null store IS the CFG edge the rule refuses to look at.
-     * With this true the rule stays purely existential: reject only when EVERY writer of the
-     * slot is a frame box. The cost is missing a dangle in any function that also nulls the
-     * slot, which is today's behaviour and the acceptable side of the asymmetry.
-     */
-    static constexpr bool kNullStoreIsAcceptEvidence = true;
 
     // Resolve the pending interface-return-dangle checks for ONE function as soon as its body
     // is fully lowered (same hook as RunNullDerefDataflow, right beside it) - the CFG is
@@ -11483,7 +11481,8 @@ public:
                                     const std::vector<llvm::Value*>* indirectArgAddrs = nullptr,
                                     llvm::Value* calleeOverride = nullptr,
                                     const std::vector<llvm::Value*>* rawArrayCounts = nullptr,
-                                    bool mayUnwind = false);
+                                    bool mayUnwind = false,
+                                    const AbiRecipe* callRecipe = nullptr);
     // A pointer to a C++ class binds to a parameter/slot of a PUBLIC base of that class, with the
     // base subobject offset added. Non-public bases are refused at the conversion site.
     // A C++ class VALUE slices to a by-value/by-reference parameter of a PUBLIC base of it.

@@ -1,23 +1,19 @@
-# Calling a Lambda<Fn()> that returns std.function crashes with SIGBUS
+# Remaining callable-binding gaps
 
-Summary: left over from the ST1 follow-ups. The generic-instantiation half (`dbl<int>` into
-std::function / a deduced C++ callable, and the explicit-constructor Upconvert crash) is fixed
-(Test/test_cpp_interop_bridge.cb 631-636). What remains, pre-existing on master: calling a
-`Lambda<Fn()>` whose result is a `std.function` crashes at run time with SIGBUS.
+Summary: the ST1 generic-instantiation cases are fixed in Test/test_cpp_interop_bridge.cb 631-636.
+T208 fixed the Lambda<Fn()> sret crash and the function-pointer call-argument move / return-ABI
+mismatches. The remaining gaps are:
 
-Repro: scratch/repro_keep/st1_followups/lambda_maker_existing.cb, lambda_maker4.cb (clang twin
-lambda_maker4.cpp prints 8 -5).
-
-Root cause: not investigated.
-
-Also seen (separate gaps, plain function names too, pre-existing on master):
 - assigning a callable to an existing `std.function` (`a = add3;`) reports "has no assignment
   operator cflat can call"; only the declarator / constructor forms bind.
-- a function name passed as a CALL ARGUMENT to a CFlat `function<int(int*)>` parameter skips the
-  `move` modifier check the declarator applies (`int consume(move int* p)` binds; double delete).
-- a `move T*`-returning function name passed as a call argument to a CFlat `function<T*(int)>`
-  parameter crashes the compiler (internal compiler error).
 - `auto p = add1;` / `auto q = dbl<int>;` report "the function 'p' is not known" at the call.
 - review round 1 (n53_review1.md): a variadic function pointer spelling loses `...`; a plain
   move-parameter function into std.function double-cleans; an owning void* return into
   std.function crashes.
+- (T208 review, pre-existing) an owning-return function bound to a `function<int*(int)>` VARIABLE, then passed twice to a
+  borrowed-slot parameter, crashes (139); the declarator bind skips the T208 call-argument ownership check.
+- (T208 review, pre-existing) a lambda literal with a `move int*` parameter passed to a borrowed `function<int(int*)>`
+  double-deletes (133).
+- (T208 review, pre-existing) `Lambda<std.string()>` / `function<std.vector<int>()>` spelled directly report "cannot find
+  the type" (aliases work); a CFlat function with a `function<alias-of-C++-class()>` parameter is never defined (link fails).
+- Function-pointer spellings in bind diagnostics drop `move` on the return (both sides print 'Pl*(int)').

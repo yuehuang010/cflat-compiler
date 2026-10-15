@@ -1,0 +1,7 @@
+// A function name used as an array dimension is not a size: it reached the alloca as a pointer and
+// failed module verification ("Alloca array size must have integer type"). Refused at the local
+// dimension site; clang++ also refuses it ("not implicitly convertible to 'unsigned long'").
+expect_error("array dimension 'K' must have an integer type") {
+    int K() { return 3; }
+    int f() { int[K] a = default; return 0; }
+}

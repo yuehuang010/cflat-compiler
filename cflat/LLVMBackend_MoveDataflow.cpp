@@ -5,6 +5,8 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/IR/Dominators.h>
+#include <llvm/Analysis/LoopInfo.h>
+#include <llvm/IR/CFG.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Linker/Linker.h>
@@ -37,8 +39,10 @@
 #include <optional>
 #include <algorithm>
 #include <cctype>
+#include <functional>
 #include <map>
 #include <set>
+#include <unordered_set>
 
 #if defined(__APPLE__)
 // Step 3 (macOS self-contained link): harvest libSystem's exported symbols from
@@ -211,6 +215,174 @@ void LLVMBackend::RunNullDerefDataflow(llvm::Function* F)
             "dereference of moved variable '{}' (it is null after the move)", earliest->name));
     }
 
+static std::vector<llvm::StoreInst*> StoresReachingLoadLinear(llvm::LoadInst* load,
+                                                              llvm::AllocaInst* slot)
+{
+        std::vector<llvm::StoreInst*> stores;
+        if (load == nullptr || slot == nullptr) return stores;
+        std::unordered_set<const llvm::StoreInst*> seenStores;
+        auto nearestStore = [&](llvm::BasicBlock* block, llvm::Instruction* before) {
+            auto current = before != nullptr ? before->getIterator() : block->end();
+            while (current != block->begin())
+            {
+                --current;
+                auto* store = llvm::dyn_cast<llvm::StoreInst>(&*current);
+                if (store != nullptr
+                    && store->getPointerOperand()->stripPointerCasts() == slot)
+                {
+                    if (seenStores.insert(store).second) stores.push_back(store);
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        std::vector<std::pair<llvm::BasicBlock*, llvm::Instruction*>> pending;
+        std::unordered_set<const llvm::BasicBlock*> visited;
+        if (!nearestStore(load->getParent(), load))
+            for (llvm::BasicBlock* predecessor : llvm::predecessors(load->getParent()))
+                pending.emplace_back(predecessor, nullptr);
+        for (size_t i = 0; i < pending.size(); ++i)
+        {
+            auto [block, before] = pending[i];
+            if (block == nullptr || !visited.insert(block).second) continue;
+            if (!nearestStore(block, before))
+                for (llvm::BasicBlock* predecessor : llvm::predecessors(block))
+                    pending.emplace_back(predecessor, nullptr);
+        }
+        return stores;
+}
+
+static bool RefineStoresByCorrelatedBranches(
+    llvm::LoadInst* load, llvm::AllocaInst* slot,
+    std::vector<llvm::StoreInst*>& stores)
+{
+        stores.clear();
+        if (load == nullptr || slot == nullptr) return true;
+        constexpr size_t kNodeBudget = 4096;
+        size_t visitedNodes = 0;
+        bool exhausted = false;
+        struct BranchFact
+        {
+            const llvm::Value* Condition = nullptr;
+            bool Truth = false;
+            const llvm::ICmpInst* Comparison = nullptr;
+            bool ComparisonTruth = false;
+        };
+        std::unordered_set<const llvm::BasicBlock*> path;
+        std::unordered_set<const llvm::StoreInst*> seenStores;
+        std::vector<BranchFact> branchFacts;
+        std::unordered_map<const llvm::Value*, unsigned> storeCountBySlot;
+        auto storesToSlot = [&](const llvm::Value* alloca) {
+            auto [it, inserted] = storeCountBySlot.emplace(alloca, 0);
+            if (inserted)
+                for (const llvm::BasicBlock& basicBlock : *load->getFunction())
+                    for (const llvm::Instruction& instruction : basicBlock)
+                        if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+                            store != nullptr
+                            && store->getPointerOperand()->stripPointerCasts() == alloca)
+                            ++it->second;
+            return it->second;
+        };
+        auto sameStableLoad = [&](const llvm::Value* left, const llvm::Value* right) {
+            if (left == right) return true;
+            auto* leftLoad = llvm::dyn_cast<llvm::LoadInst>(left);
+            auto* rightLoad = llvm::dyn_cast<llvm::LoadInst>(right);
+            if (leftLoad == nullptr || rightLoad == nullptr) return false;
+            const llvm::Value* leftSlot = leftLoad->getPointerOperand()->stripPointerCasts();
+            const llvm::Value* rightSlot = rightLoad->getPointerOperand()->stripPointerCasts();
+            if (leftSlot != rightSlot || !llvm::isa<llvm::AllocaInst>(leftSlot)) return false;
+            return storesToSlot(leftSlot) == 1;
+        };
+        auto equivalentCompareOperands = [&](const llvm::ICmpInst* left,
+                                             const llvm::ICmpInst* right) {
+            return left != nullptr && right != nullptr
+                && sameStableLoad(left->getOperand(0), right->getOperand(0))
+                && sameStableLoad(left->getOperand(1), right->getOperand(1));
+        };
+        auto addBranchFact = [&](llvm::BranchInst* branch, llvm::BasicBlock* successor) {
+            if (branch == nullptr || !branch->isConditional()
+                || branch->getSuccessor(0) == branch->getSuccessor(1))
+                return true;
+            BranchFact fact;
+            fact.Condition = branch->getCondition();
+            fact.Truth = branch->getSuccessor(0) == successor;
+            fact.Comparison = llvm::dyn_cast<llvm::ICmpInst>(fact.Condition);
+            fact.ComparisonTruth = fact.Truth;
+            if (auto* inverted = llvm::dyn_cast<llvm::BinaryOperator>(fact.Condition);
+                fact.Comparison == nullptr && inverted != nullptr
+                && inverted->getOpcode() == llvm::Instruction::Xor)
+            {
+                if (auto* one = llvm::dyn_cast<llvm::ConstantInt>(inverted->getOperand(1));
+                    one != nullptr && one->isOne())
+                {
+                    fact.Comparison = llvm::dyn_cast<llvm::ICmpInst>(inverted->getOperand(0));
+                    fact.ComparisonTruth = !fact.Truth;
+                }
+            }
+            for (const BranchFact& previous : branchFacts)
+            {
+                if (fact.Condition == previous.Condition && fact.Truth != previous.Truth)
+                    return false;
+                if (!equivalentCompareOperands(fact.Comparison, previous.Comparison)) continue;
+                auto currentPredicate = fact.Comparison->getPredicate();
+                auto previousPredicate = previous.Comparison->getPredicate();
+                if (currentPredicate == previousPredicate
+                    && fact.ComparisonTruth != previous.ComparisonTruth)
+                    return false;
+                if (currentPredicate == llvm::CmpInst::getInversePredicate(previousPredicate)
+                    && fact.ComparisonTruth == previous.ComparisonTruth)
+                    return false;
+            }
+            branchFacts.push_back(fact);
+            return true;
+        };
+        std::function<void(llvm::BasicBlock*, llvm::Instruction*)> walk =
+            [&](llvm::BasicBlock* block, llvm::Instruction* before) {
+                if (exhausted || block == nullptr) return;
+                if (++visitedNodes > kNodeBudget)
+                {
+                    exhausted = true;
+                    return;
+                }
+                if (!path.insert(block).second) return;
+                auto current = before != nullptr ? before->getIterator() : block->end();
+                while (current != block->begin())
+                {
+                    --current;
+                    auto* store = llvm::dyn_cast<llvm::StoreInst>(&*current);
+                    if (store == nullptr
+                        || store->getPointerOperand()->stripPointerCasts() != slot)
+                        continue;
+                    if (seenStores.insert(store).second) stores.push_back(store);
+                    path.erase(block);
+                    return;
+                }
+                for (llvm::BasicBlock* predecessor : llvm::predecessors(block))
+                {
+                    auto* branch = llvm::dyn_cast<llvm::BranchInst>(predecessor->getTerminator());
+                    size_t factCount = branchFacts.size();
+                    if (addBranchFact(branch, block)) walk(predecessor, nullptr);
+                    branchFacts.resize(factCount);
+                }
+                path.erase(block);
+            };
+        walk(load->getParent(), load);
+        return !exhausted;
+}
+
+static std::vector<llvm::StoreInst*> StoresReachingLoad(llvm::LoadInst* load,
+                                                        llvm::AllocaInst* slot,
+                                                        bool refineCorrelations = false)
+{
+        std::vector<llvm::StoreInst*> stores = StoresReachingLoadLinear(load, slot);
+        if (!refineCorrelations) return stores;
+        std::vector<llvm::StoreInst*> refined;
+        if (RefineStoresByCorrelatedBranches(load, slot, refined)) return refined;
+        // Exhaustion keeps the linear candidates, preserving the conservative answer.
+        return stores;
+}
+
 void LLVMBackend::RunInterfaceReturnDangleCheck(llvm::Function* F)
 {
         if (!F) return;
@@ -218,29 +390,138 @@ void LLVMBackend::RunInterfaceReturnDangleCheck(llvm::Function* F)
         if (it == pendingReturnDangleChecks_.end()) return;
         std::vector<PendingReturnDangleCheck> pending = std::move(it->second);
         pendingReturnDangleChecks_.erase(it);
+        llvm::DominatorTree dominatorTree(*F);
+        llvm::LoopInfo loopInfo(dominatorTree);
 
         for (const auto& rec : pending)
         {
-            if (!rec.Slot) continue;
-            bool hasNonFrameWriter = false;
-            for (llvm::User* u : rec.Slot->users())
+            if (!rec.Slot || !rec.ReturnedLoad) continue;
+            bool aliasOfOwnedLocal = false;
+            bool sawNullReachingStore = false;
+            std::string frameStorageClassName;
+            std::unordered_set<const llvm::Value*> valuePath;
+            std::unordered_map<const llvm::LoadInst*, std::vector<llvm::StoreInst*>> storeMemo;
+            std::unordered_set<const llvm::LoadInst*> activeLoads;
+            std::function<std::vector<llvm::StoreInst*>(llvm::LoadInst*, llvm::AllocaInst*)>
+                storesForLoad;
+            std::function<void(const llvm::Value*, int)> inspectValue =
+                [&](const llvm::Value* value, int depth) {
+                    if (value == nullptr || depth > 16 || !valuePath.insert(value).second) return;
+                    if (llvm::isa<llvm::UndefValue>(value)
+                        || llvm::isa<llvm::ConstantAggregateZero>(value)
+                        || (llvm::isa<llvm::Constant>(value)
+                            && llvm::cast<llvm::Constant>(value)->isNullValue()))
+                    {
+                        valuePath.erase(value);
+                        return;
+                    }
+                    if (const InterfaceBoxRecord* box = FindInterfaceBoxByFatValue(value))
+                    {
+                        aliasOfOwnedLocal = aliasOfOwnedLocal || box->AliasOfOwnedLocal;
+                        if (frameStorageClassName.empty()
+                            && box->Source == InterfaceBoxSource::FrameStorage)
+                            frameStorageClassName = box->SourceClassName;
+                        valuePath.erase(value);
+                        return;
+                    }
+                    if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+                    {
+                        for (const llvm::Value* incoming : phi->incoming_values())
+                            inspectValue(incoming, depth + 1);
+                        valuePath.erase(value);
+                        return;
+                    }
+                    if (const auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+                    {
+                        inspectValue(select->getTrueValue(), depth + 1);
+                        inspectValue(select->getFalseValue(), depth + 1);
+                        valuePath.erase(value);
+                        return;
+                    }
+                    if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(value);
+                        load != nullptr && load->getType() == GetFatPtrType())
+                    {
+                        auto* sourceSlot = llvm::dyn_cast<llvm::AllocaInst>(
+                            load->getPointerOperand()->stripPointerCasts());
+                        if (sourceSlot != nullptr)
+                        {
+                            std::vector<llvm::StoreInst*> sourceStores = storesForLoad(
+                                const_cast<llvm::LoadInst*>(load),
+                                const_cast<llvm::AllocaInst*>(sourceSlot));
+                            for (const llvm::StoreInst* store : sourceStores)
+                                inspectValue(store->getValueOperand(), depth + 1);
+                        }
+                    }
+                    valuePath.erase(value);
+                };
+            storesForLoad = [&](llvm::LoadInst* load, llvm::AllocaInst* slot) {
+                if (load == nullptr || slot == nullptr) return std::vector<llvm::StoreInst*>{};
+                auto cached = storeMemo.find(load);
+                if (cached != storeMemo.end()) return cached->second;
+                std::vector<llvm::StoreInst*> linear = StoresReachingLoad(load, slot);
+                if (!activeLoads.insert(load).second) return linear;
+
+                bool savedAlias = aliasOfOwnedLocal;
+                std::string savedFrame = frameStorageClassName;
+                aliasOfOwnedLocal = false;
+                frameStorageClassName.clear();
+                valuePath.clear();
+                for (const llvm::StoreInst* store : linear)
+                    inspectValue(store->getValueOperand(), 0);
+                bool hasDangerousStore = aliasOfOwnedLocal || !frameStorageClassName.empty();
+                aliasOfOwnedLocal = savedAlias;
+                frameStorageClassName = std::move(savedFrame);
+                valuePath.clear();
+
+                if (hasDangerousStore)
+                    linear = StoresReachingLoad(load, slot, true);
+                activeLoads.erase(load);
+                storeMemo.emplace(load, linear);
+                return linear;
+            };
+
+            std::vector<llvm::StoreInst*> reachingStores = storesForLoad(rec.ReturnedLoad, rec.Slot);
+            for (const llvm::StoreInst* store : reachingStores)
             {
-                const auto* store = llvm::dyn_cast<llvm::StoreInst>(u);
-                if (store == nullptr || store->getPointerOperand() != rec.Slot) continue;
-                const llvm::Value* v = store->getValueOperand();
-                bool isNullish = llvm::isa<llvm::UndefValue>(v)
-                    || llvm::isa<llvm::ConstantAggregateZero>(v)
-                    || (llvm::isa<llvm::Constant>(v)
-                        && llvm::cast<llvm::Constant>(v)->isNullValue());
-                if (isNullish) { hasNonFrameWriter = true; break; }
-                const InterfaceBoxRecord* box = FindInterfaceBoxByFatValue(v);
-                if (box == nullptr || box->Source != InterfaceBoxSource::FrameStorage)
-                {
-                    hasNonFrameWriter = true;
-                    break;
-                }
+                const llvm::Value* value = store->getValueOperand();
+                sawNullReachingStore = sawNullReachingStore
+                    || llvm::isa<llvm::UndefValue>(value)
+                    || llvm::isa<llvm::ConstantAggregateZero>(value)
+                    || (llvm::isa<llvm::Constant>(value)
+                        && llvm::cast<llvm::Constant>(value)->isNullValue());
+                inspectValue(store->getValueOperand(), 0);
             }
-            if (rec.AliasOfOwnedLocal)
+
+            // Existing interface-return behavior treats a reachable null box as neutral evidence.
+            if (sawNullReachingStore) frameStorageClassName.clear();
+
+            // Loops are not unrolled; keep accepting when one can write a non-frame box.
+            if (!frameStorageClassName.empty())
+            {
+                bool hasNonFrameLoopWriter = false;
+                for (const llvm::User* user : rec.Slot->users())
+                {
+                    const auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                    if (store == nullptr
+                        || store->getPointerOperand()->stripPointerCasts() != rec.Slot
+                        || loopInfo.getLoopFor(store->getParent()) == nullptr)
+                        continue;
+                    const llvm::Value* value = store->getValueOperand();
+                    bool isNullish = llvm::isa<llvm::UndefValue>(value)
+                        || llvm::isa<llvm::ConstantAggregateZero>(value)
+                        || (llvm::isa<llvm::Constant>(value)
+                            && llvm::cast<llvm::Constant>(value)->isNullValue());
+                    const InterfaceBoxRecord* box = FindInterfaceBoxByFatValue(value);
+                    if (isNullish || box == nullptr || box->Source != InterfaceBoxSource::FrameStorage)
+                    {
+                        hasNonFrameLoopWriter = true;
+                        break;
+                    }
+                }
+                if (hasNonFrameLoopWriter) frameStorageClassName.clear();
+            }
+
+            if (aliasOfOwnedLocal)
             {
                 SetSourceLocation(static_cast<size_t>(rec.Line), static_cast<size_t>(rec.Col));
                 LogError(std::format(
@@ -249,86 +530,15 @@ void LLVMBackend::RunInterfaceReturnDangleCheck(llvm::Function* F)
                     "return the owning local itself ('return t;' from a 'move' function) or a heap "
                     "object", rec.InterfaceName));
             }
-            if (rec.FrameStorageProvenance && !rec.ProvenanceUnknown && !hasNonFrameWriter)
+            if (!frameStorageClassName.empty())
             {
                 SetSourceLocation(static_cast<size_t>(rec.Line), static_cast<size_t>(rec.Col));
-                if (rec.FrameStorageClassName.empty())
-                    LogError(std::format(
-                        "cannot return a local value as interface '{}' - the interface fat pointer "
-                        "would dangle once this function returns; allocate the object on the heap "
-                        "and return the pointer", rec.InterfaceName));
-                else
-                    LogError(std::format(
-                        "cannot return local value '{}' as interface '{}' - the interface fat "
-                        "pointer would dangle once this function returns; allocate on the heap "
-                        "('new {}') and return the pointer", rec.FrameStorageClassName,
-                        rec.InterfaceName, rec.FrameStorageClassName));
-            }
-            bool tainted = false;
-            bool accepted = false;
-            std::string taintClassName;
-            for (llvm::User* u : rec.Slot->users())
-            {
-                if (llvm::isa<llvm::LoadInst>(u)) continue;
-                if (const auto* call = llvm::dyn_cast<llvm::CallBase>(u))
-                {
-                    // Only debug/lifetime markers are inert for a SLOT. Deliberately NOT
-                    // CallIsPointerOpaqueIntrinsic: that helper also admits llvm.mem*, which
-                    // is sound for its question (a pointer VALUE's escape) but not for this
-                    // one - a memcpy into the slot is a real write of a possibly non-frame
-                    // value, so it must fall through to accept.
-                    if (const llvm::Function* callee = call->getCalledFunction();
-                        callee != nullptr && (callee->getName().starts_with("llvm.dbg.")
-                            || callee->getName().starts_with("llvm.lifetime.")))
-                        continue;
-                    accepted = true;
-                    break;
-                }
-                if (auto* store = llvm::dyn_cast<llvm::StoreInst>(u))
-                {
-                    // The slot's ADDRESS stored elsewhere (not a store INTO the slot) is an
-                    // escape, not a write - fall through to the catch-all accept below.
-                    if (store->getPointerOperand() != rec.Slot) { accepted = true; break; }
-                    llvm::Value* v = store->getValueOperand();
-                    bool isNullish = llvm::isa<llvm::UndefValue>(v)
-                        || llvm::isa<llvm::ConstantAggregateZero>(v)
-                        || (llvm::isa<llvm::Constant>(v) && llvm::cast<llvm::Constant>(v)->isNullValue());
-                    if (isNullish)
-                    {
-                        if (kNullStoreIsAcceptEvidence) { accepted = true; break; }
-                        continue;
-                    }
-                    if (const InterfaceBoxRecord* box = FindInterfaceBoxByFatValue(v);
-                        box != nullptr && box->Source == InterfaceBoxSource::FrameStorage)
-                    {
-                        tainted = true;
-                        taintClassName = box->SourceClassName;
-                        continue;
-                    }
-                    // No ledger record at all, or Heap / Parameter / Global / Unknown, or a
-                    // load of another slot / call result / phi / argument - accept evidence.
-                    accepted = true;
-                    break;
-                }
-                // Any other user whatsoever - a call argument (handled above), a GEP with
-                // any non-load user, the address stored anywhere, memcpy/memmove, an
-                // AtomicRMW, anything not explicitly whitelisted above - accept.
-                accepted = true;
-                break;
-            }
-            if (!tainted || accepted) continue;
-
-            SetSourceLocation(static_cast<size_t>(rec.Line), static_cast<size_t>(rec.Col));
-            if (taintClassName.empty())
-                LogError(std::format(
-                    "cannot return a local value as interface '{}' - the interface fat pointer "
-                    "would dangle once this function returns; allocate the object on the heap "
-                    "and return the pointer", rec.InterfaceName));
-            else
                 LogError(std::format(
                     "cannot return local value '{}' as interface '{}' - the interface fat "
                     "pointer would dangle once this function returns; allocate on the heap "
-                    "('new {}') and return the pointer", taintClassName, rec.InterfaceName, taintClassName));
+                    "('new {}') and return the pointer", frameStorageClassName,
+                    rec.InterfaceName, frameStorageClassName));
+            }
         }
     }
 
@@ -1302,9 +1512,10 @@ llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, st
                                             const std::vector<llvm::Value*>* indirectArgAddrs,
                                             llvm::Value* calleeOverride,
                                             const std::vector<llvm::Value*>* rawArrayCounts,
-                                            bool mayUnwind)
+                                            bool mayUnwind,
+                                            const AbiRecipe* callRecipe)
 {
-        const AbiRecipe& recipe = candidate.Recipe;
+        const AbiRecipe& recipe = callRecipe != nullptr ? *callRecipe : candidate.Recipe;
         std::vector<llvm::Value*> loweredArgs;
         loweredArgs.reserve(argList.size() + (recipe.retSlot.kind == AbiSlot::SRetReturn ? 1 : 0));
 
@@ -1319,13 +1530,24 @@ llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, st
             loweredArgs.push_back(sretSlot);
         }
 
-        LowerAbiArgs(recipe, argList, indirectArgAddrs, rawArrayCounts, loweredArgs);
+        if (callRecipe != nullptr)
+        {
+            std::vector<llvm::Value*> promotedArgs = argList;
+            if (candidate.Variadic)
+                for (size_t t = candidate.Parameters.size(); t < promotedArgs.size(); ++t)
+                    promotedArgs[t] = PromoteVariadicArgument(promotedArgs[t]);
+            LowerAbiArgs(recipe, promotedArgs, indirectArgAddrs, rawArrayCounts, loweredArgs);
+        }
+        else
+        {
+            LowerAbiArgs(recipe, argList, indirectArgAddrs, rawArrayCounts, loweredArgs);
+        }
         // MS ABI instance method: the hidden slot was pushed first, the ABI wants it after `this`.
         if (SRetArgIndex(recipe) == 1 && loweredArgs.size() > 1)
             std::swap(loweredArgs[0], loweredArgs[1]);
-        // Variadic tail: scalar varargs follow the declared slots with CreateFunctionCall's default
-        // promotions; aggregate varargs were already refused (LLVMBackend_Overloads variadic gate).
-        if (candidate.Variadic)
+        // Without a call-site arrangement only scalar varargs can be appended to the declaration
+        // recipe. Aggregate variadic tails use the full Clang call arrangement above.
+        if (candidate.Variadic && callRecipe == nullptr)
             for (size_t t = recipe.paramSlots.size(); t < argList.size(); ++t)
                 loweredArgs.push_back(PromoteVariadicArgument(argList[t]));
 
@@ -1598,6 +1820,8 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
         // The loaded snapshot in `value` already captures the pointer; the caller takes ownership.
         NamedVariable* ownedStringReturnVar = nullptr;
         NamedVariable* ownedPtrReturnVar    = nullptr;
+        // The returned owner was a borrow-suppressed one (only its runtime flag is cleared on return).
+        bool ownedPtrReturnSuppressed = false;
         if (value)
         {
             if (auto* loadInst = llvm::dyn_cast<llvm::LoadInst>(value))
@@ -1624,19 +1848,23 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
                                     llvm::Constant::getNullValue(loadInst->getType()), srcAlloca);
                                 return;
                             }
-                            if (nv.Storage == srcAlloca && nv.IsOwning)
+                            if (nv.Storage == srcAlloca && IsOwnedAtScopeExit(nv))
                             {
                                 ownedPtrReturnVar = &nv;
-                                nv.IsOwning = false;  // suppress cleanup on return path
+                                ownedPtrReturnSuppressed = !nv.IsOwning;
+                                if (nv.IsOwning) nv.IsOwning = false;  // suppress cleanup on return path
+                                else nv.BorrowSuppressedOwner = false;
                                 return;
                             }
                         }
                         for (auto& [varName, nv] : frame.functionArgument)
                         {
-                            if (nv.Storage == srcAlloca && nv.IsOwning)
+                            if (nv.Storage == srcAlloca && IsOwnedAtScopeExit(nv))
                             {
                                 ownedPtrReturnVar = &nv;
-                                nv.IsOwning = false;  // suppress cleanup on return path
+                                ownedPtrReturnSuppressed = !nv.IsOwning;
+                                if (nv.IsOwning) nv.IsOwning = false;  // suppress cleanup on return path
+                                else nv.BorrowSuppressedOwner = false;
                                 return;
                             }
                         }
@@ -1713,7 +1941,10 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
         // The returned string local was moved out by zeroing its storage (not by toggling
         // IsOwningString), so nothing to restore for it - its always-run dtor now no-ops on
         // the zeroed value.
-        if (ownedPtrReturnVar)    ownedPtrReturnVar->IsOwning = true;
+        if (ownedPtrReturnVar && ownedPtrReturnSuppressed)
+            ownedPtrReturnVar->BorrowSuppressedOwner = true;
+        else if (ownedPtrReturnVar)
+            ownedPtrReturnVar->IsOwning = true;
         returnedStructDtorSkipAlloca = prevStructSkip;
 
         // Auto return-type inference: record the (BB, value) pair so the caller can

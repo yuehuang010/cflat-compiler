@@ -9,14 +9,15 @@ alias stored into an owning array element and a chained declaration then consume
 alias diagnostic; `extern` (C linkage) definitions keep the C ABI with no alias inference (ruling
 2026-09-30); a prototype followed by an inferred-alias definition links.
 
+T212 (2026-10-14) fixed the forwarded frame-local alias gap below and V2 item 3. Alias-return checks now follow alias arguments through forwarding calls; owning stores also check alias results through phi/select values, dereferences, and container indexers. The requested safe-forwarding and legal-owning-store acceptance legs remain green.
+
 Open:
 
 1. (P3) Named alias keeps a stale shallow copy: `T x = f(a); a.u = new int(9);` then x reads freed memory (master too). A storage-rebinding attempt in V2 broke the mixed alias-return legs and was removed.
 2. (P3, Windows) test.bat has no `// cflat-twin-args:` equivalent, so test_operators.cb runs only at -O0 there.
-3. (P3, pre-existing on master, rc 133 aborts; probes scratch/repro_keep/v2/rev/) alias-return result
-   stored where the alias check does not look: `baSink(k ? pick(a,b) : pick(c,d))` (both-alias-arm phi not
-   matched by IsAliasReturnResult, u_tern2.cb); `*p = pick(a,b)` (u_ptrarr.cb, u_ptrplain.cb);
-   `l[0] = pick(...)` and `l[0] = y` (list index store, u_listset.cb, u_listsetY.cb).
+3. (P3, pre-existing) a NAMED alias local stored through a raw `*p` (`Box y = pick(a,b); *p = y;`) is
+   still accepted: core hpc/btree.cb lookup's `*out = found` relies on that (out is an alias by contract),
+   so T212 refuses only a direct alias-call result there. Needs a ruling on the btree contract first.
 4. (P3) The '.copy()' steer in the alias diagnostic does not compile for a type with a unique field (BaT).
 5. (Needs ratification) V2 made an extern (C linkage) callee own its by-value owning params (C ABI, ruling
    2026-09-30), so the call site moves the argument: `ef(a)` then reading `a` is refused "use of moved
@@ -27,6 +28,8 @@ Open:
 7. (P3, pre-existing on master, rc 133) a by-value string PARAM aliased into a local and then rebound
    double-frees: `void f(string s) { string t = s; s = s + "n"; printf("%s", t.data()); }` called with an
    owned string (scratch/repro_keep/v7/d4.cb). Same alias-then-rebind shape the V7 lambda-capture fix
-   closed for captures (copy the source into the local when it may be rebound).
+   closed for captures (copy the source into the local when it may be rebound). T212 (Luna) tried a
+   param entry copy + local deep copy (values right, one 3-byte leak); stripped before landing, legs kept
+   in scratch/t212_C_legs.cb.txt (main checkout).
 
 RULED 2026-10-01 (maintainer): item 5 RATIFIED - an extern "C" callee owns its by-value owning params; `ef(a)` moves `a` and a later read is "use of moved variable". No caller-side copy.

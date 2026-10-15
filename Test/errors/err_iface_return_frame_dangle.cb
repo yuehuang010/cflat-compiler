@@ -156,6 +156,77 @@ expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
     }
 }
 
+struct T198Holder { Thing* p = default; };
+Thing t198Global = default;
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t198OwnedAliasInStructField()
+    {
+        Thing* owner = new Thing();
+        Thing* alias = owner;
+        T198Holder h = default;
+        h.p = alias;
+        return h.p;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t198OwnedAliasInArraySlot()
+    {
+        Thing* owner = new Thing();
+        Thing* alias = owner;
+        Thing*[3] slots = default;
+        slots[1] = alias;
+        return slots[1];
+    }
+}
+
+struct T198HolderOne { int pad = 0; Thing* p = default; };
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t198OwnedAliasInStructFieldOne()
+    {
+        Thing* owner = new Thing();
+        Thing* alias = owner;
+        Thing* secondAlias = alias;
+        T198HolderOne h = default;
+        h.p = secondAlias;
+        return h.p;
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t198OwnedAliasInDynamicArraySlot(int index)
+    {
+        Thing* owner = new Thing();
+        Thing* alias = owner;
+        Thing*[3] slots = default;
+        slots[index] = alias;
+        return slots[index];
+    }
+}
+
+expect_error("cannot return a borrow of a local owner as interface 'IThing'") {
+    IThing t198OwnedAliasConditionalRebind(int k)
+    {
+        Thing* owner = new Thing();
+        Thing* alias = owner;
+        IThing i = alias;
+        if (k) i = &t198Global;
+        return i;
+    }
+}
+
+expect_error("cannot return local value 'Thing' as interface 'IThing'") {
+    IThing t198FrameArrayConditionalRebind(int k)
+    {
+        Thing[3] arr = default;
+        arr[1].n = 9;
+        IThing i = &arr[1];
+        if (k) i = &t198Global;
+        return i;
+    }
+}
+
 extern int main()
 {
     return 0;

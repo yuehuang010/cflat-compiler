@@ -2875,6 +2875,13 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                     {
                         const std::string name = global->getName().str();
                         global->replaceAllUsesWith(llvm::PoisonValue::get(global->getType()));
+                        auto discardPendingGlobal = [global](auto& queue) {
+                            queue.erase(std::remove_if(queue.begin(), queue.end(), [global](const auto& item) {
+                                return item.Global == global;
+                            }), queue.end());
+                        };
+                        discardPendingGlobal(pendingGlobalDefaultConstructions_);
+                        discardPendingGlobal(pendingGlobalCxxConstructions_);
                         global->eraseFromParent();
                         compilerLLVM->globalNamedVariable.erase(name);
                         compilerLLVM->globalVariableTypes.erase(name);
@@ -6946,6 +6953,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 llvm::Type* srcMoveTempStructType = nullptr;
                 unsigned srcMoveTempFieldIndex = 0;
                 auto initializer = initDecl->initializer();
+                // Owned-call flags are per declarator: a stale flag (e.g. from a `_ =` discard) would make
+                // the pointer consumer below adopt this borrow as an owner.
+                compiler->lastCallReturnsOwned = false;
+                compiler->lastOwningResult = false;
 
                 // Bare-brace form: T[N] arr {} - LeftBrace/initializerList are on initDecl directly.
                 // Equivalent to T[N] arr = {} / T[N] arr = {field=v,...}.
@@ -7517,6 +7528,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                             rightNV.TypeAndValue.TypeName, typeAndValue.TypeName,
                                             rightNV, aliasStorage);
                                 }
+                                // A generic instance as a value (`bool b = dbl<int>;`) has no Primary yet: function<T> binds it
+                                // by signature below, any other target takes its address here like a named function.
+                                if (!typeAndValue.IsFunctionPointer && rightNV.GenericFunctionValue
+                                    && rightNV.Primary == nullptr && !rightNV.CallerName.empty())
+                                    rightNV.Primary = compiler->GetFunctionForFuncPtr(rightNV.CallerName);
                                 right = LoadNamedVariable(rightNV);
                                 // A moved core unique interface wrapper can be reboxed into a
                                 // different core unique interface wrapper; do not bitcast structs.
@@ -9279,8 +9295,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 destNV.OwnsInterfaceBox = true;
                             }
                         }
-                        TagInterfaceBoxProvenance(
-                            name, right, haveInterfaceSourceNV ? &interfaceSourceNV : nullptr);
+                        TagInterfaceBoxProvenance(name, right);
                     }
 
                     if (bindAliasReference)
@@ -9769,7 +9784,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             auto* initStore = (movedCxxReturn || loweredCopyInitInPlace)
                                 ? nullptr : compiler->CreateAssignment(right, alloc, srcIsUnsigned,
                                     nrvoLocal ? compiler->GetType(typeAndValue) : nullptr,
-                                    typeAndValue.IsUnsignedInteger() != -1);
+                                    typeAndValue.IsUnsignedInteger() != -1,
+                                    typeAndValue.IsArrayView);
                             if (movedOwningStruct)
                             {
                                 compiler->builder->CreateStore(
@@ -10054,6 +10070,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // carries the proof; a `move` source sets IsOwning above and does not.
                         if (typeAndValue.Pointer && haveInitializerSourceNV
                             && (compiler->IsBorrowedAddressValue(initializerSourceNV.Primary)
+                                || (!typeAndValue.IsArrayView
+                                    && LLVMBackend::IsProvableNonHeapAddressSource(initializerSourceNV))
                                 || initializerSourceNV.PointsToBorrowedAddress))
                             compiler->GetOrCreateStackVariable(name).PointsToBorrowedAddress = true;
                         if (haveInitializerSourceNV
@@ -10075,6 +10093,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // list); retire it here so no later declaration or return reads it as owned.
                         compiler->lastOwningResult = false;
                         compiler->lastAllocAlignment = 0;
+                        // A stale owned-call flag from this declarator (`unique<T> o = unique<T>(new T())`)
+                        // made a later `unique<T>* p = &o;` own the borrow. Retire it per declarator.
+                        compiler->lastCallReturnsOwned = false;
 
                         // Move OUT of a container element slot (`T tmp = move _data[i]`): the pointer/
                         // interface element read demoted `unique`-ness away (a slot read hands out a
@@ -11469,15 +11490,17 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
     auto markContainerPath = [&](const std::string& expression, size_t token) {
         auto path = splitLvaluePath(expression);
         if (path.empty()) return std::string();
-        for (const auto& param : paramTypes)
+        // A path rooted at a by-value param is decided by that param alone (its fields are not
+        // other params or aliases).
+        if (auto param = paramTypes.find(path.front()); param != paramTypes.end())
         {
-            if (path.front() != param.first) continue;
-            path.erase(path.begin());
-            if (path.empty() && !containerKind(param.second).empty()) return param.first;
-            for (size_t count = path.size(); count > 0; --count)
-                if (!containerAtFieldPath(param.second,
-                        std::vector<std::string>(path.begin(), path.begin() + count)).empty())
-                    return param.first;
+            std::vector<std::string> fields(std::next(path.begin()), path.end());
+            if (fields.empty()) return containerKind(param->second).empty() ? std::string() : param->first;
+            for (size_t count = fields.size(); count > 0; --count)
+                if (!containerAtFieldPath(param->second,
+                        std::vector<std::string>(fields.begin(), fields.begin() + count)).empty())
+                    return param->first;
+            return std::string();
         }
         if (auto alias = wholeParamAliases.find(path.front()); alias != wholeParamAliases.end()
             && token > alias->second.token)

@@ -5648,7 +5648,8 @@ namespace cflat_cinterop
             }
             if (st.abiWork.empty() && st.inlineVariadicWork.empty()
                 && st.functionPointerAbiWork.empty()
-                && st.memberAbiWork.empty() && !st.req.RecordsDefinitionDemand()) return;
+                && st.memberAbiWork.empty() && !st.req.RecordsDefinitionDemand()
+                && st.req.variadicCallAbiRequest.targetLinkageName.empty()) return;
             using namespace clang::CodeGen;
 
             llvm::LLVMContext llvmCtx;
@@ -5717,6 +5718,90 @@ namespace cflat_cinterop
             }
 
             ComputeCxxMemberAbi(st, ctx, root, cgm, *cg);
+
+            if (!st.req.variadicCallAbiRequest.targetLinkageName.empty())
+            {
+                auto markerType = [&](const std::string& name) -> CanQualType {
+                    IdentifierInfo& id = ctx.Idents.get(name);
+                    for (NamedDecl* nd : root->lookup(DeclarationName(&id)))
+                        if (const auto* alias = llvm::dyn_cast<TypedefNameDecl>(nd))
+                            return CanQualType::CreateUnsafe(
+                                alias->getUnderlyingType().getCanonicalType());
+                    return CanQualType();
+                };
+                const bool receiverMarkerResolved =
+                    st.req.variadicCallAbiRequest.receiverTypeAlias.empty()
+                    || !markerType(st.req.variadicCallAbiRequest.receiverTypeAlias).isNull();
+                struct VariadicTargetFinder : RecursiveASTVisitor<VariadicTargetFinder>
+                {
+                    ASTContext& Context;
+                    const std::string& Linkage;
+                    FunctionDecl* Found = nullptr;
+                    VariadicTargetFinder(ASTContext& context, const std::string& linkage)
+                        : Context(context), Linkage(linkage) {}
+                    // A variadic member of a class template lives only in the instantiation.
+                    bool shouldVisitTemplateInstantiations() const { return true; }
+                    bool VisitFunctionDecl(FunctionDecl* fd)
+                    {
+                        if (!fd->isVariadic() || fd->isInvalidDecl()) return true;
+                        const std::string name = fd->isExternC()
+                            ? fd->getNameAsString() : CxxLinkageName(Context, fd);
+                        if (name == Linkage) { Found = fd; return false; }
+                        return true;
+                    }
+                } finder(ctx, st.req.variadicCallAbiRequest.targetLinkageName);
+                if (st.contextRoot != nullptr) finder.TraverseDecl(st.contextRoot);
+                if (finder.Found == nullptr && root != st.contextRoot) finder.TraverseDecl(root);
+                if (st.req.verbose)
+                    std::cout << std::format(
+                        "[verbose] C++ variadic ABI target '{}' {} with {} extra type(s)\n",
+                        st.req.variadicCallAbiRequest.targetLinkageName,
+                        finder.Found == nullptr ? "not found" : "found",
+                        st.req.variadicCallAbiRequest.argumentTypeAliases.size());
+                const auto* foundMethod = llvm::dyn_cast_or_null<CXXMethodDecl>(finder.Found);
+                const bool foundInstanceMethod = foundMethod != nullptr && foundMethod->isInstance();
+                if (finder.Found != nullptr && receiverMarkerResolved
+                    && st.req.variadicCallAbiRequest.instanceMethod == foundInstanceMethod
+                    && !st.req.variadicCallAbiRequest.argumentTypeAliases.empty())
+                {
+                    CanQualType canon = finder.Found->getType()->getCanonicalTypeUnqualified();
+                    const auto* fptPtr = canon.getTypePtr()->getAs<FunctionProtoType>();
+                    if (fptPtr != nullptr && fptPtr->isVariadic())
+                    {
+                        CanQual<FunctionProtoType> fpt = canon.castAs<FunctionProtoType>();
+                        std::vector<CanQualType> argTypes;
+                        const auto* method = foundMethod;
+                        if (st.req.variadicCallAbiRequest.instanceMethod && method != nullptr)
+                            argTypes.push_back(CanQualType::CreateUnsafe(
+                                method->getThisType().getCanonicalType()));
+                        for (QualType param : fpt.getTypePtr()->getParamTypes())
+                            argTypes.push_back(CanQualType::CreateUnsafe(param.getCanonicalType()));
+                        bool typesResolved = true;
+                        for (const std::string& alias :
+                             st.req.variadicCallAbiRequest.argumentTypeAliases)
+                        {
+                            CanQualType type = markerType(alias);
+                            if (type.isNull()) { typesResolved = false; break; }
+                            argTypes.push_back(type);
+                        }
+                        if (typesResolved)
+                        {
+                            const RequiredArgs required = RequiredArgs::forPrototypePlus(
+                                fpt, st.req.variadicCallAbiRequest.argumentTypeAliases.size());
+                            const CGFunctionInfo& fi = method != nullptr
+                                && st.req.variadicCallAbiRequest.instanceMethod
+                                ? arrangeCXXMethodCall(cgm, fpt->getReturnType(), argTypes,
+                                    fpt->getExtInfo(), fpt->getExtParameterInfos(), required)
+                                : arrangeFreeFunctionCall(cgm, fpt->getReturnType(), argTypes,
+                                    fpt->getExtInfo(), fpt->getExtParameterInfos(), required);
+                            st.out.variadicCallAbi = DescribeAbi(fi);
+                            st.out.hasVariadicCallAbi = st.out.variadicCallAbi.valid;
+                        }
+                        else if (st.req.verbose)
+                            std::cout << "[verbose] C++ variadic ABI argument alias was not found\n";
+                    }
+                }
+            }
 
             if (st.req.RecordsDefinitionDemand())
             {

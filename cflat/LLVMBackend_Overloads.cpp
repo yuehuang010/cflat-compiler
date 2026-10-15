@@ -5114,6 +5114,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     // siblings still score (ComputeOverloadFunction ranks the variadic last).
                     if (!candidate.IsCxx) break;
                 }
+                else if (arguments.empty() && candidate.Parameters.empty() && candidate.IsCxx)
+                {
+                    // `f(...)` is viable with zero actual arguments. MatchFunction's empty
+                    // result cannot distinguish that valid bind from a failed bind.
+                    resolvedCandidate.emplace_back(arguments, candidate);
+                }
             }
             else if (arguments.size() == 0)
             {
@@ -6502,6 +6508,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 && !refusal.empty())
                 LogError(refusal);
         }
+        std::optional<AbiRecipe> variadicCallRecipe;
+        bool variadicCallAbiAttempted = false;
         std::vector<llvm::Value*> argList;
         // A by-value param an 'alias' return can hand back is passed as a pointer to a caller-owned
         // copy slot (ParamIsAliasReturnSlot), so the result points into this frame. A slot holding
@@ -6655,12 +6663,60 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 return nullptr;
             }
 
-            // By-value aggregate in a C or C++ extern `...` slot: no clang arrangement is emitted, so refuse
-            // it (fields are lost). CFlat-bodied variadics and string values (argIsStringValue) are exempt.
+            // C++ aggregate varargs need the call-site arrangement: the declaration recipe only
+            // describes fixed parameters, while Clang classifies each extra argument by target ABI.
+            // C externs and CFlat-bodied variadics keep their existing paths.
             const bool calleeIsCExtern = candidate.External && !candidate.IsCxx && !candidate.HasCFlatBody;
             const std::string aggregateName = inVariadicRange && (candidate.IsCxx || calleeIsCExtern)
                 ? AggregateVariadicArgumentType(arg) : std::string{};
-            if (!aggregateName.empty())
+            if (!aggregateName.empty() && candidate.IsCxx)
+            {
+                if (!variadicCallAbiAttempted)
+                {
+                    variadicCallAbiAttempted = true;
+                    cflat_cinterop::RawAbi callAbi;
+                    std::string requestError;
+                    if (RequestCxxVariadicCallAbi(candidate, matched, callAbi, requestError))
+                    {
+                        std::vector<TypeAndValue> callParams = candidate.Parameters;
+                        for (size_t i = candidate.Parameters.size(); i < matched.size(); ++i)
+                        {
+                            TypeAndValue type = matched[i].TypeAndValue;
+                            if (type.TypeName.empty() && matched[i].Primary != nullptr)
+                            {
+                                llvm::Type* valueType = matched[i].Primary->getType();
+                                if (valueType->isIntegerTy(1)) type.TypeName = "bool";
+                                else if (auto* integer = llvm::dyn_cast<llvm::IntegerType>(valueType))
+                                {
+                                    const unsigned width = integer->getBitWidth();
+                                    type.TypeName = width <= 32 ? "int" : width <= 64 ? "i64" : "i128";
+                                }
+                                else if (valueType->isFloatTy()) type.TypeName = "float";
+                                else if (valueType->isDoubleTy()) type.TypeName = "double";
+                            }
+                            callParams.push_back(std::move(type));
+                        }
+                        AbiRecipe recipe;
+                        std::string mismatch;
+                        CxxAbiPlanScope abiPlan(*this, &callAbi, &mismatch);
+                        if (BuildAbiRecipeFromClangPlan(
+                                diagnosticFunctionName, callAbi, candidate.ReturnType,
+                                callParams, recipe))
+                            variadicCallRecipe = std::move(recipe);
+                        else if (verbose)
+                            std::cout << std::format(
+                                "[verbose] C++ variadic call ABI for '{}' unavailable: {} "
+                                "plan slots, {} call parameters{}\n",
+                                diagnosticFunctionName, callAbi.params.size(), callParams.size(),
+                                mismatch.empty() ? std::string() : ", " + mismatch);
+                    }
+                    else if (verbose && !requestError.empty())
+                        std::cout << std::format(
+                            "[verbose] C++ variadic call ABI request for '{}' unavailable: {}\n",
+                            diagnosticFunctionName, requestError);
+                }
+            }
+            if (!aggregateName.empty() && !variadicCallRecipe.has_value())
             {
                 LogError(std::format(
                     "cannot pass aggregate value of type '{}' to the variadic '...' slot of {} "
@@ -6706,7 +6762,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
             const std::string cxxReferenceSpelling = candidate.IsCxx
                 ? CxxReferenceParameterSpelling(candidate, argIndex) : std::string();
-            const bool cxxNullptrReference = candidate.IsCxx
+            const bool cxxNullptrReference = !inVariadicRange && candidate.IsCxx
                 && (candParamItr->IsCxxNullptrT || CxxSpellingIsNullptrT(cxxReferenceSpelling))
                 && cxxReferenceSpelling.find('&') != std::string::npos;
             if (!inVariadicRange && cxxNullptrReference)
@@ -7024,7 +7080,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                 { arg.CallerName, FuncPtrSpellingOf(*candParamItr) });
                         int expectedCount = (int)candParamItr->FuncPtrParams.size();
                         if (auto* correctFn = GetFunctionForFuncPtr(arg.CallerName, expectedCount,
-                                &candParamItr->FuncPtrParams, &*candParamItr))
+                                &candParamItr->FuncPtrParams, &*candParamItr,
+                                /*compareReturnOwnership*/ true))
                             val = correctFn;
                     }
                 }
@@ -7035,6 +7092,28 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         if (RejectAliasParamFuncPtrBind(
                                 arg.CallerName.empty() ? fnSym->UniqueName : arg.CallerName, *fnSym))
                             return nullptr;
+                // A resolved function value must bind to the callback's complete ABI. Local
+                // function-pointer values are loads, so they do not enter this name-only branch.
+                if (auto* fnVal = llvm::dyn_cast_or_null<llvm::Function>(val);
+                    fnVal != nullptr && !arg.TypeAndValue.IsFunctionPointer)
+                {
+                    if (const FunctionSymbol* fnSym = FindSymbolForFunction(fnVal))
+                    {
+                        const std::string bindingName = arg.CallerName.empty()
+                            ? fnSym->UniqueName : arg.CallerName;
+                        const TypeAndValue actualSig = FuncPtrSigOfSymbol(*fnSym);
+                        std::string bindMismatch = DescribeFuncPtrBindMismatch(
+                            bindingName, actualSig, *candParamItr,
+                            /*compareReturnOwnership*/ true);
+                        if (!bindMismatch.empty()) LogRawError(bindMismatch);
+                        // A single overload can bypass GetFunctionForFuncPtr's overload ranking.
+                        // Keep the declarator's move-flag predicate on both thin and fat callbacks.
+                        if (!HasFunctionWithMoveFlags(bindingName, candParamItr->FuncPtrParams))
+                            LogErrorMessage(
+                                "function '{}' has no overload matching the '{}' modifiers required by parameter '{}' - '{}' is part of the function-pointer type",
+                                { bindingName, "move", candParamItr->VariableName, "move" });
+                    }
+                }
                 if (llvmParamTy->isStructTy())
                 {
                     // Internal function<T>: provide a closure fat struct {i8*, i8*}.
@@ -7049,19 +7128,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             if (overloads != functionTable.end() && overloads->second.size() > 1)
                             {
                                 if (auto* correctFn = GetFunctionForFuncPtr(arg.CallerName, expectedCount,
-                                        &candParamItr->FuncPtrParams, &*candParamItr))
+                                        &candParamItr->FuncPtrParams, &*candParamItr,
+                                        /*compareReturnOwnership*/ true))
                                     val = correctFn;
                             }
                             else if (auto* correctFn = GetFunctionForFuncPtr(arg.CallerName, expectedCount,
-                                         &candParamItr->FuncPtrParams))
+                                         &candParamItr->FuncPtrParams, &*candParamItr,
+                                         /*compareReturnOwnership*/ true))
                                 val = correctFn;
-                            // Reject when no overload's IsMove flags match the destination signature.
-                            if (!HasFunctionWithMoveFlags(arg.CallerName, candParamItr->FuncPtrParams))
-                            {
-                                LogErrorMessage(
-                                    "function '{}' has no overload matching the '{}' modifiers required by parameter '{}' - '{}' is part of the function-pointer type",
-                                    { arg.CallerName, "move", candParamItr->VariableName, "move" });
-                            }
                         }
                         // Same provenance gate virtual dispatch applies (LowerByValueArg): under
                         // opaque pointers a data pointer would otherwise land in the code slot.
@@ -7855,12 +7929,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     callArgs[t] = PromoteVariadicArgument(callArgs[t]);
             return CreateCallOrInvoke(fnTy, cxxVirtualCallee, callArgs, calleeMayUnwind);
         };
-        llvm::Value* result = candidate.Recipe.hasLowering
+        const AbiRecipe* callRecipe = variadicCallRecipe.has_value()
+            ? &*variadicCallRecipe : nullptr;
+        llvm::Value* result = candidate.Recipe.hasLowering || callRecipe != nullptr
             ? EmitAbiLoweredCall(candidate, argList, cxxSretDest,
                                  cxxIndirectArgAddrs.empty() ? nullptr : &cxxIndirectArgAddrs,
                                  cxxVirtualCallee,
                                  cflatRawArrayCounts.empty() ? nullptr : &cflatRawArrayCounts,
-                                 calleeMayUnwind)
+                                 calleeMayUnwind, callRecipe)
             : (cxxVirtualCallee != nullptr
                 ? emitVirtualCall()
                 : CreateFunctionCall(candidate.Function, argList, calleeMayUnwind));
@@ -8243,7 +8319,8 @@ bool LLVMBackend::RejectAliasParamFuncPtrBind(const std::string& functionName,
 
 llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int expectedParamCount,
                                           const std::vector<TypeAndValue::FuncPtrParam>* expectedParams,
-                                          const TypeAndValue* destSig)
+                                          const TypeAndValue* destSig,
+                                          bool compareReturnOwnership)
 {
         functionName = ResolveQualifiedName(functionName);
         auto it = functionTable.find(functionName);
@@ -8259,12 +8336,13 @@ llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int
             // ever disagreeing about which overloads were refused and why.
             std::vector<const FunctionSymbol*> bindable;
             for (auto* sym : viable)
-                if (DescribeFuncPtrBindMismatch(functionName, FuncPtrSigOfSymbol(*sym), *destSig).empty())
+                if (DescribeFuncPtrBindMismatch(functionName, FuncPtrSigOfSymbol(*sym), *destSig,
+                                                compareReturnOwnership).empty())
                     bindable.push_back(sym);
             if (bindable.empty())
             {
                 LogRawError(DescribeFuncPtrBindMismatch(functionName,
-                    FuncPtrSigOfSymbol(*viable.front()), *destSig));
+                    FuncPtrSigOfSymbol(*viable.front()), *destSig, compareReturnOwnership));
             }
             else
             {
@@ -9192,12 +9270,24 @@ void LLVMBackend::RecordAssignBorrow(const std::string& name, const std::string&
             else if (auto it2 = frame.functionArgument.find(name); it2 != frame.functionArgument.end())
                 nv = &it2->second;
             if (nv == nullptr) continue;
-            // A binding that already owns what it holds is not made a borrow by this store; the
-            // declaration path skips the same two cases for the same reason.
-            if (nv->IsOwning || nv->IsNewAllocated) return;
-            // A '??=' keeps the OLD referent when its arm is not taken, so it may not overwrite the
-            // origin an existing borrow names - only supply one where there was none.
+            // A '??=' keeps the OLD referent when its arm is not taken, so an owner it may not
+            // overwrite stays an owner, and so does the origin an existing borrow names.
+            if (keepExistingOrigin && (nv->IsOwning || nv->IsNewAllocated)) return;
             if (keepExistingOrigin && nv->IsBorrowed && !nv->BorrowedOrigin.empty()) return;
+            // A plain '=' to a borrow gives up the compile-time owner bit, or a later `owner = raw`
+            // adopts the borrowed pointee (T207). The runtime OwnFlag is what frees the object at
+            // scope exit, so it must survive the borrow: EmitOwnedPtrRelease at the store releases
+            // the old block and clears the flag. A move parameter has no flag yet, so it gets one
+            // (true from entry) here, before that release reads it.
+            if (nv->IsOwning || nv->IsNewAllocated)
+            {
+                nv->BorrowSuppressedOwner = true;
+                if (nv->IsOwning && !nv->OwnFlagActive && nv->OwnFlag == nullptr
+                    && IsFunctionParameterStorage(nv->Storage))
+                    ActivateParamOwnFlag(*nv);
+            }
+            nv->IsOwning = false;
+            nv->IsNewAllocated = false;
             nv->BorrowsOwningLocal = false;
             nv->OwningLocalOrigin.clear();
             nv->OwningLocalStorage = nullptr;
@@ -9292,9 +9382,12 @@ void LLVMBackend::SetStackCharBufferBorrow(const std::string& name, bool value,
         }
 }
 
-void LLVMBackend::RetireAssignBorrow(const std::string& name)
+bool LLVMBackend::RetireAssignBorrow(const std::string& name, llvm::BasicBlock* statementBlock)
 {
-        if (name.empty()) return;
+        if (name.empty()) return false;
+        // The store's STATEMENT block, when the caller captured it: an owning RHS such as `new` may
+        // split blocks internally, but the store itself still runs on every path from the statement.
+        llvm::BasicBlock* here = statementBlock != nullptr ? statementBlock : builder->GetInsertBlock();
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             NamedVariable* nv = nullptr;
@@ -9303,9 +9396,8 @@ void LLVMBackend::RetireAssignBorrow(const std::string& name)
             else if (auto it2 = frame.functionArgument.find(name); it2 != frame.functionArgument.end())
                 nv = &it2->second;
             if (nv == nullptr) continue;
-            if (nv->AssignBorrowBlock == nullptr
-                || nv->AssignBorrowBlock != builder->GetInsertBlock())
-                return;
+            if (nv->AssignBorrowBlock == nullptr || nv->AssignBorrowBlock != here)
+                return false;
             nv->IsBorrowed = false;
             nv->BorrowedOrigin.clear();
             nv->BorrowedUniqueField.clear();
@@ -9316,8 +9408,9 @@ void LLVMBackend::RetireAssignBorrow(const std::string& name)
             nv->OwningLocalStorage = nullptr;
             nv->OwningLocalBorrowAfterRebind = false;
             nv->AssignBorrowBlock = nullptr;
-            return;
+            return true;
         }
+        return false;
     }
 
 bool LLVMBackend::IsFunctionParameterStorage(const llvm::Value* slot) const

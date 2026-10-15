@@ -1,9 +1,19 @@
-# Array dimension constant lookup leftovers (after T193)
+# Local const does not make an array dimension a constant (ruling needed)
 
-Pre-existing (T193 Opus r1, 2026-10-14; same on master). Probes: cflat-fix-t193 scratch/rev_t193_opus_probe.sh (copied to scratch/repro_keep/t193_rv1/).
-- A function name used as an array dimension (`int K(){...} int f(){ int[K] a; }`) fails with "module verification failed"
-  ("Alloca array size must have integer type"); clang refuses. Fix: LogError in the array-dimension emission path when the
-  dimension value is not an integer constant (or not integer-typed).
-- A local `const int K = 5;` shadowing a file-scope `const int K = 1` sizes `int[K]` as 1 (clang 5), with or without a namespace.
-- A non-const `int K = 7;` in namespace N next to a file-scope `const int K = 1` sizes `int[K]` in N as 1 (clang: not a constant
-  expression). The T193 folder returns nullopt there, but the emission path still picks the file-scope const.
+Found by T206 (2026-10-14) from the T193 review. Items 1 and 3 of that review are closed: a function name
+or other non-integer dimension is refused, and a non-const namespace int sizes a local array from its own
+value (guard leg `t206_ns_nonconst_vla_not_file_const`).
+
+What remains:
+- A local `const int K = 5;` used as `int[K] a = default;` is a run-time-sized array (VLA). The alloca count
+  is a load of the innermost K (5), so the size is right and the lookup order is right, with or without a
+  file-scope `const int K = 1` or a namespace. But CFlat's `sizeof` on a VLA is the element size (4, the
+  convention pinned by the T114 and T118 legs in Test/test_basic.cb), so `sizeof(a) / sizeof(int)` reads 1.
+  clang++ -std=c++20 reports 5 (sizeof 20): a const local with a constant initializer is a constant expression.
+- Repro: `int main() { const int K = 5; int[K] a = default; return (int)(sizeof(a) / sizeof(int)); }` - CFlat 1, clang 5.
+
+Ruling needed: does a local `const` integer count as a constant expression for an array dimension? CFlat
+drops `const` everywhere (const-unenforced ruling), so today no local is constant. If the answer is yes:
+fold a const local with a constant initializer in FoldCompileTimeIdentifier (cflat/MainListener.h, where a
+scoped local returns nullopt) and emit a fixed array; add a leg next to t206_ns_nonconst_vla_not_file_const.
+If no: close this item and keep the VLA convention.

@@ -13248,6 +13248,17 @@ extern int main()
     total++;
     passed += testLateStructPAfterUniqueUse();
     total += 7;
+    passed += testUniqueMoveThroughDeref();
+    total += 28;
+    passed += testChainedRawIntoUnique();
+    total += 7;
+    passed += testArrowOwnedTempMember();
+    total += 34;
+    passed += testT207RawLaunder();
+    total += 19;
+
+    passed += testT212AliasReturnAcceptSet();
+    total += 15;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
@@ -13656,5 +13667,546 @@ int testLateStructPAfterUniqueUse()
     passed += Test("late_p_default_ctor", fresh.v, 0);
     passed += Test("late_qr_locals_with_unique", t143LocalMix(), 13);
     passed += Test("late_unique_alias_inside_body", t143EarlyUses(), 4);
+    return passed;
+}
+
+// T199: `move` through a dereference / field / element lvalue must null the source once. Before the
+// fix `unique<T>* p = &owner;` read a stale owned-call flag and owned the borrow, so `move *p` (and any
+// scope exit) freed owner's object twice (abort). gT199Last is the last dtor's v, gT199Dtors the count.
+int gT199Dtors = 0;
+int gT199Last = 0;
+
+struct T199Res { int v = 0; ~T199Res() { gT199Dtors = gT199Dtors + 1; gT199Last = v; } };
+struct T199Hold { unique<T199Res> f = default; };
+
+void t199Take(move unique<T199Res> r) { }
+
+unique<T199Res> t199MakeDeref()
+{
+    unique<T199Res> owner = unique<T199Res>(new T199Res());
+    owner->v = 7;
+    unique<T199Res>* p = &owner;
+    return move *p;
+}
+
+void t199DerefDecl()
+{
+    unique<T199Res> owner = unique<T199Res>(new T199Res());
+    owner->v = 7;
+    unique<T199Res>* p = &owner;
+    unique<T199Res> taken = move *p;
+}
+
+void t199DerefAssign()
+{
+    unique<T199Res> owner = unique<T199Res>(new T199Res());
+    owner->v = 7;
+    unique<T199Res>* p = &owner;
+    unique<T199Res> taken = unique<T199Res>(new T199Res());
+    taken = move *p;
+}
+
+void t199DerefArg()
+{
+    unique<T199Res> owner = unique<T199Res>(new T199Res());
+    owner->v = 7;
+    unique<T199Res>* p = &owner;
+    t199Take(move *p);
+}
+
+void t199DerefRet()
+{
+    unique<T199Res> got = t199MakeDeref();
+}
+
+void t199ArrowDecl()
+{
+    T199Hold h;
+    h.f = unique<T199Res>(new T199Res());
+    h.f->v = 7;
+    T199Hold* p = &h;
+    unique<T199Res> taken = move p->f;
+}
+
+void t199IndexDecl()
+{
+    unique<T199Res> arr[2];
+    arr[1] = unique<T199Res>(new T199Res());
+    arr[1]->v = 7;
+    unique<T199Res> taken = move arr[1];
+}
+
+void t199FieldDecl()
+{
+    T199Hold s;
+    s.f = unique<T199Res>(new T199Res());
+    s.f->v = 7;
+    unique<T199Res> taken = move s.f;
+}
+
+void t199PPFieldDecl()
+{
+    T199Hold h;
+    h.f = unique<T199Res>(new T199Res());
+    h.f->v = 7;
+    T199Hold* p = &h;
+    T199Hold** pp = &p;
+    unique<T199Res> taken = move (*pp)->f;
+}
+
+// T199 r2: a stale owned-call flag from a discard / condition / field read must not make the next
+// pointer declaration an owner. Each leg: temp dtor (1) + owner/x dtor (1) = 2, last dtor v = 7.
+unique<T199Res> t199Mk() { return unique<T199Res>(new T199Res()); }
+move T199Res* t199MkRaw() { return new T199Res(); }
+
+void t199DiscardUniqDecl()
+{
+    unique<T199Res> owner = unique<T199Res>(new T199Res());
+    owner->v = 7;
+    _ = t199Mk();
+    unique<T199Res>* p = &owner;
+}
+
+void t199DiscardRawDecl()
+{
+    T199Res x;
+    x.v = 7;
+    _ = t199MkRaw();
+    T199Res* p = &x;
+}
+
+void t199DiscardFieldRawDecl()
+{
+    T199Res x;
+    x.v = 7;
+    _ = t199MkRaw()->v;
+    T199Res* p = &x;
+}
+
+void t199CondFieldRawDecl()
+{
+    T199Res x;
+    x.v = 7;
+    for (int i = 0; i < t199MkRaw()->v; i++) { break; }
+    T199Res* p = &x;
+}
+
+void t199IfBodyDiscardRawDecl()
+{
+    T199Res x;
+    x.v = 7;
+    if (x.v == 7) { _ = t199MkRaw(); }
+    T199Res* p = &x;
+}
+
+void t199LoopBodyDiscardUniqDecl()
+{
+    unique<T199Res> owner = unique<T199Res>(new T199Res());
+    owner->v = 7;
+    for (int i = 0; i < 1; i++) { _ = t199Mk(); }
+    unique<T199Res>* p = &owner;
+}
+
+int testUniqueMoveThroughDeref()
+{
+    int passed = 0;
+    gT199Dtors = 0; gT199Last = 0;
+    t199DerefDecl();
+    passed += Test("t199_deref_decl_dtors", gT199Dtors, 1);
+    passed += Test("t199_deref_decl_value", gT199Last, 7);
+    gT199Dtors = 0; gT199Last = 0;
+    t199DerefAssign();
+    passed += Test("t199_deref_assign_dtors", gT199Dtors, 2);
+    passed += Test("t199_deref_assign_value", gT199Last, 7);
+    gT199Dtors = 0; gT199Last = 0;
+    t199DerefArg();
+    passed += Test("t199_deref_arg_dtors", gT199Dtors, 1);
+    passed += Test("t199_deref_arg_value", gT199Last, 7);
+    gT199Dtors = 0; gT199Last = 0;
+    t199DerefRet();
+    passed += Test("t199_deref_ret_dtors", gT199Dtors, 1);
+    passed += Test("t199_deref_ret_value", gT199Last, 7);
+    gT199Dtors = 0; gT199Last = 0;
+    t199ArrowDecl();
+    passed += Test("t199_arrow_decl_dtors", gT199Dtors, 1);
+    passed += Test("t199_arrow_decl_value", gT199Last, 7);
+    gT199Dtors = 0; gT199Last = 0;
+    t199IndexDecl();
+    passed += Test("t199_index_decl_dtors", gT199Dtors, 1);
+    passed += Test("t199_index_decl_value", gT199Last, 7);
+    gT199Dtors = 0; gT199Last = 0;
+    t199FieldDecl();
+    passed += Test("t199_field_decl_dtors", gT199Dtors, 1);
+    passed += Test("t199_field_decl_value", gT199Last, 7);
+    gT199Dtors = 0; gT199Last = 0;
+    t199PPFieldDecl();
+    passed += Test("t199_ppfield_decl_dtors", gT199Dtors, 1);
+    passed += Test("t199_ppfield_decl_value", gT199Last, 7);
+    gT199Dtors = 0; gT199Last = 0;
+    t199DiscardUniqDecl();
+    passed += Test("t199_discard_uniq_decl_dtors", gT199Dtors, 2);
+    passed += Test("t199_discard_uniq_decl_value", gT199Last, 7);
+    gT199Dtors = 0; gT199Last = 0;
+    t199DiscardRawDecl();
+    passed += Test("t199_discard_raw_decl_dtors", gT199Dtors, 2);
+    passed += Test("t199_discard_raw_decl_value", gT199Last, 7);
+    gT199Dtors = 0; gT199Last = 0;
+    t199DiscardFieldRawDecl();
+    passed += Test("t199_discard_field_raw_decl_dtors", gT199Dtors, 2);
+    passed += Test("t199_discard_field_raw_decl_value", gT199Last, 7);
+    gT199Dtors = 0; gT199Last = 0;
+    t199CondFieldRawDecl();
+    passed += Test("t199_cond_field_raw_decl_dtors", gT199Dtors, 2);
+    passed += Test("t199_cond_field_raw_decl_value", gT199Last, 7);
+    gT199Dtors = 0; gT199Last = 0;
+    t199IfBodyDiscardRawDecl();
+    passed += Test("t199_if_body_discard_raw_decl_dtors", gT199Dtors, 2);
+    passed += Test("t199_if_body_discard_raw_decl_value", gT199Last, 7);
+    gT199Dtors = 0; gT199Last = 0;
+    t199LoopBodyDiscardUniqDecl();
+    passed += Test("t199_loop_body_discard_uniq_decl_dtors", gT199Dtors, 2);
+    passed += Test("t199_loop_body_discard_uniq_decl_value", gT199Last, 7);
+    return passed;
+}
+
+// T203: `owner = raw = new T()` - a chained '=' whose inner target is a raw local transfers
+// ownership exactly as the two-statement `raw = new T(); owner = raw;` does: one destructor per
+// object, the reset frees the previous object, and no borrow refusal.
+int chainRawDtors = 0;
+struct ChainRawBox
+{
+    int v = 0;
+    ~ChainRawBox() { chainRawDtors = chainRawDtors + 1; }
+};
+struct ChainRawHolder { unique ChainRawBox* owner = nullptr; };
+unique ChainRawBox* chainRawGlobal = nullptr;
+
+int testChainedRawIntoUnique()
+{
+    int passed = 0;
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* owner = nullptr;
+        ChainRawBox* raw = nullptr;
+        owner = raw = new ChainRawBox();
+        owner->v = 7;
+        passed += Test("chain_raw_inner_owner_value", owner->v, 7);
+    }
+    passed += Test("chain_raw_inner_one_dtor", chainRawDtors, 1);
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* owner = nullptr;
+        ChainRawBox* raw = nullptr;
+        owner = raw = new ChainRawBox();
+        owner = raw = new ChainRawBox();
+    }
+    passed += Test("chain_raw_reset_frees_old_one", chainRawDtors, 2);
+    chainRawDtors = 0;
+    {
+        ChainRawHolder h;
+        ChainRawBox* raw = nullptr;
+        h.owner = raw = new ChainRawBox();
+    }
+    passed += Test("chain_raw_field_one_dtor", chainRawDtors, 1);
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* owner = nullptr;
+        {
+            ChainRawBox* raw = nullptr;
+            owner = raw = new ChainRawBox();
+        }
+        passed += Test("chain_raw_inner_scope_owner_alive", chainRawDtors, 0);
+    }
+    passed += Test("chain_raw_inner_scope_one_dtor", chainRawDtors, 1);
+    chainRawDtors = 0;
+    {
+        ChainRawBox* raw = nullptr;
+        chainRawGlobal = raw = new ChainRawBox();
+    }
+    chainRawGlobal = nullptr;
+    passed += Test("chain_raw_global_one_dtor", chainRawDtors, 1);
+    return passed;
+}
+
+// T205: an owning call result read through `->` (or a method on it) is destroyed at the end of its
+// full expression. Each leg loops 1000x: destructor count == calls (no leak, no double destroy).
+int gT205Dtors = 0;
+int gT205Sum = 0;
+int t205Flag = 1;
+struct T205Res { int v = 3; ~T205Res() { gT205Dtors = gT205Dtors + 1; } int current() { return v; } };
+unique<T205Res> t205Mk() { return unique<T205Res>(new T205Res()); }
+unique T205Res* t205MkU() { return new T205Res(); }
+int t205Use(int x) { return x; }
+int t205Read() { return t205Mk()->v; }
+
+void t205ArrowDecl() { for (int i = 0; i < 1000; i = i + 1) { int k = t205Mk()->v; gT205Sum = gT205Sum + k; } }
+void t205ArrowDiscard() { for (int i = 0; i < 1000; i = i + 1) _ = t205Mk()->v; }
+void t205ArrowCond() { for (int i = 0; i < 1000; i = i + 1) if (t205Mk()->v == 3) gT205Sum = gT205Sum + 1; }
+void t205ArrowArg() { for (int i = 0; i < 1000; i = i + 1) gT205Sum = gT205Sum + t205Use(t205Mk()->v); }
+void t205ArrowReturn() { for (int i = 0; i < 1000; i = i + 1) gT205Sum = gT205Sum + t205Read(); }
+void t205ArrowMethod() { for (int i = 0; i < 1000; i = i + 1) gT205Sum = gT205Sum + t205Mk()->current(); }
+void t205ArrowRawUnique() { for (int i = 0; i < 1000; i = i + 1) { int k = t205MkU()->v; gT205Sum = gT205Sum + k; } }
+void t205ArrowTwoCalls() { for (int i = 0; i < 1000; i = i + 1) { int k = t205Mk()->v + t205Mk()->v; gT205Sum = gT205Sum + k; } }
+void t205ArrowAssign() { for (int i = 0; i < 1000; i = i + 1) t205Mk()->v = 7; }
+// Taken and not-taken arms: only the evaluated receiver is destroyed.
+void t205ArrowTernary()
+{
+    t205Flag = 1;
+    for (int i = 0; i < 1000; i = i + 1) gT205Sum = gT205Sum + (t205Flag > 0 ? t205Mk()->v : 0);
+    t205Flag = 0;
+    for (int i = 0; i < 1000; i = i + 1) gT205Sum = gT205Sum + (t205Flag > 0 ? t205Mk()->v : 0);
+}
+// The receiver is evaluated on every condition test: 1001 calls for 1000 iterations.
+void t205ArrowWhile() { while (t205Mk()->v == 3 && gT205Sum < 1000) gT205Sum = gT205Sum + 1; }
+
+// T211: a pointer to a scalar read in place by a unary `*` (`s += *mk()->heap;`) lets the receiver
+// temp die at the end of its statement. The dtor poisons v, so a read after the free shows as -999.
+int gT211Dtors = 0;
+int gT211Sum = 0;
+struct T211Res { int v = 3; int* heap = nullptr; ~T211Res() { gT211Dtors = gT211Dtors + 1; v = -999; } };
+unique<T211Res> t211Mk() { T211Res* r = new T211Res(); r->heap = &r->v; return unique<T211Res>(r); }
+int t211Read() { return *t211Mk()->heap; }
+
+void t211DerefCompound() { for (int i = 0; i < 1000; i = i + 1) gT211Sum += *t211Mk()->heap; }
+void t211DerefDecl() { for (int i = 0; i < 1000; i = i + 1) { int k = *t211Mk()->heap; gT211Sum = gT211Sum + k; } }
+void t211DerefCond() { for (int i = 0; i < 1000; i = i + 1) if (*t211Mk()->heap == 3) gT211Sum = gT211Sum + 1; }
+void t211DerefStore() { for (int i = 0; i < 1000; i = i + 1) *t211Mk()->heap = 7; }
+void t211DerefReturn() { for (int i = 0; i < 1000; i = i + 1) gT211Sum = gT211Sum + t211Read(); }
+// Bindings that outlive the statement keep the pre-existing no-free path: the value must survive.
+void t211DerefAliasKept() { for (int i = 0; i < 1000; i = i + 1) { alias int x = *t211Mk()->heap; gT211Sum = gT211Sum + x; } }
+void t211AliasFieldKept() { for (int i = 0; i < 1000; i = i + 1) { alias int x = t211Mk()->v; gT211Sum = gT211Sum + x; } }
+// An index read inside an alias declaration is not what the alias binds: the temp dies.
+int[8] gT211Arr;
+void t211AliasIndex() { gT211Arr[3] = 5; for (int i = 0; i < 1000; i = i + 1) { alias int x = gT211Arr[t211Mk()->v]; gT211Sum = gT211Sum + x; } }
+void t211PointerEscape() { for (int i = 0; i < 1000; i = i + 1) { int* q = t211Mk()->heap; gT211Sum = gT211Sum + *q; } }
+
+int testArrowOwnedTempMember()
+{
+    int passed = 0;
+    gT205Dtors = 0; gT205Sum = 0;
+    t205ArrowDecl();
+    passed += Test("t205_arrow_decl_dtors", gT205Dtors, 1000);
+    passed += Test("t205_arrow_decl_value", gT205Sum, 3000);
+    gT205Dtors = 0; gT205Sum = 0;
+    t205ArrowDiscard();
+    passed += Test("t205_arrow_discard_dtors", gT205Dtors, 1000);
+    gT205Dtors = 0; gT205Sum = 0;
+    t205ArrowCond();
+    passed += Test("t205_arrow_cond_dtors", gT205Dtors, 1000);
+    passed += Test("t205_arrow_cond_value", gT205Sum, 1000);
+    gT205Dtors = 0; gT205Sum = 0;
+    t205ArrowArg();
+    passed += Test("t205_arrow_arg_dtors", gT205Dtors, 1000);
+    passed += Test("t205_arrow_arg_value", gT205Sum, 3000);
+    gT205Dtors = 0; gT205Sum = 0;
+    t205ArrowReturn();
+    passed += Test("t205_arrow_return_dtors", gT205Dtors, 1000);
+    passed += Test("t205_arrow_return_value", gT205Sum, 3000);
+    gT205Dtors = 0; gT205Sum = 0;
+    t205ArrowMethod();
+    passed += Test("t205_arrow_method_dtors", gT205Dtors, 1000);
+    passed += Test("t205_arrow_method_value", gT205Sum, 3000);
+    gT205Dtors = 0; gT205Sum = 0;
+    t205ArrowRawUnique();
+    passed += Test("t205_arrow_raw_unique_dtors", gT205Dtors, 1000);
+    passed += Test("t205_arrow_raw_unique_value", gT205Sum, 3000);
+    gT205Dtors = 0; gT205Sum = 0;
+    t205ArrowTwoCalls();
+    passed += Test("t205_arrow_two_calls_dtors", gT205Dtors, 2000);
+    passed += Test("t205_arrow_two_calls_value", gT205Sum, 6000);
+    gT205Dtors = 0; gT205Sum = 0;
+    t205ArrowAssign();
+    passed += Test("t205_arrow_assign_dtors", gT205Dtors, 1000);
+    gT205Dtors = 0; gT205Sum = 0;
+    t205ArrowTernary();
+    passed += Test("t205_arrow_ternary_dtors", gT205Dtors, 1000);
+    passed += Test("t205_arrow_ternary_value", gT205Sum, 3000);
+    gT205Dtors = 0; gT205Sum = 0;
+    t205ArrowWhile();
+    passed += Test("t205_arrow_while_dtors", gT205Dtors, 1001);
+    passed += Test("t205_arrow_while_value", gT205Sum, 1000);
+    gT211Dtors = 0; gT211Sum = 0;
+    t211DerefCompound();
+    passed += Test("t211_deref_compound_dtors", gT211Dtors, 1000);
+    passed += Test("t211_deref_compound_value", gT211Sum, 3000);
+    gT211Dtors = 0; gT211Sum = 0;
+    t211DerefDecl();
+    passed += Test("t211_deref_decl_dtors", gT211Dtors, 1000);
+    passed += Test("t211_deref_decl_value", gT211Sum, 3000);
+    gT211Dtors = 0; gT211Sum = 0;
+    t211DerefCond();
+    passed += Test("t211_deref_cond_dtors", gT211Dtors, 1000);
+    passed += Test("t211_deref_cond_value", gT211Sum, 1000);
+    gT211Dtors = 0; gT211Sum = 0;
+    t211DerefStore();
+    passed += Test("t211_deref_store_dtors", gT211Dtors, 1000);
+    gT211Dtors = 0; gT211Sum = 0;
+    t211DerefReturn();
+    passed += Test("t211_deref_return_dtors", gT211Dtors, 1000);
+    passed += Test("t211_deref_return_value", gT211Sum, 3000);
+    gT211Dtors = 0; gT211Sum = 0;
+    t211DerefAliasKept();
+    passed += Test("t211_deref_alias_value", gT211Sum, 3000);
+    gT211Dtors = 0; gT211Sum = 0;
+    t211AliasFieldKept();
+    passed += Test("t211_alias_field_value", gT211Sum, 3000);
+    gT211Dtors = 0; gT211Sum = 0;
+    t211AliasIndex();
+    passed += Test("t211_alias_index_dtors", gT211Dtors, 1000);
+    passed += Test("t211_alias_index_value", gT211Sum, 5000);
+    gT211Dtors = 0; gT211Sum = 0;
+    t211PointerEscape();
+    passed += Test("t211_pointer_escape_value", gT211Sum, 3000);
+    return passed;
+}
+
+// T207: a raw local that was rebound to an owned value (or whose reaching assignments all own) still
+// transfers to a `unique` owner, and every such leg destroys each object exactly once. The borrowed
+// and stack-address shapes are refused at compile time (Test/errors/err_unique_borrow_into_unique.cb).
+int gT207Dtors = 0;
+struct T207Res { int v = 1; ~T207Res() { gT207Dtors = gT207Dtors + 1; } };
+void t207NewTransfer() { unique T207Res* owner = nullptr; T207Res* raw = nullptr; raw = new T207Res(); owner = raw; }
+void t207DeclNew() { unique T207Res* owner = nullptr; T207Res* raw = new T207Res(); owner = raw; }
+void t207OtherRawNew() { unique T207Res* owner = nullptr; T207Res* other = new T207Res(); T207Res* raw = nullptr; raw = other; owner = raw; }
+void t207ChainNew() { T207Res* raw = nullptr; unique T207Res* owner = nullptr; owner = raw = new T207Res(); }
+void t207BorrowThenNew(T207Res* p) { unique T207Res* owner = nullptr; T207Res* raw = nullptr; raw = p; raw = new T207Res(); owner = raw; }
+void t207AddrThenNew() { T207Res loc = default; unique T207Res* owner = nullptr; T207Res* raw = nullptr; raw = &loc; raw = new T207Res(); owner = raw; }
+void t207BranchBothNew(bool c) { unique T207Res* owner = nullptr; T207Res* raw = nullptr; if (c) raw = new T207Res(); else raw = new T207Res(); owner = raw; }
+void t207BranchOneNew(bool c) { unique T207Res* owner = nullptr; T207Res* raw = nullptr; if (c) raw = new T207Res(); owner = raw; }
+// Round 2: a borrow stored by '=' stays a runtime-owned binding, so the owning stores that follow it
+// in another block, and a move parameter rebound to a borrow, free exactly what the path owns.
+void t207CrossBlockNewAfterBorrow(T207Res* q) { T207Res* raw = new T207Res(); raw = q; int i = 0; while (i < 1) { raw = new T207Res(); i++; } }
+void t207CondNewAfterBorrow(T207Res* q, bool c) { T207Res* raw = new T207Res(); raw = q; if (c) { raw = new T207Res(); } }
+void t207LoopBreakNewAfterBorrow(T207Res* q) { T207Res* raw = new T207Res(); raw = q; int i = 0; while (true) { i++; raw = new T207Res(); if (i > 1) break; } }
+void t207ParamBorrowed(move T207Res* m, T207Res* q) { m = q; }
+void t207ParamBorrowedIf(move T207Res* m, T207Res* q, bool c) { if (c) m = q; }
+void t207ParamBorrowThenNew(move T207Res* m, T207Res* q) { m = q; m = new T207Res(); }
+T207Res* t207ReturnSameBlockNew(T207Res* q) { T207Res* raw = new T207Res(); raw = q; raw = new T207Res(); return raw; }
+move T207Res* t207MoveParamReown(move T207Res* m, T207Res* q) { m = q; m = new T207Res(); return m; }
+
+int testT207RawLaunder()
+{
+    int passed = 0;
+    T207Res outer = default;
+    gT207Dtors = 0;
+    t207NewTransfer();
+    passed += Test("t207_new_transfer_dtors", gT207Dtors, 1);
+    gT207Dtors = 0;
+    t207DeclNew();
+    passed += Test("t207_decl_new_dtors", gT207Dtors, 1);
+    gT207Dtors = 0;
+    t207OtherRawNew();
+    passed += Test("t207_other_raw_new_dtors", gT207Dtors, 1);
+    gT207Dtors = 0;
+    t207ChainNew();
+    passed += Test("t207_chain_new_dtors", gT207Dtors, 1);
+    gT207Dtors = 0;
+    t207BorrowThenNew(&outer);
+    passed += Test("t207_borrow_then_new_dtors", gT207Dtors, 1);
+    gT207Dtors = 0;
+    t207AddrThenNew();
+    passed += Test("t207_addr_then_new_dtors", gT207Dtors, 2);
+    gT207Dtors = 0;
+    t207BranchBothNew(true);
+    t207BranchBothNew(false);
+    passed += Test("t207_branch_both_new_dtors", gT207Dtors, 2);
+    gT207Dtors = 0;
+    t207BranchOneNew(true);
+    t207BranchOneNew(false);
+    passed += Test("t207_branch_one_new_dtors", gT207Dtors, 1);
+    gT207Dtors = 0;
+    t207CrossBlockNewAfterBorrow(&outer);
+    passed += Test("t207_cross_block_new_after_borrow_dtors", gT207Dtors, 2);
+    gT207Dtors = 0;
+    t207CondNewAfterBorrow(&outer, true);
+    passed += Test("t207_cond_new_after_borrow_true_dtors", gT207Dtors, 2);
+    gT207Dtors = 0;
+    t207CondNewAfterBorrow(&outer, false);
+    passed += Test("t207_cond_new_after_borrow_false_dtors", gT207Dtors, 1);
+    gT207Dtors = 0;
+    t207LoopBreakNewAfterBorrow(&outer);
+    passed += Test("t207_loop_break_new_after_borrow_dtors", gT207Dtors, 3);
+    gT207Dtors = 0;
+    t207ParamBorrowed(new T207Res(), &outer);
+    passed += Test("t207_param_borrowed_dtors", gT207Dtors, 1);
+    gT207Dtors = 0;
+    t207ParamBorrowedIf(new T207Res(), &outer, true);
+    passed += Test("t207_param_borrowed_if_true_dtors", gT207Dtors, 1);
+    gT207Dtors = 0;
+    t207ParamBorrowedIf(new T207Res(), &outer, false);
+    passed += Test("t207_param_borrowed_if_false_dtors", gT207Dtors, 1);
+    gT207Dtors = 0;
+    t207ParamBorrowThenNew(new T207Res(), &outer);
+    passed += Test("t207_param_borrow_then_new_dtors", gT207Dtors, 2);
+    gT207Dtors = 0;
+    T207Res* t207Ret = t207ReturnSameBlockNew(&outer);
+    delete t207Ret;
+    passed += Test("t207_return_same_block_new_dtors", gT207Dtors, 2);
+    gT207Dtors = 0;
+    T207Res* t207Reown = t207MoveParamReown(new T207Res(), &outer);
+    passed += Test("t207_move_param_reown_return_dtors", gT207Dtors, 1);
+    delete t207Reown;
+    passed += Test("t207_move_param_reown_return_freed_once", gT207Dtors, 2);
+    gT207Dtors = 0;
+    return passed;
+}
+
+int t212ForwardGlobalValue = 13;
+int t212SinkBoxValue = 0;
+alias int t212AliasIdentity(alias int value) { return value; }
+alias int t212AliasForwardParam(alias int value) { return t212AliasIdentity(value); }
+struct T212AliasForwardBox
+{
+    int value = 19;
+    alias int throughField() { return t212AliasIdentity(value); }
+};
+alias int t212AliasForwardGlobal() { return t212AliasIdentity(t212ForwardGlobalValue); }
+void t212SinkOwnedBox(move UniqueBox value) { t212SinkBoxValue = value.item->id; }
+
+int testT212AliasReturnAcceptSet()
+{
+    int passed = 0;
+    int parameter = 7;
+    T212AliasForwardBox field = default;
+    passed += Test("t212_alias_forward_param", t212AliasForwardParam(parameter), 7);
+    passed += Test("t212_alias_forward_field", field.throughField(), 19);
+    passed += Test("t212_alias_forward_global", t212AliasForwardGlobal(), 13);
+
+    dtorCount = 0;
+    t212SinkBoxValue = 0;
+    t212SinkOwnedBox(identityBool(true) ? makeUniqueBox(54) : makeUniqueBox(55));
+    passed += Test("t212_owned_ternary_sink_value", t212SinkBoxValue, 54);
+    passed += Test("t212_owned_ternary_sink_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        UniqueBox[2] values;
+        UniqueBox* slot = &values[0];
+        *slot = makeUniqueBox(56);
+        passed += Test("t212_owned_pointer_array_store_value", values[0].boxId(), 56);
+        passed += Test("t212_owned_pointer_array_store_no_early_free", dtorCount, 0);
+    }
+    passed += Test("t212_owned_pointer_array_store_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        UniqueBox value = default;
+        UniqueBox* slot = &value;
+        *slot = makeUniqueBox(57);
+        passed += Test("t212_owned_pointer_local_store_value", value.boxId(), 57);
+        passed += Test("t212_owned_pointer_local_store_no_early_free", dtorCount, 0);
+    }
+    passed += Test("t212_owned_pointer_local_store_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        list<UniqueBox> values;
+        values.add(makeUniqueBox(58));
+        passed += Test("t212_owned_list_index_store_add_no_early_free", dtorCount, 0);
+        values[0] = makeUniqueBox(59);
+        passed += Test("t212_owned_list_index_store_drops_old_once", dtorCount, 1);
+        passed += Test("t212_owned_list_index_store_value", values[0].boxId(), 59);
+    }
+    passed += Test("t212_owned_list_index_store_frees_both_once", dtorCount, 2);
     return passed;
 }

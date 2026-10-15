@@ -106,5 +106,43 @@ extern int main()
     expect_error("has no overload matching the 'move' modifiers of function pointer signature") {
         function<int(int*)> f = consume_generic<int>;
     }
+    // T213: a move-only capture keeps the precise refusal on every path a moved or named closure
+    // takes to C++ (declaration, assignment, deduced template, `auto` rebind, mixed captures).
+    expect_error("a closure capturing the move-only 'owned' cannot be passed to C++ 'std.function<int(int)>'") {
+        Lambda<int(int)> mv = (int x) => { return x + owned->v; };
+        std.function<int(int)> g = move mv;
+    }
+    expect_error("a closure capturing the move-only 'owned' cannot be passed to C++ 'std.function<int(int)>'") {
+        Lambda<int(int)> mv = (int x) => { return x + owned->v; };
+        std.function<int(int)> g;
+        g = move mv;
+    }
+    expect_error("a closure capturing the move-only 'owned' cannot be passed to C++ 'cppi.apply_copy'") {
+        Lambda<int(int)> mv = (int x) => { return x + owned->v; };
+        int r = cppi.apply_copy(move mv, 5);
+    }
+    expect_error("a closure capturing the move-only 'owned' cannot be passed to C++ 'cppi.apply_copy'") {
+        Lambda<int(int)> mv = (int x) => { return x + owned->v; };
+        int r = cppi.apply_copy(mv, 5);
+    }
+    expect_error("a closure capturing the move-only 'owned' cannot be passed to C++ 'cppi.apply_n'") {
+        Lambda<int(int)> mv = (int x) => { return x + owned->v; };
+        int r = cppi.apply_n(move mv, 3);
+    }
+    expect_error("a closure capturing the move-only 'owned' cannot be passed to C++ 'std.function<int(int)>'") {
+        Lambda<int(int)> mv = (int x) => { return x + owned->v; };
+        auto moved = move mv;
+        std.function<int(int)> g = moved;
+    }
+    expect_error("a closure capturing the move-only 'owned' cannot be passed to C++ 'std.function<int(int)>'") {
+        CapturedBox pb = default;
+        Lambda<int(int)> mv = (int x) => { return x + owned->v + pb.v; };
+        std.function<int(int)> g = move mv;
+    }
+    // Guard: a struct-valued by-reference capture is never claimed as move-only.
+    expect_error("a closure that captures by reference ('box') cannot be passed to C++ 'std.function<int(int)>'") {
+        Lambda<int(int)> mv = (int x) => { return x + box.v; };
+        std.function<int(int)> g = move mv;
+    }
     return 0;
 }

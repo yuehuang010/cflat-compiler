@@ -1277,7 +1277,7 @@ std::string LLVMBackend::DescribeFuncPtrVariadicMismatch(const LLVMBackend::Type
 
 // The bind rule itself, shared by named functions and lambda literals. Empty when fn can bind dest.
 std::string LLVMBackend::FuncPtrBindReason(const LLVMBackend::TypeAndValue& fn,
-        const LLVMBackend::TypeAndValue& dest) const
+        const LLVMBackend::TypeAndValue& dest, bool compareReturnOwnership) const
 {
         std::vector<FuncPtrComponent> sa, sb;
         if (!FuncPtrSignatureOf(fn, sa) || !FuncPtrSignatureOf(dest, sb))
@@ -1291,13 +1291,19 @@ std::string LLVMBackend::FuncPtrBindReason(const LLVMBackend::TypeAndValue& fn,
         for (size_t i = 0; i < sa.size() && why.empty(); i++)
             if (ComponentsProvablyDiffer(sa[i], sb[i]))
                 why = (i == 0) ? "the return type differs" : std::format("parameter {} differs", i);
+        if (why.empty() && compareReturnOwnership
+            && fn.FuncPtrReturnPointer && dest.FuncPtrReturnPointer
+            && fn.FuncPtrReturnOwned && !dest.FuncPtrReturnOwned)
+            why = "it returns an owning 'move' pointer but the slot's return is borrowed (declare the "
+                  "slot's return 'move')";
         return why;
     }
 
 std::string LLVMBackend::DescribeFuncPtrBindMismatch(const std::string& functionName,
-        const LLVMBackend::TypeAndValue& fn, const LLVMBackend::TypeAndValue& dest) const
+        const LLVMBackend::TypeAndValue& fn, const LLVMBackend::TypeAndValue& dest,
+        bool compareReturnOwnership) const
 {
-        std::string why = FuncPtrBindReason(fn, dest);
+        std::string why = FuncPtrBindReason(fn, dest, compareReturnOwnership);
         if (why.empty()) return "";
         return std::format("cannot bind function '{}' to function-pointer type '{}': '{}' is "
             "'{}' - {}. A function pointer is called with no conversion site, so the signature "

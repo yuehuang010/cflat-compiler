@@ -2,6 +2,7 @@
 #include <llvm/Support/SaveAndRestore.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/Intrinsics.h>
+#include <llvm/IR/IntrinsicInst.h>
 
 class CxxFoldSretScope
 {
@@ -720,6 +721,8 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                     result.BaseType = result.Primary->getType();
                     result.TypeAndValue = assignmentResult.TypeAndValue;
                     result.Storage = assignmentResult.Storage;
+                    result.ChainedAssignSlot = assignmentResult.ChainedAssignSlot;
+                    result.ChainedAssignName = assignmentResult.ChainedAssignName;
                     // All of it: an owning struct destination carries its borrow provenance.
                     AdoptWrapperProvenance(result, assignmentResult);
                 }
@@ -957,6 +960,8 @@ llvm::Value* MainListener::BoxConcreteIntoInterface(antlr4::ParserRuleContext* e
         record.InterfaceName = interfaceName;
         record.Source = ClassifyInterfaceBoxSource(dataPtr, srcNV, transferred);
         record.OwnershipTransferred = transferred;
+        record.AliasOfOwnedLocal = !transferred
+            && PointerRootKind(dataPtr, compiler) == PointerValueRootKind::AliasOfOwnedLocal;
         record.SourceKeepsOwner = ClassifyBoxedSourceKeepsOwner(dataPtr, srcNV, transferred);
         if (record.SourceKeepsOwner)
         {
@@ -1249,8 +1254,7 @@ std::string MainListener::DescribeInterfaceBoxOwners(const std::vector<std::stri
         return text;
     }
 
-void MainListener::TagInterfaceBoxProvenance(const std::string& varName, llvm::Value* fatValue,
-                                              const LLVMBackend::NamedVariable* sourceNV) {
+void MainListener::TagInterfaceBoxProvenance(const std::string& varName, llvm::Value* fatValue) {
         if (varName.empty() || fatValue == nullptr) return;
         if (auto* constant = llvm::dyn_cast<llvm::Constant>(fatValue);
             constant != nullptr && constant->isNullValue())
@@ -1262,35 +1266,6 @@ void MainListener::TagInterfaceBoxProvenance(const std::string& varName, llvm::V
                                                 DescribeInterfaceBoxOwners(sourceNames));
         compilerLLVM->SetInterfaceBoxBorrowSlots(
             varName, borrowed ? ownerSlots : std::vector<llvm::Value*>{});
-
-        bool frameStorage = false;
-        bool unknown = false;
-        bool aliasOfOwnedLocal = false;
-        std::string className;
-        if (auto* constant = llvm::dyn_cast<llvm::Constant>(fatValue);
-            constant != nullptr && constant->isNullValue())
-            unknown = true;
-        else if (const auto* record = compilerLLVM->FindInterfaceBoxByFatValue(fatValue);
-                 record != nullptr)
-        {
-            frameStorage = record->Source == LLVMBackend::InterfaceBoxSource::FrameStorage;
-            className = record->SourceClassName;
-            unknown = !frameStorage;
-            // A borrow of an owning local, boxed without taking the owner: the owner dies at return.
-            aliasOfOwnedLocal = record->DataPointer != nullptr && !record->OwnershipTransferred
-                && PointerRootKind(record->DataPointer, compilerLLVM)
-                       == PointerValueRootKind::AliasOfOwnedLocal;
-        }
-        else if (sourceNV != nullptr)
-        {
-            frameStorage = sourceNV->InterfaceBoxFrameStorage;
-            unknown = sourceNV->InterfaceBoxReturnProvenanceUnknown;
-            className = sourceNV->InterfaceBoxFrameStorageClassName;
-        }
-        else
-            unknown = true;
-        compilerLLVM->SetInterfaceBoxReturnDangleProvenance(varName, frameStorage, unknown,
-                                                              className, aliasOfOwnedLocal);
     }
 
 bool MainListener::FatValueOwnsHeapBox(llvm::Value* fatValue) {
@@ -1366,8 +1341,221 @@ static PointerValueRootKind PointerValueRoot(llvm::Value* value, LLVMBackend* co
         llvm::Value* addr = load->getPointerOperand()->stripPointerCasts();
         if (compiler->IsFunctionArgumentStorage(addr) || llvm::isa<llvm::GlobalVariable>(addr))
             return K::Borrowed;
+        auto rootFromAggregateSlot = [&](llvm::Value* readAddress) {
+            if (fn == nullptr) return K::Borrowed;
+            llvm::Value* base = readAddress;
+            while (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(base))
+                base = gep->getPointerOperand()->stripPointerCasts();
+            auto* aggregate = llvm::dyn_cast<llvm::AllocaInst>(base);
+            if (aggregate == nullptr
+                || (!llvm::isa<llvm::ArrayType>(aggregate->getAllocatedType())
+                    && !llvm::isa<llvm::StructType>(aggregate->getAllocatedType())))
+                return K::Borrowed;
+
+            const llvm::DataLayout& layout = fn->getParent()->getDataLayout();
+            llvm::SmallVector<const llvm::Value*, 16> aggregateUses{aggregate};
+            llvm::SmallPtrSet<const llvm::Value*, 16> seenAggregateUses{aggregate};
+            while (!aggregateUses.empty())
+            {
+                const llvm::Value* current = aggregateUses.pop_back_val();
+                for (const llvm::User* user : current->users())
+                {
+                    if (const auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(user);
+                        gep != nullptr && gep->getPointerOperand() == current)
+                    {
+                        if (seenAggregateUses.insert(gep).second) aggregateUses.push_back(gep);
+                        continue;
+                    }
+                    if (const auto* cast = llvm::dyn_cast<llvm::CastInst>(user);
+                        cast != nullptr && cast->getOperand(0) == current)
+                    {
+                        if (seenAggregateUses.insert(cast).second) aggregateUses.push_back(cast);
+                        continue;
+                    }
+                    if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(user);
+                        load != nullptr && load->getPointerOperand() == current)
+                        continue;
+                    if (const auto* memory = llvm::dyn_cast<llvm::MemIntrinsic>(user);
+                        memory != nullptr && memory->getDest()->stripPointerCasts() == current)
+                        continue;
+                    if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                        store != nullptr && store->getPointerOperand() == current)
+                        continue;
+                    if (const auto* intrinsic = llvm::dyn_cast<llvm::IntrinsicInst>(user);
+                        intrinsic != nullptr
+                        && (intrinsic->getIntrinsicID() == llvm::Intrinsic::dbg_declare
+                            || intrinsic->getIntrinsicID() == llvm::Intrinsic::dbg_value
+                            || intrinsic->getIntrinsicID() == llvm::Intrinsic::lifetime_start
+                            || intrinsic->getIntrinsicID() == llvm::Intrinsic::lifetime_end))
+                        continue;
+                    return K::Borrowed;
+                }
+            }
+
+            std::unordered_map<const llvm::Value*, unsigned> storeCountBySlot;
+            auto storesToSlot = [&](const llvm::Value* slot) {
+                auto [it, inserted] = storeCountBySlot.emplace(slot, 0);
+                if (inserted)
+                    for (auto& block : *fn)
+                        for (auto& instruction : block)
+                            if (auto* store = llvm::dyn_cast<llvm::StoreInst>(&instruction);
+                                store != nullptr
+                                && store->getPointerOperand()->stripPointerCasts() == slot)
+                                ++it->second;
+                return it->second;
+            };
+            std::function<bool(llvm::Value*, llvm::Value*)> sameIndex =
+                [&](llvm::Value* left, llvm::Value* right) {
+                    if (left == right) return true;
+                    auto* leftLoad = llvm::dyn_cast<llvm::LoadInst>(left);
+                    auto* rightLoad = llvm::dyn_cast<llvm::LoadInst>(right);
+                    if (leftLoad != nullptr && rightLoad != nullptr)
+                    {
+                        llvm::Value* leftSlot = leftLoad->getPointerOperand()->stripPointerCasts();
+                        llvm::Value* rightSlot = rightLoad->getPointerOperand()->stripPointerCasts();
+                        if (leftSlot != rightSlot || !llvm::isa<llvm::AllocaInst>(leftSlot)) return false;
+                        return storesToSlot(leftSlot) == 1;
+                    }
+                    auto* leftCast = llvm::dyn_cast<llvm::CastInst>(left);
+                    auto* rightCast = llvm::dyn_cast<llvm::CastInst>(right);
+                    return leftCast != nullptr && rightCast != nullptr
+                        && leftCast->getOpcode() == rightCast->getOpcode()
+                        && sameIndex(leftCast->getOperand(0), rightCast->getOperand(0));
+                };
+            std::function<bool(llvm::Value*, llvm::Value*)> sameAddress =
+                [&](llvm::Value* left, llvm::Value* right) {
+                    if (left == right) return true;
+                    left = left->stripPointerCasts();
+                    right = right->stripPointerCasts();
+                    if (left == right) return true;
+                    int64_t leftOffset = 0;
+                    int64_t rightOffset = 0;
+                    const llvm::Value* leftBase = llvm::GetPointerBaseWithConstantOffset(
+                        left, leftOffset, layout);
+                    const llvm::Value* rightBase = llvm::GetPointerBaseWithConstantOffset(
+                        right, rightOffset, layout);
+                    if (leftBase == rightBase && leftOffset == rightOffset) return true;
+                    auto* leftGep = llvm::dyn_cast<llvm::GetElementPtrInst>(left);
+                    auto* rightGep = llvm::dyn_cast<llvm::GetElementPtrInst>(right);
+                    if (leftGep == nullptr || rightGep == nullptr
+                        || leftGep->getNumIndices() != rightGep->getNumIndices()
+                        || !sameAddress(leftGep->getPointerOperand(), rightGep->getPointerOperand()))
+                        return false;
+                    auto leftIndex = leftGep->idx_begin();
+                    auto rightIndex = rightGep->idx_begin();
+                    for (; leftIndex != leftGep->idx_end(); ++leftIndex, ++rightIndex)
+                    {
+                        auto* leftConstant = llvm::dyn_cast<llvm::ConstantInt>(*leftIndex);
+                        auto* rightConstant = llvm::dyn_cast<llvm::ConstantInt>(*rightIndex);
+                        if (leftConstant != nullptr && rightConstant != nullptr)
+                        {
+                            if (leftConstant->getValue() != rightConstant->getValue()) return false;
+                        }
+                        else if (!sameIndex(*leftIndex, *rightIndex)) return false;
+                    }
+                    return true;
+                };
+
+            int64_t readOffset = 0;
+            const llvm::Value* readBase = llvm::GetPointerBaseWithConstantOffset(
+                readAddress, readOffset, layout);
+            auto fixedStoreSize = [&](llvm::Type* type) -> uint64_t {
+                llvm::TypeSize size = layout.getTypeStoreSize(type);
+                return size.isScalable() ? 0 : size.getFixedValue();
+            };
+            uint64_t readSize = fixedStoreSize(load->getType());
+            auto writeCoversRead = [&](llvm::Value* writeAddress, uint64_t writeSize) {
+                if (writeSize == 0 || readSize == 0) return false;
+                int64_t writeOffset = 0;
+                const llvm::Value* writeBase = llvm::GetPointerBaseWithConstantOffset(
+                    writeAddress, writeOffset, layout);
+                return readBase == aggregate && writeBase == aggregate
+                    && writeOffset <= readOffset
+                    && static_cast<uint64_t>(readOffset - writeOffset) + readSize <= writeSize;
+            };
+            auto inspectWrite = [&](llvm::Instruction* instruction, bool& killed) {
+                if (auto* store = llvm::dyn_cast<llvm::StoreInst>(instruction))
+                {
+                    if (sameAddress(store->getPointerOperand(), readAddress))
+                    {
+                        killed = true;
+                        K stored = PointerValueRoot(store->getValueOperand(), compiler,
+                                                    fn, depth + 1, seen);
+                        if (store->getMetadata(fn->getContext().getMDKindID(
+                                "cflat.interface-return.alias-owned-local")) != nullptr)
+                            stored = K::AliasOfOwnedLocal;
+                        if (stored == K::OwnedLocal) stored = K::Owned;
+                        return stored;
+                    }
+                    if (writeCoversRead(store->getPointerOperand(),
+                                        fixedStoreSize(store->getValueOperand()->getType())))
+                    {
+                        killed = true;
+                        return K::Borrowed;
+                    }
+                }
+                if (auto* memory = llvm::dyn_cast<llvm::MemIntrinsic>(instruction))
+                {
+                    auto* length = llvm::dyn_cast<llvm::ConstantInt>(memory->getLength());
+                    if (length != nullptr)
+                    {
+                        int64_t writeOffset = 0;
+                        const llvm::Value* writeBase = llvm::GetPointerBaseWithConstantOffset(
+                            memory->getDest(), writeOffset, layout);
+                        uint64_t writeSize = length->getZExtValue();
+                        int64_t writeEnd = writeOffset + static_cast<int64_t>(writeSize);
+                        int64_t readEnd = readOffset + static_cast<int64_t>(readSize);
+                        if (writeCoversRead(memory->getDest(), writeSize)
+                            || (writeBase == aggregate && readBase == aggregate
+                                && writeOffset < readEnd && readOffset < writeEnd))
+                        {
+                            killed = true;
+                            return K::Borrowed;
+                        }
+                    }
+                }
+                return K::Borrowed;
+            };
+
+            K merged = K::Borrowed;
+            auto scanBlock = [&](llvm::BasicBlock* block, llvm::Instruction* before) {
+                auto current = before != nullptr ? before->getIterator() : block->end();
+                while (current != block->begin())
+                {
+                    --current;
+                    bool killed = false;
+                    K result = inspectWrite(&*current, killed);
+                    if (killed)
+                    {
+                        merged = static_cast<int>(merged) >= static_cast<int>(result)
+                            ? merged : result;
+                        return true;
+                    }
+                }
+                return false;
+            };
+            std::vector<std::pair<llvm::BasicBlock*, llvm::Instruction*>> pending;
+            llvm::SmallPtrSet<const llvm::BasicBlock*, 32> visited;
+            if (!scanBlock(load->getParent(), load))
+                for (llvm::BasicBlock* predecessor : llvm::predecessors(load->getParent()))
+                    pending.emplace_back(predecessor, nullptr);
+            for (size_t i = 0; i < pending.size(); ++i)
+            {
+                auto [block, before] = pending[i];
+                if (block == nullptr || !visited.insert(block).second) continue;
+                if (!scanBlock(block, before))
+                    for (llvm::BasicBlock* predecessor : llvm::predecessors(block))
+                        pending.emplace_back(predecessor, nullptr);
+            }
+            return merged;
+        };
         if (auto* fieldAddr = llvm::dyn_cast<llvm::GetElementPtrInst>(addr))
-            return compiler->IsOwningFieldAddress(fieldAddr) ? K::Owned : K::Borrowed;
+        {
+            if (llvm::isa<llvm::StructType>(fieldAddr->getSourceElementType())
+                && compiler->IsOwningFieldAddress(fieldAddr))
+                return K::Owned;
+            return rootFromAggregateSlot(addr);
+        }
         if (auto* ptrSlotLoad = llvm::dyn_cast<llvm::LoadInst>(addr))
         {
             // Field 0 has no GEP (IRBuilder folds a zero offset): the address is the struct
@@ -1405,7 +1593,8 @@ static PointerValueRootKind PointerValueRoot(llvm::Value* value, LLVMBackend* co
             // stores into that field are not stores into an alias slot.
             const auto* snv = compiler->FindVariableByStorage(slot);
             if (snv == nullptr) return K::Undecided;
-            return compiler->IsOwningStructField(snv->TypeAndValue.TypeName, 0) ? K::Owned : K::Borrowed;
+            return compiler->IsOwningStructField(snv->TypeAndValue.TypeName, 0)
+                ? K::Owned : rootFromAggregateSlot(addr);
         }
         // A local alias: every store into the slot decides. No store = undecided.
         K kind = K::Borrowed;
@@ -1760,6 +1949,8 @@ llvm::Value* MainListener::BoxInterfaceJoinArms(const std::vector<InterfaceJoinA
             record.InterfaceName = interfaceName;
             record.Source = ClassifyInterfaceBoxSource(armData, armSources[i], transferred);
             record.OwnershipTransferred = transferred;
+            record.AliasOfOwnedLocal = !transferred
+                && PointerRootKind(armData, compiler) == PointerValueRootKind::AliasOfOwnedLocal;
             // A PROVEN `move` arm detached its source here, so no other binding frees it. Same
             // demotion, and the same value keying, JoinArmsKeepOwner applies to the raw spelling.
             bool armMovedOut = compiler->IsMovedOutPtrValue(armData);
@@ -2159,6 +2350,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
         CFlatParser::AssignmentExpressionContext* ctx,
         LLVMBackend::NamedVariable* assignmentResult) {
         auto* compiler = Compiler(ctx);
+        // Block the assignment STATEMENT starts in: a borrow stored there is retired by an owning store
+        // later in the same statement, however many blocks the RHS creates on the way.
+        llvm::BasicBlock* assignStartBlock = compiler->builder->GetInsertBlock();
         auto condCtx = ctx->conditionalExpression();
         auto assignmentOp = ctx->assignmentOperator();
         auto unaryCtx = ctx->unaryExpression();
@@ -2218,6 +2412,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 compiler->lastCxxRetTemp_ = nullptr;
                 compiler->lastCxxRetValue_ = nullptr;
                 auto rhsNV = ParseAssignmentExpressionNamed(assignCtx);
+                // The discarded owning result is dropped here, never bound: a stale owned-call flag
+                // must not reach the next pointer declaration or assignment (T199 r2).
+                compiler->lastCallReturnsOwned = false;
+                compiler->lastOwningResult = false;
 
                 // A foreign C++ element is a live object in the container slot. Its explicit
                 // discard is the release operation, so call the foreign destructor on that slot.
@@ -3644,14 +3842,17 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 if (namedVar.UnionFieldType)
                 {
                     auto* stored = compiler->CreateAssignment(val, destination, isUnsigned, namedVar.UnionFieldType,
-                        namedVar.TypeAndValue.IsUnsignedInteger() != -1);
+                        namedVar.TypeAndValue.IsUnsignedInteger() != -1,
+                        namedVar.TypeAndValue.IsArrayView);
                     return stored;
                 }
                 return isDerefStorage()
                     ? compiler->CreateAssignment(val, destination, isUnsigned, namedVar.BaseType,
-                        namedVar.TypeAndValue.IsUnsignedInteger() != -1)
+                        namedVar.TypeAndValue.IsUnsignedInteger() != -1,
+                        namedVar.TypeAndValue.IsArrayView)
                     : compiler->CreateAssignment(val, destination, isUnsigned, nullptr,
-                        namedVar.TypeAndValue.IsUnsignedInteger() != -1);
+                        namedVar.TypeAndValue.IsUnsignedInteger() != -1,
+                        namedVar.TypeAndValue.IsArrayView);
             };
 
             /*
@@ -3746,6 +3947,16 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     {
                         assignmentResult->IsBorrowed = true;
                         assignmentResult->BorrowedOrigin = namedVar.CallerName;
+                        // T203: a plain local slot fed by a direct `new` is recorded so an outer unique
+                        // '=' can re-read it as an owner. Any other RHS keeps the borrow.
+                        if (llvm::isa_and_nonnull<llvm::AllocaInst>(destination)
+                            && namedVar.FieldName.empty() && !namedVar.CallerName.empty()
+                            && AsDirectNew(assignCtx) != nullptr
+                            && RawNewArrayValueOf(assignCtx) == nullptr)
+                        {
+                            assignmentResult->ChainedAssignSlot = destination;
+                            assignmentResult->ChainedAssignName = namedVar.CallerName;
+                        }
                     }
                 }
                 return resultValue;
@@ -3809,6 +4020,21 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 return ParseAssignmentExpressionNamed(assignCtx);
             }();
             if (RefuseImmovableAssignSource(compiler, ctx, operatorText, rightNV)) return nullptr;
+            // T203: `owner = raw = new T()` - the inner '=' left its local slot owning the object.
+            // A unique destination takes that slot as its RHS, exactly as `owner = raw;` does.
+            if (operatorText == "=" && !namedVar.TypeAndValue.Pointer
+                && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                && rightNV.IsBorrowed && rightNV.ChainedAssignSlot != nullptr)
+            {
+                const auto* slotVar = compiler->FindVariableByStorage(rightNV.ChainedAssignSlot);
+                if (slotVar != nullptr && slotVar->IsOwning)
+                {
+                    const std::string slotName = rightNV.ChainedAssignName;
+                    rightNV = *slotVar;
+                    rightNV.Primary = nullptr;
+                    rightNV.CallerName = slotName;
+                }
+            }
             // `t = std.move(x)` of a trivially copyable C++ class: the xvalue's referent is
             // byte-copied (the trivial pick), or assigned through clang's pick when it is not.
             if (operatorText == "=" && !namedVar.TypeAndValue.Pointer
@@ -3878,6 +4104,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     || existingDestination->BorrowsOwningLocal
                     || existingDestination->BorrowsOwnedElement
                     || !existingDestination->BorrowedUniqueField.empty());
+            // Set when this '=' retired the borrow the binding held (same statement block): the
+            // owning store then proves the binding owns, as a fresh binding would.
+            bool storeRetiredBorrow = false;
             bool assignmentBorrowsOwningLocal = false;
             std::string assignmentBorrowOrigin;
             llvm::Value* assignmentBorrowStorage = nullptr;
@@ -4009,9 +4238,15 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     // TransferPointerOwnershipOnStore consumes an owning pointer source later in
                     // this assignment. Do not snapshot that source's pre-transfer owner proof:
                     // the destination is the sole owner by the end of this statement.
+                    // A stack or global address is never heap-owned, even when its object owns its
+                    // elements: `raw = arr;` of a destructible array is a borrow of the array. Views
+                    // keep their own provenance (SetViewOfFixedArrayStorage), so they are exempt.
+                    const bool rhsIsStackAddress = !namedVar.TypeAndValue.IsArrayView
+                        && LLVMBackend::IsProvableNonHeapAddressSource(rightNV);
                     bool reboundToOwnedStore = coalesceResume == nullptr
                         && !assignmentBorrowsOwningLocal
                         && (srcIsOwnedPtrRhs || rightNV.IsOwning)
+                        && !rhsIsStackAddress
                         && !compiler->IsMovedBorrowedPtrValue(rightNV.Primary);
                     assignmentAdoptsOwnedSource = coalesceResume == nullptr
                         && !assignmentBorrowsOwningLocal
@@ -4115,6 +4350,25 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                             storeBorrowUniqueFieldViaCall = true;
                         }
                     }
+                    // A stack or global address (`raw = &loc;`, `raw = arr;`) is a borrow too: the
+                    // raw local never owns it, so a later reset must refuse it like a borrowed
+                    // parameter. The root object's name is the origin the message names.
+                    const bool storeSrcIsStackAddress = rhsIsStackAddress;
+                    if (!storeSrcIsBorrow && !rightNV.TypeAndValue.IsMove
+                        && (storeSrcIsStackAddress || rightNV.PointsToBorrowedAddress))
+                    {
+                        storeSrcIsBorrow = true;
+                        if (storeBorrowOrigin.empty() && storeSrcIsStackAddress)
+                        {
+                            llvm::Value* root = rightNV.Primary != nullptr
+                                ? rightNV.Primary->stripPointerCasts() : rightNV.Storage;
+                            while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(root))
+                                root = gep->getPointerOperand()->stripPointerCasts();
+                            storeBorrowOrigin = compiler->FindVariableNameByStorage(root);
+                            if (storeBorrowOrigin.empty())
+                                storeBorrowOrigin = root->getName().str();
+                        }
+                    }
                     if (storeSrcIsBorrow && !reboundToOwnedStore)
                         compiler->RecordAssignBorrow(namedVar.CallerName, storeBorrowOrigin,
                                                      storeBorrowUniqueField,
@@ -4125,7 +4379,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         compiler->RecordAssignOwningLocalBorrow(
                             namedVar.CallerName, assignmentBorrowOrigin, assignmentBorrowStorage);
                     else if (reboundToOwnedStore)
-                        compiler->RetireAssignBorrow(namedVar.CallerName);
+                        storeRetiredBorrow = compiler->RetireAssignBorrow(
+                            namedVar.CallerName, assignStartBlock);
                     // A JOIN RHS carries no source binding, so no clause above can see it; ask its
                     // arms directly. After MarkPointerRebound, which retires any earlier join.
                     std::vector<llvm::Value*> storeJoinSlots;
@@ -4617,6 +4872,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     && !sourceIsUniqueField
                     && rightNV.BorrowedUniqueField.empty()
                     && !joinMovesBorrowedParam
+                    && !rightNV.PointsToBorrowedAddress
                     && (!rightNV.IsBorrowed
                         || (rightNV.BorrowedOrigin.empty()
                             && !compiler->IsFunctionParameter(rightNV.CallerName)));
@@ -5112,7 +5368,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             if (operatorText == "=" && namedVar.TypeAndValue.IsFatInterfaceValue()
                 && namedVar.FieldName.empty() && !namedVar.CallerName.empty()
                 && llvm::isa_and_nonnull<llvm::AllocaInst>(destination))
-                TagInterfaceBoxProvenance(namedVar.CallerName, right, &rightNV);
+                TagInterfaceBoxProvenance(namedVar.CallerName, right);
 
             // A plain interface local adopts an owning result just like a value-struct local. Its
             // ownership is not implied by `unique`; the IsOwning bit is the per-slot state. When a
@@ -5660,22 +5916,30 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             if (operatorText == "=" && right && right->getType()->isStructTy() && destIsClosureFat)
             {
                 right = CloneClosureFromNamedSource(rightNV, right, ctx);
-                // Free the old env when overwriting a KNOWN-INITIALIZED destination slot, so the
-                // prior env is not orphaned. Safe slots: a whole-variable closure local/global
-                // (alloca/global), and a struct FIELD of a stack/global value-type instance - its
-                // fields are default/zero-initialized, so an unset field reads as null and the env
-                // dtor (null/tag-guarded) is a no-op. A field reached through a HEAP pointer (e.g. a
-                // raw-malloc'd thread/process packet) may be uninitialized garbage, so it is NOT
-                // freed here - freeing a garbage env would corrupt the heap.
+                // CFlat value-type method receivers are constructed with null closure fields.
+                // Free the old env only for initialized slots; another heap pointer may be raw.
                 // The clone above reads the SOURCE env first, so a self-assign (`f = f`) is safe:
                 // the independent clone exists before the old env is freed.
+                auto thisVar = compiler->GetThisPointer();
+                auto* thisStorage = llvm::dyn_cast_or_null<llvm::AllocaInst>(thisVar.Storage);
+                auto isThisPointerLoad = [&](llvm::Value* slotBase) {
+                    auto* base = slotBase != nullptr ? slotBase->stripPointerCasts() : nullptr;
+                    auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(base);
+                    return thisStorage != nullptr && load != nullptr
+                        && load->getPointerOperand()->stripPointerCasts() == thisStorage;
+                };
                 bool destSlotInitialized =
                     llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination);
-                if (!destSlotInitialized && destIsStructField)
+                if (!destSlotInitialized && destIsStructField && destGep != nullptr)
                 {
                     auto* base = destGep->getPointerOperand()->stripPointerCasts();
-                    destSlotInitialized = llvm::isa<llvm::AllocaInst>(base) || llvm::isa<llvm::GlobalVariable>(base);
+                    destSlotInitialized = llvm::isa<llvm::AllocaInst>(base)
+                        || llvm::isa<llvm::GlobalVariable>(base);
+                    if (!destSlotInitialized)
+                        destSlotInitialized = isThisPointerLoad(base);
                 }
+                if (!destSlotInitialized && !namedVar.OwningStructName.empty())
+                    destSlotInitialized = isThisPointerLoad(destination);
                 // A UNION member is NOT a known-initialized closure slot: every arm names the same
                 // bytes, so the current contents may be an unrelated arm's value.
                 if (namedVar.UnionFieldType != nullptr)
@@ -5766,22 +6030,26 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 && RejectAliasStoreIntoField(rightNV, right, ctx))
                 return finishStore(right);
 
-            // Same hazard with an owning LOCAL/GLOBAL destination (`other = k`): it destructs, so
-            // it must sit ahead of the move/destruct blocks below, which only ask for a named slot.
+            // Alias results also reach owning stores through dereferences and container indexers.
+            // Check every addressable owning lvalue before the move/drop paths below.
+            const bool destIsNamedOwningSlot = llvm::isa_and_nonnull<llvm::AllocaInst>(destination)
+                || llvm::isa_and_nonnull<llvm::GlobalVariable>(destination);
+            // A named borrow stored through a raw `*p` stays legal (btree lookup's `*out = found`
+            // hands the caller an alias by contract); a direct alias-call result there is refused.
+            auto* lhsUnary = ctx->unaryExpression();
+            const bool lhsIsStarDeref = lhsUnary != nullptr && lhsUnary->unaryOperator() != nullptr
+                && lhsUnary->unaryOperator()->getText() == "*";
+            const bool destIsIndirectOwningSlot = destination != nullptr && (namedVar.IsElementAccess
+                || (isDerefStorage() && (!lhsIsStarDeref
+                    || compiler->FindStackVariableByStorage(rightNV.Storage) == nullptr)));
             if (operatorText == "=" && !destIsStructField && namedVar.FieldName.empty()
                 && destination != nullptr
-                && (llvm::isa<llvm::AllocaInst>(destination)
-                    || llvm::isa<llvm::GlobalVariable>(destination))
+                && (destIsNamedOwningSlot || destIsIndirectOwningSlot)
                 && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName)
                 && !namedVar.TypeAndValue.Pointer
                 && destination != rightNV.Storage
-                && RejectAliasBorrowAdoption(rightNV, right, "an owning variable", ctx))
-                return finishStore(right);
-
-            if (operatorText == "=" && !destIsStructField && namedVar.IsElementAccess
-                && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName)
-                && !namedVar.TypeAndValue.Pointer
-                && RejectAliasBorrowAdoption(rightNV, right, "an owning array element", ctx))
+                && RejectAliasBorrowAdoption(rightNV, right,
+                    namedVar.IsElementAccess ? "an owning array element" : "an owning variable", ctx))
                 return finishStore(right);
 
             // The DESTINATION is a borrow local (`Box k = w.get(); k = makeBox(2);`). Its old value
@@ -7037,12 +7305,19 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 // count below is re-derived. '??=' only stores into null, so it has nothing to free.
                 if (coalesceResume == nullptr && right != nullptr
                     && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
-                    if (auto* viewLocal = compiler->FindStackVariableByStorage(namedVar.Storage))
+                {
+                    // A move parameter's slot is an argument, not a local: its owner flag exists only
+                    // once a borrow reached it (ActivateParamOwnFlag), so this finds it in the argument frames.
+                    auto* viewLocal = compiler->FindStackVariableByStorage(namedVar.Storage);
+                    if (viewLocal == nullptr)
+                        viewLocal = compiler->FindStackArgumentByStorage(namedVar.Storage);
+                    if (viewLocal != nullptr)
                         compiler->EmitOwnedPtrRelease(
                             *viewLocal, right,
                             rightNV.BorrowsOwningLocal ? rightNV.OwningLocalStorage : nullptr,
                             rightNV.IsBorrowed && !rightNV.IsOwning && !rightNV.BorrowsOwningLocal
                                 && !rightNV.TypeAndValue.IsMove);
+                }
                 auto* asgNewArr = assignCtx ? AsDirectNew(assignCtx) : nullptr;
                 const bool rhsIsWholeRawArrayBinding = rightNV.FieldName.empty()
                     && rightNV.OwningStructName.empty() && !rightNV.IsElementAccess
@@ -7203,6 +7478,15 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             }
 
             auto* assignResult = derefAssign(right, rhsUnsigned);
+            if (operatorText == "=" && namedVar.TypeAndValue.Pointer
+                && !namedVar.TypeAndValue.IsUnique
+                && (destIsStructField || namedVar.IsElementAccess)
+                && rightNV.BorrowsOwningLocal
+                && compiler->OwningLocalCopyStillAliases(rightNV))
+                if (auto* store = llvm::dyn_cast_or_null<llvm::StoreInst>(assignResult))
+                    store->setMetadata(store->getContext().getMDKindID(
+                        "cflat.interface-return.alias-owned-local"),
+                        llvm::MDNode::get(store->getContext(), {}));
             if (consumedUniqueFieldSource)
                 compiler->ConsumeOwnedNewTemp(rightNV.Primary);
             // Array-view element store: tag the store with the view's alias scope (matches the load
@@ -7221,15 +7505,39 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             // `p = q` from an owning pointer local nulled q above, so p is now the owner.
             if (operatorText == "="
                 && (assignmentAdoptsOwnedSource || (storeNulledSource && rightNV.FieldName.empty()))
-                && !destinationHadBorrowProvenance
+                && (!destinationHadBorrowProvenance
+                    || (storeRetiredBorrow && existingDestination != nullptr
+                        && !existingDestination->BorrowsOwnedElement))
                 && namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsUnique
                 && namedVar.FieldName.empty() && !namedVar.CallerName.empty()
                 && (llvm::isa<llvm::AllocaInst>(destination)
                     || llvm::isa<llvm::GlobalVariable>(destination)))
             {
                 compiler->SetVariableOwning(namedVar.CallerName, true);
+                compiler->RearmParamOwner(namedVar.CallerName);
                 compiler->ConsumeOwnedNewTemp(rightNV.Primary);
                 // Adopting from another local slot answers to that slot's aliases (leak if any).
+                if (auto* adopter = compiler->FindStackVariableByStorage(destination))
+                {
+                    // The in-block borrow this store retired no longer suppresses the owner; a
+                    // stale flag would make the return path free the returned object (T207 r2).
+                    if (storeRetiredBorrow) adopter->BorrowSuppressedOwner = false;
+                    compiler->GateOwnFlagAdoption(*adopter, right);
+                }
+            }
+            // An owned store that another block's borrow still stands in front of (not retired, so
+            // the compile-time owner bit stays clear and `owner = raw` keeps refusing). The runtime
+            // flag alone records the new block, so scope exit frees it on this path.
+            else if (operatorText == "="
+                && (assignmentAdoptsOwnedSource || (storeNulledSource && rightNV.FieldName.empty()))
+                && destinationHadBorrowProvenance && !storeRetiredBorrow
+                && namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsUnique
+                && namedVar.FieldName.empty() && !namedVar.CallerName.empty()
+                && (llvm::isa<llvm::AllocaInst>(destination)
+                    || llvm::isa<llvm::GlobalVariable>(destination)))
+            {
+                compiler->ArmSuppressedOwnFlag(namedVar.CallerName);
+                compiler->ConsumeOwnedNewTemp(rightNV.Primary);
                 if (auto* adopter = compiler->FindStackVariableByStorage(destination))
                     compiler->GateOwnFlagAdoption(*adopter, right);
             }
@@ -8443,6 +8751,36 @@ bool MainListener::LiftTernaryFunctionArmToClosure(antlr4::ParserRuleContext* ct
         return lifted;
 }
 
+// A lambda literal that IS the whole arm, through single-child chains and plain parentheses.
+// Shape probe only.
+static bool IsSoleLambdaArm(antlr4::tree::ParseTree* node)
+{
+    while (node != nullptr)
+    {
+        if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr) return true;
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+            primary != nullptr && primary->expression() != nullptr && primary->children.size() == 3)
+        {
+            node = primary->expression();
+            continue;
+        }
+        auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(node);
+        if (ctx == nullptr || ctx->children.size() != 1) return false;
+        node = ctx->children[0];
+    }
+    return false;
+}
+
+// The signature a lambda-literal arm is parsed against: the enclosing slot when it names a function
+// type, else the closure signature of the OTHER arm when that arm is already parsed.
+static LLVMBackend::TypeAndValue TernaryLambdaArmHint(const LLVMBackend::TypeAndValue& slot,
+    const LLVMBackend::TypedValue* other)
+{
+    if (slot.IsFunctionPointer || other == nullptr || !other->hasSourceType) return slot;
+    if (other->sourceType.IsFunctionPointer && !other->sourceType.Pointer) return other->sourceType;
+    return slot;
+}
+
 LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         CFlatParser::ConditionalExpressionContext* ctx,
         const LLVMBackend::TypedValue& condTv,
@@ -8643,6 +8981,13 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         size_t falseOcc = trueOcc;
         bool trueDefault = IsDefaultOnlyExpression(expressionTrueCtx);
         bool falseDefault = IsDefaultOnlyExpression(expressionFalseCtx);
+        // A lambda-literal arm reads its return type from lambdaExpectedType, which a call or
+        // assignment parsed earlier clears (`m ? mk(5) : (int a) => {...}` lost the declared slot).
+        // So a literal beside a non-literal arm is parsed AFTER that arm, against its signature.
+        const LLVMBackend::TypeAndValue slotLambdaType = lambdaExpectedType;
+        const bool trueLambdaArm = IsSoleLambdaArm(expressionTrueCtx);
+        const bool falseLambdaArm = IsSoleLambdaArm(expressionFalseCtx);
+        const bool falseFirst = trueDefault || (trueLambdaArm && !falseLambdaArm && !falseDefault);
         auto expectedForDefault = [&](llvm::Value* otherValue, bool otherIsDefault) {
             auto expected = otherIsDefault ? LLVMBackend::TypeAndValue{} : InferTernaryArmType(otherValue);
             if (expected.TypeName.empty()) expected = outerExpected;
@@ -8726,6 +9071,13 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             {
                 auto expected = expectedForDefault(falseValue, falseDefault);
                 if (!expected.TypeName.empty()) expectedScope.emplace(&declExpectedType, expected);
+            }
+            std::optional<LambdaExpectedTypeRestoreGuard> lambdaArmScope;
+            if (trueLambdaArm)
+            {
+                lambdaArmScope.emplace(&lambdaExpectedType);
+                lambdaExpectedType = TernaryLambdaArmHint(slotLambdaType,
+                    falseFirst && !falseLambdaArm ? &falseShape : nullptr);
             }
             if (use == ResultUse::Discard)
             {
@@ -8873,6 +9225,13 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 auto expected = expectedForDefault(trueValue, trueDefault);
                 if (!expected.TypeName.empty()) expectedScope.emplace(&declExpectedType, expected);
             }
+            std::optional<LambdaExpectedTypeRestoreGuard> lambdaArmScope;
+            if (falseLambdaArm)
+            {
+                lambdaArmScope.emplace(&lambdaExpectedType);
+                lambdaExpectedType = TernaryLambdaArmHint(slotLambdaType,
+                    !falseFirst && !trueLambdaArm ? &trueShape : nullptr);
+            }
             auto falseTv = ParseConditionalExpression(expressionFalseCtx, use);
             falseValue = falseTv.value;
             falseShape = falseTv;
@@ -8940,7 +9299,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         };
         try
         {
-            if (trueDefault)
+            if (falseFirst)
             {
                 parseFalseArm();
                 falseTernaryMovedState = compiler->SaveMovedState();
@@ -9406,6 +9765,32 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 compiler->builder->CreateStore(falseValue, falseAliasTemp);
             }
         }
+        // T197: a closure join with an owned temp arm (call result or lambda literal) MOVES that
+        // temp into the join - no copy, no extra retain. The arm that is not selected never runs,
+        // so its temp never exists and needs no drop. A borrowed closure arm is copied in its own
+        // block, so the join owns exactly one closure on every path and the join registers it.
+        const bool closureJoinOwnsArms = trueValue != nullptr && falseValue != nullptr
+            && trueValue->getType() == compiler->GetClosureFatPtrType()
+            && falseValue->getType() == compiler->GetClosureFatPtrType()
+            && (compiler->IsOwnedClosureTemp(trueValue) || compiler->IsOwnedClosureTemp(falseValue));
+        if (closureJoinOwnsArms)
+        {
+            auto ownClosureArm = [&](llvm::Value*& arm) {
+                if (compiler->IsOwnedClosureTemp(arm))
+                {
+                    compiler->UnregisterOwnedClosureTemp(arm);
+                    compiler->UnregisterOwnedStructTempsHolding(arm);
+                    return;
+                }
+                llvm::Value* owned = CloneTernaryClosureValue(arm, ctx);
+                if (owned != arm) compiler->UnregisterOwnedClosureTemp(owned);
+                arm = owned;
+            };
+            atTrue();
+            ownClosureArm(trueValue);
+            atFalse();
+            ownClosureArm(falseValue);
+        }
         atTrue();
         trueBr = compiler->CreateJump(resumeBlock);
         atFalse();
@@ -9448,7 +9833,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         if (sharedCxxRetTemp != nullptr && trueStorage == sharedCxxRetTemp
             && falseStorage == sharedCxxRetTemp)
             cxxLvalueStorageJoin = sharedCxxRetTemp;
-        else if ((cxxRecordJoin || scalarLvalueJoin || valueLvalueJoin)
+        // T197: an owned closure join is a fresh value, not an lvalue; a storage PHI here made
+        // a nested callee load through an untyped pointer (null-callee ICE).
+        else if (!closureJoinOwnsArms && (cxxRecordJoin || scalarLvalueJoin || valueLvalueJoin)
             && trueStorage != nullptr && falseStorage != nullptr)
         {
             auto* cxxStoragePhi = compiler->builder->CreatePHI(
@@ -9562,7 +9949,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             if ((trueNullptr || falseNullptr) && pointerArm.Pointer)
                 compiler->RegisterValueElementTypeName(phi, pointerArm.TypeName);
         }
-        llvm::Value* resultValue = CloneTernaryClosureValue(phi, ctx);
+        // An owned join is the phi itself (its arms were moved or copied in place); a plain join copies it.
+        llvm::Value* resultValue = closureJoinOwnsArms ? phi : CloneTernaryClosureValue(phi, ctx);
+        if (closureJoinOwnsArms) compiler->RegisterOwnedClosureTemp(phi);
         LLVMBackend::TypedValue result{ resultValue, joinUnsigned };
         result.isAlias = trueAlias || falseAlias;
         // A join is an explicit move only when every arm is one: `cond ? move a : b` stays a borrow.
@@ -22670,6 +23059,14 @@ void MainListener::ValidateArrayTotalElements(antlr4::ParserRuleContext* expr, u
     }
 
 llvm::Value* MainListener::FoldArrayDimValue(antlr4::ParserRuleContext* expr, llvm::Value* value) {
+        // A function name, pointer or float is not a size (it reached the alloca and failed module
+        // verification); size 1 keeps the declaration well-formed after the error, as EvalGlobalArrayDim does.
+        if (value != nullptr && !value->getType()->isIntegerTy())
+        {
+            LogErrorContext(expr, std::format("array dimension '{}' must have an integer type",
+                                              expr->getText()));
+            return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*Compiler(expr)->context), 1);
+        }
         uint64_t folded = 0;
         // Only admitted (immutable) globals fold; a mutable global keeps the run-time size.
         if (!TryFoldConstInt(value, folded, &constFoldableGlobals_,
@@ -24002,9 +24399,12 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
             // Exempt field accesses (storage is a GEP, not an alloca): 'delete param->field'
             // is intentionally allowed - the field's lifetime is the caller's contract, just
             // like the simple-variable check above.
+            // An address-of proof (`p = &x;`) owns the message for its own borrow: the address-of
+            // check below names it, and a borrow recorded from the same store must not pre-empt it.
             if (!namedVar.IsOwning
                 && namedVar.IsBorrowed
                 && !namedVar.BorrowedOrigin.empty()
+                && !namedVar.PointsToBorrowedAddress
                 && namedVar.Storage != nullptr
                 && llvm::isa<llvm::AllocaInst>(namedVar.Storage)
                 && !compiler->BorrowProofRetiredByRebind(namedVar))
@@ -24777,10 +25177,6 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.BorrowedInterfaceBox           = src.BorrowedInterfaceBox;
         dst.BorrowedInterfaceBoxSource     = src.BorrowedInterfaceBoxSource;
         dst.BorrowedInterfaceBoxSlots      = src.BorrowedInterfaceBoxSlots;
-        dst.InterfaceBoxFrameStorage        = src.InterfaceBoxFrameStorage;
-        dst.InterfaceBoxReturnProvenanceUnknown = src.InterfaceBoxReturnProvenanceUnknown;
-        dst.InterfaceBoxFrameStorageClassName = src.InterfaceBoxFrameStorageClassName;
-        dst.InterfaceBoxAliasOfOwnedLocal    = src.InterfaceBoxAliasOfOwnedLocal;
         dst.OwnedStringBorrowBlock         = src.OwnedStringBorrowBlock;
         dst.OwnedStringBorrowFunction      = src.OwnedStringBorrowFunction;
         dst.OwnedElementBorrowBlock        = src.OwnedElementBorrowBlock;
@@ -25252,6 +25648,10 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                 result.IsBonded = argNV.IsBonded;
                 result.BondByAddress = argNV.BondByAddress;
                 result.BondedSources = argNV.BondedSources;
+                // A moved closure keeps its capture names, so CxxClosureArgumentRefusal still
+                // names a move-only or by-reference capture after the move (T213).
+                result.LambdaCaptureNames = argNV.LambdaCaptureNames;
+                result.LambdaReferenceCaptureNames = argNV.LambdaReferenceCaptureNames;
                 // CallerName is deliberately NOT carried: the source is already detached and
                 // zeroed, and keeping it re-marks the origin in the move tracker (false positives).
                 // Carry the owning flag so 'move s' directly as a 'move string' arg TRANSFERS the buffer;

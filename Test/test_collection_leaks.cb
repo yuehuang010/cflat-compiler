@@ -607,6 +607,16 @@ void rowSink(LeakRow v)    { g_sinkRow = move v; }
 Lambda<int(int)> g_sinkFn = default;
 void fnSink(Lambda<int(int)> f) { g_sinkFn = move f; }
 Lambda<int()> returnByValueClosure(Lambda<int()> value) { return value; }
+struct T202ThisClosureBox
+{
+    Lambda<int()> value = default;
+    void set(Lambda<int()> next) { value = next; }
+};
+struct T202MoveClosureBox<T>
+{
+    T value = default;
+    void take(move T next) { value = move next; }
+};
 int g_nestedUniqueCtors = 0;
 int g_nestedUniqueDtors = 0;
 struct NestedUniqueOwner
@@ -905,6 +915,130 @@ bool _r3UniqueSink(bool consume, unique PtrLeak* p, list<unique PtrLeak*>* out)
     if (!consume) return false;     // not moved out - scope-exit drop frees p once
     out->add(p);                    // moved out into the caller's list
     return true;
+}
+
+// T197: a call-result closure (owned temp) in a ternary arm is MOVED into the join, so the arm
+// that is selected frees its env exactly once. Before the fix the temp leaked its env and
+// captured string on every selection (2 blocks per iteration; the copy was freed, the temp not).
+Lambda<int(int)> t197Mk(int n)
+{
+    string s = "abcdefghijklmnopqrstuvwxyz0123456789";
+    return (int a) => { return a + n + s.length(); };
+}
+int t197Fn1(int a) { return a + 1; }
+int t197Apply(Lambda<int(int)> f, int v) { return f(v); }
+Lambda<int(int)> t197Pick(int m, Lambda<int(int)> o) { return m ? t197Mk(5) : o; }
+Lambda<int(int)> t197PickFT(int m, Lambda<int(int)> o) { return m ? o : t197Mk(5); }
+struct T197Holder { Lambda<int(int)> fn = default; };
+
+// One ternary shape per cell; `other` is the non-temp closure arm. m selects the temp when 1.
+int t197Cell(int cell, int m, Lambda<int(int)> other)
+{
+    if (cell == 0) { Lambda<int(int)> z = m ? t197Mk(5) : other; return z(1); }
+    if (cell == 1) { Lambda<int(int)> z = m ? other : t197Mk(5); return z(1); }
+    if (cell == 2) { return t197Apply(m ? t197Mk(5) : other, 1); }
+    if (cell == 3) { return t197Apply(m ? other : t197Mk(5), 1); }
+    if (cell == 4) { return t197Pick(m, other)(1); }
+    if (cell == 5) { return t197PickFT(m, other)(1); }
+    if (cell == 6) { return (m ? t197Mk(5) : other)(1); }
+    if (cell == 7) { return (m ? other : t197Mk(5))(1); }
+    if (cell == 8) { Lambda<int(int)> z = t197Fn1; z = m ? t197Mk(5) : other; return z(1); }
+    if (cell == 9) { T197Holder h = default; h.fn = m ? t197Mk(5) : other; return h.fn(1); }
+    if (cell == 10) { Lambda<int(int)> z = m ? t197Mk(5) : t197Mk(6); return z(1); }
+    Lambda<int(int)> z = m ? t197Mk(5) : t197Fn1;
+    return z(1);
+}
+
+int t197RunCell(int cell, Lambda<int(int)> other)
+{
+    int acc = 0;
+    int i = 0;
+    while (i < 200)
+    {
+        acc = acc + t197Cell(cell, i % 2, other);
+        i++;
+    }
+    return acc;
+}
+
+// T197 round 2: list.add with a closure ternary (generic `move T` param), and nested closure
+// ternaries as a direct callee. m = i % 2, k = (i / 2) % 2.
+int t197NestCell(int cell, int m, int k, Lambda<int(int)> other)
+{
+    if (cell == 12) { list<Lambda<int(int)>> l = default; l.add(m ? t197Mk(5) : other); return l.get(0)(1); }
+    if (cell == 13) { list<Lambda<int(int)>> l = default; l.add(m ? other : t197Mk(5)); return l.get(0)(1); }
+    if (cell == 14) { list<Lambda<int(int)>> l = default; l.add(m ? t197Mk(5) : t197Mk(6)); return l.get(0)(1); }
+    // Decl-initialised nested callee over a local lo (a plain `return` of it does not reproduce the ICE).
+    if (cell == 15) { Lambda<int(int)> lo = t197Mk(3); int r = (m ? (k ? t197Mk(5) : t197Fn1) : lo)(1); return r; }
+    Lambda<int(int)> lo = t197Mk(3);
+    int r = (m ? lo : (k ? lo : t197Mk(7)))(1);
+    return r;
+}
+
+int t197RunNest(int cell, Lambda<int(int)> other)
+{
+    int acc = 0;
+    int i = 0;
+    while (i < 200)
+    {
+        acc = acc + t197NestCell(cell, i % 2, (i / 2) % 2, other);
+        i++;
+    }
+    return acc;
+}
+
+// T209: a lambda literal beside a call-result closure (or a second literal) in a ternary takes its
+// return type from the other arm or the declared slot. Literal returns 21 at 1, mk(5) returns 42,
+// the second literal returns 31. m alternates, so each cell sums 100 selections of each arm.
+Lambda<int(int)> t209PickLT(int m) { return m ? (int a) => { return a + 20; } : t197Mk(5); }
+Lambda<int(int)> t209PickFT(int m) { return m ? t197Mk(5) : (int a) => { return a + 20; }; }
+Lambda<int(int)> t209PickLL(int m) { return m ? (int a) => { return a + 20; } : (int a) => { return a + 30; }; }
+// A literal beside a `default` arm keeps the literal first (the default takes the literal's type).
+Lambda<int(int)> t209PickLD(int m) { return m ? (int a) => { return a + 20; } : default; }
+int t209DefaultArm()
+{
+    int r = 0;
+    for (int m = 0; m < 2; m++)
+    {
+        Lambda<int(int)> z = m ? (int a) => { return a + 20; } : default;
+        Lambda<int(int)> w = t209PickLD(m);
+        if (z != nullptr) r = r + z(1);
+        if (w == nullptr) r = r + 100;
+    }
+    return r;
+}
+
+int t209Cell(int cell, int m)
+{
+    if (cell == 0) { Lambda<int(int)> z = m ? (int a) => { return a + 20; } : t197Mk(5); return z(1); }
+    if (cell == 1) { Lambda<int(int)> z = m ? t197Mk(5) : (int a) => { return a + 20; }; return z(1); }
+    if (cell == 2) { Lambda<int(int)> z = t197Fn1; z = m ? (int a) => { return a + 20; } : t197Mk(5); return z(1); }
+    if (cell == 3) { Lambda<int(int)> z = t197Fn1; z = m ? t197Mk(5) : (int a) => { return a + 20; }; return z(1); }
+    if (cell == 4) { return t197Apply(m ? (int a) => { return a + 20; } : t197Mk(5), 1); }
+    if (cell == 5) { return t197Apply(m ? t197Mk(5) : (int a) => { return a + 20; }, 1); }
+    if (cell == 6) { return t209PickLT(m)(1); }
+    if (cell == 7) { return t209PickFT(m)(1); }
+    if (cell == 8) { return (m ? (int a) => { return a + 20; } : t197Mk(5))(1); }
+    if (cell == 9) { return (m ? t197Mk(5) : (int a) => { return a + 20; })(1); }
+    if (cell == 10) { int acc = 0; acc = acc + (m ? (int a) => { return a + 20; } : t197Mk(5))(1); return acc; }
+    if (cell == 11) { int acc = 0; acc = acc + (m ? t197Mk(5) : (int a) => { return a + 20; })(1); return acc; }
+    if (cell == 12) { Lambda<int(int)> z = m ? (int a) => { return a + 20; } : (int a) => { return a + 30; }; return z(1); }
+    if (cell == 13) { return t197Apply(m ? (int a) => { return a + 20; } : (int a) => { return a + 30; }, 1); }
+    if (cell == 14) return t209PickLL(m)(1);
+    Lambda<int(int)> z = m ? t197Mk(5) : ((int a) => { return a + 20; });
+    return z(1);
+}
+
+int t209Run(int cell)
+{
+    int acc = 0;
+    int i = 0;
+    while (i < 200)
+    {
+        acc = acc + t209Cell(cell, i % 2);
+        i++;
+    }
+    return acc;
 }
 
 extern int main()
@@ -4606,6 +4740,108 @@ extern int main()
     // === Leak oracle: everything above must have freed on scope exit ===
     u64 leaks = HeapAudit.reportLeaks();
     total++; passed += Test("HeapAudit live allocations", (i64)leaks, (i64)0);
+
+    // T197: every ternary shape with a temp closure arm, both arm orders, m = 0 and 1. Each cell
+    // must sum to the selected arms (temp 42, other 11, named fn 2, mk(6) 43) and free all of it.
+    {
+        int t197K = 10;
+        Lambda<int(int)> t197Other = (int a) => { return a + t197K; };
+        // `other` owns its env and stays live here, so each cell is measured against that baseline.
+        i64 t197Base = (i64)HeapAudit.reportLeaks();
+        for (int cell = 0; cell < 12; cell++)
+        {
+            int expectSum = 5300;
+            if (cell == 10) expectSum = 8500;
+            if (cell == 11) expectSum = 4400;
+            int got = t197RunCell(cell, t197Other);
+            total++; passed += Test("T197 ternary temp closure arm value", got, expectSum);
+            total++; passed += Test("T197 ternary temp closure arm freed", (i64)HeapAudit.reportLeaks() - t197Base, (i64)0);
+        }
+        // Round 2 cells: 12-14 list.add (temp/other, other/temp, temp/temp); 15 nested temp callee
+        // over a local lo (m=1,k=1 -> 42; m=1,k=0 -> 2; m=0 -> lo 40); 16 nested lo callee (m=1,k=0 -> 44).
+        for (int cell = 12; cell < 17; cell++)
+        {
+            int expectSum = 5300;
+            if (cell == 14) expectSum = 8500;
+            if (cell == 15) expectSum = 6200;
+            if (cell == 16) expectSum = 8200;
+            // Per-cell baseline: the cells above leak on master, which would skew a shared base.
+            i64 t197Before = (i64)HeapAudit.reportLeaks();
+            int got = t197RunNest(cell, t197Other);
+            total++; passed += Test("T197 ternary closure arm value (round 2)", got, expectSum);
+            total++; passed += Test("T197 ternary closure arm freed (round 2)", (i64)HeapAudit.reportLeaks() - t197Before, (i64)0);
+        }
+    }
+
+    // T209: cells 0-11 and 15 pair a lambda literal with mk(5) (sum 6300); cells 12-14 pair two
+    // literals (sum 5200). Every closure a cell makes is freed by the time the cell returns.
+    {
+        for (int cell = 0; cell < 16; cell++)
+        {
+            int expectSum = 6300;
+            if (cell >= 12 && cell <= 14) expectSum = 5200;
+            i64 t209Before = (i64)HeapAudit.reportLeaks();
+            int got = t209Run(cell);
+            total++; passed += Test("T209 ternary lambda literal arm value", got, expectSum);
+            total++; passed += Test("T209 ternary lambda literal arm freed", (i64)HeapAudit.reportLeaks() - t209Before, (i64)0);
+        }
+    }
+    total++; passed += Test("T209 ternary lambda literal beside default arm", t209DefaultArm(), 121);
+
+    // T202-1: overwriting a closure field through the implicit method receiver frees its old env.
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int value = 0;
+        {
+            T202ThisClosureBox box = default;
+            for (int i = 0; i < 1000; i++)
+            {
+                string captured = "abcdefghijklmnopqrstuvwxyz0123456789";
+                box.set(() => { return captured.length(); });
+            }
+            value = box.value();
+        }
+        u64 after = HeapAudit.reportLeaks();
+        total++; passed += Test("T202 this closure value", value, 36);
+        total++; passed += Test("T202 this closure overwrite frees old env", (i64)(after - before), (i64)0);
+    }
+
+    // T202-2: an explicit move through a generic method receiver also frees the prior field env.
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int value = 0;
+        {
+            T202MoveClosureBox<Lambda<int()>> box = default;
+            for (int i = 0; i < 1000; i++)
+            {
+                string captured = "abcdefghijklmnopqrstuvwxyz0123456789";
+                Lambda<int()> next = () => { return captured.length(); };
+                box.take(move next);
+            }
+            value = box.value();
+        }
+        u64 after = HeapAudit.reportLeaks();
+        total++; passed += Test("T202 generic move closure value", value, 36);
+        total++; passed += Test("T202 generic move closure overwrite frees old env", (i64)(after - before), (i64)0);
+    }
+
+    // T202-3: dictionary closure aliases forward the backing slot and release it once at teardown.
+    {
+        u64 before = HeapAudit.reportLeaks();
+        {
+            dictionary<int, Lambda<int()>> values = default;
+            string captured = "dictionary closure";
+            Lambda<int()> next = () => { return captured.length(); };
+            values.add(1, next);
+            total++; passed += Test("T202 dictionary get closure alias", values.get(1)(), 18);
+            total++; passed += Test("T202 dictionary index closure alias", values[1](), 18);
+            int slot = 0;
+            while (!values.slotOccupied(slot)) slot++;
+            total++; passed += Test("T202 dictionary valueAt closure alias", values.valueAt(slot)(), 18);
+        }
+        u64 after = HeapAudit.reportLeaks();
+        total++; passed += Test("T202 dictionary closure alias frees once", (i64)(after - before), (i64)0);
+    }
 
     // === Bug 10: globals are destructed on main's normal return (see _gLeakGate above) ===
     // Populated after the oracle above so it still sees zero; _gLeakGate's destructor re-audits

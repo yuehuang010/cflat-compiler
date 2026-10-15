@@ -4110,6 +4110,10 @@ private:
     std::string sourceFileName;
     std::string importNamespace_;
     unsigned addressOfOperandDepth_ = 0;
+    // Owning rvalue receivers of operator-> forwarding (`mk()->v`) registered for end-of-statement
+    // destruction by the postfix chain in progress. ParsePostfixExpression drops them again when the
+    // chain's result borrows from them (pointer, alias), keeping the pre-existing no-free behaviour.
+    std::vector<llvm::Value*> arrowOwnedTemps_;
     std::unordered_map<CFlatParser::FunctionDefinitionContext*,
         std::unordered_set<std::string>> functionLocalEnumNamesCache_;
 
@@ -6214,8 +6218,7 @@ public:
      * handed. A NULL box is neutral - it owns nothing, deleting it is a no-op - so it neither arms
      * nor poisons the tag. Everything else either proves a borrow or poisons the local for good.
      */
-    void TagInterfaceBoxProvenance(const std::string& varName, llvm::Value* fatValue,
-                                   const LLVMBackend::NamedVariable* sourceNV = nullptr);
+    void TagInterfaceBoxProvenance(const std::string& varName, llvm::Value* fatValue);
 
     // True when any boxing site reachable through `fatValue` (following '?:' joins) boxed a heap
     // object whose ownership it took over. Answers a join through the arms' data pointers.

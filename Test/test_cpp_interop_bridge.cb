@@ -98,6 +98,7 @@ import cpp "vector";
 import cpp "string";
 import cpp "memory";
 import cpp "functional";
+import "diagnostic/heap_audit.cb";
 import cpp "chrono";
 import cpp "complex";
 import cpp "deque";
@@ -1725,6 +1726,38 @@ namespace cbgen { T quad<T>(T x) { return x * 4; } }
 std.function<int(int)> bridge_return_lambda()
 {
     return (int x) => { cbCallableCalls++; return x * 7; };
+}
+using T208Fn = std.function<int(int)>;
+int t208LambdaResultCalls = 0;
+int t208LambdaResultSelected = 0;
+int t208LambdaResultOverload(int x)
+{
+    t208LambdaResultSelected = 1;
+    return x + 6;
+}
+double t208LambdaResultOverload(double x)
+{
+    t208LambdaResultSelected = 2;
+    return x + 60.0;
+}
+T208Fn t208LambdaResultMaker()
+{
+    Lambda<T208Fn()> maker = () => {
+        return std.function<int(int)>(t208LambdaResultOverload);
+    };
+    return maker();
+}
+T208Fn t208LambdaResultResourceMaker()
+{
+    Lambda<T208Fn()> maker = () => {
+        string captured = "abcdefghijklmnopqrstuvwxyz0123456789";
+        Lambda<int(int)> inner = (int x) => {
+            t208LambdaResultCalls++;
+            return x + (int)captured.length();
+        };
+        return move inner;
+    };
+    return maker();
 }
 struct BridgeFnHolder { std.function<int(int)> fn; };
 // Capturing closures returned as std.function: a literal (its write to `n` persists per call)
@@ -3924,6 +3957,18 @@ extern int main(int argc, char** argv)
     cbBoxDestroyed = 0;
     if (cbRunMakeBox() != 78)                       return 637;
     if (cbBoxDestroyed != 2)                        return 638;
+    // A Lambda<Fn()> returns a nontrivial C++ class through its closure thunk (T208).
+    t208LambdaResultSelected = 0;
+    T208Fn t208LambdaResult = t208LambdaResultMaker();
+    if (t208LambdaResult(2) != 8 || t208LambdaResultSelected != 1) return 644;
+    HeapAudit.enable();
+    int t208HeapBase = (int)HeapAudit.reportLeaks();
+    t208LambdaResultCalls = 0;
+    {
+        T208Fn t208ResourceResult = t208LambdaResultResourceMaker();
+        if (t208ResourceResult(5) != 41 || t208LambdaResultCalls != 1) return 645;
+    }
+    if ((int)HeapAudit.reportLeaks() != t208HeapBase) return 646;
     // A function whose signature converts to the std.function's binds through a converting
     // thunk. Pre-fix (master) the function was handed over as the TARGET pointer type, so
     // f(-5) read an int return as long (4294967292) and an int argument as long; values match
