@@ -17,3 +17,8 @@ drops `const` everywhere (const-unenforced ruling), so today no local is constan
 fold a const local with a constant initializer in FoldCompileTimeIdentifier (cflat/MainListener.h, where a
 scoped local returns nullopt) and emit a fixed array; add a leg next to t206_ns_nonconst_vla_not_file_const.
 If no: close this item and keep the VLA convention.
+
+## Ruling 2026-10-15 (item 2): deferred to const-for-variables
+Keep the VLA convention for now (`const` is still unenforced, so `K` may be reassigned and folding would be unsound).
+The maintainer's next language feature is enforced `const` for variables; once it lands, a const local with a constant
+initializer folds to a fixed array dimension (clang parity, `sizeof` = 5). Do not fold before that feature lands.

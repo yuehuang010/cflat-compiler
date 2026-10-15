@@ -9,3 +9,7 @@ scratch/rev_t117_rv.h.
 Fix direction: decide whether unions may hold non-trivial C++ classes at all (C++ requires the
 user to manage the active member; a refusal may be the CFlat-correct answer) - needs a ruling; if
 allowed, the named member of a union brace init must be constructed in place.
+
+## 2026-10-15: no ruling yet
+Maintainer is researching union semantics (C++: non-trivial member deletes the union's special members). Do not start
+either direction (refuse vs construct in place) until ruled.

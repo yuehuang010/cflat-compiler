@@ -44,3 +44,8 @@ move fixed by T231.)
   Base-class slot with a derived ctor `construct_at(bslot, D(3))`: 4/3, clang 3/2 (extra copy before the slice).
   `construct_at(ps, MkP(3))` with ps a CFlat struct pointer is refused "cannot assign a struct value to a pointer
   variable" (master too).
+
+## Ruling 2026-10-15 (`new S(mk1())`): brace init only
+CFlat structs get no paren/copy-constructor init surface: `new S(mk1())` stays refused, with a steer to the brace form
+`new S{ c = mk1() }` (improve the message from "no overload of 'S'"). The extra copy from `Cxx x = (mk1());` (107 vs clang 7)
+is a bug: parentheses never add a copy - fix it.

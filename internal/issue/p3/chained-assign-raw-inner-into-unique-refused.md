@@ -37,3 +37,7 @@ Repro (item 1):
   (cases/mk_two.cb); `raw = (c ? new PS[3] : nullptr); owner = raw;` into `unique PS*` 1 of 3 dtors
   (cases/arr_tern_two.cb - should refuse an array into a scalar unique); `PS* other = new PS();
   raw = (c ? new PS() : other);` 1 dtor where 2 are expected (cases3/tern_owned_two_nouse.cb).
+
+## Ruling 2026-10-15 (T250): two-statement form refused
+`r.raw = new PS(); owner = r.raw;` is refused exactly like `unique PS* owner = r.raw;` and the chained form - assignment
+and declaration agree. Steer: `owner = move r.raw;` or `owner = new PS();`.

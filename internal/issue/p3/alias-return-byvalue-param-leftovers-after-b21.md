@@ -31,3 +31,12 @@ Open:
    CollectAddressAliasWholeNameStores tracks `&param` aliases but not `alias T a = param`.
 
 RULED 2026-10-01 (maintainer): item 5 RATIFIED - an extern "C" callee owns its by-value owning params; `ef(a)` moves `a` and a later read is "use of moved variable". No caller-side copy.
+
+## Ruling 2026-10-15
+- (T216 / item 4) `alias` qualifies POINTERS only. `string`, although a pointer underneath, is treated as a primitive
+  type, so `alias string` is an error wherever it is spelled (return type, local, param) - not only the rebound-param
+  return T216 refuses today. The 22 `alias string` sites are all in Test/ (none in core/ or example/): move their intent
+  to an err_ leg; err_alias_return_rebound_string_param.cb becomes a special case of the general refusal. Item 1's
+  `alias string a = s` rebind (rc 134) disappears with it.
+- (item 3, btree `*p = namedAlias`) ON HOLD: no btree work until the maintainer reopens it. Leave the named-local form
+  accepted as today.

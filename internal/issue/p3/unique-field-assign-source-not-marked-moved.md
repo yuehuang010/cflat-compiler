@@ -23,3 +23,8 @@ Open:
    inside the ternary arm and the borrow in the sibling call argument are not ordered/checked).
 4. PRE-EXISTING (master too): `alias UniqueBox r = s; ... s = move u;` aborts at run time (rc 133,
    malloc free check) - whole-struct move into a struct that has a live `alias` local.
+
+## Ruling 2026-10-15 (T230 leg `unique_field_coalesce_assign_other_alive`): both `??` arms are maybe-moved
+`c.item = a.item ?? b.item;` marks BOTH arms maybe-moved, like a conditional local move (Rust semantics): a later
+`b.item->id` (or `a.item->id`) is refused until the field is reassigned. The read-only leg at Test/test_move.cb ~1725
+that pins `b.item` readable is superseded by this ruling - convert it to an err_ leg (the one sanctioned edit of it).

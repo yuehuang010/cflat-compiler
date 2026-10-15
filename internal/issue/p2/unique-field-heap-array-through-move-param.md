@@ -137,3 +137,31 @@ No work on the raw-heap-array / delete-form / unique-adoption area until the mai
 it. Do not re-raise the runtime-trap question and do not start check 4 of
 internal/plan/delete-form-static-analysis.md. Related held item:
 `p3/new-pointer-array-count-form-unparseable.md` (grammar only, but it borders this area).
+
+## Discussion 2026-10-15 (NOT ruled; still ON HOLD)
+
+Maintainer is not ready to rule; recorded so the next pass starts here. The 2026-09-04 hold stands.
+
+- Context restated: CFlat rejected the C++ array cookie in favour of `array<T>` (core/array.cb, owning `{ T* _ptr; int _len; }`);
+  `new T[n]` pairs with user-counted `delete[n]`. C++ `unique_ptr<T>(new T[3])` is silent UB, so a runtime trap (option 4)
+  would be stricter than C++. Earlier attempt to make `new T[n]` return `array<T>` hit the blast-radius wall.
+- `unique Y[]` today: refused for local and field ("array views are not supported"); see also
+  p3/unique-local-view-diagnostic-doubles-brackets.
+- Maintainer idea 1: add `unique T[]` (would be the `array<T>` layout - likely a spelling of it, not a second owned-array type)
+  and block array -> unique pointer. Alone it does not close this issue: inside `stash` nothing says `p` is an array
+  (the 2026-09-02 spike: 0 true / 5 false positives).
+- Maintainer idea 2 (direction under consideration): `new T[n]` decays to a plain `T*` (legal, usable, passable), but it is NOT
+  MOVABLE at a call site - it cannot bind to an owning `move T*` sink:
+  ```cflat
+  stash(&h, new Y[3]);                 // would be refused
+  Y* q = new Y[3]; stash(&h, move q);  // would be refused (q has new[] provenance)
+  ```
+  Then `move T*` always means one object, this issue closes statically (no runtime trap), and the hidden
+  `.raw_array_count` ABI on `move T*` becomes dead. Accepted residual: wrong `n` in `delete[n]` and provenance-lost pointers
+  (raw field, arithmetic, cast) stay the user's job ("new T[] pure, size up to the user" - maintainer notes it can lead to
+  mistakes; the held delete-form plan is the mitigation where provenance is precise).
+- Open questions for the ruling:
+  1. Does a new[] block still go to a counted `move T[]` sink (`move int[] _newStamp() { return new int[n]; }` regex.cb:859,
+     `move VrS[] VrMake` test_cpp_interop:1243)? Recommendation: keep `move T[]`, close only `move T*`.
+  2. Exempt trivially destructible T? core string.cb passes `new i8[32]` to `_strOwned(move i8* buf)`. Recommendation: exempt.
+  3. Spike before ruling: count `new T[n]` sites reaching a `move T*` today, split by destructible element type.

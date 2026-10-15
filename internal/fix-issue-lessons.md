@@ -3533,3 +3533,25 @@ before the ruling: 0 sites in core / examples / test_libs, 29 Test lines (T151 s
   literal, T182 treated an implicit-this int field as the same-named global function (`functionTable.find(text)`). Decide from
   the parse-tree shape or the resolved symbol, in codegen lookup order (local/param, implicit-this field, global, function).
   Now a line in the common implementer brief; reviewers probe a same-named field / local for any name-based gate.
+
+## Ruling 2026-10-15: owed rulings from fix box 2026-10-14b
+Per-item detail lives in the named issue file; durable decisions here.
+- Methods on raw unconstructed heap memory (T202: `NB* n = (NB*)malloc(..); n->set(f);` frees a garbage closure env) are
+  UB, as in C++: the user constructs first (`construct_at`). No refusal, no skip path; closed.
+- Unevaluated operands (`sizeof(helper(n))` etc.) run ALL diagnostics, ownership/flow included. The only exception is a dead
+  `if const` branch, which behaves like `#ifdef`. p3 sizeof-operand-ownership-diagnostic-fires closed as intended.
+- C++ ctor overload picks follow the no-implicit-narrowing-at-call-args rule: `CharSel(char,int)` /
+  `CharSel(const int&, const char*)` with `int x; CharSel(x, 1)` is refused (clang narrows). Correct; spell `(char)x`.
+- `alias` is for pointers; `string` counts as primitive, so `alias string` is an error everywhere
+  (p3/alias-return-byvalue-param-leftovers-after-b21).
+- Namespace lookup never silently picks wrong: C++ order, else refuse as ambiguous (qualify or import alias); a var and a
+  function of one name in one scope are a redefinition (p2/namespace-global-var-shadowing-function-miscompiles).
+- Last-use param `S y = s;` moves (compiler infers copy/move); no clang parity for that shape.
+- `??` / join over unique fields: both arms maybe-moved, later reads refused until reassigned. Field re-init clears the
+  moved mark on every consume path. Raw field -> unique slot by `=` refused like the declaration (assignment = declaration).
+- Fewer-params lambda bind: env-free sources only (non-capturing value, named function); capturing needs `move L`.
+- CFlat structs have no paren/copy-ctor init surface (`new S(mk1())` refused, use braces); parentheses never add a copy.
+- On hold / open: btree `*out = namedAlias` (no btree work), union with non-trivial C++ member (maintainer researching),
+  const-local array dimension (waits for enforced const-for-variables, the next feature).
+- Heap array through `move T*` into a unique field (p2/unique-field-heap-array-through-move-param) stays ON HOLD; the
+  2026-10-15 discussion (new[] not movable at a call site, `unique T[]`) is recorded in that file, not ruled.

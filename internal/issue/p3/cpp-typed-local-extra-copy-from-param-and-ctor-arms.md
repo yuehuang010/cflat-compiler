@@ -1,6 +1,6 @@
 # Spelled-type C++ class locals make copies/moves C++ elides
 
-Re-measured 2026-10-15 on master 614704be1 against clang++ -std=c++20 (probes and matrix:
+Re-measured 2026-10-15 on master 33b7ad940 against clang++ -std=c++20 (probes and matrix:
 scratch/t229_tmp/, scratch/t229_matrix.md in the fix/t229-typedlocalcopy worktree). Values and
 destructor pairing are correct everywhere; only the counts below differ.
 
@@ -34,3 +34,8 @@ as R2 on the constructor-argument path.
 
 None added: no shape in items 1-3 fails on the pre-fix build, so no leg would be a regression test
 for a change here. Existing legs 7300-7341 (Test/test_cpp_interop.cb) keep their counts.
+
+## Ruling 2026-10-15 (T229 legs 7340/7341): keep CFlat's last-use move
+`void f(S s) { S y = s; }` with `s` dead afterwards MOVES (copy 1 + move 1), typed and `auto` alike. The compiler infers
+copy vs move (design north star); clang's copy here is not a parity target. Drop the clang-parity claim for this shape;
+legs 7340/7341 stay as they are.

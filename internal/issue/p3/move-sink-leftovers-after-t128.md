@@ -23,3 +23,8 @@ items 1-3 landed in T227 and were removed; each remaining item is its own repro 
     (`t.p = UG`, c21c/c21d). Refused on master and fix: `sink(f ? u : nullptr)` (c16) and `*(f ? u : q)` (c26).
     A two-field interface join `t.item = f ? s.item : s2.item` (c25d) now compiles and nulls only at run time,
     like the non-interface two-field join: a later read of the taken field derefs null instead of a diagnostic.
+
+## Ruling 2026-10-15 (item 4): re-init clears the moved mark
+`mv(s.p); s.p = new P(); s.p->v` is legal: reassigning a consumed field clears its moved mark, as for a local and as T230
+already does for the `t.p = s.p` path. Direct and ternary sink forms alike. Check whether T230 already covers the call-sink
+path before implementing (may be stale).
