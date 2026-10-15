@@ -1061,6 +1061,12 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         {
             if (!cxxSretReturn && !compiler->currentFunctionReturnTV.Pointer)
                 trivialCxxMoveSite_ = TopLevelMoveExpression(assignExpr);
+            // Restored on scope exit, so an expect_error throw inside the operand cannot leave it set.
+            struct ReturnOperandScope {
+                const llvm::Function*& slot; const llvm::Function* outer;
+                ~ReturnOperandScope() { slot = outer; }
+            } returnOperandScope{ compiler->returnOperandFunction_, compiler->returnOperandFunction_ };
+            compiler->returnOperandFunction_ = compiler->currentFunction;
             returnNV = ParseAssignmentExpressionNamed(assignExpr, ResultUse::ReturnOperand);
             trivialCxxMoveSite_ = nullptr;
             // A generic instantiation returned as a function value (`return dbl<int>;`) is bound to its
@@ -1248,7 +1254,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             }
             // The operand IS a classified call result (a ternary of calls shares one slot):
             // the calls build straight into the return slot instead.
-            if (!defaultValue && returnNV.Primary != nullptr && returnNV.Storage == nullptr
+            // A parenthesized operand names the join temp as its storage: the same retarget as the bare form.
+            if (!defaultValue && returnNV.Primary != nullptr
+                && (returnNV.Storage == nullptr || returnNV.Storage == compiler->lastLoweredRetTemp_)
                 && returnNV.Primary == compiler->lastLoweredRetValue_)
                 if (auto* temp = llvm::dyn_cast_or_null<llvm::AllocaInst>(
                         compiler->lastLoweredRetTemp_);

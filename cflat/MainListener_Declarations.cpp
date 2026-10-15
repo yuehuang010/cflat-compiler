@@ -38,6 +38,77 @@ static std::string CoreUniqueArrayViewMessage(const std::vector<std::string>& ty
             typeArgs.empty() ? std::string() : typeArgs[0]);
     }
 
+static bool SubtreeContainsCall(antlr4::tree::ParseTree* node)
+{
+        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node);
+            postfix != nullptr && !postfix->argumentExpressionList().empty())
+            return true;
+        for (auto* child : node->children)
+            if (SubtreeContainsCall(child)) return true;
+        return false;
+    }
+
+// A subscript may be a C++ operator[] call, so a unary over one keeps the call route.
+static bool SubtreeContainsCallOrSubscript(antlr4::tree::ParseTree* node)
+{
+        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node);
+            postfix != nullptr && (!postfix->argumentExpressionList().empty() || !postfix->expression().empty()))
+            return true;
+        for (auto* child : node->children)
+            if (SubtreeContainsCallOrSubscript(child)) return true;
+        return false;
+    }
+
+static bool IsSoleOperatorExpression(antlr4::tree::ParseTree* node)
+{
+        if (auto* assign = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+        {
+            if (assign->assignmentOperator() != nullptr) return false;
+            return assign->conditionalExpression() != nullptr
+                && IsSoleOperatorExpression(assign->conditionalExpression());
+        }
+        if (auto* cond = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
+        {
+            if (cond->Question() != nullptr || cond->QuestionQuestion() != nullptr) return false;
+            return cond->logicalOrExpression() != nullptr
+                && IsSoleOperatorExpression(cond->logicalOrExpression());
+        }
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+            primary != nullptr && primary->expression() != nullptr && primary->children.size() == 3)
+            return IsSoleOperatorExpression(primary->expression());
+        // A unary operand is parsed without a fold scope: a call inside it would take the slot.
+        // A plain postfix/primary unary falls through, so `(a + f(2))` reaches its parens.
+        if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
+            unary != nullptr && unary->unaryOperator() != nullptr)
+            return unary->Sizeof().empty() && !SubtreeContainsCallOrSubscript(unary);
+        if (auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(node);
+            ctx != nullptr && ctx->children.size() == 1)
+            return IsSoleOperatorExpression(ctx->children[0]);
+        if (auto* ctx = dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(node))
+            return ctx->children.size() > 1;
+        if (auto* ctx = dynamic_cast<CFlatParser::AdditiveExpressionContext*>(node))
+            return ctx->children.size() > 1;
+        if (auto* ctx = dynamic_cast<CFlatParser::ShiftExpressionContext*>(node))
+            return ctx->children.size() > 1;
+        if (auto* ctx = dynamic_cast<CFlatParser::RelationalExpressionContext*>(node))
+            return ctx->children.size() > 1;
+        if (auto* ctx = dynamic_cast<CFlatParser::TypeCheckExpressionContext*>(node))
+            return ctx->children.size() > 1;
+        if (auto* ctx = dynamic_cast<CFlatParser::EqualityExpressionContext*>(node))
+            return ctx->children.size() > 1;
+        if (auto* ctx = dynamic_cast<CFlatParser::AndExpressionContext*>(node))
+            return ctx->children.size() > 1;
+        if (auto* ctx = dynamic_cast<CFlatParser::ExclusiveOrExpressionContext*>(node))
+            return ctx->children.size() > 1;
+        if (auto* ctx = dynamic_cast<CFlatParser::InclusiveOrExpressionContext*>(node))
+            return ctx->children.size() > 1;
+        if (auto* ctx = dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(node))
+            return ctx->children.size() > 1;
+        if (auto* ctx = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(node))
+            return ctx->children.size() > 1;
+        return false;
+    }
+
 bool MainListener::InGenericInstantiation() const {
         return !activeTypeSubstitutions.empty() || !activeValueSubstitutions.empty()
             || !activePackSubstitutions.empty();
@@ -3590,6 +3661,23 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             || (!fn->empty() && cflat_llvm::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr))
             return;
 
+        if (paramTypeList != nullptr && paramTypeList->parameterList() != nullptr
+            && !compiler->stackNamedVariable.empty())
+        {
+            const auto declarations = paramTypeList->parameterList()->parameterDeclaration();
+            const size_t count = std::min(params.size(), declarations.size());
+            auto& arguments = compiler->stackNamedVariable.back().functionArgument;
+            for (size_t i = 0; i < count; ++i)
+            {
+                if (!params[i].IsFunctionPointer
+                    || !DeclSpecHasConst(declarations[i]->declarationSpecifiers()))
+                    continue;
+                if (auto argument = arguments.find(params[i].VariableName);
+                    argument != arguments.end())
+                    argument->second.IsTopLevelConst = true;
+            }
+        }
+
         struct ActiveLocalEnumFunctionScope
         {
             LLVMBackend* backend;
@@ -4367,8 +4455,7 @@ CFlatParser::AssignmentExpressionContext* MainListener::SoleAssignmentExpression
         if (ctx == nullptr) return nullptr;
         if (ctx->children.size() == 1) return SoleAssignmentExpression(ctx->children[0]);
         if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(ctx);
-            primary != nullptr && primary->expression() != nullptr && primary->children.size() == 3
-            && primary->children[0]->getText() == "(")
+            primary != nullptr && primary->expression() != nullptr && primary->children.size() == 3)
             return SoleAssignmentExpression(primary->expression());
         return nullptr;
     }
@@ -4383,17 +4470,12 @@ CFlatParser::ConditionalExpressionContext* MainListener::SoleTernaryExpression(
         if (ctx == nullptr) return nullptr;
         if (ctx->children.size() == 1) return SoleTernaryExpression(ctx->children[0]);
         if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(ctx);
-            primary != nullptr && primary->expression() != nullptr && primary->children.size() == 3
-            && primary->children[0]->getText() == "(")
+            primary != nullptr && primary->expression() != nullptr && primary->children.size() == 3)
         {
-            // Through parens only for assignment arms: other arms (scalars for a converting ctor,
-            // nested mixed ternaries) keep the call/convert route that already handles them.
             auto* inner = SoleTernaryExpression(primary->expression());
             if (inner == nullptr || inner->expression() == nullptr || inner->conditionalExpression() == nullptr)
                 return nullptr;
-            return SoleAssignmentExpression(inner->expression()) != nullptr
-                    || SoleAssignmentExpression(inner->conditionalExpression()) != nullptr
-                ? inner : nullptr;
+            return inner;
         }
         return nullptr;
     }
@@ -5513,9 +5595,10 @@ cxx_dtor_ready:
         const std::string pfText = pf != nullptr ? pf->getText() : std::string();
         // `(T)expr` invoking a C++ conversion operator produces T exactly like a call does.
         const bool castInit = pf == nullptr && assign->getText().starts_with("(" + typeName + ")");
-        // A parenthesized ternary is a single postfix expression ending in ')': it is not a call,
-        // so it takes the ternary route below like the bare spelling.
-        if (((!pfText.empty() && pfText.back() == ')') && SoleTernaryExpression(assign) == nullptr)
+        // A parenthesized ternary or operator ends in ')' but is not a call: it takes the route
+        // of its bare spelling (ternary below, operator at the armed-slot test).
+        if (((!pfText.empty() && pfText.back() == ')') && SoleTernaryExpression(assign) == nullptr
+                && !IsSoleOperatorExpression(assign))
             || castInit)
         {
             // An assignment hides the slot from its operands and shows it only to its own
@@ -5599,20 +5682,18 @@ cxx_dtor_ready:
             return true;
         }
 
-        // A non-member C++ operator can also return this class by value. Let its normal call
-        // path construct directly into the declared slot, just as a direct function call does.
-        // The armed slot is taken by the FIRST call returning T, so it is only safe when no
-        // operand is itself a call (`a * b`, `-a`): in `make_v(1.0) * 4.0` or `(a + b) * c` the
-        // inner call would construct into the slot and the outer result would be lost. Those
-        // spellings take the temporary-then-move path below instead.
+        // A top-level operator result may construct directly into the declared slot. BINARY
+        // operand parsing scopes this slot away from nested calls; a unary operand with a call
+        // is not armed (IsSoleOperatorExpression), since its operand parse has no such scope.
         // A ternary has two independent control-flow arms. Do not arm the ordinary first-call
         // slot for it: ParseTernaryBranches moves each arm's own return temporary into the slot.
         // A trivially copyable class (admitted for its converting ctor) joins its '?:' arms as
         // a value: a class arm is a plain copy, an enum join converts below.
         const bool ternaryInit = SoleTernaryExpression(assign) != nullptr
             && compiler->IsForeignNontrivialCxxClass(typeName);
+        // A call-free initializer (`x[0]`, `a.b`, `-a`) has no inner call to take the slot.
         const bool armedOperator = SoleTernaryExpression(assign) == nullptr
-            && (assign->getText().find('(') == std::string::npos
+            && (assign->getText().find('(') == std::string::npos || IsSoleOperatorExpression(assign)
                 || SoleAssignmentExpression(assign) != nullptr);
         compiler->lastCxxRetTemp_ = nullptr;
         compiler->lastCxxRetValue_ = nullptr;
@@ -6507,6 +6588,14 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
 
         for (auto initDecl : initDeclarVec)
         {
+            // Receiver temps an alias initializer takes off the ledger (`alias int x = mk()->v;`) are
+            // settled below; a declarator that never reaches that point leaves them unfreed (no UAF).
+            struct AliasDeclTempScope
+            {
+                LLVMBackend* backend;
+                size_t mark;
+                ~AliasDeclTempScope() { backend->DiscardAliasDeclTemps(mark); }
+            } aliasTemps{ compiler, compiler->MarkAliasDeclTemps() };
             typeAndValue = parsedTypeAndValue;
             LLVMBackend::UnwindInitScope unwindInit(*compiler);
             // Each init-declarator is a full expression: land its postfix ++/-- before the next
@@ -7407,8 +7496,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 autoDeclTernaryInit_ = (typeAndValue.TypeName == "auto"
                                         || (isStaticLocal && compiler->IsCxxRecord(typeAndValue.TypeName)))
                                     && !typeAndValue.Pointer && !global_scope
-                                    && assignmentExpression->conditionalExpression() != nullptr
-                                    && assignmentExpression->conditionalExpression()->Question() != nullptr;
+                                    && SoleTernaryExpression(assignmentExpression) != nullptr;
                                 if (typeAndValue.TypeName == "auto" && !typeAndValue.Pointer
                                     && !typeAndValue.IsAlias && !global_scope)
                                     trivialCxxMoveSite_ = TopLevelMoveExpression(assignmentExpression);
@@ -7429,6 +7517,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 }
                                 trivialCxxMoveSite_ = nullptr;
                                 autoDeclTernaryInit_ = false;
+                                // A parenthesized produced value is spilled to a copy: the local adopts
+                                // the produced temp itself, as for the bare initializer (`(k ? a : b)`).
+                                if (rightNV.IsParenthesizedProducedTemp && rightNV.Storage != nullptr
+                                    && rightNV.Primary != nullptr
+                                    && rightNV.Primary == compiler->lastLoweredRetValue_
+                                    && compiler->lastLoweredRetTemp_ != nullptr)
+                                    rightNV.Storage = nullptr;
                                 if (compiler->lastCxxRetTemp_ != nullptr
                                     && rightNV.Storage == compiler->lastCxxRetTemp_
                                     && !rightNV.TypeAndValue.Pointer
@@ -8045,11 +8140,16 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // pointee at its own scope exit, so the copy owns nothing. Resolved by
                                 // STORAGE IDENTITY (a spelling that erased CallerName still resolves,
                                 // and a shadowing name cannot be mistaken for another binding).
-                                if (!rightNV.TypeAndValue.IsMove && rightNV.TypeAndValue.Pointer
+                                // A `move` PARAMETER read by name carries IsMove from its declaration;
+                                // only the `move` keyword on this expression transfers the pointer.
+                                if (!rightNV.IsExplicitMove && rightNV.TypeAndValue.Pointer
                                     && llvm::isa_and_nonnull<llvm::AllocaInst>(rightNV.Storage))
                                 {
                                     const auto* srcBind = compiler->FindVariableByStorage(rightNV.Storage);
-                                    if (srcBind != nullptr && srcBind->IsOwning)
+                                    // An owner moved out earlier in THIS block is null: its copy borrows nothing.
+                                    const bool srcMovedOutHere = srcBind != nullptr && srcBind->ExplicitlyMovedNull
+                                        && srcBind->ExplicitNullBlock == compiler->builder->GetInsertBlock();
+                                    if (srcBind != nullptr && srcBind->IsOwning && !srcMovedOutHere)
                                     {
                                         srcBorrowsOwningLocal = true;
                                         srcOwningLocalOrigin =
@@ -8452,6 +8552,23 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         if (self(self, child)) return true;
                                     return false;
                                 };
+                                // T250: `unique T* owner = raw = new T();` takes the inner local slot as
+                                // its source, exactly as `unique T* owner = raw;` does (the slot owns it).
+                                if (initializerSourceNV.IsBorrowed
+                                    && initializerSourceNV.ChainedAssignSlot != nullptr
+                                    && IsChainedAssignmentShape(assignmentExpression))
+                                {
+                                    const auto* slotVar = compiler->FindVariableByStorage(
+                                        initializerSourceNV.ChainedAssignSlot);
+                                    if (slotVar != nullptr && slotVar->IsOwning)
+                                    {
+                                        const auto chainPrimary = initializerSourceNV.Primary;
+                                        const std::string slotName = initializerSourceNV.ChainedAssignName;
+                                        initializerSourceNV = *slotVar;
+                                        initializerSourceNV.Primary = chainPrimary;
+                                        initializerSourceNV.CallerName = slotName;
+                                    }
+                                }
                                 bool initializerIsBorrowed = initializerSourceNV.IsBorrowed
                                     || initializerSourceNV.IsAliasBorrow
                                     || initializerSourceNV.TypeAndValue.IsAlias
@@ -9450,6 +9567,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         TagInterfaceBoxProvenance(name, right);
                     }
 
+                    // A bound alias (reference or pointer) keeps the temps its initializer read through
+                    // alive to this scope's end; an unbound one (`alias int x = byval(mk()->v);`) frees them
+                    // at the statement end as before.
+                    compiler->SettleAliasDeclTemps(aliasTemps.mark,
+                        bindAliasReference || typeAndValue.Pointer);
                     if (bindAliasReference)
                     {
                             auto& nv = compiler->GetOrCreateStackVariable(name);
@@ -10215,6 +10337,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             if (!borrowMoveKeepsBorrow)
                             {
                                 auto& nv = compiler->GetOrCreateStackVariable(name);
+                                // Copies of the moved-from owner now alias THIS local (`P* m = move n`).
+                                compiler->RetargetOwningLocalCopies(
+                                    compiler->FindMovedOutSourceSlot(right), name, nv.Storage);
                                 nv.IsOwning = true;
                                 nv.IsNewAllocated = true;
                                 // Carry per-site over-alignment so scope-exit / delete free via __delete_aligned.
@@ -10896,6 +11021,18 @@ void MainListener::EmitImplicitUniqueFieldMove(LLVMBackend::NamedVariable& right
         {
             if (const auto* join = compilerLLVM->FindUniqueFieldReadJoin(rightNV.Primary))
             {
+                // A global pointer arm is not heap-allocated: refuse it as the plain move would.
+                if (std::ranges::any_of(join->Sources, [](const auto& source) {
+                        return llvm::isa_and_nonnull<llvm::GlobalVariable>(source.Storage); }))
+                {
+                    compilerLLVM->LogErrorMessage(
+                        "call to '{}': cannot pass the address of a stack or global value to {} "
+                        "parameter '{}' - it takes ownership and frees the pointee at scope exit, "
+                        "but neither is heap-allocated and freeing it is undefined. Use '{}' to "
+                        "allocate on the heap, or drop '{}' if the callee only borrows.",
+                        { "reset", "'move'", "p", "new", "new" });
+                    return;
+                }
                 auto savedIP = compilerLLVM->builder->saveIP();
                 for (const auto& source : join->Sources)
                 {
@@ -10903,6 +11040,10 @@ void MainListener::EmitImplicitUniqueFieldMove(LLVMBackend::NamedVariable& right
                         || cflat_llvm::GetTerminatorOrNull(source.Block) == nullptr)
                         continue;
                     compilerLLVM->builder->SetInsertPoint(cflat_llvm::GetTerminatorOrNull(source.Block));
+                    // A single field source is null-tracked on its own path, as a plain consume is.
+                    // A join of two or more keeps the runtime nulling only (its other arm stays live).
+                    if (join->Sources.size() == 1 && !source.NullKey.empty())
+                        compilerLLVM->RecordNullSet(source.NullKey);
                     if (right->getType()->isPointerTy())
                         compilerLLVM->builder->CreateStore(
                             llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(right->getType())),

@@ -3105,3 +3105,114 @@ inline AmbigTarget::AmbigTarget(const AmbigSource& s) : v(s.v) {}
 inline AmbigSource::operator AmbigTarget() const { AmbigTarget out; out.v = v; return out; }
 inline int operator+(const AmbigTarget& a, const AmbigTarget& b) { return a.v + b.v; }
 }
+
+// T247: `new T()` value-initializes like C++: default member initializers run, a trivial aggregate
+// reads zero, a user default constructor runs as written, and a class-scope operator new is kept.
+#include <new>
+namespace cppnewdmi {
+struct Q { int a; int b; };
+struct P { int a = 5; int z = 9; };
+struct N { P in; int k = 2; };
+inline int dmiFn() { return 42; }
+struct F { int a = dmiFn(); int b = 3; };
+struct A { int arr[3] = {1, 2, 3}; int t = 8; };
+struct U { int v; U() : v(11) {} };
+struct R { Q q; int c; };
+struct S { int a = 4; };
+struct V { int a = 5; virtual ~V() {} };
+struct O {
+    int a = 6;
+    static void* operator new(std::size_t n) { return ::operator new(n); }
+    static void operator delete(void* p) { ::operator delete(p); }
+};
+struct Rf { int& r; int a = 2; };
+}
+
+// T252: `T(args)` / `new T(args)` on a C++20 aggregate is parenthesized aggregate init (P0960):
+// arguments initialize members in order, default member initializers run, and a class-scope
+// operator new is kept (its placement form is hidden, so the wrapper uses ::new).
+namespace cppnewagg {
+inline int made = 0, copies = 0, moves = 0, allocs = 0;
+inline void resetCounts() { made = 0; copies = 0; moves = 0; }
+struct Cnt {
+    int v;
+    Cnt(int x) : v(x) { made++; }
+    Cnt(const Cnt& o) : v(o.v) { copies++; }
+    Cnt(Cnt&& o) : v(o.v) { moves++; }
+};
+struct AG { int a; int b = 7; };
+struct AG2 { int a; int b; };
+struct AN { AG g; int c; };
+struct BaseA { int x; int y; };
+struct DerA : BaseA { int z; };
+struct CM { Cnt c; int k = 9; };
+struct AC {
+    int a; int b = 7;
+    static void* operator new(std::size_t n) { allocs++; return ::operator new(n); }
+    static void operator delete(void* p) { ::operator delete(p); }
+};
+struct alignas(32) AAL { int a; int b = 7; };
+inline int sumAG2(AG2 g) { return g.a * 10 + g.b; }
+inline AG mkAG(int x) { return AG(x); }
+}
+
+// T257: `new T(x)` copies the argument for a non-aggregate C++ record. The private member makes
+// NA non-aggregate while its implicit copy constructor remains trivial.
+namespace cppnewtriv {
+inline int ntCopies = 0, ncMoves = 0, allocs = 0;
+struct NA {
+    int a;
+private:
+    int b = 7;
+public:
+    int get() const { return b; }
+    void set(int value) { b = value; }
+};
+inline NA makeNA(int a, int b) { NA out; out.a = a; out.set(b); return out; }
+inline NA mkNA() { return makeNA(31, 42); }
+struct H { NA field; NA items[2]; };
+inline H makeH() {
+    H out;
+    out.field = makeNA(111, 122);
+    out.items[0] = makeNA(131, 142);
+    out.items[1] = makeNA(151, 162);
+    return out;
+}
+
+struct NT {
+    int value;
+    NT() = delete;
+    explicit NT(int v) : value(v) {}
+    NT(const NT& other) : value(other.value) { ntCopies++; }
+};
+
+struct NC {
+    int value;
+    explicit NC(int v) : value(v) {}
+    NC(const NC&) = delete;
+    NC(NC&& other) : value(other.value) { other.value = -1; ncMoves++; }
+};
+
+struct B {
+    int value;
+private:
+    int hidden;
+public:
+    void set(int v) { value = v; hidden = v + 100; }
+    int get() const { return hidden; }
+};
+struct Prefix { int pad; };
+struct D : Prefix, B { int tail; };
+
+struct O {
+    int value;
+private:
+    int hidden;
+public:
+    static void* operator new(std::size_t n) { allocs++; return ::operator new(n); }
+    static void operator delete(void* p) { ::operator delete(p); }
+    void set(int v) { value = v; hidden = v + 100; }
+    int get() const { return hidden; }
+};
+inline O makeO(int value) { O out; out.set(value); return out; }
+}

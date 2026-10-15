@@ -1664,7 +1664,11 @@ void LLVMBackend::ApplyFuncPtrSinkTransfer(const std::string& functionName,
         // (FuncPtrParamAsTypeAndValue carries IsMove); an INFERRED sink keeps IsMove false.
         std::vector<TypeAndValue> synth;
         for (size_t i = 0; i < params.size(); i++)
+        {
             synth.push_back(FuncPtrParamAsTypeAndValue(params[i], i));
+            // An unnamed function<> parameter reads as its position in sink diagnostics, not '0'.
+            synth.back().VariableName = std::format("parameter {}", i + 1);
+        }
         ApplyMoveParamTransfer(functionName, synth, args, /*paramsCarryAllocAlign*/ true,
             /*calleeIsMethod*/ false, beforeCall);
 }
@@ -1683,13 +1687,19 @@ void LLVMBackend::LogBorrowedPointerMoveSinkError(const std::string& sourceDescr
 
 void LLVMBackend::LogOwningLocalCopyMoveSinkError(const std::string& sourceName,
         const std::string& ownerName, const std::string& parameterName,
-        const std::string& functionName) const
+        const std::string& functionName, const llvm::Value* ownerStorage) const
 {
+        // A `move` parameter owns its pointee exactly as a local does; name the binding kind by
+        // storage, so a local shadowing a parameter name still reads "local".
+        const bool ownerIsParameter = ownerStorage != nullptr ? IsFunctionParameterStorage(ownerStorage)
+                                                              : IsFunctionParameter(ownerName);
+        const std::string ownerKind = ownerIsParameter ? "parameter" : "local";
         LogErrorMessage(
-            "cannot move borrowed pointer '{}' (copied from owning local '{}') into move parameter "
+            "cannot move borrowed pointer '{}' (copied from owning {} '{}') into move parameter "
             "'{}' of '{}' - '{}' still owns the pointee and frees it on scope exit. Pass '{}' "
             "itself with 'move {}' to transfer ownership, or pass a pointer that is not a copy.",
-            { sourceName, ownerName, parameterName, functionName, ownerName, ownerName, ownerName });
+            { sourceName, ownerKind, ownerName, parameterName, functionName, ownerName,
+              ownerName, ownerName });
 }
 
 void LLVMBackend::DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
@@ -1739,7 +1749,8 @@ void LLVMBackend::DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
             && OwningLocalCopyStillAliases(copy))
             LogOwningLocalCopyMoveSinkError(
                 arg.CallerName.empty() ? FindVariableNameByStorage(arg.Storage) : arg.CallerName,
-                copy.OwningLocalOrigin, paramName, SpellFunctionSymbol(*this, functionName));
+                copy.OwningLocalOrigin, paramName, SpellFunctionSymbol(*this, functionName),
+                copy.OwningLocalStorage);
 }
 
 void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,

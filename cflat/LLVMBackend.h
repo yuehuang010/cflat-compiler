@@ -2450,6 +2450,8 @@ public:
     {
         llvm::Value* Storage = nullptr;
         llvm::BasicBlock* Block = nullptr;
+        // The consumed field's null-state key (UniqueFieldNullKey); empty when untracked.
+        std::string NullKey;
     };
 
     struct UniqueFieldReadJoin
@@ -2491,7 +2493,9 @@ public:
     const NullCoalesceJoin* FindNullCoalesceJoin(const llvm::Value* value) const;
 
     // Record a direct unique-field load and carry the source slot(s) through a `?:` or `??` join.
-    void RegisterUniqueFieldRead(llvm::Value* value, llvm::Value* storage);
+    void RegisterUniqueFieldRead(llvm::Value* value, llvm::Value* storage,
+                                 const std::string& nullKey = {});
+    std::string UniqueFieldReadNullKey(const llvm::Value* value) const;
     void PropagateUniqueFieldRead(llvm::Value* trueValue, llvm::Value* falseValue,
                                   llvm::Value* joined);
     bool IsUniqueFieldReadValue(const llvm::Value* value) const;
@@ -3033,6 +3037,10 @@ private:
     // elements are destroyed in reverse; see RegisterOwnedBraceListTemp.
     struct PendingOwnedStructTemp { llvm::Value* Alloca; std::string TypeName; llvm::BasicBlock* Block; llvm::Value* LiveFlag = nullptr; uint64_t ArrayCount = 0; };
     std::vector<PendingOwnedStructTemp> pendingOwnedStructTemps;
+    // Receiver temps of the alias declarator in progress (see MarkAliasDeclTemps). They stay on the
+    // ledger until settled, so an initializer call that throws still unwinds them.
+    struct AliasDeclTemp { llvm::Value* Alloca; };
+    std::vector<AliasDeclTemp> aliasDeclTemps_;
 
     // Owning-POINTER call results (`move R*`) consumed as a SUBEXPRESSION operand, so no named
     // local ever adopts them (`if (makePtr() != nullptr)`). Pointer analog of the string/closure/
@@ -3156,6 +3164,20 @@ private:
     };
     std::vector<CxxThisEscapeGate> cxxThisEscapeGates_;
     void ResolveCxxThisEscapeGates();
+    // A direct CFlat call whose callee body is incomplete during the walk. Its temp release stays
+    // false until every recorded parameter is proven not to retain it after the walk.
+    struct DeferredCallReleaseEdge
+    {
+        std::string Callee;
+        unsigned ArgIndex = 0;
+    };
+    struct DeferredCallReleaseGate
+    {
+        llvm::WeakVH Init;
+        std::vector<DeferredCallReleaseEdge> Edges;
+    };
+    std::vector<DeferredCallReleaseGate> deferredCallReleaseGates_;
+    void ResolveDeferredCallReleaseGates();
     // A callee edge the return-keep walk could not answer yet: `Callee` is the function's NAME
     // (Function objects are replaced by the link), empty for an indirect call (never answered).
     struct ReturnReachEdge
@@ -3286,7 +3308,8 @@ private:
     void LogOwningLocalCopyMoveSinkError(const std::string& sourceName,
                                          const std::string& ownerName,
                                          const std::string& parameterName,
-                                         const std::string& functionName) const;
+                                         const std::string& functionName,
+                                         const llvm::Value* ownerStorage = nullptr) const;
     // SLOT-MOVE check for one `move` sink argument: a borrowed parameter, or a copy of a live
     // owning local, bound to the sink. Called by the direct and the indirect call sites.
     void DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
@@ -4645,6 +4668,9 @@ private:
     mutable std::unordered_set<std::string> coreFileNames_;
 
     llvm::Function* currentFunction = nullptr;
+    // The function whose `return` operand is being parsed (nullptr outside). A call in it keeps
+    // the return flush's own answer (T234) instead of gating its temp args (DropRetainedJoinArmPtrTemps).
+    const llvm::Function* returnOperandFunction_ = nullptr;
     // Active monomorphized source function/type identity for local enum keys. Scoped by
     // generic body emission and inherited by lambdas emitted from that body.
     std::string activeGenericEnumSpecialization_;
@@ -4923,10 +4949,12 @@ private:
                                             bool mayUnwind);
     void PreserveRetainedJoinArmTempsBeforeCall(const llvm::Function* callee,
                                                 llvm::ArrayRef<llvm::Value*> args);
-    // Pre-call form for a direct CFlat callee with a body: a bare owning `new` argument it does
-    // not retain is pending before the invoke, so its landing pad frees it (as a `??` arm does).
+    // Pre-call form for a direct CFlat callee with a body: gate owning temps, including an owned
+    // PHI/SELECT under a join, so the landing pad follows the same retain proof as normal cleanup.
     void RegisterDirectOwningPtrArgsBeforeCall(const llvm::Function* callee,
                                                llvm::ArrayRef<llvm::Value*> args);
+    void RegisterDeferredCallReleaseGate(llvm::Value* value, const llvm::Function& callee,
+                                         unsigned argIndex);
     void RegisterCxxGatedOwningPtrArg(llvm::Value* argVal, const llvm::Function& callee,
                                       unsigned argIndex);
 
@@ -5443,6 +5471,11 @@ private:
     // Ledger a value a `move` expression detached (see movedOutPtrValues_). An INTERFACE fat
     // pointer is accepted too - it is a struct, but it is detached by the same move contract.
     void RegisterMovedOutPtrValue(llvm::Value* value);
+    // The slot a `move` expression nulled, keyed by the moved VALUE, so the receiver that adopts the
+    // value can retarget the copies of that slot to itself (`view = n; P* m = move n;`).
+    void RegisterMovedOutSourceSlot(const llvm::Value* moved, llvm::Value* slot);
+    llvm::Value* FindMovedOutSourceSlot(const llvm::Value* moved) const;
+    std::unordered_map<const llvm::Value*, llvm::Value*> movedOutSourceSlots_;
 
     bool IsMovedOutPtrValue(llvm::Value* value) const;
 
@@ -5555,6 +5588,16 @@ private:
 
     void UnregisterOwnedStructTemp(llvm::Value* value);
 
+    // `alias` declarations: the receiver temps an initializer took off the ledger (`alias int x =
+    // mk()->v;`). Settled once per declarator: bound -> destroyed at the enclosing scope's end;
+    // unbound (`alias int x = byval(mk()->v);`) -> back on the ledger, freed at statement end.
+    size_t MarkAliasDeclTemps() const;
+    void DeferAliasDeclStructTemp(llvm::Value* alloca);
+    void SettleAliasDeclTemps(size_t mark, bool bound);
+    // Hidden scope local owning `temp` until the current scope exits; false when not dominating.
+    bool ExtendOwnedStructTempToScope(const PendingOwnedStructTemp& temp);
+    void DiscardAliasDeclTemps(size_t mark);
+
     void FlushOwnedStructTemps();
 
     // Free one unowned owning-pointer temp: null guard, full destructor, then the matching
@@ -5623,6 +5666,8 @@ private:
     OwnedTempMark MarkOwnedTemps() const;
     // True when `alloca` is an owned struct temp registered at or after `mark`.
     bool IsOwnedStructTempSince(const OwnedTempMark& mark, llvm::Value* alloca) const;
+    // True when `storage` is a field address inside a struct temp still on the owned-temp list.
+    bool IsFieldOfOwnedStructTemp(const llvm::Value* storage) const;
     void HoistOwnedPtrTempsForAddress(const OwnedTempMark& mark, llvm::Value* address,
                                       llvm::BasicBlock* hoistTo, bool includeBareNew = false);
 
@@ -5688,6 +5733,7 @@ private:
         decltype(fatInterfaceValueTypeNames_) fatInterfaceValueTypeNames_;
         decltype(viewJoinTypes_) viewJoinTypes_;
         decltype(movedOutPtrValues_) movedOutPtrValues_;
+        decltype(movedOutSourceSlots_) movedOutSourceSlots_;
         decltype(movedBorrowedPtrValues_) movedBorrowedPtrValues_;
         decltype(movedBorrowedThroughFieldValues_) movedBorrowedThroughFieldValues_;
         decltype(aliasValues_) aliasValues_;
@@ -7279,6 +7325,7 @@ public:
         // per-function reset, and this restores the outer one when we return to it.
         size_t savedCastOccurrence = 0;
         std::vector<llvm::Value*> movedOutPtrValues;
+        std::unordered_map<const llvm::Value*, llvm::Value*> movedOutSourceSlots;
         std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues;
         llvm::DenseSet<llvm::Value*> borrowedAddressValues;
         std::vector<llvm::Value*> movedBorrowedThroughFieldValues;
@@ -9826,6 +9873,15 @@ public:
                         && !member.isImplicit;
                 }));
     }
+    // clang's isAggregate: `T(args)` / `new T(args)` initialize it by parenthesized aggregate
+    // init (P0960), lowered through the same constructor wrapper as a user constructor.
+    bool IsForeignCxxAggregateClass(const std::string& typeName) const
+    {
+        if (pendingCxxRecordProjections_.count(typeName) != 0)
+            const_cast<LLVMBackend*>(this)->EnsureCxxRecordProjected(typeName, false);
+        auto record = cxxRecordEntries_.find(typeName);
+        return record != cxxRecordEntries_.end() && record->second.isAggregate;
+    }
     // C++ permits a scalar argument to initialize a class temporary for a reference or
     // by-value parameter. The call resolver uses this predicate; the lowering side materializes
     // the temporary with the selected imported constructor.
@@ -10154,6 +10210,10 @@ public:
     std::string pendingCxxTernaryDeclTypeName_;
     bool pendingCxxTernaryDeclConsumed_ = false;
     bool pendingCxxTernaryDeclFailed_ = false;
+    // A consumed nested `?:` declaration joined one derived class: its class and category (the
+    // enclosing ternary's DerivedArmCat value) so the outer join treats the nested arm alike.
+    std::string pendingCxxTernaryDeclArmType_;
+    int pendingCxxTernaryDeclArmCat_ = 0;
     // The most recent C++ call result of class type and, for an sret return, its TEMPORARY
     // (already on the owned-temp list). A declaration whose initializer produced exactly that
     // value (a chained call, `r.at(2).get_int64()`) move-constructs its local from the temp, or
@@ -11200,6 +11260,8 @@ public:
 
     // Reassigning the local makes it live again - clears the deref guard set by an explicit move.
     void MarkVariableNotExplicitlyMovedNull(const std::string& name);
+    // Clears the explicit-moved-null state of the local whose slot is `storage`.
+    void MarkStorageNotExplicitlyMovedNull(llvm::Value* storage);
 
     // '&name' escaped the address - latch off the deref guard permanently (see AddressEscaped
     // on NamedVariable): the pointee may be rewritten through the escaped pointer from here on.
@@ -11698,6 +11760,18 @@ public:
      * the original. An unresolvable or dead source answers false - the accept direction.
      */
     bool OwningLocalCopyStillAliases(const NamedVariable& nv) const;
+    // `P* m = move n;` moves the owner: every live copy of n's slot now aliases m, so the copy
+    // names m in its diagnostics (and is still refused by the same owner test).
+    void RetargetOwningLocalCopies(const llvm::Value* fromSlot, const std::string& newOwner,
+                                   llvm::Value* newSlot);
+    // The copy of a live owning local that an arm of the '??' join or '?:' select/PHI `joined`
+    // reads (null if none): the join borrows it, so a unique-field store double frees like the copy.
+    const NamedVariable* FindOwningLocalCopyJoinArm(const llvm::Value* joined) const;
+    // The arm values a '??' join, a '?:' select or a PHI yields (empty for anything else).
+    std::vector<llvm::Value*> JoinArmValues(const llvm::Value* joined) const;
+    // A unique-field store of `joined` consumes each owning-local arm as a bare local store does:
+    // that slot is nulled only when the join yielded it, so the field alone owns the object.
+    void ConsumeOwningLocalJoinArms(llvm::Value* joined);
 
     std::string FindVariableNameByStorage(const llvm::Value* slot) const;
 

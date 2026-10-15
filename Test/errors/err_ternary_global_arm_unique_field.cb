@@ -1,0 +1,14 @@
+// A global owning pointer arm of a '?:' moved into a `unique` field is refused exactly as the
+// plain '=' is: the field would free a pointee that is not heap-allocated by this statement.
+
+struct Payload { int v = 0; };
+struct Holder  { unique Payload* p = nullptr; };
+
+Payload* gPayload = nullptr;
+
+expect_error("cannot pass the address of a stack or global value to 'move' parameter 'p'") {
+    void badGlobalArm(bool f) { Holder h = default; h.p = f ? gPayload : nullptr; }
+}
+
+// The same global read as a plain borrow (no move into a field) stays legal.
+int goodGlobalBorrow(bool f) { Payload* r = f ? gPayload : nullptr; return r != nullptr ? 1 : 0; }

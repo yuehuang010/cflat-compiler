@@ -27,6 +27,34 @@ static bool IsDerefOperandChain(antlr4::tree::ParseTree* node)
     return false;
 }
 
+// The soft `alias` specifier of a declaration (the same spelling test as ParseDeclarationSpecifiers).
+static bool DeclarationSpecifiersHaveAlias(CFlatParser::DeclarationSpecifiersContext* specs)
+{
+    if (specs == nullptr) return false;
+    for (auto* spec : specs->declarationSpecifier())
+        if (spec->typeSpecifier() != nullptr && spec->typeSpecifier()->getText() == "alias")
+            return true;
+    return false;
+}
+
+// True when the postfix node sits in a ternary arm (not the test) of the enclosing declaration
+// (`c ? mk()->v : g`, `c ? idA(mk()->v) : g`). Such a temp stays on the ledger until the declarator
+// settles it, so the ternary's own hoisting gives it a live flag.
+static bool InTernaryArmOfDeclaration(antlr4::tree::ParseTree* node)
+{
+    for (antlr4::tree::ParseTree* child = node, *parent = node->parent; parent != nullptr;
+         child = parent, parent = parent->parent)
+    {
+        if (auto* cond = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(parent);
+            cond != nullptr && cond->children.size() > 1)
+            return cond->QuestionQuestion() == nullptr && cond->children[0] != child;
+        if (dynamic_cast<CFlatParser::DeclarationContext*>(parent) != nullptr
+            || dynamic_cast<CFlatParser::StatementContext*>(parent) != nullptr)
+            return false;
+    }
+    return false;
+}
+
 // True when the node may be what an `alias` declaration binds (`alias int x = mk()->v;`): the
 // bound storage outlives the statement, so the receiver temp must not die here. A subscript index,
 // a ternary test or a binary operand is only read (`alias int x = gArr[mk()->v];`), so it is not.
@@ -56,14 +84,7 @@ static bool InAliasDeclaration(antlr4::tree::ParseTree* node)
             && p->children.size() > 1)
             return false;
         if (auto* decl = dynamic_cast<CFlatParser::DeclarationContext*>(p))
-        {
-            auto* specs = decl->declarationSpecifiers();
-            if (specs == nullptr) return false;
-            for (auto* spec : specs->declarationSpecifier())
-                if (spec->typeSpecifier() != nullptr && spec->typeSpecifier()->getText() == "alias")
-                    return true;
-            return false;
-        }
+            return DeclarationSpecifiersHaveAlias(decl->declarationSpecifiers());
         if (dynamic_cast<CFlatParser::StatementContext*>(p)) return false;
     }
     return false;
@@ -144,10 +165,18 @@ static CFlatParser::PostfixExpressionContext* SoleCxxConstructionPostfix(
 }
 
 // The sole postfix expression of a single-child chain, or null when an operator sits above it.
+// A parenthesized operand `(f(x))` is transparent: its inner chain is the one that counts.
 static CFlatParser::PostfixExpressionContext* SoleChainPostfix(antlr4::tree::ParseTree* node)
 {
     if (node == nullptr) return nullptr;
-    if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node)) return postfix;
+    if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+    {
+        if (postfix->children.size() == 1)
+            if (auto* primary = postfix->primaryExpression();
+                primary != nullptr && primary->expression() != nullptr)
+                return SoleChainPostfix(primary->expression());
+        return postfix;
+    }
     auto* context = dynamic_cast<antlr4::ParserRuleContext*>(node);
     if (context == nullptr) return nullptr;
     if (context->children.size() == 1) return SoleChainPostfix(context->children[0]);
@@ -823,16 +852,22 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
         // A result that borrows from the receiver temp (pointer, alias) outlives the statement, so
         // those temps stay unregistered: the pre-existing behaviour, no free. The exception is a
         // pointer to a scalar that a unary `*` reads in place (`s += *mk()->heap;`): the temp dies
-        // at the end of the statement as for `mk()->v`. An alias binding of any result is a borrow.
+        // at the end of the statement as for `mk()->v`. An alias declaration's temps stay on the
+        // ledger and are settled by the declarator (bound: scope end; else statement end).
         if (arrowOwnedTemps_.size() > arrowTempMark)
         {
             const bool borrows = namedVar.TypeAndValue.Pointer || namedVar.TypeAndValue.IsAlias
                 || namedVar.IsAliasBorrow;
             const bool readInPlace = borrows && IsDerefOperandChain(ctx)
                 && PointsToScalar(Compiler(ctx), namedVar) && !DerefResultMayOutlive(ctx);
-            if ((borrows || InAliasDeclaration(ctx)) && !readInPlace)
+            const bool aliasDecl = InAliasDeclaration(ctx);
+            if ((borrows || aliasDecl) && !readInPlace)
                 for (size_t i = arrowTempMark; i < arrowOwnedTemps_.size(); ++i)
-                    Compiler(ctx)->UnregisterOwnedStructTemp(arrowOwnedTemps_[i]);
+                {
+                    LLVMBackend* backend = Compiler(ctx);
+                    if (!aliasDecl) backend->UnregisterOwnedStructTemp(arrowOwnedTemps_[i]);
+                    else backend->DeferAliasDeclStructTemp(arrowOwnedTemps_[i]);
+                }
             arrowOwnedTemps_.resize(arrowTempMark);
         }
         if (namedVar.TypeAndValue.IsFlexibleArrayMember && !lValue && std::find(flexibleArrayKeep_.begin(), flexibleArrayKeep_.end(), ctx) == flexibleArrayKeep_.end())
@@ -3055,6 +3090,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 structVar.Storage = spill;
                             }
 
+                            // A lowered produced temp read by field access (`(k ? move h1 : h2).c.v`)
+                            // has no owner but this statement: destroy its spill at statement end.
+                            if (structVar.IsParenthesizedProducedTemp && structVar.Storage != nullptr
+                                && !structVar.TernaryTempAlreadyRegistered && !structVar.FromOwningTempField
+                                && !structVar.TypeAndValue.Pointer
+                                && Compiler(ctx)->IsLoweredCFlatOnlyStruct(structVar.TypeAndValue.TypeName))
+                                Compiler(ctx)->RegisterOwnedStructTemp(structVar.Storage,
+                                    structVar.TypeAndValue.TypeName);
                             if (fieldIndex < dataStructure.StructFields.size())
                             {
                                 const auto& fieldType = dataStructure.StructFields[fieldIndex];
@@ -3413,7 +3456,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // Joins carry this ledger forward so only the selected arm is nulled.
                                     if (IsUniqueFieldRead(namedVar))
                                         Compiler(ctx)->RegisterUniqueFieldRead(
-                                            namedVar.Primary, namedVar.Storage);
+                                            namedVar.Primary, namedVar.Storage,
+                                            Compiler(ctx)->UniqueFieldNullKey(namedVar));
                                 }
                             }
                             // C++ `obj.f()` for a static-only member function is the qualified call
@@ -4046,6 +4090,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             lastParenExprCallerName.clear();
                             auto parenInnerNamed = lastParenExprNamed;
                             lastParenExprNamed = {};
+                            // T250: `owner = (raw = new T())` carries the inner local slot out of the
+                            // parens so an outer unique '=' consumes it as `owner = raw;` does.
+                            if (prevPrimary->expression() != nullptr)
+                            {
+                                namedVar.ChainedAssignSlot = parenInnerNamed.ChainedAssignSlot;
+                                namedVar.ChainedAssignName = parenInnerNamed.ChainedAssignName;
+                            }
                             // A parenthesized `?:` joining macro constants stays a prvalue.
                             if (prevPrimary->expression() != nullptr && parenInnerNamed.IsCxxMacroJoin)
                                 namedVar.IsCxxMacroJoin = true;
@@ -4149,7 +4200,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     && namedVar.Primary->getType() == sd.StructType)
                                 {
                                     namedVar.BaseType = sd.StructType;
-                                    if (namedVar.Storage == nullptr)
+                                    // A lowered C++ join already holds its value in the join temp: name that
+                                    // temp, so a bare return can build the selected arm straight into the slot.
+                                    auto* joinTemp = llvm::dyn_cast_or_null<llvm::AllocaInst>(
+                                        Compiler(ctx)->lastLoweredRetTemp_);
+                                    if (namedVar.Storage == nullptr && joinTemp != nullptr
+                                        && namedVar.Primary == Compiler(ctx)->lastLoweredRetValue_
+                                        && joinTemp->getAllocatedType() == sd.StructType)
+                                        namedVar.Storage = joinTemp;
+                                    else if (namedVar.Storage == nullptr)
                                     {
                                         auto* tmp = Compiler(ctx)->CreateAlloca(sd.StructType);
                                         Compiler(ctx)->builder->CreateStore(namedVar.Primary, tmp);
@@ -5161,16 +5220,21 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             compiler->lastCxxRetTemp_ = nullptr;
                             compiler->lastCxxRetValue_ = nullptr;
                             auto ownedTempMark = compiler->MarkOwnedTemps();
-                            // A single call producing this C++ class by value builds straight into the
-                            // slot (armed like a declaration initializer), so no temporary is moved.
+                            // One call or constructor expression producing this C++ class by value
+                            // builds straight into the slot, so no temporary is moved. The
+                            // constructor route consumes the slot only as a return-style destination.
                             const bool armSlotSret = !constructTargetIsCoreUnique && !destType.Pointer
                                 && compiler->IsForeignNontrivialCxxClass(destType.TypeName)
                                 && compiler->ReturnsViaCxxSret(destType.TypeName)
                                 && IsSingleCallWithoutNestedCall(callArgs[1]->assignmentExpression());
+                            const bool savedSretReturn = compiler->pendingCxxSretReturn_;
+                            const bool savedSretFixed = compiler->pendingCxxSretForFixedArray_;
                             if (armSlotSret)
                             {
                                 compiler->pendingCxxSretDest_ = slotValue;
                                 compiler->pendingCxxSretTypeName_ = destType.TypeName;
+                                compiler->pendingCxxSretReturn_ = true;
+                                compiler->pendingCxxSretForFixedArray_ = true;
                             }
                             auto sourceNV = ParseAssignmentExpressionNamed(
                                 callArgs[1]->assignmentExpression());
@@ -5180,6 +5244,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             {
                                 compiler->pendingCxxSretDest_ = nullptr;
                                 compiler->pendingCxxSretTypeName_.clear();
+                                compiler->pendingCxxSretReturn_ = savedSretReturn;
+                                compiler->pendingCxxSretForFixedArray_ = savedSretFixed;
                             }
                             auto sourceValue = builtInPlace ? nullptr
                                 : sourceNV.Primary ? sourceNV.Primary : LoadNamedVariable(sourceNV);
@@ -6861,7 +6927,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 for (size_t i = 0; i < pcount && i < argNVs.size(); i++)
                                     if (funcPtrTV.FuncPtrParams[i].IsMove && funcPtrTV.FuncPtrParams[i].Pointer)
                                         Compiler(ctx)->DiagnoseBorrowedMoveSinkArg(functionName,
-                                            std::format("{}", i), argNVs[i]);
+                                            std::format("parameter {}", i + 1), argNVs[i]);
                                 // A lambda literal's INFERRED owning sinks ride the funcptr type;
                                 // transfer the caller's source exactly as a direct call does.
                                 Compiler(ctx)->ApplyFuncPtrSinkTransfer(
@@ -11055,6 +11121,42 @@ llvm::Value* MainListener::ParseElementExpression(CFlatParser::ElementExpression
             return nullptr;
         const auto& sd = it->second;
 
+        // T261: an attribute that throws destroys the fields already built; an override releases its
+        // seed (the store drops it) and registers the new value in its place.
+        LLVMBackend::UnwindPartialScope seededFields(*compiler);
+        std::vector<llvm::Value*> seedSlots(sd.StructFields.size(), nullptr);
+        if (!sd.IsUnion && compiler->GetFunction(tagName))
+            for (unsigned i = 0; i < sd.StructFields.size(); ++i)
+            {
+                const auto& f = sd.StructFields[i];
+                if (f.Pointer || f.ElemPointer || f.IsAlias || f.IsArrayView || f.ConstArraySize != 0)
+                    continue;
+                seedSlots[i] = compiler->CreateCxxFieldGEP(sd, structPtr, i, f.VariableName + "_seed");
+                compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot, seedSlots[i], f.TypeName);
+            }
+        auto seedIndexOf = [&](const std::string& name) -> int {
+            for (unsigned i = 0; i < sd.StructFields.size(); ++i)
+                if (sd.StructFields[i].VariableName == name) return (int)i;
+            return -1;
+        };
+        auto releaseSeed = [&](const std::string& name) {
+            const int idx = seedIndexOf(name);
+            if (idx < 0 || seedSlots[idx] == nullptr) return;
+            auto& entries = compiler->unwindPartial_;
+            for (auto e = entries.rbegin(); e != entries.rend(); ++e)
+                if (e->K == LLVMBackend::UnwindPartialEntry::Kind::Slot && e->V == seedSlots[idx])
+                {
+                    entries.erase(std::next(e).base());
+                    break;
+                }
+        };
+        auto noteOverride = [&](const std::string& name) {
+            const int idx = seedIndexOf(name);
+            if (idx < 0 || seedSlots[idx] == nullptr) return;
+            compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot, seedSlots[idx],
+                                        sd.StructFields[idx].TypeName);
+        };
+
         // Attributes -> ownership-correct field stores.
         for (auto* attr : ctx->elementAttribute())
         {
@@ -11089,17 +11191,50 @@ llvm::Value* MainListener::ParseElementExpression(CFlatParser::ElementExpression
                 auto ownedTempMark = compiler->MarkOwnedTemps();
                 compiler->lastCxxRetTemp_ = nullptr;
                 compiler->lastCxxRetValue_ = nullptr;
-                rightNV = ParseAssignmentExpressionNamed(attr->assignmentExpression());
+                // T258: `f={move x}` into a lowered CFlat struct field is move-constructed member-wise
+                // over the seeded value (the heap object was default-built above).
+                const LLVMBackend::DeclTypeAndValue* attrField = nullptr;
+                unsigned attrFieldIndex = 0;
+                for (unsigned i = 0; i < sd.StructFields.size(); ++i)
+                {
+                    if (sd.StructFields[i].VariableName != fieldName) continue;
+                    attrField = &sd.StructFields[i];
+                    attrFieldIndex = i;
+                    break;
+                }
+                auto* attrMoveExpr = TopLevelMoveExpression(attr->assignmentExpression());
+                const bool loweredMoveAttr = attrMoveExpr != nullptr && attrField != nullptr
+                    && !sd.IsUnion && MainListener::IsLoweredMoveFieldTarget(compiler, *attrField);
+                llvm::Value* attrSlot = loweredMoveAttr
+                    ? compiler->CreateCxxFieldGEP(sd, structPtr, attrFieldIndex, fieldName + "_move_init")
+                    : nullptr;
+                if (loweredMoveAttr)
+                {
+                    LoweredBraceMoveScope deferMove(*this, attrMoveExpr, attrField->TypeName, attrSlot);
+                    rightNV = ParseAssignmentExpressionNamed(attr->assignmentExpression());
+                }
+                else
+                    rightNV = ParseAssignmentExpressionNamed(attr->assignmentExpression());
                 lambdaExpectedType = {};
                 rightNV.CastOccurrenceId = thisCastOcc;
                 compiler->EndCastOccurrence(savedCastOcc);
-                EmitOneFieldInit(structPtr, sd, tagName, fieldName, rightNV, ownedTempMark, attr);
+                releaseSeed(fieldName);
+                if (loweredMoveAttr && EmitDeferredLoweredMoveIntoField(
+                        attrSlot, attrField->TypeName, rightNV, /*destinationIsFresh*/ false, ownedTempMark))
+                {
+                    noteOverride(fieldName);
+                    continue;
+                }
+                if (EmitOneFieldInit(structPtr, sd, tagName, fieldName, rightNV, ownedTempMark, attr))
+                    noteOverride(fieldName);
                 continue;
             }
             rightNV.CastOccurrenceId = thisCastOcc;
             compiler->EndCastOccurrence(savedCastOcc);
-            EmitOneFieldInit(structPtr, sd, tagName, fieldName, rightNV,
-                             compiler->MarkOwnedTemps(), attr);
+            releaseSeed(fieldName);
+            if (EmitOneFieldInit(structPtr, sd, tagName, fieldName, rightNV,
+                                 compiler->MarkOwnedTemps(), attr))
+                noteOverride(fieldName);
         }
 
         // Children -> add() calls. The receiver self NV is rebuilt per call because

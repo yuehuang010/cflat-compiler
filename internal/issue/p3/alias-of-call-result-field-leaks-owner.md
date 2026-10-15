@@ -1,15 +1,13 @@
-# alias of a call-result field leaks the owner instead of extending it to scope end
+# Owning call-result temp behind a raw pointer local leaks (T205 pointer path)
 
-Summary: since T211, `alias int x = mk()->v;` (and `alias int x = *mk()->heap;`, nested
-`mk()->f->v`) never frees the owning call result: the alias reads valid storage, but a 1000x loop
-runs 0 destructors (master was a use-after-free). Same no-free path T205 uses for a pointer
-result (`int* p = mk()->heap;`). Also unfreed (conservatively): an alias declaration whose arrow
-temp sits in a call argument (`alias int x = idA(mk()->v);` must stay alive, but
-`alias int x = byval(mk()->v);` leaks too - argument positions are not told apart syntactically).
+Summary: T256 (2026-10-15) fixed `alias` declarations: `alias int x = mk()->v;`, `alias int x = *mk()->heap;`,
+`alias int x = idA(mk()->v);`, `alias int* p = mk()->heap;` and ternary arms now extend the owning receiver temp
+to the alias's scope end (one destructor per iteration); a by-value argument (`alias int x = byval(mk()->v);`)
+dies at statement end. Still open: a non-alias raw pointer local keeps the pre-existing no-free path (T205).
 
-Repro (T211 review): scratch/rev_t211_opus_probe.sh cases in the T211 worktree, or
-`for (...) { alias int x = mk()->v; s += x; }` with a dtor counter -> 0 dtors.
+Repro: `for (...) { int* p = mk()->heap; s += *p; }` with a destructor counter -> 0 destructors on master and
+after T256 (probe matrix: scratch/t256_matrix.md cells 13, 21). Also `int* q = c ? mk()->heap : nullptr;`.
 
-Fix direction: register the receiver temp for destruction at the alias's scope exit (Rust extends
-the temporary to the enclosing block), instead of unregistering it. For a call-argument position,
-only extend when the callee returns alias; a by-value argument dies at the statement end.
+Fix direction: needs a ruling first. A raw pointer's lifetime is not tracked (memory-safety ruling: borrowed
+pointer lifetimes untracked), so extending the owner would need proof that the pointer's target lies inside
+the temp. Leak, not use-after-free, until then.

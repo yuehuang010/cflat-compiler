@@ -64,7 +64,11 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
         llvm::Type* destinationType = GetType(typeValue);
         if (initValue)
         {
-            if (auto intValue = llvm::dyn_cast<llvm::ConstantInt>(initValue))
+            // A zero constant on an array view (`float[] g = 0.0;`) is the null view, as for a
+            // local (T200). The global path has no cast to do it, so it is done here.
+            if (typeValue.IsArrayView && destinationType->isPointerTy() && initValue->isNullValue())
+                initValue = llvm::Constant::getNullValue(destinationType);
+            else if (auto intValue = llvm::dyn_cast<llvm::ConstantInt>(initValue))
             {
                 // An FP global from an integer literal (`float g = 1;`) - legal for a LOCAL, and
                 // the int path below asks a non-integer type for its bit width.

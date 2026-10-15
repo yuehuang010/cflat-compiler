@@ -341,7 +341,8 @@ bool LLVMBackend::FallbackSlotMayEscape(const llvm::AllocaInst* root,
         return false;
     }
 
-void LLVMBackend::RegisterUniqueFieldRead(llvm::Value* value, llvm::Value* storage)
+void LLVMBackend::RegisterUniqueFieldRead(llvm::Value* value, llvm::Value* storage,
+                                          const std::string& nullKey)
 {
         if (value == nullptr || storage == nullptr) return;
         for (auto& entry : uniqueFieldReadValues_)
@@ -350,13 +351,21 @@ void LLVMBackend::RegisterUniqueFieldRead(llvm::Value* value, llvm::Value* stora
                 entry.second.Storage = storage;
                 entry.second.Block = builder != nullptr && builder->GetInsertBlock() != nullptr
                     ? builder->GetInsertBlock() : nullptr;
+                entry.second.NullKey = nullKey;
                 return;
             }
         uniqueFieldReadValues_.push_back({
             value,
             { storage, builder != nullptr && builder->GetInsertBlock() != nullptr
-                ? builder->GetInsertBlock() : nullptr }
+                ? builder->GetInsertBlock() : nullptr, nullKey }
         });
+    }
+
+std::string LLVMBackend::UniqueFieldReadNullKey(const llvm::Value* value) const
+{
+        for (const auto& entry : uniqueFieldReadValues_)
+            if (entry.first == value) return entry.second.NullKey;
+        return {};
     }
 
 void LLVMBackend::PropagateUniqueFieldRead(llvm::Value* trueValue, llvm::Value* falseValue,
@@ -369,7 +378,8 @@ void LLVMBackend::PropagateUniqueFieldRead(llvm::Value* trueValue, llvm::Value* 
             for (const auto& entry : uniqueFieldReadValues_)
                 if (entry.first == value)
                 {
-                    out.push_back({ entry.second.Storage, block != nullptr ? block : entry.second.Block });
+                    out.push_back({ entry.second.Storage,
+                        block != nullptr ? block : entry.second.Block, entry.second.NullKey });
                     return true;
                 }
             return false;
@@ -388,39 +398,34 @@ void LLVMBackend::PropagateUniqueFieldRead(llvm::Value* trueValue, llvm::Value* 
             auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(value);
             return constant != nullptr && constant->isNullValue();
         };
-        auto collect = [&](const llvm::Value* value, llvm::BasicBlock* block,
+        auto collect = [&](llvm::Value* value, llvm::BasicBlock* block,
                            std::vector<UniqueFieldReadSource>& out) {
             if (isNull(value)) return true;
             if (direct(value, block, out)) return true;
+            // A fresh `new` arm owns its object and has no slot to null; it adds no source.
+            if (value != nullptr && IsOwnedNewTemp(value)) return true;
             return joinedSources(value, out);
         };
 
         std::vector<UniqueFieldReadSource> sources;
-        bool recognized = false;
+        // Like '??': an arm that is not a field read (an owning `new`, a plain pointer local) has
+        // no slot to null and adds no source; each field arm is nulled on its own path only.
         if (auto* phi = llvm::dyn_cast<llvm::PHINode>(joined))
         {
-            recognized = true;
             for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
-                if (!collect(phi->getIncomingValue(i), phi->getIncomingBlock(i), sources))
-                {
-                    recognized = false;
-                    break;
-                }
+                collect(phi->getIncomingValue(i), phi->getIncomingBlock(i), sources);
         }
         else if (const auto* nullJoin = FindNullCoalesceJoin(joined))
         {
-            // A '??' arm that is not a field read (an owning `new`, a borrowed pointer) has no
-            // slot to null, so it adds no source; each field arm is nulled on its own path only.
-            recognized = true;
             for (const auto& arm : nullJoin->Arms)
                 collect(arm.Value, arm.Block, sources);
         }
         else
         {
-            recognized = collect(trueValue, nullptr, sources)
-                && collect(falseValue, nullptr, sources);
+            collect(trueValue, nullptr, sources);
+            collect(falseValue, nullptr, sources);
         }
-        if (!recognized || sources.empty()) return;
+        if (sources.empty()) return;
 
         for (auto& entry : uniqueFieldReadJoins_)
             if (entry.Joined == joined)
@@ -1634,6 +1639,7 @@ void LLVMBackend::ResolveOwnedReleaseGates()
             }
             if (!aliased) init->setOperand(0, llvm::ConstantInt::getTrue(init->getContext()));
         }
+        ResolveDeferredCallReleaseGates();
     }
 
 void LLVMBackend::ClearOwnFlag(const std::string& varName)
@@ -2251,18 +2257,45 @@ bool LLVMBackend::IsOwningPtrTempValue(llvm::Value* value) const
         return n != nullptr && !n->TypeName.empty();
     }
 
+// `&(new T)->v` and casts of it name the temp through their pointer operand (operand 0).
+static llvm::Value* PtrDerivationBase(llvm::Value* value)
+{
+        if (llvm::isa<llvm::GetElementPtrInst>(value) || llvm::isa<llvm::BitCastInst>(value)
+            || llvm::isa<llvm::AddrSpaceCastInst>(value))
+            return llvm::cast<llvm::User>(value)->getOperand(0);
+        return nullptr;
+    }
+
 void LLVMBackend::DropRetainedJoinArmPtrTemps(llvm::Value* callResult)
 {
         auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(callResult);
         if (call == nullptr) return;
         const llvm::Function* callee = call->getCalledFunction();
         const bool unproven = callee == nullptr || callee->isDeclaration();
+        // A derived argument (&(new T)->v) is followed to its temp only once the callee's body is
+        // complete: a later-declared callee keeps the deferred answer of the return flush (T234).
+        const bool bodyProven = callee == nullptr || FunctionBodyIsComplete(callee);
         const FunctionSymbol* calleeSymbol = callee != nullptr
             ? FindSymbolForFunction(callee) : nullptr;
+        // A call in a `return` operand of a pointer-returning function keeps the return flush's own
+        // deferral (T234): gating its temp here would race that answer. Elsewhere it gates like a void one.
+        const bool inReturnOperand = returnOperandFunction_ != nullptr
+            && call->getFunction() == returnOperandFunction_
+            && TypeHoldsPointer(returnOperandFunction_->getReturnType());
+        const bool gateSite = !inReturnOperand || callee == nullptr
+            || callee->getReturnType()->isVoidTy();
+        // A CFlat function declared ahead of its body: an llvm declaration, not a C prototype.
+        const bool cflatLaterBody = callee != nullptr && !bodyProven && calleeSymbol != nullptr
+            && gateSite && !calleeSymbol->IsCxx
+            && !calleeSymbol->IsCInteropDeclaration
+            && (!calleeSymbol->External || calleeSymbol->HasCFlatBody);
         const bool cxxDeclaration = callee != nullptr && callee->isDeclaration()
             && calleeSymbol != nullptr && calleeSymbol->IsCxx
             && callee->hasName() && !callee->isVarArg();
+        // A C++ declaration (body linked later) takes the same gate on a derived argument (B).
+        const bool cxxLaterBody = cxxDeclaration && gateSite && !bodyProven;
         auto hasCallGate = [&](llvm::Value* value, unsigned argIndex) {
+            if (callee == nullptr) return false;
             for (const auto& temp : pendingOwnedPtrTemps)
             {
                 if (temp.Value != value || temp.ReleaseGate == nullptr) continue;
@@ -2271,6 +2304,15 @@ void LLVMBackend::DropRetainedJoinArmPtrTemps(llvm::Value* callResult)
                     const auto* init = llvm::dyn_cast_or_null<llvm::StoreInst>(gate.Init);
                     if (init != nullptr && init->getPointerOperand() == temp.ReleaseGate
                         && gate.Callee == callee->getName() && gate.ArgIndex == argIndex)
+                        return true;
+                }
+                for (const auto& gate : deferredCallReleaseGates_)
+                {
+                    const auto* init = llvm::dyn_cast_or_null<llvm::StoreInst>(gate.Init);
+                    if (init == nullptr || init->getPointerOperand() != temp.ReleaseGate) continue;
+                    if (std::any_of(gate.Edges.begin(), gate.Edges.end(), [&](const auto& edge) {
+                        return edge.Callee == callee->getName() && edge.ArgIndex == argIndex;
+                    }))
                         return true;
                 }
             }
@@ -2290,7 +2332,11 @@ void LLVMBackend::DropRetainedJoinArmPtrTemps(llvm::Value* callResult)
                 const bool hasPendingTemp = std::any_of(
                     pendingOwnedPtrTemps.begin(), pendingOwnedPtrTemps.end(),
                     [&](const PendingOwnedPtrTemp& p) { return p.Value == cur; });
-                if (cxxDeclaration && hasPendingTemp)
+                if (hasPendingTemp && hasCallGate(cur, i))
+                {
+                    // The deferred answer controls both normal and unwind cleanup for this temp.
+                }
+                else if (cxxDeclaration && hasPendingTemp)
                 {
                     // The pre-call walk already gave join arms this gate so the invoke's
                     // exceptional pad sees it. Do not replace it with a later gate.
@@ -2307,6 +2353,25 @@ void LLVMBackend::DropRetainedJoinArmPtrTemps(llvm::Value* callResult)
                 {
                     work.push_back(sel->getTrueValue());
                     work.push_back(sel->getFalseValue());
+                }
+                else if (llvm::Value* base = PtrDerivationBase(cur))
+                {
+                    if (bodyProven) work.push_back(base);
+                    else if (cflatLaterBody || cxxLaterBody)
+                    {
+                        const bool pending = std::any_of(
+                            pendingOwnedPtrTemps.begin(), pendingOwnedPtrTemps.end(),
+                            [&](const PendingOwnedPtrTemp& p) { return p.Value == base; });
+                        if (pending)
+                        {
+                            if (!hasCallGate(base, i))
+                                RegisterCxxGatedOwningPtrArg(base, *callee, i);
+                        }
+                        else if (cxxLaterBody && IsOwningPtrTempValue(base))
+                            RegisterCxxGatedOwningPtrArg(base, *callee, i);
+                        else if (cxxLaterBody)
+                            work.push_back(base);
+                    }
                 }
             }
         }
@@ -2330,9 +2395,28 @@ void LLVMBackend::RegisterNonEscapingOwningPtrArgs(llvm::Value* callResult, bool
         for (unsigned i = 0; i < call->arg_size(); ++i)
         {
             llvm::Value* argVal = call->getArgOperand(i);
-            if (!IsOwningPtrTempValue(argVal)) continue;
+            if (argVal == nullptr || !argVal->getType()->isPointerTy()) continue;
+            const bool directTemp = IsOwningPtrTempValue(argVal);
+            if (!directTemp && PtrDerivationBase(argVal) == nullptr) continue;
             if (ParameterRetainsArgument(callee, i)) continue;
-            RegisterOwnedPtrTemp(argVal);
+            if (directTemp)
+            {
+                RegisterOwnedPtrTemp(argVal);
+                continue;
+            }
+            llvm::SmallPtrSet<llvm::Value*, 16> seen;
+            llvm::Value* value = argVal;
+            while (value != nullptr && seen.insert(value).second)
+            {
+                llvm::Value* base = PtrDerivationBase(value);
+                if (base == nullptr) break;
+                value = base;
+                if (IsOwningPtrTempValue(value))
+                {
+                    RegisterOwnedPtrTemp(value);
+                    break;
+                }
+            }
         }
     }
 
@@ -2411,8 +2495,22 @@ bool LLVMBackend::RegisterCxxOwningPtrArgsBeforeCall(const llvm::Function* calle
 void LLVMBackend::PreserveRetainedJoinArmTempsBeforeCall(const llvm::Function* callee,
                                                           llvm::ArrayRef<llvm::Value*> args)
     {
+        // Same gate as DropRetainedJoinArmPtrTemps: derived arguments wait for a complete body.
+        const bool bodyProven = callee == nullptr || FunctionBodyIsComplete(callee);
+        auto preserveOwnedTemp = [&](llvm::Value* value) {
+            if (!IsOwningPtrTempValue(value)
+                || std::none_of(pendingOwnedPtrTemps.begin(), pendingOwnedPtrTemps.end(),
+                    [&](const PendingOwnedPtrTemp& temp) { return temp.Value == value; }))
+                return false;
+            if (std::find(unwindCallConsumedTemps_.begin(), unwindCallConsumedTemps_.end(), value)
+                == unwindCallConsumedTemps_.end())
+                unwindCallConsumedTemps_.push_back(value);
+            return true;
+        };
         for (unsigned i = 0; i < args.size(); ++i)
         {
+            // Forward-declared direct callees use a deferred release gate instead.
+            if (callee != nullptr && callee->isDeclaration()) continue;
             if (args[i] == nullptr || !args[i]->getType()->isPointerTy()
                 || !ParameterRetainsArgument(callee, i))
                 continue;
@@ -2428,21 +2526,20 @@ void LLVMBackend::PreserveRetainedJoinArmTempsBeforeCall(const llvm::Function* c
                 }
                 else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
                 {
-                    for (llvm::Value* incoming : phi->incoming_values()) work.push_back(incoming);
+                    if (!preserveOwnedTemp(value))
+                        for (llvm::Value* incoming : phi->incoming_values()) work.push_back(incoming);
                 }
                 else if (auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
                 {
-                    work.push_back(select->getTrueValue());
-                    work.push_back(select->getFalseValue());
+                    if (!preserveOwnedTemp(value))
+                    {
+                        work.push_back(select->getTrueValue());
+                        work.push_back(select->getFalseValue());
+                    }
                 }
-                else if (IsOwningPtrTempValue(value)
-                    && std::any_of(pendingOwnedPtrTemps.begin(), pendingOwnedPtrTemps.end(),
-                        [&](const PendingOwnedPtrTemp& temp) { return temp.Value == value; }))
-                {
-                    if (std::find(unwindCallConsumedTemps_.begin(), unwindCallConsumedTemps_.end(), value)
-                        == unwindCallConsumedTemps_.end())
-                        unwindCallConsumedTemps_.push_back(value);
-                }
+                else if (llvm::Value* base = bodyProven ? PtrDerivationBase(value) : nullptr)
+                    work.push_back(base);
+                else preserveOwnedTemp(value);
             }
         }
     }
@@ -2450,15 +2547,138 @@ void LLVMBackend::PreserveRetainedJoinArmTempsBeforeCall(const llvm::Function* c
 void LLVMBackend::RegisterDirectOwningPtrArgsBeforeCall(const llvm::Function* callee,
                                                         llvm::ArrayRef<llvm::Value*> args)
     {
-        // Same test as the post-call registration in RegisterNonEscapingOwningPtrArgs; here it runs
-        // first so the invoke's landing pad owns the temp. RegisterOwnedPtrTemp is idempotent.
-        if (callee == nullptr || callee->isDeclaration()) return;
+        if (callee == nullptr) return;
+        const FunctionSymbol* calleeSymbol = FindSymbolForFunction(callee);
+        const bool inReturnOperand = returnOperandFunction_ != nullptr
+            && currentFunction == returnOperandFunction_
+            && TypeHoldsPointer(returnOperandFunction_->getReturnType());
+        const bool gateSite = !inReturnOperand || callee->getReturnType()->isVoidTy();
+        const bool cflatLaterBody = callee->isDeclaration() && calleeSymbol != nullptr
+            && gateSite && !calleeSymbol->IsCxx && !calleeSymbol->IsCInteropDeclaration
+            && (!calleeSymbol->External || calleeSymbol->HasCFlatBody);
+        if (callee->isDeclaration())
+        {
+            if (!callee->hasName()) return;
+            for (unsigned i = 0; i < args.size(); ++i)
+            {
+                if (args[i] == nullptr || !args[i]->getType()->isPointerTy()) continue;
+                llvm::SmallVector<llvm::Value*, 8> work{ args[i] };
+                llvm::SmallPtrSet<llvm::Value*, 16> seen;
+                while (!work.empty())
+                {
+                    llvm::Value* value = work.pop_back_val();
+                    if (value == nullptr || !seen.insert(value).second) continue;
+                    if (const auto* join = FindNullCoalesceJoin(value))
+                        for (const auto& arm : join->Arms) work.push_back(arm.Value);
+                    else if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+                    {
+                        if (IsOwningPtrTempValue(value))
+                            RegisterDeferredCallReleaseGate(value, *callee, i);
+                        else
+                            for (llvm::Value* incoming : phi->incoming_values()) work.push_back(incoming);
+                    }
+                    else if (auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+                    {
+                        if (IsOwningPtrTempValue(value))
+                            RegisterDeferredCallReleaseGate(value, *callee, i);
+                        else
+                        {
+                            work.push_back(select->getTrueValue());
+                            work.push_back(select->getFalseValue());
+                        }
+                    }
+                    else if (cflatLaterBody)
+                    {
+                        if (llvm::Value* base = PtrDerivationBase(value))
+                            work.push_back(base);
+                        else if (IsOwningPtrTempValue(value))
+                            RegisterDeferredCallReleaseGate(value, *callee, i);
+                    }
+                    else if (IsOwningPtrTempValue(value))
+                        RegisterDeferredCallReleaseGate(value, *callee, i);
+                }
+            }
+            return;
+        }
+        // Same test as post-call registration; here it runs first so an invoke's landing pad
+        // owns the temp. RegisterOwnedPtrTemp is idempotent.
         for (unsigned i = 0; i < args.size(); ++i)
         {
             if (args[i] == nullptr || !IsOwningPtrTempValue(args[i])) continue;
             if (ParameterRetainsArgument(callee, i)) continue;
             RegisterOwnedPtrTemp(args[i]);
         }
+    }
+
+void LLVMBackend::RegisterDeferredCallReleaseGate(llvm::Value* value,
+                                                   const llvm::Function& callee,
+                                                   unsigned argIndex)
+    {
+        if (!IsOwningPtrTempValue(value) || !callee.hasName()) return;
+        auto pending = std::find_if(pendingOwnedPtrTemps.begin(), pendingOwnedPtrTemps.end(),
+            [&](const PendingOwnedPtrTemp& temp) { return temp.Value == value; });
+        if (pending != pendingOwnedPtrTemps.end() && pending->ReleaseGate != nullptr)
+        {
+            for (auto& gate : deferredCallReleaseGates_)
+            {
+                const auto* init = llvm::dyn_cast_or_null<llvm::StoreInst>(gate.Init);
+                if (init == nullptr || init->getPointerOperand() != pending->ReleaseGate) continue;
+                const auto edge = std::find_if(gate.Edges.begin(), gate.Edges.end(),
+                    [&](const DeferredCallReleaseEdge& item) {
+                        return item.Callee == callee.getName() && item.ArgIndex == argIndex;
+                    });
+                if (edge == gate.Edges.end())
+                    gate.Edges.push_back({ callee.getName().str(), argIndex });
+                return;
+            }
+            // Two unrelated release proofs cannot share one gate. Keep the temp if both are
+            // required; never replace one proof with a potentially weaker one.
+            std::erase_if(pendingOwnedPtrTemps,
+                [&](const PendingOwnedPtrTemp& temp) { return temp.Value == value; });
+            return;
+        }
+
+        auto* gateSlot = AllocaAtEntry(builder->getInt1Ty(), nullptr, "callee.release.gate");
+        llvm::StoreInst* init = nullptr;
+        {
+            llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+            builder->SetInsertPoint(gateSlot->getParent(), std::next(gateSlot->getIterator()));
+            init = builder->CreateStore(builder->getInt1(false), gateSlot);
+        }
+        deferredCallReleaseGates_.push_back({ init, { { callee.getName().str(), argIndex } } });
+        RegisterOwnedPtrTemp(value, gateSlot);
+    }
+
+void LLVMBackend::ResolveDeferredCallReleaseGates()
+    {
+        if (deferredCallReleaseGates_.empty()) return;
+        std::vector<DeferredCallReleaseGate> unresolved;
+        for (const auto& gate : deferredCallReleaseGates_)
+        {
+            auto* init = llvm::dyn_cast_or_null<llvm::StoreInst>(gate.Init);
+            if (init == nullptr) continue;
+            bool complete = true;
+            bool releasable = true;
+            for (const auto& edge : gate.Edges)
+            {
+                const llvm::Function* fn = module->getFunction(edge.Callee);
+                if (fn == nullptr || !FunctionBodyIsComplete(fn) || edge.ArgIndex >= fn->arg_size())
+                {
+                    complete = false;
+                    break;
+                }
+                if (ParameterRetainsArgument(fn, edge.ArgIndex))
+                {
+                    releasable = false;
+                    break;
+                }
+            }
+            if (complete && releasable)
+                init->setOperand(0, llvm::ConstantInt::getTrue(init->getContext()));
+            else if (!complete && releasable)
+                unresolved.push_back(gate);
+        }
+        deferredCallReleaseGates_ = std::move(unresolved);
     }
 
 void LLVMBackend::ResolveCxxThisEscapeGates()
@@ -2600,6 +2820,7 @@ void LLVMBackend::DropModuleEscapeMemo()
         tempUniqueFieldArgs_.clear();
         coreUniqueGetterSource_.clear();
         owningLocalBorrowingHelperArgs_.clear();
+        deferredCallReleaseGates_.clear();
         deferredTempUniqueFieldEscapes_.clear();
         pendingLaunderTempUniqueFields_.clear();
         // Both borrow-provenance ledgers are Function*/CallInst*-keyed, so a module rebuild
@@ -3436,7 +3657,11 @@ bool LLVMBackend::ValueMayReachReturn(const llvm::Value* root, int depth,
                     const llvm::Function* callee = call->getCalledFunction();
                     if (callee == nullptr)
                     {
-                        if (leaves != nullptr && TypeHoldsPointer(call->getType()))
+                        // An indirect callee may park the argument in its result or an out-param.
+                        // Its LLVM result type can hide the pointer (ABI-coerced {i64, i64}).
+                        const bool passedToCallee = std::any_of(call->arg_begin(), call->arg_end(),
+                            [&](const llvm::Use& arg) { return arg.get() == v; });
+                        if (leaves != nullptr && (passedToCallee || TypeHoldsPointer(call->getType())))
                             leaves->Edges.push_back({ std::string(), 0 });   // never answered
                         else if (unknownPointerResultMayReach && TypeHoldsPointer(call->getType()))
                             return true;
@@ -4335,6 +4560,17 @@ std::string LLVMBackend::ResolvePointerElementTypeName(llvm::Value* value) const
         return FindDeclaredElementTypeNameForStorage(load->getPointerOperand());
 }
 
+void LLVMBackend::RegisterMovedOutSourceSlot(const llvm::Value* moved, llvm::Value* slot)
+{
+        if (moved != nullptr && slot != nullptr) movedOutSourceSlots_[moved] = slot;
+    }
+
+llvm::Value* LLVMBackend::FindMovedOutSourceSlot(const llvm::Value* moved) const
+{
+        const auto found = movedOutSourceSlots_.find(moved);
+        return found == movedOutSourceSlots_.end() ? nullptr : found->second;
+    }
+
 void LLVMBackend::RegisterMovedOutPtrValue(llvm::Value* value)
 {
         // A by-value OWNING STRUCT is the third movable shape (its source is zeroed, exactly as a
@@ -4708,6 +4944,15 @@ bool LLVMBackend::IsOwnedStructTempSince(const OwnedTempMark& mark, llvm::Value*
         return false;
     }
 
+bool LLVMBackend::IsFieldOfOwnedStructTemp(const llvm::Value* storage) const
+{
+        auto* field = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(storage);
+        if (field == nullptr) return false;
+        for (const auto& e : pendingOwnedStructTemps)
+            if (e.Alloca == field->getPointerOperand()) return true;
+        return false;
+    }
+
 bool LLVMBackend::IsOwnedClosureTemp(llvm::Value* value) const
 {
         for (const auto& e : pendingOwnedClosureTemps)
@@ -4925,6 +5170,69 @@ void LLVMBackend::UnregisterOwnedStructTemp(llvm::Value* value)
         if (value == nullptr) return;
         std::erase_if(pendingOwnedStructTemps,
             [&](const PendingOwnedStructTemp& e) { return e.Alloca == value; });
+    }
+
+size_t LLVMBackend::MarkAliasDeclTemps() const
+{
+        return aliasDeclTemps_.size();
+    }
+
+void LLVMBackend::DeferAliasDeclStructTemp(llvm::Value* alloca)
+{
+        if (alloca != nullptr) aliasDeclTemps_.push_back({ alloca });
+    }
+
+bool LLVMBackend::ExtendOwnedStructTempToScope(const PendingOwnedStructTemp& temp)
+{
+        auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(temp.Alloca);
+        if (slot == nullptr || temp.ArrayCount != 0 || temp.Block == nullptr || !IsInsertBlockLive())
+            return false;
+        // An unflagged temp runs its destructor unconditionally at scope end: it must have been
+        // built on every path to here, which is what its block dominating this point proves.
+        if (temp.LiveFlag == nullptr)
+        {
+            std::optional<llvm::DominatorTree> domTree;
+            if (!OwnedTempDominatesHere(temp.Block, builder->GetInsertBlock(), domTree)) return false;
+        }
+        const std::string name = "$alias" + std::to_string(nextDeclSequence);
+        NamedVariable& owner = GetOrCreateStackVariable(name);
+        owner.Storage = slot;
+        owner.BaseType = slot->getAllocatedType();
+        owner.TypeAndValue.TypeName = temp.TypeName;
+        owner.TypeAndValue.VariableName = name;
+        owner.IsOwningStruct = true;
+        owner.ConditionalDropFlag = temp.LiveFlag;
+        owner.DeclarationBlock = builder->GetInsertBlock();
+        owner.DeclarationScopeDepth = stackNamedVariable.size();
+        return true;
+    }
+
+void LLVMBackend::SettleAliasDeclTemps(size_t mark, bool bound)
+{
+        // Unbound: the temps stay on the ledger for the statement-end free. Bound: each leaves the
+        // ledger; one that cannot extend to the scope leaks, never a use after free.
+        for (size_t i = mark; bound && i < aliasDeclTemps_.size(); ++i)
+        {
+            const AliasDeclTemp& t = aliasDeclTemps_[i];
+            auto it = std::find_if(pendingOwnedStructTemps.begin(), pendingOwnedStructTemps.end(),
+                [&](const PendingOwnedStructTemp& e) { return e.Alloca == t.Alloca; });
+            if (it == pendingOwnedStructTemps.end()) continue;
+            ExtendOwnedStructTempToScope(*it);
+            std::erase_if(pendingOwnedStructTemps,
+                [&](const PendingOwnedStructTemp& e) { return e.Alloca == t.Alloca; });
+        }
+        aliasDeclTemps_.resize(std::min(mark, aliasDeclTemps_.size()));
+    }
+
+void LLVMBackend::DiscardAliasDeclTemps(size_t mark)
+{
+        // A temp not settled by its declarator is taken off the ledger: it may be the bound one,
+        // and a leak is safe where a statement-end free would be a use after free.
+        for (size_t i = mark; i < aliasDeclTemps_.size(); ++i)
+            std::erase_if(pendingOwnedStructTemps, [&](const PendingOwnedStructTemp& e) {
+                return e.Alloca == aliasDeclTemps_[i].Alloca; });
+        if (mark < aliasDeclTemps_.size())
+            aliasDeclTemps_.erase(aliasDeclTemps_.begin() + static_cast<long>(mark), aliasDeclTemps_.end());
     }
 
 void LLVMBackend::FlushOwnedStructTemps()
@@ -5463,6 +5771,7 @@ void LLVMBackend::DiscardOwnedTempsSince(const OwnedTempMark& mark)
         fatInterfaceValueTypeNames_.clear();
         viewJoinTypes_.clear();
         movedOutPtrValues_.clear();
+        movedOutSourceSlots_.clear();
         movedBorrowedPtrValues_.clear();
         movedBorrowedThroughFieldValues_.clear();
         aliasReturnTempSlots_.clear();
@@ -5486,6 +5795,7 @@ LLVMBackend::DetectionLedgerSnapshot LLVMBackend::SnapshotDetectionLedgers() con
         snapshot.fatInterfaceValueTypeNames_ = fatInterfaceValueTypeNames_;
         snapshot.viewJoinTypes_ = viewJoinTypes_;
         snapshot.movedOutPtrValues_ = movedOutPtrValues_;
+        snapshot.movedOutSourceSlots_ = movedOutSourceSlots_;
         snapshot.movedBorrowedPtrValues_ = movedBorrowedPtrValues_;
         snapshot.movedBorrowedThroughFieldValues_ = movedBorrowedThroughFieldValues_;
         snapshot.aliasValues_ = aliasValues_;
@@ -5509,6 +5819,7 @@ void LLVMBackend::RestoreDetectionLedgers(DetectionLedgerSnapshot snapshot)
         fatInterfaceValueTypeNames_ = std::move(snapshot.fatInterfaceValueTypeNames_);
         viewJoinTypes_ = std::move(snapshot.viewJoinTypes_);
         movedOutPtrValues_ = std::move(snapshot.movedOutPtrValues_);
+        movedOutSourceSlots_ = std::move(snapshot.movedOutSourceSlots_);
         movedBorrowedPtrValues_ = std::move(snapshot.movedBorrowedPtrValues_);
         movedBorrowedThroughFieldValues_ = std::move(snapshot.movedBorrowedThroughFieldValues_);
         aliasValues_ = std::move(snapshot.aliasValues_);
@@ -5550,6 +5861,7 @@ void LLVMBackend::FlushOwnedTemps()
         pendingLaunderTempUniqueFields_.clear();
         dataValueCodeCasts_.clear();
         movedOutPtrValues_.clear();
+        movedOutSourceSlots_.clear();
         movedBorrowedPtrValues_.clear();
         movedBorrowedThroughFieldValues_.clear();
         nonOwningStructJoins_.clear();

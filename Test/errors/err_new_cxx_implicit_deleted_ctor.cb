@@ -1,0 +1,11 @@
+// T247: `new T()` of a C++ class whose default constructor is implicitly deleted is refused
+// like clang (a reference member has no default). Master compiled it and zero-filled the object.
+import cpp "../library/cpp_interop_basic.h";
+
+extern int main()
+{
+    expect_error("implicitly-deleted default constructor") {
+        cppnewdmi.Rf* p = new cppnewdmi.Rf();
+    }
+    return 0;
+}

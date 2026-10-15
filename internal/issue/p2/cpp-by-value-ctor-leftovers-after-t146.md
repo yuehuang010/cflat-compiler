@@ -1,20 +1,14 @@
-# C++ ctor overload choice with a named fn-pointer lvalue (left after T146/T214/T232)
+# Remaining C++ overload choice with a named fn-pointer lvalue (after T248)
 
-T232 fixed the local-declaration by-value snapshot (incl. default-argument and inherited ctors),
-top-level const fn-pointer locals, and template/C-variadic ctors in argument position. Left
-(repros scratch/repro_keep/t214_rev/ with clang twins, unless quoted inline):
-- `T(bool)` + `T(Fn&&)` with a named fn-pointer lvalue picks the && overload (304, clang 501, boolrv_lv).
-- `T(Fn)` + `T(Fn&&)` with a named fn-pointer lvalue is refused as ambiguous (clang 404, valrv_lv).
+T248 fixed the function-pointer overload ranking, parameter const propagation, and const move
+cases. Remaining repros are in scratch/repro_keep/t214_rev/ with clang twins, unless quoted inline:
+- Free `fsel(Fn&)` + `fsel(const Fn&)` with a const fn-pointer local is still refused "reference to a function
+  pointer ... cannot bind" (clang 204; fixture t63.call_t248_free_pick). T248 (Luna) dropped the MapRawSig
+  refusal and selected const Fn&, but the free-call lowering passed the code address, not the slot (SIGSEGV);
+  backed out. Attempt: scratch/repro_keep/t248/t248_luna_full.patch (LLVMBackend_Overloads.cpp ~7259 hunk).
 - Same WSel in call-argument position: `struct WSel { WSel(W a, int b); WSel(const int& a, const char*); }`,
   `int x = 0; int r = f(WSel(x, bump(&x)));` with `bump` = `++*p`, converting `W(int)`: 1111 (clang 1011).
   Local declaration is fixed; a by-value class ctor parameter in argument position still reads `x` late.
-- Const fn-pointer PARAMETER: `int viaparam(const function<int(int)> p){ return take(Pick(p)); }` with
-  `Pick(Fn&)` / `Pick(const Fn&)`: 104 (clang 204). MainListener_Declarations.cpp sets IsTopLevelConst
-  only on the local-declaration path. (The const fn-pointer GLOBAL is fixed: 204.)
-- `const Fn cfp = plus; Pick o = Pick(move cfp);` with `Pick(Fn&&)` present: 304 (clang 204; const Fn&&
-  binds const Fn&).
-- Pre-existing: free `fsel(Fn&)` + `fsel(const Fn&)` called with a const fn-pointer local is refused
-  "reference to a function pointer ... cannot bind" on master and branch (clang 204).
 - Pre-existing, ruling question: `CharSel(char, int)` + `CharSel(const int&, const char*)` with `int x = 300;`
   and `CharSel(x, 1)` is refused "no constructor ... ('int', 'int')" on master and branch (clang 145).
   Likely the no-implicit-narrowing-at-call-args ruling (2026-09-04) rather than a defect; maintainer to confirm.

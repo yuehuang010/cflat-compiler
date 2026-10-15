@@ -1587,6 +1587,48 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 out.from = arg.TypeAndValue.TypeName;
                 continue;
             }
+            const TypeAndValue& functionPointerArgument = arg.HasOriginalArgumentType
+                ? arg.OriginalArgumentType : arg.TypeAndValue;
+            if (candidate.IsCxx && functionPointerArgument.IsFunctionPointer && param.IsFunctionPointer
+                && (param.IsAlias || param.IsRvalueRef || param.IsCxxConstRef)
+                && functionPointerArgument.IsThinFnPtr() && param.IsThinFnPtr())
+            {
+                const bool reference = param.IsAlias || param.IsRvalueRef;
+                const bool rvalue = IsCxxRvalueReferenceArgument(arg);
+                const int targetCv = spellingCv(CxxReferenceParameterSpelling(candidate, i))
+                    | (param.IsCxxConstRef ? 1 : 0);
+                TypeAndValue sourceReferent = functionPointerArgument;
+                sourceReferent.Pointer = false;
+                sourceReferent.ElemPointer = false;
+                sourceReferent.PointerDepth = 0;
+                sourceReferent.IsAlias = false;
+                sourceReferent.IsRvalueRef = false;
+                sourceReferent.IsCxxConstRef = false;
+                TypeAndValue targetReferent = param;
+                targetReferent.Pointer = false;
+                targetReferent.ElemPointer = false;
+                targetReferent.PointerDepth = 0;
+                targetReferent.IsAlias = false;
+                targetReferent.IsRvalueRef = false;
+                targetReferent.IsCxxConstRef = false;
+                const std::string sourceIdentity = sourceReferent.ToUniqueString(*this);
+                const std::string targetIdentity = targetReferent.ToUniqueString(*this);
+                bool nonViable = FuncPtrSignaturesProvablyDiffer(functionPointerArgument, param)
+                    || (reference && (CxxReceiverCv(arg) & ~targetCv) != 0)
+                    || (param.IsRvalueRef && !rvalue)
+                    || (param.IsAlias && !param.IsCxxConstRef && rvalue);
+                out.rank = nonViable ? kCxxNonViableRank : 0;
+                out.cxxViable = !nonViable;
+                out.from = sourceIdentity;
+                if (reference)
+                {
+                    out.cvBase = sourceIdentity;
+                    out.cv = targetCv;
+                    out.refTarget = targetIdentity;
+                    out.refBind = param.IsRvalueRef ? 1 : (targetCv & 1) != 0 ? 2 : 0;
+                }
+                continue;
+            }
             // A C++ reference parameter is an address-passed alias; only its referent is ranked.
             const bool reference = param.IsAlias || param.IsRvalueRef;
             if ((param.Pointer && !reference) || param.ElemPointer || param.IsArrayView || param.ConstArraySize > 0
@@ -2351,16 +2393,23 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         || (arg.BaseType && arg.BaseType->isPointerTy())))
                 {
                     // `function<T>`, `function<T>*` and `function<T>[]` are three DISTINCT
-                    // overloads; a disagreeing shape may still bind but never scores perfect.
-                    result = (FunctionPointerShapeOf(arg.TypeAndValue, &arg)
-                           == FunctionPointerShapeOf(*candidateParamItr, nullptr)) ? 0 : 1;
+                    // overloads. A C++ reference to function<T> binds the value's slot, so rank
+                    // its referent as the value shape rather than as a function<T>* parameter.
+                    const bool functionPointerReference = candidate.IsCxx
+                        && candidateParamItr->IsFunctionPointer
+                        && (candidateParamItr->IsAlias || candidateParamItr->IsRvalueRef);
+                    const int paramShape = functionPointerReference ? 0
+                        : FunctionPointerShapeOf(*candidateParamItr, nullptr);
+                    result = FunctionPointerShapeOf(arg.TypeAndValue, &arg) == paramShape ? 0 : 1;
                     if (result != 0)
                         shapeMismatches++;
 
                     // Shapes agree: signatures that provably name different function types are
                     // proof. Only at equal shape - a shape mismatch stays score-1 bindable.
+                    const TypeAndValue& functionPointerArgument = arg.HasOriginalArgumentType
+                        ? arg.OriginalArgumentType : arg.TypeAndValue;
                     if (result == 0
-                        && FuncPtrSignaturesProvablyDiffer(arg.TypeAndValue, *candidateParamItr))
+                        && FuncPtrSignaturesProvablyDiffer(functionPointerArgument, *candidateParamItr))
                         result = -1;
                     // A NAMED function argument carries its signature in the function table, not
                     // on the argument, so it needs the overload-set form of the same proof.
@@ -4259,7 +4308,9 @@ bool LLVMBackend::RejectFuncPtrShapeMismatch(const NamedVariable& arg, const Typ
         if (!param.IsFunctionPointer && !IsEncodedClosureType(param.TypeName))
             return false;
 
-        int paramShape = FunctionPointerShapeOf(param, nullptr);
+        const bool functionPointerReference = param.IsFunctionPointer
+            && (param.IsAlias || param.IsRvalueRef);
+        int paramShape = functionPointerReference ? 0 : FunctionPointerShapeOf(param, nullptr);
         int argShape = FunctionPointerShapeOf(arg.TypeAndValue, &arg);
         bool argIsNullLiteral = arg.Primary != nullptr
             && llvm::isa<llvm::ConstantPointerNull>(arg.Primary);
@@ -7664,6 +7715,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         // C++17 prvalue elision binds it directly; the callee owns its lifetime.
                         cxxIndirectArgAddrs.resize(candidate.Recipe.paramSlots.size(), nullptr);
                         cxxIndirectArgAddrs[i] = resultSlot;
+                        // The callee now owns the slot: disarm any argument-join owner (no-op otherwise).
+                        UnregisterOwnedStructTemp(resultSlot);
                         if (matched[i].Primary == lastLoweredRetValue_)
                         {
                             lastLoweredRetTemp_ = nullptr;
@@ -7895,11 +7948,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         const bool cxxTempsRegisteredBeforeCall = candidate.IsCxx && !candidate.Recipe.hasLowering
             && cxxVirtualCallee == nullptr
             && RegisterCxxOwningPtrArgsBeforeCall(candidate.Function, argList, calleeMayUnwind);
-        if (!candidate.IsCxx && !candidate.Recipe.hasLowering && cxxVirtualCallee == nullptr
-            && calleeMayUnwind)
+        if (!candidate.IsCxx && !candidate.Recipe.hasLowering && cxxVirtualCallee == nullptr)
         {
-            PreserveRetainedJoinArmTempsBeforeCall(candidate.Function, argList);
-            RegisterDirectOwningPtrArgsBeforeCall(candidate.Function, argList);
+            if (calleeMayUnwind)
+                PreserveRetainedJoinArmTempsBeforeCall(candidate.Function, argList);
+            if (calleeMayUnwind
+                || (candidate.Function != nullptr && candidate.Function->isDeclaration()))
+                RegisterDirectOwningPtrArgsBeforeCall(candidate.Function, argList);
         }
         if (IsVerbose() && functionName.find("operator") != std::string::npos)
         {
@@ -9478,6 +9533,18 @@ void LLVMBackend::MarkVariableNotExplicitlyMovedNull(const std::string& name)
                     return;
                 }
         }
+    }
+
+void LLVMBackend::MarkStorageNotExplicitlyMovedNull(llvm::Value* storage)
+{
+        if (storage == nullptr) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+            for (auto& entry : frame.namedVariable)
+                if (entry.second.Storage == storage)
+                {
+                    MarkVariableNotExplicitlyMovedNull(entry.first);
+                    return;
+                }
     }
 
 void LLVMBackend::MarkVariableAddressEscaped(const std::string& name)

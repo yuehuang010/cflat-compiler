@@ -7242,6 +7242,22 @@ int slViewOfStaticArr() { static int[3] sa = {5, 6, 7}; static int[] v = sa; v[2
 int slFixedArrCopy()    { int[3] src = {4, 5, 6}; static int[3] c = src; c[0] = c[0] + 1; return c[0]; }
 int slConstLenArith()   { static int[2 + 1] a = default; a[2] = a[2] + 1; return a[2]; }
 
+// File-scope zero-to-view initializers are the null view (T254, the global twin of T200's local
+// rule), and a view of a global array reads back. A fresh cache must verify the same as a warm one.
+float[] tzGz = 0.0;
+int[] tzGi = 0;
+float[] tzGd;
+int[4] tzGArr = {10, 20, 30, 40};
+int[] tzGView = tzGArr;
+int tzGlobalViewProbe()
+{
+    float[] fz = tzGz;
+    if (fz != nullptr || tzGz != nullptr || tzGi != nullptr || tzGd != nullptr) return -1;
+    int s = 0;
+    for (int i = 0; i < 4; i++) s = s + tzGView[i];
+    return s;
+}
+
 // The initializer emits a whole lambda body before the static's own storage is created. That
 // body declares a local with the SAME name and type as the static: it must not claim the
 // static's storage (which would leave the static a per-call alloca and make the lambda's local
@@ -7373,6 +7389,7 @@ bool testStaticLocals()
     result &= Test("static_view_of_global_arr", slViewOfGlobalArr(), 20);
     result &= Test("static_view_of_static_arr_1", slViewOfStaticArr(), 8);
     result &= Test("static_view_of_static_arr_2", slViewOfStaticArr(), 9);
+    result &= Test("global_zero_view_null_and_sum", tzGlobalViewProbe(), 100);
 
     // A fixed-array static COPIES its source, so a local source is not an aliasing hazard
     // and stays accepted; the copy itself persists across calls.

@@ -1734,6 +1734,98 @@ bool LLVMBackend::OwningLocalCopyStillAliases(const NamedVariable& nv) const
         return src != nullptr && src->IsOwning && !src->PointerRebound;
     }
 
+void LLVMBackend::RetargetOwningLocalCopies(const llvm::Value* fromSlot,
+        const std::string& newOwner, llvm::Value* newSlot)
+{
+        if (fromSlot == nullptr || newSlot == nullptr) return;
+        for (auto& frame : stackNamedVariable)
+            for (auto& [varName, nv] : frame.namedVariable)
+                if (nv.BorrowsOwningLocal && nv.OwningLocalStorage == fromSlot)
+                {
+                    nv.OwningLocalStorage = newSlot;
+                    nv.OwningLocalOrigin = newOwner;
+                }
+    }
+
+std::vector<llvm::Value*> LLVMBackend::JoinArmValues(const llvm::Value* joined) const
+{
+        // Leaf arms of a join, flattened through nested ?: / ?? / phi joins (visited guards phi cycles).
+        std::vector<llvm::Value*> arms;
+        std::unordered_set<const llvm::Value*> visited;
+        std::function<void(const llvm::Value*, bool)> collect = [&](const llvm::Value* value, bool top) {
+            if (!visited.insert(value).second) return;
+            std::vector<llvm::Value*> direct;
+            if (const auto* select = llvm::dyn_cast_or_null<llvm::SelectInst>(value))
+            {
+                direct.push_back(const_cast<llvm::Value*>(select->getTrueValue()));
+                direct.push_back(const_cast<llvm::Value*>(select->getFalseValue()));
+            }
+            else if (const auto* phi = llvm::dyn_cast_or_null<llvm::PHINode>(value))
+            {
+                for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+                    direct.push_back(phi->getIncomingValue(i));
+            }
+            else if (const auto* join = FindNullCoalesceJoin(value))
+            {
+                for (const auto& arm : join->Arms) direct.push_back(arm.Value);
+            }
+            else
+            {
+                if (!top) arms.push_back(const_cast<llvm::Value*>(value));
+                return;
+            }
+            for (const llvm::Value* arm : direct) collect(arm, false);
+        };
+        collect(joined, true);
+        return arms;
+    }
+
+const LLVMBackend::NamedVariable* LLVMBackend::FindOwningLocalCopyJoinArm(const llvm::Value* joined) const
+{
+        for (const llvm::Value* arm : JoinArmValues(joined))
+        {
+            const auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(arm);
+            if (load == nullptr) continue;
+            const NamedVariable* copy = FindVariableByStorage(load->getPointerOperand());
+            if (copy != nullptr && copy->BorrowsOwningLocal && OwningLocalCopyStillAliases(*copy))
+                return copy;
+        }
+        return nullptr;
+    }
+
+void LLVMBackend::ConsumeOwningLocalJoinArms(llvm::Value* joined)
+{
+        if (joined == nullptr || !joined->getType()->isPointerTy()) return;
+        const NullCoalesceJoin* coalesce = FindNullCoalesceJoin(joined);
+        // Only a direct (unnested) '??' LHS load is taken whenever non-null; see MarkVariableMoved below.
+        const llvm::Value* coalesceLhs = coalesce != nullptr && !coalesce->Arms.empty()
+            ? coalesce->Arms.front().Value : nullptr;
+        const auto arms = JoinArmValues(joined);
+        for (size_t i = 0; i < arms.size(); i++)
+        {
+            auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(arms[i]);
+            if (load == nullptr || load->getType() != joined->getType() || IsMovedOutPtrValue(arms[i]))
+                continue;
+            llvm::Value* slot = load->getPointerOperand();
+            const NamedVariable* owner = FindVariableByStorage(slot);
+            if (owner == nullptr || !owner->IsOwning || owner->IsBorrowed || owner->IsAliasBorrow
+                || owner->TypeAndValue.IsAlias || owner->BorrowsOwningLocal
+                || !owner->TypeAndValue.Pointer)
+                continue;
+            const std::string name = FindVariableNameByStorage(slot);
+            if (name.empty()) continue;
+            // Null the slot only when the join yielded this arm; the other arm keeps its owner.
+            llvm::Value* current = builder->CreateLoad(joined->getType(), slot);
+            llvm::Value* taken = builder->CreateICmpEQ(joined, current);
+            builder->CreateStore(builder->CreateSelect(taken,
+                llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(joined->getType())),
+                current), slot);
+            // The '??' LHS is taken whenever it is non-null, so its compile-time move is exact; a
+            // ternary or RHS arm may stay live, so only its runtime slot is nulled.
+            if (coalesceLhs != nullptr && arms[i] == coalesceLhs) MarkVariableMoved(name);
+        }
+    }
+
 std::string LLVMBackend::FindVariableNameByStorage(const llvm::Value* slot) const
 {
         if (slot == nullptr) return {};

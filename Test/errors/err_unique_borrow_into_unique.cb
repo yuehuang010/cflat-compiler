@@ -196,3 +196,56 @@ extern int main()
 {
     return 0;
 }
+
+// T250: the chained inner forms that stay refused keep their messages. A borrowed source (a global,
+// a ternary arm, a raw local) is refused even when the inner slot owned an older object.
+struct T250BorrowBox { int v = 0; ~T250BorrowBox() {} };
+struct T250Holder { T250BorrowBox* raw = nullptr; };
+T250BorrowBox* t250Global = nullptr;
+
+expect_error("cannot reset unique<T250BorrowBox> 'owner' from borrowed value 'raw'") {
+    void t250ChainOverwriteOwned()
+    {
+        unique T250BorrowBox* owner = nullptr;
+        T250BorrowBox* raw = nullptr;
+        raw = new T250BorrowBox();
+        owner = raw = t250Global;
+    }
+}
+
+expect_error("cannot reset unique<T250BorrowBox> 'owner' from borrowed value 'raw'") {
+    void t250ChainTernaryBorrowArm(bool c)
+    {
+        unique T250BorrowBox* owner = nullptr;
+        T250BorrowBox* raw = nullptr;
+        T250BorrowBox* src = nullptr;
+        owner = raw = (c ? new T250BorrowBox() : src);
+    }
+}
+
+expect_error("cannot reset unique<T250BorrowBox> 'owner' from borrowed value 'h'") {
+    void t250FieldChainKept()
+    {
+        unique T250BorrowBox* owner = nullptr;
+        T250Holder h;
+        owner = h.raw = new T250BorrowBox();
+    }
+}
+
+expect_error("cannot reset unique<T250BorrowBox> 'owner' from a borrowed value") {
+    void t250GlobalChainKept()
+    {
+        unique T250BorrowBox* owner = nullptr;
+        owner = t250Global = new T250BorrowBox();
+    }
+}
+
+expect_error("cannot reset unique<T250BorrowBox> 'a' from borrowed value 'b'") {
+    void t250ThreeDeepKept()
+    {
+        unique T250BorrowBox* a = nullptr;
+        T250BorrowBox* b = nullptr;
+        T250BorrowBox* c = nullptr;
+        a = b = c = new T250BorrowBox();
+    }
+}

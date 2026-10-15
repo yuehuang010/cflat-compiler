@@ -1487,6 +1487,24 @@ static CFlatParser::NewExpressionContext* RawNewArrayValueOf(antlr4::tree::Parse
     return nullptr;
 }
 
+// T250: true when the RHS IS an assignment, reached only through parentheses and single-child links.
+// A member access, cast or call around it consumes the value differently, so it never takes the slot.
+static bool IsChainedAssignmentShape(antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return false;
+    if (auto* assign = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
+        assign != nullptr && assign->assignmentOperator() != nullptr)
+        return true;
+    if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+        primary != nullptr)
+        return primary->expression() != nullptr && primary->children.size() == 3
+            && IsChainedAssignmentShape(primary->expression());
+    if (auto* ctxRule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+        ctxRule != nullptr && ctxRule->children.size() == 1)
+        return IsChainedAssignmentShape(ctxRule->children[0]);
+    return false;
+}
+
 // Fill omitted TRAILING generic arguments from the template's declared defaults. Returns true
 // when every parameter now has an argument. Shared by the struct/class and function
 // instantiation paths so both agree with the canonical mangled name.
@@ -4634,6 +4652,47 @@ private:
     // The whole `move x` initializer of an `auto` local / operand of a register return: a
     // trivially copyable C++ class there is built through clang's pick for std::move(x).
     CFlatParser::MoveExpressionContext* trivialCxxMoveSite_ = nullptr;
+    CFlatParser::MoveExpressionContext* loweredBraceMoveSite_ = nullptr;
+    std::string loweredBraceMoveTypeName_;
+    llvm::Value* loweredBraceMoveDestination_ = nullptr;
+    struct LoweredBraceMoveScope {
+        MainListener& listener;
+        CFlatParser::MoveExpressionContext* savedSite;
+        std::string savedTypeName;
+        llvm::Value* savedDestination;
+        LoweredBraceMoveScope(MainListener& owner, CFlatParser::MoveExpressionContext* site,
+                              const std::string& typeName, llvm::Value* destination)
+            : listener(owner), savedSite(owner.loweredBraceMoveSite_),
+              savedTypeName(std::move(owner.loweredBraceMoveTypeName_)),
+              savedDestination(owner.loweredBraceMoveDestination_)
+        {
+            listener.loweredBraceMoveSite_ = site;
+            listener.loweredBraceMoveTypeName_ = typeName;
+            listener.loweredBraceMoveDestination_ = destination;
+        }
+        ~LoweredBraceMoveScope()
+        {
+            listener.loweredBraceMoveSite_ = savedSite;
+            listener.loweredBraceMoveTypeName_ = std::move(savedTypeName);
+            listener.loweredBraceMoveDestination_ = savedDestination;
+        }
+        LoweredBraceMoveScope(const LoweredBraceMoveScope&) = delete;
+        LoweredBraceMoveScope& operator=(const LoweredBraceMoveScope&) = delete;
+    };
+    // T258: a plain field (not pointer, alias, view, or array) of a lowered CFlat struct type. A
+    // `move` of such a field's initializer is move-constructed member-wise into the slot.
+    static bool IsLoweredMoveFieldTarget(LLVMBackend* compiler,
+                                         const LLVMBackend::DeclTypeAndValue& field)
+    {
+        return !field.Pointer && !field.ElemPointer && !field.IsAlias && !field.IsArrayView
+            && field.ConstArraySize == 0 && compiler->IsLoweredCFlatOnlyStruct(field.TypeName);
+    }
+    // Builds the deferred `move` source (see LoweredBraceMoveScope) into a field slot member-wise.
+    // False when rightNV is not that move; the caller then runs its normal store path.
+    bool EmitDeferredLoweredMoveIntoField(llvm::Value* slot, const std::string& typeName,
+                                          const LLVMBackend::NamedVariable& rightNV,
+                                          bool destinationIsFresh,
+                                          const LLVMBackend::OwnedTempMark& ownedTempMark);
     struct CallArgumentScope {
         bool& slot;
         int& ternaryDepth;
@@ -7713,6 +7772,11 @@ public:
     bool RejectImplicitConsumeOfOutlivingOwner(
         LLVMBackend* compiler, const LLVMBackend::NamedVariable& srcNV,
         bool srcIsMove, antlr4::ParserRuleContext* ctx);
+    // Each source arm of a '?:' / '??' join that feeds a unique field store gets the same refusal
+    // its plain form gets (a field of a borrowed by-value parameter). True when refused.
+    bool RejectJoinedSourceIntoUniqueField(
+        LLVMBackend* compiler, const LLVMBackend::NamedVariable& rightNV,
+        antlr4::ParserRuleContext* ctx);
 
     // Reject an owning-field overwrite when the field path roots at a borrowed by-value
     // parameter or an alias-borrow local. The drop-old destructor would free the real owner's

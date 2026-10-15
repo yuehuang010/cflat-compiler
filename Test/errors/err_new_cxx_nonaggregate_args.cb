@@ -1,0 +1,13 @@
+import cpp "../library/cpp_interop_basic.h";
+
+extern int main()
+{
+    expect_error("no constructor matching the provided arguments") {
+        cppnewtriv.NA* invalid = new cppnewtriv.NA(1);
+    }
+    expect_error("no constructor matching the provided arguments") {
+        cppnewtriv.NA source = cppnewtriv.makeNA(1, 2);
+        cppnewtriv.NA* invalid = new cppnewtriv.NA(source, source);
+    }
+    return 0;
+}

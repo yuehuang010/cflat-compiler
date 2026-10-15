@@ -20,10 +20,7 @@ Still open:
 
 T226 review 1 (pre-existing on master): `static T g = move a` fixed by T233; `B mk(){ D d = D(6); return d; }` copies where C++20 implicit-moves.
 
-## Left after T233 r2 (Opus review 2; repros scratch/repro_keep/t233_rev2/, clang twin rv.hpp; values right, counts off by one)
-- A deferred derived arm whose other arm is a NESTED ternary skips clang's temp (nested arms record no
-  category): `B g = c ? d1 : (c ? move d2 : D(3))` fix 1 2 1 0 3, clang 1 2 1 1 4 (static and `!c` too).
-  Direction: MainListener_Expressions.cpp ~9335 / ~9490, record a nested same-derived arm as a prvalue.
-- A member of a class prvalue (`mkH(1).d`, xvalue in C++) is classified as an lvalue arm:
-  `c ? mkH(1).d : D(2)` copies where clang moves; `c ? move d1 : mkH(2).d` adds a temp. Direction: ~8941,
-  an arm stored in a field of an owned temp is an xvalue.
+## Left after T243 (Opus review 1; repros scratch/repro_keep/t243_rev/, counts only, values right)
+- A NESTED field or array element of a class temp is still an lvalue arm: `c ? rv.mkH2(1).h.d : rv.D(2)` 1 1 1 1 3
+  (clang 1 1 0 2 3); `c ? rv.mkHA(1).a[0] : rv.D(2)` 1 2 0 1 3 (clang 1 2 0 2 4). IsFieldOfOwnedStructTemp
+  (LLVMBackend_OwnershipTemps.cpp ~4726) looks one GEP deep; walk the GEP chain back to the temp's alloca.

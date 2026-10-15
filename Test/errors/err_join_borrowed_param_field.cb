@@ -1,0 +1,55 @@
+// A field of a borrowed by-value struct parameter consumed through a '?:' or '??' join is refused
+// as the plain 'S.p' store is: the caller's struct still owns the pointee.
+
+struct Resource { int id = 0; ~Resource() { } };
+struct UniqueBox { unique Resource* item = nullptr; };
+
+// Ternary join of a borrowed parameter's field into a unique field.
+expect_error("cannot consume field 'UniqueBox.item' out of borrowed parameter 's'") {
+    int joinTernary(UniqueBox s, bool f)
+    {
+        UniqueBox t = default;
+        t.item = f ? s.item : nullptr;
+        return t.item != nullptr ? 1 : 0;
+    }
+}
+
+// Null-coalescing join of the same field.
+expect_error("cannot consume field 'UniqueBox.item' out of borrowed parameter 's'") {
+    int joinCoalesce(UniqueBox s)
+    {
+        UniqueBox t = default;
+        t.item = s.item ?? nullptr;
+        return t.item != nullptr ? 1 : 0;
+    }
+}
+
+struct Outer { UniqueBox inner; };
+
+// Nested field of the borrowed parameter reached through a ternary join.
+expect_error("cannot consume field 'UniqueBox.item' out of borrowed parameter 'o'") {
+    int joinNested(Outer o, bool f)
+    {
+        UniqueBox t = default;
+        t.item = f ? o.inner.item : nullptr;
+        return t.item != nullptr ? 1 : 0;
+    }
+}
+
+// Named brace initializer whose field is a ternary join of the parameter's field.
+expect_error("cannot consume field 'UniqueBox.item' out of borrowed parameter 's'") {
+    int joinBrace(UniqueBox s, bool f)
+    {
+        UniqueBox t = { item = f ? s.item : nullptr };
+        return t.item != nullptr ? 1 : 0;
+    }
+}
+
+// Tag-form initializer, same join.
+expect_error("cannot consume field 'UniqueBox.item' out of borrowed parameter 's'") {
+    int joinTag(UniqueBox s, bool f)
+    {
+        UniqueBox t = <UniqueBox item={f ? s.item : nullptr} />;
+        return t.item != nullptr ? 1 : 0;
+    }
+}

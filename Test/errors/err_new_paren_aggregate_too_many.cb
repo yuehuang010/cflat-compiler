@@ -1,0 +1,11 @@
+// T252: `new T(args)` on a C++20 aggregate with more arguments than members is refused like the
+// local form (clang rejects it too). Master compiled the heap form and zero-filled the object.
+import cpp "../library/cpp_interop_basic.h";
+
+extern int main()
+{
+    expect_error("has no constructor taking 3 argument(s)") {
+        cppnewagg.AG2* p = new cppnewagg.AG2(1, 2, 3);
+    }
+    return 0;
+}

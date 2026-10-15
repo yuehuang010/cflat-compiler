@@ -10880,7 +10880,8 @@ bool LLVMBackend::TryBindCxxImplicitDefaultCtor(const std::string& typeName, std
         const uint64_t hash = HashWrapperKey(typeName + "|implicit-default-ctor|" + ownerSpelling);
         const std::string wrapperName = std::format("__cflat_implicit_ctor_{:016x}", hash);
         const std::string wrapperSource = "#include <new>\nextern \"C\" __attribute__((weak)) void " + wrapperName + "("
-            + ownerSpelling + " * p) { new (p) " + ownerSpelling + "(); }\n";
+            + ownerSpelling + " * p) { ::new (p) " + ownerSpelling + "(); }\n";
+        // `::new`: a class-scope operator new hides the global placement form (C++ name lookup).
         CxxRequestGroupScope groupScope(*this, &group);
         CSigEntry signature;
         if (!RequestGeneratedCxxWrapper(group, wrapperSource, wrapperName,
@@ -12142,12 +12143,10 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                             child = "(*" + parameter + ")";
                         }
                         else if (IsProvenCxxScalarLvalue(argument, true)
-                                 && argument.Storage != nullptr
-                                 && hasSelectedExactReferenceParameter(
-                                        ctorArgIndex, CxxTypeofInner(spelling), true))
+                                 && argument.Storage != nullptr)
                         {
-                            // A `Fn&` / `const Fn&` constructor parameter binds the caller's slot: the
-                            // wrapper takes its address, as the top-level thin branch does.
+                            // Keep a named function pointer an lvalue so clang ranks every ctor
+                            // against its source category, including by-value and bool overloads.
                             parameterSpellings.push_back("void *");
                             constructionFunctionPointerSlots.emplace_back(
                                 parameterSpellings.size() - 1, functionType);
@@ -12156,17 +12155,18 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                                 ? " const" : "";
                             child = "*static_cast<" + spelling + cv + " *>(" + parameter + ")";
                         }
-                        else if (argument.IsExplicitMove && argument.Storage != nullptr
-                                 && hasSelectedExactReferenceParameter(
-                                        ctorArgIndex, CxxTypeofInner(spelling), true, true))
+                        else if (IsCxxRvalueReferenceArgument(argument)
+                                 && argument.Storage != nullptr)
                         {
-                            // `move f` is an xvalue of the caller's slot, so Fn&& must alias it.
+                            // Keep xvalue category and top-level const for clang's overload set.
                             parameterSpellings.push_back("void *");
                             constructionFunctionPointerSlots.emplace_back(
                                 parameterSpellings.size() - 1, functionType);
                             argument.Primary = argument.Storage;
-                            child = "static_cast<" + spelling + " &&>(*static_cast<"
-                                + spelling + " *>(" + parameter + "))";
+                            const std::string cv = CxxConstReceiverKind(argument) != 0
+                                ? " const" : "";
+                            child = "static_cast<" + spelling + cv + " &&>(*static_cast<"
+                                + spelling + cv + " *>(" + parameter + "))";
                         }
                         else
                         {
@@ -13489,12 +13489,10 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                             child = "(*" + parameter + ")";
                         }
                         else if (IsProvenCxxScalarLvalue(argument, true)
-                                 && argument.Storage != nullptr
-                                 && hasSelectedExactReferenceParameter(
-                                        ctorArgIndex, CxxTypeofInner(spelling), true))
+                                 && argument.Storage != nullptr)
                         {
-                            // A `Fn&` / `const Fn&` constructor parameter binds the caller's slot: the
-                            // wrapper takes its address, as the top-level thin branch does.
+                            // Keep a named function pointer an lvalue so clang ranks every ctor
+                            // against its source category, including by-value and bool overloads.
                             parameterSpellings.push_back("void *");
                             constructionFunctionPointerSlots.emplace_back(
                                 parameterSpellings.size() - 1, childType);
@@ -13503,17 +13501,18 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                                 ? " const" : "";
                             child = "*static_cast<" + spelling + cv + " *>(" + parameter + ")";
                         }
-                        else if (argument.IsExplicitMove && argument.Storage != nullptr
-                                 && hasSelectedExactReferenceParameter(
-                                        ctorArgIndex, CxxTypeofInner(spelling), true, true))
+                        else if (IsCxxRvalueReferenceArgument(argument)
+                                 && argument.Storage != nullptr)
                         {
-                            // `move f` is an xvalue of the caller's slot, so Fn&& must alias it.
+                            // Keep xvalue category and top-level const for clang's overload set.
                             parameterSpellings.push_back("void *");
                             constructionFunctionPointerSlots.emplace_back(
                                 parameterSpellings.size() - 1, childType);
                             argument.Primary = argument.Storage;
-                            child = "static_cast<" + spelling + " &&>(*static_cast<"
-                                + spelling + " *>(" + parameter + "))";
+                            const std::string cv = CxxConstReceiverKind(argument) != 0
+                                ? " const" : "";
+                            child = "static_cast<" + spelling + cv + " &&>(*static_cast<"
+                                + spelling + cv + " *>(" + parameter + "))";
                         }
                         else
                         {
@@ -17283,7 +17282,8 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
                 if (i != 0) wrapperSource += ", ";
                 wrapperSource += params[i] + " p" + std::to_string(i);
             }
-            wrapperSource += ") { new (p0) " + targetCall + "; }\n";
+            // `::new`: a class-scope operator new hides the global placement form (T247).
+            wrapperSource += ") { ::new (p0) " + targetCall + "; }\n";
             if (verbose) std::cout << "[verbose]   generated ctor wrapper: " << sel << wrapperSource;
         };
         compose(parameterSpellings, callArguments, mirror);
@@ -31208,6 +31208,13 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
                                              const std::string& displayTypeName)
 {
         if (dest == nullptr || src == nullptr) return false;
+        if (IsLoweredCFlatOnlyStruct(typeName))
+        {
+            auto* valueType = GetType(TypeAndValue{ .TypeName = typeName });
+            return useMove
+                ? EmitLoweredMemberwiseMove(typeName, valueType, dest, src, context)
+                : EmitLoweredMemberwiseCopy(typeName, valueType, dest, src, context);
+        }
         // C++ falls back from move to COPY construction when the class declares no move
         // constructor. It never falls back the other way: silently moving where a copy was
         // written would leave the source consumed behind the user's back.

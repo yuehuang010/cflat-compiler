@@ -525,6 +525,139 @@ PtrLeak* rkMA(PtrLeak* a, int n) { return rkMB(a, n); }
 PtrLeak* g_rkKeep = nullptr;
 PtrLeak* rkGlobCall(int c) { return rkGlobLate(c > 0 ? new PtrLeak() : nullptr); }
 PtrLeak* rkGlobLate(PtrLeak* p) { g_rkKeep = p; if (p != nullptr) { p.v = 31; } return g_rkKeep; }
+int g_rkIZero = 0;
+// T237: the arms are interior pointers (&(new PtrLeak())->v) so the arm temp is a pointer temp the
+// return flush frees. v is the first field, so (PtrLeak*) of the arm is the object to delete.
+// (An object-pointer arm is not freed by the return flush on any build: no leg for it.)
+// Indirect (function<>) callee, struct result: the ABI coerces it to {i64, i64}, which hides the
+// pointer from the return walk, so the arm must be kept for the caller.
+struct RkWrapI { int* p = nullptr; int k = 0; };
+RkWrapI rkWrapLateI(int* p) { RkWrapI r; *p = 18; r.p = p; r.k = 18; return r; }
+function<RkWrapI(int*)> g_rkWrapFn = rkWrapLateI;
+RkWrapI rkIndCallI(int c) { return g_rkWrapFn(c > 0 ? &(new PtrLeak())->v : &g_rkIZero); }
+// The callee is defined BEFORE its caller and parks the argument in a global it returns.
+int* g_rkEarlyI = nullptr;
+int* rkGlobEarlyI(int* p) { g_rkEarlyI = p; *p = 41; return g_rkEarlyI; }
+int* rkGlobEarlyCallI(int c) { return rkGlobEarlyI(c > 0 ? &(new PtrLeak())->v : &g_rkIZero); }
+// The callee stores the argument through an out-param and returns it back from there.
+struct RkOutI { int* p = nullptr; };
+int* rkOutEarlyI(int* p, RkOutI* out) { out->p = p; *p = 51; return out->p; }
+int* rkOutCallI(int c, RkOutI* out) { return rkOutEarlyI(c > 0 ? &(new PtrLeak())->v : &g_rkIZero, out); }
+
+// T241: a statement temp whose address (&(new T241Temp(25))->v) reaches a VOID callee that stores the
+// argument out-param, global, or indirect. Nothing is returned, so the return walk never sees the
+// escape: the temp must be kept, not freed at the statement end. v is the first field (see T237).
+int g_t241Dtor = 0;
+struct T241Temp { int v = 0; T241Temp(int x) { v = x; } ~T241Temp() { g_t241Dtor = g_t241Dtor + 1; v = -777; } };
+struct T241Out { int* p = nullptr; int k = 0; };
+void t241SetOut(int* p, T241Out* o) { o->p = p; o->k = 1; }
+T241Out t241OutCall(int c) { T241Out h; t241SetOut(&(new T241Temp(25))->v, &h); return h; }
+function<void(int*, T241Out*)> g_t241Fn = t241SetOut;
+T241Out t241IndCall(int c) { T241Out h; g_t241Fn(&(new T241Temp(25))->v, &h); return h; }
+int* g_t241Keep = nullptr;
+void t241Keep(int* p) { g_t241Keep = p; }
+int* t241GlobCall(int c) { t241Keep(&(new T241Temp(25))->v); return g_t241Keep; }
+// Guards: a void callee that only reads its argument, or stores it in its own local, still frees it.
+void t241ReadOnly(int* p) { int x = *p; }
+void t241LocalStore(int* p) { int* q = p; int x = *q; }
+void t241ReadCall(int c) { t241ReadOnly(&(new T241Temp(25))->v); }
+void t241LocalCall(int c) { t241LocalStore(&(new T241Temp(25))->v); }
+// Void callees defined AFTER their callers: the free waits for the end-of-module answer.
+T241Out t241LaterCall(int c) { T241Out h; t241LaterSet(&(new T241Temp(25))->v, &h); return h; }
+void t241LaterSet(int* p, T241Out* o) { o->p = p; o->k = 1; }
+void t241LaterReadCall(int c) { t241LaterRead(&(new T241Temp(25))->v); }
+void t241LaterRead(int* p) { int x = *p; }
+// T245: a later-defined NON-void callee in a statement (`int z = f(...)`) that parks the temp's address
+// keeps it; a read-only one still frees it at the statement end.
+int* g_t245Keep = nullptr;
+int g_t245Seen = 0;
+int t245NVKeepCall(int c) { int z = t245NVSet(&(new T241Temp(25))->v); return z + c; }
+// A scalar return operand: the return flush frees a scalar result's temps, so the callee's gate decides.
+int t245RetScalarCall(int c) { return t245NVSet(&(new T241Temp(25))->v) + c; }
+int t245NVSet(int* p) { g_t245Keep = p; return 0; }
+T241Out t245NVOutCall(int c) { T241Out h; int z = t245NVOutSet(&(new T241Temp(25))->v, &h); h.k = h.k + z; return h; }
+int t245NVOutSet(int* p, T241Out* o) { o->p = p; o->k = 1; return 0; }
+void t245NVReadCall(int c) { g_t245Seen = t245NVRead(&(new T241Temp(25))->v); }
+int t245NVRead(int* p) { return *p; }
+
+// T251: later-defined callees must gate the same statement temp on both normal and unwind exits.
+int* g_t251Keep = nullptr;
+void t251LaterFieldKeep(int* p);
+int t251LateCoalesceKeepCall()
+{
+    T241Temp* e = nullptr;
+    t251LaterFieldKeep(&(e ?? new T241Temp(35))->v);
+    return 0;
+}
+int t251LateTernaryKeepCall()
+{
+    bool c = true;
+    T241Temp* e = nullptr;
+    t251LaterFieldKeep(&(c ? new T241Temp(36) : e)->v);
+    return 0;
+}
+void t251LaterFieldKeep(int* p) { g_t251Keep = p; }
+
+// T255: nested field and array-element addresses must keep their new owner through readers.
+int g_t255Dtor = 0;
+int g_t255Seen = 0;
+struct T255Leaf { int v = 0; };
+struct T255Outer
+{
+    T255Leaf inner;
+    T255Outer(int x) { inner.v = x; }
+    ~T255Outer() { g_t255Dtor = g_t255Dtor + 1; }
+};
+struct T255Array
+{
+    int a[4];
+    T255Array(int x) { a[2] = x; }
+    ~T255Array() { g_t255Dtor = g_t255Dtor + 1; }
+};
+int t255ReadEarlier(int* p) { return *p; }
+void t255NestedEarlierReadCall() { g_t255Seen = t255ReadEarlier(&(new T255Outer(25))->inner.v); }
+void t255ArrayEarlierReadCall() { g_t255Seen = t255ReadEarlier(&(new T255Array(26))->a[2]); }
+void t255ReadLaterCall();
+void t255ArrayLaterReadCall();
+int t255ReadLater(int* p) { return *p; }
+void t255ReadLaterCall() { g_t255Seen = t255ReadLater(&(new T255Outer(27))->inner.v); }
+void t255ArrayLaterReadCall() { g_t255Seen = t255ReadLater(&(new T255Array(28))->a[2]); }
+// Retaining callees keep the nested temp alive (guard: following the GEP chain must not free it).
+int* g_t255Kept = nullptr;
+void t255KeepEarlier(int* p) { g_t255Kept = p; }
+void t255KeepLater(int* p);
+void t255KeepNestedCalls()
+{
+    t255KeepEarlier(&(new T255Outer(31))->inner.v);
+    int* first = g_t255Kept;
+    t255KeepLater(&(new T255Array(32))->a[2]);
+    g_t255Seen = *first * 100 + *g_t255Kept;
+    // inner.v sits at the start of T255Outer; a[2] is two ints into T255Array.
+    if (g_t255Dtor == 0) { delete (T255Outer*)first; delete (T255Array*)(g_t255Kept - 2); }
+}
+void t255KeepLater(int* p) { g_t255Kept = p; }
+
+// T260: an all-owning ternary PHI inside `??` must keep its selected field owner through a call.
+int g_t260Dtor = 0;
+int g_t260Made = 0;
+int g_t260Seen = 0;
+int* g_t260Kept = nullptr;
+struct T260Temp
+{
+    int v = 0;
+    T260Temp(int x) { v = x; g_t260Made = g_t260Made + 1; }
+    ~T260Temp() { g_t260Dtor = g_t260Dtor + 1; }
+};
+void t260KeepLater(int* p);
+int t260ReadLater(int* p);
+int t260ReadEarlier(int* p) { return *p; }
+void t260KeepRightCall(int c) { T260Temp* e = nullptr; t260KeepLater(&(e ?? (c ? new T260Temp(51) : new T260Temp(52)))->v); }
+void t260KeepLeftCall(int c) { T260Temp* n = nullptr; t260KeepLater(&((c ? new T260Temp(53) : new T260Temp(54)) ?? n)->v); }
+int t260ReadEarlierCall(int c) { T260Temp* e = nullptr; return t260ReadEarlier(&(e ?? (c ? new T260Temp(55) : new T260Temp(56)))->v); }
+int t260ReadLaterCall(int c) { T260Temp* e = nullptr; return t260ReadLater(&(e ?? (c ? new T260Temp(57) : new T260Temp(58)))->v); }
+int t260ReadNonNullCall(int c) { T260Temp* e = new T260Temp(59); g_t260Seen = t260ReadLater(&(e ?? (c ? new T260Temp(60) : new T260Temp(61)))->v); return g_t260Seen * 100 + g_t260Made * 10 + g_t260Dtor; }
+void t260KeepLater(int* p) { g_t260Kept = p; }
+int t260ReadLater(int* p) { return *p; }
 
 // Regression: a value struct with a USER destructor over a RAW pointer field (not `unique`) and NO
 // copy() is NON-copyable - the memberwise synth would shallow-share the pointer while the dtor frees
@@ -4563,6 +4696,205 @@ extern int main()
         total++; passed += Test("mutual-recursive later callee: not freed early", g_shapeDtor, 0);
         delete mut;
         total++; passed += Test("mutual-recursive later callee: freed once by caller", g_shapeDtor, 1);
+
+        // T237: indirect callee with a struct result. The caller frees the arm object once.
+        g_shapeDtor = 0;
+        RkWrapI wrapped = rkIndCallI(1);
+        total++; passed += Test("indirect struct callee: value", *wrapped.p, 18);
+        total++; passed += Test("indirect struct callee: not freed early", g_shapeDtor, 0);
+        PtrLeak* wrappedObj = (PtrLeak*)wrapped.p;
+        delete wrappedObj;
+        total++; passed += Test("indirect struct callee: freed once by caller", g_shapeDtor, 1);
+
+        // T237: the callee is defined before the caller and returns the arm through a global.
+        g_shapeDtor = 0;
+        int* early = rkGlobEarlyCallI(1);
+        total++; passed += Test("earlier callee returns arm via global: value", *early, 41);
+        total++; passed += Test("earlier callee returns arm via global: not freed early", g_shapeDtor, 0);
+        PtrLeak* earlyObj = (PtrLeak*)early;
+        delete earlyObj;
+        g_rkEarlyI = nullptr;
+        total++; passed += Test("earlier callee returns arm via global: freed once by caller", g_shapeDtor, 1);
+
+        // T237: the callee returns the arm back from an out-param it was handed.
+        g_shapeDtor = 0;
+        RkOutI outSlot = default;
+        int* viaOut = rkOutCallI(1, &outSlot);
+        total++; passed += Test("out-param callee returns arm: value", *viaOut, 51);
+        total++; passed += Test("out-param callee returns arm: not freed early", g_shapeDtor, 0);
+        total++; passed += Test("out-param callee returns arm: slot holds it", outSlot.p == viaOut, true);
+        PtrLeak* viaOutObj = (PtrLeak*)viaOut;
+        delete viaOutObj;
+        total++; passed += Test("out-param callee returns arm: freed once by caller", g_shapeDtor, 1);
+
+        // T241: a void out-param callee keeps the arm the caller's returned struct holds.
+        g_t241Dtor = 0;
+        T241Out viaVoidOut = t241OutCall(1);
+        total++; passed += Test("void out-param callee keeps arm: value", *viaVoidOut.p, 25);
+        total++; passed += Test("void out-param callee keeps arm: not freed early", g_t241Dtor, 0);
+        T241Temp* voidOutObj = (T241Temp*)viaVoidOut.p;
+        delete voidOutObj;
+        total++; passed += Test("void out-param callee keeps arm: freed once by caller", g_t241Dtor, 1);
+
+        // T241: an indirect (function<void>) callee with the same out-param store.
+        g_t241Dtor = 0;
+        T241Out viaInd = t241IndCall(1);
+        total++; passed += Test("indirect void callee keeps arm: value", *viaInd.p, 25);
+        total++; passed += Test("indirect void callee keeps arm: not freed early", g_t241Dtor, 0);
+        T241Temp* indObj = (T241Temp*)viaInd.p;
+        delete indObj;
+        total++; passed += Test("indirect void callee keeps arm: freed once by caller", g_t241Dtor, 1);
+
+        // T241: a void callee parks the arm in a global; the caller reads it back and frees it.
+        g_t241Dtor = 0;
+        int* viaGlobVoid = t241GlobCall(1);
+        total++; passed += Test("void global callee keeps arm: value", *viaGlobVoid, 25);
+        total++; passed += Test("void global callee keeps arm: not freed early", g_t241Dtor, 0);
+        T241Temp* globObj = (T241Temp*)viaGlobVoid;
+        delete globObj;
+        g_t241Keep = nullptr;
+        total++; passed += Test("void global callee keeps arm: freed once by caller", g_t241Dtor, 1);
+
+        // T241 guards: read-only and local-store void callees still free the temp at the statement end.
+        g_t241Dtor = 0;
+        t241ReadCall(1);
+        total++; passed += Test("void read-only callee frees arm", g_t241Dtor, 1);
+        g_t241Dtor = 0;
+        t241LocalCall(1);
+        total++; passed += Test("void local-store callee frees arm", g_t241Dtor, 1);
+
+        // T241: a void callee defined after its caller keeps the arm it stores out-param.
+        g_t241Dtor = 0;
+        T241Out viaLater = t241LaterCall(1);
+        total++; passed += Test("later void callee keeps arm: value", *viaLater.p, 25);
+        total++; passed += Test("later void callee keeps arm: not freed early", g_t241Dtor, 0);
+        T241Temp* laterObj = (T241Temp*)viaLater.p;
+        delete laterObj;
+        total++; passed += Test("later void callee keeps arm: freed once by caller", g_t241Dtor, 1);
+        g_t241Dtor = 0;
+        t241LaterReadCall(1);
+        total++; passed += Test("later void read-only callee frees arm", g_t241Dtor, 1);
+
+        // T245: a later-defined non-void callee keeps the arm it parks in a global or out-param.
+        g_t241Dtor = 0;
+        g_t245Keep = nullptr;
+        total++; passed += Test("later non-void global callee: value", t245NVKeepCall(1), 1);
+        total++; passed += Test("later non-void global callee keeps arm: value", *g_t245Keep, 25);
+        total++; passed += Test("later non-void global callee keeps arm: not freed early", g_t241Dtor, 0);
+        T241Temp* nvKeepObj = (T241Temp*)g_t245Keep;
+        delete nvKeepObj;
+        g_t245Keep = nullptr;
+        total++; passed += Test("later non-void global callee keeps arm: freed once by caller", g_t241Dtor, 1);
+        g_t241Dtor = 0;
+        T241Out viaNVOut = t245NVOutCall(1);
+        total++; passed += Test("later non-void out-param callee keeps arm: value", *viaNVOut.p, 25);
+        total++; passed += Test("later non-void out-param callee keeps arm: not freed early", g_t241Dtor, 0);
+        T241Temp* nvOutObj = (T241Temp*)viaNVOut.p;
+        delete nvOutObj;
+        total++; passed += Test("later non-void out-param callee keeps arm: freed once by caller", g_t241Dtor, 1);
+        // A later non-void callee inside a scalar-returning function's return operand keeps the arm too.
+        g_t241Dtor = 0;
+        g_t245Keep = nullptr;
+        total++; passed += Test("later non-void return keeps arm: value", t245RetScalarCall(1), 1);
+        total++; passed += Test("later non-void return keeps arm: not freed early", g_t241Dtor, 0);
+        total++; passed += Test("later non-void return keeps arm: stored value", *g_t245Keep, 25);
+        T241Temp* retObj = (T241Temp*)g_t245Keep;
+        delete retObj;
+        g_t245Keep = nullptr;
+        total++; passed += Test("later non-void return keeps arm: freed once by caller", g_t241Dtor, 1);
+        // Guard: a later non-void callee that only reads its argument still frees the arm once.
+        g_t241Dtor = 0;
+        t245NVReadCall(1);
+        total++; passed += Test("later non-void read-only callee: value", g_t245Seen, 25);
+        total++; passed += Test("later non-void read-only callee frees arm", g_t241Dtor, 1);
+
+        // T251: the deferred gate must find a field pointer's temp through both join forms.
+        g_t241Dtor = 0;
+        g_t251Keep = nullptr;
+        int t251CoalesceResult = t251LateCoalesceKeepCall();
+        total++; passed += Test("T251 coalesce join call result", t251CoalesceResult, 0);
+        total++; passed += Test("T251 coalesce join retains temp", g_t241Dtor, 0);
+        int t251CoalesceValue = g_t241Dtor == 0 && g_t251Keep != nullptr ? *g_t251Keep : -999;
+        total++; passed += Test("T251 coalesce join field value", t251CoalesceValue, 35);
+        if (g_t241Dtor == 0 && g_t251Keep != nullptr) delete (T241Temp*)g_t251Keep;
+        g_t251Keep = nullptr;
+        total++; passed += Test("T251 coalesce join temp released once by owner", g_t241Dtor, 1);
+
+        g_t241Dtor = 0;
+        g_t251Keep = nullptr;
+        int t251TernaryResult = t251LateTernaryKeepCall();
+        total++; passed += Test("T251 ternary join call result", t251TernaryResult, 0);
+        total++; passed += Test("T251 ternary join retains temp", g_t241Dtor, 0);
+        int t251TernaryValue = g_t241Dtor == 0 && g_t251Keep != nullptr ? *g_t251Keep : -999;
+        total++; passed += Test("T251 ternary join field value", t251TernaryValue, 36);
+        if (g_t241Dtor == 0 && g_t251Keep != nullptr) delete (T241Temp*)g_t251Keep;
+        g_t251Keep = nullptr;
+        total++; passed += Test("T251 ternary join temp released once by owner", g_t241Dtor, 1);
+
+        // T255: earlier/later CFlat readers free both two-GEP shapes once per statement.
+        g_t255Dtor = 0;
+        t255NestedEarlierReadCall();
+        total++; passed += Test("T255 earlier nested-field reader value and frees once",
+                                g_t255Seen == 25 && g_t255Dtor == 1, true);
+        g_t255Dtor = 0;
+        t255ArrayEarlierReadCall();
+        total++; passed += Test("T255 earlier array-element reader value and frees once",
+                                g_t255Seen == 26 && g_t255Dtor == 1, true);
+
+        g_t255Dtor = 0;
+        t255ReadLaterCall();
+        total++; passed += Test("T255 later nested-field reader value and frees once",
+                                g_t255Seen == 27 && g_t255Dtor == 1, true);
+        g_t255Dtor = 0;
+        t255ArrayLaterReadCall();
+        total++; passed += Test("T255 later array-element reader value and frees once",
+                                g_t255Seen == 28 && g_t255Dtor == 1, true);
+        g_t255Dtor = 0;
+        t255KeepNestedCalls();
+        total++; passed += Test("T255 retaining callees keep nested temps alive",
+                                g_t255Seen == 3132 && g_t255Dtor == 2, true);
+
+        // T260: both `??` nestings retain either selected owner and release it once at the owner.
+        for (int c = 0; c < 2; c++)
+        {
+            g_t260Dtor = 0; g_t260Made = 0; g_t260Kept = nullptr;
+            t260KeepRightCall(c == 0);
+            int rightValue = g_t260Dtor == 0 && g_t260Kept != nullptr ? *g_t260Kept : -999;
+            int rightExpected = c == 0 ? 51 : 52;
+            total++; passed += Test("T260 RHS ternary retained value", rightValue, rightExpected);
+            total++; passed += Test("T260 RHS ternary not freed early", g_t260Dtor, 0);
+            total++; passed += Test("T260 RHS ternary constructs one arm", g_t260Made, 1);
+            if (g_t260Dtor == 0 && g_t260Kept != nullptr) delete (T260Temp*)g_t260Kept;
+            g_t260Kept = nullptr;
+            total++; passed += Test("T260 RHS ternary released once", g_t260Dtor, 1);
+
+            g_t260Dtor = 0; g_t260Made = 0; g_t260Kept = nullptr;
+            t260KeepLeftCall(c == 0);
+            int leftValue = g_t260Dtor == 0 && g_t260Kept != nullptr ? *g_t260Kept : -999;
+            int leftExpected = c == 0 ? 53 : 54;
+            total++; passed += Test("T260 LHS ternary retained value", leftValue, leftExpected);
+            total++; passed += Test("T260 LHS ternary not freed early", g_t260Dtor, 0);
+            total++; passed += Test("T260 LHS ternary constructs one arm", g_t260Made, 1);
+            if (g_t260Dtor == 0 && g_t260Kept != nullptr) delete (T260Temp*)g_t260Kept;
+            g_t260Kept = nullptr;
+            total++; passed += Test("T260 LHS ternary released once", g_t260Dtor, 1);
+        }
+
+        g_t260Dtor = 0; g_t260Made = 0;
+        total++; passed += Test("T260 earlier reader value", t260ReadEarlierCall(true), 55);
+        total++; passed += Test("T260 earlier reader frees once", g_t260Dtor, 1);
+        total++; passed += Test("T260 earlier reader constructs one arm", g_t260Made, 1);
+        g_t260Dtor = 0; g_t260Made = 0;
+        total++; passed += Test("T260 later reader value", t260ReadLaterCall(false), 58);
+        total++; passed += Test("T260 later reader frees once", g_t260Dtor, 1);
+        total++; passed += Test("T260 later reader constructs one arm", g_t260Made, 1);
+
+        g_t260Dtor = 0; g_t260Made = 0;
+        int t260NonNullResult = t260ReadNonNullCall(true);
+        total++; passed += Test("T260 non-null coalesce LHS value and scope dtor", t260NonNullResult, 5910);
+        total++; passed += Test("T260 non-null coalesce LHS constructs no fallback", g_t260Made, 1);
+        total++; passed += Test("T260 non-null coalesce LHS releases once", g_t260Dtor, 1);
+
     }
 
 

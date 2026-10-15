@@ -135,6 +135,11 @@ inline int escThrow(Esc* p, int value) { if (value != 0) throw value; return p->
 inline int escThrowKeep(Esc* p, int value)
 { if (p != nullptr) escKept = p; throw value; }
 inline Esc* escTake() noexcept { Esc* p = escKept; escKept = nullptr; return p; }
+// T245: an int* argument (`&(new Esc(x))->v`) parked in a global by one callee and only read by another.
+inline int* escIntKept = nullptr;
+inline void escKeepIntArg(int* p) noexcept { escIntKept = p; }
+inline int escReadIntArg(int* p) noexcept { return *p; }
+inline int* escIntTake() noexcept { int* p = escIntKept; escIntKept = nullptr; return p; }
 // T236: a constructor that RETAINS its pointer argument (escKept) and records the pointee's value.
 struct EscHolder
 {

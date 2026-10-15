@@ -1,0 +1,12 @@
+// A unique FIELD consumed through a '?:' arm reads as moved on the path after the join, the same
+// way the plain '=' consume does (a later dereference of the source field is refused).
+
+struct Resource2 { int id = 0; };
+struct Box { unique Resource2* item = nullptr; };
+
+expect_error("dereference of moved variable 's.item'") {
+    int badRead(bool f) { Box s = default; s.item = new Resource2(); Box t = default; t.item = f ? s.item : nullptr; return s.item->id; }
+}
+
+// A consumed field may still be tested for null: the read is legal.
+int goodNullTest(bool f) { Box s = default; s.item = new Resource2(); Box t = default; t.item = f ? s.item : nullptr; return s.item == nullptr ? 1 : 0; }

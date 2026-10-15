@@ -276,6 +276,8 @@ import cpp "library/cpp_t22_constrained_members.hpp";
 import cpp "library/cpp_interop_demand_fail.h";
 import cpp "library/cpp_interop_anon.h";
 import cpp "library/cpp_interop_explicit.h";
+import cpp "library/cpp_t253_brace_move.hpp";
+import cpp "library/cpp_t261_named_unwind.hpp";
 import cpp "library/cpp_interop_refgate.h";
 import cpp "library/cpp_interop_basic.cpp";
 import cpp "library/cpp_interop_member_shadow.h";
@@ -395,6 +397,7 @@ import cpp "library/cpp_interop_unwind.h";
 import cpp "library/cpp_interop_unwind.cpp";
 // Class-scope operator new / delete / new[] / delete[] (legs 3350-3368).
 import cpp "library/cpp_interop_opnew.h";
+import cpp "library/cpp_t242_join.h";
 import "diagnostic/heap_audit.cb";
 // Standard streams: one grouped std import (stringstream is not visible through a user header alone).
 import cpp {"sstream", "fstream", "iostream", "iomanip"};
@@ -424,6 +427,20 @@ void take<T>(list<T>* values, int expectedCount)
 struct CppListBox<T> { list<T> values; };
 struct NewTempBox<T> { T value; };
 struct CppListHolder { cpplist.Plain item = default; int tag = 0; };
+int t255CppDtor = 0;
+struct T255CppLeaf { int value = 0; };
+struct T255CppOuter
+{
+    T255CppLeaf inner;
+    T255CppOuter(int x) { inner.value = x; }
+    ~T255CppOuter() { t255CppDtor = t255CppDtor + 1; }
+};
+struct T255CppArray
+{
+    int values[4];
+    T255CppArray(int x) { values[2] = x; }
+    ~T255CppArray() { t255CppDtor = t255CppDtor + 1; }
+};
 struct CppResultHolder { cppexp.cppresult.Result<cppexp.cppresult.Middle> item = default; };
 struct CppResultBox<T> { T item = default; };
 struct CppListValue { int value = 0; };
@@ -487,6 +504,14 @@ import cpp "library/cpp_interop_t104_refparam.hpp";
 import cpp "library/cpp_t87_null_zero.h";
 import cpp "library/cpp_t132_s7_byval.hpp";
 import cpp "library/cpp_private_base_shadow.h";
+int t248ViaConstFnParam(const function<int(int)> p)
+{
+    return t63.call_t232_fn_pick(t63.CallT232FnPick(p));
+}
+struct T248NativeCtor {
+    int value;
+    T248NativeCtor(int n) { value = n; }
+};
 int cppcg_add(int a, int b) { return a + b; }
 
 // A C++ exception unwinding THROUGH CFlat frames (the C++ `guarded` catch sits above them): every
@@ -1813,6 +1838,18 @@ int T233XvalueDerivedPrvalueTern(bool c) { t226s.D d1 = t226s.D(1); t226s.B g = 
 int T233PrvalueLvalueTern(bool c) { t226s.D d1 = t226s.D(1); t226s.B g = c ? t226s.D(2) : d1; return g.get(); }
 int T233StaticLvalueDerivedPrvalueTern(bool c) { t226s.D d1 = t226s.D(1); static t226s.B g = c ? d1 : t226s.D(2); return g.get(); }
 int T233StaticMoveDeref(int x) { t226s.T a = t226s.T(x); t226s.T* p = &a; static t226s.T g = move *p; return g.get(); }
+// T243: a nested `?:` arm of one derived class joins its outer arm through a temporary; a field of a
+// class prvalue is an xvalue arm. Counts equal clang++ -std=c++20 (both c values).
+int T243NestedTern(bool c) { t226s.D d1 = t226s.D(1); t226s.D d2 = t226s.D(2); t226s.B g = c ? d1 : (c ? move d2 : t226s.D(3)); return g.get(); }
+int T243NestedNotTern(bool c) { t226s.D d1 = t226s.D(1); t226s.D d2 = t226s.D(2); t226s.B g = !c ? d1 : (c ? move d2 : t226s.D(3)); return g.get(); }
+int T243StaticNestedTern(bool c) { t226s.D d1 = t226s.D(1); t226s.D d2 = t226s.D(2); static t226s.B g = c ? d1 : (c ? move d2 : t226s.D(3)); return g.get(); }
+int T243FieldPrvalueTern(bool c) { t226s.B g = c ? t226s.mkH(1).d : t226s.D(2); return g.get(); }
+int T243XvalueFieldTern(bool c) { t226s.D d1 = t226s.D(1); t226s.B g = c ? move d1 : t226s.mkH(2).d; return g.get(); }
+int T243LvalueFieldTern(bool c) { t226s.D d1 = t226s.D(1); t226s.B g = c ? d1 : t226s.mkH(2).d; return g.get(); }
+int T243FieldBothTern(bool c) { t226s.B g = c ? t226s.mkH(1).d : t226s.mkH(2).d; return g.get(); }
+int T243FieldMoveTern(bool c) { t226s.D d2 = t226s.D(2); t226s.B g = c ? t226s.mkH(1).d : move d2; return g.get(); }
+int T243FieldTemp(bool c) { t226s.B g = t226s.mkH(1).d; return g.get(); }
+int T243NamedFieldTern(bool c) { t226s.H h = t226s.mkH(1); t226s.B g = c ? h.d : t226s.D(2); return g.get(); }
 enum T45Ternary : int { Picked = true ? 7 : 8, Other = false ? 7 : 8 };
 
 int T46GenericDot<T>(T p) { return p.get() == nullptr ? 1 : 0; }
@@ -1956,6 +1993,40 @@ struct T218Owned { unique<T218Own> u; int k = 1; T218Owned() { k = 2; u = unique
 struct T218OwnedArray { T218Owned[2] h; };
 T129UserCtor T218Make() { T129UserCtor r = { m = 9 }; return r; }
 T218Owned T218MakeOwned() { T218Owned r = default; r.u = unique<T218Own>(new T218Own()); return r; }
+struct T253HV { t253.Counted m; int k = 1; };
+struct T253OV { T253HV[2] h; };
+struct T253HU { t253.Counted m; int k = 1; T253HU() { k = 2; } };
+struct T253OU { T253HU[2] h; };
+struct T253Plain { int value = 0; };
+struct T253Owned { t253.Counted m; unique<T218Own> u; int k = 1; };
+struct T253FallbackHolder { t253.Fallback f; };
+// T258: a named struct-field `move` (`{ h = move x }`) of a lowered CFlat struct with C++ members.
+struct T258Holder { T253HV h; int z = 0; };
+struct T258Outer { T258Holder inner; int q = 0; };
+struct T258PlainHolder { T253Plain p; int z = 0; };
+struct T258OwnHolder { T253Owned o; int z = 0; };
+struct T258UCHolder { T253HV h; int z = 0; T258UCHolder() { z = 4; } };
+struct T258UCOuter { T258UCHolder inner; int q = 0; };
+struct T258ThrowV { t258.Throwy t; int k = 1; };
+struct T258ThrowHolder { T258ThrowV h; int z = 0; };
+struct T258UCThrow { T258ThrowV h; int z = 0; T258UCThrow() { z = 4; } };
+int t258Fresh(int x) { T258ThrowV s = default; t258.set_throw(x); T258ThrowHolder w = { h = move s }; return w.h.k; }
+int t258Update(int x) { T258ThrowV s = default; t258.set_throw(x); T258UCThrow w = { h = move s }; return w.h.k; }
+// T261: a named brace init (or tag form) whose later field throws destroys the fields built before it.
+struct T261Pair { t261.Counted a; t261.Counted b; int z = 0; };
+struct T261Triple { t261.Counted a; t261.Counted b; t261.Counted c; int z = 0; };
+struct T261Nest { T261Pair inner; int q = 0; };
+struct T261HV { t261.Counted m; int k = 1; };
+struct T261LowPair { T261HV a; T261HV b; int z = 0; };
+int t261Pair(int x) { t261.Counted h0 = default; T261Pair w = { a = h0, b = t261.mk(x) }; return w.z; }
+int t261PairFirst(int x) { t261.Counted h0 = default; T261Pair w = { a = t261.mk(x), b = h0 }; return w.z; }
+int t261Triple(int x) { t261.Counted h0 = default; T261Triple w = { a = h0, b = h0, c = t261.mk(x) }; return w.z; }
+int t261Nest(int x) { t261.Counted h0 = default; T261Nest w = { inner = { a = h0, b = t261.mk(x) } }; return w.q; }
+int t261Tag(int x) { t261.Counted h0 = default; T261Pair* p = <T261Pair a={h0} b={t261.mk(x)} />; int z = p->z; delete p; return z; }
+int t261Lowered(int x) { T261HV hv0 = default; T261LowPair w = { a = hv0, b = t261Mk(x) }; return w.z; }
+T261HV t261Mk(int x) { T261HV h = default; t261.boom(x); return h; }
+struct T261WB { T261HV c; int b = 0; };
+int t261Field(int x) { T261HV h0 = default; T261WB w = { c = h0, b = t261.bval(x) }; return w.b; }
 struct T130ReturnHolder { cppexp.ConvCnt c; int k = 1; };
 struct T130Generic<T> { T c; int k = 1; };
 struct T130ThrowHolder { cppunw.Tx t; int k = 1; };
@@ -2229,6 +2300,18 @@ struct T178MoveOnlyHolder
 
 // T236 (legs 3240-3246): a plain CFlat struct for the `?:` arrow leg.
 struct T236Node { int v = default; };
+
+cppon.Esc* T242LateKept = nullptr;
+int* T251LateKeptField = nullptr;
+int* T260KeptField = nullptr;
+// T256: an alias bound into a call-result temp is destroyed once when a later call in its initializer throws.
+int g_t256Dtor = 0;
+struct T256AR { int v = 7; ~T256AR() { g_t256Dtor = g_t256Dtor + 1; } };
+unique<T256AR> T256Mk() { return unique<T256AR>(new T256AR()); }
+alias int T256Id(alias int a, int t) { return a; }
+int T256AliasThrowInit(int t) { alias int a = T256Id(T256Mk()->v, cppunw.thrower(t)); return a; }
+using T257NAlias = cppnewtriv.NA;
+move T* T257NewCopy<T>(T* source) { return new T(*source); }
 
 extern int main()
 {
@@ -2974,6 +3057,26 @@ extern int main()
     const function<int(int)> t232ConstTemplateFn = t63.call_plus_one;
     if (t63.call_t232_fn_pick_template(t63.CallT232FnPick(t232ConstTemplateFn)) != 204)
         return 9394;
+    // T248: a named function-pointer lvalue cannot bind Fn&&; compare the remaining overloads.
+    function<int(int)> t248BoolFn = t63.call_plus_one;
+    if (t63.call_t248_boolrv(t63.CallT248BoolRv(t248BoolFn)) != 501) return 9400;
+    function<int(int)> t248ValFn = t63.call_plus_one;
+    if (t63.call_t248_valrv(t63.CallT248ValRv(t248ValFn)) != 404) return 9401;
+    if (t248ViaConstFnParam(t63.call_plus_one) != 204) return 9402;
+    const function<int(int)> t248ConstMoveFn = t63.call_plus_one;
+    if (t63.call_t232_fn_pick(t63.CallT232FnPick(move t248ConstMoveFn)) != 204)
+        return 9403;
+    // T248 accept-set: CFlat callees, native ctors, and data-pointer reference ranking stay stable.
+    function<int(int)> t248Callee = t63.call_plus_one;
+    if (t248Callee(3) != 4) return 9405;
+    T248NativeCtor t248Native = T248NativeCtor(42);
+    if (t248Native.value != 42) return 9406;
+    int t248Pointed = 7;
+    int* t248Data = &t248Pointed;
+    if (t63.call_t248_data_pick(t63.CallT248DataPick(t248Data)) != 107) return 9407;
+    int* t248DataMove = &t248Pointed;
+    if (t63.call_t248_data_pick(t63.CallT248DataPick(move t248DataMove)) != 307)
+        return 9408;
     // T232: template and C-variadic ctor snapshots also apply in call-argument position.
     int t232TplInput = 0;
     int t232TplResult = t63.call_t232_tplsel(t63.CallT232TplSel(
@@ -3224,6 +3327,188 @@ extern int main()
     // `static T g = move *p;` move-constructs from the pointee (it used to alias it).
     t226s.reset();
     if (T233StaticMoveDeref(3) != 3 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 1) return 93035;
+    // T247: `new T()` value-initializes a C++ class like clang: default member initializers run
+    // (oracle clang++ -std=c++20 `new T()`), a trivial aggregate reads zero, and a user ctor runs.
+    {
+        cppnewdmi.P* d247p = new cppnewdmi.P();
+        if (d247p->a != 5 || d247p->z != 9) return 98930;
+        cppnewdmi.P* d247bare = new cppnewdmi.P;
+        if (d247bare->a != 5 || d247bare->z != 9) return 98931;
+        cppnewdmi.P* d247arr = new cppnewdmi.P[2];
+        if (d247arr[1].a != 5 || d247arr[1].z != 9) return 98932;
+        cppnewdmi.Q* d247q = new cppnewdmi.Q();
+        if (d247q->a != 0 || d247q->b != 0) return 98933;
+        cppnewdmi.R* d247r = new cppnewdmi.R();
+        if (d247r->q.a != 0 || d247r->q.b != 0 || d247r->c != 0) return 98934;
+        cppnewdmi.N* d247n = new cppnewdmi.N();
+        if (d247n->in.a != 5 || d247n->in.z != 9 || d247n->k != 2) return 98935;
+        cppnewdmi.F* d247f = new cppnewdmi.F();
+        if (d247f->a != 42 || d247f->b != 3) return 98936;
+        cppnewdmi.A* d247a = new cppnewdmi.A();
+        if (d247a->arr[0] != 1 || d247a->arr[2] != 3 || d247a->t != 8) return 98937;
+        cppnewdmi.U* d247u = new cppnewdmi.U();
+        if (d247u->v != 11) return 98938;
+        cppnewdmi.S* d247s = new cppnewdmi.S();
+        if (d247s->a != 4) return 98939;
+        cppnewdmi.V* d247v = new cppnewdmi.V();
+        if (d247v->a != 5) return 98940;
+        cppnewdmi.O* d247o = new cppnewdmi.O();
+        if (d247o->a != 6) return 98941;
+        delete d247o;
+        delete d247v;
+        cppnewdmi.P d247l = cppnewdmi.P();
+        if (d247l.a != 5 || d247l.z != 9) return 98942;
+    }
+    // T252: `new T(args)` on a C++20 aggregate is paren-aggregate init (clang++ -std=c++20 oracle,
+    // dirty heap): arguments initialize members in order and default member initializers run.
+    {
+        cppnewagg.AG* a252a = new cppnewagg.AG(1);
+        if (a252a->a != 1 || a252a->b != 7) return 98943;
+        cppnewagg.AG2* a252b = new cppnewagg.AG2(1);
+        if (a252b->a != 1 || a252b->b != 0) return 98944;
+        cppnewagg.AG* a252c = new cppnewagg.AG(1, 2);
+        if (a252c->a != 1 || a252c->b != 2) return 98945;
+        cppnewagg.AG2* a252d = new cppnewagg.AG2(2.5);
+        if (a252d->a != 2 || a252d->b != 0) return 98946;
+        cppnewagg.AN* a252e = new cppnewagg.AN(cppnewagg.AG(4), 3);
+        if (a252e->g.a != 4 || a252e->g.b != 7 || a252e->c != 3) return 98947;
+        cppnewagg.DerA* a252f = new cppnewagg.DerA(cppnewagg.BaseA(1, 2), 3);
+        if (a252f->x != 1 || a252f->y != 2 || a252f->z != 3) return 98948;
+        cppnewagg.AG2 a252g = cppnewagg.AG2(4, 5);
+        cppnewagg.AG2* a252h = new cppnewagg.AG2(a252g);
+        if (a252h->a != 4 || a252h->b != 5) return 98949;
+        // A class-scope operator new is called, and its placement form is not hidden.
+        cppnewagg.allocs = 0;
+        cppnewagg.AC* a252i = new cppnewagg.AC(1);
+        if (a252i->a != 1 || a252i->b != 7 || cppnewagg.allocs != 1) return 98950;
+        cppnewagg.AAL* a252j = new cppnewagg.AAL(2);
+        if (a252j->a != 2 || a252j->b != 7 || ((long)a252j % 32) != 0) return 98951;
+        // Locals, call arguments and returns already matched clang on master: pinned here.
+        cppnewagg.AG a252k = cppnewagg.AG(1);
+        if (a252k.a != 1 || a252k.b != 7) return 98952;
+        if (cppnewagg.sumAG2(cppnewagg.AG2(4, 5)) != 45) return 98953;
+        cppnewagg.AG a252m = cppnewagg.mkAG(3);
+        if (a252m.a != 3 || a252m.b != 7) return 98954;
+        // A class member: a prvalue member argument is constructed once and a copy counts once
+        // (move count not asserted: CFlat passes the prvalue temp as an xvalue, clang elides).
+        cppnewagg.resetCounts();
+        cppnewagg.CM* a252n = new cppnewagg.CM(cppnewagg.Cnt(5), 3);
+        if (cppnewagg.made != 1 || cppnewagg.copies != 0 || a252n->c.v != 5 || a252n->k != 3) return 98955;
+        cppnewagg.resetCounts();
+        cppnewagg.CM* a252o = new cppnewagg.CM(a252n->c, 4);
+        if (cppnewagg.made != 0 || cppnewagg.copies != 1 || a252o->c.v != 5 || a252o->k != 4) return 98956;
+    }
+    // T257 accept-set: preserve nontrivial copy/move, alias, default-new, and array-new behavior.
+    {
+        cppnewtriv.ntCopies = 0;
+        cppnewtriv.NT nt = cppnewtriv.NT(73);
+        cppnewtriv.NT* ntCopy = new cppnewtriv.NT(nt);
+        if (ntCopy->value != 73 || cppnewtriv.ntCopies != 1) return 98957;
+        delete ntCopy;
+
+        cppnewtriv.ncMoves = 0;
+        cppnewtriv.NC nc = cppnewtriv.NC(84);
+        cppnewtriv.NC* ncMove = new cppnewtriv.NC(move nc);
+        if (ncMove->value != 84 || cppnewtriv.ncMoves != 1) return 98958;
+        delete ncMove;
+
+        T257NAlias aliasSource = cppnewtriv.makeNA(71, 82);
+        T257NAlias* aliasCopy = new T257NAlias(aliasSource);
+        if (aliasCopy->a != 71 || aliasCopy->get() != 82) return 98959;
+        delete aliasCopy;
+
+        cppnewtriv.NA* d257 = new cppnewtriv.NA();
+        cppnewtriv.NA* a257 = new cppnewtriv.NA[2];
+        if (d257->a != 0 || d257->get() != 7 || a257[0].get() != 7 || a257[1].get() != 7)
+            return 98960;
+        delete[2] a257;
+        delete d257;
+    }
+    // T257: non-aggregate C++ copy-init must preserve every source form and private member.
+    {
+        cppnewtriv.NA q257 = cppnewtriv.makeNA(11, 22);
+        cppnewtriv.NA* l257 = new cppnewtriv.NA(q257);
+        if (l257->a != 11 || l257->get() != 22) return 98961;
+        cppnewtriv.NA* m257 = new cppnewtriv.NA(move q257);
+        if (m257->a != 11 || m257->get() != 22) return 98962;
+
+        cppnewtriv.NA* r257 = new cppnewtriv.NA(cppnewtriv.mkNA());
+        if (r257->a != 31 || r257->get() != 42) return 98963;
+        cppnewtriv.NA derefSource = cppnewtriv.makeNA(51, 62);
+        cppnewtriv.NA* derefPtr = &derefSource;
+        cppnewtriv.NA* derefCopy = new cppnewtriv.NA(*derefPtr);
+        if (derefCopy->a != 51 || derefCopy->get() != 62) return 98964;
+
+        cppnewtriv.H holder = cppnewtriv.makeH();
+        cppnewtriv.NA* fieldCopy = new cppnewtriv.NA(holder.field);
+        if (fieldCopy->a != 111 || fieldCopy->get() != 122) return 98965;
+        cppnewtriv.NA* elementCopy = new cppnewtriv.NA(holder.items[1]);
+        if (elementCopy->a != 151 || elementCopy->get() != 162) return 98966;
+
+        cppnewtriv.NA left257 = cppnewtriv.makeNA(171, 182);
+        cppnewtriv.NA right257 = cppnewtriv.makeNA(191, 202);
+        cppnewtriv.NA* ternaryCopy = new cppnewtriv.NA(true ? left257 : right257);
+        if (ternaryCopy->a != 171 || ternaryCopy->get() != 182) return 98967;
+
+        cppnewtriv.D derived = cppnewtriv.D();
+        derived.pad = 13;
+        derived.set(95);
+        derived.tail = 27;
+        cppnewtriv.B* sliced = new cppnewtriv.B(derived);
+        if (sliced->value != 95 || sliced->get() != 195) return 98968;
+
+        cppnewtriv.NA genericSource = cppnewtriv.makeNA(91, 102);
+        cppnewtriv.NA* genericCopy = T257NewCopy<cppnewtriv.NA>(&genericSource);
+        if (genericCopy->a != 91 || genericCopy->get() != 102) return 98969;
+
+        cppnewtriv.O o257 = cppnewtriv.makeO(106);
+        cppnewtriv.allocs = 0;
+        cppnewtriv.O* classAllocCopy = new cppnewtriv.O(o257);
+        if (classAllocCopy->value != 106 || classAllocCopy->get() != 206
+            || cppnewtriv.allocs != 1) return 98970;
+
+        delete classAllocCopy;
+        delete genericCopy;
+        delete sliced;
+        delete ternaryCopy;
+        delete elementCopy;
+        delete fieldCopy;
+        delete derefCopy;
+        delete r257;
+        delete m257;
+        delete l257;
+    }
+    // T243: nested `?:` arms of one derived class and fields of class prvalues (clang counts).
+    t226s.reset();
+    if (T243NestedTern(true) != 1 || t226s.made != 2 || t226s.copies != 1 || t226s.moves != 1 || t226s.dead != 4) return 93036;
+    t226s.reset();
+    if (T243NestedTern(false) != 3 || t226s.made != 3 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 4) return 93037;
+    t226s.reset();
+    if (T243NestedNotTern(false) != 1 || t226s.made != 2 || t226s.copies != 1 || t226s.moves != 1 || t226s.dead != 4) return 93038;
+    t226s.reset();
+    if (T243StaticNestedTern(true) != 1 || t226s.made != 2 || t226s.copies != 1 || t226s.moves != 1 || t226s.dead != 3) return 93039;
+    t226s.reset();
+    if (T243FieldPrvalueTern(true) != 1 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 3) return 93040;
+    t226s.reset();
+    if (T243FieldPrvalueTern(false) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93041;
+    t226s.reset();
+    if (T243XvalueFieldTern(true) != 1 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93042;
+    t226s.reset();
+    if (T243XvalueFieldTern(false) != 2 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 3) return 93043;
+    t226s.reset();
+    if (T243LvalueFieldTern(true) != 1 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 1 || t226s.dead != 3) return 93044;
+    t226s.reset();
+    if (T243LvalueFieldTern(false) != 2 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 4) return 93045;
+    t226s.reset();
+    if (T243FieldBothTern(true) != 1 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93046;
+    t226s.reset();
+    if (T243FieldMoveTern(true) != 1 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 3) return 93047;
+    t226s.reset();
+    if (T243FieldMoveTern(false) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93048;
+    t226s.reset();
+    if (T243FieldTemp(true) != 1 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93049;
+    t226s.reset();
+    if (T243NamedFieldTern(true) != 1 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 1 || t226s.dead != 3) return 93050;
     if (T62StaticAutoGlobalCopy() != 1) return 62010;
     cpp_t62.set_global_string("changed");
     if (T62StaticAutoGlobalCopy() != 1 || T62StaticAutoGlobalCopy() != 1) return 62011;
@@ -4151,6 +4436,15 @@ extern int main()
     if (t27ptr.pick_void_or_int(t36Void) != 1) return 27025;
     // void* -> int* has no implicit conversion in C++; the detail spells the argument void*.
     expect_error("arg=void*  param=int*") { int t36Refused = t27ptr.read_int(t36Void); }
+    // T255: the C++ read-only call must release through both nested GEP shapes.
+    t255CppDtor = 0;
+    int t255CppNestedValue = t27ptr.read_int(&(new T255CppOuter(29))->inner.value);
+    if (t255CppNestedValue != 29) return 25501;
+    if (t255CppDtor != 1) return 25502;
+    t255CppDtor = 0;
+    int t255CppArrayValue = t27ptr.read_int(&(new T255CppArray(30))->values[2]);
+    if (t255CppArrayValue != 30) return 25503;
+    if (t255CppDtor != 1) return 25504;
     // T36 round 2: a chain keeps the type of its pointer step, whichever side the pointer is on
     // (clang oracle: 3/3/4/2/2; master took the leading integer's type and deduced 1).
     if (t27ptr.kind(t27CharPointer + 1 + 1) != 3) return 27026;
@@ -11887,6 +12181,330 @@ extern int main()
         if (h != 18000 || cppbv.Cnt.ctors != 4 || cppbv.Cnt.copies != 0 || cppbv.Cnt.moves != 0
             || cppbv.Cnt.dtors != 4) return 3696;
     }
+    // T239: an overloaded operator's prvalue initializes the declared slot (clang: no move).
+    {
+        cppbv.Cnt lv = cppbv.Cnt(5);
+        cppbv.Cnt.reset();
+        {
+            cppbv.Cnt z = lv + cppbv.make(8);
+            if (z.v != 13 || cppbv.Cnt.ctors != 2 || cppbv.Cnt.copies != 1
+                || cppbv.Cnt.moves != 0 || cppbv.Cnt.dtors != 2 || cppbv.Cnt.plusCalls != 1)
+                return 3697;
+        }
+        if (cppbv.Cnt.dtors != 3 || cppbv.Cnt.plusCalls != 1) return 3697;
+
+        cppbv.Cnt.reset();
+        {
+            cppbv.Cnt z = cppbv.make(2) + lv;
+            if (z.v != 7 || cppbv.Cnt.ctors != 2 || cppbv.Cnt.copies != 1
+                || cppbv.Cnt.moves != 0 || cppbv.Cnt.dtors != 2 || cppbv.Cnt.plusCalls != 1)
+                return 3698;
+        }
+        if (cppbv.Cnt.dtors != 3 || cppbv.Cnt.plusCalls != 1) return 3698;
+
+        cppbv.Cnt.reset();
+        {
+            cppbv.Cnt z = cppbv.Cnt(3) + lv;
+            if (z.v != 8 || cppbv.Cnt.ctors != 2 || cppbv.Cnt.copies != 1
+                || cppbv.Cnt.moves != 0 || cppbv.Cnt.dtors != 2 || cppbv.Cnt.plusCalls != 1)
+                return 3699;
+        }
+        if (cppbv.Cnt.dtors != 3 || cppbv.Cnt.plusCalls != 1) return 3699;
+    }
+    // T239: parentheses preserve C++17 ternary prvalue elision in init, fields, and returns.
+    {
+        for (int shape = 0; shape < 2; shape = shape + 1)
+            for (int pick = 0; pick < 2; pick = pick + 1)
+            {
+                int expected = pick != 0 ? 1 : 2;
+                cppas.Life.reset();
+                if (shape == 0)
+                {
+                    cppas.Life x = (pick != 0 ? cppas.Life(1) : cppas.Life(2));
+                    if (x.value() != expected || cppas.Life.ctors != 1 || cppas.Life.copies != 0
+                        || cppas.Life.moves != 0 || cppas.Life.dtors != 0) return 3740;
+                }
+                else
+                {
+                    cppas.Life x = ((pick != 0 ? cppas.Life(1) : cppas.Life(2)));
+                    if (x.value() != expected || cppas.Life.ctors != 1 || cppas.Life.copies != 0
+                        || cppas.Life.moves != 0 || cppas.Life.dtors != 0) return 3740;
+                }
+                if (cppas.Life.dtors != 1 || cppas.Life.last_dtor != expected) return 3740;
+            }
+
+        for (int shape = 0; shape < 2; shape = shape + 1)
+            for (int pick = 0; pick < 2; pick = pick + 1)
+            {
+                int expected = pick != 0 ? 1 : 2;
+                cppas.Life.reset();
+                if (shape == 0)
+                {
+                    auto x = (pick != 0 ? cppas.Life(1) : cppas.Life(2));
+                    if (x.value() != expected || cppas.Life.ctors != 1 || cppas.Life.copies != 0
+                        || cppas.Life.moves != 0 || cppas.Life.dtors != 0) return 3741;
+                }
+                else
+                {
+                    auto x = ((pick != 0 ? cppas.Life(1) : cppas.Life(2)));
+                    if (x.value() != expected || cppas.Life.ctors != 1 || cppas.Life.copies != 0
+                        || cppas.Life.moves != 0 || cppas.Life.dtors != 0) return 3741;
+                }
+                if (cppas.Life.dtors != 1 || cppas.Life.last_dtor != expected) return 3741;
+            }
+
+        for (int shape = 0; shape < 2; shape = shape + 1)
+            for (int pick = 0; pick < 2; pick = pick + 1)
+            {
+                int expected = pick != 0 ? 1 : 2;
+                cppas.Life.reset();
+                if (shape == 0)
+                {
+                    CppAssignHost host = { l = (pick != 0 ? cppas.Life(1) : cppas.Life(2)) };
+                    if (host.l.value() != expected || cppas.Life.ctors != 1 || cppas.Life.copies != 0
+                        || cppas.Life.moves != 0 || cppas.Life.dtors != 0) return 3742;
+                }
+                else
+                {
+                    CppAssignHost host = { l = ((pick != 0 ? cppas.Life(1) : cppas.Life(2))) };
+                    if (host.l.value() != expected || cppas.Life.ctors != 1 || cppas.Life.copies != 0
+                        || cppas.Life.moves != 0 || cppas.Life.dtors != 0) return 3742;
+                }
+                if (cppas.Life.dtors != 1 || cppas.Life.last_dtor != expected) return 3742;
+            }
+
+        for (int shape = 0; shape < 2; shape = shape + 1)
+            for (int pick = 0; pick < 2; pick = pick + 1)
+            {
+                int expected = pick != 0 ? 1 : 2;
+                cppas.Life.reset();
+                if (shape == 0)
+                {
+                    cppas.Life x = T239ParenTernReturn(pick != 0);
+                    if (x.value() != expected || cppas.Life.ctors != 1 || cppas.Life.copies != 0
+                        || cppas.Life.moves != 0 || cppas.Life.dtors != 0) return 3743;
+                }
+                else
+                {
+                    cppas.Life x = T239DoubleParenTernReturn(pick != 0);
+                    if (x.value() != expected || cppas.Life.ctors != 1 || cppas.Life.copies != 0
+                        || cppas.Life.moves != 0 || cppas.Life.dtors != 0) return 3743;
+                }
+                if (cppas.Life.dtors != 1 || cppas.Life.last_dtor != expected) return 3743;
+            }
+    }
+    // T246: a parenthesized operator initializer builds like its bare spelling (clang: 2,1,0,2),
+    // and a `move` arm of a class ternary moves its source (clang: one move, no copy).
+    {
+        cppbv.Cnt tl = cppbv.Cnt(5);
+        cppbv.Cnt.reset();
+        {
+            cppbv.Cnt z = (tl + cppbv.make(8));
+            if (z.v != 13 || cppbv.Cnt.ctors != 2 || cppbv.Cnt.copies != 1
+                || cppbv.Cnt.moves != 0 || cppbv.Cnt.dtors != 2 || cppbv.Cnt.plusCalls != 1)
+                return 3712;
+        }
+        if (cppbv.Cnt.dtors != 3 || cppbv.Cnt.plusCalls != 1) return 3712;
+
+        cppbv.Cnt.reset();
+        {
+            cppbv.Cnt z = ((cppbv.make(7) + tl));
+            if (z.v != 12 || cppbv.Cnt.ctors != 2 || cppbv.Cnt.copies != 1
+                || cppbv.Cnt.moves != 0 || cppbv.Cnt.dtors != 2 || cppbv.Cnt.plusCalls != 1)
+                return 3713;
+        }
+        if (cppbv.Cnt.dtors != 3 || cppbv.Cnt.plusCalls != 1) return 3713;
+
+        {
+            cppbv.Cnt ta = cppbv.Cnt(5);
+            bool tk = true;
+            cppbv.Cnt.reset();
+            {
+                cppbv.Cnt z = (tk ? move ta : cppbv.Cnt(2));
+                if (z.v != 5 || cppbv.Cnt.ctors != 0 || cppbv.Cnt.copies != 0
+                    || cppbv.Cnt.moves != 1 || cppbv.Cnt.dtors != 0) return 3714;
+            }
+            if (cppbv.Cnt.dtors != 1) return 3714;
+        }
+        {
+            cppbv.Cnt ta = cppbv.Cnt(5);
+            bool tk = true;
+            cppbv.Cnt.reset();
+            {
+                cppbv.Cnt z = tk ? move ta : cppbv.Cnt(2);
+                if (z.v != 5 || cppbv.Cnt.ctors != 0 || cppbv.Cnt.copies != 0
+                    || cppbv.Cnt.moves != 1 || cppbv.Cnt.dtors != 0) return 3715;
+            }
+            if (cppbv.Cnt.dtors != 1) return 3715;
+        }
+        {
+            cppbv.Cnt ta = cppbv.Cnt(5);
+            cppbv.Cnt tb = cppbv.Cnt(3);
+            bool tk = false;
+            cppbv.Cnt.reset();
+            {
+                cppbv.Cnt z = (tk ? move ta : move tb);
+                if (z.v != 3 || cppbv.Cnt.ctors != 0 || cppbv.Cnt.copies != 0
+                    || cppbv.Cnt.moves != 1 || cppbv.Cnt.dtors != 0) return 3716;
+            }
+            if (cppbv.Cnt.dtors != 1) return 3716;
+        }
+        {
+            cppbv.Cnt sh = cppbv.Cnt(5);
+            cppbv.Cnt.reset();
+            {
+                cppbv.Cnt z = (sh << 4);
+                if (z.v != 54 || cppbv.Cnt.ctors != 0 || cppbv.Cnt.copies != 1
+                    || cppbv.Cnt.moves != 0 || cppbv.Cnt.dtors != 0) return 3717;
+            }
+            if (cppbv.Cnt.dtors != 1) return 3717;
+        }
+    }
+    // T249: a CFlat struct with a C++ field (lowered) joined by '?:' with a move arm builds ONE
+    // shared temporary, as clang's prvalue join does: the moved field is moved (not copied from a
+    // zeroed source), the moved-from source reads -1, and the counts match clang++ -std=c++20.
+    {
+        int[7] o;
+        T249DeclMoveLower(true, o);
+        if (o[0] != 21 || o[1] != -1 || o[2] != 22 || o[3] != 0 || o[4] != 0 || o[5] != 1 || o[6] != 0) return 98920;
+        T249DeclMoveLower(false, o);
+        if (o[0] != 22 || o[1] != 21 || o[2] != 22 || o[3] != 0 || o[4] != 1 || o[5] != 0 || o[6] != 0) return 98921;
+        T249DeclMoveMove(true, o);
+        if (o[0] != 21 || o[1] != -1 || o[2] != 22 || o[3] != 0 || o[4] != 0 || o[5] != 1 || o[6] != 0) return 98922;
+        T249DeclMoveMove(false, o);
+        if (o[0] != 22 || o[1] != 21 || o[2] != -1 || o[3] != 0 || o[4] != 0 || o[5] != 1 || o[6] != 0) return 98923;
+        T249DeclLvLv(true, o);
+        if (o[0] != 21 || o[1] != 21 || o[2] != 22 || o[3] != 0 || o[4] != 1 || o[5] != 0 || o[6] != 0) return 98924;
+        T249DeclLvMove(false, o);
+        if (o[0] != 22 || o[1] != 21 || o[2] != -1 || o[3] != 0 || o[4] != 0 || o[5] != 1 || o[6] != 0) return 98925;
+        T249DeclMoveCall(true, o);
+        if (o[0] != 21 || o[1] != -1 || o[2] != 22 || o[3] != 0 || o[4] != 0 || o[5] != 1 || o[6] != 0) return 98926;
+        T249DeclMoveCall(false, o);
+        if (o[0] != 33 || o[1] != 21 || o[2] != 22 || o[3] != 1 || o[4] != 0 || o[5] != 0 || o[6] != 0) return 98927;
+        T249AssignMoveLower(true, o);
+        if (o[0] != 21 || o[1] != -1 || o[2] != 22 || o[3] != 0 || o[4] != 0 || o[5] != 1 || o[6] != 1) return 98928;
+        T249ArgMoveMove(true, o);
+        if (o[0] != 21 || o[1] != -1 || o[2] != 22 || o[3] != 0 || o[4] != 0 || o[5] != 1 || o[6] != 1) return 98929;
+        T249ArgMoveMove(false, o);
+        if (o[0] != 22 || o[1] != 21 || o[2] != -1 || o[3] != 0 || o[4] != 0 || o[5] != 1 || o[6] != 1) return 98930;
+        // Round 2 (review): join member read, nested join arms, loop sources and return join.
+        int[7] q;
+        T249MemRead(true, q);
+        if (q[0] != 21 || q[1] != -1 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 1 || q[6] != 1) return 98951;
+        T249MemRead(false, q);
+        if (q[0] != 22 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 1 || q[5] != 0 || q[6] != 1) return 98952;
+        T249NestA(true, q);
+        if (q[0] != 21 || q[1] != -1 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 1 || q[6] != 1) return 98953;
+        T249NestA(false, q);
+        if (q[0] != 22 || q[1] != 21 || q[2] != -1 || q[3] != 0 || q[4] != 0 || q[5] != 1 || q[6] != 1) return 98954;
+        T249NestB(true, q);
+        if (q[0] != 21 || q[1] != -1 || q[2] != 23 || q[3] != 0 || q[4] != 0 || q[5] != 1 || q[6] != 1) return 98955;
+        T249NestB(false, q);
+        if (q[0] != 23 || q[1] != 21 || q[2] != 23 || q[3] != 0 || q[4] != 1 || q[5] != 0 || q[6] != 1) return 98956;
+        T249LoopDecl(true, q);
+        if (q[0] != 222122 || q[1] != 22 || cppbv.CntA.ctors != 3 || cppbv.CntA.copies != 2
+            || cppbv.CntA.moves != 1 || cppbv.CntA.dtors != 7) return 98957;
+        T249LoopDecl(false, q);
+        if (q[0] != 222222 || q[1] != 22 || cppbv.CntA.ctors != 3 || cppbv.CntA.copies != 2
+            || cppbv.CntA.moves != 1 || cppbv.CntA.dtors != 7) return 98958;
+        T249LoopAsg(true, q);
+        if (q[0] != 222122 || q[1] != 22 || cppbv.CntA.ctors != 3 || cppbv.CntA.copies != 2
+            || cppbv.CntA.moves != 1 || cppbv.CntA.dtors != 8) return 98959;
+        T249LoopAsg(false, q);
+        if (q[0] != 222222 || q[1] != 22 || cppbv.CntA.ctors != 3 || cppbv.CntA.copies != 2
+            || cppbv.CntA.moves != 1 || cppbv.CntA.dtors != 8) return 98960;
+        T249Ret(true, q);
+        if (q[0] != 21 || q[3] != 2 || q[4] != 0 || q[5] != 1 || q[6] != 3) return 98961;
+        T249Ret(false, q);
+        if (q[0] != 22 || q[3] != 2 || q[4] != 0 || q[5] != 1 || q[6] != 3) return 98962;
+        T249PlainMove(q);
+        if (q[0] != 21 || q[1] != -1 || q[3] != 0 || q[4] != 0 || q[5] != 1 || q[6] != 1) return 98963;
+        T249CallRead(q);
+        if (q[0] != 33 || q[3] != 1 || q[4] != 0 || q[5] != 0 || q[6] != 1) return 98964;
+        // Round 3 (review): a fresh call arm or a parenthesized join owns its temp exactly once.
+        T249FieldCall(true, q);
+        if (q[0] != 33 || q[1] != 21 || q[2] != 22 || q[3] != 1 || q[4] != 0 || q[5] != 0 || q[6] != 1) return 98965;
+        T249FieldCall(false, q);
+        if (q[0] != 22 || q[1] != 21 || q[2] != -1 || q[3] != 0 || q[4] != 0 || q[5] != 1 || q[6] != 1) return 98966;
+        T249FieldMove(true, q);
+        if (q[0] != 21 || q[1] != -1 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 1 || q[6] != 1) return 98967;
+        T249FieldMove(false, q);
+        if (q[0] != 33 || q[1] != 21 || q[2] != 22 || q[3] != 1 || q[4] != 0 || q[5] != 0 || q[6] != 1) return 98968;
+        T249FieldParen(true, q);
+        if (q[0] != 33 || q[3] != 1 || q[4] != 0 || q[5] != 0 || q[6] != 1) return 98969;
+        T249ArgJoin(true, q);
+        if (q[0] != 33 || q[3] != 1 || q[4] != 0 || q[5] != 0 || q[6] != 1) return 98970;
+        T249ArgJoin(false, q);
+        if (q[0] != 22 || q[2] != -1 || q[3] != 0 || q[4] != 0 || q[5] != 1 || q[6] != 1) return 98971;
+        T249DeclParen(true, q);
+        if (q[0] != 21 || q[1] != -1 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 1 || q[6] != 1) return 98972;
+        T249DeclParen(false, q);
+        if (q[0] != 22 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 1 || q[5] != 0 || q[6] != 1) return 98973;
+        T249DeclPairParen(true, q);
+        if (q[0] != 3 || q[3] != 0 || q[4] != 0 || q[5] != 2 || q[6] != 2) return 98974;
+        T249DeclPairParen(false, q);
+        if (q[0] != 4 || q[3] != 0 || q[4] != 0 || q[5] != 2 || q[6] != 2) return 98975;
+        // A member copy that may throw splits the copy arm block (was an internal compiler error).
+        cppbv.TCopy.made = 0; cppbv.TCopy.dt = 0;
+        if (T249ThrowCopyJoin(true) != 21 || T249ThrowCopyJoin(false) != 22) return 98976;
+        if (cppbv.TCopy.made != 6 || cppbv.TCopy.dt != 6) return 98977;
+        // T263: a parenthesized move-arm ternary return builds the selected arm into the slot, as the
+        // bare spelling does: 2 ctors, 1 move, 0 copies, 3 dtors (clang++ -std=c++20).
+        T263RetParenRun(true, q);
+        if (q[0] != 21 || q[3] != 2 || q[4] != 0 || q[5] != 1 || q[6] != 3) return 98990;
+        T263RetParenRun(false, q);
+        if (q[0] != 22 || q[3] != 2 || q[4] != 0 || q[5] != 1 || q[6] != 3) return 98991;
+        // T263: assignment from a one-move-arm '?:' (clang++ -std=c++20: temp, then move-assign).
+        T263AsgMvLv(true, q);
+        if (q[0] != 21 || q[1] != -1 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 1 || q[6] != 1) return 98992;
+        T263AsgMvLv(false, q);
+        if (q[0] != 22 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 1 || q[5] != 0 || q[6] != 1) return 98993;
+        T263AsgLvMv(true, q);
+        if (q[0] != 21 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 1 || q[5] != 0 || q[6] != 1) return 98994;
+        T263AsgLvMv(false, q);
+        if (q[0] != 22 || q[1] != 21 || q[2] != -1 || q[3] != 0 || q[4] != 0 || q[5] != 1 || q[6] != 1) return 98995;
+        T263AsgLvLv(true, q);
+        if (q[0] != 21 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 98996;
+        T263AsgLoop(true, q);
+        if (q[0] != -1 || q[1] != -1 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 2 || q[6] != 2) return 98997;
+        T263AsgLoop(false, q);
+        if (q[0] != 22 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 2 || q[5] != 0 || q[6] != 2) return 98998;
+    }
+    // T264: a by-value argument joined from two fresh call arms (bare, parenthesized, const, two
+    // arguments, loop body) is owned once by the callee, as clang++'s prvalue join: 1 ctor, 1 dtor.
+    {
+        int[7] o;
+        T264Arg(true, o);
+        if (o[0] != 1 || o[3] != 1 || o[4] != 0 || o[5] != 0 || o[6] != 1) return 98978;
+        T264Arg(false, o);
+        if (o[0] != 2 || o[3] != 1 || o[4] != 0 || o[5] != 0 || o[6] != 1) return 98979;
+        T264ArgParen(true, o);
+        if (o[0] != 1 || o[3] != 1 || o[4] != 0 || o[5] != 0 || o[6] != 1) return 98980;
+        T264ConstArg(false, o);
+        if (o[0] != 2 || o[3] != 1 || o[4] != 0 || o[5] != 0 || o[6] != 1) return 98981;
+        T264TwoArgs(true, o);
+        if (o[0] != 103 || o[3] != 2 || o[4] != 0 || o[5] != 0 || o[6] != 2) return 98982;
+        T264TwoArgs(false, o);
+        if (o[0] != 204 || o[3] != 2 || o[4] != 0 || o[5] != 0 || o[6] != 2) return 98983;
+        T264Loop(true, o);
+        if (o[0] != 3 || o[3] != 3 || o[4] != 0 || o[5] != 0 || o[6] != 3) return 98984;
+        T264Loop(false, o);
+        if (o[0] != 33 || o[3] != 3 || o[4] != 0 || o[5] != 0 || o[6] != 3) return 98985;
+    }
+    // T264 round 2: a by-value join argument with a throwing later sibling is destroyed once on unwind.
+    {
+        cppunw.reset();
+        int r = cppunw.guarded(T264UJoinThrow, 1);
+        if (r != -1 || cppunw.live() != 0 || cppunw.dtors() != 1) return 98986;
+        cppunw.reset();
+        r = cppunw.guarded(T264UParenThrow, 1);
+        if (r != -1 || cppunw.live() != 0 || cppunw.dtors() != 1) return 98987;
+        cppunw.reset();
+        r = cppunw.guarded(T264UMoveThrow, 1);
+        if (r != -1 || cppunw.live() != 0 || cppunw.dtors() != 3) return 98988;
+        cppunw.reset();
+        if (T264UJoinOk(true) != 1 || cppunw.live() != 0 || cppunw.dtors() != 1) return 98989;
+    }
     // ---- C++ variadic and inherited constructor references preserve the caller (3580-3583) ----
     cppvarctor.reset();
     {
@@ -13995,6 +14613,133 @@ extern int main()
         t236R2Got = cppon.escTake();
         delete t236R2Got;
         if (cppon.live() != 0 || cppon.dtors() != 1 || cppon.clsDel() != 1) return 3258;
+
+        // T242: a late CFlat callee releases a borrowed temp only after its body is analyzed.
+        cppon.reset();
+        if (cppunw.guarded(T242LateDirect, 0) != 5 || cppon.live() != 0 || cppon.dtors() != 1
+            || cppon.clsNew() != 1 || cppon.clsDel() != 1) return 3800;
+        cppon.reset();
+        if (cppunw.guarded(T242LateDirect, 1) != -1 || cppon.live() != 0 || cppon.dtors() != 1
+            || cppon.clsNew() != 1 || cppon.clsDel() != 1) return 3801;
+        cppon.reset();
+        if (cppunw.guarded(T242LateCoal, 0) != 5 || cppon.live() != 0 || cppon.dtors() != 1
+            || cppon.clsNew() != 1 || cppon.clsDel() != 1) return 3802;
+        cppon.reset();
+        if (cppunw.guarded(T242LateCoal, 1) != -1 || cppon.live() != 0 || cppon.dtors() != 1
+            || cppon.clsNew() != 1 || cppon.clsDel() != 1) return 3803;
+        cppon.reset();
+        if (cppunw.guarded(T242LateTern, 2) != 5 || cppon.live() != 0 || cppon.dtors() != 1
+            || cppon.clsNew() != 1 || cppon.clsDel() != 1) return 3804;
+        cppon.reset();
+        if (cppunw.guarded(T242LateTern, 3) != -1 || cppon.live() != 0 || cppon.dtors() != 1
+            || cppon.clsNew() != 1 || cppon.clsDel() != 1) return 3805;
+        cppon.reset();
+        if (cppunw.guarded(T242LateTern, 0) != -1 || cppon.live() != 0 || cppon.clsNew() != 0
+            || cppon.clsDel() != 0) return 3806;
+
+        T242LateKept = nullptr;
+        cppon.reset();
+        if (cppunw.guarded(T242LateRetainCall, 0) != 5 || T242LateKept == nullptr
+            || T242LateKept->v != 5 || cppon.live() != 1 || cppon.clsNew() != 1
+            || cppon.clsDel() != 0 || cppon.dtors() != 0) return 3807;
+        cppon.Esc* t242Kept = T242LateKept;
+        T242LateKept = nullptr;
+        delete t242Kept;
+        if (cppon.live() != 0 || cppon.clsDel() != 1 || cppon.dtors() != 1) return 3807;
+        T242LateKept = nullptr;
+        cppon.reset();
+        if (cppunw.guarded(T242LateRetainCall, 1) != -1 || T242LateKept == nullptr
+            || T242LateKept->v != 5 || cppon.live() != 1 || cppon.clsNew() != 1
+            || cppon.clsDel() != 0 || cppon.dtors() != 0) return 3808;
+        t242Kept = T242LateKept;
+        T242LateKept = nullptr;
+        delete t242Kept;
+        if (cppon.live() != 0 || cppon.clsDel() != 1 || cppon.dtors() != 1) return 3808;
+
+        // T251: a later void callee's kept field pointer must survive the caller's unwind pad.
+        T251LateKeptField = nullptr;
+        cppon.reset();
+        int t251UnwindResult = cppunw.guarded(T251LateFieldThrowCall, 5);
+        if (t251UnwindResult != -5 || T251LateKeptField == nullptr || cppon.live() != 1
+            || cppon.clsNew() != 1 || cppon.clsDel() != 0 || cppon.dtors() != 0
+            || *T251LateKeptField != 25) return 3809;
+        cppon.Esc* t251Kept = (cppon.Esc*)T251LateKeptField;
+        T251LateKeptField = nullptr;
+        delete t251Kept;
+        if (cppon.live() != 0 || cppon.clsDel() != 1 || cppon.dtors() != 1) return 3809;
+        // T260: all-owning ternary PHIs inside `??` retain the chosen C++ owner on both exits.
+        for (int t260x = 0; t260x < 4; t260x++)
+        {
+            if (!T260CheckRetain(false, false, t260x)) return 3820;
+            if (!T260CheckRetain(true, false, t260x)) return 3821;
+            if (!T260CheckRetain(false, true, t260x)) return 3822;
+            if (!T260CheckRetain(true, true, t260x)) return 3823;
+        }
+        g_t256Dtor = 0;
+        if (cppunw.guarded(T256AliasThrowInit, 0) != 7 || g_t256Dtor != 1) return 256001;
+        if (cppunw.guarded(T256AliasThrowInit, 5) != -5 || g_t256Dtor != 2) return 256002;
+
+        // A void pointer joined with new selects the void* overload, as in clang++.
+        t242vj.reset();
+        void* t242VoidNull = nullptr;
+        t242vj.Ovv t242VoidCoal = t242vj.Ovv(t242VoidNull ?? new t242vj.E(5), 0);
+        t242vj.E* t242VoidCoalKeep = (t242vj.E*)t242vj.lastArg();
+        if (t242VoidCoal.r != -5 || t242vj.voidCalls() != 1 || t242vj.typedCalls() != 0
+            || t242vj.live() != 1 || t242vj.news() != 1 || t242vj.deletes() != 0
+            || t242vj.dtors() != 0 || t242VoidCoalKeep == nullptr || t242VoidCoalKeep->v != 5)
+            return 3810;
+        delete t242VoidCoalKeep;
+        if (t242vj.live() != 0 || t242vj.deletes() != 1 || t242vj.dtors() != 1) return 3810;
+        t242vj.reset();
+        bool t242Choose = true;
+        void* t242VoidTernNull = nullptr;
+        t242vj.Ovv t242VoidTern = t242vj.Ovv(t242Choose ? new t242vj.E(5) : t242VoidTernNull, 0);
+        t242vj.E* t242VoidTernKeep = (t242vj.E*)t242vj.lastArg();
+        if (t242VoidTern.r != -5 || t242vj.voidCalls() != 1 || t242vj.typedCalls() != 0
+            || t242vj.live() != 1 || t242vj.news() != 1 || t242vj.deletes() != 0
+            || t242vj.dtors() != 0 || t242VoidTernKeep == nullptr || t242VoidTernKeep->v != 5)
+            return 3811;
+        delete t242VoidTernKeep;
+        if (t242vj.live() != 0 || t242vj.deletes() != 1 || t242vj.dtors() != 1) return 3811;
+
+        t242vj.reset();
+        t242vj.E* t242TypedNull = nullptr;
+        t242vj.Ovv t242TypedCoal = t242vj.Ovv(t242TypedNull ?? new t242vj.E(5), 0);
+        t242vj.E* t242TypedCoalKeep = (t242vj.E*)t242vj.lastArg();
+        if (t242TypedCoal.r != 1005 || t242vj.voidCalls() != 0 || t242vj.typedCalls() != 1
+            || t242vj.live() != 1 || t242vj.news() != 1 || t242vj.deletes() != 0
+            || t242vj.dtors() != 0 || t242TypedCoalKeep == nullptr || t242TypedCoalKeep->v != 5)
+            return 3812;
+        delete t242TypedCoalKeep;
+        if (t242vj.live() != 0 || t242vj.deletes() != 1 || t242vj.dtors() != 1) return 3812;
+        t242vj.reset();
+        t242vj.E* t242TypedTernNull = nullptr;
+        t242vj.Ovv t242TypedTern = t242vj.Ovv(t242Choose ? new t242vj.E(5) : t242TypedTernNull, 0);
+        t242vj.E* t242TypedTernKeep = (t242vj.E*)t242vj.lastArg();
+        if (t242TypedTern.r != 1005 || t242vj.voidCalls() != 0 || t242vj.typedCalls() != 1
+            || t242vj.live() != 1 || t242vj.news() != 1 || t242vj.deletes() != 0
+            || t242vj.dtors() != 0 || t242TypedTernKeep == nullptr || t242TypedTernKeep->v != 5)
+            return 3813;
+        delete t242TypedTernKeep;
+        if (t242vj.live() != 0 || t242vj.deletes() != 1 || t242vj.dtors() != 1) return 3813;
+        t242vj.reset();
+        void* t242VoidA = nullptr;
+        void* t242VoidB = nullptr;
+        t242vj.Ovv t242VoidSameCoal = t242vj.Ovv(t242VoidA ?? t242VoidB, 0);
+        t242vj.Ovv t242VoidSameTern = t242vj.Ovv(t242Choose ? t242VoidA : t242VoidB, 0);
+        if (t242VoidSameCoal.r != -5 || t242VoidSameTern.r != -5
+            || t242vj.voidCalls() != 2 || t242vj.typedCalls() != 0) return 3814;
+
+        expect_error("has no constructor whose parameter types match") {
+            bool c = true;
+            t242vj.E* e = nullptr;
+            t242vj.F* f = nullptr;
+            t242vj.Ov bad = t242vj.Ov(c ? e : f, 0);
+        }
+        expect_error("has no constructor whose parameter types match") {
+            t242vj.E* e = nullptr;
+            t242vj.Ov bad = t242vj.Ov(e ?? new t242vj.F(), 0);
+        }
     }
     // Pointer-to-reference ranking keeps only candidates whose referent matches the pointee.
     int[2] ptrRefData = { 7, 19 };
@@ -15303,6 +16048,254 @@ int LoweredUserDtorAssignLegs(int argc)
         T129ArrayOuter t218MoveArr = { h = { move t218M1, t218M2 } };
     }
     if (cppexp.conv_ctor_count() != cppexp.conv_dtor_count()) return 12932;
+    // T253: a lowered CFlat brace element uses C++ member-wise construction for each move arm.
+    t253.reset();
+    int t253A = 0; int t253B = 0; int t253K = 0;
+    {
+        T253HV v1 = default; v1.m.value = 3;
+        T253HV v2 = default; v2.m.value = 4;
+        T253HV[2] arr = { move v1, v2 };
+        t253A = arr[0].m.value; t253B = arr[1].m.value;
+        t253K = arr[0].k + arr[1].k;
+    }
+    if (t253A != 1003 || t253B != 104 || t253K != 2
+        || t253.ctors() != 4 || t253.copies() != 1 || t253.moves() != 1
+        || t253.dtors() != 4) return 25301;
+
+    t253.reset();
+    {
+        T253HV v1 = default; v1.m.value = 3;
+        T253HV v2 = default; v2.m.value = 4;
+        T253HV[2] arr = { v1, move v2 };
+        t253A = arr[0].m.value; t253B = arr[1].m.value;
+    }
+    if (t253A != 103 || t253B != 1004 || t253.ctors() != 4
+        || t253.copies() != 1 || t253.moves() != 1 || t253.dtors() != 4) return 25302;
+
+    t253.reset();
+    {
+        T253HV v1 = default; v1.m.value = 3;
+        T253HV v2 = default; v2.m.value = 4;
+        T253HV[2] arr = { move v1, move v2 };
+        t253A = arr[0].m.value; t253B = arr[1].m.value;
+    }
+    if (t253A != 1003 || t253B != 1004 || t253.ctors() != 4
+        || t253.copies() != 0 || t253.moves() != 2 || t253.dtors() != 4) return 25303;
+
+    t253.reset();
+    {
+        T253HV v1 = default; v1.m.value = 3;
+        T253HV v2 = default; v2.m.value = 4;
+        T253HV s = move v1;
+        T253OV o = { h = { move v2, s } };
+        t253A = o.h[0].m.value; t253B = o.h[1].m.value;
+    }
+    if (t253A != 1004 || t253B != 1103 || t253.ctors() != 5
+        || t253.copies() != 1 || t253.moves() != 2 || t253.dtors() != 5) return 25304;
+
+    t253.reset();
+    {
+        T253HU v1 = default; v1.m.value = 5;
+        T253HU v2 = default; v2.m.value = 6;
+        T253OU o = { h = { move v1, v2 } };
+        t253A = o.h[0].m.value; t253B = o.h[1].m.value;
+        t253K = o.h[0].k + o.h[1].k;
+    }
+    if (t253A != 1005 || t253B != 106 || t253K != 4 || t253.ctors() != 6
+        || t253.copies() != 1 || t253.moves() != 1 || t253.dtors() != 6) return 25305;
+
+    t253.reset(); t218Live = 0;
+    int t253OwnNull = 0; int t253OwnLive = 0;
+    {
+        T253Owned owner = default; owner.m.value = 8;
+        owner.u = unique<T218Own>(new T218Own());
+        unique<T218Own>* ownerSlot = &owner.u;
+        T253Owned[1] arr = { move owner };
+        t253A = arr[0].m.value; t253B = arr[0].u != nullptr;
+        t253OwnNull = *ownerSlot == nullptr;
+    }
+    t253OwnLive = t218Live;
+    if (t253A != 1008 || t253B != 1 || t253OwnNull != 1 || t253OwnLive != 0) return 25306;
+    if (t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25307;
+
+    t253.reset();
+    {
+        int sum = 0;
+        for (int i = 0; i < 2; i++)
+        {
+            T253HV source = default; source.m.value = 10 + i;
+            T253HV[1] arr = { move source };
+            sum = sum + arr[0].m.value;
+        }
+        t253A = sum;
+    }
+    if (t253A != 2021 || t253.ctors() != 4 || t253.copies() != 0
+        || t253.moves() != 2 || t253.dtors() != 4) return 25308;
+
+    // Scalar move and a plain CFlat struct remain unchanged controls.
+    t253.reset();
+    {
+        T253HV v1 = default; v1.m.value = 7;
+        T253HV s = move v1;
+        t253A = s.m.value;
+    }
+    if (t253A != 1007 || t253.ctors() != 2 || t253.copies() != 0
+        || t253.moves() != 1 || t253.dtors() != 2) return 25309;
+    {
+        T253Plain source = { value = 41 };
+        T253Plain[1] arr = { move source };
+        t253A = arr[0].value;
+    }
+    if (t253A != 41) return 25310;
+
+    t253.reset();
+    {
+        T253FallbackHolder source = { f = t253.Fallback(17) };
+        T253FallbackHolder[1] arr = { move source };
+        t253A = arr[0].f.item.value;
+    }
+    if (t253A != 117 || t253.ctors() != 2 || t253.copies() != 1
+        || t253.moves() != 0 || t253.dtors() != 2) return 25311;
+    // T258: named `move` into a lowered CFlat struct field is move-constructed member-wise (a bit
+    // copy before); the moved-from source is destroyed once. Update, nested, throw, and tag forms too.
+    t253.reset();
+    int t258A = 0; int t258B = 0;
+    {
+        T253HV v1 = default; v1.m.value = 3;
+        T258Holder w = { h = move v1 };
+        t258A = w.h.m.value;
+    }
+    if (t258A != 1003 || t253.ctors() != 2 || t253.copies() != 0
+        || t253.moves() != 1 || t253.dtors() != 2) return 25312;
+    t253.reset();
+    {
+        T253HV v1 = default; v1.m.value = 3;
+        T258Holder w = { h = v1 };
+        t258A = w.h.m.value;
+    }
+    if (t258A != 103 || t253.ctors() != 2 || t253.copies() != 1
+        || t253.moves() != 0 || t253.dtors() != 2) return 25313;
+    t253.reset();
+    {
+        T253Plain v1 = default; v1.value = 9;
+        T258PlainHolder w = { p = move v1 };
+        t258A = w.p.value;
+    }
+    if (t258A != 9) return 25314;
+    t253.reset(); t218Live = 0;
+    {
+        T253Owned s = default; s.m.value = 3;
+        s.u = unique<T218Own>(new T218Own());
+        T258OwnHolder w = { o = move s };
+        t258A = w.o.m.value; t258B = w.o.u != nullptr;
+    }
+    if (t258A != 1003 || t258B != 1 || t218Live != 0 || t253.ctors() != 2
+        || t253.copies() != 0 || t253.moves() != 1 || t253.dtors() != 2) return 25315;
+    t253.reset();
+    {
+        int t258Sum = 0;
+        for (int i = 0; i < 2; i++)
+        {
+            T253HV s = default; s.m.value = 10 + i;
+            T258Holder w = { h = move s };
+            t258Sum = t258Sum + w.h.m.value;
+        }
+        t258A = t258Sum;
+    }
+    if (t258A != 2021 || t253.ctors() != 4 || t253.copies() != 0
+        || t253.moves() != 2 || t253.dtors() != 4) return 25316;
+    t253.reset();
+    {
+        T253HV v1 = default; v1.m.value = 3;
+        T258Outer o = { inner = { h = move v1 } };
+        t258A = o.inner.h.m.value;
+    }
+    if (t258A != 1003 || t253.ctors() != 2 || t253.copies() != 0
+        || t253.moves() != 1 || t253.dtors() != 2) return 25317;
+    t253.reset();
+    {
+        T253HV v1 = default; v1.m.value = 3;
+        T258Holder w = { z = 5, h = move v1 };
+        t258A = w.h.m.value; t258B = w.z;
+    }
+    if (t258A != 1003 || t258B != 5 || t253.ctors() != 2 || t253.moves() != 1
+        || t253.dtors() != 2) return 25318;
+    t253.reset();
+    {
+        T253HV v2 = default; v2.m.value = 4;
+        T258Holder w = { h = move v2, z = 6 };
+        t258A = w.h.m.value; t258B = w.z;
+    }
+    if (t258A != 1004 || t258B != 6 || t253.ctors() != 2 || t253.moves() != 1
+        || t253.dtors() != 2) return 25319;
+    // A C++ move ctor that throws: the source is still destroyed once, and no field is built.
+    t258.reset();
+    t258A = t258.guarded(t258Fresh, 1);
+    if (t258A != -7 || t258.ctors() != 1 || t258.moves() != 0 || t258.dtors() != 1) return 25320;
+    t258.reset();
+    t258A = t258.guarded(t258Fresh, 0);
+    if (t258A != 1 || t258.ctors() != 2 || t258.moves() != 1 || t258.dtors() != 2) return 25321;
+    // User-constructor aggregate: the seeded field is destroyed before the member-wise move.
+    t258.reset();
+    t258A = t258.guarded(t258Update, 1);
+    if (t258A != -7 || t258.ctors() != 2 || t258.moves() != 0 || t258.dtors() != 2) return 25322;
+    t258.reset();
+    t258A = t258.guarded(t258Update, 0);
+    if (t258A != 1 || t258.ctors() != 3 || t258.moves() != 1 || t258.dtors() != 3) return 25323;
+    t253.reset();
+    {
+        T253HV v1 = default; v1.m.value = 3;
+        T258UCHolder w = { h = move v1 };
+        t258A = w.h.m.value; t258B = w.z;
+    }
+    if (t258A != 1003 || t258B != 4 || t253.ctors() != 3 || t253.moves() != 1
+        || t253.dtors() != 3) return 25324;
+    t253.reset();
+    {
+        T253HV v1 = default; v1.m.value = 3;
+        T258UCOuter o = { inner = { h = move v1 } };
+        t258A = o.inner.h.m.value; t258B = o.inner.z;
+    }
+    if (t258A != 1003 || t258B != 4 || t253.ctors() != 3 || t253.moves() != 1
+        || t253.dtors() != 3) return 25325;
+    t253.reset();
+    {
+        T253HV v1 = default; v1.m.value = 3;
+        T258Holder* p = <T258Holder h={move v1} />;
+        t258A = p->h.m.value;
+        delete p;
+    }
+    if (t258A != 1003 || t253.ctors() != 3 || t253.moves() != 1 || t253.dtors() != 3) return 25326;
+    // T261: a field initializer that throws unwinds the fields already built, once each.
+    t261.reset();
+    t258A = t261.guarded(t261Pair, 1);
+    if (t258A != -7 || t261.ctors() != 1 || t261.copies() != 1 || t261.moves() != 0 || t261.dtors() != 2) return 25327;
+    t261.reset();
+    t258A = t261.guarded(t261PairFirst, 1);
+    if (t258A != -7 || t261.ctors() != 1 || t261.copies() != 0 || t261.dtors() != 1) return 25328;
+    t261.reset();
+    t258A = t261.guarded(t261Triple, 1);
+    if (t258A != -7 || t261.ctors() != 1 || t261.copies() != 2 || t261.dtors() != 3) return 25329;
+    t261.reset();
+    t258A = t261.guarded(t261Nest, 1);
+    if (t258A != -7 || t261.ctors() != 1 || t261.copies() != 1 || t261.dtors() != 2) return 25330;
+    t261.reset();
+    t258A = t261.guarded(t261Tag, 1);
+    if (t258A != -7 || t261.ctors() != 3 || t261.copies() != 1 || t261.dtors() != 4) return 25331;
+    t261.reset();
+    t258A = t261.guarded(t261Lowered, 1);
+    if (t258A != -7 || t261.ctors() != 2 || t261.copies() != 1 || t261.dtors() != 3) return 25332;
+    t261.reset();
+    t258A = t261.guarded(t261Field, 1);
+    if (t258A != -7 || t261.ctors() != 1 || t261.copies() != 1 || t261.dtors() != 2) return 25335;
+    // No-throw controls: the same initializers build and destroy each object exactly once.
+    t261.reset();
+    t258A = t261.guarded(t261Pair, 0);
+    if (t258A != 0 || t261.ctors() != 2 || t261.copies() != 1 || t261.dtors() != 3) return 25333;
+    t261.reset();
+    t258A = t261.guarded(t261Lowered, 0);
+    if (t258A != 0 || t261.ctors() != 2 || t261.copies() != 1 || t261.dtors() != 3) return 25334;
     // T130: same-local returns of CFlat structs construct into the caller's sret slot.
     cppexp.conv_reset();
     {
@@ -15435,6 +16428,43 @@ int LoweredUserDtorAssignLegs(int argc)
         if (slot->v != 5 || cppexp.conv_ctor_count() != 1
             || cppexp.conv_dtor_count() != 0) return 13038;
         free(slot);
+    }
+    // T240: construct_at(slot, T(args)) and its parenthesized forms build the C++ class straight into
+    // the slot (oracle clang++ -std=c++20 `::new (slot) T(args)`: 1 ctor, 0 dtor, value as shown).
+    cppexp.conv_reset();
+    {
+        cppexp.ConvCnt* slot = (cppexp.ConvCnt*)malloc((i64)sizeof(cppexp.ConvCnt));
+        construct_at(slot, cppexp.ConvCnt(5));
+        if (slot->v != 5 || cppexp.conv_ctor_count() != 1
+            || cppexp.conv_dtor_count() != 0) return 13060;
+        cppexp.conv_reset();
+        construct_at(slot, (T224Mk(7)));
+        if (slot->v != 7 || cppexp.conv_ctor_count() != 1
+            || cppexp.conv_dtor_count() != 0) return 13061;
+        cppexp.conv_reset();
+        construct_at(slot, (cppexp.ConvCnt(7)));
+        if (slot->v != 7 || cppexp.conv_ctor_count() != 1
+            || cppexp.conv_dtor_count() != 0) return 13062;
+        cppexp.conv_reset();
+        construct_at(slot, cppexp.ConvCnt());
+        if (slot->v != 0 || cppexp.conv_ctor_count() != 1
+            || cppexp.conv_dtor_count() != 0) return 13063;
+        free(slot);
+    }
+    // A template converting constructor is built in the slot too: no move (30, not 31).
+    {
+        cppexp.ConvVal* vslot = (cppexp.ConvVal*)malloc((i64)sizeof(cppexp.ConvVal));
+        construct_at(vslot, cppexp.ConvVal(3));
+        if (vslot->v != 30) return 13064;
+        free(vslot);
+    }
+    // A constructor expression with a slot of the same class: one construction, no temporary.
+    cppunw.reset();
+    {
+        cppunw.Tx* txSlot = (cppunw.Tx*)malloc((i64)sizeof(cppunw.Tx));
+        construct_at(txSlot, cppunw.Tx(0));
+        if (cppunw.live() != 1 || cppunw.dtors() != 0 || txSlot->get() != 0) return 13065;
+        free(txSlot);
     }
     // T224: the nested candidate's return moves nothing; the caller's destructor runs once.
     cppunw.reset();
@@ -15640,6 +16670,19 @@ int LoweredUserDtorAssignLegs(int argc)
         cppi.XvMoveOnly m2 = mb.thisMove();
         if (m2.v != 23 || mb.field.v != -1) return 17314;
     }
+    // T245: `&(new Esc(9))->v` into a C++ callee that parks the pointer in a global is kept (not freed at
+    // the statement end); a read-only C++ callee still frees the Esc once.
+    {
+        cppon.reset();
+        cppon.escKeepIntArg(&(new cppon.Esc(9))->v);
+        int* kept = cppon.escIntTake();
+        if (kept == nullptr || *kept != 9 || cppon.dtors() != 0 || cppon.live() != 1) return 17315;
+        delete (cppon.Esc*)kept;
+        if (cppon.dtors() != 1 || cppon.live() != 0) return 17316;
+        cppon.reset();
+        int readBack = cppon.escReadIntArg(&(new cppon.Esc(10))->v);
+        if (readBack != 10 || cppon.dtors() != 1 || cppon.live() != 0) return 17317;
+    }
     return 0;
 }
 
@@ -15663,6 +16706,14 @@ cppas.TallyByValue ByValueParenTernReturn(int f, cppas.TallyByValue* a, cppas.Ta
 cppas.TallyByValue ByValueParenTernReturn2(int f, cppas.TallyByValue* a, cppas.TallyByValue* c)
 {
     return ((f != 0 ? (*a = 3) : (*c += 5)));
+}
+cppas.Life T239ParenTernReturn(bool pick)
+{
+    return (pick ? cppas.Life(1) : cppas.Life(2));
+}
+cppas.Life T239DoubleParenTernReturn(bool pick)
+{
+    return ((pick ? cppas.Life(1) : cppas.Life(2)));
 }
 int ObAliasParam(alias cppas.ObSelf p) { if (p) return 1; return 2; }
 // T231: a CFlat function's by-value parameter of a C++ class (leg 3587).
@@ -15795,4 +16846,519 @@ int T236JoinTernField(int x)
     s.p = nullptr;
     cppon.EscHolder h = cppon.EscHolder(c ? new cppon.Esc(8) : s.p, x);
     return h.v;
+}
+
+int T242LateBorrow(cppon.Esc* p, int t);
+int T242LateRetain(cppon.Esc* p, int t);
+void T251LateFieldThrow(int* p, int t);
+void T260LateFieldKeep(int* p, int t);
+int T251LateFieldThrowCall(int t)
+{
+    T251LateFieldThrow(&(new cppon.Esc(25))->v, t);
+    return 0;
+}
+int T242LateDirect(int t) { return T242LateBorrow(new cppon.Esc(5), t); }
+int T242LateCoal(int t)
+{
+    cppon.Esc* empty = nullptr;
+    return T242LateBorrow(empty ?? new cppon.Esc(5), t);
+}
+int T242LateTern(int x)
+{
+    bool c = (x & 2) != 0;
+    cppon.Esc* n = nullptr;
+    return T242LateBorrow(c ? new cppon.Esc(5) : n, x & 1);
+}
+int T242LateRetainCall(int t) { return T242LateRetain(new cppon.Esc(5), t); }
+int T242LateBorrow(cppon.Esc* p, int t)
+{
+    cppunw.thrower(t);
+    return p == nullptr ? -1 : p->v;
+}
+int T242LateRetain(cppon.Esc* p, int t)
+{
+    T242LateKept = p;
+    cppunw.thrower(t);
+    return p == nullptr ? -1 : p->v;
+}
+void T251LateFieldThrow(int* p, int t)
+{
+    T251LateKeptField = p;
+    cppunw.thrower(t);
+}
+void T260KnownFieldKeep(int* p, int t)
+{
+    T260KeptField = p;
+    cppunw.thrower(t);
+}
+int T260KnownRightCall(int x)
+{
+    bool c = (x & 2) == 0;
+    cppon.Esc* e = nullptr;
+    T260KnownFieldKeep(&(e ?? (c ? new cppon.Esc(51) : new cppon.Esc(52)))->v, x & 1);
+    return 0;
+}
+int T260KnownLeftCall(int x)
+{
+    bool c = (x & 2) == 0;
+    cppon.Esc* n = nullptr;
+    T260KnownFieldKeep(&((c ? new cppon.Esc(53) : new cppon.Esc(54)) ?? n)->v, x & 1);
+    return 0;
+}
+int T260LateRightCall(int x)
+{
+    bool c = (x & 2) == 0;
+    cppon.Esc* e = nullptr;
+    T260LateFieldKeep(&(e ?? (c ? new cppon.Esc(51) : new cppon.Esc(52)))->v, x & 1);
+    return 0;
+}
+int T260LateLeftCall(int x)
+{
+    bool c = (x & 2) == 0;
+    cppon.Esc* n = nullptr;
+    T260LateFieldKeep(&((c ? new cppon.Esc(53) : new cppon.Esc(54)) ?? n)->v, x & 1);
+    return 0;
+}
+void T260LateFieldKeep(int* p, int t)
+{
+    T260KeptField = p;
+    cppunw.thrower(t);
+}
+bool T260CheckRetain(bool leftJoin, bool laterCallee, int x)
+{
+    T260KeptField = nullptr;
+    cppon.reset();
+    int result = 0;
+    if (laterCallee)
+        result = leftJoin ? cppunw.guarded(T260LateLeftCall, x) : cppunw.guarded(T260LateRightCall, x);
+    else
+        result = leftJoin ? cppunw.guarded(T260KnownLeftCall, x) : cppunw.guarded(T260KnownRightCall, x);
+    int expectedValue = leftJoin ? ((x & 2) == 0 ? 53 : 54) : ((x & 2) == 0 ? 51 : 52);
+    int expectedResult = (x & 1) == 0 ? 0 : -1;
+    bool valid = result == expectedResult && T260KeptField != nullptr && cppon.live() == 1
+        && cppon.clsNew() == 1 && cppon.clsDel() == 0 && cppon.dtors() == 0;
+    if (valid) valid = *T260KeptField == expectedValue;
+    if (T260KeptField != nullptr && cppon.live() == 1)
+    {
+        cppon.Esc* kept = (cppon.Esc*)T260KeptField;
+        T260KeptField = nullptr;
+        delete kept;
+    }
+    return valid && cppon.live() == 0 && cppon.clsDel() == 1 && cppon.dtors() == 1;
+}
+
+// T249 helpers (legs 98920-98930): each observes [v, h1.v, h2.v, ctors, copies, moves, dtors].
+struct T249Host { cppbv.CntA c = cppbv.CntA(0); };
+struct T249HT { cppbv.CntA c = cppbv.CntA(0); cppbv.TCopy t = cppbv.TCopy(0); };
+int T249ThrowCopyJoin(bool k)
+{
+    T249HT h1; h1.c.v = 21; T249HT h2; h2.c.v = 22;
+    T249HT hz = k ? move h1 : h2;
+    return hz.c.v;
+}
+T249Host T249Make() { T249Host r; r.c.v = 33; return r; }
+int T249Take(T249Host x) { return x.c.v; }
+void T249Observe(int* o, T249Host* hz, T249Host* h1, T249Host* h2)
+{
+    o[0] = hz->c.v;
+    o[1] = h1->c.v;
+    o[2] = h2->c.v;
+    o[3] = cppbv.CntA.ctors;
+    o[4] = cppbv.CntA.copies;
+    o[5] = cppbv.CntA.moves;
+    o[6] = cppbv.CntA.dtors;
+}
+void T249DeclMoveLower(bool k, int* o)
+{
+    T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22;
+    T249Host* p1 = &h1; T249Host* p2 = &h2;
+    cppbv.CntA.reset();
+    T249Host hz = k ? move h1 : h2;
+    T249Observe(o, &hz, p1, p2);
+}
+void T249DeclMoveMove(bool k, int* o)
+{
+    T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22;
+    T249Host* p1 = &h1; T249Host* p2 = &h2;
+    cppbv.CntA.reset();
+    T249Host hz = k ? move h1 : move h2;
+    T249Observe(o, &hz, p1, p2);
+}
+void T249DeclLvLv(bool k, int* o)
+{
+    T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22;
+    T249Host* p1 = &h1; T249Host* p2 = &h2;
+    cppbv.CntA.reset();
+    T249Host hz = k ? h1 : h2;
+    T249Observe(o, &hz, p1, p2);
+}
+void T249DeclLvMove(bool k, int* o)
+{
+    T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22;
+    T249Host* p1 = &h1; T249Host* p2 = &h2;
+    cppbv.CntA.reset();
+    T249Host hz = k ? h1 : move h2;
+    T249Observe(o, &hz, p1, p2);
+}
+void T249DeclMoveCall(bool k, int* o)
+{
+    T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22;
+    T249Host* p1 = &h1; T249Host* p2 = &h2;
+    cppbv.CntA.reset();
+    T249Host hz = k ? move h1 : T249Make();
+    T249Observe(o, &hz, p1, p2);
+}
+void T249AssignMoveLower(bool k, int* o)
+{
+    T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22;
+    T249Host* p1 = &h1; T249Host* p2 = &h2;
+    T249Host hz;
+    cppbv.CntA.reset();
+    hz = k ? move h1 : h2;
+    T249Observe(o, &hz, p1, p2);
+}
+void T249ArgMoveMove(bool k, int* o)
+{
+    T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22;
+    T249Host* p1 = &h1; T249Host* p2 = &h2;
+    cppbv.CntA.reset();
+    int r = T249Take(k ? move h1 : move h2);
+    o[0] = r;
+    o[1] = p1->c.v;
+    o[2] = p2->c.v;
+    o[3] = cppbv.CntA.ctors;
+    o[4] = cppbv.CntA.copies;
+    o[5] = cppbv.CntA.moves;
+    o[6] = cppbv.CntA.dtors;
+}
+
+// T249 round 2 helpers (legs 98951-98964): every count is read after the scope the join touches closes.
+void T249ReadCounts(int* o)
+{
+    o[3] = cppbv.CntA.ctors;
+    o[4] = cppbv.CntA.copies;
+    o[5] = cppbv.CntA.moves;
+    o[6] = cppbv.CntA.dtors;
+}
+// T264 helpers (legs 98978-98985): a by-value or const by-value argument joined from two fresh
+// call arms is owned once by the callee, as clang's prvalue join: one ctor and one dtor per call.
+T249Host T264Mk(int x) { T249Host r; r.c.v = x; return r; }
+int T264Cr(const T249Host h) { return h.c.v; }
+int T264Two(T249Host a, T249Host b) { return a.c.v * 100 + b.c.v; }
+void T264Arg(bool k, int* o)
+{
+    cppbv.CntA.reset();
+    {
+        o[0] = T249Take(k ? T264Mk(1) : T264Mk(2));
+    }
+    o[1] = 0;
+    o[2] = 0;
+    T249ReadCounts(o);
+}
+void T264ArgParen(bool k, int* o)
+{
+    cppbv.CntA.reset();
+    {
+        o[0] = T249Take((k ? T264Mk(1) : T264Mk(2)));
+    }
+    o[1] = 0;
+    o[2] = 0;
+    T249ReadCounts(o);
+}
+void T264ConstArg(bool k, int* o)
+{
+    cppbv.CntA.reset();
+    {
+        o[0] = T264Cr(k ? T264Mk(1) : T264Mk(2));
+    }
+    o[1] = 0;
+    o[2] = 0;
+    T249ReadCounts(o);
+}
+void T264TwoArgs(bool k, int* o)
+{
+    cppbv.CntA.reset();
+    {
+        o[0] = T264Two(k ? T264Mk(1) : T264Mk(2), k ? T264Mk(3) : T264Mk(4));
+    }
+    o[1] = 0;
+    o[2] = 0;
+    T249ReadCounts(o);
+}
+void T264Loop(bool k, int* o)
+{
+    cppbv.CntA.reset();
+    o[0] = 0;
+    for (int i = 0; i < 3; i++)
+        o[0] += T249Take(k ? T264Mk(i) : T264Mk(i + 10));
+    o[1] = 0;
+    o[2] = 0;
+    T249ReadCounts(o);
+}
+// T264 round 2 (legs 98986-98989): a by-value join argument is owned until the call adopts it, so a
+// throwing LATER sibling unwinds it once (live 0, one destructor), on the bare, parenthesized and move
+// arm forms; the normal path destroys it once. Counts come from the cppunw fixture.
+struct T264U { cppunw.Tr c = cppunw.Tr(0); };
+T264U T264UMk(int x) { T264U r; r.c.tag = x; return r; }
+int T264UHv2(T264U h, int y) { return h.c.tag + y; }
+int T264UJoinThrow(int x)
+{
+    bool k = x == 1;
+    return T264UHv2(k ? T264UMk(1) : T264UMk(2), cppunw.thrower(x));
+}
+int T264UParenThrow(int x)
+{
+    bool k = x == 1;
+    return T264UHv2((k ? T264UMk(1) : T264UMk(2)), cppunw.thrower(x));
+}
+int T264UMoveThrow(int x)
+{
+    bool k = x == 1;
+    T264U a = T264UMk(1);
+    T264U b = T264UMk(2);
+    return T264UHv2(k ? move a : move b, cppunw.thrower(x));
+}
+int T264UJoinOk(bool k)
+{
+    return T264UHv2(k ? T264UMk(1) : T264UMk(2), cppunw.thrower(0));
+}
+void T249MemRead(bool k, int* o)
+{
+    T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22;
+    T249Host* p1 = &h1; T249Host* p2 = &h2;
+    cppbv.CntA.reset();
+    {
+        int v = (k ? move h1 : h2).c.v;
+        o[0] = v;
+    }
+    o[1] = p1->c.v;
+    o[2] = p2->c.v;
+    T249ReadCounts(o);
+}
+void T249NestA(bool k, int* o)
+{
+    T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22; T249Host h3; h3.c.v = 23;
+    T249Host* p1 = &h1; T249Host* p2 = &h2;
+    cppbv.CntA.reset();
+    {
+        T249Host hz = k ? move h1 : (!k ? move h2 : h3);
+        o[0] = hz.c.v;
+    }
+    o[1] = p1->c.v;
+    o[2] = p2->c.v;
+    T249ReadCounts(o);
+}
+void T249NestB(bool k, int* o)
+{
+    T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22; T249Host h3; h3.c.v = 23;
+    T249Host* p1 = &h1; T249Host* p3 = &h3;
+    cppbv.CntA.reset();
+    {
+        T249Host hz = k ? (!k ? h2 : move h1) : h3;
+        o[0] = hz.c.v;
+    }
+    o[1] = p1->c.v;
+    o[2] = p3->c.v;
+    T249ReadCounts(o);
+}
+// Caller reads counts after return: the source locals of each iteration and h2 are destroyed here.
+void T249LoopDecl(bool k, int* o)
+{
+    T249Host h2; h2.c.v = 22;
+    T249Host* p2 = &h2;
+    cppbv.CntA.reset();
+    int s = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        T249Host h1; h1.c.v = 20 + i;
+        bool sel = k ? i == 1 : i == 2;
+        T249Host hz = sel ? move h1 : h2;
+        s = s * 100 + hz.c.v;
+    }
+    o[0] = s;
+    o[1] = p2->c.v;
+}
+void T249LoopAsg(bool k, int* o)
+{
+    T249Host h2; h2.c.v = 22;
+    T249Host* p2 = &h2;
+    T249Host hz;
+    cppbv.CntA.reset();
+    int s = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        T249Host h1; h1.c.v = 20 + i;
+        bool sel = k ? i == 1 : i == 2;
+        hz = sel ? move h1 : h2;
+        s = s * 100 + hz.c.v;
+    }
+    o[0] = s;
+    o[1] = p2->c.v;
+}
+T249Host T249RetJoin(bool k)
+{
+    T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22;
+    return k ? move h1 : move h2;
+}
+void T249Ret(bool k, int* o)
+{
+    cppbv.CntA.reset();
+    {
+        T249Host hz = T249RetJoin(k);
+        o[0] = hz.c.v;
+    }
+    T249ReadCounts(o);
+}
+// T263: the parenthesized spelling of the same move-arm return join.
+T249Host T263RetParen(bool k)
+{
+    T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22;
+    return (k ? move h1 : move h2);
+}
+void T263RetParenRun(bool k, int* o)
+{
+    cppbv.CntA.reset();
+    {
+        T249Host hz = T263RetParen(k);
+        o[0] = hz.c.v;
+    }
+    T249ReadCounts(o);
+}
+// T263: `z = k ? move a : b` on an existing C++ class builds the selected arm into a temp (move or
+// copy construct) that is then move-assigned; the lvalue-only and both-lvalue shapes are unchanged.
+void T263AsgMvLv(bool k, int* o)
+{
+    cppbv.CntA a = cppbv.CntA(21); cppbv.CntA b = cppbv.CntA(22); cppbv.CntA z = cppbv.CntA(0);
+    cppbv.CntA.reset();
+    z = k ? move a : b;
+    o[0] = z.v; o[1] = a.v; o[2] = b.v;
+    T249ReadCounts(o);
+}
+void T263AsgLvMv(bool k, int* o)
+{
+    cppbv.CntA a = cppbv.CntA(21); cppbv.CntA b = cppbv.CntA(22); cppbv.CntA z = cppbv.CntA(0);
+    cppbv.CntA.reset();
+    z = k ? a : move b;
+    o[0] = z.v; o[1] = a.v; o[2] = b.v;
+    T249ReadCounts(o);
+}
+void T263AsgLvLv(bool k, int* o)
+{
+    cppbv.CntA a = cppbv.CntA(21); cppbv.CntA b = cppbv.CntA(22); cppbv.CntA z = cppbv.CntA(0);
+    cppbv.CntA.reset();
+    z = k ? a : b;
+    o[0] = z.v; o[1] = a.v; o[2] = b.v;
+    T249ReadCounts(o);
+}
+void T263AsgLoop(bool k, int* o)
+{
+    cppbv.CntA a = cppbv.CntA(21); cppbv.CntA b = cppbv.CntA(22); cppbv.CntA z = cppbv.CntA(0);
+    cppbv.CntA.reset();
+    for (int i = 0; i < 2; i++) z = k ? move a : b;
+    o[0] = z.v; o[1] = a.v; o[2] = b.v;
+    T249ReadCounts(o);
+}
+void T249PlainMove(int* o)
+{
+    T249Host h1; h1.c.v = 21;
+    T249Host* p1 = &h1;
+    cppbv.CntA.reset();
+    {
+        T249Host hz = move h1;
+        o[0] = hz.c.v;
+    }
+    o[1] = p1->c.v;
+    o[2] = 0;
+    T249ReadCounts(o);
+}
+void T249CallRead(int* o)
+{
+    T249Host h1; h1.c.v = 21;
+    cppbv.CntA.reset();
+    {
+        int v = (T249Make()).c.v;
+        o[0] = v;
+    }
+    o[1] = 0;
+    o[2] = 0;
+    T249ReadCounts(o);
+}
+
+// T249 round 3 helpers (legs 98965-98975): a fresh call arm or a parenthesized join read through a
+// field hop, a by-value argument or a declaration is owned exactly once; counts read after the scope.
+struct T249Pair { cppbv.CntA c = cppbv.CntA(0); cppbv.CntA d = cppbv.CntA(0); };
+void T249FieldCall(bool k, int* o)
+{
+    T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22;
+    T249Host* p1 = &h1; T249Host* p2 = &h2;
+    cppbv.CntA.reset();
+    {
+        int v = (k ? T249Make() : move h2).c.v;
+        o[0] = v;
+    }
+    o[1] = p1->c.v;
+    o[2] = p2->c.v;
+    T249ReadCounts(o);
+}
+void T249FieldMove(bool k, int* o)
+{
+    T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22;
+    T249Host* p1 = &h1; T249Host* p2 = &h2;
+    cppbv.CntA.reset();
+    {
+        int v = (k ? move h1 : T249Make()).c.v;
+        o[0] = v;
+    }
+    o[1] = p1->c.v;
+    o[2] = p2->c.v;
+    T249ReadCounts(o);
+}
+void T249FieldParen(bool k, int* o)
+{
+    T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22;
+    T249Host* p1 = &h1; T249Host* p2 = &h2;
+    cppbv.CntA.reset();
+    {
+        int v = ((k ? T249Make() : move h2)).c.v;
+        o[0] = v;
+    }
+    o[1] = p1->c.v;
+    o[2] = p2->c.v;
+    T249ReadCounts(o);
+}
+void T249ArgJoin(bool k, int* o)
+{
+    T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22;
+    T249Host* p1 = &h1; T249Host* p2 = &h2;
+    cppbv.CntA.reset();
+    {
+        int r = T249Take(k ? T249Make() : move h2);
+        o[0] = r;
+    }
+    o[1] = p1->c.v;
+    o[2] = p2->c.v;
+    T249ReadCounts(o);
+}
+void T249DeclParen(bool k, int* o)
+{
+    T249Host h1; h1.c.v = 21; T249Host h2; h2.c.v = 22;
+    T249Host* p1 = &h1; T249Host* p2 = &h2;
+    cppbv.CntA.reset();
+    {
+        T249Host hz = (k ? move h1 : h2);
+        o[0] = hz.c.v;
+    }
+    o[1] = p1->c.v;
+    o[2] = p2->c.v;
+    T249ReadCounts(o);
+}
+void T249DeclPairParen(bool k, int* o)
+{
+    T249Pair t3; t3.c.v = 3; T249Pair t4; t4.c.v = 4;
+    cppbv.CntA.reset();
+    {
+        T249Pair tz = (k ? move t3 : move t4);
+        o[0] = tz.c.v;
+    }
+    T249ReadCounts(o);
 }

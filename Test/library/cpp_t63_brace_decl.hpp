@@ -179,6 +179,27 @@ struct CallFnRvaluePick {
 inline int call_fn_rvalue_ref(CallFnRvalueRef x) { return x.value; }
 template<class T> int call_fn_rvalue_ref_template(T x) { return x.value; }
 inline int call_fn_rvalue_pick(CallFnRvaluePick x) { return x.value; }
+struct CallT248BoolRv {
+    int value;
+    CallT248BoolRv(bool b) : value(500 + (b ? 1 : 0)) {}
+    CallT248BoolRv(CallFnPtr&& f) : value(300 + f(3)) {}
+};
+inline int call_t248_boolrv(CallT248BoolRv x) { return x.value; }
+struct CallT248ValRv {
+    int value;
+    CallT248ValRv(CallFnPtr f) : value(400 + f(3)) {}
+    CallT248ValRv(CallFnPtr&& f) : value(300 + f(3)) {}
+};
+inline int call_t248_valrv(CallT248ValRv x) { return x.value; }
+inline int call_t248_free_pick(CallFnPtr& f) { return 100 + f(3); }
+inline int call_t248_free_pick(const CallFnPtr& f) { return 200 + f(3); }
+struct CallT248DataPick {
+    int value;
+    CallT248DataPick(int*& p) : value(100 + *p) {}
+    CallT248DataPick(const int*& p) : value(200 + *p) {}
+    CallT248DataPick(int*&& p) : value(300 + *p) {}
+};
+inline int call_t248_data_pick(CallT248DataPick p) { return p.value; }
 struct CallFnRvalueTpl {
     int value;
     template<class F> CallFnRvalueTpl(F&& f) : value(600 + f(3)) {}

@@ -44,6 +44,132 @@ expect_error("cannot move borrowed parameter 'b' into move parameter") {
     }
 }
 
+// T238: a copy of an owning `move` PARAMETER is the same double free, and the diagnostic names
+// the parameter as the owner ("owning parameter"), direct or through a function<> sink.
+expect_error("cannot move borrowed pointer 'view' (copied from owning parameter 'n') into move parameter 'q' of 'sink'") {
+    void paramCopyDirect(move Ci* n)
+    {
+        Ci* view = n;
+        sink(view);
+    }
+}
+
+expect_error("cannot move borrowed pointer 'view' (copied from owning parameter 'n') into move parameter 'parameter 1' of 'g'") {
+    void paramCopyFuncPtr(move Ci* n)
+    {
+        function<void(move Ci*)> g = sink;
+        Ci* view = n;
+        g(view);
+    }
+}
+
+// T238 review: a LOCAL shadowing a `move` parameter's name is still reported as a local.
+expect_error("cannot move borrowed pointer 'v' (copied from owning local 'n') into move parameter 'q' of 'sink'") {
+    void shadowLocalOwner(move Ci* n)
+    {
+        sink(move n);
+        {
+            Ci* n = new Ci();
+            Ci* v = n;
+            sink(v);
+        }
+    }
+}
+
+// T238: an unnamed function<> move parameter is named by its position, not printed as '0'.
+expect_error("cannot move borrowed parameter 'b' into move parameter 'parameter 1' of 'g'") {
+    void funcPtrBorrowedPosition(Ci* b)
+    {
+        function<void(move Ci*)> g = sink;
+        g(b);
+    }
+}
+
+// T238: the wording names the CURRENT owner. `m` took the pointer from `n`, so the copy made
+// before the move is a copy of `m`, not of the moved-from `n`.
+expect_error("cannot move borrowed pointer 'view' (copied from owning local 'm') into move parameter 'q' of 'sink'") {
+    void copyBeforeMove()
+    {
+        Ci* n = new Ci();
+        Ci* view = n;
+        Ci* m = move n;
+        sink(view);
+    }
+}
+
+// T238: a '??' join whose arm copies a live owning local is stored into a unique field the same
+// way the bare copy is (`t.p = a;` is refused by the same check), so the field cannot double free.
+struct CiHolder { unique Ci* p = nullptr; };
+
+expect_error("cannot store 'a' into unique field 'CiHolder.p' - 'a' copies 'o', which still owns") {
+    void joinStoreFresh()
+    {
+        CiHolder t = default;
+        Ci* o = new Ci();
+        Ci* a = o;
+        t.p = a ?? new Ci();
+    }
+}
+
+expect_error("cannot store 'a' into unique field 'CiHolder.p' - 'a' copies 'o', which still owns") {
+    void joinStoreField()
+    {
+        CiHolder t = default;
+        CiHolder s = default;
+        Ci* o = new Ci();
+        Ci* a = o;
+        s.p = new Ci();
+        t.p = a ?? s.p;
+    }
+}
+
+// T244 review: the copy arm is found through a NESTED join too.
+expect_error("cannot store 'a' into unique field 'CiHolder.p' - 'a' copies 'o', which still owns") {
+    void nestedTernaryCopyArm(bool c)
+    {
+        CiHolder t = default;
+        Ci* o = new Ci();
+        Ci* a = o;
+        t.p = c ? (c ? a : nullptr) : nullptr;
+    }
+}
+
+// T244: a '?:' arm that copies a live owning local is refused like the '??' form (no arm registry
+// on the ternary before), whether both arms copy it or the other arm is a unique field read.
+expect_error("cannot store 'a' into unique field 'CiHolder.p' - 'a' copies 'o', which still owns") {
+    void ternaryCopyBothArms(bool c)
+    {
+        CiHolder t = default;
+        Ci* o = new Ci();
+        Ci* a = o;
+        t.p = c ? a : a;
+    }
+}
+
+expect_error("cannot store 'a' into unique field 'CiHolder.p' - 'a' copies 'o', which still owns") {
+    void ternaryCopyFieldArm(bool c)
+    {
+        CiHolder t = default;
+        CiHolder s = default;
+        Ci* o = new Ci();
+        Ci* a = o;
+        s.p = new Ci();
+        t.p = c ? a : s.p;
+    }
+}
+
+expect_error("cannot store 'a' into unique field 'CiHolder.p' - 'a' copies 'o', which still owns") {
+    void ternaryFieldFirstCopyArm(bool c)
+    {
+        CiHolder t = default;
+        CiHolder s = default;
+        Ci* o = new Ci();
+        Ci* a = o;
+        s.p = new Ci();
+        t.p = c ? s.p : a;
+    }
+}
+
 extern int main()
 {
     return 0;

@@ -20,16 +20,27 @@ slot when every return names it. T224 (2026-10-14) landed the single-local cases
   scope with both returned (neither elided), switch arms, shadowing, loops, throws. Oracle counts
   match clang++ -std=c++20 for every shape; legs Test/test_cpp_interop.cb 13041-13059.
 
+## Landed (T240)
+
+- `construct_at(slot, T(args))`, `construct_at(slot, (f(args)))` and `construct_at(slot, (T(args)))`
+  build the C++ class in the slot (clang 1 ctor / 0 dtor); a template converting constructor keeps
+  its value (30, not a moved 31). Legs Test/test_cpp_interop.cb 13060-13065.
+
 ## Still open
 
-1. `construct_at(slot, T(args))` (a constructor expression, not a call) still builds a temporary
-   and moves it: clang 1 ctor / 0 dtor, we 2 / 1. Needs the constructor route armed the same way
-   (probe: scratch/t224_tmp/probe_cat.cpp row 5).
+1. `construct_at(slot, T(f(x)))` with a nested call argument (and the declaration `C c = T(f(x))`)
+   still builds a temporary and moves it: clang 1 / 0, we 2 / 1. The single-call arming rule refuses
+   any nested call; lifting it needs a proof that the inner call cannot take the armed slot.
 2. `new S(mk1())` with S a CFlat struct holding a C++ field: "no overload of 'S'" on master and
    after T224 (clang accepts and elides). Copy/move constructor surface for CFlat structs is a
    language decision; not started.
 
 T224 review 1 notes: clang's rule fits all four multi-candidate oracle shapes - a variable is elided when
 every return inside its scope, after its declaration, names it (no maintainer decision needed; it is
-clang parity). Pre-existing: `C x = (mk1(7));` copies (107 vs clang 7) and `construct_at(slot, (mk1(7)))`
-is not armed. (By-value argument temp extra move fixed by T231.)
+clang parity). Pre-existing: `C x = (mk1(7));` copies (107 vs clang 7). (By-value argument temp extra
+move fixed by T231.)
+- (T240 review 1, pre-existing; repros scratch/repro_keep/t240_rev/) an OPERATOR result as the ctor argument,
+  `construct_at(s, T(a + b))`: 2 ctors / 1 dtor after T240 (master 3/2), clang 1/0 - same family as T(f(x)).
+  Base-class slot with a derived ctor `construct_at(bslot, D(3))`: 4/3, clang 3/2 (extra copy before the slice).
+  `construct_at(ps, MkP(3))` with ps a CFlat struct pointer is refused "cannot assign a struct value to a pointer
+  variable" (master too).

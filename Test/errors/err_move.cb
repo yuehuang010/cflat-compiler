@@ -1328,3 +1328,38 @@ expect_error("use of moved variable 'raw'") {
         int y = raw->v;
     }
 }
+
+/*
+ * T250: the ternary-new, parenthesised and declaration inners of `owner = <inner> = new T()` move the
+ * inner slot exactly like `owner = raw;`, so a later read of the inner is a use after move.
+ */
+struct T250MoveBox { int v = 0; ~T250MoveBox() {} };
+
+expect_error("use of moved variable 'raw'") {
+    void t250TernaryThenRead(bool c)
+    {
+        unique T250MoveBox* owner = nullptr;
+        T250MoveBox* raw = nullptr;
+        owner = raw = (c ? new T250MoveBox() : nullptr);
+        int y = raw->v;
+    }
+}
+
+expect_error("use of moved variable 'raw'") {
+    void t250ParenThenRead()
+    {
+        unique T250MoveBox* owner = nullptr;
+        T250MoveBox* raw = nullptr;
+        owner = (raw = new T250MoveBox());
+        int y = raw->v;
+    }
+}
+
+expect_error("use of moved variable 'raw'") {
+    void t250DeclThenRead()
+    {
+        T250MoveBox* raw = nullptr;
+        unique T250MoveBox* owner = raw = new T250MoveBox();
+        int y = raw->v;
+    }
+}

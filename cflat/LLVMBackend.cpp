@@ -4637,6 +4637,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
             // Same post-walk gate resolution as Compile, so IR dumps show the real releases.
             NoCurrentFunctionScope noCurrent(this);
             ResolveOwnedReleaseGates();
+            ResolveDeferredReturnKeepGates();
         }
         ResolveMaterializedInterfaceUses();
         stream.close();
@@ -4705,7 +4706,9 @@ void LLVMBackend::ResetForReanalysis()
     ownReleaseGates_.clear();
     fallbackOwnerGates_.clear();
     cxxThisEscapeGates_.clear();
+    deferredCallReleaseGates_.clear();
     deferredReturnKeepGates_.clear();
+    returnOperandFunction_ = nullptr;
     ownAdoptGates_.clear();
     ownSlotLeavingLoads_.clear();
     analyzeDebugInfo_ = false;
@@ -4947,6 +4950,8 @@ void LLVMBackend::ResetForReanalysis()
     pendingCxxTernaryDeclTypeName_.clear();
     pendingCxxTernaryDeclConsumed_ = false;
     pendingCxxTernaryDeclFailed_ = false;
+    pendingCxxTernaryDeclArmType_.clear();
+    pendingCxxTernaryDeclArmCat_ = 0;
     lastCxxRetTemp_ = nullptr;
     lastCxxRetValue_ = nullptr;
     lastLoweredRetTemp_ = nullptr;
@@ -5125,6 +5130,7 @@ void LLVMBackend::ResetForReanalysis()
     pendingLaunderTempUniqueFields_.clear();
     dataValueCodeCasts_.clear();
     movedOutPtrValues_.clear();
+    movedOutSourceSlots_.clear();
     movedBorrowedPtrValues_.clear();
     borrowedAddressValues_.clear();
     movedBorrowedThroughFieldValues_.clear();
@@ -7431,6 +7437,8 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
         NoCurrentFunctionScope noCurrent(this);
         EmitDeferredFullDestructorBodies();
         ResolveOwnedReleaseGates();
+        // Same return-keep answer as Compile; a gate left false would leak in a warm core.
+        ResolveDeferredReturnKeepGates();
     }
     InferCoreNoUnwind();
     return true;

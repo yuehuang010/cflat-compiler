@@ -23,5 +23,11 @@ struct D : B {
     int w;
     D(int x) : B(x), w(x * 10) {}
 };
+// T243: a class prvalue whose field is a D; `mkH(x).d` is an xvalue member of a temporary.
+struct H {
+    D d;
+    H(int x) : d(x) {}
+};
+inline H mkH(int x) { return H(x); }
 inline void reset() { made = copies = moves = dead = 0; }
 }

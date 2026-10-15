@@ -21,3 +21,8 @@ Fix direction per item: (1) register the temporary in the statement-temp destruc
 the paired delete; (2) treat a `new` expression as owning at the field-store site; (3) loop the
 deleting destructor over the runtime count; (4) refuse `new T` when the selected operator is
 inaccessible; (5) run test_cpp_interop on Windows.
+
+## From T257 review 1 (pre-existing on master; repros scratch/repro_keep/t257_rev/, probe script beside them)
+- `new DM(v)` from a `volatile DM&` source is accepted (clang refuses: no volatile copy ctor), dm_vol.
+- `new CVA(4)` through a `using` alias of a class with a converting ctor fails "has no imported constructors"; clang 8, cv_alias.
+- `new NM(mkNM())` (prvalue, deleted move ctor, guaranteed elision in clang) is refused; clang accepts, nm_prv.

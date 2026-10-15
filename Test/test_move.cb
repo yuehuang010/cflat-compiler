@@ -907,6 +907,86 @@ int testSelfRefContainerRelease()
     return passed;
 }
 
+// T259 - a '?:' arm that owns a unique field, a unique local or a global, joined into a unique
+// field: the taken arm's source is consumed on its path (one destructor), as '??' and '=' are.
+int t259FieldArm(bool f)
+{
+    UniqueBox s;
+    s.item = new Resource();
+    s.item->id = 21;
+    UniqueBox t = default;
+    t.item = f ? s.item : nullptr;
+    return t.item != nullptr ? t.item->id : -1;
+}
+
+// T262b - a field of a BORROWED by-value parameter is refused in a '?:' join; the 'move' parameter and
+// a borrowed read of the same join stay legal.
+int t262bMoveParamJoin(move UniqueBox s, bool f)
+{
+    UniqueBox t = default;
+    t.item = f ? s.item : nullptr;
+    return t.item != nullptr ? t.item->id : -1;
+}
+
+int t262bBorrowReadJoin(UniqueBox s, bool f)
+{
+    Resource* r = f ? s.item : nullptr;
+    return r != nullptr ? r->id : -1;
+}
+
+int t259FieldArmConsumes(bool f)
+{
+    UniqueBox s;
+    s.item = new Resource();
+    UniqueBox t = default;
+    t.item = f ? s.item : nullptr;
+    return s.item == nullptr ? 1 : 0;
+}
+
+int t259NewArm(bool f)
+{
+    UniqueBox s;
+    s.item = new Resource();
+    s.item->id = 25;
+    UniqueBox t = default;
+    t.item = f ? s.item : new Resource();
+    return t.item != nullptr ? t.item->id : -1;
+}
+
+int t259LocalArm(bool f)
+{
+    UniqueBox t = default;
+    unique Resource* u = new Resource();
+    u->id = 22;
+    t.item = f ? u : nullptr;
+    return t.item != nullptr ? t.item->id : -1;
+}
+
+int t259DeclArm(bool f)
+{
+    UniqueBox s;
+    s.item = new Resource();
+    s.item->id = 26;
+    UniqueBox t = { item = f ? s.item : nullptr };
+    return t.item != nullptr ? t.item->id : -1;
+}
+
+int t259Loop(bool f)
+{
+    UniqueBox s = default;
+    UniqueBox t = default;
+    int n = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        s.item = new Resource();
+        s.item->id = i + 1;
+        t.item = f ? s.item : nullptr;
+        if (t.item != nullptr) n = n + t.item->id;
+        t.item = nullptr;
+    }
+    return n;
+}
+
 int testUniqueField()
 {
     int passed = 0;
@@ -1088,6 +1168,74 @@ int testUniqueField()
         passed += Test("unique_field_self_move_no_early_free", dtorCount, 0);
     }
     passed += Test("unique_field_self_move_freed_once", dtorCount, 1);
+
+    // T259 - the taken unique FIELD arm of a '?:' is consumed on its path: one destructor, no
+    // double free; the untaken arm keeps its field. Each arm is checked on its own path.
+    dtorCount = 0;
+    int t259v = t259FieldArm(true);
+    passed += Test("t259_field_arm_taken_value", t259v, 21);
+    passed += Test("t259_field_arm_taken_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    t259v = t259FieldArm(false);
+    passed += Test("t259_field_arm_untaken_value", t259v, -1);
+    passed += Test("t259_field_arm_untaken_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("t259_field_arm_taken_source_null", t259FieldArmConsumes(true), 1);
+    passed += Test("t259_field_arm_taken_source_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("t259_field_arm_untaken_source_live", t259FieldArmConsumes(false), 0);
+    passed += Test("t259_field_arm_untaken_source_freed_once", dtorCount, 1);
+
+    // T262b - accept twins of the borrowed-parameter refusal: a move parameter's join consumes once,
+    // a borrowed read keeps the caller's field live.
+    dtorCount = 0;
+    UniqueBox t262bSrc = default;
+    t262bSrc.item = new Resource();
+    t262bSrc.item->id = 51;
+    passed += Test("t262b_move_param_join_value", t262bMoveParamJoin(move t262bSrc, true), 51);
+    passed += Test("t262b_move_param_join_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    UniqueBox t262bKeep = default;
+    t262bKeep.item = new Resource();
+    t262bKeep.item->id = 52;
+    passed += Test("t262b_borrow_read_join_value", t262bBorrowReadJoin(t262bKeep, true), 52);
+    passed += Test("t262b_borrow_read_join_source_live", t262bKeep.item != nullptr ? 1 : 0, 1);
+    passed += Test("t262b_borrow_read_join_freed_once", dtorCount, 0);
+    dtorCount = 0;
+
+    // T259 - a fresh `new` on the other arm is owned once; the taken field arm is still consumed.
+    dtorCount = 0;
+    t259v = t259NewArm(true);
+    passed += Test("t259_new_arm_field_taken_value", t259v, 25);
+    passed += Test("t259_new_arm_field_taken_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    t259v = t259NewArm(false);
+    passed += Test("t259_new_arm_untaken_value", t259v, 0);
+    passed += Test("t259_new_arm_untaken_both_freed_once", dtorCount, 2);
+
+    // T259 - a unique LOCAL arm is consumed on the taken path, as the plain '=' consumes it.
+    dtorCount = 0;
+    t259v = t259LocalArm(true);
+    passed += Test("t259_local_arm_taken_value", t259v, 22);
+    passed += Test("t259_local_arm_taken_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    t259v = t259LocalArm(false);
+    passed += Test("t259_local_arm_untaken_value", t259v, -1);
+    passed += Test("t259_local_arm_untaken_freed_once", dtorCount, 1);
+
+    // T259 - the declaration-init form and a loop body consume each iteration's taken arm once.
+    dtorCount = 0;
+    t259v = t259DeclArm(true);
+    passed += Test("t259_decl_arm_taken_value", t259v, 26);
+    passed += Test("t259_decl_arm_taken_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    t259v = t259Loop(true);
+    passed += Test("t259_loop_arm_taken_sum", t259v, 6);
+    passed += Test("t259_loop_arm_taken_freed_once", dtorCount, 3);
+    dtorCount = 0;
+    t259v = t259Loop(false);
+    passed += Test("t259_loop_arm_untaken_sum", t259v, 0);
+    passed += Test("t259_loop_arm_untaken_freed_once", dtorCount, 3);
 
     // T230 r3 - a consumed unique field is null-tracked by its full path, flow-sensitive like a
     // moved local: loops, null guards, re-init, siblings and aliases compile (r2 refused them).
@@ -13036,9 +13184,10 @@ extern int main()
     total += 7;
 
     passed += testUniqueField();
-    total += 68;
+    total += 73;
     total += 18;  // T230 legs in testUniqueField
     total += 19;  // T230 r3 legs in testUniqueField
+    total += 22;  // T259 legs in testUniqueField
 
     passed += testUniqueAssignmentOwnership();
     total += 25;
@@ -13454,7 +13603,11 @@ extern int main()
     total += 28;
     passed += testChainedRawIntoUnique();
     total += 7;
+    passed += testChainedRawShapes();
+    total += 8;
     passed += testArrowOwnedTempMember();
+    total += 34;
+    passed += testT256AliasCallField();
     total += 34;
     passed += testT207RawLaunder();
     total += 19;
@@ -13480,6 +13633,9 @@ extern int main()
 
     passed += testT227SlotMoveSinks();
     total += 19;
+
+    passed += testT238MoveSinkLegs();
+    total += 21;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
@@ -14305,6 +14461,105 @@ void t207ParamBorrowThenNew(move T207Res* m, T207Res* q) { m = q; m = new T207Re
 T207Res* t207ReturnSameBlockNew(T207Res* q) { T207Res* raw = new T207Res(); raw = q; raw = new T207Res(); return raw; }
 move T207Res* t207MoveParamReown(move T207Res* m, T207Res* q) { m = q; m = new T207Res(); return m; }
 
+// T256: `alias int x = mk()->v;` (and the deref, nested, alias-argument and by-value-argument forms)
+// extends the owning call-result temp to the alias's scope end: one destructor per iteration, the
+// value stays valid until then. A by-value argument result is not an alias: its temp dies at statement end.
+int gT256Dtors = 0;
+int gT256ODtors = 0;
+int gT256Sum = 0;
+int gT256Bad = 0;
+int gT256Fallback = 7;
+int[8] gT256Arr;
+struct T256Res { int v = 3; int* heap = nullptr; ~T256Res() { gT256Dtors = gT256Dtors + 1; v = -999; } };
+unique<T256Res> t256Mk() { T256Res* r = new T256Res(); r->heap = &r->v; return unique<T256Res>(r); }
+struct T256Inner { int v = 3; };
+T256Inner gT256In;
+struct T256Outer { T256Inner* f = nullptr; int v = 3; ~T256Outer() { gT256ODtors = gT256ODtors + 1; v = -999; } };
+unique<T256Outer> t256MkO() { T256Outer* o = new T256Outer(); o->f = &gT256In; return unique<T256Outer>(o); }
+struct T256Outer2 { T256Res inner; ~T256Outer2() { gT256ODtors = gT256ODtors + 1; } };
+unique<T256Outer2> t256MkO2() { return unique<T256Outer2>(new T256Outer2()); }
+alias int t256Id(alias int value) { return value; }
+int t256ByVal(int value) { return value; }
+
+void t256Field() { for (int i = 0; i < 1000; i = i + 1) { alias int x = t256Mk()->v; gT256Sum = gT256Sum + x; } }
+void t256Deref() { for (int i = 0; i < 1000; i = i + 1) { alias int x = *t256Mk()->heap; gT256Sum = gT256Sum + x; } }
+void t256Nested() { for (int i = 0; i < 1000; i = i + 1) { alias int x = t256MkO()->f->v; gT256Sum = gT256Sum + x; } }
+void t256AliasArg() { for (int i = 0; i < 1000; i = i + 1) { alias int x = t256Id(t256Mk()->v); gT256Sum = gT256Sum + x; } }
+void t256ByValArg() { for (int i = 0; i < 1000; i = i + 1) { alias int x = t256ByVal(t256Mk()->v); gT256Sum = gT256Sum + x; } }
+void t256ByValStmtEnd() { for (int i = 0; i < 1000; i = i + 1) { alias int x = t256ByVal(t256Mk()->v); if (gT256Dtors != i + 1) gT256Bad = gT256Bad + 1; gT256Sum = gT256Sum + x; } }
+void t256ScopeEnd() { for (int i = 0; i < 1000; i = i + 1) { alias int x = t256Mk()->v; if (gT256Dtors != i) gT256Bad = gT256Bad + 1; gT256Sum = gT256Sum + x; } }
+int t256Early(bool c) { alias int x = t256Mk()->v; if (c) return x; return x + 1; }
+void t256Return() { for (int i = 0; i < 1000; i = i + 1) gT256Sum = gT256Sum + t256Early(i % 2 == 0); }
+void t256Break() { for (int i = 0; i < 1000; i = i + 1) { alias int x = t256Mk()->v; gT256Sum = gT256Sum + x; if (i == 5) break; } }
+void t256Continue() { for (int i = 0; i < 1000; i = i + 1) { alias int x = t256Mk()->v; if (i % 2 == 1) continue; gT256Sum = gT256Sum + x; } }
+void t256NestedBlock() { { alias int x = t256Mk()->v; gT256Sum = gT256Sum + x; } if (gT256Dtors != 1) gT256Bad = gT256Bad + 1; }
+void t256PtrAlias() { for (int i = 0; i < 1000; i = i + 1) { alias int* p = t256Mk()->heap; gT256Sum = gT256Sum + *p; } }
+void t256Subscript() { gT256Arr[3] = 3; for (int i = 0; i < 1000; i = i + 1) { alias int x = gT256Arr[t256Mk()->v]; gT256Sum = gT256Sum + x; } }
+void t256TwoDecls() { for (int i = 0; i < 1000; i = i + 1) { alias int x = t256Mk()->v; alias int y = t256MkO()->f->v; gT256Sum = gT256Sum + x + y; } }
+void t256StructAlias() { for (int i = 0; i < 1000; i = i + 1) { alias T256Res r = t256MkO2()->inner; gT256Sum = gT256Sum + r.v; } }
+void t256TernaryArm() { for (int i = 0; i < 1000; i = i + 1) { alias int x = (i % 2 == 0) ? t256Mk()->v : gT256Fallback; gT256Sum = gT256Sum + x; } }
+
+void t256TernaryCallArm() { for (int i = 0; i < 1000; i = i + 1) { alias int x = (i % 2 == 0) ? t256Id(t256Mk()->v) : gT256Fallback; gT256Sum = gT256Sum + x; } }
+
+void t256Reset() { gT256Dtors = 0; gT256ODtors = 0; gT256Sum = 0; gT256Bad = 0; }
+
+int testT256AliasCallField()
+{
+    int passed = 0;
+    t256Reset(); t256Field();
+    passed += Test("t256_field_dtors", gT256Dtors, 1000);
+    passed += Test("t256_field_value", gT256Sum, 3000);
+    t256Reset(); t256Deref();
+    passed += Test("t256_deref_dtors", gT256Dtors, 1000);
+    passed += Test("t256_deref_value", gT256Sum, 3000);
+    t256Reset(); t256Nested();
+    passed += Test("t256_nested_outer_dtors", gT256ODtors, 1000);
+    passed += Test("t256_nested_value", gT256Sum, 3000);
+    t256Reset(); t256AliasArg();
+    passed += Test("t256_alias_arg_dtors", gT256Dtors, 1000);
+    passed += Test("t256_alias_arg_value", gT256Sum, 3000);
+    t256Reset(); t256ByValArg();
+    passed += Test("t256_byval_arg_dtors", gT256Dtors, 1000);
+    passed += Test("t256_byval_arg_value", gT256Sum, 3000);
+    t256Reset(); t256ByValStmtEnd();
+    passed += Test("t256_byval_stmt_end_bad", gT256Bad, 0);
+    t256Reset(); t256ScopeEnd();
+    passed += Test("t256_scope_end_bad", gT256Bad, 0);
+    passed += Test("t256_scope_end_dtors", gT256Dtors, 1000);
+    t256Reset(); t256Return();
+    passed += Test("t256_return_dtors", gT256Dtors, 1000);
+    passed += Test("t256_return_value", gT256Sum, 3500);
+    t256Reset(); t256Break();
+    passed += Test("t256_break_dtors", gT256Dtors, 6);
+    passed += Test("t256_break_value", gT256Sum, 18);
+    t256Reset(); t256Continue();
+    passed += Test("t256_continue_dtors", gT256Dtors, 1000);
+    passed += Test("t256_continue_value", gT256Sum, 1500);
+    t256Reset(); t256NestedBlock();
+    passed += Test("t256_nested_block_bad", gT256Bad, 0);
+    t256Reset(); t256PtrAlias();
+    passed += Test("t256_ptr_alias_dtors", gT256Dtors, 1000);
+    passed += Test("t256_ptr_alias_value", gT256Sum, 3000);
+    t256Reset(); t256Subscript();
+    passed += Test("t256_subscript_dtors", gT256Dtors, 1000);
+    passed += Test("t256_subscript_value", gT256Sum, 3000);
+    t256Reset(); t256TwoDecls();
+    passed += Test("t256_two_decls_dtors", gT256Dtors, 1000);
+    passed += Test("t256_two_decls_outer_dtors", gT256ODtors, 1000);
+    passed += Test("t256_two_decls_value", gT256Sum, 6000);
+    t256Reset(); t256StructAlias();
+    passed += Test("t256_struct_alias_dtors", gT256Dtors, 1000);
+    passed += Test("t256_struct_alias_outer_dtors", gT256ODtors, 1000);
+    passed += Test("t256_struct_alias_value", gT256Sum, 3000);
+    t256Reset(); t256TernaryArm();
+    passed += Test("t256_ternary_arm_value", gT256Sum, 5000);
+    passed += Test("t256_ternary_arm_dtors", gT256Dtors, 500);
+    t256Reset(); t256TernaryCallArm();
+    passed += Test("t256_ternary_call_arm_dtors", gT256Dtors, 500);
+    passed += Test("t256_ternary_call_arm_value", gT256Sum, 5000);
+    return passed;
+}
+
 int testT207RawLaunder()
 {
     int passed = 0;
@@ -14697,5 +14952,180 @@ int testT227SlotMoveSinks()
 
     i64 after = (i64)HeapAudit.reportLeaks();
     passed += Test("t227_no_leak", after - before, (i64)0);
+    return passed;
+}
+
+// T238: the legal move-sink forms on an owning `move` parameter. The refused copy shapes live in
+// Test/errors/err_move_owning_local_copy_into_sink.cb; these legs prove the owner forms still run.
+int t238OwnParamConsume(move Resource* n) { return consumeTernaryMove(n); }
+int t238OwnParamMove(move Resource* n) { return consumeTernaryMove(move n); }
+int t238OwnParamRenamed(move Resource* n)
+{
+    Resource* m = move n;
+    return consumeTernaryMove(m);
+}
+
+// T238 review: a copy taken AFTER the owner moved out (same block) is null and borrows nothing.
+int t238MovedOutParamCopy(move Resource* n)
+{
+    Resource* m = move n;
+    Resource* a = n;
+    if (a == nullptr) return consumeTernaryMove(m);
+    return -1;
+}
+int t238MovedOutJoinCopy()
+{
+    UniqueBox t = default;
+    Resource* o = new Resource();
+    o->id = 75;
+    Resource* m = move o;
+    Resource* a = o;
+    t.item = a ?? new Resource();
+    return t.item != nullptr ? consumeTernaryMove(m) : -1;
+}
+
+// T244: owning local arms of '??' / '?:' stored into a unique field (consumed through the join).
+int t244JoinOwnedArmStore()
+{
+    UniqueBox t = default;
+    Resource* o = new Resource();
+    o->id = 81;
+    t.item = o ?? nullptr;
+    return t.item != nullptr ? t.item->id : -1;
+}
+int t244TernaryOwnedArmStore(bool flag)
+{
+    UniqueBox t = default;
+    Resource* o = new Resource();
+    o->id = 82;
+    t.item = flag ? o : nullptr;
+    return t.item != nullptr ? t.item->id : -1;
+}
+// T244 review: a NESTED join consumes the owning-local leaf arm it yielded (was a double free).
+int t244NestedJoinOwnedArmStore(bool flag)
+{
+    UniqueBox t = default;
+    Resource* a = new Resource();
+    a->id = 85;
+    Resource* b = new Resource();
+    b->id = 86;
+    t.item = flag ? a : (b ?? nullptr);
+    return t.item->id;
+}
+int t244JoinRhsOwnedArmStore()
+{
+    UniqueBox t = default;
+    Resource* n = nullptr;
+    Resource* o = new Resource();
+    o->id = 83;
+    t.item = n ?? o;
+    return t.item != nullptr ? t.item->id : -1;
+}
+// The copy is taken AFTER the owner moved out, so it is null and the join consumes only `m`.
+int t244TernaryMovedOutCopy(bool flag)
+{
+    UniqueBox t = default;
+    Resource* o = new Resource();
+    o->id = 84;
+    Resource* m = move o;
+    Resource* a = o;
+    t.item = flag ? a : m;
+    return t.item != nullptr ? t.item->id : -1;
+}
+
+int testT238MoveSinkLegs()
+{
+    int passed = 0;
+    dtorCount = 0;
+    Resource* a = new Resource();
+    a->id = 71;
+    passed += Test("t238_owner_param_move_keyword_value", t238OwnParamConsume(move a), 71);
+    Resource* b = new Resource();
+    b->id = 72;
+    passed += Test("t238_owner_param_implicit_value", t238OwnParamMove(b), 72);
+    Resource* c = new Resource();
+    c->id = 73;
+    passed += Test("t238_owner_param_renamed_value", t238OwnParamRenamed(c), 73);
+    passed += Test("t238_owner_param_freed_once", dtorCount, 3);
+    dtorCount = 0;
+    Resource* d = new Resource();
+    d->id = 74;
+    passed += Test("t238_moved_out_param_copy_value", t238MovedOutParamCopy(move d), 74);
+    passed += Test("t238_moved_out_join_copy_value", t238MovedOutJoinCopy(), 75);
+    passed += Test("t238_moved_out_copies_freed_once", dtorCount, 3);
+    // T244: an owning local arm of a '??' / '?:' stored into a unique field is consumed, as
+    // `t.item = o;` consumes it; an untaken arm keeps its owner and frees at scope exit.
+    dtorCount = 0;
+    passed += Test("t244_join_owned_arm_value", t244JoinOwnedArmStore(), 81);
+    passed += Test("t244_join_owned_arm_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("t244_ternary_owned_arm_value", t244TernaryOwnedArmStore(true), 82);
+    passed += Test("t244_ternary_owned_arm_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("t244_ternary_owned_arm_untaken_value", t244TernaryOwnedArmStore(false), -1);
+    passed += Test("t244_ternary_owned_arm_untaken_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("t244_join_rhs_owned_arm_value", t244JoinRhsOwnedArmStore(), 83);
+    passed += Test("t244_join_rhs_owned_arm_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("t244_ternary_moved_out_copy_value", t244TernaryMovedOutCopy(false), 84);
+    passed += Test("t244_ternary_moved_out_copy_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("t244_nested_join_true_value", t244NestedJoinOwnedArmStore(true), 85);
+    passed += Test("t244_nested_join_true_freed_once", dtorCount, 2);
+    dtorCount = 0;
+    passed += Test("t244_nested_join_false_value", t244NestedJoinOwnedArmStore(false), 86);
+    passed += Test("t244_nested_join_false_freed_once", dtorCount, 2);
+    return passed;
+}
+
+// T250: the ternary-new, parenthesised and declaration inners of `owner = <inner> = new T()` transfer
+// ownership exactly as the two-statement `raw = new T(); owner = raw;` does: one destructor per object.
+int testChainedRawShapes()
+{
+    int passed = 0;
+    bool useNew = true;
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* owner = nullptr;
+        ChainRawBox* raw = nullptr;
+        owner = raw = (useNew ? new ChainRawBox() : nullptr);
+        owner->v = 3;
+        passed += Test("chain_tern_new_owner_value", owner->v, 3);
+    }
+    passed += Test("chain_tern_new_one_dtor", chainRawDtors, 1);
+    chainRawDtors = 0;
+    useNew = false;
+    {
+        unique ChainRawBox* owner = nullptr;
+        ChainRawBox* raw = nullptr;
+        owner = raw = (useNew ? new ChainRawBox() : nullptr);
+    }
+    passed += Test("chain_tern_null_no_dtor", chainRawDtors, 0);
+    chainRawDtors = 0;
+    {
+        unique ChainRawBox* owner = nullptr;
+        ChainRawBox* raw = nullptr;
+        owner = (raw = new ChainRawBox());
+        owner->v = 5;
+        passed += Test("chain_paren_owner_value", owner->v, 5);
+    }
+    passed += Test("chain_paren_one_dtor", chainRawDtors, 1);
+    chainRawDtors = 0;
+    {
+        ChainRawBox* raw = nullptr;
+        unique ChainRawBox* owner = raw = new ChainRawBox();
+        owner->v = 6;
+        passed += Test("chain_decl_owner_value", owner->v, 6);
+    }
+    passed += Test("chain_decl_one_dtor", chainRawDtors, 1);
+    chainRawDtors = 0;
+    {
+        ChainRawBox* raw = nullptr;
+        unique ChainRawBox* owner = raw = new ChainRawBox();
+        owner = raw = new ChainRawBox();
+    }
+    passed += Test("chain_decl_reset_frees_old_one", chainRawDtors, 2);
+    chainRawDtors = 0;
     return passed;
 }
