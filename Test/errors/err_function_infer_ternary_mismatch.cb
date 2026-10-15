@@ -29,6 +29,8 @@ expect_error("the arms of the conditional expression have different signatures '
     function<int(int)> t182RetB(int k, T182Hold h) { return k ? h.fn : t176Many; }
 }
 
+T t191Sig<T>(T a) { return a; }
+
 extern int main()
 {
     int k = 1;
@@ -51,6 +53,9 @@ extern int main()
     expect_error("the arms of the conditional expression have different signatures 'int(int, ...)' and 'int(int)'") { t182Use(k ? t176Many : h.fn); }
     expect_error("the arms of the conditional expression have different signatures 'int(int, ...)' and 'int(int)'") { T170Cb c2 = k ? t170_sum : t170_inc; }
     expect_error("no overload of 't182Ov' has the signature 'int(int, ...)' of the other arm of the conditional expression") { function f7 = k ? t182Ov : t176Many; }
+    // T191: a generic instantiation arm carries its instantiated signature into the same check.
+    expect_error("the arms of the conditional expression have different signatures 'int(int)' and 'int(int, ...)'") { function f8 = k ? t191Sig<int> : t176Many; }
+    expect_error("the arms of the conditional expression have different signatures 'int(int, ...)' and 'int(int)'") { function f9 = k ? t176Many : t191Sig<int>; }
     Lambda<int(int)> lx = (int a) => { return a; };
     expect_error("the arms of the conditional expression have different signatures 'int(int)' and 'int(int, int)'") { Lambda<int(int)> lg = k ? lx : t182Two; }
     expect_error("the arms of the conditional expression have different signatures 'int(int, int)' and 'int(int)'") { Lambda<int(int)> lh = k ? t182Two : lx; }

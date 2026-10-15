@@ -4961,12 +4961,17 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 }
             }
 
-            // Variadic-ness is part of a C function-pointer type, whatever the representation.
-            if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer
+            // Variadic-ness and the bind rule are part of a function-pointer type, whatever the representation.
+            // A generic-substituted closure field carries an encoded type name; its signature is the encoded one.
+            LLVMBackend::TypeAndValue assignSlotSig = namedVar.TypeAndValue;
+            if (!assignSlotSig.IsFunctionPointer && !assignSlotSig.Pointer)
+                if (const auto* enc = compiler->GetEncodedClosureType(assignSlotSig.TypeName))
+                    assignSlotSig = *enc;
+            if (operatorText == "=" && assignSlotSig.IsFunctionPointer
                 && rightNV.TypeAndValue.IsFunctionPointer && right)
             {
-                if (std::string why = compiler->DescribeFuncPtrVariadicMismatch(
-                        namedVar.TypeAndValue, rightNV.TypeAndValue); !why.empty())
+                if (std::string why = compiler->DescribeFuncPtrValueMismatch(
+                        assignSlotSig, rightNV.TypeAndValue); !why.empty())
                     LogErrorContext(ctx, why);
             }
 
@@ -5650,7 +5655,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             // carries an ENCODED name but is the same `__closure_fat_ptr` struct and owns an env.
             bool destIsClosureFat = namedVar.TypeAndValue.TypeName == "__closure_fat_ptr"
                 || (!namedVar.TypeAndValue.Pointer
-                    && compiler->IsFatEncodedClosureType(namedVar.TypeAndValue.TypeName));
+                    && (namedVar.BaseType == compiler->GetClosureFatPtrType()
+                        || compiler->IsFatEncodedClosureType(namedVar.TypeAndValue.TypeName)));
             if (operatorText == "=" && right && right->getType()->isStructTy() && destIsClosureFat)
             {
                 right = CloneClosureFromNamedSource(rightNV, right, ctx);
@@ -11286,8 +11292,26 @@ LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::Equal
         return {};
     }
 
+void MainListener::ResolveGenericFunctionValueOperand(LLVMBackend::NamedVariable& namedVar,
+                                                      antlr4::ParserRuleContext* ctx) {
+        if (namedVar.Primary == nullptr && namedVar.GenericFunctionValue && !namedVar.CallerName.empty())
+        {
+            namedVar.Primary = Compiler(ctx)->GetFunctionForFuncPtr(namedVar.CallerName);
+            if (auto* fn = llvm::dyn_cast_or_null<llvm::Function>(namedVar.Primary);
+                fn != nullptr && !namedVar.TypeAndValue.IsFunctionPointer)
+                if (const auto* sym = Compiler(ctx)->FindSymbolForFunction(fn))
+                    namedVar.TypeAndValue = Compiler(ctx)->FuncPtrSigOfSymbol(*sym);
+        }
+}
+
 LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::NamedVariable& namedVar,
                                                      antlr4::ParserRuleContext* ctx) {
+        // A generic function instantiation named as a VALUE (`wrap<int>`) publishes only its mangled
+        // CallerName. Resolve it to the instantiated function, with its signature, the way a plain
+        // named function value is, so a `?:` arm sees the function and can compare it with the other.
+        // Only this value path resolves it: declarations and assignments keep the CallerName fallback
+        // that binds the signature check.
+        ResolveGenericFunctionValueOperand(namedVar, ctx);
         bool isUnsigned = namedVar.TypeAndValue.IsUnsignedInteger() != -1;
         llvm::Type* elemType = nullptr;
         if (namedVar.TypeAndValue.Pointer)
@@ -16025,6 +16049,7 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
             auto firstNV = ParseCxxFoldOperand(Compiler(ctx), [&] {
                 return ParseCastExpression(nextCtxs[0], false, ResultUse::Value);
             });
+            ResolveGenericFunctionValueOperand(firstNV, nextCtxs[0]);
             NormalizeCxxReferenceNamed(ctx, firstNV);
             bool lu = firstNV.TypeAndValue.IsUnsignedInteger() != -1;
             bool lhsIsRvalue = firstNV.IsRvalue;
@@ -16050,6 +16075,7 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
                 auto rightNV = ParseCxxFoldOperand(Compiler(ctx), [&] {
                     return ParseCastExpression(nextCtxs[i], false, ResultUse::Value);
                 });
+                ResolveGenericFunctionValueOperand(rightNV, nextCtxs[i]);
                 NormalizeCxxReferenceNamed(ctx, rightNV);
                 bool ru = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
                 llvm::Value* rvalue = LoadNamedVariable(rightNV);
@@ -21354,12 +21380,18 @@ void MainListener::EmitFieldInitializer(
                         (int)initField->FuncPtrParams.size(), &initField->FuncPtrParams, initField))
                     rightNV.Primary = correctFn;
             }
-            // Variadic-ness is part of a C function-pointer field's type, as for a declaration.
-            if (initField != nullptr && initField->IsFunctionPointer
+            // Variadic-ness and the bind rule are part of a function-pointer field's type, as for a declaration.
+            // A generic-substituted closure field carries an encoded type name; its signature is the encoded one.
+            LLVMBackend::TypeAndValue initSlotSig;
+            if (initField != nullptr) initSlotSig = *initField;
+            if (initField != nullptr && !initSlotSig.IsFunctionPointer && !initSlotSig.Pointer)
+                if (const auto* enc = compiler->GetEncodedClosureType(initSlotSig.TypeName))
+                    initSlotSig = *enc;
+            if (initField != nullptr && initSlotSig.IsFunctionPointer
                 && rightNV.TypeAndValue.IsFunctionPointer)
             {
-                if (std::string why = compiler->DescribeFuncPtrVariadicMismatch(
-                        *initField, rightNV.TypeAndValue); !why.empty())
+                if (std::string why = compiler->DescribeFuncPtrValueMismatch(
+                        initSlotSig, rightNV.TypeAndValue); !why.empty())
                     LogErrorContext(fi, why);
             }
             lambdaExpectedType = {};

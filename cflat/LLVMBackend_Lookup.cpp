@@ -1275,8 +1275,9 @@ std::string LLVMBackend::DescribeFuncPtrVariadicMismatch(const LLVMBackend::Type
             FuncPtrSpellingOf(slot), FuncPtrSpellingOf(value), VariadicMismatchReason(slot.FuncPtrVariadic));
     }
 
-std::string LLVMBackend::DescribeFuncPtrBindMismatch(const std::string& functionName,
-        const LLVMBackend::TypeAndValue& fn, const LLVMBackend::TypeAndValue& dest) const
+// The bind rule itself, shared by named functions and lambda literals. Empty when fn can bind dest.
+std::string LLVMBackend::FuncPtrBindReason(const LLVMBackend::TypeAndValue& fn,
+        const LLVMBackend::TypeAndValue& dest) const
 {
         std::vector<FuncPtrComponent> sa, sb;
         if (!FuncPtrSignatureOf(fn, sa) || !FuncPtrSignatureOf(dest, sb))
@@ -1290,12 +1291,48 @@ std::string LLVMBackend::DescribeFuncPtrBindMismatch(const std::string& function
         for (size_t i = 0; i < sa.size() && why.empty(); i++)
             if (ComponentsProvablyDiffer(sa[i], sb[i]))
                 why = (i == 0) ? "the return type differs" : std::format("parameter {} differs", i);
+        return why;
+    }
+
+std::string LLVMBackend::DescribeFuncPtrBindMismatch(const std::string& functionName,
+        const LLVMBackend::TypeAndValue& fn, const LLVMBackend::TypeAndValue& dest) const
+{
+        std::string why = FuncPtrBindReason(fn, dest);
         if (why.empty()) return "";
         return std::format("cannot bind function '{}' to function-pointer type '{}': '{}' is "
             "'{}' - {}. A function pointer is called with no conversion site, so the signature "
             "has to match.",
             SpellFunctionSymbol(*this, functionName), FuncPtrSpellingOf(dest),
             SpellFunctionSymbol(*this, functionName), FuncPtrSpellingOf(fn), why);
+    }
+
+std::string LLVMBackend::DescribeFuncPtrValueMismatch(const LLVMBackend::TypeAndValue& slot,
+        const LLVMBackend::TypeAndValue& value) const
+{
+        if (std::string why = DescribeFuncPtrVariadicMismatch(slot, value); !why.empty())
+            return why;
+        if (!slot.IsFunctionPointer || !value.IsFunctionPointer)
+            return "";
+        std::string why = FuncPtrBindReason(value, slot);
+        if (why.empty() && value.TypeName == "__closure_fat_ptr"
+            && value.FuncPtrParams.size() < slot.FuncPtrParams.size())
+            why = std::format("it takes {} parameter(s) but the slot supplies {}; a Lambda<> value may carry captured state, and "
+                "a closure's environment is its last argument, so the slot's extra arguments could be read as that "
+                "state - wrap it in a lambda literal that takes the slot's parameters",
+                value.FuncPtrParams.size(), slot.FuncPtrParams.size());
+        if (why.empty()) return "";
+        return std::format("function-pointer signature mismatch: slot takes '{}' but the value is '{}' - {}",
+            FuncPtrSpellingOf(slot), FuncPtrSpellingOf(value), why);
+    }
+
+std::string LLVMBackend::DescribeLambdaBindMismatch(const LLVMBackend::TypeAndValue& lambda,
+        const LLVMBackend::TypeAndValue& slot) const
+{
+        std::string why = FuncPtrBindReason(lambda, slot);
+        if (why.empty()) return "";
+        return std::format("cannot bind this lambda of type '{}' to function-pointer type '{}' - {}. "
+            "A lambda's parameters must match the slot it is bound to; it may take fewer parameters "
+            "than the slot supplies.", FuncPtrSpellingOf(lambda), FuncPtrSpellingOf(slot), why);
     }
 
 bool LLVMBackend::ArgumentIsFunctionPointerish(const NamedVariable& arg) const

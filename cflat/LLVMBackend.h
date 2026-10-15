@@ -2107,7 +2107,7 @@ public:
         // argument Clang drops entirely (an empty record).
         enum Kind { Direct, CoerceToInt, ByVal, SRetReturn, CoercePair, CoerceFlat, Ignore };
         Kind kind = Direct;
-        llvm::Type* coerceTy = nullptr;     // eightbyte 0 type for CoerceToInt / CoercePair
+        llvm::Type* coerceTy = nullptr;     // single coercion type, or the first CoercePair part
         llvm::Type* coerceTy2 = nullptr;    // eightbyte 1 type for CoercePair
         llvm::StructType* coerceStructTy = nullptr; // element list for CoerceFlat
         llvm::Type* structTy = nullptr;      // pointee for ByVal / SRetReturn / coerce source (a record, or a scalar MS x64 passes indirectly)
@@ -9057,7 +9057,7 @@ public:
 
     // Build a param/return slot from a classifier's coerce list (SysV eightbytes or AArch64
     // registers): empty -> MEMORY (memoryKind: ByVal for params, SRetReturn for returns);
-    // one entry -> CoerceToInt; two -> CoercePair. Shared by the SysV and AArch64 classifiers.
+    // one entry -> CoerceToInt; two -> CoercePair. AArch64 params wrap two entries as one array.
     static AbiSlot MakeCoerceSlot(llvm::StructType* st, uint64_t align,
                                   const std::vector<llvm::Type*>& coerce, AbiSlot::Kind memoryKind);
 
@@ -9081,7 +9081,9 @@ public:
     // mixed int/float aggregates go entirely in general registers.
     std::vector<llvm::Type*> ClassifyAArch64Struct(llvm::StructType* st) const;
 
-    // AArch64 param classification: 1 coerce -> CoerceToInt; 2 -> CoercePair; MEMORY -> ByVal.
+    // AArch64 params keep a two-GPR composite in one [2 x i64] LLVM argument so it cannot split
+    // between X registers and the stack; HFA arrays are already single arguments.
+    // MEMORY -> ByVal.
     AbiSlot ClassifyAArch64Param(llvm::StructType* st, uint64_t align);
 
     // AArch64 return classification: 1 coerce -> CoerceToInt; 2 -> CoercePair; MEMORY -> SRet.
@@ -10649,6 +10651,25 @@ public:
      */
     std::string DescribeFuncPtrBindMismatch(const std::string& functionName,
         const LLVMBackend::TypeAndValue& fn, const LLVMBackend::TypeAndValue& dest) const;
+
+    // The reason half of the bind rule above, without the subject. Empty when fn can bind dest.
+    std::string FuncPtrBindReason(const LLVMBackend::TypeAndValue& fn,
+        const LLVMBackend::TypeAndValue& dest) const;
+
+    /*
+     * Value-site check (declaration initializer, assignment, return, brace/field initializer): the
+     * variadic check, then the bind rule for a function-pointer VALUE (`function<>`/`Lambda<>` variable,
+     * field, call result, ternary) against the slot's signature. A Lambda<> value with fewer parameters
+     * than the slot is refused too: its environment is its last argument and the static type cannot
+     * tell a capturing closure from a non-capturing one. A thin function<> value may take fewer.
+     * Empty when the value can bind.
+     */
+    std::string DescribeFuncPtrValueMismatch(const LLVMBackend::TypeAndValue& slot,
+        const LLVMBackend::TypeAndValue& value) const;
+
+    // A lambda literal bound to a Lambda<>/function<> slot: the same rule, subject named as a lambda.
+    std::string DescribeLambdaBindMismatch(const LLVMBackend::TypeAndValue& lambda,
+        const LLVMBackend::TypeAndValue& slot) const;
 
     /*
      * An argument that IS code: a function pointer, a closure value, or a function symbol. One

@@ -1037,12 +1037,16 @@ void ForwardRefScanner::SeedConstIntGlobals(CFlatParser::TranslationUnitContext*
             if (direct == nullptr || direct->assignmentExpression() != nullptr || initializer == nullptr
                 || initializer->assignmentExpression() == nullptr)
                 continue;
-            std::string name = getDirectDeclName(direct);
+            const std::string bare = getDirectDeclName(direct);
+            // Keyed by the qualified name ("N.K" inside namespace N), the same key the main pass
+            // resolves the global under; a bare name inside N reaches it through FoldCompileTimeIdentifier.
+            const std::string ns = compilerLLVM->GetCurrentNamespace();
+            const std::string name = ns.empty() || bare.empty() ? bare : ns + "." + bare;
             int64_t already = 0;
             // A -D define and the platform builtins own the name; never shadow one, and never
             // re-seed a name already recorded (that is what makes the fixpoint monotone).
-            if (name.empty() || compilerLLVM->IsReservedMacroName(name)
-                || compilerLLVM->GetCompileTimeMacro(name).value != nullptr
+            if (bare.empty() || compilerLLVM->IsReservedMacroName(bare)
+                || compilerLLVM->GetCompileTimeMacro(bare).value != nullptr
                 || compilerLLVM->TryGetConstGlobalInt(name, already))
                 continue;
             auto folded = FoldCompileTimeInt(compilerLLVM, initializer->assignmentExpression());
@@ -1052,16 +1056,26 @@ void ForwardRefScanner::SeedConstIntGlobals(CFlatParser::TranslationUnitContext*
         }
     };
 
-    // Deliberately FILE SCOPE ONLY - a namespaced `const int X` would seed under its bare name
-    // while the main pass resolves the qualified global, and two namespaces declaring the same
-    // name would make the first one win everywhere. A disagreement between the two folders is
-    // exactly the failure this seeding exists to remove, so a namespaced const stays unfoldable
-    // in the scanner (unchanged from before) rather than folding to a possibly wrong value.
+    // Namespace bodies are walked with their scope active and seed under the qualified name, so two
+    // namespaces declaring the same spelling never collide and the main pass's qualified global agrees.
+    auto seedExternals = [&](auto&& self, const auto& externals, bool& changed) -> void {
+        for (auto* ext : externals)
+        {
+            if (ext == nullptr) continue;
+            if (auto* nsDef = ext->namespaceDefinition())
+            {
+                LLVMBackend::NamespaceScope nsScope(
+                    compilerLLVM, NestedNamespaceName(compilerLLVM->GetCurrentNamespace(), nsDef));
+                self(self, nsDef->externalDeclaration(), changed);
+            }
+            else
+                seedDeclaration(ext->declaration(), changed);
+        }
+    };
     for (int round = 0; round < 4; round++)
     {
         bool changed = false;
-        for (auto* ext : tu->externalDeclaration())
-            if (ext != nullptr) seedDeclaration(ext->declaration(), changed);
+        seedExternals(seedExternals, tu->externalDeclaration(), changed);
         if (!changed) break;
     }
 }

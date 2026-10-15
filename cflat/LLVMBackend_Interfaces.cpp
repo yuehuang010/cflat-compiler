@@ -1046,7 +1046,13 @@ llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& 
         cAbiFunctionThunkCache_[key] = thunk;
 
         auto* entry = llvm::BasicBlock::Create(*context, "entry", thunk);
-        llvm::IRBuilder<> b(entry);
+        llvm::IRBuilderBase::InsertPointGuard builderIPGuard(*builder);
+        llvm::IRBuilderBase::OperandBundlesGuard builderOBGuard(*builder);
+        // The thunk is its own function: no caller debug location, no caller funclet bundle.
+        builder->setDefaultOperandBundles({});
+        builder->SetInsertPoint(entry);
+        builder->SetCurrentDebugLocation(llvm::DebugLoc());
+        auto& b = *builder;
         std::vector<llvm::Value*> loweredArgs;
         unsigned sourceArg = 0;
         llvm::AllocaInst* sretSlot = nullptr;
@@ -1083,7 +1089,7 @@ llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& 
             else if (slot.kind == AbiSlot::CoercePair)
             {
                 auto* pairTy = llvm::StructType::get(*context, { slot.coerceTy, slot.coerceTy2 });
-                auto* copy = b.CreateAlloca(slot.structTy, nullptr, "abi.coerce");
+                auto* copy = AllocaForCoerce(slot.structTy, pairTy, slot.align, "abi.coerce");
                 b.CreateStore(value, copy);
                 auto* pairPtr = b.CreateBitCast(copy, cflat_llvm::PointerTo(pairTy));
                 auto* pair = b.CreateLoad(pairTy, pairPtr);
@@ -1092,7 +1098,8 @@ llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& 
             }
             else
             {
-                auto* copy = b.CreateAlloca(slot.structTy, nullptr, "abi.coerce");
+                auto* copy = AllocaForCoerce(slot.structTy, slot.coerceTy,
+                                             slot.align, "abi.coerce");
                 b.CreateStore(value, copy);
                 auto* coercePtr = b.CreateBitCast(copy, cflat_llvm::PointerTo(slot.coerceTy));
                 loweredArgs.push_back(b.CreateLoad(slot.coerceTy, coercePtr));
@@ -1112,7 +1119,8 @@ llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& 
             b.CreateRet(b.CreateLoad(recipe.retSlot.structTy, sretSlot));
         else
         {
-            auto* resultSlot = b.CreateAlloca(recipe.retSlot.structTy, nullptr, "abi.ret");
+            auto* resultSlot = AllocaForCoerce(recipe.retSlot.structTy, call->getType(),
+                                               recipe.retSlot.align, "abi.ret");
             auto* resultPtr = b.CreateBitCast(resultSlot, cflat_llvm::PointerTo(call->getType()));
             b.CreateStore(call, resultPtr);
             b.CreateRet(b.CreateLoad(recipe.retSlot.structTy, resultSlot));

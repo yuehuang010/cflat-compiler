@@ -8207,11 +8207,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     }
                                 }
                             }
-                            // Variadic-ness is part of a C function-pointer type: refused before the
-                            // slot adopts the initializer's flag below.
+                            // Variadic-ness and the bind rule are part of a function-pointer type: refused
+                            // before the slot adopts the initializer's flag below.
                             if (right && typeAndValue.IsFunctionPointer && rhsIsFuncPtr)
                             {
-                                if (std::string why = compiler->DescribeFuncPtrVariadicMismatch(
+                                if (std::string why = compiler->DescribeFuncPtrValueMismatch(
                                         typeAndValue, rhsFnSig); !why.empty())
                                     LogErrorContext(assignmentExpression, why);
                             }
@@ -11086,15 +11086,20 @@ llvm::Value* MainListener::CloneClosureFromNamedSource(
         llvm::Value* right,
         antlr4::ParserRuleContext* ctx) {
         auto* compiler = Compiler(ctx);
+        auto* closureTy = compiler->GetClosureFatPtrType();
+        bool sourceIsClosureFat = rightNV.BaseType == closureTy
+            || rightNV.TypeAndValue.TypeName == "__closure_fat_ptr"
+            || compiler->IsFatEncodedClosureType(rightNV.TypeAndValue.TypeName);
         bool namedSource = rightNV.Storage != nullptr
             && !rightNV.TypeAndValue.IsMove
-            && rightNV.TypeAndValue.TypeName == "__closure_fat_ptr";
+            && sourceIsClosureFat
+            && right != nullptr && right->getType() == closureTy;
         if (!namedSource)
             return right;
         // Fresh arg NV (Storage + closure type only) so the user-side CallerName /
         // named-argument metadata on rightNV does not confuse copy() overload resolution.
         LLVMBackend::NamedVariable cloneArg;
-        cloneArg.BaseType = compiler->GetClosureFatPtrType();
+        cloneArg.BaseType = closureTy;
         // A union member's Storage is the union alloca, so a type-inferred load off it reads the
         // whole union; hand the copy a value loaded with the closure type instead.
         if (rightNV.UnionFieldType != nullptr)

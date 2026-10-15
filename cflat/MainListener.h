@@ -1125,6 +1125,19 @@ static std::optional<int64_t> FoldCompileTimeIdentifier(LLVMBackend* compiler,
         int64_t mv = (int64_t)ci->getSExtValue();
         return InScannerInt32Range(mv) ? std::optional<int64_t>(mv) : std::nullopt;
     }
+    // Innermost enclosing namespace first (C++ lookup): a seeded "N.name" const folds to its own value,
+    // while a non-const global or function of that qualified name hides the file-scope const.
+    for (std::string scope = compiler->GetCurrentNamespace(); !scope.empty();)
+    {
+        const std::string key = scope + "." + name;
+        int64_t nsValue = 0;
+        if (compiler->TryGetConstGlobalInt(key, nsValue))
+            return InScannerInt32Range(nsValue) ? std::optional<int64_t>(nsValue) : std::nullopt;
+        if (compiler->GetGlobalVariableNV(key).Storage != nullptr || compiler->GetFunction(key))
+            return std::nullopt;
+        const size_t dot = scope.rfind('.');
+        scope = dot == std::string::npos ? std::string{} : scope.substr(0, dot);
+    }
     int64_t cv = 0;
     if (!compiler->TryGetConstGlobalInt(name, cv))
     {
@@ -6622,6 +6635,11 @@ public:
     // NamedVariable and still produce byte-identical TypedValue state.
     LLVMBackend::TypedValue TypedValueOfNamedOperand(LLVMBackend::NamedVariable& namedVar,
                                                      antlr4::ParserRuleContext* ctx);
+
+    // A generic function instantiation used as an arithmetic operand (`wrap<int> * 0.5`) publishes
+    // only its CallerName; resolve it to the function so the operand is refused as a function value.
+    void ResolveGenericFunctionValueOperand(LLVMBackend::NamedVariable& namedVar,
+                                            antlr4::ParserRuleContext* ctx);
 
     /*
      * The castExpression an 'is'/'as' operand reduces to when relational -> shift -> additive ->

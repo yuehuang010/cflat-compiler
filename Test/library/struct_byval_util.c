@@ -96,6 +96,101 @@ int sum_six_pairs(struct Pair a, struct Pair b, struct Pair c,
            (d.x + d.y) + (e.x + e.y) + (f.x + f.y);
 }
 
+/* T190: exhausted AAPCS64 argument-register banks keep each aggregate whole. */
+struct T190CD { char c; double d; };
+struct T190Mid { int a; int b; double d; };
+struct T190Small { int a; int b; };
+struct T190HFA { double a; double b; };
+
+static int t190_weighted7(int a, int b, int c, int d, int e, int f, int g)
+{
+    return a + 2*b + 3*c + 4*d + 5*e + 6*f + 7*g;
+}
+
+int t190_many_cd(int a, int b, int c, int d, int e, int f, int g, struct T190CD s)
+{
+    return t190_weighted7(a,b,c,d,e,f,g) + (int)s.c*100 + (int)s.d*1000;
+}
+int t190_many_mid(int a, int b, int c, int d, int e, int f, int g, struct T190Mid s)
+{
+    return t190_weighted7(a,b,c,d,e,f,g) + s.a*100 + s.b*1000 + (int)s.d*10000;
+}
+int t190_many_mid_tail(int a, int b, int c, int d, int e, int f, int g,
+                       struct T190Mid s, int tail)
+{
+    return t190_weighted7(a,b,c,d,e,f,g) + s.a*100 + s.b*1000 +
+           (int)s.d*10000 + tail*100000;
+}
+int t190_six_cd(int a, int b, int c, int d, int e, int f, struct T190CD s)
+{
+    return a + 2*b + 3*c + 4*d + 5*e + 6*f + (int)s.c*100 + (int)s.d*1000;
+}
+int t190_seven_small(int a, int b, int c, int d, int e, int f, int g,
+                     struct T190Small s)
+{
+    return t190_weighted7(a,b,c,d,e,f,g) + s.a*100 + s.b*1000;
+}
+int t190_seven_hfa(double a, double b, double c, double d, double e, double f, double g,
+                   struct T190HFA s)
+{
+    return (int)(a+b+c+d+e+f+g) + (int)s.a*100 + (int)s.b*1000;
+}
+
+int t190_export_mid(int, int, int, int, int, int, int, struct T190Mid);
+int t190_export_cd(int, int, int, int, int, int, int, struct T190CD);
+int t190_call_export_mid(int a, int b, int c, int d, int e, int f, int g,
+                         struct T190Mid s)
+{
+    return t190_export_mid(a,b,c,d,e,f,g,s);
+}
+int t190_call_export_cd(int a, int b, int c, int d, int e, int f, int g,
+                        struct T190CD s)
+{
+    return t190_export_cd(a,b,c,d,e,f,g,s);
+}
+typedef int (*t190_cd_callback)(int, int, int, int, int, int, int, struct T190CD);
+typedef int (*t190_mid_callback)(int, int, int, int, int, int, int, struct T190Mid);
+int t190_invoke_cd_callback(t190_cd_callback cb, int a, int b, int c, int d, int e,
+                            int f, int g, struct T190CD s)
+{
+    return cb(a,b,c,d,e,f,g,s);
+}
+int t190_invoke_mid_callback(t190_mid_callback cb, int a, int b, int c, int d, int e,
+                             int f, int g, struct T190Mid s)
+{
+    return cb(a,b,c,d,e,f,g,s);
+}
+
+struct T190Triplet { int a; int b; int c; };
+struct T190NineBytes { char bytes[9]; };
+int t190_export_triplet6(int,int,int,int,int,int,struct T190Triplet);
+int t190_export_triplet7(int,int,int,int,int,int,int,struct T190Triplet);
+int t190_export_nine7(int,int,int,int,int,int,int,struct T190NineBytes);
+int t190_call_export_triplet6(int a,int b,int c,int d,int e,int f,struct T190Triplet s)
+{
+    return t190_export_triplet6(a,b,c,d,e,f,s);
+}
+int t190_call_export_triplet7(int a,int b,int c,int d,int e,int f,int g,struct T190Triplet s)
+{
+    return t190_export_triplet7(a,b,c,d,e,f,g,s);
+}
+typedef int (*t190_triplet_callback6)(int,int,int,int,int,int,struct T190Triplet);
+typedef int (*t190_triplet_callback7)(int,int,int,int,int,int,int,struct T190Triplet);
+int t190_invoke_triplet_callback6(t190_triplet_callback6 cb,int a,int b,int c,int d,int e,int f,
+                                  struct T190Triplet s)
+{
+    return cb(a,b,c,d,e,f,s);
+}
+int t190_invoke_triplet_callback7(t190_triplet_callback7 cb,int a,int b,int c,int d,int e,int f,
+                                  int g,struct T190Triplet s)
+{
+    return cb(a,b,c,d,e,f,g,s);
+}
+int t190_call_export_nine7(int a,int b,int c,int d,int e,int f,int g,struct T190NineBytes s)
+{
+    return t190_export_nine7(a,b,c,d,e,f,g,s);
+}
+
 /* --- function<> C-ABI legs (T77): a 24-byte aggregate crossing a function pointer. Every call
    through a function<> uses the C ABI of its signature, so these must agree with clang. --- */
 struct T77Big { long long a, b, c; };

@@ -102,6 +102,14 @@ struct TypeManglingAccess
             return 1;
         return std::nullopt;
     }
+
+    static bool IsRegisteredLocalEnum(const LLVMBackend& compiler,
+                                      std::string_view name)
+    {
+        auto it = compiler.enumBackingTypes.find(std::string(name));
+        return it != compiler.enumBackingTypes.end()
+            && compiler.IsGenericLocalEnumKey(it->first);
+    }
 };
 
 static std::string MangleGenericInstanceUnchecked(const LLVMBackend& compiler,
@@ -378,6 +386,32 @@ TypeParseCandidates ComputeMangledCandidates(const LLVMBackend& compiler,
         return out;
     }
 
+    // A registered local enum key contains its owning function's `$` separators, so it is
+    // an atomic type name even though generic arguments use `$` as their delimiter.
+    if (separator != std::string_view::npos)
+    {
+        size_t candidateEnd = text.find('$', separator + 1);
+        while (candidateEnd != std::string_view::npos)
+        {
+            const std::string_view candidate = text.substr(basePosition,
+                                                           candidateEnd - basePosition);
+            if (TypeManglingAccess::IsRegisteredLocalEnum(compiler, candidate))
+            {
+                TypeSpelling localEnum;
+                localEnum.base = std::string(candidate);
+                AddTypeCandidate(std::move(localEnum), candidateEnd, prefix, out);
+            }
+            candidateEnd = text.find('$', candidateEnd + 1);
+        }
+        const std::string_view candidate = text.substr(basePosition);
+        if (TypeManglingAccess::IsRegisteredLocalEnum(compiler, candidate))
+        {
+            TypeSpelling localEnum;
+            localEnum.base = std::string(candidate);
+            AddTypeCandidate(std::move(localEnum), text.size(), prefix, out);
+        }
+    }
+
     // Before templates are registered, a producer can still name a generic.
     // Preserve reversible parses until its arity becomes available.
     if (separator != std::string_view::npos && separator + 1 < text.size()
@@ -497,6 +531,15 @@ std::string MangleFunctionType(const LLVMBackend& compiler,
     return result;
 }
 
+static std::string GenericLocalEnumDisplayName(const LLVMBackend& compiler,
+                                               const std::string& spelling)
+{
+    const std::string enumKey = compiler.ResolveEnumTypeName(spelling);
+    if (enumKey != spelling || !compiler.IsGenericLocalEnumKey(enumKey)) return {};
+    const size_t dot = enumKey.rfind('.');
+    return dot == std::string::npos ? enumKey : enumKey.substr(dot + 1);
+}
+
 std::string PrintTypeSpelling(const LLVMBackend& compiler, const TypeSpelling& spelling)
 {
     if (spelling.closure)
@@ -525,7 +568,9 @@ std::string PrintTypeSpelling(const LLVMBackend& compiler, const TypeSpelling& s
     if (spelling.value) return spelling.base;
 
     std::string result = spelling.alias ? "alias " : "";
-    result += spelling.base == "longdouble" ? "long double" : spelling.base;
+    const std::string localEnum = GenericLocalEnumDisplayName(compiler, spelling.base);
+    const std::string& base = localEnum.empty() ? spelling.base : localEnum;
+    result += base == "longdouble" ? "long double" : base;
     // std.function's argument is a FUNCTION TYPE (`std.function<int(int)>`), encoded as a thin
     // callable: print the signature itself, not a nested `function<...>`.
     if (spelling.base == "std.function" && spelling.args.size() == 1
@@ -747,16 +792,12 @@ void RememberMangledArity(const LLVMBackend& compiler, std::string_view mangled,
 std::string SpellType(const LLVMBackend& compiler,
                       const LLVMBackend::TypeAndValue& type)
 {
-    const std::string enumKey = compiler.ResolveEnumTypeName(type.TypeName);
-    if (!enumKey.empty() && enumKey == type.TypeName
-        && !compiler.GetEnumBackingType(enumKey).empty()
-        && compiler.IsGenericLocalEnumKey(enumKey))
+    const std::string localEnum = GenericLocalEnumDisplayName(compiler, type.TypeName);
+    if (!localEnum.empty())
     {
-        const size_t dot = enumKey.rfind('.');
-        std::string shown = dot == std::string::npos ? enumKey : enumKey.substr(dot + 1);
-        if (type.IsArrayView) return shown + "[]";
-        if (type.Pointer) shown.append(type.ValuePointerDepth(), '*');
-        return shown;
+        if (type.IsArrayView) return localEnum + "[]";
+        if (type.Pointer) return localEnum + std::string(type.ValuePointerDepth(), '*');
+        return localEnum;
     }
     TypeSpelling spelling;
     if (!DemangleType(compiler, type.TypeName, spelling))

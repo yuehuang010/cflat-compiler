@@ -9905,6 +9905,9 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
 
 LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::LambdaExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
+        // Read before the body suspends the flag: a literal passed as a call argument is bound by
+        // overload resolution, which owns the signature check there (see the bind check below).
+        const bool boundAsCallArgument = inCallArgument_;
 
         // The body is a function body, not part of the argument expression the literal sits in.
         CallArgumentSuspendScope lambdaArgumentScope(inCallArgument_, ternaryCallArgumentDepth_);
@@ -9968,6 +9971,21 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         bool returnTypeInferred = returnType.TypeName.empty();
         if (returnTypeInferred)
             returnType.TypeName = "void";
+        // The signature the literal is bound to (empty when no context gave one), read before the
+        // body parses: nested literals and returns rewrite lambdaExpectedType as they go.
+        const LLVMBackend::TypeAndValue slotSignature = lambdaExpectedType;
+        // The slot's return name is what the literal's own signature records (`FuncPtrReturnTypeName`).
+        const std::string slotReturnName = returnType.TypeName;
+        // A function-typed RETURN (`Lambda<function<R(A)>()>`) is an encoded name: resolve it so
+        // the body's `return` meets the declared-return bind rule.
+        if (!returnTypeInferred && !returnType.Pointer && lambdaExpectedType.IsFunctionPointer)
+            if (const auto* retSig = compiler->GetEncodedClosureType(returnType.TypeName))
+            {
+                LLVMBackend::TypeAndValue fnReturn = *retSig;
+                fnReturn.IsMove = returnType.IsMove;
+                fnReturn.IsAlias = returnType.IsAlias;
+                returnType = fnReturn;
+            }
 
         // Keep lambda counter in sync: closure name matches lambda name index.
         size_t lambdaIdx  = compiler->lambdaCounter;
@@ -10146,6 +10164,17 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         envParam.TypeName = "void"; envParam.Pointer = true; envParam.VariableName = "__env";
         std::vector<LLVMBackend::TypeAndValue> allParams;
         allParams.insert(allParams.end(), params.begin(), params.end());
+        // Fewer parameters than a bound slot: the slot's extra arguments get ignored pads, so the
+        // env stays the last argument. The pads mirror the slot's own parameter flags.
+        const bool padSlotArgs = slotSignature.IsFunctionPointer && !boundAsCallArgument
+            && params.size() < slotSignature.FuncPtrParams.size();
+        if (padSlotArgs)
+            for (size_t i = params.size(); i < slotSignature.FuncPtrParams.size(); i++)
+            {
+                auto pad = compiler->FuncPtrParamAsTypeAndValue(slotSignature.FuncPtrParams[i], i);
+                pad.VariableName = "__pad_" + std::to_string(i);
+                allParams.push_back(pad);
+            }
         allParams.push_back(envParam);
 
         auto* fn = compiler->CreateFunctionDefinition(lambdaName, returnType, allParams);
@@ -10393,7 +10422,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         // The call signature still rides FuncPtrReturnTypeName/FuncPtrParams; GetType keys off
         // IsFunctionPointer before TypeName, so the closure fat type is still emitted.
         tv.TypeName = "__closure_fat_ptr";
-        tv.FuncPtrReturnTypeName = returnType.TypeName;
+        tv.FuncPtrReturnTypeName = slotReturnName;
         tv.FuncPtrReturnPointer  = returnType.Pointer;
         tv.FuncPtrReturnOwned = returnType.IsMove;
         tv.FuncPtrReturnAlias = returnType.IsAlias;
@@ -10415,6 +10444,15 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             fp.IsPointeeConst = p.IsSpelledPointeeConst;
             tv.FuncPtrParams.push_back(fp);
         }
+        // Bound literals use the named-function bind rule on the user arity (fewer legal, more or
+        // other types refused). Call arguments and IIFEs skip it; pads join tv after the check.
+        if (slotSignature.IsFunctionPointer && !boundAsCallArgument)
+            if (std::string why = compiler->DescribeLambdaBindMismatch(tv, slotSignature);
+                !why.empty())
+                compiler->LogRawError(why);
+        if (padSlotArgs)
+            for (size_t i = params.size(); i < slotSignature.FuncPtrParams.size(); i++)
+                tv.FuncPtrParams.push_back(slotSignature.FuncPtrParams[i]);
 
         // Build closure fat struct {invoker_as_i8ptr, env_as_i8ptr_or_null}. The env is the
         // tagged heap-env pointer (Option A); null for a non-capturing lambda.
@@ -11208,6 +11246,18 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                 nsGlobalNV.IdentifierColumn = (int)node->getSymbol()->getCharPositionInLine();
                 return nsGlobalNV;
             }
+            // The enclosing-namespace FUNCTION family shadows the global variable too; return-block and
+            // generic-template siblings have no IR entry yet and defer to the call-site dispatch.
+            if (compiler->GetFunction(nsQualified))
+            {
+                namedVar.Primary = compiler->GetFunctionForFuncPtr(nsQualified);
+                namedVar.CallerName = nsQualified;
+                return namedVar;
+            }
+            if (compiler->GetReturnBlock(nsQualified) != nullptr)
+                return {};
+            if (genericFunctionTemplates.count(nsQualified))
+                return {};
         }
 
         // try getting global variable
@@ -11277,25 +11327,6 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
         };
         if (kIntrinsics.count(name))
             return {};
-
-        // Enclosing-namespace sibling: a bare name inside "namespace N" may refer to a
-        // sibling member "N.<name>" (walking outward through parent namespaces).
-        // ResolveQualifiedName performs that lookup using the current namespace context.
-        if (nsQualified != name)
-        {
-            if (compiler->GetFunction(nsQualified))
-            {
-                namedVar.Primary = compiler->GetFunctionForFuncPtr(nsQualified);
-                namedVar.CallerName = nsQualified;
-                return namedVar;
-            }
-            // Return-block and generic-template siblings have no IR entry yet; defer to
-            // the call-site dispatch (which re-qualifies through ResolveQualifiedName).
-            if (compiler->GetReturnBlock(nsQualified) != nullptr)
-                return {};
-            if (genericFunctionTemplates.count(nsQualified))
-                return {};
-        }
 
         // A macro a C++ import's system headers define (INT_MAX after <climits>), as C++ sees it.
         // A function-like one (`assert`) has no value; its call binds it from the arguments.

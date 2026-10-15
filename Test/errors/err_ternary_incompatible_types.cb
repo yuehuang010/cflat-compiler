@@ -55,4 +55,14 @@ expect_error("'default' needs a known target type here") {
     }
 }
 
+// T191: a generic instantiation arm is a function value, so it is incompatible with an integer arm
+// exactly as a named function is.
+T tiGen<T>(T a) { return a; }
+expect_error("ternary branches have incompatible types") {
+    int genericArmVsInt(int k) {
+        int x = k ? tiGen<int> : 2;
+        return x;
+    }
+}
+
 extern int main() { return 0; }

@@ -1429,7 +1429,19 @@ std::vector<llvm::Type*> LLVMBackend::ClassifyAArch64Struct(llvm::StructType* st
 
 LLVMBackend::AbiSlot LLVMBackend::ClassifyAArch64Param(llvm::StructType* st, uint64_t align)
 {
-        AbiSlot slot = MakeCoerceSlot(st, align, ClassifyAArch64Struct(st), AbiSlot::ByVal);
+        std::vector<llvm::Type*> coerce = ClassifyAArch64Struct(st);
+        AbiSlot slot;
+        if (coerce.size() == 2)
+        {
+            // Keep a two-register composite as one LLVM argument. AArch64's lowering then
+            // spills the whole value when fewer than two X registers remain.
+            slot.kind = AbiSlot::CoerceToInt;
+            slot.coerceTy = llvm::ArrayType::get(llvm::Type::getInt64Ty(*context), 2);
+            slot.structTy = st;
+            slot.align = align;
+        }
+        else
+            slot = MakeCoerceSlot(st, align, coerce, AbiSlot::ByVal);
         // AAPCS64 passes a composite over 16 bytes as a bare pointer to a caller-made copy (clang:
         // `ptr noundef`); LLVM's byval would copy it onto the stack and shift every later argument.
         if (slot.kind == AbiSlot::ByVal)

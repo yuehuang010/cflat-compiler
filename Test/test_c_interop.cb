@@ -336,6 +336,112 @@ static int t77FnPtrLegs()
     return 0;
 }
 
+// T190: preserve whole AAPCS64 composites when the remaining GPR or SIMD bank is too small.
+extern int t190_export_mid(int a, int b, int c, int d, int e, int f, int g, T190Mid s)
+{
+    return a + 2*b + 3*c + 4*d + 5*e + 6*f + 7*g + s.a*100 + s.b*1000 + (int)s.d*10000;
+}
+extern int t190_export_cd(int a, int b, int c, int d, int e, int f, int g, T190CD s)
+{
+    return a + 2*b + 3*c + 4*d + 5*e + 6*f + 7*g + (int)s.c*100 + (int)s.d*1000;
+}
+int t190_cd_callback(int a, int b, int c, int d, int e, int f, int g, T190CD s)
+{
+    return a + 2*b + 3*c + 4*d + 5*e + 6*f + 7*g + (int)s.c*100 + (int)s.d*1000;
+}
+int t190_mid_callback(int a, int b, int c, int d, int e, int f, int g, T190Mid s)
+{
+    return a + 2*b + 3*c + 4*d + 5*e + 6*f + 7*g + s.a*100 + s.b*1000 + (int)s.d*10000;
+}
+int t190_cf_mid(int a, int b, int c, int d, int e, int f, int g, T190Mid s)
+{
+    return a + 2*b + 3*c + 4*d + 5*e + 6*f + 7*g + s.a*100 + s.b*1000 + (int)s.d*10000;
+}
+int t190_cf_mid_caller(int a, int b, int c, int d, int e, int f, int g, T190Mid s)
+{
+    return t190_cf_mid(a,b,c,d,e,f,g,s);
+}
+int t190_cf_cd(int a, int b, int c, int d, int e, int f, int g, T190CD s)
+{
+    return a + 2*b + 3*c + 4*d + 5*e + 6*f + 7*g + (int)s.c*100 + (int)s.d*1000;
+}
+int t190_cf_cd_caller(int a, int b, int c, int d, int e, int f, int g, T190CD s)
+{
+    return t190_cf_cd(a,b,c,d,e,f,g,s);
+}
+extern int t190_export_triplet6(int a, int b, int c, int d, int e, int f, T190Triplet s)
+{
+    return a + 2*b + 3*c + 4*d + 5*e + 6*f + s.a*100 + s.b*1000 + s.c*10000;
+}
+extern int t190_export_triplet7(int a, int b, int c, int d, int e, int f, int g, T190Triplet s)
+{
+    return a + 2*b + 3*c + 4*d + 5*e + 6*f + 7*g + s.a*100 + s.b*1000 + s.c*10000;
+}
+extern int t190_triplet_callback6(int a, int b, int c, int d, int e, int f, T190Triplet s)
+{
+    return a + 2*b + 3*c + 4*d + 5*e + 6*f + s.a*100 + s.b*1000 + s.c*10000;
+}
+extern int t190_triplet_callback7(int a, int b, int c, int d, int e, int f, int g, T190Triplet s)
+{
+    return a + 2*b + 3*c + 4*d + 5*e + 6*f + 7*g + s.a*100 + s.b*1000 + s.c*10000;
+}
+extern int t190_export_nine7(int a, int b, int c, int d, int e, int f, int g, T190NineBytes s)
+{
+    return a + 2*b + 3*c + 4*d + 5*e + 6*f + 7*g + (int)s.bytes[0]*100 + (int)s.bytes[8]*1000;
+}
+
+static int t190AbiLegs()
+{
+    T190CD cd = { c = (char)2, d = 5.0 };
+    T190Mid mid = { a = 3, b = 4, d = 5.0 };
+    T190Small small = { a = 3, b = 4 };
+    T190HFA hfa = { a = 8.0, b = 9.0 };
+    T190Triplet triplet = { a = 2, b = 3, c = 4 };
+    T190NineBytes nine = default;
+    nine.bytes[0] = 2;
+    nine.bytes[8] = 4;
+
+    // macOS exercises AAPCS64; Windows retains its existing indirect aggregate path.
+    if const (__MACOS__ || __WINDOWS__) {
+        // Seven ints leave one AArch64 X register; the two-slot composite goes whole to stack.
+        if (t190_many_cd(1,2,3,4,5,6,7,cd) != 5340) return 8200;
+        function<int(int,int,int,int,int,int,int,T190CD)> cdFn = t190_many_cd;
+        if (cdFn(1,2,3,4,5,6,7,cd) != 5340) return 8201;
+        if (t190_many_mid(1,2,3,4,5,6,7,mid) != 54440) return 8202;
+        function<int(int,int,int,int,int,int,int,T190Mid)> midFn = t190_many_mid;
+        if (midFn(1,2,3,4,5,6,7,mid) != 54440) return 8203;
+
+        // The trailing scalar proves NGRN stays exhausted after the composite spills.
+        if (t190_many_mid_tail(1,2,3,4,5,6,7,mid,9) != 954440) return 8204;
+        // Six ints leave x6/x7 available for both halves of a 16-byte AArch64 aggregate.
+        if (t190_six_cd(1,2,3,4,5,6,cd) != 5291) return 8205;
+        // Seven doubles leave one SIMD register; the two-member HFA remains indivisible.
+        if (t190_seven_hfa(1.0,2.0,3.0,4.0,5.0,6.0,7.0,hfa) != 9828) return 8207;
+
+        // C calls an exported CFlat function directly with each 16-byte layout.
+        if (t190_call_export_mid(1,2,3,4,5,6,7,mid) != 54440) return 8208;
+        if (t190_call_export_cd(1,2,3,4,5,6,7,cd) != 5340) return 8209;
+        // The C helper calls these CFlat callbacks through clang-compiled function pointers.
+        if (t190_invoke_cd_callback(t190_cd_callback,1,2,3,4,5,6,7,cd) != 5340) return 8210;
+        if (t190_invoke_mid_callback(t190_mid_callback,1,2,3,4,5,6,7,mid) != 54440) return 8211;
+
+        // C entry decoding must preserve all bytes of a 12-byte and a 9-byte record.
+        if (t190_call_export_triplet6(1,2,3,4,5,6,triplet) != 43291) return 8214;
+        if (t190_call_export_triplet7(1,2,3,4,5,6,7,triplet) != 43340) return 8215;
+        if (t190_invoke_triplet_callback6(t190_triplet_callback6,1,2,3,4,5,6,triplet) != 43291) return 8216;
+        if (t190_invoke_triplet_callback7(t190_triplet_callback7,1,2,3,4,5,6,7,triplet) != 43340) return 8217;
+        if (t190_call_export_nine7(1,2,3,4,5,6,7,nine) != 4340) return 8218;
+    }
+
+    // A one-register aggregate still fits in x7 after seven integer arguments.
+    if (t190_seven_small(1,2,3,4,5,6,7,small) != 4440) return 8206;
+
+    // Internal CFlat calls retain the natural aggregate signature on all targets.
+    if (t190_cf_mid_caller(1,2,3,4,5,6,7,mid) != 54440) return 8212;
+    if (t190_cf_cd_caller(1,2,3,4,5,6,7,cd) != 5340) return 8213;
+    return 0;
+}
+
 // T137: #define macros and an unscoped C enumerator as fixed array dimensions. Each must fold to
 // the constant clang uses at global, struct field and local scope (`int a[ADIM_Q]` has 3 elements).
 int[ADIM_Q] t137AdimG = default;
@@ -1317,6 +1423,9 @@ extern int main()
 
     int t77 = t77FnPtrLegs();
     if (t77 != 0) return t77;
+
+    int t190 = t190AbiLegs();
+    if (t190 != 0) return t190;
 
     int t137 = t137ArrayDimLegs();
     if (t137 != 0) return t137;

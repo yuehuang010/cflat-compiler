@@ -1,0 +1,202 @@
+// A function-pointer VALUE (a function<> or Lambda<> variable, field, call result, or ternary) bound to
+// a slot of another signature is refused at each value site: declaration, assignment, return, and
+// brace or field initializer. A Lambda<> value with fewer parameters than the slot is refused too,
+// because a closure's environment is its last argument. Accepts live in
+// Test/test_function_ptr.cb (testFuncPtrValueSlotAccepts).
+
+int t195Add2(int a, int b) { return a + b; }
+int t195Dbl(int a)         { return a * 2; }
+T t195Gen<T>(T a)          { return a + 2; }
+T t195Gen2<T>(T a, T b)    { return a + b; }
+function<int(int, int)> t195PickAdd() { return t195Add2; }
+Lambda<int(int, int)> t195MakeTwo(int k) { return (int a, int b) => { return a + b + k; }; }
+Lambda<int(int)> t195MakeOne(int k) { return (int a) => { return a + k; }; }
+struct Err195Box<T> { T v = default; };
+
+// Declaration, function<> value with more parameters than the slot.
+expect_error("function-pointer signature mismatch: slot takes 'int(int)' but the value is 'int(int, int)'") {
+    int declFnMore()
+    {
+        function<int(int, int)> p = t195Add2;
+        function<int(int)> q = p;
+        return q(1);
+    }
+}
+
+// Declaration, Lambda<> slot from a function<> value with more parameters.
+expect_error("function-pointer signature mismatch: slot takes 'int(int)' but the value is 'int(int, int)'") {
+    int declLambdaFromFnMore()
+    {
+        function<int(int, int)> p = t195Add2;
+        Lambda<int(int)> L = p;
+        return L(1);
+    }
+}
+
+// Declaration, capturing closure with fewer parameters than the slot.
+expect_error("a closure's environment is its last argument") {
+    int declCapFewer()
+    {
+        int k = 3;
+        Lambda<int(int)> L = (int a) => { return a + k; };
+        Lambda<int(int, int)> M = L;
+        return M(1, 2);
+    }
+}
+
+// Declaration, a NON-capturing closure variable with fewer parameters: refused too, because the
+// static type does not tell a capturing closure from a non-capturing one.
+expect_error("a closure's environment is its last argument") {
+    int declPlainFewer()
+    {
+        Lambda<int(int)> L = (int a) => { return a * 2; };
+        Lambda<int(int, int)> M = L;
+        return M(1, 2);
+    }
+}
+
+// Assignment, function<> value with more parameters than the Lambda<> slot.
+expect_error("function-pointer signature mismatch: slot takes 'int(int)' but the value is 'int(int, int)'") {
+    int assignFnMore()
+    {
+        Lambda<int(int)> L = (int a) => { return a; };
+        function<int(int, int)> p = t195Add2;
+        L = p;
+        return L(1);
+    }
+}
+
+// Assignment, capturing closure with fewer parameters.
+expect_error("a closure's environment is its last argument") {
+    int assignCapFewer()
+    {
+        int k = 3;
+        Lambda<int(int)> L = (int a) => { return a + k; };
+        Lambda<int(int, int)> M = (int a, int b) => { return a + b; };
+        M = L;
+        return M(1, 2);
+    }
+}
+
+// Return, function<> value with more parameters than the declared return.
+expect_error("function-pointer signature mismatch: slot takes 'int(int)' but the value is 'int(int, int)'") {
+    function<int(int)> returnsFnMore()
+    {
+        function<int(int, int)> p = t195Add2;
+        return p;
+    }
+}
+
+// Return, a Lambda<> parameter with fewer parameters than the declared return.
+expect_error("a closure's environment is its last argument") {
+    Lambda<int(int, int)> returnsCapFewer(Lambda<int(int)> src)
+    {
+        return src;
+    }
+}
+
+// Call result, a function<> value with more parameters than the slot.
+expect_error("function-pointer signature mismatch: slot takes 'int(int)' but the value is 'int(int, int)'") {
+    int callResultFnMore()
+    {
+        function<int(int)> q = t195PickAdd();
+        return q(1);
+    }
+}
+
+// Call result, a capturing closure with fewer parameters than the slot.
+expect_error("a closure's environment is its last argument") {
+    int callResultCapFewer()
+    {
+        Lambda<int(int, int)> M = t195MakeOne(3);
+        return M(1, 2);
+    }
+}
+
+// Brace field initializer, function<> value with more parameters than the Lambda<> field.
+expect_error("function-pointer signature mismatch: slot takes 'int(int)' but the value is 'int(int, int)'") {
+    struct Err195Hold
+    {
+        Lambda<int(int)> fn;
+    };
+    int braceFieldMore()
+    {
+        function<int(int, int)> p = t195Add2;
+        Err195Hold h = { fn = p };
+        return h.fn(1);
+    }
+}
+
+// Field assignment, function<> value with more parameters than the field.
+expect_error("function-pointer signature mismatch: slot takes 'int(int)' but the value is 'int(int, int)'") {
+    struct Err195Field
+    {
+        Lambda<int(int)> fn;
+    };
+    int fieldAssignMore()
+    {
+        function<int(int, int)> p = t195Add2;
+        Err195Field h;
+        h.fn = p;
+        return h.fn(1);
+    }
+}
+
+// Ternary of one function signature bound to a slot with another return type.
+expect_error("function-pointer signature mismatch: slot takes 'double(double)' but the value is 'int(int)'") {
+    int ternaryReturn()
+    {
+        int k = 1;
+        function<double(double)> g = k ? t195Dbl : t195Dbl;
+        return (int)g(1.0);
+    }
+}
+
+// Ternary of generic instantiation arms bound to a slot with another return type.
+expect_error("function-pointer signature mismatch: slot takes 'double(double)' but the value is 'int(int)'") {
+    int ternaryGeneric()
+    {
+        int k = 1;
+        function<double(double)> g = k ? t195Gen<int> : t195Gen<int>;
+        return (int)g(1.0);
+    }
+}
+
+// Generic field assignment, function<> value with more parameters than the substituted field.
+expect_error("function-pointer signature mismatch: slot takes 'int(int)' but the value is 'int(int, int)'") {
+    int genericFieldAssignMore()
+    {
+        function<int(int, int)> p = t195Add2;
+        Err195Box<function<int(int)>> bx;
+        bx.v = p;
+        return bx.v(1);
+    }
+}
+
+// Generic brace field initializer, function<> value with more parameters than the substituted field.
+expect_error("function-pointer signature mismatch: slot takes 'int(int)' but the value is 'int(int, int)'") {
+    int genericFieldBraceMore()
+    {
+        function<int(int, int)> p = t195Add2;
+        Err195Box<function<int(int)>> bx = { v = p };
+        return bx.v(1);
+    }
+}
+
+// A generic instantiation used as a multiplicative operand is a function used as a value.
+expect_error("is a function used as a value") {
+    int genericOperand()
+    {
+        double x = t195Gen<int> * 0.5;
+        return (int)x;
+    }
+}
+
+// A generic instantiation bound to a function<> slot of another arity (existing rule, kept).
+expect_error("cannot bind function 't195Gen2<int>' to function-pointer type 'int(int)'") {
+    int genericDeclMismatch()
+    {
+        function<int(int)> g = t195Gen2<int>;
+        return g(1);
+    }
+}

@@ -5352,6 +5352,47 @@ bool testTernaryClosureNamedJoin()
     return result;
 }
 
+// T191: a generic instantiation arm (`t191Wrap<int>`) of a `?:` joins like a named function arm, in
+// either order, into a function<> slot, a Lambda<> slot, a call argument and a return.
+T t191Wrap<T>(T a) { return a + 2; }
+T t191Wrap2<T>(T a) { return a * 4; }
+int t191Apply(function<int(int)> f, int v) { return f(v); }
+function<int(int)> t191Pick(int k) { return k ? t191Wrap<int> : t191Wrap2<int>; }
+
+bool testTernaryGenericFunctionArm()
+{
+    bool result = true;
+    int k = 1;
+    int z = 0;
+    int base = 20;
+    Lambda<int(int)> cap = (int a) => { return a + base; };
+    Lambda<int(int)> nc = (int a) => { return a + 10; };
+    function<int(int)> g1 = k ? t191Wrap<int> : t188Inc;     // wrap(1) = 3
+    function<int(int)> g2 = z ? t191Wrap<int> : t188Inc;     // t188Inc(1) = 2
+    function<int(int)> g3 = k ? t188Inc : t191Wrap<int>;     // t188Inc(1) = 2
+    function<int(int)> g4 = z ? t188Inc : t191Wrap<int>;     // wrap(1) = 3
+    result &= Test("generic arm joins named arm into function slot", g1(1) * 1000 + g2(1) * 100 + g3(1) * 10 + g4(1), 3223);
+    Lambda<int(int)> h1 = k ? cap : t191Wrap<int>;           // cap(1) = 21
+    Lambda<int(int)> h2 = z ? cap : t191Wrap<int>;           // wrap(1) = 3
+    Lambda<int(int)> h3 = k ? t191Wrap<int> : cap;           // wrap(1) = 3
+    Lambda<int(int)> h4 = z ? t191Wrap<int> : cap;           // cap(1) = 21
+    result &= Test("generic arm joins capturing closure", h1(1) * 1000 + h2(1) * 100 + h3(1) * 10 + h4(1), 21351);
+    Lambda<int(int)> n1 = k ? t191Wrap<int> : nc;            // wrap(1) = 3
+    result &= Test("generic arm joins non-capturing lambda", n1(1), 3);
+    function<int(int)> w1 = k ? t191Wrap<int> : t191Wrap2<int>;   // wrap(1) = 3
+    function<int(int)> w2 = z ? t191Wrap<int> : t191Wrap2<int>;   // wrap2(1) = 4
+    result &= Test("two generic arms into function slot", w1(1) * 10 + w2(1), 34);
+    function<int(int)> a2 = t188Inc;
+    a2 = k ? t191Wrap<int> : t188Inc;                        // wrap(1) = 3
+    result &= Test("generic arm assigned to function variable", a2(1), 3);
+    result &= Test("generic arm as Lambda argument", t188Apply(z ? cap : t191Wrap<int>, 1), 3);
+    result &= Test("generic arm as function argument", t191Apply(k ? t191Wrap<int> : t188Inc, 1), 3);
+    function<int(int)> r1 = t191Pick(1);                     // wrap(1) = 3
+    function<int(int)> r0 = t191Pick(0);                     // wrap2(1) = 4
+    result &= Test("generic arms returned from a ternary", r1(1) * 10 + r0(1), 34);
+    return result;
+}
+
 struct T185Box<T> { T v = default; };
 
 // T185: a function<> slot takes the values it may hold - a named function, nullptr, the zero null
@@ -5390,6 +5431,202 @@ bool testFunctionSlotAccepts()
     bx.v = nullptr;
     result &= Test("generic field nullptr", bx.v == nullptr, true);
     return result;
+}
+
+struct T189Hold
+{
+    Lambda<int(int, int)> fn;
+};
+
+int t189Inc(int a) { return a + 1; }
+
+// T189: a lambda literal bound to a slot takes the slot's signature. A lambda with FEWER parameters
+// than the slot supplies is legal (the extra argument is ignored), at every value site. Refusals
+// live in Test/errors/err_lambda_slot_signature_mismatch.cb.
+Lambda<int(int, int)> t189MakeFewer() { return (int a) => { return a + 4; }; }
+
+Lambda<function<int(int)>()> t189PickFunction() { return () => { return t189Inc; }; }
+
+bool testLambdaSlotFewerParams()
+{
+    bool result = true;
+    Lambda<int(int, int)> decl = (int a) => { return a + 1; };
+    result &= Test("declared lambda takes fewer parameters", decl(5, 99), 6);
+    Lambda<int(int, int)> assigned = (int a) => { return a + 1; };
+    assigned = (int a) => { return a + 2; };
+    result &= Test("assigned lambda takes fewer parameters", assigned(5, 99), 7);
+    function<int(int, int)> thin = (int a) => { return a + 3; };
+    result &= Test("function slot takes fewer parameters", thin(5, 99), 8);
+    Lambda<int(int, int)> returned = t189MakeFewer();
+    result &= Test("returned lambda takes fewer parameters", returned(5, 99), 9);
+    T189Hold hold = { fn = (int a) => { return a + 5; } };
+    result &= Test("field literal takes fewer parameters", hold.fn(5, 99), 10);
+    Lambda<function<int(int)>()> pick = t189PickFunction();
+    function<int(int)> g = pick();
+    result &= Test("lambda returning a function value", g(5), 6);
+    Lambda<Lambda<int(int)>(int)> mk = (int m) => { return (int a) => { return a * m; }; };
+    Lambda<int(int)> scale = mk(2);
+    result &= Test("lambda returning a lambda that captures its parameter", scale(5), 10);
+    return result;
+}
+
+int t189OwnDtors = 0;
+struct T189Own
+{
+    int value = default;
+    ~T189Own() { t189OwnDtors++; }
+};
+
+struct T189CapHold
+{
+    Lambda<int(int, int)> fn;
+};
+
+Lambda<int(int, int)> t189MakeCapFewer(int k) { return (int a) => { return a + k; }; }
+
+// T189 r2: a CAPTURING literal with fewer parameters is legal at every value site. The slot's extra
+// arguments land on ignored pad parameters, so the environment is still read from the last argument.
+bool testLambdaSlotFewerCapturing()
+{
+    bool result = true;
+    int k = 10;
+    Lambda<int(int, int)> decl = (int a) => { return a + k; };
+    result &= Test("capturing declared lambda takes fewer parameters", decl(5, 99), 15);
+    int j = 20;
+    Lambda<int(int, int)> assigned = (int a) => { return a; };
+    assigned = (int a) => { return a + j; };
+    result &= Test("capturing assigned lambda takes fewer parameters", assigned(5, 99), 25);
+    Lambda<int(int, int)> returned = t189MakeCapFewer(30);
+    result &= Test("capturing returned lambda takes fewer parameters", returned(5, 99), 35);
+    int m = 40;
+    T189CapHold hold = { fn = (int a) => { return a + m; } };
+    result &= Test("capturing field literal takes fewer parameters", hold.fn(5, 99), 45);
+    int v = 7;
+    Lambda<int(int*, int)> ptr = (int* p) => { return *p + k; };
+    result &= Test("capturing pointer-parameter lambda takes fewer parameters", ptr(&v, 99), 17);
+    Lambda<int(int, move T189Own)> owning = (int a) => { return a + k; };
+    T189Own o = { value = 1 };
+    t189OwnDtors = 0;
+    result &= Test("capturing owning-parameter lambda takes fewer parameters", owning(5, move o), 15);
+    result &= Test("owning pad parameter destroyed exactly once", t189OwnDtors, 1);
+    return result;
+}
+
+// T195: function-pointer VALUES that bind a slot of the same signature, or a thin value with fewer
+// parameters than a wider slot, stay legal at every value site. Refusals live in
+// Test/errors/err_funcptr_value_slot_signature_mismatch.cb.
+int t195Dbl(int a)        { return a * 2; }
+int t195One(int a)        { return a + 100; }
+Lambda<int(int)> t195MakeAdder(int k) { return (int a) => { return a + k; }; }
+function<int(int)> t195PickFn() { return t195Dbl; }
+int t195Apply(function<int(int)> f, int x)  { return f(x); }
+int t195ApplyL(Lambda<int(int)> f, int x)   { return f(x); }
+function<int(int)> t195PassF(function<int(int)> f) { return f; }
+Lambda<int(int)> t195PassL(Lambda<int(int)> f)     { return f; }
+
+struct T195Hold { function<int(int)> fn; Lambda<int(int)> lam; };
+
+bool testFuncPtrValueSlotAccepts()
+{
+    bool result = true;
+    int k = 3;
+    function<int(int)> fp = t195Dbl;
+    function<int(int)> fpCopy = fp;
+    result &= Test("function value copied to same signature", fpCopy(5), 10);
+    Lambda<int(int)> lam = t195MakeAdder(k);
+    Lambda<int(int)> lamCopy = lam;
+    result &= Test("closure value copied to same signature", lamCopy(1), 4);
+    lamCopy = lam;
+    result &= Test("closure value assigned to same signature", lamCopy(2), 5);
+    Lambda<int(int)> fromFn = fp;
+    result &= Test("function value into Lambda of same signature", fromFn(6), 12);
+    function<int(int)> oneP = t195One;
+    function<int(int, int)> wide = oneP;
+    result &= Test("fewer-parameter function value into wider function slot", wide(5, 9), 105);
+    wide = oneP;
+    result &= Test("fewer-parameter function value assigned to wider slot", wide(6, 9), 106);
+    int kk = 1;
+    function<int(int)> tern = kk ? fp : fpCopy;
+    result &= Test("ternary of one function signature", tern(7), 14);
+    Lambda<int(int)> lt = kk ? lam : lamCopy;
+    result &= Test("ternary of one closure signature", lt(1), 4);
+    result &= Test("function value as call argument", t195Apply(fp, 4), 8);
+    result &= Test("closure value as call argument", t195ApplyL(lam, 4), 7);
+    result &= Test("function value as closure call argument", t195ApplyL(fp, 4), 8);
+    result &= Test("function value returned", t195PassF(fp)(3), 6);
+    result &= Test("closure value returned", t195PassL(lam)(2), 5);
+    function<int(int)> fromCall = t195PickFn();
+    result &= Test("function call result into a slot", fromCall(4), 8);
+    Lambda<int(int)> lamCall = t195MakeAdder(10);
+    result &= Test("closure call result into a slot", lamCall(1), 11);
+    T195Hold h = { fn = fp, lam = lam };
+    result &= Test("function value as brace field", h.fn(2), 4);
+    result &= Test("closure value as brace field", h.lam(2), 5);
+    h.fn = fpCopy;
+    result &= Test("function value assigned to a field", h.fn(3), 6);
+    h.lam = lamCopy;
+    result &= Test("closure value assigned to a field", h.lam(3), 6);
+    T185Box<function<int(int)>> bx;
+    bx.v = fp;
+    result &= Test("generic field assigned a function value", bx.v(4), 8);
+    function<int(int)> nn = nullptr;
+    result &= Test("nullptr into a function slot", nn == nullptr, true);
+    Lambda<int(int)> nl = nullptr;
+    result &= Test("nullptr into a closure slot", nl == nullptr, true);
+    return result;
+}
+
+using T196Fn = Lambda<int(int)>;
+struct T196GenericBox<T> { T v = default; void set(T value) { v = value; } };
+struct T196CaptureSeed { int value = default; };
+
+// Literal arm: set receives the capturing closure directly as its by-value argument.
+bool testT196GenericSetterLiteral()
+{
+    int n = 3;
+    T196GenericBox<Lambda<int(int)>> b;
+    b.set((int x) => { return x + n; });
+    return Test("t196 generic setter literal capture", b.v(1), 4) != 0;
+}
+
+// Named-source arm: set receives an existing closure value with its own environment.
+bool testT196GenericSetterNamedClosure()
+{
+    int n = 3;
+    Lambda<int(int)> source = (int x) => { return x + n; };
+    T196GenericBox<Lambda<int(int)>> b;
+    b.set(source);
+    return Test("t196 generic setter named closure", b.v(1), 4) != 0;
+}
+
+// Alias arm: T resolves to the same fat closure through T196Fn.
+bool testT196GenericSetterAlias()
+{
+    int n = 3;
+    T196GenericBox<T196Fn> b;
+    b.set((int x) => { return x + n; });
+    return Test("t196 generic setter alias closure", b.v(1), 4) != 0;
+}
+
+// Reference-capture arm: seed stays in scope, isolating the closure environment store.
+bool testT196GenericSetterStructCapture()
+{
+    T196CaptureSeed seed = default;
+    seed.value = 9;
+    T196GenericBox<Lambda<int(int)>> b;
+    b.set((int x) => { return x + seed.value; });
+    return Test("t196 generic setter struct capture", b.v(1), 10) != 0;
+}
+
+// Owning-capture arm: text's source scope ends before the stored closure is invoked.
+bool testT196GenericSetterStringCapture()
+{
+    T196GenericBox<Lambda<int()>> b;
+    {
+        string text = "owned";
+        b.set(() => { return text.length(); });
+    }
+    return Test("t196 generic setter string capture after scope", b.v(), 5) != 0;
 }
 
 extern int main(int argc, char** argv)
@@ -5599,6 +5836,16 @@ extern int main(int argc, char** argv)
     total++; passed += testTernaryArmKinds()               ? 1 : 0;
     total++; passed += testFunctionSlotAccepts()           ? 1 : 0;
     total++; passed += testTernaryClosureNamedJoin()       ? 1 : 0;
+    total++; passed += testTernaryGenericFunctionArm()     ? 1 : 0;
+    total++; passed += testLambdaSlotFewerParams()         ? 1 : 0;
+    total++; passed += testLambdaSlotFewerCapturing()      ? 1 : 0;
+    total++; passed += testFuncPtrValueSlotAccepts()       ? 1 : 0;
+    // Generic closure stores must clone the tagged environment before the argument temp drops.
+    total++; passed += testT196GenericSetterLiteral()      ? 1 : 0;
+    total++; passed += testT196GenericSetterNamedClosure() ? 1 : 0;
+    total++; passed += testT196GenericSetterAlias()        ? 1 : 0;
+    total++; passed += testT196GenericSetterStructCapture() ? 1 : 0;
+    total++; passed += testT196GenericSetterStringCapture() ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

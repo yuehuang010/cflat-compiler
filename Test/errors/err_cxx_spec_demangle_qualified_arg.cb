@@ -15,3 +15,13 @@ expect_error("std.vector<std.unique_ptr<cppi.Tracked>>") {
         return report_nested(p);
     }
 }
+
+struct Box<T> { T value = default; };
+expect_error("Box<Col>") {
+    int needsInt(Box<int> box) { return 0; }
+    int run() {
+        enum Col : char { A = 1 };
+        Box<Col> box = default;
+        return needsInt(box);
+    }
+}

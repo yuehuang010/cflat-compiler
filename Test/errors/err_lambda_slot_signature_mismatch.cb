@@ -1,0 +1,65 @@
+// A lambda literal bound to a Lambda<>/function<> slot takes the slot's signature, checked with
+// the named-function bind rule: more parameters, a different parameter type, or a function-typed
+// return whose signature does not match are refused. A capturing lambda with fewer parameters than
+// the slot supplies is legal and is covered in Test/test_function_ptr.cb.
+
+int add2(int a, int b) { return a + b; }
+
+// Declaration initializer, more parameters than the slot.
+expect_error("cannot bind this lambda of type 'int(int, int)' to function-pointer type 'int(int)'") {
+    int declMore()
+    {
+        Lambda<int(int)> f = (int a, int b) => { return a + b; };
+        return f(1);
+    }
+}
+
+// Assignment, more parameters than the slot.
+expect_error("cannot bind this lambda of type 'int(int, int)' to function-pointer type 'int(int)'") {
+    int assignMore()
+    {
+        Lambda<int(int)> f = (int a) => { return a; };
+        f = (int a, int b) => { return a + b; };
+        return f(1);
+    }
+}
+
+// Declared function<> slot, more parameters.
+expect_error("cannot bind this lambda of type 'int(int, int)' to function-pointer type 'int(int)'") {
+    int thinMore()
+    {
+        function<int(int)> f = (int a, int b) => { return a + b; };
+        return f(1);
+    }
+}
+
+// Return statement, capturing lambda with more parameters than the slot.
+expect_error("cannot bind this lambda of type 'int(int, int)' to function-pointer type 'int(int)'") {
+    Lambda<int(int)> makeMore(int k)
+    {
+        return (int a, int b) => { return a + b + k; };
+    }
+}
+
+// Struct field brace initializer, a parameter type that differs from the slot.
+expect_error("cannot bind this lambda of type 'int(double)' to function-pointer type 'int(int)'") {
+    struct Err189Hold
+    {
+        Lambda<int(int)> fn;
+    };
+    int fieldType()
+    {
+        Err189Hold h = { fn = (double a) => { return 1; } };
+        return h.fn(1);
+    }
+}
+
+// A lambda returning a named function whose signature does not match the declared function<> return.
+expect_error("cannot bind function 'add2' to function-pointer type 'int(int)'") {
+    int returnsBadFunction()
+    {
+        Lambda<function<int(int)>()> pick = () => { return add2; };
+        function<int(int)> g = pick();
+        return g(1);
+    }
+}

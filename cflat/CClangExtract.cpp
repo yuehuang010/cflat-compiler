@@ -1710,6 +1710,14 @@ namespace cflat_cinterop
         void IndexSpecialMemberRecords(ASTContext& ctx, const DeclContext* dc,
             std::unordered_map<std::string, const CXXRecordDecl*>& index);
 
+        SourceLocation SemaLocationForDecl(ASTContext& ctx, const Decl* decl)
+        {
+            SourceLocation loc = decl->getLocation();
+            if (loc.isValid()) return loc;
+            SourceManager& sm = ctx.getSourceManager();
+            return sm.getLocForStartOfFile(sm.getMainFileID());
+        }
+
         /*
          * Clang's own overload resolution for `dst = src` with a non-const lvalue dst of record
          * `cxx` and a (const or non-const) rvalue src. True when the selected operator= is a
@@ -1721,14 +1729,15 @@ namespace cflat_cinterop
             if (cxx == nullptr || !cxx->hasDefinition() || cxx->isDependentContext()) return false;
             auto* record = const_cast<CXXRecordDecl*>(cxx);
             ASTContext& ctx = sema.getASTContext();
+            SourceLocation loc = SemaLocationForDecl(ctx, cxx);
             LookupResult found(sema, ctx.DeclarationNames.getCXXOperatorName(OO_Equal),
-                               SourceLocation(), Sema::LookupOrdinaryName);
+                               loc, Sema::LookupOrdinaryName);
             sema.LookupQualifiedName(found, record);
             QualType objectType = ctx.getCanonicalTagType(record);
             QualType argType = constSource ? objectType.withConst() : objectType;
-            OpaqueValueExpr arg(SourceLocation(), argType, VK_XValue);
+            OpaqueValueExpr arg(loc, argType, VK_XValue);
             Expr* args[] = { &arg };
-            OverloadCandidateSet candidates(SourceLocation(), OverloadCandidateSet::CSK_Normal);
+            OverloadCandidateSet candidates(loc, OverloadCandidateSet::CSK_Normal);
             bool any = false;
             for (NamedDecl* d : found)
             {
@@ -1751,7 +1760,7 @@ namespace cflat_cinterop
             }
             if (!any) return false;
             OverloadCandidateSet::iterator best;
-            if (candidates.BestViableFunction(sema, SourceLocation(), best) != OR_Success)
+            if (candidates.BestViableFunction(sema, loc, best) != OR_Success)
                 return false;
             const FunctionDecl* selected = best->Function;
             if (selected == nullptr || selected->isDeleted() || selected->getNumParams() != 1)
@@ -6941,7 +6950,7 @@ namespace cflat_cinterop
                 if (!queued.type->isIncompleteType()) continue;
                 const auto* cxx = queued.type->getAsCXXRecordDecl();
                 if (cxx == nullptr) continue;
-                sema.RequireCompleteType(cxx->getLocation(), queued.type,
+                sema.RequireCompleteType(SemaLocationForDecl(sema.getASTContext(), cxx), queued.type,
                                          diag::err_incomplete_type);
             }
             sema.PerformPendingInstantiations();

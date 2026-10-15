@@ -137,8 +137,11 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                 }
                 else
                 {
-                    auto* slot = AllocaAtEntry(abiSlot->structTy, nullptr,
-                        itr_nameArg->VariableName + ".abi");
+                    const std::string slotName = itr_nameArg->VariableName + ".abi";
+                    auto* slot = abiSlot->kind == AbiSlot::CoerceToInt
+                        ? AllocaForCoerce(abiSlot->structTy, abiSlot->coerceTy,
+                                          abiSlot->align, slotName.c_str())
+                        : AllocaAtEntry(abiSlot->structTy, nullptr, slotName);
                     if (abiSlot->kind == AbiSlot::CoerceToInt)
                     {
                         StoreCoerceAt(slot, incomingArg, 0);

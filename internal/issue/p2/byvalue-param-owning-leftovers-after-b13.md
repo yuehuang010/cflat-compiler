@@ -42,3 +42,8 @@ aliases, `&param...` escaping to a callee), `queue<T>.copy()`, and the tracked q
 13. **V17 LANDED 19018a0c (2026-10-01).** Item 12 is fixed: generic own methods, `->` paths, alias index stores, ++/--, field-path aliases (o4), `this` passed to helpers, element-address escapes, and direct-param index stores. Still open, master-equal; probes are in scratch/repro_keep/v17/rv17/:
     - x7: `list<int>*[1] arr; arr[0] = &b.xs; arr[0]->add(i)` gives rc 133. A container pointer stored into a local array is not tracked; element addresses are.
     - An unqualified `inner<T>(v)` inside a method gives "unknown generic function"; only `this->inner<T>(v)` builds. This is a separate resolution gap.
+
+T196 Opus r1 (2026-10-14): bond escape through a by-value Lambda param - a closure capturing `unique<Res> u` by reference passed
+to `NB.set(Lambda<int()> x) { v = x; }` in an inner scope compiles and later reads freed memory (direct store
+`b.v = () => u->value` is refused "bonded value cannot be stored in a struct field"). Repro
+scratch/repro_keep/t196_rv1/rev_t196_opus_setter_bond_escape.cb. Sibling of item 2.

@@ -1638,6 +1638,36 @@ struct T187Field
     int get() { return t187Shadow; }
 };
 
+// T193: a namespace function beats a global variable or global function of the same name in value
+// position, and a namespace const sizes an array in local, nested, field, global and generic-argument
+// positions. PRE-FIX: the global was read, or the file-scope const (1) won.
+int t193Lo = 7;
+const int T193K = 1;
+int t193Apply(function<int(int)> f) { return f(1); }
+namespace T193Fn
+{
+    int t193Lo(int a) { return a + 1; }
+    int decl() { function<int(int)> p = t193Lo; return p(1); }
+    int assign() { function<int(int)> p = default; p = t193Lo; return p(1); }
+    int arg() { return t193Apply(t193Lo); }
+    function<int(int)> ret() { return t193Lo; }
+    int retCall() { function<int(int)> p = ret(); return p(1); }
+    namespace T193Deep { int nested() { function<int(int)> p = t193Lo; return p(1); } }
+}
+namespace T193Dim
+{
+    const int T193K = 3;
+    int local() { int[T193K] a = default; return sizeof(a) / sizeof(int); }
+    namespace T193Inner { int local() { int[T193K] a = default; return sizeof(a) / sizeof(int); } }
+    struct T193Box
+    {
+        int[T193K] f;
+    };
+    int[T193K] garr;
+    struct T193Buf<T, int CAP> { T[CAP] items; int cap() { return CAP; } };
+    int gen() { T193Buf<int, T193K> b = default; return b.cap(); }
+}
+
 bool testNamespace()
 {
     bool result = true;
@@ -1652,6 +1682,19 @@ bool testNamespace()
     T187Field t187f = default;
     t187f.t187Shadow = 7;
     result &= Test("field_over_global_fn", t187f.get(), 7);
+    // T193: namespace function over the same-named global variable, in value positions.
+    result &= Test("t193_ns_fn_decl", T193Fn.decl(), 2);
+    result &= Test("t193_ns_fn_assign", T193Fn.assign(), 2);
+    result &= Test("t193_ns_fn_argument", T193Fn.arg(), 2);
+    result &= Test("t193_ns_fn_return", T193Fn.retCall(), 2);
+    result &= Test("t193_ns_fn_nested", T193Fn.T193Deep.nested(), 2);
+    // T193: a namespace const sizes an array in every position (the file-scope const is 1).
+    result &= Test("t193_ns_const_local", T193Dim.local(), 3);
+    result &= Test("t193_ns_const_nested", T193Dim.T193Inner.local(), 3);
+    T193Dim.T193Box t193b = default;
+    result &= Test("t193_ns_const_field", sizeof(t193b.f) / sizeof(int), 3);
+    result &= Test("t193_ns_const_global", sizeof(T193Dim.garr) / sizeof(int), 3);
+    result &= Test("t193_ns_const_generic", T193Dim.gen(), 3);
     result &= Test("namespace_add", MathUtils.add(3, 4), 7);            // 3+4=7
     result &= Test("namespace_multiply", MathUtils.multiply(3, 4), 12); // 3*4=12
     result &= Test("global_add", add(3, 4), 107);                       // 3+4+100=107

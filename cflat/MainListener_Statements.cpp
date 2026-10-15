@@ -722,9 +722,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 trivialCxxMoveSite_ = TopLevelMoveExpression(assignExpr);
             returnNV = ParseAssignmentExpressionNamed(assignExpr, ResultUse::ReturnOperand);
             trivialCxxMoveSite_ = nullptr;
-            // Variadic-ness of a returned function-pointer VALUE must match the declared return slot.
+            // A returned function-pointer VALUE must match the declared return slot (variadic-ness and bind rule).
             if (returnFnPtrTV.IsFunctionPointer && returnNV.TypeAndValue.IsFunctionPointer)
-                if (std::string why = compiler->DescribeFuncPtrVariadicMismatch(
+                if (std::string why = compiler->DescribeFuncPtrValueMismatch(
                         returnFnPtrTV, returnNV.TypeAndValue); !why.empty())
                     LogErrorContext(errCtx, why);
             // [immovable] C++ record: C++17 elision builds a fresh prvalue in the sret slot, so only a place
