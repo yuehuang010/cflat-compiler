@@ -1,0 +1,85 @@
+import "../library/c_variadic_fnptr.h";
+
+// T185: a function<> slot takes a function value, a nullptr, or a zero literal - never an integer, long,
+// struct value or data pointer (the integer was called as a code address). Refused at declaration
+// init, assignment, brace field, return, a '?:' arm and bare 'function' inference.
+struct S { int x; };
+struct H { function<int(int)> f = default; int k = default; };
+// T185 r2: a generic-substituted slot (field T, local T) is the same function<> slot as a plain one.
+struct T185Box<T> { T v = default; };
+expect_error("from a value of type 'int'") {
+    struct T185Gen<T> { T f = default; int set(int a) { T t = a; f = t; return 0; } };
+    int t185GenUse() { T185Gen<function<int(int)>> gen; return gen.set(4); }
+}
+// A generic return slot (T = function<..>) names "the function value" like a plain one.
+expect_error("cannot return the function value of type 'function<int(int)>'") {
+    T t185BadRet<T>() { int a = 3; return a; }
+    int t185BadRetUse() { function<int(int)> f = t185BadRet<function<int(int)>>(); return 0; }
+}
+int dbl(int x) { return x * 2; }
+expect_error("from a value of type 'int'") {
+    function<int(int)> mkI() { int b = 3; return b; }
+}
+expect_error("from a value of type 'S'") {
+    function<int(int)> mkS() { S t = default; return t; }
+}
+
+extern int main()
+{
+    int a = 3;
+    long l = 3;
+    int* p = &a;
+    S s = default;
+    string q = "abc";
+    int k = 1;
+    int b = 4;
+    expect_error("from a value of type 'int'") {
+        function<int(int)> f = a;
+    }
+    expect_error("from a value of type 'long'") {
+        function<int(int)> f = l;
+    }
+    expect_error("from a value of type 'int'") {
+        function<int(int)> f = k ? a : b;
+    }
+    expect_error("a data pointer would be called as code") {
+        function<int(int)> f = k ? p : p;
+    }
+    expect_error("a data pointer would be called as code") {
+        function<int(int)> f = k ? "abc" : "abd";
+    }
+    function<int(int)> g = dbl;
+    expect_error("from a value of type 'int'") {
+        g = a;
+    }
+    expect_error("from a value of type 'long'") {
+        g = l;
+    }
+    expect_error("from a value of type 'int'") {
+        H h = { f = a, k = 0 };
+    }
+    expect_error("from a value of type 'string'") {
+        H hq = { f = q, k = 0 };
+    }
+    expect_error("from a value of type 'S'") {
+        H hs = { f = s, k = 0 };
+    }
+    expect_error("from a value of type 'int'") {
+        T170Bin cb = a;
+    }
+    expect_error("from a value of type 'int'") {
+        T170Bin cc = k ? a : b;
+    }
+    expect_error("from a value of type 'int'") {
+        T185Box<function<int(int)>> bx;
+        bx.v = a;
+    }
+    expect_error("from a value of type 'int'") {
+        T185Box<function<int(int)>> bb = { v = a };
+    }
+    expect_error("from a value of type 'int'") {
+        T185Box<function<int(int)>> bc;
+        bc.v = a;
+        int rc = bc.v(1);
+    }
+}

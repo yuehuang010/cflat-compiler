@@ -3523,3 +3523,13 @@ arguments already refused). The explicit cast `(int)d` stays legal; a value test
 (`x = (u32)(x + d)`, never `x += (u32)d`). Implicit any -> bool stays legal everywhere, braces included ("most numbers have a zero").
 Integer constants out of range in a native brace initializer are refused like clang (T119 folded in). Blast radius measured
 before the ruling: 0 sites in core / examples / test_libs, 29 Test lines (T151 spike).
+
+- **[cpp] struct field return through a borrow (RULED 2026-10-14, T173).** Inside a method, `return f;` / `return this->f;` /
+  `return p->f;` of a non-copyable [cpp] struct field is REFUSED; the spelling is `return move f;`. cpp-struct-m10 ruling 4
+  (transfer of a [cpp] type needs explicit `move`) governs [cpp] fields; q06's accepted implicit consume of `this.field` stays
+  for native owning fields only. Same rule as T169 `return *this` / `return *p`.
+
+- 2026-10-14 (T166, T182): classification by expression TEXT regressed twice in one box - T166 matched `&&` inside a string
+  literal, T182 treated an implicit-this int field as the same-named global function (`functionTable.find(text)`). Decide from
+  the parse-tree shape or the resolved symbol, in codegen lookup order (local/param, implicit-this field, global, function).
+  Now a line in the common implementer brief; reviewers probe a same-named field / local for any name-based gate.

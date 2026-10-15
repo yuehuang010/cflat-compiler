@@ -1040,7 +1040,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         }
                     }
                 }
-                else if (auto* fit = Compiler(declSpecs)->FindOrRequestFunctionTypeAlias(typeSpec->getText());
+                else if (auto* fit = Compiler(declSpecs)->NativeTypeShadowsFunctionAlias(typeSpec->getText())
+                                         ? nullptr : Compiler(declSpecs)->FindOrRequestFunctionTypeAlias(typeSpec->getText());
                          fit != nullptr)
                 {
                     // Function-type alias (using Cb = function<R(Args)> | Lambda<R(Args)>): expand
@@ -1051,6 +1052,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     declType.FuncPtrReturnPointer  = fit->FuncPtrReturnPointer;
                     declType.FuncPtrReturnOwned = fit->FuncPtrReturnOwned;
                     declType.FuncPtrReturnAlias = fit->FuncPtrReturnAlias;
+                    declType.FuncPtrVariadic    = fit->FuncPtrVariadic;
                     declType.FuncPtrReturnPointerDepth = fit->FuncPtrReturnPointerDepth;
                     declType.FuncPtrParams         = fit->FuncPtrParams;
                     const int functionPtrDepth = PointerDepthOf(declSpecWithSuffix->pointer());
@@ -4193,6 +4195,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseForDec
     }
 
 std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclaration(CFlatParser::DeclarationContext* ctx, const std::string& namespaceName) {
+        DiagnoseBraceListsUnder(ctx);
         // Handle enum declarations which use the enumSpecifier alternative in the grammar
         if (auto enumSpec = ctx->enumSpecifier())
         {
@@ -4210,6 +4213,14 @@ void MainListener::ParseEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx, co
         // Codegen-pass folder for an initializer the pre-pass could not evaluate statically.
         std::function<bool(CFlatParser::ConditionalExpressionContext*, llvm::APInt&)> dynamicEval =
             [this, ctx](CFlatParser::ConditionalExpressionContext* cond, llvm::APInt& out) -> bool {
+                if (IsGroupedFoldCandidate(cond))
+                    if (auto folded = FoldCompileTimeInt(Compiler(ctx), cond))
+                    {
+                        out = llvm::APInt(out.getBitWidth(), static_cast<uint64_t>(*folded), true);
+                        return true;
+                    }
+                // A cast group skips the int64 folder; its &&/|| lowering needs a live function.
+                if (IsStructurallyGrouped(cond) && !HasNoTypedCast(cond) && HasShortCircuit(cond)) return false;
                 // File scope has no insert block: emit into a throwaway function (as the global
                 // initializer does) so a load of an enumerator or a global never derefs a null block.
                 auto* backend = Compiler(ctx);
@@ -4381,6 +4392,36 @@ CFlatParser::ConditionalExpressionContext* MainListener::SoleTernaryExpression(
         return nullptr;
     }
 
+bool MainListener::ResolveBareFunctionArmSignature(antlr4::ParserRuleContext* arm,
+        LLVMBackend::TypeAndValue& out)
+{
+        auto* compiler = Compiler(arm);
+        const std::string text = arm->getText();
+        const bool plainName = !text.empty()
+            && (std::isalpha(static_cast<unsigned char>(text[0])) || text[0] == '_')
+            && std::all_of(text.begin(), text.end(),
+                   [](unsigned char ch) { return std::isalnum(ch) || ch == '_'; });
+        if (!plainName) return false;
+        // A local or argument shadows a same-named function, as at every other name lookup.
+        if (auto* live = compiler->FindLiveNamedVariable(text); live != nullptr)
+        {
+            if (!live->TypeAndValue.IsFunctionPointer || live->TypeAndValue.FuncPtrReturnTypeName.empty())
+                return false;
+            out = live->TypeAndValue;
+            return true;
+        }
+        // A field (implicit 'this') or global variable shadows a same-named function, as at the
+        // codegen name lookup: the arm is a value, not a function.
+        if (NamesVisibleVariable(compiler, text)) return false;
+        // An overloaded name has no single signature to infer from: leave it to the existing refusal.
+        auto overloads = compiler->functionTable.find(text);
+        if (overloads == compiler->functionTable.end() || overloads->second.size() != 1) return false;
+        auto sig = compiler->MakeFuncPtrTypeAndValue(text);
+        if (!sig.IsFunctionPointer) return false;
+        out = std::move(sig);
+        return true;
+    }
+
 CFlatParser::ArgumentExpressionListContext* MainListener::ForeignCxxConstructArgs(
         antlr4::tree::ParseTree* node, const std::string& typeName)
 {
@@ -4431,8 +4472,10 @@ CFlatParser::ArgumentExpressionListContext* MainListener::ForeignCxxConstructArg
                     && !compiler->IsCxxForeignTypeRegistered(written)
                     && compiler->ResolveTypeAlias(written) == written)
                 {
-                    std::string ignored;   // reported by the initializer's own request
-                    compiler->TryRequestCxxType(base, targs, written, ignored);
+                    std::string requestError;
+                    if (!compiler->TryRequestCxxType(base, targs, written, requestError)
+                        && !requestError.empty())
+                        LogErrorContext(pf, requestError);
                 }
                 if (compiler->ResolveTypeAlias(written) == typeName) return args[0];
                 const std::string writtenCanonical = compiler->CxxRecordCanonicalSpelling(
@@ -4440,15 +4483,12 @@ CFlatParser::ArgumentExpressionListContext* MainListener::ForeignCxxConstructArg
                 const std::string declaredCanonical = compiler->CxxRecordCanonicalSpelling(typeName);
                 if (!writtenCanonical.empty() && writtenCanonical == declaredCanonical)
                     return args[0];
-                // Another specialization of the same template (master behaviour, ruling 2026-10-02):
-                // build the declared type in place from the args. The ordinary path cannot reach a
-                // constrained converting ctor template (std.optional<i64> = std.optional<int>(3));
-                // the missing-converting-ctor refusal is a filed p2. Nested angle arguments keep
-                // the ordinary path, as on master.
+                // Nested template arguments already use the ordinary expression path. A different
+                // flat specialization must do the same so copy-init checks its conversion in clang.
                 if (callee.find('<', lt + 1) != std::string::npos) return nullptr;
             }
-            // Identity not provable from registered records: the template name decides.
-            if (base == MangledBase(typeName)) return args[0];
+            // A matching template name does not prove specialization identity. The caller parses
+            // the written temporary, then copy-initializes this slot through the C++ wrapper.
         }
         // `using ns;` lets the class be named without its namespace, so the trailing component
         // of the registered dotted name is an equally valid spelling of the same type.
@@ -7084,6 +7124,31 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     auto assignmentExpression = initializer->assignmentExpression();
                     if (assignmentExpression != nullptr)
                         srcRhsExprText = assignmentExpression->getText();
+                    bool foldedGlobalIntegerInit = false;
+                    if (globalInitTempFn != nullptr && assignmentExpression != nullptr)
+                    {
+                        if (IsGroupedFoldCandidate(assignmentExpression))
+                            if (auto folded = FoldCompileTimeInt(compiler, assignmentExpression))
+                                if (auto* initType = compiler->GetType(typeAndValue);
+                                    initType != nullptr && initType->isIntegerTy())
+                                {
+                                    right = llvm::ConstantInt::get(initType,
+                                        llvm::APInt(initType->getIntegerBitWidth(),
+                                            static_cast<uint64_t>(*folded), false, true));
+                                    foldedGlobalIntegerInit = true;
+                                }
+                        // A cast group skips the int64 folder; its &&/|| lowering needs a function.
+                        if (!foldedGlobalIntegerInit && IsStructurallyGrouped(assignmentExpression)
+                            && !HasNoTypedCast(assignmentExpression) && HasShortCircuit(assignmentExpression))
+                        {
+                            LogErrorContext(assignmentExpression,
+                                "a global initializer with '&&' / '||' and a cast must be a "
+                                "compile-time constant expression");
+                            if (auto* initType = compiler->GetType(typeAndValue))
+                                right = llvm::Constant::getNullValue(initType);
+                            foldedGlobalIntegerInit = right != nullptr;
+                        }
+                    }
                     // Inbound alloc-align channel: an align-declared local whose initializer is a
                     // DIRECT `new` hands the declared allocation alignment down so the bare `new`
                     // allocates aligned. Gated on AsDirectNew so an indirect `new` (ternary/cast/
@@ -7092,9 +7157,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         && typeAndValue.AllocAlignValue > LLVMBackend::kDefaultNewAlign
                         && AsDirectNew(assignmentExpression) != nullptr)
                         compiler->pendingInitAllocAlign = typeAndValue.AllocAlignValue;
-                    if (assignmentExpression != nullptr)
+                    if (assignmentExpression != nullptr && !foldedGlobalIntegerInit)
                         ArmArrayNewDesugar(assignmentExpression, typeAndValue);
-                    if (assignmentExpression != nullptr)
+                    if (assignmentExpression != nullptr && !foldedGlobalIntegerInit)
                     {
                         std::optional<DeclExpectedTypeScope> coreUniqueExpectedScope;
                         if (compiler->IsCoreUniqueType(typeAndValue.TypeName)
@@ -7269,6 +7334,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             bool rhsIsPointer = false;
                             bool rhsFuncPtrReturnOwned = false;
                             bool rhsFuncPtrReturnAlias = false;
+                            bool rhsFuncPtrVariadic = false;
+                            // The RHS's whole function-pointer signature, for bare 'function' inference.
+                            LLVMBackend::TypeAndValue rhsFnSig;
                             std::vector<LLVMBackend::TypeAndValue::FuncPtrParam> rhsFuncPtrParams;
                             // Captured-variable names of an RHS lambda literal, hoisted out of the
                             // rightNV scope so the fat->thin narrowing gate below can name them.
@@ -7935,6 +8003,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer;
                                 rhsFuncPtrReturnOwned = rightNV.TypeAndValue.FuncPtrReturnOwned;
                                 rhsFuncPtrReturnAlias = rightNV.TypeAndValue.FuncPtrReturnAlias;
+                                rhsFuncPtrVariadic = rightNV.TypeAndValue.FuncPtrVariadic;
+                                if (rightNV.TypeAndValue.IsFunctionPointer)
+                                    rhsFnSig = rightNV.TypeAndValue;
                                 rhsIsThinFnPtr = rightNV.TypeAndValue.IsThinFnPtr();
                                 rhsIsPointer = rightNV.TypeAndValue.Pointer;
                                 rhsFuncPtrParams = rightNV.TypeAndValue.FuncPtrParams;
@@ -7985,13 +8056,42 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             if (right && typeAndValue.IsFunctionPointer && typeAndValue.FuncPtrReturnTypeName.empty())
                             {
                                 std::string funcName = assignmentExpression->getText();
-                                auto inferred = compiler->MakeFuncPtrTypeAndValue(funcName);
-                                if (inferred.IsFunctionPointer)
+                                LLVMBackend::TypeAndValue inferred;
+                                bool haveInferred = false;
+                                // `c ? a : b` over two plain names: both arms name one signature (the ternary's
+                                // codegen refuses arms that differ, so the first arm stands for both).
+                                LLVMBackend::TypeAndValue trueSig;
+                                LLVMBackend::TypeAndValue falseSig;
+                                auto* cond = SoleTernaryExpression(assignmentExpression);
+                                const bool ternaryResolved = cond != nullptr
+                                    && cond->expression() != nullptr && cond->conditionalExpression() != nullptr
+                                    && ResolveBareFunctionArmSignature(cond->expression(), trueSig)
+                                    && ResolveBareFunctionArmSignature(cond->conditionalExpression(), falseSig);
+                                if (ternaryResolved)
+                                {
+                                    inferred = trueSig;
+                                    haveInferred = true;
+                                }
+                                else if (rhsIsFuncPtr && !rhsFnSig.FuncPtrReturnTypeName.empty())
+                                {
+                                    // A function-pointer variable, parameter, field or call result: its declared signature.
+                                    inferred = rhsFnSig;
+                                    haveInferred = true;
+                                }
+                                else if (cond == nullptr)
+                                {
+                                    inferred = compiler->MakeFuncPtrTypeAndValue(funcName);
+                                    haveInferred = inferred.IsFunctionPointer;
+                                }
+                                if (haveInferred && inferred.IsFunctionPointer)
                                 {
                                     typeAndValue.FuncPtrReturnTypeName = inferred.FuncPtrReturnTypeName;
                                     typeAndValue.FuncPtrReturnPointer = inferred.FuncPtrReturnPointer;
                                     typeAndValue.FuncPtrReturnOwned = inferred.FuncPtrReturnOwned;
                                     typeAndValue.FuncPtrReturnAlias = inferred.FuncPtrReturnAlias;
+                                    typeAndValue.FuncPtrVariadic = inferred.FuncPtrVariadic;
+                                    typeAndValue.FuncPtrReturnPointerDepth = inferred.FuncPtrReturnPointerDepth;
+                                    typeAndValue.FuncPtrReturnResolvedKey = inferred.FuncPtrReturnResolvedKey;
                                     typeAndValue.FuncPtrParams = inferred.FuncPtrParams;
                                 }
                             }
@@ -8018,8 +8118,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     boundNamedFnName = funcName;
                                     auto boundSig = compiler->FuncPtrSigOfBoundFunction(funcName, fn);
                                     if (boundSig.IsFunctionPointer)
+                                    {
                                         typeAndValue.FuncPtrReturnOwned = boundSig.FuncPtrReturnOwned;
                                         typeAndValue.FuncPtrReturnAlias = boundSig.FuncPtrReturnAlias;
+                                        typeAndValue.FuncPtrVariadic = boundSig.FuncPtrVariadic;
+                                    }
                                     VerifyFuncPtrAssignmentMoveFlags(funcName, typeAndValue, assignmentExpression);
                                     // thin `function<T>`: bare fn ptr; fat `Lambda<T>`: closure fat struct.
                                     right = typeAndValue.IsThinFnPtr()
@@ -8039,8 +8142,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     boundNamedFnName = genericFuncCallerName;
                                     auto boundSig = compiler->FuncPtrSigOfBoundFunction(genericFuncCallerName, genericFn);
                                     if (boundSig.IsFunctionPointer)
+                                    {
                                         typeAndValue.FuncPtrReturnOwned = boundSig.FuncPtrReturnOwned;
                                         typeAndValue.FuncPtrReturnAlias = boundSig.FuncPtrReturnAlias;
+                                        typeAndValue.FuncPtrVariadic = boundSig.FuncPtrVariadic;
+                                    }
                                     VerifyFuncPtrAssignmentMoveFlags(genericFuncCallerName, typeAndValue, assignmentExpression);
                                     right = typeAndValue.IsThinFnPtr()
                                           ? compiler->MakeThinFnPtrValue(genericFn, typeAndValue)
@@ -8101,6 +8207,14 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     }
                                 }
                             }
+                            // Variadic-ness is part of a C function-pointer type: refused before the
+                            // slot adopts the initializer's flag below.
+                            if (right && typeAndValue.IsFunctionPointer && rhsIsFuncPtr)
+                            {
+                                if (std::string why = compiler->DescribeFuncPtrVariadicMismatch(
+                                        typeAndValue, rhsFnSig); !why.empty())
+                                    LogErrorContext(assignmentExpression, why);
+                            }
                             // The declared spelling carries no INFERRED sink, so adopt the
                             // initializer's - otherwise the call site never nulls the caller.
                             if (right && typeAndValue.IsFunctionPointer)
@@ -8110,6 +8224,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     AdoptInferredParamSinks(typeAndValue, rhsFuncPtrParams);
                                     typeAndValue.FuncPtrReturnOwned = rhsFuncPtrReturnOwned;
                                     typeAndValue.FuncPtrReturnAlias = rhsFuncPtrReturnAlias;
+                                    typeAndValue.FuncPtrVariadic = rhsFuncPtrVariadic;
                                 }
                                 else if (boundNamedFn != nullptr)
                                 {
@@ -8609,6 +8724,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     typeAndValue.FuncPtrReturnAlias = srcThinFnPtr->FuncPtrReturnAlias;
                     typeAndValue.FuncPtrReturnPointerDepth = srcThinFnPtr->FuncPtrReturnPointerDepth;
                     typeAndValue.FuncPtrReturnResolvedKey = srcThinFnPtr->FuncPtrReturnResolvedKey;
+                    typeAndValue.FuncPtrVariadic = srcThinFnPtr->FuncPtrVariadic;
                     typeAndValue.FuncPtrParams = srcThinFnPtr->FuncPtrParams;
                 }
                 else if (typeAndValue.TypeName == "auto" && right != nullptr && srcClosureFnPtr)
@@ -8624,6 +8740,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     typeAndValue.FuncPtrReturnAlias = srcClosureFnPtr->FuncPtrReturnAlias;
                     typeAndValue.FuncPtrReturnPointerDepth = srcClosureFnPtr->FuncPtrReturnPointerDepth;
                     typeAndValue.FuncPtrReturnResolvedKey = srcClosureFnPtr->FuncPtrReturnResolvedKey;
+                    typeAndValue.FuncPtrVariadic = srcClosureFnPtr->FuncPtrVariadic;
                     typeAndValue.FuncPtrParams = srcClosureFnPtr->FuncPtrParams;
                 }
                 else if (typeAndValue.TypeName == "auto" && right != nullptr

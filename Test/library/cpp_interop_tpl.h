@@ -2525,3 +2525,69 @@ namespace pf1u
     };
     inline int run() { U* p = new U; int v = p->active; delete p; return v; }
 }
+
+// T162: copy-init across class-template specializations (converting ctor, explicit, static_assert).
+namespace t162 {
+template <class T> struct Stats {
+    inline static int ctor = 0;
+    inline static int conversion = 0;
+    inline static int copy = 0;
+    inline static int move = 0;
+    inline static int dtor = 0;
+};
+
+template <class T, class F = int> struct Count {
+    int value;
+    Count(int x) : value(x) { ++Stats<T>::ctor; }
+    Count(const Count& other) : value(other.value) { ++Stats<T>::copy; }
+    Count(Count&& other) : value(other.value) { ++Stats<T>::move; }
+    ~Count() { ++Stats<T>::dtor; }
+};
+
+template <class T> struct SA {
+    static_assert(sizeof(T) == 4, "SA needs a 4-byte T");
+    int value;
+    SA(int x) : value(x) { ++Stats<T>::ctor; }
+    SA(const SA& other) : value(other.value) { ++Stats<T>::copy; }
+    ~SA() { ++Stats<T>::dtor; }
+};
+
+template <class T> struct Conv {
+    int value;
+    Conv(int x) : value(x) { ++Stats<T>::ctor; }
+    template <class U> Conv(const Conv<U>& other) : value(other.value + 100) {
+        ++Stats<T>::conversion;
+    }
+    Conv(const Conv& other) : value(other.value) { ++Stats<T>::copy; }
+    Conv(Conv&& other) : value(other.value) { ++Stats<T>::move; }
+    ~Conv() { ++Stats<T>::dtor; }
+};
+
+template <class T> struct Explicit {
+    int value;
+    Explicit(int x) : value(x) { ++Stats<T>::ctor; }
+    template <class U> explicit Explicit(const Explicit<U>& other) : value(other.value + 100) {
+        ++Stats<T>::conversion;
+    }
+    ~Explicit() { ++Stats<T>::dtor; }
+};
+
+template <class T> using AliasConv = Conv<T>;
+
+inline void reset() {
+    Stats<int>::ctor = Stats<int>::conversion = Stats<int>::copy = 0;
+    Stats<int>::move = Stats<int>::dtor = 0;
+    Stats<long>::ctor = Stats<long>::conversion = Stats<long>::copy = 0;
+    Stats<long>::move = Stats<long>::dtor = 0;
+}
+inline int count_ctor_int() { return Stats<int>::ctor; }
+inline int count_conversion_int() { return Stats<int>::conversion; }
+inline int count_copy_int() { return Stats<int>::copy; }
+inline int count_move_int() { return Stats<int>::move; }
+inline int count_dtor_int() { return Stats<int>::dtor; }
+inline int count_ctor_long() { return Stats<long>::ctor; }
+inline int count_conversion_long() { return Stats<long>::conversion; }
+inline int count_copy_long() { return Stats<long>::copy; }
+inline int count_move_long() { return Stats<long>::move; }
+inline int count_dtor_long() { return Stats<long>::dtor; }
+}

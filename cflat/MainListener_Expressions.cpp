@@ -1,4 +1,5 @@
 #include "MainListener.h"
+#include <llvm/Support/SaveAndRestore.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/Intrinsics.h>
 
@@ -2296,8 +2297,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     "cannot assign to macro constant '{}'", unaryCtx->getText()));
             auto destination = namedVar.Storage;
             // Every write operator (=, +=, ...) shares the const-element refusal.
-            const bool constElement = namedVar.IsElementAccess
-                && namedVar.TypeAndValue.IsCxxPointeeConst;
+            const bool constElement = namedVar.TypeAndValue.IsCxxPointeeConst
+                && (namedVar.IsElementAccess || !namedVar.TypeAndValue.Pointer);
             if (constElement || !namedVar.TypeAndValue.IsCxxMutableField)   // a mutable member is writable
                 RefuseCxxConstReferentWrite(unaryCtx, destination, "assign to", constElement);
 
@@ -3508,6 +3509,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             // it lowers to an extractelement value (lanes are read-only), so call that out.
             // Bitfield writes are exempt: they legitimately carry null Storage and route
             // the store through BitfieldStorage in bitfieldAssign below.
+            // A fresh closure value (a ternary whose function arm was lifted, T188) has a copy temp as
+            // its storage; writing there would be lost, so it is not an lvalue either.
+            if (destination != nullptr && namedVar.IsRvalue && namedVar.Primary != nullptr
+                && namedVar.Primary->getType() == compiler->GetClosureFatPtrType())
+                LogErrorContext(unaryCtx, "Left side of assignment is not an addressable lvalue.");
             if (destination == nullptr && namedVar.BitfieldStorage == nullptr)
             {
                 if (namedVar.Primary && llvm::isa<llvm::ExtractElementInst>(namedVar.Primary))
@@ -3526,9 +3532,14 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             {
                 std::string lhsName = unaryCtx != nullptr && !unaryCtx->getText().empty()
                     ? unaryCtx->getText() : namedVar.CallerName;
-                LogErrorContext(unaryCtx, std::format(
-                    "cannot assign to '{}': it is a const C++ object, so its storage is read-only. "
-                    "Copy it into a local and assign to that instead.", lhsName));
+                if (compiler->cGlobalSymbols_.count(constGlobal->getName().str()) != 0)
+                    LogErrorContext(unaryCtx, std::format(
+                        "cannot assign to '{}': it is a const C object, so its storage is read-only. "
+                        "Copy it into a local and assign to that instead.", lhsName));
+                else
+                    LogErrorContext(unaryCtx, std::format(
+                        "cannot assign to '{}': it is a const C++ object, so its storage is read-only. "
+                        "Copy it into a local and assign to that instead.", lhsName));
             }
 
             // For through-pointer dereferences (*p), Storage is a raw loaded ptr (not alloca/gep/global)
@@ -4948,6 +4959,15 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         }
                     }
                 }
+            }
+
+            // Variadic-ness is part of a C function-pointer type, whatever the representation.
+            if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer
+                && rightNV.TypeAndValue.IsFunctionPointer && right)
+            {
+                if (std::string why = compiler->DescribeFuncPtrVariadicMismatch(
+                        namedVar.TypeAndValue, rightNV.TypeAndValue); !why.empty())
+                    LogErrorContext(ctx, why);
             }
 
             // An INFERRED sink cannot be adopted onto an already-registered destination (or a
@@ -8093,6 +8113,7 @@ static void CarryCommonClosureSignature(LLVMBackend* compiler, LLVMBackend::Type
     type.FuncPtrReturnAlias = t.FuncPtrReturnAlias;
     type.FuncPtrReturnPointerDepth = t.FuncPtrReturnPointerDepth;
     type.FuncPtrReturnResolvedKey = t.FuncPtrReturnResolvedKey;
+    type.FuncPtrVariadic = t.FuncPtrVariadic;
     type.FuncPtrParams = t.FuncPtrParams;
     result.sourceType = std::move(type);
     result.sourceTypeName = "__closure_fat_ptr";
@@ -8257,6 +8278,163 @@ bool MainListener::CollectBorrowedPointerArm(const LLVMBackend::TypedValue& shap
     recorded.BorrowedPointer = true;
     recorded.BorrowedOrigin = directBorrowParam ? sourceName : source->BorrowedOrigin;
     return true;
+}
+
+/*
+ * `c ? a : b` over two function values. An OVERLOADED name arm takes the one overload that binds
+ * the other arm's signature (zero or several is refused). Two arms whose signatures provably differ
+ * are refused here, once, so the declaration, assignment, argument, return and C-typedef consumers
+ * all see the same error and the join never carries a signature. Arms with no known signature are
+ * left alone.
+ */
+void MainListener::UnifyTernaryFunctionArms(antlr4::ParserRuleContext* ctx,
+        antlr4::ParserRuleContext* trueArm, antlr4::ParserRuleContext* falseArm,
+        llvm::Value*& trueValue, llvm::Value*& falseValue,
+        LLVMBackend::TypedValue& trueShape, LLVMBackend::TypedValue& falseShape)
+{
+        auto* compiler = Compiler(ctx);
+        auto armSignature = [&](antlr4::ParserRuleContext* arm, const LLVMBackend::TypedValue& shape,
+                                LLVMBackend::TypeAndValue& out) {
+            if (shape.hasSourceType && shape.sourceType.IsFunctionPointer
+                && !shape.sourceType.FuncPtrReturnTypeName.empty())
+            {
+                out = shape.sourceType;
+                return true;
+            }
+            return ResolveBareFunctionArmSignature(arm, out);
+        };
+        auto isOverloadedName = [&](antlr4::ParserRuleContext* arm) {
+            const std::string text = arm->getText();
+            // A local, field or global variable of that name wins the codegen lookup over a function.
+            if (!IsBareIdentifierText(text) || NamesVisibleVariable(compiler, text))
+                return false;
+            auto overloads = compiler->functionTable.find(text);
+            return overloads != compiler->functionTable.end() && overloads->second.size() > 1;
+        };
+        // The overload of `name` whose signature is `sig`: the unique match, else refused.
+        auto pickOverload = [&](antlr4::ParserRuleContext* arm, const std::string& name,
+                                const LLVMBackend::TypeAndValue& sig) -> const LLVMBackend::FunctionSymbol* {
+            std::vector<const LLVMBackend::FunctionSymbol*> distinct;
+            for (const auto& sym : compiler->functionTable.find(name)->second)
+            {
+                if (sym.IsMethod || sym.Variadic != sig.FuncPtrVariadic
+                    || compiler->FuncPtrSignaturesProvablyDiffer(compiler->FuncPtrSigOfSymbol(sym), sig))
+                    continue;
+                // A C import and its hand-written CFlat declaration can register one symbol twice.
+                const bool duplicate = std::any_of(distinct.begin(), distinct.end(), [&](const auto* prior) {
+                    return (sym.Function != nullptr && sym.Function == prior->Function)
+                        || (sym.Function == nullptr && prior->Function == nullptr
+                            && sym.UniqueName == prior->UniqueName);
+                });
+                if (!duplicate) distinct.push_back(&sym);
+            }
+            if (distinct.size() == 1) return distinct.front();
+            const size_t matches = distinct.size();
+            LogErrorContext(arm, matches == 0
+                ? std::format("no overload of '{}' has the signature '{}' of the other arm of the conditional expression",
+                    name, compiler->FuncPtrSpellingOf(sig))
+                : std::format("more than one overload of '{}' has the signature '{}' of the other arm of the conditional expression",
+                    name, compiler->FuncPtrSpellingOf(sig)));
+            return nullptr;
+        };
+        const bool trueOverloaded = isOverloadedName(trueArm);
+        const bool falseOverloaded = isOverloadedName(falseArm);
+        LLVMBackend::TypeAndValue trueSig;
+        LLVMBackend::TypeAndValue falseSig;
+        bool haveTrue = !trueOverloaded && armSignature(trueArm, trueShape, trueSig);
+        bool haveFalse = !falseOverloaded && armSignature(falseArm, falseShape, falseSig);
+        auto bindArm = [&](const LLVMBackend::FunctionSymbol& sym, llvm::Value*& value,
+                           LLVMBackend::TypedValue& shape, LLVMBackend::TypeAndValue& sig) {
+            sig = compiler->FuncPtrSigOfSymbol(sym);
+            if (sym.Function != nullptr) value = sym.Function;
+            shape.sourceType = sig;
+            shape.sourceTypeName = sig.TypeName;
+            shape.hasSourceType = true;
+        };
+        if (trueOverloaded && haveFalse)
+        {
+            if (const auto* sym = pickOverload(trueArm, trueArm->getText(), falseSig); sym != nullptr)
+                {
+                    bindArm(*sym, trueValue, trueShape, trueSig);
+                    haveTrue = true;
+                }
+        }
+        if (falseOverloaded && haveTrue)
+        {
+            if (const auto* sym = pickOverload(falseArm, falseArm->getText(), trueSig); sym != nullptr)
+                {
+                    bindArm(*sym, falseValue, falseShape, falseSig);
+                    haveFalse = true;
+                }
+        }
+        if (!haveTrue || !haveFalse) return;
+        if (compiler->FuncPtrSignaturesProvablyDiffer(trueSig, falseSig)
+            || trueSig.FuncPtrVariadic != falseSig.FuncPtrVariadic)
+        {
+            LogErrorContext(ctx, std::format(
+                "the arms of the conditional expression have different signatures '{}' and '{}'",
+                compiler->FuncPtrSpellingOf(trueSig), compiler->FuncPtrSpellingOf(falseSig)));
+        }
+}
+
+/*
+ * A named function or thin function<> arm joining a closure arm is lifted into the closure form -
+ * the widen a Lambda<> slot applies to the same value - so the join is closure to closure. Only when
+ * both signatures are known and agree; otherwise the join is refused as before.
+ */
+bool MainListener::LiftTernaryFunctionArmToClosure(antlr4::ParserRuleContext* ctx,
+        llvm::Value*& trueValue, llvm::Value*& falseValue,
+        LLVMBackend::TypedValue& trueShape, LLVMBackend::TypedValue& falseShape,
+        llvm::Value*& trueStorage, llvm::Value*& falseStorage,
+        const std::function<void()>& atTrue, const std::function<void()>& atFalse)
+{
+        auto* compiler = Compiler(ctx);
+        auto* closureTy = compiler->GetClosureFatPtrType();
+        bool lifted = false;
+        auto signatureOf = [](const LLVMBackend::TypedValue& shape) -> const LLVMBackend::TypeAndValue* {
+            return shape.hasSourceType && shape.sourceType.IsFunctionPointer
+                && !shape.sourceType.FuncPtrReturnTypeName.empty() ? &shape.sourceType : nullptr;
+        };
+        auto liftArm = [&](llvm::Value*& arm, LLVMBackend::TypedValue& armShape,
+                           const LLVMBackend::TypedValue& closureShape,
+                           llvm::Value*& storage, llvm::Value*& otherStorage,
+                           const std::function<void()>& atArm) {
+            const LLVMBackend::TypeAndValue* closureSig = signatureOf(closureShape);
+            if (closureSig == nullptr) return;
+            LLVMBackend::TypeAndValue armSig;
+            if (auto* fn = llvm::dyn_cast<llvm::Function>(arm))
+            {
+                const auto* symbol = compiler->FindSymbolForFunction(fn);
+                if (symbol == nullptr || symbol->IsMethod) return;
+                armSig = compiler->FuncPtrSigOfSymbol(*symbol);
+            }
+            else if (signatureOf(armShape) != nullptr && arm->getType()->isPointerTy()
+                     && !arm->getType()->isStructTy())
+            {
+                armSig = armShape.sourceType;
+            }
+            else return;
+            if (compiler->FuncPtrSignaturesProvablyDiffer(*closureSig, armSig)
+                || closureSig->FuncPtrVariadic != armSig.FuncPtrVariadic)
+                return;
+            atArm();
+            arm = compiler->WidenBareOrThinToClosureFat(arm, armSig);
+            armShape.sourceType = *closureSig;
+            armShape.sourceTypeName = closureSig->TypeName;
+            armShape.hasSourceType = true;
+            // The arm's storage slot has the function value's type, not the closure's: a storage
+            // join would load a closure from it. The join is then a plain value join.
+            storage = nullptr;
+            otherStorage = nullptr;
+            lifted = true;
+        };
+        const bool trueIsClosure = trueValue != nullptr && trueValue->getType() == closureTy;
+        const bool falseIsClosure = falseValue != nullptr && falseValue->getType() == closureTy;
+        if (trueIsClosure && !falseIsClosure && falseValue != nullptr)
+            liftArm(falseValue, falseShape, trueShape, falseStorage, trueStorage, atFalse);
+        else if (falseIsClosure && !trueIsClosure && trueValue != nullptr)
+            liftArm(trueValue, trueShape, falseShape, trueStorage, falseStorage, atTrue);
+        return lifted;
 }
 
 LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
@@ -8901,6 +9079,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             return result;
         }
 
+        UnifyTernaryFunctionArms(ctx, expressionTrueCtx, expressionFalseCtx, trueValue, falseValue,
+                                 trueShape, falseShape);
         if (trueValue == nullptr || falseValue == nullptr)
         {
             // A valueless arm still opened its block. Close every unterminated arm block, or
@@ -9121,6 +9301,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 }
             }
         }
+        const bool liftedArm = LiftTernaryFunctionArmToClosure(ctx, trueValue, falseValue, trueShape,
+                                        falseShape, trueStorage, falseStorage, atTrue, atFalse);
         if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, trueShape, falseShape,
                 atTrue, atFalse, trueOcc, falseOcc,
                 trueUnsigned, falseUnsigned, TernaryInterfaceDestination(*compiler, outerExpected),
@@ -9383,7 +9565,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         result.receiverStorage = cxxLvalueStorageJoin;
         // Both arms fresh (call results, sret temps) make the join fresh even when no record join is
         // visible here: C++ immovable operands are refused by place, so a prvalue join must stay one.
-        result.isRvalue = (cxxRecordJoin
+        // A lifted function arm is a fresh closure value, so the join is not assignable (T188).
+        result.isRvalue = liftedArm || (cxxRecordJoin
             && (cxxLvalueStorageJoin == nullptr || bothOwnedCxxTempArms))
             || (trueShape.isRvalue && falseShape.isRvalue
                 && !trueShape.isExplicitMove && !falseShape.isExplicitMove);
@@ -9407,6 +9590,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             type.IsFunctionPointer = true;
             type.FuncPtrReturnTypeName = symbol->ReturnType.TypeName;
             type.FuncPtrReturnPointer = symbol->ReturnType.Pointer;
+            type.FuncPtrVariadic = symbol->Variadic;
             type.FuncPtrReturnPointerDepth = symbol->ReturnType.PointerDepth;
             for (const auto& parameter : symbol->Parameters)
             {
@@ -9679,6 +9863,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 type.IsFunctionPointer = true;
                 type.FuncPtrReturnTypeName = symbol->ReturnType.TypeName;
                 type.FuncPtrReturnPointer = symbol->ReturnType.Pointer;
+                type.FuncPtrVariadic = symbol->Variadic;
                 type.FuncPtrReturnPointerDepth = symbol->ReturnType.PointerDepth;
                 for (const auto& parameter : symbol->Parameters)
                 {
@@ -10194,8 +10379,14 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 // registered and re-registration is idempotent (deduped).
                 RegisterBorrowedStringOperandTemp(compiler, trueValue);
                 RegisterBorrowedStringOperandTemp(compiler, falseValue);
+                UnifyTernaryFunctionArms(ctx, expressionTrueCtx, expressionFalseCtx, trueValue, falseValue,
+                                         trueShape, falseShape);
 
                 auto here = []() {};   // eager form: both arms already live in the current block
+                llvm::Value* eagerTrueStorage = nullptr;
+                llvm::Value* eagerFalseStorage = nullptr;
+                const bool eagerLifted = LiftTernaryFunctionArmToClosure(ctx, trueValue, falseValue,
+                    trueShape, falseShape, eagerTrueStorage, eagerFalseStorage, here, here);
                 bool joinUnsigned = TernaryJoinIsUnsigned(
                     trueUnsigned,  trueValue != nullptr && trueValue->getType()->isIntegerTy()
                         ? trueValue->getType()->getIntegerBitWidth() : 0,
@@ -10260,6 +10451,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 carryCommonThinFunctionPointerType(result, trueShape, falseShape,
                                                     trueValue, falseValue);
                 CarryCommonClosureSignature(compiler, result, trueShape, falseShape);
+                if (eagerLifted) result.isRvalue = true;
                 return result;
             }
 
@@ -13285,7 +13477,7 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
         llvm::Value* readOnlyStorage = nullptr;
         bool constOperand = operandIsConst;
         // A C++ `volatile T&` result keeps its volatile into receiver cv ranking.
-        const bool volatileOperand = operandSource != nullptr
+        bool volatileOperand = operandSource != nullptr
             && operandSource->TypeAndValue.IsCxxPointeeVolatile;
         if (operandStorage != nullptr)
         {
@@ -13300,22 +13492,32 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
             }
         }
 
+        // A by-value cv C++ call result is a cv prvalue: rvalue, never a mutable target.
+        int prvalueCv = 0;
+        if (auto* callCtx = dynamic_cast<CFlatParser::UnaryExpressionContext*>(ctx);
+            callCtx != nullptr && callCtx->castExpression() != nullptr
+            && CxxArgumentLvalueKind(callCtx->castExpression()) == 2)
+            prvalueCv = compiler->lastCallReturnValueCv_;
+        const bool constPrvalue = (prvalueCv & 1) != 0;
+        volatileOperand = volatileOperand || (prvalueCv & 2) != 0;
         std::string opName = "operator" + op;
         const std::string cxxBase = typeName.substr(0, typeName.find('$'));
         const size_t cxxDot = cxxBase.rfind('.');
         const std::string cxxFreeSourceName = cxxDot == std::string::npos
             ? opName : cxxBase.substr(0, cxxDot) + "." + opName;
+        // A global-namespace class's member is named plain `operator-`, the same as its free
+        // spelling (cxxFreeSourceName), so membership is IsMethod alone.
         auto isMemberReceiver = [&](const LLVMBackend::FunctionSymbol& candidate) {
-            return !compiler->IsCxxRecord(typeName)
-                || (candidate.IsMethod && candidate.SourceName != cxxFreeSourceName);
+            return !compiler->IsCxxRecord(typeName) || candidate.IsMethod;
         };
         llvm::Value* freeOperandStorage = operandStorage != nullptr ? operandStorage : readOnlyStorage;
         if (compiler->IsCxxRecord(typeName))
             compiler->EnsureCxxMemberProjected(typeName, opName);
         if (!compiler->GetFunction(opName))
             return TryUnaryFreeOperatorOverload(operand, op, ctx, freeOperandStorage,
-                                                constOperand,
-                                                operandSource != nullptr && operandSource->IsExplicitMove);
+                                                constOperand || constPrvalue,
+                                                operandSource != nullptr && operandSource->IsExplicitMove,
+                                                constPrvalue);
 
         bool receiverFound = false;
         bool receiverConsumes = false;
@@ -13349,8 +13551,9 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
                 }
         if (!receiverFound)
             return TryUnaryFreeOperatorOverload(operand, op, ctx, freeOperandStorage,
-                                                constOperand,
-                                                operandSource != nullptr && operandSource->IsExplicitMove);
+                                                constOperand || constPrvalue,
+                                                operandSource != nullptr && operandSource->IsExplicitMove,
+                                                constPrvalue);
         if (compiler->IsCxxRecord(typeName))
         {
             compiler->TryBindCxxFunction(cxxFreeSourceName);
@@ -13359,8 +13562,13 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
                 unaryCtx != nullptr && unaryCtx->castExpression() != nullptr)
             {
                 const int lvalueKind = CxxArgumentLvalueKind(unaryCtx->castExpression());
-                if (lvalueKind >= 0) operandIsRvalue = lvalueKind != 1;
+                // A call (kind 2) is an rvalue unless it yields a const reference (an lvalue).
+                if (lvalueKind >= 0)
+                    operandIsRvalue = lvalueKind == 2 ? (operandIsRvalue && !constOperand)
+                                                      : lvalueKind != 1;
             }
+            constOperand = constOperand || constPrvalue;
+            const int receiverCv = (constOperand ? 1 : 0) | (volatileOperand ? 2 : 0);
             LLVMBackend::NamedVariable objectArg;
             objectArg.Primary = operand;
             objectArg.BaseType = structTy;
@@ -13369,28 +13577,43 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
             objectArg.TypeAndValue.IsCxxPointeeVolatile = volatileOperand;
             objectArg.IsRvalue = operandIsRvalue;
             objectArg.CxxLvalueKind = operandIsRvalue ? 0 : 1;
+            /*
+             * Every zero-argument member of the class, the const twin of a pair included. Each is
+             * judged by the one implicit-object rule (CxxImplicitObjectViable); an inherited member
+             * binds through a derived-to-base conversion, so any viable exact free outranks it.
+             */
+            const std::string constTwinName = LLVMBackend::CxxConstTwinName(opName);
+            bool memberNamed = false;
+            bool membersInherited = false;
             std::vector<const LLVMBackend::FunctionSymbol*> zeroArgMembers;
+            std::set<std::string> seenMembers;
+            for (const std::string& tableName : { opName, constTwinName })
+                if (const auto functions = compiler->functionTable.find(tableName);
+                    functions != compiler->functionTable.end())
+                    for (const auto& candidate : functions->second)
+                    {
+                        if (!candidate.IsMethod || candidate.Parameters.size() != 1
+                            || candidate.Parameters[0].TypeName != typeName) continue;
+                        memberNamed = true;
+                        if (!seenMembers.insert(candidate.UniqueName).second
+                            || !compiler->CxxImplicitObjectViable(receiverCv, operandIsRvalue, candidate))
+                            continue;
+                        zeroArgMembers.push_back(&candidate);
+                        membersInherited = membersInherited
+                            || (!candidate.CxxInheritedOwner.empty()
+                                && candidate.CxxInheritedOwner != typeName);
+                    }
+            const bool memberReachable = !zeroArgMembers.empty();
             std::vector<const LLVMBackend::FunctionSymbol*> constFreeReferences;
+            // By-value free overloads: an identity conversion, indistinguishable from any
+            // viable member's implicit object binding (clang: ambiguous).
+            std::set<const LLVMBackend::FunctionSymbol*> byValueFrees;
+            // Rvalue-reference free overloads with their cv bits (const = 1, volatile = 2).
+            std::map<const LLVMBackend::FunctionSymbol*, int> rvalueRefFrees;
             if (const auto functions = compiler->functionTable.find(opName);
                 functions != compiler->functionTable.end())
                 for (const auto& candidate : functions->second)
                 {
-                    if (candidate.IsMethod && candidate.Parameters.size() == 1
-                        && candidate.Parameters[0].TypeName == typeName)
-                    {
-                        if (const auto* info = compiler->GetCxxClassInfo(typeName))
-                            for (const auto& method : info->directMethods)
-                                if (method.raw.name == opName && method.raw.paramTypes.size() == 1
-                                    && method.raw.linkageName == candidate.UniqueName)
-                                {
-                                    const bool refViable = operandIsRvalue
-                                        ? method.raw.refQualifier != cflat_cinterop::CxxRefQualifierLValue
-                                        : method.raw.refQualifier != cflat_cinterop::CxxRefQualifierRValue;
-                                    if (refViable && (!constOperand || candidate.CxxConst))
-                                        zeroArgMembers.push_back(&candidate);
-                                }
-                        continue;
-                    }
                     if (candidate.IsMethod || !candidate.IsCxx || candidate.Parameters.size() != 1
                         || candidate.Parameters[0].TypeName != typeName) continue;
                     if (auto signatures = compiler->cxxFunctionSignatures_.find(cxxFreeSourceName);
@@ -13398,17 +13621,37 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
                         for (const auto& raw : signatures->second)
                             if (raw.linkageName == candidate.UniqueName && !raw.paramSpellings.empty())
                             {
+                                // Only a free overload this operand can bind ties: `S&` needs a
+                                // mutable lvalue, `S&&` a mutable rvalue; `const S&` binds any.
                                 const auto& spelling = raw.paramSpellings[0];
-                                if (spelling.find('&') != std::string::npos
-                                    && spelling.find("&&") == std::string::npos
-                                    && spelling.find("const") != std::string::npos)
-                                    constFreeReferences.push_back(&candidate);
+                                const bool rvalueRef = spelling.find("&&") != std::string::npos;
+                                const bool lvalueRef = !rvalueRef && spelling.find('&') != std::string::npos;
+                                const bool constSpelled = spelling.find("const") != std::string::npos;
+                                const bool volatileSpelled = spelling.find("volatile") != std::string::npos;
+                                bool bindable = true;
+                                if (lvalueRef && !constSpelled) bindable = !operandIsRvalue && !constOperand;
+                                else if (rvalueRef && !constSpelled) bindable = operandIsRvalue && !constOperand;
+                                else if (rvalueRef) bindable = operandIsRvalue;
+                                // A volatile operand binds only a volatile reference.
+                                if (volatileOperand && (lvalueRef || rvalueRef) && !volatileSpelled)
+                                    bindable = false;
+                                if (!bindable) continue;
+                                constFreeReferences.push_back(&candidate);
+                                if (!lvalueRef && !rvalueRef) byValueFrees.insert(&candidate);
+                                if (rvalueRef)
+                                    rvalueRefFrees[&candidate] = (constSpelled ? 1 : 0)
+                                        | (volatileSpelled ? 2 : 0);
                             }
                 }
+            // An inherited member's derived-to-base binding loses to any viable exact free.
+            if (membersInherited && !constFreeReferences.empty())
+                return TryUnaryFreeOperatorOverload(operand, op, ctx, freeOperandStorage,
+                                                    constOperand,
+                                                    operandSource != nullptr && operandSource->IsExplicitMove,
+                                                    constPrvalue);
             std::vector<const LLVMBackend::FunctionSymbol*> tiedFreeCandidates;
             for (const auto* member : zeroArgMembers)
             {
-                if (!member->CxxConst) continue;
                 auto memberRanks = compiler->RankCxxConversionSequences({ objectArg }, *member);
                 if (memberRanks.size() != 1 || memberRanks[0].rank != -2) continue;
                 for (const auto* freeCandidate : constFreeReferences)
@@ -13416,8 +13659,9 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
                     auto freeRanks = compiler->RankCxxConversionSequences({ objectArg }, *freeCandidate);
                     if (freeRanks.size() != 1 || freeRanks[0].rank < 0) continue;
                     bool crossing = false;
-                    if (compiler->CompareCxxConversionRanks(memberRanks, freeRanks, crossing) == 0
-                        && !crossing)
+                    if (byValueFrees.count(freeCandidate) != 0
+                        || (compiler->CompareCxxConversionRanks(memberRanks, freeRanks, crossing) == 0
+                            && !crossing))
                         tiedFreeCandidates.push_back(freeCandidate);
                 }
             }
@@ -13439,10 +13683,69 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
                 if (!memberBeatsFree) ambiguousMemberFreeTie = true;
             }
             if (ambiguousMemberFreeTie)
+            {
                 LogErrorContext(ctx, std::format(
-                    "ambiguous C++ unary operator '{}': both the const member and const-reference free overload are viable",
+                    "ambiguous C++ unary operator '{}': a member and a free overload are both viable and rank equally",
                     opName));
+                return nullptr;
+            }
+            // No viable member: TryUnaryFreeOperatorOverload decides. A bindable free that strictly
+            // outranks every viable member (clang: `const&` beats `const volatile`) is the pick.
+            bool freeOutranksMembers = false;
+            for (const auto* freeCandidate : constFreeReferences)
+            {
+                if (zeroArgMembers.empty()) break;
+                auto freeRanks = compiler->RankCxxConversionSequences({ objectArg }, *freeCandidate);
+                if (freeRanks.size() != 1 || freeRanks[0].rank < 0) continue;
+                bool outranksAll = true;
+                for (const auto* member : zeroArgMembers)
+                {
+                    auto memberRanks = compiler->RankCxxConversionSequences({ objectArg }, *member);
+                    bool crossing = false;
+                    if (memberRanks.size() != 1 || memberRanks[0].rank != -2
+                        || compiler->CompareCxxConversionRanks(memberRanks, freeRanks, crossing) != 1
+                        || crossing)
+                        outranksAll = false;
+                }
+                freeOutranksMembers = freeOutranksMembers || outranksAll;
+            }
+            // An `S&&` free is unranked against a class object: compare by cv alone (a non-ref-qualified
+            // member is exempt from [over.ics.rank] 3.2.3, leaving 3.2.6).
+            bool rvalueRefTie = false;
+            for (const auto& [freeCandidate, freeCvBits] : rvalueRefFrees)
+            {
+                const int freeCv = freeCvBits;
+                bool tied = false;
+                bool beaten = false;
+                bool outranksAll = !zeroArgMembers.empty();
+                for (const auto* member : zeroArgMembers)
+                {
+                    auto memberRanks = compiler->RankCxxConversionSequences({ objectArg }, *member);
+                    if (memberRanks.size() != 1 || memberRanks[0].rank != -2) { outranksAll = false; continue; }
+                    // 3.2.3 applies to an lvalue-ref-qualified member: the rvalue-ref free binding wins.
+                    if (member->CxxRefQualifier == cflat_cinterop::CxxRefQualifierLValue) continue;
+                    const int memberCv = memberRanks[0].second;
+                    if (memberCv == freeCv) tied = true;
+                    else if ((memberCv & freeCv) == memberCv) beaten = true;
+                    if (!((freeCv & memberCv) == freeCv && freeCv != memberCv)) outranksAll = false;
+                }
+                if (tied && !beaten) rvalueRefTie = true;
+                freeOutranksMembers = freeOutranksMembers || outranksAll;
+            }
+            if (rvalueRefTie)
+            {
+                LogErrorContext(ctx, std::format(
+                    "ambiguous C++ unary operator '{}': a member and a free overload are both viable and rank equally",
+                    opName));
+                return nullptr;
+            }
+            if (memberNamed && (!memberReachable || freeOutranksMembers))
+                return TryUnaryFreeOperatorOverload(operand, op, ctx, freeOperandStorage,
+                                                    constOperand,
+                                                    operandSource != nullptr && operandSource->IsExplicitMove,
+                                                    constPrvalue);
         }
+
         // Determine whether to pass the operand by pointer or by value.
         bool usePointer = false;
         {
@@ -13512,9 +13815,13 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
                 unaryCtx != nullptr && unaryCtx->castExpression() != nullptr)
             {
                 thisNV.CxxLvalueKind = CxxArgumentLvalueKind(unaryCtx->castExpression());
-                thisNV.IsRvalue = thisNV.CxxLvalueKind >= 0
-                    ? thisNV.CxxLvalueKind != 1
-                    : (operandSource != nullptr && operandSource->IsRvalue);
+                // A call result (kind 2) is an rvalue unless it yields a const reference.
+                if (thisNV.CxxLvalueKind == 2)
+                    thisNV.IsRvalue = operandSource != nullptr && operandSource->IsRvalue && !constOperand;
+                else
+                    thisNV.IsRvalue = thisNV.CxxLvalueKind >= 0
+                        ? thisNV.CxxLvalueKind != 1
+                        : (operandSource != nullptr && operandSource->IsRvalue);
             }
             thisNV.TernaryTempAlreadyRegistered = receiverTempAlreadyRegistered;
             thisNV.IsExplicitMove = receiverIsFreeParam && operandExplicitMove;
@@ -13534,6 +13841,16 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
             thisNV.IsCxxUnaryOperatorReceiver = true;
             thisNV.TernaryTempAlreadyRegistered = receiverTempAlreadyRegistered;
             thisNV.IsExplicitMove = receiverIsFreeParam && operandExplicitMove;
+            // The receiver's value category decides which C++ overload binds (`S&` vs `S&&`).
+            if (auto* unaryCtx = dynamic_cast<CFlatParser::UnaryExpressionContext*>(ctx);
+                unaryCtx != nullptr && unaryCtx->castExpression() != nullptr)
+            {
+                thisNV.CxxLvalueKind = CxxArgumentLvalueKind(unaryCtx->castExpression());
+                if (thisNV.CxxLvalueKind == 2)
+                    thisNV.IsRvalue = operandSource != nullptr && operandSource->IsRvalue && !constOperand;
+                else if (thisNV.CxxLvalueKind >= 0)
+                    thisNV.IsRvalue = thisNV.CxxLvalueKind != 1;
+            }
             if (operandSource != nullptr)
             {
                 thisNV.CallerName = !operandSource->FieldName.empty()
@@ -13583,7 +13900,8 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
 // that is not a C++ class, or has no such candidate, answers nullptr and keeps the old fallbacks.
 llvm::Value* MainListener::TryUnaryFreeOperatorOverload(
         llvm::Value* operand, const std::string& op,
-        antlr4::ParserRuleContext* ctx, llvm::Value* operandStorage, bool operandIsConst, bool operandExplicitMove) {
+        antlr4::ParserRuleContext* ctx, llvm::Value* operandStorage, bool operandIsConst, bool operandExplicitMove,
+        bool operandIsConstPrvalue) {
         auto* compiler = Compiler(ctx);
         if (operand == nullptr || !operand->getType()->isStructTy()) return nullptr;
         auto* structTy = llvm::cast<llvm::StructType>(operand->getType());
@@ -13611,7 +13929,7 @@ llvm::Value* MainListener::TryUnaryFreeOperatorOverload(
             const int8_t category = CxxArgumentLvalueKind(unaryCtx->castExpression());
             if (category >= 0) operandIsRvalue = category != 1;
         }
-        if (operandIsConst)
+        if (operandIsConst && !operandIsConstPrvalue)
             operandIsRvalue = false;
         auto storageFor = [&]() -> llvm::Value* {
             if (operandStorage != nullptr) return operandStorage;
@@ -14860,17 +15178,24 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 const bool filterReferences = (constLeft || leftIsRvalue || constRight || rightIsRvalue)
                     && table != compiler->functionTable.end();
                 std::vector<LLVMBackend::FunctionSymbol> original;
+                auto hiddenByOperand = [&](const LLVMBackend::FunctionSymbol& candidate) {
+                    return ((constLeft || leftIsRvalue)
+                            && leftMutableReferenceLinkages.count(candidate.UniqueName) != 0)
+                        || ((constRight || rightIsRvalue)
+                            && rightMutableReferenceLinkages.count(candidate.UniqueName) != 0);
+                };
+                compiler->cxxFilteredOperatorCandidates_.clear();
                 if (filterReferences)
                 {
                     original = table->second;
-                    std::erase_if(table->second, [&](const LLVMBackend::FunctionSymbol& candidate) {
-                        return ((constLeft || leftIsRvalue)
-                                && leftMutableReferenceLinkages.count(candidate.UniqueName) != 0)
-                            || ((constRight || rightIsRvalue)
-                                && rightMutableReferenceLinkages.count(candidate.UniqueName) != 0);
-                    });
+                    // Kept for the no-overload diagnostic, which would otherwise see an empty set.
+                    for (const auto& candidate : table->second)
+                        if (hiddenByOperand(candidate))
+                            compiler->cxxFilteredOperatorCandidates_.push_back(candidate);
+                    std::erase_if(table->second, hiddenByOperand);
                 }
                 auto restoreConstCandidates = [&]() {
+                    compiler->cxxFilteredOperatorCandidates_.clear();
                     if (!filterReferences) return;
                     auto restore = compiler->functionTable.find(lookupName);
                     if (restore == compiler->functionTable.end()) return;
@@ -16055,8 +16380,9 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
                     ? namedVar.Storage : nullptr;
             materialize(namedVar);
 
+            // A pointer never casts to a float or a simd vector (clang refuses the vector form too).
             if (namedVar.Primary != nullptr && namedVar.Primary->getType()->isPointerTy()
-                && type->isFloatingPointTy())
+                && (type->isFloatingPointTy() || type->isVectorTy()))
             {
                 std::string target = SpellType(*compiler, destTypeName);
                 if (target.empty()) target = destTypeName.TypeName;
@@ -16785,7 +17111,12 @@ LLVMBackend::NamedVariable MainListener::TrySizeofPostfixAsType(CFlatParser::Una
             if (!compiler->IsKnownTypeName(typeValue.TypeName)
                 && !compiler->IsTypeArgTypeKey(typeValue.TypeName)
                 && !knownGenericType)
+            {
+                if (std::string refusal = compiler->GetCxxBindingRefusal(postfixText);
+                    !refusal.empty())
+                    LogErrorContext(ctx, refusal);
                 return {};
+            }
 
             llvm::Type* llvmType = compiler->GetType(typeValue, nullptr, true);
             for (auto it = rawArrayDims.rbegin();
@@ -16826,6 +17157,7 @@ LLVMBackend::NamedVariable MainListener::SizeOrAlignOfAutoVariable(const std::st
 
 MainListener::UnevaluatedOperandType MainListener::EvaluateOperandTypeOnly(
     const std::function<LLVMBackend::NamedVariable()>& emit) {
+        llvm::SaveAndRestore<int> unevaluated(unevaluatedOperandDepth_, unevaluatedOperandDepth_ + 1);
         auto* compiler = Compiler();
         std::unordered_map<llvm::Value*, IncrementWork> savedPostfix;
         savedPostfix.swap(PlusPlus);
@@ -17831,6 +18163,8 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                         "dereference of moved variable '{}' (it is null after the move)",
                         namedVar.CallerName));
                 llvm::Value* loadedPtr = compiler->CreateLoad(namedVar.Storage);
+                if (derefOperandType.IsCxxPointeeConst)
+                    compiler->MarkCxxConstFieldAccess(loadedPtr);
                 // The pointee is an lvalue, never a call's sret temporary: a stale one (an earlier
                 // `?:` arm, a sibling argument) must not be adopted as its storage below.
                 compiler->lastCxxRetTemp_ = nullptr;
@@ -18341,6 +18675,10 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                     // so the reader is told about a type they never wrote. Name the spelling.
                     if (!compiler->IsKnownTypeName(elementTV.TypeName))
                     {
+                        if (std::string refusal = compiler->GetCxxBindingRefusal(
+                                typeNameCtx->getText());
+                            !refusal.empty())
+                            LogErrorContext(ctx, refusal);
                         std::string written = typeNameCtx->getText();
                         size_t close = written.rfind('>');
                         if (close != std::string::npos && close + 1 < written.size()
@@ -21006,6 +21344,23 @@ void MainListener::EmitFieldInitializer(
                     "cannot initialize field '{}' from a value of type '{}': the type is [immovable], so the "
                     "value may not be copied or moved into the aggregate (initialize the field in place)",
                     fieldName, SpellDiagnosticType(*compiler, rightNV.TypeAndValue)));
+            }
+            // A bare named function binds its function-pointer field through the same by-name
+            // rule as a declaration (GetFunctionForFuncPtr refuses what cannot bind).
+            if (initField != nullptr && initField->IsFunctionPointer
+                && llvm::isa_and_nonnull<llvm::Function>(rightNV.Primary) && !rightNV.CallerName.empty())
+            {
+                if (auto* correctFn = compiler->GetFunctionForFuncPtr(rightNV.CallerName,
+                        (int)initField->FuncPtrParams.size(), &initField->FuncPtrParams, initField))
+                    rightNV.Primary = correctFn;
+            }
+            // Variadic-ness is part of a C function-pointer field's type, as for a declaration.
+            if (initField != nullptr && initField->IsFunctionPointer
+                && rightNV.TypeAndValue.IsFunctionPointer)
+            {
+                if (std::string why = compiler->DescribeFuncPtrVariadicMismatch(
+                        *initField, rightNV.TypeAndValue); !why.empty())
+                    LogErrorContext(fi, why);
             }
             lambdaExpectedType = {};
             if (!stdFunctionField.empty())
@@ -25909,6 +26264,47 @@ void MainListener::RefuseCxxConstReferentWrite(antlr4::ParserRuleContext* ctx,
                                                bool constElement) {
         std::string target = ctx != nullptr ? ctx->getText() : std::string();
         if (target.ends_with("++") || target.ends_with("--")) target.resize(target.size() - 2);
+        if (destination != nullptr) {
+            auto* compiler = Compiler(ctx);
+            auto* constGlobal = llvm::dyn_cast<llvm::GlobalVariable>(
+                llvm::getUnderlyingObject(destination));
+            // Wording only: the object is a C-declared global, directly, or through a pointer loaded
+            // from one (`*gp`, a decayed `*arr`, a local whose stored value is such a global).
+            auto isCConstObject = [&]() {
+                llvm::Value* base = llvm::getUnderlyingObject(destination);
+                if (auto* load = llvm::dyn_cast<llvm::LoadInst>(base))
+                    base = llvm::getUnderlyingObject(load->getPointerOperand());
+                if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(base)) {
+                    for (llvm::User* user : slot->users()) {
+                        auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                        if (store == nullptr || store->getPointerOperand() != slot) continue;
+                        auto* g = llvm::dyn_cast<llvm::GlobalVariable>(
+                            llvm::getUnderlyingObject(store->getValueOperand()));
+                        if (g != nullptr && compiler->cGlobalSymbols_.count(g->getName().str()) != 0)
+                            return true;
+                    }
+                    return false;
+                }
+                auto* global = llvm::dyn_cast<llvm::GlobalVariable>(base);
+                return global != nullptr && compiler->cGlobalSymbols_.count(global->getName().str()) != 0;
+            };
+            if (compiler->IsCxxConstFieldAccess(destination)
+                || (constElement && (isCConstObject() || (constGlobal != nullptr
+                    && compiler->cxxConstGlobalSymbols_.count(constGlobal->getName().str()) != 0)))) {
+                const std::string advice = operation == "assign to"
+                    ? "Copy it into a local and assign to that instead."
+                    : "Copy it into a local and modify that instead.";
+                if (isCConstObject())
+                    LogErrorContext(ctx, std::format(
+                        "cannot {} '{}': it is a const C object, so its storage is read-only. {}",
+                        operation, target, advice));
+                else
+                    LogErrorContext(ctx, std::format(
+                        "cannot {} '{}': it is a const C++ object, so its storage is read-only. {}",
+                        operation, target, advice));
+                return;
+            }
+        }
         if (constElement)
             LogErrorContext(ctx, std::format(
                 "cannot {} '{}': it is an element of a C++ const reference, so its storage is "
@@ -25922,8 +26318,14 @@ void MainListener::RefuseCxxConstReferentWrite(antlr4::ParserRuleContext* ctx,
         // `++` / `--` on a const namespace object; `=` has its own check in the assignment path.
         auto* constGlobal = operation == "assign to" ? nullptr
             : llvm::dyn_cast<llvm::GlobalVariable>(llvm::getUnderlyingObject(destination));
-        if (constGlobal != nullptr
-            && compiler->cxxConstGlobalSymbols_.count(constGlobal->getName().str()) != 0)
+        // cxxConstGlobalSymbols_ decides (const C and C++ globals); cGlobalSymbols_ only picks wording.
+        const bool constGlobalSymbol = constGlobal != nullptr
+            && compiler->cxxConstGlobalSymbols_.count(constGlobal->getName().str()) != 0;
+        if (constGlobalSymbol && compiler->cGlobalSymbols_.count(constGlobal->getName().str()) != 0)
+            LogErrorContext(ctx, std::format(
+                "cannot {} '{}': it is a const C object, so its storage is read-only. "
+                "Copy it into a local and modify that instead.", operation, target));
+        else if (constGlobalSymbol)
             LogErrorContext(ctx, std::format(
                 "cannot {} '{}': it is a const C++ object, so its storage is read-only. "
                 "Copy it into a local and modify that instead.", operation, target));
@@ -25950,7 +26352,8 @@ bool MainListener::RefuseCxxConstReceiverCall(antlr4::ParserRuleContext* ctx,
         LogErrorContext(ctx, std::format(
             "cannot call non-const member '{}' on '{}': {}, so it is read-only and only a const "
             "member function may be called on it. {}",
-            member, object, constKind == 2 ? "it is a const C++ object"
+            member, object, constKind == 2 && compiler->IsCConstGlobalObject(arguments.front())
+                ? "it is a const C object"
                 : constKind == 3 ? "it is reached through a C++ const reference result"
                                  : "it is a const C++ object", copyAdvice));
         return true;

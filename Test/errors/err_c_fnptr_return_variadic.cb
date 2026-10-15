@@ -1,0 +1,13 @@
+import "../library/c_variadic_fnptr.h";
+
+// A C function returning a variadic function pointer keeps the `...` tail on its return type, so a
+// by-value aggregate in that tail is refused when the result is called directly. The return type is
+// serialized into the header cache: the --check warm pass (second compile) exercises that flag.
+extern int main()
+{
+    T170Pair pr = {a = 3, b = 4};
+    expect_error("cannot pass aggregate value of type 'T170Pair' to the variadic '...' slot of C function pointer 't170_getvp'") {
+        int r = t170_getvp()(1, pr);
+    }
+    return 0;
+}

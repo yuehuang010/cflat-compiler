@@ -890,6 +890,16 @@ void LLVMBackend::CheckPoisonedFunctionCalls()
 
 void LLVMBackend::CheckAliasReturnSlotAddressTaken()
 {
+        // Offenders are reported in source order of their first address use; functionTable is
+        // unordered, so iterating it directly made the order host-dependent.
+        struct Offender
+        {
+            std::string Shown;
+            std::string Param;
+            std::string Mangled;
+            const AliasReturnAddressUse* Use = nullptr;
+        };
+        std::vector<Offender> offenders;
         for (const auto& [name, symbols] : functionTable)
             for (const auto& sym : symbols)
             {
@@ -904,27 +914,43 @@ void LLVMBackend::CheckAliasReturnSlotAddressTaken()
                 if (call != nullptr && call->getCalledOperand() == sym.Function
                     && !call->getFunction()->getName().starts_with("__cflat_reverse_abi_"))
                     continue;
-                const std::string shown = sym.SourceName.empty() ? name : sym.SourceName;
                 auto useIt = firstAliasReturnAddressUse_.find(sym.Function->getName().str());
-                if (useIt != firstAliasReturnAddressUse_.end())
-                {
-                    sourceFileName = useIt->second.File;
-                    SetSourceLocation(useIt->second.Line, useIt->second.Column);
-                }
-                if (useIt != firstAliasReturnAddressUse_.end()
-                    && !useIt->second.InterfaceName.empty())
-                    LogError(std::format(
-                        "cannot convert to interface '{}': method '{}' has an 'alias' result that can "
-                        "be its by-value parameter '{}', which an interface call cannot pass through "
-                        "the required caller-owned slot", useIt->second.InterfaceName, shown, param));
-                LogError(std::format(
-                    "cannot use '{}' as a function value: its 'alias' result can be its by-value "
-                    "parameter '{}', which a function value cannot pass through the required "
-                    "caller-owned slot. Call '{}' directly, or declare the parameter 'move' so the "
-                    "result is owned.", shown, param, shown));
+                offenders.push_back({ sym.SourceName.empty() ? name : sym.SourceName, param,
+                    sym.Function->getName().str(), useIt != firstAliasReturnAddressUse_.end() ? &useIt->second : nullptr });
                 break;
                 }
             }
+        std::sort(offenders.begin(), offenders.end(), [](const Offender& a, const Offender& b)
+        {
+            if ((a.Use != nullptr) != (b.Use != nullptr)) return a.Use != nullptr;
+            if (a.Use != nullptr)
+            {
+                if (a.Use->File != b.Use->File) return a.Use->File < b.Use->File;
+                if (a.Use->Line != b.Use->Line) return a.Use->Line < b.Use->Line;
+                if (a.Use->Column != b.Use->Column) return a.Use->Column < b.Use->Column;
+            }
+            // Overloads share a source name and use site; the mangled name keeps the order total.
+            if (a.Shown != b.Shown) return a.Shown < b.Shown;
+            return a.Mangled < b.Mangled;
+        });
+        for (const Offender& o : offenders)
+        {
+            if (o.Use != nullptr)
+            {
+                sourceFileName = o.Use->File;
+                SetSourceLocation(o.Use->Line, o.Use->Column);
+            }
+            if (o.Use != nullptr && !o.Use->InterfaceName.empty())
+                LogError(std::format(
+                    "cannot convert to interface '{}': method '{}' has an 'alias' result that can "
+                    "be its by-value parameter '{}', which an interface call cannot pass through "
+                    "the required caller-owned slot", o.Use->InterfaceName, o.Shown, o.Param));
+            LogError(std::format(
+                "cannot use '{}' as a function value: its 'alias' result can be its by-value "
+                "parameter '{}', which a function value cannot pass through the required "
+                "caller-owned slot. Call '{}' directly, or declare the parameter 'move' so the "
+                "result is owned.", o.Shown, o.Param, o.Shown));
+        }
     }
 
 bool LLVMBackend::VerifyModule()
@@ -1862,17 +1888,29 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
         out.FuncPtrReturnTypeName = retTV.TypeName;
         out.FuncPtrReturnPointer = retTV.Pointer;
 
-        // Split argList on top-level commas. Bail on nested fn-ptr arg or variadic.
-        if (argList.find("...") != std::string::npos) return false;
-
         auto trim = [](std::string v) {
             size_t a = 0; while (a < v.size() && std::isspace((unsigned char)v[a])) ++a;
             size_t b = v.size(); while (b > a && std::isspace((unsigned char)v[b-1])) --b;
             return v.substr(a, b - a);
         };
 
-        // Empty arg list or "void" -> zero params.
+        // A trailing `, ...` is the variadic tail (C requires at least one named parameter before
+        // it). Any other ellipsis is refused, as is a nested fn-ptr arg below.
         std::string normArgs = trim(argList);
+        const bool variadic = normArgs.ends_with("...");
+        if (variadic)
+        {
+            const size_t comma = normArgs.rfind(',');
+            if (comma == std::string::npos || trim(normArgs.substr(comma + 1)) != "...")
+                return false;
+            argList = normArgs.substr(0, comma);
+            normArgs = trim(argList);
+            if (normArgs.empty() || normArgs == "void") return false;   // `(void, ...)` is not C
+        }
+        out.FuncPtrVariadic = variadic;
+        if (argList.find("...") != std::string::npos) return false;
+
+        // Empty arg list or "void" -> zero params.
         if (normArgs.empty() || normArgs == "void")
             return true;
 
@@ -4155,7 +4193,9 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
                     r.name, pname);
                 return true;
             }
-            if (r.isCxx && ptv.Pointer && !ptv.IsFunctionPointer
+            // C `const T *` parameters keep their pointee const too: a const C object may
+            // be passed to them but never to a mutable pointer parameter (T183).
+            if (ptv.Pointer && !ptv.IsFunctionPointer
                 && CxxSpellingHasConstPointee(r.paramTypes[i]))
                 ptv.IsCxxPointeeConst = true;
             if (r.isCxx && CxxSpellingHasVolatileTarget(r.paramTypes[i]))
@@ -4898,11 +4938,6 @@ void LLVMBackend::RegisterCxxFunctionPointerAbis(
 bool LLVMBackend::MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEntry& e,
                                bool cxxBoundary)
 {
-        if (r.ctype.find('[') != std::string::npos)
-        {
-            if (verbose) std::cout << std::format("[verbose]   skipping global '{}': array type '{}' is not bindable\n", r.name, r.ctype);
-            return false;
-        }
         e = CGlobalEntry();
         e.name = cxxBoundary && !r.qualifiedName.empty() ? r.qualifiedName : r.name;
         e.qualifiedName = r.qualifiedName;
@@ -4917,19 +4952,60 @@ bool LLVMBackend::MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEnt
         e.isInternalLinkage = r.isInternalLinkage;
         e.constInitHash = r.constInitHash;
         e.isDllImport = r.isDllImport;
+        e.fromCxxHeader = cxxBoundary;
         e.line = r.line ? r.line : 1;
         e.col  = r.col < 0 ? 0 : r.col;
-        if (!MapCTypeToTypeAndValue(r.ctype, e.type, cxxBoundary))
+
+        std::vector<uint64_t> arrayDims;
+        const bool isArray = r.ctype.find('[') != std::string::npos;
+        const std::string mappedType = isArray ? StripFixedArrayDims(r.ctype, arrayDims) : r.ctype;
+        if (isArray && (mappedType.find('[') != std::string::npos || arrayDims.empty()
+                        || std::any_of(arrayDims.begin(), arrayDims.end(),
+                                       [](uint64_t dim) { return dim == 0; })))
         {
+            if (r.ctype.find("[]") != std::string::npos)
+                e.bindRefusal = std::format(
+                    "array type '{}' is incomplete and global '{}' cannot be bound",
+                    r.ctype, e.name);
+            else
+                e.bindRefusal = std::format(
+                    "array type '{}' has unsupported variable size and global '{}' cannot be bound",
+                    r.ctype, e.name);
+            return true;
+        }
+        if (!MapCTypeToTypeAndValue(mappedType, e.type, cxxBoundary))
+        {
+            if (isArray)
+            {
+                e.bindRefusal = std::format(
+                    "array type '{}' has an unsupported element type and global '{}' cannot be bound",
+                    r.ctype, e.name);
+                return true;
+            }
             if (verbose) std::cout << std::format("[verbose]   skipping global '{}': unsupported type '{}'\n", r.name, r.ctype);
             return false;
         }
+        if (isArray)
+        {
+            e.type.ConstArraySize = arrayDims.front();
+            if (arrayDims.size() > 1)
+                e.type.ConstInnerDimensions.assign(arrayDims.begin() + 1, arrayDims.end());
+            if (r.isConst)
+                e.type.IsCxxPointeeConst = true;
+        }
+        // A C `const int *` global: the pointer is writable, its pointee is read-only.
+        else if (!cxxBoundary && e.type.Pointer && !e.type.IsFunctionPointer
+                 && CxxSpellingHasConstPointee(r.ctype))
+            e.type.IsCxxPointeeConst = true;
         // A C++ `const int *` global keeps its spelled pointee const, so a ctor wrapper spells the
         // argument as clang sees it (`const int *&` binds only a const pointee).
         if (cxxBoundary && e.type.Pointer && !e.type.IsFunctionPointer
             && CxxSpellingHasConstPointee(r.ctype))
             e.type.IsSpelledPointeeConst = true;
         e.type.VariableName = r.name;
+        if (auto it = cxxBindingRefusals_.find(e.name);
+            it != cxxBindingRefusals_.end() && it->second.starts_with("global array '"))
+            cxxBindingRefusals_.erase(it);
         return true;
     }
 
@@ -5253,7 +5329,17 @@ void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& a
                     RegisterTypeAliasSymbol(a.name, target, a.file, a.line, a.col);
             }
             else
+            {
+                // A plain C function-pointer typedef (`typedef R (*F)(...)`) names a function type,
+                // bound like `using F = function<...>` so `F f = ...` resolves by name. Eager, C only.
+                TypeAndValue fnPtrTarget;
+                if (!cxxBoundary && a.target.find("(*)") != std::string::npos
+                    && !NativeTypeShadowsFunctionAlias(a.name)
+                    && MapCTypeToTypeAndValue(a.target, fnPtrTarget, false)
+                    && fnPtrTarget.IsFunctionPointer)
+                    RegisterFunctionTypeAlias(a.name, fnPtrTarget);
                 RegisterTypeAliasSymbol(a.name, a.target, a.file, a.line, a.col, a.isAnonymousRecord);
+            }
         }
     }
 
@@ -6517,6 +6603,10 @@ std::vector<std::string> LLVMBackend::BuildCxxRequestClangArgs(
             primaryDir, group.defines, /*errorRecovery*/ true, /*asCxx*/ true);
         const auto [cpu, features] = ProgramTargetCPUFeatures();
         if (!cpu.empty()) args.push_back("-mcpu=" + cpu);
+        // -g reaches the companion's header inline bodies (CodeView on Windows, as the C path).
+        // The args fold into the request and group keys, so -g and non-g never share an entry.
+        if (cDebugInfo_) args.push_back("-g");
+        if (cDebugInfo_ && targetWindows_) args.push_back("-gcodeview");
         size_t featureStart = 0;
         while (featureStart < features.size())
         {
@@ -13102,7 +13192,7 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 continue;
             }
             // An imported `const T*` (c_str()) keeps its const pointee, as in the template path.
-            if (arg.TypeAndValue.IsCxxPointeeConst && arg.TypeAndValue.Pointer
+            if (type.IsCxxPointeeConst && type.Pointer
                 && !arg.TypeAndValue.IsFunctionPointer && spelling.ends_with("*")
                 && !spelling.starts_with("const "))
             {
@@ -15956,6 +16046,24 @@ bool LLVMBackend::CxxConstructorNeedsClangResolution(
                     arg.TypeAndValue.TypeName = arg.LiteralIdentity;
             // Exact by width is still a conversion when C++ `long` (or `ulong`) meets another
             // integer type: LLP64 Windows makes long 32 bits, LP64 macOS makes long long 64 bits.
+            // Likewise short/unsigned short, int/unsigned int and an unscoped enum beside an
+            // integer: a C++ conversion of equal rank, which the narrowing sibling ties with.
+            auto sameWidthIdentityDiffers = [&](const NamedVariable& arg, size_t index) {
+                const TypeAndValue& want = selected->params[index];
+                if (!arg.TypeAndValue.IsScopedEnum && !ResolveEnumTypeName(arg.TypeAndValue.TypeName).empty())
+                    return ResolveEnumTypeName(want.TypeName).empty();
+                FunctionSymbol symbol;
+                symbol.IsCxx = true;
+                symbol.IsMethod = true;
+                symbol.UniqueName = selected->linkageName;
+                symbol.Parameters = selected->params;
+                // A literal's lowered width is not its C++ type (`5` is int even when it lowers as i8).
+                const std::string have = !arg.LiteralIdentity.empty() ? arg.LiteralIdentity
+                                                                       : IntegerArgumentIdentity(arg, true);
+                const std::string wanted = ResolveTypeAlias(CxxIntegerParameterIdentity(symbol, index, want));
+                return !have.empty() && !wanted.empty()
+                    && CanonicalPrimitiveTypeName(have) != CanonicalPrimitiveTypeName(wanted);
+            };
             bool selectedWidens = false;
             for (size_t i = 0; i < cxxArgs.size(); ++i)
             {
@@ -15966,7 +16074,8 @@ bool LLVMBackend::CxxConstructorNeedsClangResolution(
                     && (have == "long" || have == "ulong" || want.TypeName == "long"
                         || want.TypeName == "ulong");
                 selectedWidens |= conv == ScalarArgConversion::Widen
-                    || (conv == ScalarArgConversion::Exact && longMeetsOther);
+                    || (conv == ScalarArgConversion::Exact
+                        && (longMeetsOther || sameWidthIdentityDiffers(cxxArgs[i], i + 1)));
             }
             const CxxClassInfo* listed = selectedWidens ? GetCxxClassInfoWithConstructors(typeName)
                                                         : nullptr;
@@ -17703,6 +17812,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                             return fail(std::format("'{}' has no bindable C++ class type '{}'",
                                                     cxxSpelling, rg.ctype));
                         if (!MapRawGlobal(rg, g, /*cxxBoundary*/ true)) continue;
+                        if (!g.bindRefusal.empty()) return fail(g.bindRefusal);
                         CFileSigCacheEntry positive;
                         bool withDefinitions = false;
                         if (classConstant)
@@ -20101,6 +20211,27 @@ void LLVMBackend::RegisterCGlobals(const std::vector<CGlobalEntry>& globals, con
         for (const CGlobalEntry& e : globals)
         {
             if (e.name.empty()) continue;
+            if (!e.bindRefusal.empty())
+            {
+                if (!globalNamedVariable.count(e.name))
+                    cxxBindingRefusals_[e.name] = e.bindRefusal;
+                continue;
+            }
+            if (!globalNamedVariable.count(e.name) && e.type.ConstArraySize > 0 && !e.type.Pointer
+                && cxxNontrivialRecords_.count(e.type.TypeName) != 0)
+            {
+                std::string arrayType = e.type.TypeName;
+                arrayType += std::format("[{}]", e.type.ConstArraySize);
+                for (uint64_t dim : e.type.ConstInnerDimensions)
+                    arrayType += std::format("[{}]", dim);
+                cxxBindingRefusals_[e.name] = std::format(
+                    "array type '{}' has a non-trivial element type and global '{}' cannot be bound",
+                    arrayType, e.name);
+                continue;
+            }
+            if (auto it = cxxBindingRefusals_.find(e.name);
+                it != cxxBindingRefusals_.end() && it->second.starts_with("global array '"))
+                cxxBindingRefusals_.erase(it);
             // Each import group owns its C++ internal statics (V14), so a CFlat use of a name two
             // groups define as two objects has no single referent: it is refused as ambiguous.
             const bool folded = e.isCxxConstexpr && e.isCompileTimeConstant && e.linkageName.empty();
@@ -20141,6 +20272,7 @@ void LLVMBackend::RegisterCGlobals(const std::vector<CGlobalEntry>& globals, con
                 e.linkageName);
             if (e.isDllImport && global != nullptr && global->isDeclaration())
                 global->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
+            if (global != nullptr && !e.fromCxxHeader) cGlobalSymbols_.insert(global->getName().str());
             if (isConstant)
             {
                 SetConstGlobalInt(e.name, e.constantValue);
@@ -21898,15 +22030,26 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
             if (!r.isUnion && (!r.isCxx || (!targetWindows_ && !r.isPacked))
                 && (anyBitfields || zeroSizeBitfields))
                 cBitfieldOffsetLayout = InsertCBitfieldLayoutPadding(r, fields, packedBitfields);
-            // A C++ record's layout is clang's, not CFlat's: insert explicit padding wherever
-            // clang put a field further along than CFlat's natural packing would (over-aligned
-            // members, empty-member slots), so field offsets agree before the type is built.
-            if ((r.isCxx || r.isPacked) && !generated && !r.isUnion && !anyBitfields && !hasSemanticOnlyFields)
+            // Field offsets are clang's: pad wherever clang placed a field past natural packing
+            // (over-aligned members, empty-member slots); a naturally laid-out C record gets none.
+            if (!generated && !r.isUnion && !anyBitfields && !hasSemanticOnlyFields)
                 InsertCxxLayoutPadding(r, fields);
+            // A C record over-aligned past its members takes clang's alignment like an alignas C++
+            // record: user alignment sizes it, physical alignment sets its ABI alignment.
+            bool cOverAligned = false;
+            if (!r.isCxx && !r.isPacked && !anyBitfields && r.alignBytes > 1)
+            {
+                uint64_t cMaxFieldAlign = 1;
+                for (const auto& tv : fields)
+                    if (llvm::Type* ft = GetType(tv); ft != nullptr && ft->isSized())
+                        cMaxFieldAlign = std::max<uint64_t>(cMaxFieldAlign,
+                            module->getDataLayout().getABITypeAlign(ft).value());
+                cOverAligned = r.alignBytes > cMaxFieldAlign;
+            }
             if (r.isUnion)
             {
                 const bool cUnionClangAlign = !r.isCxx && (r.isPacked || anyBitfields);
-                CreateUnionType(r.name, fields, r.isCxx || cUnionClangAlign ? r.alignBytes : 0,
+                CreateUnionType(r.name, fields, r.isCxx || cUnionClangAlign || cOverAligned ? r.alignBytes : 0,
                                 anyBitfields ? &packedBitfields : nullptr, cUnionClangAlign);
                 if (hasPromotedFields)
                 {
@@ -21925,10 +22068,11 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
             else
             {
                 CreateStructType(r.name, fields,
-                    r.isCxx || r.isPacked || clangZeroSizeLayout || cBitfieldOffsetLayout ? r.alignBytes : 0,
+                    r.isCxx || r.isPacked || clangZeroSizeLayout || cBitfieldOffsetLayout || cOverAligned
+                        ? r.alignBytes : 0,
                     anyBitfields ? &packedBitfields : nullptr,
                     r.isPacked,
-                    cBitfieldOffsetLayout && !r.isPacked ? r.alignBytes : 0);
+                    (cBitfieldOffsetLayout && !r.isPacked) || cOverAligned ? r.alignBytes : 0);
                 if (zeroSizeBitfields)
                 {
                     auto it = dataStructures.find(r.name);
@@ -22008,7 +22152,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                     cxxAnonLayoutRefusals_[r.name] = std::move(mismatch);
                 }
             }
-            if (!r.isCxx && anyBitfields)
+            if (!r.isCxx && (anyBitfields || cOverAligned))
             {
                 if (std::string mismatch = VerifyImportedRecordLayout(r); !mismatch.empty())
                     LogErrorMessage("C struct '{}' has a layout disagreement: {}",
@@ -22417,20 +22561,73 @@ LLVMBackend::CxxSpelledParamRelation LLVMBackend::CxxSpelledClassPointerRelation
 }
 
 LLVMBackend::CxxPointeeConstRelation LLVMBackend::CxxCandidatePointeeConstRelation(
-    const FunctionSymbol& candidate, size_t index, const TypeAndValue& from,
+    const FunctionSymbol& candidate, size_t index, const NamedVariable& fromArgument,
     const TypeAndValue& to) const
 {
-        const auto relation = CxxRecordPointeeConstRelation(from, to);
+        // C++ fixed arrays decay at this boundary; retain their element const for the shared
+        // record/primitive pointer relation, including pointers to inner array dimensions.
+        TypeAndValue decayedFrom = fromArgument.TypeAndValue;
+        if (decayedFrom.TypeName.empty() && !fromArgument.InferSourceTypeName.empty())
+            decayedFrom.TypeName = fromArgument.InferSourceTypeName;
+        if (decayedFrom.ConstArraySize > 0 && !decayedFrom.Pointer
+            && !decayedFrom.ElemPointer && !decayedFrom.IsArrayView
+            && !decayedFrom.IsFunctionPointer && !decayedFrom.IsInterface)
+        {
+            decayedFrom.Pointer = true;
+            if (decayedFrom.PointerDepth == 0) decayedFrom.PointerDepth = 1;
+            decayedFrom.ConstArraySize = 0;
+        }
+        if (candidate.IsCxx && !(candidate.IsMethod && index == 0)
+            && decayedFrom.Pointer && !decayedFrom.ElemPointer
+            && !decayedFrom.ConstInnerDimensions.empty() && to.Pointer && to.ElemPointer)
+        {
+            const std::string spelling = CxxReferenceParameterSpelling(candidate, index);
+            std::string compactSpelling;
+            for (char c : spelling)
+                if (!std::isspace(static_cast<unsigned char>(c))) compactSpelling += c;
+            // `int (*)[3]` and a qualified row pointer `int (*const)[3]`: qualifiers after the `*` are
+            // the pointer's own, not the pointee's.
+            bool rowPointer = false;
+            for (size_t at = compactSpelling.find("(*"); at != std::string::npos && !rowPointer;
+                 at = compactSpelling.find("(*", at + 1))
+            {
+                size_t pos = at + 2;
+                for (bool skipped = true; skipped;)
+                {
+                    skipped = false;
+                    for (const char* q : {"const", "volatile", "__restrict__", "__restrict", "restrict"})
+                        if (compactSpelling.compare(pos, std::strlen(q), q) == 0)
+                        {
+                            pos += std::strlen(q);
+                            skipped = true;
+                            break;
+                        }
+                }
+                rowPointer = compactSpelling.compare(pos, 2, ")[") == 0;
+            }
+            if (rowPointer)
+            {
+                const size_t open = spelling.find('(');
+                const std::string pointeeSpelling = spelling.substr(0, open) + " *";
+                const bool targetConst = CxxSpellingHasConstPointee(pointeeSpelling);
+                if (decayedFrom.IsCxxPointeeConst == targetConst)
+                    return CxxPointeeConstRelation::Same;
+                return decayedFrom.IsCxxPointeeConst
+                    ? CxxPointeeConstRelation::Drops : CxxPointeeConstRelation::Adds;
+            }
+        }
+        const auto relation = CxxRecordPointeeConstRelation(decayedFrom, to);
         if (relation != CxxPointeeConstRelation::Unrelated || !candidate.IsCxx
             || (candidate.IsMethod && index == 0))
             return relation;
         if (!to.Pointer || to.TypeName != "void" || to.ElemPointer || to.IsAlias || to.IsRvalueRef
-            || to.IsFunctionPointer || to.PointerDepth > 1 || !from.Pointer || from.ElemPointer
-            || from.IsFunctionPointer || from.PointerDepth > 1 || !IsCxxRecord(from.TypeName))
+            || to.IsFunctionPointer || to.PointerDepth > 1 || !decayedFrom.Pointer
+            || decayedFrom.ElemPointer || decayedFrom.IsFunctionPointer
+            || decayedFrom.PointerDepth > 1 || !IsCxxRecord(decayedFrom.TypeName))
             return relation;
         std::string base;
         bool bySpelling = false;
-        if (CxxVoidParamClassRelation(candidate, index, to, from, base, bySpelling)
+        if (CxxVoidParamClassRelation(candidate, index, to, decayedFrom, base, bySpelling)
             == CxxSpelledParamRelation::Unrelated)
             return relation;
         // The pointee const is whatever the spelling puts before its single `*`.
@@ -22443,9 +22640,9 @@ LLVMBackend::CxxPointeeConstRelation LLVMBackend::CxxCandidatePointeeConstRelati
             const std::string referent = " " + spelling.substr(0, star) + " ";
             toConst = referent.find(" const ") != std::string::npos;
         }
-        if (from.IsCxxPointeeConst == toConst) return CxxPointeeConstRelation::Same;
-        return from.IsCxxPointeeConst ? CxxPointeeConstRelation::Drops
-                                      : CxxPointeeConstRelation::Adds;
+        if (decayedFrom.IsCxxPointeeConst == toConst) return CxxPointeeConstRelation::Same;
+        return decayedFrom.IsCxxPointeeConst ? CxxPointeeConstRelation::Drops
+                                             : CxxPointeeConstRelation::Adds;
 }
 
 /*
@@ -26525,14 +26722,14 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             realPaths, cIncludeDirs_, cDefines_, extraDefines,
             targetWindows_, CInteropTargetTriple(), cppMode, cxxDefinitionsEmitted,
             cppStandard_, ProgramTargetCPUFeatures().first,
-            ProgramTargetCPUFeatures().second);
+            ProgramTargetCPUFeatures().second, cDebugInfo_);
         // The demand companion keys on the entry a compile stores, which an LSP reads too.
         const uint64_t demandEntryKey = cppMode && !cxxDefinitionsEmitted
             ? CHeaderDiskCacheKey(realPaths, cIncludeDirs_, cDefines_, extraDefines,
                                   targetWindows_, CInteropTargetTriple(), cppMode,
                                   /*cxxDefinitionsEmitted*/ true, cppStandard_,
                                   ProgramTargetCPUFeatures().first,
-                                  ProgramTargetCPUFeatures().second)
+                                  ProgramTargetCPUFeatures().second, cDebugInfo_)
             : refusalGroupKey;
 
         std::vector<CSigEntry> hitSigs;
@@ -26712,7 +26909,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                                   targetWindows_, CInteropTargetTriple(), cppMode,
                                   /*cxxDefinitionsEmitted*/ true, cppStandard_,
                                   ProgramTargetCPUFeatures().first,
-                                  ProgramTargetCPUFeatures().second)
+                                  ProgramTargetCPUFeatures().second, cDebugInfo_)
             : diskKey;
         if (!mtEc && !cHeaderCacheDir.empty())
         {
@@ -27155,6 +27352,10 @@ bool LLVMBackend::LinkCInlineDemandBodies()
             const std::string dir = std::filesystem::path(header).parent_path().string();
             const std::vector<std::string>& extraDefines = functions.front().defines;
             std::vector<std::string> args = BuildClangDriverArgs(dir, extraDefines, true, false);
+            // -g reaches the bodies too (CodeView on Windows, like CFlat's own); the args fold into
+            // the key below, so a -g body and a non-g body never share a c-inline entry.
+            if (cDebugInfo_) args.push_back("-g");
+            if (cDebugInfo_ && targetWindows_) args.push_back("-gcodeview");
             uint64_t keyHash = 14695981039346656037ULL;
             auto fold = [&keyHash](std::string_view value) {
                 for (unsigned char c : value) { keyHash ^= c; keyHash *= 1099511628211ULL; }
@@ -29858,13 +30059,13 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
         // A copy-initialized slot is the by-value parameter shape of the call-argument position.
         // When the source has an implicit conversion operator, let clang resolve the whole
         // copy-initialization sequence before the listed constructor fast path can choose one.
-        const TypeAndValue conversionSourceType = InferImplicitCxxArgumentType(source, *this);
-        if (!source.TypeAndValue.Pointer && IsCxxRecord(conversionSourceType.TypeName)
-            && HasImplicitClassConversionOperator(conversionSourceType.TypeName)
-            && conversionSourceType.TypeName != targetType && IsCxxRecord(targetType))
+        const TypeAndValue argType = InferImplicitCxxArgumentType(source, *this);
+        if (!source.TypeAndValue.Pointer && IsCxxRecord(argType.TypeName)
+            && HasImplicitClassConversionOperator(argType.TypeName)
+            && argType.TypeName != targetType && IsCxxRecord(targetType))
         {
             NamedVariable probe = source;
-            probe.TypeAndValue = conversionSourceType;
+            probe.TypeAndValue = argType;
             probe.TypeAndValue.VariableName.clear();
             std::string wrapperName;
             std::string wrapperError;
@@ -29878,6 +30079,36 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
             {
                 refusal = wrapperError;
                 return CxxConvertingCtorResult::Refused;
+            }
+        }
+
+        // A constructor template may be constrained or explicit(bool). Let clang perform
+        // copy-initialization before the extracted constructor table can choose a fast path.
+        if (!source.TypeAndValue.Pointer && IsCxxRecord(argType.TypeName)
+            && argType.TypeName != targetType && IsCxxRecord(targetType))
+        {
+            if (const auto* info = GetCxxClassInfo(targetType);
+                info != nullptr && info->hasCtorTemplate)
+            {
+                llvm::Type* objectType = GetType(TypeAndValue{ .TypeName = targetType });
+                if (objectType == nullptr || !objectType->isSized())
+                    return CxxConvertingCtorResult::NotApplicable;
+                NamedVariable probe = source;
+                probe.TypeAndValue = argType;
+                probe.TypeAndValue.VariableName.clear();
+                std::string wrapperName;
+                std::string wrapperError;
+                if (RequestCxxVariadicConstructor(targetType, { probe }, wrapperName, wrapperError,
+                                                  /*copyInit*/ true))
+                {
+                    ConstructThroughCxxCtorWrapper(source, probe, targetType, wrapperName, intoSlot);
+                    return CxxConvertingCtorResult::Converted;
+                }
+                if (!wrapperError.empty())
+                {
+                    refusal = wrapperError;
+                    return CxxConvertingCtorResult::Refused;
+                }
             }
         }
 
@@ -29903,36 +30134,8 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
         // Two converting constructors of equal rank (plan point 5): name the ambiguity.
         if (source.TypeAndValue.Pointer || !IsForeignCxxClassWithConstructors(targetType))
             return CxxConvertingCtorResult::NotApplicable;
-        TypeAndValue argType = InferImplicitCxxArgumentType(source, *this);
         if (argType.TypeName.empty() || argType.TypeName == targetType)
             return CxxConvertingCtorResult::NotApplicable;
-        /*
-         * A C++ class source into a class with constructor TEMPLATES (Eigen's
-         * `Matrix(const EigenBase<D>&)` fed a `CwiseBinaryOp`), or from a source whose
-         * conversion operator yields a class (libc++ `__val_expr::operator valarray<T>()`): the
-         * call-argument classifier leaves that to the C++-side call path, but a copy-initialized
-         * slot has none. Let clang copy-initialize through the generated wrapper; an explicit
-         * constructor or conversion operator never converts.
-         */
-        if (const auto* info = GetCxxClassInfo(targetType);
-            info != nullptr && IsCxxRecord(argType.TypeName)
-            && (info->hasCtorTemplate || HasImplicitClassConversionOperator(argType.TypeName)))
-        {
-            llvm::Type* objectType = GetType(TypeAndValue{ .TypeName = targetType });
-            if (objectType == nullptr || !objectType->isSized())
-                return CxxConvertingCtorResult::NotApplicable;
-            NamedVariable probe = source;
-            probe.TypeAndValue = argType;
-            probe.TypeAndValue.VariableName.clear();
-            std::string wrapperName;
-            std::string wrapperError;
-            if (RequestCxxVariadicConstructor(targetType, { probe }, wrapperName, wrapperError,
-                                              /*copyInit*/ true))
-            {
-                ConstructThroughCxxCtorWrapper(source, probe, targetType, wrapperName, intoSlot);
-                return CxxConvertingCtorResult::Converted;
-            }
-        }
         std::string why;
         TryBindRefusedCxxMember(targetType, "__ctor", 1);
         if (SelectCxxConstructor(targetType, { argType }, why, /*allowNumericConversions*/ true,

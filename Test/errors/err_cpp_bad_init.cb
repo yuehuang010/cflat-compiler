@@ -20,5 +20,16 @@ extern int main()
         cppi_expr.ExplicitVec3 assignExplicit = cppi_expr.ExplicitVec3(exprA + exprA);
         assignExplicit = exprA + exprA;
     }
+    // Constructing a polymorphic class template instantiates every virtual body (the vtable uses them);
+    // an invalid one is a compile-time error at the construction site, never a link failure.
+    expect_error("clang: failed to instantiate 't172::InvalidVirtual<int>::bad'") {
+        t172.InvalidVirtual<int> invalidVirtual = default;
+    }
+    expect_error("clang: failed to instantiate 't172::InvalidVirtual<int>::bad'") {
+        t172.InvalidVirtualDerived<int> invalidDerived = default;
+    }
+    expect_error("clang: failed to instantiate 't172::InvalidDtorBase<int>::~InvalidDtorBase'") {
+        t172.DtorDerived<int> dtorDerived = default;
+    }
     return 0;
 }

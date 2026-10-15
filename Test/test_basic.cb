@@ -1606,9 +1606,52 @@ namespace nsx { extern int LaterNs(int x); }
 using Math = MathUtils;          // global alias for top-level namespace
 using MathAdv = MathUtils.Advanced;  // global alias for nested namespace
 
+// A namespace variable spelled like a global function (and like a global variable): a bare name
+// inside the namespace is the namespace variable. PRE-FIX: "module verification failed" or the
+// global function / global value was read instead.
+int t187Shadow(int a) { return a + 100; }
+int t187Var = 3;
+namespace T187Ns
+{
+    int t187Shadow = 8;
+    int readVar() { return t187Shadow; }
+    int tern(int k) { return k ? t187Shadow : 4; }
+    void setVar() { t187Shadow = 9; }
+    int readAfterSet() { setVar(); return t187Shadow; }
+    int t187Var = 8;
+    int readGlobalSpelling() { return t187Var; }
+}
+namespace T187Outer
+{
+    int t187Outer(int a) { return a + 100; }
+    namespace Inner { int t187Outer = 5; int run() { return t187Outer; } }
+}
+namespace T187Outer2
+{
+    int t187Outer2 = 5;
+    namespace Inner { int run() { return t187Outer2; } }
+}
+int t187Outer2(int a) { return a + 100; }
+struct T187Field
+{
+    int t187Shadow = default;
+    int get() { return t187Shadow; }
+};
+
 bool testNamespace()
 {
     bool result = true;
+    // T187: bare namespace variable beats the same-named global function and global variable.
+    result &= Test("ns_var_over_global_fn", T187Ns.readVar(), 8);
+    result &= Test("ns_var_over_global_fn_ternary", T187Ns.tern(1) * 10 + T187Ns.tern(0), 84);
+    result &= Test("ns_var_write_over_global_fn", T187Ns.readAfterSet(), 9);
+    result &= Test("ns_var_over_global_var", T187Ns.readGlobalSpelling(), 8);
+    result &= Test("ns_inner_var_over_outer_fn", T187Outer.Inner.run(), 5);
+    result &= Test("ns_outer_var_over_global_fn", T187Outer2.Inner.run(), 5);
+    // Control: a struct field spelled like a global function already wins through 'this'.
+    T187Field t187f = default;
+    t187f.t187Shadow = 7;
+    result &= Test("field_over_global_fn", t187f.get(), 7);
     result &= Test("namespace_add", MathUtils.add(3, 4), 7);            // 3+4=7
     result &= Test("namespace_multiply", MathUtils.multiply(3, 4), 12); // 3*4=12
     result &= Test("global_add", add(3, 4), 107);                       // 3+4+100=107
@@ -2783,6 +2826,11 @@ const int IF_CONST_NEG = -5;
 const u32 IF_CONST_BIG = 0xFFFFFFFF;
 const int IF_CONST_NEG8 = -8;
 enum IfConstFlags : int { IFC_OFF = 0, IFC_ON = 1 };
+const int T166_GROUPED_GLOBAL_INIT = (1 && 1) ? 2 : 3;
+enum IfConstGroupedInit : int { IFC_GROUPED_INIT = ((1 && 1) ? 2 : 3) };
+
+int T166Overload(bool value) { return value ? 1 : 0; }
+int T166Overload(int value) { return value + 2; }
 
 bool testIfConst()
 {
@@ -2883,6 +2931,84 @@ bool testIfConst()
     {
         result &= Test("if_const_short_circuit_and", 0, 1);  // should not execute
     }
+
+    // Grouped short-circuit operators fold before any branch IR is emitted.
+    if const ((true && true) == true)
+    {
+        result &= Test("if_const_grouped_and", 11, 11);
+        result &= Test("if_const_grouped_and_overload", T166Overload((true && true) == true), 1);
+    }
+    else
+    {
+        result &= Test("if_const_grouped_and", 22, 11);
+    }
+
+    if const ((false || true) == true)
+    {
+        result &= Test("if_const_grouped_or", 11, 11);
+        result &= Test("if_const_grouped_or_overload", T166Overload((false || true) == true), 1);
+    }
+    else
+    {
+        result &= Test("if_const_grouped_or", 22, 11);
+    }
+
+    if const (((true && false) || true) == true)
+    {
+        result &= Test("if_const_nested_groups", 11, 11);
+        result &= Test("if_const_nested_groups_overload",
+                       T166Overload(((true && false) || true) == true), 1);
+    }
+    else
+    {
+        result &= Test("if_const_nested_groups", 22, 11);
+    }
+
+    if const (((IF_CONST_SEVEN == 7) && (IfConstFlags.IFC_ON == 1)))
+    {
+        result &= Test("if_const_grouped_global_enum", 11, 11);
+        result &= Test("if_const_grouped_global_enum_overload",
+                       T166Overload(((IF_CONST_SEVEN == 7) && (IfConstFlags.IFC_ON == 1))), 1);
+    }
+    else
+    {
+        result &= Test("if_const_grouped_global_enum", 22, 11);
+    }
+
+    if const (((__WINDOWS__ || __MACOS__) || __LINUX__))
+    {
+        result &= Test("if_const_grouped_platform_flags", 11, 11);
+        result &= Test("if_const_grouped_platform_overload",
+                       T166Overload(((__WINDOWS__ || __MACOS__) || __LINUX__)), 1);
+    }
+    else
+    {
+        result &= Test("if_const_grouped_platform_flags", 22, 11);
+    }
+
+    int groupedUntakenAssignment = 1;
+    int groupedTernaryValue = 0;
+    if const ((true ? 1 : (groupedUntakenAssignment = 2)) == 1)
+    {
+        groupedTernaryValue = 11;
+    }
+    else
+    {
+        groupedTernaryValue = 22;
+    }
+    result &= Test("if_const_grouped_untaken_assignment", groupedTernaryValue, 11);
+    result &= Test("if_const_grouped_assignment_not_run", groupedUntakenAssignment, 1);
+
+    result &= Test("if_const_grouped_enum_initializer", IfConstGroupedInit.IFC_GROUPED_INIT, 2);
+    result &= Test("if_const_grouped_global_initializer", T166_GROUPED_GLOBAL_INIT, 2);
+
+    int groupedSwitchResult = 0;
+    switch (1)
+    {
+        case ((1 && 1) ? 1 : 2): groupedSwitchResult = 11; break;
+        default: groupedSwitchResult = 22; break;
+    }
+    result &= Test("if_const_grouped_switch_case", groupedSwitchResult, 11);
 
     // Test 11: signed comparison of a NEGATIVE const (-5 < 5) - enters true branch.
     // Guards against zero-extending the sign away and reversing the ordered compare.

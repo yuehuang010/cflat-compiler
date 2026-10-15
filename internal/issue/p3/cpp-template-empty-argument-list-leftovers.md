@@ -24,3 +24,5 @@ every `<>` was refused.
 
 Also seen (not N63): a CFlat alias of a C++ template `using G = dz.Gate; G g = G(1)` -> "the function 'G'
 is not known", bare and explicit.
+
+- 2026-10-14 (T162 review, PRE-EXISTING): after `rq.D<> x = rq.D<int>(8)`, passing `x` to `dv(D<int>)` fails "no overload matches"; clang accepts. Repro scratch/repro_keep/t162/.

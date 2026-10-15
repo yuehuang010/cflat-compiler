@@ -2831,3 +2831,171 @@ struct M { int value; };
 inline int operator-(M& v) { ++v.value; return v.value; }
 inline const M& crefM(M& v) { return v; }
 }
+
+// T150: unary member/free ranking. Each value leg below is a clang++ -std=c++20 oracle result (2).
+namespace t150 {
+// `const&&` member on a const lvalue is unviable; the by-value free overload runs.
+struct RvalueOnlyMember { int operator-() const&& { return 1; } };
+inline int operator-(RvalueOnlyMember) { return 2; }
+inline const RvalueOnlyMember& rvalueOnlyRef(RvalueOnlyMember& v) { return v; }
+// `&` member on a prvalue is unviable; the by-value free overload runs.
+struct LvalueOnlyMember { int operator-() & { return 1; } };
+inline int operator-(LvalueOnlyMember) { return 2; }
+inline LvalueOnlyMember lvalueOnlyMake() { return LvalueOnlyMember{}; }
+// `const volatile` member against a `const&` free on a const lvalue: the less-qualified free wins.
+struct CvMemberPick { int operator-() const volatile { return 1; } };
+inline int operator-(const CvMemberPick&) { return 2; }
+inline const CvMemberPick& cvMemberRef(CvMemberPick& v) { return v; }
+// A `const` member against an `S&&` free on a prvalue: the rvalue-reference free wins.
+struct PrvConstMember { int operator-() const { return 1; } };
+inline int operator-(PrvConstMember&&) { return 2; }
+inline PrvConstMember prvConstMake() { return PrvConstMember{}; }
+// Refusals (clang: ambiguous): a member and a by-value free tie on an lvalue operand.
+struct TieConstMember { int operator-() const { return 1; } };
+inline int operator-(TieConstMember) { return 2; }
+struct TieMutableMember { int operator-() { return 1; } };
+inline int operator-(TieMutableMember) { return 2; }
+// Binary `%` with a non-const `T&` free: a const call result cannot bind it (clang: no match).
+struct RefOperand { int v; };
+inline int operator%(RefOperand&, int) { return 1; }
+inline const RefOperand& refOperandRef(RefOperand& v) { return v; }
+// A non-const member on a const prvalue is not viable; the by-value free decides (clang: 22).
+struct ConstValueS { int operator-() { return 11; } };
+inline int operator-(ConstValueS) { return 22; }
+inline const ConstValueS constValueMake() { return ConstValueS{}; }
+// The same with a `const S&` free (clang: 22).
+struct ConstRefS { int operator-() { return 11; } };
+inline int operator-(const ConstRefS&) { return 22; }
+inline const ConstRefS constRefMake() { return ConstRefS{}; }
+// A `const &` member binds a prvalue: with a by-value free it is ambiguous (clang rejects).
+struct ConstLRefMember { int operator-() const & { return 11; } };
+inline int operator-(ConstLRefMember) { return 22; }
+inline ConstLRefMember constLRefMake() { return ConstLRefMember{}; }
+// A non-const member alone on a const prvalue is no operator (clang rejects).
+struct MemberOnlyS { int operator-() { return 11; } };
+inline const MemberOnlyS memberOnlyMake() { return MemberOnlyS{}; }
+// An inherited `const S B::get()` result stays const: the by-value free decides (clang: 22).
+struct InhRetS { int operator-() { return 11; } };
+inline int operator-(InhRetS) { return 22; }
+struct InhRetBase { const InhRetS get() { return InhRetS{}; } };
+struct InhRetHolder : InhRetBase {};
+// An inherited member binds through derived-to-base: the exact by-value free wins (clang: 22).
+struct InhUnaryBase { int operator-() { return 11; } };
+struct InhUnaryS : InhUnaryBase {};
+inline int operator-(InhUnaryS) { return 22; }
+// A non-volatile `const` member cannot bind a volatile operand: the free decides (clang: 22).
+struct VolPrS { int operator-() const { return 11; } };
+inline int operator-(VolPrS) { return 22; }
+inline volatile VolPrS volPrMake() { return VolPrS{}; }
+struct VolRefS { int operator-() const { return 11; } };
+inline int operator-(const volatile VolRefS&) { return 22; }
+inline const volatile VolRefS& volRef(VolRefS& v) { return v; }
+// A template constructor copies a volatile lvalue, so the by-value free stays viable (clang: 22).
+struct VolTemplateCopyS { VolTemplateCopyS() = default; template<class T> VolTemplateCopyS(T&) {}
+    int operator-() const { return 11; } };
+inline int operator-(VolTemplateCopyS) { return 22; }
+inline volatile VolTemplateCopyS& volTemplateCopyRef(VolTemplateCopyS& v) { return v; }
+}
+
+namespace t172
+{
+    template<class T> struct InvalidVirtual
+    {
+        virtual ~InvalidVirtual() {}
+        virtual int bad() { return T::nope; }
+        int good() { return 41; }
+    };
+
+    template<class T> struct InvalidVirtualDerived : InvalidVirtual<T>
+    {
+        int goodDerived() { return 42; }
+    };
+
+    template<class T> struct InvalidNonvirtual
+    {
+        virtual ~InvalidNonvirtual() {}
+        virtual int goodVirtual() { return 43; }
+        int badNonvirtual() { return T::nope; }
+        int good() { return 44; }
+    };
+
+    template<class T> struct InvalidDtorBase
+    {
+        virtual ~InvalidDtorBase() { T::nope; }
+        virtual int value() { return 46; }
+    };
+
+    template<class T> struct DtorDerived : InvalidDtorBase<T>
+    {
+        ~DtorDerived() override {}
+        int value() override { return 47; }
+    };
+
+    template<class T> struct PolyValue
+    {
+        T value;
+        virtual ~PolyValue() = default;
+        virtual T get() const { return value; }
+        virtual T twice() const { return (T)(value + value); }
+    };
+
+    template<class T> struct Pure
+    {
+        virtual ~Pure() = default;
+        virtual int get() const = 0;
+    };
+
+    template<class T> struct PureImpl : Pure<T>
+    {
+        int get() const override { return (int)sizeof(T) + 42; }
+    };
+}
+
+namespace t168KArrayOverloads
+{
+    inline int select(int* values) { return 1000 + values[1]; }
+    inline int select(const int* values) { return 2000 + values[1]; }
+}
+inline int t168KArrayAt(int* values, int index) { return values[index]; }
+inline int t168KArrayToVoid(void* values) { return values != nullptr ? 1 : 0; }
+
+struct T168KRecord { int a[2]; char c; };
+constexpr T168KRecord t168KConstRecords[2] = {{{1, 2}, 'x'}, {{3, 4}, 'y'}};
+inline T168KRecord t168KMutableRecords[2] = {{{5, 6}, 'm'}, {{7, 8}, 'n'}};
+inline int t168KRecordConstFirst(const T168KRecord* records) { return records[1].a[0]; }
+inline int t168KRecordMutableFirst(T168KRecord* records) { return records[1].a[0]; }
+
+constexpr int t168KConstMatrix[2][3] = {{1, 2, 3}, {4, 5, 6}};
+inline int t168KConstRowFirst(const int (*rows)[3]) { return rows[1][0]; }
+inline int t168KMutableRowFirst(int (*rows)[3]) { return rows[1][0]; }
+inline int t168KConstQualRowFirst(int (*const rows)[3]) { return rows[1][0]; }
+
+inline int t168KInlineArray[3] = {101, 102, 103};
+constexpr int t168KConstexprArray[3] = {201, 202, 203};
+static const int t168KStaticArray[3] = {301, 302, 303};
+const int t168KNamespaceConstArray[3] = {401, 402, 403};
+inline float t168KFloatArray[2] = {1.25f, 2.5f};
+inline int t168KMatrix[2][3] = {{501, 502, 503}, {511, 512, 513}};
+
+struct T168KPair { int x; int y; };
+inline T168KPair t168KPairs[2] = {{601, 602}, {611, 612}};
+inline int t168KPairSum(const T168KPair* values) { return values[1].x + values[1].y; }
+inline float t168KFloatSecond(const float* values) { return values[1]; }
+
+enum T168KEnum { t168KEnumA = 1, t168KEnumB = 2 };
+inline T168KEnum t168KEnumArray[2] = {t168KEnumA, t168KEnumB};
+enum T168KIndex { t168KIndex0 = 0, t168KIndex1 = 1 };
+inline int t168KEnumIndexed[2] = {71, 72};
+inline const char* t168KStringArray[2] = {"ab", "cd"};
+
+extern int t168KIncompleteArray[];
+struct T168KNonTrivial { int value; T168KNonTrivial(); ~T168KNonTrivial(); };
+extern T168KNonTrivial t168KNonTrivialArray[1];
+
+namespace t168KArrayNs
+{
+    inline int inlineValues[3] = {111, 112, 113};
+    constexpr int constexprValues[3] = {211, 212, 213};
+    static const int staticValues[3] = {311, 312, 313};
+    const int namespaceValues[3] = {411, 412, 413};
+}

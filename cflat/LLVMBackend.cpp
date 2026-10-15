@@ -4756,6 +4756,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxForeignNamespaces_.clear();
     cxxNestedNamespaceNames_.clear();
     cxxConstGlobalSymbols_.clear();
+    cGlobalSymbols_.clear();
     cxxUsingDirectives_.clear();
     cxxForeignTypeSpellings_.clear();
     cxxFunctionPointerAbiPlans_.clear();
@@ -5073,6 +5074,8 @@ void LLVMBackend::ResetForReanalysis()
     // resolution, and a stale value misbinds templates in the NEXT file of a batched --check.
     currentNamespace_.clear();
     lastCallReturnType = TypeAndValue{};
+    lastCallReturnValueCv_ = 0;
+    cxxFilteredOperatorCandidates_.clear();
     lastCallReturnsOwned = false;
     lastOwningResult = false;
     lastMovedFromContainerSlot = false;
@@ -6936,6 +6939,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
         if (s.FuncPtrReturnPointer) o["fprp"] = true;
         if (s.FuncPtrReturnOwned) o["fpro"] = true;
         if (s.FuncPtrReturnAlias) o["fpra"] = true;
+        if (s.FuncPtrVariadic) o["fpv"] = true;
         if (s.FuncPtrReturnPointerDepth > 1)
             o["fprd"] = static_cast<int64_t>(s.FuncPtrReturnPointerDepth);
         if (!s.FuncPtrReturnResolvedKey.empty()) o["fprk"] = s.FuncPtrReturnResolvedKey;
@@ -7025,6 +7029,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
         if (auto v = o.getBoolean("fprp")) s.FuncPtrReturnPointer = *v;
         if (auto v = o.getBoolean("fpro")) s.FuncPtrReturnOwned = *v;
         if (auto v = o.getBoolean("fpra")) s.FuncPtrReturnAlias = *v;
+        if (auto v = o.getBoolean("fpv")) s.FuncPtrVariadic = *v;
         if (s.FuncPtrReturnPointer) s.FuncPtrReturnPointerDepth = 1;
         if (auto v = o.getInteger("fprd")) s.FuncPtrReturnPointerDepth = static_cast<int>(*v);
         if (auto v = o.getString("fprk")) s.FuncPtrReturnResolvedKey = v->str();

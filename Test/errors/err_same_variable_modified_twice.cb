@@ -1,0 +1,180 @@
+// A variable modified more than once inside one call argument list or one brace initializer
+// list has an unspecified order of modifications (ruling 2026-10-13): refused at each position.
+import cpp "cpp_interop_basic.h";
+import cpp "cpp_t67_postinc.hpp";
+import cpp "cpp_interop_assign.h";
+
+struct SvFx { int f; int g; };
+struct SvXy { int x; int y; };
+struct SvBump { int x; int y; void operator++() { x = x + 1; } };
+struct SvAcc { int t; int add(int a, int b) { return a * 100 + b; } };
+int svTwo(int a, int b) { return a * 100 + b; }
+int svIdent(int x) { return x; }
+expect_error("'this->x' is modified more than once in one argument list") {
+    struct SvThis { int x; int f() { return svTwo(x++, this->x++); } };
+}
+int svGlobal = 0;
+struct SvPtrHolder { SvFx* p; };
+SvFx svGs = default;
+SvFx* svGp = &svGs;
+struct SvFloatPair { float a; float b; };
+int svOne(int x) { return x + 1; }
+float svFloatCall(float a, float b) { return a + b; }
+
+extern int main()
+{
+    int y = 0;
+    int[4] a = {0, 1, 2, 3};
+    int i = 0;
+    SvXy s = {x = 1, y = 2};
+    SvXy* p = &s;
+    SvBump sb = default;
+    SvAcc acc = default;
+
+    // Argument lists: CFlat call, nested call, a single argument, named arguments.
+    expect_error("'y' is modified more than once in one argument list") {
+        svTwo(y++, y++);
+    }
+    expect_error("'y' is modified more than once in one argument list") {
+        svTwo(svIdent(y++), y++);
+    }
+    expect_error("'y' is modified more than once in one argument list") {
+        svTwo(y++ + y++, 0);
+    }
+    expect_error("'i' is modified more than once in one argument list") {
+        svTwo(a[i++], a[i++]);
+    }
+    expect_error("'s.x' is modified more than once in one argument list") {
+        svTwo(s.x++, s.x++);
+    }
+    expect_error("'p->x' is modified more than once in one argument list") {
+        svTwo(p->x++, p->x++);
+    }
+    expect_error("'sb.x' and 'sb' overlap and are both modified in one argument list") {
+        svTwo(sb.x++, sb++);
+    }
+    expect_error("'y' is modified more than once in one argument list") {
+        svTwo(a: y++, b: y++);
+    }
+    expect_error("'y' is modified more than once in one argument list") {
+        acc.add(y++, y++);
+    }
+    expect_error("'svGlobal' is modified more than once in one argument list") {
+        svTwo(svGlobal++, svGlobal--);
+    }
+    // C++ callees follow the same rule (free function and overloaded free function).
+    expect_error("'y' is modified more than once in one argument list") {
+        cppi.counter_add(y++, y++);
+    }
+    expect_error("'y' is modified more than once in one argument list") {
+        cppi.add(y++, y++);
+    }
+
+    // Brace initializer lists: named fields, positional, nested rows, compound assignment,
+    // and a modification nested inside a call argument counts for the enclosing list.
+    expect_error("'y' is modified more than once in one brace initializer list") {
+        SvFx z = {f = y++, g = y++};
+    }
+    expect_error("'y' is modified more than once in one brace initializer list") {
+        int[2] arr = {y++, y++};
+    }
+    expect_error("'y' is modified more than once in one brace initializer list") {
+        SvFx[2] fr = {{f = y++, g = 0}, {f = y++, g = 1}};
+    }
+    expect_error("'y' is modified more than once in one brace initializer list") {
+        int[2] arr = {svTwo(y++, 0), y++};
+    }
+    expect_error("'y' is modified more than once in one brace initializer list") {
+        int[2] arr = {y += 1, y += 2};
+    }
+    // Shapes rewritten in the existing legs (test_operators float/double rounding, test_cpp_interop
+    // C++ brace lists): the old single-variable spelling stays refused.
+    expect_error("'fl' is modified more than once in one brace initializer list") {
+        float fl = 16777216.0f;
+        SvFloatPair fp = {a = fl++, b = fl++};
+    }
+    expect_error("'fl' is modified more than once in one brace initializer list") {
+        float fl = 16777216.0f;
+        SvFloatPair fp = {a = fl++, b = fl--};
+    }
+    expect_error("'fl' is modified more than once in one argument list") {
+        float fl = 16777216.0f;
+        svFloatCall(fl++, fl--);
+    }
+    expect_error("'y' is modified more than once in one brace initializer list") {
+        cpp_t67.Pair t67Pair{y++, y++};
+    }
+    expect_error("'y' is modified more than once in one brace initializer list") {
+        cpp_t67.Pair t67Pair = {y++, y++};
+    }
+    expect_error("'y' is modified more than once in one brace initializer list") {
+        cpp_t67.List t67List{y++, y++};
+    }
+    expect_error("'y' is modified more than once in one brace initializer list") { // brace in an argument
+        cpp_t67.take({y++, y++});
+    }
+    expect_error("'a' is modified more than once in one brace initializer list") {
+        cppas.Tally a = default;
+        cppas.Tally[2] cells = { (a = 2), (a = 3) };
+    }
+    expect_error("'va' is modified more than once in one brace initializer list") {
+        cppas.TallyByValue va = default;
+        cppas.TallyByValue[2] cells = { (va = svOne(1)), (va += svOne(2)) };
+    }
+    // Constant-index elements and pointee derefs: the same element or pointee twice.
+    expect_error("'arr[0]' is modified more than once in one argument list") {
+        int[2] arr = {0, 0};
+        svTwo(arr[0]++, arr[0]++);
+    }
+    expect_error("'arr[0]' is modified more than once in one brace initializer list") {
+        int[2] arr = {0, 0};
+        int[2] dst = {arr[0]++, arr[0]++};
+    }
+    expect_error("'(*pvp)' is modified more than once in one argument list") {
+        int pv = 0;
+        int* pvp = &pv;
+        svTwo((*pvp)++, (*pvp)++);
+    }
+    expect_error("'(*pvp)' is modified more than once in one brace initializer list") {
+        int pv = 0;
+        int* pvp = &pv;
+        int[2] dst = {(*pvp)++, (*pvp)++};
+    }
+    expect_error("'(px)' is modified more than once in one argument list") {
+        int px = 0;
+        svTwo((px)++, (px)++);
+    }
+    expect_error("'ia[00]' is modified more than once in one argument list") {
+        int[2] ia = {0, 0};
+        svTwo(ia[0]++, ia[00]++);
+    }
+    expect_error("'pf->f' is modified more than once in one argument list") {
+        SvFx fx = {f = 0, g = 0};
+        SvFx* pf = &fx;
+        svTwo((*pf).f++, pf->f++);
+    }
+    // r4: one pointee reached two ways through a pointer field, a global pointer, or a deref
+    // assignment; the location is keyed by what it resolves to, not by its spelling.
+    expect_error("'svH.p[0].f' is modified more than once in one argument list") {
+        SvFx hs = {f = 0, g = 0};
+        SvPtrHolder svH = {p = &hs};
+        svTwo(svH.p.f++, svH.p[0].f++);
+    }
+    expect_error("'svGp->f' is modified more than once in one argument list") {
+        svTwo(svGp.f++, svGp->f++);
+    }
+    expect_error("'q[0]' is modified more than once in one brace initializer list") {
+        int qv = 0;
+        int* q = &qv;
+        int[2] dst = {(*q = 1), (q[0] = 2)};
+    }
+}
+expect_error("'p->f' is modified more than once in one argument list") {
+    struct SvFieldAlias { SvFx* p; int f() { return svTwo(p.f++, p->f++); } };
+}
+expect_error("'p->f' is modified more than once in one argument list") {
+    struct SvFieldIndexAlias { SvFx* p; int f() { return svTwo(p[0].f++, p->f++); } };
+}
+expect_error("'this->p->f' is modified more than once in one argument list") {
+    struct SvFieldThisAlias { SvFx* p; int f() { return svTwo(p.f++, this->p->f++); } };
+}

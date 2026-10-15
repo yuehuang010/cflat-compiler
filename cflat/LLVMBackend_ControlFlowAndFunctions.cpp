@@ -479,6 +479,7 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
         tv.FuncPtrReturnPointer = chosen->ReturnType.Pointer;
         tv.FuncPtrReturnOwned = chosen->ReturnType.IsMove;
         tv.FuncPtrReturnAlias = chosen->ReturnType.IsAlias;
+        tv.FuncPtrVariadic = chosen->Variadic;
         tv.FuncPtrReturnPointerDepth = chosen->ReturnType.ValuePointerDepth();
         for (const auto& p : chosen->Parameters)
         {
@@ -682,6 +683,12 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             }
             if (ReturnCarriesRawArrayCount(retTV))
                 paramTypes.push_back(cflat_llvm::PointerTo(builder->getInt64Ty()));
+            // A variadic C signature: the tail past the declared slots is passed as a direct variadic
+            // call passes it (default promotions); aggregates in it were refused at the call site.
+            std::vector<llvm::Value*> variadicTail;
+            if (funcPtrType.FuncPtrVariadic)
+                for (size_t t = funcPtrType.FuncPtrParams.size(); t < args.size(); ++t)
+                    variadicTail.push_back(PromoteVariadicArgument(args[t]));
             auto* retTy   = cxxSretReturn ? builder->getVoidTy() : GetFunctionReturnABIType(retTV);
             // Native aggregates in the signature: the C ABI of the signature (AAPCS / Win64 per
             // target), the same recipe a C caller would use. Shared lowering: LowerAbiArgs.
@@ -689,9 +696,10 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             const bool thinCAbi = ThinFnPtrUsesCAbi(cxxRecipeRet, cxxRecipeParams, thinCRecipe);
             // The return type is the lowered one; the parameter list is re-derived from the
             // lowered values at the call (raw array counts ride behind their argument).
+            const bool variadicSig = funcPtrType.FuncPtrVariadic;
             auto* cFnTy   = thinCAbi
-                ? BuildExternFunctionType(cxxRecipeRet, cxxRecipeParams, false, thinCRecipe)
-                : llvm::FunctionType::get(retTy, paramTypes, false);
+                ? BuildExternFunctionType(cxxRecipeRet, cxxRecipeParams, variadicSig, thinCRecipe)
+                : llvm::FunctionType::get(retTy, paramTypes, variadicSig);
             auto* fnPtr   = builder->CreateBitCast(funcPtr, cflat_llvm::PointerTo(cFnTy), "cfn_ptr");
             std::vector<llvm::Value*> abiArgs;
             std::vector<std::pair<unsigned, TypeAndValue>> extParams;
@@ -752,6 +760,9 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 rawReturnCountSlot = CreateRawArrayReturnCountSlot();
                 abiArgs.push_back(rawReturnCountSlot);
             }
+            // The C-ABI branch below lowers its own list and appends the tail after the slots.
+            if (!thinCAbi)
+                abiArgs.insert(abiArgs.end(), variadicTail.begin(), variadicTail.end());
             lastCallReturnType = retTV;
             llvm::Value* thinSretSlot = nullptr;
             if (thinCAbi)
@@ -782,10 +793,12 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                     loweredArgs.push_back(rawReturnCountSlot);
                 else
                     rawReturnCountSlot = nullptr;
+                // Only the declared slots type the function; the variadic tail follows them.
                 std::vector<llvm::Type*> loweredTys;
                 loweredTys.reserve(loweredArgs.size());
                 for (auto* v : loweredArgs) loweredTys.push_back(v->getType());
-                cFnTy = llvm::FunctionType::get(cFnTy->getReturnType(), loweredTys, false);
+                loweredArgs.insert(loweredArgs.end(), variadicTail.begin(), variadicTail.end());
+                cFnTy = llvm::FunctionType::get(cFnTy->getReturnType(), loweredTys, variadicSig);
                 abiArgs = std::move(loweredArgs);
             }
             PreserveRetainedJoinArmTempsBeforeCall(nullptr, abiArgs);

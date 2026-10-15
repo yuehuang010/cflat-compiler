@@ -227,6 +227,10 @@ struct BnN    { BnD d = default; int k = default; };
 struct BnG<T> { T a = default; T b = default; };
 double bnSum(BnD x) { return x.a + x.b; }
 
+// Same-variable accept set (ruling 2026-10-13): one modification per variable, or distinct
+// variables, fields and rows, stay legal in one brace list.
+struct SameVarFx { int f; int g; };
+
 extern int main()
 {
     int passed = 0;
@@ -937,6 +941,26 @@ extern int main()
         total++; passed += Test("generic S<double> fields", bg1.a == 1.5 && bg1.b == 4.5, true);
         BnG<float> bg2 = { a = bnDv, b = 1.5 };
         total++; passed += Test("generic S<float> field from a double variable", bg2.a == 3.25f && bg2.b == 1.5f, true);
+    }
+    {
+        int i = 3; int j = 4;
+        SameVarFx z = {f = i++, g = j++};
+        total++; passed += Test("same-variable accept: distinct variables in a named brace", z.f == 3 && z.g == 4 && i == 4 && j == 5, true);
+        int[2] arr = {i++, j++};
+        total++; passed += Test("same-variable accept: distinct variables in a positional brace", arr[0] == 4 && arr[1] == 5 && i == 5 && j == 6, true);
+        int xr = 3;
+        SameVarFx z2 = {f = xr, g = xr};
+        total++; passed += Test("same-variable accept: reads of one variable in a brace", z2.f == 3 && z2.g == 3, true);
+        SameVarFx z3 = {f = xr++, g = 0};
+        total++; passed += Test("same-variable accept: one modification in a named brace", z3.f == 3 && z3.g == 0 && xr == 4, true);
+        SameVarFx s = {f = 1, g = 2};
+        SameVarFx z4 = {f = s.f++, g = s.g++};
+        total++; passed += Test("same-variable accept: distinct fields of one base in a brace", z4.f == 1 && z4.g == 2 && s.f == 2 && s.g == 3, true);
+        SameVarFx[2] fr = {{f = i++, g = 0}, {f = j++, g = 1}};
+        total++; passed += Test("same-variable accept: one modification per row", fr[0].f == 5 && fr[1].f == 6 && i == 6 && j == 7, true);
+        int c = 1; int q = 5;
+        int[2] tern = {c ? q++ : q++, 0};
+        total++; passed += Test("same-variable accept: ternary arms in a brace", tern[0] == 5 && q == 6, true);
     }
     if (passed == total)
     {

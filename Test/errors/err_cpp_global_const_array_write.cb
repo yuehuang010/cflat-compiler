@@ -1,0 +1,112 @@
+import cpp "cpp_interop_basic.h";
+import "cinterop_global_arrays.h";
+
+extern int main()
+{
+    expect_error("cannot assign to 't168KConstexprArray[0]': it is a const C++ object") {
+        t168KConstexprArray[0] = 7;
+    }
+    expect_error("cannot assign to 't168KStaticArray[0]': it is a const C++ object") {
+        t168KStaticArray[0] = 7;
+    }
+    expect_error("cannot assign to 't168KNamespaceConstArray[0]': it is a const C++ object") {
+        t168KNamespaceConstArray[0] = 7;
+    }
+    expect_error("cannot assign to 't168KArrayNs.constexprValues[0]': it is a const C++ object") {
+        t168KArrayNs.constexprValues[0] = 7;
+    }
+    expect_error("cannot assign to 't168KConstexprArray[0]': it is a const C++ object") {
+        t168KConstexprArray[0] += 1;
+    }
+    expect_error("cannot increment 't168KConstexprArray[0]': it is a const C++ object") {
+        t168KConstexprArray[0]++;
+    }
+    expect_error("cannot pass C++ const pointer argument 1") {
+        t168KArrayAt(t168KConstexprArray, 0);
+    }
+    expect_error("cannot pass C++ const pointer argument 1") {
+        t168KArrayAt(t168KArrayNs.constexprValues, 0);
+    }
+    expect_error("cannot pass C++ const pointer argument 1") {
+        t168KArrayToVoid(t168KConstexprArray);
+    }
+    expect_error("cannot pass C++ const pointer argument 1") {
+        t168KRecordMutableFirst(t168KConstRecords);
+    }
+    expect_error("cannot assign to '(*t168KConstRecords).c': it is a const C++ object") {
+        (*t168KConstRecords).c = 1;
+    }
+    expect_error("cannot pass C++ const pointer argument 1") {
+        t168KMutableRowFirst(t168KConstMatrix);
+    }
+    // The row pointer's own const (`int (*const)[3]`) does not make the pointee const.
+    expect_error("cannot pass C++ const pointer argument 1") {
+        t168KConstQualRowFirst(t168KConstMatrix);
+    }
+    expect_error("cannot assign to '*t168KConstexprArray': it is a const C++ object") {
+        *t168KConstexprArray = 7;
+    }
+    expect_error("cannot assign to '*t168KConstexprArray': it is a const C++ object") {
+        *t168KConstexprArray += 1;
+    }
+    expect_error("cannot increment '(*t168KConstexprArray)': it is a const C++ object") {
+        (*t168KConstexprArray)++;
+    }
+    expect_error("array type 'int[]' is incomplete") {
+        t168KIncompleteArray[0];
+    }
+    expect_error("array type 'int[]' is incomplete") {
+        sizeof(t168KIncompleteArray);
+    }
+    expect_error("array type 'T168KNonTrivial[1]' has a non-trivial element type") {
+        t168KNonTrivialArray[0].value;
+    }
+    expect_error("array type 'T168KNonTrivial[1]' has a non-trivial element type") {
+        sizeof(t168KNonTrivialArray);
+    }
+    // T183: writes through C const globals and const-pointee pointers are refused like C++ const.
+    expect_error("cannot assign to 't183KCScalar': it is a const C object") {
+        t183KCScalar = 1;
+    }
+    expect_error("cannot assign to 't183KCScalar': it is a const C object") {
+        t183KCScalar += 1;
+    }
+    expect_error("cannot increment 't183KCScalar': it is a const C object") {
+        t183KCScalar++;
+    }
+    expect_error("cannot assign to 't183KCArray[1]': it is a const C object") {
+        t183KCArray[1] = 1;
+    }
+    expect_error("cannot increment 't183KCArray[1]': it is a const C object") {
+        t183KCArray[1]++;
+    }
+    expect_error("cannot assign to '*t183KCArray': it is a const C object") {
+        *t183KCArray = 1;
+    }
+    expect_error("cannot pass const C object argument 1 ('t183KCArray')") {
+        t183KCTakeMutable(t183KCArray);
+    }
+    expect_error("cannot pass const C object argument 1 ('t183KCScalar')") {
+        t183KCTakeMutable(&t183KCScalar);
+    }
+    expect_error("cannot assign to '*t183KCPtr': it is a const C object") {
+        *t183KCPtr = 1;
+    }
+    expect_error("cannot assign to 't183KCPtr[1]': it is a const C object") {
+        t183KCPtr[1] = 1;
+    }
+    expect_error("cannot pass const C object argument 1 ('t183KCPtr')") {
+        t183KCTakeMutable(t183KCPtr);
+    }
+    // The argument is named for the global it was loaded from, not its text or '<argument>'.
+    expect_error("cannot pass const C object argument 1 ('t183KCPtr')") {
+        t183KCTakeMutable((t183KCPtr));
+    }
+    expect_error("cannot assign to 't183KCConstPtr': it is a const C object") {
+        t183KCConstPtr = &t183KCSecond;
+    }
+    expect_error("cannot increment 't183KCConstPtr': it is a const C object") {
+        t183KCConstPtr++;
+    }
+    return 0;
+}

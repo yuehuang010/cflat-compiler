@@ -899,7 +899,10 @@ if [ "$RUN_MODE" -eq 0 ]; then
 dumpopt_name="symbol_dump_opt_after_error"
 dumpopt_log="$RES/$dumpopt_name.log"
 dumpopt_t0=$(now_ms)
-$TIMEOUT "$CFLAT" "$SRC/errors/err_switch_case_range.cb" "$SRC/test_basic.cb" -i "$LIB" \
+# A genuinely failing file (an err_*.cb fixture analyzes clean once its expect_errors match).
+dumpopt_bad="$RES/$dumpopt_name.cb"
+printf 'extern int main() { return dumpoptUndefinedName; }\n' >"$dumpopt_bad"
+$TIMEOUT "$CFLAT" "$dumpopt_bad" "$SRC/test_basic.cb" -i "$LIB" \
     --locale-dir "$LOCALE_DIR" --symbol-dump-opt module >"$dumpopt_log" 2>&1
 dumpopt_rc=$?
 if [ "$dumpopt_rc" -ne 1 ]; then
@@ -936,6 +939,72 @@ else
     write_result "$dsym_name" "FAIL: source lines are not reachable" "$dsym_t0"
   else
     write_result "$dsym_name" "PASS" "$dsym_t0"
+  fi
+fi
+
+# A C header inline (c_inline_hdr_only_call, static inline in Test/library/c_inline_demand_transitive.h,
+# called by test_c_interop.cb) must get a concrete DW_TAG_subprogram (DW_AT_low_pc) under -g. The
+# abstract DIE alone (DW_AT_inline, no code) is present on master too, so it does not count.
+inline_name="macos_g_c_inline_subprogram"
+inline_bin="$RES/$inline_name.bin"
+inline_debug="$RES/$inline_name.debug"
+inline_log="$RES/$inline_name.log"
+inline_t0=$(now_ms)
+if ! $TIMEOUT "$CFLAT" "$SRC/test_c_interop.cb" -i "$LIB" -O2 -g \
+    --locale-dir "$LOCALE_DIR" -o "$inline_bin" >"$inline_log" 2>&1; then
+  write_result "$inline_name" "FAIL compile" "$inline_t0"
+else
+  inline_artifact=""
+  if [ -d "$inline_bin.dSYM" ]; then
+    inline_artifact="$inline_bin.dSYM"
+  elif [ -f "$inline_bin.o" ]; then
+    inline_artifact="$inline_bin.o"
+  fi
+  if [ -z "$inline_artifact" ] \
+      || ! dwarfdump --debug-info "$inline_artifact" >"$inline_debug" 2>&1 \
+      || ! awk '/^0x/ { if (tag && pc && name) found = 1; tag = ($0 ~ /DW_TAG_subprogram/);
+                        pc = 0; name = 0; next }
+                tag && /DW_AT_low_pc/ { pc = 1 }
+                tag && /DW_AT_name[[:space:]]+\("c_inline_hdr_only_call"\)/ { name = 1 }
+                END { if (tag && pc && name) found = 1; exit !found }' "$inline_debug"; then
+    write_result "$inline_name" "FAIL: C header inline has no concrete DW_TAG_subprogram" "$inline_t0"
+  else
+    write_result "$inline_name" "PASS" "$inline_t0"
+  fi
+fi
+
+# A C++ header inline (cppinl::twice, Test/library/cpp_interop_inline.h) must get a concrete
+# DW_TAG_subprogram (DW_AT_low_pc, header decl_file) under -g. A generated two-line caller keeps the
+# -g compile cheap; the default -O0 keeps the body out of line. Before T181 no DIE named the header.
+cxx_inline_name="macos_g_cxx_inline_subprogram"
+cxx_inline_src="$RES/$cxx_inline_name.cb"
+cxx_inline_bin="$RES/$cxx_inline_name.bin"
+cxx_inline_debug="$RES/$cxx_inline_name.debug"
+cxx_inline_log="$RES/$cxx_inline_name.log"
+cxx_inline_t0=$(now_ms)
+printf 'import cpp "%s/cpp_interop_inline.h";\nextern int main() { return cppinl.twice(5) == 30 ? 0 : 1; }\n' \
+    "$LIB" >"$cxx_inline_src"
+if ! $TIMEOUT "$CFLAT" "$cxx_inline_src" -i "$LIB" -g \
+    --locale-dir "$LOCALE_DIR" -o "$cxx_inline_bin" >"$cxx_inline_log" 2>&1; then
+  write_result "$cxx_inline_name" "FAIL compile" "$cxx_inline_t0"
+else
+  cxx_inline_artifact=""
+  if [ -d "$cxx_inline_bin.dSYM" ]; then
+    cxx_inline_artifact="$cxx_inline_bin.dSYM"
+  elif [ -f "$cxx_inline_bin.o" ]; then
+    cxx_inline_artifact="$cxx_inline_bin.o"
+  fi
+  if [ -z "$cxx_inline_artifact" ] \
+      || ! dwarfdump --debug-info "$cxx_inline_artifact" >"$cxx_inline_debug" 2>&1 \
+      || ! awk '/^0x/ { if (tag && pc && name && file) found = 1; tag = ($0 ~ /DW_TAG_subprogram/);
+                        pc = 0; name = 0; file = 0; next }
+                tag && /DW_AT_low_pc/ { pc = 1 }
+                tag && /DW_AT_name[[:space:]]+\("twice"\)/ { name = 1 }
+                tag && /DW_AT_decl_file.*cpp_interop_inline\.h/ { file = 1 }
+                END { if (tag && pc && name && file) found = 1; exit !found }' "$cxx_inline_debug"; then
+    write_result "$cxx_inline_name" "FAIL: C++ header inline has no concrete DW_TAG_subprogram" "$cxx_inline_t0"
+  else
+    write_result "$cxx_inline_name" "PASS" "$cxx_inline_t0"
   fi
 fi
 fi

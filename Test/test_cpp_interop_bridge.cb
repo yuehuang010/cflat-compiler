@@ -93,10 +93,13 @@ import cpp "library/cpp_interop_override_abi.h";
 // The CFlat-defined [cpp] structs below derive from C++ class-template specializations, and
 // the make_shared checks register them through std::shared_ptr.
 import cpp "library/cpp_interop_tpl.h";
+import cpp "library/cpp_interop_inline.h";
 import cpp "vector";
 import cpp "string";
 import cpp "memory";
 import cpp "functional";
+import cpp "chrono";
+import cpp "complex";
 import cpp "deque";
 import cpp "map";
 import cpp "set";
@@ -1216,6 +1219,68 @@ int bridge_t160_factory_copy()
     BridgeT160Factory z = x;
     return ((((x.tag * 10 + y.tag) * 10 + y.t.value()) * 10 + z.tag) * 10 + z.t.value());
 }
+
+// T164: a CFlat value holding a C++ class (by value, nested, or as an array element) destroys its
+// members and elements last-constructed first, as C++ does. Plain CFlat values keep declaration
+// order. Each shape is paired with a clang++ -std=c++20 oracle (same log header, same cells).
+struct BridgeT164Tag { int k = 5; ~BridgeT164Tag() { dtororder.note(k); } };
+struct BridgeT164Three { dtororder.E a = default; dtororder.E b = default; dtororder.E c = default; };
+struct BridgeT164Mixed { dtororder.E a = default; BridgeT164Tag n = default; dtororder.E b = default; };
+struct BridgeT164Inner { dtororder.E a = default; dtororder.E b = default; };
+struct BridgeT164Outer { BridgeT164Inner inner = default; dtororder.E e = default; };
+struct BridgeT164ArrField { dtororder.E[3] arr = default; dtororder.E z = default; };
+struct BridgeT164Big40 { dtororder.E[40] arr = default; };
+struct BridgeT164Thr { dtororder.E a = default; dtororder.E b = default; dtororder.E c = default; };
+struct BridgeT164MixThr { dtororder.E a = default; BridgeT164Tag n = default; dtororder.E b = default; dtororder.E c = default; };
+struct BridgeT164OuterThr { BridgeT164Inner inner = default; dtororder.E e = default; };
+struct BridgeT164ArrThr { dtororder.E[3] arr = default; dtororder.E z = default; };
+struct BridgeT164ArrHolder { dtororder.E[3] arr = default; };
+[cpp] struct BridgeT164CxxOwn { BridgeT164Tag a = default; BridgeT164Tag b = default; BridgeT164Tag c = default; };
+
+int bridge_t164_three() { dtororder.reset(); { BridgeT164Three t = default; } return dtororder.dtor_log(); }
+int bridge_t164_mixed() { dtororder.reset(); { BridgeT164Mixed m = default; m.n.k = 7; } return dtororder.dtor_log(); }
+int bridge_t164_nested() { dtororder.reset(); { BridgeT164Outer o = default; } return dtororder.dtor_log(); }
+int bridge_t164_arr_local() { dtororder.reset(); { dtororder.E[3] arr = default; } return dtororder.dtor_log(); }
+int bridge_t164_arr_field() { dtororder.reset(); { BridgeT164ArrField f = default; } return dtororder.dtor_log(); }
+int bridge_t164_heap() { dtororder.reset(); { dtororder.E* p = new dtororder.E[3]; delete p; } return dtororder.dtor_log(); }
+int bridge_t164_big_local() { dtororder.reset(); { dtororder.E[40] arr = default; } return dtororder.dtor_summary(); }
+int bridge_t164_big_field() { dtororder.reset(); { BridgeT164Big40 h = default; } return dtororder.dtor_summary(); }
+int bridge_t164_cxx_own()
+{
+    dtororder.reset();
+    { BridgeT164CxxOwn c = default; c.a.k = 1; c.b.k = 2; c.c.k = 3; }
+    return dtororder.dtor_log();
+}
+// T164 r2: a native array field inside a reverse-order value walks its elements last-first too.
+struct BridgeT164NatArr { BridgeT164Tag[3] a = default; dtororder.E e = default; };
+[cpp] struct BridgeT164CxxNatArr { BridgeT164Tag[3] a = default; };
+int bridge_t164_nat_arr()
+{
+    dtororder.reset();
+    { BridgeT164NatArr s = default; s.a[0].k = 2; s.a[1].k = 3; s.a[2].k = 4; }
+    return dtororder.dtor_log();
+}
+int bridge_t164_cxx_nat_arr()
+{
+    dtororder.reset();
+    { BridgeT164CxxNatArr s = default; s.a[0].k = 1; s.a[1].k = 2; s.a[2].k = 3; }
+    return dtororder.dtor_log();
+}
+
+// Throwing constructors: the members built before the throw are destroyed in reverse by the
+// unwind, then the C++ exception is caught by the guard. Value = dtor digits * 10 + caught flag.
+int bridge_t164_thr_struct_fn() { BridgeT164Thr t = default; return 0; }
+int bridge_t164_thr_arr_fn() { dtororder.E[3] arr = default; return 0; }
+int bridge_t164_thr_arr_field_fn() { BridgeT164ArrHolder h = default; return 0; }
+int bridge_t164_thr_mix_fn() { BridgeT164MixThr t = default; return 0; }
+int bridge_t164_thr_outer_fn() { BridgeT164OuterThr t = default; return 0; }
+int bridge_t164_thr_arrf_fn() { BridgeT164ArrThr t = default; return 0; }
+int bridge_t164_thr_struct() { dtororder.reset(); dtororder.throw_at_ordinal(3); int r = dtororder.guard(bridge_t164_thr_struct_fn); return dtororder.dtor_log() * 10 + (r == -1 ? 1 : 0); }
+int bridge_t164_thr_arr() { dtororder.reset(); dtororder.throw_at_ordinal(3); int r = dtororder.guard(bridge_t164_thr_arr_fn); return dtororder.dtor_log() * 10 + (r == -1 ? 1 : 0); }
+int bridge_t164_thr_arr_field() { dtororder.reset(); dtororder.throw_at_ordinal(3); int r = dtororder.guard(bridge_t164_thr_arr_field_fn); return dtororder.dtor_log() * 10 + (r == -1 ? 1 : 0); }
+int bridge_t164_thr_mix() { dtororder.reset(); dtororder.throw_at_ordinal(3); int r = dtororder.guard(bridge_t164_thr_mix_fn); return dtororder.dtor_log() * 10 + (r == -1 ? 1 : 0); }
+int bridge_t164_thr_outer() { dtororder.reset(); dtororder.throw_at_ordinal(3); int r = dtororder.guard(bridge_t164_thr_outer_fn); return dtororder.dtor_log() * 10 + (r == -1 ? 1 : 0); }
+int bridge_t164_thr_arrf() { dtororder.reset(); dtororder.throw_at_ordinal(4); int r = dtororder.guard(bridge_t164_thr_arrf_fn); return dtororder.dtor_log() * 10 + (r == -1 ? 1 : 0); }
 
 // T156: a program's default ctor builds its user fields in the caller's sret slot. A C++ field
 // (std.list) built in a temporary and bit-copied into that slot moves the list's sentinel.
@@ -3201,6 +3266,37 @@ int uq_null_compare()
     return 0;
 }
 
+// T177: returns use copy-initialization for distinct C++ class specializations.
+std.optional<i64> t177_optional_return() { return std.optional<int>(5); }
+std.optional<i64> t177_optional_local_return()
+{
+    std.optional<int> value = std.optional<int>(5);
+    return value;
+}
+std.optional<i64> t177_optional_move_return()
+{
+    std.optional<int> value = std.optional<int>(5);
+    return move value;
+}
+std.optional<i64> t177_optional_param_return(std.optional<int> value) { return value; }
+std.optional<i64> t177_optional_branch_return(bool choose)
+{
+    if (choose) return std.optional<int>(5);
+    else return std.optional<int>(6);
+}
+std.optional<i64> t177_optional_generic_return<T>(T value) { return value; }
+std.pair<i64, int> t177_pair_return() { return std.pair<int, int>(3, 4); }
+std.tuple<i64, int> t177_tuple_return() { return std.tuple<int, int>(3, 4); }
+std.complex<double> t177_complex_return() { return std.complex<float>(3.0f, 4.0f); }
+std.chrono.milliseconds t177_duration_return() { return std.chrono.seconds(2); }
+std.string_view t177_view_return() { return std.string("abc"); }
+std.unique_ptr<cppinl.Base> t177_unique_move_return()
+{
+    std.unique_ptr<cppinl.Derived> value =
+        std.unique_ptr<cppinl.Derived>(new cppinl.Derived(5));
+    return move value;
+}
+
 extern int main(int argc, char** argv)
 {
     // Win64 keeps the existing SEH trampoline and does not emit the C++ guard, so the
@@ -3208,6 +3304,42 @@ extern int main(int argc, char** argv)
     if const (__WINDOWS__) {
         return 0;
     }
+
+    std.optional<i64> t177Opt = t177_optional_return();
+    bridge_check("T177 optional prvalue return", (int)t177Opt.value(), 5);
+    t177Opt = t177_optional_local_return();
+    bridge_check("T177 optional local return", (int)t177Opt.value(), 5);
+    t177Opt = t177_optional_move_return();
+    bridge_check("T177 optional move return", (int)t177Opt.value(), 5);
+    t177Opt = t177_optional_param_return(std.optional<int>(5));
+    bridge_check("T177 optional parameter return", (int)t177Opt.value(), 5);
+    t177Opt = t177_optional_branch_return(true);
+    bridge_check("T177 optional if return", (int)t177Opt.value(), 5);
+    t177Opt = t177_optional_branch_return(false);
+    bridge_check("T177 optional else return", (int)t177Opt.value(), 6);
+    t177Opt = t177_optional_generic_return<std.optional<int>>(std.optional<int>(5));
+    bridge_check("T177 optional generic return", (int)t177Opt.value(), 5);
+
+    std.pair<i64, int> t177Pair = t177_pair_return();
+    bridge_check("T177 pair return", (int)(t177Pair.first * 10 + t177Pair.second), 34);
+    std.tuple<i64, int> t177Tuple = t177_tuple_return();
+    bridge_check("T177 tuple return",
+        (int)(std.get<0>(t177Tuple) * 10 + std.get<1>(t177Tuple)), 34);
+    std.complex<double> t177Complex = t177_complex_return();
+    bridge_check("T177 complex return",
+        (int)(t177Complex.real() * 10.0 + t177Complex.imag()), 34);
+    std.chrono.milliseconds t177Duration = t177_duration_return();
+    bridge_check("T177 duration return", (int)t177Duration.count(), 2000);
+    std.string_view t177View = t177_view_return();
+    bridge_check("T177 string view return", (int)t177View.size(), 3);
+
+    cppinl.Base.reset_dtors();
+    {
+        std.unique_ptr<cppinl.Base> t177Unique = t177_unique_move_return();
+        bridge_check("T177 unique ptr move return value", t177Unique.get()->area(), 25);
+    }
+    bridge_check("T177 unique ptr derived destructor", cppinl.Base.derived_dtors, 1);
+    bridge_check("T177 unique ptr base destructor", cppinl.Base.base_dtors, 1);
 
     cpptw.reset_counts();
     bridge_opaque_return_discard_direct(31);
@@ -5120,6 +5252,25 @@ extern int main(int argc, char** argv)
     cpptw.reset_counts();
     bridge_check("bridge T160 factory decl then user copy and implicit copy", bridge_t160_factory_copy(), 45454);
     bridge_check("bridge T160 factory decl live", cpptw.live_allocations(), 0);
+
+    // T164: destruction order of C++ members and elements (clang++ -std=c++20 oracle values).
+    bridge_check("bridge T164 struct of three C++ fields destroyed last-first", bridge_t164_three(), 321);
+    bridge_check("bridge T164 mixed native and C++ fields destroyed last-first", bridge_t164_mixed(), 271);
+    bridge_check("bridge T164 nested struct destroyed last-first", bridge_t164_nested(), 321);
+    bridge_check("bridge T164 C++ array local destroyed last-first", bridge_t164_arr_local(), 321);
+    bridge_check("bridge T164 array field then member destroyed last-first", bridge_t164_arr_field(), 4321);
+    bridge_check("bridge T164 new[] C++ array destroyed last-first", bridge_t164_heap(), 321);
+    bridge_check("bridge T164 40-element array local destroyed last-first", bridge_t164_big_local(), 4001);
+    bridge_check("bridge T164 40-element array field destroyed last-first", bridge_t164_big_field(), 4001);
+    bridge_check("bridge T164 C++ struct with CFlat owned fields destroyed last-first", bridge_t164_cxx_own(), 321);
+    bridge_check("bridge T164 native array field in a C++-order struct destroyed last-first", bridge_t164_nat_arr(), 1432);
+    bridge_check("bridge T164 native array field in a [cpp] struct destroyed last-first", bridge_t164_cxx_nat_arr(), 321);
+    bridge_check("bridge T164 throwing struct ctor unwinds members last-first", bridge_t164_thr_struct(), 211);
+    bridge_check("bridge T164 throwing array ctor unwinds elements last-first", bridge_t164_thr_arr(), 211);
+    bridge_check("bridge T164 throwing array field ctor unwinds last-first", bridge_t164_thr_arr_field(), 211);
+    bridge_check("bridge T164 throwing mixed struct unwinds last-first", bridge_t164_thr_mix(), 2511);
+    bridge_check("bridge T164 throwing nested struct unwinds last-first", bridge_t164_thr_outer(), 211);
+    bridge_check("bridge T164 throwing struct with array field unwinds last-first", bridge_t164_thr_arrf(), 3211);
 
     bridge_reset_cf();
     int bridgeEnclosingMoveCf = bridge_enclosing_move<TwinCf>();

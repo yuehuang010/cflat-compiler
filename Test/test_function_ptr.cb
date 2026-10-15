@@ -2,6 +2,8 @@ import "test_helper.cb";
 import "list.cb";
 import "string.cb";
 import "dictionary.cb";
+import "library/c_variadic_fnptr.h";
+import "library/c_variadic_aggregate.c";
 
 // ── Named functions used throughout ──────────────────────────────────────────
 
@@ -3211,6 +3213,29 @@ bool testFuncPtrCallResultIntoClosureParam()
     return result;
 }
 
+// RETURN site (T186): a named function returned as a function<> binds by the declaration rule. The
+// same signature binds, a FEWER-parameter callback binds (the ruled accept), and an overload set
+// picks the overload matching the slot.
+int retBindAdd(int a, int b) { return a + b; }
+int retBindOne(int a)        { return a * 10; }
+int retBindOv(int a)         { return a * 100; }
+int retBindOv(int a, int b)  { return a + b; }
+function<int(int, int)> retBindSame()   { return retBindAdd; }
+function<int(int, int)> retBindFewer()  { return retBindOne; }
+function<int(int, int)> retBindOverload() { return retBindOv; }
+
+bool testFuncPtrReturnBindAccepts()
+{
+    bool result = true;
+    function<int(int, int)> same = retBindSame();
+    result &= Test("return same signature binds", same(3, 4), 7);
+    function<int(int, int)> fewer = retBindFewer();
+    result &= Test("return fewer-param callback binds", fewer(3, 4), 30);
+    function<int(int, int)> ov = retBindOverload();
+    result &= Test("return overload picks matching arity", ov(3, 4), 7);
+    return result;
+}
+
 // A function<> call result remains the receiver for every postfix-chain shape.
 struct ChainPostfixRec
 {
@@ -5071,6 +5096,302 @@ bool testAutoCopyClosure()
     return result;
 }
 
+// ── Bare 'function' inference from a function-pointer VALUE (t176) ───────────
+// The signature comes from the initializer: a variable, parameter, field, call result, C typedef,
+// or a ternary whose arms name one signature. Each leg is checked against clang -std=c17.
+
+int t176Inc(int a)         { return a + 1; }
+int t176Dbl(int a)         { return a * 2; }
+int t176Var(int n, ...)    { return n * 10 + 1; }
+int t176Recv(function<int(int)> p) { return p(5); }
+struct T176Hold { function<int(int)> fn; };
+function<int(int)> t176GetInc()  { return t176Inc; }
+function<int(int)> t176GetCInc() { return t170_inc; }
+
+int t176ViaParam(function<int(int)> p)
+{
+    function g = p;
+    return g(5) * 10 + t176Recv(g);
+}
+
+int t176Pick(function<int(int)> a, function<int(int)> b, int k)
+{
+    function f = k ? a : b;
+    return f(3);
+}
+
+bool testInferFromFunctionVariable()
+{
+    bool result = true;
+    function v = t176Inc;
+    function g = v;
+    result &= Test("infer from fp variable", g(5) * 10 + t176Recv(g), 66);
+    return result;
+}
+
+bool testInferFromFunctionParam()
+{
+    bool result = true;
+    result &= Test("infer from fp param", t176ViaParam(t176Inc), 66);
+    return result;
+}
+
+bool testInferFromFunctionField()
+{
+    bool result = true;
+    T176Hold h;
+    h.fn = t176Inc;
+    function g = h.fn;
+    result &= Test("infer from fp field", g(5) * 10 + t176Recv(g), 66);
+    return result;
+}
+
+bool testInferFromFunctionCallResult()
+{
+    bool result = true;
+    function g = t176GetInc();
+    result &= Test("infer from fp call result", g(5) * 10 + t176Recv(g), 66);
+    function c = t176GetCInc();
+    result &= Test("infer from C fp call result", c(5) * 10 + t176Recv(c), 66);
+    return result;
+}
+
+bool testInferFromCFunctionPointer()
+{
+    bool result = true;
+    T170Cb cb = t170_inc;
+    function g = cb;
+    result &= Test("infer from C typedef fp", g(5) * 10 + t176Recv(g), 66);
+    return result;
+}
+
+bool testInferFromVariadicFunctionPointer()
+{
+    bool result = true;
+    function v = t170_sum;
+    function g = v;
+    result &= Test("infer variadic C fp variable", g(2, 3, 4), 7);
+    T170Vp vp = t170_sum;
+    function h = vp;
+    result &= Test("infer variadic C typedef fp", h(2, 3, 4), 7);
+    function c = t170_getvp();
+    result &= Test("infer variadic C call result", c(2, 3, 4), 7);
+    function n = t176Var;
+    function m = n;
+    result &= Test("infer native variadic fp variable", m(2, 3, 4), 21);
+    return result;
+}
+
+bool testInferTernaryFunctionNames()
+{
+    bool result = true;
+    int k = 1;
+    function g = k ? t176Dbl : t170_inc;
+    int r = g(5) * 100 + t176Recv(g);
+    k = 0;
+    function h = k ? t176Dbl : t170_inc;
+    result &= Test("infer ternary of names", r + h(5), 1016);
+    return result;
+}
+
+bool testInferTernaryFunctionVariables()
+{
+    bool result = true;
+    function a = t176Dbl;
+    function b = t170_inc;
+    int k = 1;
+    function g = k ? a : b;
+    int r = g(5) * 100 + t176Recv(g);
+    k = 0;
+    function h = k ? a : b;
+    result &= Test("infer ternary of variables", r + h(5), 1016);
+    return result;
+}
+
+bool testInferTernaryVariadicFunctionPointer()
+{
+    bool result = true;
+    T170Vp vp = t170_sum;
+    int k = 1;
+    function g = k ? t170_sum : vp;
+    int r = g(2, 3, 4) * 10;
+    k = 0;
+    function h = k ? t170_sum : vp;
+    result &= Test("infer ternary of variadic C fps", r + h(2, 3, 4), 77);
+    result &= Test("infer ternary from params", t176Pick(t176Inc, t176Dbl, 0) * 10
+                   + t176Pick(t176Inc, t176Dbl, 1), 64);
+    return result;
+}
+
+// t182: a ternary of one signature across arm kinds (name, field, call result, C typedef variable,
+// overloaded name, nested ternary). Arm A is selected by k = 1, arm B by z = 0 (ternary of its own
+// declaration), so each pair checks both values; clang -std=c17 gives the same values at x = 5.
+int t182Sq(int a)        { return a * a; }
+int t182Tri(int a)       { return a * 3; }
+int t182Neg(int a)       { return a - 1; }
+int t182Half(int a)      { return a / 2; }
+int t182Ov(int a)        { return a + 100; }
+int t182Ov(double a)     { return 2; }
+function<int(int)> t182GetTri() { return t182Tri; }
+struct T182Hold { function<int(int)> fn; };
+
+// Implicit-this fields named like a global function (and an overloaded one): the ternary arm is the
+// field value, never the function.
+int t182Lo(int a)         { return a; }
+int t182Hi(int a, int b)  { return a + b; }
+struct T182Shadow {
+    int t182Ov = default;
+    int t182Lo = default;
+    int t182Hi = default;
+    int pickHi(int k) { return k ? t182Lo : t182Hi; }
+    int pickOv(int k) { return k ? t182Ov : t182Lo; }
+};
+
+bool testTernaryArmKinds()
+{
+    bool result = true;
+    int k = 1;
+    int z = 0;
+    int j = 1;
+    T182Hold hold;
+    hold.fn = t176Dbl;
+    T170Cb cb = t170_inc;
+    // Overloaded name: the arm binds the one overload that matches the other arm.
+    function o = k ? t182Ov : t182Sq;
+    result &= Test("ternary overloaded name arm", o(5), 105);
+    function r = z ? t182Sq : t182Ov;
+    result &= Test("ternary overloaded name arm (reversed)", r(5), 105);
+    function<int(int)> e = k ? t182Ov : t176Inc;
+    result &= Test("ternary overloaded name arm, explicit slot", e(5), 105);
+    function p = k ? hold.fn : t182Ov;
+    result &= Test("ternary overloaded name vs field", p(5), 10);
+    // Pairs: N = name (a*a), F = field (a*2), C = call result (a*3), V = C typedef variable (a+1),
+    // O = overloaded name (a+100), Q = nested ternary (a-1).
+    function nf = k ? t182Sq : hold.fn;
+    function nfB = z ? t182Sq : hold.fn;
+    result &= Test("pair N/F", nf(5) * 1000 + nfB(5), 25 * 1000 + 10);
+    function nc = k ? t182Sq : t182GetTri();
+    function cn = z ? t182Sq : t182GetTri();
+    result &= Test("pair N/C", nc(5) * 1000 + cn(5), 25 * 1000 + 15);
+    function nv = k ? t182Sq : cb;
+    function vn = z ? t182Sq : cb;
+    result &= Test("pair N/V", nv(5) * 1000 + vn(5), 25 * 1000 + 6);
+    function no = k ? t182Sq : t182Ov;
+    function on = z ? t182Sq : t182Ov;
+    result &= Test("pair N/O", no(5) * 1000 + on(5), 25 * 1000 + 105);
+    function nq = k ? t182Sq : (j ? t182Neg : t182Half);
+    function qn = z ? t182Sq : (j ? t182Neg : t182Half);
+    result &= Test("pair N/Q", nq(5) * 1000 + qn(5), 25 * 1000 + 4);
+    function fc = k ? hold.fn : t182GetTri();
+    function cf = z ? hold.fn : t182GetTri();
+    result &= Test("pair F/C", fc(5) * 1000 + cf(5), 10 * 1000 + 15);
+    function fv = k ? hold.fn : cb;
+    function vf = z ? hold.fn : cb;
+    result &= Test("pair F/V", fv(5) * 1000 + vf(5), 10 * 1000 + 6);
+    function fo = k ? hold.fn : t182Ov;
+    function foB = z ? hold.fn : t182Ov;
+    result &= Test("pair F/O", fo(5) * 1000 + foB(5), 10 * 1000 + 105);
+    function fq = k ? hold.fn : (j ? t182Neg : t182Half);
+    function qf = z ? hold.fn : (j ? t182Neg : t182Half);
+    result &= Test("pair F/Q", fq(5) * 1000 + qf(5), 10 * 1000 + 4);
+    function cv = k ? t182GetTri() : cb;
+    function vc = z ? t182GetTri() : cb;
+    result &= Test("pair C/V", cv(5) * 1000 + vc(5), 15 * 1000 + 6);
+    function co = k ? t182GetTri() : t182Ov;
+    function oc = z ? t182GetTri() : t182Ov;
+    result &= Test("pair C/O", co(5) * 1000 + oc(5), 15 * 1000 + 105);
+    function cq = k ? t182GetTri() : (j ? t182Neg : t182Half);
+    function qc = z ? t182GetTri() : (j ? t182Neg : t182Half);
+    result &= Test("pair C/Q", cq(5) * 1000 + qc(5), 15 * 1000 + 4);
+    function vo = k ? cb : t182Ov;
+    function ov = z ? cb : t182Ov;
+    result &= Test("pair V/O", vo(5) * 1000 + ov(5), 6 * 1000 + 105);
+    function vq = k ? cb : (j ? t182Neg : t182Half);
+    function qv = z ? cb : (j ? t182Neg : t182Half);
+    result &= Test("pair V/Q", vq(5) * 1000 + qv(5), 6 * 1000 + 4);
+    function oq = k ? t182Ov : (j ? t182Neg : t182Half);
+    function qo = z ? t182Ov : (j ? t182Neg : t182Half);
+    result &= Test("pair O/Q", oq(5) * 1000 + qo(5), 105 * 1000 + 4);
+    // Field arms shadow a same-named global function (and an overloaded one) in a method.
+    T182Shadow sh;
+    sh.t182Ov = 3;
+    sh.t182Lo = 4;
+    sh.t182Hi = 5;
+    result &= Test("ternary field arm shadows function", sh.pickHi(1) * 10 + sh.pickHi(0), 45);
+    result &= Test("ternary field arm shadows overloaded function", sh.pickOv(1) * 10 + sh.pickOv(0), 34);
+    return result;
+}
+
+// T188: a closure arm joined with a named function or thin function<> arm of the same signature is
+// lifted into the closure form, in either order, for a capturing or a plain lambda.
+int t188Inc(int a) { return a + 1; }
+int t188Apply(Lambda<int(int)> f, int v) { return f(v); }
+bool testTernaryClosureNamedJoin()
+{
+    bool result = true;
+    int base = 10;
+    Lambda<int(int)> cap = (int a) => { return a + base; };
+    Lambda<int(int)> plain = (int a) => { return a + 3; };
+    function<int(int)> fp = t188Inc;
+    int k = 1;
+    int z = 0;
+    Lambda<int(int)> g1 = k ? cap : t188Inc;   // cap(2) = 12
+    Lambda<int(int)> g2 = z ? cap : t188Inc;   // t188Inc(2) = 3
+    Lambda<int(int)> g3 = k ? t188Inc : cap;   // t188Inc(2) = 3
+    Lambda<int(int)> g4 = z ? t188Inc : cap;   // cap(2) = 12
+    result &= Test("ternary capture join named arm", g1(2) * 1000 + g2(2) * 100 + g3(2) * 10 + g4(2), 12 * 1000 + 3 * 100 + 3 * 10 + 12);
+    Lambda<int(int)> h1 = k ? plain : fp;      // plain(2) = 5
+    Lambda<int(int)> h2 = z ? plain : fp;      // fp(2) = 3
+    Lambda<int(int)> h3 = k ? fp : plain;      // fp(2) = 3
+    Lambda<int(int)> h4 = z ? fp : plain;      // plain(2) = 5
+    result &= Test("ternary function<> arm joins closure", h1(2) * 1000 + h2(2) * 100 + h3(2) * 10 + h4(2), 5 * 1000 + 3 * 100 + 3 * 10 + 5);
+    Lambda<int(int)> a1 = cap;
+    a1 = k ? t188Inc : cap;                    // t188Inc(2) = 3
+    result &= Test("ternary named arm assigned to Lambda", a1(2), 3);
+    result &= Test("ternary named arm as Lambda argument", t188Apply(z ? cap : t188Inc, 2), 3);
+    return result;
+}
+
+struct T185Box<T> { T v = default; };
+
+// T185: a function<> slot takes the values it may hold - a named function, nullptr, the zero null
+// literal, a function-pointer variable or field, a call result, and a ternary of those. Refusals of
+// integers, structs and data pointers live in Test/errors/err_function_slot_nonfunction.cb.
+bool testFunctionSlotAccepts()
+{
+    bool result = true;
+    int k = 1;
+    function<int(int)> z = 0;
+    result &= Test("zero literal is the null function", z == nullptr, true);
+    function<int(int)> n = nullptr;
+    n = t182Sq;
+    result &= Test("nullptr then assigned a function", n(5), 25);
+    n = 0;
+    result &= Test("zero literal assigned is null", n == nullptr, true);
+    function<int(int)> kn = k ? t182Sq : nullptr;
+    result &= Test("ternary with a nullptr arm", kn(5), 25);
+    function<int(int)> kz = k ? nullptr : t182Tri;
+    result &= Test("ternary with a nullptr arm, reversed", kz == nullptr, true);
+    T182Hold hold;
+    hold.fn = nullptr;
+    hold.fn = t182Half;
+    result &= Test("field assigned a function after nullptr", hold.fn(6), 3);
+    T182Hold held = { fn = 0 };
+    result &= Test("brace field zero is null", held.fn == nullptr, true);
+    function<int(int)> fromField = hold.fn;
+    result &= Test("function-pointer field into a slot", fromField(8), 4);
+    function<int(int)> fromCall = t182GetTri();
+    result &= Test("call result into a slot", fromCall(5), 15);
+    T185Box<function<int(int)>> bx;
+    bx.v = t182Sq;
+    result &= Test("generic field assigned a function", bx.v(3), 9);
+    bx.v = 0;
+    result &= Test("generic field zero is null", bx.v == nullptr, true);
+    bx.v = nullptr;
+    result &= Test("generic field nullptr", bx.v == nullptr, true);
+    return result;
+}
+
 extern int main(int argc, char** argv)
 {
     // The tooling regression harness passes one argument and calls this twice. The second call
@@ -5194,6 +5515,7 @@ extern int main(int argc, char** argv)
 
     // Function-pointer argument provenance / signature gating: legal spellings still bind
     total++; passed += testFuncPtrArgProvenanceAccepts()  ? 1 : 0;
+    total++; passed += testFuncPtrReturnBindAccepts()     ? 1 : 0;
     total++; passed += testOverloadedFunctionPointerArgument() ? 1 : 0;
 
     // Accept set for the shape-mismatch gate (fix/shape-arg): array->pointer decay, an array
@@ -5262,6 +5584,21 @@ extern int main(int argc, char** argv)
 
     // `auto` copy of a closure keeps its signature and captures (t139).
     total++; passed += testAutoCopyClosure()               ? 1 : 0;
+
+    // Bare 'function' inference from a function-pointer value: variable, param, field, call
+    // result, C typedef, variadic C and native, and ternaries of one signature (t176).
+    total++; passed += testInferFromFunctionVariable()     ? 1 : 0;
+    total++; passed += testInferFromFunctionParam()        ? 1 : 0;
+    total++; passed += testInferFromFunctionField()        ? 1 : 0;
+    total++; passed += testInferFromFunctionCallResult()   ? 1 : 0;
+    total++; passed += testInferFromCFunctionPointer()     ? 1 : 0;
+    total++; passed += testInferFromVariadicFunctionPointer() ? 1 : 0;
+    total++; passed += testInferTernaryFunctionNames()     ? 1 : 0;
+    total++; passed += testInferTernaryFunctionVariables() ? 1 : 0;
+    total++; passed += testInferTernaryVariadicFunctionPointer() ? 1 : 0;
+    total++; passed += testTernaryArmKinds()               ? 1 : 0;
+    total++; passed += testFunctionSlotAccepts()           ? 1 : 0;
+    total++; passed += testTernaryClosureNamedJoin()       ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -299,7 +299,8 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     }
                     declType.TypeName = mangledName;
                 }
-                else if (auto* fit = compiler->FindOrRequestFunctionTypeAlias(typeSpec->getText());
+                else if (auto* fit = compiler->NativeTypeShadowsFunctionAlias(typeSpec->getText())
+                                         ? nullptr : compiler->FindOrRequestFunctionTypeAlias(typeSpec->getText());
                          fit != nullptr)
                 {
                     // Function-type alias (using Cb = function<R(Args)> | Lambda<R(Args)>): expand
@@ -310,6 +311,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     declType.FuncPtrReturnPointer  = fit->FuncPtrReturnPointer;
                     declType.FuncPtrReturnOwned = fit->FuncPtrReturnOwned;
                     declType.FuncPtrReturnAlias = fit->FuncPtrReturnAlias;
+                    declType.FuncPtrVariadic    = fit->FuncPtrVariadic;
                     declType.FuncPtrReturnPointerDepth = fit->FuncPtrReturnPointerDepth;
                     declType.FuncPtrParams         = fit->FuncPtrParams;
                     const int functionPtrDepth = PointerDepthOf(declSpecWithSuffix->pointer());

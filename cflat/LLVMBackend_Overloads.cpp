@@ -1344,31 +1344,7 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                     || (IsCxxRecord(receiver) && IsCxxRecord(param.TypeName)
                         && IsCxxBaseOf(param.TypeName, receiver)))
                 {
-                    int memberCv = 0;
-                    const bool hasDeclarationCv = candidate.IsCInteropDeclaration
-                        || candidate.IsDeleted || candidate.CxxConst || candidate.CxxVolatile;
-                    if (hasDeclarationCv)
-                    {
-                        if (candidate.CxxConst) memberCv |= 1;
-                        if (candidate.CxxVolatile) memberCv |= 2;
-                    }
-                    else
-                    {
-                        const std::string linkage = CxxDeclarationLinkageName(candidate.UniqueName);
-                        if (linkage.find("@@QEBA") != std::string::npos
-                            || linkage.find("@@UEBA") != std::string::npos)
-                            memberCv |= 1;
-                        if (linkage.find("@@QECA") != std::string::npos
-                            || linkage.find("@@UECA") != std::string::npos)
-                            memberCv |= 2;
-                        size_t cvAt = linkage.starts_with("_ZN") ? 3 : std::string::npos;
-                        while (cvAt != std::string::npos && cvAt < linkage.size()
-                            && (linkage[cvAt] == 'K' || linkage[cvAt] == 'V'))
-                        {
-                            memberCv |= linkage[cvAt] == 'K' ? 1 : 2;
-                            ++cvAt;
-                        }
-                    }
+                    const int memberCv = CxxMemberCv(candidate);
                     const int receiverCv = CxxReceiverCv(arg);
                     out.rank = -2;
                     out.second = memberCv;
@@ -1549,9 +1525,17 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 }
                 if (pointee == CanonicalPrimitiveTypeName(param.TypeName))
                 {
-                    out.rank = 0;
+                    const std::string parameterSpelling = CxxReferenceParameterSpelling(candidate, i);
+                    const bool targetPointeeConst = param.IsCxxPointeeConst
+                        || parameterSpelling.rfind("const ", 0) == 0;
+                    const bool dropsPointeeConst = candidate.IsCxx
+                        && pt.IsCxxPointeeConst && !targetPointeeConst;
+                    out.rank = dropsPointeeConst ? kCxxNonViableRank : 0;
                     out.cvBase = pointee;
-                    out.cv = CxxReferenceParameterSpelling(candidate, i).rfind("const ", 0) == 0 ? 1 : 0;
+                    out.cv = targetPointeeConst ? 1 : 0;
+                    out.cxxViable = pt.PointerDepth == 1 && !dropsPointeeConst;
+                    out.from = pointee;
+                    continue;
                 }
                 else if (primitiveWidth(pointee) > 0 && primitiveWidth(param.TypeName) > 0
                          && primitiveWidth(pointee) != primitiveWidth(param.TypeName))
@@ -2021,12 +2005,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 || candidate.CxxRefQualifier == cflat_cinterop::CxxRefQualifierNone
                 || candidate.Parameters.empty() || arguments.empty())
                 return true;
-            const bool receiverRvalue = IsCxxObjectRvalue(arguments.front());
-            if (candidate.CxxRefQualifier == cflat_cinterop::CxxRefQualifierLValue)
-                return !receiverRvalue || (candidate.CxxConst && !candidate.CxxVolatile);
-            if (candidate.CxxRefQualifier == cflat_cinterop::CxxRefQualifierRValue)
-                return receiverRvalue;
-            return true;
+            return CxxImplicitObjectRefBinds(IsCxxObjectRvalue(arguments.front()), candidate);
         };
 
         /*
@@ -2099,7 +2078,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     if (candidate.IsCxx
                         && CxxCandidatePointeeConstRelation(candidate,
                                (size_t)std::distance(candidate.Parameters.begin(), varParamItr),
-                               arg.TypeAndValue, *varParamItr)
+                               arg, *varParamItr)
                                == CxxPointeeConstRelation::Drops)
                         variadicDropsPointeeConst = true;
                     ++varParamItr;
@@ -2179,7 +2158,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 {
                     const auto relation = CxxCandidatePointeeConstRelation(candidate,
                         (size_t)std::distance(candidate.Parameters.begin(), candidateParamItr),
-                        arg.TypeAndValue, *candidateParamItr);
+                        arg, *candidateParamItr);
                     if (relation == CxxPointeeConstRelation::Drops)
                         cxxPointeeConstMismatches += 2;
                     else if (relation == CxxPointeeConstRelation::Adds)
@@ -3192,7 +3171,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 {
                     const auto relation = CxxCandidatePointeeConstRelation(candidate,
                         (size_t)std::distance(candidate.Parameters.begin(), candidateParamItr),
-                        arg.TypeAndValue, *candidateParamItr);
+                        arg, *candidateParamItr);
                     if (relation == CxxPointeeConstRelation::Adds
                         || relation == CxxPointeeConstRelation::Drops)
                         result = std::max(result, 1);
@@ -4579,6 +4558,78 @@ bool LLVMBackend::CxxMemberIsOnlyNonConst(const std::string& recordName,
         return inspect(inspect, recordName, hasMember);
 }
 
+int LLVMBackend::CxxReturnValueCv(const FunctionSymbol& candidate)
+{
+        if (!candidate.IsCxx) return 0;
+        std::string spelled;
+        if (candidate.IsMethod && !candidate.Parameters.empty())
+        {
+                // An inherited member keeps its declaration in the class that declared it.
+                for (const std::string& owner : { candidate.Parameters.front().TypeName,
+                                                  candidate.CxxInheritedOwner })
+                    if (const auto* info = owner.empty() ? nullptr : GetCxxClassInfo(owner);
+                        info != nullptr && spelled.empty())
+                        for (const auto& method : info->directMethods)
+                            if (method.raw.linkageName == candidate.UniqueName) spelled = method.raw.retType;
+        }
+        else if (auto sigs = cxxFunctionSignatures_.find(candidate.SourceName);
+                 sigs != cxxFunctionSignatures_.end())
+                for (const CSigEntry& raw : sigs->second)
+                    if (raw.linkageName == candidate.UniqueName) spelled = raw.retSpelling;
+        if (spelled.find_first_of("*&") != std::string::npos) return 0;
+        int cv = 0;
+        std::string_view rest = spelled;
+        while (true)
+        {
+                if (rest.starts_with("const ")) { cv |= 1; rest.remove_prefix(6); }
+                else if (rest.starts_with("volatile ")) { cv |= 2; rest.remove_prefix(9); }
+                else break;
+        }
+        return cv;
+}
+
+int LLVMBackend::CxxMemberCv(const FunctionSymbol& candidate) const
+{
+        int memberCv = 0;
+        const bool hasDeclarationCv = candidate.IsCInteropDeclaration
+            || candidate.IsDeleted || candidate.CxxConst || candidate.CxxVolatile;
+        if (hasDeclarationCv)
+        {
+                if (candidate.CxxConst) memberCv |= 1;
+                if (candidate.CxxVolatile) memberCv |= 2;
+                return memberCv;
+        }
+        const std::string linkage = CxxDeclarationLinkageName(candidate.UniqueName);
+        if (linkage.find("@@QEBA") != std::string::npos || linkage.find("@@UEBA") != std::string::npos)
+                memberCv |= 1;
+        if (linkage.find("@@QECA") != std::string::npos || linkage.find("@@UECA") != std::string::npos)
+                memberCv |= 2;
+        size_t cvAt = linkage.starts_with("_ZN") ? 3 : std::string::npos;
+        while (cvAt != std::string::npos && cvAt < linkage.size()
+            && (linkage[cvAt] == 'K' || linkage[cvAt] == 'V'))
+        {
+                memberCv |= linkage[cvAt] == 'K' ? 1 : 2;
+                ++cvAt;
+        }
+        return memberCv;
+}
+
+bool LLVMBackend::CxxImplicitObjectRefBinds(bool receiverRvalue, const FunctionSymbol& member)
+{
+        if (member.CxxRefQualifier == cflat_cinterop::CxxRefQualifierLValue)
+                return !receiverRvalue || (member.CxxConst && !member.CxxVolatile);
+        if (member.CxxRefQualifier == cflat_cinterop::CxxRefQualifierRValue)
+                return receiverRvalue;
+        return true;
+}
+
+bool LLVMBackend::CxxImplicitObjectViable(int receiverCv, bool receiverRvalue,
+                                          const FunctionSymbol& member) const
+{
+        return (receiverCv & ~CxxMemberCv(member)) == 0
+            && CxxImplicitObjectRefBinds(receiverRvalue, member);
+}
+
 llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot,
         const std::string& displayName, const std::string& cxxMemberReceiver,
         bool postfixMemberCall, const std::string& enclosingFunctionName)
@@ -4587,6 +4638,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // later non-C++ call cannot make a chained result reuse an earlier sret temporary.
         lastCxxRetTemp_ = nullptr;
         lastCxxRetValue_ = nullptr;
+        lastCallReturnValueCv_ = 0;
         cxxVirtualBaseRefusal_.clear();
         std::string functionName = ResolveQualifiedName(functionNameIn, forceRoot);
         if (!forceRoot && dataStructures.count(functionName) != 0
@@ -4887,6 +4939,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 candidateSet = &receiverMemberCandidates;
         }
         std::vector<FunctionSymbol> cxxOperatorCandidates;
+        // Free C++ operators dropped because a const receiver cannot bind their non-const `T&`
+        // parameter: kept for the no-overload diagnostic, which names them and the const reason.
+        std::vector<FunctionSymbol> refusedCxxOperatorCandidates;
         // Unary operators too: a derived `operator-(int)` hides the base's unary `operator-()`.
         if (functionName.starts_with("operator") && !arguments.empty()
             && !arguments.front().TypeAndValue.TypeName.empty())
@@ -4951,7 +5006,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     receiverValue.BaseType = GetType(receiverValue.TypeAndValue);
                     if (!CanImplicitlyConstructCxxClass(receiverValue,
                                                         candidate.Parameters.front()))
+                    {
+                        if ((CxxReceiverCv(arguments.front()) & 1) != 0)
+                            refusedCxxOperatorCandidates.push_back(candidate);
                         continue;
+                    }
                 }
                 if (candidate.IsCxx && candidate.IsMethod && !candidate.Parameters.empty()
                     && candidate.Parameters.front().TypeName != operatorReceiver)
@@ -5437,12 +5496,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     if (!c.IsCxx || !c.IsMethod || c.Parameters.empty()
                         || c.Parameters[0].TypeName != receiverType)
                         continue;
-                    const bool receiverRvalue = IsCxxObjectRvalue(arguments.front());
-                    const bool matches = c.CxxRefQualifier == cflat_cinterop::CxxRefQualifierNone
-                        || (c.CxxRefQualifier == cflat_cinterop::CxxRefQualifierLValue
-                            && (!receiverRvalue || (c.CxxConst && !c.CxxVolatile)))
-                        || (c.CxxRefQualifier == cflat_cinterop::CxxRefQualifierRValue
-                            && receiverRvalue);
+                    const bool matches = CxxImplicitObjectRefBinds(IsCxxObjectRvalue(arguments.front()), c);
                     if (matches) hasReceiverCompatible = true;
                     else
                     {
@@ -5877,7 +5931,33 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
 
             // Candidates
-            msg += std::format("  Candidates ({}):\n", shownCandidates.size());
+            // Only refused free operators remain: list each with the const/rvalue reason.
+            const auto& refusedOperators = refusedCxxOperatorCandidates.empty()
+                ? cxxFilteredOperatorCandidates_ : refusedCxxOperatorCandidates;
+            if (shownCandidates.empty() && !refusedOperators.empty())
+            {
+                msg += std::format("  Candidates ({}):\n", refusedOperators.size());
+                for (const FunctionSymbol& c : refusedOperators)
+                {
+                    std::string paramList;
+                    // The raw C++ spelling keeps the reference (`M&`) the mapped type loses.
+                    const auto rawSig = cxxFunctionSignatures_.find(c.SourceName);
+                    for (size_t i = 0; i < c.Parameters.size(); i++)
+                    {
+                        std::string spelled = displayParameterType(c.Parameters[i]);
+                        if (rawSig != cxxFunctionSignatures_.end())
+                            for (const auto& raw : rawSig->second)
+                                if (raw.linkageName == c.UniqueName && i < raw.paramSpellings.size())
+                                    spelled = raw.paramSpellings[i];
+                        paramList += (i > 0 ? ", " : "") + spelled;
+                    }
+                    msg += std::format("    {}({}) was rejected because the operand is const or an rvalue and the parameter is a non-const lvalue reference\n",
+                        StripCxxConstTwin(c.SourceName.empty() ? shownFunctionName : c.SourceName), paramList);
+                }
+                shownCandidates.clear();
+            }
+            else
+                msg += std::format("  Candidates ({}):\n", shownCandidates.size());
             for (const FunctionSymbol* candidatePtr : shownCandidates)
             {
                 const auto& c = *candidatePtr;
@@ -6463,13 +6543,66 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     DisplayCxxClassName(arg.TypeAndValue.TypeName),
                     parameterName, diagnosticFunctionName));
             }
+            // A C header function's mutable pointer parameter must not receive read-only C storage
+            // (a `const` C global, or a pointer to a const pointee); clang only warns (T183).
+            // CFlat-source prototypes carry no pointee const, so they are not judged.
+            std::string objectName;
+            if (candidate.IsCInteropDeclaration && !candidate.IsCxx && !inVariadicRange && argIndex < candidate.Parameters.size()
+                && candidate.Parameters[argIndex].Pointer
+                && !candidate.Parameters[argIndex].IsFunctionPointer
+                && !candidate.Parameters[argIndex].IsCxxPointeeConst
+                && IsCConstObjectArgument(arg, &objectName))
+            {
+                const std::string sourceName = !arg.CallerName.empty() ? arg.CallerName
+                    : !objectName.empty() ? objectName
+                    : arg.TypeAndValue.VariableName.empty()
+                        ? "<argument>" : arg.TypeAndValue.VariableName;
+                LogError(std::format(
+                    "cannot pass const C object argument {} ('{}') to mutable pointer parameter "
+                    "'{}': it is read-only C storage, so the parameter could write through it",
+                    argIndex + 1, sourceName, candidate.Parameters[argIndex].VariableName));
+            }
             if (candidate.IsCxx && !inVariadicRange
                 && !(candidate.IsMethod && argIndex == 0 && candidate.CxxConst)
                 && argIndex < candidate.Parameters.size())
             {
                 const TypeAndValue& param = candidate.Parameters[argIndex];
                 const TypeAndValue& source = arg.TypeAndValue;
-                if (CxxRecordPointeeConstRelation(source, param) == CxxPointeeConstRelation::Drops)
+                TypeAndValue decayedSource = source;
+                const bool fixedArraySource = source.ConstArraySize > 0 && !source.Pointer
+                    && !source.ElemPointer && !source.IsArrayView && !source.IsFunctionPointer
+                    && !source.IsInterface;
+                if (fixedArraySource)
+                {
+                    decayedSource.Pointer = true;
+                    if (decayedSource.PointerDepth == 0) decayedSource.PointerDepth = 1;
+                    decayedSource.ConstArraySize = 0;
+                }
+                auto constRelation = CxxCandidatePointeeConstRelation(
+                    candidate, argIndex, arg, param);
+                // Primitive array decay to `void*` is an object-pointer conversion too, but the
+                // class-only fallback in CxxCandidatePointeeConstRelation cannot classify it.
+                if (constRelation == CxxPointeeConstRelation::Unrelated && fixedArraySource
+                    && candidate.IsCxx && param.Pointer && param.TypeName == "void"
+                    && !param.ElemPointer && !param.IsAlias && !param.IsRvalueRef
+                    && !param.IsFunctionPointer && param.PointerDepth <= 1)
+                {
+                    bool targetConst = param.IsCxxPointeeConst;
+                    const std::string spelling = CxxReferenceParameterSpelling(candidate, argIndex);
+                    if (const size_t star = spelling.find('*');
+                        star != std::string::npos && spelling.find('*', star + 1) == std::string::npos
+                        && spelling.find_first_of("&()[") == std::string::npos)
+                    {
+                        const std::string referent = " " + spelling.substr(0, star) + " ";
+                        targetConst = referent.find(" const ") != std::string::npos;
+                    }
+                    if (decayedSource.IsCxxPointeeConst != targetConst)
+                        constRelation = decayedSource.IsCxxPointeeConst
+                            ? CxxPointeeConstRelation::Drops : CxxPointeeConstRelation::Adds;
+                    else
+                        constRelation = CxxPointeeConstRelation::Same;
+                }
+                if (constRelation == CxxPointeeConstRelation::Drops)
                 {
                     const std::string sourceName = !arg.CallerName.empty()
                         ? arg.CallerName : source.VariableName.empty()
@@ -6525,16 +6658,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             // By-value aggregate in a C or C++ extern `...` slot: no clang arrangement is emitted, so refuse
             // it (fields are lost). CFlat-bodied variadics and string values (argIsStringValue) are exempt.
             const bool calleeIsCExtern = candidate.External && !candidate.IsCxx && !candidate.HasCFlatBody;
-            const bool argIsAggregateValue = inVariadicRange && (candidate.IsCxx || calleeIsCExtern)
-                && !arg.TypeAndValue.Pointer && !argIsStringValue && !argCxxClassName.empty()
-                && (IsDataStructure(argCxxClassName)
-                    || (arg.Primary != nullptr && arg.Primary->getType()->isStructTy()));
-            if (argIsAggregateValue)
+            const std::string aggregateName = inVariadicRange && (candidate.IsCxx || calleeIsCExtern)
+                ? AggregateVariadicArgumentType(arg) : std::string{};
+            if (!aggregateName.empty())
             {
                 LogError(std::format(
                     "cannot pass aggregate value of type '{}' to the variadic '...' slot of {} "
                     "'{}'; pass a pointer or a scalar instead",
-                    DisplayCxxClassName(argCxxClassName), candidate.IsCxx ? "C++" : "C",
+                    DisplayCxxClassName(aggregateName), candidate.IsCxx ? "C++" : "C",
                     diagnosticFunctionName));
                 return nullptr;
             }
@@ -7884,6 +8015,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
         // Cache the resolved return type so callers can populate TypeAndValue after the call.
         lastCallReturnType = candidate.ReturnType;
+        lastCallReturnValueCv_ = CxxReturnValueCv(candidate);
         lastCallReturnType.IsAlias = resultIsAlias; // mark borrow-return result; inert until consumed
         if (resultIsAlias) RegisterAliasValue(result);
         // The call RESULT is now the current expression value, so a `new`/`move` that ran only in

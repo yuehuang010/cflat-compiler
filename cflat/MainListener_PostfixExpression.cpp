@@ -1,5 +1,6 @@
 #include "MainListener.h"
 #include <llvm/Support/SaveAndRestore.h>
+#include <functional>
 
 static CFlatParser::PostfixExpressionContext* SoleCxxConstructionPostfix(
     antlr4::tree::ParseTree* node)
@@ -731,6 +732,7 @@ void MainListener::DecayFlexibleArrayMember(LLVMBackend::NamedVariable& namedVar
  */
 void MainListener::DiagnoseAssignmentArguments(CFlatParser::ArgumentExpressionListContext* list) {
         if (list == nullptr) return;
+        DiagnoseSameVariableModified(list, "argument list");
         std::vector<antlr4::tree::ParseTree*> pending(list->children.rbegin(), list->children.rend());
         while (!pending.empty())
         {
@@ -747,6 +749,411 @@ void MainListener::DiagnoseAssignmentArguments(CFlatParser::ArgumentExpressionLi
                     target));
                 return;
             }
+            pending.insert(pending.end(), node->children.rbegin(), node->children.rend());
+        }
+    }
+
+namespace {
+
+// The type the same-variable walk tracks for each location it resolves: enough to know whether
+// the next '.', '->', '[n]' or '*' stays inside the object or crosses a pointer to its pointee.
+struct SameVarType
+{
+    bool known = false;               // false: a further step cannot be classified
+    std::string typeName;             // struct name for a field lookup; "<this>" = current struct
+    int depth = 0;                    // pointer depth (0 = a value)
+    bool view = false;                // `T[]` view: indexing reaches the viewed storage
+    std::vector<uint64_t> dims;       // fixed-array dimensions, outermost first
+};
+
+// Resolved location: a root object then a path of steps. A step through a pointer is a DEREF
+// boundary "*<n>" (`p->n`, `p.n`, `(*p).n`, `p[0].n` all give `p *0 .n`); ".m" is a field and
+// "[n]" an element of a fixed array, both subobjects of the location before them.
+struct SameVarLoc
+{
+    std::vector<std::string> steps;
+    SameVarType type;
+};
+
+// What the walk needs from the enclosing scope: the type of a bare root name (and its key: a
+// local, parameter or global by name, an implicit field as `this *0 .name`), and of a field.
+struct SameVarScope
+{
+    std::function<bool(const std::string&, SameVarLoc&)> root;
+    std::function<bool(const std::string&, const std::string&, SameVarType&)> field;
+};
+
+bool SameVarIsIdent(const std::string& t)
+{
+    if (t.empty() || (t[0] >= '0' && t[0] <= '9')) return false;
+    for (char ch : t)
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_'))
+            return false;
+    return true;
+}
+
+// Value of a plain integer literal (decimal or 0x hex) as decimal text, so `a[0]` and `a[00]`
+// name one element. Empty when the index is not a literal (a variable, an expression).
+std::string SameVarConstIndex(const std::string& text)
+{
+    const bool hex = text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X');
+    std::string digits = hex ? text.substr(2) : text;
+    if (digits.empty()) return {};
+    for (char ch : digits)
+    {
+        const bool dec = ch >= '0' && ch <= '9';
+        const bool hexDigit = (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+        if (!dec && !(hex && hexDigit)) return {};
+    }
+    digits.erase(0, std::min(digits.find_first_not_of('0'), digits.size()));
+    if (digits.empty()) return "0";
+    if (digits.size() > (hex ? 16u : 19u)) return {};   // too wide for 64 bits: not proven
+    return std::to_string(std::stoull(digits, nullptr, hex ? 16 : 10));
+}
+
+// `*loc`: the first element of a fixed array, else the pointee of a pointer or view.
+bool SameVarDeref(SameVarLoc& loc, const std::string& index)
+{
+    auto& t = loc.type;
+    if (!t.known) return false;
+    if (!t.dims.empty())
+    {
+        loc.steps.push_back("[" + index + "]");
+        t.dims.erase(t.dims.begin());
+        return true;
+    }
+    if (t.depth == 0 && !t.view) return false;   // a struct value: operator[] / operator*
+    loc.steps.push_back("*" + index);
+    if (t.depth > 0) t.depth--;
+    t.view = false;
+    return true;
+}
+
+// '.', '->' or '?.' member: a pointer is crossed first (CFlat's '.' on a pointer derefs too).
+bool SameVarMember(SameVarLoc& loc, const std::string& op, const std::string& member,
+                   const SameVarScope& scope)
+{
+    auto& t = loc.type;
+    if (!t.known || !t.dims.empty() || t.view) return false;
+    if (t.depth > 0)
+    {
+        if (!SameVarDeref(loc, "0")) return false;
+    }
+    else if (op != ".") return false;            // '->' on a value goes through operator->
+    if (t.depth != 0) return false;
+    SameVarType next;
+    if (!scope.field(t.typeName, member, next)) next = SameVarType{};
+    loc.steps.push_back("." + member);
+    loc.type = next;
+    return true;
+}
+
+bool SameVarResolve(antlr4::tree::ParseTree* node, SameVarLoc& loc, const SameVarScope& scope);
+
+// The location named by a postfix chain children[0, end): its primary, then each step.
+bool SameVarResolveChain(const std::vector<antlr4::tree::ParseTree*>& kids, size_t end,
+                         SameVarLoc& loc, const SameVarScope& scope)
+{
+    if (end == 0) return false;
+    auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(kids[0]);
+    if (primary == nullptr) return false;
+    size_t k = 1;
+    if (primary->expression() != nullptr && primary->children.size() == 3
+        && primary->children[0]->getText() == "(")
+    {
+        if (!SameVarResolve(primary->expression(), loc, scope)) return false;   // parens transparent
+    }
+    else if (primary->genericIdentifier() != nullptr && SameVarIsIdent(primary->getText()))
+    {
+        const std::string name = primary->getText();
+        if (!scope.root(name, loc))
+        {
+            // Not a variable: a namespace or type qualifier. `A.x` names the global `A.x`
+            // when one is registered, else the spelling with no type (a leaf only).
+            if (end < 3 || kids[1]->getText() != "."
+                || dynamic_cast<CFlatParser::MemberNameTokenContext*>(kids[2]) == nullptr)
+                return false;
+            const std::string qualified = name + "." + kids[2]->getText();
+            if (!scope.root(qualified, loc))
+            {
+                loc = SameVarLoc{};
+                loc.steps.push_back("?" + qualified);
+            }
+            k = 3;
+        }
+    }
+    else
+        return false;
+    while (k < end)
+    {
+        const std::string op = kids[k]->getText();
+        if (op == "[")
+        {
+            auto* index = k + 2 < end ? dynamic_cast<CFlatParser::ExpressionContext*>(kids[k + 1]) : nullptr;
+            if (index == nullptr || kids[k + 2]->getText() != "]") return false;
+            const std::string value = SameVarConstIndex(index->getText());
+            if (value.empty() || !SameVarDeref(loc, value)) return false;   // variable index: unknown
+            k += 3;
+            continue;
+        }
+        if (k + 1 >= end || (op != "." && op != "->" && op != "?.")
+            || dynamic_cast<CFlatParser::MemberNameTokenContext*>(kids[k + 1]) == nullptr)
+            return false;
+        if (!SameVarMember(loc, op, kids[k + 1]->getText(), scope)) return false;
+        k += 2;
+        if (k < end && dynamic_cast<CFlatParser::GenericTypeParametersContext*>(kids[k]) != nullptr)
+            return false;
+    }
+    return true;
+}
+
+// The location an lvalue expression names, through single-child wrappers, parentheses and a
+// unary '*'. False for anything not proven (a call, arithmetic, a variable index, a cast).
+bool SameVarResolve(antlr4::tree::ParseTree* node, SameVarLoc& loc, const SameVarScope& scope)
+{
+    while (node != nullptr)
+    {
+        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+            return SameVarResolveChain(postfix->children, postfix->children.size(), loc, scope);
+        if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
+            unary != nullptr && unary->unaryOperator() != nullptr)
+        {
+            if (unary->unaryOperator()->getText() != "*" || unary->castExpression() == nullptr) return false;
+            if (!SameVarResolve(unary->castExpression(), loc, scope)) return false;
+            return SameVarDeref(loc, "0");
+        }
+        if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
+            assignment != nullptr && assignment->assignmentOperator() != nullptr)
+            return false;
+        auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+        if (rule == nullptr || rule->children.size() != 1) return false;
+        node = rule->children[0];
+    }
+    return false;
+}
+
+// sizeof / alignof / __builtin_offsetof / typeof / nameof operands are never evaluated.
+bool SameVarUnevaluated(antlr4::tree::ParseTree* node)
+{
+    if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
+        unary != nullptr && !unary->children.empty())
+    {
+        const std::string head = unary->children[0]->getText();
+        return head == "sizeof" || head == "alignof" || head == "__builtin_offsetof";
+    }
+    if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+        return primary->TypeOf() != nullptr || primary->NameOf() != nullptr;
+    return false;
+}
+
+struct SameVarMod
+{
+    antlr4::ParserRuleContext* node;
+    std::vector<std::string> key;   // canonical location, for matching
+    std::string spelled;            // the operand as written, for the diagnostic
+};
+
+// The operand children[0, end) as written in the source ("p.x", "(*p).n", "a[00]").
+std::string SameVarSpelled(const std::vector<antlr4::tree::ParseTree*>& kids, size_t end)
+{
+    std::string text;
+    for (size_t k = 0; k < end; ++k) text += kids[k]->getText();
+    return text;
+}
+
+// Every `lvalue++` / `lvalue--` and `lvalue op= ...` that is evaluated under root. Not into a
+// lambda body (its own scope), and not into an unevaluated operand (it modifies nothing).
+void CollectSameVarMods(antlr4::tree::ParseTree* root, std::vector<SameVarMod>& mods,
+                        const SameVarScope& scope)
+{
+    std::vector<antlr4::tree::ParseTree*> pending{root};
+    while (!pending.empty())
+    {
+        antlr4::tree::ParseTree* node = pending.back();
+        pending.pop_back();
+        if (dynamic_cast<CFlatParser::LambdaBodyContext*>(node) != nullptr) continue;
+        if (SameVarUnevaluated(node)) continue;
+        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+        {
+            const auto& kids = postfix->children;
+            for (size_t k = 1; k < kids.size(); ++k)
+            {
+                const std::string op = kids[k]->getText();
+                if (op != "++" && op != "--") continue;
+                SameVarLoc loc;
+                if (SameVarResolveChain(kids, k, loc, scope))
+                    mods.push_back({postfix, loc.steps, SameVarSpelled(kids, k)});
+            }
+        }
+        else if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
+                 assignment != nullptr && assignment->assignmentOperator() != nullptr
+                 && assignment->unaryExpression() != nullptr)
+        {
+            SameVarLoc loc;
+            if (SameVarResolve(assignment->unaryExpression(), loc, scope))
+                mods.push_back({assignment, loc.steps, assignment->unaryExpression()->getText()});
+        }
+        pending.insert(pending.end(), node->children.rbegin(), node->children.rend());
+    }
+}
+
+// Two locations overlap when they are one object or one is a subobject of the other: a key
+// prefix whose remaining steps cross no pointer (`s` and `s.x`, never `p` and `p *0 .n`).
+bool SameVarKeysOverlap(const std::vector<std::string>& a, const std::vector<std::string>& b)
+{
+    const auto& shorter = a.size() <= b.size() ? a : b;
+    const auto& longer = a.size() <= b.size() ? b : a;
+    if (!std::equal(shorter.begin(), shorter.end(), longer.begin())) return false;
+    for (size_t k = shorter.size(); k < longer.size(); ++k)
+        if (longer[k][0] == '*') return false;
+    return true;
+}
+// True when a and b sit in the two different arms of one `?:`: only one arm runs, so their
+// modifications never both happen. The condition and the '??' right side do not count.
+bool InExclusiveTernaryArms(antlr4::tree::ParseTree* a, antlr4::tree::ParseTree* b)
+{
+    std::vector<antlr4::tree::ParseTree*> chainA;
+    for (auto* n = a; n != nullptr; n = n->parent) chainA.push_back(n);
+    antlr4::tree::ParseTree* below = nullptr;
+    for (auto* n = b; n != nullptr; below = n, n = n->parent)
+    {
+        auto it = std::find(chainA.begin(), chainA.end(), n);
+        if (it == chainA.end()) continue;
+        if (it == chainA.begin() || below == nullptr) return false;
+        antlr4::tree::ParseTree* belowA = *(it - 1);
+        auto* cond = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(n);
+        if (cond == nullptr || cond->children.size() != 5 || cond->children[1]->getText() != "?") return false;
+        const auto isArm = [&](antlr4::tree::ParseTree* t) { return t == cond->children[2] || t == cond->children[4]; };
+        return belowA != below && isArm(belowA) && isArm(below);
+    }
+    return false;
+}
+
+} // namespace
+
+// Same-variable rule (ruling 2026-10-13): an object modified more than once inside one call
+// argument list or one brace initializer list has an unspecified order, so it is refused. A
+// reader next to one modification is not covered. Called for each argument list and, from the
+// listener, for each brace initializer list; a nested list is walked by its enclosing list too.
+// Locations are keyed by what they resolve to (SameVarLoc), not by their spelling.
+void MainListener::DiagnoseSameVariableModified(antlr4::ParserRuleContext* region, const char* what)
+{
+        if (region == nullptr || unevaluatedOperandDepth_ > 0) return;
+        auto* backend = compilerLLVM;
+        const auto fromTav = [](const LLVMBackend::TypeAndValue& tv) {
+            SameVarType t;
+            t.known = true;
+            t.typeName = tv.TypeName;
+            t.depth = !tv.Pointer ? 0 : tv.PointerDepth > 0 ? tv.PointerDepth : tv.ElemPointer ? 2 : 1;
+            t.view = tv.IsArrayView;
+            if (tv.IsArrayView && t.depth > 0) t.depth--;   // the view itself, not a raw pointer
+            if (tv.ConstArraySize > 0)
+            {
+                t.dims.push_back(tv.ConstArraySize);
+                t.dims.insert(t.dims.end(), tv.ConstInnerDimensions.begin(), tv.ConstInnerDimensions.end());
+            }
+            return t;
+        };
+        // A field of the current struct ("<this>") or of a registered struct; a bitfield is a value.
+        const auto field = [backend, fromTav](const std::string& typeName, const std::string& member,
+                                              SameVarType& out) -> bool {
+            const LLVMBackend::StructData* data = nullptr;
+            if (typeName == "<this>")
+            {
+                int index = -1;
+                const LLVMBackend::BitfieldInfo* bitfield = nullptr;
+                if (backend->FindImplicitThisField(member, &data, &index, &bitfield) == nullptr) return false;
+                if (bitfield != nullptr) { out = SameVarType{}; out.known = true; out.typeName = bitfield->TypeName; return true; }
+                if (data == nullptr || index < 0 || index >= (int)data->StructFields.size()) return false;
+                out = fromTav(data->StructFields[index]);
+                return true;
+            }
+            auto it = backend->dataStructures.find(typeName);
+            if (it == backend->dataStructures.end())
+                it = backend->dataStructures.find(backend->ResolveTypeAlias(typeName));
+            if (it == backend->dataStructures.end()) return false;
+            data = &it->second;
+            for (const auto& f : data->StructFields)
+                if (f.VariableName == member) { out = fromTav(f); return true; }
+            for (const auto& bf : data->Bitfields)
+                if (bf.Name == member) { out = SameVarType{}; out.known = true; out.typeName = bf.TypeName; return true; }
+            return false;
+        };
+        // Lookup order of a bare name: local, parameter, implicit `this` field, global.
+        const SameVarScope scope{
+            [this, backend, fromTav, field](const std::string& name, SameVarLoc& loc) -> bool {
+                loc = SameVarLoc{};
+                if (name == "this")
+                {
+                    loc.steps.push_back("this");
+                    loc.type.known = true;
+                    loc.type.typeName = "<this>";
+                    loc.type.depth = 1;
+                    return true;
+                }
+                if (const auto local = backend->GetLocalVariable(name); local.Storage != nullptr)
+                {
+                    loc.steps.push_back(name);
+                    loc.type = fromTav(local.TypeAndValue);
+                    return true;
+                }
+                if (const auto arg = backend->GetFunctionArgument(name); arg.GetValue() != nullptr)
+                {
+                    loc.steps.push_back(name);
+                    loc.type = fromTav(arg.TypeAndValue);
+                    return true;
+                }
+                if (LockRootIsImplicitThisField(name))
+                {
+                    loc.steps = {"this", "*0", "." + name};
+                    if (!field("<this>", name, loc.type)) loc.type = SameVarType{};
+                    return true;
+                }
+                if (const auto global = backend->GetGlobalVariableNV(name); global.Storage != nullptr)
+                {
+                    loc.steps.push_back(name);
+                    loc.type = fromTav(global.TypeAndValue);
+                    return true;
+                }
+                return false;
+            },
+            field};
+        std::vector<SameVarMod> mods;
+        CollectSameVarMods(region, mods, scope);
+        for (size_t j = 1; j < mods.size(); ++j)
+            for (size_t i = 0; i < j; ++i)
+            {
+                if (!SameVarKeysOverlap(mods[i].key, mods[j].key)) continue;
+                if (InExclusiveTernaryArms(mods[i].node, mods[j].node)) continue;
+                const char* tail = "; the order of these modifications is unspecified - split it into separate statements";
+                if (mods[i].key == mods[j].key)
+                    LogErrorContext(mods[j].node, std::format(
+                        "'{}' is modified more than once in one {}{}", mods[j].spelled, what, tail));
+                else
+                    LogErrorContext(mods[j].node, std::format(
+                        "'{}' and '{}' overlap and are both modified in one {}{}",
+                        mods[i].spelled, mods[j].spelled, what, tail));
+                return;
+            }
+    }
+
+void MainListener::DiagnoseBraceListsUnder(antlr4::ParserRuleContext* ctx)
+{
+        std::vector<antlr4::tree::ParseTree*> pending(ctx->children.rbegin(), ctx->children.rend());
+        while (!pending.empty())
+        {
+            antlr4::tree::ParseTree* node = pending.back();
+            pending.pop_back();
+            if (auto* list = dynamic_cast<CFlatParser::InitializerListContext*>(node))
+            {
+                DiagnoseSameVariableModified(list, "brace initializer list");
+                continue;
+            }
+            if (dynamic_cast<CFlatParser::StatementContext*>(node) != nullptr
+                || dynamic_cast<CFlatParser::CompoundStatementContext*>(node) != nullptr
+                || dynamic_cast<CFlatParser::LambdaBodyContext*>(node) != nullptr
+                || SameVarUnevaluated(node))
+                continue;
             pending.insert(pending.end(), node->children.rbegin(), node->children.rend());
         }
     }
@@ -1658,8 +2065,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         CheckGuardedWrite(ctx, namedVar);
                         llvm::Value* incrementStorage = namedVar.Storage
                             ? namedVar.Storage : parenthesizedPostfixStorage;
-                        const bool constElement = namedVar.IsElementAccess
-                            && namedVar.TypeAndValue.IsCxxPointeeConst;
+                        const bool constElement = namedVar.TypeAndValue.IsCxxPointeeConst
+                            && (namedVar.IsElementAccess || !namedVar.TypeAndValue.Pointer);
                         if (constElement || !namedVar.TypeAndValue.IsCxxMutableField)   // a mutable member is writable
                             RefuseCxxConstReferentWrite(ctx, incrementStorage, "increment", constElement);
                         if (incrementStorage)
@@ -1688,13 +2095,22 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             increment.Amount++;
                             llvm::Type* incrementType = namedVar.UnionFieldType
                                 ? namedVar.UnionFieldType : namedVar.BaseType;
+                            // A loaded, returned or argument address is opaque `ptr`; alloca, GEP and
+                            // global storage carry their own type. Indirect scalars use the declared type.
+                            const bool typedIndirectScalar = !llvm::isa<llvm::AllocaInst, llvm::GetElementPtrInst,
+                                    llvm::GlobalVariable>(incrementStorage)
+                                && namedVar.BaseType != nullptr
+                                && (namedVar.BaseType->isIntegerTy()
+                                    || namedVar.BaseType->isFloatingPointTy());
                             if (!namedVar.TypeAndValue.Pointer && incrementType
                                 && incrementType->isFloatingPointTy())
                                 increment.FloatingSteps.push_back(1);
                             increment.ElemType = et;
                             increment.LoadType = namedVar.UnionFieldType
                                 ? namedVar.UnionFieldType
-                                : (parenthesizedPostfixStorage ? namedVar.BaseType : nullptr);
+                                : (parenthesizedPostfixStorage
+                                    || typedIndirectScalar
+                                    ? namedVar.BaseType : nullptr);
                         }
                         else
                         {
@@ -1730,8 +2146,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         CheckGuardedWrite(ctx, namedVar);
                         llvm::Value* decrementStorage = namedVar.Storage
                             ? namedVar.Storage : parenthesizedPostfixStorage;
-                        const bool constElement = namedVar.IsElementAccess
-                            && namedVar.TypeAndValue.IsCxxPointeeConst;
+                        const bool constElement = namedVar.TypeAndValue.IsCxxPointeeConst
+                            && (namedVar.IsElementAccess || !namedVar.TypeAndValue.Pointer);
                         if (constElement || !namedVar.TypeAndValue.IsCxxMutableField)   // a mutable member is writable
                             RefuseCxxConstReferentWrite(ctx, decrementStorage, "decrement", constElement);
                         if (decrementStorage)
@@ -1760,13 +2176,22 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             increment.Amount--;
                             llvm::Type* incrementType = namedVar.UnionFieldType
                                 ? namedVar.UnionFieldType : namedVar.BaseType;
+                            // A loaded, returned or argument address is opaque `ptr`; alloca, GEP and
+                            // global storage carry their own type. Indirect scalars use the declared type.
+                            const bool typedIndirectScalar = !llvm::isa<llvm::AllocaInst, llvm::GetElementPtrInst,
+                                    llvm::GlobalVariable>(decrementStorage)
+                                && namedVar.BaseType != nullptr
+                                && (namedVar.BaseType->isIntegerTy()
+                                    || namedVar.BaseType->isFloatingPointTy());
                             if (!namedVar.TypeAndValue.Pointer && incrementType
                                 && incrementType->isFloatingPointTy())
                                 increment.FloatingSteps.push_back(-1);
                             increment.ElemType = et;
                             increment.LoadType = namedVar.UnionFieldType
                                 ? namedVar.UnionFieldType
-                                : (parenthesizedPostfixStorage ? namedVar.BaseType : nullptr);
+                                : (parenthesizedPostfixStorage
+                                    || typedIndirectScalar
+                                    ? namedVar.BaseType : nullptr);
                         }
                         else
                         {
@@ -2494,8 +2919,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         if (fieldType.IsCxxConstField
                                             || (!fieldType.Pointer && !fieldType.IsCxxRefToPointer
                                                 && !fieldType.IsCxxMutableField
-                                                && Compiler(ctx)->IsCxxRecord(fieldType.TypeName)
-                                                && Compiler(ctx)->CxxConstReceiverKind(structVar) != 0))
+                                                && !structVar.TypeAndValue.IsCxxConstRef
+                                                && (Compiler(ctx)->CxxConstReceiverKind(structVar) == 2
+                                                    || Compiler(ctx)->IsCxxConstFieldAccess(structVar.Storage)
+                                                    || Compiler(ctx)->IsCxxConstFieldAccess(structVar.Primary))))
                                             Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Storage);
                                         if (llvm::isa<llvm::ArrayType>(fieldLLVMType))
                                         {
@@ -2512,8 +2939,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (fieldType.IsCxxConstField
                                         || (!fieldType.Pointer && !fieldType.IsCxxRefToPointer
                                             && !fieldType.IsCxxMutableField
-                                            && Compiler(ctx)->IsCxxRecord(fieldType.TypeName)
-                                            && Compiler(ctx)->CxxConstReceiverKind(structVar) != 0))
+                                            && !structVar.TypeAndValue.IsCxxConstRef
+                                            && (Compiler(ctx)->CxxConstReceiverKind(structVar) == 2
+                                                || Compiler(ctx)->IsCxxConstFieldAccess(structVar.Storage)
+                                                || Compiler(ctx)->IsCxxConstFieldAccess(structVar.Primary))))
                                     {
                                         Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Storage);
                                         Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Primary);
@@ -2579,8 +3008,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             if (fieldType.IsCxxConstField
                                                 || (!fieldType.Pointer && !fieldType.IsCxxRefToPointer
                                                     && !fieldType.IsCxxMutableField
-                                                    && Compiler(ctx)->IsCxxRecord(fieldType.TypeName)
-                                                    && Compiler(ctx)->CxxConstReceiverKind(structVar) != 0))
+                                                    && !structVar.TypeAndValue.IsCxxConstRef
+                                                    && (Compiler(ctx)->CxxConstReceiverKind(structVar) == 2
+                                                        || Compiler(ctx)->IsCxxConstFieldAccess(structVar.Storage)
+                                                        || Compiler(ctx)->IsCxxConstFieldAccess(structVar.Primary))))
                                                 Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Storage);
                                             if (llvm::isa<llvm::ArrayType>(fieldLLVMType))
                                             {
@@ -2663,8 +3094,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (fieldType.IsCxxConstField
                                         || (!fieldType.Pointer && !fieldType.IsCxxRefToPointer
                                             && !fieldType.IsCxxMutableField
-                                            && Compiler(ctx)->IsCxxRecord(fieldType.TypeName)
-                                            && Compiler(ctx)->CxxConstReceiverKind(structVar) != 0))
+                                            && !structVar.TypeAndValue.IsCxxConstRef
+                                            && (Compiler(ctx)->CxxConstReceiverKind(structVar) == 2
+                                                || Compiler(ctx)->IsCxxConstFieldAccess(structVar.Storage)
+                                                || Compiler(ctx)->IsCxxConstFieldAccess(structVar.Primary))))
                                     {
                                         Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Storage);
                                         Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Primary);
@@ -6103,6 +6536,20 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                     }
                                 }
+                                // A variadic C signature: an argument past the declared parameters is a `...`
+                                // slot, refused for a by-value aggregate exactly as a direct C variadic call.
+                                for (size_t i = funcPtrTV.FuncPtrParams.size();
+                                     funcPtrTV.FuncPtrVariadic && i < argNVs.size(); i++)
+                                {
+                                    const std::string aggregate =
+                                        Compiler(ctx)->AggregateVariadicArgumentType(argNVs[i]);
+                                    if (!aggregate.empty())
+                                        Compiler(ctx)->LogError(std::format(
+                                            "cannot pass aggregate value of type '{}' to the variadic '...' "
+                                            "slot of C function pointer '{}'; pass a pointer or a scalar instead",
+                                            Compiler(ctx)->DisplayCxxClassName(aggregate),
+                                            SpellFunctionSymbol(*Compiler(ctx), functionName)));
+                                }
                                 // Bond/move ownership-mismatch checks against the funcptr's per-param flags.
                                 size_t pcount = std::min(argNVs.size(), funcPtrTV.FuncPtrParams.size());
                                 // Pointer DEPTH: this door lowers its own argument list, so the
@@ -6596,6 +7043,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.TypeAndValue.FuncPtrReturnTypeName = argNV.TypeAndValue.FuncPtrReturnTypeName;
                                     argVar.TypeAndValue.FuncPtrReturnPointer  = argNV.TypeAndValue.FuncPtrReturnPointer;
                                     argVar.TypeAndValue.FuncPtrReturnOwned = argNV.TypeAndValue.FuncPtrReturnOwned;
+                                    argVar.TypeAndValue.FuncPtrVariadic = argNV.TypeAndValue.FuncPtrVariadic;
                                     argVar.TypeAndValue.FuncPtrParams         = argNV.TypeAndValue.FuncPtrParams;
                                     // Reading the side channel RETIRES it, like the two other
                                     // consumers, so a stale list cannot reach the next argument.
@@ -7671,6 +8119,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.TypeAndValue.FuncPtrReturnTypeName = argNV.TypeAndValue.FuncPtrReturnTypeName;
                                     argVar.TypeAndValue.FuncPtrReturnPointer  = argNV.TypeAndValue.FuncPtrReturnPointer;
                                     argVar.TypeAndValue.FuncPtrReturnOwned = argNV.TypeAndValue.FuncPtrReturnOwned;
+                                    argVar.TypeAndValue.FuncPtrVariadic = argNV.TypeAndValue.FuncPtrVariadic;
                                     argVar.TypeAndValue.FuncPtrParams         = argNV.TypeAndValue.FuncPtrParams;
                                     // Propagate bond info so bond-to-move checks work at the call site.
                                     argVar.IsBonded = argNV.IsBonded;
@@ -10743,6 +11192,24 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
             return memberVar;
         }
 
+        // Enclosing-namespace variable before the global variable and any function of the same
+        // name: inside "namespace N" a bare `lo` names N.lo (C++ lookup, innermost scope first).
+        const std::string nsQualified = compiler->ResolveQualifiedName(name);
+        if (nsQualified != name)
+        {
+            // Sibling namespace global (registered qualified, e.g. "Cfg.W").
+            auto nsGlobalNV = compiler->GetGlobalVariableNV(nsQualified);
+            if (nsGlobalNV.Storage != nullptr)
+            {
+                if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(nsGlobalNV.Storage))
+                    compiler->ValidateCxxStaticMemberDemandAtUseSite(global->getName().str());
+                CheckGlobalGuard(node, name, nsGlobalNV);
+                nsGlobalNV.IdentifierLine = (int)node->getSymbol()->getLine();
+                nsGlobalNV.IdentifierColumn = (int)node->getSymbol()->getCharPositionInLine();
+                return nsGlobalNV;
+            }
+        }
+
         // try getting global variable
         {
             auto globalNV = compiler->GetGlobalVariableNV(name);
@@ -10814,20 +11281,8 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
         // Enclosing-namespace sibling: a bare name inside "namespace N" may refer to a
         // sibling member "N.<name>" (walking outward through parent namespaces).
         // ResolveQualifiedName performs that lookup using the current namespace context.
-        std::string nsQualified = compiler->ResolveQualifiedName(name);
         if (nsQualified != name)
         {
-            // Sibling namespace global (registered qualified, e.g. "Cfg.W").
-            auto nsGlobalNV = compiler->GetGlobalVariableNV(nsQualified);
-            if (nsGlobalNV.Storage != nullptr)
-            {
-                if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(nsGlobalNV.Storage))
-                    compiler->ValidateCxxStaticMemberDemandAtUseSite(global->getName().str());
-                CheckGlobalGuard(node, name, nsGlobalNV);
-                nsGlobalNV.IdentifierLine = (int)node->getSymbol()->getLine();
-                nsGlobalNV.IdentifierColumn = (int)node->getSymbol()->getCharPositionInLine();
-                return nsGlobalNV;
-            }
             if (compiler->GetFunction(nsQualified))
             {
                 namedVar.Primary = compiler->GetFunctionForFuncPtr(nsQualified);

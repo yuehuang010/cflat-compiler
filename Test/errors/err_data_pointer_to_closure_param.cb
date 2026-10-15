@@ -2311,3 +2311,35 @@ expect_error("function-pointer signature mismatch") {
         return SigScopeUse.runNarrow(g);
     }
 }
+
+// RETURN site (T186). A named function returned as a function<> follows the same bind rule as a
+// declaration: the component proof refuses a provable mismatch, and a fewer-parameter callback is
+// the ruled accept (LLVMBackend.h DescribeFuncPtrBindMismatch), so it is NOT a leg here. Each leg
+// compiled and ran on master before this fix.
+expect_error("cannot bind function 'retBindMore' to function-pointer type 'int(int)'") {
+    int retBindMore(int a, int b) { return a + b; }
+
+    function<int(int)> retMoreParams() { return retBindMore; }
+    int retBindMoreCall() { function<int(int)> g = retMoreParams(); return g(1); }
+}
+
+expect_error("cannot bind function 'retBindPt' to function-pointer type 'int(int)'") {
+    int retBindPt(double d) { return (int)d; }
+
+    function<int(int)> retParamType() { return retBindPt; }
+    int retBindPtCall() { function<int(int)> g = retParamType(); return g(1); }
+}
+
+expect_error("cannot bind function 'retBindRt' to function-pointer type 'int(int)'") {
+    double retBindRt(int a) { return 1.0; }
+
+    function<int(int)> retReturnType() { return retBindRt; }
+    int retBindRtCall() { function<int(int)> g = retReturnType(); return g(1); }
+}
+
+expect_error("cannot bind function 'retBindPd' to function-pointer type 'int(int*)'") {
+    int retBindPd(int** p) { return 0; }
+
+    function<int(int*)> retPointerDepth() { return retBindPd; }
+    int retBindPdCall() { function<int(int*)> g = retPointerDepth(); int v = 0; return g(&v); }
+}

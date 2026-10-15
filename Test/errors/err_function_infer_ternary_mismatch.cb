@@ -1,0 +1,66 @@
+import "../library/c_variadic_fnptr.h";
+
+// A 'c ? a : b' over two function values takes one signature from its arms. Arms that name different
+// signatures are refused in either order, at every consumer: a bare 'function' (t176), an explicit
+// slot, assignment, argument, return and a C typedef slot. Closure vs thin, variadic vs plain, arity,
+// and an overloaded name with no matching overload (t182) are each covered.
+int t176One(int a) { return a + 1; }
+int t176Many(int n, ...) { return n; }
+int t182Two(int a, int b) { return a + b; }
+int t182Ov(int a) { return a; }
+int t182Ov(double a) { return 2; }
+struct T182Hold { function<int(int)> fn; };
+int t182Use(function<int(int)> g) { return g(1); }
+int t182Lo(int a) { return a; }
+int t182Hi(int a, int b) { return a + b; }
+// Int field arms shadow the same-named global functions: no function arm, so the bare 'function'
+// inference refuses the int join (not the globals' signatures).
+struct T182Bare {
+    int t182Lo = default;
+    int t182Hi = default;
+    int pick(int k) { expect_error("unknown type ''") { function f = k ? t182Lo : t182Hi; } return k; }
+};
+
+expect_error("the arms of the conditional expression have different signatures 'int(int, ...)' and 'int(int)'") {
+    function<int(int)> t182Ret(int k, T182Hold h) { return k ? t176Many : h.fn; }
+}
+
+expect_error("the arms of the conditional expression have different signatures 'int(int)' and 'int(int, ...)'") {
+    function<int(int)> t182RetB(int k, T182Hold h) { return k ? h.fn : t176Many; }
+}
+
+extern int main()
+{
+    int k = 1;
+    T182Hold h;
+    h.fn = t176One;
+    expect_error("the arms of the conditional expression have different signatures 'int(int)' and 'int(int, ...)'") { function f = k ? t176One : t176Many; }
+    expect_error("the arms of the conditional expression have different signatures 'int(int, ...)' and 'int(int)'") { function g = k ? t176Many : t176One; }
+    expect_error("the arms of the conditional expression have different signatures 'int(int)' and 'int(int, ...)'") { function f2 = k ? h.fn : t176Many; }
+    expect_error("the arms of the conditional expression have different signatures 'int(int, ...)' and 'int(int)'") { function f3 = k ? t176Many : h.fn; }
+    expect_error("the arms of the conditional expression have different signatures 'int(int)' and 'int(int, int)'") { function f4 = k ? h.fn : t182Two; }
+    expect_error("the arms of the conditional expression have different signatures 'int(int, int)' and 'int(int)'") { function f5 = k ? t182Two : h.fn; }
+    expect_error("the arms of the conditional expression have different signatures 'int(int)' and 'int(int, ...)'") { function<int(int)> e1 = k ? h.fn : t176Many; }
+    expect_error("the arms of the conditional expression have different signatures 'int(int, ...)' and 'int(int)'") { function<int(int)> e2 = k ? t176Many : t176One; }
+    expect_error("the arms of the conditional expression have different signatures 'int(int)' and 'int(int, int)'") { function<int(int)> e3 = k ? t176One : t182Two; }
+    expect_error("the arms of the conditional expression have different signatures 'int(int)' and 'int(int, ...)'") { T170Cb c1 = k ? t170_inc : t170_sum; }
+    expect_error("the arms of the conditional expression have different signatures 'int(int)' and 'int(int, ...)'") { function<int(int)> s = h.fn; s = k ? h.fn : t176Many; }
+    expect_error("the arms of the conditional expression have different signatures 'int(int)' and 'int(int, ...)'") { t182Use(k ? h.fn : t176Many); }
+    expect_error("no overload of 't182Ov' has the signature 'int(int, int)' of the other arm of the conditional expression") { function f6 = k ? t182Ov : t182Two; }
+    expect_error("the arms of the conditional expression have different signatures 'int(int, ...)' and 'int(int)'") { function<int(int)> s2 = h.fn; s2 = k ? t176Many : h.fn; }
+    expect_error("the arms of the conditional expression have different signatures 'int(int, ...)' and 'int(int)'") { t182Use(k ? t176Many : h.fn); }
+    expect_error("the arms of the conditional expression have different signatures 'int(int, ...)' and 'int(int)'") { T170Cb c2 = k ? t170_sum : t170_inc; }
+    expect_error("no overload of 't182Ov' has the signature 'int(int, ...)' of the other arm of the conditional expression") { function f7 = k ? t182Ov : t176Many; }
+    Lambda<int(int)> lx = (int a) => { return a; };
+    expect_error("the arms of the conditional expression have different signatures 'int(int)' and 'int(int, int)'") { Lambda<int(int)> lg = k ? lx : t182Two; }
+    expect_error("the arms of the conditional expression have different signatures 'int(int, int)' and 'int(int)'") { Lambda<int(int)> lh = k ? t182Two : lx; }
+    expect_error("the arms of the conditional expression have different signatures 'int(int, int)' and 'int(int)'") { function<int(int)> hf = k ? t182Two : lx; }
+    expect_error("a closure that may carry captured state cannot become a C function pointer 'function<T>'") { function<int(int)> hx = k ? t176One : lx; }
+    Lambda<int(int)> lo = (int a) => { return a + 100; };
+    expect_error("Left side of assignment is not an addressable lvalue.") { (k ? lx : t176One) = lo; }
+    function<int(int)> fpx = t176One;
+    expect_error("Left side of assignment is not an addressable lvalue.") { (k ? fpx : lx) = lo; }
+    T182Bare b;
+    b.pick(k);
+    return 0;
+}

@@ -1,3 +1,4 @@
+// cflat-twin-args: -O2
 // End-to-end C++-interop coverage. Each section exercises one path of the C++ interop
 // pipeline; on failure the section's exit code identifies which one regressed.
 //   Trivially copyable C++ records by value - layout (size, alignment, packed,
@@ -2018,6 +2019,44 @@ int t161Legs()
     return 0;
 }
 
+// T173: helpers for the field-read legs in main (legal cells only; refusals live in Test/errors).
+struct T173TrackedHolder
+{
+    cppi.Tracked field = cppi.Tracked(17);
+    cppi.Tracked pick() { return field; }
+    cppi.Tracked thisPick() { return this->field; }
+};
+[cpp] struct T173Pod { int value = 17; };
+struct T173PlainField { int value = 17; };
+struct T173PlainHolder
+{
+    T173PlainField field = default;
+    T173PlainField pick() { return field; }
+    T173PlainField thisPick() { return this->field; }
+};
+struct T173MoveHolder
+{
+    T173Pod field = default;
+    T173Pod movePick() { return move this->field; }
+    T173Pod implicitMove() { return move field; }
+};
+T173Pod T173PtrMove(T173MoveHolder* p) { return move p->field; }
+T173Pod T173OwnedPick() { T173MoveHolder s = default; return s.field; }
+// T178: implicit-this `move field` of a non-copyable C++ class is the same move as `move this->field`.
+struct T178TrackedMove
+{
+    cppi.Tracked field = cppi.Tracked(17);
+    cppi.Tracked implicitMove() { return move field; }
+    cppi.Tracked shadowed() { cppi.Tracked field = cppi.Tracked(5); return move field; }
+};
+// T178: a move-only (deleted copy) C++ field moves out under both explicit spellings.
+struct T178MoveOnlyHolder
+{
+    cppi.XvMoveOnly field = cppi.XvMoveOnly(23);
+    cppi.XvMoveOnly implicitMove() { return move field; }
+    cppi.XvMoveOnly thisMove() { return move this->field; }
+};
+
 extern int main()
 {
     // T136: the file-scope objects above are constructed at startup, before any other code runs.
@@ -2140,6 +2179,26 @@ extern int main()
     if (t123.mkV() + 1 != 8) return 12309;
     std.optional<T123Payload> t123Optional = std.optional<T123Payload>(T123Payload());
     if ((*move t123Optional).value() != 42) return 12310;
+    // T150 (clang++ -std=c++20 oracle: 2 for each): unary member/free ranking where the member is
+    // unviable (`const&&` on an lvalue, `&` on a prvalue), or a less-qualified free wins.
+    t150.RvalueOnlyMember t150Rv = default;
+    if (-t150.rvalueOnlyRef(t150Rv) != 2) return 15001;
+    if (-t150.lvalueOnlyMake() != 2) return 15002;
+    t150.CvMemberPick t150Cv = default;
+    if (-t150.cvMemberRef(t150Cv) != 2) return 15003;
+    if (-t150.prvConstMake() != 2) return 15004;
+    if (-t150.constValueMake() != 22) return 15005;
+    if (-t150.constRefMake() != 22) return 15006;
+    // T150 r3 (clang oracle: 22 each): inherited const result, inherited member, volatile operand.
+    t150.InhRetHolder t150InhRet = default;
+    if (-t150InhRet.get() != 22) return 15007;
+    t150.InhUnaryS t150InhUnary = default;
+    if (-t150InhUnary != 22) return 15008;
+    if (-t150.volPrMake() != 22) return 15009;
+    t150.VolRefS t150VolRef = default;
+    if (-t150.volRef(t150VolRef) != 22) return 15010;
+    t150.VolTemplateCopyS t150VolCopy = default;
+    if (-t150.volTemplateCopyRef(t150VolCopy) != 22) return 15011;
     // T86: a hex float (binary exponent) and a binary suffix reach C++ template deduction and overloads with clang's
     // types (clang++ -std=c++20 oracle: 2 1 1 2 / 3 4 5 6 8 / 7 4).
     if (t86.deduce(0x1p-2) != 2) return 98210;
@@ -2332,6 +2391,34 @@ extern int main()
     if (t140Recv.takeSC(nullptr) != 22 || t140Recv.takeSC('a') != 11) return 13213;
     if (t140Recv.takeSCL(5L) != 33) return 13214;
     if (t140.takeK(0) != 1) return 13215;
+    // T180 CTORTIE accept controls (clang: 33 each): an alias or typedef of the same type, an exact
+    // short or int, a single unsigned short constructor and an enum promoting to long stay exact.
+    unsigned short t180Us = 5;
+    t140.USAlias t180UsAlias = 5;
+    t140.SUA* t180Alias = new t140.SUA(t180UsAlias);
+    if (t180Alias.v != 33) return 13216;
+    delete t180Alias;
+    t140.SUT* t180Typedef = new t140.SUT(t180Us);
+    if (t180Typedef.v != 33) return 13217;
+    delete t180Typedef;
+    short t180Sh = 5;
+    t140.SSH* t180Short = new t140.SSH(t180Sh);
+    if (t180Short.v != 33) return 13218;
+    delete t180Short;
+    t140.SUO* t180Single = new t140.SUO(t180Us);
+    if (t180Single.v != 33) return 13219;
+    delete t180Single;
+    int t180In = 5;
+    t140.SIN* t180Int = new t140.SIN(t180In);
+    if (t180Int.v != 33) return 13220;
+    delete t180Int;
+    t140.EL t180El = t140.elv;
+    t140.SEN* t180Enum = new t140.SEN(t180El);
+    if (t180Enum.v != 33) return 13221;
+    delete t180Enum;
+    t140.SIN* t180IntLit = new t140.SIN(5);   // literal 5 is int: exact, clang 33
+    if (t180IntLit.v != 33) return 13222;
+    delete t180IntLit;
     // A scalar-reference constructor beside a pointer one: the null literal reaches the mirror's selector
     // as 0, so the pointer constructor wins (clang: 99).
     t87.NullRef* t87L98138 = new t87.NullRef(0, 1.5);
@@ -5531,6 +5618,12 @@ extern int main()
     if (cppi.counter_shift(15, 1) != 30)           return 642;
     if (cppi.counter_bitand(15, 7) != 7)           return 643;
     if (cppi.counter_neg(15) != -15)               return 644;
+    // Same-variable accept set (ruling 2026-10-13): distinct variables in a C++ call stay legal.
+    {
+        int sameI = 1; int sameJ = 2;
+        if (cppi.counter_add(sameI++, sameJ++) != 3 || sameI != 2 || sameJ != 3) return 64401;
+        if (cppi.add(sameI++, sameJ++) != 5 || sameI != 3 || sameJ != 4)        return 64402;
+    }
 
     // ---- C++ ++/--, dereference, arrow forwarding and bool --------------------------------------
     cppi.Cursor incdecCursor = cppi.Cursor(10);
@@ -6108,6 +6201,18 @@ extern int main()
     if (externPoly.get() != 6) return 1015;
     if (externPoly.twice() != 12) return 1016;
 
+    // T172 accept-set, frozen against the pre-fix compiler before the virtual-body diagnostic guard.
+    t172.InvalidVirtual<int>* t172PointerOnly = nullptr;
+    if (t172PointerOnly != nullptr) return 17201;
+    t172.InvalidNonvirtual<int> t172Nonvirtual = default;
+    if (t172Nonvirtual.good() != 44) return 17202;
+    t172.PolyValue<int> t172Poly = default;
+    t172Poly.value = 23;
+    if (t172Poly.get() != 23 || t172Poly.twice() != 46) return 17203;
+    t172.PureImpl<int> t172Pure = default;
+    t172.Pure<int>* t172PureBase = &t172Pure;
+    if (t172PureBase.get() != 46) return 17204;
+
     // ---- using-declarations re-export a target under an alias name ------------------------------
     // A namespace-scope using-declaration publishes the target under the ALIAS name too; the
     // symbol it links to is still the target's own.
@@ -6154,6 +6259,75 @@ extern int main()
     if (cppi.nsobj.kOld != 7)                         return 1612;
     if (cppi.nsobj.kRed.r != 1 || cppi.nsobj.kRed.b != 3) return 1613;
     if (cppi.nsobj.kName[0] != 'm')                   return 1614;
+
+    // T168 accept-set: local fixed arrays still decay to the mutable pointer overload, remain
+    // writable and work with CFlat range-for when global C/C++ array binding is added.
+    int[3] t168AcceptArray = {10, 20, 30};
+    if (t168KArrayOverloads.select(t168AcceptArray) != 1020) return 16801;
+    int t168AcceptSum = 0;
+    for (int t168Value in t168AcceptArray) t168AcceptSum += t168Value;
+    if (t168AcceptSum != 60) return 16802;
+    t168AcceptArray[1] = 21;
+    if (t168KArrayOverloads.select(t168AcceptArray) != 1021) return 16803;
+
+    // T168: C++ namespace-scope fixed arrays bind, preserve their extent and use the C++ object
+    // storage. The pointer overload results match clang++: mutable arrays choose int*, const ones
+    // choose const int*.
+    if (t168KInlineArray[2] != 103) return 16804;
+    if (t168KConstexprArray[2] != 203) return 16821;
+    if (t168KStaticArray[2] != 303) return 16822;
+    if (t168KNamespaceConstArray[2] != 403) return 16823;
+    int t168ArrayIndex = 1;
+    if (t168KInlineArray[t168ArrayIndex] != 102) return 16805;
+    if (t168KConstexprArray[t168ArrayIndex] != 202) return 16824;
+    if (t168KStaticArray[t168ArrayIndex] != 302) return 16825;
+    if (t168KNamespaceConstArray[t168ArrayIndex] != 402) return 16826;
+    if (sizeof(t168KInlineArray) != 12) return 16806;
+    if (sizeof(t168KConstexprArray) != 12) return 16827;
+    if (sizeof(t168KStaticArray) != 12) return 16828;
+    if (sizeof(t168KNamespaceConstArray) != 12) return 16829;
+    if (t168KArrayOverloads.select(t168KInlineArray) != 1102) return 16807;
+    if (t168KArrayOverloads.select(t168KConstexprArray) != 2202) return 16830;
+    if (t168KArrayOverloads.select(t168KStaticArray) != 2302) return 16831;
+    if (t168KArrayOverloads.select(t168KNamespaceConstArray) != 2402) return 16832;
+    if (t168KArrayOverloads.select(t168KConstexprArray) * 10
+        + t168KArrayOverloads.select(t168KInlineArray) != 23122) return 16840;
+    if (t168KArrayToVoid(t168KInlineArray) != 1) return 16841;
+    if (t168KRecordConstFirst(t168KConstRecords) != 3) return 16843;
+    if (t168KRecordMutableFirst(t168KMutableRecords) != 7) return 16844;
+    if (t168KConstRowFirst(t168KConstMatrix) != 4) return 16845;
+    int t168ArraySum = 0;
+    for (int t168ArrayValue in t168KInlineArray) t168ArraySum += t168ArrayValue;
+    if (t168ArraySum != 306) return 16808;
+    t168ArraySum = 0;
+    for (int t168ArrayValue in t168KConstexprArray) t168ArraySum += t168ArrayValue;
+    if (t168ArraySum != 606) return 16833;
+    t168ArraySum = 0;
+    for (int t168ArrayValue in t168KStaticArray) t168ArraySum += t168ArrayValue;
+    if (t168ArraySum != 906) return 16834;
+    t168ArraySum = 0;
+    for (int t168ArrayValue in t168KNamespaceConstArray) t168ArraySum += t168ArrayValue;
+    if (t168ArraySum != 1206) return 16835;
+    t168KInlineArray[0] = 1;
+    *t168KInlineArray = 3;
+    *t168KInlineArray += 2;
+    (*t168KInlineArray)++;
+    if (t168KInlineArray[0] != 6) return 16842;
+    t168KInlineArray[0] = 909;
+    if (t168KArrayAt(t168KInlineArray, 0) != 909) return 16809;
+    if (t168KMatrix[1][2] != 513 || sizeof(t168KMatrix) != 24) return 16815;
+    if (t168KConstQualRowFirst(t168KMatrix) != 511) return 16899;   // mutable rows into int (*const)[3]
+    if (t168KPairs[t168ArrayIndex].x != 611 || t168KPairs[t168ArrayIndex].y != 612
+        || t168KPairSum(t168KPairs) != 1223) return 16816;
+    if (t168KFloatArray[t168ArrayIndex] != 2.5f
+        || t168KFloatSecond(t168KFloatArray) != 2.5f) return 16817;
+    if (t168KEnumArray[t168ArrayIndex] != t168KEnumB) return 16818;
+    if (t168KEnumIndexed[t168KIndex1] != 72) return 16836;
+    if (t168KStringArray[t168ArrayIndex][0] != 'c') return 16819;
+    if (t168KArrayNs.inlineValues[t168ArrayIndex] != 112) return 16820;
+    if (t168KArrayNs.constexprValues[t168ArrayIndex] != 212) return 16837;
+    if (t168KArrayNs.staticValues[t168ArrayIndex] != 312) return 16838;
+    if (t168KArrayNs.namespaceValues[t168ArrayIndex] != 412) return 16839;
 
     // ---- C++ entity lookup forms (values from a clang++ -std=c++20 oracle) ---------------------
     // Pre-fix: 32001/32002/32004 "'y' is not a member of namespace", 32005-32006 "Unknown
@@ -6502,6 +6676,27 @@ extern int main()
 
     // ---- M98: reference members as aliases of the referent (cppalias) --------------------------
     int aX = 4; int aY = 6;
+    int aDec = 9;
+    cppalias.Holder aDecH = cppalias.Holder(aDec, aY);
+    aDecH.r--;
+    if (aDec != 8 || aDecH.r != 8)                       return 1911;
+    // Postfix ++/-- on a C++ call returning T& (storage = the returned address): the declared
+    // scalar is stepped, not an 8-byte pointer. Carry shape: slot 0 wraps into the next slot.
+    int[3] cfr = { -1, 7, 9 };
+    cppalias.pick_int(cfr[0])++;
+    if (cfr[0] != 0 || cfr[1] != 7 || cfr[2] != 9)      return 1912;
+    int[3] cfrDown = { 0, 7, 9 };
+    int cfrOld = cppalias.pick_int(cfrDown[0])--;
+    if (cfrOld != 0 || cfrDown[0] != -1 || cfrDown[1] != 7) return 1913;
+    short[3] cfs = { -1, 7, 7 };
+    cppalias.pick_short(cfs[0])++;
+    if (cfs[0] != 0 || cfs[1] != 7 || cfs[2] != 7)      return 1914;
+    char[3] cfc = { -1, 20, 30 };
+    cppalias.pick_char(cfc[0])++;
+    if (cfc[0] != 0 || cfc[1] != 20 || cfc[2] != 30)    return 1915;
+    double[3] cfd = { 1.5, 7.0, 9.0 };
+    cppalias.pick_double(cfd[0])++;
+    if (cfd[0] != 2.5 || cfd[1] != 7.0 || cfd[2] != 9.0) return 1916;
     cppalias.Holder aH = cppalias.Holder(aX, aY);
     if (aH.r != 4 || aH.c != 6)                         return 1872;   // reads load the referent
     int aCopy = aH.r;
@@ -12470,7 +12665,8 @@ extern int main()
         }
         cppas.Tally.reset();
         {
-            cppas.Tally[2] cells = { (a = 2), (a = 3) };
+            cppas.Tally a2 = default;
+            cppas.Tally[2] cells = { (a = 2), (a2 = 3) };
             if (cells[0].v_ != 2 || cells[1].v_ != 3 || cppas.Tally.copies != 2) return 7484;
         }
         cppas.Tally.reset();
@@ -12602,7 +12798,8 @@ extern int main()
         }
         cppas.TallyByValue.reset();
         {
-            cppas.TallyByValue[2] cells = { (va = CbOne(1)), (va += CbOne(2)) };
+            cppas.TallyByValue va2 = default;
+            cppas.TallyByValue[2] cells = { (va = CbOne(1)), (va2 += CbOne(4)) };
             if (cells[0].v_ != 2 || cells[1].v_ != 5 || cppas.TallyByValue.copies != 2
                 || cppas.TallyByValue.moves != 0 || cppas.TallyByValue.dtors != 0) return 31862;
         }
@@ -13859,17 +14056,22 @@ int LoweredUserDtorAssignLegs(int argc)
     t67j = 0;
     cpp_t67.Made t67Made = cpp_t67.Made(2, t67j++);
     if (t67Made.first != 2 || t67Made.second != 0 || t67j != 1) return 6704;
+    // Distinct counters per element (t67i, t67k, t67m): one modification per variable, same values.
     int t67i = 0;
-    cpp_t67.Pair t67Direct{t67i++, t67i++};
-    if (t67Direct.first != 0 || t67Direct.second != 1 || t67i != 2) return 6705;
+    int t67k = 1;
+    cpp_t67.Pair t67Direct{t67i++, t67k++};
+    if (t67Direct.first != 0 || t67Direct.second != 1 || t67i != 1 || t67k != 2) return 6705;
     t67i = 0;
-    cpp_t67.Pair t67Assigned = {t67i++, t67i++};
-    if (t67Assigned.first != 0 || t67Assigned.second != 1 || t67i != 2) return 6706;
+    t67k = 1;
+    cpp_t67.Pair t67Assigned = {t67i++, t67k++};
+    if (t67Assigned.first != 0 || t67Assigned.second != 1 || t67i != 1 || t67k != 2) return 6706;
     t67i = 0;
-    cpp_t67.List t67List{t67i++, t67i++};
-    if (t67List.first != 0 || t67List.second != 1 || t67i != 2) return 6707;
+    t67k = 1;
+    cpp_t67.List t67List{t67i++, t67k++};
+    if (t67List.first != 0 || t67List.second != 1 || t67i != 1 || t67k != 2) return 6707;
     t67i = 0;
-    if (cpp_t67.take({t67i++, t67i++}) != 1 || t67i != 2) return 6708;
+    t67k = 1;
+    if (cpp_t67.take({t67i++, t67k++}) != 1 || t67i != 1 || t67k != 2) return 6708;
     t67j = 0;
     cpp_t67.Obj t67Obj = cpp_t67.Obj();
     if (t67Obj.call(t67j++) != 500 || t67j != 1) return 6709;
@@ -13880,9 +14082,11 @@ int LoweredUserDtorAssignLegs(int argc)
     std.vector<int> t67Vector = std.vector<int>(2, t67j++);
     if (t67Vector[0] != 0 || t67Vector[1] != 0 || t67j != 1) return 67011;
     t67i = 0;
-    std.vector<int> t67VectorBrace{t67i++, t67i++, t67i++};
+    t67k = 1;
+    int t67m = 2;
+    std.vector<int> t67VectorBrace{t67i++, t67k++, t67m++};
     if (t67VectorBrace[0] != 0 || t67VectorBrace[1] != 1
-        || t67VectorBrace[2] != 2 || t67i != 3) return 67012;
+        || t67VectorBrace[2] != 2 || t67i != 1 || t67k != 2 || t67m != 3) return 67012;
     int[4] t67PtrArray = default;
     int* t67Ptr = &t67PtrArray[0];
     if (cpp_t67.ptr_const_ref(t67Ptr++, &t67PtrArray[0]) != 0
@@ -14289,6 +14493,55 @@ int LoweredUserDtorAssignLegs(int argc)
         if (a.items[0].h.d.v != 5 || a.items[1].h.d.v != 5) return 97006;
     }
     if (cpp_t97.made() - cpp_t97.dtor_count != 0) return 97007;
+    // T173: legal field reads through a borrowed root (copy for copyable fields, explicit move for
+    // [cpp] PODs) and an owned local's field (moved out of the dying local).
+    {
+        T173TrackedHolder th = default;
+        cppi.Tracked t1 = th.pick();
+        if (t1.value() != 17 || th.field.value() != 17) return 17301;
+        cppi.Tracked t2 = th.thisPick();
+        if (t2.value() != 17 || th.field.value() != 17) return 17302;
+        T173PlainHolder ph = default;
+        T173PlainField p1 = ph.pick();
+        if (p1.value != 17 || ph.field.value != 17) return 17303;
+        T173PlainField p2 = ph.thisPick();
+        if (p2.value != 17 || ph.field.value != 17) return 17304;
+        T173MoveHolder mh = default;
+        T173Pod m1 = mh.movePick();
+        if (m1.value != 17 || mh.field.value != 0) return 17305;
+        T173MoveHolder mh2 = default;
+        T173Pod m2 = mh2.implicitMove();
+        if (m2.value != 17 || mh2.field.value != 0) return 17306;
+        T173MoveHolder mh3 = default;
+        T173Pod m3 = T173PtrMove(&mh3);
+        if (m3.value != 17 || mh3.field.value != 0) return 17307;
+        T173Pod o = T173OwnedPick();
+        if (o.value != 17) return 17308;
+    }
+    // T178: `move field` (implicit this) takes the field path of `move this->field`; counts match
+    // clang std::move (1 ctor, 1 move, the moved-from field and the result each destroyed once).
+    {
+        cppi.reset_counts();
+        {
+            T178TrackedMove tm = default;
+            cppi.Tracked t1 = tm.implicitMove();
+            if (cppi.ctor_count() != 1 || cppi.copy_count() != 0 || cppi.move_count() != 1
+                || cppi.dtor_count() != 0) return 17309;
+            if (t1.value() != 17 || tm.field.value() != -1) return 17310;
+            T178TrackedMove ts = default;
+            cppi.Tracked t2 = ts.shadowed();
+            if (t2.value() != 5 || ts.field.value() != 17) return 17311;
+        }
+        if (cppi.dtor_count() != 5) return 17312;
+    }
+    {
+        T178MoveOnlyHolder ma = default;
+        cppi.XvMoveOnly m1 = ma.implicitMove();
+        if (m1.v != 23 || ma.field.v != -1) return 17313;
+        T178MoveOnlyHolder mb = default;
+        cppi.XvMoveOnly m2 = mb.thisMove();
+        if (m2.v != 23 || mb.field.v != -1) return 17314;
+    }
     return 0;
 }
 
@@ -14400,3 +14653,4 @@ int W4NestedJoin(int c)
     cppon.Esc* empty = nullptr;
     return W4JoinRead(empty ?? (c > 0 ? new cppon.Esc(3) : empty));
 }
+

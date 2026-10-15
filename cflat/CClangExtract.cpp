@@ -4783,6 +4783,9 @@ namespace cflat_cinterop
                 RawGlobalVar g;
                 g.name = name;
                 g.ctype = CanonicalSpelling(ctx, vd->getType().getUnqualifiedType());
+                // A const object (scalar, array, const pointer) is read-only storage in the
+                // defining .c; CFlat writes through it are refused like C++ const globals.
+                g.isConst = vd->getType().isConstQualified();
                 g.file = file; g.line = line; g.col = col;
                 st.out.globals.push_back(std::move(g));
                 return true;

@@ -34,5 +34,35 @@ extern int main()
         t140.SLL* sllNew = new t140.SLL(lvTie);
         return sllNew.v;
     }
+    // T180 CTORTIE: a same-width distinct C++ type beside the char constructor is a tie too (clang: ambiguous).
+    expect_error("call to constructor of 't140::SUS' is ambiguous") {
+        short sTie = 5;
+        t140.SUS* susNew = new t140.SUS(sTie);
+        return susNew.v;
+    }
+    expect_error("call to constructor of 't140::SUI' is ambiguous") {
+        int iTie = 5;
+        t140.SUI* suiNew = new t140.SUI(iTie);
+        return suiNew.v;
+    }
+    // A literal is its C++ type (int), not its lowered width: `5` and `-5` tie char with unsigned.
+    expect_error("call to constructor of 't140::SUI' is ambiguous") {
+        t140.SUI* suiLit = new t140.SUI(5);
+        return suiLit.v;
+    }
+    expect_error("call to constructor of 't140::SUI' is ambiguous") {
+        t140.SUI* suiNegLit = new t140.SUI(-5);
+        return suiNegLit.v;
+    }
+    expect_error("call to constructor of 't140::SUH' is ambiguous") {
+        unsigned short uhTie = 5;
+        t140.SUH* suhNew = new t140.SUH(uhTie);
+        return suhNew.v;
+    }
+    expect_error("call to constructor of 't140::SEL' is ambiguous") {
+        t140.EL elTie = t140.elv;
+        t140.SEL* selNew = new t140.SEL(elTie);
+        return selNew.v;
+    }
     return 0;
 }

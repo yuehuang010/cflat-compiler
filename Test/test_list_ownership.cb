@@ -142,6 +142,14 @@ AliasRow* apReturnAddr(alias AliasRow r) { return &r; }
 i64 apAddrByValue(AliasRow r)         { return (i64)&r; }
 void apBumpRow(alias AliasRow r)      { r.value = r.value + 5; }
 void apBumpInt(alias int v)           { v = v + 5; }
+// Postfix ++/-- on an alias scalar steps the caller's referent as its declared type.
+void apIncInt(alias int v)            { v++; }
+void apDecInt(alias int v)            { v--; }
+int  apOldInt(alias int v)            { return v++; }
+void apDecShort(alias short v)        { v--; }
+void apIncChar(alias char v)          { v++; }
+void apIncDouble(alias double v)      { v++; }
+void apIncGeneric<T>(alias T v)       { v++; }
 void apWriteThroughPtr(AliasRow* p)   { p->value = 77; }
 void apPassAddr(alias AliasRow r)     { apWriteThroughPtr(&r); }
 int  apReadText(alias AliasRow r)     { return r.text.length(); }
@@ -184,6 +192,35 @@ int testAliasParameterBorrows()
         apAddrGeneric<AliasRow>(row) == (i64)&row ? 1 : 0, 1);
     passed += Test("generic alias param address is the caller's (primitive)",
         apAddrGeneric<int>(n) == (i64)&n ? 1 : 0, 1);
+
+    // Carry shape: a pointer-width step on the referent would also rewrite the neighbour slot.
+    int[3] aiInc = { -1, 7, 9 };
+    apIncInt(aiInc[0]);
+    passed += Test("alias int ++ updates the caller's slot", aiInc[0], 0);
+    passed += Test("alias int ++ leaves the neighbour slot", aiInc[1], 7);
+    int[3] aiDec = { 0, 7, 9 };
+    apDecInt(aiDec[0]);
+    passed += Test("alias int -- updates the caller's slot", aiDec[0], -1);
+    passed += Test("alias int -- leaves the neighbour slot", aiDec[1], 7);
+    int[3] aiOld = { -1, 7, 9 };
+    passed += Test("alias int ++ yields the old value", apOldInt(aiOld[0]), -1);
+    passed += Test("alias int ++ in a return stores the new value", aiOld[0], 0);
+    short[3] aiShort = { 0, 7, 7 };
+    apDecShort(aiShort[0]);
+    passed += Test("alias short -- updates the caller's slot", aiShort[0], -1);
+    passed += Test("alias short -- leaves the neighbour slot", aiShort[1], 7);
+    char[3] aiChar = { -1, 20, 30 };
+    apIncChar(aiChar[0]);
+    passed += Test("alias char ++ updates the caller's slot", (int)aiChar[0], 0);
+    passed += Test("alias char ++ leaves the neighbour slot", (int)aiChar[1], 20);
+    double[2] aiDbl = { 1.5, 7.0 };
+    apIncDouble(aiDbl[0]);
+    passed += Test("alias double ++ updates the caller's slot", aiDbl[0] == 2.5 ? 1 : 0, 1);
+    passed += Test("alias double ++ leaves the neighbour slot", aiDbl[1] == 7.0 ? 1 : 0, 1);
+    int[3] aiGen = { -1, 7, 9 };
+    apIncGeneric<int>(aiGen[0]);
+    passed += Test("generic alias int ++ updates the caller's slot", aiGen[0], 0);
+    passed += Test("generic alias int ++ leaves the neighbour slot", aiGen[1], 7);
 
     // The address may also be stored OUT of the callee: the caller's slot outlives the call.
     g_aliasRow = apReturnAddr(row);
@@ -1539,7 +1576,7 @@ extern int main()
     total += 8;  passed += testPrimitives();
     total += 5;  passed += testElementNamedLikeUniqueAlias();
     total += 9;  passed += testAliasLvalueSemantics();
-    total += 16; passed += testAliasParameterBorrows();
+    total += 30; passed += testAliasParameterBorrows();
     total += 12; passed += testAliasParameterTempsDestruct();
     total += 7;  passed += testAliasLvalueAssignDropsOldOwner();
     total += 8;  passed += testExplicitMoveIndirectAssignments();

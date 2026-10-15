@@ -1,0 +1,30 @@
+// A C++ class with a unary member and a by-value free overload of the same operator: on an lvalue
+// operand both are identity conversions, so clang reports the call ambiguous (clang++ -std=c++20
+// oracle: "use of overloaded operator '-' is ambiguous"). CFlat must refuse, not pick one.
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    expect_error("ambiguous C++ unary operator") {
+        t150.TieConstMember constTie = default;
+        int constTieResult = -constTie;
+    }
+    expect_error("ambiguous C++ unary operator") {
+        t150.TieMutableMember mutableTie = default;
+        int mutableTieResult = -mutableTie;
+    }
+    // Binary: the hidden `operator%(RefOperand&, int)` is named with its const/rvalue reason.
+    expect_error("was rejected because the operand is const or an rvalue") {
+        t150.RefOperand refOperand = default;
+        int refOperandResult = t150.refOperandRef(refOperand) % 1;
+    }
+    // A non-const member alone on a const prvalue is not viable (clang: invalid argument type).
+    expect_error("no operator '-' for type") {
+        int memberOnlyResult = -t150.memberOnlyMake();
+    }
+    // A `const &` member binds a prvalue; a by-value free ties with it (clang: ambiguous).
+    expect_error("ambiguous C++ unary operator") {
+        int constLRefResult = -t150.constLRefMake();
+    }
+    return 0;
+}

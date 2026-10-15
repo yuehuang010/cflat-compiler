@@ -1,4 +1,5 @@
 #include <stddef.h>
+#include "cinterop_global_arrays.h"
 /* Real C (clang-compilable) fixture for the C-interop test.
    Compiled by clang-cl when imported from a .cb; the object is linked by lld. */
 
@@ -6,6 +7,22 @@
    declaration-only, mutable CFlat global. (c_handle_payload below is static,
    so it must NOT be bound - validates the internal-linkage skip.) */
 int c_global_counter = 1000;
+
+int t168KCArray[3] = {16, 17, 18};
+T168KCArrayPair t168KCPairs[2] = {{22, 23}, {24, 25}};
+int t168KCArrayRead(int index) { return t168KCArray[index]; }
+int t168KCArrayAt(int values[]) { return values[1]; }
+int t168KCPairSum(T168KCArrayPair values[]) { return values[1].x + values[1].y; }
+
+/* T183: const C globals live in read-only storage; CFlat writes through them are refused. */
+const int t183KCScalar = 41;
+const int t183KCArray[3] = {51, 52, 53};
+int t183KCMutable = 62;
+int t183KCSecond = 63;
+const int* t183KCPtr = &t183KCMutable;
+int* const t183KCConstPtr = &t183KCMutable;
+int t183KCTakeMutable(int* p) { return *p; }
+int t183KCTakeConst(const int* p) { return *p; }
 
 int c_add(int a, int b)
 {
@@ -230,3 +247,30 @@ long long cbf_ext_call_def(int v) { extern short cbf_ext_def_ret(int); volatile 
 long long cbf_ext_call_defu(int v) { extern unsigned char cbf_ext_def_retu(int); volatile int vv = v; return cbf_ext_def_retu(vv); }
 typedef short (*cbf_ext_fpr)(int);
 cbf_ext_fpr cbf_ext_identr(cbf_ext_fpr p) { return p; }
+
+/* T174: C records over-aligned by aligned(N) on the record, a member, a typedef or a union member.
+   CFlat must take clang's size, alignment and field offsets (values pinned in test_c_interop.cb). */
+struct __attribute__((aligned(16))) T174Al16 { int x; };
+struct T174Mid { char c; int x __attribute__((aligned(8))); };
+struct __attribute__((packed, aligned(8))) T174PkAl { char c; int x; };
+struct T174Outer { char c; struct T174Al16 a; };
+union T174UAl { char c; int x __attribute__((aligned(16))); };
+struct T174Plain { int x; };
+typedef struct T174Plain T174Plain16 __attribute__((aligned(16)));
+struct T174PlHold { char c; T174Plain16 p; };
+struct T174Sh { char c; short s __attribute__((aligned(8))); long long ll; };
+struct __attribute__((aligned(32))) T174Big { long long v[4]; };
+struct T174ArrHold { int tag; struct T174Al16 items[2]; };
+struct T174Al16 t174AlArr[3] = {{100}, {200}, {300}};
+struct T174Mid t174Mid = {'m', 55};
+struct T174PkAl t174Pk = {'p', 66};
+struct T174Outer t174Outer = {'o', {77}};
+struct T174PlHold t174PlH = {'h', {12}};
+struct T174Sh t174Sh = {'s', 33, 44};
+struct T174Big t174Big = {{1, 2, 3, 4}};
+struct T174ArrHold t174AH = {7, {{21}, {22}}};
+struct T174Al16* t174_base(void) { return t174AlArr; }
+int t174_al_x(int i) { return t174AlArr[i].x; }
+struct T174Al16 t174_al_id(struct T174Al16 v) { v.x += 1; return v; }
+struct T174Big t174_big_bump(struct T174Big b) { b.v[0] += 1; return b; }
+long long t174_sh_ll(void) { return t174Sh.ll; }

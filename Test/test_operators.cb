@@ -504,26 +504,36 @@ extern int main()
     Test("postfix generic float field", postfixBox.value, 2.5f);
     Test("postfix generic float function", floatPostfixGeneric<float>(1.5f), 2.5f);
 
-    float round2Same = 16777216.0f;
-    FloatPostfixFloatPair round2SameFields = {a = round2Same++, b = round2Same++};
+    // Each modification has its own variable (ruling 2026-10-13: one variable, one modification
+    // per brace or argument list); the expected values are the old single-variable ones.
+    float round2SameA = 16777216.0f;
+    float round2SameB = 16777216.0f;
+    FloatPostfixFloatPair round2SameFields = {a = round2SameA++, b = round2SameB++};
     Test("postfix float same-sign brace fields", round2SameFields.a == 16777216.0f
-        && round2SameFields.b == 16777216.0f && round2Same == 16777216.0f, true);
-    float round2Mixed = 16777216.0f;
-    FloatPostfixFloatPair round2MixedFields = {a = round2Mixed++, b = round2Mixed--};
+        && round2SameFields.b == 16777216.0f && round2SameA == 16777216.0f
+        && round2SameB == 16777216.0f, true);
+    float round2MixedA = 16777216.0f;
+    float round2MixedB = 16777216.0f;
+    FloatPostfixFloatPair round2MixedFields = {a = round2MixedA++, b = round2MixedB--};
     Test("postfix float mixed-sign brace fields", round2MixedFields.a == 16777216.0f
-        && round2MixedFields.b == 16777216.0f && round2Mixed == 16777215.0f, true);
-    float round2CallSame = 16777216.0f;
-    bool round2CallSameArgs = floatPostfixCapture(round2CallSame++, round2CallSame++);
+        && round2MixedFields.b == 16777216.0f && round2MixedA == 16777216.0f
+        && round2MixedB == 16777215.0f, true);
+    float round2CallSameA = 16777216.0f;
+    float round2CallSameB = 16777216.0f;
+    bool round2CallSameArgs = floatPostfixCapture(round2CallSameA++, round2CallSameB++);
     Test("postfix float same-sign call args", round2CallSameArgs
-        && round2CallSame == 16777216.0f, true);
-    float round2CallMixed = 16777216.0f;
-    bool round2CallMixedArgs = floatPostfixCapture(round2CallMixed++, round2CallMixed--);
+        && round2CallSameA == 16777216.0f && round2CallSameB == 16777216.0f, true);
+    float round2CallMixedA = 16777216.0f;
+    float round2CallMixedB = 16777216.0f;
+    bool round2CallMixedArgs = floatPostfixCapture(round2CallMixedA++, round2CallMixedB--);
     Test("postfix float mixed-sign call args", round2CallMixedArgs
-        && round2CallMixed == 16777215.0f, true);
-    double round2Double = 9007199254740992.0;
-    FloatPostfixDoublePair round2DoubleFields = {a = round2Double++, b = round2Double++};
+        && round2CallMixedA == 16777216.0f && round2CallMixedB == 16777215.0f, true);
+    double round2DoubleA = 9007199254740992.0;
+    double round2DoubleB = 9007199254740992.0;
+    FloatPostfixDoublePair round2DoubleFields = {a = round2DoubleA++, b = round2DoubleB++};
     Test("postfix double same-sign fields at 2^53", round2DoubleFields.a == 9007199254740992.0
-        && round2DoubleFields.b == 9007199254740992.0 && round2Double == 9007199254740992.0, true);
+        && round2DoubleFields.b == 9007199254740992.0 && round2DoubleA == 9007199254740992.0
+        && round2DoubleB == 9007199254740992.0, true);
 
     float postfixCompoundFloat = 1.5f;
     double postfixCompoundDouble = 2.5;
@@ -1120,6 +1130,7 @@ extern int main()
     if (compoundResultOwnershipLegs() != 26) return 57;
     if (byValueParamOwnershipLegs() != 66) return 58;
     if (byValueAliasTempLegs() != 68) return 59;
+    if (sameVarAcceptLegs() != 16) return 62;
     if (byValueAliasOperatorLegs() != 11) return 61;
     if (cppUnwindThroughHelperLegs() != 0) return 60;
 
@@ -2228,6 +2239,60 @@ int byValueAliasOperatorLegs()
     passed += Test("alias minus named matches direct call", baTOperatorSignature(4, false), baTOperatorSignature(4, true));
     passed += Test("alias minus named signature", baTOperatorSignature(4, false), 5050101);
     passed += Test("alias unary temporary exact counts", baTOperatorSignature(5, false), 170101);
+    return passed;
+}
+// Same-variable accept set (ruling 2026-10-13): one modification per variable, or modifications
+// of different variables, fields, array slots and pointer targets, stay legal in one call.
+int sameVarTwo(int a, int b) { return a * 100 + b; }
+struct SameVarPair { int x; int y; };
+int sameVarPtrArg(SameVarPair* p, int b) { return b; }
+struct SameVarAccum { int t; int add(int a, int b) { t = t + 1; return a * 100 + b; } };
+struct SameVarPtrField { SameVarPair* p; int bump() { sameVarPtrArg(p++, p.x++); return 0; } };
+int sameVarAcceptLegs()
+{
+    int passed = 0;
+        int i = 1; int j = 2;
+        passed += Test("same-variable accept: distinct scalars in one call", sameVarTwo(i++, j++) == 102 && i == 2 && j == 3, true);
+        int[4] a = {10, 20, 30, 40};
+        int ai = 0; int aj = 2;
+        passed += Test("same-variable accept: distinct array indexes", sameVarTwo(a[ai++], a[aj++]) == 1030 && ai == 1 && aj == 3, true);
+        SameVarPair p1 = {x = 5, y = 0}; SameVarPair p2 = {x = 7, y = 0};
+        SameVarPair* pp = &p1; SameVarPair* qq = &p2;
+        passed += Test("same-variable accept: distinct pointer bases", sameVarTwo(pp->x++, qq->x++) == 507 && p1.x == 6 && p2.x == 8, true);
+        SameVarPair s = {x = 1, y = 2};
+        passed += Test("same-variable accept: distinct fields of one base", sameVarTwo(s.x++, s.y++) == 102 && s.x == 2 && s.y == 3, true);
+        int c = 1; int y = 5;
+        passed += Test("same-variable accept: ternary then arm alone", sameVarTwo(c ? y++ : y++, 0) == 500 && y == 6, true);
+        c = 0; y = 5;
+        passed += Test("same-variable accept: ternary else arm alone", sameVarTwo(c ? y++ : y++, 0) == 500 && y == 6, true);
+        int k = 0; int m = 10;
+        for (k = 0; k < 3; k++, m++) { }
+        passed += Test("same-variable accept: comma update outside a call", k == 3 && m == 13, true);
+        int w = 4; int z = 0;
+        passed += Test("same-variable accept: one modification of each variable", sameVarTwo(w++, z++) == 400 && w == 5 && z == 1, true);
+        SameVarAccum ac = default;
+        passed += Test("same-variable accept: method call with distinct variables", ac.add(w++, z++) == 501 && ac.t == 1 && w == 6 && z == 2, true);
+        passed += Test("same-variable accept: nested call with distinct variables", sameVarTwo(sameVarTwo(w++, 0), z++) == 60002 && w == 7 && z == 3, true);
+        int[2] ci = {10, 20};
+        passed += Test("same-variable accept: distinct constant indexes", sameVarTwo(ci[0]++, ci[1]++) == 1020 && ci[0] == 11 && ci[1] == 21, true);
+        int pa = 1; int pb = 2; int* pap = &pa; int* pbp = &pb;
+        passed += Test("same-variable accept: derefs of distinct pointers", sameVarTwo((*pap)++, (*pbp)++) == 102 && pa == 2 && pb == 3, true);
+        // The pointer and its pointee are different locations; the order of the reader is unspecified,
+        // so only the order-free facts are asserted: one element is bumped and ap advanced once.
+        SameVarPair[2] arr = {{x = 3, y = 0}, {x = 7, y = 0}};
+        SameVarPair* ap = &arr[0];
+        sameVarPtrArg(ap++, ap->x++);
+        passed += Test("same-variable accept: pointer and its pointee in one call", ap == &arr[1] && arr[0].x + arr[1].x == 11, true);
+        int sx = 0;
+        passed += Test("same-variable accept: unevaluated sizeof operand", sameVarTwo((int)sizeof(sx++), sx++) == (int)sizeof(int) * 100 && sx == 1, true);
+        // r4: a call inside an unevaluated operand is not checked; a pointer FIELD and its pointee
+        // are different locations (`p.x` on a pointer field crosses the pointer).
+        int sy = 0;
+        passed += Test("same-variable accept: call inside unevaluated sizeof", sameVarTwo((int)sizeof(sameVarTwo(sy++, sy++)), sy++) == (int)sizeof(int) * 100 && sy == 1, true);
+        SameVarPair[2] farr = {{x = 3, y = 0}, {x = 7, y = 0}};
+        SameVarPtrField pf = {p = &farr[0]};
+        pf.bump();
+        passed += Test("same-variable accept: pointer field and its pointee in one call", pf.p == &farr[1] && farr[0].x + farr[1].x == 11, true);
     return passed;
 }
 int byValueAliasTempLegs()

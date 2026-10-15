@@ -332,18 +332,50 @@ void MainListener::CollectCasesFromStatement(CFlatParser::StatementContext* stmt
                 if (ctx.isTypeSwitch)
                     LogErrorContext(labeled, "cannot mix constant cases with type cases in a switch");
 
-                const EmissionMark caseMark = MarkEmission(*compiler->builder);
-                bool pendingPostfix = false;
                 LLVMBackend::TypedValue typedVal;
+                llvm::Value* rawVal = nullptr;
+                const std::string caseText = constExpr->getText();
+                const bool hasGroupedControl = caseText.find("&&") != std::string::npos
+                    || caseText.find("||") != std::string::npos
+                    || caseText.find('?') != std::string::npos;
+                auto literalControlOnly = [&](auto&& self, antlr4::tree::ParseTree* node) -> bool {
+                    if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
+                        cast != nullptr && cast->typeName() != nullptr)
+                        return false;
+                    if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(node);
+                        terminal != nullptr
+                        && terminal->getSymbol()->getType() == CFlatParser::Identifier)
+                        return false;
+                    for (auto* child : node->children)
+                        if (!self(self, child)) return false;
+                    return true;
+                };
+                auto foldedCase = hasGroupedControl && literalControlOnly(
+                    literalControlOnly, constExpr->conditionalExpression())
+                    ? FoldCompileTimeInt(compiler, constExpr->conditionalExpression())
+                    : std::nullopt;
+                if (foldedCase)
                 {
-                    // A postfix ++/-- is deferred to the statement's end; isolate it so it is seen.
-                    PendingPostfixScope postfixScope(this);
-                    typedVal = ParseConditionalExpression(constExpr->conditionalExpression());
-                    pendingPostfix = !PlusPlus.empty();
+                    // A syntax-folded case must not emit branch blocks into the enclosing function.
+                    typedVal.value = llvm::ConstantInt::getSigned(
+                        llvm::Type::getInt32Ty(*compiler->context), *foldedCase);
+                    lastNumberLiteralIsBitPattern = false;
+                    rawVal = typedVal.value;
                 }
-                llvm::Value* rawVal = typedVal.value;
-                // `case (int)E.A++:` folds to the old value but writes the enumerator: not constant.
-                if (pendingPostfix || EmittedSideEffect(caseMark)) rawVal = nullptr;
+                else
+                {
+                    const EmissionMark caseMark = MarkEmission(*compiler->builder);
+                    bool pendingPostfix = false;
+                    {
+                        // A postfix ++/-- is deferred to the statement's end; isolate it so it is seen.
+                        PendingPostfixScope postfixScope(this);
+                        typedVal = ParseConditionalExpression(constExpr->conditionalExpression());
+                        pendingPostfix = !PlusPlus.empty();
+                    }
+                    rawVal = typedVal.value;
+                    // `case (int)E.A++:` folds to the old value but writes the enumerator: not constant.
+                    if (pendingPostfix || EmittedSideEffect(caseMark)) rawVal = nullptr;
+                }
                 auto* val = llvm::dyn_cast_or_null<llvm::ConstantInt>(rawVal);
                 // An enum member (or a const global) reads back as a load from a constant global,
                 // not a ConstantInt; fold it with the same lookup `if const` uses.
@@ -690,6 +722,11 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 trivialCxxMoveSite_ = TopLevelMoveExpression(assignExpr);
             returnNV = ParseAssignmentExpressionNamed(assignExpr, ResultUse::ReturnOperand);
             trivialCxxMoveSite_ = nullptr;
+            // Variadic-ness of a returned function-pointer VALUE must match the declared return slot.
+            if (returnFnPtrTV.IsFunctionPointer && returnNV.TypeAndValue.IsFunctionPointer)
+                if (std::string why = compiler->DescribeFuncPtrVariadicMismatch(
+                        returnFnPtrTV, returnNV.TypeAndValue); !why.empty())
+                    LogErrorContext(errCtx, why);
             // [immovable] C++ record: C++17 elision builds a fresh prvalue in the sret slot, so only a place
             // operand (variable, field, element, deref) is refused; a fresh one stays legal.
             if (cxxSretReturn && !compiler->currentFunctionReturnTV.Pointer && !compiler->currentFunctionReturnTV.IsAlias
@@ -769,24 +806,57 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && !compiler->IsCopyableType(returnNV.TypeAndValue.TypeName);
         const bool returnReadsPointerPointee = returnIsPointerDeref || returnIsPointerIndex
             || returnIsThisDeref;
+        // A GEP chain ending at a LoadInst reached the struct through a pointer (`this->f`, `f`, `p->f`):
+        // a borrow. An owned local (`s.f`) ends at its alloca, a global at its GlobalVariable.
+        bool returnReadsBorrowedField = false;
+        if (returnStorageGep != nullptr
+            && (!returnNV.FieldName.empty() || returnStorageGep->getNumIndices() == 2))
+        {
+            llvm::Value* chainRoot = returnStorageGep;
+            while (auto* chainGep = llvm::dyn_cast<llvm::GEPOperator>(chainRoot))
+                chainRoot = chainGep->getPointerOperand();
+            returnReadsBorrowedField = llvm::isa<llvm::LoadInst>(chainRoot);
+        }
+        const bool returnCxxBorrowedField = returnReadsBorrowedField
+            && (compiler->IsCxxRecord(returnNV.TypeAndValue.TypeName)
+                || compiler->IsForeignNontrivialCxxClass(returnNV.TypeAndValue.TypeName))
+            && !compiler->IsCopyableType(returnNV.TypeAndValue.TypeName);
         if (!defaultValue && assignExpr != nullptr
             && returnNV.Storage != nullptr
             && !compiler->currentFunctionReturnTV.IsAlias
             && !returnNV.TypeAndValue.Pointer && !returnNV.TypeAndValue.IsMove
             && returnNV.TypeAndValue.TypeName == compiler->currentFunctionReturnTypeName
             && compiler->IsDataStructure(returnNV.TypeAndValue.TypeName)
-            && !compiler->IsCxxRecord(returnNV.TypeAndValue.TypeName)
-            && !compiler->IsForeignNontrivialCxxClass(returnNV.TypeAndValue.TypeName)
+            // A non-copyable C++ class (every [cpp] struct: its mirror deletes the copy ctor) read
+            // through a pointer, `*this`, or a field of a borrowed root is refused, never moved
+            // out of the pointee (T169, T173).
+            && ((!compiler->IsCxxRecord(returnNV.TypeAndValue.TypeName)
+                    && !compiler->IsForeignNontrivialCxxClass(returnNV.TypeAndValue.TypeName))
+                || ((returnReadsPointerPointee || returnReadsBorrowedField)
+                    && !compiler->IsCopyableType(returnNV.TypeAndValue.TypeName)))
             && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName)
-            // Field / fixed-array GEPs keep their copy-or-move arm below. A one-index GEP over a
-            // struct pointer is `a[0]`, which is still a borrowed pointer read to refuse here.
-            && returnReadsPointerPointee
+            // Field / fixed-array GEPs of an owned root keep their copy-or-move arm below. A
+            // one-index GEP over a struct pointer is `a[0]`, still a borrowed pointer read.
+            && (returnReadsPointerPointee || returnCxxBorrowedField)
+            // An explicit `return move this->f;` of a C++ class field is the sanctioned transfer (m10
+            // ruling 4); a foreign class move result carries no IsMove flag, so test the syntax.
+            && !((compiler->IsCxxRecord(returnNV.TypeAndValue.TypeName)
+                    || compiler->IsForeignNontrivialCxxClass(returnNV.TypeAndValue.TypeName))
+                && TopLevelMoveExpression(assignExpr) != nullptr)
             && ReturnSourceIsIndirectOwningLvalue(returnNV, returnNV.Primary))
         {
-            LogErrorContext(errCtx, std::format(
-                "cannot return owning struct '{}' through pointer; use 'return move {};' "
-                "to transfer it, or copy the value before returning",
-                SpellType(*compiler, returnNV.TypeAndValue), retText));
+            const bool cxxPointee = compiler->IsCxxRecord(returnNV.TypeAndValue.TypeName)
+                || compiler->IsForeignNontrivialCxxClass(returnNV.TypeAndValue.TypeName);
+            LogErrorContext(errCtx, cxxPointee
+                ? std::format(
+                    "cannot copy C++ class '{}' into the return slot: its copy constructor is deleted "
+                    "- the source is borrowed through a pointer; return a pointer, or use "
+                    "'return move {};' to transfer it",
+                    compiler->DisplayCxxClassName(returnNV.TypeAndValue.TypeName), retText)
+                : std::format(
+                    "cannot return owning struct '{}' through pointer; use 'return move {};' "
+                    "to transfer it, or copy the value before returning",
+                    SpellType(*compiler, returnNV.TypeAndValue), retText));
         }
         if (!defaultValue && compiler->currentFunctionReturnTV.TypeName == "string"
             && !compiler->currentFunctionReturnTV.Pointer
@@ -1060,7 +1130,12 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             bool xvalueReturn = false;
             bool xvalueConstSource = false;
             std::string sourceName;
-            if (explicitMove && IsBareIdentifierText(moveName))
+            // `move f` of an implicit-this field has a bare name but no local behind it: it takes
+            // the parsed field path below, exactly like `move this->f`.
+            const bool moveNamesImplicitField = explicitMove && IsBareIdentifierText(moveName)
+                && compiler->GetScopedLocalOrArgument(moveName).Storage == nullptr
+                && compiler->HasMemberVariable(moveName);
+            if (explicitMove && IsBareIdentifierText(moveName) && !moveNamesImplicitField)
             {
                 source = compiler->GetScopedLocalOrArgument(moveName);
                 sourceName = moveName;
@@ -1175,8 +1250,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             }
             // Plan converting-constructors.md point 1: `return u;` is `return T(u);`, built
             // straight into the return slot.
-            if (!explicitMove && (source.Storage == nullptr || source.TypeAndValue.Pointer
-                                  || source.TypeAndValue.TypeName != typeName))
+            if (source.Storage == nullptr || source.TypeAndValue.Pointer
+                || source.TypeAndValue.TypeName != typeName)
             {
                 std::string refusal;
                 LLVMBackend::NamedVariable converted = returnNV;
@@ -1726,8 +1801,12 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         }
         // A string LITERAL is a 'const char*', never a 'T*' - the RETURN leg of the same gate the
         // declarator, `=`, brace-init, field-default and argument sites apply.
+        const auto& retTV = compiler->currentFunctionReturnTV;
+        const bool retFunctionSlot = retTV.IsFunctionPointer || (!retTV.Pointer
+            && compiler->GetEncodedClosureType(compiler->ResolveTypeAlias(retTV.TypeName)) != nullptr);
         RejectImplicitPrimitiveToPointer(
-            errCtx, compiler->currentFunctionReturnTV, returnNV, right, "return", "the pointer");
+            errCtx, retTV, returnNV, right, "return",
+            retFunctionSlot ? "the function value" : "the pointer");
         RejectStringLiteralIntoStructPointer(errCtx, compiler->currentFunctionReturnTV, right,
                                              "the return value");
         // Coerce the returned value to the function-pointer return type (thin vs
@@ -1814,12 +1893,17 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             auto* stringTy = llvm::StructType::getTypeByName(*compiler->context, "string");
             const bool cxxClassReturn = compiler->IsCxxRecord(
                 compiler->currentFunctionReturnTV.TypeName);
+            const std::string targetType = compiler->currentFunctionReturnTypeName;
+            const std::string sourceType = returnNV.TypeAndValue.TypeName;
+            const bool distinctCxxClassSource = !returnNV.TypeAndValue.Pointer
+                && !sourceType.empty() && compiler->IsCxxRecord(sourceType)
+                && compiler->IsCxxRecord(targetType)
+                && compiler->ResolveTypeAlias(sourceType) != compiler->ResolveTypeAlias(targetType);
             if (cxxClassReturn && returnTy->isStructTy()
-                && !right->getType()->isStructTy() && !right->getType()->isPointerTy()
-                && compiler->IsCxxTriviallyCopyableRecord(
-                    compiler->currentFunctionReturnTV.TypeName))
+                && (distinctCxxClassSource
+                    || (!right->getType()->isStructTy() && !right->getType()->isPointerTy()
+                        && compiler->IsCxxTriviallyCopyableRecord(targetType))))
             {
-                const std::string targetType = compiler->currentFunctionReturnTV.TypeName;
                 auto* convertedSlot = compiler->CreateAlloca(returnTy);
                 auto convertedSource = returnNV;
                 std::string refusal;
@@ -2747,6 +2831,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
     }
 
 void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
+        DiagnoseBraceListsUnder(statement);
         auto* compiler = Compiler(statement);
         compiler->SetCurrentDebugLocation(statement->getStart()->getLine());
 
@@ -4417,19 +4502,19 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         {
                             auto wide = compiler->WidenCaseValue(entry.value, entry.valueIsUnsigned);
                             if (!compiler->CaseValueFits(wide, entry.valueIsUnsigned, condVal->getType(), condIsUnsigned))
-                                LogErrorContext(labeledCtx, compiler->LocalizeMessage(
+                                LogErrorContext(labeledCtx, std::format(
                                     "case label '{}' does not fit the switch operand type '{}'",
-                                    { llvm::toString(wide, 10, true),
-                                      LLVMBackend::SpellIntegerType(condVal->getType(), condIsUnsigned) }));
+                                    llvm::toString(wide, 10, true),
+                                    LLVMBackend::SpellIntegerType(condVal->getType(), condIsUnsigned)));
                         }
                         auto* coerced = compiler->CoerceCaseValue(entry.value, condVal->getType(), entry.valueIsUnsigned);
                         // Two labels that convert to the same operand-typed constant would make an
                         // invalid SwitchInst, so diagnose them here instead of failing verification.
                         std::string key = llvm::toString(coerced->getValue(), 16, false);
                         if (seenCaseValues.count(key) > 0)
-                            LogErrorContext(labeledCtx, compiler->LocalizeMessage(
+                            LogErrorContext(labeledCtx, std::format(
                                 "duplicate case label '{}' in switch",
-                                { llvm::toString(coerced->getValue(), 10, !condIsUnsigned) }));
+                                llvm::toString(coerced->getValue(), 10, !condIsUnsigned)));
                         seenCaseValues[key] = labeledCtx;
                         switchInst->addCase(coerced, entry.block);
                     }
@@ -5249,7 +5334,11 @@ std::optional<int64_t> MainListener::EvalIfConstConstant(antlr4::tree::ParseTree
                 return EvalIfConstConstant(asn->conditionalExpression(), forceScratch, suppress);
             return std::nullopt;  // an actual assignment is not a constant
         }
-        // No short-circuit control flow at or below this node: emit-and-fold the leaf.
+        // Fold nested groups in the syntax tree before emission; their IR joins are not a
+        // constant value and would leave throwaway control-flow blocks in a live function.
+        if (IsGroupedFoldCandidate(node))
+            if (auto folded = FoldCompileTimeInt(Compiler(), node)) return folded;
+        // Other constant expressions still use codegen folding (sizeof, imported constants, etc.).
         return EmitAndFoldIfConstLeaf(node, forceScratch, suppress);
     }
 

@@ -1394,6 +1394,24 @@ void LLVMBackend::StoreCoerceAt(llvm::Value* structSlot, llvm::Value* val, uint6
  * sign-extend to i32, float and half widen to double. Every variadic tail goes through here,
  * the plain call path and the ABI-lowered (sret) path alike.
  */
+std::string LLVMBackend::AggregateVariadicArgumentType(const NamedVariable& arg) const
+{
+        if (arg.TypeAndValue.Pointer) return "";
+        if (arg.Primary != nullptr
+            && arg.Primary->getType() == llvm::StructType::getTypeByName(*context, "string"))
+            return "";
+        std::string name = arg.TypeAndValue.TypeName;
+        if (name.empty())
+            if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(
+                    arg.Primary != nullptr ? arg.Primary->getType() : arg.BaseType))
+                name = st->getName().str();
+        if (name.empty()) return "";
+        if (IsDataStructure(name)
+            || (arg.Primary != nullptr && arg.Primary->getType()->isStructTy()))
+            return name;
+        return "";
+}
+
 llvm::Value* LLVMBackend::PromoteVariadicArgument(llvm::Value* value)
 {
         auto valueType = value->getType();

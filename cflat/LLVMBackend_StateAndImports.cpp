@@ -2049,7 +2049,8 @@ uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& header
                                         bool cxxMode, bool cxxDefinitionsEmitted,
                                         const std::string& cppStandard,
                                         const std::string& targetCpu,
-                                        const std::string& targetFeatures)
+                                        const std::string& targetFeatures,
+                                        bool debugInfo)
 {
         uint64_t h = 14695981039346656037ULL;
         auto fold = [&h](const std::string& s) {
@@ -2073,6 +2074,9 @@ uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& header
         // disk today; keying it apart means an older entry can never be mistaken for one either.
         if (cxxMode) fold(cxxDefinitionsEmitted ? "|EDEF" : "|EDECL");
         if (cxxMode && cflat_cinterop::CxxEagerBodies()) fold("|BEAGER");
+        // -g changes the header-body bitcode (DISubprograms, and CodeView on a Windows target
+        // through the triple above), so a -g entry and a non-g entry never share a key.
+        if (cxxMode && debugInfo) fold("|G");
         // C++ request and header-body bitcode uses O1 with LLVM passes disabled.
         if (cxxMode)
         {
@@ -2153,6 +2157,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
             if (s.FuncPtrReturnPointer) j["fprp"] = true;
             if (s.FuncPtrReturnOwned) j["fpro"] = true;
             if (s.FuncPtrReturnAlias) j["fpra"] = true;
+            if (s.FuncPtrVariadic) j["fpv"] = true;
             if (s.FuncPtrReturnPointerDepth > 1) j["fprd"] = s.FuncPtrReturnPointerDepth;
             if (!s.FuncPtrReturnResolvedKey.empty()) j["fprk"] = s.FuncPtrReturnResolvedKey;
             nlohmann::json fps = nlohmann::json::array();
@@ -2228,6 +2233,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
             s.FuncPtrReturnPointer = j.value("fprp", false);
             s.FuncPtrReturnOwned = j.value("fpro", false);
             s.FuncPtrReturnAlias = j.value("fpra", false);
+            s.FuncPtrVariadic = j.value("fpv", false);
             s.FuncPtrReturnPointerDepth = j.value("fprd", s.FuncPtrReturnPointerDepth);
             s.FuncPtrReturnResolvedKey = j.value("fprk", std::string{});
             if (j.contains("fpp"))
@@ -2528,10 +2534,12 @@ nlohmann::json LLVMBackend::GlobalToJson(const CGlobalEntry& g)
                 j["cv"] = g.constantValue;
         }
         if (g.isCxxConstexpr) j["cxce"] = true;
+        if (!g.bindRefusal.empty()) j["br"] = g.bindRefusal;
         if (!g.file.empty()) j["fl"] = g.file;
         if (g.isInternalLinkage) j["il"] = true;
         if (g.constInitHash != 0) j["ci"] = g.constInitHash;
         if (g.isDllImport) j["dli"] = true;
+        if (g.fromCxxHeader) j["cxh"] = true;
         return j;
 }
 
@@ -2552,10 +2560,12 @@ LLVMBackend::CGlobalEntry LLVMBackend::GlobalFromJson(const SjVal& j)
         }
         g.constantValue = j.value("cv", (int64_t)0);
         g.isCxxConstexpr = j.value("cxce", false);
+        g.bindRefusal = j.value("br", std::string{});
         g.file = j.value("fl", std::string{});
         g.isInternalLinkage = j.value("il", false);
         g.constInitHash = j.value("ci", uint64_t{0});
         g.isDllImport = j.value("dli", false);
+        g.fromCxxHeader = j.value("cxh", false);
         g.line = j.value("ln", 1);
         g.col  = j.value("co", 0);
         return g;

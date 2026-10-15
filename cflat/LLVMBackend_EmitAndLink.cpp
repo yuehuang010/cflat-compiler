@@ -2970,6 +2970,7 @@ bool LLVMBackend::EmitCxxDemandCompanions()
         mix(std::to_string(kCHeaderCacheVersion));
         if (CacheBuildStampEnabled()) mix(CompilerBuildStamp());
         if (cflat_cinterop::CxxEagerBodies()) mix("|BEAGER");
+        if (cDebugInfo_) mix("|G");
         mix(CInteropTargetTriple());
         mix(cppStandard_);
         mix(ProgramTargetCPUFeatures().first);

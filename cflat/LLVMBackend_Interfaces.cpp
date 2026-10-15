@@ -344,6 +344,11 @@ const LLVMBackend::TypeAndValue* LLVMBackend::FindFunctionTypeAlias(const std::s
         return nullptr;
     }
 
+bool LLVMBackend::NativeTypeShadowsFunctionAlias(const std::string& name) const
+{
+        return dataStructures.count(name) > 0 || enumBackingTypes.count(name) > 0 || HasInterface(name);
+}
+
 const LLVMBackend::TypeAndValue* LLVMBackend::FindOrRequestFunctionTypeAlias(
     const std::string& name)
 {
@@ -1629,6 +1634,18 @@ llvm::Value* LLVMBackend::CoerceToFuncPtrReturn(llvm::Value* val, const TypeAndV
                 if (auto* correctFn = GetFunctionForFuncPtr(returnNV.CallerName, expectedCount,
                         &retTV.FuncPtrParams, &retTV))
                     val = correctFn;
+            }
+            // A single named function has no overload to re-select, but its signature is part of
+            // its type: refused as the declaration and assignment sites refuse it (return follows
+            // the assignment rules). The bind rule is the one GetFunctionForFuncPtr applies.
+            else if (overloads != functionTable.end() && overloads->second.size() == 1)
+            {
+                const TypeAndValue onlySig = FuncPtrSigOfSymbol(overloads->second.front());
+                if (std::string why = DescribeFuncPtrVariadicMismatch(retTV, onlySig); !why.empty())
+                    LogRawError(why);
+                else if (std::string why2 = DescribeFuncPtrBindMismatch(returnNV.CallerName, onlySig, retTV);
+                         !why2.empty())
+                    LogRawError(why2);
             }
         }
         // Same alias-param door as the declaration and argument sites: a named function whose

@@ -442,9 +442,11 @@ static LLVMBackend::TypeAndValue VisibleVariableType(LLVMBackend* compiler, cons
         return compiler->GetScopedLocalOrArgument(name).TypeAndValue;
     if (compiler->HasMemberVariable(name))
         return compiler->GetMemberVariable(name).TypeAndValue;
-    if (auto global = compiler->GetGlobalVariableNV(name); global.Storage != nullptr)
-        return global.TypeAndValue;
-    return compiler->GetGlobalVariableNV(compiler->ResolveQualifiedName(name)).TypeAndValue;
+    // Same order as ParseIdentifier: an enclosing-namespace variable shadows the global of its name.
+    if (const std::string nsQualified = compiler->ResolveQualifiedName(name);
+        nsQualified != name && compiler->GetGlobalVariableNV(nsQualified).Storage != nullptr)
+        return compiler->GetGlobalVariableNV(nsQualified).TypeAndValue;
+    return compiler->GetGlobalVariableNV(name).TypeAndValue;
 }
 
 // The identifier a typeName spells when it is exactly one unqualified, non-generic name with no
@@ -766,6 +768,44 @@ static std::optional<int64_t> ParseScannerIntegerLiteral(const std::string& text
  * constant-folding leaf for the emitting one. Any change to EvalIfConstConstant's structure must
  * be mirrored here. Whatever folds to nullopt is undecidable, which every caller handles safely.
  */
+// A grouped &&/||/?: that the syntax folder may decide. Typed casts are excluded: the folder computes
+// in plain int64, so `(u32)0` would lose its unsignedness in a relational compare.
+static bool HasNoTypedCast(antlr4::tree::ParseTree* node) {
+    if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
+        cast != nullptr && cast->typeName() != nullptr)
+        return false;
+    for (auto* child : node->children)
+        if (!HasNoTypedCast(child)) return false;
+    return true;
+}
+// Structural (never text: a string literal can hold "&&" or "?").
+static bool HasShortCircuit(antlr4::tree::ParseTree* node) {
+    if (node == nullptr) return false;
+    if (auto* a = dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(node);
+        a != nullptr && a->inclusiveOrExpression().size() > 1)
+        return true;
+    if (auto* o = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(node);
+        o != nullptr && o->logicalAndExpression().size() > 1)
+        return true;
+    for (auto* child : node->children)
+        if (HasShortCircuit(child)) return true;
+    return false;
+}
+static bool HasTernary(antlr4::tree::ParseTree* node) {
+    if (node == nullptr) return false;
+    if (auto* c = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node);
+        c != nullptr && c->expression() != nullptr)
+        return true;
+    for (auto* child : node->children)
+        if (HasTernary(child)) return true;
+    return false;
+}
+static bool IsStructurallyGrouped(antlr4::tree::ParseTree* node) {
+    return HasShortCircuit(node) || HasTernary(node);
+}
+static bool IsGroupedFoldCandidate(antlr4::tree::ParseTree* node) {
+    return IsStructurallyGrouped(node) && HasNoTypedCast(node);
+}
 static std::optional<int64_t> FoldCompileTimeInt(LLVMBackend* compiler, antlr4::tree::ParseTree* node) {
         if (node == nullptr) return std::nullopt;
         if (auto* c = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
@@ -5309,6 +5349,10 @@ public:
     // (`return (f ? x : y);`), or null. Shape probe only.
     static CFlatParser::ConditionalExpressionContext* SoleTernaryExpression(
         antlr4::tree::ParseTree* node);
+    // Signature of one arm of a bare `function f = c ? a : b;`: a plain local/argument name (its
+    // declared function type) or a plain function name with exactly one overload. False otherwise.
+    bool ResolveBareFunctionArmSignature(antlr4::ParserRuleContext* arm,
+        LLVMBackend::TypeAndValue& out);
 
     /*
      * M4b - declare a local of a foreign NONTRIVIAL C++ class by CONSTRUCTING INTO ITS SLOT.
@@ -6484,6 +6528,24 @@ public:
     void JoinTernaryClassPointee(LLVMBackend::TypedValue& result,
                                  const LLVMBackend::TypedValue& trueArm,
                                  const LLVMBackend::TypedValue& falseArm);
+    // `c ? a : b` over two function values: resolves an overloaded name arm against the other
+    // arm, and refuses arms whose signatures provably differ (every consumer sees that refusal).
+    void UnifyTernaryFunctionArms(antlr4::ParserRuleContext* ctx,
+                                  antlr4::ParserRuleContext* trueArm,
+                                  antlr4::ParserRuleContext* falseArm,
+                                  llvm::Value*& trueValue, llvm::Value*& falseValue,
+                                  LLVMBackend::TypedValue& trueShape,
+                                  LLVMBackend::TypedValue& falseShape);
+    // `c ? a : b` with a closure arm and a named-function / thin function<> arm of the same signature:
+    // lifts the function arm into the closure form (in its own arm block) so the join is closure-typed.
+    // Returns true when an arm was lifted: the join is then a fresh value, never an lvalue.
+    bool LiftTernaryFunctionArmToClosure(antlr4::ParserRuleContext* ctx,
+                                         llvm::Value*& trueValue, llvm::Value*& falseValue,
+                                         LLVMBackend::TypedValue& trueShape,
+                                         LLVMBackend::TypedValue& falseShape,
+                                         llvm::Value*& trueStorage, llvm::Value*& falseStorage,
+                                         const std::function<void()>& atTrue,
+                                         const std::function<void()>& atFalse);
     static void JoinTernaryPointerShape(LLVMBackend::TypedValue& result,
                                         const LLVMBackend::TypedValue& trueArm,
                                         const LLVMBackend::TypedValue& falseArm);
@@ -6826,7 +6888,8 @@ public:
     llvm::Value* TryUnaryFreeOperatorOverload(
         llvm::Value* operand, const std::string& op,
         antlr4::ParserRuleContext* ctx, llvm::Value* operandStorage,
-        bool operandIsConst = false, bool operandExplicitMove = false);
+        bool operandIsConst = false, bool operandExplicitMove = false,
+        bool operandIsConstPrvalue = false);
 
     // If an operator overload (e.g. operator+) just returned an owned heap string as an
     // unnamed SSA temporary, register it for end-of-full-expression cleanup. This is the
@@ -7700,6 +7763,18 @@ public:
 
     // Ruling 2026-09-27: an assignment anywhere inside a call argument is refused, any callee.
     void DiagnoseAssignmentArguments(CFlatParser::ArgumentExpressionListContext* list);
+
+    // Ruling 2026-10-13: a variable modified twice inside one argument list or brace initializer
+    // list (`what` names which) is refused; the walk covers the whole region, nested lists included.
+    void DiagnoseSameVariableModified(antlr4::ParserRuleContext* region, const char* what);
+    // > 0 while EvaluateOperandTypeOnly lowers an unevaluated operand: nothing there runs, so
+    // the same-variable rule is off (a call inside `sizeof(...)` is not checked).
+    int unevaluatedOperandDepth_ = 0;
+
+    // Runs DiagnoseSameVariableModified on every brace list under ctx, not entering a nested
+    // statement, compound statement or lambda body (those check their own). Called at codegen of
+    // each statement and declaration, so an expect_error block sees the refusal in its scope.
+    void DiagnoseBraceListsUnder(antlr4::ParserRuleContext* ctx);
 
     // Walk down single-child rule nodes to find a UnaryExpressionContext.
     // Returns nullptr if the path branches or never reaches a unaryExpression.

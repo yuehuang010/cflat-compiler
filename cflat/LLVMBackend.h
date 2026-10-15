@@ -927,6 +927,8 @@ public:
         // recovered from the bound function symbol and makes indirect calls follow direct calls.
         bool FuncPtrReturnOwned = false;
         bool FuncPtrReturnAlias = false;
+        // C variadic signature `R (*)(P..., ...)`: calls pass the tail with default promotions.
+        bool FuncPtrVariadic = false;
         /*
          * Number of '*' on a signature component. 0 means NOT RECORDED, never "not a pointer" -
          * `Pointer` already answers that, and many producers (C-interop, WinRT, synthesized
@@ -1296,6 +1298,7 @@ public:
         bool FuncPtrReturnPointer = false;
         bool FuncPtrReturnOwned = false;
         bool FuncPtrReturnAlias = false;
+        bool FuncPtrVariadic = false;
         int FuncPtrReturnPointerDepth = 0;
         std::string FuncPtrReturnResolvedKey;
         struct FuncPtrParam
@@ -1367,6 +1370,7 @@ public:
             s.FuncPtrReturnPointer = t.FuncPtrReturnPointer;
             s.FuncPtrReturnOwned = t.FuncPtrReturnOwned;
             s.FuncPtrReturnAlias = t.FuncPtrReturnAlias;
+            s.FuncPtrVariadic = t.FuncPtrVariadic;
             s.FuncPtrReturnPointerDepth = t.FuncPtrReturnPointerDepth;
             s.FuncPtrReturnResolvedKey = t.FuncPtrReturnResolvedKey;
             for (const auto& p : t.FuncPtrParams)
@@ -1439,6 +1443,7 @@ public:
             t.FuncPtrReturnPointer = FuncPtrReturnPointer;
             t.FuncPtrReturnOwned = FuncPtrReturnOwned;
             t.FuncPtrReturnAlias = FuncPtrReturnAlias;
+            t.FuncPtrVariadic = FuncPtrVariadic;
             t.FuncPtrReturnPointerDepth = FuncPtrReturnPointerDepth;
             t.FuncPtrReturnResolvedKey = FuncPtrReturnResolvedKey;
             for (const auto& p : FuncPtrParams)
@@ -3159,6 +3164,8 @@ private:
     // branches and does not raise this. Not part of the --init cache round-trip (transient state).
     int suppressExplicitNullDerefGuard_ = 0;
     bool lastCallIsBonded = false;           // set when the last call returned a bonded (borrowed) value
+    // Set with lastCallReturnType: cv bits of a by-value C++ class result (a cv prvalue).
+    int lastCallReturnValueCv_ = 0;
     bool lastCallBondByAddress = false;      // set when the bond originates from a by-address lambda capture (kind A)
     std::vector<std::string> lastCallBondedSources; // bond parameter names the last call's return borrows from
     // Capture names of the last lambda literal, for the C function-pointer diagnostic. Uses the
@@ -3729,6 +3736,12 @@ private:
     // Emitted symbol names of bound C++ const/constexpr namespace-scope objects. Their storage is
     // read-only, so a store through one traps at run time; the assignment site rejects it instead.
     std::unordered_set<std::string> cxxConstGlobalSymbols_;
+    // Emitted symbols of globals declared by a C header (any constness). Only picks the wording
+    // of a refusal already decided by cxxConstGlobalSymbols_: "const C object", not "C++".
+    std::unordered_set<std::string> cGlobalSymbols_;
+    // Operator candidates hidden for one call by the const/rvalue reference filter; the
+    // no-overload diagnostic names them. Set and cleared around that call only.
+    std::vector<FunctionSymbol> cxxFilteredOperatorCandidates_;
     // Tags / tests the C++ call whose result is a reference to a const referent; a store whose
     // underlying object is that call writes through it.
     void MarkCxxConstReferent(llvm::Value* referenceResult);
@@ -3752,7 +3765,26 @@ private:
      * through a C++ const reference result. 2 and 3 are read-only storage.
      */
     int CxxConstReceiverKind(const NamedVariable& receiver) const;
+    // True when a C argument points at read-only C storage (const pointee or const global address).
+    bool IsCConstObjectArgument(const NamedVariable& arg, std::string* objectName = nullptr) const;
+    // True when the object the argument addresses is a C-declared global (see cGlobalSymbols_).
+    bool IsCConstGlobalObject(const NamedVariable& arg) const;
     int CxxReceiverCv(const NamedVariable& receiver) const;
+    // cv bits (const = 1, volatile = 2) of a C++ candidate's by-value return (0 for a pointer or
+    // reference); an inherited member is looked up in its declaring class (CxxInheritedOwner).
+    int CxxReturnValueCv(const FunctionSymbol& candidate);
+    // cv bits (const = 1, volatile = 2) of a C++ member's implicit object parameter.
+    int CxxMemberCv(const FunctionSymbol& candidate) const;
+    // [over.match.funcs] ref-qualifier rule: `&&` binds only an rvalue receiver; `&` binds an
+    // rvalue only as `const &` (not volatile); no ref-qualifier binds either.
+    static bool CxxImplicitObjectRefBinds(bool receiverRvalue, const FunctionSymbol& member);
+    /*
+     * [over.match.funcs] implicit object parameter binding of a C++ member candidate: the
+     * receiver's cv (const = 1, volatile = 2) must be covered by the member's cv, and the
+     * ref-qualifier must bind the receiver's value category (CxxImplicitObjectRefBinds).
+     */
+    bool CxxImplicitObjectViable(int receiverCv, bool receiverRvalue,
+                                 const FunctionSymbol& member) const;
     bool IsCxxObjectRvalue(const NamedVariable& receiver) const;
     // True when this call shape has only a public non-const member, including one inherited
     // from a single public non-virtual base.
@@ -4042,6 +4074,8 @@ private:
         bool isFloatConstant = false;
         double floatValue = 0.0;
         bool isCxxConstexpr = false;
+        // Refusal saved with the header record so incomplete/unsupported arrays survive cache hits.
+        std::string bindRefusal;
         // Declaring header; with line/col it tells one declaration reached through two import
         // groups from two same-name declarations.
         std::string file;
@@ -4051,6 +4085,8 @@ private:
         uint64_t constInitHash = 0;
         // MS ABI dllimport data (MSVC's std::cout): the declaration is DLLImport.
         bool isDllImport = false;
+        // Declared in a C++ header (cxxMode import); a global without it is C-declared.
+        bool fromCxxHeader = false;
         int line = 1;
         int col = 0;
     };
@@ -5677,13 +5713,22 @@ private:
                                    const std::function<void(llvm::Value*, llvm::Value*)>& emitElem);
 
     /*
+     * Walk `n` elements of a fixed array from the LAST element down to element 0 (C++ destroys
+     * array elements in reverse construction order). Same unroll/loop split as the forward walk.
+     */
+    void EmitFixedArrayElementWalkReverse(llvm::IRBuilder<>& b, llvm::Value* base, llvm::Type* elemTy,
+                                          uint64_t n, const std::function<void(llvm::Value*)>& emitElem);
+
+    /*
      * Call `dtor` on `storage`: once when it holds a scalar, once per element when it holds a
      * fixed array. `T[N] a;` owns all N elements - calling the destructor on the base pointer
-     * alone destructs element [0] and leaks the rest. Elements are destructed in declaration
-     * order, matching the synthesized destructor's field order.
+     * alone destructs element [0] and leaks the rest. `typeName` is the element type: when it
+     * holds a C++ class member (HasCxxClassMember) the elements are destructed last-to-first,
+     * as C++ does; otherwise declaration order is kept.
      */
     void EmitFullDestructorOverStorage(llvm::IRBuilder<>& b, llvm::Value* storage,
-                                       llvm::Type* storageTy, llvm::Function* dtor);
+                                       llvm::Type* storageTy, llvm::Function* dtor,
+                                       const std::string& typeName, bool reverse = false);
 
     // `unique T* field`: null-checked delete of the pointee. Emitted into the synthesized
     // .dtorfull wrapper at teardown, and (with `replacement` set) ahead of a reassignment store,
@@ -5767,6 +5812,12 @@ private:
     bool IsOwningValueOrClosureType(const std::string& typeName);
 
     bool HasNonTrivialDestructor(const std::string& typeName);
+    /*
+     * True when `typeName` is a C++ class, or a CFlat value holding one by value (directly or
+     * through nested by-value fields). Such values destroy their members and elements in reverse
+     * order, as C++ does; plain CFlat values keep declaration order.
+     */
+    bool HasCxxClassMember(const std::string& typeName) const;
     bool IsOwningValueType(const std::string& typeName);
     // An `extern` definition with a CFlat body follows the C ABI: the callee owns (and destroys)
     // each owning by-value param, so a call hands the argument over exactly like a `move` param.
@@ -7259,6 +7310,8 @@ public:
     // FindFunctionTypeAlias, else a dotted name a C++ import binds as a function-pointer typedef
     // (std.new_handler), requested on demand.
     const TypeAndValue* FindOrRequestFunctionTypeAlias(const std::string& name);
+    // A native CFlat struct/enum/interface keeps its name: an imported C fn-ptr typedef of the same name yields.
+    bool NativeTypeShadowsFunctionAlias(const std::string& name) const;
 
     // A pure-rename `using` alias is transparent the way a C typedef is, so it must not produce its
     // own monomorphization: list<MyInt> and list<int> are ONE instantiation. Registered ahead of
@@ -10576,6 +10629,14 @@ public:
         const LLVMBackend::TypeAndValue& param) const;
 
     /*
+     * Value-site form of the variadic check (declaration initializer, assignment, return): a
+     * function-pointer VALUE whose variadic-ness differs from the slot's is refused in both
+     * directions. Empty when they agree or either side carries no signature to read.
+     */
+    std::string DescribeFuncPtrVariadicMismatch(const LLVMBackend::TypeAndValue& slot,
+        const LLVMBackend::TypeAndValue& value) const;
+
+    /*
      * Why a NAMED function cannot be entered through a destination function-pointer type. Empty
      * when it can be. Deliberately NOT the same rule as the argument path:
      *
@@ -11450,11 +11511,11 @@ public:
         return from.IsCxxPointeeConst ? CxxPointeeConstRelation::Drops
                                       : CxxPointeeConstRelation::Adds;
     }
-    // The relation above for a C++ candidate parameter, also judging a class pointer argument
-    // at a `void*` slot (a real void* or a class pointer bound as void*) by the spelled const.
+    // Candidate relation restores fixed-array element names before decay and handles class
+    // pointers at C++ `void*` slots by the declared parameter spelling.
     CxxPointeeConstRelation CxxCandidatePointeeConstRelation(const FunctionSymbol& candidate,
                                                              size_t index,
-                                                             const TypeAndValue& from,
+                                                             const NamedVariable& from,
                                                              const TypeAndValue& to) const;
 
     // Load a value of type coerceTy from byte offset byteOff within an alloca'd struct slot,
@@ -11472,6 +11533,8 @@ public:
 
     // C default argument promotions for one variadic argument (shared by every variadic call path).
     llvm::Value* PromoteVariadicArgument(llvm::Value* value);
+    // The class name of a by-value aggregate argument that a C or C++ `...` slot cannot carry, or "".
+    std::string AggregateVariadicArgumentType(const NamedVariable& arg) const;
     llvm::Value* CreateFunctionCall(llvm::Function* func, const std::vector<llvm::Value*>& arg,
                                     bool mayUnwind = false);
 
@@ -12142,7 +12205,10 @@ public:
     // 242: C++ signatures retain volatile pointee/referent receiver qualification.
     // 246: C++ request caches retain lazy binding for class-valued template globals (T138).
     // 247: out-of-line variadic C++ members carry their ABI plan (T161).
-    static constexpr int kCHeaderCacheVersion = 247;
+    // 250: C++ header inline bodies carry debug info under -g; the -g level is keyed (T181).
+    // 251: C extern globals carry const (isConst), their origin (fromCxxHeader) and scalar pointee const (T183).
+    // 252: C global origin ("cxh") recorded with the header binding (T183 r2).
+    static constexpr int kCHeaderCacheVersion = 252;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by
@@ -12172,7 +12238,8 @@ public:
                                         bool cxxDefinitionsEmitted = false,
                                         const std::string& cppStandard = "c++20",
                                         const std::string& targetCpu = {},
-                                        const std::string& targetFeatures = {});
+                                        const std::string& targetFeatures = {},
+                                        bool debugInfo = false);
 
     // Read-only adapter exposing the nlohmann subset the *FromJson converters use, backed by a
     // simdjson DOM element. Keeps converter bodies unchanged while parsing with simdjson.

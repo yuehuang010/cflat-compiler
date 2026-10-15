@@ -1,0 +1,30 @@
+import cpp "../library/cpp_interop_tpl.h";
+import cpp "vector";
+import cpp "chrono";
+
+expect_error("cannot return C++ class 't162.Explicit<int>'") {
+    t162.Explicit<int> t177_explicit_return() { return t162.Explicit<long>(7); }
+}
+expect_error("cannot return this value") {
+    std.chrono.seconds t177_narrow_duration_return() { return std.chrono.milliseconds(2000); }
+}
+expect_error("cannot return C++ class 't162.Count<int, int>'") {
+    t162.Count<int, int> t177_unrelated_return() { return t162.Conv<long>(7); }
+}
+
+extern int main()
+{
+    expect_error("cannot initialize C++ class 't162.Count<int, int>'") {
+        t162.Count<int, int> value = t162.Count<long, int>(7);
+    }
+    expect_error("could not be instantiated") {
+        t162.SA<int> value = t162.SA<i64>(7);
+    }
+    expect_error("cannot initialize C++ class 't162.Explicit<int>'") {
+        t162.Explicit<int> value = t162.Explicit<long>(7);
+    }
+    expect_error("cannot initialize C++ class 'std.vector<i64>'") {
+        std.vector<i64> value = std.vector<int>(3);
+    }
+    return 0;
+}

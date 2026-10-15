@@ -1093,8 +1093,39 @@ void LLVMBackend::EmitFixedArrayElementWalk(llvm::IRBuilder<>& b, llvm::Value* b
         b.SetInsertPoint(doneBB);
     }
 
+void LLVMBackend::EmitFixedArrayElementWalkReverse(llvm::IRBuilder<>& b, llvm::Value* base,
+                                          llvm::Type* elemTy, uint64_t n,
+                                          const std::function<void(llvm::Value*)>& emitElem)
+{
+        if (base == nullptr || elemTy == nullptr || n == 0) return;
+
+        if (n <= kMaxUnrolledArrayElements)
+        {
+            for (uint64_t i = n; i > 0; i--)
+                emitElem(b.CreateInBoundsGEP(elemTy, base, { b.getInt64(i - 1) }, "arrelem"));
+            return;
+        }
+
+        auto* fn = b.GetInsertBlock()->getParent();
+        auto* preBB  = b.GetInsertBlock();
+        auto* loopBB = llvm::BasicBlock::Create(*context, "arrwalkr.loop", fn);
+        auto* doneBB = llvm::BasicBlock::Create(*context, "arrwalkr.done", fn);
+        b.CreateBr(loopBB);
+
+        b.SetInsertPoint(loopBB);
+        auto* idx = b.CreatePHI(b.getInt64Ty(), 2, "arrwalkr.i");
+        idx->addIncoming(b.getInt64(n - 1), preBB);
+        emitElem(b.CreateInBoundsGEP(elemTy, base, { idx }, "arrelem"));
+        auto* isFirst = b.CreateICmpEQ(idx, b.getInt64(0), "arrwalkr.first");
+        auto* prev = b.CreateSub(idx, b.getInt64(1), "arrwalkr.prev");
+        idx->addIncoming(prev, b.GetInsertBlock());
+        b.CreateCondBr(isFirst, doneBB, loopBB);
+        b.SetInsertPoint(doneBB);
+    }
+
 void LLVMBackend::EmitFullDestructorOverStorage(llvm::IRBuilder<>& b, llvm::Value* storage,
-                                       llvm::Type* storageTy, llvm::Function* dtor)
+                                       llvm::Type* storageTy, llvm::Function* dtor,
+                                       const std::string& typeName, bool reverse)
 {
         if (storage == nullptr || dtor == nullptr) return;
         auto callDtor = [&](llvm::Value* p) { b.CreateCall(dtor->getFunctionType(), dtor, { p }); };
@@ -1102,8 +1133,29 @@ void LLVMBackend::EmitFullDestructorOverStorage(llvm::IRBuilder<>& b, llvm::Valu
         uint64_t n = PeelFixedArrayType(storageTy, elemTy);
         if (n == 0)
             callDtor(storage);
+        else if (reverse || HasCxxClassMember(typeName))
+            EmitFixedArrayElementWalkReverse(b, storage, elemTy, n, callDtor);
         else
             EmitFixedArrayElementWalk(b, storage, elemTy, n, callDtor);
+    }
+
+bool LLVMBackend::HasCxxClassMember(const std::string& typeName) const
+{
+        std::unordered_set<std::string> seen;
+        std::function<bool(const std::string&)> contains = [&](const std::string& name) {
+            if (IsCxxRecord(name)) return true;
+            if (!seen.insert(name).second) return false;
+            auto it = dataStructures.find(name);
+            if (it == dataStructures.end()) return false;
+            for (const auto& field : it->second.StructFields)
+            {
+                if (field.IsAlias || field.Pointer || field.ElemPointer || field.IsArrayView
+                    || field.IsSimd || field.IsBitfield || field.IsPadding) continue;
+                if (contains(field.TypeName)) return true;
+            }
+            return false;
+        };
+        return contains(typeName);
     }
 
 void LLVMBackend::EmitUniqueFieldDelete(llvm::IRBuilder<>& b, llvm::Value* fieldPtr,
@@ -1329,6 +1381,11 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
             // Resolved live (not cached) so a later-registered dtor is picked up.
             return userDtor;
         }
+        // A value holding a C++ class member destroys ALL its members in reverse declaration
+        // order (native and C++ alike), as C++ does. Plain CFlat values keep declaration order.
+        const bool reverseMembers = HasCxxClassMember(typeName);
+        if (reverseMembers)
+            std::reverse(work.begin(), work.end());
 
         // Synthesize a wrapper: user dtor first (so hand-written free-and-null logic runs
         // before member teardown), then each member's full destructor.
@@ -1365,7 +1422,8 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
                 EmitUniqueFieldDelete(b, fieldPtr, w.Dtor);
             else
                 // Scalar field: one call; owning fixed-array field: one call per element.
-                EmitFullDestructorOverStorage(b, fieldPtr, fieldTy, w.Dtor);
+                // An array field inside a reverse-order value walks its elements last-first too.
+                EmitFullDestructorOverStorage(b, fieldPtr, fieldTy, w.Dtor, w.TypeName, reverseMembers);
         }
         b.CreateRetVoid();
         return fn;
@@ -1403,6 +1461,8 @@ llvm::Function* LLVMBackend::GetOrCreateMovedFromShellDestructor(const std::stri
         fullDestructorInProgress_.erase(cacheKey);
         dsIt = dataStructures.find(typeName);
         if (work.empty() || dsIt == dataStructures.end()) return nullptr;
+        // Every member here is a C++ class or a lowered struct: destroy last-declared first.
+        std::reverse(work.begin(), work.end());
 
         auto* structTy = dsIt->second.StructType;
         auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(*context),
@@ -1421,7 +1481,8 @@ llvm::Function* LLVMBackend::GetOrCreateMovedFromShellDestructor(const std::stri
             auto* fieldTy = element == std::numeric_limits<unsigned>::max()
                 ? GetType(dsIt->second.StructFields[index])
                 : structTy->getElementType(element);
-            EmitFullDestructorOverStorage(b, fieldPtr, fieldTy, dtor);
+            EmitFullDestructorOverStorage(b, fieldPtr, fieldTy, dtor,
+                                          dsIt->second.StructFields[index].TypeName, true);
         }
         b.CreateRetVoid();
         return fn;
@@ -1435,7 +1496,8 @@ void LLVMBackend::EmitCflatOwnedFieldsDestruction(llvm::IRBuilder<>& b,
         if (dsIt == dataStructures.end() || dsIt->second.StructType == nullptr || self == nullptr)
             return;
         llvm::StructType* structTy = dsIt->second.StructType;
-        for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
+        // A C++ struct's members are destroyed last-declared first, as C++ does.
+        for (unsigned i = static_cast<unsigned>(dsIt->second.StructFields.size()); i-- > 0;)
         {
             const auto& f = dsIt->second.StructFields[i];
             if (!f.IsCflatOwned || f.IsAlias || f.IsPadding || f.IsBitfield) continue;
@@ -1465,11 +1527,11 @@ void LLVMBackend::EmitCflatOwnedFieldsDestruction(llvm::IRBuilder<>& b,
             if (f.ConstArraySize > 0)
             {
                 if (auto* dtor = GetOrCreateFullDestructor(f.TypeName))
-                    EmitFullDestructorOverStorage(b, fieldPtr, fieldTy, dtor);
+                    EmitFullDestructorOverStorage(b, fieldPtr, fieldTy, dtor, f.TypeName, true);
                 continue;
             }
             if (auto* dtor = GetOrCreateFullDestructor(f.TypeName))
-                EmitFullDestructorOverStorage(b, fieldPtr, fieldTy, dtor);
+                EmitFullDestructorOverStorage(b, fieldPtr, fieldTy, dtor, f.TypeName, true);
         }
 }
 
@@ -1668,7 +1730,20 @@ bool LLVMBackend::IsImplicitPrimitiveToPointer(const TypeAndValue& destTV,
                                                const NamedVariable& sourceNV,
                                                llvm::Value* value) const
 {
-    if (!destTV.Pointer || destTV.IsArrayView || value == nullptr)
+    // A function<> slot is a code pointer: a number or a struct value is no more a function than
+    // an integer is an address (T185). Only a function value, nullptr and the zero literal bind.
+    // A generic-substituted slot (Box<function<int(int)>>.v) keeps only its encoded name; the
+    // registry holds its signature, so it is checked as a plain function slot.
+    const TypeAndValue* encodedSlot = destTV.Pointer ? nullptr
+        : GetEncodedClosureType(ResolveTypeAlias(destTV.TypeName));
+    const bool functionSlot = destTV.IsFunctionPointer || encodedSlot != nullptr;
+    if (!destTV.Pointer && !functionSlot)
+        return false;
+    // A bare 'function' slot takes its signature from the value (T176 inference), and that
+    // inference keeps refusing a non-function value with its own text (T182 leg).
+    if (destTV.IsFunctionPointer && destTV.FuncPtrReturnTypeName.empty())
+        return false;
+    if (destTV.IsArrayView || value == nullptr)
         return false;
     const auto& sourceTV = sourceNV.TypeAndValue;
     if (sourceTV.Pointer || sourceTV.IsArrayView || sourceTV.ConstArraySize != 0
@@ -1677,6 +1752,18 @@ bool LLVMBackend::IsImplicitPrimitiveToPointer(const TypeAndValue& destTV,
         return false;
 
     auto* constantInt = llvm::dyn_cast<llvm::ConstantInt>(value);
+    // A closure value keeps its encoded fat/thin type name (registered in encodedClosureTypes_) and
+    // may carry that signature with IsFunctionPointer still false (the call-argument loop), so the
+    // struct test excludes registered closure types by the registry, never by spelling.
+    if (functionSlot && !sourceTV.TypeName.empty() && !sourceTV.IsThinFnPtr()
+        && sourceTV.TypeName != "__closure_fat_ptr" && sourceTV.FuncPtrReturnTypeName.empty())
+    {
+        const std::string resolved = ResolveTypeAlias(sourceTV.TypeName);
+        auto it = dataStructures.find(resolved);
+        if (!IsEncodedClosureType(resolved) && it != dataStructures.end()
+            && it->second.StructType != nullptr)
+            return true;
+    }
     if (sourceTV.TypeName.empty())
     {
         if (!value->getType()->isIntegerTy() && !value->getType()->isFloatingPointTy())
@@ -1712,6 +1799,24 @@ std::string LLVMBackend::DescribeImplicitPrimitiveToPointer(
             sourceType = LlvmTypeToTypeName(sourceLlvmType);
     }
     const std::string targetType = SpellType(*this, destTV);
+    const TypeAndValue* encodedSlot = destTV.Pointer ? nullptr
+        : GetEncodedClosureType(ResolveTypeAlias(destTV.TypeName));
+    if (destTV.IsFunctionPointer || encodedSlot != nullptr)
+    {
+        // A generic-substituted slot spells its signature from the registry entry (T185 r2).
+        const TypeAndValue& sig = destTV.IsFunctionPointer ? destTV : *encodedSlot;
+        const bool thin = destTV.IsFunctionPointer ? destTV.IsThinFnPtr()
+            : IsThinEncodedClosureType(ResolveTypeAlias(destTV.TypeName));
+        const char* head = thin ? "function" : "Lambda";
+        const std::string slotType = sig.FuncPtrReturnTypeName.empty()
+            ? std::format("{}<>", head)
+            : std::format("{}<{}>", head, FuncPtrSpellingOf(sig));
+        return std::format(
+            "cannot {} {} of type '{}' from a value of type '{}' - a number, data pointer or struct is "
+            "not a function; bind a named function, a '{}' value, nullptr or a lambda, or assert "
+            "a code address with an explicit cast '({})x'",
+            action, destination, slotType, sourceType, head, slotType);
+    }
     return std::format(
         "cannot {} {} of type '{}' from a value of type '{}' - an integer or other primitive "
         "is not an address; use '&x' to take an address or an explicit cast '({})x' to assert "
@@ -2678,7 +2783,7 @@ llvm::Function* LLVMBackend::GenerateClosureCaptureCleanup(const std::string& na
             auto* fldPtr = builder->CreateStructGEP(capTy, dstCaps, idx);
             if (llvm::isa<llvm::ArrayType>(capTy->getElementType(idx)))
                 EmitFullDestructorOverStorage(*builder, fldPtr, capTy->getElementType(idx),
-                    GetOrCreateFullDestructor(tn));
+                    GetOrCreateFullDestructor(tn), tn);
             else if (auto* dtor = GetOrCreateFullDestructor(tn))
                 builder->CreateCall(dtor->getFunctionType(), dtor,
                     { builder->CreateBitCast(fldPtr, dtor->getArg(0)->getType()) });

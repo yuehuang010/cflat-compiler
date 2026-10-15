@@ -1121,6 +1121,9 @@ bool LLVMBackend::FuncPtrSignaturesProvablyDiffer(const LLVMBackend::TypeAndValu
         std::vector<FuncPtrComponent> sa, sb;
         if (!FuncPtrSignatureOf(a, sa) || !FuncPtrSignatureOf(b, sb))
             return false;
+        // C: `int(*)(int, ...)` and `int(*)(int)` are different types, whatever the fixed parts.
+        if (a.FuncPtrVariadic != b.FuncPtrVariadic)
+            return true;
         if (sa.size() != sb.size())
             return true;
         for (size_t i = 0; i < sa.size(); i++)
@@ -1138,6 +1141,7 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
         sig.FuncPtrReturnPointer = sym.ReturnType.Pointer;
         sig.FuncPtrReturnOwned = sym.ReturnType.IsMove;
         sig.FuncPtrReturnAlias = sym.ReturnType.IsAlias;
+        sig.FuncPtrVariadic = sym.Variadic;
         sig.FuncPtrReturnPointerDepth = sym.ReturnType.ValuePointerDepth();
         for (const auto& p : sym.Parameters)
         {
@@ -1219,8 +1223,17 @@ std::string LLVMBackend::FuncPtrSpellingOf(const LLVMBackend::TypeAndValue& tv) 
             parameterType.PointerDepth = tv.FuncPtrParams[i].PointerDepth;
             s += SpellType(*this, parameterType);
         }
+        if (tv.FuncPtrVariadic) s += tv.FuncPtrParams.empty() ? "..." : ", ...";
         return s + ")";
     }
+
+// Variadic-ness is a signature fact: C never converts between `R(*)(P, ...)` and `R(*)(P)`.
+static std::string VariadicMismatchReason(bool slotVariadic)
+{
+        return slotVariadic
+            ? "the slot takes a variadic '...' tail and the function does not"
+            : "the function takes a variadic '...' tail and the slot does not";
+}
 
 std::string LLVMBackend::FuncPtrDifferenceOf(const std::vector<FuncPtrComponent>& sa,
         const std::vector<FuncPtrComponent>& sb) const
@@ -1240,11 +1253,26 @@ std::string LLVMBackend::DescribeFuncPtrSignatureMismatch(const LLVMBackend::Typ
         std::vector<FuncPtrComponent> sa, sb;
         if (!FuncPtrSignatureOf(arg, sa) || !FuncPtrSignatureOf(param, sb))
             return "";
-        std::string why = FuncPtrDifferenceOf(sa, sb);
+        std::string why = arg.FuncPtrVariadic != param.FuncPtrVariadic
+            ? VariadicMismatchReason(param.FuncPtrVariadic)
+            : FuncPtrDifferenceOf(sa, sb);
         if (why.empty()) return "";
         return std::format(
             "function-pointer signature mismatch: parameter takes '{}' but the argument is "
             "'{}' - {}", FuncPtrSpellingOf(param), FuncPtrSpellingOf(arg), why);
+    }
+
+std::string LLVMBackend::DescribeFuncPtrVariadicMismatch(const LLVMBackend::TypeAndValue& slot,
+        const LLVMBackend::TypeAndValue& value) const
+{
+        std::vector<FuncPtrComponent> ss, sv;
+        if (!FuncPtrSignatureOf(slot, ss) || !FuncPtrSignatureOf(value, sv))
+            return "";
+        if (slot.FuncPtrVariadic == value.FuncPtrVariadic)
+            return "";
+        return std::format(
+            "function-pointer signature mismatch: slot takes '{}' but the value is '{}' - {}",
+            FuncPtrSpellingOf(slot), FuncPtrSpellingOf(value), VariadicMismatchReason(slot.FuncPtrVariadic));
     }
 
 std::string LLVMBackend::DescribeFuncPtrBindMismatch(const std::string& functionName,
@@ -1254,7 +1282,9 @@ std::string LLVMBackend::DescribeFuncPtrBindMismatch(const std::string& function
         if (!FuncPtrSignatureOf(fn, sa) || !FuncPtrSignatureOf(dest, sb))
             return "";
         std::string why;
-        if (sa.size() > sb.size())
+        if (fn.FuncPtrVariadic != dest.FuncPtrVariadic)
+            why = VariadicMismatchReason(dest.FuncPtrVariadic);
+        else if (sa.size() > sb.size())
             why = std::format("it takes {} parameter(s) but the slot supplies only {}",
                 sa.size() - 1, sb.size() - 1);
         for (size_t i = 0; i < sa.size() && why.empty(); i++)

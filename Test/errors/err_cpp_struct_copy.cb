@@ -13,6 +13,34 @@ struct PlainCopyBad
 // The refusal text comes from the generated class's deleted C++ copy constructor, not CFlat's
 // own copy analysis.
 
+// T169: `return *this` / `return *p` of a non-copyable C++ class is refused - the receiver or
+// pointee is a borrow, so it is never silently moved out (pre-fix: accepted, source zeroed).
+expect_error("cannot copy C++ class 'CopyBadSelf' into the return slot: its copy constructor is deleted") {
+    [cpp] struct CopyBadSelf { int value = 1; CopyBadSelf self() { return *this; } };
+}
+expect_error("cannot copy C++ class 'CopyBadPick' into the return slot: its copy constructor is deleted") {
+    [cpp] struct CopyBadPick { int value = 1; };
+    CopyBadPick pick(CopyBadPick* p) { return *p; }
+}
+
+// T173: a non-copyable [cpp] FIELD read through a borrow is refused too - implicit `field`, `this->field`,
+// a pointer parameter `p->field` and a pointer local `q->field` (pre-fix: silent move-out, source zeroed).
+[cpp] struct CopyBadField { int value = 1; };
+expect_error("cannot copy C++ class 'CopyBadField' into the return slot: its copy constructor is deleted") {
+    struct CopyBadFieldImplicit { CopyBadField field = default; CopyBadField pick() { return field; } };
+}
+expect_error("cannot copy C++ class 'CopyBadField' into the return slot: its copy constructor is deleted") {
+    struct CopyBadFieldThis { CopyBadField field = default; CopyBadField pick() { return this->field; } };
+}
+expect_error("cannot copy C++ class 'CopyBadField' into the return slot: its copy constructor is deleted") {
+    struct CopyBadFieldParam { CopyBadField field = default; };
+    CopyBadField pickParam(CopyBadFieldParam* p) { return p->field; }
+}
+expect_error("cannot copy C++ class 'CopyBadField' into the return slot: its copy constructor is deleted") {
+    struct CopyBadFieldLocal { CopyBadField field = default; };
+    CopyBadField pickLocal(CopyBadFieldLocal* p) { CopyBadFieldLocal* q = p; return q->field; }
+}
+
 extern int main()
 {
     expect_error("its copy constructor is deleted") {

@@ -46,9 +46,11 @@ import { "library/c_alias_group_late_alias.h", "library/c_alias_group_late_targe
 import "library/c_alias_late_diff.h";
 import "library/c_alias_late_diff_target.h";
 import "library/testmodule.cb";
+import "library/cinterop_global_arrays.h";
 import "library/cinterop.c";
 import "library/struct_byval_util.c";
 import "library/c_variadic_aggregate.c";
+import "library/c_variadic_fnptr.h";
 import package "cinterop/mathlib.h" lib "cinterop/mathlib.lib" define "ML_EXTRA";
 import "library/c_macro_helpers.h";
 import "library/c_inline_demand_a.h";
@@ -357,6 +359,118 @@ static int t137ArrayDimLegs()
     // T137 r2: a macro dimension inside sizeof(type), and an alias whose dimensions are macros.
     if (sizeof(int[ADIM_Q]) != 12)          return 9307;
     if (sizeof(T137AdimAlias) != 36)        return 9308;
+    return 0;
+}
+
+// T170: a C variadic function-pointer typedef binds by name and its calls follow the direct variadic
+// rules (default promotions, pointer tail); a plain C function-pointer typedef name binds too.
+struct T170Hold { T170Vp fn; int k; };
+// Native CFlat struct named like the imported typedef T170Shadow (a C fn-ptr): the struct wins.
+struct T170Shadow { int x; };
+
+int t170ApplyVp(T170Vp g, int n) { return g(n, 1, 1); }
+
+// CFlat variadic function bound by bare inference (the signature keeps its variadic flag).
+int t170_inf(int n, ...) { return n + 7; }
+
+// T179: a plain call result, a variadic parameter returned, and a named variadic function returned.
+T170Bin t179Bin() { T170Bin q = t170_add; return q; }
+T170Vp t179Vp(T170Vp v) { return v; }
+T170Vp t179NamedVp() { return t170_sum; }
+
+int t170FnPtrLegs()
+{
+    T170Vp vi = t170_sum;
+    if (vi(2, 3, 4) != 7)                   return 3981;   // int tail
+    T170Vp vd = t170_sumd;
+    float xf = 2.5f;
+    if (vd(1, xf) != 3)                     return 3982;   // float tail promoted to double
+    T170Vp vc = t170_sumc;
+    char cv = 5;
+    short sv = 6;
+    if (vc(1, cv) + vc(1, sv) * 10 != 76)   return 3983;   // char and short tails promoted to int
+    T170Vp vp = t170_rdp;
+    int pv = 4;
+    if (vp(1, &pv) != 5)                    return 3984;   // pointer tail
+    T170Hold hold = default;
+    hold.fn = t170_sum;
+    if (hold.fn(3, 1, 2, 3) + hold.k != 6)  return 3985;   // struct field of the typedef type
+    if (t170ApplyVp(t170_sum, 2) != 2)      return 3986;   // typedef as a function parameter
+    T170Bin bf = t170_add;
+    if (bf(1, 2) != 3)                      return 3987;   // plain (non-variadic) typedef name
+    T170Vp rv = t170_getvp();
+    if (rv(2, 3, 4) != 7)                  return 3988;   // returned VP keeps its tail
+    T170Shadow sh = default;
+    sh.x = 7;
+    if (sh.x != 7)                          return 3989;   // native struct beats the same-named typedef
+    T170Cb cb = t170_inc;
+    if (cb(41) != 42)                       return 3990;   // unique-name typedef still binds
+    function f = t170_inf;
+    if (f(0) != 7)                          return 3991;   // bare inference keeps the variadic tail
+    // T179: same-variadic-ness values bind at every site (refusals of the other direction live in
+    // Test/errors/err_c_fnptr_variadic.cb).
+    T170Vp va = t170_sum;
+    T170Vp vb = va;
+    vb = t170_getvp();
+    if (vb(2, 3, 4) != 7)                   return 3992;   // init and assign of a variadic value
+    T170Bin pa = t179Bin();
+    T170Bin pb = pa;
+    if (pb(1, 2) != 3)                      return 3993;   // plain call result into a plain slot
+    if (t179Vp(va)(2, 3, 4) != 7)           return 3994;   // variadic parameter returned
+    if (t179NamedVp()(2, 3, 4) != 7)        return 3995;   // named variadic function returned
+    T170Hold hh = default;
+    hh.fn = t170_getvp();
+    if (hh.fn(2, 3, 4) != 7)                return 3996;   // field assigned a variadic call result
+    int tc = 1;
+    T170Vp tv = tc != 0 ? va : vb;
+    if (tv(2, 3, 4) != 7)                   return 3997;   // ternary of variadic arms
+    T170Bin tp = tc != 0 ? pa : pb;
+    if (tp(1, 2) != 3)                      return 3998;   // ternary of plain arms
+    function fi = va;
+    if (fi(2, 3, 4) != 7)                   return 3999;   // bare inference of a variadic value
+    T170Hold hb = { fn = va, k = 1 };
+    if (hb.fn(2, 3, 4) != 7)                return 4000;   // brace-init field from a variadic value
+    T170Hold hn = { fn = t170_sum, k = 1 };
+    if (hn.fn(2, 3, 4) != 7)                return 4001;   // brace-init field from a variadic named function
+    return 0;
+}
+
+// T174: C records with aligned(N) on the record, a member, a typedef or a union member. Values are
+// clang's (-std=c17): sizeof/alignof/offsetof pinned below, element reads walk clang's stride.
+struct T174Host { char c; T174Al16 a; };
+
+static int t174CAlignLegs()
+{
+    if (sizeof(T174Al16) != 16)                 return 9400;
+    if (alignof(T174Al16) != 16)                return 9401;
+    T174Al16* t174Base = t174_base();
+    if ((i64)(t174Base + 1) - (i64)t174Base != 16) return 9402;
+    if (t174Base[1].x != 200 || t174Base[2].x != 300) return 9403;
+    t174Base[1].x = 9;
+    if (t174_al_x(1) != 9)                      return 9404;
+    if (sizeof(T174Mid) != 16 || alignof(T174Mid) != 8) return 9405;
+    if (__builtin_offsetof(T174Mid, x) != 8)    return 9406;
+    if (t174Mid.x != 55)                        return 9407;
+    if (sizeof(T174PkAl) != 8 || __builtin_offsetof(T174PkAl, x) != 1) return 9408;
+    if (t174Pk.x != 66)                         return 9409;
+    if (sizeof(T174Outer) != 32 || alignof(T174Outer) != 16) return 9410;
+    if (__builtin_offsetof(T174Outer, a) != 16) return 9411;
+    if (t174Outer.a.x != 77)                    return 9412;
+    if (sizeof(T174UAl) != 16 || alignof(T174UAl) != 16) return 9413;
+    if (sizeof(T174PlHold) != 32 || alignof(T174PlHold) != 16) return 9414;
+    if (__builtin_offsetof(T174PlHold, p) != 16) return 9415;
+    if (t174PlH.p.x != 12)                      return 9416;
+    if (sizeof(T174Sh) != 24 || __builtin_offsetof(T174Sh, s) != 8) return 9417;
+    if (__builtin_offsetof(T174Sh, ll) != 16 || t174_sh_ll() != 44) return 9418;
+    if (sizeof(T174Big) != 32 || alignof(T174Big) != 32) return 9419;
+    if (sizeof(T174ArrHold) != 48 || __builtin_offsetof(T174ArrHold, items) != 16) return 9420;
+    if (t174AH.items[1].x != 22)                return 9421;
+    if (sizeof(T174Host) != 32 || __builtin_offsetof(T174Host, a) != 16) return 9422;
+    T174Al16 v = { x = 5 };
+    if (t174_al_id(v).x != 6)                   return 9423;
+    T174Big big = t174Big;
+    T174Big bumped = t174_big_bump(big);
+    if (bumped.v[0] != 2 || bumped.v[3] != 4)   return 9424;
     return 0;
 }
 
@@ -923,6 +1037,42 @@ extern int main()
     c_global_counter = c_global_counter + 5;
     if (c_global_counter != 1005)                return 185;
 
+    // T168: C header fixed arrays bind to the external storage defined by cinterop.c; the []
+    // parameter and C helper prove the array decays to a pointer at the call boundary.
+    if (t168KCArray[2] != 18)                     return 16810;
+    if (t168KCArray[1] != 17)                     return 16815;
+    if (sizeof(t168KCArray) != 12)                return 16816;
+    if (t168KCArrayAt(t168KCArray) != 17)         return 16811;
+    int t168CSum = 0;
+    for (int t168CValue in t168KCArray) t168CSum += t168CValue;
+    if (t168CSum != 51)                           return 16814;
+    t168KCArray[0] = 909;
+    if (t168KCArrayRead(0) != 909)                return 16812;
+    if (t168KCPairs[1].x != 24 || t168KCPairs[1].y != 25) return 16813;
+    if (t168KCPairSum(t168KCPairs) != 49)         return 16817;
+
+    // T183: reads of const C globals, and writes that C allows: the const-pointee pointer itself
+    // is reassignable, `int* const` writes its pointee, and const C objects pass to const params.
+    if (t183KCScalar != 41 || t183KCArray[2] != 53) return 16820;
+    if (*t183KCPtr != 62)                         return 16821;
+    if (t183KCTakeConst(t183KCArray) != 51)       return 16822;
+    if (t183KCTakeConst(t183KCPtr) != 62)         return 16823;
+    if (t183KCTakeConst(&t183KCScalar) != 41)     return 16824;
+    *t183KCConstPtr = 9;
+    if (t183KCMutable != 9)                       return 16825;
+    if (t183KCTakeMutable(t183KCConstPtr) != 9)   return 16826;
+    t183KCPtr = &t183KCSecond;
+    if (*t183KCPtr != 63)                         return 16827;
+    // Mutable C globals keep ++ / -- (T183 r2 review: the const-object gate must not catch them).
+    t183KCMutable++;
+    t183KCMutable--;
+    t183KCMutable++;
+    if (t183KCMutable != 10)                      return 16828;
+    int t183ArrBefore = t168KCArray[0];
+    t168KCArray[0]++;
+    if (t168KCArray[0] != t183ArrBefore + 1)      return 16829;
+    t168KCArray[0]--;
+
     // ---- Section L: float/double #define macro extraction -------------------
     if (!testFloatMacros())                     return 200;
 
@@ -1171,8 +1321,14 @@ extern int main()
     int t137 = t137ArrayDimLegs();
     if (t137 != 0) return t137;
 
+    int t174 = t174CAlignLegs();
+    if (t174 != 0) return t174;
+
     // T145: a scalar in a C variadic `...` slot still passes (only by-value aggregates are refused).
     if (t145_cva_scalar(1, 5) != 6) return 3980;
+
+    int t170 = t170FnPtrLegs();
+    if (t170 != 0) return t170;
 
     return 0;
 }

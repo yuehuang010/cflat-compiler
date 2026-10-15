@@ -2,6 +2,12 @@
 // a compile-time constant.
 import cpp "cpp_t45_global_xvalue.hpp";
 
+// T166 r2: a group holding a typed cast is not syntax-folded (the folder is plain int64 and would
+// lose `(u32)` signedness); it is refused, never folded to a wrong value or a crash.
+expect_error("a global initializer with '&&' / '||' and a cast must be a compile-time constant expression") {
+    int ifcCastGroupGlobal = (1 && 1) ? (-1 < (u32)0) : 5;
+}
+
 extern int main()
 {
     expect_error("'if const' condition must be a compile-time constant expression");
@@ -15,5 +21,31 @@ int T45ExistingLocalIf()
     int x;
     expect_error("'if const' condition must be a compile-time constant expression");
     if const ((x = 5) == 5) { return x; }
+    return 0;
+}
+
+// T166: grouping must not turn a runtime local into a constant expression.
+int T166GroupedNonConstantIf()
+{
+    int runtimeValue = 1;
+    expect_error("'if const' condition must be a compile-time constant expression");
+    if const ((runtimeValue == 1) && true) { return 1; }
+    return 0;
+}
+
+// T166: a taken assignment arm remains a side effect, even inside a grouped ternary.
+int T166GroupedTakenAssignmentIf()
+{
+    int runtimeValue = 1;
+    expect_error("'if const' condition must be a compile-time constant expression");
+    if const ((true ? (runtimeValue = 2) : 1) == 2) { return 1; }
+    return 0;
+}
+
+// T166 r2: the same cast group in an 'if const' falls back to the codegen fold and is refused.
+int T166CastGroupIf()
+{
+    expect_error("'if const' condition must be a compile-time constant expression");
+    if const (((1 && 1) ? (-1 < (u32)0) : 1) == 0) { return 1; }
     return 0;
 }

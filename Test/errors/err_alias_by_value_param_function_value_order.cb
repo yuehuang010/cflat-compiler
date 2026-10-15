@@ -1,0 +1,15 @@
+// T167: two offending function values are reported in source order of their first use
+// (the check iterated an unordered map, so the first error was host-dependent).
+struct AbvOrdU { unique<int> u = default; int n = 0; };
+
+AbvOrdU abvOrdZeta(AbvOrdU w) { return w; }
+AbvOrdU abvOrdAlpha(AbvOrdU w) { return w; }
+
+expect_error("cannot use 'abvOrdZeta' as a function value");
+
+extern int main()
+{
+    function f1 = abvOrdZeta;
+    function f2 = abvOrdAlpha;
+    return 0;
+}

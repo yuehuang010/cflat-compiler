@@ -1,0 +1,113 @@
+import "../library/c_variadic_fnptr.h";
+
+// T179: a variadic function-pointer VALUE (call result, variable, field, ternary, parameter) meets a
+// plain slot, and the reverse, at declaration, assignment, argument and return.
+struct T179Hold { T170Vp fn; };
+struct T179HoldB { T170Bin fn; };
+int t179ApplyBin(T170Bin g) { return 0; }
+int t179ApplyVp(T170Vp g) { return 0; }
+
+// A C variadic function-pointer typedef refuses a by-value aggregate in its `...` tail, as a direct C
+// variadic call does, and refuses a binding whose variadic-ness differs from the slot's.
+extern int main()
+{
+    T170Pair pr = {a = 3, b = 4};
+    T170Vp vf = t170_sum;
+    expect_error("cannot pass aggregate value of type 'T170Pair' to the variadic '...' slot of C function pointer 'vf'") {
+        int r = vf(1, pr);
+    }
+    expect_error("the slot takes a variadic '...' tail and the function does not") {
+        T170Vp bad = t170_add;
+    }
+    expect_error("the function takes a variadic '...' tail and the slot does not") {
+        T170Bin bad2 = t170_sum;
+    }
+    expect_error("the function takes a variadic '...' tail and the slot does not") {
+        T170Bin t179a = t170_getvp();
+    }
+    expect_error("the slot takes a variadic '...' tail and the function does not") {
+        T170Vp t179b = t170_add;
+    }
+    expect_error("the function takes a variadic '...' tail and the slot does not") {
+        T170Vp t179c = t170_sum;
+        T170Bin t179d = t179c;
+    }
+    expect_error("the slot takes a variadic '...' tail and the function does not") {
+        T170Bin t179e = t170_add;
+        T170Vp t179f = t179e;
+    }
+    expect_error("the function takes a variadic '...' tail and the slot does not") {
+        T170Vp t179g = t170_sum;
+        T170Bin t179h = t170_add;
+        t179h = t179g;
+    }
+    expect_error("the slot takes a variadic '...' tail and the function does not") {
+        T170Bin t179i = t170_add;
+        T170Vp t179j = t170_sum;
+        t179j = t179i;
+    }
+    expect_error("the function takes a variadic '...' tail and the slot does not") {
+        T179Hold t179k = default;
+        t179k.fn = t170_sum;
+        T170Bin t179l = t179k.fn;
+    }
+    expect_error("the slot takes a variadic '...' tail and the function does not") {
+        T179HoldB t179m = default;
+        t179m.fn = t170_add;
+        T170Vp t179n = t179m.fn;
+    }
+    expect_error("the function takes a variadic '...' tail and the slot does not") {
+        int t179c1 = 1;
+        T170Vp t179o = t170_sum;
+        T170Vp t179p = t170_sumd;
+        T170Bin t179q = t179c1 != 0 ? t179o : t179p;
+    }
+    expect_error("the slot takes a variadic '...' tail and the function does not") {
+        int t179c2 = 1;
+        T170Bin t179r = t170_add;
+        T170Vp t179s = t179c2 != 0 ? t179r : t179r;
+    }
+    expect_error("the function takes a variadic '...' tail and the slot does not") {
+        T170Vp t179u = t170_sum;
+        int t179v = t179ApplyBin(t179u);
+    }
+    expect_error("the function takes a variadic '...' tail and the slot does not") {
+        T170Vp t179y = t170_sum;
+        T179HoldB t179z = { fn = t179y };
+    }
+    expect_error("the function takes a variadic '...' tail and the slot does not") {
+        T179HoldB t179ac = { fn = t170_sum };
+    }
+    expect_error("the slot takes a variadic '...' tail and the function does not") {
+        T170Bin t179aa = t170_add;
+        T179Hold t179ab = { fn = t179aa };
+    }
+    expect_error("the slot takes a variadic '...' tail and the function does not") {
+        T170Bin t179w = t170_add;
+        int t179x = t179ApplyVp(t179w);
+    }
+    return 0;
+}
+
+// The return and parameter-source refusals sit at file scope: each is a function definition.
+expect_error("the function takes a variadic '...' tail and the slot does not") {
+    T170Bin t179RetVp(T170Vp vp) { return vp; }
+}
+expect_error("the slot takes a variadic '...' tail and the function does not") {
+    T170Vp t179RetBin(T170Bin bp) { return bp; }
+}
+expect_error("the function takes a variadic '...' tail and the slot does not") {
+    T170Bin t179RetNamed() { return t170_sum; }
+}
+expect_error("the slot takes a variadic '...' tail and the function does not") {
+    T170Vp t179RetNamedP() { return t170_add; }
+}
+expect_error("the function takes a variadic '...' tail and the slot does not") {
+    T170Bin t179RetCall() { return t170_getvp(); }
+}
+expect_error("the function takes a variadic '...' tail and the slot does not") {
+    int t179ParamVp(T170Vp vp) { T170Bin x = vp; return 0; }
+}
+expect_error("the slot takes a variadic '...' tail and the function does not") {
+    int t179ParamBin(T170Bin bp) { T170Vp x = bp; return 0; }
+}

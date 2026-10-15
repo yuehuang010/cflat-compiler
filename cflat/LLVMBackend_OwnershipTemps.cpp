@@ -619,6 +619,9 @@ int LLVMBackend::JoinArmDataKind(const llvm::Value* value, size_t occurrence, in
         if (IsDataValueCodeCast(value, occurrence)) return 0;
         if (llvm::isa<llvm::ConstantPointerNull>(value)) return 0;
         if (llvm::isa<llvm::Function>(value)) return -1;
+        // A string literal arm is a char* by construction (T185: `k ? "a" : "b"` into a code slot).
+        if (const auto* literal = llvm::dyn_cast<llvm::Constant>(value);
+            literal != nullptr && IsStringLiteralConstant(const_cast<llvm::Constant*>(literal))) return 1;
         if (IsLedgeredDataValue(value)) return 1;
         return JoinDeliversDataValue(value, occurrence, depth) ? 1 : -1;
     }
@@ -634,6 +637,19 @@ bool LLVMBackend::JoinDeliversDataValue(const llvm::Value* value, size_t occurre
             {
                 const int kind = JoinArmDataKind(phi->getIncomingValue(i),
                     JoinArmCastOccurrence(phi, i, occurrence), depth + 1);
+                if (kind < 0) return false;
+                if (kind > 0) proven = true;
+            }
+            return proven;
+        }
+        // A '?:' whose arms are both constants (string literals) folds to a select, not a PHI (T185).
+        if (const auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+        {
+            const llvm::Value* arms[] = { select->getTrueValue(), select->getFalseValue() };
+            for (unsigned i = 0; i < 2; i++)
+            {
+                const int kind = JoinArmDataKind(arms[i], JoinArmCastOccurrence(select, i, occurrence),
+                    depth + 1);
                 if (kind < 0) return false;
                 if (kind > 0) proven = true;
             }
@@ -5243,7 +5259,8 @@ void LLVMBackend::EmitConditionalFullDestructor(const NamedVariable& namedVar, l
         if (dtor == nullptr) return;
         if (namedVar.ConditionalDropFlag == nullptr)
         {
-            EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType, dtor);
+            EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType, dtor,
+                                          namedVar.TypeAndValue.TypeName);
             return;
         }
         auto* function = builder->GetInsertBlock()->getParent();
@@ -5253,7 +5270,8 @@ void LLVMBackend::EmitConditionalFullDestructor(const NamedVariable& namedVar, l
                                          "cxx.drop.livef");
         builder->CreateCondBr(live, liveBlock, afterBlock);
         builder->SetInsertPoint(liveBlock);
-        EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType, dtor);
+        EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType, dtor,
+                                      namedVar.TypeAndValue.TypeName);
         builder->CreateBr(afterBlock);
         builder->SetInsertPoint(afterBlock);
     }
@@ -5307,7 +5325,7 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
                 EnsureStringDtorRegistered();
                 if (it->second.Destructor == nullptr) return;
                 EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType,
-                                              it->second.Destructor);
+                                              it->second.Destructor, "string");
                 return;
             }
             // Non-string struct local: run the full destructor (user dtor + members).

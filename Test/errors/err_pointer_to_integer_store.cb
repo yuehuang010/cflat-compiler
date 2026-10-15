@@ -294,6 +294,9 @@ extern int main()
 
     expect_error("pointer cannot be cast to type 'double'") { double value = (double)p; }
     expect_error("pointer cannot be cast to type 'float'") { float value = (float)p; }
+    // T165: pointer -> simd vector failed module verification.
+    expect_error("pointer cannot be cast to type 'simd<float") { simd<float, 4> fv = (simd<float, 4>)p; }
+    expect_error("pointer cannot be cast to type 'simd<int") { simd<int, 4> iv = (simd<int, 4>)p; }
     return 0;
 }
 int p2iTakeLong(long value) { return (int)value; }

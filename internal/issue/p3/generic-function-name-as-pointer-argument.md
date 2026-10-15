@@ -23,3 +23,8 @@ function name to a function-pointer destination. Keep this separate from non-gen
 selection: add function-template deduction against the destination signature, including the
 generic/non-generic mixed set, then feed the resulting concrete function through the existing
 function-pointer binding checks.
+
+## Return-site leg (T186 Opus r1, 2026-10-14; same on master)
+`function<int(int)> r() { return gid<int>; }` and `function<T(T)> pick<T>() { return gid<T>; }` fail LLVM module verification
+("Function return type does not match operand type of return inst!", ret void); init `function<int(int)> g = gid<int>;` works.
+Repro: scratch/repro_keep/t186_rv1/a_generic.cb. A verifier failure needs a fix or a proper LogError.

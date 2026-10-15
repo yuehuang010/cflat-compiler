@@ -587,8 +587,8 @@ void LLVMBackend::RegisterThisPointer(const TypeAndValue& tv, llvm::Value* stora
 llvm::Value* LLVMBackend::CreateIncrement(llvm::Value* destination, int amount, llvm::Type* elemType,
                                           llvm::Type* loadType)
 {
-        // `loadType` is set only for a UNION member, whose Storage is the union alloca - inferring
-        // the type off that storage reads (and would write back) the whole union.
+        // A union member's Storage is the whole union, and a loaded address has opaque `ptr` type;
+        // both need the declared value type instead of inferring it from the storage operand.
         llvm::LoadInst* loadInst = loadType ? CreateLoad(loadType, destination) : CreateLoad(destination);
 
         if (loadInst->getType()->isPointerTy())
@@ -728,6 +728,42 @@ int LLVMBackend::CxxConstReceiverKind(const NamedVariable& receiver) const
         if (t.IsCxxConstRef && !t.Pointer && !t.IsCxxRefToPointer) return 1;
         if (t.IsCxxConstField && !t.Pointer && !t.IsCxxRefToPointer) return 1;
         return 0;
+}
+
+bool LLVMBackend::IsCConstObjectArgument(const NamedVariable& arg, std::string* objectName) const
+{
+        // The address of a const global (array decay, `&k`); a pointer loaded from a const pointer
+        // global is not, its pointee is writable.
+        if (arg.Primary != nullptr && arg.Primary->getType()->isPointerTy())
+            if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(llvm::getUnderlyingObject(arg.Primary));
+                global != nullptr && cxxConstGlobalSymbols_.count(global->getName().str()) != 0)
+            {
+                if (objectName != nullptr) *objectName = global->getName().str();
+                return true;
+            }
+        if (!(arg.TypeAndValue.IsCxxPointeeConst && arg.TypeAndValue.Pointer)) return false;
+        // A pointer whose pointee is const (`const int *` global): name the global it was loaded from.
+        if (objectName != nullptr)
+            for (llvm::Value* v : { arg.Storage, arg.Primary })
+            {
+                if (auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(v)) v = load->getPointerOperand();
+                if (auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(v))
+                {
+                    *objectName = global->getName().str();
+                    break;
+                }
+            }
+        return true;
+}
+
+bool LLVMBackend::IsCConstGlobalObject(const NamedVariable& arg) const
+{
+        for (llvm::Value* v : { arg.Storage, arg.Primary })
+            if (v != nullptr)
+                if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(llvm::getUnderlyingObject(v));
+                    global != nullptr && cGlobalSymbols_.count(global->getName().str()) != 0)
+                    return true;
+        return false;
 }
 
 int LLVMBackend::CxxReceiverCv(const NamedVariable& receiver) const

@@ -4126,6 +4126,53 @@ extern int main()
         std.optional<i64> s7Opt = std.optional<int>(3);
         if (!s7Opt.has_value() || s7Opt.value() != 3) return 2825;
     }
+    // T162 accept-set: constrained pair conversion and same-specialization elision stay intact.
+    {
+        std.pair<i64, int> t162Pair = std.pair<int, int>(3, 4);
+        if (t162Pair.first != 3 || t162Pair.second != 4) return 2860;
+    }
+    // T162: a different specialization is first built, then converted by its template ctor.
+    t162.reset();
+    int t162ConvValue = 0;
+    {
+        t162.Conv<int> t162Conv = t162.Conv<long>(7);
+        t162ConvValue = t162Conv.value;
+    }
+    if (t162ConvValue != 107) return 2861;
+    if (t162.count_ctor_int() != 0 || t162.count_conversion_int() != 1
+        || t162.count_copy_int() != 0 || t162.count_move_int() != 0 || t162.count_dtor_int() != 1
+        || t162.count_ctor_long() != 1 || t162.count_conversion_long() != 0
+        || t162.count_copy_long() != 0 || t162.count_move_long() != 0
+        || t162.count_dtor_long() != 1) return 2862;
+    // T162 alias-template spelling keeps the same converting constructor and lifetime counts.
+    t162.reset();
+    int t162AliasValue = 0;
+    {
+        t162.AliasConv<int> t162Alias = t162.AliasConv<long>(9);
+        t162AliasValue = t162Alias.value;
+    }
+    if (t162AliasValue != 109) return 2863;
+    if (t162.count_ctor_int() != 0 || t162.count_conversion_int() != 1
+        || t162.count_copy_int() != 0 || t162.count_move_int() != 0 || t162.count_dtor_int() != 1
+        || t162.count_ctor_long() != 1 || t162.count_conversion_long() != 0
+        || t162.count_copy_long() != 0 || t162.count_move_long() != 0
+        || t162.count_dtor_long() != 1) return 2864;
+    t162.reset();
+    int t162SameValue = 0;
+    {
+        t162.Count<int, int> t162Same = t162.Count<int, int>(7);
+        t162SameValue = t162Same.value;
+    }
+    if (t162SameValue != 7) return 2865;
+    if (t162.count_ctor_int() != 1 || t162.count_conversion_int() != 0
+        || t162.count_copy_int() != 0 || t162.count_move_int() != 0
+        || t162.count_dtor_int() != 1) return 2866;
+    // T162 neighbor: this spelling routes through C++ assignment after evaluating the source temp.
+    {
+        std.optional<i64> t162Assigned = default;
+        t162Assigned = std.optional<int>(5);
+        if (!t162Assigned.has_value() || t162Assigned.value() != 5) return 2867;
+    }
     // N67: direct C++ class prvalues enter by-value parameters without a caller-side move.
     {
         cppt.pv_reset();

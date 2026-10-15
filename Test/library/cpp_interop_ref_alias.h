@@ -27,6 +27,11 @@ struct Outer {
 inline std::pair<const int&, const int&> both(int& a, int& b) { return {a, b}; }
 
 inline int bump_ref(int& v) { return ++v; }
+// Call results that are references to scalars: postfix ++/-- acts on the returned referent.
+inline int& pick_int(int& v) { return v; }
+inline short& pick_short(short& v) { return v; }
+inline char& pick_char(char& v) { return v; }
+inline double& pick_double(double& v) { return v; }
 inline int read_const(const int& v) { return v; }
 
 
