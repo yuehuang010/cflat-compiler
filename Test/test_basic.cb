@@ -1016,14 +1016,14 @@ struct SeedCastNoCtor
 {
     u8 r = 200;      // truncates: i32 200 -> i8, reads back 200 through u8
     i16 s = 40000;   // truncates and wraps: 40000 -> -25536
-    int i = 3.7;     // fptosi: 3.7 -> 3
+    int i = (int)3.7;     // fptosi: 3.7 -> 3
 };
 
 struct SeedCastBare
 {
     u8 r = 200;
     i16 s = 40000;
-    int i = 3.7;
+    int i = (int)3.7;
     SeedCastBare() { }
 };
 
@@ -1031,7 +1031,7 @@ struct SeedCastAllDefaulted
 {
     u8 r = 200;
     i16 s = 40000;
-    int i = 3.7;
+    int i = (int)3.7;
     SeedCastAllDefaulted(int x = 3) { }
 };
 
@@ -1059,17 +1059,17 @@ class SeedCastClassNoCtor
 {
     u8 r = 200;
     i16 s = 40000;
-    int i = 3.7;
-    u8 r8 = 3.7;
-    i64 g = 3.7;
+    int i = (int)3.7;
+    u8 r8 = (u8)3.7;
+    i64 g = (i64)3.7;
 };
 
 // A parameterized user ctor does NOT suppress the synthetic no-arg ctor - it DELEGATES to it,
 // so this shape reaches the same emitter as the ctor-less class above.
 class SeedCastClassUserCtor
 {
-    int i = 3.7;
-    u8 r8 = 3.7;
+    int i = (int)3.7;
+    u8 r8 = (u8)3.7;
     int p = 1;
     SeedCastClassUserCtor(int q) { p = q; }
 };
@@ -1082,9 +1082,12 @@ double t84Big;
 double t84Mid;
 double t84Small;
 void t84Seed() { t84Big = 3000000000.5; t84Mid = 2147483648.5; t84Small = 200.5; }
-u32 t84Global = 3000000000.5;
-union T84UnionDefault { u32 f = 3000000000.5; double d; };
+u32 t84Global = (u32)3000000000.5;
+union T84UnionDefault { u32 f = (u32)3000000000.5; double d; };
 struct T84Field { u32 f; };
+struct T151Fit { u8 a = 0; int b = 0; };
+struct T151Bool { bool x : 1; };
+struct T151Byte { u8 a : 8; };
 struct T84Bits { u32 a : 12; u32 b : 20; };
 union T84Union { u32 f; double d; };
 
@@ -1170,35 +1173,36 @@ bool testNoArgCtorFieldSeedingCasts()
     result &= Test("t84_fptoui_cast_u64", (i64)(u64)t84Big == (i64)3000000000, true);  // control: 64-bit already fptosi-correct
     result &= Test("t84_fptoui_cast_u8", (i64)(u8)t84Small == (i64)200, true);          // control: passes pre-fix
     result &= Test("t84_fptoui_cast_u16", (i64)(u16)60000.5 == (i64)60000, true);
-    u32 t84Decl = t84Big;
+    u32 t84Decl = (u32)t84Big;
     result &= Test("t84_fptoui_decl_init", (i64)t84Decl == (i64)3000000000, true);      // pre-fix: garbage
     u32 t84Assign = 0;
-    t84Assign = t84Big;
+    t84Assign = (u32)t84Big;
     result &= Test("t84_fptoui_assign", (i64)t84Assign == (i64)3000000000, true);       // pre-fix: garbage
     u32 t84Compound = 0;
-    t84Compound += t84Big;
-    result &= Test("t84_fptoui_compound", (i64)t84Compound == (i64)3000000000, true);   // pre-fix: garbage
+    // C compound semantics: the sum is formed in double, then truncated. Implicit `+=` is refused (err_implicit_float_to_int).
+    t84Compound = (u32)(t84Compound + t84Big);
+    result &= Test("t84_fptoui_compound", (i64)t84Compound == (i64)3000000000, true);
     T84Field t84F;
-    t84F.f = t84Big;
+    t84F.f = (u32)t84Big;
     result &= Test("t84_fptoui_field_assign", (i64)t84F.f == (i64)3000000000, true);    // pre-fix: garbage
-    T84Field t84B = { f = t84Big };
+    T84Field t84B = { f = (u32)t84Big };
     result &= Test("t84_fptoui_brace_field", (i64)t84B.f == (i64)3000000000, true);     // pre-fix: garbage
     T84Bits t84Bits;
-    t84Bits.b = t84Big;
+    t84Bits.b = (u32)t84Big;
     result &= Test("t84_fptoui_bitfield", (i64)t84Bits.b == (i64)24064, true);          // pre-fix: garbage
-    T84Union t84U = { f = t84Big };
+    T84Union t84U = { f = (u32)t84Big };
     result &= Test("t84_fptoui_union_field", (i64)t84U.f == (i64)3000000000, true);     // pre-fix: garbage
     unsigned[2] t84Arr;
-    t84Arr[0] = t84Big;
+    t84Arr[0] = (u32)t84Big;
     result &= Test("t84_fptoui_array_elem", (i64)t84Arr[0] == (i64)3000000000, true);   // pre-fix: garbage
-    u32[2] t84ArrBrace = { t84Big, 100.5 };
+    u32[2] t84ArrBrace = { (u32)t84Big, (u32)100.5 };
     result &= Test("t84_fptoui_array_brace", (i64)t84ArrBrace[0] == (i64)3000000000, true);
-    u32[] t84ViewBrace = { t84Big, 100.5 };
+    u32[] t84ViewBrace = { (u32)t84Big, (u32)100.5 };
     result &= Test("t84_fptoui_array_view_brace", (i64)t84ViewBrace[0] == (i64)3000000000, true);
     T84UnionDefault t84UD;
     result &= Test("t84_fptoui_union_default", (i64)t84UD.f == (i64)3000000000, true);
     result &= Test("t84_fptoui_global_init", (i64)t84Global == (i64)3000000000, true);
-    simd<u32,4> t84Vec = t84Big;
+    simd<u32,4> t84Vec = (u32)t84Big;
     result &= Test("t84_fptoui_simd_splat", (i64)t84Vec[0] == (i64)3000000000, true);   // pre-fix: garbage
 
     // Brace-init is its own door: it stored the source bytes raw over the i1 slot, so '2' read
@@ -1212,6 +1216,53 @@ bool testNoArgCtorFieldSeedingCasts()
     result &= Test("boolbrace_double", bbf.f ? 1 : 0, 1);         // pre-fix: 0
     result &= Test("boolbrace_zero", bb0.f ? 1 : 0, 0);
     result &= Test("boolbrace_neighbour_intact", bbf.g, 7);       // pin: padding absorbed the wide store
+
+    // T151 accept-set (frozen before the guard): explicit casts, implicit int->float, any->bool,
+    // and integer constants that fit their element type inside a native brace initializer.
+    double t151D = 3.7;
+    float t151F = 1.5;
+    int t151I = -7;
+    result &= Test("t151_cast_int_trunc", (int)t151D, 3);
+    result &= Test("t151_cast_int_trunc_neg", (int)-3.7, -3);
+    result &= Test("t151_cast_u8_fraction", (i64)(u8)255.9, (i64)255);
+    result &= Test("t151_cast_u32_fraction", (i64)(u32)4294967295.5, (i64)4294967295);
+    result &= Test("t151_cast_float_to_double", (double)t151F == 1.5, true);
+    result &= Test("t151_cast_int_to_double", (double)t151I == -7.0, true);
+    double t151Wide = t151I;
+    result &= Test("t151_implicit_int_to_double", t151Wide == -7.0, true);
+    float t151FromInt = 9;
+    result &= Test("t151_implicit_int_to_float", t151FromInt == 9.0, true);
+    bool t151B = t151D;
+    result &= Test("t151_implicit_double_to_bool", t151B ? 1 : 0, 1);
+    int [1] t151FitInt = { 2147483647 };
+    int [1] t151FitNeg = { -1 };
+    i8 [1] t151FitI8 = { -128 };
+    u8 [1] t151FitU8 = { 255 };
+    u32 [1] t151FitU32 = { 4294967295 };
+    u64 [1] t151FitU64 = { 0xFFFFFFFFFFFFFFFF };
+    double [1] t151FitDbl = { 3 };
+    result &= Test("t151_brace_fit_int_max", (i64)t151FitInt[0], (i64)2147483647);
+    result &= Test("t151_brace_fit_int_neg", (i64)t151FitNeg[0], (i64)-1);
+    result &= Test("t151_brace_fit_i8_min", (i64)t151FitI8[0], (i64)-128);
+    result &= Test("t151_brace_fit_u8_max", (i64)t151FitU8[0], (i64)255);
+    result &= Test("t151_brace_fit_u32_max", (i64)t151FitU32[0], (i64)4294967295);
+    result &= Test("t151_brace_fit_u64_max", (i64)t151FitU64[0], (i64)-1);
+    result &= Test("t151_brace_fit_int_to_double", t151FitDbl[0] == 3.0, true);
+    T151Fit t151Fit = { a = 255, b = -1 };
+    result &= Test("t151_brace_fit_field_u8", (i64)t151Fit.a, (i64)255);
+    result &= Test("t151_brace_fit_field_int", (i64)t151Fit.b, (i64)-1);
+    T151Fit t151Sign = { b = (int)(u32)4294967295 };
+    result &= Test("t151_brace_explicit_sign_cast", (i64)t151Sign.b, (i64)-1);
+    T151Byte t151Byte = { a = (u8)300 };
+    result &= Test("t151_bitfield_explicit_u8_cast", (i64)t151Byte.a, (i64)44);
+    T151Bool t151BoolBits = default;
+    t151BoolBits.x = t151D;
+    result &= Test("t151_bool_bitfield_double_truth", t151BoolBits.x, true);
+    T151Bool t151BoolZero = default;
+    t151BoolZero.x = 0.0;
+    result &= Test("t151_bool_bitfield_double_zero", t151BoolZero.x, false);
+    T151Bool t151BoolBrace = { x = t151F };
+    result &= Test("t151_bool_bitfield_brace_truth", t151BoolBrace.x, true);
     return result;
 }
 

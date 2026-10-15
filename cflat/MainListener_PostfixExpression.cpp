@@ -1,6 +1,45 @@
 #include "MainListener.h"
 #include <llvm/Support/SaveAndRestore.h>
 
+static CFlatParser::PostfixExpressionContext* SoleCxxConstructionPostfix(
+    antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return nullptr;
+    if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+    {
+        // The context spans the whole postfix chain: `T(args).member()` also has one postfix
+        // node. Defer only a standalone constructor call, never a temporary receiver chain.
+        auto callArguments = postfix->argumentExpressionList();
+        const bool direct = callArguments.size() == 1 && postfix->children.size() >= 2
+                && postfix->children[postfix->children.size() - 2] == callArguments.front()
+                && postfix->children.back()->getText() == ")";
+        if (direct) return postfix;
+        if (postfix->children.size() == 1)
+            if (auto* primary = postfix->primaryExpression();
+                primary != nullptr && primary->expression() != nullptr)
+                return SoleCxxConstructionPostfix(primary->expression());
+        return nullptr;
+    }
+    auto* context = dynamic_cast<antlr4::ParserRuleContext*>(node);
+    if (context == nullptr) return nullptr;
+    if (context->children.size() == 1) return SoleCxxConstructionPostfix(context->children[0]);
+    if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(context);
+        primary != nullptr && primary->expression() != nullptr)
+        return SoleCxxConstructionPostfix(primary->expression());
+    return nullptr;
+}
+
+static bool IsSoleCxxClassConstruction(const LLVMBackend& compiler,
+                                       antlr4::tree::ParseTree* node)
+{
+    auto* postfix = SoleCxxConstructionPostfix(node);
+    if (postfix == nullptr) return false;
+    const std::string text = postfix->getText();
+    const size_t open = text.find('(');
+    return open != std::string::npos
+        && compiler.IsForeignCxxClassWithConstructors(text.substr(0, open));
+}
+
 static uint32_t DecodeLiteralScalar(std::string::const_iterator& it,
                                     const std::string::const_iterator& end)
 {
@@ -835,6 +874,23 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 }
                 NormalizeCxxRvalueReferenceArgument(ctx, parsed);
                 return parsed;
+            };
+
+            auto flattenCxxDirectConstructionArguments = [](
+                std::vector<LLVMBackend::NamedVariable>& values) {
+                using Value = LLVMBackend::NamedVariable;
+                std::vector<Value> flattened;
+                auto append = [&](auto&& self, const Value& value) -> void {
+                    if (!value.IsCxxDirectConstruction)
+                    {
+                        flattened.push_back(value);
+                        return;
+                    }
+                    for (const Value& argument : value.CxxDirectConstructionArguments)
+                        self(self, argument);
+                };
+                for (const Value& value : values) append(append, value);
+                values = std::move(flattened);
             };
 
             int functionArgCounter = 0;
@@ -3348,6 +3404,17 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // A parenthesized `?:` joining macro constants stays a prvalue.
                             if (prevPrimary->expression() != nullptr && parenInnerNamed.IsCxxMacroJoin)
                                 namedVar.IsCxxMacroJoin = true;
+                            if (prevPrimary->expression() != nullptr && childLimit == 1
+                                && parenInnerNamed.IsCxxDirectConstruction)
+                            {
+                                namedVar.IsCxxDirectConstruction = true;
+                                namedVar.CxxDirectConstructionUsesBraces =
+                                    parenInnerNamed.CxxDirectConstructionUsesBraces;
+                                namedVar.CxxDirectConstructionType =
+                                    parenInnerNamed.CxxDirectConstructionType;
+                                namedVar.CxxDirectConstructionArguments =
+                                    parenInnerNamed.CxxDirectConstructionArguments;
+                            }
                             // And a parenthesized class-pointer `?:` keeps its joined pointee class.
                             if (prevPrimary->expression() != nullptr && namedVar.Primary == parenInnerNamed.Primary)
                             {
@@ -4509,9 +4576,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     || NamedVarIsString(sourceNV)))
                             {
                                 AssignSourceKind kind;
-                                auto toStore = ClassifyOwningAssignSource(
-                                    sourceValue, destType.TypeName, sourceNV.TypeAndValue.IsMove,
-                                    ctx, kind);
+                                auto toStore = ClassifyOwningAssignSource(sourceValue,
+                                    destType.TypeName,
+                                    sourceNV.IsRvalue || sourceNV.TypeAndValue.IsMove, ctx, kind);
                                 compiler->builder->CreateStore(toStore, slotValue);
                                 if (kind == AssignSourceKind::Move && sourceNV.Storage != nullptr)
                                 {
@@ -6464,6 +6531,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
                                     argVar.IsNormalizedCxxXvalue = argNV.IsNormalizedCxxXvalue;
                                     argVar.IsRvalue = argNV.IsRvalue;
+                                    argVar.IsCxxDirectConstruction = argNV.IsCxxDirectConstruction;
+                                    argVar.CxxDirectConstructionUsesBraces =
+                                        argNV.CxxDirectConstructionUsesBraces;
+                                    argVar.CxxDirectConstructionType = argNV.CxxDirectConstructionType;
+                                    argVar.CxxDirectConstructionArguments =
+                                        argNV.CxxDirectConstructionArguments;
                                     argVar.IsDefaultArgument = argNV.IsDefaultArgument;
                                     argVar.CxxParamLastUse = argNV.CxxParamLastUse;
                                     argVar.CxxLvalueKind =
@@ -6899,6 +6972,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
 
                             std::vector<LLVMBackend::CxxBraceArgument> cxxBraceArguments;
                             bool cxxCallRefused = false;
+                            bool cxxDirectConstructionMemberCall = false;
                             // Class-pointer '?:' arguments the arg loop could not box yet (see
                             // BoxDeferredJoinArgument): resolved after every argument is typed.
                             struct PendingClassJoin
@@ -6910,6 +6984,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             std::vector<PendingClassJoin> pendingJoinArguments;
                             auto evaluateCallArguments = [&]()
                             {
+                                bool localCxxDirectConstructionOrderSafe = true;
+                                llvm::SaveAndRestore<bool*> directConstructionOrderScope(
+                                    cxxDirectConstructionCallOrderSafe_,
+                                    cxxDirectConstructionCallOrderSafe_ == nullptr
+                                        ? &localCxxDirectConstructionOrderSafe
+                                        : cxxDirectConstructionCallOrderSafe_);
                                 if (argumentList.size() > 0)
                                 {
                                     auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
@@ -7318,11 +7398,116 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argExpectedScope.emplace(&declExpectedType, argExpectedDest);
                                     CallArgumentScope callArgumentScope(
                                         inCallArgument_, ternaryCallArgumentDepth_);
-                                    CxxCallArgumentScope cxxCallArgumentScope(
-                                        inCxxCallArgument_, funcSym != nullptr ? funcSym->IsCxx
-                                            : Compiler(ctx)->HasCxxFunctionTemplate(functionName)
-                                                || (structVar.BaseType != nullptr && Compiler(ctx)->HasCxxFunctionTemplateMember(
+                                    const bool cxxCallArgument = funcSym != nullptr ? funcSym->IsCxx
+                                        : Compiler(ctx)->HasCxxFunctionTemplate(functionName)
+                                            || (structVar.BaseType != nullptr
+                                                && Compiler(ctx)->HasCxxFunctionTemplateMember(
+                                                    structVar.TypeAndValue.TypeName, primaryIdentifier));
+                                    const bool cxxMemberReceiver = structVar.BaseType != nullptr
+                                        && !structVar.TypeAndValue.TypeName.empty()
+                                        && Compiler(ctx)->IsCxxRecord(
+                                            structVar.TypeAndValue.TypeName);
+                                    const size_t wrapperDot = functionName.rfind('.');
+                                    const bool cxxFreeWrapper = wrapperDot != std::string::npos
+                                        && Compiler(ctx)->IsCxxNamespace(
+                                            functionName.substr(0, wrapperDot))
+                                        && !Compiler(ctx)->IsDataStructure(
+                                            functionName.substr(0, wrapperDot))
+                                        && !cxxMemberReceiver
+                                        && (functionName.starts_with("std.")
+                                            || !Compiler(ctx)->HasCxxFunctionTemplate(functionName));
+                                    const bool cxxTemplateWrapper = funcSym == nullptr
+                                        && (Compiler(ctx)->HasCxxFunctionTemplate(functionName)
+                                            || (structVar.BaseType != nullptr
+                                                && Compiler(ctx)->HasCxxFunctionTemplateMember(
                                                     structVar.TypeAndValue.TypeName, primaryIdentifier)));
+                                    const bool directConstructionParent =
+                                        cxxDirectConstructionArgument_ != nullptr
+                                        && SoleCxxConstructionPostfix(cxxDirectConstructionArgument_) == ctx
+                                        && Compiler(ctx)->IsForeignCxxClassWithConstructors(functionName);
+                                    const bool cxxNonTemplateMemberWrapper =
+                                        cxxMemberReceiver && !cxxTemplateWrapper
+                                        && ((funcSym != nullptr && funcSym->IsCxx)
+                                            || Compiler(ctx)->IsCxxMemberFunctionParameterByValue(
+                                                structVar.TypeAndValue.TypeName, primaryIdentifier,
+                                                argIdx, namedArgCtx.size()));
+                                    cxxDirectConstructionMemberCall = cxxDirectConstructionMemberCall
+                                        || cxxNonTemplateMemberWrapper;
+                                    const bool cxxFunctionWrapper =
+                                        (cxxFreeWrapper
+                                            && !Compiler(ctx)->IsForeignCxxClassWithConstructors(functionName))
+                                        || cxxTemplateWrapper
+                                        || cxxNonTemplateMemberWrapper;
+                                    bool cxxDirectConstructionSink = false;
+                                    if (cxxFunctionWrapper)
+                                    {
+                                        if (cxxTemplateWrapper)
+                                        {
+                                            const std::string ownerType = structVar.BaseType != nullptr
+                                                ? structVar.TypeAndValue.TypeName : std::string();
+                                            const std::string templateName = ownerType.empty()
+                                                ? functionName : primaryIdentifier;
+                                            cxxDirectConstructionSink =
+                                                Compiler(ctx)->IsCxxFunctionTemplateParameterByValue(
+                                                    templateName, ownerType, argIdx, namedArgCtx.size());
+                                        }
+                                        else if (cxxFreeWrapper)
+                                        {
+                                            cxxDirectConstructionSink =
+                                                Compiler(ctx)->IsCxxFreeFunctionParameterByValue(
+                                                    functionName, argIdx, namedArgCtx.size());
+                                        }
+                                        else if (cxxNonTemplateMemberWrapper)
+                                        {
+                                            cxxDirectConstructionSink =
+                                                Compiler(ctx)->IsCxxMemberFunctionParameterByValue(
+                                                    structVar.TypeAndValue.TypeName, primaryIdentifier,
+                                                    argIdx, namedArgCtx.size())
+                                                || (funcSym != nullptr && funcSym->IsCxx
+                                                    && declaredIdx[argIdx] >= 0
+                                                    && !Compiler(ctx)->IsCxxReferenceParameter(
+                                                        *funcSym, static_cast<size_t>(declaredIdx[argIdx])));
+                                        }
+                                        else if (funcSym != nullptr && funcSym->IsCxx
+                                            && declaredIdx[argIdx] >= 0)
+                                        {
+                                            cxxDirectConstructionSink = !Compiler(ctx)->IsCxxReferenceParameter(
+                                                *funcSym, static_cast<size_t>(declaredIdx[argIdx]));
+                                        }
+                                    }
+                                    llvm::SaveAndRestore<CFlatParser::AssignmentExpressionContext*>
+                                        directConstructionArgument(
+                                            cxxDirectConstructionArgument_,
+                                            cxxDirectConstructionSink || directConstructionParent
+                                                ? namedArgument->assignmentExpression() : nullptr);
+                                    const bool directClassConstructionArgument =
+                                        (cxxDirectConstructionSink || directConstructionParent)
+                                        && IsSoleCxxClassConstruction(
+                                            *Compiler(ctx), namedArgument->assignmentExpression());
+                                    const bool hasLaterConstructionSibling =
+                                        directClassConstructionArgument
+                                        && argIdx + 1 < namedArgCtx.size();
+                                    if (hasLaterConstructionSibling
+                                        && cxxDirectConstructionCallOrderSafe_ != nullptr)
+                                        *cxxDirectConstructionCallOrderSafe_ = false;
+                                    llvm::SaveAndRestore<bool> directConstructionPosition(
+                                        cxxDirectConstructionCanDefer_,
+                                        cxxDirectConstructionCanDefer_
+                                            && !hasLaterConstructionSibling
+                                            && (cxxDirectConstructionCallOrderSafe_ == nullptr
+                                                || *cxxDirectConstructionCallOrderSafe_));
+                                    llvm::SaveAndRestore<bool> directConstructionSiblingOrder(
+                                        cxxDirectConstructionHasLaterSibling_,
+                                        directClassConstructionArgument
+                                            ? hasLaterConstructionSibling
+                                            : cxxDirectConstructionHasLaterSibling_);
+                                    llvm::SaveAndRestore<LLVMBackend::TypeAndValue>
+                                        directConstructionTargetType(
+                                            cxxDirectConstructionTargetType_,
+                                            cxxDirectConstructionSink || directConstructionParent
+                                                ? argExpectedDest : LLVMBackend::TypeAndValue{});
+                                    CxxCallArgumentScope cxxCallArgumentScope(
+                                        inCxxCallArgument_, cxxCallArgument);
                                     auto argNV = ParseCallArgument([&] {
                                         return this->ParseAssignmentExpressionNamed(
                                             namedArgument->assignmentExpression());
@@ -7407,6 +7592,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     LLVMBackend::NamedVariable argVar;
                                     argVar.OriginalArgumentType = argNV.TypeAndValue;
                                     argVar.HasOriginalArgumentType = true;
+                                    argVar.IsCxxDirectConstruction = argNV.IsCxxDirectConstruction;
+                                    argVar.CxxDirectConstructionUsesBraces =
+                                        argNV.CxxDirectConstructionUsesBraces;
+                                    argVar.CxxDirectConstructionType = argNV.CxxDirectConstructionType;
+                                    argVar.CxxDirectConstructionArguments =
+                                        argNV.CxxDirectConstructionArguments;
 
                                     if (argName)
                                         argVar.TypeAndValue.VariableName = argName->getText();
@@ -7871,30 +8062,44 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         && !owner.empty();
                                     templateBesideNonTemplate = templateBesideNonTemplate
                                         || deduceBesideSpecializations;
+                                    const bool needsDirectConstructionWrapper = std::any_of(
+                                        arguments.begin(), arguments.end(), [](const auto& argument) {
+                                            return argument.IsCxxDirectConstruction;
+                                        });
                                     if (hasNonWrapper
                                         && (!cxxFreeFunction || !functionName.starts_with("std.")
                                             || hasExactNonWrapper)
                                         && !(hasForwardingReferenceTemplate
                                              && hasForwardingReferenceLvalue)
-                                        && !templateBesideNonTemplate) return;
+                                        && !templateBesideNonTemplate
+                                        && !needsDirectConstructionWrapper) return;
                                 }
                                 if (!isTemplate && owner.empty() && cxxBraceArguments.empty())
                                 {
-                                    if (!cxxFreeFunction) return;
-                                    std::string freeError;
-                                    if (!compiler->RequestCxxFreeFunction(
-                                            functionName, cxxExplicitTemplateArgs, arguments,
-                                            resolvedName, freeError))
+                                    const bool hasDirectConstructionArgument = std::any_of(
+                                        arguments.begin(), arguments.end(), [](const auto& argument) {
+                                            return argument.IsCxxDirectConstruction;
+                                        });
+                                    if (cxxFreeFunction)
                                     {
-                                        if (const std::string cflatMove = CflatValueStdMoveError(
-                                                *compiler, functionName, arguments);
-                                            !freeError.empty() && !cflatMove.empty())
-                                            freeError = cflatMove;
-                                        if (!freeError.empty()) LogErrorContext(primaryCtx, freeError);
+                                        std::string freeError;
+                                        if (!compiler->RequestCxxFreeFunction(
+                                                functionName, cxxExplicitTemplateArgs, arguments,
+                                                resolvedName, freeError))
+                                        {
+                                            if (const std::string cflatMove = CflatValueStdMoveError(
+                                                    *compiler, functionName, arguments);
+                                                !freeError.empty() && !cflatMove.empty())
+                                                freeError = cflatMove;
+                                            if (!freeError.empty()) LogErrorContext(primaryCtx, freeError);
+                                            return;
+                                        }
+                                        flattenCxxDirectConstructionArguments(arguments);
+                                        cxxExplicitTemplateArgs.clear();
                                         return;
                                     }
-                                    cxxExplicitTemplateArgs.clear();
-                                    return;
+                                    if (!hasDirectConstructionArgument
+                                        || !cxxDirectConstructionMemberCall) return;
                                 }
                                 // A brace list into an unbound free C++ function (std.max({3, 9, 4})):
                                 // clang deduces against initializer_list<T> in a generated wrapper.
@@ -7987,6 +8192,29 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         clangRejected = compiler->LastCxxRequestClangRejected();
                                     }
                                 }
+                                const bool hasDirectConstructionArgument = std::any_of(
+                                    arguments.begin(), arguments.end(), [](const auto& argument) {
+                                        return argument.IsCxxDirectConstruction;
+                                    });
+                                const std::string memberReceiverType = cxxMemberReceiverType();
+                                if (!requested && !isTemplate && hasDirectConstructionArgument
+                                    && cxxDirectConstructionMemberCall && !memberReceiverType.empty())
+                                {
+                                    std::string memberError;
+                                    requested = compiler->RequestCxxFreeFunction(
+                                        functionName, {}, arguments, registeredName, memberError,
+                                        {}, {}, {}, false, {}, memberReceiverType);
+                                    clangRejected = compiler->LastCxxRequestClangRejected();
+                                    if (requested)
+                                    {
+                                        resolvedName = registeredName;
+                                        templateError.clear();
+                                    }
+                                    else if (!memberError.empty())
+                                    {
+                                        templateError = memberError;
+                                    }
+                                }
                                 if (!requested)
                                 {
                                     if (isTemplate && !owner.empty()
@@ -8005,6 +8233,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     cxxBraceArguments.clear();
                                     return;
                                 }
+                                flattenCxxDirectConstructionArguments(arguments);
                                 // Literal-specialized template wrappers are registered by content key.
                                 if (isTemplate && !registeredName.empty()
                                     && (!cxxExplicitTemplateArgs.empty()
@@ -8021,6 +8250,71 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             };
                             bool foreignCxxConstructor =
                                 compiler->IsForeignCxxClassWithConstructors(functionName);
+                            auto canDeferCxxConstruction = [&](llvm::Type* objectType) {
+                                if (!cxxDirectConstructionCanDefer_
+                                    || cxxDirectConstructionHasLaterSibling_
+                                    || (cxxDirectConstructionCallOrderSafe_ != nullptr
+                                        && !*cxxDirectConstructionCallOrderSafe_))
+                                    return false;
+                                if (objectType == nullptr || !objectType->isStructTy()) return false;
+                                if (cxxDirectConstructionTargetType_.TypeName.empty()
+                                    || cxxDirectConstructionTargetType_.TypeName == "auto")
+                                    return true;
+                                return compiler->GetType(cxxDirectConstructionTargetType_) == objectType;
+                            };
+                            if (foreignCxxConstructor && arguments.size() == 1
+                                && arguments.front().TypeAndValue.TypeName == "__cflat_brace_arg"
+                                && cxxBraceArguments.size() == 1
+                                && cxxBraceArguments.front().argumentIndex == 0
+                                && cxxDirectConstructionArgument_ != nullptr
+                                && SoleCxxConstructionPostfix(cxxDirectConstructionArgument_) == ctx)
+                            {
+                                auto* objectType = compiler->GetType(
+                                    LLVMBackend::TypeAndValue{ .TypeName = functionName });
+                                if (canDeferCxxConstruction(objectType))
+                                {
+                                    callArgumentPostfix.Flush();
+                                    LLVMBackend::NamedVariable deferred;
+                                    deferred.Primary = llvm::UndefValue::get(objectType);
+                                    deferred.BaseType = objectType;
+                                    deferred.TypeAndValue.TypeName = functionName;
+                                    deferred.IsRvalue = true;
+                                    deferred.IsCxxDirectConstruction = true;
+                                    deferred.CxxDirectConstructionUsesBraces = true;
+                                    deferred.CxxDirectConstructionType = functionName;
+                                    deferred.CxxDirectConstructionArguments =
+                                        cxxBraceArguments.front().elements;
+                                    namedVar = std::move(deferred);
+                                    structVar = {};
+                                    interfaceVar = {};
+                                    namespaceContext.clear();
+                                    break;
+                                }
+                            }
+                            if (foreignCxxConstructor && cxxBraceArguments.empty()
+                                && cxxDirectConstructionArgument_ != nullptr
+                                && SoleCxxConstructionPostfix(cxxDirectConstructionArgument_) == ctx)
+                            {
+                                auto* objectType = compiler->GetType(
+                                    LLVMBackend::TypeAndValue{ .TypeName = functionName });
+                                if (canDeferCxxConstruction(objectType))
+                                {
+                                    callArgumentPostfix.Flush();
+                                    LLVMBackend::NamedVariable deferred;
+                                    deferred.Primary = llvm::UndefValue::get(objectType);
+                                    deferred.BaseType = objectType;
+                                    deferred.TypeAndValue.TypeName = functionName;
+                                    deferred.IsRvalue = true;
+                                    deferred.IsCxxDirectConstruction = true;
+                                    deferred.CxxDirectConstructionType = functionName;
+                                    deferred.CxxDirectConstructionArguments = arguments;
+                                    namedVar = std::move(deferred);
+                                    structVar = {};
+                                    interfaceVar = {};
+                                    namespaceContext.clear();
+                                    break;
+                                }
+                            }
                             if (foreignCxxConstructor && !cxxBraceArguments.empty())
                             {
                                 std::string wrapperName;

@@ -2761,12 +2761,54 @@ bool testAutoReturn()
 
 auto pick<T>(T a, T b) { return a > b ? a : b; }
 
+// Unsuffixed literal arguments infer their C++ default type (int, long, double, char, bool), not the
+// narrowed width the literal is stored at. Pre-fix: litFirst(300, 2) refused (T = i8) and
+// sizeof(litFirst(7, 2)) == 1. Declared arguments keep binding T over a literal.
+T litFirst<T>(T a, T b) { return a; }
+T litSecond<T>(T a, T b) { return b; }
+struct LitBox<T> { T v; };
+LitBox<T> litBox<T>(T a) { LitBox<T> b = { v = a }; return b; }
+struct LitHolder
+{
+    static T litPick<T>(T a, T b) { return b; }
+};
+
 bool testGenericArgInference()
 {
     bool result = true;
     result &= Test("pick_int_max",  pick(3, 7),                  7);
     result &= Test("pick_int_min",  pick(9, 2),                  9);
     result &= Test("pick_i64_max",  pick((i64)10, (i64)20), (i64)20);
+    // int default: value and width (pre-fix: refused / 1 byte).
+    result &= Test("lit_val_300",       litFirst(300, 2),        300);
+    result &= Test("lit_second_val_300", litSecond(2, 300),      300);
+    result &= Test("lit_val_neg_300",   litFirst(-300, 2),      -300);
+    result &= Test("lit_sz_small",      (int)sizeof(litFirst(7, 2)), 4);
+    result &= Test("lit_sz_300",        (int)sizeof(litFirst(300, 2)), 4);
+    result &= Test("lit_sz_70000",      (int)sizeof(litFirst(70000, 2)), 4);
+    result &= Test("lit_sz_neg",        (int)sizeof(litFirst(-7, 2)), 4);
+    result &= Test("lit_sz_paren",      (int)sizeof(litFirst((300), 2)), 4);
+    result &= Test("lit_sz_u_suffix",   (int)sizeof(litFirst(7u, 2u)), 4);
+    // Wider default: long for a literal past int, double for a floating literal, float for 1.5f.
+    result &= Test("lit_sz_long",       (int)sizeof(litFirst(5000000000, 2)), 8);
+    result &= Test("lit_sz_long_second", (int)sizeof(litFirst(2, 5000000000)), 8);
+    result &= Test("lit_sz_hex_u32",    (int)sizeof(litFirst(0xFFFFFFFF, 0xFFFFFFFE)), 4);
+    result &= Test("lit_sz_double",     (int)sizeof(litFirst(1.5, 2.5)), 8);
+    result &= Test("lit_sz_float",      (int)sizeof(litFirst(1.5f, 2.5f)), 4);
+    // char and bool keep their own types (accept-set guard: width 1 either way).
+    result &= Test("lit_sz_char",       (int)sizeof(litFirst('a', 'b')), 1);
+    result &= Test("lit_sz_bool",       (int)sizeof(litFirst(true, false)), 1);
+    // Declared arguments win over a literal in either position.
+    u8 small = 3;
+    i64 wide = 3;
+    result &= Test("lit_mix_u8_first",  (int)sizeof(litFirst(small, 2)), 1);
+    result &= Test("lit_mix_u8_second", (int)sizeof(litFirst(2, small)), 1);
+    result &= Test("lit_mix_i64_first", (int)sizeof(litFirst(wide, 2)), 8);
+    result &= Test("lit_mix_i64_second", (int)sizeof(litFirst(2, wide)), 8);
+    // Generic static method and generic function returning a generic struct.
+    result &= Test("lit_method_val",    LitHolder.litPick(300, 2), 2);
+    result &= Test("lit_method_sz",     (int)sizeof(LitHolder.litPick(7, 2)), 4);
+    result &= Test("lit_box_sz",        (int)sizeof(litBox(7).v), 4);
     return result;
 }
 

@@ -1,0 +1,36 @@
+// T119: an integer constant that does not fit the element type inside a native brace initializer
+// is refused like clang; a fitting constant ({-1} into int) is accepted (test_basic T151 legs).
+struct T119Fit { u8 a = 0; int b = 0; };
+struct T119Named { int b = 0; };
+union T119Union { int f = 0; double d; };
+struct T119Byte { u8 a : 8; };
+
+expect_error("cannot be narrowed to type 'int'") {
+    int [1] g119 = { 3000000000 };
+}
+
+extern int main()
+{
+    expect_error("cannot be narrowed to type 'u8'") {
+        u8 [1] b119 = { 300 };
+    }
+    expect_error("cannot be narrowed to type 'int'") {
+        int [1] a119 = { 0xFFFFFFFF };
+    }
+    expect_error("cannot be narrowed to type 'u32'") {
+        u32 [1] n119 = { -1 };
+    }
+    expect_error("cannot be narrowed to type 'u8'") {
+        T119Fit f119 = { a = 300, b = 5 };
+    }
+    expect_error("cannot be narrowed to type 'int'") {
+        T119Named n119 = { b = (u32)4294967295 };
+    }
+    expect_error("cannot be narrowed to type 'int'") {
+        T119Union u119 = { f = (u32)4294967295 };
+    }
+    expect_error("cannot be narrowed to type 'u8'") {
+        T119Byte y119 = { a = 300 };
+    }
+    return 0;
+}

@@ -192,6 +192,9 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         {
             _checkBounds(index, "take");
             T v = move _data[index];
+            // The moved-from source is still a live object until released; the shift below
+            // constructs over it, so release it here (as removeAt does) or it leaks.
+            _releaseAt(index);
             int i = index;
             while (i < _size - 1)
             {
@@ -245,7 +248,16 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
                 while (i < _size)
                 {
                     if const (!is_copyable(T)) compile_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the list instead of copying it");
-                    else                       result.add(_data[i]);
+                    else
+                    {
+                        if const (is_cpp_class(T)) result.add(_data[i]);
+                        else
+                        {
+                            if (result._size >= result._capacity) result._grow();
+                            construct_at(&result._data[result._size], _data[i]);
+                            result._size++;
+                        }
+                    }
                     i++;
                 }
                 return result;
@@ -282,7 +294,16 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
                 {
                     // Total copy policy per element (identity for borrows, deep for copyable owners).
                     if const (!is_copyable(T)) compile_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the list instead of copying it");
-                    else                       result.add(_data[i]);
+                    else
+                    {
+                        if const (is_cpp_class(T)) result.add(_data[i]);
+                        else
+                        {
+                            if (result._size >= result._capacity) result._grow();
+                            construct_at(&result._data[result._size], _data[i]);
+                            result._size++;
+                        }
+                    }
                     i++;
                 }
 

@@ -2938,6 +2938,8 @@ bool LLVMBackend::EmitCxxDemandCompanions()
     for (const auto& [key, use] : cxxDemandGroups_) keys.insert(key);
     for (const auto& [key, group] : cxxIncrementalGroups_)
         if (group != nullptr && group->DemandChunks() > 0) keys.insert(key);
+    // use_empty() asserts on a lazily-loaded core; the link materializes it next anyway.
+    MaterializeCoreIfLazy();
     const std::vector<std::string> demand = CxxProgramDemand();
     const std::string cacheDir = noCache_ ? std::string{} : GetCHeaderCacheDir();
     for (const std::string& key : keys)

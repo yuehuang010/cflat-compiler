@@ -17,3 +17,6 @@ cppt.pick(f + 1.0);   // CFlat 2, clang 3
 
 Check CFlat's own literal typing rule first (is `1.0` deliberately float in CFlat? doc/LANGUAGE.md); if CFlat
 follows C, the arithmetic result is double. If CFlat deliberately types `1.0` as float, this needs a ruling.
+
+DEFERRED 2026-10-13 (maintainer): `1.0` is float by design (doc/LANGUAGE.md, narrowest literal typing); whether C++ call
+arguments should type unsuffixed floating literals as double is deferred - no work until reopened.

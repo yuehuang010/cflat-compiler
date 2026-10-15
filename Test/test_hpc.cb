@@ -129,7 +129,7 @@ int testFloatArithmetic(int seed)
 simd<float, 4> retFloatLocal(int seed) { float x = (float)seed + 0.5f; return x; }
 simd<i32, 8> retIntLiteral() { return 3; }
 simd<double, 4> retDoubleFromInt(int seed) { int y = seed + 1; return y; }
-simd<i32, 4> retIntFromDouble() { double d = 2.5; return d; }   // narrows like assignment: 2
+simd<i32, 4> retIntFromDouble() { double d = 2.5; return (i32)d; }   // explicit cast splat: 2 (implicit return refused, see err_implicit_float_to_int)
 simd<i32, 4> retTwoSites(int k) { if (k > 0) { return 5; } return 6; }
 simd<T, 4> retGeneric<T>(T v) { return v; }
 
@@ -2348,7 +2348,16 @@ int testFftBluestein()
 // splat, and in a declaration splat. The source is a global seeded at run time (see test_basic).
 double t84HpcBig;
 void t84HpcSeed() { t84HpcBig = 3000000000.5; }
-simd<u32,4> t84HpcRet() { return t84HpcBig; }
+simd<u32,4> t84HpcRet() { return (u32)t84HpcBig; }
+simd<u32,4> t84HpcAddThenCast(simd<u32,4> x, double d)
+{
+    double[4] input;
+    for (int lane = 0; lane < 4; lane++) input[lane] = (double)x[lane];
+    auto sum = simd<double,4>.load(input, 0) + d;
+    u32[4] output;
+    for (int lane = 0; lane < 4; lane++) output[lane] = (u32)sum[lane];
+    return simd<u32,4>.load(output, 0);
+}
 
 int testT84SimdConversion(int seed)
 {
@@ -2357,14 +2366,19 @@ int testT84SimdConversion(int seed)
     simd<u32,4> r = t84HpcRet();
     passed += Test("t84 simd scalar return lane0", (i64)r[0] == (i64)3000000000, true);
     passed += Test("t84 simd scalar return lane3", (i64)r[3] == (i64)3000000000, true);
+    // T151: implicit double -> u32 in an op splat is refused now; the add runs in double lanes and
+    // the explicit cast follows it (cast-before-add would give 1, not 0, for the 1 + -0.5 control).
     simd<u32,4> x = 0;
-    x += t84HpcBig;
+    x = t84HpcAddThenCast(x, t84HpcBig);
     passed += Test("t84 simd op splat lane0", (i64)x[0] == (i64)3000000000, true);
-    simd<u32,4> d = t84HpcBig;
+    simd<u32,4> xc = 1;
+    xc = t84HpcAddThenCast(xc, -0.5);
+    passed += Test("t84 simd add then cast lane1", (i64)xc[1] == (i64)0, true);
+    simd<u32,4> d = (u32)t84HpcBig;
     passed += Test("t84 simd decl splat lane2", (i64)d[2] == (i64)3000000000, true);
     list<u32> t84L = list<u32>();
     t84L.add(7);
-    t84L[0] = t84HpcBig;
+    t84L[0] = (u32)t84HpcBig;
     passed += Test("t84 list element store", (i64)t84L[0] == (i64)3000000000, true);
     return passed;
 }
@@ -2385,7 +2399,7 @@ extern int main(int argc, char** argv)
     int seed = argc;   // 1 with no args
 
     passed += testFloatArithmetic(seed);   total += 4;
-    passed += testT84SimdConversion(seed); total += 5;
+    passed += testT84SimdConversion(seed); total += 6;
     passed += testMixedScalarVector(seed); total += 4;
     passed += testSimdScalarReturn(seed);  total += 9;
     passed += testIntegerSimd(seed);       total += 4;

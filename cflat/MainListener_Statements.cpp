@@ -4980,8 +4980,31 @@ void MainListener::GenerateDefaultParamOverloads(
             }
             else
             {
+                // A C++-lowered result (a struct with a C++ field) is built straight into this
+                // wrapper's own sret slot: a bit-copy of a temporary would dangle self-pointers.
+                const auto& recipe = compiler->currentFunctionAbiRecipe;
+                const bool sretWrapper = compiler->ReturnsViaCxxSret(returnType.TypeName)
+                    && recipe.hasLowering && recipe.retSlot.kind == LLVMBackend::AbiSlot::SRetReturn
+                    && compiler->currentFunction != nullptr;
+                if (sretWrapper)
+                {
+                    llvm::Value* sretDest = compiler->currentFunction->getArg(
+                        compiler->SRetArgIndex(recipe));
+                    compiler->pendingCxxSretDest_ = sretDest;
+                    compiler->pendingCxxSretTypeName_ = returnType.TypeName;
+                    compiler->pendingCxxSretReturn_ = true;
+                    compiler->pendingCxxSretForFixedArray_ = true;
+                }
                 auto result = compiler->CreateOverloadedFunctionCall(name, callArgs);
-                compiler->CreateReturnCall(result);
+                const bool builtInPlace = sretWrapper && compiler->pendingCxxSretDest_ == nullptr;
+                if (sretWrapper)
+                {
+                    compiler->pendingCxxSretDest_ = nullptr;
+                    compiler->pendingCxxSretTypeName_.clear();
+                    compiler->pendingCxxSretReturn_ = false;
+                    compiler->pendingCxxSretForFixedArray_ = false;
+                }
+                compiler->CreateReturnCall(builtInPlace ? nullptr : result);
             }
 
             compiler->CreateBlockBreak(nullptr, true);

@@ -1619,6 +1619,11 @@ public:
         // True only for a value-producing expression. Named variables, fields, elements, aliases,
         // and dereferences remain lvalues even when their LLVM value has no storage of its own.
         bool IsRvalue = false;
+        // Direct foreign C++ construction deferred into a generated call wrapper.
+        bool IsCxxDirectConstruction = false;
+        bool CxxDirectConstructionUsesBraces = false;
+        std::string CxxDirectConstructionType;
+        std::vector<NamedVariable> CxxDirectConstructionArguments;
         // T142: the value of a `default` call argument. Overload ranking refuses it for reference and
         // move/owning-sink parameters (only a by-value parameter takes it).
         bool IsDefaultArgument = false;
@@ -6216,6 +6221,14 @@ private:
         const std::vector<cflat_cinterop::RawFunctionTemplate>& templates, size_t group,
         const std::string& fileForLsp);
     bool HasCxxFunctionTemplate(const std::string& qualifiedName) const;
+    bool IsCxxFunctionTemplateParameterByValue(const std::string& functionName,
+                                               const std::string& ownerType,
+                                               size_t parameterIndex, size_t arity) const;
+    bool IsCxxFreeFunctionParameterByValue(const std::string& functionName,
+                                           size_t parameterIndex, size_t arity) const;
+    bool IsCxxMemberFunctionParameterByValue(const std::string& ownerType,
+                                             const std::string& memberName,
+                                             size_t parameterIndex, size_t arity) const;
     bool HasCxxForwardingReferenceTemplate(const std::string& qualifiedName) const;
     bool IsCxxNamespacePath(const std::string& name) const;
     // Broader fallback for namespace paths whose declarations were not harvested at import.
@@ -6272,7 +6285,8 @@ private:
                                 const std::string& infixLhsName = {},
                                 const std::string& infixRhsName = {},
                                 bool adlCall = false,
-                                const std::vector<std::pair<size_t, size_t>>& braceGroups = {});
+                                const std::vector<std::pair<size_t, size_t>>& braceGroups = {},
+                                const std::string& memberOwnerType = {});
     /*
      * A free C++ call with brace-list arguments and no bound declaration (std.max({3, 9, 4})):
      * each list's elements become wrapper parameters and the wrapper writes the list back as
@@ -8647,6 +8661,22 @@ public:
     // destUnsigned: destination is an unsigned integer; a float source then lowers to fptoui.
     llvm::Value* CreateCast(llvm::Value* value, llvm::Type* destType, bool isSigned = false, bool destUnsigned = false);
 
+    // T151: refuses an IMPLICIT floating -> integer store (any -> bool stays legal). Explicit
+    // casts never reach it; every implicit store site calls this one predicate.
+    void RefuseImplicitFloatToInt(llvm::Value* value, llvm::Type* destType, bool destUnsigned) const;
+    // T119: refuses an integer constant that does not fit its element type inside a native brace
+    // initializer (clang's narrowing rule). Active only while a NativeBraceScope is open.
+    void RefuseNarrowingBraceConstant(llvm::Value* value, bool srcUnsigned, llvm::Type* destType,
+                                      bool destUnsigned) const;
+    static std::string IntegerTypeSpelling(unsigned bits, bool isUnsigned);
+    unsigned nativeBraceDepth = 0;
+    struct NativeBraceScope
+    {
+        LLVMBackend& backend;
+        explicit NativeBraceScope(LLVMBackend& b) : backend(b) { ++backend.nativeBraceDepth; }
+        ~NativeBraceScope() { --backend.nativeBraceDepth; }
+    };
+
     llvm::Value* CreateCast(llvm::Instruction::CastOps op, llvm::Value* value, llvm::Type* destType);
 
     // Returns the bit width of a bitfield's underlying integer type, or 0 if the
@@ -9973,6 +10003,9 @@ public:
     // the slot as its storage; every other consumer sees a plain by-value result.
     llvm::Value* lastLoweredRetTemp_ = nullptr;
     llvm::Value* lastLoweredRetValue_ = nullptr;
+    // Identity-only: the sret temp of the last member copy() call that returned a lowered
+    // struct. A declaration adopts it only when its initializer IS that call's result.
+    llvm::Value* lastLoweredCopyRetTemp_ = nullptr;
     // Indirect calls emitted while their by-value return type was still opaque; rewritten to
     // sret once the type completes classified (the stored function value is the sret shim).
     struct OpaqueReturnIndirectCall { llvm::WeakTrackingVH call; std::string typeName; };
@@ -10245,7 +10278,8 @@ public:
      */
     int ScoreMoveAgreement(const std::vector<NamedVariable>& arguments, const FunctionSymbol& candidate) const;
     bool IsRvalueReferenceArgument(const NamedVariable& arg) const;
-    bool IsProvenCxxScalarLvalue(const NamedVariable& arg) const;
+    // thinFnPtrSlot: a thin function pointer argument whose slot a C++ reference may bind.
+    bool IsProvenCxxScalarLvalue(const NamedVariable& arg, bool thinFnPtrSlot = false) const;
     // The declaration a generated `__cflat_dflt_*` wrapper forwards to; other names unchanged.
     static std::string CxxDeclarationLinkageName(std::string name);
     std::string CxxReferenceParameterSpelling(const FunctionSymbol& candidate, size_t index) const;
@@ -12107,7 +12141,8 @@ public:
     // 241: C++ signatures retain deleted and explicit-specialization status (T116).
     // 242: C++ signatures retain volatile pointee/referent receiver qualification.
     // 246: C++ request caches retain lazy binding for class-valued template globals (T138).
-    static constexpr int kCHeaderCacheVersion = 246;
+    // 247: out-of-line variadic C++ members carry their ABI plan (T161).
+    static constexpr int kCHeaderCacheVersion = 247;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

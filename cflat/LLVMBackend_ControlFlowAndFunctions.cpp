@@ -2326,6 +2326,8 @@ void LLVMBackend::FlushPendingFunctionDeclarations()
                 if (provisional == nullptr || wanted == nullptr
                     || provisional->getFunctionType() == wanted)
                     continue;
+                // users() asserts while --check keeps the cached core module lazy.
+                MaterializeCoreIfLazy();
                 // Taking the address (`fp = f`) is ABI-neutral under opaque pointers. A direct call
                 // emitted against the provisional type is repaired only when the one change is a
                 // classified return turning into sret (the parameter list is otherwise identical).

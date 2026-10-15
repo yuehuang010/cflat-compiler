@@ -1755,6 +1755,21 @@ int t54IntSource() { return 3; }
 int t67CallCount = 0;
 int t67NextValue() { t67CallCount++; return t67CallCount; }
 int t70CflatByval(cppi.Tracked value) { return value.value(); }
+int t159_const_param(const cppi_t159.Host* host)
+{
+    cppi_t159.Arg arg = cppi_t159.Arg(7);
+    return (move *host).member(arg);
+}
+int t159_const_subscript(const cppi_t159.Host* hosts)
+{
+    cppi_t159.Arg arg = cppi_t159.Arg(7);
+    return (move hosts[1]).member(arg);
+}
+int t159_arg_counts_ok()
+{
+    return cppi_t159.ctors() == 1 && cppi_t159.copies() == 1
+        && cppi_t159.moves() == 0 && cppi_t159.dtors() == 2;
+}
 
 int t70_cflat_pointer_or_value(cppi.Tracked* value) { return 1; }
 int t70_cflat_pointer_or_value(cppi.Tracked value) { return value.value(); }
@@ -1956,6 +1971,52 @@ struct T98Shadow
 
 int T103NativeNull(int value) { return 71; }
 int T103NativeNull(int* value) { return 72; }
+
+int t161ViaRef(alias t161.VBase r) { return r.vf(2, 3, (float)2.5, (char)4, (short)5, true); }
+
+int t161Legs()
+{
+    // T161: out-of-line variadic members (declared in the class, defined outside it) bind like their
+    // in-class siblings: scalar tails take default promotions, sret returns work. Static, const,
+    // template-member and overload-set siblings included; an aggregate in the tail is still refused.
+    t161.Out t161Out = t161.Out();
+    T161Big t161Big = t161Out.f_int(9, 17);
+    if (t161Big.a != 9 || t161Big.b != 17 || t161Big.d != 4) return 3977;
+    t161Big = t161Out.f_float(9, (float)2.5);
+    if (t161Big.b != 5) return 3978;
+    t161Big = t161Out.f_char(9, (char)17);
+    if (t161Big.b != 17) return 3979;
+    t161Big = t161Out.f_short(9, (short)17);
+    if (t161Big.b != 17) return 3980;
+    int t161V = 17;
+    t161Big = t161Out.f_ptr(9, &t161V);
+    if (t161Big.b != 17) return 3981;
+    t161Big = t161Out.zero(9);
+    if (t161Big.a != 9 || t161Big.b != 0 || t161Big.c != 3) return 3982;
+    t161Big = t161Out.mix(9, (i64)11, 5, 2.5);
+    if (t161Big.b != 11 || t161Big.c != 12 || t161Big.d != 5) return 3983;
+    t161Big = t161Out.cmix(9, 2.5);
+    if (t161Big.b != 5 || t161Big.c != 7 || t161Big.d != 6) return 3984;
+    t161Big = t161.Out.s_mix(9, 17);
+    if (t161Big.a != 9 || t161Big.b != 17 || t161Big.c != 5) return 3985;
+    if (t161Out.ov(3, (i64)4) != 304 || t161Out.ov(3, 4, 5) != 7) return 3986;
+    t161.Tpl<int> t161Tpl = t161.Tpl<int>();
+    t161Big = t161Tpl.m(9, 17);
+    if (t161Big.a != 9 || t161Big.b != 17 || t161Big.d != 8) return 3987;
+    T161Big t161Agg = {a = 1, b = 2, c = 3, d = 4};
+    expect_error("cannot pass aggregate value of type 'T161Big' to the variadic") {
+        T161Big t161Bad = t161.Out.s_mix(9, t161Agg);
+    }
+    // Out-of-line cppi.Variadic::sum (cpp_interop_basic.cpp) is reached and returns its count.
+    cppi.Variadic t161Vs = cppi.Variadic();
+    if (t161Vs.sum(5, 1, 2, 3) != 5) return 3988;
+    // A VIRTUAL variadic member takes the default promotions before the vtable call: float widens
+    // to double, char/short/bool to int (clang: 15457). Through a base pointer and a base reference.
+    t161.VBase* t161Vb = t161.vbase();
+    if (t161Vb.vf(2, 3, (float)2.5, (char)4, (short)5, true) != 15457) return 3989;
+    if (t161ViaRef(*t161Vb) != 15457) return 3990;
+    return 0;
+}
 
 extern int main()
 {
@@ -2481,10 +2542,102 @@ extern int main()
         return 9305;
     t63.resetCounted();
     std.vector<t63.Counted> t63Temps{t63.Counted(30), t63.Counted(40)};
-    // clang elides the temporaries into the list (0 moves); the thunk moves them in.
-    if (t63.countedCopyCount() != 2
+    // Vector brace-list expansion remains separate from call-argument elision in this round.
+    if (t63.countedCopyCount() != 2 || t63.countedMoveCount() != 2
         || t63Temps.size() != 2 || t63Temps[0].value != 30 || t63Temps[1].value != 40)
         return 9306;
+    t63.resetCounted();
+    if (t63.countedByVal(t63.Counted(50)) != 50) return 9336;
+    if (t63.countedCopyCount() != 0 || t63.countedMoveCount() != 0
+        || t63.countedDtorCount() != 1) return 9337;
+    t63.resetCallCounts();
+    int t146Pair = t63.call_event_pair(
+        t63.CallEvent(t63.call_next_side()), t63.CallEvent(t63.call_next_side()));
+    if (t146Pair != 1012) return 9350;
+    if (t63.callCtorCount() != 2 || t63.callCopyCount() != 0
+        || t63.callMoveCount() != 2 || t63.callDtorCount() != 4
+        || t63.callSideCount() != 22) return 9351;
+    t63.resetCallCounts();
+    int t146EventFirst = t63.call_event_then_int(
+        t63.CallEvent(t63.call_next_side()), t63.call_next_side());
+    if (t146EventFirst != 1012) return 9352;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0
+        || t63.callMoveCount() != 1 || t63.callDtorCount() != 2
+        || t63.callSideCount() != 12) return 9353;
+    t63.resetCallCounts();
+    int t146PlainFirst = t63.call_int_then_event(
+        t63.call_next_side(), t63.CallEvent(t63.call_next_side()));
+    if (t146PlainFirst != 1002) return 9354;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0
+        || t63.callMoveCount() != 0 || t63.callDtorCount() != 1
+        || t63.callSideCount() != 12) return 9355;
+    t63.resetCallCounts();
+    int t146SnapshotInput = 0;
+    int t146Snapshot = t63.call_snapshot_then_int(
+        t63.CallSnapshot(t146SnapshotInput), t63.call_bump_scalar(&t146SnapshotInput));
+    if (t146Snapshot != 1) return 9356;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0
+        || t63.callMoveCount() != 1 || t63.callDtorCount() != 2
+        || t63.callSideCount() != 1 || t146SnapshotInput != 1) return 9357;
+    t63.resetCallCounts();
+    t63.CallHost t146Host = default;
+    int t146Template = t146Host.template_event(
+        t63.CallEvent(t63.call_next_side()), t63.call_next_side());
+    if (t146Template != 1012) return 9358;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0
+        || t63.callMoveCount() != 1 || t63.callDtorCount() != 2
+        || t63.callSideCount() != 12) return 9359;
+    t63.resetCallCounts();
+    int t146Member = t146Host.member(t63.CallEvent(3));
+    if (t146Member != 203) return 9360;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0
+        || t63.callMoveCount() != 0 || t63.callDtorCount() != 1
+        || t63.callSideCount() != 10) return 9361;
+    t63.resetCallCounts();
+    int t146MemberOrder = t146Host.member_event(
+        t63.CallEvent(t63.call_next_side()), t63.call_next_side());
+    if (t146MemberOrder != 1012) return 9362;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0
+        || t63.callMoveCount() != 1 || t63.callDtorCount() != 2
+        || t63.callSideCount() != 12) return 9363;
+    t63.resetCallCounts();
+    int t146Paren = t63.call_event_value((t63.CallEvent(7)));
+    if (t146Paren != 7) return 9364;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0
+        || t63.callMoveCount() != 0 || t63.callDtorCount() != 1
+        || t63.callSideCount() != 10) return 9365;
+    t63.resetCallCounts();
+    int t146ParenOrder = t63.call_event_then_int(
+        (t63.CallEvent(t63.call_next_side())), t63.call_next_side());
+    if (t146ParenOrder != 1012) return 9366;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0
+        || t63.callMoveCount() != 1 || t63.callDtorCount() != 2
+        || t63.callSideCount() != 12) return 9367;
+    // T146 r3: a `Fn&` constructor parameter binds the caller's slot, free and template sinks alike
+    // (clang: 104 both; the nulled slot makes the sum 104, a by-value copy would leave it 204).
+    function<int(int)> t146FnFree = t63.call_plus_one;
+    int t146FnFreeSum = t63.call_fnref_value(t63.CallFnRef(t146FnFree))
+        + (t146FnFree == nullptr ? 100 : 200);
+    if (t146FnFreeSum != 104) return 9368;
+    function<int(int)> t146FnTemplate = t63.call_plus_one;
+    int t146FnTemplateSum = t63.call_fnref_template(t63.CallFnRef(t146FnTemplate))
+        + (t146FnTemplate == nullptr ? 100 : 200);
+    if (t146FnTemplateSum != 104) return 9369;
+    // T146 r4: `Fn volatile&` nulls the caller's slot; `Fn const volatile&` keeps its identity.
+    function<int(int)> t146VolFree = t63.call_plus_one;
+    int t146VolFreeSum = t63.call_fnref_volatile(t63.CallFnVolRef(t146VolFree))
+        + (t146VolFree == nullptr ? 100 : 200);
+    if (t146VolFreeSum != 104) return 9370;
+    function<int(int)> t146VolTemplate = t63.call_plus_one;
+    int t146VolTemplateSum = t63.call_fnref_template(t63.CallFnVolRef(t146VolTemplate))
+        + (t146VolTemplate == nullptr ? 100 : 200);
+    if (t146VolTemplateSum != 104) return 9371;
+    function<int(int)> t146CvFree = t63.call_plus_one;
+    t63.call_set_cv(&t146CvFree);
+    if (t63.call_fnref_cv(t63.CallFnCvRef(t146CvFree)) != 104) return 9372;
+    function<int(int)> t146CvTemplate = t63.call_plus_one;
+    t63.call_set_cv(&t146CvTemplate);
+    if (t63.call_fnref_template(t63.CallFnCvRef(t146CvTemplate)) != 104) return 9373;
     t63.ExplicitOnly t63ExplicitDirect{6, 8};
     if (t63ExplicitDirect.first != 6 || t63ExplicitDirect.second != 8) return 9307;
     t63.ClassNew t63ClassNew{1, 2, 3};
@@ -7191,10 +7344,19 @@ extern int main()
     if ((i64)cppcr.ThkUns((unsigned)ctorrefBig).v != 3000000000) return 7147;
     // T84 round 2: a C++ operator double() result converts to unsigned by the destination's sign.
     T84Double t84Conv = T84Double(ctorrefBig);
-    u32 t84ConvAssign = t84Conv;
+    u32 t84ConvAssign = (u32)t84Conv;
     if ((i64)t84ConvAssign != 3000000000) return 7406;
     if ((i64)(u32)t84Conv != 3000000000) return 7407;
-    if ((i64)t84Take(t84Conv) != 3000000000) return 7408;
+    if ((i64)t84Take((u32)t84Conv) != 3000000000) return 7408;
+    // T151 accept-set (frozen before the guard): C++ conversion operators into float/double and
+    // explicit casts out of them stay legal; only an implicit float->integer store is refused.
+    T84Double t151Dbl = T84Double(2.5);
+    float t151Ff = t151Dbl;
+    if (t151Ff != 2.5) return 7420;
+    double t151Dd = t151Dbl;
+    if (t151Dd != 2.5) return 7421;
+    if ((int)t151Dbl != 2) return 7422;
+    if ((i64)(u32)t151Dbl != 2) return 7423;
 
     // Same-width C++ scalar spellings still require a fresh conversion temporary.
     long ctorrefLong = 4;
@@ -11171,6 +11333,8 @@ extern int main()
     if (t144Big.b != 11 || t144Big.c != 12 || t144Big.d != 5) return 3975;
     t144Big = t144Ret.plain(9, (i64)11);
     if (t144Big.b != 11 || t144Big.c != 7) return 3976;
+    int t161Rc = t161Legs();
+    if (t161Rc != 0) return t161Rc;
     cppexp.MemRankRref rankRref = cppexp.MemRankRref();
     rankRref.push(10);
     if (rankRref.n != 3710) return 3710;
@@ -11801,6 +11965,52 @@ extern int main()
             || cppon.clsDel() != 1) return 7080;
     }
     if (cppon.live() != 0 || cppon.clsDel() != 2) return 7080;
+    // T159: moving a C++ const receiver preserves its const xvalue category without writing
+    // through the referent; clang++ selects const && (counts use a named by-value argument).
+    cppi_t159.reset();
+    {
+        cppi_t159.Arg t159Arg = cppi_t159.Arg(7);
+        int t159Value = (move cppi_t159.free_host()).member(t159Arg);
+        if (t159Value != 407) return 15901;
+    }
+    if (!t159_arg_counts_ok() || cppi_t159.mutable_r() != 0 || cppi_t159.const_r() != 1
+        || cppi_t159.const_l() != 0) return 15901;
+    cppi_t159.reset();
+    {
+        cppi_t159.Arg t159Arg = cppi_t159.Arg(7);
+        int t159Value = (move cppi_t159.provider.host()).member(t159Arg);
+        if (t159Value != 407) return 15902;
+    }
+    if (!t159_arg_counts_ok() || cppi_t159.mutable_r() != 0 || cppi_t159.const_r() != 1
+        || cppi_t159.const_l() != 0) return 15902;
+    cppi_t159.reset();
+    if (t159_const_param(cppi_t159.free_host()) != 407 || !t159_arg_counts_ok()
+        || cppi_t159.mutable_r() != 0 || cppi_t159.const_r() != 1
+        || cppi_t159.const_l() != 0) return 15903;
+    cppi_t159.reset();
+    {
+        cppi_t159.Arg t159Arg = cppi_t159.Arg(7);
+        int t159Value = (move cppi_t159.global_host).member(t159Arg);
+        if (t159Value != 407) return 15904;
+    }
+    if (!t159_arg_counts_ok() || cppi_t159.mutable_r() != 0 || cppi_t159.const_r() != 1
+        || cppi_t159.const_l() != 0) return 15904;
+    // A const array element / pointer subscript stays an xvalue after `move` (clang: const &&).
+    cppi_t159.reset();
+    {
+        cppi_t159.Arg t159Arg = cppi_t159.Arg(7);
+        if ((move cppi_t159.host_arr.a[1]).member(t159Arg) != 407) return 15905;
+    }
+    if (cppi_t159.const_r() != 1 || cppi_t159.const_l() != 0) return 15905;
+    cppi_t159.reset();
+    if (t159_const_subscript(cppi_t159.host_arr_ptr()) != 407 || cppi_t159.const_r() != 1
+        || cppi_t159.const_l() != 0) return 15906;
+    cppi_t159.reset();
+    {
+        cppi_t159.Arg t159Arg = cppi_t159.Arg(7);
+        if ((move cppi_t159.big_host_arr.a[1]).member(t159Arg) != 407) return 15907;
+    }
+    if (cppi_t159.big_host_arr.a[1].v != 6 || cppi_t159.const_r() != 1) return 15907;
     // std.format checks companion emission of libc++ inline variables and ctor-initializer
     // callees, including std::to_address reached from basic_string_view construction.
     std.string fmtText = "ab";

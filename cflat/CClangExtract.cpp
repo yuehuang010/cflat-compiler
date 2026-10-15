@@ -5774,7 +5774,6 @@ namespace cflat_cinterop
                 RawCxxMember& m = rec.members[w.memberIdx];
                 const CXXMethodDecl* md = w.md;
                 if (md == nullptr || md->isInvalidDecl() || md->getType()->isDependentType()
-                    || (md->isVariadic() && !m.isInline)
                     || CompleteNonDependentCxxRecord(md->getParent()) == nullptr)
                     continue;
 

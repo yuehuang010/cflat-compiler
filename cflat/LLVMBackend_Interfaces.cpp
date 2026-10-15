@@ -1205,14 +1205,24 @@ llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
                          "signature; this callback shape is not supported");
                 return nullptr;
             }
+            const size_t naturalParamIndex = naturalArgs.size()
+                + (cxxSretReturn && SRetArgIndex(plan.recipe) <= naturalArgs.size() ? 1 : 0);
+            if (naturalParamIndex >= original->arg_size())
+            {
+                LogError("reverse ABI thunk parameter does not match its natural "
+                         "function signature");
+                return nullptr;
+            }
+            const bool naturalParamIsPointer = original->getFunctionType()->getParamType(
+                static_cast<unsigned>(naturalParamIndex))->isPointerTy();
             llvm::Value* value = nullptr;
             if (slot.kind == AbiSlot::Direct)
                 value = thunk->getArg(loweredIndex++);
             else if (slot.kind == AbiSlot::ByVal)
             {
                 auto* incoming = thunk->getArg(loweredIndex++);
-                if (!plan.params[i].Pointer && !plan.params[i].IsAlias
-                    && IsForeignNontrivialCxxClass(plan.params[i].TypeName))
+                // Preserve the CFlat caller-owned slot when its natural parameter ABI is indirect.
+                if (naturalParamIsPointer)
                     value = incoming;
                 else
                     value = b.CreateLoad(slot.structTy, incoming, "callback.byval");
@@ -1229,7 +1239,9 @@ llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
                                                 slot.align, "callback.coerce");
                 for (const auto& piece : pieces)
                     StoreCoerceAt(storage, thunk->getArg(loweredIndex++), piece.second);
-                value = b.CreateLoad(slot.structTy, storage, "callback.arg");
+                value = naturalParamIsPointer
+                    ? static_cast<llvm::Value*>(storage)
+                    : static_cast<llvm::Value*>(b.CreateLoad(slot.structTy, storage, "callback.arg"));
             }
             naturalArgs.push_back(value);
             if (ParameterCarriesRawArrayCount(plan.params[i]))

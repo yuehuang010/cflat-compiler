@@ -61,8 +61,10 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 
 | Run | Branch | Issue(s) | Notes |
 |-----|--------|----------|-------|
-| T119 | fix/t119-bracenarrow | BRACENARROW (p3 native brace narrowing constants, adds rejection) | PARKED 13:46 for a maintainer ruling. Luna scan (worktree scratch/t119_*): 7 existing sites clang refuses - Test/test_basic.cb 1020/1022 (100.5 -> u32), 1032-1034 (bool from 2, 256, 0.5), test_initializer_list.cb 899 (1.5 -> int, 7.9 -> i64); those tests assert "brace converts like =". Q: does constant narrowing refusal cover float->int and int/float->bool (rewrite those legs), or only integer range overflow? |
-| T146 | fix/t146-prvelide | PRVELIDE (p2/cpp-by-value-class-temporary-extra-moves, call args) | PARKED 22:47: r1 08dd8dafb, Sol r1 REG eval order + 2 INC; see scratch/resume_2026-10-13.md |
+| T150 | fix/t150-opunary | OPUNARY (p3/cpp-unary-operator-leftovers-after-d7) | r4 Opus (volatile rejection) |
+| T157 | fix/t157-seqtwice | SEQTWICE (p3/same-variable-postfix-twice-in-one-call, RULED refuse) | Sol r2 findings -> r4 Opus queued |
+| T162 | fix/t162-tplconv | TPLCONV (p2/cpp-template-name-accept-without-converting-ctor) | r1 Luna xhigh 00:12 |
+| T163 | fix/t163-o2leg | O2LEG (p2/o2-builtin-folding-overrides-cflat-definitions remainder: test_cpp_interop at -O2, leg 3411) | r1 Luna xhigh 00:12 |
 
 
 ## A - crashes, asserts, link failures

@@ -969,19 +969,75 @@ namespace cppt
     }
 
     // By-value class parameter counters (N67): constructions, copies, moves, destructions.
-    inline int pv_c = 0, pv_cp = 0, pv_mv = 0, pv_d = 0;
-    inline void pv_reset() { pv_c = pv_cp = pv_mv = pv_d = 0; }
+    inline int pv_c = 0, pv_cp = 0, pv_mv = 0, pv_d = 0, pv_side = 0, pv_owner_live = 0;
+    inline void pv_reset() { pv_c = pv_cp = pv_mv = pv_d = pv_side = pv_owner_live = 0; }
+    inline int pv_next(int value) { return value + ++pv_side; }
     template <class T, class F = void (*)(int*)>
     struct PvCount
     {
         int value;
+        PvCount() : value(0) { ++pv_c; }
         PvCount(int v) : value(v) { ++pv_c; }
+        PvCount(int x, int y) : value(x + y) { ++pv_c; }
+        PvCount(std::initializer_list<int> values)
+            : value(values.size() == 0 ? 0 : *values.begin()) { ++pv_c; }
         PvCount(const PvCount& x) : value(x.value) { ++pv_cp; }
         PvCount(PvCount&& x) : value(x.value) { ++pv_mv; }
         ~PvCount() { ++pv_d; }
     };
     template <class T, class F>
     int pv_take(PvCount<T, F> x) { return x.value; }
+    template <class T, class F>
+    int pv_take_pair(PvCount<T, F> x, PvCount<T, F> y) { return x.value * 100 + y.value; }
+    template <class T, class F>
+    int pv_take_weighted(PvCount<T, F> x, int y) { return x.value * 100 + y; }
+
+    struct PvInner
+    {
+        int value;
+        PvInner(int x) : value(x) { ++pv_c; }
+        PvInner(const PvInner&) = delete;
+        PvInner(PvInner&&) = delete;
+        ~PvInner() { ++pv_d; }
+    };
+    struct PvOuter
+    {
+        int value;
+        PvOuter(PvInner&& x) : value(x.value + 10) { ++pv_c; }
+        PvOuter(const PvOuter&) = delete;
+        PvOuter(PvOuter&&) = delete;
+        ~PvOuter() { ++pv_d; }
+    };
+    template <class Q>
+    int pv_nested(Q x) { return x.value; }
+
+    struct PvDelMove
+    {
+        int value;
+        PvDelMove(int x) : value(x) { ++pv_c; }
+        PvDelMove(const PvDelMove&) = delete;
+        PvDelMove(PvDelMove&&) = delete;
+        ~PvDelMove() { ++pv_d; }
+    };
+    template <class Q>
+    int pv_take_del(Q x) { return x.value; }
+
+    struct PvOwner
+    {
+        int* value;
+        PvOwner(int x) : value(new int(x)) { ++pv_c; ++pv_owner_live; }
+        PvOwner(const PvOwner&) = delete;
+        PvOwner(PvOwner&&) = delete;
+        ~PvOwner() { delete value; --pv_owner_live; ++pv_d; }
+    };
+    template <class Q>
+    int pv_take_owner(Q x) { return *x.value; }
+
+    struct PvHost
+    {
+        template <class Q>
+        int byVal(Q x) { return x.value + 100; }
+    };
 }
 
 namespace ptrbool

@@ -4126,14 +4126,50 @@ extern int main()
         std.optional<i64> s7Opt = std.optional<int>(3);
         if (!s7Opt.has_value() || s7Opt.value() != 3) return 2825;
     }
-    // N67: a C++ class prvalue / named lvalue / move x at a by-value C++ class parameter. The
-    // prvalue is moved once (clang elides it completely: counts 1,0,0,1; remaining gap in
-    // internal/issue/p2/cpp-by-value-class-temporary-extra-moves.md); no copy, balanced lifetimes.
+    // N67: direct C++ class prvalues enter by-value parameters without a caller-side move.
     {
         cppt.pv_reset();
+        if (cppt.pv_take<int, int>(cppt.PvCount<int, int>()) != 0) return 2829;
+        if (cppt.pv_c != 1 || cppt.pv_cp != 0 || cppt.pv_mv != 0 || cppt.pv_d != 1) return 2840;
+        cppt.pv_reset();
         if (cppt.pv_take<int, int>(cppt.PvCount<int, int>(7)) != 7) return 2830;
-        if (cppt.pv_c != 1 || cppt.pv_cp != 0 || cppt.pv_mv > 1) return 2831;
-        if (cppt.pv_d != cppt.pv_c + cppt.pv_mv) return 2832;
+        if (cppt.pv_c != 1 || cppt.pv_cp != 0 || cppt.pv_mv != 0 || cppt.pv_d != 1) return 2831;
+        cppt.pv_reset();
+        if (cppt.pv_take<int, int>(cppt.PvCount<int, int>(4, 5)) != 9) return 2841;
+        if (cppt.pv_c != 1 || cppt.pv_cp != 0 || cppt.pv_mv != 0 || cppt.pv_d != 1) return 2842;
+        cppt.pv_reset();
+        // CFlat uses T({x}) for an initializer-list constructor; C++ spells this T{x}.
+        if (cppt.pv_take<int, int>(cppt.PvCount<int, int>({7})) != 7) return 2857;
+        if (cppt.pv_c != 1 || cppt.pv_cp != 0 || cppt.pv_mv != 0 || cppt.pv_d != 1) return 2858;
+        cppt.pv_reset();
+        if (cppt.pv_take_pair<int, int>(cppt.PvCount<int, int>(5), cppt.PvCount<int, int>(6)) != 506)
+            return 2843;
+        if (cppt.pv_c != 2 || cppt.pv_cp != 0 || cppt.pv_mv != 0 || cppt.pv_d != 2) return 2844;
+        cppt.pv_reset();
+        if (cppt.pv_take_weighted<int, int>(cppt.PvCount<int, int>(cppt.pv_next(1)),
+                                             cppt.pv_next(10)) != 212) return 2845;
+        if (cppt.pv_side != 2 || cppt.pv_c != 1 || cppt.pv_cp != 0
+            || cppt.pv_mv != 0 || cppt.pv_d != 1) return 2846;
+        cppt.pv_reset();
+        if (cppt.pv_take_pair<int, int>(
+                cppt.PvCount<int, int>(cppt.pv_next(1)),
+                cppt.PvCount<int, int>(cppt.pv_next(10))) != 212) return 2847;
+        if (cppt.pv_side != 2 || cppt.pv_c != 2 || cppt.pv_cp != 0
+            || cppt.pv_mv != 0 || cppt.pv_d != 2) return 2848;
+        cppt.pv_reset();
+        if (cppt.pv_nested(cppt.PvOuter(cppt.PvInner(8))) != 18) return 2849;
+        if (cppt.pv_c != 2 || cppt.pv_cp != 0 || cppt.pv_mv != 0 || cppt.pv_d != 2) return 2850;
+        cppt.pv_reset();
+        if (cppt.pv_take_del(cppt.PvDelMove(9)) != 9) return 2851;
+        if (cppt.pv_c != 1 || cppt.pv_cp != 0 || cppt.pv_mv != 0 || cppt.pv_d != 1) return 2852;
+        cppt.pv_reset();
+        if (cppt.pv_take_owner(cppt.PvOwner(10)) != 10) return 2853;
+        if (cppt.pv_c != 1 || cppt.pv_cp != 0 || cppt.pv_mv != 0 || cppt.pv_d != 1
+            || cppt.pv_owner_live != 0) return 2854;
+        cppt.pv_reset();
+        cppt.PvHost host = default;
+        if (host.byVal(cppt.PvCount<int, int>(7)) != 107) return 2855;
+        if (cppt.pv_c != 1 || cppt.pv_cp != 0 || cppt.pv_mv != 0 || cppt.pv_d != 1) return 2856;
         cppt.pv_reset();
         {
             cppt.PvCount<int, int> named = cppt.PvCount<int, int>(8);

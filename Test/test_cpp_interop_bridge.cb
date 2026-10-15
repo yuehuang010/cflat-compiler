@@ -103,6 +103,8 @@ import cpp "set";
 import cpp "library/cpp_interop_setcopy.h";
 import cpp "list";
 import "list.cb";
+import "dictionary.cb";
+import "malloc_allocator.cb";
 import cpp "array";
 import cpp "library/cpp_interop_view_decay.h";
 import cpp "library/cpp_interop_lvalue_sink.h";
@@ -930,6 +932,320 @@ int bridge_lowered_move_assign_after_cond_release(bool release)
     if (release) { _ = move a; }
     a = move b;
     return a.value.value();
+}
+
+// T149 D3: a dictionary slot is raw storage that was never constructed. The first set, an
+// overwrite and a rehash past the load factor must construct the slot in place.
+int bridge_t149_dict_lowered()
+{
+    dictionary<int, BridgeLoweredUserCopy> d = default;
+    BridgeLoweredUserCopy a = default; a.t.set(7);
+    d.set(1, a);
+    a.t.set(8);
+    d.set(1, a);
+    int i = 2;
+    while (i < 12) { a.t.set(i * 10); d.set(i, a); i++; }
+    d.remove(2);
+    return d.get(1).t.value() * 1000 + d.get(11).t.value();
+}
+
+int bridge_t149_dict_moved()
+{
+    dictionary<int, BridgeCopyFieldHolder<cpptw.Twin>> d = default;
+    int i = 0;
+    while (i < 10) { BridgeCopyFieldHolder<cpptw.Twin> b = default; b.value.set(i * 10 + 1); d.set(i, move b); i++; }
+    BridgeCopyFieldHolder<cpptw.Twin> e = default; e.value.set(9);
+    d.set(3, move e);
+    d.remove(4);
+    return d.get(3).value.value() * 1000 + d.get(9).value.value() + d.count() * 100000;
+}
+
+// T149 D4: take() must release the moved-from source, or the live count keeps it.
+int bridge_t149_take_lowered()
+{
+    list<BridgeCopyFieldHolder<cpptw.Twin>> xs = default;
+    int i = 0;
+    while (i < 4) { BridgeCopyFieldHolder<cpptw.Twin> a = default; a.value.set(10 + i); xs.add(move a); i++; }
+    BridgeCopyFieldHolder<cpptw.Twin> t = xs.take(1);
+    BridgeCopyFieldHolder<cpptw.Twin> l = xs.take(2);
+    return t.value.value() * 1000 + l.value.value() * 10 + xs.count();
+}
+
+int bridge_t149_take_plain()
+{
+    list<cpptw.Twin> xs = default;
+    int i = 0;
+    while (i < 3) { cpptw.Twin v = cpptw.Twin(20 + i); xs.add(move v); i++; }
+    cpptw.Twin t = xs.take(0);
+    xs.removeAt(0);
+    cpptw.Twin w = cpptw.Twin(30);
+    xs.insert(0, move w);
+    return t.value() * 1000 + xs[0].value() * 10 + xs.count();
+}
+
+// T149 D5: a fixed-array field with `= default` of a struct holding a self-referential C++ member
+// (std.list) must be built in place. A bit-copied temporary moves the list's sentinel.
+struct BridgeT149Node { std.list<int> l = default; int tag = 0; };
+struct BridgeT149Arr2 { BridgeT149Node[2] arr = default; };
+struct BridgeT149Arr1 { BridgeT149Node[1] arr = default; };
+struct BridgeT149Outer { BridgeT149Arr2 inner = default; int k = 4; };
+BridgeT149Arr2 bridge_t149_global_arr2 = default;
+
+int bridge_t149_arr_field()
+{
+    BridgeT149Arr2 x = default;
+    x.arr[0].l.push_back(1); x.arr[0].l.push_back(2); x.arr[1].l.push_back(3);
+    BridgeT149Arr1 y = default; y.arr[0].l.push_back(5);
+    BridgeT149Outer o = default; o.inner.arr[1].l.push_back(7); o.inner.arr[1].l.push_back(8);
+    return x.arr[0].l.size() * 1000 + x.arr[1].l.size() * 100 + y.arr[0].l.size() * 10 + o.inner.arr[1].l.size();
+}
+
+int bridge_t149_arr_global()
+{
+    bridge_t149_global_arr2.arr[1].l.push_back(9);
+    return bridge_t149_global_arr2.arr[1].l.size() * 10 + bridge_t149_global_arr2.arr[0].l.size();
+}
+
+// T149 D5 r2: a user-written no-arg constructor seeds a C++-field array in place too (same rule
+// as the `= default` field initializer; a bit-copied temp breaks the list sentinel at teardown).
+struct BridgeT149UserArr { BridgeT149Node[2] arr = default; BridgeT149UserArr() {} };
+
+int bridge_t149_user_ctor_arr()
+{
+    BridgeT149UserArr a = default;
+    a.arr[0].l.push_back(1); a.arr[1].l.push_back(2); a.arr[1].l.push_back(3);
+    return a.arr[0].l.size() * 10 + a.arr[1].l.size();
+}
+
+// T154 D5b: a PARAMETERIZED constructor (alone, beside a no-arg one, or with a defaulted parameter)
+// and a struct holding such a value must build C++-field arrays and struct fields in place. A
+// bit-copied temporary moves the list sentinel: sizes come out wrong and teardown aborts.
+struct BridgeT154ParamArr { BridgeT149Node[2] arr = default; BridgeT154ParamArr(int n) { arr[0].l.push_back(n); } };
+struct BridgeT154BothArr { BridgeT149Node[2] arr = default; BridgeT154BothArr() {} BridgeT154BothArr(int n) { arr[0].l.push_back(n); } };
+struct BridgeT154Holder { BridgeT154BothArr inner = default; BridgeT154Holder() {} };
+struct BridgeT154DefArg { BridgeT149Node[2] arr = default; BridgeT154DefArg(int n = 7) { arr[0].l.push_back(n); } };
+struct BridgeT154SynthHolder { BridgeT154BothArr inner = default; int k = 1; BridgeT154SynthHolder(int n) { k = n; } };
+
+int bridge_t154_param_ctor_arr()
+{
+    BridgeT154ParamArr a = BridgeT154ParamArr(7);
+    a.arr[0].l.push_back(3); a.arr[1].l.push_back(4);
+    return a.arr[0].l.size() * 10 + a.arr[1].l.size();
+}
+
+int bridge_t154_both_ctors_arr()
+{
+    BridgeT154BothArr a = BridgeT154BothArr(7);
+    a.arr[0].l.push_back(3); a.arr[1].l.push_back(4);
+    return a.arr[0].l.size() * 10 + a.arr[1].l.size();
+}
+
+int bridge_t154_holder_field()
+{
+    BridgeT154Holder h = default;
+    h.inner.arr[0].l.push_back(3); h.inner.arr[1].l.push_back(4);
+    BridgeT154SynthHolder s = BridgeT154SynthHolder(5);
+    s.inner.arr[1].l.push_back(6);
+    return h.inner.arr[0].l.size() * 100 + h.inner.arr[1].l.size() * 10 + s.inner.arr[1].l.size() + s.k * 1000;
+}
+
+int bridge_t154_default_arg_arr()
+{
+    BridgeT154DefArg d = default;
+    d.arr[0].l.push_back(3); d.arr[1].l.push_back(4);
+    return d.arr[0].l.size() * 10 + d.arr[1].l.size();
+}
+
+// T160: a user copy() returning a lowered struct with self-referential C++ fields must build
+// directly into the destination, and nested/container copies must call that user method once.
+struct BridgeT160Direct
+{
+    cpptw.Twin t = default;
+    int tag = 0;
+    int copies = 0;
+    BridgeT160Direct copy()
+    {
+        BridgeT160Direct b = default;
+        b.t.set(t.value()); b.tag = tag + 1; b.copies = copies + 1;
+        return move b;
+    }
+};
+
+struct BridgeT160Array1
+{
+    BridgeT149Node[1] arr = default;
+    cpptw.Twin marker = default;
+    int tag = 0;
+    int copies = 0;
+    BridgeT160Array1 copy()
+    {
+        BridgeT160Array1 b = default;
+        b.arr[0].l.push_back(arr[0].l.front());
+        b.marker.set(marker.value()); b.tag = tag + 1; b.copies = copies + 1;
+        return move b;
+    }
+};
+
+struct BridgeT160Array2
+{
+    BridgeT149Node[2] arr = default;
+    cpptw.Twin marker = default;
+    int tag = 0;
+    int copies = 0;
+    BridgeT160Array2 copy()
+    {
+        BridgeT160Array2 b = default;
+        b.arr[0].l.push_back(arr[0].l.front());
+        b.arr[1].l.push_back(arr[1].l.front());
+        b.marker.set(marker.value()); b.tag = tag + 1; b.copies = copies + 1;
+        return move b;
+    }
+};
+
+struct BridgeT160Outer
+{
+    BridgeT160Direct inner = default;
+    int k = 0;
+};
+
+int bridge_t160_direct_copy()
+{
+    BridgeT160Direct a = default; a.t.set(17); a.tag = 1;
+    BridgeT160Direct b = a;
+    return a.tag * 1000 + b.tag * 100 + b.t.value() * 10 + b.copies;
+}
+
+int bridge_t160_array1_copy()
+{
+    BridgeT160Array1 a = default; a.arr[0].l.push_back(7); a.marker.set(7); a.tag = 1;
+    BridgeT160Array1 b = a;
+    return a.tag * 1000 + b.tag * 100 + b.arr[0].l.front() * 10 + b.copies;
+}
+
+int bridge_t160_array2_copy()
+{
+    BridgeT160Array2 a = default;
+    a.arr[0].l.push_back(17); a.arr[0].tag = 3;
+    a.arr[1].l.push_back(19); a.arr[1].tag = 5;
+    a.marker.set(1); a.tag = 1;
+    BridgeT160Array2 b = a;
+    return b.tag * 10000 + b.arr[0].l.front() * 100 + b.arr[1].l.front() * 10 + b.copies;
+}
+
+int bridge_t160_nested_copy()
+{
+    BridgeT160Outer a = default; a.inner.t.set(23); a.inner.tag = 4; a.k = 6;
+    BridgeT160Outer b = a;
+    return b.k * 10000 + b.inner.t.value() * 100 + b.inner.tag * 10 + b.inner.copies;
+}
+
+int bridge_t160_list_copy()
+{
+    list<BridgeT160Direct> source = default;
+    BridgeT160Direct a = default; a.t.set(31); a.tag = 2; source.add(move a);
+    a.t.set(37); a.tag = 5; source.add(move a);
+    list<BridgeT160Direct> copied = source.copy();
+    return copied.count() * 1000000
+        + copied[0].t.value() * 10000 + copied[0].tag * 1000 + copied[0].copies * 100
+        + copied[1].t.value() * 100 + copied[1].tag * 10 + copied[1].copies;
+}
+
+int bridge_t160_list_copy_allocator()
+{
+    MallocAllocator backing = default;
+    IAllocator allocator = backing;
+    list<BridgeT160Direct> source = default;
+    BridgeT160Direct a = default; a.t.set(31); a.tag = 2; source.add(move a);
+    a.t.set(37); a.tag = 5; source.add(move a);
+    list<BridgeT160Direct> copied = source.copy(allocator);
+    return copied.count() * 1000000
+        + copied[0].t.value() * 10000 + copied[0].tag * 1000 + copied[0].copies * 100
+        + copied[1].t.value() * 100 + copied[1].tag * 10 + copied[1].copies;
+}
+
+int bridge_t160_explicit_copy()
+{
+    BridgeT160Direct a = default; a.t.set(41); a.tag = 8;
+    BridgeT160Direct b = a.copy();
+    return a.tag * 1000 + b.tag * 100 + b.t.value() * 10 + b.copies;
+}
+
+int bridge_t160_dictionary_copy()
+{
+    dictionary<int, BridgeLoweredUserCopy> source = default;
+    BridgeLoweredUserCopy p = default; p.t.set(7); p.copies = 0; source.set(1, move p);
+    p.t.set(9); source.set(2, move p);
+    dictionary<int, BridgeLoweredUserCopy> copied = source.copy();
+    int sum = 0; int copies = 0; int i = 0;
+    while (i < copied.slotCount())
+    {
+        if (copied.slotOccupied(i))
+        {
+            sum += copied.keyAt(i) * 100 + copied.valueAt(i).t.value();
+            copies += copied.valueAt(i).copies;
+        }
+        i++;
+    }
+    return source.count() * 1000000 + copied.count() * 100000 + sum * 100 + copies;
+}
+
+// T160 (r2): a lowered struct with a member copy() declared from a factory call. The factory's
+// sret temp is the local's storage; copy() and implicit copy must not retarget onto a later alloca.
+struct BridgeT160Factory
+{
+    cpptw.Twin t = default;
+    int tag = 0;
+    BridgeT160Factory copy()
+    {
+        BridgeT160Factory b = default;
+        b.t.set(t.value()); b.tag = tag + 1;
+        return move b;
+    }
+};
+
+BridgeT160Factory bridge_t160_make_factory(int v)
+{
+    BridgeT160Factory b = default; b.t.set(v); b.tag = v;
+    return move b;
+}
+
+int bridge_t160_factory_copy()
+{
+    BridgeT160Factory x = bridge_t160_make_factory(4);
+    BridgeT160Factory y = x.copy();
+    BridgeT160Factory z = x;
+    return ((((x.tag * 10 + y.tag) * 10 + y.t.value()) * 10 + z.tag) * 10 + z.t.value());
+}
+
+// T156: a program's default ctor builds its user fields in the caller's sret slot. A C++ field
+// (std.list) built in a temporary and bit-copied into that slot moves the list's sentinel.
+program BridgeT156Prog
+{
+    std.list<int> l = default;
+    BridgeT149Node[2] arr = default;
+    int k = 5;
+    int main()
+    {
+        l.push_back(3); l.push_back(4); arr[1].l.push_back(9);
+        return 0;
+    }
+    int probe() { return (int)l.size() * 1000 + (int)arr[1].l.size() * 100 + (int)arr[0].l.size() * 10 + k; }
+};
+
+// Fields read before and after main(); the program tears down when p leaves scope.
+int bridge_t156_program_fields()
+{
+    BridgeT156Prog p = default;
+    int before = p.probe();
+    p.main();
+    return before * 10000 + p.probe();
+}
+
+int bridge_t156_program_teardown()
+{
+    BridgeT156Prog p = default;
+    p.main();
+    return 7;
 }
 
 // A field type with a user copy constructor and destructor but clang's implicit TRIVIAL
@@ -4750,6 +5066,60 @@ extern int main(int argc, char** argv)
     bridge_check("bridge lowered trivial operator= field value", bridge_lowered_trivial_assign_field(), 39);
     bridge_check("bridge lowered trivial operator= field C++ copy", cpptw.trivial_assign_copy_count(), 0);
     bridge_check("bridge lowered trivial operator= field C++ dtor", cpptw.trivial_assign_dtor_count(), 3);
+
+    // T149 D3-D5: dictionary slots, list take() and fixed-array fields of C++-field structs.
+    cpptw.reset_counts();
+    bridge_check("bridge T149 dictionary lowered value", bridge_t149_dict_lowered(), 8110);
+    bridge_check("bridge T149 dictionary lowered C++ live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge T149 dictionary moved value", bridge_t149_dict_moved(), 909091);
+    bridge_check("bridge T149 dictionary moved C++ live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge T149 list take lowered value", bridge_t149_take_lowered(), 11132);
+    bridge_check("bridge T149 list take lowered C++ live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge T149 list take plain value", bridge_t149_take_plain(), 20302);
+    bridge_check("bridge T149 list take plain C++ live", cpptw.live_allocations(), 0);
+
+    // T156: program user fields (C++ list, array of C++-field structs, native) built in the sret slot.
+    bridge_check("bridge T156 program field value", bridge_t156_program_fields(), 52105);
+    bridge_check("bridge T156 program teardown", bridge_t156_program_teardown(), 7);
+    bridge_check("bridge T149 fixed-array field value", bridge_t149_arr_field(), 2112);
+    bridge_check("bridge T149 fixed-array global value", bridge_t149_arr_global(), 10);
+    bridge_check("bridge T149 user-ctor fixed-array field value", bridge_t149_user_ctor_arr(), 12);
+    bridge_check("bridge T154 parameterized ctor array value", bridge_t154_param_ctor_arr(), 21);
+    bridge_check("bridge T154 both ctors array value", bridge_t154_both_ctors_arr(), 21);
+    bridge_check("bridge T154 holder field value", bridge_t154_holder_field(), 100 + 10 + 1 + 5000);
+    bridge_check("bridge T154 default-argument array value", bridge_t154_default_arg_arr(), 21);
+
+    // T160: sret user-copy results, nested user copies, and one copy per container element.
+    cpptw.reset_counts();
+    bridge_check("bridge T160 direct C++ field user copy", bridge_t160_direct_copy(), 1371);
+    bridge_check("bridge T160 direct C++ field live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge T160 self-referential array[1] user copy", bridge_t160_array1_copy(), 1271);
+    bridge_check("bridge T160 self-referential array[1] live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge T160 self-referential array[2] user copy", bridge_t160_array2_copy(), 21891);
+    bridge_check("bridge T160 self-referential array[2] live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge T160 nested user copy called", bridge_t160_nested_copy(), 62351);
+    bridge_check("bridge T160 nested user copy live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge T160 list copy one user copy per element", bridge_t160_list_copy(), 2316861);
+    bridge_check("bridge T160 list copy live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge T160 list allocator copy one user copy per element", bridge_t160_list_copy_allocator(), 2316861);
+    bridge_check("bridge T160 list allocator copy live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge T160 explicit user copy", bridge_t160_explicit_copy(), 9311);
+    bridge_check("bridge T160 explicit user copy live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge T160 dictionary copy sret and values", bridge_t160_dictionary_copy(), 2231602);
+    bridge_check("bridge T160 dictionary copy live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge T160 factory decl then user copy and implicit copy", bridge_t160_factory_copy(), 45454);
+    bridge_check("bridge T160 factory decl live", cpptw.live_allocations(), 0);
 
     bridge_reset_cf();
     int bridgeEnclosingMoveCf = bridge_enclosing_move<TwinCf>();

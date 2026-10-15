@@ -1,0 +1,76 @@
+// T151: an implicit floating -> integer store is refused in every position; explicit casts stay legal.
+import cpp "t84_conversion.hpp";
+import cpp "cpp_t103_nullctor.hpp";
+import cpp "cpp_interop_explicit.h";
+
+double t151Dret() { return 2.5; }
+
+expect_error("loses the fractional part") {
+    struct T151FieldDefault { int i = 3.7; };
+}
+expect_error("loses the fractional part") {
+    simd<i32, 4> t151RetSimd() { double r = 2.5; return r; }
+}
+expect_error("loses the fractional part") {
+    struct T151CtorField { int i = 3.7; T151CtorField() { } };
+}
+expect_error("loses the fractional part") {
+    u32 t151GlobalInit = 3000000000.5;
+}
+
+struct T151Bits { u32 a : 12; u32 b : 20; };
+struct T151Named { int i = 0; };
+
+extern int main()
+{
+    double d = 2.5;
+    expect_error("loses the fractional part") {
+        int declInit = d;
+    }
+    int assigned = 0;
+    expect_error("loses the fractional part") {
+        assigned = d;
+    }
+    int compound = 1;
+    expect_error("loses the fractional part") {
+        compound += 0.5;
+    }
+    bool t = true;
+    expect_error("loses the fractional part") {
+        int tern = t ? 1 : d;
+    }
+    expect_error("loses the fractional part") {
+        int [2] arrElem = { 1.5, 2 };
+    }
+    expect_error("loses the fractional part") {
+        simd<u32, 4> splat = d;
+    }
+    expect_error("loses the fractional part") {
+        T151Bits bits;
+        bits.b = d;
+    }
+    expect_error("loses the fractional part") {
+        T151Named named = { i = d };
+    }
+    expect_error("loses the fractional part") {
+        T151Bits seeded = { a = d };
+    }
+    expect_error("loses the fractional part") {
+        simd<u32, 4> t151Sx = 0;
+        t151Sx += d;
+    }
+    expect_error("loses the fractional part") {
+        int t151Ctor = cppexp.memrank_rref(d);
+    }
+    expect_error("would convert a floating value to an integer") {
+        int t151Ret = t103.empty_function(t151Dret);
+    }
+    T84Double conv = T84Double(2.5);
+    expect_error("loses the fractional part") {
+        u32 convStore = conv;
+    }
+    u32 legalCast = (u32)conv;
+    int legalIntCast = (int)d;
+    int legalCtorCast = cppexp.memrank_rref((int)d);
+    return 0;
+}

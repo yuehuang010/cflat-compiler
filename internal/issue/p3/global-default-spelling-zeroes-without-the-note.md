@@ -49,3 +49,14 @@ queued - its field values are written into the same constant afterwards and the 
 2026-10-12 (T136 r3): T136 merged native + C++ global construction into one declaration-ordered initializer, but a
 native global with a CFlat ctor body spelled `= default` / `= {}` still reads 0 (clang 5); fixing it flips the frozen
 test_initializer_list legs ~588 / ~824, so it stays with this issue.
+
+## Arrays: `S[2] g = default;` zero-fills even a foldable element default (T149 r2, 2026-10-13, master 4fee72142)
+`struct S { int x = 9; }; S g4 = default; S[2] g5 = default; S[2] g6;` prints g4.x 9, g5[1].x 0, g6[1].x 9 (clang-style
+expectation 9 for all). Same for a nested global `O g = default;` whose field is `A[2] a = default` (Sol T149 r1, arrays.cb).
+Root cause (Haiku T149): GenerateDefaultValue skips the array element walk when global_scope is true and returns a null constant.
+Fix direction: fold each element's default at file scope (the `S[2] g6;` arm already does). WRONG VALUE, not only a missing note.
+Repro: scratch/repro_keep/t149/v4.cb.
+2026-10-13 T158: flat and N-D `S[N] g = default` now fold the element default (frozen leg fadGlobal updated 0 -> 14, it had
+pinned this wrong value). STILL OPEN: nested `O g = default;` whose field is `S[2] a = default` reads 0 for every field
+(even `int z = 1`): the constant folder cannot fold a struct whose ctor writes an array-of-struct field, so the whole global
+falls back to zero (second root cause, not one site).

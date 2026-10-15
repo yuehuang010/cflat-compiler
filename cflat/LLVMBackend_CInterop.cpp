@@ -2929,6 +2929,8 @@ llvm::Function* LLVMBackend::StdFunctionConvertingThunk(const std::string& name,
         auto* thunk = llvm::Function::Create(thunkTy, llvm::Function::InternalLinkage, thunkName,
                                              *module);
         llvm::IRBuilder<> b(llvm::BasicBlock::Create(*context, "entry", thunk));
+        // Set when a floating -> integer adaptation is refused, so the mismatch names the cause.
+        bool floatToIntRefused = false;
         auto convert = [&](llvm::Value* v, llvm::Type* to, bool srcUnsigned,
                            bool dstUnsigned) -> llvm::Value* {
             llvm::Type* from = v->getType();
@@ -2946,7 +2948,9 @@ llvm::Function* LLVMBackend::StdFunctionConvertingThunk(const std::string& name,
             {
                 if (to->getIntegerBitWidth() == 1)
                     return b.CreateFCmpUNE(v, llvm::ConstantFP::get(from, 0.0));
-                return dstUnsigned ? b.CreateFPToUI(v, to) : b.CreateFPToSI(v, to);
+                // Implicit float -> integer adaptation is refused at binding (ruling 2026-10-13).
+                floatToIntRefused = true;
+                return nullptr;
             }
             if (from->isFloatingPointTy() && to->isFloatingPointTy()) return b.CreateFPCast(v, to);
             return nullptr;
@@ -2960,6 +2964,8 @@ llvm::Function* LLVMBackend::StdFunctionConvertingThunk(const std::string& name,
             if (v == nullptr)
             {
                 thunk->eraseFromParent();
+                if (floatToIntRefused)
+                    return mismatch(std::format("parameter {} would convert a floating value to an integer; use an explicit cast", i + 1));
                 return mismatch(std::format("parameter {} does not convert", i + 1));
             }
             callArgs.push_back(v);
@@ -2977,6 +2983,8 @@ llvm::Function* LLVMBackend::StdFunctionConvertingThunk(const std::string& name,
             if (r == nullptr)
             {
                 thunk->eraseFromParent();
+                if (floatToIntRefused)
+                    return mismatch("the return would convert a floating value to an integer; use an explicit cast");
                 return mismatch("the return type does not convert");
             }
             b.CreateRet(r);
@@ -8693,6 +8701,78 @@ bool LLVMBackend::HasCxxFunctionTemplate(const std::string& qualifiedName) const
                                                qualifiedName.substr(dot + 1)).empty();
 }
 
+bool LLVMBackend::IsCxxFunctionTemplateParameterByValue(const std::string& functionName,
+                                                        const std::string& ownerType,
+                                                        size_t parameterIndex,
+                                                        size_t arity) const
+{
+        const std::string resolved = ownerType.empty()
+            ? functionName
+            : ResolveCxxFunctionTemplateName(ownerType, functionName);
+        auto templates = cxxFunctionTemplates_.find(resolved);
+        if (templates == cxxFunctionTemplates_.end()) return false;
+        bool sawCandidate = false;
+        for (const auto& candidate : templates->second)
+        {
+            const bool kindMatches = ownerType.empty()
+                ? candidate.kind == cflat_cinterop::RawFunctionTemplate::Free
+                    || candidate.kind == cflat_cinterop::RawFunctionTemplate::StaticMember
+                : candidate.kind == cflat_cinterop::RawFunctionTemplate::InstanceMember
+                    || candidate.kind == cflat_cinterop::RawFunctionTemplate::StaticMember;
+            if (!kindMatches || arity < candidate.minArity || arity > candidate.maxArity)
+                continue;
+            sawCandidate = true;
+            size_t index = parameterIndex;
+            if (candidate.hasParameterPack && !candidate.parameterTypes.empty()
+                && index >= candidate.parameterTypes.size() - 1)
+                index = candidate.parameterTypes.size() - 1;
+            if (index >= candidate.parameterTypes.size()
+                || candidate.parameterTypes[index].find('&') != std::string::npos)
+                return false;
+        }
+        return sawCandidate;
+}
+
+bool LLVMBackend::IsCxxFreeFunctionParameterByValue(const std::string& functionName,
+                                                    size_t parameterIndex,
+                                                    size_t arity) const
+{
+        auto signatures = cxxFunctionSignatures_.find(functionName);
+        if (signatures == cxxFunctionSignatures_.end()) return false;
+        bool sawCandidate = false;
+        for (const auto& signature : signatures->second)
+        {
+            if (!signature.isCxx || signature.paramSpellings.size() != arity) continue;
+            sawCandidate = true;
+            if (parameterIndex >= signature.paramSpellings.size()
+                || signature.paramSpellings[parameterIndex].find('&') != std::string::npos)
+                return false;
+        }
+        return sawCandidate;
+}
+
+bool LLVMBackend::IsCxxMemberFunctionParameterByValue(const std::string& ownerType,
+                                                      const std::string& memberName,
+                                                      size_t parameterIndex,
+                                                      size_t arity) const
+{
+        auto record = cxxRecordEntries_.find(ownerType);
+        if (record == cxxRecordEntries_.end()) return false;
+        bool sawCandidate = false;
+        for (const auto& member : record->second.members)
+        {
+            if (member.name != memberName
+                || member.kind != cflat_cinterop::RawCxxMember::Instance
+                || member.paramTypes.size() != arity
+                || parameterIndex >= member.paramTypes.size())
+                continue;
+            sawCandidate = true;
+            if (member.paramTypes[parameterIndex].find('&') != std::string::npos)
+                return false;
+        }
+        return sawCandidate;
+}
+
 static bool CxxTemplateHasForwardingReferenceParameter(
         const cflat_cinterop::RawFunctionTemplate& candidate)
 {
@@ -10844,6 +10924,26 @@ bool LLVMBackend::IsCxxFunctionDesignatorArgument(const NamedVariable& arg) cons
             && llvm::isa<llvm::Function>(arg.Primary->stripPointerCasts());
 }
 
+// `R (*&)(A)` and its const/volatile forms: the referent `R (*)(A)` of a non-rvalue reference
+// to a function pointer, as clang canonicalizes it; empty for any other spelling.
+static std::string CxxFunctionPointerReferentParameter(const std::string& parameter)
+{
+        for (std::string marker : { std::string("(*&)"), std::string("(*const &)"),
+                                    std::string("(*volatile &)"),
+                                    std::string("(*const volatile &)") })
+            if (size_t at = parameter.find(marker); at != std::string::npos)
+                return parameter.substr(0, at) + "(*)" + parameter.substr(at + marker.size());
+        return {};
+}
+
+// The C++ type inside a `__typeof__( ... )` spelling (CxxThinFunctionPointerSpelling's form).
+static std::string CxxTypeofInner(const std::string& spelling)
+{
+        constexpr std::string_view prefix = "__typeof__(";
+        if (!spelling.starts_with(prefix) || !spelling.ends_with(")")) return {};
+        return spelling.substr(prefix.size(), spelling.size() - prefix.size() - 1);
+}
+
 // `X *const &`: a C++ const reference to a pointer (a literal binds its decayed temporary).
 static bool IsCxxConstRefToPointerSpelling(std::string type)
 {
@@ -11102,6 +11202,10 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         error.clear();
         lastCxxRequestClangRejected_ = false;
         registeredName.clear();
+        const bool hasDirectConstructionArgument = std::any_of(
+            arguments.begin(), arguments.end(), [](const auto& argument) {
+                return argument.IsCxxDirectConstruction;
+            });
         const std::string lookupName = ownerType.empty()
             ? functionName : ownerType + "." + functionName;
         std::string templateName = lookupName;
@@ -11438,6 +11542,8 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         std::vector<std::string> parameterSpellings;
         std::vector<std::string> callArguments;
         std::vector<std::pair<size_t, size_t>> functionPointerCallerSlots;
+        // (wrapper parameter, the direct-construction argument whose slot the wrapper takes).
+        std::vector<std::pair<size_t, TypeAndValue>> constructionFunctionPointerSlots;
         // (call argument index, C++ literal spelling) for the literal retry below.
         std::vector<std::pair<size_t, std::string>> literalCallArguments;
         // A `const` CFlat's types cannot show was spelled into the wrapper: see uniqueForConst.
@@ -11515,6 +11621,128 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         std::map<size_t, std::pair<size_t, std::string>> classBackedParams;
         std::string wrapperBodyPrefix;
         bool wrapperNeedsInitializerList = false;
+        auto appendDirectConstruction = [&](NamedVariable& construction,
+                                             auto&& self,
+                                             std::string& expression) -> bool {
+            if (!construction.IsCxxDirectConstruction) return false;
+            std::string typeSpelling;
+            if (!CxxSpellingForCflatType(construction.CxxDirectConstructionType, typeSpelling))
+                return false;
+            std::vector<std::string> constructorArguments;
+            auto hasExactLvalueReferenceParameter = [&](size_t index,
+                                                         const std::string& spelling,
+                                                         bool functionPointer = false) {
+                auto record = cxxRecordEntries_.find(construction.CxxDirectConstructionType);
+                if (record == cxxRecordEntries_.end()) return false;
+                for (const auto& member : record->second.members)
+                {
+                    if (member.kind != cflat_cinterop::RawCxxMember::Constructor
+                        || member.paramTypes.size()
+                            < construction.CxxDirectConstructionArguments.size() + 1)
+                        continue;
+                    bool fits = true;
+                    for (size_t n = construction.CxxDirectConstructionArguments.size() + 1;
+                         n < member.paramTypes.size(); ++n)
+                        if ((n >= member.defaultArgs.size() || member.defaultArgs[n].kind.empty())
+                            && !(n + 1 == member.paramTypes.size()
+                                && member.paramTypes[n].ends_with("...")))
+                        { fits = false; break; }
+                    if (!fits || index + 1 >= member.paramTypes.size()) continue;
+                    const std::string& parameter = member.paramTypes[index + 1];
+                    const std::string referent = functionPointer
+                        ? CxxFunctionPointerReferentParameter(parameter)
+                        : parameter.ends_with("&") && !parameter.ends_with("&&")
+                            ? StripCxxRefAndCv(parameter) : std::string();
+                    if (!referent.empty() && SqueezeCxxSpelling(referent)
+                        == SqueezeCxxSpelling(spelling)) return true;
+                }
+                return false;
+            };
+            for (size_t ctorArgIndex = 0;
+                 ctorArgIndex < construction.CxxDirectConstructionArguments.size();
+                 ++ctorArgIndex)
+            {
+                NamedVariable& argument =
+                    construction.CxxDirectConstructionArguments[ctorArgIndex];
+                std::string child;
+                if (argument.IsCxxDirectConstruction)
+                {
+                    if (!self(argument, self, child)) return false;
+                }
+                else
+                {
+                    std::string spelling;
+                    const std::string type = cflatTypeOf(argument);
+                    TypeAndValue functionType = argument.TypeAndValue;
+                    if (IsCxxFunctionDesignatorArgument(argument))
+                        if (auto* fn = llvm::dyn_cast<llvm::Function>(
+                                argument.Primary->stripPointerCasts()))
+                            if (const FunctionSymbol* symbol = FindSymbolForFunction(fn))
+                                functionType = FuncPtrSigOfSymbol(*symbol);
+                    if (type == "__c_fn_ptr") functionType.TypeName = type;
+                    if (!argument.CxxClosureSignature.empty())
+                    {
+                        const std::string parameter = "p" + std::to_string(flatParameterIndex++);
+                        parameterSpellings.push_back("void *");
+                        child = CxxClosureCallArgument(argument, parameter);
+                        closureArgument = true;
+                    }
+                    else if (CxxThinFunctionPointerSpelling(functionType, spelling))
+                    {
+                        const std::string parameter = "p" + std::to_string(flatParameterIndex++);
+                        if (IsCxxFunctionDesignatorArgument(argument))
+                        {
+                            parameterSpellings.push_back(spelling);
+                            child = "(*" + parameter + ")";
+                        }
+                        else if (IsProvenCxxScalarLvalue(argument, true)
+                                 && argument.Storage != nullptr
+                                 && hasExactLvalueReferenceParameter(
+                                        ctorArgIndex, CxxTypeofInner(spelling), true))
+                        {
+                            // A `Fn&` / `const Fn&` constructor parameter binds the caller's slot: the
+                            // wrapper takes its address, as the top-level thin branch does.
+                            parameterSpellings.push_back("void *");
+                            constructionFunctionPointerSlots.emplace_back(
+                                parameterSpellings.size() - 1, functionType);
+                            argument.Primary = argument.Storage;
+                            child = "*static_cast<" + spelling + " *>(" + parameter + ")";
+                        }
+                        else
+                        {
+                            // By value: the snapshot the wrapper took is the argument.
+                            parameterSpellings.push_back(spelling);
+                            child = "static_cast<" + spelling + " &&>(" + parameter + ")";
+                        }
+                    }
+                    else
+                    {
+                        if (type.empty() || !cxxTemplateArgumentSpelling(type, spelling)) return false;
+                        const bool classValue = !argument.TypeAndValue.Pointer
+                            && IsCxxRecord(argument.TypeAndValue.TypeName);
+                        const bool lvalue = classValue ? !IsCxxRvalueReferenceArgument(argument)
+                            : IsProvenCxxScalarLvalue(argument);
+                        const bool constObject = CxxConstReceiverKind(argument) != 0;
+                        std::string parameterSpelling = constObject ? "const " + spelling : spelling;
+                        if (classValue) parameterSpelling += lvalue ? " &" : " &&";
+                        else if (lvalue && hasExactLvalueReferenceParameter(ctorArgIndex, spelling))
+                            parameterSpelling += " &";
+                        parameterSpellings.push_back(std::move(parameterSpelling));
+                        const std::string parameter = "p" + std::to_string(flatParameterIndex++);
+                        child = lvalue ? parameter
+                            : "static_cast<" + spelling + " &&>(" + parameter + ")";
+                    }
+                }
+                constructorArguments.push_back(std::move(child));
+            }
+            const char* open = construction.CxxDirectConstructionUsesBraces ? "({" : "(";
+            const char* close = construction.CxxDirectConstructionUsesBraces ? "})" : ")";
+            expression = typeSpelling + open;
+            for (size_t i = 0; i < constructorArguments.size(); ++i)
+                expression += (i == 0 ? "" : ", ") + constructorArguments[i];
+            expression += close;
+            return true;
+        };
         for (size_t i = selected->kind == cflat_cinterop::RawFunctionTemplate::InstanceMember ? 1u : 0u;
              i < arguments.size(); ++i)
         {
@@ -11781,6 +12009,14 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 constSpelled = true;
             }
             const bool classRvalue = classArgument && arg.IsRvalue;
+            if (classRvalue && arg.IsCxxDirectConstruction)
+            {
+                std::string construction;
+                if (!appendDirectConstruction(arg, appendDirectConstruction, construction))
+                    return noMatch("a direct C++ construction argument cannot be forwarded");
+                callArguments.push_back(std::move(construction));
+                continue;
+            }
             /*
              * The wrapper takes the first-element pointer and rebuilds the caller's array lvalue,
              * so C++ deduces `T&` / `T(&)[N]` as the array and a by-value `T` decays on its own.
@@ -11951,7 +12187,21 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 self(self, MangleType(*this, arg));
         };
         for (const auto& argument : arguments)
+        {
             collectTypeDependencies(collectTypeDependencies, cflatTypeOf(argument));
+            auto collectConstructionDependencies = [&](auto&& self,
+                                                        const NamedVariable& construction) -> void {
+                if (!construction.IsCxxDirectConstruction) return;
+                collectTypeDependencies(collectTypeDependencies,
+                                        construction.CxxDirectConstructionType);
+                for (const NamedVariable& child : construction.CxxDirectConstructionArguments)
+                {
+                    collectTypeDependencies(collectTypeDependencies, cflatTypeOf(child));
+                    self(self, child);
+                }
+            };
+            collectConstructionDependencies(collectConstructionDependencies, argument);
+        }
         for (const std::string& explicitArg : explicitArgs)
             if (!explicitArg.starts_with("#"))
                 collectTypeDependencies(collectTypeDependencies, explicitArg);
@@ -11963,8 +12213,21 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         generatedTypeArguments.reserve(arguments.size() + explicitArgs.size());
         if (selected->kind == cflat_cinterop::RawFunctionTemplate::InstanceMember)
             generatedTypeArguments.push_back(ownerType);
+        auto appendConstructionTypeArguments = [&](auto&& self,
+                                                    const NamedVariable& construction) -> void {
+            if (!construction.IsCxxDirectConstruction) return;
+            generatedTypeArguments.push_back(construction.CxxDirectConstructionType);
+            for (const NamedVariable& child : construction.CxxDirectConstructionArguments)
+            {
+                generatedTypeArguments.push_back(cflatTypeOf(child));
+                self(self, child);
+            }
+        };
         for (const auto& argument : arguments)
+        {
             generatedTypeArguments.push_back(cflatTypeOf(argument));
+            appendConstructionTypeArguments(appendConstructionTypeArguments, argument);
+        }
         for (const std::string& explicitArg : explicitArgs)
             if (!explicitArg.starts_with("#")) generatedTypeArguments.push_back(explicitArg);
         GeneratedCxxDefinitionsFor(generatedTypeArguments, generatedTypeSource,
@@ -12012,7 +12275,8 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         const bool uniqueForCategory = categorySensitive && infixOperator.empty()
             && !functionName.starts_with("operator")
             && functionName.find(".operator") == std::string::npos;
-        const bool uniqueForFunctionPointerSlot = !functionPointerCallerSlots.empty();
+        const bool uniqueForFunctionPointerSlot = !functionPointerCallerSlots.empty()
+            || !constructionFunctionPointerSlots.empty();
         // So does one with a spelled `const`: its CFlat signature equals the non-const sibling's.
         const bool uniqueForConst = constSpelled && infixOperator.empty()
             && !functionName.starts_with("operator")
@@ -12020,7 +12284,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         const bool uniqueForBraceBacking = !scalarBackedParams.empty() || !classBackedParams.empty();
         if (!explicitArgs.empty() || infixForm || uniqueForCategory || uniqueForConst
             || uniqueForFunctionPointerSlot || uniqueForBraceBacking || uniqueRegistration || closureArgument
-            || literalArrayArgument)
+            || literalArrayArgument || hasDirectConstructionArgument)
         {
             registeredName = wrapperName;
             if (functionTable.find(wrapperName) != functionTable.end()
@@ -12289,6 +12553,14 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                     bound.params[parameterIndex].TypeName = "__c_fn_ptr";
                 bound.params[parameterIndex].IsFunctionPointer = true;
             }
+        for (const auto& [parameterIndex, slotType] : constructionFunctionPointerSlots)
+            if (parameterIndex < bound.params.size())
+            {
+                bound.params[parameterIndex] = slotType;
+                if (bound.params[parameterIndex].TypeName.empty())
+                    bound.params[parameterIndex].TypeName = "__c_fn_ptr";
+                bound.params[parameterIndex].IsFunctionPointer = true;
+            }
         RegisterCSignatures({ bound }, selected->file.empty() ? group.headers.front() : selected->file);
         bool registered = false;
         if (auto it = functionTable.find(registeredName); it != functionTable.end())
@@ -12399,8 +12671,14 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                                          const std::string& infixLhsName,
                                          const std::string& infixRhsName,
                                          bool adlCall,
-                                         const std::vector<std::pair<size_t, size_t>>& braceGroups)
+                                         const std::vector<std::pair<size_t, size_t>>& braceGroups,
+                                         const std::string& memberOwnerType)
 {
+        const bool memberCall = !memberOwnerType.empty();
+        const std::string memberName = memberCall
+            ? functionName.substr(functionName.rfind('.') == std::string::npos
+                ? 0 : functionName.rfind('.') + 1)
+            : std::string();
         lastCxxRequestClangRejected_ = false;
         lastCxxRequestNoViableAtRequest_ = false;
         /*
@@ -12415,7 +12693,11 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
         const size_t infixRhsIndex = infixLhsName.empty() ? 1 : 0;
         error.clear();
         registeredName.clear();
-        if (!functionName.starts_with("std.") && !adlCall)
+        const bool hasDirectConstructionArgument = std::any_of(
+            arguments.begin(), arguments.end(), [](const auto& argument) {
+                return argument.IsCxxDirectConstruction;
+            });
+        if (!memberCall && !functionName.starts_with("std.") && !adlCall)
             if (std::string refusal = GetCxxBindingRefusal(functionName); !refusal.empty())
             {
                 auto fit = functionTable.find(functionName);
@@ -12426,7 +12708,8 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 }
             }
         const bool functionMacro = cxxFunctionMacros_.count(functionName) != 0;
-        if ((functionName.find('.') == std::string::npos && !functionMacro) || !HasCxxImportGroup())
+        if ((functionName.find('.') == std::string::npos && !functionMacro && !memberCall)
+            || !HasCxxImportGroup())
             return false;
         for (NamedVariable& argument : arguments)
         {
@@ -12539,6 +12822,23 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
          */
         auto literalBindsPointerConstRef = [&](size_t index) {
             bool any = false;
+            if (memberCall)
+            {
+                auto record = cxxRecordEntries_.find(memberOwnerType);
+                if (record == cxxRecordEntries_.end() || index == 0) return false;
+                const size_t userIndex = index - 1;
+                for (const auto& member : record->second.members)
+                {
+                    if (member.name != memberName
+                        || member.kind != cflat_cinterop::RawCxxMember::Instance
+                        || member.paramTypes.size() + 1 != arguments.size()
+                        || userIndex >= member.paramTypes.size())
+                        continue;
+                    if (!IsCxxConstRefToPointerSpelling(member.paramTypes[userIndex])) return false;
+                    any = true;
+                }
+                return any;
+            }
             if (auto templates = cxxFunctionTemplates_.find(functionName);
                 templates != cxxFunctionTemplates_.end())
                 for (const auto& candidate : templates->second)
@@ -12564,13 +12864,139 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
         std::vector<std::string> parameterSpellings;
         std::vector<std::string> callArguments;
         std::vector<size_t> functionPointerCallerSlots;
+        std::vector<std::pair<size_t, TypeAndValue>> constructionFunctionPointerSlots;
         parameterSpellings.reserve(arguments.size());
         callArguments.reserve(arguments.size());
         // (call argument index, C++ literal spelling) for the literal retry below.
         std::vector<std::pair<size_t, std::string>> literalCallArguments;
+        auto appendDirectConstruction = [&](NamedVariable& construction,
+                                             auto&& self,
+                                             std::string& expression) -> bool {
+            if (!construction.IsCxxDirectConstruction) return false;
+            std::string typeSpelling;
+            if (!CxxSpellingForCflatType(construction.CxxDirectConstructionType, typeSpelling))
+                return false;
+            std::vector<std::string> constructorArguments;
+            auto hasExactLvalueReferenceParameter = [&](size_t index,
+                                                         const std::string& spelling,
+                                                         bool functionPointer = false) {
+                auto record = cxxRecordEntries_.find(construction.CxxDirectConstructionType);
+                if (record == cxxRecordEntries_.end()) return false;
+                for (const auto& member : record->second.members)
+                {
+                    if (member.kind != cflat_cinterop::RawCxxMember::Constructor
+                        || member.paramTypes.size()
+                            < construction.CxxDirectConstructionArguments.size() + 1)
+                        continue;
+                    bool fits = true;
+                    for (size_t n = construction.CxxDirectConstructionArguments.size() + 1;
+                         n < member.paramTypes.size(); ++n)
+                        if ((n >= member.defaultArgs.size() || member.defaultArgs[n].kind.empty())
+                            && !(n + 1 == member.paramTypes.size()
+                                && member.paramTypes[n].ends_with("...")))
+                        { fits = false; break; }
+                    if (!fits || index + 1 >= member.paramTypes.size()) continue;
+                    const std::string& parameter = member.paramTypes[index + 1];
+                    const std::string referent = functionPointer
+                        ? CxxFunctionPointerReferentParameter(parameter)
+                        : parameter.ends_with("&") && !parameter.ends_with("&&")
+                            ? StripCxxRefAndCv(parameter) : std::string();
+                    if (!referent.empty() && SqueezeCxxSpelling(referent)
+                        == SqueezeCxxSpelling(spelling)) return true;
+                }
+                return false;
+            };
+            for (size_t ctorArgIndex = 0;
+                 ctorArgIndex < construction.CxxDirectConstructionArguments.size();
+                 ++ctorArgIndex)
+            {
+                NamedVariable& argument =
+                    construction.CxxDirectConstructionArguments[ctorArgIndex];
+                std::string child;
+                if (argument.IsCxxDirectConstruction)
+                {
+                    if (!self(argument, self, child)) return false;
+                }
+                else
+                {
+                    TypeAndValue childType = argumentType(argument);
+                    if (IsCxxFunctionDesignatorArgument(argument))
+                        if (auto* fn = llvm::dyn_cast<llvm::Function>(
+                                argument.Primary->stripPointerCasts()))
+                            if (const FunctionSymbol* symbol = FindSymbolForFunction(fn))
+                                childType = FuncPtrSigOfSymbol(*symbol);
+                    std::string spelling;
+                    if (!argument.CxxClosureSignature.empty())
+                    {
+                        const std::string parameter = "p"
+                            + std::to_string(parameterSpellings.size());
+                        parameterSpellings.push_back("void *");
+                        child = CxxClosureCallArgument(argument, parameter);
+                    }
+                    else if (CxxThinFunctionPointerSpelling(childType, spelling))
+                    {
+                        const std::string parameter = "p"
+                            + std::to_string(parameterSpellings.size());
+                        if (IsCxxFunctionDesignatorArgument(argument))
+                        {
+                            parameterSpellings.push_back(spelling);
+                            child = "(*" + parameter + ")";
+                        }
+                        else if (IsProvenCxxScalarLvalue(argument, true)
+                                 && argument.Storage != nullptr
+                                 && hasExactLvalueReferenceParameter(
+                                        ctorArgIndex, CxxTypeofInner(spelling), true))
+                        {
+                            // A `Fn&` / `const Fn&` constructor parameter binds the caller's slot: the
+                            // wrapper takes its address, as the top-level thin branch does.
+                            parameterSpellings.push_back("void *");
+                            constructionFunctionPointerSlots.emplace_back(
+                                parameterSpellings.size() - 1, childType);
+                            argument.Primary = argument.Storage;
+                            child = "*static_cast<" + spelling + " *>(" + parameter + ")";
+                        }
+                        else
+                        {
+                            // By value: the snapshot the wrapper took is the argument.
+                            parameterSpellings.push_back(spelling);
+                            child = "static_cast<" + spelling + " &&>(" + parameter + ")";
+                        }
+                    }
+                    else
+                    {
+                        if (!enumSpelling(childType, spelling)
+                            && !CxxSpellingForCflatType(cflatTypeOf(argument), spelling))
+                            return false;
+                        const bool classValue = !childType.Pointer
+                            && IsCxxRecord(childType.TypeName) && !childType.IsInterface;
+                        const bool lvalue = classValue ? !IsCxxRvalueReferenceArgument(argument)
+                            : IsProvenCxxScalarLvalue(argument);
+                        const bool constObject = CxxConstReceiverKind(argument) != 0;
+                        std::string parameterSpelling = constObject ? "const " + spelling : spelling;
+                        if (classValue) parameterSpelling += lvalue ? " &" : " &&";
+                        else if (lvalue && hasExactLvalueReferenceParameter(ctorArgIndex, spelling))
+                            parameterSpelling += " &";
+                        const std::string parameter = "p"
+                            + std::to_string(parameterSpellings.size());
+                        parameterSpellings.push_back(std::move(parameterSpelling));
+                        child = lvalue ? parameter
+                            : "static_cast<" + spelling + " &&>(" + parameter + ")";
+                    }
+                }
+                constructorArguments.push_back(std::move(child));
+            }
+            const char* open = construction.CxxDirectConstructionUsesBraces ? "({" : "(";
+            const char* close = construction.CxxDirectConstructionUsesBraces ? "})" : ")";
+            expression = typeSpelling + open;
+            for (size_t i = 0; i < constructorArguments.size(); ++i)
+                expression += (i == 0 ? "" : ", ") + constructorArguments[i];
+            expression += close;
+            return true;
+        };
         for (size_t i = 0; i < arguments.size(); ++i)
         {
             NamedVariable& arg = arguments[i];
+            const size_t parameterIndex = parameterSpellings.size();
             TypeAndValue type = argumentType(arg);
             auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
             const bool stringLiteral = constant != nullptr && IsStringLiteralConstant(constant);
@@ -12580,7 +13006,7 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
             if (stringLiteral && literalBindsPointerConstRef(i))
             {
                 parameterSpellings.push_back("const char *const &");
-                callArguments.push_back("p" + std::to_string(i));
+                callArguments.push_back("p" + std::to_string(parameterIndex));
                 literalArrayArgument = true;
                 continue;
             }
@@ -12589,7 +13015,7 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                     ? CxxStringLiteralArrayLvalue(arg, i) : std::string();
                 !literalArray.empty())
             {
-                literalArrayParams.push_back(i);
+                literalArrayParams.push_back(parameterIndex);
                 parameterSpellings.push_back("const char *");
                 callArguments.push_back(std::move(literalArray));
                 literalArrayArgument = true;
@@ -12608,14 +13034,15 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
             {
                 // A CFlat closure: the wrapper builds the owning __cflat_closure<> prvalue.
                 parameterSpellings.push_back("void *");
-                callArguments.push_back(CxxClosureCallArgument(arg, "p" + std::to_string(i)));
+                callArguments.push_back(CxxClosureCallArgument(arg,
+                    "p" + std::to_string(parameterIndex)));
                 continue;
             }
             // The null type needs no header: C++ deduces std::nullptr_t from this spelling.
             if (type.TypeName == "std.nullptr_t" && !type.Pointer)
             {
                 parameterSpellings.push_back("decltype(nullptr)");
-                callArguments.push_back("p" + std::to_string(i));
+                callArguments.push_back("p" + std::to_string(parameterIndex));
                 continue;
             }
             if (CxxThinFunctionPointerSpelling(type, spelling))
@@ -12623,7 +13050,7 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 if (IsCxxFunctionDesignatorArgument(arg))
                 {
                     parameterSpellings.push_back(spelling);
-                    callArguments.push_back("(*p" + std::to_string(i) + ")");
+                    callArguments.push_back("(*p" + std::to_string(parameterIndex) + ")");
                 }
                 else
                 {
@@ -12645,9 +13072,9 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                         arg.Storage = slot;
                     }
                     arg.Primary = slot;
-                    functionPointerCallerSlots.push_back(i);
+                    functionPointerCallerSlots.push_back(parameterIndex);
                     const std::string referent = "*static_cast<" + spelling + " *>(p"
-                        + std::to_string(i) + ")";
+                        + std::to_string(parameterIndex) + ")";
                     // `move f` keeps its caller slot here, so the xvalue is spelled from the move.
                     callArguments.push_back(arg.IsRvalue || arg.IsExplicitMove
                         ? "static_cast<" + spelling + " &&>(" + referent + ")" : referent);
@@ -12661,6 +13088,18 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 error = std::format("C++ free function '{}' has an argument type that cannot be spelled in C++",
                                     functionName);
                 return false;
+            }
+            if (arg.IsCxxDirectConstruction)
+            {
+                std::string construction;
+                if (!appendDirectConstruction(arg, appendDirectConstruction, construction))
+                {
+                    error = std::format("C++ free function '{}' has a direct class construction "
+                                        "argument that cannot be forwarded", functionName);
+                    return false;
+                }
+                callArguments.push_back(std::move(construction));
+                continue;
             }
             // An imported `const T*` (c_str()) keeps its const pointee, as in the template path.
             if (arg.TypeAndValue.IsCxxPointeeConst && arg.TypeAndValue.Pointer
@@ -12679,7 +13118,7 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 {
                     parameterSpellings.push_back(spelling + " &&");
                     callArguments.push_back("static_cast<" + spelling + " &&>(p"
-                                            + std::to_string(i) + ")");
+                                            + std::to_string(parameterIndex) + ")");
                 }
                 else
                 {
@@ -12687,7 +13126,7 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                     const bool constObject = !arg.IsRvalue && CxxConstReceiverKind(arg) != 0;
                     constSpelled = constSpelled || constObject;
                     parameterSpellings.push_back((constObject ? "const " : "") + spelling + " &");
-                    callArguments.push_back("p" + std::to_string(i));
+                    callArguments.push_back("p" + std::to_string(parameterIndex));
                 }
             }
             else
@@ -12705,7 +13144,7 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 const bool cxxRvalue = !IsProvenCxxScalarLvalue(arg);
                 if (!cxxRvalue && !spelling.ends_with(" &")) spelling += " &";
                 const bool xvalue = cxxRvalue && !spelling.ends_with(" &");
-                const std::string parameter = "p" + std::to_string(i);
+                const std::string parameter = "p" + std::to_string(parameterIndex);
                 callArguments.push_back(xvalue
                     ? "static_cast<" + spelling + " &&>(" + parameter + ")" : parameter);
                 /*
@@ -12825,6 +13264,17 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
         };
         auto makeTarget = [&](const std::vector<std::string>& ungroupedCalls) {
             const std::vector<std::string> calls = groupBraceCalls(ungroupedCalls);
+            if (memberCall)
+            {
+                std::string target = calls.empty() ? std::string("p0") : calls.front();
+                target = arguments.front().TypeAndValue.Pointer
+                    ? target + "->" + memberName
+                    : "(" + target + ")." + memberName;
+                target += "(";
+                for (size_t i = 1; i < calls.size(); ++i)
+                    target += (i == 1 ? "" : ", ") + calls[i];
+                return target + ")";
+            }
             // An ADL call is written unqualified so C++ searches the arguments' associated
             // namespaces and hidden friends, as a range-for's free begin/end lookup does.
             std::string target = adlCall ? functionName.substr(functionName.rfind('.') + 1)
@@ -12874,12 +13324,27 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 && !cxxImportGroups_[owner->second].headers.empty())
                 addDependencyGroup(owner->second);
         };
+        auto collectConstructionDependencies = [&](auto&& self,
+                                                    const NamedVariable& construction) -> void {
+            if (!construction.IsCxxDirectConstruction) return;
+            collectTypeDependencies(construction.CxxDirectConstructionType);
+            for (const NamedVariable& child : construction.CxxDirectConstructionArguments)
+            {
+                collectTypeDependencies(cflatTypeOf(child));
+                self(self, child);
+            }
+        };
         for (const auto& argument : arguments)
+        {
             collectTypeDependencies(cflatTypeOf(argument));
+            collectConstructionDependencies(collectConstructionDependencies, argument);
+        }
         for (const std::string& explicitArg : explicitArgs)
             if (!explicitArg.starts_with("#")) collectTypeDependencies(explicitArg);
 
         const std::string cxxBase = [&] {
+            if (memberCall)
+                return CxxNameFromCflat(memberOwnerType) + "::" + memberName;
             std::string result = functionName;
             for (size_t pos = 0; (pos = result.find('.', pos)) != std::string::npos; pos += 2)
                 result.replace(pos, 1, "::");
@@ -12912,7 +13377,7 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                                 || constSpelled || literalArrayArgument
                                 || !functionPointerCallerSlots.empty()
                                 || !ResolveEnumTypeName(functionName).empty()
-                                || !braceGroups.empty())
+                                || !braceGroups.empty() || hasDirectConstructionArgument)
                 ? wrapper.name : functionName;
             std::string parameters;
             for (size_t i = 0; i < parameterSpellings.size(); ++i)
@@ -13175,6 +13640,14 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                     == candidateGroups.end())
                     candidateGroups.push_back(group);
         }
+        else if (memberCall)
+        {
+            if (auto owner = cxxTypeOwnerGroup_.find(memberOwnerType);
+                owner != cxxTypeOwnerGroup_.end() && owner->second < cxxImportGroups_.size())
+                candidateGroups.push_back(owner->second);
+            else
+                candidateGroups = CandidateCxxGroupsFor(cxxBase);
+        }
         else if (auto owner = cxxFunctionOwnerGroup_.find(functionName);
             owner != cxxFunctionOwnerGroup_.end() && owner->second < cxxImportGroups_.size())
             candidateGroups.push_back(owner->second);
@@ -13384,6 +13857,14 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                             bound.params[argumentIndex].TypeName = "__c_fn_ptr";
                         bound.params[argumentIndex].IsFunctionPointer = true;
                     }
+                for (const auto& [parameterIndex, slotType] : constructionFunctionPointerSlots)
+                    if (parameterIndex < bound.params.size())
+                    {
+                        bound.params[parameterIndex] = slotType;
+                        if (bound.params[parameterIndex].TypeName.empty())
+                            bound.params[parameterIndex].TypeName = "__c_fn_ptr";
+                        bound.params[parameterIndex].IsFunctionPointer = true;
+                    }
                 bound.name = chosen.bindName;
                 RegisterCSignatures({ bound }, group.headers.front());
                 if (auto fit = functionTable.find(chosen.bindName); fit != functionTable.end())
@@ -13416,7 +13897,8 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
         }
         const size_t missingDot = functionName.rfind('.');
         const std::string missingMember = functionName.substr(missingDot + 1);
-        const std::string missingNamespace = functionName.substr(0, missingDot);
+        const std::string missingNamespace = memberCall ? memberOwnerType
+            : functionName.substr(0, missingDot);
         error = std::format("'{}' is not a member of namespace '{}' (C++ free function '{}' "
                             "could not be bound", missingMember, missingNamespace, functionName);
         if (!lastError.empty()) error += " (clang: " + lastError + ")";
@@ -23056,7 +23538,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
          * the overload rather than on its class.
          */
         auto hasReachableSymbol = [](const Member& m) {
-            return m.bindRefusal.empty() && !m.isDeleted && (!m.variadic || m.isInline)
+            return m.bindRefusal.empty() && !m.isDeleted
                 && !m.requiresConstructorWrapper && !m.needsLocalDefinition
                 && m.abi.valid && !m.linkageName.empty();
         };
@@ -23204,13 +23686,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                     refuse(refusal);
                 continue;
             }
-            // Constructor templates are retained for the on-demand wrapper path. Report them
-            // only when they are ordinary members that cannot use that path.
-            if (m.variadic && !m.isInline)
-            {
-                if (m.kind != Member::Constructor) refuse("is variadic");
-                continue;
-            }
+            // Variadic constructors take the wrapper path below (out-of-line or not). A variadic
+            // ordinary member binds like an in-class one, whether or not its definition is inline.
             if (m.requiresConstructorWrapper
                 || (m.variadic && m.kind == Member::Constructor))
             {
@@ -29204,6 +29681,10 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
             }
             else
             {
+                // Implicit converting constructor: a floating argument into an integer
+                // parameter is refused (ruling 2026-10-13). Explicit casts stay legal.
+                RefuseImplicitFloatToInt(value, constructorType,
+                                         ctor->params.size() > 1 && ctor->params[1].IsUnsignedInteger() != -1);
                 value = Upconvert(value, constructorType,
                                   arg.TypeAndValue.IsUnsignedInteger() != -1);
                 if (value->getType() != constructorType)
@@ -29576,6 +30057,31 @@ bool LLVMBackend::EmitLoweredMemberwiseCopy(const std::string& typeName, llvm::T
         auto* structType = llvm::dyn_cast<llvm::StructType>(valueType);
         if (structType == nullptr || data.StructType == nullptr) return false;
 
+        auto hasExplicitCopy = [&](const std::string& fieldTypeName) {
+            return HasCopyOverloadFor(fieldTypeName)
+                && !memberwiseCopyCache_.contains(fieldTypeName);
+        };
+        auto copyWithUserMethod = [&](const std::string& fieldTypeName, llvm::Type* fieldType,
+                                      llvm::Value* dst, llvm::Value* src) {
+            NamedVariable source;
+            source.Storage = src;
+            source.BaseType = fieldType;
+            source.TypeAndValue.TypeName = fieldTypeName;
+            auto* copied = CreateOverloadedFunctionCall("copy", { source });
+            if (copied == nullptr) return false;
+            if (IsLoweredCFlatOnlyStruct(fieldTypeName)
+                && copied == lastLoweredRetValue_ && lastLoweredRetTemp_ != nullptr)
+            {
+                auto* resultTemp = lastLoweredRetTemp_;
+                if (resultTemp != dst) resultTemp->replaceAllUsesWith(dst);
+                if (lastLoweredRetTemp_ == resultTemp) lastLoweredRetTemp_ = dst;
+                UnregisterOwnedStructTemp(resultTemp);
+            }
+            else
+                builder->CreateStore(copied, dst);
+            return true;
+        };
+
         builder->CreateStore(llvm::Constant::getNullValue(valueType), dest);
         UnwindPartialScope copiedFields(*this);
         for (size_t i = 0; i < data.StructFields.size()
@@ -29629,6 +30135,11 @@ bool LLVMBackend::EmitLoweredMemberwiseCopy(const std::string& typeName, llvm::T
                                                          false, fieldContext.c_str()))
                             return false;
                     }
+                    else if (hasExplicitCopy(field.TypeName))
+                    {
+                        if (!copyWithUserMethod(field.TypeName, elemType, dstElem, srcElem))
+                            return false;
+                    }
                     else if (IsLoweredCFlatOnlyStruct(field.TypeName))
                     {
                         if (!EmitLoweredMemberwiseCopy(field.TypeName, elemType, dstElem,
@@ -29662,6 +30173,12 @@ bool LLVMBackend::EmitLoweredMemberwiseCopy(const std::string& typeName, llvm::T
             {
                 if (!EmitCxxCopyOrMoveConstruct(field.TypeName, dstField, srcField, false,
                                                  fieldContext.c_str()))
+                    return false;
+                NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, dstField, field.TypeName);
+            }
+            else if (hasExplicitCopy(field.TypeName))
+            {
+                if (!copyWithUserMethod(field.TypeName, fieldType, dstField, srcField))
                     return false;
                 NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, dstField, field.TypeName);
             }
@@ -30560,6 +31077,8 @@ bool LLVMBackend::ApplyCxxConversionOperator(NamedVariable& nv, const TypeAndVal
         {
             llvm::Type* destLLVM = GetType(const_cast<TypeAndValue&>(dest));
             if (destLLVM == nullptr) return false;
+            // An explicit '(T)conv' reaches here with allowExplicit; only an implicit store is refused.
+            if (!allowExplicit) RefuseImplicitFloatToInt(result, destLLVM, dest.IsUnsignedInteger() != -1);
             if (result->getType() != destLLVM)
                 result = CreateCast(result, destLLVM, !result->getType()->isIntegerTy(1),
                                     dest.IsUnsignedInteger() != -1);

@@ -4946,6 +4946,7 @@ void LLVMBackend::ResetForReanalysis()
     lastCxxRetValue_ = nullptr;
     lastLoweredRetTemp_ = nullptr;
     lastLoweredRetValue_ = nullptr;
+    lastLoweredCopyRetTemp_ = nullptr;
     opaqueReturnIndirectCalls_.clear();
     opaqueReturnDiscardSites_.clear();
     // RegisterEncodedClosureType memoizes on this map but writes the encoded closure's backing

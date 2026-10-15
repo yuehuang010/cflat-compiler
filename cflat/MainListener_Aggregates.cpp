@@ -198,6 +198,13 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                 || FieldHasEmptyCxxBraceInitializer(field)
                 || FieldInitializerIsSingleCall(field.Initializer->assignmentExpression()));
         bool initializedArrayInPlace = false;
+        // `= default` on a C++-field array is built in place like a field with no initializer:
+        // a bit-copied temporary would move a self-referential member (std::list sentinel).
+        const bool inPlaceCxxArrayDefault = field.Initializer != nullptr
+            && field.Initializer->Default() != nullptr && fieldDestination != nullptr
+            && !field.Pointer && !field.IsArrayView && field.ConstArraySize > 0
+            && (fieldCount != SIZE_MAX || !compiler->HasUnavailableNestedCxxDefault(field.TypeName))
+            && HasGlobalCxxFieldDefaultConstruction(field);
         if (armFieldSret)
         {
             compiler->pendingCxxSretDest_ = fieldDestination;
@@ -227,7 +234,7 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                     structType = compiler->CreateStructType(structName, fields);
                 }
             }
-            else if (field.Initializer->Default() != nullptr)
+            else if (field.Initializer->Default() != nullptr && !inPlaceCxxArrayDefault)
             {
                 GlobalScopeGuard fieldInitScope(global_scope);
                 rvalue = GenerateDefaultValue(field);
@@ -236,7 +243,8 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
         if (rvalue == nullptr)
         {
             auto* fieldType = compiler->GetType(field);
-            if (field.Initializer == nullptr && FieldDefaultBraceList(field) == nullptr
+            if ((field.Initializer == nullptr || inPlaceCxxArrayDefault)
+                && FieldDefaultBraceList(field) == nullptr
                 && fieldDestination != nullptr && fieldType != nullptr && fieldType->isArrayTy())
             {
                 if (fieldCount != SIZE_MAX
@@ -407,6 +415,7 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
             }
             else
             {
+                compiler->RefuseImplicitFloatToInt(rvalue, destType, field.IsUnsignedInteger() != -1);
                 if (ShouldWarnImplicitFieldNarrowing(rvalue, destType, field.TypeName))
                     compiler->LogWarning(std::format(
                         "implicit narrowing to '{}' in field '{}' - use an explicit cast",
@@ -1741,6 +1750,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                             else
                             {
                                 // Narrowing field initializer (e.g. u8 r = 255 has i32 literal).
+                compiler->RefuseImplicitFloatToInt(rvalue, destType, declList[structIndex].IsUnsignedInteger() != -1);
                 if (ShouldWarnImplicitFieldNarrowing(
                                         rvalue, destType, declList[structIndex].TypeName))
                                     compiler->LogWarning(std::format(
@@ -3918,90 +3928,82 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
             returnType.TypeName = name;
             compiler->CreateFunctionDefinition(name, returnType, {});
 
+            // The whole program is built in the caller's sret slot when it returns indirectly:
+            // user fields are constructed in place (as the struct default ctor does), so a
+            // self-referential C++ field is never bit-copied out of a temporary (T156).
+            llvm::Value* sretDest = nullptr;
+            if (compiler->currentFunctionAbiRecipe.retSlot.kind
+                == LLVMBackend::AbiSlot::SRetReturn)
+                sretDest = compiler->currentFunction->getArg(
+                    compiler->SRetArgIndex(compiler->currentFunctionAbiRecipe));
+
             // User fields share the struct default ctor's field walk (a field initializer that
             // unwinds destroys the fields already built); synthetic fields are written below.
             llvm::Value* structVal = EmitAggregateFieldInitialization(name, structType, declList,
-                                                                      exitCodeFieldIndex);
+                                                                      exitCodeFieldIndex, sretDest);
+            // Synthetic fields: a store through StructGEP into the sret slot, else an insertvalue.
+            auto setSynthetic = [&](unsigned index, llvm::Value* value) {
+                if (sretDest != nullptr)
+                    compiler->builder->CreateStore(value, compiler->builder->CreateStructGEP(
+                        structType, sretDest, index));
+                else
+                    structVal = compiler->CreateInsertValue(structVal, value, index);
+            };
 
             // Synthetic field: exitCode = -1
-            {
-                auto* minusOne = llvm::ConstantInt::getSigned(
-                    llvm::Type::getInt32Ty(*compiler->context), -1);
-                structVal = compiler->CreateInsertValue(structVal, minusOne, exitCodeFieldIndex);
-            }
+            setSynthetic(exitCodeFieldIndex, llvm::ConstantInt::getSigned(
+                llvm::Type::getInt32Ty(*compiler->context), -1));
 
             // Synthetic field: _thread = Thread()
             if (auto* threadCtorFn = compiler->GetFunction("Thread"))
             {
                 auto* threadInitVal = compiler->builder->CreateCall(
                     threadCtorFn->getFunctionType(), threadCtorFn, {}, "thread_init");
-                structVal = compiler->CreateInsertValue(structVal, threadInitVal, threadFieldIndex);
+                setSynthetic(threadFieldIndex, threadInitVal);
             }
 
             // Synthetic field: _allocator = zero (null IAllocator fat-ptr)
-            {
-                auto* fatTy = compiler->GetFatPtrType();
-                structVal = compiler->CreateInsertValue(
-                    structVal, llvm::Constant::getNullValue(fatTy), allocatorFieldIndex);
-            }
+            setSynthetic(allocatorFieldIndex, llvm::Constant::getNullValue(compiler->GetFatPtrType()));
 
             // Synthetic field: onStdout = nullptr (fat closure struct {i8*, i8*})
-            {
-                auto& onStdoutDecl = declList[onStdoutFieldIndex];
-                auto* fieldType = compiler->GetType(onStdoutDecl);
-                structVal = compiler->CreateInsertValue(
-                    structVal, llvm::Constant::getNullValue(fieldType), onStdoutFieldIndex);
-            }
+            setSynthetic(onStdoutFieldIndex, llvm::Constant::getNullValue(
+                compiler->GetType(declList[onStdoutFieldIndex])));
 
             // Synthetic field: onStdin = nullptr (fat closure struct {i8*, i8*})
-            {
-                auto& onStdinDecl = declList[onStdinFieldIndex];
-                auto* fieldType = compiler->GetType(onStdinDecl);
-                structVal = compiler->CreateInsertValue(
-                    structVal, llvm::Constant::getNullValue(fieldType), onStdinFieldIndex);
-            }
+            setSynthetic(onStdinFieldIndex, llvm::Constant::getNullValue(
+                compiler->GetType(declList[onStdinFieldIndex])));
 
             // Synthetic field: onStdinReturn = nullptr (fat closure struct {i8*, i8*})
-            {
-                auto& onStdinReturnDecl = declList[onStdinReturnFieldIndex];
-                auto* fieldType = compiler->GetType(onStdinReturnDecl);
-                structVal = compiler->CreateInsertValue(
-                    structVal, llvm::Constant::getNullValue(fieldType), onStdinReturnFieldIndex);
-            }
+            setSynthetic(onStdinReturnFieldIndex, llvm::Constant::getNullValue(
+                compiler->GetType(declList[onStdinReturnFieldIndex])));
 
             // Synthetic field: _stop_source = stop_source() (zero-init; init() called in run())
             if (auto* stopSrcCtorFn = compiler->GetFunction("stop_source"))
             {
                 auto* stopSrcInitVal = compiler->builder->CreateCall(
                     stopSrcCtorFn->getFunctionType(), stopSrcCtorFn, {}, "stop_src_zero");
-                structVal = compiler->CreateInsertValue(structVal, stopSrcInitVal, stopSrcFieldIndex);
+                setSynthetic(stopSrcFieldIndex, stopSrcInitVal);
             }
 
             // Synthetic field: trackHandles = 0 (int, not bool - avoids i1-in-ConstantStruct assertion)
-            structVal = compiler->CreateInsertValue(
-                structVal,
-                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0),
-                trackHandlesFieldIndex);
+            setSynthetic(trackHandlesFieldIndex,
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0));
 
             // Synthetic field: useChannel = 0 (opt-in arena-channel gate for `p1 >> p2`)
-            structVal = compiler->CreateInsertValue(
-                structVal,
-                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0),
-                useChannelFieldIndex);
+            setSynthetic(useChannelFieldIndex,
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0));
 
             // Synthetic field: _fpConfig = 0 (no-op; user arms the program thread via `prog._fpConfig = FP_*`)
-            structVal = compiler->CreateInsertValue(
-                structVal,
-                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0),
-                fpConfigFieldIndex);
+            setSynthetic(fpConfigFieldIndex,
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0));
 
             // Synthetic fields: _out = nullptr, _in = nullptr (stream*; only present when stream.cb is imported)
             if (outFieldIndex != (unsigned)-1)
             {
                 auto* streamTy = compiler->GetDataStructure("stream").StructType;
                 auto* nullStream = llvm::Constant::getNullValue(cflat_llvm::PointerTo(streamTy));
-                structVal = compiler->CreateInsertValue(structVal, nullStream, outFieldIndex);
-                structVal = compiler->CreateInsertValue(structVal, nullStream, inStreamFieldIndex);
+                setSynthetic(outFieldIndex, nullStream);
+                setSynthetic(inStreamFieldIndex, nullStream);
             }
 
             // Allocate a non-null arena_channel shell: send/recv are no-ops on the uninitialized shell,
@@ -4012,11 +4014,11 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
                     ArenaChannelTypeName(*compiler)).StructType;
                 llvm::Value* shell = EmitArenaChannelShellAlloc(compiler);
                 if (!shell) shell = llvm::Constant::getNullValue(cflat_llvm::PointerTo(arenaTy));
-                structVal = compiler->CreateInsertValue(structVal, shell, inboxArenaFieldIndex);
-                structVal = compiler->CreateInsertValue(structVal, shell, outboxFieldIndex);
+                setSynthetic(inboxArenaFieldIndex, shell);
+                setSynthetic(outboxFieldIndex, shell);
             }
 
-            compiler->CreateReturnCall(structVal);
+            compiler->CreateReturnCall(sretDest != nullptr ? nullptr : structVal);
             compiler->CreateBlockBreak(nullptr, true);
         }
 
@@ -5074,6 +5076,7 @@ void MainListener::EmitCppStructConstructorThunk(
                 if (destinationType->isStructTy())
                     value = GenerateDefaultValue(field);
                 else
+                    compiler->RefuseImplicitFloatToInt(value, destinationType, field.IsUnsignedInteger() != -1);
                     value = compiler->CreateCast(value, destinationType, false, field.IsUnsignedInteger() != -1);
             }
             if (value != nullptr && value->getType() == destinationType)
@@ -5288,6 +5291,28 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
             compiler->builder->CreateStore(llvm::Constant::getNullValue(structLLVMType), thisAlloca);
             auto structData = compiler->GetDataStructure(structName);
             unsigned fieldIdx = 0;
+            // A C++-field array default is built element by element in place; a bit-copied temp
+            // would move a self-referential member (std::list sentinel). Same rule as :200-260.
+            auto seedsCxxArrayInPlace = [&](const LLVMBackend::DeclTypeAndValue& f) {
+                return (f.Initializer == nullptr || f.Initializer->Default() != nullptr)
+                    && !f.Pointer && !f.IsArrayView && f.ConstArraySize > 0
+                    && !compiler->HasUnavailableNestedCxxDefault(f.TypeName)
+                    && HasGlobalCxxFieldDefaultConstruction(f);
+            };
+            // A CFlat struct field default-constructed straight into its slot (see EmitStructDefaultInto).
+            auto seedsCflatStructInPlace = [&](const LLVMBackend::DeclTypeAndValue& f) {
+                return (f.Initializer == nullptr || f.Initializer->Default() != nullptr)
+                    && !f.Pointer && !f.IsAlias && !f.IsArrayView && f.ConstArraySize == 0
+                    && !compiler->IsCxxRecord(f.TypeName) && compiler->GetFunction(f.TypeName) != nullptr;
+            };
+            auto seedFixedArrayInPlace = [&](llvm::Value* ptr, const LLVMBackend::DeclTypeAndValue& f) {
+                GlobalScopeGuard fieldInitScope(global_scope);
+                EmitFixedArrayDefaultInit(ptr, f);
+                llvm::Type* elemTy = nullptr;
+                const uint64_t n = compiler->PeelFixedArrayType(compiler->GetType(f), elemTy);
+                compiler->NoteUnwindArrayPrefix(ptr, elemTy, compiler->builder->getInt64(n),
+                                                f.TypeName);
+            };
             // Every field-default form the synthesized default constructors seed must be seeded
             // here too, or a user-written no-arg ctor silently leaves fields zeroed (see :271).
             for (const auto& field : structData.StructFields)
@@ -5359,7 +5384,23 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                             && compiler->FindCxxDefaultCtor(field.TypeName) == nullptr
                             && (compiler->CxxElementNeedsDefaultConstruction(field.TypeName)
                                 || compiler->HasNonPublicCxxDefaultCtor(field.TypeName));
-                        if (!unavailableCxxDefault)
+                        if (destType->isArrayTy() && seedsCxxArrayInPlace(field))
+                        {
+                            seedFixedArrayInPlace(fieldPtr, field);
+                            fieldInitializedInPlace = true;
+                        }
+                        else if (destType->isStructTy() && seedsCflatStructInPlace(field))
+                        {
+                            fieldVal = EmitStructDefaultInto(fieldPtr, field.TypeName);
+                            if (fieldVal == nullptr)
+                            {
+                                compiler->NoteUnwindPartial(
+                                    LLVMBackend::UnwindPartialEntry::Kind::Slot,
+                                    fieldPtr, field.TypeName);
+                                fieldInitializedInPlace = true;
+                            }
+                        }
+                        else if (!unavailableCxxDefault)
                             fieldVal = GenerateDefaultValue(field);
                     }
                 }
@@ -5370,7 +5411,12 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                 {
                     // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
                     // here would call a same-named sibling type's ctor (layer 3).
-                    if (destType->isArrayTy()
+                    if (destType->isArrayTy() && seedsCxxArrayInPlace(field))
+                    {
+                        seedFixedArrayInPlace(fieldPtr, field);
+                        fieldInitializedInPlace = true;
+                    }
+                    else if (destType->isArrayTy()
                         && !compiler->HasUnavailableNestedCxxDefault(field.TypeName))
                         fieldVal = GenerateDefaultValue(field);
                     else if (destType->isArrayTy())
@@ -5385,6 +5431,17 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                             compiler->NoteUnwindPartial(
                                 LLVMBackend::UnwindPartialEntry::Kind::Slot,
                                 fieldPtr, field.TypeName);
+                        }
+                    }
+                    else if (destType->isStructTy() && seedsCflatStructInPlace(field))
+                    {
+                        fieldVal = EmitStructDefaultInto(fieldPtr, field.TypeName);
+                        if (fieldVal == nullptr)
+                        {
+                            compiler->NoteUnwindPartial(
+                                LLVMBackend::UnwindPartialEntry::Kind::Slot,
+                                fieldPtr, field.TypeName);
+                            fieldInitializedInPlace = true;
                         }
                     }
                     else if (compiler->GetFunction(field.TypeName))
@@ -5412,6 +5469,7 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                         else
                         {
                             // Narrowing field initializer (e.g. u8 r = 255 has i32 literal).
+                            compiler->RefuseImplicitFloatToInt(fieldVal, destType, field.IsUnsignedInteger() != -1);
                             if (ShouldWarnImplicitFieldNarrowing(fieldVal, destType, field.TypeName))
                                 compiler->LogWarning(std::format(
                                     "implicit narrowing to '{}' in field '{}' - use an explicit cast",
@@ -5431,16 +5489,16 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
         }
         else if (hasExplicitNoArgCtor)
         {
+            // Built in place in thisAlloca: a whole-struct temporary stored into `this` would
+            // bit-copy a self-referential C++ field (std::list sentinel) and dangle it.
             auto fields = compiler->GetDataStructure(structName).StructFields;
-            auto* fieldValue = EmitAggregateFieldInitialization(
-                structName, structLLVMType, fields);
-            if (fieldValue)
-                compiler->builder->CreateStore(fieldValue, thisAlloca);
+            EmitAggregateFieldInitialization(structName, structLLVMType, fields, SIZE_MAX,
+                                             thisAlloca, nullptr, true);
         }
         else
         {
             // With no user no-arg ctor, the synthesized ctor remains the field-init path.
-            auto* defaultVal = compiler->CreateOverloadedFunctionCall(structName, {}, true);
+            auto* defaultVal = EmitStructDefaultInto(thisAlloca, structName);
             if (defaultVal)
                 compiler->builder->CreateStore(defaultVal, thisAlloca);
         }

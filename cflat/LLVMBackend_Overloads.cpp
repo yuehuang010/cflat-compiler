@@ -7713,6 +7713,17 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             std::cout << std::format("[verbose] selected operator overload: {} ({})\n",
                                      selectedName, candidate.UniqueName);
         }
+        // A non-lowered virtual call reaches the vtable slot directly. A variadic member's scalar
+        // tail takes the same default promotions as every other variadic call (T161 r3).
+        const auto emitVirtualCall = [&]() -> llvm::Value*
+        {
+            auto* fnTy = candidate.Function->getFunctionType();
+            std::vector<llvm::Value*> callArgs = argList;
+            if (fnTy->isVarArg())
+                for (size_t t = fnTy->getNumParams(); t < callArgs.size(); ++t)
+                    callArgs[t] = PromoteVariadicArgument(callArgs[t]);
+            return CreateCallOrInvoke(fnTy, cxxVirtualCallee, callArgs, calleeMayUnwind);
+        };
         llvm::Value* result = candidate.Recipe.hasLowering
             ? EmitAbiLoweredCall(candidate, argList, cxxSretDest,
                                  cxxIndirectArgAddrs.empty() ? nullptr : &cxxIndirectArgAddrs,
@@ -7720,8 +7731,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                  cflatRawArrayCounts.empty() ? nullptr : &cflatRawArrayCounts,
                                  calleeMayUnwind)
             : (cxxVirtualCallee != nullptr
-                ? (llvm::Value*)CreateCallOrInvoke(candidate.Function->getFunctionType(),
-                                                   cxxVirtualCallee, argList, calleeMayUnwind)
+                ? emitVirtualCall()
                 : CreateFunctionCall(candidate.Function, argList, calleeMayUnwind));
         RecordOpaqueReturnCall(result, candidate.ReturnType.TypeName, functionName);
         unwindCallConsumedTemps_.clear();
@@ -7787,6 +7797,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             {
                 lastLoweredRetTemp_ = cxxRetTemp;
                 lastLoweredRetValue_ = result;
+                lastLoweredCopyRetTemp_ = (candidate.IsMethod && functionName == "copy")
+                    ? cxxRetTemp : nullptr;
             }
             else
             {

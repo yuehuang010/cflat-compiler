@@ -547,6 +547,17 @@ std::string MainListener::InferAndInstantiateGenericFunction(const std::string& 
         return {};
     }
 
+// Bit width of a literal's default type (a LiteralIdentity spelling); 0 for any other name. Two
+// literal arguments that disagree keep the wider one: first(5000000000, 2) infers long, not int.
+static unsigned LiteralDefaultBits(const std::string& name)
+{
+        if (name == "char" || name == "bool") return 8;
+        if (name == "int" || name == "u32" || name == "float") return 32;
+        if (name == "long" || name == "ulong") return static_cast<unsigned>(LLVMBackend::longBits_);
+        if (name == "i64" || name == "u64" || name == "double" || name == "longdouble") return 64;
+        return 0;
+}
+
 std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& funcName,
                                                const std::vector<LLVMBackend::NamedVariable>& args) {
         auto templateIt = genericFunctionTemplates.find(funcName);
@@ -565,6 +576,8 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
         // A binding read off the argument's DECLARED spelling outranks the LLVM-type fallback,
         // and two declared bindings that disagree infer nothing (the overload error stands).
         std::unordered_map<std::string, bool> declaredBinding;
+        // True while a binding came from an unsuffixed literal's default type (not a declared name).
+        std::unordered_map<std::string, bool> literalBinding;
         for (size_t i = 0; i < paramDecls.size() && i < args.size(); i++)
         {
             std::string paramTypeName;
@@ -646,6 +659,15 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                         declared = true;
                     }
                 }
+                // An unsuffixed literal infers its C++ default type (300 is int, 1.5 is double,
+                // 'a' is char), not its narrowed LLVM width (i16 / float / i8). Plain 'T' only:
+                // a 'T*' or 'T[]' parameter keeps the BaseType fallback below.
+                bool fromLiteral = false;
+                if (argType.empty() && !args[i].LiteralIdentity.empty() && !paramView && paramStars == 0)
+                {
+                    argType = args[i].LiteralIdentity;
+                    fromLiteral = true;
+                }
                 // Free-function calls drop TypeName for signed-int args. Fall back to the LLVM
                 // BaseType so literals infer; NOT for a view, whose opaque pointer recovers as
                 // a bogus 'i8' ELEMENT name that then fails the element-match gate.
@@ -658,6 +680,7 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                 {
                     inferred[tp] = argType;
                     declaredBinding[tp] = declared;
+                    literalBinding[tp] = fromLiteral;
                 }
                 else if (declared && !declaredBinding[tp])
                 {
@@ -672,7 +695,14 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                 }
                 else if (!declared && !declaredBinding[tp])
                 {
-                    prev->second = argType;   // fallback only: last one wins, as before
+                    // Two literal defaults keep the wider type; any other fallback: last one wins.
+                    const bool keepWider = fromLiteral && literalBinding[tp]
+                        && LiteralDefaultBits(prev->second) > LiteralDefaultBits(argType);
+                    if (!keepWider)
+                    {
+                        prev->second = argType;
+                        literalBinding[tp] = fromLiteral;
+                    }
                 }
                 break;
             }

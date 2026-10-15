@@ -3233,6 +3233,10 @@ on LLP64 and 64-bit on LP64); an `L` value too large for 32-bit `long` uses `i64
   an unsuffixed literal is always `int`. This is by design; use a suffix (`5u`, `123L`)
   or a cast to steer the pick. Calls with a single candidate are unaffected (widening
   is implicit), and variadic arguments are promoted as in C.
+- **Generic deduction is the exception.** A generic `T` deduced from an unsuffixed literal takes
+  the C++ default type: `int` (or `long` when the value does not fit), `double` for a floating
+  literal. So `first(7, 2)` deduces `T = int` and `first(300, 2)` compiles. Two literals that need
+  different types widen to the larger one.
 - **Floating point**: a no-suffix decimal is `float` (f32) when it round-trips through
   float without loss of precision, otherwise `double` (f64). So `1.5` and `100.0` are
   `float`, while `0.1` and `3.141592653589793` (which lose precision in float) are

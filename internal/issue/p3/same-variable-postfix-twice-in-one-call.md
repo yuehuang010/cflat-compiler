@@ -9,3 +9,7 @@ sequence left to right like brace lists. Probes: scratch/repro_keep/t67_rev/.
 T71 review 2 (2026-10-07, on 393f0bd9): `two(y++, y++)` now leaves y at 2 (both steps applied); the
 open part is the argument values. Named-field brace init has the same shape: `S z = {f = x++, g = x++}`
 (int) gives z.g 10 where C++ gives 11 (master same). Probes: scratch/repro_keep/t71_rev2/.
+
+RULED 2026-10-13 (maintainer): REFUSE. Modifying the same variable more than once (postfix/prefix ++/--, assignment) inside one
+call's argument list, or inside one brace initializer list (positional and named fields), is a compile error, like clang's
+-Wunsequenced made an error. Reads of the variable next to one modification are not covered by this ruling.

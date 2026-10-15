@@ -1822,7 +1822,7 @@ MainListener::ResolvePendingGlobalDefaultConstructions()
         {
             if (item.Global == nullptr || item.Global->isDeclaration()) continue;
             std::string unavailableType;
-            if (compilerLLVM->HasUnavailableNestedCxxDefault(
+            if (!item.FoldOnly && compilerLLVM->HasUnavailableNestedCxxDefault(
                     item.TypeValue.TypeName, &unavailableType))
             {
                 const auto* info = compilerLLVM->GetCxxClassInfo(unavailableType);
@@ -1854,6 +1854,8 @@ MainListener::ResolvePendingGlobalDefaultConstructions()
                 item.Global->setInitializer(folded);
                 continue;
             }
+            // A fold-only retry (`= default` array) that does not fold keeps its zero constant.
+            if (item.FoldOnly) continue;
             // The module initializer runs on ONE thread, so a 'thread_local' copy in any other
             // thread would still read zero.
             if (item.TypeValue.threadLocal)
@@ -2140,6 +2142,26 @@ llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndVa
 
         auto* llvmType = compiler->GetType(resolved);
         if (!llvmType) return nullptr;
+
+        // File scope has no element walk below: fold one element's default construction and
+        // replicate it, as the `S[N] g;` declarator arm does. An element that does not fold keeps
+        // the zero constant, the storage a non-folding global has always had.
+        if (!resolved.Pointer && llvmType->isArrayTy() && global_scope)
+        {
+            auto* element = llvmType;
+            while (element->isArrayTy()) element = element->getArrayElementType();
+            if (element->isStructTy() && !compiler->IsCxxRecord(resolved.TypeName)
+                && compiler->GetDataStructure(resolved.TypeName).StructType != nullptr
+                && compiler->GetFunction(resolved.TypeName) != nullptr)
+            {
+                LLVMBackend::DeclTypeAndValue elemValue = resolved;
+                elemValue.ConstArraySize = 0;
+                elemValue.ConstInnerDimensions.clear();
+                if (auto* elemConst = TryFoldGlobalDefaultConstruction(elemValue))
+                    if (auto* splat = SplatConstantOverFixedArray(elemConst, llvmType)) return splat;
+            }
+            return llvm::Constant::getNullValue(llvmType);
+        }
 
         // A fixed-array field default must construct each aggregate element, not just zero-fill
         // the enclosing array. The local declarator already uses EmitFixedArrayDefaultInit; use
@@ -3843,8 +3865,8 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseDeclarationList(st
                                  const char* msg) -> std::optional<uint64_t>
         {
             auto* sizeVal = TryFoldArrayDim(expr);
-            if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(sizeVal))
-                return ci->getZExtValue();
+            if (sizeVal != nullptr)
+                return sizeVal->getZExtValue();
             LogErrorContext(errCtx, msg);
             return std::nullopt;
         };
@@ -5908,6 +5930,30 @@ bool MainListener::ValidateApplicationIcons(antlr4::ParserRuleContext* ctx,
     return true;
 }
 
+llvm::Value* MainListener::EmitStructDefaultInto(llvm::Value* destination,
+                                                 const std::string& typeName)
+{
+    auto* compiler = Compiler();
+    const bool arm = destination != nullptr && compiler->ReturnsViaCxxSret(typeName);
+    if (arm)
+    {
+        compiler->pendingCxxSretDest_ = destination;
+        compiler->pendingCxxSretTypeName_ = typeName;
+        compiler->pendingCxxSretReturn_ = true;
+        compiler->pendingCxxSretForFixedArray_ = true;
+    }
+    llvm::Value* value = compiler->CreateOverloadedFunctionCall(typeName, {}, true);
+    const bool builtInPlace = arm && compiler->pendingCxxSretDest_ == nullptr;
+    if (arm)
+    {
+        compiler->pendingCxxSretDest_ = nullptr;
+        compiler->pendingCxxSretTypeName_.clear();
+        compiler->pendingCxxSretReturn_ = false;
+        compiler->pendingCxxSretForFixedArray_ = false;
+    }
+    return builtInPlace ? nullptr : value;
+}
+
 bool MainListener::EmitNontrivialCxxDefaultAt(
     llvm::Value* destination, const LLVMBackend::DeclTypeAndValue& typeValue)
 {
@@ -6789,6 +6835,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // a.copy() instead of a shallow alias. srcStorage non-null + !srcIsMove + a
                 // CallerName marks a named lvalue source whose buffer is still owned elsewhere.
                 llvm::Value* srcStorage = nullptr;
+                bool loweredCopyInitInPlace = false;
+                bool loweredSretResultRetargeted = false;
                 // Non-null when the source is a UNION member: Storage is the union alloca, so any
                 // type-inferred load off it reads the whole union instead of the member.
                 llvm::Type* srcUnionFieldType = nullptr;
@@ -8799,8 +8847,31 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     if (DeclSpecHasConst(declSpec) && !typeAndValue.Pointer
                         && compiler->IsCxxRecord(typeAndValue.TypeName))
                         compiler->MarkCxxConstFieldAccess(global);
-                    if (pendingGlobalDefaultConstruction && !externDeclOnly)
+                    // `S[N] g = default;` / `= {}` of a CFlat struct array that is still zero here: the
+                    // element's constructor may not be emitted yet (an unmaterialized generic), so the
+                    // fold is retried at module end. Fold-only: a failing retry keeps the zero constant.
+                    auto innermostIsStruct = [&]() {
+                        auto* t = compiler->GetType(typeAndValue);
+                        while (t != nullptr && t->isArrayTy()) t = t->getArrayElementType();
+                        return t != nullptr && t->isStructTy();
+                    };
+                    const bool foldOnlyRetry = !pendingGlobalDefaultConstruction && !externDeclOnly
+                        && global_scope && global != nullptr && !global->isDeclaration()
+                        && initializer != nullptr
+                        && (initializer->Default() != nullptr
+                            || (initializer->LeftBrace() != nullptr && initializer->initializerList() == nullptr))
+                        && !typeAndValue.Pointer && !typeAndValue.IsArrayView && !typeAndValue.IsInterface
+                        && !typeAndValue.IsAlias && typeAndValue.ConstArraySize > 0
+                        && !compiler->IsCxxRecord(typeAndValue.TypeName)
+                        && (right == nullptr
+                            || (llvm::isa<llvm::Constant>(right)
+                                && llvm::cast<llvm::Constant>(right)->isNullValue()))
+                        && innermostIsStruct();
+                    if ((pendingGlobalDefaultConstruction || foldOnlyRetry) && !externDeclOnly)
+                    {
                         QueuePendingGlobalConstruction(pendingGlobalDefaultConstructions_, {global, typeAndValue, direct});
+                        pendingGlobalDefaultConstructions_.back().FoldOnly = foldOnlyRetry;
+                    }
                     /*
                      * A global of a C++ class with a NONTRIVIAL default constructor (or a fixed
                      * array of one) keeps its zeroinitializer here and gets the constructor call
@@ -8936,12 +9007,39 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         typeAndValue.UserAlignValue, nrvoStorage);
                     if (nrvoLocal)
                         nrvo.localStorage = alloc;
+                    const bool loweredSretResult = srcCxxRetTemp != nullptr
+                        && !typeAndValue.Pointer
+                        && !srcCxxRetTempFromDefault
+                        && srcInferredTypeName == typeAndValue.TypeName
+                        && srcCxxRetTemp == compiler->lastLoweredCopyRetTemp_
+                        && compiler->IsLoweredCFlatOnlyStruct(typeAndValue.TypeName);
                     const bool elideCxxReturn = srcCxxRetTemp != nullptr
                         && !typeAndValue.Pointer
                         && (srcInferredTypeName == typeAndValue.TypeName
                             || srcCxxRetTempFromDefault)
                         && compiler->ReturnsViaCxxSret(typeAndValue.TypeName);
-                    if (elideCxxReturn)
+                    if (loweredSretResult)
+                    {
+                        // The user copy() call already built the initializer value in its sret temp.
+                        // alloc was created AFTER that call, so it cannot receive the sret pointer
+                        // (dominance). A local adopts the temp; an NRVO sret arg or static/global
+                        // destination already dominates the call and takes it.
+                        if (llvm::isa<llvm::AllocaInst>(alloc))
+                        {
+                            alloc = srcCxxRetTemp;
+                            compiler->GetOrCreateStackVariable(name).Storage = alloc;
+                        }
+                        else if (alloc != srcCxxRetTemp)
+                            srcCxxRetTemp->replaceAllUsesWith(alloc);
+                        if (compiler->lastLoweredRetTemp_ == srcCxxRetTemp)
+                            compiler->lastLoweredRetTemp_ = alloc;
+                        if (srcStorage == srcCxxRetTemp) srcStorage = nullptr;
+                        srcIsMove = false;
+                        loweredCopyInitInPlace = true;
+                        loweredSretResultRetargeted = true;
+                        compiler->UnregisterOwnedStructTemp(srcCxxRetTemp);
+                    }
+                    else if (elideCxxReturn)
                     {
                         if (nrvoLocal && alloc != srcCxxRetTemp)
                         {
@@ -9189,10 +9287,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // null srcStorage). An INDIRECT lvalue source (field / deref / fixed-array
                         // element) takes the same decision - see srcIsIndirectOwningLvalue below.
                         bool didDeepCopyBorrowString = false;
-                        bool loweredCopyInitInPlace = false;
                         // `T x = move y;` of a lowered struct: restore the bytes the move zeroed and
                         // move-construct the C++ fields; y stays a live moved-from object.
-                        if (srcIsMove && srcStorage == nullptr && srcUnionFieldType == nullptr
+                        if (srcIsMove && !loweredSretResultRetargeted
+                            && srcStorage == nullptr && srcUnionFieldType == nullptr
                             && right != nullptr && right->getType()->isStructTy()
                             && srcInferredTypeName == typeAndValue.TypeName && !srcInferredPointer
                             && compiler->IsLoweredCFlatOnlyStruct(typeAndValue.TypeName))
@@ -9284,6 +9382,19 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         copySource.TypeAndValue.TypeName = typeAndValue.TypeName;
                                         right = compiler->CreateOverloadedFunctionCall("copy", { copySource });
                                         if (right == nullptr) return allocList;
+                                        auto* resultTemp = compiler->lastLoweredRetTemp_;
+                                        if (compiler->IsLoweredCFlatOnlyStruct(typeAndValue.TypeName)
+                                            && right == compiler->lastLoweredRetValue_
+                                            && resultTemp != nullptr)
+                                        {
+                                            if (resultTemp != alloc)
+                                                resultTemp->replaceAllUsesWith(alloc);
+                                            if (compiler->lastLoweredRetTemp_ == resultTemp)
+                                                compiler->lastLoweredRetTemp_ = alloc;
+                                            compiler->UnregisterOwnedStructTemp(resultTemp);
+                                            loweredCopyInitInPlace = true;
+                                            loweredSretResultRetargeted = true;
+                                        }
                                     }
                                     else
                                     {
@@ -9480,7 +9591,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         }
                         else if (!bindAliasReference)
                         {
-                            bool movedCxxReturn = elideCxxReturn;
+                            bool movedCxxReturn = elideCxxReturn || loweredSretResultRetargeted;
                             if (!elideCxxReturn && srcCxxRetTemp != nullptr
                                 && !typeAndValue.Pointer
                                 && right->getType()->isStructTy()

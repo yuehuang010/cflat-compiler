@@ -768,16 +768,16 @@ bool LLVMBackend::IsCxxRvalueReferenceArgument(const NamedVariable& arg) const
  * classified it as an lvalue designator (or a call returning `T&`), it is not flagged rvalue, and
  * its value was loaded from its own storage in this very expression. No name lookup.
  */
-bool LLVMBackend::IsProvenCxxScalarLvalue(const NamedVariable& arg) const
+bool LLVMBackend::IsProvenCxxScalarLvalue(const NamedVariable& arg, bool thinFnPtrSlot) const
 {
         if (arg.CxxLvalueKind == 0 || arg.CxxLvalueKind == 3 || arg.IsExplicitMove) return false;
         // An imported integer-zero macro is a literal prvalue, as IsCxxRvalueReferenceArgument says.
         if (IsNullPointerConstantArgument(arg, true)) return false;
         if (arg.IsCxxMacroGlobal || arg.IsCxxMacroJoin) return false;
         if (IsRvalueReferenceArgument(arg)) return false;
-        // A function<> value crosses into C++ as a function pointer VALUE: the callee gets a
-        // copy of the code address, and the extractor has no mapping for `R (*&)(A)`.
-        if (arg.TypeAndValue.IsThinFnPtr()) return false;
+        // A function<> value is a function pointer VALUE in C++, and the extractor cannot spell
+        // `R (*&)(A)`; a caller passing the slot as `void *` opts in (thinFnPtrSlot).
+        if (!thinFnPtrSlot && arg.TypeAndValue.IsThinFnPtr()) return false;
         /*
          * A call is an lvalue only through a `T&` result (its IsRvalue marks the call itself):
          * an alias, or a value loaded from the very pointer the call returned.

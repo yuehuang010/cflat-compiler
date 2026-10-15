@@ -103,6 +103,7 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
                     bool destIsUnsigned = typeValue.IsUnsignedInteger() != -1;
                     llvm::APSInt converted(destBits, destIsUnsigned);
                     bool isExact = false;
+                    RefuseImplicitFloatToInt(fpValue, destinationType, typeValue.IsUnsignedInteger() != -1);
                     fpValue->getValueAPF().convertToInteger(converted, llvm::APFloat::rmTowardZero, &isExact);
                     initValue = llvm::ConstantInt::get(*context, converted);
                 }
@@ -740,6 +741,8 @@ int LLVMBackend::CxxReceiverCv(const NamedVariable& receiver) const
 
 bool LLVMBackend::IsCxxObjectRvalue(const NamedVariable& receiver) const
 {
+        // `move a[i]` / `move p->f` keep the element in place; the explicit move still makes it an xvalue.
+        if (receiver.IsExplicitMove) return true;
         if (receiver.FieldPathThroughPointer || receiver.CxxLvalueReceiver) return false;
         if (receiver.TypeAndValue.Pointer && !receiver.TypeAndValue.IsFunctionPointer
             && !receiver.TypeAndValue.IsRvalueRef
@@ -832,6 +835,8 @@ llvm::StoreInst* LLVMBackend::CreateAssignment(llvm::Value* value, llvm::Value* 
             {
                 // Upconvert handles integer widening with correct sign semantics (SExt for signed, ZExt for unsigned).
                 // CreateCast handles all other conversions (truncation, int<->float, ptr<->int, etc.).
+                RefuseImplicitFloatToInt(value, destType, destUnsigned);
+                RefuseNarrowingBraceConstant(value, srcIsUnsigned, destType, destUnsigned);
                 value = Upconvert(value, destType, srcIsUnsigned);
                 if (value->getType() != destType)
                     value = CreateCast(value, destType, false, destUnsigned);
@@ -1071,6 +1076,50 @@ std::string LLVMBackend::DescribeAggregateStorageShape(llvm::Type* type,
             return std::format("fixed array '{}{}'", elemName, dims);
         return std::format("fixed-array storage with dimensions {}", dims);
     }
+
+std::string LLVMBackend::IntegerTypeSpelling(unsigned bits, bool isUnsigned)
+{
+        if (bits == 32 && !isUnsigned) return "int";
+        return std::format("{}{}", isUnsigned ? 'u' : 'i', bits);
+}
+
+// T151: every implicit floating -> integer store lands here (decl init, '=', compound, element,
+// field, global, bitfield, C++ conversion operator). Bool is a truth test and stays legal.
+void LLVMBackend::RefuseImplicitFloatToInt(llvm::Value* value, llvm::Type* destType, bool destUnsigned) const
+{
+        if (value == nullptr || destType == nullptr) return;
+        if (!value->getType()->isFloatingPointTy() || !destType->isIntegerTy()) return;
+        if (destType->isIntegerTy(1)) return;
+        const char* srcName = value->getType()->isFloatTy() ? "float"
+                            : value->getType()->isDoubleTy() ? "double" : "floating-point";
+        LogError(std::format("implicit conversion from '{}' to '{}' loses the fractional part; "
+                             "use an explicit cast",
+                             srcName, IntegerTypeSpelling(destType->getIntegerBitWidth(), destUnsigned)));
+}
+
+// T119: a constant element must fit the destination exactly (no truncation, no sign change), the
+// way clang's brace narrowing rule decides. The widened compare keeps 2^bits representable.
+void LLVMBackend::RefuseNarrowingBraceConstant(llvm::Value* value, bool srcUnsigned, llvm::Type* destType,
+                                               bool destUnsigned) const
+{
+        if (nativeBraceDepth == 0 || value == nullptr || destType == nullptr) return;
+        const auto* constant = llvm::dyn_cast<llvm::ConstantInt>(value);
+        if (constant == nullptr || !destType->isIntegerTy() || destType->isIntegerTy(1)
+            || constant->getType()->isIntegerTy(1))
+            return;
+        const unsigned bits = destType->getIntegerBitWidth();
+        const unsigned wide = std::max(constant->getBitWidth(), bits) + 2;
+        const llvm::APInt value2 = srcUnsigned ? constant->getValue().zext(wide) : constant->getValue().sext(wide);
+        const llvm::APInt low = destUnsigned ? llvm::APInt(wide, 0) : llvm::APInt::getSignedMinValue(bits).sext(wide);
+        const llvm::APInt high = destUnsigned ? llvm::APInt::getMaxValue(bits).zext(wide)
+                                              : llvm::APInt::getSignedMaxValue(bits).sext(wide);
+        if (!value2.slt(low) && !value2.sgt(high)) return;
+        llvm::SmallString<32> digits;
+        value2.toString(digits, 10, true);
+        LogError(std::format("integer constant {} cannot be narrowed to type '{}' in a brace-list "
+                             "initializer; use an explicit cast",
+                             std::string(digits.str()), IntegerTypeSpelling(bits, destUnsigned)));
+}
 
 llvm::Value* LLVMBackend::CreateCast(llvm::Value* value, llvm::Type* destType, bool isSigned, bool destUnsigned)
 {
@@ -2234,6 +2283,8 @@ llvm::Value* LLVMBackend::SplatScalarToVectorType(llvm::Value* scalar, llvm::Fix
 
 llvm::Value* LLVMBackend::ConvertScalarToType(llvm::Value* scalar, llvm::Type* target, bool srcIsUnsigned, bool destUnsigned)
 {
+        RefuseImplicitFloatToInt(scalar, target, destUnsigned);
+        RefuseNarrowingBraceConstant(scalar, srcIsUnsigned, target, destUnsigned);
         scalar = Upconvert(scalar, target, srcIsUnsigned);
         if (scalar->getType() != target)
             scalar = CreateCast(scalar, target, false, destUnsigned);

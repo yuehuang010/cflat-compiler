@@ -1,17 +1,15 @@
-# CFlat structs with non-relocatable C++ fields: dictionary slots, list.take leak, fixed-array fields
+# CFlat structs with non-relocatable C++ fields: remaining V1b items and dictionary copy()
 
-Summary: the V1b review (2026-10-01) found these. All three also fail on master. They are in plan scope (internal/plan/cflat-struct-nontrivial-cxx-fields.md) and were left out of V1b.
-Probes and clang++ oracles are in scratch/repro_keep/v1b_rv4/ (runner run.sh).
+Summary: the V1b review (2026-10-01) found R1-R3 and the nits below. D3 (dictionary slots), D4 (list.take leak) and
+D5 (fixed-array field of a lowered struct) were fixed in the T149 round 1 change (regression legs in
+Test/test_cpp_interop_bridge.cb, T149 block). Probes for the remaining items: scratch/repro_keep/v1b/rv5/ (run.sh is the branch, runm.sh is master).
 
-- D3: `dictionary<int, S>` segfaults on the first `set` (e1.cb). `operator=` runs on calloc'd storage that was never constructed.
-  Fix direction: use `construct_at` for fresh slots, at cflat/core/dictionary.cb:106, :194 and :257.
-- D4: `list.take()` leaks one object, leaving live=1 (d3.cb). This happens even with a plain `list<cpptw.Twin>` (h1.cb).
-  At cflat/core/list.cb:175, `T v = move _data[index];` leaves the moved-from element alive, then `construct_at` overwrites it.
-  Fix direction: a declaration move from an element access destroys the source (as EmitLoweredValueIntoSlot does), or list.cb releases the slot.
-- D5: a fixed-array field of a lowered struct (`struct A2 { S[2] arr = default; }`) is never constructed, so the first use crashes (b1.cb, b5.cb, a6.cb).
-  Fixed-array locals (`S[2] x;`) work (b4.cb).
-
-Crashes and leaks, hence p2.
+Found in T149 round 1, not fixed (all reproduce identically on master):
+- Member-init spelling `A() : arr() {}` on a plain CFlat struct is refused ("a base initializer is only valid in a [cpp]
+  struct"); clang accepts. Spelling gap, not a crash.
+- C2: `dictionary<int, cpptw.Twin>` (and `std.list<int>` values) cannot even be declared: copy() is instantiated
+  eagerly and `result._values[i] = _values[i].copy()` is refused ("cannot assign to C++ class ... from this expression"
+  for std.list, "cannot copy 'cpptw.Twin'" for Twin; the diagnostic points at dictionary.cb:529). Repro: scratch/t149/pc5.cb.
 
 V1b r5 review (2026-10-01, V1b landed 52a77168). These also crash on master; probes are in scratch/repro_keep/v1b/rv5/ (run.sh is the branch, runm.sh is master):
 - R1: `_ = move o.s; o.s = b;` on a lowered field (f1.cb, f1b.cb).

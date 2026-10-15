@@ -3514,3 +3514,12 @@ refusal text stays as the fallback where no wrapper can be generated (opaque mem
 C++-rooted prefix only the exact member counts for C++ entities; CFlat entities under the same prefix
 still walk outward. A CFlat-declared segment never re-enables the outward walk for C++ entities.
 Spell it `w.P`. Never relax this to restore the pre-T61 walk.
+
+## Ruling 2026-10-13: no implicit floating -> integer conversion; any -> bool stays implicit (landed with T151)
+CFlat safety means less ambiguity. An implicit floating -> integer conversion is refused in EVERY position: declaration init, `=`,
+compound `op=` (`i += 0.5`), array / brace / named-field elements, simd splats, field defaults, globals, bitfield stores, implicit
+C++ converting constructors, std::function adapters, C++ conversion-operator results stored into an integer (return and call
+arguments already refused). The explicit cast `(int)d` stays legal; a value test of C store semantics casts the whole expression
+(`x = (u32)(x + d)`, never `x += (u32)d`). Implicit any -> bool stays legal everywhere, braces included ("most numbers have a zero").
+Integer constants out of range in a native brace initializer are refused like clang (T119 folded in). Blast radius measured
+before the ruling: 0 sites in core / examples / test_libs, 29 Test lines (T151 spike).

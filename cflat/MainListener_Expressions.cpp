@@ -3568,7 +3568,16 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 // Cast the incoming value to the storage word's integer width.
                 // Third arg of CreateCast is isSigned (used only when widening); flip
                 // BitfieldUnsigned to get sign-extension for signed bitfields.
-                auto* valAsStorage = compiler->CreateCast(val, storageTy, !namedVar.BitfieldUnsigned, namedVar.BitfieldUnsigned);
+                // Declared bool: any -> bool is a truth test (ruling 2026-10-13), zero-extended
+                // so the word sees 0/1 and not a sign-extended i1.
+                llvm::Value* valAsStorage = nullptr;
+                if (namedVar.TypeAndValue.TypeName == "bool")
+                    valAsStorage = compiler->builder->CreateZExt(compiler->CoerceToBoolCondition(val), storageTy);
+                else
+                {
+                    compiler->RefuseImplicitFloatToInt(val, storageTy, namedVar.BitfieldUnsigned);
+                    valAsStorage = compiler->CreateCast(val, storageTy, !namedVar.BitfieldUnsigned, namedVar.BitfieldUnsigned);
+                }
                 auto* valMasked = compiler->builder->CreateAnd(valAsStorage, cflat_llvm::GetIntTruncated(storageTy, valMask));
                 auto* valShifted = compiler->builder->CreateShl(valMasked, cflat_llvm::GetIntTruncated(storageTy, off));
                 auto* word = compiler->LoadBitfieldWord(namedVar.BitfieldStorage, namedVar.BitfieldStorageType);
@@ -19665,11 +19674,20 @@ bool MainListener::EmitOneFieldInit(
             && !fieldType.Pointer && fieldType.ConstArraySize == 0)
         {
             auto* fieldLLVMType = compiler->GetType(fieldType);
-            if (fieldLLVMType != nullptr && fieldLLVMType != val->getType()
-                && !fieldLLVMType->isIntegerTy(1)
+            // The range check runs before the same-LLVM-type shortcut: '{ f = (u32)4294967295 }'
+            // into an int field has equal types but does not fit.
+            if (fieldLLVMType != nullptr && !fieldLLVMType->isIntegerTy(1)
                 && (fieldLLVMType->isIntegerTy() || fieldLLVMType->isFloatingPointTy()))
-                val = compiler->ConvertScalarToType(val, fieldLLVMType, rightIsUnsigned,
+            {
+                // Named brace fields ('{ f = v }'): T119 constant fit applies to this store.
+                LLVMBackend::NativeBraceScope braceScope(*compiler);
+                // The loaded value is no longer a constant; the literal source is checked here.
+                compiler->RefuseNarrowingBraceConstant(rightNV.Primary, rightIsUnsigned, fieldLLVMType,
                     fieldType.IsUnsignedInteger() != -1);
+                if (fieldLLVMType != val->getType())
+                    val = compiler->ConvertScalarToType(val, fieldLLVMType, rightIsUnsigned,
+                        fieldType.IsUnsignedInteger() != -1);
+            }
         }
 
         // A 'bool' field brace-init is a truth test like the '=' and cast paths. Upconvert only
@@ -20366,7 +20384,10 @@ static llvm::Value* ConstructDefaultArrayElement(LLVMBackend* compiler, const st
         // A zero-offset GEP of a global array can fold back to the GlobalVariable; carry the
         // constructor's element type so CreateAssignment does not mistake the slot for the array.
         if (elem != nullptr && !builtInPlace)
+        {
+            LLVMBackend::NativeBraceScope braceScope(*compiler);
             compiler->CreateAssignment(elem, elemPtr, false, elem->getType());
+        }
         return elem;
 }
 
@@ -20810,8 +20831,11 @@ void MainListener::EmitFieldInitializer(
                             || !EmitForeignCxxFixedArrayIntoSlot(
                                 nestedField, nestedDestination, nestedSlot,
                                 "into a fixed-array field", fi))
+                        {
+                            LLVMBackend::NativeBraceScope braceScope(*compiler);
                             compiler->CreateAssignment(nestedValue, nestedDestination, false,
                                 compiler->GetType(nestedField));
+                        }
                     }
                     continue;
                 }
@@ -20876,7 +20900,23 @@ void MainListener::EmitFieldInitializer(
                 unsigned off = bfHit->BitOffset;
                 uint64_t valMask = (w == 64) ? ~uint64_t(0) : ((uint64_t(1) << w) - 1);
                 uint64_t windowMask = valMask << off;
-                auto* valAsStorage = compiler->CreateCast(val, wordTy, !bfHit->IsUnsigned, bfHit->IsUnsigned);
+                llvm::Value* valAsStorage = nullptr;
+                if (bfHit->TypeName == "bool")
+                    valAsStorage = compiler->builder->CreateZExt(compiler->CoerceToBoolCondition(val), wordTy);
+                else
+                {
+                    // Brace constants are range-checked against the DECLARED type, not the width.
+                    LLVMBackend::TypeAndValue declared{ .TypeName = bfHit->TypeName };
+                    if (llvm::Type* declaredLLVM = compiler->GetType(declared);
+                        declaredLLVM != nullptr && declaredLLVM->isIntegerTy())
+                    {
+                        LLVMBackend::NativeBraceScope braceScope(*compiler);
+                        compiler->RefuseNarrowingBraceConstant(rightNV.Primary,
+                            rightNV.TypeAndValue.IsUnsignedInteger() != -1, declaredLLVM, bfHit->IsUnsigned);
+                    }
+                    compiler->RefuseImplicitFloatToInt(val, wordTy, bfHit->IsUnsigned);
+                    valAsStorage = compiler->CreateCast(val, wordTy, !bfHit->IsUnsigned, bfHit->IsUnsigned);
+                }
                 auto* valMasked = compiler->builder->CreateAnd(valAsStorage, cflat_llvm::GetIntTruncated(wordTy, valMask));
                 auto* valShifted = compiler->builder->CreateShl(valMasked, cflat_llvm::GetIntTruncated(wordTy, off));
                 auto* word = compiler->LoadBitfieldWord(storagePtr, storageTy);
@@ -21397,8 +21437,11 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                 continue;
             }
             ConsumeOwningBraceElementSource(nv, val, elemPtr, fixedElemTV, tv.TypeName, fi);
-            compiler->CreateAssignment(val, elemPtr,
-                nv.TypeAndValue.IsUnsignedInteger() != -1, elemTy, fixedElemTV.IsUnsignedInteger() != -1);
+            {
+                LLVMBackend::NativeBraceScope braceScope(*compiler);
+                compiler->CreateAssignment(val, elemPtr,
+                    nv.TypeAndValue.IsUnsignedInteger() != -1, elemTy, fixedElemTV.IsUnsignedInteger() != -1);
+            }
         }
         noteBuiltElement();
 
@@ -21853,7 +21896,14 @@ void MainListener::EmitGlobalFixedArrayInit(
                         val = compiler->WrapStringLiteralAsString(val);
                 }
                 auto* c = llvm::dyn_cast_or_null<llvm::Constant>(val);
-                if (c) c = CoerceConstantToArrayElement(compiler, c, elemTy);
+                if (c)
+                {
+                    LLVMBackend::NativeBraceScope braceScope(*compiler);
+                    compiler->RefuseImplicitFloatToInt(c, elemTy, globalElemTV.IsUnsignedInteger() != -1);
+                    compiler->RefuseNarrowingBraceConstant(c, nv.TypeAndValue.IsUnsignedInteger() != -1,
+                        elemTy, globalElemTV.IsUnsignedInteger() != -1);
+                    c = CoerceConstantToArrayElement(compiler, c, elemTy);
+                }
                 if (!c)
                 {
                     if (elemTy->isStructTy())
@@ -24420,6 +24470,37 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
             && !argNV.IsTempSpillStorage
             && compiler->IsForeignNontrivialCxxReturnClass(argNV.TypeAndValue.TypeName))
         {
+            argNV.IsExplicitMove = true;
+            argNV.IsRvalue = true;
+            return argNV;
+        }
+
+        // A const C++ object becomes `const T&&`; keep its referent, including for trivial records.
+        if (!argNV.TypeAndValue.Pointer && argNV.Storage != nullptr
+            && !argNV.IsTempSpillStorage
+            && compiler->IsCxxRecord(argNV.TypeAndValue.TypeName)
+            && !compiler->IsCppStructName(argNV.TypeAndValue.TypeName)
+            && compiler->CxxConstReceiverKind(argNV) != 0)
+        {
+            if (ctx == trivialCxxMoveSite_)
+            {
+                LLVMBackend::NamedVariable built = argNV;
+                std::string refusal;
+                const std::string sourceName = !argNV.CallerName.empty() ? argNV.CallerName
+                    : ctx->unaryExpression() != nullptr ? ctx->unaryExpression()->getText()
+                                                        : std::string();
+                if (compiler->MaterializeTrivialCxxExplicitMove(built, sourceName, refusal))
+                {
+                    built.IsExplicitMove = true;
+                    built.IsRvalue = true;
+                    return built;
+                }
+                if (!refusal.empty())
+                {
+                    LogErrorContext(ctx, refusal);
+                    return {};
+                }
+            }
             argNV.IsExplicitMove = true;
             argNV.IsRvalue = true;
             return argNV;

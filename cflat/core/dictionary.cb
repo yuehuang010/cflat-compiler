@@ -106,8 +106,8 @@ struct dictionary<K, V>
                     int slot = _slot(oldKeys[i]);
                     while (_status[slot] != 0)
                         slot = (slot + 1) % _capacity;
-                    _keys[slot]   = oldKeys[i];
-                    _values[slot] = oldValues[i];
+                    construct_at(&_keys[slot], move oldKeys[i]);
+                    construct_at(&_values[slot], move oldValues[i]);
                     _status[slot] = 1;
                     _count++;
                 }
@@ -137,7 +137,7 @@ struct dictionary<K, V>
             // A `unique` key is policy-rejected on the hash path; keep its .copy() (itself an error on
             // an owning key) out of the instantiation so that tailored diagnostic is the one reported.
             if const (is_unique(K)) compile_error("dictionary keys cannot be 'unique'; a lookup reads the key for hashing/equality and would move it out. Use 'dictionary<K*, V>' for a borrowed key, or a primitive/owning-value key, and manage the key lifetime separately.");
-            else _keys[index] = key.copy();
+            else construct_at(&_keys[index], key.copy());
         }
     }
 
@@ -215,7 +215,7 @@ struct dictionary<K, V>
                 int insertSlot = _insertSlotFor(k);
                 if (insertSlot == -1) return false;
                 _placeKeyAt(insertSlot, k);
-                _values[insertSlot] = value;
+                construct_at(&_values[insertSlot], value);
                 _status[insertSlot] = 1;
                 _count++;
                 return true;
@@ -259,7 +259,7 @@ struct dictionary<K, V>
                     _status[updateSlot] = 1;
                     _count++;
                 }
-                _values[updateSlot] = value;
+                construct_at(&_values[updateSlot], value);
             }
         }
     }
@@ -285,7 +285,7 @@ struct dictionary<K, V>
             int insertSlot = _insertSlotFor(k);
             if (insertSlot == -1) return false;
             _placeKeyAt(insertSlot, k);
-            _values[insertSlot] = move value;
+            construct_at(&_values[insertSlot], move value);
             _status[insertSlot] = 1;
             _count++;
             return true;
@@ -310,7 +310,7 @@ struct dictionary<K, V>
                 _status[updateSlot] = 1;
                 _count++;
             }
-            _values[updateSlot] = move value;
+            construct_at(&_values[updateSlot], move value);
         }
     }
 
@@ -524,9 +524,9 @@ struct dictionary<K, V>
                         // eager instantiation (a `unique` element would deref-copy the pointee) with a dead
                         // if const branch, so the real key-policy error still fires first.
                         if const (is_unique(K)) compile_error("dictionary keys cannot be 'unique'");
-                        else                    result._keys[i] = _keys[i].copy();
+                        else                    construct_at(&result._keys[i], _keys[i].copy());
                         if const (!is_copyable(V)) compile_error("cannot copy this dictionary: its value type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the dictionary instead of copying it");
-                        else                       result._values[i] = _values[i].copy();
+                        else                       construct_at(&result._values[i], _values[i].copy());
                     }
                     i++;
                 }

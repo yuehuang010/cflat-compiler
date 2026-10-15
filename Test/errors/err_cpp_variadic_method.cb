@@ -1,10 +1,15 @@
 import cpp "cpp_interop_basic.h";
 
+// An out-of-line variadic member takes its scalar tail like clang, but an aggregate in the `...`
+// tail is still refused at the call (same rule as err_cpp_variadic_aggregate.cb).
+struct VariadicPod { int a; int b; };
+
 extern int main()
 {
-    expect_error("member 'sum' of C++ class 'cppi.Variadic' is variadic") {
-        cppi.Variadic* v = nullptr;
-        v.sum(1, 2);
+    cppi.Variadic* v = nullptr;
+    VariadicPod p = {a = 3, b = 4};
+    expect_error("cannot pass aggregate value of type 'VariadicPod' to the variadic") {
+        int r = v.sum(1, p);
     }
     return 0;
 }

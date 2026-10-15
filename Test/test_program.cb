@@ -85,7 +85,7 @@ program NoInitFieldConfig {
 // Regression for the same issue's scalar arm: the synthesized ctor must CreateCast the
 // mismatched default instead of feeding it unconverted into CreateInsertValue.
 program NarrowFieldConfig {
-    int i = 3.7;
+    int i = (int)3.7;
 
     int main(move list<string> args) {
         return i;

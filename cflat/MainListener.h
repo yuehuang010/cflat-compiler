@@ -4181,6 +4181,9 @@ private:
         // C++-class array whose every element is an empty brace `{}` (each element is built
         // through the same empty-brace route at startup).
         bool EmptyBraceElements = false;
+        // `S[N] g = default;` / `= {}` whose element fold failed at the declaration: the retry folds
+        // only, and a failing retry keeps the zero constant (no runtime construction, no note).
+        bool FoldOnly = false;
         // Declaration order across BOTH queues (native and C++), so one module initializer runs
         // the constructions in the order the globals were declared.
         size_t Sequence = 0;
@@ -4501,6 +4504,11 @@ private:
     // before its value is joined with a borrowed consumer.
     bool inCallArgument_ = false;
     bool inCxxCallArgument_ = false;
+    CFlatParser::AssignmentExpressionContext* cxxDirectConstructionArgument_ = nullptr;
+    LLVMBackend::TypeAndValue cxxDirectConstructionTargetType_;
+    bool cxxDirectConstructionCanDefer_ = true;
+    bool cxxDirectConstructionHasLaterSibling_ = false;
+    bool* cxxDirectConstructionCallOrderSafe_ = nullptr;
     // The one postfix expression whose flexible-array member stays an array (the direct operand
     // of `sizeof` or unary `&`); every other value context decays it to `T*`, as C does.
     std::vector<antlr4::ParserRuleContext*> flexibleArrayKeep_;
@@ -4705,6 +4713,10 @@ private:
     llvm::Value* GenerateDefaultValue(const LLVMBackend::DeclTypeAndValue& typeValue);
     bool EmitNontrivialCxxDefaultAt(llvm::Value* destination,
                                    const LLVMBackend::DeclTypeAndValue& typeValue);
+    // Default-constructs CFlat struct typeName. When its constructor returns via C++ sret (it has
+    // a C++ field) the object is built directly in `destination` and nullptr comes back; otherwise
+    // the returned value, which the caller stores. Never bit-copies a self-referential member.
+    llvm::Value* EmitStructDefaultInto(llvm::Value* destination, const std::string& typeName);
 
     // Constant value of a type's default construction, or nullptr when it is not constant.
     llvm::Constant* TryFoldGlobalDefaultConstruction(const LLVMBackend::DeclTypeAndValue& typeValue);
