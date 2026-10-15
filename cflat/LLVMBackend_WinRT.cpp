@@ -1681,6 +1681,67 @@ void LLVMBackend::LogBorrowedPointerMoveSinkError(const std::string& sourceDescr
             { sourceDescription, parameterName, functionName, declaredName, declaredName });
 }
 
+void LLVMBackend::LogOwningLocalCopyMoveSinkError(const std::string& sourceName,
+        const std::string& ownerName, const std::string& parameterName,
+        const std::string& functionName) const
+{
+        LogErrorMessage(
+            "cannot move borrowed pointer '{}' (copied from owning local '{}') into move parameter "
+            "'{}' of '{}' - '{}' still owns the pointee and frees it on scope exit. Pass '{}' "
+            "itself with 'move {}' to transfer ownership, or pass a pointer that is not a copy.",
+            { sourceName, ownerName, parameterName, functionName, ownerName, ownerName, ownerName });
+}
+
+void LLVMBackend::DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
+        const std::string& paramName, const NamedVariable& arg)
+{
+        // The argument NV is rebuilt by the expression walk, so the borrow bits live on the
+        // binding itself - ask the live variable, not the copy. Unknown provenance ACCEPTS.
+        const bool storageIsLocalSlot = arg.Storage != nullptr
+            && llvm::isa<llvm::AllocaInst>(arg.Storage);
+        if (!storageIsLocalSlot || !arg.FieldName.empty()) return;
+        const NamedVariable* live = FindVariableByStorage(arg.Storage);
+        const bool argOwns = arg.IsOwning || arg.IsOwningStruct || arg.IsOwningString
+            || arg.OwnsInterfaceBox
+            || (live != nullptr && (live->IsOwning || live->IsOwningStruct
+                                    || live->IsOwningString || live->IsNewAllocated))
+            || (!arg.CallerName.empty() && IsVariableOwning(arg.CallerName));
+        if (argOwns || BorrowProofRetiredByRebind(arg)
+            || (live != nullptr && BorrowProofRetiredByRebind(*live)))
+            return;
+        const bool directBorrowParam = !arg.CallerName.empty()
+            && IsFunctionParameter(arg.CallerName);
+        // A local read out of a FIELD of the borrowed parameter copies an OWNING SLOT, not the
+        // parameter - that is exactly the legal idiom, so it is not reached by this rule.
+        const bool throughField = arg.BorrowedThroughField
+            || (live != nullptr && live->BorrowedThroughField);
+        const std::string borrowOrigin = throughField ? std::string()
+            : (!arg.BorrowedOrigin.empty()
+               ? arg.BorrowedOrigin
+               : (live != nullptr && live->IsBorrowed ? live->BorrowedOrigin : std::string()));
+        const bool copiedFromBorrowParam = !directBorrowParam
+            && !borrowOrigin.empty() && IsFunctionParameter(borrowOrigin);
+        if (directBorrowParam || copiedFromBorrowParam)
+        {
+            const std::string sourceName = directBorrowParam
+                ? std::format("borrowed parameter '{}'", arg.CallerName)
+                : std::format("borrowed pointer '{}' (copied from parameter '{}')",
+                              arg.CallerName.empty() ? borrowOrigin : arg.CallerName,
+                              borrowOrigin);
+            const std::string declName = directBorrowParam ? arg.CallerName : borrowOrigin;
+            LogBorrowedPointerMoveSinkError(sourceName, paramName,
+                SpellFunctionSymbol(*this, functionName), declName);
+            return;
+        }
+        // A plain copy of a live OWNING local (`P* view = n;`) is the same double free.
+        const NamedVariable& copy = live != nullptr ? *live : arg;
+        if (!directBorrowParam && !throughField && copy.BorrowsOwningLocal
+            && OwningLocalCopyStillAliases(copy))
+            LogOwningLocalCopyMoveSinkError(
+                arg.CallerName.empty() ? FindVariableNameByStorage(arg.Storage) : arg.CallerName,
+                copy.OwningLocalOrigin, paramName, SpellFunctionSymbol(*this, functionName));
+}
+
 void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args,
         bool paramsCarryAllocAlign, bool calleeIsMethod, bool beforeCall, bool calleeIsCxx)
@@ -1725,7 +1786,10 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     const std::string borrowOrigin = borrowedArm->BorrowedOrigin;
                     const bool copiedBorrow = !directBorrowParam && !borrowOrigin.empty()
                         && IsFunctionParameter(borrowOrigin);
-                    if (directBorrowParam || copiedBorrow)
+                    if (borrowedArm->BorrowedFromOwningLocal)
+                        LogOwningLocalCopyMoveSinkError(borrowedArm->CallerName, borrowOrigin,
+                            params[i].VariableName, SpellFunctionSymbol(*this, functionName));
+                    else if (directBorrowParam || copiedBorrow)
                     {
                         const std::string sourceDescription = directBorrowParam
                             ? std::format("borrowed parameter '{}'", borrowedArm->CallerName)

@@ -379,9 +379,68 @@ struct NewTempProbe
 int _newTempProbeLook(NewTempProbe* p) { return p->v; }
 int _newTempProbeRead(int* p) { return *p; }
 int _newTempProbeReadLive(int* p) { return _newTempProbeDtors == 0 ? *p : -1; }
+// T215: a callee that RETAINS its pointer argument (stores it in a global); must not be freed early.
+NewTempProbe* _newTempProbeKept = nullptr;
+void _newTempProbeKeep(NewTempProbe* p) { _newTempProbeKept = p; }
 move NewTempProbe* _newTempProbeMake(int x)
 {
     NewTempProbe* p = new NewTempProbe(x);
+    return p;
+}
+// T220: a runtime '??' whose fallback is a bare `new`. The hidden owner frees it at q's scope exit
+// unless a copy of q escapes (return, global store, retaining callee), which leaves it leaked.
+int _t220Coalesce(NewTempProbe* g) { NewTempProbe* q = g ?? new NewTempProbe(51); return q->v; }
+int _t220Nested(NewTempProbe* g, NewTempProbe* h) { NewTempProbe* q = g ?? h ?? new NewTempProbe(55); return q->v; }
+int _t220Loop(int n, NewTempProbe* live)
+{
+    int sum = 0;
+    for (int i = 0; i < n; i++)
+    {
+        NewTempProbe* g = live;
+        if (i % 2 == 0) g = nullptr;
+        NewTempProbe* q = g ?? new NewTempProbe(56);
+        sum = sum + q->v;
+    }
+    return sum;
+}
+NewTempProbe* _t220Keep(NewTempProbe* g) { NewTempProbe* q = g ?? new NewTempProbe(53); return q; }
+NewTempProbe* _t220Stored = nullptr;
+void _t220Store(NewTempProbe* g) { NewTempProbe* q = g ?? new NewTempProbe(57); _t220Stored = q; }
+void _t220Retain(NewTempProbe* g) { NewTempProbe* q = g ?? new NewTempProbe(54); _newTempProbeKeep(q); }
+int _t220Borrow(NewTempProbe* g) { NewTempProbe* q = g ?? new NewTempProbe(58); return _newTempProbeLook(q); }
+void _t220Delete(NewTempProbe* g) { NewTempProbe* q = g ?? new NewTempProbe(59); delete q; }
+int _t220Take(move NewTempProbe* p) { int v = p->v; delete p; return v; }
+int _t220Give(NewTempProbe* g) { NewTempProbe* q = g ?? new NewTempProbe(60); return _t220Take(move q); }
+// `move q` into a local, a return or a global hands the fallback on: the hidden owner must not free it.
+int _t220MoveLocal(NewTempProbe* g) { NewTempProbe* q = g ?? new NewTempProbe(61); NewTempProbe* r = move q; int v = r->v; delete r; return v; }
+NewTempProbe* _t220MoveReturn(NewTempProbe* g) { NewTempProbe* q = g ?? new NewTempProbe(62); return move q; }
+NewTempProbe* _t220MovedGlobal = nullptr;
+void _t220MoveGlobal(NewTempProbe* g) { NewTempProbe* q = g ?? new NewTempProbe(63); _t220MovedGlobal = move q; }
+
+// T222: `?.` chains on owned temporaries. ChainProbe has a next link and a self()/pv()/keep() surface;
+// _chainMake returns an owning temp, _chainNil an owning null, _chainMakeLinked an owning temp with next set.
+int _chainNews = 0;
+int _chainDtors = 0;
+ChainProbe* _chainKept = nullptr;
+struct ChainProbe
+{
+    int v = 0;
+    ChainProbe* next = nullptr;
+    ChainProbe(int x) { v = x; _chainNews++; }
+    ~ChainProbe() { _chainDtors++; }
+    ChainProbe* self() { return this; }
+    int* pv() { return &v; }
+    int get() { return v; }
+    int keep() { _chainKept = this; return v; }
+};
+int _chainLook(ChainProbe* p) { return p == nullptr ? -1 : p->v; }
+move ChainProbe* _chainMake(int x) { ChainProbe* p = new ChainProbe(x); return p; }
+move ChainProbe* _chainNil() { return nullptr; }
+ChainProbe* _chainLinkTo = nullptr;
+move ChainProbe* _chainMakeLinked(int x)
+{
+    ChainProbe* p = new ChainProbe(x);
+    p->next = _chainLinkTo;
     return p;
 }
 
@@ -437,6 +496,35 @@ void lamRetain(PtrLeak* p)
     int q = f(1);
     g_lamKept = p;
 }
+
+// T234: a '?:' arm temp passed to a callee defined LATER in the file. The return keeps the temp
+// only while the callee may hand that argument back; the answer is read at end of module, once
+// the callee's body exists. Each callee below is defined after its caller, on purpose.
+int g_rkZero = 6;
+struct RkHold { int* p = nullptr; int k = 0; };
+int* rkCallSecond(int c) { return rkSecondLate(c > 0 ? &(new PtrLeak())->v : &g_rkZero, &g_rkZero); }
+int* rkSecondLate(int* a, int* b) { return b; }
+PtrLeak* rkCallFirst(int c) { return rkFirstLate(c > 0 ? new PtrLeak() : nullptr, nullptr); }
+PtrLeak* rkFirstLate(PtrLeak* a, PtrLeak* b) { if (a != nullptr) { a.v = 21; } return a; }
+RkHold rkHoldCall(int c) { return rkHoldLate(c > 0 ? &(new PtrLeak())->v : &g_rkZero); }
+RkHold rkHoldLate(int* p) { RkHold r; r.p = &g_rkZero; r.k = *p; return r; }
+// Self recursion: the callee's own body is still being emitted at the inner call site.
+PtrLeak* rkRec(PtrLeak* a, int n)
+{
+    if (n <= 0) return a;
+    return rkRec(n > 0 ? new PtrLeak() : nullptr, n - 1);
+}
+// Mutual recursion: rkMA is emitted after rkMB, so the leaf resolves once both bodies exist.
+PtrLeak* rkMB(PtrLeak* b, int n)
+{
+    if (n <= 0) return b;
+    return rkMA(n > 0 ? new PtrLeak() : nullptr, n - 1);
+}
+PtrLeak* rkMA(PtrLeak* a, int n) { return rkMB(a, n); }
+// T234 review: the later callee parks the argument in a global and returns it from there.
+PtrLeak* g_rkKeep = nullptr;
+PtrLeak* rkGlobCall(int c) { return rkGlobLate(c > 0 ? new PtrLeak() : nullptr); }
+PtrLeak* rkGlobLate(PtrLeak* p) { g_rkKeep = p; if (p != nullptr) { p.v = 31; } return g_rkKeep; }
 
 // Regression: a value struct with a USER destructor over a RAW pointer field (not `unique`) and NO
 // copy() is NON-copyable - the memberwise synth would shallow-share the pointer while the dtor frees
@@ -4430,6 +4518,53 @@ extern int main()
             total++; passed += Test("ternary arm owning-struct field read in loop", armLoop, "tok33");
         }
     }
+    // === T234: '?:' arm temp into a callee defined later (return keep rule, end-of-module answer) ===
+    {
+        // The callee returns its OTHER argument: the arm temp dies at the return.
+        g_shapeDtor = 0;
+        int* other = rkCallSecond(1);
+        total++; passed += Test("later callee returns other arm: value", *other, 6);
+        total++; passed += Test("later callee returns other arm: temp freed", g_shapeDtor, 1);
+
+        // The callee returns the ARM argument: the caller owns it and frees it exactly once.
+        g_shapeDtor = 0;
+        PtrLeak* first = rkCallFirst(1);
+        total++; passed += Test("later callee returns arm: value", first->v, 21);
+        total++; passed += Test("later callee returns arm: not freed early", g_shapeDtor, 0);
+        delete first;
+        total++; passed += Test("later callee returns arm: freed once by caller", g_shapeDtor, 1);
+
+        // A struct return that does not carry the argument: the temp dies at the return.
+        g_shapeDtor = 0;
+        RkHold held = rkHoldCall(1);
+        total++; passed += Test("later struct callee: value", held.p == &g_rkZero, true);
+        total++; passed += Test("later struct callee: temp freed", g_shapeDtor, 1);
+
+        // Self recursion: the arm temp is returned from the innermost call, so it must survive.
+        g_shapeDtor = 0;
+        PtrLeak* rec = rkRec(nullptr, 1);
+        total++; passed += Test("self-recursive later callee: arm returned", rec != nullptr, true);
+        total++; passed += Test("self-recursive later callee: not freed early", g_shapeDtor, 0);
+        delete rec;
+        total++; passed += Test("self-recursive later callee: freed once by caller", g_shapeDtor, 1);
+
+        // The later callee returns the arm through a global: kept, never freed early.
+        g_shapeDtor = 0;
+        PtrLeak* viaGlobal = rkGlobCall(1);
+        total++; passed += Test("later callee returns arm via global: value", viaGlobal->v, 31);
+        total++; passed += Test("later callee returns arm via global: not freed early", g_shapeDtor, 0);
+        delete viaGlobal;
+        g_rkKeep = nullptr;
+
+        // Mutual recursion, same contract.
+        g_shapeDtor = 0;
+        PtrLeak* mut = rkMB(nullptr, 1);
+        total++; passed += Test("mutual-recursive later callee: arm returned", mut != nullptr, true);
+        total++; passed += Test("mutual-recursive later callee: not freed early", g_shapeDtor, 0);
+        delete mut;
+        total++; passed += Test("mutual-recursive later callee: freed once by caller", g_shapeDtor, 1);
+    }
+
 
     // === Bug 11: a freshly allocated container buffer is default-CONSTRUCTED, not empty ===
     // Every leg below is a resource count, not a value: pre-fix each container leaked one
@@ -4734,6 +4869,208 @@ extern int main()
             total++; passed += Test("stored ternary new remains owned", _newTempProbeDtors, 0);
         }
         total++; passed += Test("stored ternary new released at owner end", _newTempProbeDtors, 1);
+
+        // T215: a bare `new` arm of a ternary in a CALL ARGUMENT is ledgered and freed at the statement end.
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        g_armGate = 1;
+        int callArmTaken = _newTempProbeLook(RuntimeTrue() ? new NewTempProbe(36) : borrowed);
+        total++; passed += Test("T215 call arg new arm value", callArmTaken, 36);
+        total++; passed += Test("T215 call arg new arm allocated", _newTempProbeNews, 1);
+        total++; passed += Test("T215 call arg new arm released", _newTempProbeDtors, 1);
+
+        // T215: `??` in a call argument with a taken new LHS arm: the arm is freed; the RHS is never built.
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        g_armGate = 1;
+        NewTempProbe* coalNil = nullptr;
+        int callCoalArmTaken = _newTempProbeLook(
+            (RuntimeTrue() ? new NewTempProbe(37) : coalNil)
+                ?? new NewTempProbe(38));
+        total++; passed += Test("T215 call arg coal lhs arm value", callCoalArmTaken, 37);
+        total++; passed += Test("T215 call arg coal lhs arm allocated", _newTempProbeNews, 1);
+        total++; passed += Test("T215 call arg coal lhs arm released", _newTempProbeDtors, 1);
+
+        // T215 guard: a RETAINING callee keeps a taken new arm alive past the statement (no early free).
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        g_armGate = 1;
+        _newTempProbeKeep(RuntimeTrue() ? new NewTempProbe(41) : borrowed);
+        total++; passed += Test("T215 retained call arg new arm value", _newTempProbeKept->v, 41);
+        total++; passed += Test("T215 retained call arg new arm allocated", _newTempProbeNews, 1);
+        total++; passed += Test("T215 retained call arg new arm not freed", _newTempProbeDtors, 0);
+        delete _newTempProbeKept;
+        _newTempProbeKept = nullptr;
+        total++; passed += Test("T215 retained call arg new arm released by owner", _newTempProbeDtors, 1);
+
+        // T215 guard, borrowed arm taken: the retaining callee gets the borrow and nothing is freed.
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        g_armGate = 0;
+        _newTempProbeKeep(RuntimeTrue() ? new NewTempProbe(42) : borrowed);
+        total++; passed += Test("T215 retained call arg borrow value", _newTempProbeKept->v, 20);
+        total++; passed += Test("T215 retained call arg borrow frees nothing", _newTempProbeDtors, 0);
+        total++; passed += Test("T215 retained call arg borrow skips new arm", _newTempProbeNews, 0);
+        _newTempProbeKept = nullptr;
+
+        // T215: a `??` RHS address-of a new temp, outside a call, is released at the statement end (both c).
+        int* addrNil = nullptr;
+        int* addrNp = nullptr;
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        g_armGate = 1;
+        bool coalAddrTaken = (RuntimeTrue() ? (addrNil ?? &(new NewTempProbe(43))->v) : addrNp) == addrNp;
+        total++; passed += Test("T215 coal address new rhs value", coalAddrTaken, false);
+        total++; passed += Test("T215 coal address new rhs allocated", _newTempProbeNews, 1);
+        total++; passed += Test("T215 coal address new rhs released", _newTempProbeDtors, 1);
+
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        g_armGate = 0;
+        bool coalAddrSkipped = (RuntimeTrue() ? (addrNil ?? &(new NewTempProbe(44))->v) : addrNp) == addrNp;
+        total++; passed += Test("T215 coal address skipped arm value", coalAddrSkipped, true);
+        total++; passed += Test("T215 coal address skipped arm creates nothing", _newTempProbeNews, 0);
+        total++; passed += Test("T215 coal address skipped arm frees nothing", _newTempProbeDtors, 0);
+        g_armGate = 1;
+
+        // T220: a runtime '??' fallback that is a bare `new` is freed at the declaration's scope exit
+        // when the LHS is null; a LHS-taken borrow allocates and frees nothing; nesting and loops count
+        // one free per fallback.
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        int t220Nil = _t220Coalesce(nullptr);
+        total++; passed += Test("T220 decl fallback value", t220Nil, 51);
+        total++; passed += Test("T220 decl fallback allocated", _newTempProbeNews, 1);
+        total++; passed += Test("T220 decl fallback released", _newTempProbeDtors, 1);
+
+        NewTempProbe* t220Live = new NewTempProbe(52);
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        int t220Taken = _t220Coalesce(t220Live);
+        total++; passed += Test("T220 decl borrow value", t220Taken, 52);
+        total++; passed += Test("T220 decl borrow allocates nothing", _newTempProbeNews, 0);
+        total++; passed += Test("T220 decl borrow frees nothing", _newTempProbeDtors, 0);
+
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        int t220Nested = _t220Nested(nullptr, nullptr);
+        total++; passed += Test("T220 nested fallback value", t220Nested, 55);
+        total++; passed += Test("T220 nested fallback released", _newTempProbeDtors, 1);
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        int t220NestedHit = _t220Nested(nullptr, t220Live);
+        total++; passed += Test("T220 nested inner borrow value", t220NestedHit, 52);
+        total++; passed += Test("T220 nested inner borrow frees nothing", _newTempProbeDtors, 0);
+
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        int t220Loop = _t220Loop(1000, t220Live);
+        total++; passed += Test("T220 loop sum", t220Loop, 500 * 56 + 500 * 52);
+        total++; passed += Test("T220 loop fallbacks allocated", _newTempProbeNews, 500);
+        total++; passed += Test("T220 loop fallbacks released", _newTempProbeDtors, 500);
+        delete t220Live;
+
+        // T220 escape guards: a fallback copy that is returned, stored in a global or retained by a
+        // callee is not freed at scope exit (it stays with its new owner, or leaks).
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        NewTempProbe* t220Returned = _t220Keep(nullptr);
+        total++; passed += Test("T220 returned fallback value", t220Returned->v, 53);
+        total++; passed += Test("T220 returned fallback not freed in callee", _newTempProbeDtors, 0);
+        delete t220Returned;
+
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        _t220Store(nullptr);
+        total++; passed += Test("T220 stored fallback value", _t220Stored->v, 57);
+        total++; passed += Test("T220 stored fallback not freed in callee", _newTempProbeDtors, 0);
+        delete _t220Stored;
+        _t220Stored = nullptr;
+
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        _t220Retain(nullptr);
+        total++; passed += Test("T220 retained fallback value", _newTempProbeKept->v, 54);
+        total++; passed += Test("T220 retained fallback not freed in callee", _newTempProbeDtors, 0);
+        delete _newTempProbeKept;
+        _newTempProbeKept = nullptr;
+
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        int t220Lent = _t220Borrow(nullptr);
+        total++; passed += Test("T220 lent fallback value", t220Lent, 58);
+        total++; passed += Test("T220 lent fallback released", _newTempProbeDtors, 1);
+
+        // T220: an explicit delete or a move of the fallback borrow frees it exactly once.
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        _t220Delete(nullptr);
+        total++; passed += Test("T220 explicit delete allocated", _newTempProbeNews, 1);
+        total++; passed += Test("T220 explicit delete frees once", _newTempProbeDtors, 1);
+
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        int t220Given = _t220Give(nullptr);
+        total++; passed += Test("T220 moved fallback value", t220Given, 60);
+        total++; passed += Test("T220 moved fallback frees once", _newTempProbeDtors, 1);
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        int t220MovedLocal = _t220MoveLocal(nullptr);
+        total++; passed += Test("T220 move-to-local value", t220MovedLocal, 61);
+        total++; passed += Test("T220 move-to-local frees once", _newTempProbeDtors, 1);
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        NewTempProbe* t220MoveRet = _t220MoveReturn(nullptr);
+        total++; passed += Test("T220 move-return alive", t220MoveRet->v + _newTempProbeDtors, 62);
+        delete t220MoveRet;
+        _newTempProbeNews = 0; _newTempProbeDtors = 0;
+        _t220MoveGlobal(nullptr);
+        total++; passed += Test("T220 move-to-global alive", _t220MovedGlobal->v + _newTempProbeDtors, 63);
+        delete _t220MovedGlobal;
+        _t220MovedGlobal = nullptr;
+
+        // T222: `?.` chains on owned temps. The count legs fail on the pre-T222 build (the receiver leaked);
+        // a pointer result into the receiver stays a leak like `->`, so those legs pin the value only.
+        _chainNews = 0; _chainDtors = 0;
+        int chainNested = (new ChainProbe(4))?.next?.v;
+        total++; passed += Test("T222 nested new receiver value", chainNested, 0);
+        total++; passed += Test("T222 nested new receiver allocated", _chainNews, 1);
+        total++; passed += Test("T222 nested new receiver released", _chainDtors, 1);
+
+        _chainNews = 0; _chainDtors = 0;
+        int chainArrowNested = (new ChainProbe(4))->next?.v;
+        total++; passed += Test("T222 arrow nested new receiver value", chainArrowNested, 0);
+        total++; passed += Test("T222 arrow nested new receiver released", _chainDtors, 1);
+
+        _chainLinkTo = new ChainProbe(9);
+        _chainNews = 0; _chainDtors = 0;
+        int chainLinked = (_chainMakeLinked(4))?.next?.v;
+        total++; passed += Test("T222 owning nested receiver value", chainLinked, 9);
+        total++; passed += Test("T222 owning nested receiver released", _chainDtors, 1);
+        delete _chainLinkTo;
+        _chainLinkTo = nullptr;
+
+        _chainNews = 0; _chainDtors = 0;
+        int chainSelf = _chainLook((new ChainProbe(8))?.self());
+        total++; passed += Test("T222 self call on new receiver value", chainSelf, 8);
+        total++; passed += Test("T222 self call on new receiver released", _chainDtors, 1);
+
+        _chainNews = 0; _chainDtors = 0;
+        int chainTwoSelf = _chainLook((new ChainProbe(2))?.self()) + _chainLook((new ChainProbe(3))?.self());
+        total++; passed += Test("T222 two self calls value", chainTwoSelf, 5);
+        total++; passed += Test("T222 two self calls released", _chainDtors, 2);
+
+        _chainNews = 0; _chainDtors = 0;
+        int chainOwnField = _chainMake(4)?.v;
+        total++; passed += Test("T222 owning call receiver value", chainOwnField, 4);
+        total++; passed += Test("T222 owning call receiver released", _chainDtors, 1);
+
+        _chainNews = 0; _chainDtors = 0;
+        int chainOwnNil = _chainNil()?.v;
+        int chainOwnNilSelf = _chainLook(_chainNil()?.self());
+        total++; passed += Test("T222 owning null receiver value", chainOwnNil, 0);
+        total++; passed += Test("T222 owning null receiver self value", chainOwnNilSelf, -1);
+        total++; passed += Test("T222 owning null receiver frees nothing", _chainDtors, 0);
+
+        // Escape guards: a pointer into the receiver is read while the receiver is still alive.
+        _chainNews = 0; _chainDtors = 0;
+        ChainProbe* chainSelfPtr = (new ChainProbe(3))?.self();
+        total++; passed += Test("T222 self result bound to local live", chainSelfPtr->v, 3);
+        delete chainSelfPtr;
+        int* chainPvPtr = (new ChainProbe(6))?.pv();
+        total++; passed += Test("T222 pv result bound to local live", *chainPvPtr, 6);
+        delete (ChainProbe*)chainPvPtr;
+
+        // A retaining callee keeps the receiver past the statement: never freed early.
+        _chainNews = 0; _chainDtors = 0;
+        int chainKeptVal = (new ChainProbe(5))?.keep();
+        total++; passed += Test("T222 retained keep value", chainKeptVal, 5);
+        total++; passed += Test("T222 retained keep not freed", _chainDtors, 0);
+        total++; passed += Test("T222 retained keep still live", _chainKept->v, 5);
+        delete _chainKept;
+        _chainKept = nullptr;
+
         delete borrowed;
     }
 

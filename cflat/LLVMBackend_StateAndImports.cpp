@@ -2641,6 +2641,7 @@ nlohmann::json LLVMBackend::CxxMemberToJson(
         if (m.isDeleted)            j["dl"] = true;
         if (m.isDefaulted)          j["df"] = true;
         if (m.isImplicit)           j["im"] = true;
+        if (m.isUsingShadow)        j["us"] = true;
         if (m.isTemplateSpecialization) j["ts"] = true;
         if (m.needsLocalDefinition) j["nd"] = true;
         if (m.definitionAssumed)    j["da"] = true;
@@ -2703,6 +2704,7 @@ cflat_cinterop::RawCxxMember LLVMBackend::CxxMemberFromJson(
         m.isDeleted            = j.value("dl", false);
         m.isDefaulted          = j.value("df", false);
         m.isImplicit           = j.value("im", false);
+        m.isUsingShadow        = j.value("us", false);
         m.isTemplateSpecialization = j.value("ts", false);
         m.needsLocalDefinition = j.value("nd", false);
         m.definitionAssumed = j.value("da", false);

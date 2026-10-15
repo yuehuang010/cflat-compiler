@@ -10,5 +10,11 @@ extern int main()
         cppi.Tracked dst = move src;
         int leak = src.value();
     }
+    // T233 round 2: a static move from a moved-from local is refused like the local form.
+    expect_error("use of moved variable 'src'") {
+        cppi.Tracked src = cppi.Tracked(1);
+        static cppi.Tracked first = move src;
+        static cppi.Tracked second = move src;
+    }
     return 0;
 }

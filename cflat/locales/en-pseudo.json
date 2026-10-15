@@ -330,6 +330,15 @@
       "p",
       "p"
     ],
+    "cannotmoveborrowedpo...ointerthatisnotacopy3009dc2e4fffaa0f": [
+      "view",
+      "n",
+      "q",
+      "sink",
+      "n",
+      "n",
+      "n"
+    ],
     "cannotmovetheoverali...heelementtypeinstead37678af4b62532f7": [
       "b",
       "new T[n] alignas(0, 64)",
@@ -2008,6 +2017,7 @@
     "cannotmaterializeimp...classargumentforarg058a97d9c8a4df65b": "cannot materialize implicit C++ class argument for '{0}'",
     "cannotmovearg0intomo...ifthisfunctionownsite3725c6c36e14caf": "cannot move {0} into move parameter '{1}' of '{2}' - the caller may still own this pointer and will free it on scope exit. Move it out of the owning slot instead (e.g. 'move parent->children[i]'), or declare '{3}' as 'move {4}' if this function owns it.",
     "cannotmovearg0itwasr...luethereceivercanownecd0567bd50b057c": "cannot 'move' '{0}' - it was returned as a borrow of unique field '{1}', and moving the alias does not null the field, so the field's synthesized destructor still frees the pointee. Pass it to a plain (non-'move') parameter, which borrows, or pass a value the receiver can own.",
+    "cannotmoveborrowedpo...ointerthatisnotacopy3009dc2e4fffaa0f": "cannot move borrowed pointer '{0}' (copied from owning local '{1}') into move parameter '{2}' of '{3}' - '{4}' still owns the pointee and frees it on scope exit. Pass '{5}' itself with 'move {6}' to transfer ownership, or pass a pointer that is not a copy.",
     "cannotmovetheoverali...heelementtypeinstead37678af4b62532f7": "cannot move the over-aligned buffer '{0}' ('{1}') into the '{2}' parameter of '{3}': that alignment is a property of the allocation, not of the type, so the callee cannot recover it. Declare the parameter '{4}' so the block alignment is recorded, or over-align the ELEMENT TYPE instead.",
     "cannotpassaarg0bitin...itexplicitlywitharg3e8b611917d2a59d2": "cannot pass a {0}-bit integer to {1}: implicit integer narrowing to '{2}' is not allowed at a call argument - cast it explicitly with '({3})'",
     "cannotpassaarg0value...llonenotasinglevaluee93521a582289c53": "cannot pass a '{0}' value as array-view parameter '{1}' ('{2}') - a view indexes whole '{3}' elements, so its source must be an array view of '{4}' (or a null one), not a single value",

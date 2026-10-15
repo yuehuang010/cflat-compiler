@@ -89,7 +89,7 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 | - | p3/cpp-wrapper-rejection-cache-keyed-by-text-only | stale cached wrapper rejection | TU-context-dependent clang rejection replays after a fix until cache cleared; T58 r3, pre-existing |
 | - | p3/cpp-brace-ctor-enum-element-overload-choice | brace ctor with enum elements | A({e,e}) picks unsigned[2], L({e,e}) ambiguous; clang promotes to int; T58 review 3, pre-existing |
 | - | p3/cpp-initializer-list-only-class-empty-braces-refused | `T v{}` with only an initializer_list ctor | refused; clang calls it with an empty list; T63 review 1, pre-existing |
-| - | p2/cpp-by-value-class-temporary-extra-moves | prvalue C++ class into C++ (by-value args, brace elements, by-value param return) | extra move/copy + dtor vs clang elision; deleted-move prvalue refused; N67 partial; raised p3 -> p2 2026-10-09 |
+| - | p3/cxx-byvalue-prvalue-arg-moved-not-elided | prvalue C++ class into a by-value param | extra move vs clang elision; the old p2 by-value-temporary-extra-moves file was gone, re-pointed 2026-10-15 (T229) |
 | - | p3/cpp-brace-element-enum-and-macro-constants-not-constant | enum/macro constants in braces | refused as narrowing (non-constant); clang accepts; T63 review 2, pre-existing |
 | - | p2/cpp-pointer-reference-ctor-param-binds-temporary | C++ ctor wrapper, `T*&` param | `PRef(yp)` binds a temp; `*pr.q` garbage (clang 6); T47 reviews, pre-existing |
 | - | p3/cpp-reference-member-leftovers-after-t47 | ref members | designated init refused; const array-ref member write accepted; const C& result ranks C& first (T47 reviews, pre-existing) |

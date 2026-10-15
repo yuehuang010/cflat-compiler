@@ -5,6 +5,7 @@ import cpp "cpp_interop_unique_deleter.hpp";
 import cpp "cpp_t28_fwdref.hpp";
 import "cpp_t103_nullctor_c.h";
 import cpp "cpp_t103_nullctor.hpp";
+import cpp "cpp_t63_brace_decl.hpp";
 
 void CrDeleteWrongParam(int x) { }
 int CrDeleteWrongReturn(move int* p) { delete p; return 1; }
@@ -160,6 +161,14 @@ extern int main()
     }
     expect_error("no overload of 't103.only_pointer' matches") {
         int v = t103.only_pointer(T103_C_CHAR_ZERO);
+    }
+    expect_error("is an rvalue reference; pass 'move <arg>' or a temporary") {
+        function<int(int)> f = t63.call_plus_one;
+        int value = t63.call_fn_rvalue_ref(t63.CallFnRvalueRef(f));
+    }
+    expect_error("is an rvalue reference; pass 'move <arg>' or a temporary") {
+        function<int(int)> f = t63.call_plus_one;
+        int value = t63.call_fn_rvalue_ref_template(t63.CallFnRvalueRef(f));
     }
     return 0;
 }

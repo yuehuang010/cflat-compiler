@@ -229,4 +229,69 @@ struct TinyIterVec {
     TinyIter begin() { TinyIter r; r.p = d; return r; }
     TinyIter end() { TinyIter r; r.p = d + 5; return r; }
 };
+
+// T221: using-declarations expose base overloads while preserving C++ name lookup.
+struct T221OpBase {
+    long operator-(long rhs) const { return 1000 + (int)rhs; }
+};
+struct T221OpUsingOnly : T221OpBase {
+    using T221OpBase::operator-;
+};
+struct T221OpUsingPlus : T221OpBase {
+    using T221OpBase::operator-;
+    long operator-(int rhs) const { return 2000 + rhs; }
+};
+struct T221NamedBase {
+    long get(long rhs) const { return 3000 + (int)rhs; }
+};
+struct T221NamedUsingOnly : T221NamedBase {
+    using T221NamedBase::get;
+};
+template<class T> struct T221TemplBase {
+    long operator-(long rhs) const { return 4000 + (int)rhs; }
+};
+struct T221TemplUsing : T221TemplBase<int> {
+    using T221TemplBase<int>::operator-;
+};
+struct T221EqBase {
+    int value = 0;
+    bool operator==(const T221EqBase& rhs) const { return value == rhs.value; }
+};
+struct T221EqUsing : T221EqBase {
+    using T221EqBase::operator==;
+};
+struct T221PrivateUsing : private T221OpBase {
+public:
+    using T221OpBase::operator-;
+};
+// Only the overload a using-declaration names is reachable; the other base's overload stays hidden.
+struct T221NamedBaseInt {
+    long get(int rhs) const { return 3500 + (int)rhs; }
+};
+struct T221NamedMulti : T221NamedBase, T221NamedBaseInt {
+    using T221NamedBase::get;
+};
+struct T221OpBaseInt {
+    long operator-(int rhs) const { return 1100 + rhs; }
+};
+struct T221OpMulti : T221OpBase, T221OpBaseInt {
+    using T221OpBase::operator-;
+};
+struct T221PrivateNamedUsing : T221NamedBase {
+private:
+    using T221NamedBase::get;
+};
+struct T221StaticBaseLong {
+    static long s(long rhs) { return 5000 + (int)rhs; }
+};
+struct T221StaticBaseInt {
+    static long s(int rhs) { return 5100 + rhs; }
+};
+struct T221StaticMulti : T221StaticBaseLong, T221StaticBaseInt {
+    using T221StaticBaseLong::s;
+};
+struct T221StaticPrivate : T221StaticBaseLong {
+private:
+    using T221StaticBaseLong::s;
+};
 }

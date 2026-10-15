@@ -218,6 +218,129 @@ const LLVMBackend::NullCoalesceJoin* LLVMBackend::FindNullCoalesceJoin(const llv
         return nullptr;
     }
 
+void LLVMBackend::AttachNullCoalesceFallback(llvm::Value* joined, const NullCoalesceFallback& fallback)
+{
+        if (joined == nullptr || fallback.Slot == nullptr) return;
+        for (auto& entry : nullCoalesceJoins_)
+            if (entry.Joined == joined) { entry.Fallback = fallback; return; }
+    }
+
+void LLVMBackend::BindNullCoalesceFallbackOwner(llvm::Value* joined, llvm::AllocaInst* declSlot,
+                                                const TypeAndValue& declType)
+{
+        if (joined == nullptr || declSlot == nullptr || stackNamedVariable.empty() || builder == nullptr
+            || !IsInsertBlockLive()) return;
+        const NullCoalesceJoin* join = FindNullCoalesceJoin(joined);
+        if (join == nullptr || join->Fallback.Slot == nullptr) return;
+        const NullCoalesceFallback& fallback = join->Fallback;
+        llvm::Function* fn = builder->GetInsertBlock()->getParent();
+        if (fallback.Slot->getFunction() != fn || declSlot->getFunction() != fn) return;
+        if (fallback.TypeName != declType.TypeName) return;
+        // The hidden owner is a plain owning pointer local of the declaration's scope: scope-exit
+        // cleanup frees its slot (null-skipped) behind the runtime flag, exactly like `T* p = new T`.
+        const std::string name = "$coalesce" + std::to_string(nextDeclSequence);
+        NamedVariable& owner = GetOrCreateStackVariable(name);
+        owner.Storage = fallback.Slot;
+        owner.BaseType = fallback.Slot->getAllocatedType();
+        owner.TypeAndValue = declType;
+        owner.TypeAndValue.VariableName = name;
+        owner.IsOwning = true;
+        owner.IsNewAllocated = true;
+        owner.AllocAlignment = fallback.AllocAlign;
+        owner.DeclarationBlock = builder->GetInsertBlock();
+        owner.DeclarationScopeDepth = stackNamedVariable.size();
+        // Stored false at entry (no release) until ResolveOwnedReleaseGates proves no copy escapes.
+        auto* gateSlot = AllocaAtEntry(builder->getInt1Ty(), nullptr, name + ".owns");
+        llvm::StoreInst* init = nullptr;
+        {
+            llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+            builder->SetInsertPoint(gateSlot->getParent(), std::next(gateSlot->getIterator()));
+            init = builder->CreateStore(builder->getInt1(false), gateSlot);
+        }
+        owner.OwnFlag = gateSlot;
+        owner.OwnFlagActive = true;
+        fallbackOwnerGates_.push_back({ declSlot, init });
+    }
+
+void LLVMBackend::NoteFallbackRootConsumed(const llvm::Value* storage)
+{
+        // An explicit `delete` of the declared pointer frees the block itself: the owner stays off.
+        std::erase_if(fallbackOwnerGates_, [&](const FallbackOwnerGate& gate) { return gate.Root == storage; });
+    }
+
+bool LLVMBackend::FallbackSlotMayEscape(const llvm::AllocaInst* root,
+                                        const std::unordered_set<const llvm::Value*>& releaseLoads)
+{
+        // Escape = a copy of the block that outlives the slot's scope or is stored or retained:
+        // a return, a store of the value, an unmodelled user, or a callee that may retain it.
+        // Comparisons, field/pointee access and non-retaining callees keep the block local.
+        llvm::SmallPtrSet<const llvm::Value*, 16> visited;
+        llvm::SmallVector<const llvm::Value*, 16> work;
+        auto enqueue = [&](const llvm::Value* v) { if (visited.insert(v).second) work.push_back(v); };
+        for (const llvm::User* u : root->users())
+        {
+            const auto* st = llvm::dyn_cast<llvm::StoreInst>(u);
+            if (st == nullptr || st->getPointerOperand() != root || st->getValueOperand() == root)
+            {
+                const auto* ld = llvm::dyn_cast<llvm::LoadInst>(u);
+                if (ld == nullptr || ld->getPointerOperand() != root) return true;
+                // The declared pointer is a borrow: its only leaving loads are `move q`, which
+                // hand the block on, so every load is followed (T220 review: move-out escapes).
+                (void)releaseLoads;
+                enqueue(ld);
+            }
+        }
+        while (!work.empty())
+        {
+            if (visited.size() > kMaxRetainUses) return true;
+            const llvm::Value* v = work.pop_back_val();
+            for (const llvm::User* u : v->users())
+            {
+                const auto* inst = llvm::dyn_cast<llvm::Instruction>(u);
+                if (inst == nullptr) return true;
+                if (llvm::isa<llvm::ICmpInst>(inst)) continue;
+                if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(inst))
+                {
+                    if (st->getValueOperand() == v) return true;   // the block itself is stored
+                    continue;                                      // writing THROUGH the block
+                }
+                if (const auto* ld = llvm::dyn_cast<llvm::LoadInst>(inst))
+                {
+                    if (TypeHoldsPointer(ld->getType())) enqueue(ld);
+                    continue;
+                }
+                if (const auto* call = llvm::dyn_cast<llvm::CallBase>(inst))
+                {
+                    const llvm::Function* callee = call->getCalledFunction();
+                    if (callee == nullptr) return true;
+                    if (CallIsPointerOpaqueIntrinsic(callee))
+                    {
+                        if (callee->getName().starts_with("llvm.mem")) return true;
+                        continue;
+                    }
+                    bool passedAsArg = false;
+                    for (unsigned i = 0; i < call->arg_size(); ++i)
+                    {
+                        if (call->getArgOperand(i) != v) continue;
+                        passedAsArg = true;
+                        if (ParameterRetainsArgument(callee, i, 0)) return true;
+                    }
+                    if (!passedAsArg) return true;
+                    continue;
+                }
+                if (llvm::isa<llvm::GetElementPtrInst>(inst) || llvm::isa<llvm::BitCastInst>(inst)
+                    || llvm::isa<llvm::AddrSpaceCastInst>(inst) || llvm::isa<llvm::PHINode>(inst)
+                    || llvm::isa<llvm::SelectInst>(inst))
+                {
+                    enqueue(inst);
+                    continue;
+                }
+                return true;   // a return, an aggregate insert, or any unmodelled use
+            }
+        }
+        return false;
+    }
+
 void LLVMBackend::RegisterUniqueFieldRead(llvm::Value* value, llvm::Value* storage)
 {
         if (value == nullptr || storage == nullptr) return;
@@ -286,13 +409,11 @@ void LLVMBackend::PropagateUniqueFieldRead(llvm::Value* trueValue, llvm::Value* 
         }
         else if (const auto* nullJoin = FindNullCoalesceJoin(joined))
         {
+            // A '??' arm that is not a field read (an owning `new`, a borrowed pointer) has no
+            // slot to null, so it adds no source; each field arm is nulled on its own path only.
             recognized = true;
             for (const auto& arm : nullJoin->Arms)
-                if (!collect(arm.Value, arm.Block, sources))
-                {
-                    recognized = false;
-                    break;
-                }
+                collect(arm.Value, arm.Block, sources);
         }
         else
         {
@@ -1413,6 +1534,20 @@ bool LLVMBackend::OwnedSlotLoadEscapes(const llvm::LoadInst* root, const llvm::A
 
 void LLVMBackend::ResolveOwnedReleaseGates()
 {
+        // '??' fallback owners first: a bound owner is released only when no copy of its declared
+        // pointer escapes (a return, a store, a retaining callee). Otherwise it stays leaked.
+        std::vector<FallbackOwnerGate> fallbacks;
+        fallbacks.swap(fallbackOwnerGates_);
+        std::unordered_set<const llvm::Value*> releaseLoads;
+        for (const auto& load : ownSlotLeavingLoads_)
+            if (load) releaseLoads.insert(load);
+        for (const auto& gate : fallbacks)
+        {
+            auto* root = llvm::dyn_cast_or_null<llvm::AllocaInst>(gate.Root);
+            auto* init = llvm::dyn_cast_or_null<llvm::StoreInst>(gate.Init);
+            if (root != nullptr && init != nullptr && !FallbackSlotMayEscape(root, releaseLoads))
+                init->setOperand(0, llvm::ConstantInt::getTrue(init->getContext()));
+        }
         std::vector<OwnReleaseGate> pending;
         pending.swap(ownReleaseGates_);
         std::vector<OwnAdoptGate> adopts;
@@ -2006,6 +2141,16 @@ void LLVMBackend::PropagateOwnedReturnTemp(llvm::Value* from, llvm::Value* to)
         ownedReturnReleaseTemps_.push_back(copy);
 }
 
+bool LLVMBackend::IsOwnedCxxPrvalueArgument(const NamedVariable& arg, llvm::Type* structTy) const
+{
+        // A `move x` names a slot, and a named source is never in the pending list.
+        if (!arg.IsRvalue || (arg.IsExplicitMove && !arg.IsCxxPrvalueTemp)) return false;
+        auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(arg.Storage);
+        if (slot == nullptr || slot->getAllocatedType() != structTy) return false;
+        return std::any_of(pendingOwnedStructTemps.begin(), pendingOwnedStructTemps.end(),
+                           [&](const PendingOwnedStructTemp& e) { return e.Alloca == slot; });
+}
+
 bool LLVMBackend::IsProducedTempValue(llvm::Value* value) const
 {
         if (value == nullptr) return false;
@@ -2029,6 +2174,13 @@ void LLVMBackend::PropagateNullConditionalOwnership(llvm::Value* from, llvm::Val
         // sites downstream must see it as one.
         PropagateProducedTempValue(from, to);
         PropagateOwnedReturnTemp(from, to);
+        // An access-arm `new` result that adopted its receiver (`?.self()`) is owned by the merged
+        // value: the consumer frees it once, and the null arm owns nothing.
+        if (FindOwnedNewTemp(from) != nullptr)
+        {
+            PropagateOwnedNewTemp(from, to);
+            ConsumeOwnedNewTemp(from);
+        }
         // A closure temp is registered by the CALL and has no consumer-side registration site to
         // re-find it, so its ledger entry must MOVE to the merged value (a string's does not:
         // the produced-temp sites above re-register that one where it matters).
@@ -2295,6 +2447,20 @@ void LLVMBackend::PreserveRetainedJoinArmTempsBeforeCall(const llvm::Function* c
         }
     }
 
+void LLVMBackend::RegisterDirectOwningPtrArgsBeforeCall(const llvm::Function* callee,
+                                                        llvm::ArrayRef<llvm::Value*> args)
+    {
+        // Same test as the post-call registration in RegisterNonEscapingOwningPtrArgs; here it runs
+        // first so the invoke's landing pad owns the temp. RegisterOwnedPtrTemp is idempotent.
+        if (callee == nullptr || callee->isDeclaration()) return;
+        for (unsigned i = 0; i < args.size(); ++i)
+        {
+            if (args[i] == nullptr || !IsOwningPtrTempValue(args[i])) continue;
+            if (ParameterRetainsArgument(callee, i)) continue;
+            RegisterOwnedPtrTemp(args[i]);
+        }
+    }
+
 void LLVMBackend::ResolveCxxThisEscapeGates()
 {
         if (cxxThisEscapeGates_.empty()) return;
@@ -2314,6 +2480,77 @@ void LLVMBackend::ResolveCxxThisEscapeGates()
             if (fn == nullptr || fn->isDeclaration() || gate.ArgIndex >= fn->arg_size()) continue;
             if (ParameterRetainsArgument(fn, gate.ArgIndex)) continue;
             init->setOperand(0, llvm::ConstantInt::getTrue(init->getContext()));
+        }
+    }
+
+/*
+ * Return-flush verdict for one pointer temp whose address may reach the returned value.
+ *   Keep  - a definite path reaches the return, or the walk hit a limit, or an indirect call.
+ *   Free  - nothing reaches the return (no path, no leaf).
+ *   Defer - the only possible path runs through callees whose bodies are not emitted yet (a
+ *           function declared later, or the one being emitted). The free is emitted now behind
+ *           an i1 gate that the end-of-module resolve flips to true only when every leaf proves
+ *           its argument does not reach a return. Until then the gate is false: a leak, never an
+ *           early free.
+ */
+bool LLVMBackend::ShouldFreeReturnedPtrTemp(PendingOwnedPtrTemp& temp, const llvm::Value* pendingReturn)
+{
+        ReturnReachLeaves leaves;
+        if (ValueMayReachReturn(temp.Value, 0, true, pendingReturn, &leaves)) return false;
+        if (leaves.Unresolved) return false;
+        if (leaves.Edges.empty()) return true;
+        for (const auto& edge : leaves.Edges)
+            if (edge.Callee.empty()) return false;
+        // A cxx release gate already owns this free; a second gate would replace it.
+        if (temp.ReleaseGate != nullptr) return false;
+        auto* gateSlot = AllocaAtEntry(builder->getInt1Ty(), nullptr, "ret.keep.gate");
+        llvm::StoreInst* init = nullptr;
+        {
+            llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+            builder->SetInsertPoint(gateSlot->getParent(), std::next(gateSlot->getIterator()));
+            init = builder->CreateStore(builder->getInt1(false), gateSlot);
+        }
+        deferredReturnKeepGates_.push_back({ init, std::move(leaves.Edges) });
+        temp.ReleaseGate = gateSlot;
+        return true;
+    }
+
+/*
+ * True when every leaf edge is a function with a complete body whose argument does not reach a
+ * return, following the leaves of those bodies in turn. An edge with no name, no body (an extern,
+ * an indirect call), or a limit answers false: the temp stays kept.
+ */
+bool LLVMBackend::LeafEdgesProveNoReturn(const std::vector<ReturnReachEdge>& edges,
+                                         std::set<std::pair<std::string, unsigned>>& seen)
+{
+        for (const auto& edge : edges)
+        {
+            if (edge.Callee.empty()) return false;
+            // Already under proof further up (a cycle): its answer is the outer one's to give.
+            if (!seen.insert({ edge.Callee, edge.ArgIndex }).second) continue;
+            const llvm::Function* fn = module->getFunction(edge.Callee);
+            if (fn == nullptr || !FunctionBodyIsComplete(fn) || edge.ArgIndex >= fn->arg_size())
+                return false;
+            ReturnReachLeaves more;
+            if (ParameterMayReachReturn(fn, edge.ArgIndex, 0, &more)) return false;
+            if (more.Unresolved || !LeafEdgesProveNoReturn(more.Edges, seen)) return false;
+        }
+        return true;
+    }
+
+void LLVMBackend::ResolveDeferredReturnKeepGates()
+{
+        if (deferredReturnKeepGates_.empty()) return;
+        std::vector<DeferredReturnKeepGate> pending;
+        pending.swap(deferredReturnKeepGates_);
+        NoCurrentFunctionScope noCurrent(this);
+        for (const auto& gate : pending)
+        {
+            auto* init = llvm::dyn_cast_or_null<llvm::StoreInst>(gate.Init);
+            if (init == nullptr) continue;
+            std::set<std::pair<std::string, unsigned>> seen;
+            if (LeafEdgesProveNoReturn(gate.Edges, seen))
+                init->setOperand(0, llvm::ConstantInt::getTrue(init->getContext()));
         }
     }
 
@@ -2388,6 +2625,9 @@ bool LLVMBackend::TernaryArmJoinsOwning(llvm::Value* arm)
         if (auto* c = llvm::dyn_cast<llvm::Constant>(arm); c != nullptr && c->isNullValue()) return true;
         if (IsOwningPtrTempValue(arm) || IsMovedOutPtrValue(arm)
             || RawArrayResultOwns(arm)) return true;
+        // A bare `new` arm hoisted into its conditional slot (call argument) still owns it.
+        for (const auto& temp : pendingOwnedPtrTemps)
+            if (temp.Value == arm && temp.ConditionalSlot != nullptr) return true;
         // A nontrivial C++ value returned by value is held in a tracked sret slot. Its loaded
         // SSA value is an owning temporary even though C++ records are not CFlat owning structs.
         std::unordered_set<const llvm::Value*> visiting;
@@ -2526,6 +2766,17 @@ bool LLVMBackend::PropagateTernaryOwnership(llvm::Value* trueValue, llvm::Value*
             PropagateOwnedNewTemp(trueValue, joined);
         else
             PropagateOwnedNewTemp(falseValue, joined);
+        // The join owns a hoisted call-argument `new` arm: drop its slot and ledger entry so no
+        // enclosing join re-hoists it (one owner, one free).
+        for (llvm::Value* arm : { trueValue, falseValue })
+        {
+            if (!IsOwnedNewTemp(arm)) continue;
+            bool hoisted = std::any_of(pendingOwnedPtrTemps.begin(), pendingOwnedPtrTemps.end(),
+                [&](const PendingOwnedPtrTemp& t) { return t.Value == arm && t.ConditionalSlot != nullptr; });
+            if (!hoisted) continue;
+            std::erase_if(ownedNewTemps_, [&](const OwnedNewTemp& n) { return n.Value == arm; });
+            UnregisterOwnedPtrTemp(arm);
+        }
         // A join of `move` arms carries the detachment out on the JOINED value, so a receiver can
         // still recognise the result as owning by value identity rather than by a sticky flag.
         if (IsMovedOutPtrValue(trueValue) || IsMovedOutPtrValue(falseValue))
@@ -2983,14 +3234,28 @@ bool LLVMBackend::OwningPtrProvablyEscapes(const llvm::Value* root, std::string&
         return false;
     }
 
-bool LLVMBackend::ParameterMayReachReturn(const llvm::Function* fn, unsigned argIndex, int depth)
+bool LLVMBackend::ParameterMayReachReturn(const llvm::Function* fn, unsigned argIndex, int depth,
+                                          ReturnReachLeaves* leaves)
 {
-        if (fn == nullptr || argIndex >= fn->arg_size() || depth > kMaxRetainDepth) return false;
+        if (fn == nullptr || argIndex >= fn->arg_size()) return false;
+        if (depth > kMaxRetainDepth)
+        {
+            if (leaves != nullptr) leaves->Unresolved = true;
+            return false;
+        }
         if (fn->getReturnType()->isVoidTy()) return false;
+        // A body still to come (declared later in the file, or the function being emitted) cannot
+        // be read yet: record it, and let the end-of-module resolve answer once it is complete.
+        if (leaves != nullptr && TypeHoldsPointer(fn->getReturnType()) && !FunctionBodyIsComplete(fn))
+        {
+            if (fn->hasName()) leaves->Edges.push_back({ fn->getName().str(), argIndex });
+            else leaves->Unresolved = true;
+            return false;
+        }
         if (!FunctionBodyIsReadable(fn)) return false;
         auto key = std::make_pair(fn, argIndex);
         if (!mayReachReturnInProgress_.insert(key).second) return false;   // cycle: no proof
-        bool reaches = ValueMayReachReturn(fn->getArg(argIndex), depth);
+        bool reaches = ValueMayReachReturn(fn->getArg(argIndex), depth, false, nullptr, leaves);
         mayReachReturnInProgress_.erase(key);
         return reaches;
     }
@@ -3092,7 +3357,8 @@ bool LLVMBackend::ValueMayReachBorrowingContainerSink(const llvm::Value* root, i
 
 bool LLVMBackend::ValueMayReachReturn(const llvm::Value* root, int depth,
                                       bool unknownPointerResultMayReach,
-                                      const llvm::Value* pendingReturnValue)
+                                      const llvm::Value* pendingReturnValue,
+                                      ReturnReachLeaves* leaves)
 {
         llvm::SmallPtrSet<const llvm::Value*, 16> visited;
         llvm::SmallVector<const llvm::Value*, 16> work;
@@ -3100,7 +3366,11 @@ bool LLVMBackend::ValueMayReachReturn(const llvm::Value* root, int depth,
         work.push_back(root);
         while (!work.empty())
         {
-            if (visited.size() > kMaxRetainUses) return unknownPointerResultMayReach;
+            if (visited.size() > kMaxRetainUses)
+            {
+                if (leaves != nullptr) leaves->Unresolved = true;
+                return unknownPointerResultMayReach;
+            }
             const llvm::Value* v = work.pop_back_val();
             for (const llvm::User* u : v->users())
             {
@@ -3112,10 +3382,15 @@ bool LLVMBackend::ValueMayReachReturn(const llvm::Value* root, int depth,
                     {
                         const llvm::Function* callee = call->getCalledFunction();
                         for (unsigned i = 0; i < call->arg_size(); ++i)
-                            if (call->getArgOperand(i) == v
-                                && ParameterMayReachReturn(callee, i, depth + 1)) return true;
+                        {
+                            if (call->getArgOperand(i) != v) continue;
+                            if (leaves != nullptr && callee == nullptr)
+                                leaves->Edges.push_back({ std::string(), 0 });   // never answered
+                            else if (ParameterMayReachReturn(callee, i, depth + 1, leaves)) return true;
+                        }
+                        // With leaves, a declared callee was recorded as a leaf above.
                         if (unknownPointerResultMayReach
-                            && (!callee || callee->isDeclaration())) return true;
+                            && (!callee || (callee->isDeclaration() && leaves == nullptr))) return true;
                     }
                     else return true;
                 }
@@ -3132,7 +3407,12 @@ bool LLVMBackend::ValueMayReachReturn(const llvm::Value* root, int depth,
                     if (st->getValueOperand() != v) continue;
                     const llvm::Value* obj = llvm::getUnderlyingObject(st->getPointerOperand());
                     if (const auto* slot = llvm::dyn_cast<llvm::AllocaInst>(obj))
+                    {
                         if (visited.insert(slot).second) work.push_back(slot);
+                    }
+                    // Deferred proof of a callee body: a store to a global, argument or heap may
+                    // be read back and returned (`g = p; return g;`), so it counts as reaching.
+                    else if (leaves != nullptr && pendingReturnValue == nullptr) return true;
                     continue;
                 }
                 if (llvm::isa<llvm::LoadInst>(inst))
@@ -3156,7 +3436,9 @@ bool LLVMBackend::ValueMayReachReturn(const llvm::Value* root, int depth,
                     const llvm::Function* callee = call->getCalledFunction();
                     if (callee == nullptr)
                     {
-                        if (unknownPointerResultMayReach && TypeHoldsPointer(call->getType()))
+                        if (leaves != nullptr && TypeHoldsPointer(call->getType()))
+                            leaves->Edges.push_back({ std::string(), 0 });   // never answered
+                        else if (unknownPointerResultMayReach && TypeHoldsPointer(call->getType()))
                             return true;
                         continue;
                     }
@@ -3173,14 +3455,12 @@ bool LLVMBackend::ValueMayReachReturn(const llvm::Value* root, int depth,
                                 if (visited.insert(call).second) work.push_back(call);
                                 break;
                             }
-                            if (ParameterMayReachReturn(callee, i, depth + 1))
-                            {
+                            // No break: a later position of the same argument may still be a leaf.
+                            if (ParameterMayReachReturn(callee, i, depth + 1, leaves))
                                 if (visited.insert(call).second) work.push_back(call);
-                                break;
-                            }
                         }
                     if (unknownPointerResultMayReach && passedTrackedValue
-                        && (!callee || callee->isDeclaration())
+                        && (!callee || (callee->isDeclaration() && leaves == nullptr))
                         && TypeHoldsPointer(call->getType())) return true;
                     continue;
                 }
@@ -4420,6 +4700,14 @@ bool LLVMBackend::IsOwnedTempValue(const NamedVariable& arg) const
         return false;
     }
 
+bool LLVMBackend::IsOwnedStructTempSince(const OwnedTempMark& mark, llvm::Value* alloca) const
+{
+        if (alloca == nullptr) return false;
+        for (size_t i = mark.Structs; i < pendingOwnedStructTemps.size(); ++i)
+            if (pendingOwnedStructTemps[i].Alloca == alloca) return true;
+        return false;
+    }
+
 bool LLVMBackend::IsOwnedClosureTemp(llvm::Value* value) const
 {
         for (const auto& e : pendingOwnedClosureTemps)
@@ -5077,12 +5365,13 @@ void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* k
         ClaimIntLaunderedPtrTemps(mark.Ptrs, keep);
         std::vector<PendingOwnedPtrTemp> ptrTemps;
         for (size_t i = mark.Ptrs; i < pendingOwnedPtrTemps.size(); ++i)
-            if (pendingOwnedPtrTemps[i].ConditionalSlot == nullptr
-                && pendingOwnedPtrTemps[i].Value != keep
-                && !(preserveReturnedPtrTemps
-                    && ValueMayReachReturn(pendingOwnedPtrTemps[i].Value, 0,
-                                           /*unknownPointerResultMayReach=*/true, keep)))
-                ptrTemps.push_back(pendingOwnedPtrTemps[i]);
+        {
+            if (pendingOwnedPtrTemps[i].ConditionalSlot != nullptr
+                || pendingOwnedPtrTemps[i].Value == keep) continue;
+            PendingOwnedPtrTemp temp = pendingOwnedPtrTemps[i];
+            if (preserveReturnedPtrTemps && !ShouldFreeReturnedPtrTemp(temp, keep)) continue;
+            ptrTemps.push_back(temp);
+        }
 
         TrimOwnedTempsSince(pendingOwnedStringTemps,  mark.Strings,  keep, pairValue);
         TrimOwnedTempsSince(pendingOwnedClosureTemps, mark.Closures, keep, pairValue);
@@ -5121,11 +5410,9 @@ void LLVMBackend::FlushConditionalPtrTempsSince(size_t from,
         for (size_t i = from; i < pendingOwnedPtrTemps.size(); ++i)
             if (pendingOwnedPtrTemps[i].ConditionalSlot != nullptr)
             {
-                if (!(preserveReturnedPtrTemps
-                    && ValueMayReachReturn(pendingOwnedPtrTemps[i].Value, 0,
-                                           /*unknownPointerResultMayReach=*/true,
-                                           pendingReturnValue)))
-                    temps.push_back(pendingOwnedPtrTemps[i]);
+                PendingOwnedPtrTemp temp = pendingOwnedPtrTemps[i];
+                if (!preserveReturnedPtrTemps || ShouldFreeReturnedPtrTemp(temp, pendingReturnValue))
+                    temps.push_back(temp);
             }
             else
                 pendingOwnedPtrTemps[write++] = pendingOwnedPtrTemps[i];

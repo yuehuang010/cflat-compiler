@@ -143,6 +143,42 @@ static CFlatParser::PostfixExpressionContext* SoleCxxConstructionPostfix(
     return nullptr;
 }
 
+// The sole postfix expression of a single-child chain, or null when an operator sits above it.
+static CFlatParser::PostfixExpressionContext* SoleChainPostfix(antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return nullptr;
+    if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node)) return postfix;
+    auto* context = dynamic_cast<antlr4::ParserRuleContext*>(node);
+    if (context == nullptr) return nullptr;
+    if (context->children.size() == 1) return SoleChainPostfix(context->children[0]);
+    if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(context);
+        primary != nullptr && primary->expression() != nullptr)
+        return SoleChainPostfix(primary->expression());
+    return nullptr;
+}
+
+// True when a call suffix (`(...)`) sits anywhere below `node` other than `skip`: a nested call.
+static bool HasCallSuffixBelow(antlr4::tree::ParseTree* node,
+                               const CFlatParser::PostfixExpressionContext* skip)
+{
+    if (node == nullptr) return false;
+    if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node);
+        postfix != nullptr && postfix != skip && !postfix->argumentExpressionList().empty())
+        return true;
+    for (auto* child : node->children)
+        if (HasCallSuffixBelow(child, skip)) return true;
+    return false;
+}
+
+// `construct_at(slot, f(args))` where the initializer is ONE call with no nested call: the only
+// call may build its C++ class result straight into the slot (the declaration-site rule).
+static bool IsSingleCallWithoutNestedCall(antlr4::tree::ParseTree* node)
+{
+    auto* top = SoleChainPostfix(node);
+    if (top == nullptr || top->argumentExpressionList().size() != 1) return false;
+    return !HasCallSuffixBelow(top, top);
+}
+
 static bool IsSoleCxxClassConstruction(const LLVMBackend& compiler,
                                        antlr4::tree::ParseTree* node)
 {
@@ -1407,6 +1443,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 {
                     parsed.Storage = retTemp;
                     parsed.IsRvalue = true;
+                    parsed.IsCxxPrvalueTemp = !parsed.IsExplicitMove;
                 }
                 NormalizeCxxRvalueReferenceArgument(ctx, parsed);
                 return parsed;
@@ -1431,6 +1468,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
 
             int functionArgCounter = 0;
             bool nullConditionalPending = false;
+            // The owned temp (`new` or an owning call result) the chain's first member link runs on.
+            // A `?.` chain ending on a scalar releases it at the end of the full expression (see the
+            // end of the whole-chain merge). A call made on the chain (ncChainCalled) keeps the root
+            // on its own this-argument rule instead.
+            llvm::Value* ncChainRootTemp = nullptr;
+            bool ncChainRootChecked = false;
+            bool ncChainCalled = false;
             // HResult `?.`/`?->` chaining: armed by [PFX-1] when the receiver is an HResult<T*>.
             // structVar is redirected to the unwrapped `.value` object; hresultChainStorage holds
             // the source HResult so the call dispatch can branch on failed() and propagate hr.
@@ -1503,14 +1547,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             // The block holding the FIRST '?.' branch: it dominates the merge, so owned temps
             // created inside the chain are re-homed there instead of freed at the merge.
             llvm::BasicBlock* ncHoistBlock = nullptr;
-            // releaseNewTemp: only a SCALAR field read may free an owned new-temp receiver at the
-            // merge; a call or non-scalar member can hand out a pointer into it (see PFX-1b).
+            // releaseNewTemp: only a SCALAR field read may free an owned temp held by a link at the
+            // merge; the chain root is left to the whole-chain merge (end of chain). A call or
+            // non-scalar member can hand out a pointer into it (see PFX-1b).
             auto ncEnterGuard = [&](llvm::Value* testPtr, bool releaseNewTemp = false)
             {
                 auto* compiler = Compiler(ctx);
                 if (!ncTempMark.has_value())
                     ncTempMark = compiler->MarkOwnedTemps();
-                if (releaseNewTemp && compiler->IsOwnedNewTemp(testPtr))
+                if (releaseNewTemp && testPtr != ncChainRootTemp && compiler->IsOwningPtrTempValue(testPtr))
                     compiler->RegisterOwnedPtrTemp(testPtr);
                 if (ncHoistBlock == nullptr)
                     ncHoistBlock = compiler->builder->GetInsertBlock();
@@ -1851,8 +1896,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     {
                     case CFlatParser::LeftBracket:
                     case CFlatParser::RightBracket:
-                    case CFlatParser::LeftParen:
                     case CFlatParser::RightParen: { prevToken = tokenType; break; }
+                    case CFlatParser::LeftParen:
+                    {
+                        // A call made ON the chain (after its first member link) hands the root to the
+                        // call's own this-argument rule; the call that produced the root does not.
+                        if (ncChainRootChecked) ncChainCalled = true;
+                        prevToken = tokenType;
+                        break;
+                    }
                     // [PFX-1] member-access operator (. -> ?.): auto-deref the receiver (pointer or
                     // embedded struct) into structVar so the next identifier resolves against it.
                     case CFlatParser::Dot:
@@ -1863,6 +1915,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             LogErrorContext(ctx, "a void call result cannot be used as a chain receiver");
                         prevToken = tokenType;
                         nullConditionalPending = (tokenType == CFlatParser::QuestionDot);
+                        if (!ncChainRootChecked)
+                        {
+                            ncChainRootChecked = true;
+                            if (namedVar.TypeAndValue.Pointer && namedVar.Primary != nullptr
+                                && Compiler(ctx)->IsOwningPtrTempValue(namedVar.Primary))
+                                ncChainRootTemp = namedVar.Primary;
+                        }
                         // A parenthesized pointer join carries its element name on the joined
                         // LLVM value even when the expression wrapper has no NamedVariable type.
                         if (namedVar.TypeAndValue.TypeName.empty() && namedVar.Primary != nullptr
@@ -1870,21 +1929,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         {
                             std::string elementType =
                                 Compiler(ctx)->FindValueElementTypeName(namedVar.Primary);
+                            // Both `??` and `?:` joins: the pointee the arms agree on (W4, T236).
                             if (elementType.empty())
-                                if (const auto* join = Compiler(ctx)->FindNullCoalesceJoin(namedVar.Primary))
-                                {
-                                    for (const auto& arm : join->Arms)
-                                    {
-                                        const auto armType = InferTernaryArmType(arm.Value);
-                                        if (!armType.Pointer || armType.TypeName.empty()) continue;
-                                        if (elementType.empty()) elementType = armType.TypeName;
-                                        else if (elementType != armType.TypeName)
-                                        {
-                                            elementType.clear();
-                                            break;
-                                        }
-                                    }
-                                }
+                                elementType = JoinedPointerArmType(namedVar.Primary).TypeName;
                             if (!elementType.empty())
                             {
                                 namedVar.TypeAndValue.TypeName = elementType;
@@ -5114,17 +5161,35 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             compiler->lastCxxRetTemp_ = nullptr;
                             compiler->lastCxxRetValue_ = nullptr;
                             auto ownedTempMark = compiler->MarkOwnedTemps();
+                            // A single call producing this C++ class by value builds straight into the
+                            // slot (armed like a declaration initializer), so no temporary is moved.
+                            const bool armSlotSret = !constructTargetIsCoreUnique && !destType.Pointer
+                                && compiler->IsForeignNontrivialCxxClass(destType.TypeName)
+                                && compiler->ReturnsViaCxxSret(destType.TypeName)
+                                && IsSingleCallWithoutNestedCall(callArgs[1]->assignmentExpression());
+                            if (armSlotSret)
+                            {
+                                compiler->pendingCxxSretDest_ = slotValue;
+                                compiler->pendingCxxSretTypeName_ = destType.TypeName;
+                            }
                             auto sourceNV = ParseAssignmentExpressionNamed(
                                 callArgs[1]->assignmentExpression());
-                            auto sourceValue = sourceNV.Primary
-                                ? sourceNV.Primary : LoadNamedVariable(sourceNV);
+                            const bool builtInPlace = armSlotSret
+                                && compiler->pendingCxxSretDest_ == nullptr;
+                            if (armSlotSret)
+                            {
+                                compiler->pendingCxxSretDest_ = nullptr;
+                                compiler->pendingCxxSretTypeName_.clear();
+                            }
+                            auto sourceValue = builtInPlace ? nullptr
+                                : sourceNV.Primary ? sourceNV.Primary : LoadNamedVariable(sourceNV);
                             const bool consumesInferredSink = !destType.Pointer
                                 && compiler->IsForeignNontrivialCxxClass(destType.TypeName)
                                 && sourceNV.TypeAndValue.IsOwningSink
                                 && compiler->OwningSinkConsumesConcrete(sourceNV.TypeAndValue);
                             sourceNV.IsRvalue = sourceNV.IsRvalue || sourceNV.IsExplicitMove
                                 || sourceNV.TypeAndValue.IsMove || consumesInferredSink;
-                            if (sourceValue == nullptr)
+                            if (sourceValue == nullptr && !builtInPlace)
                             {
                                 LogErrorContext(ctx, "construct_at second argument does not produce a value");
                                 namedVar = {};
@@ -5146,7 +5211,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         slotNV.CallerName, slotNV.FieldName);
                             };
 
-                            if (!destType.Pointer
+                            if (builtInPlace)
+                            {
+                                reviveDirectSlot();
+                            }
+                            else if (!destType.Pointer
                                 && compiler->IsForeignNontrivialCxxClass(destType.TypeName))
                             {
                                 EmitForeignCxxValueIntoSlot(destType, slotValue, sourceNV, sourceValue,
@@ -6787,6 +6856,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     Compiler(ctx)->RegisterOwnedReturnTemp(
                                         result, functionName, Compiler(ctx)->lastCallReturnType);
                                 }
+                                // A borrowed argument (or copy of an owning local) bound to a declared
+                                // `move` parameter is the direct call's SLOT-MOVE refusal.
+                                for (size_t i = 0; i < pcount && i < argNVs.size(); i++)
+                                    if (funcPtrTV.FuncPtrParams[i].IsMove && funcPtrTV.FuncPtrParams[i].Pointer)
+                                        Compiler(ctx)->DiagnoseBorrowedMoveSinkArg(functionName,
+                                            std::format("{}", i), argNVs[i]);
                                 // A lambda literal's INFERRED owning sinks ride the funcptr type;
                                 // transfer the caller's source exactly as a direct call does.
                                 Compiler(ctx)->ApplyFuncPtrSinkTransfer(
@@ -7143,6 +7218,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
                                     argVar.IsNormalizedCxxXvalue = argNV.IsNormalizedCxxXvalue;
                                     argVar.IsRvalue = argNV.IsRvalue;
+                                    argVar.IsCxxPrvalueTemp = argNV.IsCxxPrvalueTemp;
                                     argVar.IsCxxDirectConstruction = argNV.IsCxxDirectConstruction;
                                     argVar.CxxDirectConstructionUsesBraces =
                                         argNV.CxxDirectConstructionUsesBraces;
@@ -7549,6 +7625,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             {
                                 // LoadNamedVariable is not called for receivers, so check here.
                                 CheckMovedReceiver(structVar);
+                                // The method may re-initialize any field under its receiver path.
+                                Compiler(ctx)->RecordNullEvent(nulldf::EventKind::ClearFields,
+                                    structVar.FieldPathText.empty() ? structVar.CallerName : structVar.FieldPathText, 0, 0);
                                 LLVMBackend::NamedVariable argumentNamedVar = structVar; // Copy;
                                 argumentNamedVar.TypeAndValue.VariableName = "";
                                 // An owning-value rvalue temp receiver is dropped after the call - destruct it.
@@ -8097,9 +8176,57 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         (cxxDirectConstructionSink || directConstructionParent)
                                         && IsSoleCxxClassConstruction(
                                             *Compiler(ctx), namedArgument->assignmentExpression());
-                                    const bool hasLaterConstructionSibling =
-                                        directClassConstructionArgument
-                                        && argIdx + 1 < namedArgCtx.size();
+                                    auto isLiteralArgumentTree = [&](auto&& self,
+                                                                     antlr4::tree::ParseTree* node) -> bool {
+                                        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+                                            return primary->Constant() != nullptr
+                                                || !primary->StringLiteral().empty();
+                                        auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+                                        return rule != nullptr && rule->children.size() == 1
+                                            && self(self, rule->children.front());
+                                    };
+                                    auto laterParameterIsByValue = [&](size_t parameterIndex) {
+                                        const std::string ownerType = structVar.BaseType != nullptr
+                                            ? structVar.TypeAndValue.TypeName : std::string();
+                                        if (cxxTemplateWrapper)
+                                        {
+                                            const std::string templateName = ownerType.empty()
+                                                ? functionName : primaryIdentifier;
+                                            return Compiler(ctx)->IsCxxFunctionTemplateParameterByValue(
+                                                templateName, ownerType, parameterIndex, namedArgCtx.size());
+                                        }
+                                        if (cxxFreeWrapper)
+                                            return Compiler(ctx)->IsCxxFreeFunctionParameterByValue(
+                                                functionName, parameterIndex, namedArgCtx.size());
+                                        if (cxxNonTemplateMemberWrapper)
+                                            return Compiler(ctx)->IsCxxMemberFunctionParameterByValue(
+                                                structVar.TypeAndValue.TypeName, primaryIdentifier,
+                                                parameterIndex, namedArgCtx.size());
+                                        if (directConstructionParent)
+                                            return Compiler(ctx)->IsCxxConstructorParameterByValue(
+                                                functionName, parameterIndex, namedArgCtx.size());
+                                        if (funcSym != nullptr && funcSym->IsCxx
+                                            && parameterIndex < declaredIdx.size()
+                                            && declaredIdx[parameterIndex] >= 0)
+                                            return !Compiler(ctx)->IsCxxReferenceParameter(
+                                                *funcSym, static_cast<size_t>(declaredIdx[parameterIndex]));
+                                        return false;
+                                    };
+                                    bool hasLaterConstructionSibling = false;
+                                    for (size_t siblingIndex = argIdx + 1;
+                                         directClassConstructionArgument && siblingIndex < namedArgCtx.size();
+                                         ++siblingIndex)
+                                    {
+                                        auto* sibling = namedArgCtx[siblingIndex];
+                                        if (sibling->assignmentExpression() == nullptr
+                                            || !isLiteralArgumentTree(isLiteralArgumentTree,
+                                                sibling->assignmentExpression())
+                                            || !laterParameterIsByValue(siblingIndex))
+                                        {
+                                            hasLaterConstructionSibling = true;
+                                            break;
+                                        }
+                                    }
                                     if (hasLaterConstructionSibling
                                         && cxxDirectConstructionCallOrderSafe_ != nullptr)
                                         *cxxDirectConstructionCallOrderSafe_ = false;
@@ -8126,6 +8253,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             namedArgument->assignmentExpression());
                                     });
                                     NormalizeCxxReferenceNamed(namedArgument, argNV);
+                                    // T235: a C++ class prvalue before a direct construction keeps it out of
+                                    // the wrapper, whose by-value param would move the prvalue (clang: 0).
+                                    if (cxxDirectConstructionCallOrderSafe_ != nullptr && argNV.IsRvalue
+                                        && !argNV.IsCxxDirectConstruction && !argNV.TypeAndValue.Pointer
+                                        && Compiler(ctx)->IsCxxRecord(argNV.TypeAndValue.TypeName))
+                                        *cxxDirectConstructionCallOrderSafe_ = false;
                                     if (defaultArgument)
                                         MaterializeDefaultArgument(namedArgument, argNV, argExpectedDest);
                                     argExpectedScope.reset();
@@ -8205,6 +8338,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     LLVMBackend::NamedVariable argVar;
                                     argVar.OriginalArgumentType = argNV.TypeAndValue;
                                     argVar.HasOriginalArgumentType = true;
+                                    argVar.IsTopLevelConst = argNV.IsTopLevelConst;
                                     argVar.IsCxxDirectConstruction = argNV.IsCxxDirectConstruction;
                                     argVar.CxxDirectConstructionUsesBraces =
                                         argNV.CxxDirectConstructionUsesBraces;
@@ -8243,6 +8377,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
                                     argVar.IsNormalizedCxxXvalue = argNV.IsNormalizedCxxXvalue;
                                     argVar.IsRvalue = argNV.IsRvalue;
+                                    argVar.IsCxxPrvalueTemp = argNV.IsCxxPrvalueTemp;
                                     argVar.IsDefaultArgument = argNV.IsDefaultArgument;
                                     argVar.CxxParamLastUse = argNV.CxxParamLastUse;
                                     argVar.CxxLvalueKind =
@@ -9021,7 +9156,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         && !arg.InferSourceTypeName.empty())
                                         ctorTypes.back().TypeName = arg.InferSourceTypeName;
                                     TypeUntypedCtorArg(ctorTypes.back(), value,
-                                        arg.LiteralIdentitySuffixed ? arg.LiteralIdentity : std::string());
+                                        arg.LiteralIdentitySuffixed ? arg.LiteralIdentity : std::string(),
+                                        &arg.TypeAndValue);
                                     if (arg.TypeAndValue.TypeName.empty() && !arg.TypeAndValue.Pointer
                                         && arg.Storage != nullptr && !arg.IsRvalue
                                         && arg.CxxLvalueKind == 1
@@ -9051,6 +9187,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         && (why.starts_with("constructor '")
                                             || why.starts_with("no overload of '"));
                                 }
+                                if (const std::string refusal =
+                                        compiler->CxxConstructorRvalueRefBindRefusal(
+                                            functionName, arguments);
+                                    !refusal.empty())
+                                    LogErrorContext(ctx, refusal);
                                 // A constructor template can outrank the listed pick: clang
                                 // resolves `T(args)`, the listed pick stays the fallback.
                                 bool nullPointerCandidate = false;
@@ -9587,6 +9728,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         namedVar = {};
                     }
                 }
+
+                // A scalar final read cannot borrow the root temp, so the root is released at the end
+                // of the full expression, after every link. A pointer or aggregate result may point
+                // into it and stays unregistered, exactly as the `->` form leaves it (see PFX-1b).
+                if (ncChainRootTemp != nullptr && !ncChainCalled && addressOfOperandDepth_ == 0
+                    && namedVar.Primary != nullptr && !namedVar.TypeAndValue.Pointer
+                    && !namedVar.TypeAndValue.IsAlias && !namedVar.IsAliasBorrow
+                    && (namedVar.Primary->getType()->isIntegerTy()
+                        || namedVar.Primary->getType()->isFloatingPointTy()))
+                    compiler->RegisterOwnedPtrTemp(ncChainRootTemp);
             }
 
             // [PFX-2-dangle] The chain ended on a member name that was never called. For a method

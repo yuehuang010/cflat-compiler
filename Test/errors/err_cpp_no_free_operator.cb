@@ -101,5 +101,22 @@ extern int main()
         cppfopun.Two u = default;
         auto r = -u;
     }
+    // T219: explicit class conversions remain unavailable to free operators.
+    expect_error("no operator '+'") {
+        t219.ExplicitSource a = default;
+        t219.ExplicitTarget b = default;
+        int rejected = a + b;
+    }
+    expect_error("no operator '-'") {
+        t219.ExplicitCtorTarget a = default;
+        t219.ExplicitCtorSource b = default;
+        int rejected = a - b;
+    }
+    // The converting constructor and conversion function are ambiguous in clang too.
+    expect_error("ambiguous") {
+        t219.AmbigSource a = default;
+        t219.AmbigSource b = default;
+        int rejected = a + b;
+    }
     return 0;
 }

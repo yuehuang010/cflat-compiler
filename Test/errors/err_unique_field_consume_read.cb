@@ -1,0 +1,69 @@
+// T230: a plain '=' from a `unique` field (or a `move` of one) consumes the SOURCE field, exactly as
+// `move` does: the field path is null like a moved local, so a later dereference is refused. Before
+// T230 the consume was not recorded and the dereference segfaulted at run time.
+struct P { int v = 0; ~P() { } };
+struct S { unique P* p = nullptr; };
+
+expect_error("dereference of moved variable 's.p'") {
+    void explicitFieldMoveThenRead()
+    {
+        S s = default;
+        s.p = new P();
+        S t = default;
+        t.p = move s.p;
+        int r = s.p->v;
+    }
+}
+
+expect_error("dereference of moved variable 's.p'") {
+    void implicitFieldMoveThenRead()
+    {
+        S s = default;
+        s.p = new P();
+        S t = default;
+        t.p = s.p;
+        int r = s.p->v;
+    }
+}
+
+// Nested paths are keyed in full: re-initializing the sibling `o.c.p` does not revive `o.b.p`.
+struct O { S b; S c; };
+expect_error("dereference of moved variable 'o.b.p'") {
+    void nestedSiblingReinitThenRead()
+    {
+        O o = default;
+        o.b.p = new P();
+        S t = default;
+        t.p = o.b.p;
+        o.c.p = new P();
+        int r = o.b.p->v;
+    }
+}
+
+// A consume on one path only: the read after the join is refused, as a conditional local move is.
+expect_error("dereference of moved variable 's.p'") {
+    void conditionalFieldMoveThenRead(bool c)
+    {
+        S s = default;
+        s.p = new P();
+        S t = default;
+        if (c) { t.p = s.p; }
+        int r = s.p->v;
+    }
+}
+
+// A plain '=' from an owning local consumes it: the later dereference is refused.
+expect_error("dereference of moved variable 'a'") {
+    void localImplicitMoveThenRead()
+    {
+        unique P* a = new P();
+        unique P* b = nullptr;
+        b = a;
+        int r = a->v;
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

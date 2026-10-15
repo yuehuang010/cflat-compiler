@@ -646,6 +646,12 @@ llvm::Value* LLVMBackend::CreateCxxFieldGEP(const StructData& data, llvm::Value*
 llvm::Value* LLVMBackend::CreateCxxFieldGEP(llvm::IRBuilder<>& irBuilder, const StructData& data,
                                              llvm::Value* object, unsigned index, std::string name)
 {
+        // Keep mutability on the field address after constness propagates from its receiver.
+        auto markMutableField = [&](llvm::GetElementPtrInst* gep) {
+            if (index < data.StructFields.size() && data.StructFields[index].IsCxxMutableField)
+                gep->setMetadata("cflat.cxx.mutablefield", llvm::MDNode::get(*context, {}));
+            return gep;
+        };
         if (!data.CxxOffsetLayout || index >= data.CxxFieldOffsets.size())
         {
             if (llvm::isa<llvm::GlobalVariable>(object))
@@ -653,9 +659,10 @@ llvm::Value* LLVMBackend::CreateCxxFieldGEP(llvm::IRBuilder<>& irBuilder, const 
                 llvm::Value* idxs[] = { irBuilder.getInt32(0), irBuilder.getInt32(index) };
                 auto* gep = llvm::GetElementPtrInst::CreateInBounds(data.StructType, object, idxs);
                 irBuilder.Insert(gep, name);
-                return gep;
+                return markMutableField(gep);
             }
-            return irBuilder.CreateStructGEP(data.StructType, object, index, name);
+            return markMutableField(llvm::cast<llvm::GetElementPtrInst>(
+                irBuilder.CreateStructGEP(data.StructType, object, index, name)));
         }
         llvm::GetElementPtrInst* gep = nullptr;
         if (llvm::isa<llvm::GlobalVariable>(object))
@@ -675,7 +682,7 @@ llvm::Value* LLVMBackend::CreateCxxFieldGEP(llvm::IRBuilder<>& irBuilder, const 
             llvm::ConstantAsMetadata::get(builder->getInt32(index))
         };
         gep->setMetadata("cflat.cxx.field", llvm::MDNode::get(*context, operands));
-        return gep;
+        return markMutableField(gep);
 }
 
 void LLVMBackend::MarkCxxConstReferent(llvm::Value* referenceResult)
@@ -693,6 +700,7 @@ bool LLVMBackend::IsCxxConstReferent(llvm::Value* destination) const
 
 void LLVMBackend::MarkCxxConstFieldAccess(llvm::Value* fieldAddress)
 {
+        if (IsCxxMutableFieldAccess(fieldAddress)) return;
         if (auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(fieldAddress))
         {
             cxxConstGlobalSymbols_.insert(global->getName().str());
@@ -708,10 +716,22 @@ bool LLVMBackend::IsCxxConstFieldAccess(llvm::Value* fieldAddress) const
         return inst != nullptr && inst->getMetadata("cflat.cxx.constfield") != nullptr;
 }
 
+bool LLVMBackend::IsCxxMutableFieldAccess(llvm::Value* fieldAddress) const
+{
+        auto* inst = llvm::dyn_cast_or_null<llvm::Instruction>(fieldAddress);
+        if (inst != nullptr && inst->getMetadata("cflat.cxx.mutablefield") != nullptr)
+            return true;
+        const TypeAndValue* field = FindDeclaredFieldTypeAndValueForStorage(fieldAddress);
+        return field != nullptr && field->IsCxxMutableField;
+}
+
 int LLVMBackend::CxxConstReceiverKind(const NamedVariable& receiver) const
 {
         const TypeAndValue& t = receiver.TypeAndValue;
         if (t.IsCxxMutableField && !t.Pointer && !t.IsCxxRefToPointer) return 0;
+        const bool functionPointer = t.IsFunctionPointer
+            || (receiver.HasOriginalArgumentType && receiver.OriginalArgumentType.IsFunctionPointer);
+        if (receiver.IsTopLevelConst && (!t.Pointer || functionPointer)) return 1;
         for (llvm::Value* v : { receiver.Storage, receiver.Primary })
         {
             if (v == nullptr || !v->getType()->isPointerTy()) continue;

@@ -1552,6 +1552,8 @@ public:
         bool MoveParamSinkArgument = false;
         bool BorrowedPointer = false;
         std::string BorrowedOrigin;
+        // BorrowedOrigin names a live OWNING local the arm copied (not a borrowed parameter).
+        bool BorrowedFromOwningLocal = false;
         std::string DeferredDiagnostic;
     };
 
@@ -1566,6 +1568,8 @@ public:
         llvm::Type* BaseType = nullptr;  // The type of the value, even if it is a pointer.
         llvm::Value* Primary = nullptr;  // The value or result
         llvm::Value* Storage = nullptr;  // The container holding the value, used to load or store.
+        // The declaration's top-level const, retained for C++ reference overload selection.
+        bool IsTopLevelConst = false;
         llvm::Value* AddressedUniqueSlot = nullptr;
         std::string AddressedUniqueTypeName;
         llvm::Type* UnionFieldType = nullptr;  // When non-null: load/store this storage as this type (union field access).
@@ -1624,6 +1628,8 @@ public:
         // True only for a value-producing expression. Named variables, fields, elements, aliases,
         // and dereferences remain lvalues even when their LLVM value has no storage of its own.
         bool IsRvalue = false;
+        // Storage is this argument's C++ prvalue temp (call, operator or ctor result), not a named slot.
+        bool IsCxxPrvalueTemp = false;
         // Direct foreign C++ construction deferred into a generated call wrapper.
         bool IsCxxDirectConstruction = false;
         bool CxxDirectConstructionUsesBraces = false;
@@ -2417,10 +2423,24 @@ public:
         llvm::BasicBlock* Block = nullptr;
     };
 
+    /*
+     * The hidden owner of a runtime '??' fallback: an entry slot holding the `new` allocation the
+     * RHS built, null when the LHS was taken. The join's value stays a borrow; the slot is freed at
+     * the scope exit of the declaration it binds to, and only when no copy of the block escapes.
+     */
+    struct NullCoalesceFallback
+    {
+        llvm::AllocaInst* Slot = nullptr;
+        std::string TypeName;
+        uint64_t AllocAlign = 0;
+    };
+
     struct NullCoalesceJoin
     {
         llvm::Value* Joined = nullptr;
         std::vector<NullCoalesceJoinArm> Arms;
+        // Set (Slot non-null) when the runtime fallback arm is a bare `new` this join owns.
+        NullCoalesceFallback Fallback;
     };
 
     // A value read from a unique field keeps the field slot that must be nulled when the value is
@@ -2456,6 +2476,17 @@ public:
     std::vector<NullCoalesceJoin> nullCoalesceJoins_;
 
     void RegisterNullCoalesceJoin(llvm::Value* joined, std::vector<NullCoalesceJoinArm> arms);
+    // Attach the fallback owner of a registered '??' join (no-op for an unregistered value).
+    void AttachNullCoalesceFallback(llvm::Value* joined, const NullCoalesceFallback& fallback);
+    // A declaration `T* q = <join>` adopts the join's fallback owner: a hidden owning local in the
+    // current scope whose runtime flag is patched true after the walk when no copy of q escapes.
+    void BindNullCoalesceFallbackOwner(llvm::Value* joined, llvm::AllocaInst* declSlot,
+                                       const TypeAndValue& declType);
+    // True when a copy of the block `root` holds may leave the frame or be stored elsewhere.
+    // An explicit delete through this slot consumes the block: its fallback owner never releases.
+    void NoteFallbackRootConsumed(const llvm::Value* storage);
+    bool FallbackSlotMayEscape(const llvm::AllocaInst* root,
+                               const std::unordered_set<const llvm::Value*>& releaseLoads);
 
     const NullCoalesceJoin* FindNullCoalesceJoin(const llvm::Value* value) const;
 
@@ -3125,6 +3156,34 @@ private:
     };
     std::vector<CxxThisEscapeGate> cxxThisEscapeGates_;
     void ResolveCxxThisEscapeGates();
+    // A callee edge the return-keep walk could not answer yet: `Callee` is the function's NAME
+    // (Function objects are replaced by the link), empty for an indirect call (never answered).
+    struct ReturnReachEdge
+    {
+        std::string Callee;
+        unsigned ArgIndex = 0;
+    };
+    // Leaves collected by a return-keep walk (see ValueMayReachReturn). Unresolved = a limit was
+    // hit, so the walk cannot be answered later either and the temp is kept.
+    struct ReturnReachLeaves
+    {
+        std::vector<ReturnReachEdge> Edges;
+        bool Unresolved = false;
+    };
+    // An arm temp whose free waits on the end-of-module answer of its leaf edges. Init is the
+    // entry-block store of the i1 gate (false = keep); it becomes true only when every edge proves.
+    struct DeferredReturnKeepGate
+    {
+        llvm::Value* Init = nullptr;
+        std::vector<ReturnReachEdge> Edges;
+    };
+    std::vector<DeferredReturnKeepGate> deferredReturnKeepGates_;
+    void ResolveDeferredReturnKeepGates();
+    bool LeafEdgesProveNoReturn(const std::vector<ReturnReachEdge>& edges,
+                                std::set<std::pair<std::string, unsigned>>& seen);
+    // Return-flush verdict for one ledgered pointer temp: true = free now (possibly behind a gate
+    // on `temp.ReleaseGate`), false = keep. See the definition for the three-way split.
+    bool ShouldFreeReturnedPtrTemp(PendingOwnedPtrTemp& temp, const llvm::Value* pendingReturn);
     // One per adoption of a block from another local slot (`b = a`, `b = move a`): an entry-block
     // i1 stored false (the adopter does not own), patched true after the walk when no alias of the
     // source slot (or of a slot the source itself adopted from) can reach the transferring load.
@@ -3224,6 +3283,14 @@ private:
                                          const std::string& parameterName,
                                          const std::string& functionName,
                                          const std::string& declaredName) const;
+    void LogOwningLocalCopyMoveSinkError(const std::string& sourceName,
+                                         const std::string& ownerName,
+                                         const std::string& parameterName,
+                                         const std::string& functionName) const;
+    // SLOT-MOVE check for one `move` sink argument: a borrowed parameter, or a copy of a live
+    // owning local, bound to the sink. Called by the direct and the indirect call sites.
+    void DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
+                                     const std::string& paramName, const NamedVariable& arg);
     // "'Box' is a generic type; type arguments are required ..." for bare `Box` and `Box<>`.
     void LogGenericTypeArgsRequired(const std::string& displayName,
                                     const std::vector<std::string>& parameterNames) const;
@@ -3733,6 +3800,7 @@ private:
     bool IsCxxConstReferent(llvm::Value* destination) const;
     void MarkCxxConstFieldAccess(llvm::Value* fieldAddress);
     bool IsCxxConstFieldAccess(llvm::Value* fieldAddress) const;
+    bool IsCxxMutableFieldAccess(llvm::Value* fieldAddress) const;
     // A const C++ member whose non-const twin owns the CFlat name registers under this name.
     static std::string CxxConstTwinName(const std::string& member)
     {
@@ -4709,6 +4777,14 @@ private:
     void GateOwnFlagAdoption(const NamedVariable& nv, llvm::Value* stored);
     // After the walk: a gate becomes true when no alias-leaving use of its slot reaches it.
     void ResolveOwnedReleaseGates();
+    // One per '??' fallback owner bound to a declaration: the entry-block i1 is stored false and
+    // patched true after the walk when FallbackSlotMayEscape(Root) is false.
+    struct FallbackOwnerGate
+    {
+        llvm::WeakVH Root;
+        llvm::WeakVH Init;
+    };
+    std::vector<FallbackOwnerGate> fallbackOwnerGates_;
     // The uses of `slot` after which a copy of the block it holds may live on elsewhere.
     std::vector<const llvm::Instruction*> OwnedSlotAliasPoints(
         const llvm::AllocaInst* slot, const std::unordered_set<const llvm::Value*>& leavingLoads);
@@ -4788,6 +4864,9 @@ private:
     // chain or ternary whose arm was one. The temp-registration sites test this, never
     // isa<CallInst> directly, or a merged result silently stops being registered and leaks.
     bool IsProducedTempValue(llvm::Value* value) const;
+    // True when a by-value C++ class argument already is a prvalue temp of this full expression
+    // (owned, of the parameter's struct type): C++17 elision binds it, no copy or move.
+    bool IsOwnedCxxPrvalueArgument(const NamedVariable& arg, llvm::Type* structTy) const;
 
     // Carry produced-temp identity through a value join, including nested ternaries.
     void PropagateProducedTempValue(llvm::Value* from, llvm::Value* to);
@@ -4844,6 +4923,10 @@ private:
                                             bool mayUnwind);
     void PreserveRetainedJoinArmTempsBeforeCall(const llvm::Function* callee,
                                                 llvm::ArrayRef<llvm::Value*> args);
+    // Pre-call form for a direct CFlat callee with a body: a bare owning `new` argument it does
+    // not retain is pending before the invoke, so its landing pad frees it (as a `??` arm does).
+    void RegisterDirectOwningPtrArgsBeforeCall(const llvm::Function* callee,
+                                               llvm::ArrayRef<llvm::Value*> args);
     void RegisterCxxGatedOwningPtrArg(llvm::Value* argVal, const llvm::Function& callee,
                                       unsigned argIndex);
 
@@ -5089,7 +5172,11 @@ private:
      * Unknown - no callee, a declaration, an unreadable body, recursion - answers FALSE, which
      * is this guard family's ratified polarity.
      */
-    bool ParameterMayReachReturn(const llvm::Function* fn, unsigned argIndex, int depth = 0);
+    // With `leaves` (return-keep flush only) a callee whose body is not complete YET (declared
+    // later, or the function being emitted) is recorded as a leaf instead of answered FALSE; the
+    // caller answers the leaves at end of module (ResolveDeferredReturnKeepGates).
+    bool ParameterMayReachReturn(const llvm::Function* fn, unsigned argIndex, int depth = 0,
+                                 ReturnReachLeaves* leaves = nullptr);
 
     // True only when a bare pointer parameter reaches a direct borrowing-container element sink
     // whose receiver names memory that outlives the callee frame. Unknown answers are false.
@@ -5101,7 +5188,8 @@ private:
     // OwningPtrProvablyEscapes is not: the query is rare and a body may still be growing.
     bool ValueMayReachReturn(const llvm::Value* root, int depth,
                              bool unknownPointerResultMayReach = false,
-                             const llvm::Value* pendingReturnValue = nullptr);
+                             const llvm::Value* pendingReturnValue = nullptr,
+                             ReturnReachLeaves* leaves = nullptr);
 
     /*
      * The RETURN-IDENTITY ALIAS PROOF: strictly stronger than ParameterMayReachReturn ("one path
@@ -5533,6 +5621,8 @@ private:
     }
 
     OwnedTempMark MarkOwnedTemps() const;
+    // True when `alloca` is an owned struct temp registered at or after `mark`.
+    bool IsOwnedStructTempSince(const OwnedTempMark& mark, llvm::Value* alloca) const;
     void HoistOwnedPtrTempsForAddress(const OwnedTempMark& mark, llvm::Value* address,
                                       llvm::BasicBlock* hoistTo, bool includeBareNew = false);
 
@@ -6284,6 +6374,8 @@ private:
     bool IsCxxMemberFunctionParameterByValue(const std::string& ownerType,
                                              const std::string& memberName,
                                              size_t parameterIndex, size_t arity) const;
+    bool IsCxxConstructorParameterByValue(const std::string& typeName,
+                                           size_t parameterIndex, size_t arity) const;
     bool HasCxxForwardingReferenceTemplate(const std::string& qualifiedName) const;
     bool IsCxxNamespacePath(const std::string& name) const;
     // Broader fallback for namespace paths whose declarations were not harvested at import.
@@ -9820,6 +9912,8 @@ public:
     // A C++ record with a non-explicit conversion operator to a non-primitive type (libc++
     // `__val_expr::operator valarray<T>()`): copy-initializing a class from it is clang's call.
     bool HasImplicitClassConversionOperator(const std::string& sourceType);
+    // A C++ record with a non-explicit constructor (or ctor template) callable with one argument.
+    bool HasCxxImplicitConvertingCtor(const std::string& targetType);
     // clang's std::is_convertible<S&&, P*> for a class xvalue at a P* parameter; cached per pair.
     bool HasImplicitClassPointerConversion(const std::string& sourceType,
                                            const std::string& pointeeType, bool pointeeConst);
@@ -9974,6 +10068,10 @@ public:
                                             const std::vector<NamedVariable>* argVars = nullptr,
                                             bool allowExplicit = true,
                                             bool* nullPointerCandidate = nullptr) const;
+    bool CxxConstructorThunkParameterIsReference(const std::string& typeName,
+                                                 const std::vector<NamedVariable>& arguments,
+                                                 size_t index, bool rvalueReference,
+                                                 bool& isReference);
     // Preserve CFlat's explicit single-float to integer refusal when every arity-compatible ctor
     // requires that conversion. Other unresolved constructor sets may be delegated to clang.
     bool CxxCtorSetRequiresFloatToInteger(const std::string& typeName,
@@ -10002,6 +10100,8 @@ public:
     std::string CxxConstructorCopySinkError(
         const CxxClassInfo::Structor* selected,
         const std::vector<NamedVariable>& arguments) const;
+    std::string CxxConstructorRvalueRefBindRefusal(
+        const std::string& typeName, const std::vector<NamedVariable>& arguments) const;
     std::string ExplicitCxxConstructorBlocking(const std::string& typeName,
                                                const std::vector<TypeAndValue>& argTypes);
     // Verdict of the one implicit user-defined conversion at a C++ call argument. The two
@@ -11117,6 +11217,8 @@ public:
     // Cross-block half: log this dereference for the MAY-null fixpoint. Only whole-local owning
     // pointers/interfaces can ever receive a SetNull event, so nothing else is worth logging.
     void RecordNullDerefFor(const NamedVariable& nv, int line, int col);
+    // Null-state key of a `unique` field path ("o.b.p"); empty when the access is not one.
+    std::string UniqueFieldNullKey(const NamedVariable& nv) const;
 
     // Per-field move tracking. Moving a struct sub-path (e.g. `node->left`) into a 'move'
     // parameter must mark ONLY that field as moved, not the whole base variable - otherwise
@@ -12228,7 +12330,9 @@ public:
     // 250: C++ header inline bodies carry debug info under -g; the -g level is keyed (T181).
     // 251: C extern globals carry const (isConst), their origin (fromCxxHeader) and scalar pointee const (T183).
     // 252: C global origin ("cxh") recorded with the header binding (T183 r2).
-    static constexpr int kCHeaderCacheVersion = 252;
+    // 257: mutable C++ field writes use the cached record field flag (T217).
+    // 259: C++ member cache marks methods introduced by a using-declaration (T221).
+    static constexpr int kCHeaderCacheVersion = 259;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

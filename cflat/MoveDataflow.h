@@ -296,6 +296,8 @@ namespace nulldf
         Escape,     // '&x' - the pointee may be rewritten through the escaped address
         Read,       // any NON-dereference read of x - the only way a guard can consult it
         Deref,      // '->' / '.' / '*' / '[]' on x (check-only)
+        ClearFields,  // method call on struct path x - every field path under x may be re-initialized
+        EscapeFields, // `alias` of struct x - its field paths can be rewritten through the alias
     };
 
     struct Event
@@ -556,7 +558,15 @@ namespace nulldf
         {
         case EventKind::SetNull:   s[e.name].insert(e.block); break;
         case EventKind::ClearNull:
+        case EventKind::ClearFields:
+            // Re-binding a struct path also re-initializes every field path under it ("s" -> "s.p").
+            for (auto it = s.lower_bound(e.name); it != s.end() && it->first.starts_with(e.name); )
+                it = (it->first.size() > e.name.size() ? it->first[e.name.size()] == '.'
+                                                       : e.kind == EventKind::ClearNull)
+                    ? s.erase(it) : std::next(it);
+            break;
         case EventKind::Read:      s.erase(e.name);           break;
+        case EventKind::EscapeFields:
         case EventKind::Escape:
         case EventKind::Deref:                                break;
         }
@@ -581,7 +591,7 @@ namespace nulldf
         for (const auto& e : events)
         {
             if (!e.block || e.block->getParent() != F) continue;
-            if (e.kind == EventKind::Escape) escaped.insert(e.name);
+            if (e.kind == EventKind::Escape || e.kind == EventKind::EscapeFields) escaped.insert(e.name);
             else if (e.kind == EventKind::SetNull) haveSet = true;
         }
         if (!haveSet) return out; // fast path: nothing in F was ever explicitly moved out
@@ -590,7 +600,10 @@ namespace nulldf
         for (const auto& e : events)
         {
             if (!e.block || e.block->getParent() != F) continue;
-            if (e.kind == EventKind::Escape || escaped.count(e.name)) continue;
+            // A field path ("s.p") is unchecked once its root escaped: an alias may rewrite it.
+            if (e.kind == EventKind::Escape || e.kind == EventKind::EscapeFields
+                || escaped.count(e.name) || escaped.count(e.name.substr(0, e.name.find('.'))))
+                continue;
             byBlock[e.block].push_back(&e);
         }
         if (byBlock.empty()) return out;

@@ -4959,6 +4959,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             info.directMethods.begin(), info.directMethods.end(),
                             [&](const CxxClassInfo::Method& method) {
                                 return method.raw.name == functionName
+                                    && !method.raw.isUsingShadow
                                     && method.raw.linkageName == candidate.UniqueName;
                             });
                         if (declaresCandidate)
@@ -4975,11 +4976,21 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     if (!visited.insert(current).second) return false;
                     const CxxClassInfo* info = GetCxxClassInfo(current);
                     if (info == nullptr) return false;
-                    if (std::any_of(info->directMethods.begin(), info->directMethods.end(),
-                                    [&](const CxxClassInfo::Method& method) {
-                                        return method.raw.name == functionName;
-                                    }))
-                        return false;
+                    // A class that names the function hides the bases' overloads of it, except the
+                    // one a using-declaration here names: that one continues toward its owner.
+                    const bool namesFunction = std::any_of(
+                        info->directMethods.begin(), info->directMethods.end(),
+                        [&](const CxxClassInfo::Method& method) {
+                            return method.raw.name == functionName;
+                        });
+                    const bool namesCandidate = std::any_of(
+                        info->directMethods.begin(), info->directMethods.end(),
+                        [&](const CxxClassInfo::Method& method) {
+                            return method.raw.name == functionName
+                                && method.raw.isUsingShadow
+                                && method.raw.linkageName == candidate.UniqueName;
+                        });
+                    if (namesFunction && !namesCandidate) return false;
                     for (const CxxClassInfo::BaseRef& base : info->bases)
                     {
                         if (base.access != cflat_cinterop::AccessPublic) continue;
@@ -7209,6 +7220,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
             else if (!inVariadicRange && ParameterIsAliasByPointer(*candParamItr))
             {
+                // The callee may re-initialize any field under the aliased argument path.
+                if (const std::string& path = arg.FieldPathText.empty() ? arg.CallerName : arg.FieldPathText;
+                    !path.empty())
+                    RecordNullEvent(nulldf::EventKind::ClearFields, path, 0, 0);
                 argList.push_back(LowerAliasByPointerArg(arg, *candParamItr));
             }
             else
@@ -7456,49 +7471,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         // type says the callee takes ownership.
                         || (!sinkParam.Pointer && IsCoreUniqueType(sinkParam.TypeName))
                         || foreignCxxPointerSink);
-                const auto& arg = matched[i];
-                bool storageIsLocalSlot = arg.Storage != nullptr
-                    && llvm::isa<llvm::AllocaInst>(arg.Storage);
-                // The argument NV is rebuilt by the expression walk, so the borrow bits live on
-                // the binding itself - ask the live variable, not the copy.
-                const NamedVariable* live = storageIsLocalSlot
-                    ? FindVariableByStorage(arg.Storage) : nullptr;
-                bool argOwns = arg.IsOwning || arg.IsOwningStruct || arg.IsOwningString
-                    || arg.OwnsInterfaceBox
-                    || (live != nullptr && (live->IsOwning || live->IsOwningStruct
-                                            || live->IsOwningString || live->IsNewAllocated))
-                    || (!arg.CallerName.empty() && IsVariableOwning(arg.CallerName));
-                if (paramIsSink && storageIsLocalSlot && !argOwns && arg.FieldName.empty()
-                    && !BorrowProofRetiredByRebind(arg)
-                    && (live == nullptr || !BorrowProofRetiredByRebind(*live)))
-                {
-                    bool directBorrowParam = !arg.CallerName.empty()
-                        && IsFunctionParameter(arg.CallerName);
-                    // A local read out of a FIELD of the borrowed parameter copies an OWNING
-                    // SLOT, not the parameter - that is exactly the legal idiom, so it is not
-                    // reached by this rule.
-                    bool throughField = arg.BorrowedThroughField
-                        || (live != nullptr && live->BorrowedThroughField);
-                    std::string borrowOrigin = throughField ? std::string()
-                        : (!arg.BorrowedOrigin.empty()
-                           ? arg.BorrowedOrigin
-                           : (live != nullptr && live->IsBorrowed ? live->BorrowedOrigin
-                                                                  : std::string()));
-                    bool copiedFromBorrowParam = !directBorrowParam
-                        && !borrowOrigin.empty() && IsFunctionParameter(borrowOrigin);
-                    if (directBorrowParam || copiedFromBorrowParam)
-                    {
-                        std::string sourceName = directBorrowParam
-                            ? std::format("borrowed parameter '{}'", arg.CallerName)
-                            : std::format("borrowed pointer '{}' (copied from parameter '{}')",
-                                          arg.CallerName.empty() ? borrowOrigin
-                                                                 : arg.CallerName,
-                                          borrowOrigin);
-                        std::string declName = directBorrowParam ? arg.CallerName : borrowOrigin;
-                        LogBorrowedPointerMoveSinkError(sourceName, sinkParam.VariableName,
-                            SpellFunctionSymbol(*this, diagnosticFunctionName), declName);
-                    }
-                }
+                if (paramIsSink)
+                    DiagnoseBorrowedMoveSinkArg(diagnosticFunctionName,
+                        sinkParam.VariableName, matched[i]);
             }
 
             // [immovable]: a by-value or `move` parameter takes the value itself, so passing any
@@ -7739,6 +7714,18 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     continue;
                 }
                 auto* structTy = candidate.Recipe.paramSlots[i].structTy;
+                // A C++ class prvalue (call, operator or constructor result) already sits in an owned
+                // temp of this full expression. C++17 elision binds that object as the parameter:
+                // no second object and no move, as clang does.
+                if (cxxObject && IsOwnedCxxPrvalueArgument(matched[i], structTy))
+                {
+                    // A callee-destroyed parameter takes the temp's destruction from the caller.
+                    if (IsCxxParamDestroyedInCallee(pn))
+                        UnregisterOwnedStructTemp(matched[i].Storage);
+                    cxxIndirectArgAddrs.resize(candidate.Recipe.paramSlots.size(), nullptr);
+                    cxxIndirectArgAddrs[i] = matched[i].Storage;
+                    continue;
+                }
                 auto* temp = AllocaAtEntry(structTy, nullptr, "cxx.argtemp",
                                            candidate.Recipe.paramSlots[i].align);
                 const bool useMove = candidate.Parameters[i].IsMove
@@ -7910,7 +7897,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             && RegisterCxxOwningPtrArgsBeforeCall(candidate.Function, argList, calleeMayUnwind);
         if (!candidate.IsCxx && !candidate.Recipe.hasLowering && cxxVirtualCallee == nullptr
             && calleeMayUnwind)
+        {
             PreserveRetainedJoinArmTempsBeforeCall(candidate.Function, argList);
+            RegisterDirectOwningPtrArgsBeforeCall(candidate.Function, argList);
+        }
         if (IsVerbose() && functionName.find("operator") != std::string::npos)
         {
             const std::string selectedName = candidate.SourceName.empty()
@@ -9519,9 +9509,41 @@ bool LLVMBackend::IsExplicitlyMovedNullHere(const NamedVariable& nv) const
             && builder && nv.ExplicitNullBlock == builder->GetInsertBlock();
     }
 
+std::string LLVMBackend::UniqueFieldNullKey(const NamedVariable& nv) const
+{
+        if (nv.FieldName.empty() || nv.FieldPathText.empty() || nv.IsElementAccess
+            || nv.FieldPathThroughPointer || nv.FieldPathRoot.empty())
+            return "";
+        if (!(nv.TypeAndValue.IsUnique || IsCoreUniqueType(nv.TypeAndValue.TypeName))) return "";
+        // Only a path rooted IN a struct value local: a pointer ("ps->p"), alias, parameter or global
+        // root may be rewritten through another name - left unchecked.
+        // The null-state analysis keys by name: a root shadowing an outer same-named local is unchecked.
+        const NamedVariable* root = nullptr;
+        for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(nv.FieldPathRoot); it != frame.namedVariable.end())
+            {
+                if (root != nullptr) return "";
+                root = &it->second;
+                continue;
+            }
+            if (frame.functionArgument.count(nv.FieldPathRoot)) return "";
+        }
+        if (root == nullptr || root->TypeAndValue.Pointer || root->IsAliasBorrow
+            || root->TypeAndValue.IsAlias || root->IsStaticLocal)
+            return "";
+        return nv.FieldPathText;
+    }
+
 void LLVMBackend::RecordNullDerefFor(const NamedVariable& nv, int line, int col)
 {
-        if (nv.CallerName.empty() || !nv.FieldName.empty() || nv.AddressEscaped) return;
+        // A consumed `unique` field is null like a moved local, keyed by its full path ("o.b.p").
+        if (!nv.FieldName.empty())
+        {
+            if (std::string key = UniqueFieldNullKey(nv); !key.empty()) RecordNullDeref(key, line, col);
+            return;
+        }
+        if (nv.CallerName.empty() || nv.AddressEscaped) return;
         if (!(nv.ExplicitlyMovedNull || nv.IsOwning
               || nv.TypeAndValue.IsUnique
               || IsCoreUniqueType(nv.TypeAndValue.TypeName)))

@@ -135,6 +135,21 @@ inline int escThrow(Esc* p, int value) { if (value != 0) throw value; return p->
 inline int escThrowKeep(Esc* p, int value)
 { if (p != nullptr) escKept = p; throw value; }
 inline Esc* escTake() noexcept { Esc* p = escKept; escKept = nullptr; return p; }
+// T236: a constructor that RETAINS its pointer argument (escKept) and records the pointee's value.
+struct EscHolder
+{
+    int v;
+    EscHolder(Esc* p, int t) : v(p == nullptr ? -1 : p->v + t) { escKept = p; }
+};
+// T236 round 2: Base sits at a non-zero offset (X is the first base); Hb takes the Base pointer.
+struct T236X { int pad = 100; };
+struct T236Base { int b = 7; };
+struct T236D : T236X, T236Base { int d = 9; };
+struct T236Hb
+{
+    int r;
+    T236Hb(T236Base* p, int t) : r(p == nullptr ? -1 : p->b + t) {}
+};
 struct EscPoly
 {
     int v;

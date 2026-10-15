@@ -25,11 +25,9 @@ Open:
 6. (P3, pre-existing on master, leaks not crashes; probes scratch/repro_keep/v2/rv2/) a conditional rebind
    of an alias local leaks the new value (r2.cb, r3b.cb, r5.cb - deliberate leak-over-double-free trade);
    a non-extern function value called with a temp argument leaks it (e3o.cb).
-7. (P3, pre-existing on master, rc 133) a by-value string PARAM aliased into a local and then rebound
-   double-frees: `void f(string s) { string t = s; s = s + "n"; printf("%s", t.data()); }` called with an
-   owned string (scratch/repro_keep/v7/d4.cb). Same alias-then-rebind shape the V7 lambda-capture fix
-   closed for captures (copy the source into the local when it may be rebound). T212 (Luna) tried a
-   param entry copy + local deep copy (values right, one 3-byte leak); stripped before landing, legs kept
-   in scratch/t212_C_legs.cb.txt (main checkout).
+8. (P3, pre-existing on master, rc 134; T216 review) a by-value string param rebound only through an
+   `alias` local still frees the caller's buffer: `int f(string s) { alias string a = s; a = "zzzz"; return
+   s.length(); }` (scratch/repro_keep/t216_aliasloc_repro.cb). T216's entry copy keys on whole-name stores;
+   CollectAddressAliasWholeNameStores tracks `&param` aliases but not `alias T a = param`.
 
 RULED 2026-10-01 (maintainer): item 5 RATIFIED - an extern "C" callee owns its by-value owning params; `ef(a)` moves `a` and a later read is "use of moved variable". No caller-side copy.

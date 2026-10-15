@@ -2493,6 +2493,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     if (!LinkCxxCompanionModules()) return false;
     // The C++ bodies are in the module now: answer the `this`-escape gates left false.
     ResolveCxxThisEscapeGates();
+    // Every callee body is linked now, so the return-keep leaves can be answered too.
+    ResolveDeferredReturnKeepGates();
 
     // Clang's own initializers are in llvm.global_ctors only after the link above, so the
     // single-driver rewrite that fixes construction order has to run here, not earlier.
@@ -4701,7 +4703,9 @@ void LLVMBackend::ResetForReanalysis()
     JoinCHeaderDiskCacheWriters();
     EndActiveRoot();
     ownReleaseGates_.clear();
+    fallbackOwnerGates_.clear();
     cxxThisEscapeGates_.clear();
+    deferredReturnKeepGates_.clear();
     ownAdoptGates_.clear();
     ownSlotLeavingLoads_.clear();
     analyzeDebugInfo_ = false;

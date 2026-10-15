@@ -213,6 +213,17 @@ struct UniqueBox
     void selfAssignBare() { item = item; }
 };
 
+// T230 r3 - two unique-field boxes, for nested field-path consume legs.
+struct UniqueBoxPair
+{
+    UniqueBox b;
+    UniqueBox c;
+    void reinitB() { b.item = new Resource(); b.item->id = 5; }
+};
+
+// T230 review 2 - re-inits a consumed unique field through an alias parameter.
+int t230FillAlias(alias UniqueBox r) { r.item = new Resource(); r.item->id = 3; return 0; }
+
 // `unique` composes with a hand-written destructor. The user dtor runs FIRST, so releasing
 // the field early leaves the synthesized delete looking at nullptr - not a double free.
 // Stage 2 note: this used to spell the release `delete item; item = nullptr;`. A hand-written
@@ -1007,6 +1018,195 @@ int testUniqueField()
         passed += Test("unique_move_into_field_not_freed_early", dtorCount, 0);
     }
     passed += Test("unique_move_into_field_freed_once", dtorCount, 1);
+
+    // T230 - a moved-from unique LOCAL that is re-initialized is live again. The explicit move
+    // nulls it; the assignment of a fresh object clears that state, so the read is legal.
+    dtorCount = 0;
+    {
+        unique Resource* a = new Resource();
+        unique Resource* b = nullptr;
+        b = move a;
+        a = new Resource();
+        a->id = 3;
+        passed += Test("unique_local_reinit_after_move_live", a->id, 3);
+        passed += Test("unique_local_reinit_no_early_free", dtorCount, 0);
+    }
+    passed += Test("unique_local_reinit_both_freed_once", dtorCount, 2);
+
+    // T230 - a plain '=' from a unique field into a unique field consumes the source field (as
+    // `move` does); re-initializing that field makes it readable again and both objects are freed once.
+    dtorCount = 0;
+    {
+        UniqueBox s;
+        s.item = new Resource();
+        UniqueBox t = default;
+        t.item = s.item;
+        s.item = new Resource();
+        s.item->id = 4;
+        passed += Test("unique_field_consume_reinit_live", s.item->id, 4);
+        passed += Test("unique_field_consume_reinit_no_early_free", dtorCount, 0);
+    }
+    passed += Test("unique_field_consume_reinit_freed_once", dtorCount, 2);
+
+    // T230 guard - a consume on one branch leaves the other branch's read of the field legal.
+    dtorCount = 0;
+    {
+        UniqueBox s;
+        s.item = new Resource();
+        s.item->id = 6;
+        UniqueBox t = default;
+        int seen = 0;
+        if (conditionalNewCount < 0) { t.item = s.item; } else { seen = s.item->id; }
+        passed += Test("unique_field_consume_other_branch_reads", seen, 6);
+    }
+    passed += Test("unique_field_consume_other_branch_freed_once", dtorCount, 1);
+
+    // T230 guard - the consume of one element of a struct array leaves the other element live.
+    dtorCount = 0;
+    {
+        UniqueBox[2] arr = default;
+        arr[0].item = new Resource();
+        arr[1].item = new Resource();
+        UniqueBox t = default;
+        t.item = arr[0].item;
+        passed += Test("unique_array_field_consume_other_live", arr[1].item->id, 0);
+    }
+    passed += Test("unique_array_field_consume_freed_once", dtorCount, 2);
+
+    // T230 guard - a self-assign of a unique field, '=' or 'move', leaves it live: the consume
+    // and the destination re-init cancel. A consumed field is still readable as null.
+    dtorCount = 0;
+    {
+        UniqueBox s;
+        s.item = new Resource();
+        s.item->id = 7;
+        s.item = move s.item;
+        passed += Test("unique_field_self_move_live", s.item->id, 7);
+        UniqueBox t = default;
+        t.item = s.item;
+        passed += Test("unique_field_consumed_reads_null", s.item == nullptr ? 1 : 0, 1);
+        passed += Test("unique_field_self_move_no_early_free", dtorCount, 0);
+    }
+    passed += Test("unique_field_self_move_freed_once", dtorCount, 1);
+
+    // T230 r3 - a consumed unique field is null-tracked by its full path, flow-sensitive like a
+    // moved local: loops, null guards, re-init, siblings and aliases compile (r2 refused them).
+    dtorCount = 0;
+    {
+        UniqueBox s = default;
+        UniqueBox t = default;
+        int k = 0;
+        while (k < 3) { s.item = new Resource(); s.item->id = k; t.item = s.item; k++; }
+        passed += Test("unique_field_loop_consume_reinit_last", t.item->id, 2);
+        passed += Test("unique_field_loop_consume_reinit_freed", dtorCount, 2);
+    }
+    passed += Test("unique_field_loop_consume_reinit_freed_once", dtorCount, 3);
+    dtorCount = 0;
+    {
+        UniqueBox s = default;
+        UniqueBox t = default;
+        int k = 0;
+        while (k < 3) { s.item = new Resource(); s.item->id = k; t.item = move s.item; k++; }
+        passed += Test("unique_field_loop_move_reinit_last", t.item->id, 2);
+    }
+    passed += Test("unique_field_loop_move_reinit_freed_once", dtorCount, 3);
+    dtorCount = 0;
+    {
+        UniqueBox s = default;
+        s.item = new Resource();
+        UniqueBox t = default;
+        int z = 0;
+        int k = 0;
+        while (k < 2) { z += s.item == nullptr ? 1 : 0; t.item = s.item; k++; }
+        passed += Test("unique_field_loop_nullcheck_read", z, 1);
+    }
+    passed += Test("unique_field_loop_nullcheck_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    {
+        UniqueBox s = default;
+        s.item = new Resource();
+        s.item->id = 8;
+        UniqueBox t = default;
+        if (conditionalNewCount < 0) { t.item = s.item; }
+        int seen = 0;
+        if (s.item != nullptr) { seen = s.item->id; }
+        passed += Test("unique_field_cond_consume_guarded_deref", seen, 8);
+    }
+    passed += Test("unique_field_cond_consume_guarded_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    {
+        UniqueBoxPair o = default;
+        o.b.item = new Resource();
+        o.c.item = new Resource();
+        o.c.item->id = 2;
+        UniqueBox t = default;
+        t.item = o.b.item;
+        passed += Test("unique_field_nested_sibling_live", o.c.item->id, 2);
+        o.reinitB();
+        passed += Test("unique_field_nested_method_reinit_live", o.b.item->id, 5);
+    }
+    passed += Test("unique_field_nested_freed_once", dtorCount, 3);
+    dtorCount = 0;
+    {
+        UniqueBox s = default;
+        s.item = new Resource();
+        s.item->id = 4;
+        UniqueBox* ps = &s;
+        ps->item = s.item;
+        passed += Test("unique_field_alias_dest_ptr_live", s.item->id, 4);
+        s.item = ps->item;
+        passed += Test("unique_field_alias_src_ptr_live", ps->item->id, 4);
+    }
+    passed += Test("unique_field_alias_ptr_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    {
+        UniqueBox s = default;
+        s.item = new Resource();
+        alias UniqueBox r = s;
+        UniqueBox t = default;
+        t.item = s.item;
+        r.item = new Resource();
+        r.item->id = 5;
+        passed += Test("unique_field_alias_local_reinit_live", s.item->id, 5);
+    }
+    passed += Test("unique_field_alias_local_freed_once", dtorCount, 2);
+    dtorCount = 0;
+    {
+        UniqueBox s = default;
+        s.item = new Resource();
+        UniqueBox t = default;
+        UniqueBox u = default;
+        u.item = new Resource();
+        u.item->id = 6;
+        t.item = s.item;
+        s = move u;
+        passed += Test("unique_field_whole_struct_reinit_live", s.item->id, 6);
+    }
+    passed += Test("unique_field_whole_struct_reinit_freed_once", dtorCount, 2);
+    dtorCount = 0;
+    {
+        UniqueBox s = default;
+        UniqueBox t = default;
+        s.item = new Resource();
+        t.item = s.item;
+        t230FillAlias(s);
+        passed += Test("unique_field_alias_param_reinit_live", s.item->id, 3);
+    }
+    passed += Test("unique_field_alias_param_reinit_freed_once", dtorCount, 2);
+    dtorCount = 0;
+    {
+        UniqueBox s = default;
+        s.item = new Resource();
+        s.item->id = 5;
+        UniqueBox t = default;
+        {
+            UniqueBox s = default;
+            s.item = new Resource();
+            t.item = s.item;
+        }
+        passed += Test("unique_field_inner_shadow_consume_outer_live", s.item->id, 5);
+    }
+    passed += Test("unique_field_inner_shadow_consume_freed_once", dtorCount, 2);
 
     // Stage 3 (Trap B) - `move` OUT of a unique field is the sanctioned extraction: it nulls
     // the field, so the local owns the pointee and the synthesized dtor finds nothing to free.
@@ -12837,6 +13037,8 @@ extern int main()
 
     passed += testUniqueField();
     total += 68;
+    total += 18;  // T230 legs in testUniqueField
+    total += 19;  // T230 r3 legs in testUniqueField
 
     passed += testUniqueAssignmentOwnership();
     total += 25;
@@ -13256,9 +13458,28 @@ extern int main()
     total += 34;
     passed += testT207RawLaunder();
     total += 19;
+    passed += testT216RebindLocalNotTaken();
+    total += 3;
+    passed += testT216RebindLocalTaken();
+    total += 4;
+    passed += testT216LocalTakenNotRebound();
+    total += 4;
+    passed += testT216CompoundAssign();
+    total += 3;
+    passed += testT216TempArgument();
+    total += 2;
+    passed += testT216RebindLoop();
+    total += 3;
+    passed += testT216LambdaOnlyWrite();
+    total += 1;
+    passed += testT216RebindReturn();
+    total += 6;
 
     passed += testT212AliasReturnAcceptSet();
     total += 15;
+
+    passed += testT227SlotMoveSinks();
+    total += 19;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
@@ -14208,5 +14429,273 @@ int testT212AliasReturnAcceptSet()
         passed += Test("t212_owned_list_index_store_value", values[0].boxId(), 59);
     }
     passed += Test("t212_owned_list_index_store_frees_both_once", dtorCount, 2);
+    return passed;
+}
+
+/*
+ * T216: a by-value string parameter the body rebinds (`s = ...`, `s += ...`) must not free the
+ * caller's buffer. The caller keeps ownership of its argument, so the callee owns a copy once the
+ * parameter is written; an unwritten parameter stays a borrow. Each leg owns its source string.
+ */
+int t216RebindValue(string s)
+{
+    s = s + "n";
+    return Test("t216_param_rebound_value", s, "mqn");
+}
+
+int t216RebindLength(string s)
+{
+    s = s + "n";
+    return s.length() == 3 ? 1 : 0;
+}
+
+int t216RebindLocalTaken(string s)
+{
+    string t = s;
+    s = s + "n";
+    return Test("t216_param_rebound_local_taken_copy", t, "mq")
+        + Test("t216_param_rebound_local_taken_new", s, "mqn");
+}
+
+int t216LocalTakenNotRebound(string s)
+{
+    string t = s;
+    t = t + "x";
+    return Test("t216_param_kept_local_taken_s", s, "mq")
+        + Test("t216_param_kept_local_taken_t", t, "mqx");
+}
+
+int t216CompoundAssign(string s)
+{
+    s += "k";
+    return Test("t216_param_compound_assign", s, "mqk");
+}
+
+int testT216RebindLocalNotTaken()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    string source = "m" + "q";
+    i64 before = (i64)HeapAudit.reportLeaks();
+    passed += t216RebindValue(source);
+    i64 after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t216_param_rebound_source_unchanged", source, "mq");
+    passed += Test("t216_param_rebound_heap_delta", after - before, (i64)0);
+    return passed;
+}
+
+int testT216RebindLocalTaken()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    string source = "m" + "q";
+    i64 before = (i64)HeapAudit.reportLeaks();
+    passed += t216RebindLocalTaken(source);
+    i64 after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t216_param_rebound_taken_source_unchanged", source, "mq");
+    passed += Test("t216_param_rebound_taken_heap_delta", after - before, (i64)0);
+    return passed;
+}
+
+int testT216LocalTakenNotRebound()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    string source = "m" + "q";
+    i64 before = (i64)HeapAudit.reportLeaks();
+    passed += t216LocalTakenNotRebound(source);
+    i64 after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t216_param_kept_source_unchanged", source, "mq");
+    passed += Test("t216_param_kept_heap_delta", after - before, (i64)0);
+    return passed;
+}
+
+int testT216CompoundAssign()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    string source = "m" + "q";
+    i64 before = (i64)HeapAudit.reportLeaks();
+    passed += t216CompoundAssign(source);
+    i64 after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t216_compound_source_unchanged", source, "mq");
+    passed += Test("t216_compound_heap_delta", after - before, (i64)0);
+    return passed;
+}
+
+int testT216TempArgument()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    i64 before = (i64)HeapAudit.reportLeaks();
+    passed += t216RebindValue("m" + "q");
+    i64 after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t216_temp_arg_heap_delta", after - before, (i64)0);
+    return passed;
+}
+
+int testT216RebindLoop()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    string source = "m" + "q";
+    i64 before = (i64)HeapAudit.reportLeaks();
+    int ok = 0;
+    for (int i = 0; i < 1000; i++)
+        ok += t216RebindLength(source);
+    i64 after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t216_loop_rebound_all_ok", ok, 1000);
+    passed += Test("t216_loop_source_unchanged", source, "mq");
+    passed += Test("t216_loop_heap_delta", after - before, (i64)0);
+    return passed;
+}
+
+/*
+ * A rebound string parameter returned by name hands its buffer to the caller (a move out of the
+ * owned parameter), so the callee's scope exit must not free it.
+ */
+string t216RebindReturn(string s)
+{
+    s = s + "n";
+    return s;
+}
+
+string t216RebindReturnCond(string s, bool c)
+{
+    if (c) s = s + "n";
+    return s;
+}
+
+// Accept-set neighbour: an unwritten by-value string parameter still echoes through an alias return.
+alias string t216AliasEcho(string s)
+{
+    return s;
+}
+
+// A store inside a lambda writes the closure's own capture: the param stays a caller borrow.
+alias string t216LambdaOnlyWrite(string s)
+{
+    Lambda<int()> g = () => { s = s + "z"; return s.length(); };
+    int k = g();
+    return s;
+}
+
+int testT216LambdaOnlyWrite()
+{
+    string source = "m" + "q";
+    string r = t216LambdaOnlyWrite(source);
+    return Test("t216_lambda_only_write_alias_return", r, "mq");
+}
+
+int testT216RebindReturn()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    string source = "m" + "q";
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        string r = t216RebindReturn(source);
+        string c = t216RebindReturnCond(source, false);
+        string d = t216RebindReturnCond(source, true);
+        string e = t216AliasEcho(source);
+        passed += Test("t216_rebind_return_value", r, "mqn");
+        passed += Test("t216_rebind_return_cond_false", c, "mq");
+        passed += Test("t216_rebind_return_cond_true", d, "mqn");
+        passed += Test("t216_alias_echo_unwritten", e, "mq");
+    }
+    passed += Test("t216_rebind_return_source_unchanged", source, "mq");
+    i64 after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t216_rebind_return_heap_delta", after - before, (i64)0);
+    return passed;
+}
+
+// T227: a `??` operand bound to a NON-move borrow keeps the owning field live (the join must not
+// move it out), and a raw copy of an OWNING local is a borrow, so the owner stays the sole owner
+// along every accepted path. The refusals live in Test/errors/err_move_owning_local_copy_into_sink.cb.
+int t227BorrowParam(Resource* b) { return b->id; }
+
+int testT227SlotMoveSinks()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    i64 before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    {
+        UniqueBox s;
+        s.item = new Resource();
+        s.item->id = 91;
+        Resource* a = nullptr;
+        int viaCall = t227BorrowParam(a ?? s.item);
+        passed += Test("t227_borrow_join_call_value", viaCall, 91);
+        passed += Test("t227_borrow_join_call_field_live", s.item->id, 91);
+        Resource* q = a ?? s.item;
+        passed += Test("t227_borrow_join_local_value", q->id, 91);
+        passed += Test("t227_borrow_join_local_field_live", s.item->id, 91);
+        s.item = a ?? s.item;
+        passed += Test("t227_borrow_join_self_assign_value", s.item->id, 91);
+        passed += Test("t227_borrow_join_self_assign_no_early_free", dtorCount, 0);
+    }
+    passed += Test("t227_borrow_join_owner_freed_once", dtorCount, 1);
+
+    // Owner legs: `mv(n)` (implicit consume), `mv(move n)`, and a copy whose owner was rebound or
+    // nulled after the copy are all accepted; each object is freed exactly once.
+    dtorCount = 0;
+    {
+        Resource* n = new Resource();
+        n->id = 93;
+        Resource* view = n;
+        int value = consumeTernaryMove(n);
+        passed += Test("t227_owner_implicit_consume_value", value, 93);
+    }
+    passed += Test("t227_owner_implicit_consume_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* n = new Resource();
+        n->id = 94;
+        Resource* view = n;
+        int value = consumeTernaryMove(move n);
+        passed += Test("t227_owner_move_value", value, 94);
+    }
+    passed += Test("t227_owner_move_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* n = new Resource();
+        n->id = 95;
+        Resource* view = n;
+        n = new Resource();
+        n->id = 96;
+        int first = consumeTernaryMove(view);
+        int second = consumeTernaryMove(n);
+        passed += Test("t227_owner_rebound_copy_value", first, 95);
+        passed += Test("t227_owner_rebound_owner_value", second, 96);
+    }
+    passed += Test("t227_owner_rebound_freed_once_each", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        Resource* n = new Resource();
+        n->id = 97;
+        Resource* view = n;
+        n = nullptr;
+        int value = consumeTernaryMove(view);
+        passed += Test("t227_owner_nulled_copy_value", value, 97);
+    }
+    passed += Test("t227_owner_nulled_copy_freed_once", dtorCount, 1);
+
+    // An owning argument through a `function<>` with a declared move parameter is accepted.
+    dtorCount = 0;
+    {
+        function<int(move Resource*)> g = consumeTernaryMove;
+        Resource* m = new Resource();
+        m->id = 98;
+        int value = g(m);
+        passed += Test("t227_funcptr_owner_value", value, 98);
+    }
+    passed += Test("t227_funcptr_owner_freed_once", dtorCount, 1);
+
+    i64 after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t227_no_leak", after - before, (i64)0);
     return passed;
 }

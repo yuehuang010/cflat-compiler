@@ -3392,8 +3392,8 @@ extern int main(int argc, char** argv)
     bridge_check("byvalue free lvalue live", cpptw.live_allocations(), 0);
     cpptw.reset_counts();
     bridge_check("byvalue free move prvalue value", bridge_param_free_move(cpptw.Twin(11)), 11);
-    bridge_check("byvalue free move prvalue move", cpptw.move_count(), 1);
-    bridge_check("byvalue free move prvalue dtor", cpptw.dtor_count(), 2);
+    bridge_check("byvalue free move prvalue move", cpptw.move_count(), 0);
+    bridge_check("byvalue free move prvalue dtor", cpptw.dtor_count(), 1);
     bridge_check("byvalue free move prvalue live", cpptw.live_allocations(), 0);
 
     cpptw.reset_counts();
@@ -3410,8 +3410,8 @@ extern int main(int argc, char** argv)
         BridgeParamMethod method = default;
         bridge_check("byvalue method move prvalue value", method.take_move(cpptw.Twin(13)), 13);
     }
-    bridge_check("byvalue method move prvalue move", cpptw.move_count(), 1);
-    bridge_check("byvalue method move prvalue dtor", cpptw.dtor_count(), 2);
+    bridge_check("byvalue method move prvalue move", cpptw.move_count(), 0);
+    bridge_check("byvalue method move prvalue dtor", cpptw.dtor_count(), 1);
     bridge_check("byvalue method move prvalue live", cpptw.live_allocations(), 0);
 
     cpptw.reset_counts();
@@ -3425,8 +3425,8 @@ extern int main(int argc, char** argv)
     cpptw.reset_counts();
     bridge_check("byvalue generic move prvalue value",
         bridge_param_generic_move<cpptw.Twin>(cpptw.Twin(15)), 15);
-    bridge_check("byvalue generic move prvalue move", cpptw.move_count(), 1);
-    bridge_check("byvalue generic move prvalue dtor", cpptw.dtor_count(), 2);
+    bridge_check("byvalue generic move prvalue move", cpptw.move_count(), 0);
+    bridge_check("byvalue generic move prvalue dtor", cpptw.dtor_count(), 1);
     bridge_check("byvalue generic move prvalue live", cpptw.live_allocations(), 0);
 
     cpptw.reset_counts();
@@ -4569,8 +4569,8 @@ extern int main(int argc, char** argv)
         bridge_check("captured C++ return value", value.value(), 43);
     }
     bridge_check("captured C++ return copy", cppi.copy_count(), 2);
-    bridge_check("captured C++ return move", cppi.move_count(), 1);
-    bridge_check("captured C++ return dtor", cppi.dtor_count(), 4);
+    bridge_check("captured C++ return move", cppi.move_count(), 0);
+    bridge_check("captured C++ return dtor", cppi.dtor_count(), 3);
     bridge_check("captured C++ source remains", bridge_capture_probe(43), 4343);
 
     {

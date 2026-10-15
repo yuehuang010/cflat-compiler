@@ -3605,8 +3605,8 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         compiler->InitializeBlock(&fn->front(), false);
         NamedReturnElisionContext nrvoContext;
         nrvoContext.function = fn;
-        const std::string nrvoName = ClassifyNamedLocalReturnCandidate(func);
-        if (!nrvoName.empty() && compiler->currentFunction == fn
+        auto nrvoDeclarators = ClassifyNamedLocalReturnCandidates(func);
+        if (!nrvoDeclarators.empty() && compiler->currentFunction == fn
             && !returnType.Pointer && !returnType.IsAlias && !returnType.IsMove
             && compiler->currentFunctionAbiRecipe.hasLowering
             && compiler->currentFunctionAbiRecipe.retSlot.kind == LLVMBackend::AbiSlot::SRetReturn
@@ -3619,9 +3619,8 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             const unsigned sretIndex = compiler->SRetArgIndex(compiler->currentFunctionAbiRecipe);
             if (compiler->currentFunction->arg_size() > sretIndex)
             {
-                nrvoContext.variableName = nrvoName;
+                nrvoContext.declarators = std::move(nrvoDeclarators);
                 nrvoContext.sretStorage = compiler->currentFunction->getArg(sretIndex);
-                nrvoContext.functionScopeDepth = compiler->stackNamedVariable.size();
             }
         }
         NamedReturnElisionScope nrvoScope(*this, std::move(nrvoContext));
@@ -5007,7 +5006,8 @@ cxx_dtor_ready:
                 argValues.push_back(argValue);
                 argTypes.push_back(nv.TypeAndValue);
                 TypeUntypedCtorArg(argTypes.back(), argValue,
-                                   suffixedLiteral ? nv.LiteralIdentity : std::string());
+                                   suffixedLiteral ? nv.LiteralIdentity : std::string(),
+                                   &nv.TypeAndValue);
                 if (nv.TypeAndValue.TypeName.empty() && !nv.TypeAndValue.Pointer
                     && compiler->IsCxxRecord(argTypes.back().TypeName))
                     nv.TypeAndValue.TypeName = argTypes.back().TypeName;
@@ -6937,6 +6937,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // A non-pointer alias declaration is a reference binding. Keep the RHS slot instead
                 // of copying its loaded value into the declaration's temporary alloca.
                 llvm::Value* aliasStorage = nullptr;
+                std::string aliasSourceName; // root variable an `alias` local binds to
                 bool bindAliasReference = false;
                 // True when the initializer borrows an element the owning container frees
                 // (`B* g = l.get(0)` on a `list<unique B*>`). A later `delete g` double-frees.
@@ -7193,6 +7194,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 && rightNV.Storage != nullptr)
                             {
                                 aliasStorage = rightNV.Storage;
+                                aliasSourceName = rightNV.CallerName;
                                 bindAliasReference = true;
                             }
                             // Interface decl-init is its OWN branch, so the escape gate in the
@@ -7349,6 +7351,48 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             // The RHS's whole function-pointer signature, for bare 'function' inference.
                             LLVMBackend::TypeAndValue rhsFnSig;
                             std::vector<LLVMBackend::TypeAndValue::FuncPtrParam> rhsFuncPtrParams;
+                            // `static B g = c ? x : y;` (explicit C++ class): each arm is built in the
+                            // static's own slot under the guard, so the selected object is built once.
+                            if (isStaticLocal && !global_scope && !typeAndValue.Pointer
+                                && !typeAndValue.IsAlias && typeAndValue.TypeName != "auto"
+                                && compiler->IsForeignNontrivialCxxClass(typeAndValue.TypeName)
+                                && SoleTernaryExpression(assignmentExpression) != nullptr)
+                            {
+                                compiler->RequestStaticLocalStorage(name, typeAndValue.TypeName);
+                                llvm::Value* staticSlot = compiler->CreateLocalVariable(
+                                    typeAndValue, nullptr, nullptr, line, typeAndValue.UserAlignValue);
+                                allocList.push_back(std::pair(name, nullptr));
+                                if (staticSlot == nullptr) continue;
+                                compiler->SetCurrentDebugLocation(line);
+                                const auto ternaryInitMark = compiler->MarkOwnedTemps();
+                                compiler->lastCxxRetTemp_ = nullptr;
+                                compiler->lastCxxRetValue_ = nullptr;
+                                compiler->pendingCxxTernaryDeclConsumed_ = false;
+                                compiler->pendingCxxTernaryDeclFailed_ = false;
+                                compiler->pendingCxxTernaryDeclDest_ = staticSlot;
+                                compiler->pendingCxxTernaryDeclTypeName_ = typeAndValue.TypeName;
+                                [[maybe_unused]] auto ternaryArms = ParseAssignmentExpressionNamed(
+                                    assignmentExpression);
+                                const bool ternaryConsumed = compiler->pendingCxxTernaryDeclConsumed_;
+                                const bool ternaryFailed = compiler->pendingCxxTernaryDeclFailed_;
+                                compiler->pendingCxxTernaryDeclDest_ = nullptr;
+                                compiler->pendingCxxTernaryDeclTypeName_.clear();
+                                compiler->pendingCxxTernaryDeclConsumed_ = false;
+                                compiler->pendingCxxTernaryDeclFailed_ = false;
+                                compiler->lastCxxRetTemp_ = nullptr;
+                                compiler->lastCxxRetValue_ = nullptr;
+                                if (!ternaryConsumed || ternaryFailed)
+                                    LogErrorContext(assignmentExpression, std::format(
+                                        "cannot initialize C++ class '{}' from this expression; use '{}(args)', "
+                                        "a '{}' lvalue, or 'move <{}> lvalue'",
+                                        compiler->DisplayCxxClassName(typeAndValue.TypeName),
+                                        compiler->DisplayCxxClassName(typeAndValue.TypeName),
+                                        compiler->DisplayCxxClassName(typeAndValue.TypeName),
+                                        compiler->DisplayCxxClassName(typeAndValue.TypeName)));
+                                compiler->FlushOwnedTempsSince(ternaryInitMark, nullptr, nullptr,
+                                    /*preserveReturnedPtrTemps*/ false);
+                                continue;
+                            }
                             // Captured-variable names of an RHS lambda literal, hoisted out of the
                             // rightNV scope so the fat->thin narrowing gate below can name them.
                             {
@@ -7368,6 +7412,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 if (typeAndValue.TypeName == "auto" && !typeAndValue.Pointer
                                     && !typeAndValue.IsAlias && !global_scope)
                                     trivialCxxMoveSite_ = TopLevelMoveExpression(assignmentExpression);
+                                const auto staticInitMark = compiler->MarkOwnedTemps();
                                 auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
                                 // [immovable]: `T b = a;` / `T b = move a;` copies or moves an existing
                                 // value into a new owner. In-place init (`T b = default;`) and borrows
@@ -7412,6 +7457,43 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && compiler->IsOwnedTempValue(rightNV))
                                     srcCxxRetTemp = rightNV.Storage;
                                 ApplyCallResultBorrowProvenance(compiler, rightNV);
+                                // `static T g = move x;` (same class) move-constructs from x's storage, as clang
+                                // does. A bare name is consumed and must be live; `move *p` consumes the object.
+                                if (isStaticLocal && !global_scope && !typeAndValue.Pointer
+                                    && !typeAndValue.IsAlias && !rightNV.TypeAndValue.Pointer
+                                    && rightNV.Storage != nullptr
+                                    && compiler->IsForeignNontrivialCxxClass(typeAndValue.TypeName)
+                                    && compiler->ResolveTypeAlias(typeAndValue.TypeName)
+                                        == compiler->ResolveTypeAlias(rightNV.TypeAndValue.TypeName))
+                                {
+                                    auto* moveSource = TopLevelMoveExpression(assignmentExpression);
+                                    if (moveSource != nullptr && moveSource->unaryExpression() != nullptr)
+                                    {
+                                        const std::string movedName = moveSource->unaryExpression()->getText();
+                                        const bool bareSource = IsBareIdentifierText(movedName);
+                                        if (auto* srcNV = bareSource ? compiler->FindLiveNamedVariable(movedName)
+                                                                     : nullptr;
+                                            srcNV != nullptr && (srcNV->IsMoved || srcNV->ExplicitlyMovedNull))
+                                        {
+                                            LogErrorContext(moveSource, std::format(
+                                                "use of moved variable '{}'", movedName));
+                                            continue;
+                                        }
+                                        compiler->RequestStaticLocalStorage(name, typeAndValue.TypeName);
+                                        llvm::Value* staticSlot = compiler->CreateLocalVariable(
+                                            typeAndValue, nullptr, nullptr, line, typeAndValue.UserAlignValue);
+                                        allocList.push_back(std::pair(name, nullptr));
+                                        if (staticSlot != nullptr)
+                                        {
+                                            compiler->SetCurrentDebugLocation(line);
+                                            compiler->EmitCxxCopyOrMoveConstruct(
+                                                typeAndValue.TypeName, staticSlot, rightNV.Storage,
+                                                /*useMove*/ true, "into static local");
+                                        }
+                                        if (bareSource) compiler->MarkVariableMoved(movedName);
+                                        continue;
+                                    }
+                                }
                                 // A `T&&` class result (std.move(x)) initializing a T or `auto`
                                 // value is an xvalue: read the referent as a moved-from source.
                                 // A nontrivial class under `auto` is constructed in place by
@@ -7475,7 +7557,14 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // object in its static slot with the selected copy constructor.
                                 // The ordinary auto-local path is intentionally bypassed for
                                 // static storage and would otherwise store the source bytes.
-                                if (staticAutoDeclaration && !rightNV.IsRvalue
+                                // An explicit `static T g = lvalue;` (same class, not a borrow)
+                                // takes the same route: clang copies once, cflat aliased it.
+                                const bool staticSameClassLvalue = isStaticLocal
+                                    && !typeAndValue.Pointer && !typeAndValue.IsAlias
+                                    && compiler->ResolveTypeAlias(typeAndValue.TypeName)
+                                        == compiler->ResolveTypeAlias(rightNV.TypeAndValue.TypeName);
+                                if ((staticAutoDeclaration || staticSameClassLvalue)
+                                    && !rightNV.IsRvalue
                                     && rightNV.Storage != nullptr
                                     && !rightNV.TypeAndValue.Pointer
                                     && compiler->IsForeignNontrivialCxxClass(
@@ -7497,6 +7586,67 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     }
                                     continue;
                                 }
+                                // `static B g = D(x);` / `static B g = move d;`: a derived C++ class value
+                                // slices into the static's storage through B's constructors, as a
+                                // non-static local does (clang: B's move ctor for a derived rvalue).
+                                const std::string staticTargetName = compiler->ResolveTypeAlias(
+                                    typeAndValue.TypeName);
+                                if (isStaticLocal && !typeAndValue.Pointer && !typeAndValue.IsAlias
+                                    && !rightNV.TypeAndValue.Pointer && rightNV.Storage != nullptr
+                                    && compiler->IsCxxDerivedToBaseValue(rightNV.TypeAndValue,
+                                        LLVMBackend::TypeAndValue{ .TypeName = staticTargetName },
+                                        &rightNV))
+                                {
+                                    compiler->RequestStaticLocalStorage(name, typeAndValue.TypeName);
+                                    llvm::Value* staticSlot = compiler->CreateLocalVariable(
+                                        typeAndValue, nullptr, nullptr, line,
+                                        typeAndValue.UserAlignValue);
+                                    allocList.push_back(std::pair(name, nullptr));
+                                    if (staticSlot != nullptr)
+                                    {
+                                        std::string refusal;
+                                        compiler->SetCurrentDebugLocation(line);
+                                        // `move d` consumes a named source, as the non-static path does.
+                                        LLVMBackend::NamedVariable slicedSource = rightNV;
+                                        std::string movedName;
+                                        if (auto* moveSource = TopLevelMoveExpression(assignmentExpression);
+                                            moveSource != nullptr && moveSource->unaryExpression() != nullptr
+                                            && IsBareIdentifierText(moveSource->unaryExpression()->getText()))
+                                        {
+                                            movedName = moveSource->unaryExpression()->getText();
+                                            slicedSource.Primary = nullptr;
+                                            slicedSource.IsExplicitMove = true;
+                                            slicedSource.CallerName = movedName;
+                                        }
+                                        switch (compiler->ConvertThroughCxxConvertingCtor(
+                                            slicedSource, staticTargetName, staticSlot, refusal,
+                                            /*directInit*/ false, /*allowScalarNarrowing*/ true))
+                                        {
+                                        case LLVMBackend::CxxConvertingCtorResult::Converted:
+                                            break;
+                                        case LLVMBackend::CxxConvertingCtorResult::Refused:
+                                            LogErrorContext(assignmentExpression, std::format(
+                                                "cannot initialize C++ class '{}' from this expression; {}",
+                                                compiler->DisplayCxxClassName(staticTargetName), refusal));
+                                            break;
+                                        default:
+                                            LogErrorContext(assignmentExpression, std::format(
+                                                "cannot initialize C++ class '{}' from this expression; "
+                                                "use '{}(args)', a '{}' lvalue, or 'move <{}> lvalue'",
+                                                compiler->DisplayCxxClassName(staticTargetName),
+                                                compiler->DisplayCxxClassName(staticTargetName),
+                                                compiler->DisplayCxxClassName(staticTargetName),
+                                                compiler->DisplayCxxClassName(staticTargetName)));
+                                            break;
+                                        }
+                                        // The source temporary dies inside the guarded init, not at the
+                                        // function's exit block, which the guard does not dominate.
+                                        compiler->FlushOwnedTempsSince(staticInitMark, nullptr, nullptr,
+                                            /*preserveReturnedPtrTemps*/ false);
+                                        if (!movedName.empty()) compiler->MarkVariableMoved(movedName);
+                                    }
+                                    continue;
+                                }
                                 initializerSourceNV = rightNV;
                                 haveInitializerSourceNV = true;
                                 if (global_scope)
@@ -7514,6 +7664,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && typeAndValue.IsAlias)
                                 {
                                     aliasStorage = rightNV.Storage;
+                                    aliasSourceName = rightNV.CallerName;
                                     bindAliasReference = true;
                                     // A C++ derived lvalue bound to a base alias: adjust the
                                     // address (clang's conversion for a virtual route).
@@ -9109,15 +9260,16 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     bool nrvoLocal = false;
                     llvm::Value* nrvoStorage = nullptr;
                     auto& nrvo = namedReturnElision_;
+                    const auto nrvoCandidate = std::find(nrvo.declarators.begin(),
+                        nrvo.declarators.end(), direct);
                     if (nrvo.function == compiler->currentFunction
-                        && !nrvo.variableName.empty() && nrvo.variableName == name)
+                        && nrvoCandidate != nrvo.declarators.end())
                     {
                         auto* localType = compiler->GetType(typeAndValue);
                         const auto& recipe = compiler->currentFunctionAbiRecipe;
                         const uint64_t abiAlign = localType != nullptr && localType->isSized()
                             ? compiler->module->getDataLayout().getABITypeAlign(localType).value() : 0;
                         nrvoLocal = !global_scope && !isStaticLocal
-                            && compiler->stackNamedVariable.size() == nrvo.functionScopeDepth
                             && !typeAndValue.Pointer && !typeAndValue.IsAlias && !typeAndValue.IsMove
                             && typeAndValue.ConstArraySize == 0
                             && typeAndValue.TypeName == compiler->currentFunctionReturnTypeName
@@ -9133,13 +9285,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         if (nrvoLocal)
                             nrvoStorage = nrvo.sretStorage;
                         else
-                            nrvo.variableName.clear();
+                            nrvo.declarators.erase(nrvoCandidate);
                     }
                     auto alloc = compiler->CreateLocalVariable(typeAndValue,
                         right ? right->getType() : nullptr, arraySize, line,
                         typeAndValue.UserAlignValue, nrvoStorage);
-                    if (nrvoLocal)
-                        nrvo.localStorage = alloc;
+                    compiler->GetOrCreateStackVariable(name).IsTopLevelConst
+                        = DeclSpecHasConst(declSpec) && typeAndValue.IsFunctionPointer;
                     const bool loweredSretResult = srcCxxRetTemp != nullptr
                         && !typeAndValue.Pointer
                         && !srcCxxRetTempFromDefault
@@ -9307,6 +9459,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         nv.IsOwning = false;
                         nv.IsOwningString = false;
                         RecordAliasBorrowDeclBlock(compiler, nv);
+                        // A store through the alias rewrites the source's fields: stop null-tracking them.
+                        compiler->RecordNullEvent(nulldf::EventKind::EscapeFields, aliasSourceName, 0, 0);
                     }
                     else if (needsArrayDefaultInit)
                         EmitFixedArrayDefaultInit(alloc, typeAndValue, direct);
@@ -9796,6 +9950,14 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     compiler->MarkVariableExplicitlyMovedNull(srcCallerName);
                                 }
                             }
+                            // A runtime '??' fallback that is a bare `new` hands its hidden owner to this
+                            // declaration; the declared pointer stays a borrow (see BindNullCoalesceFallbackOwner).
+                            if (right != nullptr && typeAndValue.Pointer
+                                && !typeAndValue.ElemPointer && !typeAndValue.IsUnique
+                                && !typeAndValue.IsAlias && !typeAndValue.IsMove
+                                && !typeAndValue.IsArrayView)
+                                if (auto* declSlot = llvm::dyn_cast_or_null<llvm::AllocaInst>(alloc))
+                                    compiler->BindNullCoalesceFallbackOwner(right, declSlot, typeAndValue);
                             if (coreUniqueImplicitDefault && initStore != nullptr)
                                 initStore->setMetadata(
                                     LLVMBackend::kIfaceDeclSplatMD,
@@ -10779,6 +10941,9 @@ void MainListener::EmitImplicitUniqueFieldMove(LLVMBackend::NamedVariable& right
         // re-reads the nulled slot, and IsMove is what the borrow/ownership legs already key on.
         rightNV.TypeAndValue.IsMove = true;
         rightNV.Storage = nullptr;
+        // The implicit move nulls the FIELD only: its path is null like an explicitly moved local.
+        if (std::string key = compilerLLVM->UniqueFieldNullKey(rightNV); !key.empty())
+            compilerLLVM->RecordNullSet(key);
     }
 
 bool MainListener::RejectFieldAllocAlignMismatch(
@@ -11150,6 +11315,10 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
     std::unordered_set<std::string> written;
     CollectWholeNameStoreDestinations(func->compoundStatement(), written);
     CollectAddressAliasWholeNameStores(func->compoundStatement(), params, written, true);
+    // A lambda owns its by-value string capture, so a store there leaves the param untouched.
+    std::unordered_set<std::string> writtenOutsideLambdas;
+    CollectWholeNameStoreDestinations(func->compoundStatement(), writtenOutsideLambdas, true);
+    CollectAddressAliasWholeNameStores(func->compoundStatement(), params, writtenOutsideLambdas, true);
     std::unordered_map<std::string, std::string> paramTypes;
     for (const auto& p : params)
         if (!p.VariableName.empty()) paramTypes.emplace(p.VariableName, p.TypeName);
@@ -11754,7 +11923,8 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
     for (const auto& p : params)
     {
         if (p.VariableName.empty() || written.count(p.VariableName) == 0) continue;
-        if (p.Pointer || p.ElemPointer || p.IsMove || p.IsAlias || p.TypeName == "string") continue;
+        if (p.Pointer || p.ElemPointer || p.IsMove || p.IsAlias) continue;
+        if (p.TypeName == "string" && writtenOutsideLambdas.count(p.VariableName) == 0) continue;
         if (!compiler->IsDataStructure(p.TypeName) || !compiler->IsOwningValueType(p.TypeName)
             || !compiler->IsCopyableType(p.TypeName)
             || compiler->IsForeignNontrivialCxxClass(p.TypeName))
@@ -11770,7 +11940,9 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
         if (copy == nullptr) continue;
         compiler->builder->CreateStore(copy, it->second.Storage);
         it->second.IsBorrowedOwningValue = false;
-        it->second.IsOwningStruct = true;
+        // A string owner is released through its string flag, as a rebound string local is.
+        if (p.TypeName == "string") it->second.IsOwningString = true;
+        else it->second.IsOwningStruct = true;
     }
 }
 
@@ -12486,7 +12658,8 @@ LLVMBackend::NamedVariable MainListener::FinishAssignmentExpressionNamed(
  * `const char *` parameter maps to (const is dropped at the boundary).
  */
 void MainListener::TypeUntypedCtorArg(LLVMBackend::TypeAndValue& argType, llvm::Value* argValue,
-                                      const std::string& suffixedLiteralIdentity)
+                                      const std::string& suffixedLiteralIdentity,
+                                      LLVMBackend::TypeAndValue* sourceTwin)
 {
     // A suffixed integer literal (1L, 1UL, 1LL) has its exact C++ type, not its lowered width's name.
     if (!suffixedLiteralIdentity.empty() && !argType.Pointer
@@ -12497,6 +12670,23 @@ void MainListener::TypeUntypedCtorArg(LLVMBackend::TypeAndValue& argType, llvm::
         if (probe.IsInteger() == (int)argValue->getType()->getIntegerBitWidth())
         {
             argType.TypeName = suffixedLiteralIdentity;
+            return;
+        }
+    }
+    // A `??` / `?:` pointer join carries no spelling: name it by the pointee its arms share.
+    if (argType.TypeName.empty() && !argType.Pointer && argValue != nullptr
+        && argValue->getType()->isPointerTy())
+    {
+        if (const auto joined = JoinedPointerArmType(argValue); !joined.TypeName.empty())
+        {
+            argType.TypeName = joined.TypeName;
+            argType.Pointer = true;
+            // Lowering reads the source twin: a base-class pointer needs the derived pointee too.
+            if (sourceTwin != nullptr && sourceTwin->TypeName.empty() && !sourceTwin->Pointer)
+            {
+                sourceTwin->TypeName = joined.TypeName;
+                sourceTwin->Pointer = true;
+            }
             return;
         }
     }

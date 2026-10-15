@@ -1,0 +1,50 @@
+// The SLOT-MOVE rule for a raw COPY of an OWNING local (T227): `P* view = n;` is a borrow, and
+// the owner `n` still frees the pointee at scope exit, so binding `view` to a `move` sink is a
+// double free - direct, as a ternary arm, or through a `function<>`. A borrowed PARAMETER reaching
+// a `function<>` move sink is the same refusal as the direct call. The accepted owner forms
+// (`mv(n)`, `mv(move n)`, a rebound or nulled owner) are value legs in Test/test_move.cb.
+import "unique.cb";
+
+class Ci { int r = 7; ~Ci() { } };
+void sink(move Ci* q) { delete q; }
+
+expect_error("cannot move borrowed pointer 'view' (copied from owning local 'n') into move parameter 'q' of 'sink'") {
+    void directCopy()
+    {
+        Ci* n = new Ci();
+        Ci* view = n;
+        sink(view);
+    }
+}
+
+expect_error("cannot move borrowed pointer 'view' (copied from owning local 'n') into move parameter 'q' of 'sink'") {
+    void ternaryCopy(bool c)
+    {
+        Ci* n = new Ci();
+        Ci* view = n;
+        sink(c ? view : view);
+    }
+}
+
+expect_error("cannot move borrowed pointer 'view' (copied from owning local 'n') into move parameter") {
+    void funcPtrCopy()
+    {
+        function<void(move Ci*)> g = sink;
+        Ci* n = new Ci();
+        Ci* view = n;
+        g(view);
+    }
+}
+
+expect_error("cannot move borrowed parameter 'b' into move parameter") {
+    void funcPtrBorrowed(Ci* b)
+    {
+        function<void(move Ci*)> g = sink;
+        g(b);
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

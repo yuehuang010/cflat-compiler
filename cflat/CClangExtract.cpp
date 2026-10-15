@@ -3220,6 +3220,7 @@ namespace cflat_cinterop
                     m.isDeleted = md->isDeleted();
                     m.isDefaulted = md->isDefaulted();
                     m.isImplicit = md->isImplicit();
+                    m.isUsingShadow = usingAccess.count(md) != 0;
                     m.isTemplateSpecialization = md->getPrimaryTemplate() != nullptr;
                     m.isNoexcept = DeclIsNoexcept(md);
                     m.access = MapAccess(usingAccess.count(md) != 0 ? usingAccess.at(md)

@@ -1,6 +1,347 @@
 #include "MainListener.h"
 #include <llvm/Analysis/ValueTracking.h>
 
+namespace {
+
+using LoopConstKind = std::function<int(const LLVMBackend::NamedVariable&)>;
+
+// A loop body is emitted once, before its back-edge exists; collect const-pointee stores first
+// so receiver lookup joins the back-edge state at the loop header.
+
+std::string LoopSimplePostfixName(CFlatParser::PostfixExpressionContext* postfix,
+                                  bool& isCall)
+{
+        isCall = false;
+        if (postfix == nullptr || postfix->primaryExpression() == nullptr) return {};
+        auto* primary = postfix->primaryExpression();
+        auto* identifier = primary->genericIdentifier();
+        if (identifier == nullptr || identifier->genericTypeParameters() != nullptr
+            || identifier->Identifier() == nullptr)
+            return {};
+
+        std::string name = identifier->Identifier()->getText();
+        bool wantMember = false;
+        bool sawCall = false;
+        for (size_t i = 1; i < postfix->children.size(); ++i)
+        {
+            auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i]);
+            if (terminal != nullptr)
+            {
+                const std::string token = terminal->getText();
+                if (token == "." || token == "->")
+                {
+                    if (wantMember || sawCall) return {};
+                    wantMember = true;
+                }
+                else if (token == "(")
+                {
+                    if (wantMember || sawCall) return {};
+                    sawCall = true;
+                }
+                else if (token != ")")
+                    return {};
+                continue;
+            }
+            if (auto* member = dynamic_cast<CFlatParser::MemberNameTokenContext*>(postfix->children[i]))
+            {
+                if (!wantMember) return {};
+                name += "." + member->getText();
+                wantMember = false;
+                continue;
+            }
+            if (dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(postfix->children[i]) != nullptr
+                && sawCall)
+                continue;
+            return {};
+        }
+        if (wantMember) return {};
+        isCall = sawCall;
+        return name;
+}
+
+antlr4::ParserRuleContext* LoopOnlyRuleChild(antlr4::ParserRuleContext* parent)
+{
+        if (parent == nullptr) return nullptr;
+        antlr4::ParserRuleContext* only = nullptr;
+        for (antlr4::tree::ParseTree* child : parent->children)
+            if (auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(child))
+            {
+                if (only != nullptr) return nullptr;
+                only = rule;
+            }
+        return only;
+}
+
+CFlatParser::UnaryExpressionContext* LoopUnwrapUnary(antlr4::ParserRuleContext* node)
+{
+        while (node != nullptr)
+        {
+            if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node)) return unary;
+            node = LoopOnlyRuleChild(node);
+        }
+        return nullptr;
+}
+
+LLVMBackend::NamedVariable LoopLookupLoopValue(LLVMBackend* compiler, const std::string& name)
+{
+        if (compiler == nullptr || name.empty()) return {};
+        auto value = compiler->GetScopedLocalOrArgument(name);
+        if (value.Storage != nullptr) return value;
+        const LLVMBackend::StructData* owner = nullptr;
+        int fieldIndex = -1;
+        if (const auto* thisValue = compiler->FindImplicitThisField(name, &owner, &fieldIndex);
+            thisValue != nullptr && owner != nullptr && fieldIndex >= 0
+            && static_cast<size_t>(fieldIndex) < owner->StructFields.size())
+        {
+            value.Storage = thisValue->Storage;
+            value.TypeAndValue = owner->StructFields[static_cast<size_t>(fieldIndex)];
+            value.TypeAndValue.ParentVariableName = name;
+            return value;
+        }
+        value = compiler->GetGlobalVariableNV(name);
+        if (value.Storage == nullptr)
+            value = compiler->GetGlobalVariableNV(compiler->ResolveQualifiedName(name));
+        return value;
+}
+
+LLVMBackend::TypeAndValue LoopFunctionReturn(LLVMBackend* compiler, const std::string& name)
+{
+        if (compiler == nullptr || name.empty()) return {};
+        if (LoopLookupLoopValue(compiler, name).Storage != nullptr) return {};
+        auto type = compiler->GetFunctionReturnTypeInfo(name);
+        if (type.TypeName.empty())
+            type = compiler->GetFunctionReturnTypeInfo(compiler->ResolveQualifiedName(name));
+        return type;
+}
+
+bool LoopValueMayPointToConstCxxObject(CFlatParser::AssignmentExpressionContext* expression,
+                                       LLVMBackend* compiler, const LoopConstKind& constKind);
+bool LoopUnaryValueMayPointToConstCxxObject(CFlatParser::UnaryExpressionContext* unary,
+                                            LLVMBackend* compiler, const LoopConstKind& constKind);
+
+bool LoopConstObjectAddress(CFlatParser::CastExpressionContext* expression,
+                            LLVMBackend* compiler, const LoopConstKind& constKind)
+{
+        auto* operand = LoopUnwrapUnary(expression);
+        if (operand == nullptr) return false;
+        if (operand->unaryOperator() != nullptr)
+        {
+            if (operand->unaryOperator()->getText() == "*")
+                return LoopUnaryValueMayPointToConstCxxObject(
+                    LoopUnwrapUnary(operand->castExpression()), compiler, constKind);
+            return false;
+        }
+        auto* postfix = operand->postfixExpression();
+        if (postfix == nullptr) return false;
+        if (auto* primary = postfix->primaryExpression(); primary != nullptr
+            && primary->LeftParen() != nullptr && primary->expression() != nullptr)
+            return LoopValueMayPointToConstCxxObject(primary->expression()->assignmentExpression(), compiler, constKind);
+
+        bool isCall = false;
+        const std::string name = LoopSimplePostfixName(postfix, isCall);
+        if (name.empty()) return false;
+        if (isCall)
+        {
+            const auto result = LoopFunctionReturn(compiler, name);
+            return result.IsCxxConstRef || (result.Pointer && result.IsCxxPointeeConst);
+        }
+        auto source = LoopLookupLoopValue(compiler, name);
+        return source.Storage != nullptr && constKind(source) != 0;
+}
+
+bool LoopUnaryValueMayPointToConstCxxObject(CFlatParser::UnaryExpressionContext* unary,
+                                            LLVMBackend* compiler, const LoopConstKind& constKind)
+{
+        if (unary == nullptr) return false;
+        if (unary->unaryOperator() != nullptr)
+        {
+            const std::string op = unary->unaryOperator()->getText();
+            if (op == "&") return LoopConstObjectAddress(unary->castExpression(), compiler, constKind);
+            if (op == "*")
+                return LoopUnaryValueMayPointToConstCxxObject(
+                    LoopUnwrapUnary(unary->castExpression()), compiler, constKind);
+            return false;
+        }
+        auto* postfix = unary->postfixExpression();
+        if (postfix == nullptr) return false;
+        if (auto* primary = postfix->primaryExpression(); primary != nullptr
+            && primary->LeftParen() != nullptr && primary->expression() != nullptr)
+            return LoopValueMayPointToConstCxxObject(primary->expression()->assignmentExpression(), compiler, constKind);
+
+        bool isCall = false;
+        const std::string name = LoopSimplePostfixName(postfix, isCall);
+        if (name.empty()) return false;
+        if (isCall)
+        {
+            const auto result = LoopFunctionReturn(compiler, name);
+            return result.Pointer && result.IsCxxPointeeConst;
+        }
+        auto source = LoopLookupLoopValue(compiler, name);
+        return source.Storage != nullptr && source.TypeAndValue.Pointer
+            && constKind(source) != 0;
+}
+
+bool LoopConditionalValueMayPointToConstCxxObject(CFlatParser::ConditionalExpressionContext* expression,
+                                                  LLVMBackend* compiler, const LoopConstKind& constKind)
+{
+        if (expression == nullptr) return false;
+        if (expression->expression() != nullptr && expression->conditionalExpression() != nullptr)
+            return LoopValueMayPointToConstCxxObject(expression->expression()->assignmentExpression(), compiler, constKind)
+                || LoopConditionalValueMayPointToConstCxxObject(expression->conditionalExpression(), compiler, constKind);
+        auto* unary = LoopUnwrapUnary(expression);
+        return LoopUnaryValueMayPointToConstCxxObject(unary, compiler, constKind);
+}
+
+bool LoopValueMayPointToConstCxxObject(CFlatParser::AssignmentExpressionContext* expression,
+                                       LLVMBackend* compiler, const LoopConstKind& constKind)
+{
+        if (expression == nullptr) return false;
+        if (expression->assignmentOperator() != nullptr)
+            return LoopValueMayPointToConstCxxObject(expression->assignmentExpression(), compiler, constKind);
+        return LoopConditionalValueMayPointToConstCxxObject(expression->conditionalExpression(), compiler, constKind);
+}
+
+std::string LoopSimpleAssignmentTarget(CFlatParser::UnaryExpressionContext* unary)
+{
+        if (unary == nullptr || unary->unaryOperator() != nullptr || unary->postfixExpression() == nullptr)
+            return {};
+        auto* postfix = unary->postfixExpression();
+        bool isCall = false;
+        if (postfix->children.size() != 1) return {};
+        const std::string name = LoopSimplePostfixName(postfix, isCall);
+        if (isCall || name.empty()) return {};
+        return name;
+}
+
+std::string LoopDeclaredName(CFlatParser::DeclaratorContext* declarator)
+{
+        if (declarator == nullptr || declarator->directDeclarator() == nullptr) return {};
+        auto* direct = declarator->directDeclarator();
+        while (direct != nullptr)
+        {
+            if (direct->Identifier() != nullptr) return direct->Identifier()->getText();
+            declarator = direct->declarator();
+            direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+        }
+        return {};
+}
+
+bool LoopDeclarationHasName(CFlatParser::DeclarationContext* declaration, const std::string& name)
+{
+        if (declaration == nullptr || declaration->initDeclaratorList() == nullptr) return false;
+        for (auto* item : declaration->initDeclaratorList()->initDeclarator())
+            if (LoopDeclaredName(item->declarator()) == name) return true;
+        return false;
+}
+
+bool LoopBlockItemDeclaresName(CFlatParser::BlockItemContext* item, const std::string& name)
+{
+        if (item == nullptr) return false;
+        if (LoopDeclarationHasName(item->declaration(), name)) return true;
+        if (auto* destructuring = item->destructuringDeclaration(); destructuring != nullptr)
+            for (auto* entry : destructuring->destructuringEntry())
+                if (entry->Identifier() != nullptr && entry->Identifier()->getText() == name)
+                    return true;
+        return false;
+}
+
+bool LoopAssignmentIsShadowed(antlr4::ParserRuleContext* assignment,
+                              CFlatParser::IterationStatementContext* loop,
+                              const std::string& name)
+{
+        for (antlr4::tree::ParseTree* ancestor = assignment != nullptr ? assignment->parent : nullptr;
+             ancestor != nullptr && ancestor != loop; ancestor = ancestor->parent)
+        {
+            if (auto* compound = dynamic_cast<CFlatParser::CompoundStatementContext*>(ancestor))
+            {
+                auto* list = compound->blockItemList();
+                if (list == nullptr) continue;
+                auto items = list->blockItem();
+                size_t current = items.size();
+                for (size_t i = 0; i < items.size(); ++i)
+                {
+                    for (antlr4::tree::ParseTree* node = assignment; node != nullptr && node != compound;
+                         node = node->parent)
+                        if (node == items[i])
+                        {
+                            current = i;
+                            break;
+                        }
+                    if (current != items.size()) break;
+                }
+                for (size_t i = 0; i < current; ++i)
+                    if (LoopBlockItemDeclaresName(items[i], name)) return true;
+            }
+            if (auto* nestedLoop = dynamic_cast<CFlatParser::IterationStatementContext*>(ancestor))
+            {
+                if (nestedLoop->declarationSpecifiers() != nullptr && nestedLoop->In()
+                    && nestedLoop->Identifier() != nullptr && nestedLoop->Identifier()->getText() == name)
+                    return true;
+                if (auto* condition = nestedLoop->forCondition(); condition != nullptr
+                    && condition->forDeclaration() != nullptr
+                    && condition->forDeclaration()->initDeclaratorList() != nullptr)
+                    for (auto* item : condition->forDeclaration()->initDeclaratorList()->initDeclarator())
+                        if (LoopDeclaredName(item->declarator()) == name) return true;
+            }
+        }
+        return false;
+}
+
+std::unordered_set<std::string> FindLoopBackEdgeCxxConstPointerTargets(
+        LLVMBackend* compiler, CFlatParser::IterationStatementContext* loop,
+        const LoopConstKind& constKind)
+{
+        if (compiler == nullptr || loop == nullptr) return {};
+        std::unordered_set<std::string> targets;
+        auto visit = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+            if (node == nullptr || dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr)
+                return;
+            if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
+                assignment != nullptr && assignment->assignmentOperator() != nullptr
+                && assignment->assignmentOperator()->getText() == "="
+                && LoopValueMayPointToConstCxxObject(assignment->assignmentExpression(), compiler, constKind))
+            {
+                const std::string name = LoopSimpleAssignmentTarget(assignment->unaryExpression());
+                const bool rangeVariable = loop->declarationSpecifiers() != nullptr && loop->In()
+                    && loop->Identifier() != nullptr && loop->Identifier()->getText() == name;
+                if (!name.empty() && !rangeVariable
+                    && !LoopAssignmentIsShadowed(assignment, loop, name))
+                    targets.insert(name);
+            }
+            for (antlr4::tree::ParseTree* child : node->children) self(self, child);
+        };
+        visit(visit, loop);
+        return targets;
+}
+
+} // namespace
+
+void MainListener::MarkLoopBackEdgeCxxConstPointers(
+        LLVMBackend* compiler, CFlatParser::IterationStatementContext* loop)
+{
+        if (compiler == nullptr || loop == nullptr) return;
+        LoopConstKind constKind = [compiler](const LLVMBackend::NamedVariable& receiver) {
+            return compiler->CxxConstReceiverKind(receiver);
+        };
+        // Rescan until no new name is marked: an alias made const later in the same body
+        // (`q = &c; p = q;`) only shows as const once q is marked. Bounded by the chain length.
+        for (bool marked = true; marked;)
+        {
+            marked = false;
+            for (const std::string& name :
+                 FindLoopBackEdgeCxxConstPointerTargets(compiler, loop, constKind))
+                if (auto* variable = compiler->FindLiveNamedVariable(name);
+                    variable != nullptr && variable->TypeAndValue.Pointer
+                    && !variable->TypeAndValue.IsFunctionPointer
+                    && !variable->TypeAndValue.IsCxxPointeeConst
+                    && compiler->IsCxxRecord(variable->TypeAndValue.TypeName))
+                {
+                    variable->TypeAndValue.IsCxxPointeeConst = true;
+                    marked = true;
+                }
+        }
+}
+
 MainListener::RangeForContext* MainListener::FindActiveRangeForVariable(
         const LLVMBackend::NamedVariable& nv) {
         if (!nv.FieldName.empty()) return nullptr;
@@ -990,19 +1331,16 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             };
             auto* structType = compiler->GetDataStructure(returnTypeName).StructType;
             auto& nrvo = namedReturnElision_;
-            std::string returnedName = retText;
-            while (returnedName.size() >= 2 && returnedName.front() == '(' && returnedName.back() == ')')
-                returnedName = returnedName.substr(1, returnedName.size() - 2);
+            // Identity, not text: the returned operand's storage IS the candidate's sret storage.
             const bool nrvoReturn = !defaultValue && nrvo.function == compiler->currentFunction
-                && !nrvo.variableName.empty() && nrvo.variableName == returnedName
-                && nrvo.localStorage != nullptr && nrvo.localStorage == cxxSretDest
-                && returnNV.Storage == nrvo.localStorage
+                && nrvo.sretStorage != nullptr && nrvo.sretStorage == cxxSretDest
+                && returnNV.Storage == nrvo.sretStorage
                 && returnNV.TypeAndValue.TypeName == returnTypeName
                 && !returnNV.TypeAndValue.Pointer;
             if (nrvoReturn)
             {
                 llvm::Value* previousSkip = compiler->returnedStructDtorSkipAlloca;
-                compiler->returnedStructDtorSkipAlloca = nrvo.localStorage;
+                compiler->returnedStructDtorSkipAlloca = nrvo.sretStorage;
                 finishLoweredReturn();
                 compiler->returnedStructDtorSkipAlloca = previousSkip;
                 return;
@@ -3207,6 +3545,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
             {
                 auto expression = iterationStatement->expression();
                 auto innerStatement = iterationStatement->statement();
+                MarkLoopBackEdgeCxxConstPointers(compiler, iterationStatement);
 
                 auto blockInner = compiler->CreateBasicBlock("doWhileInner");
                 auto blockCondition = compiler->CreateBasicBlock("doWhileCondition");
@@ -3238,6 +3577,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
             {
                 auto expression = iterationStatement->expression();
                 auto innerStatement = iterationStatement->statement();
+                MarkLoopBackEdgeCxxConstPointers(compiler, iterationStatement);
 
                 auto blockCondition = compiler->CreateBasicBlock("whileCondition");
                 auto blockInner = compiler->CreateBasicBlock("whileInner");
@@ -3332,6 +3672,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         compiler->FlushOwnedTemps();
                     }
 
+                    MarkLoopBackEdgeCxxConstPointers(compiler, iterationStatement);
+
                     compiler->CreateBlockBreak(blockCondition, false);
 
                     // Condition
@@ -3395,6 +3737,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     auto varNameTok  = iterationStatement->Identifier();
                     auto collExprCtx = iterationStatement->expression();
                     auto bodyStmt    = iterationStatement->statement();
+                    MarkLoopBackEdgeCxxConstPointers(compiler, iterationStatement);
 
                     std::string varName = varNameTok->getText();
 

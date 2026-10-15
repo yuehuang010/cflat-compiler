@@ -331,6 +331,7 @@ namespace cflat_cinterop
         bool isDeleted = false;
         bool isDefaulted = false;
         bool isImplicit = false;
+        bool isUsingShadow = false;
         bool isTemplateSpecialization = false;
         // No CALLABLE definition is available: the member is implicit, defaulted, or inline, and
         // Clang did not emit a body for it into the companion module. When definition emission

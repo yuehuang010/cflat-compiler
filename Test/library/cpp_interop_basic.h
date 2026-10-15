@@ -2999,3 +2999,109 @@ namespace t168KArrayNs
     static const int staticValues[3] = {311, 312, 313};
     const int namespaceValues[3] = {411, 412, 413};
 }
+
+namespace t219 {
+struct ConvTarget { int v; };
+struct ConvSource {
+    int v;
+    operator ConvTarget() const { return ConvTarget{v + 10}; }
+};
+inline int take_conv(const ConvTarget& value) { return value.v; }
+inline int operator+(const ConvTarget& a, const ConvTarget& b) {
+    return 50 + a.v * 10 + b.v;
+}
+
+struct CtorSource { int v; };
+struct CtorTarget {
+    int v;
+    CtorTarget() = default;
+    CtorTarget(const CtorSource& s) : v(s.v + 20) {}
+};
+inline int take_ctor(const CtorTarget& value) { return value.v; }
+inline int operator-(const CtorTarget& a, const CtorTarget& b) {
+    return 60 + a.v * 10 + b.v;
+}
+
+struct MixTarget;
+struct MixLeft { int v; operator MixTarget() const; };
+struct MixRight { int v; };
+struct MixTarget {
+    int v;
+    MixTarget() = default;
+    MixTarget(int n) : v(n) {}
+    MixTarget(const MixRight& r) : v(r.v + 40) {}
+};
+inline MixLeft::operator MixTarget() const { return MixTarget{v + 30}; }
+inline int operator*(const MixTarget& a, const MixTarget& b) {
+    return 300 + a.v * 10 + b.v;
+}
+
+struct ExactTarget { int v; };
+struct ExactSource { int v; operator ExactTarget() const { return ExactTarget{v + 10}; } };
+inline int operator+(const ExactTarget& a, const ExactTarget& b) {
+    return 100 + a.v * 10 + b.v;
+}
+inline int operator+(const ExactSource& a, const ExactSource& b) {
+    return 900 + a.v * 10 + b.v;
+}
+
+struct MemberTarget { int v; };
+struct MemberSource {
+    int v;
+    operator MemberTarget() const { return MemberTarget{v}; }
+    int operator+(const MemberSource& rhs) const { return 700 + v * 10 + rhs.v; }
+};
+inline int operator+(const MemberTarget& a, const MemberSource& b) {
+    return 800 + a.v * 10 + b.v;
+}
+
+struct CompoundTarget { int v; };
+struct CompoundSource { int v; operator CompoundTarget() const { return CompoundTarget{v + 50}; } };
+inline int compound_choice = 0;
+inline CompoundTarget operator+=(CompoundTarget left, const CompoundTarget& right) {
+    compound_choice = 800 + left.v * 10 + right.v;
+    return CompoundTarget{left.v + right.v};
+}
+
+struct EqTarget { int v; };
+struct EqSource { int v; operator EqTarget() const { return EqTarget{v + 70}; } };
+inline int eq_choice = 0;
+inline bool operator==(const EqTarget& a, const EqTarget& b) {
+    eq_choice = 800 + a.v * 10 + b.v;
+    return a.v == b.v;
+}
+
+struct OrderTarget { int v; };
+struct OrderSource { int v; operator OrderTarget() const { return OrderTarget{v + 10}; } };
+inline int order_choice = 0;
+inline int operator<=>(const OrderTarget& a, const OrderTarget& b) {
+    order_choice = 900 + a.v * 10 + b.v;
+    return a.v - b.v;
+}
+
+struct ExplicitTarget { int v; };
+struct ExplicitSource { int v; explicit operator ExplicitTarget() const { return ExplicitTarget{v}; } };
+inline int operator+(const ExplicitTarget& a, const ExplicitTarget& b) { return a.v + b.v; }
+
+struct ExplicitCtorSource { int v; };
+struct ExplicitCtorTarget {
+    int v;
+    ExplicitCtorTarget() = default;
+    explicit ExplicitCtorTarget(const ExplicitCtorSource& s) : v(s.v) {}
+};
+inline int operator-(const ExplicitCtorTarget& a, const ExplicitCtorTarget& b) { return a.v - b.v; }
+
+struct AmbigSource;
+struct AmbigTarget {
+    int v;
+    AmbigTarget() = default;
+    AmbigTarget(const AmbigSource& s);
+};
+struct AmbigSource {
+    int v;
+    operator AmbigTarget() const;
+};
+inline AmbigTarget::AmbigTarget(const AmbigSource& s) : v(s.v) {}
+inline AmbigSource::operator AmbigTarget() const { AmbigTarget out; out.v = v; return out; }
+inline int operator+(const AmbigTarget& a, const AmbigTarget& b) { return a.v + b.v; }
+}

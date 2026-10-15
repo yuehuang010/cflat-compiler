@@ -228,6 +228,7 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_t217_mutable.hpp";
 import "library/cpp_t103_nullctor_c.h";
 import cpp "library/cpp_t103_nullctor.hpp";
 import cpp "library/cpp_t110_varlink.hpp";
@@ -238,6 +239,7 @@ import cpp "library/cpp_t97_fieldctor.h";
 import cpp "library/cpp_t68_intptr.hpp";
 import cpp "library/cpp_t62_static_auto.hpp";
 import cpp "library/cpp_t93_static_init.hpp";
+import cpp "library/cpp_t226_static_init.hpp";
 import cpp "library/cpp_u8_literal.hpp";
 import cpp "library/cpp_t43_char_types.hpp";
 import cpp "library/cpp_immovable.hpp";
@@ -400,6 +402,7 @@ import cpp "library/cpp_interop_stream.h";
 import cpp "library/cpp_interop_list.h";
 // Assignment into a live object from a temporary: instrumented, header-only.
 import cpp "library/cpp_interop_assign.h";
+import cpp "library/cpp_t231_byvalue.hpp";
 import cpp "library/cpp_interop_proxy_assign.h";
 import cpp "library/t29_valarray_subscript.hpp";
 import cpp "library/cpp_interop_refbinding.h";
@@ -633,6 +636,8 @@ int UnwTakeByValue(cppunw.Tr t, int x)
 {
     return cppunw.thrower(x) + t.get();
 }
+// T231: a prvalue built in the by-value parameter of a throwing callee is destroyed once (clang).
+int UnwPrvalueParam(int x) { return UnwTakeByValue(cppunw.Tr(7), x); }
 int UnwByValueParam(int x)
 {
     cppunw.Tr a = cppunw.Tr(7);
@@ -1734,6 +1739,80 @@ int T93TrkTernary(bool c, int x, int y)
     static t93s.Trk g = c ? t93s.Trk(x) : t93s.Trk(y);
     return g.ok() * 100 + g.get();
 }
+// T226: a static local copies an lvalue source once (a ternary picks one arm), slices a derived
+// value through the base's constructors (move for a prvalue or `move d`, copy for an lvalue), and
+// keeps its initializer once-only. Counts match clang++ -std=c++20.
+int T226StaticTernary(bool c)
+{
+    t226s.T a = t226s.T(3);
+    t226s.T b = t226s.T(4);
+    static t226s.T g = c ? a : b;
+    return g.get();
+}
+int T226StaticCopyName(int x)
+{
+    t226s.T a = t226s.T(x);
+    static t226s.T g = a;
+    return g.get();
+}
+int T226StaticSlice(int x) { static t226s.B g = t226s.D(x); return g.get(); }
+int T226StaticSliceLvalue(int x)
+{
+    t226s.D d = t226s.D(x);
+    static t226s.B g = d;
+    return g.get();
+}
+int T226StaticSliceMove(int x)
+{
+    t226s.D d = t226s.D(x);
+    static t226s.B g = move d;
+    return g.get();
+}
+int T226LocalSlice(int x) { t226s.B g = t226s.D(x); return g.get(); }
+// T233: a static or local C++ class initialized by `move` or from a ternary whose arms are derived or
+// base values. Counts match clang++ -std=c++20: one move-construction of the selected object, the
+// unselected arm never built, the moved-from source still destroyed at its own scope exit.
+int T233StaticMove(int x)
+{
+    t226s.T a = t226s.T(x);
+    static t226s.T g = move a;
+    return g.get();
+}
+// A second static, so the guard leg is not primed by the first leg.
+int T233StaticMoveGuard(int x)
+{
+    t226s.T a = t226s.T(x);
+    static t226s.T g = move a;
+    return g.get();
+}
+int T233LocalDerivedTern(bool c) { t226s.B g = c ? t226s.D(1) : t226s.D(2); return g.get(); }
+int T233LocalMixedTern(bool c) { t226s.B g = c ? t226s.D(1) : t226s.B(2); return g.get(); }
+int T233StaticMixedTern(bool c) { static t226s.B g = c ? t226s.D(1) : t226s.B(2); return g.get(); }
+int T233StaticMixedFalse(bool c) { static t226s.B g = c ? t226s.D(1) : t226s.B(2); return g.get(); }
+int T233LocalLvalueTern(bool c)
+{
+    t226s.D d1 = t226s.D(1);
+    t226s.D d2 = t226s.D(2);
+    t226s.B g = c ? d1 : d2;
+    return g.get();
+}
+int T233StaticLvalueMixed(bool c)
+{
+    t226s.D d1 = t226s.D(1);
+    t226s.B b2 = t226s.B(2);
+    static t226s.B g = c ? d1 : b2;
+    return g.get();
+}
+// T233 round 2: mixed value categories of one derived class join as a prvalue (clang): the lvalue or
+// xvalue arm copies or moves into a D temporary, which then slices into B. Counts match clang++.
+int T233XvalueDerivedTern(bool c) { t226s.D d1 = t226s.D(1); t226s.D d2 = t226s.D(2); t226s.B g = c ? move d1 : move d2; return g.get(); }
+int T233LvalueXvalueTern(bool c) { t226s.D d1 = t226s.D(1); t226s.D d2 = t226s.D(2); t226s.B g = c ? d1 : move d2; return g.get(); }
+int T233XvalueLvalueTern(bool c) { t226s.D d1 = t226s.D(1); t226s.D d2 = t226s.D(2); t226s.B g = c ? move d1 : d2; return g.get(); }
+int T233LvalueDerivedPrvalueTern(bool c) { t226s.D d1 = t226s.D(1); t226s.B g = c ? d1 : t226s.D(2); return g.get(); }
+int T233XvalueDerivedPrvalueTern(bool c) { t226s.D d1 = t226s.D(1); t226s.B g = c ? move d1 : t226s.D(2); return g.get(); }
+int T233PrvalueLvalueTern(bool c) { t226s.D d1 = t226s.D(1); t226s.B g = c ? t226s.D(2) : d1; return g.get(); }
+int T233StaticLvalueDerivedPrvalueTern(bool c) { t226s.D d1 = t226s.D(1); static t226s.B g = c ? d1 : t226s.D(2); return g.get(); }
+int T233StaticMoveDeref(int x) { t226s.T a = t226s.T(x); t226s.T* p = &a; static t226s.T g = move *p; return g.get(); }
 enum T45Ternary : int { Picked = true ? 7 : 8, Other = false ? 7 : 8 };
 
 int T46GenericDot<T>(T p) { return p.get() == nullptr ? 1 : 0; }
@@ -1868,6 +1947,15 @@ struct T129SingleOuter { T129UserCtor h; };
 struct T129Array2DOuter { T129UserCtor[2][2] h; };
 struct T129ThrowUserCtor { cppunw.Tx m; int k = 1; T129ThrowUserCtor() { k = 2; } };
 struct T129ThrowArrayOuter { T129ThrowUserCtor[2] h; };
+// T218: expression and call-result elements over user-ctor array elements (shapes beside T129).
+struct T218Single { T129UserCtor[1] h; };
+struct T218Triple { T129UserCtor[3] h; };
+int t218Live = 0;
+struct T218Own { int v = 0; T218Own() { t218Live = t218Live + 1; } ~T218Own() { t218Live = t218Live - 1; } };
+struct T218Owned { unique<T218Own> u; int k = 1; T218Owned() { k = 2; u = unique<T218Own>(new T218Own()); } };
+struct T218OwnedArray { T218Owned[2] h; };
+T129UserCtor T218Make() { T129UserCtor r = { m = 9 }; return r; }
+T218Owned T218MakeOwned() { T218Owned r = default; r.u = unique<T218Own>(new T218Own()); return r; }
 struct T130ReturnHolder { cppexp.ConvCnt c; int k = 1; };
 struct T130Generic<T> { T c; int k = 1; };
 struct T130ThrowHolder { cppunw.Tx t; int k = 1; };
@@ -1938,6 +2026,88 @@ T130ThrowHolder T130ThrowReturn(int x)
 int T130ThrowWrapper(int x)
 {
     T130ThrowHolder s = T130ThrowReturn(x);
+    return s.t.get();
+}
+// T224: a named return whose local sits in a nested block, shadows an outer name, or lives in a loop.
+T130ReturnHolder T224Nested(int choose) { { T130ReturnHolder s = { c = 5 }; if (choose) return s; return s; } }
+T130ReturnHolder T224Scoped(int choose)
+{
+    { T130ReturnHolder t = { c = 9 }; T130ReturnHolder s = { c = 5 }; if (choose) return s; return s; }
+}
+T130ReturnHolder T224Shadow() { T130ReturnHolder s = { c = 5 }; { T130ReturnHolder s = { c = 6 }; return s; } }
+T130ReturnHolder T224Outer() { T130ReturnHolder s = { c = 5 }; { T130ReturnHolder s = { c = 6 }; } return s; }
+T130ReturnHolder T224Loop(int n)
+{
+    int i = 0;
+    while (true) { T130ReturnHolder s = { c = 7 }; if (i == n) return s; i = i + 1; }
+}
+T130ThrowHolder T224ThrowNested(int x)
+{
+    { T130ThrowHolder s = { t = cppunw.Tx(0) }; cppunw.thrower(x); return s; }
+}
+int T224ThrowWrapper(int x)
+{
+    T130ThrowHolder s = T224ThrowNested(x);
+    return s.t.get();
+}
+cppexp.ConvCnt T224Mk(int x) { return x; }
+// T228: several candidates share the sret slot. A local is elided when every return inside its live
+// range names it; a return naming another local (or any other value) keeps it a normal local.
+// Oracle: clang++ -std=c++20 on the same shapes (scratch/t228_tmp/oracle.cpp, oracle2.cpp, oracle3.cpp).
+T130ReturnHolder T228Sibling(int c)
+{
+    { T130ReturnHolder s = { c = 5 }; if (c) return s; }
+    { T130ReturnHolder s = { c = 6 }; return s; }
+}
+T130ReturnHolder T228Shared(int c)
+{
+    T130ReturnHolder a = { c = 5 };
+    { T130ReturnHolder z = { c = 7 }; if (c) return z; }
+    return a;
+}
+T130ReturnHolder T228Mixed(int c)
+{
+    T130ReturnHolder a = { c = 5 };
+    if (c) return a;
+    T130ReturnHolder b = { c = 6 };
+    return b;
+}
+T130ReturnHolder T228Early(int c)
+{
+    { if (c) return T130Make(); }
+    T130ReturnHolder b = { c = 6 };
+    return b;
+}
+T130ReturnHolder T228Tail(int c)
+{
+    T130ReturnHolder a = { c = 5 };
+    { T130ReturnHolder b = { c = 6 }; if (c) return b; }
+    T130ReturnHolder z = { c = 7 };
+    return z;
+}
+T130ReturnHolder T228Shadow(int c)
+{
+    T130ReturnHolder a = { c = 5 };
+    { T130ReturnHolder a = { c = 6 }; if (c) return a; }
+    return a;
+}
+T130ReturnHolder T228Switch(int c)
+{
+    switch (c) { case 0: { T130ReturnHolder s = { c = 5 }; return s; } default: { T130ReturnHolder t = { c = 6 }; return t; } }
+}
+T130ReturnHolder T228Loop(int n)
+{
+    int i = 0;
+    while (true) { T130ReturnHolder a = { c = 7 }; i = i + 1; if (i < n) continue; return a; }
+}
+T130ThrowHolder T228ThrowSibling(int x)
+{
+    { T130ThrowHolder s = { t = cppunw.Tx(0) }; if (x == 0) return s; cppunw.thrower(x); }
+    { T130ThrowHolder s = { t = cppunw.Tx(0) }; return s; }
+}
+int T228ThrowWrapper(int x)
+{
+    T130ThrowHolder s = T228ThrowSibling(x);
     return s.t.get();
 }
 T73Holder t73Global = default;
@@ -2057,8 +2227,29 @@ struct T178MoveOnlyHolder
     cppi.XvMoveOnly thisMove() { return move this->field; }
 };
 
+// T236 (legs 3240-3246): a plain CFlat struct for the `?:` arrow leg.
+struct T236Node { int v = default; };
+
 extern int main()
 {
+    // T217: mutable fields stay writable through const C++ storage, including constexpr globals.
+    t217_constexpr.m = 7;
+    if (t217_constexpr.m != 7 || t217_constexpr.n != 2) return 4219;
+    t217_const.m = 8;
+    if (t217_const.m != 8 || t217_const.n != 4) return 4220;
+    t217_const.m += 1;
+    if (t217_const.m != 9 || t217_const.n != 4) return 4220;
+    int t217Old = t217_const.m++;
+    if (t217Old != 9 || t217_const.m != 10 || t217_const.n != 4) return 4220;
+    t217_const_ptr()->m = 12;
+    if (t217_const_ptr()->m != 12 || t217_const_ptr()->n != 4) return 4220;
+    if (t217_const.bump() != 22 || t217_const.m != 22 || t217_const.n != 4) return 4220;
+    t217_outer.inner.m = 11;
+    if (t217_outer.inner.m != 11 || t217_outer.inner.n != 6) return 4220;
+    const T217Outer t217LocalConst = t217_outer;
+    t217LocalConst.inner.m = 13;
+    if (t217LocalConst.inner.m != 13 || t217LocalConst.inner.n != 6) return 4220;
+
     // T136: the file-scope objects above are constructed at startup, before any other code runs.
     if (t135.t136CtorCount() != 9 || t136GlobalBrace.n != 0 || t136GlobalEq.n != 0
         || t136GlobalArr[0].n != 0 || t136GlobalArr[1].n != 0
@@ -2642,14 +2833,14 @@ extern int main()
         t63.CallEvent(t63.call_next_side()), t63.CallEvent(t63.call_next_side()));
     if (t146Pair != 1012) return 9350;
     if (t63.callCtorCount() != 2 || t63.callCopyCount() != 0
-        || t63.callMoveCount() != 2 || t63.callDtorCount() != 4
+        || t63.callMoveCount() != 0 || t63.callDtorCount() != 2
         || t63.callSideCount() != 22) return 9351;
     t63.resetCallCounts();
     int t146EventFirst = t63.call_event_then_int(
         t63.CallEvent(t63.call_next_side()), t63.call_next_side());
     if (t146EventFirst != 1012) return 9352;
     if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0
-        || t63.callMoveCount() != 1 || t63.callDtorCount() != 2
+        || t63.callMoveCount() != 0 || t63.callDtorCount() != 1
         || t63.callSideCount() != 12) return 9353;
     t63.resetCallCounts();
     int t146PlainFirst = t63.call_int_then_event(
@@ -2664,7 +2855,7 @@ extern int main()
         t63.CallSnapshot(t146SnapshotInput), t63.call_bump_scalar(&t146SnapshotInput));
     if (t146Snapshot != 1) return 9356;
     if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0
-        || t63.callMoveCount() != 1 || t63.callDtorCount() != 2
+        || t63.callMoveCount() != 0 || t63.callDtorCount() != 1
         || t63.callSideCount() != 1 || t146SnapshotInput != 1) return 9357;
     t63.resetCallCounts();
     t63.CallHost t146Host = default;
@@ -2685,7 +2876,7 @@ extern int main()
         t63.CallEvent(t63.call_next_side()), t63.call_next_side());
     if (t146MemberOrder != 1012) return 9362;
     if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0
-        || t63.callMoveCount() != 1 || t63.callDtorCount() != 2
+        || t63.callMoveCount() != 0 || t63.callDtorCount() != 1
         || t63.callSideCount() != 12) return 9363;
     t63.resetCallCounts();
     int t146Paren = t63.call_event_value((t63.CallEvent(7)));
@@ -2698,7 +2889,7 @@ extern int main()
         (t63.CallEvent(t63.call_next_side())), t63.call_next_side());
     if (t146ParenOrder != 1012) return 9366;
     if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0
-        || t63.callMoveCount() != 1 || t63.callDtorCount() != 2
+        || t63.callMoveCount() != 0 || t63.callDtorCount() != 1
         || t63.callSideCount() != 12) return 9367;
     // T146 r3: a `Fn&` constructor parameter binds the caller's slot, free and template sinks alike
     // (clang: 104 both; the nulled slot makes the sum 104, a by-value copy would leave it 204).
@@ -2725,6 +2916,79 @@ extern int main()
     function<int(int)> t146CvTemplate = t63.call_plus_one;
     t63.call_set_cv(&t146CvTemplate);
     if (t63.call_fnref_template(t63.CallFnCvRef(t146CvTemplate)) != 104) return 9373;
+    // T214: an overloaded constructor's by-value scalar argument is snapshotted before its sibling mutates it.
+    t63.resetCallCounts();
+    int t214ChoiceFreeInput = 0;
+    int t214ChoiceFree = t63.call_choice_value(
+        t63.CallChoice(t214ChoiceFreeInput, t63.call_bump_choice(&t214ChoiceFreeInput)));
+    if (t214ChoiceFree != 101) return 9374;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t214ChoiceFreeInput != 1) return 9375;
+    t63.resetCallCounts();
+    int t214ChoiceTemplateInput = 0;
+    int t214ChoiceTemplate = t63.call_choice_template(
+        t63.CallChoice(t214ChoiceTemplateInput, t63.call_bump_choice(&t214ChoiceTemplateInput)));
+    if (t214ChoiceTemplate != 101) return 9376;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1 || t214ChoiceTemplateInput != 1) return 9377;
+    // T214: the overloaded member path elides the class temporary into its by-value parameter.
+    t63.resetCallCounts();
+    t63.CallHost t214Host = default;
+    int t214MemberOverload = t214Host.overloaded(t63.CallEvent(7), 2.0);
+    if (t214MemberOverload != 509) return 9378;
+    if (t63.callCtorCount() != 1 || t63.callCopyCount() != 0 || t63.callMoveCount() != 0
+        || t63.callDtorCount() != 1) return 9379;
+    // T214 accept set: a mutable lvalue picks Fn&, a function value picks Fn&&, and move f binds Fn&&.
+    function<int(int)> t214FnLvalue = t63.call_plus_one;
+    int t214FnLvaluePick = t63.call_fn_rvalue_pick(t63.CallFnRvaluePick(t214FnLvalue))
+        + (t214FnLvalue == nullptr ? 100 : 200);
+    if (t214FnLvaluePick != 204) return 9380;
+    if (t63.call_fn_rvalue_pick(t63.CallFnRvaluePick(t63.call_plus_one)) != 304) return 9381;
+    if (t63.call_fn_rvalue_ref(t63.CallFnRvalueRef(t63.call_plus_one)) != 304) return 9382;
+    // A ctor template deduces F& for the lvalue and wins over Fn&& (clang 604): not refused.
+    function<int(int)> t214FnTplLvalue = t63.call_plus_one;
+    if (t63.call_fn_rvalue_tpl(t63.CallFnRvalueTpl(t214FnTplLvalue)) != 604) return 9389;
+    function<int(int)> t214FnMove = t63.call_plus_one;
+    int t214FnMoveRef = t63.call_fn_rvalue_ref(t63.CallFnRvalueRef(move t214FnMove))
+        + (t214FnMove == nullptr ? 100 : 200);
+    if (t214FnMoveRef != 404) return 9383;
+    function<int(int)> t214FnMovePick = t63.call_plus_one;
+    int t214FnMovePickResult = t63.call_fn_rvalue_pick(t63.CallFnRvaluePick(move t214FnMovePick))
+        + (t214FnMovePick == nullptr ? 100 : 200);
+    if (t214FnMovePickResult != 404) return 9384;
+    // T232: direct local construction snapshots the selected by-value ctor parameters.
+    int t232BaseInput = 0;
+    t63.CallT232BaseSel t232Base = t63.CallT232BaseSel(
+        t232BaseInput, t63.call_bump_choice(&t232BaseInput));
+    if (t232Base.value * 10 + t232BaseInput != 1011) return 9390;
+    int t232DefInput = 0;
+    t63.CallT232DefSel t232Def = t63.CallT232DefSel(
+        t232DefInput, t63.call_bump_choice(&t232DefInput));
+    if (t232Def.value * 10 + t232DefInput != 1011) return 9391;
+    int t232InhInput = 0;
+    t63.CallT232InhSel t232Inh = t63.CallT232InhSel(
+        t232InhInput, t63.call_bump_choice(&t232InhInput));
+    if (t232Inh.value * 10 + t232InhInput != 1011) return 9392;
+    const function<int(int)> t232ConstFn = t63.call_plus_one;
+    if (t63.call_t232_fn_pick(t63.CallT232FnPick(t232ConstFn)) != 204) return 9393;
+    const function<int(int)> t232ConstTemplateFn = t63.call_plus_one;
+    if (t63.call_t232_fn_pick_template(t63.CallT232FnPick(t232ConstTemplateFn)) != 204)
+        return 9394;
+    // T232: template and C-variadic ctor snapshots also apply in call-argument position.
+    int t232TplInput = 0;
+    int t232TplResult = t63.call_t232_tplsel(t63.CallT232TplSel(
+        t232TplInput, t63.call_bump_choice(&t232TplInput)));
+    if (t232TplResult * 10 + t232TplInput != 1011) return 9395;
+    int t232VarInput = 0;
+    int t232VarResult = t63.call_t232_varsel(t63.CallT232VarSel(
+        t232VarInput, t63.call_bump_choice(&t232VarInput)));
+    if (t232VarResult * 10 + t232VarInput != 1011) return 9396;
+    // T232 r2: a converting W pick is built directly in the ctor parameter (clang: no copy).
+    int t232WInput = 0;
+    int t232WCopies = t63.call_t232_w_copy_count();
+    t63.CallT232WSel t232W = t63.CallT232WSel(t232WInput, t63.call_bump_choice(&t232WInput));
+    if (t232W.value * 10 + t232WInput != 1011) return 9397;
+    if (t63.call_t232_w_copy_count() != t232WCopies) return 9398;
     t63.ExplicitOnly t63ExplicitDirect{6, 8};
     if (t63ExplicitDirect.first != 6 || t63ExplicitDirect.second != 8) return 9307;
     t63.ClassNew t63ClassNew{1, 2, 3};
@@ -2891,6 +3155,75 @@ extern int main()
     t93s.reset();
     int t93b = T93TrkTernary(true, 3, 4) + T93TrkTernary(false, 5, 6);
     if (t93b != 206 || t93s.made != 1 || t93s.copies != 0 || t93s.moves != 0) return 93007;
+    // T226: static copy from an lvalue arm, once; the second entry copies nothing.
+    t226s.reset();
+    int t226a = T226StaticTernary(false);
+    if (t226a != 4 || t226s.made != 2 || t226s.copies != 1 || t226s.moves != 0 || t226s.dead != 2) return 93008;
+    t226a = T226StaticTernary(true);
+    if (t226a != 4 || t226s.made != 4 || t226s.copies != 1 || t226s.dead != 4) return 93009;
+    t226s.reset();
+    if (T226StaticCopyName(3) != 3 || t226s.made != 1 || t226s.copies != 1 || t226s.dead != 1) return 93010;
+    // T226: static slice from a prvalue: B's move ctor, one temporary destroyed, built once.
+    t226s.reset();
+    int t226b = T226StaticSlice(3) + T226StaticSlice(4);
+    if (t226b != 6 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 1) return 93011;
+    t226s.reset();
+    int t226c = T226StaticSliceLvalue(3);
+    if (t226c != 3 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 0 || t226s.dead != 1) return 93012;
+    t226s.reset();
+    t226c = T226StaticSliceMove(3);
+    if (t226c != 3 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 1) return 93013;
+    t226s.reset();
+    int t226d = T226LocalSlice(3);
+    if (t226d != 3 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93014;
+    // T233: `static T g = move a;` move-constructs once (the static used to alias a); guard holds.
+    t226s.reset();
+    if (T233StaticMove(3) != 3 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 1) return 93015;
+    t226s.reset();
+    if (T233StaticMoveGuard(3) + T233StaticMoveGuard(4) != 6 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93016;
+    // T233: a derived or base prvalue arm of a ternary slices into a base local through B's move ctor.
+    t226s.reset();
+    if (T233LocalDerivedTern(true) != 1 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93017;
+    t226s.reset();
+    if (T233LocalDerivedTern(false) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93018;
+    t226s.reset();
+    if (T233LocalMixedTern(true) != 1 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 2) return 93019;
+    t226s.reset();
+    if (T233LocalMixedTern(false) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 0 || t226s.dead != 1) return 93020;
+    // T233: the same arms into a static; the second entry is guarded and constructs nothing.
+    t226s.reset();
+    if (T233StaticMixedTern(true) + T233StaticMixedTern(false) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 1) return 93021;
+    t226s.reset();
+    if (T233StaticMixedFalse(false) != 2 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 0 || t226s.dead != 0) return 93022;
+    // T233: a derived lvalue arm copies its base subobject once into the base local or static.
+    t226s.reset();
+    if (T233LocalLvalueTern(false) != 2 || t226s.made != 2 || t226s.copies != 1 || t226s.moves != 0 || t226s.dead != 3) return 93023;
+    t226s.reset();
+    if (T233StaticLvalueMixed(true) != 1 || t226s.made != 2 || t226s.copies != 1 || t226s.moves != 0 || t226s.dead != 2) return 93024;
+    // T233 round 2: mixed lvalue/xvalue/prvalue arms of one derived class (clang counts).
+    t226s.reset();
+    if (T233XvalueDerivedTern(true) != 1 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 3) return 93025;
+    t226s.reset();
+    if (T233XvalueDerivedTern(false) != 2 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 3) return 93026;
+    t226s.reset();
+    if (T233LvalueXvalueTern(true) != 1 || t226s.made != 2 || t226s.copies != 1 || t226s.moves != 1 || t226s.dead != 4) return 93027;
+    t226s.reset();
+    if (T233LvalueXvalueTern(false) != 2 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 4) return 93028;
+    t226s.reset();
+    if (T233XvalueLvalueTern(true) != 1 || t226s.made != 2 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 4) return 93029;
+    t226s.reset();
+    if (T233XvalueLvalueTern(false) != 2 || t226s.made != 2 || t226s.copies != 1 || t226s.moves != 1 || t226s.dead != 4) return 93030;
+    t226s.reset();
+    if (T233LvalueDerivedPrvalueTern(true) != 1 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 1 || t226s.dead != 3) return 93031;
+    t226s.reset();
+    if (T233PrvalueLvalueTern(false) != 1 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 1 || t226s.dead != 3) return 93032;
+    t226s.reset();
+    if (T233XvalueDerivedPrvalueTern(true) != 1 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 2 || t226s.dead != 3) return 93033;
+    t226s.reset();
+    if (T233StaticLvalueDerivedPrvalueTern(true) != 1 || t226s.made != 1 || t226s.copies != 1 || t226s.moves != 1 || t226s.dead != 2) return 93034;
+    // `static T g = move *p;` move-constructs from the pointee (it used to alias it).
+    t226s.reset();
+    if (T233StaticMoveDeref(3) != 3 || t226s.made != 1 || t226s.copies != 0 || t226s.moves != 1 || t226s.dead != 1) return 93035;
     if (T62StaticAutoGlobalCopy() != 1) return 62010;
     cpp_t62.set_global_string("changed");
     if (T62StaticAutoGlobalCopy() != 1 || T62StaticAutoGlobalCopy() != 1) return 62011;
@@ -6128,6 +6461,43 @@ extern int main()
     opgridSink << opgridFa;
     if (opgridSink.total != 13)                         return 983;
 
+    // T219 ACCEPT SET: an exact free overload beats the conversion-target overload, and an exact
+    // member overload beats a free candidate that needs a conversion for its left operand.
+    t219.ExactSource t219ExactA = default; t219ExactA.v = 3;
+    t219.ExactSource t219ExactB = default; t219ExactB.v = 4;
+    if (t219ExactA + t219ExactB != 934) return 65001;
+    t219.MemberSource t219MemberA = default; t219MemberA.v = 5;
+    t219.MemberSource t219MemberB = default; t219MemberB.v = 6;
+    if (t219MemberA + t219MemberB != 756) return 65002;
+
+    t219.ConvSource t219ConvArg = default; t219ConvArg.v = 3;
+    t219.CtorSource t219CtorArg = default; t219CtorArg.v = 2;
+    if (t219.take_conv(t219ConvArg) != 13) return 65003;
+    if (t219.take_ctor(t219CtorArg) != 22) return 65004;
+
+    // T219: free operators accept one implicit conversion per operand and keep clang's winner.
+    t219.ConvSource t219ConvLeft = default; t219ConvLeft.v = 3;
+    t219.ConvTarget t219ConvRight = default; t219ConvRight.v = 4;
+    if (t219ConvLeft + t219ConvRight != 184) return 65005;
+    t219.CtorTarget t219CtorLeft = default; t219CtorLeft.v = 5;
+    t219.CtorSource t219CtorRight = default; t219CtorRight.v = 2;
+    if (t219CtorLeft - t219CtorRight != 132) return 65006;
+    t219.MixLeft t219MixLeft = default; t219MixLeft.v = 1;
+    t219.MixRight t219MixRight = default; t219MixRight.v = 2;
+    if (t219MixLeft * t219MixRight != 652) return 65007;
+    t219.CompoundSource t219CompoundLeft = default; t219CompoundLeft.v = 1;
+    t219.CompoundTarget t219CompoundRight = default; t219CompoundRight.v = 2;
+    t219CompoundLeft += t219CompoundRight;
+    if (t219.compound_choice != 1312) return 65008;
+    t219.EqSource t219EqLeft = default; t219EqLeft.v = 8;
+    t219.EqSource t219EqRight = default; t219EqRight.v = 9;
+    bool t219Eq = t219EqLeft == t219EqRight;
+    if (t219Eq || t219.eq_choice != 1659) return 65009;
+    t219.OrderSource t219OrderLeft = default; t219OrderLeft.v = 3;
+    t219.OrderSource t219OrderRight = default; t219OrderRight.v = 4;
+    bool t219Less = t219OrderLeft < t219OrderRight;
+    if (!t219Less || t219.order_choice != 1044) return 65010;
+
     // ---- scalar-to-class reference conversion and chained class returns -------------------------
     double screfScalar = 2.5;
     int screfInteger = 3;
@@ -8561,6 +8931,27 @@ extern int main()
     if (t75RankLit.tag != 2)                                                   return 2293;
     cpi_t42.RankExplicit t75RankRet = (cpi_t42.RankExplicit)t75Pick(t75RankSrc);
     if (t75RankRet.tag != 3)                                                   return 2294;
+    cppsopd.T221OpUsingOnly t221OpOnly = default;
+    if (t221OpOnly - 2 != 1002)                                                return 4401;
+    cppsopd.T221NamedUsingOnly t221Named = default;
+    if (t221Named.get(5) != 3005)                                              return 4402;
+    cppsopd.T221OpUsingPlus t221OpPlus = default;
+    if (t221OpPlus - (long)7 != 1007)                                          return 4403;
+    if (t221OpPlus - 7 != 2007)                                                return 4404;
+    cppsopd.T221TemplUsing t221Templ = default;
+    if (t221Templ - (long)6 != 4006)                                           return 4405;
+    cppsopd.T221EqUsing t221EqA = default;
+    cppsopd.T221EqUsing t221EqB = default;
+    t221EqA.value = 2;
+    t221EqB.value = 3;
+    if (!(t221EqA != t221EqB))                                                return 4406;
+    cppsopd.T221PrivateUsing t221Private = default;
+    if (t221Private - 9 != 1009)                                              return 4407;
+    cppsopd.T221NamedMulti t221NamedMulti = default;
+    if (t221NamedMulti.get(5) != 3005)                                        return 4410;
+    cppsopd.T221OpMulti t221OpMulti = default;
+    if (t221OpMulti - 2 != 1002)                                              return 4411;
+    if (cppsopd.T221StaticMulti.s(2) != 5002)                                 return 4412;
     // A class template specialization target; copy-assign from the temporary adds 10 to tag.
     cppexp.ConvBox<int> convBox = 3;
     if (convBox.v != 3 || convBox.tag != 1)                                    return 2247;
@@ -9423,6 +9814,9 @@ extern int main()
         cppunw.reset();
         r = cppunw.guarded(UnwByValueParam, 5); // the caller-owned by-value argument temp
         if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 2) return 3168;
+        cppunw.reset();
+        r = cppunw.guarded(UnwPrvalueParam, 5); // T231: the prvalue parameter, destroyed once
+        if (r != -5 || cppunw.live() != 0 || cppunw.dtors() != 1) return 3626;
         // The drop flag decides: released before the throw (flag clear, no second destructor)
         // and still live at the throw (the pad destroys it). One code for both paths.
         cppunw.reset();
@@ -10244,45 +10638,46 @@ extern int main()
     }
 
     // By-value C++ last-use identity: counts include the transfer into each CFlat helper.
+    // T231: a prvalue argument is the helper's parameter (no extra move or destroy); pins drop them.
     {
         cpptw.reset_counts();
         int observed = lu_no_shadow(cpptw.Twin(7));
-        if (observed != 7 || cpptw.packed_counts() != 23) return 3340;
+        if (observed != 7 || cpptw.packed_counts() != 12) return 3340;
     }
     {
         cpptw.reset_counts();
         int observed = lu_loop(cpptw.Twin(7));
-        if (observed != 14 || cpptw.packed_counts() != 214) return 3341;
+        if (observed != 14 || cpptw.packed_counts() != 203) return 3341;
     }
     {
         cpptw.reset_counts();
         int observed = lu_lambda(cpptw.Twin(7));
-        if (observed != 14 || cpptw.packed_counts() != 124) return 3342;
+        if (observed != 14 || cpptw.packed_counts() != 113) return 3342;
     }
     {
         cpptw.reset_counts();
         int observed = lu_shadow_alias(cpptw.Twin(7));
-        if (observed != 107 || cpptw.packed_counts() != 125) return 3343;
+        if (observed != 107 || cpptw.packed_counts() != 114) return 3343;
     }
     {
         cpptw.reset_counts();
         int observed = lu_after_block(cpptw.Twin(7));
-        if (observed != 114 || cpptw.packed_counts() != 226) return 3344;
+        if (observed != 114 || cpptw.packed_counts() != 215) return 3344;
     }
     {
         cpptw.reset_counts();
         int observed = lu_with_global(cpptw.Twin(7));
-        if (observed != 37 || cpptw.packed_counts() != 23) return 3345;
+        if (observed != 37 || cpptw.packed_counts() != 12) return 3345;
     }
     {
         cpptw.reset_counts();
         int observed = lu_prefix(cpptw.Twin(7), cpptw.Twin(8));
-        if (observed != 807 || cpptw.packed_counts() != 46) return 3346;
+        if (observed != 807 || cpptw.packed_counts() != 24) return 3346;
     }
     {
         cpptw.reset_counts();
         int observed = lu_double_call(cpptw.Twin(7));
-        if (observed != 14 || cpptw.packed_counts() != 124) return 3347;
+        if (observed != 14 || cpptw.packed_counts() != 113) return 3347;
     }
     {
         cpptw.reset_counts();
@@ -10292,7 +10687,7 @@ extern int main()
     {
         cpptw.reset_counts();
         int observed = lu_shadow_exact(cpptw.Twin(7));
-        if (observed != 57 || cpptw.packed_counts() != 125) return 3349;
+        if (observed != 57 || cpptw.packed_counts() != 114) return 3349;
     }
 
     // ---- a C++ reference return and a derived pointer at a RETURN statement (3370-3389) ----
@@ -11233,12 +11628,138 @@ extern int main()
         cppas.Life.reset();
         {
             CppAssignHost h = { l = c ? cppas.Life(21) : cppas.Life(22) };
-            // clang builds the selected arm in place (moves 0); p3 ternary-arm-into-field-moves.
+            // clang builds the selected arm in place (moves 0, dtors 0 in scope); T223.
             if (h.l.value() != expected || cppas.Life.ctors != 1 || cppas.Life.copies != 0
-                || cppas.Life.moves != 1 || cppas.Life.dtors != 1
-                || cppas.Life.last_dtor != -1) return 3571;
+                || cppas.Life.moves != 0 || cppas.Life.dtors != 0
+                || cppas.Life.last_dtor != 0) return 3571;
         }
-        if (cppas.Life.dtors != 2 || cppas.Life.last_dtor != expected) return 3571;
+        if (cppas.Life.dtors != 1 || cppas.Life.last_dtor != expected) return 3571;
+    }
+
+    // T223: a `?:` of C++ prvalues initializing a declaration or a fresh field builds the selected
+    // arm in place, like clang (moves 0; dtors 0 in scope). Each count is the clang++ oracle's.
+    for (int i = 0; i < 2; i++)
+    {
+        bool c = i == 0;
+        cppas.Life.reset();
+        cppas.Life x = c ? cppas.Life(1) : cppas.Life(2);
+        if (x.value() != (c ? 1 : 2) || cppas.Life.ctors != 1 || cppas.Life.copies != 0
+            || cppas.Life.moves != 0 || cppas.Life.dtors != 0) return 4501;
+    }
+
+    for (int i = 0; i < 2; i++)
+    {
+        bool c = i == 0;
+        cppas.Life lv = cppas.Life(7);
+        cppas.Life.reset();
+        cppas.Life x = c ? lv : cppas.Life(8);
+        if (x.value() != (c ? 7 : 8) || cppas.Life.ctors != (c ? 0 : 1)
+            || cppas.Life.copies != (c ? 1 : 0) || cppas.Life.moves != 0
+            || cppas.Life.dtors != 0) return 4502;
+    }
+
+    for (int i = 0; i < 4; i++)
+    {
+        bool a = (i & 1) == 0;
+        bool b = (i & 2) == 0;
+        cppas.Life.reset();
+        {
+            CppAssignHost h = { l = a ? cppas.Life(1) : (b ? cppas.Life(2) : cppas.Life(3)) };
+            if (h.l.value() != (a ? 1 : (b ? 2 : 3)) || cppas.Life.ctors != 1
+                || cppas.Life.copies != 0 || cppas.Life.moves != 0
+                || cppas.Life.dtors != 0) return 4503;
+        }
+        if (cppas.Life.dtors != 1 || cppas.Life.last_dtor != (a ? 1 : (b ? 2 : 3))) return 4503;
+    }
+
+    for (int i = 0; i < 4; i++)
+    {
+        bool a = (i & 1) == 0;
+        bool b = (i & 2) == 0;
+        cppas.Life.reset();
+        {
+            CppAssignHost h = { l = a ? cppas.Life(1) : b ? cppas.Life(2) : cppas.Life(3) };
+            if (h.l.value() != (a ? 1 : (b ? 2 : 3)) || cppas.Life.ctors != 1
+                || cppas.Life.copies != 0 || cppas.Life.moves != 0
+                || cppas.Life.dtors != 0) return 4504;
+        }
+        if (cppas.Life.dtors != 1 || cppas.Life.last_dtor != (a ? 1 : (b ? 2 : 3))) return 4504;
+    }
+
+    for (int i = 0; i < 2; i++)
+    {
+        bool c = i == 0;
+        cppas.Life lv = cppas.Life(7);
+        cppas.Life.reset();
+        {
+            CppAssignHost h = { l = c ? cppas.Life(5) : lv };
+            if (h.l.value() != (c ? 5 : 7) || cppas.Life.ctors != (c ? 1 : 0)
+                || cppas.Life.copies != (c ? 0 : 1) || cppas.Life.moves != 0
+                || cppas.Life.dtors != 0) return 4505;
+        }
+        if (cppas.Life.dtors != 1 || cppas.Life.last_dtor != (c ? 5 : 7)) return 4505;
+    }
+
+    for (int i = 0; i < 2; i++)
+    {
+        bool c = i == 0;
+        cppas.Life.reset();
+        {
+            CppAssignHost h = { l = c ? cppas.make_life(31) : cppas.make_life(32) };
+            if (h.l.value() != (c ? 31 : 32) || cppas.Life.ctors != 1 || cppas.Life.copies != 0
+                || cppas.Life.moves != 0 || cppas.Life.dtors != 0) return 4506;
+        }
+        if (cppas.Life.dtors != 1 || cppas.Life.last_dtor != (c ? 31 : 32)) return 4506;
+    }
+
+    for (int i = 0; i < 4; i++)
+    {
+        bool a = (i & 1) == 0;
+        bool b = (i & 2) == 0;
+        cppas.Life lv = cppas.Life(9);
+        cppas.Life.reset();
+        {
+            CppAssignHost h = { l = a ? cppas.make_life(4) : (b ? cppas.make_life(5) : lv) };
+            if (h.l.value() != (a ? 4 : (b ? 5 : 9)) || cppas.Life.ctors != (a || b ? 1 : 0)
+                || cppas.Life.copies != (a || b ? 0 : 1) || cppas.Life.moves != 0
+                || cppas.Life.dtors != 0) return 4507;
+        }
+        if (cppas.Life.dtors != 1 || cppas.Life.last_dtor != (a ? 4 : (b ? 5 : 9))) return 4507;
+    }
+
+    for (int i = 0; i < 4; i++)
+    {
+        bool a = (i & 1) == 0;
+        bool b = (i & 2) == 0;
+        cppas.Life lv = cppas.Life(9);
+        cppas.Life.reset();
+        cppas.Life x = a ? cppas.Life(6) : (b ? lv : cppas.make_life(7));
+        if (x.value() != (a ? 6 : (b ? 9 : 7)) || cppas.Life.ctors != (a ? 1 : (b ? 0 : 1))
+            || cppas.Life.copies != (a ? 0 : (b ? 1 : 0)) || cppas.Life.moves != 0
+            || cppas.Life.dtors != 0) return 4508;
+    }
+
+    for (int i = 0; i < 2; i++)
+    {
+        bool a = i == 0;
+        cppas.Life lv = cppas.Life(9);
+        cppas.Life.reset();
+        cppas.Life y = a ? cppas.Life(cppas.read_life(lv)) : cppas.Life(10);
+        if (y.value() != (a ? 9 : 10) || cppas.Life.ctors != 1
+            || cppas.Life.copies != (a ? 1 : 0) || cppas.Life.moves != 0
+            || cppas.Life.dtors != (a ? 1 : 0)) return 4509;
+    }
+
+    // A NON-fresh slot keeps assignment semantics (move-assign from the selected arm); unchanged.
+    for (int i = 0; i < 2; i++)
+    {
+        bool c = i == 0;
+        CppAssignHost h = { l = cppas.Life(0) };
+        cppas.Life.reset();
+        h.l = c ? cppas.Life(41) : cppas.Life(42);
+        if (h.l.value() != (c ? 41 : 42) || cppas.Life.ctors != 1 || cppas.Life.copies != 0
+            || cppas.Life.moves != 0 || cppas.Life.move_assigns != 1
+            || cppas.Life.copy_assigns != 0 || cppas.Life.dtors != 1) return 4510;
     }
 
     for (int i = 0; i < 2; i++)
@@ -11263,6 +11784,108 @@ extern int main()
         if (selected->value() != expected || cppas.Life.ctors != 0
             || cppas.Life.moves != 0 || cppas.Life.copies != 0
             || cppas.Life.dtors != 0) return 3573;
+    }
+    // T231: a C++ class prvalue for a by-value parameter is built in the parameter (C++17 elision,
+    // clang counts). Legs 3584-3589 fail on the pre-fix build (extra move and destroy per argument).
+    {
+        cppbv.Cnt lv = cppbv.Cnt(9);
+        cppbv.Cnt.reset();
+        int a = cppbv.readc(cppbv.make(8));
+        if (a != 8 || cppbv.Cnt.ctors != 1 || cppbv.Cnt.copies != 0 || cppbv.Cnt.moves != 0
+            || cppbv.Cnt.dtors != 1) return 3584;
+        cppbv.Cnt.reset();
+        int b = cppbv.readc(lv);
+        if (b != 9 || cppbv.Cnt.copies != 1 || cppbv.Cnt.moves != 0 || cppbv.Cnt.dtors != 1) return 3584;
+        cppbv.Cnt.reset();
+        int c = cppbv.readc(move lv);
+        if (c != 9 || cppbv.Cnt.copies != 0 || cppbv.Cnt.moves != 1 || cppbv.Cnt.dtors != 1) return 3584;
+    }
+    // Nested prvalue calls: each result is the next parameter, no move; both temps die at the end.
+    cppbv.Cnt.reset();
+    {
+        int a = cppbv.readc(cppbv.readc2(cppbv.make(8)));
+        if (a != 108 || cppbv.Cnt.ctors != 2 || cppbv.Cnt.copies != 0 || cppbv.Cnt.moves != 0
+            || cppbv.Cnt.dtors != 2) return 3585;
+    }
+    // A derived prvalue sliced into a by-value base moves once (clang); a derived lvalue copies once.
+    {
+        cppbv.Cnt.reset();
+        int a = cppbv.takebase(cppbv.CntD(3));
+        if (a != 3 || cppbv.Cnt.ctors != 1 || cppbv.Cnt.copies != 0 || cppbv.Cnt.moves != 1
+            || cppbv.Cnt.dtors != 2) return 3586;
+        cppbv.CntD dl = cppbv.CntD(3);
+        cppbv.Cnt.reset();
+        int b = cppbv.takebase(dl);
+        if (b != 3 || cppbv.Cnt.copies != 1 || cppbv.Cnt.moves != 0 || cppbv.Cnt.dtors != 1) return 3586;
+    }
+    {
+        cppbv.Cnt.reset();
+        int a = t231_cfl_takes(cppbv.make(8));
+        if (a != 8 || cppbv.Cnt.ctors != 1 || cppbv.Cnt.copies != 0 || cppbv.Cnt.moves != 0
+            || cppbv.Cnt.dtors != 1) return 3587;
+    }
+    {
+        cppbv.Holder h;
+        cppbv.Cnt.reset();
+        int a = h.take(cppbv.make(8));
+        if (a != 8 || cppbv.Cnt.ctors != 1 || cppbv.Cnt.copies != 0 || cppbv.Cnt.moves != 0
+            || cppbv.Cnt.dtors != 1) return 3588;
+    }
+    {
+        cppbv.Cnt lv = cppbv.Cnt(5);
+        cppbv.Cnt.reset();
+        int a = cppbv.readc(lv + cppbv.make(8));
+        if (a != 13 || cppbv.Cnt.ctors != 2 || cppbv.Cnt.copies != 1 || cppbv.Cnt.moves != 0
+            || cppbv.Cnt.dtors != 3) return 3589;
+    }
+    // T235: a prvalue LEFT operand is the by-value parameter like the right one (clang counts).
+    // Legs 3688-3690 and 3694 fail on the pre-fix build; 3691-3693 pin the throw paths; 3695 guards.
+    {
+        cppbv.Cnt lv = cppbv.Cnt(5);
+        cppbv.Cnt.reset();
+        int a = cppbv.readc(cppbv.make(2) + lv);
+        if (a != 7 || cppbv.Cnt.ctors != 2 || cppbv.Cnt.copies != 1 || cppbv.Cnt.moves != 0
+            || cppbv.Cnt.dtors != 3) return 3688;
+        cppbv.Cnt.reset();
+        int b = cppbv.readc(cppbv.make(2) + cppbv.make(3));
+        if (b != 5 || cppbv.Cnt.ctors != 3 || cppbv.Cnt.copies != 0 || cppbv.Cnt.moves != 0
+            || cppbv.Cnt.dtors != 3) return 3689;
+        // A call result before a direct construction: the construction stays in CFlat (no wrapper move).
+        cppbv.Cnt.reset();
+        int c = cppbv.pair(cppbv.make(3), cppbv.Cnt(7));
+        if (c != 37 || cppbv.Cnt.ctors != 2 || cppbv.Cnt.copies != 0 || cppbv.Cnt.moves != 0
+            || cppbv.Cnt.dtors != 2) return 3690;
+        // The callee throws with both prvalue parameters live: each is destroyed once.
+        cppbv.Cnt.reset();
+        int d = cppbv.guardInt(T235Throw, 5);
+        if (d != -5 || cppbv.Cnt.ctors != 2 || cppbv.Cnt.copies != 0 || cppbv.Cnt.moves != 0
+            || cppbv.Cnt.dtors != 2) return 3691;
+        // A later argument throws (evaluation order unspecified): every built temp dies once, no move.
+        cppbv.Cnt.reset();
+        int e = cppbv.guardInt(T235Later, 5);
+        if (e != -5 || cppbv.Cnt.ctors != cppbv.Cnt.dtors || cppbv.Cnt.copies != 0
+            || cppbv.Cnt.moves != 0 || cppbv.Cnt.dtors > 2) return 3692;
+        cppbv.Cnt.reset();
+        int sum = 0;
+        for (int i = 0; i < 3; i = i + 1)
+            sum = sum + cppbv.pair(cppbv.make(i), cppbv.Cnt(i));
+        if (sum != 33 || cppbv.Cnt.ctors != 6 || cppbv.Cnt.copies != 0 || cppbv.Cnt.moves != 0
+            || cppbv.Cnt.dtors != 6) return 3693;
+        cppbv.Cnt m2 = cppbv.Cnt(6);
+        cppbv.Cnt.reset();
+        int f = cppbv.readc(cppbv.make(2) + move m2);
+        if (f != 8 || cppbv.Cnt.ctors != 2 || cppbv.Cnt.copies != 0 || cppbv.Cnt.moves != 1
+            || cppbv.Cnt.dtors != 3) return 3694;
+        cppbv.Cnt m1 = cppbv.Cnt(5);
+        cppbv.Cnt.reset();
+        int g = cppbv.readc(move m1 + cppbv.make(8));
+        if (g != 13 || cppbv.Cnt.ctors != 2 || cppbv.Cnt.copies != 0 || cppbv.Cnt.moves != 1
+            || cppbv.Cnt.dtors != 3) return 3695;
+        // T235 review: a mixed set (by value + const&) binds a prvalue operand without a move.
+        cppbv.Cnt.reset();
+        int h = cppbv.readc(cppbv.make(6) / 1.5) + cppbv.readc(1.5 / cppbv.make(6));
+        if (h != 18000 || cppbv.Cnt.ctors != 4 || cppbv.Cnt.copies != 0 || cppbv.Cnt.moves != 0
+            || cppbv.Cnt.dtors != 4) return 3696;
     }
     // ---- C++ variadic and inherited constructor references preserve the caller (3580-3583) ----
     cppvarctor.reset();
@@ -11740,15 +12363,15 @@ extern int main()
     delete cppKeptArm;
     if (cppon.clsDel() != 1 || cppon.dtors() != 1 || cppon.live() != 0) return 3649;
     // A plain ?: arm has no conditional-slot entry; a C++ borrow must not gate the PHI arm value.
-    // Pins the bare-new arm leak (live 2) filed as p3 mixed-ternary-bare-new-call-arg-leaks.
+    // The bare-new arm is freed after the call (T215; was a leak, live 2).
     cppon.reset();
     cppon.Esc* cppPlainFallback = new cppon.Esc(46);
     int cppPlainBorrow = cppon.escRead(cppArmPick > 0
         ? new cppon.Esc(47) : cppPlainFallback);
-    if (cppPlainBorrow != 47 || cppon.clsNew() != 2 || cppon.clsDel() != 0
-        || cppon.dtors() != 0 || cppon.live() != 2) return 3650;
+    if (cppPlainBorrow != 47 || cppon.clsNew() != 2 || cppon.clsDel() != 1
+        || cppon.dtors() != 1 || cppon.live() != 1) return 3650;
     delete cppPlainFallback;
-    if (cppon.clsDel() != 1 || cppon.dtors() != 1 || cppon.live() != 1) return 3650;
+    if (cppon.clsDel() != 2 || cppon.dtors() != 2 || cppon.live() != 0) return 3650;
     // A retaining C++ parameter keeps the selected plain ?: arm until the caller deletes it.
     cppon.reset();
     cppPlainFallback = new cppon.Esc(48);
@@ -12482,6 +13105,95 @@ extern int main()
     auto crBranchConstPointee = cppi.cr_const_ptr();
     if (cppi.crMutable.v > 100) { crBranchConstPointee = &cppi.crMutable; }
     if (crBranchConstPointee->get() != 3 || cppi.crMutable.v != 3) return 7981;
+    // T225: a const pointee assigned on a loop back-edge makes the loop receiver maybe-const.
+    cppi.crMutable.v = 3;
+    cppi.CrPair* t225While = &cppi.crMutable;
+    int t225WhileIndex = 0;
+    while (t225WhileIndex < 2)
+    {
+        if (t225While->get() != 3) return 8010;
+        t225While = &cppi.crConst;
+        t225WhileIndex = t225WhileIndex + 1;
+    }
+    cppi.crMutable.v = 3;
+    cppi.CrPair* t225For = &cppi.crMutable;
+    for (int t225ForIndex = 0; t225ForIndex < 2;
+         t225For = &cppi.crConst, t225ForIndex = t225ForIndex + 1)
+        if (t225For->get() != 3) return 8011;
+    cppi.crMutable.v = 3;
+    cppi.CrPair* t225Do = &cppi.crMutable;
+    int t225DoIndex = 0;
+    do
+    {
+        if (t225Do->get() != 3) return 8012;
+        t225Do = &cppi.crConst;
+        t225DoIndex = t225DoIndex + 1;
+    }
+    while (t225DoIndex < 2);
+    cppi.crMutable.v = 3;
+    cppi.CrPair* t225Return = &cppi.crMutable;
+    int t225ReturnIndex = 0;
+    while (t225ReturnIndex < 2)
+    {
+        if (t225Return->get() != 3) return 8013;
+        t225Return = cppi.cr_const_ptr();
+        t225ReturnIndex = t225ReturnIndex + 1;
+    }
+    cppi.crMutable.v = 3;
+    cppi.CrPair* t225Ternary = &cppi.crMutable;
+    int t225TernaryIndex = 0;
+    while (t225TernaryIndex < 2)
+    {
+        if (t225Ternary->get() != 3) return 8014;
+        t225Ternary = t225TernaryIndex == 0
+            ? &cppi.crConst : &cppi.crMutable;
+        t225TernaryIndex = t225TernaryIndex + 1;
+    }
+    cppi.crMutable.v = 3;
+    const cppi.CrPair t225ConstLocal = default;
+    cppi.CrPair* t225LocalAddress = &cppi.crMutable;
+    int t225LocalAddressIndex = 0;
+    while (t225LocalAddressIndex < 2)
+    {
+        if (t225LocalAddress->get() != 3) return 8017;
+        t225LocalAddress = &t225ConstLocal;
+        t225LocalAddressIndex = t225LocalAddressIndex + 1;
+    }
+    cppi.crMutable.v = 3;
+    const cppi.CrPair* t225ConstSource = &cppi.crConst;
+    cppi.CrPair* t225ConstAlias = &cppi.crMutable;
+    int t225ConstAliasIndex = 0;
+    while (t225ConstAliasIndex < 2)
+    {
+        if (t225ConstAlias->get() != 3) return 8018;
+        t225ConstAlias = t225ConstSource;
+        t225ConstAliasIndex = t225ConstAliasIndex + 1;
+    }
+    // T225 review: an alias made const later in the same loop body (q, then p = q) is const too.
+    cppi.CrPair* t225LateAlias = &cppi.crMutable;
+    cppi.CrPair* t225LateSource = &cppi.crMutable;
+    int t225LateIndex = 0;
+    while (t225LateIndex < 2)
+    {
+        if (t225LateAlias->get() != 3) return 8019;
+        t225LateSource = &cppi.crConst;
+        t225LateAlias = t225LateSource;
+        t225LateIndex = t225LateIndex + 1;
+    }
+    // A nested local with the same name must not make the outer mutable pointer const.
+    cppi.crMutable.v = 3;
+    cppi.CrPair* t225Shadow = &cppi.crMutable;
+    int t225ShadowIndex = 0;
+    while (t225ShadowIndex < 1)
+    {
+        {
+            cppi.CrPair* t225Shadow = &cppi.crMutable;
+            t225Shadow = &cppi.crConst;
+            if (t225Shadow->get() != 3) return 8015;
+        }
+        if (t225Shadow->get() != 13 || cppi.crMutable.v != 13) return 8016;
+        t225ShadowIndex = t225ShadowIndex + 1;
+    }
     cppi.crMutable.v = 3;
     if (crCallGet(crCopiedConstPointee) != 13 || cppi.crMutable.v != 13) return 7979;
     cppi.MtSinkNoCopy mtSink = cppi.MtSinkNoCopy();
@@ -13198,6 +13910,91 @@ extern int main()
         w4R = W4NestedJoin(0);
         if (w4R != -1 || cppon.live() != 0 || cppon.dtors() != 0
             || cppon.clsNew() != 0 || cppon.clsDel() != 0) return 3204;
+    }
+    // T236: a `??` / `?:` pointer join names its pointee as a C++ constructor argument (retained
+    // here, so the object survives for escTake); `?:` and `??` arrows read the arm pointee; a direct
+    // `new` into a borrowing CFlat callee frees on unwind as the `??` join form does.
+    {
+        int t236C = 1;
+        cppon.reset();
+        cppon.Esc* t236N = nullptr;
+        cppon.EscHolder t236Coal = cppon.EscHolder(t236N ?? new cppon.Esc(5), 0);
+        cppon.Esc* t236Got = cppon.escTake();
+        if (t236Coal.v != 5 || t236Got == nullptr || t236Got->v != 5 || cppon.live() != 1
+            || cppon.clsNew() != 1 || cppon.clsDel() != 0) return 3240;
+        delete t236Got;
+        if (cppon.live() != 0 || cppon.dtors() != 1 || cppon.clsDel() != 1) return 3240;
+        cppon.reset();
+        cppon.EscHolder t236Tern = cppon.EscHolder(t236C != 0 ? new cppon.Esc(6) : t236N, 0);
+        t236Got = cppon.escTake();
+        if (t236Tern.v != 6 || t236Got == nullptr || t236Got->v != 6 || cppon.live() != 1
+            || cppon.clsNew() != 1 || cppon.clsDel() != 0) return 3241;
+        delete t236Got;
+        if (cppon.live() != 0 || cppon.dtors() != 1 || cppon.clsDel() != 1) return 3241;
+        cppon.Esc* t236A = new cppon.Esc(11);
+        cppon.Esc* t236B = new cppon.Esc(12);
+        if ((t236C != 0 ? t236A : t236B)->v != 11 || (t236C == 0 ? t236A : t236B)->v != 12
+            || (t236C != 0 ? t236A : t236N)->v != 11) return 3242;
+        delete t236A;
+        delete t236B;
+        T236Node* t236Sa = new T236Node();
+        t236Sa->v = 22;
+        T236Node* t236Sb = new T236Node();
+        t236Sb->v = 33;
+        if ((t236C != 0 ? t236Sa : t236Sb)->v != 22 || (t236C == 0 ? t236Sa : t236Sb)->v != 33) return 3243;
+        delete t236Sa;
+        delete t236Sb;
+        cppon.reset();
+        if (cppunw.guarded(T236BorrowDirect, 41) != -41 || cppon.live() != 0 || cppon.dtors() != 1
+            || cppon.clsNew() != 1 || cppon.clsDel() != 1) return 3244;
+        cppon.reset();
+        if (cppunw.guarded(T236BorrowJoin, 42) != -42 || cppon.live() != 0 || cppon.dtors() != 1
+            || cppon.clsNew() != 1 || cppon.clsDel() != 1) return 3245;
+        cppon.reset();
+        if (T236BorrowDirect(0) != 0 || cppon.live() != 0 || cppon.dtors() != 1
+            || cppon.clsNew() != 1 || cppon.clsDel() != 1) return 3246;
+        // Round 2 (leg 3254): a join of derived pointers into a ctor taking a NON-FIRST base pointer
+        // is adjusted to the base subobject (7 / 8 as clang; un-adjusted it reads pad, 100).
+        cppon.T236D* f1d1 = new cppon.T236D();
+        f1d1->pad = 100;
+        f1d1->b = 7;
+        cppon.T236D* f1d2 = new cppon.T236D();
+        f1d2->pad = 100;
+        f1d2->b = 8;
+        cppon.T236D* f1dn = nullptr;
+        cppon.T236Hb f1Tern = cppon.T236Hb(t236C != 0 ? f1d1 : f1d2, 0);
+        cppon.T236Hb f1Coal = cppon.T236Hb(f1dn ?? f1d2, 0);
+        cppon.T236Hb* f1New = new cppon.T236Hb(t236C != 0 ? f1d1 : f1d2, 1);
+        if (f1Tern.r != 7 || f1Coal.r != 8 || f1New->r != 8) return 3254;
+        delete f1New;
+        delete f1d1;
+        delete f1d2;
+        // Round 2 (legs 3255-3258): the join arm is typed from a nullptr-initialized slot's declared
+        // type or from its raw `new` arm, with no earlier `new` of the pointee in the helper.
+        cppon.reset();
+        if (T236JoinCoalLocal(0) != 5 || cppon.live() != 1 || cppon.clsNew() != 1
+            || cppon.clsDel() != 0) return 3255;
+        cppon.Esc* t236R2Got = cppon.escTake();
+        delete t236R2Got;
+        if (cppon.live() != 0 || cppon.dtors() != 1 || cppon.clsDel() != 1) return 3255;
+        cppon.reset();
+        if (T236JoinTernLocal(0) != 6 || cppon.live() != 1 || cppon.clsNew() != 1
+            || cppon.clsDel() != 0) return 3256;
+        t236R2Got = cppon.escTake();
+        delete t236R2Got;
+        if (cppon.live() != 0 || cppon.dtors() != 1 || cppon.clsDel() != 1) return 3256;
+        cppon.reset();
+        if (T236JoinCoalGlobal(0) != 7 || cppon.live() != 1 || cppon.clsNew() != 1
+            || cppon.clsDel() != 0) return 3257;
+        t236R2Got = cppon.escTake();
+        delete t236R2Got;
+        if (cppon.live() != 0 || cppon.dtors() != 1 || cppon.clsDel() != 1) return 3257;
+        cppon.reset();
+        if (T236JoinTernField(0) != 8 || cppon.live() != 1 || cppon.clsNew() != 1
+            || cppon.clsDel() != 0) return 3258;
+        t236R2Got = cppon.escTake();
+        delete t236R2Got;
+        if (cppon.live() != 0 || cppon.dtors() != 1 || cppon.clsDel() != 1) return 3258;
     }
     // Pointer-to-reference ranking keeps only candidates whose referent matches the pointee.
     int[2] ptrRefData = { 7, 19 };
@@ -14421,6 +15218,91 @@ int LoweredUserDtorAssignLegs(int argc)
     cppunw.reset();
     if (cppunw.guarded(T129ThrowArrayInit, 0) != -6) return 12912;
     if (cppunw.live() != 0 || cppunw.dtors() != 4) return 12913;
+    // T218: an expression, mixed or call-result element written over a user-ctor array element
+    // destroys the element it replaces: counts balance, and values match the T129 braced route.
+    T129UserCtor t218X = { m = 7 };
+    int t218V0 = 0; int t218V1 = 0; int t218V2 = 0; int t218K = 0;
+    cppexp.conv_reset();
+    {
+        T129ArrayOuter t218Two = { h = { t218X, t218X } };
+        t218V0 = t218Two.h[0].m.v; t218V1 = t218Two.h[1].m.v;
+        t218K = t218Two.h[0].k + t218Two.h[1].k;
+    }
+    if (t218V0 != 1107 || t218V1 != 1107 || t218K != 4) return 12914;
+    if (cppexp.conv_ctor_count() != 4 || cppexp.conv_dtor_count() != 4) return 12915;
+    cppexp.conv_reset();
+    {
+        T129ArrayOuter t218Mixed = { h = { { m = 5 }, t218X } };
+        t218V0 = t218Mixed.h[0].m.v; t218V1 = t218Mixed.h[1].m.v;
+    }
+    if (t218V0 != 1005 || t218V1 != 1107) return 12916;
+    if (cppexp.conv_ctor_count() != 5 || cppexp.conv_dtor_count() != 5) return 12917;
+    cppexp.conv_reset();
+    {
+        T129ArrayOuter t218Reversed = { h = { t218X, { m = 6 } } };
+        t218V0 = t218Reversed.h[0].m.v; t218V1 = t218Reversed.h[1].m.v;
+    }
+    if (t218V0 != 1107 || t218V1 != 1006) return 12918;
+    if (cppexp.conv_ctor_count() != 5 || cppexp.conv_dtor_count() != 5) return 12919;
+    cppexp.conv_reset();
+    {
+        T218Single t218One = { h = { t218X } };
+        t218V0 = t218One.h[0].m.v;
+    }
+    if (t218V0 != 1107) return 12920;
+    if (cppexp.conv_ctor_count() != 2 || cppexp.conv_dtor_count() != 2) return 12921;
+    cppexp.conv_reset();
+    {
+        T218Triple t218Three = { h = { t218X, t218X, t218X } };
+        t218V0 = t218Three.h[0].m.v; t218V1 = t218Three.h[1].m.v; t218V2 = t218Three.h[2].m.v;
+    }
+    if (t218V0 != 1107 || t218V1 != 1107 || t218V2 != 1107) return 12922;
+    if (cppexp.conv_ctor_count() != 6 || cppexp.conv_dtor_count() != 6) return 12923;
+    cppexp.conv_reset();
+    {
+        T129ArrayOuter t218Call = { h = { T218Make(), t218X } };
+        t218V0 = t218Call.h[0].m.v; t218V1 = t218Call.h[1].m.v;
+    }
+    if (t218V0 != 1009 || t218V1 != 1107) return 12924;
+    if (cppexp.conv_ctor_count() != cppexp.conv_dtor_count()) return 12925;
+    cppexp.conv_reset();
+    {
+        T129ArrayOuter* t218Heap = new T129ArrayOuter { h = { t218X, t218X } };
+        t218V0 = t218Heap->h[0].m.v;
+        delete t218Heap;
+    }
+    if (t218V0 != 1107) return 12926;
+    if (cppexp.conv_ctor_count() != 4 || cppexp.conv_dtor_count() != 4) return 12927;
+    // T218 owning CFlat fields: a unique<T> element replaced by an element write is released.
+    t218Live = 0;
+    {
+        T218Owned t218Y1 = default;
+        T218Owned t218Y2 = default;
+        T218OwnedArray t218Owned = { h = { move t218Y1, move t218Y2 } };
+    }
+    if (t218Live != 0) return 12928;
+    t218Live = 0;
+    {
+        T218OwnedArray t218OwnCall = { h = { T218MakeOwned(), T218MakeOwned() } };
+    }
+    if (t218Live != 0) return 12929;
+    // 2-D rows mixing expression and braced elements; the moved-from local is destroyed at scope end.
+    cppexp.conv_reset();
+    {
+        T129Array2DOuter t218TwoD = { h = { { t218X, t218X }, { { m = 5 }, t218X } } };
+        t218V0 = t218TwoD.h[0][0].m.v; t218V1 = t218TwoD.h[0][1].m.v;
+        t218V2 = t218TwoD.h[1][0].m.v;
+        t218K = t218TwoD.h[1][1].m.v;
+    }
+    if (t218V0 != 1107 || t218V1 != 1107 || t218V2 != 1005 || t218K != 1107) return 12930;
+    if (cppexp.conv_ctor_count() != cppexp.conv_dtor_count()) return 12931;
+    cppexp.conv_reset();
+    {
+        T129UserCtor t218M1 = { m = 3 };
+        T129UserCtor t218M2 = { m = 4 };
+        T129ArrayOuter t218MoveArr = { h = { move t218M1, t218M2 } };
+    }
+    if (cppexp.conv_ctor_count() != cppexp.conv_dtor_count()) return 12932;
     // T130: same-local returns of CFlat structs construct into the caller's sret slot.
     cppexp.conv_reset();
     {
@@ -14506,6 +15388,190 @@ int LoweredUserDtorAssignLegs(int argc)
         if (value.t.get() != 0 || cppunw.live() != 1 || cppunw.dtors() != 0) return 13024;
     }
     if (cppunw.live() != 0 || cppunw.dtors() != 1) return 13025;
+    // T224: clang++ -std=c++20 elides every return below (oracle: scratch/t224_tmp/probe_nrvo*.cpp).
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T224Nested(1);
+        if (value.c.v != 5 || cppexp.conv_ctor_count() != 1
+            || cppexp.conv_dtor_count() != 0) return 13026;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13027;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T224Scoped(0);
+        if (value.c.v != 5 || cppexp.conv_ctor_count() != 2
+            || cppexp.conv_dtor_count() != 1) return 13028;
+    }
+    if (cppexp.conv_dtor_count() != 2) return 13029;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T224Shadow();
+        if (value.c.v != 6 || cppexp.conv_ctor_count() != 2
+            || cppexp.conv_dtor_count() != 1) return 13030;
+    }
+    if (cppexp.conv_dtor_count() != 2) return 13031;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T224Outer();
+        if (value.c.v != 5 || cppexp.conv_ctor_count() != 2
+            || cppexp.conv_dtor_count() != 1) return 13032;
+    }
+    if (cppexp.conv_dtor_count() != 2) return 13033;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T224Loop(2);
+        if (value.c.v != 7 || cppexp.conv_ctor_count() != 3
+            || cppexp.conv_dtor_count() != 2) return 13034;
+    }
+    if (cppexp.conv_dtor_count() != 3) return 13035;
+    cppunw.reset();
+    if (cppunw.guarded(T224ThrowWrapper, 5) != -5) return 13036;
+    if (cppunw.live() != 0 || cppunw.dtors() != 1) return 13037;
+    // T224: construct_at(slot, f(args)) builds the call's C++ class result straight into the slot.
+    cppexp.conv_reset();
+    {
+        cppexp.ConvCnt* slot = (cppexp.ConvCnt*)malloc((i64)sizeof(cppexp.ConvCnt));
+        construct_at(slot, T224Mk(5));
+        if (slot->v != 5 || cppexp.conv_ctor_count() != 1
+            || cppexp.conv_dtor_count() != 0) return 13038;
+        free(slot);
+    }
+    // T224: the nested candidate's return moves nothing; the caller's destructor runs once.
+    cppunw.reset();
+    {
+        T130ThrowHolder value = T224ThrowNested(0);
+        if (value.t.get() != 0 || cppunw.live() != 1 || cppunw.dtors() != 0) return 13039;
+    }
+    if (cppunw.live() != 0 || cppunw.dtors() != 1) return 13040;
+    // T228: each candidate local is elided on its own live range (clang++ oracle counts in the helpers' comment).
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T228Sibling(0);
+        if (value.c.v != 6 || cppexp.conv_ctor_count() != 2
+            || cppexp.conv_dtor_count() != 1) return 13041;
+    }
+    if (cppexp.conv_dtor_count() != 2) return 13041;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T228Sibling(1);
+        if (value.c.v != 5 || cppexp.conv_ctor_count() != 1
+            || cppexp.conv_dtor_count() != 0) return 13042;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13042;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T228Shared(1);
+        if (value.c.v != 7 || cppexp.conv_ctor_count() != 2
+            || cppexp.conv_dtor_count() != 1) return 13043;
+    }
+    if (cppexp.conv_dtor_count() != 2) return 13043;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T228Shared(0);
+        if (value.c.v != 1005 || cppexp.conv_ctor_count() != 3
+            || cppexp.conv_dtor_count() != 2) return 13044;
+    }
+    if (cppexp.conv_dtor_count() != 3) return 13044;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T228Mixed(0);
+        if (value.c.v != 6 || cppexp.conv_ctor_count() != 2
+            || cppexp.conv_dtor_count() != 1) return 13045;
+    }
+    if (cppexp.conv_dtor_count() != 2) return 13045;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T228Mixed(1);
+        if (value.c.v != 1005 || cppexp.conv_ctor_count() != 2
+            || cppexp.conv_dtor_count() != 1) return 13046;
+    }
+    if (cppexp.conv_dtor_count() != 2) return 13046;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T228Early(0);
+        if (value.c.v != 6 || cppexp.conv_ctor_count() != 1
+            || cppexp.conv_dtor_count() != 0) return 13047;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13047;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T228Early(1);
+        if (value.c.v != 5 || cppexp.conv_ctor_count() != 1
+            || cppexp.conv_dtor_count() != 0) return 13048;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13048;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T228Tail(0);
+        if (value.c.v != 7 || cppexp.conv_ctor_count() != 3
+            || cppexp.conv_dtor_count() != 2) return 13049;
+    }
+    if (cppexp.conv_dtor_count() != 3) return 13049;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T228Tail(1);
+        if (value.c.v != 6 || cppexp.conv_ctor_count() != 2
+            || cppexp.conv_dtor_count() != 1) return 13050;
+    }
+    if (cppexp.conv_dtor_count() != 2) return 13050;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T228Shadow(0);
+        if (value.c.v != 1005 || cppexp.conv_ctor_count() != 3
+            || cppexp.conv_dtor_count() != 2) return 13051;
+    }
+    if (cppexp.conv_dtor_count() != 3) return 13051;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T228Shadow(1);
+        if (value.c.v != 6 || cppexp.conv_ctor_count() != 2
+            || cppexp.conv_dtor_count() != 1) return 13052;
+    }
+    if (cppexp.conv_dtor_count() != 2) return 13052;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T228Switch(0);
+        if (value.c.v != 5 || cppexp.conv_ctor_count() != 1
+            || cppexp.conv_dtor_count() != 0) return 13053;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13053;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T228Switch(1);
+        if (value.c.v != 6 || cppexp.conv_ctor_count() != 1
+            || cppexp.conv_dtor_count() != 0) return 13054;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13054;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T228Loop(0);
+        if (value.c.v != 7 || cppexp.conv_ctor_count() != 1
+            || cppexp.conv_dtor_count() != 0) return 13055;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13055;
+    cppexp.conv_reset();
+    {
+        T130ReturnHolder value = T228Loop(3);
+        if (value.c.v != 7 || cppexp.conv_ctor_count() != 3
+            || cppexp.conv_dtor_count() != 2) return 13056;
+    }
+    if (cppexp.conv_dtor_count() != 3) return 13056;
+    // T228: a sibling candidate whose block falls through after a live candidate's throw.
+    cppunw.reset();
+    {
+        T130ThrowHolder value = T228ThrowSibling(0);
+        if (value.t.get() != 0 || cppunw.live() != 1 || cppunw.dtors() != 0) return 13057;
+    }
+    if (cppunw.live() != 0 || cppunw.dtors() != 1) return 13057;
+    cppunw.reset();
+    {
+        T130ThrowHolder value = T228ThrowSibling(-1);
+        if (value.t.get() != 0 || cppunw.live() != 1 || cppunw.dtors() != 1) return 13058;
+    }
+    if (cppunw.live() != 0 || cppunw.dtors() != 2) return 13058;
+    cppunw.reset();
+    if (cppunw.guarded(T228ThrowWrapper, 5) != -5) return 13059;
+    if (cppunw.live() != 0 || cppunw.dtors() != 1) return 13059;
     // T97: a C++ field named by a brace default keeps its value when the CFlat struct has no user ctor.
     // Probe scratch/repro_keep/v20/rv20/d/p.cb (master gave d.v=0 here; the user-ctor form was already right).
     cpp_t97.reset();
@@ -14599,6 +15665,11 @@ cppas.TallyByValue ByValueParenTernReturn2(int f, cppas.TallyByValue* a, cppas.T
     return ((f != 0 ? (*a = 3) : (*c += 5)));
 }
 int ObAliasParam(alias cppas.ObSelf p) { if (p) return 1; return 2; }
+// T231: a CFlat function's by-value parameter of a C++ class (leg 3587).
+int t231_cfl_takes(cppbv.Cnt x) { return x.v; }
+// T235: a prvalue first and a throwing callee / throwing later argument (legs 3691-3692).
+int T235Throw(int x) { return cppbv.pairThrow(cppbv.make(x), cppbv.Cnt(x * 100)); }
+int T235Later(int x) { return cppbv.pair(cppbv.make(x), cppbv.Cnt(cppbv.boomArg(x))); }
 int ObPtrParam(cppas.ObSelf* p) { if (*p) return 1; return 2; }
 int* EscTernFieldAddr(int x) { return x > 0 ? &(new cppon.Esc(x))->v : nullptr; }
 int* EscLaunderedFieldAddr(int x) { return (int*)(long)&(new cppon.Esc(x))->v; }
@@ -14684,4 +15755,44 @@ int W4NestedJoin(int c)
 {
     cppon.Esc* empty = nullptr;
     return W4JoinRead(empty ?? (c > 0 ? new cppon.Esc(3) : empty));
+}
+
+// T236 helpers (legs 3240-3246): a CFlat borrowing callee that throws through a C++ helper.
+// Borrows p: it is read here, never handed to a C++ callee that could keep it.
+int T236BorrowCallee(cppon.Esc* p, int t) { cppunw.thrower(t); return p == nullptr ? -1 : p->v; }
+int T236BorrowDirect(int x) { return T236BorrowCallee(new cppon.Esc(x), x); }
+int T236BorrowJoin(int x)
+{
+    cppon.Esc* empty = nullptr;
+    return T236BorrowCallee(empty ?? new cppon.Esc(x), x);
+}
+// T236 round 2 (legs 3255-3258): each helper has NO earlier `new cppon.Esc`, so the join arm must
+// be typed from the nullptr-initialized slot's DECLARED type (local, global, field).
+cppon.Esc* T236GlobalNull = nullptr;
+struct T236Slot { cppon.Esc* p; };
+int T236JoinCoalLocal(int x)
+{
+    cppon.Esc* empty = nullptr;
+    cppon.EscHolder h = cppon.EscHolder(empty ?? new cppon.Esc(5), x);
+    return h.v;
+}
+int T236JoinTernLocal(int x)
+{
+    bool c = true;
+    cppon.Esc* n = nullptr;
+    cppon.EscHolder h = cppon.EscHolder(c ? new cppon.Esc(6) : n, x);
+    return h.v;
+}
+int T236JoinCoalGlobal(int x)
+{
+    cppon.EscHolder h = cppon.EscHolder(T236GlobalNull ?? new cppon.Esc(7), x);
+    return h.v;
+}
+int T236JoinTernField(int x)
+{
+    bool c = true;
+    T236Slot s = T236Slot();
+    s.p = nullptr;
+    cppon.EscHolder h = cppon.EscHolder(c ? new cppon.Esc(8) : s.p, x);
+    return h.v;
 }

@@ -2803,17 +2803,6 @@ static bool HasNonAutomaticStorageClass(CFlatParser::DeclarationSpecifiersContex
     return false;
 }
 
-static bool DeclarationNamesVariable(CFlatParser::DeclarationContext* declaration,
-                                     const std::string& name)
-{
-    if (declaration == nullptr || declaration->initDeclaratorList() == nullptr) return false;
-    for (auto* init : declaration->initDeclaratorList()->initDeclarator())
-        if (init->declarator() != nullptr
-            && getDirectDeclName(init->declarator()->directDeclarator()) == name)
-            return true;
-    return false;
-}
-
 static bool IsBareReturnIdentifier(const std::string& text)
 {
     if (text.empty()) return false;
@@ -2825,85 +2814,151 @@ static bool IsBareReturnIdentifier(const std::string& text)
     });
 }
 
-static bool HasOtherOwnDeclarationNamed(antlr4::tree::ParseTree* node,
-                                        const std::string& name,
-                                        CFlatParser::DeclarationContext* selected)
+// Scope-resolved walk for the named-return candidates. Every plain automatic local is a candidate;
+// a scope maps each name to its candidate index, or to kNoCandidate for any other binding
+// (parameter, static, for/foreach, destructuring, pattern binding).
+struct NamedLocalReturnScan
 {
-    if (node == nullptr) return false;
-    if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node) != nullptr) return false;
-    if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(node);
-        declaration != nullptr && declaration != selected
-        && DeclarationNamesVariable(declaration, name))
-        return true;
-    if (auto* destructuring = dynamic_cast<CFlatParser::DestructuringDeclarationContext*>(node))
-        for (auto* entry : destructuring->destructuringEntry())
-            if (entry->Identifier() != nullptr && entry->Identifier()->getText() == name)
-                return true;
+    static constexpr size_t kNoCandidate = static_cast<size_t>(-1);
+    using Scope = std::vector<std::pair<std::string, size_t>>;
+    struct Candidate
+    {
+        CFlatParser::DirectDeclaratorContext* declarator = nullptr;
+        bool named = false;   // some return names this local
+        bool killed = false;  // some return inside its live range names something else
+    };
+    std::vector<Scope> scopes;
+    std::vector<Candidate> candidates;
+
+    void Bind(const std::string& name, CFlatParser::DirectDeclaratorContext* local)
+    {
+        if (scopes.empty()) return;
+        size_t index = kNoCandidate;
+        if (local != nullptr)
+        {
+            index = candidates.size();
+            candidates.push_back(Candidate{local});
+        }
+        scopes.back().emplace_back(name, index);
+    }
+    // Innermost binding wins. kNoCandidate for an unknown name or a non-automatic binding.
+    size_t Resolve(const std::string& name) const
+    {
+        for (auto scope = scopes.rbegin(); scope != scopes.rend(); ++scope)
+            for (auto entry = scope->rbegin(); entry != scope->rend(); ++entry)
+                if (entry->first == name) return entry->second;
+        return kNoCandidate;
+    }
+    // A return naming `named` (kNoCandidate: no local) ends the live range of every other candidate
+    // in scope here. Candidates declared later are not in scope yet, so they are unaffected.
+    void Return(size_t named)
+    {
+        for (const auto& scope : scopes)
+            for (const auto& entry : scope)
+                if (entry.second != kNoCandidate && entry.second != named)
+                    candidates[entry.second].killed = true;
+        if (named != kNoCandidate) candidates[named].named = true;
+    }
+};
+
+static void NamedLocalReturnVisit(antlr4::tree::ParseTree* node, NamedLocalReturnScan& scan)
+{
+    if (node == nullptr) return;
+    if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node) != nullptr) return;
+    auto visitChildren = [&]() {
+        for (auto* child : node->children) NamedLocalReturnVisit(child, scan);
+    };
+    if (dynamic_cast<CFlatParser::CompoundStatementContext*>(node) != nullptr)
+    {
+        scan.scopes.emplace_back();
+        visitChildren();
+        scan.scopes.pop_back();
+        return;
+    }
     if (auto* loop = AsRuleCtx<CFlatParser::IterationStatementContext>(node))
     {
-        if (loop->In() != nullptr && loop->Identifier() != nullptr
-            && loop->Identifier()->getText() == name)
-            return true;
-        if (loop->forCondition() != nullptr && loop->forCondition()->forDeclaration() != nullptr)
-        {
-            auto* decl = loop->forCondition()->forDeclaration();
-            if (decl->initDeclaratorList() != nullptr)
-                for (auto* init : decl->initDeclaratorList()->initDeclarator())
-                    if (init->declarator() != nullptr
-                        && getDirectDeclName(init->declarator()->directDeclarator()) == name)
-                        return true;
-        }
+        scan.scopes.emplace_back();
+        if (loop->In() != nullptr && loop->Identifier() != nullptr)
+            scan.Bind(loop->Identifier()->getText(), nullptr);
+        visitChildren();
+        scan.scopes.pop_back();
+        return;
     }
-    for (auto* child : node->children)
-        if (HasOtherOwnDeclarationNamed(child, name, selected)) return true;
-    return false;
+    if (auto* labeled = AsRuleCtx<CFlatParser::LabeledStatementContext>(node))
+    {
+        // A pattern arm binds its identifier; a plain label (starts with the identifier) does not.
+        scan.scopes.emplace_back();
+        if (labeled->Identifier() != nullptr
+            && labeled->getStart()->getType() != CFlatParser::Identifier)
+            scan.Bind(labeled->Identifier()->getText(), nullptr);
+        visitChildren();
+        scan.scopes.pop_back();
+        return;
+    }
+    if (auto* destructuring = dynamic_cast<CFlatParser::DestructuringDeclarationContext*>(node))
+    {
+        for (auto* entry : destructuring->destructuringEntry())
+            if (entry->Identifier() != nullptr) scan.Bind(entry->Identifier()->getText(), nullptr);
+        return;
+    }
+    if (auto* forDecl = dynamic_cast<CFlatParser::ForDeclarationContext*>(node))
+    {
+        if (forDecl->initDeclaratorList() != nullptr)
+            for (auto* init : forDecl->initDeclaratorList()->initDeclarator())
+                if (init->declarator() != nullptr)
+                    scan.Bind(getDirectDeclName(init->declarator()->directDeclarator()), nullptr);
+        return;
+    }
+    if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(node))
+    {
+        const bool automatic = !HasNonAutomaticStorageClass(declaration->declarationSpecifiers());
+        if (declaration->initDeclaratorList() != nullptr)
+            for (auto* init : declaration->initDeclaratorList()->initDeclarator())
+                if (init->declarator() != nullptr && init->declarator()->directDeclarator() != nullptr)
+                    scan.Bind(getDirectDeclName(init->declarator()->directDeclarator()),
+                              automatic ? init->declarator()->directDeclarator() : nullptr);
+        return;
+    }
+    if (auto* jump = AsRuleCtx<CFlatParser::JumpStatementContext>(node))
+    {
+        if (jump->Return() == nullptr) { visitChildren(); return; }
+        // Only a bare identifier (no cast or wrapper) names a local; anything else names none.
+        size_t named = NamedLocalReturnScan::kNoCandidate;
+        if (jump->expression() != nullptr && jump->compoundStatement() == nullptr)
+        {
+            std::vector<std::string> wrapperTypes;
+            const std::string returned = BareSourceText(jump->expression(), &wrapperTypes);
+            if (wrapperTypes.empty() && IsBareReturnIdentifier(returned))
+                named = scan.Resolve(returned);
+        }
+        scan.Return(named);
+        return;
+    }
+    visitChildren();
 }
 
-// Pre-scan the function's returns before codegen. Only a single, function-scope local name used
-// by every return can share the hidden sret slot; all other shapes keep ordinary return lowering.
-static std::string ClassifyNamedLocalReturnCandidate(CFlatParser::FunctionDefinitionContext* func)
+// Pre-scan the function's returns before codegen (clang's NRVO rule): a local is built in the hidden
+// sret slot when every return statement inside its live range - after its declarator, in its
+// scope - names it. Several such locals may share the slot: their live ranges cannot overlap,
+// since a return inside both would have to name both. Returns in declaration order.
+static std::vector<CFlatParser::DirectDeclaratorContext*> ClassifyNamedLocalReturnCandidates(
+    CFlatParser::FunctionDefinitionContext* func)
 {
+    std::vector<CFlatParser::DirectDeclaratorContext*> out;
     if (func == nullptr || func->compoundStatement() == nullptr
         || func->compoundStatement()->blockItemList() == nullptr)
-        return {};
+        return out;
 
-    std::vector<CFlatParser::JumpStatementContext*> returns;
-    CollectOwnReturnStatements(func->compoundStatement(), returns);
-    if (returns.empty()) return {};
-
-    std::string name;
-    for (auto* jump : returns)
-    {
-        if (jump->expression() == nullptr || jump->compoundStatement() != nullptr) return {};
-        std::vector<std::string> wrapperTypes;
-        std::string returned = BareSourceText(jump->expression(), &wrapperTypes);
-        if (!wrapperTypes.empty() || !IsBareReturnIdentifier(returned)) return {};
-        if (name.empty()) name = std::move(returned);
-        else if (name != returned) return {};
-    }
-
-    CFlatParser::DeclarationContext* selected = nullptr;
-    for (auto* item : func->compoundStatement()->blockItemList()->blockItem())
-        if (auto* declaration = item->declaration();
-            declaration != nullptr && DeclarationNamesVariable(declaration, name))
-        {
-            if (selected != nullptr) return {};
-            selected = declaration;
-        }
-    if (selected == nullptr || HasNonAutomaticStorageClass(selected->declarationSpecifiers()))
-        return {};
-
-    const auto declarationToken = selected->getStart()->getTokenIndex();
-    for (auto* jump : returns)
-        if (jump->getStart()->getTokenIndex() < declarationToken) return {};
-
-    if (HasOtherOwnDeclarationNamed(func->compoundStatement(), name, selected)) return {};
+    NamedLocalReturnScan scan;
+    scan.scopes.emplace_back();
     if (func->parameterTypeList() != nullptr && func->parameterTypeList()->parameterList() != nullptr)
         for (auto* param : func->parameterTypeList()->parameterList()->parameterDeclaration())
-            if (param->declarator() != nullptr
-                && getDirectDeclName(param->declarator()->directDeclarator()) == name)
-                return {};
-    return name;
+            if (param->declarator() != nullptr && param->declarator()->directDeclarator() != nullptr)
+                scan.Bind(getDirectDeclName(param->declarator()->directDeclarator()), nullptr);
+    NamedLocalReturnVisit(func->compoundStatement(), scan);
+    for (const auto& candidate : scan.candidates)
+        if (candidate.named && !candidate.killed) out.push_back(candidate.declarator);
+    return out;
 }
 
 enum class ValueStructReturnKind { NotApplicable, AllBorrowedParam, Mixed };
@@ -3299,10 +3354,12 @@ inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unorde
 // Collect the bare names a body stores INTO as a whole (`w = v`, `w += k`). Lambdas and nested
 // functions are a different scope. Drives the copy-on-entry of a written copyable parameter.
 inline void CollectWholeNameStoreDestinations(antlr4::tree::ParseTree* node,
-                                              std::unordered_set<std::string>& out)
+                                              std::unordered_set<std::string>& out,
+                                              bool skipLambdas = false)
 {
     if (node == nullptr) return;
     if (AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node)) return;
+    if (skipLambdas && AsRuleCtx<CFlatParser::LambdaExpressionContext>(node)) return;
     if (auto* asn = AsRuleCtx<CFlatParser::AssignmentExpressionContext>(node))
         if (asn->assignmentOperator() != nullptr && asn->unaryExpression() != nullptr)
         {
@@ -3311,7 +3368,7 @@ inline void CollectWholeNameStoreDestinations(antlr4::tree::ParseTree* node,
                 out.insert(dest);
         }
     for (auto* child : node->children)
-        CollectWholeNameStoreDestinations(child, out);
+        CollectWholeNameStoreDestinations(child, out, skipLambdas);
 }
 
 // First character of a rule's source text without building the subtree string (getText()
@@ -4478,10 +4535,10 @@ private:
     struct NamedReturnElisionContext
     {
         llvm::Function* function = nullptr;
-        std::string variableName;
+        // The locals every return names within their live ranges (scope-resolved declarators);
+        // they all share the sret slot, and their live ranges never overlap.
+        std::vector<CFlatParser::DirectDeclaratorContext*> declarators;
         llvm::Value* sretStorage = nullptr;
-        llvm::Value* localStorage = nullptr;
-        size_t functionScopeDepth = 0;
     } namedReturnElision_;
 
     struct NamedReturnElisionScope
@@ -5189,6 +5246,8 @@ public:
     // Must run while still in the body block: FlushOwnedTemps' dominance guard frees only temps
     // registered in the current block, so the caller branches to the loop latch / resume after.
     void ParseControlledBody(CFlatParser::StatementContext* body);
+    void MarkLoopBackEdgeCxxConstPointers(
+        LLVMBackend* compiler, CFlatParser::IterationStatementContext* loop);
 
     // Trace one candidate DATA pointer to the frame alloca it addresses, or nullptr when it
     // outlives the frame (heap, global, by-reference parameter, or anything loaded).
@@ -6884,8 +6943,10 @@ public:
     void CheckMovedReceiver(const LLVMBackend::NamedVariable& receiver);
 
     // Give an untyped literal argument the shape a C++ constructor overload can match on.
+    // sourceTwin: the argument's own TypeAndValue that lowering reads; a typed join is mirrored there.
     void TypeUntypedCtorArg(LLVMBackend::TypeAndValue& argType, llvm::Value* argValue,
-                            const std::string& suffixedLiteralIdentity = {});
+                            const std::string& suffixedLiteralIdentity = {},
+                            LLVMBackend::TypeAndValue* sourceTwin = nullptr);
 
     llvm::Value* LoadNamedVariableImpl(LLVMBackend::NamedVariable& namedVar);
 
@@ -7909,6 +7970,8 @@ public:
         const LLVMBackend::TypeAndValue& dest);
     LLVMBackend::TypeAndValue InferTernaryArmType(llvm::Value* value);
     LLVMBackend::TypeAndValue InferTernaryArmType(const LLVMBackend::TypedValue& value);
+    // Pointee name of a `??` / `?:` pointer join, read from its arms (empty when unproven).
+    LLVMBackend::TypeAndValue JoinedPointerArmType(llvm::Value* joined);
 
     // A discarded statement result (`makePlain(2);`) that is an unclaimed owning-struct rvalue
     // temp is claimed by nothing, so without this it leaks. Spill it and register for destruction
