@@ -28,7 +28,7 @@ import "com.cb";
 import "dxgi.h" lib "dxgi.lib";
 
 // Map the well-known PCI vendor id to a readable name. Anything else prints as hex.
-char* vendorName(u32 id)
+(const char)* vendorName(u32 id)
 {
     if (id == 0x1002) return "AMD";
     if (id == 0x10DE) return "NVIDIA";

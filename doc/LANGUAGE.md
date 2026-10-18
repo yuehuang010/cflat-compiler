@@ -11,6 +11,7 @@
   - [Enums](#enums)
   - [`= default` Initialization](#-default-initialization)
   - [Brace Initializers](#brace-initializers)
+- [Const](#const)
 - [Functions & Core Collections](#functions--core-collections)
   - [Overloading](#overloading)
   - [Default Parameters](#default-parameters)
@@ -218,7 +219,7 @@ Concatenation with `operator+` - produces a freshly allocated buffer:
 
 ```c
 string a = "hello";
-string b = a + " world";          // string + const char*
+string b = a + " world";          // string + (const char)*
 string c = a + b;                 // string + string
 ```
 
@@ -316,8 +317,8 @@ bool sameContent = (string)a == b;    // value-compares the bytes
 **`char* + char*` concatenates.** Pointer + pointer has no meaning in C, so `+` on two c-strings allocates a fresh owned buffer and concatenates (the caller frees it). `ptr + int` remains pointer arithmetic.
 
 ```c
-char* a = "foo";
-char* b = "bar";
+(const char)* a = "foo";
+(const char)* b = "bar";
 string r = a + b;        // "foobar" - owned, freed at scope exit
 ```
 
@@ -566,7 +567,96 @@ carries no length to infer.
 > (e.g. `int` -> `i64`) is implicit, but there is **no implicit down-conversion**. The container
 > paths resolve `add`/`set` by overload, so a narrowing element literal does not match -
 > `list<float> = {1.5}` (the literal `1.5` is `double`) and `list<u8> = {255}` are rejected.
-> `char*` literals are the one special case: they are coerced to `string` for `string` elements.
+> String literals are the one special case: they are coerced to `string` for `string` elements.
+
+---
+
+
+## Const
+
+`const` is enforced. A CFlat type is one word (`int`, `int*`, `list<int>`, `T`), and `const`
+applies to the **whole word**, transitively: everything reached through a const word is read-only.
+
+```c
+const int x = 3;              // x is read-only
+const int* p = &x;            // = const (int*): p cannot be reseated AND *p, p[i] are read-only
+(const int)* q = &x;          // const on the inner word only: q++ is fine, *q = 1 is refused
+const(int)* r = &x;           // same type as (const int)*
+(const int*)* pp = &p;        // pp reseatable, *pp fixed, **pp read-only
+```
+
+A spelled const always covers a level and every level inside it. A type shows as `const W` when
+every level is const, as `W` when none is, and otherwise as `(const Inner)` followed by the
+remaining `*`s. Two spellings are refused: east const `int const*` and the trailing pointer const
+`int* const`. A C++ type that has a const pointer level with no CFlat spelling (such as an
+`int* const` field) is still enforced, and is shown in C++ spelling. `using` keeps the const word
+whole: `using CStr = (const char)*;` is a reseatable view, and `const IntPtr` with
+`using IntPtr = int*;` is exactly `const int*`.
+
+**Const objects.** A const local, global, or by-value parameter must be initialized. Any write to it
+is refused: `=`, compound assignment, `++`/`--`, taking a mutable pointer, a mutable `alias` / `T*`
+argument, or an explicit `move` (because `move` nulls its source). An implicit last-use consume is
+still allowed. Top-level const is not part of a function's type, so `f(const int)` and `f(int)` are
+the same function.
+
+**Const fields and transitive structs.** A `const` field can be written only during construction:
+its field default, a brace-init element, or the constructor. A struct with a const field cannot be
+whole-assigned (`s = t;`), although copy and move construction stay legal. `const S s` is deep:
+with a pointer field `p`, `*s.p = 5` is refused too. C++ is shallow here.
+
+**Conversions and casts.** Adding const is implicit everywhere: initialization, assignment,
+arguments, return, and brace elements. Dropping const is refused everywhere except through an
+explicit C cast, which may add or remove const at any level; there is no `const_cast`. Multi-level
+conversions follow C++ `[conv.qual]`. `(const T)*` converts to `(const void)*`, never to `void*`.
+Calls into `extern` C prototypes and C++ functions obey the same rules. For example, a
+`(const int)*` cannot be passed to a C `int*` parameter.
+
+```c
+int v = 1;
+(const int)* ro = &v;         // add: implicit
+int* rw = ro;                 // refused: the conversion discards const
+int* rw2 = (int*)ro;          // explicit cast: allowed
+```
+
+**String literals** have type `(const char)*`, and `auto s = "x";` deduces `(const char)*`.
+`char* s = "x";` is refused, and so is passing a literal to a mutable `char*` parameter. A literal
+still converts to `string` and to a C++ `const char*` converting constructor.
+
+**Read-only methods.** On a const object, or through a pointer to const, only read-only methods can
+be called. Read-only-ness is inferred from the method body: writing a field counts, and so does
+writing through a pointer field, because const is transitive. An explicit trailing `func() const`
+is not spelled yet. Calls through an interface on a const receiver are allowed for now; this is
+pending the explicit trailing-`const` spelling for interface methods.
+
+**Generics.**
+- `const` directly on a generic type argument is refused, at every site. That covers declarations,
+  `new`, explicit call arguments, `using`, and nested arguments, and also an alias that names a
+  const word (`using CI = const int; list<CI>`). The error is
+  `'const' is not allowed on a generic type argument; use it on the pointee ('const T*') or on the declaration`.
+  Containers own mutable slots, which is why C++ `vector<const T>` is also ill-formed. Put the
+  const on the pointee instead.
+- Pointee const is legal and keys its own instantiation. `list<(const char)*>` and `list<char*>`
+  are distinct types, and `typeof` shows `list<(const char)*>`.
+- Inside a generic body, `const T` is whole-word const over T. With `T = int*`, `const T` is
+  exactly `const int*`, so the C++ `int* const` gotcha does not exist.
+- Deduction strips only top-level const. `id(c)` with `const int c` gives `T = int`, while
+  `id(cp)` with `(const int)* cp` gives `T = (const int)*` (and a string literal gives
+  `T = (const char)*`).
+- `const` on a type parameter itself (`struct Box<const T>`) is refused with the same message.
+
+```c
+struct Cell<T> { T v = default; };
+int n = 1;
+Cell<(const int)*> c = { v = &n };   // legal: pointee const
+// *c.v = 2;                         // refused: reached through a pointer to const
+// list<const int> bad;              // refused: 'const' is not allowed on a generic type argument
+```
+
+**`is_assignable(T)`** is a compile-time intrinsic that is false when `T` is a CFlat struct holding
+a `const` field anywhere in its by-value layout. Core containers relocate elements by construction
+and guard only in-place reassignment (`list<T>.sort()`), so `list<S>` works for a const-field `S`
+until an assigning method is called. It sits with `is_unique(T)` and
+`is_copyable(T)` under Generics.
 
 ---
 

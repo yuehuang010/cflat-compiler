@@ -923,8 +923,10 @@ extern int main()
 
     // A pointer element's C++ T*& result is an alias to the pointer slot, not the slot address.
     {
-        char* ptrelemS = "element";
-        char* ptrelemT = "replacement";
+        char[8] ptrelemSBuf = "element";
+        char* ptrelemS = ptrelemSBuf;
+        char[12] ptrelemTBuf = "replacement";
+        char* ptrelemT = ptrelemTBuf;
         std.vector<char*> ptrelemPv = default;
         ptrelemPv.push_back(ptrelemS);
         if (ptrelemPv[0] != ptrelemS)                         return 578;
@@ -1065,7 +1067,8 @@ extern int main()
     if (cppi.array_total(veciterArray) != 17)          return 703;
 
     // ---- std::string_view and a free variadic function ------------------------------------------
-    char* strviewCstr = "hello";
+    char[6] strviewCstrBuf = "hello";
+    char* strviewCstr = strviewCstrBuf;
     std.string_view strviewSv = std.string_view(strviewCstr);
     if ((int)strviewSv.size() != 5)                      return 740;
     if (strviewSv.data()[1] != 'e')                     return 741;
@@ -2027,7 +2030,8 @@ extern int main()
     if (strlitA.n() != 6) return 1795;
 
     // A typed pointer on the left keeps the free std::string operator candidates reachable.
-    char* pointerLeft = "abc";
+    char[4] pointerLeftBuf = "abc";
+    char* pointerLeft = pointerLeftBuf;
     std.string pointerRight = std.string("abd");
     std.string pointerSum = pointerLeft + pointerRight;
     if ((int)pointerSum.size() != 6) return 1798;
@@ -2035,7 +2039,8 @@ extern int main()
     char[4] arrayLeft = { 'c', 'd', 0, 0 };
     std.string arraySum = arrayLeft + pointerRight;
     if ((int)arraySum.size() != 5) return 1801;
-    char* equalPointer = "same";
+    char[5] equalPointerBuf = "same";
+    char* equalPointer = equalPointerBuf;
     std.string equalString = std.string("same");
     if (!(equalPointer == equalString)) return 1800;
 
@@ -2044,7 +2049,8 @@ extern int main()
     if (!(chainLiteral == "abdcdef")) return 1802;
     std.string chainString = pointerRight + pointerRight + pointerRight;
     if (!(chainString == "abdabdabd")) return 1803;
-    char* chainPointer = "cd";
+    char[3] chainPointerBuf = "cd";
+    char* chainPointer = chainPointerBuf;
     std.string chainPointerResult = pointerRight + chainPointer + chainPointer;
     if (!(chainPointerResult == "abdcdcd")) return 1804;
 
@@ -2224,7 +2230,8 @@ extern int main()
 
     // Controls that behaved identically pre-fix: a char* local, a literal std.map key, and
     // the CFlat-native string operators the literal wrap exists for.
-    char* strlitP = " world";
+    char[7] strlitPBuf = " world";
+    char* strlitP = strlitPBuf;
     std.string strlitS2 = std.string("hello");
     strlitS2 += strlitP;
     if ((int)strlitS2.size() != 11) return 1802;
@@ -3954,7 +3961,8 @@ extern int main()
         // So does a string literal; a `char*` lvalue binds the caller's variable, a `char*` result
         // gets a caller slot, `const char (&)[N]` still deduces the literal's array (2764 guard).
         if (cpptrr.read_late_cstr(cpptrr.first_of("xyz", 0))[2] != (char)122)   return 2761;
-        char* ucs = "abc";
+        char[4] ucsBuf = "abc";
+        char* ucs = ucsBuf;
         if (cpptrr.read_late_cstr(cpptrr.pair_first("mno", ua + 2))[2] != (char)111)  return 2762;
         if (cpptrr.read_late_cstr(upk.first_of("qrs", ua))[1] != (char)114)     return 2763;
         if (&cpptrr.first_of(ucs, 0) != &ucs || cpptrr.lit_len("hello") != 6
@@ -3963,7 +3971,8 @@ extern int main()
         // A literal in a `const R&...` pack and one at `const U&` in a loop live in the caller
         // too; ranking is master's, `const U&` over `const U&&` as clang picks (2767 guard).
         if (cpptrr.read_late_cstr(cpptrr.pack_first("pk", ua))[1] != (char)107) return 2765;
-        char* ulp = "lop";
+        char[4] ulpBuf = "lop";
+        char* ulp = ulpBuf;
         for (int uk = 0; uk < 3; uk++)
             if (cpptrr.read_late_cstr(cpptrr.first_of("lop", uk))[uk] != ulp[uk])   return 2766;
         if (cpptrr.rank_cr("x") != 1)                                       return 2767;

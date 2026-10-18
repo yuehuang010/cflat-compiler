@@ -4864,6 +4864,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         lastCxxRetValue_ = nullptr;
         lastCallReturnValueCv_ = 0;
         cxxVirtualBaseRefusal_.clear();
+        // The call site the postfix lowering named for THIS call (nested calls already ran).
+        const void* receiverCallSite = std::exchange(pendingCallSite_, nullptr);
         std::string functionName = ResolveQualifiedName(functionNameIn, forceRoot);
         if (!forceRoot && dataStructures.count(functionName) != 0
             && (currentFunction == nullptr || currentFunction->getName() != functionName)
@@ -6775,6 +6777,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             std::vector<llvm::Value*> AncestorSlots;
         };
         std::vector<AliasSlotArg> aliasSlots;
+        RecordReceiverCallResolution(receiverCallSite, functionName, candidate.UniqueName);
+        // #8: a native method on a const receiver must be read-only (inferred from its body).
+        if (!matched.empty() && IsNativeReceiverMethod(candidate))
+            RefuseConstReceiverMethodCall(candidate, matched.front(), functionName);
         auto candParamItr = candidate.Parameters.begin();
         size_t argIndex = 0;
         for (auto& arg : matched)

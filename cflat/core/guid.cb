@@ -121,7 +121,7 @@ struct Guid
         b[6] = (u8)(Data3 >> 8);  b[7] = (u8)Data3;
         for (i32 i = 0; i < 8; i++) b[8 + i] = Data4[i];
 
-        char* hex = "0123456789abcdef";
+        const char* hex = "0123456789abcdef";
         char[37] out = default;   // 36 chars + NUL
         i32 pos = 0;
         for (i32 i = 0; i < 16; i++)

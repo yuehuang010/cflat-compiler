@@ -15,7 +15,7 @@ extern int main()
     char[8] d2_ = default;
     char* d2 = d2_;
     std.strncpy(d2, "abcdef", 3);
-    char* hay = "hello world hello";
+    (const char)* hay = "hello world hello";
     if (std.strlen(d) != 6 || std.strcmp(d, "foobar") != 0 || std.strncmp(d, "fooxyz", 3) != 0 || std.strcmp(d2, "abc") != 0
         || std.strchr(hay, 'w') != hay + 6 || std.strrchr(hay, 'h') != hay + 12 || std.strstr(hay, "world") != hay + 6 || std.strchr(hay, 'z') != nullptr)
     { printf("FAIL str*\n"); failures |= 1; }

@@ -60,32 +60,38 @@ bool cocoaInit()
     return __cocoaInited;
 }
 
-void* cls(char* name) { return __objcGetClass(name); }
-void* sel(char* name) { return __selRegisterName(name); }
+// The runtime reads its string arguments; function<> cannot spell a const parameter, so the
+// dlsym'd bindings take char* and these wrappers cast the read-only view once.
+void* cls((const char)* name) { return __objcGetClass((char*)name); }
+void* sel((const char)* name) { return __selRegisterName((char*)name); }
+bool __addMethodTyped(void* klass, (const char)* selName, void* imp, (const char)* types)
+{
+    return __classAddMethod(klass, sel(selName), imp, (char*)types) != (i8)0;
+}
 
 void* poolPush() { return __poolPush(); }
 void  poolPop(void* pool) { __poolPop(pool); }
 
 // objc_msgSend, cast per signature. [obj selector] with 0..3 object args.
-void* msg0(void* obj, char* selName)
+void* msg0(void* obj, (const char)* selName)
 {
     function<void*(void*, void*)> f = (function<void*(void*, void*)>)__objcMsgSendPtr;
     return f(obj, sel(selName));
 }
 
-void* msg1(void* obj, char* selName, void* a)
+void* msg1(void* obj, (const char)* selName, void* a)
 {
     function<void*(void*, void*, void*)> f = (function<void*(void*, void*, void*)>)__objcMsgSendPtr;
     return f(obj, sel(selName), a);
 }
 
-void* msg2(void* obj, char* selName, void* a, void* b)
+void* msg2(void* obj, (const char)* selName, void* a, void* b)
 {
     function<void*(void*, void*, void*, void*)> f = (function<void*(void*, void*, void*, void*)>)__objcMsgSendPtr;
     return f(obj, sel(selName), a, b);
 }
 
-void* msg3(void* obj, char* selName, void* a, void* b, void* c)
+void* msg3(void* obj, (const char)* selName, void* a, void* b, void* c)
 {
     function<void*(void*, void*, void*, void*, void*)> f =
         (function<void*(void*, void*, void*, void*, void*)>)__objcMsgSendPtr;
@@ -93,14 +99,14 @@ void* msg3(void* obj, char* selName, void* a, void* b, void* c)
 }
 
 // [obj selector:(NSInteger)v] - e.g. setActivationPolicy:, setBezelStyle:.
-void* msgInt(void* obj, char* selName, i64 v)
+void* msgInt(void* obj, (const char)* selName, i64 v)
 {
     function<void*(void*, void*, i64)> f = (function<void*(void*, void*, i64)>)__objcMsgSendPtr;
     return f(obj, sel(selName), v);
 }
 
 // [obj selector:(BOOL)v] - e.g. setEditable:, activateIgnoringOtherApps:.
-void* msgBool(void* obj, char* selName, bool v)
+void* msgBool(void* obj, (const char)* selName, bool v)
 {
     function<void*(void*, void*, i8)> f = (function<void*(void*, void*, i8)>)__objcMsgSendPtr;
     return f(obj, sel(selName), v ? (i8)1 : (i8)0);
@@ -109,7 +115,7 @@ void* msgBool(void* obj, char* selName, bool v)
 // [obj selector:(NSRect)r]. On arm64 an NSRect (4 doubles) is a homogeneous
 // float aggregate passed in d0-d3 - the same registers as 4 separate double
 // args - so a plain-doubles signature through msgSend is ABI-identical.
-void* msgRect(void* obj, char* selName, double x, double y, double w, double h)
+void* msgRect(void* obj, (const char)* selName, double x, double y, double w, double h)
 {
     function<void*(void*, void*, double, double, double, double)> f =
         (function<void*(void*, void*, double, double, double, double)>)__objcMsgSendPtr;
@@ -118,7 +124,7 @@ void* msgRect(void* obj, char* selName, double x, double y, double w, double h)
 
 // initWithContentRect:styleMask:backing:defer: - NSRect in d0-d3, then the
 // integer args land in x2/x3/x4 exactly as the real signature expects.
-void* msgRect3i(void* obj, char* selName, double x, double y, double w, double h,
+void* msgRect3i(void* obj, (const char)* selName, double x, double y, double w, double h,
                 u64 styleMask, u64 backing, bool deferFlag)
 {
     function<void*(void*, void*, double, double, double, double, u64, u64, i8)> f =
@@ -127,7 +133,7 @@ void* msgRect3i(void* obj, char* selName, double x, double y, double w, double h
 }
 
 // [obj selector] returning char* - e.g. UTF8String.
-char* msgCStr(void* obj, char* selName)
+char* msgCStr(void* obj, (const char)* selName)
 {
     function<char*(void*, void*)> f = (function<char*(void*, void*)>)__objcMsgSendPtr;
     return f(obj, sel(selName));
@@ -136,7 +142,7 @@ char* msgCStr(void* obj, char* selName)
 // --- Additional typed msgSend casts (used by the AppKit INativeHost) ---------
 // [obj selector:(double)v] - e.g. setDoubleValue:, setMinValue:. One double lands
 // in d0 exactly as the real signature expects.
-void* msgSetDouble(void* obj, char* selName, double v)
+void* msgSetDouble(void* obj, (const char)* selName, double v)
 {
     function<void*(void*, void*, double)> f =
         (function<void*(void*, void*, double)>)__objcMsgSendPtr;
@@ -146,7 +152,7 @@ void* msgSetDouble(void* obj, char* selName, double v)
 // [obj selector:(NSSize){w,h}] - e.g. setMinSize:, setMaxSize:, setContainerSize:.
 // On arm64 an NSSize (2 doubles) is a homogeneous FP aggregate in d0/d1, ABI-identical
 // to two separate double args.
-void* msgSize(void* obj, char* selName, double w, double h)
+void* msgSize(void* obj, (const char)* selName, double w, double h)
 {
     function<void*(void*, void*, double, double)> f =
         (function<void*(void*, void*, double, double)>)__objcMsgSendPtr;
@@ -155,28 +161,28 @@ void* msgSize(void* obj, char* selName, double w, double h)
 
 // [obj selector] returning double - e.g. doubleValue (NSSlider/NSNumber). The
 // result comes back in d0, so a double-returning cast reads it directly.
-double msgGetDouble(void* obj, char* selName)
+double msgGetDouble(void* obj, (const char)* selName)
 {
     function<double(void*, void*)> f = (function<double(void*, void*)>)__objcMsgSendPtr;
     return f(obj, sel(selName));
 }
 
 // [obj selector] returning NSInteger - e.g. tag, state, runModal. Returned in x0.
-i64 msgGetI64(void* obj, char* selName)
+i64 msgGetI64(void* obj, (const char)* selName)
 {
     function<i64(void*, void*)> f = (function<i64(void*, void*)>)__objcMsgSendPtr;
     return f(obj, sel(selName));
 }
 
 // [obj selector:(id)arg] returning NSInteger - e.g. rowForItem:, indexOfObject:.
-i64 msgGetI64Arg(void* obj, char* selName, void* a)
+i64 msgGetI64Arg(void* obj, (const char)* selName, void* a)
 {
     function<i64(void*, void*, void*)> f = (function<i64(void*, void*, void*)>)__objcMsgSendPtr;
     return f(obj, sel(selName), a);
 }
 
 // [obj selector:(id)arg] returning BOOL - e.g. isKindOfClass:. Result in w0.
-i8 msgBool1(void* obj, char* selName, void* a)
+i8 msgBool1(void* obj, (const char)* selName, void* a)
 {
     function<i8(void*, void*, void*)> f = (function<i8(void*, void*, void*)>)__objcMsgSendPtr;
     return f(obj, sel(selName), a);
@@ -184,7 +190,7 @@ i8 msgBool1(void* obj, char* selName, void* a)
 
 // [obj selector:(NSRange){loc,len}] - an NSRange arg is two NSUInteger, passed in
 // two integer registers (x2/x3), ABI-identical to two u64 args.
-void* msgRange(void* obj, char* selName, u64 loc, u64 len)
+void* msgRange(void* obj, (const char)* selName, u64 loc, u64 len)
 {
     function<void*(void*, void*, u64, u64)> f =
         (function<void*(void*, void*, u64, u64)>)__objcMsgSendPtr;
@@ -193,7 +199,7 @@ void* msgRange(void* obj, char* selName, u64 loc, u64 len)
 
 // [obj selector:(id)arg range:(NSRange){loc,len}] - insertText:replacementRange:.
 // id in x2, then the NSRange in x3/x4.
-void* msgIdRange(void* obj, char* selName, void* a, u64 loc, u64 len)
+void* msgIdRange(void* obj, (const char)* selName, void* a, u64 loc, u64 len)
 {
     function<void*(void*, void*, void*, u64, u64)> f =
         (function<void*(void*, void*, void*, u64, u64)>)__objcMsgSendPtr;
@@ -203,7 +209,7 @@ void* msgIdRange(void* obj, char* selName, void* a, u64 loc, u64 len)
 // [obj selector] returning NSRange - e.g. selectedRange. An NSRange (two
 // NSUInteger) is returned in x0/x1; reading only x0 (the location) via a u64 cast
 // is ABI-legal and ignores the length in x1.
-u64 msgRangeLoc(void* obj, char* selName)
+u64 msgRangeLoc(void* obj, (const char)* selName)
 {
     function<u64(void*, void*)> f = (function<u64(void*, void*)>)__objcMsgSendPtr;
     return f(obj, sel(selName));
@@ -211,37 +217,37 @@ u64 msgRangeLoc(void* obj, char* selName)
 
 // Adds -(BOOL)sel implemented by a CFlat function (no id arg) - e.g. isFlipped.
 // Encoding "c@:" = BOOL(self,_cmd).
-bool addMethodBool0(void* klass, char* selName, function<i8(void*, void*)> imp)
+bool addMethodBool0(void* klass, (const char)* selName, function<i8(void*, void*)> imp)
 {
-    return __classAddMethod(klass, sel(selName), (void*)imp, "c@:") != (i8)0;
+    return __addMethodTyped(klass, selName, (void*)imp, "c@:");
 }
 
 // C string -> autoreleased NSString, and back.
-void* nsStr(char* s) { return msg1(cls("NSString"), "stringWithUTF8String:", (void*)s); }
+void* nsStr((const char)* s) { return msg1(cls("NSString"), "stringWithUTF8String:", (void*)s); }
 char* cStr(void* nsString) { return msgCStr(nsString, "UTF8String"); }
 
 // Runtime class registration - this is how CFlat code receives target/action
 // callbacks and delegate messages. Type encodings: "v@:@" = void(self,_cmd,id),
 // "c@:@" = BOOL(self,_cmd,id).
-void* newClass(char* name, char* superName)
+void* newClass((const char)* name, (const char)* superName)
 {
     // objc_allocateClassPair returns null for an already-registered name; check
     // first so a second bring-up in the same process returns cleanly (callers
     // guard on null and skip re-adding methods).
     if (cls(name) != nullptr) return nullptr;
-    return __allocClassPair(cls(superName), name, 0u);
+    return __allocClassPair(cls(superName), (char*)name, 0u);
 }
 
 // Adds -(void)sel:(id)arg implemented by a CFlat function.
-bool addMethod0(void* klass, char* selName, function<void(void*, void*, void*)> imp)
+bool addMethod0(void* klass, (const char)* selName, function<void(void*, void*, void*)> imp)
 {
-    return __classAddMethod(klass, sel(selName), (void*)imp, "v@:@") != (i8)0;
+    return __addMethodTyped(klass, selName, (void*)imp, "v@:@");
 }
 
 // Adds -(BOOL)sel:(id)arg implemented by a CFlat function.
-bool addMethodBool(void* klass, char* selName, function<i8(void*, void*, void*)> imp)
+bool addMethodBool(void* klass, (const char)* selName, function<i8(void*, void*, void*)> imp)
 {
-    return __classAddMethod(klass, sel(selName), (void*)imp, "c@:@") != (i8)0;
+    return __addMethodTyped(klass, selName, (void*)imp, "c@:@");
 }
 
 void finishClass(void* klass) { __registerClassPair(klass); }
@@ -251,59 +257,59 @@ void finishClass(void* klass) { __registerClassPair(klass); }
 //   q = NSInteger, c = BOOL, @ = id, : = SEL, v = void.
 
 // -(NSInteger)sel:(id)a  -> "q@:@" (e.g. numberOfRowsInTableView:).
-bool addMethodI64_1(void* klass, char* selName, function<i64(void*, void*, void*)> imp)
+bool addMethodI64_1(void* klass, (const char)* selName, function<i64(void*, void*, void*)> imp)
 {
-    return __classAddMethod(klass, sel(selName), (void*)imp, "q@:@") != (i8)0;
+    return __addMethodTyped(klass, selName, (void*)imp, "q@:@");
 }
 
 // -(NSInteger)sel:(id)a b:(id)b  -> "q@:@@" (outlineView:numberOfChildrenOfItem:).
-bool addMethodI64_2(void* klass, char* selName, function<i64(void*, void*, void*, void*)> imp)
+bool addMethodI64_2(void* klass, (const char)* selName, function<i64(void*, void*, void*, void*)> imp)
 {
-    return __classAddMethod(klass, sel(selName), (void*)imp, "q@:@@") != (i8)0;
+    return __addMethodTyped(klass, selName, (void*)imp, "q@:@@");
 }
 
 // -(BOOL)sel:(id)a b:(id)b  -> "c@:@@" (outlineView:isItemExpandable:).
-bool addMethodBool2(void* klass, char* selName, function<i8(void*, void*, void*, void*)> imp)
+bool addMethodBool2(void* klass, (const char)* selName, function<i8(void*, void*, void*, void*)> imp)
 {
-    return __classAddMethod(klass, sel(selName), (void*)imp, "c@:@@") != (i8)0;
+    return __addMethodTyped(klass, selName, (void*)imp, "c@:@@");
 }
 
 // -(id)sel:(id)a b:(id)b c:(NSInteger)c  -> "@@:@@q"
 // (tableView:objectValueForTableColumn:row:).
-bool addMethodIdIdIdI64(void* klass, char* selName, function<void*(void*, void*, void*, void*, i64)> imp)
+bool addMethodIdIdIdI64(void* klass, (const char)* selName, function<void*(void*, void*, void*, void*, i64)> imp)
 {
-    return __classAddMethod(klass, sel(selName), (void*)imp, "@@:@@q") != (i8)0;
+    return __addMethodTyped(klass, selName, (void*)imp, "@@:@@q");
 }
 
 // -(id)sel:(id)a b:(NSInteger)b c:(id)c  -> "@@:@q@" (outlineView:child:ofItem:).
-bool addMethodIdIdI64Id(void* klass, char* selName, function<void*(void*, void*, void*, i64, void*)> imp)
+bool addMethodIdIdI64Id(void* klass, (const char)* selName, function<void*(void*, void*, void*, i64, void*)> imp)
 {
-    return __classAddMethod(klass, sel(selName), (void*)imp, "@@:@q@") != (i8)0;
+    return __addMethodTyped(klass, selName, (void*)imp, "@@:@q@");
 }
 
 // -(id)sel:(id)a b:(id)b c:(id)c  -> "@@:@@@"
 // (outlineView:objectValueForTableColumn:byItem:).
-bool addMethodIdIdIdId(void* klass, char* selName, function<void*(void*, void*, void*, void*, void*)> imp)
+bool addMethodIdIdIdId(void* klass, (const char)* selName, function<void*(void*, void*, void*, void*, void*)> imp)
 {
-    return __classAddMethod(klass, sel(selName), (void*)imp, "@@:@@@") != (i8)0;
+    return __addMethodTyped(klass, selName, (void*)imp, "@@:@@@");
 }
 
 // -(void)sel:(id)a b:(id)b  -> "v@:@@" (a two-arg notification/void selector).
-bool addMethod2(void* klass, char* selName, function<void(void*, void*, void*, void*)> imp)
+bool addMethod2(void* klass, (const char)* selName, function<void(void*, void*, void*, void*)> imp)
 {
-    return __classAddMethod(klass, sel(selName), (void*)imp, "v@:@@") != (i8)0;
+    return __addMethodTyped(klass, selName, (void*)imp, "v@:@@");
 }
 
 // -(void)sel:(id)table cell:(id)cell column:(id)column row:(NSInteger)row.
-bool addMethodVoidIdIdIdI64(void* klass, char* selName,
+bool addMethodVoidIdIdIdI64(void* klass, (const char)* selName,
                             function<void(void*, void*, void*, void*, void*, i64)> imp)
 {
-    return __classAddMethod(klass, sel(selName), (void*)imp, "v@:@@@q") != (i8)0;
+    return __addMethodTyped(klass, selName, (void*)imp, "v@:@@@q");
 }
 
 // [obj selector:(NSInteger)v] returning NSInteger - e.g. numberOfItems reads with
 // msgGetI64; this is for selectItemAtIndex: style calls that also return an integer.
-void* msgIntArg(void* obj, char* selName, i64 v)
+void* msgIntArg(void* obj, (const char)* selName, i64 v)
 {
     function<void*(void*, void*, i64)> f = (function<void*(void*, void*, i64)>)__objcMsgSendPtr;
     return f(obj, sel(selName), v);
@@ -336,7 +342,7 @@ void* nsBitmapRep(void* planes, i64 w, i64 h, i64 bitsPerSample, i64 samplesPerP
 
 // performSelectorOnMainThread:withObject:waitUntilDone: - marshal a call to the main
 // thread. `arg` is an id passed to the selector; waitUntilDone NO for async post.
-void* msgPerformOnMain(void* obj, char* selName, void* arg, bool waitDone)
+void* msgPerformOnMain(void* obj, (const char)* selName, void* arg, bool waitDone)
 {
     function<void*(void*, void*, void*, void*, i8)> f =
         (function<void*(void*, void*, void*, void*, i8)>)__objcMsgSendPtr;
@@ -346,7 +352,7 @@ void* msgPerformOnMain(void* obj, char* selName, void* arg, bool waitDone)
 
 // Registers a one-method target class and returns an instance of it - the
 // Cocoa equivalent of a Win32 WndProc for a single control action.
-void* makeTarget(char* className, char* actionSel, function<void(void*, void*, void*)> imp)
+void* makeTarget((const char)* className, (const char)* actionSel, function<void(void*, void*, void*)> imp)
 {
     void* klass = newClass(className, "NSObject");
     if (klass == nullptr) return nullptr;
@@ -385,7 +391,7 @@ void* cocoaApp()
 
 // Titled + closable + miniaturizable window; (x, y) is the bottom-left corner
 // of the content rect in screen coordinates.
-void* createWindow(char* title, double x, double y, double w, double h)
+void* createWindow((const char)* title, double x, double y, double w, double h)
 {
     // styleMask 15 = Titled|Closable|Miniaturizable|Resizable, backing 2 = Buffered
     void* win = msgRect3i(msg0(cls("NSWindow"), "alloc"),
@@ -404,7 +410,7 @@ void addToWindow(void* win, void* view)
 }
 
 // Static text - the Cocoa analog of a Win32 STATIC control.
-void* createLabel(void* win, char* text, double x, double y, double w, double h)
+void* createLabel(void* win, (const char)* text, double x, double y, double w, double h)
 {
     void* label = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", x, y, w, h);
     msg1(label, "setStringValue:", nsStr(text));
@@ -418,8 +424,8 @@ void* createLabel(void* win, char* text, double x, double y, double w, double h)
 
 // Push button wired to target/action - the analog of a Win32 BUTTON with
 // WM_COMMAND routed to `actionSel` on `target`.
-void* createButton(void* win, char* title, double x, double y, double w, double h,
-                   void* target, char* actionSel)
+void* createButton(void* win, (const char)* title, double x, double y, double w, double h,
+                   void* target, (const char)* actionSel)
 {
     void* button = msgRect(msg0(cls("NSButton"), "alloc"), "initWithFrame:", x, y, w, h);
     msg1(button, "setTitle:", nsStr(title));
@@ -431,7 +437,7 @@ void* createButton(void* win, char* title, double x, double y, double w, double 
 }
 
 // Editable single-line text input - the analog of a Win32 EDIT control.
-void* createTextField(void* win, char* text, double x, double y, double w, double h)
+void* createTextField(void* win, (const char)* text, double x, double y, double w, double h)
 {
     void* field = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", x, y, w, h);
     msg1(field, "setStringValue:", nsStr(text));
@@ -439,7 +445,7 @@ void* createTextField(void* win, char* text, double x, double y, double w, doubl
     return field;
 }
 
-void  setText(void* control, char* s) { msg1(control, "setStringValue:", nsStr(s)); }
+void  setText(void* control, (const char)* s) { msg1(control, "setStringValue:", nsStr(s)); }
 char* getText(void* control) { return cStr(msg0(control, "stringValue")); }
 
 // Shows the window and enters the Cocoa event loop; returns when the app

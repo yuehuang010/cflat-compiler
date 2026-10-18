@@ -42,7 +42,8 @@ i32 length(string self)
 // returns a pointer to a static empty literal so it stays safe to hand to C as a C string.
 char* data(string self)
 {
-    if (self._ptr == nullptr) return "";
+    // A literal is read-only; _ptr stays char* until the borrowed-string hole is closed.
+    if (self._ptr == nullptr) return (char*)"";
     return self._ptr;
 }
 
@@ -166,17 +167,18 @@ move string toString(double self)
 }
 
 // Convert a bool to "true"/"false". Non-owning reference to a static literal; no allocation.
+// The casts keep _ptr char* (see data()); the borrowed literal must still never be written.
 string toString(bool self)
 {
     string result = default;
     if (self)
     {
-        result._ptr = "true";
+        result._ptr = (char*)"true";
         result._len = 4;
     }
     else
     {
-        result._ptr = "false";
+        result._ptr = (char*)"false";
         result._len = 5;
     }
     return result;

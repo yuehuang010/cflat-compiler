@@ -157,7 +157,7 @@ expect_error("cannot store a pointer value into struct storage") {
 expect_error("cannot store a pointer value into struct storage") {
     void t75PointerCastWithoutCharCtor()
     {
-        char* source = "abc";
+        (const char)* source = "abc";
         T75NoCharCtor value = (T75NoCharCtor)source;
     }
 }

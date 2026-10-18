@@ -3493,7 +3493,7 @@ extern int main()
     if (t63ExplicitDirect.first != 6 || t63ExplicitDirect.second != 8) return 9307;
     t63.ClassNew t63ClassNew{1, 2, 3};
     if (t63ClassNew.count != 3) return 9308;
-    c8* t43c8 = u8"x";
+    (const c8)* t43c8 = u8"x";
     c16* t43c16 = (c16*)0;
     c32* t43c32 = (c32*)0;
     if (t43_over_char("x") != 1 || t43_over_char(u8"x") != 2
@@ -4079,7 +4079,8 @@ extern int main()
             return 11105;
     }
     // T42: a converting-ctor temporary binds C++ `const X&` / `X&&` (clang++ oracle values).
-    char* t42Cp = "A";
+    char[2] t42CpBuf = "A";
+    char* t42Cp = t42CpBuf;
     cpi_t42.Src t42Src = cpi_t42.Src(5);
     int t42Made = cpi_t42.made;
     int t42Gone = cpi_t42.gone;
@@ -9690,21 +9691,25 @@ extern int main()
     if ((int)convStd.size() != 2 || ConvRetStd().size() != 5)                  return 2246;
     cpi_t42.Box t75CtorCast = (cpi_t42.Box)"A";
     if (t75CtorCast.id() != 65)                                                return 2275;
-    char* t75CtorSource = "B";
+    char[2] t75CtorSourceBuf = "B";
+    char* t75CtorSource = t75CtorSourceBuf;
     cpi_t42.Box t75CtorCastLocal = (cpi_t42.Box)t75CtorSource;
     if (t75CtorCastLocal.id() != 66)                                           return 2276;
     std.string t75StdCast = (std.string)"abc";
     if ((int)t75StdCast.size() != 3)                                           return 2277;
-    char* t75StdSource = "xyz";
+    char[4] t75StdSourceBuf = "xyz";
+    char* t75StdSource = t75StdSourceBuf;
     std.string t75StdCastLocal = (std.string)t75StdSource;
     if ((int)t75StdCastLocal.size() != 3)                                      return 2278;
     cpi_t42.ExplicitOnly t75ExplicitLit = (cpi_t42.ExplicitOnly)"a";
     if (t75ExplicitLit.v != 97)                                                return 2279;
-    char* t75ExplicitSrc = "b";
+    char[2] t75ExplicitSrcBuf = "b";
+    char* t75ExplicitSrc = t75ExplicitSrcBuf;
     cpi_t42.ExplicitOnly t75ExplicitLocal = (cpi_t42.ExplicitOnly)t75ExplicitSrc;
     if (t75ExplicitLocal.v != 98)                                              return 2291;
     // Explicit char* beats a non-explicit const char* for a char* local; a literal takes const char*.
-    char* t75RankSrc = "c";
+    char[2] t75RankBuf = "c";
+    char* t75RankSrc = t75RankBuf;
     cpi_t42.RankExplicit t75RankLocal = (cpi_t42.RankExplicit)t75RankSrc;
     if (t75RankLocal.tag != 3)                                                 return 2292;
     cpi_t42.RankExplicit t75RankLit = (cpi_t42.RankExplicit)"d";
@@ -9746,7 +9751,8 @@ extern int main()
     cpi_t42.t334_arrcast_reset();
     int t334PtrDuring = -1;
     {
-        char* t334PtrSrc = "abc";
+        char[4] t334PtrBuf = "abc";
+        char* t334PtrSrc = t334PtrBuf;
         cpi_t42.T334ArrChar t334PtrLife = (cpi_t42.T334ArrChar)t334PtrSrc;
         if (t334PtrLife.id() != 1)                                            return 33409;
         t334PtrDuring = cpi_t42.t334_arrcast_dtor_count();
@@ -9922,7 +9928,8 @@ extern int main()
     if (cppexp.conv_ip_val(&cipK) != 107 || cppexp.conv_ip_val(cipP) != 107)   return 2266;
     if (cppexp.conv_ip_val(cipC) != 107 || cppexp.conv_ip_val(&cipA[1]) != 104) return 2267;
     if (cppexp.conv_ip_two(&cipK, cipP) != 77)                                 return 2268;
-    char* cipS = "abcde";
+    char[6] cipSBuf = "abcde";
+    char* cipS = cipSBuf;
     if (cppexp.conv_cp_val(cipS) != 5)                                         return 2269;
     // Const-reference parameter: pre-fix this compiled by binding `&cipK` AS a ConvPtr object
     // (set = garbage); now ConvPtr(const int*) builds the temporary (set 1).
@@ -11206,7 +11213,8 @@ extern int main()
         // binary operator '<<' ... 'pointer'".
         std.ostringstream po = default;
         std.string src = std.string("cs");
-        char* p = "pp";
+        char[3] pBuf = "pp";
+        char* p = pBuf;
         po << src.c_str() << "|" << (char*)p << "|" << (void*)nullptr << "|" << src;
         std.string ps = po.str();
         if (ps != "cs|pp|0|cs") return 3210;
@@ -11953,7 +11961,8 @@ extern int main()
     // A pointer operand binds the `const CharT*` overload, never the `CharT` one: the pre-fix
     // binary spelled `char* p` as `char` and failed module verification (size 3 = char overload).
     std.string sppBase = "ab";
-    char* sppP = "cd";
+    char[3] sppPBuf = "cd";
+    char* sppP = sppPBuf;
     const char* sppCp = "cd";
     char[8] sppArr = "cd";
     char[4] sppBuf = "xy";
@@ -11972,7 +11981,8 @@ extern int main()
     if (sppPlusAddr.size() != 3 || sppPlusAddr[2] != 'y')               return 7704;
     std.string sppPlusDeref = sppBase + *sppPp;
     if (sppPlusDeref.size() != 4 || sppPlusDeref[3] != 'd')             return 7705;
-    char* sppSame = "ab";
+    char[3] sppSameBuf = "ab";
+    char* sppSame = sppSameBuf;
     if (!(sppBase == sppSame) || sppBase == sppP || !(sppBase != sppP)) return 7706;
     if (!(sppBase < sppP) || sppBase >= sppP || !(sppBase <= sppSame))  return 7707;
     // Accept-set: a `char` operand keeps the `CharT` overload.
@@ -11992,8 +12002,10 @@ extern int main()
     std.string pdS = "ab";
     std.string pdRow = pdS + pdRows[1];
     if (pdRow.size() != 4 || pdRow[3] != 'd')                           return 7801;
-    char* pdA = "cd";
-    char* pdB = "efg";
+    char[3] pdABuf = "cd";
+    char* pdA = pdABuf;
+    char[4] pdBBuf = "efg";
+    char* pdB = pdBBuf;
     bool pdPickA = pdRow.size() == 4;
     std.string pdJoin = pdS + (pdPickA ? pdA : pdB);
     if (pdJoin.size() != 4 || pdJoin[3] != 'd')                         return 7802;

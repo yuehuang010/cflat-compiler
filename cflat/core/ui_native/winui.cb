@@ -338,6 +338,16 @@ function<i32(void*, u32, i32, u32)> _wAdjustWindowRectEx = nullptr;
 function<u32(i32)> _wGetSysColor = nullptr;
 function<i32(void*, char*, u32, u32, void**)> _wRegOpenKeyExA = nullptr;
 function<i32(void*, char*, void*, u32*, void*, u32*)> _wRegQueryValueExA = nullptr;
+// The registry reads its name arguments; function<> cannot spell a const parameter, so these
+// wrappers take the read-only view and cast once at the boundary.
+i32 _wRegOpenKeyRead(void* root, (const char)* subKey, u32 options, u32 access, void** key)
+{
+    return _wRegOpenKeyExA(root, (char*)subKey, options, access, key);
+}
+i32 _wRegQueryValueRead(void* key, (const char)* name, void* reserved, u32* type, void* data, u32* size)
+{
+    return _wRegQueryValueExA(key, (char*)name, reserved, type, data, size);
+}
 function<i32(void*)> _wRegCloseKey = nullptr;
 function<i32(u32, u32, void*, u32)> _wSystemParametersInfoA = nullptr;
 bool _wChromeBound = false;
@@ -3944,13 +3954,13 @@ bool _winuiSystemPrefersDark(u64 target)
     if (!highContrast && _wRegOpenKeyExA != nullptr && _wRegQueryValueExA != nullptr && _wRegCloseKey != nullptr)
     {
         void* key = nullptr;
-        i32 rc = _wRegOpenKeyExA((void*)(i64)(0 - 2147483647),
+        i32 rc = _wRegOpenKeyRead((void*)(i64)(0 - 2147483647),
             "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
             0u, 0x20019u, &key);
         if (rc == 0 && key != nullptr)
         {
             u32 type = 0u; u32 size = 4u; u32 useLight = 1u;
-            rc = _wRegQueryValueExA(key, "AppsUseLightTheme", nullptr, &type, &useLight, &size);
+            rc = _wRegQueryValueRead(key, "AppsUseLightTheme", nullptr, &type, &useLight, &size);
             _wRegCloseKey(key);
             if (rc == 0 && type == 4u && size >= 4u) result = useLight == 0u;
         }

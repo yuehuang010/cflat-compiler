@@ -5012,7 +5012,7 @@ bool testIfaceCodeValueArgAcceptSet()
     // A 'string' parameter still takes a literal and a char* through the coercion.
     IcvasStrTaker* st = new IcvasStrTaker();
     IIcvasStr istr = st;
-    char* cp = "abcd";
+    (const char)* cp = "abcd";
     result &= Test("icvas_string_literal_arg", istr.take("hello"), 5);
     result &= Test("icvas_char_ptr_arg", istr.take(cp), 4);
 

@@ -12,7 +12,7 @@ extern int main()
         cppt.dflt.CountDone made = cppt.dflt.CountDone<>();
     }
     expect_error("call to consteval function") {
-        char* format = "runtime";
+        (const char)* format = "runtime";
         cppceval.first(format, 7);
     }
     expect_error("argument type cannot be spelled in C++") {

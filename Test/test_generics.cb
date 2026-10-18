@@ -5813,7 +5813,116 @@ extern int main()
     total++; passed += testMemberTypeValueParens()                   ? 1 : 0;
     total++; passed += testMemberTypeForwardRecords()                ? 1 : 0;
     total++; passed += testPointerOnlyLaterStruct()                  ? 1 : 0;
+    total++; passed += testConstGenerics()                           ? 1 : 0;
+    total++; passed += testConstGenericList()                        ? 1 : 0;
+    total++; passed += testConstGenericAliasPack()                   ? 1 : 0;
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
+}
+
+// Const phase 7 (plan cflat-const.md R6 A, R11): generics. `const` on a type ARGUMENT is refused
+// (#14, see err_const_generic_arg.cb); pointee const inside it is legal and keys its own
+// instantiation; `const T` is whole-word const over T; deduction drops only top-level const.
+struct C07Cell<T> { T v = default; int set(T x) { v = x; return 0; } };
+struct C07Pair { int n = 0; int* p = nullptr; };
+int c07Read<T>(T p) { return (int)*p; }
+int c07WriteThrough<T>(T p) { *p = 5; return 1; }
+int c07Copy<T>(T v) { v = v; return 1; }
+int c07ConstDeref<T>(T v) { const T c = v; *c = 9; return 0; }
+int c07ConstReseat<T>(T v) { const T c = v; c = v; return 0; }
+int c07ConstValue<T>(T v) { const T c = v; c = v; return 0; }
+int c07ConstField<T>(T v) { const T c = v; c.n = 3; return 0; }
+int c07ConstThrough<T>(T v) { const T c = v; *c.p = 3; return 0; }
+int c07ConstViewChar<T>(T v) { const T c = v; c[0] = 'z'; return 0; }
+int c07ConstRead<T>(T v) { const T c = v; return (int)c[0]; }
+
+bool testConstGenerics()
+{
+    bool result = true;
+    int a = 1;
+    int b = 2;
+    const int* fixed = &a;
+    (const int)* view = &b;
+    int* raw = &a;
+    // Rule 4: G<(const int)*> and G<int*> are different instantiations with different rules.
+    C07Cell<(const int)*> readOnly;
+    readOnly.v = &a;
+    readOnly.v = &b;                                    // the slot reseats: only *v is read-only
+    C07Cell<int*> writable;
+    writable.set(&a);
+    *writable.v = 4;
+    result &= Test("const_generic_arg_read", *readOnly.v + a, 6);
+    result &= Test("const_generic_arg_typeof", typeof(readOnly), "C07Cell<(const int)*>");
+    result &= Test("const_generic_arg_typeof_plain", typeof(writable), "C07Cell<int*>");
+    expect_error("it is reached through a pointer to const") { *readOnly.v = 3; }
+    expect_error("the conversion discards const") { int* out = readOnly.v; }
+    // Explicit arguments: the body is checked per instantiation.
+    result &= Test("const_generic_explicit_read", c07Read<(const int)*>(view), 2);
+    expect_error("it is reached through a pointer to const") { c07WriteThrough<(const int)*>(view); }
+    expect_error("the conversion discards const") { c07WriteThrough<int*>(view); }
+    // Rule 3: deduction keeps pointee const and drops the argument's own const.
+    const int seed = 4;
+    result &= Test("const_generic_deduce_top", c07Copy(seed), 1);
+    result &= Test("const_generic_deduce_view", c07Read(view) + c07Read(fixed) + c07Copy(view), 7);
+    result &= Test("const_generic_deduce_literal", c07Read("x"), 120);
+    expect_error("it is reached through a pointer to const") { c07WriteThrough(fixed); }
+    expect_error("it is reached through a pointer to const") { c07WriteThrough(view); }
+    result &= Test("const_generic_deduce_mutable", c07WriteThrough(raw) + a, 6);
+    // Rule 2: `const T` is const over the whole word T (T = int* gives `const int*`).
+    expect_error("it is reached through a pointer to const") { c07ConstDeref<int*>(raw); }
+    expect_error("cannot assign to 'c': it is declared const") { c07ConstReseat<int*>(raw); }
+    expect_error("cannot assign to 'c': it is declared const") { c07ConstValue<int>(1); }
+    C07Pair pair = { n = 1, p = &a };
+    expect_error("'c' is const") { c07ConstField<C07Pair>(pair); }
+    expect_error("'c' is const") { c07ConstThrough<C07Pair>(pair); }
+    expect_error("cannot assign to 'c': it is declared const") { c07ConstReseat<(const char)*>("q"); }
+    expect_error("it is reached through a pointer to const") { c07ConstViewChar<(const char)*>("q"); }
+    result &= Test("const_generic_const_T_read", c07ConstRead<(const char)*>("q") + c07ConstRead<int*>(raw), 118);
+    return result;
+}
+
+// A container of read-only views: `list<(const char)*>` hands out `(const char)*` elements.
+bool testConstGenericList()
+{
+    bool result = true;
+    list<(const char)*> names;
+    names.add("ab");
+    names.add("c");
+    (const char)* first = names[0];
+    result &= Test("const_generic_list_view", (int)first[1] + names.count(), 100);
+    expect_error("the conversion discards const") { char* m = names[0]; }
+    return result;
+}
+
+// Round 2: a `using A = T;` alias (function body or aggregate) keeps T's pointee const, and the
+// first element of a variadic pack binds peeled like any other argument.
+int c07AliasRead<T>(T p) { using A = T; A q = p; return *q; }
+int c07AliasWrite<T>(T p) { using A = T; A q = p; *q = 4; return 0; }
+struct C07AliasBox<T> { using A = T; A v = default; int get() { A t = v; return *t; } };
+int c07PackFirst<T...>() { T p = default; return (int)sizeof(p); }
+struct C07PackCell<T...> { T v = default; };
+
+bool testConstGenericAliasPack()
+{
+    bool result = true;
+    int n = 7;
+    result &= Test("const_generic_alias_local_read", c07AliasRead<(const int)*>(&n), 7);
+    expect_error("it is reached through a pointer to const") { c07AliasWrite<(const int)*>(&n); }
+    C07AliasBox<(const int)*> box;
+    box.v = &n;
+    result &= Test("const_generic_alias_field_read", box.get(), 7);
+    expect_error("cannot assign to '*box.v': it is reached through a pointer to const") { *box.v = 9; }
+    C07AliasBox<int*> mbox;
+    mbox.v = &n;
+    *mbox.v = 8;
+    result &= Test("const_generic_alias_field_mutable", n, 8);
+    result &= Test("const_generic_pack_first", c07PackFirst<(const int)*, int>(), 8);
+    C07PackCell<(const int)*, int*> cell = default;
+    cell.v_0 = &n;
+    cell.v_1 = &n;
+    *cell.v_1 = 6;
+    expect_error("cannot assign to '*cell.v_0': it is reached through a pointer to const") { *cell.v_0 = 1; }
+    result &= Test("const_generic_pack_read", *cell.v_0, 6);
+    return result;
 }

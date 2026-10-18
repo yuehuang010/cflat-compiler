@@ -15996,7 +15996,10 @@ llvm::Value* MainListener::TryPointerLhsOperatorOverload(
                         if (!rst->isLiteral() && rst->hasName())
                             rightNV.TypeAndValue.TypeName = rst->getName().str();
 
+                    // The operator expression is the site key codegen's choice is recorded under.
+                    compiler->pendingCallSite_ = ctx;
                     auto* result = compiler->CreateOverloadedFunctionCall(opName, { thisNV, rightNV });
+                    compiler->pendingCallSite_ = nullptr;
                     TrackOwnedStringOperatorResult(compiler, result);
                     return result;
                 }
@@ -16995,11 +16998,15 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 llvm::Value* result = nullptr;
                 try
                 {
+                    // The operator expression is the site key codegen's choice is recorded under.
+                    compiler->pendingCallSite_ = ctx;
                     result = compiler->CreateOverloadedFunctionCall(
                         lookupName, { leftArg, rightArg }, true);
+                    compiler->pendingCallSite_ = nullptr;
                 }
                 catch (...)
                 {
+                    compiler->pendingCallSite_ = nullptr;
                     restoreConstCandidates();
                     throw;
                 }
@@ -17940,6 +17947,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             thisNV.TypeAndValue.TypeName = typeName;
             thisNV.TypeAndValue.Pointer  = true;
             thisNV.Primary = tempAlloca;
+            if (tempAlloca != lhsStorage && !lhsIsRvalue) thisNV.ConstReceiverStorage = lhsStorage;
             thisNV.TernaryTempAlreadyRegistered = receiverTempAlreadyRegistered;
             // The caller's own storage is an lvalue: a ref-qualified C++ member ranks it as one.
             thisNV.CxxLvalueReceiver = tempAlloca == lhsStorage && lhsStorage != nullptr
@@ -17952,7 +17960,10 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 thisNV.IsRvalue = receiverRvalue;
             }
             FlushCallPostfix();
+            // The operator expression is the site key codegen's choice is recorded under.
+            compiler->pendingCallSite_ = ctx;
             auto* result = compiler->CreateOverloadedFunctionCall(opName, { thisNV, rightNV });
+            compiler->pendingCallSite_ = nullptr;
             TrackOwnedStringOperatorResult(compiler, result);
             return result;
         }
@@ -17992,7 +18003,10 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 thisNV.IsRvalue = receiverRvalue;
             }
             FlushCallPostfix();
+            // The operator expression is the site key codegen's choice is recorded under.
+            compiler->pendingCallSite_ = ctx;
             auto* result = compiler->CreateOverloadedFunctionCall(opName, { thisNV, rightNV });
+            compiler->pendingCallSite_ = nullptr;
             TrackOwnedStringOperatorResult(compiler, result);
             return result;
         }
@@ -19512,6 +19526,7 @@ MainListener::UnevaluatedOperandType MainListener::EvaluateOperandTypeOnly(
             {
                 out.ValueType = nv.Primary->getType();
                 out.HasValue = true;
+                out.IsStringLiteral = compiler->IsStringLiteralGlobal(nv.Primary);
             }
             else if (nv.Storage != nullptr)
                 out.HasValue = true;
@@ -21033,6 +21048,17 @@ std::string MainListener::ParseTypeSpecifierName(
         if (it != activeTypeSubstitutions.end()) name = it->second;
         StripOwnershipQualifiers(name);  // resolve to the underlying LLVM type; storage markers only
         return Compiler(ctx)->ResolveQualifiedName(name, wasSubstituted);
+    }
+
+int MainListener::SubstitutedConstDepth(CFlatParser::TypeSpecifierContext* ctx,
+    CFlatParser::MultiWordTypeSuffixContext* suffix) {
+        if (ctx == nullptr || activeTypeSubstitutions.empty() || ctx->tupleTypeSpecifier() != nullptr
+            || ctx->memberTypeSpecifier() != nullptr)
+            return 0;
+        std::string base;
+        if (GenericSpecOf(ctx, base) != nullptr) return 0;
+        std::string name = CanonicalTypeSpecifierText(ctx, suffix, false, nullptr);
+        return activeTypeSubstitutions.ConstDepth(name);
     }
 
 std::string MainListener::ResolveInitializerArgType(
@@ -25534,10 +25560,12 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         // If type substitution produced a pointer type (e.g. T=Employee*), strip the '*'
         // and treat as pointer-to-element so GetType resolves the base type correctly.
         bool typeIsPtr = false;
+        int typeStars = 0;
         while (!typeName.empty() && typeName.back() == '*')
         {
             typeName.pop_back();
             typeIsPtr = true;
+            ++typeStars;
         }
 
         // `array<T> a = new T[n];` (and the assignment / return forms): the element count lives in
@@ -26394,6 +26422,14 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         // star the result read as an 'S[]' and bound anything an 'S[]' binds.
         result.TypeAndValue.ElemPointer = isArray && typeIsPtr;
         result.Primary = typedPtr;
+        // `new T[n]` / `new T` with T bound to a pointee-const argument (`(const char)*`).
+        if (int constDepth = SubstitutedConstDepth(ctx->typeSpecifier(), ctx->multiWordTypeSuffix());
+            constDepth > 0 && typeStars == 1)   // deeper results exceed the 2-level model
+        {
+            result.TypeAndValue.ConstMask = static_cast<uint8_t>((1u << std::min(constDepth, 7)) - 1u);
+            result.Primary = compiler->MarkCastQualification(typedPtr, result.TypeAndValue,
+                SpellTypeForSymbolDump(*compiler, result.TypeAndValue));
+        }
         result.BaseType = ptrTy;
         result.RawArrayLength = isArray ? count : nullptr;
         // A free site does not need the alignment VALUE - only which deallocator to use, since

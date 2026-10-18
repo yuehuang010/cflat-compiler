@@ -64,11 +64,11 @@ void armOverlapped(OVERLAPPED* ov, void* ev)
 u32 waitForIo(void* ioEvent, void* shutdownEvent, u32 timeoutMs)
 {
     // void*[2] is a fixed-size handle array; &handles[0] decays to the HANDLE*
-    // (collapsed to void* in the C ABI) that WaitForMultipleObjects expects.
+    // that WaitForMultipleObjects expects.
     void*[2] handles = default;
     handles[0] = ioEvent;
     handles[1] = shutdownEvent;
-    return WaitForMultipleObjects((u32)2, (void*)&handles[0], 0, timeoutMs);
+    return WaitForMultipleObjects((u32)2, &handles[0], 0, timeoutMs);
 }
 
 // Drive one overlapped operation to completion: issue the call, and if it
@@ -78,7 +78,7 @@ u32 waitForIo(void* ioEvent, void* shutdownEvent, u32 timeoutMs)
 // shared overlapped state.
 bool completeOverlapped(void* hPipe, OVERLAPPED* ov, void* ioEvent,
                         void* shutdownEvent, int started, u32* outBytes,
-                        char* opName)
+                        (const char)* opName)
 {
     u32 bytes = 0;
     if (started != 0) {

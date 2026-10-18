@@ -6,7 +6,7 @@ extern int main()
 {
     if (GetCurrentProcessId() == 0) return 1;
     if (lstrlenW(L"abcd") != 4) return 2;
-    wchar_t* wide = L"xyz";
+    (const wchar_t)* wide = L"xyz";
     if (sizeof(wide[0]) != 2 || wide[2] != (wchar_t)'z') return 3;
 
     LARGE_INTEGER freq = default;

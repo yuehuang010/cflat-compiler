@@ -208,7 +208,7 @@ void fill(void* hdc, RECT* rc, u32 color)
     DeleteObject(br);
 }
 
-void drawCenteredText(void* hdc, RECT* rc, char* text, u32 color)
+void drawCenteredText(void* hdc, RECT* rc, (const char)* text, u32 color)
 {
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, color);

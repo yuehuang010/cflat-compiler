@@ -212,7 +212,7 @@ expect_error("use of moved variable 's.p'") {
         s.p = new P();
         mvP(s.p);
         int i = 0;
-        for (char* t = ";true;"; i < n; i++) { s.p = new P(); }
+        for ((const char)* t = ";true;"; i < n; i++) { s.p = new P(); }
         int x = s.p->v;
     }
 }

@@ -1012,6 +1012,9 @@ void LLVMBackend::EmitError(std::string message, std::string sourceMessage) cons
         const std::string& matchMessage = sourceMessage.empty() ? message : sourceMessage;
         bool isExpectedMatch = !expectedError.empty()
             && matchMessage.find(expectedError) != std::string::npos;
+        // The expectation that caught its error drops the #8 entries it owns.
+        if (isExpectedMatch)
+            const_cast<LLVMBackend*>(this)->DiscardExpectScopeEntries(activeExpectScope_);
         if (diagnosticSink_)
         {
             if (isExpectedMatch)
@@ -1093,6 +1096,7 @@ std::string LLVMBackend::GetTypeAnnotationArg(const std::string& name, const std
 
 void LLVMBackend::RestoreFileScopeExpectedError()
 {
+        activeExpectScope_ = 0;
         expectedError = fileScopeExpectedError_;
         expectedErrorScopeDepth = SIZE_MAX;
     }

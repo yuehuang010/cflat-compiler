@@ -27,7 +27,7 @@ import "windows.h";
 import "string.cb";
 
 // Map a FILE_ACTION_* code to a fixed-width label.
-char* actionText(u32 action)
+(const char)* actionText(u32 action)
 {
     if (action == (u32)FILE_ACTION_ADDED)            return "ADDED           ";
     if (action == (u32)FILE_ACTION_REMOVED)          return "REMOVED         ";
@@ -62,7 +62,7 @@ extern int main(int argc, char** argv)
     int fniSize = (int)sizeof(FILE_NOTIFY_INFORMATION);
     printf("sizeof(FILE_NOTIFY_INFORMATION) = %d (expect 16 on x64)\n", fniSize);
 
-    char* dir = ".";
+    (const char)* dir = ".";
     if (argc >= 2) dir = argv[1];
     int maxEvents = 10;
     if (argc >= 3) {

@@ -601,6 +601,14 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
                 "type argument; a sized 'T[N]', an unsized multi-dimensional 'T[][]' and a "
                 "pointer-to-array 'T[]*' are not");
         std::string resolved;
+        // Pointee const the argument carries (`(const int)*` = 1); top-level const is #14 (R6 A).
+        int argConstDepth = 0;
+        // The body pre-scan (ScanAndQueueGenericTypeUses) runs before an expect_error is armed;
+        // the walk resolves the same entry again and reports it there.
+        const bool reportConstArg = memberTypeSilentDepth_ == 0;
+        if (entry->Const() != nullptr && reportConstArg)
+            LogErrorContext(entry, "'const' is not allowed on a generic type argument; "
+                "use it on the pointee ('const T*') or on the declaration");
 
         std::string innerBase;
         if (typeSpec != nullptr && typeSpec->typeName() != nullptr)
@@ -608,6 +616,7 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
             auto nested = ParseTypeName(typeSpec->typeName(), true, entry);
             nested.ApplyWholeWordConst();
             resolved = nested.TypeName + std::string(nested.PointerDepth, '*');
+            argConstDepth = std::popcount(nested.ConstMask);
         }
         else if (auto* innerParams = GenericSpecOf(typeSpec, innerBase))
         {
@@ -682,11 +691,15 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
                 resolved = ResolveMemberTypeSpecifier(typeSpec->memberTypeSpecifier());
             auto substIt = activeTypeSubstitutions.find(resolved);
             bool substituted = substIt != activeTypeSubstitutions.end();
+            if (!substituted && !resolved.empty())
+                if (const uint8_t aliasMask = Compiler(entry)->ResolveTypeAliasConstMask(resolved); aliasMask != 0)
+                    argConstDepth = std::popcount(aliasMask);   // `using VP = (const int)*;`
             if (substIt != activeTypeSubstitutions.end())
             {
                 // A substituted arg may itself carry "*"/"[]" (e.g. a pack param bound to "int[]")
                 // or an "alias " prefix; peel it onto flags so it re-encodes once below.
                 bool substAlias = false;
+                argConstDepth = activeTypeSubstitutions.ConstDepth(resolved);
                 resolved = substIt->second;
                 // Stars WRITTEN on a view arg (`T*[]`) are element stars already; the peel adds
                 // any the substituted spelling itself carries (`T[]` with T bound to "int*").
@@ -851,6 +864,24 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
                 LogErrorContext(entry, std::format("alias requires a pointer or interface type; "
                     "'{}' is neither", uniqueBase));
             resolved = std::string(kAliasQualifierPrefix) + resolved;
+        }
+        // A view of const elements keeps the pre-const key (not spelled yet).
+        if (argConstDepth > 0 && !hasArrayView)
+        {
+            int totalStars = 0;
+            while (totalStars < static_cast<int>(resolved.size())
+                   && resolved[resolved.size() - 1 - totalStars] == '*')
+                ++totalStars;
+            if (argConstDepth > totalStars)
+            {
+                if (entry->Const() == nullptr && reportConstArg)
+                    LogErrorContext(entry, "'const' is not allowed on a generic type argument; "
+                        "use it on the pointee ('const T*') or on the declaration");
+            }
+            // A deeper argument's `T*` slots exceed the 2-level model: it keeps the pre-const key,
+            // so its const is enforced where a value converts into it (#5/#6).
+            else if (totalStars == 1)
+                resolved = JoinConstTypeArgument(resolved, argConstDepth);
         }
         return resolved;
     }
@@ -1214,6 +1245,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 // Star count contributed by an active type SUBSTITUTION (T bound to "C**" -> 2).
                 // Real depth, not a flag, so the declarator combination below can prove a total.
                 int substArgPtrDepth = 0;
+                uint8_t substConstBits = 0;   // pointee const of a substituted argument
                 int substArgElemPtrDepth = 0;  // stars on a view ARG's element ("int*[]")
                 // T bound to a '...[]' array-view ARGUMENT (P<int[]> -> T = "int[]").
                 bool substArgIsArrayView = false;
@@ -1408,6 +1440,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                 CanonicalizeUniqueSigComponent(Compiler(declSpecs), p.TypeName,
                                                                p.Pointer, p.PointerDepth);
                                 p.ResolvedTypeKey = SigComponentResolvedKey(p.TypeName);
+                                MarkSubstitutedPointeeConst(p, param->typeSpecifier(),
+                                    param->multiWordTypeSuffix(), pStars);
                                 declType.FuncPtrParams.push_back(p);
                             }
                         }
@@ -1676,6 +1710,12 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         // A substituted type may carry a "*" (pointer), "[]" (noalias array-view),
                         // or "alias " suffix - e.g. a tuple pack param bound to "int[]". Strip only
                         // the alias marker here; a desugared unique type is already a core value.
+                        // A pointee-const argument (`(const int)*`) const-qualifies its inner levels.
+                        if (int constDepth = activeTypeSubstitutions.ConstDepth(typeName); constDepth > 0)
+                        {
+                            substConstBits = static_cast<uint8_t>((1u << std::min(constDepth, 7)) - 1u);
+                            declType.ConstMask |= substConstBits;
+                        }
                         typeName = substIt->second;
                         bool substAliasArg = false;
                         PeelTypeArgSuffix(typeName, substPointerDepth, substArrayView,
@@ -1712,7 +1752,11 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         && Compiler(declSpecs)->FindFunctionTypeAlias(typeName) == nullptr)
                         if (std::string member = ResolveDottedMemberType(typeSpec->getText(), typeSpec);
                             !member.empty())
+                        {
+                            // A member typedef registered just now (`using Name = const char*`).
+                            declType.ConstMask |= Compiler(declSpecs)->ResolveTypeAliasConstMask(typeName);
                             typeName = member;
+                        }
                     // Peel an array alias's brackets (using Vec3 = float[3]) BEFORE the stars so
                     // "int*[3]" yields dims {3} over base "int*".
                     std::vector<uint64_t> aliasDims;
@@ -1796,6 +1840,9 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     int totalPtr = declStars + substArgPtrDepth;
                     if (substArgPtrDepth >= 2) declType.ElemPointer = true;
                     declType.PointerDepth = totalPtr > 2 ? 0 : totalPtr;
+                    // Over the cap the levels are not modelled, so the argument's const is not
+                    // placeable (list<(const int*)*>'s own `T* _data`): leave it unenforced.
+                    if (totalPtr > 2) declType.ConstMask &= static_cast<uint8_t>(~substConstBits);
                 }
                 if (auto* dimSpec = ArrayDimsOf(declSpecWithSuffix))
                 {
@@ -2016,10 +2063,23 @@ void MainListener::MarkConstGlobalReadOnly(llvm::GlobalVariable* global,
         if (global == nullptr || !global->hasInitializer() || global->isDeclaration()
             || !Compiler()->IsNativeConstObject(tv))
             return;
-        // Scalars, pointers and arrays of them only: a struct may still be written by a method.
+        /*
+         * A const receiver only runs read-only methods (#8), so a struct is read-only data too -
+         * unless something besides a method may still write it: a destructor (user-written or
+         * synthesized for an owning field), or anything not a plain native struct.
+         */
         llvm::Type* element = global->getValueType();
         while (element->isArrayTy()) element = element->getArrayElementType();
-        if (element->isIntegerTy() || element->isFloatingPointTy() || element->isPointerTy())
+        bool plainStruct = false;
+        if (element->isStructTy())
+        {
+            auto* backend = Compiler();
+            const std::string& typeName = tv.TypeName;
+            plainStruct = !tv.Pointer && !tv.IsInterface && backend->dataStructures.count(typeName) != 0
+                && !backend->IsCxxRecord(typeName) && !backend->IsInterfaceType(typeName)
+                && !backend->IsOwningValueType(typeName);
+        }
+        if (element->isIntegerTy() || element->isFloatingPointTy() || element->isPointerTy() || plainStruct)
             global->setConstant(true);
     }
 
@@ -2993,6 +3053,7 @@ void MainListener::ParseInterfaceDefinition(CFlatParser::InterfaceDefinitionCont
         {
             if (nameGid->genericTypeParameters()->typeParameterList()->typeParameterEntry().empty())
                 LogErrorContext(ctx, "generic definition needs at least one type parameter");
+            RefuseConstTemplateParameters(nameGid->genericTypeParameters());
             if (Compiler()->gts.scannedGenericStructNames.count(name) != 0
                 || genericStructTemplates.count(name) != 0
                 || genericClassTemplates.count(name) != 0)
@@ -3143,6 +3204,7 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
         PrimitiveTypeError canonicalError;
         std::string target;
         uint8_t targetConstMask = 0;
+        int substConstDepth = 0;
         if (auto* nestedType = typeSpec->typeName())
         {
             auto nestedValue = ParseTypeName(nestedType, true, ctx);
@@ -3159,8 +3221,14 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
             if (auto* memberType = typeSpec->memberTypeSpecifier())
                 target = ResolveMemberTypeSpecifier(memberType);
             else if (auto subst = activeTypeSubstitutions.find(target); subst != activeTypeSubstitutions.end())
+            {
+                // A pointee-const argument (T = (const int)*) keeps its const depth through the alias.
+                substConstDepth = activeTypeSubstitutions.ConstDepth(target);
                 target = subst->second;
+            }
             targetConstMask = compiler->ResolveTypeAliasConstMask(target);
+            if (substConstDepth > 0)
+                targetConstMask |= static_cast<uint8_t>((1u << std::min(substConstDepth, 7)) - 1u);
         }
         // A pointer alias (using Handle = void*) stores its trailing stars in the alias string;
         // the stars are peeled back onto the pointer flags at the resolution site (GetType /
@@ -3457,6 +3525,7 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                     std::string rawText = expectErrDecl->StringLiteral()->getText();
                     compilerLLVM->expectedError = ProcessRawText(rawText);
                     compilerLLVM->expectedErrorScopeDepth = compilerLLVM->stackNamedVariable.size();
+                    compilerLLVM->ArmExpectScope();
                 }
             }
             else
@@ -3465,6 +3534,7 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                 std::string rawText = expectErrDecl->StringLiteral()->getText();
                 compilerLLVM->expectedError = ProcessRawText(rawText);
                 compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;
+                compilerLLVM->ArmExpectScope();
                 auto ownedTempMark = compilerLLVM->MarkOwnedTemps();
                 std::unordered_set<std::string> typesBefore;
                 for (const auto& [name, _] : compilerLLVM->dataStructures)
@@ -3549,7 +3619,9 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                     global_scope = true;
                 }
 
-                if (!errorReceived && !compilerLLVM->expectedError.empty())
+                // A deferred #8 owned by this block decides it at module end.
+                if (!errorReceived && !compilerLLVM->expectedError.empty()
+                    && !compilerLLVM->DeferExpectationVerdict())
                 {
                     std::cout << std::format("FAIL: expected error '{}' did not occur\n",
                                               compilerLLVM->expectedError);
@@ -3925,7 +3997,8 @@ void MainListener::ParseNamespaceDefinition(CFlatParser::NamespaceDefinitionCont
 
         // A bare namespace expectation has no enclosing function to check its scope exit.
         if (!compilerLLVM->expectedError.empty()
-            && compilerLLVM->expectedErrorScopeDepth != SIZE_MAX)
+            && compilerLLVM->expectedErrorScopeDepth != SIZE_MAX
+            && !compilerLLVM->DeferExpectationVerdict())
         {
             std::cout << std::format("FAIL: expected error '{}' did not occur\n",
                                       compilerLLVM->expectedError);
@@ -4032,6 +4105,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                     "redefinition of '{}' as a different kind of symbol", name));
             if (func->genericTypeParameters()->typeParameterList()->typeParameterEntry().empty())
                 LogErrorContext(func, "generic definition needs at least one type parameter");
+            RefuseConstTemplateParameters(func->genericTypeParameters());
             std::vector<std::string> valueParams;
             std::vector<std::string> valueDefaults;
             auto typeParams = ParseGenericTypeParameters(func->genericTypeParameters(), &valueParams,
@@ -4239,6 +4313,9 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             bodyLine = body->getStart()->getLine();
         const std::string linkageName = returnType.external && structName.empty() && !namespaceName.empty()
             ? ::getFunctionName(func, compiler) : std::string();
+        // Re-scanned at the definition with the live `if const` arms (the pre-pass has none).
+        const std::string receiverBody = RecordReceiverScan(compiler, func, name, returnType, allParams,
+                                                            varargs, SinkIfConstEvaluator());
         auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external,
             varargs, line, returnsOwned, !structName.empty(), returnType.CallConv, bodyLine, linkageName);
 
@@ -4249,6 +4326,14 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         if (fn->isMaterializable()
             || (!fn->empty() && cflat_llvm::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr))
             return;
+        // Codegen's overload choices in this body are recorded under its unique name.
+        struct ReceiverBodyScope
+        {
+            LLVMBackend* backend;
+            bool active;
+            ~ReceiverBodyScope() { if (active) backend->EndReceiverBody(); }
+        } receiverBodyScope{ compiler, !receiverBody.empty() };
+        if (!receiverBody.empty()) compiler->BeginReceiverBody(receiverBody);
 
         if (paramTypeList != nullptr && paramTypeList->parameterList() != nullptr
             && !compiler->stackNamedVariable.empty())
@@ -9714,6 +9799,14 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                  * spelling is rejected outright (a thin view carries no row stride). Reject
                  * rather than leave the shapeless binding that indexed nothing and read garbage.
                  */
+                // `auto s = "x";` deduces the literal's type, `(const char)*` (R11).
+                if (typeAndValue.TypeName == "auto" && !typeAndValue.Pointer && srcInferredTypeName.empty()
+                    && compiler->IsStringLiteralGlobal(right))
+                {
+                    srcInferredTypeName = "char";
+                    srcInferredPointer = true;
+                    srcInferredConstMask = 1;
+                }
                 if (typeAndValue.TypeName == "auto" && right != nullptr && !global_scope
                     && !typeAndValue.Pointer && !typeAndValue.IsSimd
                     && typeAndValue.ConstArraySize == 0
@@ -10035,6 +10128,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
 
                     const size_t pendingConstructionsBefore = pendingGlobalDefaultConstructions_.size()
                         + pendingGlobalCxxConstructions_.size();
+                    const size_t pendingDefaultBefore = pendingGlobalDefaultConstructions_.size();
                     auto* global = compiler->CreateGlobalVariable(typeAndValue, constant,
                         typeAndValue.threadLocal, typeAndValue.UserAlignValue, externDeclOnly,
                         srcIsUnsigned);
@@ -10120,9 +10214,19 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     }
                     // A native const scalar / pointer / scalar-array global with a constant initializer
                     // and no module-init construction is read-only data.
-                    if (!externDeclOnly && global_scope && constant != nullptr
-                        && pendingConstructionsBefore == pendingGlobalDefaultConstructions_.size()
-                            + pendingGlobalCxxConstructions_.size())
+                    // `= default` on a native struct folds into the initializer; the queued C++-field
+                    // construction is dropped at emission when no field needs one.
+                    const bool foldedNativeDefault = explicitZeroDefault && !typeAndValue.Pointer
+                        && pendingDefaultBefore == pendingGlobalDefaultConstructions_.size()
+                        && pendingConstructionsBefore + 1 == pendingGlobalDefaultConstructions_.size()
+                            + pendingGlobalCxxConstructions_.size()
+                        && !compiler->IsCxxRecord(typeAndValue.TypeName)
+                        && !HasGlobalCxxFieldDefaultConstruction(typeAndValue);
+                    if (!externDeclOnly && global_scope
+                        && ((constant != nullptr
+                            && pendingConstructionsBefore == pendingGlobalDefaultConstructions_.size()
+                                + pendingGlobalCxxConstructions_.size())
+                            || foldedNativeDefault))
                         MarkConstGlobalReadOnly(global, typeAndValue);
                     // Constant scalar globals may fold in compile-time expressions; mutable globals may not.
                     if (!externDeclOnly && DeclSpecHasConst(declSpec)
@@ -13853,7 +13957,7 @@ bool MainListener::EnsureAggregateAliases(const std::string& owner) {
                 if (i < valueParams.size() && !valueParams[i].empty())
                     activeValueSubstitutions[typeParams[i]] = typeArgs[i];
                 else
-                    activeTypeSubstitutions[typeParams[i]] = typeArgs[i];
+                    activeTypeSubstitutions.Bind(typeParams[i], typeArgs[i]);
             }
             {
                 TemplateNamespaceScope nsScope(compiler, templateName);

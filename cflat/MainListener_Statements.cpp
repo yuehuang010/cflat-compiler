@@ -5183,6 +5183,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
             {
                 // Scoped block form: expect_error("msg") { ... } - error must occur inside the braces.
                 compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;  // manual check after block
+                compilerLLVM->ArmExpectScope();
                 size_t savedDepth = compilerLLVM->stackNamedVariable.size();
                 auto* entryBB = compilerLLVM->builder->GetInsertBlock();
                 bool entryWasUnterminated = entryBB != nullptr && cflat_llvm::GetTerminatorOrNull(entryBB) == nullptr;
@@ -5255,7 +5256,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 if (!errorReceived)
                 {
                     compiler->CreateBlockBreak(nullptr, true);
-                    if (!compilerLLVM->expectedError.empty())
+                    // A deferred #8 owned by this block decides it at module end.
+                    if (!compilerLLVM->expectedError.empty() && !compilerLLVM->DeferExpectationVerdict())
                     {
                         std::cout << std::format("FAIL: expected error '{}' did not occur\n",
                                                   compilerLLVM->expectedError);
@@ -5271,6 +5273,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
             {
                 // Bare-semicolon form: expect_error("msg"); - error must occur before the enclosing scope exits.
                 compilerLLVM->expectedErrorScopeDepth = compilerLLVM->stackNamedVariable.size();
+                compilerLLVM->ArmExpectScope();
             }
             return;
         }

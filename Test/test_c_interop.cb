@@ -1459,5 +1459,21 @@ extern int main()
     int t170 = t170FnPtrLegs();
     if (t170 != 0) return t170;
 
+    int c06 = c06ConstCharFieldLegs();
+    if (c06 != 0) return c06;
+
+    return 0;
+}
+
+// c06: a C struct field spelled `const char*` (directly or via a typedef) keeps its pointee const,
+// so a string literal is accepted; a mutable `char*` field still refuses one (#5).
+int c06ConstCharFieldLegs()
+{
+    C06Names n = default;
+    n.direct = "ab";
+    n.alias = "cd";
+    if (c06NamesSecond(&n) != 98100) return 4060;
+    expect_error("the conversion discards const") { n.mutable_name = "ef"; }
+    expect_error("it is reached through a pointer to const") { n.direct[0] = 'x'; }
     return 0;
 }

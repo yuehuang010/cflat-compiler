@@ -1,0 +1,102 @@
+// Const phase 4: a const receiver only runs read-only methods (plan cflat-const.md section 2 item 4,
+// section 4 #8). Read-only-ness is inferred from the method body: no write to the object or
+// through its pointer fields, and every member it calls on the object is read-only too.
+import "list.cb";
+
+struct C04S
+{
+    int n = 0;
+    int* p = nullptr;
+    int Get() { return n; }
+    void Set(int v) { n = v; }
+    void Poke(int v) { *p = v; }
+    void Bump() { n++; }
+    void Reset() { Set(0); }
+    int Grab() { int* out = &n; return *out; }
+    int Ping(int k) { if (k == 0) { n = 1; return 0; } return Pong(k - 1); }
+    int Pong(int k) { return Ping(k); }
+    C04S operator+(C04S other) { n = n + other.n; return other; }
+};
+struct C04Holder { C04S s = default; int k = 0; };
+struct C04Cell<T> { T v = default; int Clear() { if const (is_pointer(T)) { v = nullptr; return 1; } else return 0; } };
+
+const C04S C04G = default;
+
+expect_error("cannot call non-const member 'Set' on 'b': it is declared const")
+{
+    int c04BadParamMethod(const C04S b) { b.Set(2); return 0; }
+}
+expect_error("cannot call non-const member 'Bump' on 'C04G': it is declared const")
+{
+    int c04BadGlobal() { C04G.Bump(); return 0; }
+}
+
+extern int main()
+{
+    int target = 1;
+    const C04S s = { n = 5, p = &target };
+    C04S m = default;
+    expect_error("cannot call non-const member 'Set' on 's': it is declared const") { s.Set(1); }
+    expect_error("cannot call non-const member 'Poke' on 's': it is declared const") { s.Poke(2); }
+    expect_error("cannot call non-const member 'Bump' on 's': it is declared const") { s.Bump(); }
+    expect_error("cannot call non-const member 'Reset' on 's': it is declared const") { s.Reset(); }
+    expect_error("cannot call non-const member 'Grab' on 's': it is declared const") { s.Grab(); }
+    expect_error("cannot call non-const member 'Ping' on 's': it is declared const") { s.Ping(3); }
+    expect_error("cannot call non-const member 'Pong' on 's': it is declared const") { s.Pong(3); }
+    expect_error("cannot call non-const member 'operator+' on 's': it is declared const") { C04S r = s + m; }
+    const C04S* whole = &m;
+    expect_error("cannot call non-const member 'Set' on 'whole': it is reached through a pointer to const ('whole')") { whole->Set(1); }
+    (const C04S)* view = &m;
+    expect_error("cannot call non-const member 'Set' on 'view': it is reached through a pointer to const ('view')") { view->Set(1); }
+    const C04Holder h = default;
+    expect_error("cannot call non-const member 'Set' on 'h.s': 'h' is const") { h.s.Set(1); }
+    const C04Cell<int*> cell = { v = &target };
+    expect_error("cannot call non-const member 'Clear' on 'cell': it is declared const") { cell.Clear(); }
+    list<int> raw;
+    raw.add(1);
+    const list<int> numbers = raw.copy();
+    expect_error("cannot call non-const member 'add' on 'numbers': it is declared const") { numbers.add(2); }
+    expect_error("cannot call non-const member 'clear' on 'numbers': it is declared const") { numbers.clear(); }
+    return 0;
+}
+
+// Round 2: writes through a getter's alias result, the acquire / release a `lock` calls, and the
+// overload codegen actually selects for an escaped field address.
+struct C04Inner { int n = 3; };
+struct C04Getter
+{
+    C04Inner inner;
+    alias C04Inner get() { return inner; }
+    void write() { get().n = 9; }
+};
+[Capability(ILockable)] struct C04Lock { int n = 0; void acquire() { n++; } void release() { n++; } };
+struct C04Locked { C04Lock l; int read() { lock(l) { } return l.n; } };
+int c04Pick(int* p, int k) { *p = 9; return 101; }
+int c04Pick(const int* p, double k) { return 202; }
+struct C04Picker { int n = 3; int read() { return c04Pick(&n, 1); } };
+
+expect_error("cannot call non-const member 'write' on 'g': it is declared const")
+{
+    int c04BadGetterWrite(const C04Getter g) { g.write(); return 0; }
+}
+expect_error("cannot call non-const member 'read' on 'k': it is declared const")
+{
+    int c04BadLockRead(const C04Locked k) { return k.read(); }
+}
+expect_error("cannot call non-const member 'read' on 'p': it is declared const")
+{
+    int c04BadPickRead(const C04Picker p) { return p.read(); }
+}
+
+// Round 3: an alias result is the receiver's storage unless every return is rooted elsewhere.
+C04Inner c04MixedGlobal = {};
+struct C04Mixed
+{
+    C04Inner inner;
+    alias C04Inner Pick(bool own) { if (own) return inner; return c04MixedGlobal; }
+    void Write() { Pick(false).n = 1; }
+};
+expect_error("cannot call non-const member 'Write' on 'x': it is declared const")
+{
+    int c04BadMixedWrite(const C04Mixed x) { x.Write(); return 0; }
+}

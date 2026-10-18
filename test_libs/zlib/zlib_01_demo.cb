@@ -28,7 +28,7 @@ import "string.cb";
 extern int main(int argc, char** argv)
 {
     // Default to this file's path relative to the repo root; allow override.
-    char* path = "test_libs/zlib/zlib_01_demo.cb";
+    (const char)* path = "test_libs/zlib/zlib_01_demo.cb";
     if (argc > 1) { path = argv[1]; }
 
     File* f = new File;

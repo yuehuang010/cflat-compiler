@@ -1,0 +1,64 @@
+import "list.cb";
+
+// Const phase 7 (plan cflat-const.md R6 A, #14): `const` directly on a generic type argument is
+// refused at every site a type argument is spelled; pointee const inside it stays legal.
+struct C07G<T> { T v = default; };
+int c07Id<T>(T v) { return 0; }
+using C07CI = const int;
+using C07CP = const int*;
+using C07VP = (const int)*;
+
+expect_error("'const' is not allowed on a generic type argument") {
+    using C07ListAlias = list<const int>;
+}
+expect_error("'const' is not allowed on a generic type argument") {
+    struct C07Holder { list<const int> items; };
+}
+expect_error("'const' is not allowed on a generic type argument") {
+    int c07Take(list<const int>* l) { return 0; }
+}
+expect_error("'const' is not allowed on a generic type argument") {
+    C07G<const int> c07Make() { C07G<const int> g; return g; }
+}
+expect_error("'const' is not allowed on a generic type argument") {
+    struct C07Decl<const T> { T v = default; };
+}
+expect_error("'const' is not allowed on a generic type argument") {
+    int c07DeclFn<const T>(T v) { return 0; }
+}
+
+extern int main()
+{
+    void* raw = nullptr;
+    expect_error("'const' is not allowed on a generic type argument") { list<const int> a; }
+    expect_error("'const' is not allowed on a generic type argument") { C07G<const int*> g; }
+    expect_error("'const' is not allowed on a generic type argument") { c07Id<const int>(3); }
+    expect_error("'const' is not allowed on a generic type argument") { auto p = new C07G<const int>(); }
+    expect_error("'const' is not allowed on a generic type argument") { list<list<const int>> n; }
+    expect_error("'const' is not allowed on a generic type argument") { C07G<C07CI> c1; }
+    expect_error("'const' is not allowed on a generic type argument") { C07G<C07CP> c2; }
+    expect_error("'const' is not allowed on a generic type argument") { C07G<(const int)> c3; }
+    expect_error("'const' is not allowed on a generic type argument") { C07G<const(int*)> c4; }
+    expect_error("'const' is not allowed on a generic type argument") { using L = list<const int>; L l; }
+    expect_error("'const' is not allowed on a generic type argument") { auto c = (list<const int>*)raw; }
+    expect_error("'const' is not allowed on a generic type argument") { int s = (int)sizeof(list<const int>); }
+    // Legal: the const is on the pointee.
+    C07G<(const char)*> ok1;
+    C07G<const(int)*> ok2;
+    C07G<C07VP> ok3;
+    C07G<C07CI*> ok4;
+    return 0;
+}
+
+// Round 2: an aggregate `using A = T;` keeps the argument's pointee const, so a write through
+// the aliased field is refused (it compiled clean when the alias dropped the const depth).
+struct C07AliasCell<T> { using A = T; A v = default; };
+int c07AliasWrite()
+{
+    int n = 7;
+    C07AliasCell<(const int)*> h;
+    h.v = &n;
+    expect_error("cannot assign to '*h.v': it is reached through a pointer to const");
+    *h.v = 9;
+    return n;
+}

@@ -2253,6 +2253,7 @@ llvm::Value* LLVMBackend::CreateGlobalString(std::string name, std::string text)
         auto* gv = builder->CreateGlobalString(text, name, 0, module.get());
         stringPool[text] = gv;
         stringLiteralLenByPtr[gv] = (int32_t)text.size();
+        stringLiteralGlobals_.insert(gv);
         return gv;
     }
 
@@ -2270,6 +2271,7 @@ llvm::Value* LLVMBackend::CreateGlobalEncodedString(std::string name,
         auto* global = new llvm::GlobalVariable(*module, arrayType, true,
             llvm::GlobalValue::PrivateLinkage, initializer, name);
         global->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+        stringLiteralGlobals_.insert(global);
         return builder->CreateInBoundsGEP(arrayType, global,
             { builder->getInt32(0), builder->getInt32(0) });
     }

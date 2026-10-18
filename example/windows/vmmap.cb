@@ -24,7 +24,7 @@ import "windows.h";
 import "string.cb";
 
 // Decode the State field to a short fixed-width label.
-char* stateText(u32 state)
+(const char)* stateText(u32 state)
 {
     if ((state & (u32)MEM_COMMIT) != 0u)  return "COMMIT ";
     if ((state & (u32)MEM_RESERVE) != 0u) return "RESERVE";
@@ -33,7 +33,7 @@ char* stateText(u32 state)
 }
 
 // Decode the Type field. Free regions have no type.
-char* typeText(u32 state, u32 type)
+(const char)* typeText(u32 state, u32 type)
 {
     if ((state & (u32)MEM_FREE) != 0u)    return "-      ";
     if ((type & (u32)MEM_IMAGE) != 0u)    return "IMAGE  ";

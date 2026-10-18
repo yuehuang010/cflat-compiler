@@ -5022,7 +5022,7 @@ void registerHostClasses()
         function<i8(void*, void*)> flip = _canvasIsFlippedImp;
         addMethodBool0(cvv, "isFlipped", flip);
         function<void(void*, void*, double, double, double, double)> dr = _canvasDrawRectImp;
-        __classAddMethod(cvv, sel("drawRect:"), (void*)dr, "v@:{{CGRect={{CGPoint=dd}}{{CGSize=dd}}}}");
+        __addMethodTyped(cvv, "drawRect:", (void*)dr, "v@:{{CGRect={{CGPoint=dd}}{{CGSize=dd}}}}");
         // Input overrides (mouseDown:/Dragged:/Up:/scrollWheel:/magnifyWithEvent:): all
         // take (self, _cmd, NSEvent*), encoding "v@:@". They invoke the element handlers
         // (no-op by default), so an input-less canvas is unaffected.

@@ -161,7 +161,20 @@ struct TypePrefix
     int pointerDepth = 0;
     bool view = false;
     bool alias = false;
+    int constDepth = 0;
 };
+
+// ".c<N>" = pointee const depth N of a generic type argument.
+static bool ParseConstDepthToken(std::string_view token, int& depth)
+{
+    if (token.size() < 3 || token[0] != '.' || token[1] != 'c') return false;
+    int value = 0;
+    auto result = std::from_chars(token.data() + 2, token.data() + token.size(), value);
+    if (result.ec != std::errc{} || result.ptr != token.data() + token.size() || value <= 0)
+        return false;
+    depth = value;
+    return true;
+}
 
 static bool ParseCountToken(std::string_view token, size_t& value)
 {
@@ -188,6 +201,9 @@ static bool ParseTypePrefix(std::string_view text, size_t& position, TypePrefix&
         }
         else if (token == ".a")
             prefix.alias = true;
+        else if (int depth = 0; prefix.constDepth == 0 && !prefix.view && prefix.pointerDepth == 0
+                 && ParseConstDepthToken(token, depth))
+            prefix.constDepth = depth;
         else
             return false;
         if (separator == std::string_view::npos) return false;
@@ -199,6 +215,7 @@ static bool ParseTypePrefix(std::string_view text, size_t& position, TypePrefix&
 static void ApplyTypePrefix(TypeSpelling& spelling, const TypePrefix& prefix)
 {
     spelling.alias = spelling.alias || prefix.alias;
+    if (prefix.constDepth != 0) spelling.constDepth = prefix.constDepth;
     // With `view` set, pointerDepth counts the ELEMENT's stars ("int*[]"); without it, the
     // type's own stars. The prefix parser rejects any other ordering, so this is a bijection.
     if (prefix.view)
@@ -331,8 +348,10 @@ TypeParseCandidates ComputeMangledCandidates(const LLVMBackend& compiler,
     size_t firstEnd = text.find('$', position);
     std::string_view firstToken = firstEnd == std::string_view::npos
         ? text.substr(position) : text.substr(position, firstEnd - position);
+    int constToken = 0;
     if (firstToken.size() > 1 && firstToken.front() == '.'
-        && firstToken != ".p" && firstToken != ".v" && firstToken != ".a")
+        && firstToken != ".p" && firstToken != ".v" && firstToken != ".a"
+        && !ParseConstDepthToken(firstToken, constToken))
     {
         if (firstToken == ".p" || firstToken == ".v" || firstToken == ".a") return out;
         TypeSpelling value;
@@ -444,6 +463,16 @@ std::string MangleTypeArgument(const LLVMBackend& compiler, std::string_view typ
     if (IsDecimalInteger(typeName))
         return typeName.front() == '-'
             ? ".n" + std::string(typeName.substr(1)) : "." + std::string(typeName);
+
+    // Pointee const rides as a prefix token after the alias marker: ".a$.c1$.p$int".
+    std::string plain;
+    int constDepth = 0;
+    if (!typeName.starts_with(".") && SplitConstTypeArgument(typeName, plain, constDepth))
+        {
+            std::string inner = MangleTypeArgument(compiler, plain);
+            const size_t at = inner.starts_with(".a$") ? 3 : 0;
+            return inner.insert(at, ".c" + std::to_string(constDepth) + "$");
+        }
 
     // Already encoded nested types are reparsed so primitive aliases inside them
     // are canonicalized as well.
@@ -595,6 +624,13 @@ std::string PrintTypeSpelling(const LLVMBackend& compiler, const TypeSpelling& s
     // Stars bind to the ELEMENT of a view ("int*[]"), so they print before the brackets.
     result += std::string(std::max(spelling.pointerDepth, 0), '*');
     if (spelling.view) result += "[]";
+    if (spelling.constDepth > 0 && !spelling.view)
+    {
+        // Pointee const prints in the whole-word spelling: "(const int)*", "(const int*)*".
+        const bool hasAlias = spelling.alias;
+        std::string plain = hasAlias ? result.substr(6) : result;
+        result = (hasAlias ? "alias " : "") + JoinConstTypeArgument(plain, spelling.constDepth);
+    }
     return result;
 }
 
@@ -603,6 +639,7 @@ std::string RemangleTypeSpelling(const LLVMBackend& compiler, const TypeSpelling
     if (!spelling.encodedName.empty()) return spelling.encodedName;
     std::string result;
     if (spelling.alias) result += ".a$";
+    if (spelling.constDepth > 0) result += ".c" + std::to_string(spelling.constDepth) + "$";
     // The view code comes first, then the ELEMENT's stars: "int*[]" -> ".v$.p$int".
     if (spelling.view) result += ".v$";
     for (int i = 0; i < std::max(spelling.pointerDepth, 0); i++) result += ".p$";
@@ -986,4 +1023,61 @@ std::string SpellFunctionSymbol(const LLVMBackend& compiler, std::string_view sy
 std::string LLVMBackend::TypeAndValue::ToUniqueString(const LLVMBackend& compiler) const
 {
     return MangleType(compiler, *this);
+}
+
+bool SplitConstTypeArgument(std::string_view arg, std::string& plain, int& constDepth)
+{
+    constDepth = 0;
+    std::string_view rest = arg;
+    std::string prefix;
+    if (rest.starts_with("alias "))
+    {
+        prefix = "alias ";
+        rest.remove_prefix(6);
+    }
+    if (rest.starts_with(".a$"))
+    {
+        prefix = ".a$";
+        rest.remove_prefix(3);
+    }
+    if (rest.starts_with(".c"))
+    {
+        // Mangled form: ".c<N>$" ahead of the remaining codes.
+        const size_t separator = rest.find('$');
+        int depth = 0;
+        if (separator == std::string_view::npos || !ParseConstDepthToken(rest.substr(0, separator), depth))
+            return false;
+        plain = prefix + std::string(rest.substr(separator + 1));
+        constDepth = depth;
+        return true;
+    }
+    size_t outer = 0;
+    while (outer < rest.size() && rest[rest.size() - 1 - outer] == '*') ++outer;
+    std::string_view word = rest.substr(0, rest.size() - outer);
+    if (outer == 0 || !word.starts_with("(const ") || !word.ends_with(")")) return false;
+    word = word.substr(7, word.size() - 8);
+    size_t inner = 0;
+    while (inner < word.size() && word[word.size() - 1 - inner] == '*') ++inner;
+    if (inner == word.size()) return false;
+    plain = prefix + std::string(word.substr(0, word.size() - inner)) + std::string(inner + outer, '*');
+    constDepth = static_cast<int>(inner) + 1;
+    return true;
+}
+
+std::string JoinConstTypeArgument(const std::string& plain, int constDepth)
+{
+    if (constDepth <= 0 || plain.ends_with("[]")) return plain;
+    std::string rest = plain;
+    std::string prefix;
+    if (rest.starts_with("alias "))
+    {
+        prefix = "alias ";
+        rest.erase(0, 6);
+    }
+    size_t stars = 0;
+    while (stars < rest.size() && rest[rest.size() - 1 - stars] == '*') ++stars;
+    if (stars == 0 || stars == rest.size()) return plain;
+    const size_t depth = std::min<size_t>(static_cast<size_t>(constDepth), stars);
+    const std::string base = rest.substr(0, rest.size() - stars);
+    return prefix + "(const " + base + std::string(depth - 1, '*') + ")" + std::string(stars - depth + 1, '*');
 }

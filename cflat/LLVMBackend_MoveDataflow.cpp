@@ -1998,6 +1998,52 @@ uint8_t LLVMBackend::DeclaredPointeeConstLevels(const TypeAndValue& tv) const
         return LevelsBelow(DeclaredTopLevels(tv));
 }
 
+// Whether a string literal (or a join arm that is one) names another element type than the
+// one-level pointer target: a type mismatch, reported by the type check rather than as #5-#7.
+bool LLVMBackend::LiteralMismatchesPointee(const llvm::Value* value, const TypeAndValue& source,
+    const TypeAndValue& target, int depth, int guard) const
+{
+        if (value == nullptr || guard > 8) return false;
+        if (auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+            return LiteralMismatchesPointee(select->getTrueValue(), source, target, depth, guard + 1)
+                || LiteralMismatchesPointee(select->getFalseValue(), source, target, depth, guard + 1);
+        if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+        {
+            for (const llvm::Value* arm : phi->incoming_values())
+                if (LiteralMismatchesPointee(arm, source, target, depth, guard + 1)) return true;
+            return false;
+        }
+        if (!IsStringLiteralGlobal(value)) return false;
+        const std::string targetName = CanonicalPrimitiveTypeName(ResolveTypeAlias(target.TypeName));
+        if (depth != 1) return true;
+        if (targetName == "void") return false;
+        // A prefixed literal's own type names it (`u8"x"` is c8, same width as char); otherwise
+        // compare the element type (a join arm or a defaulted argument carries no literal type).
+        if (guard == 0 && source.Pointer)
+        {
+            const std::string sourceName = CanonicalPrimitiveTypeName(ResolveTypeAlias(source.TypeName));
+            if (sourceName == "c8" || sourceName == "c16" || sourceName == "c32" || sourceName == "wchar")
+                return sourceName != targetName;
+        }
+        const auto* global = llvm::dyn_cast<llvm::GlobalVariable>(value->stripPointerCasts());
+        const auto* array = global != nullptr ? llvm::dyn_cast<llvm::ArrayType>(global->getValueType()) : nullptr;
+        if (array == nullptr) return true;
+        TypeAndValue pointee = target;
+        pointee.Pointer = false;
+        pointee.ElemPointer = false;
+        pointee.PointerDepth = 0;
+        pointee.IsArrayView = false;
+        pointee.ConstMask = 0;
+        return GetType(pointee) != array->getElementType();
+}
+
+bool LLVMBackend::IsStringLiteralGlobal(const llvm::Value* value) const
+{
+        // Constant expressions only: a cast instruction (`(char*)"x"`) carries its own levels.
+        return value != nullptr && !llvm::isa<llvm::Instruction>(value)
+            && stringLiteralGlobals_.count(value->stripPointerCasts()) != 0;
+}
+
 /*
  * Const levels of the object stored at `address` (bit 0) and of what its value reaches (bit k):
  * a const write cause on the address makes everything behind it const (transitive, R11);
@@ -2006,6 +2052,7 @@ uint8_t LLVMBackend::DeclaredPointeeConstLevels(const TypeAndValue& tv) const
 uint8_t LLVMBackend::StoredConstLevels(const llvm::Value* address, std::string& name, int depth) const
 {
         if (address == nullptr || depth > 8) return 0;
+        if (IsStringLiteralGlobal(address)) return ValueConstLevels(address, name, depth + 1);
         if (auto* inst = llvm::dyn_cast<llvm::Instruction>(address);
             inst != nullptr && inst->getMetadata("cflat.const.cast") != nullptr)
             return ValueConstLevels(address, name, depth + 1);
@@ -2051,6 +2098,12 @@ uint8_t LLVMBackend::StoredConstLevels(const llvm::Value* address, std::string& 
 uint8_t LLVMBackend::ValueConstLevels(const llvm::Value* pointer, std::string& name, int depth) const
 {
         if (pointer == nullptr || depth > 8) return 0;
+        // A string literal is a `(const char)*` (R11): its characters are read-only.
+        if (IsStringLiteralGlobal(pointer))
+        {
+            name = "string literal";
+            return 0xFF;
+        }
         if (auto* inst = llvm::dyn_cast<llvm::Instruction>(pointer))
         {
             if (const llvm::MDNode* md = inst->getMetadata("cflat.const.cast"))
@@ -2160,6 +2213,9 @@ bool LLVMBackend::ConversionDiscardsConst(const llvm::Value* value, const TypeAn
             return false;
         const int depth = target.IsArrayView ? (target.ElemPointer ? 2 : 1) : target.ValuePointerDepth();
         if (depth <= 0) return false;
+        // A literal (or a join of literals) into a pointer to another element type is a type
+        // mismatch, reported as one; `u8"x"` is a `c8` literal.
+        if (LiteralMismatchesPointee(value, source, target, depth)) return false;
         std::string name;
         const uint8_t from = StoredConstLevels(value, name);
         uint8_t to = 0;
@@ -2171,6 +2227,8 @@ bool LLVMBackend::ConversionDiscardsConst(const llvm::Value* value, const TypeAn
         }
         else
             to = DeclaredPointeeConstLevels(target);
+        // A C++ `const char*` alias (`using Name = const char*`) keeps its pointee const.
+        if (target.IsCxxPointeeConst && depth == 1) to |= 1u;
         if (!QualificationDiscardsConst(from, to, depth)) return false;
         TypeAndValue shown = source.TypeName.empty() || target.IsArrayView ? target : source;
         shown.DiagnosticTypeName.clear();
@@ -2254,6 +2312,8 @@ llvm::Value* LLVMBackend::MarkCastQualification(llvm::Value* pointer, const Type
             if (builder->GetInsertBlock() == nullptr
                 || ((StoredConstLevels(pointer, current) ^ levels) & depthMask) == 0)
                 return pointer;
+            // `(Point*)"nn"` stays the literal itself: the reinterpret is refused where it lands.
+            if (LiteralMismatchesPointee(pointer, TypeAndValue{}, tv, depth)) return pointer;
             llvm::Value* zero = builder->getInt64(0);
             inst = llvm::GetElementPtrInst::Create(llvm::Type::getInt8Ty(*context), pointer,
                 llvm::ArrayRef<llvm::Value*>(zero), llvm::Twine("cast.qual"));
@@ -2750,3 +2810,596 @@ std::vector<LLVMBackend::AutoReturnSite> LLVMBackend::EndAutoReturnCapture()
 
 bool LLVMBackend::IsAutoReturnCaptureActive() const
 { return autoReturnCapture.has_value(); }
+
+namespace
+{
+    using ReceiverPath = LLVMBackend::ReceiverPath;
+
+    // Where a receiver path lands: its declared type when the walk could follow it, and how many
+    // pointers it went through (0 = the receiver's own storage, 1 = what its pointers reach).
+    struct ReceiverWalk
+    {
+        bool Known = false;
+        LLVMBackend::TypeAndValue Type;
+        int Derefs = 0;
+        // A call result codegen has not decided yet that may be writable: any use is a write.
+        bool Undecided = false;
+    };
+
+    bool ReceiverPointerLike(const LLVMBackend::TypeAndValue& tv)
+    {
+        if (tv.IsInterface || tv.IsFunctionPointer) return false;
+        return tv.Pointer || tv.PointerDepth > 0 || tv.IsArrayView || tv.ConstArraySize > 0;
+    }
+
+    LLVMBackend::TypeAndValue ReceiverPointee(const LLVMBackend::TypeAndValue& tv)
+    {
+        LLVMBackend::TypeAndValue e = tv;
+        e.ConstArraySize = 0;
+        e.ConstMask = 0;
+        if (tv.IsArrayView)
+        {
+            e.IsArrayView = false;
+            e.Pointer = tv.ElemPointer;
+            e.PointerDepth = tv.ElemPointer ? 1 : 0;
+        }
+        else if (tv.ElemPointer || tv.PointerDepth >= 2)
+        {
+            e.Pointer = true;
+            e.PointerDepth = tv.PointerDepth >= 2 ? tv.PointerDepth - 1 : 1;
+        }
+        else
+        {
+            e.Pointer = false;
+            e.PointerDepth = 0;
+        }
+        e.ElemPointer = false;
+        return e;
+    }
+
+    // The level a pointer parameter reaches first is const (C spelled levels included).
+    bool ReceiverParamPointeeConst(const LLVMBackend::TypeAndValue& p)
+    {
+        if (p.IsCxxPointeeConst) return true;
+        if (p.IsArrayView) return p.IsConstObject();
+        const int depth = p.ValuePointerDepth();
+        return depth >= 1 && ((p.ConstMask >> (depth - 1)) & 1u) != 0;
+    }
+}
+
+void LLVMBackend::RecordReceiverScanFacts(const std::string& uniqueName, ReceiverScanFacts facts)
+{
+    if (uniqueName.empty()) return;
+    readOnlyMethodMemo_.clear();
+    receiverScanFacts_[uniqueName] = std::move(facts);
+}
+
+bool LLVMBackend::IsNativeReceiverMethod(const FunctionSymbol& method) const
+{
+    if (method.IsCxx || method.Parameters.empty()) return false;
+    if (!method.IsMethod && receiverScanFacts_.count(method.UniqueName) == 0
+        && method.ConstMethodState == 0)
+        return false;
+    const TypeAndValue& self = method.Parameters.front();
+    return self.Pointer && self.VariableName == self.TypeName + "__"
+        && dataStructures.count(self.TypeName) != 0 && !IsCxxRecord(self.TypeName);
+}
+
+bool LLVMBackend::IsReadOnlyMethod(const FunctionSymbol& method)
+{
+    if (method.IsCxx) return method.CxxConst;
+    if (auto memo = readOnlyMethodMemo_.find(method.UniqueName); memo != readOnlyMethodMemo_.end())
+        return memo->second;
+    // No body facts (a cached core method): the cache's answer. A native method nothing ever
+    // scanned is not presumed read-only.
+    if (receiverScanFacts_.count(method.UniqueName) == 0) return method.ConstMethodState == 1;
+
+    auto fieldOf = [&](const std::string& structName, const std::string& name,
+                       TypeAndValue& out) -> bool {
+        auto sd = dataStructures.find(structName);
+        if (sd == dataStructures.end()) return false;
+        for (const auto& field : sd->second.StructFields)
+            if (field.VariableName == name) { out = field; return true; }
+        for (const auto& bit : sd->second.Bitfields)
+            if (bit.Name == name) { out = TypeAndValue{}; out.TypeName = bit.TypeName; return true; }
+        return false;
+    };
+    auto nativeStruct = [&](const std::string& name) {
+        return dataStructures.count(name) != 0 && !IsCxxRecord(name) && !IsInterfaceType(name);
+    };
+    // Codegen's own overload choice at a call site of `owner`'s body: null until that body was
+    // emitted, or when the site never reached overload resolution (the caller falls back).
+    auto chosen = [&](const std::string& owner, const void* site) -> const FunctionSymbol* {
+        if (receiverBodiesEmitted_.count(owner) == 0) { ++receiverFallbackConsults_; return nullptr; }
+        if (site == nullptr) return nullptr;
+        auto body = receiverCallResolution_.find(owner);
+        if (body == receiverCallResolution_.end()) return nullptr;
+        auto at = body->second.find(site);
+        if (at == body->second.end()) return nullptr;
+        auto symbolIn = [&](const std::vector<FunctionSymbol>& list) -> const FunctionSymbol* {
+            for (const auto& sym : list)
+                if (sym.UniqueName == at->second.second) return &sym;
+            return nullptr;
+        };
+        if (auto it = functionTable.find(at->second.first); it != functionTable.end())
+            if (const auto* sym = symbolIn(it->second)) return sym;
+        for (const auto& [key, list] : functionTable)
+            if (const auto* sym = symbolIn(list)) return sym;
+        return nullptr;
+    };
+    auto methodsOf = [&](const std::string& typeName, const std::string& member, size_t arity) {
+        std::vector<const FunctionSymbol*> out;
+        auto it = functionTable.find(member);
+        if (it == functionTable.end()) return out;
+        for (const auto& sym : it->second)
+            if (IsNativeReceiverMethod(sym) && sym.Parameters.front().TypeName == typeName
+                && (sym.Parameters.size() - 1 >= arity || sym.Variadic))
+                out.push_back(&sym);
+        return out;
+    };
+    // A call result that is an alias or a pointer to non-const can be written through.
+    auto resultWritable = [](const FunctionSymbol& callee) {
+        if (callee.ReturnsAlias) return !callee.ReturnType.IsConstObject();
+        return ReceiverPointerLike(callee.ReturnType) && !ReceiverParamPointeeConst(callee.ReturnType);
+    };
+    // The native struct a member call reaches through at most one pointer, with that pointer count.
+    auto callObject = [&](const ReceiverWalk& w, std::string& typeName, int& derefs) {
+        derefs = w.Derefs;
+        if (w.Type.Pointer && w.Type.PointerDepth <= 1 && !w.Type.ElemPointer) derefs++;
+        else if (w.Type.Pointer) return false;
+        if (derefs >= 2 || w.Type.IsInterface || IsInterfaceType(w.Type.TypeName)) return false;
+        typeName = w.Type.TypeName;
+        return true;
+    };
+
+    // Null when the path is not rooted at the receiver (a bare name the struct has no field for,
+    // a by-value copy, a call result that cannot reach the object).
+    std::function<std::optional<ReceiverWalk>(const std::string&, const ReceiverScanFacts&,
+                                              const ReceiverPath&, int)> walk;
+    /*
+     * Return provenance: an alias / pointer result is the receiver's storage unless every return
+     * (each `?:` arm on its own) is rooted elsewhere (global, unassigned parameter, literal,
+     * `new`). Solved as a least fixed point over returned calls, so a cycle adds nothing; unknown,
+     * no body facts or nesting past 256 count as the receiver's (fail closed).
+     */
+    std::unordered_map<std::string, bool> provenance;
+    int provenanceNesting = 0;
+    bool provenanceChanged = false;
+    auto evaluateProvenance = [&](const std::string& unique) {
+        const ReceiverScanFacts& facts = receiverScanFacts_.at(unique);
+        for (const auto& r : facts.Returns)
+        {
+            if (r.Kind == 2) return true;
+            if (r.Kind == 1) continue;
+            if (walk(unique, facts, r.Source, 0).has_value()) return true;
+        }
+        return false;
+    };
+    std::function<bool(const FunctionSymbol&)> resultIsReceiver = [&](const FunctionSymbol& callee) -> bool {
+        const std::string& unique = callee.UniqueName;
+        if (receiverScanFacts_.count(unique) == 0 || provenanceNesting > 256) return true;
+        if (auto it = provenance.find(unique); it != provenance.end()) return it->second;
+        provenance[unique] = false;
+        ++provenanceNesting;
+        const bool value = evaluateProvenance(unique);
+        --provenanceNesting;
+        if (value)
+        {
+            provenance[unique] = true;
+            provenanceChanged = true;
+        }
+        // Outermost query: re-evaluate the still-false summaries until nothing changes (one of
+        // them may have read another's in-progress answer).
+        while (provenanceNesting == 0 && provenanceChanged)
+        {
+            provenanceChanged = false;
+            std::vector<std::string> open;
+            for (const auto& [name, isReceiver] : provenance)
+                if (!isReceiver) open.push_back(name);
+            ++provenanceNesting;
+            for (const auto& name : open)
+                if (!provenance[name] && evaluateProvenance(name))
+                {
+                    provenance[name] = true;
+                    provenanceChanged = true;
+                }
+            --provenanceNesting;
+        }
+        return provenance[unique];
+    };
+    walk = [&](const std::string& owner, const ReceiverScanFacts& facts, const ReceiverPath& path,
+               int depth) -> std::optional<ReceiverWalk> {
+        const std::string& structName = facts.StructName;
+        ReceiverWalk w;
+        if (path.Result >= 0)
+        {
+            if (depth > 16 || static_cast<size_t>(path.Result) >= facts.Results.size())
+            {
+                w.Undecided = true;
+                return w;
+            }
+            const auto& call = facts.Results[path.Result];
+            std::string typeName = structName;
+            int derefs = 0;
+            if (call.Implicit)
+            {
+                TypeAndValue field;
+                if (fieldOf(structName, call.Member, field)) return std::nullopt;
+            }
+            else
+            {
+                auto r = walk(owner, facts, call.Receiver, depth + 1);
+                if (!r.has_value() || r->Undecided) return r;
+                if (!r->Known || !callObject(*r, typeName, derefs) || !nativeStruct(typeName)) return std::nullopt;
+            }
+            if (const auto* callee = chosen(owner, call.Site))
+            {
+                if (!IsNativeReceiverMethod(*callee) || !resultWritable(*callee)
+                    || !resultIsReceiver(*callee))
+                    return std::nullopt;
+                w.Type = callee->ReturnType;
+                w.Type.IsAlias = false;
+                w.Derefs = derefs;
+            }
+            else
+            {
+                // Not decided by codegen yet: any overload handing back a writable result counts.
+                bool writable = false;
+                for (const auto* callee : methodsOf(typeName, call.Member, call.Arity))
+                    writable = writable || resultWritable(*callee);
+                if (!writable) return std::nullopt;
+                w.Undecided = true;
+                return w;
+            }
+        }
+        else if (path.IsThis) w.Type.TypeName = structName;
+        else if (!fieldOf(structName, path.Root, w.Type)) return std::nullopt;
+        w.Known = true;
+        for (const auto& step : path.Steps)
+        {
+            if (step == "=")
+            {
+                // A by-value copy keeps provenance only when what was copied is a pointer or view.
+                if (w.Type.IsArrayView || (ReceiverPointerLike(w.Type) && w.Type.ConstArraySize == 0)) continue;
+                return std::nullopt;
+            }
+            const bool member = step.starts_with(".") || step.starts_with("->");
+            const bool arrow = step.starts_with("->");
+            if (member)
+            {
+                if (arrow || (w.Type.Pointer && w.Type.ConstArraySize == 0))
+                {
+                    if (!w.Type.Pointer) { w.Known = false; return w; }
+                    w.Derefs++;
+                    w.Type = ReceiverPointee(w.Type);
+                }
+                TypeAndValue field;
+                if (w.Type.Pointer || !nativeStruct(w.Type.TypeName)
+                    || !fieldOf(w.Type.TypeName, step.substr(arrow ? 2 : 1), field))
+                {
+                    w.Known = false;
+                    return w;
+                }
+                w.Type = field;
+                continue;
+            }
+            if (step == "[]" && w.Type.ConstArraySize > 0 && !w.Type.Pointer)
+            {
+                TypeAndValue e = w.Type;
+                e.ConstArraySize = 0;
+                e.Pointer = w.Type.ElemPointer;
+                e.PointerDepth = w.Type.ElemPointer ? 1 : 0;
+                e.ElemPointer = false;
+                w.Type = e;
+                continue;
+            }
+            if (!w.Type.Pointer && !w.Type.IsArrayView) { w.Known = false; return w; }
+            w.Derefs++;
+            w.Type = ReceiverPointee(w.Type);
+        }
+        return w;
+    };
+    /*
+     * An argument keeps the receiver's const when the parameter it binds does. With codegen's
+     * choice there is one candidate; otherwise every viable overload must keep it (fail closed).
+     */
+    auto keepsConst = [&](const std::vector<const FunctionSymbol*>& candidates, bool method, size_t argIndex,
+                          size_t arity, bool pointerRelevant, bool aliasRelevant) {
+        bool viable = false;
+        for (const auto* sym : candidates)
+        {
+            const size_t base = method ? 1 : 0;
+            if (sym->Parameters.size() - base < arity && !sym->Variadic) continue;
+            viable = true;
+            const size_t index = argIndex + base;
+            if (index >= sym->Parameters.size()) continue;
+            const TypeAndValue& p = sym->Parameters[index];
+            const bool pointerParam = p.Pointer || p.PointerDepth > 0 || p.IsArrayView;
+            if (pointerParam && !p.IsAlias)
+            {
+                if (pointerRelevant && !ReceiverParamPointeeConst(p)) return false;
+                continue;
+            }
+            if (p.IsAlias && !p.IsConstObject() && aliasRelevant) return false;
+        }
+        return viable;
+    };
+
+    struct Node { bool Mutating = false; std::vector<std::string> Deps; };
+    std::unordered_map<std::string, Node> nodes;
+    std::vector<std::string> pending{ method.UniqueName };
+    auto depend = [&](Node& node, const FunctionSymbol& callee) {
+        if (callee.IsCxx) { if (!callee.CxxConst) node.Mutating = true; return; }
+        if (auto memo = readOnlyMethodMemo_.find(callee.UniqueName); memo != readOnlyMethodMemo_.end())
+        {
+            if (!memo->second) node.Mutating = true;
+            return;
+        }
+        if (receiverScanFacts_.count(callee.UniqueName) == 0)
+        {
+            if (callee.ConstMethodState != 1) node.Mutating = true;
+            return;
+        }
+        node.Deps.push_back(callee.UniqueName);
+        if (nodes.count(callee.UniqueName) == 0) pending.push_back(callee.UniqueName);
+    };
+    while (!pending.empty())
+    {
+        const std::string name = pending.back();
+        pending.pop_back();
+        if (nodes.count(name) != 0) continue;
+        Node& node = nodes[name];
+        const ReceiverScanFacts& facts = receiverScanFacts_.at(name);
+        const std::string& self = facts.StructName;
+        for (const auto& write : facts.Writes)
+            if (auto w = walk(name, facts, write.Target, 0); w.has_value() && w->Derefs <= 1)
+            {
+                node.Mutating = true;
+                break;
+            }
+        if (node.Mutating) continue;
+        for (const auto& escape : facts.Escapes)
+        {
+            auto w = walk(name, facts, escape.Source, 0);
+            if (!w.has_value()) continue;
+            const bool pointerRelevant = escape.AddressOf ? w->Derefs <= 1
+                : w->Derefs <= 0 && (!w->Known || ReceiverPointerLike(w->Type));
+            const bool aliasRelevant = !escape.AddressOf && w->Derefs <= 1;
+            if (escape.Kind == 0)
+            {
+                if (escape.AliasBind ? aliasRelevant : pointerRelevant) node.Mutating = true;
+            }
+            else
+            {
+                // Unresolvable callee: only a definite pointer into the receiver counts.
+                const bool definite = escape.AddressOf ? w->Derefs <= 1
+                    : (w->Known || w->Undecided) && w->Derefs <= 0
+                        && (w->Undecided || ReceiverPointerLike(w->Type));
+                std::vector<const FunctionSymbol*> candidates;
+                bool method = false;
+                bool resolved = escape.Kind != 3;
+                const FunctionSymbol* callee = escape.Kind != 3 ? chosen(name, escape.Site) : nullptr;
+                if (callee != nullptr && !callee->IsCxx)
+                {
+                    candidates.push_back(callee);
+                    method = IsNativeReceiverMethod(*callee);
+                }
+                else if (escape.Kind == 1)
+                {
+                    TypeAndValue field;
+                    if (fieldOf(self, escape.Callee, field)) resolved = false;
+                    else if (candidates = methodsOf(self, escape.Callee, escape.Arity); !candidates.empty())
+                        method = true;
+                    else if (auto it = functionTable.find(escape.Callee); it != functionTable.end())
+                        for (const auto& sym : it->second)
+                            if (!IsNativeReceiverMethod(sym)) candidates.push_back(&sym);
+                }
+                else if (escape.Kind == 2)
+                {
+                    auto r = walk(name, facts, escape.CalleeReceiver, 0);
+                    std::string typeName;
+                    if (r.has_value() && r->Known && r->Type.PointerDepth <= 1 && !r->Type.ElemPointer)
+                        typeName = r->Type.TypeName;
+                    if (!r.has_value() && escape.CalleeReceiver.Result < 0 && !escape.CalleeReceiver.IsThis
+                        && escape.CalleeReceiver.Steps.empty())
+                    {
+                        // Not a field: a namespace-qualified free function (`os.f(...)`).
+                        if (auto it = functionTable.find(escape.CalleeReceiver.Root + "." + escape.Callee);
+                            it != functionTable.end())
+                            for (const auto& sym : it->second)
+                                if (!IsNativeReceiverMethod(sym)) candidates.push_back(&sym);
+                        resolved = !candidates.empty();
+                    }
+                    else if (typeName.empty() || !nativeStruct(typeName)) resolved = false;
+                    else { candidates = methodsOf(typeName, escape.Callee, escape.Arity); method = true; }
+                }
+                if (!resolved || candidates.empty())
+                    node.Mutating = definite;
+                else if ((pointerRelevant || aliasRelevant)
+                    && !keepsConst(candidates, method, escape.ArgIndex, escape.Arity, pointerRelevant, aliasRelevant))
+                    node.Mutating = true;
+            }
+            if (node.Mutating) break;
+        }
+        if (node.Mutating) continue;
+        for (const auto& call : facts.Calls)
+        {
+            std::string typeName;
+            if (call.Implicit)
+            {
+                TypeAndValue field;
+                if (fieldOf(self, call.Member, field)) continue;
+                typeName = self;
+            }
+            else
+            {
+                auto w = walk(name, facts, call.Receiver, 0);
+                if (w.has_value() && w->Undecided) { node.Mutating = true; break; }
+                int derefs = 0;
+                if (!w.has_value() || !w->Known || !callObject(*w, typeName, derefs)) continue;
+                if (IsCxxRecord(typeName))
+                {
+                    if (CxxMemberIsOnlyNonConst(typeName, call.Member, call.Arity + 1)) node.Mutating = true;
+                    if (node.Mutating) break;
+                    continue;
+                }
+                if (!nativeStruct(typeName)) continue;
+            }
+            if (const auto* callee = chosen(name, call.Site))
+            {
+                // Codegen's choice: a free function an implicit call resolved to is no dependency.
+                if (IsNativeReceiverMethod(*callee)) depend(node, *callee);
+            }
+            else
+                for (const auto* candidate : methodsOf(typeName, call.Member, call.Arity))
+                    depend(node, *candidate);
+            if (node.Mutating) break;
+        }
+    }
+    // Greatest fixed point: everything starts read-only unless a direct cause was found; a
+    // node depending on a mutating node turns mutating until nothing changes.
+    for (bool changed = true; changed;)
+    {
+        changed = false;
+        for (auto& [name, node] : nodes)
+        {
+            if (node.Mutating) continue;
+            for (const auto& dep : node.Deps)
+                if (auto it = nodes.find(dep); it != nodes.end() && it->second.Mutating)
+                {
+                    node.Mutating = true;
+                    changed = true;
+                    break;
+                }
+        }
+    }
+    for (const auto& [name, node] : nodes) readOnlyMethodMemo_[name] = !node.Mutating;
+    return readOnlyMethodMemo_[method.UniqueName];
+}
+
+void LLVMBackend::ResolveConstMethodStates()
+{
+    for (auto& [key, overloads] : functionTable)
+        for (auto& sym : overloads)
+            if (receiverScanFacts_.count(sym.UniqueName) != 0)
+                sym.ConstMethodState = IsReadOnlyMethod(sym) ? 1 : 2;
+}
+
+void LLVMBackend::RefuseConstReceiverMethodCall(const FunctionSymbol& method, const NamedVariable& self,
+                                                const std::string& functionName)
+{
+    using Kind = ConstWriteCause::CauseKind;
+    ConstWriteCause cause;
+    llvm::Value* address = nullptr;
+    if (self.ConstReceiverStorage != nullptr)
+        address = self.ConstReceiverStorage;
+    else if (self.TypeAndValue.Pointer && self.Primary == nullptr && self.Storage != nullptr)
+    {
+        // A pointer receiver still in its slot: the slot's declared pointee decides.
+        std::string name;
+        if (const auto* declared = DeclaredConstSlot(self.Storage, name);
+            declared != nullptr && ConstSlotPointeeIsConst(*declared))
+        {
+            cause.Kind = Kind::ThroughPointer;
+            cause.Name = name;
+        }
+    }
+    else
+        address = self.TypeAndValue.Pointer || self.Storage == nullptr ? self.Primary : self.Storage;
+    if (address != nullptr) cause = FindConstWriteCause(address);
+    if (cause.Kind == Kind::None) return;
+    std::string object = !self.FieldPathText.empty() ? self.FieldPathText
+        : !self.CallerName.empty() ? self.CallerName : self.TypeAndValue.VariableName;
+    if (object.empty()) object = cause.Kind == Kind::Object ? cause.Root.Name : cause.Name;
+    std::string reason;
+    if (cause.Kind == Kind::Field)
+        reason = std::format("field '{}' is const", cause.Name);
+    else if (cause.Kind == Kind::ThroughPointer)
+        reason = std::format("it is reached through a pointer to const ('{}')", cause.Name);
+    else if (cause.Root.Storage == address || object == cause.Root.Name)
+        reason = "it is declared const";
+    else
+        reason = std::format("'{}' is const", cause.Root.Name);
+    const std::string member = method.SourceName.empty() ? functionName : method.SourceName;
+    PendingConstReceiverCall entry;
+    entry.Callee = method;
+    entry.Message = std::format(
+        "cannot call non-const member '{}' on '{}': {}, so it is read-only and only a const "
+        "member function may be called on it. {}", member, object, reason,
+        std::format("'{}' is not read-only: its body writes the object, or calls a member that does.",
+                    member));
+    entry.File = sourceFileName;
+    entry.Line = currentLine;
+    entry.Column = currentColumn;
+    // Owned by the scoped / bare expect_error armed here; the file-scope one is module level.
+    if (!expectedError.empty() && expectedError != fileScopeExpectedError_) entry.Owner = activeExpectScope_;
+    pendingConstReceiverCalls_.push_back(std::move(entry));
+}
+
+bool LLVMBackend::DeferExpectationVerdict()
+{
+    const size_t scope = activeExpectScope_;
+    if (scope == 0 || expectedError.empty()
+        || std::none_of(pendingConstReceiverCalls_.begin(), pendingConstReceiverCalls_.end(),
+                        [&](const auto& e) { return e.Owner == scope; }))
+        return false;
+    deferredExpectations_.push_back(activeExpectPosition_);
+    RestoreFileScopeExpectedError();
+    return true;
+}
+
+// `aborted`: an expected error ended the walk early. Only the deferred expectations are settled
+// (never dropped); a refusal that needed the no-body fallback cannot answer one.
+void LLVMBackend::ResolvePendingConstReceiverCalls(bool aborted)
+{
+    std::vector<PendingConstReceiverCall> pending;
+    pending.swap(pendingConstReceiverCalls_);
+    std::vector<DeferredExpectation> expectations;
+    expectations.swap(deferredExpectations_);
+    // Deferred expectations first, in source order: each is answered by the first refusal it
+    // owns (matched: PASS; another message: the usual mismatch), or did not occur.
+    for (const auto& expectation : expectations)
+    {
+        bool answered = false;
+        bool undecided = false;
+        for (const auto& entry : pending)
+        {
+            if (entry.Owner != expectation.Scope) continue;
+            if (aborted) { readOnlyMethodMemo_.clear(); receiverFallbackConsults_ = 0; }
+            if (IsReadOnlyMethod(entry.Callee)) continue;
+            if (aborted && receiverFallbackConsults_ != 0) { undecided = true; continue; }
+            expectedError = expectation.Expected;
+            expectedErrorScopeDepth = SIZE_MAX;
+            activeExpectScope_ = 0;
+            try
+            {
+                ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
+                LogError(entry.Message);
+            }
+            catch (const ExpectedErrorReceived&) {}
+            RestoreFileScopeExpectedError();
+            answered = true;
+            break;
+        }
+        if (answered) continue;
+        ReportingFileScope fileScope(this, expectation.File, expectation.Line, expectation.Column);
+        if (undecided)
+            std::cout << std::format("FAIL: expected error '{}' could not be decided: the compile stopped before every called body was emitted\n", expectation.Expected);
+        else
+            std::cout << std::format("FAIL: expected error '{}' did not occur\n", expectation.Expected);
+        if (diagnosticSink_)
+            throw CompilerAbortException{ "expected error did not occur", sourceFileName, currentLine, currentColumn };
+        FailCompilation("expected error did not occur");
+    }
+    if (aborted) return;
+    // Module level (and any owner that neither caught nor deferred), in call order; LogError
+    // ends the compile (or answers the file-scope expectation) at the first refusal.
+    std::unordered_set<size_t> deferredScopes;
+    for (const auto& expectation : expectations) deferredScopes.insert(expectation.Scope);
+    for (const auto& entry : pending)
+    {
+        if (deferredScopes.count(entry.Owner) != 0 || IsReadOnlyMethod(entry.Callee)) continue;
+        ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
+        LogError(entry.Message);
+    }
+}

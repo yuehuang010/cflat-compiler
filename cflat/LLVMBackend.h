@@ -1899,6 +1899,9 @@ public:
         std::string OwningStructName;    // when this NamedVariable is a struct-field access, the field's owning struct
         std::string FieldName;           // when this NamedVariable is a struct-field access, the field name
         std::string FieldPathText;       // source spelling of a field path, e.g. "w.inner.b"
+        // A receiver passed as a copy (a native member operator's left operand): the caller's
+        // own object, which decides whether the call is on a const receiver. Not cached.
+        llvm::Value* ConstReceiverStorage = nullptr;
         // Canonical move path below CallerName, with compile-time array indices only.
         std::string MovePathKey;
         bool MovePathHasDynamicIndex = false;
@@ -2230,6 +2233,8 @@ public:
         int CxxRefQualifier = cflat_cinterop::CxxRefQualifierNone;
         bool CxxVolatile = false;  // volatile-qualified C++ member declaration
         bool CxxConst = false;     // const-qualified C++ instance member
+        // Native method read-only-ness from the cache: 0 unknown, 1 read-only, 2 mutating.
+        uint8_t ConstMethodState = 0;
         bool IsNoexcept = true;    // potentially throwing C++ calls are gated until EH support
         bool IsCInteropAlias = false;
         bool IsCInteropDeclaration = false;
@@ -4693,6 +4698,8 @@ private:
     std::unordered_map<std::string, ReturnBlockEntry> returnBlockTable;
     std::optional<std::vector<AutoReturnSite>> autoReturnCapture; // active when emitting an 'auto' generic instantiation
     std::unordered_map<llvm::Constant*, int32_t> stringLiteralLenByPtr;
+    // Globals backing string literals (narrow and wide): their characters are read-only (R11).
+    std::unordered_set<const llvm::Value*> stringLiteralGlobals_;
     bool strConcatRegistered = false;
     bool stringDtorRegistered = false;
     bool closureLifetimeRegistered = false;   // closure dtor + copy registered (lazy; needs function.cb)
@@ -11908,12 +11915,159 @@ public:
         std::string Name;       // Field: the const field; ThroughPointer: the pointer
     };
     ConstWriteCause FindConstWriteCause(const llvm::Value* address) const;
+
+    /*
+     * Const receivers (iteration 1, inferred read-only-ness): what a native method body does with
+     * its `this`, recorded structurally at declaration (RecordReceiverScan, MainListener.h) and
+     * resolved lazily against the declared types (IsReadOnlyMethod). A path starts at the object
+     * (`IsThis`) or at a bare name that is a field when the struct declares one; steps are ".f",
+     * "->f", "[]" and "*".
+     */
+    struct ReceiverPath
+    {
+        bool IsThis = false;
+        std::string Root;
+        std::vector<std::string> Steps;
+        // >= 0: the path starts at the result of ReceiverScanFacts::Results[Result] (a call).
+        int Result = -1;
+    };
+    struct ReceiverScanFacts
+    {
+        std::string StructName;
+        struct Write { ReceiverPath Target; };
+        std::vector<Write> Writes;
+        // A member call on a receiver path (an implicit-this call has an IsThis receiver).
+        // Site: the call's '(' token, the key codegen records its chosen overload under.
+        struct Call
+        {
+            ReceiverPath Receiver;
+            std::string Member;
+            size_t Arity = 0;
+            bool Implicit = false;
+            const void* Site = nullptr;
+        };
+        std::vector<Call> Calls;
+        // Calls whose result a path starts at (ReceiverPath::Result).
+        std::vector<Call> Results;
+        /*
+         * A receiver-rooted value flowing somewhere: an argument (Kind 1 free / implicit-this
+         * function, 2 member of CalleeReceiver, 3 unresolvable callee), or an initializer /
+         * assigned value (Kind 0, AliasBind for a mutable `alias` binding).
+         */
+        struct Escape
+        {
+            ReceiverPath Source;
+            bool AddressOf = false;
+            bool AliasBind = false;
+            int Kind = 0;
+            std::string Callee;
+            ReceiverPath CalleeReceiver;
+            size_t ArgIndex = 0;
+            size_t Arity = 0;
+            const void* Site = nullptr;
+        };
+        std::vector<Escape> Escapes;
+        /*
+         * What an `alias` / pointer return hands back: Kind 0 a receiver-candidate path, 1 rooted
+         * elsewhere (an unassigned parameter, a literal, `new`), 2 unknown.
+         */
+        struct Return { int Kind = 2; ReceiverPath Source; bool AddressOf = false; };
+        std::vector<Return> Returns;
+    };
+    void RecordReceiverScanFacts(const std::string& uniqueName, ReceiverScanFacts facts);
+    bool HasReceiverScanFacts(const std::string& uniqueName) const
+    {
+        return receiverScanFacts_.count(uniqueName) != 0;
+    }
+    // A native method may be called on a const receiver (greatest fixed point over its calls).
+    bool IsReadOnlyMethod(const FunctionSymbol& method);
+    // Native method (has a `this`) whose read-only-ness the call site judges.
+    bool IsNativeReceiverMethod(const FunctionSymbol& method) const;
+    // #8: refuse a call of a method that is not read-only on a const receiver.
+    void RefuseConstReceiverMethodCall(const FunctionSymbol& method, const NamedVariable& self,
+                                       const std::string& functionName);
+    // Settle every recorded method into FunctionSymbol::ConstMethodState before the cache is written.
+    void ResolveConstMethodStates();
+    std::unordered_map<std::string, ReceiverScanFacts> receiverScanFacts_;
+    std::unordered_map<std::string, bool> readOnlyMethodMemo_;
+    /*
+     * Codegen's own overload choice per call site of a native method body: method unique name ->
+     * site ('(' token) -> (functionTable key, callee unique name). A body is "emitted" once its
+     * codegen finished; until then a site has no answer and the analysis falls back fail closed.
+     */
+    std::unordered_map<std::string, std::unordered_map<const void*, std::pair<std::string, std::string>>>
+        receiverCallResolution_;
+    std::unordered_set<std::string> receiverBodiesEmitted_;
+    // Counts call sites answered by the no-body fallback (settling an aborted module).
+    size_t receiverFallbackConsults_ = 0;
+    std::vector<std::string> receiverBodyStack_;
+    // Set by the postfix lowering right before the call it describes; taken at call entry.
+    const void* pendingCallSite_ = nullptr;
+    void BeginReceiverBody(const std::string& uniqueName) { receiverBodyStack_.push_back(uniqueName); }
+    void EndReceiverBody()
+    {
+        if (receiverBodyStack_.empty()) return;
+        receiverBodiesEmitted_.insert(receiverBodyStack_.back());
+        receiverBodyStack_.pop_back();
+        readOnlyMethodMemo_.clear();
+    }
+    // First choice wins: a chained binary operator lowers its leftmost operator first.
+    void RecordReceiverCallResolution(const void* site, const std::string& key, const std::string& unique)
+    {
+        if (site != nullptr && !receiverBodyStack_.empty())
+            receiverCallResolution_[receiverBodyStack_.back()].try_emplace(site, key, unique);
+    }
+    /*
+     * #8 is decided once every body is emitted: a call on a const receiver records the callee
+     * and its finished diagnostic. Owner: the scoped / bare expect_error armed when it was
+     * queued (0 = module level). A scope that catches an error drops what it owns; one that ends
+     * without an error but owns entries defers its verdict to the module-end resolution.
+     */
+    struct PendingConstReceiverCall
+    {
+        FunctionSymbol Callee;
+        std::string Message;
+        std::string File;
+        size_t Line = 0;
+        size_t Column = 0;
+        size_t Owner = 0;
+    };
+    struct DeferredExpectation
+    {
+        size_t Scope = 0;
+        std::string Expected;
+        std::string File;
+        size_t Line = 0;
+        size_t Column = 0;
+    };
+    std::vector<PendingConstReceiverCall> pendingConstReceiverCalls_;
+    std::vector<DeferredExpectation> deferredExpectations_;
+    size_t activeExpectScope_ = 0;
+    size_t expectScopeCounter_ = 0;
+    DeferredExpectation activeExpectPosition_;
+    // A scoped / bare expect_error was armed at the current source position.
+    void ArmExpectScope()
+    {
+        activeExpectScope_ = ++expectScopeCounter_;
+        activeExpectPosition_ = { activeExpectScope_, expectedError, sourceFileName, currentLine, currentColumn };
+    }
+    // Its scope ended without an error: true (and disarmed) when pending #8 entries decide it.
+    bool DeferExpectationVerdict();
+    void DiscardExpectScopeEntries(size_t scope)
+    {
+        if (scope == 0) return;
+        std::erase_if(pendingConstReceiverCalls_, [&](const auto& e) { return e.Owner == scope; });
+    }
+    void ResolvePendingConstReceiverCalls(bool aborted = false);
     const TypeAndValue* DeclaredConstSlot(const llvm::Value* slot, std::string& name, int depth = 0) const;
     bool PointerValuePointeeConst(const llvm::Value* pointer, std::string& name, int depth = 0) const;
     // Top-relative const levels (bit 0 = the first level reached): behind a pointer value, of the
     // object stored at an address (bit 0 = that object), and behind a declared pointer type.
     uint8_t ValueConstLevels(const llvm::Value* pointer, std::string& name, int depth = 0) const;
     uint8_t StoredConstLevels(const llvm::Value* address, std::string& name, int depth = 0) const;
+    bool IsStringLiteralGlobal(const llvm::Value* value) const;
+    bool LiteralMismatchesPointee(const llvm::Value* value, const TypeAndValue& source,
+        const TypeAndValue& target, int depth, int guard = 0) const;
     uint8_t DeclaredPointeeConstLevels(const TypeAndValue& tv) const;
     static bool QualificationDiscardsConst(uint8_t source, uint8_t target, int depth);
     llvm::Value* ArgumentPointerValue(const NamedVariable& arg) const;
@@ -12637,7 +12791,7 @@ public:
     // 262: C++ records carry every class-scope name ("sn") for range-for member lookup (T328).
     // 263: C header cached signatures retain C no-prototype function-pointer state (T332 r2).
     // 264: C++ fields retain explicit constness for mutable-ancestry write checks (T335 r2).
-    static constexpr int kCHeaderCacheVersion = 264;
+    static constexpr int kCHeaderCacheVersion = 265;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

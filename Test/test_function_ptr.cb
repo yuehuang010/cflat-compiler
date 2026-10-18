@@ -494,7 +494,7 @@ bool testCapturePrimitives()
 
     // char* - pointer copy; both sides read the same bytes
     {
-        char* msg = "hello";
+        (const char)* msg = "hello";
         Lambda<int()> getLen = () => { return strlen(msg); };
         result &= Test("char* capture", getLen(), 5);
     }
@@ -2822,7 +2822,7 @@ int spellCallString(function<int(string)> f) { return f("hi"); }
 int spellCallString(double d)                { return 700 + (int)d; }
 
 int onStringArg(string s)                    { return 18; }
-int spellCallCharPtr(function<int(char*)> f) { return f("hi"); }
+int spellCallCharPtr(function<int(char*)> f) { char[3] hi = "hi"; return f(hi); }
 int spellCallCharPtr(double d)               { return 700 + (int)d; }
 
 // A struct component proves only its OWN identity - the same struct spelled through an alias is
@@ -3335,7 +3335,8 @@ bool testFuncPtrCallResultIntoClosureParam()
     // that proof from becoming a blanket ban on any arity difference.
     g_prefixArityCalls = 0;
     function<void(char*, int)> pa = prefixArityOne;
-    pa("hi", 2);
+    char[3] paText = "hi";
+    pa(paText, 2);
     result &= Test("declaration-site prefix arity", g_prefixArityCalls, 1);
 
     return result;
@@ -3903,7 +3904,7 @@ bool testCodeValueJoinAccepts()
     // A '?:' arm harmonized into `string`: legal for a real string and for a raw char*, refused
     // only when the pointer arm is PROVEN code. These are the accept twins of that rejection.
     string sa = "aa";
-    char*  raw = "raw";
+    (const char)*  raw = "raw";
     string ternStr = c > 0 ? sa : "0";
     string ternRaw = c > 0 ? raw : sa;
     result &= Test("cvj_tern_string_literal_arm", (int)ternStr.length(), 2);

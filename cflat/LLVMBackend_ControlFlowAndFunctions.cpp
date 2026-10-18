@@ -1263,7 +1263,9 @@ llvm::UncondBrInst* LLVMBackend::CreateBlockBreak(llvm::BasicBlock* resumeBlock,
         if (exitBlockStack)
         {
             // Bare-semicolon form: expect_error("msg"); - if the expected error never fired before this scope exits, report failure.
-            if (!expectedError.empty() && expectedErrorScopeDepth == stackNamedVariable.size())
+            // A deferred #8 owned by it decides it at module end instead.
+            if (!expectedError.empty() && expectedErrorScopeDepth == stackNamedVariable.size()
+                && !DeferExpectationVerdict())
             {
                 std::cout << std::format("FAIL: expected error '{}' did not occur\n", expectedError);
                 expectedError.clear();

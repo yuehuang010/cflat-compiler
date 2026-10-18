@@ -555,6 +555,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         {
             if (ctx->genericTypeParameters()->typeParameterList()->typeParameterEntry().empty())
                 LogErrorContext(ctx, "generic definition needs at least one type parameter");
+            RefuseConstTemplateParameters(ctx->genericTypeParameters());
             if (Compiler()->gts.scannedGenericInterfaceNames.count(structName) != 0
                 || genericInterfaceTemplates.count(structName) != 0)
                 LogErrorContext(ctx, std::format(
@@ -792,7 +793,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             auto savedPackItemSubst = activeTypeSubstitutions;
             for (size_t i = 0; i < packTypes.size(); i++)
             {
-                activeTypeSubstitutions[packParamName] = packTypes[i];
+                activeTypeSubstitutions.Bind(packParamName, packTypes[i]);
                 auto expanded = ParseDeclarationList({decl});
                 for (auto& f : expanded)
                 {
@@ -1937,6 +1938,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                         ->typeParameterEntry().empty())
                         LogErrorContext(func->genericTypeParameters(),
                             "generic definition needs at least one type parameter");
+                    RefuseConstTemplateParameters(func->genericTypeParameters());
                     std::string qualifiedName = structName + "." + funcName;
                     genericFunctionTemplates[qualifiedName] = func;
                     // Declaring NAMESPACE of the owner, recorded not derived: the key's last dot
@@ -4267,6 +4269,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         {
             if (ctx->genericTypeParameters()->typeParameterList()->typeParameterEntry().empty())
                 LogErrorContext(ctx, "generic definition needs at least one type parameter");
+            RefuseConstTemplateParameters(ctx->genericTypeParameters());
             if (Compiler()->gts.scannedGenericInterfaceNames.count(structName) != 0
                 || genericInterfaceTemplates.count(structName) != 0)
                 LogErrorContext(ctx, std::format(
@@ -4454,7 +4457,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             auto savedPackItemSubst = activeTypeSubstitutions;
             for (size_t i = 0; i < packTypes.size(); i++)
             {
-                activeTypeSubstitutions[packParamName] = packTypes[i];
+                activeTypeSubstitutions.Bind(packParamName, packTypes[i]);
                 auto expanded = ParseDeclarationList({decl});
                 for (auto& f : expanded)
                 {

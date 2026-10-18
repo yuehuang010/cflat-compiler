@@ -1,0 +1,54 @@
+// Const phase 6: a string literal is a `(const char)*` (plan cflat-const.md section 2 item 13, R11).
+// Converting it to a mutable `char*` is #5 (init / assign), #6 (argument), #7 (return), and a
+// write through it is #3. Copying it into an array, or into a `string`, stays legal.
+struct C06Sink
+{
+    int n = 0;
+    void Put(char* s) { n = (int)s[0]; }
+};
+void c06Write(char* s) { s[0] = 'x'; }
+extern void c06ExternWrite(char* s);
+function<void(char*)> c06WriteFn = default;
+
+expect_error("cannot return '(const char)*' as 'char*': the conversion discards const") {
+    char* c06Leak() { return "leak"; }
+}
+
+extern int main()
+{
+    expect_error("cannot convert '(const char)*' to 'char*': the conversion discards const") {
+        char* p = "init";
+    }
+    expect_error("cannot convert '(const char)*' to 'char*': the conversion discards const") {
+        char* q = nullptr;
+        q = "assign";
+    }
+    expect_error("cannot convert '(const wchar)*' to 'wchar*': the conversion discards const") {
+        wchar* w = L"wide";
+    }
+    expect_error("cannot pass argument 1 ('(const char)*') to parameter 's' ('char*'): the conversion discards const") {
+        c06Write("native");
+    }
+    expect_error("cannot pass argument 1 ('(const char)*') to parameter 's' ('char*'): the conversion discards const") {
+        c06ExternWrite("extern");
+    }
+    expect_error("cannot pass argument 1 ('(const char)*') to parameter 's' ('char*'): the conversion discards const") {
+        C06Sink sink = default;
+        sink.Put("method");
+    }
+    expect_error("the conversion discards const") {
+        c06WriteFn = c06Write;
+        c06WriteFn("value");
+    }
+    expect_error("it is reached through a pointer to const") {
+        "abc"[0] = 'x';
+    }
+    expect_error("it is reached through a pointer to const") {
+        auto lit = "auto";
+        lit[0] = 'A';
+    }
+    char[4] copy = "abc";
+    copy[0] = 'X';
+    string text = "fine";
+    return copy[0] == 'X' && text.length() == 4 ? 0 : 1;
+}

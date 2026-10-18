@@ -20,6 +20,9 @@ struct TypeSpelling
     bool thinClosure = false;
     bool bareFunction = false;
     bool move = false;
+    // Pointee const of a generic type argument: const levels counted from the innermost
+    // pointee (`(const int)*` = 1, `(const int*)*` = 2). Never the argument's own level.
+    int constDepth = 0;
     std::string encodedName;
 };
 
@@ -51,6 +54,12 @@ std::string SpellTypeForSymbolDump(const LLVMBackend& compiler,
 std::string SpellDiagnosticType(const LLVMBackend& compiler,
                                 const LLVMBackend::TypeAndValue& type);
 std::string_view MangledBase(std::string_view mangled);
+// A generic type argument carrying pointee const, spelled "(const int)*" (mangled ".c1$.p$int"):
+// the argument without it and its const depth. False when the argument carries none.
+bool SplitConstTypeArgument(std::string_view arg, std::string& plain, int& constDepth);
+// Inverse of SplitConstTypeArgument for a spelled argument; the depth is capped below the
+// argument's own level (a generic argument never carries top-level const).
+std::string JoinConstTypeArgument(const std::string& plain, int constDepth);
 // Declared defaults of a template's generic parameters (parallel to its parameter list; empty
 // string = no default). Null when the template name is unknown.
 const std::vector<std::string>* GenericValueDefaultsFor(const LLVMBackend& compiler,

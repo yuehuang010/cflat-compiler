@@ -25,7 +25,7 @@ extern u64 mach_absolute_time();
 extern int mach_timebase_info(TimebaseInfo* info);
 
 // Prints a string-valued sysctl like hw.model or machdep.cpu.brand_string.
-void printSysctlString(char* key)
+void printSysctlString((const char)* key)
 {
     char[256] buf;
     u64 len = (u64)sizeof(buf);
@@ -35,7 +35,7 @@ void printSysctlString(char* key)
         printf("%-28s <unavailable>\n", key);
 }
 
-void printSysctlInt(char* key)
+void printSysctlInt((const char)* key)
 {
     i64 value = 0;
     u64 len = 8u;

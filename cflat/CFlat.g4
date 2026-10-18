@@ -430,7 +430,7 @@ typeParameterList
 typeParameterEntry
     : valueParameterDeclaration
     | functionTypeArgument
-    | Identifier? typeSpecifier multiWordTypeSuffix? pointer? arrayTypeSuffix? Ellipsis?   // leading Identifier is the `unique` ownership qualifier (soft keyword, validated in the listener); `T[]` arg = a noalias array-view; `[N]`/`[]*` rejected in the listener
+    | Identifier? Const? typeSpecifier multiWordTypeSuffix? pointer? arrayTypeSuffix? Ellipsis?   // `Const` is refused (#14); leading Identifier is the `unique` ownership qualifier (soft keyword, validated in the listener); `T[]` arg = a noalias array-view; `[N]`/`[]*` rejected in the listener
     | shiftExpression                                                 // compile-time VALUE argument, e.g. `8`, `CAP*2`, `(A>B)`
     ;
 // C and C++ permit several primitive type spellings in one type argument, such as

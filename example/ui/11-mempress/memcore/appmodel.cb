@@ -4,7 +4,7 @@
 import "list.cb";
 import "string.cb";
 
-char* kBackgroundAppKey = "background";
+(const char)* kBackgroundAppKey = "background";
 
 enum PressureBand : i32 { Low = 0, Moderate = 1, High = 2, Critical = 3 };
 
@@ -62,7 +62,7 @@ struct AppEntry
     PressureScore pressure = default;
 };
 
-char* pressureBandName(i32 band)
+(const char)* pressureBandName(i32 band)
 {
     if (band == PressureBand.Critical) return "Critical";
     if (band == PressureBand.High)     return "High";

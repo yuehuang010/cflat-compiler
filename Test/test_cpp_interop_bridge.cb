@@ -2071,7 +2071,8 @@ void stdfn_install(alias cppfn.Holder h)
     h.set_handler(local);
 }
 
-int cbMixedOut(cppi.Mixed m, char** out) { *out = "callback-out"; return m.i + (int)m.d; }
+char[13] cbMixedOutText = "callback-out";
+int cbMixedOut(cppi.Mixed m, char** out) { *out = cbMixedOutText; return m.i + (int)m.d; }
 cppi.Mixed cbMixed(cppi.Mixed m) { m.d = m.d + 1.0; m.i = m.i + 1; return m; }
 cppi.Large cbLarge(cppi.Large v)
 {
@@ -4396,7 +4397,8 @@ extern int main(int argc, char** argv)
     Lambda<int(int)> capL2 = (int x) => { return x + capS.length(); };
     if (cppi.apply_copy(move capL2, 1) != 74)       return 657;
     std.vector<char*> revPv = default;
-    char* revS = "vector-pointer";
+    char[15] revSBuf = "vector-pointer";
+    char* revS = revSBuf;
     revPv.push_back(revS);
     if (revPv[0] != revS)                             return 616;
     cppi.Mixed revMo = default; revMo.i = 30; revMo.d = 2.0;
@@ -7496,7 +7498,8 @@ extern int main(int argc, char** argv)
     // Remaining picks clang makes differently (legs 3640-3644).
     {
         // A string literal is const char[N]: const char* over char* (was 5); a char* stays 5.
-        char* named = "ab";
+        char[3] namedBuf = "ab";
+        char* named = namedBuf;
         bridge_check("pick string literal const char*", cpppa.rk_cc("ab") * 10 + cpppa.rk_cc(named), 65);
         if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
             return 3640;

@@ -280,3 +280,7 @@ int c03KCReadMulti(const int** p) { return **p; }
 int c03KCReadAll(const int* const* p) { return **p; }
 /* c03: `int *const *` is const at the pointer slot only; its int stays writable. */
 int c03KCSlotRead(int* const* p) { return **p; }
+/* c06: a C field spelled `const char*` (directly or through a typedef) takes a string literal. */
+typedef const char* C06_PCSTR;
+struct C06Names { const char* direct; C06_PCSTR alias; char* mutable_name; };
+int c06NamesSecond(const struct C06Names* n) { return n->direct[1] * 1000 + n->alias[1]; }

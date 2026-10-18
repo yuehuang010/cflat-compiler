@@ -47,8 +47,8 @@ extern int main(int argc, char** argv)
         return 0;
     }
 
-    char* host = "example.com";
-    char* path = "/";
+    (const char)* host = "example.com";
+    (const char)* path = "/";
     if (argc >= 2) host = argv[1];
     if (argc >= 3) path = argv[2];
 
@@ -74,7 +74,7 @@ extern int main(int argc, char** argv)
     hints.ai_protocol = kIpprotoTcp;
 
     addrinfo* resolved = nullptr;
-    int gai = getaddrinfo(host, "80", (void*)&hints, (void*)&resolved);
+    int gai = getaddrinfo(host, "80", (void*)&hints, (void**)&resolved);
     if (gai != 0) {
         // getaddrinfo returns the WSA error code directly; mirror it via
         // WSAGetLastError for parity with the rest of the failure paths.

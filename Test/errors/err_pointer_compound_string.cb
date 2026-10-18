@@ -2,7 +2,7 @@
 expect_error("cannot add a value of type 'string' to a pointer") {
     extern int main()
     {
-        char* p = "abc";
+        (const char)* p = "abc";
         string s = "x";
         p += s;
         return 0;

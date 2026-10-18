@@ -5337,7 +5337,10 @@ void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& a
                     if (mapped && mappedTarget.IsFunctionPointer)
                         RegisterFunctionTypeAlias(a.qualifiedName, mappedTarget);
                     else
-                        RegisterTypeAlias(a.qualifiedName, qualifiedTarget);
+                        // `using Name = const char*` keeps its pointee const (a `(const char)*`).
+                        RegisterTypeAlias(a.qualifiedName, qualifiedTarget,
+                            mapped && cxxBoundary && mappedTarget.Pointer && !mappedTarget.ElemPointer
+                                && !mappedTarget.IsFunctionPointer && CxxSpellingHasConstPointee(a.target) ? 1 : 0);
                     if (mapped && mappedTarget.IsCxxNullptrT) cxxNullptrTAliases_.insert(a.qualifiedName);
                 }
                 // A global C++ typedef of a non-record type binds by its plain name, as clang sees
@@ -5440,6 +5443,8 @@ bool LLVMBackend::MaterializeCxxGlobalTypedef(const std::string& name)
         if (mapped.ElemPointer) spelled += "*";
         if (spelled == name) return false;
         typeAliases[name] = spelled;
+        if (mapped.Pointer && !mapped.ElemPointer && CxxSpellingHasConstPointee(target))
+            typeAliasConstMasks[name] = 1;
         if (mapped.IsCxxNullptrT) cxxNullptrTAliases_.insert(name);
         return true;
     }
@@ -18568,6 +18573,9 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             if (mapped.Pointer) spelled += "*";
             if (mapped.ElemPointer) spelled += "*";
             typeAliases[cflatName] = spelled;
+            // `using Name = const char*` keeps its pointee const (a `(const char)*` alias).
+            if (mapped.Pointer && !mapped.ElemPointer && CxxSpellingHasConstPointee(spelling))
+                typeAliasConstMasks[cflatName] = 1;
             if (mapped.IsCxxNullptrT) cxxNullptrTAliases_.insert(cflatName);
             cxxForeignRequests_[cflatName] = "";
             return true;
@@ -22920,6 +22928,12 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 if (r.isCxx && tv.Pointer && !tv.IsFunctionPointer
                     && CxxSpellingHasConstPointee(f.ctype))
                     tv.IsCxxPointeeConst = true;
+                // A C field keeps its spelled pointee const (`const char* p`, a `PCSTR`; ctype is
+                // canonical). Only a downward-closed mask is a CFlat spelling (R11).
+                if (!r.isCxx && tv.Pointer && !tv.IsFunctionPointer && !tv.IsArrayView)
+                    if (const uint8_t mask = CSpellingPointeeConstMask(f.ctype, tv.ValuePointerDepth());
+                        mask != 0 && (mask & (mask + 1u)) == 0)
+                        tv.ConstMask = mask;
                 if (r.isCxx && CxxSpellingHasVolatileTarget(f.ctype))
                     tv.IsCxxPointeeVolatile = true;
                 tv.IsCxxConstField = f.isConst && !f.isMutable && !tv.Pointer

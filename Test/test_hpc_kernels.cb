@@ -32,7 +32,7 @@ import "filesystem.cb";
 int g_pass = 0;
 int g_total = 0;
 
-void check(char* name, double got, double want)
+void check((const char)* name, double got, double want)
 {
     g_total = g_total + 1;
     double d = got - want;
@@ -43,7 +43,7 @@ void check(char* name, double got, double want)
 
 // Like check() but with a caller-supplied tolerance, for the factorization and
 // iterative-solver checks whose convergence floors are coarser than 1e-6 (Jacobi).
-void check_tol(char* name, double got, double want, double tol)
+void check_tol((const char)* name, double got, double want, double tol)
 {
     g_total = g_total + 1;
     double d = got - want;
@@ -52,7 +52,7 @@ void check_tol(char* name, double got, double want, double tol)
     else         { printf("  FAIL %-28s got %.6f want %.6f\n", name, got, want); }
 }
 
-void check_int(char* name, int got, int want)
+void check_int((const char)* name, int got, int want)
 {
     g_total = g_total + 1;
     if (got == want) { g_pass = g_pass + 1; printf("  ok   %-28s = %d\n", name, got); }
@@ -896,7 +896,7 @@ void test_dataio_pipeline()
     // and the record-aligned parallel split, and must keep file order.
     string big = "test_hpc_sci_pipe_big.txt";
     i8* block = (i8*)malloc((i64)131072);
-    char* pat = "1.5 2.5 3.5 4.5 ";
+    (const char)* pat = "1.5 2.5 3.5 4.5 ";
     for (i64 i = (i64)0; i < (i64)131072; i = i + (i64)16) memcpy(block + i, (i8*)pat, (i64)16);
     File* bf = new File;
     bf->openWrite(big);

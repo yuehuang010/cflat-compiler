@@ -14,7 +14,7 @@ import "string.cb";
 import "filesystem.cb";
 
 // Length of a null-terminated C string.
-int cstrLen(char* s)
+int cstrLen((const char)* s)
 {
     int n = 0;
     while (s[n] != 0) { n = n + 1; }
@@ -22,7 +22,7 @@ int cstrLen(char* s)
 }
 
 // Index of `needle` in `hay[start..endExcl)`, or -1 if not found.
-int indexIn(char* hay, int start, int endExcl, char* needle)
+int indexIn(char* hay, int start, int endExcl, (const char)* needle)
 {
     int nl = cstrLen(needle);
     if (nl == 0) { return start; }
@@ -38,7 +38,7 @@ int indexIn(char* hay, int start, int endExcl, char* needle)
 
 // Verify the body of `@<fnTag>` vectorizes, is alias-scoped, and has no memcheck.
 // Returns 1 on success, 0 on failure (and prints the specific reason).
-int checkFunction(char* ir, int len, char* fnTag)
+int checkFunction(char* ir, int len, (const char)* fnTag)
 {
     int start = indexIn(ir, 0, len, fnTag);
     if (start < 0) {

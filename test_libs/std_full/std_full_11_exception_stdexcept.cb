@@ -6,7 +6,7 @@ import cpp "string";
 import cpp "cstring";
 int terminate_calls = 0;
 void my_terminate() { terminate_calls++; }
-bool same(char* w, char* want) { return w != nullptr && std.strcmp(w, want) == 0; }
+bool same((const char)* w, (const char)* want) { return w != nullptr && std.strcmp(w, want) == 0; }
 extern int main()
 {
     int failures = 0;

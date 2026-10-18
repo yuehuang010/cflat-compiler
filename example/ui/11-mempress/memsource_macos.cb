@@ -322,49 +322,50 @@ bool _macIconInit()
         && _macIconRegisterName != nullptr;
 }
 
-void* _macIconClass(char* name) { return _macIconGetClass(name); }
-void* _macIconSel(char* name) { return _macIconRegisterName(name); }
+// function<> cannot spell a const parameter: the runtime bindings take char* and only read it.
+void* _macIconClass((const char)* name) { return _macIconGetClass((char*)name); }
+void* _macIconSel((const char)* name) { return _macIconRegisterName((char*)name); }
 
-void* _macIconMsg0(void* object, char* selector)
+void* _macIconMsg0(void* object, (const char)* selector)
 {
     function<void*(void*, void*)> f = (function<void*(void*, void*)>)_macIconMsgSend;
     return f(object, _macIconSel(selector));
 }
 
-void* _macIconMsg1(void* object, char* selector, void* arg)
+void* _macIconMsg1(void* object, (const char)* selector, void* arg)
 {
     function<void*(void*, void*, void*)> f =
         (function<void*(void*, void*, void*)>)_macIconMsgSend;
     return f(object, _macIconSel(selector), arg);
 }
 
-i64 _macIconI64(void* object, char* selector)
+i64 _macIconI64(void* object, (const char)* selector)
 {
     function<i64(void*, void*)> f = (function<i64(void*, void*)>)_macIconMsgSend;
     return f(object, _macIconSel(selector));
 }
 
-void* _macIconObjArg(void* object, char* selector, i64 arg)
+void* _macIconObjArg(void* object, (const char)* selector, i64 arg)
 {
     function<void*(void*, void*, i64)> f =
         (function<void*(void*, void*, i64)>)_macIconMsgSend;
     return f(object, _macIconSel(selector), arg);
 }
 
-i8 _macIconBool1(void* object, char* selector, void* arg)
+i8 _macIconBool1(void* object, (const char)* selector, void* arg)
 {
     function<i8(void*, void*, void*)> f =
         (function<i8(void*, void*, void*)>)_macIconMsgSend;
     return f(object, _macIconSel(selector), arg);
 }
 
-i8 _macIconBool0(void* object, char* selector)
+i8 _macIconBool0(void* object, (const char)* selector)
 {
     function<i8(void*, void*)> f = (function<i8(void*, void*)>)_macIconMsgSend;
     return f(object, _macIconSel(selector));
 }
 
-void* _macIconNSString(char* text)
+void* _macIconNSString((const char)* text)
 {
     return _macIconMsg1(_macIconClass("NSString"),
                         "stringWithUTF8String:", (void*)text);

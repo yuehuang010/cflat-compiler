@@ -689,6 +689,8 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         ApplyOwningSinkInference(compiler, func, allParams);
 
         bool returnsOwned = ComputeReturnsOwned(returnType, name, allParams);
+        if (!structName.empty() && !isOperatorFunc && !isStaticFunc)
+            RecordReceiverScan(compiler, func, name, returnType, allParams, varargs);
 
         const std::string linkageName = returnType.external && !namespaceName.empty()
             ? rawFuncName : std::string();
@@ -1297,6 +1299,8 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
         // The scan mangles a nested generic base itself, so its name is not yet in any type
         // registry - but the main pass HAS registered it by the time it resolves the same arg.
         bool baseIsGenericInstantiation = false;
+        // Mirror of the main pass: the pointee const an argument carries keys its instantiation.
+        int argConstDepth = 0;
         if (typeSpec != nullptr && typeSpec->typeName() != nullptr)
         {
             ConstTypeSyntax shape;
@@ -1307,7 +1311,10 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
                     [this](auto* tuple) {
                         return ResolveTupleTypeSpecifier(tuple);
                     }))
+            {
                 resolved = shape.TypeName + std::string(shape.PointerDepth, '*');
+                argConstDepth = shape.PointerDepth + 1;
+            }
         }
         else if (auto* innerParams = GenericSpecOf(typeSpec, innerBase))
         {
@@ -1348,6 +1355,8 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
                 resolved = subst->second;
                 substituted = true;
             }
+            else if (const uint8_t aliasMask = Compiler(entry)->ResolveTypeAliasConstMask(resolved); aliasMask != 0)
+                argConstDepth = std::popcount(aliasMask);
             // Namespace enums are collected before this scan but their backing types are not
             // registered until ScanExternalDeclaration. Local enum arguments are deferred.
             if (!substituted)
@@ -1449,6 +1458,15 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
         }
         else if (isAlias)
             resolved = std::string(kAliasQualifierPrefix) + resolved;
+        if (argConstDepth > 0 && !uniqueArgView)
+        {
+            int totalStars = 0;
+            while (totalStars < static_cast<int>(resolved.size())
+                   && resolved[resolved.size() - 1 - totalStars] == '*')
+                ++totalStars;
+            if (argConstDepth <= totalStars && totalStars == 1)
+                resolved = JoinConstTypeArgument(resolved, argConstDepth);
+        }
         return resolved;
     }
 
@@ -2179,7 +2197,16 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
                 target = ResolveMemberTypeSpecifier(memberType);
             else if (auto subst = scanTypeSubstitutions_.find(target); subst != scanTypeSubstitutions_.end())
                 target = subst->second;
+            // A scanned argument spells pointee const ("(const int)*"); the alias keeps it as a mask.
+            std::string plainTarget;
+            int substConstDepth = 0;
+            if (SplitConstTypeArgument(target, plainTarget, substConstDepth) && substConstDepth > 0)
+                target = plainTarget;
+            else
+                substConstDepth = 0;
             targetConstMask = compiler->ResolveTypeAliasConstMask(target);
+            if (substConstDepth > 0)
+                targetConstMask |= static_cast<uint8_t>((1u << std::min(substConstDepth, 7)) - 1u);
         }
         // A pointer alias (using Handle = void*) stores its trailing stars in the alias string;
         // they are peeled back onto the pointer flags at the resolution site (GetType /

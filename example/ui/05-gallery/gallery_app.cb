@@ -220,7 +220,7 @@ class GalleryApp : IComponent
     string _colorHex(Color c)
     {
         int raw = colorRaw(c);
-        char* hex = "0123456789ABCDEF";
+        (const char)* hex = "0123456789ABCDEF";
         char[8] out = default;
         out[0] = '#';
         out[1] = hex[(raw >> 20) & 0xF]; out[2] = hex[(raw >> 16) & 0xF];

@@ -116,7 +116,7 @@ void MainListener::InstantiateGenericInterface(const std::string& baseName, cons
         {
             activePackSubstitutions.erase(k);
             activeValueSubstitutions.erase(k);
-            activeTypeSubstitutions[k] = v;
+            activeTypeSubstitutions.Bind(k, v);
         }
         for (const auto& [k, v] : packSubstitutions)
         {
@@ -376,18 +376,18 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
                     activeValueSubstitutions[typeParams[i]] = typeArgs[i];
                     valueMacros.Bind(typeParams[i], ParseValueArg(typeArgs[i]));
                 }
-                else activeTypeSubstitutions[typeParams[i]] = typeArgs[i];
+                else activeTypeSubstitutions.Bind(typeParams[i], typeArgs[i]);
             }
         }
         else
         {
             for (size_t i = 0; i < packIdx; i++)
-                activeTypeSubstitutions[typeParams[i]] = typeArgs[i];
+                activeTypeSubstitutions.Bind(typeParams[i], typeArgs[i]);
             activePackSubstitutions[typeParams[packIdx]] =
                 std::vector<std::string>(typeArgs.begin() + packIdx, typeArgs.end());
             if (!activePackSubstitutions[typeParams[packIdx]].empty())
-                activeTypeSubstitutions[typeParams[packIdx]] =
-                    activePackSubstitutions[typeParams[packIdx]].front();
+                activeTypeSubstitutions.Bind(typeParams[packIdx],
+                    activePackSubstitutions[typeParams[packIdx]].front());
         }
 
         if (!CheckValueConstraints(baseName, tmplCtx->whereClause(), typeParams, valueParams, typeArgs))
@@ -677,8 +677,28 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                         argStars -= paramStars;
                         argType = base + std::string(argStars, '*') + (argView ? "[]" : "");
                         declared = true;
+                        // `T v` keeps the argument's pointee const and drops its own (C++):
+                        // `(const int)* p` and `const int* p` both deduce T = `(const int)*`.
+                        if (paramStars == 0 && !argView && argStars == 1)
+                        {
+                            std::string constName;
+                            const uint8_t levels = compilerLLVM->StoredConstLevels(
+                                compilerLLVM->ArgumentPointerValue(args[i]), constName);
+                            if ((levels & 1u) != 0) argType = JoinConstTypeArgument(argType, 1);
+                        }
                     }
                 }
+                // A narrow string literal is a `(const char)*` (R2), as `auto s = "x"` deduces.
+                if (argType.empty() && paramStars == 0 && !paramView
+                    && compilerLLVM->IsStringLiteralGlobal(args[i].Primary))
+                    if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(
+                            args[i].Primary->stripPointerCasts());
+                        global != nullptr && global->getValueType()->isArrayTy()
+                        && global->getValueType()->getArrayElementType()->isIntegerTy(8))
+                    {
+                        argType = JoinConstTypeArgument("char*", 1);
+                        declared = true;
+                    }
                 // An unsuffixed literal infers its C++ default type (300 is int, 1.5 is double,
                 // 'a' is char), not its narrowed LLVM width (i16 / float / i8). Plain 'T' only:
                 // a 'T*' or 'T[]' parameter keeps the BaseType fallback below.
@@ -782,6 +802,7 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
                     CanonicalizeUniqueSigComponent(compilerLLVM, p.TypeName, p.Pointer,
                                                    p.PointerDepth);
                     p.ResolvedTypeKey = SigComponentResolvedKey(p.TypeName);
+                    MarkSubstitutedPointeeConst(p, param->typeSpecifier(), param->multiWordTypeSuffix(), pStars);
                     tv.FuncPtrParams.push_back(p);
                 }
         }
@@ -1150,14 +1171,14 @@ void MainListener::ProcessPendingInstantiations() {
                         activeValueSubstitutions[typeParams[i]] = pending.typeArgs[i];
                         valueMacros.Bind(typeParams[i], ParseValueArg(pending.typeArgs[i]));
                     }
-                    else activeTypeSubstitutions[typeParams[i]] = pending.typeArgs[i];
+                    else activeTypeSubstitutions.Bind(typeParams[i], pending.typeArgs[i]);
                 }
             }
             else
             {
                 // Fixed params before the pack
                 for (size_t i = 0; i < packIdx && i < pending.typeArgs.size(); i++)
-                    activeTypeSubstitutions[typeParams[i]] = pending.typeArgs[i];
+                    activeTypeSubstitutions.Bind(typeParams[i], pending.typeArgs[i]);
                 // Pack param absorbs remaining type args
                 activePackSubstitutions[typeParams[packIdx]] =
                     std::vector<std::string>(pending.typeArgs.begin() + packIdx, pending.typeArgs.end());
@@ -1248,6 +1269,9 @@ void MainListener::PreDeclareInstantiationMembers(
             // set now (ParseFunctionDefinition sees alreadyDeclared and does not re-register). The
             // if-const evaluator lets a move inside a live if-const branch mark the param a sink.
             ApplyOwningSinkInference(compiler, func, declAllParams, SinkIfConstEvaluator());
+            if (!isStaticLike)
+                RecordReceiverScan(compiler, func, declName, declReturnType, declAllParams, declVarargs,
+                                   SinkIfConstEvaluator());
             bool declReturnsOwned = ComputeReturnsOwned(declReturnType, declName, declAllParams);
             compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs, declReturnsOwned, !isStaticLike);
         }

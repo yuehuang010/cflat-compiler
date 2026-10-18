@@ -29,7 +29,7 @@ import { "d3d11.h", "d3dcompiler.h" } lib { "d3d11.lib", "d3dcompiler.lib" };
 const i32 W = 256;
 const i32 H = 256;
 
-u64 cstrlen(char* s)
+u64 cstrlen((const char)* s)
 {
     u64 n = 0;
     while (s[n] != 0) n = n + 1;
@@ -37,7 +37,7 @@ u64 cstrlen(char* s)
 }
 
 // Compile one HLSL entry point to bytecode, or report the compiler's error blob and exit.
-ID3DBlob* compileShader(char* src, char* entry, char* target)
+ID3DBlob* compileShader((const char)* src, (const char)* entry, (const char)* target)
 {
     ID3DBlob* code = nullptr;
     ID3DBlob* errors = nullptr;
@@ -63,7 +63,7 @@ void putU32(u8* p, u32 v)
 }
 
 // Write a 24-bit, bottom-up BMP from the mapped RGBA pixels (rowPitch from the GPU map).
-void writeBmp(char* path, u8* pixels, u32 rowPitch)
+void writeBmp((const char)* path, u8* pixels, u32 rowPitch)
 {
     u32 rowBytes = (u32)(W * 3);
     u32 dataSize = rowBytes * (u32)H;
@@ -107,7 +107,7 @@ extern int main()
     // HLSL source. Single literal (cflat does not concatenate adjacent string literals)
     // and every brace is doubled, because cflat strings are interpolated: a lone `{`
     // would start an interpolation expression. `{{`/`}}` emit a literal `{`/`}`.
-    char* hlsl = "struct VOut{{float4 pos:SV_POSITION; float4 col:COLOR;}}; VOut VSMain(float2 p:POS, float3 c:COL){{VOut o;o.pos=float4(p,0,1);o.col=float4(c,1);return o;}} float4 PSMain(VOut i):SV_TARGET{{return i.col;}}";
+    (const char)* hlsl = "struct VOut{{float4 pos:SV_POSITION; float4 col:COLOR;}}; VOut VSMain(float2 p:POS, float3 c:COL){{VOut o;o.pos=float4(p,0,1);o.col=float4(c,1);return o;}} float4 PSMain(VOut i):SV_TARGET{{return i.col;}}";
 
     // 1. Device + immediate context on the hardware adapter (feature level 11_0).
     // D3D_FEATURE_LEVEL is an i32-backed enum; cflat exposes its constants but not the

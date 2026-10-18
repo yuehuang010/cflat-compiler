@@ -51,7 +51,7 @@ Counts countFile(char* path) {
     return result;
 }
 
-void printCounts(Counts c, char* label) {
+void printCounts(Counts c, (const char)* label) {
     printf("%7d %7d %7d %s\n", c.lines, c.words, c.chars, label);
 }
 

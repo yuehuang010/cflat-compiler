@@ -2420,6 +2420,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         stream.close();
         if (verbose) std::cout << "[verbose]   walk complete\n";
 
+        // #8 on const receivers: every body (generic instantiations included) is emitted now.
+        // First of the end-of-module checks: it stands in for a check made during the walk.
+        ResolvePendingConstReceiverCalls();
+
         // Move-dataflow: solve the MaybeMoved fixpoint over the fully-emitted module and report
         // any loop-carried / cross-block use-after-move the inline checker missed (LogError).
         // Must run INSIDE this try and BEFORE the did-not-occur check so a matching error is
@@ -2460,7 +2464,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         catch (const ExpectedErrorReceived&)
         {
             // A file-scope expectation matched somewhere in imports / scan / walk. The PASS
-            // line is already printed; report success so --check counts the file as passing.
+            // line is already printed; settle any deferred scoped verdict before reporting success.
+            ResolvePendingConstReceiverCalls(true);
             return true;
         }
 
@@ -4660,6 +4665,8 @@ bool LLVMBackend::Analyze(const std::string& filePath,
             // bodies of deferred delete-site destructor wrappers (recursive containers whose
             // element type was incomplete when the container dtor was emitted).
             EmitDeferredFullDestructorBodies();
+            // #8 on const receivers, as in Compile: every body is emitted now.
+            ResolvePendingConstReceiverCalls();
             // Same post-walk gate resolution as Compile, so IR dumps show the real releases.
             NoCurrentFunctionScope noCurrent(this);
             ResolveOwnedReleaseGates();
@@ -4669,7 +4676,13 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         stream.close();
     }
     catch (CompilerAbortException&) { return false; }
-    catch (ExpectedErrorReceived&)  { return false; }
+    catch (ExpectedErrorReceived&)
+    {
+        // Never drop a deferred expect_error verdict, even on an aborted analysis.
+        try { ResolvePendingConstReceiverCalls(true); }
+        catch (CompilerAbortException&) {}
+        return false;
+    }
 
     if (debugInfo)
         FinalizeDebugInfo();
@@ -4730,6 +4743,15 @@ void LLVMBackend::ResetForReanalysis()
     JoinCHeaderDiskCacheWriters();
     EndActiveRoot();
     ownReleaseGates_.clear();
+    receiverScanFacts_.clear();
+    readOnlyMethodMemo_.clear();
+    receiverCallResolution_.clear();
+    receiverBodiesEmitted_.clear();
+    receiverBodyStack_.clear();
+    pendingCallSite_ = nullptr;
+    pendingConstReceiverCalls_.clear();
+    deferredExpectations_.clear();
+    activeExpectScope_ = 0;
     fallbackOwnerGates_.clear();
     cxxThisEscapeGates_.clear();
     deferredCallReleaseGates_.clear();
@@ -5086,6 +5108,7 @@ void LLVMBackend::ResetForReanalysis()
     constGlobalInts_.clear();
     constGlobalFPs_.clear();
     stringLiteralLenByPtr.clear();
+    stringLiteralGlobals_.clear();
     strConcatRegistered = false;
     stringDtorRegistered = false;
     pendingOwnedClosureTemps.clear();
@@ -6779,6 +6802,7 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
             std::cout << std::format("  Warning: could not create {}: {}\n", bcCacheDir, ec.message());
             continue;
         }
+        coreCompiler.ResolveConstMethodStates();
         if (coreCompiler.SaveCoreBitcode(bcCacheDir, platform))
         {
             std::cout << std::format("  Saved core_{}.bc + .meta.json\n", platform);
@@ -6849,6 +6873,7 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
             std::cout << std::format("  Warning: could not create {}: {}\n", bcCacheDir, ec.message());
             continue;
         }
+        coreCompiler.ResolveConstMethodStates();
         if (coreCompiler.SaveCoreBitcode(bcCacheDir, platform))
         {
             std::cout << std::format("  Saved core_{}.bc + .meta.json\n", platform);
@@ -7414,6 +7439,7 @@ static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
         o["cxxrq"] = s.CxxRefQualifier;
     if (s.CxxVolatile)  o["cxxvol"] = true;
     if (s.CxxConst)     o["cxxconst"] = true;
+    if (s.ConstMethodState) o["cms"] = static_cast<int64_t>(s.ConstMethodState);
     if (!s.IsNoexcept)  o["nx"] = true;
     if (s.ReturnsAlias) o["ra"] = true;
     if (s.ReturnsAliasOfByValueParam) o["rabv"] = true;
@@ -7595,7 +7621,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     // than silently reused (v6 includes the LSP core-variable replay state; v8 is the non-pointer
     // `alias T` parameter reference ABI; v11 adds closure capture-cleanup MOVE mode 2; v12 adds
     // const floating global admission names; v13 stores function origin metadata).
-    root["version"]   = 14;
+    root["version"]   = 15;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
 #if defined(__APPLE__)
@@ -8083,7 +8109,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 14) return false;
+    if (!ver || *ver != 15) return false;
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != coreHash) return false;
 #if defined(__APPLE__)
@@ -8290,6 +8316,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (auto v = fo->getInteger("cxxrq")) sym.CxxRefQualifier = (int)*v;
             if (auto v = fo->getBoolean("cxxvol")) sym.CxxVolatile = *v;
             if (auto v = fo->getBoolean("cxxconst")) sym.CxxConst = *v;
+            if (auto v = fo->getInteger("cms")) sym.ConstMethodState = static_cast<uint8_t>(*v);
             if (auto v = fo->getBoolean("nx")) sym.IsNoexcept = !*v;
             if (auto* ab = fo->getObject("cxxabi")) sym.CxxAbi = DeserializeCxxAbi(*ab);
             if (auto v = fo->getBoolean("ra")) sym.ReturnsAlias = *v;

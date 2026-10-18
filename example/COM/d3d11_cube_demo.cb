@@ -32,7 +32,7 @@ import "linear_math.cb";   // mat4f - row-major float 4x4 matrix math
 const i32 W = 640;
 const i32 H = 480;
 
-u64 cstrlen(char* s)
+u64 cstrlen((const char)* s)
 {
     u64 n = 0;
     while (s[n] != 0) n = n + 1;
@@ -64,7 +64,7 @@ mat4f computeMvp(float a)
 }
 
 // Compile one HLSL entry point to bytecode, or report the compiler's error blob and exit.
-ID3DBlob* compileShader(char* src, char* entry, char* target)
+ID3DBlob* compileShader((const char)* src, (const char)* entry, (const char)* target)
 {
     ID3DBlob* code = nullptr;
     ID3DBlob* errors = nullptr;
@@ -120,7 +120,7 @@ extern int main()
     // HLSL: a constant buffer holding the row-major MVP, a vertex shader that transforms the
     // position and forwards the color, and a passthrough pixel shader. Single literal, every
     // brace doubled (cflat interpolates strings, so a lone `{` would start an interpolation).
-    char* hlsl = "cbuffer Cb:register(b0){{row_major float4x4 gT;}}; struct VOut{{float4 pos:SV_POSITION; float4 col:COLOR;}}; VOut VSMain(float3 p:POSITION,float3 c:COLOR){{VOut o;o.pos=mul(float4(p,1),gT);o.col=float4(c,1);return o;}} float4 PSMain(VOut i):SV_TARGET{{return i.col;}}";
+    (const char)* hlsl = "cbuffer Cb:register(b0){{row_major float4x4 gT;}}; struct VOut{{float4 pos:SV_POSITION; float4 col:COLOR;}}; VOut VSMain(float3 p:POSITION,float3 c:COLOR){{VOut o;o.pos=mul(float4(p,1),gT);o.col=float4(c,1);return o;}} float4 PSMain(VOut i):SV_TARGET{{return i.col;}}";
 
     void* hInst = GetModuleHandleA(nullptr);
 

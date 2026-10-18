@@ -17,7 +17,7 @@ extern int main()
     char[16] word_ = default; char* word = word_;
     int matched = std.sscanf("17 2.5 hello", "%d %lf %15s", &a, &d, word);
     if (matched != 3 || a != 17 || d != 2.5 || std.strcmp(word, "hello") != 0) { printf("FAIL sscanf\n"); failures |= 4; }
-    char* path = "std_full_11_cstdio.tmp";
+    (const char)* path = "std_full_11_cstdio.tmp";
     std.FILE* f = std.fopen(path, "wb");
     bool opened = f != nullptr;
     unsigned long w = 0;

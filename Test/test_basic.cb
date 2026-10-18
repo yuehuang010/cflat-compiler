@@ -2692,7 +2692,7 @@ bool testStringLiteral()
     result &= Test("ternary_str_reversed",     t3.data(), "fallback");
 
     // Encoding prefixes retain their element type and terminate the encoded array.
-    wchar* wide = L"abcd";
+    (const wchar)* wide = L"abcd";
     int wideLength = 0;
     while (wide[wideLength] != 0) wideLength++;
     result &= Test("wide_literal_size", sizeof(wchar), sizeof(wide[0]));
@@ -2702,11 +2702,11 @@ bool testStringLiteral()
         result &= Test("wide_literal_width", sizeof(wchar), 2);
     else
         result &= Test("wide_literal_width", sizeof(wchar), 4);
-    c16* utf16 = u"A\u263a";
-    c32* utf32 = U"A\U0001f600";
-    c16* utf16Pair = u"\U0001f600";
+    (const c16)* utf16 = u"A\u263a";
+    (const c32)* utf32 = U"A\U0001f600";
+    (const c16)* utf16Pair = u"\U0001f600";
     string narrowUcn = "\u263a";
-    c8* utf8Ucn = u8"\u263a";
+    (const c8)* utf8Ucn = u8"\u263a";
     result &= Test("utf16_literal_smile", utf16[1], (c16)0x263a);
     result &= Test("utf32_literal_non_bmp", utf32[1], (c32)0x1f600);
     result &= Test("utf16_literal_surrogate_high", utf16Pair[0], (c16)0xd83d);
@@ -2714,7 +2714,7 @@ bool testStringLiteral()
     result &= Test("narrow_ucn_utf8_length", narrowUcn.length(), 3);
     result &= (u8)narrowUcn.data()[0] == (u8)0xe2;
     result &= (u8)utf8Ucn[0] == (u8)0xe2;
-    c8* utf8Literal = u8"xyz";
+    (const c8)* utf8Literal = u8"xyz";
     result &= utf8Literal[0] == (c8)'x';
     result &= Test("wide_character_literal", (wchar)L'b', (wchar)'b');
     result &= Test("utf16_character_literal", (c16)u'\u263a', (c16)0x263a);
@@ -4638,7 +4638,7 @@ bool testPointerScalarAcceptSet()
     int* explicitCast = (int*)value;
     result &= Test("ptr_scalar_explicit_cast", (i64)explicitCast, 11);
 
-    char* text = "ok";
+    (const char)* text = "ok";
     result &= Test("ptr_scalar_string_literal", text[1], 'k');
 
     int[2] values = { 4, 8 };
@@ -5698,6 +5698,13 @@ extern int main()
     total++; passed += testConstObjects() ? 1 : 0;
     total++; passed += testConstFields() ? 1 : 0;
     total++; passed += testConstPointee() ? 1 : 0;
+    total++; passed += testConstReceivers() ? 1 : 0;
+    total++; passed += testConstReceiversRound2() ? 1 : 0;
+    total++; passed += testConstReceiversRound3() ? 1 : 0;
+    total++; passed += testConstReceiversRound4() ? 1 : 0;
+    total++; passed += testConstReceiversRound5() ? 1 : 0;
+    total++; passed += testConstStringLiterals() ? 1 : 0;
+    total++; passed += testConstWholeWord() ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -6511,7 +6518,7 @@ bool testPointerArrays()
 {
     bool result = true;
 
-    char*[3] words;
+    (const char)*[3] words;
     words[0] = "alpha";
     words[1] = "beta";
     words[2] = "gamma";
@@ -8441,5 +8448,289 @@ bool testConstPointee()
     expect_error("it is reached through a pointer to const") { *usingWhole = 1; }
     expect_error("it is reached through a pointer to const") { *usingLocal = 1; }
     expect_error("the conversion discards const") { C03IntPtr dropped = usingFixed; }
+    return result;
+}
+
+// Const receivers (phase 4): read-only-ness of a native method is inferred from its body.
+struct C04Box
+{
+    int n = 0;
+    int* p = nullptr;
+    int Get() { return n; }             // read-only by inference: callable on a const box
+    void Set(int v) { n = v; }          // writes this->n: not callable on a const box
+    int Peek() { return *p; }           // reads through p only: read-only
+    void Poke(int v) { *p = v; }        // writes through p: not read-only (transitive const)
+    int Both() { return Get() + Peek(); }
+    void Reset() { Set(0); }            // calls a mutating helper
+    int Even(int k) { if (k == 0) return n; return Odd(k - 1); }
+    int Odd(int k) { if (k == 0) return n + 1; return Even(k - 1); }
+};
+struct C04Cell<T>
+{
+    T v = default;
+    T Read() { return v; }
+    int Clear() { if const (is_pointer(T)) { v = nullptr; return 1; } else return 0; }
+};
+int c04ParamGet(const C04Box b) { return b.Get() + b.Peek(); }
+expect_error("cannot call non-const member 'Set' on 'b': it is declared const")
+{
+    int c04BadParamMethod(const C04Box b) { b.Set(2); return 0; }
+}
+
+bool testConstReceivers()
+{
+    bool result = true;
+    int target = 1;
+    const C04Box box = { n = 5, p = &target };
+    C04Box boxCopy = box;                               // copy out is fine and writable
+    boxCopy.Set(6);
+    result &= Test("const_receiver_readonly_method", box.Get(), 5);
+    result &= Test("const_receiver_readonly_through_ptr", box.Peek(), 1);
+    result &= Test("const_receiver_copy_writable", boxCopy.Get(), 6);
+    result &= Test("const_receiver_calls_readonly", box.Both(), 6);
+    result &= Test("const_receiver_mutual_recursion", box.Even(3) + box.Odd(2), 12);
+    result &= Test("const_receiver_param", c04ParamGet(box), 6);
+    (const C04Box)* view = &boxCopy;
+    result &= Test("const_receiver_through_pointer", view->Get(), 6);
+    expect_error("cannot call non-const member 'Set' on 'box': it is declared const") { box.Set(1); }
+    expect_error("cannot call non-const member 'Poke' on 'box': it is declared const") { box.Poke(1); }
+    expect_error("cannot call non-const member 'Reset' on 'box': it is declared const") { box.Reset(); }
+    expect_error("cannot call non-const member 'Set' on 'view'") { view->Set(1); }
+
+    // Generic methods are judged per instantiation: Clear writes only when T is a pointer.
+    const C04Cell<int> cell = { v = 7 };
+    const C04Cell<int*> ptrCell = { v = &target };
+    result &= Test("const_receiver_generic", cell.Read() + cell.Clear() + *ptrCell.Read(), 8);
+    expect_error("cannot call non-const member 'Clear' on 'ptrCell': it is declared const") { ptrCell.Clear(); }
+
+    // Core containers on a const receiver: reads and iteration work, mutation is refused.
+    list<int> raw;
+    raw.add(3);
+    raw.add(4);
+    const list<int> numbers = raw.copy();
+    int sum = 0;
+    for (int x in numbers) sum += x;
+    result &= Test("const_receiver_list", numbers.count() + numbers.get(0) + numbers[1] + sum, 16);
+    expect_error("cannot call non-const member 'add' on 'numbers': it is declared const") { numbers.add(5); }
+    string hello = "hello";
+    const string word = hello.copy();
+    result &= Test("const_receiver_string", word.length() + (word == "hello" ? 1 : 0) + (word.startsWith("he") ? 1 : 0), 7);
+    return result;
+}
+
+// Const receivers, round 2: the overload codegen selects decides a dependency, a by-value `auto`
+// copy is not the object, a dead `if const` arm writes nothing.
+struct C04R2Inner { int n = 3; };
+struct C04R2
+{
+    int n = 3;
+    C04R2Inner inner;
+    int F(int k) { return n + k; }
+    int F(double k) { n = 99; return n; }
+    int ReadOverload() { return F(4); }
+    int ReadCopy() { auto t = this->inner; t.n = 7; return t.n; }
+    int ReadDead() { if const (false) { n = 9; } return n; }
+};
+
+bool testConstReceiversRound2()
+{
+    bool result = true;
+    const C04R2 s = default;
+    result &= Test("const_receiver_overload", s.ReadOverload(), 7);
+    result &= Test("const_receiver_auto_copy", s.ReadCopy() * 10 + s.inner.n, 73);
+    result &= Test("const_receiver_dead_arm", s.ReadDead(), 3);
+    return result;
+}
+
+// Const receivers, round 3: #8 is decided after every body is emitted, so a call that comes
+// before its callee's body sees the live `if const` arm and codegen's chosen overloads; an
+// `alias` result rooted in a global is not the receiver's storage.
+struct C04R3Inner { int n = 3; };
+C04R3Inner c04R3Global = {};
+int c04R3Pick(const int* p, int k) { return *p + 4; }
+int c04R3Pick(int* p, double k) { *p = 99; return *p; }
+struct C04R3
+{
+    int n = 3;
+    int InvokeEscape(const C04R3 s) { return s.ReadEscape(); }
+    int InvokeOverload(const C04R3 s) { return s.ReadOverload(); }
+    int InvokeDead(const C04R3 s) { return s.ReadDead(); }
+    int ReadEscape() { return c04R3Pick(&n, 1); }
+    int F(int k) { return n + k; }
+    int F(double k) { n = 99; return n; }
+    int ReadOverload() { return F(4); }
+    int ReadDead() { if const (false) { n = 9; } return n; }
+    int operator+(int k) { return n + k; }
+    int operator+(double k) { n = 99; return n; }
+    int ReadOperator() { return *this + 4; }
+    alias C04R3Inner Shared() { return c04R3Global; }
+    void WriteShared() { Shared().n = 9; }
+};
+
+bool testConstReceiversRound3()
+{
+    bool result = true;
+    C04R3 m = default;
+    const C04R3 s = default;
+    result &= Test("const_receiver_late_escape", m.InvokeEscape(m), 7);
+    result &= Test("const_receiver_late_overload", m.InvokeOverload(m), 7);
+    result &= Test("const_receiver_late_dead_arm", m.InvokeDead(m), 3);
+    result &= Test("const_receiver_binary_overload", s.ReadOperator(), 7);
+    s.WriteShared();
+    result &= Test("const_receiver_external_alias", c04R3Global.n * 10 + s.n, 93);
+    return result;
+}
+
+// Const receivers, round 4: an `alias` result joins the provenance of both ternary arms, a deep
+// chain of getters resolves as a fixed point, and a reassigned inner local does not taint a param.
+struct C04R4Inner { int n = 3; };
+C04R4Inner c04R4G = {};
+C04R4Inner c04R4H = {};
+C04R4Inner c04R4Deep = {};
+int c04R4Int = 3;
+struct C04R4
+{
+    int n = 0;
+    alias C04R4Inner Pick(bool b) { return b ? c04R4G : c04R4H; }
+    void WriteTernary() { Pick(true).n = 9; }
+    alias C04R4Inner Get0() { return c04R4Deep; }
+    alias C04R4Inner Get1() { return Get0(); }
+    alias C04R4Inner Get2() { return Get1(); }
+    alias C04R4Inner Get3() { return Get2(); }
+    alias C04R4Inner Get4() { return Get3(); }
+    alias C04R4Inner Get5() { return Get4(); }
+    alias C04R4Inner Get6() { return Get5(); }
+    alias C04R4Inner Get7() { return Get6(); }
+    alias C04R4Inner Get8() { return Get7(); }
+    alias C04R4Inner Get9() { return Get8(); }
+    alias C04R4Inner Get10() { return Get9(); }
+    alias C04R4Inner Get11() { return Get10(); }
+    alias C04R4Inner Get12() { return Get11(); }
+    alias C04R4Inner Get13() { return Get12(); }
+    alias C04R4Inner Get14() { return Get13(); }
+    alias C04R4Inner Get15() { return Get14(); }
+    alias C04R4Inner Get16() { return Get15(); }
+    alias C04R4Inner Get17() { return Get16(); }
+    alias C04R4Inner Get18() { return Get17(); }
+    void WriteDeep() { Get18().n = 9; }
+    int* Through(int* p) { { int p = 0; p = 1; } return p; }
+    void WriteShadow() { *Through(&c04R4Int) = 9; }
+};
+
+bool testConstReceiversRound4()
+{
+    bool result = true;
+    const C04R4 s = default;
+    s.WriteTernary();
+    result &= Test("const_receiver_external_ternary", c04R4G.n * 10 + c04R4H.n, 93);
+    s.WriteDeep();
+    result &= Test("const_receiver_deep_external", c04R4Deep.n, 9);
+    s.WriteShadow();
+    result &= Test("const_receiver_param_shadow", c04R4Int, 9);
+    return result;
+}
+
+// Const receivers, round 5: a local alias declared in one branch ends with its block, so the
+// other branch returns the untouched parameter of the same name.
+int c04R5Int = 3;
+struct C04R5
+{
+    int n = 0;
+    int* Get(int* p, bool b) { if (b) { auto p = &n; } else { return p; } return p; }
+    void Write() { *Get(&c04R5Int, false) = 9; }
+};
+
+bool testConstReceiversRound5()
+{
+    const C04R5 s = default;
+    s.Write();
+    return Test("const_receiver_param_branch_alias", c04R5Int * 10 + s.n, 90) != 0;
+}
+
+// =============================================================
+// Const phase 6: a string literal is a `(const char)*` (R2 A, R11)
+// =============================================================
+
+// A `(const char)*` param is a reseatable read-only view: the classic scanning loop.
+int tcLength((const char)* s)
+{
+    int n = 0;
+    while (*s) { s++; n++; }
+    return n;
+}
+
+// The same view spelled const(char)*; both spellings are the same type.
+int tcLengthCall(const(char)* s) { return tcLength(s); }
+
+// `const char* s` param: s is fixed inside the body, the characters are read-only.
+int tcFirst(const char* s) { return (int)s[0]; }
+
+bool testConstStringLiterals()
+{
+    bool result = true;
+    // Leg 6: string literals are `(const char)*` (R2 A).
+    (const char)* lit = "const";
+    const char* name = "fixed";
+    auto deduced = "auto";                              // deduces (const char)*: reseatable
+    deduced++;
+    result &= Test("const_literal_length", tcLength(lit), 5);
+    result &= Test("const_literal_fn_spelling", tcLengthCall("abc"), 3);
+    result &= Test("const_literal_first", tcFirst(name), 102);
+    result &= Test("const_literal_auto_reseat", (int)*deduced, 117);
+    result &= Test("const_literal_typeof", typeof(lit), "(const char)*");
+    result &= Test("const_literal_typeof_auto", typeof(deduced), "(const char)*");
+    result &= Test("const_literal_typeof_literal", typeof("abc"), "(const char)*");
+    char[4] buf = { 'x', 'y', 'z', 0 };
+    result &= Test("const_mutable_into_view_param", tcLength(buf), 3);
+    expect_error("the conversion discards const") { char* litBad = "nope"; }
+    expect_error("it is reached through a pointer to const") { lit[0] = 'C'; }
+    expect_error("cannot assign to 'name': it is declared const") { name = "other"; }
+
+    // An array initialized from a literal copies it: the copy is writable.
+    char[4] copy = "abc";
+    copy[0] = 'X';
+    result &= Test("const_literal_array_copy", (int)copy[0] * 1000 + (int)copy[2], 88099);
+    // A literal into `string` (operator string) and an array of read-only views.
+    string text = "hello";
+    result &= Test("const_literal_to_string", text.length(), 5);
+    (const char)*[2] names = { "ab", "cde" };
+    result &= Test("const_literal_brace_views", tcLength(names[0]) * 10 + tcLength(names[1]), 23);
+    expect_error("the conversion discards const") { char*[2] bad = { "a", "b" }; }
+    // C variadic and `const char*` params take a literal as before.
+    char[16] out = default;
+    result &= Test("const_literal_into_variadic", snprintf(out, 16, "%s-%s", "ab", "cd"), 5);
+    result &= Test("const_literal_printf_result", (int)out[2], 45);
+    return result;
+}
+
+// Const phase 7: the review draft's last legs (scratch/const_iter1/const_section.cb leg 9 generics,
+// leg 10 `using` typeof); its other legs landed with phases 1-6 (testConstObjects ... testConstStringLiterals).
+using TcCStr = (const char)*;
+using TcIntPtr = int*;
+int tcGenericFirst<T>(const T p) { return p[0]; }   // T = int*: `const T` is `const int*`
+T tcGenericBump<T>(T v) { v++; return v; }           // a const argument deduces T = int
+
+bool testConstWholeWord()
+{
+    bool result = true;
+    int[3] data = { 11, 2, 3 };
+    int* raw = data;
+    const int seed = 41;
+    result &= Test("const_generic_whole", tcGenericFirst(raw), 11);
+    result &= Test("const_generic_deduce_strips", tcGenericBump(seed), 42);
+    list<(const char)*> names = default;
+    names.add("a");
+    names.add("bc");
+    result &= Test("const_generic_view_arg", tcLength(names[1]), 2);
+    expect_error("'const' is not allowed on a generic type argument") { list<const int> bad = default; }
+    // typeof(type) takes no '*' or 'const' yet, so the draft's typeof((const char)*) is spelled
+    // through variables of the two types.
+    TcCStr aliasView = "alias";
+    (const char)* spelledView = "spelled";
+    const TcIntPtr aliasConstPtr = raw;
+    const int* spelledConstPtr = raw;
+    result &= Test("const_using_typeof", typeof(aliasView), typeof(spelledView));
+    result &= Test("const_using_typeof_whole", typeof(aliasConstPtr), typeof(spelledConstPtr));
+    result &= Test("const_using_typeof_text", typeof(aliasConstPtr), "const int*");
     return result;
 }

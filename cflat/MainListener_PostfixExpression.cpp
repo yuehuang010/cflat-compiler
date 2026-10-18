@@ -1720,6 +1720,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             size_t childLimit = ctx->children.size();
             childLimit -= std::min(dropTrailingChildren, childLimit);
             size_t childIndex = 0;
+            // The '(' of the call being lowered: the site key of codegen's overload choice.
+            antlr4::tree::TerminalNode* callParen = nullptr;
 
             // A suffix consumes the primary as a receiver/callee, so the enclosing destination
             // belongs to the final postfix result, not to that primary. The one exception is a
@@ -1952,12 +1954,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     {
                     case CFlatParser::LeftBracket:
                     case CFlatParser::RightBracket:
-                    case CFlatParser::RightParen: { prevToken = tokenType; break; }
+                    case CFlatParser::RightParen:
+                    {
+                        if (tokenType == CFlatParser::LeftBracket) callParen = terminal;
+                        prevToken = tokenType;
+                        break;
+                    }
                     case CFlatParser::LeftParen:
                     {
                         // A call made ON the chain (after its first member link) hands the root to the
                         // call's own this-argument rule; the call that produced the root does not.
                         if (ncChainRootChecked) ncChainCalled = true;
+                        callParen = terminal;
                         prevToken = tokenType;
                         break;
                     }
@@ -4048,7 +4056,22 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     else if (prefix == "U") namedVar.TypeAndValue.TypeName = "c32";
                                 }
                                 if (!namedVar.TypeAndValue.TypeName.empty())
+                                {
                                     namedVar.TypeAndValue.Pointer = true;
+                                    namedVar.TypeAndValue.ConstMask = 1;
+                                }
+                                // `"abc"[i]` indexes the literal's characters, a `(const char)*`.
+                                auto* next = childLimit > 1
+                                    ? dynamic_cast<antlr4::tree::TerminalNode*>(ctx->children[1]) : nullptr;
+                                if (namedVar.TypeAndValue.TypeName.empty() && next != nullptr
+                                    && next->getSymbol()->getType() == CFlatParser::LeftBracket
+                                    && Compiler(ctx)->IsStringLiteralGlobal(namedVar.Primary))
+                                {
+                                    namedVar.TypeAndValue.TypeName = "char";
+                                    namedVar.TypeAndValue.Pointer = true;
+                                    namedVar.TypeAndValue.ConstMask = 1;
+                                    namedVar.BaseType = Compiler(ctx)->builder->getInt8Ty();
+                                }
                             }
                             // `default` takes the destination's type - publish it so a following
                             // suffix and the caller both see the right type, not an empty one.
@@ -4442,7 +4465,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
 
                             CheckMovedReceiver(structVar);
                             FlushCallPostfix();
+                            Compiler(ctx)->pendingCallSite_ = callParen;
                             auto* result = Compiler(ctx)->CreateOverloadedFunctionCall("operator[]", { thisNV, idxNV });
+                            Compiler(ctx)->pendingCallSite_ = nullptr;
                             if (result)
                             {
                                 namedVar.Primary  = result;
@@ -9790,6 +9815,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
 
                                 requestCxxTemplate(resolvedFuncName);
                                 callArgumentPostfix.Flush();
+                                Compiler(ctx)->pendingCallSite_ = callParen;
                                 namedVar.Primary = RefuseCxxConstReceiverCall(ctx, arguments,
                                         cxxMemberReceiverType(), resolvedFuncName,
                                         lastMemberReceiverPath)
@@ -9801,6 +9827,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         && !callHasCxxBraceArguments,
                                     enclosingFunctionName);
                                 globalScopeCall = false;
+                                Compiler(ctx)->pendingCallSite_ = nullptr;
                                 {
                                     std::string rcvr = structVar.TypeAndValue.VariableName;
                                     if (rcvr.empty() && !compilerLLVM->lastCallParameterNames.empty())
@@ -9862,6 +9889,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
                                 requestCxxTemplate(resolvedFuncName);
                                 callArgumentPostfix.Flush();
+                                Compiler(ctx)->pendingCallSite_ = callParen;
                                 namedVar.Primary = RefuseCxxConstReceiverCall(ctx, arguments,
                                         cxxMemberReceiverType(), resolvedFuncName,
                                         lastMemberReceiverPath)
@@ -9873,6 +9901,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         && !callHasCxxBraceArguments,
                                     enclosingFunctionName);
                                 globalScopeCall = false;
+                                Compiler(ctx)->pendingCallSite_ = nullptr;
                                 {
                                     std::string rcvr = structVar.TypeAndValue.VariableName;
                                     if (rcvr.empty() && !compilerLLVM->lastCallParameterNames.empty())
@@ -11637,6 +11666,13 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
                     // The operand is unevaluated: its type only, no calls or side effects.
                     auto namedVar = EvaluateOperandTypeOnly([&]() { return ParseUnaryExpression(ue); });
                     type = namedVar.Type;
+                    // A narrow string literal carries no type name; it is a `(const char)*` (R11).
+                    if (type.TypeName.empty() && namedVar.IsStringLiteral)
+                    {
+                        type.TypeName = "char";
+                        type.Pointer = true;
+                        type.ConstMask = 1;
+                    }
                 // 'auto' variables carry the literal text "auto" (or an empty
                 // string) as their declared TypeName even though the concrete
                 // type is known. Recover it from the resolved LLVM BaseType,
@@ -11649,8 +11685,9 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
                 }
             }
 
+            // The spelling carries const (`(const char)*` for a literal, R11).
             std::string spelling = type.TypeName.empty() || type.TypeName == "auto"
-                ? "unknown" : SpellType(*compiler, type);
+                ? "unknown" : SpellTypeForSymbolDump(*compiler, type);
             return compiler->CreateGlobalString("typeof", spelling);
         }
         else if (ctx->NameOf())

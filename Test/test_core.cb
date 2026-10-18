@@ -1271,7 +1271,7 @@ CPToken makeCPToken(string t)
     return tk;
 }
 
-char* giveCharPtr()
+(const char)* giveCharPtr()
 {
     return "wxyz";
 }
@@ -1331,7 +1331,7 @@ int testString()
 
     // Method-call syntax on a char* / char[N] receiver dispatches to
     // toString(const char* self), yielding an OWNED string copy of the C bytes.
-    char* litPtr = "abc";
+    (const char)* litPtr = "abc";
     string fromPtr = litPtr.toString();
     passed += Test("char* toString length", fromPtr.length(), 3);
     passed += Test("char* toString data",   fromPtr.data(),   "abc");
@@ -1474,11 +1474,11 @@ int testStringInterpolation()
 
     // An EMPTY brace pair is not interpolated: the literal stays a plain char*. PRE, the label
     // failed overload resolution and 'emptyPair' failed pointer initialization ('string' source).
-    char* emptyPair = "a = {} b";
+    (const char)* emptyPair = "a = {} b";
     passed += Test("interp_empty_pair_is_charptr = {} in label", emptyPair, "a = {} b");
 
     // A '{' with no matching '}' is a plain character for the same reason.
-    char* unmatched = "unmatched { brace";
+    (const char)* unmatched = "unmatched { brace";
     passed += Test("interp_unmatched_brace_is_charptr", unmatched, "unmatched { brace");
 
     // Accept-set freeze (passes on both binaries by design): a literal that DOES interpolate
@@ -1488,7 +1488,7 @@ int testStringInterpolation()
 
     // Deliberate PRE->POST change: on the plain path an empty pair's trailing '}' now folds
     // with the next one per the '}}' escape rule (PRE read "a {}} b").
-    char* braceRun = "a {}} b";
+    (const char)* braceRun = "a {}} b";
     passed += Test("interp_empty_pair_brace_run", braceRun, "a {} b");
 
     return passed;
@@ -1680,7 +1680,8 @@ int testStringView()
 
     // string_view(ptr, len): the (char*, int) chunk a C callback hands over, with no copy.
     // The literal length argument is typed i8, so this also pins the widening to i32.
-    char* raw = "hello world";
+    char[12] rawBuf = "hello world";
+    char* raw = rawBuf;
     string_view chunk = string_view(raw, 5);
     passed += Test("view_ptr_len_length", chunk.length(), 5);
     passed += Test("view_ptr_len_get0", chunk.get(0), 'h');
@@ -2465,7 +2466,7 @@ int testStringAPI()
     // list on scope exit must not touch the borrowed literal buffer (ASan-clean). Also
     // exercises Item 2: (string)charPtr value-compares a string by content.
     {
-        char* rawLit = "borrowed-buf";
+        (const char)* rawLit = "borrowed-buf";
         {
             list<string> bl = default;
             string bw = (string)rawLit;
@@ -2482,8 +2483,8 @@ int testStringAPI()
     // erroring with the old toString() advice. char* + literal and chained concat too; the
     // owned intermediates are freed at end-of-expression (ASan-clean).
     {
-        char* cp = "foo";
-        char* cq = "bar";
+        (const char)* cp = "foo";
+        (const char)* cq = "bar";
         string cc1 = cp + cq;
         passed += Test("charptr + charptr", cc1, "foobar");
         string cc2 = cp + "X";
@@ -3515,7 +3516,7 @@ struct VpsNsDest { VpsNs.VpsElem[] v = default; };
 struct VpsAliasDest { VpsAlias[] v = default; };
 struct VpsBoxElem<T> { T t = default; };
 struct VpsBoxDest { VpsBoxElem<int>[] v = default; };
-struct VpsCharDest { char[] c = default; };
+struct VpsCharDest { (const char)[] c = default; };
 struct VpsIntDest { int[] p = default; };
 
 /*
@@ -4866,7 +4867,7 @@ int testT147TernaryJoin()
     passed += Test("T147 explicit interface cast of the same ternary picks the same overload", t147Tag * 10000 + r, 20122);
     // A string literal arm still joins a char pointer arm (only a class pointer arm is refused).
     char* buf = nullptr;
-    char* s = c > 0 ? buf : "abc";
+    (const char)* s = c > 0 ? buf : "abc";
     int ch = s[0];
     passed += Test("T147 char pointer ternary with string literal arm keeps working", ch, 97);
     delete a;

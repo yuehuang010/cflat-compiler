@@ -18,6 +18,15 @@ PHASE 3 LANDED 2026-10-18 (0e443afcf): writes through a pointer to const at any 
 spelled levels; casts add or drop const; `using X = const W` parses. Deferred: overloads differing only in pointee const
 (R1 B: duplicate), function<> const params (p3 function-type-cannot-carry-pointee-const), string `_ptr` borrow cast
 (p3 string-ptr-drops-const-from-borrowed-literal, phase 6), C auto-extern return const (phase 5).
+PHASE 4 LANDED 2026-10-18 (fe983b97e): read-only methods inferred (receiver scan + fixed point over codegen's chosen
+overloads, return provenance; core cached as `cms`, cache v15); #8 on const receivers, deferred to module end (an
+expect_error scope owns its entries; its verdict waits for module end); const dtor-free non-owning struct globals are
+`constant`. Limits: a read-only method's alias/pointer RESULT is not const-qualified on a const receiver (needs trailing
+const, later iteration); pointer writes deeper than one level stay read-only (R11 one level).
+PHASE 6 LANDED 2026-10-18 (74ba23ec0): string literals are `(const char)*` (#3 #5 #6 #7 via the phase-3 predicate; auto
+deduces it); imported C struct fields keep their spelled pointee const (header cache v265); core/Test/example/test_libs and
+Windows-only sites migrated (static sweep, Windows not compiled - verify on the final Windows gate). Part B (string `_ptr`
+/ `data()` const) stopped at its threshold: p3 string-ptr-drops-const-from-borrowed-literal.
 Written 2026-10-16 against master 6dcf38aee. Supersedes, once ruled, the
 2026-08-26 "const stays unenforced" ruling and the "(CFlat exposes no const)" clause of the
 2026-09-27 C++-const ruling. Probes: `scratch/const_spike/p01-p19.cb`

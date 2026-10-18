@@ -33,6 +33,7 @@
 #include <cctype>
 #include <cmath>
 #include <charconv>
+#include <bit>
 #include <cassert>
 #include <vector>
 
@@ -1881,6 +1882,44 @@ static bool StripAliasQualifier(std::string& name)
     }
     return false;
 }
+
+// Type parameter -> argument spelling of the instantiation being walked. An argument's pointee
+// const ("(const int)*") is kept beside the plain spelling, which every reader of the map sees;
+// copies (save/restore around a nested instantiation) carry both. `[]` binds with no const.
+class TypeSubstitutionMap : public std::unordered_map<std::string, std::string>
+{
+public:
+    std::string& operator[](const std::string& name)
+    {
+        constDepths_.erase(name);
+        return std::unordered_map<std::string, std::string>::operator[](name);
+    }
+    size_t erase(const std::string& name)
+    {
+        constDepths_.erase(name);
+        return std::unordered_map<std::string, std::string>::erase(name);
+    }
+    // Binds `name` to a spelled or mangled argument, peeling its pointee const.
+    void Bind(const std::string& name, const std::string& arg)
+    {
+        std::string plain;
+        int depth = 0;
+        if (SplitConstTypeArgument(arg, plain, depth))
+        {
+            std::unordered_map<std::string, std::string>::operator[](name) = plain;
+            constDepths_[name] = depth;
+            return;
+        }
+        (*this)[name] = arg;
+    }
+    int ConstDepth(const std::string& name) const
+    {
+        auto it = constDepths_.find(name);
+        return it == constDepths_.end() ? 0 : it->second;
+    }
+private:
+    std::unordered_map<std::string, int> constDepths_;
+};
 
 // Strip the leading `alias ` qualifier off a resolved type-arg string. It is a generic
 // instantiation marker, not part of the underlying LLVM type.
@@ -4206,6 +4245,664 @@ inline void ApplyOwningSinkInference(const LLVMBackend* compiler,
 // 'unique'/'alias'/'bond' are not grammar keywords at all - they parse as genericIdentifier,
 // also a typeSpecifier. So a ctor carrying one of those four reads as "member" in the
 // duplicate diagnostic. The duplicate is still caught; only the noun is wrong.
+/*
+ * Const receivers (iteration 1): the structural facts a native method body states about its
+ * `this` - writes, member calls, receiver-rooted values handed on. Names resolve in codegen
+ * order (parameter / enclosing local first, then a field when the struct declares one, which
+ * IsReadOnlyMethod decides against the declared types); expression TEXT never decides anything.
+ */
+class ReceiverScan
+{
+public:
+    using Path = LLVMBackend::ReceiverPath;
+    using Facts = LLVMBackend::ReceiverScanFacts;
+
+    struct Value
+    {
+        bool Ok = false;
+        Path P;
+        bool AddressOf = false;     // the value is the ADDRESS of the path (`&f`, `this`)
+        bool WholeLocal = false;    // a bare local bound to receiver storage
+        bool Borrow = false;        // ... that is a range-for element borrow
+    };
+
+    ReceiverScan(const std::vector<LLVMBackend::TypeAndValue>& allParams, const IfConstEvaluator& eval)
+        : eval_(eval)
+    {
+        facts_.StructName = allParams.front().TypeName;
+        for (size_t i = 1; i < allParams.size(); ++i)
+            if (!allParams[i].VariableName.empty()) params_.insert(allParams[i].VariableName);
+    }
+
+    Facts Run(antlr4::tree::ParseTree* body)
+    {
+        Walk(body);
+        // A parameter the body re-seats may hold anything by the time it is returned.
+        for (size_t i = 0; i < facts_.Returns.size(); ++i)
+            if (facts_.Returns[i].Kind == 1 && !returnedParams_[i].empty()
+                && assigned_.count(returnedParams_[i]) != 0)
+                facts_.Returns[i].Kind = 2;
+        return std::move(facts_);
+    }
+
+private:
+    // Copy: a by-value binding; IsReadOnlyMethod keeps it rooted only for a pointer or view type.
+    // `Decl` is the declaring node, so a block exit can tell its own locals from outer ones.
+    struct AliasEntry { Path P; bool AddressOf = false; bool Borrow = false; bool Copy = false;
+                        const void* Decl = nullptr; };
+
+    static bool Is(antlr4::tree::ParseTree* node, size_t rule)
+    {
+        auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(node);
+        return ctx != nullptr && ctx->getRuleIndex() == rule;
+    }
+    static antlr4::tree::TerminalNode* Terminal(antlr4::tree::ParseTree* node)
+    {
+        return node != nullptr && node->getTreeType() == antlr4::tree::ParseTreeType::TERMINAL
+            ? dynamic_cast<antlr4::tree::TerminalNode*>(node) : nullptr;
+    }
+
+    static void Step(Value& v, const std::string& step)
+    {
+        if (v.AddressOf)
+        {
+            // Through the address of an object: `(&o)->f` is `o.f`, `*&o` and `(&o)[0]` are `o`.
+            v.AddressOf = false;
+            if (step.starts_with("->")) v.P.Steps.push_back("." + step.substr(2));
+            else if (step.starts_with(".")) v.P.Steps.push_back(step);
+        }
+        else
+            v.P.Steps.push_back(step);
+        v.WholeLocal = false;
+        v.Borrow = false;
+    }
+
+    Value Name(antlr4::ParserRuleContext* use, const std::string& name) const
+    {
+        Value v;
+        if (name.empty()) return v;
+        if (name == "this")
+        {
+            v.Ok = true;
+            v.P.IsThis = true;
+            v.AddressOf = true;
+            return v;
+        }
+        if (params_.count(name) != 0 || NameShadowedByEnclosingLocal(use, name))
+        {
+            auto it = aliases_.find(name);
+            if (it == aliases_.end()) return v;
+            v.Ok = true;
+            v.P = it->second.P;
+            if (it->second.Copy) v.P.Steps.push_back("=");
+            v.AddressOf = it->second.AddressOf;
+            v.WholeLocal = true;
+            v.Borrow = it->second.Borrow;
+            return v;
+        }
+        v.Ok = true;
+        v.P.Root = name;
+        return v;
+    }
+
+    // The receiver-rooted value an expression denotes, peeling only shape-preserving wrappers.
+    Value Of(antlr4::tree::ParseTree* node)
+    {
+        Value none;
+        while (node != nullptr)
+        {
+            auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(node);
+            if (ctx == nullptr) return none;
+            const size_t rule = ctx->getRuleIndex();
+            if (rule == CFlatParser::RulePostfixExpression) return Postfix(ctx, nullptr);
+            if (rule == CFlatParser::RuleUnaryExpression && ctx->children.size() == 2)
+            {
+                auto* op = dynamic_cast<CFlatParser::UnaryOperatorContext*>(ctx->children[0]);
+                if (op == nullptr) return none;
+                Value inner = Of(ctx->children[1]);
+                if (!inner.Ok) return none;
+                const std::string text = op->getText();
+                if (text == "&")
+                {
+                    if (inner.AddressOf) return none;
+                    inner.AddressOf = true;
+                    inner.WholeLocal = false;
+                    return inner;
+                }
+                if (text == "*") { Step(inner, "*"); return inner; }
+                return none;
+            }
+            if (rule == CFlatParser::RuleAdditiveExpression && ctx->children.size() == 3)
+            {
+                // `f + k` on a pointer field is still a pointer into what the field reaches.
+                Value inner = Of(ctx->children[0]);
+                inner.WholeLocal = false;
+                inner.Borrow = false;
+                return inner;
+            }
+            if (rule == CFlatParser::RulePrimaryExpression)
+            {
+                auto* primary = static_cast<CFlatParser::PrimaryExpressionContext*>(ctx);
+                if (primary->expression() != nullptr && ctx->children.size() == 3)
+                {
+                    node = primary->expression();
+                    continue;
+                }
+                return none;
+            }
+            if (rule == CFlatParser::RuleCastExpression && ctx->children.size() != 1) return none;
+            if (ctx->children.size() != 1) return none;
+            node = ctx->children[0];
+        }
+        return none;
+    }
+
+    /*
+     * Walk a postfix chain. With `record` set, calls and `++` / `--` in it are recorded; the
+     * returned value is the chain's path when it denotes receiver storage.
+     */
+    Value Postfix(antlr4::ParserRuleContext* ctx, Facts* record, size_t limit = SIZE_MAX)
+    {
+        auto* postfix = static_cast<CFlatParser::PostfixExpressionContext*>(ctx);
+        Value v;
+        auto* primary = postfix->primaryExpression();
+        bool bareName = false;
+        std::string calleeName;
+        if (primary != nullptr && primary->genericIdentifier() != nullptr
+            && primary->genericIdentifier()->genericTypeParameters() == nullptr)
+        {
+            calleeName = primary->genericIdentifier()->Identifier()->getText();
+            bareName = true;
+            v = Name(primary, calleeName);
+        }
+        else if (primary != nullptr && primary->expression() != nullptr && primary->children.size() == 3)
+            v = Of(primary->expression());
+        const auto& children = postfix->children;
+        std::string member;      // the member named by the step just taken
+        Value beforeMember;      // the receiver that member was taken on
+        for (size_t i = 1; i < children.size() && i < limit; ++i)
+        {
+            auto* term = Terminal(children[i]);
+            if (term == nullptr) continue;
+            const std::string tok = term->getText();
+            if (tok == "[")
+            {
+                if (v.Ok && record != nullptr) record->Calls.push_back({ v.P, "operator[]", 1, false, term });
+                if (v.Ok) Step(v, "[]");
+                member.clear();
+                bareName = false;
+            }
+            else if (tok == "." || tok == "->" || tok == "?.")
+            {
+                if (i + 1 < children.size() && Terminal(children[i + 1]) != nullptr)
+                {
+                    // `.~()`: an explicit destructor call.
+                    v = Value{};
+                    member.clear();
+                    bareName = false;
+                    continue;
+                }
+                member = i + 1 < children.size() ? children[i + 1]->getText() : std::string();
+                beforeMember = v;
+                if (v.Ok) Step(v, (tok == "->" ? "->" : ".") + member);
+                bareName = false;
+                ++i;
+            }
+            else if (tok == "(")
+            {
+                CFlatParser::ArgumentExpressionListContext* args = nullptr;
+                if (i + 1 < children.size())
+                    args = dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(children[i + 1]);
+                if (record != nullptr) RecordCall(primary, bareName, calleeName, member, beforeMember, args, term);
+                // A call on the receiver: its result may be an alias / pointer into it.
+                v = Value{};
+                Path receiverPath;
+                bool implicit = false;
+                if (CallReceiver(primary, bareName, calleeName, member, beforeMember, receiverPath, implicit))
+                {
+                    facts_.Results.push_back({ receiverPath, implicit ? calleeName : member,
+                                               args != nullptr ? args->argumentNamedExpression().size() : 0,
+                                               implicit, term });
+                    v.Ok = true;
+                    v.P.Result = static_cast<int>(facts_.Results.size() - 1);
+                }
+                member.clear();
+                bareName = false;
+            }
+            else if (tok == "++" || tok == "--")
+            {
+                if (record != nullptr) RecordWrite(v, ctx);
+                v = Value{};
+                member.clear();
+                bareName = false;
+            }
+        }
+        return v;
+    }
+
+    // The postfix expression a single-child chain reduces to.
+    static antlr4::ParserRuleContext* PostfixOf(antlr4::tree::ParseTree* node)
+    {
+        while (auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(node))
+        {
+            if (ctx->getRuleIndex() == CFlatParser::RulePostfixExpression) return ctx;
+            if (ctx->children.size() != 1) return nullptr;
+            node = ctx->children[0];
+        }
+        return nullptr;
+    }
+
+    void RecordWrite(const Value& v, antlr4::ParserRuleContext* at)
+    {
+        if (!v.Ok || (v.WholeLocal && !v.Borrow)) return;
+        // Writing `&x` itself is not a write; writing through it is (Step already folded it).
+        if (v.AddressOf) return;
+        facts_.Writes.push_back({ v.P });
+    }
+
+    void RecordEscape(const Value& v, int kind, const std::string& callee, const Path& calleeReceiver,
+                      size_t argIndex, size_t arity, bool aliasBind, antlr4::ParserRuleContext* at,
+                      const void* site = nullptr)
+    {
+        if (!v.Ok) return;
+        LLVMBackend::ReceiverScanFacts::Escape e;
+        e.Source = v.P;
+        e.AddressOf = v.AddressOf;
+        e.AliasBind = aliasBind;
+        e.Kind = kind;
+        e.Callee = callee;
+        e.CalleeReceiver = calleeReceiver;
+        e.ArgIndex = argIndex;
+        e.Arity = arity;
+        e.Site = site;
+        facts_.Escapes.push_back(std::move(e));
+    }
+
+    /*
+     * The object a call is made on: an implicit-this member (or a free function, decided against
+     * the declarations) for a bare name that is no local / parameter, else the receiver-rooted
+     * object of a member call. A local / parameter callee is a function value: none.
+     */
+    bool CallReceiver(antlr4::ParserRuleContext* use, bool bareName, const std::string& calleeName,
+                      const std::string& member, const Value& receiver, Path& out, bool& implicit) const
+    {
+        implicit = false;
+        if (bareName && !calleeName.empty())
+        {
+            if (params_.count(calleeName) != 0 || NameShadowedByEnclosingLocal(use, calleeName)) return false;
+            out = Path{};
+            out.IsThis = true;
+            implicit = true;
+            return true;
+        }
+        if (member.empty() || !receiver.Ok) return false;
+        Value object = receiver;
+        if (object.AddressOf) object.AddressOf = false;
+        else if (object.WholeLocal && !object.Borrow)
+            object.P.Steps.push_back("*"); // a local pointer bound to receiver storage: its pointee
+        out = object.P;
+        return true;
+    }
+
+    void RecordCall(antlr4::ParserRuleContext* use, bool bareName, const std::string& calleeName,
+                    const std::string& member, const Value& receiver,
+                    CFlatParser::ArgumentExpressionListContext* args, const void* site)
+    {
+        std::vector<CFlatParser::ArgumentNamedExpressionContext*> list;
+        if (args != nullptr) list = args->argumentNamedExpression();
+        const size_t arity = list.size();
+        int kind = 3;
+        std::string callee;
+        Path calleeReceiver;
+        bool implicit = false;
+        if (CallReceiver(use, bareName, calleeName, member, receiver, calleeReceiver, implicit))
+        {
+            callee = implicit ? calleeName : member;
+            facts_.Calls.push_back({ calleeReceiver, callee, arity, implicit, site });
+            kind = implicit ? 1 : 2;
+        }
+        else
+            calleeReceiver = Path{};
+        for (size_t a = 0; a < list.size(); ++a)
+            if (auto* arg = list[a]->assignmentExpression())
+                RecordEscape(Of(arg), kind, callee, calleeReceiver, a, arity, false, arg, site);
+    }
+
+    static bool SpecifiersSay(CFlatParser::DeclarationSpecifiersContext* specs, bool& isConst, bool& isAuto,
+                              bool& isAlias)
+    {
+        isConst = isAuto = isAlias = false;
+        if (specs == nullptr) return false;
+        for (auto* spec : specs->declarationSpecifier())
+        {
+            if (spec->typeQualifier() != nullptr) isConst = true;
+            if (auto* typeSpec = spec->typeSpecifier())
+            {
+                // `alias` is a soft keyword, matched like both ParseDeclarationSpecifiers do.
+                if (typeSpec->getText() == "alias") isAlias = true;
+                if (typeSpec->getStart() != nullptr && typeSpec->getStart()->getType() == CFlatParser::Auto
+                    && typeSpec->children.size() == 1)
+                    isAuto = true;
+            }
+        }
+        return true;
+    }
+
+    void Declare(CFlatParser::DeclarationSpecifiersContext* specs, CFlatParser::InitDeclaratorListContext* list)
+    {
+        if (list == nullptr) return;
+        bool isConst = false, isAuto = false, isAlias = false;
+        SpecifiersSay(specs, isConst, isAuto, isAlias);
+        for (auto* init : list->initDeclarator())
+        {
+            auto* declarator = init->declarator();
+            auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+            const std::string name = direct != nullptr && direct->Identifier() != nullptr
+                ? direct->Identifier()->getText() : std::string();
+            aliases_.erase(name);
+            auto* iz = init->initializer();
+            std::vector<antlr4::ParserRuleContext*> elements;
+            if (iz != nullptr && iz->assignmentExpression() != nullptr)
+            {
+                Value v = Of(iz->assignmentExpression());
+                if (!v.Ok) continue;
+                if (isAlias && !isConst)
+                    RecordEscape(v, 0, {}, {}, 0, 0, true, iz);
+                else if (isAlias || isConst || isAuto)
+                {
+                    if (!name.empty())
+                        aliases_[name] = AliasEntry{ v.P, v.AddressOf, isAlias || v.Borrow,
+                                                     !v.AddressOf && !isAlias && !v.Borrow, init };
+                }
+                else
+                    RecordEscape(v, 0, {}, {}, 0, 0, false, iz);
+                continue;
+            }
+            CFlatParser::InitializerListContext* braces = iz != nullptr ? iz->initializerList()
+                                                                         : init->initializerList();
+            if (braces != nullptr)
+                for (auto* element : braces->fieldInit())
+                    for (auto* value : element->assignmentExpression())
+                        RecordEscape(Of(value), 0, {}, {}, 0, 0, false, value);
+        }
+    }
+
+    /*
+     * A block (or loop) is a lexical scope for local aliases: on exit, a local it declared is
+     * dropped and an outer one it shadowed comes back. An outer local re-seated inside keeps
+     * its new value (same declaring node).
+     */
+    void Walk(antlr4::tree::ParseTree* node)
+    {
+        auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(node);
+        if (ctx == nullptr) return;
+        const size_t rule = ctx->getRuleIndex();
+        if (rule != CFlatParser::RuleCompoundStatement && rule != CFlatParser::RuleIterationStatement)
+        {
+            WalkNode(ctx, rule);
+            return;
+        }
+        auto outer = aliases_;
+        WalkNode(ctx, rule);
+        for (auto& [name, entry] : outer)
+            if (auto it = aliases_.find(name); it != aliases_.end() && it->second.Decl == entry.Decl)
+                entry = it->second;
+        aliases_ = std::move(outer);
+    }
+
+    void WalkNode(antlr4::ParserRuleContext* ctx, const size_t rule)
+    {
+        if (rule == CFlatParser::RuleFunctionDefinition && depth_ > 0) return;
+        if (rule == CFlatParser::RuleSelectionStatement)
+        {
+            auto* sel = static_cast<CFlatParser::SelectionStatementContext*>(ctx);
+            if (sel->If() != nullptr && sel->Const() != nullptr)
+            {
+                // `if const`: only the live arm of this instantiation; undecided scans both.
+                auto arms = sel->statement();
+                const int taken = eval_ ? eval_(sel->expression()) : -1;
+                ++depth_;
+                if (taken != 0 && !arms.empty()) Walk(arms[0]);
+                if (taken != 1 && arms.size() > 1) Walk(arms[1]);
+                --depth_;
+                return;
+            }
+        }
+        if (rule == CFlatParser::RuleDeclaration)
+        {
+            auto* decl = static_cast<CFlatParser::DeclarationContext*>(ctx);
+            ++depth_;
+            for (auto* child : ctx->children) Walk(child);
+            --depth_;
+            Declare(decl->declarationSpecifiers(), decl->initDeclaratorList());
+            return;
+        }
+        if (rule == CFlatParser::RuleForDeclaration)
+        {
+            auto* decl = static_cast<CFlatParser::ForDeclarationContext*>(ctx);
+            ++depth_;
+            for (auto* child : ctx->children) Walk(child);
+            --depth_;
+            Declare(decl->declarationSpecifiers(), decl->initDeclaratorList());
+            return;
+        }
+        if (rule == CFlatParser::RuleIterationStatement)
+        {
+            auto* loop = static_cast<CFlatParser::IterationStatementContext*>(ctx);
+            if (loop->In() != nullptr && loop->Identifier() != nullptr && loop->expression() != nullptr)
+            {
+                Value iterable = Of(loop->expression());
+                const std::string name = loop->Identifier()->getText();
+                aliases_.erase(name);
+                if (iterable.Ok)
+                {
+                    Value object = iterable;
+                    if (object.AddressOf) object.AddressOf = false;
+                    facts_.Calls.push_back({ object.P, "count", 0, false });
+                    facts_.Calls.push_back({ object.P, "get", 1, false });
+                    Path element = object.P;
+                    element.Steps.push_back("[]");
+                    aliases_[name] = AliasEntry{ element, false, true, false, loop };
+                }
+            }
+        }
+        if (rule == CFlatParser::RuleAssignmentExpression)
+        {
+            auto* asn = static_cast<CFlatParser::AssignmentExpressionContext*>(ctx);
+            if (asn->assignmentOperator() != nullptr && asn->unaryExpression() != nullptr)
+            {
+                // A parameter re-seated here (a same-named local declared around it is not it).
+                if (auto* pfx = asn->unaryExpression()->postfixExpression();
+                    pfx != nullptr && pfx->children.size() == 1 && pfx->primaryExpression() != nullptr
+                    && pfx->primaryExpression()->genericIdentifier() != nullptr)
+                {
+                    const std::string name = pfx->primaryExpression()->genericIdentifier()->Identifier()->getText();
+                    if (params_.count(name) != 0 && !NameShadowedByEnclosingLocal(asn, name)) assigned_.insert(name);
+                }
+                Value target = Of(asn->unaryExpression());
+                RecordWrite(target, asn);
+                if (asn->assignmentOperator()->getText() == "=" && asn->assignmentExpression() != nullptr)
+                {
+                    Value source = Of(asn->assignmentExpression());
+                    if (target.Ok && target.WholeLocal && !target.Borrow && source.Ok)
+                    {
+                        // Re-seating a local that already views receiver storage keeps it a view.
+                        auto* name = asn->unaryExpression()->postfixExpression();
+                        if (name != nullptr && name->primaryExpression() != nullptr
+                            && name->primaryExpression()->genericIdentifier() != nullptr)
+                        {
+                            auto it = aliases_.find(name->primaryExpression()->genericIdentifier()->Identifier()->getText());
+                            if (it != aliases_.end())
+                                it->second = AliasEntry{ source.P, source.AddressOf, it->second.Borrow,
+                                                         !source.AddressOf && !it->second.Borrow,
+                                                         it->second.Decl };
+                        }
+                    }
+                    else if (!target.Ok || (target.WholeLocal && !target.Borrow))
+                        RecordEscape(source, 0, {}, {}, 0, 0, false, asn);
+                }
+            }
+        }
+        if (rule == CFlatParser::RuleLockStatement)
+        {
+            // `lock(x) { }` calls x's acquire / release pair for the lock mode, as the lowering does.
+            for (auto* expr : static_cast<CFlatParser::LockStatementContext*>(ctx)->lockClause()
+                     ->lockArgList()->expression())
+            {
+                const std::string mode = LockTextMode(expr->getText());
+                Value v;
+                if (mode.empty()) v = Of(expr);
+                else if (auto* pfx = PostfixOf(expr); pfx != nullptr && pfx->children.size() >= 3)
+                    v = Postfix(pfx, nullptr, pfx->children.size() - 2);
+                Path object;
+                bool implicit = false;
+                // Any member name selects CallReceiver's member-call form (object = v's path).
+                if (!CallReceiver(ctx, false, {}, "lock", v, object, implicit)) continue;
+                const std::string wantMode = mode == "read" || mode == "optimistic" ? mode : std::string();
+                for (const auto& cap : kCapabilities)
+                    if (wantMode == cap.Mode)
+                    {
+                        facts_.Calls.push_back({ object, cap.Acquire, 0, false });
+                        facts_.Calls.push_back({ object, cap.Release, 0, false });
+                    }
+            }
+        }
+        if (rule == CFlatParser::RuleJumpStatement)
+        {
+            auto* jump = static_cast<CFlatParser::JumpStatementContext*>(ctx);
+            if (jump->Return() != nullptr && jump->expression() != nullptr) RecordReturn(jump->expression());
+            else if (jump->Return() != nullptr)
+            {
+                // `return default;` is a null pointer; a block return is not followed (unknown).
+                LLVMBackend::ReceiverScanFacts::Return r;
+                if (jump->Default() != nullptr) r.Kind = 1;
+                facts_.Returns.push_back(r);
+                returnedParams_.push_back({});
+            }
+        }
+        if (rule == CFlatParser::RuleMoveExpression)
+            RecordWrite(Of(static_cast<CFlatParser::MoveExpressionContext*>(ctx)->unaryExpression()), ctx);
+        if (rule == CFlatParser::RuleDeleteExpression)
+        {
+            // `delete p` releases what p reaches.
+            Value v = Of(static_cast<CFlatParser::DeleteExpressionContext*>(ctx)->expression());
+            if (v.Ok) { v.WholeLocal = false; Step(v, "*"); RecordWrite(v, ctx); }
+        }
+        if (rule == CFlatParser::RulePostfixExpression)
+            Postfix(ctx, &facts_);
+        if (ctx->children.size() >= 3
+            && (rule == CFlatParser::RuleEqualityExpression || rule == CFlatParser::RuleRelationalExpression
+                || rule == CFlatParser::RuleAdditiveExpression || rule == CFlatParser::RuleMultiplicativeExpression
+                || rule == CFlatParser::RuleShiftExpression || rule == CFlatParser::RuleAndExpression
+                || rule == CFlatParser::RuleExclusiveOrExpression || rule == CFlatParser::RuleInclusiveOrExpression))
+        {
+            // A member operator on a receiver-rooted left operand is a member call on it.
+            if (auto* op = Terminal(ctx->children[1]))
+            {
+                Value lhs = Of(ctx->children[0]);
+                if (lhs.Ok && !lhs.AddressOf)
+                    facts_.Calls.push_back({ lhs.P, "operator" + op->getText(), 1, false, ctx });
+            }
+        }
+        ++depth_;
+        for (auto* child : ctx->children) Walk(child);
+        --depth_;
+    }
+
+    // Classify one returned expression (Facts::Return); each arm of `?:` / `??` on its own.
+    void RecordReturn(antlr4::tree::ParseTree* expr)
+    {
+        antlr4::tree::ParseTree* node = expr;
+        while (auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(node))
+        {
+            if (ctx->getRuleIndex() == CFlatParser::RuleConditionalExpression && ctx->children.size() == 5)
+            {
+                RecordReturn(ctx->children[2]);
+                RecordReturn(ctx->children[4]);
+                return;
+            }
+            if (ctx->getRuleIndex() == CFlatParser::RuleConditionalExpression && ctx->children.size() == 3)
+            {
+                RecordReturn(ctx->children[0]);
+                RecordReturn(ctx->children[2]);
+                return;
+            }
+            if (ctx->getRuleIndex() == CFlatParser::RulePrimaryExpression && ctx->children.size() == 3
+                && static_cast<CFlatParser::PrimaryExpressionContext*>(ctx)->expression() != nullptr)
+            {
+                RecordReturn(static_cast<CFlatParser::PrimaryExpressionContext*>(ctx)->expression());
+                return;
+            }
+            if (ctx->children.size() != 1) break;
+            node = ctx->children[0];
+        }
+        LLVMBackend::ReceiverScanFacts::Return r;
+        std::string param;
+        Value v = Of(expr);
+        if (v.Ok)
+        {
+            r.Kind = 0;
+            r.Source = v.P;
+            r.AddressOf = v.AddressOf;
+        }
+        else
+        {
+            node = expr;
+            while (auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(node))
+            {
+                if (ctx->getRuleIndex() == CFlatParser::RuleNewExpression) { r.Kind = 1; break; }
+                if (ctx->getRuleIndex() == CFlatParser::RulePrimaryExpression)
+                {
+                    auto* primary = static_cast<CFlatParser::PrimaryExpressionContext*>(ctx);
+                    if (ctx->children.size() == 1 && Terminal(ctx->children[0]) != nullptr)
+                        r.Kind = 1; // a literal
+                    else if (primary->genericIdentifier() != nullptr && ctx->children.size() == 1
+                             && primary->genericIdentifier()->genericTypeParameters() == nullptr)
+                    {
+                        // The parameter itself, not a local of the same name declared around it.
+                        const std::string name = primary->genericIdentifier()->Identifier()->getText();
+                        if (params_.count(name) != 0 && aliases_.count(name) == 0
+                            && !NameShadowedByEnclosingLocal(primary, name))
+                        {
+                            r.Kind = 1;
+                            param = name;
+                        }
+                    }
+                    break;
+                }
+                if (ctx->children.size() != 1) break;
+                node = ctx->children[0];
+            }
+        }
+        facts_.Returns.push_back(std::move(r));
+        returnedParams_.push_back(param);
+    }
+
+    const IfConstEvaluator& eval_;
+    Facts facts_;
+    std::vector<std::string> returnedParams_;
+    std::unordered_set<std::string> assigned_;
+    std::unordered_set<std::string> params_;
+    std::unordered_map<std::string, AliasEntry> aliases_;
+    int depth_ = 0;
+};
+
+// Record the receiver facts of a native method (`allParams[0]` is its synthesized `this`).
+// Returns the method's unique name, empty when it is not a native method with a body.
+inline std::string RecordReceiverScan(LLVMBackend* compiler, CFlatParser::FunctionDefinitionContext* func,
+                                      const std::string& name, const LLVMBackend::DeclTypeAndValue& returnType,
+                                      const std::vector<LLVMBackend::TypeAndValue>& allParams, bool varargs,
+                                      const IfConstEvaluator& eval = {})
+{
+    if (compiler == nullptr || func == nullptr || func->compoundStatement() == nullptr || allParams.empty())
+        return {};
+    const auto& self = allParams.front();
+    if (!self.Pointer || self.VariableName != self.TypeName + "__" || returnType.external) return {};
+    const std::string unique = compiler->ComputeMangledName(name, returnType, allParams, varargs);
+    compiler->RecordReceiverScanFacts(unique, ReceiverScan(allParams, eval).Run(func->compoundStatement()));
+    return unique;
+}
+
 inline bool FunctionDeclaresReturnType(CFlatParser::FunctionDefinitionContext* func)
 {
     auto* specs = func->declarationSpecifiers();
@@ -4974,7 +5671,7 @@ private:
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>& genericStructConstraints;
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>& genericClassConstraints;
     // Active type parameter substitutions during generic instantiation (e.g. "T" -> "int")
-    std::unordered_map<std::string, std::string> activeTypeSubstitutions;
+    TypeSubstitutionMap activeTypeSubstitutions;
     // Active compile-time value substitutions during generic instantiation (e.g. "N" -> "8").
     std::unordered_map<std::string, std::string> activeValueSubstitutions;
 
@@ -5356,6 +6053,28 @@ private:
     // Recursively resolve a typeParameterEntry to its mangled string,
     // applying activeTypeSubstitutions and handling nested generics like Box<Box<T>>.
     std::string ResolveTypeArgEntry(CFlatParser::TypeParameterEntryContext* entry);
+    // `struct G<const T>`: a template parameter is a bare name, never const-qualified (#14).
+    void RefuseConstTemplateParameters(CFlatParser::GenericTypeParametersContext* params)
+    {
+        if (params == nullptr || params->typeParameterList() == nullptr) return;
+        for (auto* entry : params->typeParameterList()->typeParameterEntry())
+            if (entry->Const() != nullptr)
+                LogErrorContext(entry, "'const' is not allowed on a generic type argument; "
+                    "use it on the pointee ('const T*') or on the declaration");
+    }
+    // Pointee const depth of the argument a type parameter spelled at `ctx` is bound to (0: none).
+    int SubstitutedConstDepth(CFlatParser::TypeSpecifierContext* ctx,
+                              CFlatParser::MultiWordTypeSuffixContext* suffix);
+    // A function-type parameter spelled `T` with T bound to a fully pointee-const argument
+    // (`(const char)*`) keeps it as IsPointeeConst, the one const a FuncPtrParam carries.
+    void MarkSubstitutedPointeeConst(LLVMBackend::TypeAndValue::FuncPtrParam& p,
+        CFlatParser::TypeSpecifierContext* ctx, CFlatParser::MultiWordTypeSuffixContext* suffix,
+        int writtenStars)
+    {
+        if (writtenStars == 0 && p.Pointer
+            && SubstitutedConstDepth(ctx, suffix) >= std::max(p.PointerDepth, 1))
+            p.IsPointeeConst = true;
+    }
     std::string ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntryContext* entry);
 
     // Queue a generic instantiation for a known template (dedup via instantiatedGenerics).
@@ -7799,6 +8518,7 @@ public:
         llvm::Type* ValueType = nullptr;  // type of the operand's value (Primary), if any
         llvm::Type* BaseType = nullptr;
         bool HasValue = false;
+        bool IsStringLiteral = false;  // the value is a string literal's global
     };
     UnevaluatedOperandType EvaluateOperandTypeOnly(const std::function<LLVMBackend::NamedVariable()>& emit);
     // sizeof (isSizeof) or alignof of a resolved type, honoring struct-level alignas; i64 result.
