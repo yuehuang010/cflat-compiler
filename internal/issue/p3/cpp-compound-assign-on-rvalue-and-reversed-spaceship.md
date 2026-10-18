@@ -3,7 +3,7 @@
 PRE-EXISTING (T127 reviews 2 and 3; same on master).
 
 The reversed `<=>` relation item from this issue is fixed on master by
-`ae7b0174d14c8708fa447a260c66981a34c0ea5e` (T291). On 2026-10-17, the supplied
+`753d9b22f5510ebe3f31a1fd1962440ee9edd83e` (T291). On 2026-10-17, the supplied
 master executable matched clang for `0 < w`, `0 > w`, `0 <= w`, `0 >= w`, and
 `w < 0` with member/free operators, strong/partial/weak ordering, and a template
 class. Do not reopen that item without a new failing shape.

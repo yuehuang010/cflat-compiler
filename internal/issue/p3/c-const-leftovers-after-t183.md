@@ -8,3 +8,9 @@ Filed 2026-10-14 from the T183 Opus review (PRE-EXISTING). Repros scratch/repro_
    accepted (clang warns). Element pointee const not carried for arrays of pointers.
 3. `r_rs.a = 1` writes a const FIELD of a non-const C struct (clang errors); accepted, no crash.
 (`int* p = r_karr; *p = 9;` - pointer init drops const - is T184's scope.)
+
+Re-checked 2026-10-18 after const iteration 1 (master ecf28e477): items 1-3 still compile (c_r_memset, c_r_strcpy_dst,
+c_r_cflat_fn, c_r_parr_w, c_r_parr_pass, c_r_rs_a all rc 0). Iteration 1 covered CFlat-declared extern prototypes, C
+params and C struct fields, but not C header GLOBALS (`extern const int r_karr[3]`, `extern const int* r_parr[2]`) or a
+const field of a non-const C struct global. Fix direction: plan item 10 - CGlobalEntry::isConst (and element pointee const
+of global arrays) become ConstMask on the global's TypeAndValue, so phases 1-3 enforce them unchanged.

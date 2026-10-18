@@ -5,7 +5,7 @@ half-built lambda function in the module; RunMoveDataflow then aborts (SIGABRT).
 inside a lambda body (e.g. an undefined variable). Found by the const phase 1 implementer, 2026-10-17; the c01 legs
 moved to file-scope expect_error blocks to avoid it.
 
-Repro (scratch/repro_keep/const_c01/p/lam_ee.cb, verified on master e4e7fcf4c):
+Repro (scratch/repro_keep/const_c01/p/lam_ee.cb, verified on master b4b7e3448):
 `extern int main() { expect_error("Undefined variable zz") { Lambda<int()> f = () => { return zz + 1; }; } return 0; }`
 -> prints "PASS: expected error received", then the compiler crashes (rc 139; the implementer saw SIGABRT in
 RunMoveDataflow on its variant).

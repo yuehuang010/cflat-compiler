@@ -1,7 +1,7 @@
 # Explicit `(const char*)p` cast picks the mutable C++ overload
 
 Summary: with C++ overloads `pick(char*)` and `pick(const char*)`, CFlat `probe.pick((const char*)p)` (p a
-`char*`) selects `pick(char*)` (22); clang selects `pick(const char*)` (11). Pre-existing on master d3681293f,
+`char*`) selects `pick(char*)` (22); clang selects `pick(const char*)` (11). Pre-existing on master b4b7e3448,
 unchanged by const phase 0 (c00 review, 2026-10-17). Iteration 1 of the const plan is native-only; this is the
 C++ interop side (internal/plan/cflat-const.md phase 5).
 

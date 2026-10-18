@@ -5,29 +5,35 @@ R2 A, R3 B for now (inferred; trailing `func() const` later), R4 A, R5 A, R6 A, 
 place, R10 superseded, R11 whole-word spelling; interface method calls on a const receiver are
 allowed until trailing const lands. Review-draft legs (gitignored):
 scratch/const_iter1/const_section.cb (append to Test/test_basic.cb, call testConstWholeWord from main).
-PHASE 0 LANDED 2026-10-17 (0066755bf): spellings, ConstMask carry/cache/--symbol-dump, east const and
+PHASE 0 LANDED 2026-10-17 (b4b7e3448): spellings, ConstMask carry/cache/--symbol-dump, east const and
 '* const' refused everywhere; known limit: `const(function<...>)` wrapper does not resolve yet.
-PHASE 1 LANDED 2026-10-17 (1d37f660d): const objects read-only (#1 #4 #11 #12), &G, rodata scalar/array globals,
+PHASE 1 LANDED 2026-10-17 (b4b7e3448): const objects read-only (#1 #4 #11 #12), &G, rodata scalar/array globals,
 lexical const-local folding (dims, value generic args, captures). Struct globals stay mutable `global` until phase 4.
-PHASE 2 LANDED 2026-10-18 (904ee4fdd): const fields (#2), whole-assign refusal (#13), transitive const through a const
+PHASE 2 LANDED 2026-10-18 (b4b7e3448): const fields (#2), whole-assign refusal (#13), transitive const through a const
 struct's pointer fields (#4), field access through a pointer to const (#3, incl. call/ternary/union bases), explicit cast
 drops pointee const at member access, is_assignable(T) + guarded core containers (R5a). Left for phase 3: bare `*p`/`p[i]`,
 pointers copied out of const objects, `*((int*)box.p) = 2`. hpc/btree.cb and com.cb HResult<T> still assign live slots.
-PHASE 3 LANDED 2026-10-18 (0e443afcf): writes through a pointer to const at any level (#3); qualification conversions
+PHASE 3 LANDED 2026-10-18 (b4b7e3448): writes through a pointer to const at any level (#3); qualification conversions
 (#5 #6 #7 #16, C++ multi-level, void*, views, pointer aliases, compound pointer assign); C params compare their exact
 spelled levels; casts add or drop const; `using X = const W` parses. Deferred: overloads differing only in pointee const
 (R1 B: duplicate), function<> const params (p3 function-type-cannot-carry-pointee-const), string `_ptr` borrow cast
 (p3 string-ptr-drops-const-from-borrowed-literal, phase 6), C auto-extern return const (phase 5).
-PHASE 4 LANDED 2026-10-18 (fe983b97e): read-only methods inferred (receiver scan + fixed point over codegen's chosen
+PHASE 4 LANDED 2026-10-18 (ecf28e477): read-only methods inferred (receiver scan + fixed point over codegen's chosen
 overloads, return provenance; core cached as `cms`, cache v15); #8 on const receivers, deferred to module end (an
 expect_error scope owns its entries; its verdict waits for module end); const dtor-free non-owning struct globals are
 `constant`. Limits: a read-only method's alias/pointer RESULT is not const-qualified on a const receiver (needs trailing
 const, later iteration); pointer writes deeper than one level stay read-only (R11 one level).
-PHASE 6 LANDED 2026-10-18 (74ba23ec0): string literals are `(const char)*` (#3 #5 #6 #7 via the phase-3 predicate; auto
+PHASE 6 LANDED 2026-10-18 (ecf28e477): string literals are `(const char)*` (#3 #5 #6 #7 via the phase-3 predicate; auto
 deduces it); imported C struct fields keep their spelled pointee const (header cache v265); core/Test/example/test_libs and
 Windows-only sites migrated (static sweep, Windows not compiled - verify on the final Windows gate). Part B (string `_ptr`
 / `data()` const) stopped at its threshold: p3 string-ptr-drops-const-from-borrowed-literal.
-Written 2026-10-16 against master 6dcf38aee. Supersedes, once ruled, the
+PHASE 7 LANDED 2026-10-18 (ecf28e477): #14 (const on a generic type argument, incl. aliases naming a const word);
+`const T` whole-word per instantiation; pointee-const type args mangle distinctly (`.c<N>$`, existing symbols unchanged;
+depth-1 only); deduction keeps pointee const, strips top-level; doc/LANGUAGE.md "Const" section; review-draft remainder
+appended as testConstWholeWord. ITERATION 1 COMPLETE (phases 0-4, 6, 7). Open: phase 5 (C++ interop), trailing
+`func() const` + interface const methods (#9 #10 #15), is_const(T), C header globals / C auto-extern return const
+(p3 c-const-leftovers-after-t183 still reproduces), string `_ptr` (p3), function<> const params (p3), Windows gate.
+Written 2026-10-16 against master 753d9b22f. Supersedes, once ruled, the
 2026-08-26 "const stays unenforced" ruling and the "(CFlat exposes no const)" clause of the
 2026-09-27 C++-const ruling. Probes: `scratch/const_spike/p01-p19.cb`
 (gitignored; re-create from the repros below if gone).

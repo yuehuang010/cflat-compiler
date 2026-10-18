@@ -7,7 +7,7 @@ the explicit-move-nulls-source ruling already covers it.
    prints 0: `f` is not nulled after `move f` bound to a by-value C++ ctor parameter (c12_move_local.cb). Must print 1,
    as for a by-value function call argument.
 
-PREMISE CORRECTED 2026-10-15 (T270, verified by the main session on master 8bd415044): `move f` of a thin
+PREMISE CORRECTED 2026-10-15 (T270, verified by the main session on master 753d9b22f): `move f` of a thin
 `function<int(int)>` value nulls the source NOWHERE today - not into a by-value CFlat call argument (`take(move f)`),
 not into a local (`function<int(int)> k2 = move k;`); a `move` param read is refused "use of moved variable" instead.
 So the by-value C++ ctor case is one instance of a language-wide gap, not a C++-path bug. NEEDS RULING: should `move`
