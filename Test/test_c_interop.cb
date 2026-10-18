@@ -81,7 +81,6 @@ int my_inc_cb(int x) { return x + 1; }
 
 string abiStringGlobal = default;
 extern string abiExternStringValue() { return abiStringGlobal; }
-extern alias string abiExternAliasStringValue() { return abiStringGlobal; }
 // Taken as a function-pointer value below: an extern whose return is C-ABI lowered needs an
 // adapter thunk, while the CFlat sibling on the same signature must stay unwrapped.
 extern string abiExternStringOf(int n) { return abiStringGlobal; }
@@ -606,7 +605,6 @@ extern int main()
 
     abiStringGlobal = "hello".copy();
     if ((int)abiExternStringValue().length() != 5)      return 11;
-    if ((int)abiExternAliasStringValue().length() != 5) return 12;
     function<string(int)> abiFp = abiExternStringOf;
     string abiViaPtr = abiFp(0);
     if ((int)abiViaPtr.length() != 5)   return 13;   // extern string through function<>

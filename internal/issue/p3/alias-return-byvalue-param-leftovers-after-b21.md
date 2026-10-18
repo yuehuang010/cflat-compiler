@@ -25,10 +25,6 @@ Open:
 6. (P3, pre-existing on master, leaks not crashes; probes scratch/repro_keep/v2/rv2/) a conditional rebind
    of an alias local leaks the new value (r2.cb, r3b.cb, r5.cb - deliberate leak-over-double-free trade);
    a non-extern function value called with a temp argument leaks it (e3o.cb).
-8. (P3, pre-existing on master, rc 134; T216 review) a by-value string param rebound only through an
-   `alias` local still frees the caller's buffer: `int f(string s) { alias string a = s; a = "zzzz"; return
-   s.length(); }` (scratch/repro_keep/t216_aliasloc_repro.cb). T216's entry copy keys on whole-name stores;
-   CollectAddressAliasWholeNameStores tracks `&param` aliases but not `alias T a = param`.
 
 RULED 2026-10-01 (maintainer): item 5 RATIFIED - an extern "C" callee owns its by-value owning params; `ef(a)` moves `a` and a later read is "use of moved variable". No caller-side copy.
 
@@ -40,3 +36,8 @@ RULED 2026-10-01 (maintainer): item 5 RATIFIED - an extern "C" callee owns its b
   `alias string a = s` rebind (rc 134) disappears with it.
 - (item 3, btree `*p = namedAlias`) ON HOLD: no btree work until the maintainer reopens it. Leave the named-local form
   accepted as today.
+
+## T267 (landed 2026-10-15): spelled `alias string` refused in every position
+Still accepted, NEEDS RULING: `alias string[]`, `alias string?`, and `using S = string; alias S x;` (refusal keys on the
+spelled `string` keyword so a generic `alias T` with T=string stays legal; the alias-string diagnostics are now covered by
+generic-form legs).

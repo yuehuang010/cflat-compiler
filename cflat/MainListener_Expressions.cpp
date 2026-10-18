@@ -39,14 +39,6 @@ static auto ParseCxxFoldOperand(LLVMBackend* compiler, Parse&& parse)
     return parse();
 }
 
-static bool FieldInitializerIsSingleCall(CFlatParser::AssignmentExpressionContext* expr)
-{
-    if (expr == nullptr) return true;
-    const std::string text = expr->getText();
-    return !text.empty() && text.back() == ')' && text.find('?') == std::string::npos
-        && std::count(text.begin(), text.end(), '(') == 1;
-}
-
 /*
  * The type name of a built-in arithmetic result from its operand names, using the usual
  * arithmetic conversions. `long + 1` stays `long` even when LLVM shares its type with `i64`.
@@ -251,6 +243,15 @@ static bool IsStringLiteralText(std::string_view text)
         return text.size() >= 2 && text.front() == '"' && text.back() == '"';
 }
 
+// A CFlat arithmetic type name (signed and unsigned spelled apart; the name, not the width, says which).
+static bool IsCflatArithmeticName(const std::string& name)
+{
+    static const std::set<std::string> names = {
+        "bool", "char", "i8", "u8", "short", "i16", "u16", "int", "i32", "uint", "u32",
+        "long", "i64", "ulong", "u64", "float", "double" };
+    return names.count(name) != 0;
+}
+
 static std::string ScalarTypeNameForValue(llvm::Type* type)
 {
     if (type == nullptr) return std::string();
@@ -278,6 +279,19 @@ struct SpaceshipRelation { std::string_view spelling; int low; int high; };
 static constexpr std::array<SpaceshipRelation, 4> kSpaceshipRelations = {{
     { "<", -1, -1 }, { ">", 1, 1 }, { "<=", -1, 0 }, { ">=", 0, 1 }
 }};
+
+/*
+ * The reversed rewrite of `x @ y` is `0 @ (y <=> x)` - the same relation with 0 on the left -
+ * so the ordering must be read against the MIRROR relation's range: `x > y` reversed is
+ * `(y <=> x) < 0`, which is the "<" range. Returns the mirrored spelling.
+ */
+static std::string_view MirrorRelationSpelling(std::string_view op)
+{
+    if (op == "<") return ">";
+    if (op == ">") return "<";
+    if (op == "<=") return ">=";
+    return "<=";
+}
 
 static bool IsBinaryExpressionRuleWithOperator(antlr4::tree::ParseTree* node)
 {
@@ -498,7 +512,7 @@ bool MainListener::IsBondedClosureContainer(
     }
 
 // The expression is a whole call argument, possibly parenthesized: `f(c ? a : b)`, `f((c ? a : b))`.
-static bool IsCallArgumentThroughParens(antlr4::ParserRuleContext* ctx)
+bool MainListener::IsCallArgumentThroughParens(antlr4::ParserRuleContext* ctx)
 {
     for (auto* node = ctx->parent; node != nullptr; )
     {
@@ -2538,7 +2552,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             // enter the nontrivial special-member assignment path below.
             auto* assignedExpr = ctx->assignmentExpression();
             if (operatorText == "=" && assignedExpr != nullptr
-                && assignedExpr->getText() == "default"
+                && IsDefaultOnlyExpression(assignedExpr, false)
                 && !namedVar.TypeAndValue.Pointer
                 && compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName))
             {
@@ -2786,6 +2800,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 assignmentResult->Storage = destination;
                 assignmentResult->CallerName = namedVar.CallerName;
                 assignmentResult->FieldName = namedVar.FieldName;
+                assignmentResult->MovePathKey = namedVar.MovePathKey;
+                assignmentResult->MovePathHasDynamicIndex = namedVar.MovePathHasDynamicIndex;
                 return loaded;
             };
             const auto* assignmentClassInfo =
@@ -2826,7 +2842,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     const bool rhsTemporary = rhsPostfix != nullptr && !rhsPostfix->LeftParen().empty();
                     const bool rhsConstructor = assignCtx != nullptr
                         && ForeignCxxConstructArgs(assignCtx, tn) != nullptr;
-                    const bool rhsDefault = assignCtx != nullptr && assignCtx->getText() == "default";
+                    const bool rhsDefault = IsDefaultOnlyExpression(assignCtx, false);
                     // Created on demand by whichever of release/assignment is compiled first, so an
                     // assignment may precede the releasing function in source order.
                     auto* destinationGlobalLiveFlag = compiler->EnsureGlobalCxxLiveFlag(namedVar);
@@ -3035,10 +3051,33 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     }
                     // A `T&&` result (std.move(x)) is an xvalue: move-assign from the referent,
                     // which is neither a temporary to destroy here nor a CFlat variable to consume.
-                    const bool xvalueSource = !useMove && !adoptedRaw && rhsTemp == nullptr
-                        && !rhsDefault && compiler->IsCxxRvalueRefClassResult(rhsNV)
+                    // `z = k ? move a : move b;` joins two xvalues: clang move-assigns the selected arm's
+                    // object directly (no temp), so the join's storage is that object (T288).
+                    auto* assignTernaryArms = SoleTernaryExpression(assignCtx);
+                    // Narrow gate (T288 r3): only a bare name of a non-const, non-pointer local or
+                    // parameter counts. Fields, derefs, calls, indexes and const names keep master's path.
+                    auto plainMutableMoveArm = [&](antlr4::tree::ParseTree* arm) {
+                        auto* mv = TopLevelMoveExpression(arm);
+                        if (mv == nullptr || mv->unaryExpression() == nullptr) return false;
+                        const std::string name = mv->unaryExpression()->getText();
+                        if (!IsBareIdentifierText(name)) return false;
+                        auto* nv = compiler->FindLiveNamedVariable(name);
+                        return nv != nullptr && !nv->TypeAndValue.Pointer
+                            && !nv->TypeAndValue.IsCxxConstRef
+                            && compiler->CxxConstReceiverKind(*nv) == 0;
+                    };
+                    const bool bothArmsMovedJoin = !useMove && assignTernaryArms != nullptr
+                        && assignTernaryArms->expression() != nullptr
+                        && assignTernaryArms->conditionalExpression() != nullptr
+                        && plainMutableMoveArm(assignTernaryArms->expression()->assignmentExpression())
+                        && plainMutableMoveArm(assignTernaryArms->conditionalExpression());
+                    const bool movedJoinSource = bothArmsMovedJoin && !adoptedRaw && rhsTemp == nullptr
+                        && !rhsDefault && rhsNV.Storage != nullptr && !rhsNV.TypeAndValue.Pointer
                         && rhsNV.TypeAndValue.TypeName == tn;
-                    if (xvalueSource) sourceStorage = rhsNV.Primary;
+                    const bool xvalueSource = !useMove && !adoptedRaw && rhsTemp == nullptr
+                        && !rhsDefault && (compiler->IsCxxRvalueRefClassResult(rhsNV) || movedJoinSource)
+                        && rhsNV.TypeAndValue.TypeName == tn;
+                    if (xvalueSource) sourceStorage = movedJoinSource ? rhsNV.Storage : rhsNV.Primary;
                     std::string conversionRefusal;
                     /*
                      * A trivially copyable class admitted here only for its converting-ctor
@@ -3333,7 +3372,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         LLVMBackend::NamedVariable converted = rhsNV;
                         compiler->SetCurrentDebugLocation(ctx->getStart()->getLine());
                         switch (compiler->ConvertThroughCxxConvertingCtor(
-                                    converted, tn, nullptr, conversionRefusal))
+                                    converted, tn, nullptr, conversionRefusal,
+                                    /*directInit*/ false, /*allowScalarNarrowing*/ true))
                         {
                         case LLVMBackend::CxxConvertingCtorResult::Converted:
                             rhsNV = converted;
@@ -3608,6 +3648,18 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     {
                         compiler->MarkVariableUnmoved(namedVar.CallerName);
                         compiler->MarkVariableNotExplicitlyMovedNull(namedVar.CallerName);
+                    }
+                    // A '=' store re-initializes the destination field path (reviveStoredField, which
+                    // the finishStore tail runs); this foreign-class store returns before that tail.
+                    if (operatorText == "=" && !namedVar.FieldName.empty())
+                    {
+                        const std::string movePath = LLVMBackend::FieldMoveKey(namedVar);
+                        if (!movePath.empty())
+                        {
+                            movedf::ReviveFieldPath(namedVar.MovedFields, movePath);
+                            if (!namedVar.CallerName.empty())
+                                compiler->MarkVariableFieldUnmoved(namedVar.CallerName, movePath);
+                        }
                     }
                     return classAssignValue();
                 }
@@ -3962,6 +4014,16 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             }
             // Closes the '??=' assign arm and yields the destination's value at the join. Identity
             // for a plain '=', which has no arm to close.
+            // A '=' store re-initializes a destination field: revive its moved mark on the binding
+            // AND on the LHS copy taken at parse time, which later result loads read (`s.p = move o;`).
+            auto reviveStoredField = [&]() {
+                const std::string movePath = LLVMBackend::FieldMoveKey(namedVar);
+                if (operatorText != "=" || coalesceResume != nullptr || movePath.empty())
+                    return;
+                movedf::ReviveFieldPath(namedVar.MovedFields, movePath);
+                if (!namedVar.CallerName.empty())
+                    compiler->MarkVariableFieldUnmoved(namedVar.CallerName, movePath);
+            };
             auto finishStore = [&](llvm::Value* v) -> llvm::Value* {
                 llvm::Value* resultValue = v;
                 // A '=' store re-initializes a destination field path AFTER any source consume, so
@@ -3969,6 +4031,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 if (operatorText == "=" && !namedVar.FieldName.empty() && !namedVar.FieldPathText.empty()
                     && !namedVar.IsElementAccess)
                     compiler->RecordNullClear(namedVar.FieldPathText);
+                reviveStoredField();
                 if (coalesceResume == nullptr)
                 {
                     if (auto* store = llvm::dyn_cast_or_null<llvm::StoreInst>(v))
@@ -4006,6 +4069,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         assignmentResult->Storage = destination;
                         assignmentResult->CallerName = namedVar.CallerName;
                         assignmentResult->FieldName = namedVar.FieldName;
+                        assignmentResult->MovePathKey = namedVar.MovePathKey;
+                        assignmentResult->MovePathHasDynamicIndex = namedVar.MovePathHasDynamicIndex;
                         assignmentResult->IsOwning = true;
                         // Same provenance `T x = w` would see, so the borrow guards refuse
                         // `(h->f += 2)` exactly where they refuse `h->f`.
@@ -4089,6 +4154,16 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     !namedVar.TypeAndValue.Pointer && compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName));
                 return ParseAssignmentExpressionNamed(assignCtx);
             }();
+            const bool explicitMoveClosureBind = assignCtx != nullptr
+                && assignCtx->unaryExpression() != nullptr
+                && assignCtx->unaryExpression()->moveExpression() != nullptr;
+            if (operatorText == "=" && explicitMoveClosureBind
+                && compiler->FuncPtrFewerParamsCanAdapt(rightNV.TypeAndValue,
+                                                        namedVar.TypeAndValue))
+            {
+                rightNV.IsExplicitMove = true;
+                rightNV.IsRvalue = true;
+            }
             if (RefuseImmovableAssignSource(compiler, ctx, operatorText, rightNV)) return nullptr;
             // T203: `owner = raw = new T()` - the inner '=' left its local slot owning the object.
             // A unique destination takes that slot as its RHS, exactly as `owner = raw;` does.
@@ -4958,6 +5033,53 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     && (!rightNV.IsBorrowed
                         || (rightNV.BorrowedOrigin.empty()
                             && !compiler->IsFunctionParameter(rightNV.CallerName)));
+                // Assignment is declaration: a source the declaration refuses as borrowed (no owning
+                // flag on the value, the local, the arms of a join, or the RHS shape) is refused here
+                // too. A raw struct field, an implicit-this or global raw field, and a join with such an
+                // arm all reach this point without a field-shaped NamedVariable, so the test is the
+                // owning flags rather than the source's parse shape.
+                const bool declOwns = rightNV.IsOwning || rightNV.IsOwningStruct
+                    || rightNV.TypeAndValue.IsMove || rightNV.IsExplicitMove
+                    || compiler->lastOwningResult || srcIsOwnedPtrRhs || sourceIsUniqueField
+                    || (right != nullptr && (compiler->IsOwnedNewTemp(right) || compiler->FindOwnedReturnTemp(right) != nullptr
+                        || compiler->IsOwningPtrTempValue(right)
+                        || compiler->IsMovedOutPtrValue(right)
+                        || compiler->TernaryArmJoinsOwning(right)));
+                // Only a raw STRUCT FIELD source (a load through a field GEP of a non-unique struct, or
+                // a '?:' join with such an arm) is refused here. A raw local or a call result keeps the
+                // round-2 behavior: a plain-field accessor's result is adopted by design.
+                auto isRawFieldLoad = [&](llvm::Value* v) -> bool {
+                    auto* ld = llvm::dyn_cast_or_null<llvm::LoadInst>(v);
+                    if (ld == nullptr) return false;
+                    auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(ld->getPointerOperand());
+                    if (gep == nullptr) return false;
+                    auto* st = llvm::dyn_cast<llvm::StructType>(gep->getSourceElementType());
+                    return st != nullptr && st->hasName() && !compiler->IsCoreUniqueType(st->getName().str());
+                };
+                bool rawFieldSourced = isRawFieldLoad(right);
+                if (auto* joinPhi = llvm::dyn_cast_or_null<llvm::PHINode>(right))
+                    for (unsigned i = 0; i < joinPhi->getNumIncomingValues(); ++i)
+                        rawFieldSourced = rawFieldSourced || isRawFieldLoad(joinPhi->getIncomingValue(i));
+                if (unprovenRawValue && !declOwns && rawFieldSourced && !nullSource && !destinationIsField
+                    && !namedVar.CallerName.empty() && right != nullptr
+                    && !llvm::isa<llvm::ConstantPointerNull>(right) && !IsAllNullPhi(right))
+                {
+                    std::string uniqueType = SpellType(*compiler, namedVar.TypeAndValue);
+                    while (uniqueType.ends_with("*")) uniqueType.pop_back();
+                    const std::string srcName = rightNV.CallerName.empty()
+                        ? std::string() : rightNV.CallerName;
+                    if (srcName.empty())
+                        LogErrorContext(ctx, std::format(
+                            "cannot reset {} '{}' from a borrowed value - the source still owns it; "
+                            "use 'new', a 'move' expression, or a move-returning call",
+                            uniqueType, namedVar.CallerName));
+                    else
+                        LogErrorContext(ctx, std::format(
+                            "cannot reset {} '{}' from borrowed value '{}' - the source still owns it; "
+                            "use 'new', a 'move' expression, or a move-returning call",
+                            uniqueType, namedVar.CallerName, srcName));
+                    return finishStore(right);
+                }
                 if (srcIsOwnedForCoreUnique || sourceIsUniqueField || nullSource || unprovenRawValue)
                 {
                     LLVMBackend::NamedVariable resetArg = rightNV;
@@ -5124,6 +5246,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 }
                 compiler->lastOwningResult = false;
                 compiler->lastCallReturnsOwned = false;
+                // The result load reads the LHS copy, so revive it before the load, not in finishStore.
+                reviveStoredField();
                 return finishStore(LoadNamedVariable(namedVar));
             }
 
@@ -5186,7 +5310,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 std::string funcName = assignCtx->getText();
                 int expectedParams = (int)namedVar.TypeAndValue.FuncPtrParams.size();
                 if (llvm::isa<llvm::Function>(right))
-                    if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams, &namedVar.TypeAndValue.FuncPtrParams, &namedVar.TypeAndValue))
+                    if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams, &namedVar.TypeAndValue.FuncPtrParams, &namedVar.TypeAndValue, /*compareReturnOwnership*/ true))
                         right = correctFn;
                 if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
                 {
@@ -5203,7 +5327,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 && !rightNV.CallerName.empty())
             {
                 int expectedParams = (int)namedVar.TypeAndValue.FuncPtrParams.size();
-                llvm::Function* genericFn = compiler->GetFunctionForFuncPtr(rightNV.CallerName, expectedParams, &namedVar.TypeAndValue.FuncPtrParams, &namedVar.TypeAndValue);
+                llvm::Function* genericFn = compiler->GetFunctionForFuncPtr(rightNV.CallerName, expectedParams, &namedVar.TypeAndValue.FuncPtrParams, &namedVar.TypeAndValue, /*compareReturnOwnership*/ true);
                 if (genericFn)
                 {
                     VerifyFuncPtrAssignmentMoveFlags(rightNV.CallerName, namedVar.TypeAndValue, ctx);
@@ -5286,26 +5410,18 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                                 : std::format("'{}.{}'", namedVar.CallerName, namedVar.FieldName));
                 }
             }
-            // Funcptr-to-funcptr assignment: per-param IsMove flags must agree on both sides.
+            // Funcptr-to-funcptr assignment, thin AND fat: return ownership and per-param IsMove flags must agree.
+            LLVMBackend::TypeAndValue assignValueSig = rightNV.TypeAndValue;
+            if (assignValueSig.FuncPtrReturnTypeName.empty() && !assignValueSig.Pointer)
+                if (const auto* enc = compiler->GetEncodedClosureType(assignValueSig.TypeName))
+                    assignValueSig = *enc;
             if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer
-                && rightNV.TypeAndValue.IsFunctionPointer
-                && right && right->getType()->isStructTy())
+                && assignValueSig.IsFunctionPointer && right)
             {
-                const auto& lhsP = namedVar.TypeAndValue.FuncPtrParams;
-                const auto& rhsP = rightNV.TypeAndValue.FuncPtrParams;
-                if (lhsP.size() == rhsP.size())
-                {
-                    for (size_t i = 0; i < lhsP.size(); i++)
-                    {
-                        if (!compiler->FuncPtrParamMoveAgrees(lhsP[i], rhsP[i]))
-                        {
-                            LogErrorContext(ctx, std::format(
-                                "incompatible function pointer assignment: parameter {} differs in 'move' modifier - 'move' is part of the function-pointer type",
-                                i + 1));
-                            break;
-                        }
-                    }
-                }
+                if (std::string why = compiler->FuncPtrValueOwnershipReason(
+                        assignValueSig, namedVar.TypeAndValue); !why.empty())
+                    LogErrorContext(ctx, std::format(
+                        "incompatible function pointer assignment: {}", why));
             }
 
             // Variadic-ness and the bind rule are part of a function-pointer type, whatever the representation.
@@ -5315,10 +5431,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 if (const auto* enc = compiler->GetEncodedClosureType(assignSlotSig.TypeName))
                     assignSlotSig = *enc;
             if (operatorText == "=" && assignSlotSig.IsFunctionPointer
-                && rightNV.TypeAndValue.IsFunctionPointer && right)
+                && assignValueSig.IsFunctionPointer && right)
             {
+                if (compiler->ClosureValueCanAdaptToSlot(rightNV, assignSlotSig))
+                    right = compiler->AdaptClosureValueToSlot(right, rightNV, assignSlotSig);
                 if (std::string why = compiler->DescribeFuncPtrValueMismatch(
-                        assignSlotSig, rightNV.TypeAndValue); !why.empty())
+                        assignSlotSig, rightNV); !why.empty())
                     LogErrorContext(ctx, why);
             }
 
@@ -5849,6 +5967,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     assignmentResult->Storage = destination;
                     assignmentResult->CallerName = namedVar.CallerName;
                     assignmentResult->FieldName = namedVar.FieldName;
+                    assignmentResult->MovePathKey = namedVar.MovePathKey;
+                    assignmentResult->MovePathHasDynamicIndex = namedVar.MovePathHasDynamicIndex;
                 }
                 return stored;
             }
@@ -6007,6 +6127,17 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             if (operatorText == "=" && right && right->getType()->isStructTy() && destIsClosureFat)
             {
                 right = CloneClosureFromNamedSource(rightNV, right, ctx);
+                if (auto* destMeta = compiler->FindStackVariableByStorage(destination))
+                {
+                    const bool envKnownFree = (rightNV.ClosureEnvKnownFree
+                            && !rightNV.ClosureEnvProvenanceTainted)
+                        || llvm::isa_and_nonnull<llvm::Function>(rightNV.Primary)
+                        || compiler->ClosureIsStaticallyNonCapturing(right);
+                    destMeta->ClosureEnvProvenanceTainted =
+                        destMeta->ClosureEnvProvenanceTainted || !envKnownFree;
+                    destMeta->ClosureEnvKnownFree =
+                        envKnownFree && !destMeta->ClosureEnvProvenanceTainted;
+                }
                 // CFlat value-type method receivers are constructed with null closure fields.
                 // Free the old env only for initialized slots; another heap pointer may be raw.
                 // The clone above reads the SOURCE env first, so a self-assign (`f = f`) is safe:
@@ -6228,7 +6359,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             {
                 const std::string& loweredType = namedVar.TypeAndValue.TypeName;
                 bool useMove = rightNV.TypeAndValue.IsMove || rightNV.IsExplicitMove;
-                bool fromTemp = false;
+                bool fromTemp = IsDefaultOnlyExpression(assignCtx);
                 llvm::Value* source = rightNV.Storage;
                 if (source == nullptr && right == compiler->lastLoweredRetValue_
                     && compiler->lastLoweredRetTemp_ != nullptr)
@@ -7643,9 +7774,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             // Reassignment to a moved variable (or field) makes it live again.
             if (operatorText == "=" && !namedVar.CallerName.empty())
             {
-                if (!namedVar.FieldName.empty())
-                    compiler->MarkVariableFieldUnmoved(namedVar.CallerName, namedVar.FieldName);
-                else
+                if (const std::string movePath = LLVMBackend::FieldMoveKey(namedVar);
+                    !movePath.empty())
+                    compiler->MarkVariableFieldUnmoved(namedVar.CallerName, movePath);
+                else if (!namedVar.IsElementAccess && namedVar.FieldName.empty()
+                    && namedVar.OwningStructName.empty())
                 {
                     compiler->MarkVariableUnmoved(namedVar.CallerName);
                     compiler->MarkVariableNotExplicitlyMovedNull(namedVar.CallerName);
@@ -7796,27 +7929,29 @@ LLVMBackend::TypedValue MainListener::ParseTernaryArmExpression(
         return tv;
 }
 
-bool MainListener::IsDefaultOnlyExpression(antlr4::ParserRuleContext* ctx) const {
+bool MainListener::IsDefaultOnlyExpression(antlr4::ParserRuleContext* ctx,
+        bool allowParentheses) const {
         if (ctx == nullptr) return false;
-        std::string text = ctx->getText();
-        while (text.size() >= 2 && text.front() == '(' && text.back() == ')')
-        {
-            int depth = 0;
-            bool wrapsAll = true;
-            for (size_t i = 0; i < text.size(); i++)
-            {
-                if (text[i] == '(') depth++;
-                else if (text[i] == ')' && --depth == 0 && i + 1 != text.size())
+        bool sawDefault = false;
+        std::function<bool(antlr4::tree::ParseTree*)> onlyDefault =
+            [&](antlr4::tree::ParseTree* node) {
+                if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(node))
                 {
-                    wrapsAll = false;
-                    break;
+                    const size_t tokenType = terminal->getSymbol()->getType();
+                    if (tokenType == CFlatParser::Default && !sawDefault)
+                    {
+                        sawDefault = true;
+                        return true;
+                    }
+                    return allowParentheses && (tokenType == CFlatParser::LeftParen
+                        || tokenType == CFlatParser::RightParen);
                 }
-            }
-            if (!wrapsAll || depth != 0) break;
-            text = text.substr(1, text.size() - 2);
-        }
-        return text == "default";
-    }
+                for (auto* child : node->children)
+                    if (!onlyDefault(child)) return false;
+                return true;
+            };
+        return onlyDefault(ctx) && sawDefault;
+}
 
 /*
  * A view read out of a struct FIELD names no declared slot, so recover the element from the
@@ -10720,13 +10855,17 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                     result.conditionalMoveSources))
                 return;
             if (inCallArgument_ && value->getType()->isPointerTy()
-                && !shape.sourceFieldName.empty() && !shape.sourceIsElementAccess)
+                && (!shape.sourceMovePathKey.empty()
+                    || (!shape.sourceFieldName.empty() && !shape.sourceIsElementAccess)))
             {
                 auto* fieldAddr = llvm::dyn_cast<llvm::GetElementPtrInst>(storage);
                 if (fieldAddr != nullptr && compiler->IsOwningFieldAddress(fieldAddr))
                 {
                     result.conditionalMoveSources.push_back({ storage, value->getType(), armBlock,
                         sourceName, shape.sourceFieldName, false });
+                    result.conditionalMoveSources.back().MovePathKey = shape.sourceMovePathKey;
+                    result.conditionalMoveSources.back().MovePathHasDynamicIndex =
+                        shape.sourceMovePathHasDynamicIndex;
                     result.conditionalMoveSources.back().MoveParamSinkArgument = true;
                     return;
                 }
@@ -10737,6 +10876,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 || (!coreUniqueSource && compiler->IsCopyableType(typeName))) return;
             result.conditionalMoveSources.push_back({ storage, value->getType(), armBlock,
                 sourceName, shape.sourceFieldName, shape.sourceIsElementAccess });
+            result.conditionalMoveSources.back().MovePathKey = shape.sourceMovePathKey;
+            result.conditionalMoveSources.back().MovePathHasDynamicIndex =
+                shape.sourceMovePathHasDynamicIndex;
             result.conditionalMoveSources.back().MoveParamSinkArgument = inCallArgument_;
         };
         collectConditionalMoveSources(trueShape, trueValue, trueStorage, trueEnd,
@@ -11734,13 +11876,16 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
                                                            true, true, accumulatorIsRvalue, rv.isRvalue,
                                                            acc == lv.value ? lv.sourceTypeName
                                                                            : std::string(),
-                                                           rv.sourceTypeName, 0, false, {}, {},
+                                                           rv.sourceTypeName,
+                                                           acc == lv.value ? lv.pointerDepth : 0,
+                                                           acc == lv.value && lv.elemPointer, {}, {},
                                                            false, {}, {}, false, {}, {},
                                                            rv.cxxPointeeConst,
                                                            acc == lv.value ? lv.cxxArithIdentity : std::string(),
                                                            rv.cxxArithIdentity, rv.isExplicitMove, acc == lv.value && lv.isExplicitMove,
                                                            acc == lv.value && lv.hasSourceType && lv.sourceType.IsCxxNullptrT,
-                                                           rv.hasSourceType && rv.sourceType.IsCxxNullptrT);
+                                                           rv.hasSourceType && rv.sourceType.IsCxxNullptrT,
+                                                           false, acc == lv.value && lv.cxxPointeeConst);
                 if (overload == nullptr && acc != nullptr && rv.value != nullptr
                     && (acc->getType()->isStructTy() || rv.value->getType()->isStructTy()))
                     LogErrorContext(ctx, "no overload of 'operator|' matches the given arguments.");
@@ -11828,13 +11973,16 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
                                                            true, true, accumulatorIsRvalue, rv.isRvalue,
                                                            acc == lv.value ? lv.sourceTypeName
                                                                            : std::string(),
-                                                           rv.sourceTypeName, 0, false, {}, {},
+                                                           rv.sourceTypeName,
+                                                           acc == lv.value ? lv.pointerDepth : 0,
+                                                           acc == lv.value && lv.elemPointer, {}, {},
                                                            false, {}, {}, false, {}, {},
                                                            rv.cxxPointeeConst,
                                                            acc == lv.value ? lv.cxxArithIdentity : std::string(),
                                                            rv.cxxArithIdentity, rv.isExplicitMove, acc == lv.value && lv.isExplicitMove,
                                                            acc == lv.value && lv.hasSourceType && lv.sourceType.IsCxxNullptrT,
-                                                           rv.hasSourceType && rv.sourceType.IsCxxNullptrT);
+                                                           rv.hasSourceType && rv.sourceType.IsCxxNullptrT,
+                                                           false, acc == lv.value && lv.cxxPointeeConst);
                 if (overload == nullptr && acc != nullptr && rv.value != nullptr
                     && (acc->getType()->isStructTy() || rv.value->getType()->isStructTy()))
                     LogErrorContext(ctx, "no overload of 'operator^' matches the given arguments.");
@@ -12054,13 +12202,16 @@ LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpress
                                                            true, true, accumulatorIsRvalue, rv.isRvalue,
                                                            acc == lv.value ? lv.sourceTypeName
                                                                            : std::string(),
-                                                           rv.sourceTypeName, 0, false, {}, {},
+                                                           rv.sourceTypeName,
+                                                           acc == lv.value ? lv.pointerDepth : 0,
+                                                           acc == lv.value && lv.elemPointer, {}, {},
                                                            false, {}, {}, false, {}, {},
                                                            rv.cxxPointeeConst,
                                                            acc == lv.value ? lv.cxxArithIdentity : std::string(),
                                                            rv.cxxArithIdentity, rv.isExplicitMove, acc == lv.value && lv.isExplicitMove,
                                                            acc == lv.value && lv.hasSourceType && lv.sourceType.IsCxxNullptrT,
-                                                           rv.hasSourceType && rv.sourceType.IsCxxNullptrT);
+                                                           rv.hasSourceType && rv.sourceType.IsCxxNullptrT,
+                                                           false, acc == lv.value && lv.cxxPointeeConst);
                 if (overload == nullptr && acc != nullptr && rv.value != nullptr
                     && (acc->getType()->isStructTy() || rv.value->getType()->isStructTy()))
                     LogErrorContext(ctx, "no overload of 'operator&' matches the given arguments.");
@@ -12137,6 +12288,19 @@ LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::Equal
         }
         else if (nextCtxs.size() == 2)
         {
+            // Each operand's moved-slot value reads are deferred (CheckMovedValueRead); the operand
+            // result decides below which of them is exempt. Receiver and dereference uses never defer.
+            auto parseOperand = [&](CFlatParser::TypeCheckExpressionContext* operand,
+                                    std::vector<DeferredMovedRead>& deferred) {
+                struct RestoreSink
+                {
+                    std::vector<DeferredMovedRead>*& sink;
+                    std::vector<DeferredMovedRead>* saved;
+                    ~RestoreSink() { sink = saved; }
+                } restore{ deferredMovedReads_, deferredMovedReads_ };
+                deferredMovedReads_ = &deferred;
+                return ParseTypeCheckExpression(operand, ResultUse::Value);
+            };
             // Clear lastCallReturnsOwned before each operand: a prior operand would leave it set
             // and the next (possibly a named variable) would be mis-registered and double-freed.
             // Each owned-string operand that is a call result is a temporary the comparison only
@@ -12144,15 +12308,44 @@ LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::Equal
             // An owning-POINTER operand (`makePtr() != nullptr`) is the same shape: the comparison
             // yields a bool, so the pointer cannot escape and the temp is freed at the same point.
             Compiler(ctx)->lastCallReturnsOwned = false;
-            auto lv = ParseTypeCheckExpression(nextCtxs[0], ResultUse::Value);
+            std::vector<DeferredMovedRead> lvMovedReads, rvMovedReads;
+            auto lv = parseOperand(nextCtxs[0], lvMovedReads);
             NormalizeCxxReferenceOperand(ctx, lv);
             RegisterBorrowedStringOperandTemp(Compiler(ctx), lv.value);
             Compiler(ctx)->RegisterOwnedPtrTemp(lv.value);
             Compiler(ctx)->lastCallReturnsOwned = false;
-            auto rv = ParseTypeCheckExpression(nextCtxs[1], ResultUse::Value);
+            auto rv = parseOperand(nextCtxs[1], rvMovedReads);
             NormalizeCxxReferenceOperand(ctx, rv);
             RegisterBorrowedStringOperandTemp(Compiler(ctx), rv.value);
             Compiler(ctx)->RegisterOwnedPtrTemp(rv.value);
+            // A moved slot compared with the null constant is exempt only when the operand IS that
+            // slot's load (`a[0] == nullptr`, `o.a[0].p == (nullptr)`). A read beneath the operand
+            // (`a[0]->next`, a call argument) keeps its check. Decided on the resolved values only.
+            const bool lvIsNull = llvm::isa_and_nonnull<llvm::ConstantPointerNull>(lv.value);
+            const bool rvIsNull = llvm::isa_and_nonnull<llvm::ConstantPointerNull>(rv.value);
+            auto settleMovedReads = [&](const std::vector<DeferredMovedRead>& reads,
+                                        const LLVMBackend::TypedValue& operand, bool otherIsNull) {
+                // Pointer-to-pointer casts keep the slot's value: compare through them, never through a
+                // dereference or a non-pointer cast (those are new values, not the read's value).
+                auto stripPointerCasts = [](llvm::Value* v) {
+                    while (auto* cast = llvm::dyn_cast_or_null<llvm::BitCastInst>(v))
+                    {
+                        if (!cast->getSrcTy()->isPointerTy() || !cast->getDestTy()->isPointerTy()) break;
+                        v = cast->getOperand(0);
+                    }
+                    return v;
+                };
+                llvm::Value* whole = stripPointerCasts(operand.value);
+                for (const auto& read : reads)
+                {
+                    const bool wholeOperand = read.ownSlot && read.value != nullptr && whole != nullptr
+                        && whole == stripPointerCasts(read.value);
+                    if (!(otherIsNull && wholeOperand))
+                        LogMovedUse(read.subject, read.line, read.column);
+                }
+            };
+            settleMovedReads(lvMovedReads, lv, rvIsNull);
+            settleMovedReads(rvMovedReads, rv, lvIsNull);
             std::string op = ctx->children[1]->getText();
 
             Compiler(ctx)->RejectImplicitIntegerPointeePointerConversion(
@@ -12251,7 +12444,8 @@ LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::Equal
                                                        {}, {}, false, {}, {}, false, {}, {},
                                                        rv.cxxPointeeConst, lv.cxxArithIdentity, rv.cxxArithIdentity, rv.isExplicitMove, lv.isExplicitMove,
                                                        lv.hasSourceType && lv.sourceType.IsCxxNullptrT,
-                                                       rv.hasSourceType && rv.sourceType.IsCxxNullptrT);
+                                                       rv.hasSourceType && rv.sourceType.IsCxxNullptrT,
+                                                       false, lv.cxxPointeeConst);
             if (overload)
             {
                 LLVMBackend::NamedVariable resultNV;
@@ -12316,6 +12510,8 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         result.sourceCallerName = namedVar.CallerName.empty()
             ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
         result.sourceFieldName = namedVar.FieldName;
+        result.sourceMovePathKey = namedVar.MovePathKey;
+        result.sourceMovePathHasDynamicIndex = namedVar.MovePathHasDynamicIndex;
         result.sourceIsElementAccess = namedVar.IsElementAccess;
         result.conditionalMoveSources = namedVar.ConditionalMoveSources;
         // An explicit `move` of a C++ record is an xvalue: it binds an rvalue reference as a temp.
@@ -13041,7 +13237,8 @@ LLVMBackend::TypedValue MainListener::ParseRelationalExpression(CFlatParser::Rel
                                                        {}, {}, false, {}, {}, false, {}, {},
                                                        rv.cxxPointeeConst, lv.cxxArithIdentity, rv.cxxArithIdentity, rv.isExplicitMove, lv.isExplicitMove,
                                                        lv.hasSourceType && lv.sourceType.IsCxxNullptrT,
-                                                       rv.hasSourceType && rv.sourceType.IsCxxNullptrT);
+                                                       rv.hasSourceType && rv.sourceType.IsCxxNullptrT,
+                                                       false, lv.cxxPointeeConst);
             if (overload)
             {
                 LLVMBackend::NamedVariable resultNV;
@@ -13704,10 +13901,12 @@ MainListener::ShiftPairResult MainListener::ParseShiftPair(
                         lv.value, op, rv.value, ctx, lv.elemType, rv.pointerDepth,
                         rv.elemPointer, lhsStorage, rhsStorage, false, true,
                         lv.isRvalue, rv.isRvalue, lv.sourceTypeName, rv.sourceTypeName,
-                        0, false, {}, {}, false, rv.sourceCallerName, {}, false, {}, {},
+                        lv.pointerDepth, lv.elemPointer, {}, {}, false,
+                        rv.sourceCallerName, {}, false, {}, {},
                         rv.cxxPointeeConst, lv.cxxArithIdentity, rv.cxxArithIdentity, rv.isExplicitMove, lv.isExplicitMove,
                         lv.hasSourceType && lv.sourceType.IsCxxNullptrT,
-                        rv.hasSourceType && rv.sourceType.IsCxxNullptrT);
+                        rv.hasSourceType && rv.sourceType.IsCxxNullptrT,
+                        false, lv.cxxPointeeConst);
                 if (overload != nullptr)
                 {
                     LLVMBackend::NamedVariable resultNV;
@@ -14104,7 +14303,8 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                                                                leftArith,
                                                                rv.cxxArithIdentity, rv.isExplicitMove, lvalue == lv.value && lv.isExplicitMove,
                                                                lvalue == lv.value && lv.hasSourceType && lv.sourceType.IsCxxNullptrT,
-                                                               rv.hasSourceType && rv.sourceType.IsCxxNullptrT);
+                                                               rv.hasSourceType && rv.sourceType.IsCxxNullptrT,
+                                                               false, lvalue == lv.value && lv.cxxPointeeConst);
 
                 // char* + char* concatenation: TryBinaryOperatorOverload dispatches off a struct lvalue
                     // and can't reach raw i8*; both must qualify as c-strings so int* + int* still errors.
@@ -14318,24 +14518,54 @@ LLVMBackend::NamedVariable MainListener::LowerSpanElementAccess(
         return elem;
     }
 
+// A dereference or member use of a receiver is never exempt: `a[0]->next` reads through the moved value.
 void MainListener::CheckMovedReceiver(const LLVMBackend::NamedVariable& receiver)
 {
-        if (receiver.IdentifierLine > 0 && !receiver.IsElementAccess)
+        CheckMovedUse(receiver, nullptr, nullptr);
+    }
+
+void MainListener::CheckMovedValueRead(const LLVMBackend::NamedVariable& nv, llvm::Value* readValue)
+{
+        CheckMovedUse(nv, deferredMovedReads_, readValue);
+    }
+
+void MainListener::CheckMovedUse(const LLVMBackend::NamedVariable& receiver,
+                                 std::vector<DeferredMovedRead>* deferred, llvm::Value* readValue)
+{
+        const std::string movePath = LLVMBackend::FieldMoveKey(receiver);
+        if (receiver.IdentifierLine > 0
+            && (!receiver.IsElementAccess || !LLVMBackend::FieldMoveKey(receiver).empty()))
         {
-            Compiler()->RecordMoveUse(receiver.CallerName, receiver.FieldName,
+            Compiler()->RecordMoveUse(receiver.CallerName, movePath,
                                       receiver.IdentifierLine, receiver.IdentifierColumn);
             if (auto moved = Compiler()->MovedUseSubject(receiver); !moved.empty())
             {
-                Compiler()->currentLine = receiver.IdentifierLine;
-                Compiler()->currentColumn = receiver.IdentifierColumn;
-                Compiler()->LogError(std::format("use of moved variable '{}'", moved));
+                if (deferred != nullptr)
+                {
+                    // Exempt only a T281 element path (`a[K]`, `o.a[K].p`): a plain moved field keeps master's refusal.
+                    const bool ownSlot = receiver.MovePathKey.find(']') != std::string::npos
+                        && !movePath.empty() && moved == movedf::DisplayPath(receiver.CallerName, movePath);
+                    deferred->push_back({ readValue, moved,
+                                          receiver.IdentifierLine, receiver.IdentifierColumn, ownSlot });
+                    return;
+                }
+                LogMovedUse(moved, receiver.IdentifierLine, receiver.IdentifierColumn);
             }
         }
+    }
+
+void MainListener::LogMovedUse(const std::string& subject, int line, int column)
+{
+        Compiler()->currentLine = line;
+        Compiler()->currentColumn = column;
+        Compiler()->LogError(std::format("use of moved variable '{}'", subject));
     }
 
 llvm::Value* MainListener::LoadNamedVariable(LLVMBackend::NamedVariable& namedVar) {
         auto* compiler = Compiler();
         llvm::Value* result = LoadNamedVariableImpl(namedVar);
+        // The moved check sees the value the read produced: a cast or comparison operand matches by identity.
+        CheckMovedValueRead(namedVar, result);
         if (result != nullptr && namedVar.TypeAndValue.IsFatInterfaceValue()
             && !namedVar.TypeAndValue.Pointer)
             compiler->RegisterFatInterfaceValueTypeName(result, namedVar.TypeAndValue.TypeName);
@@ -14367,7 +14597,6 @@ llvm::Value* MainListener::LoadNamedVariableImpl(LLVMBackend::NamedVariable& nam
         // A consumed `unique` field path reads as null; the read is a guard for its null state.
         if (std::string key = compiler->UniqueFieldNullKey(namedVar); !key.empty())
             compiler->RecordNullRead(key);
-        CheckMovedReceiver(namedVar);
         if (namedVar.TypeAndValue.Pointer)
         {
             if (namedVar.Primary != nullptr)
@@ -14567,6 +14796,8 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
                                                 constOperand || constPrvalue,
                                                 operandSource != nullptr && operandSource->IsExplicitMove,
                                                 constPrvalue);
+        // The viable members that beat every free candidate; the member call is dispatched over these only.
+        std::vector<std::string> cxxPinnedMembers;
         if (compiler->IsCxxRecord(typeName))
         {
             compiler->TryBindCxxFunction(cxxFreeSourceName);
@@ -14757,6 +14988,9 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
                                                     constOperand,
                                                     operandSource != nullptr && operandSource->IsExplicitMove,
                                                     constPrvalue);
+            // Member wins over every free: the member call must not re-rank the free candidates by name.
+            for (const auto* member : zeroArgMembers)
+                cxxPinnedMembers.push_back(member->UniqueName);
         }
 
         // Determine whether to pass the operand by pointer or by value.
@@ -14821,6 +15055,7 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
             thisNV.TypeAndValue.IsCxxPointeeConst = constOperand;
             thisNV.TypeAndValue.IsCxxPointeeVolatile = volatileOperand;
             thisNV.IsCxxUnaryOperatorReceiver = true;
+            thisNV.CxxPinnedMemberNames = cxxPinnedMembers;
             thisNV.Primary = tempAlloca;
             // An lvalue receiver lets C++ pick the non-const overload.
             if (tempAlloca == operandStorage) thisNV.Storage = operandStorage;
@@ -14852,6 +15087,7 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
             thisNV.Primary  = operand;
             thisNV.BaseType = structTy;
             thisNV.IsCxxUnaryOperatorReceiver = true;
+            thisNV.CxxPinnedMemberNames = cxxPinnedMembers;
             thisNV.TernaryTempAlreadyRegistered = receiverTempAlreadyRegistered;
             thisNV.IsExplicitMove = receiverIsFreeParam && operandExplicitMove;
             // The receiver's value category decides which C++ overload binds (`S&` vs `S&&`).
@@ -14870,6 +15106,8 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
                     ? operandSource->TypeAndValue.ParentVariableName
                     : operandSource->CallerName;
                 thisNV.FieldName = operandSource->FieldName;
+                thisNV.MovePathKey = operandSource->MovePathKey;
+                thisNV.MovePathHasDynamicIndex = operandSource->MovePathHasDynamicIndex;
                 thisNV.OwningStructName = operandSource->OwningStructName;
                 thisNV.IsElementAccess = operandSource->IsElementAccess;
                 thisNV.ConditionalMoveSources = operandSource->ConditionalMoveSources;
@@ -14899,7 +15137,7 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
             if (!consumedSource.empty())
             {
                 if (!thisNV.FieldName.empty())
-                    compiler->MarkVariableFieldMoved(consumedSource, thisNV.FieldName);
+                    compiler->MarkVariableFieldMoved(consumedSource, LLVMBackend::FieldMoveKey(thisNV));
                 else if (!thisNV.IsElementAccess)
                     compiler->MarkVariableMoved(consumedSource);
             }
@@ -15417,7 +15655,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         bool rhsCxxPointeeConst, const std::string& lhsArithIdentity,
         const std::string& rhsArithIdentity,
         bool rhsExplicitMove, bool lhsExplicitMove,
-        bool lhsCxxNullptrT, bool rhsCxxNullptrT, bool lhsMaterializedPrvalue) {
+        bool lhsCxxNullptrT, bool rhsCxxNullptrT, bool lhsMaterializedPrvalue,
+        bool lhsCxxPointeeConst) {
         auto* compiler = Compiler(ctx);
         if (!lvalue) return nullptr;
         struct RewriteDepthScope
@@ -15547,7 +15786,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 lhsIsRvalue, rhsIsRvalue,
                                                         lhsTypeName, rhsTypeName, lhsPointerDepth, lhsElemPointer,
                                                         {}, {}, false, {}, {}, false, {}, {}, rhsCxxPointeeConst, lhsArithIdentity, rhsArithIdentity, rhsExplicitMove, lhsExplicitMove,
-                                                        lhsCxxNullptrT, rhsCxxNullptrT, lhsMaterializedPrvalue);
+                                                        lhsCxxNullptrT, rhsCxxNullptrT,
+                                                        lhsMaterializedPrvalue, lhsCxxPointeeConst);
             if (eq == nullptr || !eq->getType()->isIntegerTy()) return nullptr;
             if (eq->getType()->isIntegerTy(1)) return compiler->builder->CreateNot(eq);
             return compiler->builder->CreateICmpEQ(eq,
@@ -16219,6 +16459,26 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                         leftArg.TypeAndValue.EnumBacking = compiler->GetEnumBackingType(enumKey);
                     }
                 }
+                if (leftInfo.second.empty() && lvalue != nullptr
+                    && lvalue->getType()->isPointerTy() && lhsPointerDepth >= 1)
+                {
+                    leftArg.TypeAndValue.Pointer = true;
+                    leftArg.TypeAndValue.PointerDepth = lhsPointerDepth;
+                    leftArg.TypeAndValue.ElemPointer = lhsElemPointer;
+                    if (LLVMBackend::IsPrimitiveTypeName(lhsTypeName))
+                    {
+                        leftArg.InferSourceTypeName = lhsTypeName;
+                        leftArg.TypeAndValue.IsCxxPointeeConst = lhsCxxPointeeConst;
+                    }
+                    else if (!rightInfo.second.empty()
+                             && compiler->IsCxxRecord(rightInfo.second)
+                             && compiler->IsCxxRecord(lhsTypeName))
+                    {
+                        leftArg.TypeAndValue.TypeName = lhsTypeName;
+                        leftArg.TypeAndValue.IsCxxPointeeConst = lhsCxxPointeeConst;
+                        leftArg.AllowCxxClassPointerCtorConversion = true;
+                    }
+                }
                 if (rightInfo.second.empty() && rvalue != nullptr)
                 {
                     // A scalar pointer names its pointee by its recorded depth, like a call argument.
@@ -16238,6 +16498,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                         {
                             rightArg.TypeAndValue.TypeName = rhsTypeName;
                             rightArg.TypeAndValue.IsCxxPointeeConst = rhsCxxPointeeConst;
+                            rightArg.AllowCxxClassPointerCtorConversion = true;
                         }
                     }
                     else if (rhsDepthUnproven && rightTypedPointer)
@@ -16385,13 +16646,22 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 if (op == candidate.spelling) { relation = &candidate; break; }
             if (relation == nullptr) return nullptr;
             RewriteDepthScope rewriteScope(cxxOperatorRewriteDepth_);
+            lastRewriteWasReversed_ = false;
             llvm::Value* ordering = TryBinaryOperatorOverload(
                 lvalue, "<=>", rvalue, ctx, lhsElemType, rhsPointerDepth, rhsElemPointer,
                 lhsStorage, rhsStorage, false, allowReversed, lhsIsRvalue, rhsIsRvalue,
                 lhsTypeName, rhsTypeName, lhsPointerDepth, lhsElemPointer,
                 {}, {}, false, {}, {}, false, {}, {}, rhsCxxPointeeConst, lhsArithIdentity, rhsArithIdentity, rhsExplicitMove, lhsExplicitMove,
-                lhsCxxNullptrT, rhsCxxNullptrT, lhsMaterializedPrvalue);
+                lhsCxxNullptrT, rhsCxxNullptrT, lhsMaterializedPrvalue,
+                lhsCxxPointeeConst);
             if (ordering == nullptr) return nullptr;
+            // The ordering came from `rvalue <=> lvalue`: the relation applies with 0 on the left.
+            if (lastRewriteWasReversed_)
+            {
+                const std::string_view mirror = MirrorRelationSpelling(op);
+                for (const auto& candidate : kSpaceshipRelations)
+                    if (mirror == candidate.spelling) relation = &candidate;
+            }
             // The type mapper lowers every comparison category to that single signed byte; a
             // one-field wrapper is unwrapped here for a `<=>` that returns something else. An
             // ordering laid out as an opaque one-byte BLOB (`{ [1 x i8] }`, which is how an
@@ -16436,14 +16706,19 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             };
             if (!isCxxOperand(lvalue) && !isCxxOperand(rvalue)) return nullptr;
             RewriteDepthScope rewriteScope(cxxOperatorRewriteDepth_);
-            return TryBinaryOperatorOverload(rvalue, op, lvalue, ctx, nullptr,
-                                             lhsPointerDepth, lhsElemPointer,
-                                             rhsStorage, lhsStorage, false, false,
-                                             rhsIsRvalue, lhsIsRvalue,
-                                             rhsTypeName, lhsTypeName,
-                                             rhsPointerDepth, rhsElemPointer,
-                {}, {}, false, {}, {}, false, {}, {}, false, rhsArithIdentity, lhsArithIdentity, lhsExplicitMove, rhsExplicitMove,
-                rhsCxxNullptrT, lhsCxxNullptrT);
+            llvm::Value* reversed = TryBinaryOperatorOverload(
+                rvalue, op, lvalue, ctx, nullptr,
+                lhsPointerDepth, lhsElemPointer,
+                rhsStorage, lhsStorage, false, false,
+                rhsIsRvalue, lhsIsRvalue,
+                rhsTypeName, lhsTypeName,
+                rhsPointerDepth, rhsElemPointer,
+                {}, {}, false, {}, {}, false, {}, {}, lhsCxxPointeeConst,
+                rhsArithIdentity, lhsArithIdentity, lhsExplicitMove, rhsExplicitMove,
+                rhsCxxNullptrT, lhsCxxNullptrT, false, rhsCxxPointeeConst);
+            // Read by rewriteFromSpaceship: its ordering is `rvalue <=> lvalue`.
+            if (reversed != nullptr) lastRewriteWasReversed_ = true;
+            return reversed;
         };
 
         // Every C++20 rewrite, in the order the standard considers them.
@@ -16588,8 +16863,10 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     allowReversed, lhsIsRvalue, rhsIsRvalue, lhsTypeName, rhsTypeName,
                     lhsPointerDepth, lhsElemPointer,
                     {}, {}, false, {}, {}, false, {}, {}, rhsCxxPointeeConst, lhsArithIdentity, rhsArithIdentity, rhsExplicitMove, lhsExplicitMove,
-                    lhsCxxNullptrT, rhsCxxNullptrT, lhsMaterializedPrvalue);
+                    lhsCxxNullptrT, rhsCxxNullptrT, lhsMaterializedPrvalue,
+                    lhsCxxPointeeConst);
             }
+            bool triedCxxComparisonRewrites = false;
             if (isCxxRecordValue(rvalue))
             {
                 if (adlDecides())
@@ -16597,10 +16874,16 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     if (llvm::Value* adl = tryFreeOperator(true)) return adl;
                 }
                 else if (llvm::Value* freeResult = tryFreeOperator()) return freeResult;
+                if (IsComparisonOperatorText(op))
+                {
+                    triedCxxComparisonRewrites = true;
+                    if (llvm::Value* rewritten = tryRewrites()) return rewritten;
+                }
             }
             if (auto* bound = TryPointerLhsOperatorOverload(lvalue, op, rvalue, ctx, lhsElemType))
                 return bound;
-            if (llvm::Value* rewritten = tryRewrites()) return rewritten;
+            if (!triedCxxComparisonRewrites)
+                if (llvm::Value* rewritten = tryRewrites()) return rewritten;
             return nullptr;
         }
 
@@ -16900,6 +17183,17 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             rightNV.IsElementAccess = rhsIsElementAccess;
             rightNV.ConditionalMoveSources = rhsConditionalMoves;
             rightNV.ForceOperatorConsume = rhsConsumes;
+            // A scalar variable or call result: its declared CFlat name is the proof (never the width),
+            // kept only when it lowers to the value's own type.
+            if (rightNV.CxxArithIdentity.empty() && rvalue != nullptr
+                && !rvalue->getType()->isStructTy() && !rvalue->getType()->isPointerTy()
+                && IsCflatArithmeticName(rhsTypeName))
+            {
+                LLVMBackend::TypeAndValue declared;
+                declared.TypeName = rhsTypeName;
+                if (compiler->GetType(declared, nullptr, false) == rvalue->getType())
+                    rightNV.CxxArithIdentity = rhsTypeName;
+            }
             if (rvalue && rvalue->getType()->isStructTy())
             {
                 auto* rst = llvm::cast<llvm::StructType>(rvalue->getType());
@@ -16977,6 +17271,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     {
                         rightNV.TypeAndValue.TypeName = rhsTypeName;
                         rightNV.TypeAndValue.IsCxxPointeeConst = rhsCxxPointeeConst;
+                        rightNV.AllowCxxClassPointerCtorConversion = true;
                     }
                 }
             }
@@ -17020,6 +17315,152 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
 
         auto rightNV = makeRightNV();
         if (rhsExplicitMove) rightNV.IsExplicitMove = true;
+        // C++ class receiver: members and frees compete on the whole argument list, as the unary rule does
+        // (T275). A free-only winner goes to the free path; a member winner pins the member set; a member
+        // and a free that tie are ambiguous (clang). Not inside a C++20 rewrite (operands are reversed).
+        std::vector<std::string> cxxPinnedMembers;
+        int8_t receiverCategory = -1;
+        bool receiverRvalue = lhsIsRvalue;
+        // Plain binary operators only: `=` and the compound assignments keep their own member rules.
+        const bool plainBinaryOperator = op == "==" || op == "!=" || op == "<=" || op == ">="
+            || (op != "=" && (op.back() != '=' || op.size() == 1));
+        if (plainBinaryOperator && compiler->IsCxxRecord(typeName) && cxxOperatorRewriteDepth_ == 0)
+        {
+            std::vector<antlr4::ParserRuleContext*> operandRules;
+            for (auto* child : ctx->children)
+                if (auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(child))
+                    operandRules.push_back(rule);
+            if (operandRules.size() == 2)
+            {
+                receiverCategory = CxxArgumentLvalueKind(operandRules[0]);
+                if (receiverCategory == 1) receiverRvalue = false;
+                else if (receiverCategory == 0) receiverRvalue = true;
+            }
+            // Namespace-scope frees are bound lazily under "ns.operatorX"; bind them before ranking.
+            std::vector<std::string> tables = { opName };
+            {
+                const std::string base = typeName.substr(0, typeName.find('$'));
+                const size_t dot = base.rfind('.');
+                if (dot != std::string::npos)
+                {
+                    const std::string nsOperator = base.substr(0, dot) + "." + opName;
+                    compiler->TryBindCxxFunction(nsOperator);
+                    tables.push_back(nsOperator);
+                }
+            }
+            LLVMBackend::NamedVariable objectArg;
+            objectArg.Primary = lvalue;
+            objectArg.Storage = lhsStorage;
+            objectArg.BaseType = structTy;
+            objectArg.TypeAndValue.TypeName = typeName;
+            objectArg.IsRvalue = receiverRvalue;
+            objectArg.CxxLvalueKind = receiverCategory;
+            const int receiverCv = compiler->CxxReceiverCv(objectArg);
+            // Parameter binding of a free operator's first operand: 0 by value, 1 `T&`, 2 `const T&`, 3 `T&&`.
+            auto freeParamRefKind = [&](const LLVMBackend::FunctionSymbol& candidate) {
+                auto rawIt = compiler->cxxFunctionSignatures_.find(candidate.SourceName);
+                if (rawIt != compiler->cxxFunctionSignatures_.end())
+                    for (const auto& raw : rawIt->second)
+                        if (raw.linkageName == candidate.UniqueName && !raw.paramSpellings.empty())
+                        {
+                            const auto& spelling = raw.paramSpellings[0];
+                            if (spelling.find("&&") != std::string::npos) return 3;
+                            if (spelling.find('&') != std::string::npos)
+                                return spelling.find("const") != std::string::npos ? 2 : 1;
+                            return 0;
+                        }
+                if (candidate.Parameters.empty()) return 0;
+                if (candidate.Parameters[0].IsRvalueRef) return 3;
+                if (candidate.Parameters[0].IsCxxConstRef) return 2;
+                return candidate.Parameters[0].IsAlias ? 1 : 0;
+            };
+            struct RankedOperator
+            {
+                std::string uniqueName;
+                std::vector<LLVMBackend::CxxConversionRank> ranks;
+                bool member = false;
+            };
+            std::vector<RankedOperator> viable;
+            std::set<std::string> seen;
+            bool hasMember = false;
+            bool hasFree = false;
+            bool objectOnlyFailure = false;
+            for (const std::string& table : tables)
+                if (auto it = compiler->functionTable.find(table); it != compiler->functionTable.end())
+                    for (const auto& candidate : it->second)
+                    {
+                        if (!candidate.IsCxx || candidate.Parameters.size() != 2
+                            || candidate.Parameters[0].TypeName != typeName
+                            || !seen.insert(candidate.UniqueName).second) continue;
+                        if (candidate.IsMethod && table != opName) continue;
+                        if (!candidate.IsMethod && candidate.SourceName != table) continue;
+                        (candidate.IsMethod ? hasMember : hasFree) = true;
+                        // The object's binding is decided here, from the parameter spelling: the rank leaves a
+                        // non-const lvalue reference to an rvalue and an rvalue reference unranked (-1).
+                        const int refKind = candidate.IsMethod ? 0 : freeParamRefKind(candidate);
+                        const bool objectOk = candidate.IsMethod
+                            ? compiler->CxxImplicitObjectViable(receiverCv, receiverRvalue, candidate)
+                            : refKind == 0 || refKind == 2
+                              || (refKind == 1 && !receiverRvalue && (receiverCv & 1) == 0)
+                              || (refKind == 3 && receiverRvalue && (receiverCv & 1) == 0);
+                        auto ranks = compiler->RankCxxConversionSequences({ objectArg, rightNV }, candidate);
+                        if (ranks.size() != 2) continue;
+                        if (refKind == 3 && ranks[0].rank == -1)
+                        {
+                            // An rvalue reference to the object's class: [over.ics.rank] 3.2.3 against a member.
+                            ranks[0].rank = 0;
+                            ranks[0].cvBase = typeName;
+                            ranks[0].refTarget = typeName;
+                            ranks[0].refBind = 1;
+                        }
+                        auto rankOk = [&](size_t i) {
+                            if (ranks[i].rank == LLVMBackend::kCxxNonViableRank) return false;
+                            if (i == 0 && candidate.IsMethod) return ranks[i].rank == -2;
+                            return ranks[i].rank >= 0;
+                        };
+                        const bool rhsOk = rankOk(1);
+                        if (rhsOk && !objectOk) objectOnlyFailure = true;
+                        if (objectOk && rhsOk && rankOk(0))
+                            viable.push_back({ candidate.UniqueName, ranks, candidate.IsMethod });
+                    }
+            // Nothing viable, and the object alone is why (the right operand binds): clang refuses too.
+            if (hasMember && hasFree && viable.empty() && objectOnlyFailure)
+            {
+                LogErrorContext(ctx, std::format("no overload of 'operator{}' matches the given arguments.", op));
+                return nullptr;
+            }
+            if (hasMember && hasFree && !viable.empty())
+            {
+                std::vector<const RankedOperator*> winners;
+                for (const auto& c : viable)
+                {
+                    bool beaten = false;
+                    for (const auto& d : viable)
+                    {
+                        bool crossing = false;
+                        if (&c != &d && compiler->CompareCxxConversionRanks(d.ranks, c.ranks, crossing) == -1
+                            && !crossing)
+                        {
+                            beaten = true;
+                            break;
+                        }
+                    }
+                    if (!beaten) winners.push_back(&c);
+                }
+                bool winnerMember = false;
+                bool winnerFree = false;
+                for (const auto* w : winners) (w->member ? winnerMember : winnerFree) = true;
+                if (winnerMember && winnerFree)
+                {
+                    LogErrorContext(ctx, std::format(
+                        "ambiguous C++ binary operator '{}': a member and a free overload are both viable and rank equally",
+                        opName));
+                    return nullptr;
+                }
+                if (winnerFree && !winnerMember) return tryFreeOperator();
+                for (const auto* w : winners) cxxPinnedMembers.push_back(w->uniqueName);
+            }
+        }
         // T85: a member dropped for an unrelated pointee may leave a member operator template (not
         // harvested) to rank beside the rest; clang decides that set, and its refusal stands.
         if (compiler->IsCxxRecord(typeName)
@@ -17080,6 +17521,12 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             thisNV.CxxLvalueReceiver = tempAlloca == lhsStorage && lhsStorage != nullptr
                 && !lhsMaterializedPrvalue;
 
+            thisNV.CxxPinnedMemberNames = cxxPinnedMembers;
+            if (receiverCategory >= 0)
+            {
+                thisNV.CxxLvalueKind = receiverCategory;
+                thisNV.IsRvalue = receiverRvalue;
+            }
             FlushCallPostfix();
             auto* result = compiler->CreateOverloadedFunctionCall(opName, { thisNV, rightNV });
             TrackOwnedStringOperatorResult(compiler, result);
@@ -17114,6 +17561,12 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 }
             }
 
+            thisNV.CxxPinnedMemberNames = cxxPinnedMembers;
+            if (receiverCategory >= 0)
+            {
+                thisNV.CxxLvalueKind = receiverCategory;
+                thisNV.IsRvalue = receiverRvalue;
+            }
             FlushCallPostfix();
             auto* result = compiler->CreateOverloadedFunctionCall(opName, { thisNV, rightNV });
             TrackOwnedStringOperatorResult(compiler, result);
@@ -17146,6 +17599,8 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
             llvm::Value* lhsStorage = firstNV.Storage;
             llvm::Type* lhsRefType = nullptr;
             std::string lhsSourceTypeName = firstNV.TypeAndValue.TypeName;
+            int firstPointerDepth = 0;
+            bool firstElemPointer = false;
             std::string lhsArithIdentity = firstNV.CxxArithIdentity;
             std::string lhsNativeArithmeticTypeName;
             std::string leftLiteralIdentity = CxxLiteralOperandIdentity(nextCtxs[0]);
@@ -17176,6 +17631,8 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
                 int rightDepth = 0;
                 bool rightElemPointer = false;
                 OperandPointerDepth(rightNV, rvalue, rightDepth, rightElemPointer);
+                if (i == 1 && lvalue->getType()->isPointerTy())
+                    OperandPointerDepth(firstNV, lvalue, firstPointerDepth, firstElemPointer);
                 auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx, nullptr,
                                                               rightDepth, rightElemPointer,
                                                               lhsStorage, rightNV.Storage,
@@ -17184,12 +17641,15 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
                                                               i == 1 ? firstNV.TypeAndValue.TypeName
                                                                      : std::string(),
                                                               rightNV.TypeAndValue.TypeName,
-                                                              0, false, std::string(), std::string(),
+                                                              i == 1 ? firstPointerDepth : 0,
+                                                              i == 1 && firstElemPointer,
+                                                              std::string(), std::string(),
                                                               false, std::string(), std::string(),
                                                               false, {}, {}, false, leftArith,
                                                               rightNV.CxxArithIdentity, rightNV.IsExplicitMove, i == 1 && firstNV.IsExplicitMove,
                                                               i == 1 && firstNV.TypeAndValue.IsCxxNullptrT,
-                                                              rightNV.TypeAndValue.IsCxxNullptrT);
+                                                              rightNV.TypeAndValue.IsCxxNullptrT,
+                                                              false, i == 1 && firstNV.TypeAndValue.IsCxxPointeeConst);
                 if (overload)
                 {
                     LLVMBackend::NamedVariable resultNV;
@@ -18811,6 +19271,18 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
 
             if (opText == "!")
                 compiler->ExchangeElseBlock(savedElse);
+            // A C++ `T&&` class result is an xvalue at its address: the overload acts on that object.
+            const bool xvalueOperand = (opText == "!" || opText == "-" || opText == "+" || opText == "~")
+                && compiler->IsCxxRvalueRefClassResult(namedVar);
+            if (xvalueOperand)
+            {
+                namedVar.Storage = namedVar.Primary;
+                namedVar.Primary = nullptr;
+                namedVar.BaseType = compiler->GetType(LLVMBackend::TypeAndValue{ .TypeName = namedVar.TypeAndValue.TypeName });
+                namedVar.TypeAndValue.Pointer = false;
+                namedVar.TypeAndValue.IsRvalueRef = false;
+                namedVar.IsRvalue = true;
+            }
 
             if (opText == "&")
             {
@@ -19303,7 +19775,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                         && compiler->IsCxxConstReferent(namedVar.Storage));
                 llvm::Value* operandStorage = (operandCategory == 2
                     || (operandCategory < 0 && namedVar.IsRvalue))
-                    && !constReferenceResult ? nullptr : namedVar.Storage;
+                    && !constReferenceResult && !xvalueOperand ? nullptr : namedVar.Storage;
                 auto newValue = this->LoadNamedVariable(namedVar);
                 if (auto* overload = TryUnaryOperatorOverload(newValue, "!", ctx, operandStorage, &namedVar,
                                                                constReferenceResult))
@@ -19356,7 +19828,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                         && compiler->IsCxxConstReferent(namedVar.Storage));
                 llvm::Value* operandStorage = (operandCategory == 2
                     || (operandCategory < 0 && namedVar.IsRvalue))
-                    && !constReferenceResult ? nullptr : namedVar.Storage;
+                    && !constReferenceResult && !xvalueOperand ? nullptr : namedVar.Storage;
                 auto newValue = this->LoadNamedVariable(namedVar);
                 auto* overload = TryUnaryOperatorOverload(newValue, "-", ctx, operandStorage, &namedVar,
                                                            constReferenceResult);
@@ -19416,7 +19888,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                         && compiler->IsCxxConstReferent(namedVar.Storage));
                 llvm::Value* operandStorage = (operandCategory == 2
                     || (operandCategory < 0 && namedVar.IsRvalue))
-                    && !constReferenceResult ? nullptr : namedVar.Storage;
+                    && !constReferenceResult && !xvalueOperand ? nullptr : namedVar.Storage;
                 auto newValue = this->LoadNamedVariable(namedVar);
                 auto* overload = TryUnaryOperatorOverload(newValue, "+", ctx, operandStorage, &namedVar,
                                                            constReferenceResult);
@@ -19452,7 +19924,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                         && compiler->IsCxxConstReferent(namedVar.Storage));
                 llvm::Value* operandStorage = (operandCategory == 2
                     || (operandCategory < 0 && namedVar.IsRvalue))
-                    && !constReferenceResult ? nullptr : namedVar.Storage;
+                    && !constReferenceResult && !xvalueOperand ? nullptr : namedVar.Storage;
                 auto newValue = this->LoadNamedVariable(namedVar);
                 auto* overload = TryUnaryOperatorOverload(newValue, "~", ctx, operandStorage, &namedVar,
                                                            constReferenceResult);
@@ -20198,6 +20670,8 @@ llvm::Value* MainListener::CxxAssignOperatorValue(
     assignmentResult->Storage = direct;
     assignmentResult->CallerName = namedVar.CallerName;
     assignmentResult->FieldName = namedVar.FieldName;
+    assignmentResult->MovePathKey = namedVar.MovePathKey;
+    assignmentResult->MovePathHasDynamicIndex = namedVar.MovePathHasDynamicIndex;
     return loaded;
 }
 
@@ -22571,11 +23045,18 @@ void MainListener::EmitFieldInitializer(
             if (initField != nullptr && !initSlotSig.IsFunctionPointer && !initSlotSig.Pointer)
                 if (const auto* enc = compiler->GetEncodedClosureType(initSlotSig.TypeName))
                     initSlotSig = *enc;
+            LLVMBackend::TypeAndValue initSourceSig = rightNV.TypeAndValue;
+            if (initSourceSig.FuncPtrReturnTypeName.empty() && !initSourceSig.Pointer)
+                if (const auto* enc = compiler->GetEncodedClosureType(initSourceSig.TypeName))
+                    initSourceSig = *enc;
             if (initField != nullptr && initSlotSig.IsFunctionPointer
-                && rightNV.TypeAndValue.IsFunctionPointer)
+                && initSourceSig.IsFunctionPointer)
             {
+                if (compiler->ClosureValueCanAdaptToSlot(rightNV, initSlotSig))
+                    compiler->AdaptClosureValueToSlot(
+                        LoadNamedVariable(rightNV), rightNV, initSlotSig);
                 if (std::string why = compiler->DescribeFuncPtrValueMismatch(
-                        initSlotSig, rightNV.TypeAndValue); !why.empty())
+                        initSlotSig, rightNV); !why.empty())
                     LogErrorContext(fi, why);
             }
             lambdaExpectedType = {};
@@ -24309,8 +24790,11 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         // Compute allocation size
         if (!elemType || !elemType->isSized())
         {
-            LogErrorContext(ctx, std::format("'new': cannot compute size of unsized or unresolved type '{}'",
-                SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName })));
+            // A C++ class left as an opaque shell on purpose (virtual inheritance) names its own
+            // refusal, the same one a by-value local gets, instead of a generic size failure.
+            if (!compiler->RejectUnsupportedCxxLayout(typeName))
+                LogErrorContext(ctx, std::format("'new': cannot compute size of unsized or unresolved type '{}'",
+                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName })));
             return {};
         }
         const std::string allocOperator = isArray ? "operator new[]" : "operator new";
@@ -26159,6 +26643,8 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         // borrowed-by-value-parameter reject guard read.
         dst.OwningStructName = src.OwningStructName;
         dst.FieldName        = src.FieldName;
+        dst.MovePathKey      = src.MovePathKey;
+        dst.MovePathHasDynamicIndex = src.MovePathHasDynamicIndex;
         dst.FieldPathText    = src.FieldPathText;
         dst.FieldPathRoot    = src.FieldPathRoot;
         dst.FieldPathThroughPointer = src.FieldPathThroughPointer;
@@ -26276,6 +26762,19 @@ CFlatParser::TypeCheckExpressionContext* MainListener::SoleTypeCheckExpressionOf
 LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
         auto argNV = ParseUnaryExpression(ctx->unaryExpression());
+        auto markMovedPath = [&]() {
+            const std::string movePath = LLVMBackend::FieldMoveKey(argNV);
+            // Legacy field moves retain their null-dereference behavior (notably, comparing a
+            // moved field with nullptr remains legal). Array slots need an indexed move path so
+            // a sibling element cannot revive or hide the moved element.
+            if (movePath.empty() || movePath.find('[') == std::string::npos
+                || argNV.CallerName.empty() || argNV.IsBorrowed)
+                return;
+            if (argNV.IsOwning || argNV.TypeAndValue.IsUnique || argNV.IsOwningString
+                || compiler->IsCoreUniqueType(argNV.TypeAndValue.TypeName)
+                || compiler->IsOwningValueType(argNV.TypeAndValue.TypeName))
+                compiler->MarkVariableFieldMoved(argNV.CallerName, movePath);
+        };
         if (argNV.ContainsBondedClosure)
             LogErrorContext(ctx,
                 "cannot move a holder containing a bonded closure - the closure would outlive its captured local");
@@ -26549,6 +27048,19 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         }
 
         llvm::Value* ptrVal = LoadNamedVariable(argNV);
+        const auto* encodedClosure = compiler->GetEncodedClosureType(argNV.TypeAndValue.TypeName);
+        const bool movingFatClosure = !argNV.TypeAndValue.Pointer && argNV.Storage != nullptr
+            && ((argNV.TypeAndValue.IsFunctionPointer && !argNV.TypeAndValue.IsThinFnPtr())
+                || (encodedClosure != nullptr && !encodedClosure->IsThinFnPtr()));
+        if (movingFatClosure && ptrVal != nullptr && ptrVal->getType()->isStructTy()
+            && lambdaExpectedType.IsFunctionPointer && !lambdaExpectedType.IsThinFnPtr()
+            && compiler->FuncPtrFewerParamsCanAdapt(argNV.TypeAndValue, lambdaExpectedType))
+        {
+            argNV.Primary = ptrVal;
+            argNV.IsExplicitMove = true;
+            argNV.IsRvalue = true;
+            return argNV;
+        }
         const bool deferLoweredBraceMove = ctx == loweredBraceMoveSite_
             && argNV.Storage != nullptr && argNV.Storage != loweredBraceMoveDestination_
             && !argNV.TypeAndValue.Pointer
@@ -26671,6 +27183,7 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                         && !argNV.IsBorrowed
                         && !compiler->IsCoreUniqueType(argNV.TypeAndValue.TypeName))
                         compiler->MarkVariableMoved(argNV.CallerName);
+                    markMovedPath();
                     if (std::string key = compiler->UniqueFieldNullKey(argNV); !key.empty())
                         compiler->RecordNullSet(key);
                     compiler->lastOwningResult = true;
@@ -26701,6 +27214,7 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                 if (!argNV.IsElementAccess && argNV.FieldName.empty() && !argNV.IsBorrowed
                     && !compiler->IsCoreUniqueType(argNV.TypeAndValue.TypeName))
                     compiler->MarkVariableMoved(argNV.CallerName);
+                markMovedPath();
                 // A field move of a `unique` wrapper nulls the FIELD path, like a moved local.
                 if (std::string key = compiler->UniqueFieldNullKey(argNV); !key.empty())
                     compiler->RecordNullSet(key);
@@ -26813,6 +27327,7 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
             compiler->builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), argNV.Storage);
             compiler->NoteOwnSlotLeavingLoad(ptrVal);
         }
+        markMovedPath();
         if (moveSourceIsWholeBinding)
             compiler->StoreRawArrayLength(argNV, nullptr);
 

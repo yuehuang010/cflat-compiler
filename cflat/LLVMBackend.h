@@ -1555,6 +1555,8 @@ public:
         // BorrowedOrigin names a live OWNING local the arm copied (not a borrowed parameter).
         bool BorrowedFromOwningLocal = false;
         std::string DeferredDiagnostic;
+        std::string MovePathKey;
+        bool MovePathHasDynamicIndex = false;
     };
 
     struct NamedVariable
@@ -1598,6 +1600,8 @@ public:
         // call site drops TypeName for a primitive so overload matching stays LLVM-type based.
         // Generic type-argument inference reads it; not part of the --init cache round-trip.
         std::string InferSourceTypeName;
+        // Set only for C++ class-pointer operator operands; ordinary call arguments leave it false.
+        bool AllowCxxClassPointerCtorConversion = false;
         // C++ identity of a built-in arithmetic result (`l + 1` is C++ `long`, typed i64 here),
         // for C++ template deduction only; native typing never reads it. Transient.
         std::string CxxArithIdentity;
@@ -1619,6 +1623,9 @@ public:
         // Transient: an imported enumerator / integer macro's value as a brace-list literal, set before
         // the element loses its storage. Empty when the element is not such a constant.
         std::string CxxImportedLiteral;
+        // The value of a constant element (an enumerator or integer macro) read from its global: narrowing
+        // checks it as a constant expression. Null for anything else.
+        llvm::ConstantInt* CxxConstantValue = nullptr;
         // compile-time: this argument was written 'move x' at a call site and is a VALUE type
         // (string/owning struct/closure). Zeroing is deferred to ApplyMoveParamTransfer so the
         // callee's parameter move-ness is known first. Not part of the --init cache round-trip.
@@ -1649,6 +1656,9 @@ public:
         int8_t CxxLvalueKind = -1;
         // The unary operator path carries the operand address for either `this` or a free ref arg.
         bool IsCxxUnaryOperatorReceiver = false;
+        // Unary C++ dispatch: the viable member overloads already chosen over every free candidate
+        // (UniqueNames). When non-empty the operator resolver ranks only these.
+        std::vector<std::string> CxxPinnedMemberNames;
         // Non-null when Primary is the POINTER a C++ operator returned for a `T&` result: the
         // referenced value type, carried through a parenthesized sub-expression.
         llvm::Type* CxxRefValueType = nullptr;
@@ -1747,6 +1757,10 @@ public:
         // Capture names for lambda literals, in capture order. Empty for non-capturing lambdas.
         // Used to diagnose capturing lambdas passed to C function-pointer params (C ABI can't carry state).
         std::vector<std::string> LambdaCaptureNames;
+        // Positive codegen provenance: this value's closure env is known to carry no captures.
+        // Tainted slots stay unknown after any store whose env provenance cannot be proved.
+        bool ClosureEnvKnownFree = false;
+        bool ClosureEnvProvenanceTainted = false;
         // By-reference lambda captures that point at non-static storage.
         std::vector<std::string> LambdaReferenceCaptureNames;
         // Set when a CFlat closure was handed to C++ as a `void*` to its {code, env} pair: the
@@ -1841,6 +1855,9 @@ public:
         std::string OwningStructName;    // when this NamedVariable is a struct-field access, the field's owning struct
         std::string FieldName;           // when this NamedVariable is a struct-field access, the field name
         std::string FieldPathText;       // source spelling of a field path, e.g. "w.inner.b"
+        // Canonical move path below CallerName, with compile-time array indices only.
+        std::string MovePathKey;
+        bool MovePathHasDynamicIndex = false;
         // The lock-set key the guarded-field READ check matched for this access, keyed on the
         // canonical receiver path ("o.inner.mtx"). Empty when the field is unguarded or the
         // receiver was not a plain path - the write check then falls back to GuardLockKey.
@@ -1903,8 +1920,7 @@ public:
         int IdentifierLine = 0;          // source location for use-after-move error reporting
         int IdentifierColumn = 0;
         // True when a subscript '[i]' produced this NamedVariable (an array/pointer element).
-        // Move-dataflow treats index/deref lvalues as untracked (permissive), so USE-recording
-        // skips these - moving out of a container slot is neither checked nor flagged.
+        // Constant indices may carry MovePathKey; runtime indices remain untracked.
         bool IsElementAccess = false;
         // True when the subscript's BASE binding was a user-visible `T[]` array VIEW. The element
         // GEP has a container buffer's single-index shape, so this is the only positive signal
@@ -1986,6 +2002,8 @@ public:
         // Source identity retained while operator reductions carry values without their NamedVariable.
         std::string  sourceCallerName;
         std::string  sourceFieldName;
+        std::string  sourceMovePathKey;
+        bool         sourceMovePathHasDynamicIndex = false;
         bool         sourceIsElementAccess = false;
         std::vector<ConditionalMoveSource> conditionalMoveSources;
 
@@ -2162,6 +2180,7 @@ public:
         bool ReturnsAliasOfByValueParam = false;
         bool IsMethod = false;     // true when registered as a struct/class method (has implicit self pointer)
         bool IsCxx = false;        // declaration came from a C++ header
+        bool IsCoreLibraryFunction = false; // implicit core origin; explicit C/C++ imports remain declarations
         bool IsDeleted = false;    // retained as a C++ overload candidate, rejected if selected
         bool IsCxxTemplateSpecialization = false;
         int CxxRefQualifier = cflat_cinterop::CxxRefQualifierNone;
@@ -3432,6 +3451,9 @@ private:
     std::unordered_set<std::string> importedEnumeratorGlobals_;
     // Unscoped C++ enum -> CFlat name of its integral promotion type ([conv.prom]/3-4).
     std::unordered_map<std::string, std::string> enumPromotedTypes_;
+    // Enum keys read from a clang declaration (imported C/C++). A registered enum key outside this
+    // set is CFlat-declared: C++ sees its values as its backing integers.
+    std::unordered_set<std::string> importedEnumTypes_;
     // Declaration sites (file:line:col) an enum key was registered from. Both passes and a
     // re-import replay the same site, which is the no-op; a second, different site is a
     // redefinition. Transient per compile, never serialized.
@@ -4179,6 +4201,8 @@ private:
         // Natural type resolves to void* (sentinel pointer like INVALID_HANDLE_VALUE).
         // Emitted as a void* global so it can be compared against pointer-returning APIs.
         bool isPointer = false;
+        // Scalar pointee of a typed cast pointer macro ((int*)0): empty for void* sentinels.
+        std::string pointeeTypeName;
         // Natural type is float/double. Routes on type, not fold success: `(double)(0x100000000)`
         // folds fine but is an integer constant - type routing prevents misclassifying it.
         bool isFloat = false;
@@ -6516,6 +6540,8 @@ private:
                                  std::vector<NamedVariable>& arguments,
                                  std::vector<CxxBraceArgument>& braceArguments,
                                  std::string& error);
+    // The C++ type a braced scalar element is ranked as (literal/declared type, enum promotion).
+    std::string CxxBraceElementIdentity(const NamedVariable& element) const;
     std::string CxxBraceSelectorElement(const NamedVariable& element,
                                         const std::vector<std::string>& candidateElements);
     bool RequestCxxBraceConstructor(const std::string& typeName,
@@ -6525,6 +6551,7 @@ private:
                                     std::string& error);
     // An imported unscoped enumerator or integer macro as a bare integer literal, else empty.
     std::string CxxImportedConstantLiteral(const NamedVariable& element) const;
+    void RecordCxxConstantBraceElement(NamedVariable& element, llvm::Value* value);
     bool RequestCxxDirectBraceConstructor(const std::string& typeName,
                                           const std::vector<NamedVariable>& elements,
                                           const std::string& initializerList,
@@ -6667,6 +6694,9 @@ private:
                                         const std::string& targetParameter) const;
     std::string CxxBraceContainerElementSpelling(const std::string& parameter);
     bool IsCxxScalarBraceElement(const std::string& element);
+    // A scalar brace element or bool: a `bool[N]` / initializer_list<bool> candidate ranks with the others.
+    bool IsCxxScalarOrBoolBraceElement(const std::string& element)
+        { return IsCxxScalarBraceElement(element) || element == "bool"; }
     // The scalar E of a class parameter whose own std::initializer_list<E> constructor a braced
     // list copy-list-initializes; empty unless exactly one such E is declared.
     std::string CxxClassBraceListElement(const std::string& parameter);
@@ -6716,6 +6746,17 @@ private:
     // its C++ identity (i8 is `char` or `i8`, i32 is `int` or `wchar`, i64 is `long` or `i64`).
     // NamedVariable::CxxArithIdentity when it lowers to exactly the value's type, else empty.
     std::string CxxArithIdentityForArgument(const NamedVariable& arg, llvm::Type* valueType) const;
+    std::string CxxUnscopedEnumPromotedIdentity(const NamedVariable& arg) const;
+    // CFlat-declared unscoped enum: true for its key, false for an imported or scoped enum.
+    bool IsCflatOnlyUnscopedEnum(const std::string& enumKey) const;
+    // Its backing integer's C++ spelling (`int`, `unsigned char`), false for any other key.
+    bool CxxCflatEnumBackingSpelling(const std::string& enumKey, std::string& spelling) const;
+    // The CFlat backing name ("int") of an unscoped CFlat-declared enum value, else empty.
+    std::string CxxCflatEnumBackingIdentity(const NamedVariable& arg) const;
+    // The initializer of a CFlat member global (`CE.ce1`); null for a variable or any other storage.
+    const llvm::ConstantInt* CflatEnumeratorConstant(const llvm::Value* storage,
+                                                     const std::string& enumKey) const;
+    bool CxxEnumPromotesToElement(const NamedVariable& source, const TypeAndValue& elementType);
     std::string DeclaredPrimitiveIdentityForCxxArgument(const NamedVariable& arg,
                                                         llvm::Type* valueType) const;
     /*
@@ -7735,6 +7776,10 @@ public:
     // for narrowing a fat closure to a thin `function<T>` - the same env-null signal the extern
     // function-pointer argument path uses.
     bool ClosureIsStaticallyNonCapturing(llvm::Value* fatVal);
+    bool ClosureValueCanAdaptToSlot(const NamedVariable& value, const TypeAndValue& slot) const;
+    llvm::Value* AdaptClosureValueToSlot(llvm::Value* value, NamedVariable& source,
+                                         const TypeAndValue& slot);
+    bool FuncPtrFewerParamsCanAdapt(const TypeAndValue& source, const TypeAndValue& slot) const;
     // The natural forwarder a fat closure calls through (lowered signature), or nullptr. Looks
     // through the insertvalue chain and a null-selecting code field (a widened runtime pointer).
     llvm::Function* ClosureForwarderOf(llvm::Value* fatVal);
@@ -9505,6 +9550,16 @@ public:
                                                 const std::string& methodName,
                                                 const std::vector<TypeAndValue>& params);
     bool IsCxxRecord(const std::string& typeName) const { return cxxRecords_.count(typeName) != 0; }
+    // T272: true when a CFlat struct declares no constructor that takes parameters (only the
+    // synthesized no-arg one, or none): a constructor call with arguments can never bind to it.
+    bool CFlatStructHasOnlyNoArgCtor(const std::string& typeName) const
+    {
+        auto it = functionTable.find(typeName);
+        if (it == functionTable.end()) return true;
+        return std::none_of(it->second.begin(), it->second.end(), [](const FunctionSymbol& c) {
+            return c.IsCxx || c.Variadic || !c.Parameters.empty();
+        });
+    }
     // True when `cflatName` was bound as a specialization of the C++ class template spelled
     // `baseName` (`std.barrier` -> `std::barrier<>`), false for a plain record or a typedef.
     bool IsCxxTemplateSpecializationOf(const std::string& cflatName, const std::string& baseName) const
@@ -10823,6 +10878,11 @@ public:
     // The reason half of the bind rule above, without the subject. Empty when fn can bind dest.
     std::string FuncPtrBindReason(const LLVMBackend::TypeAndValue& fn,
         const LLVMBackend::TypeAndValue& dest, bool compareReturnOwnership = false) const;
+    // T287: the ownership half of the bind rule for a function-pointer VALUE (lambda literal, variable)
+    // crossing a declared slot: owning return into a borrowed return, and each parameter's 'move'.
+    // Empty when they agree. Shared by the declarator, assignment and call-argument paths.
+    std::string FuncPtrValueOwnershipReason(const LLVMBackend::TypeAndValue& source,
+        const LLVMBackend::TypeAndValue& slot);
 
     /*
      * Value-site check (declaration initializer, assignment, return, brace/field initializer): the
@@ -10833,7 +10893,9 @@ public:
      * Empty when the value can bind.
      */
     std::string DescribeFuncPtrValueMismatch(const LLVMBackend::TypeAndValue& slot,
-        const LLVMBackend::TypeAndValue& value) const;
+                                             const LLVMBackend::TypeAndValue& value) const;
+    std::string DescribeFuncPtrValueMismatch(const LLVMBackend::TypeAndValue& slot,
+                                             const NamedVariable& value) const;
 
     // A lambda literal bound to a Lambda<>/function<> slot: the same rule, subject named as a lambda.
     std::string DescribeLambdaBindMismatch(const LLVMBackend::TypeAndValue& lambda,
@@ -11286,6 +11348,9 @@ public:
     // parameter must mark ONLY that field as moved, not the whole base variable - otherwise
     // a sibling access (`node->right`) or the base itself is wrongly rejected as use-after-
     // move. This is what lets legitimate recursive owning-pointer-tree code compile.
+    // Key of a field mark: the path below the root binding ('inner.p' for o.inner.p), so a nested
+    // path never aliases a one-level field of the same leaf name. Falls back to the leaf name.
+    static std::string FieldMoveKey(const NamedVariable& nv);
     void MarkVariableFieldMoved(const std::string& name, const std::string& field);
 
     // Reassigning a field (`node->left = ...`) makes it live again.
@@ -12406,7 +12471,9 @@ public:
     // 252: C global origin ("cxh") recorded with the header binding (T183 r2).
     // 257: mutable C++ field writes use the cached record field flag (T217).
     // 259: C++ member cache marks methods introduced by a using-declaration (T221).
-    static constexpr int kCHeaderCacheVersion = 259;
+    // 260: a header whose used virtual destructor has an unusable operator delete is refused (T294).
+    // 261: a cast null-pointer macro records its pointee type (T296).
+    static constexpr int kCHeaderCacheVersion = 261;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by
@@ -12789,6 +12856,12 @@ public:
     // `label` (e.g. "local", "per-user") is used only in the printed status lines.
     // Prints what was removed. Returns false on a real failure; a missing root is success.
     static bool ClearCacheDir(const std::string& root, bool verbose, const std::string& label);
+
+    // Delete cache generations under `root` the current build cannot read: cheaders/v<N> of
+    // another schema version and runtime/<hash> of other core sources. Returns false on a
+    // failed delete. Used by --init-prune / --init-local-prune after init.
+    static bool PruneCacheDir(const std::string& root, const std::string& runtimeDir,
+                              bool verbose, const std::string& label);
 
 #if defined(__APPLE__)
     // Harvest libSystem's reexported symbols from the live dyld shared cache and

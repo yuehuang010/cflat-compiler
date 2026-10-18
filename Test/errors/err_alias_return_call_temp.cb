@@ -1,0 +1,50 @@
+// An alias return whose borrow root is an owner the callee frame destroys on return: a call-result
+// temp (`mk()->v`, `(*mk()).v`), a `new` temp, a ternary arm of one, a named local or a by-value
+// unique param, and a pointer `alias T*` / raw `T*` return of `get()` on such an owner. Every return
+// would hand back a pointee the owner's destructor frees first, so each is refused at compile time.
+int gT274Dtors = 0;
+struct T274Res { int v = 3; ~T274Res() { gT274Dtors = gT274Dtors + 1; } };
+struct T274Holder { unique<T274Res> u = default; };
+unique<T274Res> t274Mk() { return unique<T274Res>(new T274Res()); }
+T274Res* gT274Other = nullptr;
+
+expect_error("borrows frame-local storage") {
+    alias int t274ArrowCall() { return t274Mk()->v; }
+}
+
+expect_error("borrows frame-local storage") {
+    alias int t274DerefCall() { return (*t274Mk()).v; }
+}
+
+expect_error("borrows frame-local storage") {
+    alias int t274NewArrow() { return (new T274Res())->v; }
+}
+
+expect_error("borrows frame-local storage") {
+    alias int t274TernaryArm(bool c) { return c ? t274Mk()->v : gT274Other->v; }
+}
+
+expect_error("borrows frame-local storage") {
+    alias int t274LocalOwner() { unique<T274Res> u = t274Mk(); return u->v; }
+}
+
+expect_error("borrows frame-local storage") {
+    alias int t274LocalField() { T274Holder h; h.u = t274Mk(); return h.u->v; }
+}
+
+expect_error("borrows frame-local storage") {
+    alias int t274ParamOwner(unique<T274Res> u) { return u->v; }
+}
+
+expect_error("cannot return the address of") {
+    alias T274Res* t274PtrCall() { return t274Mk().get(); }
+}
+
+expect_error("cannot return the address of") {
+    T274Res* t274RawLocal() { unique<T274Res> u = t274Mk(); return u.get(); }
+}
+
+extern int main()
+{
+    return 0;
+}

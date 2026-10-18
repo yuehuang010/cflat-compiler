@@ -1965,6 +1965,16 @@ bool testT208FunctionArgAcceptSet()
         result &= Test("t208 declarator preserves owned return value", p->value, 9);
     }
     result &= Test("t208 declarator owned return dtor once", t208CallArgDtorCount, 1);
+
+    // T287 accept legs: an owning-return variable into an owning-return slot, and a 'move' lambda into a 'move' slot.
+    t208CallArgDtorCount = 0;
+    function<move T208CallArgPayload*(int)> ownedVar = t208CallArgMakeOwned;
+    result &= Test("t287 owned variable into owned return slot value", t208CallArgInvokeOwnedReturn(ownedVar), 7);
+    result &= Test("t287 owned variable into owned return slot dtor once", t208CallArgDtorCount, 1);
+
+    t208CallArgDtorCount = 0;
+    result &= Test("t287 move lambda into move slot value", t208CallArgInvokeMove((move T208CallArgPayload* p) => { int v = p->value; delete p; return v; }), 7);
+    result &= Test("t287 move lambda into move slot dtor once", t208CallArgDtorCount, 1);
     return result;
 }
 
@@ -5641,6 +5651,103 @@ Lambda<int(int)> t195PassL(Lambda<int(int)> f)     { return f; }
 
 struct T195Hold { function<int(int)> fn; Lambda<int(int)> lam; };
 
+int t271OwnerDtors = 0;
+struct T271Owner
+{
+    int value = default;
+    ~T271Owner() { t271OwnerDtors++; }
+};
+
+int t271WideOverloadHits = 0;
+int t271OtherOverloadHits = 0;
+int t271Choose(Lambda<int(int, int)> fn)
+{
+    t271WideOverloadHits++;
+    return fn(4, 9);
+}
+int t271Choose(int value)
+{
+    t271OtherOverloadHits++;
+    return value;
+}
+
+int t271NamedFewer(int a) { return a + 8; }
+Lambda<int(int, int)> t271WidenReturn()
+{
+    Lambda<int(int)> narrow = (int a) => { return a + 5; };
+    return narrow;
+}
+
+struct T271WideHold { Lambda<int(int, int)> fn; };
+
+int t279PlusFive(int a) { return a + 5; }
+int t279GenericEnvFreeWide<T>()
+{
+    Lambda<int(int)> narrow = (int a) => { return a + 9; };
+    T wide = narrow;
+    return wide(1, 2);
+}
+function<int(int)> t279AliasReturnGlobal = doubleIt;
+alias T t279AliasReturnExact<T>() { return t279AliasReturnGlobal; }
+int t279GenericThinWiden<T>(T fn)
+{
+    Lambda<int(int, int)> wide = fn;
+    return wide(1, 2);
+}
+int t279GenericSameLambda<T>(T fn)
+{
+    Lambda<int(int, int)> same = fn;
+    return same(1, 2);
+}
+int t279GenericSameThin<T>(T fn)
+{
+    function<int(int)> same = fn;
+    return same(1);
+}
+int t279GenericMoveWiden<T>(T fn)
+{
+    Lambda<int(int, int)> wide = move fn;
+    return wide(4, 9);
+}
+int t279GenericMoveWidenResult()
+{
+    T271Owner* owner = new T271Owner();
+    (*owner).value = 3;
+    Lambda<int(int)> source = (int a) => { return a + (*owner).value; };
+    int value = t279GenericMoveWiden<Lambda<int(int)>>(move source);
+    delete owner;
+    return value;
+}
+int t279DirectSameCapture(Lambda<int(int, int)> fn)
+{
+    Lambda<int(int, int)> same = fn;
+    return same(1, 2);
+}
+int t279WideOverloadHits = 0;
+int t279OtherOverloadHits = 0;
+int t279Choose(Lambda<int(int, int)> fn)
+{
+    t279WideOverloadHits++;
+    return fn(4, 9);
+}
+int t279Choose(int value)
+{
+    t279OtherOverloadHits++;
+    return value;
+}
+int t279GenericCallThin<T>(T fn) { return t279Choose(fn); }
+
+int t271MoveCaptureAndReturn()
+{
+    T271Owner owner = { value = 3 };
+    Lambda<int(int)> source = (int a) => { return a + owner.value; };
+    Lambda<int(int, int)> wide = nullptr;
+    wide = move source;
+    int moved = source == nullptr;
+    int value = wide(4, 9);
+    return moved * 100 + value;
+}
+
 bool testFuncPtrValueSlotAccepts()
 {
     bool result = true;
@@ -5688,7 +5795,87 @@ bool testFuncPtrValueSlotAccepts()
     result &= Test("nullptr into a function slot", nn == nullptr, true);
     Lambda<int(int)> nl = nullptr;
     result &= Test("nullptr into a closure slot", nl == nullptr, true);
+
+    Lambda<int(int)> t271DeclSource = (int a) => { return a * 2; };
+    Lambda<int(int, int)> t271DeclWide = t271DeclSource;
+    result &= Test("t271 fewer lambda declaration value", t271DeclWide(4, 9), 8);
+
+    Lambda<int(int)> t271AssignSource = (int a) => { return a + 3; };
+    Lambda<int(int, int)> t271AssignWide = (int a, int b) => { return -1; };
+    t271AssignWide = t271AssignSource;
+    result &= Test("t271 fewer lambda assignment value", t271AssignWide(4, 9), 7);
+
+    int t271CallValue = t271Choose(t271AssignSource);
+    result &= Test("t271 fewer lambda call argument value", t271CallValue, 7);
+    result &= Test("t271 wider lambda overload selected", t271WideOverloadHits, 1);
+    result &= Test("t271 other overload not selected", t271OtherOverloadHits, 0);
+
+    Lambda<int(int, int)> t271Returned = t271WidenReturn();
+    result &= Test("t271 fewer lambda return value", t271Returned(4, 9), 9);
+
+    Lambda<int(int)> t271FieldSource = (int a) => { return a + 6; };
+    T271WideHold t271Field;
+    t271Field.fn = t271FieldSource;
+    result &= Test("t271 fewer lambda field store value", t271Field.fn(4, 9), 10);
+    Lambda<int(int)> t271BraceSource = (int a) => { return a + 7; };
+    T271WideHold t271Brace = { fn = t271BraceSource };
+    result &= Test("t271 fewer lambda field brace value", t271Brace.fn(4, 9), 11);
+
+    Lambda<int(int)> t271NamedSource = t271NamedFewer;
+    Lambda<int(int, int)> t271NamedWide = t271NamedSource;
+    result &= Test("t271 named function value through narrow slot", t271NamedWide(4, 9), 12);
+
+    t271OwnerDtors = 0;
+    result &= Test("t271 moved capture source nulled and adapter value",
+        t271MoveCaptureAndReturn(), 107);
+    result &= Test("t271 moved capture owner dropped once", t271OwnerDtors, 1);
+
+    function<int(int)> t279Thin = t279PlusFive;
+    Lambda<int(int, int)> t279DirectThinWide = t279Thin;
+    result &= Test("t279 direct thin value widens to Lambda", t279DirectThinWide(1, 2), 6);
+    result &= Test("t279 generic thin variable widens to Lambda",
+        t279GenericThinWiden<function<int(int)>>(t279Thin), 6);
+    result &= Test("t279 generic thin function widens to Lambda",
+        t279GenericThinWiden<function<int(int)>>(t279PlusFive), 6);
+    t279WideOverloadHits = 0;
+    t279OtherOverloadHits = 0;
+    result &= Test("t279 generic thin call selects wider Lambda overload",
+        t279GenericCallThin<function<int(int)>>(t279Thin), 9);
+    result &= Test("t279 generic thin wider overload ran", t279WideOverloadHits, 1);
+    result &= Test("t279 generic thin other overload did not run", t279OtherOverloadHits, 0);
+
+    Lambda<int(int, int)> t279SameLambda = (int a, int b) => { return a + b + 4; };
+    result &= Test("t279 generic same-arity Lambda value",
+        t279GenericSameLambda<Lambda<int(int, int)>>(t279SameLambda), 7);
+    result &= Test("t279 generic env-free wider declaration value",
+        t279GenericEnvFreeWide<Lambda<int(int, int)>>(), 10);
+    function<int(int)> t279AliasReturned = t279AliasReturnExact<function<int(int)>>();
+    result &= Test("t279 generic alias return exact signature",
+        t279AliasReturned(4), 8);
+    result &= Test("t279 generic same-arity thin value",
+        t279GenericSameThin<function<int(int)>>(t279Thin), 6);
+    int t279CaptureValue = 3;
+    Lambda<int(int, int)> t279SameCapture =
+        (int a, int b) => { return a + b + t279CaptureValue; };
+    result &= Test("t279 direct same-arity capturing value",
+        t279DirectSameCapture(t279SameCapture), 6);
+
+    t271OwnerDtors = 0;
+    result &= Test("t279 generic moved capture value", t279GenericMoveWidenResult(), 7);
+    result &= Test("t279 generic moved capture owner dropped once", t271OwnerDtors, 1);
     return result;
+}
+
+bool testT271LoopNoncapturingReassignment()
+{
+    Lambda<int(int)> source = (int a) => { return a; };
+    int sum = 0;
+    for (int i = 0; i < 4; i++) {
+        Lambda<int(int, int)> wide = source;
+        sum += wide(1, 2);
+        source = (int a) => { return a + 1; };
+    }
+    return Test("t271 noncapturing loop reassignment remains env-free", sum, 7) != 0;
 }
 
 using T196Fn = Lambda<int(int)>;
@@ -5765,6 +5952,93 @@ bool testT201GenericValueSites()
     result &= Test("generic instance in function declaration", g(9), 18);
     return result;
 }
+
+// T282: a generic instance whose argument is a Lambda<> carries the ENCODED closure name
+// ("fatfn$...") as its parameter type. A same-signature copy from it must clone the environment
+// like the non-generic form does, or the caller and the copy free one env twice.
+int t282CopyGeneric<T>(T x) { Lambda<int(int)> M = x; return M(3); }
+int t282CopyAlias<T>(alias T x) { Lambda<int(int)> M = x; return M(3); }
+int t282Take(Lambda<int(int)> y) { Lambda<int(int)> z = y; return z(3); }
+int t282Pass<T>(T x) { return t282Take(x); }
+T t282Id<T>(T x) { return x; }
+int t282TwoCopies<T>(T x) { T M = x; Lambda<int(int)> N = x; return M(1) * 10 + N(2) + x(3) * 100; }
+int t282FnCopy<T>(T x) { T M = x; return M(3); }
+int twice282(int a) { return a * 2; }
+struct T282Box<T> { T fn = default; };
+int t282DtorCount = 0;
+struct T282Owner { int value = default; ~T282Owner() { t282DtorCount++; } };
+int t282BoxCopy<T>(T x) { T282Box<T> b; b.fn = x; T282Box<T> d = b; Lambda<int(int)> e = d.fn; return e(1); }
+
+bool testT282GenericCopies()
+{
+    int k = 3;
+    Lambda<int(int)> B = (int a) => { return a + k; };
+    bool result = true;
+    result &= Test("t282 generic decl copy", t282CopyGeneric<Lambda<int(int)>>(B), 6);
+    result &= Test("t282 generic copy source survives", B(1), 4);
+    result &= Test("t282 generic alias copy", t282CopyAlias<Lambda<int(int)>>(B), 6);
+    result &= Test("t282 generic pass-on copy", t282Pass<Lambda<int(int)>>(B), 6);
+    result &= Test("t282 generic return identity", t282Id<Lambda<int(int)>>(B)(3), 6);
+    result &= Test("t282 two copies in generic", t282TwoCopies<Lambda<int(int)>>(B), 645);
+    result &= Test("t282 two copies source survives", B(0), 3);
+    function<int(int)> F = twice282;
+    result &= Test("t282 generic function copy", t282FnCopy<function<int(int)>>(F), 6);
+    return result;
+}
+
+bool testT282GenericBoxCopies()
+{
+    int k = 5;
+    T282Box<Lambda<int(int)>> b;
+    b.fn = (int a) => { return a + k; };
+    Lambda<int(int)> c = b.fn;
+    bool result = true;
+    result &= Test("t282 box field copy", b.fn(1) + c(2), 13);
+    Lambda<int(int)> m = move b.fn;
+    result &= Test("t282 box field move", m(2), 7);
+    result &= Test("t282 box field moved-from null", b.fn == nullptr ? 1 : 0, 1);
+    Lambda<int(int)> B2 = (int a) => { return a + k; };
+    result &= Test("t282 generic box copy", t282BoxCopy<Lambda<int(int)>>(B2), 6);
+    return result;
+}
+
+// Owning capture: the generic alias copy must leave the owner alive and drop it exactly once.
+bool testT282GenericDtorOnce()
+{
+    t282DtorCount = 0;
+    T282Owner owner = { value = 4 };
+    Lambda<int(int)> B = (int a) => { return a + owner.value; };
+    int r = t282CopyAlias<Lambda<int(int)>>(B);
+    bool result = true;
+    result &= Test("t282 owner alive after generic copy", t282DtorCount, 0);
+    result &= Test("t282 generic owner copy value", r * 10 + B(1), 75);
+    return result;
+}
+
+int t283DtorCount = 0;
+struct T283Owner { int value = default; ~T283Owner() { t283DtorCount++; } };
+int t283CopyAliasDecl(alias Lambda<int(int)> x)
+{
+    Lambda<int(int)> M = x;
+    return M(3);
+}
+
+bool testT283AliasDeclCopy()
+{
+    t283DtorCount = 0;
+    bool result = true;
+    {
+        T283Owner owner = { value = 4 };
+        string captured = "four";
+        Lambda<int(int)> B = (int a) => { return a + owner.value + captured.length(); };
+        int copied = t283CopyAliasDecl(B);
+        result &= Test("t283 alias decl value and source", copied * 10 + B(1), 119);
+        result &= Test("t283 alias decl owner live", t283DtorCount, 0);
+    }
+    result &= Test("t283 alias decl owner dropped once", t283DtorCount, 1);
+    return result;
+}
+
 
 extern int main(int argc, char** argv)
 {
@@ -5978,6 +6252,7 @@ extern int main(int argc, char** argv)
     total++; passed += testLambdaSlotFewerParams()         ? 1 : 0;
     total++; passed += testLambdaSlotFewerCapturing()      ? 1 : 0;
     total++; passed += testFuncPtrValueSlotAccepts()       ? 1 : 0;
+    total++; passed += testT271LoopNoncapturingReassignment() ? 1 : 0;
     // Generic closure stores must clone the tagged environment before the argument temp drops.
     total++; passed += testT196GenericSetterLiteral()      ? 1 : 0;
     total++; passed += testT196GenericSetterNamedClosure() ? 1 : 0;
@@ -5985,6 +6260,11 @@ extern int main(int argc, char** argv)
     total++; passed += testT196GenericSetterStructCapture() ? 1 : 0;
     total++; passed += testT196GenericSetterStringCapture() ? 1 : 0;
     total++; passed += testT201GenericValueSites() ? 1 : 0;
+    // T282: generic copies of a capturing Lambda<> (encoded closure name) clone the env.
+    total++; passed += testT282GenericCopies()             ? 1 : 0;
+    total++; passed += testT282GenericBoxCopies()          ? 1 : 0;
+    total++; passed += (testT282GenericDtorOnce() && Test("t282 owner dropped once", t282DtorCount, 1)) ? 1 : 0;
+    total++; passed += testT283AliasDeclCopy() ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

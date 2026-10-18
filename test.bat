@@ -184,10 +184,11 @@ REM parallel worker compiles load bitcode instead of re-parsing the stdlib closu
 REM Use the compiler under test; --init-local must succeed - a failure is a real regression.
 REM --init-local (not --init) so the cache lands in <exe dir>\.cflat: two worktrees or a
 REM Debug/Release pair testing concurrently then cannot collide on one %USERPROFILE%\.cflat,
-REM and the suite never overwrites the developer's own per-user cache.
-"%COMPILER%" --init-local --nologo >"%OUT%\results\init.log" 2>&1
+REM and the suite never overwrites the developer's own per-user cache. The -prune form also deletes
+REM cache generations this build cannot read (other cheaders\v<N>, other runtime\<hash>).
+"%COMPILER%" --init-local-prune --nologo >"%OUT%\results\init.log" 2>&1
 if errorlevel 1 (
-    echo FAILED: cflat.exe --init-local
+    echo FAILED: cflat.exe --init-local-prune
     type "%OUT%\results\init.log"
     exit /b 1
 )

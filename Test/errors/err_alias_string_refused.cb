@@ -1,0 +1,28 @@
+// `alias` qualifies pointer types only (ruling 2026-10-15). `string` is a primitive even though it
+// is a pointer underneath, so `alias string` is refused wherever it is spelled: return type, local,
+// parameter, struct field, and global. The refusal fires once per declaration.
+import "string.cb";
+
+expect_error("'alias' applies to pointer types only") {
+    alias string refusedReturn() { return "x"; }
+}
+
+expect_error("'alias' applies to pointer types only") {
+    int refusedParam(alias string s) { return 0; }
+}
+
+expect_error("'alias' applies to pointer types only") {
+    struct RefusedField { alias string value = default; };
+}
+
+expect_error("'alias' applies to pointer types only") {
+    alias string refusedGlobal = default;
+}
+
+extern int main()
+{
+    expect_error("'alias' applies to pointer types only") {
+        alias string refusedLocal = "x";
+    }
+    return 0;
+}

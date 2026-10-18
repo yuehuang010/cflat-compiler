@@ -707,7 +707,7 @@ iterationStatement
 //    |   For '(' declaration  expression? ';' expression? ')' statement
 
 forCondition
-    : (forDeclaration | expression?) ';' assignmentExpression ';' forExpression
+    : (forDeclaration | expression?) ';' assignmentExpression ';' forExpression?
     ;
 
 forDeclaration

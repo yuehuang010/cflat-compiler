@@ -10,6 +10,12 @@ expect_error("array views are not supported - a view does not own its buffer") {
     int takesLocal() { unique int[] v = new int[2]; return v[0]; }
 }
 
+// The diagnostic names the view type once: 'Y[]', not 'Y[][]'.
+expect_error("'unique' on 'YV[]': array views are not supported") {
+    struct YV { int v = 0; ~YV() { } };
+    int namesViewOnce() { unique YV[] arr = new YV[3]; return 0; }
+}
+
 interface IOwned { int val(); };
 
 expect_error("array views are not supported - a view does not own its buffer") {

@@ -5016,6 +5016,7 @@ void LLVMBackend::ResetForReanalysis()
     scopedCppEnumeratorHints_.clear();
     importedEnumeratorGlobals_.clear();
     enumPromotedTypes_.clear();
+    importedEnumTypes_.clear();
     enumDeclSites_.clear();
     typeAliases.clear();
     cxxNullptrTAliases_.clear();
@@ -6846,8 +6847,31 @@ static uint64_t FnvHash64(const void* data, size_t len)
     return h;
 }
 
-// FNV-1a hash over all .cb file modification times in runtimeDir/core, sorted by path.
-// Returns a 16-hex-char string. Returns "" if the core dir is inaccessible.
+// FNV-1a hash over all .cb file modification times in <runtimeDir>/core, sorted by path.
+// Returns a 16-hex-char string, or "" if the core dir is inaccessible.
+static std::string HashCoreSources(const std::filesystem::path& canonicalRuntimeDir)
+{
+    std::error_code ec;
+    std::vector<std::filesystem::path> files;
+    for (auto& e : std::filesystem::directory_iterator(canonicalRuntimeDir / "core", ec))
+        if (e.path().extension() == ".cb") files.push_back(e.path());
+    if (ec) return {};
+    std::sort(files.begin(), files.end());
+
+    uint64_t h = 14695981039346656037ULL;
+    for (auto& f : files)
+    {
+        auto wt = std::filesystem::last_write_time(f, ec);
+        if (ec) continue;
+        auto ns = wt.time_since_epoch().count();
+        h ^= FnvHash64(&ns, sizeof(ns));
+        h *= 1099511628211ULL;
+    }
+    char buf[17];
+    snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
+    return buf;
+}
+
 std::string LLVMBackend::ComputeCoreHash(const std::string& runtimeDir) const
 {
     llvm::TimeTraceScope hashScope("CoreCacheHash", runtimeDir);
@@ -6858,30 +6882,94 @@ std::string LLVMBackend::ComputeCoreHash(const std::string& runtimeDir) const
     std::error_code ec;
     entry.canonicalRuntimeDir = std::filesystem::weakly_canonical(runtimeDir, ec);
     if (ec) entry.canonicalRuntimeDir = std::filesystem::path(runtimeDir);
-
-    auto coreDir = entry.canonicalRuntimeDir / "core";
-    std::vector<std::filesystem::path> files;
-    for (auto& e : std::filesystem::directory_iterator(coreDir, ec))
-        if (e.path().extension() == ".cb") files.push_back(e.path());
-    if (!ec)
-    {
-        std::sort(files.begin(), files.end());
-
-        uint64_t h = 14695981039346656037ULL;
-        for (auto& f : files)
-        {
-            auto wt = std::filesystem::last_write_time(f, ec);
-            if (ec) continue;
-            auto ns = wt.time_since_epoch().count();
-            h ^= FnvHash64(&ns, sizeof(ns));
-            h *= 1099511628211ULL;
-        }
-        char buf[17];
-        snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
-        entry.hash = buf;
-    }
+    entry.hash = HashCoreSources(entry.canonicalRuntimeDir);
     coreHashCache_.emplace(runtimeDir, std::move(entry));
     return coreHashCache_.find(runtimeDir)->second.hash;
+}
+
+/*
+    --init-prune / --init-local-prune: delete every cache generation under `root`
+    that the current build can never read - cheaders/v<N> folders of another cache schema
+    version and runtime/<hash> core-bitcode folders of other core sources. Entries inside the
+    current cheaders/v<N> are left alone. Only those two name shapes are touched and symlinks
+    are never followed, so a CFLAT_CACHE_DIR root of any name is safe.
+*/
+bool LLVMBackend::PruneCacheDir(const std::string& root, const std::string& runtimeDir,
+                                bool verbose, const std::string& label)
+{
+    namespace fs = std::filesystem;
+    if (root.empty())
+    {
+        std::cout << std::format("{} cache: (could not determine path)\n", label);
+        return true;
+    }
+    std::error_code ec;
+    fs::path canonicalRuntime = fs::weakly_canonical(runtimeDir, ec);
+    if (ec) canonicalRuntime = fs::path(runtimeDir);
+    const std::string coreHash = HashCoreSources(canonicalRuntime);
+    const std::string headerVersion = "v" + std::to_string(kCHeaderCacheVersion);
+
+    auto isDigits = [](const std::string& s, size_t from) {
+        if (s.size() <= from) return false;
+        for (size_t i = from; i < s.size(); ++i)
+            if (s[i] < '0' || s[i] > '9') return false;
+        return true;
+    };
+    auto isHex16 = [](const std::string& s) {
+        if (s.size() != 16) return false;
+        for (char c : s)
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+        return true;
+    };
+
+    // Collect first, delete after: removing while iterating invalidates the iterator.
+    std::vector<fs::path> dead;
+    auto collect = [&](const fs::path& dir, auto&& isStale) {
+        std::error_code e;
+        for (fs::directory_iterator it(dir, e), end; !e && it != end; it.increment(e))
+        {
+            std::error_code te;
+            if (it->is_symlink(te) || te || !it->is_directory(te) || te) continue;
+            if (isStale(it->path().filename().string())) dead.push_back(it->path());
+        }
+    };
+    collect(fs::path(root) / "cheaders", [&](const std::string& name) {
+        return name.size() > 1 && name[0] == 'v' && isDigits(name, 1) && name != headerVersion;
+    });
+    // An unreadable core dir yields no hash; then no runtime folder can be judged stale.
+    if (!coreHash.empty())
+        collect(fs::path(root) / "runtime", [&](const std::string& name) {
+            return isHex16(name) && name != coreHash;
+        });
+
+    std::cout << std::format("{} cache: {}\n", label, root);
+    uintmax_t files = 0, bytes = 0;
+    bool ok = true;
+    for (const auto& path : dead)
+    {
+        for (fs::recursive_directory_iterator it(path, ec), end; !ec && it != end; it.increment(ec))
+        {
+            std::error_code se;
+            if (it->is_regular_file(se) && !se)
+            {
+                ++files;
+                bytes += it->file_size(se);
+            }
+        }
+        ec.clear();
+        fs::remove_all(path, ec);
+        if (ec)
+        {
+            std::cout << std::format("  Error: could not remove {}: {}\n", path.string(), ec.message());
+            ok = false;
+            ec.clear();
+        }
+        else if (verbose)
+            std::cout << std::format("  [verbose] removed {}\n", path.string());
+    }
+    std::cout << std::format("  Pruned {} stale folder(s) ({} file(s), {} bytes); kept cheaders/{} and runtime/{}.\n",
+                             dead.size(), files, bytes, headerVersion, coreHash.empty() ? "(unknown)" : coreHash);
+    return ok;
 }
 
 // Returns <cache>/runtime/<hash>  or "" on failure. Built with std::filesystem
@@ -7282,6 +7370,8 @@ static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
     // dropping it would fall the declaration back onto the C size heuristic.
     if (s.CxxAbi.valid)  o["cxxabi"] = SerializeCxxAbi(s.CxxAbi);
     if (s.IsCxx)        o["cxx"] = true;
+    if (s.IsCoreLibraryFunction) o["core"] = true;
+    if (s.IsCInteropDeclaration) o["cinterop"] = true;
     if (s.CxxRefQualifier != cflat_cinterop::CxxRefQualifierNone)
         o["cxxrq"] = s.CxxRefQualifier;
     if (s.CxxVolatile)  o["cxxvol"] = true;
@@ -7466,8 +7556,8 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     // Each version added tables an older cache lacks, so an older cache must be rejected rather
     // than silently reused (v6 includes the LSP core-variable replay state; v8 is the non-pointer
     // `alias T` parameter reference ABI; v11 adds closure capture-cleanup MOVE mode 2; v12 adds
-    // const floating global admission names).
-    root["version"]   = 12;
+    // const floating global admission names; v13 stores function origin metadata).
+    root["version"]   = 13;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
 #if defined(__APPLE__)
@@ -7949,7 +8039,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 12) return false;  // v11 lacks const floating global admission names
+    if (!ver || *ver != 13) return false;  // v12 lacks function origin metadata
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != coreHash) return false;
 #if defined(__APPLE__)
@@ -8042,6 +8132,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     scopedCppEnumeratorHints_.clear();
     importedEnumeratorGlobals_.clear();
     enumPromotedTypes_.clear();
+    importedEnumTypes_.clear();
     enumDeclSites_.clear();
     // strConcatRegistered / stringDtorRegistered: will be set below after deserialization
     // verifies the functions are present in the bitcode.
@@ -8146,6 +8237,8 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (auto v = fo->getBoolean("ext")) sym.External = *v;
             if (auto v = fo->getBoolean("ro")) sym.ReturnsOwned = *v;
             if (auto v = fo->getBoolean("cxx")) sym.IsCxx = *v;
+            if (auto v = fo->getBoolean("core")) sym.IsCoreLibraryFunction = *v;
+            if (auto v = fo->getBoolean("cinterop")) sym.IsCInteropDeclaration = *v;
             if (auto v = fo->getInteger("cxxrq")) sym.CxxRefQualifier = (int)*v;
             if (auto v = fo->getBoolean("cxxvol")) sym.CxxVolatile = *v;
             if (auto v = fo->getBoolean("cxxconst")) sym.CxxConst = *v;

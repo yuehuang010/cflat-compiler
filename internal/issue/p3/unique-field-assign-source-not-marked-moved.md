@@ -9,11 +9,6 @@ Legs: Test/errors/err_unique_field_consume_read.cb, Test/test_move.cb `unique_lo
 `unique_field_consume_*`, `unique_array_field_consume_*`, `unique_field_self_move_*`.
 
 Open:
-1. NEEDS RULING - `t.p = a ?? s.p` (the `??` join). Only the selected arm is nulled at run time; the
-   non-selected arm stays live. Question: is the field arm readable after the join (today, and leg
-   Test/test_move.cb `unique_field_coalesce_assign_other_alive` pins it readable) or refused as a
-   MAY-move like a conditional local move (unsound read is possible: when `a` is null, `s.p` is
-   nulled and a later `s.p->v` segfaults)?
 2. Unchecked consume paths (r3 null-state keying, LLVMBackend::UniqueFieldNullKey): only a path
    rooted in a plain struct value LOCAL is tracked. A path through a pointer (`ps->p`, `this->p`),
    or rooted in a parameter, alias local, static local or global, and any element path (`a[0].p`)
@@ -28,3 +23,6 @@ Open:
 `c.item = a.item ?? b.item;` marks BOTH arms maybe-moved, like a conditional local move (Rust semantics): a later
 `b.item->id` (or `a.item->id`) is refused until the field is reassigned. The read-only leg at Test/test_move.cb ~1725
 that pins `b.item` readable is superseded by this ruling - convert it to an err_ leg (the one sanctioned edit of it).
+5. (T266 review 1, PRE-EXISTING on master) a `??` join of unique fields passed as a CALL ARGUMENT is not null-tracked:
+   `mv(a.item ?? b.item); a.item->id` segfaults (no diagnostic). The '=' destination form is refused after T266; the
+   call-argument join should mark both arms maybe-moved the same way.

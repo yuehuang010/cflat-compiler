@@ -914,6 +914,23 @@ static std::string CurrentReturnBaseTypeSpelling(const LLVMBackend* compiler)
         return SpellType(*compiler, tv);
     }
 
+// A borrowing core unique<T> member call (`operator->`, `get`; pointer return, release() excluded)
+// whose receiver storage is in this frame: `mk()->v`, `u.get()`, `u->v` on a local or by-value
+// param. The receiver's destructor frees the pointee on return, so the borrow dangles.
+bool MainListener::IsFrameOwnedUniqueBorrow(const LLVMBackend* compiler, llvm::Value* value)
+{
+        auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(value);
+        if (call == nullptr || call->getCalledFunction() == nullptr || call->arg_size() == 0) return false;
+        llvm::Value* receiver = call->getArgOperand(0)->stripPointerCasts();
+        while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(receiver))
+            receiver = gep->getPointerOperand()->stripPointerCasts();
+        if (!llvm::isa<llvm::AllocaInst>(receiver)) return false;
+        const auto* sym = compiler->FindSymbolForFunction(call->getCalledFunction());
+        return sym != nullptr && sym->IsMethod && !sym->Parameters.empty()
+            && compiler->IsCoreUniqueType(sym->Parameters[0].TypeName)
+            && sym->ReturnType.Pointer && !sym->ReturnType.IsMove;
+    }
+
 std::string MainListener::ReturnUpcastStructName(const LLVMBackend::NamedVariable& nv) {
         if (!nv.TypeAndValue.TypeName.empty()) return nv.TypeAndValue.TypeName;
         if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(nv.BaseType)) return st->getName().str();
@@ -989,10 +1006,22 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         // expression - lowering a returned lambda calls createFunctionBlock, which
         // overwrites currentFunctionReturnTV with the lambda's own return type.
         LLVMBackend::TypeAndValue returnFnPtrTV;
+        bool encodedAliasReturnSlot = false;
         if (compiler->currentFunctionReturnTV.IsFunctionPointer)
         {
             lambdaExpectedType = compiler->currentFunctionReturnTV;
             returnFnPtrTV = compiler->currentFunctionReturnTV;
+        }
+        else if (!compiler->currentFunctionReturnTV.Pointer)
+        {
+            if (const auto* encoded = compiler->GetEncodedClosureType(
+                    compiler->currentFunctionReturnTV.TypeName))
+            {
+                returnFnPtrTV = *encoded;
+                encodedAliasReturnSlot = compiler->currentFunctionReturnTV.IsAlias;
+                if (!encodedAliasReturnSlot)
+                    lambdaExpectedType = *encoded;
+            }
         }
         // A std.function return type types a returned lambda the same way; the lambda then
         // converts through the function-pointer constructor like a returned function<> value.
@@ -1073,10 +1102,19 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             // instance here, the way a named function value is, before the return slot is checked.
             ResolveGenericFunctionValueOperand(returnNV, assignExpr);
             // A returned function-pointer VALUE must match the declared return slot (variadic-ness and bind rule).
-            if (returnFnPtrTV.IsFunctionPointer && returnNV.TypeAndValue.IsFunctionPointer)
+            const auto* encodedReturnSource = returnNV.TypeAndValue.Pointer
+                ? nullptr : compiler->GetEncodedClosureType(returnNV.TypeAndValue.TypeName);
+            if (returnFnPtrTV.IsFunctionPointer
+                && (returnNV.TypeAndValue.IsFunctionPointer || encodedReturnSource != nullptr))
+            {
+                if (!encodedAliasReturnSlot
+                    && compiler->ClosureValueCanAdaptToSlot(returnNV, returnFnPtrTV))
+                    compiler->AdaptClosureValueToSlot(
+                        LoadNamedVariable(returnNV), returnNV, returnFnPtrTV);
                 if (std::string why = compiler->DescribeFuncPtrValueMismatch(
-                        returnFnPtrTV, returnNV.TypeAndValue); !why.empty())
+                        returnFnPtrTV, returnNV); !why.empty())
                     LogErrorContext(errCtx, why);
+            }
             // [immovable] C++ record: C++17 elision builds a fresh prvalue in the sret slot, so only a place
             // operand (variable, field, element, deref) is refused; a fresh one stays legal.
             if (cxxSretReturn && !compiler->currentFunctionReturnTV.Pointer && !compiler->currentFunctionReturnTV.IsAlias
@@ -1543,6 +1581,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
 
             if (!explicitMove && IsBareIdentifierText(retText) && source.Storage != nullptr
                 && !source.TypeAndValue.Pointer && source.TypeAndValue.TypeName != typeName
+                && source.TypeAndValue.IsFloatingPoint() == -1
                 && compiler->CanImplicitlyConstructCxxClass(
                     source, compiler->currentFunctionReturnTV, true))
             {
@@ -1783,6 +1822,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     return aliasSourcePointsIntoFrame(gep->getPointerOperand(), depth + 1);
 
                 auto* call = llvm::dyn_cast<llvm::CallBase>(value);
+                // A new-expression result (`(new R())->v`) has no owner that outlives the frame.
+                if (compiler->IsOwnedNewTemp(value)) return true;
+                if (IsFrameOwnedUniqueBorrow(compiler, value)) return true;
                 if (call == nullptr || call->getCalledFunction() == nullptr) return false;
                 const auto* symbol = compiler->FindSymbolForFunction(call->getCalledFunction());
                 if (symbol == nullptr || symbol->IsCxx || symbol->ReturnType.Pointer
@@ -2070,6 +2112,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
          * address. Loaded pointer values and caller/global/static storage do not root here.
          */
         bool frameLocalPointerReturn = false;
+        bool frameLocalArmUnderJoin = false;  // the frame-local arm sat under a '?:' / '??' join
         bool cflatAliasJoinArm = false;
         if (!aliasRefReturn && assignExpr != nullptr && cxxRefReturnAddr == nullptr
             && !cxxReferenceResultTernaryJoin && compiler->currentFunctionReturnTV.Pointer)
@@ -2106,7 +2149,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     walkJoinArms(gep->getPointerOperand(), underJoin);
                     return;
                 }
-                frameLocalPointerReturn = PointsIntoStackFrame(value);
+                frameLocalPointerReturn = PointsIntoStackFrame(value)
+                    || IsFrameOwnedUniqueBorrow(compiler, value);
+                frameLocalArmUnderJoin = frameLocalPointerReturn && underJoin;
                 if (!frameLocalPointerReturn && underJoin && isCflatAliasCall(value))
                     cflatAliasJoinArm = true;
             };
@@ -2230,7 +2275,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                                              "the return value");
         // Coerce the returned value to the function-pointer return type (thin vs
         // fat): a named function, a thin function<> value, or a fat closure value.
-        if (right && returnFnPtrTV.IsFunctionPointer)
+        if (right && returnFnPtrTV.IsFunctionPointer && !encodedAliasReturnSlot)
         {
             // The declared RETURN type is the crossing here: it cannot adopt an inferred sink,
             // so a consuming closure leaving through it must spell the sink.
@@ -2712,8 +2757,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     && ReturnSourceIsIndirectOwningLvalue(returnNV, right)));
         if (frameLocalPointerReturn)
         {
-            const std::string what = returnNV.CallerName.empty()
-                ? std::string("a '?:' arm") : "'" + returnNV.CallerName + "'";
+            const std::string what = !returnNV.CallerName.empty()
+                ? "'" + returnNV.CallerName + "'"
+                : frameLocalArmUnderJoin ? std::string("a '?:' arm") : std::string("this value");
             LogErrorContext(errCtx, std::format("cannot return the address of {}: it points into "
                 "this function's own frame and would dangle once the function returns (an 'alias' "
                 "return does not change that). Return a pointer into caller-owned, global or heap "
@@ -3366,6 +3412,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
 
         if (labeledStatement != nullptr && !switchStack.empty())
         {
+            // Dispatch may reach this label directly, skipping earlier cases: merge the pre-switch state.
+            compiler->MergeMovedStateInto(switchStack.back().preSwitchMoved);
             auto& ctx = switchStack.back();
             llvm::BasicBlock* targetBlock = nullptr;
 
@@ -3419,6 +3467,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 }
 
                 ParseStatement(labeledStatement->statement());
+                switchStack.back().exitMoved.push_back(compiler->SaveMovedState());
                 compiler->CreateBlockBreak(ctx.resumeBlock, true);
                 return;
             }
@@ -3487,14 +3536,20 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
             }
             else if (jump->Continue())
             {
-                RecordLoopExitMovedState();
+                // continue re-tests the condition; an always-true condition never exits the loop there.
+                if (loopConditionAlwaysTrue_.empty() || !loopConditionAlwaysTrue_.back())
+                    RecordLoopExitMovedState();
                 straightLineJumped_ = true;
                 compiler->CreateContinueCall();
                 return;
             }
             else if (jump->Break())
             {
-                RecordLoopExitMovedState();
+                // A break whose innermost breakable is the switch joins the switch's exits.
+                if (!switchStack.empty() && switchStack.back().loopDepth == loopBreakMovedStates_.size())
+                    switchStack.back().exitMoved.push_back(compiler->SaveMovedState());
+                else
+                    RecordLoopExitMovedState();
                 straightLineJumped_ = true;
                 compiler->CreateBreakCall();
                 return;
@@ -3527,7 +3582,29 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
             // return in its body does not mark the enclosing straight-line as returned.
             ReturnFlagGuard returnFlagGuard(&straightLineReturned_);
             ReturnFlagGuard jumpFlagGuard(&straightLineJumped_);
-            LoopMovedStateGuard loopMovedGuard(this, compiler);
+            // do-while runs its body once; while/for/for-in may run zero times unless the condition is
+            // a literal true (such a loop exits only through break).
+            bool loopMayRunZero = false;
+            auto isAlwaysTrue = [&](antlr4::tree::ParseTree* condition) {
+                auto folded = FoldCompileTimeInt(compiler, condition);
+                return folded.has_value() && *folded != 0;
+            };
+            if (!iterationStatement->Do())
+            {
+                if (iterationStatement->While())
+                    loopMayRunZero = !isAlwaysTrue(iterationStatement->expression());
+                else if (iterationStatement->forCondition() != nullptr)
+                {
+                    auto* cond = iterationStatement->forCondition()->assignmentExpression();
+                    loopMayRunZero = !isAlwaysTrue(cond);
+                }
+                else
+                    loopMayRunZero = true;  // for-in: the collection may be empty
+            }
+            const bool conditionAlwaysTrue = iterationStatement->Do()
+                ? isAlwaysTrue(iterationStatement->expression())
+                : !loopMayRunZero && iterationStatement->In() == nullptr;
+            LoopMovedStateGuard loopMovedGuard(this, compiler, loopMayRunZero, conditionAlwaysTrue);
             // Consume the vectorize request immediately so it binds only to this
             // loop level (a nested loop in the body re-reads a cleared flag).
             bool doVectorize = vectorizeActive_;
@@ -3658,6 +3735,9 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     auto blockInner = compiler->CreateBasicBlock("forInner");
                     auto blockIncrement = compiler->CreateBasicBlock("forIncrement");
                     auto blockResume = compiler->CreateBasicBlock("forResume");
+                    // Normal exit only: frees the for-init scope, then joins blockResume. A break
+                    // frees the scope on its own edge and jumps to blockResume directly.
+                    auto blockExit = compiler->CreateBasicBlock("forExit");
 
                     compiler->CreateBlockBreak(blockInit, false);
 
@@ -3666,7 +3746,14 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     // initialization
                     compiler->InitializeBlock(blockInit, true, blockIncrement, blockResume, blockResume);
                     if (declaration)
+                    {
+                        // The init's owned temps die at the end of its full-expression, once (C++
+                        // [stmt.for]). Flush only what the declaration registered: the condition block
+                        // runs every iteration, and body temps must keep their master ledger.
+                        auto initTempMark = compiler->MarkOwnedTemps();
                         ParseForDeclaration(declaration);
+                        compiler->FlushOwnedTempsSince(initTempMark, nullptr);
+                    }
                     if (expressionCtx)
                     {
                         // for-init is a discard position too: a bare owning-return call must error
@@ -3690,7 +3777,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     condition = compiler->CoerceToBoolCondition(condition);
                     // Free owned-string temps from the condition in the condition block (see do-while).
                     compiler->FlushOwnedTemps();
-                    compiler->CreateConditionJump(condition, blockInner, blockResume);
+                    compiler->CreateConditionJump(condition, blockInner, blockExit);
 
                     // Inner statement
                     compiler->InitializeBlock(blockInner, false);
@@ -3709,15 +3796,18 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     // Increment
                     compiler->InitializeBlock(blockIncrement, false);
 
-                    auto assignments = forIncrementCtx->assignmentExpression();
-                    for (auto assign : assignments)
+                    if (forIncrementCtx != nullptr)
                     {
-                        // A for-update is a discard position too (its value is unused).
-                        bool bareExpr = assign->assignmentOperator() == nullptr;
-                        auto nv = ParseAssignmentExpressionNamed(assign, ResultUse::Discard);
-                        if (bareExpr) DiagnoseDiscardedOwningReturn(assign, nv);
-                        ProcessPlusPlus();
-                        RegisterDiscardedOwningStructTemp(nv, bareExpr);
+                        auto assignments = forIncrementCtx->assignmentExpression();
+                        for (auto assign : assignments)
+                        {
+                            // A for-update is a discard position too (its value is unused).
+                            bool bareExpr = assign->assignmentOperator() == nullptr;
+                            auto nv = ParseAssignmentExpressionNamed(assign, ResultUse::Discard);
+                            if (bareExpr) DiagnoseDiscardedOwningReturn(assign, nv);
+                            ProcessPlusPlus();
+                            RegisterDiscardedOwningStructTemp(nv, bareExpr);
+                        }
                     }
                     // Flush HERE, not in the condition block: the increment block does not
                     // dominate the condition, so a temp registered here would never be freed.
@@ -3730,11 +3820,12 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     if (doVectorize)
                         compiler->AttachVectorizeHintToCurrentLatch(vectorizeLine);
 
-                    // resume
-                    compiler->InitializeBlock(blockResume, false);
+                    // Normal exit: free and pop the for-init scope once, then join resume.
+                    compiler->InitializeBlock(blockExit, false);
+                    compiler->CreateBlockBreak(blockResume, true);
 
-                    // pop the stack
-                    compiler->CreateBlockBreak(nullptr, true);
+                    // resume (break target: the break already freed the scope)
+                    compiler->InitializeBlock(blockResume, false);
 
                     return;
                 }
@@ -4727,6 +4818,13 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     // no moves here. A break/continue's moves rejoin at loop exit instead.
                     compiler->RestoreMovedState(preIfMovedState);
                 }
+                else
+                {
+                    // No else and the then-branch falls through: resume is reached from the then-branch
+                    // AND the condition-false path (pre-if state). A re-init in only the then-branch
+                    // must not revive the field for the false path, so merge the two (maybe-moved).
+                    compiler->MergeMovedStates(thenMovedState, preIfMovedState);
+                }
 
                 // The enclosing straight-line has unconditionally returned iff it already had, or
                 // this if returns on every path (both branches return; a no-else if falls through).
@@ -4984,6 +5082,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 // Push scope: break -> resumeBlock, no continue (propagates to outer loop)
                 compiler->InitializeBlock(nullptr, true, nullptr, switchCtx.resumeBlock, nullptr);
 
+                switchCtx.preSwitchMoved = compiler->SaveMovedState();
+                switchCtx.loopDepth = loopBreakMovedStates_.size();
                 switchStack.push_back(switchCtx);
 
                 if (body && body->blockItemList())
@@ -4992,7 +5092,14 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 // Fallthrough at end of switch body -> resume
                 compiler->CreateBlockBreak(switchCtx.resumeBlock, true);
 
+                // Resume is reached from every exit (break, arm end, last case fall-through) and,
+                // without a default, from the dispatch itself (pre-switch state).
+                auto exitMoved = std::move(switchStack.back().exitMoved);
                 switchStack.pop_back();
+                for (const auto& snap : exitMoved)
+                    compiler->MergeMovedStateInto(snap);
+                if (switchCtx.defaultBlock == nullptr)
+                    compiler->MergeMovedStateInto(switchCtx.preSwitchMoved);
 
                 compiler->InitializeBlock(switchCtx.resumeBlock, false);
                 // Free the scrutinee temporaries now that the dispatch is done and all paths have

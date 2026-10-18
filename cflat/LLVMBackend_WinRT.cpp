@@ -1769,18 +1769,25 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 {
                     std::string movedName = args[i].CallerName.empty()
                         ? args[i].TypeAndValue.VariableName : args[i].CallerName;
-                    if (IsForeignNontrivialCxxClass(params[i].TypeName)
-                        && !movedName.empty() && args[i].FieldName.empty()
-                        && !args[i].IsElementAccess)
-                        MarkVariableMoved(movedName);
-                    else if (IsForeignNontrivialCxxClass(params[i].TypeName)
-                             && !movedName.empty() && !args[i].FieldName.empty())
-                        MarkVariableFieldMoved(movedName, args[i].FieldName);
+                    const std::string movePath = FieldMoveKey(args[i]);
+                    // A lowered CFlat struct is marked moved only by a `move` parameter, like the plain
+                    // struct sink (diagnostic only: storage not zeroed); a copy param keeps it readable.
+                    const bool loweredStructMoveSink = !IsForeignNontrivialCxxClass(params[i].TypeName)
+                        && params[i].IsMove && !args[i].DeferMovedMark;
+                    if ((IsForeignNontrivialCxxClass(params[i].TypeName) || loweredStructMoveSink)
+                        && !movedName.empty())
+                    {
+                        if (!movePath.empty()) MarkVariableFieldMoved(movedName, movePath);
+                        else if (!args[i].IsElementAccess) MarkVariableMoved(movedName);
+                    }
                 }
                 continue;
             }
             std::string sourceName = args[i].CallerName;
-            if (sourceName.empty() && args[i].FieldName.empty())
+            const std::string movePath = FieldMoveKey(args[i]);
+            const bool wholeBindingSource = !args[i].IsElementAccess
+                && args[i].FieldName.empty() && args[i].OwningStructName.empty();
+            if (sourceName.empty() && movePath.empty())
                 sourceName = args[i].TypeAndValue.VariableName;
             const bool paramIsMoveSink = params[i].IsMove
                 || (!params[i].Pointer && !params[i].IsAlias
@@ -1827,11 +1834,10 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 // object remains alive, so do not zero its storage or retire its destructor.
                 if (!beforeCall)
                 {
-                    if (!sourceName.empty() && args[i].FieldName.empty()
-                        && !args[i].IsElementAccess)
+                    if (!sourceName.empty() && !movePath.empty())
+                        MarkVariableFieldMoved(sourceName, movePath);
+                    else if (!sourceName.empty() && !args[i].IsElementAccess)
                         MarkVariableMoved(sourceName);
-                    else if (!sourceName.empty() && !args[i].FieldName.empty())
-                        MarkVariableFieldMoved(sourceName, args[i].FieldName);
                 }
                 continue;
             }
@@ -2022,11 +2028,12 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 // Look up the source by name so we still null its alloca and prevent a double-free.
                 llvm::Value* srcStorage = args[i].Storage;
                 llvm::Type*  srcBaseTy  = args[i].BaseType;
-                bool isFieldAccess = !args[i].FieldName.empty();
+                bool isFieldAccess = !movePath.empty();
                 // The CallerName fallback resolves the BASE variable's storage; do NOT use it
                 // for a field access or it would null the base pointer instead of the field.
                 // A field access already carries its own (GEP) Storage.
-                if (srcStorage == nullptr && !isFieldAccess && !sourceName.empty())
+                if (srcStorage == nullptr && !isFieldAccess && wholeBindingSource
+                    && !sourceName.empty())
                 {
                     auto ref = FindVariableStorage(sourceName);
                     srcStorage = ref.Storage;
@@ -2059,10 +2066,10 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                         }
                         else if (!source.CallerName.empty())
                         {
-                            if (!source.FieldName.empty())
-                            {
+                            if (!source.MovePathHasDynamicIndex && !source.MovePathKey.empty())
+                                MarkVariableFieldMoved(source.CallerName, source.MovePathKey);
+                            else if (!source.FieldName.empty())
                                 MarkVariableFieldMoved(source.CallerName, source.FieldName);
-                            }
                             else if (!source.IsElementAccess)
                                 MarkVariableMoved(source.CallerName);
                         }
@@ -2095,7 +2102,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                             if (args[i].FieldName.empty() && args[i].OwningStructName.empty()
                                 && !args[i].IsElementAccess)
                                 StoreRawArrayLength(args[i], nullptr);
-                            if (!isFieldAccess)
+                            if (!isFieldAccess && wholeBindingSource)
                                 SetOwnMoveOrigin(srcStorage, currentLine, currentColumn);
                         }
                         else if (params[i].TypeName == "string" && args[i].IsOwningString)
@@ -2138,7 +2145,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     && (args[i].IsOwning || IsVariableOwning(sourceName))
                     && srcStorage != nullptr)
                 {
-                    if (!args[i].DeferMovedMark && !sourceName.empty() && !isFieldAccess)
+                    if (!args[i].DeferMovedMark && !sourceName.empty() && !isFieldAccess
+                        && wholeBindingSource)
                         MarkVariableMoved(sourceName);
                 }
                 // Compile-time: mark the caller's storage as moved so subsequent reads are rejected.
@@ -2153,8 +2161,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     if (isPtr || isOwningStr || isStruct)
                     {
                         if (isFieldAccess)
-                            MarkVariableFieldMoved(sourceName, args[i].FieldName);
-                        else
+                            MarkVariableFieldMoved(sourceName, movePath);
+                        else if (wholeBindingSource)
                             MarkVariableMoved(sourceName);
                     }
                 }
@@ -2165,7 +2173,10 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
             if (!beforeCall && foreignCxxPointerSink && !args[i].TypeAndValue.Pointer
                 && IsCoreUniqueType(args[i].TypeAndValue.TypeName)
                 && args[i].IsExplicitMove && !sourceName.empty())
-                MarkVariableMoved(sourceName);
+            {
+                if (!movePath.empty()) MarkVariableFieldMoved(sourceName, movePath);
+                else if (wholeBindingSource) MarkVariableMoved(sourceName);
+            }
         }
     }
 
@@ -2658,6 +2669,8 @@ llvm::Value* LLVMBackend::LowerByValueArg(llvm::Value* value, const TypeAndValue
 bool LLVMBackend::ArgumentProvablyMismatchesParameter(const NamedVariable& arg, const TypeAndValue& param) const
 {
         if (!param.IsFunctionPointer && !IsEncodedClosureType(param.TypeName))
+            return false;
+        if (ClosureValueCanAdaptToSlot(arg, param))
             return false;
         // Second proof: two signatures that provably name different function types, at the same
         // indirection shape. Precedes the closure early-out, which such a pointer would satisfy.

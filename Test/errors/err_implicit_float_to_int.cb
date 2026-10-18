@@ -17,6 +17,9 @@ expect_error("loses the fractional part") {
 expect_error("loses the fractional part") {
     u32 t151GlobalInit = 3000000000.5;
 }
+expect_error("loses the fractional part") {
+    t300.IntCtor t300ReturnInt(double source) { return source; }
+}
 
 struct T151Bits { u32 a : 12; u32 b : 20; };
 struct T151Named { int i = 0; };
@@ -24,6 +27,11 @@ struct T151Named { int i = 0; };
 extern int main()
 {
     double d = 2.5;
+    // T300: copy-init constructs directly into the destination slot, including the return slot.
+    expect_error("loses the fractional part") { t300.IntCtor t300CopyInt = d; }
+    expect_error("loses the fractional part") { t300.CharCtor t300CopyChar = d; }
+    expect_error("loses the fractional part") { t300.LongCtor t300CopyLong = d; }
+    expect_error("loses the fractional part") { t300.Pick t300CopyPick = d; }
     expect_error("loses the fractional part") {
         int declInit = d;
     }

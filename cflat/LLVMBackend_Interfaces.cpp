@@ -1582,6 +1582,197 @@ bool LLVMBackend::ClosureIsStaticallyNonCapturing(llvm::Value* fatVal)
         return llvm::isa<llvm::ConstantPointerNull>(envField);
     }
 
+bool LLVMBackend::ClosureValueCanAdaptToSlot(const NamedVariable& value,
+        const TypeAndValue& requestedSlot) const
+{
+        TypeAndValue slot = requestedSlot;
+        if (!slot.IsFunctionPointer && !slot.Pointer)
+            if (const auto* enc = GetEncodedClosureType(slot.TypeName))
+                slot = *enc;
+        TypeAndValue source = value.TypeAndValue;
+        if (value.HasOriginalArgumentType
+            && (source.FuncPtrReturnTypeName.empty() || !source.IsFunctionPointer))
+            source = value.OriginalArgumentType;
+        bool namedFunction = false;
+        if (auto* fn = llvm::dyn_cast_or_null<llvm::Function>(value.Primary))
+        {
+            if (const auto* symbol = FindSymbolForFunction(fn))
+            {
+                source = FuncPtrSigOfSymbol(*symbol);
+                namedFunction = true;
+            }
+        }
+        if (!source.IsFunctionPointer && !source.Pointer)
+            if (const auto* enc = GetEncodedClosureType(source.TypeName))
+                source = *enc;
+        if (source.FuncPtrReturnTypeName.empty()
+            || !FuncPtrFewerParamsCanAdapt(source, slot))
+            return false;
+        bool envKnownFree = value.ClosureEnvKnownFree
+            && !value.ClosureEnvProvenanceTainted;
+        if (!envKnownFree && !value.ClosureEnvProvenanceTainted && value.Storage != nullptr)
+            if (const auto* binding = FindVariableByStorage(value.Storage))
+                envKnownFree = binding->ClosureEnvKnownFree
+                    && !binding->ClosureEnvProvenanceTainted;
+        return namedFunction
+            || source.IsThinFnPtr()
+            || envKnownFree
+            || value.IsExplicitMove;
+    }
+
+llvm::Value* LLVMBackend::AdaptClosureValueToSlot(llvm::Value* value,
+        NamedVariable& source, const TypeAndValue& requestedSlot)
+{
+        TypeAndValue slot = requestedSlot;
+        if (!slot.IsFunctionPointer && !slot.Pointer)
+            if (const auto* enc = GetEncodedClosureType(slot.TypeName))
+                slot = *enc;
+        TypeAndValue sourceSig = source.TypeAndValue;
+        if (source.HasOriginalArgumentType
+            && (sourceSig.FuncPtrReturnTypeName.empty() || !sourceSig.IsFunctionPointer))
+            sourceSig = source.OriginalArgumentType;
+        if (sourceSig.FuncPtrReturnTypeName.empty() && !sourceSig.Pointer)
+            if (const auto* enc = GetEncodedClosureType(sourceSig.TypeName))
+                sourceSig = *enc;
+        auto* namedFn = llvm::dyn_cast_or_null<llvm::Function>(value);
+        if (namedFn == nullptr)
+            namedFn = llvm::dyn_cast_or_null<llvm::Function>(source.Primary);
+        if (namedFn != nullptr)
+        {
+            if (const auto* symbol = FindSymbolForFunction(namedFn))
+                sourceSig = FuncPtrSigOfSymbol(*symbol);
+        }
+        if (!ClosureValueCanAdaptToSlot(source, slot))
+            return value;
+        if (sourceSig.FuncPtrReturnTypeName.empty())
+            return value;
+
+        llvm::Value* innerValue = value != nullptr ? value : source.Primary;
+        if (auto* fn = llvm::dyn_cast_or_null<llvm::Function>(innerValue))
+            innerValue = WrapBareValueAsFatStruct(fn);
+        else if (innerValue != nullptr && innerValue->getType()->isPointerTy()
+            && sourceSig.IsThinFnPtr())
+            innerValue = WidenThinToFat(innerValue, sourceSig);
+        auto* closureTy = GetClosureFatPtrType();
+        if (innerValue == nullptr || innerValue->getType() != closureTy)
+            return value;
+
+        const std::string adapterName = "__closure_adapter_" + CreateAnonFunctionName();
+        auto* envTy = llvm::StructType::create(*context, { closureTy }, adapterName + ".env");
+        llvm::Function* cleanup = GenerateClosureCaptureCleanup(
+            adapterName + ".cleanup", envTy, { { 0u, "__closure_fat_ptr" } });
+        llvm::Function* envNew = GetFunction("__closure_env_new");
+        if (envNew == nullptr)
+            LogErrorMessage("cannot adapt this Lambda<> value: closure environment allocation is unavailable");
+
+        auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
+        TypeAndValue returnTV;
+        std::vector<TypeAndValue> slotParams;
+        UnpackFuncPtrSignature(slot, returnTV, slotParams);
+        std::vector<TypeAndValue> adapterParams;
+        adapterParams.reserve(slotParams.size() + 1);
+        for (size_t i = 0; i < slotParams.size(); ++i)
+        {
+            slotParams[i].VariableName = "__adapter_arg_" + std::to_string(i);
+            adapterParams.push_back(slotParams[i]);
+        }
+        TypeAndValue envParam;
+        envParam.TypeName = "void";
+        envParam.Pointer = true;
+        envParam.VariableName = "__adapter_env";
+        adapterParams.push_back(envParam);
+
+        BuilderStateGuard savedState(this);
+        auto* adapter = CreateFunctionDefinition(adapterName, returnTV, adapterParams);
+        InitializeBlock(&adapter->front(), false);
+        auto envArg = GetFunctionArgument("__adapter_env");
+        auto* envArgValue = LoadArgStorage(envArg);
+        auto* adapterEnvBase = builder->CreateBitCast(envArgValue, cflat_llvm::PointerTo(envTy));
+        auto* innerPtr = builder->CreateStructGEP(envTy, adapterEnvBase, 0);
+        auto* inner = builder->CreateLoad(closureTy, innerPtr, "adapter_inner");
+
+        std::vector<llvm::Value*> callArgs;
+        std::vector<NamedVariable> callArgNVs;
+        callArgs.reserve(sourceSig.FuncPtrParams.size());
+        callArgNVs.reserve(sourceSig.FuncPtrParams.size());
+        for (size_t i = 0; i < sourceSig.FuncPtrParams.size(); ++i)
+        {
+            auto arg = GetFunctionArgument(adapterParams[i].VariableName);
+            auto* argValue = LoadArgStorage(arg);
+            if (argValue == nullptr)
+                LogErrorMessage("cannot form a Lambda<> arity adapter parameter value");
+            callArgs.push_back(argValue);
+            callArgNVs.push_back(arg);
+        }
+        sourceSig.TypeName = "__closure_fat_ptr";
+        sourceSig.IsFunctionPointer = true;
+        sourceSig.VariableName = adapterName;
+        ApplyFuncPtrSinkTransfer(adapterName, sourceSig.FuncPtrParams, callArgNVs, true);
+        auto* result = CreateIndirectCall(sourceSig, inner, callArgs, &callArgNVs);
+        ApplyFuncPtrSinkTransfer(adapterName, sourceSig.FuncPtrParams, callArgNVs, false);
+        CreateReturnCall(result);
+        RunDeferredEndOfBodyChecks(adapter);
+        if (!stackNamedVariable.empty())
+            stackNamedVariable.pop_back();
+        savedState.restore();
+
+        auto* adapterCode = builder->CreateBitCast(adapter, i8PtrTy, "closure_adapter_code");
+        auto* innerCode = builder->CreateExtractValue(innerValue, { 0u }, "adapter_source_code");
+        auto* nullCode = llvm::ConstantPointerNull::get(i8PtrTy);
+        auto* sourceIsNull = builder->CreateICmpEQ(innerCode, nullCode, "adapter_source_is_null");
+        auto* outerFunction = builder->GetInsertBlock()->getParent();
+        auto* nullBlock = llvm::BasicBlock::Create(*context, adapterName + ".null", outerFunction);
+        auto* allocateBlock = llvm::BasicBlock::Create(*context, adapterName + ".allocate", outerFunction);
+        auto* mergeBlock = llvm::BasicBlock::Create(*context, adapterName + ".merge", outerFunction);
+        builder->CreateCondBr(sourceIsNull, nullBlock, allocateBlock);
+        builder->SetInsertPoint(nullBlock);
+        builder->CreateBr(mergeBlock);
+        builder->SetInsertPoint(allocateBlock);
+        auto* cleanupArg = cleanup != nullptr
+            ? static_cast<llvm::Value*>(builder->CreateBitCast(cleanup, i8PtrTy))
+            : static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(i8PtrTy));
+        const uint64_t envSize = module->getDataLayout().getTypeAllocSize(envTy);
+        auto* taggedEnv = builder->CreateCall(envNew->getFunctionType(), envNew,
+            { llvm::ConstantInt::get(builder->getInt64Ty(), envSize), cleanupArg }, "closure_adapter_env");
+        auto* envInt = builder->CreatePtrToInt(taggedEnv, builder->getInt64Ty());
+        auto* baseInt = builder->CreateAnd(envInt, builder->getInt64(~(uint64_t)1));
+        auto* baseI8 = builder->CreateIntToPtr(baseInt, i8PtrTy);
+        auto* envBase = builder->CreateBitCast(baseI8, cflat_llvm::PointerTo(envTy));
+        builder->CreateStore(innerValue, builder->CreateStructGEP(envTy, envBase, 0));
+        builder->CreateBr(mergeBlock);
+        builder->SetInsertPoint(mergeBlock);
+        auto* outerCode = builder->CreatePHI(i8PtrTy, 2, "closure_adapter_code_or_null");
+        outerCode->addIncoming(nullCode, nullBlock);
+        outerCode->addIncoming(adapterCode, allocateBlock);
+        auto* outerEnv = builder->CreatePHI(i8PtrTy, 2, "closure_adapter_env_or_null");
+        outerEnv->addIncoming(nullCode, nullBlock);
+        outerEnv->addIncoming(taggedEnv, allocateBlock);
+        if (source.IsExplicitMove && source.Storage != nullptr)
+        {
+            builder->CreateStore(llvm::ConstantAggregateZero::get(closureTy), source.Storage);
+            if (!source.CallerName.empty() && source.FieldName.empty() && !source.IsElementAccess)
+                MarkVariableExplicitlyMovedNull(source.CallerName);
+            lastOwningResult = true;
+        }
+        UnregisterOwnedClosureTemp(innerValue);
+        llvm::Value* fat = llvm::UndefValue::get(closureTy);
+        fat = builder->CreateInsertValue(fat, outerCode, { 0u });
+        fat = builder->CreateInsertValue(fat, outerEnv, { 1u });
+        RegisterOwnedClosureTemp(fat);
+        source.Primary = fat;
+        source.Storage = nullptr;
+        source.BaseType = closureTy;
+        source.TypeAndValue = slot;
+        source.TypeAndValue.TypeName = "__closure_fat_ptr";
+        source.IsRvalue = true;
+        source.IsExplicitMove = false;
+        source.ClosureEnvKnownFree = false;
+        source.ClosureEnvProvenanceTainted = true;
+        source.CallerName.clear();
+        source.FieldName.clear();
+        return fat;
+    }
+
 std::string LLVMBackend::DescribeCapturingClosureToThin(const std::vector<std::string>& captureNames) const
 {
         if (captureNames.empty())

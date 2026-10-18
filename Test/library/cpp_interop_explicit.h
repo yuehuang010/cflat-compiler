@@ -238,6 +238,15 @@ struct ConvCnt {
     ConvCnt& operator=(ConvCnt&& o) { v = o.v + 20000; return *this; }
     ~ConvCnt() { ++conv_dtors; }
 };
+// T272: a maker and a taker for ConvCnt (parenthesized-initializer legs). ConvNoDefault has no
+// default constructor, so a CFlat struct holding it has no implicit no-arg construction.
+inline ConvCnt conv_mk(int x) { return ConvCnt(x); }
+inline int conv_take(ConvCnt c) { return c.v; }
+struct ConvNoDefault {
+    int v;
+    ConvNoDefault(int x) : v(x) {}
+};
+inline ConvNoDefault conv_mk_nd(int x) { return ConvNoDefault(x); }
 // A `const char*` converting constructor: a string literal passes its constant pointer.
 struct ConvStr {
     const char* p = nullptr;
@@ -418,6 +427,7 @@ inline int conv_ip_bool_cref(const ConvPtr& c) { return 1; }
 inline int conv_ip_bool_cref(bool b) { return 2; }
 // The bool sibling is NOT viable on its second argument, so C++ calls the ConvIp overload.
 struct ConvIpOther { int v = 0; };
+struct ConvIpField { int f = 0; };
 inline int conv_ip_oa(ConvIp c, int n) { return c.v + n; }
 inline int conv_ip_oa(bool b, ConvIpOther* o) { return 99; }
 struct ConvIpHost {
@@ -426,8 +436,25 @@ struct ConvIpHost {
     ConvIpHost(ConvIp c) : base(c.v) {}
     int add(ConvIp c) const { return base + c.v; }
     int operator-(ConvIp c) const { return base - c.v; }
+    long operator-(long n) const { return 2000 + n; }
+    int operator+(ConvIp c) const { return base + c.v; }
+    bool operator==(ConvIp c) const { return base + c.v == 1007; }
+    ConvIpHost& operator-=(ConvIp c) { base -= c.v; return *this; }
     int pick(ConvIp c) const { return 1; }
     int pick(bool b) const { return 2; }
+};
+inline int operator-(ConvIp c, ConvIpHost h) { return h.base * 10 + c.v; }
+inline int operator|(ConvIp c, ConvIpHost h) { return h.base * 10 + c.v + 1; }
+inline int operator^(ConvIp c, ConvIpHost h) { return h.base * 10 + c.v + 2; }
+inline int operator&(ConvIp c, ConvIpHost h) { return h.base * 10 + c.v + 3; }
+struct ConvIpNeHost { int value = 7; };
+inline bool operator==(ConvIp c, ConvIpNeHost h) { return c.v == h.value; }
+struct ConvIpRevEqHost {
+    int base = 1000;
+    bool operator==(ConvIp c) const { return base + c.v == 1007; }
+};
+struct ConvIpRevSpaceshipHost {
+    int operator<=>(ConvIp c) const { return c.v - 6; }
 };
 template <class T> struct ConvBox {
     T v{};
@@ -485,3 +512,44 @@ struct Rr { int c; Rr(int&&) : c(1) {} };
 }
 namespace r2 { struct Tm { int c; Tm(int) : c(1) {} template <class U> Tm(U) : c(2) {} }; }
 namespace rv { struct TT { int chosen; template <class U> TT(U) : chosen(1) {} TT(int) : chosen(2) {} }; }
+
+// Class-pointer operands must reach their converting constructor at C++ operators.
+inline int t304ClassPointerSelection = 0;
+struct T304Foo { int value = 3; };
+struct T304R {
+    int value;
+    T304R(const T304Foo* p) : value(p ? p->value : -1) { t304ClassPointerSelection = 301; }
+};
+struct T304H6 { int value = 0; };
+inline int operator-(T304R r, T304H6) { t304ClassPointerSelection = 302; return 600 + r.value; }
+struct T304H8 {
+    int operator-(T304R r) const { t304ClassPointerSelection = 303; return 800 + r.value; }
+};
+struct T304RevEqHost {};
+inline bool operator==(T304R r, T304RevEqHost) {
+    t304ClassPointerSelection = 304;
+    return r.value == 3;
+}
+struct T304RNonConst {
+    int value;
+    T304RNonConst(T304Foo* p) : value(p ? p->value : -1) { t304ClassPointerSelection = 305; }
+};
+struct T304HNonConst {};
+inline int operator-(T304RNonConst r, T304HNonConst) {
+    t304ClassPointerSelection = 306;
+    return 1000 + r.value;
+}
+struct T304CallHost {
+    int f(const T304Foo* p) const { t304ClassPointerSelection = 307; return 900 + p->value; }
+};
+struct T304ExactChoiceHost {};
+inline int operator-(T304R r, T304ExactChoiceHost) {
+    t304ClassPointerSelection = 310;
+    return 400 + r.value;
+}
+inline int operator-(const T304Foo* p, T304ExactChoiceHost) {
+    t304ClassPointerSelection = 311;
+    return 500 + p->value;
+}
+inline const T304Foo* t304_cfoo() { static T304Foo f; return &f; }
+inline int t304_selected() { return t304ClassPointerSelection; }

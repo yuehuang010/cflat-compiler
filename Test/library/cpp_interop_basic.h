@@ -2897,6 +2897,92 @@ inline int operator-(VolTemplateCopyS) { return 22; }
 inline volatile VolTemplateCopyS& volTemplateCopyRef(VolTemplateCopyS& v) { return v; }
 }
 
+// T275: unary member/free ranking for rvalue and xvalue receivers (clang++ -std=c++20 oracle).
+namespace t275 {
+// A non-ref-qualified member binds a prvalue; the `S&` free cannot bind it (clang: 1).
+struct RvalueMemberRefFree { int operator-() { return 1; } };
+inline int operator-(RvalueMemberRefFree&) { return 2; }
+inline RvalueMemberRefFree rvalueMemberRefFreeMake() { return RvalueMemberRefFree{}; }
+// An overloaded `!` reached through a call that returns `T&&` (clang: 7).
+struct XvalueNot { int operator!() const { return 7; } };
+inline XvalueNot&& xvalueNotRef(XvalueNot& v) { return static_cast<XvalueNot&&>(v); }
+// An xvalue binds the `&&`-qualified member; the `const&` free ranks below it (clang: 1).
+struct XvalueRvalueMember { int operator-() && { return 1; } };
+inline int operator-(const XvalueRvalueMember&) { return 2; }
+inline XvalueRvalueMember&& xvalueRvalueRef(XvalueRvalueMember& v) { return static_cast<XvalueRvalueMember&&>(v); }
+// Unary `~` and `+` on a `T&&` call result reach the member (clang: 8, 9).
+struct XvalueTilde { int operator~() { return 8; } int operator+() && { return 9; } };
+inline XvalueTilde&& xvalueTildeRef(XvalueTilde& v) { return static_cast<XvalueTilde&&>(v); }
+}
+
+// T280: binary member/free ranking on a class receiver (clang++ -std=c++20 oracle values in comments).
+namespace t280 {
+// A non-const lvalue ties the member and the `S&` free: clang reports the call ambiguous.
+struct TieMember { int operator+(int) { return 1; } };
+inline int operator+(TieMember&, int) { return 2; }
+// A prvalue receiver binds the non-ref-qualified member; the `S&` free cannot bind it (clang: 1).
+struct RvalueMember { int operator+(int) { return 1; } };
+inline int operator+(RvalueMember&, int) { return 2; }
+inline RvalueMember rvalueMemberMake() { return RvalueMember{}; }
+// A ref-qualified member cannot take a prvalue; the by-value free can (clang: 2).
+struct LrefMember { int operator+(int) & { return 1; } };
+inline int operator+(LrefMember, int) { return 2; }
+inline LrefMember lrefMemberMake() { return LrefMember{}; }
+// An `S&&` free takes the prvalue the `&`-qualified member cannot (clang: 2).
+struct LrefMemberRref { int operator+(int) & { return 1; } };
+inline int operator+(LrefMemberRref&&, int) { return 2; }
+inline LrefMemberRref lrefMemberRrefMake() { return LrefMemberRref{}; }
+// A const member against an `S&&` free on a prvalue: the free's object is less cv-qualified (clang: 2).
+struct ConstMemberRref { int operator+(int) const { return 1; } };
+inline int operator+(ConstMemberRref&&, int) { return 2; }
+inline ConstMemberRref constMemberRrefMake() { return ConstMemberRref{}; }
+// A non-const member against a `const S&` free on a non-const lvalue: the member is less cv-qualified (clang: 1).
+struct MemberCref { int operator+(int) { return 1; } };
+inline int operator+(const MemberCref&, int) { return 2; }
+// The non-const member is not viable on a const lvalue; the by-value free is (clang: 2).
+struct EqMemberVal { int operator==(int) { return 1; } };
+inline int operator==(EqMemberVal, int) { return 2; }
+inline const EqMemberVal& eqConstRef(EqMemberVal& v) { return v; }
+// An inherited member's object is a derived-to-base conversion: the exact `InhDer&` free wins (clang: 2).
+struct InhBase { int operator+(int) { return 1; } };
+struct InhDer : InhBase {};
+inline int operator+(InhDer&, int) { return 2; }
+// The same against a `const InhCDer&` free on a non-const lvalue (clang: 2).
+struct InhCBase { int operator+(int) { return 1; } };
+struct InhCDer : InhCBase {};
+inline int operator+(const InhCDer&, int) { return 2; }
+inline int oneValue() { return 1; }
+// An unsigned right operand is a declared type: the member `unsigned int` takes the lvalue (clang: 1).
+struct UintMember { int operator+(unsigned int) { return 1; } };
+inline int operator+(const UintMember&, unsigned int) { return 2; }
+struct UlongMember { int operator+(unsigned long) { return 1; } };
+inline int operator+(const UlongMember&, unsigned long) { return 2; }
+// An int member and an unsigned free tie on a non-const lvalue (clang: ambiguous).
+struct UintTie { int operator+(int) { return 1; } };
+inline int operator+(const UintTie&, unsigned int) { return 2; }
+// A by-value exact free beats an inherited member's derived-to-base object (clang: 2).
+struct ByValBase { int operator+(int) { return 1; } };
+struct ByValDer : ByValBase {};
+inline int operator+(ByValDer, int) { return 2; }
+struct ByValLongBase { int operator+(long) { return 1; } };
+struct ByValLongDer : ByValLongBase {};
+inline int operator+(ByValLongDer, int) { return 2; }
+}
+
+// T291: a reversed `<=>` relation (`5 > x` as `0 > (x <=> 5)`) reads the mirrored ordering range
+// (clang++ -std=c++20 oracle values in comments).
+namespace t291 {
+// A const member `<=>` and a free `<=>`: the reversed rewrite answers `5 @ value` with the usual order.
+struct OrdMember { int v; std::strong_ordering operator<=>(int x) const { return v <=> x; } };
+inline OrdMember ordMemberMake(int v) { OrdMember o; o.v = v; return o; }
+struct OrdFree { int v; };
+inline std::strong_ordering operator<=>(const OrdFree& o, int x) { return o.v <=> x; }
+inline OrdFree ordFreeMake(int v) { OrdFree o; o.v = v; return o; }
+// The reversed `==` (and `!=` negated from it) on a member.
+struct EqMember { int v; bool operator==(int x) const { return v == x; } };
+inline EqMember eqMemberMake(int v) { EqMember e; e.v = v; return e; }
+}
+
 namespace t172
 {
     template<class T> struct InvalidVirtual

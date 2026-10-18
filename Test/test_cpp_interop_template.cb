@@ -639,6 +639,19 @@ extern int main()
         if (t92Explicit.c != 3005) return 55033;
         t55.ExplicitLeg t92Direct = t55.ExplicitLeg(k ? 5 : 6);
         if (t92Direct.c != 1005) return 55034;
+        t55.AssignNarrowUnsigned t297Unsigned = default;
+        t297Unsigned = i;
+        if (t297Unsigned.c != 4005) return 55035;
+        t55.AssignNarrowExplicit t297Explicit = default;
+        t297Explicit = i;
+        if (t297Explicit.c != 3005) return 55036;
+        t55.AssignNarrowExplicit t297CopyInit = i;
+        if (t297CopyInit.c != 3005) return 55037;
+        t55.AssignNarrowRoute t297Route = t55.AssignNarrowRoute(1u);
+        t297Route = i;
+        if (t297Route.c != 1005 || t297Route.via != 2) return 55038;
+        t55.assignNarrowGlobal = i;
+        if (t55.assignNarrowGlobal.c != 3005) return 55039;
     }
 
     // T23: under NDEBUG assert expands to ((void)0) and evaluates nothing, as in C++.

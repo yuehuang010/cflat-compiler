@@ -2,9 +2,75 @@
 // still runs at scope exit, but reading it is an error). Same diagnostic text as every other
 // use-after-move site - C++ has no null state to read instead.
 import cpp "cpp_interop_basic.h";
+// T293: with a cpp import present, a sibling re-init does not revive a nested moved CFlat unique
+// field (the C++ call invokes used to hide the dereference from the null dataflow).
+import "unique.cb";
+struct SibReP { int v = 0; ~SibReP() { } };
+struct SibReS { unique SibReP* p = nullptr; };
+struct SibReO { SibReS b; SibReS c; };
+expect_error("dereference of moved variable 'o.b.p'") {
+    void nestedSiblingReinitWithCppImport()
+    {
+        SibReO o = default;
+        o.b.p = new SibReP();
+        SibReS t = default;
+        t.p = o.b.p;
+        o.c.p = new SibReP();
+        int r = o.b.p->v;
+    }
+}
+// The re-init of the moved path itself revives it: this function compiles.
+void ownFieldReinitRevives()
+{
+    SibReO o = default;
+    o.b.p = new SibReP();
+    SibReS t = default;
+    t.p = o.b.p;
+    o.b.p = new SibReP();
+    int r = o.b.p->v;
+}
+
+// T295: a by-value 'move' parameter consumes a lowered struct (a C++ field) exactly as a plain
+// struct; the plain control is PlainMove. A copy parameter (copyLoweredMove) stays readable.
+struct LoweredMove
+{
+    cppi.Tracked t = cppi.Tracked(1);
+    int id = 0;
+};
+void passLoweredMove(move LoweredMove b) { }
+void copyLoweredMove(LoweredMove b) { }
+
+struct PlainMove
+{
+    int id = 0;
+    ~PlainMove() { }
+};
+void passPlainMove(move PlainMove b) { }
 
 extern int main()
 {
+    expect_error("use of moved variable 'lm'") {
+        LoweredMove lm = default;
+        passLoweredMove(lm);
+        int leak = lm.id;
+    }
+    expect_error("use of moved variable 'lm'") {
+        LoweredMove lm = default;
+        passLoweredMove(move lm);
+        passLoweredMove(lm);
+    }
+    expect_error("use of moved variable 'pm'") {
+        PlainMove pm = default;
+        passPlainMove(pm);
+        int leak = pm.id;
+    }
+    LoweredMove copied = default;
+    copyLoweredMove(copied);
+    int stillReadable = copied.id;
+    LoweredMove again = default;
+    passLoweredMove(move again);
+    again = default;
+    int revived = again.id;
     expect_error("use of moved variable 'src'") {
         cppi.Tracked src = cppi.Tracked(1);
         cppi.Tracked dst = move src;

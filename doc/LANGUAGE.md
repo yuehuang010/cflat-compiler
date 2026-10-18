@@ -1419,9 +1419,11 @@ This applies to `string` only, because it is the one owning type with a cheap to
 Every other owning value read off a temporary is still rejected (`unique T*` fields, structs that
 own a resource): those have no safe implicit duplicate, so bind the whole call result to a local
 first, or write `.copy()`. Declaring the binding **`alias`** opts out of the implicit copy and keeps
-the borrow you asked for, so `alias string a = bars.get(0).date;` is still rejected at the binding,
-and a named `alias` string local is still rejected at a field store - copying either one silently
-would make a second owner.
+the borrow you asked for, so `alias T a = bars.get(0).date;` (generic `T` instantiated with `string`)
+is still rejected at the binding, and a named `alias` string local is still rejected at a field store -
+copying either one silently would make a second owner. `alias` qualifies pointer types only: `string`
+is a primitive, so `alias string` is a compile error in every position (return type, local, parameter,
+field, global); write plain `string` instead.
 
 ### Moving into a `move` parameter: the slot rule
 

@@ -418,7 +418,8 @@ if [ "$RUN_MODE" -eq 1 ]; then
   fi
 fi
 
-# Warm-cache pass: populate the --init-local bitcode cache, then re-run the negative
+# Warm-cache pass: populate the local bitcode cache (--init-local-prune = --init-local
+# plus deleting cache generations this build cannot read), then re-run the negative
 # tests against it. This exercises the serializer round-trip that test.bat covers
 # on Windows but test.sh previously never did. See
 # internal/issue/init-cache-state-drop-invisible-on-posix.md.
@@ -426,10 +427,10 @@ fi
 # Debug/Release pair testing concurrently then cannot collide on one ~/.cflat, and the
 # suite never overwrites the developer's own per-user cache.
 if [ "$RUN_MODE" -eq 0 ]; then
-  if "$CFLAT" --init-local >"$RES/_init.log" 2>&1; then
+  if "$CFLAT" --init-local-prune >"$RES/_init.log" 2>&1; then
     printf '%s' "$err_list" | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_err_warm "$@"' _ {}
   else
-    echo "FAIL: cflat --init-local crashed (warm-cache pass could not run)"
+    echo "FAIL: cflat --init-local-prune crashed (warm-cache pass could not run)"
     echo "FAIL" >"$RES/_init.result"
     tail -n 8 "$RES/_init.log" 2>/dev/null
   fi

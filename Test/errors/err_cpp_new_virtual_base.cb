@@ -1,0 +1,10 @@
+// `new` of a C++ class with virtual inheritance is refused with the reason a by-value use gets
+// (its layout is an opaque shell on purpose), not a generic "cannot compute size" failure.
+// A pointer to such a class stays legal - see err_cpp_virtual_base.cb.
+import cpp "cpp_interop_poly.h";
+
+expect_error("uses virtual inheritance, which is not supported yet") {
+    cpppoly.VBaseMid* m = new cpppoly.VBaseMid();
+}
+
+extern int main() { return 0; }

@@ -1,8 +1,7 @@
 // A function-pointer VALUE (a function<> or Lambda<> variable, field, call result, or ternary) bound to
 // a slot of another signature is refused at each value site: declaration, assignment, return, and
-// brace or field initializer. A Lambda<> value with fewer parameters than the slot is refused too,
-// because a closure's environment is its last argument. Accepts live in
-// Test/test_function_ptr.cb (testFuncPtrValueSlotAccepts).
+// brace or field initializer. Capturing Lambda<> values with fewer parameters are refused unless
+// explicitly moved; proven env-free values are covered in Test/test_function_ptr.cb.
 
 int t195Add2(int a, int b) { return a + b; }
 int t195Dbl(int a)         { return a * 2; }
@@ -44,17 +43,6 @@ expect_error("a closure's environment is its last argument") {
     }
 }
 
-// Declaration, a NON-capturing closure variable with fewer parameters: refused too, because the
-// static type does not tell a capturing closure from a non-capturing one.
-expect_error("a closure's environment is its last argument") {
-    int declPlainFewer()
-    {
-        Lambda<int(int)> L = (int a) => { return a * 2; };
-        Lambda<int(int, int)> M = L;
-        return M(1, 2);
-    }
-}
-
 // Assignment, function<> value with more parameters than the Lambda<> slot.
 expect_error("function-pointer signature mismatch: slot takes 'int(int)' but the value is 'int(int, int)'") {
     int assignFnMore()
@@ -63,6 +51,51 @@ expect_error("function-pointer signature mismatch: slot takes 'int(int)' but the
         function<int(int, int)> p = t195Add2;
         L = p;
         return L(1);
+    }
+}
+
+// A capturing source remains refused at a call-argument bind unless it is explicitly moved.
+expect_error("arity differs: one takes 1 parameter(s), the other 2") {
+    int callCapturedFewer(Lambda<int(int, int)> fn) { return fn(1, 2); }
+    int callCapturedFewerSource()
+    {
+        int k = 3;
+        Lambda<int(int)> L = (int a) => { return a + k; };
+        return callCapturedFewer(L);
+    }
+}
+
+// A known capturing local cannot be implicitly copied into a wider return slot.
+expect_error("a closure's environment is its last argument") {
+    Lambda<int(int, int)> returnsCapturedLocal()
+    {
+        int k = 4;
+        Lambda<int(int)> L = (int a) => { return a + k; };
+        return L;
+    }
+}
+
+// A capturing source remains refused for both struct field store spellings.
+expect_error("a closure's environment is its last argument") {
+    struct Err195CapField { Lambda<int(int, int)> fn; };
+    int assignCapturedField()
+    {
+        int k = 5;
+        Lambda<int(int)> L = (int a) => { return a + k; };
+        Err195CapField h;
+        h.fn = L;
+        return h.fn(1, 2);
+    }
+}
+
+expect_error("a closure's environment is its last argument") {
+    struct Err195CapBrace { Lambda<int(int, int)> fn; };
+    int braceCapturedField()
+    {
+        int k = 6;
+        Lambda<int(int)> L = (int a) => { return a + k; };
+        Err195CapBrace h = { fn = L };
+        return h.fn(1, 2);
     }
 }
 
@@ -198,5 +231,263 @@ expect_error("cannot bind function 't195Gen2<int>' to function-pointer type 'int
     {
         function<int(int)> g = t195Gen2<int>;
         return g(1);
+    }
+}
+
+// An unsafe loop-back store taints a previously noncapturing local before assignment codegen.
+expect_error("a closure's environment is its last argument") {
+    int t271LoopAssignmentRefusal()
+    {
+        int k = 3;
+        Lambda<int(int)> source = (int a) => { return a; };
+        Lambda<int(int, int)> wide = nullptr;
+        for (int i = 0; i < 4; i++) {
+            wide = source;
+            source = (int a) => { return a + k; };
+        }
+        return wide(1, 2);
+    }
+}
+
+// The same loop-back store must taint the local before an in-loop declaration copies it.
+expect_error("a closure's environment is its last argument") {
+    int t271LoopDeclarationRefusal()
+    {
+        int k = 3;
+        Lambda<int(int)> source = (int a) => { return a; };
+        int sum = 0;
+        for (int i = 0; i < 4; i++) {
+            Lambda<int(int, int)> wide = source;
+            sum += wide(1, 2);
+            source = (int a) => { return a + k; };
+        }
+        return sum;
+    }
+}
+
+// A conditional reassignment in a while loop is part of the same whole-scope proof.
+expect_error("a closure's environment is its last argument") {
+    int t271WhileIfRefusal()
+    {
+        int k = 3;
+        Lambda<int(int)> source = (int a) => { return a; };
+        int sum = 0;
+        int i = 0;
+        while (i < 3) {
+            Lambda<int(int, int)> wide = source;
+            sum += wide(1, 2);
+            if (i == 0) source = (int a) => { return a + k; };
+            i++;
+        }
+        return sum;
+    }
+}
+
+// Passing the local by value is safe only while every loop-back value is env-free.
+expect_error("arity differs: one takes 1 parameter(s), the other 2") {
+    int t271ApplyWideInLoop(Lambda<int(int, int)> fn) { return fn(1, 2); }
+    int t271LoopCallArgumentRefusal()
+    {
+        int k = 3;
+        Lambda<int(int)> source = (int a) => { return a; };
+        int sum = 0;
+        for (int i = 0; i < 4; i++) {
+            sum += t271ApplyWideInLoop(source);
+            source = (int a) => { return a + k; };
+        }
+        return sum;
+    }
+}
+
+// A store from an inner local that shadows a live thin name is judged by the inner declaration.
+int t271ShadowTf(int a) { return a; }
+expect_error("a closure's environment is its last argument") {
+    int t271ShadowedThinNameRefusal()
+    {
+        int k = 3;
+        function<int(int)> g = t271ShadowTf;
+        Lambda<int(int)> source = (int a) => { return a; };
+        int sum = 0;
+        for (int i = 0; i < 4; i++) {
+            Lambda<int(int, int)> wide = source;
+            sum += wide(1, 2);
+            { Lambda<int(int)> g = (int a) => { return a + k; }; source = g; }
+        }
+        return sum + g(0);
+    }
+}
+
+// A for-in element shadowing a live thin name is bound in the body: never proven env-free.
+struct T271Bag { Lambda<int(int)>[2] items = default; int count() { return 0; } Lambda<int(int)> get(int i) { return items[i]; } };
+expect_error("a closure's environment is its last argument") {
+    int t271ForInShadowRefusal(T271Bag* bag)
+    {
+        function<int(int)> g = t271ShadowTf;
+        Lambda<int(int)> source = (int a) => { return a; };
+        int sum = 0;
+        for (int i = 0; i < 2; i++) {
+            Lambda<int(int, int)> wide = source;
+            sum += wide(1, 2);
+            for (Lambda<int(int)> g in *bag) { source = g; }
+        }
+        return sum + g(0);
+    }
+}
+
+// A monomorphized generic parameter has unknown closure-environment provenance at the declaration site.
+expect_error("function-pointer signature mismatch: slot takes 'int(int, int)' but the value is 'int(int)'") {
+    int t279GenericDeclaration<T>(T source)
+    {
+        Lambda<int(int, int)> wide = source;
+        return wide(1, 2);
+    }
+    int t279GenericDeclarationSource()
+    {
+        int k = 3;
+        Lambda<int(int)> narrow = (int a) => { return a + k; };
+        return t279GenericDeclaration<Lambda<int(int)>>(narrow);
+    }
+}
+
+// Deduction must retain the captured Lambda signature instead of binding T to __closure_fat_ptr.
+expect_error("function-pointer signature mismatch: slot takes 'int(int, int)' but the value is 'int(int)'") {
+    int t279R2DeducedCapture<T>(T source)
+    {
+        Lambda<int(int, int)> wide = source;
+        return wide(1, 2);
+    }
+    int t279R2DeducedCaptureSource()
+    {
+        int k = 3;
+        Lambda<int(int)> narrow = (int a) => { return a + k; };
+        return t279R2DeducedCapture(narrow);
+    }
+}
+
+// An env-free Lambda deduces its signature too, matching the explicit-T refusal above.
+expect_error("function-pointer signature mismatch: slot takes 'int(int, int)' but the value is 'int(int)'") {
+    int t279R2DeducedEnvFree<T>(T source)
+    {
+        Lambda<int(int, int)> wide = source;
+        return wide(1, 2);
+    }
+    int t279R2DeducedEnvFreeSource()
+    {
+        Lambda<int(int)> narrow = (int a) => { return a + 4; };
+        return t279R2DeducedEnvFree(narrow);
+    }
+}
+
+// Decode the generic destination type T before checking this declaration's signature.
+expect_error("function-pointer signature mismatch: slot takes 'int(int, int)' but the value is 'int(int)'") {
+    int t279R2WideDeclaration<T>(Lambda<int(int)> source)
+    {
+        T wide = source;
+        return wide(1, 2);
+    }
+    int t279R2WideDeclarationSource()
+    {
+        int k = 3;
+        Lambda<int(int)> narrow = (int a) => { return a + k; };
+        return t279R2WideDeclaration<Lambda<int(int, int)>>(narrow);
+    }
+}
+
+// Decode the generic return slot T before checking the returned narrow closure.
+expect_error("function-pointer signature mismatch: slot takes 'int(int, int)' but the value is 'int(int)'") {
+    T t279R2WideReturn<T>(Lambda<int(int)> source) { return source; }
+    int t279R2WideReturnSource()
+    {
+        int k = 3;
+        Lambda<int(int)> narrow = (int a) => { return a + k; };
+        Lambda<int(int, int)> wide = t279R2WideReturn<Lambda<int(int, int)>>(narrow);
+        return wide(1, 2);
+    }
+}
+
+// The same signature gate applies to assignment after the destination was initialized.
+expect_error("function-pointer signature mismatch: slot takes 'int(int, int)' but the value is 'int(int)'") {
+    int t279GenericAssignment<T>(T source)
+    {
+        Lambda<int(int, int)> wide = (int a, int b) => { return -1; };
+        wide = source;
+        return wide(1, 2);
+    }
+    int t279GenericAssignmentSource()
+    {
+        int k = 3;
+        Lambda<int(int)> narrow = (int a) => { return a + k; };
+        return t279GenericAssignment<Lambda<int(int)>>(narrow);
+    }
+}
+
+// Returning the generic parameter to a wider closure return slot is the same value bind.
+expect_error("function-pointer signature mismatch: slot takes 'int(int, int)' but the value is 'int(int)'") {
+    Lambda<int(int, int)> t279GenericReturn<T>(T source) { return source; }
+    int t279GenericReturnSource()
+    {
+        int k = 3;
+        Lambda<int(int)> narrow = (int a) => { return a + k; };
+        Lambda<int(int, int)> wide = t279GenericReturn<Lambda<int(int)>>(narrow);
+        return wide(1, 2);
+    }
+}
+
+// A generic source cannot satisfy a wider function parameter without a proven adapter source.
+expect_error("function-pointer signature mismatch") {
+    int t279ApplyWide(Lambda<int(int, int)> fn) { return fn(1, 2); }
+    int t279GenericCallArgument<T>(T source) { return t279ApplyWide(source); }
+    int t279GenericCallArgumentSource()
+    {
+        int k = 3;
+        Lambda<int(int)> narrow = (int a) => { return a + k; };
+        return t279GenericCallArgument<Lambda<int(int)>>(narrow);
+    }
+}
+
+// A field store inside the instantiated generic body must use the slot predicate too.
+expect_error("function-pointer signature mismatch: slot takes 'int(int, int)' but the value is 'int(int)'") {
+    struct T279WideField { Lambda<int(int, int)> fn; };
+    int t279GenericField<T>(T source)
+    {
+        T279WideField hold;
+        hold.fn = source;
+        return hold.fn(1, 2);
+    }
+    int t279GenericFieldSource()
+    {
+        int k = 3;
+        Lambda<int(int)> narrow = (int a) => { return a + k; };
+        return t279GenericField<Lambda<int(int)>>(narrow);
+    }
+}
+
+// The body cannot infer a generic parameter's environment provenance from one env-free call.
+expect_error("function-pointer signature mismatch: slot takes 'int(int, int)' but the value is 'int(int)'") {
+    int t279GenericEnvFree<T>(T source)
+    {
+        Lambda<int(int, int)> wide = source;
+        return wide(1, 2);
+    }
+    int t279GenericEnvFreeSource()
+    {
+        Lambda<int(int)> narrow = (int a) => { return a + 4; };
+        int envFreeValue = t279GenericEnvFree<Lambda<int(int)>>(narrow);
+        int k = 3;
+        Lambda<int(int)> captured = (int a) => { return a + k; };
+        return envFreeValue + t279GenericEnvFree<Lambda<int(int)>>(captured);
+    }
+}
+
+// An alias generic return must compare its decoded slot signature before returning the value.
+expect_error("function-pointer signature mismatch: slot takes 'int(int, int)' but the value is 'int(int)'") {
+    alias T t279AliasReturnMismatch<T>(alias Lambda<int(int)> source) { return source; }
+    int t279AliasReturnMismatchSource()
+    {
+        int k = 3;
+        Lambda<int(int)> narrow = (int a) => { return a + k; };
+        Lambda<int(int, int)> wide =
+            t279AliasReturnMismatch<Lambda<int(int, int)>>(narrow);
+        return wide(1, 2);
     }
 }

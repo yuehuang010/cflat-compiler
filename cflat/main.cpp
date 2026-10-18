@@ -228,6 +228,8 @@ int main(int argc, char* argv[])
     args.addFlag("init-local", 0, "Populate <exe dir>/.cflat cache instead of the per-user cache, then exit; later compiles from this exe pick it up automatically");
     args.addFlag("init-clear", 0, "Delete BOTH the per-user (%USERPROFILE%\\.cflat / ~/.cflat) and local (<exe dir>/.cflat) cache directories and exit; re-run --init/--init-local afterward to repopulate");
     args.addFlag("init-clear-local", 0, "Delete only the <exe dir>/.cflat cache directory and exit; leaves the per-user cache alone");
+    args.addFlag("init-prune", 0, "Same as --init, then delete cache generations this build cannot read (cheaders/v<N> of another cache version, runtime/<hash> of other core sources), then exit");
+    args.addFlag("init-local-prune", 0, "Same as --init-local, then delete cache generations this build cannot read from <exe dir>/.cflat, then exit");
     args.addFlag("print-supported-cpus", 0, "List the target CPUs accepted by --cpu/--tune for the active --platform, then exit");
     args.addFlag("print-host-cpu", 0, "Print the LLVM name of the host CPU (what --cpu native resolves to), then exit");
     args.addOption("cpu", 0, "Target CPU for code generation (name from --print-supported-cpus, or 'native'); sets ISA features + tuning", "");
@@ -261,6 +263,7 @@ int main(int argc, char* argv[])
         && !args.hasFlag("run") && !args.hasFlag("check") && !args.hasFlag("grammar")
         && !args.hasFlag("init") && !args.hasFlag("init-local")
         && !args.hasFlag("init-clear") && !args.hasFlag("init-clear-local")
+        && !args.hasFlag("init-prune") && !args.hasFlag("init-local-prune")
         && !args.hasFlag("print-supported-cpus") && !args.hasFlag("print-host-cpu")
         && !args.hasFlag("winmd-sig-selftest")
         && !args.getOption("dump-winmd") && !args.getOption("winmd-instantiate")
@@ -340,11 +343,12 @@ int main(int argc, char* argv[])
     }
     auto updateLocale = args.getOption("update-locale");
 
-    // --init / --init-local / --init-clear / --init-clear-local are mutually exclusive;
-    // refuse rather than guessing which one was meant.
+    // --init / --init-local / --init-clear / --init-clear-local and the two prune forms are
+    // mutually exclusive; refuse rather than guessing which one was meant.
     {
         std::vector<std::string> initFlagsSeen;
-        for (const char* f : {"init", "init-local", "init-clear", "init-clear-local"})
+        for (const char* f : {"init", "init-local", "init-clear", "init-clear-local",
+                              "init-prune", "init-local-prune"})
             if (args.hasFlag(f))
                 initFlagsSeen.push_back(f);
         if (initFlagsSeen.size() > 1)
@@ -355,7 +359,7 @@ int main(int argc, char* argv[])
                 if (i) joined += ", ";
                 joined += "--" + initFlagsSeen[i];
             }
-            std::cout << std::format("Error: {} cannot be combined. Pass exactly one of --init, --init-local, --init-clear, --init-clear-local.\n", joined);
+            std::cout << std::format("Error: {} cannot be combined. Pass exactly one of --init, --init-local, --init-clear, --init-clear-local, --init-prune, --init-local-prune.\n", joined);
             return 1;
         }
     }
@@ -410,7 +414,8 @@ int main(int argc, char* argv[])
         return ok ? 0 : 1;
     }
 
-    if (args.hasFlag("init-local"))
+    const bool pruneLocal = args.hasFlag("init-local-prune");
+    if (args.hasFlag("init-local") || pruneLocal)
     {
         std::string localDir = LocalCacheDir();
         if (localDir.empty())
@@ -466,10 +471,13 @@ int main(int argc, char* argv[])
                 std::cout << "Time trace written to init.time-trace.json\n";
             llvm::timeTraceProfilerCleanup();
         }
+        if (ok && pruneLocal)
+            ok = LLVMBackend::PruneCacheDir(localDir, runtimeDir, args.hasFlag("verbose"), "local");
         return ok ? 0 : 1;
     }
 
-    if (args.hasFlag("init"))
+    const bool pruneUser = args.hasFlag("init-prune");
+    if (args.hasFlag("init") || pruneUser)
     {
         std::cout << std::format("cache dir: {}\n", LLVMBackend::GetCflatCacheDir());
 
@@ -486,6 +494,9 @@ int main(int argc, char* argv[])
                 std::cout << "Time trace written to init.time-trace.json\n";
             llvm::timeTraceProfilerCleanup();
         }
+        if (ok && pruneUser)
+            ok = LLVMBackend::PruneCacheDir(LLVMBackend::GetCflatCacheDir(), runtimeDir,
+                                            args.hasFlag("verbose"), "resolved");
         return ok ? 0 : 1;
     }
 

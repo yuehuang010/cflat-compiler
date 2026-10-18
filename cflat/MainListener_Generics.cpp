@@ -603,12 +603,32 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                 if (paramTypeName != tp)
                     continue;
                 const auto& tv = args[i].TypeAndValue;
+                const auto& sourceTV = args[i].HasOriginalArgumentType
+                    ? args[i].OriginalArgumentType : tv;
                 // The call site drops TypeName for primitives, so the declared name arrives on
                 // the side channel; the reference-kind flags are propagated either way.
                 std::string base = tv.TypeName.empty() ? args[i].InferSourceTypeName : tv.TypeName;
                 bool declared = false;
                 std::string argType;
-                if (!base.empty())
+                // A function value's ABI carrier is __closure_fat_ptr / __c_fn_ptr, but C++-style
+                // T deduction binds its declared function type. Re-encode the original signature
+                // with the same key explicit Lambda<> / function<> arguments use.
+                if (paramStars == 0 && !paramView && !sourceTV.Pointer
+                    && sourceTV.IsFunctionPointer && !sourceTV.FuncPtrReturnTypeName.empty())
+                {
+                    argType = EncodeClosureFromSig(compilerLLVM, sourceTV);
+                    declared = true;
+                }
+                else if (paramStars == 0 && !paramView && !sourceTV.Pointer
+                    && !sourceTV.IsFunctionPointer)
+                {
+                    if (compilerLLVM->GetEncodedClosureType(sourceTV.TypeName) != nullptr)
+                    {
+                        argType = sourceTV.TypeName;
+                        declared = true;
+                    }
+                }
+                if (argType.empty() && !base.empty())
                 {
                     // Rebuild the argument's written spelling from its flags: a view carries its
                     // ELEMENT's stars ('int*[]'), a plain pointer its own depth.

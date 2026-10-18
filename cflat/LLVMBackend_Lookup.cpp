@@ -1106,23 +1106,45 @@ bool LLVMBackend::ComponentsProvablyDiffer(const FuncPtrComponent& a, const Func
 
 bool LLVMBackend::FuncPtrSignatureOf(const LLVMBackend::TypeAndValue& tv, std::vector<FuncPtrComponent>& out) const
 {
-        if (tv.FuncPtrReturnTypeName.empty()) return false;
+        TypeAndValue signature = tv;
+        if (signature.FuncPtrReturnTypeName.empty() && !signature.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(signature.TypeName))
+                signature = *encoded;
+        if (signature.FuncPtrReturnTypeName.empty()) return false;
         out.clear();
-        out.push_back(FuncPtrComponentOf(tv.FuncPtrReturnTypeName, tv.FuncPtrReturnPointer,
-            tv.FuncPtrReturnPointerDepth, tv.FuncPtrReturnResolvedKey));
-        for (const auto& p : tv.FuncPtrParams)
+        out.push_back(FuncPtrComponentOf(signature.FuncPtrReturnTypeName, signature.FuncPtrReturnPointer,
+            signature.FuncPtrReturnPointerDepth, signature.FuncPtrReturnResolvedKey));
+        for (const auto& p : signature.FuncPtrParams)
             out.push_back(FuncPtrComponentOf(p.TypeName, p.Pointer, p.PointerDepth, p.ResolvedTypeKey));
         return true;
     }
 
+static bool IsUnknownFatClosureSignature(const LLVMBackend::TypeAndValue& tv)
+{
+        return !tv.Pointer && tv.FuncPtrReturnTypeName.empty()
+            && ((tv.IsFunctionPointer && !tv.IsThinFnPtr())
+                || tv.TypeName == "__closure_fat_ptr");
+}
+
 bool LLVMBackend::FuncPtrSignaturesProvablyDiffer(const LLVMBackend::TypeAndValue& a,
         const LLVMBackend::TypeAndValue& b) const
 {
+        TypeAndValue left = a, right = b;
+        if (left.FuncPtrReturnTypeName.empty() && !left.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(left.TypeName))
+                left = *encoded;
+        if (right.FuncPtrReturnTypeName.empty() && !right.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(right.TypeName))
+                right = *encoded;
         std::vector<FuncPtrComponent> sa, sb;
-        if (!FuncPtrSignatureOf(a, sa) || !FuncPtrSignatureOf(b, sb))
+        if (!FuncPtrSignatureOf(left, sa))
+            return IsUnknownFatClosureSignature(left)
+                && FuncPtrSignatureOf(right, sb)
+                && right.IsFunctionPointer && !right.IsThinFnPtr();
+        if (!FuncPtrSignatureOf(right, sb))
             return false;
         // C: `int(*)(int, ...)` and `int(*)(int)` are different types, whatever the fixed parts.
-        if (a.FuncPtrVariadic != b.FuncPtrVariadic)
+        if (left.FuncPtrVariadic != right.FuncPtrVariadic)
             return true;
         if (sa.size() != sb.size())
             return true;
@@ -1181,8 +1203,12 @@ bool LLVMBackend::NamedFunctionProvablyMismatchesFuncPtr(const std::string& func
         auto it = functionTable.find(functionName);
         if (it == functionTable.end() || it->second.empty()) return false;
         for (const auto& sym : it->second)
-            if (!FuncPtrSignaturesProvablyDiffer(FuncPtrSigOfSymbol(sym), param))
+        {
+            const auto sig = FuncPtrSigOfSymbol(sym);
+            if (!FuncPtrSignaturesProvablyDiffer(sig, param)
+                || FuncPtrFewerParamsCanAdapt(sig, param))
                 return false;
+        }
         return true;
     }
 
@@ -1192,8 +1218,12 @@ const LLVMBackend::FunctionSymbol* LLVMBackend::NamedFunctionOverloadForFuncPtr(
         auto it = functionTable.find(ResolveQualifiedName(functionName));
         if (it == functionTable.end()) return nullptr;
         for (const auto& sym : it->second)
-            if (!sym.IsMethod && !FuncPtrSignaturesProvablyDiffer(FuncPtrSigOfSymbol(sym), param))
+        {
+            const auto sig = FuncPtrSigOfSymbol(sym);
+            if (!sym.IsMethod && (!FuncPtrSignaturesProvablyDiffer(sig, param)
+                || FuncPtrFewerParamsCanAdapt(sig, param)))
                 return &sym;
+        }
         return nullptr;
     }
 
@@ -1207,23 +1237,27 @@ bool LLVMBackend::NamedFunctionArgMismatches(const NamedVariable& arg, const Typ
 
 std::string LLVMBackend::FuncPtrSpellingOf(const LLVMBackend::TypeAndValue& tv) const
 {
+        TypeAndValue signature = tv;
+        if (signature.FuncPtrReturnTypeName.empty() && !signature.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(signature.TypeName))
+                signature = *encoded;
         // One '*' per recorded level, so a depth mismatch is visible as `int**` vs `int*` rather
         // than as two identical-looking spellings.
         TypeAndValue returnType;
-        returnType.TypeName = tv.FuncPtrReturnTypeName;
-        returnType.Pointer = tv.FuncPtrReturnPointer;
-        returnType.PointerDepth = tv.FuncPtrReturnPointerDepth;
+        returnType.TypeName = signature.FuncPtrReturnTypeName;
+        returnType.Pointer = signature.FuncPtrReturnPointer;
+        returnType.PointerDepth = signature.FuncPtrReturnPointerDepth;
         std::string s = SpellType(*this, returnType) + "(";
-        for (size_t i = 0; i < tv.FuncPtrParams.size(); i++)
+        for (size_t i = 0; i < signature.FuncPtrParams.size(); i++)
         {
             if (i > 0) s += ", ";
             TypeAndValue parameterType;
-            parameterType.TypeName = tv.FuncPtrParams[i].TypeName;
-            parameterType.Pointer = tv.FuncPtrParams[i].Pointer;
-            parameterType.PointerDepth = tv.FuncPtrParams[i].PointerDepth;
+            parameterType.TypeName = signature.FuncPtrParams[i].TypeName;
+            parameterType.Pointer = signature.FuncPtrParams[i].Pointer;
+            parameterType.PointerDepth = signature.FuncPtrParams[i].PointerDepth;
             s += SpellType(*this, parameterType);
         }
-        if (tv.FuncPtrVariadic) s += tv.FuncPtrParams.empty() ? "..." : ", ...";
+        if (signature.FuncPtrVariadic) s += signature.FuncPtrParams.empty() ? "..." : ", ...";
         return s + ")";
     }
 
@@ -1250,41 +1284,71 @@ std::string LLVMBackend::FuncPtrDifferenceOf(const std::vector<FuncPtrComponent>
 std::string LLVMBackend::DescribeFuncPtrSignatureMismatch(const LLVMBackend::TypeAndValue& arg,
         const LLVMBackend::TypeAndValue& param) const
 {
+        TypeAndValue argument = arg, parameter = param;
+        if (argument.FuncPtrReturnTypeName.empty() && !argument.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(argument.TypeName))
+                argument = *encoded;
+        if (parameter.FuncPtrReturnTypeName.empty() && !parameter.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(parameter.TypeName))
+                parameter = *encoded;
         std::vector<FuncPtrComponent> sa, sb;
-        if (!FuncPtrSignatureOf(arg, sa) || !FuncPtrSignatureOf(param, sb))
+        const bool hasArgumentSignature = FuncPtrSignatureOf(argument, sa);
+        const bool hasParameterSignature = FuncPtrSignatureOf(parameter, sb);
+        if (!hasArgumentSignature || !hasParameterSignature)
+        {
+            if (IsUnknownFatClosureSignature(argument) && hasParameterSignature
+                && parameter.IsFunctionPointer && !parameter.IsThinFnPtr())
+                return std::format("function-pointer signature mismatch: parameter takes '{}' but the "
+                    "fat closure's signature is unknown", FuncPtrSpellingOf(parameter));
             return "";
-        std::string why = arg.FuncPtrVariadic != param.FuncPtrVariadic
-            ? VariadicMismatchReason(param.FuncPtrVariadic)
+        }
+        std::string why = argument.FuncPtrVariadic != parameter.FuncPtrVariadic
+            ? VariadicMismatchReason(parameter.FuncPtrVariadic)
             : FuncPtrDifferenceOf(sa, sb);
         if (why.empty()) return "";
         return std::format(
             "function-pointer signature mismatch: parameter takes '{}' but the argument is "
-            "'{}' - {}", FuncPtrSpellingOf(param), FuncPtrSpellingOf(arg), why);
+            "'{}' - {}", FuncPtrSpellingOf(parameter), FuncPtrSpellingOf(argument), why);
     }
 
 std::string LLVMBackend::DescribeFuncPtrVariadicMismatch(const LLVMBackend::TypeAndValue& slot,
         const LLVMBackend::TypeAndValue& value) const
 {
+        TypeAndValue slotSignature = slot, valueSignature = value;
+        if (slotSignature.FuncPtrReturnTypeName.empty() && !slotSignature.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(slotSignature.TypeName))
+                slotSignature = *encoded;
+        if (valueSignature.FuncPtrReturnTypeName.empty() && !valueSignature.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(valueSignature.TypeName))
+                valueSignature = *encoded;
         std::vector<FuncPtrComponent> ss, sv;
-        if (!FuncPtrSignatureOf(slot, ss) || !FuncPtrSignatureOf(value, sv))
+        if (!FuncPtrSignatureOf(slotSignature, ss) || !FuncPtrSignatureOf(valueSignature, sv))
             return "";
-        if (slot.FuncPtrVariadic == value.FuncPtrVariadic)
+        if (slotSignature.FuncPtrVariadic == valueSignature.FuncPtrVariadic)
             return "";
         return std::format(
             "function-pointer signature mismatch: slot takes '{}' but the value is '{}' - {}",
-            FuncPtrSpellingOf(slot), FuncPtrSpellingOf(value), VariadicMismatchReason(slot.FuncPtrVariadic));
+            FuncPtrSpellingOf(slotSignature), FuncPtrSpellingOf(valueSignature),
+            VariadicMismatchReason(slotSignature.FuncPtrVariadic));
     }
 
 // The bind rule itself, shared by named functions and lambda literals. Empty when fn can bind dest.
 std::string LLVMBackend::FuncPtrBindReason(const LLVMBackend::TypeAndValue& fn,
         const LLVMBackend::TypeAndValue& dest, bool compareReturnOwnership) const
 {
+        TypeAndValue function = fn, destination = dest;
+        if (function.FuncPtrReturnTypeName.empty() && !function.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(function.TypeName))
+                function = *encoded;
+        if (destination.FuncPtrReturnTypeName.empty() && !destination.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(destination.TypeName))
+                destination = *encoded;
         std::vector<FuncPtrComponent> sa, sb;
-        if (!FuncPtrSignatureOf(fn, sa) || !FuncPtrSignatureOf(dest, sb))
+        if (!FuncPtrSignatureOf(function, sa) || !FuncPtrSignatureOf(destination, sb))
             return "";
         std::string why;
-        if (fn.FuncPtrVariadic != dest.FuncPtrVariadic)
-            why = VariadicMismatchReason(dest.FuncPtrVariadic);
+        if (function.FuncPtrVariadic != destination.FuncPtrVariadic)
+            why = VariadicMismatchReason(destination.FuncPtrVariadic);
         else if (sa.size() > sb.size())
             why = std::format("it takes {} parameter(s) but the slot supplies only {}",
                 sa.size() - 1, sb.size() - 1);
@@ -1292,11 +1356,65 @@ std::string LLVMBackend::FuncPtrBindReason(const LLVMBackend::TypeAndValue& fn,
             if (ComponentsProvablyDiffer(sa[i], sb[i]))
                 why = (i == 0) ? "the return type differs" : std::format("parameter {} differs", i);
         if (why.empty() && compareReturnOwnership
-            && fn.FuncPtrReturnPointer && dest.FuncPtrReturnPointer
-            && fn.FuncPtrReturnOwned && !dest.FuncPtrReturnOwned)
+            && function.FuncPtrReturnPointer && destination.FuncPtrReturnPointer
+            && function.FuncPtrReturnOwned && !destination.FuncPtrReturnOwned)
             why = "it returns an owning 'move' pointer but the slot's return is borrowed (declare the "
                   "slot's return 'move')";
         return why;
+    }
+
+// T287: the ownership half of the bind rule, for a function-pointer VALUE. A named function gets
+// the same two facts from FuncPtrBindReason; a lambda literal or variable carries them on its type.
+std::string LLVMBackend::FuncPtrValueOwnershipReason(const LLVMBackend::TypeAndValue& source,
+        const LLVMBackend::TypeAndValue& slot)
+{
+        TypeAndValue src = source, dst = slot;
+        if (src.FuncPtrReturnTypeName.empty() && !src.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(src.TypeName))
+                src = *encoded;
+        if (dst.FuncPtrReturnTypeName.empty() && !dst.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(dst.TypeName))
+                dst = *encoded;
+        if (!dst.IsFunctionPointer) return "";
+        if (src.FuncPtrReturnPointer && dst.FuncPtrReturnPointer
+            && src.FuncPtrReturnOwned && !dst.FuncPtrReturnOwned)
+            return "it returns an owning 'move' pointer but the slot's return is borrowed (declare the "
+                   "slot's return 'move')";
+        // Different arities are the adaptation rule's business (FuncPtrFewerParamsCanAdapt), not 'move'.
+        if (src.FuncPtrParams.size() != dst.FuncPtrParams.size()) return "";
+        for (size_t i = 0; i < dst.FuncPtrParams.size(); i++)
+            if (!FuncPtrParamMoveAgrees(dst.FuncPtrParams[i], src.FuncPtrParams[i]))
+                return std::format("parameter {} differs in 'move' modifier - 'move' is part of the "
+                    "function-pointer type", i + 1);
+        return "";
+    }
+
+bool LLVMBackend::FuncPtrFewerParamsCanAdapt(const TypeAndValue& source,
+        const TypeAndValue& slot) const
+{
+        TypeAndValue sourceSig = source;
+        TypeAndValue slotSig = slot;
+        if (!sourceSig.IsFunctionPointer && !sourceSig.Pointer)
+            if (const auto* enc = GetEncodedClosureType(sourceSig.TypeName))
+                sourceSig = *enc;
+        if (!slotSig.IsFunctionPointer && !slotSig.Pointer)
+            if (const auto* enc = GetEncodedClosureType(slotSig.TypeName))
+                slotSig = *enc;
+        if (!slotSig.IsFunctionPointer || slotSig.IsThinFnPtr()
+            || sourceSig.FuncPtrParams.size() >= slotSig.FuncPtrParams.size()
+            || sourceSig.FuncPtrVariadic || slotSig.FuncPtrVariadic
+            || !FuncPtrBindReason(sourceSig, slotSig).empty())
+            return false;
+        for (size_t i = 0; i < sourceSig.FuncPtrParams.size(); ++i)
+        {
+            const auto& src = sourceSig.FuncPtrParams[i];
+            const auto& dst = slotSig.FuncPtrParams[i];
+            if ((src.AllocAlignValue != 0 && dst.AllocAlignValue != 0
+                    && src.AllocAlignValue != dst.AllocAlignValue)
+                || src.IsMove != dst.IsMove)
+                return false;
+        }
+        return true;
     }
 
 std::string LLVMBackend::DescribeFuncPtrBindMismatch(const std::string& functionName,
@@ -1315,20 +1433,53 @@ std::string LLVMBackend::DescribeFuncPtrBindMismatch(const std::string& function
 std::string LLVMBackend::DescribeFuncPtrValueMismatch(const LLVMBackend::TypeAndValue& slot,
         const LLVMBackend::TypeAndValue& value) const
 {
-        if (std::string why = DescribeFuncPtrVariadicMismatch(slot, value); !why.empty())
+        TypeAndValue slotSignature = slot, valueSignature = value;
+        if (slotSignature.FuncPtrReturnTypeName.empty() && !slotSignature.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(slotSignature.TypeName))
+                slotSignature = *encoded;
+        if (valueSignature.FuncPtrReturnTypeName.empty() && !valueSignature.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(valueSignature.TypeName))
+                valueSignature = *encoded;
+        if (IsUnknownFatClosureSignature(valueSignature)
+            && slotSignature.IsFunctionPointer && !slotSignature.IsThinFnPtr()
+            && !slotSignature.FuncPtrReturnTypeName.empty())
+            return std::format("function-pointer signature mismatch: slot takes '{}' but the fat "
+                "closure's signature is unknown", FuncPtrSpellingOf(slotSignature));
+        if (std::string why = DescribeFuncPtrVariadicMismatch(slotSignature, valueSignature); !why.empty())
             return why;
-        if (!slot.IsFunctionPointer || !value.IsFunctionPointer)
+        if (!slotSignature.IsFunctionPointer || !valueSignature.IsFunctionPointer)
             return "";
-        std::string why = FuncPtrBindReason(value, slot);
-        if (why.empty() && value.TypeName == "__closure_fat_ptr"
-            && value.FuncPtrParams.size() < slot.FuncPtrParams.size())
+        std::string why = FuncPtrBindReason(valueSignature, slotSignature);
+        if (why.empty() && valueSignature.TypeName == "__closure_fat_ptr"
+            && valueSignature.FuncPtrParams.size() < slotSignature.FuncPtrParams.size())
             why = std::format("it takes {} parameter(s) but the slot supplies {}; a Lambda<> value may carry captured state, and "
                 "a closure's environment is its last argument, so the slot's extra arguments could be read as that "
                 "state - wrap it in a lambda literal that takes the slot's parameters",
-                value.FuncPtrParams.size(), slot.FuncPtrParams.size());
+                valueSignature.FuncPtrParams.size(), slotSignature.FuncPtrParams.size());
         if (why.empty()) return "";
         return std::format("function-pointer signature mismatch: slot takes '{}' but the value is '{}' - {}",
-            FuncPtrSpellingOf(slot), FuncPtrSpellingOf(value), why);
+            FuncPtrSpellingOf(slotSignature), FuncPtrSpellingOf(valueSignature), why);
+    }
+
+std::string LLVMBackend::DescribeFuncPtrValueMismatch(const LLVMBackend::TypeAndValue& slot,
+        const NamedVariable& value) const
+{
+        TypeAndValue source = value.TypeAndValue;
+        if (auto* fn = llvm::dyn_cast_or_null<llvm::Function>(value.Primary))
+            if (const auto* symbol = FindSymbolForFunction(fn))
+                source = FuncPtrSigOfSymbol(*symbol);
+        if (source.FuncPtrReturnTypeName.empty() && !source.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(source.TypeName))
+                source = *encoded;
+        if (source.FuncPtrReturnTypeName.empty())
+            return IsUnknownFatClosureSignature(source)
+                ? DescribeFuncPtrValueMismatch(slot, source) : "";
+        if (FuncPtrFewerParamsCanAdapt(source, slot)
+            && ((value.ClosureEnvKnownFree && !value.ClosureEnvProvenanceTainted)
+                || value.IsExplicitMove
+                || (value.Primary && llvm::isa<llvm::Function>(value.Primary))))
+            return "";
+        return DescribeFuncPtrValueMismatch(slot, source);
     }
 
 std::string LLVMBackend::DescribeLambdaBindMismatch(const LLVMBackend::TypeAndValue& lambda,

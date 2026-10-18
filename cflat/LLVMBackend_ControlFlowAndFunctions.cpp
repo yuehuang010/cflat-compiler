@@ -2591,7 +2591,11 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
                         sameSignature = sameTypeAndValue(sym.Parameters[i], arguments[i]);
                     if (!external || existingProvisional
                         || (existing->getFunctionType() == functionType && sameSignature))
+                    {
+                        if (!CurrentSourceIsCoreLibrary() && (external || isCxx))
+                            sym.IsCoreLibraryFunction = false;
                         return;
+                    }
                     break;
                 }
 
@@ -2681,6 +2685,7 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
                 .ReturnsAlias = returnType.IsAlias, // 'alias' return: caller must not free the interior
                 .IsMethod = isMethod,
                 .IsCxx = isCxx,
+                .IsCoreLibraryFunction = CurrentSourceIsCoreLibrary(),
                 .IsDeleted = isDeleted,
                 .IsNoexcept = isNoexcept,
                 .Recipe = recipe,
@@ -3229,6 +3234,7 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
                 .ReturnsOwned = returnsOwned,
                 .ReturnsAlias = returnType.IsAlias, // 'alias' return: caller must not free the interior
                 .IsMethod = isMethod,
+                .IsCoreLibraryFunction = CurrentSourceIsCoreLibrary(),
                 .Recipe = recipe,
             };
 

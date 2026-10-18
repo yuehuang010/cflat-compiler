@@ -93,6 +93,64 @@ struct FlexibleArrayKeepScope
     FlexibleArrayKeepScope& operator=(const FlexibleArrayKeepScope&) = delete;
 };
 
+// Parentheses around a whole initializer add nothing (`C x = (f(a));` is `C x = f(a);`): peel
+// `( expression )` primaries reached through single-child rules only. A call with a suffix, or any
+// operator above the parens, stops the peel. Shape only, never the text of the expression (T272).
+inline CFlatParser::AssignmentExpressionContext* UnwrapInitializerParens(
+    CFlatParser::AssignmentExpressionContext* assign)
+{
+    while (assign != nullptr)
+    {
+        antlr4::tree::ParseTree* node = assign;
+        while (auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node))
+        {
+            if (rule->children.size() != 1) break;
+            node = rule->children[0];
+        }
+        auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+        if (primary == nullptr || primary->children.size() != 3 || primary->expression() == nullptr
+            || primary->NameOf() != nullptr || primary->TypeOf() != nullptr)
+            break;
+        auto* inner = primary->expression()->assignmentExpression();
+        if (inner == nullptr) break;
+        assign = inner;
+    }
+    return assign;
+}
+
+// Every '(' suffix and parenthesized primary under `node`: a single-call initializer has exactly one.
+inline size_t CountCallParens(antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return 0;
+    size_t count = 0;
+    if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+        count += postfix->LeftParen().size();
+    else if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+             primary != nullptr && primary->LeftParen() != nullptr)
+        ++count;
+    for (auto* child : node->children) count += CountCallParens(child);
+    return count;
+}
+
+// A field initializer may build straight into the field slot only when it is ONE call (T272): after
+// peeling redundant parentheses, a postfix chain whose top suffix is the call's `( ... )` and that
+// holds no other call or parenthesis. A conditional or a member access/subscript above the call fails.
+inline bool FieldInitializerIsSingleCall(CFlatParser::AssignmentExpressionContext* expr)
+{
+    if (expr == nullptr) return true;
+    antlr4::tree::ParseTree* node = UnwrapInitializerParens(expr);
+    while (auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node))
+    {
+        if (rule->children.size() != 1) break;
+        node = rule->children[0];
+    }
+    auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node);
+    if (postfix == nullptr || postfix->RightParen().empty()
+        || postfix->children.back() != postfix->RightParen().back())
+        return false;
+    return postfix->LeftParen().size() == 1 && CountCallParens(postfix) == 1;
+}
+
 // A zero-length member (`T m[0]`) still undecayed: the one operand `sizeof` measures as 0.
 static bool IsZeroLengthArrayMemberOperand(const LLVMBackend::TypeAndValue& type)
 {
@@ -4185,6 +4243,19 @@ private:
     std::string sourceFileName;
     std::string importNamespace_;
     unsigned addressOfOperandDepth_ = 0;
+    // A moved-slot VALUE read seen while an equality operand is parsed: logged only after the
+    // comparison settles (ParseEqualityExpression exempts the one read that is the whole operand).
+    struct DeferredMovedRead
+    {
+        // The value the read produced (its load, or the get() call of a unique slot); matched by identity.
+        llvm::Value* value = nullptr;
+        std::string subject;
+        int line = 0;
+        int column = 0;
+        // The moved path is this read's own tracked element slot (not a whole moved owner it lives in).
+        bool ownSlot = false;
+    };
+    std::vector<DeferredMovedRead>* deferredMovedReads_ = nullptr;
     // Owning rvalue receivers of operator-> forwarding (`mk()->v`) registered for end-of-statement
     // destruction by the postfix chain in progress. ParsePostfixExpression drops them again when the
     // chain's result borrows from them (pointer, alias), keeping the pre-existing no-free behaviour.
@@ -4526,6 +4597,11 @@ private:
         bool isTypeSwitch = false;                // true if this switch contains type cases
         bool isArmStyle = false;                  // true if any case uses => syntax
         llvm::Value* condValue = nullptr;         // switch condition value (needed for bound var extraction)
+        // Moved state before the body, and the exit states that reach resume (breaks, arm ends).
+        // Labels merge preSwitchMoved in (dispatch may skip earlier cases); resume merges all exits.
+        LLVMBackend::MovedStateSnapshot preSwitchMoved;
+        std::vector<LLVMBackend::MovedStateSnapshot> exitMoved;
+        size_t loopDepth = 0;                     // loopBreakMovedStates_ depth at the switch
     };
 
     std::vector<SwitchContext> switchStack;
@@ -4579,6 +4655,8 @@ private:
 
     // Per-loop stack of moved-state snapshots taken at each break/continue inside the body.
     std::vector<std::vector<LLVMBackend::MovedStateSnapshot>> loopBreakMovedStates_;
+    // Parallel to loopBreakMovedStates_: the loop's condition folds to true, so `continue` never exits it.
+    std::vector<bool> loopConditionAlwaysTrue_;
 
     struct RangeForContext
     {
@@ -4757,14 +4835,22 @@ private:
 
     // Scopes one loop's break/continue snapshot list, then ORs them into the live state on
     // exit so moves performed on a breaking path stay visible to code after the loop.
+    // A loop that may run zero times (mayRunZero) also exits from its pre-loop state, so a
+    // re-init in the body does not revive a field for the zero-trip path.
     struct LoopMovedStateGuard {
         MainListener* self; LLVMBackend* compiler;
-        LoopMovedStateGuard(MainListener* s, LLVMBackend* c) : self(s), compiler(c)
-            { self->loopBreakMovedStates_.emplace_back(); }
+        bool mayRunZero; LLVMBackend::MovedStateSnapshot preLoop;
+        LoopMovedStateGuard(MainListener* s, LLVMBackend* c, bool zeroTrip, bool alwaysTrue)
+            : self(s), compiler(c), mayRunZero(zeroTrip)
+            {
+                self->loopBreakMovedStates_.emplace_back(); self->loopConditionAlwaysTrue_.push_back(alwaysTrue);
+                if (mayRunZero) preLoop = compiler->SaveMovedState();
+            }
         ~LoopMovedStateGuard() {
+            if (mayRunZero) compiler->MergeMovedStateInto(preLoop);
             for (const auto& snap : self->loopBreakMovedStates_.back())
                 compiler->MergeMovedStateInto(snap);
-            self->loopBreakMovedStates_.pop_back();
+            self->loopBreakMovedStates_.pop_back(); self->loopConditionAlwaysTrue_.pop_back();
         }
     };
 
@@ -4883,7 +4969,8 @@ private:
     //   - struct types (local scope): calls the default constructor.
     //   - struct types (global scope): the constant value of that same construction, if it has one.
     //   - everything else: zero-initializes.
-    llvm::Value* GenerateDefaultValue(const LLVMBackend::DeclTypeAndValue& typeValue);
+    llvm::Value* GenerateDefaultValue(const LLVMBackend::DeclTypeAndValue& typeValue,
+        antlr4::ParserRuleContext* expressionContext = nullptr);
     bool EmitNontrivialCxxDefaultAt(llvm::Value* destination,
                                    const LLVMBackend::DeclTypeAndValue& typeValue);
     // Default-constructs CFlat struct typeName. When its constructor returns via C++ sret (it has
@@ -5401,7 +5488,7 @@ public:
     // bodyNamespace: the namespace the BODY resolves in when it differs from the one the NAME is
     // built from - a generic instantiation carries its whole key in nameOverride, so namespaceName
     // must stay empty there while the body still belongs to the template's declaring namespace.
-    void ParseFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {}, const std::string& nameOverride = {}, const std::string& bodyNamespace = {});
+    void ParseFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {}, const std::string& nameOverride = {}, std::optional<std::string> bodyNamespace = std::nullopt);
 
     std::vector<LLVMBackend::AnnotationValue> ParseAnnotationList(CFlatParser::AnnotationListContext* annList);
 
@@ -5939,6 +6026,7 @@ public:
 
     bool IsProgramLifetimeStorage(const LLVMBackend::NamedVariable& nv) const;
     static bool PointsIntoStackFrame(llvm::Value* value);
+    static bool IsFrameOwnedUniqueBorrow(const LLVMBackend* compiler, llvm::Value* value);
     void RejectLambdaReferenceCaptureEscape(
         bool destinationHasProgramLifetime,
         const LLVMBackend::NamedVariable& source,
@@ -7000,6 +7088,12 @@ public:
 
     // Check a receiver use at call sites that do not load the receiver first.
     void CheckMovedReceiver(const LLVMBackend::NamedVariable& receiver);
+    // Value read of a named variable (LoadNamedVariable), given the value it produced: deferred inside an
+    // equality operand.
+    void CheckMovedValueRead(const LLVMBackend::NamedVariable& nv, llvm::Value* readValue);
+    void CheckMovedUse(const LLVMBackend::NamedVariable& nv, std::vector<DeferredMovedRead>* deferred,
+                       llvm::Value* readValue);
+    void LogMovedUse(const std::string& subject, int line, int column);
 
     // Give an untyped literal argument the shape a C++ constructor overload can match on.
     // sourceTwin: the argument's own TypeAndValue that lowering reads; a typed join is mirrored there.
@@ -7085,6 +7179,9 @@ public:
     // > 0 while a C++20 rewrite re-enters TryBinaryOperatorOverload; the ADL infix request is
     // made only for the operator as written, where clang applies the rewrites itself.
     int cxxOperatorRewriteDepth_ = 0;
+    // Set when the last reversed C++20 rewrite (`y <=> x` for `x op y`) produced the result, so
+    // rewriteFromSpaceship mirrors its relation: `x > y` reversed is `0 > (y <=> x)`.
+    bool lastRewriteWasReversed_ = false;
     // > 0 while a compound assignment tries CFlat's `a = a op b` desugaring: that fallback keeps
     // the registered-operator / builtin-conversion resolution and never asks clang.
     int cxxAdlSuppressDepth_ = 0;
@@ -7125,7 +7222,8 @@ public:
         bool lhsCxxNullptrT = false,
         bool rhsCxxNullptrT = false,
         // lhsStorage is a materialized copy of a prvalue left operand, not the caller's lvalue.
-        bool lhsMaterializedPrvalue = false);
+        bool lhsMaterializedPrvalue = false,
+        bool lhsCxxPointeeConst = false);
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);
@@ -7714,6 +7812,7 @@ public:
     // through single-child pass-through expression nodes only, so 'f(move a)' matches while
     // 'f(g(move a))' or 'f(move a + b)' does not.
     static bool IsDirectCallArgument(antlr4::ParserRuleContext* ctx);
+    static bool IsCallArgumentThroughParens(antlr4::ParserRuleContext* ctx);
 
     /*
      * True when `name` is a by-value STRUCT parameter of the current function that was NOT
@@ -8028,10 +8127,11 @@ public:
     // definition; the fallback is plain ParseExpression).
     LLVMBackend::TypedValue ParseTernaryArmExpression(CFlatParser::ExpressionContext* ctx);
 
-    bool IsDefaultOnlyExpression(antlr4::ParserRuleContext* ctx) const;
-    // T142: types and owns a `default` call argument for the parameter it binds (direct and interface calls).
+    bool IsDefaultOnlyExpression(antlr4::ParserRuleContext* ctx,
+                                 bool allowParentheses = true) const;
+    // T142: types and owns a `default` call argument for the parameter it binds.
     void MaterializeDefaultArgument(antlr4::ParserRuleContext* ctx, LLVMBackend::NamedVariable& argNV,
-        const LLVMBackend::TypeAndValue& dest);
+        const LLVMBackend::TypeAndValue& dest, bool directLoweredSret = false);
     LLVMBackend::TypeAndValue InferTernaryArmType(llvm::Value* value);
     LLVMBackend::TypeAndValue InferTernaryArmType(const LLVMBackend::TypedValue& value);
     // Pointee name of a `??` / `?:` pointer join, read from its arms (empty when unproven).

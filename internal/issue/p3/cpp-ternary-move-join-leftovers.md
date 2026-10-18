@@ -1,10 +1,4 @@
-# `z = k ? move a : move b;` (both arms moved, C++ class assignment) copy-assigns instead of moving
-
-Found 2026-10-15 by T249 (pre-existing on master). Repro scratch/repro_keep/t249/cls.cb, cell d5 shape
-(`z = k ? move a : move b;`): CFlat copy-assigns (a not nulled); clang move-assigns straight from the xvalue
-(0 temps, 1 move-assign). The one-move-arm forms (`z = k ? move a : b;`, `z = k ? a : move b;`) are fixed
-by T263 (temp per arm, then move-assign, as clang's prvalue join). A CFlat struct with a C++ field is already
-exact on master for both shapes.
+# Ternary move-join leftovers after T249 and T263 (lowered-struct and C++ shapes)
 
 ## Lowered-struct ternary leftovers after T249 (repros scratch/repro_keep/t249_rev/cases3/, clang twins .cpp)
 - (unwind leak) `take2T(h2, k ? mkHT() : move h1)` where a LATER sibling argument's copy throws: the join temp
@@ -25,3 +19,12 @@ exact on master for both shapes.
   sibling throws: `hv2(gid(mkH(1)), rq.thrower(x))`, `hv2(gid(k ? mkH(1) : mkH(2)), rq.thrower(x))`. A C++ class join
   passed to a C++ function (`rq.cref(k ? mkC(1) : mkC(2))`) does one extra move+destroy vs clang (no leak).
   Repros scratch/repro_keep/t264_rev/.
+
+## T288 review 1 leftovers (pre-existing on master, not fixed by T288)
+- Source reads stay allowed after a ternary move join (onearm_read.cb, bare.cb), while a direct move refuses them (direct.cb).
+- nested_outer.cb and flat_host.cb do one extra move/dtor versus clang.
+- derived.cb and convert.cb are refused as incompatible ternary types.
+- Declaration `T z2 = k ? move a : move b;` with const arms moves the const sources on master (clang copy-constructs, sources untouched); not reached by the T288 assignment join, no leg.
+- Const by-value parameter (`void f(const rv.C a)`): CFlat keeps no const on by-value params, so `z = k ? move a : move b` with `a` such a parameter moves on T288 (master copied); master's explicit `z = move a` already moves it. Needs const carried on parameter signatures.
+- Mutable field join `z = k ? move s.a : move s.b` (s a mutable local): clang move-assigns (one source reads -1 after the join); master copy-assigns and keeps both sources. T288 r3 leaves it on master's path (legs 99017/99018 pin master). Pre-existing, not fixed by T288.
+- Const-host field join `z = k ? move s.a : move s.b` (s const): clang and master copy-assign and keep both sources; T288 r3 falls back to master's path (leg 99015/99016).

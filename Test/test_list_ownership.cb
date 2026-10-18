@@ -54,10 +54,10 @@ AliasRow* g_aliasRow = nullptr;
 
 // A user-written alias accessor hands out the same live-slot lvalue the container
 // accessors do, so assigning through it must drop the old owner exactly as `l[0] = v` does.
-class AliasHolder
+class AliasHolderG<T>
 {
-    string t = default;
-    alias string get() { return this->t; }
+    T t = default;
+    alias T get() { return this->t; }
 };
 
 // An owned TEMP source: a returned local is moved out, so the assignment has no named
@@ -133,7 +133,6 @@ int testPrimitives()
 // legs left the caller unchanged.
 i64 apAddrRow(alias AliasRow r)       { return (i64)&r; }
 i64 apAddrInt(alias int v)            { return (i64)&v; }
-i64 apAddrStr(alias string s)         { return (i64)&s; }
 i64 apAddrGeneric<T>(alias T x)       { return (i64)&x; }
 i64 apAddrForward(alias AliasRow r)   { return apAddrRow(r); }
 AliasRow* apReturnAddr(alias AliasRow r) { return &r; }
@@ -186,7 +185,7 @@ int testAliasParameterBorrows()
 
     string s = "borrowed";
     passed += Test("alias string param address is the caller's",
-        apAddrStr(s) == (i64)&s ? 1 : 0, 1);
+        apAddrGeneric<string>(s) == (i64)&s ? 1 : 0, 1);
 
     passed += Test("generic alias param address is the caller's (struct)",
         apAddrGeneric<AliasRow>(row) == (i64)&row ? 1 : 0, 1);
@@ -258,7 +257,7 @@ int apTakeAliasRes(alias ApRes r) { return *r.p; }
 int apTakeValueRes(ApRes r)       { return *r.p; }
 int apAliasIsNull(alias ApRes r)  { return r.p == nullptr ? 1 : 0; }
 int apNestForward(alias ApRes r)  { return apTakeAliasRes(r); }
-int apAliasStrLen(alias string s) { return s.length(); }
+int apAliasStrLen(string s) { return s.length(); }
 int apAliasIntPlus(alias int v)   { return v + 1; }
 
 int testAliasParameterTempsDestruct()
@@ -276,7 +275,7 @@ int testAliasParameterTempsDestruct()
 
     // A literal has no destructor: these pin that the registration is TYPE-gated (an owning
     // struct only) and neither fires nor mis-lowers on a string / primitive argument.
-    passed += Test("string literal into an alias string param", apAliasStrLen("hello"), 5);
+    passed += Test("string literal into a string param", apAliasStrLen("hello"), 5);
     passed += Test("int literal into an alias int param", apAliasIntPlus(3), 4);
 
     // A temp produced by a '?.' chain reaches the argument as a MERGED load, not a CallInst,
@@ -376,13 +375,14 @@ int testAliasLvalueAssignDropsOldOwner()
         passed += Test("alias index assign temp replaces string element", l[0].length(), 4);
     }
 
-    // Same shape through a user `alias string get()` rather than a container accessor.
+    // Same shape through a user `alias T get()` (T=string) rather than a container accessor.
     {
-        AliasHolder h = default;
+        AliasHolderG<string> h = default;
         h.t = "alpha".copy();
         h.get() = "beta".copy();
         passed += Test("user alias accessor assign replaces string", h.t.length(), 4);
     }
+
 
     // Value element with a side-effecting destructor, OWNED TEMP source. This leg does NOT
     // discriminate the leak fix (it counted 2 before it too): it is the tripwire for the

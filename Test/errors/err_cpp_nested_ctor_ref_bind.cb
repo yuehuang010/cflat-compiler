@@ -1,0 +1,11 @@
+// T270: a nested C++ ctor argument that cannot bind reports clang's reason, not the outer lookup.
+import cpp "cpp_t63_brace_decl.hpp";
+
+extern int main()
+{
+    const function<int(int)> l = t63.call_plus_one;
+    expect_error("could not be bound (clang: no matching conversion for functional-style cast") {
+        int x = t63.call_fnref_value(t63.CallFnRef(l));
+    }
+    return 0;
+}

@@ -3,6 +3,11 @@
 #include <functional>
 #define T103_NULL_ALIAS NULL
 #define T103_NULLPTR_MACRO nullptr
+// T296: cast-pointer macros are typed pointers in C++, never integers.
+#define T296_CAST_NULL ((int*)0)
+#define T296_CAST_EIGHT ((int*)8)
+#define T296_CAST_LONG_NULL ((long long*)0)
+#define T296_CONST_CAST_NULL ((const int*)0)
 
 namespace t103 {
 inline int only_int(int) { return 11; }
@@ -12,6 +17,11 @@ inline int pointer_or_long(long) { return 32; }
 inline int c_header_null(int* p) { return p == nullptr ? 41 : 42; }
 inline int macro_null(int* p) { return p == nullptr ? 43 : 44; }
 inline int macro_nullptr(int* p) { return p == nullptr ? 45 : 46; }
+inline int t296_pointer(int* p) { return p == nullptr ? 1 : 2; }
+inline int t296_overload(int) { return 10; }
+inline int t296_overload(int* p) { return p == nullptr ? 11 : 12; }
+inline int t296_int(int v) { return v; }
+inline int t296_long_pointer(long long* p) { return p == nullptr ? 3 : 4; }
 inline int empty_function(std::function<int()> f) { return f ? 47 : 48; }
 struct NonLiteralZero {
     int v;

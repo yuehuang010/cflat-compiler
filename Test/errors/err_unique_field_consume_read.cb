@@ -1,6 +1,8 @@
 // T230: a plain '=' from a `unique` field (or a `move` of one) consumes the SOURCE field, exactly as
 // `move` does: the field path is null like a moved local, so a later dereference is refused. Before
 // T230 the consume was not recorded and the dereference segfaulted at run time.
+import "list.cb";
+import "unique.cb";
 struct P { int v = 0; ~P() { } };
 struct S { unique P* p = nullptr; };
 
@@ -60,6 +62,427 @@ expect_error("dereference of moved variable 'a'") {
         unique P* b = nullptr;
         b = a;
         int r = a->v;
+    }
+}
+
+// A '??' or '?:' join of two field arms consumes one arm on each path: a read of either arm after the
+// join is refused, as a conditional local move is. The `== nullptr` compare of an arm stays legal.
+expect_error("dereference of moved variable 'a.p'") {
+    void coalesceJoinLeftArmThenRead()
+    {
+        S a = default; S b = default; S c = default;
+        a.p = new P(); b.p = new P();
+        c.p = a.p ?? b.p;
+        int r = a.p->v;
+    }
+}
+
+expect_error("dereference of moved variable 'b.p'") {
+    void coalesceJoinRightArmThenRead()
+    {
+        S a = default; S b = default; S c = default;
+        a.p = new P(); b.p = new P();
+        c.p = a.p ?? b.p;
+        int r = b.p->v;
+    }
+}
+
+expect_error("dereference of moved variable 'a.p'") {
+    void ternaryJoinLeftArmThenRead(bool f)
+    {
+        S a = default; S b = default; S c = default;
+        a.p = new P(); b.p = new P();
+        c.p = f ? a.p : b.p;
+        int r = a.p->v;
+    }
+}
+
+expect_error("dereference of moved variable 'b.p'") {
+    void ternaryJoinRightArmThenRead(bool f)
+    {
+        S a = default; S b = default; S c = default;
+        a.p = new P(); b.p = new P();
+        c.p = f ? a.p : b.p;
+        int r = b.p->v;
+    }
+}
+
+// Round 3: a re-init on ONE branch after a call-sink consume leaves the field maybe-moved at the join.
+void mvP(move P* p) { delete p; }
+expect_error("use of moved variable 's.p'") {
+    void oneBranchReinitThenRead(bool c)
+    {
+        S s = default;
+        s.p = new P();
+        mvP(s.p);
+        if (c) { s.p = new P(); }
+        int r = s.p->v;
+    }
+}
+
+// A re-init of the root field does not revive the same-leaf nested field of the root.
+struct NR { S inner = default; unique P* p = nullptr; };
+expect_error("use of moved variable 'o.p'") {
+    void nestedRootNotRevivedByInner()
+    {
+        NR o = default;
+        o.p = new P();
+        mvP(o.p);
+        o.inner.p = new P();
+        int r = o.p->v;
+    }
+}
+
+expect_error("use of moved variable 'o.inner.p'") {
+    void nestedInnerNotRevivedByRoot()
+    {
+        NR o = default;
+        o.inner.p = new P();
+        mvP(o.inner.p);
+        o.p = new P();
+        int r = o.inner.p->v;
+    }
+}
+
+// Round 4: a re-init inside a loop body that may run zero times, or in one switch case without a
+// default, is not live on the zero-trip / other-case exit path.
+expect_error("use of moved variable 's.p'") {
+    void whileZeroTripReinitThenRead(int n)
+    {
+        S s = default;
+        s.p = new P();
+        mvP(s.p);
+        while (n > 5) { s.p = new P(); n--; }
+        int r = s.p->v;
+    }
+}
+
+expect_error("use of moved variable 's.p'") {
+    void forZeroTripReinitThenRead(int n)
+    {
+        S s = default;
+        s.p = new P();
+        mvP(s.p);
+        for (int i = 0; i < n - 1; i++) { s.p = new P(); }
+        int r = s.p->v;
+    }
+}
+
+expect_error("use of moved variable 's.p'") {
+    void switchOneCaseReinitThenRead(int n)
+    {
+        S s = default;
+        s.p = new P();
+        mvP(s.p);
+        switch (n) { case 3: s.p = new P(); break; default: break; }
+        int r = s.p->v;
+    }
+}
+
+expect_error("use of moved variable 's.p'") {
+    void switchNoDefaultReinitThenRead(int n)
+    {
+        S s = default;
+        s.p = new P();
+        mvP(s.p);
+        switch (n) { case 3: s.p = new P(); break; case 4: s.p = new P(); break; }
+        int r = s.p->v;
+    }
+}
+
+struct ZR { int lo = default; int hi = default; int count() { return hi - lo; } int get(int i) { return lo + i; } };
+
+expect_error("use of moved variable 's.p'") {
+    void forInReinitThenRead(int n)
+    {
+        S s = default;
+        s.p = new P();
+        mvP(s.p);
+        ZR r = default;
+        r.hi = n;
+        for (int v in r) { s.p = new P(); }
+        int x = s.p->v;
+    }
+}
+
+expect_error("use of moved variable 's.p'") {
+    void forStringInitReinitThenRead(int n)
+    {
+        S s = default;
+        s.p = new P();
+        mvP(s.p);
+        int i = 0;
+        for (char* t = ";true;"; i < n; i++) { s.p = new P(); }
+        int x = s.p->v;
+    }
+}
+
+// T277: a local unique receiver's operator-> must consult the merged moved state.
+expect_error("use of moved variable 'u'") {
+    void localNoElseReinitThenRead(int n)
+    {
+        unique P* u = new P();
+        mvP(u);
+        if (n > 0) u = new P();
+        int r = u->v;
+    }
+}
+
+expect_error("use of moved variable 'u'") {
+    void localWhileZeroTripReinitThenRead(int n)
+    {
+        unique P* u = new P();
+        mvP(u);
+        while (n > 0) { u = new P(); n--; }
+        int r = u->v;
+    }
+}
+
+expect_error("use of moved variable 'u'") {
+    void localForZeroTripReinitThenRead(int n)
+    {
+        unique P* u = new P();
+        mvP(u);
+        for (int i = 0; i < n; i++) { u = new P(); }
+        int r = u->v;
+    }
+}
+
+expect_error("use of moved variable 'u'") {
+    void localForInEmptyReinitThenRead()
+    {
+        unique P* u = new P();
+        mvP(u);
+        list<int> empty;
+        for (int value in empty) { u = new P(); }
+        int r = u->v;
+    }
+}
+
+expect_error("use of moved variable 'u'") {
+    void localSwitchSkippedReinitThenRead(int n)
+    {
+        unique P* u = new P();
+        mvP(u);
+        switch (n) { case 1: u = new P(); break; default: break; }
+        int r = u->v;
+    }
+}
+
+expect_error("use of moved variable 'u'") {
+    void localSwitchNoDefaultReinitThenRead(int n)
+    {
+        unique P* u = new P();
+        mvP(u);
+        switch (n) { case 1: u = new P(); break; case 2: u = new P(); break; }
+        int r = u->v;
+    }
+}
+
+void mvLibraryUnique(move unique<P> value) { }
+expect_error("use of moved variable 'u'") {
+    void libraryUniqueLocalNoElseReinitThenRead(int n)
+    {
+        unique<P> u = unique<P>(new P());
+        mvLibraryUnique(u);
+        if (n > 0) u = unique<P>(new P());
+        int r = u->v;
+    }
+}
+
+// T281: constant indexed fields are distinct move paths and require exact-path reinitialization.
+expect_error("use of moved variable 'arr[0].p'") {
+    void arrayFieldMoveThenReadSameIndex()
+    {
+        S[2] arr = default;
+        arr[0].p = new P();
+        mvP(arr[0].p);
+        int r = arr[0].p->v;
+    }
+}
+
+expect_error("use of moved variable 'arr[0].p'") {
+    void arrayFieldSiblingReinitDoesNotRevive()
+    {
+        S[2] arr = default;
+        arr[0].p = new P();
+        mvP(arr[0].p);
+        arr[1].p = new P();
+        int r = arr[0].p->v;
+    }
+}
+
+expect_error("use of moved variable 'arr[0].p'") {
+    void arrayFieldMoveAssignSiblingReinitDoesNotRevive()
+    {
+        S[2] arr = default;
+        unique P* holder = nullptr;
+        arr[0].p = new P();
+        holder = move arr[0].p;
+        arr[1].p = new P();
+        int r = arr[0].p->v;
+    }
+}
+
+expect_error("use of moved variable 'arr[0].p'") {
+    void arrayFieldOneBranchReinitThenRead(bool c)
+    {
+        S[2] arr = default;
+        arr[0].p = new P();
+        mvP(arr[0].p);
+        if (c) arr[0].p = new P();
+        int r = arr[0].p->v;
+    }
+}
+
+expect_error("use of moved variable 'arr[0].p'") {
+    void arrayFieldZeroTripReinitThenRead(int n)
+    {
+        S[2] arr = default;
+        arr[0].p = new P();
+        mvP(arr[0].p);
+        while (n > 0) arr[0].p = new P();
+        int r = arr[0].p->v;
+    }
+}
+
+expect_error("use of moved variable 'arr[0].p'") {
+    void arrayFieldSwitchSkippedReinitThenRead(int n)
+    {
+        S[2] arr = default;
+        arr[0].p = new P();
+        mvP(arr[0].p);
+        switch (n) { case 1: arr[0].p = new P(); break; default: break; }
+        int r = arr[0].p->v;
+    }
+}
+
+// Round 3: a null comparison exempts only the slot's own load. A dereference through the moved element
+// (`a[0]->next`) keeps its check inside an `== nullptr` operand, and so does the next operand of `&&`.
+// Master refuses the first leg too (its text names 'a'); this leg guards the round-1 regression.
+struct NullQ { int v = 1; };
+struct NullP { NullQ* next = nullptr; };
+void mvNullP(move NullP* p) { delete p; }
+expect_error("use of moved variable 'a[0]'") {
+    void nullCompareThroughMovedElement()
+    {
+        unique NullP*[2] a = default;
+        a[0] = new NullP();
+        mvNullP(a[0]);
+        int r = a[0]->next == nullptr ? 0 : 1;
+    }
+}
+
+expect_error("use of moved variable 'a[0]'") {
+    void nullCompareAndDerefMovedElement()
+    {
+        unique NullP*[2] a = default;
+        a[0] = new NullP();
+        mvNullP(a[0]);
+        int r = (a[0] == nullptr && a[0]->next == nullptr) ? 0 : 1;
+    }
+}
+
+// Name gate: a local named like nullptr is an ordinary name, so a non-null comparison of its moved slot is refused.
+expect_error("use of moved variable 'nullptr_like[0]'") {
+    void nullptrNamedSlotComparedWithLive()
+    {
+        unique P*[2] nullptr_like = default;
+        P* q = new P();
+        nullptr_like[0] = new P();
+        mvP(nullptr_like[0]);
+        int r = nullptr_like[0] == q ? 0 : 1;
+    }
+}
+
+// T289: a moved unique field or constant-index element passed as a NON-move call argument is a use. A
+// borrowed raw parameter (`P*`, `alias P*`), a method argument, and a conditional move are all refused.
+int cArgReadP(P* p) { return p->v; }
+int cArgReadAlias(alias P* p) { return 0; }
+struct CaHolder { int m(P* p) { return 0; } };
+expect_error("use of moved variable 's.p'") {
+    void borrowedArgAfterFieldMove()
+    {
+        S s = default;
+        s.p = new P();
+        mvP(s.p);
+        int r = cArgReadP(s.p);
+    }
+}
+
+expect_error("use of moved variable 's.p'") {
+    void conditionalFieldMoveThenArg(bool c)
+    {
+        S s = default;
+        s.p = new P();
+        if (c) { mvP(s.p); }
+        int r = cArgReadP(s.p);
+    }
+}
+
+expect_error("use of moved variable 'arr[0].p'") {
+    void borrowedArgAfterElementFieldMove()
+    {
+        S[2] arr = default;
+        arr[0].p = new P();
+        mvP(arr[0].p);
+        int r = cArgReadP(arr[0].p);
+    }
+}
+
+expect_error("use of moved variable 'arr[0].p'") {
+    void borrowedArgSiblingReinitDoesNotRevive()
+    {
+        S[2] arr = default;
+        arr[0].p = new P();
+        mvP(arr[0].p);
+        arr[1].p = new P();
+        int r = cArgReadP(arr[0].p);
+    }
+}
+
+expect_error("use of moved variable 'a[0]'") {
+    void borrowedArgAfterPlainElementMove()
+    {
+        unique P*[2] a = default;
+        a[0] = new P();
+        mvP(a[0]);
+        int r = cArgReadP(a[0]);
+    }
+}
+
+expect_error("use of moved variable 's.p'") {
+    void methodArgAfterFieldMove()
+    {
+        S s = default;
+        s.p = new P();
+        mvP(s.p);
+        CaHolder h = default;
+        int r = h.m(s.p);
+    }
+}
+
+// Alias parameters: the moved field is refused at the call, like a borrowed raw parameter.
+expect_error("use of moved variable 's.p'") {
+    void aliasArgAfterFieldMove()
+    {
+        S s = default;
+        s.p = new P();
+        mvP(s.p);
+        int r = cArgReadAlias(s.p);
+    }
+}
+
+// T292: a re-init on one branch only leaves the field maybe-moved after the join, so the read is refused.
+expect_error("dereference of moved variable 's.p'") {
+    void conditionalFieldReinitThenRead(bool c)
+    {
+        S s = default;
+        s.p = new P();
+        S t = default;
+        t.p = move s.p;
+        if (c) { s.p = new P(); }
+        int r = s.p->v;
     }
 }
 

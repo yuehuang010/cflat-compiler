@@ -59,6 +59,414 @@ static bool SubtreeContainsCallOrSubscript(antlr4::tree::ParseTree* node)
         return false;
     }
 
+// Resolve future stores by lexical declarations before codegen reaches them.
+struct ClosureEnvScope
+{
+        struct Entry
+        {
+            std::string name;
+            const CFlatParser::DirectDeclaratorContext* declaration;
+            bool opaque;   // bound in the body with no declaration node (for-in, destructuring)
+        };
+        using Scope = std::vector<Entry>;
+        std::vector<Scope> scopes;
+
+        void Bind(const std::string& name, const CFlatParser::DirectDeclaratorContext* declaration,
+                  bool opaque = false)
+        {
+            if (!scopes.empty()) scopes.back().push_back({ name, declaration, opaque });
+        }
+        bool Lookup(const std::string& name, const CFlatParser::DirectDeclaratorContext*& declaration,
+                    bool* opaque = nullptr) const
+        {
+            for (auto scope = scopes.rbegin(); scope != scopes.rend(); ++scope)
+                for (auto entry = scope->rbegin(); entry != scope->rend(); ++entry)
+                    if (entry->name == name)
+                    {
+                        declaration = entry->declaration;
+                        if (opaque != nullptr) *opaque = entry->opaque;
+                        return true;
+                    }
+            return false;
+        }
+    };
+
+using ClosureLiveLookup = std::function<LLVMBackend::NamedVariable*(const std::string&)>;
+using ClosureNameLookup = std::function<bool(const std::string&)>;
+using ClosureReferenceLookup = std::function<bool(const std::string&, size_t, bool)>;
+
+static CFlatParser::LambdaExpressionContext* SoleLambdaExpression(antlr4::tree::ParseTree* node)
+{
+        if (auto* lambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(node)) return lambda;
+        CFlatParser::LambdaExpressionContext* result = nullptr;
+        if (node == nullptr) return nullptr;
+        for (auto* child : node->children)
+            if (dynamic_cast<antlr4::RuleContext*>(child) != nullptr)
+            {
+                if (result != nullptr) return nullptr;
+                result = SoleLambdaExpression(child);
+                if (result == nullptr) return nullptr;
+            }
+        return result;
+    }
+
+static CFlatParser::PrimaryExpressionContext* SolePrimaryExpression(antlr4::tree::ParseTree* node)
+{
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node)) return primary;
+        CFlatParser::PrimaryExpressionContext* result = nullptr;
+        if (node == nullptr) return nullptr;
+        for (auto* child : node->children)
+            if (dynamic_cast<antlr4::RuleContext*>(child) != nullptr)
+            {
+                if (result != nullptr) return nullptr;
+                result = SolePrimaryExpression(child);
+                if (result == nullptr) return nullptr;
+            }
+        return result;
+    }
+
+static bool LambdaBodyIsEnvFree(CFlatParser::LambdaExpressionContext* lambda,
+                                const ClosureEnvScope& outerScope,
+                                const ClosureLiveLookup& findLive,
+                                const ClosureNameLookup& hasThisField,
+                                const ClosureNameLookup& isGlobal,
+                                const ClosureNameLookup& isFunction)
+{
+        if (lambda == nullptr || lambda->lambdaBody() == nullptr) return false;
+        ClosureEnvScope locals;
+        locals.scopes.emplace_back();
+        if (lambda->lambdaParamList() != nullptr)
+            for (auto* param : lambda->lambdaParamList()->lambdaParam())
+                if (param->Identifier() != nullptr) locals.Bind(param->Identifier()->getText(), nullptr);
+
+        bool envFree = true;
+        std::function<void(antlr4::tree::ParseTree*)> visit = [&](antlr4::tree::ParseTree* node)
+        {
+            if (node == nullptr || !envFree) return;
+            if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr)
+            {
+                envFree = false;
+                return;
+            }
+            if (dynamic_cast<CFlatParser::CompoundStatementContext*>(node) != nullptr)
+            {
+                locals.scopes.emplace_back();
+                for (auto* child : node->children) visit(child);
+                locals.scopes.pop_back();
+                return;
+            }
+            auto visitDeclaration = [&](CFlatParser::InitDeclaratorListContext* declarations)
+            {
+                if (declarations == nullptr) return;
+                for (auto* init : declarations->initDeclarator())
+                {
+                    auto* direct = init->declarator() != nullptr
+                        ? init->declarator()->directDeclarator() : nullptr;
+                    if (direct != nullptr) locals.Bind(getDirectDeclName(direct), direct);
+                    if (init->initializer() != nullptr) visit(init->initializer());
+                    if (init->initializerList() != nullptr) visit(init->initializerList());
+                }
+            };
+            if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(node))
+            {
+                visitDeclaration(declaration->initDeclaratorList());
+                return;
+            }
+            if (auto* declaration = dynamic_cast<CFlatParser::ForDeclarationContext*>(node))
+            {
+                visitDeclaration(declaration->initDeclaratorList());
+                return;
+            }
+            if (auto* destructuring = dynamic_cast<CFlatParser::DestructuringDeclarationContext*>(node))
+            {
+                if (destructuring->assignmentExpression() != nullptr) visit(destructuring->assignmentExpression());
+                for (auto* entry : destructuring->destructuringEntry())
+                    if (entry->Identifier() != nullptr) locals.Bind(entry->Identifier()->getText(), nullptr);
+                return;
+            }
+            if (dynamic_cast<CFlatParser::IterationStatementContext*>(node) != nullptr)
+            {
+                locals.scopes.emplace_back();
+                for (auto* child : node->children) visit(child);
+                locals.scopes.pop_back();
+                return;
+            }
+            if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+            {
+                auto* identifier = primary->genericIdentifier() != nullptr
+                    ? primary->genericIdentifier()->Identifier() : nullptr;
+                if (identifier == nullptr)
+                {
+                    for (auto* child : node->children) visit(child);
+                    return;
+                }
+                const std::string name = identifier->getText();
+                if (primary->DoubleColon() != nullptr) return;
+                const CFlatParser::DirectDeclaratorContext* binding = nullptr;
+                if (locals.Lookup(name, binding)) return;
+                if (outerScope.Lookup(name, binding) || findLive(name) != nullptr
+                    || hasThisField(name))
+                {
+                    envFree = false;
+                    return;
+                }
+                if (!isGlobal(name) && !isFunction(name))
+                    envFree = false;
+                return;
+            }
+            for (auto* child : node->children) visit(child);
+        };
+        visit(lambda->lambdaBody());
+        return envFree;
+    }
+
+struct ClosureEnvStoreScan
+{
+        const CFlatParser::DirectDeclaratorContext* candidate;
+        ClosureLiveLookup findLive;
+        ClosureNameLookup hasThisField;
+        ClosureNameLookup isGlobal;
+        ClosureNameLookup isFunction;
+        ClosureReferenceLookup isNonConstReference;
+        ClosureEnvScope scope;
+        bool foundCandidate = false;
+        bool envFree = true;
+
+        bool IsKnownFreeStore(CFlatParser::AssignmentExpressionContext* source)
+        {
+            if (auto* lambda = SoleLambdaExpression(source))
+                return LambdaBodyIsEnvFree(lambda, scope, findLive, hasThisField, isGlobal, isFunction);
+            auto* primary = SolePrimaryExpression(source);
+            if (primary == nullptr) return false;
+            if (primary->Constant() != nullptr
+                && primary->Constant()->getSymbol()->getType() == CFlatParser::NullPtrConstant)
+                return true;
+            auto* identifier = primary->genericIdentifier() != nullptr
+                ? primary->genericIdentifier()->Identifier() : nullptr;
+            if (identifier == nullptr || primary->genericIdentifier()->genericTypeParameters() != nullptr)
+                return false;
+            const std::string name = identifier->getText();
+            const CFlatParser::DirectDeclaratorContext* binding = nullptr;
+            bool opaque = false;
+            if (scope.Lookup(name, binding, &opaque))
+            {
+                if (binding == candidate) return envFree;
+                // findLive answers at the candidate's declaration: wrong for a name bound later in the body.
+                if (opaque || (binding != nullptr
+                    && binding->getStart()->getTokenIndex() > candidate->getStart()->getTokenIndex()))
+                    return false;
+                auto* live = findLive(name);
+                return live != nullptr && live->TypeAndValue.IsThinFnPtr();
+            }
+            if (auto* live = findLive(name))
+                return live->TypeAndValue.IsThinFnPtr();
+            if (hasThisField(name) || isGlobal(name)) return false;
+            return isFunction(name);
+        }
+
+        bool IsNonConstCxxReferenceArgument(CFlatParser::PrimaryExpressionContext* use)
+        {
+            auto* argument = dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(use->parent);
+            for (auto* parent = use->parent; parent != nullptr && argument == nullptr; parent = parent->parent)
+                argument = dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(parent);
+            if (argument == nullptr || argument->assignmentExpression() == nullptr) return false;
+            auto* list = dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(argument->parent);
+            auto* call = list != nullptr ? dynamic_cast<CFlatParser::PostfixExpressionContext*>(list->parent) : nullptr;
+            if (call == nullptr) return false;
+
+            size_t argumentIndex = 0;
+            bool foundArgument = false;
+            for (auto* callList : call->argumentExpressionList())
+            {
+                for (auto* arg : callList->argumentNamedExpression())
+                {
+                    if (arg == argument) { foundArgument = true; break; }
+                    ++argumentIndex;
+                }
+                if (foundArgument) break;
+            }
+            if (!foundArgument) return false;
+
+            auto* callee = call->primaryExpression();
+            std::string calleeName;
+            bool memberCall = false;
+            if (callee != nullptr && callee->genericIdentifier() != nullptr
+                && callee->genericIdentifier()->genericTypeParameters() == nullptr)
+            {
+                calleeName = callee->genericIdentifier()->Identifier()->getText();
+                const CFlatParser::DirectDeclaratorContext* binding = nullptr;
+                if (scope.Lookup(calleeName, binding) || findLive(calleeName) != nullptr
+                    || hasThisField(calleeName) || isGlobal(calleeName))
+                    return false;
+            }
+            else if (!call->memberNameToken().empty())
+            {
+                calleeName = call->memberNameToken().back()->getText();
+                memberCall = true;
+            }
+            return !calleeName.empty() && isNonConstReference(calleeName, argumentIndex, memberCall);
+        }
+
+        void InspectUse(CFlatParser::PrimaryExpressionContext* use)
+        {
+            for (auto* parent = use->parent; parent != nullptr; parent = parent->parent)
+            {
+                if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent) != nullptr) return;
+                if (dynamic_cast<CFlatParser::MoveExpressionContext*>(parent) != nullptr
+                    || (dynamic_cast<CFlatParser::UnaryExpressionContext*>(parent) != nullptr
+                        && static_cast<CFlatParser::UnaryExpressionContext*>(parent)->unaryOperator() != nullptr
+                        && static_cast<CFlatParser::UnaryExpressionContext*>(parent)->unaryOperator()->And() != nullptr))
+                {
+                    envFree = false;
+                    return;
+                }
+                if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(parent))
+                    if (!postfix->PlusPlus().empty() || !postfix->MinusMinus().empty())
+                    {
+                        envFree = false;
+                        return;
+                    }
+                if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent))
+                    if (assignment->unaryExpression() != nullptr && assignment->assignmentOperator() != nullptr)
+                    for (antlr4::tree::ParseTree* node = use;
+                         node != nullptr && node != assignment; node = node->parent)
+                            if (node == assignment->unaryExpression())
+                            {
+                                auto* op = assignment->assignmentOperator();
+                                if (op->Assign() == nullptr
+                                    || !IsKnownFreeStore(assignment->assignmentExpression()))
+                                    envFree = false;
+                                return;
+                            }
+            }
+            if (IsNonConstCxxReferenceArgument(use)) envFree = false;
+        }
+
+        void VisitDeclaration(CFlatParser::InitDeclaratorListContext* declarations)
+        {
+            if (declarations == nullptr) return;
+            for (auto* init : declarations->initDeclarator())
+            {
+                auto* direct = init->declarator() != nullptr
+                    ? init->declarator()->directDeclarator() : nullptr;
+                if (direct != nullptr)
+                {
+                    scope.Bind(getDirectDeclName(direct), direct);
+                    if (direct == candidate) foundCandidate = true;
+                }
+                if (init->initializer() != nullptr) Visit(init->initializer());
+                if (init->initializerList() != nullptr) Visit(init->initializerList());
+            }
+        }
+
+        void Visit(antlr4::tree::ParseTree* node)
+        {
+            if (node == nullptr || !envFree) return;
+            if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr) return;
+            if (dynamic_cast<CFlatParser::CompoundStatementContext*>(node) != nullptr)
+            {
+                scope.scopes.emplace_back();
+                for (auto* child : node->children) Visit(child);
+                scope.scopes.pop_back();
+                return;
+            }
+            if (auto* iteration = dynamic_cast<CFlatParser::IterationStatementContext*>(node))
+            {
+                scope.scopes.emplace_back();
+                if (iteration->In() != nullptr && iteration->Identifier() != nullptr)
+                    scope.Bind(iteration->Identifier()->getText(), nullptr, /*opaque*/ true);
+                for (auto* child : node->children) Visit(child);
+                scope.scopes.pop_back();
+                return;
+            }
+            if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(node))
+            {
+                VisitDeclaration(declaration->initDeclaratorList());
+                return;
+            }
+            if (auto* declaration = dynamic_cast<CFlatParser::ForDeclarationContext*>(node))
+            {
+                VisitDeclaration(declaration->initDeclaratorList());
+                return;
+            }
+            if (auto* destructuring = dynamic_cast<CFlatParser::DestructuringDeclarationContext*>(node))
+            {
+                if (destructuring->assignmentExpression() != nullptr) Visit(destructuring->assignmentExpression());
+                for (auto* entry : destructuring->destructuringEntry())
+                    if (entry->Identifier() != nullptr)
+                        scope.Bind(entry->Identifier()->getText(), nullptr, /*opaque*/ true);
+                return;
+            }
+            if (auto* label = dynamic_cast<CFlatParser::LabeledStatementContext*>(node))
+            {
+                scope.scopes.emplace_back();
+                if (label->Identifier() != nullptr && label->getStart()->getType() != CFlatParser::Identifier)
+                    scope.Bind(label->Identifier()->getText(), nullptr);
+                for (auto* child : node->children) Visit(child);
+                scope.scopes.pop_back();
+                return;
+            }
+            if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+            {
+                auto* identifier = primary->genericIdentifier() != nullptr
+                    ? primary->genericIdentifier()->Identifier() : nullptr;
+                if (identifier != nullptr)
+                {
+                    const CFlatParser::DirectDeclaratorContext* binding = nullptr;
+                    if (scope.Lookup(identifier->getText(), binding) && binding == candidate)
+                        InspectUse(primary);
+                }
+                if (primary->genericIdentifier() != nullptr) return;
+            }
+            for (auto* child : node->children) Visit(child);
+        }
+    };
+
+static bool ClosureLocalStoresAreProvablyEnvFree(CFlatParser::InitDeclaratorContext* init,
+                                                  const ClosureLiveLookup& findLive,
+                                                  const ClosureNameLookup& hasThisField,
+                                                  const ClosureNameLookup& isGlobal,
+                                                  const ClosureNameLookup& isFunction,
+                                                  const ClosureReferenceLookup& isNonConstReference)
+{
+        if (init == nullptr || init->declarator() == nullptr
+            || init->declarator()->directDeclarator() == nullptr) return false;
+        auto* candidate = init->declarator()->directDeclarator();
+        CFlatParser::FunctionDefinitionContext* function = nullptr;
+        CFlatParser::LambdaExpressionContext* lambda = nullptr;
+        for (auto* parent = init->parent; parent != nullptr; parent = parent->parent)
+        {
+            if (auto* enclosingLambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent))
+            {
+                lambda = enclosingLambda;
+                break;
+            }
+            if (auto* enclosingFunction = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent))
+            {
+                function = enclosingFunction;
+                break;
+            }
+        }
+        antlr4::tree::ParseTree* body = lambda != nullptr
+            ? static_cast<antlr4::tree::ParseTree*>(lambda->lambdaBody())
+            : function != nullptr ? static_cast<antlr4::tree::ParseTree*>(function->compoundStatement()) : nullptr;
+        if (body == nullptr) return false;
+
+        ClosureEnvStoreScan scan{
+            candidate, findLive, hasThisField, isGlobal, isFunction, isNonConstReference };
+        scan.scope.scopes.emplace_back();
+        if (function != nullptr && function->parameterTypeList() != nullptr
+            && function->parameterTypeList()->parameterList() != nullptr)
+            for (auto* param : function->parameterTypeList()->parameterList()->parameterDeclaration())
+                if (param->declarator() != nullptr && param->declarator()->directDeclarator() != nullptr)
+                    scan.scope.Bind(getDirectDeclName(param->declarator()->directDeclarator()), nullptr);
+        if (lambda != nullptr && lambda->lambdaParamList() != nullptr)
+            for (auto* param : lambda->lambdaParamList()->lambdaParam())
+                if (param->Identifier() != nullptr) scan.scope.Bind(param->Identifier()->getText(), nullptr);
+        scan.Visit(body);
+        return scan.foundCandidate && scan.envFree;
+    }
+
 static bool IsSoleOperatorExpression(antlr4::tree::ParseTree* node)
 {
         if (auto* assign = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
@@ -1446,6 +1854,17 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         declType.Pointer = true;
                     }
                 }
+                // `alias` qualifies pointers only (ruling 2026-10-15): a spelled `alias string` is refused in
+                // every position; a generic `alias T` with T=string is not (probe-only ruling).
+                if (declType.IsAlias && declType.TypeName == "string" && !declType.Pointer && !hasExplicitPointer)
+                {
+                    bool spelledString = false;
+                    for (auto* spec : declSpecList)
+                        if (spec->typeSpecifier() != nullptr && spec->typeSpecifier()->getText() == "string")
+                            spelledString = true;
+                    if (spelledString)
+                        LogErrorContext(declSpec, "'alias' applies to pointer types only; 'string' is a primitive");
+                }
                 // Direct `unique` on a local/param (D4/D5): it qualifies a single-indirection pointer
                 // or an interface only (D1). A field is validated separately by ValidateUniqueField.
                 if (hasUniqueSpecifier
@@ -1455,7 +1874,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // teardown deletes. Same rule (and wording) as the field form.
                     if (declType.IsArrayView)
                         LogErrorContext(declSpec, std::format(
-                            "'unique' on '{}[]': array views are not supported - a view does not "
+                            "'unique' on '{}': array views are not supported - a view does not "
                             "own its buffer", SpellType(*Compiler(declSpecs), declType)));
                     bool uniqueSingleIndirect = (declType.Pointer && !declType.ElemPointer
                         && !declType.IsArrayView) || declType.IsFatInterfaceValue();
@@ -2196,7 +2615,8 @@ llvm::Constant* MainListener::SplatConstantOverFixedArray(llvm::Constant* elemCo
         return llvm::ConstantArray::get(arrTy, elems);
     }
 
-llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndValue& typeValue) {
+llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndValue& typeValue,
+        antlr4::ParserRuleContext* expressionContext) {
         auto* compiler = Compiler();
         // Apply active type-parameter substitutions as a fallback in case the caller
         // hasn't already resolved them (e.g. "V" inside a generic method body).
@@ -2303,7 +2723,21 @@ llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndVa
                         compiler->pendingCxxSretTypeName_.clear();
                     }
                     if (compiler->EmitCxxStructorCall(resolved.TypeName, *ctor, slot, {}))
-                        return inPlace ? nullptr : compiler->CreateLoad(llvmType, slot);
+                    {
+                        if (inPlace) return nullptr;
+                        auto* value = compiler->CreateLoad(llvmType, slot);
+                        // A direct default argument is an owned prvalue; carry its slot for ABI lowering.
+                        if (inCallArgument_ && expressionContext != nullptr
+                            && (IsDirectCallArgument(expressionContext)
+                                || IsCallArgumentThroughParens(expressionContext)))
+                            if (auto* temp = llvm::dyn_cast_or_null<llvm::AllocaInst>(slot))
+                            {
+                                compiler->RegisterOwnedStructTemp(temp, resolved.TypeName);
+                                compiler->lastCxxRetTemp_ = temp;
+                                compiler->lastCxxRetValue_ = value;
+                            }
+                        return value;
+                    }
                     if (inPlace) return nullptr;
                 }
                 std::string ambiguityError;
@@ -3373,7 +3807,7 @@ void MainListener::enterExternalDeclaration(CFlatParser::ExternalDeclarationCont
         ParseExternalDeclaration(ctx);
     }
 
-void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName, const std::string& namespaceName, const std::string& nameOverride, const std::string& bodyNamespace) {
+void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName, const std::string& namespaceName, const std::string& nameOverride, std::optional<std::string> bodyNamespace) {
         auto* compiler = Compiler(func);
         // A body compiled mid-expression (first-use generic instantiation) must not flush the
         // caller's pending postfix ++/-- into itself.
@@ -3446,6 +3880,10 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // If this is a generic function template definition (not an instantiation), store it and return.
         if (nameOverride.empty() && func->genericTypeParameters() != nullptr)
         {
+            if (auto variable = compiler->globalNamedVariable.find(name);
+                variable != compiler->globalNamedVariable.end() && variable->second != nullptr)
+                LogErrorContext(func, std::format(
+                    "redefinition of '{}' as a different kind of symbol", name));
             if (func->genericTypeParameters()->typeParameterList()->typeParameterEntry().empty())
                 LogErrorContext(func, "generic definition needs at least one type parameter");
             std::vector<std::string> valueParams;
@@ -3453,6 +3891,10 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             auto typeParams = ParseGenericTypeParameters(func->genericTypeParameters(), &valueParams,
                                                          &valueDefaults);
             genericFunctionTemplates[name] = func;
+            if (compiler->CurrentSourceIsCoreLibrary())
+                compiler->gts.coreGenericTemplates.insert(name);
+            else
+                compiler->gts.coreGenericTemplates.erase(name);
             // Record the declaring namespace, never re-derive it from the key: a call site's bare
             // spelling resolves through it (ResolveGenericFunctionBase) and the body is lowered in it.
             Compiler()->gts.genericTemplateNamespace[name] = namespaceName;
@@ -3722,7 +4164,9 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // sibling reference (bare "helper" inside "namespace N") resolves to "N.helper".
         // RAII: a LogError inside the body throws on the batch/LSP paths, and a skipped restore
         // would steer the next file's generic-template resolution.
-        LLVMBackend::NamespaceScope nsScope(compiler, bodyNamespace.empty() ? namespaceName : bodyNamespace);
+        const std::string functionBodyNamespace = bodyNamespace.has_value() ? *bodyNamespace
+            : !namespaceName.empty() ? namespaceName : compiler->GetCurrentNamespace();
+        LLVMBackend::NamespaceScope nsScope(compiler, functionBodyNamespace);
         LLVMBackend::CppStructAccessScope cppStructAccessScope(
             compiler, cppDerivedContext ? structName : std::string());
 
@@ -4595,7 +5039,9 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         const std::string typeName = declType.TypeName;
         const bool hasCxxConstructors = compiler->IsForeignCxxClassWithConstructors(typeName);
         auto* initializer = initDeclarator->initializer();
-        auto* assign = initializer != nullptr ? initializer->assignmentExpression() : nullptr;
+        // Redundant parentheses take the bare initializer's route (in-place elision).
+        auto* assign = UnwrapInitializerParens(
+            initializer != nullptr ? initializer->assignmentExpression() : nullptr);
         auto* declarationBraceList = initDeclarator->initializerList();
         if (declarationBraceList == nullptr && initializer != nullptr
             && initializer->LeftBrace() != nullptr)
@@ -4636,7 +5082,8 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         // Depending on the initializer alternative selected by ANTLR, `default` may be exposed
         // as the rule token or as a single assignment-expression child.
         bool isDefaultForm = initializer != nullptr
-            && (initializer->Default() != nullptr || initializer->getText() == "default");
+            && (initializer->Default() != nullptr
+                || IsDefaultOnlyExpression(initializer->assignmentExpression(), false));
         if (emptyBraceDeclaration) isDefaultForm = true;
         auto* ctorArgs = assign != nullptr ? ForeignCxxConstructArgs(assign, typeName) : nullptr;
         auto* moveExpr = assign != nullptr ? TopLevelMoveExpression(assign) : nullptr;
@@ -4835,6 +5282,7 @@ cxx_dtor_ready:
                     else if (!compiler->IsCxxRecord(elementNV.TypeAndValue.TypeName))
                     {
                         elementNV.CxxImportedLiteral = compiler->CxxImportedConstantLiteral(elementNV);
+                        compiler->RecordCxxConstantBraceElement(elementNV, elementValue);
                         elementNV.Storage = nullptr;
                         elementNV.IsRvalue = true;
                     }
@@ -4969,7 +5417,7 @@ cxx_dtor_ready:
             };
             for (auto* named : ctorArgs->argumentNamedExpression())
             {
-                auto* argAssign = named->assignmentExpression();
+                auto* argAssign = UnwrapInitializerParens(named->assignmentExpression());
                 const std::string braceText = named->getText();
                 const bool emptyBrace = braceText == "{}"
                     || (named->Identifier() != nullptr
@@ -5542,6 +5990,7 @@ cxx_dtor_ready:
             {
                 auto* srcNV = compiler->FindLiveNamedVariable(srcText);
                 if (srcNV != nullptr && srcNV->Storage != nullptr && !srcNV->TypeAndValue.Pointer
+                    && srcNV->TypeAndValue.IsFloatingPoint() == -1
                     && compiler->CanImplicitlyConstructCxxClass(*srcNV, declType, true))
                 {
                     std::string wrapperName;
@@ -6866,7 +7315,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     && paramTypeList == nullptr && !hasParens && direct != nullptr
                     && (initDecl->initializer() == nullptr
                         || initDecl->initializer()->Default() != nullptr
-                        || initDecl->initializer()->getText() == "default")
+                        || IsDefaultOnlyExpression(
+                            initDecl->initializer()->assignmentExpression(), false))
                     && compiler->IsCxxRecord(typeAndValue.TypeName))
                 {
                     std::string unavailableType;
@@ -6920,6 +7370,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 bool haveInterfaceSourceNV = false;
                 LLVMBackend::NamedVariable initializerSourceNV;
                 bool haveInitializerSourceNV = false;
+                bool closureInitKnownFree = false;
+                bool closureInitAdapted = false;
                 bool srcIsUnsigned = false;
                 bool srcIsBorrowed = false;
                 std::string srcBorrowedOrigin;
@@ -7225,6 +7677,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     auto assignmentExpression = initializer->assignmentExpression();
                     if (assignmentExpression != nullptr)
                         srcRhsExprText = assignmentExpression->getText();
+                    // Redundant parentheses take the bare initializer's route (elision, ternary arms).
+                    assignmentExpression = UnwrapInitializerParens(assignmentExpression);
                     bool foldedGlobalIntegerInit = false;
                     if (globalInitTempFn != nullptr && assignmentExpression != nullptr)
                     {
@@ -7502,6 +7956,16 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     trivialCxxMoveSite_ = TopLevelMoveExpression(assignmentExpression);
                                 const auto staticInitMark = compiler->MarkOwnedTemps();
                                 auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
+                                const bool explicitMoveClosureInit =
+                                    assignmentExpression->unaryExpression() != nullptr
+                                    && assignmentExpression->unaryExpression()->moveExpression() != nullptr;
+                                if (explicitMoveClosureInit
+                                    && compiler->FuncPtrFewerParamsCanAdapt(
+                                        rightNV.TypeAndValue, typeAndValue))
+                                {
+                                    rightNV.IsExplicitMove = true;
+                                    rightNV.IsRvalue = true;
+                                }
                                 // [immovable]: `T b = a;` / `T b = move a;` copies or moves an existing
                                 // value into a new owner. In-place init (`T b = default;`) and borrows
                                 // (`alias T b = a;`, `T* p = &a;`) stay legal.
@@ -8055,6 +8519,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcBorrowedField = rightNV.FieldName;
                                 srcFieldPathNV.OwningStructName = rightNV.OwningStructName;
                                 srcFieldPathNV.FieldName = rightNV.FieldName;
+                                srcFieldPathNV.MovePathKey = rightNV.MovePathKey;
+                                srcFieldPathNV.MovePathHasDynamicIndex = rightNV.MovePathHasDynamicIndex;
                                 srcFieldPathNV.FieldPathText = rightNV.FieldPathText;
                                 srcFieldPathNV.FieldPathRoot = rightNV.FieldPathRoot;
                                 srcFieldPathNV.RootIsBorrowedByValueParam =
@@ -8267,15 +8733,21 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     rightNV.PointsToBorrowedByValueParam;
                                 srcRawArrayLength = rhsIsWholeRawArrayBinding
                                     ? compiler->LoadRawArrayLength(rightNV) : nullptr;
-                                rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer;
-                                rhsFuncPtrReturnOwned = rightNV.TypeAndValue.FuncPtrReturnOwned;
-                                rhsFuncPtrReturnAlias = rightNV.TypeAndValue.FuncPtrReturnAlias;
-                                rhsFuncPtrVariadic = rightNV.TypeAndValue.FuncPtrVariadic;
+                                const auto* encodedRhsSignature = rightNV.TypeAndValue.Pointer
+                                    ? nullptr : compiler->GetEncodedClosureType(rightNV.TypeAndValue.TypeName);
+                                rhsFnSig = rightNV.TypeAndValue;
+                                if (!rhsFnSig.IsFunctionPointer && encodedRhsSignature != nullptr)
+                                    rhsFnSig = *encodedRhsSignature;
+                                rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer
+                                    || encodedRhsSignature != nullptr;
+                                rhsFuncPtrReturnOwned = rhsFnSig.FuncPtrReturnOwned;
+                                rhsFuncPtrReturnAlias = rhsFnSig.FuncPtrReturnAlias;
+                                rhsFuncPtrVariadic = rhsFnSig.FuncPtrVariadic;
                                 if (rightNV.TypeAndValue.IsFunctionPointer)
                                     rhsFnSig = rightNV.TypeAndValue;
-                                rhsIsThinFnPtr = rightNV.TypeAndValue.IsThinFnPtr();
+                                rhsIsThinFnPtr = rhsFnSig.IsFunctionPointer && rhsFnSig.IsThinFnPtr();
                                 rhsIsPointer = rightNV.TypeAndValue.Pointer;
-                                rhsFuncPtrParams = rightNV.TypeAndValue.FuncPtrParams;
+                                rhsFuncPtrParams = rhsFnSig.FuncPtrParams;
                                 rhsLambdaCaptureNames = rightNV.LambdaCaptureNames;
                                 rhsLambdaReferenceCaptureNames = rightNV.LambdaReferenceCaptureNames;
                                 RejectLambdaReferenceCaptureEscape(
@@ -8298,10 +8770,15 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // stored a code address in a data pointer and wrote through it.
                                 if (compiler->CodeValueIntoDataDestination(rightNV, typeAndValue))
                                     LogErrorContext(assignmentExpression,
-                                        compiler->DescribeCodeValueIntoData(
+                                    compiler->DescribeCodeValueIntoData(
                                             CodeValueDestSpelling(typeAndValue), "initialize",
                                             CodeValueCastAdvice(typeAndValue)));
                             }
+                            LLVMBackend::TypeAndValue declaredFuncSlotSig = typeAndValue;
+                            if (!declaredFuncSlotSig.IsFunctionPointer && !declaredFuncSlotSig.Pointer)
+                                if (const auto* encoded = compiler->GetEncodedClosureType(
+                                        declaredFuncSlotSig.TypeName))
+                                    declaredFuncSlotSig = *encoded;
                             lambdaExpectedType = {};
                             // Implicit char* -> string coercion: string s = "hello" or string s = charPtr.
                             if (right && typeAndValue.TypeName == "string" && !typeAndValue.Pointer
@@ -8320,7 +8797,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     "and '+' concatenation still convert automatically)");
                             }
                             // Bare 'function' type inference: infer signature from the assigned function value.
-                            if (right && typeAndValue.IsFunctionPointer && typeAndValue.FuncPtrReturnTypeName.empty())
+                            if (right && declaredFuncSlotSig.IsFunctionPointer
+                                && declaredFuncSlotSig.FuncPtrReturnTypeName.empty())
                             {
                                 std::string funcName = assignmentExpression->getText();
                                 LLVMBackend::TypeAndValue inferred;
@@ -8362,12 +8840,14 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     typeAndValue.FuncPtrParams = inferred.FuncPtrParams;
                                 }
                             }
+                            if (typeAndValue.IsFunctionPointer)
+                                declaredFuncSlotSig = typeAndValue;
                             // The overload actually BOUND below, kept so the inferred-sink adoption
                             // reads the same one the call will run (never a by-name re-lookup).
                             const llvm::Function* boundNamedFn = nullptr;
                             std::string boundNamedFnName;
                             // Wrap named function in closure fat struct when declaring function<T>.
-                            if (right && typeAndValue.IsFunctionPointer && !right->getType()->isStructTy())
+                            if (right && declaredFuncSlotSig.IsFunctionPointer && !right->getType()->isStructTy())
                             {
                                 // Re-resolve by name to avoid picking a struct method that shares the
                                 // same plain key in functionTable (e.g. atomic_counter::add vs add).
@@ -8375,9 +8855,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // llvm::Function); a same-named local/param of function-pointer type
                                 // loads to a Value and must shadow the global function, not be replaced.
                                 std::string funcName = assignmentExpression->getText();
-                                int expectedParams = (int)typeAndValue.FuncPtrParams.size();
+                                int expectedParams = (int)declaredFuncSlotSig.FuncPtrParams.size();
                                 if (llvm::isa<llvm::Function>(right))
-                                    if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams, &typeAndValue.FuncPtrParams, &typeAndValue))
+                                    if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams, &declaredFuncSlotSig.FuncPtrParams, &declaredFuncSlotSig))
                                         right = correctFn;
                                 if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
                                 {
@@ -8390,19 +8870,19 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         typeAndValue.FuncPtrReturnAlias = boundSig.FuncPtrReturnAlias;
                                         typeAndValue.FuncPtrVariadic = boundSig.FuncPtrVariadic;
                                     }
-                                    VerifyFuncPtrAssignmentMoveFlags(funcName, typeAndValue, assignmentExpression);
+                                    VerifyFuncPtrAssignmentMoveFlags(funcName, declaredFuncSlotSig, assignmentExpression);
                                     // thin `function<T>`: bare fn ptr; fat `Lambda<T>`: closure fat struct.
-                                    right = typeAndValue.IsThinFnPtr()
-                                          ? compiler->MakeThinFnPtrValue(fn, typeAndValue)
+                                    right = declaredFuncSlotSig.IsThinFnPtr()
+                                          ? compiler->MakeThinFnPtrValue(fn, declaredFuncSlotSig)
                                           : compiler->WrapBareValueAsFatStruct(fn);
                                 }
                             }
                             // Fallback for generic function pointers (e.g. function<int(void*)> fp = wrap<int>):
                             // the RHS parses to an empty namedVar with CallerName set to the mangled function name.
-                            if (!right && typeAndValue.IsFunctionPointer && !genericFuncCallerName.empty())
+                            if (!right && declaredFuncSlotSig.IsFunctionPointer && !genericFuncCallerName.empty())
                             {
-                                int expectedParams = (int)typeAndValue.FuncPtrParams.size();
-                                llvm::Function* genericFn = compiler->GetFunctionForFuncPtr(genericFuncCallerName, expectedParams, &typeAndValue.FuncPtrParams, &typeAndValue);
+                                int expectedParams = (int)declaredFuncSlotSig.FuncPtrParams.size();
+                                llvm::Function* genericFn = compiler->GetFunctionForFuncPtr(genericFuncCallerName, expectedParams, &declaredFuncSlotSig.FuncPtrParams, &declaredFuncSlotSig);
                                 if (genericFn)
                                 {
                                     boundNamedFn = genericFn;
@@ -8414,9 +8894,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         typeAndValue.FuncPtrReturnAlias = boundSig.FuncPtrReturnAlias;
                                         typeAndValue.FuncPtrVariadic = boundSig.FuncPtrVariadic;
                                     }
-                                    VerifyFuncPtrAssignmentMoveFlags(genericFuncCallerName, typeAndValue, assignmentExpression);
-                                    right = typeAndValue.IsThinFnPtr()
-                                          ? compiler->MakeThinFnPtrValue(genericFn, typeAndValue)
+                                    VerifyFuncPtrAssignmentMoveFlags(genericFuncCallerName, declaredFuncSlotSig, assignmentExpression);
+                                    right = declaredFuncSlotSig.IsThinFnPtr()
+                                          ? compiler->MakeThinFnPtrValue(genericFn, declaredFuncSlotSig)
                                           : compiler->WrapBareValueAsFatStruct(genericFn);
                                 }
                             }
@@ -8424,7 +8904,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             // (env is a compile-time null). A capturing lambda literal or a stored Lambda<>
                             // value cannot carry captures across the C ABI, so reject it with guidance
                             // instead of dropping the env (a thin ptr over freed/absent state -> crash).
-                            if (right && typeAndValue.IsFunctionPointer && typeAndValue.IsThinFnPtr()
+                            if (right && declaredFuncSlotSig.IsFunctionPointer && declaredFuncSlotSig.IsThinFnPtr()
                                 && right->getType() == compiler->GetClosureFatPtrType())
                             {
                                 compiler->UnregisterOwnedClosureTemp(right);
@@ -8437,10 +8917,38 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     right = llvm::UndefValue::get(compiler->BuildThinFnPtrType(typeAndValue));
                                 }
                             }
+                            if (right && declaredFuncSlotSig.IsFunctionPointer && !declaredFuncSlotSig.IsThinFnPtr()
+                                && rhsIsFuncPtr && haveInitializerSourceNV)
+                            {
+                                closureInitKnownFree = initializerSourceNV.ClosureEnvKnownFree
+                                    && !initializerSourceNV.ClosureEnvProvenanceTainted;
+                                closureInitKnownFree = closureInitKnownFree
+                                    || rhsIsThinFnPtr
+                                    || llvm::isa_and_nonnull<llvm::Function>(initializerSourceNV.Primary);
+                                if (!right->getType()->isPointerTy()
+                                    && right->getType() == compiler->GetClosureFatPtrType()
+                                    && compiler->ClosureIsStaticallyNonCapturing(right))
+                                    closureInitKnownFree = true;
+                                if (compiler->ClosureValueCanAdaptToSlot(
+                                        initializerSourceNV, declaredFuncSlotSig))
+                                {
+                                    right = compiler->AdaptClosureValueToSlot(
+                                        right, initializerSourceNV, declaredFuncSlotSig);
+                                    closureInitKnownFree = false;
+                                    closureInitAdapted = true;
+                                    srcStorage = nullptr;
+                                    srcUnionFieldType = nullptr;
+                                    srcIsMove = true;
+                                    srcInferredTypeName = "__closure_fat_ptr";
+                                    srcInferredPointer = false;
+                                    srcPrimary = right;
+                                    srcCallerName.clear();
+                                }
+                            }
                             // Decl-init spelling of the thin gate ('function<T> f = vp;'); rightNV
                             // is out of scope here, so rhsProvenance carries only the two flags read.
-                            if (right && typeAndValue.IsFunctionPointer && typeAndValue.IsThinFnPtr()
-                                && !typeAndValue.Pointer && right->getType()->isPointerTy())
+                            if (right && declaredFuncSlotSig.IsFunctionPointer && declaredFuncSlotSig.IsThinFnPtr()
+                                && !declaredFuncSlotSig.Pointer && right->getType()->isPointerTy())
                             {
                                 LLVMBackend::NamedVariable rhsProvenance;
                                 rhsProvenance.TypeAndValue.IsFunctionPointer = rhsIsFuncPtr;
@@ -8451,35 +8959,33 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             }
                             // Widen a thin function<T> value to a fat Lambda<T>: store {code, null}, no
                             // thunk. Mirrors the call-arg widen; keeps thin -> Lambda -> toFunction lossless.
-                            if (right && typeAndValue.IsFunctionPointer && !typeAndValue.IsThinFnPtr()
+                            if (right && declaredFuncSlotSig.IsFunctionPointer && !declaredFuncSlotSig.IsThinFnPtr()
                                 && rhsIsThinFnPtr && !right->getType()->isStructTy())
                             {
-                                right = compiler->WidenThinToFat(right, typeAndValue);
+                                right = compiler->WidenThinToFat(right, declaredFuncSlotSig);
                             }
 
-                            // Funcptr-to-funcptr declaration init: per-param IsMove flags must agree.
-                            if (right && typeAndValue.IsFunctionPointer && rhsIsFuncPtr
-                                && right->getType()->isStructTy()
-                                && typeAndValue.FuncPtrParams.size() == rhsFuncPtrParams.size())
+                            const bool destIsFatClosure = declaredFuncSlotSig.IsFunctionPointer
+                                && !declaredFuncSlotSig.IsThinFnPtr();
+                            if (right && boundNamedFn != nullptr && !closureInitAdapted
+                                && destIsFatClosure)
+                                closureInitKnownFree = true;
+
+                            // Funcptr-to-funcptr declaration init, thin AND fat: the return ownership and the
+                            // per-param IsMove flags must agree (T287: a thin source skipped this gate).
+                            if (right && declaredFuncSlotSig.IsFunctionPointer && rhsIsFuncPtr)
                             {
-                                for (size_t i = 0; i < typeAndValue.FuncPtrParams.size(); i++)
-                                {
-                                    if (!compiler->FuncPtrParamMoveAgrees(
-                                            typeAndValue.FuncPtrParams[i], rhsFuncPtrParams[i]))
-                                    {
-                                        LogErrorContext(assignmentExpression, std::format(
-                                            "incompatible function pointer initializer: parameter {} differs in 'move' modifier - 'move' is part of the function-pointer type",
-                                            i + 1));
-                                        break;
-                                    }
-                                }
+                                if (std::string why = compiler->FuncPtrValueOwnershipReason(
+                                        rhsFnSig, declaredFuncSlotSig); !why.empty())
+                                    LogErrorContext(assignmentExpression, std::format(
+                                        "incompatible function pointer initializer: {}", why));
                             }
                             // Variadic-ness and the bind rule are part of a function-pointer type: refused
                             // before the slot adopts the initializer's flag below.
-                            if (right && typeAndValue.IsFunctionPointer && rhsIsFuncPtr)
+                            if (right && declaredFuncSlotSig.IsFunctionPointer && rhsIsFuncPtr)
                             {
                                 if (std::string why = compiler->DescribeFuncPtrValueMismatch(
-                                        typeAndValue, rhsFnSig); !why.empty())
+                                        declaredFuncSlotSig, initializerSourceNV); !why.empty())
                                     LogErrorContext(assignmentExpression, why);
                             }
                             // The declared spelling carries no INFERRED sink, so adopt the
@@ -8643,6 +9149,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     ctorArg.Storage = initializerSourceNV.Storage;
                                     ctorArg.CallerName = initializerSourceNV.CallerName;
                                     ctorArg.FieldName = initializerSourceNV.FieldName;
+                                    ctorArg.MovePathKey = initializerSourceNV.MovePathKey;
+                                    ctorArg.MovePathHasDynamicIndex =
+                                        initializerSourceNV.MovePathHasDynamicIndex;
                                     ctorArg.OwningStructName = initializerSourceNV.OwningStructName;
                                     bool movedContainerSlot = compiler->lastMovedFromContainerSlot;
                                     ctorArg.IsExplicitMove = initializerSourceNV.IsExplicitMove;
@@ -9059,6 +9568,22 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
 
                 if (global_scope)
                 {
+                    bool sameScopeFunction = false;
+                    if (auto functions = compiler->functionTable.find(name);
+                        functions != compiler->functionTable.end())
+                        for (const auto& symbol : functions->second)
+                            if (!symbol.IsMethod
+                                && (!symbol.IsCoreLibraryFunction || symbol.IsCInteropDeclaration || symbol.IsCxx))
+                            {
+                                sameScopeFunction = true;
+                                break;
+                            }
+                    if (!sameScopeFunction && genericFunctionTemplates.count(name) != 0
+                        && compiler->gts.coreGenericTemplates.count(name) == 0)
+                        sameScopeFunction = true;
+                    if (sameScopeFunction)
+                        LogErrorContext(direct, std::format(
+                            "redefinition of '{}' as a different kind of symbol", name));
                     // Same-scope (file-scope) redeclaration of a global is rejected (C semantics),
                     // mirroring the local check. An `extern` declaration may legitimately precede a
                     // definition (or repeat), so only flag when a prior real DEFINITION already exists
@@ -9529,6 +10054,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             compiler->StoreRawArrayLength(viewNV, srcRawArrayLength);
                         viewNV.OwningStructName = srcFieldPathNV.OwningStructName;
                         viewNV.FieldName = srcFieldPathNV.FieldName;
+                        viewNV.MovePathKey = srcFieldPathNV.MovePathKey;
+                        viewNV.MovePathHasDynamicIndex = srcFieldPathNV.MovePathHasDynamicIndex;
                         viewNV.FieldPathText = srcFieldPathNV.FieldPathText;
                         viewNV.FieldPathRoot = srcFieldPathNV.FieldPathRoot;
                         viewNV.RootIsBorrowedByValueParam =
@@ -9670,7 +10197,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && !llvm::isa<llvm::AllocaInst>(srcStorage)
                             && !llvm::isa<llvm::GlobalVariable>(srcStorage)
                             && !srcIsMove
-                            && srcInferredTypeName == "__closure_fat_ptr"
+                            && (srcInferredTypeName == "__closure_fat_ptr"
+                                || compiler->IsFatEncodedClosureType(srcInferredTypeName))
                             && typeAndValue.TypeName == "__closure_fat_ptr")
                         {
                             LLVMBackend::NamedVariable srcNV;
@@ -9745,8 +10273,15 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             // A foreign C++ sret temp must stay live until its C++ move constructor
                             // reads it below; its destructor will clean up the moved-from object.
                             && srcCxxRetTemp == nullptr
-                            && !srcIsAlias
-                            && srcInferredTypeName == typeAndValue.TypeName
+                            // A closure is clone-safe: an alias source still needs an independent
+                            // env when this declaration creates a new owning slot.
+                            && (!srcIsAlias || typeAndValue.TypeName == "__closure_fat_ptr")
+                            // A generic argument's Lambda<> source carries its encoded name
+                            // ("fatfn$...") while the declared local is "__closure_fat_ptr":
+                            // the same fat closure, so it takes the closure copy below.
+                            && (srcInferredTypeName == typeAndValue.TypeName
+                                || (typeAndValue.TypeName == "__closure_fat_ptr"
+                                    && compiler->IsFatEncodedClosureType(srcInferredTypeName)))
                             && compiler->IsOwningValueType(typeAndValue.TypeName))
                         {
                             if (typeAndValue.TypeName == "__closure_fat_ptr")
@@ -10101,8 +10636,63 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // A closure local now owns its env (its scope-exit dtor frees it), so drop
                         // the value from the owned-closure temp-flush list to avoid a double-free
                         // (covers a lambda literal RHS, a clone, or a call result uniformly).
-                        if (typeAndValue.TypeName == "__closure_fat_ptr")
+                        const bool closureFatLocal = typeAndValue.IsFunctionPointer
+                            && !typeAndValue.IsThinFnPtr();
+                        if (closureInitAdapted || typeAndValue.TypeName == "__closure_fat_ptr")
                             compiler->UnregisterOwnedClosureTemp(right);
+                        if (typeAndValue.TypeName == "__closure_fat_ptr" || closureFatLocal
+                            || (!typeAndValue.Pointer
+                                && compiler->IsFatEncodedClosureType(typeAndValue.TypeName)))
+                        {
+                            auto& closureLocal = compiler->GetOrCreateStackVariable(name);
+                            ClosureLiveLookup findLive = [compiler](const std::string& valueName) {
+                                return compiler->FindLiveNamedVariable(valueName);
+                            };
+                            ClosureNameLookup hasThisField = [compiler](const std::string& valueName) {
+                                const auto thisValue = compiler->GetThisPointer();
+                                if (thisValue.TypeAndValue.TypeName.empty()) return false;
+                                const auto data = compiler->GetDataStructure(thisValue.TypeAndValue.TypeName);
+                                return std::ranges::any_of(data.StructFields, [&](const auto& field) {
+                                    return field.VariableName == valueName;
+                                });
+                            };
+                            ClosureNameLookup isGlobal = [compiler](const std::string& valueName) {
+                                return compiler->globalNamedVariable.count(valueName) != 0;
+                            };
+                            ClosureNameLookup isFunction = [compiler](const std::string& valueName) {
+                                return compiler->functionTable.count(valueName) != 0;
+                            };
+                            ClosureReferenceLookup isNonConstReference =
+                                [compiler](const std::string& functionName, size_t paramIndex, bool memberCall) {
+                                    auto isNonConst = [&](const LLVMBackend::FunctionSymbol& function) {
+                                        if (!function.IsCxx || paramIndex >= function.Parameters.size()
+                                            || !compiler->IsCxxReferenceParameter(function, paramIndex))
+                                            return false;
+                                        const std::string spelling =
+                                            compiler->CxxReferenceParameterSpelling(function, paramIndex);
+                                        return spelling.empty() || spelling.find("const") == std::string::npos;
+                                    };
+                                    if (!memberCall)
+                                    {
+                                        if (auto it = compiler->functionTable.find(functionName);
+                                            it != compiler->functionTable.end())
+                                            for (const auto& function : it->second)
+                                                if (isNonConst(function)) return true;
+                                        return false;
+                                    }
+                                    for (const auto& entry : compiler->functionTable)
+                                        for (const auto& function : entry.second)
+                                            if (function.SourceName == functionName && isNonConst(function))
+                                                return true;
+                                    return false;
+                                };
+                            const bool scopeEnvFree = closureInitKnownFree
+                                && ClosureLocalStoresAreProvablyEnvFree(
+                                    initDecl, findLive, hasThisField, isGlobal,
+                                    isFunction, isNonConstReference);
+                            closureLocal.ClosureEnvKnownFree = scopeEnvFree;
+                            closureLocal.ClosureEnvProvenanceTainted = !scopeEnvFree;
+                        }
 
                         // `alias` (borrow) initializer: the local shallow-aliases storage the source
                         // still owns. Suppress its scope-exit destructor so it does not double-free,
@@ -11040,9 +11630,9 @@ void MainListener::EmitImplicitUniqueFieldMove(LLVMBackend::NamedVariable& right
                         || cflat_llvm::GetTerminatorOrNull(source.Block) == nullptr)
                         continue;
                     compilerLLVM->builder->SetInsertPoint(cflat_llvm::GetTerminatorOrNull(source.Block));
-                    // A single field source is null-tracked on its own path, as a plain consume is.
-                    // A join of two or more keeps the runtime nulling only (its other arm stays live).
-                    if (join->Sources.size() == 1 && !source.NullKey.empty())
+                    // Each consumed arm is null-tracked on its own predecessor, as a plain consume is:
+                    // a deref after a join is refused as maybe-moved, `== nullptr` reads stay legal.
+                    if (!source.NullKey.empty())
                         compilerLLVM->RecordNullSet(source.NullKey);
                     if (right->getType()->isPointerTy())
                         compilerLLVM->builder->CreateStore(
@@ -11390,9 +11980,11 @@ bool MainListener::TransferPointerOwnershipOnStore(
                     if (sourceIsWholeRawArrayBinding)
                         compiler->StoreRawArrayLength(rightNV, nullptr);
                     // Moving a field (`x = node->left`) marks only that field, not the base.
-                    if (!rightNV.FieldName.empty())
-                        compiler->MarkVariableFieldMoved(rightNV.CallerName, rightNV.FieldName);
-                    else
+                    if (const std::string movePath = LLVMBackend::FieldMoveKey(rightNV);
+                        !movePath.empty())
+                        compiler->MarkVariableFieldMoved(rightNV.CallerName, movePath);
+                    else if (!rightNV.IsElementAccess && rightNV.FieldName.empty()
+                        && rightNV.OwningStructName.empty())
                     {
                         compiler->MarkVariableMoved(rightNV.CallerName);
                         // Boxing into an interface ('live = sc') transfers ownership to a handle

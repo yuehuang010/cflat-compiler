@@ -14,13 +14,6 @@ form. Still open:
    emits `get(raw)` on the raw object pointer (wrong code). Fix direction: make the outer treat the
    inner's field as a unique-field move source (as IsUniqueFieldRead does for `owner = u.p`).
 
-2. Two-statement field-raw inner leaks: `r.raw = new PS(); owner = r.raw;` (r: plain struct with
-   `PS* raw`) compiles with dtors=0 (the source is an unproven raw value, so owner becomes an alias
-   and nothing frees it). Chained form `owner = r.raw = new PS()` is REFUSED on purpose
-   ("cannot reset unique<PS> 'owner' from borrowed value 'r'"), matching `unique PS* owner = r.raw;`.
-   Decide: refuse the two-statement assignment too (consistent with the declaration form), or
-   accept with a consume of the field. Not changed by T250.
-
 3. Chained three deep `a = b = c = new PS()` stays refused ("cannot reset unique<PS> 'a' from
    borrowed value 'b'"). The two-statement `c = new PS(); b = c; a = b;` compiles (dtors=1). Kept
    as is: the middle `b = c` is a raw alias, and extending the slot through a raw alias is not done.
@@ -41,3 +34,10 @@ Repro (item 1):
 ## Ruling 2026-10-15 (T250): two-statement form refused
 `r.raw = new PS(); owner = r.raw;` is refused exactly like `unique PS* owner = r.raw;` and the chained form - assignment
 and declaration agree. Steer: `owner = move r.raw;` or `owner = new PS();`.
+
+## T266 (2026-10-15): two-statement `owner = r.raw` refused (direct, implicit-this, global, ternary arm)
+Still accepted on master and after T266 while the DECLARATION refuses them (assignment = declaration ruling):
+`owner = pick()` where pick returns a borrowed global (but a plain-field accessor returning a raw pointer is adopted by
+design - test_move plain_field_borrow_adopt_value has the same shape), and `owner = k ? raw_local : nullptr`; also
+`j_field` residual. NEEDS RULING: must assignment match the declaration for call results that return a borrow?
+Repros: scratch/repro_keep/t266_rev/.

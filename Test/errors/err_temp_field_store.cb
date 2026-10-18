@@ -22,8 +22,51 @@ bool RuntimePick() { return gRuntimePick; }
 
 alias Tok ReturnAliasTok(alias Tok value) { return value; }
 
+// The NAMED `alias` string local (T=string) is a borrow the user spelled, so the field store must
+// not silently copy it into a second owner. Generic `alias T` keeps the substring reachable.
+struct BoxG<T> { T slot = default; };
+void namedAliasStringStoreG<T>(T x)
+{
+    expect_error("cannot store an 'alias' string local") {
+        list<T> fields;
+        fields.add(x);
+        alias T a = fields.get(0);
+        BoxG<T> b = default;
+        b.slot = a;
+    }
+}
+
+// Its BRACE twin: the same borrow through the other field-store spelling.
+void namedAliasStringBraceStoreG<T>(T x)
+{
+    expect_error("cannot store an 'alias' string local") {
+        list<T> fields;
+        fields.add(x);
+        alias T a = fields.get(0);
+        BoxG<T> b = { slot = a };
+    }
+}
+
+// A user-spelled `alias` local (T=string) BOUND to a temp's field is rejected at the BINDING.
+// The 2026-08-21 implicit copy is for bindings that OWN; a declared `alias` asks for the borrow,
+// and a borrow of a temporary is exactly the dangle this guard exists for.
+struct TokG<T> { T text = default; };
+void aliasLocalFromTempStringFieldG<T>(T x)
+{
+    expect_error("taken from a temporary") {
+        list<TokG<T>> toks;
+        TokG<T> t = default; t.text = x; toks.add(t);
+        alias T a = toks.get(0).text;
+        BoxG<T> b = default;
+        b.slot = a;
+    }
+}
+
 extern int main()
 {
+    namedAliasStringStoreG<string>("x");
+    namedAliasStringBraceStoreG<string>("x");
+    aliasLocalFromTempStringFieldG<string>("x" + "y");
     list<Outer> outers = default;
     Outer o = default; o.inner.text = "x" + "y"; outers.add(o);
     expect_error("taken from a temporary");
@@ -42,42 +85,6 @@ expect_error("taken from a temporary") {
     }
 }
 
-// The one string leg that is still a REJECT: a NAMED `alias` string local is a borrow the
-// user spelled, so the field store must not silently copy it into a second owner.
-expect_error("cannot store an 'alias' string local") {
-    void namedAliasStringStore() {
-        list<string> fields;
-        fields.add("x");
-        alias string a = fields.get(0);
-        Box b = default;
-        b.slot = a;
-    }
-}
-
-// Its BRACE twin: the same borrow through the other field-store spelling.
-expect_error("cannot store an 'alias' string local") {
-    void namedAliasStringBraceStore() {
-        list<string> fields;
-        fields.add("x");
-        alias string a = fields.get(0);
-        Box b = { slot = a };
-    }
-}
-
-// A user-spelled `alias` string local BOUND to a temp's string FIELD is rejected at the BINDING.
-// The 2026-08-21 implicit copy is for bindings that OWN; a declared `alias` asks for the borrow,
-// and a borrow of a temporary is exactly the dangle this guard exists for. Without the declared-
-// `alias` exclusion the binding is silently upgraded to an owned copy and the only diagnostic left
-// is the later store's "its buffer is owned elsewhere", which by then is not true.
-expect_error("taken from a temporary") {
-    void aliasLocalFromTempStringField() {
-        list<Tok> toks;
-        Tok t = default; t.text = "x" + "y"; toks.add(t);
-        alias string a = toks.get(0).text;
-        Box b = default;
-        b.slot = a;
-    }
-}
 
 // An `alias`-returning FUNCTION result: for an owning struct the truer diagnosis is the
 // alias-value store reject, which fires first and says the same thing about the same borrow.

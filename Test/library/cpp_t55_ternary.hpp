@@ -39,4 +39,33 @@ struct ExplicitLeg {
     explicit ExplicitLeg(int value) { c = 1000 + value; }
     ExplicitLeg(signed char value) { c = 3000 + (int)value; }
 };
+struct AssignNarrowUnsigned {
+    int c = 0;
+    AssignNarrowUnsigned() = default;
+    AssignNarrowUnsigned(unsigned value) { c = 4000 + (int)value; }
+};
+struct AssignNarrowExplicit {
+    int c = 0;
+    AssignNarrowExplicit() = default;
+    explicit AssignNarrowExplicit(int value) { c = 1000 + value; }
+    AssignNarrowExplicit(signed char value) { c = 3000 + (int)value; }
+};
+struct AssignNarrowRoute {
+    int c = 0;
+    int via = 0;
+    AssignNarrowRoute() = default;
+    AssignNarrowRoute(unsigned value) { c = 4000 + (int)value; via = 1; }
+    AssignNarrowRoute& operator=(int value) { c = 1000 + value; via = 2; return *this; }
+};
+struct AssignNarrowDeleted {
+    int c = 0;
+    AssignNarrowDeleted(unsigned value) { c = 4000 + (int)value; }
+    AssignNarrowDeleted& operator=(const AssignNarrowDeleted&) = delete;
+};
+struct AmbSB { int c; AmbSB(signed char) : c(1) {} AmbSB(bool) : c(2) {} };
+struct AmbSL { int c; AmbSL(signed char) : c(1) {} AmbSL(long) : c(2) {} };
+struct AmbSY { int c; AmbSY(signed char) : c(1) {} AmbSY(unsigned) : c(2) {} };
+struct AmbSF { int c; AmbSF(float) : c(1) {} AmbSF(int) : c(2) {} };
+struct AmbSH { int c; AmbSH(signed char) : c(1) {} AmbSH(long long) : c(2) {} };
+inline AssignNarrowExplicit assignNarrowGlobal;
 }

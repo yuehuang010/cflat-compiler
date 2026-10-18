@@ -1,0 +1,52 @@
+// Assignment is declaration: `owner = r.raw;` into a unique local refuses a raw struct field, a borrow
+// that still owns nothing, exactly as `unique PS* owner = r.raw;` does. Owning forms are accepted.
+struct PS { int v = 0; ~PS() { } };
+struct R { PS* raw = nullptr; };
+
+expect_error("cannot reset unique<PS> 'owner' from borrowed value 'r'") {
+    void rawFieldAssignRefused()
+    {
+        R r = default;
+        unique PS* owner = nullptr;
+        r.raw = new PS();
+        owner = r.raw;
+    }
+}
+
+// Round 3: the same refusal for an implicit-this raw field, a global raw field, a '?:' join with a raw
+// field arm.
+struct GR { PS* raw = nullptr; };
+GR gr = default;
+
+expect_error("cannot reset unique<PS> 'owner' from a borrowed value") {
+    struct H { PS* raw = nullptr; int g() { unique PS* owner = nullptr; owner = raw; return 0; } };
+    int implicitThisRawFieldAssign()
+    {
+        H h = default;
+        return h.g();
+    }
+}
+
+expect_error("cannot reset unique<PS> 'owner' from a borrowed value") {
+    void globalRawFieldAssign()
+    {
+        gr.raw = new PS();
+        unique PS* owner = nullptr;
+        owner = gr.raw;
+    }
+}
+
+expect_error("cannot reset unique<PS> 'owner' from a borrowed value") {
+    void ternaryRawFieldAssign(bool k)
+    {
+        GR r = default;
+        r.raw = new PS();
+        unique PS* owner = nullptr;
+        owner = k ? r.raw : nullptr;
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

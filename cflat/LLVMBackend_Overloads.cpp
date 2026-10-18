@@ -1351,6 +1351,11 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                     out.objectRef = candidate.CxxRefQualifier;
                     out.objectIsRvalue = IsCxxObjectRvalue(arg);
                     out.from = param.TypeName;
+                    // An inherited member's object is a derived-to-base conversion (clang's
+                    // Conversion rank), so the comparator ranks it below an exact receiver.
+                    if (!candidate.CxxInheritedOwner.empty()
+                        && candidate.CxxInheritedOwner != param.TypeName)
+                        out.toClass = candidate.CxxInheritedOwner;
                     out.implicitObjectCvNonViable = (receiverCv & ~memberCv) != 0;
                     if (out.implicitObjectCvNonViable)
                         out.rank = kCxxNonViableRank;
@@ -1779,8 +1784,10 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 const auto backing = enumBackingTypes.find(at.TypeName);
                 const std::string backingName = backing != enumBackingTypes.end()
                     ? arithmeticName(backing->second) : std::string();
-                const bool narrowFixed = !backingName.empty() && integerBits(backingName) > 0
-                    && integerBits(backingName) < 32;
+                // bool is narrower than int too: clang ranks `enum : bool` to bool over int.
+                const bool narrowFixed = !backingName.empty()
+                    && (backingName == "bool" || (integerBits(backingName) > 0
+                                                  && integerBits(backingName) < 32));
                 out.rank = narrowFixed && to == backingName ? 0
                     : !promotedName.empty() && to == promotedName ? 1 : 2;
                 out.cxxViable = true;
@@ -1841,6 +1848,18 @@ int LLVMBackend::CompareCxxConversionRanks(const std::vector<CxxConversionRank>&
             const bool yNonViable = y.rank == kCxxNonViableRank || y.implicitObjectCvNonViable;
             if (xNonViable || yNonViable)
                 order = xNonViable == yNonViable ? 0 : (xNonViable ? 1 : -1);
+            else if ((x.rank == -2) != (y.rank == -2)
+                && !(x.rank == -2 ? x : y).toClass.empty())
+            {
+                // Inherited member object (derived-to-base): an exact binding to the receiver wins,
+                // a reference (cvBase) or by-value (empty cvBase; the free's object is the receiver).
+                const CxxConversionRank& object = x.rank == -2 ? x : y;
+                const CxxConversionRank& reference = x.rank == -2 ? y : x;
+                if (reference.rank == 0 && (reference.cvBase == object.from || reference.cvBase.empty()))
+                    order = x.rank == -2 ? 1 : -1;
+                else
+                    return 2;
+            }
             else if (x.rank == -2 || y.rank == -2)
             {
                 if (x.rank == -2 && y.rank == -2)
@@ -2410,7 +2429,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         ? arg.OriginalArgumentType : arg.TypeAndValue;
                     if (result == 0
                         && FuncPtrSignaturesProvablyDiffer(functionPointerArgument, *candidateParamItr))
-                        result = -1;
+                    {
+                        if (FuncPtrFewerParamsCanAdapt(functionPointerArgument, *candidateParamItr)
+                            && ClosureValueCanAdaptToSlot(arg, *candidateParamItr))
+                            result = 1;
+                        else
+                            result = -1;
+                    }
                     // A NAMED function argument carries its signature in the function table, not
                     // on the argument, so it needs the overload-set form of the same proof.
                     if (result != -1 && NamedFunctionArgMismatches(arg, *candidateParamItr))
@@ -4699,6 +4724,16 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             // A CFlat constructor is the first point where an unavailable C++ member default
             // becomes observable. The synthesized body was emitted at the type declaration and
             // intentionally leaves such a member zeroed until this real call is requested.
+            // T272 (ruling 2026-10-15): a CFlat struct has no constructor call syntax. With arguments and
+            // no parameterized constructor it is refused here, before the implicit no-arg constructor's
+            // C++ members are bound (which would report the unrelated default-constructor refusal).
+            if (!arguments.empty() && CFlatStructHasOnlyNoArgCtor(functionName))
+            {
+                const std::string spelled = SpellType(*this, TypeAndValue{ .TypeName = functionName });
+                LogError(std::format("CFlat struct '{0}' has no constructor call syntax - use brace init, e.g. '{0}{{ field = value }}'",
+                                     spelled));
+                return nullptr;
+            }
             std::string unavailableType;
             if (HasUnavailableNestedCxxDefault(functionName, &unavailableType))
             {
@@ -5053,8 +5088,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 return reachesOwner(operatorReceiver);
             };
             const bool cxxOperatorReceiver = IsCxxRecord(operatorReceiver);
+            // The unary caller already ranked member against free and kept only the member(s).
+            const auto& pinnedMembers = arguments.front().CxxPinnedMemberNames;
             for (const FunctionSymbol& candidate : *candidateSet)
             {
+                if (!pinnedMembers.empty()
+                    && std::find(pinnedMembers.begin(), pinnedMembers.end(), candidate.UniqueName)
+                        == pinnedMembers.end())
+                    continue;
                 if (cxxOperatorReceiver && candidate.IsCxx && !candidate.IsMethod
                     && !candidate.Parameters.empty()
                     && IsCxxRecord(candidate.Parameters.front().TypeName)
@@ -6123,8 +6164,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 auto pi = c.Parameters.begin();
                 for (size_t i = 0; i < arguments.size() && pi != c.Parameters.end(); i++, ++pi)
                 {
-                    if (!pi->IsFunctionPointer) continue;
-                    std::string why = DescribeFuncPtrSignatureMismatch(arguments[i].TypeAndValue, *pi);
+                    if (!pi->IsFunctionPointer && !IsEncodedClosureType(pi->TypeName)) continue;
+                    const TypeAndValue& functionPointerArgument = arguments[i].HasOriginalArgumentType
+                        ? arguments[i].OriginalArgumentType : arguments[i].TypeAndValue;
+                    std::string why = DescribeFuncPtrSignatureMismatch(functionPointerArgument, *pi);
                     if (why.empty() && c.IsCxx
                         && NamedFunctionArgMismatches(arguments[i], *pi))
                     {
@@ -6586,7 +6629,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         std::vector<AliasSlotArg> aliasSlots;
         auto candParamItr = candidate.Parameters.begin();
         size_t argIndex = 0;
-        for (const auto& arg : matched)
+        for (auto& arg : matched)
         {
             // Variadic arguments past the declared parameter list must not be dispatched
             // through pointer-parameter logic (candParamItr points at the last declared
@@ -7176,10 +7219,22 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                 { bindingName, "move", candParamItr->VariableName, "move" });
                     }
                 }
+                // T287: a lambda literal or a function-pointer variable must agree with the slot's 'move'
+                // parameters and owning return, as a bare named function does above (named args skip here).
+                if (!(!arg.CallerName.empty() && llvm::isa_and_nonnull<llvm::Function>(val))
+                    && ArgumentIsFunctionPointerish(arg))
+                {
+                    if (std::string why = FuncPtrValueOwnershipReason(arg.TypeAndValue, *candParamItr);
+                        !why.empty())
+                        LogErrorMessage("cannot pass this function-pointer value to parameter '{}': {}",
+                            { candParamItr->VariableName, why });
+                }
                 if (llvmParamTy->isStructTy())
                 {
                     // Internal function<T>: provide a closure fat struct {i8*, i8*}.
-                    if (val && !val->getType()->isStructTy())
+                    if (val && ClosureValueCanAdaptToSlot(arg, *candParamItr))
+                        val = AdaptClosureValueToSlot(val, arg, *candParamItr);
+                    else if (val && !val->getType()->isStructTy())
                     {
                         // Re-resolve a NAMED FUNCTION only: skips same-key method overloads and
                         // picks matching 'move' flags. On a call result CallerName is the CALLEE.
@@ -9618,6 +9673,27 @@ void LLVMBackend::RecordNullDerefFor(const NamedVariable& nv, int line, int col)
         RecordNullDeref(nv.CallerName, line, col);
     }
 
+std::string LLVMBackend::FieldMoveKey(const NamedVariable& nv)
+{
+        if (nv.MovePathHasDynamicIndex) return {};
+        if (!nv.MovePathKey.empty())
+        {
+            // T281 tracks an array element itself, or a field below an indexed element. An
+            // indexed member array (`node->children[i]`) keeps the pre-existing slot-move rules.
+            const size_t closeIndex = nv.MovePathKey.find(']');
+            if (closeIndex != std::string::npos
+                && nv.MovePathKey.find('.', closeIndex + 1) == std::string::npos
+                && !nv.FieldName.empty())
+                return {};
+            return nv.MovePathKey;
+        }
+        const std::string prefix = nv.CallerName + ".";
+        if (!nv.CallerName.empty() && nv.FieldPathText.size() > prefix.size()
+            && nv.FieldPathText.compare(0, prefix.size(), prefix) == 0)
+            return nv.FieldPathText.substr(prefix.size());
+        return nv.FieldName;
+    }
+
 void LLVMBackend::MarkVariableFieldMoved(const std::string& name, const std::string& field)
 {
         if (name.empty() || field.empty()) return;
@@ -9625,9 +9701,9 @@ void LLVMBackend::MarkVariableFieldMoved(const std::string& name, const std::str
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
-                { it->second.MovedFields.insert(field); return; }
+                    { movedf::MarkFieldPathMoved(it->second.MovedFields, field); return; }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
-                { it->second.MovedFields.insert(field); return; }
+                { movedf::MarkFieldPathMoved(it->second.MovedFields, field); return; }
         }
     }
 
@@ -9638,17 +9714,18 @@ void LLVMBackend::MarkVariableFieldUnmoved(const std::string& name, const std::s
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
-                { it->second.MovedFields.erase(field); return; }
+                { movedf::ReviveFieldPath(it->second.MovedFields, field); return; }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
-                { it->second.MovedFields.erase(field); return; }
+                { movedf::ReviveFieldPath(it->second.MovedFields, field); return; }
         }
     }
 
 std::string LLVMBackend::MovedUseSubject(const NamedVariable& nv) const
 {
         if (nv.IsMoved) return nv.CallerName;
-        if (!nv.FieldName.empty() && nv.MovedFields.count(nv.FieldName))
-            return nv.CallerName + "." + nv.FieldName;
+        const std::string movePath = FieldMoveKey(nv);
+        if (!movePath.empty() && movedf::IsFieldPathMoved(nv.MovedFields, movePath))
+            return movedf::DisplayPath(nv.CallerName, movePath);
         if (!nv.CallerName.empty())
         {
             for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
@@ -9661,8 +9738,8 @@ std::string LLVMBackend::MovedUseSubject(const NamedVariable& nv) const
                     binding = &it->second;
                 if (binding == nullptr) continue;
                 if (binding->IsMoved) return nv.CallerName;
-                if (!nv.FieldName.empty() && binding->MovedFields.count(nv.FieldName))
-                    return nv.CallerName + "." + nv.FieldName;
+                if (!movePath.empty() && movedf::IsFieldPathMoved(binding->MovedFields, movePath))
+                    return movedf::DisplayPath(nv.CallerName, movePath);
                 break;
             }
         }

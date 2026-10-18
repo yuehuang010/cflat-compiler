@@ -1,0 +1,23 @@
+// A C++ class receiver on a non-const lvalue: its member `operator+` and the free `operator+(T&, int)`
+// bind the object the same way, so clang reports the call ambiguous and CFlat refuses it too.
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    t280.TieMember tie = default;
+    expect_error("ambiguous C++ binary operator 'operator+': a member and a free overload are both viable and rank equally") {
+        int r = tie + 1;
+    }
+    // The right operand as a variable ties the same way (clang: ambiguous).
+    int t280Rhs = 1;
+    expect_error("ambiguous C++ binary operator 'operator+': a member and a free overload are both viable and rank equally") {
+        int r = tie + t280Rhs;
+    }
+    // An int member and an unsigned free tie on a non-const lvalue: clang reports the call ambiguous.
+    t280.UintTie ut = default;
+    unsigned int uv = 1;
+    expect_error("ambiguous C++ binary operator 'operator+': a member and a free overload are both viable and rank equally") {
+        int r = ut + uv;
+    }
+    return 0;
+}

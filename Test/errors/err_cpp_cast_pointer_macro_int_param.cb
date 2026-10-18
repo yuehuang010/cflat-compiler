@@ -1,0 +1,9 @@
+// A cast-pointer macro ((int*)0) is an int* value, never an integer: clang refuses it at an int parameter.
+import cpp "cpp_t103_nullctor.hpp";
+
+expect_error("no overload of 't103.t296_int' matches") {
+    extern int main()
+    {
+        return t103.t296_int(T296_CAST_NULL);
+    }
+}

@@ -450,6 +450,10 @@
       "p",
       "take"
     ],
+    "cannotpassthisfuncti...etoparameterarg0arg1d3d64fd013bab604": [
+      "f",
+      "it returns an owning 'move' pointer but the slot's return is borrowed (declare the slot's return 'move')"
+    ],
     "cannotpasstocfunctio...mbdaoranamedfunction48dd5fe854279d60": [
       "cmp",
       "1",
@@ -2044,6 +2048,7 @@
     "cannotpassarg0tothev...icitlywitharg6egarg797ac9bd8fa8f5479": "cannot pass '{0}' to the variadic '{1}' of '{2}': a variadic slot is untyped and a '{3}' is a {4} value, not a '{5}' - the length field would be read as the next argument. Pass the buffer explicitly with '{6}' (e.g. {7}).",
     "cannotpassbondedvalu...toftheirsourcesscope560cc5e8605342a2": "cannot pass bonded value to interface method '{0}.{1}' parameter '{2}' - bonded values cannot be transferred out of their source's scope",
     "cannotpassowningheap...quetdoesnotownarrays57d0d857da621597": "cannot pass owning heap array '{0}' to parameter '{1}' of '{2}': unique<T> does not own arrays",
+    "cannotpassthisfuncti...etoparameterarg0arg1d3d64fd013bab604": "cannot pass this function-pointer value to parameter '{0}': {1}",
     "cannotpasstocfunctio...mbdaoranamedfunction48dd5fe854279d60": "cannot pass to C function-pointer parameter '{0}': this lambda captured {1} {2} [{3}]. A C callback is a bare code pointer and cannot carry captured state - pass a non-capturing lambda or a named function.",
     "cannotpasstocfunctio...mbdaoranamedfunction7fc3eb38b29ed908": "cannot pass to C function-pointer parameter '{0}': this lambda captured {1} {2} [{3}, ... (and {4} more)]. A C callback is a bare code pointer and cannot carry captured state - pass a non-capturing lambda or a named function.",
     "cannotpasstocfunctio...mbdaoranamedfunctionf611c7976a8f6c79": "cannot pass to C function-pointer parameter '{0}': this 'function<>' value may store captured state. A C callback is a bare code pointer - pass a non-capturing lambda or a named function.",

@@ -85,6 +85,9 @@ static bool InAliasDeclaration(antlr4::tree::ParseTree* node)
             return false;
         if (auto* decl = dynamic_cast<CFlatParser::DeclarationContext*>(p))
             return DeclarationSpecifiersHaveAlias(decl->declarationSpecifiers());
+        // A for-init declaration binds its alias for the whole loop (the for-init scope's end).
+        if (auto* forDecl = dynamic_cast<CFlatParser::ForDeclarationContext*>(p))
+            return DeclarationSpecifiersHaveAlias(forDecl->declarationSpecifiers());
         if (dynamic_cast<CFlatParser::StatementContext*>(p)) return false;
     }
     return false;
@@ -1379,7 +1382,7 @@ void MainListener::DiagnoseVoidResultConsumed(antlr4::ParserRuleContext* ctx,
 // T142: `default` names no type; the parameter it binds supplies the type. It is a fresh owned
 // temporary of this full expression (a by-value parameter borrows it), destroyed at its end.
 void MainListener::MaterializeDefaultArgument(antlr4::ParserRuleContext* ctx, LLVMBackend::NamedVariable& argNV,
-    const LLVMBackend::TypeAndValue& dest)
+    const LLVMBackend::TypeAndValue& dest, bool directLoweredSret)
 {
         argNV.IsDefaultArgument = true;
         if (argNV.TypeAndValue.TypeName.empty())
@@ -1397,6 +1400,16 @@ void MainListener::MaterializeDefaultArgument(antlr4::ParserRuleContext* ctx, LL
         }
         if (argNV.Primary != nullptr && !dest.Pointer && Compiler(ctx)->IsOwningValueType(dest.TypeName))
         {
+                // Lowered sret prvalues already own their result slot, which the ABI can pass
+                // directly to the callee. Do not register a second copy beside that slot.
+                if (directLoweredSret)
+                    if (auto* source = Compiler(ctx)->LoweredSretTempOf(
+                            argNV.Primary, Compiler(ctx)->GetType(dest)))
+                    {
+                            argNV.Storage = source;
+                            argNV.IsRvalue = true;
+                            return;
+                    }
                 auto* spill = Compiler(ctx)->CreateAlloca(argNV.Primary->getType());
                 Compiler(ctx)->CreateAssignment(argNV.Primary, spill);
                 Compiler(ctx)->RegisterOwnedStructTemp(spill, dest.TypeName);
@@ -1802,6 +1815,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 structVar.IsBorrowed      = namedVar.IsBorrowed;
                 structVar.BorrowedOrigin  = namedVar.BorrowedOrigin;
                 structVar.FieldPathThroughPointer = namedVar.FieldPathThroughPointer;
+                structVar.MovePathKey = namedVar.MovePathKey;
+                structVar.MovePathHasDynamicIndex = namedVar.MovePathHasDynamicIndex;
                 structVar.FieldPathRoot = namedVar.FieldPathRoot;
                 structVar.ContainsBondedClosure = namedVar.ContainsBondedClosure;
                 structVar.BondedSources = namedVar.BondedSources;
@@ -1865,7 +1880,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         }
                     }
 
-                    if (!compiler->IsCoreUniqueType(receiver.TypeAndValue.TypeName))
+                    // A core unique receiver is also a named local read: consult its merged move state.
+                    // Null-conditional access stays safe after a move and skips this guard.
+                    if (!nullConditionalPending)
                         CheckMovedReceiver(receiver);
                     FlushCallPostfix();
                     auto* arrowResult = compiler->CreateOverloadedFunctionCall("operator->", { thisNV });
@@ -1882,11 +1899,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     bool throughPointer = receiver.FieldPathThroughPointer
                         || throughCoreUniqueField;
                     std::string pathRoot = receiver.FieldPathRoot;
+                    std::string movePath = receiver.MovePathKey;
+                    bool movePathHasDynamicIndex = receiver.MovePathHasDynamicIndex;
                     receiver = {};
                     receiver.Primary      = arrowResult;
                     receiver.BaseType     = arrowResult->getType();
                     receiver.TypeAndValue = compiler->lastCallReturnType;
                     receiver.FieldPathThroughPointer = throughPointer;
+                    receiver.MovePathKey = movePath;
+                    receiver.MovePathHasDynamicIndex = movePathHasDynamicIndex;
                     receiver.FieldPathRoot = pathRoot;
                     PrepareAliasCallResult(ctx, receiver, false);
 
@@ -3363,6 +3384,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // can reject it when invoked outside the owning struct's own methods.
                                     namedVar.OwningStructName = structVar.TypeAndValue.TypeName;
                                     namedVar.FieldName        = primaryIdentifier;
+                                    namedVar.MovePathHasDynamicIndex = structVar.MovePathHasDynamicIndex;
+                                    namedVar.MovePathKey = structVar.MovePathHasDynamicIndex
+                                        ? std::string()
+                                        : structVar.MovePathKey.empty()
+                                            ? primaryIdentifier
+                                            : structVar.MovePathKey + "." + primaryIdentifier;
                                     namedVar.FieldPathText = structVar.FieldPathText.empty()
                                         ? structVar.TypeAndValue.VariableName + "." + primaryIdentifier
                                         : structVar.FieldPathText + "." + primaryIdentifier;
@@ -4661,8 +4688,25 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             interfaceVar = {};
                         }
 
-                        // A subscript result is an element (container slot): move-dataflow leaves
-                        // index/deref lvalues untracked, so mark it so USE-recording skips it.
+                        // Keep a structural move path for element slots; the index value is folded
+                        // from the parse tree, never recovered from source text.
+                        if (auto foldedIndex = FoldCompileTimeInt(Compiler(ctx), expressCtx))
+                        {
+                            if (!namedVar.MovePathHasDynamicIndex)
+                                namedVar.MovePathKey += "[" + std::to_string(*foldedIndex) + "]";
+                        }
+                        else
+                        {
+                            namedVar.MovePathKey.clear();
+                            namedVar.MovePathHasDynamicIndex = true;
+                        }
+                        // The struct/interface receiver was captured above while the move path
+                        // still named the containing array. Refresh it after adding the index so
+                        // `arr[K].field` carries the element identity into field lookup.
+                        if (namedVar.BaseType && namedVar.BaseType->isStructTy())
+                            structVar = namedVar;
+                        // A subscript result is an element (container slot); only folded indices
+                        // contribute to a field move path.
                         namedVar.IsElementAccess = true;
                         receiverWasFixedArray = false;
                         // Positive provenance for the ownership arms: only an addressable element
@@ -5274,7 +5318,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
                                 else
                                     compiler->MarkVariableFieldUnmoved(
-                                        slotNV.CallerName, slotNV.FieldName);
+                                        slotNV.CallerName, LLVMBackend::FieldMoveKey(slotNV));
                             };
 
                             if (builtInPlace)
@@ -5333,6 +5377,28 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     sourceNV, slotValue, destType.IsInterface, ctx);
                                 TransferMoveStringOwnershipOnStore(sourceNV, ctx);
                                 reviveDirectSlot();
+                            }
+                            if (sourceNV.IsRvalue
+                                && llvm::isa_and_nonnull<llvm::LoadInst>(sourceNV.Storage)
+                                && !sourceNV.IsTempSpillStorage
+                                && compiler->IsLoweredCFlatOnlyStruct(sourceNV.TypeAndValue.TypeName))
+                            {
+                                if (auto* shell = compiler->GetOrCreateMovedFromShellDestructor(
+                                        sourceNV.TypeAndValue.TypeName))
+                                    compiler->builder->CreateCall(shell->getFunctionType(), shell,
+                                                                  { sourceNV.Storage });
+                                compiler->builder->CreateStore(
+                                    llvm::ConstantAggregateZero::get(sourceValue->getType()),
+                                    sourceNV.Storage);
+                                const std::string movePath = LLVMBackend::FieldMoveKey(sourceNV);
+                                if (!sourceNV.CallerName.empty() && !movePath.empty())
+                                    compiler->MarkVariableFieldMoved(sourceNV.CallerName, movePath);
+                                else if (!sourceNV.CallerName.empty()
+                                    && sourceNV.FieldName.empty() && sourceNV.OwningStructName.empty()
+                                    && !sourceNV.IsElementAccess
+                                    && (llvm::isa<llvm::AllocaInst>(sourceNV.Storage)
+                                        || llvm::isa<llvm::GlobalVariable>(sourceNV.Storage)))
+                                    compiler->MarkVariableMoved(sourceNV.CallerName);
                             }
                             namedVar = {};
                             break;
@@ -6705,9 +6771,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // so a moved-from closure local must be diagnosed exactly as a plain read
                             // would (mirrors LoadNamedVariable). Without this, `sink(move f); f(1)`
                             // dereferences a nulled env and segfaults instead of failing to compile.
-                            if (namedVar.IdentifierLine > 0 && !namedVar.IsElementAccess)
+                            if (namedVar.IdentifierLine > 0
+                                && (!namedVar.IsElementAccess
+                                    || !LLVMBackend::FieldMoveKey(namedVar).empty()))
                             {
-                                Compiler(ctx)->RecordMoveUse(namedVar.CallerName, namedVar.FieldName,
+                                Compiler(ctx)->RecordMoveUse(namedVar.CallerName, LLVMBackend::FieldMoveKey(namedVar),
                                                              namedVar.IdentifierLine, namedVar.IdentifierColumn);
                                 if (auto moved = Compiler(ctx)->MovedUseSubject(namedVar); !moved.empty())
                                 {
@@ -6825,8 +6893,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         // Compile-time use-after-move check: arg is a moved variable (or field).
                                         if (argNV.IdentifierLine > 0)
                                         {
-                                            if (!argNV.IsElementAccess)
-                                                Compiler(ctx)->RecordMoveUse(argNV.CallerName, argNV.FieldName,
+                                            if (!argNV.IsElementAccess
+                                                || !LLVMBackend::FieldMoveKey(argNV).empty())
+                                                Compiler(ctx)->RecordMoveUse(argNV.CallerName, LLVMBackend::FieldMoveKey(argNV),
                                                                              argNV.IdentifierLine, argNV.IdentifierColumn);
                                             if (auto moved = Compiler(ctx)->MovedUseSubject(argNV); !moved.empty())
                                             {
@@ -7222,18 +7291,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         MaterializeDefaultArgument(namedArgument, argNV, ifaceArgExpectedDest);
                                     ifaceArgExpectedScope.reset();
                                     lambdaExpectedType = {};
-                                    // Use-after-move check: a field access carries a populated Primary, so the
-                                    // LoadNamedVariable check below is skipped for it - check explicitly here so
-                                    // re-moving a field (or any moved variable) is rejected uniformly.
+                                    // Use-after-move: a field/element argument has Primary set and skips LoadNamedVariable's
+                                    // check, so check it here; a raw borrow of a stored core unique is checked there.
                                     bool coreUniqueRawBorrow = !ifaceArgExpectedDest.IsMove
                                         && !ifaceArgExpectedDest.IsUnique
                                         && ifaceArgExpectedDest.Pointer
                                         && !argNV.TypeAndValue.Pointer
                                         && Compiler(ctx)->IsCoreUniqueType(argNV.TypeAndValue.TypeName);
-                                    if (argNV.IdentifierLine > 0 && !coreUniqueRawBorrow)
+                                    if (argNV.IdentifierLine > 0 && (!coreUniqueRawBorrow || argNV.Primary != nullptr))
                                     {
-                                        if (!argNV.IsElementAccess)
-                                            Compiler(ctx)->RecordMoveUse(argNV.CallerName, argNV.FieldName,
+                                        if (!argNV.IsElementAccess
+                                            || !LLVMBackend::FieldMoveKey(argNV).empty())
+                                            Compiler(ctx)->RecordMoveUse(argNV.CallerName, LLVMBackend::FieldMoveKey(argNV),
                                                                          argNV.IdentifierLine, argNV.IdentifierColumn);
                                         if (auto moved = Compiler(ctx)->MovedUseSubject(argNV); !moved.empty())
                                         {
@@ -7282,6 +7351,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // Explicit 'move' at the call site: drives move-overload selection
                                     // and the borrow-param diagnostic after overload resolution.
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
+                                    argVar.ClosureEnvKnownFree = argNV.ClosureEnvKnownFree;
+                                    argVar.ClosureEnvProvenanceTainted =
+                                        argNV.ClosureEnvProvenanceTainted;
                                     argVar.IsNormalizedCxxXvalue = argNV.IsNormalizedCxxXvalue;
                                     argVar.IsRvalue = argNV.IsRvalue;
                                     argVar.IsCxxPrvalueTemp = argNV.IsCxxPrvalueTemp;
@@ -7331,6 +7403,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.CallerName = argNV.CallerName;
                                     // Per-field move tracking: moving `node->left` marks only that field.
                                     argVar.FieldName = argNV.FieldName;
+                                    argVar.MovePathKey = argNV.MovePathKey;
+                                    argVar.MovePathHasDynamicIndex = argNV.MovePathHasDynamicIndex;
+                                    argVar.FieldPathText = argNV.FieldPathText;
+                                    argVar.FieldPathRoot = argNV.FieldPathRoot;
                                     argVar.MovedFields = argNV.MovedFields;
                                     argVar.TypeAndValue.IsInterface = argNV.TypeAndValue.IsInterface;
                                     argVar.IsBonded = argNV.IsBonded;
@@ -7759,7 +7835,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         bool hasDefaultArgument = false;
                                         for (auto* namedArgument : namedArgCtx)
                                             if (namedArgument->assignmentExpression() != nullptr
-                                                && namedArgument->assignmentExpression()->getText() == "default")
+                                                && IsDefaultOnlyExpression(
+                                                    namedArgument->assignmentExpression(), false))
                                             {
                                                 hasDefaultArgument = true;
                                                 break;
@@ -8010,6 +8087,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                             &elementVar.LiteralIdentitySuffixed);
                                                     elementVar.TypeAndValue.VariableName.clear();
                                                     if (!cxxClassElement) elementVar.IsRvalue = true;
+                                                    // An imported enumerator or integer macro keeps its typed constant
+                                                    // spelling: clang reads it as a constant expression, not a variable.
+                                                    if (!cxxClassElement)
+                                                    {
+                                                        elementVar.CxxImportedLiteral =
+                                                            Compiler(ctx)->CxxImportedConstantLiteral(elementNV);
+                                                        Compiler(ctx)->RecordCxxConstantBraceElement(elementVar, elementValue);
+                                                    }
                                                     brace.elements.push_back(std::move(elementVar));
                                                     ProcessPlusPlus();
                                                 }
@@ -8326,7 +8411,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         && Compiler(ctx)->IsCxxRecord(argNV.TypeAndValue.TypeName))
                                         *cxxDirectConstructionCallOrderSafe_ = false;
                                     if (defaultArgument)
-                                        MaterializeDefaultArgument(namedArgument, argNV, argExpectedDest);
+                                        MaterializeDefaultArgument(namedArgument, argNV, argExpectedDest,
+                                                                   true);
                                     argExpectedScope.reset();
                                     // A lambda for a std::function parameter converts through its
                                     // function-pointer constructor, like a function<> value does.
@@ -8365,18 +8451,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (argNV.ContainsBondedClosure)
                                         Compiler(ctx)->LogError(
                                             "cannot pass a holder containing a bonded closure to a function - the callee could stash it beyond the captured local's lifetime");
-                                    // Use-after-move check: a field access carries a populated Primary, so the
-                                    // LoadNamedVariable check below is skipped for it - check explicitly here so
-                                    // re-moving a field (or any moved variable) is rejected uniformly.
+                                    // Use-after-move: a field/element argument has Primary set and skips LoadNamedVariable's
+                                    // check, so check it here; a raw borrow of a stored core unique is checked there.
                                     bool coreUniqueRawBorrow = !argExpectedDest.IsMove
                                         && !argExpectedDest.IsUnique
                                         && argExpectedDest.Pointer
                                         && !argNV.TypeAndValue.Pointer
                                         && Compiler(ctx)->IsCoreUniqueType(argNV.TypeAndValue.TypeName);
-                                    if (argNV.IdentifierLine > 0 && !coreUniqueRawBorrow)
+                                    if (argNV.IdentifierLine > 0 && (!coreUniqueRawBorrow || argNV.Primary != nullptr))
                                     {
-                                        if (!argNV.IsElementAccess)
-                                            Compiler(ctx)->RecordMoveUse(argNV.CallerName, argNV.FieldName,
+                                        if (!argNV.IsElementAccess
+                                            || !LLVMBackend::FieldMoveKey(argNV).empty())
+                                            Compiler(ctx)->RecordMoveUse(argNV.CallerName, LLVMBackend::FieldMoveKey(argNV),
                                                                          argNV.IdentifierLine, argNV.IdentifierColumn);
                                         if (auto moved = Compiler(ctx)->MovedUseSubject(argNV); !moved.empty())
                                         {
@@ -8427,6 +8513,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // moving a struct sub-path (`node->left`) marks only that field, not the
                                     // whole base variable - letting recursive owning-pointer-tree code compile.
                                     argVar.FieldName = argNV.FieldName;
+                                    argVar.MovePathKey = argNV.MovePathKey;
+                                    argVar.MovePathHasDynamicIndex = argNV.MovePathHasDynamicIndex;
+                                    argVar.FieldPathText = argNV.FieldPathText;
+                                    argVar.FieldPathRoot = argNV.FieldPathRoot;
                                     argVar.MovedFields = argNV.MovedFields;
                                     // Propagate storage and ownership so move-param zeroing works at the call site.
                                     argVar.Storage = argNV.Storage;
@@ -10875,6 +10965,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         result.Primary     = fat;
         result.TypeAndValue = tv;
         result.IsRvalue     = true;
+        result.ClosureEnvKnownFree = captures.empty();
 
         // Register the lambda value as an owned-closure temporary (Option A): if it is not bound
         // to a named owner (e.g. passed directly by value as an argument), its heap env is freed
@@ -11335,7 +11426,7 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
             }
             LLVMBackend::DeclTypeAndValue dtv;
             static_cast<LLVMBackend::TypeAndValue&>(dtv) = declExpectedType;
-            return GenerateDefaultValue(dtv);
+            return GenerateDefaultValue(dtv, ctx);
         }
 
         if (ctx->TypeOf())

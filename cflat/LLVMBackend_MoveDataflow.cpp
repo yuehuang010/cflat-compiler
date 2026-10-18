@@ -1119,7 +1119,7 @@ void LLVMBackend::MergeMovedStateInto(const MovedStateSnapshot& state)
             if (auto it = state.moved.find(name); it != state.moved.end() && it->second)
                 nv.IsMoved = true;
             if (auto it = state.movedFields.find(name); it != state.movedFields.end())
-                nv.MovedFields.insert(it->second.begin(), it->second.end());
+                nv.MovedFields = movedf::MergeFieldPaths(nv.MovedFields, it->second);
         };
         for (auto& frame : stackNamedVariable)
         {
@@ -1139,11 +1139,7 @@ void LLVMBackend::MergeMovedStates(const MovedStateSnapshot& thenState,
             auto tf = thenState.movedFields.find(name);
             auto ef = elseState.movedFields.find(name);
             if (tf != thenState.movedFields.end() && ef != elseState.movedFields.end())
-            {
-                std::unordered_set<std::string> merged = tf->second;
-                merged.insert(ef->second.begin(), ef->second.end());
-                nv.MovedFields = std::move(merged);
-            }
+                nv.MovedFields = movedf::MergeFieldPaths(tf->second, ef->second);
         };
         for (auto& frame : stackNamedVariable)
         {

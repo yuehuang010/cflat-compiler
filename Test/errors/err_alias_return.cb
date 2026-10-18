@@ -8,28 +8,27 @@ import "list.cb";
 
 struct Token { string text = default; };
 
-alias string frameArrayString()
+// Frame-local owners returned through a generic `alias T` (T=string): the frame-local alias
+// string check must still fire; each expect_error wraps its return statement.
+struct AliasStringBoxG<T> { T s = default; };
+alias T frameArrayStringG<T>(T seed)
 {
-    string[2] dst;
-    dst[0] = "ab" + "cd";
-    expect_error("cannot return an 'alias' string value");
-    return dst[0];
+    T[2] dst;
+    dst[0] = seed + seed;
+    expect_error("cannot return an 'alias' string value") { return dst[0]; }
 }
 
-alias string frameWholeString()
+alias T frameWholeStringG<T>(T seed)
 {
-    string s = "ab" + "cd";
-    expect_error("cannot return an 'alias' string value");
-    return s;
+    T s = seed + seed;
+    expect_error("cannot return an 'alias' string value") { return s; }
 }
 
-struct AliasStringBox { string s = default; };
-alias string frameFieldString()
+alias T frameFieldStringG<T>(T seed)
 {
-    AliasStringBox b = default;
-    b.s = "ab" + "cd";
-    expect_error("cannot return an 'alias' string value");
-    return b.s;
+    AliasStringBoxG<T> b = default;
+    b.s = seed + seed;
+    expect_error("cannot return an 'alias' string value") { return b.s; }
 }
 
 Token firstToken(list<Token> toks)
@@ -53,6 +52,9 @@ Inner stealSlot(Outer* w)
 
 extern int main()
 {
+    string fa = frameArrayStringG<string>("ab");
+    string fw = frameWholeStringG<string>("ab");
+    string ff = frameFieldStringG<string>("ab");
     return 0;
 }
 

@@ -1,0 +1,15 @@
+// A cast-pointer macro is not another pointee: clang refuses ((int*)0) at a long long* parameter (long long, not
+// long: long is int-width on LLP64) and
+// ((const int*)0) at a mutable int* parameter (the const pointee is not carried, so it stays refused).
+import cpp "cpp_t103_nullctor.hpp";
+
+expect_error("no overload of 't103.t296_long_pointer' matches") {
+    extern int main()
+    {
+        return t103.t296_long_pointer(T296_CAST_NULL);
+    }
+}
+
+expect_error("no overload of 't103.t296_pointer' matches") {
+    int t296_const_pointee(int dummy) { return t103.t296_pointer(T296_CONST_CAST_NULL); }
+}

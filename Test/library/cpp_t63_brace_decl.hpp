@@ -212,3 +212,115 @@ inline int countedMoveCount() { return countedMoves; }
 inline int countedDtorCount() { return countedDtors; }
 inline int countedByVal(Counted value) { return value.value; }
 }
+
+// T278 macro: an integer macro constant that fits (clang oracle 1).
+#define T278_ONE 1
+#define T278_BIG 300
+
+// T276: unscoped enum elements of brace lists (clang oracle in the leg comments).
+namespace t276 {
+enum E { e0, e1 };                       // unscoped, no fixed type: promotes to int
+enum CU : unsigned char { cu0, cu1 };    // fixed: the underlying type matches exactly
+enum FU : unsigned { fu0, fu1 };         // fixed unsigned: stays unsigned
+enum FL : long long { fl0, fl1 };       // fixed long long: stays long long
+enum class SC { s0, s1 };                // scoped: no promotion
+enum SH : short { sh0, sh1 };            // fixed: the underlying short matches exactly
+enum W16 : char16_t { w0, w1 };          // fixed char-type: keeps its own spelling
+enum WW : wchar_t { ww0, ww1 };          // fixed char-type: keeps its own spelling
+enum HG { h0, h1 = 0x100000000ll };      // no fixed type, value above UINT_MAX: promotes to long
+
+struct A {
+    int w;
+    A(const int (&)[2]) : w(1) {}
+    A(const unsigned (&)[2]) : w(2) {}
+};
+struct AL {
+    int w;
+    AL(const int (&)[2]) : w(1) {}
+    AL(const long long (&)[2]) : w(3) {}
+};
+struct AC {
+    int w;
+    AC(const int (&)[2]) : w(1) {}
+    AC(const unsigned char (&)[2]) : w(5) {}
+};
+struct SA {
+    int w;
+    SA(const int (&)[2]) : w(1) {}
+    SA(const SC (&)[2]) : w(4) {}
+};
+struct L {
+    int w;
+    L(std::initializer_list<int>) : w(1) {}
+    L(std::initializer_list<long>) : w(2) {}
+};
+struct A16 {
+    int w;
+    A16(const int (&)[2]) : w(1) {}
+    A16(const char16_t (&)[2]) : w(7) {}
+};
+struct AW {
+    int w;
+    AW(const int (&)[2]) : w(1) {}
+    AW(const wchar_t (&)[2]) : w(8) {}
+};
+struct AH {
+    int w;
+    AH(const int (&)[2]) : w(1) {}
+#if !defined(_MSC_VER)
+    // MSVC keeps a non-fixed enum int (value truncated), so the twin would redeclare AH(int[2]).
+    AH(const decltype(+h1) (&)[2]) : w(3) {}   // LP64: the promoted 64-bit type
+#endif
+};
+inline int fa(const int (&)[2]) { return 1; }
+inline int fa(const unsigned (&)[2]) { return 2; }
+// T278: an enumerator constant that fits is not narrowing in a brace element; `enum : bool` ranks as bool.
+enum K65 { k0, k65 = 65 };                // unscoped, no fixed type: promotes to int
+enum KBig { kb0, kb1 = 300 };             // 300 does not fit a char
+enum KNeg { kn0 = -1, kn1 = 1 };          // -1 does not fit an unsigned char
+enum KBool : bool { kf, kt };             // fixed bool: clang ranks bool over int
+struct KChar {
+    int w;
+    KChar(const char (&a)[1]) : w(a[0]) {}
+};
+struct KUChar {
+    int w;
+    KUChar(const unsigned char (&a)[1]) : w(a[0]) {}
+};
+struct KBoolArr {
+    int w;
+    KBoolArr(const int (&)[2]) : w(1) {}
+    KBoolArr(const bool (&)[2]) : w(11) {}
+};
+struct KBoolList {
+    int w;
+    KBoolList(std::initializer_list<int>) : w(1) {}
+    KBoolList(std::initializer_list<bool>) : w(11) {}
+};
+inline int kChar(const char (&a)[1]) { return a[0]; }
+inline int kUChar(const unsigned char (&a)[1]) { return a[0]; }
+inline int ol(std::initializer_list<int>) { return 1; }
+inline int ol(std::initializer_list<bool>) { return 11; }
+inline int ol2(std::initializer_list<bool>) { return 11; }
+inline int ol2(std::initializer_list<int>) { return 1; }
+inline int ci(std::initializer_list<char>) { return 1; }
+inline int ci(std::initializer_list<int>) { return 2; }
+inline int li(std::initializer_list<long>) { return 1; }
+inline int li(std::initializer_list<int>) { return 2; }
+inline int iu(std::initializer_list<int>) { return 1; }
+inline int iu(std::initializer_list<unsigned>) { return 2; }
+}
+
+// T286: a CFlat-declared enum value (no C++ spelling) binds as its backing integer; an imported enum keeps its own overload.
+namespace t286 {
+enum IE : int { ie0, ie1 = 1 };
+inline int ee(IE e) { return 100 + (int)e; }
+inline int ee(int x) { return 200 + x; }
+inline int si1(int x) { return x; }
+inline int si1(const char (&a)[1]) { return 50 + a[0]; }
+inline int mx(int a, int b) { return a * 10 + b; }
+inline int mx(int a, const char (&b)[1]) { return a + b[0]; }
+inline int sc1(const char (&a)[1]) { return a[0]; }
+inline int ci(std::initializer_list<char>) { return 1; }
+inline int ci(std::initializer_list<int>) { return 2; }
+}

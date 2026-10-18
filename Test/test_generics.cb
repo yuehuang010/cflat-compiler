@@ -4580,9 +4580,8 @@ bool testGnNsGfCtrlOwnerStructNameEqualsNamespace()
     return result;
 }
 
-// Leg K (CONTROL) - a bare call from inside a STRUCT METHOD body in a namespace does NOT see the
-// namespace, so it takes the global template. Pinned together with its NON-GENERIC control, which
-// answers the same way: this is a general namespace-scope limit, not a generic-function one.
+// Leg K - a bare call in a struct method body sees its enclosing namespace, matching C++.
+// Distinct results identify the global and namespace candidates for generic and plain functions.
 Gq15T gq15Id<Gq15T>(Gq15T x) { return x; }
 int gq15Plain(int x) { return x; }
 namespace Gq15NS
@@ -4598,10 +4597,129 @@ bool testGnNsGfCtrlStructMethodBodyScope()
 {
     bool result = true;
     Gq15NS.S s = default;
-    result &= Test("gf_method_body_generic",  s.mGeneric(),        10);
-    result &= Test("gf_method_body_plain",    s.mPlain(),          10);
+    result &= Test("gf_method_body_generic",  s.mGeneric(),        11);
+    result &= Test("gf_method_body_plain",    s.mPlain(),          11);
     result &= Test("gf_free_body_generic",    Gq15NS.freeGeneric(), 11);
     result &= Test("gf_free_body_plain",      Gq15NS.freePlain(),   11);
+    return result;
+}
+
+// T268 accept-set and namespace lookup legs. Each shadow candidate has a distinct value.
+int t268AcceptLocal(int x) { return x + 1; }
+int t268AcceptField(int x) { return x + 1; }
+int t268AcceptScope(int x) { return x + 100; }
+int t268AcceptOver(int x) { return x + 10; }
+int t268AcceptOver(double x) { return (int)x + 20; }
+int sprintf = 3;
+
+struct T268AcceptFieldBox
+{
+    int t268AcceptField = 7;
+    int read() { return t268AcceptField; }
+};
+
+// A global variable named like a struct method is not a same-scope redefinition (T268 review 1).
+struct T268AcceptMethodBox { int value = 1; int t268MethodName() { return value; } };
+int t268MethodName = 5;
+
+namespace T268AcceptNs
+{
+    int t268AcceptScope = 7;
+    int read() { return t268AcceptScope; }
+}
+
+int t268Plain(int x) { return x + 100; }
+namespace T268PlainNs
+{
+    int t268Plain(int x) { return x + 1; }
+    struct S { int run() { return t268Plain(10); } };
+}
+
+int t268Nested(int x) { return x + 30; }
+namespace T268Outer
+{
+    int t268Nested(int x) { return x + 20; }
+    namespace Inner
+    {
+        int t268Nested(int x) { return x + 1; }
+        struct S { int run() { return t268Nested(10); } };
+    }
+}
+
+const int t268GenericK = 1;
+int t268Generic<T>(T x) { return 100 + (int)x; }
+namespace T268GenericNs
+{
+    const int t268GenericK = 3;
+    int t268Generic<T>(T x) { return (int)x + 1; }
+    struct Box<T>
+    {
+        int run(T x)
+        {
+            int[t268GenericK] a = default;
+            return t268Generic<T>(x) + (int)(sizeof(a) / sizeof(int));
+        }
+    };
+}
+
+int t268MethodValue = 77;
+namespace T268ValueNs
+{
+    int t268MethodValue(int x) { return x + 1; }
+    struct S
+    {
+        int run()
+        {
+            function<int(int)> f = t268MethodValue;
+            return f(10);
+        }
+    };
+}
+
+int t268MethodVar = 200;
+namespace T268MethodVarNs
+{
+    int t268MethodVar = 8;
+    struct S { int run() { return t268MethodVar; } };
+}
+
+int t268ClassFn(int x) { return x + 100; }
+namespace T268ClassNs
+{
+    int t268ClassFn(int x) { return x + 1; }
+    class S
+    {
+        int run() { return t268ClassFn(10); }
+        static int staticRun() { return t268ClassFn(10); }
+    };
+}
+
+bool testT268NamespaceLookupCoverage()
+{
+    bool result = true;
+    int t268AcceptLocal = 3;
+    result &= Test("t268_accept_local_shadow", t268AcceptLocal, 3);
+    T268AcceptFieldBox fieldBox = default;
+    result &= Test("t268_accept_field_shadow", fieldBox.read(), 7);
+    T268AcceptMethodBox methodBox = default;
+    result &= Test("t268_accept_global_named_like_method", t268MethodName + methodBox.t268MethodName(), 6);
+    result &= Test("t268_accept_namespace_var_global_function", T268AcceptNs.read(), 7);
+    result &= Test("t268_accept_overloads", t268AcceptOver(1) + t268AcceptOver(2.0), 33);
+    result &= Test("t268_accept_unimported_libc_name", sprintf, 3);
+
+    T268PlainNs.S plain = default;
+    result &= Test("t268_method_plain_namespace_call", plain.run(), 11);
+    T268Outer.Inner.S nested = default;
+    result &= Test("t268_method_nested_inner_shadows_outer", nested.run(), 11);
+    T268GenericNs.Box<int> generic = default;
+    result &= Test("t268_generic_struct_method_namespace", generic.run(10), 14);
+    T268ValueNs.S value = default;
+    result &= Test("t268_method_function_value", value.run(), 11);
+    T268MethodVarNs.S nsVar = default;
+    result &= Test("t268_method_namespace_variable", nsVar.run(), 8);
+    T268ClassNs.S classMethod = default;
+    result &= Test("t268_class_method_namespace", classMethod.run(), 11);
+    result &= Test("t268_class_static_method_namespace", T268ClassNs.S.staticRun(), 11);
     return result;
 }
 
@@ -5632,6 +5750,7 @@ extern int main()
     total++; passed += testGnNsGfMemberVsFreeNameCollision()      ? 1 : 0;
     total++; passed += testGnNsGfCtrlOwnerStructNameEqualsNamespace() ? 1 : 0;
     total++; passed += testGnNsGfCtrlStructMethodBodyScope()      ? 1 : 0;
+    total++; passed += testT268NamespaceLookupCoverage()          ? 1 : 0;
 
     total++; passed += testGnCanonicalPrimitiveTypeArg()          ? 1 : 0;
     total++; passed += testGnUnresolvedGenericShellGate()          ? 1 : 0;

@@ -330,6 +330,8 @@ int t64Forward<T>(T value) { return t64TakeInt(value); }
 i64 t64ForwardI64<T>(T value) { return t64TakeI64(value); }
 int t64PrintU8<T>(T value) { return printf("%u", value); }
 int t64PrintU16<T>(T value) { return printf("%u", value); }
+t300.DoubleCtor t300MakeDouble(double value) { return value; }
+t300.DoubleCtor t300MakeDoubleCtor(double value) { return value; }
 extern int abs(int value);
 import cpp "future";
 import cpp "system_error";
@@ -427,6 +429,7 @@ void take<T>(list<T>* values, int expectedCount)
 struct CppListBox<T> { list<T> values; };
 struct NewTempBox<T> { T value; };
 struct CppListHolder { cpplist.Plain item = default; int tag = 0; };
+struct T304NativeFoo { int value = 3; };
 int t255CppDtor = 0;
 struct T255CppLeaf { int value = 0; };
 struct T255CppOuter
@@ -498,6 +501,7 @@ t50v.V* t50Up(t50v.L* p) { return p; }
 int t50Take(t50v.V* v) { return v == nullptr ? -1 : v.value; }
 import cpp "library/t31_minmax_brace.hpp";
 import cpp "library/cpp_t63_brace_decl.hpp";
+enum T276Cf : u8 { T276C0, T276C1 };
 import cpp "library/cpp_t135_field_brace.hpp";
 import cpp "library/cpp_t78_scalar_table.h";
 import cpp "library/cpp_interop_t104_refparam.hpp";
@@ -2122,6 +2126,9 @@ int T224ThrowWrapper(int x)
     return s.t.get();
 }
 cppexp.ConvCnt T224Mk(int x) { return x; }
+// T272: a return of a parenthesized C++ call elides like the bare return (clang: 1 ctor, 1 dtor).
+cppexp.ConvCnt T272Ret() { return (cppexp.conv_mk(7)); }
+struct T272Hold { cppexp.ConvCnt c; };
 // T228: several candidates share the sret slot. A local is elided when every return inside its live
 // range names it; a return naming another local (or any other value) keeps it a normal local.
 // Oracle: clang++ -std=c++20 on the same shapes (scratch/t228_tmp/oracle.cpp, oracle2.cpp, oracle3.cpp).
@@ -2407,6 +2414,12 @@ extern int main()
     delete t103Expr;
     delete t103Variable;
 
+    // T296: a cast-pointer macro ((int*)0) is an int* value (clang: exact int* overload), and
+    // ((int*)8) a non-null int*; the system NULL (__null) at int* is a null pointer (clang accepts).
+    if (t103.t296_pointer(T296_CAST_NULL) != 1 || t103.t296_pointer(T296_CAST_EIGHT) != 2) return 29601;
+    if (t103.t296_overload(T296_CAST_NULL) != 11 || t103.t296_overload(T296_CAST_EIGHT) != 12) return 29602;
+    if (t103.t296_pointer(NULL) != 1) return 29603;
+
     // T95: `*arr` on a fixed array of C++ records decays to its element pointer (clang: builtin deref,
     // never the element operator*). master: LLVM verification failure / "indirection requires a pointer".
     t95d.C[2] t95arr;
@@ -2473,6 +2486,65 @@ extern int main()
     if (-t150.volRef(t150VolRef) != 22) return 15010;
     t150.VolTemplateCopyS t150VolCopy = default;
     if (-t150.volTemplateCopyRef(t150VolCopy) != 22) return 15011;
+    // T275 (clang++ -std=c++20 oracle: 1 7 1 8 9): rvalue receiver member beats the `S&` free; xvalue receivers.
+    if (-t275.rvalueMemberRefFreeMake() != 1) return 27501;
+    t275.XvalueNot t275XvNot = default;
+    int t275XvNotValue = !t275.xvalueNotRef(t275XvNot);
+    if (t275XvNotValue != 7) return 27502;
+    t275.XvalueRvalueMember t275XvRv = default;
+    if (-t275.xvalueRvalueRef(t275XvRv) != 1) return 27503;
+    t275.XvalueTilde t275XvTilde = default;
+    if (~t275.xvalueTildeRef(t275XvTilde) != 8 || +t275.xvalueTildeRef(t275XvTilde) != 9) return 27504;
+    // T280 (clang++ -std=c++20 oracle: 1 2 2 2 1 2): binary member/free ranking on a class receiver.
+    if (t280.rvalueMemberMake() + 1 != 1) return 27505;
+    if (t280.lrefMemberMake() + 1 != 2) return 27506;
+    if (t280.lrefMemberRrefMake() + 1 != 2) return 27507;
+    if (t280.constMemberRrefMake() + 1 != 2) return 27508;
+    t280.MemberCref t280Mc = default;
+    if (t280Mc + 1 != 1) return 27509;
+    t280.EqMemberVal t280Eq = default;
+    // The overload's own result is the value: 2 when the free wins, 1 when the member does.
+    int r27510 = t280.eqConstRef(t280Eq) == 2;
+    if (r27510 != 2) return 27510;
+    // Variable and call-result right operands rank the same as the literal (clang: 1, 1).
+    int t280Rhs = 1;
+    if (t280Mc + t280Rhs != 1) return 27511;
+    if (t280.rvalueMemberMake() + t280.oneValue() != 1) return 27512;
+    // Inherited member against an exact free (clang: 2, 2): the free's object is the better binding.
+    t280.InhDer t280Inh = default;
+    if (t280Inh + 1 != 2) return 27513;
+    t280.InhCDer t280InhC = default;
+    if (t280InhC + 1 != 2) return 27514;
+    // Unsigned right operands rank by their declared type (clang: 1, 1); master picks the free (2).
+    t280.UintMember t280Um = default;
+    unsigned int t280Uv = 1;
+    if (t280Um + t280Uv != 1) return 27515;
+    t280.UlongMember t280Ul = default;
+    unsigned long t280Ulv = 1;
+    if (t280Ul + t280Ulv != 1) return 27516;
+    // By-value exact free against an inherited member (clang: 2, 2); master picks the member (1).
+    t280.ByValDer t280Bv = default;
+    if (t280Bv + 1 != 2) return 27517;
+    t280.ByValLongDer t280Bl = default;
+    if (t280Bl + 1 != 2) return 27518;
+    // T291 (clang++ -std=c++20 oracle: 1 0 1 0 1 / 0 1 / 0 / 1 0 / 1 0 / 0 1): a reversed
+    // `<=>` relation (`5 > x` as `0 > (x <=> 5)`) reads the mirrored ordering range.
+    if (!(5 > t291.ordMemberMake(4))) return 27519;
+    if (5 < t291.ordMemberMake(4)) return 27520;
+    if (!(5 >= t291.ordMemberMake(5))) return 27521;
+    if (6 <= t291.ordMemberMake(5)) return 27522;
+    if (!(5 <= t291.ordMemberMake(5))) return 27523;
+    if (4 >= t291.ordMemberMake(5)) return 27524;
+    if (!(5 > t291.ordFreeMake(4))) return 27525;
+    if (5 < t291.ordFreeMake(4)) return 27526;
+    t291.OrdMember t291Om = t291.ordMemberMake(4);
+    if (!(5 > t291Om)) return 27527;
+    if (5 < t291Om) return 27528;
+    // The reversed `==` and `!=` (negated from it) on a member.
+    t291.EqMember t291Eq = t291.eqMemberMake(5);
+    if (!(5 == t291Eq) || 5 != t291Eq) return 27529;
+    t291.EqMember t291Eq4 = t291.eqMemberMake(4);
+    if ((5 == t291Eq4) || !(5 != t291Eq4)) return 27530;
     // T86: a hex float (binary exponent) and a binary suffix reach C++ template deduction and overloads with clang's
     // types (clang++ -std=c++20 oracle: 2 1 1 2 / 3 4 5 6 8 / 7 4).
     if (t86.deduce(0x1p-2) != 2) return 98210;
@@ -4464,6 +4536,62 @@ extern int main()
     if (t27ptr.arith_kind(1.0f + 1) != 2 || t27ptr.arith_kind(1.5f * 2) != 2
         || t27ptr.arith_kind(t58L + 1.0) != 3 || t27ptr.arith_kind(t58F * 2.0) != 3
         || t27ptr.pick_arith(1.0f + 1) != 2 || t27ptr.pick_arith(t58F * 2.0) != 3) return 27031;
+    // T276: an unscoped enum element of a brace list is spelled by its promoted type (clang
+    // oracle: ee/const/mixed/Lee/Lconst/Ecode/ACe 1); a fixed narrow enum keeps its own identity.
+    t276.E t276E = t276.E.e1;
+    t276.CU t276Cu = t276.CU.cu1;
+    t276.FU t276Fu = t276.FU.fu1;
+    t276.SH t276Sh = t276.SH.sh1;
+    T276Cf t276Cf = T276Cf.T276C1;
+    if (t276.A({t276E, t276E}).w != 1 || t276.A({t276E, 1}).w != 1
+        || t276.A({t276E, t276Cu}).w != 1)                                   return 27032;
+    if (t276.A({t276.E.e1, t276.E.e1}).w != 1)                              return 27033;
+    if (t276.A({t276Cu, t276Cu}).w != 1 || t276.A({t276Fu, t276Fu}).w != 2) return 27034;
+    if (t276.AC({t276E, t276E}).w != 1 || t276.AC({t276Cu, t276Cu}).w != 5) return 27035;
+    if (t276.AC({t276Sh, t276Sh}).w != 1 || t276.AC({t276Cf, t276Cf}).w != 5) return 27036;
+    if (t276.L({t276E, t276E}).w != 1 || t276.L({t276.E.e1, t276.E.e1}).w != 1) return 27037;
+    if (t276.fa({t276E, t276E}) != 1 || t276.fa({t276Fu, t276Fu}) != 2)     return 27038;
+    if (t276.AL({t276.FL.fl1, t276.FL.fl1}).w != 3)                         return 27039;
+    if (t276.SA({t276.SC.s1, t276.SC.s1}).w != 4)                           return 27040;
+    // T276 round 2: a fixed char-type enum keeps its own spelling (clang oracle: A16 7, AW 8).
+    t276.W16 t276W16 = t276.W16.w1;
+    t276.WW t276Ww = t276.WW.ww1;
+    if (t276.A16({t276W16, t276W16}).w != 7 || t276.A16({t276.W16.w0, t276.W16.w0}).w != 7) return 27041;
+    if (t276.AW({t276Ww, t276Ww}).w != 8)                                   return 27042;
+    // T276 round 3: a non-fixed enum above UINT_MAX is spelled by its 64-bit promoted type (clang 3).
+    // LP64 only: MSVC keeps a non-fixed enum int, so the header omits the 64-bit AH twin there.
+    if const (!__WINDOWS__)
+    {
+        t276.HG t276Hg = t276.HG.h1;
+        if (t276.AH({t276Hg, t276Hg}).w != 3 || t276.AH({t276.HG.h1, t276.HG.h1}).w != 3) return 27043;
+    }
+    // T278: an enumerator or integer macro constant that fits is not narrowing in a brace element
+    // (clang oracle: 65/1/1/1/1/11/11); refusals of the non-fitting and non-constant cases are in
+    // Test/errors/err_brace_constant_narrowing.cb.
+    t276.KBool t278Bool = t276.KBool.kt;
+    if (t276.kChar({t276.K65.k65}) != 65 || t276.kChar({t276.E.e1}) != 1) return 27044;
+    if (t276.kUChar({t276.KNeg.kn1}) != 1 || t276.kChar({T278_ONE}) != 1) return 27045;
+    if (t276.KChar({t276.E.e1}).w != 1 || t276.KChar({t276.K65.k65}).w != 65) return 27046;
+    if (t276.KUChar({t276.KNeg.kn1}).w != 1) return 27047;
+    if (t276.KBoolArr({t278Bool, t278Bool}).w != 11 || t276.KBoolArr({t276.KBool.kf, t276.KBool.kf}).w != 11) return 27048;
+    if (t276.KBoolList({t278Bool, t278Bool}).w != 11 || t276.KBoolList({t276.KBool.kf, t276.KBool.kt}).w != 11) return 27049;
+    if (t276.ol({t278Bool, t278Bool}) != 11 || t276.ol({t276.KBool.kf, t276.KBool.kt}) != 11) return 27050;
+    if (t276.ol({1, 2}) != 1 || t276.ol({t278Bool, 1}) != 1) return 27051;
+    if (t276.ol2({1, 2}) != 1 || t276.ol2({t278Bool, 1}) != 1) return 27052;
+    t276.E t278Enum = t276.E.e1;
+    if (t276.ci({t276.E.e1, t276.E.e1}) != 2) return 27053;
+    if (t276.ci({t278Enum, t278Enum}) * 10 + t276.li({t278Enum, t278Enum}) != 22) return 27054;
+    if (t276.iu({1u, 2u}) != 2) return 27055;
+    // T286: a CFlat-declared enum value has no C++ spelling; C++ reads it as its backing integer
+    // (clang oracle: 11/1/1/2/101/201/1). Refusals of the non-constant and non-fitting cases are in
+    // Test/errors/err_brace_constant_narrowing.cb.
+    enum CE : int { ce0, ce1 = 1, ce9 = 300 };
+    enum CU : unsigned char { cu0, cu1 = 1 };
+    if (t286.mx(CE.ce1, CE.ce1) != 11) return 27056;
+    if (t286.sc1({CE.ce1}) != 1 || t286.sc1({CU.cu1}) != 1) return 27057;
+    if (t286.ci({CE.ce1}) != 2) return 27058;
+    if (t286.ee(t286.IE.ie1) != 101 || t286.ee(CE.ce1) != 201) return 27059;
+    if (t286.si1(CU.cu1) != 1) return 27060;
     if (t3lookup.f1() != 1) return 13001;
     if (t3lookup.f2() != 1) return 13002;
     if (t3lookup.f3() != 1) return 13003;
@@ -8217,6 +8345,21 @@ extern int main()
     if ((int)t151Dbl != 2) return 7422;
     if ((i64)(u32)t151Dbl != 2) return 7423;
 
+    // T300 accept-set: exact double overloads and explicit scalar casts keep their values.
+    double t300Source = 5.5;
+    t300.DoubleCtor t300DoubleCopy = t300Source;
+    if (t300DoubleCopy.value != 105) return 30000;
+    t300.DoubleCtor t300ClassReturn = t300MakeDoubleCtor(t300Source);
+    if (t300ClassReturn.value != 105) return 30005;
+    t300.DoubleCtor t300DoubleReturn = t300MakeDouble(t300Source);
+    if (t300DoubleReturn.value != 105 || t300.takeDouble(t300Source) != 105) return 30001;
+    t300.IntCtor t300IntCast = (int)t300Source;
+    if (t300IntCast.value != 15) return 30002;
+    t300.Pick t300PickCast = (int)t300Source;
+    if (t300PickCast.value != 75) return 30003;
+    t300.BoolCtor t300BoolCopy = t300Source;
+    if (t300BoolCopy.value != 41) return 30004;
+
     // Same-width C++ scalar spellings still require a fresh conversion temporary.
     long ctorrefLong = 4;
     if (thkU.mutll(ctorrefLong) != 4 || ctorrefLong != 4)                   return 7100;
@@ -9332,6 +9475,58 @@ extern int main()
     // Member call and a member operator with an `int*` operand.
     cppexp.ConvIpHost cipH = default;
     if (cipH.add(&cipK) != 1007 || (cipH - cipP) != 993)                       return 2271;
+    // Address-of RHS controls already use the same pointer conversion; free operators also
+    // receive proven pointer metadata when the written left operand is address-of or a local.
+    cppexp.ConvIpHost cipIssueH = default;
+    cipIssueH.base = 1;
+    if ((cipIssueH - &cipK) != -6)                                             return 9720;
+    if ((cipH - &cipK) != 993 || (cipH + &cipA[1]) != 1004)                   return 9724;
+    cppexp.ConvIpField cipAddrField = default;
+    cipAddrField.f = 11;
+    if ((cipH - &cipAddrField.f) != 989 || !(cipH == &cipK))                  return 9721;
+    cppexp.ConvIpHost cipCompound = default;
+    cipCompound -= &cipK;
+    if (cipCompound.base != 993)                                               return 9722;
+    // Pre-fix, free candidates see `ptr <unnamed>` instead of the left address-of/local pointer.
+    if ((&cipK - cipH) != 10007 || (cipP - cipH) != 10007)                    return 9723;
+    // Bitwise folds use the same free-operator left argument and must select ConvIp too.
+    if ((&cipK | cipH) != 10008 || (&cipK ^ cipH) != 10009
+        || (&cipK & cipH) != 10010)                                            return 9725;
+    // Pointer-left comparisons must reach C++20 rewrites before the pointer misuse diagnostic.
+    cppexp.ConvIpNeHost cipNe = default;
+    if ((&cipK != cipNe) || (cipP != cipNe))                                  return 9726;
+    cppexp.ConvIpRevEqHost cipRevEq = default;
+    if (!(&cipK == cipRevEq) || (&cipK != cipRevEq))                          return 9727;
+    cppexp.ConvIpRevSpaceshipHost cipRevSpaceship = default;
+    if (!(&cipK < cipRevSpaceship))                                            return 9728;
+    // T304: C++ class pointers can convert through a pointer-taking ctor at a C++ operator.
+    T304Foo t304Foo = default;
+    T304H6 t304H6 = default;
+    T304H8 t304H8 = default;
+    T304RevEqHost t304RevEq = default;
+    if ((&t304Foo - t304H6) != 603 || t304_selected() != 302)                  return 9730;
+    if ((t304_cfoo() - t304H6) != 603 || t304_selected() != 302)               return 9731;
+    if ((t304H8 - &t304Foo) != 803 || t304_selected() != 303)                  return 9732;
+    if (!(&t304Foo == t304RevEq) || t304_selected() != 304)                    return 9733;
+    T304HNonConst t304NonConstHost = default;
+    if ((&t304Foo - t304NonConstHost) != 1003 || t304_selected() != 306)       return 9734;
+    T304ExactChoiceHost t304ExactHost = default;
+    if ((&t304Foo - t304ExactHost) != 503 || t304_selected() != 311)           return 9735;
+    T304CallHost t304CallHost = default;
+    if (t304CallHost.f(&t304Foo) != 903 || t304_selected() != 307)             return 9736;
+    expect_error("no overload") {
+        T304HNonConst constPointerHost = default;
+        int constPointerReject = t304_cfoo() - constPointerHost;
+    }
+    expect_error("no overload") {
+        T304NativeFoo nativeFoo = default;
+        T304H6 nativePointerHost = default;
+        int nativePointerReject = &nativeFoo - nativePointerHost;
+    }
+    expect_error("no overload of 'operator-' matches the given arguments") {
+        long long cipLong = 7;   // long long: long is int-width on LLP64 and would convert
+        int cipBad = cipH - &cipLong;
+    }
     // ACCEPT SET (passes pre-fix too): an exact `const int*` overload beats the user-defined
     // conversion, and a spelled constructor argument already converted.
     if (cppexp.conv_ip_exact(&cipK) != 2 || cppexp.conv_ip_exact(cipP) != 2)   return 2272;
@@ -12469,6 +12664,54 @@ extern int main()
         if (q[0] != -1 || q[1] != -1 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 2 || q[6] != 2) return 98997;
         T263AsgLoop(false, q);
         if (q[0] != 22 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 2 || q[5] != 0 || q[6] != 2) return 98998;
+        // T288: both-arm moves (`z = k ? move a : move b`) move-assign the selected arm directly: no temp,
+        // the selected source moved-from (a == -1 or b == -1, the other arm live), as clang++ -std=c++20.
+        T288AsgBoth(true, q);
+        if (q[0] != 21 || q[1] != -1 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 98999;
+        T288AsgBoth(false, q);
+        if (q[0] != 22 || q[1] != 21 || q[2] != -1 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99000;
+        T288AsgParenBoth(true, q);
+        if (q[0] != 21 || q[1] != -1 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99001;
+        T288AsgParenBoth(false, q);
+        if (q[0] != 22 || q[1] != 21 || q[2] != -1 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99002;
+        // A declaration of the same join move-constructs the selected arm (clang: 1 move, 1 dtor).
+        T288DeclBoth(true, q);
+        if (q[0] != 21 || q[1] != -1 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 1 || q[6] != 1) return 99003;
+        T288DeclBoth(false, q);
+        if (q[0] != 22 || q[1] != 21 || q[2] != -1 || q[3] != 0 || q[4] != 0 || q[5] != 1 || q[6] != 1) return 99004;
+        T288AsgBothLoop(true, q);
+        if (q[0] != -1 || q[1] != -1 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99005;
+        T288AsgBothLoop(false, q);
+        if (q[0] != -1 || q[1] != 21 || q[2] != -1 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99006;
+        // T288 r2: a const arm makes the join a const xvalue (`const T&&`): copy-assign, sources untouched,
+        // no move (clang++ -std=c++20). Either arm const, bare or parenthesized.
+        T288ConstBoth(true, q);
+        if (q[0] != 21 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99007;
+        T288ConstBoth(false, q);
+        if (q[0] != 22 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99008;
+        T288ConstParenBoth(true, q);
+        if (q[0] != 21 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99009;
+        T288ConstParenBoth(false, q);
+        if (q[0] != 22 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99010;
+        T288ConstFirst(true, q);
+        if (q[0] != 21 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99011;
+        T288ConstFirst(false, q);
+        if (q[0] != 22 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99012;
+        T288ConstSecond(true, q);
+        if (q[0] != 21 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99013;
+        T288ConstSecond(false, q);
+        if (q[0] != 22 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99014;
+        // T288 r3: a const-host field arm is not a plain local join: copy-assign, sources kept (as clang).
+        T288ConstHostField(true, q);
+        if (q[0] != 21 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99015;
+        T288ConstHostField(false, q);
+        if (q[0] != 22 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99016;
+        // T288 r3: a mutable field join (`move s.a : move s.b`) stays on master's copy path. clang
+        // move-assigns here (pre-existing, not fixed by T288; see the p3 issue file).
+        T288FieldJoin(true, q);
+        if (q[0] != 21 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99017;
+        T288FieldJoin(false, q);
+        if (q[0] != 22 || q[1] != 21 || q[2] != 22 || q[3] != 0 || q[4] != 0 || q[5] != 0 || q[6] != 0) return 99018;
     }
     // T264: a by-value argument joined from two fresh call arms (bare, parenthesized, const, two
     // arguments, loop body) is owned once by the callee, as clang++'s prvalue join: 1 ctor, 1 dtor.
@@ -16466,6 +16709,64 @@ int LoweredUserDtorAssignLegs(int argc)
         if (cppunw.live() != 1 || cppunw.dtors() != 0 || txSlot->get() != 0) return 13065;
         free(txSlot);
     }
+    // T272: parentheses add no copy. Each leg's counts are the clang++ -std=c++20 oracle values.
+    cppexp.conv_reset();
+    {
+        cppexp.ConvCnt pdA = (cppexp.conv_mk(7));
+        if (pdA.v != 7 || cppexp.conv_ctor_count() != 1 || cppexp.conv_dtor_count() != 0) return 13066;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13066;
+    cppexp.conv_reset();
+    {
+        cppexp.ConvCnt pdB = ((cppexp.conv_mk(7)));
+        if (pdB.v != 7 || cppexp.conv_ctor_count() != 1) return 13067;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13067;
+    cppexp.conv_reset();
+    {
+        cppexp.ConvCnt pdC = T272Ret();
+        if (pdC.v != 7 || cppexp.conv_ctor_count() != 1) return 13068;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13068;
+    cppexp.conv_reset();
+    {
+        cppexp.ConvCnt pdD = cppexp.conv_mk(1);
+        pdD = (cppexp.conv_mk(7));
+        if (pdD.v != 20007 || cppexp.conv_ctor_count() != 2 || cppexp.conv_dtor_count() != 1) return 13069;
+    }
+    if (cppexp.conv_dtor_count() != 2) return 13069;
+    cppexp.conv_reset();
+    {
+        int pdArg = cppexp.conv_take((cppexp.conv_mk(7)));
+        if (pdArg != 7 || cppexp.conv_ctor_count() != 1 || cppexp.conv_dtor_count() != 1) return 13070;
+    }
+    cppexp.conv_reset();
+    {
+        auto pdAuto = (cppexp.conv_mk(7));
+        if (pdAuto.v != 7 || cppexp.conv_ctor_count() != 1) return 13071;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13071;
+    cppexp.conv_reset();
+    {
+        cppexp.ConvCnt pdSrc = cppexp.conv_mk(3);
+        cppexp.ConvCnt pdCopy = (pdSrc);
+        if (pdCopy.v != 103 || cppexp.conv_ctor_count() != 2) return 13072;
+    }
+    if (cppexp.conv_dtor_count() != 2) return 13072;
+    // T272: parentheses inside a brace field initializer add no construction (clang: one ctor, no dtor).
+    cppexp.conv_reset();
+    {
+        T272Hold pdF = { c = (cppexp.conv_mk(7)) };
+        if (pdF.c.v != 7 || cppexp.conv_ctor_count() != 1 || cppexp.conv_dtor_count() != 0) return 13073;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13073;
+    cppexp.conv_reset();
+    {
+        T272Hold* pdN = new T272Hold{ c = (cppexp.conv_mk(7)) };
+        if (pdN->c.v != 7 || cppexp.conv_ctor_count() != 1) return 13074;
+        delete pdN;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13074;
     // T224: the nested candidate's return moves nothing; the caller's destructor runs once.
     cppunw.reset();
     {
@@ -17256,6 +17557,96 @@ void T263AsgLoop(bool k, int* o)
     cppbv.CntA.reset();
     for (int i = 0; i < 2; i++) z = k ? move a : b;
     o[0] = z.v; o[1] = a.v; o[2] = b.v;
+    T249ReadCounts(o);
+}
+// T288: `z = k ? move a : move b` (both arms moved) is an xvalue join: the selected arm is move-assigned
+// directly, with no temporary (clang++ -std=c++20). A declaration move-constructs the selected arm.
+void T288AsgBoth(bool k, int* o)
+{
+    cppbv.CntA a = cppbv.CntA(21); cppbv.CntA b = cppbv.CntA(22); cppbv.CntA z = cppbv.CntA(0);
+    cppbv.CntA.reset();
+    z = k ? move a : move b;
+    o[0] = z.v; o[1] = a.v; o[2] = b.v;
+    T249ReadCounts(o);
+}
+void T288AsgParenBoth(bool k, int* o)
+{
+    cppbv.CntA a = cppbv.CntA(21); cppbv.CntA b = cppbv.CntA(22); cppbv.CntA z = cppbv.CntA(0);
+    cppbv.CntA.reset();
+    z = (k ? move a : move b);
+    o[0] = z.v; o[1] = a.v; o[2] = b.v;
+    T249ReadCounts(o);
+}
+void T288DeclBoth(bool k, int* o)
+{
+    cppbv.CntA a = cppbv.CntA(21); cppbv.CntA b = cppbv.CntA(22);
+    cppbv.CntA.reset();
+    int zv = 0;
+    {
+        cppbv.CntA z2 = k ? move a : move b;
+        zv = z2.v;
+    }
+    o[0] = zv; o[1] = a.v; o[2] = b.v;
+    T249ReadCounts(o);
+}
+void T288AsgBothLoop(bool k, int* o)
+{
+    cppbv.CntA a = cppbv.CntA(21); cppbv.CntA b = cppbv.CntA(22); cppbv.CntA z = cppbv.CntA(0);
+    cppbv.CntA.reset();
+    for (int i = 0; i < 2; i++) z = k ? move a : move b;
+    o[0] = z.v; o[1] = a.v; o[2] = b.v;
+    T249ReadCounts(o);
+}
+// T288 r2: a const C++ object arm (`const T a`) makes the whole `?:` join a const xvalue: copy-assign.
+void T288ConstBoth(bool k, int* o)
+{
+    const cppbv.CntA a = cppbv.CntA(21); const cppbv.CntA b = cppbv.CntA(22); cppbv.CntA z = cppbv.CntA(0);
+    cppbv.CntA.reset();
+    z = k ? move a : move b;
+    o[0] = z.v; o[1] = a.v; o[2] = b.v;
+    T249ReadCounts(o);
+}
+void T288ConstParenBoth(bool k, int* o)
+{
+    const cppbv.CntA a = cppbv.CntA(21); const cppbv.CntA b = cppbv.CntA(22); cppbv.CntA z = cppbv.CntA(0);
+    cppbv.CntA.reset();
+    z = (k ? move a : move b);
+    o[0] = z.v; o[1] = a.v; o[2] = b.v;
+    T249ReadCounts(o);
+}
+void T288ConstFirst(bool k, int* o)
+{
+    const cppbv.CntA a = cppbv.CntA(21); cppbv.CntA b = cppbv.CntA(22); cppbv.CntA z = cppbv.CntA(0);
+    cppbv.CntA.reset();
+    z = k ? move a : move b;
+    o[0] = z.v; o[1] = a.v; o[2] = b.v;
+    T249ReadCounts(o);
+}
+void T288ConstSecond(bool k, int* o)
+{
+    cppbv.CntA a = cppbv.CntA(21); const cppbv.CntA b = cppbv.CntA(22); cppbv.CntA z = cppbv.CntA(0);
+    cppbv.CntA.reset();
+    z = k ? move a : move b;
+    o[0] = z.v; o[1] = a.v; o[2] = b.v;
+    T249ReadCounts(o);
+}
+struct T288Host { cppbv.CntA a = cppbv.CntA(21); cppbv.CntA b = cppbv.CntA(22); };
+void T288ConstHostField(bool k, int* o)
+{
+    const T288Host s = T288Host();
+    cppbv.CntA z = cppbv.CntA(0);
+    cppbv.CntA.reset();
+    z = k ? move s.a : move s.b;
+    o[0] = z.v; o[1] = s.a.v; o[2] = s.b.v;
+    T249ReadCounts(o);
+}
+void T288FieldJoin(bool k, int* o)
+{
+    T288Host s = T288Host();
+    cppbv.CntA z = cppbv.CntA(0);
+    cppbv.CntA.reset();
+    z = k ? move s.a : move s.b;
+    o[0] = z.v; o[1] = s.a.v; o[2] = s.b.v;
     T249ReadCounts(o);
 }
 void T249PlainMove(int* o)

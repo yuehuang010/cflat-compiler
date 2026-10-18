@@ -1,15 +1,16 @@
 // An `alias` string return of a by-value string parameter the body rebinds. The rebind gives the
 // parameter its own buffer in this frame, so an alias return would borrow storage that dies on return.
+// Generic `alias T` (T=string) keeps the T216 frame-local substring reachable.
 import "string.cb";
 
-alias string reboundEcho(string s, bool c)
+alias T reboundEcho<T>(T s, bool c)
 {
-    if (c) s = s + "n";
-    expect_error("cannot return an 'alias' string value that borrows frame-local storage");
-    return s;
+    if (c) s = s + s;
+    expect_error("cannot return an 'alias' string value that borrows frame-local storage") { return s; }
 }
 
 extern int main()
 {
+    string r = reboundEcho<string>("ab", true);
     return 0;
 }

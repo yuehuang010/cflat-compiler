@@ -804,6 +804,10 @@ bool LLVMBackend::IsCxxObjectRvalue(const NamedVariable& receiver) const
         // `move a[i]` / `move p->f` keep the element in place; the explicit move still makes it an xvalue.
         if (receiver.IsExplicitMove) return true;
         if (receiver.FieldPathThroughPointer || receiver.CxxLvalueReceiver) return false;
+        // A unary operator on a call result: the front end decided the category (an xvalue `T&&` stays
+        // a pointer-shaped object, so the Storage test below would call it an lvalue).
+        if (receiver.IsCxxUnaryOperatorReceiver && receiver.CxxLvalueKind == 2 && receiver.IsRvalue)
+            return true;
         if (receiver.TypeAndValue.Pointer && !receiver.TypeAndValue.IsFunctionPointer
             && !receiver.TypeAndValue.IsRvalueRef
             && IsCxxRecord(receiver.TypeAndValue.TypeName))

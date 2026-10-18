@@ -1,19 +1,24 @@
-# C++ virtual dtor with a deleted / private / ambiguous operator delete is accepted
+# C++ virtual dtor with a deleted / private / ambiguous operator delete is accepted when its vtable is unused
 
-Summary: a header whose class has a virtual destructor and an unusable class-scope operator delete
-(deleted, private in a base, or ambiguous across bases) compiles and runs under cflat; clang++
--std=c++20 rejects it. Pre-existing on master; found by the T50-win review (2026-10-05).
+Summary: T294 (2026-10-16) closed the USED-vtable case: a class whose vtable is used (constructed, new, by-value local)
+now refuses with clang's own text ("clang: attempt to use a deleted function" / private member / multiple base
+classes), cold and warm. Still open: a header whose class is never demanded (vtable unused) compiles; clang++
+-std=c++20 rejects the header at the dtor definition.
 
-Repro: scratch/repro_keep/t50win/{deleted,private_inherited,ambiguous}.{hpp,cb} and the *2 variants
-(add a demanded class Q in the same chunk; run2.sh runs cold and warm). cflat prints 17 / 115.
-Oracle: "attempt to use a deleted function" / "'operator delete' is a private member of
-'probe::B'" / "member 'operator delete' found in multiple base classes of different types".
+Repro (T294 review 1, scratch/repro_keep/wt_t294/rev_t294_sol_tmp/unused_min.{cb,hpp}, round2.log for the
+private-inherited and ambiguous variants):
+```cpp
+struct P { virtual ~P() {} static void operator delete(void*) = delete; };
+```
+```cflat
+import cpp "unused_min.hpp";
+extern int main() { return 17; }   // cflat: 17, clang: error
+```
 
-Root cause: LazyBodies::Skip skips the inline virtual dtor body, so Sema::CheckDestructor (which
-diagnoses the lookup) never runs at parse time. Since T50-win, LazyBodies::ResolveUsedVTableDeletes
-runs CheckDestructor for used vtables, but from HandleTranslationUnit - after IncrementalParser's
-hasErrorOccurred check - so the diagnostic is swallowed and the dtor is only setInvalidDecl.
+Root cause: LazyBodies::Skip skips the inline virtual dtor body, so Sema::CheckDestructor never runs for it;
+LazyBodies::ResolveUsedVTableDeletes (cflat/CxxIncrementalGroup.cpp ~1309) walks only Sema::VTablesUsed.
 
-Fix direction: surface diagnostics raised by ResolveUsedVTableDeletes (relay as a clang error with
-the "clang: " prefix), or run it before the error check. Cover unused vtables too only if clang
-diagnoses them (it checks at the dtor body, so it does). Keep it lazy: no extra parse.
+Fix direction: validate operator delete lookup for skipped, defined, nondependent virtual dtors even without a used
+vtable (lookup only, no eager body parse), relay the diagnostic the same way as the used case. Cost check: run
+scratch/libs_perf.sh (torch/std headers have many virtual dtors). Leg: import-only expect_error at file scope in
+Test/errors/err_cpp_new_private_operator.cb against a dedicated fixture header (shared headers leak the refusal).

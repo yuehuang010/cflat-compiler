@@ -1,0 +1,34 @@
+// A CFlat struct has no constructor call syntax: `Plain(3)` and `new Plain(3)` are refused with a
+// steer to brace init (T272 ruling 2026-10-15). A struct that DECLARES a constructor keeps the
+// overload message for a wrong-arity call, and a struct whose C++ field has no default constructor
+// steers at its paren call instead of reporting that field.
+import cpp "cpp_interop_explicit.h";
+
+struct Plain { int a; };
+struct S2 { int a; S2(int x, int y) { a = x + y; } };
+struct SD { int a; SD(int x = 5) { a = x; } };
+struct HoldND { cppexp.ConvNoDefault c; };
+
+expect_error("CFlat struct 'Plain' has no constructor call syntax - use brace init") {
+    int new_plain() { Plain* p = new Plain(3); return 0; }
+}
+
+expect_error("CFlat struct 'Plain' has no constructor call syntax - use brace init") {
+    int paren_plain() { Plain q = Plain(3); return q.a; }
+}
+
+expect_error("no overload of 'S2' matches the given arguments") {
+    int arity_s2() { S2 s = S2(1, 2, 3); return s.a; }
+}
+
+expect_error("no overload of 'SD' matches the given arguments") {
+    int arity_sd() { SD s = SD(1, 2); return s.a; }
+}
+
+expect_error("CFlat struct 'HoldND' has no constructor call syntax - use brace init") {
+    int hold_nd() { HoldND* p = new HoldND(cppexp.conv_mk_nd(7)); return 0; }
+}
+
+expect_error("CFlat struct 'HoldND' has no constructor call syntax - use brace init") {
+    int hold_nd_paren() { HoldND h = HoldND(cppexp.conv_mk_nd(7)); return 0; }
+}

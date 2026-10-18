@@ -272,6 +272,10 @@ The recurring failure mode of this whole family, stated once:
   printed line comes from `cflat/locales/en.json` and can differ in wording (T110: printed "cannot
   choose which 'ov' to call", source "ambiguous call to 'ov'"). Copy the substring from the code,
   not from the console; a printed-text substring reports FAIL even though it is visible.
+- **A Mac-green leg that leans on `long` width or a non-fixed enum's width is Windows-red.** LLP64: `long` is 32-bit
+  (so `long*` converts like `int*`), and MSVC keeps a non-fixed enum `int`. Fix box 2026-10-15 shipped three such legs
+  (T276 header twin, T296 and T298 `long` pointees), all red only at the close gate. Spell the 64-bit case `long long`,
+  guard header twins with `#if !defined(_MSC_VER)`, and the CFlat leg with `if const (!__WINDOWS__)`.
 
 ## On agent reports
 

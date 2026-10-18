@@ -138,3 +138,76 @@ expect_error("returns an owning 'move' pointer but the slot's return is borrowed
     void t208AcceptReturnNs(function<int*(int)> f) { int* p = f(1); delete p; }
     void t208CallReturnNs() { t208AcceptReturnNs(T208ReturnNs.make); }
 }
+
+// T287: a declarator adopts the owning return of a named function, so the VARIABLE carries it, and the
+// call-argument check refuses it at a borrowed-return slot. Pre-fix the second call crashed (rc 139).
+expect_error("it returns an owning 'move' pointer but the slot's return is borrowed") {
+    move int* t287MakeOwned(int x) { int* p = new int(x); return p; }
+    void t287TakeBorrowed(function<int*(int)> f) { }
+    void t287CallVar() {
+        function<int*(int)> fv = t287MakeOwned;
+        t287TakeBorrowed(fv);
+        t287TakeBorrowed(fv);
+    }
+}
+
+// Assignment cannot adopt an owning return (it is not flow-sensitive), so it refuses the bind itself.
+expect_error("it returns an owning 'move' pointer but the slot's return is borrowed") {
+    move int* t287MakeAssign(int x) { int* p = new int(x); return p; }
+    void t287CallAssign() {
+        function<int*(int)> fv = nullptr;
+        fv = t287MakeAssign;
+    }
+}
+
+// A variable of owning-return type passed to a borrowed-return parameter.
+expect_error("it returns an owning 'move' pointer but the slot's return is borrowed") {
+    move int* t287MakeVar(int x) { int* p = new int(x); return p; }
+    int t287TakeRet(function<int*(int)> f) { return 0; }
+    void t287OwnedVarArg() {
+        function<move int*(int)> g = t287MakeVar;
+        t287TakeRet(g);
+    }
+}
+
+// A thin lambda literal whose parameter is 'move' cannot bind a borrowed slot (declarator, then call argument).
+expect_error("differs in 'move' modifier") {
+    void t287CallDecl() {
+        function<int(int*)> f = (move int* p) => { int v = *p; delete p; return v; };
+    }
+}
+
+expect_error("differs in 'move' modifier") {
+    int t287ApplyBorrow(function<int(int*)> f, int* p) { return f(p); }
+    void t287CallLambdaArg() {
+        int* q = new int(5);
+        t287ApplyBorrow((move int* p) => { int v = *p; delete p; return v; }, q);
+    }
+}
+
+// A thin function<> variable with a 'move' parameter passed to a borrowed slot (pre-fix: rc 134).
+expect_error("differs in 'move' modifier") {
+    int t287ConsumeVar(move int* p) { int v = *p; delete p; return v; }
+    int t287ApplyVar(function<int(int*)> f, int* p) { return f(p); }
+    void t287MoveVarArg() {
+        function<int(move int*)> h = t287ConsumeVar;
+        int* q = new int(5);
+        t287ApplyVar(h, q);
+    }
+}
+
+// Thin-to-thin declarator init: the gate that skipped thin sources let the 'move' mismatch double-free.
+expect_error("differs in 'move' modifier") {
+    int t287ConsumeThin(move int* p) { int v = *p; delete p; return v; }
+    void t287ThinToThin() {
+        function<int(move int*)> h = t287ConsumeThin;
+        function<int(int*)> f = h;
+    }
+}
+
+// The reverse crossing: a borrowing literal cannot take a slot that transfers ownership to it.
+expect_error("differs in 'move' modifier") {
+    void t287Reverse() {
+        function<int(move int*)> f = (int* p) => { return *p; };
+    }
+}

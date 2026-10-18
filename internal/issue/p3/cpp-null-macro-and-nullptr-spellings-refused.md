@@ -3,7 +3,6 @@
 Summary: clang++ -std=c++20 accepts each of these as a null pointer; cflat reports "no overload".
 Pre-existing on master; found by the T52 reviews (2026-10-06).
 
-- `lp(NULL)` and `#define Z NULL` (C++ `__null`) into `int lp(int*)`.
 - `#define Z nullptr` into `int*`.
 - A C header's `#define CN NULL` (`((void*)0)`) into a C++ `int*` param.
 - `nullptr` into a by-value `std::function<int()>` param (clang: empty function).
@@ -34,9 +33,16 @@ Also (T52 review 7, 2026-10-06; literal 0 behaves the same, so these are not mac
 
 ## After T68 review 1 (2026-10-07, pre-existing, master same)
 
-- Real system `NULL` (`__null`) at a C++ `int*` param: "no overload" (clang accepts); T68's leg uses a
-  fixture NULL defined as 0, so the system spelling is untested.
-- Cast macro `#define RCAST ((int*)0)` imports as int and is refused at `int*` (clang accepts).
+(T296 2026-10-16: the system NULL at int* and the cast macro ((int*)0) are fixed; the NULL
+leg in Test/test_cpp_interop.cb is a guard, it already passed on master.)
+- Const-pointee cast macros (`((const int*)0)`) stay refused at `int*`: the typed pointer does not carry the
+  const pointee (clang accepts them at `const int*`).
+
 - Class with only `D(int*)`: `D(0)` refused (clang 30), while implicit `takeD(0)` works.
 - `o + 0` with `operator+(Op, int*)` and `operator+(Op, long)`: clang ambiguous, CFlat picks int* (40).
 - Probes: scratch/repro_keep/t68_rev/.
+
+## Note 2026-10-16 (Windows close gate)
+On LLP64 a `((int*)0)` macro at a C++ `long*` param is accepted (CFlat `long` = target width, so the int pointee matches);
+clang-cl refuses. T296 leg retargeted to `long long*` (distinct on both ABIs). Whether CFlat should keep C++ `long` distinct from
+`int` on Windows at C++ pointer params is open (L = target long ruling covers CFlat-side spelling only).

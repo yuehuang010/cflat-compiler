@@ -242,6 +242,7 @@ namespace
     public:
         unsigned errors = 0;
         std::string firstError;
+        std::string lastError;   // the newest error's text
         // firstError is a no-viable-operator / invalid-operands error AT an interpreter input
         // line (the request's own expression), not inside a header or an instantiated body.
         bool firstErrorNoViableAtInput = false;
@@ -279,6 +280,11 @@ namespace
             groupText.clear();
             AppendGroupLine(info);
             ++errors;
+            {
+                llvm::SmallString<256> text;
+                info.FormatDiagnostic(text);
+                lastError = text.str().str();
+            }
             BlameError(info);
             Blame(info);
             for (unsigned i = 0; i < info.getNumArgs() && !incompleteRecordInvolved; ++i)
@@ -725,6 +731,10 @@ namespace
         const std::unordered_map<const clang::FunctionDecl*, std::string>* poisoned = nullptr;
         const std::unordered_map<const clang::FunctionDecl*, std::string>* causes = nullptr;
         std::string poisonDiagnostic;
+        // Clang's error for a used virtual destructor whose operator delete is unusable.
+        std::string vtableDeleteDiagnostic;
+        // Impl::causes: a use that walks into the destructor is refused with its clang text.
+        std::unordered_map<const clang::FunctionDecl*, std::string>* vtableCauses = nullptr;
         const clang::FunctionDecl* poisonedDecl = nullptr;   // the poisoned body the walk reached
         std::unordered_set<const clang::FunctionDecl*> walked;
         std::unordered_set<const clang::CXXRecordDecl*> vtableRecords;
@@ -1313,8 +1323,18 @@ namespace
             for (clang::CXXDestructorDecl* dtor : pending)
             {
                 clang::Sema::ContextRAII inDtor(*sema, dtor);
-                if (sema->CheckDestructor(dtor) || dtor->getOperatorDelete() == nullptr)
-                    dtor->setInvalidDecl();
+                auto* counting = dynamic_cast<CountingDiagnosticConsumer*>(
+                    sema->getDiagnostics().getClient());
+                const unsigned before = counting != nullptr ? counting->errors : 0;
+                const bool failed = sema->CheckDestructor(dtor)
+                    || dtor->getOperatorDelete() == nullptr;
+                if (!failed) continue;
+                dtor->setInvalidDecl();
+                std::string text = counting != nullptr && counting->errors > before
+                    ? counting->lastError
+                    : "'operator delete' of a virtual destructor is unusable";
+                if (vtableCauses != nullptr) vtableCauses->emplace(dtor, text);
+                if (vtableDeleteDiagnostic.empty()) vtableDeleteDiagnostic = std::move(text);
             }
         }
     };
@@ -1937,6 +1957,7 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
         lazy.sema = &ci.getSema();
         lazy.poisoned = &impl->poisoned;
         lazy.causes = &impl->causes;
+        lazy.vtableCauses = &impl->causes;
         // CFLAT_CXX_EAGER_BODIES=1 parses every body up front (A/B and bisecting a late body).
         if (lazy.parser != nullptr && !cflat_cinterop::CxxEagerBodies() && !forceEagerBodies)
         {
@@ -2195,6 +2216,13 @@ std::unique_ptr<CxxIncrementalGroup> CxxIncrementalGroup::Create(
         {
             error = ErrorText(ptu.takeError());
             if (error.empty()) error = diagnostics.consumer.firstError;
+            return nullptr;
+        }
+        // Raised after clang's error check (ResolveUsedVTableDeletes runs in HandleTranslationUnit),
+        // so a tolerated header would otherwise keep a virtual destructor with an unusable delete.
+        if (!impl->lazy.vtableDeleteDiagnostic.empty())
+        {
+            error = "clang: " + impl->lazy.vtableDeleteDiagnostic;
             return nullptr;
         }
         if (!tolerateDiagnostics && diagnostics.consumer.errors != 0)

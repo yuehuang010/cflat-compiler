@@ -3187,6 +3187,14 @@ std::string LLVMBackend::CxxClosureArgumentRefusal(NamedVariable& arg, const std
                                                    const TypeAndValue* signatureHint)
 {
         if (!IsUnwrappedFatClosure(arg)) return {};
+        // Explicitly moved closure arguments no longer have storage to recover their binding type from.
+        if (!arg.TypeAndValue.IsFunctionPointer && arg.HasOriginalArgumentType
+            && arg.OriginalArgumentType.IsFunctionPointer)
+        {
+            const std::string typeName = arg.TypeAndValue.TypeName;
+            arg.TypeAndValue = arg.OriginalArgumentType;
+            if (!typeName.empty()) arg.TypeAndValue.TypeName = typeName;
+        }
         // A call argument may carry only the closure type name; its variable has the signature.
         if (!arg.TypeAndValue.IsFunctionPointer && arg.Storage != nullptr)
             if (const NamedVariable* variable = FindVariableByStorage(arg.Storage);
@@ -5039,6 +5047,14 @@ bool LLVMBackend::ClassifyRawMacro(const cflat_cinterop::RawMacro& r, CMacroEntr
                 else if (cxxBoundary && tv.Pointer && !tv.ElemPointer && BitfieldStorageBits(tv.TypeName) == 0
                          && tv.TypeName != "float" && tv.TypeName != "double")
                     e.isPointer = true;
+                // A scalar cast pointer ((int*)0) is a typed pointer in C++, not its integer
+                // value: keep the pointee so the global is int*, as clang types it (T296).
+                // A const pointee is not carried (the global would bind mutable int*): stays as master.
+                else if (cxxBoundary && tv.Pointer && !tv.ElemPointer && !r.pointeeConst)
+                {
+                    e.isPointer = true;
+                    e.pointeeTypeName = tv.TypeName;
+                }
                 else if (!tv.Pointer && BitfieldStorageBits(tv.TypeName) != 0 && tv.TypeName != "bool")
                     e.intTypeName = tv.TypeName;   // known plain integer scalar
             }
@@ -5942,6 +5958,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         for (const auto& re : raw.enums)
         {
             if (re.isScoped && !re.enumType.empty()) RegisterScopedEnumType(re.enumType);
+            if (!re.enumType.empty()) importedEnumTypes_.insert(re.enumType);
             if (re.enumType.empty() || re.underlyingType.empty()) continue;
             TypeAndValue backing;
             if (MapCTypeToTypeAndValue(re.underlyingType, backing, cxxMode))
@@ -6157,6 +6174,82 @@ std::string LLVMBackend::CxxArithIdentityForArgument(const NamedVariable& arg,
             && valueType->isFloatingPointTy()
             && identityType->getPrimitiveSizeInBits() > valueType->getPrimitiveSizeInBits();
         return identityType == valueType || floating ? arg.CxxArithIdentity : std::string();
+}
+
+/*
+ * An unscoped enum lvalue or constant is spelled to clang by its PROMOTED type ([conv.prom]).
+ * Allowlist: a NON-FIXED enum's promoted type differs from its backing only as an unsigned backing
+ * (all values non-negative) promoting to the signed type of the same width (int, long). Every fixed underlying type
+ * keeps its own spelling (clang matches it exactly), char-type and bool included.
+ * Empty for a scoped enum, a non-enum, or any pair outside the allowlist.
+ */
+std::string LLVMBackend::CxxUnscopedEnumPromotedIdentity(const NamedVariable& arg) const
+{
+        const TypeAndValue& tv = arg.TypeAndValue;
+        if (tv.Pointer || tv.ElemPointer || tv.TypeName.empty()) return std::string();
+        const std::string key = ResolveEnumTypeName(tv.TypeName);
+        if (key.empty() || IsScopedEnumTypeName(key)) return std::string();
+        auto promoted = enumPromotedTypes_.find(key);
+        auto backing = enumBackingTypes.find(key);
+        if (promoted == enumPromotedTypes_.end() || backing == enumBackingTypes.end()) return std::string();
+        static const std::unordered_set<std::string> unsignedBackings = { "u32", "uint", "u64", "ulong" };
+        static const std::unordered_set<std::string> signedPromotions = { "int", "i32", "long", "i64" };
+        if (unsignedBackings.count(backing->second) == 0 || signedPromotions.count(promoted->second) == 0)
+            return std::string();
+        const bool wide = backing->second == "u64" || backing->second == "ulong";
+        const bool wideP = promoted->second == "long" || promoted->second == "i64";
+        if (wide != wideP) return std::string();
+        return promoted->second;
+}
+
+/*
+ * A CFlat-declared enum has no C++ spelling, and clang never sees its declaration. Its values are
+ * the backing integers C++ would read, so every wrapper spells the type as that integer. The
+ * marker is the import: only a clang-read enum is in importedEnumTypes_. Scoped enums stay refused.
+ */
+bool LLVMBackend::IsCflatOnlyUnscopedEnum(const std::string& enumKey) const
+{
+        return !enumKey.empty() && enumBackingTypes.count(enumKey) != 0
+            && importedEnumTypes_.count(enumKey) == 0 && scopedEnumTypes_.count(enumKey) == 0;
+}
+
+bool LLVMBackend::CxxCflatEnumBackingSpelling(const std::string& enumKey, std::string& spelling) const
+{
+        return IsCflatOnlyUnscopedEnum(enumKey) && CxxSpellingForCflatType(GetEnumBackingType(enumKey), spelling);
+}
+
+std::string LLVMBackend::CxxCflatEnumBackingIdentity(const NamedVariable& arg) const
+{
+        const TypeAndValue& tv = arg.TypeAndValue;
+        if (tv.Pointer || tv.ElemPointer || tv.TypeName.empty()) return std::string();
+        const std::string key = ResolveEnumTypeName(tv.TypeName);
+        return IsCflatOnlyUnscopedEnum(key) ? GetEnumBackingType(key) : std::string();
+}
+
+const llvm::ConstantInt* LLVMBackend::CflatEnumeratorConstant(const llvm::Value* storage,
+                                                              const std::string& enumKey) const
+{
+        auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(storage);
+        if (global == nullptr || !global->hasInitializer() || !IsCflatOnlyUnscopedEnum(enumKey))
+            return nullptr;
+        // A member global is named `<enum>.<member>`; a variable of the enum type is not.
+        const std::string name = global->getName().str();
+        const std::string prefix = enumKey + ".";
+        int64_t value = 0;
+        if (name.compare(0, prefix.size(), prefix) != 0
+            || !TryGetEnumMemberInt(enumKey, name.substr(prefix.size()), value))
+            return nullptr;
+        return llvm::dyn_cast<llvm::ConstantInt>(global->getInitializer());
+}
+
+bool LLVMBackend::CxxEnumPromotesToElement(const NamedVariable& source,
+                                           const TypeAndValue& elementType)
+{
+        const std::string promoted = CxxUnscopedEnumPromotedIdentity(source);
+        TypeAndValue promotedType;
+        return !promoted.empty() && MapCTypeToTypeAndValue(promoted, promotedType, true)
+            && promotedType.IsUnsignedInteger() == elementType.IsUnsignedInteger()
+            && GetType(promotedType) == GetType(elementType);
 }
 
 std::string LLVMBackend::DeclaredPrimitiveIdentityForCxxArgument(const NamedVariable& arg,
@@ -9496,7 +9589,8 @@ static bool CxxBraceElementNarrows(const LLVMBackend::NamedVariable& source, llv
         // target represents exactly is exempt, floating -> integer never is.
         const bool srcUnsigned = have->isIntegerTy(1)
             || source.TypeAndValue.IsUnsignedInteger() != -1;
-        auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(value);
+        auto* constInt = source.CxxConstantValue != nullptr ? source.CxxConstantValue
+                                                            : llvm::dyn_cast<llvm::ConstantInt>(value);
         auto* constFp = llvm::dyn_cast<llvm::ConstantFP>(value);
         bool narrows = false;
         // `int` and `unsigned` share one LLVM type: same type is exempt only with equal sign.
@@ -9560,6 +9654,8 @@ bool LLVMBackend::CheckCxxBraceNarrowing(const CxxBraceArgument& brace, const st
             if (source.TypeAndValue.Pointer || have == nullptr
                 || (!have->isIntegerTy() && !have->isFloatingPointTy()))
                 continue;
+            if (CxxEnumPromotesToElement(source, elementType))
+                continue;
             if (CxxBraceElementNarrows(source, elementTy,
                     elementTy->isIntegerTy(1) || elementType.IsUnsignedInteger() != -1))
             {
@@ -9590,8 +9686,9 @@ bool LLVMBackend::EmitCxxBraceBacking(const CxxBraceArgument& brace, const TypeA
                 error = "brace arguments must contain scalar values of one type";
                 return false;
             }
-            const bool narrows = CxxBraceElementNarrows(source, elementTy,
-                elementTy->isIntegerTy(1) || elementType.IsUnsignedInteger() != -1);
+            const bool narrows = !CxxEnumPromotesToElement(source, elementType)
+                && CxxBraceElementNarrows(source, elementTy,
+                    elementTy->isIntegerTy(1) || elementType.IsUnsignedInteger() != -1);
             if (narrows)
             {
                 error = std::format("brace-list element {} of '{}' narrows to the C++ "
@@ -9655,6 +9752,10 @@ std::string LLVMBackend::CxxBraceElementSpelling(const CxxBraceArgument& brace,
             // An arithmetic result keeps its C++ type (`l + 1` is `long`, not the i64 TypeName).
             if (std::string arith = CxxArithIdentityForArgument(arg, valueType); !arith.empty())
                 type = arith;
+            if (std::string promoted = CxxUnscopedEnumPromotedIdentity(arg); !promoted.empty())
+                type = promoted;
+            if (std::string backing = CxxCflatEnumBackingIdentity(arg); !backing.empty())
+                type = backing;
             // The declared primitive identity outranks the machine-type guess below, which
             // cannot tell `char` from `i8` or `long` from `i64`.
             if (type.empty()) type = DeclaredPrimitiveIdentityForCxxArgument(arg, valueType);
@@ -9729,6 +9830,24 @@ static std::string CxxZeroLiteralSpelling(const std::string& identity)
 // One brace element as a C++ expression of its exact source type, for an overload selector: a
 // constant stays a constant expression (narrowing reads as at the source), anything else is a
 // declval. Empty when the element is not a spellable scalar.
+std::string LLVMBackend::CxxBraceElementIdentity(const NamedVariable& element) const
+{
+        llvm::Type* valueType = element.Primary != nullptr ? element.Primary->getType()
+                                                           : element.BaseType;
+        std::string type = !element.LiteralIdentity.empty() ? element.LiteralIdentity
+                                                            : element.TypeAndValue.TypeName;
+        // Same identity CxxBraceElementSpelling keys the wrapper by (`l + 4` is `long`), so two
+        // wrappers never share one selector namespace while ranking different element types.
+        if (std::string arith = CxxArithIdentityForArgument(element, valueType); !arith.empty())
+            type = arith;
+        if (std::string promoted = CxxUnscopedEnumPromotedIdentity(element); !promoted.empty())
+            type = promoted;
+        if (std::string backing = CxxCflatEnumBackingIdentity(element); !backing.empty())
+            type = backing;
+        if (type.empty()) type = DeclaredPrimitiveIdentityForCxxArgument(element, valueType);
+        return type;
+}
+
 std::string LLVMBackend::CxxBraceSelectorElement(
         const NamedVariable& element, const std::vector<std::string>& candidateElements)
 {
@@ -9744,13 +9863,7 @@ std::string LLVMBackend::CxxBraceSelectorElement(
             if (std::string zero = CxxZeroLiteralSpelling(element.LiteralIdentity); !zero.empty())
                 return zero;
         }
-        std::string type = !element.LiteralIdentity.empty() ? element.LiteralIdentity
-                                                            : element.TypeAndValue.TypeName;
-        // Same identity CxxBraceElementSpelling keys the wrapper by (`l + 4` is `long`), so two
-        // wrappers never share one selector namespace while ranking different element types.
-        if (std::string arith = CxxArithIdentityForArgument(element, valueType); !arith.empty())
-            type = arith;
-        if (type.empty()) type = DeclaredPrimitiveIdentityForCxxArgument(element, valueType);
+        std::string type = CxxBraceElementIdentity(element);
         auto* constantInt = llvm::dyn_cast_or_null<llvm::ConstantInt>(element.Primary);
         auto* constantFp = llvm::dyn_cast_or_null<llvm::ConstantFP>(element.Primary);
         // An untyped integer literal is spelled as itself, so clang gives it its own type.
@@ -13263,6 +13376,8 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 key = type.TypeName;
             if (key.empty() && type.IsScopedEnum) key = type.TypeName;
             if (key.empty()) return false;
+            if (!type.Pointer && !type.ElemPointer && CxxCflatEnumBackingSpelling(key, spelling))
+                return true;
             if (auto it = cxxCflatToCxxSpelling_.find(key); it != cxxCflatToCxxSpelling_.end())
                 spelling = it->second;
             else
@@ -13735,7 +13850,9 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
             {
                 const NamedVariable& element = arguments[i];
                 const std::string& identity = element.LiteralIdentity;
-                if (identity.empty()) continue;
+                // An imported enumerator or integer macro is a constant too: its typed constant text
+                // goes in the list (clang applies the constant-expression rule to it).
+                if (identity.empty() && element.CxxImportedLiteral.empty()) continue;
                 const std::string forwarded = callArguments[i];
                 // Recorded after the literal spelling below replaced the forwarded parameter.
                 struct RecordLiteral
@@ -13749,6 +13866,11 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                         if (calls[index] != forwarded) literals[index] = calls[index];
                     }
                 } recordLiteral{ braceLiteralElements, callArguments, forwarded, i };
+                if (identity.empty())
+                {
+                    callArguments[i] = element.CxxImportedLiteral;
+                    continue;
+                }
                 if (auto* constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(element.Primary))
                 {
                     static const std::map<std::string, std::pair<std::string, unsigned>> suffixes = {
@@ -14456,6 +14578,14 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
             if (!lastError.empty()) error += " (clang: " + lastError + ")";
             return false;
         }
+        // clang found the name but could not bind it (a nested ctor or call argument refused):
+        // its reason is the cause, not "not a member of namespace".
+        if (!lastError.empty() && !lastError.starts_with("no member named "))
+        {
+            error = std::format("C++ free function '{}' could not be bound (clang: {})",
+                                functionName, lastError);
+            return false;
+        }
         const size_t missingDot = functionName.rfind('.');
         const std::string missingMember = functionName.substr(missingDot + 1);
         const std::string missingNamespace = memberCall ? memberOwnerType
@@ -14612,7 +14742,7 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                 element = classBraceListElementFor(parameter, kind);
             else
                 return std::string();
-            return IsCxxScalarBraceElement(element) && CxxBraceElementsAllScalar(brace)
+            return IsCxxScalarOrBoolBraceElement(element) && CxxBraceElementsAllScalar(brace)
                 ? element : std::string();
         };
         std::string initializerListRefusal;
@@ -14665,12 +14795,74 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             }
             return priority;
         };
+        // The CFlat primitive a C++ element spelling or identity names ("unsigned int" is u32).
+        auto primitiveOf = [&](const std::string& spelling) {
+            const std::string compact = SqueezeCxxSpelling(StripCxxRefAndCv(spelling));
+            const char* integer = CxxCompactIntegerSpellingToCflat(compact);
+            return CanonicalPrimitiveTypeName(integer != nullptr ? std::string(integer) : compact);
+        };
+        auto integerBitsOf = [](const std::string& name) {
+            TypeAndValue probe;
+            probe.TypeName = name;
+            return probe.IsInteger();
+        };
+        // One braced element against a candidate's element type, ranked as RankCxxConversionSequences
+        // ranks an argument: an unscoped enum by its fixed or promoted type, anything else by identity.
+        // 0 exact, 1 integral or floating promotion, 2 any other conversion.
+        auto elementRank = [&](const NamedVariable& e, const std::string& to) -> size_t {
+            const TypeAndValue& tv = e.TypeAndValue;
+            const std::string key = tv.Pointer || tv.ElemPointer ? std::string() : ResolveEnumTypeName(tv.TypeName);
+            auto promoted = enumPromotedTypes_.find(key);
+            if (!key.empty() && !IsScopedEnumTypeName(key) && promoted != enumPromotedTypes_.end())
+            {
+                const std::string promotedName = primitiveOf(promoted->second);
+                auto backing = enumBackingTypes.find(key);
+                const std::string backingName = backing != enumBackingTypes.end()
+                    ? primitiveOf(backing->second) : std::string();
+                const bool narrowFixed = !backingName.empty()
+                    && (backingName == "bool" || (integerBitsOf(backingName) > 0
+                                                  && integerBitsOf(backingName) < 32));
+                if (narrowFixed && to == backingName) return 0;
+                return to == promotedName ? 1 : 2;
+            }
+            const std::string identity = primitiveOf(CxxBraceElementIdentity(e));
+            if (identity.empty()) return 2;
+            if (identity == to) return 0;
+            if (to == "int" && (identity == "bool" || (integerBitsOf(identity) > 0
+                                                      && integerBitsOf(identity) < 32)))
+                return 1;
+            if (to == "double" && identity == "float") return 1;
+            return 2;
+        };
+        // Candidates tied on priority and arity: clang ranks a braced list by its WORST element
+        // conversion ([over.ics.list]); the candidate whose worst element ranks lowest wins, and
+        // ties keep the first candidate.
+        auto braceElementRank = [&](const std::vector<std::string>& params) {
+            size_t worst = 0;
+            for (const auto& brace : braceArguments)
+            {
+                if (brace.parameterIndex >= params.size() || brace.hasCxxClassElements) continue;
+                const std::string& target = params[brace.parameterIndex];
+                std::string element;
+                std::string extent;
+                if (CxxBraceContainerKindOf(target) == CxxBraceContainerKind::InitializerList)
+                    element = CxxBraceTargetElementSpelling(target);
+                else if (!CxxArrayReferenceParameter(target, element, extent))
+                    continue;
+                if (element.empty()) continue;
+                const std::string to = primitiveOf(element);
+                for (const auto& e : brace.elements)
+                    worst = std::max(worst, elementRank(e, to));
+            }
+            return worst;
+        };
         if (ownerType.empty())
         {
             auto it = cxxFunctionSignatures_.find(functionName);
             if (it == cxxFunctionSignatures_.end()) return false;
             int selectedBracePriority = 100;
             size_t selectedExtraParameters = static_cast<size_t>(-1);
+            size_t selectedRank = static_cast<size_t>(-1);
             for (const auto& sig : it->second)
             {
                 // A brace wrapper registered by an earlier call is not a C++ overload: its
@@ -14682,10 +14874,13 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                 const auto bracePriority = bracePriorityFor(sig.paramSpellings, sig.paramNames);
                 if (!bracePriority) continue;
                 const size_t extraParameters = sig.paramSpellings.size() - arguments.size();
+                const size_t rank = braceElementRank(sig.paramSpellings);
                 if (selected.found
                     && (*bracePriority > selectedBracePriority
                         || (*bracePriority == selectedBracePriority
-                            && extraParameters >= selectedExtraParameters)))
+                            && (extraParameters > selectedExtraParameters
+                                || (extraParameters == selectedExtraParameters
+                                    && rank >= selectedRank)))))
                     continue;
                 const bool exact = sig.paramSpellings.size() == arguments.size();
                 selected.paramTypes = sig.paramSpellings;
@@ -14698,8 +14893,9 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                 selected.isNoexcept = sig.isNoexcept;
                 selectedBracePriority = *bracePriority;
                 selectedExtraParameters = extraParameters;
+                selectedRank = rank;
                 selected.found = true;
-                if (exact && *bracePriority == 0) break;
+                if (exact && *bracePriority == 0 && rank == 0) break;
             }
             if (!selected.found)
             {
@@ -14716,6 +14912,7 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             const cflat_cinterop::RawCxxMember* fallback = nullptr;
             int fallbackBracePriority = 100;
             size_t fallbackExtraParameters = static_cast<size_t>(-1);
+            size_t fallbackRank = static_cast<size_t>(-1);
             for (const auto& member : record->second.members)
             {
                 if (member.name != memberName
@@ -14732,15 +14929,20 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                 const auto bracePriority = bracePriorityFor(member.paramTypes, member.paramNames);
                 if (!bracePriority) continue;
                 const size_t extraParameters = member.paramTypes.size() - arguments.size();
+                const size_t rank = braceElementRank(member.paramTypes);
                 if (fallback != nullptr
                     && (*bracePriority > fallbackBracePriority
                         || (*bracePriority == fallbackBracePriority
-                            && extraParameters >= fallbackExtraParameters)))
+                            && (extraParameters > fallbackExtraParameters
+                                || (extraParameters == fallbackExtraParameters
+                                    && rank >= fallbackRank)))))
                     continue;
                 fallback = &member;
                 fallbackBracePriority = *bracePriority;
                 fallbackExtraParameters = extraParameters;
-                if (member.paramTypes.size() == arguments.size() && *bracePriority == 0)
+                fallbackRank = rank;
+                if (member.paramTypes.size() == arguments.size() && *bracePriority == 0
+                    && rank == 0)
                 {
                     break;
                 }
@@ -15424,9 +15626,7 @@ bool LLVMBackend::RequestCxxBraceConstructor(
         // Which braced arguments are backed, and as what: an initializer_list candidate outranks
         // an array for a braced list ([over.ics.list]), so arrays count only without one.
         std::map<size_t, bool> backedList;
-        auto scalarElement = [&](const std::string& element) {
-            return IsCxxScalarBraceElement(element);
-        };
+        auto scalarElement = [&](const std::string& element) { return IsCxxScalarOrBoolBraceElement(element); };
         // The parameter as a selector declares it (an array's extent is the list's own count, a
         // deduced `N` included); empty when it cannot take the backed list of that kind.
         auto backedParameter = [&](const std::string& parameter, size_t count, bool list) {
@@ -16059,12 +16259,45 @@ static std::string DirectBraceConstantText(const LLVMBackend::NamedVariable& ele
         return {};
 }
 
+/*
+ * A brace element that reads an imported enumerator or integer macro constant records the constant, so
+ * narrowing reads it as a constant expression (clang does). A CFlat-declared enumerator is not recorded.
+ */
+void LLVMBackend::RecordCxxConstantBraceElement(NamedVariable& element, llvm::Value* value)
+{
+        element.CxxConstantValue = nullptr;
+        if (element.TypeAndValue.Pointer || element.TypeAndValue.ElemPointer) return;
+        // A scoped enumerator converts to no integer: its constant value is not a brace constant.
+        if (element.TypeAndValue.IsScopedEnum
+            || IsScopedEnumTypeName(ResolveEnumTypeName(element.TypeAndValue.TypeName))) return;
+        auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(value);
+        auto* global = load != nullptr ? llvm::dyn_cast<llvm::GlobalVariable>(load->getPointerOperand()) : nullptr;
+        if (global == nullptr || !global->hasInitializer()) return;
+        const bool cflatEnumerator = CflatEnumeratorConstant(
+            global, ResolveEnumTypeName(element.TypeAndValue.TypeName)) != nullptr;
+        if (!element.IsCxxMacroGlobal && !IsImportedEnumeratorStorage(global) && !cflatEnumerator) return;
+        element.CxxConstantValue = llvm::dyn_cast<llvm::ConstantInt>(global->getInitializer());
+}
+
 std::string LLVMBackend::CxxImportedConstantLiteral(const NamedVariable& element) const
 {
         // C++ treats an imported enumerator or integer macro as a constant; CFlat keeps its global.
         // The literal keeps the constant's own C++ type, so overloads and narrowing see what clang sees.
-        if (element.TypeAndValue.Pointer || element.TypeAndValue.IsScopedEnum || element.Storage == nullptr)
+        if (element.TypeAndValue.Pointer || element.TypeAndValue.IsScopedEnum || element.Storage == nullptr
+            || IsScopedEnumTypeName(ResolveEnumTypeName(element.TypeAndValue.TypeName)))
             return {};
+        // A CFlat enumerator is a constant of its backing integer: spelled as that type, value kept.
+        const std::string enumKey = ResolveEnumTypeName(element.TypeAndValue.TypeName);
+        if (const llvm::ConstantInt* value = CflatEnumeratorConstant(element.Storage, enumKey))
+        {
+            std::string backing;
+            if (!CxxCflatEnumBackingSpelling(enumKey, backing) || value->getBitWidth() > 64) return {};
+            TypeAndValue probe;
+            probe.TypeName = GetEnumBackingType(enumKey);
+            const std::string literal = probe.IsUnsignedInteger() > 0
+                ? std::to_string(value->getZExtValue()) : std::to_string(value->getSExtValue());
+            return "(" + backing + ")" + literal;
+        }
         if (!element.IsCxxMacroGlobal && !IsImportedEnumeratorStorage(element.Storage)) return {};
         if (IsImportedEnumeratorStorage(element.Storage))
         {
@@ -16076,7 +16309,9 @@ std::string LLVMBackend::CxxImportedConstantLiteral(const NamedVariable& element
             const size_t nameDot = name.rfind('.');
             const std::string enumScope = enumDot == std::string::npos ? std::string() : enumType.substr(0, enumDot);
             const std::string nameScope = nameDot == std::string::npos ? std::string() : name.substr(0, nameDot);
-            if (enumScope != nameScope) return {};
+            // `ns.A.e` is the enumerator of enum `ns.A` (spelled `ns::A::e`, valid for an unscoped enum);
+            // `ns.e` is one declared directly in the namespace.
+            if (enumScope != nameScope && enumType != nameScope) return {};
             std::string qualified;
             for (char c : name)
             {
@@ -16854,6 +17089,8 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
                 key = type.TypeName;
             if (key.empty() && type.IsScopedEnum) key = type.TypeName;
             if (key.empty()) return false;
+            if (!type.Pointer && !type.ElemPointer && CxxCflatEnumBackingSpelling(key, spelling))
+                return true;
             if (auto it = cxxCflatToCxxSpelling_.find(key); it != cxxCflatToCxxSpelling_.end())
                 spelling = it->second;
             else
@@ -17990,6 +18227,7 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                 return fail(std::format("'{}' does not name a C++ class type in the imported headers",
                                         cxxSpelling));
             if (head.isScoped) RegisterScopedEnumType(cflatName);
+            importedEnumTypes_.insert(cflatName);
             RegisterEnumBackingType(cflatName, backing.TypeName);
             if (TypeAndValue promoted; !head.promotedType.empty()
                 && MapCTypeToTypeAndValue(head.promotedType, promoted, /*cxxBoundary*/ true))
@@ -20403,6 +20641,7 @@ void LLVMBackend::RegisterCEnums(const std::vector<CEnumEntry>& enums, const std
                 runTypeResolved = false;
                 runIntTy = nullptr;
                 if (e.isScoped && !e.enumType.empty()) RegisterScopedEnumType(e.enumType);
+                if (!e.enumType.empty()) importedEnumTypes_.insert(e.enumType);
                 if (cxxBoundary && activeCxxRequestGroup_ != nullptr && !e.enumType.empty())
                     cxxTypeOwnerGroup_.emplace(e.enumType, activeCxxRequestGroup_->primary);
                 if (!e.enumType.empty() && !e.underlyingType.empty())
@@ -26352,8 +26591,9 @@ void LLVMBackend::RegisterCMacros(const std::vector<CMacroEntry>& macros)
             else if (m.isPointer)
             {
                 // Sentinel pointer: reinterpret the bit pattern as a void* so comparisons
-                // against HANDLE-returning APIs work without an explicit cast.
-                tv.TypeName = "void";
+                // against HANDLE-returning APIs work without an explicit cast; a scalar cast
+                // pointer keeps its pointee (int* for ((int*)0)).
+                tv.TypeName = m.pointeeTypeName.empty() ? "void" : m.pointeeTypeName;
                 tv.Pointer  = true;
                 llvm::Type* i8Ptr = llvm::PointerType::get(*context, 0);
                 llvm::Constant* bits = builder->getInt64((uint64_t)m.value);
@@ -28873,10 +29113,11 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                 return false;                 // record types must match exactly
             // Ordinary C++ scalar conversions are allowed when selecting a converting
             // constructor. Exact same-family matches still win through the exact counter.
+            const bool boolTarget = !want.Pointer && want.TypeName == "bool";
             if (allowNumericConversions
                 && ((want.IsFloatingPoint() != -1 && got.IsInteger() != -1)
-                || (want.IsInteger() != -1 && got.IsFloatingPoint() != -1))
-                )
+                || (want.IsInteger() != -1 && got.IsFloatingPoint() != -1)
+                || (boolTarget && (got.IsInteger() != -1 || got.IsFloatingPoint() != -1))))
                 return true;
             // Scalar table (ruling 2026-10-09): a narrowing or other-enum argument is not a
             // match; clang would otherwise take it silently.
@@ -29748,15 +29989,16 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
                     && !param.ElemPointer && !cxxByValueParam
                 ? CxxArgConversion::NonConstLvalueRef : CxxArgConversion::Convertible;
         }
-        // A pointer argument converts only into a ctor taking a NON-class pointee (`P(const int*)`,
-        // incl. a proven `&k` / `int*` local); a class pointer keeps its dereference rules.
+        // A pointer normally converts only into a ctor taking a non-class pointee (`P(const int*)`);
+        // a C++ operator operand opts in only after its record pointee is proven.
         const bool classPointerArg = arg.TypeAndValue.Pointer
             && !IsCxxNullTypedArgument(arg)
             && ((arg.TypeAndValue.TypeName.empty() && !IsProvenPrimitiveSinglePointerArg(arg))
                 || IsCxxRecord(arg.TypeAndValue.TypeName)
                 || dataStructures.count(arg.TypeAndValue.TypeName) != 0
                 || arg.TypeAndValue.IsFunctionPointer || arg.TypeAndValue.IsArrayView);
-        if (param.TypeName.empty() || param.IsInterface || classPointerArg
+        if (param.TypeName.empty() || param.IsInterface
+            || (classPointerArg && !arg.AllowCxxClassPointerCtorConversion)
             || (param.Pointer && !cxxByValueParam
                 && (!param.IsAlias || param.IsCxxRefToPointer)
                 && !IsForeignCxxClassWithConstructors(param.TypeName))
@@ -30810,7 +31052,10 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
                 ConstructThroughCxxCtorWrapper(source, probe, targetType, wrapperName, intoSlot);
                 return CxxConvertingCtorResult::Converted;
             }
-            if (scalarTableTie && !wrapperError.empty())
+            // Clang confirms this tie but omits candidate signatures from the wrapper diagnostic.
+            // Keep its other refusals; the typed constructor table below supplies the candidates.
+            if (scalarTableTie && !wrapperError.empty()
+                && wrapperError.find("ambiguous") == std::string::npos)
             {
                 refusal = wrapperError;
                 return CxxConvertingCtorResult::Refused;
@@ -30821,9 +31066,10 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
                 candidates = candidates.substr(2, candidates.size() - 3);
             refusal = std::format("the implicit conversion from '{}' is ambiguous: C++ class '{}' "
                                   "has more than one converting constructor of equal rank ({}); "
-                                  "spell the conversion out as '{}(<argument>)' with a cast "
-                                  "argument", argType.TypeName, DisplayCxxClassName(targetType),
+                                  "spell the conversion out as '{}(<argument>)' with a cast argument",
+                                  argType.TypeName, DisplayCxxClassName(targetType),
                                   candidates, DisplayCxxClassName(targetType));
+            if (!wrapperError.empty()) refusal += "; " + wrapperError;
             return CxxConvertingCtorResult::Refused;
         }
         return CxxConvertingCtorResult::NotApplicable;

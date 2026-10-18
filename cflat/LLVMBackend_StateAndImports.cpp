@@ -2973,6 +2973,7 @@ nlohmann::json LLVMBackend::MacroToJson(const CMacroEntry& m, CCachePathTable* f
         PathToJson(j, m.file, files);
         if (m.isIntegerLiteralZero) j["ilz"] = true;
         if (m.isPointer) j["isp"]  = true;
+        if (!m.pointeeTypeName.empty()) j["pte"] = m.pointeeTypeName;
         // Store the float as its raw IEEE-754 bit pattern, not as a JSON number:
         // nlohmann serializes inf/NaN as JSON `null` (math.h's INFINITY/NAN/HUGE_VAL),
         // which then throws type_error.302 on reload. Bits round-trip every value exactly.
@@ -2999,6 +3000,7 @@ LLVMBackend::CMacroEntry LLVMBackend::MacroFromJson(const SjVal& j, const CCache
         m.col       = j.value("co",  0);
         m.isIntegerLiteralZero = j.value("ilz", false);
         m.isPointer = j.value("isp", false);
+        m.pointeeTypeName = j.value("pte", std::string{});
         m.isFloat   = j.value("isf", false);
         if (m.isFloat)
         {

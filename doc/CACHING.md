@@ -138,6 +138,20 @@ and simply does not register with the extension.
 | `--init` re-run | Overwrites the files in the current hash directory |
 | Cache absent or unreadable | Transparent fallback to full source parse |
 
+## Pruning dead generations (`--init-prune` / `--init-local-prune`)
+
+```bash
+cflat --init-local-prune    # --init-local, then prune <exe dir>/.cflat
+cflat --init-prune          # --init, then prune the resolved cache directory
+```
+
+Runs the matching init, then deletes every folder the current build can never read:
+`cheaders/v<N>` of another cache version (`kCHeaderCacheVersion`) and `runtime/<hash>` of other
+core sources. Only those two name shapes are touched and symlinks are never followed. Entries
+inside the current `cheaders/v<N>` are not judged - a request entry an older build wrote is kept
+(see the request-entry prune rule under C-header cache). `test.sh` and `test.bat` run
+`--init-local-prune` in place of `--init-local`.
+
 ## Clearing the cache (`--init-clear` / `--init-clear-local`)
 
 **Behaviour change:** `--init-clear` now clears **both** the per-user cache and the local
@@ -235,8 +249,9 @@ The extracted declarations (functions, enums, records, macros, globals) are seri
 ```
 
 `<version>` is the cache schema version (`kCHeaderCacheVersion`). A version bump starts a new,
-empty folder; folders of other versions are never read or scanned, so nothing prunes them -
-delete them by hand, or with `--init-clear` / `--init-clear-local`.
+empty folder; folders of other versions are never read. The first header import of a process
+removes another version's folder once nothing in it has been written for 24 hours;
+`--init-prune` / `--init-local-prune` remove them at once (see below).
 
 When a C++ import emits a companion module, its bitcode is stored as the raw
 `<key>.bc` sidecar next to the JSON; the JSON records the sidecar name, byte length, and FNV-1a

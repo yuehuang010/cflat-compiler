@@ -301,6 +301,7 @@ ProxyCppRecord makeProxyCppRecord()
 // std::function as a MEMBER parameter and as a RETURN type.
 import cpp "library/cpp_interop_stdfn.h";
 import cpp "library/cpp_interop_twin.h";
+import cpp "library/cpp_interop_lastuse.h";
 import cpp "library/cpp_interop_arrayelem.h";
 import "library/cpp_interop_gfield_a.cb";
 import "library/cpp_interop_gfield_b.cb";
@@ -1112,6 +1113,48 @@ struct BridgeT160Outer
     int k = 0;
 };
 
+struct BridgeT299Lowered
+{
+    cpptw.Twin t = default;
+    int tag = 0;
+};
+
+struct BridgeT299Outer
+{
+    BridgeT299Lowered inner = default;
+    int tag = 0;
+};
+
+int bridge_t301_boxd = 0;
+struct BridgeT301BoxA { int value = 0; ~BridgeT301BoxA() { bridge_t301_boxd = bridge_t301_boxd + 1; } };
+struct BridgeT301BoxB { int value = 0; ~BridgeT301BoxB() { bridge_t301_boxd = bridge_t301_boxd + 1; } };
+struct BridgeT301BoxC { int value = 0; ~BridgeT301BoxC() { bridge_t301_boxd = bridge_t301_boxd + 1; } };
+struct BridgeT301BoxD { int value = 0; ~BridgeT301BoxD() { bridge_t301_boxd = bridge_t301_boxd + 1; } };
+struct BridgeT301BoxE { int value = 0; ~BridgeT301BoxE() { bridge_t301_boxd = bridge_t301_boxd + 1; } };
+struct BridgeT301TwinUniqueTwin
+{
+    cpptw.Twin a = default;
+    unique BridgeT301BoxA* b = default;
+    cpptw.Twin c = default;
+    int tag = 0;
+};
+struct BridgeT301UniqueTwin { unique BridgeT301BoxB* b = default; cpptw.Twin c = default; };
+struct BridgeT301TwinUnique { cpptw.Twin a = default; unique BridgeT301BoxC* b = default; };
+struct BridgeT301IntUniqueTwinInt
+{
+    int first = 0;
+    unique BridgeT301BoxD* b = default;
+    cpptw.Twin c = default;
+    int last = 0;
+};
+struct BridgeT301Inner { cpptw.Twin t = default; int tag = 0; };
+struct BridgeT301NestedAfterUnique
+{
+    unique BridgeT301BoxE* b = default;
+    BridgeT301Inner inner = default;
+    int tag = 0;
+};
+
 int bridge_t160_direct_copy()
 {
     BridgeT160Direct a = default; a.t.set(17); a.tag = 1;
@@ -1147,7 +1190,7 @@ int bridge_t160_list_copy()
 {
     list<BridgeT160Direct> source = default;
     BridgeT160Direct a = default; a.t.set(31); a.tag = 2; source.add(move a);
-    a.t.set(37); a.tag = 5; source.add(move a);
+    BridgeT160Direct a2 = default; a2.t.set(37); a2.tag = 5; source.add(move a2);
     list<BridgeT160Direct> copied = source.copy();
     return copied.count() * 1000000
         + copied[0].t.value() * 10000 + copied[0].tag * 1000 + copied[0].copies * 100
@@ -1160,11 +1203,158 @@ int bridge_t160_list_copy_allocator()
     IAllocator allocator = backing;
     list<BridgeT160Direct> source = default;
     BridgeT160Direct a = default; a.t.set(31); a.tag = 2; source.add(move a);
-    a.t.set(37); a.tag = 5; source.add(move a);
+    BridgeT160Direct a2 = default; a2.t.set(37); a2.tag = 5; source.add(move a2);
     list<BridgeT160Direct> copied = source.copy(allocator);
     return copied.count() * 1000000
         + copied[0].t.value() * 10000 + copied[0].tag * 1000 + copied[0].copies * 100
         + copied[1].t.value() * 100 + copied[1].tag * 10 + copied[1].copies;
+}
+
+int bridge_t299_pack_result(int value, int baseLive)
+{
+    // The decimal digits after value encode ctor, copy, move, copy-assign, move-assign, dtor, live delta.
+    return value * 10000000 + cpptw.ctor_count() * 1000000
+        + cpptw.copy_count() * 100000 + cpptw.move_count() * 10000
+        + cpptw.copy_assign_count() * 1000 + cpptw.move_assign_count() * 100
+        + cpptw.dtor_count() * 10 + cpptw.live_allocations() - baseLive;
+}
+
+int bridge_t299_assign_default()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = 0;
+    { BridgeT299Lowered x = default; x.t.set(17); x = default; value = x.t.value(); }
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t299_assign_parenthesized_default()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = 0;
+    { BridgeT299Lowered x = default; x.t.set(17); x = (default); value = x.t.value(); }
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t299_assign_nested_default()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = 0;
+    { BridgeT299Outer o = default; o.inner.t.set(17); o.inner = default; value = o.inner.t.value(); }
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t299_assign_array_default()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = 0;
+    { BridgeT299Lowered[1] arr = default; arr[0].t.set(17); arr[0] = default; value = arr[0].t.value(); }
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t302_take_lowered(BridgeT299Lowered value) { return value.t.value(); }
+
+int bridge_t302_lowered_default_arg()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = bridge_t302_take_lowered(default);
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t302_lowered_paren_default_arg()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = bridge_t302_take_lowered((default));
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t302_lowered_deep_paren_default_arg()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = bridge_t302_take_lowered(((default)));
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t302_cpp_default_arg()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = cpptw.take(default);
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t302_cpp_paren_default_arg()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = cpptw.take((default));
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t302_cpp_deep_paren_default_arg()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = cpptw.take(((default)));
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t302_cpp_ternary_default_move()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = 0;
+    {
+        cpptw.Twin tw = default;
+        bool nc = false;
+        value = cpptw.take(nc ? default : move tw);
+    }
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t301_pack_result(int value)
+{
+    return value * 1000000 + cpptw.ctor_count() * 100000 + cpptw.copy_count() * 10000
+        + cpptw.move_count() * 1000 + cpptw.copy_assign_count() * 100
+        + cpptw.move_assign_count() * 10 + cpptw.dtor_count();
+}
+
+int bridge_t301_twin_unique_twin()
+{
+    cpptw.reset_counts(); bridge_t301_boxd = 0;
+    int value = 0;
+    { BridgeT301TwinUniqueTwin x = default; x.a.set(3); x.b = new BridgeT301BoxA(); x.c.set(7);
+      value = x.a.value() * 10 + x.c.value(); }
+    return bridge_t301_pack_result(value);
+}
+
+int bridge_t301_unique_twin()
+{
+    cpptw.reset_counts(); bridge_t301_boxd = 0;
+    int value = 0;
+    { BridgeT301UniqueTwin x = default; x.b = new BridgeT301BoxB(); x.c.set(11); value = x.c.value(); }
+    return bridge_t301_pack_result(value);
+}
+
+int bridge_t301_twin_unique()
+{
+    cpptw.reset_counts(); bridge_t301_boxd = 0;
+    int value = 0;
+    { BridgeT301TwinUnique x = default; x.a.set(13); x.b = new BridgeT301BoxC(); value = x.a.value(); }
+    return bridge_t301_pack_result(value);
+}
+
+int bridge_t301_int_unique_twin_int()
+{
+    cpptw.reset_counts(); bridge_t301_boxd = 0;
+    int value = 0;
+    { BridgeT301IntUniqueTwinInt x = default; x.first = 3; x.b = new BridgeT301BoxD();
+      x.c.set(7); x.last = 5; value = x.first * 100 + x.c.value() * 10 + x.last; }
+    return bridge_t301_pack_result(value);
+}
+
+int bridge_t301_nested_after_unique()
+{
+    cpptw.reset_counts(); bridge_t301_boxd = 0;
+    int value = 0;
+    { BridgeT301NestedAfterUnique x = default; x.b = new BridgeT301BoxE();
+      x.inner.t.set(13); x.inner.tag = 4; value = x.inner.t.value() * 10 + x.inner.tag; }
+    return bridge_t301_pack_result(value);
 }
 
 int bridge_t160_explicit_copy()
@@ -1178,7 +1368,7 @@ int bridge_t160_dictionary_copy()
 {
     dictionary<int, BridgeLoweredUserCopy> source = default;
     BridgeLoweredUserCopy p = default; p.t.set(7); p.copies = 0; source.set(1, move p);
-    p.t.set(9); source.set(2, move p);
+    BridgeLoweredUserCopy p2 = default; p2.t.set(9); source.set(2, move p2);
     dictionary<int, BridgeLoweredUserCopy> copied = source.copy();
     int sum = 0; int copies = 0; int i = 0;
     while (i < copied.slotCount())
@@ -3257,6 +3447,55 @@ int uq_reassign_and_adopt()
     if (cpuq.ctors() != 4 || cpuq.dtors() != 4) return 3556;
     return 0;
 }
+// T292: a consumed C++ unique field is live again after a plain '=' re-init (the finishStore revive does not
+// run on the foreign-class store path, so the field stayed moved). Codes 3561-3562.
+struct UqSpelled { std.unique_ptr<cpuq.Widget> w; };
+int uq_reinit_after_consume()
+{
+    cpuq.reset_counts();
+    {
+        UqHolder h = default;
+        h.w = cpuq.make(20);
+        cpuq.take(move h.w);                  // the sink destroys the 20 Widget
+        h.w = new cpuq.Widget(21);            // re-init revives the consumed field
+        if (cpuq.peek(h.w) != 21 || h.w->value() != 21) return 3561;
+        cpuq.take(move h.w);                  // a second consume of the re-initialized field
+        h.w = cpuq.make(22);
+        if (cpuq.peek(h.w) != 22 || cpuq.dtors() != 2) return 3561;
+        UqHolder[2] arr = default;
+        arr[0].w = cpuq.make(26);
+        cpuq.take(move arr[0].w);
+        arr[0].w = cpuq.make(27);             // constant-index element path revives too
+        if (cpuq.peek(arr[0].w) != 27) return 3561;
+    }
+    if (cpuq.ctors() != 5 || cpuq.dtors() != 5) return 3561;
+    return 0;
+}
+int uq_reinit_spelled_after_consume()
+{
+    cpuq.reset_counts();
+    {
+        UqSpelled sp = default;
+        sp.w = cpuq.make(30);
+        cpuq.take(move sp.w);
+        sp.w = cpuq.make(31);
+        if (cpuq.peek(sp.w) != 31) return 3562;
+    }
+    if (cpuq.ctors() != 2 || cpuq.dtors() != 2) return 3562;
+    return 0;
+}
+// T292: a re-init on one branch only stays maybe-moved after the join, so the read is refused.
+struct UqOneBranchHolder { unique cpuq.Widget* w = default; };
+expect_error("use of moved variable 'h.w'") {
+    int uq_reinit_one_branch_refused(bool c)
+    {
+        UqOneBranchHolder h = default;
+        h.w = cpuq.make(1);
+        cpuq.take(move h.w);
+        if (c) { h.w = cpuq.make(2); }
+        return cpuq.peek(h.w);
+    }
+}
 int uq_spellings()
 {
     cpuq.reset_counts();
@@ -5298,6 +5537,49 @@ extern int main(int argc, char** argv)
     bridge_check("bridge T160 factory decl then user copy and implicit copy", bridge_t160_factory_copy(), 45454);
     bridge_check("bridge T160 factory decl live", cpptw.live_allocations(), 0);
 
+    // T299: lowered-struct reassignment matches implicit C++ memberwise operator= counts.
+    cpptw.reset_counts();
+    bridge_check("bridge T299 default assignment value/counts/live", bridge_t299_assign_default(), 2000120);
+    cpptw.reset_counts();
+    bridge_check("bridge T299 parenthesized default value/counts/live", bridge_t299_assign_parenthesized_default(), 2000120);
+    cpptw.reset_counts();
+    bridge_check("bridge T299 nested-field default assignment value/counts/live", bridge_t299_assign_nested_default(), 2000120);
+    cpptw.reset_counts();
+    bridge_check("bridge T299 array-element default assignment value/counts/live", bridge_t299_assign_array_default(), 2000120);
+
+    // T302: default arguments preserve the owned prvalue for lowered and direct C++ by-value params.
+    cpptw.reset_counts();
+    bridge_check("bridge T302 lowered bare default argument value/counts/live", bridge_t302_lowered_default_arg(), 1000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T302 lowered parenthesized default argument value/counts/live", bridge_t302_lowered_paren_default_arg(), 1000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T302 lowered deeply parenthesized default argument value/counts/live", bridge_t302_lowered_deep_paren_default_arg(), 1000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T302 C++ bare default argument value/counts/live", bridge_t302_cpp_default_arg(), 1000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T302 C++ parenthesized default argument value/counts/live", bridge_t302_cpp_paren_default_arg(), 1000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T302 C++ deeply parenthesized default argument value/counts/live", bridge_t302_cpp_deep_paren_default_arg(), 1000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T302 C++ ternary default/move argument value/counts/live", bridge_t302_cpp_ternary_default_move(), 1100020);
+
+    // T301: a C++ class field after a unique field keeps its C++ layout and destruction counts.
+    bridge_check("bridge T301 Twin/unique/Twin value and counts", bridge_t301_twin_unique_twin(), 37200002);
+    bridge_check("bridge T301 Twin/unique/Twin live", cpptw.live_allocations(), 0);
+    bridge_check("bridge T301 Twin/unique/Twin Box destroyed", bridge_t301_boxd, 1);
+    bridge_check("bridge T301 unique/Twin value and counts", bridge_t301_unique_twin(), 11100001);
+    bridge_check("bridge T301 unique/Twin live", cpptw.live_allocations(), 0);
+    bridge_check("bridge T301 unique/Twin Box destroyed", bridge_t301_boxd, 1);
+    bridge_check("bridge T301 Twin/unique value and counts", bridge_t301_twin_unique(), 13100001);
+    bridge_check("bridge T301 Twin/unique live", cpptw.live_allocations(), 0);
+    bridge_check("bridge T301 Twin/unique Box destroyed", bridge_t301_boxd, 1);
+    bridge_check("bridge T301 int/unique/Twin/int value and counts", bridge_t301_int_unique_twin_int(), 375100001);
+    bridge_check("bridge T301 int/unique/Twin/int live", cpptw.live_allocations(), 0);
+    bridge_check("bridge T301 int/unique/Twin/int Box destroyed", bridge_t301_boxd, 1);
+    bridge_check("bridge T301 nested lowered field after unique value and counts", bridge_t301_nested_after_unique(), 134100001);
+    bridge_check("bridge T301 nested lowered field live", cpptw.live_allocations(), 0);
+    bridge_check("bridge T301 nested Box destroyed", bridge_t301_boxd, 1);
+
     // T164: destruction order of C++ members and elements (clang++ -std=c++20 oracle values).
     bridge_check("bridge T164 struct of three C++ fields destroyed last-first", bridge_t164_three(), 321);
     bridge_check("bridge T164 mixed native and C++ fields destroyed last-first", bridge_t164_mixed(), 271);
@@ -6527,6 +6809,8 @@ extern int main(int argc, char** argv)
     if (uqResult == 0) uqResult = uq_spellings();
     if (uqResult == 0) uqResult = uq_cflat_sink();
     if (uqResult == 0) uqResult = uq_null_compare();
+    if (uqResult == 0) uqResult = uq_reinit_after_consume();
+    if (uqResult == 0) uqResult = uq_reinit_spelled_after_consume();
     if (uqResult != 0) return uqResult;
 
     // ---- CFlat method before protected C++ base member (3570-3579) ---------------------

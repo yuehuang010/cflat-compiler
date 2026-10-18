@@ -2,16 +2,6 @@
 
 namespace
 {
-// A field initializer may build straight into the field slot only when it is one call: in a
-// conditional, the first-emitted arm would take the slot even when the other arm is selected.
-bool FieldInitializerIsSingleCall(CFlatParser::AssignmentExpressionContext* expr)
-{
-    if (expr == nullptr) return true;
-    const std::string text = expr->getText();
-    return !text.empty() && text.back() == ')' && text.find('?') == std::string::npos
-        && std::count(text.begin(), text.end(), '(') == 1;
-}
-
 bool ShouldWarnImplicitFieldNarrowing(llvm::Value* value, llvm::Type* destinationType,
                                       const std::string& destinationTypeName)
 {
@@ -856,20 +846,16 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             userAlign = ParseAlignmentSpecifier(alignSpec);
         llvm::StructType* structType;
         llvm::StructType* literalType = nullptr;
-        if (isUnion)
-        {
-            // A union body is one array: an over-aligned member cannot get a pad slot, it
-            // just raises the union's alignment (all members start at offset 0).
-            structType = compiler->CreateUnionType(structName, declList, userAlign);
-        }
-        else if (isCppStruct)
+        // Materialize a core unique field before this struct's body is fixed. LLVM can keep
+        // stale offsets when an opaque unique specialization is completed afterward.
+        if (!isUnion)
         {
             bool needsFieldInstantiation = false;
             for (const auto& field : declList)
             {
+                if (!compiler->IsCoreUniqueType(field.TypeName)) continue;
                 auto fieldData = compiler->GetDataStructure(field.TypeName);
-                if (compiler->IsCoreUniqueType(field.TypeName)
-                    && (fieldData.StructType == nullptr || fieldData.StructType->isOpaque()))
+                if (fieldData.StructType == nullptr || fieldData.StructType->isOpaque())
                 {
                     needsFieldInstantiation = true;
                     break;
@@ -881,6 +867,15 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 ProcessPendingInstantiations();
                 activeTypeSubstitutions = savedSubst;
             }
+        }
+        if (isUnion)
+        {
+            // A union body is one array: an over-aligned member cannot get a pad slot, it
+            // just raises the union's alignment (all members start at offset 0).
+            structType = compiler->CreateUnionType(structName, declList, userAlign);
+        }
+        else if (isCppStruct)
+        {
             uint64_t fieldAlign = 0;
             declList = compiler->PadFieldsForAlignment(declList, fieldAlign,
                 anyBitfields ? &packedBitfields : nullptr);

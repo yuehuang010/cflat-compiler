@@ -1,4 +1,5 @@
 import cpp "cpp_interop_opnew.h";
+import cpp "cpp_interop_vdtor_delete.h";
 
 expect_error("its class-level 'operator new' is not accessible") {
     int PrivateNewProbe() {
@@ -12,4 +13,33 @@ expect_error("its class-level 'operator delete' is not accessible") {
         cppon.PrivateDelete* p = new cppon.PrivateDelete(2);
         return p->v;
     }
+}
+
+// Used virtual destructor whose operator delete clang refuses: clang's own text, not a cflat wrapper.
+expect_error("attempt to use a deleted function") {
+    int VdtorDeletedProbe() {
+        cppvd.Deleted* p = new cppvd.Deleted();
+        return 1;
+    }
+}
+
+// A `new` of this class stops at cflat's own class-level operator delete check, so use a local.
+expect_error("'operator delete' is a private member of") {
+    int VdtorPrivateProbe() {
+        cppvd.PrivDerived v;
+        return 2;
+    }
+}
+
+expect_error("member 'operator delete' found in multiple base classes of different types") {
+    int VdtorAmbiguousProbe() {
+        cppvd.Ambig* p = new cppvd.Ambig();
+        return 3;
+    }
+}
+
+// Accept leg: a usable class-scope delete with a virtual destructor still compiles.
+int VdtorUsableProbe() {
+    cppvd.Usable* p = new cppvd.Usable();
+    return 4;
 }

@@ -453,6 +453,18 @@ void sinkUnique(unique Resource* r)
     int x = r->id;
 }
 
+move Resource* t266MakeResource(int id)
+{
+    Resource* result = new Resource();
+    result->id = id;
+    return result;
+}
+
+void t266ConsumeResource(move Resource* value)
+{
+    delete value;
+}
+
 // Move/borrow overload pair: 'move' participates in mangling and overload selection.
 // probe(move Resource*) returns 100 + id and takes ownership (deletes r).
 // probe(Resource*)      returns 200 + id and borrows.
@@ -545,11 +557,6 @@ struct TempStringField
     string value = default;
 };
 
-struct AliasStringField
-{
-    alias string value = default;
-};
-
 int testTempStringFieldStores()
 {
     int passed = 0;
@@ -572,18 +579,6 @@ int testTempStringFieldStores()
     return passed;
 }
 
-int testAliasStringFieldStore()
-{
-    list<string> fields;
-    fields.add("borrowed-field");
-    AliasStringField borrowed = default;
-    borrowed.value = fields.get(0);
-    AliasStringField brace = { value = fields.get(0) };
-    int passed = Test("alias_string_destination_field", borrowed.value, "borrowed-field");
-    passed += Test("alias_string_destination_brace", brace.value, "borrowed-field");
-    return passed;
-}
-
 int testTernaryAliasStickyFieldStore()
 {
     int passed = 0;
@@ -594,13 +589,13 @@ int testTernaryAliasStickyFieldStore()
     // An alias binding primes lastCallReturnType.IsAlias; a later ternary/?? whose arms make
     // no call must not inherit that stale flag when storing into a plain (non-alias) field.
     TempStringField litArm = default;
-    alias string a1 = fields.get(0);
+    string a1 = fields.get(0);
     bool pick1 = false;
     litArm.value = pick1 ? "yes" : "no";
     passed += Test("ternary_alias_sticky_literal_arms", litArm.value, "no");
 
     TempStringField ownedArm = default;
-    alias string a2 = fields.get(0);
+    string a2 = fields.get(0);
     string o1 = "yes-owned";
     string o2 = "no-owned";
     bool pick2 = false;
@@ -608,7 +603,7 @@ int testTernaryAliasStickyFieldStore()
     passed += Test("ternary_alias_sticky_owned_arms", ownedArm.value, "no-owned");
 
     TempStringField coalesceArm = default;
-    alias string a3 = fields.get(0);
+    string a3 = fields.get(0);
     string? maybeNull = nullptr;
     coalesceArm.value = maybeNull ?? "fallback";
     passed += Test("nullcoalesce_alias_sticky_literal_arm", coalesceArm.value, "fallback");
@@ -1704,12 +1699,11 @@ int testUniqueAssignmentOwnership()
         c.item = identityBool(true) ? a.item : b.item;
         passed += Test("unique_field_ternary_assign_id", c.item->id, 4);
         passed += Test("unique_field_ternary_assign_selected_nulled", a.item == nullptr ? 1 : 0, 1);
-        passed += Test("unique_field_ternary_assign_other_alive", b.item->id, 6);
         passed += Test("unique_field_ternary_assign_no_early_free", dtorCount, 0);
     }
     passed += Test("unique_field_ternary_assign_freed_once_each", dtorCount, 2);
 
-    // Null-coalescing joins preserve the selected unique-field source just like ternaries.
+    // Both null-coalescing arms may be consumed, like conditional local moves.
     dtorCount = 0;
     {
         UniqueBox a;
@@ -1722,7 +1716,6 @@ int testUniqueAssignmentOwnership()
         c.item = a.item ?? b.item;
         passed += Test("unique_field_coalesce_assign_id", c.item->id, 4);
         passed += Test("unique_field_coalesce_assign_selected_nulled", a.item == nullptr ? 1 : 0, 1);
-        passed += Test("unique_field_coalesce_assign_other_alive", b.item->id, 6);
         passed += Test("unique_field_coalesce_assign_no_early_free", dtorCount, 0);
     }
     passed += Test("unique_field_coalesce_assign_freed_once_each", dtorCount, 2);
@@ -1769,6 +1762,164 @@ int testUniqueAssignmentOwnership()
         passed += Test("deref_self_assign_no_free", dtorCount, 0);
     }
     passed += Test("deref_self_assign_freed_once", dtorCount, 1);
+
+    return passed;
+}
+
+int testT266SinkReinit()
+{
+    int passed = 0;
+
+    dtorCount = 0;
+    {
+        UniqueBox s;
+        s.item = t266MakeResource(301);
+        t266ConsumeResource(s.item);
+        s.item = t266MakeResource(302);
+        passed += Test("t266_direct_sink_reinit_value", s.item->id, 302);
+        passed += Test("t266_direct_sink_reinit_after_consume", dtorCount, 1);
+    }
+    passed += Test("t266_direct_sink_reinit_destroys_once", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        UniqueBox s;
+        s.item = t266MakeResource(303);
+        t266ConsumeResource(identityBool(true) ? s.item : nullptr);
+        s.item = t266MakeResource(304);
+        passed += Test("t266_ternary_sink_reinit_value", s.item->id, 304);
+        passed += Test("t266_ternary_sink_reinit_after_consume", dtorCount, 1);
+    }
+    passed += Test("t266_ternary_sink_reinit_destroys_once", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        UniqueBox s;
+        s.item = t266MakeResource(305);
+        t266ConsumeResource(s.item);
+        unique Resource* other = t266MakeResource(306);
+        s.item = move other;
+        passed += Test("t266_move_reinit_value", s.item->id, 306);
+        passed += Test("t266_move_reinit_after_consume", dtorCount, 1);
+    }
+    passed += Test("t266_move_reinit_destroys_once", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        UniqueBox s;
+        s.item = t266MakeResource(307);
+        t266ConsumeResource(s.item);
+        s.item = t266MakeResource(308);
+        passed += Test("t266_call_reinit_value", s.item->id, 308);
+        passed += Test("t266_call_reinit_after_consume", dtorCount, 1);
+    }
+    passed += Test("t266_call_reinit_destroys_once", dtorCount, 2);
+
+    // Accept set: after a ?: join of two field arms, comparing either arm and reassigning both is legal.
+    dtorCount = 0;
+    {
+        UniqueBox a;
+        UniqueBox b;
+        UniqueBox c;
+        a.item = t266MakeResource(309);
+        b.item = t266MakeResource(310);
+        c.item = identityBool(true) ? a.item : b.item;
+        passed += Test("t266_ternary_join_lhs_compares_null", a.item == nullptr ? 1 : 0, 1);
+        passed += Test("t266_ternary_join_rhs_compares_live", b.item != nullptr ? 1 : 0, 1);
+        b.item = t266MakeResource(311);
+        a.item = t266MakeResource(312);
+        passed += Test("t266_ternary_join_rhs_reinit_value", b.item->id, 311);
+        passed += Test("t266_ternary_join_lhs_reinit_value", a.item->id, 312);
+    }
+    passed += Test("t266_ternary_join_destroys_once", dtorCount, 4);
+
+    return passed;
+}
+
+struct T266RawHolder { Resource* raw = nullptr; };
+struct T266UniqueHolder { unique Resource* p = nullptr; };
+
+// Assignment into a unique local from a source that owns the pointee: every accepted form keeps one dtor.
+int testT266RawFieldAssign()
+{
+    int passed = 0;
+
+    dtorCount = 0;
+    {
+        T266RawHolder r = default;
+        unique Resource* owner = nullptr;
+        r.raw = new Resource();
+        r.raw->id = 61;
+        owner = move r.raw;
+        passed += Test("t266_assign_move_raw_value", owner->id, 61);
+    }
+    passed += Test("t266_assign_move_raw_one_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique Resource* owner = nullptr;
+        owner = new Resource();
+        owner->id = 62;
+        passed += Test("t266_assign_new_value", owner->id, 62);
+    }
+    passed += Test("t266_assign_new_one_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique Resource* owner = nullptr;
+        owner = t266MakeResource(63);
+        passed += Test("t266_assign_call_value", owner->id, 63);
+    }
+    passed += Test("t266_assign_call_one_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique Resource* owner = nullptr;
+        unique Resource* other = new Resource();
+        other->id = 64;
+        owner = other;
+        passed += Test("t266_assign_unique_value", owner->id, 64);
+    }
+    passed += Test("t266_assign_unique_one_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique Resource* owner = nullptr;
+        unique Resource* other = new Resource();
+        other->id = 65;
+        owner = move other;
+        passed += Test("t266_assign_move_unique_value", owner->id, 65);
+    }
+    passed += Test("t266_assign_move_unique_one_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        T266UniqueHolder u = default;
+        unique Resource* owner = nullptr;
+        u.p = new Resource();
+        u.p->id = 66;
+        owner = u.p;
+        passed += Test("t266_assign_unique_field_value", owner->id, 66);
+    }
+    passed += Test("t266_assign_unique_field_one_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* raw = new Resource();
+        raw->id = 67;
+        unique Resource* owner = nullptr;
+        owner = raw;
+        passed += Test("t266_assign_owning_raw_local_value", owner->id, 67);
+    }
+    passed += Test("t266_assign_owning_raw_local_one_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique Resource* owner = new Resource();
+        owner = nullptr;
+        passed += Test("t266_assign_nullptr_is_null", owner == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("t266_assign_nullptr_one_dtor", dtorCount, 1);
 
     return passed;
 }
@@ -12824,6 +12975,732 @@ int t143EarlyUses()
     return *u + (pn.q == nullptr ? 0 : 1) + hd.r;
 }
 
+// Round 3: a re-init on both branches after a call-sink consume is live after the join; a sibling
+// re-init does not change the other field's path; a '?:' join of owned `new` arms still adopts.
+struct T266Nest { UniqueBox b = default; UniqueBox c = default; };
+int testT266RoundThree()
+{
+    int passed = 0;
+
+    dtorCount = 0;
+    {
+        UniqueBox s = default;
+        s.item = t266MakeResource(401);
+        t266ConsumeResource(s.item);
+        if (identityBool(true)) { s.item = t266MakeResource(402); }
+        else { s.item = t266MakeResource(403); }
+        passed += Test("t266_r3_both_branch_reinit_value", s.item->id, 402);
+    }
+    passed += Test("t266_r3_both_branch_reinit_destroys_once", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        T266Nest o = default;
+        o.b.item = t266MakeResource(411);
+        o.c.item = t266MakeResource(412);
+        t266ConsumeResource(o.b.item);
+        o.c.item = t266MakeResource(413);
+        passed += Test("t266_r3_sibling_reinit_value", o.c.item->id, 413);
+    }
+    passed += Test("t266_r3_sibling_reinit_destroys_once", dtorCount, 3);
+
+    dtorCount = 0;
+    {
+        unique Resource* owner = nullptr;
+        owner = identityBool(true) ? new Resource() : nullptr;
+        owner->id = 421;
+        passed += Test("t266_r3_owning_new_join_value", owner->id, 421);
+    }
+    passed += Test("t266_r3_owning_new_join_one_dtor", dtorCount, 1);
+
+    return passed;
+}
+
+// Round 4: a re-init inside a loop body (and the zero-trip exit) or in every arm of a switch is live
+// after the statement; a consume and re-init inside one iteration stays legal.
+int testT266RoundFour()
+{
+    int passed = 0;
+
+    dtorCount = 0;
+    {
+        UniqueBox s = default;
+        s.item = t266MakeResource(501);
+        t266ConsumeResource(s.item);
+        s.item = t266MakeResource(502);
+        int n = 0;
+        while (n < 2) { t266ConsumeResource(s.item); s.item = t266MakeResource(503 + n); n++; }
+        passed += Test("t266_r4_while_iter_value", s.item->id, 504);
+    }
+    passed += Test("t266_r4_while_iter_dtors", dtorCount, 4);
+
+    dtorCount = 0;
+    {
+        UniqueBox s = default;
+        s.item = t266MakeResource(511);
+        t266ConsumeResource(s.item);
+        int k = 1;
+        switch (k) { case 3: s.item = t266MakeResource(512); break; default: s.item = t266MakeResource(513); break; }
+        passed += Test("t266_r4_switch_default_value", s.item->id, 513);
+    }
+    passed += Test("t266_r4_switch_default_dtors", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        UniqueBox s = default;
+        s.item = t266MakeResource(521);
+        t266ConsumeResource(s.item);
+        int n = 0;
+        do { s.item = t266MakeResource(522 + n); n++; } while (n < 2);
+        passed += Test("t266_r4_do_while_value", s.item->id, 523);
+    }
+    passed += Test("t266_r4_do_while_dtors", dtorCount, 3);
+
+    dtorCount = 0;
+    {
+        UniqueBox s = default;
+        s.item = t266MakeResource(531);
+        t266ConsumeResource(s.item);
+        s.item = t266MakeResource(532);
+        int k = 1;
+        switch (k) { case 3: k = 0; break; }
+        passed += Test("t266_r4_switch_nodefault_value", s.item->id, 532);
+    }
+    passed += Test("t266_r4_switch_nodefault_dtors", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        UniqueBox s = default;
+        s.item = t266MakeResource(541);
+        t266ConsumeResource(s.item);
+        while (true) { s.item = t266MakeResource(542); break; }
+        passed += Test("t266_r4_while_true_value", s.item->id, 542);
+    }
+    passed += Test("t266_r4_while_true_dtors", dtorCount, 2);
+
+    return passed;
+}
+
+struct T277LocalBox { unique Resource* item = nullptr; };
+T277LocalBox t277MakeLocalBox(int id)
+{
+    T277LocalBox box = default;
+    box.item = t266MakeResource(id);
+    return box;
+}
+void t277ConsumeLocalBox(move T277LocalBox box) { }
+
+int testT277LocalIfElse(int pick, int falseId, int trueId,
+    const char* valueName, const char* liveName, const char* dtorName)
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        unique Resource* owner = t266MakeResource(2600);
+        t266ConsumeResource(owner);
+        if (pick) owner = t266MakeResource(trueId);
+        else owner = t266MakeResource(falseId);
+        passed += Test(valueName, owner->id, pick ? trueId : falseId);
+        passed += Test(liveName, dtorCount, 1);
+    }
+    passed += Test(dtorName, dtorCount, 2);
+    return passed;
+}
+
+int testT277LocalPreIfReinit(int pick, const char* valueName,
+    const char* liveName, const char* dtorName)
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        unique Resource* owner = t266MakeResource(2610);
+        t266ConsumeResource(owner);
+        owner = t266MakeResource(2611);
+        if (pick) owner = t266MakeResource(2612);
+        passed += Test(valueName, owner->id, pick ? 2612 : 2611);
+        passed += Test(liveName, dtorCount, pick ? 2 : 1);
+    }
+    passed += Test(dtorName, dtorCount, pick ? 3 : 2);
+    return passed;
+}
+
+int testT277LocalAfterIfReinit(int pick, const char* valueName,
+    const char* liveName, const char* dtorName)
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        unique Resource* owner = t266MakeResource(2620);
+        t266ConsumeResource(owner);
+        if (pick) owner = t266MakeResource(2621);
+        owner = t266MakeResource(2622);
+        passed += Test(valueName, owner->id, 2622);
+        passed += Test(liveName, dtorCount, pick ? 2 : 1);
+    }
+    passed += Test(dtorName, dtorCount, pick ? 3 : 2);
+    return passed;
+}
+
+int testT277DoWhileReinit(int pick)
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        unique Resource* owner = t266MakeResource(2630);
+        t266ConsumeResource(owner);
+        int i = 0;
+        do { owner = t266MakeResource(2631 + i); i++; } while (i < pick + 1);
+        passed += Test("t277_do_while_local_value", owner->id, 2630 + pick + 1);
+        passed += Test("t277_do_while_local_live", dtorCount, pick + 1);
+    }
+    passed += Test("t277_do_while_local_dtors", dtorCount, pick + 2);
+    return passed;
+}
+
+int testT277WhileTrueReinit()
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        unique Resource* owner = t266MakeResource(2640);
+        t266ConsumeResource(owner);
+        while (true) { owner = t266MakeResource(2641); break; }
+        passed += Test("t277_while_true_local_value", owner->id, 2641);
+        passed += Test("t277_while_true_local_live", dtorCount, 1);
+    }
+    passed += Test("t277_while_true_local_dtors", dtorCount, 2);
+    // continue in an always-true loop re-tests a true condition: it is not an exit, so the read is live.
+    dtorCount = 0;
+    {
+        unique Resource* owner = t266MakeResource(2642);
+        t266ConsumeResource(owner);
+        int k = 0;
+        while (true) { k++; if (k < 2) continue; owner = t266MakeResource(2643); break; }
+        passed += Test("t277_while_true_continue_value", owner->id, 2643);
+    }
+    passed += Test("t277_while_true_continue_dtors", dtorCount, 2);
+    return passed;
+}
+
+int testT277SwitchEveryArm(int selected, int expectedId)
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        unique Resource* owner = t266MakeResource(2650);
+        t266ConsumeResource(owner);
+        switch (selected)
+        {
+            case 0: owner = t266MakeResource(2651); break;
+            case 1: owner = t266MakeResource(2652); break;
+            default: owner = t266MakeResource(2653); break;
+        }
+        passed += Test("t277_switch_every_local_arm_value", owner->id, expectedId);
+        passed += Test("t277_switch_every_local_arm_live", dtorCount, 1);
+    }
+    passed += Test("t277_switch_every_local_arm_dtors", dtorCount, 2);
+    return passed;
+}
+
+int testT277LibraryUniqueIfElse(int pick, const char* valueName,
+    const char* liveName, const char* dtorName)
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        unique<Resource> owner = makeLibraryUnique(2660);
+        consumeLibraryUnique(owner);
+        if (pick) owner = makeLibraryUnique(2662);
+        else owner = makeLibraryUnique(2661);
+        passed += Test(valueName, owner->id, pick ? 2662 : 2661);
+        passed += Test(liveName, dtorCount, 1);
+    }
+    passed += Test(dtorName, dtorCount, 2);
+    return passed;
+}
+
+int testT277StructIfElse(int pick, const char* valueName,
+    const char* liveName, const char* dtorName)
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        T277LocalBox owner = t277MakeLocalBox(2670);
+        t277ConsumeLocalBox(owner);
+        if (pick) owner = t277MakeLocalBox(2672);
+        else owner = t277MakeLocalBox(2671);
+        passed += Test(valueName, owner.item->id, pick ? 2672 : 2671);
+        passed += Test(liveName, dtorCount, 1);
+    }
+    passed += Test(dtorName, dtorCount, 2);
+    return passed;
+}
+
+int testT277ForConstantTrue()
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        UniqueBox owner = default;
+        owner.item = t266MakeResource(2680);
+        t266ConsumeResource(owner.item);
+        int i = 0;
+        for (; 1 == 1; i++) { owner.item = t266MakeResource(2681); break; }
+        passed += Test("t277_for_constant_true_field_value", owner.item->id, 2681);
+        passed += Test("t277_for_constant_true_field_live", dtorCount, 1);
+    }
+    passed += Test("t277_for_constant_true_field_dtors", dtorCount, 2);
+    return passed;
+}
+
+int testT277ForNoUpdate()
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        unique Resource* owner = t266MakeResource(2690);
+        t266ConsumeResource(owner);
+        for (; true;) { owner = t266MakeResource(2691); break; }
+        passed += Test("t277_for_no_update_local_value", owner->id, 2691);
+        passed += Test("t277_for_no_update_local_live", dtorCount, 1);
+    }
+    passed += Test("t277_for_no_update_local_dtors", dtorCount, 2);
+    return passed;
+}
+
+int testT277LocalReinitAccept()
+{
+    int passed = 0;
+    passed += testT277LocalIfElse(0, 2601, 2602,
+        "t277_local_ifelse_false_value", "t277_local_ifelse_false_live", "t277_local_ifelse_false_dtors");
+    passed += testT277LocalIfElse(1, 2601, 2602,
+        "t277_local_ifelse_true_value", "t277_local_ifelse_true_live", "t277_local_ifelse_true_dtors");
+    passed += testT277LocalPreIfReinit(0,
+        "t277_local_preif_false_value", "t277_local_preif_false_live", "t277_local_preif_false_dtors");
+    passed += testT277LocalPreIfReinit(1,
+        "t277_local_preif_true_value", "t277_local_preif_true_live", "t277_local_preif_true_dtors");
+    passed += testT277LocalAfterIfReinit(0,
+        "t277_local_afterif_false_value", "t277_local_afterif_false_live", "t277_local_afterif_false_dtors");
+    passed += testT277LocalAfterIfReinit(1,
+        "t277_local_afterif_true_value", "t277_local_afterif_true_live", "t277_local_afterif_true_dtors");
+    passed += testT277DoWhileReinit(0);
+    passed += testT277DoWhileReinit(1);
+    passed += testT277WhileTrueReinit();
+    passed += testT277SwitchEveryArm(0, 2651);
+    passed += testT277SwitchEveryArm(1, 2652);
+    passed += testT277SwitchEveryArm(2, 2653);
+    passed += testT277LibraryUniqueIfElse(0,
+        "t277_library_unique_false_value", "t277_library_unique_false_live", "t277_library_unique_false_dtors");
+    passed += testT277LibraryUniqueIfElse(1,
+        "t277_library_unique_true_value", "t277_library_unique_true_live", "t277_library_unique_true_dtors");
+    passed += testT277StructIfElse(0,
+        "t277_struct_ifelse_false_value", "t277_struct_ifelse_false_live", "t277_struct_ifelse_false_dtors");
+    passed += testT277StructIfElse(1,
+        "t277_struct_ifelse_true_value", "t277_struct_ifelse_true_live", "t277_struct_ifelse_true_dtors");
+    passed += testT277ForConstantTrue();
+    passed += testT277ForNoUpdate();
+    return passed;
+}
+
+struct T281ArrayBox { unique Resource* item = nullptr; };
+
+int testT281ArrayElementAcceptSet()
+{
+    int passed = 0;
+
+    dtorCount = 0;
+    {
+        T281ArrayBox[2] arr = default;
+        arr[0].item = t266MakeResource(2811);
+        t266ConsumeResource(arr[0].item);
+        arr[0].item = t266MakeResource(2812);
+        passed += Test("t281_same_index_reinit_value", arr[0].item->id, 2812);
+        passed += Test("t281_same_index_reinit_after_move_dtor", dtorCount, 1);
+    }
+    passed += Test("t281_same_index_reinit_scope_dtor", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        T281ArrayBox[2] arr = default;
+        arr[0].item = t266MakeResource(2821);
+        arr[1].item = t266MakeResource(2822);
+        t266ConsumeResource(arr[0].item);
+        arr[0].item = t266MakeResource(2823);
+        t266ConsumeResource(arr[1].item);
+        arr[1].item = t266MakeResource(2824);
+        passed += Test("t281_distinct_reinit_index_zero_value", arr[0].item->id, 2823);
+        passed += Test("t281_distinct_reinit_index_one_value", arr[1].item->id, 2824);
+        passed += Test("t281_distinct_reinit_after_moves_dtors", dtorCount, 2);
+    }
+    passed += Test("t281_distinct_reinit_scope_dtors", dtorCount, 4);
+
+    dtorCount = 0;
+    {
+        T281ArrayBox[2] arr = default;
+        arr[0].item = t266MakeResource(2831);
+        arr[1].item = t266MakeResource(2832);
+        t266ConsumeResource(arr[0].item);
+        passed += Test("t281_live_sibling_after_move_value", arr[1].item->id, 2832);
+        passed += Test("t281_live_sibling_after_move_dtor", dtorCount, 1);
+    }
+    passed += Test("t281_live_sibling_scope_dtor", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        T281ArrayBox[2] arr = default;
+        arr[0].item = t266MakeResource(2841);
+        arr[1].item = t266MakeResource(2842);
+        passed += Test("t281_never_moved_index_zero_value", arr[0].item->id, 2841);
+        passed += Test("t281_never_moved_index_one_value", arr[1].item->id, 2842);
+    }
+    passed += Test("t281_never_moved_scope_dtors", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        T281ArrayBox[2] arr = default;
+        arr[1 - 1].item = t266MakeResource(2851);
+        t266ConsumeResource(arr[0].item);
+        arr[(0)].item = t266MakeResource(2852);
+        passed += Test("t281_folded_index_reinit_value", arr[0].item->id, 2852);
+        passed += Test("t281_folded_index_reinit_after_move_dtor", dtorCount, 1);
+    }
+    passed += Test("t281_folded_index_scope_dtor", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        T281ArrayBox[2] arr = default;
+        arr[0].item = t266MakeResource(2861);
+        arr[1].item = t266MakeResource(2862);
+        int i = 1;
+        t266ConsumeResource(arr[i].item);
+        arr[0].item = t266MakeResource(2863);
+        passed += Test("t281_dynamic_move_constant_reinit_value", arr[0].item->id, 2863);
+        passed += Test("t281_dynamic_move_constant_reinit_live_dtors", dtorCount, 2);
+    }
+    passed += Test("t281_dynamic_move_constant_reinit_scope_dtors", dtorCount, 3);
+
+    return passed;
+}
+
+int testT281PlainOwnerArrayAcceptSet()
+{
+    int passed = 0;
+
+    dtorCount = 0;
+    {
+        unique Resource*[2] arr = default;
+        arr[0] = t266MakeResource(2813);
+        t266ConsumeResource(arr[0]);
+        arr[0] = t266MakeResource(2814);
+        passed += Test("t281_plain_same_index_reinit_value", arr[0]->id, 2814);
+        passed += Test("t281_plain_same_index_reinit_after_move_dtor", dtorCount, 1);
+    }
+    passed += Test("t281_plain_same_index_reinit_scope_dtor", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        unique Resource*[2] arr = default;
+        arr[0] = t266MakeResource(2825);
+        arr[1] = t266MakeResource(2826);
+        t266ConsumeResource(arr[0]);
+        arr[0] = t266MakeResource(2827);
+        t266ConsumeResource(arr[1]);
+        arr[1] = t266MakeResource(2828);
+        passed += Test("t281_plain_distinct_reinit_index_zero", arr[0]->id, 2827);
+        passed += Test("t281_plain_distinct_reinit_index_one", arr[1]->id, 2828);
+        passed += Test("t281_plain_distinct_reinit_after_moves_dtors", dtorCount, 2);
+    }
+    passed += Test("t281_plain_distinct_reinit_scope_dtors", dtorCount, 4);
+
+    dtorCount = 0;
+    {
+        unique Resource*[2] arr = default;
+        arr[0] = t266MakeResource(2833);
+        arr[1] = t266MakeResource(2834);
+        t266ConsumeResource(arr[0]);
+        passed += Test("t281_plain_live_sibling_after_move", arr[1]->id, 2834);
+        passed += Test("t281_plain_live_sibling_after_move_dtor", dtorCount, 1);
+    }
+    passed += Test("t281_plain_live_sibling_scope_dtor", dtorCount, 2);
+
+    return passed;
+}
+
+// Round 3: a null comparison is exempt only for the moved slot's own load. Plain and field slots, the
+// parenthesized null, the reversed order and a nested owner path compare as null; a live sibling does not.
+struct T281NullBox { unique Resource* p = nullptr; };
+struct T281NullOwner { T281NullBox[2] a = default; };
+
+int testT281NullCompareAcceptSet()
+{
+    int passed = 0;
+
+    dtorCount = 0;
+    {
+        unique Resource*[2] a = default;
+        a[0] = t266MakeResource(2841);
+        t266ConsumeResource(a[0]);
+        int eq = a[0] == nullptr ? 1 : 0;
+        int ne = a[0] != nullptr ? 1 : 0;
+        int rev = nullptr == a[0] ? 1 : 0;
+        passed += Test("t281_null_plain_eq", eq, 1);
+        passed += Test("t281_null_plain_ne", ne, 0);
+        passed += Test("t281_null_plain_rev", rev, 1);
+        int castEq = (Resource*)a[0] == nullptr ? 1 : 0;
+        passed += Test("t281_null_plain_cast_eq", castEq, 1);
+        passed += Test("t281_null_plain_dtor", dtorCount, 1);
+    }
+    passed += Test("t281_null_plain_scope_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        T281NullBox[2] b = default;
+        b[0].p = t266MakeResource(2851);
+        t266ConsumeResource(b[0].p);
+        int eq = b[0].p == (nullptr) ? 1 : 0;
+        int rev = nullptr == (b[0].p) ? 1 : 0;
+        int ne = (b[0].p) != (nullptr) ? 1 : 0;
+        passed += Test("t281_null_field_paren_eq", eq, 1);
+        passed += Test("t281_null_field_paren_rev", rev, 1);
+        passed += Test("t281_null_field_paren_ne", ne, 0);
+        int castEq = (Resource*)b[0].p == nullptr ? 1 : 0;
+        int voidEq = (void*)b[0].p == nullptr ? 1 : 0;
+        passed += Test("t281_null_field_cast_eq", castEq, 1);
+        passed += Test("t281_null_field_void_cast_eq", voidEq, 1);
+        passed += Test("t281_null_field_paren_dtor", dtorCount, 1);
+    }
+    passed += Test("t281_null_field_paren_scope_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        T281NullOwner o = default;
+        o.a[0].p = t266MakeResource(2861);
+        o.a[1].p = t266MakeResource(2862);
+        t266ConsumeResource(o.a[0].p);
+        int eq = o.a[0].p == nullptr ? 1 : 0;
+        int rev = (nullptr) == o.a[0].p ? 1 : 0;
+        int live = o.a[1].p == nullptr ? 1 : 0;
+        passed += Test("t281_null_nested_eq", eq, 1);
+        passed += Test("t281_null_nested_rev", rev, 1);
+        passed += Test("t281_null_nested_live_sibling", live, 0);
+        passed += Test("t281_null_nested_live_value", o.a[1].p->id, 2862);
+        passed += Test("t281_null_nested_dtor", dtorCount, 1);
+    }
+    passed += Test("t281_null_nested_scope_dtor", dtorCount, 2);
+
+    return passed;
+}
+
+int testT281ArrayIfElseReinit(int pick, int expectedId)
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        T281ArrayBox[2] arr = default;
+        arr[0].item = t266MakeResource(2871);
+        t266ConsumeResource(arr[0].item);
+        if (pick) arr[0].item = t266MakeResource(2872);
+        else arr[0].item = t266MakeResource(2873);
+        passed += Test("t281_if_else_same_path_reinit_value", arr[0].item->id, expectedId);
+        passed += Test("t281_if_else_same_path_reinit_live_dtor", dtorCount, 1);
+    }
+    passed += Test("t281_if_else_same_path_reinit_scope_dtor", dtorCount, 2);
+    return passed;
+}
+
+int testT281ArraySwitchReinit(int selected, int expectedId)
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        T281ArrayBox[2] arr = default;
+        arr[0].item = t266MakeResource(2881);
+        t266ConsumeResource(arr[0].item);
+        switch (selected)
+        {
+            case 0: arr[0].item = t266MakeResource(2882); break;
+            case 1: arr[0].item = t266MakeResource(2883); break;
+            default: arr[0].item = t266MakeResource(2884); break;
+        }
+        passed += Test("t281_switch_every_arm_same_path_value", arr[0].item->id, expectedId);
+        passed += Test("t281_switch_every_arm_same_path_live_dtor", dtorCount, 1);
+    }
+    passed += Test("t281_switch_every_arm_same_path_scope_dtor", dtorCount, 2);
+    return passed;
+}
+
+int testT281ArrayLoopReinitAccept()
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        T281ArrayBox[2] arr = default;
+        arr[0].item = t266MakeResource(2891);
+        t266ConsumeResource(arr[0].item);
+        int i = 0;
+        do { arr[0].item = t266MakeResource(2892 + i); i++; } while (i < 1);
+        passed += Test("t281_do_while_same_path_reinit_value", arr[0].item->id, 2892);
+        passed += Test("t281_do_while_same_path_reinit_live_dtor", dtorCount, 1);
+    }
+    passed += Test("t281_do_while_same_path_reinit_scope_dtor", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        T281ArrayBox[2] arr = default;
+        arr[0].item = t266MakeResource(2893);
+        t266ConsumeResource(arr[0].item);
+        while (true) { arr[0].item = t266MakeResource(2894); break; }
+        passed += Test("t281_while_true_same_path_reinit_value", arr[0].item->id, 2894);
+        passed += Test("t281_while_true_same_path_reinit_live_dtor", dtorCount, 1);
+    }
+    passed += Test("t281_while_true_same_path_reinit_scope_dtor", dtorCount, 2);
+    return passed;
+}
+
+struct T281TaskSlot { unique Resource* h = nullptr; };
+
+int testT281DynamicTaskDrain()
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        T281TaskSlot[3] handles = default;
+        handles[0].h = t266MakeResource(2811);
+        handles[1].h = t266MakeResource(2812);
+        handles[2].h = t266MakeResource(2813);
+        int w = 0;
+        int sum = 0;
+        while (w < 3)
+        {
+            Resource* h = move handles[w].h;
+            sum = sum + h->id;
+            delete h;
+            w = w + 1;
+        }
+        passed += Test("t281_dynamic_task_drain_values", sum, 8436);
+        passed += Test("t281_dynamic_task_drain_loop_dtors", dtorCount, 3);
+    }
+    passed += Test("t281_dynamic_task_drain_scope_dtors", dtorCount, 3);
+    return passed;
+}
+
+int testT281DictionaryRehashMove()
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        unique Resource*[3] oldKeys = default;
+        unique Resource*[3] newKeys = default;
+        oldKeys[0] = t266MakeResource(2821);
+        oldKeys[1] = t266MakeResource(2822);
+        oldKeys[2] = t266MakeResource(2823);
+        int[3] occupied = default;
+        int i = 0;
+        while (i < 3)
+        {
+            int slot = oldKeys[i]->id % 3;
+            while (occupied[slot] != 0)
+                slot = (slot + 1) % 3;
+            newKeys[slot] = move oldKeys[i];
+            occupied[slot] = 1;
+            i = i + 1;
+        }
+        passed += Test("t281_dictionary_rehash_slot_zero", newKeys[0]->id, 2823);
+        passed += Test("t281_dictionary_rehash_slot_one", newKeys[1]->id, 2821);
+        passed += Test("t281_dictionary_rehash_slot_two", newKeys[2]->id, 2822);
+        passed += Test("t281_dictionary_rehash_live_dtors", dtorCount, 0);
+    }
+    passed += Test("t281_dictionary_rehash_scope_dtors", dtorCount, 3);
+    return passed;
+}
+
+// T289: a unique field or element re-initialized after a consume is a live argument again, and the
+// sibling field, the whole struct by pointer and a method argument are not refused.
+struct T289Box { unique Resource* item = nullptr; };
+struct T289Pair { unique Resource* a = nullptr; unique Resource* b = nullptr; };
+struct T289Reader { int peek(Resource* r) { return r->id; } };
+int t289ReadResource(Resource* r) { return r->id; }
+int t289BoxEmpty(T289Box* box) { return box->item == nullptr ? 1 : 0; }
+
+int testT289CallArgAcceptSet()
+{
+    int passed = 0;
+
+    dtorCount = 0;
+    {
+        T289Box b = default;
+        b.item = t266MakeResource(2901);
+        t266ConsumeResource(b.item);
+        b.item = t266MakeResource(2902);
+        passed += Test("t289_arg_after_reinit_value", t289ReadResource(b.item), 2902);
+        passed += Test("t289_arg_after_reinit_dtor", dtorCount, 1);
+    }
+    passed += Test("t289_arg_after_reinit_scope_dtor", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        T289Pair p = default;
+        p.a = t266MakeResource(2911);
+        p.b = t266MakeResource(2912);
+        t266ConsumeResource(p.a);
+        passed += Test("t289_sibling_arg_value", t289ReadResource(p.b), 2912);
+        passed += Test("t289_sibling_arg_dtor", dtorCount, 1);
+    }
+    passed += Test("t289_sibling_arg_scope_dtor", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        T281ArrayBox[2] arr = default;
+        arr[0].item = t266MakeResource(2921);
+        arr[1].item = t266MakeResource(2922);
+        t266ConsumeResource(arr[0].item);
+        passed += Test("t289_element_sibling_arg_value", t289ReadResource(arr[1].item), 2922);
+        arr[0].item = t266MakeResource(2923);
+        passed += Test("t289_element_reinit_arg_value", t289ReadResource(arr[0].item), 2923);
+        passed += Test("t289_element_arg_dtor", dtorCount, 1);
+    }
+    passed += Test("t289_element_arg_scope_dtor", dtorCount, 3);
+
+    dtorCount = 0;
+    {
+        T289Box b = default;
+        b.item = t266MakeResource(2931);
+        t266ConsumeResource(b.item);
+        T289Reader reader = default;
+        passed += Test("t289_whole_box_empty_before_reinit", t289BoxEmpty(&b), 1);
+        b.item = t266MakeResource(2932);
+        passed += Test("t289_method_arg_after_reinit_value", reader.peek(b.item), 2932);
+        passed += Test("t289_whole_box_after_reinit", t289BoxEmpty(&b), 0);
+        passed += Test("t289_method_arg_dtor", dtorCount, 1);
+    }
+    passed += Test("t289_method_arg_scope_dtor", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        T289Box b = default;
+        b.item = t266MakeResource(2941);
+        t266ConsumeResource(b.item);
+        bool flag = true;
+        if (flag) { b.item = t266MakeResource(2942); } else { b.item = t266MakeResource(2943); }
+        passed += Test("t289_both_branch_reinit_arg_value", t289ReadResource(b.item), 2942);
+        passed += Test("t289_both_branch_reinit_dtor", dtorCount, 1);
+    }
+    passed += Test("t289_both_branch_reinit_scope_dtor", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        T289Box b = default;
+        b.item = t266MakeResource(2951);
+        t266ConsumeResource(b.item);
+        b.item = t266MakeResource(2952);
+        t266ConsumeResource(b.item);
+        passed += Test("t289_move_arg_after_reinit_dtor", dtorCount, 2);
+    }
+    passed += Test("t289_move_arg_after_reinit_scope_dtor", dtorCount, 2);
+
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -13016,8 +13893,6 @@ extern int main()
     passed += testTempStringFieldStores();
     total += 4;
 
-    passed += testAliasStringFieldStore();
-    total += 2;
 
     passed += testTernaryAliasStickyFieldStore();
     total += 4;
@@ -13190,7 +14065,41 @@ extern int main()
     total += 22;  // T259 legs in testUniqueField
 
     passed += testUniqueAssignmentOwnership();
-    total += 25;
+    total += 23;
+
+    passed += testT266SinkReinit();
+    total += 17;
+
+    passed += testT266RawFieldAssign();
+    total += 16;
+
+    passed += testT266RoundThree();
+    total += 6;
+
+    passed += testT266RoundFour();
+    total += 10;
+
+    passed += testT277LocalReinitAccept();
+    total += 56;
+
+    passed += testT281ArrayElementAcceptSet();
+    total += 19;
+    passed += testT281PlainOwnerArrayAcceptSet();
+    total += 10;
+    passed += testT281ArrayIfElseReinit(0, 2873);
+    passed += testT281ArrayIfElseReinit(1, 2872);
+    passed += testT281ArraySwitchReinit(0, 2882);
+    passed += testT281ArraySwitchReinit(1, 2883);
+    passed += testT281ArraySwitchReinit(2, 2884);
+    passed += testT281ArrayLoopReinitAccept();
+    total += 21;
+    passed += testT281DynamicTaskDrain();
+    passed += testT281DictionaryRehashMove();
+    total += 8;
+    passed += testT281NullCompareAcceptSet();
+    total += 19;
+    passed += testT289CallArgAcceptSet();
+    total += 20;
 
     passed += testParamStringToField();
     total += 1;
@@ -13609,6 +14518,8 @@ extern int main()
     total += 34;
     passed += testT256AliasCallField();
     total += 34;
+    passed += testT273ForInitScope();
+    total += 28;
     passed += testT207RawLaunder();
     total += 19;
     passed += testT216RebindLocalNotTaken();
@@ -13630,6 +14541,8 @@ extern int main()
 
     passed += testT212AliasReturnAcceptSet();
     total += 15;
+    passed += testT274AliasReturnAcceptSet();
+    total += 7;
 
     passed += testT227SlotMoveSinks();
     total += 19;
@@ -14560,6 +15473,98 @@ int testT256AliasCallField()
     return passed;
 }
 
+// T273: a for-init owner is freed exactly once on every exit edge (break, normal exit, return,
+// nested break; continue keeps it alive). An `alias` for-init binds its receiver temp for the loop.
+int gT273Dtors = 0;
+int gT273Sum = 0;
+struct T273R { int v = 3; ~T273R() { gT273Dtors = gT273Dtors + 1; v = -999; } };
+struct T273Plain { int v = 3; ~T273Plain() { gT273Dtors = gT273Dtors + 1; } };
+unique<T273R> t273Mk() { return unique<T273R>(new T273R()); }
+void t273Eat(move unique<T273R> x) { }
+void t273Break() { int n = 0; for (unique<T273R> u = t273Mk(); n < 3; n = n + 1) { break; } }
+void t273Normal() { int n = 0; for (unique<T273R> u = t273Mk(); n < 3; n = n + 1) { } }
+int t273Return() { int n = 0; for (unique<T273R> u = t273Mk(); n < 3; n = n + 1) { return 7; } return 0; }
+void t273Continue() { int n = 0; for (unique<T273R> u = t273Mk(); n < 3; n = n + 1) { continue; } }
+void t273ContinueBreak() { int n = 0; for (unique<T273R> u = t273Mk(); n < 3; n = n + 1) { if (n == 0) { continue; } break; } }
+void t273Nested() { int m = 0; for (unique<T273R> o = t273Mk(); m < 1; m = m + 1) { int n = 0; for (unique<T273R> u = t273Mk(); n < 3; n = n + 1) { break; } break; } }
+void t273TwoDecl() { int n = 0; for (unique<T273R> a = t273Mk(), b = t273Mk(); n < 3; n = n + 1) { break; } }
+void t273RawPtr() { int n = 0; for (unique T273R* p = new T273R(); n < 3; n = n + 1) { break; } }
+void t273Plain() { int n = 0; for (T273Plain r = T273Plain(); n < 3; n = n + 1) { break; } }
+// list<T> add(T()) runs the temporary's dtor as well as the element's: two per add, same as the no-break form.
+void t273List() { int n = 0; for (list<T273Plain> l = default; n < 3; n = n + 1) { l.add(T273Plain()); break; } }
+void t273Move(int flag) { int n = 0; for (unique<T273R> u = t273Mk(); n < 3; n = n + 1) { if (flag == 0) { break; } t273Eat(move u); break; } }
+void t273AliasBreak() { for (alias int x = t273Mk()->v; gT273Dtors < 1; gT273Dtors = gT273Dtors + 0) { gT273Sum = gT273Sum + x; break; } }
+void t273AliasNormal() { int n = 0; for (alias int x = t273Mk()->v; n < 3; n = n + 1) { gT273Sum = gT273Sum + x; } }
+int t273AliasReturn() { int n = 0; for (alias int x = t273Mk()->v; n < 3; n = n + 1) { return x; } return 0; }
+// T284: a for-init owning temp dies once at the end of the init, not in the condition block (which
+// runs every iteration). Body temps keep their own per-statement free.
+void t284Init() { int s = 0; for (int x = t273Mk()->v; s < 3; s = s + 1) { } }
+void t284Value() { int s = 0; for (int x = t273Mk()->v; s < 3; s = s + 1) { gT273Sum = gT273Sum + x; } }
+void t284TwoDecl() { int s = 0; for (int a = t273Mk()->v, b = t273Mk()->v; s < 3; s = s + 1) { } }
+void t284Break() { int s = 0; for (int x = t273Mk()->v; s < 3; s = s + 1) { break; } }
+void t284Continue() { int s = 0; for (int x = t273Mk()->v; s < 2; s = s + 1) { continue; } }
+void t284Nested() { int m = 0; for (int y = 0; m < 2; m = m + 1) { int n = 0; for (int x = t273Mk()->v; n < 1; n = n + 1) { } } }
+void t284ZeroTrip() { int s = 0; for (int x = t273Mk()->v; s < 0; s = s + 1) { } }
+void t284InitAndBody() { int s = 0; for (int x = t273Mk()->v; s < 3; s = s + 1) { gT273Sum = gT273Sum + t273Mk()->v; } }
+void t273Reset() { gT273Dtors = 0; gT273Sum = 0; }
+
+int testT273ForInitScope()
+{
+    int passed = 0;
+    t273Reset(); t273Break();
+    passed += Test("t273_break_dtors", gT273Dtors, 1);
+    t273Reset(); t273Normal();
+    passed += Test("t273_normal_dtors", gT273Dtors, 1);
+    t273Reset(); t273Return();
+    passed += Test("t273_return_dtors", gT273Dtors, 1);
+    passed += Test("t273_return_value", t273Return(), 7);
+    t273Reset(); t273Continue();
+    passed += Test("t273_continue_dtors", gT273Dtors, 1);
+    t273Reset(); t273ContinueBreak();
+    passed += Test("t273_continue_break_dtors", gT273Dtors, 1);
+    t273Reset(); t273Nested();
+    passed += Test("t273_nested_dtors", gT273Dtors, 2);
+    t273Reset(); t273TwoDecl();
+    passed += Test("t273_two_decl_dtors", gT273Dtors, 2);
+    t273Reset(); t273RawPtr();
+    passed += Test("t273_raw_ptr_dtors", gT273Dtors, 1);
+    t273Reset(); t273Plain();
+    passed += Test("t273_plain_struct_dtors", gT273Dtors, 1);
+    t273Reset(); t273List();
+    passed += Test("t273_list_dtors", gT273Dtors, 2);
+    t273Reset(); t273Move(0);
+    passed += Test("t273_move_break_dtors", gT273Dtors, 1);
+    t273Reset(); t273Move(1);
+    passed += Test("t273_move_then_break_dtors", gT273Dtors, 1);
+    t273Reset(); t273AliasBreak();
+    passed += Test("t273_alias_break_dtors", gT273Dtors, 1);
+    passed += Test("t273_alias_break_value", gT273Sum, 3);
+    t273Reset(); t273AliasNormal();
+    passed += Test("t273_alias_normal_dtors", gT273Dtors, 1);
+    passed += Test("t273_alias_normal_value", gT273Sum, 9);
+    t273Reset();
+    passed += Test("t273_alias_return_value", t273AliasReturn(), 3);
+    passed += Test("t273_alias_return_dtors", gT273Dtors, 1);
+    t273Reset(); t284Init();
+    passed += Test("t284_init_temp_dtors", gT273Dtors, 1);
+    t273Reset(); t284Value();
+    passed += Test("t284_init_temp_value", gT273Sum, 9);
+    t273Reset(); t284TwoDecl();
+    passed += Test("t284_two_declarator_dtors", gT273Dtors, 2);
+    t273Reset(); t284Break();
+    passed += Test("t284_break_dtors", gT273Dtors, 1);
+    t273Reset(); t284Continue();
+    passed += Test("t284_continue_dtors", gT273Dtors, 1);
+    t273Reset(); t284Nested();
+    passed += Test("t284_nested_init_dtors", gT273Dtors, 2);
+    t273Reset(); t284ZeroTrip();
+    passed += Test("t284_zero_trip_dtors", gT273Dtors, 1);
+    t273Reset(); t284InitAndBody();
+    passed += Test("t284_init_and_body_dtors", gT273Dtors, 4);
+    passed += Test("t284_init_and_body_value", gT273Sum, 9);
+    return passed;
+}
+
 int testT207RawLaunder()
 {
     int passed = 0;
@@ -14684,6 +15689,44 @@ int testT212AliasReturnAcceptSet()
         passed += Test("t212_owned_list_index_store_value", values[0].boxId(), 59);
     }
     passed += Test("t212_owned_list_index_store_frees_both_once", dtorCount, 2);
+    return passed;
+}
+
+// T274 accept set: alias value returns whose borrow root is caller-owned, global or heap storage
+// keep compiling; only a receiver the callee frame destroys on return is refused (err_alias_return_call_temp).
+struct T274Pt { int v = 5; };
+struct T274Box { unique<T274Pt> u = default; };
+unique<T274Pt> t274Mk() { return unique<T274Pt>(new T274Pt()); }
+unique<T274Pt> gT274U;
+T274Pt[2] gT274Arr;
+alias int t274PtrField(T274Pt* r) { return r->v; }
+alias int t274ArrElem(T274Pt* a) { return a[0].v; }
+alias int t274PtrFwd(T274Pt* r) { return t274PtrField(r); }
+alias int t274UniqueField(T274Box* b) { return b->u->v; }
+alias int t274AliasUniqueParam(alias unique<T274Pt> u) { return u->v; }
+alias int t274GlobalUnique() { return gT274U->v; }
+alias int t274GlobalField() { return gT274Arr[1].v; }
+
+int testT274AliasReturnAcceptSet()
+{
+    int passed = 0;
+    T274Pt pt;
+    T274Box box;
+    pt.v = 11;
+    gT274Arr[0].v = 12;
+    box.u = t274Mk();
+    box.u->v = 13;
+    gT274U = t274Mk();
+    gT274U->v = 14;
+    unique<T274Pt> loc = t274Mk();
+    loc->v = 15;
+    passed += Test("t274_alias_ptr_field", t274PtrField(&pt), 11);
+    passed += Test("t274_alias_ptr_fwd", t274PtrFwd(&pt), 11);
+    passed += Test("t274_alias_arr_elem", t274ArrElem(gT274Arr), 12);
+    passed += Test("t274_alias_unique_field_of_ptr", t274UniqueField(&box), 13);
+    passed += Test("t274_alias_unique_alias_param", t274AliasUniqueParam(loc), 15);
+    passed += Test("t274_alias_global_unique", t274GlobalUnique(), 14);
+    passed += Test("t274_alias_global_field", t274GlobalField(), 5);
     return passed;
 }
 
@@ -14822,13 +15865,13 @@ string t216RebindReturnCond(string s, bool c)
 }
 
 // Accept-set neighbour: an unwritten by-value string parameter still echoes through an alias return.
-alias string t216AliasEcho(string s)
+alias T t216AliasEcho<T>(T s)
 {
     return s;
 }
 
 // A store inside a lambda writes the closure's own capture: the param stays a caller borrow.
-alias string t216LambdaOnlyWrite(string s)
+alias T t216LambdaOnlyWrite<T>(T s)
 {
     Lambda<int()> g = () => { s = s + "z"; return s.length(); };
     int k = g();
@@ -14838,7 +15881,7 @@ alias string t216LambdaOnlyWrite(string s)
 int testT216LambdaOnlyWrite()
 {
     string source = "m" + "q";
-    string r = t216LambdaOnlyWrite(source);
+    string r = t216LambdaOnlyWrite<string>(source);
     return Test("t216_lambda_only_write_alias_return", r, "mq");
 }
 
@@ -14852,7 +15895,7 @@ int testT216RebindReturn()
         string r = t216RebindReturn(source);
         string c = t216RebindReturnCond(source, false);
         string d = t216RebindReturnCond(source, true);
-        string e = t216AliasEcho(source);
+        string e = t216AliasEcho<string>(source);
         passed += Test("t216_rebind_return_value", r, "mqn");
         passed += Test("t216_rebind_return_cond_false", c, "mq");
         passed += Test("t216_rebind_return_cond_true", d, "mqn");

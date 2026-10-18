@@ -3,6 +3,7 @@
 // Every leg pins the CANDIDATE it was rejected for, so each one proves its own site fired; the
 // spelled form of each of these calls is a value leg in Test/test_cpp_interop.cb (2200-2220).
 import cpp "cpp_interop_explicit.h";
+import cpp "cpp_t55_ternary.hpp";
 
 // Converting constructors at the copy-initialization positions (plan converting-constructors.md)
 // refuse the same candidates. Each leg names the position in its message prefix.
@@ -30,6 +31,31 @@ extern int main()
     expect_error("cannot assign to C++ class 'cppexp.ConvAmb' from this expression; the implicit conversion from 'int' is ambiguous") {
         cppexp.ConvAmb assignAmb = default;
         assignAmb = 5;
+    }
+    expect_error("clang: overload resolution selected deleted operator '='") {
+        int deletedSource = 5;
+        t55.AssignNarrowDeleted deletedAssign = t55.AssignNarrowDeleted(1u);
+        deletedAssign = deletedSource;
+    }
+    expect_error("t55.AmbSB(i8), t55.AmbSB(bool)") {
+        int ambiguousSourceSB = 5;
+        t55.AmbSB initAmbSB = ambiguousSourceSB;
+    }
+    expect_error("t55.AmbSL(i8), t55.AmbSL(long)") {
+        int ambiguousSourceSL = 5;
+        t55.AmbSL initAmbSL = ambiguousSourceSL;
+    }
+    expect_error("t55.AmbSY(i8), t55.AmbSY(u32)") {
+        int ambiguousSourceSY = 5;
+        t55.AmbSY initAmbSY = ambiguousSourceSY;
+    }
+    expect_error("t55.AmbSF(float), t55.AmbSF(int)") {
+        double ambiguousSource = 5.0;
+        t55.AmbSF initAmbSF = ambiguousSource;
+    }
+    expect_error("t55.AmbSH(i8), t55.AmbSH(i64)") {
+        short ambiguousSource = 5;
+        t55.AmbSH initAmbSH = ambiguousSource;
     }
     // Two user-defined conversions (char* -> ConvStr -> ConvChain) are never chained, and a
     // pointer never reaches an integer-taking constructor. Both keep the generic refusal.

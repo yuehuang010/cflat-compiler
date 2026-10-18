@@ -4874,6 +4874,8 @@ namespace cflat_cinterop
                     // Strip the probe's top-level `const` (from `static const __auto_type`) so a
                     // function-pointer macro reads "int (*)(int, int)", not "int (*const)(...)".
                     m.naturalType = CanonicalSpelling(ctx, vd->getType().getUnqualifiedType());
+                    m.pointeeConst = vd->getType()->isPointerType()
+                        && vd->getType()->getPointeeType().isConstQualified();
                     const APValue& v = ev.Val;
                     if (v.isInt())        { m.kind = RawMacro::Int; m.intValue = ApsIntToLongLong(v.getInt()); }
                     else if (m.isIntegerLiteralZero && m.naturalType.find('*') != std::string::npos)

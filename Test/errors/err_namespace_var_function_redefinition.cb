@@ -1,0 +1,33 @@
+expect_error("redefinition of") {
+    int t268DuplicateGlobal = 3;
+    int t268DuplicateGlobal(int x) { return x; }
+}
+
+expect_error("redefinition of") {
+    int t268DuplicateGlobalReverse(int x) { return x; }
+    int t268DuplicateGlobalReverse = 3;
+}
+
+expect_error("redefinition of") {
+    namespace T268DuplicateNs {
+        int t268Duplicate = 3;
+        int t268Duplicate(int x) { return x; }
+    }
+}
+
+expect_error("redefinition of") {
+    namespace T268DuplicateNsReverse {
+        int t268Duplicate(int x) { return x; }
+        int t268Duplicate = 3;
+    }
+}
+
+expect_error("redefinition of") {
+    int t268DuplicateGeneric = 3;
+    int t268DuplicateGeneric<T>(T x) { return (int)x; }
+}
+
+expect_error("redefinition of") {
+    int t268DuplicateGenericReverse<T>(T x) { return (int)x; }
+    int t268DuplicateGenericReverse = 3;
+}

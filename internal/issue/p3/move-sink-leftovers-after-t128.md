@@ -3,9 +3,6 @@
 PRE-EXISTING on master (T128 reviews 1-2, 2026-10-11). The review probes went with the worktree;
 items 1-3 landed in T227 and were removed; each remaining item is its own repro (P = struct with a destructor, mv takes `move P*`).
 
-4. Reassigning a field after it was consumed (`mv(s.p); s.p = new P(); s.p->v`) is still
-   "use of moved variable" - direct and ternary forms agree; a field re-init after a consume should
-   clear the moved mark like a local does.
 12. (T259 probe, pre-existing; OPEN after T262b - sink transfer from a local through `??` is unsolved, Luna patch and report at
    /Users/felixhuang/source/cflat-compiler/scratch/repro_keep/t262/t262_luna.patch and t262_report.md) `??` with a unique LOCAL lhs double frees when stored into a unique field:
    `unique P* u = new P(); t.p = u ?? nullptr;` (abort under MallocScribble). The field `??` form clears

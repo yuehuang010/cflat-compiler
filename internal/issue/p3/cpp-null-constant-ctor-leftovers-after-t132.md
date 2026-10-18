@@ -16,3 +16,8 @@ are closed by T140 (NULLLEFT); items 1, 2 and 4 are fixed, item 6 did not reprod
    refusal is right; the text differs.
 10. Same-named free functions in two namespaces (`t140::takeK` and `rv::takeK(t132::K)` in one TU):
    `t140.takeK(0)` fails to bind ("clang: no viable conversion from 'int'"); alone it returns 1.
+
+## Widened 2026-10-16 (T300 review, pre-existing)
+Item 5 is not specific to `= 0`: ANY scalar initializer on a C++ class field default (`struct W { IntC c = 5; }`, `IntC c = 2.5`)
+reads 0 - no ctor runs. Once fixed, a floating initializer through an integer ctor must refuse (ruling 2026-10-13).
+Probe: scratch/repro_keep/wt_t300/rev_t300_opus_probe.sh.

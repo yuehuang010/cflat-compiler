@@ -28,8 +28,8 @@
 
 namespace movedf
 {
-    // A movepath is "name" (whole var) or "name.field" (field subpath). Index/deref/any
-    // non-name-or-static-field lvalue carries no path and is never recorded.
+    // A movepath is a whole binding or a field/index path below one. Only constant indexes are
+    // represented; runtime-index moves do not add field-path state.
     enum class EventKind
     {
         KillWhole,        // insert "name"
@@ -57,18 +57,93 @@ namespace movedf
         int col = 0;
     };
 
-    // Maybe-moved lattice element: the set of maybe-moved move-paths.
+    // Maybe-moved lattice element: whole-binding keys plus encoded field paths.
     using MovedSet = std::unordered_set<std::string>;
 
-    // USE-check rule (mirrors LLVMBackend::MovedUseSubject): path "name" is moved if
-    // "name" is in the set; path "name.field" is moved if "name" OR "name.field" is.
+    inline bool IsFieldPathMoved(const MovedSet& s, const std::string& field)
+    {
+        return !field.empty() && s.count(field) != 0;
+    }
+
+    inline void MarkFieldPathMoved(MovedSet& s, const std::string& field)
+    {
+        if (field.empty()) return;
+        s.erase("!" + field);
+        s.insert(field);
+    }
+
+    inline void ReviveFieldPath(MovedSet& s, const std::string& field)
+    {
+        if (field.empty()) return;
+        s.erase(field);
+        s.insert("!" + field);
+    }
+
+    inline MovedSet MergeFieldPaths(const MovedSet& left, const MovedSet& right)
+    {
+        MovedSet merged;
+        for (const auto& path : left) if (path.empty() || path[0] != '!') merged.insert(path);
+        for (const auto& path : right) if (path.empty() || path[0] != '!') merged.insert(path);
+        MovedSet candidates;
+        for (const auto& path : left) if (!path.empty() && path[0] == '!') candidates.insert(path);
+        for (const auto& path : right) if (!path.empty() && path[0] == '!') candidates.insert(path);
+        for (const auto& candidate : candidates)
+        {
+            const std::string path = candidate.substr(1);
+            if (!IsFieldPathMoved(left, path) && !IsFieldPathMoved(right, path))
+                merged.insert(candidate);
+        }
+        return merged;
+    }
+
+    inline std::string FieldKey(const std::string& name, const std::string& field)
+    { return name + '\x1f' + field; }
+
+    inline std::string RevivedFieldKey(const std::string& name, const std::string& field)
+    { return '!' + name + '\x1f' + field; }
+
     inline bool IsPathMoved(const MovedSet& s, const std::string& name, const std::string& field)
     {
         if (s.count(name)) return true;
-        if (!field.empty() && s.count(name + "." + field)) return true;
-        return false;
+        if (field.empty()) return false;
+        return s.count(FieldKey(name, field)) != 0;
     }
 
+    // Positive field keys union at joins. Re-init exemptions survive only if the path is live on
+    // every incoming edge, matching T266/T277's conservative maybe-moved merge.
+    inline MovedSet MergeMovedSets(const std::vector<const MovedSet*>& inputs)
+    {
+        MovedSet merged, candidates;
+        for (const MovedSet* input : inputs)
+            if (input != nullptr)
+                for (const auto& key : *input)
+                {
+                    if (key.empty() || key[0] != '!') merged.insert(key);
+                    else candidates.insert(key);
+                }
+        for (const auto& candidate : candidates)
+        {
+            const size_t separator = candidate.find('\x1f', 1);
+            if (separator == std::string::npos) continue;
+            const std::string name = candidate.substr(1, separator - 1);
+            const std::string field = candidate.substr(separator + 1);
+            bool liveEverywhere = true;
+            for (const MovedSet* input : inputs)
+                if (input != nullptr && IsPathMoved(*input, name, field))
+                { liveEverywhere = false; break; }
+            if (liveEverywhere) merged.insert(candidate);
+        }
+        return merged;
+    }
+
+    inline std::string DisplayPath(const std::string& name, const std::string& field)
+    {
+        if (field.empty()) return name;
+        return field.front() == '[' ? name + field : name + "." + field;
+    }
+
+    // USE-check rule (mirrors LLVMBackend::MovedUseSubject): a whole binding move poisons
+    // everything below it, while field/index paths compare exact and dynamic index components.
     // Apply one event's gen/kill to the running set (Use is a no-op).
     inline void ApplyEvent(MovedSet& s, const Event& e)
     {
@@ -78,22 +153,32 @@ namespace movedf
             s.insert(e.name);
             break;
         case EventKind::KillField:
-            s.insert(e.name + "." + e.field);
+            if (!e.field.empty())
+            {
+                s.insert(FieldKey(e.name, e.field));
+                s.erase(RevivedFieldKey(e.name, e.field));
+            }
             break;
         case EventKind::GenReviveWhole:
             s.erase(e.name);
             break;
         case EventKind::GenReviveField:
-            s.erase(e.name + "." + e.field);
+            if (!e.field.empty())
+            {
+                s.erase(FieldKey(e.name, e.field));
+                s.insert(RevivedFieldKey(e.name, e.field));
+            }
             break;
         case EventKind::GenBind:
         {
             // Fresh binding clears the whole var and every field subpath.
             s.erase(e.name);
-            std::string prefix = e.name + ".";
+            const std::string prefix = e.name + '\x1f';
+            const std::string revivedPrefix = "!" + prefix;
             for (auto it = s.begin(); it != s.end(); )
             {
-                if (it->compare(0, prefix.size(), prefix) == 0)
+                if (it->compare(0, prefix.size(), prefix) == 0
+                    || it->compare(0, revivedPrefix.size(), revivedPrefix) == 0)
                     it = s.erase(it);
                 else
                     ++it;
@@ -187,10 +272,11 @@ namespace movedf
             {
                 if (!dirty[i]) continue;
                 dirty[i] = 0;
-                MovedSet result;
+                std::vector<const MovedSet*> incoming;
                 if (i != 0)
                     for (int p : preds[i])
-                        result.insert(blockOut[p].begin(), blockOut[p].end());
+                        incoming.push_back(&blockOut[p]);
+                MovedSet result = MergeMovedSets(incoming);
                 transfer(i, result);
                 if (result != blockOut[i])
                 {
@@ -209,10 +295,11 @@ namespace movedf
         std::vector<MovedSet> acyclicOut(n);
         for (int i = 0; i < n; ++i)
         {
-            MovedSet result;
+            std::vector<const MovedSet*> incoming;
             for (int p : preds[i])
                 if (p < i)
-                    result.insert(acyclicOut[p].begin(), acyclicOut[p].end());
+                    incoming.push_back(&acyclicOut[p]);
+            MovedSet result = MergeMovedSets(incoming);
             transfer(i, result);
             acyclicOut[i] = std::move(result);
         }
@@ -226,14 +313,16 @@ namespace movedf
             if (rit == rpo.end()) continue;
             const int i = rit->second;
             if (!blockEvents[i]) continue;
-            MovedSet running, acyclicRunning;
+            std::vector<const MovedSet*> incoming, acyclicIncoming;
             if (i != 0)
                 for (int p : preds[i])
                 {
-                    running.insert(blockOut[p].begin(), blockOut[p].end());
+                    incoming.push_back(&blockOut[p]);
                     if (p < i)
-                        acyclicRunning.insert(acyclicOut[p].begin(), acyclicOut[p].end());
+                        acyclicIncoming.push_back(&acyclicOut[p]);
                 }
+            MovedSet running = MergeMovedSets(incoming);
+            MovedSet acyclicRunning = MergeMovedSets(acyclicIncoming);
 
             for (const Event* e : *blockEvents[i])
             {
@@ -243,7 +332,7 @@ namespace movedf
                     bool movedLinear = IsPathMoved(acyclicRunning, e->name, e->field);
                     if (movedFix && !movedLinear)
                     {
-                        std::string path = e->field.empty() ? e->name : (e->name + "." + e->field);
+                        std::string path = DisplayPath(e->name, e->field);
                         // One source site can be tapped by two USE sites (load + call-arg);
                         // report each distinct path+location once.
                         if (seen.insert(path + ":" + std::to_string(e->line) + ":" +
@@ -483,11 +572,16 @@ namespace nulldf
             auto pd = ComputePostDominators(blocks, rpo, proven);
             for (llvm::BasicBlock* bb : blocks)
             {
-                size_t n = 0;
-                for (llvm::BasicBlock* s : llvm::successors(bb)) { (void)s; n++; }
-                if (n < 2) continue;
+                // An invoke's unwind edge never reaches code after the call, so it is no decision
+                // a later event can be guarded by: only the normal edge is a branch here.
+                std::vector<llvm::BasicBlock*> succs;
+                if (auto* inv = llvm::dyn_cast_or_null<llvm::InvokeInst>(bb->getTerminator()))
+                    succs.push_back(inv->getNormalDest());
+                else
+                    succs.assign(llvm::succ_begin(bb), llvm::succ_end(bb));
+                if (succs.size() < 2) continue;
                 std::unordered_set<llvm::BasicBlock*> seen;
-                for (llvm::BasicBlock* s : llvm::successors(bb))
+                for (llvm::BasicBlock* s : succs)
                 {
                     if (!rpo.count(s) || !seen.insert(s).second) continue;
                     // Every X with X pdom S and not X pdom B is exactly pd[S] minus pd[B].

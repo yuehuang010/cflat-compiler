@@ -1,13 +1,48 @@
 // T98: a macro that does not fit the element type is a constant narrowing, refused like clang.
 import cpp "cpp_t98_macro_constant.hpp";
+import cpp "cpp_t63_brace_decl.hpp";
 
 extern int main()
 {
+    // T286: a CFlat-declared enum value is its backing integer, so a non-constant one and a
+    // non-fitting constant are refused as narrowing, not as an unknown type name.
+    enum CE : int { ce0, ce1 = 1, ce9 = 300 };
+    expect_error("narrows in list-initialization") {
+        CE t286Var = CE.ce1;
+        int t286NonConst = t286.sc1({t286Var});
+    }
+    expect_error("narrows in list-initialization") {
+        int t286Big = t286.sc1({CE.ce9});
+    }
     expect_error("which cannot be narrowed to type 'short'") {
         cpi_t98.Shorts s{T98_BIG, 2};
     }
     expect_error("cannot be narrowed to type 'int'") {
         cpi_t98.Ints u{T98_UMAX};
+    }
+    // T278: a constant that does not fit, a negative into unsigned, a scoped enum, a non-constant
+    // enum variable, and a non-fitting macro are refused like clang.
+    expect_error("narrows in list-initialization") {
+        int t278Big = t276.kChar({t276.KBig.kb1});
+    }
+    expect_error("narrows in list-initialization") {
+        int t278Neg = t276.kUChar({t276.KNeg.kn0});
+    }
+    expect_error("narrows to the C++ constructor's 'char'") {
+        int t278Ctor = t276.KChar({t276.KBig.kb1}).w;
+    }
+    expect_error("cannot initialize an array element of type 'const char'") {
+        int t278Scoped = t276.kChar({t276.SC.s1});
+    }
+    expect_error("narrows in list-initialization") {
+        t276.E t278Var = t276.E.e1;
+        int t278NonConst = t276.kChar({t278Var});
+    }
+    expect_error("narrows in list-initialization") {
+        int t278Macro = t276.kChar({T278_BIG});
+    }
+    expect_error("narrows to the C++ parameter's 'char'") {
+        int t278ScopedList = t276.ci({t276.SC.s1});
     }
     return 0;
 }
