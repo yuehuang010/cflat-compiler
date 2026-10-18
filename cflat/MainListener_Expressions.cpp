@@ -2373,6 +2373,38 @@ bool MainListener::RejectPrimitiveValueIntoArrayView(antlr4::ParserRuleContext* 
         return true;
     }
 
+/*
+ * The address of a const C++ object into a mutable C++ record pointer slot: clang refuses the store
+ * (discards qualifiers). Every slot kind is refused, except a plain scalar local (the T225 pick).
+ */
+static std::string ConstPointeeSlotKind(llvm::Value* destination) {
+    if (destination == nullptr) return {};
+    if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(destination))
+        return slot->getAllocatedType()->isArrayTy() ? "array element" : std::string();
+    if (llvm::isa<llvm::GlobalVariable>(destination)) return "global";
+    if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(destination))
+        return gep->getSourceElementType()->isStructTy() ? "field" : "array element";
+    return "dereferenced slot";
+}
+
+bool MainListener::RejectConstRecordPointeeStore(antlr4::ParserRuleContext* ctx,
+                                     const LLVMBackend::TypeAndValue& target,
+                                     const LLVMBackend::NamedVariable& rhsNV,
+                                     const std::string& kind, const std::string& name) {
+        auto* compiler = Compiler(ctx);
+        if (!target.Pointer || target.PointerDepth > 1 || !compiler->IsCxxRecord(target.TypeName))
+            return false;
+        if (compiler->CxxRecordPointeeConstRelation(rhsNV.TypeAndValue, target)
+            != LLVMBackend::CxxPointeeConstRelation::Drops)
+            return false;
+        const std::string className = compiler->DisplayCxxClassName(target.TypeName);
+        LogErrorContext(ctx, std::format(
+            "cannot assign the address of a const C++ object to {} '{}': a mutable '{} *' {} could "
+            "write through read-only storage. Declare it as 'const {} *' instead.",
+            kind, name, className, kind, className));
+        return true;
+    }
+
 bool MainListener::RejectArrayViewElementMismatch(antlr4::ParserRuleContext* ctx,
                                      const LLVMBackend::TypeAndValue& target,
                                      const LLVMBackend::NamedVariable& rhsNV) {
@@ -4364,6 +4396,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 RejectArrayViewElementMismatch(ctx, namedVar.TypeAndValue, rightNV);
                 // Same door, primitive axis: `v = runtimeInt;` reinterprets a number as an address.
                 RejectPrimitiveValueIntoArrayView(ctx, namedVar.TypeAndValue, rightNV);
+                // Same door, C++ axis: a const C++ object's address into a mutable record pointer slot.
+                if (const std::string slotKind = ConstPointeeSlotKind(destination); !slotKind.empty())
+                    RejectConstRecordPointeeStore(ctx, namedVar.TypeAndValue, rightNV, slotKind,
+                        !namedVar.FieldName.empty() ? namedVar.FieldName
+                            : !namedVar.TypeAndValue.VariableName.empty()
+                                ? namedVar.TypeAndValue.VariableName : namedVar.CallerName);
                 const bool sameScopeStringLocal = NamedVarIsString(namedVar)
                     && namedVar.FieldName.empty() && !isDerefStorage()
                     && !namedVar.CallerName.empty()
@@ -8902,6 +8940,7 @@ static void CarryCommonClosureSignature(LLVMBackend* compiler, LLVMBackend::Type
     type.FuncPtrReturnPointerDepth = t.FuncPtrReturnPointerDepth;
     type.FuncPtrReturnResolvedKey = t.FuncPtrReturnResolvedKey;
     type.FuncPtrVariadic = t.FuncPtrVariadic;
+    type.FuncPtrNoPrototype = t.FuncPtrNoPrototype;
     type.FuncPtrParams = t.FuncPtrParams;
     result.sourceType = std::move(type);
     result.sourceTypeName = "__closure_fat_ptr";
@@ -9754,6 +9793,15 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             compiler->pendingCxxTernaryDeclArmType_.clear();
             compiler->pendingCxxTernaryDeclArmCat_ = 0;
         };
+        // `p++` / `p--` arms load the old value and then store the slot (now, or queued in PlusPlus
+        // until the arm's postfix flush): a prvalue, not the slot.
+        bool trueSlotRewritten = false, falseSlotRewritten = false;
+        auto loadSlotRewrittenAfter = [](llvm::LoadInst* load) {
+            for (auto* i = load->getNextNode(); i != nullptr; i = i->getNextNode())
+                if (auto* st = llvm::dyn_cast<llvm::StoreInst>(i))
+                    if (st->getPointerOperand() == load->getPointerOperand()) return true;
+            return false;
+        };
         auto takeNestedCxxTernaryArm = [&](bool nested) -> int {
             if (!nested) return 0;
             compiler->pendingCxxTernaryDeclDest_ = nullptr;
@@ -9819,7 +9867,11 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             if (trueStorage == nullptr && trueValue != nullptr
                 && !compiler->IsProducedTempValue(trueValue))
                 if (auto* load = llvm::dyn_cast<llvm::LoadInst>(trueValue))
+                {
                     trueStorage = load->getPointerOperand();
+                    trueSlotRewritten = loadSlotRewrittenAfter(load)
+                        || PlusPlus.count(load->getPointerOperand()) != 0;
+                }
             trueAlias = trueAlias || compiler->IsAliasValue(trueValue);
             const int trueNestedState = takeNestedCxxTernaryArm(trueNested);
             if (trueNestedState == 2) cxxTernaryDeclFailed = true;
@@ -9970,7 +10022,11 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             if (falseStorage == nullptr && falseValue != nullptr
                 && !compiler->IsProducedTempValue(falseValue))
                 if (auto* load = llvm::dyn_cast<llvm::LoadInst>(falseValue))
+                {
                     falseStorage = load->getPointerOperand();
+                    falseSlotRewritten = loadSlotRewrittenAfter(load)
+                        || PlusPlus.count(load->getPointerOperand()) != 0;
+                }
             falseAlias = falseAlias || compiler->IsAliasValue(falseValue);
             const int falseNestedState = takeNestedCxxTernaryArm(falseNested);
             if (falseNestedState == 2) cxxTernaryDeclFailed = true;
@@ -10724,13 +10780,33 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             && !trueValue->getType()->isPointerTy()
             && trueStorage != nullptr && falseStorage != nullptr
             && !isBorrowedTernaryArm(trueStorage) && !isBorrowedTernaryArm(falseStorage);
+        // C++ `T*&` / `T* const&` args bind the SELECTED pointer slot, as record and scalar joins do.
+        // Call arguments only; owning, borrowed, moved or mixed-type arms keep the value join.
+        auto pointerSlotArm = [&](llvm::Value* storage) {
+            const auto* source = compiler->FindVariableByStorage(storage);
+            return source == nullptr || !source->IsOwning;
+        };
+        const LLVMBackend::TypeAndValue truePointerArmType = trueShape.hasSourceType
+            ? trueShape.sourceType : InferTernaryArmType(trueValue);
+        const LLVMBackend::TypeAndValue falsePointerArmType = falseShape.hasSourceType
+            ? falseShape.sourceType : InferTernaryArmType(falseValue);
+        const bool pointerSlotJoin = inCallArgument_ && trueValue != nullptr && falseValue != nullptr
+            && trueValue->getType()->isPointerTy() && falseValue->getType()->isPointerTy()
+            && trueStorage != nullptr && falseStorage != nullptr
+            && !trueShape.isExplicitMove && !falseShape.isExplicitMove
+            && !trueAlias && !falseAlias && !trueTempField && !falseTempField
+            && !isBorrowedTernaryArm(trueStorage) && !isBorrowedTernaryArm(falseStorage)
+            && pointerSlotArm(trueStorage) && pointerSlotArm(falseStorage)
+            && !trueSlotRewritten && !falseSlotRewritten
+            && truePointerArmType.TypeName == falsePointerArmType.TypeName
+            && truePointerArmType.PointerDepth == falsePointerArmType.PointerDepth;
         if (sharedCxxRetTemp != nullptr && trueStorage == sharedCxxRetTemp
             && falseStorage == sharedCxxRetTemp)
             cxxLvalueStorageJoin = sharedCxxRetTemp;
         // T197: an owned closure join is a fresh value, not an lvalue; a storage PHI here made
         // a nested callee load through an untyped pointer (null-callee ICE).
         else if (!closureJoinOwnsArms
-            && (cxxRecordJoin || scalarLvalueJoin || valueLvalueJoin)
+            && (cxxRecordJoin || scalarLvalueJoin || valueLvalueJoin || pointerSlotJoin)
             && trueStorage != nullptr && falseStorage != nullptr)
         {
             auto* cxxStoragePhi = compiler->builder->CreatePHI(
@@ -14466,6 +14542,13 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                         "ptrdiff");
                     if (elemType)
                     {
+                        Compiler(ctx)->TouchWaitingLayout(elemType);
+                        // An unsized or zero-size element has no stride: dividing by it traps at run time.
+                        if (!elemType->isSized()
+                            || Compiler(ctx)->module->getDataLayout().getTypeAllocSize(elemType) == 0)
+                            LogErrorContext(ctx, "pointer difference: the element type has no size, "
+                                                 "so there is no element count to divide by. Cast both "
+                                                 "pointers to a typed pointer first.");
                         auto* elemSize = Compiler(ctx)->GetTypeSizeBytes(elemType);
                         lvalue = Compiler(ctx)->builder->CreateSDiv(byteDiff, elemSize, "ptrdiff_elem");
                     }
@@ -14916,6 +14999,7 @@ llvm::Value* MainListener::LoadNamedVariableImpl(LLVMBackend::NamedVariable& nam
                 }
                 // An opaque C++ class (a layout cflat refused, e.g. virtual inheritance) has no
                 // value to load: only its address binds (a reference), so the read stays poison.
+                compiler->TouchWaitingLayout(namedVar.BaseType);
                 if (namedVar.BaseType && namedVar.BaseType->isStructTy()
                     && !namedVar.BaseType->isSized())
                     return llvm::PoisonValue::get(namedVar.BaseType);
@@ -16514,7 +16598,12 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     if (storage != nullptr)
                         argument.TypeAndValue.IsCxxConstRef = compiler->IsCxxConstReferent(storage);
 
-                    if (compiler->IsCxxDerivedToBaseValue(argument.TypeAndValue, param, &argument))
+                    // An rvalue reference is not IsAlias (CInterop 4176): a derived prvalue binds its base
+                    // `Base&&` by the same derived-to-base test as a `const Base&`.
+                    auto baseTarget = param;
+                    if (param.IsRvalueRef && param.Pointer && !param.ElemPointer && isRvalue)
+                        baseTarget.IsAlias = true;
+                    if (compiler->IsCxxDerivedToBaseValue(argument.TypeAndValue, baseTarget, &argument))
                         return true;
                     // Cheap record scan first: each CanImplicitlyConstructCxxClass probe is a wrapper.
                     if (!compiler->HasImplicitClassConversionOperator(sourceType)
@@ -17639,6 +17728,9 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 if (receiverCategory == 1) receiverRvalue = false;
                 else if (receiverCategory == 0) receiverRvalue = true;
             }
+            // Inherited members are projected on demand: an unprojected base member would never reach the
+            // candidate set, and a viable free would win against nothing (clang ranks it against the member).
+            compiler->EnsureCxxMemberProjected(typeName, opName);
             // Namespace-scope frees are bound lazily under "ns.operatorX"; bind them before ranking.
             std::vector<std::string> tables = { opName };
             {
@@ -17677,12 +17769,14 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 if (candidate.Parameters[0].IsCxxConstRef) return 2;
                 return candidate.Parameters[0].IsAlias ? 1 : 0;
             };
+            // A free over a base of the receiver's class, by value or by any reference: clang ranks it
+            // beside the members, so it must be a candidate (not only `T&` / `const T&`).
             auto isInheritedBaseReferenceFree = [&](const LLVMBackend::FunctionSymbol& candidate) {
                 if (candidate.IsMethod || candidate.Parameters.empty()) return false;
-                const int refKind = freeParamRefKind(candidate);
-                const std::string& paramType = candidate.Parameters[0].TypeName;
-                return (refKind == 1 || refKind == 2) && paramType != typeName
-                    && compiler->IsCxxBaseOf(paramType, typeName);
+                const auto& param = candidate.Parameters[0];
+                if (param.Pointer && !param.IsAlias && !param.IsRvalueRef) return false;
+                const std::string& paramType = param.TypeName;
+                return paramType != typeName && compiler->IsCxxBaseOf(paramType, typeName);
             };
             struct RankedOperator
             {
@@ -18140,13 +18234,102 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
             // A cast to 'void' DISCARDS its operand, so a value-less call is legal under it -
             // read the destination off the spelling (alias-resolved) before parsing the operand.
             bool destIsVoid = compiler->ResolveTypeAlias(typeName->getText()) == "void";
-            auto namedVar = ParseCastExpression(castExp, false,
-                destIsVoid ? ResultUse::Discard : ResultUse::Value);
+            bool castInitIdentityCall = false;
+            if (ctx == pendingCxxCastInitContext_
+                && compiler->pendingCxxSretDest_ != nullptr
+                && !destTypeName.Pointer && !destTypeName.ElemPointer
+                && !destTypeName.IsArrayView
+                && compiler->ResolveTypeAlias(compiler->pendingCxxSretTypeName_)
+                    == compiler->ResolveTypeAlias(destTypeName.TypeName)
+                && compiler->IsForeignNontrivialCxxClass(
+                    compiler->ResolveTypeAlias(destTypeName.TypeName)))
+            {
+                auto solePostfix = [&](auto&& self, antlr4::tree::ParseTree* node)
+                    -> CFlatParser::PostfixExpressionContext* {
+                    if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+                        return postfix->argumentExpressionList().size() == 1
+                            && postfix->children.size() == 4 ? postfix : nullptr;
+                    if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
+                        cast != nullptr && cast->typeName() != nullptr
+                            && cast->castExpression() != nullptr)
+                    {
+                        const auto nestedType = ParseTypeName(cast->typeName(), false, cast);
+                        if (nestedType.Pointer || nestedType.ElemPointer || nestedType.IsArrayView
+                            || compiler->ResolveTypeAlias(nestedType.TypeName)
+                                != compiler->ResolveTypeAlias(destTypeName.TypeName))
+                            return nullptr;
+                        return self(self, cast->castExpression());
+                    }
+                    if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+                        primary != nullptr && primary->expression() != nullptr
+                            && primary->children.size() == 3)
+                        return self(self, primary->expression());
+                    auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+                    if (rule == nullptr) return nullptr;
+                    if (rule->children.size() == 1)
+                        return self(self, rule->children[0]);
+                    return nullptr;
+                };
+                auto* postfix = solePostfix(solePostfix, castExp);
+                if (postfix != nullptr)
+                {
+                    size_t callSuffixes = 0;
+                    auto countCalls = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+                        if (auto* call = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+                            callSuffixes += call->argumentExpressionList().size();
+                        if (node != nullptr)
+                            for (auto* child : node->children) self(self, child);
+                    };
+                    countCalls(countCalls, castExp);
+                    castInitIdentityCall = callSuffixes == 1;
+                }
+            }
+            LLVMBackend::NamedVariable namedVar;
+            {
+                // Conversion casts hide the initializer slot. Transparent identity casts around
+                // a direct call may pass it through for guaranteed elision.
+                struct HideCastInitDestination
+                {
+                    LLVMBackend* compiler;
+                    llvm::Value* destination = nullptr;
+                    std::string typeName;
+                    bool active = false;
+                    HideCastInitDestination(LLVMBackend* compiler, bool hide)
+                        : compiler(compiler)
+                    {
+                        if (!hide || compiler->pendingCxxSretDest_ == nullptr) return;
+                        destination = compiler->pendingCxxSretDest_;
+                        typeName = compiler->pendingCxxSretTypeName_;
+                        compiler->pendingCxxSretDest_ = nullptr;
+                        compiler->pendingCxxSretTypeName_.clear();
+                        active = true;
+                    }
+                    ~HideCastInitDestination()
+                    {
+                        if (!active) return;
+                        compiler->pendingCxxSretDest_ = destination;
+                        compiler->pendingCxxSretTypeName_ = std::move(typeName);
+                    }
+                } hide(compiler, ctx == pendingCxxCastInitContext_
+                    && !castInitIdentityCall);
+                namedVar = ParseCastExpression(castExp, false,
+                    destIsVoid ? ResultUse::Discard : ResultUse::Value);
+            }
             // A cast result is a new value: `(long)ZERO` is not the macro's literal (clang refuses it).
             namedVar.IsCxxMacroGlobal = false;
             namedVar.IsCxxNullIntegerMacro = false;
             // A cast names the C++ type itself: `(long)(ul + 1)` is no longer `unsigned long`.
             namedVar.CxxArithIdentity.clear();
+            const std::string castSourceType =
+                compiler->ResolveTypeAlias(namedVar.TypeAndValue.TypeName);
+            if (IsRedundantCastOfSource(namedVar.TypeAndValue, destTypeName)
+                && !namedVar.TypeAndValue.Pointer
+                && !namedVar.IsExplicitMove
+                && compiler->IsForeignNontrivialCxxClass(castSourceType))
+            {
+                // Preserve ordinary C++ object category and return-slot provenance.
+                return namedVar;
+            }
             auto type = compiler->GetType(destTypeName);
 
             // Materialize a stored operand into Primary. A fixed-size array decays to
@@ -18282,7 +18465,10 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
             const bool charPointerSource = namedVar.TypeAndValue.TypeName == "char"
                 && namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.ElemPointer
                 && !namedVar.TypeAndValue.IsArrayView;
-            if (charPointerSource && !destTypeName.Pointer && !destTypeName.ElemPointer
+            const bool fixedArraySource = LLVMBackend::IsCxxFixedArrayArgument(namedVar);
+            const bool cxxClassSource = compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName);
+            if ((charPointerSource || fixedArraySource || cxxClassSource)
+                && !destTypeName.Pointer && !destTypeName.ElemPointer
                 && !destTypeName.IsArrayView
                 && compiler->IsForeignNontrivialCxxClass(destTypeName.TypeName)
                 && namedVar.TypeAndValue.TypeName != destTypeName.TypeName)
@@ -18290,8 +18476,19 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
                 auto converted = namedVar;
                 converted.TypeAndValue.VariableName.clear();
                 std::string refusal;
+                llvm::Value* intoSlot = nullptr;
+                std::string pendingType;
+                if (ctx == pendingCxxCastInitContext_
+                    && compiler->pendingCxxSretDest_ != nullptr
+                    && compiler->pendingCxxSretTypeName_ == destTypeName.TypeName)
+                {
+                    intoSlot = compiler->pendingCxxSretDest_;
+                    pendingType = compiler->pendingCxxSretTypeName_;
+                    compiler->pendingCxxSretDest_ = nullptr;
+                    compiler->pendingCxxSretTypeName_.clear();
+                }
                 switch (compiler->ConvertThroughCxxConvertingCtor(
-                            converted, destTypeName.TypeName, nullptr, refusal,
+                            converted, destTypeName.TypeName, intoSlot, refusal,
                             /*directInit*/ true))
                 {
                 case LLVMBackend::CxxConvertingCtorResult::Converted:
@@ -18305,6 +18502,11 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
                     namedVar.TypeAndValue = destTypeName;
                     return namedVar;
                 default:
+                    if (intoSlot != nullptr)
+                    {
+                        compiler->pendingCxxSretDest_ = intoSlot;
+                        compiler->pendingCxxSretTypeName_ = pendingType;
+                    }
                     break;
                 }
             }
@@ -18634,6 +18836,17 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(
                     // (using Handle = void*) onto the pointer flag.
                     if (PeelAliasPointerStars(typeValue.TypeName) > 0)
                         typeValue.Pointer = true;
+                    // A C function-pointer typedef is a function-type alias, not a type alias:
+                    // expand it to its signature as the declaration path does (MainListener_Declarations).
+                    if (!compilerLLVM->NativeTypeShadowsFunctionAlias(typeValue.TypeName))
+                        if (const auto* fit = compilerLLVM->FindOrRequestFunctionTypeAlias(typeValue.TypeName);
+                            fit != nullptr)
+                        {
+                            typeValue = *fit;
+                            typeValue.Pointer = false;
+                            typeValue.PointerDepth = 0;
+                            typeValue.ElemPointer = false;
+                        }
                 }
             }
         }
@@ -18715,6 +18928,7 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(
 LLVMBackend::NamedVariable MainListener::SizeOrAlignOfType(const LLVMBackend::TypeAndValue& typeValue,
                                                            llvm::Type* llvmType, bool isSizeof) {
         auto* compiler = Compiler();
+        compiler->TouchWaitingLayout(llvmType);
         if (llvmType == nullptr || !llvmType->isSized())
         {
             compiler->LogError(std::format("sizeof/alignof: type '{}' is incomplete",
@@ -19005,6 +19219,7 @@ LLVMBackend::NamedVariable MainListener::TrySizeofPostfixAsType(CFlatParser::Una
             }
 
             llvm::Type* llvmType = compiler->GetType(typeValue, nullptr, true);
+            compiler->TouchWaitingLayout(llvmType);
             for (auto it = rawArrayDims.rbegin();
                  it != rawArrayDims.rend() && llvmType != nullptr; ++it)
                 llvmType = llvm::ArrayType::get(llvmType, *it);
@@ -20589,6 +20804,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                     }
                     llvmType = compiler->GetType(elementTV, nullptr, true);
                 }
+                compiler->TouchWaitingLayout(llvmType);
                 if (!llvmType)
                 {
                     LogErrorContext(ctx, "sizeof/alignof: could not resolve type to LLVM type");
@@ -21536,6 +21752,8 @@ bool MainListener::EmitOneFieldInit(
         // it, and the store below would leave the slot pointing at something that is not an array.
         if (RejectValueIntoArrayViewField(rightNV, fieldType, displayTypeName, fieldName, errCtx))
             return false;
+        // A const C++ object's address into a mutable record pointer field (clang refuses).
+        RejectConstRecordPointeeStore(errCtx, fieldType, rightNV, "field", fieldName);
 
         RejectRawHeapArrayIntoUniqueField(rightNV, fieldType, fieldName, errCtx);
 
@@ -21996,6 +22214,24 @@ bool MainListener::EmitOneFieldInit(
             destination = gep;
         }
 
+        // In a by-value brace argument, this aggregate's cleanup takes over an owning field temp.
+        if (inCallArgument_ && !fieldType.Pointer && !fieldType.IsAlias
+            && !fieldType.IsArrayView && fieldType.ConstArraySize == 0
+            && !compiler->IsCxxRecord(fieldType.TypeName)
+            && compiler->GetType(fieldType) == val->getType()
+            && compiler->IsOwningValueType(fieldType.TypeName))
+        {
+            if (rightNV.TernaryTempAlreadyRegistered)
+            {
+                if (auto* join = llvm::dyn_cast<llvm::PHINode>(rightNV.Primary))
+                    compiler->AdoptTernaryArmStructTemps(join);
+            }
+            else if (compiler->IsProducedTempValue(rightNV.Primary))
+                compiler->UnregisterOwnedStructTempsHolding(rightNV.Primary);
+            else if (compiler->IsOwnedStructTempSince(ownedTempMark, rightNV.Storage))
+                compiler->UnregisterOwnedStructTemp(rightNV.Storage);
+        }
+
         // The field now holds this pointer, so account for it exactly as the `=` path does: refcount
         // a new-allocated local's escape, or null the source. Without this both the source local and
         // the field's destructor free the one pointee.
@@ -22120,6 +22356,8 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
             && AsDirectNew(ae) != nullptr)
             compiler->pendingInitAllocAlign = field.AllocAlignValue;
         auto nv = ParseAssignmentExpressionNamed(ae);
+        // A field default initializer is a field store (`cppi.CrPair* p = &crConst;` is refused).
+        RejectConstRecordPointeeStore(ae, field, nv, "field", field.VariableName);
         compiler->RejectImplicitIntegerPointeePointerConversion(nv.TypeAndValue, field);
         llvm::Value* val = LoadNamedVariable(nv);
         // A scalar initializer of a C++ class field (`IntC c = 5;`) is a converting constructor
@@ -22903,11 +23141,15 @@ bool MainListener::EmitDeferredLoweredMoveIntoField(
         llvm::Value* slot,
         const std::string& typeName,
         const LLVMBackend::NamedVariable& rightNV,
+        CFlatParser::MoveExpressionContext* moveSite,
         bool destinationIsFresh,
         const LLVMBackend::OwnedTempMark& ownedTempMark) {
     auto* compiler = Compiler();
     const auto& srcTV = rightNV.TypeAndValue;
-    if (slot == nullptr || !srcTV.IsMove || rightNV.Storage == nullptr || rightNV.Storage == slot
+    const bool moveCallTemp = moveSite != nullptr && rightNV.Storage == nullptr;
+    const bool namedMove = srcTV.IsMove && rightNV.Storage != nullptr;
+    if (slot == nullptr || (!moveCallTemp && !namedMove)
+        || (rightNV.Storage != nullptr && rightNV.Storage == slot)
         || srcTV.Pointer || srcTV.ElemPointer || srcTV.IsArrayView || srcTV.ConstArraySize != 0
         || compiler->ResolveTypeAlias(srcTV.TypeName) != compiler->ResolveTypeAlias(typeName))
         return false;
@@ -22916,10 +23158,24 @@ bool MainListener::EmitDeferredLoweredMoveIntoField(
         if (auto* dtor = compiler->GetOrCreateFullDestructor(typeName))
             compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { slot });
     // Re-arm the moved-from source first, so a throwing move ctor still unwinds it.
-    const std::string movedName = compiler->FindVariableNameByStorage(rightNV.Storage);
-    if (!movedName.empty()) compiler->MarkVariableNotExplicitlyMovedNull(movedName);
-    compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, rightNV.Storage,
-        /*useMove*/ true, "into a struct field");
+    if (namedMove)
+    {
+        const std::string movedName = compiler->FindVariableNameByStorage(rightNV.Storage);
+        if (!movedName.empty()) compiler->MarkVariableNotExplicitlyMovedNull(movedName);
+        compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, rightNV.Storage,
+            /*useMove*/ true, "into a struct field");
+    }
+    else
+    {
+        auto sourceNV = rightNV;
+        sourceNV.TypeAndValue.IsMove = true;
+        sourceNV.IsExplicitMove = true;
+        sourceNV.IsRvalue = true;
+        auto* sourceValue = sourceNV.Primary != nullptr ? sourceNV.Primary : LoadNamedVariable(sourceNV);
+        if (sourceValue == nullptr || !EmitLoweredValueIntoSlot(compiler, typeName, slot,
+                sourceNV, sourceValue, moveSite, "into a struct field"))
+            return false;
+    }
     compiler->FlushOwnedTempsSince(ownedTempMark, nullptr, nullptr);
     if (destinationIsFresh && compiler->HasNonTrivialDestructor(typeName))
         compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot, slot, typeName);
@@ -23423,7 +23679,8 @@ void MainListener::EmitFieldInitializer(
                     fieldName, SpellDiagnosticType(*compiler, rightNV.TypeAndValue)));
             }
             if (loweredMoveField && EmitDeferredLoweredMoveIntoField(
-                    loweredMoveSlot, initField->TypeName, rightNV, destinationIsFresh, ownedTempMark))
+                    loweredMoveSlot, initField->TypeName, rightNV, fieldMoveExpr,
+                    destinationIsFresh, ownedTempMark))
             {
                 compiler->EndCastOccurrence(savedCastOcc);
                 continue;
@@ -23842,11 +24099,28 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                 if (updateExistingElements)
                     if (auto* dtor = compiler->GetOrCreateFullDestructor(tv.TypeName))
                         compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { elemPtr });
-                // Re-arm the moved-from source first, so a throwing move ctor still unwinds it.
                 const std::string movedName = compiler->FindVariableNameByStorage(nv.Storage);
                 if (!movedName.empty()) compiler->MarkVariableNotExplicitlyMovedNull(movedName);
                 compiler->EmitCxxCopyOrMoveConstruct(tv.TypeName, elemPtr, nv.Storage,
                     /*useMove*/ true, "into a fixed-array element");
+                compiler->FlushOwnedTempsSince(elementOwnedTempMark, nullptr, nullptr);
+                noteBuiltElement();
+                continue;
+            }
+            if (loweredCxxElement && moveExpr != nullptr && nv.Storage == nullptr)
+            {
+                if (updateExistingElements)
+                    if (auto* dtor = compiler->GetOrCreateFullDestructor(tv.TypeName))
+                        compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { elemPtr });
+                auto sourceNV = nv;
+                sourceNV.TypeAndValue.IsMove = true;
+                sourceNV.IsExplicitMove = true;
+                sourceNV.IsRvalue = true;
+                auto* sourceValue = sourceNV.Primary != nullptr
+                    ? sourceNV.Primary : LoadNamedVariable(sourceNV);
+                if (sourceValue == nullptr || !EmitLoweredValueIntoSlot(compiler, tv.TypeName,
+                        elemPtr, sourceNV, sourceValue, moveExpr, "into a fixed-array element"))
+                    continue;
                 compiler->FlushOwnedTempsSince(elementOwnedTempMark, nullptr, nullptr);
                 noteBuiltElement();
                 continue;
@@ -25686,7 +25960,9 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         }
         // A C++ class allocates through C++'s allocation functions, matched on every free site:
         // `new T[n]` looks up operator new[] (class-scope, else global), never operator new.
-        const bool cxxAllocator = !typeIsPtr && compiler->CxxClassUsesCxxAllocator(typeName);
+        // A CFlat-declared operator new on T hides the base's C++ one: the scalar form calls it.
+        const bool cxxAllocator = !typeIsPtr && compiler->CxxClassUsesCxxAllocator(typeName)
+            && (isArray || !compiler->HasCflatClassAllocFunction(typeName, "operator new"));
         if (cxxAllocator)
         {
             rawPtr = isArray ? compiler->EmitCxxHeapAllocateArray(typeName, sizeVal, allocAlign)
@@ -28576,6 +28852,7 @@ void MainListener::NormalizeCxxReferenceOperand(
 void MainListener::PrepareAliasCallResult(
         antlr4::ParserRuleContext* ctx,
         LLVMBackend::NamedVariable& result, bool markRvalue) {
+        result.IsTopLevelConst = result.TypeAndValue.IsCxxConstValueReturn;
         if (markRvalue && result.Primary != nullptr && !result.TypeAndValue.IsAlias)
             result.IsRvalue = true;
         // A nontrivial foreign C++ class returned by value lives in the sret temporary until the
@@ -28757,12 +29034,47 @@ void MainListener::RefuseCxxConstReferentWrite(antlr4::ParserRuleContext* ctx,
                 auto* global = llvm::dyn_cast<llvm::GlobalVariable>(base);
                 return global != nullptr && compiler->cGlobalSymbols_.count(global->getName().str()) != 0;
             };
-            if (compiler->IsCxxConstFieldAccess(destination)
+            llvm::Value* pointeeBase = destination;
+            while (auto* gep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(pointeeBase))
+                pointeeBase = gep->getPointerOperand();
+            const LLVMBackend::TypeAndValue* pointerSlot = nullptr;
+            bool cxxPointerField = false;
+            if (auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(pointeeBase))
+            {
+                pointerSlot = compiler->FindDeclaredFieldTypeAndValueForStorage(
+                    load->getPointerOperand());
+                if (auto* slotGep = llvm::dyn_cast<llvm::GetElementPtrInst>(
+                        load->getPointerOperand()))
+                {
+                    if (const llvm::MDNode* field = slotGep->getMetadata("cflat.cxx.field"))
+                    {
+                        if (field->getNumOperands() == 2)
+                            if (auto* typeName = llvm::dyn_cast<llvm::MDString>(field->getOperand(0)))
+                                cxxPointerField = compiler->IsCxxRecord(typeName->getString().str());
+                    }
+                    else if (auto* type = llvm::dyn_cast<llvm::StructType>(
+                                 slotGep->getSourceElementType());
+                             type != nullptr && type->hasName())
+                        cxxPointerField = compiler->IsCxxRecord(type->getName().str());
+                }
+            }
+            const bool constPointeeAccess = constElement && cxxPointerField
+                && pointerSlot != nullptr && pointerSlot->Pointer
+                && pointerSlot->IsCxxPointeeConst;
+            const bool constField = compiler->IsCxxConstFieldAccess(destination);
+            if (constPointeeAccess || constField
                 || (constElement && (isCConstObject() || (constGlobal != nullptr
                     && compiler->cxxConstGlobalSymbols_.count(constGlobal->getName().str()) != 0)))) {
                 const std::string advice = operation == "assign to"
                     ? "Copy it into a local and assign to that instead."
                     : "Copy it into a local and modify that instead.";
+                if (constPointeeAccess)
+                {
+                    LogErrorContext(ctx, std::format(
+                        "cannot {} '{}': it is reached through a const C++ pointee, so it is "
+                        "read-only. {}", operation, target, advice));
+                    return;
+                }
                 if (isCConstObject())
                     LogErrorContext(ctx, std::format(
                         "cannot {} '{}': it is a const C object, so its storage is read-only. {}",

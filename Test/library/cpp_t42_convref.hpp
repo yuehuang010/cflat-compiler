@@ -1,4 +1,5 @@
 #pragma once
+#include <tuple>
 // T42: a C++ `const X&` / `X&&` parameter bound to the temporary a non-explicit converting
 // constructor makes from an argument of another type (char*, a class, a template class).
 namespace cpi_t42 {
@@ -82,4 +83,85 @@ inline const CvSource& cvSource() { static const CvSource s; return s; }
 inline CvSource& cvMutable() { static CvSource s; return s; }
 struct CvTarget { int value; CvTarget(CvSource& s) : value(s.value + 1) {} };
 inline int takeCv(CvTarget&& t) { return t.value; }
+}
+
+namespace cpi_t42 {
+inline int t334_arrcast_gone = 0;
+inline void t334_arrcast_reset() { t334_arrcast_gone = 0; }
+inline int t334_arrcast_dtor_count() { return t334_arrcast_gone; }
+struct T334ArrChar {
+    int tag;
+    T334ArrChar(char*) : tag(1) {}
+    ~T334ArrChar() { t334_arrcast_gone++; }
+    int id() const { return tag; }
+};
+struct T334ArrIntPtr {
+    int tag;
+    T334ArrIntPtr(int*) : tag(2) {}
+    ~T334ArrIntPtr() { t334_arrcast_gone++; }
+    int id() const { return tag; }
+};
+struct T334ArrConstChar {
+    int tag;
+    T334ArrConstChar(const char*) : tag(3) {}
+    ~T334ArrConstChar() { t334_arrcast_gone++; }
+    int id() const { return tag; }
+};
+struct T334ArrPtrOrInt {
+    int tag;
+    T334ArrPtrOrInt(char*) : tag(21) {}
+    T334ArrPtrOrInt(int) : tag(22) {}
+    ~T334ArrPtrOrInt() { t334_arrcast_gone++; }
+    int id() const { return tag; }
+};
+struct T334ArrRef {
+    int tag;
+    T334ArrRef(char (&)[4]) : tag(32) {}
+    ~T334ArrRef() { t334_arrcast_gone++; }
+    int id() const { return tag; }
+};
+struct T334ArrAmbiguous {
+    int tag;
+    T334ArrAmbiguous(char*) : tag(31) {}
+    T334ArrAmbiguous(char (&)[4]) : tag(32) {}
+    ~T334ArrAmbiguous() { t334_arrcast_gone++; }
+    int id() const { return tag; }
+};
+struct T334ArrImplicit {
+    int tag;
+    T334ArrImplicit(char*) : tag(41) {}
+    ~T334ArrImplicit() { t334_arrcast_gone++; }
+    int id() const { return tag; }
+};
+struct T334ArrTupleRef {
+    int tag;
+    T334ArrTupleRef(std::tuple<const char (&)[4]> source) : tag(std::get<0>(source)[0]) {}
+    ~T334ArrTupleRef() {}
+    int id() const { return tag; }
+};
+struct T334ArrSource { char buf[4]; };
+inline int t334_arrcast_first(char* p) { return p[0]; }
+}
+
+namespace cpi_t42 {
+inline Box t334_make_box(int value) { return Box(Src(value)); }
+}
+
+namespace cpi_t42 {
+inline int t339_born = 0, t339_copies = 0, t339_moves = 0, t339_dead = 0;
+inline void t339_reset() {
+    t339_born = t339_copies = t339_moves = t339_dead = 0;
+}
+struct T339Box {
+    int value;
+    explicit T339Box(int v) : value(v) { ++t339_born; }
+    T339Box(const T339Box& other) : value(other.value) { ++t339_born; ++t339_copies; }
+    T339Box(T339Box&& other) noexcept : value(other.value) {
+        ++t339_born; ++t339_moves; other.value = -1;
+    }
+    ~T339Box() { ++t339_dead; }
+    int id() const { return value; }
+};
+inline T339Box t339_make_box() { return T339Box(7); }
+inline T339Box t339_outer_box(T339Box value) { return T339Box(value.id() + 2); }
 }

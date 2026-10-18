@@ -1692,12 +1692,18 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 && candidate.CxxAbi.valid
                 && paramIndex < candidate.CxxAbi.params.size()
                 && candidate.CxxAbi.params[paramIndex].kind == cflat_cinterop::RawAbiSlot::Indirect;
-            if (IsCxxRecord(at.TypeName) && IsCxxDerivedToBaseValue(at, param, nullptr))
+            // An rvalue reference is not IsAlias (CInterop 4176): a prvalue of the derived class binds the
+            // base reference by the same derived-to-base conversion as a const lvalue reference.
+            TypeAndValue baseTarget = param;
+            if (param.IsRvalueRef && param.Pointer && !param.ElemPointer)
+                baseTarget.IsAlias = IsCxxRvalueReferenceArgument(arg);
+            if (IsCxxRecord(at.TypeName) && IsCxxDerivedToBaseValue(at, baseTarget, nullptr))
             {
                 out.rank = 2;
                 out.cxxViable = true;
                 out.from = at.TypeName;
                 out.toClass = param.TypeName;
+                if (reference) out.derivedRefBind = param.IsRvalueRef ? 1 : 2;
                 if (reference && !param.IsRvalueRef)
                 {
                     out.cvBase = param.TypeName;   // 3.2.6 on a derived-to-base reference too
@@ -1841,6 +1847,10 @@ int LLVMBackend::CompareCxxConversionRanks(const std::vector<CxxConversionRank>&
             return 2;
         // [over.ics.rank] tie-breakers between two sequences of the same rank.
         auto tieBreak = [&](const CxxConversionRank& x, const CxxConversionRank& y) {
+            // 3.2.3: a derived-to-base `Base&&` bound to an rvalue beats `Base&` / `const Base&`.
+            if (x.derivedRefBind != 0 && y.derivedRefBind != 0 && x.from == y.from
+                && x.toClass == y.toClass && x.derivedRefBind != y.derivedRefBind)
+                return x.derivedRefBind - y.derivedRefBind;
             // 3.2.5 / 3.2.6: from one source to one target, the less cv-qualified is better.
             if (!x.cvBase.empty() && x.cvBase == y.cvBase && x.from == y.from)
             {
@@ -1886,13 +1896,13 @@ int LLVMBackend::CompareCxxConversionRanks(const std::vector<CxxConversionRank>&
                 const CxxConversionRank& reference = x.rank == -2 ? y : x;
                 if (reference.rank == 0 && (reference.cvBase == object.from || reference.cvBase.empty()))
                     order = x.rank == -2 ? 1 : -1;
-                else if (reference.rank == 2 && !reference.cvBase.empty()
-                         && !reference.toClass.empty() && object.from == reference.from)
+                else if (reference.rank == 2 && !reference.toClass.empty() && object.from == reference.from)
                 {
                     order = tieBreak(object, reference);
                     if (order == 0)
                     {
-                        if (object.toClass != reference.toClass
+                        // A by-value or rvalue-reference base has no cv to compare: equal distance ties.
+                        if (reference.cvBase.empty() || object.toClass != reference.toClass
                             || reference.cvBase != object.toClass)
                             return 2;
                         if ((object.second & reference.cv) == object.second)
@@ -1928,8 +1938,7 @@ int LLVMBackend::CompareCxxConversionRanks(const std::vector<CxxConversionRank>&
                     const CxxConversionRank& object = x.rank == -2 ? x : y;
                     const CxxConversionRank& reference = x.rank == -2 ? y : x;
                     if (object.toClass.empty() && reference.rank == 2
-                        && !reference.cvBase.empty() && !reference.toClass.empty()
-                        && object.from == reference.from)
+                        && !reference.toClass.empty() && object.from == reference.from)
                         order = -1;
                     else
                     {
@@ -2653,9 +2662,10 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         result = 0;
                     // A C++ lvalue reference is represented as an alias value in CFlat. A
                     // derived lvalue binds to a public base reference by a standard conversion;
-                    // lower it from the derived object's storage with the base offset.
-                    else if (tmpParam.IsAlias && !tmpParam.ElemPointer
-                             && IsCxxDerivedToBaseValue(tmpArg, tmpParam, nullptr))
+                    // lower it from the derived object's storage with the base offset. `Base&&`
+                    // takes the same binding for a proven rvalue (the rank site agrees).
+                    else if (!tmpParam.ElemPointer
+                             && IsCxxDerivedToBaseReferenceBinding(tmpArg, tmpParam, arg))
                         result = 1;
                     // M6 - a pointer to a C++ class binds to a parameter typed as a PUBLIC base
                     // of it, with the base subobject offset added at the call. Scored as an
@@ -3710,6 +3720,23 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     || IsCxxTemplateSpecializationSymbol(symbol);
             };
             std::set<std::string> declarations;
+            // A by-value and a `Base&&` derived-to-base binding to two UNRELATED bases: 4.4 orders
+            // only bases on one chain, so the pair ties (clang: ambiguous). Judged per mixed parameter.
+            auto unrelatedDerivedMix = [](const std::vector<CxxConversionRank>& rx,
+                                          const std::vector<CxxConversionRank>& ry,
+                                          const FunctionSymbol& x, const FunctionSymbol& y) {
+                for (size_t k = 0; k < rx.size() && k < ry.size() && k < x.Parameters.size()
+                                    && k < y.Parameters.size(); ++k)
+                {
+                    const bool mixed = (x.Parameters[k].IsAlias || x.Parameters[k].IsRvalueRef)
+                        != (y.Parameters[k].IsAlias || y.Parameters[k].IsRvalueRef);
+                    const bool unrelated = rx[k].rank == 2 && ry[k].rank == 2
+                        && rx[k].from == ry[k].from && !rx[k].toClass.empty() && !ry[k].toClass.empty()
+                        && rx[k].toClass != ry[k].toClass;
+                    if (mixed && !unrelated) return false;
+                }
+                return true;
+            };
             bool indistinguishable = !anyCrossing && survivors.size() > 1;
             for (size_t i = 0; indistinguishable && i < survivors.size(); ++i)
             {
@@ -3722,7 +3749,11 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     bool crossing = false;
                     indistinguishable = CompareCxxConversionRanks(cxxRanks[survivors[i]->pair],
                                                                   cxxRanks[survivors[j]->pair], crossing) == 0
-                        && !referenceMix(survivors[i]->pair->second, survivors[j]->pair->second);
+                        && (!referenceMix(survivors[i]->pair->second, survivors[j]->pair->second)
+                            || unrelatedDerivedMix(cxxRanks[survivors[i]->pair],
+                                                   cxxRanks[survivors[j]->pair],
+                                                   survivors[i]->pair->second,
+                                                   survivors[j]->pair->second));
                 }
             }
             if (indistinguishable)
@@ -7246,6 +7277,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     for (size_t i = 0; i < argIndex && i < candidate.Parameters.size(); i++)
                         llvmParamIndex += ParameterCarriesRawArrayCount(candidate.Parameters[i]) ? 2u : 1u;
                 }
+                // A C++ class return's hidden sret pointer is an LLVM param that argList never holds:
+                // skip it, or a Lambda<> param reads the sret slot as its own.
+                if (candidate.Recipe.retSlot.kind == AbiSlot::SRetReturn)
+                    llvmParamIndex += 1;
                 auto* llvmParamTy = candidate.Function->getFunctionType()->getParamType(llvmParamIndex);
                 // A bare overloaded name needs the destination signature before either the
                 // internal closure ABI or the external thin-pointer ABI lowers it.
@@ -8013,8 +8048,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     if (FindCxxBaseOffset(at.TypeName, pt.TypeName, off, inaccessible))
                         argList[i] = EmitCxxBaseAdjust(argList[i], off);
                 }
-                else if (!at.Pointer && pt.IsAlias && pt.Pointer && !pt.ElemPointer
-                         && IsCxxDerivedToBaseValue(at, pt, nullptr))
+                else if (!at.Pointer && pt.Pointer && !pt.ElemPointer
+                         && IsCxxDerivedToBaseReferenceBinding(at, pt, matched[i]))
                 {
                     LowerCxxReferenceToBase(at.TypeName, pt.TypeName, matched[i], argList[i]);
                 }

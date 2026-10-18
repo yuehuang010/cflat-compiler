@@ -4874,6 +4874,16 @@ int testT147TernaryJoin()
     return passed;
 }
 
+// imaxabs is declared only in core/cruntime.cb (implicit via runtime.cb): a global of that name stays accepted.
+int imaxabs = 7;
+
+int testT323ImplicitCoreGlobal()
+{
+    int passed = 0;
+    passed += Test("implicit runtime core name as a global", imaxabs, 7);
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -4928,6 +4938,7 @@ extern int main()
     r = testT75StringCasts();   passed += r; total += 4;
     r = testT141TernaryClassPointee(); passed += r; total += 6;
     r = testT147TernaryJoin();  passed += r; total += 3;
+    r = testT323ImplicitCoreGlobal(); passed += r; total += 1;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

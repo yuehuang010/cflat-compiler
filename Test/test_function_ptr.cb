@@ -75,6 +75,9 @@ bool testExplicitFunctionPointer()
     Lambda<int(int, int)> f = add;
     result &= Test("explicit add",    f(3, 4),  7);
 
+    function<int(int, int)> typedFn = add;
+    result &= Test("typed native function value", typedFn(20, 22), 42);
+
     f = mul;
     result &= Test("reassign to mul", f(3, 4), 12);
 

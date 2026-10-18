@@ -5339,7 +5339,8 @@ bool LLVMBackend::BorrowedOwningStructTempQualifies(const NamedVariable& arg, bo
 {
         const std::string& typeName = arg.TypeAndValue.TypeName;
         if (arg.Primary == nullptr || arg.Storage != nullptr || arg.BaseType == nullptr) return false;
-        if (!IsProducedTempValue(arg.Primary)) return false;   // only a produced temp, not a named local
+        // A CFlat brace argument is loaded from its construction slot rather than a call result.
+        if (!arg.IsCFlatBraceInitTemp && !IsProducedTempValue(arg.Primary)) return false;
         // A ternary PHI is registered per produced arm while the argument is parsed. Do not
         // register the joined value again when the call lowering sees the same argument.
         if (!fromTernaryArm && llvm::isa<llvm::PHINode>(arg.Primary)) return false;
@@ -6414,8 +6415,11 @@ bool LLVMBackend::EmitUserNewHeapFree(const std::string& typeName, llvm::Value* 
         if (it == functionTable.end() || it->second.empty()) return false;
         const FunctionSymbol* oneArg = nullptr;
         const FunctionSymbol* sized = nullptr;
+        // A CFlat-declared delete on T hides the base's C++ overloads (class-scope lookup).
+        const bool ownCflat = HasCflatClassAllocFunction(typeName, "operator delete");
         for (const FunctionSymbol& sym : it->second)
         {
+            if (ownCflat && sym.IsCxx) continue;
             if (sym.Variadic || sym.Parameters.empty() || !sym.Parameters[0].Pointer) continue;
             if (sym.Parameters.size() == 1 && oneArg == nullptr) oneArg = &sym;
             else if (sym.Parameters.size() == 2 && sized == nullptr && !sym.Parameters[1].Pointer)

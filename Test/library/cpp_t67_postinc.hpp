@@ -9,6 +9,9 @@ template<class T> inline int by_template(T value) { return 400 + value; }
 inline long ptr_const_ref(int* const& value, int* base) { return value - base; }
 inline long ptr_rvalue_ref(int*&& value, int* base) { return value - base; }
 inline long ptr_value(int* value, int* base) { return value - base; }
+inline void ptr_bump(int*& value) { value++; }
+inline long ptr_const_addr(int* const& value) { return (long)&value; }
+inline long ptr_const_const_addr(const int* const& value) { return (long)&value; }
 inline int* postinc_base = nullptr;
 
 struct Pair { int first, second; };

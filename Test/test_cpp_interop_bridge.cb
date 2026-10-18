@@ -2437,6 +2437,12 @@ int bridge_sret_lambda_run(int selector)
     return bridge_sret_lambda_apply(fn, 5);
 }
 
+// T319: a Lambda<Twin()> handed to a function that returns a C++ class by value (sret). Pre-fix the
+// Lambda slot was read as the hidden sret pointer and lowered as a bare C callback.
+cpptw.Twin t319_rettw() { return default; }
+cpptw.Twin t319_runl(Lambda<cpptw.Twin()> f) { return f(); }
+cpptw.Twin t319_runc(cpptw.Twin t, Lambda<int()> f) { return cpptw.Twin(cpptw.take(t) + f()); }
+
 int bridge_sret_array_dtors = 0;
 struct BridgeSretArrayElem
 {
@@ -2959,6 +2965,24 @@ int bridge_range_self_iter_auto()
     cpptw.SelfRangeIter entries = cpptw.SelfRangeIter(3, 6);
     int sum = 0;
     for (auto v in entries) sum = sum + v;
+    return sum;
+}
+
+// begin/end lookup: one member name (ADL decides both) and an inherited member pair. Expected
+// sums come from the same loops compiled by clang++ -std=c++20 (member begin would give 5).
+int bridge_range_one_member_begin()
+{
+    cpptw.OneMemberRange values = default;
+    int sum = 0;
+    for (int v in values) sum = sum + v;
+    return sum;
+}
+
+int bridge_range_inherit_member()
+{
+    cpptw.InheritMemberRange values = default;
+    int sum = 0;
+    for (int v in values) sum = sum + v;
     return sum;
 }
 
@@ -4152,6 +4176,8 @@ extern int main(int argc, char** argv)
     bridge_check("range-for free begin/end break resources", bridge_tracked_range_balanced(), 1);
     bridge_check("range-for by-value free begin int", bridge_range_self_iter_int(), 12);
     bridge_check("range-for by-value free begin auto", bridge_range_self_iter_auto(), 12);
+    bridge_check("range-for one member begin, free end", bridge_range_one_member_begin(), 6);
+    bridge_check("range-for inherited member begin/end", bridge_range_inherit_member(), 6);
     bridge_check("range-for by-value free begin alias", bridge_range_self_iter_alias(), 12);
     bridge_check("range-for by-value free begin temporary", bridge_range_self_iter_temporary(), 3);
     bridge_check("range-for hidden friend begin/end", bridge_range_friend_begin_end(), 15);
@@ -6341,6 +6367,41 @@ extern int main(int argc, char** argv)
     if (bridge_move_ternary_cpp(false) != 82000 + 810 - 1) return 1968;
     if (cpptw.move_count() != 1 || cpptw.dtor_count() != 3
         || cpptw.live_allocations() != 0) return 1969;
+
+    // T319: values and Twin counters match clang++ -std=c++20 std::function legs. The by-value
+    // leg moves the parameter at its last use (as C++ std::move(t)), so copy 0 / move 1.
+    cpptw.reset_counts();
+    int t319Block = t319_runl(() => { return cpptw.Twin(cpptw.take(t319_rettw()) + 7); }).value();
+    if (t319Block != 7) return 1974;
+    if (cpptw.ctor_count() != 2 || cpptw.copy_count() != 0 || cpptw.move_count() != 0
+        || cpptw.dtor_count() != 2 || cpptw.live_allocations() != 0) return 1975;
+    cpptw.reset_counts();
+    int t319Expr = t319_runl(() => cpptw.Twin(cpptw.take(t319_rettw()) + 7)).value();
+    if (t319Expr != 7) return 1976;
+    if (cpptw.ctor_count() != 2 || cpptw.copy_count() != 0 || cpptw.move_count() != 0
+        || cpptw.dtor_count() != 2 || cpptw.live_allocations() != 0) return 1977;
+    int t319K = 6;
+    cpptw.reset_counts();
+    int t319Cap = t319_runl(() => { return cpptw.Twin(t319K + 3); }).value();
+    if (t319Cap != 9) return 1978;
+    if (cpptw.ctor_count() != 1 || cpptw.copy_count() != 0 || cpptw.move_count() != 0
+        || cpptw.dtor_count() != 1 || cpptw.live_allocations() != 0) return 1979;
+    cpptw.reset_counts();
+    int t319CapExpr = t319_runl(() => cpptw.Twin(t319K * 2)).value();
+    if (t319CapExpr != 12) return 1980;
+    if (cpptw.ctor_count() != 1 || cpptw.copy_count() != 0 || cpptw.move_count() != 0
+        || cpptw.dtor_count() != 1 || cpptw.live_allocations() != 0) return 1981;
+    Lambda<cpptw.Twin()> t319Stored = () => { return cpptw.Twin(t319K + 1); };
+    cpptw.reset_counts();
+    int t319Sto = t319_runl(t319Stored).value();
+    if (t319Sto != 7) return 1982;
+    if (cpptw.ctor_count() != 1 || cpptw.copy_count() != 0 || cpptw.move_count() != 0
+        || cpptw.dtor_count() != 1 || cpptw.live_allocations() != 0) return 1983;
+    cpptw.reset_counts();
+    int t319By = t319_runc(cpptw.Twin(2), () => { return 5; }).value();
+    if (t319By != 7) return 1984;
+    if (cpptw.ctor_count() != 2 || cpptw.copy_count() != 0 || cpptw.move_count() != 1
+        || cpptw.dtor_count() != 3 || cpptw.live_allocations() != 0) return 1985;
 
     if (bridge_passed != bridge_checks) return 2000;
 

@@ -38,5 +38,17 @@ expect_error("ambiguous C++ binary operator 'operator+'") {
     t307.IA_cv_cv value = default;
     int selected = value + 1;
 }
+// T321: a by-value base free and an inherited member at equal distance: the call must be rejected.
+expect_error("ambiguous C++ binary operator 'operator+'") {
+    t321.MT value = default;
+    int selected = value + 1;
+}
+// T321 round 2: a derived prvalue binds two UNRELATED bases (by value and `&&`): tie, refused (clang: ambiguous).
+expect_error("ambiguous call to 't321r2.operator+': no candidate ranks better than the others") {
+    int selected = t321r2.a9Mk() + 1;
+}
+expect_error("ambiguous call to 't321r2.fy': no candidate ranks better than the others") {
+    int selected = t321r2.fy(t321r2.a9Mk());
+}
     return 0;
 }

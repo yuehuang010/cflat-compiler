@@ -2673,6 +2673,7 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
             if (external && !(cxxPlan != nullptr && cxxPlan->valid))
                 ApplyNarrowIntExtAttrs(fn, returnType, arguments, useRecipe ? &recipe : nullptr);
 
+            RecordExplicitCoreFunction(mangledName, false);
             auto& symList = functionTable[functionName];
             FunctionSymbol funcSym = {
                 .UniqueName = mangledName,
@@ -3223,6 +3224,7 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
 
         if (!alreadyDeclared)
         {
+            RecordExplicitCoreFunction(mangledName, false);
             auto& symList = functionTable[functionName];
             FunctionSymbol funcSym = {
                 .UniqueName = mangledName,

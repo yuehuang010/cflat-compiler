@@ -1,3 +1,5 @@
+import "math.cb";
+
 expect_error("redefinition of") {
     int t268DuplicateGlobal = 3;
     int t268DuplicateGlobal(int x) { return x; }
@@ -30,4 +32,9 @@ expect_error("redefinition of") {
 expect_error("redefinition of") {
     int t268DuplicateGenericReverse<T>(T x) { return (int)x; }
     int t268DuplicateGenericReverse = 3;
+}
+
+// A global named like a function of an EXPLICITLY imported core file (math.cb above) is refused.
+expect_error("redefinition of") {
+    double tan = 2.0;
 }

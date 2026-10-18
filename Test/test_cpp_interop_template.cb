@@ -386,6 +386,8 @@ int crtp_peek_handle(cppi_crtp.WeakHandle<CrtpSelfHandles>* handle) { return han
 // resolved by the ForwardRefScanner copy of the declaration path, not by the codegen copy.
 int alnpat_take_nbdef(alna.NBdef<int> value) { return value.v + 100; }
 alna.NBdef<int> alnpat_make_nbdef() { alna.NBdef<int> made = default; return made; }
+// A variadic C++ alias as a FILE-SCOPE parameter type (the expanded pack reaches the signature).
+int alnv_seq_size(alnv.ISeq<0,1,2> s) { return (int)s.size(); }
 
 /*
  * Section M103 helpers: a std container over a std specialization over a USER class, spelled in a
@@ -4499,5 +4501,27 @@ extern int main()
         if (cppsopd.tinyRefCompoundLast != 5) return 5282;
         cppsopd.tinyRefCompound() += 1;
         if (cppsopd.tinyRefCompoundLast != 6) return 5283;
+
+        // T329: a C++ alias template with a PARAMETER PACK (`using ISeq = Seq<I...>`). Pre-fix
+        // it was refused as "takes 1 template argument(s), but 3 were given".
+        alnv.ISeq<0,1,2> seqLocal = default;
+        if (seqLocal.size() != 3)                                            return 5284;
+        if (alnv.ISeq<0,1,2>.size() != 3)                                    return 5285;
+        if (alnv_seq_size(seqLocal) != 3)                                    return 5286;
+        alnv.ISeq<> seqEmpty = default;
+        if (seqEmpty.size() != 0)                                            return 5287;
+        alnv.Tup<int,double> tupLocal = default;
+        if (tupLocal.size() != 2)                                            return 5288;
+        // A fixed parameter, then a pack: Front<int,double,char> names Pair<int, TypeList<double,char>>.
+        alnv.Front<int,double,char> frontLocal = default;
+        if (frontLocal.tag() != 402)                                         return 5289;
+        if (alnv.Front<int,double,char>().tag() != 402)                      return 5290;
+        // A pack left empty by a use site with fewer arguments: Pair<int, TypeList<>>.
+        alnv.Front<int> frontOnly = default;
+        if (frontOnly.tag() != 400)                                          return 5291;
+        // The non-variadic alias keeps its measured behaviour.
+        alnv.SingleAlias<int> singleLocal = default;
+        singleLocal.v = 4;
+        if (singleLocal.v != 4)                                              return 5292;
     return 0;
 }

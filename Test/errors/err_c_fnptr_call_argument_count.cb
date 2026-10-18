@@ -1,0 +1,83 @@
+import "../library/c_variadic_fnptr.h";
+import cpp "../library/cpp_interop_fnptr.h";
+
+struct T332Hold { T170Bin fn; };
+int t332Add(int a, int b) { return a + b; }
+T170Bin t332GetBin() { return t170_add; }
+
+expect_error("call through a function value: expected 2 argument(s), got 1") {
+    int t332ParamTooFew(T170Bin fn) { return fn(1); }
+}
+expect_error("call through a function value: expected 2 argument(s), got 3") {
+    int t332ParamTooMany(T170Bin fn) { return fn(1, 2, 3); }
+}
+
+extern int main()
+{
+    expect_error("call through a function value: expected 2 argument(s), got 1") {
+        T170Bin value = t170_add;
+        int result = value(1);
+    }
+    expect_error("call through a function value: expected 2 argument(s), got 3") {
+        T170Bin value = t170_add;
+        int result = value(1, 2, 3);
+    }
+    expect_error("call through a function value: expected 2 argument(s), got 1") {
+        T332Hold hold = default;
+        hold.fn = t170_add;
+        int result = hold.fn(1);
+    }
+    expect_error("call through a function value: expected 2 argument(s), got 3") {
+        T332Hold hold = default;
+        hold.fn = t170_add;
+        int result = hold.fn(1, 2, 3);
+    }
+    expect_error("call through a function value: expected 2 argument(s), got 1") {
+        int result = t332GetBin()(1);
+    }
+    expect_error("call through a function value: expected 2 argument(s), got 3") {
+        int result = t332GetBin()(1, 2, 3);
+    }
+    expect_error("call through a function value: expected 1 argument(s), got 0") {
+        T170Vp value = t170_sum;
+        int result = value();
+    }
+    expect_error("call through a function value: expected 2 argument(s), got 1") {
+        function<int(int, int)> value = t332Add;
+        int result = value(1);
+    }
+    expect_error("call through a function value: expected 2 argument(s), got 3") {
+        function<int(int, int)> value = t332Add;
+        int result = value(1, 2, 3);
+    }
+    expect_error("call through a function value: expected 2 argument(s), got 1") {
+        Lambda<int(int, int)> value = (int a, int b) => { return a + b; };
+        int result = value(1);
+    }
+    expect_error("call through a function value: expected 2 argument(s), got 3") {
+        Lambda<int(int, int)> value = (int a, int b) => { return a + b; };
+        int result = value(1, 2, 3);
+    }
+    expect_error("call through a function value: expected 1 argument(s), got 0") {
+        cppfnptr.CbAlias value = cppfnptr.plus_one;
+        int result = value();
+    }
+    expect_error("call through a function value: expected 1 argument(s), got 2") {
+        cppfnptr.CbAlias value = cppfnptr.plus_one;
+        int result = value(1, 2);
+    }
+    expect_error("call through a function value: expected 0 argument(s), got 1") {
+        T332VoidProto value = nullptr;
+        int result = value(17);
+    }
+    expect_error("call through a function value: expected 0 argument(s), got 1") {
+        T332Unproto loose = nullptr;
+        T332VoidProto strict = loose;
+        int result = strict(17);
+    }
+    expect_error("call through a function value: expected 0 argument(s), got 1") {
+        cppfnptr.VoidCb value = nullptr;
+        value(17);
+    }
+    return 0;
+}

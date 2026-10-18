@@ -623,6 +623,36 @@ bool LLVMBackend::CurrentSourceIsCoreLibrary() const
         && IsPathUnderDirectory(currentSourceFilePath_, std::filesystem::path(runtimeDir) / "core");
 }
 
+bool LLVMBackend::IsCoreSourcePath(const std::string& path) const
+{
+    bool isCore = false;
+    if (!runtimeDir.empty())
+    {
+        std::error_code cec;
+        auto coreDir = std::filesystem::canonical(std::filesystem::path(runtimeDir) / "core", cec);
+        if (!cec)
+            isCore = IsPathUnderDirectory(path, coreDir);
+    }
+    // Same library, different checkout: an analyzed core root imports its siblings from ITS
+    // directory, not from runtimeDir/core, and they are core all the same.
+    if (!isCore && !rootCoreDir_.empty())
+        isCore = IsPathUnderDirectory(path, rootCoreDir_);
+    return isCore;
+}
+
+void LLVMBackend::RecordExplicitCoreFunction(const std::string& key, bool genericTemplate)
+{
+    if (!compilingExplicitCoreFile_ || !CurrentSourceIsCoreLibrary()) return;
+    (genericTemplate ? explicitCoreTemplateFile_ : explicitCoreFunctionFile_)[key] = currentSourceFilePath_;
+}
+
+bool LLVMBackend::IsExplicitCoreFunction(const std::string& key, bool genericTemplate) const
+{
+    const auto& table = genericTemplate ? explicitCoreTemplateFile_ : explicitCoreFunctionFile_;
+    auto it = table.find(key);
+    return it != table.end() && explicitCoreImportFiles_.count(it->second) != 0;
+}
+
 bool LLVMBackend::IsIsolatedCoreSource() const
 {
     return isolatedPolicy_.has_value() && !currentSourceIsCore_ && !runtimeDir.empty()
@@ -3373,6 +3403,10 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         LogError(std::format("Circular import detected: {}", chain));
         return false;
     }
+    // An explicit `import` written in non-core source. Recorded before the dedup return so a file
+    // the runtime graph already loaded is still known; its symbols are never recorded, so implicit wins.
+    bool explicitCoreImport = IsCoreSourcePath(canonicalStr) && !IsCoreSourcePath(importingFilePath);
+    if (explicitCoreImport) explicitCoreImportFiles_.insert(canonicalStr);
     // Check dedup (file already fully processed or eagerly registered).
     if (importedFiles.count(canonicalStr))
     {
@@ -3487,18 +3521,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     llvm::TimeTraceScope importScope("ImportFile", importFilename);
 
     // Keep the source-origin classification for code-generation behavior.
-    bool isCoreImport = false;
-    if (!runtimeDir.empty())
-    {
-        std::error_code cec;
-        auto coreDir = std::filesystem::canonical(std::filesystem::path(runtimeDir) / "core", cec);
-        if (!cec)
-            isCoreImport = IsPathUnderDirectory(canonicalStr, coreDir);
-    }
-    // Same library, different checkout: an analyzed core root imports its siblings from ITS
-    // directory, not from runtimeDir/core, and they are core all the same.
-    if (!isCoreImport && !rootCoreDir_.empty())
-        isCoreImport = IsPathUnderDirectory(canonicalStr, rootCoreDir_);
+    bool isCoreImport = IsCoreSourcePath(canonicalStr);
 
     // Imported trees are mtime-and-size validated and pinned by this backend, so
     // generic-template ctx pointers remain valid across re-analysis.
@@ -3600,9 +3623,11 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     auto savedSourceFileName = sourceFileName;
     auto savedSourceFilePath = currentSourceFilePath_;
     auto savedSourceIsCore = currentSourceIsCore_;
+    auto savedExplicitCore = compilingExplicitCoreFile_;
     sourceFileName = std::filesystem::path(canonicalStr).filename().string();
     currentSourceFilePath_ = canonicalStr;
     currentSourceIsCore_ = isCoreImport;
+    compilingExplicitCoreFile_ = explicitCoreImport;
     ValidateIsolatedParseTree(computeUnit);
     // Files that follow this import are not scanned yet, so no interface-implementor claim made
     // while codegen'ing it can be proven complete (see InterfaceImplementorSetIsUncertain).
@@ -3673,6 +3698,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     sourceFileName = savedSourceFileName;
     currentSourceFilePath_ = savedSourceFilePath;
     currentSourceIsCore_ = savedSourceIsCore;
+    compilingExplicitCoreFile_ = savedExplicitCore;
     return true;
 }
 
@@ -5194,6 +5220,9 @@ void LLVMBackend::ResetForReanalysis()
     // Clear per-analysis import state. Imported parse trees deliberately survive this reset;
     // their path, mtime, and size validation keeps them safe and fresh.
     importedFiles.clear();
+    explicitCoreImportFiles_.clear();
+    explicitCoreFunctionFile_.clear();
+    explicitCoreTemplateFile_.clear();
     importStack.clear();
     importAliasMembers.clear();
     syntheticParseStates_.clear();
@@ -7013,11 +7042,13 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.IsRvalueRef)             o["rr"]  = true;
     if (s.IsCxxRefToPointer)      o["crp"] = true;
     if (s.IsCxxConstRef)          o["ccr"] = true;
+    if (s.IsCxxConstValueReturn)  o["ccv"] = true;
     if (s.IsCxxPointeeConst)      o["cpc"] = true;
     if (s.IsCxxPointeeVolatile)   o["cpv"] = true;
     if (s.IsSpelledPointeeConst)  o["spc"] = true;
     if (s.IsCxxNullptrT)          o["cnt"] = true;
     if (s.IsCxxConstField)        o["ccf"] = true;
+    if (s.IsCxxDeclaredConstField) o["ccdf"] = true;
     if (s.IsCxxMutableField)      o["cmf"] = true;
     if (s.IsOwningSink)           o["osk"] = true;
     if (s.IsConsumeInferredSink)  o["cis"] = true;
@@ -7030,6 +7061,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.LockThis)               o["lt"]  = true;
     if (s.LockThisMode != LockMode::Exclusive) o["ltm"] = static_cast<int64_t>(s.LockThisMode);
     if (!s.GuardedBy.empty())     o["gb"]  = s.GuardedBy;
+    if (s.FuncPtrNoPrototype)     o["fpnp"] = true;
     if (s.IsFunctionPointer)
     {
         o["fp"]  = true;
@@ -7103,11 +7135,13 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("rr")) s.IsRvalueRef = *v;
     if (auto v = o.getBoolean("crp")) s.IsCxxRefToPointer = *v;
     if (auto v = o.getBoolean("ccr")) s.IsCxxConstRef = *v;
+    if (auto v = o.getBoolean("ccv")) s.IsCxxConstValueReturn = *v;
     if (auto v = o.getBoolean("cpc")) s.IsCxxPointeeConst = *v;
     if (auto v = o.getBoolean("cpv")) s.IsCxxPointeeVolatile = *v;
     if (auto v = o.getBoolean("spc")) s.IsSpelledPointeeConst = *v;
     if (auto v = o.getBoolean("cnt")) s.IsCxxNullptrT = *v;
     if (auto v = o.getBoolean("ccf")) s.IsCxxConstField = *v;
+    if (auto v = o.getBoolean("ccdf")) s.IsCxxDeclaredConstField = *v;
     if (auto v = o.getBoolean("cmf")) s.IsCxxMutableField = *v;
     if (auto v = o.getBoolean("osk")) s.IsOwningSink = *v;
     if (auto v = o.getBoolean("cis")) s.IsConsumeInferredSink = *v;
@@ -7121,6 +7155,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getInteger("ltm")) s.LockThisMode = static_cast<LockMode>(*v);
     if (auto v = o.getString("gb"))  s.GuardedBy = v->str();
     if (auto v = o.getBoolean("fp")) s.IsFunctionPointer = *v;
+    if (auto v = o.getBoolean("fpnp")) s.FuncPtrNoPrototype = *v;
     if (s.IsFunctionPointer)
     {
         if (auto v = o.getString("fpr"))   s.FuncPtrReturnTypeName = v->str();

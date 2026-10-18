@@ -2965,6 +2965,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 && Compiler(ctx)->IsCxxRecord(structVar.TypeAndValue.TypeName))
                                 Compiler(ctx)->EnsureCxxMemberProjected(
                                     structVar.TypeAndValue.TypeName, primaryIdentifier);
+                            // A member named through a pointer-only instance needs its body now.
+                            DrainWaitingPointerInstance(structVar.TypeAndValue.TypeName);
                             auto dataStructure = Compiler(ctx)->GetDataStructure(llvm::dyn_cast<llvm::StructType>(structVar.BaseType));
 
                             // [PFX-2c] Access control on an imported C++ class. A private or
@@ -3148,9 +3150,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     auto* fieldLLVMType = Compiler(ctx)->GetType(fieldType);
                                     if (dataStructure.IsUnion)
                                     {
-                                        namedVar.Storage = dataStructure.CxxOffsetLayout
-                                            && fieldIndex < dataStructure.CxxFieldOffsets.size()
-                                            && dataStructure.CxxFieldOffsets[fieldIndex] != 0
+                                        const bool hasOffset = dataStructure.CxxOffsetLayout
+                                            && fieldIndex < dataStructure.CxxFieldOffsets.size();
+                                        namedVar.Storage = (hasOffset || fieldType.IsCxxMutableField)
                                             ? Compiler(ctx)->CreateCxxFieldGEP(
                                                 dataStructure, structVar.Storage, fieldIndex)
                                             : structVar.Storage;
@@ -3233,11 +3235,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         auto* fieldLLVMType = Compiler(ctx)->GetType(fieldType);
                                         if (dataStructure.IsUnion)
                                         {
-                                            // Most union members start at offset 0. C++ promoted
-                                            // members can start inside an anonymous struct member.
-                                            namedVar.Storage = dataStructure.CxxOffsetLayout
-                                                && fieldIndex < dataStructure.CxxFieldOffsets.size()
-                                                && dataStructure.CxxFieldOffsets[fieldIndex] != 0
+                                            // Give offset-zero mutable C++ members a tagged address too.
+                                            const bool hasOffset = dataStructure.CxxOffsetLayout
+                                                && fieldIndex < dataStructure.CxxFieldOffsets.size();
+                                            namedVar.Storage = (hasOffset || fieldType.IsCxxMutableField)
                                                 ? Compiler(ctx)->CreateCxxFieldGEP(
                                                     dataStructure, structVar.Storage, fieldIndex)
                                                 : structVar.Storage;
@@ -4631,6 +4632,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             auto elementType = Compiler(ctx)->GetType(elementTypeAndValue);
                             // An UNSIZED element has no stride: a 'void*' traps in LLVM's
                             // alignment query, an incomplete record emitted invalid IR.
+                            Compiler(ctx)->TouchWaitingLayout(elementType);
                             if (elementType == nullptr || !elementType->isSized())
                                 LogErrorContext(ctx, std::format(
                                     "cannot index '{}': its element has no size, so there is no "
@@ -6905,6 +6907,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                     }
                                 }
+                                const size_t fixedArgCount = funcPtrTV.FuncPtrParams.size();
+                                const size_t actualArgCount = argNVs.size();
+                                if (!funcPtrTV.FuncPtrNoPrototype
+                                    && (actualArgCount < fixedArgCount
+                                        || (!funcPtrTV.FuncPtrVariadic && actualArgCount > fixedArgCount)))
+                                    LogErrorContext(ctx, std::format(
+                                        "call through a function value: expected {} argument(s), got {}",
+                                        fixedArgCount, actualArgCount));
                                 // A variadic C signature: an argument past the declared parameters is a `...`
                                 // slot, refused for a by-value aggregate exactly as a direct C variadic call.
                                 for (size_t i = funcPtrTV.FuncPtrParams.size();
@@ -7427,6 +7437,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.TypeAndValue.FuncPtrReturnPointer  = argNV.TypeAndValue.FuncPtrReturnPointer;
                                     argVar.TypeAndValue.FuncPtrReturnOwned = argNV.TypeAndValue.FuncPtrReturnOwned;
                                     argVar.TypeAndValue.FuncPtrVariadic = argNV.TypeAndValue.FuncPtrVariadic;
+                                    argVar.TypeAndValue.FuncPtrNoPrototype = argNV.TypeAndValue.FuncPtrNoPrototype;
                                     argVar.TypeAndValue.FuncPtrParams         = argNV.TypeAndValue.FuncPtrParams;
                                     // Reading the side channel RETIRES it, like the two other
                                     // consumers, so a stale list cannot reach the next argument.
@@ -7977,6 +7988,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 argVar.BaseType = loaded->getType();
                                                 argVar.TypeAndValue.TypeName = structType;
                                                 argVar.TypeAndValue.VariableName = namedParam;
+                                                argVar.IsCFlatBraceInitTemp = true;
                                                 arguments.emplace_back(argVar);
                                             }
                                             else
@@ -7998,6 +8010,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                     argVar.BaseType = loaded->getType();
                                                     argVar.TypeAndValue.TypeName = structType;
                                                     argVar.TypeAndValue.VariableName = namedParam;
+                                                    argVar.IsCFlatBraceInitTemp = true;
                                                     arguments.emplace_back(argVar);
                                                 }
                                             }
@@ -8605,6 +8618,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.TypeAndValue.FuncPtrReturnPointer  = argNV.TypeAndValue.FuncPtrReturnPointer;
                                     argVar.TypeAndValue.FuncPtrReturnOwned = argNV.TypeAndValue.FuncPtrReturnOwned;
                                     argVar.TypeAndValue.FuncPtrVariadic = argNV.TypeAndValue.FuncPtrVariadic;
+                                    argVar.TypeAndValue.FuncPtrNoPrototype = argNV.TypeAndValue.FuncPtrNoPrototype;
                                     argVar.TypeAndValue.FuncPtrParams         = argNV.TypeAndValue.FuncPtrParams;
                                     // Propagate bond info so bond-to-move checks work at the call site.
                                     argVar.IsBonded = argNV.IsBonded;
@@ -11161,6 +11175,7 @@ llvm::Value* MainListener::EmitHeapDefaultConstruct(LLVMBackend* compiler, const
                                           antlr4::ParserRuleContext* errCtx) {
         LLVMBackend::TypeAndValue typeInfo{ .TypeName = typeName };
         llvm::Type* elemType = compiler->GetType(typeInfo);
+        compiler->TouchWaitingLayout(elemType);
         if (!elemType || !elemType->isSized())
         {
             LogErrorContext(errCtx, std::format("'<{}>': cannot construct unknown or unsized type",
@@ -11348,7 +11363,8 @@ llvm::Value* MainListener::ParseElementExpression(CFlatParser::ElementExpression
                 compiler->EndCastOccurrence(savedCastOcc);
                 releaseSeed(fieldName);
                 if (loweredMoveAttr && EmitDeferredLoweredMoveIntoField(
-                        attrSlot, attrField->TypeName, rightNV, /*destinationIsFresh*/ false, ownedTempMark))
+                        attrSlot, attrField->TypeName, rightNV, attrMoveExpr,
+                        /*destinationIsFresh*/ false, ownedTempMark))
                 {
                     noteOverride(fieldName);
                     continue;
@@ -12426,7 +12442,8 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                         // instantiation naming this one as a field type finds a type even when
                         // the forward scan spelled the shell differently (e.g. an alias arg).
                         QueueGenericInstantiation(baseName, typeArgs,
-                                                  MangledGenericName(baseName, typeArgs), genParams);
+                                                  MangledGenericName(baseName, typeArgs), genParams,
+                                                  IsPointerOnlyTypeUse(typeSpec));
                     }
                     break;
                 }

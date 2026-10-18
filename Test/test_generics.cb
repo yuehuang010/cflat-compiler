@@ -5606,6 +5606,46 @@ bool testMemberTypeForwardRecords()
     return true;
 }
 
+// A pointer to a generic instance over a struct declared LATER names the instance only: its body
+// (sizeof(T), methods) waits for PoLater's definition. PoTag's method is T-free, so calling it
+// before PoLater exists still works (the member access drains the instance).
+struct PoWrap<T> { T v; int size() { return sizeof(T); } };
+struct PoTag<T> { int k = 0; int tag() { return 9; } };
+struct PoHolder { PoWrap<PoLater>* w = nullptr; PoTag<PoLater>* t = nullptr; };
+int poParam(PoWrap<PoLater>* p) { return p == nullptr ? 7 : 1; }
+int poLocalBefore() { PoWrap<PoLater>* q = nullptr; return q == nullptr ? 3 : 1; }
+int poCallBefore(PoHolder* h) { return h->t->tag(); }
+// T sits behind a pointer, so the layout is T-free: pointer difference, element indexing and
+// sizeof(*p) need that layout now, before PoLater is defined.
+struct PoRef<T> { int k = 2; T* v = nullptr; int get() { return k; } };
+int poDiff(PoRef<PoLater>* a, PoRef<PoLater>* b) { return a - b; }
+int poIndexK(PoRef<PoLater>* p) { return p[0].k; }
+int poSizeofDeref(PoRef<PoLater>* p) { return sizeof(*p); }
+struct PoLater { int a = 0; };
+struct PoAfterHolder { PoWrap<PoLater> w; };
+
+bool testPointerOnlyLaterStruct()
+{
+    bool result = true;
+    PoHolder h = default;
+    result &= Test("po_pointer_field_before_struct", h.w == nullptr, true);
+    h.w = new PoWrap<PoLater>();
+    result &= Test("po_pointer_field_method_after", h.w->size(), 4);
+    result &= Test("po_pointer_param_before_struct", poParam(nullptr), 7);
+    result &= Test("po_pointer_local_before_struct", poLocalBefore(), 3);
+    PoHolder hc = default;
+    hc.t = new PoTag<PoLater>();
+    result &= Test("po_member_call_before_struct", poCallBefore(&hc), 9);
+    PoAfterHolder after = default;
+    result &= Test("po_by_value_after_struct", after.w.size(), 4);
+    PoRef<PoLater>* pk = new PoRef<PoLater>();
+    PoRef<PoLater>* pk3 = pk + 3;
+    result &= Test("po_ptr_diff_before_struct", poDiff(pk3, pk), 3);
+    result &= Test("po_index_member_before_struct", poIndexK(pk), 2);
+    result &= Test("po_sizeof_deref_before_struct", poSizeofDeref(pk), 16);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -5772,6 +5812,7 @@ extern int main()
     total++; passed += testMemberTypeNames()                         ? 1 : 0;
     total++; passed += testMemberTypeValueParens()                   ? 1 : 0;
     total++; passed += testMemberTypeForwardRecords()                ? 1 : 0;
+    total++; passed += testPointerOnlyLaterStruct()                  ? 1 : 0;
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -92,3 +92,19 @@ T170Vp t170_getvp(void)
 {
     return t170_sum;
 }
+
+static int t332_unproto_target(int ignored)
+{
+    (void)ignored;
+    return 42;
+}
+
+T332Unproto t332_get_constant(void)
+{
+    return t332_unproto_target;
+}
+
+int t332_forty_three(void)
+{
+    return 43;
+}

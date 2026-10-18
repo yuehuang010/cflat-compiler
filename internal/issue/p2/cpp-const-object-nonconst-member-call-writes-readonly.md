@@ -22,7 +22,8 @@ The W13 value legs and gate results are recorded in `scratch/briefs/w13_report.m
 
 Fixed in W6 (2026-09-30): elided `const auto` template call, static/instance `mix` through an object, shared receiver-kind routing for template calls, address-of a const slot / const array element, `const C*` parameter and struct field. The const-copy slot marker, file-scope const records and const-pointer argument conversion were resolved in W13. Probes are archived in the main checkout at `scratch/repro_keep/w6/`.
 
-T225 review 1 (pre-existing, also straight-line): an implicit-this FIELD or a GLOBAL pointer assigned a
-const C++ object (`p = &crConst; p->get();`) is never marked const (only locals are -
-MainListener_Expressions.cpp ~4309 requires FieldName.empty()), so the mutable twin runs and writes
-read-only storage (bus error 138; clang 3).
+T324 review 1 (pre-existing, bus error 138 on master and after T324): the const of `&crConst` is dropped at a CALL or
+RETURN door before any store - passing it to a CFlat `cppi.CrPair*` parameter (then stored to a local/global or used in a
+ctor field init) and `cppi.CrPair* mk() { return &cppi.crConst; }`. clang refuses all. Repros in the T324 worktree scratch
+were param_to_global / param_local / ctor_field / return_ptr; fix direction: run the T324 const-record-pointee check
+(RejectConstRecordPointeeStore) at CFlat call arguments and returns, like W13 does for C++ parameters.

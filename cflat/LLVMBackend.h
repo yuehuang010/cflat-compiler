@@ -182,6 +182,9 @@ struct GenericTemplateState
         size_t originLine = 0;
         size_t originColumn = 0;
         antlr4::ParserRuleContext* site = nullptr;
+        // Queued only through a pointer use (`Wrap<S>* p`). Its body waits until every struct
+        // argument is defined, since a pointer needs the name, never the layout or methods.
+        bool pointerOnly = false;
     };
 
     // The record ProcessPendingInstantiations is draining right now, when it has at least one
@@ -303,6 +306,9 @@ struct GenericTemplateState
     std::unordered_set<std::string>                                             instantiatedGenericFunctions;
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericFunctionConstraints;
     std::vector<PendingInstantiation>                                           pendingInstantiations;
+    // Set by the active MainListener: drains a waiting pointer-only instance on its first by-value
+    // layout lookup (GetType). Null outside a listener's walk.
+    std::function<void(const std::string&)>                                     drainWaitingInstance;
     // Mangled tuple name -> its element type args. Recorded wherever a tuple shell is named
     // (including the forward-ref pre-scan) so a destructure can lazily instantiate the fields
     // when the tuple is reached only via a return type before its producer was code-generated.
@@ -863,6 +869,8 @@ public:
          * pointer slot, never the pointee - pointee const is IsCxxPointeeConst.
          */
         bool IsCxxConstRef = false;
+        // Top-level const on a C++ class returned by value; applies to its call-result prvalue.
+        bool IsCxxConstValueReturn = false;
         // C++ pointer result whose innermost POINTEE is const (`const T*`, `const T*&`,
         // `T const *const &`, `const T *const *`). Internal only: overload ranking and receivers.
         bool IsCxxPointeeConst = false;
@@ -875,6 +883,8 @@ public:
         // or 0 binds a C++ nullptr_t parameter. Internal only: overload viability.
         bool IsCxxNullptrT = false;
         bool IsCxxConstField = false;
+        // Explicit const on this C++ field, separate from constness inherited from its receiver.
+        bool IsCxxDeclaredConstField = false;
         // C++ mutable field; the member object ignores constness of its parent.
         bool IsCxxMutableField = false;
         // Set by the ForwardRefScanner body-scan on a plain by-value parameter the callee body
@@ -915,7 +925,7 @@ public:
         // IsThinFnPtr() is DERIVED from TypeName (not stored) so the two can never drift; set
         // TypeName to one of the two names above and this follows.
         bool IsThinFnPtr() const { return TypeName == "__c_fn_ptr"; }
-        // The three signature fields below can be populated with IsFunctionPointer still FALSE:
+        // Signature metadata below can be populated with IsFunctionPointer still FALSE:
         // the direct call-argument loop copies the SIGNATURE of a stored `function<>`/`Lambda<>`
         // argument without claiming the argument IS one, because setting IsFunctionPointer or
         // TypeName there would re-route unrelated calls through other branches of the scorer.
@@ -929,6 +939,8 @@ public:
         bool FuncPtrReturnAlias = false;
         // C variadic signature `R (*)(P..., ...)`: calls pass the tail with default promotions.
         bool FuncPtrVariadic = false;
+        // C `R (*)()` has no prototype; unlike `(void)` it does not constrain call arity.
+        bool FuncPtrNoPrototype = false;
         /*
          * Number of '*' on a signature component. 0 means NOT RECORDED, never "not a pointer" -
          * `Pointer` already answers that, and many producers (C-interop, WinRT, synthesized
@@ -1276,11 +1288,13 @@ public:
         bool IsRvalueRef = false;
         bool IsCxxRefToPointer = false;
         bool IsCxxConstRef = false;
+        bool IsCxxConstValueReturn = false;
         bool IsCxxPointeeConst = false;
         bool IsCxxPointeeVolatile = false;
         bool IsSpelledPointeeConst = false;
         bool IsCxxNullptrT = false;
         bool IsCxxConstField = false;
+        bool IsCxxDeclaredConstField = false;
         bool IsCxxMutableField = false;
         bool IsOwningSink = false;
         bool IsConsumeInferredSink = false;
@@ -1299,6 +1313,7 @@ public:
         bool FuncPtrReturnOwned = false;
         bool FuncPtrReturnAlias = false;
         bool FuncPtrVariadic = false;
+        bool FuncPtrNoPrototype = false;
         int FuncPtrReturnPointerDepth = 0;
         std::string FuncPtrReturnResolvedKey;
         struct FuncPtrParam
@@ -1348,11 +1363,13 @@ public:
             s.IsRvalueRef = t.IsRvalueRef;
             s.IsCxxRefToPointer = t.IsCxxRefToPointer;
             s.IsCxxConstRef = t.IsCxxConstRef;
+            s.IsCxxConstValueReturn = t.IsCxxConstValueReturn;
             s.IsCxxPointeeConst = t.IsCxxPointeeConst;
             s.IsCxxPointeeVolatile = t.IsCxxPointeeVolatile;
             s.IsSpelledPointeeConst = t.IsSpelledPointeeConst;
             s.IsCxxNullptrT = t.IsCxxNullptrT;
             s.IsCxxConstField = t.IsCxxConstField;
+            s.IsCxxDeclaredConstField = t.IsCxxDeclaredConstField;
             s.IsCxxMutableField = t.IsCxxMutableField;
             s.IsOwningSink = t.IsOwningSink;
             s.IsConsumeInferredSink = t.IsConsumeInferredSink;
@@ -1371,6 +1388,7 @@ public:
             s.FuncPtrReturnOwned = t.FuncPtrReturnOwned;
             s.FuncPtrReturnAlias = t.FuncPtrReturnAlias;
             s.FuncPtrVariadic = t.FuncPtrVariadic;
+            s.FuncPtrNoPrototype = t.FuncPtrNoPrototype;
             s.FuncPtrReturnPointerDepth = t.FuncPtrReturnPointerDepth;
             s.FuncPtrReturnResolvedKey = t.FuncPtrReturnResolvedKey;
             for (const auto& p : t.FuncPtrParams)
@@ -1421,11 +1439,13 @@ public:
             t.IsRvalueRef = IsRvalueRef;
             t.IsCxxRefToPointer = IsCxxRefToPointer;
             t.IsCxxConstRef = IsCxxConstRef;
+            t.IsCxxConstValueReturn = IsCxxConstValueReturn;
             t.IsCxxPointeeConst = IsCxxPointeeConst;
             t.IsCxxPointeeVolatile = IsCxxPointeeVolatile;
             t.IsSpelledPointeeConst = IsSpelledPointeeConst;
             t.IsCxxNullptrT = IsCxxNullptrT;
             t.IsCxxConstField = IsCxxConstField;
+            t.IsCxxDeclaredConstField = IsCxxDeclaredConstField;
             t.IsCxxMutableField = IsCxxMutableField;
             t.IsOwningSink = IsOwningSink;
             t.IsConsumeInferredSink = IsConsumeInferredSink;
@@ -1444,6 +1464,7 @@ public:
             t.FuncPtrReturnOwned = FuncPtrReturnOwned;
             t.FuncPtrReturnAlias = FuncPtrReturnAlias;
             t.FuncPtrVariadic = FuncPtrVariadic;
+            t.FuncPtrNoPrototype = FuncPtrNoPrototype;
             t.FuncPtrReturnPointerDepth = FuncPtrReturnPointerDepth;
             t.FuncPtrReturnResolvedKey = FuncPtrReturnResolvedKey;
             for (const auto& p : FuncPtrParams)
@@ -1635,6 +1656,8 @@ public:
         // True only for a value-producing expression. Named variables, fields, elements, aliases,
         // and dereferences remain lvalues even when their LLVM value has no storage of its own.
         bool IsRvalue = false;
+        // CFlat brace arguments load from their construction slot instead of a call instruction.
+        bool IsCFlatBraceInitTemp = false;
         // Storage is this argument's C++ prvalue temp (call, operator or ctor result), not a named slot.
         bool IsCxxPrvalueTemp = false;
         // Direct foreign C++ construction deferred into a generated call wrapper.
@@ -1930,8 +1953,8 @@ public:
         // extracted out of a returned temp). The copy is shallow and dies with the full expression,
         // so reads are fine but 'move' and stores through it are rejected.
         bool IsTempSpillStorage = false;
-        // The ternary result is already covered by a temp registration. Alias lowering uses this
-        // to avoid registering its materialized copy a second time.
+        // Ternary arm temps are already registered; an owning destination adopts those entries
+        // instead of registering the joined value a second time.
         bool TernaryTempAlreadyRegistered = false;
         // True only for a parenthesized produced rvalue whose recovery spill is not an lvalue.
         bool IsParenthesizedProducedTemp = false;
@@ -3640,6 +3663,12 @@ private:
     std::string currentNamespace_;
     std::unordered_map<std::string, std::unordered_set<std::string>> importAliasMembers;
     std::unordered_set<std::string> importedFiles;
+    // Core files imported by user code, and the core symbols they registered (key -> file).
+    // Feeds the T268 redefinition rule; runtime.cb-graph symbols are never recorded.
+    std::unordered_set<std::string> explicitCoreImportFiles_;
+    std::unordered_map<std::string, std::string> explicitCoreFunctionFile_;
+    std::unordered_map<std::string, std::string> explicitCoreTemplateFile_;
+    bool compilingExplicitCoreFile_ = false;  // true while an explicit core import compiles
     std::vector<std::string> importStack;  // DFS stack for circular import detection
     std::vector<std::string> importSearchDirs;  // -i dirs, searched in order (first match wins)
     std::string runtimeDir;
@@ -4293,6 +4322,7 @@ private:
         std::vector<cflat_cinterop::RawCxxCtorTemplate> ctorTemplates;
         std::vector<cflat_cinterop::RawCxxMember> members;
         std::vector<cflat_cinterop::RawCxxStaticVar> staticVars;
+        std::vector<std::string> scopeNames;   // class-scope names incl. bases (see RawCxxRecord)
         std::vector<CRecordFieldEntry> fields;
         int line = 1;
         int col = 0;
@@ -5647,12 +5677,11 @@ private:
     // fields of an already-registered owning temp (FromOwningTempField) run their own paths.
     void RegisterBorrowedOwningStructTemp(const NamedVariable& arg, bool fromTernaryArm = false);
 
-    // A `?:` argument whose arms each registered an owning struct temp (TernaryTempAlreadyRegistered)
-    // is moving into an alias-return copy slot: drop those arm entries so the slot is the one owner.
-    // True only when every incoming value of the join had its own entry.
+    // When a `?:` value moves into an owning slot, drop its arm entries so the destination is the
+    // one owner. True only when every incoming value of the join had its own entry.
     bool AdoptTernaryArmStructTemps(llvm::PHINode* join);
-    // T197: a closure arm moved into a closure join is owned by the join; drop the struct-temp
-    // entry the per-arm registration made for that same value, or it frees the value a second time.
+    // A produced value stored into an owning slot is owned there; drop its temp entry to avoid a
+    // second destructor for the same value.
     void UnregisterOwnedStructTempsHolding(llvm::Value* value);
 
     // Shared gate: true when `arg` is an unowned produced rvalue of an owning struct type, i.e.
@@ -10009,6 +10038,8 @@ public:
     void ConstructThroughCxxCtorWrapper(NamedVariable& arg, const NamedVariable& source,
                                         const std::string& targetType,
                                         const std::string& wrapperName, llvm::Value* intoSlot);
+    static bool IsCxxFixedArrayArgument(const NamedVariable& arg);
+    static TypeAndValue CxxFixedArrayDecayType(const NamedVariable& arg);
     /*
      * The shared converting-constructor resolver (internal/plan/converting-constructors.md,
      * phase 1): ONE implicit user-defined conversion `T(source)` into C++ class `targetType`,
@@ -10111,6 +10142,9 @@ public:
     // nullptr when the global one applies. 'sized' = the (void*, size_t) delete form.
     const FunctionSymbol* FindCxxClassAllocFunction(const std::string& typeName,
                                                     const std::string& opName, bool& sized);
+    // True when a CFlat-declared (not projected from C++) member 'opName' is declared on typeName
+    // itself. It hides the base's C++ overloads of that name, so the class-scope pick is CFlat's.
+    bool HasCflatClassAllocFunction(const std::string& typeName, const std::string& opName);
     llvm::Value* CallCxxClassAllocFunction(const FunctionSymbol& sym, std::vector<llvm::Value*> args,
                                            bool mayUnwind);
     // A foreign C++ class whose heap blocks come from the C++ allocation functions (class-scope
@@ -10360,6 +10394,8 @@ public:
     // C++ class member lookup for `name` in typeName or a base ([stmt.ranged] asks whether
     // begin/end are members at all, before access or viability); any member kind counts.
     bool CxxClassHasMemberNamed(const std::string& typeName, const std::string& name);
+    // Complete class-scope lookup (enumerators, nested types, private names): [stmt.ranged].
+    bool CxxClassHasScopeName(const std::string& typeName, const std::string& name);
     void EnsureCxxGateSpecialMembersProjected(const std::string& typeName);
     // R1: define the deferred special members of a header record (and its pending bases) in
     // its group's live Interpreter, then fold the member facts into the retained record.
@@ -10549,6 +10585,11 @@ public:
     bool IsKnownTypeName(const std::string& name) const;
 
     llvm::Type* GetType(const LLVMBackend::TypeAndValue& typeAndValue, llvm::Type* autoType = nullptr, bool allowPointer = true) const;
+    // Drain the waiting pointer-only instance named `name`, if a listener is active. Cheap when no
+    // record is pending. Called before any by-value layout lookup of a generic instance.
+    void TouchWaitingInstance(const std::string& name) const;
+    // The same drain keyed by an LLVM type: looks through arrays to a named struct.
+    void TouchWaitingLayout(llvm::Type* type) const;
 
     // Array-view element gate: true only when a view SOURCE binds to a destination whose
     // ELEMENT representation is PROVEN different (name/depth). Fills the two spellings.
@@ -11033,6 +11074,9 @@ public:
         // beats one bound to `const refTarget&` (2).
         std::string refTarget;
         int refBind = 0;
+        // [over.ics.rank] 3.2.3 for a derived-to-base binding: `Base&&` to an rvalue (1) beats
+        // `Base&` / `const Base&` (2); a by-value base has no binding kind (0).
+        int derivedRefBind = 0;
     };
     // The candidate C++ would call when CFlat's call rules refuse it (see ComputeOverloadFunction).
     struct CxxPreferredOverload
@@ -11728,6 +11772,10 @@ public:
     // A C++ class VALUE slices to a by-value/by-reference parameter of a PUBLIC base of it.
     bool IsCxxDerivedToBaseValue(const TypeAndValue& from, const TypeAndValue& to,
                                  const NamedVariable* source) const;
+    // A derived-to-base binding to a reference parameter: an lvalue reference, or `Base&&` when the
+    // argument is a PROVEN rvalue. By-value parameters are not reference bindings (false).
+    bool IsCxxDerivedToBaseReferenceBinding(const TypeAndValue& from, const TypeAndValue& to,
+                                            const NamedVariable& arg) const;
     bool IsCxxSharedPtrUpcast(const TypeAndValue& from, const TypeAndValue& to) const;
     bool IsCxxDerivedToBasePointer(const TypeAndValue& from, const TypeAndValue& to) const
     {
@@ -12256,6 +12304,12 @@ public:
     std::optional<IsolatedPolicy> GetIsolatedPolicy() const;
     bool IsIsolated() const;
     bool CurrentSourceIsCoreLibrary() const;
+    // True when `path` (a file or the root) lives in the core library directory.
+    bool IsCoreSourcePath(const std::string& path) const;
+    // Records a core function (key = UniqueName) or generic template (key = name) registered
+    // while an explicit core import compiles; IsExplicitCoreFunction answers for the T268 rule.
+    void RecordExplicitCoreFunction(const std::string& key, bool genericTemplate);
+    bool IsExplicitCoreFunction(const std::string& key, bool genericTemplate) const;
     /*
      * The directory of an analyzed ROOT that is itself a core library source (the LSP opening
      * cflat/core/list.cb, or --check on it). That checkout is a second copy of the library, so
@@ -12484,7 +12538,10 @@ public:
     // 259: C++ member cache marks methods introduced by a using-declaration (T221).
     // 260: a header whose used virtual destructor has an unusable operator delete is refused (T294).
     // 261: a cast null-pointer macro records its pointee type (T296).
-    static constexpr int kCHeaderCacheVersion = 261;
+    // 262: C++ records carry every class-scope name ("sn") for range-for member lookup (T328).
+    // 263: C header cached signatures retain C no-prototype function-pointer state (T332 r2).
+    // 264: C++ fields retain explicit constness for mutable-ancestry write checks (T335 r2).
+    static constexpr int kCHeaderCacheVersion = 264;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

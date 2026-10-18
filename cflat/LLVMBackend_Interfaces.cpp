@@ -525,9 +525,24 @@ namespace
             const std::string word = text.substr(i, j - i);
             auto it = binding.find(word);
             out += it != binding.end() ? it->second : word;
+            // A pack expansion `P...` spells the joined list; the ellipsis is not part of it.
+            if (it != binding.end() && text.compare(j, 3, "...") == 0) j += 3;
             i = j;
         }
         return out;
+    }
+
+    // True when a pattern argument spells `name...` as a whole identifier, directly or nested
+    // ("Seq<I...>", "TypeList<T...>"). Only a parameter pack can be expanded that way.
+    bool SpellsPackExpansion(const std::string& text, const std::string& name)
+    {
+        for (size_t at = 0; (at = text.find(name, at)) != std::string::npos; at += name.size())
+        {
+            const bool leftOk = at == 0
+                || (std::isalnum((unsigned char)text[at - 1]) == 0 && text[at - 1] != '_');
+            if (leftOk && text.compare(at + name.size(), 3, "...") == 0) return true;
+        }
+        return false;
     }
 
     // Whole-identifier containment, so `TT` does not match `T`.
@@ -556,7 +571,14 @@ bool LLVMBackend::ApplyCxxAliasPattern(std::string& base, std::vector<std::strin
         {
             const CxxAliasPattern* pattern = FindFirstVisibleScoped(cxxAliasPatterns_, base);
             if (pattern == nullptr || pattern->targetBase.empty()) break;
-            if (args.size() > pattern->params.size())
+            // A LAST parameter that the pattern expands (`Seq<I...>`) is a pack: it takes every
+            // remaining use-site argument, possibly none. A pack elsewhere is not spelled here.
+            const bool packParam = !pattern->params.empty()
+                && std::ranges::any_of(pattern->args, [&](const std::string& patternArg) {
+                       return SpellsPackExpansion(patternArg, pattern->params.back());
+                   });
+            const size_t fixedCount = packParam ? pattern->params.size() - 1 : pattern->params.size();
+            if (!packParam && args.size() > pattern->params.size())
             {
                 if (error != nullptr)
                     *error = std::format(
@@ -567,13 +589,23 @@ bool LLVMBackend::ApplyCxxAliasPattern(std::string& base, std::vector<std::strin
             // Use-site arguments bind positionally; the alias's OWN parameter defaults cover the
             // rest. A default may name an earlier parameter, so bind left to right.
             std::unordered_map<std::string, std::string> binding;
-            for (size_t i = 0; i < pattern->params.size(); ++i)
+            for (size_t i = 0; i < fixedCount; ++i)
             {
                 if (i < args.size()) { binding.emplace(pattern->params[i], args[i]); continue; }
                 const std::string& fallback = i < pattern->paramDefaults.size()
                     ? pattern->paramDefaults[i] : std::string{};
                 if (!fallback.empty())
                     binding.emplace(pattern->params[i], SubstituteAliasParams(fallback, binding));
+            }
+            // The pack's elements stay separate arguments; nested uses see them joined.
+            std::vector<std::string> packArgs;
+            if (packParam)
+            {
+                for (size_t i = fixedCount; i < args.size(); ++i) packArgs.push_back(args[i]);
+                std::string joined;
+                for (const std::string& element : packArgs)
+                    joined += (joined.empty() ? "" : ", ") + element;
+                binding.emplace(pattern->params.back(), joined);
             }
             auto isUnboundParam = [&](const std::string& text) {
                 return binding.count(text) == 0
@@ -620,6 +652,11 @@ bool LLVMBackend::ApplyCxxAliasPattern(std::string& base, std::vector<std::strin
             std::vector<std::string> substituted;
             for (size_t i = 0; i < keep; ++i)
             {
+                if (packParam && pattern->args[i] == pattern->params.back() + "...")
+                {
+                    substituted.insert(substituted.end(), packArgs.begin(), packArgs.end());
+                    continue;
+                }
                 auto bound = binding.find(pattern->args[i]);
                 substituted.push_back(bound != binding.end()
                     ? bound->second : SubstituteAliasParams(pattern->args[i], binding));

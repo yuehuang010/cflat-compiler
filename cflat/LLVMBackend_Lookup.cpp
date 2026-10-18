@@ -204,6 +204,21 @@ static bool IsKeywordPrimitiveSpelling(const std::string& name)
     return name.size() <= 6 && keywords.count(std::string_view(name)) != 0;
 }
 
+void LLVMBackend::TouchWaitingInstance(const std::string& name) const
+{
+        if (!gts.drainWaitingInstance || gts.pendingInstantiations.empty() || name.empty())
+            return;
+        gts.drainWaitingInstance(name);
+}
+
+void LLVMBackend::TouchWaitingLayout(llvm::Type* type) const
+{
+        while (type != nullptr && type->isArrayTy())
+            type = llvm::cast<llvm::ArrayType>(type)->getElementType();
+        if (auto* st = type != nullptr ? llvm::dyn_cast<llvm::StructType>(type) : nullptr; st != nullptr && st->hasName())
+            TouchWaitingInstance(st->getName().str());
+}
+
 llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, llvm::Type* autoType, bool allowPointer) const
 {
         if (typeAndValue.IsFunctionPointer)

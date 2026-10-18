@@ -4422,6 +4422,7 @@ private:
     // function pointer. An immediately-invoked lambda literal reads its return type from here
     // instead of inheriting the enclosing literal's. Empty (and never "auto") when no context.
     LLVMBackend::TypeAndValue declExpectedType;
+    CFlatParser::CastExpressionContext* pendingCxxCastInitContext_ = nullptr;
     // Parser ambiguity for `decl = () => _ = expr`: the outer assignment can claim the discard
     // tail, leaving the lambda body as `_`. The named-expression path temporarily hands that RHS
     // to ParseLambdaExpression so the discard remains inside the lambda.
@@ -4770,6 +4771,7 @@ private:
     // False when rightNV is not that move; the caller then runs its normal store path.
     bool EmitDeferredLoweredMoveIntoField(llvm::Value* slot, const std::string& typeName,
                                           const LLVMBackend::NamedVariable& rightNV,
+                                          CFlatParser::MoveExpressionContext* moveSite,
                                           bool destinationIsFresh,
                                           const LLVMBackend::OwnedTempMark& ownedTempMark);
     struct CallArgumentScope {
@@ -4874,17 +4876,32 @@ private:
     // immediately so the mangled type name resolves even before the body is emitted;
     // interface templates are instantiated later by ProcessPendingInstantiations.
     // No-op for unknown base names (e.g. an unresolved type parameter like "T").
+    // pointerOnly: the use is spelled `T<..>*`; a later by-value use promotes the record.
     void QueueGenericInstantiation(const std::string& baseName,
                                    const std::vector<std::string>& typeArgs,
                                    const std::string& mangledName,
-                                   antlr4::ParserRuleContext* site = nullptr);
+                                   antlr4::ParserRuleContext* site = nullptr,
+                                   bool pointerOnly = false);
 
     // Append a pending instantiation, stamping the USER-side origin: the argument site in the
     // file being walked, or the outer record's origin when queued from inside a template body.
     void QueuePendingInstantiation(const std::string& templateName,
                                    const std::vector<std::string>& typeArgs,
                                    const std::string& mangledName,
-                                   antlr4::ParserRuleContext* site = nullptr);
+                                   antlr4::ParserRuleContext* site = nullptr,
+                                   bool pointerOnly = false);
+
+    // True for a type use spelled as a plain pointer, `T<..>*` (declarationSpecifier with a pointer,
+    // no array suffix, no '?'). Such a use names the instance; it does not need the instance's body.
+    static bool IsPointerOnlyTypeUse(antlr4::tree::ParseTree* typeSpecNode);
+    // A pointer-only record waits (is not drained) while a struct argument is a CFlat struct that
+    // is declared but not yet defined. Its body would otherwise name sizeof(arg) on an opaque shell.
+    bool PendingWaitsOnStructBody(const GenericTemplateState::PendingInstantiation& pending);
+    // A by-value use of an already-queued instance: the pending record's body is needed now.
+    void PromotePointerOnlyInstantiation(const std::string& mangledName);
+    // A member is named through a receiver of this instance: a waiting record drains now.
+    void DrainWaitingPointerInstance(const std::string& mangledName);
+    std::function<void(const std::string&)> savedDrainWaitingInstance_;
 
     // Resolve a type in a function-pointer signature position (return or param) the way an ordinary
     // type position resolves: apply active substitutions, and if it names a generic instantiation
@@ -4992,6 +5009,8 @@ public:
     static std::string EncodeClosureFromSig(LLVMBackend* compiler, const LLVMBackend::TypeAndValue& sig);
 
     MainListener(CFlatParser* parser, LLVMBackend* compilerLLVM, const std::string& filename);
+    // Restores the drain hook the constructor replaced, so no touch reaches a dead listener.
+    ~MainListener();
 
     // Retry global default folds after all declarations and deferred instantiations are emitted.
     // Returns the native constructions that did not fold (run by the emit step below).
@@ -6640,6 +6659,12 @@ public:
                                      const LLVMBackend::TypeAndValue& target,
                                      const LLVMBackend::NamedVariable& rhsNV);
 
+    // C++ axis: a const C++ object's address into a mutable C++ record pointer slot (clang refuses).
+    bool RejectConstRecordPointeeStore(antlr4::ParserRuleContext* ctx,
+                                     const LLVMBackend::TypeAndValue& target,
+                                     const LLVMBackend::NamedVariable& rhsNV,
+                                     const std::string& kind, const std::string& name);
+
     // Primitive-to-pointer sibling: a nonzero scalar is a value, not an address.
     bool RejectImplicitPrimitiveToPointer(antlr4::ParserRuleContext* ctx,
                                      const LLVMBackend::TypeAndValue& target,
@@ -7366,7 +7391,7 @@ public:
     // Construct a lowered struct value into raw storage from its source address (construct_at).
     bool EmitLoweredValueIntoSlot(LLVMBackend* compiler, const std::string& typeName,
         llvm::Value* slot, LLVMBackend::NamedVariable& sourceNV, llvm::Value* sourceValue,
-        antlr4::ParserRuleContext* ctx);
+        antlr4::ParserRuleContext* ctx, const char* context = "into construct_at storage");
 
     // Construct one foreign nontrivial C++ value into a fresh or replacement slot. This is
     // shared by scalar struct fields and fixed-array elements so their copy/move decisions agree.

@@ -3363,6 +3363,44 @@ struct OwnLt : OwnLtMid { bool operator<(int) { return true; } };
 inline bool operator<(OwnLtMid&, int) { return false; }
 }
 
+// T321: a derived PRVALUE against a base free operator. `RC&&` binds the base by derived-to-base
+// (rank 2); a by-value base parameter slices the prvalue (clang 2, 2; master 1, 1).
+namespace t321 {
+struct RB { int operator+(int) { return 1; } }; struct RC : RB {}; struct RA : RC {};
+inline int operator+(RC&&, int) { return 2; }
+inline RA raMk() { return RA(); }
+inline int fr(RC&&) { return 2; }
+inline int fr(RB&&) { return 3; }
+struct VB { int operator+(int) { return 1; } }; struct VC : VB {}; struct VA : VC {};
+inline int operator+(VC, int) { return 2; }
+inline VA vaMk() { return VA(); }
+struct MB { int operator+(int) { return 1; } }; struct MM : MB {}; struct MT : MM {};
+inline int operator+(MB, int) { return 3; }
+}
+
+// T321 round 2: a derived prvalue against Base&& and const Base& frees, and unrelated-base ties.
+namespace t321r2 {
+struct B4 {}; struct A4 : B4 {};
+inline bool operator==(B4&&, int) { return true; }
+inline A4 a4Mk() { return A4(); }
+struct M {}; struct MD : M {};
+inline int fm(M&&) { return 2; }
+inline int fm(const M&) { return 3; }
+inline int operator+(M&&, int) { return 2; }
+inline int operator+(const M&, int) { return 3; }
+inline MD mdMk() { return MD(); }
+struct Y9a {}; struct Y9b {}; struct A9 : Y9a, Y9b {};
+inline int operator+(Y9a, int) { return 2; }
+inline int operator+(Y9b&&, int) { return 3; }
+inline A9 a9Mk() { return A9(); }
+inline int fy(Y9a) { return 2; }
+inline int fy(Y9b&&) { return 3; }
+struct H5B {}; struct H5Mid : H5B {}; struct H5D : H5Mid {};
+inline int f5(H5B&&) { return 1; }         // loses: D->Mid beats D->B ([over.ics.rank] 4.4)
+inline int f5(const H5Mid&) { return 2; }
+inline H5D h5Mk() { return H5D(); }
+}
+
 // T316: a hidden friend == set with int and double overloads and a converting ctor. `x == 1L`
 // is ambiguous in clang (refused); the shapes below pick the overload clang picks.
 namespace t316 {

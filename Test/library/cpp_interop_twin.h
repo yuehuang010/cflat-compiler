@@ -518,6 +518,39 @@ namespace cpptw
     {
         int values[2] = { 3, 7 };
     };
+
+    // [stmt.ranged]: member lookup finds begin AND end (any kind) -> r.begin()/r.end(); not
+    // callable here, so CFlat refuses (clang: called object type is not a function, etc.).
+    struct EnumBothRange { enum { begin, end }; int values[3] = { 1, 2, 3 }; };
+    struct TypeBothRange { struct begin {}; struct end {}; int values[3] = { 1, 2, 3 }; };
+    struct PrivateTypesRange { private: struct begin {}; struct end {}; public: int values[3] = { 1, 2, 3 }; };
+    struct InheritEnumRange : EnumBothRange {};
+    inline int* begin(EnumBothRange& range) { return range.values; }
+    inline int* end(EnumBothRange& range) { return range.values + 3; }
+    inline int* begin(TypeBothRange& range) { return range.values; }
+    inline int* end(TypeBothRange& range) { return range.values + 3; }
+    inline int* begin(PrivateTypesRange& range) { return range.values; }
+    inline int* end(PrivateTypesRange& range) { return range.values + 3; }
+    inline int* begin(InheritEnumRange& range) { return range.values; }
+    inline int* end(InheritEnumRange& range) { return range.values + 3; }
+
+    // Only begin is a member (ignored: both come from ADL); member begin starts at values + 1.
+    struct OneMemberRange
+    {
+        int values[3] = { 1, 2, 3 };
+        int* begin() { return values + 1; }
+    };
+    inline int* begin(OneMemberRange& range) { return range.values; }
+    inline int* end(OneMemberRange& range) { return range.values + 3; }
+
+    // Member begin/end inherited from a base count as found.
+    struct OrdinaryBaseRange
+    {
+        int values[3] = { 1, 2, 3 };
+        int* begin() { return values; }
+        int* end() { return values + 3; }
+    };
+    struct InheritMemberRange : OrdinaryBaseRange {};
 }
 
 // Global-scope begin/end: ordinary unqualified lookup would find these, [stmt.ranged] does not

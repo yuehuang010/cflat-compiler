@@ -841,7 +841,8 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
 void MainListener::QueueGenericInstantiation(const std::string& baseName,
                                    const std::vector<std::string>& typeArgs,
                                    const std::string& mangledName,
-                                   antlr4::ParserRuleContext* site) {
+                                   antlr4::ParserRuleContext* site,
+                                   bool pointerOnly) {
 #ifndef NDEBUG
         TypeSpelling spelling;
         if (DemangleType(*Compiler(), mangledName, spelling))
@@ -856,12 +857,15 @@ void MainListener::QueueGenericInstantiation(const std::string& baseName,
         if (IsCoreUniqueArrayViewInstantiation(Compiler(), mangledName, typeArgs))
             Compiler()->LogError(CoreUniqueArrayViewMessage(typeArgs));
         if (instantiatedGenerics.count(mangledName))
+        {
+            if (!pointerOnly) PromotePointerOnlyInstantiation(mangledName);
             return;
+        }
         bool isStructOrClass = genericStructTemplates.count(baseName) || genericClassTemplates.count(baseName);
         bool isInterface = genericInterfaceTemplates.count(baseName);
         if (!isStructOrClass && !isInterface)
             return;
-        QueuePendingInstantiation(baseName, typeArgs, mangledName, site);
+        QueuePendingInstantiation(baseName, typeArgs, mangledName, site, pointerOnly);
         instantiatedGenerics.insert(mangledName);
         // One predicate for "is this base an interface name", shared with the three scanner sites.
         if (Compiler()->IsGenericInterfaceTemplateName(baseName))
@@ -1532,6 +1536,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     declType.FuncPtrReturnOwned = fit->FuncPtrReturnOwned;
                     declType.FuncPtrReturnAlias = fit->FuncPtrReturnAlias;
                     declType.FuncPtrVariadic    = fit->FuncPtrVariadic;
+                    declType.FuncPtrNoPrototype = fit->FuncPtrNoPrototype;
                     declType.FuncPtrReturnPointerDepth = fit->FuncPtrReturnPointerDepth;
                     declType.FuncPtrParams         = fit->FuncPtrParams;
                     const int functionPtrDepth = PointerDepthOf(declSpecWithSuffix->pointer());
@@ -2794,6 +2799,8 @@ MainListener::MainListener(CFlatParser* parser, LLVMBackend* compilerLLVM, const
         this->parser = parser;
         this->compilerLLVM = compilerLLVM;
         this->sourceFileName = filename;
+        savedDrainWaitingInstance_ = compilerLLVM->gts.drainWaitingInstance;
+        compilerLLVM->gts.drainWaitingInstance = [this](const std::string& name) { DrainWaitingPointerInstance(name); };
         // The forward-ref scan for this file is complete, so every struct's fields are
         // registered and the queued 'alias' return inference can be gated on ownership.
         compilerLLVM->ResolvePendingAliasReturnInference();
@@ -2841,6 +2848,11 @@ bool MainListener::NativeTemplateNeedsTypeArgs(const std::string& spelledBase,
         if (!isValue || !hasDefault) return true;
     }
     return false;
+}
+
+MainListener::~MainListener()
+{
+        compilerLLVM->gts.drainWaitingInstance = savedDrainWaitingInstance_;
 }
 
 void MainListener::RejectMissingNativeTemplateTypeArgs(antlr4::ParserRuleContext* site,
@@ -3900,6 +3912,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                 compiler->gts.coreGenericTemplates.insert(name);
             else
                 compiler->gts.coreGenericTemplates.erase(name);
+            compiler->RecordExplicitCoreFunction(name, true);
             // Record the declaring namespace, never re-derive it from the key: a call site's bare
             // spelling resolves through it (ResolveGenericFunctionBase) and the body is lowered in it.
             Compiler()->gts.genericTemplateNamespace[name] = namespaceName;
@@ -6047,8 +6060,15 @@ cxx_dtor_ready:
         // or move-constructed from the outermost call's return temporary.
         auto* pf = SolePostfixExpression(assign);
         const std::string pfText = pf != nullptr ? pf->getText() : std::string();
-        // `(T)expr` invoking a C++ conversion operator produces T exactly like a call does.
-        const bool castInit = pf == nullptr && assign->getText().starts_with("(" + typeName + ")");
+        auto* castInitContext = tryGetCastExpression(assign);
+        bool castInit = false;
+        if (castInitContext != nullptr && castInitContext->typeName() != nullptr)
+        {
+            const auto castType = ParseTypeName(castInitContext->typeName(), false, castInitContext);
+            castInit = !castType.Pointer && !castType.ElemPointer && !castType.IsArrayView
+                && compiler->ResolveTypeAlias(castType.TypeName)
+                    == compiler->ResolveTypeAlias(typeName);
+        }
         // A parenthesized ternary or operator ends in ')' but is not a call: it takes the route
         // of its bare spelling (ternary below, operator at the armed-slot test).
         if (((!pfText.empty() && pfText.back() == ')') && SoleTernaryExpression(assign) == nullptr
@@ -6068,8 +6088,40 @@ cxx_dtor_ready:
                 compiler->pendingCxxSretDest_ = slot;
                 compiler->pendingCxxSretTypeName_ = typeName;
             }
-            auto rightNV = parseInitializerOnce();
-            const bool consumed = armed && compiler->pendingCxxSretDest_ == nullptr;
+            else if (castInit)
+            {
+                compiler->pendingCxxSretDest_ = slot;
+                compiler->pendingCxxSretTypeName_ = typeName;
+            }
+            LLVMBackend::NamedVariable rightNV;
+            bool castSlotConsumed = false;
+            {
+                struct RestoreCastInitContext
+                {
+                    CFlatParser::CastExpressionContext*& slot;
+                    CFlatParser::CastExpressionContext* saved;
+                    ~RestoreCastInitContext() { slot = saved; }
+                } restore{ pendingCxxCastInitContext_, pendingCxxCastInitContext_ };
+                struct ClearUnconsumedCastSlot
+                {
+                    LLVMBackend* compiler;
+                    llvm::Value* destination;
+                    bool active;
+                    ~ClearUnconsumedCastSlot()
+                    {
+                        if (active && compiler->pendingCxxSretDest_ == destination)
+                        {
+                            compiler->pendingCxxSretDest_ = nullptr;
+                            compiler->pendingCxxSretTypeName_.clear();
+                        }
+                    }
+                } clearSlot{ compiler, slot, castInit };
+                pendingCxxCastInitContext_ = castInit ? castInitContext : nullptr;
+                rightNV = parseInitializerOnce();
+                castSlotConsumed = castInit && compiler->pendingCxxSretDest_ == nullptr;
+            }
+            const bool consumed = (armed && compiler->pendingCxxSretDest_ == nullptr)
+                || castSlotConsumed;
             compiler->pendingCxxSretDest_ = nullptr;
             compiler->pendingCxxSretTypeName_.clear();
             if (consumed) return true;
@@ -6082,6 +6134,39 @@ cxx_dtor_ready:
             // is cleared by PrepareAliasCallResult, so copy it into the declared slot as a class lvalue.
             if (sameType && rightNV.Storage != nullptr)
             {
+                if (rightNV.IsExplicitMove)
+                {
+                    const bool constSource = compiler->CxxConstReceiverKind(rightNV) != 0;
+                    const std::string sourceName = !rightNV.CallerName.empty()
+                        ? rightNV.CallerName : rightNV.TypeAndValue.VariableName;
+                    std::string refusal;
+                    if (compiler->CxxExplicitMoveNeedsTransfer(typeName, constSource, false))
+                    {
+                        if (!compiler->EmitCxxExplicitMoveTransfer(typeName, slot,
+                                rightNV.Storage, constSource, false, sourceName, refusal))
+                            LogErrorContext(assign, refusal);
+                    }
+                    else
+                        compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, rightNV.Storage,
+                            /*useMove*/ true, std::format("into local '{}'", name).c_str(),
+                            declType.DiagnosticTypeName);
+                    if (auto* source = IsBareIdentifierText(sourceName)
+                            ? compiler->FindLiveNamedVariable(sourceName) : nullptr;
+                        source != nullptr && source->Storage == rightNV.Storage)
+                        compiler->MarkVariableMoved(sourceName);
+                    return true;
+                }
+                if (castInit && rightNV.Storage != slot
+                    && rightNV.Storage == compiler->lastCxxRetTemp_
+                    && compiler->IsForeignNontrivialCxxClass(typeName))
+                {
+                    auto* sourceTemp = rightNV.Storage;
+                    sourceTemp->replaceAllUsesWith(slot);
+                    compiler->UnregisterOwnedStructTemp(sourceTemp);
+                    compiler->lastCxxRetTemp_ = nullptr;
+                    compiler->lastCxxRetValue_ = nullptr;
+                    return true;
+                }
                 const bool useMove = compiler->IsCxxRvalueReferenceArgument(rightNV)
                     && compiler->FindCxxCopyCtor(typeName) == nullptr
                     && compiler->FindCxxMoveCtor(typeName) != nullptr;
@@ -7514,6 +7599,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 llvm::Type* srcMoveTempStructType = nullptr;
                 unsigned srcMoveTempFieldIndex = 0;
                 auto initializer = initDecl->initializer();
+                const bool initializerHasTopLevelMove = initializer != nullptr
+                    && TopLevelMoveExpression(initializer->assignmentExpression()) != nullptr;
                 // Owned-call flags are per declarator: a stale flag (e.g. from a `_ =` discard) would make
                 // the pointer consumer below adopt this borrow as an owner.
                 compiler->lastCallReturnsOwned = false;
@@ -7912,6 +7999,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             bool rhsFuncPtrReturnOwned = false;
                             bool rhsFuncPtrReturnAlias = false;
                             bool rhsFuncPtrVariadic = false;
+                            bool rhsFuncPtrNoPrototype = false;
                             // The RHS's whole function-pointer signature, for bare 'function' inference.
                             LLVMBackend::TypeAndValue rhsFnSig;
                             std::vector<LLVMBackend::TypeAndValue::FuncPtrParam> rhsFuncPtrParams;
@@ -8764,6 +8852,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 rhsFuncPtrReturnOwned = rhsFnSig.FuncPtrReturnOwned;
                                 rhsFuncPtrReturnAlias = rhsFnSig.FuncPtrReturnAlias;
                                 rhsFuncPtrVariadic = rhsFnSig.FuncPtrVariadic;
+                                rhsFuncPtrNoPrototype = rhsFnSig.FuncPtrNoPrototype;
                                 if (rightNV.TypeAndValue.IsFunctionPointer)
                                     rhsFnSig = rightNV.TypeAndValue;
                                 rhsIsThinFnPtr = rhsFnSig.IsFunctionPointer && rhsFnSig.IsThinFnPtr();
@@ -8780,6 +8869,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 RejectArrayViewElementMismatch(assignmentExpression, typeAndValue, rightNV);
                                 // int[] v = runtimeInt; reinterprets a number as an address.
                                 RejectPrimitiveValueIntoArrayView(assignmentExpression, typeAndValue, rightNV);
+                                // A global (or static local) `T* g = &constObject;` is the store `g = &constObject;` refuses.
+                                if (global_scope || isStaticLocal)
+                                    RejectConstRecordPointeeStore(assignmentExpression, typeAndValue,
+                                        rightNV, "global", name);
                                 if (RejectImplicitPrimitiveToPointer(
                                         assignmentExpression, typeAndValue, rightNV, right,
                                         "initialize", std::format("variable '{}'", name)))
@@ -8857,6 +8950,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     typeAndValue.FuncPtrReturnOwned = inferred.FuncPtrReturnOwned;
                                     typeAndValue.FuncPtrReturnAlias = inferred.FuncPtrReturnAlias;
                                     typeAndValue.FuncPtrVariadic = inferred.FuncPtrVariadic;
+                                    typeAndValue.FuncPtrNoPrototype = inferred.FuncPtrNoPrototype;
                                     typeAndValue.FuncPtrReturnPointerDepth = inferred.FuncPtrReturnPointerDepth;
                                     typeAndValue.FuncPtrReturnResolvedKey = inferred.FuncPtrReturnResolvedKey;
                                     typeAndValue.FuncPtrParams = inferred.FuncPtrParams;
@@ -9542,6 +9636,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     typeAndValue.FuncPtrReturnPointerDepth = srcThinFnPtr->FuncPtrReturnPointerDepth;
                     typeAndValue.FuncPtrReturnResolvedKey = srcThinFnPtr->FuncPtrReturnResolvedKey;
                     typeAndValue.FuncPtrVariadic = srcThinFnPtr->FuncPtrVariadic;
+                    typeAndValue.FuncPtrNoPrototype = srcThinFnPtr->FuncPtrNoPrototype;
                     typeAndValue.FuncPtrParams = srcThinFnPtr->FuncPtrParams;
                 }
                 else if (typeAndValue.TypeName == "auto" && right != nullptr && srcClosureFnPtr)
@@ -9558,6 +9653,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     typeAndValue.FuncPtrReturnPointerDepth = srcClosureFnPtr->FuncPtrReturnPointerDepth;
                     typeAndValue.FuncPtrReturnResolvedKey = srcClosureFnPtr->FuncPtrReturnResolvedKey;
                     typeAndValue.FuncPtrVariadic = srcClosureFnPtr->FuncPtrVariadic;
+                    typeAndValue.FuncPtrNoPrototype = srcClosureFnPtr->FuncPtrNoPrototype;
                     typeAndValue.FuncPtrParams = srcClosureFnPtr->FuncPtrParams;
                 }
                 else if (typeAndValue.TypeName == "auto" && right != nullptr
@@ -9596,14 +9692,17 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     if (auto functions = compiler->functionTable.find(name);
                         functions != compiler->functionTable.end())
                         for (const auto& symbol : functions->second)
+                            // Implicit core functions may be overridden; an explicitly imported core file is not.
                             if (!symbol.IsMethod
-                                && (!symbol.IsCoreLibraryFunction || symbol.IsCInteropDeclaration || symbol.IsCxx))
+                                && (!symbol.IsCoreLibraryFunction || symbol.IsCInteropDeclaration || symbol.IsCxx
+                                    || compiler->IsExplicitCoreFunction(symbol.UniqueName, false)))
                             {
                                 sameScopeFunction = true;
                                 break;
                             }
                     if (!sameScopeFunction && genericFunctionTemplates.count(name) != 0
-                        && compiler->gts.coreGenericTemplates.count(name) == 0)
+                        && (compiler->gts.coreGenericTemplates.count(name) == 0
+                            || compiler->IsExplicitCoreFunction(name, true)))
                         sameScopeFunction = true;
                     if (sameScopeFunction)
                         LogErrorContext(direct, std::format(
@@ -9966,6 +10065,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         && compiler->IsLoweredCFlatOnlyStruct(typeAndValue.TypeName);
                     const bool elideCxxReturn = srcCxxRetTemp != nullptr
                         && !typeAndValue.Pointer
+                        && !initializerHasTopLevelMove
                         && (srcInferredTypeName == typeAndValue.TypeName
                             || srcCxxRetTempFromDefault)
                         && compiler->ReturnsViaCxxSret(typeAndValue.TypeName);
@@ -10249,11 +10349,28 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         bool didDeepCopyBorrowString = false;
                         // `T x = move y;` of a lowered struct: restore the bytes the move zeroed and
                         // move-construct the C++ fields; y stays a live moved-from object.
-                        if (srcIsMove && !loweredSretResultRetargeted
+                        if (initializerHasTopLevelMove && srcCxxRetTemp != nullptr
+                            && !loweredSretResultRetargeted
                             && srcStorage == nullptr && srcUnionFieldType == nullptr
                             && right != nullptr && right->getType()->isStructTy()
                             && srcInferredTypeName == typeAndValue.TypeName && !srcInferredPointer
                             && compiler->IsLoweredCFlatOnlyStruct(typeAndValue.TypeName))
+                        {
+                            auto sourceNV = initializerSourceNV;
+                            sourceNV.TypeAndValue.IsMove = true;
+                            sourceNV.IsExplicitMove = true;
+                            sourceNV.IsRvalue = true;
+                            loweredCopyInitInPlace = EmitLoweredValueIntoSlot(compiler,
+                                typeAndValue.TypeName, alloc, sourceNV, right, direct,
+                                "in move initialization");
+                            if (!loweredCopyInitInPlace) return allocList;
+                        }
+                        else if (srcIsMove && !loweredSretResultRetargeted
+                            && srcStorage == nullptr && srcUnionFieldType == nullptr
+                            && right != nullptr && right->getType()->isStructTy()
+                            && srcInferredTypeName == typeAndValue.TypeName && !srcInferredPointer
+                            && compiler->IsLoweredCFlatOnlyStruct(typeAndValue.TypeName))
+                        {
                             if (auto* loaded = llvm::dyn_cast<llvm::LoadInst>(right))
                             {
                                 auto* source = loaded->getPointerOperand();
@@ -10267,6 +10384,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     "in move initialization");
                                 if (!loweredCopyInitInPlace) return allocList;
                             }
+                        }
                         auto* srcInitGep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(srcStorage);
                         bool srcIsNamedSlot = srcStorage != nullptr
                             && (llvm::isa<llvm::AllocaInst>(srcStorage)
@@ -12711,7 +12829,7 @@ void MainListener::CopyWrittenCopyableParams(CFlatParser::FunctionDefinitionCont
  */
 bool MainListener::EmitLoweredValueIntoSlot(LLVMBackend* compiler, const std::string& typeName,
         llvm::Value* slot, LLVMBackend::NamedVariable& sourceNV, llvm::Value* sourceValue,
-        antlr4::ParserRuleContext* ctx)
+        antlr4::ParserRuleContext* ctx, const char* context)
 {
         auto* valueType = sourceValue->getType();
         bool useMove = sourceNV.IsRvalue || sourceNV.IsExplicitMove || sourceNV.TypeAndValue.IsMove;
@@ -12723,6 +12841,9 @@ bool MainListener::EmitLoweredValueIntoSlot(LLVMBackend* compiler, const std::st
         {
             source = compiler->lastLoweredRetTemp_;
             fromTemp = true;
+            // Parenthesized `move (call())` has already zeroed this spill; restore its capture.
+            if (sourceNV.IsExplicitMove || sourceNV.TypeAndValue.IsMove)
+                compiler->builder->CreateStore(sourceValue, source);
         }
         if (source == nullptr)
             if (auto* loaded = llvm::dyn_cast<llvm::LoadInst>(sourceValue))
@@ -12769,13 +12890,19 @@ bool MainListener::EmitLoweredValueIntoSlot(LLVMBackend* compiler, const std::st
             fromTemp = true;
         }
         if (fromTemp) useMove = true;
+        LLVMBackend::UnwindPartialScope moveCleanup(*compiler);
+        if (fromTemp && useMove)
+            compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Members,
+                                        source, typeName);
         const bool built = useMove
             ? compiler->EmitLoweredMemberwiseMove(typeName, valueType, slot, source,
-                                                  "into construct_at storage")
-            : compiler->EmitLoweredMemberwiseCopy(typeName, valueType, slot, source,
-                                                  "into construct_at storage");
+                                                  context)
+            : compiler->EmitLoweredMemberwiseCopy(typeName, valueType, slot, source, context);
         if (!built) return false;
         auto* dtor = compiler->GetOrCreateFullDestructor(typeName);
+        if (useMove)
+            compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot,
+                                        slot, typeName);
         if (fromTemp)
         {
             // The moved-from temporary drops only its C++ fields, never the user destructor.

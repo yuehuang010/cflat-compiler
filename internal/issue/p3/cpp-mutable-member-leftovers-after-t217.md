@@ -1,19 +1,20 @@
-# Mutable C++ members still refused after T217 (inherited, union, array element, sub-struct member)
+# p3: Returned const C++ pointer still permits writes to non-mutable fields
 
-T217 (2026-10-14) made a `mutable` field of a const C++ object writable (direct, compound, postfix; constexpr
-global emitted writable). The T217 Opus review found four shapes clang accepts that master and T217 still
-refuse with "cannot assign to '...': it is a const C++ object" (repros + clang twins:
-scratch/repro_keep/t217_rev/, script rev_t217_opus_probe.sh):
-- inherited: `struct RDer : RBase` with `mutable int bm` in the base, `r_der.bm = 4` (clang rc 4)
-- union member: `union RU { mutable int a; float f; }`, `r_u.a = 4` (clang rc 4)
-- array element of a mutable array member: `mutable int a[2]`, `r_arr.a[1] = 9` (clang rc 9)
-- member of a mutable sub-struct: `mutable RInner in`, `r_mi.in.x = 3` (clang rc 3)
+## Repro
 
-Fix direction: IsCxxMutableFieldAccess (LLVMBackend_VariablesAndIR.cpp ~719) checks only the written address -
-walk up parent field GEPs (stop at a load) and accept if any is mutable (array, sub-struct); propagate the
-mutable flag to flattened base-class fields (LLVMBackend_CInterop.cpp ~22279); mark union member accesses.
-Pin each with its refused non-mutable sibling.
+`Test/library/cpp_t217_mutable.hpp` declares `inline const T217KM* t217_const_ptr()`. This CFlat write currently compiles and runs, but clang++ refuses it:
 
-Also pre-existing (same review): `r_cptr()->n = 6` through a `const RKM*` returned from C++ is accepted (clang
-refuses); `*r_mp.p = 1` on `mutable const int* p` is refused correctly but the text says "const C++ object"
-rather than naming the const pointee.
+```cflat
+import cpp "cpp_t217_mutable.hpp";
+extern int main() { t217_const_ptr()->n = 6; return 0; }
+```
+
+Measured against the master Release executable: compile/run succeeds with exit code 0. `clang++ -std=c++20 -fsyntax-only` says `cannot assign to return value because function 't217_const_ptr' returns a const value`. The mutable sibling `t217_const_ptr()->m` remains writable.
+
+## Root cause
+
+The assignment const-object guard only recognizes a destination whose underlying object is a registered const global. A field reached through a returned pointer has a call-result base, so that guard does not see the returned pointer's const qualification. This is separate from the T335 GEP ancestry and flattened-field metadata gaps, which are fixed in this worktree.
+
+## Fix direction
+
+Propagate const-pointee provenance from a C++ pointer result to member accesses and refuse writes to non-mutable fields while retaining C++ `mutable` writes. Keep the const-reference-result path distinct.

@@ -837,11 +837,14 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
             std::string mangledName = MangledGenericName(baseName, typeArgs);
 
             // Queue the instantiation instead of doing it immediately
+            const bool pointerOnly = IsPointerOnlyTypeUse(typeSpec);
             if (!instantiatedGenerics.count(mangledName))
             {
-                QueuePendingInstantiation(baseName, typeArgs, mangledName, genParams);
+                QueuePendingInstantiation(baseName, typeArgs, mangledName, genParams, pointerOnly);
                 instantiatedGenerics.insert(mangledName);
             }
+            else if (!pointerOnly)
+                PromotePointerOnlyInstantiation(mangledName);
             break;
         }
     }
@@ -889,9 +892,58 @@ bool MainListener::QueueAndProcessLocalEnumInstantiation(
         return true;
 }
 
+bool MainListener::IsPointerOnlyTypeUse(antlr4::tree::ParseTree* typeSpecNode)
+{
+        auto* specItem = typeSpecNode != nullptr
+            ? dynamic_cast<CFlatParser::DeclarationSpecifierContext*>(typeSpecNode->parent) : nullptr;
+        return specItem != nullptr && specItem->pointer() != nullptr
+            && specItem->arrayTypeSuffix() == nullptr && specItem->Question() == nullptr;
+}
+
+bool MainListener::PendingWaitsOnStructBody(const GenericTemplateState::PendingInstantiation& pending)
+{
+        if (!pending.pointerOnly) return false;
+        if (!genericStructTemplates.count(pending.templateName) && !genericClassTemplates.count(pending.templateName))
+            return false;
+        auto& c = *Compiler();
+        for (const auto& arg : pending.typeArgs)
+        {
+            // Only CFlat struct definitions the forward scan saw: a C++ or interop shell is never
+            // waited on, since its completion has no hook here and the record would never drain.
+            if (!c.gts.scannedTypeNames.count(arg) || c.gts.scannedInterfaceNames.count(arg))
+                continue;
+            auto it = c.dataStructures.find(arg);
+            if (it != c.dataStructures.end() && it->second.StructType && it->second.StructType->isOpaque())
+                return true;
+        }
+        return false;
+}
+
+void MainListener::PromotePointerOnlyInstantiation(const std::string& mangledName)
+{
+        for (auto& pending : pendingInstantiations)
+            if (pending.mangledName == mangledName)
+                pending.pointerOnly = false;
+}
+
+void MainListener::DrainWaitingPointerInstance(const std::string& mangledName)
+{
+        bool waiting = false;
+        for (auto& pending : pendingInstantiations)
+            if (pending.mangledName == mangledName && PendingWaitsOnStructBody(pending))
+            {
+                pending.pointerOnly = false;
+                waiting = true;
+            }
+        if (!waiting) return;
+        // Mid-expression: keep the caller's builder position (same guard as the tuple and array sites).
+        LLVMBackend::BuilderStateGuard savedState(Compiler());
+        ProcessPendingInstantiations();
+}
+
 void MainListener::QueuePendingInstantiation(const std::string& templateName,
     const std::vector<std::string>& typeArgs, const std::string& mangledName,
-    antlr4::ParserRuleContext* site)
+    antlr4::ParserRuleContext* site, bool pointerOnly)
 {
         const bool cflatTemplate = genericStructTemplates.count(templateName) != 0
             || genericClassTemplates.count(templateName) != 0
@@ -905,6 +957,7 @@ void MainListener::QueuePendingInstantiation(const std::string& templateName,
             return;
         }
         PendingInstantiation record{ templateName, typeArgs, mangledName };
+        record.pointerOnly = pointerOnly;
         const auto& active = compilerLLVM->gts.activeInstantiationOrigin;
         if (active.valid)
         {
@@ -929,9 +982,20 @@ void MainListener::ProcessPendingInstantiations() {
         {
             // Interface instantiations drain FIRST: a struct layout naming Container<int> in a
             // field (list<Container<int>>._data) needs interfaceTable to already hold it.
-            size_t pick = pendingInstantiations.size() - 1;
+            // A pointer-only record over a struct still being defined stays queued: it drains from
+            // that struct's own flush once the body exists (ParseStructDefinition, after the body).
+            auto waits = [&](size_t i) { return PendingWaitsOnStructBody(pendingInstantiations[i]); };
+            size_t pick = pendingInstantiations.size();
             for (size_t i = pendingInstantiations.size(); i-- > 0; )
-                if (Compiler()->IsGenericInterfaceTemplateName(pendingInstantiations[i].templateName))
+                if (!waits(i))
+                {
+                    pick = i;
+                    break;
+                }
+            if (pick == pendingInstantiations.size())
+                break;
+            for (size_t i = pendingInstantiations.size(); i-- > 0; )
+                if (Compiler()->IsGenericInterfaceTemplateName(pendingInstantiations[i].templateName) && !waits(i))
                 {
                     pick = i;
                     break;

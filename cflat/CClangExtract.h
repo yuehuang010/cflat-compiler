@@ -484,6 +484,9 @@ namespace cflat_cinterop
         std::vector<RawCxxCtorTemplate> ctorTemplates;
         std::vector<RawCxxMember> members;
         std::vector<RawCxxStaticVar> staticVars;
+        // Every class-scope name of the class and its bases (enumerators, nested types,
+        // typedefs, using-decls, private members): [stmt.ranged] member lookup, presence only.
+        std::vector<std::string> scopeNames;
         std::string qualifiedName;
         /*
          * cxxMode: Clang's CANONICAL spelling of the record's own type

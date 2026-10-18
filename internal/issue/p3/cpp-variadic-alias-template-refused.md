@@ -1,13 +1,11 @@
-# Variadic C++ alias template from an in-repo header refused
+# Variadic C++ alias template leftovers after T329
 
-Found by ST4 (2026-10-01), pre-existing. An alias template with a parameter pack, e.g.
-
-```cpp
-template<unsigned long... I> struct Seq { static constexpr unsigned long size() { return sizeof...(I); } };
-template<unsigned long... I> using ISeq = Seq<I...>;
-```
-
-is refused when named from CFlat (`ns.ISeq<0,1,2>`): the alias machinery has no pack support
-(LLVMBackend_Interfaces.cpp ~432). `std.index_sequence` works only because system headers are not
-scanned at import (it goes through a clang type request). Fix: expand packs in the alias
-substitution, or route an in-repo variadic alias through the same clang type request path.
+T329 (2026-10-16) expands a trailing pack that the alias target spells `P...` (ISeq<0,1,2>, ISeq<>, TypeList<T...>,
+Pair<H, TypeList<T...>>). Still refused (master identical):
+- a pack the target never expands: `template<class... T> using Fixed = Single<int>;` (arity refusal). T329 infers "pack"
+  from the pattern spelling only; needs a pack flag from CClangExtract.cpp (HarvestAliasTemplatePattern ~4540,
+  VisitTypeAliasTemplateDecl ~4620) - a new field there needs the header-cache serializer.
+- a pack that is not the last parameter (`template<class... T, class U>`), not measured.
+- (T329 review 1) pattern expansion `template<class... T> using Proj = TypeList<Box<T>...>;` refused with a garbled
+  "TypeList<Box<int>::::::>" text (clang 1); `Mix = Pair2<TypeList<T...>, TypeList<Box<T>...>>` now fails with that text
+  instead of the arity message. An alias using only `sizeof...(T)` (`SzOnly = Val<sizeof...(T)>`) gets the arity refusal.

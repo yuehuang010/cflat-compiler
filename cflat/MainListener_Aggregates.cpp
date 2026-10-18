@@ -1489,9 +1489,59 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 }
                 source += ");\n";
             }
-            source += "}\nnamespace __cflat_user {\nstruct " + shortName + " final";
+            // Scalar operator new / delete the CFlat struct declares. C++ frees a D (unique<D>, delete)
+            // through them, so the twin forwards to CFlat's own members (extern "C" thunks below).
+            bool fwdNew = false, fwdDel = false, fwdDelSized = false;
+            for (auto* func : functionList)
+            {
+                // Class operator new / delete are implicitly static ([class.free]), spelled or not.
+                const std::string opName = getFunctionName(func);
+                if (opName != "operator new" && opName != "operator delete") continue;
+                const auto opParams = ParseParameterTypeList(func->parameterTypeList());
+                auto isPtr = [](const LLVMBackend::DeclTypeAndValue& p) {
+                    return p.PointerDepth > 0 || p.Pointer; };
+                auto isSize = [&](const LLVMBackend::DeclTypeAndValue& p) {
+                    return !isPtr(p) && (p.TypeName == "i64" || p.TypeName == "u64"); };
+                if (opName == "operator new")
+                    fwdNew |= opParams.size() == 1 && isSize(opParams[0]);
+                else if (opParams.size() == 1 && isPtr(opParams[0]))
+                    fwdDel = true;
+                else if (opParams.size() == 2 && isPtr(opParams[0]) && isSize(opParams[1]))
+                    fwdDelSized = true;
+            }
+            if (fwdNew) source += "void* __cflat_opnew_" + shortName + "(decltype(sizeof(0)) n);\n";
+            if (fwdDel) source += "void __cflat_opdel_" + shortName + "(void* p);\n";
+            if (fwdDelSized)
+                source += "void __cflat_opdels_" + shortName + "(void* p, decltype(sizeof(0)) n);\n";
+            auto isByValueCxxRecord = [&](const LLVMBackend::DeclTypeAndValue& param) {
+                if (param.Pointer || param.PointerDepth != 0 || param.IsArrayView
+                    || param.IsAlias || param.IsRvalueRef || param.IsCxxConstRef
+                    || param.IsCxxRefToPointer)
+                    return false;
+                return compiler->GetCxxClassInfo(param.TypeName) != nullptr;
+            };
+            const bool hasByValueCxxRecordOverrideParam = std::any_of(
+                overrides.begin(), overrides.end(), [&](const auto& overrideInfo) {
+                    return std::any_of(overrideInfo.Params.begin(), overrideInfo.Params.end(),
+                                       isByValueCxxRecord);
+                });
+            source += "}\n";
+            if (hasByValueCxxRecordOverrideParam)
+                source += "template <class T> static decltype(auto) __cflat_forward_by_value_"
+                    + shortName + "(T& value) { if constexpr (requires(T&& source) { "
+                    "T(static_cast<T&&>(source)); }) return static_cast<T&&>(value); "
+                    "else return static_cast<const T&>(value); }\n";
+            source += "namespace __cflat_user {\nstruct " + shortName + " final";
             if (!baseCxxName.empty()) source += " : public " + baseCxxName;
             source += " {\n";
+            if (fwdNew)
+                source += "    static void* operator new(decltype(sizeof(0)) n) { return __cflat_opnew_"
+                    + shortName + "(n); }\n";
+            if (fwdDel)
+                source += "    static void operator delete(void* p) { __cflat_opdel_" + shortName + "(p); }\n";
+            if (fwdDelSized)
+                source += "    static void operator delete(void* p, decltype(sizeof(0)) n) { __cflat_opdels_"
+                    + shortName + "(p, n); }\n";
             std::set<std::pair<std::string, std::string>> inheritedUsing;
             for (const auto& method : cppMethods)
                 for (const auto& candidate : compiler->FindCxxBaseMethods(cppBaseName, method.Name))
@@ -1557,9 +1607,16 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 if (raw.retType != "void") source += "return ";
                 source += overrideInfo.StableName + "(this";
                 for (size_t i = 0; i < overrideInfo.Params.size(); ++i)
-                    source += ", " + (overrideInfo.Params[i].VariableName.empty()
-                                      ? "p" + std::to_string(i)
-                                      : overrideInfo.Params[i].VariableName);
+                {
+                    const auto& param = overrideInfo.Params[i];
+                    const std::string paramName = param.VariableName.empty()
+                        ? "p" + std::to_string(i) : param.VariableName;
+                    source += ", ";
+                    if (isByValueCxxRecord(param))
+                        source += "__cflat_forward_by_value_" + shortName + "(" + paramName + ")";
+                    else
+                        source += paramName;
+                }
                 source += "); }\n";
             }
             for (const auto& method : cppMethods)
@@ -1921,6 +1978,61 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                         ParseFunctionDefinition(func, structName);
                 }
             }
+        }
+
+        // The C++ twin's operator new / delete forwarders (see the twin source) call these thunks.
+        // Each takes its target's exact type and forwards its arguments unchanged.
+        if (isCppStruct)
+        {
+            auto ownCflatOp = [&](const std::string& op,
+                                  const std::function<bool(llvm::FunctionType*)>& accept) {
+                llvm::Function* found = nullptr;
+                auto it = compiler->functionTable.find(structName + "." + op);
+                if (it == compiler->functionTable.end()) return found;
+                for (const auto& sym : it->second)
+                {
+                    if (sym.IsCxx || sym.Variadic) continue;
+                    llvm::Function* fn = sym.Function != nullptr
+                        ? sym.Function : compiler->GetFunction(sym.UniqueName);
+                    if (fn != nullptr && accept(fn->getFunctionType())) { found = fn; break; }
+                }
+                return found;
+            };
+            auto emitForwarder = [&](const std::string& name, llvm::Function* target) {
+                if (target == nullptr) return;
+                auto* fty = target->getFunctionType();
+                // The twin's extern "C" declaration may already be imported as a declaration.
+                llvm::Function* thunk = compiler->module->getFunction(name);
+                if (thunk != nullptr && (!thunk->isDeclaration() || thunk->getFunctionType() != fty))
+                    return;
+                if (thunk == nullptr)
+                    thunk = llvm::Function::Create(fty, llvm::GlobalValue::ExternalLinkage,
+                                                   name, compiler->module.get());
+                auto* entry = llvm::BasicBlock::Create(*compiler->context, "entry", thunk);
+                llvm::IRBuilder<> b(entry);
+                std::vector<llvm::Value*> args;
+                for (auto& arg : thunk->args()) args.push_back(&arg);
+                auto* result = b.CreateCall(fty, target, args);
+                if (fty->getReturnType()->isVoidTy()) b.CreateRetVoid();
+                else b.CreateRet(result);
+            };
+            const std::string stem = CppStructThunkStem(structName);
+            auto ptrParam = [](llvm::FunctionType* t, unsigned i) {
+                return i < t->getNumParams() && t->getParamType(i)->isPointerTy(); };
+            auto sizeParam = [](llvm::FunctionType* t, unsigned i) {
+                return i < t->getNumParams() && t->getParamType(i)->isIntegerTy(64); };
+            emitForwarder("__cflat_opnew_" + stem, ownCflatOp("operator new",
+                [&](llvm::FunctionType* t) {
+                    return t->getNumParams() == 1 && sizeParam(t, 0)
+                        && t->getReturnType()->isPointerTy(); }));
+            emitForwarder("__cflat_opdel_" + stem, ownCflatOp("operator delete",
+                [&](llvm::FunctionType* t) {
+                    return t->getNumParams() == 1 && ptrParam(t, 0)
+                        && t->getReturnType()->isVoidTy(); }));
+            emitForwarder("__cflat_opdels_" + stem, ownCflatOp("operator delete",
+                [&](llvm::FunctionType* t) {
+                    return t->getNumParams() == 2 && ptrParam(t, 0) && sizeParam(t, 1)
+                        && t->getReturnType()->isVoidTy(); }));
         }
 
         // Parse destructor

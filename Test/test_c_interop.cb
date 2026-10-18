@@ -470,10 +470,13 @@ static int t137ArrayDimLegs()
 // T170: a C variadic function-pointer typedef binds by name and its calls follow the direct variadic
 // rules (default promotions, pointer tail); a plain C function-pointer typedef name binds too.
 struct T170Hold { T170Vp fn; int k; };
+struct T332BinHold { T170Bin fn; };
 // Native CFlat struct named like the imported typedef T170Shadow (a C fn-ptr): the struct wins.
 struct T170Shadow { int x; };
 
 int t170ApplyVp(T170Vp g, int n) { return g(n, 1, 1); }
+int t332ApplyBin(T170Bin g) { return g(20, 22); }
+T170Bin t332GetBin() { return t170_add; }
 
 // CFlat variadic function bound by bare inference (the signature keeps its variadic flag).
 int t170_inf(int n, ...) { return n + 7; }
@@ -503,6 +506,17 @@ int t170FnPtrLegs()
     if (t170ApplyVp(t170_sum, 2) != 2)      return 3986;   // typedef as a function parameter
     T170Bin bf = t170_add;
     if (bf(1, 2) != 3)                      return 3987;   // plain (non-variadic) typedef name
+    T332BinHold t332Hold = default;
+    t332Hold.fn = t170_add;
+    if (t332Hold.fn(20, 22) != 42)          return 4006;   // exact count through a struct field
+    if (t332ApplyBin(t170_add) != 42)        return 4007;   // exact count through a function parameter
+    if (t332GetBin()(20, 22) != 42)          return 4008;   // exact count through a returned value
+    T332Unproto unproto = t332_get_constant();
+    if (unproto(17) != 42)                   return 4010;   // C17 no-prototype function pointer accepts any arity
+    T332VoidProto t332P = t332_forty_three;
+    T332Unproto t332U = t332P;                                // declared no-prototype type wins over the initializer's
+    if (unproto(17) == -1)                   return t332U(17);
+    if (t332U() != 43)                       return 4011;
     T170Vp rv = t170_getvp();
     if (rv(2, 3, 4) != 7)                  return 3988;   // returned VP keeps its tail
     T170Shadow sh = default;
@@ -537,6 +551,14 @@ int t170FnPtrLegs()
     if (hb.fn(2, 3, 4) != 7)                return 4000;   // brace-init field from a variadic value
     T170Hold hn = { fn = t170_sum, k = 1 };
     if (hn.fn(2, 3, 4) != 7)                return 4001;   // brace-init field from a variadic named function
+    // A C function-pointer typedef is a cast target; the cast keeps the callee (values from clang -std=c17).
+    T170Bin ctb = (T170Bin)t170_add;
+    if (ctb(1, 2) != 3)                     return 4002;   // cast of a named function
+    if (((T170Bin)t170_add)(1, 2) != 3)     return 4003;   // called directly on the cast
+    T170Vp t332Var = t170_sum;
+    if (t332Var(2, 3, 4) != 7)              return 4005;   // variadic function-pointer tail remains accepted
+    T170Vp cvv = (T170Vp)((T170Bin)va);
+    if (cvv(2, 3, 4) != 7)                  return 4004;   // round trip through the plain typedef
     return 0;
 }
 

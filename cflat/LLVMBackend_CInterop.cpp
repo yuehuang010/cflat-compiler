@@ -70,7 +70,7 @@
 static const std::string kCxxWrapperPidDecl =
     "template <class T> struct __cflat_pid { typedef T type; };\n";
 
-static bool IsCxxFixedArrayArgument(const LLVMBackend::NamedVariable& arg)
+bool LLVMBackend::IsCxxFixedArrayArgument(const NamedVariable& arg)
 {
         return (arg.TypeAndValue.ConstArraySize != 0
                 || llvm::isa_and_nonnull<llvm::ArrayType>(arg.BaseType))
@@ -78,8 +78,7 @@ static bool IsCxxFixedArrayArgument(const LLVMBackend::NamedVariable& arg)
             && (arg.Primary == nullptr || arg.Primary->getType()->isPointerTy());
 }
 
-static LLVMBackend::TypeAndValue CxxFixedArrayDecayType(
-        const LLVMBackend::NamedVariable& arg)
+LLVMBackend::TypeAndValue LLVMBackend::CxxFixedArrayDecayType(const NamedVariable& arg)
 {
         LLVMBackend::TypeAndValue type = arg.TypeAndValue;
         if (!IsCxxFixedArrayArgument(arg)) return type;
@@ -1908,6 +1907,7 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
             if (normArgs.empty() || normArgs == "void") return false;   // `(void, ...)` is not C
         }
         out.FuncPtrVariadic = variadic;
+        out.FuncPtrNoPrototype = !cxxBoundary && normArgs.empty();
         if (argList.find("...") != std::string::npos) return false;
 
         // Empty arg list or "void" -> zero params.
@@ -4020,6 +4020,26 @@ static bool CxxSpellingHasConstPointee(const std::string& spelling)
         return false;
 }
 
+static bool CxxSpellingHasTopLevelConst(const std::string& spelling)
+{
+        int templateDepth = 0;
+        for (size_t i = 0; i < spelling.size(); ++i)
+        {
+            if (spelling[i] == '<') { ++templateDepth; continue; }
+            if (spelling[i] == '>') { --templateDepth; continue; }
+            if (templateDepth != 0 || i + 5 > spelling.size()
+                || spelling.compare(i, 5, "const") != 0)
+                continue;
+            const bool leftOk = i == 0 || !(std::isalnum((unsigned char)spelling[i - 1])
+                                             || spelling[i - 1] == '_' || spelling[i - 1] == ':');
+            const size_t end = i + 5;
+            const bool rightOk = end == spelling.size()
+                || !(std::isalnum((unsigned char)spelling[end]) || spelling[end] == '_');
+            if (leftOk && rightOk) return true;
+        }
+        return false;
+}
+
 bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
 {
         e = CSigEntry();
@@ -4111,6 +4131,9 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
         if (r.isCxx && e.ret.Pointer && e.ret.IsRvalueRef && !e.ret.IsFunctionPointer
             && IsCxxRecord(e.ret.TypeName) && CxxRvalueReferenceIsConst(r.retType))
             e.ret.IsCxxConstRef = true;
+        if (r.isCxx && !e.ret.Pointer && !e.ret.IsAlias && !e.ret.IsFunctionPointer
+            && IsCxxRecord(e.ret.TypeName) && CxxSpellingHasTopLevelConst(r.retType))
+            e.ret.IsCxxConstValueReturn = true;
         if (r.isCxx && e.ret.Pointer && !e.ret.IsFunctionPointer
             && CxxSpellingHasConstPointee(r.retType))
             e.ret.IsCxxPointeeConst = true;
@@ -5509,6 +5532,7 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
             rec.specialMembersPending = r.specialMembersPending;
             rec.isTriviallyCopyable = r.isTriviallyCopyable;
             rec.isTriviallyRelocatable = r.isTriviallyRelocatable;
+            rec.scopeNames = r.scopeNames;
             rec.sizeBytes = r.sizeBytes; rec.alignBytes = r.alignBytes;
             rec.isTrivial = r.isTrivial;
             rec.line = r.line ? r.line : 1; rec.col = r.col < 0 ? 0 : r.col;
@@ -8624,6 +8648,7 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
         raw.isTrivial = cached.isTrivial;
         raw.isTriviallyCopyable = cached.isTriviallyCopyable;
         raw.isTriviallyRelocatable = cached.isTriviallyRelocatable;
+        raw.scopeNames = cached.scopeNames;
         raw.isPolymorphic = cached.isPolymorphic;
         raw.hasBases = cached.hasBases;
         raw.hasVirtualBases = cached.hasVirtualBases;
@@ -11754,13 +11779,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             }
         }
 
-        // A fixed array argument reaches C++ decayed, as a prvalue pointer to its first element.
-        auto decaysFixedArray = [](const NamedVariable& arg) {
-            return (arg.TypeAndValue.ConstArraySize != 0
-                    || llvm::isa_and_nonnull<llvm::ArrayType>(arg.BaseType))
-                && !arg.TypeAndValue.IsArrayView
-                && (arg.Primary == nullptr || arg.Primary->getType()->isPointerTy());
-        };
+        // A fixed array argument reaches C++ decayed as a prvalue pointer to element zero.
         auto cflatTypeOf = [&](const NamedVariable& arg) {
             if (IsCxxNullTypedArgument(arg)) return std::string("std.nullptr_t");
             std::string type = !arg.LiteralIdentity.empty()
@@ -11811,7 +11830,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 type += "*";
                 if (arg.TypeAndValue.ElemPointer) type += "*";
             }
-            if (decaysFixedArray(arg))
+            if (IsCxxFixedArrayArgument(arg))
             {
                 if (pointer && arg.TypeAndValue.ElemPointer) return std::string();
                 type += "*";
@@ -12382,7 +12401,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 return constant != nullptr && IsStringLiteralConstant(constant);
             }();
             // A class keeps its storage-based category; a scalar needs positive lvalue proof.
-            const bool decayedArray = decaysFixedArray(arg);
+            const bool decayedArray = IsCxxFixedArrayArgument(arg);
             const bool classArgument = !arg.TypeAndValue.Pointer && !decayedArray
                 && IsCxxRecord(arg.TypeAndValue.TypeName);
             const bool provenLvalue = decayedArray ? false
@@ -17277,7 +17296,7 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             std::vector<TypeAndValue> argTypes;
             for (const NamedVariable& arg : arguments)
             {
-                TypeAndValue tv = arg.TypeAndValue;
+                TypeAndValue tv = CxxFixedArrayDecayType(arg);
                 if (tv.TypeName.empty() && !arg.LiteralIdentity.empty())
                     tv.TypeName = arg.LiteralIdentity;
                 argTypes.push_back(tv);
@@ -17289,7 +17308,13 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             && IsCxxRecord(arguments.front().TypeAndValue.TypeName)
             && HasImplicitClassConversionOperator(arguments.front().TypeAndValue.TypeName))
             declaredWrapperCtor = true;
+        if (!declaredWrapperCtor && IsForeignCxxClassWithConstructors(typeName))
+            declaredWrapperCtor = std::any_of(arguments.begin(), arguments.end(),
+                [](const NamedVariable& arg) { return IsCxxFixedArrayArgument(arg); });
         bool forwardsScalarReference = false;
+        // Mark only this generated top-level declarator; nested tuple types may contain (&).
+        static constexpr std::string_view kArrayReferenceParameterMarker =
+            "(&cflat_array_argument_marker)";
         auto giveUp = [&](const char* why) {
             if (declaredWrapperCtor) error = why;
             return false;
@@ -17423,7 +17448,42 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
                 callArguments.push_back(CxxClosureCallArgument(arg, "p" + std::to_string(i + 1)));
                 continue;
             }
-            if ((arg.TypeAndValue.TypeName == "char" && arg.TypeAndValue.Pointer
+            const bool fixedArray = IsCxxFixedArrayArgument(arg);
+            std::vector<uint64_t> arrayDimensions;
+            if (fixedArray && arg.TypeAndValue.ConstArraySize != 0)
+            {
+                arrayDimensions.push_back(arg.TypeAndValue.ConstArraySize);
+                arrayDimensions.insert(arrayDimensions.end(),
+                    arg.TypeAndValue.ConstInnerDimensions.begin(),
+                    arg.TypeAndValue.ConstInnerDimensions.end());
+            }
+            else if (fixedArray)
+            {
+                llvm::Type* arrayType = arg.BaseType;
+                while (auto* array = llvm::dyn_cast_or_null<llvm::ArrayType>(arrayType))
+                {
+                    arrayDimensions.push_back(array->getNumElements());
+                    arrayType = array->getElementType();
+                }
+            }
+            const bool preserveArrayShape = fixedArray && !arrayDimensions.empty()
+                && std::all_of(arrayDimensions.begin(), arrayDimensions.end(),
+                               [](uint64_t size) { return size != 0; });
+            if (preserveArrayShape)
+            {
+                std::string elementType = cflatType;
+                if (elementType.empty() || elementType.back() != '*')
+                    return giveUp("a fixed-array constructor argument has no element type");
+                elementType.pop_back();
+                if (!CxxSpellingForCflatType(elementType, spelling))
+                    return giveUp("a fixed-array constructor argument type has no C++ spelling");
+                if (declaredPointeeConst(arg) && !spelling.starts_with("const "))
+                    spelling = "const " + spelling;
+                spelling += " " + std::string(kArrayReferenceParameterMarker);
+                for (uint64_t size : arrayDimensions)
+                    spelling += std::format("[{}]", size);
+            }
+            else if ((arg.TypeAndValue.TypeName == "char" && arg.TypeAndValue.Pointer
                     && arg.IsRvalue) || stringLiteral)
                 spelling = "const char *";
             else if (!CxxThinFunctionPointerSpelling(arg.TypeAndValue, spelling)
@@ -17755,6 +17815,16 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         }
 
         std::string wrapperSource;
+        const auto namedParameter = [](std::string spelling, const std::string& name) {
+            const size_t arrayReference = spelling.find(kArrayReferenceParameterMarker);
+            if (arrayReference != std::string::npos)
+            {
+                spelling.replace(arrayReference, kArrayReferenceParameterMarker.size(),
+                                 "(&" + name + ")");
+                return spelling;
+            }
+            return spelling + " " + name;
+        };
         auto compose = [&](const std::vector<std::string>& params,
                            const std::vector<std::string>& args, const std::string& sel) {
             std::string targetCall = ownerSpelling + "(";
@@ -17776,7 +17846,7 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             for (size_t i = 0; i < params.size(); ++i)
             {
                 if (i != 0) wrapperSource += ", ";
-                wrapperSource += params[i] + " p" + std::to_string(i);
+                wrapperSource += namedParameter(params[i], "p" + std::to_string(i));
             }
             // `::new`: a class-scope operator new hides the global placement form (T247).
             wrapperSource += ") { ::new (p0) " + targetCall + "; }\n";
@@ -21628,6 +21698,8 @@ bool LLVMBackend::MakeOpaqueFieldBlob(const CRecordFieldEntry& f, DeclTypeAndVal
         out.ConstArraySize = f.sizeBytes / unit;
         if (f.alignBytes > 8) out.UserAlignValue = f.alignBytes;
         out.VariableName = f.name;
+        out.IsCxxDeclaredConstField = f.isConst;
+        out.IsCxxMutableField = f.isMutable;
         return true;
 }
 
@@ -21922,6 +21994,16 @@ bool LLVMBackend::CxxClassHasMemberNamed(const std::string& typeName, const std:
             return false;
         };
         return lookup(typeName);
+}
+
+bool LLVMBackend::CxxClassHasScopeName(const std::string& typeName, const std::string& name)
+{
+        // scopeNames already folds in the bases (extraction walks them), so one record suffices.
+        EnsureCxxRecordProjected(typeName, false);
+        auto it = cxxRecordEntries_.find(typeName);
+        if (it == cxxRecordEntries_.end()) return false;
+        const auto& names = it->second.scopeNames;
+        return std::find(names.begin(), names.end(), name) != names.end();
 }
 
 bool LLVMBackend::EnsureCxxMemberProjected(const std::string& typeName,
@@ -22651,6 +22733,8 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                         }
                         tv.IsFlexibleArrayMember = f.isZeroSize && !arrDims.empty();
                         tv.IsZeroLengthArrayMember = tv.IsFlexibleArrayMember && zeroLengthArray;
+                        tv.IsCxxDeclaredConstField = r.isCxx && f.isConst;
+                        tv.IsCxxMutableField = f.isMutable;
                         MarkCxxReferenceField(f.ctype, tv, r.isCxx);
                         static_cast<TypeAndValue&>(d) = tv;
                         d.VariableName = f.name;
@@ -22725,6 +22809,8 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                         descriptor.name = field.VariableName;
                         descriptor.ctype = field.TypeName;
                         descriptor.access = cflat_cinterop::AccessPublic;
+                        descriptor.isConst = field.IsCxxDeclaredConstField;
+                        descriptor.isMutable = field.IsCxxMutableField;
                         descriptor.offsetBytes = blockOffset + layout->getElementOffset((unsigned)fi);
                         auto* fieldType = GetType(field);
                         if (fieldType == nullptr || !fieldType->isSized())
@@ -22793,6 +22879,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                     ok = false;
                     break;
                 }
+                tv.IsCxxDeclaredConstField = r.isCxx && f.isConst;
                 tv.IsCxxMutableField = f.isMutable;
                 MarkCxxReferenceField(f.ctype, tv, r.isCxx);
                 // `const char* p`: the pointee stays const for C++ overload choice.
@@ -24520,7 +24607,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
         // A member's declared type, mapped through the shared C spelling mapper. A pointer to a
         // KNOWN aggregate keeps its pointee (the mapper decays struct pointers to void*), which is
         // what makes a method returning `Other*` chain into `Other`'s own members.
-        auto mapType = [&](const std::string& spelling, TypeAndValue& tv) -> bool {
+        auto mapType = [&](const std::string& spelling, TypeAndValue& tv,
+                           bool isReturn = false) -> bool {
             std::vector<uint64_t> dims;
             std::string elem = StripFixedArrayDims(spelling, dims);
             if (!MapCTypeToTypeAndValue(elem, tv, true)) return false;
@@ -24536,6 +24624,9 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 tv.ConstArraySize = dims[0];
                 tv.ConstInnerDimensions.assign(dims.begin() + 1, dims.end());
             }
+            if (isReturn && !tv.Pointer && !tv.IsAlias && !tv.IsFunctionPointer
+                && IsCxxRecord(tv.TypeName) && CxxSpellingHasTopLevelConst(spelling))
+                tv.IsCxxConstValueReturn = true;
             return true;
         };
 
@@ -24629,7 +24720,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             method.ownerType = r.name;
             method.raw = m;
             TypeAndValue ret;
-            if (!mapType(m.retType, ret))
+            if (!mapType(m.retType, ret, true))
             {
                 method.spellable = false;
                 info.directMethods.push_back(std::move(method));
@@ -24929,7 +25020,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             CxxSpellingWithoutRef(m.retType, &returnRefKind);
             const bool stdFunctionRet = !isStructor
                 && mapStdFunction(m.retType, /*isReturn*/ true, /*structorParam*/ false, ret);
-            if (!stdFunctionRet && !mapType(m.retType, ret))
+            if (!stdFunctionRet && !mapType(m.retType, ret, true))
             {
                 refuse(IsLongDoubleSpelling(m.retType) && !IsCInteropLongDoubleSupported()
                     ? CInteropLongDoubleRefusal()
@@ -30136,8 +30227,8 @@ static bool ZeroLiteralAsNullptrArgument(const LLVMBackend::NamedVariable& arg, 
 static LLVMBackend::TypeAndValue InferImplicitCxxArgumentType(
         const LLVMBackend::NamedVariable& arg, const LLVMBackend& backend)
 {
-        if (IsCxxFixedArrayArgument(arg))
-            return CxxFixedArrayDecayType(arg);
+        if (LLVMBackend::IsCxxFixedArrayArgument(arg))
+            return LLVMBackend::CxxFixedArrayDecayType(arg);
         LLVMBackend::TypeAndValue type = arg.TypeAndValue;
         // A nullptr value converts through a ctor taking std::nullptr_t, never as a raw pointer.
         if (LLVMBackend::IsCxxNullTypedArgument(arg))
@@ -30724,6 +30815,20 @@ bool LLVMBackend::IsCxxDerivedToBaseValue(const TypeAndValue& from, const TypeAn
         return FindCxxValueBaseOffset(from.TypeName, to.TypeName, offset, inaccessible, source);
 }
 
+bool LLVMBackend::IsCxxDerivedToBaseReferenceBinding(const TypeAndValue& from, const TypeAndValue& to,
+                                                    const NamedVariable& arg) const
+{
+        if (to.ElemPointer) return false;
+        // An lvalue reference binds exactly as before.
+        if (!to.IsRvalueRef) return to.IsAlias && IsCxxDerivedToBaseValue(from, to, nullptr);
+        // `Base&&` binds a derived prvalue only when the argument's rvalue-ness is proven; an
+        // rvalue reference is never IsAlias (CInterop 4176), so it is checked as an alias here.
+        if (!IsCxxRvalueReferenceArgument(arg)) return false;
+        TypeAndValue target = to;
+        target.IsAlias = true;
+        return IsCxxDerivedToBaseValue(from, target, nullptr);
+}
+
 bool LLVMBackend::IsCxxSharedPtrUpcast(const TypeAndValue& from,
                                        const TypeAndValue& to) const
 {
@@ -30923,6 +31028,9 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
         std::string wrapperError;
         NamedVariable source = arg;
         source.TypeAndValue = argType;
+        // A slice keeps the derived source type: the wrapper's `Base&&` then binds the base subobject
+        // of the object (LowerAliasByPointerArg), not a cast of the derived value.
+        if (slicesToBase) source.TypeAndValue = arg.TypeAndValue;
         source.TypeAndValue.VariableName.clear();
         const auto* info = GetCxxClassInfoWithConstructors(param.TypeName);
         // A non-const `operator T()` beats `T(const S&)` on an lvalue; copy-initialization
@@ -31281,7 +31389,9 @@ LLVMBackend::CxxConvertingCtorResult LLVMBackend::ConvertThroughCxxConvertingCto
             NamedVariable probe = source;
             // Only a literal is const char*; a mutable char* rvalue keeps its spelling.
             if (!source.IsStringLiteral) probe.IsRvalue = false;
-            probe.TypeAndValue = InferImplicitCxxArgumentType(source, *this);
+            // Keep array shape here so clang can bind array references before applying decay.
+            if (!IsCxxFixedArrayArgument(source))
+                probe.TypeAndValue = InferImplicitCxxArgumentType(source, *this);
             probe.TypeAndValue.VariableName.clear();
             std::string wrapperName;
             std::string wrapperError;
@@ -31436,10 +31546,15 @@ bool LLVMBackend::EmitLoweredMemberwiseMove(const std::string& typeName, llvm::T
                                             const char* context, uint64_t skipBefore,
                                             uint64_t skipAfter)
 {
+        UnwindPartialScope movedFields(*this);
         if (auto* arrayType = llvm::dyn_cast<llvm::ArrayType>(valueType))
         {
+            const size_t arrayMark = unwindPartial_.size();
             for (uint64_t i = 0; i < arrayType->getNumElements(); ++i)
             {
+                unwindPartial_.resize(arrayMark);
+                NoteUnwindArrayPrefix(dest, arrayType->getElementType(), builder->getInt64(i),
+                                      typeName);
                 auto* index = builder->getInt64(i);
                 auto* dstElem = builder->CreateInBoundsGEP(arrayType, dest,
                                                            { builder->getInt32(0), index });
@@ -31448,7 +31563,11 @@ bool LLVMBackend::EmitLoweredMemberwiseMove(const std::string& typeName, llvm::T
                 if (!EmitLoweredMemberwiseMove(typeName, arrayType->getElementType(), dstElem,
                                                srcElem, context))
                     return false;
+                unwindPartial_.resize(arrayMark);
+                NoteUnwindArrayPrefix(dest, arrayType->getElementType(), builder->getInt64(i + 1),
+                                      typeName);
             }
+            movedFields.Release();
             return true;
         }
         const bool generated = generatedCxxRecords_.count(typeName) != 0;
@@ -31477,17 +31596,29 @@ bool LLVMBackend::EmitLoweredMemberwiseMove(const std::string& typeName, llvm::T
                     if (!EmitLoweredMemberwiseMove(field.TypeName, fieldType, dstField, srcField,
                                                    context))
                         return false;
+                    if (field.ConstArraySize > 0)
+                    {
+                        auto* arrayType = llvm::dyn_cast<llvm::ArrayType>(fieldType);
+                        if (arrayType == nullptr) return false;
+                        NoteUnwindArrayPrefix(dstField, arrayType->getElementType(),
+                            builder->getInt64(arrayType->getNumElements()), field.TypeName);
+                    }
+                    else
+                        NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, dstField,
+                                          field.TypeName);
                     continue;
                 }
                 auto* value = builder->CreateLoad(fieldType, srcField);
                 builder->CreateStore(value, dstField);
                 builder->CreateStore(llvm::Constant::getNullValue(fieldType), srcField);
             }
+            movedFields.Release();
             return true;
         }
         auto* value = builder->CreateLoad(valueType, src);
         builder->CreateStore(value, dest);
         builder->CreateStore(llvm::Constant::getNullValue(valueType), src);
+        movedFields.Release();
         return true;
 }
 
@@ -32077,6 +32208,16 @@ const LLVMBackend::FunctionSymbol* LLVMBackend::FindCxxClassAllocFunction(
         return nullptr;
     }
 
+bool LLVMBackend::HasCflatClassAllocFunction(const std::string& typeName, const std::string& opName)
+{
+        // Projected base members share this table entry; only CFlat-declared ones answer here.
+        auto it = functionTable.find(typeName + "." + opName);
+        if (it == functionTable.end()) return false;
+        for (const FunctionSymbol& sym : it->second)
+            if (!sym.IsCxx) return true;
+        return false;
+    }
+
 bool LLVMBackend::CxxClassUsesCxxAllocator(const std::string& typeName)
 {
         if (typeName.empty() || GetCxxClassInfo(typeName) == nullptr) return false;
@@ -32108,6 +32249,14 @@ llvm::Value* LLVMBackend::EmitCxxHeapAllocate(const std::string& typeName)
 {
         uint64_t size = 0, align = 0;
         if (!CxxObjectSizeAndAlign(typeName, size, align)) return nullptr;
+        // A CFlat-declared operator new on the class itself hides the base's: CFlat's call.
+        if (HasCflatClassAllocFunction(typeName, "operator new"))
+        {
+            LLVMBackend::NamedVariable szArg;
+            szArg.Primary = builder->getInt64(size);
+            szArg.BaseType = szArg.Primary->getType();
+            return CreateOverloadedFunctionCall(typeName + ".operator new", { szArg });
+        }
         // A class-scope operator new (own or inherited) replaces the global one.
         bool sized = false;
         if (const FunctionSymbol* cls = FindCxxClassAllocFunction(typeName, "operator new", sized))
@@ -32125,6 +32274,12 @@ void LLVMBackend::EmitCxxHeapFree(const std::string& typeName, llvm::Value* ptr)
         uint64_t size = 0, align = 0;
         if (ptr == nullptr || !CxxObjectSizeAndAlign(typeName, size, align)) return;
         auto* voidPtr = builder->CreateBitCast(ptr, cflat_llvm::PointerTo(builder->getInt8Ty()));
+        // A CFlat-declared operator delete on the class itself hides the base's C++ ones.
+        if (HasCflatClassAllocFunction(typeName, "operator delete"))
+        {
+            EmitUserNewHeapFree(typeName, voidPtr, builder->getInt64(size));
+            return;
+        }
         bool sized = false;
         if (const FunctionSymbol* cls = FindCxxClassAllocFunction(typeName, "operator delete", sized))
         {

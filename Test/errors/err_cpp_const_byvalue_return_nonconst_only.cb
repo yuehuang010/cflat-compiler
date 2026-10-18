@@ -1,0 +1,5 @@
+import cpp "cpp_t322_constretcv.hpp";
+
+expect_error("only a const member function may be called") {
+    int invalid() { return cppi322.makeOnly().f(); }
+}

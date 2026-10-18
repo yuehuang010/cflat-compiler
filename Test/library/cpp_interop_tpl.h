@@ -2055,6 +2055,23 @@ namespace alna
 template <class T> using GNBdef = alnp::NBox<T, 6>;                 // global-scope alias
 template <class T> struct GAlnBox { T value; GAlnBox() noexcept : value(T(8)) {} };
 template <class T> using GAlnBoxAlias = GAlnBox<T>;                 // global unqualified target
+// Variadic alias templates: the alias's parameter pack expands into the target's pack or argument list.
+namespace alnv
+{
+    template <unsigned long... I> struct Seq { static constexpr unsigned long size() noexcept { return sizeof...(I); } };
+    template <unsigned long... I> using ISeq = Seq<I...>;            // non-type pack
+    template <class... T> struct TypeList { static constexpr unsigned long size() noexcept { return sizeof...(T); } };
+    template <class... T> using Tup = TypeList<T...>;                // type pack
+    template <class A, class B> struct Pair
+    {
+        A a; B b;
+        Pair() noexcept : a(), b() {}
+        int tag() const noexcept { return (int)sizeof(A) * 100 + (int)b.size(); }
+    };
+    template <class H, class... T> using Front = Pair<H, TypeList<T...>>;  // fixed, then pack
+    template <class T> struct Single { T v; Single() noexcept : v() {} };
+    template <class T> using SingleAlias = Single<T>;                // no pack: unchanged
+}
 inline int alna_take_nbdef(const alna::NBdef<int>& b) noexcept { return b.v + 1; }
 
 // A C++ signature that names a std container over a std container over a POINTER to a user class

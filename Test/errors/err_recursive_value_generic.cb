@@ -1,3 +1,11 @@
+// A by-value field of a generic instance over a struct declared LATER is still refused at the
+// holder: the instance body is needed now. (A pointer field to it is accepted - test_generics.)
+struct ErrWrapBody<T> { T v; int size() { return sizeof(T); } };
+expect_error("sizeof/alignof: type 'ErrLaterStruct' is incomplete") {
+    struct ErrEarlyHolder { ErrWrapBody<ErrLaterStruct> w; };
+}
+struct ErrLaterStruct { int a = 0; };
+
 // The instantiated generic's by-value self field must be checked after substitution.
 expect_error("by-value cycle");
 struct RecursiveGeneric<T> { RecursiveGeneric<T> inner; };

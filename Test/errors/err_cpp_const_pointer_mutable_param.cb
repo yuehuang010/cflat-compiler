@@ -6,6 +6,40 @@ expect_error("cannot pass C++ const pointer argument 1 ('p')") {
     }
 }
 
+// A mutable C++ record pointer field or global cannot take a const object's address (clang: discards
+// qualifiers). Locals keep the sticky const pick; the const-declared twins are legal.
+cppi.CrPair* refusedGlobal;
+expect_error("cannot assign the address of a const C++ object to field 'p'") {
+    struct RefusedHolder
+    {
+        cppi.CrPair* p;
+        int set() { p = &cppi.crConst; return 0; }
+    };
+}
+expect_error("cannot assign the address of a const C++ object to field 'p'") {
+    struct RefusedThisHolder
+    {
+        cppi.CrPair* p;
+        int set() { this->p = &cppi.crConst; return 0; }
+    };
+}
+
+expect_error("cannot assign the address of a const C++ object to array element 'ps'") {
+    struct RefusedArrayHolder
+    {
+        cppi.CrPair* ps[2];
+        int set() { ps[0] = &cppi.crConst; return 0; }
+    };
+}
+struct RefusedBraceHolder { cppi.CrPair* p; };
+expect_error("cannot assign the address of a const C++ object to field 'p'") {
+    struct RefusedDefaultHolder { cppi.CrPair* p = &cppi.crConst; };
+}
+expect_error("cannot assign the address of a const C++ object to global 'refusedInit'") {
+    cppi.CrPair* refusedInit = &cppi.crConst;
+}
+cppi.CrPair* refusedDerefTarget;
+
 extern int main()
 {
     cppi.CrReceiverValue value = default;
@@ -27,6 +61,23 @@ extern int main()
     // A constructor with only a mutable pointer parameter refuses it too.
     expect_error("is a mutable C++ pointer and argument 1 points to a const C++ object") {
         cppi.ConstPointerRankCtor built = cppi.ConstPointerRankCtor(rankPointer);
+    }
+    expect_error("cannot assign the address of a const C++ object to global 'refusedGlobal'") {
+        refusedGlobal = &cppi.crConst;
+    }
+    expect_error("cannot assign the address of a const C++ object to global 'refusedGlobal'") {
+        refusedGlobal = cppi.cr_const_ptr();
+    }
+    expect_error("cannot assign the address of a const C++ object to array element 'arr'") {
+        cppi.CrPair*[2] arr;
+        arr[0] = &cppi.crConst;
+    }
+    expect_error("cannot assign the address of a const C++ object to dereferenced slot 'pp'") {
+        cppi.CrPair** pp = &refusedDerefTarget;
+        *pp = &cppi.crConst;
+    }
+    expect_error("cannot assign the address of a const C++ object to field 'p'") {
+        RefusedBraceHolder braced = { p = &cppi.crConst };
     }
     return 0;
 }

@@ -24,3 +24,9 @@ typedef int (*T170Cb)(int);
 
 typedef int (*T311Bin)(int, int);
 struct T311Ops { T311Bin f; int k; };
+
+/* T332: C17's empty list has no prototype; `(void)` is a fixed zero-argument prototype. */
+typedef int (*T332Unproto)();
+typedef int (*T332VoidProto)(void);
+T332Unproto t332_get_constant(void);
+int t332_forty_three(void);

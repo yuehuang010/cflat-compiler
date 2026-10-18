@@ -1,0 +1,29 @@
+import cpp "cpp_interop_twin.h";
+
+// [stmt.ranged]: member lookup finds begin AND end, whatever their kind or access. An enumerator,
+// nested type or private type named begin/end is not callable, so the range-for is refused even
+// though namespace begin/end would iterate it.
+extern int main()
+{
+    expect_error("its member 'begin' cannot be called from CFlat") {
+        cpptw.EnumBothRange r = default;
+        int sum = 0;
+        for (int v in r) sum = sum + v;
+    }
+    expect_error("its member 'begin' cannot be called from CFlat") {
+        cpptw.TypeBothRange r = default;
+        int sum = 0;
+        for (int v in r) sum = sum + v;
+    }
+    expect_error("its member 'begin' cannot be called from CFlat") {
+        cpptw.PrivateTypesRange r = default;
+        int sum = 0;
+        for (int v in r) sum = sum + v;
+    }
+    expect_error("its member 'begin' cannot be called from CFlat") {
+        cpptw.InheritEnumRange r = default;
+        int sum = 0;
+        for (int v in r) sum = sum + v;
+    }
+    return 0;
+}

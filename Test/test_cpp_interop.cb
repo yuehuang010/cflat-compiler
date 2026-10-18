@@ -228,6 +228,7 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_t322_constretcv.hpp";
 import cpp "library/cpp_t217_mutable.hpp";
 import "library/cpp_t103_nullctor_c.h";
 import cpp "library/cpp_t103_nullctor.hpp";
@@ -408,6 +409,7 @@ import cpp "library/cpp_interop_list.h";
 // Assignment into a live object from a temporary: instrumented, header-only.
 import cpp "library/cpp_interop_assign.h";
 import cpp "library/cpp_t231_byvalue.hpp";
+import cpp "library/cpp_t331_override.hpp";
 import cpp "library/cpp_interop_proxy_assign.h";
 import cpp "library/t29_valarray_subscript.hpp";
 import cpp "library/cpp_interop_refbinding.h";
@@ -448,6 +450,8 @@ struct CppResultHolder { cppexp.cppresult.Result<cppexp.cppresult.Middle> item =
 struct CppResultBox<T> { T item = default; };
 struct CppListValue { int value = 0; };
 struct T67PostincNode { int value = 0; };
+struct T325PtrHolder { int* p = nullptr; int* q = nullptr; };
+int* t325Global = nullptr;
 struct CppAssignHost { cppas.Life l = cppas.Life(1); std.string s; };
 struct CppTallyHost { cppas.Tally t = default; };
 struct CppAssignRouteHost { cppas.AssignRouteTrivial item; };
@@ -1211,6 +1215,42 @@ int OnUniqueCls(int x) { unique cppon.Cls* p = new cppon.Cls(x); return p->get()
 int OnUniqueLib(int x) { unique<cppon.Cls> p = new cppon.Cls(x); return p->get(); }
 int OnViewScope(int x) { cppon.Plain[] p = new cppon.Plain[3]; return p[2].get() + x; }
 int OnClsCtorThrows(int x) { cppon.Cls* p = new cppon.Cls(-x); int v = p->get(); delete p; return v; }
+// T320: [cpp] structs over cppon.Cls. D's own operator new allocates; E's own delete frees.
+// Otherwise the base's class operators apply (clang class-scope lookup, then bases).
+int t320New = 0;
+int t320Del = 0;
+[cpp] struct T320D : cppon.Cls { int z = 0;
+    static void* operator new(i64 n) { t320New = t320New + 1; return malloc(n); }
+    T320D() { z = 1; }
+    T320D(int x) { z = t261.bval(x); }
+};
+[cpp] struct T320E : cppon.Cls { int z = 0;
+    static void operator delete(void* p) { t320Del = t320Del + 1; free(p); }
+    T320E(int x) { z = t261.bval(x); }
+};
+int T320Throw(int x) { T320D* p = new T320D(x); delete p; return 0; }
+int T320EThrow(int x) { T320E* p = new T320E(x); delete p; return 0; }
+// T320 r2: unique<D> drops free through the pair the class declares: its own delete, or the base's.
+int t320uNew = 0;
+int t320uDel = 0;
+int t320uNNew = 0;
+int t320uSDel = 0;
+[cpp] struct T320UD : cppon.Cls { int z = 0;
+    static void* operator new(i64 n) { t320uNew = t320uNew + 1; return malloc(n); }
+    static void operator delete(void* p) { t320uDel = t320uDel + 1; free(p); }
+    T320UD(int x) { z = x; }
+};
+[cpp] struct T320UN : cppon.Cls { int z = 0;
+    static void* operator new(i64 n) { t320uNNew = t320uNNew + 1; return malloc(n); }
+    T320UN(int x) { z = x; }
+};
+[cpp] struct T320US : cppon.Cls { int z = 0;
+    void operator delete(void* p, i64 n) { t320uSDel = t320uSDel + 1; free(p); }   // implicitly static
+    T320US(int x) { z = x; }
+};
+int T320UniqD(int x) { unique<T320UD> p = new T320UD(x); return p->z; }
+int T320UniqN(int x) { unique<T320UN> p = new T320UN(x); return p->z; }
+int T320UniqS(int x) { unique<T320US> p = new T320US(x); return p->z; }
 // list<T*>.add invoke regressions (legs 3600-3601).
 int tempListBdtors = 0;
 struct TempListB
@@ -2007,6 +2047,27 @@ struct T312O { T312E[2] h; };
 struct T312O2 { T312O[2] a; };
 T312E t312Gx = default;
 struct T312FD { T312E[2] h = { t312Gx, t312Gx }; };
+// T336: by-value CFlat brace-argument ownership coverage.
+struct T336Plain { T312E e; };
+struct T336Array3 { T312E[3] h; };
+struct T336PlainElement { int w = 0; };
+struct T336PlainArray { T336PlainElement[2] h; };
+struct T336OwnedLeaf { unique<T218Own> u = default; };
+struct T336MixedOwned { T312E e; T336OwnedLeaf leaf; };
+int t336TakeO(T312O o) { return o.h[0].w + o.h[1].w; }
+int t336TakeO2(T312O2 o) { return o.a[0].h[0].w + o.a[0].h[1].w; }
+int t336TakePlain(T336Plain o) { return o.e.w; }
+int t336TakeArray3(T336Array3 o) { return o.h[0].w + o.h[1].w + o.h[2].w; }
+int t336TakePlainArray(T336PlainArray o) { return o.h[0].w * 10 + o.h[1].w; }
+move T336OwnedLeaf t336MakeOwnedLeaf(int v) { T336OwnedLeaf r = default; r.u = unique<T218Own>(new T218Own()); r.u->v = v; return move r; }
+bool t336Identity(bool value) { return value; }
+int t336TakeMixedOwned(T336MixedOwned o) { return o.e.w * 10 + o.leaf.u->v; }
+int t336TakeMove(move T312O o) { T312O dst = move o; return dst.h[0].w + dst.h[1].w; }
+int t336TakeEarly(T312O o) { return 701 + o.h[0].w; }
+move string t336HeapString() { string s = "abcdefghijklmnopqrstuvwxyz" + "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; return move s; }
+move T312O t336MakeO() { T312O r = { h = { {}, { w = 14 } } }; return move r; }
+void t336ThrowTake(T312O o, int x) { cppunw.thrower(x); }
+int t336ThrowCallback(int x) { t336ThrowTake({ h = { { w = 15 }, { w = 16 } } }, x); return 0; }
 struct T218Owned { unique<T218Own> u; int k = 1; T218Owned() { k = 2; u = unique<T218Own>(new T218Own()); } };
 struct T218OwnedArray { T218Owned[2] h; };
 T129UserCtor T218Make() { T129UserCtor r = { m = 9 }; return r; }
@@ -2018,6 +2079,8 @@ struct T253OU { T253HU[2] h; };
 struct T253Plain { int value = 0; };
 struct T253Owned { t253.Counted m; unique<T218Own> u; int k = 1; };
 struct T253FallbackHolder { t253.Fallback f; };
+T253HV t330MakeHV() { T253HV r = default; r.m.value = 5; return r; }
+T253HV t330MakeHV9() { T253HV r = default; r.m.value = 9; return r; }
 // T258: a named struct-field `move` (`{ h = move x }`) of a lowered CFlat struct with C++ members.
 struct T258Holder { T253HV h; int z = 0; };
 struct T258Outer { T258Holder inner; int q = 0; };
@@ -2026,10 +2089,15 @@ struct T258OwnHolder { T253Owned o; int z = 0; };
 struct T258UCHolder { T253HV h; int z = 0; T258UCHolder() { z = 4; } };
 struct T258UCOuter { T258UCHolder inner; int q = 0; };
 struct T258ThrowV { t258.Throwy t; int k = 1; };
+struct T330ThrowPair { t258.Throwy a; t258.Throwy b; };
 struct T258ThrowHolder { T258ThrowV h; int z = 0; };
 struct T258UCThrow { T258ThrowV h; int z = 0; T258UCThrow() { z = 4; } };
 int t258Fresh(int x) { T258ThrowV s = default; t258.set_throw(x); T258ThrowHolder w = { h = move s }; return w.h.k; }
 int t258Update(int x) { T258ThrowV s = default; t258.set_throw(x); T258UCThrow w = { h = move s }; return w.h.k; }
+T258ThrowV t330MakeThrowV() { T258ThrowV r = default; return r; }
+T330ThrowPair t330MakeThrowPair() { T330ThrowPair r = default; return r; }
+int t330ThrowDecl(int x) { t258.set_throw(x); T258ThrowV d = move t330MakeThrowV(); return d.k; }
+int t330ThrowPairDecl(int x) { t258.set_throw(x); T330ThrowPair d = move t330MakeThrowPair(); return d.a.value + d.b.value; }
 // T261: a named brace init (or tag form) whose later field throws destroys the fields built before it.
 struct T261Pair { t261.Counted a; t261.Counted b; int z = 0; };
 struct T261Triple { t261.Counted a; t261.Counted b; t261.Counted c; int z = 0; };
@@ -2385,6 +2453,35 @@ alias int T256Id(alias int a, int t) { return a; }
 int T256AliasThrowInit(int t) { alias int a = T256Id(T256Mk()->v, cppunw.thrower(t)); return a; }
 using T257NAlias = cppnewtriv.NA;
 move T* T257NewCopy<T>(T* source) { return new T(*source); }
+// T324: a const pointee stored in a global or field resolves to the const twin; a mutable one does not.
+const cppi.CrPair* t324ConstGlobal;
+cppi.CrPair* t324MutGlobal;
+struct T324ConstHolder
+{
+    const cppi.CrPair* p;
+    int set() { p = &cppi.crConst; return 0; }
+    int run() { return this->p->get(); }
+};
+
+int t331OverrideCalls = 0;
+[cpp] struct T331Override : cppt331.Base
+{
+    override int use(cppt331.Counted value)
+    {
+        t331OverrideCalls = t331OverrideCalls + 1;
+        return cppt331.throw_if_positive(value.value);
+    }
+};
+
+int t335SetThroughConstParam(const T217KM* p)
+{
+    p->m = 15;
+    return p->m;
+}
+
+cpi_t42.T339Box T339ReturnCastBox() {
+    return (cpi_t42.T339Box)cpi_t42.t339_make_box();
+}
 
 extern int main()
 {
@@ -2405,6 +2502,49 @@ extern int main()
     const T217Outer t217LocalConst = t217_outer;
     t217LocalConst.inner.m = 13;
     if (t217LocalConst.inner.m != 13 || t217LocalConst.inner.n != 6) return 4220;
+
+    // T335: mutable base fields retain their flag when the C++ base storage is flattened.
+    t335Derived.bm = 4;
+    if (t335Derived.bm != 4 || t335Derived.bn != 11 || t335Derived.d != 12) return 33501;
+    t335Derived.bm += 3;
+    if (t335Derived.bm != 7 || t335Derived.bn != 11) return 33502;
+    int t335BaseOld = t335Derived.bm++;
+    if (t335BaseOld != 7 || t335Derived.bm != 8) return 33503;
+
+    // T335: union mutable members stay writable while non-mutable siblings remain const.
+    t335Union.a = 4;
+    if (t335Union.a != 4) return 33504;
+    t335Union.a += 3;
+    if (t335Union.a != 7) return 33505;
+    int t335UnionOld = t335Union.a++;
+    if (t335UnionOld != 7 || t335Union.a != 8) return 33506;
+
+    // T335: element GEPs inherit mutability from the mutable array member.
+    t335Array.a[1] = 9;
+    if (t335Array.a[1] != 9 || t335Array.a[0] != 1) return 33507;
+    t335Array.a[1] += 3;
+    if (t335Array.a[1] != 12) return 33508;
+    int t335ArrayOld = t335Array.a[1]++;
+    if (t335ArrayOld != 12 || t335Array.a[1] != 13) return 33509;
+
+    // T335: a member of a mutable sub-struct inherits that subobject's mutability.
+    t335Member.in.x = 3;
+    if (t335Member.in.x != 3 || t335Member.k != 6) return 33510;
+    t335Member.in.x += 3;
+    if (t335Member.in.x != 6) return 33511;
+    int t335MemberOld = t335Member.in.x++;
+    if (t335MemberOld != 6 || t335Member.in.x != 7) return 33512;
+
+    // T335: a mutable field is writable through a const C++ pointer parameter.
+    if (t335SetThroughConstParam(t217_const_ptr()) != 15
+        || t217_const_ptr()->m != 15 || t217_const_ptr()->n != 4)
+        return 33513;
+
+    // T335 r2: a const record may still expose a mutable member, including an anonymous union.
+    t335ConstMutableHolder.child.m = 11;
+    if (t335ConstMutableHolder.child.m != 11) return 33514;
+    t335AnonymousUnion.m = 11;
+    if (t335AnonymousUnion.m != 11) return 33515;
 
     // T136: the file-scope objects above are constructed at startup, before any other code runs.
     if (t135.t136CtorCount() != 9 || t136GlobalBrace.n != 0 || t136GlobalEq.n != 0
@@ -2643,6 +2783,23 @@ extern int main()
     if (t307_inherited_cv_const + 1 != 2) return 30724;
     t307.IA_cv_volatile t307_inherited_cv_volatile = default;
     if (t307_inherited_cv_volatile + 1 != 2) return 30725;
+    // T321: a derived PRVALUE binds a base `RC&&` free (clang 2; master 1) and the nearer of two base
+    // rvalue-reference overloads (clang 2); a by-value base free slices it (clang 2; master 1).
+    if (t321.raMk() + 1 != 2) return 30750;
+    if (t321.fr(t321.raMk()) != 2) return 30751;
+    if (t321.vaMk() + 1 != 2) return 30752;
+    t321.VA t321_byvalue_lvalue = default;
+    if (t321_byvalue_lvalue + 1 != 2) return 30753;
+    // T321 round 2: `Base&&` on a derived prvalue ranks with the reversed and plain forms (clang 5 / 6 / 2 / 2).
+    if (!(1 == t321r2.a4Mk())) return 30754;
+    if (1 != t321r2.a4Mk()) return 30755;
+    if (t321r2.fm(t321r2.mdMk()) != 2) return 30756;
+    if (t321r2.mdMk() + 1 != 2) return 30757;
+    if (t321r2.f5(t321r2.h5Mk()) != 2) return 30760;   // nearer base beats the && binding
+    // Guard: an lvalue never binds `M&&`, so the `const M&` overload wins (clang 3 / 3).
+    t321r2.MD t321r2_lvalue = default;
+    if (t321r2.fm(t321r2_lvalue) != 3) return 30758;
+    if (t321r2_lvalue + 1 != 3) return 30759;
     // T316: hidden friend == set (int, double, X): the unambiguous shapes pick clang's overload
     // (oracle: 30 30 20 20 20 20 30 30 10 20 20 20); the ambiguous ones are refused in errors/.
     t316.X t316X = 1;
@@ -9554,6 +9711,118 @@ extern int main()
     if (t75RankLit.tag != 2)                                                   return 2293;
     cpi_t42.RankExplicit t75RankRet = (cpi_t42.RankExplicit)t75Pick(t75RankSrc);
     if (t75RankRet.tag != 3)                                                   return 2294;
+    // T334: tags discriminate the selected C++ constructor for fixed-array casts.
+    char[4] t334ArrCharSrc = {97, 98, 99, 0};
+    cpi_t42.T334ArrChar t334ArrChar = (cpi_t42.T334ArrChar)t334ArrCharSrc;
+    if (t334ArrChar.id() != 1)                                                 return 33401;
+    int[3] t334ArrIntSrc = {1, 2, 3};
+    cpi_t42.T334ArrIntPtr t334ArrInt = (cpi_t42.T334ArrIntPtr)t334ArrIntSrc;
+    if (t334ArrInt.id() != 2)                                                  return 33402;
+    cpi_t42.T334ArrConstChar t334ArrConst = (cpi_t42.T334ArrConstChar)t334ArrCharSrc;
+    if (t334ArrConst.id() != 3)                                                return 33403;
+    cpi_t42.T334ArrPtrOrInt t334ArrRank = (cpi_t42.T334ArrPtrOrInt)t334ArrCharSrc;
+    if (t334ArrRank.id() != 21)                                                return 33404;
+    cpi_t42.T334ArrRef t334ArrRef = (cpi_t42.T334ArrRef)t334ArrCharSrc;
+    if (t334ArrRef.id() != 32)                                                 return 33405;
+    cpi_t42.T334ArrTupleRef t334ArrTupleRef =
+        cpi_t42.T334ArrTupleRef(std.forward_as_tuple("abc"));
+    if (t334ArrTupleRef.id() != 97)                                            return 33411;
+    cpi_t42.T334ArrSource t334ArrField = default;
+    t334ArrField.buf[0] = 97;
+    t334ArrField.buf[1] = 98;
+    t334ArrField.buf[2] = 99;
+    t334ArrField.buf[3] = 0;
+    cpi_t42.T334ArrChar t334ArrFieldCast = (cpi_t42.T334ArrChar)t334ArrField.buf;
+    if (t334ArrFieldCast.id() != 1)                                           return 33406;
+    cpi_t42.t334_arrcast_reset();
+    int t334ArrDuring = -1;
+    {
+        char[4] t334ArrLifeSrc = {97, 98, 99, 0};
+        cpi_t42.T334ArrChar t334ArrLife = (cpi_t42.T334ArrChar)t334ArrLifeSrc;
+        if (t334ArrLife.id() != 1)                                            return 33407;
+        t334ArrDuring = cpi_t42.t334_arrcast_dtor_count();
+    }
+    if (t334ArrDuring != 0 || cpi_t42.t334_arrcast_dtor_count() != 1)          return 33408;
+    cpi_t42.t334_arrcast_reset();
+    int t334PtrDuring = -1;
+    {
+        char* t334PtrSrc = "abc";
+        cpi_t42.T334ArrChar t334PtrLife = (cpi_t42.T334ArrChar)t334PtrSrc;
+        if (t334PtrLife.id() != 1)                                            return 33409;
+        t334PtrDuring = cpi_t42.t334_arrcast_dtor_count();
+    }
+    if (t334PtrDuring != 0 || cpi_t42.t334_arrcast_dtor_count() != 1)          return 33410;
+    cpi_t42.Box t334SameTypePrvalue =
+        (cpi_t42.Box)cpi_t42.t334_make_box(7);
+    if (t334SameTypePrvalue.id() != 1007)                                     return 33412;
+    cpi_t42.Box t334DifferentTypePrvalue =
+        (cpi_t42.Box)cpi_t42.mkSrc(17);
+    if (t334DifferentTypePrvalue.id() != 1017)                                return 33413;
+    cpi_t42.Box t334ConditionalPrvalue =
+        (cpi_t42.Box)(true ? cpi_t42.t334_make_box(21) : cpi_t42.t334_make_box(22));
+    if (t334ConditionalPrvalue.id() != 1021)                                  return 33414;
+
+    // T339: same-type C++ prvalue casts preserve guaranteed elision and object lifetime.
+    cpi_t42.t339_reset();
+    {
+        cpi_t42.T339Box t339Identity =
+            (cpi_t42.T339Box)cpi_t42.t339_make_box();
+        if (t339Identity.id() != 7 || cpi_t42.t339_born != 1
+            || cpi_t42.t339_copies != 0 || cpi_t42.t339_moves != 0) return 33901;
+    }
+    if (cpi_t42.t339_dead != 1)                                               return 33901;
+    cpi_t42.t339_reset();
+    {
+        cpi_t42.T339Box t339Nested = (cpi_t42.T339Box)(cpi_t42.T339Box)
+            cpi_t42.t339_make_box();
+        if (t339Nested.id() != 7 || cpi_t42.t339_born != 1
+            || cpi_t42.t339_copies != 0 || cpi_t42.t339_moves != 0) return 33902;
+    }
+    if (cpi_t42.t339_dead != 1)                                               return 33902;
+    cpi_t42.t339_reset();
+    {
+        cpi_t42.T339Box t339Source = cpi_t42.t339_make_box();
+        cpi_t42.t339_reset();
+        cpi_t42.T339Box t339Moved = (cpi_t42.T339Box)(move t339Source);
+        if (t339Moved.id() != 7 || cpi_t42.t339_born != 1
+            || cpi_t42.t339_copies != 0 || cpi_t42.t339_moves != 1) return 33903;
+    }
+    if (cpi_t42.t339_dead != 2)                                               return 33903;
+    cpi_t42.t339_reset();
+    {
+        cpi_t42.T339Box t339Returned = T339ReturnCastBox();
+        if (t339Returned.id() != 7 || cpi_t42.t339_born != 1
+            || cpi_t42.t339_copies != 0 || cpi_t42.t339_moves != 0) return 33904;
+    }
+    if (cpi_t42.t339_dead != 1)                                               return 33904;
+    cpi_t42.t339_reset();
+    {
+        cpi_t42.T339Box t339NestedArgument =
+            (cpi_t42.T339Box)cpi_t42.t339_outer_box(cpi_t42.t339_make_box());
+        if (t339NestedArgument.id() != 9 || cpi_t42.t339_born != 2
+            || cpi_t42.t339_copies != 0 || cpi_t42.t339_moves != 0) return 33905;
+    }
+    if (cpi_t42.t339_dead != 2)                                               return 33905;
+    cpi_t42.t339_reset();
+    {
+        // The false arm selects the lvalue; the call in the other arm must not receive the slot.
+        cpi_t42.T339Box t339MixedSource = cpi_t42.t339_make_box();
+        cpi_t42.t339_reset();
+        cpi_t42.T339Box t339MixedArm = (cpi_t42.T339Box)(false
+            ? cpi_t42.t339_make_box() : t339MixedSource);
+        if (t339MixedArm.id() != 7 || cpi_t42.t339_born != 1
+            || cpi_t42.t339_copies != 1 || cpi_t42.t339_moves != 0) return 33906;
+    }
+    if (cpi_t42.t339_dead != 2)                                               return 33906;
+    cpi_t42.t339_reset();
+    {
+        // Moving a returned temporary selects one move constructor and destroys both objects.
+        cpi_t42.T339Box t339MoveTemp =
+            (cpi_t42.T339Box)(move cpi_t42.t339_make_box());
+        if (t339MoveTemp.id() != 7 || cpi_t42.t339_born != 2
+            || cpi_t42.t339_copies != 0 || cpi_t42.t339_moves != 1) return 33907;
+    }
+    if (cpi_t42.t339_dead != 2)                                               return 33907;
     cppsopd.T221OpUsingOnly t221OpOnly = default;
     if (t221OpOnly - 2 != 1002)                                                return 4401;
     cppsopd.T221NamedUsingOnly t221Named = default;
@@ -10998,6 +11267,8 @@ extern int main()
         if (cppi.apply_int(iop, 4, 5) != 9) return 3727;
         cppfnptr.CbAlias cb = fnptr_add_one;
         if (cppfnptr.callback_call(cb, 1) != 2) return 3728;
+        cppfnptr.CbAlias direct = cppfnptr.plus_one;
+        if (direct(41) != 42) return 3729;
     }
     if (cppi.cpp_std() != 202002L) return 3212;
 
@@ -11350,6 +11621,55 @@ extern int main()
             || cppon.clsDel() != 0 || cppon.clsNewArr() != 0 || cppon.clsDelArr() != 0
             || cppunw.newArrs() != 1 || cppunw.deleteArrs() != 1 || cppunw.deletes() != 0)
             return 3368;
+        // T320: `new T320D(x)` / `new T320D()` / `new T320D` run D's own operator new; cppon's class
+        // new is hidden. A throwing constructor frees through the base's class delete (no own delete).
+        t320New = 0;
+        cppon.reset();
+        T320D* t320a = new T320D(4);
+        if (t320a->z != 4 || t320New != 1 || cppon.clsNew() != 0) return 3367;
+        delete t320a;
+        if (cppon.clsDel() != 1) return 3397;
+        t320New = 0;
+        cppon.reset();
+        T320D* t320b = new T320D();
+        delete t320b;
+        if (t320New != 1 || cppon.clsNew() != 0 || cppon.clsDel() != 1) return 3369;
+        t320New = 0;
+        cppon.reset();
+        if (cppunw.guarded(T320Throw, 1) != -7 || t320New != 1 || cppon.clsNew() != 0
+            || cppon.clsDel() != 1) return 3386;
+        t320New = 0;
+        cppon.reset();
+        T320D* t320c = new T320D;
+        delete t320c;
+        if (t320New != 1 || cppon.clsNew() != 0 || cppon.clsDel() != 1) return 3389;
+        // T320: E's own operator delete frees the block it was given; the base's new allocated it.
+        t320Del = 0;
+        cppon.reset();
+        T320E* t320e = new T320E(3);
+        if (t320e->z != 3 || cppon.clsNew() != 1) return 3387;
+        delete t320e;
+        if (t320Del != 1 || cppon.clsDel() != 0) return 3398;
+        t320Del = 0;
+        cppon.reset();
+        if (cppunw.guarded(T320EThrow, 1) != -7 || t320Del != 1 || cppon.clsNew() != 1
+            || cppon.clsDel() != 0) return 3388;
+        // T320 r2: unique<D> drop frees through D's own delete (its own new allocated the block).
+        t320uNew = 0;
+        t320uDel = 0;
+        cppon.reset();
+        if (T320UniqD(3) != 3 || t320uNew != 1 || t320uDel != 1 || cppon.clsNew() != 0
+            || cppon.clsDel() != 0) return 3399;
+        // T320 r2: own new only: the base's class delete frees the block (clang pairs them).
+        t320uNNew = 0;
+        cppon.reset();
+        if (T320UniqN(3) != 3 || t320uNNew != 1 || cppon.clsNew() != 0 || cppon.clsDel() != 1)
+            return 3421;
+        // T320 r2: own sized delete only: it hides the base's delete and takes the block.
+        t320uSDel = 0;
+        cppon.reset();
+        if (T320UniqS(3) != 3 || t320uSDel != 1 || cppon.clsNew() != 1 || cppon.clsDel() != 0)
+            return 3422;
 
     }
 
@@ -14090,6 +14410,18 @@ extern int main()
     // the mutable object); master ran the non-const one in place (SIGBUS on read-only storage).
     if (cppi.crConst.get() != 3 || cppi.crConstexpr.get() != 3 || cppi.cr_const_ref().get() != 3)
         return 7969;
+
+    // T322: const C++ by-value prvalues use the const twin, while an auto copy drops const.
+    int t322FreeReturn = cppi322.make().f();
+    int t322MethodReturn = cppi322.holder.get().f();
+    if (t322FreeReturn != 2 || t322MethodReturn != 2) return 32201;
+    auto t322AutoCopy = cppi322.make();
+    if (t322AutoCopy.f() != 1) return 32202;
+    if (cppi322.ref().f() != 2) return 32203;
+    if (cppi322.make2().f() != 1) return 32204;
+    if (cppi322.ptr()->f() != 2) return 32205;
+    if (cppi322.make().onlyConst() != 3) return 32206;
+
     if (cppi.crConst.add(1) != 4 || cppi.cr_const_ref().add(2) != 5) return 7970;
     if (cppi.crConst + 1 != 104 || cppi.cr_const_ref() + 2 != 105 || cppi.crConst.conly() != 1003)
         return 7971;
@@ -14293,6 +14625,17 @@ extern int main()
     }
     cppi.crMutable.v = 3;
     if (crCallGet(crCopiedConstPointee) != 13 || cppi.crMutable.v != 13) return 7979;
+    // T324 legs: clang gives 3 (const twin), 3 (field const twin), 13 (mutable twin, writes crMutable).
+    cppi.crMutable.v = 3;
+    t324ConstGlobal = &cppi.crConst;
+    if (t324ConstGlobal->get() != 3) return 8020;
+    T324ConstHolder t324Holder = default;
+    t324Holder.set();
+    if (t324Holder.run() != 3) return 8021;
+    cppi.crMutable.v = 3;
+    t324MutGlobal = &cppi.crMutable;
+    if (t324MutGlobal->get() != 13 || cppi.crMutable.v != 13) return 8022;
+    cppi.crMutable.v = 3;
     cppi.MtSinkNoCopy mtSink = cppi.MtSinkNoCopy();
     cppi.MtNoCopy mtNoCopy = cppi.MtNoCopy();
     if (mtSink.put(1, move mtNoCopy) != 2) return 7931;
@@ -16223,6 +16566,44 @@ int LoweredUserDtorAssignLegs(int argc)
     t67Ptr = &t67PtrArray[0];
     int t67Indexed = t67PtrArray[t67Ptr++ - &t67PtrArray[0]];
     if (t67Indexed != 11 || t67Ptr - &t67PtrArray[0] != 1) return 67035;
+    // T325: a both-lvalue pointer ternary binds the SELECTED slot at a C++ reference parameter
+    // (clang: value and address identity); a rvalue reference refuses it like a plain lvalue.
+    int* t325P = &t67PtrArray[0];
+    int* t325O = &t67PtrArray[2];
+    bool t325T = true;
+    bool t325F = false;
+    if (cpp_t67.ptr_const_addr(t325T ? t325P : t325O) != (long)&t325P) return 67036;
+    if (cpp_t67.ptr_const_addr(t325F ? t325P : t325O) != (long)&t325O) return 67037;
+    if (cpp_t67.ptr_const_const_addr(t325T ? t325P : t325O) != (long)&t325P) return 67038;
+    cpp_t67.ptr_bump(t325T ? t325P : t325O);
+    if (t325P != &t67PtrArray[1]) return 67039;
+    cpp_t67.ptr_bump(t325F ? t325P : t325O);
+    if (t325O != &t67PtrArray[3]) return 67040;
+    T325PtrHolder t325H = default;
+    t325H.p = &t67PtrArray[0];
+    t325H.q = &t67PtrArray[2];
+    if (cpp_t67.ptr_const_addr(t325T ? t325H.p : t325H.q) != (long)&t325H.p) return 67041;
+    cpp_t67.ptr_bump(t325T ? t325H.p : t325H.q);
+    if (t325H.p != &t67PtrArray[1]) return 67042;
+    int*[2] t325Arr = default;
+    t325Arr[0] = &t67PtrArray[0];
+    t325Arr[1] = &t67PtrArray[2];
+    if (cpp_t67.ptr_const_addr(t325T ? t325Arr[0] : t325Arr[1]) != (long)&t325Arr[0]) return 67043;
+    cpp_t67.ptr_bump(t325F ? t325Arr[0] : t325Arr[1]);
+    if (t325Arr[1] != &t67PtrArray[3]) return 67044;
+    t325Global = &t67PtrArray[0];
+    if (cpp_t67.ptr_const_addr(t325T ? t325Global : t325P) != (long)&t325Global) return 67045;
+    cpp_t67.ptr_bump(t325T ? t325Global : t325P);
+    if (t325Global != &t67PtrArray[1]) return 67046;
+    expect_error("is an rvalue reference") {
+        cpp_t67.ptr_rvalue_ref(t325T ? t325P : t325O, &t67PtrArray[0]);
+    }
+    expect_error("cannot bind an rvalue") {
+        cpp_t67.ptr_bump(t325T ? t325P++ : t325O);   // postfix arm is a prvalue (clang refuses)
+    }
+    expect_error("cannot bind an rvalue") {
+        cpp_t67.ptr_bump(t325F ? t325P : t325O++);   // false-arm postfix is queued until the arm flush
+    }
     t67CallCount = 0;
     if (cpp_t67.by_value(t67NextValue()) != 101 || t67CallCount != 1) return 67013;
     t67CallCount = 0;
@@ -16580,6 +16961,59 @@ int LoweredUserDtorAssignLegs(int argc)
         T312FD t312Fd;
     }
     if (t312Ct != 0 || t312Dt != 2) return 12937;
+    // T336: a by-value brace argument owns its temporary through the call's full-expression.
+    t312Ct = 0; t312Dt = 0;
+    int t336SingleValue = t336TakeO({ h = { { w = 11 }, { w = 12 } } });
+    if (t336SingleValue != 23 || t312Ct != 2 || t312Dt != 2) return 33601;
+    t312Ct = 0; t312Dt = 0;
+    int t336NestedValue = t336TakeO2({ a = { { h = { {}, {} } } } });
+    if (t336NestedValue != 0 || t312Ct != 4 || t312Dt != 4) return 33602;
+    t312Ct = 0; t312Dt = 0;
+    int t336PlainValue = t336TakePlain({ e = { w = 31 } });
+    if (t336PlainValue != 31 || t312Ct != 1 || t312Dt != 1) return 33603;
+    t312Ct = 0; t312Dt = 0;
+    int t336Array3Value = t336TakeArray3({ h = { { w = 1 }, { w = 2 }, { w = 3 } } });
+    if (t336Array3Value != 6 || t312Ct != 3 || t312Dt != 3) return 33604;
+    t312Ct = 0; t312Dt = 0;
+    int t336PlainArrayValue = t336TakePlainArray({ h = { { w = 4 }, { w = 5 } } });
+    if (t336PlainArrayValue != 45 || t312Ct != 0 || t312Dt != 0) return 33605;
+    t312Ct = 0; t312Dt = 0;
+    u64 t336MoveBase = HeapAudit.reportLeaks();
+    int t336MoveValue = t336TakeMove({ h = { { w = 21, s = t336HeapString() }, { w = 22 } } });
+    if (t336MoveValue != 43
+        || t312Ct != 2 || t312Dt != 4 || HeapAudit.reportLeaks() != t336MoveBase) return 33606;
+    t312Ct = 0; t312Dt = 0;
+    int t336EarlyValue = t336TakeEarly({ h = { { w = 7 }, {} } });
+    if (t336EarlyValue != 708 || t312Ct != 2 || t312Dt != 2) return 33607;
+    t312Ct = 0; t312Dt = 0;
+    int t336CallValue = t336TakeO(t336MakeO());
+    if (t336CallValue != 14 || t312Ct != 2 || t312Dt != 2) return 33608;
+    t312Ct = 0; t312Dt = 0;
+    {
+        T312O t336Named = { h = { { w = 5 }, { w = 6 } } };
+        int t336NamedValue = t336TakeO(t336Named);
+        if (t336NamedValue != 11 || t312Ct != 2 || t312Dt != 0) return 33609;
+    }
+    if (t312Ct != 2 || t312Dt != 2) return 33610;
+    t312Ct = 0; t312Dt = 0;
+    cppunw.reset();
+    int t336ExceptionResult = cppunw.guarded(t336ThrowCallback, 5);
+    if (t336ExceptionResult != -5 || t312Ct != 2 || t312Dt != 2
+        || cppunw.live() != 0 || cppunw.dtors() != 0) return 33611;
+    HeapAudit.enable();
+    u64 t336HeapBase = HeapAudit.reportLeaks();
+    t312Ct = 0; t312Dt = 0;
+    int t336HeapValue = t336TakeO({ h = { { s = t336HeapString() }, {} } });
+    if (t336HeapValue != 0 || t312Ct != 2 || t312Dt != 2
+        || HeapAudit.reportLeaks() != t336HeapBase) return 33612;
+    t312Ct = 0; t312Dt = 0;
+    int t336OwnedLiveBase = t218Live;
+    u64 t336OwnedHeapBase = HeapAudit.reportLeaks();
+    int t336MixedOwnedValue = t336TakeMixedOwned({ e = { w = 2 },
+        leaf = t336Identity(false) ? t336MakeOwnedLeaf(1) : t336MakeOwnedLeaf(3) });
+    if (t336MixedOwnedValue != 23 || t312Ct != 1 || t312Dt != 1
+        || t218Live != t336OwnedLiveBase || HeapAudit.reportLeaks() != t336OwnedHeapBase)
+        return 33613;
     // T253: a lowered CFlat brace element uses C++ member-wise construction for each move arm.
     t253.reset();
     int t253A = 0; int t253B = 0; int t253K = 0;
@@ -16799,6 +17233,87 @@ int LoweredUserDtorAssignLegs(int argc)
         delete p;
     }
     if (t258A != 1003 || t253.ctors() != 3 || t253.moves() != 1 || t253.dtors() != 3) return 25326;
+    // T330: move of a lowered call result invokes the member move ctor, like std::move(mk()).
+    t253.reset();
+    {
+        T253HV d = move t330MakeHV();
+        t258A = d.m.value;
+    }
+    if (t258A != 1005 || t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25331;
+    t253.reset();
+    {
+        T253HV d = t330MakeHV();
+        t258A = d.m.value;
+    }
+    if (t258A != 5 || t253.ctors() != 1 || t253.copies() != 0 || t253.moves() != 0
+        || t253.dtors() != 1) return 25332;
+    t253.reset();
+    {
+        T253HV[1] arr = { move t330MakeHV() };
+        t258A = arr[0].m.value;
+    }
+    if (t258A != 1005 || t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25333;
+    t253.reset();
+    {
+        T253HV[1] arr = { t330MakeHV() };
+        t258A = arr[0].m.value;
+    }
+    if (t258A != 5 || t253.ctors() != 1 || t253.copies() != 0 || t253.moves() != 0
+        || t253.dtors() != 1) return 25334;
+    t253.reset();
+    {
+        T258Holder w = { h = move t330MakeHV() };
+        t258A = w.h.m.value;
+    }
+    if (t258A != 1005 || t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25335;
+    t253.reset();
+    {
+        T258Holder w = { h = t330MakeHV() };
+        t258A = w.h.m.value;
+    }
+    if (t258A != 5 || t253.ctors() != 1 || t253.copies() != 0 || t253.moves() != 0
+        || t253.dtors() != 1) return 25336;
+    t253.reset();
+    {
+        T258Holder* p = <T258Holder h={move t330MakeHV()} />;
+        t258A = p->h.m.value;
+        delete p;
+    }
+    if (t258A != 1005 || t253.ctors() != 3 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 3) return 25337;
+    t258.reset();
+    t258A = t258.guarded(t330ThrowDecl, 1);
+    if (t258A != -7 || t258.ctors() != 1 || t258.moves() != 0
+        || t258.dtors() != t258.ctors()) return 25401;
+    t258.reset();
+    t258A = t258.guarded(t330ThrowPairDecl, 2);
+    if (t258A != -7 || t258.ctors() != 3 || t258.moves() != 1
+        || t258.dtors() != 3 || t258.dtors() != t258.ctors()) return 25402;
+    t253.reset();
+    {
+        T253HV d = move (t330MakeHV());
+        t258A = d.m.value;
+    }
+    if (t258A != 1005 || t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25403;
+    t253.reset();
+    int t330TrueValue = 0;
+    int t330FalseValue = 0;
+    {
+        bool t330SelectFirst = true;
+        T253HV d = move (t330SelectFirst ? t330MakeHV() : t330MakeHV9());
+        t330TrueValue = d.m.value;
+    }
+    {
+        bool t330SelectFirst = false;
+        T253HV d = move (t330SelectFirst ? t330MakeHV() : t330MakeHV9());
+        t330FalseValue = d.m.value;
+    }
+    if (t330TrueValue != 1005 || t330FalseValue != 1009 || t253.ctors() != 4
+        || t253.copies() != 0 || t253.moves() != 2 || t253.dtors() != 4) return 25404;
     // T261: a field initializer that throws unwinds the fields already built, once each.
     t261.reset();
     t258A = t261.guarded(t261Pair, 1);
@@ -17326,6 +17841,23 @@ int LoweredUserDtorAssignLegs(int argc)
         cppon.reset();
         int readBack = cppon.escReadIntArg(&(new cppon.Esc(10))->v);
         if (readBack != 10 || cppon.dtors() != 1 || cppon.live() != 0) return 17317;
+    }
+    // T331: an override moves its by-value C++ parameter into the CFlat body (clang counts).
+    {
+        T331Override object = default;
+        t331OverrideCalls = 0;
+        cppt331.Counted.reset();
+        int normal = cppt331.call(&object, 0);
+        if (normal != 0 || t331OverrideCalls != 1 || cppt331.Counted.ctors != 1
+            || cppt331.Counted.copies != 0 || cppt331.Counted.moves != 1
+            || cppt331.Counted.dtors != 2 || cppt331.Counted.live != 0) return 33101;
+
+        t331OverrideCalls = 0;
+        cppt331.Counted.reset();
+        int thrown = cppt331.catch_call(&object, 13);
+        if (thrown != -13 || t331OverrideCalls != 1 || cppt331.Counted.ctors != 1
+            || cppt331.Counted.copies != 0 || cppt331.Counted.moves != 1
+            || cppt331.Counted.dtors != 2 || cppt331.Counted.live != 0) return 33102;
     }
     return 0;
 }

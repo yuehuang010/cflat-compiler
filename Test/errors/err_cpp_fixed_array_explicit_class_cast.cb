@@ -1,0 +1,13 @@
+import cpp "cpp_t42_convref.hpp";
+
+extern int main() {
+    expect_error("clang: no matching constructor for initialization of 'cpi_t42::T334ArrChar'") {
+        int[3] source = {1, 2, 3};
+        cpi_t42.T334ArrChar bad = (cpi_t42.T334ArrChar)source;
+    }
+    expect_error("clang: call to constructor of 'cpi_t42::T334ArrAmbiguous' is ambiguous") {
+        char[4] source = {97, 98, 99, 0};
+        cpi_t42.T334ArrAmbiguous bad = (cpi_t42.T334ArrAmbiguous)source;
+    }
+    return 0;
+}

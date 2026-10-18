@@ -2138,6 +2138,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.IsSpelledPointeeConst) j["spc"] = true;
         if (s.IsCxxNullptrT) j["cnt"] = true;
         if (s.IsCxxConstField) j["ccf"] = true;
+        if (s.IsCxxDeclaredConstField) j["ccdf"] = true;
         if (s.IsCxxMutableField) j["cmf"] = true;
         if (s.IsOwningSink)   j["osk"] = true;
         if (s.IsConsumeInferredSink) j["cis"] = true;
@@ -2150,6 +2151,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.LockThis)        j["lt"] = true;
         if (s.LockThisMode != LockMode::Exclusive) j["ltm"] = static_cast<int>(s.LockThisMode);
         if (!s.GuardedBy.empty()) j["gb"] = s.GuardedBy;
+        if (s.FuncPtrNoPrototype) j["fpnp"] = true;
         if (s.IsFunctionPointer)
         {
             j["fp"]  = true;
@@ -2214,6 +2216,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsSpelledPointeeConst = j.value("spc", false);
         s.IsCxxNullptrT = j.value("cnt", false);
         s.IsCxxConstField = j.value("ccf", false);
+        s.IsCxxDeclaredConstField = j.value("ccdf", false);
         s.IsCxxMutableField = j.value("cmf", false);
         s.IsOwningSink = j.value("osk", false);
         s.IsConsumeInferredSink = j.value("cis", false);
@@ -2227,6 +2230,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.LockThisMode = static_cast<LockMode>(j.value("ltm", 0));
         s.GuardedBy = j.value("gb", std::string{});
         s.IsFunctionPointer = j.value("fp", false);
+        s.FuncPtrNoPrototype = j.value("fpnp", false);
         if (s.IsFunctionPointer)
         {
             s.FuncPtrReturnTypeName = j.value("fpr", std::string{});
@@ -2798,6 +2802,13 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
         if (r.isTrivial) j["tv"] = true;
         if (r.isTriviallyCopyable) j["tc"] = true;
         if (r.isTriviallyRelocatable) j["tr"] = true;
+        // [stmt.ranged] complete member lookup: a warm cache must keep enumerator/type names.
+        // Identifiers never contain a newline, so the list packs as one newline-joined string.
+        if (!r.scopeNames.empty()) j["sn"] = [&] {
+            std::string packed;
+            for (const std::string& s : r.scopeNames) packed += s + "\n";
+            return packed;
+        }();
         if (r.specialMembersPending) j["smp"] = true;
         if (r.sizeBytes != 0)  j["sz"] = r.sizeBytes;
         if (r.alignBytes != 0) j["al"] = r.alignBytes;
@@ -2900,6 +2911,16 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
         r.isTrivial = j.value("tv", false);
         r.isTriviallyCopyable = j.value("tc", false);
         r.isTriviallyRelocatable = j.value("tr", false);
+        {
+            const std::string packed = j.value("sn", std::string{});
+            for (size_t start = 0; start < packed.size();)
+            {
+                size_t end = packed.find('\n', start);
+                if (end == std::string::npos) end = packed.size();
+                r.scopeNames.push_back(packed.substr(start, end - start));
+                start = end + 1;
+            }
+        }
         r.specialMembersPending = j.value("smp", false);
         r.sizeBytes  = j.value("sz", (uint64_t)0);
         r.alignBytes = j.value("al", (uint64_t)0);

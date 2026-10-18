@@ -656,6 +656,14 @@ llvm::Value* LLVMBackend::CreateCxxFieldGEP(llvm::IRBuilder<>& irBuilder, const 
                 gep->setMetadata("cflat.cxx.mutablefield", llvm::MDNode::get(*context, {}));
             return gep;
         };
+        if (data.IsUnion && !data.CxxOffsetLayout && data.StructType->hasName()
+            && cxxRecords_.count(data.StructType->getName().str()) != 0)
+        {
+            llvm::Value* idxs[] = { irBuilder.getInt64(0) };
+            auto* gep = llvm::GetElementPtrInst::CreateInBounds(irBuilder.getInt8Ty(), object, idxs);
+            irBuilder.Insert(gep, name);
+            return markMutableField(gep);
+        }
         if (!data.CxxOffsetLayout || index >= data.CxxFieldOffsets.size())
         {
             if (llvm::isa<llvm::GlobalVariable>(object))
@@ -722,11 +730,20 @@ bool LLVMBackend::IsCxxConstFieldAccess(llvm::Value* fieldAddress) const
 
 bool LLVMBackend::IsCxxMutableFieldAccess(llvm::Value* fieldAddress) const
 {
-        auto* inst = llvm::dyn_cast_or_null<llvm::Instruction>(fieldAddress);
-        if (inst != nullptr && inst->getMetadata("cflat.cxx.mutablefield") != nullptr)
-            return true;
-        const TypeAndValue* field = FindDeclaredFieldTypeAndValueForStorage(fieldAddress);
-        return field != nullptr && field->IsCxxMutableField;
+        // A declared const field blocks mutable ancestors; the nearest mutable field otherwise wins.
+        llvm::Value* current = fieldAddress;
+        while (auto* inst = llvm::dyn_cast_or_null<llvm::Instruction>(current))
+        {
+            const TypeAndValue* field = FindDeclaredFieldTypeAndValueForStorage(current);
+            if (field != nullptr && field->IsCxxDeclaredConstField) return false;
+            if (inst->getMetadata("cflat.cxx.mutablefield") != nullptr) return true;
+            if (field != nullptr && field->IsCxxMutableField) return true;
+            auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(inst);
+            if (gep == nullptr) break;
+            current = gep->getPointerOperand();
+            if (llvm::isa<llvm::LoadInst>(current)) break;
+        }
+        return false;
 }
 
 int LLVMBackend::CxxConstReceiverKind(const NamedVariable& receiver) const
@@ -831,6 +848,7 @@ unsigned LLVMBackend::CxxFieldElementIndex(const StructData& data, unsigned inde
 
 llvm::Value* LLVMBackend::CreateGEP(llvm::Type* type, llvm::Value* ptr, llvm::Value* offset, std::string name)
 {
+        TouchWaitingLayout(type);
         return builder->CreateGEP(type, ptr, offset, name);
     }
 

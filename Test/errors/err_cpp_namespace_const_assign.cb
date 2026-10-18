@@ -33,6 +33,25 @@ extern int main()
         t217_const.n = 1;
     }
 
+    // T335: inherited non-mutable, union, array, and sub-struct siblings stay const.
+    expect_error("cannot assign to 't335Derived.bn': it is a const C++ object") {
+        t335Derived.bn = 4;
+    }
+    expect_error("cannot assign to 't335Union.f': it is a const C++ object") {
+        t335Union.f = 1;
+    }
+    expect_error("cannot assign to 't335Array.b[1]': it is a const C++ object") {
+        t335Array.b[1] = 9;
+    }
+    expect_error("cannot assign to 't335Member.k': it is a const C++ object") {
+        t335Member.k = 9;
+    }
+
+    // Mutability of the pointer slot does not extend through its load to a const pointee.
+    expect_error("cannot assign to '*t335Pointer.p': it is reached through a const C++ pointee") {
+        *t335Pointer.p = 1;
+    }
+
     // A write through a C++ `const T&` / `const T&&` RESULT, free or member, is refused too
     // (ruling 2026-09-27): `=`, compound assignment, `++` / `--`, a field of a const class
     // referent, and the pointer SLOT of `T *const &`. Master accepted every one. Its pointee,
@@ -94,5 +113,24 @@ extern int main()
     expect_error("cannot assign to '(h.clr())': it is reached through a C++ const reference result") {
         cppi.MtConstHolder h = cppi.MtConstHolder();
         (h.clr()) = 3;
+    }
+    // T335 r2: a mutable ancestor cannot override a const field below it.
+    expect_error("cannot assign to 't335ConstOuter.m.k': it is a const C++ object") {
+        t335ConstOuter.m.k = 11;
+    }
+    expect_error("cannot assign to 't335ConstOuter.m.k': it is a const C++ object") {
+        t335ConstOuter.m.k += 1;
+    }
+    expect_error("cannot increment 't335ConstOuter.m.k': it is a const C++ object") {
+        t335ConstOuter.m.k++;
+    }
+    expect_error("cannot assign to 't335ConstArrayOuter.a[1].k': it is a const C++ object") {
+        t335ConstArrayOuter.a[1].k = 11;
+    }
+    expect_error("cannot assign to 't335ConstRecordOuter.m.child.x': it is a const C++ object") {
+        t335ConstRecordOuter.m.child.x = 11;
+    }
+    expect_error("cannot assign to 't335ConstInheritedOuter.m.k': it is a const C++ object") {
+        t335ConstInheritedOuter.m.k = 11;
     }
 }

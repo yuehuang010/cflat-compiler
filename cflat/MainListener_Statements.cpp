@@ -4068,9 +4068,16 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     const std::string collTypeName = collNV.TypeAndValue.TypeName;
                     const bool cxxRangeCandidate = !isFaceType && !isFixedArray && !isArrayView
                         && compiler->IsCxxRecord(collTypeName);
-                    const bool cxxMemberRange = cxxRangeCandidate
+                    // Complete lookup selects the member form (clang), so a non-callable pair is
+                    // refused below. A count() class keeps its CFlat count-protocol route.
+                    const bool cxxNamedPair = cxxRangeCandidate
+                        && compiler->CxxClassHasScopeName(collTypeName, "begin")
+                        && compiler->CxxClassHasScopeName(collTypeName, "end");
+                    const bool cxxCallablePair = cxxRangeCandidate
                         && compiler->CxxClassHasMemberNamed(collTypeName, "begin")
                         && compiler->CxxClassHasMemberNamed(collTypeName, "end");
+                    const bool cxxMemberRange = cxxCallablePair
+                        || (cxxNamedPair && !compiler->CxxClassHasMemberNamed(collTypeName, "count"));
                     if (cxxRangeCandidate)
                     {
                         compiler->EnsureCxxMemberProjected(collTypeName, "begin");

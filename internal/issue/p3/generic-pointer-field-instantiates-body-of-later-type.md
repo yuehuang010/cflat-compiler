@@ -1,14 +1,14 @@
-# A pointer to a generic struct instance over a later-declared type instantiates the body ("sizeof incomplete")
+# unique<Wrap<S2>> field over a later-declared type instantiates the body ("sizeof incomplete")
 
-Found by the T301 Opus review (2026-10-16), pre-existing on master (with or without a unique field).
+T327 (2026-10-16) fixed the raw-pointer shapes (`Wrap<S2>*` field / param / local before `struct S2`: pointer-only pending
+instances wait for the struct body). Still open, same on master:
 
 ```cflat
 struct Wrap<T> { T v; int size() { return sizeof(T); } }
-struct Holder { Wrap<S2>* w = nullptr; }
+struct Holder { unique<Wrap<S2>> u; }
 struct S2 { int a = 0; }
-extern int main() { Holder h = default; return 0; }
 ```
-Refused "sizeof/alignof: type 'S2' is incomplete". clang accepts the C++ twin: a pointer to `Wrap<S2>` does not
-instantiate the class body or its member functions until used. Fix direction: a pointer field to a generic instance should
-register the instance shell only; instantiate fields/methods on first by-value use or member access (or defer method
-bodies to the end of the file).
+Refused "sizeof/alignof: type 'S2' is incomplete"; clang accepts a unique_ptr<Wrap<S2>> member. Likely path: the eager
+type-argument queue at MainListener_Declarations.cpp ~629 plus core/unique.cb (destructor `delete _p` instantiates the
+pointee). Fix direction: unique<T>'s instance (and its pointee) waits for T like a pointer-only record (T327
+PendingWaitsOnStructBody). Also eager: pointer uses inside generic template bodies and in function-pointer signatures.

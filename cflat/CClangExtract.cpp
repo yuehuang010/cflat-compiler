@@ -3382,6 +3382,30 @@ namespace cflat_cinterop
                 };
                 collectStaticDataMembers(cxx, collectStaticDataMembers);
 
+                // [stmt.ranged] needs clang's complete class-scope lookup: every named decl of
+                // the class and its bases, plus UNSCOPED enumerators (they live in the class).
+                std::set<std::string> scopeNameSet;
+                auto collectScopeNames = [&](const CXXRecordDecl* rd, auto&& self) -> void {
+                    for (const Decl* d : rd->decls())
+                    {
+                        if (const auto* nd = dyn_cast<NamedDecl>(d))
+                            if (nd->getIdentifier() != nullptr)
+                                scopeNameSet.insert(nd->getNameAsString());
+                        const auto* ed = dyn_cast<EnumDecl>(d);
+                        if (ed != nullptr && !ed->isScoped())
+                            for (const EnumConstantDecl* ec : ed->enumerators())
+                                scopeNameSet.insert(ec->getNameAsString());
+                    }
+                    for (const CXXBaseSpecifier& base : rd->bases())
+                    {
+                        const CXXRecordDecl* baseDecl = base.getType()->getAsCXXRecordDecl();
+                        if (baseDecl != nullptr && baseDecl->getDefinition() != nullptr)
+                            self(baseDecl->getDefinition(), self);
+                    }
+                };
+                collectScopeNames(cxx, collectScopeNames);
+                rec.scopeNames.assign(scopeNameSet.begin(), scopeNameSet.end());
+
                 for (const VarDecl* vd : staticDataMembers)
                 {
                     auto rememberInitializerFailure = [&](RawCxxStaticVar& sv) {
@@ -3545,6 +3569,8 @@ namespace cflat_cinterop
                     rf.name = f->getNameAsString();
                     rf.ctype = CanonicalSpelling(ctx, f->getType());
                     rf.isZeroSize = f->isZeroSize(ctx);
+                    rf.isConst = f->getType().isConstQualified();
+                    rf.isMutable = f->isMutable();
                     rf.offsetBytes = baseOff + layout.getFieldOffset(idx) / 8;
                     RecordRawFieldLayout(f->getType(), rf);
                     rf.access = MapAccess(f->getAccess());
