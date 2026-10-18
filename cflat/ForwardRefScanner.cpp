@@ -5,6 +5,39 @@ LLVMBackend* ForwardRefScanner::Compiler(antlr4::ParserRuleContext* ctx) {
         return compilerLLVM;
     }
 
+std::string ForwardRefScanner::ResolveTupleTypeSpecifier(
+    CFlatParser::TupleTypeSpecifierContext* tupleSpec)
+{
+        if (tupleSpec == nullptr) return {};
+        auto* compiler = Compiler(tupleSpec);
+        std::vector<std::string> typeArgs;
+        if (auto* packEntry = tupleSpec->tupleTypePackEntry())
+        {
+            PrimitiveTypeError packError;
+            std::string packName = CanonicalTypeSpecifierText(
+                packEntry->typeSpecifier(), packEntry->multiWordTypeSuffix(), false, &packError);
+            if (HasPrimitiveTypeError(packError))
+                compiler->LogError(LocalizePrimitiveTypeError(compiler, packError));
+            typeArgs.push_back(compiler->ResolveTypeArgBaseName(packName));
+        }
+        else
+        {
+            for (auto* entry : tupleSpec->tupleTypeEntry())
+            {
+                PrimitiveTypeError argError;
+                typeArgs.push_back(TupleEntryArgName(compiler, entry, &argError));
+                if (HasPrimitiveTypeError(argError))
+                    compiler->LogError(LocalizePrimitiveTypeError(compiler, argError));
+            }
+        }
+        std::string tupleName = MangleGenericInstance(*compiler, "tuple", typeArgs);
+        compiler->CreateStructType(tupleName, {});
+        LLVMBackend::TypeAndValue rt{ .TypeName = tupleName };
+        compiler->CreateFunctionDeclaration(tupleName, rt, {});
+        compiler->gts.tupleTypeArgs[tupleName] = typeArgs;
+        return tupleName;
+    }
+
 std::vector<CFlatParser::InterfaceMemberContext*> ForwardRefScanner::ResolveInterfaceMembers(CFlatParser::InterfaceDefinitionContext* ctx) {
         std::vector<CFlatParser::InterfaceMemberContext*> out;
         for (auto* m : ctx->interfaceMember())
@@ -134,20 +167,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         // Pack-only form (T...) resolved during instantiation - skip forward-declare here
                         if (tts->tupleTypePackEntry() != nullptr)
                             break;
-                        std::vector<std::string> typeArgs;
-                        for (auto* entry : tts->tupleTypeEntry())
-                        {
-                            PrimitiveTypeError argError;
-                            typeArgs.push_back(TupleEntryArgName(compiler, entry, &argError));
-                            if (HasPrimitiveTypeError(argError))
-                                compiler->LogError(LocalizePrimitiveTypeError(compiler, argError));
-                        }
-                        std::string mangledName = MangleGenericInstance(*compiler, "tuple", typeArgs);
-                        compiler->CreateStructType(mangledName, {});
-                        LLVMBackend::TypeAndValue rt{ .TypeName = mangledName };
-                        compiler->CreateFunctionDeclaration(mangledName, rt, {});
-                        compiler->gts.tupleTypeArgs[mangledName] = typeArgs;
-                        declType.TypeName = mangledName;
+                        declType.TypeName = ResolveTupleTypeSpecifier(tts);
                         declType.Pointer = declSpecWithSuffix->pointer() != nullptr;
                         declType.ArraySize = ArrayDimsOf(declSpecWithSuffix) ?
                             ArrayDimsOf(declSpecWithSuffix)->assignmentExpression(0) : nullptr;
@@ -335,6 +355,24 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     }
                     break;
                 }
+                else if (auto* nestedType = typeSpec->typeName())
+                {
+                    ConstTypeSyntax shape;
+                    if (ResolveConstTypeSyntax(compiler, nestedType, shape, &scanTypeSubstitutions_,
+                            [this](auto* entry) { return ResolveForwardTypeArg(entry); },
+                            [this](auto* member) { return ResolveMemberTypeSpecifier(member); },
+                            [this](auto* tuple) {
+                                return ResolveTupleTypeSpecifier(tuple);
+                            }))
+                    {
+                        ApplyConstMaskThroughDepth(shape.ConstMask, shape.PointerDepth);
+                        declType.TypeName = shape.TypeName;
+                        declType.ConstMask |= shape.ConstMask;
+                        declType.IsArrayView = shape.IsArrayView;
+                        declType.Pointer = shape.IsArrayView;
+                        aliasPtrDepth = shape.PointerDepth;
+                    }
+                }
                 else
                 {
                     std::string specText = canonicalTypeName.empty()
@@ -352,6 +390,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     if (compiler->IsCxxNullptrTAlias(specText)) declType.IsCxxNullptrT = true;
                     declType.TypeName = compiler->ResolveQualifiedName(specText);
                     // Resolve type aliases (e.g. user-defined aliases)
+                    declType.ConstMask |= compiler->ResolveTypeAliasConstMask(declType.TypeName);
                     declType.TypeName = compiler->ResolveTypeAlias(declType.TypeName);
                     // An enum names a real type here: bind it to its registered (scoped) key and
                     // record the backing spelling that carries its width and signedness.
@@ -551,12 +590,13 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
             declType.AllocAlignValue = CoreUniqueDeclaredAllocAlign(compiler, declType.TypeName);
         bool hasConstQualifier = false;
         for (auto* spec : declSpecs->declarationSpecifier())
-            if (auto* qualifier = spec->typeQualifier();
-                qualifier != nullptr && qualifier->getText() == "const")
+            if (spec->typeQualifier() != nullptr)
                 hasConstQualifier = true;
+        if (hasConstQualifier)
+            declType.ApplyWholeWordConst();
         if (hasConstQualifier && declType.Pointer && compiler->IsCxxRecord(declType.TypeName))
             declType.IsCxxPointeeConst = true;
-        declType.IsSpelledPointeeConst = hasConstQualifier && declType.Pointer;
+        declType.IsSpelledPointeeConst = (declType.ConstMask & 1) != 0 && declType.Pointer;
         return declType;
     }
 
@@ -703,7 +743,7 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         {
             // Qualify member methods with their owning type ("double vec3.dot(...)"),
             // mirroring how namespace functions already carry their namespace in `name`.
-            std::string displayTypeName = SpellType(*compiler, returnType);
+            std::string displayTypeName = SpellTypeForSymbolDump(*compiler, returnType);
             std::string displayOwnerName;
             if (!structName.empty())
             {
@@ -721,7 +761,7 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
                     continue;
                 if (!first) sig += ", ";
                 first = false;
-                sig += SpellType(*compiler, p);
+                sig += SpellTypeForSymbolDump(*compiler, p);
                 if (!p.VariableName.empty()) sig += " " + p.VariableName;
             }
             sig += ")";
@@ -872,7 +912,7 @@ void ForwardRefScanner::ScanInterfaceDefinition(CFlatParser::InterfaceDefinition
             for (const auto& f : allFields != nullptr ? *allFields : kNoFields)
             {
                 if (f.VariableName.empty()) continue;
-                std::string typeSig = SpellType(*Compiler(ctx), f);
+                std::string typeSig = SpellTypeForSymbolDump(*Compiler(ctx), f);
                 std::string key = name + "." + f.VariableName;
                 LLVMBackend::TypeAndValue ownerType;
                 ownerType.TypeName = name;
@@ -1170,18 +1210,31 @@ void ForwardRefScanner::ValidateIsolatedIntegralPointerCasts(antlr4::tree::Parse
     auto validateCasts = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
         if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
         {
-        auto* typeName = cast->typeName();
-        auto* targetDecl = typeName ? typeName->abstractDeclarator() : nullptr;
+        auto* castTypeName = cast->castTypeName();
+        auto* targetDecl = castTypeName ? castTypeName->abstractDeclarator() : nullptr;
         bool targetPointer = targetDecl != nullptr
             && (targetDecl->pointer() != nullptr || targetDecl->arrayTypeSuffix() != nullptr);
         bool sourceIntegral = cast->castExpression() != nullptr
             && ScannerFoldIfConst(cast->castExpression()).has_value();
         if (!sourceIntegral && cast->castExpression() != nullptr)
             if (auto* sourceCast = dynamic_cast<CFlatParser::CastExpressionContext*>(cast->castExpression());
-                sourceCast != nullptr && sourceCast->typeName() != nullptr)
+                sourceCast != nullptr && sourceCast->castTypeName() != nullptr)
             {
                 LLVMBackend::TypeAndValue source;
-                source.TypeName = compilerLLVM->ResolveTypeAlias(sourceCast->typeName()->getText());
+                ConstTypeSyntax sourceShape;
+                if (ResolveConstCastTypeSyntax(compilerLLVM, sourceCast->castTypeName(), sourceShape,
+                        &scanTypeSubstitutions_,
+                        [this](auto* entry) { return ResolveForwardTypeArg(entry); },
+                        [this](auto* member) { return ResolveMemberTypeSpecifier(member); },
+                        [this](auto* tuple) {
+                            return ResolveTupleTypeSpecifier(tuple);
+                        }))
+                {
+                    source.TypeName = sourceShape.TypeName;
+                    source.Pointer = sourceShape.PointerDepth > 0;
+                    source.ElemPointer = sourceShape.PointerDepth >= 2;
+                    source.PointerDepth = sourceShape.PointerDepth > 2 ? 0 : sourceShape.PointerDepth;
+                }
                 sourceIntegral = source.IsInteger() != -1 || source.IsUnsignedInteger() != -1
                     || source.TypeName == "bool";
             }
@@ -1244,7 +1297,19 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
         // The scan mangles a nested generic base itself, so its name is not yet in any type
         // registry - but the main pass HAS registered it by the time it resolves the same arg.
         bool baseIsGenericInstantiation = false;
-        if (auto* innerParams = GenericSpecOf(typeSpec, innerBase))
+        if (typeSpec != nullptr && typeSpec->typeName() != nullptr)
+        {
+            ConstTypeSyntax shape;
+            if (ResolveConstTypeSpecifierSyntax(Compiler(entry), typeSpec, shape,
+                    &scanTypeSubstitutions_,
+                    [this](auto* innerEntry) { return ResolveForwardTypeArg(innerEntry); },
+                    [this](auto* member) { return ResolveMemberTypeSpecifier(member); },
+                    [this](auto* tuple) {
+                        return ResolveTupleTypeSpecifier(tuple);
+                    }))
+                resolved = shape.TypeName + std::string(shape.PointerDepth, '*');
+        }
+        else if (auto* innerParams = GenericSpecOf(typeSpec, innerBase))
         {
             baseIsGenericInstantiation = true;
             std::vector<std::string> innerArgs;
@@ -1314,8 +1379,17 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
                 if (Compiler(entry)->IsTypeArgTypeKey(resolved)
                     || Compiler(entry)->IsKnownTypeName(resolved))
                     ;
-                else if (auto folded = FoldCompileTimeInt(Compiler(entry), typeSpec->genericIdentifier()))
-                    return std::to_string(*folded);
+                else
+                {
+                    // The scan has no frames: a name resolves lexically (a local const shadows a global).
+                    const LexicalConstTypeParser parseType =
+                        [this](CFlatParser::DeclarationSpecifiersContext* d) -> LLVMBackend::TypeAndValue {
+                            return ParseDeclarationSpecifiers(d);
+                        };
+                    LexicalConstParserScope lexicalScope(&parseType);
+                    if (auto folded = FoldCompileTimeInt(Compiler(entry), typeSpec->genericIdentifier()))
+                        return std::to_string(*folded);
+                }
             }
             // A function-type alias resolves to the SAME encoded closure name as the direct
             // spelling, exactly as the main pass does. A unique-qualified closure is left in its
@@ -1980,6 +2054,34 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx,
                     }
                     break;
                 }
+            case CFlatParser::RulePostfixExpression:
+                {
+                    /*
+                     * A qualified generic spelled as an expression (`ns.G<C>`, an is_assignable
+                     * operand) is `ns` . `G` <C>: pre-declare it like the typeName spelling, only
+                     * when the dotted prefix names a CFlat template key.
+                     */
+                    auto* postfix = static_cast<CFlatParser::PostfixExpressionContext*>(ruleCtx);
+                    auto* primary = postfix->primaryExpression();
+                    if (primary == nullptr || primary->genericIdentifier() == nullptr
+                        || primary->genericIdentifier()->genericTypeParameters() != nullptr) break;
+                    std::string qualified = primary->getText();
+                    for (size_t i = 1; i + 1 < postfix->children.size(); i += 2)
+                    {
+                        auto* dot = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i]);
+                        auto* member = dynamic_cast<CFlatParser::MemberNameTokenContext*>(postfix->children[i + 1]);
+                        if (dot == nullptr || member == nullptr || dot->getText() != ".") break;
+                        qualified += "." + member->getText();
+                        if (i + 2 < postfix->children.size())
+                            if (auto* params = dynamic_cast<CFlatParser::GenericTypeParametersContext*>(postfix->children[i + 2]))
+                            {
+                                if (Compiler(params)->IsGenericTemplateKey(qualified))
+                                    tryPreDeclare(qualified, params);
+                                break;
+                            }
+                    }
+                    break;
+                }
             case CFlatParser::RulePrimaryExpression:
                 {
                     auto* primaryExpr = static_cast<CFlatParser::PrimaryExpressionContext*>(ruleCtx);
@@ -2050,18 +2152,41 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
             return;
         }
         PrimitiveTypeError canonicalError;
-        std::string target = CanonicalTypeSpecifierText(
-            typeSpec, ctx->multiWordTypeSuffix(), false, &canonicalError);
-        if (HasPrimitiveTypeError(canonicalError))
-            compiler->LogError(LocalizePrimitiveTypeError(compiler, canonicalError));
-        if (auto* memberType = typeSpec->memberTypeSpecifier())
-            target = ResolveMemberTypeSpecifier(memberType);
-        else if (auto subst = scanTypeSubstitutions_.find(target); subst != scanTypeSubstitutions_.end())
-            target = subst->second;
+        std::string target;
+        uint8_t targetConstMask = 0;
+        if (typeSpec->typeName() != nullptr)
+        {
+            ConstTypeSyntax shape;
+            if (ResolveConstTypeSpecifierSyntax(compiler, typeSpec, shape,
+                    &scanTypeSubstitutions_,
+                    [this](auto* entry) { return ResolveForwardTypeArg(entry); },
+                    [this](auto* member) { return ResolveMemberTypeSpecifier(member); },
+                    [this](auto* tuple) {
+                        return ResolveTupleTypeSpecifier(tuple);
+                    }))
+            {
+                target = shape.TypeName + std::string(shape.PointerDepth, '*');
+                targetConstMask = shape.ConstMask;
+            }
+        }
+        else
+        {
+            target = CanonicalTypeSpecifierText(
+                typeSpec, ctx->multiWordTypeSuffix(), false, &canonicalError);
+            if (HasPrimitiveTypeError(canonicalError))
+                compiler->LogError(LocalizePrimitiveTypeError(compiler, canonicalError));
+            if (auto* memberType = typeSpec->memberTypeSpecifier())
+                target = ResolveMemberTypeSpecifier(memberType);
+            else if (auto subst = scanTypeSubstitutions_.find(target); subst != scanTypeSubstitutions_.end())
+                target = subst->second;
+            targetConstMask = compiler->ResolveTypeAliasConstMask(target);
+        }
         // A pointer alias (using Handle = void*) stores its trailing stars in the alias string;
         // they are peeled back onto the pointer flags at the resolution site (GetType /
         // ParseDeclarationSpecifiers). Storage stays string-shaped - no descriptor struct.
         std::string suffix(ctx->pointer() != nullptr ? ctx->pointer()->Star().size() : 0, '*');
+        if (ctx->Const() != nullptr)
+            targetConstMask = UsingWholeWordConstMask(compiler, target, suffix.size());
 
         // Generic RHS (using IL = list<int>): mangle to list$int, pre-declare the shell +
         // default ctor to enqueue the instantiation (mirrors the use-site path at
@@ -2098,7 +2223,7 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
                 std::string cxxError;
                 compiler->TryRequestCxxType(resolvedBaseName, args, mangledName, cxxError);
             }
-            compiler->RegisterTypeAlias(alias, mangledName + suffix);
+            compiler->RegisterTypeAlias(alias, mangledName + suffix, targetConstMask);
             return;
         }
 
@@ -2132,13 +2257,13 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
             targetDecorated = enumKey + std::string(targetPointerDepth, '*');
             for (uint64_t dim : targetArrayDims)
                 targetDecorated += "[" + std::to_string(dim) + "]";
-            compiler->RegisterTypeAlias(alias, targetDecorated + suffix);
+            compiler->RegisterTypeAlias(alias, targetDecorated + suffix, targetConstMask);
             return;
         }
 
         if (compiler->IsInterfaceType(targetBase) || compiler->dataStructures.count(targetBase) > 0
             || LLVMBackend::IsPrimitiveTypeName(targetBase) || compiler->IsWinrtFullName(targetBase))
-            compiler->RegisterTypeAlias(alias, targetDecorated + suffix);
+            compiler->RegisterTypeAlias(alias, targetDecorated + suffix, targetConstMask);
         else if (provisionalAliasNs_.has_value())
         {
             // A template member alias naming a record declared later in the file: the name scan
@@ -2147,7 +2272,8 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
             const std::string known = compiler->gts.scannedTypeNames.count(sibling) != 0 ? sibling
                 : compiler->gts.scannedTypeNames.count(targetBase) != 0 ? targetBase : std::string{};
             if (!known.empty())
-                compiler->RegisterTypeAlias(alias, known + targetDecorated.substr(targetBase.size()) + suffix);
+                compiler->RegisterTypeAlias(alias, known + targetDecorated.substr(targetBase.size()) + suffix,
+                                            targetConstMask);
         }
     }
 

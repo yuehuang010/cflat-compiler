@@ -1,0 +1,75 @@
+// Const phase 3: an implicit pointer conversion may add const but never discard it (plan
+// cflat-const.md section 2 item 3, section 4 #5). Per level, C++ [conv.qual]: a target that adds
+// const below the first level needs every level above it const too. `void*` follows the same rule.
+struct C03DBox { int* p = nullptr; (const int)* cp = nullptr; };
+struct C03DStamp { const int id = 0; int n = 0; C03DStamp(int i) { id = i; } };
+const int c03dTarget = 7;
+const int[3] C03DTable = { 1, 2, 3 };
+
+expect_error("cannot convert '(const int)*' to 'int*': the conversion discards const") {
+    int* c03dGlobal = &c03dTarget;
+}
+
+expect_error("cannot convert '(const int)*' to 'int*': the conversion discards const") {
+    struct C03DDefault { int* p = &c03dTarget; };
+    void c03dFieldDefault() { C03DDefault d = default; }
+}
+
+extern int main()
+{
+    int x = 1;
+    int* raw = &x;
+    const int* fixedView = raw;
+    (const int)* view = raw;
+    const int L = 3;
+    expect_error("cannot convert '(const int)*' to 'int*': the conversion discards const. Use an explicit cast if the object is really writable") { int* bad = view; }
+    expect_error("cannot convert '(const int)*' to 'int*'") { int* bad = fixedView; }
+    expect_error("cannot convert '(const int)*' to 'int*'") { int* bad = &L; }
+    expect_error("cannot convert '(const int)*' to 'int*'") { int* bad = C03DTable; }
+    expect_error("cannot convert '(const int)*' to 'int*'") { int* bad = view + 1; }
+    expect_error("cannot convert '(const int)*' to 'int*'") { int* bad = raw; bad = view; }
+    expect_error("cannot convert '(const int)*' to 'int*'") { bool c = x > 0; int* bad = c ? raw : view; }
+    expect_error("cannot convert '(const int)*' to 'int*'") { int* bad = ((const int)*)raw; }
+
+    // void*: const(void)* keeps const, void* would discard it.
+    expect_error("cannot convert '(const int)*' to 'void*'") { void* bad = view; }
+    expect_error("cannot convert '(const void)*' to 'void*'") { const(void)* opaque = view; void* bad = opaque; }
+
+    // Brace elements: a struct field and an array element.
+    expect_error("cannot convert '(const int)*' to 'int*'") { C03DBox b = { p = view }; }
+    expect_error("cannot convert '(const int)*' to 'int*'") { int*[2] arr = { raw, view }; }
+    expect_error("cannot convert '(const int)*' to 'int*'") { C03DBox b = default; b.p = view; }
+
+    // Transitive: a pointer read out of a const object, or through a pointer to const.
+    const C03DBox constBox = { p = raw };
+    C03DBox mutableBox = { p = raw };
+    (const C03DBox)* boxView = &mutableBox;
+    expect_error("cannot convert '(const int)*' to 'int*'") { int* bad = constBox.p; }
+    expect_error("cannot convert '(const int)*' to 'int*'") { int* bad = boxView->p; }
+    expect_error("cannot convert '(const int)*' to 'int*'") { int* bad = &constBox.p[0]; }
+    C03DStamp stamp = C03DStamp(4);
+    expect_error("cannot convert '(const int)*' to 'int*'") { int* bad = &stamp.id; }
+
+    // Multi-level.
+    int** pp = &raw;
+    const int* slot = raw;
+    expect_error("cannot convert 'int**' to '(const int)**': the conversion discards const") { (const int)** bad = pp; }
+    expect_error("cannot convert '(const int*)*' to 'int**'") { int** bad = &slot; }
+    expect_error("cannot convert '(const int*)*' to '(const int)**'") { (const int)** bad = &slot; }
+    expect_error("cannot convert '(const int)**' to 'int**'") { (const int)* cursor = raw; (const int)** cp = &cursor; int** bad = cp; }
+
+    // Views: a view of const elements never becomes a mutable view.
+    int[3] cells = { 1, 2, 3 };
+    const int[] readCells = cells;
+    int[] cellView = cells;
+    expect_error("cannot convert 'const int[]' to 'int[]': the conversion discards const") { int[] bad = C03DTable; }
+    expect_error("cannot convert 'const int[]' to 'int[]'") { int[] bad = readCells; }
+    expect_error("cannot convert 'const int[]' to 'int[]'") { cellView = readCells; }
+    expect_error("cannot convert 'const int[]' to 'int[]'") { bool c = x > 0; int[] bad = c ? cellView : readCells; }
+    expect_error("cannot convert 'const int[]' to 'int*'") { int* bad = readCells; }
+
+    // `alias T*` copies the pointer: its pointee qualification follows.
+    expect_error("cannot convert '(const int)*' to 'int*': the conversion discards const") { alias int* bad = view; }
+    expect_error("cannot convert '(const int)*' to 'int*'") { alias int* bad = fixedView; }
+    return 0;
+}

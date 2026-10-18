@@ -681,7 +681,7 @@ void MainListener::CollectCasesFromStatement(CFlatParser::StatementContext* stmt
                     || caseText.find('?') != std::string::npos;
                 auto literalControlOnly = [&](auto&& self, antlr4::tree::ParseTree* node) -> bool {
                     if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
-                        cast != nullptr && cast->typeName() != nullptr)
+                        cast != nullptr && cast->castTypeName() != nullptr)
                         return false;
                     if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(node);
                         terminal != nullptr
@@ -2316,6 +2316,10 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             retFunctionSlot ? "the function value" : "the pointer");
         RejectStringLiteralIntoStructPointer(errCtx, compiler->currentFunctionReturnTV, right,
                                              "the return value");
+        if (std::string from, to; right != nullptr && !retFunctionSlot
+            && compiler->ConversionDiscardsConst(right, returnNV.TypeAndValue, retTV, from, to))
+            LogErrorContext(errCtx, std::format("cannot return '{}' as '{}': the conversion discards const",
+                from, to));
         // Coerce the returned value to the function-pointer return type (thin vs
         // fat): a named function, a thin function<> value, or a fat closure value.
         if (right && returnFnPtrTV.IsFunctionPointer && !encodedAliasReturnSlot)

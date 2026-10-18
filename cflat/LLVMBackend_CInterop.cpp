@@ -3993,6 +3993,37 @@ static bool CxxParamIsConstRefToPointer(const std::string& spelling)
  * `const T *const &`, `const T *const *`. Template arguments and function-pointer spellings are
  * not looked into; `T *const &` (const pointer slot only) is false.
  */
+/*
+ * Pointee const levels of a C pointer spelling, bottom-relative like ConstMask (bit 0 = the
+ * innermost pointee): `const int **` -> 1, `const int *const *` -> 3. The parameter's own
+ * top-level const is not part of it. 0 when the spelling is not `depth` plain stars.
+ */
+static uint8_t CSpellingPointeeConstMask(const std::string& spelling, int depth)
+{
+        if (spelling.find_first_of("()[<&") != std::string::npos || depth <= 0) return 0;
+        std::vector<std::string> segments(1);
+        for (char c : spelling)
+        {
+            if (c == '*') segments.emplace_back();
+            else segments.back() += c;
+        }
+        if ((int)segments.size() - 1 != depth) return 0;
+        auto hasConst = [](const std::string& seg) {
+            for (size_t at = seg.find("const"); at != std::string::npos; at = seg.find("const", at + 1))
+            {
+                const bool leftOk = at == 0 || !(std::isalnum((unsigned char)seg[at - 1]) || seg[at - 1] == '_');
+                const size_t end = at + 5;
+                const bool rightOk = end >= seg.size() || !(std::isalnum((unsigned char)seg[end]) || seg[end] == '_');
+                if (leftOk && rightOk) return true;
+            }
+            return false;
+        };
+        uint8_t mask = 0;
+        for (int k = 0; k < depth; ++k)
+            if (hasConst(segments[k])) mask |= static_cast<uint8_t>(1u << k);
+        return mask;
+}
+
 static bool CxxSpellingHasConstPointee(const std::string& spelling)
 {
         if (spelling.find('(') != std::string::npos) return false;
@@ -4229,6 +4260,9 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
             if (ptv.Pointer && !ptv.IsFunctionPointer
                 && CxxSpellingHasConstPointee(r.paramTypes[i]))
                 ptv.IsCxxPointeeConst = true;
+            // A C parameter keeps the levels it spells (`const int **` is const at the int only).
+            if (!r.isCxx && ptv.Pointer && !ptv.IsFunctionPointer && !ptv.IsArrayView)
+                ptv.ConstMask = CSpellingPointeeConstMask(r.paramTypes[i], ptv.ValuePointerDepth());
             if (r.isCxx && CxxSpellingHasVolatileTarget(r.paramTypes[i]))
                 ptv.IsCxxPointeeVolatile = true;
             // The spelled pointee const rides a named imported function's funcptr signature.

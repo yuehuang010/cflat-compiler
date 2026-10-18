@@ -1294,7 +1294,7 @@ namespace os
             return n;
         } else {
             char* env = os.posix.getenv("TMPDIR");
-            const char* src = "/tmp";
+            (const char)* src = "/tmp";
             if (env != nullptr && env[0] != 0) src = (const char*)env;
             i32 n = 0;
             while (src[n] != 0 && (i64)n < len - 1) { buf[n] = src[n]; n = n + 1; }

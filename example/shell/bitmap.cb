@@ -298,7 +298,7 @@ namespace Bitmap
     int run(int argc, char** argv)
     {
         Bitmap* src = nullptr;
-        const char* label = "<sample>";
+        (const char)* label = "<sample>";
 
         if (argc >= 2)
         {

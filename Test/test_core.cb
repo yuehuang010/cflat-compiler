@@ -3591,7 +3591,7 @@ int runViewFixedArraySources()
     int ptrOne = 1; int ptrTwo = 2;
     int*[2] ptrArr; ptrArr[0] = &ptrOne; ptrArr[1] = &ptrTwo;
     char ca = 65; char cb = 66;
-    const char*[2] constCharArr; constCharArr[0] = &ca; constCharArr[1] = &cb;
+    (const char)*[2] constCharArr; constCharArr[0] = &ca; constCharArr[1] = &cb;
     void*[2] voidArr; voidArr[0] = &ptrOne; voidArr[1] = &ptrTwo;
     VfaPtrElem pe0 = default; VfaPtrElem pe1 = default; pe1.value = 2;
     VfaPtrElem*[2] elemArr; elemArr[0] = &pe0; elemArr[1] = &pe1;

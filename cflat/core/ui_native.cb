@@ -720,7 +720,7 @@ struct ListCellStyle
 // into its own cache. Empty identity or invalid dimensions means "no icon".
 struct ListRowIcon
 {
-    const char* identity = nullptr;
+    (const char)* identity = nullptr;
     u64    pixels = 0u;
     int    pxW = 0;
     int    pxH = 0;

@@ -1,0 +1,28 @@
+// Const phase 1: an explicit 'move' nulls its source, so it is refused on a const object
+// (plan section 4 #12). The implicit last-use consume stays legal.
+struct C01M { int n = 0; int* p = nullptr; };
+
+C01M c01Sink(move C01M m) { return m; }
+string c01TakeString(move string s) { return s; }
+
+const C01M C01GlobalM = default;
+
+expect_error("cannot move out of const 'b'")
+{
+    C01M c01BadParamMove(const C01M b) { return move b; }
+}
+
+extern int main()
+{
+    const C01M m = default;
+    expect_error("cannot move out of const 'm'") { C01M t = move m; }
+    expect_error("cannot move out of const 'm'") { C01M t = c01Sink(move m); }
+    expect_error("cannot move out of const 'm'") { _ = move m; }
+    expect_error("cannot move out of const 'm.p'") { int* q = move m.p; }
+    expect_error("cannot move out of const 'C01GlobalM'") { C01M g = move C01GlobalM; }
+    const string s = "abc";
+    expect_error("cannot move out of const 's'") { string t = move s; }
+    const string last = "kept";
+    string consumed = c01TakeString(last);
+    return consumed.length() == 4 ? 0 : 1;
+}

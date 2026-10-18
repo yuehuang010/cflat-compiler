@@ -38,7 +38,8 @@ class queue<T>
             int i = 0;
             while (i < _size)
             {
-                newData[i] = move _data[_front + i];
+                if const (is_pointer(T)) newData[i] = move _data[_front + i];
+                else construct_at(&newData[i], move _data[_front + i]);
                 i++;
             }
             if (_data != nullptr)
@@ -87,7 +88,8 @@ class queue<T>
         else
         {
             if (_front + _size >= _capacity) _grow();
-            _data[_front + _size] = value;
+            if const (is_pointer(T)) _data[_front + _size] = value;
+            else construct_at(&_data[_front + _size], value);
             _size++;
         }
     }
@@ -102,7 +104,7 @@ class queue<T>
         void enqueue(move T value)
         {
             if (_front + _size >= _capacity) _grow();
-            _data[_front + _size] = move value;
+            construct_at(&_data[_front + _size], move value);
             _size++;
         }
     }

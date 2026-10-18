@@ -1,0 +1,13 @@
+// Const phase 2: a container element type with a const field is storable (relocation is
+// construction) but cannot be reassigned, so list<T>.sort() refuses when it is called.
+// File-scope expectation: the core compile_error is deferred past the scoped form.
+import "list.cb";
+struct C02Elem { const int id = 0; C02Elem(int i) { id = i; } };
+expect_error("list<T>.sort(): the element type has a const field and cannot be reassigned");
+extern int main()
+{
+    list<C02Elem> l = default;
+    l.add(C02Elem(2));
+    l.sort((C02Elem a, C02Elem b) => a.id < b.id);
+    return 0;
+}

@@ -1978,6 +1978,19 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 && Compiler(ctx)->IsOwningPtrTempValue(namedVar.Primary))
                                 ncChainRootTemp = namedVar.Primary;
                         }
+                        // The receiver's own type decides whether `->` / `.` reaches a const
+                        // pointee (call result, cast, union arm, field). An untyped join is decided from its arms.
+                        if (namedVar.TypeAndValue.Pointer && namedVar.Primary != nullptr)
+                        {
+                            std::string receiverText;
+                            for (auto* child : ctx->children)
+                            {
+                                if (child == parseTree) break;
+                                receiverText += child->getText();
+                            }
+                            Compiler(ctx)->MarkPointeeQualification(namedVar.Primary,
+                                namedVar.TypeAndValue, receiverText);
+                        }
                         // A parenthesized pointer join carries its element name on the joined
                         // LLVM value even when the expression wrapper has no NamedVariable type.
                         if (namedVar.TypeAndValue.TypeName.empty() && namedVar.Primary != nullptr
@@ -2316,6 +2329,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             && (namedVar.IsElementAccess || !namedVar.TypeAndValue.Pointer);
                         if (constElement || !namedVar.TypeAndValue.IsCxxMutableField)   // a mutable member is writable
                             RefuseCxxConstReferentWrite(ctx, incrementStorage, "increment", constElement);
+                        RefuseConstObjectWrite(ctx, namedVar, incrementStorage, "increment");
                         if (incrementStorage)
                         {
                             namedVar.Primary = namedVar.Primary
@@ -2397,6 +2411,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             && (namedVar.IsElementAccess || !namedVar.TypeAndValue.Pointer);
                         if (constElement || !namedVar.TypeAndValue.IsCxxMutableField)   // a mutable member is writable
                             RefuseCxxConstReferentWrite(ctx, decrementStorage, "decrement", constElement);
+                        RefuseConstObjectWrite(ctx, namedVar, decrementStorage, "decrement");
                         if (decrementStorage)
                         {
                             namedVar.Primary = namedVar.Primary
@@ -2755,7 +2770,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             namedVar.Primary = llvm::ConstantInt::get(intTy,
                                                 llvm::APInt(intTy->getBitWidth(),
                                                     static_cast<uint64_t>(constValue), false, true));
-                                            namedVar.Storage = nullptr;
+                                            // A native const keeps its storage: '&G' and the write refusal need it.
+                                            if (!Compiler(ctx)->IsNativeConstGlobal(globalNV))
+                                                namedVar.Storage = nullptr;
                                         }
                                         else
                                             namedVar = globalNV;
@@ -6411,6 +6428,95 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             break;
                         }
 
+                        // Compile-time intrinsic: is_assignable(T) - 0 when T is a native struct
+                        // with a const field anywhere by value (whole assignment is refused), else 1.
+                        if (!postfixMemberCallPending && functionName == "is_assignable")
+                        {
+                            bool isAssignable = true;
+                            if (argumentList.size() > 0)
+                            {
+                                auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
+                                if (!namedArgCtx.empty())
+                                {
+                                    auto* be = Compiler(ctx);
+                                    auto* argExpr = namedArgCtx[0]->assignmentExpression();
+                                    std::string base = argExpr->getText();
+                                    bool isPointer = false;
+                                    if (auto substIt = activeTypeSubstitutions.find(base);
+                                        substIt != activeTypeSubstitutions.end())
+                                    {
+                                        // A substituted T may be mid-instantiation: decide from its name.
+                                        base = LegacyUniqueSubstitutionSpelling(be, substIt->second);
+                                        StripOwnershipQualifiers(base);
+                                        isPointer = !base.empty() && base.back() == '*';
+                                    }
+                                    else
+                                    {
+                                        // Every direct spelling (alias, namespace, generic) is resolved and
+                                        // instantiated as sizeof(typeName) does, then fails closed.
+                                        bool resolved = false;
+                                        antlr4::ANTLRInputStream typeInput(base);
+                                        CFlatLexer typeLexer(&typeInput);
+                                        antlr4::CommonTokenStream typeTokens(&typeLexer);
+                                        CFlatParser typeParser(&typeTokens);
+                                        typeLexer.removeErrorListeners();
+                                        typeParser.removeErrorListeners();
+                                        auto* parsedTypeName = typeParser.typeName();
+                                        if (typeParser.getNumberOfSyntaxErrors() == 0 && typeTokens.LA(1) == -1)
+                                        {
+                                            auto operand = ParseTypeName(parsedTypeName, true, ctx);
+                                            if (!operand.TypeName.empty())
+                                            {
+                                                resolved = true;
+                                                base = operand.TypeName;
+                                                isPointer = operand.Pointer || operand.IsArrayView;
+                                                llvm::Type* argType = isPointer ? nullptr
+                                                    : be->GetType(operand, nullptr, true);
+                                                be->TouchWaitingLayout(argType);
+                                                while (argType != nullptr && argType->isArrayTy())
+                                                    argType = argType->getArrayElementType();
+                                                auto* st = llvm::dyn_cast_or_null<llvm::StructType>(argType);
+                                                TypeSpelling spelling;
+                                                if (st != nullptr && !st->isSized() && st->hasName()
+                                                    && DemangleType(*be, st->getName().str(), spelling) && !spelling.args.empty())
+                                                {
+                                                    // A generic named only here (no instantiating use) is built now, as a
+                                                    // by-value declaration would.
+                                                    std::vector<std::string> typeArgs;
+                                                    for (const auto& arg : spelling.args)
+                                                        typeArgs.push_back(MangleType(*be, arg));
+                                                    QueueGenericInstantiation(spelling.base, typeArgs, st->getName().str(), ctx);
+                                                    LLVMBackend::BuilderStateGuard savedState(be);
+                                                    ProcessPendingInstantiations();
+                                                }
+                                                if (st != nullptr)
+                                                {
+                                                    if (st->hasName() && be->dataStructures.count(st->getName().str()) != 0)
+                                                        base = st->getName().str();
+                                                    if (!st->isSized() && !be->IsCxxRecord(base))
+                                                        LogErrorContext(ctx, std::format(
+                                                            "type '{}' is incomplete here (its layout is not available at this point); "
+                                                            "it can only be used through a pointer", SpellType(*be, operand)));
+                                                }
+                                            }
+                                        }
+                                        if (!resolved)
+                                        {
+                                            StripOwnershipQualifiers(base);
+                                            isPointer = !base.empty() && base.back() == '*';
+                                        }
+                                    }
+                                    std::string constField;
+                                    isAssignable = base.empty() || isPointer
+                                        || !be->FindNativeConstField(base, constField);
+                                }
+                            }
+                            namedVar.Primary = llvm::ConstantInt::get(
+                                llvm::Type::getInt1Ty(*Compiler(ctx)->context), isAssignable ? 1 : 0);
+                            namedVar.TypeAndValue.TypeName = "int";
+                            break;
+                        }
+
                         // Compile-time intrinsic: is_cpp_class(T) - true for imported C++ records.
                         // Generic container code uses it to isolate C++ ABI restrictions from
                         // CFlat move-only structs, which remain valid value types.
@@ -10024,7 +10130,7 @@ CFlatParser::CastExpressionContext* MainListener::tryGetCastExpression(antlr4::R
         if (ctx->getRuleIndex() == CFlatParser::RuleCastExpression)
         {
             auto* ce = dynamic_cast<CFlatParser::CastExpressionContext*>(ctx);
-            if (ce != nullptr && ce->typeName() != nullptr && ce->castExpression() != nullptr)
+            if (ce != nullptr && ce->castTypeName() != nullptr && ce->castExpression() != nullptr)
                 return ce;
         }
 
@@ -10382,6 +10488,7 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
                                 ci.TV   = nv.TypeAndValue;
                                 ci.OuterStorage = nv.Storage;
                                 ci.SourceIsStaticLocal = nv.IsStaticLocal;
+                                ci.ConstFoldInt = nv.ConstFoldInt;
                                 // Every non-pointer struct value captures BY REFERENCE, as
                                 // doc/LANGUAGE.md "Reference capture" documents - a container
                                 // (list/dictionary) is a struct like any other, and value-capturing
@@ -10743,6 +10850,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
 
                 auto& captureNV = compiler->GetOrCreateStackVariable(cap.Name);
                 compiler->RecordMoveGenBind(cap.Name); // fresh capture binding in the lambda body
+                captureNV.ConstFoldInt = cap.ConstFoldInt;
 
                 if (cap.ByReference)
                 {
@@ -10759,6 +10867,8 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                         LLVMBackend::TypeAndValue captureTV = cap.TV;
                         captureTV.Pointer        = true;
                         captureTV.ConstArraySize = 0;  // inside the lambda this is a T*, not a T[N]
+                        // A const array stays const through the decayed pointer: the pointer and its elements.
+                        if (compiler->IsNativeConstObject(cap.TV)) captureTV.ApplyWholeWordConst();
                         captureNV.Primary      = outerPtr;
                         captureNV.TypeAndValue = captureTV;
                         captureNV.BaseType     = cflat_llvm::PointerTo(structTy);
@@ -11882,7 +11992,9 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                         globalNV.Primary = llvm::ConstantInt::get(intTy,
                             llvm::APInt(intTy->getBitWidth(), static_cast<uint64_t>(constValue),
                                         false, true));
-                        globalNV.Storage = nullptr;
+                        // A native const keeps its storage: '&G' and the write refusal need it.
+                        if (!compiler->IsNativeConstGlobal(globalNV))
+                            globalNV.Storage = nullptr;
                     }
                 }
                 CheckGlobalGuard(node, name, globalNV);
@@ -11915,7 +12027,7 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
 
         // Compiler intrinsics handled at the call site - not in the function table.
         static const std::unordered_set<std::string> kIntrinsics = {
-            "va_start", "va_end", "is_pointer", "is_unique", "is_interface", "is_copyable", "is_movable", "is_cpp_class", "is_primitive", "is_string", "annotationof",
+            "va_start", "va_end", "is_pointer", "is_unique", "is_interface", "is_copyable", "is_movable", "is_assignable", "is_cpp_class", "is_primitive", "is_string", "annotationof",
             "compile_error", "construct_at", "embed",
             "reflect", "reflect_set", "json_const", "xml_const", "__rdtscp", "__readcyclecounter", "__lfence", "__pause",
             "__popcount", "__ctz", "__clz", "__prefetch", "__fma", "__likely", "__unlikely",

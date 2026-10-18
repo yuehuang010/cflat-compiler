@@ -850,6 +850,7 @@ public:
         // the '&' (+1), '*' (-1) and pointer-subscript (-1) steps over an ALREADY-RECORDED depth.
         // A new producer that CHANGES depth must step it too, or it falsely proves the old one.
         int PointerDepth = 0;
+        uint8_t ConstMask = 0;
         bool IsInterface = false;
         bool IsInterfacePointer = false; // true when T is interface AND this is a pointer TO that fat-ptr (e.g. T* field where T=IMessage, or channel<IMessage*>)
         // True when this type IS one bare interface fat value ({vtable,data} by value). DERIVED,
@@ -1174,6 +1175,20 @@ public:
             return (ElemPointer || PointerDepth >= 2) ? 2 : (Pointer ? 1 : 0);
         }
 
+        void ApplyWholeWordConst()
+        {
+            const int depth = IsArrayView ? (ElemPointer ? 1 : 0) : ValuePointerDepth();
+            ConstMask = static_cast<uint8_t>((1u << (depth + 1)) - 1u);
+        }
+
+        // The declared OBJECT itself is const: the ConstMask bit at the level ApplyWholeWordConst
+        // treats as the object (`const int* p` and `const int x` yes, `(const int)* q` no).
+        bool IsConstObject() const
+        {
+            const int depth = IsArrayView ? (ElemPointer ? 1 : 0) : ValuePointerDepth();
+            return ((ConstMask >> depth) & 1u) != 0;
+        }
+
         // A plain `T**` value, proven either by the ElemPointer bit or by a recorded depth >= 2
         // (which is how an inline `&x` over a `T*` proves itself). Both readings hold only when
         // nothing else on the type claims depth for an ELEMENT (array/view/simd) or a fat shape.
@@ -1257,6 +1272,7 @@ public:
     struct AliasScopeFrame
     {
         std::unordered_map<std::string, std::string> typeAliases;
+        std::unordered_map<std::string, uint8_t> typeAliasConstMasks;
         std::unordered_map<std::string, TypeAndValue> functionTypeAliases;
     };
 
@@ -1279,6 +1295,7 @@ public:
         bool Pointer = false;
         bool ElemPointer = false;
         int PointerDepth = 0;
+        uint8_t ConstMask = 0;
         bool IsInterface = false;
         bool IsInterfacePointer = false;
         bool IsNullable = false;
@@ -1354,6 +1371,7 @@ public:
             s.Pointer = t.Pointer;
             s.ElemPointer = t.ElemPointer;
             s.PointerDepth = t.PointerDepth;
+            s.ConstMask = t.ConstMask;
             s.IsInterface = t.IsInterface;
             s.IsInterfacePointer = t.IsInterfacePointer;
             s.IsNullable = t.IsNullable;
@@ -1430,6 +1448,7 @@ public:
             t.Pointer = Pointer;
             t.ElemPointer = ElemPointer;
             t.PointerDepth = PointerDepth;
+            t.ConstMask = ConstMask;
             t.IsInterface = IsInterface;
             t.IsInterfacePointer = IsInterfacePointer;
             t.IsNullable = IsNullable;
@@ -1593,6 +1612,8 @@ public:
         llvm::Value* Storage = nullptr;  // The container holding the value, used to load or store.
         // The declaration's top-level const, retained for C++ reference overload selection.
         bool IsTopLevelConst = false;
+        // A const integer local with a constant initializer: folds like a file-scope const.
+        std::optional<int64_t> ConstFoldInt;
         llvm::Value* AddressedUniqueSlot = nullptr;
         std::string AddressedUniqueTypeName;
         llvm::Type* UnionFieldType = nullptr;  // When non-null: load/store this storage as this type (union field access).
@@ -3482,6 +3503,7 @@ private:
     // redefinition. Transient per compile, never serialized.
     std::unordered_map<std::string, std::unordered_set<std::string>> enumDeclSites_;
     std::unordered_map<std::string, std::string> typeAliases;
+    std::unordered_map<std::string, uint8_t> typeAliasConstMasks;
     // C++ aliases of std::nullptr_t (std.nullptr_t, `using Nil = std::nullptr_t`): typeAliases
     // spells them void*, this keeps their identity for IsCxxNullptrT. Cleared with typeAliases.
     std::unordered_set<std::string> cxxNullptrTAliases_;
@@ -7485,10 +7507,12 @@ public:
 
     static bool IsPrimitiveTypeName(const std::string& name);
 
-    void RegisterTypeAlias(const std::string& alias, const std::string& target);
+    void RegisterTypeAlias(const std::string& alias, const std::string& target,
+                           uint8_t constMask = 0);
     void RegisterFunctionTypeAlias(const std::string& alias, const TypeAndValue& target);
 
     std::string ResolveTypeAlias(const std::string& name) const;
+    uint8_t ResolveTypeAliasConstMask(const std::string& name) const;
     /*
      * `Owner.name` in type position: the member type `name` of record `owner` - a CFlat
      * aggregate's `using` alias or nested aggregate, or a C++ record's member typedef / nested
@@ -11862,6 +11886,78 @@ public:
     // The binding behind a slot, for guards that need its ownership flags and not just its name.
     // Same search order as FindVariableNameByStorage; null when the slot is not a live binding.
     const NamedVariable* FindVariableByStorage(const llvm::Value* slot) const;
+
+    // Native CFlat const object (local, parameter, global) whose storage `address` lands in by value
+    // (GEPs only, no load). C/C++ globals and C++ records keep their own const checks; null if none.
+    struct ConstObjectRoot { std::string Name; llvm::Value* Storage = nullptr; llvm::Type* Type = nullptr; };
+    std::optional<ConstObjectRoot> FindConstObjectRoot(const llvm::Value* address) const;
+    bool IsNativeConstObject(const TypeAndValue& tv) const;
+    bool IsNativeConstGlobal(const NamedVariable& globalNV) const;
+
+    /*
+     * Why a write to `address` is refused, innermost cause first: a const native field on the
+     * way (except the running constructor's own fields of `this`), a const object root (phase 1),
+     * or a load of a pointer whose pointee is const - spelled on the slot it was loaded from, or
+     * inherited from a const object holding that slot (transitive const).
+     */
+    struct ConstWriteCause
+    {
+        enum class CauseKind { None, Object, Field, ThroughPointer };
+        CauseKind Kind = CauseKind::None;
+        ConstObjectRoot Root;   // Object, and the holder of a pointer slot reached transitively
+        std::string Name;       // Field: the const field; ThroughPointer: the pointer
+    };
+    ConstWriteCause FindConstWriteCause(const llvm::Value* address) const;
+    const TypeAndValue* DeclaredConstSlot(const llvm::Value* slot, std::string& name, int depth = 0) const;
+    bool PointerValuePointeeConst(const llvm::Value* pointer, std::string& name, int depth = 0) const;
+    // Top-relative const levels (bit 0 = the first level reached): behind a pointer value, of the
+    // object stored at an address (bit 0 = that object), and behind a declared pointer type.
+    uint8_t ValueConstLevels(const llvm::Value* pointer, std::string& name, int depth = 0) const;
+    uint8_t StoredConstLevels(const llvm::Value* address, std::string& name, int depth = 0) const;
+    uint8_t DeclaredPointeeConstLevels(const TypeAndValue& tv) const;
+    static bool QualificationDiscardsConst(uint8_t source, uint8_t target, int depth);
+    llvm::Value* ArgumentPointerValue(const NamedVariable& arg) const;
+    TypeAndValue ParameterQualification(const FunctionSymbol& candidate, const TypeAndValue& param) const;
+    // A C header parameter's ConstMask holds its exact spelled levels (`int *const *`), not filled.
+    static bool ParameterHasExactLevels(const FunctionSymbol& candidate, const TypeAndValue& param)
+    {
+        return candidate.IsCInteropDeclaration && !candidate.IsCxx && param.ConstMask != 0;
+    }
+    bool ConversionDiscardsConst(const llvm::Value* value, const TypeAndValue& source,
+                                 const TypeAndValue& target, std::string& sourceSpelled,
+                                 std::string& targetSpelled, bool exactTargetLevels = false) const;
+    // Stamp the pointee qualification of the expression that produced `pointer` (a member-access
+    // receiver), or the exact qualification an explicit cast gives it (R7 A).
+    void MarkPointeeQualification(llvm::Value* pointer, const TypeAndValue& tv, const std::string& name);
+    llvm::Value* MarkCastQualification(llvm::Value* pointer, const TypeAndValue& tv, const std::string& text);
+    // First const field of a native struct, by value through embedded structs and fixed arrays.
+    bool FindNativeConstField(const std::string& typeName, std::string& field) const;
+    // The native constructor body being emitted and its `this` storage (its own const fields
+    // are writable there).
+    llvm::Value* constructingThis_ = nullptr;
+    llvm::Function* constructingFunction_ = nullptr;
+    bool IsConstructingStorage(const llvm::Value* storage) const
+    {
+        auto* block = builder->GetInsertBlock();
+        return storage != nullptr && storage == constructingThis_ && block != nullptr
+            && block->getParent() == constructingFunction_;
+    }
+    struct ConstructingScope
+    {
+        LLVMBackend* backend;
+        llvm::Value* savedThis;
+        llvm::Function* savedFunction;
+        ConstructingScope(LLVMBackend* b, llvm::Value* thisStorage)
+            : backend(b), savedThis(b->constructingThis_), savedFunction(b->constructingFunction_)
+        {
+            auto* block = b->builder->GetInsertBlock();
+            b->constructingThis_ = thisStorage;
+            b->constructingFunction_ = block != nullptr ? block->getParent() : nullptr;
+        }
+        ~ConstructingScope() { backend->constructingThis_ = savedThis; backend->constructingFunction_ = savedFunction; }
+        ConstructingScope(const ConstructingScope&) = delete;
+        ConstructingScope& operator=(const ConstructingScope&) = delete;
+    };
 
     /*
      * Has a plain `=` since the declaration made this binding the SOLE owner of what it now holds, so

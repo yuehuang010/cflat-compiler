@@ -135,14 +135,14 @@ extern int main(int argc, char** argv)
     // Usage: win32_shot [path.bmp] [dark|light] [states|pressed]
     //   states  - focus the field + hover the button
     //   pressed - focus the field + press the button
-    const char* path = "out/ui_shot.bmp";
+    (const char)* path = "out/ui_shot.bmp";
     if (argc > 1) path = argv[1];
     Theme theme = lightTheme();
     if (argc > 2 && strcmp(argv[2], "dark") == 0) theme = darkTheme();
 
-    const char* focusKey = "";
-    const char* hoverKey = "";
-    const char* pressKey = "";
+    (const char)* focusKey = "";
+    (const char)* hoverKey = "";
+    (const char)* pressKey = "";
     if (argc > 3 && strcmp(argv[3], "states") == 0)  { focusKey = "name"; hoverKey = "btn"; }
     if (argc > 3 && strcmp(argv[3], "pressed") == 0) { focusKey = "name"; pressKey = "btn"; }
 

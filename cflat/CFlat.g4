@@ -155,7 +155,7 @@ unaryOperator
     ;
 
 castExpression
-    : '(' typeName ')' castExpression
+    : '(' castTypeName ')' castExpression
     | unaryExpression
     | DigitSequence // for
     ;
@@ -353,6 +353,8 @@ typeSpecifier
     | functionPointerSpecifier
     | simdTypeSpecifier
     | tupleTypeSpecifier
+    | 'const' '(' typeName ')'   // const(T): whole-word const on an inner type
+    | '(' 'const' typeName ')'   // (const T): same meaning
     ;
 
 // Builtin special-form vector type: simd<T,N>. 'simd' is an inline-literal soft keyword
@@ -590,6 +592,13 @@ typeName
     : specifierQualifierList abstractDeclarator?
     ;
 
+// A top-level const needs a declarator, so `(const T)` never opens a cast and `(const T)*`
+// always starts a type.
+castTypeName
+    : typeSpecifier* abstractDeclarator?
+    | typeQualifier typeSpecifier* abstractDeclarator
+    ;
+
 abstractDeclarator
     : pointer
     | pointer? arrayTypeSuffix   // `(T[])` cast target = the noalias array-view escape (explicit T* -> T[]); trailing '*' caught for a diagnostic
@@ -774,7 +783,7 @@ ifConstBlock
     ;
 
 usingDeclaration
-    : Using (Identifier | String) '=' typeSpecifier multiWordTypeSuffix? pointer? arrayTypeSuffix? ';'
+    : Using (Identifier | String) '=' Const? typeSpecifier multiWordTypeSuffix? pointer? arrayTypeSuffix? ';'   // `const W`: whole-word const, as in a declaration
     ;
 
 importDeclaration

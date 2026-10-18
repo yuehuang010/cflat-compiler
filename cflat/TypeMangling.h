@@ -46,6 +46,8 @@ void RememberMangledArity(const LLVMBackend& compiler, std::string_view mangled,
 
 std::string SpellType(const LLVMBackend& compiler,
                       const LLVMBackend::TypeAndValue& type);
+std::string SpellTypeForSymbolDump(const LLVMBackend& compiler,
+                                   const LLVMBackend::TypeAndValue& type);
 std::string SpellDiagnosticType(const LLVMBackend& compiler,
                                 const LLVMBackend::TypeAndValue& type);
 std::string_view MangledBase(std::string_view mangled);

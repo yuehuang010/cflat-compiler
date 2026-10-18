@@ -521,6 +521,16 @@ static antlr4::tree::TerminalNode* BareTypeNameIdentifier(CFlatParser::TypeNameC
     return gid->Identifier();
 }
 
+static antlr4::tree::TerminalNode* BareCastTypeNameIdentifier(CFlatParser::CastTypeNameContext* typeName)
+{
+    if (typeName == nullptr || typeName->typeQualifier() != nullptr
+        || typeName->abstractDeclarator() != nullptr || typeName->typeSpecifier().size() != 1)
+        return nullptr;
+    auto* gid = typeName->typeSpecifier()[0]->genericIdentifier();
+    if (gid == nullptr || gid->genericTypeParameters() != nullptr) return nullptr;
+    return gid->Identifier();
+}
+
 static std::vector<std::string> TypeSpecifierWords(
     CFlatParser::TypeSpecifierContext* typeSpec,
     CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr)
@@ -605,6 +615,52 @@ static bool IsBadArrayArg(Ctx* c)
 static int PointerDepthOf(CFlatParser::PointerContext* p)
 {
     return p == nullptr ? 0 : (int)p->Star().size();
+}
+
+static std::vector<CFlatParser::TypeQualifierContext*> ConstQualifiersAfterPointerStar(
+    CFlatParser::PointerContext* pointer)
+{
+    std::vector<CFlatParser::TypeQualifierContext*> result;
+    if (pointer == nullptr) return result;
+    for (auto* qualifierList : pointer->typeQualifierList())
+        for (auto* qualifier : qualifierList->typeQualifier())
+            if (qualifier->getText() == "const") result.push_back(qualifier);
+    return result;
+}
+
+static std::string ConstAfterPointerDiagnostic(const std::string& spelledBaseType)
+{
+    return std::format("'const' after '*' is not allowed: const applies to the whole type. "
+        "Write 'const {}' (pointer and target fixed) or '(const {})*' (target read-only)",
+        spelledBaseType, spelledBaseType);
+}
+
+static std::string SpelledTypeNameBase(
+    const std::vector<CFlatParser::TypeSpecifierContext*>& typeSpecs);
+
+static std::string SpelledTypeNameBase(CFlatParser::TypeNameContext* typeName)
+{
+    auto* spec = typeName == nullptr ? nullptr : typeName->specifierQualifierList();
+    if (spec == nullptr) return "T";
+    return SpelledTypeNameBase(spec->typeSpecifier());
+}
+
+static std::string SpelledTypeNameBase(
+    const std::vector<CFlatParser::TypeSpecifierContext*>& typeSpecs)
+{
+    if (typeSpecs.size() == 1 && typeSpecs.front()->typeName() != nullptr)
+        return SpelledTypeNameBase(typeSpecs.front()->typeName());
+    std::vector<std::string> words;
+    for (auto* spec : typeSpecs) words.push_back(spec->getText());
+    return words.empty() ? "T" : JoinTypeSpecifierWords(words);
+}
+
+static std::string SpelledTypeNameBase(CFlatParser::TypeSpecifierContext* typeSpec,
+                                       CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr)
+{
+    if (typeSpec != nullptr && typeSpec->typeName() != nullptr)
+        return SpelledTypeNameBase(typeSpec->typeName());
+    return JoinTypeSpecifierWords(TypeSpecifierWords(typeSpec, suffix));
 }
 
 // Type-arg string for one tuple element: the bare type plus its reference-kind suffix
@@ -817,6 +873,8 @@ static bool ScannerAddOverflow(int64_t a, int64_t b, int64_t* out);
 static bool ScannerSubOverflow(int64_t a, int64_t b, int64_t* out);
 static bool ScannerMulOverflow(int64_t a, int64_t b, int64_t* out);
 static std::optional<int64_t> ParseScannerIntegerLiteral(const std::string& textIn);
+static std::string ResolveCastTypeNameForScanner(
+    LLVMBackend* compiler, CFlatParser::CastTypeNameContext* castTypeName);
 
 /*
  * The shared compile-time integer folder, callable from BOTH passes (the ForwardRefScanner
@@ -830,7 +888,7 @@ static std::optional<int64_t> ParseScannerIntegerLiteral(const std::string& text
 // in plain int64, so `(u32)0` would lose its unsignedness in a relational compare.
 static bool HasNoTypedCast(antlr4::tree::ParseTree* node) {
     if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
-        cast != nullptr && cast->typeName() != nullptr)
+        cast != nullptr && cast->castTypeName() != nullptr)
         return false;
     for (auto* child : node->children)
         if (!HasNoTypedCast(child)) return false;
@@ -1022,15 +1080,17 @@ static std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler, antl
         }
         if (auto* n = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
         {
-            if (n->typeName() != nullptr)
+            if (n->castTypeName() != nullptr)
             {
                 // A C-cast to an integer (or enum) target folds as the main pass's truncation;
                 // every other target leaves the condition undecidable.
                 if (compiler == nullptr) return std::nullopt;
                 auto v = FoldCompileTimeIntLeaf(compiler, n->castExpression());
                 if (!v) return std::nullopt;
+                std::string targetTypeName = ResolveCastTypeNameForScanner(compiler, n->castTypeName());
+                if (targetTypeName.empty()) return std::nullopt;
                 int64_t out = 0;
-                if (!compiler->TryGetScanTimeIntegerCast(n->typeName()->getText(), *v, out))
+                if (!compiler->TryGetScanTimeIntegerCast(targetTypeName, *v, out))
                     return std::nullopt;
                 return InScannerInt32Range(out) ? std::optional<int64_t>(out) : std::nullopt;
             }
@@ -1165,6 +1225,218 @@ static std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler, antl
         return std::nullopt;
     }
 
+// A const integer local folds only when its value is exactly representable in its own type.
+static bool ConstLocalFoldFits(llvm::IntegerType* type, int64_t value)
+{
+    if (type == nullptr || type->getBitWidth() < 2 || !InScannerInt32Range(value)) return false;
+    return type->getBitWidth() >= 32
+        || (value >= 0 && value < (int64_t(1) << (type->getBitWidth() - 1)));
+}
+
+/*
+ * A pre-pass has no local frames, so a value generic argument naming a const integer local
+ * (`const int K = 4; Buf<int, K> b;`) is found lexically. Every binding construct of the grammar
+ * either folds (a const integer declarator) or shadows: earlier block items and earlier declarators
+ * of the same declaration, for-init declarators, range-for and case-arm variables, lambda, function
+ * and generic parameters, destructuring entries and block `using` names. `found` reports a binding.
+ */
+using LexicalConstTypeParser =
+    std::function<LLVMBackend::TypeAndValue(CFlatParser::DeclarationSpecifiersContext*)>;
+// Set while a lexical const initializer folds, so its identifiers resolve in their own scope.
+inline thread_local const LexicalConstTypeParser* activeLexicalConstTypeParser = nullptr;
+struct LexicalConstParserScope
+{
+    const LexicalConstTypeParser* saved = activeLexicalConstTypeParser;
+    explicit LexicalConstParserScope(const LexicalConstTypeParser* p) { activeLexicalConstTypeParser = p; }
+    ~LexicalConstParserScope() { activeLexicalConstTypeParser = saved; }
+    LexicalConstParserScope(const LexicalConstParserScope&) = delete;
+    LexicalConstParserScope& operator=(const LexicalConstParserScope&) = delete;
+};
+static std::string getDirectDeclName(CFlatParser::DirectDeclaratorContext* d);
+static bool LexicalIsUnder(antlr4::tree::ParseTree* node, antlr4::tree::ParseTree* ancestor)
+{
+    for (; node != nullptr; node = node->parent)
+        if (node == ancestor) return true;
+    return false;
+}
+// A generic type or value parameter of that name shadows any outer constant.
+static bool LexicalGenericParamNamed(CFlatParser::GenericTypeParametersContext* g, const std::string& name)
+{
+    if (g == nullptr || g->typeParameterList() == nullptr) return false;
+    for (auto* e : g->typeParameterList()->typeParameterEntry())
+    {
+        if (auto* v = e->valueParameterDeclaration(); v != nullptr && v->Identifier() != nullptr
+            && v->Identifier()->getText() == name)
+            return true;
+        if (e->typeSpecifier() != nullptr && e->typeSpecifier()->getText() == name) return true;
+    }
+    return false;
+}
+/*
+ * The last declarator of `list` named `name` visible at `use`. A use inside `owner` (the
+ * declaration itself) sees only the declarators before the one holding it; a use in the
+ * specifiers sees none. `self`: the declarator holding the use declares `name` (C++ point of
+ * declaration), so the name is that unfoldable object, never an outer one.
+ */
+static CFlatParser::InitDeclaratorContext* LexicalVisibleDeclarator(antlr4::tree::ParseTree* owner,
+    CFlatParser::InitDeclaratorListContext* list, const std::string& name, antlr4::tree::ParseTree* use,
+    bool* self)
+{
+    if (list == nullptr) return nullptr;
+    const bool inside = LexicalIsUnder(use, owner);
+    if (inside && !LexicalIsUnder(use, list)) return nullptr;
+    CFlatParser::InitDeclaratorContext* match = nullptr;
+    for (auto* init : list->initDeclarator())
+    {
+        const bool named = init->declarator() != nullptr && init->declarator()->directDeclarator() != nullptr
+            && getDirectDeclName(init->declarator()->directDeclarator()) == name;
+        if (inside && LexicalIsUnder(use, init))
+        {
+            if (named) *self = true;
+            break;
+        }
+        if (named) match = init;
+    }
+    return match;
+}
+// A block declaration that introduces a TYPE of that name (a local enum, a struct/union body in
+// the specifiers): the name is no value. Enumerators are scoped (`E.n`) and add no bare name.
+static bool LexicalDeclaresTypeNamed(CFlatParser::DeclarationContext* decl, const std::string& name)
+{
+    if (auto* en = decl->enumSpecifier(); en != nullptr && en->Identifier() != nullptr)
+        return en->Identifier()->getText() == name;
+    std::vector<antlr4::tree::ParseTree*> pending{ decl->declarationSpecifiers() };
+    while (!pending.empty())
+    {
+        auto* tree = pending.back();
+        pending.pop_back();
+        if (tree == nullptr) continue;
+        if (auto* su = dynamic_cast<CFlatParser::StructOrUnionSpecifierContext*>(tree);
+            su != nullptr && su->LeftBrace() != nullptr && su->genericIdentifier() != nullptr
+            && su->genericIdentifier()->Identifier() != nullptr
+            && su->genericIdentifier()->Identifier()->getText() == name)
+            return true;
+        for (auto* child : tree->children) pending.push_back(child);
+    }
+    return false;
+}
+static std::optional<int64_t> FoldLexicalConstLocal(LLVMBackend* compiler, antlr4::tree::ParseTree* use,
+    const std::string& name, const LexicalConstTypeParser& parseType, bool* found = nullptr)
+{
+    if (found != nullptr) *found = false;
+    auto shadow = [&]() -> std::optional<int64_t> {
+        if (found != nullptr) *found = true;
+        return std::nullopt;
+    };
+    auto fold = [&](CFlatParser::DeclarationSpecifiersContext* specs,
+                    CFlatParser::InitDeclaratorContext* match) -> std::optional<int64_t> {
+        if (found != nullptr) *found = true;
+        auto* initializer = match->initializer();
+        if (specs == nullptr || initializer == nullptr || initializer->assignmentExpression() == nullptr)
+            return std::nullopt;
+        auto type = parseType(specs);
+        if (type.Pointer || type.ConstArraySize != 0 || !compiler->IsNativeConstObject(type))
+            return std::nullopt;
+        auto* intTy = llvm::dyn_cast_or_null<llvm::IntegerType>(compiler->GetType(type));
+        LexicalConstParserScope parserScope(&parseType);
+        auto folded = FoldCompileTimeInt(compiler, initializer->assignmentExpression());
+        if (!folded || !ConstLocalFoldFits(intTy, *folded)) return std::nullopt;
+        return folded;
+    };
+    for (antlr4::tree::ParseTree* node = use; node != nullptr && node->parent != nullptr;
+         node = node->parent)
+    {
+        auto* parent = node->parent;
+        if (auto* fn = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent))
+        {
+            if (auto* types = fn->parameterTypeList(); types != nullptr && types->parameterList() != nullptr)
+                for (auto* param : types->parameterList()->parameterDeclaration())
+                    if (param->declarator() != nullptr && param->declarator()->directDeclarator() != nullptr
+                        && getDirectDeclName(param->declarator()->directDeclarator()) == name)
+                        return shadow();
+            if (LexicalGenericParamNamed(fn->genericTypeParameters(), name)) return shadow();
+            continue;
+        }
+        if (auto* sd = dynamic_cast<CFlatParser::StructDefinitionContext*>(parent))
+        {
+            if (LexicalGenericParamNamed(sd->genericTypeParameters(), name)) return shadow();
+            continue;
+        }
+        if (auto* lambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent))
+        {
+            // A capture is the outer binding itself, so only the lambda's own parameters shadow.
+            if (lambda->lambdaParamList() != nullptr)
+                for (auto* param : lambda->lambdaParamList()->lambdaParam())
+                    if (param->Identifier() != nullptr && param->Identifier()->getText() == name)
+                        return shadow();
+            continue;
+        }
+        if (auto* arm = dynamic_cast<CFlatParser::LabeledStatementContext*>(parent))
+        {
+            if (arm->typeSpecifier() != nullptr && arm->Identifier() != nullptr
+                && node == arm->statement() && arm->Identifier()->getText() == name)
+                return shadow();
+            continue;
+        }
+        if (auto* loop = dynamic_cast<CFlatParser::IterationStatementContext*>(parent))
+        {
+            if (loop->In() != nullptr && node == loop->statement() && loop->Identifier() != nullptr
+                && loop->Identifier()->getText() == name)
+                return shadow();
+            if (loop->forCondition() != nullptr)
+                if (auto* forDecl = loop->forCondition()->forDeclaration())
+                {
+                    bool self = false;
+                    auto* match = LexicalVisibleDeclarator(forDecl, forDecl->initDeclaratorList(), name, use, &self);
+                    if (self) return shadow();
+                    if (match != nullptr) return fold(forDecl->declarationSpecifiers(), match);
+                }
+            continue;
+        }
+        auto* list = dynamic_cast<CFlatParser::BlockItemListContext*>(parent);
+        if (list == nullptr) continue;
+        CFlatParser::InitDeclaratorContext* match = nullptr;
+        CFlatParser::DeclarationSpecifiersContext* matchSpecs = nullptr;
+        bool shadowed = false;
+        for (auto* item : list->blockItem())
+        {
+            auto* decl = item->declaration();
+            bool self = false;
+            auto* visible = decl != nullptr
+                ? LexicalVisibleDeclarator(decl, decl->initDeclaratorList(), name, use, &self) : nullptr;
+            if (self) return shadow();
+            if (visible != nullptr)
+            {
+                match = visible;
+                matchSpecs = decl->declarationSpecifiers();
+                shadowed = false;
+            }
+            if (item == node) break;
+            if (decl != nullptr && LexicalDeclaresTypeNamed(decl, name))
+            {
+                match = nullptr;
+                shadowed = true;
+            }
+            if (auto* destructure = item->destructuringDeclaration())
+                for (auto* entry : destructure->destructuringEntry())
+                    if (entry->Identifier() != nullptr && entry->Identifier()->getText() == name)
+                    {
+                        match = nullptr;
+                        shadowed = true;
+                    }
+            if (auto* alias = item->usingDeclaration(); alias != nullptr && alias->Identifier() != nullptr
+                && alias->Identifier()->getText() == name)
+            {
+                match = nullptr;
+                shadowed = true;
+            }
+        }
+        if (shadowed) return shadow();
+        if (match != nullptr) return fold(matchSpecs, match);
+    }
+    return std::nullopt;
+}
+
 // A bare identifier that names a compile-time integer: a -D define or a platform builtin
 // (compileTimeMacros), or a file-scope `const` integer global the scanner seeded. Anything
 // generic, qualified or unknown is not constant.
@@ -1174,7 +1446,16 @@ static std::optional<int64_t> FoldCompileTimeIdentifier(LLVMBackend* compiler,
     if (compiler == nullptr || gid == nullptr) return std::nullopt;
     if (gid->genericTypeParameters() != nullptr || gid->Identifier() == nullptr) return std::nullopt;
     const std::string name = gid->Identifier()->getText();
-    if (compiler->GetScopedLocalOrArgument(name).Storage != nullptr) return std::nullopt;
+    if (auto local = compiler->GetScopedLocalOrArgument(name); local.Storage != nullptr)
+        return local.ConstFoldInt;
+    // Inside a lexical const initializer a name resolves in that declaration's own scope first.
+    if (activeLexicalConstTypeParser != nullptr)
+    {
+        bool lexicalBinding = false;
+        auto lexical = FoldLexicalConstLocal(compiler, gid, name, *activeLexicalConstTypeParser,
+                                             &lexicalBinding);
+        if (lexicalBinding) return lexical;
+    }
     // An implicit-this field shadows a global constant of the same name.
     if (compiler->FindImplicitThisField(name, nullptr, nullptr) != nullptr) return std::nullopt;
     auto macro = compiler->GetCompileTimeMacro(name);
@@ -1625,6 +1906,15 @@ static std::string MangleTypeArg(const LLVMBackend* compiler, const std::string&
 // pre-scans (ForwardRefScanner::ScanGenericTypeUses and MainListener::ScanAndQueueGenericTypeUses)
 // so a body-scope alias binds to the same target in both. With an alias frame open the rename
 // lands in THAT frame, so it never displaces or outlives a file-scope alias of the same name.
+// `using X = const W*;`: whole-word const over every level of the aliased word (ApplyWholeWordConst).
+static uint8_t UsingWholeWordConstMask(LLVMBackend* compiler, const std::string& target, size_t suffixStars)
+{
+    const std::string resolved = compiler->ResolveTypeAlias(target);
+    size_t depth = suffixStars;
+    for (auto it = resolved.rbegin(); it != resolved.rend() && *it == '*'; ++it) ++depth;
+    return static_cast<uint8_t>((1u << (std::min<size_t>(depth, 6) + 1)) - 1u);
+}
+
 static void RegisterPureRenameAlias(LLVMBackend* compiler, CFlatParser::UsingDeclarationContext* ctx)
 {
     if (compiler == nullptr || ctx == nullptr) return;
@@ -1692,6 +1982,202 @@ static CFlatParser::GenericTypeParametersContext* GenericSpecOf(
         return g->genericTypeParameters();
     }
     return nullptr;
+}
+
+using TypeNameArgumentResolver = std::function<std::string(CFlatParser::TypeParameterEntryContext*)>;
+using TypeNameMemberResolver = std::function<std::string(CFlatParser::MemberTypeSpecifierContext*)>;
+using TypeNameTupleResolver = std::function<std::string(CFlatParser::TupleTypeSpecifierContext*)>;
+
+struct CanonicalTypeSpecifier
+{
+    std::string TypeName;
+    std::string GenericBase;
+    std::vector<std::string> GenericArgs;
+    int PointerDepth = 0;
+    uint8_t ConstMask = 0;
+    bool IsGeneric = false;
+};
+
+static bool ResolveCanonicalTypeSpecifier(
+    LLVMBackend* compiler, const std::vector<CFlatParser::TypeSpecifierContext*>& specs,
+    const std::unordered_map<std::string, std::string>* substitutions,
+    const TypeNameArgumentResolver& resolveTypeArg,
+    const TypeNameMemberResolver& resolveMemberType,
+    bool reportGenericAlias, CanonicalTypeSpecifier& out,
+    PrimitiveTypeError* errorOut = nullptr,
+    const TypeNameTupleResolver& resolveTupleType = {})
+{
+    if (compiler == nullptr || specs.empty()) return false;
+    PrimitiveTypeError typeError;
+    if (specs.size() > 1)
+    {
+        std::vector<std::string> words;
+        for (auto* spec : specs) words.push_back(spec->getText());
+        if (!CanonicalizePrimitiveTypeWords(words, out.TypeName, typeError))
+        {
+            if (errorOut != nullptr) *errorOut = typeError;
+            return false;
+        }
+    }
+    else
+    {
+        auto* typeSpec = specs.front();
+        if (typeSpec == nullptr || typeSpec->typeName() != nullptr
+            || typeSpec->functionPointerSpecifier() != nullptr)
+            return false;
+
+        if (auto* tuple = typeSpec->tupleTypeSpecifier())
+        {
+            if (!resolveTupleType) return false;
+            out.TypeName = resolveTupleType(tuple);
+        }
+        else if (auto* generic = GenericSpecOf(typeSpec, out.GenericBase))
+        {
+            out.IsGeneric = true;
+            for (auto* entry : generic->typeParameterList()->typeParameterEntry())
+                out.GenericArgs.push_back(resolveTypeArg
+                    ? resolveTypeArg(entry) : entry->getText());
+            for (auto& arg : out.GenericArgs)
+                if (std::string enumKey = compiler->ResolveEnumTypeName(arg); !enumKey.empty())
+                    arg = std::move(enumKey);
+            compiler->ResolveGenericAliasSpelling(
+                out.GenericBase, out.GenericArgs, reportGenericAlias);
+            out.TypeName = MangleGenericInstance(*compiler, out.GenericBase, out.GenericArgs);
+        }
+        else if (auto* memberType = typeSpec->memberTypeSpecifier())
+            out.TypeName = resolveMemberType ? resolveMemberType(memberType) : memberType->getText();
+        else
+        {
+            if (!CanonicalizePrimitiveTypeWords({ typeSpec->getText() }, out.TypeName, typeError))
+            {
+                if (errorOut != nullptr) *errorOut = typeError;
+                return false;
+            }
+        }
+    }
+
+    if (substitutions != nullptr)
+        if (auto it = substitutions->find(out.TypeName); it != substitutions->end())
+            out.TypeName = it->second;
+    out.TypeName = compiler->ResolveQualifiedName(out.TypeName);
+    out.ConstMask |= compiler->ResolveTypeAliasConstMask(out.TypeName);
+    out.TypeName = compiler->ResolveTypeAlias(out.TypeName);
+    out.PointerDepth = PeelAliasPointerStars(out.TypeName);
+    return true;
+}
+
+struct ConstTypeSyntax
+{
+    std::string TypeName;
+    int PointerDepth = 0;
+    uint8_t ConstMask = 0;
+    bool IsArrayView = false;
+};
+
+static void ApplyConstMaskThroughDepth(uint8_t& mask, int depth)
+{
+    depth = std::clamp(depth, 0, 7);
+    mask = static_cast<uint8_t>((1u << (depth + 1)) - 1u);
+}
+
+static bool ResolveConstTypeSyntax(
+    LLVMBackend* compiler, CFlatParser::TypeNameContext* ctx, ConstTypeSyntax& out,
+    const std::unordered_map<std::string, std::string>* substitutions = nullptr,
+    const TypeNameArgumentResolver& resolveTypeArg = {},
+    const TypeNameMemberResolver& resolveMemberType = {},
+    const TypeNameTupleResolver& resolveTupleType = {})
+{
+    if (compiler == nullptr || ctx == nullptr) return false;
+    auto* spec = ctx->specifierQualifierList();
+    if (spec == nullptr || spec->typeSpecifier().empty()) return false;
+    auto specs = spec->typeSpecifier();
+    auto* typeSpec = specs.front();
+    if (auto* nested = typeSpec->typeName())
+    {
+        if (specs.size() != 1) return false;
+        if (!ResolveConstTypeSyntax(compiler, nested, out, substitutions,
+                resolveTypeArg, resolveMemberType, resolveTupleType)) return false;
+        ApplyConstMaskThroughDepth(out.ConstMask, out.PointerDepth);
+    }
+    else
+    {
+        CanonicalTypeSpecifier resolved;
+        if (!ResolveCanonicalTypeSpecifier(compiler, specs, substitutions, resolveTypeArg,
+                resolveMemberType, false, resolved, nullptr, resolveTupleType))
+            return false;
+        out.TypeName = resolved.TypeName;
+        out.ConstMask = resolved.ConstMask;
+        out.PointerDepth = resolved.PointerDepth;
+    }
+
+    if (auto* abstractDecl = ctx->abstractDeclarator())
+    {
+        if (abstractDecl->pointer() != nullptr)
+            out.PointerDepth += PointerDepthOf(abstractDecl->pointer());
+        if (auto* dims = ArrayDimsOf(abstractDecl); dims != nullptr
+            && dims->assignmentExpression().empty())
+            out.IsArrayView = true;
+    }
+    if (spec->typeQualifier() != nullptr && spec->typeQualifier()->getText() == "const")
+        ApplyConstMaskThroughDepth(out.ConstMask, out.PointerDepth);
+    return true;
+}
+
+static bool ResolveConstTypeSpecifierSyntax(
+    LLVMBackend* compiler, CFlatParser::TypeSpecifierContext* typeSpec, ConstTypeSyntax& out,
+    const std::unordered_map<std::string, std::string>* substitutions = nullptr,
+    const TypeNameArgumentResolver& resolveTypeArg = {},
+    const TypeNameMemberResolver& resolveMemberType = {},
+    const TypeNameTupleResolver& resolveTupleType = {})
+{
+    if (typeSpec == nullptr || typeSpec->typeName() == nullptr) return false;
+    if (!ResolveConstTypeSyntax(compiler, typeSpec->typeName(), out, substitutions,
+            resolveTypeArg, resolveMemberType, resolveTupleType)) return false;
+    ApplyConstMaskThroughDepth(out.ConstMask, out.PointerDepth);
+    return true;
+}
+
+static bool ResolveConstCastTypeSyntax(
+    LLVMBackend* compiler, CFlatParser::CastTypeNameContext* ctx, ConstTypeSyntax& out,
+    const std::unordered_map<std::string, std::string>* substitutions = nullptr,
+    const TypeNameArgumentResolver& resolveTypeArg = {},
+    const TypeNameMemberResolver& resolveMemberType = {},
+    const TypeNameTupleResolver& resolveTupleType = {})
+{
+    if (compiler == nullptr || ctx == nullptr || ctx->typeSpecifier().empty()) return false;
+    auto specs = ctx->typeSpecifier();
+    if (specs.size() == 1 && specs.front()->typeName() != nullptr)
+    {
+        if (!ResolveConstTypeSpecifierSyntax(compiler, specs.front(), out, substitutions,
+                resolveTypeArg, resolveMemberType, resolveTupleType)) return false;
+    }
+    else
+    {
+        CanonicalTypeSpecifier resolved;
+        if (!ResolveCanonicalTypeSpecifier(compiler, specs, substitutions, resolveTypeArg,
+                resolveMemberType, false, resolved, nullptr, resolveTupleType))
+            return false;
+        out.ConstMask = resolved.ConstMask;
+        out.PointerDepth = resolved.PointerDepth;
+        out.TypeName = resolved.TypeName;
+    }
+    if (ctx->abstractDeclarator() != nullptr)
+    {
+        out.PointerDepth += PointerDepthOf(ctx->abstractDeclarator()->pointer());
+        if (auto* dims = ArrayDimsOf(ctx->abstractDeclarator()); dims != nullptr
+            && dims->assignmentExpression().empty())
+            out.IsArrayView = true;
+    }
+    if (ctx->typeQualifier() != nullptr && ctx->typeQualifier()->getText() == "const")
+        ApplyConstMaskThroughDepth(out.ConstMask, out.PointerDepth);
+    return true;
+}
+
+static std::string ResolveCastTypeNameForScanner(
+    LLVMBackend* compiler, CFlatParser::CastTypeNameContext* castTypeName)
+{
+    ConstTypeSyntax shape;
+    return ResolveConstCastTypeSyntax(compiler, castTypeName, shape) ? shape.TypeName : std::string();
 }
 
 static std::unordered_set<std::string> CollectFunctionLocalEnumNames(
@@ -2535,9 +3021,9 @@ inline std::string BareSourceText(antlr4::tree::ParseTree* node,
         if (outWrapperTypes != nullptr)
         {
             if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
-                if (cast->typeName() != nullptr && cast->castExpression() != nullptr)
+                if (cast->castTypeName() != nullptr && cast->castExpression() != nullptr)
                 {
-                    outWrapperTypes->push_back(cast->typeName()->getText());
+                    outWrapperTypes->push_back(cast->castTypeName()->getText());
                     node = cast->castExpression();
                     continue;
                 }
@@ -3759,6 +4245,7 @@ private:
     bool IsLocalDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs) const;
 
     LLVMBackend* Compiler(antlr4::ParserRuleContext* ctx);
+    std::string ResolveTupleTypeSpecifier(CFlatParser::TupleTypeSpecifierContext* tupleSpec);
 
     // The scanner cannot evaluate an `if const` condition (no active type substitutions, no
     // expression codegen), so it skips those members rather than register a not-taken signature.
@@ -4939,6 +5426,8 @@ private:
     // Encode a closure type (Lambda<...>/function<...>) that appears as a generic argument or in a
     // nested signature position into a symbol-safe name (BuildEncodedClosureName), resolving its
     // signature component types, and register the call descriptor. Returns the encoded name.
+    void ValidateConstAfterPointerStar(CFlatParser::PointerContext* pointer,
+                                       const std::string& spelledBaseType);
     std::string EncodeClosureCodegen(CFlatParser::FunctionPointerSpecifierContext* fpSpec);
     std::string EncodePlainFunctionTypeCodegen(CFlatParser::FunctionTypeArgumentContext* fnSpec);
 
@@ -6673,6 +7162,10 @@ public:
                                      const std::string& action,
                                      const std::string& destination);
 
+    // #5: an implicit pointer conversion of `value` to `target` that discards const.
+    bool RejectConstDiscardingConversion(antlr4::ParserRuleContext* ctx,
+        const LLVMBackend::NamedVariable& source, llvm::Value* value,
+        const LLVMBackend::TypeAndValue& target);
     bool RejectImplicitPointerToNumber(antlr4::ParserRuleContext* ctx,
                                        const LLVMBackend::TypeAndValue& target,
                                        const LLVMBackend::NamedVariable& rhsNV,
@@ -6856,7 +7349,7 @@ public:
     };
     std::unordered_map<const antlr4::ParserRuleContext*, std::unique_ptr<ValueCastReparse>> valueCastReparses_;
     CFlatParser::CastExpressionContext* FindValueCastHazard(antlr4::tree::ParseTree* node);
-    bool CastTypeNameNamesValue(CFlatParser::TypeNameContext* typeName);
+    bool CastTypeNameNamesValue(CFlatParser::CastTypeNameContext* typeName);
     CFlatParser::AndExpressionContext* ReparseValueCast(CFlatParser::AndExpressionContext* ctx,
                                                         CFlatParser::CastExpressionContext* hazard);
 
@@ -7262,6 +7755,8 @@ public:
 
     LLVMBackend::NamedVariable ParseCastExpression(CFlatParser::CastExpressionContext* ctx, bool lvalue = false,
                                                    ResultUse use = ResultUse::Value);
+    LLVMBackend::NamedVariable ParseCastExpressionImpl(CFlatParser::CastExpressionContext* ctx, bool lvalue,
+                                                       ResultUse use);
 
     /*
      * Give a cast operand that carries no llvm::Value a value or a diagnostic, so CreateCast is
@@ -7275,6 +7770,13 @@ public:
 
     LLVMBackend::TypeAndValue ParseTypeName(CFlatParser::TypeNameContext* ctx,
         bool allowSizedArray = false, antlr4::ParserRuleContext* useSite = nullptr);
+    LLVMBackend::TypeAndValue ParseCastTypeName(CFlatParser::CastTypeNameContext* ctx,
+        bool allowSizedArray = false, antlr4::ParserRuleContext* useSite = nullptr);
+    LLVMBackend::TypeAndValue ParseTypeNameParts(
+        const std::vector<CFlatParser::TypeSpecifierContext*>& typeSpecs,
+        CFlatParser::TypeQualifierContext* typeQualifier,
+        CFlatParser::AbstractDeclaratorContext* abstractDecl, bool allowSizedArray,
+        antlr4::ParserRuleContext* typeContext, antlr4::ParserRuleContext* useSite);
 
     LLVMBackend::NamedVariable ParseUnaryExpression(CFlatParser::UnaryExpressionContext* ctx,
                                                     ResultUse use = ResultUse::Value);
@@ -8106,6 +8608,7 @@ public:
         llvm::Value* OuterStorage;
         bool IsThis = false;    // the implicit method self pointer; capture by value, re-register as 'this'
         bool SourceIsStaticLocal = false;
+        std::optional<int64_t> ConstFoldInt;  // a folded const local stays foldable through the capture
     };
 
     // Walk the lambda body AST and collect variables captured from the enclosing function scope.
@@ -8350,6 +8853,12 @@ public:
     // C++ const array reference (any write operator), refused on its own.
     void RefuseCxxConstReferentWrite(antlr4::ParserRuleContext* ctx, llvm::Value* destination,
                                      const std::string& operation, bool constElement = false);
+    // Refuses a write (assign / compound / ++ / -- / explicit move) whose destination lands by
+    // value in a native const object; the one predicate every write path calls. True if refused.
+    // A native const global with a constant initializer and no startup construction -> rodata.
+    void MarkConstGlobalReadOnly(llvm::GlobalVariable* global, const LLVMBackend::TypeAndValue& tv);
+    bool RefuseConstObjectWrite(antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& target,
+                                llvm::Value* destination, const std::string& operation);
     // Refuses `obj.f()` when obj is read-only C++ storage (const namespace object, const
     // reference result) and every overload of f is non-const. True when it refused.
     bool RefuseCxxConstReceiverCall(antlr4::ParserRuleContext* ctx,

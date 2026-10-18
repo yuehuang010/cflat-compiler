@@ -1,0 +1,9 @@
+void f() {}
+
+extern int main()
+{
+    expect_error("returns 'void', so it produces no value to consume") {
+        void* pointer = (void*)f();
+    }
+    return 0;
+}

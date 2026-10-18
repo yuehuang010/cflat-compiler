@@ -1,0 +1,84 @@
+// Const phase 2: const is transitive (plan cflat-const.md R11). Through a const struct object the
+// pointees of its pointer fields are read-only too (section 4 #4), and a field path off a pointer
+// whose pointee level is const (`const S* ps`, `(const S)* ps`) is read-only (#3). A bare `*p` /
+// `p[i]` on a `const int*` and a pointer copied out into a mutable variable are phase 3.
+struct C02Pt { int x = 0; };
+struct C02Inner { int* p = nullptr; };
+struct C02Box
+{
+    int n = 0;
+    int* p = nullptr;
+    C02Pt* q = nullptr;
+    C02Inner inner = default;
+    int[] v;
+};
+C02Pt c02Pt = default;
+const C02Box C02GB = default;
+
+extern int main()
+{
+    int t = 1;
+    const C02Box box = { n = 5, p = &t, q = &c02Pt };
+    expect_error("cannot assign to '*box.p': 'box' is const") { *box.p = 2; }
+    expect_error("cannot assign to 'box.p[0]': 'box' is const") { box.p[0] = 2; }
+    expect_error("cannot assign to 'box.q->x': 'box' is const") { box.q->x = 2; }
+    expect_error("cannot assign to 'box.q.x': 'box' is const") { box.q.x = 2; }
+    expect_error("cannot assign to 'box.inner.p[2]': 'box' is const") { box.inner.p[2] = 1; }
+    expect_error("cannot increment '(*box.p)': 'box' is const") { (*box.p)++; }
+    expect_error("cannot modify '*box.p': 'box' is const") { *box.p += 3; }
+    expect_error("cannot assign to 'box.v[0]': 'box' is const") { box.v[0] = 1; }
+    expect_error("cannot assign to '*C02GB.p': 'C02GB' is const") { *C02GB.p = 1; }
+
+    C02Box mutableBox = default;
+    const C02Box* cps = &mutableBox;
+    expect_error("cannot assign to 'cps->n': it is reached through a pointer to const ('cps')") { cps->n = 1; }
+    return 0;
+}
+
+expect_error("cannot assign to '*box.p': 'box' is const") {
+    int c02Capture() { int t = 1; const C02Box box = { p = &t }; Lambda<int()> f = () => { *box.p = 7; return 0; }; return f(); }
+}
+expect_error("cannot assign to '*b.p': 'b' is const") {
+    int c02Param(const C02Box b) { *b.p = 1; return 0; }
+}
+expect_error("cannot assign to 'ps->n': it is reached through a pointer to const ('ps')") {
+    int c02Arrow(const C02Box* ps) { ps->n = 1; return 0; }
+}
+expect_error("cannot assign to '*ps->p': it is reached through a pointer to const ('ps')") {
+    int c02ArrowDeref(const C02Box* ps) { *ps->p = 1; return 0; }
+}
+expect_error("cannot assign to 'ps.n': it is reached through a pointer to const ('ps')") {
+    int c02Dot(const C02Box* ps) { ps.n = 1; return 0; }
+}
+expect_error("cannot assign to 'ps[0].n': it is reached through a pointer to const ('ps')") {
+    int c02Index(const C02Box* ps) { ps[0].n = 1; return 0; }
+}
+expect_error("cannot assign to 'ps->n': it is reached through a pointer to const ('ps')") {
+    int c02View((const C02Box)* ps) { ps->n = 1; return 0; }
+}
+expect_error("cannot assign to 'ps->p[0]': it is reached through a pointer to const ('ps')") {
+    int c02ViewIndex((const C02Box)* ps) { ps->p[0] = 1; return 0; }
+}
+expect_error("cannot assign to 'ps->q->x': it is reached through a pointer to const ('ps')") {
+    int c02ViewChain(const C02Box* ps) { ps->q->x = 1; return 0; }
+}
+// The pointee qualification of a call result, a ternary arm or a union arm comes from its type.
+C02Box c02Global = default;
+const C02Box* c02Get() { return &c02Global; }
+expect_error("cannot assign to 'c02Get()->n': it is reached through a pointer to const ('c02Get()')") {
+    int c02Call() { c02Get()->n = 1; return 0; }
+}
+expect_error("it is reached through a pointer to const ('q')") {
+    int c02Ternary(int c, C02Box* m, const C02Box* q) { (c == 1 ? m : q)->n = 1; return 0; }
+}
+expect_error("it is reached through a pointer to const ('p')") {
+    int c02TernaryFirst(int c, (const C02Box)* p, C02Box* m) { (c == 1 ? p : m)->n = 1; return 0; }
+}
+union C02U { (const C02Box)* p; int n; };
+expect_error("cannot assign to 'u.p->n': it is reached through a pointer to const ('u.p')") {
+    int c02Union(C02U u) { u.p->n = 1; return 0; }
+}
+// The outermost cast decides: re-adding const after an inner cast dropped it is read-only again.
+expect_error("it is reached through a pointer to const ('((constC02Box*)((C02Box*)ps))')") {
+    int c02Requalify(const C02Box* ps) { ((const C02Box*)((C02Box*)ps))->n = 1; return 0; }
+}

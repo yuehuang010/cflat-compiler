@@ -562,6 +562,27 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         lastCxxRetValue_ = nullptr;
         lastLoweredRetTemp_ = nullptr;
         lastLoweredRetValue_ = nullptr;
+        // #6 through a function value. Its parameter types spell no pointee const, except the
+        // C-origin flag (then every level is read-only).
+        for (size_t i = 0; i < args.size() && i < funcPtrType.FuncPtrParams.size(); ++i)
+        {
+            const auto& param = funcPtrType.FuncPtrParams[i];
+            if (!param.Pointer || param.IsRvalueRef || IsCxxRecord(param.TypeName)) continue;
+            TypeAndValue target;
+            target.TypeName = param.TypeName;
+            target.Pointer = true;
+            target.PointerDepth = param.PointerDepth > 0 ? param.PointerDepth : 1;
+            target.ElemPointer = target.PointerDepth >= 2;
+            if (param.IsPointeeConst)
+                target.ConstMask = static_cast<uint8_t>((1u << target.ValuePointerDepth()) - 1u);
+            const TypeAndValue source = argNVs != nullptr && i < argNVs->size()
+                ? (*argNVs)[i].TypeAndValue : TypeAndValue{};
+            std::string from, to;
+            if (ConversionDiscardsConst(args[i], source, target, from, to))
+                LogError(std::format(
+                    "cannot pass argument {} ('{}') to parameter '{}' ('{}'): the conversion "
+                    "discards const", i + 1, from, i + 1, to));
+        }
         auto prepareCxxSret = [&](const TypeAndValue& retTV)
             -> std::pair<llvm::Type*, llvm::Value*> {
             if (retTV.Pointer || retTV.IsAlias

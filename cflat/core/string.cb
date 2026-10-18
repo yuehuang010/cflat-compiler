@@ -229,14 +229,14 @@ move string toString(i64 self, i32 base)
 // Owned string copy of a NUL-terminated C string; the source buffer is not
 // consumed or freed - the bytes are copied and the caller owns the result. Reach
 // it with method-call syntax on a char* / char[N] receiver: `pe.szExeFile.toString()`.
-// (`char*` and `const char*` are the same type to the compiler - TypeName "char";
-// the const is a documentation-only qualifier, matching operator string below.)
+// The parameter is `const char*`: the bytes are only read, so a read-only buffer (a const
+// array, a `(const char)*`) may be passed; a `char*` converts to it implicitly.
 move string toString(const char* self)
 {
-    string borrowed = default;
-    borrowed._ptr = self;
-    borrowed._len = strlen(self);
-    return borrowed.copy();
+    i32 len = strlen(self);
+    char* buf = new char[len + 1];
+    memcpy(buf, self, (i64)(len + 1));
+    return _strOwned(move buf, len);
 }
 
 // -- operator string conversions ----------------------------------------------
@@ -254,12 +254,13 @@ string operator string(IString s)
 
 // Wrap a raw C string pointer into a non-owning string value. The result borrows `s`
 // (no allocation; owned bit clear); it must not outlive the buffer. Call `.copy()` to take
-// ownership. `const char*` matches the operator+ family - char* and const char* are the
-// same type to the compiler (TypeName "char"); the const is a documentation-only qualifier.
+// ownership. `const char*` accepts a read-only buffer, but the result borrows it through the
+// mutable `char* _ptr`, and `data()` hands that out as `char*`: the cast below is a known const
+// hole until the string pointee is made const.
 string operator string(const char* s)
 {
     string result = default;
-    result._ptr = s;
+    result._ptr = (char*)s;
     result._len = strlen(s);
     return result;
 }

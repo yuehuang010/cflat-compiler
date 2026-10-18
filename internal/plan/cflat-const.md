@@ -1,9 +1,26 @@
 # Enforced `const` for CFlat
 
-Status: PLAN, AWAITING RULINGS R1-R10 (section 6; maintainer deferred them 2026-10-16 - do not
-start any phase before they are ruled). Written 2026-10-16 against master 6dcf38aee. Supersedes, once ruled, the
+Status: RULED 2026-10-17 for iteration 1 (native CFlat only; C++ interop = phase 5, later). R1 B,
+R2 A, R3 B for now (inferred; trailing `func() const` later), R4 A, R5 A, R6 A, R7 A, R8 A, R9 fix in
+place, R10 superseded, R11 whole-word spelling; interface method calls on a const receiver are
+allowed until trailing const lands. Review-draft legs (gitignored):
+scratch/const_iter1/const_section.cb (append to Test/test_basic.cb, call testConstWholeWord from main).
+PHASE 0 LANDED 2026-10-17 (0066755bf): spellings, ConstMask carry/cache/--symbol-dump, east const and
+'* const' refused everywhere; known limit: `const(function<...>)` wrapper does not resolve yet.
+PHASE 1 LANDED 2026-10-17 (1d37f660d): const objects read-only (#1 #4 #11 #12), &G, rodata scalar/array globals,
+lexical const-local folding (dims, value generic args, captures). Struct globals stay mutable `global` until phase 4.
+PHASE 2 LANDED 2026-10-18 (904ee4fdd): const fields (#2), whole-assign refusal (#13), transitive const through a const
+struct's pointer fields (#4), field access through a pointer to const (#3, incl. call/ternary/union bases), explicit cast
+drops pointee const at member access, is_assignable(T) + guarded core containers (R5a). Left for phase 3: bare `*p`/`p[i]`,
+pointers copied out of const objects, `*((int*)box.p) = 2`. hpc/btree.cb and com.cb HResult<T> still assign live slots.
+PHASE 3 LANDED 2026-10-18 (0e443afcf): writes through a pointer to const at any level (#3); qualification conversions
+(#5 #6 #7 #16, C++ multi-level, void*, views, pointer aliases, compound pointer assign); C params compare their exact
+spelled levels; casts add or drop const; `using X = const W` parses. Deferred: overloads differing only in pointee const
+(R1 B: duplicate), function<> const params (p3 function-type-cannot-carry-pointee-const), string `_ptr` borrow cast
+(p3 string-ptr-drops-const-from-borrowed-literal, phase 6), C auto-extern return const (phase 5).
+Written 2026-10-16 against master 6dcf38aee. Supersedes, once ruled, the
 2026-08-26 "const stays unenforced" ruling and the "(CFlat exposes no const)" clause of the
-2026-09-27 C++-const ruling. Nothing implemented. Probes: `scratch/const_spike/p01-p19.cb`
+2026-09-27 C++-const ruling. Probes: `scratch/const_spike/p01-p19.cb`
 (gitignored; re-create from the repros below if gone).
 
 North star check: CFlat is borrow-by-default with compiler-inferred copy/move. `const` is the one
@@ -307,7 +324,9 @@ Brief constraints (every phase): both-pass ParseDeclarationSpecifiers, LogError-
 no new non-err test files, existing tests read-only except the named legs, serializer rule, never
 edit `cflat/locales/`, shell-safety line, token-efficiency directive.
 
-## 6. Rulings needed
+## 6. Rulings
+
+RULED 2026-10-17 (maintainer): every recommendation below adopted; R3 = B for iteration 1.
 
 R1. **Overload on pointee const** (`f(int*)` and `f(const int*)` both declared).
   A: allowed, ranked like C++ (needs mangling markers). B: refused as a duplicate; const only
@@ -335,6 +354,11 @@ R4. **Explicit `move` of a const.** A: refused (#12), implicit last-use consume 
 R5. **Whole-assignment of a struct with a const field.** A: refused (C++). B: allowed as a
   re-init. Recommend **A**.
 
+R5a. **Containers of a const-field T** (RULED 2026-10-17). A compile-time intrinsic `is_assignable(T)` (false when T
+  has a const field anywhere: embedded structs, fixed-array fields, union arms) guards the assigning methods of core
+  containers (`list.sort` etc.) with `if const`; relocation into fresh storage is construction, not assignment. So
+  `list<S>` with a const-field S works and only calling an assigning method fails (C++ `std::sort` behaviour).
+
 R6. **`const` as a generic argument** (`list<const int>`). A: refused, pointee const only.
   B: allowed, const propagates into members. Recommend **A** (containers need mutable slots;
   C++ forbids it for the same reason).
@@ -353,3 +377,80 @@ R9. **Scope of phase 3 migration.** Fix core prototypes to be const-correct (a `
 R10. **Ruling text supersession.** Confirm the 2026-08-26 ruling and the "(CFlat exposes no
   const)" clause of 2026-09-27 are superseded on ruling this plan, and record it in the
   fix-issue-lessons digest.
+
+R11. **Spelling: whole-word `const`** (proposed 2026-10-17, maintainer-preferred direction; grammar
+  spiked, see below). Fixes the "is `const int*` the pointer or the int" confusion: a CFlat type
+  is one word (`int*`, `list<int>`, `T`), and `const` applies to the whole word, transitively
+  (D-style): everything reached through it is read-only.
+  - `const int x` - value read-only (unchanged).
+  - `const int* p` = `const (int*)`: `p` cannot be reseated AND `*p` / `p[i]` / `p.f` are read-only.
+    ConstMask: every level at and below the declared object (0b11).
+  - `(const int)* p` and `const(int)* p` (both accepted, same meaning): const on the inner word
+    only - `p` reseatable, `*p` read-only (0b01). Nests: `(const int*)* pp` = pp reseatable,
+    `*pp` fixed, `**pp` read-only; `const(int)** pp` = pp and `*pp` reseatable, `**pp`
+    read-only; `const(const(int)*)*` is the same type as `(const int*)*`. Spelled masks are always
+    downward closed (bit k set => every inner bit set): it is a "const depth". Display: all
+    levels -> `const W`, none -> `W`, else `(const Inner)` + the remaining `*`s.
+  - `const S s` with a pointer field: `*s.p = 5` refused too (transitive). C++ is shallow here
+    (`s.p` becomes `int* const`, `*s.p` writable) and gets deep const only from const-overloaded
+    accessors; CFlat containers get it for free.
+  - Generics: `const T` with `T = int*` is exactly the written-out `const int*` - the C++
+    `const T` -> `int* const` gotcha of section 2 item 7 disappears.
+  - `using` captures the const word whole: `using CStr = (const char)*;` is a reseatable view,
+    `using Fixed = const int*;` is fully const; `const Alias` applies const to the whole aliased
+    word (`const IntPtr` with `IntPtr = int*` is `const int*`), the generic rule.
+  - Parameters follow the variable rules exactly (2026-10-17 direction: a parameter declaration
+    reads like a variable declaration). `const int* p` param = p fixed in the body and `*p`
+    read-only; `(const int)* p` = reseatable view; `const int v` / `const S b` by value = the
+    callee may not write the copy (transitively for S). Top-level const stays out of the
+    function type, so callers pass a `const int*` and a `(const int)*` alike, and an extern
+    prototype's `const char* s` needs no change.
+  - Iteration 1 scope (2026-10-17): variables, parameters, fields, string literals, `using`, and
+    METHOD CALLS on a const receiver - read-only-ness inferred from the body (R3 B for now; a
+    write through a pointer field counts, transitive const). The explicit trailing
+    `func() const` spelling (R3 C's assert form, required on interface / extern / C++-bound
+    declarations) moves to a later iteration; until then interface methods called on a const
+    receiver need a ruling of their own.
+  - Refused spellings: east const `int const*` and trailing `int* const` (0 real sites in
+    core / Test / example; comments only). A C++ type with a const pointer level and no CFlat
+    spelling (`int* const` field, `char* const&` param) stays enforced through ConstMask and is
+    displayed in C++ spelling.
+  - Supersedes: section 2 item 3 (`const T*` = pointee-only, `T* const`), the section 3 example
+    masks (`const int*` becomes 0b11, `(const int)*` is the old 0b01), the item 7 generic gotcha.
+  - Migration: existing `const T*` declarations whose pointer is reseated (`s++`, `p = next`)
+    become `(const T)*`. Regex upper bound 46 of 465 `const T*` decls (top:
+    `example/ui/03-canvas-win32/win32_shot.cb` 8, `Test/test_cpp_interop.cb` 5,
+    `Test/test_basic.cb` 4, `example/hpc/heat_stencil.cb` 4, `cflat/core/os.posix.cb` 2); the
+    exact list comes from a build with the rule on. Signatures are unaffected: top-level const is
+    not part of a function type, so a `const char* s` param still matches clang's `const char*`.
+  - C++ interop open sub-question: a C++ const method may write through a member pointer (shallow).
+    Binding one on a const C++ object must follow clang's rule, so CFlat records are transitive
+    and C++ records shallow - a bridge-transparency (2026-09-17) exception to rule on. `mutable`
+    has no CFlat spelling yet; needed if a `lock()` mutex field must work in a read-only method.
+  - Grammar (spiked in `scratch/const_whole/`, ANTLR 4.13.2 Java target, LL exact-ambiguity
+    detection, no predicates):
+    ```
+    typeSpecifier
+        : ...
+        | 'const' '(' typeName ')'      // const(T)
+        | '(' 'const' typeName ')'      // (const T)
+        ;
+    castExpression
+        : '(' castTypeName ')' castExpression
+        | ...
+    castTypeName                        // top-level const needs a declarator
+        : typeSpecifier* abstractDeclarator?
+        | typeQualifier typeSpecifier* abstractDeclarator
+        ;
+    ```
+    Without the cast narrowing, `(const int)* p;` as a statement is a real blockItem ambiguity
+    (declaration vs. cast of `*p`); with it the ambiguity is gone. Cost: `(const int)x` /
+    `(const int)*p` stop being casts (a cast yields a value, so the const was meaningless; 0
+    real sites); the listener should still diagnose them - today it is a raw ANTLR error.
+    `(const char*)x` (96 sites) is untouched. `const (int, float) t` (const tuple) and
+    `if const (...)` still parse. Pre-existing exact ambiguities (parameterDeclaration
+    declarator vs abstractDeclarator, `= default` initializer) are unchanged by the edit.
+    The listener reads casts through `castTypeName` instead of `typeName` (both
+    `ParseDeclarationSpecifiers` copies + cast / abstract-declarator helpers).
+    Corpus check: all 1059 `.cb` under core / Test / example parse to the IDENTICAL tree (modulo
+    the `castTypeName` wrapper) with identical syntax-error and exact-ambiguity counts.

@@ -320,6 +320,9 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     {
     if const (!is_cpp_class(T) || is_copyable(T))
     {
+    // Sorting swaps live elements by assignment; a const-field T cannot be reassigned.
+    if const (is_assignable(T))
+    {
         // Lomuto partition: pivot at _data[hi], returns final pivot index.
         int _partition(int lo, int hi, Lambda<bool(T, T)> compare)
         {
@@ -372,6 +375,14 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
             if (_size > 1)
                 _qsort(0, _size - 1, compare);
         }
+    }
+    else
+    {
+        void sort(Lambda<bool(T, T)> compare)
+        {
+            compile_error("list<T>.sort(): the element type has a const field and cannot be reassigned, so it cannot be sorted in place");
+        }
+    }
     }
     }
 

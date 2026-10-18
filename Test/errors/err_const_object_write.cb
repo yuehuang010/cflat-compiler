@@ -1,0 +1,96 @@
+// Const phase 1: the declared object of a const local, global, namespace global or by-value
+// parameter is read-only (plan cflat-const.md section 4 #1 and #4). Writes THROUGH a pointer are
+// a later phase and are not refused here.
+using C01IntPtr = int*;
+
+struct C01In { int n = 0; };
+struct C01S { int n = 0; int[3] arr = default; C01In inner = default; };
+
+const int C01G = 5;
+const int[3] C01GA = { 1, 2, 3 };
+const C01S C01GS = default;
+namespace c01ns { const int NG = 7; }
+
+expect_error("cannot assign to 'v': it is declared const")
+{
+    int c01BadParamValue(const int v) { v = 1; return v; }
+}
+expect_error("cannot modify 'v': it is declared const")
+{
+    int c01BadParamCompound(const int v = 3) { v += 1; return v; }
+}
+expect_error("cannot assign to 'b.n': 'b' is const")
+{
+    int c01BadParamField(const C01S b) { b.n = 1; return 0; }
+}
+expect_error("cannot assign to 'b': it is declared const")
+{
+    int c01BadParamWhole(const C01S b) { b = default; return 0; }
+}
+expect_error("cannot increment 'p': it is declared const")
+{
+    int c01BadParamReseat(const int* p) { p++; return 0; }
+}
+
+extern int main()
+{
+    const int L = 3;
+    expect_error("cannot assign to 'L': it is declared const") { L = 4; }
+    expect_error("cannot modify 'L': it is declared const") { L += 4; }
+    expect_error("cannot modify 'L': it is declared const") { L <<= 1; }
+    expect_error("cannot increment 'L': it is declared const") { L++; }
+    expect_error("cannot decrement 'L': it is declared const") { L--; }
+
+    const C01S s = default;
+    expect_error("cannot assign to 's.n': 's' is const") { s.n = 1; }
+    expect_error("cannot assign to 's.inner.n': 's' is const") { s.inner.n = 1; }
+    expect_error("cannot assign to 's.arr[1]': 's' is const") { s.arr[1] = 1; }
+    expect_error("cannot increment 's.n': 's' is const") { s.n++; }
+    expect_error("cannot assign to 's': it is declared const") { s = default; }
+
+    const int[3] t = { 1, 2, 3 };
+    expect_error("cannot assign to 't[0]': 't' is const") { t[0] = 1; }
+    expect_error("cannot modify 't[2]': 't' is const") { t[2] *= 2; }
+
+    expect_error("cannot assign to 'C01G': it is declared const") { C01G = 1; }
+    expect_error("cannot increment 'C01G': it is declared const") { C01G++; }
+    expect_error("cannot assign to 'C01GA[0]': 'C01GA' is const") { C01GA[0] = 1; }
+    expect_error("cannot assign to 'C01GS.n': 'C01GS' is const") { C01GS.n = 1; }
+    expect_error("cannot assign to 'c01ns.NG': it is declared const") { c01ns.NG = 1; }
+
+    int x = 1;
+    const int* p = &x;
+    expect_error("cannot assign to 'p': it is declared const") { p = &x; }
+    expect_error("cannot increment 'p': it is declared const") { p++; }
+    const C01IntPtr ap = &x;
+    expect_error("cannot assign to 'ap': it is declared const") { ap = &x; }
+    expect_error("cannot decrement 'ap': it is declared const") { ap--; }
+    int[3] items = { 1, 2, 3 };
+    expect_error("cannot assign to 'item': it is declared const") { for (const int item in items) { item = 0; } }
+    return 0;
+}
+
+// Lambda captures keep the captured object's const: by-reference (struct) and env-slot (array, scalar).
+expect_error("cannot assign to 's.n': 's' is const") {
+    int c01CapField() { const C01S s = default; Lambda<int()> f = () => { s.n = 4; return s.n; }; return f(); }
+}
+expect_error("cannot assign to 's.inner.n': 's' is const") {
+    int c01CapNested() { const C01S s = default; Lambda<int()> f = () => { s.inner.n = 4; return 0; }; return f(); }
+}
+expect_error("cannot assign to 's': it is declared const") {
+    int c01CapWhole() { const C01S s = default; Lambda<int()> f = () => { s = default; return 0; }; return f(); }
+}
+expect_error("cannot assign to 't[1]': 't' is const") {
+    int c01CapArray() { const int[2] t = { 1, 2 }; Lambda<int()> f = () => { t[1] = 4; return t[1]; }; return f(); }
+}
+expect_error("cannot increment 'cn': it is declared const") {
+    int c01CapScalar() { const int cn = 2; Lambda<int()> f = () => { cn++; return cn; }; return f(); }
+}
+
+// A block-scope enum names a TYPE: it shadows a same-named global const, so a
+// const local built from it is no compile-time value (clang: "'n' does not refer to a value").
+struct C01EBuf<T, int N> { T[N] data = default; int cap() { return N; } };
+const int c01TypeN = 9;
+expect_error("generic argument for value parameter 'N' in template 'C01EBuf' has the wrong kind") {
+    int c01EnumShadow() { enum c01TypeN : int { A = 3 }; const int k = c01TypeN + 1; C01EBuf<int, k> b = default; return b.cap(); }
+}

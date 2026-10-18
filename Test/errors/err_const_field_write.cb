@@ -1,0 +1,100 @@
+// Const phase 2: a const FIELD is set only during construction - its field default, a brace-init
+// element, and the constructor of the struct that owns it (plan cflat-const.md section 4 #2).
+// Every other write is refused: methods, an embedding struct's constructor, another object of
+// the same type inside the constructor, and every path that reaches the field (pointer, alias,
+// view, array element, global, capture, generic instantiation).
+struct C02Stamp
+{
+    const int id = 0;
+    int hits = 0;
+    const string name = "a";
+    const int[2] ids = { 1, 2 };
+    C02Stamp(int i) { id = i; this.hits = 1; }
+};
+struct C02Wrap { C02Stamp s = C02Stamp(4); int k = 0; };
+struct C02Box<T> { const T v = default; int n = 0; };
+C02Stamp C02G = default;
+namespace c02ns { C02Stamp NG = default; }
+
+extern int main()
+{
+    C02Stamp s = C02Stamp(1);
+    expect_error("cannot assign to 's.id': field 'id' is const and can only be set during construction") { s.id = 1; }
+    expect_error("cannot modify 's.id': field 'id' is const") { s.id += 1; }
+    expect_error("cannot increment 's.id': field 'id' is const") { s.id++; }
+    expect_error("cannot decrement 's.id': field 'id' is const") { s.id--; }
+    expect_error("cannot assign to 's.ids[0]': field 'ids' is const") { s.ids[0] = 5; }
+    expect_error("cannot move out of 's.name': field 'name' is const") { string t = move s.name; }
+    expect_error("cannot move out of 's.name': field 'name' is const") { _ = move s.name; }
+
+    C02Stamp[2] arr;
+    expect_error("cannot assign to 'arr[0].id': field 'id' is const") { arr[0].id = 1; }
+    expect_error("cannot assign to 'e.id': field 'id' is const") { for (C02Stamp e in arr) { e.id = 1; } }
+
+    C02Wrap w = default;
+    expect_error("cannot assign to 'w.s.id': field 'id' is const") { w.s.id = 2; }
+    expect_error("cannot assign to 'C02G.id': field 'id' is const") { C02G.id = 3; }
+    expect_error("cannot assign to 'c02ns.NG.id': field 'id' is const") { c02ns.NG.id = 3; }
+
+    C02Box<int> b = default;
+    expect_error("cannot assign to 'b.v': field 'v' is const") { b.v = 1; }
+
+    C02Stamp* ps = &s;
+    expect_error("cannot assign to 'ps->id': field 'id' is const") { ps->id = 1; }
+    expect_error("cannot assign to 'ps.id': field 'id' is const") { ps.id = 1; }
+    expect_error("cannot assign to 'ps[0].id': field 'id' is const") { ps[0].id = 1; }
+    expect_error("cannot assign to '(*ps).id': field 'id' is const") { (*ps).id = 1; }
+    return 0;
+}
+
+expect_error("cannot assign to 's.id': field 'id' is const") {
+    int c02Capture() { C02Stamp s = C02Stamp(1); Lambda<int()> f = () => { s.id = 9; return 0; }; return f(); }
+}
+expect_error("cannot assign to 'id': field 'id' is const and can only be set during construction") {
+    struct C02M1 { const int id = 0; void Bad() { id = 2; } };
+}
+expect_error("cannot assign to 'this.id': field 'id' is const") {
+    struct C02M2 { const int id = 0; void Bad() { this.id = 2; } };
+}
+expect_error("cannot assign to 'o->id': field 'id' is const") {
+    struct C02M3 { const int id = 0; void Bad(C02M3* o) { o->id = 2; } };
+}
+// Inside the constructor only the object under construction is writable.
+expect_error("cannot assign to 'o.id': field 'id' is const") {
+    struct C02M4 { const int id = 0; C02M4(int i) { C02M4 o = default; o.id = i; } };
+}
+// An embedding struct's constructor does not construct the embedded struct.
+expect_error("cannot assign to 's.id': field 'id' is const") {
+    struct C02M6 { C02Stamp s = C02Stamp(4); C02M6(int i) { s.id = i; } };
+}
+expect_error("cannot assign to 'this.s.id': field 'id' is const") {
+    struct C02M7 { C02Stamp s = C02Stamp(4); C02M7(int i) { this.s.id = i; } };
+}
+expect_error("cannot assign to 'items[0].id': field 'id' is const") {
+    struct C02M8 { C02Stamp[2] items; C02M8(int i) { items[0].id = i; } };
+}
+expect_error("cannot assign to 'v': field 'v' is const") {
+    struct C02M9<T> { const T v = default; void Bad(T x) { v = x; } };
+    void c02UseM9() { C02M9<int> m = default; m.Bad(1); }
+}
+expect_error("cannot assign to 'p->id': field 'id' is const") {
+    void c02SetId<T>(T* p) { p->id = 1; }
+    void c02CallSetId() { C02Stamp s = C02Stamp(1); c02SetId(&s); }
+}
+expect_error("cannot assign to 's.id': field 'id' is const") {
+    void c02ViaAlias(alias C02Stamp s) { s.id = 1; }
+}
+expect_error("cannot assign to 'v[0].id': field 'id' is const") {
+    void c02ViaView(C02Stamp[] v) { v[0].id = 1; }
+}
+expect_error("cannot assign to 's.id': field 'id' is const") {
+    void c02ViaValue(C02Stamp s) { s.id = 1; }
+}
+expect_error("cannot assign to 'id': field 'id' is const") {
+    struct C02M10 { const int id = 0; ~C02M10() { id = 0; } };
+}
+// A union arm has the union's own address; the arm's declaration still decides.
+expect_error("cannot assign to 'u.a': field 'a' is const") {
+    union C02U { const int a; float b; };
+    void c02UnionArm() { C02U u = default; u.b = 1.0; u.a = 3; }
+}

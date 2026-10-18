@@ -1,0 +1,24 @@
+// Const phase 1: a const variable must be initialized at its declaration (plan section 4 #11).
+expect_error("const variable 'c01UninitGlobal' must be initialized")
+{
+    const int c01UninitGlobal;
+}
+
+struct C01U { int n = 0; };
+
+extern int main()
+{
+    expect_error("const variable 'c01Local' must be initialized") { const int c01Local; }
+    expect_error("const variable 'c01Ptr' must be initialized") { const int* c01Ptr; }
+    expect_error("const variable 'c01Struct' must be initialized") { const C01U c01Struct; }
+    expect_error("const variable 'c01Static' must be initialized") { static const int c01Static; }
+    expect_error("const variable 'c01Second' must be initialized") { const int c01First = 1, c01Second; }
+    // Every initializer form counts: '= value', '= default', brace-init and a constructor call.
+    const int c01Value = 1;
+    const C01U c01Default = default;
+    const C01U c01Brace = { n = 2 };
+    const C01U c01Bare { n = 3 };
+    const C01U c01Ctor = C01U();
+    (const int)* c01View;
+    return c01Value + c01Default.n + c01Brace.n + c01Bare.n + c01Ctor.n - 6;
+}

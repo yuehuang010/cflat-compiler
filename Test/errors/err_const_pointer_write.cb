@@ -1,0 +1,64 @@
+// Const phase 3: a write through a pointer to const is refused at every form (plan cflat-const.md
+// section 2 item 3 through R11, section 4 #3). The level comes from the pointer's own type and the
+// derefs applied: `(const int*)* pp` fixes `*pp`, `const(int)** pp2` only `**pp2`.
+struct C03WBox { int n = 0; (const int)* cp = nullptr; int* p = nullptr; };
+(const int)* c03wGet((const int)* p) { return p; }
+const int C03WTable = 4;
+
+extern int main()
+{
+    int x = 1;
+    int* raw = &x;
+    const int* fixedView = raw;
+    (const int)* view = raw;
+    const(int)* view2 = raw;
+    expect_error("cannot assign to '*fixedView': it is reached through a pointer to const ('fixedView')") { *fixedView = 5; }
+    expect_error("cannot assign to 'fixedView[0]': it is reached through a pointer to const ('fixedView')") { fixedView[0] = 5; }
+    expect_error("cannot assign to '*view': it is reached through a pointer to const ('view')") { *view = 5; }
+    expect_error("cannot assign to 'view2[0]': it is reached through a pointer to const ('view2')") { view2[0] = 5; }
+    expect_error("cannot modify 'view[0]': it is reached through a pointer to const ('view')") { view[0] += 1; }
+    expect_error("cannot modify '*view': it is reached through a pointer to const ('view')") { *view <<= 1; }
+    expect_error("cannot increment '(*view)': it is reached through a pointer to const ('view')") { (*view)++; }
+    expect_error("cannot decrement 'view[0]': it is reached through a pointer to const ('view')") { view[0]--; }
+    expect_error("it is reached through a pointer to const") { *(view + 1) = 2; }
+
+    // Multi-level: the level written decides.
+    const int* slot = raw;
+    (const int*)* pp = &slot;
+    (const int)* cursor = raw;
+    const(int)** pp2 = &cursor;
+    expect_error("cannot assign to '*pp': it is reached through a pointer to const ('pp')") { *pp = raw; }
+    expect_error("cannot assign to '**pp': it is reached through a pointer to const ('pp')") { **pp = 1; }
+    expect_error("cannot assign to '**pp2': it is reached through a pointer to const ('pp2')") { **pp2 = 1; }
+    expect_error("cannot assign to 'pp2[0][0]': it is reached through a pointer to const ('pp2')") { pp2[0][0] = 1; }
+
+    // A pointer-typed field, a call result, a ternary, a cast to const.
+    C03WBox box = default;
+    box.cp = raw;
+    bool pick = x > 0;
+    expect_error("cannot assign to '*box.cp': it is reached through a pointer to const ('cp')") { *box.cp = 3; }
+    expect_error("cannot assign to 'box.cp[0]': it is reached through a pointer to const ('cp')") { box.cp[0] = 3; }
+    expect_error("it is reached through a pointer to const") { *c03wGet(raw) = 4; }
+    expect_error("it is reached through a pointer to const") { *(pick ? view : raw) = 4; }
+    expect_error("it is reached through a pointer to const") { *((const int)*)raw = 4; }
+    expect_error("it is reached through a pointer to const") { ((const(int)*)raw)[0] = 4; }
+
+    // An array element holding a pointer to const.
+    (const int)*[2] views = { raw, raw };
+    expect_error("it is reached through a pointer to const") { *views[1] = 2; }
+
+    // `&` of a const object is a pointer to const.
+    expect_error("it is reached through a pointer to const") { *(&C03WTable) = 2; }
+    return 0;
+}
+
+// Parameters: the callee may not write through a pointer-to-const parameter.
+expect_error("cannot assign to '*p': it is reached through a pointer to const ('p')") {
+    void c03wParam((const int)* p) { *p = 1; }
+}
+expect_error("cannot assign to 'p[1]': it is reached through a pointer to const ('p')") {
+    void c03wParamWhole(const int* p) { p[1] = 1; }
+}
+expect_error("cannot assign to '*s': it is reached through a pointer to const ('s')") {
+    void c03wScan((const char)* s) { while (*s != 0) s++; *s = 'x'; }
+}

@@ -1,0 +1,58 @@
+// Const phase 2: a struct with a const field - directly, in an embedded by-value struct, or in an
+// element of a fixed array field - has no whole assignment (C++ deletes it; plan cflat-const.md
+// R5 A, section 4 #13). Init, copy/move construction, return and by-value passing stay legal.
+struct C02Stamp { const int id = 0; int hits = 0; C02Stamp(int i) { id = i; } };
+struct C02Wrap { C02Stamp s = C02Stamp(4); int k = 0; };
+struct C02Arr { C02Stamp[2] items; int z = 0; };
+struct C02Box<T> { const T v = default; int n = 0; };
+C02Stamp C02G = default;
+
+extern int main()
+{
+    C02Stamp s = C02Stamp(1);
+    C02Stamp t = C02Stamp(2);
+    expect_error("cannot assign a whole 'C02Stamp': field 'id' is const") { s = t; }
+    expect_error("cannot assign a whole 'C02Stamp': field 'id' is const") { s = default; }
+    expect_error("cannot assign a whole 'C02Stamp': field 'id' is const") { s = C02Stamp(9); }
+    expect_error("cannot assign a whole 'C02Stamp': field 'id' is const") { s = move t; }
+    C02Stamp* ps = &s;
+    expect_error("cannot assign a whole 'C02Stamp': field 'id' is const") { *ps = t; }
+    C02Stamp[2] arr;
+    expect_error("cannot assign a whole 'C02Stamp': field 'id' is const") { arr[0] = C02Stamp(3); }
+    expect_error("cannot assign a whole 'C02Stamp': field 'id' is const") { C02G = default; }
+
+    C02Wrap w = default;
+    C02Wrap w2 = default;
+    expect_error("cannot assign a whole 'C02Stamp': field 'id' is const") { w.s = C02Stamp(3); }
+    expect_error("cannot assign a whole 'C02Wrap': field 'id' is const") { w = w2; }
+    C02Wrap[2] ws;
+    expect_error("cannot assign a whole 'C02Wrap': field 'id' is const") { ws[1] = default; }
+
+    C02Arr a = default;
+    C02Arr a2 = default;
+    expect_error("cannot assign a whole 'C02Arr': field 'id' is const") { a = a2; }
+
+    C02Box<int> b = default;
+    C02Box<int> c = default;
+    expect_error("cannot assign a whole 'C02Box<int>': field 'v' is const") { b = c; }
+    return 0;
+}
+
+expect_error("cannot assign a whole 'C02Stamp': field 'id' is const") {
+    int c02Capture() { C02Stamp s = C02Stamp(1); Lambda<int()> f = () => { s = default; return 0; }; return f(); }
+}
+// The embedding constructor must build the member through its field default, not assign it.
+expect_error("cannot assign a whole 'C02Stamp': field 'id' is const") {
+    struct C02A2 { C02Stamp s = C02Stamp(4); C02A2(int i) { s = C02Stamp(i); } };
+}
+expect_error("cannot assign a whole 'C02A4': field 'id' is const") {
+    struct C02A4 { const int id = 0; int n = 0; void Reset(C02A4* o) { *o = default; } };
+}
+expect_error("cannot assign a whole 'C02Stamp': field 'id' is const") {
+    void c02Assign<T>(T* p, T q) { *p = q; }
+    void c02CallAssign() { C02Stamp s = C02Stamp(1); c02Assign(&s, C02Stamp(2)); }
+}
+expect_error("cannot assign a whole 'C02U': field 'a' is const") {
+    union C02U { const int a; float b; };
+    void c02UnionWhole() { C02U u = default; C02U v = default; u = v; }
+}

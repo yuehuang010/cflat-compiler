@@ -2012,6 +2012,11 @@ if const (is_cpp_class(T) && !is_copyable(T))
 }
 ```
 
+`is_assignable(T)` is false when `T` is a CFlat struct holding a `const` field anywhere in its
+by-value layout (such a value can be constructed but never reassigned), true otherwise. Core
+containers relocate with `construct_at`, and only guard in-place reassignment (`list<T>.sort()`,
+`channel<T>` / `spsc_queue<T>` slot writes, `view<T>.set()`) with it.
+
 `compile_error("message")` is a builtin usable inside `if const` in generic code. It
 marks the enclosing method as poisoned for that instantiation; the error only fires if
 the method is actually called (not merely instantiated), which is what lets
@@ -3291,8 +3296,8 @@ Note: `program` remains required at the start of a managed-entry-point definitio
 
 **Reserved compiler intrinsics** (built-in pseudo-functions - cannot be redefined):
 
-`annotationof`, `construct_at`, `embed`, `expect_error`, `is_copyable`, `is_cpp_class`,
-`is_interface`, `is_pointer`, `is_primitive`, `is_string`, `is_unique`, `json_const`, `nameof`,
+`annotationof`, `construct_at`, `embed`, `expect_error`, `is_assignable`, `is_copyable`,
+`is_cpp_class`, `is_interface`, `is_pointer`, `is_primitive`, `is_string`, `is_unique`, `json_const`, `nameof`,
 `reflect`, `reflect_set`, `sizeof`, `typeof`, `xml_const`
 
 **Compiler-recognized methods** (not reserved - you define them on a type, the

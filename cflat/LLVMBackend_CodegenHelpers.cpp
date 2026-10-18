@@ -354,7 +354,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
             }
             if (symbolSink_ && !itr_nameArg->VariableName.empty())
                 symbolSink_->RegisterVariable(itr_nameArg->VariableName, itr_nameArg->TypeName,
-                                              SpellType(*this, *itr_nameArg));
+                                              SpellTypeForSymbolDump(*this, *itr_nameArg));
 
             RecordMoveGenBind(itr_nameArg->VariableName); // fresh parameter binding
 

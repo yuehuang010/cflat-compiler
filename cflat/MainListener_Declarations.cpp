@@ -581,6 +581,9 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
         // Written stars are COUNTED, not flagged: Box<C**> must reach MangleTypeArg as "C**" so it
         // mangles Box$.p$.p$C and becomes its own instantiation.
         int pointerDepth = PointerDepthOf(entry->pointer());
+        for (auto* qualifier : ConstQualifiersAfterPointerStar(entry->pointer()))
+            LogErrorContext(qualifier, ConstAfterPointerDiagnostic(
+                SpelledTypeNameBase(typeSpec, entry->multiWordTypeSuffix())));
         bool hasPointer = pointerDepth > 0;
         // Now that the stars are COUNTED here, this spelling joins the others that count them: a
         // written depth of 3+ is refused rather than clamped (the type model holds two levels).
@@ -600,7 +603,13 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
         std::string resolved;
 
         std::string innerBase;
-        if (auto* innerParams = GenericSpecOf(typeSpec, innerBase))
+        if (typeSpec != nullptr && typeSpec->typeName() != nullptr)
+        {
+            auto nested = ParseTypeName(typeSpec->typeName(), true, entry);
+            nested.ApplyWholeWordConst();
+            resolved = nested.TypeName + std::string(nested.PointerDepth, '*');
+        }
+        else if (auto* innerParams = GenericSpecOf(typeSpec, innerBase))
         {
             // Nested generic (e.g., Box<T>): recurse into each type argument
             std::vector<std::string> innerArgs;
@@ -735,7 +744,15 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
                 if (Compiler(entry)->IsTypeArgTypeKey(base)
                     || Compiler(entry)->IsKnownTypeName(base))
                     resolved = base;
-                else if (auto folded = FoldCompileTimeInt(Compiler(entry), typeSpec->genericIdentifier()))
+                else if (auto folded = [&]() {
+                             // The pre-scan has no frames: a name resolves lexically before globals.
+                             const LexicalConstTypeParser parseType =
+                                 [this](CFlatParser::DeclarationSpecifiersContext* d) -> LLVMBackend::TypeAndValue {
+                                     return ParseDeclarationSpecifiers(d);
+                                 };
+                             LexicalConstParserScope lexicalScope(&parseType);
+                             return FoldCompileTimeInt(Compiler(entry), typeSpec->genericIdentifier());
+                         }())
                     return std::to_string(*folded);
                 else if (typeSpec->qualifiedGenericIdentifier() != nullptr
                          && !Compiler(entry)->IsCxxForeignTypeRegistered(base))
@@ -974,6 +991,12 @@ void MainListener::RejectFatEncodedClosurePointerArg(antlr4::ParserRuleContext* 
         RejectFatClosurePointerArg(ctx, false, ClosureArgSpelling(c, baseName));
     }
 
+void MainListener::ValidateConstAfterPointerStar(CFlatParser::PointerContext* pointer,
+                                                  const std::string& spelledBaseType) {
+        for (auto* qualifier : ConstQualifiersAfterPointerStar(pointer))
+            LogErrorContext(qualifier, ConstAfterPointerDiagnostic(spelledBaseType));
+    }
+
 std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpecifierContext* fpSpec) {
         bool isThin = fpSpec->Function() != nullptr;
         if (fpSpec->typeSpecifier() == nullptr)
@@ -987,6 +1010,8 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
         sig.TypeName = isThin ? "__c_fn_ptr" : "__closure_fat_ptr";
         bool retPtr = fpSpec->pointer() != nullptr;
         int retStars = PointerDepthOf(fpSpec->pointer());
+        ValidateConstAfterPointerStar(fpSpec->pointer(),
+            SpelledTypeNameBase(fpSpec->typeSpecifier(), fpSpec->multiWordTypeSuffix()));
         std::string retName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr,
                                                          fpSpec->multiWordTypeSuffix());
         // A signature component over the cap can never be matched: no function may declare a
@@ -1012,6 +1037,8 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
             {
                 bool pPtr = param->pointer() != nullptr;
                 int pStars = PointerDepthOf(param->pointer());
+                ValidateConstAfterPointerStar(param->pointer(),
+                    SpelledTypeNameBase(param->typeSpecifier(), param->multiWordTypeSuffix()));
                 std::string pName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr,
                                                                param->multiWordTypeSuffix());
                 if (pStars > PointerDepthCap)
@@ -1038,6 +1065,8 @@ std::string MainListener::EncodePlainFunctionTypeCodegen(
         sig.TypeName = "__c_fn_ptr";
         bool retPtr = fnSpec->pointer() != nullptr;
         int retStars = PointerDepthOf(fnSpec->pointer());
+        ValidateConstAfterPointerStar(fnSpec->pointer(),
+            SpelledTypeNameBase(fnSpec->typeSpecifier(), fnSpec->multiWordTypeSuffix()));
         sig.FuncPtrReturnTypeName = ResolveSigComponentCodegen(fnSpec->typeSpecifier(), retPtr,
                                                                fnSpec->multiWordTypeSuffix());
         sig.FuncPtrReturnPointer = retPtr;
@@ -1049,6 +1078,8 @@ std::string MainListener::EncodePlainFunctionTypeCodegen(
                 LLVMBackend::TypeAndValue::FuncPtrParam p;
                 bool pPtr = param->pointer() != nullptr;
                 int pStars = PointerDepthOf(param->pointer());
+                ValidateConstAfterPointerStar(param->pointer(),
+                    SpelledTypeNameBase(param->typeSpecifier(), param->multiWordTypeSuffix()));
                 p.TypeName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr,
                                                         param->multiWordTypeSuffix());
                 p.Pointer = pPtr;
@@ -1117,6 +1148,33 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         ? declSpec->typeSpecifier()->getText() : "T"), writtenStars));
         }
         std::vector<std::string> typeWords = CollectDeclarationTypeSpecifierWords(declSpecList);
+        std::string spelledBaseType = JoinTypeSpecifierWords(typeWords);
+        for (auto* spec : declSpecList)
+            if (auto* typeSpec = spec->typeSpecifier(); typeSpec != nullptr
+                && typeSpec->typeName() != nullptr
+                && typeSpec->typeName()->specifierQualifierList() != nullptr
+                && !typeSpec->typeName()->specifierQualifierList()->typeSpecifier().empty())
+            {
+                spelledBaseType = typeSpec->typeName()->specifierQualifierList()
+                    ->typeSpecifier().front()->getText();
+                break;
+            }
+        for (size_t i = 0; i < declSpecList.size(); ++i)
+        {
+            auto* qualifier = declSpecList[i]->typeQualifier();
+            if (qualifier == nullptr) continue;
+            for (size_t j = 0; j < i; ++j)
+                if (auto* priorType = declSpecList[j]->typeSpecifier();
+                    priorType != nullptr && !IsSoftKeywordTypeSpecifier(priorType->getText())
+                    && priorType->getStop()->getTokenIndex()
+                        < qualifier->getStart()->getTokenIndex())
+                    LogErrorContext(qualifier, std::format(
+                        "'const' must come before the type it qualifies; write 'const {}' instead",
+                        spelledBaseType));
+        }
+        for (auto* spec : declSpecList)
+            for (auto* qualifier : ConstQualifiersAfterPointerStar(spec->pointer()))
+                LogErrorContext(qualifier, ConstAfterPointerDiagnostic(spelledBaseType));
         PrimitiveTypeError canonicalTypeError;
         std::string canonicalTypeName;
         CanonicalizePrimitiveTypeWords(typeWords, canonicalTypeName, canonicalTypeError);
@@ -1304,6 +1362,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         // signature (e.g. Lambda<list<string>()>) stores the mangled "list$string".
                         bool retPtr = fpSpec->pointer() != nullptr;
                         int retStars = PointerDepthOf(fpSpec->pointer());
+                        ValidateConstAfterPointerStar(fpSpec->pointer(),
+                            SpelledTypeNameBase(fpSpec->typeSpecifier(), fpSpec->multiWordTypeSuffix()));
                         declType.FuncPtrReturnTypeName = ResolveSigComponentCodegen(
                             fpSpec->typeSpecifier(), retPtr, fpSpec->multiWordTypeSuffix());
                         if (auto* qualifier = fpSpec->functionReturnQualifier(); qualifier != nullptr)
@@ -1330,6 +1390,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                 LLVMBackend::TypeAndValue::FuncPtrParam p;
                                 bool pPtr = param->pointer() != nullptr;
                                 int pStars = PointerDepthOf(param->pointer());
+                                ValidateConstAfterPointerStar(param->pointer(),
+                                    SpelledTypeNameBase(param->typeSpecifier(), param->multiWordTypeSuffix()));
                                 p.TypeName = ResolveSigComponentCodegen(
                                     param->typeSpecifier(), pPtr, param->multiWordTypeSuffix());
                                 LLVMBackend::TypeAndValue pType;
@@ -1570,6 +1632,20 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     }
                     break;
                 }
+                else if (auto* nestedType = typeSpec->typeName())
+                {
+                    auto wrappedType = ParseTypeName(nestedType, true, declSpec);
+                    wrappedType.ApplyWholeWordConst();
+                    declType.TypeName = wrappedType.TypeName;
+                    declType.Pointer = wrappedType.Pointer;
+                    declType.ElemPointer = wrappedType.ElemPointer;
+                    declType.PointerDepth = wrappedType.PointerDepth;
+                    declType.IsArrayView = wrappedType.IsArrayView;
+                    declType.ConstMask |= wrappedType.ConstMask;
+                    substArgPtrDepth = wrappedType.PointerDepth;
+                    if (wrappedType.IsArrayView && wrappedType.ElemPointer)
+                        substArgElemPtrDepth = 1;
+                }
                 else
                 {
                     auto* memberType = typeSpec->memberTypeSpecifier();
@@ -1626,6 +1702,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                             typeName = qualified;
                     }
                     // Resolve type aliases (e.g. user-defined aliases)
+                    declType.ConstMask |= Compiler(declSpecs)->ResolveTypeAliasConstMask(typeName);
                     typeName = Compiler(declSpecs)->ResolveTypeAlias(typeName);
                     // `Owner.name` naming a member type (`Plain.Id`, `T.value_type` in a body).
                     if (!wasSubstituted && typeSpec->qualifiedGenericIdentifier() != nullptr
@@ -1923,14 +2000,27 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
             declType.AllocAlignValue = CoreUniqueDeclaredAllocAlign(Compiler(), declType.TypeName);
         bool hasConstQualifier = false;
         for (auto* spec : declSpecs->declarationSpecifier())
-            if (auto* qualifier = spec->typeQualifier();
-                qualifier != nullptr && qualifier->getText() == "const")
+            if (spec->typeQualifier() != nullptr)
                 hasConstQualifier = true;
+        if (hasConstQualifier)
+            declType.ApplyWholeWordConst();
         if (hasConstQualifier && declType.Pointer && Compiler(declSpecs)->IsCxxRecord(declType.TypeName))
             declType.IsCxxPointeeConst = true;
-        declType.IsSpelledPointeeConst = hasConstQualifier && declType.Pointer;
+        declType.IsSpelledPointeeConst = (declType.ConstMask & 1) != 0 && declType.Pointer;
 
         return declType;
+    }
+
+void MainListener::MarkConstGlobalReadOnly(llvm::GlobalVariable* global,
+                                           const LLVMBackend::TypeAndValue& tv) {
+        if (global == nullptr || !global->hasInitializer() || global->isDeclaration()
+            || !Compiler()->IsNativeConstObject(tv))
+            return;
+        // Scalars, pointers and arrays of them only: a struct may still be written by a method.
+        llvm::Type* element = global->getValueType();
+        while (element->isArrayTy()) element = element->getArrayElementType();
+        if (element->isIntegerTy() || element->isFloatingPointTy() || element->isPointerTy())
+            global->setConstant(true);
     }
 
 uint64_t MainListener::ValidateAlignValue(antlr4::ParserRuleContext* ctx, int64_t signedVal, const char* what) {
@@ -3001,6 +3091,22 @@ std::string MainListener::DeclaringNamespaceOf(LLVMBackend* compiler, const std:
 
 void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* ctx) {
         auto* compiler = Compiler(ctx);
+        auto spellAliasTarget = [&](const std::string& typeName, uint8_t constMask,
+                                    int pointerDepth) {
+            LLVMBackend::TypeAndValue displayType;
+            std::string baseTypeName = typeName;
+            std::vector<uint64_t> arrayDims;
+            PeelAliasArrayDims(baseTypeName, arrayDims);
+            PeelAliasPointerStars(baseTypeName);
+            for (uint64_t dim : arrayDims)
+                baseTypeName += "[" + std::to_string(dim) + "]";
+            displayType.TypeName = std::move(baseTypeName);
+            displayType.ConstMask = constMask;
+            displayType.Pointer = pointerDepth > 0;
+            displayType.ElemPointer = pointerDepth >= 2;
+            displayType.PointerDepth = pointerDepth > PointerDepthCap ? 0 : pointerDepth;
+            return SpellTypeForSymbolDump(*compiler, displayType);
+        };
 
         // The alias name may be a plain Identifier or the 'string' keyword token.
         std::string alias;
@@ -3014,6 +3120,8 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
                 "alias '{}' is already defined in this scope", { alias }));
 
         auto* typeSpec = ctx->typeSpecifier();
+        ValidateConstAfterPointerStar(ctx->pointer(),
+            SpelledTypeNameBase(typeSpec, ctx->multiWordTypeSuffix()));
 
         // Function-type alias (using Cb = function<R(Args)>): a closure type carries a call
         // signature, not a plain type name, so it is stored structurally in functionTypeAliases
@@ -3021,28 +3129,45 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
         // type/namespace dispatch below, which only recognizes named types.
         if (auto* fpSpec = typeSpec->functionPointerSpecifier())
         {
-            compiler->RegisterFunctionTypeAlias(alias, BuildFuncPtrAliasType(fpSpec));
+            auto functionType = BuildFuncPtrAliasType(fpSpec);
+            compiler->RegisterFunctionTypeAlias(alias, functionType);
             if (auto* s = compiler->GetSymbolSink())
                 s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                            "using " + alias + " = " + typeSpec->getText(), {},
+                            "using " + alias + " = "
+                                + SpellTypeForSymbolDump(*compiler, functionType), {},
                             ExtractLeadingDoc(GetTokens(), ctx->getStart()));
             return;
         }
 
         PrimitiveTypeError canonicalError;
-        std::string target = CanonicalTypeSpecifierText(
-            typeSpec, ctx->multiWordTypeSuffix(), false, &canonicalError);
-        if (HasPrimitiveTypeError(canonicalError))
-            LogErrorContext(ctx, LocalizePrimitiveTypeError(compiler, canonicalError));
-        if (auto* memberType = typeSpec->memberTypeSpecifier())
-            target = ResolveMemberTypeSpecifier(memberType);
-        else if (auto subst = activeTypeSubstitutions.find(target); subst != activeTypeSubstitutions.end())
-            target = subst->second;
+        std::string target;
+        uint8_t targetConstMask = 0;
+        if (auto* nestedType = typeSpec->typeName())
+        {
+            auto nestedValue = ParseTypeName(nestedType, true, ctx);
+            nestedValue.ApplyWholeWordConst();
+            targetConstMask = nestedValue.ConstMask;
+            target = nestedValue.TypeName + std::string(nestedValue.PointerDepth, '*');
+        }
+        else
+        {
+            target = CanonicalTypeSpecifierText(
+                typeSpec, ctx->multiWordTypeSuffix(), false, &canonicalError);
+            if (HasPrimitiveTypeError(canonicalError))
+                LogErrorContext(ctx, LocalizePrimitiveTypeError(compiler, canonicalError));
+            if (auto* memberType = typeSpec->memberTypeSpecifier())
+                target = ResolveMemberTypeSpecifier(memberType);
+            else if (auto subst = activeTypeSubstitutions.find(target); subst != activeTypeSubstitutions.end())
+                target = subst->second;
+            targetConstMask = compiler->ResolveTypeAliasConstMask(target);
+        }
         // A pointer alias (using Handle = void*) stores its trailing stars in the alias string;
         // the stars are peeled back onto the pointer flags at the resolution site (GetType /
         // ParseDeclarationSpecifiers). Storage stays string-shaped - no descriptor struct.
         std::string suffix(ctx->pointer() != nullptr ? ctx->pointer()->Star().size() : 0, '*');
+        if (ctx->Const() != nullptr)
+            targetConstMask = UsingWholeWordConstMask(compiler, target, suffix.size());
         // An alias RHS over the cap names a type no declarator could ever spell; reject it here
         // rather than only at the (possibly absent) use site.
         if ((int)suffix.size() > PointerDepthCap)
@@ -3149,11 +3274,13 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
                     return;
                 }
             }
-            compiler->RegisterTypeAlias(alias, mangledName + suffix);
+            compiler->RegisterTypeAlias(alias, mangledName + suffix, targetConstMask);
             if (auto* s = compiler->GetSymbolSink())
                 s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                            "using " + alias + " = " + target + suffix, {},
+                            "using " + alias + " = " + spellAliasTarget(
+                                mangledName + suffix, targetConstMask,
+                                targetPointerDepth + PointerDepthOf(ctx->pointer())), {},
                             ExtractLeadingDoc(GetTokens(), ctx->getStart()));
             return;
         }
@@ -3167,7 +3294,7 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
             if (auto* s = compiler->GetSymbolSink())
                 s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                            "using " + alias + " = " + target, {},
+                            "using " + alias + " = " + spellAliasTarget(target, 0, 0), {},
                             ExtractLeadingDoc(GetTokens(), ctx->getStart()));
             return;
         }
@@ -3180,7 +3307,7 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
             targetDecorated = enumKey + std::string(targetPointerDepth, '*');
             for (uint64_t dim : targetArrayDims)
                 targetDecorated += "[" + std::to_string(dim) + "]";
-            compiler->RegisterTypeAlias(alias, targetDecorated + suffix);
+            compiler->RegisterTypeAlias(alias, targetDecorated + suffix, targetConstMask);
             return;
         }
 
@@ -3202,11 +3329,13 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
                     alias, targetDecorated, alias));
                 return;
             }
-            compiler->RegisterTypeAlias(alias, targetDecorated + suffix);
+            compiler->RegisterTypeAlias(alias, targetDecorated + suffix, targetConstMask);
             if (auto* s = compiler->GetSymbolSink())
                 s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                            "using " + alias + " = " + targetDecorated + suffix, {},
+                            "using " + alias + " = " + spellAliasTarget(
+                                targetDecorated + suffix, targetConstMask,
+                                targetPointerDepth + PointerDepthOf(ctx->pointer())), {},
                             ExtractLeadingDoc(GetTokens(), ctx->getStart()));
         }
         else if (!suffix.empty())
@@ -3888,7 +4017,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                                     compiler->GetSourceFilePath(),
                                     (int)direct->getStart()->getLine(),
                                     (int)direct->getStart()->getCharPositionInLine(),
-                                    SpellType(*compiler, params[i]));
+                                    SpellTypeForSymbolDump(*compiler, params[i]));
             }
         }
         size_t line = func->getStart()->getLine();
@@ -6062,9 +6191,9 @@ cxx_dtor_ready:
         const std::string pfText = pf != nullptr ? pf->getText() : std::string();
         auto* castInitContext = tryGetCastExpression(assign);
         bool castInit = false;
-        if (castInitContext != nullptr && castInitContext->typeName() != nullptr)
+        if (castInitContext != nullptr && castInitContext->castTypeName() != nullptr)
         {
-            const auto castType = ParseTypeName(castInitContext->typeName(), false, castInitContext);
+            const auto castType = ParseCastTypeName(castInitContext->castTypeName(), false, castInitContext);
             castInit = !castType.Pointer && !castType.ElemPointer && !castType.IsArrayView
                 && compiler->ResolveTypeAlias(castType.TypeName)
                     == compiler->ResolveTypeAlias(typeName);
@@ -7294,13 +7423,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // dedupes instead of listing as a phantom overload.
                 if (auto* s = compiler->GetSymbolSink())
                 {
-                    std::string sig = SpellType(*compiler, typeAndValue) + " " + declName + "(";
+                    std::string sig = SpellTypeForSymbolDump(*compiler, typeAndValue) + " " + declName + "(";
                     bool first = true;
                     for (const auto& p : declParams)
                     {
                         if (!first) sig += ", ";
                         first = false;
-                        sig += SpellType(*compiler, p);
+                        sig += SpellTypeForSymbolDump(*compiler, p);
                         if (!p.VariableName.empty()) sig += " " + p.VariableName;
                     }
                     if (ellipsis) sig += first ? "..." : ", ...";
@@ -7499,6 +7628,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 std::string srcInferredTypeName;
                 bool srcInferredPointer = false;
                 bool srcInferredElemPointer = false;
+                uint8_t srcInferredConstMask = 0;
                 // Thin function-pointer initializer (`auto p = signal(...)`): its signature.
                 std::optional<LLVMBackend::TypeAndValue> srcThinFnPtr;
                 // Closure initializer (`auto f = lam;`): its Lambda<> signature. The fat value
@@ -7599,6 +7729,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 llvm::Type* srcMoveTempStructType = nullptr;
                 unsigned srcMoveTempFieldIndex = 0;
                 auto initializer = initDecl->initializer();
+                if (initializer == nullptr && initDecl->LeftBrace() == nullptr
+                    && !typeAndValue.external && compiler->IsNativeConstObject(typeAndValue))
+                    LogErrorContext(direct, std::format(
+                        "const variable '{}' must be initialized", declaratorName));
                 const bool initializerHasTopLevelMove = initializer != nullptr
                     && TopLevelMoveExpression(initializer->assignmentExpression()) != nullptr;
                 // Owned-call flags are per declarator: a stale flag (e.g. from a `_ =` discard) would make
@@ -8748,6 +8882,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcInferredTypeName = rightNV.TypeAndValue.TypeName;
                                 srcInferredPointer = rightNV.TypeAndValue.Pointer;
                                 srcInferredElemPointer = rightNV.TypeAndValue.ElemPointer;
+                                srcInferredConstMask = rightNV.TypeAndValue.ConstMask;
                                 if (rightNV.TypeAndValue.IsThinFnPtr() && !rightNV.TypeAndValue.Pointer
                                     && !rightNV.TypeAndValue.FuncPtrReturnTypeName.empty())
                                     srcThinFnPtr = rightNV.TypeAndValue;
@@ -8880,6 +9015,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 if (RejectImplicitPointerToNumber(
                                         assignmentExpression, typeAndValue, rightNV, right,
                                         "initialize", std::format("variable '{}'", name)))
+                                    right = nullptr;
+                                if (right != nullptr && RejectConstDiscardingConversion(
+                                        assignmentExpression, rightNV, right, typeAndValue))
                                     right = nullptr;
                                 // Declarator-init leg of the code-value store gate: `Rec* r = w;`
                                 // stored a code address in a data pointer and wrote through it.
@@ -9671,6 +9809,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         typeAndValue.IsInterface = compiler->IsInterfaceType(srcInferredTypeName);
                         typeAndValue.IsCxxPointeeConst = srcCxxPointeeConst && srcInferredPointer;
                         typeAndValue.IsCxxNullptrT = srcCxxNullptrT;
+                        // C++ deduction: the initializer's top-level const is dropped, pointee const is kept.
+                        const bool declaredConst = typeAndValue.IsConstObject();
+                        typeAndValue.ConstMask = static_cast<uint8_t>(srcInferredConstMask
+                            & ((1u << typeAndValue.ValuePointerDepth()) - 1u));
+                        if (declaredConst) typeAndValue.ApplyWholeWordConst();
                     }
                 }
                 if (typeAndValue.Pointer && srcCxxPointeeConst)
@@ -9890,6 +10033,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         }
                     }
 
+                    const size_t pendingConstructionsBefore = pendingGlobalDefaultConstructions_.size()
+                        + pendingGlobalCxxConstructions_.size();
                     auto* global = compiler->CreateGlobalVariable(typeAndValue, constant,
                         typeAndValue.threadLocal, typeAndValue.UserAlignValue, externDeclOnly,
                         srcIsUnsigned);
@@ -9973,6 +10118,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && !HasInterpolation(raw))
                             compiler->RecordCompileTimeStringConstant(name, ProcessRawText(raw));
                     }
+                    // A native const scalar / pointer / scalar-array global with a constant initializer
+                    // and no module-init construction is read-only data.
+                    if (!externDeclOnly && global_scope && constant != nullptr
+                        && pendingConstructionsBefore == pendingGlobalDefaultConstructions_.size()
+                            + pendingGlobalCxxConstructions_.size())
+                        MarkConstGlobalReadOnly(global, typeAndValue);
                     // Constant scalar globals may fold in compile-time expressions; mutable globals may not.
                     if (!externDeclOnly && DeclSpecHasConst(declSpec)
                         && (llvm::isa_and_nonnull<llvm::ConstantInt>(constant)
@@ -9998,7 +10149,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                             compiler->GetSourceFilePath(),
                                             (int)direct->getStart()->getLine(),
                                             (int)direct->getStart()->getCharPositionInLine(),
-                                            SpellType(*compiler, typeAndValue));
+                                            SpellTypeForSymbolDump(*compiler, typeAndValue));
                         // Also register as a named symbol so globals (including
                         // namespace consts like Math.PI) show up in --symbol
                         // queries and in their namespace's member listing.
@@ -10006,7 +10157,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     compiler->GetSourceFilePath(),
                                     (int)direct->getStart()->getLine(),
                                     (int)direct->getStart()->getCharPositionInLine(),
-                                    std::format("{} {}", SpellType(*compiler, typeAndValue), name),
+                                    std::format("{} {}", SpellTypeForSymbolDump(*compiler, typeAndValue), name),
                                     {}, name);
                     }
                 }
@@ -10057,6 +10208,22 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         typeAndValue.UserAlignValue, nrvoStorage);
                     compiler->GetOrCreateStackVariable(name).IsTopLevelConst
                         = DeclSpecHasConst(declSpec) && typeAndValue.IsFunctionPointer;
+                    // A const integer local with a constant initializer folds (array dims, value generic args).
+                    if (initializer != nullptr && initializer->assignmentExpression() != nullptr
+                        && !typeAndValue.Pointer && typeAndValue.ConstArraySize == 0
+                        && compiler->IsNativeConstObject(typeAndValue))
+                        if (auto* intTy = llvm::dyn_cast_or_null<llvm::IntegerType>(compiler->GetType(typeAndValue)))
+                        {
+                            // Same lexical lookup as the pre-pass: a local type name (enum) is no value.
+                            const LexicalConstTypeParser parseType =
+                                [this](CFlatParser::DeclarationSpecifiersContext* d) -> LLVMBackend::TypeAndValue {
+                                    return ParseDeclarationSpecifiers(d);
+                                };
+                            LexicalConstParserScope lexicalScope(&parseType);
+                            if (auto folded = FoldCompileTimeInt(compiler, initializer->assignmentExpression());
+                                folded && ConstLocalFoldFits(intTy, *folded))
+                                compiler->GetOrCreateStackVariable(name).ConstFoldInt = *folded;
+                        }
                     const bool loweredSretResult = srcCxxRetTemp != nullptr
                         && !typeAndValue.Pointer
                         && !srcCxxRetTempFromDefault
@@ -10223,6 +10390,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     // at the statement end as before.
                     compiler->SettleAliasDeclTemps(aliasTemps.mark,
                         bindAliasReference || typeAndValue.Pointer);
+                    // A mutable alias bound to a whole const object (#16); `const alias T` may bind it.
+                    if (bindAliasReference && aliasStorage != nullptr && !typeAndValue.Pointer
+                        && !typeAndValue.IsConstObject())
+                        if (auto bound = compiler->FindConstObjectRoot(aliasStorage);
+                            bound.has_value() && bound->Storage == aliasStorage)
+                            LogErrorContext(direct, std::format(
+                                "cannot take a mutable pointer to '{}': it is declared const", bound->Name));
                     if (bindAliasReference)
                     {
                             auto& nv = compiler->GetOrCreateStackVariable(name);

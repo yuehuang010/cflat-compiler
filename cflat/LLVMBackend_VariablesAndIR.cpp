@@ -236,7 +236,7 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
 
         if (symbolSink_ && !typeValue.VariableName.empty())
             symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName,
-                                          SpellType(*this, typeValue));
+                                          SpellTypeForSymbolDump(*this, typeValue));
 
         if (diBuilder && diFile && !typeValue.VariableName.empty() && !externalDecl)
         {
@@ -479,7 +479,7 @@ llvm::Value* LLVMBackend::CreateLocalVariable(const TypeAndValue& typeValue, llv
             if (symbolSink_ && !typeValue.VariableName.empty())
                 symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName,
                                               GetSourceFilePath(), (int)line, 0,
-                                              SpellType(*this, typeValue));
+                                              SpellTypeForSymbolDump(*this, typeValue));
             CreateOwnOriginSlot(gv);
             if (diBuilder && diFile && !typeValue.VariableName.empty())
             {
@@ -530,7 +530,7 @@ llvm::Value* LLVMBackend::CreateLocalVariable(const TypeAndValue& typeValue, llv
         if (symbolSink_ && !typeValue.VariableName.empty())
             symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName,
                                           GetSourceFilePath(), (int)line, 0,
-                                          SpellType(*this, typeValue));
+                                          SpellTypeForSymbolDump(*this, typeValue));
 
         if (diBuilder && currentSubprogram && (unsigned)line > 0)
         {
@@ -557,7 +557,7 @@ void LLVMBackend::RegisterPrimaryVariable(const TypeAndValue& typeValue, llvm::V
 
         if (symbolSink_ && !typeValue.VariableName.empty())
             symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName,
-                                          SpellType(*this, typeValue));
+                                          SpellTypeForSymbolDump(*this, typeValue));
     }
 
 llvm::AllocaInst* LLVMBackend::CreateAlloca(llvm::Type* type)

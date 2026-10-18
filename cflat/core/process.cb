@@ -331,7 +331,7 @@ class process : IProcess {
 
             // Build a NULL-terminated argv of malloc'd C strings: [exe, args..., 0].
             int argc = pargs->count();
-            const char** argv = (const char**)malloc((i64)((argc + 2) * 8));
+            (const char)** argv = ((const char)**)malloc((i64)((argc + 2) * 8));
             argv[0] = _proc_dupcstr(exe.data(), exe.length());
             int ai = 0;
             while (ai < argc) {

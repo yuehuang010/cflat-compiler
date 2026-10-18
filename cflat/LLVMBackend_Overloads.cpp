@@ -286,6 +286,27 @@ static bool CxxSpellingHasPointerTarget(const std::string& spelling)
  * its pointee only in InferSourceTypeName (call and operator operands) gets it back. A reference
  * to a non-pointer (`const bool&`) binds the pointer-to-scalar conversion and is never judged.
  */
+// The pointer value an argument passes: its value, or the storage of a fixed array that decays.
+llvm::Value* LLVMBackend::ArgumentPointerValue(const NamedVariable& arg) const
+{
+    llvm::Value* passed = arg.Primary;
+    if ((passed == nullptr || !passed->getType()->isPointerTy()) && arg.Storage != nullptr
+        && arg.TypeAndValue.ConstArraySize > 0 && !arg.TypeAndValue.Pointer)
+        passed = arg.Storage;
+    return passed;
+}
+
+// A parameter's declared qualification. A C header parameter carries its spelled levels in
+// ConstMask; one without them (an unparsed spelling) falls back to every level read-only.
+LLVMBackend::TypeAndValue LLVMBackend::ParameterQualification(const FunctionSymbol& candidate,
+                                                              const TypeAndValue& param) const
+{
+    TypeAndValue target = param;
+    if (candidate.IsCInteropDeclaration && param.IsCxxPointeeConst && param.Pointer && param.ConstMask == 0)
+        target.ConstMask |= static_cast<uint8_t>((1u << param.ValuePointerDepth()) - 1u);
+    return target;
+}
+
 bool LLVMBackend::IsUnrelatedPointeeArgument(const NamedVariable& arg,
                                              const FunctionSymbol& candidate, size_t index) const
 {
@@ -2082,6 +2103,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             // Native: a floating pointee against an unrelated primitive pointee (int* into double*).
             // Removed while any other candidate is viable, else kept (legacy accept, master pick).
             bool unrelatedPointeeNotViable = false;
+            // Native: the parameter discards the argument's pointee const (#6).
+            bool constDiscardNotViable = false;
             // A normalized C++ class xvalue cannot bind a same-class pointer value parameter.
             bool normalizedCxxXvaluePointerNotViable = false;
             bool defaultArgumentNotViable = false;
@@ -2260,6 +2283,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             bool callbackConstUnproven = false;
             bool cxxPointeeConstNotViable = false;
             bool unrelatedPointeeNotViable = false;
+            bool constDiscardNotViable = false;
             bool normalizedCxxXvaluePointerNotViable = false;
             // T142: a `default` argument binds only a by-value parameter.
             bool defaultArgumentNotViable = false;
@@ -3147,6 +3171,17 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 if (IsUnrelatedPointeeArgument(arg, candidate, (size_t)std::distance(
                         candidate.Parameters.begin(), candidateParamItr)))
                     result = -1;
+                // A native candidate whose parameter would discard the argument's const is not
+                // viable (C++); removed while another is viable, else kept so the call reports #6.
+                if (result >= 0 && candidates.size() > 1 && !candidate.IsCxx
+                    && !(candidate.IsMethod && candidateParamItr == candidate.Parameters.begin()))
+                {
+                    std::string from, to;
+                    if (ConversionDiscardsConst(ArgumentPointerValue(arg), originalArgType,
+                            ParameterQualification(candidate, *candidateParamItr), from, to,
+                            ParameterHasExactLevels(candidate, *candidateParamItr)))
+                        constDiscardNotViable = true;
+                }
                 // `long*` vs the same-width `iN*` is accepted but never perfect, so an exactly
                 // spelled overload (f(long*) vs f(i64*)) still wins.
                 if (result == 0 && candidates.size() > 1 && originalArgType.Pointer
@@ -3457,6 +3492,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 ranked.callbackConstUnproven = callbackConstUnproven;
                 ranked.cxxPointeeConstNotViable = cxxPointeeConstNotViable;
                 ranked.unrelatedPointeeNotViable = unrelatedPointeeNotViable;
+                ranked.constDiscardNotViable = constDiscardNotViable;
                 ranked.normalizedCxxXvaluePointerNotViable = normalizedCxxXvaluePointerNotViable;
                 ranked.defaultArgumentNotViable = defaultArgumentNotViable;
                 ranked.userConversions = userConversions;
@@ -3486,6 +3522,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
         {
             std::erase_if(perfect, [](const Ranked& r) { return r.unrelatedPointeeNotViable; });
             std::erase_if(possible, [](const Ranked& r) { return r.unrelatedPointeeNotViable; });
+        }
+        auto constKeepingViable = [](const Ranked& r) { return !r.constDiscardNotViable; };
+        if (std::any_of(perfect.begin(), perfect.end(), constKeepingViable)
+            || std::any_of(possible.begin(), possible.end(), constKeepingViable))
+        {
+            std::erase_if(perfect, [](const Ranked& r) { return r.constDiscardNotViable; });
+            std::erase_if(possible, [](const Ranked& r) { return r.constDiscardNotViable; });
         }
         auto normalizedXvaluePointerViable = [](const Ranked& r) {
             return !r.normalizedCxxXvaluePointerNotViable;
@@ -6779,6 +6822,37 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     "cannot pass const C object argument {} ('{}') to mutable pointer parameter "
                     "'{}': it is read-only C storage, so the parameter could write through it",
                     argIndex + 1, sourceName, candidate.Parameters[argIndex].VariableName));
+            }
+            // #6: a native argument whose pointee const the parameter would discard. A parsed C
+            // parameter compares its exact spelled levels; an unparsed one falls back to the C-origin flag.
+            if (!candidate.IsCxx && !inVariadicRange && !(candidate.IsMethod && argIndex == 0)
+                && argIndex < candidate.Parameters.size())
+            {
+                const TypeAndValue& param = candidate.Parameters[argIndex];
+                const bool arrayDecay = arg.TypeAndValue.ConstArraySize > 0 && !arg.TypeAndValue.Pointer;
+                llvm::Value* passed = ArgumentPointerValue(arg);
+                // A whole const object bound to a mutable `alias T` parameter (#16).
+                if (param.IsAlias && !param.Pointer && !param.IsConstObject() && arg.Storage != nullptr)
+                    if (auto bound = FindConstObjectRoot(arg.Storage); bound.has_value())
+                        LogError(std::format(
+                            "cannot take a mutable pointer to '{}': it is declared const", bound->Name));
+                const TypeAndValue target = ParameterQualification(candidate, param);
+                std::string from, to;
+                // `&L` of a whole const object is #16; an array decaying to its element pointer is #6.
+                const auto root = passed != nullptr && !arrayDecay ? FindConstObjectRoot(passed) : std::nullopt;
+                if (ConversionDiscardsConst(passed,
+                        arg.HasOriginalArgumentType ? arg.OriginalArgumentType : arg.TypeAndValue,
+                        target, from, to, ParameterHasExactLevels(candidate, param)))
+                {
+                    if (root.has_value() && root->Storage == passed)
+                        LogError(std::format("cannot take a mutable pointer to '{}': it is declared const",
+                            root->Name));
+                    else
+                        LogError(std::format(
+                            "cannot pass argument {} ('{}') to parameter '{}' ('{}'): the conversion "
+                            "discards const", candidate.IsMethod ? argIndex : argIndex + 1, from,
+                            param.VariableName, to));
+                }
             }
             if (candidate.IsCxx && !inVariadicRange
                 && !(candidate.IsMethod && argIndex == 0 && candidate.CxxConst)

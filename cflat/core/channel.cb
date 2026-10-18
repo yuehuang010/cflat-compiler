@@ -135,7 +135,7 @@ class channel<T>
             i64  dif    = seq - pos;
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_head, pos, pos + (i64)1)) {
-                    _buf[slot] = item;
+                    if const (is_assignable(T)) _buf[slot] = item; else compile_error("channel<T>: the element type has a const field and cannot be reassigned");
                     __atomic_release_store_i64(seqPtr, pos + (i64)1);
                     return true;
                 }
@@ -159,7 +159,7 @@ class channel<T>
             i64  dif    = seq - (pos + (i64)1);
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_tail, pos, pos + (i64)1)) {
-                    *out = _buf[slot];
+                    if const (is_assignable(T)) *out = _buf[slot]; else compile_error("channel<T>: the element type has a const field and cannot be reassigned");
                     __atomic_release_store_i64(seqPtr, pos + _cap);
                     return true;
                 }
@@ -184,7 +184,7 @@ class channel<T>
             i64  dif    = seq - (pos + (i64)1);
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_tail, pos, pos + (i64)1)) {
-                    *out = _buf[slot];
+                    if const (is_assignable(T)) *out = _buf[slot]; else compile_error("channel<T>: the element type has a const field and cannot be reassigned");
                     __atomic_release_store_i64(seqPtr, pos + _cap);
                     return true;
                 }
@@ -211,7 +211,7 @@ class channel<T>
             i64  dif    = seq - pos;
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_head, pos, pos + (i64)1)) {
-                    _buf[slot] = item;
+                    if const (is_assignable(T)) _buf[slot] = item; else compile_error("channel<T>: the element type has a const field and cannot be reassigned");
                     __atomic_release_store_i64(seqPtr, pos + (i64)1);
                     return;
                 }
@@ -270,7 +270,7 @@ class channel<T>
             i64  dif    = seq - (pos + (i64)1);
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_tail, pos, pos + (i64)1)) {
-                    *out = _buf[slot];
+                    if const (is_assignable(T)) *out = _buf[slot]; else compile_error("channel<T>: the element type has a const field and cannot be reassigned");
                     __atomic_release_store_i64(seqPtr, pos + _cap);
                     return true;
                 }
@@ -301,7 +301,7 @@ class channel<T>
             i64  dif    = seq - pos;
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_head, pos, pos + (i64)1)) {
-                    _buf[slot] = item;
+                    if const (is_assignable(T)) _buf[slot] = item; else compile_error("channel<T>: the element type has a const field and cannot be reassigned");
                     __atomic_release_store_i64(seqPtr, pos + (i64)1);
                     return;
                 }
@@ -346,12 +346,17 @@ class channel<T>
     //   channel<int>* a = ...; channel<int>* b = ...;
     //   a >> b;   // forward everything pushed into *a on into *b
     void operator>>(channel<T>* dst) {
-        void** ctx = (void**)malloc((i64)16);    // {src, dst}; freed by the forwarder
-        ctx[0] = (void*)this;
-        ctx[1] = (void*)dst;
-        function<int(void*)> entry = __channel_forward<T>;
-        Thread t = default;
-        t.start(entry, (void*)ctx);              // detached fire-and-forget forwarder
+        // The forwarder push()es, so keep its instantiation behind the same guard.
+        if const (!is_assignable(T)) compile_error("channel<T>: the element type has a const field and cannot be reassigned");
+        else
+        {
+            void** ctx = (void**)malloc((i64)16);    // {src, dst}; freed by the forwarder
+            ctx[0] = (void*)this;
+            ctx[1] = (void*)dst;
+            function<int(void*)> entry = __channel_forward<T>;
+            Thread t = default;
+            t.start(entry, (void*)ctx);              // detached fire-and-forget forwarder
+        }
     }
 
     // Total slot capacity (the power-of-two the channel was sized to).

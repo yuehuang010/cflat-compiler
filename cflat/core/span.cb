@@ -50,7 +50,7 @@ struct span<T>
     // Read the element at index (carries the noalias contract).
     T    get(i64 index) { return _ptr[index]; }
     // Overwrite the element at index (carries the noalias contract).
-    void set(i64 index, T value) { _ptr[index] = value; }
+    void set(i64 index, T value) { if const (is_assignable(T)) _ptr[index] = value; else compile_error("span<T>: the element type has a const field and cannot be reassigned"); }
     // s[index] - same semantics as get(index).
     T    operator[](i64 index) { return _ptr[index]; }
 

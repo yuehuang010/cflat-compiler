@@ -5045,6 +5045,7 @@ void LLVMBackend::ResetForReanalysis()
     importedEnumTypes_.clear();
     enumDeclSites_.clear();
     typeAliases.clear();
+    typeAliasConstMasks.clear();
     cxxNullptrTAliases_.clear();
     cxxDeductionWrappers_.clear();
     aliasScopeStack_.clear();
@@ -7033,6 +7034,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.Pointer)                o["p"]   = true;
     if (s.ElemPointer)            o["ep"]  = true;
     if (s.PointerDepth)           o["pd"]  = static_cast<int64_t>(s.PointerDepth);
+    if (s.ConstMask)               o["cm"]  = static_cast<int64_t>(s.ConstMask);
     if (s.IsInterface)            o["if"]  = true;
     if (s.IsInterfacePointer)     o["ifp"] = true;
     if (s.IsNullable)             o["nl"]  = true;
@@ -7126,6 +7128,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("p"))  s.Pointer = *v;
     if (auto v = o.getBoolean("ep")) s.ElemPointer = *v;
     if (auto v = o.getInteger("pd")) s.PointerDepth = static_cast<int>(*v);
+    if (auto v = o.getInteger("cm")) s.ConstMask = static_cast<uint8_t>(*v);
     if (auto v = o.getBoolean("if")) s.IsInterface = *v;
     if (auto v = o.getBoolean("ifp"))s.IsInterfacePointer = *v;
     if (auto v = o.getBoolean("nl")) s.IsNullable = *v;
@@ -7592,7 +7595,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     // than silently reused (v6 includes the LSP core-variable replay state; v8 is the non-pointer
     // `alias T` parameter reference ABI; v11 adds closure capture-cleanup MOVE mode 2; v12 adds
     // const floating global admission names; v13 stores function origin metadata).
-    root["version"]   = 13;
+    root["version"]   = 14;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
 #if defined(__APPLE__)
@@ -7636,6 +7639,12 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
         llvm::json::Object obj;
         for (auto& [k, v] : typeAliases) obj[k] = v;
         root["type_aliases"] = std::move(obj);
+    }
+    {
+        llvm::json::Object obj;
+        for (auto& [k, v] : typeAliasConstMasks)
+            if (v != 0) obj[k] = static_cast<int64_t>(v);
+        root["type_alias_const_masks"] = std::move(obj);
     }
     // cxxNullptrTAliases_ - type aliases spelled void* that name std::nullptr_t.
     {
@@ -8074,7 +8083,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 13) return false;  // v12 lacks function origin metadata
+    if (!ver || *ver != 14) return false;
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != coreHash) return false;
 #if defined(__APPLE__)
@@ -8201,6 +8210,10 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     if (auto* obj = root->getObject("type_aliases"))
         for (auto& kv : *obj)
             if (auto v = kv.second.getAsString()) typeAliases[kv.first.str()] = v->str();
+    if (auto* obj = root->getObject("type_alias_const_masks"))
+        for (auto& kv : *obj)
+            if (auto v = kv.second.getAsInteger())
+                typeAliasConstMasks[kv.first.str()] = static_cast<uint8_t>(*v);
     if (auto* arr = root->getArray("cxx_nullptr_t_aliases"))
         for (auto& elem : *arr)
             if (auto v = elem.getAsString()) cxxNullptrTAliases_.insert(v->str());

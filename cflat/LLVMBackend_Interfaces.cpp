@@ -191,14 +191,17 @@ bool LLVMBackend::IsPrimitiveTypeName(const std::string& name)
         return primitives.count(name) > 0;
     }
 
-void LLVMBackend::RegisterTypeAlias(const std::string& alias, const std::string& target)
+void LLVMBackend::RegisterTypeAlias(const std::string& alias, const std::string& target,
+                                    uint8_t constMask)
 {
         if (!aliasScopeStack_.empty())
         {
             aliasScopeStack_.back().typeAliases[alias] = target;
+            aliasScopeStack_.back().typeAliasConstMasks[alias] = constMask;
             return;
         }
         RegisterScopedName(typeAliases, alias, target);
+        RegisterScopedName(typeAliasConstMasks, alias, constMask);
     }
 
 void LLVMBackend::RegisterFunctionTypeAlias(const std::string& alias, const TypeAndValue& target)
@@ -241,6 +244,31 @@ std::string LLVMBackend::ResolveTypeAlias(const std::string& name) const
                         return it->second;
             }
         return name;
+    }
+
+uint8_t LLVMBackend::ResolveTypeAliasConstMask(const std::string& name) const
+{
+        for (const auto& frame : std::ranges::reverse_view(aliasScopeStack_))
+            if (auto it = frame.typeAliasConstMasks.find(name); it != frame.typeAliasConstMasks.end())
+                return it->second;
+        if (const uint8_t* found = FindFirstVisibleScoped(typeAliasConstMasks, name)) return *found;
+        if (!aggregateAliasScopes_.empty())
+            if (size_t dot = name.rfind('.'); dot != std::string::npos && dot > 0 && dot + 1 < name.size()
+                && aggregateAliasMemberNames_.count(name.substr(dot + 1)) != 0)
+            {
+                std::string owner = name.substr(0, dot);
+                auto frame = aggregateAliasScopes_.find(owner);
+                if (frame == aggregateAliasScopes_.end())
+                {
+                    owner = ResolveQualifiedName(ResolveTypeAlias(owner));
+                    frame = aggregateAliasScopes_.find(owner);
+                }
+                if (frame != aggregateAliasScopes_.end())
+                    if (auto it = frame->second.typeAliasConstMasks.find(name.substr(dot + 1));
+                        it != frame->second.typeAliasConstMasks.end())
+                        return it->second;
+            }
+        return 0;
     }
 
 std::string LLVMBackend::ResolveMemberType(const std::string& owner, const std::string& member,

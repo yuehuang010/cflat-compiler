@@ -1,0 +1,93 @@
+// Const phase 3: an argument conversion that discards const is refused for every native callee
+// (plan cflat-const.md section 4 #6), a return that discards it is #7, and the address of a const
+// object passed to a mutable pointer parameter or bound to a mutable alias is #16.
+import "../library/cinterop.c";
+struct C03AWriter
+{
+    int n = 0;
+    void Put(int* p) { *p = n; }
+    C03AWriter() { }
+    C03AWriter(int* seed) { n = *seed; }
+};
+struct C03AVec
+{
+    int v = 0;
+    C03AVec operator+(int* p) { C03AVec r = default; r.v = v + *p; return r; }
+};
+void c03aWrite(int* p) { *p = 1; }
+void c03aWriteMany(int a, int* p) { *p = a; }
+void c03aWriteVoid(void* p) { }
+void c03aWriteDouble(int** pp) { }
+void c03aBind(alias int r) { r = 1; }
+extern void c03aExternWrite(int* p);
+void c03aViewFill(int[] v) { v[0] = 1; }
+void c03aAliasWrite(alias int* r) { *r = 1; }
+int c03aViewRead(const int[] v) { return v[0]; }
+const int C03AGlobal = 4;
+const int[3] C03ATable = { 1, 2, 3 };
+
+expect_error("cannot return '(const int)*' as 'int*': the conversion discards const") {
+    int* c03aLeak((const int)* p) { return p; }
+}
+expect_error("cannot return '(const int)*' as 'int*': the conversion discards const") {
+    int* c03aLeakGlobal() { return &C03AGlobal; }
+}
+expect_error("cannot return '(const int*)*' as 'int**'") {
+    int** c03aLeakDouble((const int*)* pp) { return pp; }
+}
+expect_error("cannot return 'const int[]' as 'int[]': the conversion discards const") {
+    int[] c03aLeakView(const int[] v) { return v; }
+}
+
+extern int main()
+{
+    int x = 1;
+    int* raw = &x;
+    const int* fixedView = raw;
+    (const int)* view = raw;
+    const int L = 3;
+    expect_error("cannot pass argument 1 ('(const int)*') to parameter 'p' ('int*'): the conversion discards const") { c03aWrite(view); }
+    expect_error("cannot pass argument 1 ('(const int)*') to parameter 'p' ('int*')") { c03aWrite(fixedView); }
+    expect_error("cannot pass argument 2 ('(const int)*') to parameter 'p' ('int*')") { c03aWriteMany(1, view); }
+    expect_error("cannot pass argument 1 ('(const int)*') to parameter 'p' ('void*')") { c03aWriteVoid(view); }
+    expect_error("cannot pass argument 1 ('(const int)*') to parameter 'p' ('int*')") { c03aWrite(C03ATable); }
+    expect_error("cannot pass argument 1 ('(const int)*') to parameter 'p' ('int*')") { c03aExternWrite(view); }
+    expect_error("cannot pass argument 1 ('(const int)*') to parameter 'p' ('int*')") { t183KCTakeMutable(view); }
+    expect_error("cannot take a mutable pointer to 'slot': it is declared const") { const int* slot = raw; c03aWriteDouble(&slot); }
+    expect_error("cannot pass argument 1 ('(const int*)*') to parameter 'pp' ('int**')") { const int* slot = raw; (const int*)* ps = &slot; c03aWriteDouble(ps); }
+
+    // Methods, constructors, operators.
+    C03AWriter w = default;
+    C03AVec v = default;
+    expect_error("cannot pass argument 1 ('(const int)*') to parameter 'p' ('int*')") { w.Put(view); }
+    expect_error("cannot pass argument 1 ('(const int)*') to parameter 'seed' ('int*')") { C03AWriter w2 = C03AWriter(view); }
+    expect_error("cannot pass argument 1 ('(const int)*') to parameter 'p' ('int*')") { C03AVec r = v + view; }
+
+    // Calls through a function value or a closure.
+    function<void(int*)> fp = c03aWrite;
+    Lambda<void(int*)> lam = (int* p) => { *p = 3; };
+    expect_error("cannot pass argument 1 ('(const int)*') to parameter '1' ('int*')") { fp(view); }
+    expect_error("cannot pass argument 1 ('(const int)*') to parameter '1' ('int*')") { lam(view); }
+
+    // The address of a const object, or the object bound to a mutable alias (#16).
+    expect_error("cannot take a mutable pointer to 'L': it is declared const") { c03aBind(L); }
+    expect_error("cannot take a mutable pointer to 'L': it is declared const") { alias int bound = L; }
+    expect_error("cannot take a mutable pointer to 'L': it is declared const") { c03aWrite(&L); }
+    expect_error("cannot take a mutable pointer to 'C03AGlobal': it is declared const") { c03aWrite(&C03AGlobal); }
+    expect_error("cannot take a mutable pointer to 'L': it is declared const") { w.Put(&L); }
+
+    // Views, pointer aliases, and C parameters spelled at several levels.
+    int[2] pair = { 1, 2 };
+    const int[] readPair = pair;
+    int total = c03aViewRead(readPair) + c03aViewRead(pair);
+    expect_error("cannot pass argument 1 ('const int[]') to parameter 'v' ('int[]'): the conversion discards const") { c03aViewFill(readPair); }
+    expect_error("cannot pass argument 1 ('const int[]') to parameter 'v' ('int[]')") { c03aViewFill(C03ATable); }
+    expect_error("cannot pass argument 1 ('(const int)*') to parameter 'r' ('int*')") { c03aAliasWrite(view); }
+    (const int)* cview = raw;
+    (const int)** cviewSlot = &cview;
+    total += c03KCReadMulti(cviewSlot) + c03KCReadAll(&raw) + c03KCReadAll(cviewSlot);
+    expect_error("cannot pass argument 1 ('int**') to parameter 'p' ('(const int)**'): the conversion discards const") { c03KCReadMulti(&raw); }
+    total += c03KCSlotRead(&raw);
+    expect_error("cannot pass argument 1 ('(const int)**') to parameter 'p' ('int* const*'): the conversion discards const") { c03KCSlotRead(&cview); }
+    return 0;
+}

@@ -1,6 +1,9 @@
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/Analysis/ValueTracking.h>
+#include <llvm/IR/GetElementPtrTypeIterator.h>
+#include "TypeMangling.h"
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
@@ -1712,6 +1715,578 @@ const LLVMBackend::NamedVariable* LLVMBackend::FindVariableByStorage(const llvm:
         }
         return nullptr;
     }
+
+bool LLVMBackend::IsNativeConstObject(const TypeAndValue& tv) const
+{
+        return tv.IsConstObject() && !IsCxxRecord(tv.TypeName);
+    }
+
+bool LLVMBackend::IsNativeConstGlobal(const NamedVariable& globalNV) const
+{
+        auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(globalNV.Storage);
+        if (global == nullptr || !IsNativeConstObject(globalNV.TypeAndValue)) return false;
+        const std::string symbol = global->getName().str();
+        return cGlobalSymbols_.count(symbol) == 0 && cxxConstGlobalSymbols_.count(symbol) == 0;
+    }
+
+std::optional<LLVMBackend::ConstObjectRoot> LLVMBackend::FindConstObjectRoot(
+    const llvm::Value* address) const
+{
+        if (address == nullptr) return std::nullopt;
+        // A binding whose storage IS the address or a GEP base of it first: a range-for element
+        // borrow, or a lambda's by-value env slot (the slot is itself a GEP off the env).
+        for (const llvm::Value* step = address; step != nullptr;)
+        {
+            for (auto frame = stackNamedVariable.rbegin(); frame != stackNamedVariable.rend(); ++frame)
+                for (const auto& [varName, nv] : frame->namedVariable)
+                    if (nv.Storage == step && IsNativeConstObject(nv.TypeAndValue))
+                        return ConstObjectRoot{ varName, nv.Storage, nv.BaseType };
+            if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(step)) step = gep->getPointerOperand();
+            else step = nullptr;
+        }
+        const llvm::Value* root = llvm::getUnderlyingObject(address, 0);
+        if (llvm::isa<llvm::AllocaInst>(root) || llvm::isa<llvm::Argument>(root))
+        {
+            for (auto frame = stackNamedVariable.rbegin(); frame != stackNamedVariable.rend(); ++frame)
+            {
+                for (const auto& [varName, nv] : frame->namedVariable)
+                    if (nv.Storage == root && IsNativeConstObject(nv.TypeAndValue))
+                        return ConstObjectRoot{ varName, nv.Storage, nv.BaseType };
+                for (const auto& [varName, nv] : frame->functionArgument)
+                    if (nv.Storage == root && IsNativeConstObject(nv.TypeAndValue))
+                        return ConstObjectRoot{ varName, nv.Storage, nv.BaseType };
+            }
+            return std::nullopt;
+        }
+        // A lambda's by-reference capture of a const object: its storage (struct) or decayed
+        // element pointer (array) is the address loaded from the env, so match that load exactly.
+        if (llvm::isa<llvm::LoadInst>(root))
+        {
+            for (auto frame = stackNamedVariable.rbegin(); frame != stackNamedVariable.rend(); ++frame)
+                for (const auto& [varName, nv] : frame->namedVariable)
+                    if (nv.IsClosureRefCapture && IsNativeConstObject(nv.TypeAndValue)
+                        && (nv.Storage == root || (nv.Storage == nullptr && nv.Primary == root)))
+                        return ConstObjectRoot{ varName, const_cast<llvm::Value*>(root), nv.BaseType };
+            return std::nullopt;
+        }
+        auto* global = llvm::dyn_cast<llvm::GlobalVariable>(root);
+        if (global == nullptr) return std::nullopt;
+        const std::string symbol = global->getName().str();
+        if (cGlobalSymbols_.count(symbol) != 0 || cxxConstGlobalSymbols_.count(symbol) != 0)
+            return std::nullopt;
+        // The symbol name is the usual key; scan only when a namespaced key spells it differently.
+        if (auto direct = globalNamedVariable.find(symbol);
+            direct != globalNamedVariable.end() && direct->second == global)
+        {
+            auto tv = globalVariableTypes.find(symbol);
+            if (tv != globalVariableTypes.end() && IsNativeConstObject(tv->second))
+                return ConstObjectRoot{ symbol, direct->second, global->getValueType() };
+            return std::nullopt;
+        }
+        for (const auto& [varName, slot] : globalNamedVariable)
+        {
+            if (slot != global) continue;
+            auto tv = globalVariableTypes.find(varName);
+            if (tv != globalVariableTypes.end() && IsNativeConstObject(tv->second))
+                return ConstObjectRoot{ varName, slot, slot->getValueType() };
+        }
+        return std::nullopt;
+    }
+
+namespace
+{
+    // The pointee level of a pointer (or view) slot is const: one bit below the object bit; a
+    // view's object bit is its element.
+    bool ConstSlotPointeeIsConst(const LLVMBackend::TypeAndValue& tv)
+    {
+        if (tv.IsArrayView) return tv.IsConstObject();
+        const int depth = tv.ValuePointerDepth();
+        return depth >= 1 && ((tv.ConstMask >> (depth - 1)) & 1u) != 0;
+    }
+}
+
+/*
+ * The declared type of the slot a pointer was loaded from: a live binding, a native global, a
+ * native struct field (through any array steps), or an element of an array binding. Null when
+ * the slot is anything else (pointer arithmetic, a temporary, a C/C++ object).
+ */
+const LLVMBackend::TypeAndValue* LLVMBackend::DeclaredConstSlot(const llvm::Value* slot,
+    std::string& name, int depth) const
+{
+        if (slot == nullptr || depth > 8) return nullptr;
+        if (const auto* nv = FindVariableByStorage(slot))
+        {
+            name = nv->TypeAndValue.VariableName;
+            return &nv->TypeAndValue;
+        }
+        if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(slot))
+        {
+            const std::string symbol = global->getName().str();
+            if (cGlobalSymbols_.count(symbol) != 0 || cxxConstGlobalSymbols_.count(symbol) != 0)
+                return nullptr;
+            for (const auto& [varName, storage] : globalNamedVariable)
+            {
+                if (storage != global) continue;
+                auto tv = globalVariableTypes.find(varName);
+                if (tv == globalVariableTypes.end()) return nullptr;
+                name = varName;
+                return &tv->second;
+            }
+            return nullptr;
+        }
+        auto* gep = llvm::dyn_cast<llvm::GEPOperator>(slot);
+        if (gep == nullptr || gep->getNumIndices() < 2) return nullptr;
+        const LLVMBackend::TypeAndValue* field = nullptr;
+        bool firstIndex = true;
+        for (auto it = llvm::gep_type_begin(gep), end = llvm::gep_type_end(gep); it != end; ++it)
+        {
+            auto* index = llvm::dyn_cast<llvm::ConstantInt>(it.getOperand());
+            if (firstIndex)
+            {
+                firstIndex = false;
+                if (index == nullptr || !index->isZero()) return nullptr;
+                continue;
+            }
+            auto* structType = it.getStructTypeOrNull();
+            if (structType == nullptr) continue;     // a fixed-array element keeps the declaration
+            if (index == nullptr) return nullptr;
+            if (!structType->hasName())
+            {
+                // A view's fat {ptr, len} slot: the view binding's own declaration.
+                std::string baseName;
+                const auto* base = DeclaredConstSlot(gep->getPointerOperand(), baseName, depth + 1);
+                if (field != nullptr || base == nullptr || !base->IsArrayView) return nullptr;
+                name = baseName;
+                return base;
+            }
+            if (IsCxxRecord(structType->getName().str())) return nullptr;
+            field = FindDeclaredFieldOfStructType(structType, index->getZExtValue());
+            if (field == nullptr) return nullptr;
+            name = field->VariableName;
+        }
+        if (field != nullptr) return field;
+        return DeclaredConstSlot(gep->getPointerOperand(), name, depth + 1);
+}
+
+LLVMBackend::ConstWriteCause LLVMBackend::FindConstWriteCause(const llvm::Value* address) const
+{
+        ConstWriteCause cause;
+        if (address == nullptr) return cause;
+        // Const native fields on the GEP chain, innermost first. The running constructor's own
+        // fields (first struct step off its `this`) are still being built.
+        const llvm::Value* base = address;
+        bool fieldStep = false;     // the address is a field (of a field ...) of what `base` holds
+        while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(base))
+        {
+            const bool ownThis = IsConstructingStorage(gep->getPointerOperand());
+            const TypeAndValue* constField = nullptr;
+            if (const llvm::MDNode* md = llvm::isa<llvm::Instruction>(gep)
+                    ? llvm::cast<llvm::Instruction>(gep)->getMetadata("cflat.cxx.field") : nullptr)
+            {
+                // Offset-layout field address: one field, named by the metadata.
+                fieldStep = true;
+                auto* owner = md->getNumOperands() == 2 ? llvm::dyn_cast<llvm::MDString>(md->getOperand(0)) : nullptr;
+                const TypeAndValue* field = FindDeclaredFieldTypeAndValueForStorage(gep);
+                if (owner != nullptr && field != nullptr && !IsCxxRecord(owner->getString().str())
+                    && IsNativeConstObject(*field) && !ownThis)
+                    constField = field;
+            }
+            else
+            {
+                bool firstStruct = true;
+                for (auto it = llvm::gep_type_begin(gep), end = llvm::gep_type_end(gep); it != end; ++it)
+                {
+                    auto* structType = it.getStructTypeOrNull();
+                    if (structType == nullptr) continue;
+                    fieldStep = true;
+                    const bool exempt = ownThis && firstStruct;
+                    firstStruct = false;
+                    auto* index = llvm::dyn_cast<llvm::ConstantInt>(it.getOperand());
+                    if (index == nullptr || !structType->hasName()
+                        || IsCxxRecord(structType->getName().str()))
+                        continue;
+                    const TypeAndValue* field = FindDeclaredFieldOfStructType(structType, index->getZExtValue());
+                    if (field != nullptr && IsNativeConstObject(*field) && !exempt) constField = field;
+                }
+            }
+            if (constField != nullptr)
+            {
+                cause.Kind = ConstWriteCause::CauseKind::Field;
+                cause.Name = constField->VariableName;
+                return cause;
+            }
+            base = gep->getPointerOperand();
+        }
+        if (auto root = FindConstObjectRoot(address))
+        {
+            cause.Kind = ConstWriteCause::CauseKind::Object;
+            cause.Root = *root;
+            return cause;
+        }
+        // An explicit cast decides the qualification of everything behind it (R7 A).
+        std::string pointerName;
+        if (auto* inst = llvm::dyn_cast<llvm::Instruction>(base);
+            inst != nullptr && inst->getMetadata("cflat.const.cast") != nullptr)
+        {
+            if ((ValueConstLevels(base, pointerName) & 1u) == 0) return cause;
+            cause.Kind = ConstWriteCause::CauseKind::ThroughPointer;
+            cause.Name = pointerName;
+            return cause;
+        }
+        /*
+         * A pointer value P. Refused on a field path off it (`ps->n`, `get()->n`, `(c ? p : q)->n`)
+         * when P's type has a const pointee, when P was read out of a slot lying strictly inside
+         * const storage (transitive const: `*s.p`), or (bare `*p`, `p[i]`, `**pp`) when the
+         * pointee level P reaches is const.
+         */
+        if (fieldStep && PointerValuePointeeConst(base, pointerName))
+        {
+            cause.Kind = ConstWriteCause::CauseKind::ThroughPointer;
+            cause.Name = pointerName;
+            return cause;
+        }
+        if (auto* load = llvm::dyn_cast<llvm::LoadInst>(base))
+        {
+            const llvm::Value* slot = load->getPointerOperand();
+            ConstWriteCause holder = FindConstWriteCause(slot);
+            if (holder.Kind != ConstWriteCause::CauseKind::None
+                && !(holder.Kind == ConstWriteCause::CauseKind::Object && holder.Root.Storage == slot))
+                return holder;
+        }
+        if (!fieldStep && PointerValuePointeeConst(base, pointerName))
+        {
+            cause.Kind = ConstWriteCause::CauseKind::ThroughPointer;
+            cause.Name = pointerName;
+        }
+        return cause;
+}
+
+namespace
+{
+    // Top-relative const levels of a declared type: bit 0 = the declared object, bit k = the
+    // k-th level reached through it. Spelled masks are downward closed, so a set bit fills deeper.
+    uint8_t DeclaredTopLevels(const LLVMBackend::TypeAndValue& tv)
+    {
+        uint8_t levels = 0;
+        if (tv.IsArrayView)
+        {
+            // A view's object bit is its element: the view slot and its elements share it.
+            const int depth = tv.ElemPointer ? 1 : 0;
+            for (int j = 0; j <= depth + 1; ++j)
+            {
+                const int bit = j == 0 ? depth : depth - (j - 1);
+                if (((tv.ConstMask >> bit) & 1u) != 0) levels |= static_cast<uint8_t>(1u << j);
+            }
+        }
+        else
+        {
+            const int depth = tv.ValuePointerDepth();
+            for (int j = 0; j <= depth; ++j)
+                if (((tv.ConstMask >> (depth - j)) & 1u) != 0) levels |= static_cast<uint8_t>(1u << j);
+        }
+        for (int j = 0; j < 8; ++j)
+            if (((levels >> j) & 1u) != 0) return static_cast<uint8_t>(0xFFu << j);
+        return 0;
+    }
+
+    uint8_t LevelsBelow(uint8_t levels) { return static_cast<uint8_t>((levels >> 1) | (levels & 0x80u)); }
+}
+
+uint8_t LLVMBackend::DeclaredPointeeConstLevels(const TypeAndValue& tv) const
+{
+        if (IsCxxRecord(tv.TypeName)) return 0;
+        return LevelsBelow(DeclaredTopLevels(tv));
+}
+
+/*
+ * Const levels of the object stored at `address` (bit 0) and of what its value reaches (bit k):
+ * a const write cause on the address makes everything behind it const (transitive, R11);
+ * otherwise a declared slot gives its spelled levels, and a computed address its value's.
+ */
+uint8_t LLVMBackend::StoredConstLevels(const llvm::Value* address, std::string& name, int depth) const
+{
+        if (address == nullptr || depth > 8) return 0;
+        if (auto* inst = llvm::dyn_cast<llvm::Instruction>(address);
+            inst != nullptr && inst->getMetadata("cflat.const.cast") != nullptr)
+            return ValueConstLevels(address, name, depth + 1);
+        if (auto cause = FindConstWriteCause(address); cause.Kind != ConstWriteCause::CauseKind::None)
+        {
+            name = cause.Kind == ConstWriteCause::CauseKind::Object ? cause.Root.Name : cause.Name;
+            return 0xFF;
+        }
+        if (llvm::isa<llvm::AllocaInst>(address) || llvm::isa<llvm::GlobalVariable>(address)
+            || llvm::isa<llvm::GEPOperator>(address))
+        {
+            std::string slotName;
+            if (const auto* tv = DeclaredConstSlot(address, slotName))
+            {
+                if (IsCxxRecord(tv->TypeName)) return 0;
+                name = slotName;
+                return DeclaredTopLevels(*tv);
+            }
+            // An unnamed spill slot (a parenthesized pointer expression): what was stored in it.
+            if (auto* spill = llvm::dyn_cast<llvm::AllocaInst>(address))
+            {
+                const llvm::StoreInst* only = nullptr;
+                for (const llvm::User* user : spill->users())
+                    if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                        store != nullptr && store->getPointerOperand() == spill)
+                    {
+                        if (only != nullptr) return 0;
+                        only = store;
+                    }
+                if (only == nullptr || !only->getValueOperand()->getType()->isPointerTy()) return 0;
+                return static_cast<uint8_t>(StoredConstLevels(only->getValueOperand(), name, depth + 1) << 1);
+            }
+            if (!llvm::isa<llvm::GEPOperator>(address)) return 0;
+        }
+        return ValueConstLevels(address, name, depth + 1);
+}
+
+/*
+ * Const levels behind pointer value `pointer` (bit 0 = `*pointer`, bit 1 = `**pointer`), from the
+ * expression that produced it: an explicit cast or member-access receiver stamp, the slot it was
+ * loaded from, a call's return type, pointer arithmetic over a pointer, or any arm of a join.
+ */
+uint8_t LLVMBackend::ValueConstLevels(const llvm::Value* pointer, std::string& name, int depth) const
+{
+        if (pointer == nullptr || depth > 8) return 0;
+        if (auto* inst = llvm::dyn_cast<llvm::Instruction>(pointer))
+        {
+            if (const llvm::MDNode* md = inst->getMetadata("cflat.const.cast"))
+            {
+                uint8_t levels = 0;
+                if (md->getNumOperands() == 2)
+                {
+                    if (auto* text = llvm::dyn_cast<llvm::MDString>(md->getOperand(0)))
+                        name = text->getString().str();
+                    if (auto* c = llvm::mdconst::dyn_extract<llvm::ConstantInt>(md->getOperand(1)))
+                        levels = static_cast<uint8_t>(c->getZExtValue());
+                }
+                return levels;
+            }
+            if (inst->getMetadata("cflat.pointee.mutable") != nullptr) return 0;
+            if (const llvm::MDNode* md = inst->getMetadata("cflat.pointee.const"))
+            {
+                if (md->getNumOperands() == 1)
+                    if (auto* text = llvm::dyn_cast<llvm::MDString>(md->getOperand(0)))
+                        name = text->getString().str();
+                return 0xFF;
+            }
+        }
+        if (auto* load = llvm::dyn_cast<llvm::LoadInst>(pointer))
+            return LevelsBelow(StoredConstLevels(load->getPointerOperand(), name, depth + 1));
+        if (auto* call = llvm::dyn_cast<llvm::CallInst>(pointer))
+        {
+            const auto* symbol = FindSymbolForFunction(call->getCalledFunction());
+            if (symbol == nullptr) return 0;
+            const uint8_t levels = DeclaredPointeeConstLevels(symbol->ReturnType);
+            if (levels == 0) return 0;
+            name = call->getCalledFunction()->getName().str();
+            if (std::string spelled = SpellFunctionSymbol(*this, name); !spelled.empty()) name = spelled;
+            return levels;
+        }
+        // A join is const where either arm is (C++: the composite pointer type).
+        if (auto* phi = llvm::dyn_cast<llvm::PHINode>(pointer))
+        {
+            uint8_t levels = 0;
+            for (const llvm::Value* arm : phi->incoming_values())
+            {
+                std::string armName;
+                const uint8_t armLevels = StoredConstLevels(arm, armName, depth + 1);
+                if (armLevels != 0 && levels == 0) name = armName;
+                levels |= armLevels;
+            }
+            return levels;
+        }
+        if (auto* select = llvm::dyn_cast<llvm::SelectInst>(pointer))
+        {
+            std::string trueName, falseName;
+            const uint8_t t = StoredConstLevels(select->getTrueValue(), trueName, depth + 1);
+            const uint8_t f = StoredConstLevels(select->getFalseValue(), falseName, depth + 1);
+            name = t != 0 ? trueName : falseName;
+            return static_cast<uint8_t>(t | f);
+        }
+        // Pointer arithmetic and element addressing over a pointer keep its qualification.
+        if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(pointer))
+        {
+            for (auto it = llvm::gep_type_begin(gep), end = llvm::gep_type_end(gep); it != end; ++it)
+                if (it.getStructTypeOrNull() != nullptr) return 0;
+            return StoredConstLevels(gep->getPointerOperand(), name, depth + 1);
+        }
+        return 0;
+}
+
+bool LLVMBackend::PointerValuePointeeConst(const llvm::Value* pointer, std::string& name, int depth) const
+{
+        return (ValueConstLevels(pointer, name, depth) & 1u) != 0;
+}
+
+/*
+ * C++ [conv.qual] over pointee levels 0..depth-1 (top-relative): a level const in the source
+ * must be const in the target, and a target that adds const below the first level needs every
+ * level above it const too (`int** -> (const int)**` is refused, `-> (const int*)*` is not).
+ */
+bool LLVMBackend::QualificationDiscardsConst(uint8_t source, uint8_t target, int depth)
+{
+        for (int j = 0; j < depth; ++j)
+        {
+            const bool s = ((source >> j) & 1u) != 0;
+            const bool t = ((target >> j) & 1u) != 0;
+            if (s && !t) return true;
+            if (t && !s)
+                for (int k = 0; k < j; ++k)
+                    if (((target >> k) & 1u) == 0) return true;
+        }
+        return false;
+}
+
+/*
+ * Whether the implicit conversion of pointer value `value` (expression type `source`) to the
+ * declared pointer type `target` discards const (#5-#7). Fills both spellings for the message;
+ * a value's own top-level const is not part of it. C++ targets and shapes are phase 5.
+ */
+bool LLVMBackend::ConversionDiscardsConst(const llvm::Value* value, const TypeAndValue& source,
+    const TypeAndValue& target, std::string& sourceSpelled, std::string& targetSpelled,
+    bool exactTargetLevels) const
+{
+        if (value == nullptr || !value->getType()->isPointerTy()
+            || llvm::isa<llvm::ConstantPointerNull>(value))
+            return false;
+        // A view passes its element pointer; `alias T*` binds a copy of the pointer value.
+        if (!(target.Pointer || target.IsArrayView) || target.IsFunctionPointer || target.IsInterface
+            || (target.IsAlias && !target.Pointer) || target.IsRvalueRef || target.IsCxxRefToPointer
+            || target.IsCxxConstRef || IsCxxRecord(target.TypeName) || IsCxxRecord(source.TypeName))
+            return false;
+        const int depth = target.IsArrayView ? (target.ElemPointer ? 2 : 1) : target.ValuePointerDepth();
+        if (depth <= 0) return false;
+        std::string name;
+        const uint8_t from = StoredConstLevels(value, name);
+        uint8_t to = 0;
+        if (exactTargetLevels)
+        {
+            // Exact top-relative pointee levels: bit j = ConstMask bit (depth - 1 - j), no fill.
+            for (int j = 0; j < depth; ++j)
+                if (((target.ConstMask >> (depth - 1 - j)) & 1u) != 0) to |= static_cast<uint8_t>(1u << j);
+        }
+        else
+            to = DeclaredPointeeConstLevels(target);
+        if (!QualificationDiscardsConst(from, to, depth)) return false;
+        TypeAndValue shown = source.TypeName.empty() || target.IsArrayView ? target : source;
+        shown.DiagnosticTypeName.clear();
+        if (target.IsArrayView)
+        {
+            // Shown as a view of the source's element qualification.
+            shown.ConstMask = 0;
+            for (int j = 0; j < depth; ++j)
+                if (((from >> j) & 1u) != 0) shown.ConstMask |= static_cast<uint8_t>(1u << (depth - 1 - j));
+        }
+        else if (!shown.Pointer || shown.ValuePointerDepth() != depth)
+        {
+            // An array decays, `&x` and the like: show the source at the target's depth.
+            shown.Pointer = true;
+            shown.ElemPointer = depth >= 2;
+            shown.PointerDepth = depth;
+            shown.ConstArraySize = 0;
+            shown.ConstInnerDimensions.clear();
+            shown.IsArrayView = false;
+        }
+        if (!target.IsArrayView)
+        {
+            shown.ConstMask = 0;
+            for (int j = 0; j < depth; ++j)
+                if (((from >> j) & 1u) != 0) shown.ConstMask |= static_cast<uint8_t>(1u << (depth - 1 - j));
+        }
+        sourceSpelled = SpellTypeForSymbolDump(*this, shown);
+        TypeAndValue declared = target;
+        declared.DiagnosticTypeName.clear();
+        targetSpelled = SpellTypeForSymbolDump(*this, declared);
+        // A C level set no CFlat spelling covers (`int *const *`): spell it the C way.
+        const uint8_t pointeeMask = static_cast<uint8_t>(target.ConstMask & ((1u << depth) - 1u));
+        if (exactTargetLevels && (pointeeMask & (pointeeMask + 1u)) != 0)
+        {
+            TypeAndValue base = target;
+            base.DiagnosticTypeName.clear();
+            base.Pointer = false;
+            base.ElemPointer = false;
+            base.PointerDepth = 0;
+            base.ConstMask = 0;
+            targetSpelled = ((pointeeMask & 1u) != 0 ? "const " : "") + SpellTypeForSymbolDump(*this, base);
+            for (int k = 1; k <= depth; ++k)
+                targetSpelled += k < depth && ((pointeeMask >> k) & 1u) != 0 ? "* const" : "*";
+        }
+        return true;
+}
+
+void LLVMBackend::MarkPointeeQualification(llvm::Value* pointer, const TypeAndValue& tv,
+                                           const std::string& name)
+{
+        auto* inst = llvm::dyn_cast_or_null<llvm::Instruction>(pointer);
+        if (inst == nullptr || !inst->getType()->isPointerTy() || tv.TypeName.empty()) return;
+        // Casts reuse the operand's instruction, so this access's own (outermost) type decides:
+        // a const pointee re-qualifies even after an inner cast dropped it.
+        if (ConstSlotPointeeIsConst(tv) && !IsCxxRecord(tv.TypeName))
+        {
+            inst->setMetadata("cflat.const.cast", nullptr);
+            inst->setMetadata("cflat.pointee.mutable", nullptr);
+            inst->setMetadata("cflat.pointee.const",
+                llvm::MDNode::get(*context, { llvm::MDString::get(*context, name) }));
+        }
+        else if (inst->getMetadata("cflat.const.cast") == nullptr)
+        {
+            inst->setMetadata("cflat.pointee.const", nullptr);
+            inst->setMetadata("cflat.pointee.mutable", llvm::MDNode::get(*context, {}));
+        }
+}
+
+llvm::Value* LLVMBackend::MarkCastQualification(llvm::Value* pointer, const TypeAndValue& tv,
+                                                const std::string& text)
+{
+        if (pointer == nullptr || !pointer->getType()->isPointerTy()) return pointer;
+        auto* inst = llvm::dyn_cast<llvm::Instruction>(pointer);
+        // Storage itself (a slot, a global, a parameter) is shared by every use: stamp a copy.
+        const uint8_t levels = DeclaredPointeeConstLevels(tv);
+        if (inst == nullptr || llvm::isa<llvm::AllocaInst>(inst))
+        {
+            std::string current;
+            const int depth = tv.IsArrayView ? (tv.ElemPointer ? 2 : 1) : tv.ValuePointerDepth();
+            const uint8_t depthMask = static_cast<uint8_t>((1u << depth) - 1u);
+            if (builder->GetInsertBlock() == nullptr
+                || ((StoredConstLevels(pointer, current) ^ levels) & depthMask) == 0)
+                return pointer;
+            llvm::Value* zero = builder->getInt64(0);
+            inst = llvm::GetElementPtrInst::Create(llvm::Type::getInt8Ty(*context), pointer,
+                llvm::ArrayRef<llvm::Value*>(zero), llvm::Twine("cast.qual"));
+            builder->Insert(inst);
+            pointer = inst;
+        }
+        inst->setMetadata("cflat.pointee.const", nullptr);
+        inst->setMetadata("cflat.pointee.mutable", nullptr);
+        inst->setMetadata("cflat.const.cast", llvm::MDNode::get(*context,
+            { llvm::MDString::get(*context, text),
+              llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(llvm::Type::getInt8Ty(*context), levels)) }));
+        return pointer;
+}
+
+bool LLVMBackend::FindNativeConstField(const std::string& typeName, std::string& field) const
+{
+        if (IsCxxRecord(typeName)) return false;
+        auto it = dataStructures.find(typeName);
+        if (it == dataStructures.end()) return false;
+        for (const auto& f : it->second.StructFields)
+        {
+            if (IsNativeConstObject(f))
+            {
+                field = f.VariableName;
+                return true;
+            }
+            // By-value members only: a pointer or view refers to someone else's object.
+            if (!f.Pointer && !f.IsArrayView && f.TypeName != typeName
+                && FindNativeConstField(f.TypeName, field))
+                return true;
+        }
+        return false;
+}
 
 bool LLVMBackend::BorrowProofRetiredByRebind(const NamedVariable& nv) const
 {

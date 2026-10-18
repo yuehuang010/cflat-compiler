@@ -1870,7 +1870,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     if (!ann.Value.empty()) annSig += "(" + ann.Value + ")";
                     annSig += "] ";
                 }
-                std::string typeSig = SpellType(*compiler, field);
+                std::string typeSig = SpellTypeForSymbolDump(*compiler, field);
                 LLVMBackend::TypeAndValue ownerType;
                 ownerType.TypeName = structName;
                 const std::string displayFieldName = SpellType(*compiler, ownerType) + "." + field.VariableName;
@@ -4168,7 +4168,7 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
                     if (!ann.Value.empty()) annSig += "(" + ann.Value + ")";
                     annSig += "] ";
                 }
-                std::string typeSig = SpellType(*compiler, field);
+                std::string typeSig = SpellTypeForSymbolDump(*compiler, field);
                 LLVMBackend::TypeAndValue ownerType;
                 ownerType.TypeName = name;
                 const std::string displayFieldName = SpellType(*compiler, ownerType) + "." + field.VariableName;
@@ -4594,7 +4594,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     if (!ann.Value.empty()) annSig += "(" + ann.Value + ")";
                     annSig += "] ";
                 }
-                std::string typeSig = SpellType(*compiler, field);
+                std::string typeSig = SpellTypeForSymbolDump(*compiler, field);
                 LLVMBackend::TypeAndValue ownerType;
                 ownerType.TypeName = structName;
                 const std::string displayFieldName = SpellType(*compiler, ownerType) + "." + field.VariableName;
@@ -5227,7 +5227,11 @@ void MainListener::EmitCppStructConstructorThunk(
             }
         }
 
-        if (body != nullptr) ParseBlockItemList(body);
+        if (body != nullptr)
+        {
+            LLVMBackend::ConstructingScope constructing(compiler, dst);
+            ParseBlockItemList(body);
+        }
         compiler->CreateReturnCall(nullptr);
         compiler->CreateBlockBreak(nullptr, true);
         compiler->ClearCurrentSubprogram();
@@ -5647,9 +5651,12 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
         thisTv.Pointer = true;
         compiler->RegisterThisPointer(thisTv, thisAlloca, structLLVMType);
 
-        // Parse user-written constructor body
-        if (auto* blockItemList = func->compoundStatement()->blockItemList())
-            ParseBlockItemList(blockItemList);
+        // Parse user-written constructor body; its own const fields are still being built.
+        {
+            LLVMBackend::ConstructingScope constructing(compiler, thisAlloca);
+            if (auto* blockItemList = func->compoundStatement()->blockItemList())
+                ParseBlockItemList(blockItemList);
+        }
 
         // Classified aggregates already occupy the caller's sret slot.
         if (cxxSretCtor)

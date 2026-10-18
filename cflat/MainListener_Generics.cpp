@@ -751,6 +751,8 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
             // the mangled "list$string" and queues the instantiation.
             bool retPtr = fpSpec->pointer() != nullptr;
             int retStars = PointerDepthOf(fpSpec->pointer());
+            ValidateConstAfterPointerStar(fpSpec->pointer(),
+                SpelledTypeNameBase(fpSpec->typeSpecifier(), fpSpec->multiWordTypeSuffix()));
             tv.FuncPtrReturnTypeName = ResolveSigComponentCodegen(
                 fpSpec->typeSpecifier(), retPtr, fpSpec->multiWordTypeSuffix());
             tv.FuncPtrReturnPointer  = retPtr;
@@ -770,6 +772,8 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
                     LLVMBackend::TypeAndValue::FuncPtrParam p;
                     bool pPtr = param->pointer() != nullptr;
                     int pStars = PointerDepthOf(param->pointer());
+                    ValidateConstAfterPointerStar(param->pointer(),
+                        SpelledTypeNameBase(param->typeSpecifier(), param->multiWordTypeSuffix()));
                     p.TypeName = ResolveSigComponentCodegen(
                         param->typeSpecifier(), pPtr, param->multiWordTypeSuffix());
                     p.Pointer  = pPtr;

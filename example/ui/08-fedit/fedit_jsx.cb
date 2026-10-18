@@ -363,7 +363,7 @@ class Editor : IComponent
         int startPos = nativeSelectionStart(EDITOR_KEY) + 1;
         if (startPos < 0) startPos = 0;
         if (startPos > n) startPos = n;
-        char* hit = strstr(content.data() + startPos, this.findText.data());
+        (const char)* hit = strstr(content.data() + startPos, this.findText.data());
         if (hit == nullptr) hit = strstr(content.data(), this.findText.data());
         if (hit == nullptr) return;
         int pos = (int)(hit - content.data());

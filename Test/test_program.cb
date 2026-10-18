@@ -591,7 +591,7 @@ int g_stdin_idx = 0;
 char* provide_stdin() {
     int idx = g_stdin_idx;
     g_stdin_idx++;
-    const char* src = nullptr;
+    (const char)* src = nullptr;
     if (idx == 0) src = "hello\n";
     else if (idx == 1) src = "world\n";
     else if (idx == 2) src = "foo\n";
@@ -608,7 +608,7 @@ int g_scanf_idx = 0;
 char* provide_stdin_scanf() {
     int idx = g_scanf_idx;
     g_scanf_idx++;
-    const char* src = nullptr;
+    (const char)* src = nullptr;
     if (idx == 0) src = "10\n";
     else if (idx == 1) src = "20\n";
     else if (idx == 2) src = "30\n";

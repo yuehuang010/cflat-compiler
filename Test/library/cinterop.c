@@ -274,3 +274,9 @@ int t174_al_x(int i) { return t174AlArr[i].x; }
 struct T174Al16 t174_al_id(struct T174Al16 v) { v.x += 1; return v; }
 struct T174Big t174_big_bump(struct T174Big b) { b.v[0] += 1; return b; }
 long long t174_sh_ll(void) { return t174Sh.ll; }
+
+/* c03: a C parameter keeps the const levels it spells (`const int **` is const at the int only). */
+int c03KCReadMulti(const int** p) { return **p; }
+int c03KCReadAll(const int* const* p) { return **p; }
+/* c03: `int *const *` is const at the pointer slot only; its int stays writable. */
+int c03KCSlotRead(int* const* p) { return **p; }

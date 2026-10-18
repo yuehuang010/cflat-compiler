@@ -1,0 +1,60 @@
+import "list.cb";
+
+expect_error("'const' must come before the type it qualifies") {
+    int const value = 1;
+}
+
+expect_error("'const' after '*' is not allowed") {
+    int* const value = nullptr;
+}
+
+expect_error("'const' after '*' is not allowed") {
+    int value = 4;
+    int* pointer = &value;
+    int* cast = (int* const)pointer;
+}
+
+expect_error("'const' after '*' is not allowed") {
+    int size = (int)sizeof(int* const);
+}
+
+expect_error("'const' after '*' is not allowed") {
+    int size = (int)sizeof(const(int* const));
+}
+
+expect_error("'const' after '*' is not allowed") {
+    list<int* const> values;
+}
+
+expect_error("'const' after '*' is not allowed") {
+    using C00FnConstParam = function<int(int* const)>;
+}
+
+expect_error("'const' after '*' is not allowed") {
+    using C00FnConstReturn = function<int* const(int)>;
+}
+
+expect_error("'const' after '*' is not allowed") {
+    list<int(int* const)> values;
+}
+
+expect_error("'const' after '*' is not allowed") {
+    using C00GlobalTrailing = int* const;
+}
+
+expect_error("'const' after '*' is not allowed") {
+    extern int c00LocalTrailingUsing() {
+        using C00LocalTrailing = int* const;
+        return 0;
+    }
+}
+
+expect_error("'const' after '*' is not allowed") {
+    namespace C00TrailingUsingNamespace {
+        using C00NamespaceTrailing = int* const;
+    }
+}
+
+expect_error("'const' after '*' is not allowed") {
+    using C00FunctionPointerTrailing = function<int(int)>* const;
+}

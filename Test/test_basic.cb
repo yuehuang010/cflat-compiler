@@ -1,4 +1,4 @@
-import "test_helper.cb";
+import "test_helper.cb"; import "list.cb";
 
 // =============================================================
 // Union types
@@ -2418,12 +2418,12 @@ bool testNullCoalescingAssignment()
     result &= Test("nullcoalasgn_rhs_value", take, 7);
 
     // null pointer: should be assigned the rhs
-    const char* p = nullptr;
+    (const char)* p = nullptr;
     p ??= "hello";
     result &= Test("nullcoalasgn_null_ptr", p, "hello");
 
     // non-null pointer: should keep its original value
-    const char* q = "world";
+    (const char)* q = "world";
     q ??= "other";
     result &= Test("nullcoalasgn_nonnull_ptr", q, "world");
 
@@ -5694,6 +5694,10 @@ extern int main()
     total++; passed += testPostfixGenericInstantiation()   ? 1 : 0;
     total++; passed += testOffsetofIntrinsic() ? 1 : 0;
     total++; passed += testCharFamilyExplicitCasts() ? 1 : 0;
+    total++; passed += testConstSpellingsParse() ? 1 : 0;
+    total++; passed += testConstObjects() ? 1 : 0;
+    total++; passed += testConstFields() ? 1 : 0;
+    total++; passed += testConstPointee() ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -7862,5 +7866,580 @@ bool testCharFamilyExplicitCasts()
     chars[1] = 'B';
     char* charView = chars;
     Assert("char_family_same_type_decay", (int)charView[1], 66);
+    return result;
+}
+
+struct C00ConstCarryStruct
+{
+    int value = default;
+};
+
+struct C00ConstCarryFields
+{
+    const int whole = default;
+    const(int)* wrapped = default;
+    (const int)* parenthesized = default;
+};
+
+namespace ns
+{
+    struct S { int value = default; };
+}
+
+struct C00ConstCarryWrapperFields
+{
+    const(unsigned int)* multiword = default;
+    (const list<int>)* generic = default;
+    const(ns.S)* namespaced = default;
+};
+
+const(unsigned int)* c00ConstCarryMultiwordGlobal = default;
+(const list<int>)* c00ConstCarryGenericGlobal = default;
+const(ns.S)* c00ConstCarryNamespaceGlobal = default;
+
+using C00ConstCarryPointer = int*;
+using C00ConstCarryCharPointer = (const char)*;
+using C00ConstCarryUIntAlias = unsigned int;
+using C00ConstCarryListAlias = list<int>;
+
+int c00ConstCarryParam(const int value, (const int)* p)
+{
+    return value + *p;
+}
+
+int c00ConstCarryMultiwordParam(const(unsigned int)* p) { return (int)*p; }
+int c00ConstCarryGenericParam((const list<int>)* p) { return p.count(); }
+int c00ConstCarryNamespaceParam(const(ns.S)* p) { return p.value; }
+const(unsigned int)* c00ConstCarryMultiwordReturn(uint* p) { return p; }
+(const list<int>)* c00ConstCarryGenericReturn(list<int>* p) { return p; }
+const(ns.S)* c00ConstCarryNamespaceReturn(ns.S* p) { return p; }
+int c00ConstCarryAliasUIntParam(const(C00ConstCarryUIntAlias)* p) { return (int)*p; }
+int c00ConstCarryAliasListParam((const C00ConstCarryListAlias)* p) { return p.count(); }
+
+T c00ConstGenericIdentity<T>(T value)
+{
+    const(T) local = value;
+    return (T)local;
+}
+
+bool testConstSpellingsParse()
+{
+    bool result = true;
+    const int whole = 7;
+    const(int) callWrapped = 8;
+    (const int) parenthesized = 9;
+    result &= Test("const_whole_word", whole, 7);
+    result &= Test("const_function_spelling", callWrapped, 8);
+    result &= Test("const_parenthesized_spelling", parenthesized, 9);
+
+    int mutableValue = 10;
+    int* p = &mutableValue;
+    int* plainCast = (int*)p;
+    const int* prefixPointer = p;
+    const(int)* wrappedPointer = p;
+    (const int)* parenthesizedPointer = p;
+    int** mutableDoublePointer = &p;
+    const int** wholeConstDoublePointer = mutableDoublePointer;
+    (const int*)* innerConstDoublePointer = mutableDoublePointer;
+    const(int)** wrappedConstDoublePointer = (const(int)**)mutableDoublePointer;
+    const(const(int)*)* nestedConstDoublePointer = mutableDoublePointer;
+    (const int)* castParenthesized = ((const int)*)p;
+    const(int)* castWrapped = (const(int)*)p;
+    (const int)* castPrefix = (const int*)p;
+    result &= Test("const_pointer_read", *prefixPointer, 10);
+    result &= Test("const_accept_plain_pointer_cast", *plainCast, 10);
+    result &= Test("const_accept_plain_pointer_sizeof", (int)sizeof(int*), 8);
+    result &= Test("const_accept_prefix_pointer_sizeof", (int)sizeof(const int*), 8);
+    result &= Test("const_accept_wrapped_pointer_sizeof", (int)sizeof(const(int)*), 8);
+    result &= Test("const_wrapped_pointer_read", *wrappedPointer, 10);
+    result &= Test("const_parenthesized_pointer_read", *parenthesizedPointer, 10);
+    result &= Test("const_whole_double_pointer_read", **wholeConstDoublePointer, 10);
+    result &= Test("const_inner_double_pointer_read", **innerConstDoublePointer, 10);
+    result &= Test("const_wrapped_double_pointer_read", **wrappedConstDoublePointer, 10);
+    result &= Test("const_nested_double_pointer_read", **nestedConstDoublePointer, 10);
+    result &= Test("const_cast_parenthesized", *castParenthesized, 10);
+    result &= Test("const_cast_wrapped", *castWrapped, 10);
+    result &= Test("const_cast_prefix", *castPrefix, 10);
+    result &= Test("const_sizeof_parenthesized", (int)sizeof((const int)*), 8);
+    result &= Test("const_sizeof_wrapped", (int)sizeof(const(int)*), 8);
+
+    int[3] values = { 1, 2, 3 };
+    const int[3] constValues = values;
+    result &= Test("const_array_element", constValues[2], 3);
+
+    C00ConstCarryFields fields;
+    fields.wrapped = &mutableValue;
+    fields.parenthesized = &mutableValue;
+    result &= Test("const_field_value", fields.whole, 0);
+    result &= Test("const_pointer_field", *fields.wrapped, 10);
+    result &= Test("const_parenthesized_field", *fields.parenthesized, 10);
+    result &= Test("const_parameter", c00ConstCarryParam(2, &mutableValue), 12);
+
+    uint wrappedUInt = 31;
+    list<int> wrappedList = default;
+    wrappedList.add(5);
+    ns.S wrappedObject;
+    wrappedObject.value = 7;
+    C00ConstCarryWrapperFields wrapperFields;
+    wrapperFields.multiword = &wrappedUInt;
+    wrapperFields.generic = &wrappedList;
+    wrapperFields.namespaced = &wrappedObject;
+    c00ConstCarryMultiwordGlobal = &wrappedUInt;
+    c00ConstCarryGenericGlobal = &wrappedList;
+    c00ConstCarryNamespaceGlobal = &wrappedObject;
+    result &= Test("const_wrapper_multiword_param", c00ConstCarryMultiwordParam(&wrappedUInt), 31);
+    result &= Test("const_wrapper_multiword_return", (int)*c00ConstCarryMultiwordReturn(&wrappedUInt), 31);
+    result &= Test("const_wrapper_multiword_field", (int)*wrapperFields.multiword, 31);
+    result &= Test("const_wrapper_multiword_global", (int)*c00ConstCarryMultiwordGlobal, 31);
+    result &= Test("const_wrapper_generic_param", c00ConstCarryGenericParam(&wrappedList), 1);
+    result &= Test("const_wrapper_generic_return", c00ConstCarryGenericReturn(&wrappedList).count(), 1);
+    result &= Test("const_wrapper_generic_field", wrapperFields.generic.count(), 1);
+    result &= Test("const_wrapper_generic_global", c00ConstCarryGenericGlobal.count(), 1);
+    result &= Test("const_wrapper_namespace_param", c00ConstCarryNamespaceParam(&wrappedObject), 7);
+    result &= Test("const_wrapper_namespace_return", c00ConstCarryNamespaceReturn(&wrappedObject).value, 7);
+    result &= Test("const_wrapper_namespace_field", wrapperFields.namespaced.value, 7);
+    result &= Test("const_wrapper_namespace_global", c00ConstCarryNamespaceGlobal.value, 7);
+    result &= Test("const_wrapper_alias_multiword_param", c00ConstCarryAliasUIntParam(&wrappedUInt), 31);
+    result &= Test("const_wrapper_alias_generic_param", c00ConstCarryAliasListParam(&wrappedList), 1);
+
+    const C00ConstCarryPointer wholeAlias = &mutableValue;
+    result &= Test("const_alias_pointer", *wholeAlias, 10);
+    result &= Test("const_generic_T_value", c00ConstGenericIdentity<int>(14), 14);
+    int* genericPointer = c00ConstGenericIdentity<int*>(p);
+    result &= Test("const_generic_T_pointer", *genericPointer, 10);
+
+    list<(const char)*> pointerList;
+    result &= Test("const_generic_argument", pointerList.count(), 0);
+    list<int> listValue = default;
+    list<int>* listPointer = &listValue;
+    list<int>* listPointerCast = (list<int>*)listPointer;
+    result &= Test("const_accept_generic_pointer_cast", listPointerCast == nullptr ? 0 : 1, 1);
+    result &= Test("const_accept_generic_pointer_sizeof", (int)sizeof(list<int>*), 8);
+
+    char[4] chars = default;
+    chars[0] = 'A';
+    chars[1] = 'B';
+    C00ConstCarryCharPointer charAlias = chars;
+    (const char)* scan = charAlias;
+    int sum = 0;
+    while (*scan != 0)
+    {
+        sum += *scan;
+        scan++;
+    }
+    result &= Test("const_pointer_scan", sum, 131);
+
+    C00ConstCarryStruct value;
+    value.value = 13;
+    const C00ConstCarryStruct wholeStruct = value;
+    result &= Test("const_struct_value", wholeStruct.value, 13);
+    (int,int) tupleValue = default;
+    result &= Test("const_wrapper_tuple_parameter", c00ConstTupleParam(tupleValue), 0);
+    result &= Test("const_wrapper_tuple_pointer_parameter",
+        c00ConstTuplePointerParam(&tupleValue), 0);
+    result &= Test("const_wrapper_tuple_pack_local", c00ConstTuplePackLocal(), 0);
+    return result;
+}
+
+int c00ConstTupleParam(const((int,int)) p) { return (int)sizeof(p) - 8; }
+int c00ConstTuplePointerParam(const((int,int))* p) { return (int)sizeof(p) - 8; }
+int c00ConstTuplePackParam(const((int...)) p) { return 0; }
+int c00ConstTuplePackLocal() { const((int...)) p = default; return 0; }
+
+// Const phase 1 (plan cflat-const.md): const objects are read-only and fold like file-scope consts.
+const int C01Limit = 4;
+// Enumerators are scoped (c01LocalE.c01EnumV): a bare c01EnumV is this global, as with a C++ enum class.
+const int c01EnumV = 9;
+const int[3] C01Table = { 10, 20, 30 };
+namespace c01ns { const int Depth = 6; }
+struct C01Buf<T, int N> { T[N] data = default; int cap() { return N; } };
+struct C01Pair { int a = 0; int[2] arr = default; };
+string c01Consume(move string s) { return s; }
+int c01ParamRead(const int v, const C01Pair p) { return v + p.a + p.arr[1]; }
+int c01ViewSum((const int)* p, int n) { int s = 0; for (int i = 0; i < n; i++) { s += *p; p++; } return s; }
+
+bool testConstObjects()
+{
+    bool result = true;
+    const int localLimit = 3;
+    int copy = C01Limit;
+    copy++;
+    result &= Test("const_obj_read", C01Limit + localLimit + c01ns.Depth, 13);
+    result &= Test("const_obj_copy_out", copy, 5);
+    result &= Test("const_obj_global_array", C01Table[2], 30);
+    const int* globalAddr = &C01Limit;
+    (const int)* localAddr = &localLimit;
+    auto deduced = &localLimit;
+    result &= Test("const_obj_address_global", *globalAddr, 4);
+    result &= Test("const_obj_address_local", *localAddr + *deduced, 6);
+    int[localLimit] dims = default;
+    result &= Test("const_obj_local_dim", (int)sizeof(dims), 12);
+    C01Buf<int, localLimit> buf = default;
+    result &= Test("const_obj_local_generic_arg", buf.cap(), 3);
+    int[3] data = { 1, 2, 3 };
+    (const int)* walk = data;
+    walk++;
+    result &= Test("const_obj_view_reseat", *walk, 2);
+    result &= Test("const_obj_view_param", c01ViewSum(data, 3), 6);
+    C01Pair pair = default;
+    pair.a = 2;
+    pair.arr[1] = 5;
+    result &= Test("const_obj_param_read", c01ParamRead(1, pair), 8);
+    const C01Pair whole = pair;
+    C01Pair copied = whole;
+    copied.a = 9;
+    result &= Test("const_obj_struct_copy_out", whole.a + copied.a, 11);
+    const string owned = "const";
+    result &= Test("const_obj_last_use_consume", (int)c01Consume(owned).length(), 5);
+    const int c01a = 3;
+    const int c01b = c01a + 1;
+    C01Buf<int, c01b> chained = default;
+    result &= Test("const_obj_fold_chain", chained.cap(), 4);
+    const int c01Shadow = 2;
+    const int c01Next = c01Shadow * 3;
+    C01Buf<int, c01Next> shadowed = default;
+    result &= Test("const_obj_fold_shadow", shadowed.cap(), 6);
+    C01Pair mutablePair = default;
+    int[2] mutableArr = { 1, 2 };
+    int target = 0;
+    int* sink = &target;
+    Lambda<int()> writer = () => { mutablePair.a = 4; mutableArr[1] = 5; *sink = 6; return mutableArr[1]; };
+    int wrote = writer();
+    result &= Test("const_obj_capture_mutable", mutablePair.a + wrote + target, 15);
+    Lambda<int()> reader = () => { return whole.a + localLimit; };
+    result &= Test("const_obj_capture_read", reader(), 5);
+    int forCap = 0;
+    for (const int c01ForU = 3; forCap == 0;) { C01Buf<int, c01ForU> fb = default; forCap = fb.cap(); }
+    result &= Test("const_obj_fold_for_init", forCap, 3);
+    forCap = 0;
+    for (const int c01ForN = 3; forCap == 0;) { C01Buf<int, c01ForN> fb = default; forCap = fb.cap(); }
+    result &= Test("const_obj_fold_for_init_shadow", forCap, 3);
+    forCap = 0;
+    for (const int c01ForK = 2, c01ForN = c01ForK + 1; forCap == 0;) { C01Buf<int, c01ForN> fb = default; forCap = fb.cap(); }
+    result &= Test("const_obj_fold_for_init_sibling", forCap, 3);
+    const int c01SibU = 3, c01SibV = c01SibU + 1;
+    C01Buf<int, c01SibV> sibU = default;
+    result &= Test("const_obj_fold_sibling", sibU.cap(), 4);
+    const int c01SibA = 3, c01SibB = c01SibA + 1;
+    C01Buf<int, c01SibB> sibA = default;
+    result &= Test("const_obj_fold_sibling_shadow", sibA.cap(), 4);
+    const int c01CapU = 3;
+    Lambda<int()> capU = () => { const int k = c01CapU + 1; C01Buf<int, k> cb = default; return cb.cap(); };
+    result &= Test("const_obj_fold_capture", capU(), 4);
+    const int c01CapN = 3;
+    Lambda<int()> capN = () => { const int k = c01CapN + 2; C01Buf<int, k> cb = default; return cb.cap(); };
+    result &= Test("const_obj_fold_capture_shadow", capN(), 5);
+    enum c01LocalE : int { c01EnumV = 3 };
+    c01LocalE localEnum = default;
+    result &= Test("const_obj_local_enum_type", (int)sizeof(localEnum), 4);
+    const int c01EnumK = c01EnumV + 1;
+    C01Buf<int, c01EnumK> enumBuf = default;
+    result &= Test("const_obj_fold_scoped_enumerator", enumBuf.cap(), 10);
+    return result;
+}
+
+// Same name as a const local in testConstObjects: the local must win when folding.
+const int c01Shadow = 9;
+const int c01ForN = 9;
+const int c01SibA = 9;
+const int c01CapN = 9;
+
+// Const phase 2 (plan cflat-const.md): a const field is set only during construction, a struct
+// holding one is never whole-assigned, and const reaches through a const struct's pointers.
+struct C02Stamp
+{
+    const int id = 0;
+    int hits = 0;
+    const int tag = 5;
+    C02Stamp(int i) { id = i; this.hits = 1; }
+    int Get() { return id + tag; }
+};
+struct C02Own { const int id = 0; C02Own() { id = 8; } };
+struct C02Rec { const int id = 1; int n = 0; };
+struct C02Wrap { C02Stamp s = C02Stamp(4); int k = 0; C02Wrap(int i) { k = i; } };
+struct C02Box<T> { const T v = default; int n = 0; C02Box(T x) { v = x; } };
+struct C02Self { const int id = 0; int peer = 0; C02Self(int i) { id = i; C02Self other = C02Self(); peer = other.id; } };
+struct C02Ptrs { int n = 0; int* p = nullptr; };
+struct C02Holder { (const C02Ptrs)* p = nullptr; };
+struct C02Gen<T> { T value = default; };
+using C02StampAlias = C02Stamp;
+using C02GenAlias = C02Gen<C02Stamp>;
+namespace c02ns { struct Wrap<T> { T value = default; }; }
+C02Stamp c02Make(int i) { C02Stamp r = C02Stamp(i); return r; }
+int c02Take(C02Stamp s) { return s.id; }
+int c02Borrow(alias C02Stamp s) { return s.id + s.hits; }
+int c02ReadThrough(const C02Ptrs* ps) { return ps->n + *ps->p; }
+int c02ReadView((const C02Ptrs)* ps) { return ps->n; }
+
+bool testConstFields()
+{
+    bool result = true;
+    C02Stamp stamp = C02Stamp(7);
+    stamp.hits++;
+    result &= Test("const_field_ctor_set", stamp.id, 7);
+    result &= Test("const_field_default", stamp.tag, 5);
+    result &= Test("const_field_sibling_writable", stamp.hits, 2);
+    result &= Test("const_field_method_read", stamp.Get(), 12);
+    C02Own own = C02Own();
+    result &= Test("const_field_noarg_ctor_body", own.id, 8);
+    C02Rec rec = { id = 4, n = 2 };
+    C02Rec recDefault = default;
+    result &= Test("const_field_brace_init", rec.id + rec.n, 6);
+    result &= Test("const_field_brace_default", recDefault.id, 1);
+    C02Stamp copied = stamp;
+    C02Stamp moved = move copied;
+    result &= Test("const_field_copy_move_construct", moved.id, 7);
+    result &= Test("const_field_return_by_value", c02Make(3).id, 3);
+    result &= Test("const_field_by_value_arg", c02Take(stamp) + c02Borrow(stamp), 16);
+    C02Wrap wrap = C02Wrap(2);
+    wrap.s.hits = 3;
+    result &= Test("const_field_embedded", wrap.s.id + wrap.s.hits + wrap.k, 9);
+    C02Box<int> box = C02Box<int>(6);
+    result &= Test("const_field_generic_ctor", box.v, 6);
+    C02Self self = C02Self(9);
+    result &= Test("const_field_ctor_local_peer", self.id + self.peer, 9);
+    C02Stamp* ps = &stamp;
+    ps->hits = 8;
+    result &= Test("const_field_through_mutable_pointer", ps->id + stamp.hits, 15);
+    // Transitive const: a copy out is writable; reads through the const object stay legal.
+    int target = 1;
+    const C02Ptrs cbox = { n = 5, p = &target };
+    C02Ptrs boxCopy = cbox;
+    boxCopy.n = 6;
+    result &= Test("const_struct_read_through", cbox.n + *cbox.p, 6);
+    result &= Test("const_struct_copy_writable", boxCopy.n, 6);
+    result &= Test("const_struct_read_param", c02ReadThrough(&boxCopy) + c02ReadView(&boxCopy), 13);
+    (const C02Ptrs)* view = &cbox;
+    view = &boxCopy;
+    result &= Test("const_struct_view_reseat", view->n, 6);
+    // An explicit cast drops const (R7 A).
+    const C02Ptrs* constPs = &boxCopy;
+    ((C02Ptrs*)constPs)->n = 7;
+    result &= Test("const_cast_drops_pointee", boxCopy.n, 7);
+    C02Holder holder = { p = &boxCopy };
+    ((C02Ptrs*)holder.p)->n = 8;
+    result &= Test("const_cast_drops_field_pointee", boxCopy.n, 8);
+    ((C02Ptrs*)((const C02Ptrs*)constPs))->n = 9;
+    result &= Test("const_cast_outer_drop_wins", boxCopy.n, 9);
+    result &= Test("const_field_containers", c02Containers(), 0);
+    result &= Test("const_field_is_assignable", c02Assignable<int>() + c02Assignable<C02Ptrs>() + c02Assignable<C02Stamp*>(), 3);
+    result &= Test("const_field_not_assignable", c02Assignable<C02Stamp>() + c02Assignable<C02Wrap>(), 0);
+    int direct = (is_assignable(C02Gen<C02Stamp>) ? 0 : 1) + (is_assignable(C02Gen<int>) ? 1 : 0) + (is_assignable(C02Box<int>) ? 0 : 1);
+    result &= Test("const_field_is_assignable_generic_spelling", direct, 3);
+    // An alias and a namespaced generic with no other instantiating use resolve like sizeof's operand.
+    int spelled = (is_assignable(C02StampAlias) ? 0 : 1) + (is_assignable(C02GenAlias) ? 0 : 1)
+        + (is_assignable(c02ns.Wrap<C02Stamp>) ? 0 : 1) + (is_assignable(c02ns.Wrap<int>) ? 1 : 0);
+    result &= Test("const_field_is_assignable_alias_namespace", spelled, 4);
+    return result;
+}
+
+import "hashset.cb";
+import "queue.cb";
+struct C02Key
+{
+    const int id = 0;
+    C02Key(int i) { id = i; }
+    int hash() { return id; }
+    bool operator==(C02Key o) { return id == o.id; }
+};
+int c02Assignable<T>() { if const (is_assignable(T)) return 1; else return 0; }
+// Containers relocate by construction, so a const-field element type is storable.
+int c02Containers()
+{
+    int bad = 0;
+    list<C02Stamp> l = default;
+    int i = 0;
+    while (i < 12) { l.add(C02Stamp(i)); i++; }
+    int sum = 0;
+    for (C02Stamp s in l) sum += s.id;
+    if (sum != 66 || l[5].id != 5) bad += 1;
+    queue<C02Stamp> q = default;
+    i = 0;
+    while (i < 12) { q.enqueue(C02Stamp(i)); i++; }
+    if (q.dequeue().id != 0 || q.count() != 11) bad += 2;
+    hashset<C02Key> hs = default;
+    i = 0;
+    while (i < 30) { hs.add(C02Key(i)); i++; }
+    if (!hs.contains(C02Key(21)) || hs.contains(C02Key(40)) || hs.count() != 30) bad += 4;
+    return bad;
+}
+
+// Const phase 3 (plan cflat-const.md): pointee const. Writes through a pointer to const are
+// refused at every level, and an implicit conversion may add const but never discard it.
+const int[3] C03GlobalTable = { 10, 20, 30 };
+struct C03Box { int n = 0; int* p = nullptr; };
+using C03CStr = (const char)*;
+using C03IntPtr = int*;
+int c03Length((const char)* s) { int n = 0; while (*s) { s++; n++; } return n; }
+int c03ParamValue(const int v) { return v * 2; }
+int c03ParamWhole(const int* p) { return p[0] + p[1]; }
+int c03ParamView((const int)* p) { int s = 0; for (int i = 0; i < 2; i++) { s += *p; p++; } return s; }
+int c03ParamStruct(const C03Box b) { return b.n + *b.p; }
+int c03ParamAlias(const C03IntPtr p) { return p[0]; }
+int c03ParamDefault(const int scale = 3) { return scale; }
+void c03ParamWriteThrough(int* p) { p[0] = 99; }
+int c03ReadDouble((const int*)* pp) { return **pp; }
+(const int)* c03Pass((const int)* p) { return p; }
+int c03Pick(int* p) { return 1; }
+int c03Pick(const(void)* p) { return 2; }
+int c03ReadAlias(const alias int r) { return r; }
+const(void)* c03Opaque((const int)* p) { return p; }
+// Round 2: views carry element const, `alias T*` copies the pointer with its qualification, and
+// `using` captures a whole-word const type.
+using C03FixedInts = const int*;
+using C03ConstIntPtr = const C03IntPtr;
+int c03FixedParam(C03FixedInts p) { return p[1]; }
+int c03ViewSum(const int[] v) { return v[0] + v[1]; }
+void c03ViewFill(int[] v) { v[0] = 7; }
+void c03AliasPtrWrite(alias int* r) { *r = 8; }
+int c03AliasPtrRead(alias (const int)* r) { return *r; }
+expect_error("it is reached through a pointer to const") {
+    int c03BadFixedParam(C03FixedInts p) { p[0] = 1; return 0; }
+}
+
+bool testConstPointee()
+{
+    bool result = true;
+    int[3] data = { 1, 2, 3 };
+    int* raw = data;
+
+    // `const int* p` = const(int*): neither p nor *p may change.
+    const int* fixedView = raw;
+    result &= Test("const_pointee_whole_read", fixedView[1], 2);
+    expect_error("it is reached through a pointer to const") { *fixedView = 5; }
+    expect_error("it is reached through a pointer to const") { fixedView[2] = 5; }
+
+    // `(const int)*` and `const(int)*`: reseatable view, read-only target.
+    (const int)* walk = raw;
+    const(int)* walk2 = raw;
+    int sum = 0;
+    for (int i = 0; i < 3; i++) { sum += *walk; walk++; }
+    walk2 = walk2 + 2;
+    result &= Test("const_pointee_view_scan", sum, 6);
+    result &= Test("const_pointee_view_reseat", *walk2, 3);
+    expect_error("it is reached through a pointer to const") { *walk2 = 7; }
+    expect_error("it is reached through a pointer to const") { walk2[0] += 1; }
+
+    // Adding const is implicit, dropping it needs an explicit cast (R7 A).
+    (const int)* view = raw;
+    int* back = (int*)view;
+    back[0] = 11;
+    result &= Test("const_pointee_cast_drops", data[0], 11);
+    result &= Test("const_pointee_view_sees_write", view[0], 11);
+    expect_error("the conversion discards const") { int* bad = view; }
+    expect_error("the conversion discards const") { int* bad2 = fixedView; }
+    expect_error("the conversion discards const") { void* bad3 = view; }
+    const(void)* opaque = view;
+    result &= Test("const_pointee_void_view", opaque != nullptr, true);
+    result &= Test("const_pointee_void_return", c03Opaque(view) == opaque, true);
+    (const int)* passed = c03Pass(raw);
+    result &= Test("const_pointee_return_adds", passed[2], 3);
+    (const int)* arith = view + 1;
+    result &= Test("const_pointee_arith_keeps_view", *arith, 2);
+    bool pick = data[2] == 3;
+    (const int)* joined = pick ? raw : view;
+    result &= Test("const_pointee_ternary_join", *joined, 11);
+    C03Box box = { n = 1, p = raw };
+    const C03Box constBox = { n = 2, p = raw };
+    (const int)* fromConstBox = constBox.p;
+    int* fromConstBoxCast = (int*)constBox.p;
+    *((int*)constBox.p) = 12;
+    result &= Test("const_pointee_transitive_read", *fromConstBox, 12);
+    result &= Test("const_pointee_transitive_cast", fromConstBoxCast == raw, true);
+    expect_error("the conversion discards const") { int* bad4 = constBox.p; }
+
+    // Multi-level. `(const int*)* pp`: pp reseatable, *pp fixed, **pp read-only.
+    const int* slotA = raw;
+    (const int*)* pp = &slotA;
+    result &= Test("const_pointee_multi_read", **pp, 12);
+    const(int)** pp2 = nullptr;
+    (const int)* cursor = raw;
+    pp2 = &cursor;
+    *pp2 = *pp2 + 1;
+    result &= Test("const_pointee_multi_inner_reseat", **pp2, 2);
+    int** mutablePP = &raw;
+    (const int*)* addedBoth = mutablePP;
+    result &= Test("const_pointee_multi_add_both", c03ReadDouble(mutablePP) + **addedBoth, 24);
+    expect_error("it is reached through a pointer to const") { *pp = raw; }
+    expect_error("it is reached through a pointer to const") { **pp2 = 0; }
+    expect_error("the conversion discards const") { int** ppBad = &raw; (const int)** ppView = ppBad; }
+
+    // `using` captures the const word: the conversions behave as spelled out.
+    C03CStr aliasView = "alias";
+    const C03IntPtr aliasFixed = raw;
+    const C03IntPtr aliasConstPtr = raw;
+    using C03LocalView = const(int)*;
+    C03LocalView localView = raw;
+    localView++;
+    result &= Test("const_pointee_using_view", c03Length(aliasView), 5);
+    result &= Test("const_pointee_using_fixed", aliasFixed[1] + aliasConstPtr[0], 14);
+    result &= Test("const_pointee_using_local_view", *localView, 2);
+    expect_error("it is reached through a pointer to const") { aliasFixed[0] = 1; }
+    expect_error("it is reached through a pointer to const") { *aliasConstPtr = 1; }
+    expect_error("it is reached through a pointer to const") { *localView = 1; }
+    expect_error("the conversion discards const") { C03IntPtr dropped = localView; }
+
+    // Parameters mirror variables; top-level const is the callee's own.
+    const int localLimit = 3;
+    const int* argFixed = raw;
+    (const int)* argView = raw;
+    result &= Test("const_pointee_param_value", c03ParamValue(localLimit), 6);
+    result &= Test("const_pointee_param_whole", c03ParamWhole(raw), 14);
+    result &= Test("const_pointee_param_fixed_into_view", c03ParamView(argFixed), 14);
+    result &= Test("const_pointee_param_view_into_whole", c03ParamWhole(argView), 14);
+    result &= Test("const_pointee_param_struct", c03ParamStruct(box), 13);
+    result &= Test("const_pointee_param_alias", c03ParamAlias(raw), 12);
+    result &= Test("const_pointee_param_default", c03ParamDefault(), 3);
+    result &= Test("const_pointee_param_global_table", c03ParamWhole(C03GlobalTable), 30);
+    c03ParamWriteThrough(raw);
+    result &= Test("const_pointee_param_mutable_arg", data[0], 99);
+    expect_error("cannot pass argument 1 ('(const int)*') to parameter 'p' ('int*'): the conversion discards const")
+    {
+        c03ParamWriteThrough(argView);
+    }
+    expect_error("the conversion discards const") { c03ParamWriteThrough(argFixed); }
+    expect_error("the conversion discards const") { c03ParamWriteThrough(C03GlobalTable); }
+
+    // A candidate that would discard const is not viable: the read-only one is chosen (clang).
+    result &= Test("const_pointee_overload_mutable", c03Pick(raw), 1);
+    result &= Test("const_pointee_overload_const", c03Pick(argView), 2);
+    const alias int constBound = localLimit;
+    result &= Test("const_pointee_const_alias_binds", constBound + c03ReadAlias(localLimit), 6);
+
+    // Views: the element qualification converts like a pointer's; a cast may drop it.
+    int[] mutableElems = data;
+    const int[] readElems = data;
+    result &= Test("const_pointee_view_read", c03ViewSum(readElems) + c03ViewSum(mutableElems), 2 * (data[0] + data[1]));
+    int[] castElems = (int[])readElems;
+    castElems[1] = 5;
+    result &= Test("const_pointee_view_cast_drops", data[1], 5);
+    c03ViewFill(mutableElems);
+    result &= Test("const_pointee_view_mutable_param", data[0], 7);
+    expect_error("cannot convert 'const int[]' to 'int[]': the conversion discards const") { int[] dropped = readElems; }
+    expect_error("cannot convert 'const int[]' to 'int[]'") { mutableElems = readElems; }
+    expect_error("cannot pass argument 1 ('const int[]') to parameter 'v' ('int[]')") { c03ViewFill(readElems); }
+    expect_error("it is reached through a pointer to const") { readElems[0] = 1; }
+
+    // `alias T*` binds a copy of the pointer: the pointee qualification follows it.
+    int* writable = raw;
+    c03AliasPtrWrite(writable);
+    alias (const int)* aliasRead = raw;
+    result &= Test("const_pointee_alias_pointer", c03AliasPtrRead(argView) + *aliasRead, 16);
+    expect_error("cannot convert '(const int)*' to 'int*'") { alias int* aliasDropped = argView; }
+    expect_error("cannot pass argument 1 ('(const int)*') to parameter 'r' ('int*')") { c03AliasPtrWrite(argView); }
+    expect_error("it is reached through a pointer to const") { *aliasRead = 1; }
+
+    // `using` keeps a whole-word const: `const W` covers every level of W.
+    C03FixedInts usingFixed = raw;
+    C03ConstIntPtr usingWhole = raw;
+    using C03LocalFixed = const int*;
+    C03LocalFixed usingLocal = raw;
+    result &= Test("const_pointee_using_fixed", usingFixed[1] + c03FixedParam(raw) + usingWhole[1] + usingLocal[1], 20);
+    expect_error("cannot assign to 'usingFixed': it is declared const") { usingFixed = raw; }
+    expect_error("it is reached through a pointer to const") { usingFixed[0] = 1; }
+    expect_error("cannot increment 'usingWhole': it is declared const") { usingWhole++; }
+    expect_error("it is reached through a pointer to const") { *usingWhole = 1; }
+    expect_error("it is reached through a pointer to const") { *usingLocal = 1; }
+    expect_error("the conversion discards const") { C03IntPtr dropped = usingFixed; }
     return result;
 }

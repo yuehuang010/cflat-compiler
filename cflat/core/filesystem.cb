@@ -26,7 +26,7 @@ win_int _fs_fclose(void* s) { return fclose(s); }
 i64 _fs_fread(char* buf, i64 size, i64 count, void* s) {
     return (i64)fread(buf, (win_size)size, (win_size)count, s);
 }
-i64 _fs_fwrite(char* buf, i64 size, i64 count, void* s) {
+i64 _fs_fwrite(const char* buf, i64 size, i64 count, void* s) {
     return (i64)fwrite(buf, (win_size)size, (win_size)count, s);
 }
 win_int _fs_feof(void* s) { return feof(s); }
@@ -197,9 +197,15 @@ class File
     bool write(string text)
     {
         if (_handle == nullptr) return false;
-        int len = text.length();
+        return _writeText(text.data(), (i64)text.length());
+    }
+
+    // Write `len` bytes of read-only text; shared by the string and the C-string writers.
+    bool _writeText(const char* text, i64 len)
+    {
+        if (_handle == nullptr) return false;
         if (len == 0) return true;
-        i64 written = _fs_fwrite(text.data(), 1, len, _handle);
+        i64 written = _fs_fwrite(text, 1, len, _handle);
         return written == len;
     }
 
@@ -317,10 +323,15 @@ class File
     // Overload of writeAllText taking a raw C string for content.
     static bool writeAllText(string path, const char* content)
     {
-        string s;
-        s._ptr = content;
-        s._len = strlen(content);
-        return File.writeAllText(path, s);
+        File* f = new File;
+        if (!f->openWrite(path))
+        {
+            delete f;
+            return false;
+        }
+        bool ok = f->_writeText(content, (i64)strlen(content));
+        delete f;
+        return ok;
     }
 
     // Append content to path (creates the file if it does not exist).
@@ -340,10 +351,15 @@ class File
     // Overload of appendAllText taking a raw C string for content.
     static bool appendAllText(string path, const char* content)
     {
-        string s;
-        s._ptr = content;
-        s._len = strlen(content);
-        return File.appendAllText(path, s);
+        File* f = new File;
+        if (!f->openAppend(path))
+        {
+            delete f;
+            return false;
+        }
+        bool ok = f->_writeText(content, (i64)strlen(content));
+        delete f;
+        return ok;
     }
 
     // Destructor: close the file handle if still open.

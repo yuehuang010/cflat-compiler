@@ -2136,6 +2136,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.IsCxxPointeeConst) j["cpc"] = true;
         if (s.IsCxxPointeeVolatile) j["cpv"] = true;
         if (s.IsSpelledPointeeConst) j["spc"] = true;
+        if (s.ConstMask) j["cm"] = static_cast<int64_t>(s.ConstMask);
         if (s.IsCxxNullptrT) j["cnt"] = true;
         if (s.IsCxxConstField) j["ccf"] = true;
         if (s.IsCxxDeclaredConstField) j["ccdf"] = true;
@@ -2214,6 +2215,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsCxxPointeeConst = j.value("cpc", false);
         s.IsCxxPointeeVolatile = j.value("cpv", false);
         s.IsSpelledPointeeConst = j.value("spc", false);
+        s.ConstMask = static_cast<uint8_t>(j.value("cm", 0));
         s.IsCxxNullptrT = j.value("cnt", false);
         s.IsCxxConstField = j.value("ccf", false);
         s.IsCxxDeclaredConstField = j.value("ccdf", false);

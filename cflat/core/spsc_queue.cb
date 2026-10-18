@@ -60,7 +60,7 @@ class spsc_queue<T>
         int head = __atomic_i32_load(&_head);
         int next = (head + 1) % _cap;
         if (next == __atomic_i32_load(&_tail)) return false;   // full
-        _buf[head] = item;
+        if const (is_assignable(T)) _buf[head] = item; else compile_error("spsc_queue<T>: the element type has a const field and cannot be reassigned");
         __atomic_i32_store(&_head, next);
         return true;
     }
@@ -70,17 +70,17 @@ class spsc_queue<T>
     bool try_pop(T* out) {
         int tail = __atomic_i32_load(&_tail);
         if (tail == __atomic_i32_load(&_head)) return false;   // empty
-        *out = _buf[tail];
+        if const (is_assignable(T)) *out = _buf[tail]; else compile_error("spsc_queue<T>: the element type has a const field and cannot be reassigned");
         __atomic_i32_store(&_tail, (tail + 1) % _cap);
         return true;
     }
 
     // send/receive/try_receive: IQueue-compatible aliases used by program inbox dispatch.
-    void send(move T item) { push(move item); }
+    void send(move T item) { if const (is_assignable(T)) push(move item); else compile_error("spsc_queue<T>: the element type has a const field and cannot be reassigned"); }
     // Blocking receive - alias for pop().
     T    receive()         { return pop(); }
     // Non-blocking receive - alias for try_pop().
-    bool try_receive(T* out) { return try_pop(out); }
+    bool try_receive(T* out) { if const (is_assignable(T)) return try_pop(out); else compile_error("spsc_queue<T>: the element type has a const field and cannot be reassigned"); return false; }
 
     // Blocking push.  Spins until a slot is available, then writes the item.
     // For pointer types T, ownership is transferred (caller's pointer is nulled).
@@ -92,7 +92,7 @@ class spsc_queue<T>
             head = __atomic_i32_load(&_head);
             next = (head + 1) % _cap;
         }
-        _buf[head] = item;
+        if const (is_assignable(T)) _buf[head] = item; else compile_error("spsc_queue<T>: the element type has a const field and cannot be reassigned");
         __atomic_i32_store(&_head, next);
     }
 

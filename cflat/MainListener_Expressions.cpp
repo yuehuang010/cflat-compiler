@@ -546,7 +546,7 @@ bool MainListener::IsWholeCxxCallArgumentShape(
                 return sawTypeCast;
             if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
             {
-                if (cast->typeName() != nullptr && cast->castExpression() != nullptr)
+                if (cast->castTypeName() != nullptr && cast->castExpression() != nullptr)
                 {
                     antlr4::tree::ParseTree* childOnPath = ctx;
                     while (childOnPath != nullptr && childOnPath->parent != cast)
@@ -2533,11 +2533,14 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     {
                         if (auto* nv = compiler->FindLiveNamedVariable(name))
                         {
+                            RefuseConstObjectWrite(inner, *nv, nv->Storage, "move");
                             ReleaseOwningLocalNow(unaryCtx, nv, name);
                             return nullptr;
                         }
                         if (compiler->GetGlobalVariable(name) != nullptr)
                         {
+                            auto globalNV = compiler->GetGlobalVariableNV(name);
+                            RefuseConstObjectWrite(inner, globalNV, globalNV.Storage, "move");
                             ReleaseOwningGlobalNow(unaryCtx, name);
                             return nullptr;
                         }
@@ -2629,6 +2632,20 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 LogErrorContext(unaryCtx, std::format(
                     "cannot assign to macro constant '{}'", unaryCtx->getText()));
             auto destination = namedVar.Storage;
+            // A struct with a const field has no assignment (C++ deletes it): only construction
+            // sets it. Init, copy/move construction and by-value passing stay legal.
+            if (!RefuseConstObjectWrite(unaryCtx, namedVar, destination,
+                                        operatorText == "=" ? "assign to" : "modify")
+                && operatorText == "=" && !namedVar.TypeAndValue.Pointer
+                && !namedVar.TypeAndValue.IsArrayView)
+                if (std::string constField;
+                    compiler->FindNativeConstField(namedVar.TypeAndValue.TypeName, constField))
+                {
+                    LLVMBackend::TypeAndValue wholeType;
+                    wholeType.TypeName = namedVar.TypeAndValue.TypeName;
+                    LogErrorContext(unaryCtx, std::format("cannot assign a whole '{}': field '{}' is const",
+                        SpellDiagnosticType(*compiler, wholeType), constField));
+                }
             // Every write operator (=, +=, ...) shares the const-element refusal.
             const bool constElement = namedVar.TypeAndValue.IsCxxPointeeConst
                 && (namedVar.IsElementAccess || !namedVar.TypeAndValue.Pointer);
@@ -5828,6 +5845,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     : namedVar.FieldName.empty() ? std::format("'{}'", namedVar.CallerName)
                     : std::format("'{}.{}'", namedVar.CallerName, namedVar.FieldName)))
                 return finishStore(right);
+            if (operatorText == "=" && right != nullptr
+                && RejectConstDiscardingConversion(ctx, rightNV, right, namedVar.TypeAndValue))
+                return finishStore(right);
 
             // Pointer variable assigned a struct value: catch the mismatch here
             // with a clear message rather than letting LLVM assert inside CreateCast.
@@ -8073,7 +8093,7 @@ bool MainListener::IsTernaryArmOfCallArgument(antlr4::ParserRuleContext* ctx)
             if (dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(up) != nullptr) return true;
             // A cast rule without a typeName is a plain pass-through, like any single-child rule.
             if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(up);
-                cast != nullptr && cast->typeName() != nullptr)
+                cast != nullptr && cast->castTypeName() != nullptr)
             {
                 if (cast->castExpression() != nullptr
                     && child == static_cast<antlr4::tree::ParseTree*>(cast->castExpression()))
@@ -8116,7 +8136,7 @@ bool MainListener::HasDefaultOnlyTernaryArm(antlr4::ParserRuleContext* ctx) cons
             if (rule == nullptr) return false;
             // A typeName cast around the ternary: `(T)(c ? default : x)`. The join checks the arm type.
             if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
-                cast != nullptr && cast->typeName() != nullptr && cast->castExpression() != nullptr)
+                cast != nullptr && cast->castTypeName() != nullptr && cast->castExpression() != nullptr)
             {
                 node = cast->castExpression();
                 continue;
@@ -12382,12 +12402,11 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
         return {};
     }
 
-bool MainListener::CastTypeNameNamesValue(CFlatParser::TypeNameContext* typeName) {
-        if (typeName == nullptr || typeName->abstractDeclarator() != nullptr) return false;
-        auto* specList = typeName->specifierQualifierList();
-        if (specList == nullptr || specList->children.size() != 1 || specList->typeSpecifier().size() != 1)
+bool MainListener::CastTypeNameNamesValue(CFlatParser::CastTypeNameContext* typeName) {
+        if (typeName == nullptr || typeName->typeQualifier() != nullptr
+            || typeName->abstractDeclarator() != nullptr || typeName->typeSpecifier().size() != 1)
             return false;
-        auto* typeSpec = specList->typeSpecifier()[0];
+        auto* typeSpec = typeName->typeSpecifier()[0];
         auto* compiler = Compiler();
         // `Spec<args>.name`: a value exactly when the member lookup says it is not a type.
         if (auto* memberType = typeSpec->memberTypeSpecifier())
@@ -12423,7 +12442,7 @@ CFlatParser::CastExpressionContext* MainListener::FindValueCastHazard(antlr4::tr
         // a parenthesized sub-expression, call or index is its own and-expression.
         if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
         {
-            if (cast->typeName() != nullptr && cast->castExpression() != nullptr)
+            if (cast->castTypeName() != nullptr && cast->castExpression() != nullptr)
             {
                 auto* operand = cast->castExpression()->unaryExpression();
                 auto* op = operand != nullptr ? operand->unaryOperator() : nullptr;
@@ -12431,7 +12450,7 @@ CFlatParser::CastExpressionContext* MainListener::FindValueCastHazard(antlr4::tr
                 {
                     const std::string opText = op->getText();
                     if ((opText == "+" || opText == "-" || opText == "*" || opText == "&")
-                        && CastTypeNameNamesValue(cast->typeName()))
+                        && CastTypeNameNamesValue(cast->castTypeName()))
                         return cast;
                 }
             }
@@ -18186,7 +18205,7 @@ void MainListener::ResolveValuelessCastOperand(CFlatParser::CastExpressionContex
         {
             // Spell the destination from the source text; a synthesized rendering would have to
             // guess at array-view, function-pointer and alias spellings.
-            std::string destText = ctx->typeName() != nullptr ? ctx->typeName()->getText()
+            std::string destText = ctx->castTypeName() != nullptr ? ctx->castTypeName()->getText()
                 : SpellType(*compiler, destTypeName);
             LogErrorContext(ctx, std::format(
                 "'{}' does not name a value, so it cannot be cast to '{}' - a type name, a namespace "
@@ -18197,10 +18216,40 @@ void MainListener::ResolveValuelessCastOperand(CFlatParser::CastExpressionContex
 
 LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastExpressionContext* ctx, bool lvalue,
                                                    ResultUse use) {
+        auto result = ParseCastExpressionImpl(ctx, lvalue, use);
+        // An explicit cast to a pointer gives it exactly the spelled qualification: it may drop or
+        // add const at any level (R7 A).
+        if (ctx->castExpression() != nullptr && ctx->castTypeName() != nullptr
+            && (result.TypeAndValue.Pointer || result.TypeAndValue.IsArrayView))
+        {
+            auto* compiler = Compiler(ctx);
+            std::string ignored;
+            const uint8_t before = compiler->StoredConstLevels(result.Primary, ignored);
+            result.Primary = compiler->MarkCastQualification(result.Primary, result.TypeAndValue,
+                                                             CollapsedSourceText(ctx));
+            // A re-read of the operand's own slot (`((int*)p)[0]`) would lose the stamp, so a cast
+            // that changes the qualification reads through a slot of its own.
+            const uint8_t depthMask = static_cast<uint8_t>((1u << result.TypeAndValue.ValuePointerDepth()) - 1u);
+            // A view keeps its slot: its element count lives beside it.
+            if (auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(result.Primary);
+                load != nullptr && !result.TypeAndValue.IsArrayView && result.Storage != nullptr
+                && load->getPointerOperand() == result.Storage
+                && ((before ^ compiler->DeclaredPointeeConstLevels(result.TypeAndValue)) & depthMask) != 0)
+            {
+                auto* slot = compiler->CreateAlloca(result.Primary->getType());
+                compiler->builder->CreateStore(result.Primary, slot);
+                result.Storage = slot;
+            }
+        }
+        return result;
+}
+
+LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::CastExpressionContext* ctx, bool lvalue,
+                                                   ResultUse use) {
         auto* compiler = Compiler(ctx);
         auto unaryCtx = ctx->unaryExpression();
         auto castExp = ctx->castExpression();
-        auto typeName = ctx->typeName();
+        auto typeName = ctx->castTypeName();
 
         if (unaryCtx != nullptr)
         {
@@ -18211,7 +18260,7 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
         {
             // `(name) rest` where `name` is both a visible variable and a type: ANTLR has already
             // chosen the cast, and C would read an expression. Refuse rather than guess.
-            if (auto* bareName = BareTypeNameIdentifier(typeName))
+            if (auto* bareName = BareCastTypeNameIdentifier(typeName))
             {
                 const std::string candidate = bareName->getText();
                 PrimitiveTypeError spellingError;
@@ -18227,13 +18276,14 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
                     return {};
                 }
             }
-            auto destTypeName = ParseTypeName(typeName, false, ctx);
+            auto destTypeName = ParseCastTypeName(typeName, false, ctx);
             // The explicit cast target is the operand's conversion context. Do not let the
             // outer initializer/return destination leak through the cast into its operand.
             DeclExpectedTypeScope castExpectedScope(&declExpectedType, destTypeName);
             // A cast to 'void' DISCARDS its operand, so a value-less call is legal under it -
             // read the destination off the spelling (alias-resolved) before parsing the operand.
-            bool destIsVoid = compiler->ResolveTypeAlias(typeName->getText()) == "void";
+            bool destIsVoid = compiler->ResolveTypeAlias(destTypeName.TypeName) == "void"
+                && !destTypeName.Pointer && !destTypeName.ElemPointer && !destTypeName.IsArrayView;
             bool castInitIdentityCall = false;
             if (ctx == pendingCxxCastInitContext_
                 && compiler->pendingCxxSretDest_ != nullptr
@@ -18250,10 +18300,10 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
                         return postfix->argumentExpressionList().size() == 1
                             && postfix->children.size() == 4 ? postfix : nullptr;
                     if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
-                        cast != nullptr && cast->typeName() != nullptr
+                        cast != nullptr && cast->castTypeName() != nullptr
                             && cast->castExpression() != nullptr)
                     {
-                        const auto nestedType = ParseTypeName(cast->typeName(), false, cast);
+                        const auto nestedType = ParseCastTypeName(cast->castTypeName(), false, cast);
                         if (nestedType.Pointer || nestedType.ElemPointer || nestedType.IsArrayView
                             || compiler->ResolveTypeAlias(nestedType.TypeName)
                                 != compiler->ResolveTypeAlias(destTypeName.TypeName))
@@ -18748,22 +18798,41 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
 LLVMBackend::TypeAndValue MainListener::ParseTypeName(
     CFlatParser::TypeNameContext* ctx, bool allowSizedArray,
     antlr4::ParserRuleContext* useSite) {
-        auto specCtx = ctx->specifierQualifierList();
-        auto abstractDecl = ctx->abstractDeclarator();
+        if (ctx == nullptr) return {};
+        auto* specCtx = ctx->specifierQualifierList();
+        return ParseTypeNameParts(specCtx ? specCtx->typeSpecifier()
+                                          : std::vector<CFlatParser::TypeSpecifierContext*>{},
+            specCtx ? specCtx->typeQualifier() : nullptr, ctx->abstractDeclarator(),
+            allowSizedArray, ctx, useSite);
+    }
+
+LLVMBackend::TypeAndValue MainListener::ParseCastTypeName(
+    CFlatParser::CastTypeNameContext* ctx, bool allowSizedArray,
+    antlr4::ParserRuleContext* useSite) {
+        if (ctx == nullptr) return {};
+        return ParseTypeNameParts(ctx->typeSpecifier(), ctx->typeQualifier(),
+            ctx->abstractDeclarator(), allowSizedArray, ctx, useSite);
+    }
+
+LLVMBackend::TypeAndValue MainListener::ParseTypeNameParts(
+    const std::vector<CFlatParser::TypeSpecifierContext*>& typeSpecs,
+    CFlatParser::TypeQualifierContext* typeQualifier,
+    CFlatParser::AbstractDeclaratorContext* abstractDecl, bool allowSizedArray,
+    antlr4::ParserRuleContext* typeContext, antlr4::ParserRuleContext* useSite) {
 
         LLVMBackend::TypeAndValue typeValue;
-
-        if (specCtx)
+        if (!typeSpecs.empty())
         {
-            auto typeQualfier = specCtx->typeQualifier();
-            auto typeSpecs = specCtx->typeSpecifier();
-
-            if (typeSpecs.size() > 0)
-            {
                 auto* typeSpec = typeSpecs[0];
                 std::string baseName;
                 auto* genParams = GenericSpecOf(typeSpec, baseName);
-                if (auto* tupleSpec = typeSpec->tupleTypeSpecifier())
+                if (auto* nestedType = typeSpec->typeName())
+                {
+                    typeValue = ParseTypeName(nestedType, allowSizedArray,
+                        useSite != nullptr ? useSite : typeContext);
+                    typeValue.ApplyWholeWordConst();
+                }
+                else if (auto* tupleSpec = typeSpec->tupleTypeSpecifier())
                     typeValue.TypeName = ParseTupleTypeSpecifier(tupleSpec);
                 else if (auto* fpSpec = typeSpec->functionPointerSpecifier())
                 {
@@ -18775,12 +18844,25 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(
                 else if (genParams != nullptr)
                 {
                     // Generic cast: (channel<int>*) -> mangle to channel__int
-                    std::vector<std::string> typeArgs;
-                    for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
-                        typeArgs.push_back(ResolveTypeArgEntry(entry));
-                    ResolveEnumTypeArguments(typeArgs);
-                    compilerLLVM->ResolveGenericAliasSpelling(baseName, typeArgs);
-                    typeValue.TypeName = MangledGenericName(baseName, typeArgs);
+                    CanonicalTypeSpecifier canonical;
+                    const TypeNameArgumentResolver resolveArg = [this](auto* entry) {
+                        return ResolveTypeArgEntry(entry);
+                    };
+                    const std::vector<CFlatParser::TypeSpecifierContext*> genericSpecs{ typeSpec };
+                    if (!ResolveCanonicalTypeSpecifier(compilerLLVM, genericSpecs,
+                            &activeTypeSubstitutions, resolveArg, {}, true, canonical))
+                        return typeValue;
+                    baseName = canonical.GenericBase;
+                    const auto& typeArgs = canonical.GenericArgs;
+                    typeValue.TypeName = canonical.TypeName;
+                    typeValue.ConstMask |= canonical.ConstMask;
+                    const int aliasPointerDepth = canonical.PointerDepth;
+                    if (aliasPointerDepth > 0)
+                    {
+                        typeValue.Pointer = true;
+                        typeValue.ElemPointer = aliasPointerDepth >= 2;
+                        typeValue.PointerDepth = aliasPointerDepth > 2 ? 0 : aliasPointerDepth;
+                    }
                     std::string cxxError;
                     const bool cxxType = compilerLLVM->TryRequestCxxType(
                         baseName, typeArgs, typeValue.TypeName, cxxError);
@@ -18797,9 +18879,22 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(
                 }
                 else if (auto* memberType = typeSpec->memberTypeSpecifier())
                 {
-                    typeValue.TypeName = compilerLLVM->ResolveTypeAlias(ResolveMemberTypeSpecifier(memberType));
-                    if (PeelAliasPointerStars(typeValue.TypeName) > 0)
+                    CanonicalTypeSpecifier canonical;
+                    const TypeNameMemberResolver resolveMember = [this](auto* member) {
+                        return ResolveMemberTypeSpecifier(member);
+                    };
+                    if (!ResolveCanonicalTypeSpecifier(compilerLLVM, typeSpecs,
+                            &activeTypeSubstitutions, {}, resolveMember, true, canonical))
+                        return typeValue;
+                    typeValue.TypeName = canonical.TypeName;
+                    typeValue.ConstMask |= canonical.ConstMask;
+                    const int aliasPointerDepth = canonical.PointerDepth;
+                    if (aliasPointerDepth > 0)
+                    {
                         typeValue.Pointer = true;
+                        typeValue.ElemPointer = aliasPointerDepth >= 2;
+                        typeValue.PointerDepth = aliasPointerDepth > 2 ? 0 : aliasPointerDepth;
+                    }
                     const size_t scope = typeValue.TypeName.rfind('.');
                     if (!compilerLLVM->IsKnownTypeName(typeValue.TypeName)
                         && scope != std::string::npos
@@ -18815,27 +18910,31 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(
                 }
                 else
                 {
-                    std::vector<std::string> words;
-                    for (auto* ts : typeSpecs) words.push_back(ts->getText());
                     PrimitiveTypeError canonicalError;
-                    CanonicalizePrimitiveTypeWords(words, typeValue.TypeName, canonicalError);
+                    CanonicalTypeSpecifier canonical;
+                    const TypeNameArgumentResolver resolveArg = [this](auto* entry) {
+                        return ResolveTypeArgEntry(entry);
+                    };
+                    const TypeNameMemberResolver resolveMember = [this](auto* member) {
+                        return ResolveMemberTypeSpecifier(member);
+                    };
+                    if (!ResolveCanonicalTypeSpecifier(compilerLLVM, typeSpecs,
+                            &activeTypeSubstitutions, resolveArg, resolveMember, true,
+                            canonical, &canonicalError))
+                        LogErrorContext(typeContext,
+                            LocalizePrimitiveTypeError(compilerLLVM, canonicalError));
+                    typeValue.TypeName = canonical.TypeName;
+                    typeValue.ConstMask |= canonical.ConstMask;
+                    if (canonical.PointerDepth > 0)
+                    {
+                        typeValue.Pointer = true;
+                        typeValue.ElemPointer = canonical.PointerDepth >= 2;
+                        typeValue.PointerDepth = canonical.PointerDepth > 2
+                            ? 0 : canonical.PointerDepth;
+                    }
                     if (typeValue.TypeName == "longdouble" && !HasPrimitiveTypeError(canonicalError)
                         && !compilerLLVM->IsCInteropLongDoubleSupported())
-                        LogErrorContext(ctx, compilerLLVM->CInteropLongDoubleRefusal());
-                    if (HasPrimitiveTypeError(canonicalError))
-                        LogErrorContext(ctx, LocalizePrimitiveTypeError(compilerLLVM, canonicalError));
-                    // Apply active type-parameter substitutions (e.g. T -> int inside a generic function body).
-                    auto substIt = activeTypeSubstitutions.find(typeValue.TypeName);
-                    if (substIt != activeTypeSubstitutions.end())
-                        typeValue.TypeName = substIt->second;
-                    // Expand a `using` alias so a cast through it names a real type, e.g.
-                    // (StringOp*)p -> the instantiated thin-interface struct. One-hop, matching the
-                    // declaration path (ParseDeclarationSpecifiers); covers generic and plain aliases.
-                    typeValue.TypeName = compilerLLVM->ResolveTypeAlias(typeValue.TypeName);
-                    // Peel any trailing stars baked into a substitution or pointer alias
-                    // (using Handle = void*) onto the pointer flag.
-                    if (PeelAliasPointerStars(typeValue.TypeName) > 0)
-                        typeValue.Pointer = true;
+                        LogErrorContext(typeContext, compilerLLVM->CInteropLongDoubleRefusal());
                     // A C function-pointer typedef is a function-type alias, not a type alias:
                     // expand it to its signature as the declaration path does (MainListener_Declarations).
                     if (!compilerLLVM->NativeTypeShadowsFunctionAlias(typeValue.TypeName))
@@ -18848,12 +18947,11 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(
                             typeValue.ElemPointer = false;
                         }
                 }
-            }
         }
         else
         {
             // undefined type.
-            LogErrorContext(ctx, "Type name has no specifier-qualifier list.");
+            LogErrorContext(typeContext, "Type name has no specifier-qualifier list.");
             return typeValue;
         }
 
@@ -18867,14 +18965,21 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(
                 if (!compilerLLVM->TryRequestCxxType(
                         typeValue.TypeName, {}, typeValue.TypeName, cxxError)
                     && cxxError.find("could not be instantiated:") != std::string::npos)
-                    LogCxxErrorContext(ctx, cxxError);
+                    LogCxxErrorContext(typeContext, cxxError);
                 typeValue.TypeName = compilerLLVM->ResolveTypeAlias(typeValue.TypeName);
             }
         }
 
         if (abstractDecl && abstractDecl->pointer())
         {
+            const std::string spelledBaseType = SpelledTypeNameBase(typeSpecs);
+            for (auto* qualifier : ConstQualifiersAfterPointerStar(abstractDecl->pointer()))
+                LogErrorContext(qualifier, ConstAfterPointerDiagnostic(spelledBaseType));
             typeValue.Pointer = true;
+            const int declaredDepth = PointerDepthOf(abstractDecl->pointer());
+            const int totalDepth = typeValue.PointerDepth + declaredDepth;
+            typeValue.ElemPointer = typeValue.ElemPointer || totalDepth >= 2;
+            typeValue.PointerDepth = totalDepth > PointerDepthCap ? 0 : totalDepth;
         }
 
         // Cast targets keep enum identity for lookup, but integer operations also need the
@@ -18899,16 +19004,16 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(
             // Redirect to the array-view cast (return-early avoids a duplicate sized-array error).
             if (ArrayPtrOf(abstractDecl))
             {
-                LogErrorContext(ctx, "pointer to array-view '(T[]*)' is not a valid type; cast to "
+                LogErrorContext(typeContext, "pointer to array-view '(T[]*)' is not a valid type; cast to "
                     "the array-view '(T[])' and take its address separately if you need a pointer");
                 return typeValue;
             }
             if (auto* dimSpec = ArrayDimsOf(abstractDecl))
             {
                 if (DimSpecIsUnsizedMultiDim(dimSpec))
-                    LogErrorContext(ctx, UnsizedMultiDimMessage(SpellType(*Compiler(), typeValue)));
+                    LogErrorContext(typeContext, UnsizedMultiDimMessage(SpellType(*Compiler(), typeValue)));
                 if (!allowSizedArray && !dimSpec->assignmentExpression().empty())
-                    LogErrorContext(ctx, "a sized array '(T[N])' is not a valid cast target; "
+                    LogErrorContext(typeContext, "a sized array '(T[N])' is not a valid cast target; "
                         "use '(T[])' for the noalias array-view");
                 if (dimSpec->assignmentExpression().empty())
                 {
@@ -18921,6 +19026,10 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(
                 }
             }
         }
+
+        if (typeQualifier != nullptr)
+            typeValue.ApplyWholeWordConst();
+        typeValue.IsSpelledPointeeConst = (typeValue.ConstMask & 1) != 0 && typeValue.Pointer;
 
         return typeValue;
     }
@@ -21944,6 +22053,8 @@ bool MainListener::EmitOneFieldInit(
                 errCtx, fieldType, rightNV, val, "brace-initialize",
                 std::format("field '{}.{}'", displayTypeName, fieldName)))
             return false;
+        if (RejectConstDiscardingConversion(errCtx, rightNV, val, fieldType))
+            return false;
 
         // `{ f = cppRefCall() }` binds the referent and `{ f = derivedPtr }` shifts to the base
         // subobject: the brace twin of the declaration-initializer and `=` legs.
@@ -22488,6 +22599,8 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
         if (RejectImplicitPointerToNumber(
                 ae, field, nv, nv.Primary, "default-initialize",
                 std::format("field '{}.{}'", structName, field.VariableName)))
+            return val;
+        if (val != nullptr && RejectConstDiscardingConversion(ae, nv, val, field))
             return val;
         RejectCodeValueIntoDataSlot(ae, nv, field, "default-initialize",
             std::format("field '{}.{}' of", structName, field.VariableName));
@@ -23102,6 +23215,17 @@ bool MainListener::RejectImplicitPrimitiveToPointer(
         if (!compiler->IsImplicitPrimitiveToPointer(target, rhsNV, value)) return false;
         LogErrorContext(ctx, compiler->DescribeImplicitPrimitiveToPointer(
             target, rhsNV, value, action, destination));
+        return true;
+    }
+
+bool MainListener::RejectConstDiscardingConversion(
+    antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& source, llvm::Value* value,
+    const LLVMBackend::TypeAndValue& target) {
+        std::string from, to;
+        if (!Compiler(ctx)->ConversionDiscardsConst(value, source.TypeAndValue, target, from, to))
+            return false;
+        LogErrorContext(ctx, std::format("cannot convert '{}' to '{}': the conversion discards const. "
+            "Use an explicit cast if the object is really writable", from, to));
         return true;
     }
 
@@ -24139,6 +24263,8 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                     fi, fixedElemTV, nv, val, "brace-initialize",
                     std::format("element {} of '{}'", i, name)))
                 continue;
+            if (RejectConstDiscardingConversion(fi, nv, val, fixedElemTV))
+                continue;
 
             // Aggregate leg of the code-value store gate: `Rec*[2] arr = { w, w };`.
             RejectCodeValueIntoDataSlot(fi, nv, fixedElemTV, "brace-initialize",
@@ -24632,6 +24758,7 @@ void MainListener::EmitGlobalFixedArrayInit(
                     gclo && gclo->IsThinFnPtr() && !globalElemTV.Pointer)
                     val = compiler->BareFunctionToThinValue(val, gclo);
                 compiler->RejectImplicitIntegerPointeePointerConversion(nv.TypeAndValue, globalElemTV);
+                RejectConstDiscardingConversion(fi, nv, val, globalElemTV);
                 if (codeValueElem == nullptr
                     && compiler->CodeValueIntoDataDestination(nv, globalElemTV))
                 {
@@ -24701,6 +24828,8 @@ void MainListener::EmitGlobalFixedArrayInit(
         }
 
         auto* globalArr = compiler->CreateGlobalVariable(tv, arrConst);
+        const size_t pendingConstructionsBefore = pendingGlobalDefaultConstructions_.size()
+            + pendingGlobalCxxConstructions_.size();
         // Every element is value-initialized at startup (a zero constant is only the storage).
         if (cxxEmptyBraceElems && globalArr != nullptr)
         {
@@ -24719,15 +24848,19 @@ void MainListener::EmitGlobalFixedArrayInit(
             QueuePendingGlobalConstruction(pendingGlobalDefaultConstructions_, {globalArr, declTv, direct});
         }
 
+        if (pendingConstructionsBefore == pendingGlobalDefaultConstructions_.size()
+                + pendingGlobalCxxConstructions_.size())
+            MarkConstGlobalReadOnly(globalArr, tv);
+
         // Register the global for LSP/--symbol, matching the scalar global path.
         if (auto* s = compiler->GetSymbolSink())
         {
             int dl = (int)direct->getStart()->getLine();
             int dc = (int)direct->getStart()->getCharPositionInLine();
             s->RegisterVariable(name, tv.TypeName, compiler->GetSourceFilePath(), dl, dc,
-                                SpellType(*compiler, tv));
+                                SpellTypeForSymbolDump(*compiler, tv));
             s->Register(SymbolKind::Variable, name, compiler->GetSourceFilePath(), dl, dc,
-                        std::format("{}[{}] {}", SpellType(*compiler, tv), n, name), {}, name);
+                        std::format("{}[{}] {}", SpellTypeForSymbolDump(*compiler, tv), n, name), {}, name);
         }
     }
 
@@ -25168,6 +25301,8 @@ void MainListener::EmitArrayViewInferredInit(
             if (RejectImplicitPointerToNumber(
                     fi, elemTV, nv, val, "brace-initialize",
                     std::format("element {} of '{}'", i, name)))
+                continue;
+            if (RejectConstDiscardingConversion(fi, nv, val, elemTV))
                 continue;
 
             // Aggregate leg of the code-value store gate: `Rec*[] v = { w, w };`.
@@ -26347,12 +26482,12 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
         {
             auto* castCtx = tryGetCastExpression(ctx->expression());
             while (castCtx != nullptr
-                   && castCtx->typeName() != nullptr
+                   && castCtx->castTypeName() != nullptr
                    && castCtx->castExpression() != nullptr)
             {
                 if (!sawCast)
                 {
-                    auto destTV  = ParseTypeName(castCtx->typeName(), false, castCtx);
+                    auto destTV  = ParseCastTypeName(castCtx->castTypeName(), false, castCtx);
                     castTypeName = destTV.TypeName;
                     castElemPtr  = destTV.ElemPointer;
                     sawCast      = true;
@@ -27470,6 +27605,9 @@ CFlatParser::TypeCheckExpressionContext* MainListener::SoleTypeCheckExpressionOf
 LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
         auto argNV = ParseUnaryExpression(ctx->unaryExpression());
+        // Into a C++ parameter the move binds `const T&&` / `const T&` (C++ rule) and nulls nothing.
+        if (!inCxxCallArgument_)
+            RefuseConstObjectWrite(ctx->unaryExpression(), argNV, argNV.Storage, "move");
         auto markMovedPath = [&]() {
             const std::string movePath = LLVMBackend::FieldMoveKey(argNV);
             // Legacy field moves retain their null-dereference behavior (notably, comparing a
@@ -29109,6 +29247,50 @@ void MainListener::RefuseCxxConstReferentWrite(antlr4::ParserRuleContext* ctx,
             LogErrorContext(ctx, std::format(
                 "cannot {} '{}': it is a const C++ object, so its storage is read-only. "
                 "Copy it into a local and modify that instead.", operation, target));
+}
+
+bool MainListener::RefuseConstObjectWrite(antlr4::ParserRuleContext* ctx,
+                                          const LLVMBackend::NamedVariable& target,
+                                          llvm::Value* destination,
+                                          const std::string& operation) {
+        if (ctx == nullptr || destination == nullptr) return false;
+        auto cause = Compiler(ctx)->FindConstWriteCause(destination);
+        using Kind = LLVMBackend::ConstWriteCause::CauseKind;
+        // A union arm shares the union's address (no field GEP), so the arm comes from the access.
+        const bool unionArm = cause.Kind == Kind::None && target.UnionFieldType != nullptr
+            && Compiler(ctx)->IsNativeConstObject(target.TypeAndValue)
+            && !Compiler(ctx)->IsConstructingStorage(destination);
+        if (unionArm) cause.Name = target.TypeAndValue.VariableName;
+        if (cause.Kind == Kind::None && !unionArm) return false;
+        std::string path = ctx->getText();
+        if (path.ends_with("++") || path.ends_with("--")) path.resize(path.size() - 2);
+        const std::string verb = operation == "move" ? "move out of" : operation;
+        if (cause.Kind == Kind::Field || unionArm)
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot {} '{}': field '{}' is const and can only be set during construction",
+                verb, path, cause.Name));
+            return true;
+        }
+        if (cause.Kind == Kind::ThroughPointer)
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot {} '{}': it is reached through a pointer to const ('{}')", verb, path, cause.Name));
+            return true;
+        }
+        const auto* root = &cause.Root;
+        // The whole object, or a field / element reached from it by value.
+        const bool wholeObject = destination == root->Storage
+            && (target.BaseType == nullptr || target.BaseType == root->Type);
+        if (operation == "move")
+            LogErrorContext(ctx, std::format(
+                "cannot move out of const '{}': 'move' nulls the source, which is a write. Let the "
+                "last use consume it, or drop 'const'", path));
+        else if (wholeObject)
+            LogErrorContext(ctx, std::format("cannot {} '{}': it is declared const", operation, path));
+        else
+            LogErrorContext(ctx, std::format("cannot {} '{}': '{}' is const", operation, path, root->Name));
+        return true;
 }
 
 bool MainListener::RefuseCxxConstReceiverCall(antlr4::ParserRuleContext* ctx,

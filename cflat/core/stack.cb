@@ -37,7 +37,8 @@ class stack<T>
             int i = 0;
             while (i < _size)
             {
-                newData[i] = move _data[i];
+                if const (is_pointer(T)) newData[i] = move _data[i];
+                else construct_at(&newData[i], move _data[i]);
                 i++;
             }
             if (_data != nullptr)
@@ -76,7 +77,8 @@ class stack<T>
         else
         {
             if (_size >= _capacity) _grow();
-            _data[_size] = value;
+            if const (is_pointer(T)) _data[_size] = value;
+            else construct_at(&_data[_size], value);
             _size++;
         }
     }
@@ -91,7 +93,7 @@ class stack<T>
         void push(move T value)
         {
             if (_size >= _capacity) _grow();
-            _data[_size] = move value;
+            construct_at(&_data[_size], move value);
             _size++;
         }
     }

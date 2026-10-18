@@ -817,6 +817,34 @@ std::string SpellType(const LLVMBackend& compiler,
     return PrintTypeSpelling(compiler, spelling);
 }
 
+std::string SpellTypeForSymbolDump(const LLVMBackend& compiler,
+                                   const LLVMBackend::TypeAndValue& type)
+{
+    const std::string spelling = SpellType(compiler, type);
+    const int depth = type.IsArrayView ? (type.ElemPointer ? 1 : 0) : type.ValuePointerDepth();
+    const uint8_t mask = type.ConstMask;
+    int constLevel = -1;
+    for (int i = 0; i <= depth; ++i)
+    {
+        if ((mask & (1u << i)) == 0) break;
+        constLevel = i;
+    }
+    if (constLevel < 0) return spelling;
+    if (constLevel == depth) return "const " + spelling;
+
+    auto inner = type;
+    if (type.IsArrayView)
+        inner.ElemPointer = constLevel > 0;
+    else
+    {
+        inner.Pointer = constLevel > 0;
+        inner.ElemPointer = constLevel >= 2;
+        inner.PointerDepth = constLevel;
+    }
+    return "(const " + SpellType(compiler, inner) + ")"
+        + std::string(static_cast<size_t>(depth - constLevel), '*');
+}
+
 std::string SpellDiagnosticType(const LLVMBackend& compiler,
                                 const LLVMBackend::TypeAndValue& type)
 {
