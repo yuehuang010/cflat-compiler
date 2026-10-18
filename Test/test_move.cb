@@ -14519,7 +14519,7 @@ extern int main()
     passed += testT256AliasCallField();
     total += 34;
     passed += testT273ForInitScope();
-    total += 28;
+    total += 32;
     passed += testT207RawLaunder();
     total += 19;
     passed += testT216RebindLocalNotTaken();
@@ -15506,6 +15506,12 @@ void t284Continue() { int s = 0; for (int x = t273Mk()->v; s < 2; s = s + 1) { c
 void t284Nested() { int m = 0; for (int y = 0; m < 2; m = m + 1) { int n = 0; for (int x = t273Mk()->v; n < 1; n = n + 1) { } } }
 void t284ZeroTrip() { int s = 0; for (int x = t273Mk()->v; s < 0; s = s + 1) { } }
 void t284InitAndBody() { int s = 0; for (int x = t273Mk()->v; s < 3; s = s + 1) { gT273Sum = gT273Sum + t273Mk()->v; } }
+// T309: each initializer ends its temporary before the next declarator reads the dtor count.
+void t309PlainTwoDecl() { int x = t273Mk()->v, y = gT273Dtors; gT273Sum = y * 10 + x; }
+void t309ThirdDecl() { int first = 4, x = t273Mk()->v, y = gT273Dtors; gT273Sum = first * 40 + y * 10 + x; }
+void t309ForTwoDecl() { int n = 0; for (int x = t273Mk()->v, y = gT273Dtors; n < 1; n = n + 1) { gT273Sum = y * 10 + x; } }
+T273R* t309RecordDtorThenNull() { gT273Sum = gT273Dtors; return nullptr; }
+void t309RawGetTwoDecl() { T273R* p = t273Mk().get(), q = t309RecordDtorThenNull(); gT273Sum = gT273Sum * 10 + gT273Dtors; }
 void t273Reset() { gT273Dtors = 0; gT273Sum = 0; }
 
 int testT273ForInitScope()
@@ -15562,6 +15568,14 @@ int testT273ForInitScope()
     t273Reset(); t284InitAndBody();
     passed += Test("t284_init_and_body_dtors", gT273Dtors, 4);
     passed += Test("t284_init_and_body_value", gT273Sum, 9);
+    t273Reset(); t309PlainTwoDecl();
+    passed += Test("t309_plain_multidecl_timing_and_value", gT273Dtors * 100 + gT273Sum, 113);
+    t273Reset(); t309ThirdDecl();
+    passed += Test("t309_later_declarator_timing_and_value", gT273Dtors * 200 + gT273Sum, 373);
+    t273Reset(); t309ForTwoDecl();
+    passed += Test("t309_for_init_multidecl_timing_and_value", gT273Dtors * 100 + gT273Sum, 113);
+    t273Reset(); t309RawGetTwoDecl();
+    passed += Test("t309_raw_get_multidecl_timing", gT273Dtors * 100 + gT273Sum, 111);
     return passed;
 }
 

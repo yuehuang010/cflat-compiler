@@ -1,0 +1,14 @@
+import cpp "cpp_interop_explicit.h";
+
+extern int main()
+{
+    T305R2Foo t305R2Foo = default;
+    T305R2Foo* t305R2FooPtr = &t305R2Foo;
+    expect_error("no overload of 't305r2_ref_only'") {
+        int r1 = t305r2_ref_only(&t305R2Foo);
+    }
+    expect_error("no overload of 't305r2_ref_only'") {
+        int r2 = t305r2_ref_only(t305R2FooPtr);
+    }
+    return 0;
+}

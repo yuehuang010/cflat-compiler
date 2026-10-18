@@ -482,3 +482,23 @@ expect_error("cannot join an array view of 'Cfh' with an array view of 'CfhOther
     CfhOther[2] cfhGlobal;
     int cfhCall(int c) { Cfh[2] p; Cfh[] pv = p; Cfh[] j = c != 0 ? pv : cfhGlobal; return j[1].k; }
 }
+
+// RAW-POINTER join door: a '?:' over two raw pointers is one raw pointer, so it may not bind a view.
+// The '??' spelling of the same join carries no pointer shape of its own and was accepted before.
+expect_error("cannot pass a raw pointer 'long*' as array-view parameter 'v' ('int[]')") {
+    int rjcTake(int[] v) { return v == nullptr ? 0 : v[0]; }
+    int rjcCall() { long a = 1; long b = 2; long* l = &a; long* r = &b; return rjcTake(l ?? r); }
+}
+
+// A nullptr arm inherits the raw pointer of its partner (C++ composite pointer type), so the join
+// is still a raw pointer and may not bind a view. Accepted before the fix.
+expect_error("cannot pass a raw pointer 'long*' as array-view parameter 'v' ('int[]')") {
+    int rjnTake(int[] v) { return v == nullptr ? 0 : v[0]; }
+    int rjnCall(int c) { long a = 1; long* l = &a; return rjnTake(c != 0 ? nullptr : l); }
+}
+
+// Same nullptr-arm join with the raw pointer on the left.
+expect_error("cannot pass a raw pointer 'long*' as array-view parameter 'v' ('int[]')") {
+    int rjrTake(int[] v) { return v == nullptr ? 0 : v[0]; }
+    int rjrCall(int c) { long a = 1; long* l = &a; return rjrTake(c != 0 ? l : nullptr); }
+}

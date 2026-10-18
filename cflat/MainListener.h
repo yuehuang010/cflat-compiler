@@ -4714,6 +4714,7 @@ private:
     // before its value is joined with a borrowed consumer.
     bool inCallArgument_ = false;
     bool inCxxCallArgument_ = false;
+    LLVMBackend::TypeAndValue cxxCallArgumentExpectedType_;
     CFlatParser::AssignmentExpressionContext* cxxDirectConstructionArgument_ = nullptr;
     LLVMBackend::TypeAndValue cxxDirectConstructionTargetType_;
     bool cxxDirectConstructionCanDefer_ = true;
@@ -6162,6 +6163,9 @@ public:
         llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined,
         antlr4::ParserRuleContext* trueCtx, antlr4::ParserRuleContext* falseCtx,
         antlr4::ParserRuleContext* ctx);
+    // The '?:' ownership-join diagnostic, owning arm first. Shared by every refusal of a mixed join.
+    void ReportMixedOwnershipTernaryJoin(antlr4::ParserRuleContext* owningCtx,
+        antlr4::ParserRuleContext* borrowCtx, antlr4::ParserRuleContext* ctx);
 
     /*
      * Copying a NAMED owning value into a struct field by value aliases its backing buffer, which
@@ -7185,6 +7189,9 @@ public:
     // > 0 while a compound assignment tries CFlat's `a = a op b` desugaring: that fallback keeps
     // the registered-operator / builtin-conversion resolution and never asks clang.
     int cxxAdlSuppressDepth_ = 0;
+    // The operator expression whose clang ADL request was AMBIGUOUS (refused, logged): its
+    // registered and rewritten fallbacks stay silent so no overload is picked behind clang's back.
+    const antlr4::ParserRuleContext* cxxAdlAmbiguousCtx_ = nullptr;
     struct AdlSuppressScope
     {
         int* depth = nullptr;
@@ -7451,11 +7458,15 @@ public:
      * `program` emitters (ParseProgramDefinition and ParseImportedProgramDefinition). The guard has
      * to be in all five or the same spelling survives through another declaration kind.
      */
+    // A scalar initializer of a C++ class field runs the converting constructor: built into
+    // intoSlot when given (constructedInPlace set), else into a temporary whose value is returned.
     llvm::Value* ParseFieldDefaultInitializer(
         const std::string& structName,
         const LLVMBackend::TypeAndValue& field,
         CFlatParser::AssignmentExpressionContext* ae,
-        bool* srcIsUnsigned = nullptr);
+        bool* srcIsUnsigned = nullptr,
+        llvm::Value* intoSlot = nullptr,
+        bool* constructedInPlace = nullptr);
 
     /*
      * The brace-list spelling of a field default (`Inner i = { x = 1 };` and the bare
@@ -7492,6 +7503,10 @@ public:
         llvm::Value* destination = nullptr,
         CFlatParser::InitializerListContext* braceOverrides = nullptr,
         bool preservePartialScope = false);
+
+    // True when a CFlat struct type runs a user-declared no-arg constructor for itself or for a
+    // struct element reachable through its by-value fields (arrays included).
+    bool CflatStructNeedsCtorConstruction(const std::string& typeName, int depth = 0);
 
     bool CanFreshBraceInitializeAggregate(
         const std::string& typeName,
@@ -7813,6 +7828,10 @@ public:
     // 'f(g(move a))' or 'f(move a + b)' does not.
     static bool IsDirectCallArgument(antlr4::ParserRuleContext* ctx);
     static bool IsCallArgumentThroughParens(antlr4::ParserRuleContext* ctx);
+    // True when `ctx` is an operand arm of a '?:' that is the whole of a call argument (type-blind).
+    static bool IsTernaryArmOfCallArgument(antlr4::ParserRuleContext* ctx);
+    bool IsWholeCxxCallArgumentShape(antlr4::ParserRuleContext* ctx,
+                                     const LLVMBackend::TypeAndValue& expected) const;
 
     /*
      * True when `name` is a by-value STRUCT parameter of the current function that was NOT
@@ -8129,6 +8148,7 @@ public:
 
     bool IsDefaultOnlyExpression(antlr4::ParserRuleContext* ctx,
                                  bool allowParentheses = true) const;
+    bool HasDefaultOnlyTernaryArm(antlr4::ParserRuleContext* ctx) const;
     // T142: types and owns a `default` call argument for the parameter it binds.
     void MaterializeDefaultArgument(antlr4::ParserRuleContext* ctx, LLVMBackend::NamedVariable& argNV,
         const LLVMBackend::TypeAndValue& dest, bool directLoweredSret = false);

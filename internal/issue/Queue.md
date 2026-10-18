@@ -152,7 +152,7 @@ concurrent runs on the same function). Run ids are new for this regroup; old ids
 | - | p3/cpp-fixed-char-array-explicit-class-cast-refused | explicit cast of char[N] | non-literal fixed char array cast to class refused; clang picks char*; T75 review 1, pre-existing |
 | - | p3/cpp-null-macro-and-nullptr-spellings-refused | null-constant classifier + converting ctor | full; NULL/__null/nullptr macros, nullptr -> std::function (T52 review, pre-existing; AFTER T52) |
 | D1b | p3/cpp-nullptr-t-free-function-and-void-pointer-gaps + p3/cpp-unguarded-header-class-template-lookup-fails-cold (cold-cache only) | free-function selection; incremental request units | NEW 2026-09-28 (D1 leftovers) |
-| - | p3/cpp-converting-ctor-raw-array-source-refused-implicit, p3/cpp-expression-template-to-cflat-byvalue-class-param-refused (NEW) | converting-ctor path | absorbed by P1 (converting constructors); land there |
+| - | p3/cpp-expression-template-to-cflat-byvalue-class-param-refused (NEW) | converting-ctor path | absorbed by P1 (converting constructors); land there |
 
 ## E - temporary lifetime, leak, dangle (one issue per run, opus-tier area)
 

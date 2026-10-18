@@ -3074,6 +3074,36 @@ int runRawCountJoinView(int choose)
 struct ViewJoinHolder { int[] v = default; };
 int viewJoinTake(int[] d) { return d[0]; }
 int[] viewJoinPick(int[] a, int[] b, bool c) { return c ? a : b; }
+
+// Accept-set beside the raw-pointer join refusals (err_arrayview_call_arg.cb): a null/default arm
+// joined with a view, a fixed-array join and an 'int*[2]' join all still bind a view parameter,
+// and a null arm joined with a raw pointer still binds a NON-view pointer parameter.
+int rpjTake(int[] d) { return d == nullptr ? 3 : d[0]; }
+int rpjPtr(int*[] d) { return d == nullptr ? 4 : *d[1]; }
+int rpjLong(long* p) { return p == nullptr ? 5 : (int)*p; }
+int runRawPointerJoinAcceptSet(int choose)
+{
+    bool c = choose != 0;
+    int[] view = new int[2];
+    view[0] = 6;
+    int[2] fixed;
+    fixed[0] = 7;
+    int two = 2;
+    int three = 3;
+    int*[2] c1;
+    c1[1] = &two;
+    int*[2] c2;
+    c2[1] = &three;
+    long lv = 1;
+    long* lp = &lv;
+    int a = rpjTake(c ? nullptr : view);
+    int b = rpjTake(c ? view : nullptr);
+    int d = rpjTake(c ? default : view);
+    int e = rpjTake(c ? fixed : fixed);
+    int f = rpjPtr(c ? c1 : c2);
+    int g = rpjLong(c ? nullptr : lp);
+    return a + b + d + e + f + g;
+}
 int runViewTernaryElementJoin(int choose)
 {
     int[3] store; store[0] = 7; store[1] = 8; store[2] = 9;
@@ -4536,6 +4566,8 @@ int testRawArrayRuntimeCount()
         runAlignedGlobalUnknownSource(), 13157);
     passed += Test("raw count ternary array view ranges",
         runRawCountJoinView(1) * 10 + runRawCountJoinView(0), 24);
+    passed += Test("raw pointer join accept-set: null, fixed, int*[2] and null-raw arms",
+        runRawPointerJoinAcceptSet(1) * 100 + runRawPointerJoinAcceptSet(0), 2626);
     passed += Test("view ternary keeps its arms' element at every door",
         runViewTernaryElementJoin(1), 61);
     passed += Test("view ternary field-read arm keeps its element at every door",
@@ -4887,7 +4919,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 100;
+    r = testRawArrayRuntimeCount(); passed += r; total += 101;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 89;

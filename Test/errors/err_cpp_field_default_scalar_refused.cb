@@ -1,0 +1,18 @@
+import cpp "cpp_t310_fldinit.hpp";
+import cpp "cpp_t132_s7_byval.hpp";
+
+// A scalar field default of a C++ class type takes the same constructor selection as a local: a
+// floating initializer through an integer-only constructor is refused, and a literal 0 that clang
+// finds ambiguous between two constructors is refused with the local-variable text.
+expect_error("implicit conversion from 'float' to 'int' loses the fractional part") {
+    struct T310FloatField { t310.IntC c = 2.5; };
+}
+// A variable is not a null constant: a field default of a C++ class with only a pointer constructor is
+// refused like the local `t310.KP k = zero;`, never stored as a plain value.
+int T310Zero = 0;
+expect_error("cannot initialize C++ class 't310.KP' from this expression") {
+    struct T310ZeroField { t310.KP k = T310Zero; };
+}
+expect_error("C++ variadic constructor call 't132.S7' does not match (clang: conversion from 'int' to 't132::S7' is ambiguous)") {
+    struct T310TieField { t132.S7 s = 0; };
+}

@@ -1,0 +1,42 @@
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+// New inherited member/free rank ties share the binary ambiguity diagnostic.
+// item2_equal_distance: the call must be rejected as ambiguous.
+expect_error("ambiguous C++ binary operator 'operator+'") {
+    t307.I2A value = default;
+    int selected = value + 1;
+}
+// inherited_mut_mut: the call must be rejected as ambiguous.
+expect_error("ambiguous C++ binary operator 'operator+'") {
+    t307.IA_mut_mut value = default;
+    int selected = value + 1;
+}
+// inherited_const_const: the call must be rejected as ambiguous.
+expect_error("ambiguous C++ binary operator 'operator+'") {
+    t307.IA_const_const value = default;
+    int selected = value + 1;
+}
+// inherited_const_volatile: the call must be rejected as ambiguous.
+expect_error("ambiguous C++ binary operator 'operator+'") {
+    t307.IA_const_volatile value = default;
+    int selected = value + 1;
+}
+// inherited_volatile_const: the call must be rejected as ambiguous.
+expect_error("ambiguous C++ binary operator 'operator+'") {
+    t307.IA_volatile_const value = default;
+    int selected = value + 1;
+}
+// inherited_volatile_volatile: the call must be rejected as ambiguous.
+expect_error("ambiguous C++ binary operator 'operator+'") {
+    t307.IA_volatile_volatile value = default;
+    int selected = value + 1;
+}
+// inherited_cv_cv: the call must be rejected as ambiguous.
+expect_error("ambiguous C++ binary operator 'operator+'") {
+    t307.IA_cv_cv value = default;
+    int selected = value + 1;
+}
+    return 0;
+}

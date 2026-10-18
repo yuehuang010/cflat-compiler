@@ -17,3 +17,10 @@ T170Vp t170_getvp(void);
 /* Same spelling as a native CFlat struct below: the native name keeps precedence. */
 typedef int (*T170Shadow)(int);
 typedef int (*T170Cb)(int);
+
+/* T311: the C null-pointer macro into function slots (Test/test_function_ptr.cb). */
+#include <stddef.h>
+#define T311_NULL NULL
+
+typedef int (*T311Bin)(int, int);
+struct T311Ops { T311Bin f; int k; };

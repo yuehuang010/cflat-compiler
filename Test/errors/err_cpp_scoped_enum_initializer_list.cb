@@ -1,0 +1,51 @@
+import cpp "cpp_t63_brace_decl.hpp";
+
+extern int main()
+{
+    expect_error("no overload of 't276.t308ScopedArithmeticList'") {
+        int result = t276.t308ScopedArithmeticList({t276.T308SC.s1});
+    }
+    expect_error("no overload of 't276.t308ScopedIntList'") {
+        int result = t276.t308ScopedIntList({t276.T308SC.s1});
+    }
+    expect_error("no overload of 't276.t308ScopedUnsignedList'") {
+        int result = t276.t308ScopedUnsignedList({t276.T308SC.s1});
+    }
+    // T308 round 2 (F1): an int or another enum never converts to an initializer_list of an enum.
+    expect_error("no overload of 't276.t308ScopedList'") {
+        int result = t276.t308ScopedList({1});
+    }
+    expect_error("no overload of 't276.t308EnumOnlyList'") {
+        int result = t276.t308EnumOnlyList({1});
+    }
+    expect_error("no overload of 't276.t308EnumOnlyList'") {
+        int result = t276.t308EnumOnlyList({t276.T308SC.s1});
+    }
+    expect_error("no overload of 't276.t308EnumOnlyList'") {
+        int result = t276.t308EnumOnlyList({t276.E.e1});
+    }
+    expect_error("no overload of 't276.t308ScopedOtherList'") {
+        int result = t276.t308ScopedOtherList({t276.T308SC.s1});
+    }
+    expect_error("no overload of 't276.t308OtherEnumList'") {
+        int result = t276.t308OtherEnumList({t276.T308E.t308E1});
+    }
+    expect_error("no overload of 't276.t308ScopedList'") {
+        int result = t276.t308ScopedList({t276.T308C8.c1});
+    }
+    expect_error("no overload of 't276.t308ScopedList'") {
+        int result = t276.t308ScopedList({t276.T308E.t308E1});
+    }
+    // T308 round 2 (F2): a scoped enum never converts to a non-32-bit or non-int scalar.
+    expect_error("narrows to the C++ parameter's 'i64'") {
+        int result = t276.t308LLList({t276.T308SC.s1});
+    }
+    expect_error("narrows to the C++ parameter's 'i64'") {
+        t276.T308SC t308Local = t276.T308SC.s1;
+        int result = t276.t308LLList({t308Local});
+    }
+    expect_error("narrows to the C++ parameter's 'char'") {
+        int result = t276.t308CharList({t276.T308C8.c1});
+    }
+    return 0;
+}

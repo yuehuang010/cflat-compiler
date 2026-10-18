@@ -530,3 +530,85 @@ struct GlobalScopeRange
 };
 inline int* begin(GlobalScopeRange& range) { return range.values; }
 inline int* end(GlobalScopeRange& range) { return range.values + 2; }
+
+// T306: a C++ ctor taking Twin by value, for `Holder((default))`.
+namespace cppt306
+{
+    class Holder
+    {
+    public:
+        explicit Holder(cpptw::Twin value) : value_(value) {}
+        int value() const { return value_.value(); }
+    private:
+        cpptw::Twin value_;
+    };
+}
+
+// T306 round 2: a by-value Twin ctor param followed by a defaulted param.
+namespace cppt306
+{
+    class DefaultArgHolder
+    {
+    public:
+        explicit DefaultArgHolder(cpptw::Twin value, int bias = 5) : value_(value.value() + bias) {}
+        int value() const { return value_; }
+    private:
+        int value_;
+    };
+}
+
+// T306 round 3: a second by-value constructor, so a `default` argument has no unique parameter type,
+// and a derived Twin for a ternary arm that slices into the Twin parameter.
+namespace cppt306
+{
+    struct PairTag
+    {
+        PairTag() {}
+        PairTag(const PairTag&) {}
+        ~PairTag() {}
+    };
+    class DefaultPairHolder
+    {
+    public:
+        explicit DefaultPairHolder(cpptw::Twin value) : value_(value.value()) {}
+        explicit DefaultPairHolder(PairTag) : value_(-1) {}
+        int value() const { return value_; }
+    private:
+        int value_;
+    };
+    struct DerivedTwin : cpptw::Twin { DerivedTwin() {} };
+    inline DerivedTwin derived_twin() { return DerivedTwin{}; }
+}
+
+namespace cppt306
+{
+    // A nontrivial class with a non-explicit converting constructor from Twin (a converting cast target).
+    struct ConvTwin
+    {
+        cpptw::Twin t;
+        ConvTwin() {}
+        ConvTwin(cpptw::Twin v) : t(static_cast<cpptw::Twin&&>(v)) {}
+        int value() const { return t.value(); }
+    };
+    class ConvTwinHolder
+    {
+    public:
+        explicit ConvTwinHolder(ConvTwin value) : value_(value.value()) {}
+        int value() const { return value_; }
+    private:
+        int value_;
+    };
+}
+
+namespace cppt306
+{
+    // T306 round 4: an unrelated nontrivial class that converts to Twin (a borrowed lvalue arm of another type).
+    struct LookTwin
+    {
+        int field;
+        LookTwin() : field(4) {}
+        LookTwin(const LookTwin& other) : field(other.field) {}
+        ~LookTwin() {}
+        operator cpptw::Twin() const { return cpptw::Twin(field); }
+    };
+}

@@ -8173,9 +8173,22 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                     // T142: `default` names no type, so the by-value parameter it binds supplies the
                                     // value. Exactly one native overload may take it at this position.
+                                    const bool cxxConstructorCall =
+                                        Compiler(ctx)->IsForeignCxxClassWithConstructors(functionName);
+                                    auto* argumentExpression = namedArgument->assignmentExpression();
+                                    const bool defaultOnlyArgument = argumentExpression != nullptr
+                                        && IsDefaultOnlyExpression(argumentExpression);
+                                    if (cxxConstructorCall && argumentExpression != nullptr
+                                        && (defaultOnlyArgument
+                                            || HasDefaultOnlyTernaryArm(argumentExpression)))
+                                    {
+                                        LLVMBackend::TypeAndValue ctorTarget;
+                                        if (Compiler(ctx)->GetUniqueCxxConstructorValueParameter(
+                                                functionName, argIdx, namedArgCtx.size(), ctorTarget))
+                                            argExpectedDest = ctorTarget;
+                                    }
                                     bool defaultArgument = false;
-                                    if (namedArgument->assignmentExpression() != nullptr
-                                        && IsDefaultOnlyExpression(namedArgument->assignmentExpression()))
+                                    if (defaultOnlyArgument)
                                     {
                                         std::vector<std::string> allNames;
                                         allNames.reserve(namedArgCtx.size());
@@ -8241,11 +8254,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argExpectedScope.emplace(&declExpectedType, argExpectedDest);
                                     CallArgumentScope callArgumentScope(
                                         inCallArgument_, ternaryCallArgumentDepth_);
-                                    const bool cxxCallArgument = funcSym != nullptr ? funcSym->IsCxx
-                                        : Compiler(ctx)->HasCxxFunctionTemplate(functionName)
-                                            || (structVar.BaseType != nullptr
-                                                && Compiler(ctx)->HasCxxFunctionTemplateMember(
-                                                    structVar.TypeAndValue.TypeName, primaryIdentifier));
                                     const bool cxxMemberReceiver = structVar.BaseType != nullptr
                                         && !structVar.TypeAndValue.TypeName.empty()
                                         && Compiler(ctx)->IsCxxRecord(
@@ -8268,6 +8276,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         cxxDirectConstructionArgument_ != nullptr
                                         && SoleCxxConstructionPostfix(cxxDirectConstructionArgument_) == ctx
                                         && Compiler(ctx)->IsForeignCxxClassWithConstructors(functionName);
+                                    const bool cxxCallArgument = funcSym != nullptr ? funcSym->IsCxx
+                                        : Compiler(ctx)->HasCxxFunctionTemplate(functionName)
+                                            || (structVar.BaseType != nullptr
+                                                && Compiler(ctx)->HasCxxFunctionTemplateMember(
+                                                    structVar.TypeAndValue.TypeName, primaryIdentifier))
+                                            || cxxConstructorCall || directConstructionParent;
                                     const bool cxxNonTemplateMemberWrapper =
                                         cxxMemberReceiver && !cxxTemplateWrapper
                                         && ((funcSym != nullptr && funcSym->IsCxx)
@@ -8399,6 +8413,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 ? argExpectedDest : LLVMBackend::TypeAndValue{});
                                     CxxCallArgumentScope cxxCallArgumentScope(
                                         inCxxCallArgument_, cxxCallArgument);
+                                    // Only a by-value class slot names what `default` builds: an indirect
+                                    // (pointer / rvalue-ref) wrapper parameter is a lowering, not the destination.
+                                    const bool byValueExpected = !argExpectedDest.Pointer
+                                        && argExpectedDest.PointerDepth == 0 && !argExpectedDest.IsAlias
+                                        && !argExpectedDest.IsRvalueRef;
+                                    llvm::SaveAndRestore<LLVMBackend::TypeAndValue>
+                                        cxxCallArgumentExpectedTypeScope(
+                                            cxxCallArgumentExpectedType_, cxxCallArgument && byValueExpected
+                                                ? argExpectedDest : LLVMBackend::TypeAndValue{});
                                     auto argNV = ParseCallArgument([&] {
                                         return this->ParseAssignmentExpressionNamed(
                                             namedArgument->assignmentExpression());
@@ -8562,6 +8585,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // The POSITIVE depth is the argument-side proof the depth gates
                                     // read; dropped here every argument looks depth-unrecorded.
                                     argVar.TypeAndValue.PointerDepth = argNV.TypeAndValue.PointerDepth;
+                                    // A C++ call may use a converting ctor only from a single pointer
+                                    // whose pointee is a proven C++ record.
+                                    argVar.AllowCxxClassPointerCtorConversion = cxxCallArgument
+                                        && argNV.TypeAndValue.Pointer
+                                        && argNV.TypeAndValue.ValuePointerDepth() == 1
+                                        && Compiler(ctx)->IsCxxRecord(argNV.TypeAndValue.TypeName);
                                     // Same for a FIXED `T[N]`: argValue is already the decayed element-0
                                     // address (LoadNamedVariable), so ConstArraySize is the only surviving
                                     // signal that this was an array - needed by the funcptr shape gate
@@ -11177,6 +11206,12 @@ llvm::Value* MainListener::EmitHeapDefaultConstruct(LLVMBackend* compiler, const
         }
 
         llvm::Value* typedPtr = compiler->builder->CreateBitCast(rawPtr, cflat_llvm::PointerTo(elemType), "elemnew");
+        // The block is freed (never destroyed) if an attribute or the default constructor throws;
+        // the caller's UnwindPartialScope releases the note once the element is returned.
+        compiler->NoteUnwindPartial(compiler->GetFunction(opNewName)
+                ? LLVMBackend::UnwindPartialEntry::Kind::UserNewHeap
+                : LLVMBackend::UnwindPartialEntry::Kind::CflatHeap,
+            typedPtr, typeName, useAligned ? effAlign : 0, sizeVal);
         if (compiler->GetFunction(typeName))
         {
             llvm::Value* structVal = compiler->CreateOverloadedFunctionCall(typeName, {});
@@ -11207,6 +11242,8 @@ llvm::Value* MainListener::ParseElementExpression(CFlatParser::ElementExpression
             return nullptr;
         }
 
+        // T261/T313: holds the block's unwind note across the attributes and children below.
+        LLVMBackend::UnwindPartialScope blockScope(*compiler);
         llvm::Value* structPtr = EmitHeapDefaultConstruct(compiler, tagName, ctx);
         if (!structPtr)
             return nullptr;

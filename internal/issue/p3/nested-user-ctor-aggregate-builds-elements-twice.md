@@ -1,13 +1,22 @@
-# Nested aggregate of user-ctor array elements builds every element twice
+# Field default overridden by a nested list copies then destroys the default
 
-Found: T218 Opus review 1 (2026-10-14), pre-existing on master. `struct E { string s; E() { ... } ~E() {...} };`
-`struct O { E[2] h; }; struct O2 { O[2] a; };` then `O2 v = { a = { { h = { x, x } } } };` runs every `E()`
-twice and the first round leaks: all-braced elements give ct=8 dt=4 on master and after T218; the expression
-form gives master ct=9 dt=4, T218 ct=8 dt=7. Probe: scratch/rev_t218_opus_probe.sh (T218 worktree).
+Found: T312 (2026-10-16), pre-existing on master. Pure CFlat, balanced (no leak, no double destroy).
+`struct E { string s; int w = 0; E() { ct++ } ~E() { dt++ } };` with `E gx = default;`,
+`struct FD { E[2] h = { gx, gx }; };`, `struct R { FD f; int k = 1; };`.
+`R r = { f = { h = { gx, gx } } };` destroys two copies inside the scope (dt=2 before scope exit).
+clang++ -std=c++20 never makes or destroys those default copies (dt=0 inside, dt=2 after).
 
-Also seen (same review, pre-existing): a struct FIELD default `E[2] h = { gx, gx };` never runs `E()` (ct=0) -
-check whether a user ctor must run before the default elements are copied in.
+Identical output on master and on the T312 branch (checked 2026-10-16).
 
-Fix direction: the outer aggregate's zero-fill/construct pass and the inner T129/T218 update route both
-construct the inner elements; construct once (inner update path only) when the outer element is itself built
-by an initializer list.
+Fix direction: when a named field override replaces a braced field default, do not copy the default
+first. The override path (EmitFieldInitializer nested array arm) should replace the field without
+building the default. Copies are not counted by a user ctor, so this shows only in destructor counts.
+
+## Element-expression default-then-replace (T312 review 1, 2026-10-16)
+An element initialized from an EXPRESSION is first default-constructed, then replaced (ct/dt, inside scope -> after):
+- one level `O v = { h = { x, x } };`: CFlat 2/2 -> 2/4 (master and T312 same), clang 0/0 -> 0/2;
+- nested `O2 v = { a = { { h = { x, x } } } };`: master 8/2 -> 8/6, T312 4/2 -> 4/6, clang 2/0 -> 2/4;
+- `h = { move y, {} }` with a unique<R> field: 4 R allocations vs clang 3 (balanced, live 0).
+Leg Test/test_cpp_interop.cb 12936 pins the T312 count (4/6) - update it when this is fixed.
+Fix direction: construct an expression element directly from its initializer (copy/move) instead of default + assign.
+Probe: scratch/repro_keep/wt_t312/rev_t312_opus_probe.sh (cases L_expr_nested, K_expr_1lvl, D2_unique_move).

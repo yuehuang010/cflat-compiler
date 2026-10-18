@@ -1,4 +1,5 @@
 import cpp "../library/cpp_interop_assign.h";
+import cpp "../library/cpp_interop_twin.h";
 
 struct TernaryOwnership
 {
@@ -49,5 +50,65 @@ expect_error("'?:' arms differ in ownership: 'a + b' is an owning value and 'a.c
         cppas.Life b = cppas.Life(4);
         cppas.Life target = cppas.Life(0);
         target = c ? a + b : a.const_ref();
+    }
+}
+
+// T306 round 3: a default-only arm refuses at the ownership join unless the other arm IS the
+// destination class. Shapes: no unique constructor target, a derived arm under a cast, and a
+// converting cast whose other arm is a different class.
+cpptw.Twin rettw() { return default; }
+
+expect_error("'?:' arms differ in ownership: 'rettw()' is an owning value and 'default' is a borrow") {
+    int r3CtorOverloadTernary(bool c)
+    {
+        return cppt306.DefaultPairHolder(c ? default : rettw()).value();
+    }
+}
+
+expect_error("'?:' arms differ in ownership: 'cppt306.derived_twin()' is an owning value and 'default' is a borrow") {
+    int r3CastDerivedArm(bool c)
+    {
+        return cppt306.DefaultArgHolder((cpptw.Twin)(c ? default : cppt306.derived_twin())).value();
+    }
+}
+
+expect_error("'?:' arms differ in ownership: 'rettw()' is an owning value and 'default' is a borrow") {
+    int r3ConvertingCastArm(bool c)
+    {
+        return cppt306.ConvTwinHolder((cppt306.ConvTwin)(c ? default : rettw())).value();
+    }
+}
+
+// T306 round 4: a borrowed lvalue arm of another type owns nothing; the arms differ in type.
+struct R4SameLayout { int field = default; int* d = default; };
+
+expect_error("'?:' arms differ in type: 'cs' is a 'R4SameLayout', but 'default' builds the argument type 'cpptw.Twin'") {
+    int r4CflatLvalueArm(bool c)
+    {
+        R4SameLayout cs = default;
+        return cppt306.Holder(c ? default : cs).value();
+    }
+}
+
+expect_error("'?:' arms differ in type: 'lk' is a 'cppt306.LookTwin', but 'default' builds the argument type 'cpptw.Twin'") {
+    int r4CxxLvalueArm(bool c)
+    {
+        cppt306.LookTwin lk = default;
+        return cppt306.Holder(c ? lk : default).value();
+    }
+}
+
+// T306 round 5: a scalar arm is not an owning value either; the arms differ in type.
+expect_error("'?:' arms differ in type: '5' is a") {
+    int r5ScalarArm(bool c)
+    {
+        return cppt306.Holder(c ? default : 5).value();
+    }
+}
+
+expect_error("'?:' arms differ in type: 'default' builds the argument type 'cpptw.Twin', but 'nullptr' is not that type") {
+    int r5NullArm(bool c)
+    {
+        return cppt306.Holder(c ? default : nullptr).value();
     }
 }

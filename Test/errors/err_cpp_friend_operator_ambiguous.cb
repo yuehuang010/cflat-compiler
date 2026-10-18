@@ -1,0 +1,30 @@
+// A hidden friend `==` set with int and double overloads: `x == 1L` (and the reversed, unsigned,
+// long long and long double spellings) is ambiguous in clang. CFlat must refuse with clang's
+// diagnostic instead of silently picking the friend taking X by value.
+import cpp "cpp_interop_basic.h";
+
+// A generic body is re-walked per instantiation: one ambiguous instantiation must not silence the next.
+int t316Eq<T>(t316.X x, T v) { return x == v; }
+
+extern int main()
+{
+    t316.X x = 1;
+    expect_error("clang: use of overloaded operator '==' is ambiguous") {
+        int a = x == 1L;
+    }
+    expect_error("clang: use of overloaded operator '==' is ambiguous") {
+        int b = 1L == x;
+    }
+    expect_error("clang: use of overloaded operator '==' is ambiguous") {
+        int c = x == 1u;
+    }
+    expect_error("clang: use of overloaded operator '==' is ambiguous") {
+        int d = x == 1LL;
+    }
+    int g1 = t316Eq<int>(x, 1);
+    expect_error("clang: use of overloaded operator '==' is ambiguous") {
+        int g2 = t316Eq<long>(x, 1L);
+    }
+    int g3 = t316Eq<double>(x, 1.0);
+    return 0;
+}

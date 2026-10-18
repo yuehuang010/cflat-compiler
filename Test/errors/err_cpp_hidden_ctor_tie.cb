@@ -1,0 +1,27 @@
+import cpp "cpp_t310_fldinit.hpp";
+
+// clang refuses each of these as ambiguous: a deleted, private or protected char constructor ties with
+// the long one for an int argument (new, by-value and field default), so CFlat must not pick the long one.
+expect_error("conversion from 'int' to 't310::PTc' is ambiguous") {
+    struct T310ProtField { t310.PTc p = 5; };
+}
+extern int main()
+{
+    expect_error("call to constructor of 't310::DCh' is ambiguous") {
+        t310.DCh* d = new t310.DCh(5);
+        return d.v;
+    }
+    expect_error("conversion from 'int' to 't310::PRv' is ambiguous") {
+        t310.PRv p = 5;
+        return p.v;
+    }
+    expect_error("conversion from 'int' to 't310::PRv' is ambiguous") {
+        return t310.takePRv(5);
+    }
+    // A protected char constructor ties with the long one for an int argument (clang: ambiguous).
+    expect_error("call to constructor of 't310::PTc' is ambiguous") {
+        t310.PTc* q = new t310.PTc(5);
+        return q.v;
+    }
+    return 0;
+}

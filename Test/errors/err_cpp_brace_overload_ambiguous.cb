@@ -1,0 +1,40 @@
+// C++ brace-list overloads whose best element ranks tie are ambiguous (clang: "call to '...' is
+// ambiguous"): each leg below was a silent pick of the first-declared overload. Fixtures:
+// Test/library/cpp_t63_brace_decl.hpp (t314). Positive controls with a strictly better element are
+// in Test/test_cpp_interop.cb (T314 legs).
+import cpp "cpp_t63_brace_decl.hpp";
+
+extern int main()
+{
+    // Free functions, both declaration orders: int -> long long and int -> double are both conversions.
+    expect_error("ambiguous call to 't314.ldb': no candidate ranks better than the others") {
+        int r = t314.ldb({1, 2});
+    }
+    expect_error("ambiguous call to 't314.dll': no candidate ranks better than the others") {
+        int r = t314.dll({1, 2});
+    }
+    // unsigned vs long long with int elements: both conversions.
+    expect_error("ambiguous call to 't314.ui': no candidate ranks better than the others") {
+        int r = t314.ui({1, 2});
+    }
+    // float vs double, bool vs double with int elements: both conversions.
+    expect_error("ambiguous call to 't314.fd': no candidate ranks better than the others") {
+        int r = t314.fd({1, 2});
+    }
+    expect_error("ambiguous call to 't314.bd': no candidate ranks better than the others") {
+        int r = t314.bd({1, 2});
+    }
+    // A mixed list: 2.0 is a conversion to long long and to double alike.
+    expect_error("ambiguous call to 't314.ldb': no candidate ranks better than the others") {
+        int r = t314.ldb({1, 2.0});
+    }
+    // Member overloads take the same selector.
+    expect_error("ambiguous call to 'm_ldb': no candidate ranks better than the others") {
+        t314.S s = t314.S();
+        int r = s.m_ldb({1, 2});
+    }
+    expect_error("ambiguous call to 'm_ui': no candidate ranks better than the others") {
+        t314.S s = t314.S();
+        int r = s.m_ui({1, 2});
+    }
+}

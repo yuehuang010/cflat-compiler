@@ -1250,6 +1250,49 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && !compiler->currentFunctionReturnTV.Pointer
             && RejectStackCharBufferEscape(returnNV, errCtx))
             return;
+        /*
+         * `C f() { return new T[n]; }` converts an unnamed raw array result through C's converting
+         * constructor, as the spelled `return C(new T[n]);` does: straight into the sret slot, or
+         * into a temporary whose value returns in registers. Any other shape keeps the rules below.
+         */
+        if (!defaultValue && returnNV.Storage == nullptr && returnNV.TypeAndValue.IsArrayView
+            && returnNV.TypeAndValue.Pointer && !compiler->currentFunctionReturnTV.Pointer
+            && compiler->IsCxxRecord(compiler->currentFunctionReturnTypeName)
+            && compiler->IsRawArrayResult(returnNV.Primary))
+        {
+            const std::string retType = compiler->currentFunctionReturnTypeName;
+            llvm::Value* slot = cxxSretReturn ? cxxSretDest : nullptr;
+            LLVMBackend::TypeAndValue classType;
+            classType.TypeName = retType;
+            if (slot == nullptr)
+                slot = compiler->AllocaAtEntry(compiler->GetType(classType), nullptr,
+                                               "cxx.return.raw");
+            std::string refusal;
+            LLVMBackend::NamedVariable source = returnNV;
+            switch (compiler->ConvertThroughCxxConvertingCtor(source, retType, slot, refusal,
+                    /*directInit*/ false, /*allowScalarNarrowing*/ true))
+            {
+            case LLVMBackend::CxxConvertingCtorResult::Converted:
+                if (cxxSretReturn)
+                {
+                    ProcessPlusPlus();
+                    compiler->FlushOwnedTemps();
+                    compiler->CreateReturnCall(nullptr);
+                    return;
+                }
+                returnNV = LLVMBackend::NamedVariable{};
+                returnNV.TypeAndValue = classType;
+                returnNV.BaseType = compiler->GetType(classType);
+                returnNV.Primary = compiler->CreateLoad(returnNV.BaseType, slot);
+                returnNV.IsRvalue = true;
+                break;
+            case LLVMBackend::CxxConvertingCtorResult::Refused:
+                LogErrorContext(errCtx, refusal);
+                return;
+            default:
+                break;
+            }
+        }
         const bool cxxReturnCallConstructed = cxxSretReturn && !defaultValue && !cxxReturnTernary
             && compiler->pendingCxxSretDest_ == nullptr;
         const bool cxxReturnTernaryConstructed = cxxReturnTernary

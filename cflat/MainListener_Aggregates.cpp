@@ -116,7 +116,10 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                     return value.VariableName == fieldName;
                 });
                 if (field != fields.end()
-                    && explicitNoArgConstructors_.count(field->TypeName) != 0)
+                    && (explicitNoArgConstructors_.count(field->TypeName) != 0
+                        || (field->ConstArraySize > 0 && !field->Pointer && !field->ElemPointer
+                            && !field->IsArrayView && !compiler->IsCxxRecord(field->TypeName)
+                            && CflatStructNeedsCtorConstruction(field->TypeName))))
                     continue;
             }
             // `f = {}` on a plain CFlat struct field: the seed builds it once, like an omitted field.
@@ -317,7 +320,11 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
     auto emitExplicitNoArgNestedOverride = [&](unsigned fieldIndex) {
         if (destination == nullptr || braceOverrides == nullptr) return;
         const auto& field = fields[fieldIndex];
-        if (explicitNoArgConstructors_.count(field.TypeName) == 0) return;
+        if (explicitNoArgConstructors_.count(field.TypeName) == 0
+            && !(field.ConstArraySize > 0 && !field.Pointer && !field.ElemPointer
+                 && !field.IsArrayView && !compiler->IsCxxRecord(field.TypeName)
+                 && CflatStructNeedsCtorConstruction(field.TypeName)))
+            return;
         for (auto* fi : braceOverrides->fieldInit())
         {
             if (fi == nullptr || fi->Identifier() == nullptr
@@ -427,6 +434,24 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
         }
     }
     return structValue;
+}
+
+bool MainListener::CflatStructNeedsCtorConstruction(const std::string& typeName, int depth)
+{
+    if (explicitNoArgConstructors_.count(typeName) != 0) return true;
+    if (depth > 32) return false;
+    auto* compiler = Compiler();
+    const auto data = compiler->GetDataStructure(typeName);
+    if (data.StructType == nullptr || data.IsUnion) return false;
+    for (const auto& field : data.StructFields)
+    {
+        if (field.Pointer || field.ElemPointer || field.IsAlias || field.IsArrayView
+            || field.IsFunctionPointer || field.TypeName == typeName
+            || compiler->IsCxxRecord(field.TypeName))
+            continue;
+        if (CflatStructNeedsCtorConstruction(field.TypeName, depth + 1)) return true;
+    }
+    return false;
 }
 
 bool MainListener::CanFreshBraceInitializeAggregate(
@@ -5347,10 +5372,11 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                             compiler->pendingCxxSretReturn_ = true;
                             compiler->pendingCxxSretForFixedArray_ = true;
                         }
+                        bool constructedInPlace = false;
                         fieldVal = ParseFieldDefaultInitializer(structName, field, assignExpr,
-                            &fieldValSrcUnsigned);
-                        fieldInitializedInPlace = armFieldSret
-                            && compiler->pendingCxxSretDest_ == nullptr;
+                            &fieldValSrcUnsigned, fieldPtr, &constructedInPlace);
+                        fieldInitializedInPlace = constructedInPlace || (armFieldSret
+                            && compiler->pendingCxxSretDest_ == nullptr);
                         if (armFieldSret)
                         {
                             compiler->pendingCxxSretDest_ = nullptr;

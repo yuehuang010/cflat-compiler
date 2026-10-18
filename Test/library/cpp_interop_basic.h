@@ -3302,3 +3302,72 @@ public:
 };
 inline O makeO(int value) { O out; out.set(value); return out; }
 }
+
+// T307: binary member/free ranking across inherited bases and cv qualifications.
+namespace t307 {
+struct I1B { int operator+(int) { return 1; } }; struct I1C : I1B {}; struct I1A : I1C {}; inline int operator+(I1C&, int) { return 2; }
+struct I2B { int operator+(int) { return 1; } }; struct I2C : I2B {}; struct I2A : I2C {}; inline int operator+(I2B&, int) { return 2; }
+struct SBM { int operator+(int) { return 1; } }; struct SBC : SBM {}; struct SBA : SBC {}; inline int operator+(const SBM&, int) { return 2; }
+struct SBCV { int operator+(int) const { return 1; } }; struct SBCVC : SBCV {}; struct SBCVA : SBCVC {}; inline int operator+(SBCV&, int) { return 2; }
+struct SBCR { int operator+(int) const & { return 1; } }; struct SBCRC : SBCR {}; struct SBCRA : SBCRC {}; inline int operator+(SBCR&, int) { return 2; }
+struct SBV { int operator+(int) volatile { return 1; } }; struct SBVC : SBV {}; struct SBVA : SBVC {}; inline int operator+(SBV&, int) { return 2; }
+struct CV_mut_mut { int operator+(int) { return 1; } }; inline int operator+(CV_mut_mut&, int) { return 2; }
+struct CV_mut_const { int operator+(int) { return 1; } }; inline int operator+(const CV_mut_const&, int) { return 2; }
+struct CV_mut_volatile { int operator+(int) { return 1; } }; inline int operator+(volatile CV_mut_volatile&, int) { return 2; }
+struct CV_mut_cv { int operator+(int) { return 1; } }; inline int operator+(const volatile CV_mut_cv&, int) { return 2; }
+struct CV_const_mut { int operator+(int) const { return 1; } }; inline int operator+(CV_const_mut&, int) { return 2; }
+struct CV_const_const { int operator+(int) const { return 1; } }; inline int operator+(const CV_const_const&, int) { return 2; }
+struct CV_const_volatile { int operator+(int) const { return 1; } }; inline int operator+(volatile CV_const_volatile&, int) { return 2; }
+struct CV_const_cv { int operator+(int) const { return 1; } }; inline int operator+(const volatile CV_const_cv&, int) { return 2; }
+struct CV_volatile_mut { int operator+(int) volatile { return 1; } }; inline int operator+(CV_volatile_mut&, int) { return 2; }
+struct CV_volatile_const { int operator+(int) volatile { return 1; } }; inline int operator+(const CV_volatile_const&, int) { return 2; }
+struct CV_volatile_volatile { int operator+(int) volatile { return 1; } }; inline int operator+(volatile CV_volatile_volatile&, int) { return 2; }
+struct CV_volatile_cv { int operator+(int) volatile { return 1; } }; inline int operator+(const volatile CV_volatile_cv&, int) { return 2; }
+struct CV_cv_mut { int operator+(int) const volatile { return 1; } }; inline int operator+(CV_cv_mut&, int) { return 2; }
+struct CV_cv_const { int operator+(int) const volatile { return 1; } }; inline int operator+(const CV_cv_const&, int) { return 2; }
+struct CV_cv_volatile { int operator+(int) const volatile { return 1; } }; inline int operator+(volatile CV_cv_volatile&, int) { return 2; }
+struct CV_cv_cv { int operator+(int) const volatile { return 1; } }; inline int operator+(const volatile CV_cv_cv&, int) { return 2; }
+struct IB_mut_mut { int operator+(int) { return 1; } }; struct IC_mut_mut : IB_mut_mut {}; struct IA_mut_mut : IC_mut_mut {}; inline int operator+(IB_mut_mut&, int) { return 2; }
+struct IB_mut_const { int operator+(int) { return 1; } }; struct IC_mut_const : IB_mut_const {}; struct IA_mut_const : IC_mut_const {}; inline int operator+(const IB_mut_const&, int) { return 2; }
+struct IB_mut_volatile { int operator+(int) { return 1; } }; struct IC_mut_volatile : IB_mut_volatile {}; struct IA_mut_volatile : IC_mut_volatile {}; inline int operator+(volatile IB_mut_volatile&, int) { return 2; }
+struct IB_mut_cv { int operator+(int) { return 1; } }; struct IC_mut_cv : IB_mut_cv {}; struct IA_mut_cv : IC_mut_cv {}; inline int operator+(const volatile IB_mut_cv&, int) { return 2; }
+struct IB_const_mut { int operator+(int) const { return 1; } }; struct IC_const_mut : IB_const_mut {}; struct IA_const_mut : IC_const_mut {}; inline int operator+(IB_const_mut&, int) { return 2; }
+struct IB_const_const { int operator+(int) const { return 1; } }; struct IC_const_const : IB_const_const {}; struct IA_const_const : IC_const_const {}; inline int operator+(const IB_const_const&, int) { return 2; }
+struct IB_const_volatile { int operator+(int) const { return 1; } }; struct IC_const_volatile : IB_const_volatile {}; struct IA_const_volatile : IC_const_volatile {}; inline int operator+(volatile IB_const_volatile&, int) { return 2; }
+struct IB_const_cv { int operator+(int) const { return 1; } }; struct IC_const_cv : IB_const_cv {}; struct IA_const_cv : IC_const_cv {}; inline int operator+(const volatile IB_const_cv&, int) { return 2; }
+struct IB_volatile_mut { int operator+(int) volatile { return 1; } }; struct IC_volatile_mut : IB_volatile_mut {}; struct IA_volatile_mut : IC_volatile_mut {}; inline int operator+(IB_volatile_mut&, int) { return 2; }
+struct IB_volatile_const { int operator+(int) volatile { return 1; } }; struct IC_volatile_const : IB_volatile_const {}; struct IA_volatile_const : IC_volatile_const {}; inline int operator+(const IB_volatile_const&, int) { return 2; }
+struct IB_volatile_volatile { int operator+(int) volatile { return 1; } }; struct IC_volatile_volatile : IB_volatile_volatile {}; struct IA_volatile_volatile : IC_volatile_volatile {}; inline int operator+(volatile IB_volatile_volatile&, int) { return 2; }
+struct IB_volatile_cv { int operator+(int) volatile { return 1; } }; struct IC_volatile_cv : IB_volatile_cv {}; struct IA_volatile_cv : IC_volatile_cv {}; inline int operator+(const volatile IB_volatile_cv&, int) { return 2; }
+struct IB_cv_mut { int operator+(int) const volatile { return 1; } }; struct IC_cv_mut : IB_cv_mut {}; struct IA_cv_mut : IC_cv_mut {}; inline int operator+(IB_cv_mut&, int) { return 2; }
+struct IB_cv_const { int operator+(int) const volatile { return 1; } }; struct IC_cv_const : IB_cv_const {}; struct IA_cv_const : IC_cv_const {}; inline int operator+(const IB_cv_const&, int) { return 2; }
+struct IB_cv_volatile { int operator+(int) const volatile { return 1; } }; struct IC_cv_volatile : IB_cv_volatile {}; struct IA_cv_volatile : IC_cv_volatile {}; inline int operator+(volatile IB_cv_volatile&, int) { return 2; }
+struct IB_cv_cv { int operator+(int) const volatile { return 1; } }; struct IC_cv_cv : IB_cv_cv {}; struct IA_cv_cv : IC_cv_cv {}; inline int operator+(const volatile IB_cv_cv&, int) { return 2; }
+struct NoInheritance { int operator+(int) { return 1; } }; inline int operator+(NoInheritance&, int) { return 2; }
+struct NoInheritanceCv { int operator+(int) { return 1; } }; inline int operator+(const NoInheritanceCv&, int) { return 2; }
+struct OwnPlusBase {};
+struct OwnPlus : OwnPlusBase { int operator+(int) { return 1; } };
+inline int operator+(const OwnPlusBase&, int) { return 2; }
+struct OwnConstPlusBase {};
+struct OwnConstPlus : OwnConstPlusBase { int operator+(int) const { return 1; } };
+inline int operator+(OwnConstPlusBase&, int) { return 2; }
+struct OwnPlusBothBase { int operator+(int) { return 3; } };
+struct OwnPlusBoth : OwnPlusBothBase { int operator+(int) { return 1; } };
+inline int operator+(OwnPlusBothBase&, int) { return 2; }
+struct OwnEqBase {};
+struct OwnEq : OwnEqBase { bool operator==(const OwnEq&) const { return true; } };
+inline bool operator==(const OwnEqBase&, const OwnEqBase&) { return false; }
+struct OwnLtBase {};
+struct OwnLtMid : OwnLtBase {};
+struct OwnLt : OwnLtMid { bool operator<(int) { return true; } };
+inline bool operator<(OwnLtMid&, int) { return false; }
+}
+
+// T316: a hidden friend == set with int and double overloads and a converting ctor. `x == 1L`
+// is ambiguous in clang (refused); the shapes below pick the overload clang picks.
+namespace t316 {
+struct X { int v; X(int x): v(x) {}
+  friend int operator==(const X& a, const X& b) { return 10; }
+  friend int operator==(const X& a, double b) { return 20; }
+  friend int operator==(const X& a, int b) { return 30; } };
+}

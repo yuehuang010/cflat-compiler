@@ -507,7 +507,13 @@ import cpp "library/cpp_t78_scalar_table.h";
 import cpp "library/cpp_interop_t104_refparam.hpp";
 import cpp "library/cpp_t87_null_zero.h";
 import cpp "library/cpp_t132_s7_byval.hpp";
+import cpp "library/cpp_t310_fldinit.hpp";
 import cpp "library/cpp_private_base_shadow.h";
+// T310 FLDINIT: scalar field defaults of C++ class type run the converting constructor.
+struct T310FieldW { t310.IntC c = 5; };
+struct T310FieldK { t310.KP k = 0; };
+struct T310FieldCT { t310.CT c = 5; };
+struct T310FieldCTL { t310.CT c = 5L; };
 int t248ViaConstFnParam(const function<int(int)> p)
 {
     return t63.call_t232_fn_pick(t63.CallT232FnPick(p));
@@ -1993,6 +1999,14 @@ struct T218Single { T129UserCtor[1] h; };
 struct T218Triple { T129UserCtor[3] h; };
 int t218Live = 0;
 struct T218Own { int v = 0; T218Own() { t218Live = t218Live + 1; } ~T218Own() { t218Live = t218Live - 1; } };
+// T312: user-ctor element counters for the nested aggregate and field-default legs (in main).
+int t312Ct = 0;
+int t312Dt = 0;
+struct T312E { string s; int w = 0; T312E() { t312Ct = t312Ct + 1; } ~T312E() { t312Dt = t312Dt + 1; } };
+struct T312O { T312E[2] h; };
+struct T312O2 { T312O[2] a; };
+T312E t312Gx = default;
+struct T312FD { T312E[2] h = { t312Gx, t312Gx }; };
 struct T218Owned { unique<T218Own> u; int k = 1; T218Owned() { k = 2; u = unique<T218Own>(new T218Own()); } };
 struct T218OwnedArray { T218Owned[2] h; };
 T129UserCtor T218Make() { T129UserCtor r = { m = 9 }; return r; }
@@ -2031,6 +2045,58 @@ int t261Lowered(int x) { T261HV hv0 = default; T261LowPair w = { a = hv0, b = t2
 T261HV t261Mk(int x) { T261HV h = default; t261.boom(x); return h; }
 struct T261WB { T261HV c; int b = 0; };
 int t261Field(int x) { T261HV h0 = default; T261WB w = { c = h0, b = t261.bval(x) }; return w.b; }
+// T313: the element block of a tag form (or `new T{...}`) whose attribute throws is freed once,
+// through the operator new/delete pair it came from: the user pair when the struct declares one.
+int t313UnNew = 0;
+int t313UnDel = 0;
+struct T313UN { t261.Counted a; t261.Counted b; int z = 0;
+    static void* operator new(i64 n) { t313UnNew = t313UnNew + 1; return malloc(n); }
+    static void operator delete(void* p) { t313UnDel = t313UnDel + 1; free(p); }
+};
+int t313UserTag(int x) { t261.Counted h0 = default; T313UN* p = <T313UN a={h0} b={t261.mk(x)} />; int z = p->z; delete p; return z; }
+int t313UserTagOk(int x) { t261.Counted h0 = default; T313UN* p = <T313UN a={h0} b={t261.mk(x + 5)} />; int z = p->z; delete p; return z; }
+int t313UserNew(int x) { t261.Counted h0 = default; T313UN* p = new T313UN{ a = h0, b = t261.mk(x) }; int z = p->z; delete p; return z; }
+struct T313UC { t261.Counted a; int z = 0;
+    static void* operator new(i64 n) { t313UnNew = t313UnNew + 1; return malloc(n); }
+    static void operator delete(void* p) { t313UnDel = t313UnDel + 1; free(p); }
+    T313UC(int x) { z = t261.bval(x); }
+};
+int t313CtorThrow(int x) { T313UC* p = new T313UC(x); int z = p->z; delete p; return z; }
+// T313 r2: a class whose only operator delete is sized (void*, i64) frees the block through it on unwind.
+int t313SdNew = 0;
+int t313SdDel = 0;
+struct T313SD { t261.Counted a; int z = 0;
+    static void* operator new(i64 n) { t313SdNew = t313SdNew + 1; return malloc(n); }
+    static void operator delete(void* p, i64 n) { t313SdDel = t313SdDel + 1; free(p); }
+};
+int t313SdOk(int x) { T313SD* p = <T313SD z={x} />; int z = p->z; return z; }
+int t313SdTag(int x) { t261.Counted h0 = default; T313SD* p = <T313SD a={h0} z={t261.bval(x)} />; int z = p->z; return z; }
+int t313SdBrace(int x) { t261.Counted h0 = default; T313SD* p = new T313SD{ a = h0, z = t261.bval(x) }; int z = p->z; return z; }
+// T313 r2: `new T[3]` with a user operator new: a throwing element frees the block through the user delete.
+int t313ArN = 0;
+int t313ArD = 0;
+int t313ArX = 0;
+struct T313AR { t261.Counted a; int z = 0;
+    static void* operator new(i64 n) { t313ArN = t313ArN + 1; return malloc(n); }
+    static void operator delete(void* p) { t313ArD = t313ArD + 1; free(p); }
+    T313AR() { t313ArX = t313ArX + 1; z = t261.bval(t313ArX - 1); }
+};
+int t313ArrThrow(int unused) { T313AR* p = new T313AR[3]; delete[3] p; return unused; }
+// T313 r3: only non-usual class deletes ((void*, int), (void*, int, int)): compiles, unwind frees nothing (clang).
+int t313NuNew = 0;
+int t313NuDel = 0;
+struct T313NI { t261.Counted a; int z = 0;
+    static void* operator new(i64 n) { t313NuNew = t313NuNew + 1; return malloc(n); }
+    static void operator delete(void* p, int a) { t313NuDel = t313NuDel + 1; free(p); }
+};
+struct T313NII { t261.Counted a; int z = 0;
+    static void* operator new(i64 n) { t313NuNew = t313NuNew + 1; return malloc(n); }
+    static void operator delete(void* p, int a, int b) { t313NuDel = t313NuDel + 1; free(p); }
+    T313NII(int x) { z = t261.bval(x); }
+};
+int t313NiTag(int x) { t261.Counted h0 = default; T313NI* p = <T313NI a={h0} z={t261.bval(x)} />; int z = p->z; return z; }
+int t313NiBrace(int x) { t261.Counted h0 = default; T313NI* p = new T313NI{ a = h0, z = t261.bval(x) }; int z = p->z; return z; }
+int t313NiiArgs(int x) { T313NII* p = new T313NII(x); int z = p->z; return z; }
 struct T130ReturnHolder { cppexp.ConvCnt c; int k = 1; };
 struct T130Generic<T> { T c; int k = 1; };
 struct T130ThrowHolder { cppunw.Tx t; int k = 1; };
@@ -2527,6 +2593,69 @@ extern int main()
     if (t280Bv + 1 != 2) return 27517;
     t280.ByValLongDer t280Bl = default;
     if (t280Bl + 1 != 2) return 27518;
+    // T307: binary member/free ranking across inherited bases and cv qualifications.
+    // Distinct member/free return tags make each ranking decision observable.
+    t307.I1A t307_item1_nearer_free = default;
+    if (t307_item1_nearer_free + 1 != 2) return 30701;
+    // T307 round 2: exact member object bindings beat inherited-base reference conversions.
+    t307.SBA t307_samebase_mut = default;
+    if (t307_samebase_mut + 1 != 1) return 30726;
+    t307.IA_mut_const t307_inherited_mut_const = default;
+    if (t307_inherited_mut_const + 1 != 1) return 30727;
+    t307.IA_mut_volatile t307_inherited_mut_volatile = default;
+    if (t307_inherited_mut_volatile + 1 != 1) return 30728;
+    t307.IA_mut_cv t307_inherited_mut_cv = default;
+    if (t307_inherited_mut_cv + 1 != 1) return 30729;
+    t307.IA_const_cv t307_inherited_const_cv = default;
+    if (t307_inherited_const_cv + 1 != 1) return 30730;
+    t307.CV_mut_cv t307_cv_mut_cv = default;
+    if (t307_cv_mut_cv + 1 != 1) return 30731;
+    t307.CV_const_cv t307_cv_const_cv = default;
+    if (t307_cv_const_cv + 1 != 1) return 30732;
+    t307.CV_volatile_cv t307_cv_volatile_cv = default;
+    if (t307_cv_volatile_cv + 1 != 1) return 30733;
+    t307.NoInheritanceCv t307_noinherit_control = default;
+    if (t307_noinherit_control + 1 != 1) return 30734;
+    t307.OwnPlus t307_own_plus = default;
+    if (t307_own_plus + 1 != 1) return 30735;
+    t307.OwnConstPlus t307_own_const_plus = default;
+    if (t307_own_const_plus + 1 != 1) return 30736;
+    t307.OwnPlusBoth t307_own_plus_both = default;
+    if (t307_own_plus_both + 1 != 1) return 30737;
+    t307.OwnEq t307_own_eq = default;
+    t307.OwnEq t307_own_eq_other = default;
+    if (!(t307_own_eq == t307_own_eq_other)) return 30738;
+    t307.OwnLt t307_own_lt = default;
+    if (!(t307_own_lt < 1)) return 30739;
+    t307.SBCVA t307_samebase_const = default;
+    if (t307_samebase_const + 1 != 2) return 30703;
+    t307.SBCRA t307_samebase_constref = default;
+    if (t307_samebase_constref + 1 != 2) return 30704;
+    t307.SBVA t307_samebase_volatile = default;
+    if (t307_samebase_volatile + 1 != 2) return 30705;
+    t307.IA_const_mut t307_inherited_const_mut = default;
+    if (t307_inherited_const_mut + 1 != 2) return 30719;
+    t307.IA_volatile_mut t307_inherited_volatile_mut = default;
+    if (t307_inherited_volatile_mut + 1 != 2) return 30721;
+    t307.IA_cv_mut t307_inherited_cv_mut = default;
+    if (t307_inherited_cv_mut + 1 != 2) return 30723;
+    t307.IA_cv_const t307_inherited_cv_const = default;
+    if (t307_inherited_cv_const + 1 != 2) return 30724;
+    t307.IA_cv_volatile t307_inherited_cv_volatile = default;
+    if (t307_inherited_cv_volatile + 1 != 2) return 30725;
+    // T316: hidden friend == set (int, double, X): the unambiguous shapes pick clang's overload
+    // (oracle: 30 30 20 20 20 20 30 30 10 20 20 20); the ambiguous ones are refused in errors/.
+    t316.X t316X = 1;
+    if ((t316X == 1) != 30) return 30740;
+    if ((1 == t316X) != 30) return 30741;
+    if ((t316X == 1.0) != 20) return 30742;
+    if ((1.0 == t316X) != 20) return 30743;
+    if ((t316X == 1.5) != 20) return 30744;
+    if ((t316X == 1.0f) != 20) return 30745;
+    if ((t316X == 'c') != 30) return 30746;
+    if ((t316X == true) != 30) return 30747;
+    if ((t316X == t316X) != 10) return 30748;
+    if ((t316X == (int)1L) != 30) return 30749;
     // T291 (clang++ -std=c++20 oracle: 1 0 1 0 1 / 0 1 / 0 / 1 0 / 1 0 / 0 1): a reversed
     // `<=>` relation (`5 > x` as `0 > (x <=> 5)`) reads the mirrored ordering range.
     if (!(5 > t291.ordMemberMake(4))) return 27519;
@@ -2765,6 +2894,45 @@ extern int main()
     t140.SIN* t180IntLit = new t140.SIN(5);   // literal 5 is int: exact, clang 33
     if (t180IntLit.v != 33) return 13222;
     delete t180IntLit;
+    // T310 FLDINIT: field defaults of C++ class type (clang: 5, 5, 5, 1) and their one construction and
+    // destruction (live counter: +1 inside the block, back afterwards).
+    T310FieldW t310W;
+    if (t310W.c.v != 5) return 13301;
+    T310FieldW t310WBrace{};
+    if (t310WBrace.c.v != 5) return 13302;
+    T310FieldW* t310WNew = new T310FieldW();
+    if (t310WNew.c.v != 5) return 13303;
+    delete t310WNew;
+    T310FieldK t310K;
+    if (t310K.k.was_null != 1) return 13304;
+    int t310Live = t310.liveCount();
+    {
+        T310FieldCT t310Ct;
+        if (t310.liveCount() != t310Live + 1) return 13305;
+    }
+    if (t310.liveCount() != t310Live) return 13306;
+    // T310 round 2: a long literal into a C++ class field default takes the converting constructor (clang: 5, one
+    // construction and destruction).
+    int t310LiveL = t310.liveCount();
+    {
+        T310FieldCTL t310CtL;
+        if (t310CtL.c.v != 5) return 13311;
+        if (t310.liveCount() != t310LiveL + 1) return 13312;
+    }
+    if (t310.liveCount() != t310LiveL) return 13313;
+    // T310 ITEM 8: `new K{0}` is the paren form's constructor call (clang: 1).
+    t310.KP* t310KNew = new t310.KP{0};
+    if (t310KNew.was_null != 1) return 13307;
+    delete t310KNew;
+    // T310 ITEM 7 accept controls (clang: 33, 1): an exact int beats a private char tie, and an exact long
+    // beats a narrowing sibling.
+    t310.HideOk* t310Hide = new t310.HideOk(5);
+    if (t310Hide.v != 33) return 13308;
+    delete t310Hide;
+    if (t310.takeHideOk(5) != 33) return 13309;
+    t310.PRv* t310PrL = new t310.PRv(5L);
+    if (t310PrL.v != 1) return 13310;
+    delete t310PrL;
     // A scalar-reference constructor beside a pointer one: the null literal reaches the mirror's selector
     // as 0, so the pointer constructor wins (clang: 99).
     t87.NullRef* t87L98138 = new t87.NullRef(0, 1.5);
@@ -4592,6 +4760,24 @@ extern int main()
     if (t286.ci({CE.ce1}) != 2) return 27058;
     if (t286.ee(t286.IE.ie1) != 101 || t286.ee(CE.ce1) != 201) return 27059;
     if (t286.si1(CU.cu1) != 1) return 27060;
+    // T308: scoped enums keep identity in list binding; an imported enum list beats int.
+    t276.T308SC t308Scoped = t276.T308SC.s1;
+    if (t276.t308ScopedList({t276.T308SC.s1}) != 8
+        || t276.t308ScopedList({t308Scoped}) != 8) return 27061;
+    if (t276.t308EnumRank({t276.T308E.t308E1, t276.T308E.t308E1}) != 101) return 27062;
+    // Accept-set: unscoped enum and int lists still bind to initializer_list<int>.
+    if (t276.t308UnscopedIntList({t276.E.e1}) != 41 || t276.t308IntList({1, 2}) != 51) return 27063;
+    // The literal array extent includes its NUL; this literal has extent 7.
+    if (t286.sc7("CE.one") != 72) return 27064;
+    // T314: a strictly better brace element match still wins; equal-rank ties are refused in
+    // Test/errors/err_cpp_brace_overload_ambiguous.cb (clang oracle: 1/1/2/1/1/1/1).
+    t314.S t314S = t314.S();
+    if (t314.id({1, 2}) != 1 || t314.ui({1u, 2u}) != 1 || t314.fd({1.0, 2.0}) != 2) return 27065;
+    if (t314.ldb({1LL, 2LL}) != 1 || t314.dll({1.0, 2.0}) != 1) return 27066;
+    if (t314S.m_ui({1u, 2u}) != 1 || t314S.m_ldb({1LL, 2LL}) != 1) return 27067;
+    if (t314.fd({1.5f, 2.5f}) != 1) return 27068;
+    // A plain argument or a ref-qualified receiver decides these; a braced-element tie must not refuse.
+    if (t314.pb(1, {1, 2}) != 1 || t314S.m_pb(1, {1, 2}) != 1 || t314S.m_rq({1, 2}) != 1) return 27069;
     if (t3lookup.f1() != 1) return 13001;
     if (t3lookup.f2() != 1) return 13002;
     if (t3lookup.f3() != 1) return 13003;
@@ -9527,6 +9713,47 @@ extern int main()
         long long cipLong = 7;   // long long: long is int-width on LLP64 and would convert
         int cipBad = cipH - &cipLong;
     }
+    // T305: C++ call arguments can convert a proven C++ record pointer through a ctor.
+    T305CallFoo t305CallFoo = default;
+    T305CallFoo* t305CallFooPtr = &t305CallFoo;
+    T305CallDerived t305CallDerived = default;
+    T305CallDerived* t305CallDerivedPtr = &t305CallDerived;
+    T305CallObj t305CallObj = default;
+    if (t305_call_take_r(&t305CallFoo) != 113 || t305_call_selected() != 1) return 9740;
+    if (t305CallObj.take_r(&t305CallFoo) != 213 || t305_call_selected() != 2) return 9741;
+    if (t305_call_take_r(t305CallFooPtr) != 113 || t305_call_selected() != 1) return 9742;
+    if (t305_call_take_r(t305_call_make_foo()) != 113 || t305_call_selected() != 1) return 9743;
+    // Exact pointer overloads beat conversion through T305CallR for mutable and const pointers.
+    if (t305_call_choose_mut(t305CallFooPtr) != 503 || t305_call_selected() != 5) return 9744;
+    if (t305_call_choose_const(t305CallFooPtr) != 303 || t305_call_selected() != 3) return 9745;
+    if (t305_call_choose_const(t305_call_make_cfoo()) != 303
+        || t305_call_selected() != 3) return 9746;
+    if (t305_call_take_rbase(t305CallDerivedPtr) != 704
+        || t305_call_selected() != 7) return 9747;
+    if (t305_call_take_base_ptr(t305CallDerivedPtr) != 1034
+        || t305_call_selected() != 10) return 9748;
+    // Round 2: a pointer argument must not bind RR(const Foo&); C++ selects the pointer ctor.
+    T305R2Foo t305R2Foo = default;
+    T305R2Host t305R2Host = default;
+    if (t305r2_ref_or_ptr(&t305R2Foo) != 2 || t305r2_selected() != 402) return 9749;
+    // The same constructor filter applies to T304's class-pointer operator operand path.
+    if (&t305R2Foo - t305R2Host != 23 || t305r2_selected() != 502) return 9750;
+    // Round 3: a const reference to a pointer parameter gets the address of a pointer temporary.
+    T305R3Foo t305R3Foo = default;
+    T305R3Foo* t305R3FooPtr = &t305R3Foo;
+    if (t305r3_take(t305R3FooPtr) != 10 || t305r3_selected() != 1) return 9751;
+    // Round 4: a derived pointer (base at a non-zero offset) is adjusted before the temp
+    // stores it, null stays null; a non-const `int*&` writes back into the argument slot.
+    T305R4Derived t305R4D = default;
+    T305R4Derived* t305R4DPtr = &t305R4D;
+    T305R4Derived* t305R4DNull = nullptr;
+    T305R4Host t305R4H = default;
+    if (t305r3_take(t305R4DPtr) != 10 || t305r3_take(&t305R4D) != 10) return 9752;
+    if (t305r3_take(t305R4DNull) != -1)                                 return 9753;
+    if (t305R4H + t305R4DPtr != 70)                                     return 9754;
+    int t305R4Iv = 8;
+    int* t305R4Ip = &t305R4Iv;
+    if (t305r4_take_int(t305R4Ip) != 8 || t305R4Ip != nullptr)         return 9755;
     // ACCEPT SET (passes pre-fix too): an exact `const int*` overload beats the user-defined
     // conversion, and a spelled constructor argument already converted.
     if (cppexp.conv_ip_exact(&cipK) != 2 || cppexp.conv_ip_exact(cipP) != 2)   return 2272;
@@ -11177,6 +11404,15 @@ extern int main()
         cpptw.reset_counts();
         int observed = lu_shadow_exact(cpptw.Twin(7));
         if (observed != 57 || cpptw.packed_counts() != 114) return 3349;
+    }
+    // T309: a foreign Twin temp dies before the next local declarator reads its counter.
+    {
+        cpptw.reset_counts();
+        int value = cpptw.Twin(17).value(), observed = cpptw.dtor_count();
+        if (value != 17 || observed != 1 || cpptw.ctor_count() != 1
+            || cpptw.copy_count() != 0 || cpptw.move_count() != 0
+            || cpptw.dtor_count() != 1 || cpptw.live_allocations() != 0)
+            return 3350;
     }
 
     // ---- a C++ reference return and a derived pointer at a RETURN statement (3370-3389) ----
@@ -15215,6 +15451,28 @@ extern int main()
     t102Converted = 5;
     if (t102a.convert_assign_value(t102Converted) != 5
         || t102a.convert_assign_ctor_count() != 2) return 3289;
+    // T317: an unnamed `new T[n]` source converts through the implicit converting constructor taking
+    // const int*, as the spelled `NX(new int[3])` does, in assignment, declaration, call and return.
+    {
+        t317rawarr.NX t317a = default;
+        t317a = new int[3];
+        if (t317a.p == nullptr)                                                  return 99101;
+        t317rawarr.NX t317d = new int[3];
+        if (t317d.p == nullptr)                                                  return 99102;
+        if (t317rawarr.take_nx(new int[3]) != 0)                                 return 99103;
+        if (t317rawarr.take_nx_ref(new int[3]) != 0)                             return 99104;
+        t317rawarr.NX t317r = T317MakeNx();
+        if (t317r.p == nullptr)                                                  return 99105;
+        t317rawarr.NZ t317z = default;
+        t317z = new int[3];
+        if (t317z.p == nullptr)                                                  return 99106;
+        if (t317rawarr.take_nz(new int[3]) != 0)                                 return 99107;
+    }
+    // An explicit converting constructor is still refused implicitly for a raw array source.
+    expect_error("is declared explicit, so it is not offered as an implicit conversion") {
+        t317rawarr.XE t317x = default;
+        t317x = new int[3];
+    }
     return 0;
 }
 
@@ -16291,6 +16549,37 @@ int LoweredUserDtorAssignLegs(int argc)
         T129ArrayOuter t218MoveArr = { h = { move t218M1, t218M2 } };
     }
     if (cppexp.conv_ctor_count() != cppexp.conv_dtor_count()) return 12932;
+    // T312: a nested aggregate of user-ctor array elements builds each element's ctor once.
+    // Oracle: clang++ -std=c++20 (braced nested: ct 4 dt 4); expression elements keep the
+    // one-level T218 default-then-replace count (copies are not counted by t312Ct).
+    t312Ct = 0; t312Dt = 0;
+    {
+        T312O2 t312Braced = { a = { { h = { {}, {} } } } };
+    }
+    if (t312Ct != 4 || t312Dt != 4) return 12933;
+    t312Ct = 0; t312Dt = 0;
+    {
+        T312O2* t312Heap = new T312O2 { a = { { h = { {}, {} } } } };
+        delete t312Heap;
+    }
+    if (t312Ct != 4 || t312Dt != 4) return 12934;
+    T312E t312X = default;
+    t312X.w = 7;
+    t312Ct = 0; t312Dt = 0;
+    {
+        T312O2 t312Expr = { a = { { h = { t312X, t312X } } } };
+        if (t312Expr.a[0].h[0].w != 7 || t312Expr.a[0].h[1].w != 7) return 12935;
+        if (t312Expr.a[1].h[0].w != 0) return 12935;
+    }
+    // Known gap vs clang (2/4): element-expression default-then-replace, p3 nested-user-ctor-aggregate-builds-elements-twice.
+    if (t312Ct != 4 || t312Dt != 6) return 12936;
+    // Guard (passes on master too): field default `E[2] h = { gx, gx }` copy-initializes from gx, no E()
+    // runs and each copy is destroyed once, as in clang.
+    t312Ct = 0; t312Dt = 0;
+    {
+        T312FD t312Fd;
+    }
+    if (t312Ct != 0 || t312Dt != 2) return 12937;
     // T253: a lowered CFlat brace element uses C++ member-wise construction for each move arm.
     t253.reset();
     int t253A = 0; int t253B = 0; int t253K = 0;
@@ -16532,6 +16821,60 @@ int LoweredUserDtorAssignLegs(int argc)
     t261.reset();
     t258A = t261.guarded(t261Field, 1);
     if (t258A != -7 || t261.ctors() != 1 || t261.copies() != 1 || t261.dtors() != 2) return 25335;
+    // T313: a tag-form block freed when an attribute throws (heap audit: no leak), then the user pair.
+    HeapAudit.enable();
+    int t313Base = (int)HeapAudit.reportLeaks();
+    t261.reset();
+    t258A = t261.guarded(t261Tag, 1);
+    if (t258A != -7 || (int)HeapAudit.reportLeaks() != t313Base) return 25336;
+    t313UnNew = 0;
+    t313UnDel = 0;
+    t261.reset();
+    t258A = t261.guarded(t313UserTag, 1);
+    if (t258A != -7 || t313UnNew != 1 || t313UnDel != 1 || t261.dtors() != 4) return 25337;
+    t313UnNew = 0;
+    t313UnDel = 0;
+    t258A = t313UserTagOk(1);
+    if (t258A != 0 || t313UnNew != 1 || t313UnDel != 1) return 25338;
+    t313UnNew = 0;
+    t313UnDel = 0;
+    t261.reset();
+    t258A = t261.guarded(t313UserNew, 1);
+    if (t258A != -7 || t313UnNew != 1 || t313UnDel != 1 || t261.dtors() != 2) return 25339;
+    // T313: `new T(args)` whose constructor throws frees the user-new block through the user delete.
+    t313UnNew = 0;
+    t313UnDel = 0;
+    t258A = t261.guarded(t313CtorThrow, 1);
+    if (t258A != -7 || t313UnNew != 1 || t313UnDel != 1) return 25340;
+    // T313 r2: sized-only operator delete: the no-throw path is correct, a throw frees once through it.
+    t313SdNew = 0;
+    t313SdDel = 0;
+    t258A = t313SdOk(3);
+    if (t258A != 3 || t313SdNew != 1 || t313SdDel != 0) return 25341;
+    t313SdNew = 0;
+    t313SdDel = 0;
+    t258A = t261.guarded(t313SdTag, 1);
+    if (t258A != -7 || t313SdNew != 1 || t313SdDel != 1) return 25342;
+    t313SdNew = 0;
+    t313SdDel = 0;
+    t258A = t261.guarded(t313SdBrace, 1);
+    if (t258A != -7 || t313SdNew != 1 || t313SdDel != 1) return 25343;
+    // T313 r2: `new T[3]` with a user operator new: a throwing element frees the block once.
+    t313ArN = 0;
+    t313ArD = 0;
+    t313ArX = 0;
+    t261.reset();
+    t258A = t261.guarded(t313ArrThrow, 1);
+    if (t258A != -7 || t313ArN != 1 || t313ArD != 1 || t261.dtors() != 2) return 25344;
+    // T313 r3: non-usual-only class deletes: the throwing path calls no user deallocator.
+    t313NuNew = 0;
+    t313NuDel = 0;
+    t258A = t261.guarded(t313NiTag, 1);
+    if (t258A != -7 || t313NuNew != 1 || t313NuDel != 0) return 25345;
+    t258A = t261.guarded(t313NiBrace, 1);
+    if (t258A != -7 || t313NuNew != 2 || t313NuDel != 0) return 25346;
+    t258A = t261.guarded(t313NiiArgs, 1);
+    if (t258A != -7 || t313NuNew != 3 || t313NuDel != 0) return 25347;
     // No-throw controls: the same initializers build and destroy each object exactly once.
     t261.reset();
     t258A = t261.guarded(t261Pair, 0);
@@ -17753,3 +18096,4 @@ void T249DeclPairParen(bool k, int* o)
     }
     T249ReadCounts(o);
 }
+t317rawarr.NX T317MakeNx() { return new int[3]; }

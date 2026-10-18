@@ -131,6 +131,15 @@
       "makeJoinBox()",
       "borrowed"
     ],
+    "armsdifferintypearg0...armtotheargumenttyped6a6000d02c21947": [
+      "cs",
+      "R4SameLayout",
+      "cpptw.Twin"
+    ],
+    "armsdifferintypedefa...armtotheargumenttypea4be80217395fe9c": [
+      "cpptw.Twin",
+      "nullptr"
+    ],
     "basearg0ofstructarg1isnotacclass": [
       "LocalIface",
       "Bad"
@@ -1979,6 +1988,8 @@
     "argumentforinterface...hasnoresolvedstorage7ebcdaffd59e5355": "argument for interface parameter '{0}' of {1} has no resolved storage",
     "armsdifferinownershi...dmakebotharmsborrows33877404c72b56a3": "'?:' arms differ in ownership: '{0}' allocates a value the join cannot own and '{1}' is a borrow of an existing value, so the allocating arm leaks whenever it is taken. Either 'move' the borrowed side into a fresh value so both arms own, or allocate into a named owner before the '?:' and make both arms borrows.",
     "armsdifferinownershi...rmakebotharmsborrows499fceef95c57fab": "'?:' arms differ in ownership: '{0}' is an owning value and '{1}' is a borrow of an existing value. Either 'move' the borrowed side into a fresh value so both arms own, or make both arms borrows.",
+    "armsdifferintypearg0...armtotheargumenttyped6a6000d02c21947": "'?:' arms differ in type: '{0}' is a '{1}', but 'default' builds the argument type '{2}'. Convert that arm to the argument type.",
+    "armsdifferintypedefa...armtotheargumenttypea4be80217395fe9c": "'?:' arms differ in type: 'default' builds the argument type '{0}', but '{1}' is not that type. Convert that arm to the argument type.",
     "basearg0ofstructarg1isnotacclass": "base '{0}' of struct '{1}' is not a C++ class",
     "baseinitializerargum...parametersorliterals4e1fed190568eb69": "base initializer arguments must be constructor parameters or literals",
     "baseinitializerisonlyvalidinacppstruct": "base initializer is only valid in a [cpp] struct",

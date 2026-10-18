@@ -1,0 +1,12 @@
+import cpp "cpp_t63_brace_decl.hpp";
+
+extern int main()
+{
+    expect_error("no overload of 't286.sc1'") {
+        int result = t286.sc1("CE.one");
+    }
+    expect_error("no overload of 't286.sc9'") {
+        int result = t286.sc9("CE.one");
+    }
+    return 0;
+}

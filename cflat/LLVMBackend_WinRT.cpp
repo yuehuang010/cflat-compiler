@@ -2184,6 +2184,13 @@ bool LLVMBackend::ArgumentIsProvablyDataPointer(llvm::Value* value, const NamedV
 {
         if (llvm::isa<llvm::Function>(value)) return false;               // a named function
         if (llvm::isa<llvm::ConstantPointerNull>(value)) return false;    // parity with the direct path
+        // A C NULL macro reads as a load of its backing global; the ilz macro flags make it the
+        // null pointer constant nullptr is here.
+        if (arg.IsCxxNullIntegerMacro && arg.IsCxxMacroGlobal)
+            if (auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(value))
+                if (auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(load->getPointerOperand());
+                    global != nullptr && cxxZeroIntegerMacroNames_.count(global->getName().str()) != 0)
+                    return false;
         if (arg.TypeAndValue.IsFunctionPointer) return false;             // a closure value
         if (auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(value);
             constant != nullptr && IsStringLiteralConstant(constant)) return true;

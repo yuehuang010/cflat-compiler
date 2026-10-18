@@ -204,6 +204,20 @@ bool LLVMBackend::CxxArrayReferenceSpelling(const FunctionSymbol& candidate, siz
     return group.find('&') != std::string::npos && group.find('*') == std::string::npos;
 }
 
+static std::optional<uint64_t> FixedCxxArrayReferenceExtent(std::string_view spelling)
+{
+    const size_t close = spelling.find(")[");
+    if (close == std::string_view::npos) return std::nullopt;
+    const size_t begin = close + 2;
+    const size_t end = spelling.find(']', begin);
+    if (end == std::string_view::npos || end == begin) return std::nullopt;
+    uint64_t extent = 0;
+    const auto [parsed, error] = std::from_chars(spelling.data() + begin,
+                                                 spelling.data() + end, extent);
+    if (error != std::errc{} || parsed != spelling.data() + end) return std::nullopt;
+    return extent;
+}
+
 // A C++ null pointer constant is an integer literal of value 0 of any integer type, unsigned or
 // suffixed, but never a +0 / -0 expression. Native CFlat keeps the identity-int rule.
 bool LLVMBackend::IsNullPointerConstantArgument(const NamedVariable& arg, bool cxx) const
@@ -1426,6 +1440,21 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 // array-to-pointer, and the deprecated drop to `char*` binds worse.
                 if (arg.IsStringLiteral)
                 {
+                    if (CxxArrayReferenceSpelling(candidate, i))
+                    {
+                        const auto declaredExtent = FixedCxxArrayReferenceExtent(
+                            CxxReferenceParameterSpelling(candidate, i));
+                        auto* literal = llvm::dyn_cast_or_null<llvm::Constant>(arg.Primary);
+                        const auto actualLength = stringLiteralLenByPtr.find(literal);
+                        if (declaredExtent && actualLength != stringLiteralLenByPtr.end()
+                            && actualLength->second >= 0
+                            && *declaredExtent != static_cast<uint64_t>(actualLength->second) + 1)
+                        {
+                            out.rank = kCxxNonViableRank;
+                            out.from = "char";
+                            continue;
+                        }
+                    }
                     if (param.TypeName == "char")
                     {
                         out.rank = 0;
@@ -1672,7 +1701,7 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 if (reference && !param.IsRvalueRef)
                 {
                     out.cvBase = param.TypeName;   // 3.2.6 on a derived-to-base reference too
-                    out.cv = constReference ? 1 : 0;
+                    out.cv = referenceCv;
                 }
                 continue;
             }
@@ -1857,6 +1886,22 @@ int LLVMBackend::CompareCxxConversionRanks(const std::vector<CxxConversionRank>&
                 const CxxConversionRank& reference = x.rank == -2 ? y : x;
                 if (reference.rank == 0 && (reference.cvBase == object.from || reference.cvBase.empty()))
                     order = x.rank == -2 ? 1 : -1;
+                else if (reference.rank == 2 && !reference.cvBase.empty()
+                         && !reference.toClass.empty() && object.from == reference.from)
+                {
+                    order = tieBreak(object, reference);
+                    if (order == 0)
+                    {
+                        if (object.toClass != reference.toClass
+                            || reference.cvBase != object.toClass)
+                            return 2;
+                        if ((object.second & reference.cv) == object.second)
+                            order = object.second == reference.cv ? 0 : -1;
+                        else if ((object.second & reference.cv) == reference.cv)
+                            order = 1;
+                    }
+                    if (x.rank != -2) order = -order;
+                }
                 else
                     return 2;
             }
@@ -1882,10 +1927,17 @@ int LLVMBackend::CompareCxxConversionRanks(const std::vector<CxxConversionRank>&
                 {
                     const CxxConversionRank& object = x.rank == -2 ? x : y;
                     const CxxConversionRank& reference = x.rank == -2 ? y : x;
-                    if (reference.rank != 0 || reference.cvBase != object.from) return 2;
-                    if (object.second == reference.cv) order = 0;
-                    else if ((object.second & reference.cv) == object.second) order = -1;
-                    else if ((object.second & reference.cv) == reference.cv) order = 1;
+                    if (object.toClass.empty() && reference.rank == 2
+                        && !reference.cvBase.empty() && !reference.toClass.empty()
+                        && object.from == reference.from)
+                        order = -1;
+                    else
+                    {
+                        if (reference.rank != 0 || reference.cvBase != object.from) return 2;
+                        if (object.second == reference.cv) order = 0;
+                        else if ((object.second & reference.cv) == object.second) order = -1;
+                        else if ((object.second & reference.cv) == reference.cv) order = 1;
+                    }
                     if (object.objectIsRvalue
                         && object.objectRef == cflat_cinterop::CxxRefQualifierRValue
                         && reference.refBind == 2)
@@ -2045,6 +2097,19 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(
                 value == nullptr ? nullptr : value->stripPointerCasts());
             return constant != nullptr && IsStringLiteralConstant(constant);
+        };
+        auto stringLiteralFitsArrayReference = [&](const FunctionSymbol& candidate, size_t index,
+                                                   const NamedVariable& arg) {
+            if (!candidate.IsCxx || !CxxArrayReferenceSpelling(candidate, index)
+                || (!arg.IsStringLiteral && !isStringLiteralValue(arg.Primary)))
+                return true;
+            const auto extent = FixedCxxArrayReferenceExtent(
+                CxxReferenceParameterSpelling(candidate, index));
+            auto* literal = llvm::dyn_cast_or_null<llvm::Constant>(
+                arg.Primary == nullptr ? nullptr : arg.Primary->stripPointerCasts());
+            const auto length = stringLiteralLenByPtr.find(literal);
+            return !extent || length == stringLiteralLenByPtr.end() || length->second < 0
+                || *extent == static_cast<uint64_t>(length->second) + 1;
         };
         // Cost of one const-added binding, weighted so a value/reference pair does not tie into
         // declaration order: same polarity as the equal-spelling arm (reference wins an lvalue).
@@ -3118,9 +3183,16 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 const bool sourceIsEnum = arg.TypeAndValue.IsScopedEnum
                     || !arg.TypeAndValue.EnumBacking.empty()
                     || IsScopedEnumTypeName(sourceEnum) || !ResolveEnumTypeName(sourceEnum).empty();
+                const std::string sourceEnumKey = ResolveEnumTypeName(sourceEnum);
+                const std::string targetEnumKey = ResolveEnumTypeName(candidateParamItr->TypeName);
+                const bool exactEnumPointer = arg.TypeAndValue.Pointer && candidateParamItr->Pointer
+                    && arg.TypeAndValue.ElemPointer == candidateParamItr->ElemPointer
+                    && arg.TypeAndValue.PointerDepth == candidateParamItr->PointerDepth
+                    && !sourceEnumKey.empty() && sourceEnumKey == targetEnumKey;
                 if (candidate.IsCxx && sourceIsEnum
                     && (candidateParamItr->Pointer || candidateParamItr->IsFunctionPointer)
-                    && !candidateParamItr->IsAlias && !candidateParamItr->IsRvalueRef)
+                    && !candidateParamItr->IsAlias && !candidateParamItr->IsRvalueRef
+                    && !exactEnumPointer)
                     result = -1;
                 // A scoped enum has no standard conversion here, but a clang-proved converting
                 // ctor keeps the candidate viable; the mismatch only blocks the fallbacks above.
@@ -3311,6 +3383,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     && (IsCxxNullTypedArgument(arg) || IsNullPointerConstantArgument(arg, true))
                     && !CxxReferenceAllowsNullPointerConversion(*candidateParamItr,
                         CxxReferenceParameterSpelling(candidate, paramIndex)))
+                    result = -1;
+                if (!stringLiteralFitsArrayReference(candidate, paramIndex, arg))
                     result = -1;
                 // Native floating pair (double and long double lower alike): exact 0, float -> double a
                 // promotion, any other floating widen a conversion - so {double, longdouble} picks like clang.

@@ -1307,6 +1307,89 @@ int bridge_t302_cpp_ternary_default_move()
     return bridge_t299_pack_result(value, baseLive);
 }
 
+int bridge_t306_cpp_cast_default_paren()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = cpptw.take((cpptw.Twin)(default));
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t306_cpp_cast_default_bare()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = cpptw.take((cpptw.Twin)default);
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+cpptw.Twin bridge_t306_rettw() { return default; }
+
+int bridge_t306_cpp_ternary_default_move(bool c)
+{
+    int baseLive = cpptw.live_allocations();
+    int value = 0;
+    {
+        cpptw.Twin tw = default;
+        value = cpptw.take(c ? default : move tw);
+    }
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t306_cpp_ternary_default_default(bool c)
+{
+    int baseLive = cpptw.live_allocations();
+    int value = cpptw.take(c ? default : (default));
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t306_cpp_ternary_default_return(bool c)
+{
+    int baseLive = cpptw.live_allocations();
+    int value = cpptw.take(c ? default : bridge_t306_rettw());
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t306_cpp_ternary_default_ctor(bool c)
+{
+    int baseLive = cpptw.live_allocations();
+    int value = cpptw.take(c ? default : cpptw.Twin(4));
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t306_cpp_holder_default()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = cppt306.Holder((default)).value();
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t306_cpp_ctor_ternary_default_arg(bool c)
+{
+    int baseLive = cpptw.live_allocations();
+    int value = cppt306.DefaultArgHolder(c ? default : bridge_t306_rettw()).value();
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t306_cpp_holder_ternary_default(bool c)
+{
+    int baseLive = cpptw.live_allocations();
+    int value = cppt306.Holder(c ? default : bridge_t306_rettw()).value();
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t306_cpp_cast_ternary_default(bool c)
+{
+    int baseLive = cpptw.live_allocations();
+    int value = cpptw.take((cpptw.Twin)(c ? default : bridge_t306_rettw()));
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t306_cpp_cast_ctor_ternary_default(bool c)
+{
+    int baseLive = cpptw.live_allocations();
+    int value = cppt306.DefaultArgHolder((cpptw.Twin)(c ? default : bridge_t306_rettw())).value();
+    return bridge_t299_pack_result(value, baseLive);
+}
+
 int bridge_t301_pack_result(int value)
 {
     return value * 1000000 + cpptw.ctor_count() * 100000 + cpptw.copy_count() * 10000
@@ -5561,7 +5644,57 @@ extern int main(int argc, char** argv)
     cpptw.reset_counts();
     bridge_check("bridge T302 C++ deeply parenthesized default argument value/counts/live", bridge_t302_cpp_deep_paren_default_arg(), 1000010);
     cpptw.reset_counts();
-    bridge_check("bridge T302 C++ ternary default/move argument value/counts/live", bridge_t302_cpp_ternary_default_move(), 1100020);
+    bridge_check("bridge T302 C++ ternary default/move argument value/counts/live", bridge_t302_cpp_ternary_default_move(), 1010020);
+
+    // T306: C++ defaults keep their value category through casts and both prvalue ternary arms.
+    cpptw.reset_counts();
+    bridge_check("bridge T306 parenthesized cast default argument", bridge_t306_cpp_cast_default_paren(), 1000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T306 bare cast default argument", bridge_t306_cpp_cast_default_bare(), 1000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T306 default/move ternary false", bridge_t306_cpp_ternary_default_move(false), 1010020);
+    cpptw.reset_counts();
+    bridge_check("bridge T306 default/move ternary true", bridge_t306_cpp_ternary_default_move(true), 2000020);
+    cpptw.reset_counts();
+    bridge_check("bridge T306 default/default ternary false", bridge_t306_cpp_ternary_default_default(false), 1000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T306 default/default ternary true", bridge_t306_cpp_ternary_default_default(true), 1000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T306 default/return ternary false", bridge_t306_cpp_ternary_default_return(false), 1000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T306 default/return ternary true", bridge_t306_cpp_ternary_default_return(true), 1000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T306 default/constructor ternary false", bridge_t306_cpp_ternary_default_ctor(false), 41000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T306 default/constructor ternary true", bridge_t306_cpp_ternary_default_ctor(true), 1000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T306 C++ constructor by-value default", bridge_t306_cpp_holder_default(), 1100020);
+    cpptw.reset_counts();
+    bridge_check("bridge T306 ctor default/return ternary with defaulted trailing param false",
+        bridge_t306_cpp_ctor_ternary_default_arg(false), 51000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T306 ctor default/return ternary with defaulted trailing param true",
+        bridge_t306_cpp_ctor_ternary_default_arg(true), 51000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T306 Holder default/return ternary false",
+        bridge_t306_cpp_holder_ternary_default(false), 1100020);
+    cpptw.reset_counts();
+    bridge_check("bridge T306 Holder default/return ternary true",
+        bridge_t306_cpp_holder_ternary_default(true), 1100020);
+    cpptw.reset_counts();
+    bridge_check("bridge T306 same-type cast default/return ternary false",
+        bridge_t306_cpp_cast_ternary_default(false), 1000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T306 same-type cast default/return ternary true",
+        bridge_t306_cpp_cast_ternary_default(true), 1000010);
+
+    // T306 round 3: a same-type cast around a ternary into a constructor with a defaulted trailing param.
+    cpptw.reset_counts();
+    bridge_check("bridge T306 r3 cast ctor ternary default false",
+        bridge_t306_cpp_cast_ctor_ternary_default(false), 51000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T306 r3 cast ctor ternary default true",
+        bridge_t306_cpp_cast_ctor_ternary_default(true), 51000010);
 
     // T301: a C++ class field after a unique field keeps its C++ layout and destruction counts.
     bridge_check("bridge T301 Twin/unique/Twin value and counts", bridge_t301_twin_unique_twin(), 37200002);

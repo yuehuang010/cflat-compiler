@@ -22,3 +22,11 @@ Still open:
 
 Repro base: Test/library/cpp_interop_unwind.h / .cpp and the unwind section of Test/test_cpp_interop.cb
 (codes 3160-3198, 3261-3281).
+
+## 2026-10-16 (T313 reviews 2-3): brace `new` of a non-fresh struct gets no unwind note
+
+`new S{ z = rv.bval(1) }` where S holds a C++ class plus an int and is not eligible for the fresh in-place brace path:
+when the element initializer throws, no UserNewHeap unwind entry is recorded, so the block leaks (user delete count 0,
+master same). The tag form, `new T(args)` and fresh-eligible `new T{...}` are covered by T313 (EmitUserNewHeapFree).
+Also from T313 review 3, for a ruling only: the sized class `operator delete(void*, N)` is recognized for ANY non-pointer
+64-bit integer N (i64 or u64); clang accepts only std::size_t (long long / unsigned long long free nothing there).

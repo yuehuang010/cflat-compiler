@@ -6278,7 +6278,9 @@ private:
      * Partial construction: what an unwind out of the object under construction must release.
      * A finished field VALUE (destroyed through a spill) or field SLOT (in place), the MEMBERS of a built `this` slot
      * while a constructor body runs (never its user ~T), and a `new` block whose constructor
-     * has not returned (freed, never destroyed). Keyed by function; the pad runs them newest
+     * has not returned (freed, never destroyed). UserNewHeap: the same block when it came from a
+     * user 'T.operator new' - freed through 'T.operator delete' (Count = the byte size it was given).
+     * Keyed by function; the pad runs them newest
      * first, before the statement temps. UnwindPartialScope pops what its region pushed.
      * ArrayPrefix: the first `Count` elements (ElemTy, element type TypeName) at V are built;
      * the pad destroys them newest first. Count may be a runtime value (a loop's phi).
@@ -6286,7 +6288,7 @@ private:
     struct UnwindPartialEntry
     {
         // StaticFlag: a static local's run-once flag (V), cleared so the next entry re-runs its initializer.
-        enum class Kind { Value, Slot, Members, CxxHeap, CxxHeapArray, CflatHeap, ArrayPrefix, StaticFlag } K;
+        enum class Kind { Value, Slot, Members, CxxHeap, CxxHeapArray, CflatHeap, UserNewHeap, ArrayPrefix, StaticFlag } K;
         llvm::Value* V;
         std::string TypeName;
         llvm::Function* Fn;
@@ -6446,6 +6448,9 @@ private:
                                              size_t parameterIndex, size_t arity) const;
     bool IsCxxConstructorParameterByValue(const std::string& typeName,
                                            size_t parameterIndex, size_t arity) const;
+    bool GetUniqueCxxConstructorValueParameter(const std::string& typeName,
+                                               size_t parameterIndex, size_t arity,
+                                               TypeAndValue& out) const;
     bool HasCxxForwardingReferenceTemplate(const std::string& qualifiedName) const;
     bool IsCxxNamespacePath(const std::string& name) const;
     // Broader fallback for namespace paths whose declarations were not harvested at import.
@@ -10096,6 +10101,8 @@ public:
     llvm::Value* EmitCxxHeapAllocate(const std::string& typeName);
     // Release storage obtained from EmitCxxHeapAllocate. The destructor is NOT run here.
     void EmitCxxHeapFree(const std::string& typeName, llvm::Value* ptr);
+    // Unwind release of a user T.operator new block through T's usual operator delete (see .cpp).
+    bool EmitUserNewHeapFree(const std::string& typeName, llvm::Value* ptr, llvm::Value* allocSize);
     // ::operator new[] / ::operator delete[] (unsized), declared on demand like the pair above.
     llvm::Function* GetCxxOperatorNewArray(bool overAligned);
     llvm::Function* GetCxxOperatorDeleteArray(bool overAligned);
@@ -10173,6 +10180,10 @@ public:
      * literal zero has a viable pointer-parameter constructor candidate, or an unseen template
      * candidate could outrank the listed pick. `argVars` carries literal provenance.
      */
+    // A deleted or private non-copy/move constructor that fits the arity and takes a scalar argument:
+    // harvest drops it, but C++ ranks it in the tie, so only clang can decide that call.
+    bool HasHiddenScalarCxxConstructor(const std::string& typeName,
+                                       const std::vector<TypeAndValue>& argTypes) const;
     bool CxxConstructorNeedsClangResolution(const std::string& typeName,
                                             const CxxClassInfo::Structor* selected,
                                             const std::vector<TypeAndValue>& argTypes,

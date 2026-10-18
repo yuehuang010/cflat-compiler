@@ -552,4 +552,143 @@ inline int operator-(const T304Foo* p, T304ExactChoiceHost) {
     return 500 + p->value;
 }
 inline const T304Foo* t304_cfoo() { static T304Foo f; return &f; }
+
+// T305: C++ class pointers can convert through pointer-taking converting ctors at call arguments.
+inline int t305CallPointerSelection = 0;
+struct T305CallFoo { int value = 3; };
+struct T305CallBar { int value = 9; };
+struct T305CallR {
+    int value;
+    T305CallR(const T305CallFoo* p)
+        : value(p ? p->value : -1) { t305CallPointerSelection = 301; }
+};
+inline int t305_call_take_r(T305CallR r) {
+    t305CallPointerSelection = 1;
+    return 110 + r.value;
+}
+struct T305CallObj {
+    int take_r(T305CallR r) {
+        t305CallPointerSelection = 2;
+        return 210 + r.value;
+    }
+};
+inline T305CallFoo* t305_call_make_foo() {
+    static T305CallFoo f;
+    return &f;
+}
+inline const T305CallFoo* t305_call_make_cfoo() {
+    static T305CallFoo f;
+    return &f;
+}
+inline int t305_call_choose_const(const T305CallFoo* p) {
+    t305CallPointerSelection = 3;
+    return 300 + p->value;
+}
+inline int t305_call_choose_const(T305CallR r) {
+    t305CallPointerSelection = 4;
+    return 400 + r.value;
+}
+inline int t305_call_choose_mut(T305CallFoo* p) {
+    t305CallPointerSelection = 5;
+    return 500 + p->value;
+}
+inline int t305_call_choose_mut(T305CallR r) {
+    t305CallPointerSelection = 6;
+    return 600 + r.value;
+}
+struct T305CallPad {
+    int pad = 0;
+    virtual ~T305CallPad() = default;
+};
+struct T305CallBase {
+    int value;
+    explicit T305CallBase(int v) : value(v) {}
+    virtual ~T305CallBase() = default;
+    virtual int kind() const { return 1; }
+};
+struct T305CallDerived : T305CallPad, T305CallBase {
+    T305CallDerived() : T305CallPad(), T305CallBase(4) {}
+    int kind() const override { return 3; }
+};
+struct T305CallRBase {
+    int value;
+    T305CallRBase(const T305CallBase* p)
+        : value(p ? p->value : -1) { t305CallPointerSelection = 307; }
+};
+inline int t305_call_take_rbase(T305CallRBase r) {
+    t305CallPointerSelection = 7;
+    return 700 + r.value;
+}
+inline int t305_call_take_base_ptr(T305CallBase* p) {
+    t305CallPointerSelection = 10;
+    return 1000 + (p ? p->kind() * 10 + p->value : -1);
+}
+struct T305CallRNonConst {
+    int value;
+    T305CallRNonConst(T305CallFoo* p)
+        : value(p ? p->value : -1) { t305CallPointerSelection = 308; }
+};
+inline int t305_call_take_nonconst(T305CallRNonConst r) {
+    t305CallPointerSelection = 8;
+    return 800 + r.value;
+}
+struct T305CallExplicit {
+    int value;
+    explicit T305CallExplicit(const T305CallFoo* p)
+        : value(p ? p->value : -1) { t305CallPointerSelection = 309; }
+};
+inline int t305_call_take_explicit(T305CallExplicit r) {
+    t305CallPointerSelection = 9;
+    return 900 + r.value;
+}
+inline int t305_call_selected() { return t305CallPointerSelection; }
 inline int t304_selected() { return t304ClassPointerSelection; }
+
+// T305 round 2: a Foo* reaches only a pointer-taking converting ctor, never R(const Foo&).
+inline int t305r2Selection = 0;
+struct T305R2Foo { int value = 3; };
+struct T305R2RR {
+    int value;
+    T305R2RR(const T305R2Foo& f) : value(f.value + 100) { t305r2Selection = 301; }
+};
+struct T305R2R {
+    int value;
+    T305R2R(const T305R2Foo* p) : value(p ? p->value : -1) { t305r2Selection = 302; }
+};
+inline int t305r2_ref_only(T305R2RR r) { return r.value; }
+inline int t305r2_ref_or_ptr(T305R2RR) { t305r2Selection = 401; return 1; }
+inline int t305r2_ref_or_ptr(T305R2R) { t305r2Selection = 402; return 2; }
+struct T305R2Host {};
+inline int operator-(T305R2RR, T305R2Host) { t305r2Selection = 501; return 113; }
+inline int operator-(T305R2R, T305R2Host) { t305r2Selection = 502; return 23; }
+inline int t305r2_selected() { return t305r2Selection; }
+
+// T305 round 3: a const reference to a pointer is bound to a pointer temporary.
+inline int t305r3Selection = 0;
+struct T305R3Foo { int value = 10; };
+struct T305R3Ref {
+    int value;
+    T305R3Ref(const T305R3Foo* const& p) : value(p ? p->value : -1) { t305r3Selection = 1; }
+};
+inline int t305r3_take(T305R3Ref r) { return r.value; }
+inline int t305r3_selected() { return t305r3Selection; }
+
+// T305 round 4: a derived pointer is base-adjusted before the temp; a non-const T*& binds the slot.
+struct T305R4Pad { int pad = 11; virtual ~T305R4Pad() = default; };
+struct T305R4Derived : T305R4Pad, T305R3Foo { int z = 1; };
+struct T305R4Host { int k = 1; };
+inline int operator+(T305R4Host, T305R3Ref r) { return r.value + 60; }
+struct T305R4IntRef {
+    int value;
+    T305R4IntRef(int*& p) : value(p ? *p : 70) { p = nullptr; }
+};
+inline int t305r4_take_int(T305R4IntRef r) { return r.value; }
+// T317: an unnamed `new T[n]` source at an implicit converting constructor taking const int*.
+namespace t317rawarr {
+struct NX { const int* p = nullptr; NX() = default; NX(const int* q) : p(q) {} };
+struct NZ { const int* p = nullptr; NZ() = default; NZ(const int* q) : p(q) {} NZ(const NZ& o) : p(o.p) {} ~NZ() {} };
+struct XE { const int* p = nullptr; XE() = default; explicit XE(const int* q) : p(q) {} };
+inline int take_nx(NX v) { return v.p != nullptr ? 0 : 1; }
+inline int take_nx_ref(const NX& v) { return v.p != nullptr ? 0 : 1; }
+inline int take_nz(NZ v) { return v.p != nullptr ? 0 : 1; }
+}

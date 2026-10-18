@@ -309,6 +309,38 @@ inline int li(std::initializer_list<long>) { return 1; }
 inline int li(std::initializer_list<int>) { return 2; }
 inline int iu(std::initializer_list<int>) { return 1; }
 inline int iu(std::initializer_list<unsigned>) { return 2; }
+enum class T308SC : int { s0, s1 };
+inline int t308ScopedList(std::initializer_list<T308SC> values)
+{
+    return (int)*values.begin() + 7;
+}
+inline int t308ScopedIntList(std::initializer_list<int> values)
+{
+    return (int)*values.begin() + 20;
+}
+inline int t308ScopedUnsignedList(std::initializer_list<unsigned>) { return 3; }
+inline int t308ScopedArithmeticList(std::initializer_list<int>) { return 1; }
+inline int t308ScopedArithmeticList(std::initializer_list<unsigned>) { return 2; }
+enum T308E : int { t308E0, t308E1 = 1 };
+inline int t308EnumRank(std::initializer_list<T308E>) { return 101; }
+inline int t308EnumRank(std::initializer_list<int>) { return 201; }
+inline int t308UnscopedIntList(std::initializer_list<int> values)
+{
+    return (int)*values.begin() + 40;
+}
+inline int t308IntList(std::initializer_list<int> values)
+{
+    return (int)*values.begin() + 50;
+}
+// T308 round 2: enum elements never convert to another enum, and a scoped element never converts to a scalar.
+enum T308E2 : int { t308F0 };
+enum class T308C8 : char { c0, c1 };
+enum class T308SC2 : int { u0, u1 };
+inline int t308EnumOnlyList(std::initializer_list<T308E>) { return 301; }
+inline int t308OtherEnumList(std::initializer_list<T308E2>) { return 302; }
+inline int t308ScopedOtherList(std::initializer_list<T308SC2>) { return 303; }
+inline int t308LLList(std::initializer_list<long long>) { return 304; }
+inline int t308CharList(std::initializer_list<char>) { return 305; }
 }
 
 // T286: a CFlat-declared enum value (no C++ spelling) binds as its backing integer; an imported enum keeps its own overload.
@@ -321,6 +353,36 @@ inline int si1(const char (&a)[1]) { return 50 + a[0]; }
 inline int mx(int a, int b) { return a * 10 + b; }
 inline int mx(int a, const char (&b)[1]) { return a + b[0]; }
 inline int sc1(const char (&a)[1]) { return a[0]; }
+inline int sc7(const char (&a)[7]) { return 72 + a[0] - 'C'; }
+inline int sc9(const char (&a)[9]) { return 92 + a[0] - 'C'; }
 inline int ci(std::initializer_list<char>) { return 1; }
 inline int ci(std::initializer_list<int>) { return 2; }
+}
+// T314: an equal-rank brace-list tie is ambiguous in clang (CFlat refuses it); a strictly better
+// element match still wins. `long long` keeps the shapes the same on LLP64 Windows.
+namespace t314 {
+inline int ldb(std::initializer_list<long long>) { return 1; }
+inline int ldb(std::initializer_list<double>) { return 2; }
+inline int dll(std::initializer_list<double>) { return 1; }
+inline int dll(std::initializer_list<long long>) { return 2; }
+inline int ui(std::initializer_list<unsigned>) { return 1; }
+inline int ui(std::initializer_list<long long>) { return 2; }
+inline int id(std::initializer_list<int>) { return 1; }
+inline int id(std::initializer_list<double>) { return 2; }
+inline int fd(std::initializer_list<float>) { return 1; }
+inline int fd(std::initializer_list<double>) { return 2; }
+inline int bd(std::initializer_list<bool>) { return 1; }
+inline int bd(std::initializer_list<double>) { return 2; }
+struct S {
+    int m_ldb(std::initializer_list<long long>) { return 1; }
+    int m_ldb(std::initializer_list<double>) { return 2; }
+    int m_ui(std::initializer_list<unsigned>) { return 1; }
+    int m_ui(std::initializer_list<long long>) { return 2; }
+    int m_pb(int, std::initializer_list<int>) { return 1; }
+    int m_pb(long, std::initializer_list<int>) { return 2; }
+    int m_rq(std::initializer_list<long>) & { return 1; }
+    int m_rq(std::initializer_list<double>) && { return 2; }
+};
+inline int pb(int, std::initializer_list<int>) { return 1; }
+inline int pb(long, std::initializer_list<int>) { return 2; }
 }

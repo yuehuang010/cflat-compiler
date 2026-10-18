@@ -6379,7 +6379,12 @@ void LLVMBackend::EmitUnwindPartialRelease(const UnwindPartialEntry& e)
             EmitCxxHeapFreeArray(e.TypeName, e.V, e.Count, e.AllocAlign);
             return;
         case UnwindPartialEntry::Kind::CflatHeap:
+        case UnwindPartialEntry::Kind::UserNewHeap:
         {
+            // A user 'T.operator new' block goes to T's usual deallocator (or none when T declares
+            // only non-usual ones); with no class operator delete it falls to the global free below.
+            if (e.K == UnwindPartialEntry::Kind::UserNewHeap && EmitUserNewHeapFree(e.TypeName, e.V, e.Count))
+                return;
             // Free only: the constructor never returned, so there is no object to destroy.
             uint64_t effAlign = e.AllocAlign;
             TypeAndValue tv{ .TypeName = e.TypeName };
@@ -6393,6 +6398,44 @@ void LLVMBackend::EmitUnwindPartialRelease(const UnwindPartialEntry& e)
             return;
         }
         }
+}
+
+/*
+ * Release a block from a user 'T.operator new' whose construction never finished, choosing the
+ * deallocator like clang ([basic.stc.dynamic.deallocation] usual deallocation function): T's
+ * one-arg (void*) operator delete, else the sized (void*, 64-bit integer) one passed allocSize.
+ * T declaring only non-usual deletes ((void*, int), (void*, void*), ...) frees nothing, as clang.
+ * Returns false when T declares no operator delete (the caller frees globally). Selection is by
+ * signature only - never a user-facing overload error from an unwind pad.
+ */
+bool LLVMBackend::EmitUserNewHeapFree(const std::string& typeName, llvm::Value* ptr, llvm::Value* allocSize)
+{
+        auto it = functionTable.find(typeName + ".operator delete");
+        if (it == functionTable.end() || it->second.empty()) return false;
+        const FunctionSymbol* oneArg = nullptr;
+        const FunctionSymbol* sized = nullptr;
+        for (const FunctionSymbol& sym : it->second)
+        {
+            if (sym.Variadic || sym.Parameters.empty() || !sym.Parameters[0].Pointer) continue;
+            if (sym.Parameters.size() == 1 && oneArg == nullptr) oneArg = &sym;
+            else if (sym.Parameters.size() == 2 && sized == nullptr && !sym.Parameters[1].Pointer)
+            {
+                TypeAndValue p1 = sym.Parameters[1];
+                if (llvm::Type* t = GetType(p1); t != nullptr && t->isIntegerTy(64)) sized = &sym;
+            }
+        }
+        const FunctionSymbol* pick = oneArg != nullptr ? oneArg : (allocSize != nullptr ? sized : nullptr);
+        if (pick == nullptr) return true;
+        llvm::Function* fn = pick->Function != nullptr ? pick->Function : GetFunction(pick->UniqueName);
+        const unsigned want = pick == sized ? 2u : 1u;
+        if (fn == nullptr || fn->getFunctionType()->getNumParams() != want
+            || !fn->getFunctionType()->getParamType(0)->isPointerTy())
+            return true;
+        std::vector<llvm::Value*> args{ builder->CreateBitCast(ptr, fn->getFunctionType()->getParamType(0)) };
+        if (want == 2)
+            args.push_back(builder->CreateZExtOrTrunc(allocSize, fn->getFunctionType()->getParamType(1)));
+        builder->CreateCall(fn->getFunctionType(), fn, args);
+        return true;
 }
 
 void LLVMBackend::NoteUnwindArrayPrefix(llvm::Value* base, llvm::Type* elemTy, llvm::Value* count,

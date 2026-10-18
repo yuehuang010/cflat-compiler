@@ -5558,6 +5558,35 @@ bool testFunctionSlotAccepts()
     return result;
 }
 
+int t311TakeFn(function<int(int)> f) { return f == nullptr ? 1 : 0; }
+int t311TakeCFn(T311Bin f) { return f == nullptr ? 1 : 0; }
+struct T311Hold { function<int(int)> fn = T311_NULL; };
+int t311DefaultArg(function<int(int)> f = T311_NULL) { return f == nullptr ? 1 : 0; }
+
+// T311: the C NULL macro is a null pointer constant, so it enters a function<> slot, a C
+// function-pointer slot and a C struct fn-pointer field exactly where nullptr does.
+bool testFunctionSlotNullMacro()
+{
+    bool result = true;
+    function<int(int)> fm = T311_NULL;
+    result &= Test("C NULL macro into a function<> local", fm == nullptr, true);
+    function<int(int)> fa = t182Sq;
+    fa = T311_NULL;
+    result &= Test("C NULL macro assigned to a function<>", fa == nullptr, true);
+    T311Bin cb = T311_NULL;
+    result &= Test("C NULL macro into a C function pointer", cb == nullptr, true);
+    T311Ops ops = { f = T311_NULL, k = 3 };
+    result &= Test("C NULL macro into a C struct field (brace init)", ops.f == nullptr, true);
+    ops.f = T311_NULL;
+    result &= Test("C NULL macro assigned to a C struct field", ops.f == nullptr, true);
+    result &= Test("C NULL macro passed to a function<> parameter", t311TakeFn(T311_NULL), 1);
+    result &= Test("C NULL macro passed to a C function pointer parameter", t311TakeCFn(T311_NULL), 1);
+    T311Hold dh;
+    result &= Test("C NULL macro as a struct function<> field default", dh.fn == nullptr, true);
+    result &= Test("C NULL macro as a function<> parameter default", t311DefaultArg(), 1);
+    return result;
+}
+
 struct T189Hold
 {
     Lambda<int(int, int)> fn;
@@ -6247,6 +6276,7 @@ extern int main(int argc, char** argv)
     total++; passed += testInferTernaryVariadicFunctionPointer() ? 1 : 0;
     total++; passed += testTernaryArmKinds()               ? 1 : 0;
     total++; passed += testFunctionSlotAccepts()           ? 1 : 0;
+    total++; passed += testFunctionSlotNullMacro()         ? 1 : 0;
     total++; passed += testTernaryClosureNamedJoin()       ? 1 : 0;
     total++; passed += testTernaryGenericFunctionArm()     ? 1 : 0;
     total++; passed += testLambdaSlotFewerParams()         ? 1 : 0;

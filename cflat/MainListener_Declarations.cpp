@@ -2728,8 +2728,13 @@ llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndVa
                         auto* value = compiler->CreateLoad(llvmType, slot);
                         // A direct default argument is an owned prvalue; carry its slot for ABI lowering.
                         if (inCallArgument_ && expressionContext != nullptr
-                            && (IsDirectCallArgument(expressionContext)
-                                || IsCallArgumentThroughParens(expressionContext)))
+                            && ((IsDirectCallArgument(expressionContext)
+                                 || IsCallArgumentThroughParens(expressionContext))
+                                || (inCxxCallArgument_
+                                    && compiler->IsForeignNontrivialCxxClass(resolved.TypeName)
+                                    // A ternary arm with no known destination stays unowned: its join refuses.
+                                    && (!cxxCallArgumentExpectedType_.TypeName.empty()
+                                        || !IsTernaryArmOfCallArgument(expressionContext)))))
                             if (auto* temp = llvm::dyn_cast_or_null<llvm::AllocaInst>(slot))
                             {
                                 compiler->RegisterOwnedStructTemp(temp, resolved.TypeName);
@@ -7037,6 +7042,20 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
 
         for (auto initDecl : initDeclarVec)
         {
+            // Each local init-declarator is one full-expression. Bound/adopted temps have
+            // already left the ledger by this scope's destructor; globals keep their old path.
+            struct OwnedTempDeclScope
+            {
+                LLVMBackend* backend;
+                LLVMBackend::OwnedTempMark mark;
+                bool enabled;
+                int uncaught = std::uncaught_exceptions();
+                ~OwnedTempDeclScope()
+                {
+                    if (enabled && std::uncaught_exceptions() <= uncaught)
+                        backend->FlushOwnedTempsSince(mark, nullptr);
+                }
+            } ownedTemps{ compiler, compiler->MarkOwnedTemps(), !global_scope };
             // Receiver temps an alias initializer takes off the ledger (`alias int x = mk()->v;`) are
             // settled below; a declarator that never reaches that point leaves them unfreed (no UAF).
             struct AliasDeclTempScope
@@ -7888,6 +7907,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             // Hoisted for the thin function<> provenance gate below, which needs the
                             // RHS's declared-pointer shape after rightNV itself goes out of scope.
                             bool rhsIsPointer = false;
+                            // C null-pointer macro provenance (ArgumentIsProvablyDataPointer reads it).
+                            bool rhsIsNullMacro = false;
                             bool rhsFuncPtrReturnOwned = false;
                             bool rhsFuncPtrReturnAlias = false;
                             bool rhsFuncPtrVariadic = false;
@@ -8747,6 +8768,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     rhsFnSig = rightNV.TypeAndValue;
                                 rhsIsThinFnPtr = rhsFnSig.IsFunctionPointer && rhsFnSig.IsThinFnPtr();
                                 rhsIsPointer = rightNV.TypeAndValue.Pointer;
+                                rhsIsNullMacro = rightNV.IsCxxMacroGlobal && rightNV.IsCxxNullIntegerMacro;
                                 rhsFuncPtrParams = rhsFnSig.FuncPtrParams;
                                 rhsLambdaCaptureNames = rightNV.LambdaCaptureNames;
                                 rhsLambdaReferenceCaptureNames = rightNV.LambdaReferenceCaptureNames;
@@ -8954,6 +8976,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 rhsProvenance.TypeAndValue.IsFunctionPointer = rhsIsFuncPtr;
                                 rhsProvenance.TypeAndValue.Pointer = rhsIsPointer;
                                 rhsProvenance.TypeAndValue.TypeName = srcInferredTypeName;
+                                rhsProvenance.IsCxxMacroGlobal = rhsIsNullMacro;
+                                rhsProvenance.IsCxxNullIntegerMacro = rhsIsNullMacro;
                                 compiler->CheckThinFnPtrAssignProvenance(right, rhsProvenance,
                                     std::format("'{}'", name));
                             }
@@ -12974,6 +12998,14 @@ bool MainListener::RejectMixedOwnershipTernaryJoin(
         bool trueOwns = compiler->TernaryArmJoinsOwning(trueValue);
         bool falseOwns = compiler->TernaryArmJoinsOwning(falseValue);
         if (trueOwns == falseOwns) return false;
+        ReportMixedOwnershipTernaryJoin(trueOwns ? trueCtx : falseCtx,
+            trueOwns ? falseCtx : trueCtx, ctx);
+        return true;
+    }
+
+void MainListener::ReportMixedOwnershipTernaryJoin(antlr4::ParserRuleContext* owningCtx,
+        antlr4::ParserRuleContext* borrowCtx, antlr4::ParserRuleContext* ctx) {
+        auto* compiler = Compiler(ctx);
         // Original source slice, not getText(): the parse tree drops whitespace, so `move x`
         // would otherwise be quoted back at the user as 'movex'.
         auto armText = [](antlr4::ParserRuleContext* armCtx) {
@@ -12988,14 +13020,11 @@ bool MainListener::RejectMixedOwnershipTernaryJoin(
             return text;
         };
         // Fixed wording, owning arm first, so the catalog string carries no English fragments.
-        antlr4::ParserRuleContext* owningCtx = trueOwns ? trueCtx : falseCtx;
-        antlr4::ParserRuleContext* borrowCtx = trueOwns ? falseCtx : trueCtx;
         LogErrorContext(ctx, compiler->LocalizeMessage(
             "'?:' arms differ in ownership: '{}' is an owning value and '{}' is a borrow of an "
             "existing value. Either 'move' the borrowed side into a fresh value so both arms own, "
             "or make both arms borrows.",
             { armText(owningCtx), armText(borrowCtx) }));
-        return true;
     }
 
 bool MainListener::RejectMixedOwnershipPointerTernaryJoin(

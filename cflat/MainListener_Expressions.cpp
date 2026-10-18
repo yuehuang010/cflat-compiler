@@ -528,6 +528,61 @@ bool MainListener::IsCallArgumentThroughParens(antlr4::ParserRuleContext* ctx)
     return false;
 }
 
+bool MainListener::IsWholeCxxCallArgumentShape(
+        antlr4::ParserRuleContext* ctx, const LLVMBackend::TypeAndValue& expected) const
+{
+        if (ctx == nullptr) return false;
+        if (IsDirectCallArgument(ctx) || IsCallArgumentThroughParens(ctx)) return true;
+        if (expected.TypeName.empty() || expected.Pointer || expected.PointerDepth > 0
+            || cxxCallArgumentExpectedType_.TypeName.empty()
+            || cxxCallArgumentExpectedType_.Pointer || cxxCallArgumentExpectedType_.PointerDepth > 0
+            || compilerLLVM->GetType(expected) != compilerLLVM->GetType(cxxCallArgumentExpectedType_))
+            return false;
+
+        bool sawTypeCast = false;
+        for (auto* node = ctx->parent; node != nullptr; )
+        {
+            if (dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(node) != nullptr)
+                return sawTypeCast;
+            if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
+            {
+                if (cast->typeName() != nullptr && cast->castExpression() != nullptr)
+                {
+                    antlr4::tree::ParseTree* childOnPath = ctx;
+                    while (childOnPath != nullptr && childOnPath->parent != cast)
+                        childOnPath = childOnPath->parent;
+                    if (childOnPath != cast->castExpression()) return false;
+                    sawTypeCast = true;
+                }
+                else if (cast->children.size() != 1)
+                    return false;
+                node = cast->parent;
+                continue;
+            }
+            auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+            if (rule == nullptr) return false;
+            if (rule->children.size() == 1)
+            {
+                node = rule->parent;
+                continue;
+            }
+            if (rule->children.size() == 3)
+            {
+                auto* left = dynamic_cast<antlr4::tree::TerminalNode*>(rule->children[0]);
+                auto* right = dynamic_cast<antlr4::tree::TerminalNode*>(rule->children[2]);
+                if (left != nullptr && right != nullptr
+                    && left->getSymbol()->getType() == CFlatParser::LeftParen
+                    && right->getSymbol()->getType() == CFlatParser::RightParen)
+                {
+                    node = rule->parent;
+                    continue;
+                }
+            }
+            return false;
+        }
+        return false;
+}
+
 LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatParser::AssignmentExpressionContext* ctx,
                                                               ResultUse use) {
         // Snapshot and clear the owned-return flag so FinishAssignmentExpressionNamed
@@ -7953,6 +8008,103 @@ bool MainListener::IsDefaultOnlyExpression(antlr4::ParserRuleContext* ctx,
         return onlyDefault(ctx) && sawDefault;
 }
 
+static bool IsParenTerminal(antlr4::tree::ParseTree* node, size_t tokenType)
+{
+        auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(node);
+        return terminal != nullptr && terminal->getSymbol()->getType() == tokenType;
+}
+
+// True when `ctx` is an operand arm of a '?:' that is the WHOLE of a call argument, possibly through
+// parentheses and typeName casts. Type-blind: the destination type is not consulted.
+bool MainListener::IsTernaryArmOfCallArgument(antlr4::ParserRuleContext* ctx)
+{
+        antlr4::tree::ParseTree* node = ctx != nullptr ? ctx->parent : nullptr;
+        antlr4::tree::ParseTree* child = ctx;
+        for (; node != nullptr; child = node, node = node->parent)
+        {
+            auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node);
+            if (conditional != nullptr && conditional->Question() != nullptr
+                && child != static_cast<antlr4::tree::ParseTree*>(conditional->logicalOrExpression()))
+                break;
+        }
+        if (node == nullptr) return false;
+        // Only pass-through rules, parentheses and casts may separate the '?:' from the argument.
+        child = node;
+        for (auto* up = node->parent; up != nullptr; child = up, up = up->parent)
+        {
+            if (dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(up) != nullptr) return true;
+            // A cast rule without a typeName is a plain pass-through, like any single-child rule.
+            if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(up);
+                cast != nullptr && cast->typeName() != nullptr)
+            {
+                if (cast->castExpression() != nullptr
+                    && child == static_cast<antlr4::tree::ParseTree*>(cast->castExpression()))
+                    continue;
+                return false;
+            }
+            auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(up);
+            if (rule == nullptr) return false;
+            if (rule->children.size() == 1) continue;
+            if (rule->children.size() == 3 && rule->children[1] == child
+                && IsParenTerminal(rule->children[0], CFlatParser::LeftParen)
+                && IsParenTerminal(rule->children[2], CFlatParser::RightParen))
+                continue;
+            return false;
+        }
+        return false;
+}
+
+bool MainListener::HasDefaultOnlyTernaryArm(antlr4::ParserRuleContext* ctx) const
+{
+        auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(ctx);
+        auto* conditional = assignment != nullptr && assignment->assignmentOperator() == nullptr
+            ? assignment->conditionalExpression() : nullptr;
+        if (conditional != nullptr && conditional->Question() != nullptr)
+            return IsDefaultOnlyExpression(conditional->expression())
+                || IsDefaultOnlyExpression(conditional->conditionalExpression());
+        if (ctx == nullptr || ctx->getStart() == nullptr || ctx->getStop() == nullptr
+            || ctx->getStart()->getType() != CFlatParser::LeftParen
+            || ctx->getStop()->getType() != CFlatParser::RightParen)
+            return false;
+
+        for (auto* node = dynamic_cast<antlr4::tree::ParseTree*>(ctx); node != nullptr; )
+        {
+            if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node);
+                conditional != nullptr && conditional->Question() != nullptr)
+                return IsDefaultOnlyExpression(conditional->expression())
+                    || IsDefaultOnlyExpression(conditional->conditionalExpression());
+
+            auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+            if (rule == nullptr) return false;
+            // A typeName cast around the ternary: `(T)(c ? default : x)`. The join checks the arm type.
+            if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
+                cast != nullptr && cast->typeName() != nullptr && cast->castExpression() != nullptr)
+            {
+                node = cast->castExpression();
+                continue;
+            }
+            if (rule->children.size() == 1)
+            {
+                node = rule->children.front();
+                continue;
+            }
+            if (rule->children.size() == 3)
+            {
+                auto* left = dynamic_cast<antlr4::tree::TerminalNode*>(rule->children[0]);
+                auto* right = dynamic_cast<antlr4::tree::TerminalNode*>(rule->children[2]);
+                if (left != nullptr && right != nullptr
+                    && left->getSymbol()->getType() == CFlatParser::LeftParen
+                    && right->getSymbol()->getType() == CFlatParser::RightParen)
+                {
+                    node = rule->children[1];
+                    continue;
+                }
+            }
+            return false;
+        }
+        return false;
+}
+
 /*
  * A view read out of a struct FIELD names no declared slot, so recover the element from the
  * field's own declaration. Three addressings, one question: the field GEP handed in as storage,
@@ -8778,6 +8930,26 @@ void MainListener::JoinTernaryPointerShape(LLVMBackend::TypedValue& result,
             return;
         }
         if (result.value == nullptr || !result.value->getType()->isPointerTy()) return;
+        // A nullptr/default arm takes its partner's pointer shape (C++ composite pointer type);
+        // a view partner is named by the view ledger instead, so it never reaches here.
+        auto isNullArm = [](const LLVMBackend::TypedValue& arm) {
+            return llvm::isa_and_nonnull<llvm::ConstantPointerNull>(arm.value)
+                || (arm.hasSourceType && arm.sourceType.IsCxxNullptrT);
+        };
+        const bool trueNull = isNullArm(trueArm);
+        const bool falseNull = isNullArm(falseArm);
+        if (trueNull && falseNull) return;
+        if (trueNull || falseNull)
+        {
+            const auto& shaped = trueNull ? falseArm : trueArm;
+            if (shaped.isArrayView || shaped.pointerDepth < 1
+                || !LLVMBackend::IsPrimitiveTypeName(shaped.sourceTypeName)
+                || shaped.sourceTypeName == "void") return;
+            result.pointerDepth = shaped.pointerDepth;
+            result.elemPointer = shaped.elemPointer;
+            result.sourceTypeName = shaped.sourceTypeName;
+            return;
+        }
         if (trueArm.pointerDepth < 1 || !LLVMBackend::IsPrimitiveTypeName(trueArm.sourceTypeName)
             || trueArm.sourceTypeName == "void") return;
         if (trueArm.pointerDepth != falseArm.pointerDepth
@@ -9405,6 +9577,11 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             ~TernaryCallArgumentDepthScope() { if (active) --depth; }
             bool IsOutermost() const { return active && depth == 1; }
         } ternaryDepth(ternaryCallArgumentDepth_, inCallArgument_);
+        const bool cxxCallArgumentJoin = cxxTernaryDecl && inCallArgument_
+            && inCxxCallArgument_ && ternaryDepth.IsOutermost()
+            && (IsDefaultOnlyExpression(expressionTrueCtx)
+                || IsDefaultOnlyExpression(expressionFalseCtx))
+            && IsWholeCxxCallArgumentShape(ctx, outerExpected);
 
         auto* trueBlock   = compiler->CreateBasicBlock("ternary_true");
         auto* falseBlock  = compiler->CreateBasicBlock("ternary_false");
@@ -9925,6 +10102,48 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             throw;
         }
 
+        // T306 r3: a default-only argument joins into the destination only when the other arm IS
+        // that class. Any other arm type (a derived class, or a cast to another class) refuses here.
+        if (cxxCallArgumentJoin && trueValue != nullptr && falseValue != nullptr)
+        {
+            const bool trueIsDefault = IsDefaultOnlyExpression(expressionTrueCtx);
+            const bool falseIsDefault = IsDefaultOnlyExpression(expressionFalseCtx);
+            llvm::Value* otherValue = trueIsDefault ? falseValue : trueValue;
+            if (!(trueIsDefault && falseIsDefault)
+                && otherValue->getType() != cxxTernaryDeclLlvmType())
+            {
+                antlr4::ParserRuleContext* defaultArmCtx = trueIsDefault ? expressionTrueCtx
+                    : static_cast<antlr4::ParserRuleContext*>(expressionFalseCtx);
+                antlr4::ParserRuleContext* otherArmCtx = trueIsDefault
+                    ? static_cast<antlr4::ParserRuleContext*>(expressionFalseCtx) : expressionTrueCtx;
+                // A place (named variable, field, deref) owns nothing here: the arms differ in TYPE.
+                // A call result or other temporary lives in an unnamed slot and keeps the ownership text.
+                llvm::Value* otherStorage = trueIsDefault ? falseStorage : trueStorage;
+                const bool otherIsPlace = otherStorage != nullptr
+                    && isAddressableLvalue(otherValue, otherStorage)
+                    && !compiler->IsProducedTempValue(otherValue)
+                    && (!llvm::isa<llvm::AllocaInst>(otherStorage)
+                        || compiler->FindVariableByStorage(otherStorage) != nullptr);
+                // Only a nontrivial C++ class temporary can own; a scalar, pointer or CFlat value is a type mismatch.
+                const auto otherArmType = InferTernaryArmType(otherValue);
+                const std::string otherSpelled = SpellType(*compiler, otherArmType);
+                if (!otherIsPlace && otherSpelled.empty())
+                    LogErrorContext(ctx, compiler->LocalizeMessage(
+                        "'?:' arms differ in type: 'default' builds the argument type '{}', but '{}' is not "
+                        "that type. Convert that arm to the argument type.",
+                        { SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = cxxTernaryDeclType }),
+                          CollapsedSourceText(otherArmCtx) }));
+                else if (otherIsPlace || !compiler->IsForeignNontrivialCxxClass(otherArmType.TypeName))
+                    LogErrorContext(ctx, compiler->LocalizeMessage(
+                        "'?:' arms differ in type: '{}' is a '{}', but 'default' builds the argument type "
+                        "'{}'. Convert that arm to the argument type.",
+                        { CollapsedSourceText(otherArmCtx),
+                          otherSpelled,
+                          SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = cxxTernaryDeclType }) }));
+                else
+                    ReportMixedOwnershipTernaryJoin(otherArmCtx, defaultArmCtx, ctx);
+            }
+        }
         if (cxxTernaryDecl && !cxxTernaryDeclFailed && cxxTernaryDeclArmsMoved == 2)
         {
             if (trueEnd != nullptr && cflat_llvm::GetTerminatorOrNull(trueEnd) == nullptr)
@@ -9947,6 +10166,20 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 compiler->pendingCxxTernaryDeclArmType_ = trueDerived.typeName;
                 compiler->pendingCxxTernaryDeclArmCat_ = static_cast<int>(
                     trueDerived.cat == falseDerived.cat ? trueDerived.cat : DerivedArmCat::Prvalue);
+            }
+            if (cxxCallArgumentJoin)
+            {
+                auto* joined = compiler->CreateLoad(cxxTernaryDeclLlvmType(), cxxTernaryDeclDest);
+                joined->setName("cxx.ternary.arg.value");
+                compiler->RegisterOwnedStructTemp(cxxTernaryDeclDest, cxxTernaryDeclType);
+                compiler->lastCxxRetTemp_ = cxxTernaryDeclDest;
+                compiler->lastCxxRetValue_ = joined;
+                LLVMBackend::TypedValue result{ joined, false };
+                result.isRvalue = true;
+                result.storage = cxxTernaryDeclDest;
+                result.sourceType.TypeName = cxxTernaryDeclType;
+                result.hasSourceType = true;
+                return result;
             }
             // Two fresh arms built the slot in place: the join is a prvalue, not a place.
             LLVMBackend::TypedValue consumed{};
@@ -11346,6 +11579,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 }
             }
             LLVMBackend::TypedValue result{ joined, false };
+            // Both arms named one raw pointer shape: the '??' join carries it like a '?:' join.
+            JoinTernaryPointerShape(result, lhsTv, rhsShape);
             if (inCallArgument_ && joined != nullptr && joined->getType()->isPointerTy()
                 && lhsBr != nullptr && rhsBr != nullptr)
             {
@@ -11386,6 +11621,48 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
         // Only a real `?:` claims it: a plain operand (a parenthesized arm `a ? X : (b ? Y : Z)`)
         // passes the slot on to the ternary inside it.
         const bool claimsCxxTernaryDecl = ctx->Question() != nullptr;
+        const bool cxxCallDefaultTernary = claimsCxxTernaryDecl && inCallArgument_
+            && inCxxCallArgument_
+            && !outerExpected.Pointer && !outerExpected.IsAlias
+            && !outerExpected.IsRvalueRef
+            && compiler->IsForeignNontrivialCxxClass(outerExpected.TypeName)
+            && (IsDefaultOnlyExpression(ctx->expression())
+                || IsDefaultOnlyExpression(ctx->conditionalExpression()))
+            && IsWholeCxxCallArgumentShape(ctx, outerExpected);
+        auto* cxxCallTernaryType = cxxCallDefaultTernary
+            ? compiler->GetType(outerExpected) : nullptr;
+        llvm::Value* cxxCallTernarySlot = cxxCallTernaryType != nullptr
+            ? compiler->AllocaAtEntry(cxxCallTernaryType, nullptr, "cxx.ternary.arg") : nullptr;
+        struct CxxCallTernaryPendingScope
+        {
+            LLVMBackend* backend;
+            bool active;
+            llvm::Value* savedDest;
+            std::string savedType;
+            bool savedConsumed;
+            bool savedFailed;
+            CxxCallTernaryPendingScope(LLVMBackend* b, llvm::Value* slot,
+                                       const std::string& typeName)
+                : backend(b), active(slot != nullptr), savedDest(b->pendingCxxTernaryDeclDest_),
+                  savedType(b->pendingCxxTernaryDeclTypeName_),
+                  savedConsumed(b->pendingCxxTernaryDeclConsumed_),
+                  savedFailed(b->pendingCxxTernaryDeclFailed_)
+            {
+                if (!active) return;
+                backend->pendingCxxTernaryDeclDest_ = slot;
+                backend->pendingCxxTernaryDeclTypeName_ = typeName;
+                backend->pendingCxxTernaryDeclConsumed_ = false;
+                backend->pendingCxxTernaryDeclFailed_ = false;
+            }
+            ~CxxCallTernaryPendingScope()
+            {
+                if (!active) return;
+                backend->pendingCxxTernaryDeclDest_ = savedDest;
+                backend->pendingCxxTernaryDeclTypeName_ = std::move(savedType);
+                backend->pendingCxxTernaryDeclConsumed_ = savedConsumed;
+                backend->pendingCxxTernaryDeclFailed_ = savedFailed;
+            }
+        } cxxCallTernaryPending(compiler, cxxCallTernarySlot, outerExpected.TypeName);
         llvm::Value* cxxTernaryDeclDest = claimsCxxTernaryDecl
             ? compiler->pendingCxxTernaryDeclDest_ : nullptr;
         const std::string cxxTernaryDeclType = claimsCxxTernaryDecl
@@ -15659,6 +15936,15 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         bool lhsCxxPointeeConst) {
         auto* compiler = Compiler(ctx);
         if (!lvalue) return nullptr;
+        // An ADL request for this expression was ambiguous and refused: nested rewrites stay silent.
+        if (ctx != nullptr && ctx == cxxAdlAmbiguousCtx_) return nullptr;
+        // The marker covers one outermost resolution only: a generic body re-walks the same ctx.
+        struct AdlAmbiguousScope
+        {
+            const antlr4::ParserRuleContext*& marker;
+            bool outermost;
+            ~AdlAmbiguousScope() { if (outermost) marker = nullptr; }
+        } adlAmbiguousScope{ cxxAdlAmbiguousCtx_, cxxOperatorRewriteDepth_ == 0 };
         struct RewriteDepthScope
         {
             int& depth;
@@ -15885,8 +16171,11 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         // distinguish `const T&` from an actual `T*`; both have the same mapped pointer shape.
         // The last ADL-form request clang itself rejected (its text), for the T85 drop fallback.
         std::string adlClangRefusal;
+        // True when that refusal is clang's "is ambiguous" diagnostic: refused, never a fallback.
+        bool adlClangAmbiguous = false;
         // clangDecides: the ADL form asks clang even for a class hiding nothing (T85 template rank).
         auto tryFreeOperator = [&](bool adlOnly = false, bool clangDecides = false) -> llvm::Value* {
+            if (ctx != nullptr && ctx == cxxAdlAmbiguousCtx_) return nullptr;
             llvm::Value* freeLhsStorage = lhsIsRvalue ? nullptr : lhsStorage;
             llvm::Value* freeRhsStorage = rhsIsRvalue ? nullptr : rhsStorage;
             auto structInfo = [](llvm::Value* value) {
@@ -16051,6 +16340,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 if (adlInfix)
                 {
                     adlClangRefusal.clear();
+                    adlClangAmbiguous = false;
                     if (!compiler->RequestCxxFreeFunction(sourceName, {}, templateArgs,
                                                           registeredName, templateError, op)
                         || registeredName.empty())
@@ -16059,8 +16349,12 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                         // set says the same. Any other clang refusal (ambiguous, a body) is kept.
                         if (compiler->LastCxxRequestClangRejected() && !templateError.empty()
                             && !compiler->LastCxxRequestNoViableAtRequest())
+                        {
                             adlClangRefusal = templateError.starts_with("clang: ")
                                 ? templateError : "clang: " + templateError;
+                            adlClangAmbiguous = templateError.find("use of overloaded operator") != std::string::npos
+                                && templateError.find("is ambiguous") != std::string::npos;
+                        }
                         return nullptr;
                     }
                 }
@@ -16127,8 +16421,16 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 const std::string& owner = leftClass ? leftInfo.second : rightInfo.second;
                 const std::string base = owner.substr(0, owner.find('$'));
                 const size_t dot = base.rfind('.');
-                return callOperatorTemplate((dot == std::string::npos ? std::string("__cxx_free")
-                                             : base.substr(0, dot)) + "." + opName, true);
+                adlClangAmbiguous = false;
+                llvm::Value* adlResult = callOperatorTemplate((dot == std::string::npos
+                    ? std::string("__cxx_free") : base.substr(0, dot)) + "." + opName, true);
+                // Clang's ambiguity is the answer: refuse here, never fall back to a registered overload.
+                if (adlResult == nullptr && adlClangAmbiguous && ctx != nullptr)
+                {
+                    cxxAdlAmbiguousCtx_ = ctx;
+                    LogErrorContext(ctx, adlClangRefusal);
+                }
+                return adlResult;
             }
 
             for (const std::string& ns : namespaces)
@@ -16730,6 +17032,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         };
 
         auto reportNoOperator = [&](const std::string& typeName) -> llvm::Value* {
+            if (ctx != nullptr && ctx == cxxAdlAmbiguousCtx_) return nullptr;
             // A C++ record with no viable member/free operator may still reach a built-in
             // operator through one implicit conversion function. Keep this after operator
             // lookup so a real C++ overload always wins, and never apply it to CFlat structs.
@@ -17374,6 +17677,13 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 if (candidate.Parameters[0].IsCxxConstRef) return 2;
                 return candidate.Parameters[0].IsAlias ? 1 : 0;
             };
+            auto isInheritedBaseReferenceFree = [&](const LLVMBackend::FunctionSymbol& candidate) {
+                if (candidate.IsMethod || candidate.Parameters.empty()) return false;
+                const int refKind = freeParamRefKind(candidate);
+                const std::string& paramType = candidate.Parameters[0].TypeName;
+                return (refKind == 1 || refKind == 2) && paramType != typeName
+                    && compiler->IsCxxBaseOf(paramType, typeName);
+            };
             struct RankedOperator
             {
                 std::string uniqueName;
@@ -17390,7 +17700,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     for (const auto& candidate : it->second)
                     {
                         if (!candidate.IsCxx || candidate.Parameters.size() != 2
-                            || candidate.Parameters[0].TypeName != typeName
+                            || (candidate.Parameters[0].TypeName != typeName
+                                && !isInheritedBaseReferenceFree(candidate))
                             || !seen.insert(candidate.UniqueName).second) continue;
                         if (candidate.IsMethod && table != opName) continue;
                         if (!candidate.IsMethod && candidate.SourceName != table) continue;
@@ -21800,7 +22111,9 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
         const std::string& structName,
         const LLVMBackend::TypeAndValue& field,
         CFlatParser::AssignmentExpressionContext* ae,
-        bool* srcIsUnsigned) {
+        bool* srcIsUnsigned,
+        llvm::Value* intoSlot,
+        bool* constructedInPlace) {
         auto* compiler = Compiler(ae);
         const auto fieldInitTemps = compiler->MarkOwnedTemps();
         if (field.AllocAlignValue > LLVMBackend::kDefaultNewAlign
@@ -21809,6 +22122,92 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
         auto nv = ParseAssignmentExpressionNamed(ae);
         compiler->RejectImplicitIntegerPointeePointerConversion(nv.TypeAndValue, field);
         llvm::Value* val = LoadNamedVariable(nv);
+        // A scalar initializer of a C++ class field (`IntC c = 5;`) is a converting constructor
+        // call, the same one a local `IntC c = 5;` makes; a plain store would leave the field unset.
+        if (val != nullptr && !field.Pointer && !field.IsAlias && !field.IsArrayView
+            && field.ConstArraySize == 0 && compiler->IsCxxRecord(field.TypeName)
+            && !nv.TypeAndValue.Pointer
+            && (val->getType()->isIntegerTy() || val->getType()->isFloatingPointTy()))
+        {
+            LLVMBackend::NamedVariable source = nv;
+            source.Primary = val;
+            // A literal is typed the way the local and new-expression paths type it.
+            bool suffixedLiteral = false;
+            if (source.LiteralIdentity.empty())
+                source.LiteralIdentity = LLVMBackend::LiteralIdentityForOverload(
+                    ae->getText(), &suffixedLiteral);
+            TypeUntypedCtorArg(source.TypeAndValue, val,
+                               suffixedLiteral ? source.LiteralIdentity : std::string(), nullptr);
+            llvm::Value* slot = intoSlot;
+            llvm::Type* classType = compiler->GetType(field);
+            if (slot == nullptr && classType != nullptr)
+                slot = compiler->AllocaAtEntry(classType, nullptr, "field.cxx.init");
+            // A tie CFlat cannot judge, or a candidate it drops, is clang's: the same test a local runs.
+            std::string why;
+            bool nullPointerCandidate = false;
+            std::vector<LLVMBackend::NamedVariable> ctorVars{ source };
+            const std::vector<LLVMBackend::TypeAndValue> ctorTypes{ source.TypeAndValue };
+            const auto* listed = compiler->SelectCxxConstructor(field.TypeName, ctorTypes, why,
+                                                               false, &ctorVars);
+            const bool clangDecides = compiler->CxxConstructorNeedsClangResolution(
+                    field.TypeName, listed, ctorTypes, &ctorVars, /*allowExplicit*/ true,
+                    &nullPointerCandidate)
+                || (listed == nullptr && why.find("more than one") != std::string::npos);
+            std::string refusal;
+            auto converted = LLVMBackend::CxxConvertingCtorResult::NotApplicable;
+            if (slot != nullptr && clangDecides)
+            {
+                std::string wrapperName;
+                std::string wrapperError;
+                if (compiler->RequestCxxVariadicConstructor(field.TypeName, { source }, wrapperName,
+                                                            wrapperError, /*copyInit*/ true))
+                {
+                    LLVMBackend::NamedVariable self;
+                    self.Primary = slot;
+                    self.BaseType = slot->getType();
+                    self.TypeAndValue.TypeName = field.TypeName;
+                    self.TypeAndValue.Pointer = true;
+                    self.IsRvalue = true;
+                    compiler->CreateOverloadedFunctionCall(wrapperName, { self, source });
+                    converted = LLVMBackend::CxxConvertingCtorResult::Converted;
+                }
+                else if (!wrapperError.empty())
+                {
+                    refusal = wrapperError;
+                    converted = LLVMBackend::CxxConvertingCtorResult::Refused;
+                }
+            }
+            // Same conversion call as a local `T t = u;` (convertInto): scalar narrowing allowed.
+            if (slot != nullptr && converted == LLVMBackend::CxxConvertingCtorResult::NotApplicable)
+                converted = compiler->ConvertThroughCxxConvertingCtor(source, field.TypeName, slot,
+                                                                      refusal,
+                                                                      /*directInit*/ false,
+                                                                      /*allowScalarNarrowing*/ true);
+            if (converted == LLVMBackend::CxxConvertingCtorResult::Refused)
+                LogErrorContext(ae, refusal);
+            if (converted == LLVMBackend::CxxConvertingCtorResult::NotApplicable)
+            {
+                // Never a plain store into a C++ record: the local path refuses the same way.
+                LogErrorContext(ae, std::format(
+                    "cannot initialize C++ class '{}' from this expression; use '{}(args)', "
+                    "'= default', a '{}' lvalue, or 'move <{}> lvalue'",
+                    compiler->DisplayCxxClassName(field.TypeName),
+                    compiler->DisplayCxxClassName(field.TypeName),
+                    compiler->DisplayCxxClassName(field.TypeName),
+                    compiler->DisplayCxxClassName(field.TypeName)));
+            }
+            if (slot != nullptr && classType != nullptr)
+            {
+                if (converted != LLVMBackend::CxxConvertingCtorResult::NotApplicable
+                    && intoSlot != nullptr)
+                {
+                    if (constructedInPlace != nullptr) *constructedInPlace = true;
+                    return nullptr;
+                }
+                return compiler->builder->CreateLoad(classType, slot);
+            }
+            return val;
+        }
         RejectRawHeapArrayIntoUniqueField(nv, field, field.VariableName, ae);
         // R5: `unique T* f = new T();` on a C++ class (std::unique_ptr<T>) adopts the pointer.
         if (val != nullptr && !field.Pointer && val->getType()->isPointerTy())
@@ -22749,7 +23148,7 @@ void MainListener::EmitFieldInitializer(
                     const bool constructedCflatElements = !nestedField.Pointer
                         && !nestedField.ElemPointer && !nestedField.IsArrayView
                         && !compiler->IsCxxRecord(nestedField.TypeName)
-                        && explicitNoArgConstructors_.count(nestedField.TypeName) != 0;
+                        && CflatStructNeedsCtorConstruction(nestedField.TypeName);
                     if (constructedCflatElements && positionalArray && allPositionalElements)
                     {
                         // The containing aggregate already ran each element's user constructor.
@@ -24835,8 +25234,23 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                 SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName }), denied));
             return {};
         }
-        const bool hasNewCxxArgs = ctx->argumentExpressionList() != nullptr
-            && !ctx->argumentExpressionList()->argumentNamedExpression().empty();
+        // `new K{0}` on a C++ class: plain positional brace items take the paren form's ctor
+        // resolution (0 is the null pointer constant); other brace forms keep their refusal.
+        const auto braceFields = ctx->initializerList() != nullptr
+            ? ctx->initializerList()->fieldInit() : std::vector<CFlatParser::FieldInitContext*>{};
+        const bool braceCxxArgs = ctx->initializerList() != nullptr && !isArray && !typeIsPtr
+            && !braceFields.empty()
+            && std::all_of(braceFields.begin(), braceFields.end(),
+                           [](CFlatParser::FieldInitContext* field) {
+                               return field->Identifier() == nullptr && field->Assign() == nullptr
+                                   && field->LeftBrace() == nullptr && field->Colon() == nullptr
+                                   && field->assignmentExpression().size() == 1;
+                           })
+            && (compiler->IsForeignNontrivialCxxClass(typeName)
+                || compiler->IsForeignCxxClassWithUserDeclaredConstructor(typeName))
+            && !compiler->IsForeignCxxAggregateClass(typeName);
+        const bool hasNewCxxArgs = braceCxxArgs || (ctx->argumentExpressionList() != nullptr
+            && !ctx->argumentExpressionList()->argumentNamedExpression().empty());
         const std::string resolvedNewCxxType = hasNewCxxArgs
             ? compiler->ResolveTypeAlias(typeName) : std::string{};
         const bool hasForeignCxxRecordArgs = hasNewCxxArgs && !isArray && !typeIsPtr
@@ -24878,7 +25292,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     compiler->DisplayCxxClassName(typeName)));
                 return {};
             }
-            if (ctx->initializerList() != nullptr)
+            if (ctx->initializerList() != nullptr && !braceCxxArgs)
             {
                 LogErrorContext(ctx, std::format(
                     "cannot brace-initialize C++ class '{}'; use 'new {}(args)'",
@@ -24889,10 +25303,25 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             std::vector<llvm::Value*> ctorArgs;
             std::vector<LLVMBackend::NamedVariable> ctorArgVars;
             std::vector<LLVMBackend::TypeAndValue> ctorArgTypes;
-            if (auto* argList = ctx->argumentExpressionList())
+            // The constructor arguments: the paren list, or the positional elements of `new K{...}`.
+            std::vector<antlr4::ParserRuleContext*> ctorArgNodes;
+            std::vector<CFlatParser::AssignmentExpressionContext*> ctorArgExprs;
+            if (braceCxxArgs)
+                for (auto* field : braceFields)
+                {
+                    ctorArgNodes.push_back(field);
+                    ctorArgExprs.push_back(field->assignmentExpression(0));
+                }
+            else if (auto* argList = ctx->argumentExpressionList())
                 for (auto* named : argList->argumentNamedExpression())
                 {
-                    auto* argAssign = named->assignmentExpression();
+                    ctorArgNodes.push_back(named);
+                    ctorArgExprs.push_back(named->assignmentExpression());
+                }
+            for (size_t argIndex = 0; argIndex < ctorArgNodes.size(); ++argIndex)
+                {
+                    auto* named = ctorArgNodes[argIndex];
+                    auto* argAssign = ctorArgExprs[argIndex];
                     if (argAssign == nullptr)
                     {
                         LogErrorContext(named, std::format(
@@ -24905,7 +25334,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                     auto nv = ParseAssignmentExpressionNamed(argAssign);
                     NormalizeCxxRvalueReferenceArgument(argAssign, nv);
                     BindCxxCtorPointerSlotAddress(argAssign, nv, typeName, ctorArgVars.size(),
-                                                  argList->argumentNamedExpression().size());
+                                                  ctorArgNodes.size());
                     const bool hadSourceTypeName = !nv.TypeAndValue.TypeName.empty();
                     // Same literal identity the call-argument builder records (integer -> enum refusal).
                     bool suffixedLiteral = false;
@@ -25318,11 +25747,13 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             && compiler->CxxElementNeedsDefaultConstruction(typeName))
             compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::CxxHeapArray,
                                         typedPtr, typeName, allocAlign, count);
-        else if (isArray && count && !typeIsPtr && !compiler->GetFunction(opNewName)
+        else if (isArray && count && !typeIsPtr
             && (compiler->GetFunction(typeName) != nullptr
                 || compiler->CxxElementNeedsDefaultConstruction(typeName)))
-            compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::CflatHeap,
-                                        typedPtr, typeName, useAligned ? allocAlign : 0);
+            compiler->NoteUnwindPartial(compiler->GetFunction(opNewName)
+                    ? LLVMBackend::UnwindPartialEntry::Kind::UserNewHeap
+                    : LLVMBackend::UnwindPartialEntry::Kind::CflatHeap,
+                typedPtr, typeName, useAligned ? allocAlign : 0, sizeVal);
         if (isArray && count && !typeIsPtr && compiler->GetFunction(typeName) == nullptr
             && compiler->CxxElementNeedsDefaultConstruction(typeName))
         {
@@ -25370,9 +25801,10 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         {
             // An unwind out of the arguments or the constructor frees the global-new block.
             LLVMBackend::UnwindPartialScope newBlockScope(*compiler);
-            if (!(!typeName.empty() && compiler->GetFunction(opNewName)))
-                compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::CflatHeap,
-                                            typedPtr, typeName, useAligned ? allocAlign : 0);
+            compiler->NoteUnwindPartial(compiler->GetFunction(opNewName)
+                    ? LLVMBackend::UnwindPartialEntry::Kind::UserNewHeap
+                    : LLVMBackend::UnwindPartialEntry::Kind::CflatHeap,
+                typedPtr, typeName, useAligned ? allocAlign : 0, sizeVal);
             std::vector<LLVMBackend::NamedVariable> ctorArgs;
             auto argList = ctx->argumentExpressionList();
             if (argList != nullptr)
@@ -25523,10 +25955,10 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             if (freshBraceInit)
             {
                 LLVMBackend::UnwindPartialScope newBraceScope(*compiler);
-                if (!compiler->GetFunction(opNewName))
-                    compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::CflatHeap,
-                                                typedPtr, typeName,
-                                                useAligned ? allocAlign : 0);
+                compiler->NoteUnwindPartial(compiler->GetFunction(opNewName)
+                        ? LLVMBackend::UnwindPartialEntry::Kind::UserNewHeap
+                        : LLVMBackend::UnwindPartialEntry::Kind::CflatHeap,
+                    typedPtr, typeName, useAligned ? allocAlign : 0, sizeVal);
                 if (!EmitFreshBraceInitializeAggregate(typedPtr, typeName, initList))
                     EmitFieldInitializer(typedPtr, typeName, initList);
                 newBraceScope.Release();
