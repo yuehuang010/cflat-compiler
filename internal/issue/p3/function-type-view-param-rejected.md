@@ -9,7 +9,7 @@
 int sum(int[] v) { return 0; }
 extern int main() { function<int(int[])> f = sum; return f(nullptr); }
 ```
-Master (0ccbd8e47) refuses at `<`. C++20 accepts the analogue `std::function<int(std::span<const int>)>`.
+Master (74834c205) refuses at `<`. C++20 accepts the analogue `std::function<int(std::span<const int>)>`.
 
 ## Fix direction
 Add `arrayTypeSuffix?` to `functionPointerParam`; carry view + element const through both function-type parse paths

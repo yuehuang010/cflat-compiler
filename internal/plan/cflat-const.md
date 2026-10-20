@@ -31,16 +31,16 @@ PHASE 7 LANDED 2026-10-18 (ecf28e477): #14 (const on a generic type argument, in
 `const T` whole-word per instantiation; pointee-const type args mangle distinctly (`.c<N>$`, existing symbols unchanged;
 depth-1 only); deduction keeps pointee const, strips top-level; doc/LANGUAGE.md "Const" section; review-draft remainder
 appended as testConstWholeWord. ITERATION 1 COMPLETE (phases 0-4, 6, 7).
-ITEM 10 (C side) LANDED 2026-10-19 (fa1d8e755): C header / .c globals, C struct/union fields (top-level const too), typedef'd
+ITEM 10 (C side) LANDED 2026-10-19 (87b36b2f1): C header / .c globals, C struct/union fields (top-level const too), typedef'd
 spellings and C auto-extern results carry ConstMask like the native declaration; DeclaredConstSlot sees C globals; header
 cache v266. C function-pointer results/params stay unconst (p3 function-type-cannot-carry-pointee-const, needs ruling).
-TRAILING CONST RULED 2026-10-19 (R3 -> C), PHASE 8 LANDED 2026-10-19 (8b7c67afa; constructors cannot be const;
+TRAILING CONST RULED 2026-10-19 (R3 -> C), PHASE 8 LANDED 2026-10-19 (87b36b2f1; constructors cannot be const;
 leftovers p3 trailing-const-leftovers-after-c08, p3 duplicate-function-definition-accepted): C++ spelling `int get() const`; explicit const asserts
 (#9), inference stays for unmarked methods, interface methods must spell const (#10). RULED 2026-10-19: function types carry pointee const, exact-match identity (LANDED c14 same day); string data() -> (const char)*, data_mut()
 copies a borrowed string first (rulings in the two p3 issue files). Phase 5 (C++) ON HOLD.
 RULED 2026-10-19: a `(const E)[]` generic argument is its own instantiation, mangled distinctly like `(const E)*` (phase 7);
 element const is enforced in the body and is_const answers 1 (today it binds as `E[]`, so a const view cannot be passed
-to a generic at all - fails safe). Queued after c11 + c14 (TypeMangling overlap). IS_CONST(T) LANDED 2026-10-19 (fbb939d25; view args answer 0 until the (const E)[] ruling lands). STRING data()/data_mut() LANDED (be36e4cee). Open:
+to a generic at all - fails safe). VIEW RULING LANDED 2026-10-19 (74834c205; mangled .c1$.v$, depth-1 like pointers; function-type view params = p3 function-type-view-param-rejected). IS_CONST(T) LANDED 2026-10-19 (c44b629c3; view args answer 1). STRING data()/data_mut() LANDED (076a9dd31). Open:
 (p3), function<> const params (p3), Windows gate (box offline 2026-10-19).
 Written 2026-10-16 against master 753d9b22f. Supersedes, once ruled, the
 2026-08-26 "const stays unenforced" ruling and the "(CFlat exposes no const)" clause of the

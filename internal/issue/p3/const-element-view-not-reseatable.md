@@ -1,6 +1,6 @@
 # `(const E)[]` view variable cannot be reassigned
 
-Filed 2026-10-19 from the c16 report; verified on master c7be589ef (scratch/cview/reseat.cb, gitignored).
+Filed 2026-10-19 from the c16 report; verified on master 076a9dd31 (scratch/cview/reseat.cb, gitignored).
 
 ```cflat
 int[2] a = {1, 2}; int[2] b = {3, 4};

@@ -1,6 +1,6 @@
 # Trailing const leftovers after c08 (const plan phase 8)
 
-Filed 2026-10-19 from the c08 implementer report (landed 8b7c67afa). Items 1-3 (#8 field naming,
+Filed 2026-10-19 from the c08 implementer report (landed 87b36b2f1). Items 1-3 (#8 field naming,
 #10 location for generic interfaces, receiver on internal interface dispatch) fixed in c11.
 1. Calling a free function declared after the struct with `this` from inside a method (`pokeT(this)`) fails with
    "no overload matches", const or not (pre-existing, unrelated to const).
