@@ -679,6 +679,7 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
             thisParam.TypeName = structName;
             thisParam.VariableName = structName + "__";
             thisParam.Pointer = true;
+            if (func->trailingConst() != nullptr) thisParam.ConstMask = 1;  // `this` is (const S)*
             params.insert(params.begin(), thisParam);
         }
 
@@ -767,6 +768,7 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
                 if (!p.VariableName.empty()) sig += " " + p.VariableName;
             }
             sig += ")";
+            if (func->trailingConst() != nullptr) sig += " const";
             std::string doc = ExtractLeadingDoc(tokens_, func->getStart());
             s->Register(SymbolKind::Function, name, compiler->GetSourceFilePath(),
                         (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(),
@@ -856,6 +858,7 @@ void ForwardRefScanner::ScanInterfaceDefinition(CFlatParser::InterfaceDefinition
         {
             LLVMBackend::InterfaceMethod m;
             m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
+            m.IsConst = method->trailingConst() != nullptr;
             m.Name = getInterfaceMethodName(method);
             auto declParams = ParseParameterTypeList(method->parameterTypeList());
             for (const auto& p : declParams)

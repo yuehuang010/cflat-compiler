@@ -24,6 +24,21 @@ int* const t183KCConstPtr = &t183KCMutable;
 int t183KCTakeMutable(int* p) { return *p; }
 int t183KCTakeConst(const int* p) { return *p; }
 
+/* c10: const C globals, results and fields read back through CFlat. */
+static const int t10KSeven = 7;
+static const char* t10Names[2] = { "p0", "p1" };
+const char t10KStr[6] = "hello";
+const int* t10KPArr[2] = { &t183KCScalar, &t10KSeven };
+struct T10RS t10RS = { 3, 4 };
+struct T10FS t10FS = { { 5, 6 }, "nm", "pc", { 8, 9 } };
+T10_PCSTR t10Pc = "xyz";
+const char* t10Name(void) { return t10KStr; }
+T10_PCSTR t10Name2(void) { return t10KStr + 1; }
+const int* t10Ip(void) { return &t10KSeven; }
+const char** t10Pp(void) { return t10Names; }
+int t10TakeMut(char* s) { return s[0]; }
+int t10TakeConst(const char* s) { return s[0]; }
+
 int c_add(int a, int b)
 {
     return a + b;

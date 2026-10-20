@@ -7714,7 +7714,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     interfaceVar.TypeAndValue.TypeName,
                                     primaryIdentifier,
                                     extraArgs,
-                                    ncSitePtr
+                                    ncSitePtr,
+                                    &interfaceVar
                                 );
                                 if (cleanupInlineOwnedReceiver && ifacePtr != nullptr)
                                 {
@@ -10559,6 +10560,9 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
 
 LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::LambdaExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
+        if (ctx->trailingConst() != nullptr)
+            LogErrorContext(ctx->trailingConst(),
+                "'const' after a parameter list is only allowed on a member function");
         // Read before the body suspends the flag: a literal passed as a call argument is bound by
         // overload resolution, which owns the signature check there (see the bind check below).
         const bool boundAsCallArgument = inCallArgument_;

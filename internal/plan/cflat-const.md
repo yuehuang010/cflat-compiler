@@ -30,9 +30,15 @@ Windows-only sites migrated (static sweep, Windows not compiled - verify on the 
 PHASE 7 LANDED 2026-10-18 (ecf28e477): #14 (const on a generic type argument, incl. aliases naming a const word);
 `const T` whole-word per instantiation; pointee-const type args mangle distinctly (`.c<N>$`, existing symbols unchanged;
 depth-1 only); deduction keeps pointee const, strips top-level; doc/LANGUAGE.md "Const" section; review-draft remainder
-appended as testConstWholeWord. ITERATION 1 COMPLETE (phases 0-4, 6, 7). Open: phase 5 (C++ interop), trailing
-`func() const` + interface const methods (#9 #10 #15), is_const(T), C header globals / C auto-extern return const
-(p3 c-const-leftovers-after-t183 still reproduces), string `_ptr` (p3), function<> const params (p3), Windows gate.
+appended as testConstWholeWord. ITERATION 1 COMPLETE (phases 0-4, 6, 7).
+ITEM 10 (C side) LANDED 2026-10-19 (fa1d8e755): C header / .c globals, C struct/union fields (top-level const too), typedef'd
+spellings and C auto-extern results carry ConstMask like the native declaration; DeclaredConstSlot sees C globals; header
+cache v266. C function-pointer results/params stay unconst (p3 function-type-cannot-carry-pointee-const, needs ruling).
+TRAILING CONST RULED 2026-10-19 (R3 -> C), PHASE 8 LANDED 2026-10-19 (8b7c67afa; constructors cannot be const;
+leftovers p3 trailing-const-leftovers-after-c08, p3 duplicate-function-definition-accepted): C++ spelling `int get() const`; explicit const asserts
+(#9), inference stays for unmarked methods, interface methods must spell const (#10). RULED 2026-10-19: function types carry pointee const, exact-match identity; string data() -> (const char)*, data_mut()
+copies a borrowed string first (rulings in the two p3 issue files). Phase 5 (C++) ON HOLD. Open: is_const(T), string `_ptr`
+(p3), function<> const params (p3), Windows gate (box offline 2026-10-19).
 Written 2026-10-16 against master 753d9b22f. Supersedes, once ruled, the
 2026-08-26 "const stays unenforced" ruling and the "(CFlat exposes no const)" clause of the
 2026-09-27 C++-const ruling. Probes: `scratch/const_spike/p01-p19.cb`
@@ -325,6 +331,7 @@ SAME phase as the rule that needs them (core edits need redeploy + `--init-local
 | 5 | Interop unification | Fold `IsCxxConstRef`/`IsCxxPointeeConst`/CFlat-slot `MarkCxxConstFieldAccess` into `ConstMask`; delete `IsSpelledPointeeConst`; C auto-extern return const; CFlat const into C++ `T*` refused; C++ const results into CFlat mutable refused. | p16 `takes_ptr(cp)` and `char* n = cname()` refused; existing C++-const tests unchanged (texts may unify - update expectations only where the text family merged, never weaken); the 2-3 p3 issues above deleted. |
 | 6 | String literals | Literal type `const char*`; core/Test/example `char* x = "..."` and `extern ...(char* fmt` prototypes migrated (counts in section 1). | p05 refused at compile time; `err_const_string_literal.cb`; test_example green. |
 | 7 | Generics + polish | #14, deduction stripping, `const T` on pointer T, `is_const(T)`, doc/LANGUAGE.md section, remove "const unenforced" notes in docs. | test_generics legs; `err_const_generic_arg.cb`. |
+| 8 | Trailing const (iteration 2, R3 C) | Grammar: optional `const` after the parameter list of a member function definition, a struct-body method declaration, an interface method and a member operator (100% rules, no predicates; ForwardRefScanner records it); on a free / extern / generic free function #15. Explicit const: `this` is `const S*` in the body, so a write is #9 and returning a pointer/alias into `this` as mutable is #7 (closes the phase-4 result limit for marked methods); the flag joins `IsConstMethod` (explicit wins, inference unchanged for unmarked). Interfaces: a call on a const interface receiver (`const IFoo`, `const IFoo*`, `const alias IFoo`) needs a const interface method (#8, ends the iteration-1 allowance); an implementer of a const interface method must be read-only, inferred or explicit (#10). Receiver const is not part of the signature (R1 B: `get()` + `get() const` = duplicate); vtable layout unchanged. Cache: explicit flag in SerializeFuncSym + interface table round-trip. Migration: core / Test / example interface methods called on const receivers gain `const` (count in the brief, from a build with the rule on). `mutable` stays out. | explicit-const write, implementer-writes and const-interface-receiver legs refused (#9 #10 #8) in `err_const_method_writes.cb` / `err_const_method_call.cb`; test_basic legs: marked and unmarked read-only methods on const receivers, const interface method via const receiver, marked method returning `(const int)*` into this; test_lsp green; cold == warm verdicts. |
 
 Phases 1, 2 can run in parallel after 0 (disjoint diagnostics; both touch assignment checks -
 stack 2 on 1 if the brief overlaps `MainListener_Expressions.cpp` assignment paths). 3 before 4
@@ -360,6 +367,9 @@ R3. **Method read-only-ness.** A: explicit trailing `const` only (C++). B: infer
   core method uncallable on a const receiver until annotated; inference matches the north star.
   Cost: a body change can silently change a public method's const-ness - acceptable inside a
   module, and interface methods are explicit anyway.
+  AMENDED 2026-10-19 (maintainer): iteration 2 adopts **C** (phase 8). Surface: C++ trailing `const` after the
+  parameter list; explicit const that writes is an error; unmarked methods keep inference; interface methods
+  must spell `const` to be callable on a const interface receiver.
 
 R4. **Explicit `move` of a const.** A: refused (#12), implicit last-use consume allowed.
   B: allowed (Rust: binding dies). C: becomes a copy (C++ `std::move(const T)`).

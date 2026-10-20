@@ -5364,6 +5364,12 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
             Compiler(func)->LogErrorMessage("base initializer is only valid in a [cpp] struct");
             return;
         }
+        // A constructor initializes its object, so it can never be const (C++ rule).
+        if (func->trailingConst() != nullptr)
+        {
+            LogErrorContext(func->trailingConst(), "a constructor cannot be declared const");
+            return;
+        }
         auto params = ParseParameterTypeList(func->parameterTypeList());
         if (cppCtorIndex != SIZE_MAX)
         {

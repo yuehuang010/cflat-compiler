@@ -4168,6 +4168,11 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
         if (r.isCxx && e.ret.Pointer && !e.ret.IsFunctionPointer
             && CxxSpellingHasConstPointee(r.retType))
             e.ret.IsCxxPointeeConst = true;
+        // A C result keeps its spelled pointee levels like a C parameter (`const char *` -> 1).
+        if (!r.isCxx && e.ret.Pointer && !e.ret.IsFunctionPointer && !e.ret.IsArrayView)
+            if (const uint8_t mask = CSpellingPointeeConstMask(r.retType, e.ret.ValuePointerDepth());
+                mask != 0 && (mask & (mask + 1u)) == 0)
+                e.ret.ConstMask = mask;
         if (r.isCxx && CxxSpellingHasVolatileTarget(r.retType))
             e.ret.IsCxxPointeeVolatile = true;
         for (size_t i = 0; i < r.paramTypes.size(); ++i)
@@ -5067,6 +5072,15 @@ bool LLVMBackend::MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEnt
         if (cxxBoundary && e.type.Pointer && !e.type.IsFunctionPointer
             && CxxSpellingHasConstPointee(r.ctype))
             e.type.IsSpelledPointeeConst = true;
+        // A C global carries the ConstMask of its native spelling (an array's mask is its element's);
+        // only a downward-closed mask is a CFlat spelling (R11), so `int* const` keeps none.
+        if (!cxxBoundary && !e.type.IsFunctionPointer && !e.type.IsArrayView)
+        {
+            const int depth = e.type.ValuePointerDepth();
+            const uint8_t mask = static_cast<uint8_t>(CSpellingPointeeConstMask(mappedType, depth)
+                | (r.isConst ? (1u << depth) : 0u));
+            if (mask != 0 && (mask & (mask + 1u)) == 0) e.type.ConstMask = mask;
+        }
         e.type.VariableName = r.name;
         if (auto it = cxxBindingRefusals_.find(e.name);
             it != cxxBindingRefusals_.end() && it->second.starts_with("global array '"))
@@ -22929,11 +22943,15 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                     && CxxSpellingHasConstPointee(f.ctype))
                     tv.IsCxxPointeeConst = true;
                 // A C field keeps its spelled pointee const (`const char* p`, a `PCSTR`; ctype is
-                // canonical). Only a downward-closed mask is a CFlat spelling (R11).
-                if (!r.isCxx && tv.Pointer && !tv.IsFunctionPointer && !tv.IsArrayView)
-                    if (const uint8_t mask = CSpellingPointeeConstMask(f.ctype, tv.ValuePointerDepth());
-                        mask != 0 && (mask & (mask + 1u)) == 0)
-                        tv.ConstMask = mask;
+                // canonical), and its own top-level const (an array's is its element's). Only a
+                // downward-closed mask is a CFlat spelling (R11).
+                if (!r.isCxx && !tv.IsFunctionPointer && !tv.IsArrayView)
+                {
+                    const int depth = tv.ValuePointerDepth();
+                    const uint8_t mask = static_cast<uint8_t>(CSpellingPointeeConstMask(elemSpelling, depth)
+                        | (f.isConst && !f.isMutable ? (1u << depth) : 0u));
+                    if (mask != 0 && (mask & (mask + 1u)) == 0) tv.ConstMask = mask;
+                }
                 if (r.isCxx && CxxSpellingHasVolatileTarget(f.ctype))
                     tv.IsCxxPointeeVolatile = true;
                 tv.IsCxxConstField = f.isConst && !f.isMutable && !tv.Pointer

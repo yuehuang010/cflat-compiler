@@ -1199,6 +1199,27 @@ extern int main()
     if (t168KCArray[0] != t183ArrBefore + 1)      return 16829;
     t168KCArray[0]--;
 
+    // c10: const C header globals, results and fields read and pass like their native spelling;
+    // the writes C allows stay legal (a pointee-const element reseats, a mutable field writes).
+    if (t10KStr[1] != 101 || t10TakeConst(t10KStr) != 104)        return 16840;
+    if (*t10KPArr[1] != 7 || t183KCTakeConst(t10KPArr[0]) != 41) return 16841;
+    t10KPArr[0] = &t183KCSecond;
+    if (*t10KPArr[0] != 63)                                       return 16842;
+    t10RS.b = 14;
+    if (t10RS.a + t10RS.b != 17)                                  return 16843;
+    t10FS.in.y = 19;
+    t10FS.pc = "qr";
+    if (t10FS.arr[1] + t10FS.in.x + t10FS.in.y != 33 || t10FS.nm[1] != 109
+        || t10FS.pc[1] != 114)                                    return 16844;
+    (const char)* t10N = t10Name();
+    auto t10A = t10Name2();
+    if (t10N[0] != 104 || t10A[0] != 101 || t10TakeConst(t10Name()) != 104) return 16845;
+    if (*t10Ip() != 7)                                            return 16846;
+    (const char)** t10P = t10Pp();
+    if (t10P[1][1] != 49)                                         return 16847;
+    t10Pc = "w";
+    if (t10Pc[0] != 119 || t10TakeConst(t10Pc) != 119)            return 16848;
+
     // ---- Section L: float/double #define macro extraction -------------------
     if (!testFloatMacros())                     return 200;
 
@@ -1462,6 +1483,9 @@ extern int main()
     int c06 = c06ConstCharFieldLegs();
     if (c06 != 0) return c06;
 
+    int c10 = c10ConstCResultLegs();
+    if (c10 != 0) return c10;
+
     return 0;
 }
 
@@ -1476,4 +1500,28 @@ int c06ConstCharFieldLegs()
     expect_error("the conversion discards const") { n.mutable_name = "ef"; }
     expect_error("it is reached through a pointer to const") { n.direct[0] = 'x'; }
     return 0;
+}
+
+// c10: a C result keeps its spelled pointee const (directly or through a typedef), like a native
+// `const char*` return; reading it through `(const char)*` or `auto` stays legal.
+int c10ConstCResultLegs()
+{
+    expect_error("cannot convert '(const char)*' to 'char*': the conversion discards const") {
+        char* c10N = t10Name();
+    }
+    expect_error("cannot convert '(const char)*' to 'char*': the conversion discards const") {
+        char* c10N2 = t10Name2();
+    }
+    expect_error("cannot assign to '*c10I': it is reached through a pointer to const") {
+        auto c10I = t10Ip();
+        *c10I = 1;
+    }
+    expect_error("cannot pass argument 1 ('(const char)*') to parameter 's' ('char*'): the conversion discards const") {
+        t10TakeMut(t10Name());
+    }
+    expect_error("cannot convert '(const char)**' to 'char**': the conversion discards const") {
+        char** c10Pp = t10Pp();
+    }
+    auto c10A = t10Ip();
+    return *c10A == 7 ? 0 : 16849;
 }

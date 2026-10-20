@@ -624,9 +624,26 @@ still converts to `string` and to a C++ `const char*` converting constructor.
 
 **Read-only methods.** On a const object, or through a pointer to const, only read-only methods can
 be called. Read-only-ness is inferred from the method body: writing a field counts, and so does
-writing through a pointer field, because const is transitive. An explicit trailing `func() const`
-is not spelled yet. Calls through an interface on a const receiver are allowed for now; this is
-pending the explicit trailing-`const` spelling for interface methods.
+writing through a pointer field, because const is transitive. A trailing `const` after the
+parameter list asserts it, as in C++:
+
+```cflat
+struct Counter
+{
+    int n = default;
+    int get() const { return n; }   // inside, this is (const Counter)*
+    void bump() { n++; }
+};
+```
+
+A method marked `const` that writes `this` is refused, and so is returning a mutable pointer into
+`this` from it. Unmarked methods keep the inferred answer. Receiver const is not part of the
+signature: `get()` and `get() const` are the same method. Trailing `const` is refused on free
+functions, lambdas and extern prototypes.
+
+Interface methods have no body, so they must spell `const` to be callable on a const interface
+receiver (`const IFoo`, `const IFoo*`, `const alias IFoo`). A method implementing a const interface
+method must be read-only, marked or inferred.
 
 **Generics.**
 - `const` directly on a generic type argument is refused, at every site. That covers declarations,

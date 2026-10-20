@@ -5705,6 +5705,7 @@ extern int main()
     total++; passed += testConstReceiversRound5() ? 1 : 0;
     total++; passed += testConstStringLiterals() ? 1 : 0;
     total++; passed += testConstWholeWord() ? 1 : 0;
+    total++; passed += testConstTrailing() ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -8732,5 +8733,61 @@ bool testConstWholeWord()
     result &= Test("const_using_typeof", typeof(aliasView), typeof(spelledView));
     result &= Test("const_using_typeof_whole", typeof(aliasConstPtr), typeof(spelledConstPtr));
     result &= Test("const_using_typeof_text", typeof(aliasConstPtr), "const int*");
+    return result;
+}
+
+// Const phase 8: trailing `func() const`. A marked method runs on a const receiver with `this` as
+// `(const S)*`; unmarked methods keep inference; an interface method spelled const is callable on
+// a const interface receiver; the flag applies to every instantiation of a generic struct.
+struct C08TBox
+{
+    int n = 5;
+    int* p = nullptr;
+    int Get() const { return n; }
+    int Peek() const { return *p; }
+    int Inferred() { return n + 10; }
+    int Both() const { return Get() + Inferred(); }
+    (const int)* Addr() const { return &n; }
+    void Set(int v) { n = v; }
+    C08TBox operator+(C08TBox other) const { C08TBox r = { n = n + other.n }; return r; }
+};
+struct C08TCell<T> { T v = default; T Read() const { return v; } };
+interface IC08TRead { int read() const; void write(int v); };
+class C08TMarked : IC08TRead { int n = 70; int read() const { return n; } void write(int v) { n = v; } };
+class C08TInferred : IC08TRead { int n = 7; int read() { return n * 2; } void write(int v) { n = v; } };
+struct C08TIfaceHolder { IC08TRead r; int k = 0; };
+int c08TViaConst(const IC08TRead r) { return r.read(); }
+int c08TViaAlias(const alias IC08TRead r) { return r.read(); }
+int c08TViaHolder(const C08TIfaceHolder h) { return h.r.read(); }
+
+bool testConstTrailing()
+{
+    bool result = true;
+    int target = 3;
+    const C08TBox box = { n = 5, p = &target };
+    C08TBox m = default;
+    m.Set(8);
+    result &= Test("const_trailing_marked", box.Get(), 5);
+    result &= Test("const_trailing_marked_through_ptr", box.Peek(), 3);
+    result &= Test("const_trailing_unmarked_inferred", box.Inferred(), 15);
+    result &= Test("const_trailing_calls_inferred", box.Both(), 20);
+    result &= Test("const_trailing_mutable_receiver", m.Get(), 8);
+    result &= Test("const_trailing_const_result", *box.Addr(), 5);
+    result &= Test("const_trailing_const_result_is_field", box.Addr() == &box.n ? 1 : 0, 1);
+    (const C08TBox)* view = &m;
+    result &= Test("const_trailing_pointer_to_const", view->Get(), 8);
+    C08TBox sum = box + m;
+    result &= Test("const_trailing_operator", sum.n, 13);
+    const C08TCell<int> cell = { v = 4 };
+    const C08TCell<double> realCell = { v = 2.5 };
+    result &= Test("const_trailing_generic", cell.Read() + (int)(realCell.Read() * 2.0), 9);
+    C08TMarked marked = default;
+    C08TInferred inferred = default;
+    IC08TRead viaMarked = &marked;
+    IC08TRead viaInferred = &inferred;
+    result &= Test("const_trailing_iface_param", c08TViaConst(viaMarked) + c08TViaConst(viaInferred), 84);
+    result &= Test("const_trailing_iface_alias", c08TViaAlias(viaInferred), 14);
+    C08TIfaceHolder holder = { r = viaMarked };
+    result &= Test("const_trailing_iface_field", c08TViaHolder(holder), 70);
     return result;
 }

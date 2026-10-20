@@ -212,6 +212,7 @@ void MainListener::InstantiateGenericInterface(const std::string& baseName, cons
             if (RejectVariadicInterfaceMethod(mangledName, method)) continue;
             LLVMBackend::InterfaceMethod m;
             m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
+            m.IsConst = method->trailingConst() != nullptr;
             m.Name = getInterfaceMethodName(method);
             auto declParams = ParseParameterTypeList(method->parameterTypeList());
             for (const auto& p : declParams)
@@ -1260,6 +1261,7 @@ void MainListener::PreDeclareInstantiationMembers(
                 thisParam.TypeName = structName;
                 thisParam.VariableName = structName + "__";
                 thisParam.Pointer = true;
+                if (func->trailingConst() != nullptr) thisParam.ConstMask = 1;  // `this` is (const S)*
                 declParams.insert(declParams.begin(), thisParam);
             }
 

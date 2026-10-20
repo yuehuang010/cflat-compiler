@@ -1806,9 +1806,9 @@ namespace
 }
 
 /*
- * The declared type of the slot a pointer was loaded from: a live binding, a native global, a
- * native struct field (through any array steps), or an element of an array binding. Null when
- * the slot is anything else (pointer arithmetic, a temporary, a C/C++ object).
+ * The declared type of the slot a pointer was loaded from: a live binding, a native or C header
+ * global, a native struct field (through any array steps), or an element of an array binding.
+ * Null when the slot is anything else (pointer arithmetic, a temporary, a C++ object).
  */
 const LLVMBackend::TypeAndValue* LLVMBackend::DeclaredConstSlot(const llvm::Value* slot,
     std::string& name, int depth) const
@@ -1822,7 +1822,8 @@ const LLVMBackend::TypeAndValue* LLVMBackend::DeclaredConstSlot(const llvm::Valu
         if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(slot))
         {
             const std::string symbol = global->getName().str();
-            if (cGlobalSymbols_.count(symbol) != 0 || cxxConstGlobalSymbols_.count(symbol) != 0)
+            // A C header global spells its levels in ConstMask; a C++ const global is phase 5.
+            if (cGlobalSymbols_.count(symbol) == 0 && cxxConstGlobalSymbols_.count(symbol) != 0)
                 return nullptr;
             for (const auto& [varName, storage] : globalNamedVariable)
             {
@@ -2888,6 +2889,8 @@ bool LLVMBackend::IsNativeReceiverMethod(const FunctionSymbol& method) const
 bool LLVMBackend::IsReadOnlyMethod(const FunctionSymbol& method)
 {
     if (method.IsCxx) return method.CxxConst;
+    // Explicit `const`: its body was checked against a `(const S)*` this (#9), so it is read-only.
+    if (method.IsExplicitConstMethod()) return true;
     if (auto memo = readOnlyMethodMemo_.find(method.UniqueName); memo != readOnlyMethodMemo_.end())
         return memo->second;
     // No body facts (a cached core method): the cache's answer. A native method nothing ever
@@ -3125,22 +3128,43 @@ bool LLVMBackend::IsReadOnlyMethod(const FunctionSymbol& method)
         return viable;
     };
 
-    struct Node { bool Mutating = false; std::vector<std::string> Deps; };
+    // Cause: what the first mutation found writes, for the #10 wording ("n", "&n", "Set()").
+    struct Node { bool Mutating = false; std::string Cause; std::vector<std::string> Deps, DepNames; };
     std::unordered_map<std::string, Node> nodes;
     std::vector<std::string> pending{ method.UniqueName };
+    auto render = [](const ReceiverScanFacts& facts, const ReceiverPath& path) {
+        std::string text = path.Result >= 0 && static_cast<size_t>(path.Result) < facts.Results.size()
+            ? facts.Results[path.Result].Member + "()" : path.IsThis ? std::string("this") : path.Root;
+        int derefs = 0;
+        for (const auto& step : path.Steps)
+        {
+            if (step == "*") ++derefs;
+            else if (step != "=") text += step;
+        }
+        return std::string(derefs, '*') + text;
+    };
+    auto calleeText = [](const FunctionSymbol& callee) {
+        return (callee.SourceName.empty() ? callee.UniqueName : callee.SourceName) + "()";
+    };
     auto depend = [&](Node& node, const FunctionSymbol& callee) {
-        if (callee.IsCxx) { if (!callee.CxxConst) node.Mutating = true; return; }
+        if (callee.IsCxx)
+        {
+            if (!callee.CxxConst) { node.Mutating = true; node.Cause = calleeText(callee); }
+            return;
+        }
+        if (callee.IsExplicitConstMethod()) return;
         if (auto memo = readOnlyMethodMemo_.find(callee.UniqueName); memo != readOnlyMethodMemo_.end())
         {
-            if (!memo->second) node.Mutating = true;
+            if (!memo->second) { node.Mutating = true; node.Cause = calleeText(callee); }
             return;
         }
         if (receiverScanFacts_.count(callee.UniqueName) == 0)
         {
-            if (callee.ConstMethodState != 1) node.Mutating = true;
+            if (callee.ConstMethodState != 1) { node.Mutating = true; node.Cause = calleeText(callee); }
             return;
         }
         node.Deps.push_back(callee.UniqueName);
+        node.DepNames.push_back(calleeText(callee));
         if (nodes.count(callee.UniqueName) == 0) pending.push_back(callee.UniqueName);
     };
     while (!pending.empty())
@@ -3155,6 +3179,7 @@ bool LLVMBackend::IsReadOnlyMethod(const FunctionSymbol& method)
             if (auto w = walk(name, facts, write.Target, 0); w.has_value() && w->Derefs <= 1)
             {
                 node.Mutating = true;
+                node.Cause = render(facts, write.Target);
                 break;
             }
         if (node.Mutating) continue;
@@ -3219,7 +3244,11 @@ bool LLVMBackend::IsReadOnlyMethod(const FunctionSymbol& method)
                     && !keepsConst(candidates, method, escape.ArgIndex, escape.Arity, pointerRelevant, aliasRelevant))
                     node.Mutating = true;
             }
-            if (node.Mutating) break;
+            if (node.Mutating)
+            {
+                node.Cause = (escape.AddressOf ? "&" : "") + render(facts, escape.Source);
+                break;
+            }
         }
         if (node.Mutating) continue;
         for (const auto& call : facts.Calls)
@@ -3234,12 +3263,21 @@ bool LLVMBackend::IsReadOnlyMethod(const FunctionSymbol& method)
             else
             {
                 auto w = walk(name, facts, call.Receiver, 0);
-                if (w.has_value() && w->Undecided) { node.Mutating = true; break; }
+                if (w.has_value() && w->Undecided)
+                {
+                    node.Mutating = true;
+                    node.Cause = call.Member + "()";
+                    break;
+                }
                 int derefs = 0;
                 if (!w.has_value() || !w->Known || !callObject(*w, typeName, derefs)) continue;
                 if (IsCxxRecord(typeName))
                 {
-                    if (CxxMemberIsOnlyNonConst(typeName, call.Member, call.Arity + 1)) node.Mutating = true;
+                    if (CxxMemberIsOnlyNonConst(typeName, call.Member, call.Arity + 1))
+                    {
+                        node.Mutating = true;
+                        node.Cause = call.Member + "()";
+                    }
                     if (node.Mutating) break;
                     continue;
                 }
@@ -3264,16 +3302,21 @@ bool LLVMBackend::IsReadOnlyMethod(const FunctionSymbol& method)
         for (auto& [name, node] : nodes)
         {
             if (node.Mutating) continue;
-            for (const auto& dep : node.Deps)
-                if (auto it = nodes.find(dep); it != nodes.end() && it->second.Mutating)
+            for (size_t d = 0; d < node.Deps.size(); ++d)
+                if (auto it = nodes.find(node.Deps[d]); it != nodes.end() && it->second.Mutating)
                 {
                     node.Mutating = true;
+                    node.Cause = node.DepNames[d];
                     changed = true;
                     break;
                 }
         }
     }
-    for (const auto& [name, node] : nodes) readOnlyMethodMemo_[name] = !node.Mutating;
+    for (const auto& [name, node] : nodes)
+    {
+        readOnlyMethodMemo_[name] = !node.Mutating;
+        if (node.Mutating) readOnlyCauseMemo_[name] = node.Cause;
+    }
     return readOnlyMethodMemo_[method.UniqueName];
 }
 
@@ -3285,8 +3328,8 @@ void LLVMBackend::ResolveConstMethodStates()
                 sym.ConstMethodState = IsReadOnlyMethod(sym) ? 1 : 2;
 }
 
-void LLVMBackend::RefuseConstReceiverMethodCall(const FunctionSymbol& method, const NamedVariable& self,
-                                                const std::string& functionName)
+bool LLVMBackend::ConstReceiverReason(const NamedVariable& self, std::string& object,
+                                      std::string& reason) const
 {
     using Kind = ConstWriteCause::CauseKind;
     ConstWriteCause cause;
@@ -3307,11 +3350,14 @@ void LLVMBackend::RefuseConstReceiverMethodCall(const FunctionSymbol& method, co
     else
         address = self.TypeAndValue.Pointer || self.Storage == nullptr ? self.Primary : self.Storage;
     if (address != nullptr) cause = FindConstWriteCause(address);
-    if (cause.Kind == Kind::None) return;
-    std::string object = !self.FieldPathText.empty() ? self.FieldPathText
-        : !self.CallerName.empty() ? self.CallerName : self.TypeAndValue.VariableName;
+    if (cause.Kind == Kind::None) return false;
+    // The implicit `this` of a const member function: its slot is named `S__`.
+    if (cause.Kind == Kind::ThroughPointer && cause.Name.ends_with("__")) cause.Name = "this";
+    // First spelled name; the implicit `this` slot (`S__`) names nothing the user wrote.
+    object.clear();
+    for (const std::string* name : { &self.FieldPathText, &self.CallerName, &self.TypeAndValue.VariableName })
+        if (!name->empty() && !name->ends_with("__")) { object = *name; break; }
     if (object.empty()) object = cause.Kind == Kind::Object ? cause.Root.Name : cause.Name;
-    std::string reason;
     if (cause.Kind == Kind::Field)
         reason = std::format("field '{}' is const", cause.Name);
     else if (cause.Kind == Kind::ThroughPointer)
@@ -3320,6 +3366,14 @@ void LLVMBackend::RefuseConstReceiverMethodCall(const FunctionSymbol& method, co
         reason = "it is declared const";
     else
         reason = std::format("'{}' is const", cause.Root.Name);
+    return true;
+}
+
+void LLVMBackend::RefuseConstReceiverMethodCall(const FunctionSymbol& method, const NamedVariable& self,
+                                                const std::string& functionName)
+{
+    std::string object, reason;
+    if (!ConstReceiverReason(self, object, reason)) return;
     const std::string member = method.SourceName.empty() ? functionName : method.SourceName;
     PendingConstReceiverCall entry;
     entry.Callee = method;
@@ -3334,6 +3388,44 @@ void LLVMBackend::RefuseConstReceiverMethodCall(const FunctionSymbol& method, co
     // Owned by the scoped / bare expect_error armed here; the file-scope one is module level.
     if (!expectedError.empty() && expectedError != fileScopeExpectedError_) entry.Owner = activeExpectScope_;
     pendingConstReceiverCalls_.push_back(std::move(entry));
+}
+
+void LLVMBackend::RecordConstInterfaceImplementer(const FunctionSymbol& impl, const std::string& structName,
+                                                  const std::string& ifaceName, const std::string& member)
+{
+    if (impl.IsCxx || impl.IsExplicitConstMethod()) return;
+    PendingConstReceiverCall entry;
+    entry.Callee = impl;
+    entry.Message = std::format("'{}.{}' implements const interface method '{}.{}' but writes '",
+        SpellType(*this, TypeAndValue{ .TypeName = structName }), member,
+        SpellType(*this, TypeAndValue{ .TypeName = ifaceName }), member);
+    entry.AppendsCause = true;
+    entry.File = sourceFileName;
+    entry.Line = currentLine;
+    entry.Column = currentColumn;
+    if (!expectedError.empty() && expectedError != fileScopeExpectedError_) entry.Owner = activeExpectScope_;
+    pendingConstReceiverCalls_.push_back(std::move(entry));
+}
+
+void LLVMBackend::RefuseConstInterfaceReceiverCall(const NamedVariable& receiver, const std::string& ifaceName,
+                                                   const std::string& member)
+{
+    std::string object, reason;
+    if (!ConstReceiverReason(receiver, object, reason)) return;
+    LogError(std::format(
+        "cannot call non-const member '{}' on '{}': {}, so it is read-only and only a const "
+        "member function may be called on it. {}", member, object, reason,
+        std::format("'{}.{}' is not declared const in the interface.",
+                    SpellType(*this, TypeAndValue{ .TypeName = ifaceName }), member)));
+}
+
+// The #8 / #10 text of a pending entry; #10 names what the implementer's body writes.
+static std::string PendingConstMessage(const LLVMBackend::PendingConstReceiverCall& entry,
+    const std::unordered_map<std::string, std::string>& causes)
+{
+    if (!entry.AppendsCause) return entry.Message;
+    auto it = causes.find(entry.Callee.UniqueName);
+    return entry.Message + (it == causes.end() ? std::string("the object") : it->second) + "'";
 }
 
 bool LLVMBackend::DeferExpectationVerdict()
@@ -3374,7 +3466,7 @@ void LLVMBackend::ResolvePendingConstReceiverCalls(bool aborted)
             try
             {
                 ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
-                LogError(entry.Message);
+                LogError(PendingConstMessage(entry, readOnlyCauseMemo_));
             }
             catch (const ExpectedErrorReceived&) {}
             RestoreFileScopeExpectedError();
@@ -3400,6 +3492,6 @@ void LLVMBackend::ResolvePendingConstReceiverCalls(bool aborted)
     {
         if (deferredScopes.count(entry.Owner) != 0 || IsReadOnlyMethod(entry.Callee)) continue;
         ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
-        LogError(entry.Message);
+        LogError(PendingConstMessage(entry, readOnlyCauseMemo_));
     }
 }

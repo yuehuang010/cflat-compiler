@@ -14,3 +14,20 @@ extern int t183KCMutable;
 extern int t183KCSecond;
 int t183KCTakeMutable(int* p);
 int t183KCTakeConst(const int* p);
+
+/* c10: C header globals, results and fields carry the const of their native CFlat spelling. */
+typedef const char* T10_PCSTR;
+struct T10RS { const int a; int b; };
+struct T10FS { const int arr[2]; const char* const nm; T10_PCSTR pc; struct { const int x; int y; } in; };
+union T10UC { const int k; int m; };
+extern const char t10KStr[6];
+extern const int* t10KPArr[2];
+extern struct T10RS t10RS;
+extern struct T10FS t10FS;
+extern T10_PCSTR t10Pc;
+const char* t10Name(void);
+T10_PCSTR t10Name2(void);
+const int* t10Ip(void);
+const char** t10Pp(void);
+int t10TakeMut(char* s);
+int t10TakeConst(const char* s);

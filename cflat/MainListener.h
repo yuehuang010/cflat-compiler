@@ -9568,6 +9568,8 @@ public:
     // (its body must be side-effect free or the version validation means nothing).
     // No-ops when the guard is not held: the read-side check has already reported that.
     void CheckGuardedWrite(antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& target);
+    // The write target is a C-declared global, or a pointer loaded from one (wording only).
+    bool IsReachedFromCGlobal(llvm::Value* destination);
     // Refuses a store whose target is reached through a C++ const reference result or, for
     // `++` / `--`, is a const C++ namespace object. constElement: the target is an element of a
     // C++ const array reference (any write operator), refused on its own.

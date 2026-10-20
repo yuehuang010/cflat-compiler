@@ -3087,6 +3087,7 @@ void MainListener::ParseInterfaceDefinition(CFlatParser::InterfaceDefinitionCont
             if (RejectVariadicInterfaceMethod(name, method)) continue;
             LLVMBackend::InterfaceMethod m;
             m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
+            m.IsConst = method->trailingConst() != nullptr;
             bool fixedReturn = false;
             for (auto* spec : method->declarationSpecifiers()->declarationSpecifier())
                 if (auto* dims = ArrayDimsOf(spec); dims != nullptr && !dims->assignmentExpression().empty())
@@ -4041,6 +4042,13 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             LogErrorContext(func, "application is only valid on file-scope variable declarations");
             return;
         }
+        // #15: a free / static / generic free function has no `this` to make const.
+        if (func->trailingConst() != nullptr && structName.empty())
+        {
+            LogErrorContext(func->trailingConst(),
+                "'const' after a parameter list is only allowed on a member function");
+            return;
+        }
         // Create Function Definition
         auto name = nameOverride.empty() ? ::getFunctionName(func, compiler) : nameOverride;
         if (!namespaceName.empty())
@@ -4149,6 +4157,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             typeValue.TypeName = structName;
             typeValue.VariableName = structName + "__";
             typeValue.Pointer = true;
+            if (func->trailingConst() != nullptr) typeValue.ConstMask = 1;  // `this` is (const S)*
             params.insert(params.begin(), typeValue);
         }
 
@@ -7414,6 +7423,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
             // matches grammar alternative `directDeclarator '(' identifierList? ')'`
             bool hasParens = declarator->children.size() > 1;
 
+            if (declarator->trailingConst() != nullptr && !inStructFieldDecl_)
+                LogErrorContext(declarator->trailingConst(),
+                    "'const' after a parameter list is only allowed on a member function");
             if (paramTypeList != nullptr || hasParens)
             {
                 // If there is parameter list (or empty parens), then it is a function.

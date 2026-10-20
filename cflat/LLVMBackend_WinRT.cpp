@@ -2962,7 +2962,7 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
 
 llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::string& ifaceName,
         const std::string& methodName, const std::vector<NamedVariable>& extraArgNVs,
-        const NullIfaceDispatchSite* site)
+        const NullIfaceDispatchSite* site, const NamedVariable* userReceiver)
 {
         auto fatTy = GetFatPtrType();
         auto ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
@@ -2993,6 +2993,8 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         if (methodIdx < 0)
             return nullptr;
         const InterfaceMethod* methodInfo = &(*ifaceMethods)[methodIdx];
+        if (userReceiver != nullptr && !methodInfo->IsConst)
+            RefuseConstInterfaceReceiverCall(*userReceiver, ifaceName, methodName);
 
         for (size_t i = 0; i < methodInfo->Parameters.size() && i < callArgNVs.size(); i++)
         {
@@ -3502,6 +3504,7 @@ void LLVMBackend::VerifyInterfaceImplementation(const std::string& structName, c
             // 'set'). The class conforms if ANY of them satisfies the contract, so remember the first
             // signature-matching candidate to blame only if none conform.
             const FunctionSymbol* firstCandidate = nullptr;
+            const FunctionSymbol* conforming = nullptr;
             bool anyConforms = false;
             auto funcIt = functionTable.find(method.Name);
             if (funcIt != functionTable.end())
@@ -3535,6 +3538,7 @@ void LLVMBackend::VerifyInterfaceImplementation(const std::string& structName, c
                         if (InterfaceMethodContractConforms(method, sym))
                         {
                             anyConforms = true;
+                            conforming = &sym;
                             break;
                         }
                     }
@@ -3553,6 +3557,10 @@ void LLVMBackend::VerifyInterfaceImplementation(const std::string& structName, c
                 // first signature-matching candidate so the diagnostic names a real overload.
                 VerifyInterfaceMethodContract(structName, interfaceName, method, *firstCandidate);
             }
+            // #10: the implementer of a const interface method must be read-only.
+            if (found && method.IsConst)
+                RecordConstInterfaceImplementer(conforming ? *conforming : *firstCandidate,
+                                                structName, interfaceName, method.Name);
         }
 
         auto sdIt = dataStructures.find(structName);

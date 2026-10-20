@@ -20,7 +20,7 @@ bash test_example.sh               # 0 failed
 ./test_libs.sh -t 3 -j 1 torch     # torch 11/0 - required for any change under cflat/*CInterop*, *Overloads*, C++ call/ctor/operator paths
 ```
 
-**Maintainer 2026-10-06: both the Mac and the Windows box are in interactive use (Windows = gaming) - no perf / wall-clock measurements on either; gates report pass/fail counts only; libs_perf.sh skipped.** **Maintainer 2026-10-06: tier 3 (torch) is SKIPPED until further notice** - stdlib is the focus; the gate is tiers 1-2
+**Maintainer 2026-10-06: both the Mac and the Windows box are in interactive use - no perf / wall-clock measurements on either; gates report pass/fail counts only; libs_perf.sh skipped.** **Maintainer 2026-10-06: tier 3 (torch) is SKIPPED until further notice** - stdlib is the focus; the gate is tiers 1-2
 (plus test.sh / examples). libs_perf.sh torch legs are skipped with it.
 
 Resource rule: agents never run the torch tier and run tiers 1-2 at `-j 2` at most (torch compiles
@@ -351,12 +351,12 @@ function values.
 
 Windows gate: scratch/win_gate.ps1, ship `git bundle create x <branch> ^26b8647e`; baseline
 test.bat all pass, test_example 94/4/42 (4 = SSH-env GUI failures). Treat Windows timings as
-pass/fail only (the maintainer games on that machine; cold header cache after a version flip).
+pass/fail only (the machine is in interactive use; cold header cache after a version flip).
 
 ## Timebox 2026-10-01 - rulings burn-down (22:33 2026-09-30 to 10:33 - extended 4 h at 03:15, land-only from 09:00)
 
 Rulings from 2026-09-30 evening (memory rulings-2026-09-30-p2-batch). Max 3 implementers, Codex
-Luna; escalation Codex r1-3 -> Opus -> Fable. Windows box shared with the maintainer: timings
+Luna; escalation Codex r1-3 -> Opus -> Fable. Windows box in interactive use: timings
 pass/fail only.
 
 | Run | Issue | Worktree / branch | State |
@@ -368,7 +368,7 @@ Landed: V20 52a77168 (field initializer in a no-arg user ctor built in place, si
 
 Runs group the S rows by mechanism. Each run removes the DISABLED markers of its cases in the fix commit (`./test_libs.sh std --include-disabled` -> XPASS). Max 3 implementers, Codex Luna; escalation Codex r1-3 -> Opus -> Fable. Windows box off: no Windows gate this timebox (20:45: box back; master validated - test.bat green, std tier 7 Windows-only failures -> N55). 21:05 maintainer: the max-3 implementer cap is the Mac's; up to 3 more runs build/test on the Windows box (edit on Mac, winsync, Mac gate at landing). 20:08 maintainer: Claude slots 3 (= codex). 20:05 maintainer: timebox reset to 4 hours from now - ends 00:05, land-only from ~23:05.
 
-15:55 maintainer experiment: implementers = Opus (Agent tool), reviewers = Codex Sol 6.1 (gpt-6.1-sol, high); up to 3 codex + 2 claude agents, max 3 active implementers; the Luna runs already started finish as Luna. Machine shared with the maintainer's other work: compile-time numbers are unstable - libs_perf.sh is run but only a gross regression (> 25%, re-measured once) blocks a merge; note the numbers per landing.
+15:55 maintainer experiment: implementers = Opus (Agent tool), reviewers = Codex Sol 6.1 (gpt-6.1-sol, high); up to 3 codex + 2 claude agents, max 3 active implementers; the Luna runs already started finish as Luna. Machine in interactive use: compile-time numbers are unstable - libs_perf.sh is run but only a gross regression (> 25%, re-measured once) blocks a merge; note the numbers per landing.
 
 | Run | Rows | Mechanism | Wave |
 |---|---|---|---|

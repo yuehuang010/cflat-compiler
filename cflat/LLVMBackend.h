@@ -2235,6 +2235,13 @@ public:
         bool CxxConst = false;     // const-qualified C++ instance member
         // Native method read-only-ness from the cache: 0 unknown, 1 read-only, 2 mutating.
         uint8_t ConstMethodState = 0;
+        // `int get() const`: the implicit `this` parameter is `(const S)*` (ConstMask bit 0).
+        bool IsExplicitConstMethod() const
+        {
+            if (IsCxx || Parameters.empty()) return false;
+            const TypeAndValue& self = Parameters.front();
+            return self.Pointer && (self.ConstMask & 1u) != 0 && self.VariableName == self.TypeName + "__";
+        }
         bool IsNoexcept = true;    // potentially throwing C++ calls are gated until EH support
         bool IsCInteropAlias = false;
         bool IsCInteropDeclaration = false;
@@ -2258,6 +2265,7 @@ public:
         std::string Name;
         TypeAndValue ReturnType;
         std::vector<TypeAndValue> Parameters; // excludes the implicit 'this' pointer
+        bool IsConst = false;                 // `int get() const;`: callable on a const receiver
     };
 
     struct WideIntegerConstant
@@ -8792,9 +8800,10 @@ public:
         const std::vector<InterfaceMethod>& methods, const std::vector<NamedVariable>& args,
         std::vector<NamedVariable>& matchedArgs);
 
+    // receiver: the user's receiver expression, judged for #8 (a const one needs a const method).
     llvm::Value* CallInterfaceMethod(llvm::Value* ifacePtr, const std::string& ifaceName,
         const std::string& methodName, const std::vector<NamedVariable>& extraArgNVs,
-        const NullIfaceDispatchSite* site = nullptr);
+        const NullIfaceDispatchSite* site = nullptr, const NamedVariable* receiver = nullptr);
 
     // Helper for building string NamedVariables for reflection visitor calls.
     // Wraps a string literal pointer into a string struct value.
@@ -11986,10 +11995,20 @@ public:
     // #8: refuse a call of a method that is not read-only on a const receiver.
     void RefuseConstReceiverMethodCall(const FunctionSymbol& method, const NamedVariable& self,
                                        const std::string& functionName);
+    // Why `self` is a const receiver (#8 object and reason); false when it is not one.
+    bool ConstReceiverReason(const NamedVariable& self, std::string& object, std::string& reason) const;
+    // #10: `impl` implements const interface method `ifaceName.member`; judged at module end.
+    void RecordConstInterfaceImplementer(const FunctionSymbol& impl, const std::string& structName,
+                                         const std::string& ifaceName, const std::string& member);
+    // #8 on an interface receiver: only a method the interface spells `const` may be called.
+    void RefuseConstInterfaceReceiverCall(const NamedVariable& receiver, const std::string& ifaceName,
+                                          const std::string& member);
     // Settle every recorded method into FunctionSymbol::ConstMethodState before the cache is written.
     void ResolveConstMethodStates();
     std::unordered_map<std::string, ReceiverScanFacts> receiverScanFacts_;
     std::unordered_map<std::string, bool> readOnlyMethodMemo_;
+    // What a mutating method's body writes, first cause found ("n", "&n", "Set()"); #10 wording.
+    std::unordered_map<std::string, std::string> readOnlyCauseMemo_;
     /*
      * Codegen's own overload choice per call site of a native method body: method unique name ->
      * site ('(' token) -> (functionTable key, callee unique name). A body is "emitted" once its
@@ -12031,6 +12050,8 @@ public:
         size_t Line = 0;
         size_t Column = 0;
         size_t Owner = 0;
+        // #10: Message ends in "but writes '"; the inferred cause and the closing quote follow.
+        bool AppendsCause = false;
     };
     struct DeferredExpectation
     {
@@ -12791,7 +12812,8 @@ public:
     // 262: C++ records carry every class-scope name ("sn") for range-for member lookup (T328).
     // 263: C header cached signatures retain C no-prototype function-pointer state (T332 r2).
     // 264: C++ fields retain explicit constness for mutable-ancestry write checks (T335 r2).
-    static constexpr int kCHeaderCacheVersion = 265;
+    // 266: C globals, field top-level const and C results carry ConstMask (const item 10).
+    static constexpr int kCHeaderCacheVersion = 266;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

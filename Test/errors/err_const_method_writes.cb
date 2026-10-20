@@ -1,0 +1,127 @@
+// Const phase 8: trailing `func() const` (plan cflat-const.md section 4 #7 #9 #10 #15). Inside a
+// const member function `this` is `(const S)*`, so a write is #9 and a pointer into the object
+// returned as mutable is #7. A const interface method needs a read-only implementer (#10, judged
+// at module end from the inferred body). Only a member function may spell the trailing const (#15).
+
+struct C08W
+{
+    int n = 0;
+    int* p = nullptr;
+    int arr[2];
+    void Mutate() { n = 1; }
+};
+
+expect_error("method 'Set' is declared const but writes 'n'")
+{
+    struct C08W1 { int n = 0; void Set(int v) const { n = v; } };
+}
+expect_error("method 'Set' is declared const but writes 'this->n'")
+{
+    struct C08W2 { int n = 0; void Set(int v) const { this->n = v; } };
+}
+expect_error("method 'Bump' is declared const but writes 'n'")
+{
+    struct C08W3 { int n = 0; void Bump() const { n++; } };
+}
+expect_error("method 'Add' is declared const but writes 'n'")
+{
+    struct C08W4 { int n = 0; void Add(int v) const { n += v; } };
+}
+expect_error("method 'Poke' is declared const but writes '*p'")
+{
+    struct C08W5 { int* p = nullptr; void Poke() const { *p = 2; } };
+}
+expect_error("method 'Fill' is declared const but writes 'arr[1]'")
+{
+    struct C08W6 { int arr[2]; void Fill() const { arr[1] = 3; } };
+}
+expect_error("method 'Deep' is declared const but writes 'w.n'")
+{
+    struct C08W7 { C08W w; void Deep() const { w.n = 4; } };
+}
+expect_error("method 'Set' is declared const but writes 'v'")
+{
+    struct C08W8<T> { T v = default; void Set(T x) const { v = x; } };
+    int c08W8Use() { C08W8<int> g = default; g.Set(1); return 0; }
+}
+expect_error("cannot return '(const int)*' as 'int*': the conversion discards const")
+{
+    struct C08R1 { int n = 0; int* Addr() const { return &n; } };
+}
+// Per instantiation: with T = int*, the field's pointee is const through a const `this`.
+expect_error("cannot return '(const int)*' as 'int*': the conversion discards const")
+{
+    struct C08R4<T> { T v = default; T Read() const { return v; } };
+    int c08R4Use() { int k = 1; C08R4<int*> c = { v = &k }; return *c.Read(); }
+}
+expect_error("cannot convert '(const int)*' to 'int*': the conversion discards const")
+{
+    struct C08R2 { int n = 0; int Grab() const { int* q = &n; return *q; } };
+}
+expect_error("cannot call non-const member 'Mutate' on 'this': it is reached through a pointer to const ('this')")
+{
+    struct C08R3 { C08W w; void Bad() const { w.Mutate(); } };
+}
+
+// #15: no `this` to make const.
+expect_error("'const' after a parameter list is only allowed on a member function")
+{
+    int c08Free() const { return 1; }
+}
+expect_error("'const' after a parameter list is only allowed on a member function")
+{
+    int c08Generic<T>(T x) const { return 1; }
+}
+expect_error("'const' after a parameter list is only allowed on a member function")
+{
+    struct C08Static { static int Make() const { return 1; } };
+}
+expect_error("'const' after a parameter list is only allowed on a member function")
+{
+    extern int c08Ext(int x) const;
+}
+int c08Lambda()
+{
+    expect_error("'const' after a parameter list is only allowed on a member function")
+    {
+        auto f = (int x) const => x + 1;
+    }
+    return 0;
+}
+
+// #10: deferred to module end, so each leg owns its own scope and the verdict waits.
+interface IC08 { int get() const; void set(int v); };
+expect_error("'C08Writer.get' implements const interface method 'IC08.get' but writes 'n'")
+{
+    class C08Writer : IC08 { int n = 0; int get() { n++; return n; } void set(int v) { n = v; } };
+}
+expect_error("'C08Caller.get' implements const interface method 'IC08.get' but writes 'bump()'")
+{
+    class C08Caller : IC08 { int n = 0; void bump() { n++; } int get() { bump(); return n; } void set(int v) { n = v; } };
+}
+
+// A constructor initializes its object, so it can never be const.
+expect_error("a constructor cannot be declared const")
+{
+    struct C08Ctor { int n = default; C08Ctor(int v) const { n = v; } };
+}
+expect_error("a constructor cannot be declared const")
+{
+    struct C08GenCtor<T> { T v = default; C08GenCtor(T x) const { v = x; } };
+    int c08GenCtorUse() { C08GenCtor<int> g = C08GenCtor<int>(1); return g.v; }
+}
+
+// #9 is the const method's own this, never a name pattern: a `p__` pointer keeps #3.
+int c08NameGate()
+{
+    int n = 0;
+    (const int)* p__ = &n;
+    expect_error("cannot assign to '*p__': it is reached through a pointer to const ('p__')");
+    *p__ = 1;
+    return 0;
+}
+
+extern int main()
+{
+    return c08Lambda() + c08NameGate();
+}

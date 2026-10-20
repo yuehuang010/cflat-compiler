@@ -2,7 +2,7 @@
 
 Pre-existing on master. Measured 2026-10-16 with
 `bash scratch/rev_t306_opus_probe.sh`; the `M` column used
-`/Users/felixhuang/source/cflat-compiler/x64/Release/cflat` without rebuilding it.
+`./x64/Release/cflat` without rebuilding it.
 
 ## Repros and measurements
 

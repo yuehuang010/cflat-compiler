@@ -100,3 +100,25 @@ expect_error("cannot call non-const member 'Write' on 'x': it is declared const"
 {
     int c04BadMixedWrite(const C04Mixed x) { x.Write(); return 0; }
 }
+
+// Phase 8: an interface method is callable on a const interface receiver only when the interface
+// spells it `const` (ends the iteration-1 allowance); the vtable call is refused at once.
+interface IC08Call { int get() const; void set(int v); };
+struct C08IfaceHolder { IC08Call i; int k = 0; };
+expect_error("cannot call non-const member 'set' on 'f': it is declared const, so it is read-only and only a const member function may be called on it. 'IC08Call.set' is not declared const in the interface.")
+{
+    int c08BadIfaceParam(const IC08Call f) { f.set(2); return f.get(); }
+}
+expect_error("cannot call non-const member 'set' on 'f': it is declared const")
+{
+    int c08BadIfaceAlias(const alias IC08Call f) { f.set(2); return f.get(); }
+}
+expect_error("cannot call non-const member 'set' on 'h.i': 'h' is const")
+{
+    int c08BadIfaceField(const C08IfaceHolder h) { h.i.set(2); return h.i.get(); }
+}
+// A const member function's `this` is const: an implicit call of a mutating member is #8.
+expect_error("cannot call non-const member 'Set' on 'this': it is reached through a pointer to const ('this')")
+{
+    struct C08Self { int n = 0; void Set(int v) { n = v; } int Get() const { return n; } void Bad() const { Set(Get()); } };
+}

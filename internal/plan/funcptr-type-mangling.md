@@ -4,7 +4,7 @@ Status: **Stage -1, Stage 0 layer 0, layer 1 and Stage 2's pointer-depth half ar
 (qualified struct keys) is the open remainder; the layer-2 rename is deliberately NOT being done -
 see "Layer 2 has no defect behind it any more". Written 2026-08-02 to unblock the parked branch
 `fix/funcptr-sig`
-(`b2f564b`, worktree `/Users/felixhuang/source/cflat-fix-funcptr-sig`) recorded in
+(`b2f564b`, worktree `../cflat-fix-funcptr-sig`) recorded in
 `internal/issue/p1/funcptr-overload-binding-ignores-signature.md`.
 
 The branch proved a function-pointer signature by comparing per-component DESCRIPTORS. It

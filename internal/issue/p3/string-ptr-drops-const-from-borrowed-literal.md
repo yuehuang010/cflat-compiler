@@ -15,3 +15,8 @@ Measured in const phase 6 (2026-10-18, part B attempt, reverted): with `_ptr` `(
 stop the compile, so the real count is higher. Needs a design call first: `string_view` semantics and an owned-only mutable
 accessor (owned vs borrowed flag). Site list: scratch/repro_keep/const_c06/partB_conversion_sites.txt (gitignored).
 Literals are now `(const char)*`, so string.cb keeps three explicit casts (commented) until this lands.
+
+RULED 2026-10-19 (maintainer): `string.data()` returns `(const char)*`. Mutable access goes through a new
+`data_mut()` that first copies a borrowed string into an owned buffer (copy-on-write, Rust Cow::to_mut), then returns
+`char*`. `_ptr` becomes `(const char)*`; the three commented casts in string.cb go away. Callers that write through
+`data()` migrate to `data_mut()`; callers that only read keep `data()` and pass it to `const char*` params.

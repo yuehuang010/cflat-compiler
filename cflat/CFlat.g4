@@ -403,7 +403,7 @@ functionPointerParam
     ;
 
 lambdaExpression
-    : '(' lambdaParamList? ')' FatArrow lambdaBody
+    : '(' lambdaParamList? ')' trailingConst? FatArrow lambdaBody
     ;
 
 lambdaParamList
@@ -552,8 +552,14 @@ alignmentSpecifier
 
 declarator
     : directDeclarator
-    | directDeclarator '(' parameterTypeList ')' // function declaration
-    | directDeclarator '(' identifierList? ')'
+    | directDeclarator '(' parameterTypeList ')' trailingConst? // function declaration
+    | directDeclarator '(' identifierList? ')' trailingConst?
+    ;
+
+// `int get() const`: a const member function (its `this` is `const S*`). Only a member function
+// may carry it; the listener refuses it elsewhere.
+trailingConst
+    : Const
     ;
 
 directDeclarator
@@ -859,7 +865,7 @@ namespaceDefinition
     ;
 
 functionDefinition
-    : declarationSpecifiers? (directDeclarator | operatorFunctionId) genericTypeParameters? '(' parameterTypeList? ')' (':' baseSpecifier '(' argumentExpressionList? ')')? whereClause? lockClause? compoundStatement
+    : declarationSpecifiers? (directDeclarator | operatorFunctionId) genericTypeParameters? '(' parameterTypeList? ')' trailingConst? (':' baseSpecifier '(' argumentExpressionList? ')')? whereClause? lockClause? compoundStatement
     ;
 
 structDefinition
@@ -1089,7 +1095,7 @@ ifConstInterfaceBlock
     ;
 
 interfaceMethod
-    : declarationSpecifiers (directDeclarator | operatorFunctionId) '(' parameterTypeList? ')' ';'
+    : declarationSpecifiers (directDeclarator | operatorFunctionId) '(' parameterTypeList? ')' trailingConst? ';'
     ;
 
 interfaceField

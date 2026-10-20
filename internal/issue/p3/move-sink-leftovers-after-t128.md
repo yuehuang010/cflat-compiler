@@ -4,7 +4,7 @@ PRE-EXISTING on master (T128 reviews 1-2, 2026-10-11). The review probes went wi
 items 1-3 landed in T227 and were removed; each remaining item is its own repro (P = struct with a destructor, mv takes `move P*`).
 
 12. (T259 probe, pre-existing; OPEN after T262b - sink transfer from a local through `??` is unsolved, Luna patch and report at
-   /Users/felixhuang/source/cflat-compiler/scratch/repro_keep/t262/t262_luna.patch and t262_report.md) `??` with a unique LOCAL lhs double frees when stored into a unique field:
+   ./scratch/repro_keep/t262/t262_luna.patch and t262_report.md) `??` with a unique LOCAL lhs double frees when stored into a unique field:
    `unique P* u = new P(); t.p = u ?? nullptr;` (abort under MallocScribble). The field `??` form clears
    its lhs slot at the `??` site whatever the destination, so clearing a local there the same way would
    also null `P* r = u ?? nullptr;` (a borrow that is correct on master). Fix needs the destination at

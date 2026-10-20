@@ -4745,6 +4745,7 @@ void LLVMBackend::ResetForReanalysis()
     ownReleaseGates_.clear();
     receiverScanFacts_.clear();
     readOnlyMethodMemo_.clear();
+    readOnlyCauseMemo_.clear();
     receiverCallResolution_.clear();
     receiverBodiesEmitted_.clear();
     receiverBodyStack_.clear();
@@ -7469,6 +7470,7 @@ static llvm::json::Object SerializeIfaceMethod(const IM& m)
     llvm::json::Array ps;
     for (auto& p : m.Parameters) ps.push_back(SerializeTav(p));
     o["ps"] = std::move(ps);
+    if (m.IsConst) o["c"] = true;
     return o;
 }
 
@@ -7480,6 +7482,7 @@ static IM DeserializeIfaceMethod(const llvm::json::Object& o)
     if (auto* ps = o.getArray("ps"))
         for (auto& elem : *ps)
             if (auto* po = elem.getAsObject()) m.Parameters.push_back(DeserializeTav(*po));
+    if (auto c = o.getBoolean("c")) m.IsConst = *c;
     return m;
 }
 
@@ -7620,8 +7623,9 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     // Each version added tables an older cache lacks, so an older cache must be rejected rather
     // than silently reused (v6 includes the LSP core-variable replay state; v8 is the non-pointer
     // `alias T` parameter reference ABI; v11 adds closure capture-cleanup MOVE mode 2; v12 adds
-    // const floating global admission names; v13 stores function origin metadata).
-    root["version"]   = 15;
+    // const floating global admission names; v13 stores function origin metadata; v16 adds
+    // const interface methods).
+    root["version"]   = 16;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
 #if defined(__APPLE__)
@@ -8109,7 +8113,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 15) return false;
+    if (!ver || *ver != 16) return false;
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != coreHash) return false;
 #if defined(__APPLE__)

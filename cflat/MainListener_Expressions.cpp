@@ -29188,26 +29188,7 @@ void MainListener::RefuseCxxConstReferentWrite(antlr4::ParserRuleContext* ctx,
         if (destination != nullptr) {
             auto* constGlobal = llvm::dyn_cast<llvm::GlobalVariable>(
                 llvm::getUnderlyingObject(destination));
-            // Wording only: the object is a C-declared global, directly, or through a pointer loaded
-            // from one (`*gp`, a decayed `*arr`, a local whose stored value is such a global).
-            auto isCConstObject = [&]() {
-                llvm::Value* base = llvm::getUnderlyingObject(destination);
-                if (auto* load = llvm::dyn_cast<llvm::LoadInst>(base))
-                    base = llvm::getUnderlyingObject(load->getPointerOperand());
-                if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(base)) {
-                    for (llvm::User* user : slot->users()) {
-                        auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
-                        if (store == nullptr || store->getPointerOperand() != slot) continue;
-                        auto* g = llvm::dyn_cast<llvm::GlobalVariable>(
-                            llvm::getUnderlyingObject(store->getValueOperand()));
-                        if (g != nullptr && compiler->cGlobalSymbols_.count(g->getName().str()) != 0)
-                            return true;
-                    }
-                    return false;
-                }
-                auto* global = llvm::dyn_cast<llvm::GlobalVariable>(base);
-                return global != nullptr && compiler->cGlobalSymbols_.count(global->getName().str()) != 0;
-            };
+            auto isCConstObject = [&]() { return IsReachedFromCGlobal(destination); };
             llvm::Value* pointeeBase = destination;
             while (auto* gep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(pointeeBase))
                 pointeeBase = gep->getPointerOperand();
@@ -29285,6 +29266,29 @@ void MainListener::RefuseCxxConstReferentWrite(antlr4::ParserRuleContext* ctx,
                 "Copy it into a local and modify that instead.", operation, target));
 }
 
+// Wording only: the object is a C-declared global, directly, or through a pointer loaded from
+// one (`*gp`, a decayed `*arr`, a local whose stored value is such a global).
+bool MainListener::IsReachedFromCGlobal(llvm::Value* destination) {
+        if (destination == nullptr) return false;
+        auto* compiler = Compiler();
+        llvm::Value* base = llvm::getUnderlyingObject(destination);
+        if (auto* load = llvm::dyn_cast<llvm::LoadInst>(base))
+            base = llvm::getUnderlyingObject(load->getPointerOperand());
+        if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(base)) {
+            for (llvm::User* user : slot->users()) {
+                auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                if (store == nullptr || store->getPointerOperand() != slot) continue;
+                auto* g = llvm::dyn_cast<llvm::GlobalVariable>(
+                    llvm::getUnderlyingObject(store->getValueOperand()));
+                if (g != nullptr && compiler->cGlobalSymbols_.count(g->getName().str()) != 0)
+                    return true;
+            }
+            return false;
+        }
+        auto* global = llvm::dyn_cast<llvm::GlobalVariable>(base);
+        return global != nullptr && compiler->cGlobalSymbols_.count(global->getName().str()) != 0;
+}
+
 bool MainListener::RefuseConstObjectWrite(antlr4::ParserRuleContext* ctx,
                                           const LLVMBackend::NamedVariable& target,
                                           llvm::Value* destination,
@@ -29298,6 +29302,13 @@ bool MainListener::RefuseConstObjectWrite(antlr4::ParserRuleContext* ctx,
             && !Compiler(ctx)->IsConstructingStorage(destination);
         if (unionArm) cause.Name = target.TypeAndValue.VariableName;
         if (cause.Kind == Kind::None && !unionArm) return false;
+        // A const element reached from a C global keeps the C-object wording of
+        // RefuseCxxConstReferentWrite, which reports every such write.
+        if (cause.Kind == Kind::ThroughPointer && operation != "move"
+            && target.TypeAndValue.IsCxxPointeeConst
+            && (target.IsElementAccess || !target.TypeAndValue.Pointer)
+            && IsReachedFromCGlobal(destination))
+            return false;
         std::string path = ctx->getText();
         if (path.ends_with("++") || path.ends_with("--")) path.resize(path.size() - 2);
         const std::string verb = operation == "move" ? "move out of" : operation;
@@ -29306,6 +29317,18 @@ bool MainListener::RefuseConstObjectWrite(antlr4::ParserRuleContext* ctx,
             LogErrorContext(ctx, std::format(
                 "cannot {} '{}': field '{}' is const and can only be set during construction",
                 verb, path, cause.Name));
+            return true;
+        }
+        // #9: the pointer is the implicit `(const S)*` this of the explicit const method being
+        // compiled - judged by that method's own this parameter, never by a name pattern.
+        auto* insertBlock = Compiler(ctx)->builder->GetInsertBlock();
+        const auto* currentSym = cause.Kind == Kind::ThroughPointer && insertBlock != nullptr
+            ? Compiler(ctx)->GetFunctionSymbol(insertBlock->getParent()) : nullptr;
+        if (currentSym != nullptr && currentSym->IsExplicitConstMethod()
+            && cause.Name == currentSym->Parameters.front().VariableName)
+        {
+            LogErrorContext(ctx, std::format("method '{}' is declared const but writes '{}'",
+                                             Compiler(ctx)->GetCurrentFunctionName(), path));
             return true;
         }
         if (cause.Kind == Kind::ThroughPointer)
