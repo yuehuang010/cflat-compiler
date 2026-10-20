@@ -687,6 +687,14 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                                 compilerLLVM->ArgumentPointerValue(args[i]), constName);
                             if ((levels & 1u) != 0) argType = JoinConstTypeArgument(argType, 1);
                         }
+                        // A view of const elements deduces T = `(const int)[]` (ruling 2026-10-19).
+                        else if (paramStars == 0 && !paramView && argView && argStars == 0)
+                        {
+                            std::string constName;
+                            const uint8_t levels = compilerLLVM->StoredConstLevels(
+                                compilerLLVM->ArgumentPointerValue(args[i]), constName);
+                            if ((levels & 1u) != 0) argType = JoinConstTypeArgument(argType, 1);
+                        }
                     }
                 }
                 // A narrow string literal is a `(const char)*` (R2), as `auto s = "x"` deduces.

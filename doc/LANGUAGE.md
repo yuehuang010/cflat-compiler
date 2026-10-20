@@ -656,12 +656,14 @@ method must be read-only, marked or inferred.
   Containers own mutable slots, which is why C++ `vector<const T>` is also ill-formed. Put the
   const on the pointee instead.
 - Pointee const is legal and keys its own instantiation. `list<(const char)*>` and `list<char*>`
-  are distinct types, and `typeof` shows `list<(const char)*>`.
+  are distinct types, and `typeof` shows `list<(const char)*>`. A view of const elements does the
+  same: `Box<(const int)[]>` is not `Box<int[]>`, and a write through the element (`v[0] = 1`) is
+  refused inside the body. A view of pointers (`(const int)*[]`) still keys as its non-const form.
 - Inside a generic body, `const T` is whole-word const over T. With `T = int*`, `const T` is
   exactly `const int*`, so the C++ `int* const` gotcha does not exist.
 - Deduction strips only top-level const. `id(c)` with `const int c` gives `T = int`, while
   `id(cp)` with `(const int)* cp` gives `T = (const int)*` (and a string literal gives
-  `T = (const char)*`).
+  `T = (const char)*`); `id(cv)` with `(const int)[] cv` gives `T = (const int)[]`.
 - `const` on a type parameter itself (`struct Box<const T>`) is refused with the same message.
 
 ```c
@@ -687,9 +689,9 @@ until an assigning method is called. It sits with `is_unique(T)` and
 `is_copyable(T)` under Generics.
 
 **`is_const(T)`** is a compile-time intrinsic, the const counterpart to `is_pointer(T)`. For a
-pointer `T` it answers for the pointee: `(const int)*` gives 1, `int*` gives 0. An array-view
-argument binds without its element const today (`Check<(const int)[]>` is the same instantiation
-as `Check<int[]>`), so it gives 0. For any other `T` it answers for `T` itself, which a generic argument never carries
+pointer `T` it answers for the pointee: `(const int)*` gives 1, `int*` gives 0. For an
+array-view `T` it answers for the element: `(const int)[]` gives 1 (its own instantiation),
+`int[]` gives 0. For any other `T` it answers for `T` itself, which a generic argument never carries
 (`const` is refused there), so in a generic body only pointee const shows. Deduction strips
 top-level const first, so `f(c)` with `const int c` gives 0, while `f(cp)` with `(const int)* cp`
 gives 1. On a concrete type name outside a generic it gives the same answer
@@ -973,6 +975,9 @@ Pair<int, float> p = default;
 p.first  = 1;
 p.second = 3.14f;
 ```
+
+A type argument's pointee or element const is part of the instantiation: `Box<(const int)*>` and
+`Box<(const int)[]>` are distinct from `Box<int*>` and `Box<int[]>`, and the body enforces that const.
 
 ### Value Generic Parameters
 

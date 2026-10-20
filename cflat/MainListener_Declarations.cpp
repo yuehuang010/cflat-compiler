@@ -865,8 +865,14 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
                     "'{}' is neither", uniqueBase));
             resolved = std::string(kAliasQualifierPrefix) + resolved;
         }
-        // A view of const elements keeps the pre-const key (not spelled yet).
-        if (argConstDepth > 0 && !hasArrayView)
+        // A view of const elements is its own instantiation (`(const int)[]`, ruling 2026-10-19);
+        // a view of pointers keeps the pre-const key, like a deeper pointer argument below.
+        if (argConstDepth > 0 && hasArrayView)
+        {
+            if (resolved.ends_with("[]") && !resolved.ends_with("*[]"))
+                resolved = JoinConstTypeArgument(resolved, 1);
+        }
+        else if (argConstDepth > 0)
         {
             int totalStars = 0;
             while (totalStars < static_cast<int>(resolved.size())

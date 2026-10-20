@@ -1466,7 +1466,13 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
         }
         else if (isAlias)
             resolved = std::string(kAliasQualifierPrefix) + resolved;
-        if (argConstDepth > 0 && !uniqueArgView)
+        // Mirror of the main pass: a view of const non-pointer elements keys as `(const E)[]`.
+        if (argConstDepth > 0 && uniqueArgView)
+        {
+            if (resolved.ends_with("[]") && !resolved.ends_with("*[]"))
+                resolved = JoinConstTypeArgument(resolved, 1);
+        }
+        else if (argConstDepth > 0)
         {
             int totalStars = 0;
             while (totalStars < static_cast<int>(resolved.size())

@@ -62,3 +62,39 @@ int c07AliasWrite()
     *h.v = 9;
     return n;
 }
+
+// `(const E)[]` is its own instantiation (ruling 2026-10-19): element const is enforced in the
+// body for explicit and deduced arguments, and through a generic struct's field. Each template
+// is instantiated only with a const view, so the expectation sits in its body.
+void c07ViewWrite<T>(T v)
+{
+    expect_error("cannot assign to 'v[0]': it is reached through a pointer to const ('v')") { v[0] = 1; }
+}
+void c07ViewWriteD<T>(T v)
+{
+    expect_error("cannot assign to 'v[0]': it is reached through a pointer to const ('v')") { v[0] = 1; }
+}
+void c07ViewWriteM<T>(T v)
+{
+    expect_error("cannot assign to 'v[0]': it is reached through a pointer to const ('v')") { v[0] = 1; }
+}
+struct C07ViewHold<T> { T v; };
+int c07ViewCalls()
+{
+    int[2] a = {1, 2};
+    (const int)[] cv = a;
+    int[] mv = a;
+    c07ViewWrite<(const int)[]>(cv);
+    c07ViewWriteD(cv);
+    c07ViewWriteM<(const int)[]>(mv);
+    return a[0];
+}
+int c07ViewField()
+{
+    int[2] a = {1, 2};
+    (const int)[] cv = a;
+    C07ViewHold<(const int)[]> h = { v = cv };
+    expect_error("cannot assign to 'h.v[0]'");
+    h.v[0] = 5;
+    return a[0];
+}

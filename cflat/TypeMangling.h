@@ -54,8 +54,8 @@ std::string SpellTypeForSymbolDump(const LLVMBackend& compiler,
 std::string SpellDiagnosticType(const LLVMBackend& compiler,
                                 const LLVMBackend::TypeAndValue& type);
 std::string_view MangledBase(std::string_view mangled);
-// A generic type argument carrying pointee const, spelled "(const int)*" (mangled ".c1$.p$int"):
-// the argument without it and its const depth. False when the argument carries none.
+// A generic type argument carrying pointee const, spelled "(const int)*" (mangled ".c1$.p$int")
+// or "(const int)[]" (".c1$.v$int"): the argument without it and its const depth. False if none.
 bool SplitConstTypeArgument(std::string_view arg, std::string& plain, int& constDepth);
 // Inverse of SplitConstTypeArgument for a spelled argument; the depth is capped below the
 // argument's own level (a generic argument never carries top-level const).

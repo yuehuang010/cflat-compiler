@@ -1540,6 +1540,45 @@ bool testIsConstIntrinsic()
     result &= Test("is_const concrete alias cip",  is_const(IsConstCip) ? 1 : 0, 1);
     result &= Test("is_const concrete const word", is_const(IsConstWord) ? 1 : 0, 1);
     result &= Test("is_const concrete const int",  is_const(IsConstCi) ? 1 : 0, 1);
+    // A view of const elements is its own instantiation (ruling 2026-10-19).
+    int[2] va = {1, 2};
+    (const int)[] cview = va;
+    int[] mview = va;
+    ConstChecker<(const int)[]> cvc = default;
+    ConstChecker<int[]>         mvc = default;
+    result &= Test("is_const (const int)[]",          cvc.check(), 1);
+    result &= Test("is_const int[]",                  mvc.check(), 0);
+    result &= Test("is_const deduced (const int)[]",  isConstDeduced(cview), 1);
+    result &= Test("is_const deduced int[]",          isConstDeduced(mview), 0);
+    result &= Test("is_const explicit (const int)[]", isConstDeduced<(const int)[]>(mview), 1);
+    return result;
+}
+
+// `(const E)[]` generic arguments: own instantiation, element const kept inside the body.
+int cviewSum<T>(T v) { return v[0] + v[1]; }
+int cviewWriteIf<T>(T v) { if const (!is_const(T)) v[0] = 9; return v[0]; }
+struct CviewHold<T> { T v; int first() { return v[0]; } };
+int cviewNest<T>(T x) { CviewHold<T> h = { v = x }; return h.first() + is_const(T) * 10; }
+
+bool testConstViewInstantiation()
+{
+    bool result = true;
+    int[2] a = {1, 2};
+    int[2] b = {30, 40};
+    (const int)[] cv = a;
+    int[] mv = b;
+    result &= Test("cview sum deduced const",     cviewSum(cv), 3);
+    result &= Test("cview sum explicit const",    cviewSum<(const int)[]>(cv), 3);
+    result &= Test("cview sum mutable",           cviewSum(mv), 70);
+    result &= Test("cview write-if const skips",  cviewWriteIf(cv) * 100 + a[0], 101);
+    result &= Test("cview write-if mutable",      cviewWriteIf(mv) * 100 + b[0], 909);
+    CviewHold<(const int)[]> h = { v = cv };
+    result &= Test("cview hold const read",       h.v[1] * 10 + h.first(), 21);
+    CviewHold<int[]> hm = { v = mv };
+    hm.v[1] = 41;
+    result &= Test("cview hold mutable write",    b[1], 41);
+    result &= Test("cview nested const",          cviewNest(cv), 11);
+    result &= Test("cview nested mutable",        cviewNest(mv), 9);
     return result;
 }
 
@@ -5728,6 +5767,7 @@ extern int main()
     total++; passed += testMixedGenericFields()          ? 1 : 0;
     total++; passed += testIsPointerIntrinsic()          ? 1 : 0;
     total++; passed += testIsConstIntrinsic()            ? 1 : 0;
+    total++; passed += testConstViewInstantiation()      ? 1 : 0;
     total++; passed += testIntrinsicMemberNames()        ? 1 : 0;
     total++; passed += testTemplateFunctions()           ? 1 : 0;
     total++; passed += testNewPrimitiveInitializers()    ? 1 : 0;

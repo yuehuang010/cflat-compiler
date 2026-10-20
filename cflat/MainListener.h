@@ -1885,7 +1885,7 @@ static bool StripAliasQualifier(std::string& name)
 
 // Type parameter -> argument spelling of the instantiation being walked. An argument's pointee
 // const ("(const int)*") is kept beside the plain spelling, which every reader of the map sees;
-// copies (save/restore around a nested instantiation) carry both. `[]` binds with no const.
+// copies (save/restore around a nested instantiation) carry both; a view's element const too.
 class TypeSubstitutionMap : public std::unordered_map<std::string, std::string>
 {
 public:

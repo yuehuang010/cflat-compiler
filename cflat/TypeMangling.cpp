@@ -640,9 +640,9 @@ std::string PrintTypeSpelling(const LLVMBackend& compiler, const TypeSpelling& s
     // Stars bind to the ELEMENT of a view ("int*[]"), so they print before the brackets.
     result += std::string(std::max(spelling.pointerDepth, 0), '*');
     if (spelling.view) result += "[]";
-    if (spelling.constDepth > 0 && !spelling.view)
+    if (spelling.constDepth > 0)
     {
-        // Pointee const prints in the whole-word spelling: "(const int)*", "(const int*)*".
+        // Pointee const prints whole-word: "(const int)*", "(const int*)*", "(const int)[]".
         const bool hasAlias = spelling.alias;
         std::string plain = hasAlias ? result.substr(6) : result;
         result = (hasAlias ? "alias " : "") + JoinConstTypeArgument(plain, spelling.constDepth);
@@ -1069,22 +1069,26 @@ bool SplitConstTypeArgument(std::string_view arg, std::string& plain, int& const
         constDepth = depth;
         return true;
     }
+    // A view's `[]` is one level like a star: "(const int)[]" = "int[]" with element const.
+    const bool view = rest.ends_with("[]");
+    if (view) rest.remove_suffix(2);
     size_t outer = 0;
     while (outer < rest.size() && rest[rest.size() - 1 - outer] == '*') ++outer;
     std::string_view word = rest.substr(0, rest.size() - outer);
-    if (outer == 0 || !word.starts_with("(const ") || !word.ends_with(")")) return false;
+    if ((outer == 0 && !view) || !word.starts_with("(const ") || !word.ends_with(")")) return false;
     word = word.substr(7, word.size() - 8);
     size_t inner = 0;
     while (inner < word.size() && word[word.size() - 1 - inner] == '*') ++inner;
     if (inner == word.size()) return false;
-    plain = prefix + std::string(word.substr(0, word.size() - inner)) + std::string(inner + outer, '*');
+    plain = prefix + std::string(word.substr(0, word.size() - inner)) + std::string(inner + outer, '*')
+        + (view ? "[]" : "");
     constDepth = static_cast<int>(inner) + 1;
     return true;
 }
 
 std::string JoinConstTypeArgument(const std::string& plain, int constDepth)
 {
-    if (constDepth <= 0 || plain.ends_with("[]")) return plain;
+    if (constDepth <= 0) return plain;
     std::string rest = plain;
     std::string prefix;
     if (rest.starts_with("alias "))
@@ -1092,10 +1096,15 @@ std::string JoinConstTypeArgument(const std::string& plain, int constDepth)
         prefix = "alias ";
         rest.erase(0, 6);
     }
+    // A view's `[]` counts as the outermost level: "int[]" at depth 1 is "(const int)[]".
+    const bool view = rest.ends_with("[]");
+    if (view) rest.erase(rest.size() - 2);
     size_t stars = 0;
     while (stars < rest.size() && rest[rest.size() - 1 - stars] == '*') ++stars;
-    if (stars == 0 || stars == rest.size()) return plain;
-    const size_t depth = std::min<size_t>(static_cast<size_t>(constDepth), stars);
+    if (stars == rest.size() || (stars == 0 && !view)) return plain;
+    const size_t levels = stars + (view ? 1 : 0);
+    const size_t depth = std::min<size_t>(static_cast<size_t>(constDepth), levels);
     const std::string base = rest.substr(0, rest.size() - stars);
-    return prefix + "(const " + base + std::string(depth - 1, '*') + ")" + std::string(stars - depth + 1, '*');
+    return prefix + "(const " + base + std::string(depth - 1, '*') + ")"
+        + std::string(levels - depth + (view ? 0 : 1), '*') + (view ? "[]" : "");
 }
