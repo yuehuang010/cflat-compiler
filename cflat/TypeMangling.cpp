@@ -517,8 +517,20 @@ std::string MangleTypeArgument(const LLVMBackend& compiler, std::string_view typ
          + CanonicalTypeBase(compiler, typeName.substr(start, baseEnd - start));
 }
 
+// Pointee const depth of a function-type component for its ".c<N>$" marker: the contiguous
+// levels from the innermost pointee (the only masks a whole-word spelling produces).
+static int FunctionComponentConstDepth(int constMask, bool pointer, int pointerDepth)
+{
+    if (constMask <= 0 || !pointer) return 0;
+    const int depth = std::max(pointerDepth, 1);
+    int levels = 0;
+    while (levels < depth && ((constMask >> levels) & 1) != 0) ++levels;
+    return levels;
+}
+
 std::string MangleFunctionComponent(const LLVMBackend& compiler, std::string_view name,
-                                    bool pointer, int pointerDepth, bool alias = false)
+                                    bool pointer, int pointerDepth, bool alias = false,
+                                    int constMask = -1)
 {
     LLVMBackend::TypeAndValue component;
     component.TypeName = name.empty() ? "void" : MangleTypeArgument(compiler, name);
@@ -526,7 +538,11 @@ std::string MangleFunctionComponent(const LLVMBackend& compiler, std::string_vie
     component.ElemPointer = pointer && pointerDepth >= 2;
     component.PointerDepth = pointer ? std::max(pointerDepth, 1) : 0;
     component.IsAlias = alias;
-    return MangleType(compiler, component);
+    std::string mangled = MangleType(compiler, component);
+    // Pointee const is part of a function type's identity: ".c1$.p$char" for `(const char)*`.
+    if (const int constDepth = FunctionComponentConstDepth(constMask, pointer, pointerDepth); constDepth > 0)
+        mangled.insert(mangled.starts_with(".a$") ? 3 : 0, ".c" + std::to_string(constDepth) + "$");
+    return mangled;
 }
 
 std::string MangleFunctionType(const LLVMBackend& compiler,
@@ -545,13 +561,13 @@ std::string MangleFunctionType(const LLVMBackend& compiler,
            + MangleFunctionComponent(compiler, type.FuncPtrReturnTypeName,
                                      type.FuncPtrReturnPointer,
                                      type.FuncPtrReturnPointerDepth,
-                                     type.FuncPtrReturnAlias);
+                                     type.FuncPtrReturnAlias, type.FuncPtrReturnConstMask);
     for (const auto& param : type.FuncPtrParams)
     {
         result += "$";
         if (param.IsMove) result += ".m$";
         result += MangleFunctionComponent(compiler, param.TypeName,
-                                          param.Pointer, param.PointerDepth);
+                                          param.Pointer, param.PointerDepth, false, param.ConstMask);
     }
 #ifndef NDEBUG
     TypeSpelling spelling;
@@ -751,14 +767,16 @@ std::string MangleGenericInstance(const LLVMBackend& compiler, std::string_view 
 
 std::string MangleClosureType(const LLVMBackend& compiler, bool isThin,
                               const std::string& ret, int retDepth,
-                              const std::vector<std::pair<std::string, int>>& params)
+                              const std::vector<std::pair<std::string, int>>& params,
+                              int retConstMask, const std::vector<int>* paramConstMasks)
 {
     std::string result = isThin ? "cfn$." : "fatfn$.";
     result += std::to_string(params.size()) + "$"
-           + MangleFunctionComponent(compiler, ret, retDepth > 0, retDepth);
-    for (const auto& param : params)
-        result += "$" + MangleFunctionComponent(compiler, param.first, param.second > 0,
-                                                  param.second);
+           + MangleFunctionComponent(compiler, ret, retDepth > 0, retDepth, false, retConstMask);
+    for (size_t i = 0; i < params.size(); i++)
+        result += "$" + MangleFunctionComponent(compiler, params[i].first, params[i].second > 0,
+            params[i].second, false,
+            paramConstMasks != nullptr && i < paramConstMasks->size() ? (*paramConstMasks)[i] : -1);
 #ifndef NDEBUG
     TypeSpelling spelling;
     assert(DemangleType(compiler, result, spelling));

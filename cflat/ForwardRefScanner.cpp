@@ -185,8 +185,10 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                             // Resolve generic signature types (gap b) to match the main pass.
                             bool retPtr = fpSpec->pointer() != nullptr;
                             int retStars = PointerDepthOf(fpSpec->pointer());
-                            declType.FuncPtrReturnTypeName = ResolveSigComponentScanner(
-                                fpSpec->typeSpecifier(), retPtr, fpSpec->multiWordTypeSuffix());
+                            int retConst = 0;
+                            declType.FuncPtrReturnTypeName = ResolveSigComponentConstScanner(
+                                fpSpec->typeSpecifier(), retPtr, retStars, retConst, fpSpec->multiWordTypeSuffix());
+                            declType.FuncPtrReturnConstMask = retConst;
                             declType.FuncPtrReturnPointer = retPtr;
                             declType.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
                             declType.FuncPtrReturnResolvedKey = SigComponentResolvedKeyScanner(declType.FuncPtrReturnTypeName);
@@ -197,8 +199,10 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                                     LLVMBackend::TypeAndValue::FuncPtrParam p;
                                     bool pPtr = param->pointer() != nullptr;
                                     int pStars = PointerDepthOf(param->pointer());
-                                    p.TypeName = ResolveSigComponentScanner(
-                                        param->typeSpecifier(), pPtr, param->multiWordTypeSuffix());
+                                    int pConst = 0;
+                                    p.TypeName = ResolveSigComponentConstScanner(
+                                        param->typeSpecifier(), pPtr, pStars, pConst, param->multiWordTypeSuffix());
+                                    p.ConstMask = pConst;
                                     p.Pointer = pPtr;
                                     p.IsMove = param->Move() != nullptr;
                                     p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
@@ -334,6 +338,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     declType.FuncPtrVariadic    = fit->FuncPtrVariadic;
                     declType.FuncPtrNoPrototype = fit->FuncPtrNoPrototype;
                     declType.FuncPtrReturnPointerDepth = fit->FuncPtrReturnPointerDepth;
+                    declType.FuncPtrReturnConstMask = fit->FuncPtrReturnConstMask;
                     declType.FuncPtrParams         = fit->FuncPtrParams;
                     const int functionPtrDepth = PointerDepthOf(declSpecWithSuffix->pointer());
                     declType.Pointer               = functionPtrDepth > 0;
@@ -1497,6 +1502,32 @@ std::string ForwardRefScanner::ResolveSigComponentScanner(
         return compilerLLVM->ResolveTypeAlias(result);
     }
 
+std::string ForwardRefScanner::ResolveSigComponentConstScanner(
+    CFlatParser::TypeSpecifierContext* ts, bool& outPointer, int& stars, int& constMask,
+    CFlatParser::MultiWordTypeSuffixContext* suffix) {
+        constMask = 0;
+        if (ts != nullptr && ts->typeName() != nullptr)
+        {
+            ConstTypeSyntax shape;
+            if (!ResolveConstTypeSpecifierSyntax(compilerLLVM, ts, shape, &scanTypeSubstitutions_,
+                    [this](auto* entry) { return ResolveForwardTypeArg(entry); },
+                    [this](auto* member) { return ResolveMemberTypeSpecifier(member); },
+                    [this](auto* tuple) { return ResolveTupleTypeSpecifier(tuple); }))
+                return ts->getText();
+            stars += shape.PointerDepth;
+            outPointer = stars > 0;
+            constMask = PointeeConstOfComponent(shape.ConstMask, stars);
+            return shape.TypeName;
+        }
+        std::string name = ResolveSigComponentScanner(ts, outPointer, suffix);
+        int depth = ReconcilePointerDepth(outPointer, stars);
+        std::string aliased = compilerLLVM->ResolveTypeAlias(name);
+        int aliasStars = 0;
+        while (aliasStars < (int)aliased.size() && aliased[aliased.size() - 1 - aliasStars] == '*') ++aliasStars;
+        constMask = PointeeConstOfComponent(compilerLLVM->ResolveTypeAliasConstMask(name), depth + aliasStars);
+        return name;
+    }
+
 std::string ForwardRefScanner::SigComponentResolvedKeyScanner(const std::string& name) {
         return compilerLLVM->FuncPtrComponentDeclaringKey(name);
     }
@@ -1507,19 +1538,24 @@ std::string ForwardRefScanner::EncodeClosureScanner(CFlatParser::FunctionPointer
             return isThin ? "__c_fn_ptr" : "__closure_fat_ptr";  // main pass reports the error
         bool retPtr = fpSpec->pointer() != nullptr;
         int retStars = PointerDepthOf(fpSpec->pointer());
-        std::string retName = ResolveSigComponentScanner(fpSpec->typeSpecifier(), retPtr,
-                                                         fpSpec->multiWordTypeSuffix());
+        int retConst = 0;
+        std::string retName = ResolveSigComponentConstScanner(fpSpec->typeSpecifier(), retPtr,
+                                                              retStars, retConst, fpSpec->multiWordTypeSuffix());
         std::vector<std::pair<std::string, int>> encParams;
+        std::vector<int> paramConsts;
         if (fpSpec->functionPointerParamList() != nullptr)
             for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
             {
                 bool pPtr = param->pointer() != nullptr;
                 int pStars = PointerDepthOf(param->pointer());
-                std::string pName = ResolveSigComponentScanner(param->typeSpecifier(), pPtr,
-                                                               param->multiWordTypeSuffix());
+                int pConst = 0;
+                std::string pName = ResolveSigComponentConstScanner(param->typeSpecifier(), pPtr,
+                                                                    pStars, pConst, param->multiWordTypeSuffix());
                 encParams.push_back({ pName, ReconcilePointerDepth(pPtr, pStars) });
+                paramConsts.push_back(pConst);
             }
-        return BuildEncodedClosureName(compilerLLVM, isThin, retName, ReconcilePointerDepth(retPtr, retStars), encParams);
+        return BuildEncodedClosureName(compilerLLVM, isThin, retName, ReconcilePointerDepth(retPtr, retStars),
+                                       encParams, retConst, &paramConsts);
     }
 
 std::string ForwardRefScanner::EncodePlainFunctionTypeScanner(
@@ -2126,8 +2162,10 @@ LLVMBackend::TypeAndValue ForwardRefScanner::BuildFuncPtrAliasType(CFlatParser::
             // Resolve generic signature types (gap b) to match the main pass.
             bool retPtr = fpSpec->pointer() != nullptr;
             int retStars = PointerDepthOf(fpSpec->pointer());
-            tv.FuncPtrReturnTypeName = ResolveSigComponentScanner(
-                fpSpec->typeSpecifier(), retPtr, fpSpec->multiWordTypeSuffix());
+            int retConst = 0;
+            tv.FuncPtrReturnTypeName = ResolveSigComponentConstScanner(
+                fpSpec->typeSpecifier(), retPtr, retStars, retConst, fpSpec->multiWordTypeSuffix());
+            tv.FuncPtrReturnConstMask = retConst;
             tv.FuncPtrReturnPointer  = retPtr;
             tv.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
             tv.FuncPtrReturnResolvedKey = SigComponentResolvedKeyScanner(tv.FuncPtrReturnTypeName);
@@ -2137,8 +2175,10 @@ LLVMBackend::TypeAndValue ForwardRefScanner::BuildFuncPtrAliasType(CFlatParser::
                     LLVMBackend::TypeAndValue::FuncPtrParam p;
                     bool pPtr = param->pointer() != nullptr;
                     int pStars = PointerDepthOf(param->pointer());
-                    p.TypeName = ResolveSigComponentScanner(
-                        param->typeSpecifier(), pPtr, param->multiWordTypeSuffix());
+                    int pConst = 0;
+                    p.TypeName = ResolveSigComponentConstScanner(
+                        param->typeSpecifier(), pPtr, pStars, pConst, param->multiWordTypeSuffix());
+                    p.ConstMask = pConst;
                     p.Pointer  = pPtr;
                     p.IsMove   = param->Move() != nullptr;
                     p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);

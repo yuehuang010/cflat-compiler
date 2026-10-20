@@ -489,7 +489,7 @@ class Path
     // Return the filename component (everything after the last separator).
     static move string getFileName(string path)
     {
-        char* p = path.data();
+        (const char)* p = path.data();
         i32 len = path.length();
         i32 lastSep = -1;
         i32 i = 0;
@@ -509,7 +509,7 @@ class Path
     // Returns "" if path contains no separator.
     static move string getDirectory(string path)
     {
-        char* p = path.data();
+        (const char)* p = path.data();
         i32 len = path.length();
         i32 lastSep = -1;
         i32 i = 0;
@@ -529,7 +529,7 @@ class Path
     // Return the extension including the leading dot (e.g. ".txt"), or "" if none.
     static move string getExtension(string path)
     {
-        char* p = path.data();
+        (const char)* p = path.data();
         i32 len = path.length();
         i32 lastDot = -1;
         i32 i = 0;
@@ -560,7 +560,7 @@ class Path
     // Pass ext="" to strip the extension.
     static move string changeExtension(string path, string ext)
     {
-        char* p = path.data();
+        (const char)* p = path.data();
         i32 len = path.length();
         i32 lastDot = -1;
         i32 i = 0;

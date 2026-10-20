@@ -48,7 +48,7 @@ class HttpResponse {
         // auto-free), then take ownership of a fresh copy. The copy is routed
         // through a `move` local: a bare `_body = value.copy()` would not transfer
         // ownership of the temporary, leaving _body aliasing a freed buffer.
-        if (_body._ptr != nullptr) { char* p = move _body._ptr; delete p; }
+        if (_body._ptr != nullptr) { string released = move _body; }
         string owned = value.copy();
         _body = move owned;
     }
@@ -95,7 +95,7 @@ class HttpResponse {
 
     ~HttpResponse()
     {
-        if (_body._ptr != nullptr) { char* p = move _body._ptr; delete p; }
+        if (_body._ptr != nullptr) { string released = move _body; }
         // _statusText is literal-backed (never owned) - not freed.
         // _headerNames / _headerValues own their elements and self-clean.
     }

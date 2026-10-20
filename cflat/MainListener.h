@@ -2380,6 +2380,14 @@ static int ReconcilePointerDepth(bool pointer, int stars)
     return stars > 0 ? stars : 1;
 }
 
+// The pointee half of a component's ConstMask at `depth` levels: a function type ignores the
+// component's own top-level const, as C does.
+static int PointeeConstOfComponent(int mask, int depth)
+{
+    if (mask <= 0 || depth <= 0) return 0;
+    return mask & ((1 << std::min(depth, 7)) - 1);
+}
+
 // Each component folds its pointer DEPTH in via MangleTypeArg ("int*" -> ".p$int", "int**" ->
 // ".p$.p$int"); isThin selects the thin/fat prefix. Examples: Lambda<int(int)> ->
 // "fatfn$.1$int$int"; function<void(UiTest*)> -> "cfn$.1$void$.p$UiTest";
@@ -2388,10 +2396,11 @@ static int ReconcilePointerDepth(bool pointer, int stars)
 // the string this produced before depth existed.
 static std::string BuildEncodedClosureName(const LLVMBackend* compiler, bool isThin,
     const std::string& ret, int retDepth,
-    const std::vector<std::pair<std::string, int>>& params)
+    const std::vector<std::pair<std::string, int>>& params,
+    int retConstMask = -1, const std::vector<int>* paramConstMasks = nullptr)
 {
     if (compiler == nullptr) return ret;
-    return MangleClosureType(*compiler, isThin, ret, retDepth, params);
+    return MangleClosureType(*compiler, isThin, ret, retDepth, params, retConstMask, paramConstMasks);
 }
 
 
@@ -5275,6 +5284,10 @@ public:
     // match MangledGenericName; a nested closure encodes recursively. Names only (no queue/register).
     std::string ResolveSigComponentScanner(CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
                                            CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
+    // A component spelled `(const T)` / `const(T)`: folds T's own stars into `stars` and returns its
+    // pointee const (bottom-relative, top level dropped) in `constMask`. Twin of the main pass copy.
+    std::string ResolveSigComponentConstScanner(CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
+        int& stars, int& constMask, CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
 
     /*
      * Scanner counterpart of MainListener::SigComponentResolvedKey. Both are one line onto the
@@ -6119,6 +6132,10 @@ private:
     // byte-identical to the pre-existing raw-getText() behavior (no alias resolution added).
     std::string ResolveSigComponentCodegen(CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
                                            CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
+    // A component spelled `(const T)` / `const(T)`: folds T's own stars into `stars` and returns its
+    // pointee const (bottom-relative, top level dropped) in `constMask`. Twin of the scanner copy.
+    std::string ResolveSigComponentConstCodegen(CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
+        int& stars, int& constMask, CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
 
     /*
      * The declaring-scope-resolved key for a signature component, recorded ALONGSIDE the raw

@@ -575,8 +575,8 @@ bool testCaptureString()
     // string data() access inside lambda
     {
         string word = "abc";
-        Lambda<char*()> getPtr = () => { return word.data(); };
-        char* ptr = getPtr();
+        Lambda<(const char)*()> getPtr = () => { return word.data(); };
+        (const char)* ptr = getPtr();
         result &= Test("string data() non-null", ptr != nullptr, true);
         result &= Test("string data() len",      strlen(ptr),    3);
     }

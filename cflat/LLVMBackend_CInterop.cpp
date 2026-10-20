@@ -1786,6 +1786,8 @@ bool LLVMBackend::IsLongDoubleSpelling(const std::string& spelling)
         return spelling.find("long double") != std::string::npos;
 }
 
+static uint8_t CSpellingPointeeConstMask(const std::string& spelling, int depth);
+
 bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndValue& out,
                                        std::unordered_set<std::string>& visited,
                                        bool cxxBoundary)
@@ -1886,6 +1888,14 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
         }
         out.FuncPtrReturnTypeName = retTV.TypeName;
         out.FuncPtrReturnPointer = retTV.Pointer;
+        // A C function type keeps its result and parameter pointee const (exact-match identity);
+        // a C++ one stays unrecorded (phase 5).
+        if (!cxxBoundary)
+        {
+            int mask = CSpellingPointeeConstMask(retSpelling, retTV.ValuePointerDepth());
+            out.FuncPtrReturnConstMask = mask != 0 ? mask : retTV.PointeeConstMask();
+            if (out.FuncPtrReturnConstMask > 0) out.FuncPtrReturnPointerDepth = retTV.ValuePointerDepth();
+        }
 
         auto trim = [](std::string v) {
             size_t a = 0; while (a < v.size() && std::isspace((unsigned char)v[a])) ++a;
@@ -1939,6 +1949,11 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
             fp.IsRvalueRef = ptv.IsRvalueRef;
             // Leading const qualifies the innermost pointee (`const void *`).
             fp.IsPointeeConst = ptv.Pointer && trim(p).starts_with("const ");
+            if (!cxxBoundary)
+            {
+                int mask = CSpellingPointeeConstMask(trim(p), ptv.ValuePointerDepth());
+                fp.ConstMask = mask != 0 ? mask : ptv.PointeeConstMask();
+            }
             out.FuncPtrParams.push_back(fp);
         }
         return true;

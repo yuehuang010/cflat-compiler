@@ -155,7 +155,31 @@ extern int main()
         auto c13Const = c13ConstPSResult();
         c13Const.y = 1;
     }
+    // c14: a C function pointer (global, typedef'd, struct field, parameter) keeps its result and
+    // parameter pointee const, like the function type it is.
+    expect_error("cannot convert '(const char)*' to 'char*': the conversion discards const") {
+        char* c14P = c14RevFp();
+    }
+    expect_error("cannot convert '(const char)*' to 'char*': the conversion discards const") {
+        char* c14P = c14RevTd();
+    }
+    expect_error("cannot convert '(const char)*' to 'char*': the conversion discards const") {
+        char* c14P = c14Ops.name();
+    }
+    expect_error("cannot assign to 'c14RevFp()[0]': it is reached through a pointer to const ('c14RevFp()')") {
+        c14RevFp()[0] = 'z';
+    }
+    expect_error("cannot pass argument 1 ('function<int(char*)>') to parameter 'f' ('function<int((const char)*)>'): the conversion discards const") {
+        int c14R = c14CallTake(c14CflatMutTake, "z");
+    }
+    expect_error("cannot convert 'function<int(char*)>' to 'function<int((const char)*)>': the conversion discards const") {
+        c14TakeFp = c14CflatMutTake;
+    }
+    expect_error("cannot convert 'function<int((const char)*)>' to 'function<int(char*)>': the conversion discards const") {
+        function<int(char*)> c14Slot = c14Ops.take;
+    }
     return 0;
 }
 
 int c10CflatTake(int* p) { return *p; }
+int c14CflatMutTake(char* s) { return 3; }

@@ -191,7 +191,7 @@ bool eqCI(string a, const char* b)
     int alen = a.length();
     int blen = strlen(b);
     if (alen != blen) return false;
-    char* ap = a.data();
+    (const char)* ap = a.data();
     int i = 0;
     while (i < alen)
     {
@@ -385,7 +385,7 @@ void handleTab(i8* buf, int* lenPtr, int cap)
     if (n == 1)
     {
         string m = matches->get(0);
-        char* mp = m.data();
+        (const char)* mp = m.data();
         int mlen = m.length();
         int j = stubLen;
         while (j < mlen) { *lenPtr = appendChar(buf, *lenPtr, cap, mp[j]); j++; }
@@ -402,8 +402,8 @@ void handleTab(i8* buf, int* lenPtr, int cap)
         string s = matches->get(mi);
         int slen = s.length();
         int limit = cpLen < slen ? cpLen : slen;
-        char* a = first.data();
-        char* b = s.data();
+        (const char)* a = first.data();
+        (const char)* b = s.data();
         int k = 0;
         while (k < limit && tolower((int)(u8)a[k]) == tolower((int)(u8)b[k])) k++;
         cpLen = k;
@@ -412,7 +412,7 @@ void handleTab(i8* buf, int* lenPtr, int cap)
 
     if (cpLen > stubLen)
     {
-        char* fp = first.data();
+        (const char)* fp = first.data();
         int j = stubLen;
         while (j < cpLen) { *lenPtr = appendChar(buf, *lenPtr, cap, fp[j]); j++; }
     }
@@ -486,7 +486,7 @@ void edReplace(i8* buf, int* len, int* cursor, int cap, string s)
     while (*cursor > 0) { printf("\b"); (*cursor)--; }
     int newLen = s.length();
     if (newLen > cap - 1) newLen = cap - 1;
-    char* sp = s.data();
+    (const char)* sp = s.data();
     int i = 0;
     while (i < newLen) { buf[i] = sp[i]; printf("%c", (int)(u8)sp[i]); i++; }
     if (newLen < *len)
@@ -664,7 +664,7 @@ string expandEnv(string line)
 
 void tokenizeLine(string line, list<string>* tokens, list<int>* kinds)
 {
-    char* p = line.data();
+    (const char)* p = line.data();
     int len = line.length();
     int i = 0;
     while (i < len)

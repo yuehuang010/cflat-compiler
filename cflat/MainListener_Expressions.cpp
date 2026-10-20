@@ -5425,6 +5425,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
                 {
                     VerifyFuncPtrAssignmentMoveFlags(funcName, namedVar.TypeAndValue, ctx);
+                    LLVMBackend::NamedVariable boundValue;
+                    boundValue.Primary = fn;
+                    if (std::string constWhy = compiler->DescribeFuncPtrConstMismatch(
+                            namedVar.TypeAndValue, boundValue); !constWhy.empty())
+                        LogErrorContext(ctx, constWhy);
                     right = namedVar.TypeAndValue.IsThinFnPtr()
                           ? compiler->MakeThinFnPtrValue(fn, namedVar.TypeAndValue)
                           : compiler->WrapBareValueAsFatStruct(fn);
@@ -5548,6 +5553,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 if (std::string why = compiler->DescribeFuncPtrValueMismatch(
                         assignSlotSig, rightNV); !why.empty())
                     LogErrorContext(ctx, why);
+                else if (std::string constWhy = compiler->DescribeFuncPtrConstMismatch(
+                        assignSlotSig, rightNV); !constWhy.empty())
+                    LogErrorContext(ctx, constWhy);
             }
 
             // An INFERRED sink cannot be adopted onto an already-registered destination (or a
@@ -8958,6 +8966,7 @@ static void CarryCommonClosureSignature(LLVMBackend* compiler, LLVMBackend::Type
     type.FuncPtrReturnOwned = t.FuncPtrReturnOwned;
     type.FuncPtrReturnAlias = t.FuncPtrReturnAlias;
     type.FuncPtrReturnPointerDepth = t.FuncPtrReturnPointerDepth;
+    type.FuncPtrReturnConstMask = t.FuncPtrReturnConstMask;
     type.FuncPtrReturnResolvedKey = t.FuncPtrReturnResolvedKey;
     type.FuncPtrVariadic = t.FuncPtrVariadic;
     type.FuncPtrNoPrototype = t.FuncPtrNoPrototype;
@@ -23864,6 +23873,9 @@ void MainListener::EmitFieldInitializer(
                 if (std::string why = compiler->DescribeFuncPtrValueMismatch(
                         initSlotSig, rightNV); !why.empty())
                     LogErrorContext(fi, why);
+                else if (std::string constWhy = compiler->DescribeFuncPtrConstMismatch(
+                        initSlotSig, rightNV); !constWhy.empty())
+                    LogErrorContext(fi, constWhy);
             }
             lambdaExpectedType = {};
             if (!stdFunctionField.empty())

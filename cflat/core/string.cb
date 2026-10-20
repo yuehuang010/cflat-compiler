@@ -1,7 +1,8 @@
 // Core string types.
 //
 // `string` is a value type with a pointer to NUL-terminated bytes and a byte count:
-//   char* data()   - pointer to the underlying bytes (null-terminated)
+//   (const char)* data() - read-only pointer to the underlying bytes (null-terminated)
+//   char* data_mut()     - writable pointer; copies a borrowed string into an owned buffer first
 //   i32 length() - number of bytes, not counting the terminator
 //
 // String literals are automatically wrapped into a `string` by the compiler.
@@ -40,17 +41,40 @@ i32 length(string self)
 
 // Pointer to the underlying NUL-terminated bytes. A default/empty string (_ptr == null)
 // returns a pointer to a static empty literal so it stays safe to hand to C as a C string.
-char* data(string self)
+(const char)* data(string self)
 {
-    // A literal is read-only; _ptr stays char* until the borrowed-string hole is closed.
-    if (self._ptr == nullptr) return (char*)"";
+    if (self._ptr == nullptr) return "";
     return self._ptr;
+}
+
+// Writable pointer to the bytes. A BORROWED string (literal, char* wrap, default) is first
+// copied into an owned NUL-terminated buffer (copy-on-write), so a write never reaches storage
+// the string does not own. An owned string returns its own buffer, unchanged. Call it on a
+// local or a field: a by-value `string` parameter is a borrow, so its copy would not be freed.
+char* data_mut(string* self)
+{
+    if ((self->_len & (i32)0x80000000) == 0)
+    {
+        i32 len = self->_len;
+        char* buf = new char[len + 1];
+        (const char)* src = self->_ptr;
+        i32 i = 0;
+        while (i < len)
+        {
+            buf[i] = src[i];
+            i = i + 1;
+        }
+        buf[len] = 0;
+        *self = _strOwned(move buf, len);
+    }
+    // _ptr is (const char)* for every string; the owned bit proves this buffer is ours.
+    return (char*)self->_ptr;
 }
 
 // FNV-1a hash over the bytes (basis 0x811C9DC5, prime 0x01000193, byte zero-extended).
 i32 hash(string self)
 {
-    char* p = self._ptr;
+    (const char)* p = self._ptr;
     i32 len = self.length();
     i32 h = (i32)2166136261;
     i32 i = 0;
@@ -167,18 +191,17 @@ move string toString(double self)
 }
 
 // Convert a bool to "true"/"false". Non-owning reference to a static literal; no allocation.
-// The casts keep _ptr char* (see data()); the borrowed literal must still never be written.
 string toString(bool self)
 {
     string result = default;
     if (self)
     {
-        result._ptr = (char*)"true";
+        result._ptr = "true";
         result._len = 4;
     }
     else
     {
-        result._ptr = (char*)"false";
+        result._ptr = "false";
         result._len = 5;
     }
     return result;
@@ -256,13 +279,11 @@ string operator string(IString s)
 
 // Wrap a raw C string pointer into a non-owning string value. The result borrows `s`
 // (no allocation; owned bit clear); it must not outlive the buffer. Call `.copy()` to take
-// ownership. `const char*` accepts a read-only buffer, but the result borrows it through the
-// mutable `char* _ptr`, and `data()` hands that out as `char*`: the cast below is a known const
-// hole until the string pointee is made const.
+// ownership. The borrowed bytes stay read-only: data() is (const char)*, data_mut() copies.
 string operator string(const char* s)
 {
     string result = default;
-    result._ptr = (char*)s;
+    result._ptr = s;
     result._len = strlen(s);
     return result;
 }
@@ -339,7 +360,7 @@ string operator+(string a, string b)
     i32 total = alen + blen;
     char* buf   = new char[total + 1];
 
-    char* aptr = a.data();
+    (const char)* aptr = a.data();
     i32 i = 0;
     while (i < alen)
     {
@@ -347,7 +368,7 @@ string operator+(string a, string b)
         i++;
     }
 
-    char* bptr = b.data();
+    (const char)* bptr = b.data();
     i32 j = 0;
     while (j < blen)
     {
@@ -367,7 +388,7 @@ string operator+(string a, const char* b)
     i32 total = alen + blen;
     char* buf   = new char[total + 1];
 
-    char* aptr = a.data();
+    (const char)* aptr = a.data();
     i32 i = 0;
     while (i < alen)
     {
@@ -396,7 +417,7 @@ string operator+(const char* a, string b)
     char* buf   = new char[total + 1];
     i32 i = 0;
     while (i < alen) { buf[i] = a[i]; i++; }
-    char* bptr = b.data();
+    (const char)* bptr = b.data();
     i32 j = 0;
     while (j < blen) { buf[alen + j] = bptr[j]; j++; }
     buf[total] = 0;
@@ -432,7 +453,7 @@ move string copy(string self)
 {
     i32 len = self.length();
     char* buf = new char[len + 1];
-    char* src = self.data();
+    (const char)* src = self.data();
     i32 i = 0;
     while (i < len)
     {
@@ -452,7 +473,7 @@ move string copy(string self, IAllocator alloc)
 {
     i32 len  = self.length();
     char* buf  = (char*)alloc.alloc((i64)len + 1);
-    char* src  = self.data();
+    (const char)* src  = self.data();
     i32 i = 0;
     while (i < len)
     {
@@ -557,8 +578,8 @@ i32 indexOf(string self, string needle, i32 startPos)
     i32 nlen = needle.length();
     if (nlen == 0) return startPos < 0 ? 0 : (startPos > slen ? slen : startPos);
     if (startPos < 0) startPos = 0;
-    char* sp = self._ptr;
-    char* np = needle._ptr;
+    (const char)* sp = self._ptr;
+    (const char)* np = needle._ptr;
     i32 limit = slen - nlen;
     i32 i = startPos;
     while (i <= limit)
@@ -579,7 +600,7 @@ i32 indexOf(string self, string needle)
 i32 indexOf(string self, i8 c)
 {
     i32 len = self.length();
-    char* p = self._ptr;
+    (const char)* p = self._ptr;
     i32 i = 0;
     while (i < len)
     {
@@ -596,8 +617,8 @@ i32 lastIndexOf(string self, string needle)
     i32 nlen = needle.length();
     if (nlen == 0) return slen;
     if (nlen > slen) return -1;
-    char* sp = self._ptr;
-    char* np = needle._ptr;
+    (const char)* sp = self._ptr;
+    (const char)* np = needle._ptr;
     i32 i = slen - nlen;
     while (i >= 0)
     {
@@ -611,7 +632,7 @@ i32 lastIndexOf(string self, string needle)
 i32 lastIndexOf(string self, i8 c)
 {
     i32 len = self.length();
-    char* p = self._ptr;
+    (const char)* p = self._ptr;
     i32 i = len - 1;
     while (i >= 0)
     {
@@ -678,11 +699,11 @@ bool operator>(string a, string b)
 // Non-owning view into a string's buffer.  _ptr is borrowed; never freed.
 struct string_view
 {
-    char* _ptr = nullptr;
+    (const char)* _ptr = nullptr;
     i32 _len = 0;
 
     // Pointer to the borrowed bytes (not NUL-terminated in general).
-    char* data()      { return _ptr; }
+    (const char)* data() { return _ptr; }
     // Number of bytes in the view.
     i32 length()    { return _len; }
     // Byte at position i (unchecked).
@@ -690,7 +711,7 @@ struct string_view
 
     // View over `len` borrowed bytes at `ptr` (C++ string_view(ptr, count)).  Nothing is
     // copied and no NUL terminator is required; the caller keeps ownership of the bytes.
-    string_view(char* ptr, i32 len)
+    string_view((const char)* ptr, i32 len)
     {
         this->_ptr = ptr;
         this->_len = len;
@@ -764,7 +785,7 @@ struct stringbuilder
     // Append the contents of another string.
     void append(string s)
     {
-        char* src = s.data();
+        (const char)* src = s.data();
         i32 addLen = s.length();
         i32 newLen = _length + addLen;
         _ensure(newLen + 1);
@@ -914,7 +935,7 @@ struct stringbuilder
         if (addLen == 0) return;
         i32 newLen = _length + addLen;
         _ensure(newLen + 1);
-        char* src = sv.data();
+        (const char)* src = sv.data();
         int i = 0;
         while (i < addLen) { _data[_length + i] = src[i]; i++; }
         _data[newLen] = 0;
@@ -982,7 +1003,7 @@ move string substring(string self, i32 start)
     if (start > slen) start = slen;
     i32 len = slen - start;
     char* buf = new char[len + 1];
-    char* src = self._ptr + start;
+    (const char)* src = self._ptr + start;
     i32 i = 0;
     while (i < len) { buf[i] = src[i]; i++; }
     buf[len] = 0;
@@ -998,7 +1019,7 @@ move string substring(string self, i32 start, i32 len)
     if (len < 0) len = 0;
     if (start + len > slen) len = slen - start;
     char* buf = new char[len + 1];
-    char* src = self._ptr + start;
+    (const char)* src = self._ptr + start;
     i32 i = 0;
     while (i < len) { buf[i] = src[i]; i++; }
     buf[len] = 0;
@@ -1013,9 +1034,9 @@ move string replace(string self, string oldVal, string newVal)
     i32 olen = oldVal.length();
     if (olen == 0) return self.copy();
     i32 slen = self.length();
-    char* sp = self._ptr;
-    char* op = oldVal._ptr;
-    char* np = newVal._ptr;
+    (const char)* sp = self._ptr;
+    (const char)* op = oldVal._ptr;
+    (const char)* np = newVal._ptr;
     i32 nlen = newVal.length();
     stringbuilder sb;
     i32 pos = 0;
@@ -1048,7 +1069,7 @@ move string toUpper(string self)
 {
     i32 len = self.length();
     char* buf = new char[len + 1];
-    char* src = self._ptr;
+    (const char)* src = self._ptr;
     i32 i = 0;
     while (i < len)
     {
@@ -1066,7 +1087,7 @@ move string toLower(string self)
 {
     i32 len = self.length();
     char* buf = new char[len + 1];
-    char* src = self._ptr;
+    (const char)* src = self._ptr;
     i32 i = 0;
     while (i < len)
     {
@@ -1083,7 +1104,7 @@ move string toLower(string self)
 move string trimStart(string self)
 {
     i32 len = self.length();
-    char* src = self._ptr;
+    (const char)* src = self._ptr;
     i32 startIdx = 0;
     while (startIdx < len)
     {
@@ -1103,7 +1124,7 @@ move string trimStart(string self)
 move string trimEnd(string self)
 {
     i32 len = self.length();
-    char* src = self._ptr;
+    (const char)* src = self._ptr;
     i32 endIdx = len;
     while (endIdx > 0)
     {
@@ -1122,7 +1143,7 @@ move string trimEnd(string self)
 move string trim(string self)
 {
     i32 len = self.length();
-    char* src = self._ptr;
+    (const char)* src = self._ptr;
     i32 startIdx = 0;
     while (startIdx < len)
     {
@@ -1155,7 +1176,7 @@ move string padLeft(string self, i32 width)
     char* buf = new char[width + 1];
     i32 i = 0;
     while (i < pad) { buf[i] = ' '; i++; }
-    char* src = self._ptr;
+    (const char)* src = self._ptr;
     i32 j = 0;
     while (j < len) { buf[pad + j] = src[j]; j++; }
     buf[width] = 0;
@@ -1169,7 +1190,7 @@ move string padRight(string self, i32 width)
     i32 len = self.length();
     if (len >= width) return self.copy();
     char* buf = new char[width + 1];
-    char* src = self._ptr;
+    (const char)* src = self._ptr;
     i32 i = 0;
     while (i < len) { buf[i] = src[i]; i++; }
     while (i < width) { buf[i] = ' '; i++; }
@@ -1180,7 +1201,7 @@ move string padRight(string self, i32 width)
 // -- Phase 3: split / join ----------------------------------------------------
 
 // Build an owning string from the byte range [src, src+len).
-move string _str_owned_range(char* src, i32 len)
+move string _str_owned_range((const char)* src, i32 len)
 {
     char* buf = new char[len + 1];
     i32 k = 0;
@@ -1204,8 +1225,8 @@ move list<string> split(string self, string sep)
         out.add(self.copy());
         return move out;
     }
-    char* sp = self._ptr;
-    char* dp = sep._ptr;
+    (const char)* sp = self._ptr;
+    (const char)* dp = sep._ptr;
     i32 pos = 0;
     while (pos <= slen)
     {
@@ -1237,7 +1258,7 @@ move list<string> split(string self, i8 sep)
 {
     list<string> out = default;
     i32 slen = self.length();
-    char* sp = self._ptr;
+    (const char)* sp = self._ptr;
     i32 pos = 0;
     while (pos <= slen)
     {
@@ -1282,14 +1303,14 @@ move string join(string sep, list<string> parts)
         idx++;
     }
     char* buf = new char[total + 1];
-    char* sepPtr = sep._ptr;
+    (const char)* sepPtr = sep._ptr;
     i32 pos = 0;
     idx = 0;
     while (idx < count)
     {
         string part = parts.get(idx);
         i32 plen = part.length();
-        char* pp = part.data();
+        (const char)* pp = part.data();
         i32 k = 0;
         while (k < plen) { buf[pos] = pp[k]; pos++; k++; }
         if (idx < count - 1)

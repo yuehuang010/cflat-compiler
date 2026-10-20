@@ -144,10 +144,10 @@ class HttpRequest {
         // Owned scalar string fields - free their buffers (bare `string` members
         // are not auto-destructed). All four only ever hold owned parser copies.
         // `move` makes the ownership transfer out of the field explicit.
-        if (method._ptr  != nullptr) { char* p = move method._ptr;  delete p; }
-        if (path._ptr    != nullptr) { char* p = move path._ptr;    delete p; }
-        if (version._ptr != nullptr) { char* p = move version._ptr; delete p; }
-        if (body._ptr    != nullptr) { char* p = move body._ptr;    delete p; }
+        if (method._ptr  != nullptr) { string released = move method;  }
+        if (path._ptr    != nullptr) { string released = move path;    }
+        if (version._ptr != nullptr) { string released = move version; }
+        if (body._ptr    != nullptr) { string released = move body;    }
         // The six list<string> members own their elements and self-clean.
     }
 };
@@ -194,9 +194,9 @@ class HttpClientResponse {
 
     ~HttpClientResponse()
     {
-        if (version._ptr    != nullptr) { char* p = move version._ptr;    delete p; }
-        if (statusText._ptr != nullptr) { char* p = move statusText._ptr; delete p; }
-        if (body._ptr       != nullptr) { char* p = move body._ptr;       delete p; }
+        if (version._ptr    != nullptr) { string released = move version;    }
+        if (statusText._ptr != nullptr) { string released = move statusText; }
+        if (body._ptr       != nullptr) { string released = move body;       }
     }
 };
 

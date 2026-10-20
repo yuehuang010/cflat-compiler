@@ -152,7 +152,7 @@ class XmlBuilder : IReflector
         string tag = name;
         if (tag.length() == 0) tag = "item";
         _openTag(tag);
-        char* ptr = value.data();
+        (const char)* ptr = value.data();
         int vlen = value.length();
         int i = 0;
         while (i < vlen)
@@ -215,7 +215,7 @@ class XmlBuilder : IReflector
     }
 
     // Parse XML from a raw byte pointer + length - avoids a string copy at the call site.
-    static T fromXmlRaw<T>(char* data, int len)
+    static T fromXmlRaw<T>((const char)* data, int len)
     {
         Arena arena;
         arena.setBlockSize(4096);
@@ -308,7 +308,7 @@ class XmlNode : IJSON, IJSONArray
     // Parse decimal text into a 64-bit integer (the full JSON interoperable integer range).
     i64 _textToInt64(string text)
     {
-        char* p = text.data();
+        (const char)* p = text.data();
         int len = text.length();
         int i = 0;
         bool neg = false;
@@ -324,7 +324,7 @@ class XmlNode : IJSON, IJSONArray
     // Parse decimal text with an optional fractional part into a double.
     double _textToDouble(string text)
     {
-        char* p = text.data();
+        (const char)* p = text.data();
         int len = text.length();
         int i = 0;
         bool neg = false;
@@ -464,7 +464,7 @@ class XmlNode : IJSON, IJSONArray
 // Attributes are skipped - field values are carried by child elements only.
 struct XmlParser
 {
-    char*    _src   = nullptr;
+    (const char)* _src = nullptr;
     int    _pos   = 0;
     int    _len   = 0;
     Arena* _arena = nullptr;

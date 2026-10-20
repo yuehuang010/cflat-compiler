@@ -160,7 +160,7 @@ void _proc_write(void* pipe, char* buf, i32 len) {
 }
 
 // Heap-copy n bytes of a string as a NUL-terminated C string (for POSIX argv).
-char* _proc_dupcstr(char* src, int n) {
+char* _proc_dupcstr((const char)* src, int n) {
     char* b = (char*)malloc((i64)(n + 1));
     memcpy(b, src, n);
     b[n] = 0;
@@ -213,7 +213,7 @@ int __process_writer_fn(move void* rawCtx) {
 char* __process_build_cmdline(string exe, list<string>* pargs) {
     stringbuilder sb;
     bool nq = false;
-    char* ep = exe.data(); int elen = exe.length(); int k = 0;
+    (const char)* ep = exe.data(); int elen = exe.length(); int k = 0;
     while (k < elen) { if (ep[k] == ' ') { nq = true; break; } k++; }
     if (nq) sb.appendChar('"');
     sb.append(exe);
@@ -223,7 +223,7 @@ char* __process_build_cmdline(string exe, list<string>* pargs) {
         sb.appendChar(' ');
         string arg = pargs->get(i);
         bool q = false;
-        char* ap = arg.data(); int al = arg.length(); int j = 0;
+        (const char)* ap = arg.data(); int al = arg.length(); int j = 0;
         while (j < al) { if (ap[j] == ' ') { q = true; break; } j++; }
         if (q) sb.appendChar('"');
         sb.append(arg);

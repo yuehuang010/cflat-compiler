@@ -5706,6 +5706,8 @@ extern int main()
     total++; passed += testConstStringLiterals() ? 1 : 0;
     total++; passed += testConstWholeWord() ? 1 : 0;
     total++; passed += testConstTrailing() ? 1 : 0;
+    total++; passed += testStringDataMut() ? 1 : 0;
+    total++; passed += testConstFunctionType() ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -8789,5 +8791,84 @@ bool testConstTrailing()
     result &= Test("const_trailing_iface_alias", c08TViaAlias(viaInferred), 14);
     C08TIfaceHolder holder = { r = viaMarked };
     result &= Test("const_trailing_iface_field", c08TViaHolder(holder), 70);
+    return result;
+}
+
+// string data() is (const char)*; data_mut() copies a borrowed string into an owned buffer
+// first, so a write never reaches a literal or a wrapped char* buffer.
+struct C15StrHolder { string f = default; int n = 0; };
+
+bool testStringDataMut()
+{
+    bool result = true;
+    string s = "x";
+    s.data_mut()[0] = 'y';
+    result &= Test("data_mut_literal_written", (int)s.data()[0], (int)'y');
+    string t = "x";
+    result &= Test("data_mut_literal_untouched", (int)t.data()[0] + (int)"x"[0], 2 * (int)'x');
+    result &= Test("data_mut_borrowed_now_owned", ((s._len & (i32)0x80000000) != 0 ? 1 : 0) + s.length(), 2);
+    char[4] raw = "abc";
+    string wrap = &raw[0];
+    wrap.data_mut()[0] = 'Z';
+    result &= Test("data_mut_wrap_copies", (int)wrap.data()[0] * 1000 + (int)raw[0], (int)'Z' * 1000 + (int)'a');
+    string owned = "abc".copy();
+    (const char)* before = owned.data();
+    char* w = owned.data_mut();
+    w[1] = 'X';
+    result &= Test("data_mut_owned_in_place", (before == owned.data() ? 1 : 0) + (owned == "aXc" ? 2 : 0), 3);
+    string empty = default;
+    char* e = empty.data_mut();
+    result &= Test("data_mut_default_empty", (int)e[0] + empty.length() + (e != nullptr ? 1 : 0), 1);
+    C15StrHolder h = default;
+    h.f = "lit";
+    h.f.data_mut()[0] = 'F';
+    result &= Test("data_mut_field", h.f == "Fit" ? 1 : 0, 1);
+    string moved = move s;
+    result &= Test("data_mut_then_move", (int)moved.data()[0], (int)'y');
+    return result;
+}
+
+// Function types carry pointee const (ruled 2026-10-19): `(const T)*` params and returns resolve in
+// function<> / Lambda<>, a function name binds with its declared consts, and the type is exact.
+int c14TLen(const char* s) { int n = 0; while (s[n] != 0) n++; return n; }
+int c14TPoke(char* s) { s[0] = 'X'; return 100; }
+(const char)* c14TName() { return "name"; }
+int c14TApply(function<int((const char)*)> f, (const char)* s) { return f(s) * 10; }
+int c14TApplyT<T>(function<int(T)> f, T v) { return f(v) + 1000; }
+int c14TPick(function<int(char*)> f) { return 10; }
+int c14TPick(function<int((const char)*)> f) { return 20; }
+
+bool testConstFunctionType()
+{
+    bool result = true;
+    function<int((const char)*)> f = c14TLen;
+    function<int(TcCStr)> viaAlias = c14TLen;
+    function<int(const(char)*)> viaConstCall = c14TLen;
+    function<int(char*)> g = c14TPoke;
+    function<(const char)*()> h = c14TName;
+    Lambda<int((const char)*)> lam = ((const char)* s) => c14TLen(s) + 1;
+    Lambda<(const char)*()> lamName = () => "lit";
+    result &= Test("const_fntype_param", f("abc"), 3);
+    result &= Test("const_fntype_alias_param", viaAlias("ab"), 2);
+    result &= Test("const_fntype_const_call_spelling", viaConstCall("abcd"), 4);
+    char[4] buf = default;
+    buf[0] = 'a';
+    result &= Test("const_fntype_mutable_param", g(&buf[0]) + (int)buf[0], 188);
+    (const char)* name = h();
+    result &= Test("const_fntype_return", c14TLen(name) + (int)name[0], 114);
+    result &= Test("const_fntype_lambda_param", lam("x"), 2);
+    result &= Test("const_fntype_lambda_return", c14TLen(lamName()), 3);
+    result &= Test("const_fntype_named_arg", c14TApply(c14TLen, "xy"), 20);
+    result &= Test("const_fntype_value_arg", c14TApply(f, "xyz"), 30);
+    result &= Test("const_fntype_generic_arg", c14TApplyT<(const char)*>(f, "four"), 1004);
+    list<function<int((const char)*)>> fns = default;
+    fns.add(f);
+    fns.add(c14TLen);
+    result &= Test("const_fntype_list_element", fns[0]("hello") + fns[1]("hi") * 10, 25);
+    auto copied = f;
+    result &= Test("const_fntype_auto_copy", copied("seven!!"), 7);
+    // Overloads on a function-type parameter's pointee const pick the exact match (clang++ -std=c++20).
+    result &= Test("const_fntype_overload_value", c14TPick(g) * 100 + c14TPick(f), 1020);
+    result &= Test("const_fntype_overload_name", c14TPick(c14TPoke) * 100 + c14TPick(c14TLen), 1020);
     return result;
 }

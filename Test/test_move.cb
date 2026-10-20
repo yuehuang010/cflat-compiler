@@ -14550,6 +14550,9 @@ extern int main()
     passed += testT238MoveSinkLegs();
     total += 21;
 
+    passed += testC15DataMutHeap();
+    total += 2;
+
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -16184,5 +16187,40 @@ int testChainedRawShapes()
     }
     passed += Test("chain_decl_reset_frees_old_one", chainRawDtors, 2);
     chainRawDtors = 0;
+    return passed;
+}
+
+// string.data_mut() on a borrowed string takes an owned copy: the string that switched from
+// borrowed to owned is freed exactly once through move, copy, list and field teardown.
+struct C15MutHolder { string f = default; };
+
+int c15DataMutRound()
+{
+    string a = "lit";
+    a.data_mut()[0] = 'L';
+    string b = move a;
+    string c = b.copy();
+    c.data_mut()[1] = 'I';
+    list<string> l = default;
+    string e = "lst";
+    e.data_mut()[0] = 'E';
+    l.add(move e);
+    C15MutHolder* h = new C15MutHolder;
+    h->f = "fld";
+    h->f.data_mut()[0] = 'F';
+    int got = (b == "Lit" ? 1 : 0) + (c == "LIt" ? 2 : 0) + (l[0] == "Est" ? 4 : 0) + (h->f == "Fld" ? 8 : 0);
+    delete h;
+    return got;
+}
+
+int testC15DataMutHeap()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    i64 before = (i64)HeapAudit.reportLeaks();
+    int got = c15DataMutRound();
+    i64 after = (i64)HeapAudit.reportLeaks();
+    passed += Test("c15_data_mut_values", got, 15);
+    passed += Test("c15_data_mut_heap_delta", after - before, (i64)0);
     return passed;
 }

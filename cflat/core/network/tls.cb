@@ -25,10 +25,10 @@ if const (__MACOS__) {
     function<void*(void*, int, int)> __tlsCreateContext = default;
     function<int(void*, function<int(void*, i8*, u64*)>, function<int(void*, i8*, u64*)>)> __tlsSetIOFuncs = default;
     function<int(void*, void*)> __tlsSetConnection = default;
-    function<int(void*, char*, u64)> __tlsSetPeerDomainName = default;
+    function<int(void*, (const char)*, u64)> __tlsSetPeerDomainName = default;
     function<int(void*)> __tlsHandshake = default;
     function<int(void*, i8*, u64, u64*)> __tlsRead = default;
-    function<int(void*, i8*, u64, u64*)> __tlsWrite = default;
+    function<int(void*, (const void)*, u64, u64*)> __tlsWrite = default;
     function<int(void*)> __tlsClose = default;
     function<void(void*)> __tlsRelease = default;
 
@@ -71,10 +71,10 @@ if const (__MACOS__) {
         __tlsCreateContext = (function<void*(void*, int, int)>)dlsym(__tlsSecurity, "SSLCreateContext");
         __tlsSetIOFuncs = (function<int(void*, function<int(void*, i8*, u64*)>, function<int(void*, i8*, u64*)>)>)dlsym(__tlsSecurity, "SSLSetIOFuncs");
         __tlsSetConnection = (function<int(void*, void*)>)dlsym(__tlsSecurity, "SSLSetConnection");
-        __tlsSetPeerDomainName = (function<int(void*, char*, u64)>)dlsym(__tlsSecurity, "SSLSetPeerDomainName");
+        __tlsSetPeerDomainName = (function<int(void*, (const char)*, u64)>)dlsym(__tlsSecurity, "SSLSetPeerDomainName");
         __tlsHandshake = (function<int(void*)>)dlsym(__tlsSecurity, "SSLHandshake");
         __tlsRead = (function<int(void*, i8*, u64, u64*)>)dlsym(__tlsSecurity, "SSLRead");
-        __tlsWrite = (function<int(void*, i8*, u64, u64*)>)dlsym(__tlsSecurity, "SSLWrite");
+        __tlsWrite = (function<int(void*, (const void)*, u64, u64*)>)dlsym(__tlsSecurity, "SSLWrite");
         __tlsClose = (function<int(void*)>)dlsym(__tlsSecurity, "SSLClose");
         __tlsRelease = (function<void(void*)>)dlsym(__tlsCoreFoundation, "CFRelease");
         __tlsLoaded = __tlsCreateContext != nullptr && __tlsSetIOFuncs != nullptr
@@ -344,7 +344,7 @@ class TlsSocket
         if const (__MACOS__) {
             if (_context == nullptr) return -1;
             u64 written = 0;
-            int status = __tlsWrite(_context, (i8*)data, (u64)length, &written);
+            int status = __tlsWrite(_context, data, (u64)length, &written);
             return status == 0 ? (int)written : -1;
         }
         return -1;

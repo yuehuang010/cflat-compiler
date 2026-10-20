@@ -121,7 +121,7 @@ class JsonBuilder : IReflector
     {
         emitKey(name);
         sb.appendChar('"');
-        char* ptr = value.data();
+        (const char)* ptr = value.data();
         int len = value.length();
         int i = 0;
         while (i < len)
@@ -202,7 +202,7 @@ class JsonBuilder : IReflector
 
     // Parse JSON from a raw byte pointer + length. Avoids a string copy at the
     // call site - useful when the caller already holds an char* buffer.
-    static T fromJsonRaw<T>(char* data, int len)
+    static T fromJsonRaw<T>((const char)* data, int len)
     {
         Arena arena;
         arena.setBlockSize(4096);
@@ -446,7 +446,7 @@ class JsonNode : IJSON, IJSONArray
 // and the returned root must be deleted by the caller as before.
 struct JsonParser
 {
-    char*    _src   = nullptr;
+    (const char)* _src = nullptr;
     int    _pos   = 0;
     int    _len   = 0;
     Arena* _arena = nullptr;
@@ -503,7 +503,7 @@ struct JsonParser
     // reclaimed when the arena tears down); otherwise the result owns a heap buffer.
     // The `move` return keeps each parsed string in the same ownership domain as the
     // JsonNode field that consumes it - no orphan buffers, no double free.
-    move string _copyOut(char* src, int len)
+    move string _copyOut((const char)* src, int len)
     {
         char* buf = nullptr;
         if (_arena != nullptr) buf = (char*)_arena.alloc((i64)(len + 1));

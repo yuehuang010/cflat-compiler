@@ -212,7 +212,8 @@ and `u8` string literals.
 ```c
 string s = "hello";
 s.length();   // 5
-s.data();     // i8* - null-terminated bytes
+s.data();     // (const char)* - read-only, null-terminated bytes
+s.data_mut(); // char* - writable; a borrowed string (literal, char* wrap) is copied into an owned buffer first
 ```
 
 Concatenation with `operator+` - produces a freshly allocated buffer:
@@ -292,10 +293,12 @@ For your own types, implement `IString` (`string ToString()`); string interpolat
 **Coercion is one-way.** `char*` -> `string` is implicit everywhere - call arguments, `==`, `+`, declaration initializers - by wrapping the pointer in a non-owning `string` (the `_len` comes from `strlen`). `string` -> `char*` is *never* implicit; call `.data()` to hand a `string` to a C API. The asymmetry is intentional: an implicit outbound decay would silently hand off a borrow whose lifetime matters, exactly where it matters most (extern C calls).
 
 ```c
-extern void takesCStr(char* s);   // a C function
+extern void takesCStr(const char* s);   // a C function
 string s = "hello";
-takesCStr(s.data());              // explicit - the borrow is visible
+takesCStr(s.data());                    // explicit - the borrow is visible
 ```
+
+**`data()` is read-only; `data_mut()` writes.** `data()` returns `(const char)*`: a borrowed `string` may wrap a literal in read-only memory, so a write through it, or passing it to a `char*` parameter, is refused. `data_mut()` returns `char*`. On a borrowed string it first copies the bytes (length + NUL) into an owned buffer the string then owns (copy-on-write, like Rust `Cow::to_mut`); on an owned string it returns the existing buffer, so writes land in place. The literal itself is never touched: after `string s = "x"; s.data_mut()[0] = 'y';`, a later `"x"` still reads `"x"`. Call it on a local or a field, not on a by-value `string` parameter - a parameter is a borrow, and the copy it would take is not freed.
 
 **Wrapping a `char*` borrows; it does not copy.** `(string)charPtr` (and the implicit coercion) produce a non-owning `string` that aliases the original buffer - it is *not* freed when that `string` goes out of scope, and it must not outlive the buffer it points at. To take ownership of an independent copy, call `.copy()`:
 
@@ -668,6 +671,14 @@ Cell<(const int)*> c = { v = &n };   // legal: pointee const
 // *c.v = 2;                         // refused: reached through a pointer to const
 // list<const int> bad;              // refused: 'const' is not allowed on a generic type argument
 ```
+
+**Function types.** A `function<>` or `Lambda<>` parameter or return carries its pointee const
+(`function<int((const char)*)>`), and so does a C function pointer. Identity is exact, as in C:
+`function<int((const char)*)>` and `function<int(char*)>` are different types, and neither converts
+to the other (refused with the conversion-discards-const error). A function name binds with its
+declared parameter consts, so `int f(const char* s)` binds `function<int((const char)*)>` only.
+A call through the value returns the declared pointee const and checks its arguments against the
+declared parameters. C++ function types are not covered yet.
 
 **`is_assignable(T)`** is a compile-time intrinsic that is false when `T` is a CFlat struct holding
 a `const` field anywhere in its by-value layout. Core containers relocate elements by construction

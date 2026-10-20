@@ -774,8 +774,10 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
             int retStars = PointerDepthOf(fpSpec->pointer());
             ValidateConstAfterPointerStar(fpSpec->pointer(),
                 SpelledTypeNameBase(fpSpec->typeSpecifier(), fpSpec->multiWordTypeSuffix()));
-            tv.FuncPtrReturnTypeName = ResolveSigComponentCodegen(
-                fpSpec->typeSpecifier(), retPtr, fpSpec->multiWordTypeSuffix());
+            int retConst = 0;
+            tv.FuncPtrReturnTypeName = ResolveSigComponentConstCodegen(
+                fpSpec->typeSpecifier(), retPtr, retStars, retConst, fpSpec->multiWordTypeSuffix());
+            tv.FuncPtrReturnConstMask = retConst;
             tv.FuncPtrReturnPointer  = retPtr;
             if (auto* qualifier = fpSpec->functionReturnQualifier(); qualifier != nullptr)
             {
@@ -795,8 +797,10 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
                     int pStars = PointerDepthOf(param->pointer());
                     ValidateConstAfterPointerStar(param->pointer(),
                         SpelledTypeNameBase(param->typeSpecifier(), param->multiWordTypeSuffix()));
-                    p.TypeName = ResolveSigComponentCodegen(
-                        param->typeSpecifier(), pPtr, param->multiWordTypeSuffix());
+                    int pConst = 0;
+                    p.TypeName = ResolveSigComponentConstCodegen(
+                        param->typeSpecifier(), pPtr, pStars, pConst, param->multiWordTypeSuffix());
+                    p.ConstMask = pConst;
                     p.Pointer  = pPtr;
                     p.IsMove   = param->Move() != nullptr;
                     p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);

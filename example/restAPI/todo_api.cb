@@ -40,7 +40,7 @@ struct Todo {
     // free it here. `move` makes the ownership transfer out of the field explicit.
     ~Todo()
     {
-        if (title._ptr != nullptr) { char* p = move title._ptr; delete p; }
+        if (title._ptr != nullptr) { string released = move title; }
     }
 };
 
@@ -120,7 +120,7 @@ HttpResponse* listTodos(HttpRequest* req)
 
     string body = sb.toString();
     HttpResponse* r = HttpResponse.okJson(body);
-    if (body._ptr != nullptr) { char* p = move body._ptr; delete p; }
+    if (body._ptr != nullptr) { string released = move body; }
     return r;
 }
 
@@ -142,7 +142,7 @@ HttpResponse* createTodo(HttpRequest* req)
 
     HttpResponse* r = HttpResponse.okJson(j);
     r->setStatus(201, "Created");
-    if (j._ptr != nullptr) { char* p = move j._ptr; delete p; }
+    if (j._ptr != nullptr) { string released = move j; }
     return r;
 }
 
@@ -158,7 +158,7 @@ HttpResponse* getTodo(HttpRequest* req)
         {
             string j = _todoJson(g_todos.get(i));
             r = HttpResponse.okJson(j);
-            if (j._ptr != nullptr) { char* p = move j._ptr; delete p; }
+            if (j._ptr != nullptr) { string released = move j; }
         }
     }
     if (r == nullptr) r = HttpResponse.notFound();
@@ -180,14 +180,14 @@ HttpResponse* updateTodo(HttpRequest* req)
             Todo* t = g_todos.get(i);
             if (hasTitle)
             {
-                if (t->title._ptr != nullptr) { char* p = move t->title._ptr; delete p; }
+                if (t->title._ptr != nullptr) { string released = move t->title; }
                 t->title = input.title.copy();   // owned copy transfers to the field
             }
             t->done = input.done;
 
             string j = _todoJson(t);
             r = HttpResponse.okJson(j);
-            if (j._ptr != nullptr) { char* p = move j._ptr; delete p; }
+            if (j._ptr != nullptr) { string released = move j; }
         }
     }
     if (r == nullptr) r = HttpResponse.notFound();

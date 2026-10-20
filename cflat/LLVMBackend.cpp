@@ -7102,6 +7102,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
         if (s.FuncPtrReturnPointerDepth > 1)
             o["fprd"] = static_cast<int64_t>(s.FuncPtrReturnPointerDepth);
         if (!s.FuncPtrReturnResolvedKey.empty()) o["fprk"] = s.FuncPtrReturnResolvedKey;
+        if (s.FuncPtrReturnConstMask >= 0) o["fprc"] = static_cast<int64_t>(s.FuncPtrReturnConstMask);
         llvm::json::Array fps;
         for (const auto& p : s.FuncPtrParams)
         {
@@ -7118,6 +7119,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
             if (p.IsPointeeConst) po["pc"] = true;
             if (p.PointerDepth > 1) po["pd"] = static_cast<int64_t>(p.PointerDepth);
             if (!p.ResolvedTypeKey.empty()) po["rk"] = p.ResolvedTypeKey;
+            if (p.ConstMask >= 0) po["cm"] = static_cast<int64_t>(p.ConstMask);
             fps.push_back(std::move(po));
         }
         o["fpp"] = std::move(fps);
@@ -7196,6 +7198,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
         if (s.FuncPtrReturnPointer) s.FuncPtrReturnPointerDepth = 1;
         if (auto v = o.getInteger("fprd")) s.FuncPtrReturnPointerDepth = static_cast<int>(*v);
         if (auto v = o.getString("fprk")) s.FuncPtrReturnResolvedKey = v->str();
+        if (auto v = o.getInteger("fprc")) s.FuncPtrReturnConstMask = static_cast<int>(*v);
         if (auto* fps = o.getArray("fpp"))
             for (auto& elem : *fps)
                 if (auto* po = elem.getAsObject())
@@ -7214,6 +7217,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
                     if (p.Pointer) p.PointerDepth = 1;
                     if (auto v = po->getInteger("pd")) p.PointerDepth = static_cast<int>(*v);
                     if (auto v = po->getString("rk")) p.ResolvedTypeKey = v->str();
+                    if (auto v = po->getInteger("cm")) p.ConstMask = static_cast<int>(*v);
                     s.FuncPtrParams.push_back(std::move(p));
                 }
     }
@@ -7625,8 +7629,8 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     // than silently reused (v6 includes the LSP core-variable replay state; v8 is the non-pointer
     // `alias T` parameter reference ABI; v11 adds closure capture-cleanup MOVE mode 2; v12 adds
     // const floating global admission names; v13 stores function origin metadata; v16 adds
-    // const interface methods).
-    root["version"]   = 16;
+    // const interface methods; v17 function-type pointee const masks).
+    root["version"]   = 17;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
 #if defined(__APPLE__)
@@ -8114,7 +8118,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 16) return false;
+    if (!ver || *ver != 17) return false;
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != coreHash) return false;
 #if defined(__APPLE__)

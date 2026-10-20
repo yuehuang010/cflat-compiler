@@ -547,6 +547,8 @@ void LLVMBackend::RegisterBuiltinString()
         ptrField.TypeName = "char";
         ptrField.VariableName = "_ptr";
         ptrField.Pointer = true;
+        // `(const char)*`: a borrowed string may wrap a literal; data_mut() copies before writing.
+        ptrField.ConstMask = 1;
 
         DeclTypeAndValue lenField;
         lenField.TypeName = "i32";

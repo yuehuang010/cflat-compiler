@@ -3181,6 +3181,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                             ParameterQualification(candidate, *candidateParamItr), from, to,
                             ParameterHasExactLevels(candidate, *candidateParamItr)))
                         constDiscardNotViable = true;
+                    // Function types whose recorded pointee consts differ are distinct (no conversion).
+                    if (FuncPtrPointeeConstDiffers(FuncPtrValueSignature(arg), *candidateParamItr, from, to))
+                        constDiscardNotViable = true;
                 }
                 // `long*` vs the same-width `iN*` is accepted but never perfect, so an exactly
                 // spelled overload (f(long*) vs f(i64*)) still wins.
@@ -6845,6 +6848,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             "cannot take a mutable pointer to '{}': it is declared const", bound->Name));
                 const TypeAndValue target = ParameterQualification(candidate, param);
                 std::string from, to;
+                // A function-type parameter: its pointee consts must match exactly (no conversion).
+                if (FuncPtrPointeeConstDiffers(FuncPtrValueSignature(arg), param, from, to))
+                    LogError(std::format(
+                        "cannot pass argument {} ('{}') to parameter '{}' ('{}'): the conversion "
+                        "discards const", candidate.IsMethod ? argIndex : argIndex + 1, from,
+                        param.VariableName, to));
                 // `&L` of a whole const object is #16; an array decaying to its element pointer is #6.
                 const auto root = passed != nullptr && !arrayDecay ? FindConstObjectRoot(passed) : std::nullopt;
                 if (ConversionDiscardsConst(passed,

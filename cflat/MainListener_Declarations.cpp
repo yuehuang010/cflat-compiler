@@ -978,6 +978,32 @@ std::string MainListener::ResolveSigComponentCodegen(
         return name;
     }
 
+std::string MainListener::ResolveSigComponentConstCodegen(
+    CFlatParser::TypeSpecifierContext* ts, bool& outPointer, int& stars, int& constMask,
+    CFlatParser::MultiWordTypeSuffixContext* suffix) {
+        constMask = 0;
+        if (ts != nullptr && ts->typeName() != nullptr)
+        {
+            auto nested = ParseTypeName(ts->typeName(), true, ts);
+            nested.ApplyWholeWordConst();
+            stars += nested.ValuePointerDepth();
+            outPointer = stars > 0;
+            constMask = PointeeConstOfComponent(nested.ConstMask, stars);
+            return nested.TypeName;
+        }
+        std::string name = ResolveSigComponentCodegen(ts, outPointer, suffix);
+        int depth = ReconcilePointerDepth(outPointer, stars);
+        // A pointer alias (`using CStr = (const char)*`) brings its own levels and their const.
+        std::string aliased = Compiler()->ResolveTypeAlias(name);
+        int aliasStars = 0;
+        while (aliasStars < (int)aliased.size() && aliased[aliased.size() - 1 - aliasStars] == '*') ++aliasStars;
+        int mask = Compiler()->ResolveTypeAliasConstMask(name);
+        if (int substituted = SubstitutedConstDepth(ts, suffix); substituted > 0)
+            mask |= (1 << std::min(substituted, 7)) - 1;
+        constMask = PointeeConstOfComponent(mask, depth + aliasStars);
+        return name;
+    }
+
 std::string MainListener::SigComponentResolvedKey(const std::string& name) {
         return Compiler()->FuncPtrComponentDeclaringKey(name);
     }
@@ -1043,8 +1069,10 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
         int retStars = PointerDepthOf(fpSpec->pointer());
         ValidateConstAfterPointerStar(fpSpec->pointer(),
             SpelledTypeNameBase(fpSpec->typeSpecifier(), fpSpec->multiWordTypeSuffix()));
-        std::string retName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr,
-                                                         fpSpec->multiWordTypeSuffix());
+        int retConst = 0;
+        std::string retName = ResolveSigComponentConstCodegen(fpSpec->typeSpecifier(), retPtr,
+                                                              retStars, retConst, fpSpec->multiWordTypeSuffix());
+        sig.FuncPtrReturnConstMask = retConst;
         // A signature component over the cap can never be matched: no function may declare a
         // 3-star return or parameter, so the closure type would be unpopulatable.
         if (retStars > PointerDepthCap)
@@ -1070,8 +1098,9 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
                 int pStars = PointerDepthOf(param->pointer());
                 ValidateConstAfterPointerStar(param->pointer(),
                     SpelledTypeNameBase(param->typeSpecifier(), param->multiWordTypeSuffix()));
-                std::string pName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr,
-                                                               param->multiWordTypeSuffix());
+                int pConst = 0;
+                std::string pName = ResolveSigComponentConstCodegen(param->typeSpecifier(), pPtr,
+                                                                    pStars, pConst, param->multiWordTypeSuffix());
                 if (pStars > PointerDepthCap)
                     LogErrorContext(param, PointerDepthCapMessage(
                         std::format("function type parameter '{}'", pName), pStars));
@@ -1081,10 +1110,13 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
                 fp.TypeName = pName; fp.Pointer = pPtr; fp.IsMove = param->Move() != nullptr;
                 fp.PointerDepth = pDepth;
                 fp.ResolvedTypeKey = SigComponentResolvedKey(pName);
+                fp.ConstMask = pConst;
                 sig.FuncPtrParams.push_back(fp);
             }
+        std::vector<int> paramConsts;
+        for (const auto& fp : sig.FuncPtrParams) paramConsts.push_back(fp.ConstMask);
         std::string encoded = BuildEncodedClosureName(Compiler(), isThin, retName,
-            sig.FuncPtrReturnPointerDepth, encParams);
+            sig.FuncPtrReturnPointerDepth, encParams, sig.FuncPtrReturnConstMask, &paramConsts);
         Compiler(fpSpec)->RegisterEncodedClosureType(encoded, sig);
         return encoded;
     }
@@ -1127,10 +1159,15 @@ std::string MainListener::EncodePlainFunctionTypeCodegen(
 
 std::string MainListener::EncodeClosureFromSig(LLVMBackend* compiler, const LLVMBackend::TypeAndValue& sig) {
         std::vector<std::pair<std::string, int>> params;
+        std::vector<int> paramConsts;
         for (const auto& p : sig.FuncPtrParams)
+        {
             params.push_back({ p.TypeName, ReconcilePointerDepth(p.Pointer, p.PointerDepth) });
+            paramConsts.push_back(p.ConstMask);
+        }
         std::string encoded = BuildEncodedClosureName(compiler, sig.IsThinFnPtr(), sig.FuncPtrReturnTypeName,
-            ReconcilePointerDepth(sig.FuncPtrReturnPointer, sig.FuncPtrReturnPointerDepth), params);
+            ReconcilePointerDepth(sig.FuncPtrReturnPointer, sig.FuncPtrReturnPointerDepth), params,
+            sig.FuncPtrReturnConstMask, &paramConsts);
         compiler->RegisterEncodedClosureType(encoded, sig);
         return encoded;
     }
@@ -1396,8 +1433,10 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         int retStars = PointerDepthOf(fpSpec->pointer());
                         ValidateConstAfterPointerStar(fpSpec->pointer(),
                             SpelledTypeNameBase(fpSpec->typeSpecifier(), fpSpec->multiWordTypeSuffix()));
-                        declType.FuncPtrReturnTypeName = ResolveSigComponentCodegen(
-                            fpSpec->typeSpecifier(), retPtr, fpSpec->multiWordTypeSuffix());
+                        int retConst = 0;
+                        declType.FuncPtrReturnTypeName = ResolveSigComponentConstCodegen(
+                            fpSpec->typeSpecifier(), retPtr, retStars, retConst, fpSpec->multiWordTypeSuffix());
+                        declType.FuncPtrReturnConstMask = retConst;
                         if (auto* qualifier = fpSpec->functionReturnQualifier(); qualifier != nullptr)
                         {
                             std::string text = qualifier->getText();
@@ -1424,8 +1463,10 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                 int pStars = PointerDepthOf(param->pointer());
                                 ValidateConstAfterPointerStar(param->pointer(),
                                     SpelledTypeNameBase(param->typeSpecifier(), param->multiWordTypeSuffix()));
-                                p.TypeName = ResolveSigComponentCodegen(
-                                    param->typeSpecifier(), pPtr, param->multiWordTypeSuffix());
+                                int pConst = 0;
+                                p.TypeName = ResolveSigComponentConstCodegen(
+                                    param->typeSpecifier(), pPtr, pStars, pConst, param->multiWordTypeSuffix());
+                                p.ConstMask = pConst;
                                 LLVMBackend::TypeAndValue pType;
                                 pType.TypeName = p.TypeName;
                                 pType.Pointer = pPtr;
@@ -1634,6 +1675,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     declType.FuncPtrVariadic    = fit->FuncPtrVariadic;
                     declType.FuncPtrNoPrototype = fit->FuncPtrNoPrototype;
                     declType.FuncPtrReturnPointerDepth = fit->FuncPtrReturnPointerDepth;
+                    declType.FuncPtrReturnConstMask = fit->FuncPtrReturnConstMask;
                     declType.FuncPtrParams         = fit->FuncPtrParams;
                     const int functionPtrDepth = PointerDepthOf(declSpecWithSuffix->pointer());
                     declType.Pointer               = functionPtrDepth > 0;
@@ -9187,6 +9229,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     typeAndValue.FuncPtrVariadic = inferred.FuncPtrVariadic;
                                     typeAndValue.FuncPtrNoPrototype = inferred.FuncPtrNoPrototype;
                                     typeAndValue.FuncPtrReturnPointerDepth = inferred.FuncPtrReturnPointerDepth;
+                                    typeAndValue.FuncPtrReturnConstMask = inferred.FuncPtrReturnConstMask;
                                     typeAndValue.FuncPtrReturnResolvedKey = inferred.FuncPtrReturnResolvedKey;
                                     typeAndValue.FuncPtrParams = inferred.FuncPtrParams;
                                 }
@@ -9222,6 +9265,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         typeAndValue.FuncPtrVariadic = boundSig.FuncPtrVariadic;
                                     }
                                     VerifyFuncPtrAssignmentMoveFlags(funcName, declaredFuncSlotSig, assignmentExpression);
+                                    LLVMBackend::NamedVariable boundValue;
+                                    boundValue.Primary = fn;
+                                    if (std::string constWhy = compiler->DescribeFuncPtrConstMismatch(
+                                            declaredFuncSlotSig, boundValue); !constWhy.empty())
+                                        LogErrorContext(assignmentExpression, constWhy);
                                     // thin `function<T>`: bare fn ptr; fat `Lambda<T>`: closure fat struct.
                                     right = declaredFuncSlotSig.IsThinFnPtr()
                                           ? compiler->MakeThinFnPtrValue(fn, declaredFuncSlotSig)
@@ -9340,6 +9388,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 if (std::string why = compiler->DescribeFuncPtrValueMismatch(
                                         declaredFuncSlotSig, initializerSourceNV); !why.empty())
                                     LogErrorContext(assignmentExpression, why);
+                                else if (std::string constWhy = compiler->DescribeFuncPtrConstMismatch(
+                                        declaredFuncSlotSig, initializerSourceNV); !constWhy.empty())
+                                    LogErrorContext(assignmentExpression, constWhy);
                             }
                             // The declared spelling carries no INFERRED sink, so adopt the
                             // initializer's - otherwise the call site never nulls the caller.
@@ -9877,6 +9928,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     typeAndValue.FuncPtrReturnOwned = srcThinFnPtr->FuncPtrReturnOwned;
                     typeAndValue.FuncPtrReturnAlias = srcThinFnPtr->FuncPtrReturnAlias;
                     typeAndValue.FuncPtrReturnPointerDepth = srcThinFnPtr->FuncPtrReturnPointerDepth;
+                    typeAndValue.FuncPtrReturnConstMask = srcThinFnPtr->FuncPtrReturnConstMask;
                     typeAndValue.FuncPtrReturnResolvedKey = srcThinFnPtr->FuncPtrReturnResolvedKey;
                     typeAndValue.FuncPtrVariadic = srcThinFnPtr->FuncPtrVariadic;
                     typeAndValue.FuncPtrNoPrototype = srcThinFnPtr->FuncPtrNoPrototype;
@@ -9894,6 +9946,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     typeAndValue.FuncPtrReturnOwned = srcClosureFnPtr->FuncPtrReturnOwned;
                     typeAndValue.FuncPtrReturnAlias = srcClosureFnPtr->FuncPtrReturnAlias;
                     typeAndValue.FuncPtrReturnPointerDepth = srcClosureFnPtr->FuncPtrReturnPointerDepth;
+                    typeAndValue.FuncPtrReturnConstMask = srcClosureFnPtr->FuncPtrReturnConstMask;
                     typeAndValue.FuncPtrReturnResolvedKey = srcClosureFnPtr->FuncPtrReturnResolvedKey;
                     typeAndValue.FuncPtrVariadic = srcClosureFnPtr->FuncPtrVariadic;
                     typeAndValue.FuncPtrNoPrototype = srcClosureFnPtr->FuncPtrNoPrototype;

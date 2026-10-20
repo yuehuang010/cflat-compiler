@@ -484,6 +484,9 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
         tv.FuncPtrReturnAlias = chosen->ReturnType.IsAlias;
         tv.FuncPtrVariadic = chosen->Variadic;
         tv.FuncPtrReturnPointerDepth = chosen->ReturnType.ValuePointerDepth();
+        // Pointee const is part of the function type; a C++ function's stays unrecorded (phase 5).
+        if (!chosen->IsCxx)
+            tv.FuncPtrReturnConstMask = chosen->ReturnType.PointeeConstMask();
         for (const auto& p : chosen->Parameters)
         {
             TypeAndValue::FuncPtrParam fp;
@@ -497,11 +500,21 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
             fp.IsReturnInferredSink = p.IsReturnInferredSink;
             fp.IsWriteInferredSink = p.IsWriteInferredSink;
             fp.PointerDepth = p.ValuePointerDepth();
+            if (!chosen->IsCxx) fp.ConstMask = p.PointeeConstMask();
             fp.IsPointeeConst = p.IsSpelledPointeeConst
                 || (chosen->IsCxx && p.IsCxxPointeeConst);
             tv.FuncPtrParams.push_back(fp);
         }
         return tv;
+    }
+
+// A call through a function value returns its type's pointee const (`function<(const char)*()>`).
+void LLVMBackend::ApplyFuncPtrReturnConst(const TypeAndValue& funcPtrType, TypeAndValue& retTV)
+{
+        if (!funcPtrType.FuncPtrReturnPointer || funcPtrType.FuncPtrReturnConstMask <= 0) return;
+        retTV.PointerDepth = std::max(funcPtrType.FuncPtrReturnPointerDepth, 1);
+        retTV.ElemPointer = retTV.PointerDepth >= 2;
+        retTV.ConstMask = static_cast<uint8_t>(funcPtrType.FuncPtrReturnConstMask);
     }
 
 void LLVMBackend::CheckIndirectCallArgShape(llvm::Value* arg, llvm::Type* destTy, size_t index,
@@ -562,8 +575,8 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         lastCxxRetValue_ = nullptr;
         lastLoweredRetTemp_ = nullptr;
         lastLoweredRetValue_ = nullptr;
-        // #6 through a function value. Its parameter types spell no pointee const, except the
-        // C-origin flag (then every level is read-only).
+        // #6 through a function value: its recorded parameter pointee const, else the interop
+        // flag (then every level is read-only).
         for (size_t i = 0; i < args.size() && i < funcPtrType.FuncPtrParams.size(); ++i)
         {
             const auto& param = funcPtrType.FuncPtrParams[i];
@@ -573,7 +586,9 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             target.Pointer = true;
             target.PointerDepth = param.PointerDepth > 0 ? param.PointerDepth : 1;
             target.ElemPointer = target.PointerDepth >= 2;
-            if (param.IsPointeeConst)
+            if (param.ConstMask >= 0)
+                target.ConstMask = static_cast<uint8_t>(param.ConstMask);
+            else if (param.IsPointeeConst)
                 target.ConstMask = static_cast<uint8_t>((1u << target.ValuePointerDepth()) - 1u);
             const TypeAndValue source = argNVs != nullptr && i < argNVs->size()
                 ? (*argNVs)[i].TypeAndValue : TypeAndValue{};
@@ -694,6 +709,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             retTV.Pointer  = funcPtrType.FuncPtrReturnPointer;
             retTV.IsMove   = funcPtrType.FuncPtrReturnOwned;
             retTV.IsAlias  = funcPtrType.FuncPtrReturnAlias;
+            ApplyFuncPtrReturnConst(funcPtrType, retTV);
             auto cxxSret = prepareCxxSret(retTV);
             const bool cxxSretReturn = cxxSret.first != nullptr;
             AbiRecipe cxxSretRecipe = cxxIndirectRecipe;
@@ -904,6 +920,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         retTV.Pointer  = funcPtrType.FuncPtrReturnPointer;
         retTV.IsMove   = funcPtrType.FuncPtrReturnOwned;
         retTV.IsAlias  = funcPtrType.FuncPtrReturnAlias;
+        ApplyFuncPtrReturnConst(funcPtrType, retTV);
         auto cxxSret = prepareCxxSret(retTV);
         const bool cxxSretReturn = cxxSret.first != nullptr;
         AbiRecipe cxxSretRecipe = cxxIndirectRecipe;

@@ -1,0 +1,88 @@
+// Function types carry pointee const with exact-match identity (ruled 2026-10-19): a function type
+// whose return or parameter pointee const differs is a different type, and there is no qualification
+// conversion between the two in either direction (clang -std=c17 and -std=c++20 refuse the same).
+using C14ECStr = (const char)*;
+int c14eLen(const char* s) { return 1; }
+int c14ePoke(char* s) { s[0] = 'X'; return 7; }
+(const char)* c14eName() { return "name"; }
+char* c14eMutName() { return nullptr; }
+int c14eTakeC(function<int((const char)*)> f) { return f("abcd"); }
+int c14eTakeM(function<int(char*)> f) { return 0; }
+int c14eApplyT<T>(function<int(T)> f, T v) { return f(v); }
+
+expect_error("cannot return 'function<int((const char)*)>' as 'function<int(char*)>': the conversion discards const") {
+    function<int(char*)> c14eRetM(function<int((const char)*)> f) { return f; }
+}
+
+expect_error("cannot return '(const char)*' as 'char*': the conversion discards const") {
+    Lambda<char*()> c14eRetLambda() { return () => "lit"; }
+}
+
+expect_error("cannot convert 'Lambda<int(char*)>' to 'Lambda<int((const char)*)>': the conversion discards const") {
+    void c14eLambdaParam() { Lambda<int((const char)*)> l = (char* s) => 1; }
+}
+
+expect_error("cannot convert 'Lambda<int((const char)*)>' to 'Lambda<int(char*)>': the conversion discards const") {
+    void c14eLambdaParamConst() { Lambda<int(char*)> l = ((const char)* s) => 1; }
+}
+
+extern int main()
+{
+    function<int((const char)*)> f = c14eLen;
+    function<int(char*)> g = c14ePoke;
+    function<(const char)*()> h = c14eName;
+    expect_error("cannot convert 'function<int(char*)>' to 'function<int((const char)*)>': the conversion discards const") {
+        function<int((const char)*)> x = g;
+    }
+    expect_error("cannot convert 'function<int((const char)*)>' to 'function<int(char*)>': the conversion discards const") {
+        function<int(char*)> x = f;
+    }
+    expect_error("cannot convert 'function<int(char*)>' to 'function<int((const char)*)>': the conversion discards const") {
+        f = g;
+    }
+    expect_error("cannot convert 'function<int((const char)*)>' to 'function<int(char*)>': the conversion discards const") {
+        g = f;
+    }
+    // A function NAME binds with its declared parameter and return consts.
+    expect_error("cannot convert 'function<int((const char)*)>' to 'function<int(char*)>': the conversion discards const") {
+        function<int(char*)> x = c14eLen;
+    }
+    expect_error("cannot convert 'function<int(char*)>' to 'function<int(C14ECStr)>': the conversion discards const") {
+        function<int(C14ECStr)> x = c14ePoke;
+    }
+    expect_error("cannot convert 'function<(const char)*()>' to 'function<char*()>': the conversion discards const") {
+        function<char*()> x = c14eName;
+    }
+    expect_error("cannot convert 'function<char*()>' to 'function<(const char)*()>': the conversion discards const") {
+        function<(const char)*()> x = c14eMutName;
+    }
+    expect_error("cannot convert 'function<int((const char)*)>' to 'Lambda<int(char*)>': the conversion discards const") {
+        Lambda<int(char*)> x = c14eLen;
+    }
+    expect_error("cannot pass argument 1 ('function<int(char*)>') to parameter 'f' ('function<int((const char)*)>'): the conversion discards const") {
+        int r = c14eTakeC(g);
+    }
+    expect_error("cannot pass argument 1 ('function<int((const char)*)>') to parameter 'f' ('function<int(char*)>'): the conversion discards const") {
+        int r = c14eTakeM(f);
+    }
+    expect_error("cannot pass argument 1 ('function<int(char*)>') to parameter 'f' ('function<int((const char)*)>'): the conversion discards const") {
+        int r = c14eTakeC(c14ePoke);
+    }
+    expect_error("cannot pass argument 1 ('function<int((const char)*)>') to parameter 'f' ('function<int(char*)>'): the conversion discards const") {
+        int r = c14eTakeM(c14eLen);
+    }
+    expect_error("cannot pass argument 1 ('function<int((const char)*)>') to parameter 'f' ('function<int(char*)>'): the conversion discards const") {
+        int r = c14eApplyT<char*>(f, nullptr);
+    }
+    // Calls through a function value: its return keeps the pointee const, its params check args.
+    expect_error("cannot convert '(const char)*' to 'char*': the conversion discards const") {
+        char* p = h();
+    }
+    expect_error("cannot assign to 'h()[0]': it is reached through a pointer to const ('h()')") {
+        h()[0] = 'z';
+    }
+    expect_error("cannot pass argument 1 ('(const char)*') to parameter '1' ('char*'): the conversion discards const") {
+        int r = g("lit");
+    }
+    return 0;
+}

@@ -9,13 +9,13 @@ struct TypedPointerOwner
 {
     string text = default;
     int item = 0;
-    char* textPointer = nullptr;
+    (const char)* textPointer = nullptr;
     int** itemPointer = nullptr;
     int*[2] pointers = default;
 };
 struct TypedPointerSink
 {
-    char* textPointer = nullptr;
+    (const char)* textPointer = nullptr;
     int** itemPointer = nullptr;
     int* pointer = nullptr;
 };

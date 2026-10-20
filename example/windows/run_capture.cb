@@ -83,7 +83,8 @@ extern int main(int argc, char** argv)
     PROCESS_INFORMATION pi = default;
 
     // bInheritHandles = TRUE so the child inherits hWrite (and the std handles).
-    if (CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr, 1,
+    // CreateProcessA may write lpCommandLine, so it gets the mutable buffer.
+    if (CreateProcessA(nullptr, cmdline.data_mut(), nullptr, nullptr, 1,
                        0u, nullptr, nullptr, &si, &pi) == 0) {
         printf("CreateProcessA failed (error %u)\n", GetLastError());
         CloseHandle(hRead);

@@ -1180,6 +1180,9 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
         sig.FuncPtrReturnAlias = sym.ReturnType.IsAlias;
         sig.FuncPtrVariadic = sym.Variadic;
         sig.FuncPtrReturnPointerDepth = sym.ReturnType.ValuePointerDepth();
+        // Pointee const is part of the function type; a C++ function's stays unrecorded (phase 5).
+        if (!sym.IsCxx)
+            sig.FuncPtrReturnConstMask = sym.ReturnType.PointeeConstMask();
         for (const auto& p : sym.Parameters)
         {
             TypeAndValue::FuncPtrParam fp;
@@ -1194,6 +1197,7 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
             fp.IsReturnInferredSink = p.IsReturnInferredSink;
             fp.IsWriteInferredSink = p.IsWriteInferredSink;
             fp.PointerDepth = p.ValuePointerDepth();
+            if (!sym.IsCxx) fp.ConstMask = p.PointeeConstMask();
             // A C++ member's mapped pointee const is recorded only as IsCxxPointeeConst.
             fp.IsPointeeConst = p.IsSpelledPointeeConst || (sym.IsCxx && p.IsCxxPointeeConst);
             sig.FuncPtrParams.push_back(fp);
@@ -1257,23 +1261,78 @@ std::string LLVMBackend::FuncPtrSpellingOf(const LLVMBackend::TypeAndValue& tv) 
             if (const auto* encoded = GetEncodedClosureType(signature.TypeName))
                 signature = *encoded;
         // One '*' per recorded level, so a depth mismatch is visible as `int**` vs `int*` rather
-        // than as two identical-looking spellings.
-        TypeAndValue returnType;
-        returnType.TypeName = signature.FuncPtrReturnTypeName;
-        returnType.Pointer = signature.FuncPtrReturnPointer;
-        returnType.PointerDepth = signature.FuncPtrReturnPointerDepth;
-        std::string s = SpellType(*this, returnType) + "(";
+        // than as two identical-looking spellings; recorded pointee const prints whole-word.
+        auto component = [&](const std::string& name, bool pointer, int depth, int constMask) {
+            TypeAndValue type;
+            type.TypeName = name;
+            type.Pointer = pointer;
+            type.PointerDepth = depth;
+            if (pointer && constMask > 0)
+            {
+                type.PointerDepth = std::max(depth, 1);
+                type.ElemPointer = type.PointerDepth >= 2;
+                type.ConstMask = static_cast<uint8_t>(constMask);
+                return SpellTypeForSymbolDump(*this, type);
+            }
+            return SpellType(*this, type);
+        };
+        std::string s = component(signature.FuncPtrReturnTypeName, signature.FuncPtrReturnPointer,
+            signature.FuncPtrReturnPointerDepth, signature.FuncPtrReturnConstMask) + "(";
         for (size_t i = 0; i < signature.FuncPtrParams.size(); i++)
         {
             if (i > 0) s += ", ";
-            TypeAndValue parameterType;
-            parameterType.TypeName = signature.FuncPtrParams[i].TypeName;
-            parameterType.Pointer = signature.FuncPtrParams[i].Pointer;
-            parameterType.PointerDepth = signature.FuncPtrParams[i].PointerDepth;
-            s += SpellType(*this, parameterType);
+            const auto& p = signature.FuncPtrParams[i];
+            s += component(p.TypeName, p.Pointer, p.PointerDepth, p.ConstMask);
         }
         if (signature.FuncPtrVariadic) s += signature.FuncPtrParams.empty() ? "..." : ", ...";
         return s + ")";
+    }
+
+bool LLVMBackend::FuncPtrPointeeConstDiffers(const TypeAndValue& value, const TypeAndValue& slot,
+        std::string& valueSpelled, std::string& slotSpelled) const
+{
+        TypeAndValue source = value, target = slot;
+        if (source.FuncPtrReturnTypeName.empty() && !source.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(source.TypeName))
+                source = *encoded;
+        if (target.FuncPtrReturnTypeName.empty() && !target.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(target.TypeName))
+                target = *encoded;
+        if (source.FuncPtrReturnTypeName.empty() || target.FuncPtrReturnTypeName.empty()
+            || !target.IsFunctionPointer)
+            return false;
+        auto differ = [](int a, int b) { return a >= 0 && b >= 0 && a != b; };
+        // A by-value component records 0; a pointer alias component (`CStr`) records its alias's levels.
+        bool differs = differ(source.FuncPtrReturnConstMask, target.FuncPtrReturnConstMask);
+        // The shared prefix: an arity difference is the bind rule's business.
+        for (size_t i = 0; i < source.FuncPtrParams.size() && i < target.FuncPtrParams.size(); i++)
+            differs = differs || differ(source.FuncPtrParams[i].ConstMask, target.FuncPtrParams[i].ConstMask);
+        if (!differs) return false;
+        auto family = [](const TypeAndValue& t) {
+            return std::string(t.IsFunctionPointer && !t.IsThinFnPtr() ? "Lambda" : "function");
+        };
+        valueSpelled = family(source) + "<" + FuncPtrSpellingOf(source) + ">";
+        slotSpelled = family(target) + "<" + FuncPtrSpellingOf(target) + ">";
+        return true;
+    }
+
+LLVMBackend::TypeAndValue LLVMBackend::FuncPtrValueSignature(const NamedVariable& value) const
+{
+        if (auto* fn = llvm::dyn_cast_or_null<llvm::Function>(value.Primary))
+            if (const auto* symbol = FindSymbolForFunction(fn))
+                return FuncPtrSigOfSymbol(*symbol);
+        return value.TypeAndValue;
+    }
+
+std::string LLVMBackend::DescribeFuncPtrConstMismatch(const TypeAndValue& slot, const NamedVariable& value,
+        FuncPtrConstRole role) const
+{
+        std::string from, to;
+        if (!FuncPtrPointeeConstDiffers(FuncPtrValueSignature(value), slot, from, to)) return "";
+        if (role == FuncPtrConstRole::Return)
+            return std::format("cannot return '{}' as '{}': the conversion discards const", from, to);
+        return std::format("cannot convert '{}' to '{}': the conversion discards const. "
+            "Use an explicit cast if the object is really writable", from, to);
     }
 
 // Variadic-ness is a signature fact: C never converts between `R(*)(P, ...)` and `R(*)(P)`.

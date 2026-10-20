@@ -47,6 +47,14 @@ extern int main()
         auto lit = "auto";
         lit[0] = 'A';
     }
+    expect_error("it is reached through a pointer to const") {
+        string ds = "y";
+        ds.data()[0] = 'z';
+    }
+    expect_error("cannot pass argument 1 ('(const char)*') to parameter 's' ('char*'): the conversion discards const") {
+        string dp = "w";
+        c06Write(dp.data());
+    }
     char[4] copy = "abc";
     copy[0] = 'X';
     string text = "fine";

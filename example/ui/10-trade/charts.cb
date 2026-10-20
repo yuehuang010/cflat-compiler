@@ -132,7 +132,7 @@ int chParamInt(string params, string key, int fallback)
     if (at < 0) return fallback;
     int start = (int)at + key.length() + 1;
     int n = params.length();
-    char* d = params.data();
+    (const char)* d = params.data();
     int end = start;
     while (end < n)
     {

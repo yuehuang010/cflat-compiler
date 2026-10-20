@@ -964,6 +964,9 @@ public:
          * a rejection - a type not yet registered when the walk runs simply records nothing.
          */
         std::string FuncPtrReturnResolvedKey;
+        // Pointee const of the return (FuncPtrParam::ConstMask for a parameter), bottom-relative like
+        // ConstMask, top level excluded. -1 = NOT RECORDED (C++, WinRT): it proves no difference.
+        int FuncPtrReturnConstMask = -1;
         struct FuncPtrParam
         {
             std::string TypeName;
@@ -980,6 +983,7 @@ public:
             bool IsPointeeConst = false;  // spelled `const T*`; see IsSpelledPointeeConst
             int PointerDepth = 0;   // 0 = not recorded; see FuncPtrReturnPointerDepth
             std::string ResolvedTypeKey;  // "" = not recorded; see FuncPtrReturnResolvedKey
+            int ConstMask = -1;     // -1 = not recorded; see FuncPtrReturnConstMask
         };
         std::vector<FuncPtrParam> FuncPtrParams;
 
@@ -1189,6 +1193,15 @@ public:
             return ((ConstMask >> depth) & 1u) != 0;
         }
 
+        // The pointee levels of ConstMask (top level dropped), as a function-type component keeps
+        // them. A view's elements are not modelled in a function type, so it records none.
+        int PointeeConstMask() const
+        {
+            const int depth = ValuePointerDepth();
+            if (IsArrayView || depth <= 0) return 0;
+            return ConstMask & ((1 << depth) - 1);
+        }
+
         // A plain `T**` value, proven either by the ElemPointer bit or by a recorded depth >= 2
         // (which is how an inline `&x` over a `T*` proves itself). Both readings hold only when
         // nothing else on the type claims depth for an ELEMENT (array/view/simd) or a fat shape.
@@ -1333,6 +1346,7 @@ public:
         bool FuncPtrNoPrototype = false;
         int FuncPtrReturnPointerDepth = 0;
         std::string FuncPtrReturnResolvedKey;
+        int FuncPtrReturnConstMask = -1;
         struct FuncPtrParam
         {
             std::string TypeName;
@@ -1347,6 +1361,7 @@ public:
             bool IsPointeeConst = false;
             int PointerDepth = 0;
             std::string ResolvedTypeKey;
+            int ConstMask = -1;
         };
         std::vector<FuncPtrParam> FuncPtrParams;
         uint64_t ConstArraySize = 0;
@@ -1409,6 +1424,7 @@ public:
             s.FuncPtrNoPrototype = t.FuncPtrNoPrototype;
             s.FuncPtrReturnPointerDepth = t.FuncPtrReturnPointerDepth;
             s.FuncPtrReturnResolvedKey = t.FuncPtrReturnResolvedKey;
+            s.FuncPtrReturnConstMask = t.FuncPtrReturnConstMask;
             for (const auto& p : t.FuncPtrParams)
             {
                 FuncPtrParam q;
@@ -1424,6 +1440,7 @@ public:
                 q.IsPointeeConst = p.IsPointeeConst;
                 q.PointerDepth = p.PointerDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
+                q.ConstMask = p.ConstMask;
                 s.FuncPtrParams.push_back(std::move(q));
             }
             s.ConstArraySize = t.ConstArraySize;
@@ -1486,6 +1503,7 @@ public:
             t.FuncPtrNoPrototype = FuncPtrNoPrototype;
             t.FuncPtrReturnPointerDepth = FuncPtrReturnPointerDepth;
             t.FuncPtrReturnResolvedKey = FuncPtrReturnResolvedKey;
+            t.FuncPtrReturnConstMask = FuncPtrReturnConstMask;
             for (const auto& p : FuncPtrParams)
             {
                 TypeAndValue::FuncPtrParam q;
@@ -1501,6 +1519,7 @@ public:
                 q.IsPointeeConst = p.IsPointeeConst;
                 q.PointerDepth = p.PointerDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
+                q.ConstMask = p.ConstMask;
                 t.FuncPtrParams.push_back(std::move(q));
             }
             t.ConstArraySize = ConstArraySize;
@@ -10893,6 +10912,7 @@ public:
 
     // The function-pointer signature of ONE registered overload.
     TypeAndValue FuncPtrSigOfSymbol(const FunctionSymbol& sym) const;
+    static void ApplyFuncPtrReturnConst(const TypeAndValue& funcPtrType, TypeAndValue& retTV);
 
     // Expand a function-pointer signature into its return and ordinary parameter descriptors.
     void UnpackFuncPtrSignature(const TypeAndValue& fpTV, TypeAndValue& ret,
@@ -10930,6 +10950,20 @@ public:
 
     // Source-shaped rendering of a function-pointer signature, for diagnostics: `double(double)`.
     std::string FuncPtrSpellingOf(const LLVMBackend::TypeAndValue& tv) const;
+
+    /*
+     * Function types carry pointee const with exact-match identity (ruled 2026-10-19): true when
+     * `value` cannot enter `slot` because a return or parameter pointee const differs where both
+     * record it (-1 = unrecorded proves nothing). Fills both function-type spellings.
+     */
+    bool FuncPtrPointeeConstDiffers(const TypeAndValue& value, const TypeAndValue& slot,
+        std::string& valueSpelled, std::string& slotSpelled) const;
+    // The signature a function-pointer VALUE carries: a named function's own, else its type's.
+    TypeAndValue FuncPtrValueSignature(const NamedVariable& value) const;
+    enum class FuncPtrConstRole { Convert, Return };
+    // #5 (or #7 for a return) when `value` differs from `slot` only in pointee const; else empty.
+    std::string DescribeFuncPtrConstMismatch(const TypeAndValue& slot, const NamedVariable& value,
+        FuncPtrConstRole role = FuncPtrConstRole::Convert) const;
 
     // WHICH component of two signatures differs, as a diagnostic tail. Empty when nothing is
     // provably different. Shared, so the argument-site and bind-site messages cannot drift apart.
@@ -12820,7 +12854,8 @@ public:
     // 264: C++ fields retain explicit constness for mutable-ancestry write checks (T335 r2).
     // 266: C globals, field top-level const and C results carry ConstMask (const item 10).
     // 267: C header signatures retain result pointee record identity and anonymous typedef layout.
-    static constexpr int kCHeaderCacheVersion = 267;
+    // 268: C function-pointer results and parameters carry pointee ConstMask.
+    static constexpr int kCHeaderCacheVersion = 268;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

@@ -2163,6 +2163,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
             if (s.FuncPtrVariadic) j["fpv"] = true;
             if (s.FuncPtrReturnPointerDepth > 1) j["fprd"] = s.FuncPtrReturnPointerDepth;
             if (!s.FuncPtrReturnResolvedKey.empty()) j["fprk"] = s.FuncPtrReturnResolvedKey;
+            if (s.FuncPtrReturnConstMask >= 0) j["fprc"] = s.FuncPtrReturnConstMask;
             nlohmann::json fps = nlohmann::json::array();
             for (const auto& p : s.FuncPtrParams)
             {
@@ -2179,6 +2180,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
                 if (p.IsPointeeConst) pj["pc"] = true;
                 if (p.PointerDepth > 1) pj["pd"] = p.PointerDepth;
                 if (!p.ResolvedTypeKey.empty()) pj["rk"] = p.ResolvedTypeKey;
+                if (p.ConstMask >= 0) pj["cm"] = p.ConstMask;
                 fps.push_back(pj);
             }
             j["fpp"] = fps;
@@ -2242,6 +2244,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
             s.FuncPtrVariadic = j.value("fpv", false);
             s.FuncPtrReturnPointerDepth = j.value("fprd", s.FuncPtrReturnPointerDepth);
             s.FuncPtrReturnResolvedKey = j.value("fprk", std::string{});
+            s.FuncPtrReturnConstMask = j.value("fprc", -1);
             if (j.contains("fpp"))
                 for (const auto& pj : j["fpp"])
                 {
@@ -2258,6 +2261,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
                     p.IsPointeeConst = pj.value("pc", false);
                     p.PointerDepth = pj.value("pd", p.PointerDepth);
                     p.ResolvedTypeKey = pj.value("rk", std::string{});
+                    p.ConstMask = pj.value("cm", -1);
                     s.FuncPtrParams.push_back(std::move(p));
                 }
         }

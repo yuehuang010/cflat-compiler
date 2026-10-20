@@ -1114,6 +1114,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 if (std::string why = compiler->DescribeFuncPtrValueMismatch(
                         returnFnPtrTV, returnNV); !why.empty())
                     LogErrorContext(errCtx, why);
+                else if (std::string constWhy = compiler->DescribeFuncPtrConstMismatch(returnFnPtrTV,
+                        returnNV, LLVMBackend::FuncPtrConstRole::Return); !constWhy.empty())
+                    LogErrorContext(errCtx, constWhy);
             }
             // [immovable] C++ record: C++17 elision builds a fresh prvalue in the sret slot, so only a place
             // operand (variable, field, element, deref) is refused; a fresh one stays legal.

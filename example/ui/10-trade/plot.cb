@@ -545,7 +545,7 @@ class Plot
         {
             scale = 1;
         }
-        char* d = s.data();
+        (const char)* d = s.data();
         int i = 0;
         while (i < s.length())
         {

@@ -19,7 +19,7 @@ import "string.cb";
 
 // Windows: kernel32 UTF-8 <-> UTF-16 transcoding. CodePage 65001 = CP_UTF8.
 // (Declared on all platforms but only called on the Windows path below.)
-extern stdcall i32 MultiByteToWideChar(u32 codePage, u32 flags, char* mbStr, i32 mbBytes, u16* wideStr, i32 wideChars);
+extern stdcall i32 MultiByteToWideChar(u32 codePage, u32 flags, (const char)* mbStr, i32 mbBytes, u16* wideStr, i32 wideChars);
 extern stdcall i32 WideCharToMultiByte(u32 codePage, u32 flags, u16* wideStr, i32 wideChars, char* mbStr, i32 mbBytes, char* defaultChar, i32* usedDefault);
 
 // POSIX has no OS transcoder, so do the UTF-8 <-> UTF-16 conversion by hand
@@ -72,7 +72,7 @@ i32 _wstr_w2m(u16* src, i32 len, char* dst) {
 }
 
 // UTF-8 bytes -> UTF-16 code units. Returns the code-unit count.
-i32 _wstr_m2w(char* src, i32 len, u16* dst) {
+i32 _wstr_m2w((const char)* src, i32 len, u16* dst) {
     i32 out = 0;
     i32 i   = 0;
     while (i < len) {

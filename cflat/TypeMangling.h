@@ -78,4 +78,5 @@ std::string SpellFunctionSymbol(const LLVMBackend& compiler, std::string_view sy
 
 std::string MangleClosureType(const LLVMBackend& compiler, bool isThin,
                               const std::string& ret, int retDepth,
-                              const std::vector<std::pair<std::string, int>>& params);
+                              const std::vector<std::pair<std::string, int>>& params,
+                              int retConstMask = -1, const std::vector<int>* paramConstMasks = nullptr);

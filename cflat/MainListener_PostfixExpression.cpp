@@ -4014,6 +4014,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     ctxTv.FuncPtrReturnTypeName = declExpectedType.TypeName;
                                     ctxTv.FuncPtrReturnPointer  = declExpectedType.Pointer;
                                     ctxTv.FuncPtrReturnPointerDepth = declExpectedType.ValuePointerDepth();
+                                    ctxTv.FuncPtrReturnConstMask = declExpectedType.PointeeConstMask();
                                     // A `unique` destination is an owning LOCATION; the return
                                     // spelling that fills it is `move`, so both map to Owned.
                                     ctxTv.FuncPtrReturnOwned    = declExpectedType.IsMove
@@ -7160,6 +7161,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 callArgumentPostfix.Flush();
                                 auto result = Compiler(ctx)->CreateIndirectCall(
                                     funcPtrTV, funcPtr, callArgs, &argNVs, &rawArrayCounts);
+                                // The result keeps the function type's return pointee const.
+                                if (result != nullptr && result->getType()->isPointerTy()
+                                    && Compiler(ctx)->lastCallReturnType.ConstMask != 0)
+                                    result = Compiler(ctx)->MarkCastQualification(result,
+                                        Compiler(ctx)->lastCallReturnType, functionName + "()");
                                 Compiler(ctx)->unwindCallConsumedTemps_.clear();
                                 Compiler(ctx)->lastCallReturnsOwned = funcPtrTV.FuncPtrReturnOwned;
                                 if (result != nullptr && funcPtrTV.FuncPtrReturnOwned)
@@ -10641,6 +10647,18 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                     p.TypeName = ResolveMemberTypeSpecifier(memberType);
                 p.TypeName = compiler->ResolveTypeAlias(p.TypeName);
                 p.Pointer = param->pointer() != nullptr;
+                // `((const char)* s) => ...`: the whole-word wrapper keeps its pointee const.
+                if (auto* nested = param->typeSpecifier()->typeName(); nested != nullptr)
+                {
+                    auto inner = ParseTypeName(nested, true, param);
+                    inner.ApplyWholeWordConst();
+                    const int stars = inner.ValuePointerDepth() + PointerDepthOf(param->pointer());
+                    p.TypeName = inner.TypeName;
+                    p.Pointer = stars > 0;
+                    p.PointerDepth = stars;
+                    p.ElemPointer = stars >= 2;
+                    p.ConstMask = inner.ConstMask;
+                }
                 // `(move T p) => ...` - the literal's half of the `Lambda<void(move T)>` spelling.
                 p.IsMove = param->Move() != nullptr;
                 p.IsInterface = compiler->IsInterfaceType(p.TypeName);
@@ -10678,6 +10696,13 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         returnType.Pointer = lambdaExpectedType.FuncPtrReturnPointer;
         returnType.IsMove = lambdaExpectedType.FuncPtrReturnOwned;
         returnType.IsAlias = lambdaExpectedType.FuncPtrReturnAlias;
+        // The slot's pointee const on the return binds the body's `return` (#7).
+        if (returnType.Pointer && lambdaExpectedType.FuncPtrReturnConstMask > 0)
+        {
+            returnType.PointerDepth = std::max(lambdaExpectedType.FuncPtrReturnPointerDepth, 1);
+            returnType.ElemPointer = returnType.PointerDepth >= 2;
+            returnType.ConstMask = static_cast<uint8_t>(lambdaExpectedType.FuncPtrReturnConstMask);
+        }
         // An EMPTY expected return type means no context supplied one (e.g. an immediately-invoked
         // literal). "void" is a fallback, not a declaration, and the two must not be confused: a
         // declared void discards its expression body, an inferred one cannot.
@@ -11141,12 +11166,14 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         tv.FuncPtrReturnOwned = returnType.IsMove;
         tv.FuncPtrReturnAlias = returnType.IsAlias;
         tv.FuncPtrReturnPointerDepth = returnType.ValuePointerDepth();
+        tv.FuncPtrReturnConstMask = returnType.PointeeConstMask();
         for (const auto& p : params)
         {
             LLVMBackend::TypeAndValue::FuncPtrParam fp;
             fp.TypeName = p.TypeName;
             fp.Pointer  = p.Pointer;
             fp.PointerDepth = p.ValuePointerDepth();
+            fp.ConstMask = p.PointeeConstMask();
             // Carry the inferred sink onto the TYPE so the indirect call site can null the
             // caller's source; a declared Lambda<...> spelling never sets these.
             fp.IsOwningSink = p.IsOwningSink;

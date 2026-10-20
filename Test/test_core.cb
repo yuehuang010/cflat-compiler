@@ -1741,8 +1741,8 @@ struct OwnedRet {
     string b = default;
     ~OwnedRet() {
         g_owned_ret_dtor++;
-        if (a._ptr != nullptr) { char* p = move a._ptr; delete p; }
-        if (b._ptr != nullptr) { char* p = move b._ptr; delete p; }
+        if (a._ptr != nullptr) { string released = move a; }
+        if (b._ptr != nullptr) { string released = move b; }
     }
 };
 

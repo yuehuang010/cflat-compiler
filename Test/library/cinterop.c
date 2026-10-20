@@ -309,3 +309,11 @@ int c03KCSlotRead(int* const* p) { return **p; }
 typedef const char* C06_PCSTR;
 struct C06Names { const char* direct; C06_PCSTR alias; char* mutable_name; };
 int c06NamesSecond(const struct C06Names* n) { return n->direct[1] * 1000 + n->alias[1]; }
+/* c14: C function pointers keep their result and parameter pointee const. */
+static const char* c14Rev(void) { return "rev"; }
+static int c14Take(const char* s) { return s[0]; }
+const char* (*c14RevFp)(void) = c14Rev;
+C14RevFn c14RevTd = c14Rev;
+int (*c14TakeFp)(const char* s) = c14Take;
+struct C14Ops c14Ops = { c14Rev, c14Take };
+int c14CallTake(int (*f)(const char*), const char* s) { return f(s) + 1; }

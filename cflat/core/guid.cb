@@ -63,7 +63,7 @@ struct Guid
     static Guid parse(string s)
     {
         Guid g = default;
-        char* p = s.data();
+        (const char)* p = s.data();
         i32 len = s.length();
 
         // Accumulate the 32 textual nibbles into 16 raw bytes (text byte order).

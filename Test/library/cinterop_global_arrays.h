@@ -43,3 +43,12 @@ union C13U { int x; int y; };
 union C13U* c13UnionResult(void);
 struct C13Opaque;
 struct C13Opaque* c13OpaqueResult(void);
+
+/* c14: C function pointers keep their result and parameter pointee const. */
+typedef const char* (*C14RevFn)(void);
+extern const char* (*c14RevFp)(void);
+extern C14RevFn c14RevTd;
+extern int (*c14TakeFp)(const char* s);
+struct C14Ops { const char* (*name)(void); int (*take)(const char* s); };
+extern struct C14Ops c14Ops;
+int c14CallTake(int (*f)(const char*), const char* s);

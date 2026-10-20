@@ -113,8 +113,8 @@ struct JsonDoc {
     list<string> tags = default;
     int    year   = 0;
     ~JsonDoc() {
-        if (title._ptr  != nullptr) { char* p = move title._ptr;  delete p; }
-        if (author._ptr != nullptr) { char* p = move author._ptr; delete p; }
+        if (title._ptr  != nullptr) { string released = move title;  }
+        if (author._ptr != nullptr) { string released = move author; }
     }
 };
 

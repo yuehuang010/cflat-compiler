@@ -181,7 +181,7 @@ struct TBBUTTONA
     u8 fsStyle = 0;
     u16 reserved = 0;
     u64 dwData = 0u;
-    char* iString = nullptr;
+    (const char)* iString = nullptr;
 };
 
 // Status bar (msctls_statusbar32) messages.
