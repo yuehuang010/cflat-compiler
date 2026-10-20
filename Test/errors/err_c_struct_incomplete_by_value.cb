@@ -1,17 +1,15 @@
-// A C-imported record the extractor still has to abandon registers as an unsized
-// opaque shell. Declaring one by value must be a clean diagnostic, not an LLVM
-// module-verification failure.
+// A C-imported record without a layout registers as an unsized opaque shell. Declaring one
+// by value must be a clean diagnostic, not an LLVM module-verification failure.
 //
-// SERVICE_CUSTOM_SYSTEM_STATE_CHANGE_DATA_ITEM (winsvc.h) embeds, by value, an anonymous union
-// whose 'CustomStateId' member (SERVICE_TRIGGER_CUSTOM_STATE_ID) the C interop extractor cannot
-// map, so the union stays unsized and the enclosing record is abandoned - exactly the
-// incomplete-layout path this test guards. (Earlier targets now import fine: the
-// RETRIEVAL_POINTERS_BUFFER.Extents[1] array-of-unnamed-struct case - see Test/test_windows.cb -
-// and userCLIPFORMAT, whose nested MIDL union lays out since records are ordered nested-first.)
+// _PROC_THREAD_ATTRIBUTE_LIST (winbase.h) is only ever forward-declared, so it stays unsized -
+// exactly the incomplete-layout path this test guards. (Earlier targets now import fine:
+// SERVICE_CUSTOM_SYSTEM_STATE_CHANGE_DATA_ITEM, whose anonymous typedef'd union member lays out
+// since anonymous typedef records are emitted; RETRIEVAL_POINTERS_BUFFER.Extents[1] - see
+// Test/test_windows.cb - and userCLIPFORMAT, laid out since records are ordered nested-first.)
 import "windows.h";
 
 extern int main()
 {
     expect_error("is incomplete here (its layout is not available at this point)");
-    SERVICE_CUSTOM_SYSTEM_STATE_CHANGE_DATA_ITEM rec = default;
+    _PROC_THREAD_ATTRIBUTE_LIST rec = default;
 }

@@ -309,6 +309,9 @@ extern int main(int argc, char** argv)
     rpb.Extents[0].Lcn.QuadPart = 0x00000000DEADBEEF;
     total++; passed += Test("RETRIEVAL_POINTERS_BUFFER.Extents[0].Lcn.LowPart (transparent overlay)",
                             (u32)rpb.Extents[0].Lcn.LowPart == 0xDEADBEEFu, true);
+    // winsvc.h: a union whose member is an anonymous typedef'd struct; clang sizeof = 8.
+    total++; passed += Test("sizeof(SERVICE_CUSTOM_SYSTEM_STATE_CHANGE_DATA_ITEM)",
+                            (int)sizeof(SERVICE_CUSTOM_SYSTEM_STATE_CHANGE_DATA_ITEM), 8);
 
     // Bitfields inside C11 anonymous members (PROCESS_MITIGATION_ASLR_POLICY, winnt.h):
     //   union { DWORD Flags; struct { DWORD EnableBottomUpRandomization:1; ...; DWORD ReservedFlags:28; }; }

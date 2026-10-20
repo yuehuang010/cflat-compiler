@@ -21812,6 +21812,14 @@ bool LLVMBackend::TryInsertCBitfieldLayoutPadding(const CRecordEntry& r,
             out.push_back(fields[i]);
             at += static_cast<uint64_t>(dl.getTypeAllocSize(ft));
         }
+        // MS ABI keeps a packed record's last bitfield unit at its declared size; pad to clang's size.
+        if (r.isPacked && r.sizeBytes > at)
+        {
+            DeclTypeAndValue pad;
+            pad.TypeName = "u8";
+            pad.ConstArraySize = r.sizeBytes - at;
+            out.push_back(std::move(pad));
+        }
         for (auto& bf : bitfields)
         {
             const unsigned oldIndex = bf.StorageFieldIndex;
