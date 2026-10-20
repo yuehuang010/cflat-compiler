@@ -4607,7 +4607,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                             ifacePtr = compiler->CreateAlloca(fatTy);
                             compiler->CreateAssignment(collNV.Primary, ifacePtr);
                         }
-                        countVal = compiler->CallInterfaceMethod(ifacePtr, collNV.TypeAndValue.TypeName, "count", {});
+                        countVal = compiler->CallInterfaceMethod(ifacePtr, collNV.TypeAndValue.TypeName, "count", {},
+                            nullptr, &collNV);
                     }
                     else
                     {
@@ -4703,7 +4704,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     }
                     else if (isFaceType)
                     {
-                        elemVal = compiler->CallInterfaceMethod(ifacePtr, collNV.TypeAndValue.TypeName, "get", { indexNV });
+                        elemVal = compiler->CallInterfaceMethod(ifacePtr, collNV.TypeAndValue.TypeName, "get", { indexNV },
+                            nullptr, &collNV);
                         if (compiler->lastCallReturnType.IsAlias
                             && !compiler->lastCallReturnType.Pointer && elemVal != nullptr)
                         {

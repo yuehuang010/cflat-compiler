@@ -3842,7 +3842,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         {
                             setResult = compiler->CallInterfaceMethod(
                                 range->interfaceStorage, range->collection.TypeAndValue.TypeName,
-                                "set", { indexNV, rightNV });
+                                "set", { indexNV, rightNV }, nullptr, &range->collection);
                         }
                         else
                         {

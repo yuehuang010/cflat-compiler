@@ -4525,6 +4525,8 @@ namespace cflat_cinterop
                     const RecordDecl* rd = rt->getDecl();
                     t.isAnonymousRecord = (rd->isStruct() || rd->isUnion()) && !rd->getIdentifier()
                                        && rd->getTypedefNameForAnonDecl() == td;
+                    if (t.isAnonymousRecord && st.req.requireInScope && !st.req.cxxMode)
+                        EmitDefinedRecord(const_cast<RecordDecl*>(rd), name);
                 }
                 FillTypedefUnderlying(u, t);
                 st.out.typedefs.push_back(std::move(t));

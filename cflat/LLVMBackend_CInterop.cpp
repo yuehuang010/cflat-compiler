@@ -4122,6 +4122,36 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
             if (verbose) std::cout << std::format("[verbose]   skipping '{}': unsupported return type '{}'\n", r.name, r.retType);
             return r.isCxx;
         }
+        if (!r.isCxx && e.ret.Pointer && !e.ret.IsFunctionPointer
+            && e.ret.TypeName == "void" && e.ret.ValuePointerDepth() == 1)
+        {
+            std::unordered_set<std::string> seenTypedefs;
+            std::function<std::string(const std::string&)> cRecordPointee =
+                [&](const std::string& spelling) -> std::string {
+                int ptrLevels = 0;
+                const std::string tag = AggregatePointeeTag(spelling, ptrLevels);
+                if (ptrLevels == 1)
+                    if (auto record = dataStructures.find(tag); record != dataStructures.end()
+                        && record->second.StructType != nullptr && !record->second.StructType->isOpaque())
+                        return tag;
+
+                std::string base = spelling;
+                for (const char* word : { "const", "volatile", "restrict", "__restrict",
+                                           "__restrict__", "_Nonnull", "_Nullable",
+                                           "_Null_unspecified" })
+                    EraseDeclaratorToken(base, word);
+                base.erase(std::remove(base.begin(), base.end(), '*'), base.end());
+                size_t first = base.find_first_not_of(" \t");
+                size_t last = base.find_last_not_of(" \t");
+                if (first == std::string::npos) return {};
+                base = base.substr(first, last - first + 1);
+                auto alias = cTypedefMap_.find(base);
+                if (alias == cTypedefMap_.end() || !seenTypedefs.insert(base).second) return {};
+                return cRecordPointee(alias->second + std::string(ptrLevels, '*'));
+            };
+            const std::string tag = cRecordPointee(r.retType);
+            if (!tag.empty()) e.ret.TypeName = tag;
+        }
         if (r.isCxx && e.ret.IsFunctionPointer && e.ret.Pointer
             && (e.ret.IsAlias || e.ret.IsRvalueRef))
         {
@@ -5547,9 +5577,48 @@ void LLVMBackend::PruneRecordsToNeededClosure(cflat_cinterop::ExtractResult& raw
             needed[it->second] = true;
             work.push_back(it->second);
         };
+        std::function<std::string(const std::string&, std::unordered_set<std::string>&)> resultRecordTag =
+            [&](const std::string& spelling, std::unordered_set<std::string>& seen) -> std::string {
+            int pointerDepth = 0;
+            const std::string tag = AggregatePointeeTag(spelling, pointerDepth);
+            if (pointerDepth != 1) return {};
+            if (!tag.empty()) return tag;
+            std::string base = spelling;
+            for (const char* word : { "const", "volatile", "restrict", "__restrict",
+                                       "__restrict__", "_Nonnull", "_Nullable",
+                                       "_Null_unspecified" })
+                EraseDeclaratorToken(base, word);
+            base.erase(std::remove(base.begin(), base.end(), '*'), base.end());
+            size_t first = base.find_first_not_of(" \t");
+            size_t last = base.find_last_not_of(" \t");
+            if (first == std::string::npos) return {};
+            base = base.substr(first, last - first + 1);
+            if (!seen.insert(base).second) return {};
+            auto alias = std::find_if(raw.typedefs.begin(), raw.typedefs.end(), [&](const auto& td) {
+                return td.name == base;
+            });
+            return alias == raw.typedefs.end() ? std::string()
+                : resultRecordTag(alias->underlying + "*", seen);
+        };
         for (const auto& sig : raw.sigs)
         {
             seed(sig.retType);
+            int resultPointerDepth = 0;
+            const std::string resultTag = AggregatePointeeTag(sig.retType, resultPointerDepth);
+            std::unordered_set<std::string> seenTypedefs;
+            // C results only: C++ record pointers bind through their own retyping path.
+            const std::string pointeeTag = resultPointerDepth == 1 && !sig.isCxx
+                ? (resultTag.empty() ? resultRecordTag(sig.retType, seenTypedefs) : resultTag)
+                : std::string();
+            if (!pointeeTag.empty())
+            {
+                auto it = byName.find(pointeeTag);
+                if (it != byName.end() && !needed[it->second])
+                {
+                    needed[it->second] = true;
+                    work.push_back(it->second);
+                }
+            }
             for (const auto& pt : sig.paramTypes) seed(pt);
         }
         for (const auto& g : raw.globals) seed(g.ctype);

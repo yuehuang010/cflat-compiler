@@ -1486,6 +1486,9 @@ extern int main()
     int c10 = c10ConstCResultLegs();
     if (c10 != 0) return c10;
 
+    int c13 = c13StructPointerResultLegs();
+    if (c13 != 0) return c13;
+
     return 0;
 }
 
@@ -1524,4 +1527,15 @@ int c10ConstCResultLegs()
     }
     auto c10A = t10Ip();
     return *c10A == 7 ? 0 : 16849;
+}
+
+int c13StructPointerResultLegs()
+{
+    auto p = c13PSResult();
+    auto t = c13TypedefPSResult();
+    auto a = c13AnonResult();
+    auto u = c13UnionResult();
+    auto o = c13OpaqueResult();
+    if (p.y != 7 || t.y != 7 || a.y != 8 || u.x != 5 || o != nullptr) return 16913;
+    return 0;
 }

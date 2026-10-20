@@ -1495,6 +1495,54 @@ bool testIsPointerIntrinsic()
     return result;
 }
 
+// is_const(T): const at T's own level, or at the pointee of a pointer T (const plan item 7).
+struct ConstChecker<T>
+{
+    int check() { return is_const(T); }
+};
+int isConstDeduced<T>(T x) { return is_const(T); }
+int isConstBranch<T>(T x) { if const (is_const(T)) return 7; else return 3; }
+using IsConstPcs = (const char)*;
+using IsConstCip = (const int)*;
+using IsConstWord = const char*;
+using IsConstCi = const int;
+
+bool testIsConstIntrinsic()
+{
+    bool result = true;
+    ConstChecker<int*>              mp = default;
+    ConstChecker<(const int)*>      cp = default;
+    ConstChecker<IsConstPcs>        cs = default;
+    ConstChecker<(const Employee)*> ce = default;
+    ConstChecker<Employee*>         me = default;
+    ConstChecker<int>               mi = default;
+    result &= Test("is_const int*",             mp.check(), 0);
+    result &= Test("is_const (const int)*",     cp.check(), 1);
+    result &= Test("is_const const char* alias", cs.check(), 1);
+    result &= Test("is_const (const Employee)*", ce.check(), 1);
+    result &= Test("is_const Employee*",        me.check(), 0);
+    result &= Test("is_const int",              mi.check(), 0);
+    int n = 1;
+    const int ci = 4;
+    (const int)* pc = &n;
+    const int* wc = &n;
+    int* pm = &n;
+    // Deduction strips top-level const only; pointee const is kept.
+    result &= Test("is_const deduced const int",   isConstDeduced(ci), 0);
+    result &= Test("is_const deduced (const int)*", isConstDeduced(pc), 1);
+    result &= Test("is_const deduced const int*",  isConstDeduced(wc), 1);
+    result &= Test("is_const deduced int*",        isConstDeduced(pm), 0);
+    result &= Test("is_const if const const ptr",  isConstBranch(pc), 7);
+    result &= Test("is_const if const mut ptr",    isConstBranch(pm), 3);
+    result &= Test("is_const if const const int",  isConstBranch(ci), 3);
+    // Outside a generic, on a concrete type name.
+    result &= Test("is_const concrete Employee",   is_const(Employee) ? 1 : 0, 0);
+    result &= Test("is_const concrete alias cip",  is_const(IsConstCip) ? 1 : 0, 1);
+    result &= Test("is_const concrete const word", is_const(IsConstWord) ? 1 : 0, 1);
+    result &= Test("is_const concrete const int",  is_const(IsConstCi) ? 1 : 0, 1);
+    return result;
+}
+
 struct IntrinsicMemberNames
 {
     bool is_string() { return true; }
@@ -5679,6 +5727,7 @@ extern int main()
     total++; passed += testMultiLayerGeneric()           ? 1 : 0;
     total++; passed += testMixedGenericFields()          ? 1 : 0;
     total++; passed += testIsPointerIntrinsic()          ? 1 : 0;
+    total++; passed += testIsConstIntrinsic()            ? 1 : 0;
     total++; passed += testIntrinsicMemberNames()        ? 1 : 0;
     total++; passed += testTemplateFunctions()           ? 1 : 0;
     total++; passed += testNewPrimitiveInitializers()    ? 1 : 0;

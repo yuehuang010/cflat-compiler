@@ -2872,6 +2872,7 @@ void LLVMBackend::RecordReceiverScanFacts(const std::string& uniqueName, Receive
 {
     if (uniqueName.empty()) return;
     readOnlyMethodMemo_.clear();
+    if (facts.File.empty()) facts.File = sourceFileName;
     receiverScanFacts_[uniqueName] = std::move(facts);
 }
 
@@ -3370,10 +3371,12 @@ bool LLVMBackend::ConstReceiverReason(const NamedVariable& self, std::string& ob
 }
 
 void LLVMBackend::RefuseConstReceiverMethodCall(const FunctionSymbol& method, const NamedVariable& self,
-                                                const std::string& functionName)
+                                                const std::string& functionName, const std::string& receiverText)
 {
     std::string object, reason;
     if (!ConstReceiverReason(self, object, reason)) return;
+    // The spelled receiver names an implicit-this field ('w') that the value itself cannot.
+    if (!receiverText.empty()) object = receiverText;
     const std::string member = method.SourceName.empty() ? functionName : method.SourceName;
     PendingConstReceiverCall entry;
     entry.Callee = method;
@@ -3403,6 +3406,14 @@ void LLVMBackend::RecordConstInterfaceImplementer(const FunctionSymbol& impl, co
     entry.File = sourceFileName;
     entry.Line = currentLine;
     entry.Column = currentColumn;
+    // The implementing method's own definition, not wherever the class walk stands (a generic
+    // interface instantiation leaves it at the interface template).
+    if (auto it = receiverScanFacts_.find(impl.UniqueName); it != receiverScanFacts_.end() && it->second.Line != 0)
+    {
+        if (!it->second.File.empty()) entry.File = it->second.File;
+        entry.Line = it->second.Line;
+        entry.Column = it->second.Column;
+    }
     if (!expectedError.empty() && expectedError != fileScopeExpectedError_) entry.Owner = activeExpectScope_;
     pendingConstReceiverCalls_.push_back(std::move(entry));
 }

@@ -4750,6 +4750,7 @@ void LLVMBackend::ResetForReanalysis()
     receiverBodiesEmitted_.clear();
     receiverBodyStack_.clear();
     pendingCallSite_ = nullptr;
+    pendingReceiverText_.clear();
     pendingConstReceiverCalls_.clear();
     deferredExpectations_.clear();
     activeExpectScope_ = 0;

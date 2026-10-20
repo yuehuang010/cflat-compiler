@@ -4899,7 +4899,10 @@ inline std::string RecordReceiverScan(LLVMBackend* compiler, CFlatParser::Functi
     const auto& self = allParams.front();
     if (!self.Pointer || self.VariableName != self.TypeName + "__" || returnType.external) return {};
     const std::string unique = compiler->ComputeMangledName(name, returnType, allParams, varargs);
-    compiler->RecordReceiverScanFacts(unique, ReceiverScan(allParams, eval).Run(func->compoundStatement()));
+    auto facts = ReceiverScan(allParams, eval).Run(func->compoundStatement());
+    facts.Line = func->getStart()->getLine();
+    facts.Column = func->getStart()->getCharPositionInLine();
+    compiler->RecordReceiverScanFacts(unique, std::move(facts));
     return unique;
 }
 

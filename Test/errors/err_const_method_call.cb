@@ -122,3 +122,20 @@ expect_error("cannot call non-const member 'Set' on 'this': it is reached throug
 {
     struct C08Self { int n = 0; void Set(int v) { n = v; } int Get() const { return n; } void Bad() const { Set(Get()); } };
 }
+// Internal interface dispatch is judged too: for-in over a const interface calls count/get, and
+// assigning the loop variable calls set.
+interface IC11Col { int count(); int get(int i) const; void set(int i, int v); };
+interface IC11Get { int count() const; int get(int i); };
+interface IC11Set { int count() const; int get(int i) const; void set(int i, int v); };
+expect_error("cannot call non-const member 'count' on 'c': it is declared const, so it is read-only and only a const member function may be called on it. 'IC11Col.count' is not declared const in the interface.")
+{
+    int c11ForCount(const IC11Col c) { int s = 0; for (int x in c) s += x; return s; }
+}
+expect_error("cannot call non-const member 'get' on 'c': it is declared const, so it is read-only and only a const member function may be called on it. 'IC11Get.get' is not declared const in the interface.")
+{
+    int c11ForGet(const IC11Get c) { int s = 0; for (int x in c) s += x; return s; }
+}
+expect_error("cannot call non-const member 'set' on 'c': it is declared const, so it is read-only and only a const member function may be called on it. 'IC11Set.set' is not declared const in the interface.")
+{
+    int c11ForSet(const IC11Set c) { for (int x in c) x = 0; return 0; }
+}

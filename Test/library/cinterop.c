@@ -290,6 +290,16 @@ struct T174Al16 t174_al_id(struct T174Al16 v) { v.x += 1; return v; }
 struct T174Big t174_big_bump(struct T174Big b) { b.v[0] += 1; return b; }
 long long t174_sh_ll(void) { return t174Sh.ll; }
 
+static struct C13PS c13PSValue = {3, 7};
+static C13Anon c13AnonValue = {4, 8};
+static union C13U c13UnionValue = {5};
+struct C13PS* c13PSResult(void) { return &c13PSValue; }
+const struct C13PS* c13ConstPSResult(void) { return &c13PSValue; }
+C13PSP c13TypedefPSResult(void) { return &c13PSValue; }
+C13Anon* c13AnonResult(void) { return &c13AnonValue; }
+union C13U* c13UnionResult(void) { return &c13UnionValue; }
+struct C13Opaque* c13OpaqueResult(void) { return 0; }
+
 /* c03: a C parameter keeps the const levels it spells (`const int **` is const at the int only). */
 int c03KCReadMulti(const int** p) { return **p; }
 int c03KCReadAll(const int* const* p) { return **p; }

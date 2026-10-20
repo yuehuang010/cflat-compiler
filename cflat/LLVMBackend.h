@@ -11943,6 +11943,10 @@ public:
     struct ReceiverScanFacts
     {
         std::string StructName;
+        // The method's definition site; #10 points at it (0 = unknown).
+        std::string File;
+        size_t Line = 0;
+        size_t Column = 0;
         struct Write { ReceiverPath Target; };
         std::vector<Write> Writes;
         // A member call on a receiver path (an implicit-this call has an IsThis receiver).
@@ -11994,7 +11998,7 @@ public:
     bool IsNativeReceiverMethod(const FunctionSymbol& method) const;
     // #8: refuse a call of a method that is not read-only on a const receiver.
     void RefuseConstReceiverMethodCall(const FunctionSymbol& method, const NamedVariable& self,
-                                       const std::string& functionName);
+                                       const std::string& functionName, const std::string& receiverText = {});
     // Why `self` is a const receiver (#8 object and reason); false when it is not one.
     bool ConstReceiverReason(const NamedVariable& self, std::string& object, std::string& reason) const;
     // #10: `impl` implements const interface method `ifaceName.member`; judged at module end.
@@ -12022,6 +12026,8 @@ public:
     std::vector<std::string> receiverBodyStack_;
     // Set by the postfix lowering right before the call it describes; taken at call entry.
     const void* pendingCallSite_ = nullptr;
+    // Receiver spelling of that call ("w", "this.w", "h.s"), naming the object in #8; same lifetime.
+    std::string pendingReceiverText_;
     void BeginReceiverBody(const std::string& uniqueName) { receiverBodyStack_.push_back(uniqueName); }
     void EndReceiverBody()
     {
@@ -12813,7 +12819,8 @@ public:
     // 263: C header cached signatures retain C no-prototype function-pointer state (T332 r2).
     // 264: C++ fields retain explicit constness for mutable-ancestry write checks (T335 r2).
     // 266: C globals, field top-level const and C results carry ConstMask (const item 10).
-    static constexpr int kCHeaderCacheVersion = 266;
+    // 267: C header signatures retain result pointee record identity and anonymous typedef layout.
+    static constexpr int kCHeaderCacheVersion = 267;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

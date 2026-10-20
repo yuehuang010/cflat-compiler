@@ -58,9 +58,18 @@ expect_error("cannot convert '(const int)*' to 'int*': the conversion discards c
 {
     struct C08R2 { int n = 0; int Grab() const { int* q = &n; return *q; } };
 }
-expect_error("cannot call non-const member 'Mutate' on 'this': it is reached through a pointer to const ('this')")
+expect_error("cannot call non-const member 'Mutate' on 'w': it is reached through a pointer to const ('this')")
 {
     struct C08R3 { C08W w; void Bad() const { w.Mutate(); } };
+}
+// #8 names the spelled field path, never the implicit `this` slot.
+expect_error("cannot call non-const member 'Mutate' on 'this.w': it is reached through a pointer to const ('this')")
+{
+    struct C11R5 { C08W w; void Bad() const { this.w.Mutate(); } };
+}
+expect_error("cannot call non-const member 'Mutate' on 'this.w': it is reached through a pointer to const ('this')")
+{
+    struct C11R6 { C08W w; void Bad() const { this->w.Mutate(); } };
 }
 
 // #15: no `this` to make const.

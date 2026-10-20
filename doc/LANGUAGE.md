@@ -675,6 +675,19 @@ and guard only in-place reassignment (`list<T>.sort()`), so `list<S>` works for 
 until an assigning method is called. It sits with `is_unique(T)` and
 `is_copyable(T)` under Generics.
 
+**`is_const(T)`** is a compile-time intrinsic, the const counterpart to `is_pointer(T)`. For a
+pointer `T` it answers for the pointee: `(const int)*` gives 1, `int*` gives 0. An array-view
+argument binds without its element const today (`Check<(const int)[]>` is the same instantiation
+as `Check<int[]>`), so it gives 0. For any other `T` it answers for `T` itself, which a generic argument never carries
+(`const` is refused there), so in a generic body only pointee const shows. Deduction strips
+top-level const first, so `f(c)` with `const int c` gives 0, while `f(cp)` with `(const int)* cp`
+gives 1. On a concrete type name outside a generic it gives the same answer
+(`using CS = const char*; is_const(CS)` is 1). Use it under `if const`:
+
+```c
+int pick<T>(T x) { if const (is_const(T)) return 7; else return 3; }
+```
+
 ---
 
 
@@ -3403,7 +3416,7 @@ Note: `program` remains required at the start of a managed-entry-point definitio
 
 **Reserved compiler intrinsics** (built-in pseudo-functions - cannot be redefined):
 
-`annotationof`, `construct_at`, `embed`, `expect_error`, `is_assignable`, `is_copyable`,
+`annotationof`, `construct_at`, `embed`, `expect_error`, `is_assignable`, `is_const`, `is_copyable`,
 `is_cpp_class`, `is_interface`, `is_pointer`, `is_primitive`, `is_string`, `is_unique`, `json_const`, `nameof`,
 `reflect`, `reflect_set`, `sizeof`, `typeof`, `xml_const`
 

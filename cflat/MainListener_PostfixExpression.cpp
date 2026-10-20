@@ -6362,6 +6362,57 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             break;
                         }
 
+                        // Compile-time intrinsic: is_const(T) - const at T's own level, or at the pointee
+                        // of a pointer T ((const int)* 1, int* 0); a substituted T has no top-level const.
+                        if (!postfixMemberCallPending && functionName == "is_const")
+                        {
+                            bool isConst = false;
+                            if (argumentList.size() > 0)
+                            {
+                                auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
+                                if (!namedArgCtx.empty())
+                                {
+                                    std::string argText = namedArgCtx[0]->assignmentExpression()->getText();
+                                    if (auto substIt = activeTypeSubstitutions.find(argText);
+                                        substIt != activeTypeSubstitutions.end())
+                                    {
+                                        std::string base = substIt->second;
+                                        StripOwnershipQualifiers(base);
+                                        int stars = 0;
+                                        while (stars < (int)base.size() && base[base.size() - 1 - stars] == '*') ++stars;
+                                        const int depth = activeTypeSubstitutions.ConstDepth(argText);
+                                        isConst = stars > 0 ? depth >= stars : depth > 0;
+                                    }
+                                    else
+                                    {
+                                        antlr4::ANTLRInputStream typeInput(argText);
+                                        CFlatLexer typeLexer(&typeInput);
+                                        antlr4::CommonTokenStream typeTokens(&typeLexer);
+                                        CFlatParser typeParser(&typeTokens);
+                                        typeLexer.removeErrorListeners();
+                                        typeParser.removeErrorListeners();
+                                        auto* parsedTypeName = typeParser.typeName();
+                                        if (typeParser.getNumberOfSyntaxErrors() == 0 && typeTokens.LA(1) == -1)
+                                        {
+                                            auto operand = ParseTypeName(parsedTypeName, true, ctx);
+                                            if (!operand.TypeName.empty())
+                                            {
+                                                // The pointee / element level: bit 0 is the innermost.
+                                                const int level = operand.IsArrayView
+                                                    ? (operand.ElemPointer ? 1 : 0)
+                                                    : std::max(operand.ValuePointerDepth() - 1, 0);
+                                                isConst = ((operand.ConstMask >> level) & 1u) != 0;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            namedVar.Primary = llvm::ConstantInt::get(
+                                llvm::Type::getInt1Ty(*Compiler(ctx)->context), isConst ? 1 : 0);
+                            namedVar.TypeAndValue.TypeName = "int";
+                            break;
+                        }
+
                         // Compile-time intrinsic: is_interface(T) - returns 1 if the type parameter T
                         // resolves to an interface VALUE (a fat pointer { vtable*, data* }), 0 otherwise.
                         // is_pointer(T) is also true for an interface value, so this is the
@@ -9817,6 +9868,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 requestCxxTemplate(resolvedFuncName);
                                 callArgumentPostfix.Flush();
                                 Compiler(ctx)->pendingCallSite_ = callParen;
+                                Compiler(ctx)->pendingReceiverText_ = lastMemberReceiverPath;
                                 namedVar.Primary = RefuseCxxConstReceiverCall(ctx, arguments,
                                         cxxMemberReceiverType(), resolvedFuncName,
                                         lastMemberReceiverPath)
@@ -9829,6 +9881,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     enclosingFunctionName);
                                 globalScopeCall = false;
                                 Compiler(ctx)->pendingCallSite_ = nullptr;
+                                Compiler(ctx)->pendingReceiverText_.clear();
                                 {
                                     std::string rcvr = structVar.TypeAndValue.VariableName;
                                     if (rcvr.empty() && !compilerLLVM->lastCallParameterNames.empty())
@@ -9891,6 +9944,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 requestCxxTemplate(resolvedFuncName);
                                 callArgumentPostfix.Flush();
                                 Compiler(ctx)->pendingCallSite_ = callParen;
+                                Compiler(ctx)->pendingReceiverText_ = lastMemberReceiverPath;
                                 namedVar.Primary = RefuseCxxConstReceiverCall(ctx, arguments,
                                         cxxMemberReceiverType(), resolvedFuncName,
                                         lastMemberReceiverPath)
@@ -9903,6 +9957,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     enclosingFunctionName);
                                 globalScopeCall = false;
                                 Compiler(ctx)->pendingCallSite_ = nullptr;
+                                Compiler(ctx)->pendingReceiverText_.clear();
                                 {
                                     std::string rcvr = structVar.TypeAndValue.VariableName;
                                     if (rcvr.empty() && !compilerLLVM->lastCallParameterNames.empty())
@@ -12068,7 +12123,7 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
 
         // Compiler intrinsics handled at the call site - not in the function table.
         static const std::unordered_set<std::string> kIntrinsics = {
-            "va_start", "va_end", "is_pointer", "is_unique", "is_interface", "is_copyable", "is_movable", "is_assignable", "is_cpp_class", "is_primitive", "is_string", "annotationof",
+            "va_start", "va_end", "is_pointer", "is_unique", "is_const", "is_interface", "is_copyable", "is_movable", "is_assignable", "is_cpp_class", "is_primitive", "is_string", "annotationof",
             "compile_error", "construct_at", "embed",
             "reflect", "reflect_set", "json_const", "xml_const", "__rdtscp", "__readcyclecounter", "__lfence", "__pause",
             "__popcount", "__ctz", "__clz", "__prefetch", "__fma", "__likely", "__unlikely",

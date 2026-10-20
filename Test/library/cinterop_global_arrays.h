@@ -31,3 +31,15 @@ const int* t10Ip(void);
 const char** t10Pp(void);
 int t10TakeMut(char* s);
 int t10TakeConst(const char* s);
+
+struct C13PS { int x; int y; };
+struct C13PS* c13PSResult(void);
+const struct C13PS* c13ConstPSResult(void);
+typedef struct C13PS* C13PSP;
+C13PSP c13TypedefPSResult(void);
+typedef struct { int x; int y; } C13Anon;
+C13Anon* c13AnonResult(void);
+union C13U { int x; int y; };
+union C13U* c13UnionResult(void);
+struct C13Opaque;
+struct C13Opaque* c13OpaqueResult(void);
