@@ -7702,7 +7702,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     // is a copy), so an rvalue temp must still be registered for end-of-expr freeing.
                     const bool externByValueReturnParam = candidate.ReturnsAliasOfByValueParam
                         && !candidate.ReturnsAlias
-                        && candParamItr->IsReturnInferredSink && !candParamItr->Pointer
+                        && candParamItr->IsReturnInferredSink && !candParamItr->IsWriteInferredSink
+                        && !candParamItr->Pointer
                         && !candParamItr->IsAlias && !candParamItr->IsMove
                         && ResolveTypeAlias(candParamItr->TypeName)
                             == ResolveTypeAlias(candidate.ReturnType.TypeName);
@@ -8390,8 +8391,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         bool aliasStringTempMayOwn = !candidate.IsCxx && !candidate.External
             && TryAdoptAliasReturnStringTemp(result, candidate.ReturnType,
                 candidate.ReturnsOwned, candidate.ReturnsAlias,
-                candidate.Parameters,
-                argList, &matched, !allowOperatorAliasReturnStringTemp);
+                candidate.Parameters, argList, &matched);
         // Settle the copy slots of an alias-return call. When every possible source slot holds a
         // temporary, the result is one of them: it owns that value, and a slot the result does not
         // name is destroyed at the end of the full expression (runtime-compared with several).
@@ -8654,7 +8654,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             transferParamsStorage = candidate.Parameters;
             transferParams = &transferParamsStorage;
             for (auto& param : transferParamsStorage)
-                if (param.IsReturnInferredSink && !param.Pointer
+                if (param.IsReturnInferredSink && !param.IsWriteInferredSink && !param.Pointer
                     && ResolveTypeAlias(param.TypeName) == ResolveTypeAlias(candidate.ReturnType.TypeName))
                     param.IsReturnInferredSink = false;
         }

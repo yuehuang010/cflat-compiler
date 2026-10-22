@@ -629,8 +629,13 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
             for (auto* innerEntry : innerParams->typeParameterList()->typeParameterEntry())
                 innerArgs.push_back(ResolveTypeArgEntry(innerEntry));
             ResolveEnumTypeArguments(innerArgs);
-            Compiler()->ResolveGenericAliasSpelling(innerBase, innerArgs);
-            Compiler()->CompleteCxxTemplateTypeArgs(innerBase, innerArgs);
+            const std::string spelledInnerBase = innerBase;
+            auto* innerCompiler = Compiler(innerParams);
+            const std::string innerScope = !structScopeStack.empty() ? structScopeStack.back()
+                : EnclosingAggregateScopeFromContext(innerCompiler, innerParams);
+            innerBase = ResolveGenericTemplateSpellingAtScope(
+                innerCompiler, spelledInnerBase, innerArgs, innerScope, innerParams, spelledInnerBase, true);
+            innerCompiler->CompleteCxxTemplateTypeArgs(innerBase, innerArgs);
             ResolveEnumTypeArguments(innerArgs);
             resolved = MangledGenericName(innerBase, innerArgs);
             // A foreign C++ specialization used as a type argument (`list<std.vector<int>>`, or
@@ -903,41 +908,47 @@ void MainListener::QueueGenericInstantiation(const std::string& baseName,
                                    const std::string& mangledName,
                                    antlr4::ParserRuleContext* site,
                                    bool pointerOnly) {
+        auto* compiler = site != nullptr ? Compiler(site) : Compiler();
+        const std::string scope = !structScopeStack.empty() ? structScopeStack.back()
+            : EnclosingAggregateScopeFromContext(compiler, site);
+        const std::string resolvedBase = compiler->IsGenericTemplateKey(baseName) ? baseName
+            : ResolveGenericTemplateBaseAtScope(compiler, baseName, scope, site, baseName);
+        const std::string resolvedName = resolvedBase == baseName ? mangledName
+            : MangleGenericInstance(*compiler, resolvedBase, typeArgs);
 #ifndef NDEBUG
         TypeSpelling spelling;
-        if (DemangleType(*Compiler(), mangledName, spelling))
+        if (DemangleType(*compiler, resolvedName, spelling))
         {
             std::vector<std::string> args;
             args.reserve(spelling.args.size());
             for (const auto& arg : spelling.args)
-                args.push_back(MangleType(*Compiler(), arg));
-            assert(MangleGenericInstance(*Compiler(), spelling.base, args) == mangledName);
+                args.push_back(MangleType(*compiler, arg));
+            assert(MangleGenericInstance(*compiler, spelling.base, args) == resolvedName);
         }
 #endif
-        if (IsCoreUniqueArrayViewInstantiation(Compiler(), mangledName, typeArgs))
+        if (IsCoreUniqueArrayViewInstantiation(compiler, resolvedName, typeArgs))
             Compiler()->LogError(CoreUniqueArrayViewMessage(typeArgs));
-        if (instantiatedGenerics.count(mangledName))
+        if (instantiatedGenerics.count(resolvedName))
         {
-            if (!pointerOnly) PromotePointerOnlyInstantiation(mangledName);
+            if (!pointerOnly) PromotePointerOnlyInstantiation(resolvedName);
             return;
         }
-        bool isStructOrClass = genericStructTemplates.count(baseName) || genericClassTemplates.count(baseName);
-        bool isInterface = genericInterfaceTemplates.count(baseName);
+        bool isStructOrClass = genericStructTemplates.count(resolvedBase) || genericClassTemplates.count(resolvedBase);
+        bool isInterface = genericInterfaceTemplates.count(resolvedBase);
         if (!isStructOrClass && !isInterface)
             return;
-        QueuePendingInstantiation(baseName, typeArgs, mangledName, site, pointerOnly);
-        instantiatedGenerics.insert(mangledName);
+        QueuePendingInstantiation(resolvedBase, typeArgs, resolvedName, site, pointerOnly);
+        instantiatedGenerics.insert(resolvedName);
         // One predicate for "is this base an interface name", shared with the three scanner sites.
-        if (Compiler()->IsGenericInterfaceTemplateName(baseName))
-            Compiler()->gts.genericInterfaceInstances.insert(mangledName);
+        if (compiler->IsGenericInterfaceTemplateName(resolvedBase))
+            compiler->gts.genericInterfaceInstances.insert(resolvedName);
         if (isStructOrClass)
         {
-            auto* c = Compiler();
-            if (!c->GetDataStructure(mangledName).StructType)
+            if (!compiler->GetDataStructure(resolvedName).StructType)
             {
-                c->CreateStructType(mangledName, {});
-                LLVMBackend::TypeAndValue rt{ .TypeName = mangledName };
-                c->CreateFunctionDeclaration(mangledName, rt, {});
+                compiler->CreateStructType(resolvedName, {});
+                LLVMBackend::TypeAndValue rt{ .TypeName = resolvedName };
+                compiler->CreateFunctionDeclaration(resolvedName, rt, {});
             }
         }
     }
@@ -1648,10 +1659,18 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                 LogErrorContext(entry, "unique is not supported as a tuple element type");
                             typeArgs.push_back(ResolveTypeArgEntry(entry));
                         }
-                    // A C++ alias template names its target with its OWN argument pattern, which
-                    // may fix, reorder or partially bind the target's parameters.
-                    baseName = spelledBase;
-                    Compiler(declSpecs)->ResolveGenericAliasSpelling(baseName, typeArgs);
+            const std::string enclosingScope = !structScopeStack.empty() ? structScopeStack.back()
+                : EnclosingAggregateScopeFromContext(Compiler(declSpecs), genParams);
+            bool nonGenericRefusal = false;
+            baseName = ResolveGenericTemplateSpellingAtScope(Compiler(declSpecs), spelledBase, typeArgs,
+                enclosingScope, genParams, spelledBase, true, &nonGenericRefusal);
+            if (baseName.empty() && nonGenericRefusal)
+                LogErrorContext(genParams, std::format(
+                    "'{}' names a non-generic type in the enclosing aggregate; template arguments are not allowed",
+                    spelledBase));
+            else if (baseName.empty())
+                LogErrorContext(genParams, std::format(
+                    "nested generic template '{}' is declared after this type use", spelledBase));
                     ResolveEnumTypeArguments(typeArgs);
                     Compiler(declSpecs)->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
                     ResolveEnumTypeArguments(typeArgs);
@@ -1668,7 +1687,10 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                             LogErrorContext(genParams,
                                 std::format("'{}' is not a generic type", spelledBase));
                     }
-                    std::string mangledName = MangledGenericName(baseName, typeArgs);
+                    std::string mangledName = Compiler(declSpecs)->IsGenericBaseAlias(spelledBase)
+                        && !Compiler(declSpecs)->HasCxxAliasTemplate(spelledBase)
+                        ? MangleGenericInstance(*Compiler(declSpecs), baseName, typeArgs)
+                        : MangledGenericName(baseName, typeArgs, genParams);
                     if (IsCoreUniqueArrayViewInstantiation(Compiler(declSpecs), mangledName, typeArgs))
                         LogErrorContext(genParams, CoreUniqueArrayViewMessage(typeArgs));
                     declType.TypeName = mangledName;
@@ -3296,6 +3318,8 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
                 "alias '{}' is already defined in this scope", { alias }));
 
         auto* typeSpec = ctx->typeSpecifier();
+        if (typeSpec != nullptr)
+            RegisterLexicalLocalTypeName(compiler, ctx, alias);
         ValidateConstAfterPointerStar(ctx->pointer(),
             SpelledTypeNameBase(typeSpec, ctx->multiWordTypeSuffix()));
 
@@ -3423,13 +3447,28 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
         std::string baseName;
         if (auto* genParams = GenericSpecOf(typeSpec, baseName))
         {
+            const std::string spelledBase = baseName;
             std::vector<std::string> typeArgs;
             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                 typeArgs.push_back(ResolveTypeArgEntry(entry));
             ResolveEnumTypeArguments(typeArgs);
-            compiler->ResolveGenericAliasSpelling(baseName, typeArgs);
+            const std::string enclosingScope = !structScopeStack.empty() ? structScopeStack.back()
+                : EnclosingAggregateScopeFromContext(compiler, genParams);
+            bool nonGenericRefusal = false;
+            baseName = ResolveGenericTemplateSpellingAtScope(compiler, spelledBase, typeArgs,
+                enclosingScope, genParams, spelledBase, true, &nonGenericRefusal);
+            if (baseName.empty() && nonGenericRefusal)
+                LogErrorContext(genParams, std::format(
+                    "'{}' names a non-generic type in the enclosing aggregate; template arguments are not allowed",
+                    spelledBase));
+            else if (baseName.empty())
+                LogErrorContext(genParams, std::format(
+                    "nested generic template '{}' is declared after this type use", spelledBase));
             compiler->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
-            std::string mangledName = MangledGenericName(baseName, typeArgs);
+            std::string mangledName = compiler->IsGenericBaseAlias(spelledBase)
+                && !compiler->HasCxxAliasTemplate(spelledBase)
+                ? MangleGenericInstance(*compiler, baseName, typeArgs)
+                : MangledGenericName(baseName, typeArgs, genParams);
 
             if (genericStructTemplates.count(baseName) != 0
                 || genericClassTemplates.count(baseName) != 0
@@ -4146,6 +4185,7 @@ void MainListener::enterExternalDeclaration(CFlatParser::ExternalDeclarationCont
 
 void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName, const std::string& namespaceName, const std::string& nameOverride, std::optional<std::string> bodyNamespace) {
         auto* compiler = Compiler(func);
+        LexicalLocalTypeScope lexicalLocalTypeScope(compiler);
         // A body compiled mid-expression (first-use generic instantiation) must not flush the
         // caller's pending postfix ++/-- into itself.
         PendingPostfixScope pendingPostfixScope(this);
@@ -4485,17 +4525,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             }
         }
 
-        struct ActiveLocalEnumFunctionScope
-        {
-            LLVMBackend* backend;
-            std::string saved;
-            ActiveLocalEnumFunctionScope(LLVMBackend* b, const std::string& name)
-                : backend(b), saved(std::move(b->activeLocalEnumFunction_))
-            {
-                backend->activeLocalEnumFunction_ = name;
-            }
-            ~ActiveLocalEnumFunctionScope() { backend->activeLocalEnumFunction_ = std::move(saved); }
-        } localEnumFunctionScope(compiler, fn->getName().str());
+        ActiveLocalEnumFunctionScope localEnumFunctionScope(compiler, fn->getName().str());
 
         compiler->InitializeBlock(&fn->front(), false);
         NamedReturnElisionContext nrvoContext;
@@ -5104,6 +5134,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseForDec
 
 std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclaration(CFlatParser::DeclarationContext* ctx, const std::string& namespaceName) {
         DiagnoseBraceListsUnder(ctx);
+        RegisterLexicalStructNamesInDeclaration(Compiler(ctx), ctx);
         // Handle enum declarations which use the enumSpecifier alternative in the grammar
         if (auto enumSpec = ctx->enumSpecifier())
         {
@@ -5189,6 +5220,8 @@ void MainListener::ParseEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx, co
             };
         auto* compiler = Compiler(ctx);
         compiler->RegisterEnumSpecifier(ctx, namespaceName, &constFoldableGlobals_, dynamicEval);
+        if (ctx->Identifier() != nullptr)
+            RegisterLexicalLocalTypeName(compiler, ctx, ctx->Identifier()->getText());
 
         // An enum is a type and its members are named constants, so index both: --symbol,
         // hover and completion see `Dir` and `Dir.Back` the way they see a struct and its fields.
@@ -5852,6 +5885,92 @@ cxx_dtor_ready:
                     return true;
                 }
                 compiler->lastCxxRetTemp_ = nullptr;
+                LLVMBackend::TypeAndValue ctorArgExpected;
+                auto* bareArgIdentifier = BareGenericFunctionValueIdentifier(argAssign);
+                const std::string genericBase = bareArgIdentifier != nullptr
+                    ? compiler->ResolveGenericFunctionBase(bareArgIdentifier->getText()) : std::string();
+                const bool genericFunctionArgument = bareArgIdentifier != nullptr
+                    && !NamesVisibleVariable(compiler, bareArgIdentifier->getText())
+                    && genericFunctionTemplates.count(genericBase) != 0;
+                bool ctorArgExpectedConflict = false;
+                bool genericCtorDestinationResolved = false;
+                std::vector<LLVMBackend::TypeAndValue> ctorArgCallbackCandidates;
+                if (genericFunctionArgument)
+                    if (const auto* info = compiler->GetCxxClassInfo(typeName))
+                {
+                    const size_t parameterIndex = ctorArguments.size() + 1;
+                    for (const auto& candidate : info->constructors)
+                    {
+                        if (parameterIndex >= candidate.params.size()) continue;
+                        const auto& parameter = candidate.params[parameterIndex];
+                        if (parameter.FuncPtrReturnTypeName.empty()) continue;
+                        ctorArgCallbackCandidates.push_back(parameter);
+                        if (ctorArgExpected.FuncPtrReturnTypeName.empty())
+                            ctorArgExpected = parameter;
+                        else if (ctorArgExpected.IsThinFnPtr() != parameter.IsThinFnPtr()
+                            || compiler->FuncPtrSpellingOf(ctorArgExpected)
+                                != compiler->FuncPtrSpellingOf(parameter))
+                            ctorArgExpectedConflict = true;
+                    }
+                }
+                auto logGenericCtorNoMatch = [&]() {
+                    auto failedArguments = argTypes;
+                    LLVMBackend::TypeAndValue unresolvedGeneric;
+                    unresolvedGeneric.TypeName = std::format("generic function {}", genericBase);
+                    failedArguments.push_back(std::move(unresolvedGeneric));
+                    const std::string noMatch = compiler->CxxCtorNoMatchReason(failedArguments);
+                    LogErrorContext(direct, std::format("C++ class '{}' {}",
+                        compiler->DisplayCxxClassName(typeName), noMatch));
+                };
+                if (ctorArgExpectedConflict)
+                {
+                    const auto deducedCandidateIndices = DeduceGenericFunctionCallbackCandidates(
+                        genericBase, ctorArgCallbackCandidates);
+                    std::vector<std::string> candidateNames;
+                    for (size_t candidateIndex : deducedCandidateIndices)
+                    {
+                        const auto& callbackSignature = ctorArgCallbackCandidates[candidateIndex];
+                        candidateNames.push_back(std::format(
+                            "'{}' constructor candidate {} with callback signature '{}'",
+                            compiler->DisplayCxxClassName(typeName), candidateIndex + 1,
+                            compiler->FuncPtrSpellingOf(callbackSignature)));
+                    }
+
+                    if (deducedCandidateIndices.size() > 1)
+                    {
+                        std::string candidates;
+                        for (size_t i = 0; i < candidateNames.size(); ++i)
+                        {
+                            if (i != 0) candidates += "; ";
+                            candidates += candidateNames[i];
+                        }
+                        LogErrorContext(argAssign, std::format(
+                            "ambiguous generic function '{}' for C++ constructor: {}",
+                            genericBase, candidates));
+                        return true;
+                    }
+                    if (deducedCandidateIndices.size() == 1)
+                    {
+                        ctorArgExpected = ctorArgCallbackCandidates[deducedCandidateIndices.front()];
+                        genericCtorDestinationResolved = true;
+                    }
+                    else
+                    {
+                        logGenericCtorNoMatch();
+                        return true;
+                    }
+                }
+                if (genericFunctionArgument && !genericCtorDestinationResolved
+                    && (ctorArgExpected.FuncPtrReturnTypeName.empty()
+                        || DeduceGenericFunctionCallbackCandidates(
+                            genericBase, { ctorArgExpected }).empty()))
+                {
+                    logGenericCtorNoMatch();
+                    return true;
+                }
+                std::optional<DeclExpectedTypeScope> ctorArgExpectedScope;
+                if (!ctorArgExpected.FuncPtrReturnTypeName.empty())
+                    ctorArgExpectedScope.emplace(&declExpectedType, ctorArgExpected, true);
                 // A C++ constructor argument is a C++ call argument: `?:` arms use the usual
                 // arithmetic conversions (T55), so `rv.C(k ? 5 : 6)` deduces int like clang.
                 CxxCallArgumentScope cxxCtorArgumentScope(inCxxCallArgument_, true);
@@ -8361,7 +8480,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             // A non-funcptr destination still supplies the return type an
                             // IMMEDIATELY-INVOKED literal in this initializer needs; the postfix
                             // path consults it so the literal stops inheriting an enclosing one.
-                            DeclExpectedTypeScope declExpectedScope(&declExpectedType, typeAndValue);
+                            DeclExpectedTypeScope declExpectedScope(&declExpectedType, typeAndValue, true);
                             std::string genericFuncCallerName;
                             bool rhsIsFuncPtr = false;
                             bool rhsIsThinFnPtr = false;
@@ -8727,6 +8846,29 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && rightNV.Primary == nullptr && !rightNV.CallerName.empty())
                                     rightNV.Primary = compiler->GetFunctionForFuncPtr(rightNV.CallerName);
                                 right = LoadNamedVariable(rightNV);
+                                bool uniqueFieldAssignmentResult = initializer
+                                    && !global_scope && assignmentExpression != nullptr
+                                    && assignmentExpression->assignmentOperator() != nullptr
+                                    && rightNV.IsUniqueFieldAssignmentResult
+                                    && !rightNV.TypeAndValue.Pointer
+                                    && compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName)
+                                    && IsUniqueFieldRead(rightNV)
+                                    && (typeAndValue.IsUnique
+                                        || (!typeAndValue.Pointer
+                                            && compiler->IsCoreUniqueType(typeAndValue.TypeName)));
+                                if (uniqueFieldAssignmentResult)
+                                {
+                                    if (RejectImplicitConsumeOfOutlivingOwner(
+                                            compiler, rightNV, false, assignmentExpression))
+                                        return allocList;
+                                    if (RejectConsumeOfBorrowedByValueParamField(
+                                            compiler, rightNV, assignmentExpression))
+                                        return allocList;
+                                    EmitImplicitUniqueFieldMove(rightNV, right, nullptr, {});
+                                    rightNV.IsOwning = true;
+                                    rightNV.IsBorrowed = false;
+                                    rightNV.BorrowedOrigin.clear();
+                                }
                                 // A moved core unique interface wrapper can be reboxed into a
                                 // different core unique interface wrapper; do not bitcast structs.
                                 if (right != nullptr && !typeAndValue.Pointer
@@ -9293,7 +9435,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             if (right && declaredFuncSlotSig.IsFunctionPointer
                                 && declaredFuncSlotSig.FuncPtrReturnTypeName.empty())
                             {
-                                std::string funcName = assignmentExpression->getText();
+                                std::string funcName = !genericFuncCallerName.empty()
+                                    ? genericFuncCallerName : right->getName().str();
                                 LLVMBackend::TypeAndValue inferred;
                                 bool haveInferred = false;
                                 // `c ? a : b` over two plain names: both arms name one signature (the ternary's
@@ -9349,7 +9492,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // Only when the RHS is a bare named function (right is already an
                                 // llvm::Function); a same-named local/param of function-pointer type
                                 // loads to a Value and must shadow the global function, not be replaced.
-                                std::string funcName = assignmentExpression->getText();
+                                std::string funcName = !genericFuncCallerName.empty()
+                                    ? genericFuncCallerName : right->getName().str();
                                 int expectedParams = (int)declaredFuncSlotSig.FuncPtrParams.size();
                                 if (llvm::isa<llvm::Function>(right))
                                     if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams, &declaredFuncSlotSig.FuncPtrParams, &declaredFuncSlotSig))
@@ -14232,7 +14376,11 @@ std::string MainListener::ResolveMemberTypeChain(
         std::vector<std::string> args;
         for (auto* entry : ownerArgs->typeParameterList()->typeParameterEntry())
             args.push_back(ResolveTypeArgEntry(entry));
-        compiler->ResolveGenericAliasSpelling(base, args);
+        const std::string spelledBase = base;
+        const std::string scope = !structScopeStack.empty() ? structScopeStack.back()
+            : EnclosingAggregateScopeFromContext(compiler, ownerArgs);
+        base = ResolveGenericTemplateSpellingAtScope(
+            compiler, spelledBase, args, scope, site, spelledBase, report);
         compiler->CompleteCxxTemplateTypeArgs(base, args);
         std::string owner = MangledGenericName(base, args);
         {

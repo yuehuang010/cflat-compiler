@@ -1165,7 +1165,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         // The enclosing function's RETURN type is the context for an immediately-invoked literal
         // in the returned expression, exactly as a declarator's type is for its initializer.
         std::optional<DeclExpectedTypeScope> returnExpectedScope;
-        returnExpectedScope.emplace(&declExpectedType, compiler->currentFunctionReturnTV);
+        returnExpectedScope.emplace(&declExpectedType, compiler->currentFunctionReturnTV, true);
         if (assignExpr != nullptr)
             ArmArrayNewDesugar(assignExpr, compiler->currentFunctionReturnTV);
         const bool cxxSretReturn = compiler->currentFunctionAbiRecipe.hasLowering
@@ -3603,6 +3603,11 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
         {
             // Dispatch may reach this label directly, skipping earlier cases: merge the pre-switch state.
             compiler->MergeMovedStateInto(switchStack.back().preSwitchMoved);
+            auto fallthroughOwnFlagState = compiler->SaveOwnFlagJoinState();
+            auto labelOwnFlagState = compiler->MergeOwnFlagJoinStates(
+                fallthroughOwnFlagState, switchStack.back().preSwitchOwnFlag,
+                compiler->IsInsideOwnershipControlFrame(LLVMBackend::OwnFlagLoopFrame));
+            compiler->RestoreOwnFlagJoinState(labelOwnFlagState);
             // Dispatch may skip earlier case groups: joins made inside the switch move out of its frame.
             compiler->ReanchorOwnFlagJoinsOutOf(LLVMBackend::OwnFlagSwitchFrame);
             auto& ctx = switchStack.back();
@@ -3659,6 +3664,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
 
                 ParseStatement(labeledStatement->statement());
                 switchStack.back().exitMoved.push_back(compiler->SaveMovedState());
+                if (compiler->IsInsertBlockLive() && !compiler->IsCurrentBlockUnreachable())
+                    switchStack.back().exitOwnFlag.push_back(compiler->SaveOwnFlagJoinState());
                 compiler->CreateBlockBreak(ctx.resumeBlock, true);
                 return;
             }
@@ -3729,7 +3736,10 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
             {
                 // continue re-tests the condition; an always-true condition never exits the loop there.
                 if (loopConditionAlwaysTrue_.empty() || !loopConditionAlwaysTrue_.back())
+                {
                     RecordLoopExitMovedState();
+                    compiler->RecordOwnFlagLoopExitState();
+                }
                 // The jump skips later stores inside the loop: joins made there move out of it.
                 compiler->ReanchorOwnFlagJoinsOutOf(LLVMBackend::OwnFlagLoopFrame);
                 straightLineJumped_ = true;
@@ -3740,9 +3750,15 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
             {
                 // A break whose innermost breakable is the switch joins the switch's exits.
                 if (!switchStack.empty() && switchStack.back().loopDepth == loopBreakMovedStates_.size())
+                {
                     switchStack.back().exitMoved.push_back(compiler->SaveMovedState());
+                    switchStack.back().exitOwnFlag.push_back(compiler->SaveOwnFlagJoinState());
+                }
                 else
+                {
                     RecordLoopExitMovedState();
+                    compiler->RecordOwnFlagLoopExitState();
+                }
                 // The jump skips later stores inside the exited construct: joins made there move out of it.
                 compiler->ReanchorOwnFlagJoinsOutOf(LLVMBackend::OwnFlagLoopFrame | LLVMBackend::OwnFlagSwitchFrame);
                 straightLineJumped_ = true;
@@ -3823,7 +3839,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
             // non-null for both rules. Do() is unambiguous and must be tested first.
             if (iterationStatement->Do())
             {
-                OwnershipControlScope loopControlScope(compiler, LLVMBackend::OwnFlagLoopFrame);
+                OwnershipControlScope loopControlScope(
+                    compiler, LLVMBackend::OwnFlagLoopFrame | LLVMBackend::OwnFlagDoWhileFrame);
                 auto expression = iterationStatement->expression();
                 auto innerStatement = iterationStatement->statement();
                 MarkLoopBackEdgeCxxConstPointers(compiler, iterationStatement);
@@ -3836,6 +3853,9 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
 
                 compiler->InitializeBlock(blockInner, true, blockCondition, blockResume, blockResume);
                 ParseControlledBody(innerStatement);
+                if ((loopConditionAlwaysTrue_.empty() || !loopConditionAlwaysTrue_.back())
+                    && compiler->IsInsertBlockLive() && !compiler->IsCurrentBlockUnreachable())
+                    compiler->RecordOwnFlagLoopExitState();
                 compiler->CreateContinueCall();
 
                 compiler->InitializeBlock(blockCondition, false);
@@ -4031,6 +4051,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 // Range-based for: for (T x in collection) statement
                 else if (iterationStatement->declarationSpecifiers() && iterationStatement->In())
                 {
+                    OwnershipControlScope loopControlScope(compiler, LLVMBackend::OwnFlagLoopFrame);
                     auto declSpecCtx = iterationStatement->declarationSpecifiers();
                     auto varNameTok  = iterationStatement->Identifier();
                     auto collExprCtx = iterationStatement->expression();
@@ -4974,6 +4995,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 compiler->CreateConditionJump(condition, blockTrue, blockFalse);
 
                 auto preIfMovedState = compiler->SaveMovedState();
+                auto preIfOwnFlagState = compiler->SaveOwnFlagJoinState();
 
                 // Only a `return` branch's moves truly vanish (the path exits the function). A
                 // break/continue branch REJOINS later code (post-loop / next iteration), so its
@@ -4988,7 +5010,9 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 straightLineJumped_ = false;
                 ParseControlledBody(innerStatement[0]);
                 bool thenReturned = straightLineReturned_ || straightLineJumped_;
+                bool thenJumped = straightLineJumped_;
                 auto thenMovedState = compiler->SaveMovedState();
+                auto thenOwnFlagState = compiler->SaveOwnFlagJoinState();
 
                 compiler->CreateBlockBreak(blockResume, true);
 
@@ -4997,6 +5021,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 {
                     // Restore pre-branch moved state so else doesn't inherit if-branch moves.
                     compiler->RestoreMovedState(preIfMovedState);
+                    compiler->RestoreOwnFlagJoinState(preIfOwnFlagState);
 
                     // else statement
                     compiler->InitializeBlock(blockElse, true);
@@ -5005,6 +5030,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     ParseControlledBody(innerStatement[1]);
                     elseReturned = straightLineReturned_ || straightLineJumped_;
                     auto elseMovedState = compiler->SaveMovedState();
+                    auto elseOwnFlagState = compiler->SaveOwnFlagJoinState();
                     compiler->CreateBlockBreak(blockResume, true);
 
                     // Drop an EXITING branch's moves (return/break/continue never reach resume).
@@ -5018,6 +5044,24 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         compiler->RestoreMovedState(preIfMovedState);
                     else
                         compiler->MergeMovedStates(thenMovedState, elseMovedState);
+
+                    if (thenReturned && !elseReturned)
+                        compiler->RestoreOwnFlagJoinState(compiler->NormalizeOwnFlagJoinState(
+                            elseOwnFlagState, compiler->IsInsideOwnershipControlFrame(
+                                LLVMBackend::OwnFlagLoopFrame)));
+                    else if (!thenReturned && elseReturned)
+                        compiler->RestoreOwnFlagJoinState(compiler->NormalizeOwnFlagJoinState(
+                            thenOwnFlagState, compiler->IsInsideOwnershipControlFrame(
+                                LLVMBackend::OwnFlagLoopFrame)));
+                    else if (thenReturned && elseReturned)
+                        compiler->RestoreOwnFlagJoinState(preIfOwnFlagState);
+                    else
+                    {
+                        auto mergedOwnFlagState = compiler->MergeOwnFlagJoinStates(
+                            thenOwnFlagState, elseOwnFlagState,
+                            compiler->IsInsideOwnershipControlFrame(LLVMBackend::OwnFlagLoopFrame));
+                        compiler->RestoreOwnFlagJoinState(mergedOwnFlagState);
+                    }
                 }
                 else if (thenReturned)
                 {
@@ -5025,6 +5069,16 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     // then-branch, so an exiting (return/break/continue) then-branch contributes
                     // no moves here. A break/continue's moves rejoin at loop exit instead.
                     compiler->RestoreMovedState(preIfMovedState);
+                    if (thenJumped)
+                    {
+                        // Preserve loop re-anchoring from break/continue paths. The branch does
+                        // not reach this merge, but it can skip a later re-own on another iteration.
+                        auto mergedOwnFlagState = compiler->MergeOwnFlagJoinStates(
+                            thenOwnFlagState, preIfOwnFlagState,
+                            compiler->IsInsideOwnershipControlFrame(LLVMBackend::OwnFlagLoopFrame));
+                        compiler->RestoreOwnFlagJoinState(mergedOwnFlagState);
+                    }
+                    else compiler->RestoreOwnFlagJoinState(preIfOwnFlagState);
                 }
                 else
                 {
@@ -5032,6 +5086,10 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     // AND the condition-false path (pre-if state). A re-init in only the then-branch
                     // must not revive the field for the false path, so merge the two (maybe-moved).
                     compiler->MergeMovedStates(thenMovedState, preIfMovedState);
+                    auto mergedOwnFlagState = compiler->MergeOwnFlagJoinStates(
+                        thenOwnFlagState, preIfOwnFlagState,
+                        compiler->IsInsideOwnershipControlFrame(LLVMBackend::OwnFlagLoopFrame));
+                    compiler->RestoreOwnFlagJoinState(mergedOwnFlagState);
                 }
 
                 // The enclosing straight-line has unconditionally returned iff it already had, or
@@ -5291,6 +5349,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 compiler->InitializeBlock(nullptr, true, nullptr, switchCtx.resumeBlock, nullptr);
 
                 switchCtx.preSwitchMoved = compiler->SaveMovedState();
+                switchCtx.preSwitchOwnFlag = compiler->SaveOwnFlagJoinState();
                 switchCtx.loopDepth = loopBreakMovedStates_.size();
                 switchStack.push_back(switchCtx);
 
@@ -5302,16 +5361,35 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 }
 
                 // Fallthrough at end of switch body -> resume
+                if (compiler->IsInsertBlockLive() && !compiler->IsCurrentBlockUnreachable())
+                    switchStack.back().exitOwnFlag.push_back(compiler->SaveOwnFlagJoinState());
                 compiler->CreateBlockBreak(switchCtx.resumeBlock, true);
 
                 // Resume is reached from every exit (break, arm end, last case fall-through) and,
                 // without a default, from the dispatch itself (pre-switch state).
                 auto exitMoved = std::move(switchStack.back().exitMoved);
+                auto exitOwnFlag = std::move(switchStack.back().exitOwnFlag);
                 switchStack.pop_back();
                 for (const auto& snap : exitMoved)
                     compiler->MergeMovedStateInto(snap);
                 if (switchCtx.defaultBlock == nullptr)
                     compiler->MergeMovedStateInto(switchCtx.preSwitchMoved);
+
+                if (switchCtx.defaultBlock == nullptr)
+                    exitOwnFlag.push_back(switchCtx.preSwitchOwnFlag);
+                if (!exitOwnFlag.empty())
+                {
+                    auto mergedOwnFlagState = exitOwnFlag.front();
+                    bool keepMayBeFalse = compiler->IsInsideOwnershipControlFrame(
+                        LLVMBackend::OwnFlagLoopFrame);
+                    for (size_t i = 1; i < exitOwnFlag.size(); ++i)
+                        mergedOwnFlagState = compiler->MergeOwnFlagJoinStates(
+                            mergedOwnFlagState, exitOwnFlag[i], keepMayBeFalse);
+                    if (exitOwnFlag.size() == 1)
+                        mergedOwnFlagState = compiler->NormalizeOwnFlagJoinState(
+                            mergedOwnFlagState, keepMayBeFalse);
+                    compiler->RestoreOwnFlagJoinState(mergedOwnFlagState);
+                }
 
                 compiler->InitializeBlock(switchCtx.resumeBlock, false);
                 // Free the scrutinee temporaries now that the dispatch is done and all paths have
@@ -5701,7 +5779,7 @@ void MainListener::GenerateDefaultParamOverloads(
                     // lambda literal still needs the declared parameter's function signature.
                     // Restore on LogError unwind so the wrapper cannot leak its context.
                     LambdaExpectedTypeRestoreGuard lambdaExpectedTypeRestore(&lambdaExpectedType);
-                    DeclExpectedTypeScope defaultExpectedScope(&declExpectedType, params[i]);
+                    DeclExpectedTypeScope defaultExpectedScope(&declExpectedType, params[i], true);
                     if (params[i].IsFunctionPointer)
                         lambdaExpectedType = params[i];
                     else if (const auto* encoded = compiler->GetEncodedClosureType(params[i].TypeName))

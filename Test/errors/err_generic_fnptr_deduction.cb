@@ -1,0 +1,135 @@
+import cpp "t84_conversion.hpp";
+import cpp "t373_generic_fnptr.hpp";
+
+T id<T>(T x) { return x + 100; }
+int t373NativeAmb(function<int(int)> f) { return f(1) + 10; }
+int t373NativeAmb(function<long(long)> f) { return (int)f(1) + 20; }
+int t373NativeNone(function<int(int, int)> f) { return 1; }
+int t373NativeNone(function<double(double, double)> f) { return 2; }
+
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380R2Compound() { int value = 1; value += id; return value; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380R2CastBinary() { int value = (int)(id + 1); return value; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380R2IfCondition() { if (id) return 1; return 0; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380R2WhileCondition() { while (id) { break; } return 0; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380R2ForCondition() { for (; id;) { break; } return 0; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380R2TernaryCondition() { return id ? 1 : 2; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    bool t380R2LogicalNot() { return !id; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    bool t380R2LogicalAnd() { bool c = true; return id && c; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    bool t380R2LogicalOr() { bool c = false; return c || id; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380R2ArrayElement() { int[2] values = { id, 5 }; return values[1]; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380R2ViewElement() { int[] values = { id, 5 }; return values[1]; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    bool t380R2EqualityNull() { return id == nullptr; }
+}
+
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380IntInit() { int value = id; return value; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380BoolInit() { bool value = id; return value ? 1 : 0; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380LongInit() { long value = id; return (int)value; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380FloatInit() { float value = id; return (int)value; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380DoubleInit() { double value = id; return (int)value; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380Assignment() { int value = 9; value = id; return value; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380Return() { return id; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380TakeInt(int value) { return value; }
+    int t380CallArgument() { return t380TakeInt(id); }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    struct T380ScalarField { int value = 4; };
+    int t380FieldInit() { T380ScalarField value = { value = id }; return value.value; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380Ternary(bool condition) { int value = condition ? id : 0; return value; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    int t380Binary() { return id + 1; }
+}
+expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
+    namespace T380Ns {
+        T id<T>(T value) { return value; }
+        int get() { int value = id; return value; }
+    }
+}
+
+expect_error("ambiguous generic function 'id' for callback candidates 'int(int)' and 'long(long)'") {
+    int t373FreeAmb() { return t373.freeAmb(id); }
+}
+expect_error("ambiguous generic function 'id' for callback candidates 'int(int)' and 'long(long)'") {
+    int t373MethodAmb() { t373.M m = t373.M(); return m.both(id); }
+}
+expect_error("ambiguous generic function 'id' for callback candidates 'int(int)' and 'long(long)'") {
+    int t373NativeAmbCall() { return t373NativeAmb(id); }
+}
+int t373NativePrev(int a, function<int(int)> f) { return f(1) + 10; }
+int t373NativePrev(int a, function<long(long)> f) { return (int)f(1) + 20; }
+// The generic after an earlier argument, and candidates with C++ default parameters, still see every candidate.
+expect_error("ambiguous generic function 'id' for callback candidates 'int(int)' and 'long(long)'") {
+    int t373FreePrevAmb() { return t373.prevAmb(3, id); }
+}
+expect_error("ambiguous generic function 'id' for callback candidates 'int(int)' and 'long(long)'") {
+    int t373NativePrevAmb() { return t373NativePrev(3, id); }
+}
+expect_error("ambiguous generic function 'id' for callback candidates 'int(int)' and 'long(long)'") {
+    int t373FreeDefaultAmb() { return t373.defAmb(id); }
+}
+expect_error("ambiguous generic function 'id' for callback candidates 'int(int)' and 'long(long)'") {
+    int t373MethodDefaultAmb() { t373.M m = t373.M(); return m.defBoth(id); }
+}
+expect_error("generic function 'id' has no matching callback candidates: 'int(int, int)' and 'double(double, double)'") {
+    int t373FreeNone() { return t373.freeNone(id); }
+}
+expect_error("generic function 'id' has no matching callback candidates: 'int(int, int)' and 'double(double, double)'") {
+    int t373MethodNone() { t373.M m = t373.M(); return m.none(id); }
+}
+expect_error("generic function 'id' has no matching callback candidates: 'int(int, int)' and 'double(double, double)'") {
+    int t373NativeNoneCall() { return t373NativeNone(id); }
+}
+
+void t373Delete<T>(move T* p) { delete p; }
+expect_error("cannot deduce generic function") {
+    function<void(float)> bad = t373Delete;
+}
+
+int t373Conflict<T>(T* a, T* b) { return *a + *b; }
+expect_error("conflicting or incompatible type deductions") {
+    function<int(int*, float*)> bad = t373Conflict;
+}
+
+expect_error("without a function-pointer destination") {
+    t300.LongCtor bad = t300.LongCtor(t373Delete);
+}

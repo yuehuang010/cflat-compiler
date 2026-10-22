@@ -195,6 +195,8 @@ cppfop.FoldRef d5_return_temporary_fold(cppfop.FoldRef* a, cppfop.FoldRef* b,
 // libc++ headers are the fixture, reached by the SYSTEM header spelling below.
 import cpp "library/cpp_interop_tpl.h";
 import cpp "library/cpp_interop_unique_deleter.hpp";
+import cpp "library/cpp_interop_fnptr.h";
+import cpp "library/t373_generic_fnptr.hpp";
 import cpp "library/cpp_t37_member_types.hpp";
 import cpp "library/cpp_interop_by_value.h";
 import cpp "library/cpp_t76_ladder.hpp";
@@ -238,6 +240,12 @@ import cpp "library/cpp_interop_global_scope.h";
 import cpp "library/cpp_interop_global_collision.h";
 // T23: assert from an NDEBUG group (this file has no other assert definition).
 import cpp "cassert" define "NDEBUG";
+struct T383CppAliasOuter
+{
+    struct GCellAlias<T> { int tag = default; };
+    GCellAlias<int> field;
+    int Read() { GCellAlias<int> local = default; local.tag = 11; return local.tag; }
+};
 int t23NdebugCalls = 0;
 bool t23NdebugSide() { t23NdebugCalls += 1; return false; }
 
@@ -247,6 +255,37 @@ void s7DeleteInt(move int* p) { delete p; s7DeleterCalls += 1; }
 void s7DeleteOverload(int x) { s7DeleterCalls += 100; }
 void s7DeleteOverload(move int* p, int z) { delete p; s7DeleterCalls += 1000; }
 void s7DeleteOverload(move int* p) { delete p; s7DeleterCalls += 1; }
+int s7GenericDeleterCalls = 0;
+void s7GenericDelete<T>(move T* p) { delete p; s7GenericDeleterCalls += 1; }
+void s7GenericDelete(move float* p) { delete p; s7GenericDeleterCalls += 1000; }
+int s7GenericCppMethod<T>(T value) { return value + 30; }
+
+// T373 r3: variables shadow the same-spelled generic callback at constructor argument sites.
+T id<T>(T x) { return x + 100; }
+int t373FnPtrParamShadow(int id)
+{
+    t373.W w = t373.W(id);
+    return w.value;
+}
+struct T373FnPtrFieldShadow
+{
+    int id = 7;
+    int get() { t373.W w = t373.W(id); return w.value; }
+};
+namespace t373FnPtrGlobalShadow
+{
+    int id = 7;
+    int get() { t373.W w = t373.W(id); return w.value; }
+}
+
+int t373NativeFirst(function<int(int)> f) { return f(1) + 10; }
+int t373NativeFirst(function<double(double, int)> f) { return 99; }
+int t373NativeBoth(function<int(int)> f) { return f(1) + 10; }
+int t373NativeBoth(function<long(long)> f) { return (int)f(1) + 20; }
+int t373NativeSecond(function<double(double, int)> f) { return 99; }
+int t373NativeSecond(function<int(int)> f) { return f(1) + 10; }
+int t373NativeNone(function<int(int, int)> f) { return 1; }
+int t373NativeNone(function<double(double, double)> f) { return 2; }
 
 // Defaulted-argument default constructors (section 2701-2711): a field and a global of a class
 // whose only default constructor needs a C++ default argument cflat cannot pass.
@@ -1939,6 +1978,10 @@ extern int main()
     // ALIASED specialization by reference, so a second registration would not bind here.
     if (gcellalias_take(gcellaliasCtor) != 11)            return 1584;
     if (cellalias_take(cellaliasCtor) != 12)              return 1585;
+    T383CppAliasOuter t383CppAlias = default;
+    t383CppAlias.field.tag = 7;
+    if (t383CppAlias.field.tag != 7)                      return 1600;
+    if (t383CppAlias.Read() != 11)                        return 1601;
     // An alias template inside a NESTED namespace, constructor-called.
     cppta.deep.DeepCellAlias<int> cellaliasDeep = cppta.deep.DeepCellAlias<int>();
     if (cellaliasDeep.value != 9)                         return 1586;
@@ -4208,6 +4251,38 @@ extern int main()
         if (*p != 16) return 2823;
     }
     if (s7DeleterCalls != 7) return 2824;
+    {
+        cppt.NoMoveFnUniquePtr<int, function<void(int*)>> p =
+            cppt.NoMoveFnUniquePtr<int, function<void(int*)>>(new int(17), s7GenericDelete);
+        if (*p != 17) return 2830;
+    }
+    if (s7GenericDeleterCalls != 1) return 2831;
+    {
+        cppfnptr.Sink sink = cppfnptr.Sink();
+        if (sink.member(s7GenericCppMethod) != 1) return 2834;
+        cppfnptr.Sink invoked = cppfnptr.Sink(s7GenericCppMethod);
+        if (invoked.value != 34) return 2835;
+        if (cppfnptr.callback_call(cppfnptr.plus_one, s7GenericCppMethod(4)) != 35) return 2836;
+    }
+    // T373 r3: a local, parameter, field and namespace global named `id` stay values in ctor args.
+    {
+        int id = 7;
+        t373.W w = t373.W(id);
+        if (w.value != 7) return 2840;
+    }
+    if (t373FnPtrParamShadow(7) != 7) return 2841;
+    T373FnPtrFieldShadow t373FieldShadow = T373FnPtrFieldShadow();
+    if (t373FieldShadow.get() != 7) return 2842;
+    if (t373FnPtrGlobalShadow.get() != 7) return 2843;
+    // Each overload set must scan every callback destination and retain the sole match.
+    if (t373.freeFirst(id) != 111) return 2844;
+    if (t373.freeSecond(id) != 111) return 2845;
+    t373.M t373Method = t373.M();
+    if (t373Method.first(id) != 111) return 2846;
+    if (t373Method.second(id) != 111) return 2847;
+    if (t373NativeFirst(id) != 111) return 2848;
+    if (t373NativeSecond(id) != 111) return 2849;
+    if (t373.defSole(id) != 111) return 2991;
     // Another specialization of the same template initializes the declared one in place from
     // the arguments (master behaviour): clang reaches optional's constrained converting ctor.
     {

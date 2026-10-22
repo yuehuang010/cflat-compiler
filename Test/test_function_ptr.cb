@@ -4,6 +4,7 @@ import "string.cb";
 import "dictionary.cb";
 import "library/c_variadic_fnptr.h";
 import "library/c_variadic_aggregate.c";
+import "library/cinterop.c";
 
 // ── Named functions used throughout ──────────────────────────────────────────
 
@@ -6072,6 +6073,102 @@ bool testT283AliasDeclCopy()
     return result;
 }
 
+int t373Read<T>(T* p) { return *p + 100; }
+extern short cbf_ext_def_ret(int value) { return (short)value; }
+extern u8 cbf_ext_def_retu(int value) { return (u8)value; }
+int t373Apply(function<int(int*)> f) { int value = 2; return f(&value); }
+int t373ApplyGeneric<T>(function<int(int*)> f) { int value = 3; return f(&value); }
+T t373ReturnOnly<T>() { return 77; }
+int t373Add<T, U>(T* a, U* b) { return *a + *b; }
+int t373Select<T>(T* p) { return *p + 100; }
+int t373Select(float* p) { return 900; }
+int t373ReadChar<T>(T p) { return p[0]; }
+function<int(int*)> t373ReturnRead() { return t373Read; }
+struct T373FunctionHolder { function<int(int*)> callback = t373Read; };
+
+bool testT373GenericFunctionNameDestinations()
+{
+    bool result = true;
+    int value = 1;
+    function<int(int*)> direct = t373Read;
+    result &= Test("t373 generic bare name into function slot", direct(&value), 101);
+    result &= Test("t373 generic bare name into native parameter", t373Apply(t373Read), 102);
+    result &= Test("t373 generic bare name into generic parameter",
+        t373ApplyGeneric<int>(t373Read), 103);
+    Lambda<int(int*)> closure = t373Read;
+    result &= Test("t373 generic bare name into Lambda slot", closure(&value), 101);
+    function<int(int*)> returned = t373ReturnRead();
+    result &= Test("t373 generic bare name in return", returned(&value), 101);
+    T373FunctionHolder holder = default;
+    int fieldValue = 6;
+    result &= Test("t373 generic bare name in field default", holder.callback(&fieldValue), 106);
+    holder.callback = t373Read;
+    int assignedValue = 7;
+    result &= Test("t373 generic bare name in field assignment", holder.callback(&assignedValue), 107);
+    function<int(int*, int*)> two = t373Add;
+    int left = 4;
+    int right = 8;
+    result &= Test("t373 two generic parameters from function type", two(&left, &right), 12);
+    function<int()> returnOnly = t373ReturnOnly;
+    result &= Test("t373 return-only generic parameter from function type", returnOnly(), 77);
+    function<int(int*)> reusedA = t373Read;
+    function<int(int*)> reusedB = t373Read;
+    result &= Test("t373 reused generic function instance", reusedA(&value) + reusedB(&value), 202);
+    function<int(int*)> selected = t373Select;
+    result &= Test("t373 generic beats mismatching concrete overload", selected(&value), 101);
+    result &= Test("t373 C callback destination", c14CallTake(t373ReadChar, "A"), 66);
+    return result;
+}
+
+int t380Identity<T>(T value) { return value; }
+int t380ReadChar<T>(T value) { return value[0]; }
+int t380R2Apply(function<int(int)> fn, int value) { return fn(value); }
+int t380R2Concrete(int value) { return value; }
+
+bool testT380GenericFunctionNameAcceptSet()
+{
+    bool result = true;
+    function<int(int)> direct = t380Identity;
+    result &= Test("t380 generic name into function slot", direct(7), 7);
+    Lambda<int(int)> closure = t380Identity;
+    result &= Test("t380 generic name into Lambda slot", closure(8), 8);
+    result &= Test("t380 generic name into C callback", c14CallTake(t380ReadChar, "A"), 66);
+    {
+        int t380Identity = 3;
+        result &= Test("t380 local shadows generic name", t380Identity, 3);
+    }
+    result &= Test("t380 ordinary generic call", t380Identity(9), 9);
+    return result;
+}
+
+bool testT380R2GenericFunctionConsumers()
+{
+    bool result = true;
+    result &= Test("t380 r2 call result under plus", t380R2Apply(t380Identity, 3) + 4, 7);
+    result &= Test("t380 r2 call result under multiply", 2 * t380R2Apply(t380Identity, 3), 6);
+    result &= Test("t380 r2 call result under shift", t380R2Apply(t380Identity, 3) << 1, 6);
+    result &= Test("t380 r2 call result under comparison",
+        t380R2Apply(t380Identity, 3) == 3 ? 1 : 0, 1);
+    result &= Test("t380 r2 call result under relational comparison",
+        t380R2Apply(t380Identity, 3) > 2 ? 1 : 0, 1);
+    Lambda<int()> closure = () => { return t380R2Apply(t380Identity, 3) + 1; };
+    result &= Test("t380 r2 call in lambda body", closure(), 4);
+    result &= Test("t380 r2 call in ternary arms",
+        true ? t380R2Apply(t380Identity, 3) : t380R2Apply(t380Identity, 4), 3);
+    result &= Test("t380 r2 concrete function condition", t380R2Concrete ? 1 : 0, 1);
+    int concreteConditions = 0;
+    if (t380R2Concrete) concreteConditions++;
+    while (t380R2Concrete) { concreteConditions++; break; }
+    for (; t380R2Concrete;) { concreteConditions++; break; }
+    if (!t380R2Concrete) return false;
+    result &= Test("t380 r2 concrete function logical and",
+        t380R2Concrete && true ? 1 : 0, 1);
+    result &= Test("t380 r2 concrete function logical or",
+        false || t380R2Concrete ? 1 : 0, 1);
+    result &= Test("t380 r2 concrete function condition slots", concreteConditions, 3);
+    return result;
+}
+
 
 int t370SumView(int[] values)
 {
@@ -6241,6 +6338,9 @@ extern int main(int argc, char** argv)
     // 'move' in function pointer signatures
     total++; passed += testFuncPtrMoveSignature()      ? 1 : 0;
     total++; passed += testT208FunctionArgAcceptSet()  ? 1 : 0;
+    total++; passed += testT373GenericFunctionNameDestinations() ? 1 : 0;
+    total++; passed += testT380GenericFunctionNameAcceptSet() ? 1 : 0;
+    total++; passed += testT380R2GenericFunctionConsumers() ? 1 : 0;
 
     // Non-capturing lambda across the C ABI
     total++; passed += testNonCapturingLambdaToCFuncPtr() ? 1 : 0;

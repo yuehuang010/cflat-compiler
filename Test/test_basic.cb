@@ -542,6 +542,214 @@ int localEnumSiblingBlocks()
     return result;
 }
 
+int t371ParameterSameScope(int n)
+{
+    enum n : int { A = 3 };
+    return n + 1;
+}
+
+int t371SameScopeLocalWins()
+{
+    int n = 9;
+    enum n : int { A = 3 };
+    return n + 1;
+}
+
+int t371QualifiedEnumerator()
+{
+    enum n : int { A = 3 };
+    return (int)n.A;
+}
+
+int t371TypeAfterEnum()
+{
+    enum n : int { A = 3 };
+    n value = n.A;
+    return (int)value;
+}
+
+int t371InnerValueWins()
+{
+    { enum n : int { A = 3 }; { int n = 1; return n; } }
+    return 0;
+}
+
+int t371SiblingBlockDoesNotShadow()
+{
+    int n = 9;
+    { enum n : int { A = 3 }; }
+    return n + 1;
+}
+
+int t371ValueBeforeEnum()
+{
+    int n = 9;
+    { int value = n + 1; enum n : int { A = 3 }; return value; }
+    return 0;
+}
+
+int t371SizeofType()
+{
+    enum n : int { A = 3 };
+    return (int)sizeof(n);
+}
+
+int t371CastTarget()
+{
+    enum n : int { A = 3 };
+    n value = (n)3;
+    return (int)value;
+}
+
+int t371Identity<T>(T value) { return (int)value; }
+struct T371MemberOuterHolder { int value = 7; };
+interface T371CaseBase { int get(); };
+class T371CaseBox : T371CaseBase { int value = 4; int get() { return value; } };
+
+int t371ForInitValue()
+{
+    int sum = 0;
+    { enum n : int { A = 3 }; for (int n = 0; n < 4; n++) sum += n; }
+    return sum;
+}
+
+int t371RangeForValue()
+{
+    int[3] values = { 1, 2, 3 };
+    int sum = 0;
+    { enum n : int { A = 3 }; for (int n in values) sum += n; }
+    return sum;
+}
+
+int t371LambdaParameterValue()
+{
+    { enum n : int { A = 3 }; Lambda<int(int)> f = (int n) => { return n; }; return f(4); }
+}
+
+int t371MemberOuterValue()
+{
+    int n = 7;
+    {
+        enum n : int { A = 3 };
+        n value = n.A;
+        int result = (int)value;
+        switch (3) { case n.A: result += 5; break; default: break; }
+        return result + t371Identity<n>(n.A);
+    }
+}
+
+int t371StructMemberOuterValue()
+{
+    T371MemberOuterHolder n = default;
+    { enum n : int { A = 3 }; return (int)n.A; }
+}
+
+int t371CaseArmBindingValue()
+{
+    T371CaseBox concrete = default;
+    T371CaseBase iface = concrete;
+    { enum n : int { A = 3 }; switch (iface) { case T371CaseBox* n => return n.get(); default => return 0; } }
+}
+
+int t379IssueDtorValue = 0;
+struct T379IssueCtor { int r = 0; T379IssueCtor() { { enum n : int { A = 3 }; r = n.A; } } };
+struct T379IssueDtor { ~T379IssueDtor() { { enum n : int { A = 4 }; t379IssueDtorValue = n.A; } } };
+
+struct T379CtorA { int value = 0; T379CtorA() { enum n : int { A = 3 }; value = n.A; } };
+struct T379CtorB { int value = 0; T379CtorB() { enum n : int { A = 4 }; value = n.A; } };
+
+int t379DtorSum = 0;
+struct T379DtorA { ~T379DtorA() { enum n : int { A = 3 }; t379DtorSum += n.A; } };
+struct T379DtorB { ~T379DtorB() { enum n : int { A = 4 }; t379DtorSum += n.A; } };
+
+int t379OrdinaryEnum() { enum n : int { A = 4 }; return n.A; }
+struct T379CtorFunction { int value = 0; T379CtorFunction() { enum n : int { A = 3 }; value = n.A; } };
+
+struct T379Box<T>
+{
+    int value = 0;
+    T379Box() { enum n : int { A = 3 }; value = (int)n.A + (int)sizeof(T); }
+};
+
+struct T379LambdaCtor
+{
+    int value = 0;
+    T379LambdaCtor()
+    {
+        enum n : int { A = 3 };
+        Lambda<int()> f = () => { enum n : int { A = 4 }; return (int)n.A; };
+        value = (int)n.A + f();
+    }
+};
+
+struct T379MethodCtor
+{
+    int value = 0;
+    T379MethodCtor() { enum n : int { A = 3 }; value = (int)n.A; }
+    int f() { enum n : int { A = 4 }; return (int)n.A; }
+};
+
+enum T379FileEnum : int { A = 5 };
+struct T379FileShadowCtor
+{
+    int value = 0;
+    T379FileShadowCtor() { enum T379FileEnum : int { A = 3 }; value = (int)T379FileEnum.A; }
+};
+
+int t379ProgramDtorValue = 0;
+struct T379ProgramDtorCtor
+{
+    T379ProgramDtorCtor() { enum n : int { A = 3 }; t379ProgramDtorValue += (int)n.A; }
+};
+program T379EnumProgram
+{
+    int main(move list<string> args) { return 0; }
+    ~T379EnumProgram() { enum n : int { A = 4 }; t379ProgramDtorValue += (int)n.A; }
+};
+
+bool testT379LocalEnums()
+{
+    bool result = true;
+    T379IssueCtor issueCtor = T379IssueCtor();
+    { T379IssueDtor issueDtor = default; }
+    result &= Test("t379_ctor_dtor_enum_scope", issueCtor.r + t379IssueDtorValue, 7);
+
+    T379CtorA ctorA = T379CtorA();
+    T379CtorB ctorB = T379CtorB();
+    result &= Test("t379_ctor_ctor_enum_scope", ctorA.value + ctorB.value, 7);
+
+    {
+        T379DtorA dtorA = default;
+        T379DtorB dtorB = default;
+    }
+    result &= Test("t379_dtor_dtor_enum_scope", t379DtorSum, 7);
+
+    T379CtorFunction ctorFunction = T379CtorFunction();
+    result &= Test("t379_ctor_function_enum_scope", ctorFunction.value + t379OrdinaryEnum(), 7);
+
+    T379Box<int> boxInt = T379Box<int>();
+    T379Box<long> boxLong = T379Box<long>();
+    result &= Test("t379_generic_ctor_enum_scope", boxInt.value + boxLong.value,
+        6 + (int)sizeof(int) + (int)sizeof(long));
+
+    T379LambdaCtor lambdaCtor = T379LambdaCtor();
+    result &= Test("t379_ctor_lambda_enum_scope", lambdaCtor.value, 7);
+
+    T379MethodCtor methodCtor = T379MethodCtor();
+    result &= Test("t379_ctor_method_enum_scope", methodCtor.value + methodCtor.f(), 7);
+
+    T379FileShadowCtor fileShadowCtor = T379FileShadowCtor();
+    result &= Test("t379_ctor_shadows_file_enum", fileShadowCtor.value + (int)T379FileEnum.A, 8);
+
+    {
+        T379ProgramDtorCtor programDtorCtor = T379ProgramDtorCtor();
+        T379EnumProgram programDtor = default;
+    }
+    result &= Test("t379_program_dtor_enum_scope", t379ProgramDtorValue, 7);
+
+    return result;
+}
+
 enum T115Enum : int { Value = 1 };
 int t115GenericEnum<T>(T x) { return (int)T115Enum.Value + (int)x; }
 int t115GenericEnumCaller()
@@ -578,6 +786,21 @@ bool testEnum()
     result &= Test("local_enum_switch_lambda_sizeof",
         localEnumFeatures() + localEnumFeaturesSecond(), 36);
     result &= Test("local_enum_sibling_blocks", localEnumSiblingBlocks(), 7);
+    result &= Test("t371_parameter_same_scope", t371ParameterSameScope(9), 10);
+    result &= Test("t371_same_scope_local_wins", t371SameScopeLocalWins(), 10);
+    result &= Test("t371_qualified_enumerator", t371QualifiedEnumerator(), 3);
+    result &= Test("t371_type_after_enum", t371TypeAfterEnum(), 3);
+    result &= Test("t371_inner_value_wins", t371InnerValueWins(), 1);
+    result &= Test("t371_sibling_block_does_not_shadow", t371SiblingBlockDoesNotShadow(), 10);
+    result &= Test("t371_value_before_enum", t371ValueBeforeEnum(), 10);
+    result &= Test("t371_sizeof_type", t371SizeofType(), 4);
+    result &= Test("t371_cast_target", t371CastTarget(), 3);
+    result &= Test("t371_for_init_value", t371ForInitValue(), 6);
+    result &= Test("t371_range_for_value", t371RangeForValue(), 6);
+    result &= Test("t371_lambda_parameter_value", t371LambdaParameterValue(), 4);
+    result &= Test("t371_member_outer_value", t371MemberOuterValue(), 11);
+    result &= Test("t371_struct_member_outer_value", t371StructMemberOuterValue(), 3);
+    result &= Test("t371_case_arm_binding_value", t371CaseArmBindingValue(), 4);
     result &= Test("local_enum_scope_not_captured_by_generic",
         t115GenericEnumCaller(), 11);
 
@@ -5622,6 +5845,7 @@ extern int main()
     total++; passed += testAssertReturnBlock()           ? 1 : 0;
     total++; passed += testExplicitIntTypes()            ? 1 : 0;
     total++; passed += testEnum()                        ? 1 : 0;
+    total++; passed += testT379LocalEnums()               ? 1 : 0;
     total++; passed += testNegativeGlobalInit()          ? 1 : 0;
     total++; passed += testConstGlobalIsNotAMacro()      ? 1 : 0;
     total++; passed += testNullConditional()             ? 1 : 0;
@@ -8172,9 +8396,24 @@ struct C02Self { const int id = 0; int peer = 0; C02Self(int i) { id = i; C02Sel
 struct C02Ptrs { int n = 0; int* p = nullptr; };
 struct C02Holder { (const C02Ptrs)* p = nullptr; };
 struct C02Gen<T> { T value = default; };
+struct C02Plain { int n = 0; };
 using C02StampAlias = C02Stamp;
 using C02GenAlias = C02Gen<C02Stamp>;
+using C02PlainAlias = C02Plain;
 namespace c02ns { struct Wrap<T> { T value = default; }; }
+using c02n = c02ns;
+namespace c02outer
+{
+    namespace ns { struct Wrap<T> { T value = default; }; }
+    int relativeConst() { return is_assignable(ns.Wrap<C02Stamp>) ? 1 : 0; }
+    int relativeConstGrouped() { return is_assignable((ns.Wrap<C02Stamp>)) ? 1 : 0; }
+    int relativePlain() { return is_assignable(ns.Wrap<int>) ? 1 : 0; }
+    int relativePlainGrouped() { return is_assignable((ns.Wrap<int>)) ? 1 : 0; }
+}
+int c02AliasNsConst() { return is_assignable(c02n.Wrap<C02Stamp>) ? 1 : 0; }
+int c02AliasNsConstGrouped() { return is_assignable((c02n.Wrap<C02Stamp>)) ? 1 : 0; }
+int c02AliasNsPlain() { return is_assignable(c02n.Wrap<int>) ? 1 : 0; }
+int c02AliasNsPlainGrouped() { return is_assignable((c02n.Wrap<int>)) ? 1 : 0; }
 C02Stamp c02Make(int i) { C02Stamp r = C02Stamp(i); return r; }
 int c02Take(C02Stamp s) { return s.id; }
 int c02Borrow(alias C02Stamp s) { return s.id + s.hits; }
@@ -8234,6 +8473,26 @@ bool testConstFields()
     result &= Test("const_field_containers", c02Containers(), 0);
     result &= Test("const_field_is_assignable", c02Assignable<int>() + c02Assignable<C02Ptrs>() + c02Assignable<C02Stamp*>(), 3);
     result &= Test("const_field_not_assignable", c02Assignable<C02Stamp>() + c02Assignable<C02Wrap>(), 0);
+    int acceptedSpellings = (is_assignable(C02Plain) ? 1 : 0) + (is_assignable((C02Plain)) ? 1 : 0)
+        + (is_assignable(C02PlainAlias) ? 1 : 0) + (is_assignable((C02PlainAlias)) ? 1 : 0)
+        + (is_assignable(C02Gen<int>) ? 1 : 0) + (is_assignable((C02Gen<int>)) ? 1 : 0);
+    result &= Test("const_field_is_assignable_accept_set", acceptedSpellings, 6);
+    result &= Test("const_field_is_assignable_grouped_struct", is_assignable((C02Stamp)) ? 1 : 0, 0);
+    result &= Test("const_field_is_assignable_grouped_alias", is_assignable((C02StampAlias)) ? 1 : 0, 0);
+    result &= Test("const_field_is_assignable_grouped_generic", is_assignable((C02Gen<C02Stamp>)) ? 1 : 0, 0);
+    result &= Test("const_field_is_assignable_grouped_generic_alias", is_assignable((C02GenAlias)) ? 1 : 0, 0);
+    result &= Test("const_field_is_assignable_grouped_namespace_generic", is_assignable((c02ns.Wrap<C02Stamp>)) ? 1 : 0, 0);
+    result &= Test("const_field_is_assignable_nested_grouping", is_assignable(((C02Stamp)) ) ? 1 : 0, 0);
+    result &= Test("const_field_is_assignable_grouped_substitution", c02GroupedAssignable<C02Stamp>(), 0);
+    result &= Test("const_field_is_assignable_grouped_substitution_plain", c02GroupedAssignable<int>(), 1);
+    result &= Test("const_field_is_assignable_namespace_alias", c02AliasNsConst(), 0);
+    result &= Test("const_field_is_assignable_namespace_alias_grouped", c02AliasNsConstGrouped(), 0);
+    result &= Test("const_field_is_assignable_namespace_alias_plain", c02AliasNsPlain(), 1);
+    result &= Test("const_field_is_assignable_namespace_alias_plain_grouped", c02AliasNsPlainGrouped(), 1);
+    result &= Test("const_field_is_assignable_relative_namespace", c02outer.relativeConst(), 0);
+    result &= Test("const_field_is_assignable_relative_namespace_grouped", c02outer.relativeConstGrouped(), 0);
+    result &= Test("const_field_is_assignable_relative_namespace_plain", c02outer.relativePlain(), 1);
+    result &= Test("const_field_is_assignable_relative_namespace_plain_grouped", c02outer.relativePlainGrouped(), 1);
     int direct = (is_assignable(C02Gen<C02Stamp>) ? 0 : 1) + (is_assignable(C02Gen<int>) ? 1 : 0) + (is_assignable(C02Box<int>) ? 0 : 1);
     result &= Test("const_field_is_assignable_generic_spelling", direct, 3);
     // An alias and a namespaced generic with no other instantiating use resolve like sizeof's operand.
@@ -8253,6 +8512,7 @@ struct C02Key
     bool operator==(C02Key o) { return id == o.id; }
 };
 int c02Assignable<T>() { if const (is_assignable(T)) return 1; else return 0; }
+int c02GroupedAssignable<T>() { if const (is_assignable((T))) return 1; else return 0; }
 // Containers relocate by construction, so a const-field element type is storable.
 int c02Containers()
 {

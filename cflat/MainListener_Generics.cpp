@@ -769,6 +769,145 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
         return InstantiateGenericFunction(funcName, typeArgs);
     }
 
+std::string MainListener::TryInferAndInstantiateFromFuncPtr(const std::string& funcName,
+        const LLVMBackend::TypeAndValue& destSig, std::string& refusal)
+{
+        auto templateIt = genericFunctionTemplates.find(funcName);
+        if (templateIt == genericFunctionTemplates.end()) return {};
+        auto* funcCtx = compilerLLVM->MaterializeGenericFunction(funcName);
+        if (funcCtx == nullptr) return {};
+        const auto& typeParams = genericFunctionTypeParams[funcName];
+        if (typeParams.empty()) return {};
+
+        LLVMBackend::TypeAndValue destReturn;
+        std::vector<LLVMBackend::TypeAndValue> destParams;
+        compilerLLVM->UnpackFuncPtrSignature(destSig, destReturn, destParams);
+        if (destSig.FuncPtrReturnConstMask >= 0)
+            destReturn.ConstMask = static_cast<uint8_t>(destSig.FuncPtrReturnConstMask);
+        for (size_t i = 0; i < destParams.size() && i < destSig.FuncPtrParams.size(); ++i)
+            if (destSig.FuncPtrParams[i].ConstMask >= 0)
+                destParams[i].ConstMask = static_cast<uint8_t>(destSig.FuncPtrParams[i].ConstMask);
+            else if (destSig.FuncPtrParams[i].IsPointeeConst)
+                destParams[i].ConstMask = 1;
+        auto* paramList = funcCtx->parameterTypeList();
+        auto paramDecls = paramList != nullptr && paramList->parameterList() != nullptr
+            ? paramList->parameterList()->parameterDeclaration()
+            : std::vector<CFlatParser::ParameterDeclarationContext*>{};
+        if (paramDecls.size() != destParams.size()) return {};
+
+        std::unordered_map<std::string, std::string> inferred;
+        bool conflict = false;
+        auto deduce = [&](const LLVMBackend::TypeAndValue& pattern,
+                          const LLVMBackend::TypeAndValue& actual) {
+            auto typeParam = std::find(typeParams.begin(), typeParams.end(), pattern.TypeName);
+            if (typeParam == typeParams.end()) return;
+
+            const int patternDepth = pattern.Pointer
+                ? std::max(pattern.PointerDepth, 1) : 0;
+            const int actualDepth = actual.Pointer
+                ? std::max(actual.PointerDepth, 1) : 0;
+            const bool patternPointeeConst = (pattern.ConstMask & 1u) != 0;
+            if (actualDepth < patternDepth)
+            {
+                conflict = true;
+                return;
+            }
+            std::string argType = actual.TypeName;
+            const int remainingDepth = actualDepth - patternDepth;
+            argType += std::string(remainingDepth, '*');
+            if ((actual.ConstMask & 1u) != 0 && !patternPointeeConst)
+                argType = remainingDepth == 0
+                    ? "(const " + argType + ")"
+                    : JoinConstTypeArgument(argType, 1);
+            if (argType.empty())
+            {
+                conflict = true;
+                return;
+            }
+            auto [it, inserted] = inferred.emplace(pattern.TypeName, argType);
+            if (!inserted && it->second != argType) conflict = true;
+        };
+
+        LLVMBackend::DeclTypeAndValue returnPattern = getFunctionReturnType(funcCtx);
+        if (funcCtx->declarationSpecifiers() != nullptr)
+            for (auto* spec : funcCtx->declarationSpecifiers()->declarationSpecifier())
+            {
+                auto* typeSpec = spec->typeSpecifier();
+                auto* genericType = typeSpec != nullptr ? typeSpec->genericIdentifier() : nullptr;
+                if (genericType == nullptr || genericType->Identifier() == nullptr) continue;
+                const std::string name = genericType->Identifier()->getText();
+                if (std::find(typeParams.begin(), typeParams.end(), name) == typeParams.end()) continue;
+                returnPattern = {};
+                returnPattern.TypeName = name;
+                returnPattern.Pointer = spec->pointer() != nullptr;
+                returnPattern.PointerDepth = PointerDepthOf(spec->pointer());
+                break;
+            }
+        deduce(returnPattern, destReturn);
+        for (size_t i = 0; i < paramDecls.size(); ++i)
+        {
+            auto paramPattern = ParseDeclarationSpecifiers(
+                paramDecls[i]->declarationSpecifiers());
+            deduce(paramPattern, destParams[i]);
+        }
+
+        if (conflict)
+        {
+            refusal = std::format(
+                "cannot deduce generic function '{}' from destination '{}': conflicting or incompatible type deductions",
+                funcName, compilerLLVM->FuncPtrSpellingOf(destSig));
+            return {};
+        }
+        if (inferred.size() != typeParams.size())
+        {
+            std::vector<std::string> missing;
+            for (const auto& param : typeParams)
+                if (inferred.find(param) == inferred.end()) missing.push_back(param);
+            std::string names;
+            for (size_t i = 0; i < missing.size(); ++i)
+            {
+                if (i != 0) names += ", ";
+                names += missing[i];
+            }
+            refusal = std::format(
+                "cannot deduce generic function '{}' from destination '{}': no deduction for template parameter(s) {}",
+                funcName, compilerLLVM->FuncPtrSpellingOf(destSig), names);
+            return {};
+        }
+
+        std::vector<std::string> typeArgs;
+        for (const auto& param : typeParams)
+            typeArgs.push_back(inferred.at(param));
+        return InstantiateGenericFunction(funcName, typeArgs);
+    }
+
+std::vector<size_t> MainListener::DeduceGenericFunctionCallbackCandidates(
+    const std::string& funcName,
+    const std::vector<LLVMBackend::TypeAndValue>& callbackCandidates)
+{
+    std::vector<size_t> deduced;
+    for (size_t i = 0; i < callbackCandidates.size(); ++i)
+    {
+        const auto& callbackSignature = callbackCandidates[i];
+        std::string refusal;
+        const std::string mangled = TryInferAndInstantiateFromFuncPtr(
+            funcName, callbackSignature, refusal);
+        if (mangled.empty()) continue;
+
+        auto instantiated = compilerLLVM->functionTable.find(
+            compilerLLVM->ResolveQualifiedName(mangled));
+        if (instantiated == compilerLLVM->functionTable.end()) continue;
+        const bool bindable = std::any_of(instantiated->second.begin(),
+            instantiated->second.end(), [&](const auto& symbol) {
+                return !symbol.IsMethod
+                    && compilerLLVM->DescribeFuncPtrBindMismatch(mangled,
+                        compilerLLVM->FuncPtrSigOfSymbol(symbol), callbackSignature).empty();
+            });
+        if (bindable) deduced.push_back(i);
+    }
+    return deduced;
+}
+
 LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::FunctionPointerSpecifierContext* fpSpec) {
         LLVMBackend::TypeAndValue tv;
         tv.IsFunctionPointer = true;
@@ -883,10 +1022,18 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
             ResolveEnumTypeArguments(typeArgs);
             // Instantiation PRE-SCAN: opportunistic, so a refused pattern is reported by the
             // declaration path instead, inside whatever scope the spelling actually sits in.
-            Compiler()->ResolveGenericAliasSpelling(baseName, typeArgs, false);
+            const std::string spelledBase = baseName;
+            baseName = ResolveGenericTemplateSpellingAtScope(
+                Compiler(), spelledBase, typeArgs,
+                structScopeStack.empty() ? std::string{} : structScopeStack.back(),
+                genParams, spelledBase, false);
+            if (baseName.empty()) continue;
             Compiler()->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
 
-            std::string mangledName = MangledGenericName(baseName, typeArgs);
+            std::string mangledName = Compiler()->IsGenericBaseAlias(spelledBase)
+                && !Compiler()->HasCxxAliasTemplate(spelledBase)
+                ? MangleGenericInstance(*Compiler(), baseName, typeArgs)
+                : MangledGenericName(baseName, typeArgs, genParams);
 
             // Queue the instantiation instead of doing it immediately
             const bool pointerOnly = IsPointerOnlyTypeUse(typeSpec);
@@ -901,10 +1048,16 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
         }
     }
 
-std::string MainListener::MangledGenericName(const std::string& baseName, const std::vector<std::string>& typeArgs) {
+std::string MainListener::MangledGenericName(const std::string& baseName,
+    const std::vector<std::string>& typeArgs, antlr4::tree::ParseTree* useSite) {
         std::vector<std::string> resolvedArgs = typeArgs;
         ResolveEnumTypeArguments(resolvedArgs);
-        return MangleGenericInstance(*Compiler(), baseName, resolvedArgs);
+        auto* compiler = Compiler();
+        const std::string scope = structScopeStack.empty() ? std::string{} : structScopeStack.back();
+        const std::string resolvedBase = ResolveGenericTemplateBaseAtScope(
+            compiler, baseName, scope, useSite, baseName);
+        if (resolvedBase.empty()) return {};
+        return MangleGenericInstance(*compiler, resolvedBase, resolvedArgs);
     }
 
 void MainListener::ResolveEnumTypeArguments(std::vector<std::string>& typeArgs)
@@ -1056,6 +1209,27 @@ void MainListener::ProcessPendingInstantiations() {
             pendingInstantiations.erase(pendingInstantiations.begin() + pick);
             // Nested drains run under the enclosing body's alias frames; this record gets none of them.
             LLVMBackend::AliasStackParkGuard parkedAliases(compilerLLVM);
+            struct LexicalAliasScopePopGuard
+            {
+                LLVMBackend* compiler;
+                size_t count;
+                ~LexicalAliasScopePopGuard()
+                {
+                    while (count > 0)
+                    {
+                        compiler->PopAliasScope();
+                        --count;
+                    }
+                }
+            } lexicalAliasPop{ compilerLLVM, 0 };
+            if (auto aliases = genericLexicalAliasScopes_.find(pending.templateName);
+                aliases != genericLexicalAliasScopes_.end())
+                for (const auto& frame : aliases->second)
+                {
+                    compilerLLVM->PushAliasScope();
+                    compilerLLVM->aliasScopeStack_.back() = frame;
+                    ++lexicalAliasPop.count;
+                }
 
             // Publish this record's origin for the duration of its instantiation: a body type
             // lookup that fails on a substituted array view is reported at the user's argument.

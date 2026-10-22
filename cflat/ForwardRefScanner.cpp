@@ -50,6 +50,92 @@ std::string ForwardRefScanner::ResolveTupleTypeSpecifier(
         return tupleName;
     }
 
+std::string ForwardRefScanner::ResolveGenericTemplateBaseAtUse(
+    LLVMBackend* compiler, const std::string& spelledBase, antlr4::tree::ParseTree* useSite,
+    const std::string& lookupName)
+{
+        if (compiler == nullptr || spelledBase.empty()) return spelledBase;
+        auto definitionFor = [&](const std::string& key) -> antlr4::ParserRuleContext*
+        {
+            if (auto it = scannedGenericAggregates_.find(key); it != scannedGenericAggregates_.end())
+                return it->second;
+            return compiler->GetGenericTemplateDefinitionContext(key);
+        };
+        auto isLater = [&](const std::string& key)
+        {
+            auto* use = dynamic_cast<antlr4::ParserRuleContext*>(useSite);
+            auto* definition = definitionFor(key);
+            return use != nullptr && use->getStart() != nullptr && definition != nullptr
+                && definition->getStart() != nullptr
+                && definition->getStart()->getTokenIndex() >= use->getStart()->getTokenIndex();
+        };
+        const auto scopes = EnclosingAggregateScopesFromContext(compiler, useSite);
+        const std::string& lexicalName = lookupName.empty() ? spelledBase : lookupName;
+        const bool lexicalBareName = lexicalName.find('.') == std::string::npos;
+        const bool hasExactKey = compiler->IsGenericTemplateKey(spelledBase);
+        if (lexicalBareName)
+        {
+            for (const auto& scope : scopes)
+            {
+                const std::string nested = scope.Name + "." + lexicalName;
+                if (compiler->IsGenericTemplateKey(nested))
+                {
+                    if (!IsAggregateMemberDeclarationTypeUse(useSite) || !isLater(nested)) return nested;
+                    const std::string fallback = hasExactKey ? spelledBase
+                        : compiler->ResolveGenericBaseAlias(spelledBase);
+                    if (!compiler->IsGenericTemplateKey(fallback)
+                        || GenericTemplateKeyNestedInAnyScope(fallback, scopes)) return {};
+                    return fallback;
+                }
+                if (HasVisibleNonGenericAggregateName(scope, lexicalName, useSite)) return {};
+            }
+        }
+        if (compiler->HasCxxAliasTemplate(lexicalName)) return spelledBase;
+        if (compiler->IsGenericBaseAlias(lexicalName))
+            return compiler->ResolveGenericBaseAlias(lexicalName);
+        if (hasExactKey)
+        {
+            if (IsAggregateMemberDeclarationTypeUse(useSite)
+                && GenericTemplateKeyNestedInAnyScope(spelledBase, scopes) && isLater(spelledBase)) return {};
+            return spelledBase;
+        }
+        const std::string base = compiler->ResolveGenericBaseAlias(spelledBase);
+        if (compiler->IsGenericTemplateKey(base))
+        {
+            if (IsAggregateMemberDeclarationTypeUse(useSite)
+                && GenericTemplateKeyNestedInAnyScope(base, scopes) && isLater(base)) return {};
+            return base;
+        }
+        const std::string resolved = ResolveGenericTemplateBaseAtScope(
+            compiler, spelledBase, scopes, useSite, lexicalName);
+        if (IsAggregateMemberDeclarationTypeUse(useSite)
+            && GenericTemplateKeyNestedInAnyScope(resolved, scopes) && isLater(resolved))
+        {
+            if (!lexicalBareName) return {};
+            const std::string fallback = compiler->IsGenericTemplateKey(base)
+                ? base : compiler->ResolveGenericTemplateBase(lexicalName);
+            if (!compiler->IsGenericTemplateKey(fallback) || fallback == resolved
+                || GenericTemplateKeyNestedInAnyScope(fallback, scopes)) return {};
+            return fallback;
+        }
+        return resolved;
+    }
+
+std::string ForwardRefScanner::ResolveGenericTemplateSpellingAtUse(
+    LLVMBackend* compiler, const std::string& spelledBase, std::vector<std::string>& args,
+    antlr4::tree::ParseTree* useSite, const std::string& lookupName, bool report)
+{
+        if (compiler == nullptr || spelledBase.empty()) return spelledBase;
+        std::string base = ResolveGenericTemplateBaseAtUse(compiler, spelledBase, useSite, lookupName);
+        if (base.empty() || base == spelledBase)
+        {
+            base = spelledBase;
+            compiler->ResolveGenericAliasSpelling(base, args, report);
+            base = ResolveGenericTemplateBaseAtUse(compiler, base, useSite, lookupName);
+        }
+        return base;
+    }
+
 std::vector<CFlatParser::InterfaceMemberContext*> ForwardRefScanner::ResolveInterfaceMembers(CFlatParser::InterfaceDefinitionContext* ctx) {
         std::vector<CFlatParser::InterfaceMemberContext*> out;
         for (auto* m : ctx->interfaceMember())
@@ -304,10 +390,8 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                                 // Keep scanner and codegen argument spellings in sync.
                                 typeArgs.push_back(ResolveForwardTypeArg(entry));
                             }
-                    // A C++ alias template names its target with its OWN argument pattern, which
-                    // may fix, reorder or partially bind the target's parameters.
-                    baseName = spelledBase;
-                    compiler->ResolveGenericAliasSpelling(baseName, typeArgs, false);
+                    baseName = ResolveGenericTemplateSpellingAtUse(
+                        compiler, spelledBase, typeArgs, genParams, spelledBase, false);
                     compiler->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
                     std::string mangledName = MangleGenericInstance(*compiler, baseName, typeArgs);
                     // A generic INTERFACE instantiation is a fat pointer, not a struct: no shell,
@@ -323,8 +407,8 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         auto* parameterList = genParams->typeParameterList();
                         for (auto* entry : parameterList->typeParameterEntry())
                             interfaceArgs.push_back(ResolveForwardTypeArg(entry));
-                        std::string interfaceBase = spelledBase;
-                        compiler->ResolveGenericAliasSpelling(interfaceBase, interfaceArgs, false);
+                        std::string interfaceBase = ResolveGenericTemplateSpellingAtUse(
+                            compiler, spelledBase, interfaceArgs, genParams, spelledBase, false);
                         mangledName = MangleGenericInstance(*compiler, interfaceBase, interfaceArgs);
                     }
                     // No template anywhere by this name: skip the shell, which would suppress the
@@ -1044,8 +1128,8 @@ void ForwardRefScanner::RegisterRenameAlias(CFlatParser::UsingDeclarationContext
                 std::vector<std::string> args;
                 for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                     args.push_back(ResolveForwardTypeArg(entry));
-                std::string resolvedBase = genericBase;
-                compilerLLVM->ResolveGenericAliasSpelling(resolvedBase, args, false);
+                std::string resolvedBase = ResolveGenericTemplateSpellingAtUse(
+                    compilerLLVM, genericBase, args, genParams, genericBase, false);
                 compilerLLVM->CompleteCxxTemplateTypeArgs(resolvedBase, args);
                 if (!compilerLLVM->AnyGenericTypeTemplateNamed(resolvedBase)
                     && !compilerLLVM->IsGenericInterfaceTemplateName(resolvedBase))
@@ -1309,8 +1393,39 @@ void ForwardRefScanner::PreRegisterRenameAliases(antlr4::RuleContext* ctx) {
             switch (ruleCtx->getRuleIndex())
             {
             case CFlatParser::RuleUsingDeclaration:
-                RegisterRenameAlias(static_cast<CFlatParser::UsingDeclarationContext*>(ruleCtx));
+            {
+                auto* usingDecl = static_cast<CFlatParser::UsingDeclarationContext*>(ruleCtx);
+                if (usingDecl->Identifier() != nullptr && usingDecl->typeSpecifier() != nullptr
+                    && usingDecl->typeSpecifier()->functionPointerSpecifier() == nullptr
+                    && usingDecl->pointer() == nullptr && usingDecl->arrayTypeSuffix() == nullptr)
+                {
+                    std::string targetBase;
+                    if (GenericSpecOf(usingDecl->typeSpecifier(), targetBase) == nullptr)
+                    {
+                        PrimitiveTypeError targetError;
+                        targetBase = CanonicalTypeSpecifierText(usingDecl->typeSpecifier(),
+                            usingDecl->multiWordTypeSuffix(), false, &targetError);
+                        if (!HasPrimitiveTypeError(targetError))
+                        {
+                            targetBase = compilerLLVM->ResolveGenericBaseAlias(
+                                compilerLLVM->ResolveTypeAlias(
+                                    compilerLLVM->ResolveQualifiedName(targetBase)));
+                            const bool namesType = compilerLLVM->IsInterfaceType(targetBase)
+                                || compilerLLVM->GetDataStructure(targetBase).StructType != nullptr
+                                || LLVMBackend::IsPrimitiveTypeName(targetBase)
+                                || compilerLLVM->IsWinrtFullName(targetBase);
+                            if (!namesType)
+                            {
+                                compilerLLVM->RegisterNamespaceAlias(
+                                    usingDecl->Identifier()->getText(), targetBase);
+                                break;
+                            }
+                        }
+                    }
+                }
+                RegisterRenameAlias(usingDecl);
                 break;
+            }
             case CFlatParser::RuleExternalDeclaration:
                 PreRegisterRenameAliases(ruleCtx);
                 break;
@@ -1368,10 +1483,12 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
         else if (auto* innerParams = GenericSpecOf(typeSpec, innerBase))
         {
             baseIsGenericInstantiation = true;
+            const std::string spelledInnerBase = innerBase;
             std::vector<std::string> innerArgs;
             for (auto* innerEntry : innerParams->typeParameterList()->typeParameterEntry())
                 innerArgs.push_back(ResolveForwardTypeArg(innerEntry));
-            Compiler(entry)->ResolveGenericAliasSpelling(innerBase, innerArgs, false);
+            innerBase = ResolveGenericTemplateSpellingAtUse(
+                Compiler(entry), spelledInnerBase, innerArgs, entry, spelledInnerBase, false);
             Compiler(entry)->CompleteCxxTemplateTypeArgs(innerBase, innerArgs);
             resolved = MangleGenericInstance(*Compiler(entry), innerBase, innerArgs);
             // Mirror of the main pass's ResolveTypeArgEntry: register a nested foreign C++
@@ -1835,12 +1952,13 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
                 auto* sd = static_cast<CFlatParser::StructDefinitionContext*>(ruleCtx);
                 std::string tn = sd->directDeclarator() != nullptr ? sd->directDeclarator()->getText() : std::string{};
                 recordTypeName(tn);
-                if (sd->genericTypeParameters() != nullptr && !tn.empty())
+                if (sd->genericTypeParameters() != nullptr && !tn.empty() && !unkeyable)
                 {
-                    if (certain) scannedGenericAggregates_[QualifyName(ns, tn)] = sd;
-                    if (certain) scannedGenericAggregateNs_[QualifyName(ns, tn)] = ns;
-                    if (certain) RecordScannedGenericStructName(QualifyName(ns, tn));
-                    else compiler->gts.scannedGenericStructNamesUncertain.insert(QualifyName(ns, tn));
+                    const std::string templateKey = QualifyName(QualifyName(ns, typePath), tn);
+                    if (certain) scannedGenericAggregates_[templateKey] = sd;
+                    if (certain) scannedGenericAggregateNs_[templateKey] = ns;
+                    if (certain) RecordScannedGenericStructName(templateKey);
+                    else compiler->gts.scannedGenericStructNamesUncertain.insert(templateKey);
                 }
                 CollectGenericTemplateDecls(ruleCtx, certain, ifConstUnfoldable, ns, QualifyName(typePath, tn),
                                             unkeyable || sd->genericTypeParameters() != nullptr);
@@ -1851,12 +1969,13 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
                 auto* cd = static_cast<CFlatParser::ClassDefinitionContext*>(ruleCtx);
                 std::string tn = cd->directDeclarator() != nullptr ? cd->directDeclarator()->getText() : std::string{};
                 recordTypeName(tn);
-                if (cd->genericTypeParameters() != nullptr && !tn.empty())
+                if (cd->genericTypeParameters() != nullptr && !tn.empty() && !unkeyable)
                 {
-                    if (certain) scannedGenericAggregates_[QualifyName(ns, tn)] = cd;
-                    if (certain) scannedGenericAggregateNs_[QualifyName(ns, tn)] = ns;
-                    if (certain) RecordScannedGenericStructName(QualifyName(ns, tn));
-                    else compiler->gts.scannedGenericStructNamesUncertain.insert(QualifyName(ns, tn));
+                    const std::string templateKey = QualifyName(QualifyName(ns, typePath), tn);
+                    if (certain) scannedGenericAggregates_[templateKey] = cd;
+                    if (certain) scannedGenericAggregateNs_[templateKey] = ns;
+                    if (certain) RecordScannedGenericStructName(templateKey);
+                    else compiler->gts.scannedGenericStructNamesUncertain.insert(templateKey);
                 }
                 CollectGenericTemplateDecls(ruleCtx, certain, ifConstUnfoldable, ns, QualifyName(typePath, tn),
                                             unkeyable || cd->genericTypeParameters() != nullptr);
@@ -2029,10 +2148,11 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx,
             auto tryPreDeclare = [&](const std::string& spelledBase, CFlatParser::GenericTypeParametersContext* genericParams)
             {
                 auto* compiler = Compiler(genericParams);
+                std::string baseName = ResolveGenericTemplateBaseAtUse(
+                    compiler, spelledBase, genericParams, spelledBase);
                 // No evidence of a generic TYPE template by this name anywhere: pre-declaring an
                 // opaque shell here would suppress the `unknown type` diagnostic the use is owed.
-                if (!compiler->AnyGenericTypeTemplateNamed(spelledBase))
-                    return;
+                if (!compiler->AnyGenericTypeTemplateNamed(baseName)) return;
                 if (GenericArgumentsNeedFunctionLocalEnumDeferral(
                         genericParams, localEnumNames, compiler,
                         &compiler->gts.scannedNonLocalEnumNames,
@@ -2040,7 +2160,6 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx,
                     return;  // The main walk queues this after the local enum declaration registers.
                 // Name the shell after the registered KEY, not the spelling: a bare use inside a
                 // namespace would otherwise leave an opaque 'Box$int' that 'NS.Box$int' never completes.
-                std::string baseName = compiler->ResolveGenericTemplateBase(spelledBase);
                 std::vector<std::string> args;
                 for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
                     args.push_back(ResolveForwardTypeArg(entry));
@@ -2164,9 +2283,13 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx,
                     // The qualified spelling 'NS.Box<int>', only when it names a CFlat template key:
                     // an imported winmd generic is built elsewhere and must get no opaque shell.
                     if (std::string qBase; auto* qParams = GenericSpecOf(typeSpec, qBase))
+                    {
+                        auto* c = Compiler(typeSpec);
+                        const std::string resolvedBase = c->ResolveGenericTemplateBase(qBase);
                         if (typeSpec->qualifiedGenericIdentifier() != nullptr
-                            && Compiler(typeSpec)->IsGenericTemplateKey(qBase))
+                            && c->IsGenericTemplateKey(resolvedBase))
                             tryPreDeclare(qBase, qParams);
+                    }
                     // `Other<int>.Id` in a field / local of a non-generic body, the template declared
                     // later: shell + provisional alias frame now (CFlat owners only, no clang request).
                     if (auto* memberType = typeSpec->memberTypeSpecifier())
@@ -2240,7 +2363,9 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx,
                         if (i + 2 < postfix->children.size())
                             if (auto* params = dynamic_cast<CFlatParser::GenericTypeParametersContext*>(postfix->children[i + 2]))
                             {
-                                if (Compiler(params)->IsGenericTemplateKey(qualified))
+                                auto* c = Compiler(params);
+                                const std::string resolvedBase = c->ResolveGenericTemplateBase(qualified);
+                                if (c->IsGenericTemplateKey(resolvedBase))
                                     tryPreDeclare(qualified, params);
                                 break;
                             }
@@ -2395,8 +2520,8 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
                 // Route every arg through ResolveForwardTypeArg so this shell matches ParseUsingDeclaration.
                 args.push_back(ResolveForwardTypeArg(entry));
             }
-            std::string resolvedBaseName = baseName;
-            compiler->ResolveGenericAliasSpelling(resolvedBaseName, args, false);
+            std::string resolvedBaseName = ResolveGenericTemplateSpellingAtUse(
+                compiler, baseName, args, genParams, baseName, false);
             compiler->CompleteCxxTemplateTypeArgs(resolvedBaseName, args);
             std::string mangledName = MangleGenericInstance(*compiler, resolvedBaseName, args);
             // A generic interface instantiation gets no struct shell / default ctor (see
@@ -2900,10 +3025,12 @@ std::string ForwardRefScanner::ResolveMemberTypeSpecifier(CFlatParser::MemberTyp
         auto* ownerCtx = ctx->memberTypeOwner();
         const std::string ownerText = ownerCtx->getText();
         std::string base = ownerText.substr(0, ownerText.find('<'));
+        const std::string spelledBase = base;
         std::vector<std::string> args;
         for (auto* entry : ownerCtx->genericTypeParameters()->typeParameterList()->typeParameterEntry())
             args.push_back(ResolveForwardTypeArg(entry));
-        compiler->ResolveGenericAliasSpelling(base, args, false);
+        base = ResolveGenericTemplateSpellingAtUse(
+            compiler, spelledBase, args, ownerCtx, spelledBase, false);
         compiler->CompleteCxxTemplateTypeArgs(base, args);
         std::string owner = MangleGenericInstance(*compiler, base, args);
         // Mirror of ScanUsingDeclaration's generic RHS: a CFlat template gets its shell (the main

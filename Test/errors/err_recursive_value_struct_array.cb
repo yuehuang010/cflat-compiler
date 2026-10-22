@@ -1,4 +1,36 @@
+expect_error("contains a by-value cycle") {
+    struct T374RecursiveOuter {
+        struct Inner<T> { T value = default; };
+        Inner<T374RecursiveOuter> b;
+    };
+}
+
+expect_error("nested generic template 'Inner' is declared after this type use") {
+    struct T374AfterUseOuter {
+        Inner<int> b;
+        struct Inner<T> { T value = default; };
+    };
+}
+
+expect_error("'Inner' names a non-generic type in the enclosing aggregate; template arguments are not allowed") {
+    struct T384ShadowOuter {
+        struct Inner<T> { T value = default; };
+        struct Mid { struct Inner { int value = default; }; Inner<int> b; };
+    };
+}
+
+expect_error("'Inner' names a non-generic type in the enclosing aggregate; template arguments are not allowed") {
+    struct T384LateShadowOuter {
+        struct Inner<T> { T value = default; };
+        struct Mid {
+            int Run() { Inner<int> x = default; return (int)sizeof(x); }
+            struct Inner { int value = default; };
+        };
+    };
+}
+
 // A fixed array of the containing type is still by-value recursive storage.
 expect_error("field 'RecursiveArray.arr'");
 struct RecursiveArray { RecursiveArray[4] arr; };
+
 extern int main() { return 0; }

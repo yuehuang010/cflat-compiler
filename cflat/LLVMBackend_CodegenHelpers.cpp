@@ -326,6 +326,10 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                     && IsOwningValueType(itr_nameArg->TypeName)
                     && !IsCopyableType(itr_nameArg->TypeName))
                     namedVar.IsOwningStruct = true;
+                if (ResolveTypeAlias(itr_nameArg->TypeName) == "string"
+                    && itr_nameArg->IsConsumeInferredSink
+                    && OwningSinkConsumesConcrete(*itr_nameArg))
+                    namedVar.IsOwningString = true;
                 if (ownsCFlatExternParams && CFlatExternOwnsByValueParam(*itr_nameArg))
                     namedVar.IsOwningStruct = true;
                 RegisterFunctionArgument(itr_nameArg->VariableName, namedVar);
@@ -2172,7 +2176,8 @@ bool LLVMBackend::ParamIsAliasReturnSlot(const TypeAndValue& ret, const TypeAndV
         if (!ret.IsAlias || ret.Pointer || ret.ElemPointer || ret.IsArrayView || ret.IsFunctionPointer
             || ret.IsInterface || ret.IsCxxRefToPointer || ret.TypeName.empty())
             return false;
-        if (!p.IsReturnInferredSink || p.Pointer || p.ElemPointer || p.IsAlias || p.IsMove
+        if (!p.IsReturnInferredSink || p.IsWriteInferredSink
+            || p.Pointer || p.ElemPointer || p.IsAlias || p.IsMove
             || p.IsArrayView || p.IsInterface || p.IsFunctionPointer || p.IsCxxRefToPointer)
             return false;
         if (ResolveTypeAlias(p.TypeName) != ResolveTypeAlias(ret.TypeName)) return false;
@@ -2199,7 +2204,21 @@ void LLVMBackend::RecordAliasReturnAddressUse(const llvm::Function* function,
 bool LLVMBackend::OwningSinkConsumesConcrete(const TypeAndValue& p)
 {
         if (!p.IsOwningSink) return false;
-        if (p.IsReturnInferredSink && TypeOwnsUniquePointer(p.TypeName)) return false;
+        if (p.IsReturnInferredSink && !p.IsWriteInferredSink
+            && TypeOwnsUniquePointer(p.TypeName)) return false;
+        if (ResolveTypeAlias(p.TypeName) == "string")
+        {
+            if (p.IsMove) return true;
+            if (p.IsReturnInferredSink && p.IsWriteInferredSink)
+                return p.IsConsumeInferredSink;
+            if (p.IsReturnInferredSink || p.IsWriteInferredSink)
+                return false;
+            return p.IsConsumeInferredSink;
+        }
+        if (p.IsConsumeInferredSink && IsCopyableType(p.TypeName)
+            && ResolveTypeAlias(p.TypeName) != "string") return false;
+        if (p.IsReturnInferredSink && p.IsWriteInferredSink)
+            return true;
         if (p.IsConsumeInferredSink) return !IsCopyableType(p.TypeName);
         return true;
     }

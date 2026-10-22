@@ -5,23 +5,11 @@ Bucket: p3 (usable-surface gap, conservative refusal) + one silent leak (see ite
 T203 (raw local) and T250 (ternary-new, parenthesised, declaration inner) now match the two-statement
 form. Still open:
 
-1. Unique-field inner leaks silently: `owner = u.p = new PS();` (u: struct with `unique PS* p`)
-   compiles, one object leaked (dtors=0). The two-statement `u.p = new PS(); owner = u.p;` is correct
-   (dtors=1). Read of `u.p` after the chain is not diagnosed in either form (null deref at run time).
-   Root cause: the unique-field '=' returns the OLD field value as its Primary (the value is
-   stored before the reset returns), and the NamedVariable copy drops IsOwning, so the outer unique
-   '=' takes the stale value. A reload of the field pointer was tried and reverted: the outer then
-   emits `get(raw)` on the raw object pointer (wrong code). Fix direction: make the outer treat the
-   inner's field as a unique-field move source (as IsUniqueFieldRead does for `owner = u.p`).
-
 3. Chained three deep `a = b = c = new PS()` stays refused ("cannot reset unique<PS> 'a' from
    borrowed value 'b'"). The two-statement `c = new PS(); b = c; a = b;` compiles (dtors=1). Kept
    as is: the middle `b = c` is a raw alias, and extending the slot through a raw alias is not done.
 
 Global inner `owner = gRaw = new PS()` stays refused (a global is never a consumable slot).
-
-Repro (item 1):
-    unique PS* owner = nullptr; U u; owner = u.p = new PS();   // dtors=0, expected 1
 
 ## T250 review 1 (repros scratch/repro_keep/t250_rev/)
 - Still refused while the two-statement form compiles: a `??` arm, a `(PS*)0` arm, `owner = (raw = mkU())`,

@@ -898,12 +898,11 @@ public:
         // COPY, so the param stays a borrow and the caller keeps its value. An unconditional-`move`
         // sink leaves this false and consumes any owner, exactly as before.
         bool IsConsumeInferredSink = false;
-        // Set with IsConsumeInferredSink when `return p` is the ONLY consume: a unique-owning type
-        // then stays a borrow (its passthrough is an inferred 'alias' return), others consume.
+        // The body returns this parameter on at least one path. IsWriteInferredSink distinguishes a
+        // return-only passthrough from a mixed return and another consuming path.
         bool IsReturnInferredSink = false;
-        // Set with IsConsumeInferredSink when a whole-name write (`p = v`, `p += k`) is a trigger
-        // and no store/move consumes p: nothing escapes, so a bonded argument is refused only
-        // when the concrete type is consumed (OwningSinkConsumesConcrete).
+        // Set with IsConsumeInferredSink for a whole-name write, or alongside IsReturnInferredSink
+        // when another consume path exists. It distinguishes return-only passthroughs.
         bool IsWriteInferredSink = false;
         // Pure-borrow element (list<alias T*>) whose owner lives elsewhere; a later delete of a
         // local bound to this accessor result double-frees when the real owner releases it.
@@ -975,6 +974,7 @@ public:
             bool IsOwningSink = false;
             bool IsConsumeInferredSink = false;
             bool IsReturnInferredSink = false;
+            // True for whole-name writes and for a non-return consume path combined with a return.
             bool IsWriteInferredSink = false;
             bool IsRvalueRef = false;
             bool IsPointeeConst = false;  // spelled `const T*` (a C++ signature: ConstMask is -1)
@@ -1703,6 +1703,8 @@ public:
         std::string AddressedUniqueTypeName;
         llvm::Type* UnionFieldType = nullptr;  // When non-null: load/store this storage as this type (union field access).
         bool IsOwning = false;           // true for move parameters, new-allocated locals, and any owned pointer - freed on scope exit
+        // Set only when a field assignment rebuilt its unique wrapper from the RHS value.
+        bool IsUniqueFieldAssignmentResult = false;
         bool OwnsInterfaceBox = false;   // true when a plain interface local adopted an owned box
         bool IsAdoptable = false;        // compiler-generated node already owned by its parent tree
         bool IsNewAllocated = false;     // true only for 'new'-allocated locals - enables refcount on field escape (cleared on null-source transfer)
@@ -3484,6 +3486,8 @@ private:
     // owning local, bound to the sink. Called by the direct and the indirect call sites.
     void DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
                                      const std::string& paramName, const NamedVariable& arg);
+    bool BindingKeepsOwnershipOfBoxedObject(const NamedVariable* namedVar) const;
+    bool JoinArmsStillKeepOwner(const NamedVariable& namedVar, int depth = 0) const;
     // "'Box' is a generic type; type arguments are required ..." for bare `Box` and `Box<>`.
     void LogGenericTypeArgsRequired(const std::string& displayName,
                                     const std::vector<std::string>& parameterNames) const;
@@ -3706,6 +3710,8 @@ private:
     // Interfaces whose real implementor set is a main-pass fact: named in a generic class's base
     // clause, or spelled generically. Never prove a conversion impossible against one of these.
     std::unordered_set<std::string> uncertainInterfaceImpls;
+    std::unordered_set<std::string> uncertainGenericClassInterfaceImpls_;
+    std::unordered_set<std::string> uncertainOtherInterfaceImpls_;
     // Concrete INSTANCES of a generic interface (the mangled name) that have actually been
     // instantiated. Every implementor of such an instance registers under that mangled name, so
     // the instance HAS a closed world of its own even though its template never can. Only trusted
@@ -4160,6 +4166,7 @@ public:
     // Ownership control-frame kinds (EnterOwnershipControlRegion / ReanchorOwnFlagJoinsOutOf).
     static constexpr uint8_t OwnFlagLoopFrame = 1;
     static constexpr uint8_t OwnFlagSwitchFrame = 2;
+    static constexpr uint8_t OwnFlagDoWhileFrame = 4;
 private:
     std::string cppStandard_ = "c++20";
     // --error-on-cpp-reparse: at most 1 clang parse (or cache load in its place) per translation unit.
@@ -4181,6 +4188,15 @@ private:
     // Parallel to ownFlagControlPath_: the OwnFlagLoopFrame/OwnFlagSwitchFrame bits of each frame.
     std::vector<uint8_t> ownFlagControlKind_;
     uint64_t nextOwnFlagControlFrameId_ = 1;
+    std::unordered_set<const llvm::Value*> ownFlagDefinitelyReowned_;
+    struct OwnFlagLoopReownFrame
+    {
+        std::unordered_set<const llvm::Value*> entrySnapshot;
+        std::unordered_set<const llvm::Value*> exitIntersection;
+        bool isDoWhile = false;
+        bool hasExitState = false;
+    };
+    std::vector<OwnFlagLoopReownFrame> ownFlagLoopReownSnapshots_;
 
     struct UniqueFieldBorrowReturn
     {
@@ -4913,6 +4929,8 @@ private:
     // enclosing function identity while their body block gets its own lexical scope.
     std::string activeLocalEnumFunction_;
     std::vector<std::string> activeLocalEnumScopes_;
+    // Candidate block-scope type names let lexical shadow checks skip unrelated identifiers.
+    std::vector<std::unordered_set<std::string>> activeLexicalLocalTypeNames_;
     std::string sourceFileName;
     std::string currentSourceFilePath_;
     std::vector<ManifestFragment> manifestFragments_;
@@ -5104,6 +5122,7 @@ private:
     void EmitOwningUniqueArrayCleanup(const NamedVariable& namedVar);
 
     void RegisterOwnedStringTemp(llvm::Value* value);
+    void RegisterOwnedStringRvalueArguments(const std::vector<NamedVariable>& args);
 
     // True when `value` is a registered, still-unclaimed owned string temp (a produced value with
     // no named owner) rather than a local/field read whose own owner frees it.
@@ -7520,6 +7539,22 @@ public:
     bool HasCxxClassTemplate(const std::string& baseName) const;
     bool CompleteCxxTemplateTypeArgs(const std::string& baseName,
                                      std::vector<std::string>& typeArgs);
+    void PushLexicalLocalTypeScope() { activeLexicalLocalTypeNames_.emplace_back(); }
+    void PopLexicalLocalTypeScope()
+    {
+        if (!activeLexicalLocalTypeNames_.empty()) activeLexicalLocalTypeNames_.pop_back();
+    }
+    void RegisterLexicalLocalTypeName(const std::string& name)
+    {
+        if (!name.empty() && !activeLexicalLocalTypeNames_.empty())
+            activeLexicalLocalTypeNames_.back().insert(name);
+    }
+    bool HasLexicalLocalTypeName(const std::string& name) const
+    {
+        for (const auto& names : activeLexicalLocalTypeNames_)
+            if (names.count(name) != 0) return true;
+        return false;
+    }
 
     LLVMBackend()
     {
@@ -7821,6 +7856,7 @@ public:
     // The single definition of "the generic template key space" - both the routing predicates and
     // the use-site base resolution below consult it, so they cannot drift apart.
     bool IsGenericTemplateKey(const std::string& key) const;
+    antlr4::ParserRuleContext* GetGenericTemplateDefinitionContext(const std::string& key) const;
 
     /*
      * Resolve the SPELLED base of a generic instantiation to the key its template is registered
@@ -8138,7 +8174,8 @@ public:
     // Every registered type that may provide this interface. False = the set is untrustworthy
     // (mid-import, uncertain template, or empty), which callers must read as "no proof".
     bool EnumerateInterfaceImplementors(const std::string& ifaceName,
-                                        std::vector<std::string>& out) const;
+                                        std::vector<std::string>& out,
+                                        bool allowKnownGenericClassInstances = false) const;
 
     llvm::GlobalVariable* GetOrCreateProgramVTable(ProgramData& pd, const std::string& structName, const std::string& ifaceName);
 
@@ -8160,6 +8197,7 @@ public:
     // Mark an interface whose implementor set cannot be settled before codegen (a generic class
     // names it, or it is itself spelled generically), so the check never proves anything about it.
     void RecordUncertainInterfaceImpl(const std::string& ifaceName);
+    void RecordUncertainGenericClassInterfaceImpl(const std::string& ifaceName);
 
     // Remember that a generic interface INSTANCE was materialized under this mangled name.
     void RecordCertainInstantiatedInterface(const std::string& mangledName);
@@ -9360,6 +9398,7 @@ public:
 
     void EnterOwnershipControlRegion(uint8_t frameKind = 0);
     void LeaveOwnershipControlRegion();
+    void RecordOwnFlagLoopExitState();
 
     void SwitchToBlock(llvm::BasicBlock* block);
 
@@ -9407,7 +9446,7 @@ public:
     bool TryAdoptAliasReturnStringTemp(llvm::Value*& result, const TypeAndValue& returnType,
         bool returnsOwned, bool returnsAlias, const std::vector<TypeAndValue>& params,
         const std::vector<llvm::Value*>& args, const std::vector<NamedVariable>* argNVs,
-        bool requireReturnSinkParam);
+        bool requireReturnSinkParam = false);
 
     llvm::SwitchInst* CreateSwitchInst(llvm::Value* cond, llvm::BasicBlock* defaultBlock, unsigned numCases);
 
@@ -11919,6 +11958,12 @@ public:
         std::map<std::string, std::unordered_set<std::string>> movedFields;
     };
 
+    struct OwnFlagJoinSnapshot
+    {
+        std::unordered_map<const llvm::Value*, std::vector<uint64_t>> mayBeFalsePaths;
+        std::unordered_set<const llvm::Value*> definitelyReowned;
+    };
+
     // Snapshots the IsMoved flag and per-field moved set for all variables in all active scopes.
     MovedStateSnapshot SaveMovedState() const;
 
@@ -11932,6 +11977,17 @@ public:
     // Merges two post-branch states: a variable (or field) is moved if it was moved in either branch.
     void MergeMovedStates(const MovedStateSnapshot& thenState,
                           const MovedStateSnapshot& elseState);
+
+    OwnFlagJoinSnapshot SaveOwnFlagJoinState();
+    void RestoreOwnFlagJoinState(const OwnFlagJoinSnapshot& state);
+    OwnFlagJoinSnapshot MergeOwnFlagJoinStates(const OwnFlagJoinSnapshot& first,
+                                                const OwnFlagJoinSnapshot& second,
+                                                bool keepMayBeFalse) const;
+    OwnFlagJoinSnapshot NormalizeOwnFlagJoinState(const OwnFlagJoinSnapshot& state,
+                                                   bool keepMayBeFalse) const;
+    bool IsInsideOwnershipControlFrame(uint8_t frameKinds) const;
+    bool HasOwnershipControlFrameBetween(const std::vector<uint64_t>& originPath,
+                                         uint8_t frameKinds) const;
 
     llvm::GlobalVariable* GetGlobalVariable(const std::string& name);
 

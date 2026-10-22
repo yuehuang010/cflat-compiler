@@ -885,6 +885,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         {
             structName = baseName;
         }
+        RegisterLexicalLocalTypeName(compiler, ctx, baseName);
 
         const auto rawAnnotations = ExtractAnnotations(ctx->annotationList());
         const auto baseClauses = BaseClauseIdentifiers(ctx);
@@ -915,6 +916,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters(), &valueParams,
                                                          &valueDefaults);
             genericStructTemplates[structName] = ctx;
+            if (HasEnclosingAggregateContext(ctx))
+                genericLexicalAliasScopes_[structName] = compiler->aliasScopeStack_;
             // Origin marker: a template DECLARED in a core library file. Read by
             // IsBorrowingContainerElementSink so a user type of the same name is not mistaken
             // for the core container.
@@ -1726,7 +1729,11 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 {
                     for (auto* entry : generic->typeParameterList()->typeParameterEntry())
                         initializerArgs.push_back(ResolveTypeArgEntry(entry));
-                    compiler->ResolveGenericAliasSpelling(initializerName, initializerArgs);
+                    const std::string spelledBase = initializerName;
+                    const std::string enclosingScope = !structScopeStack.empty() ? structScopeStack.back()
+                        : EnclosingAggregateScopeFromContext(compiler, generic);
+                    initializerName = ResolveGenericTemplateSpellingAtScope(
+                        compiler, spelledBase, initializerArgs, enclosingScope, generic, spelledBase, true);
                     compiler->CompleteCxxTemplateTypeArgs(initializerName, initializerArgs);
                     initializerName = MangledGenericName(initializerName, initializerArgs);
                 }
@@ -4683,6 +4690,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters(), &valueParams,
                                                          &valueDefaults);
             genericClassTemplates[structName] = ctx;
+            if (HasEnclosingAggregateContext(ctx))
+                genericLexicalAliasScopes_[structName] = compiler->aliasScopeStack_;
             // Origin marker: a template DECLARED in a core library file. Read by
             // IsBorrowingContainerElementSink so a user type of the same name is not mistaken
             // for the core container.
@@ -5548,6 +5557,7 @@ void MainListener::EmitCppStructConstructorThunk(
         if (fn->isMaterializable()
             || (!fn->empty() && cflat_llvm::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr))
             return;
+        ActiveLocalEnumFunctionScope localEnumFunctionScope(compiler, fn->getName().str());
         compiler->InitializeBlock(&fn->front(), false);
         LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
@@ -5779,6 +5789,7 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                                                size_t cppCtorIndex,
                                                bool hasExplicitNoArgCtor) {
         auto* compiler = Compiler(func);
+        LexicalLocalTypeScope lexicalLocalTypeScope(compiler);
         if (func->baseSpecifier() != nullptr && !compiler->HasTypeAnnotation(structName, "cpp"))
         {
             Compiler(func)->LogErrorMessage("base initializer is only valid in a [cpp] struct");
@@ -5822,6 +5833,7 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
             || (!fn->empty() && cflat_llvm::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr))
             return;
 
+        ActiveLocalEnumFunctionScope localEnumFunctionScope(compiler, fn->getName().str());
         compiler->InitializeBlock(&fn->front(), false);
         LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
@@ -6103,6 +6115,7 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
 
 void MainListener::ParseDestructorDefinition(CFlatParser::DestructorDefinitionContext* ctx, const std::string& structName) {
         auto* compiler = Compiler(ctx);
+        LexicalLocalTypeScope lexicalLocalTypeScope(compiler);
         if (compiler->HasTypeAnnotation(structName, "cpp"))
         {
             LLVMBackend::DeclTypeAndValue thisParam;
@@ -6114,6 +6127,7 @@ void MainListener::ParseDestructorDefinition(CFlatParser::DestructorDefinitionCo
             auto fn = compiler->CreateFunctionDefinition(fullName, returnType, { thisParam },
                                                          false, false,
                                                          static_cast<int>(ctx->getStart()->getLine()));
+            ActiveLocalEnumFunctionScope localEnumFunctionScope(compiler, fn->getName().str());
             compiler->InitializeBlock(&fn->front(), false);
             LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
             LLVMBackend::CppStructAccessScope cppStructAccessScope(compiler, structName);
@@ -6158,6 +6172,7 @@ void MainListener::ParseDestructorDefinition(CFlatParser::DestructorDefinitionCo
         auto fn = compiler->CreateFunctionDefinition(fullName, returnType, params, false, false, line);
         compiler->RegisterDestructor(structName, fn);
 
+        ActiveLocalEnumFunctionScope localEnumFunctionScope(compiler, fn->getName().str());
         compiler->InitializeBlock(&fn->front(), false);
         LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
@@ -6176,6 +6191,7 @@ void MainListener::ParseDestructorDefinition(CFlatParser::DestructorDefinitionCo
 
 void MainListener::ParseProgramDestructorDefinition(CFlatParser::DestructorDefinitionContext* ctx, const std::string& name) {
         auto* compiler = Compiler(ctx);
+        LexicalLocalTypeScope lexicalLocalTypeScope(compiler);
         LLVMBackend::DeclTypeAndValue thisParam;
         thisParam.TypeName = name;
         thisParam.VariableName = name + "__";
@@ -6205,6 +6221,7 @@ void MainListener::ParseProgramDestructorDefinition(CFlatParser::DestructorDefin
         auto fn = compiler->CreateFunctionDefinition(fullName, returnType, params, false, false, line);
         compiler->RegisterDestructor(name, fn);
 
+        ActiveLocalEnumFunctionScope localEnumFunctionScope(compiler, fn->getName().str());
         compiler->InitializeBlock(&fn->front(), false);
         LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on

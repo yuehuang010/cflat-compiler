@@ -1,0 +1,89 @@
+// A local type name is not a value when it is closer than the outer value binding.
+expect_error("'n' names a type, not a value") {
+    int t371OuterLocal()
+    {
+        const int n = 9;
+        { enum n : int { A = 3 }; return n + 1; }
+    }
+}
+
+expect_error("'n' names a type, not a value") {
+    int t371MutableOuterLocal()
+    {
+        int n = 9;
+        { enum n : int { A = 3 }; return n + 1; }
+    }
+}
+
+expect_error("'n' names a type, not a value") {
+    int t371Parameter(int n)
+    {
+        { enum n : int { A = 3 }; return n + 1; }
+    }
+}
+
+expect_error("'n' names a type, not a value") {
+    namespace T371Global
+    {
+        int n = 9;
+        int read()
+        {
+            { enum n : int { A = 3 }; return n + 1; }
+        }
+    }
+}
+
+expect_error("'n' names a type, not a value") {
+    int n() { return 9; }
+    int t371FunctionName()
+    {
+        { enum n : int { A = 3 }; function<int()> target = n; return 0; }
+    }
+}
+
+expect_error("'n' names a type, not a value") {
+    struct T371LocalEnumField
+    {
+        int n = 9;
+        int read()
+        {
+            { enum n : int { A = 3 }; return n + 1; }
+        }
+    };
+}
+
+expect_error("'n' names a type, not a value") {
+    int t371UsingAlias()
+    {
+        int n = 9;
+        { using n = int; return n + 1; }
+    }
+}
+
+expect_error("'n' names a type, not a value") {
+    int t371Generic<T>(T n)
+    {
+        { enum n : int { A = 3 }; return n + 1; }
+    }
+    int t371GenericCaller() { return t371Generic<int>(9); }
+}
+
+expect_error("'n' names a type, not a value") {
+    int t371Lambda()
+    {
+        function<int(int)> target = (int n) => {
+            { enum n : int { A = 3 }; return n + 1; }
+        };
+        return target(9);
+    }
+}
+
+// Constructor and destructor bodies open the same local-type scope as functions.
+expect_error("'n' names a type, not a value") {
+    struct T371CtorShadow { int n = 7; int r = 0; T371CtorShadow() { { enum n : int { A = 3 }; r = n; } } };
+}
+
+int t371DtorSeen = 0;
+expect_error("'m' names a type, not a value") {
+    struct T371DtorShadow { int m = 7; ~T371DtorShadow() { { enum m : int { A = 3 }; t371DtorSeen = m; } } };
+}

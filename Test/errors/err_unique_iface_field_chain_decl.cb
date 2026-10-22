@@ -1,0 +1,10 @@
+import "unique.cb";
+interface IB { int tag(); };
+class BI : IB { int tag() { return 42; } };
+struct UI { unique IB i = default; };
+
+expect_error("cannot initialize unique<IB> 'o' from borrowed value 'w'") {
+    void badInterfaceFieldChain() { UI w = default; unique IB o = w.i = new BI(); }
+}
+
+extern int main() { return 0; }

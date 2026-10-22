@@ -1216,13 +1216,183 @@ void LLVMBackend::EnterOwnershipControlRegion(uint8_t frameKind)
 {
         ownFlagControlPath_.push_back(nextOwnFlagControlFrameId_++);
         ownFlagControlKind_.push_back(frameKind);
+        if (frameKind & OwnFlagLoopFrame)
+        {
+            OwnFlagLoopReownFrame frame;
+            frame.entrySnapshot = ownFlagDefinitelyReowned_;
+            frame.isDoWhile = (frameKind & OwnFlagDoWhileFrame) != 0;
+            ownFlagLoopReownSnapshots_.push_back(std::move(frame));
+        }
 }
 
 void LLVMBackend::LeaveOwnershipControlRegion()
 {
         if (ownFlagControlPath_.empty()) return;
+        if ((ownFlagControlKind_.back() & OwnFlagLoopFrame)
+            && !ownFlagLoopReownSnapshots_.empty())
+        {
+            const auto& frame = ownFlagLoopReownSnapshots_.back();
+            if (frame.isDoWhile && frame.hasExitState)
+            {
+                ownFlagDefinitelyReowned_ = frame.exitIntersection;
+                for (auto& scope : stackNamedVariable)
+                    for (auto& entry : scope.namedVariable)
+                    {
+                        auto& namedVar = entry.second;
+                        if (namedVar.OwnFlagMayBeFalse && namedVar.Storage != nullptr
+                            && frame.exitIntersection.contains(namedVar.Storage))
+                        {
+                            namedVar.OwnFlagMayBeFalse = false;
+                            namedVar.OwnFlagMayBeFalseControlPath.clear();
+                        }
+                    }
+            }
+            else
+            {
+                for (auto it = ownFlagDefinitelyReowned_.begin(); it != ownFlagDefinitelyReowned_.end();)
+                {
+                    if (!frame.entrySnapshot.contains(*it)) it = ownFlagDefinitelyReowned_.erase(it);
+                    else ++it;
+                }
+            }
+            ownFlagLoopReownSnapshots_.pop_back();
+        }
         ownFlagControlPath_.pop_back();
         ownFlagControlKind_.pop_back();
+}
+
+void LLVMBackend::RecordOwnFlagLoopExitState()
+{
+        if (ownFlagLoopReownSnapshots_.empty()) return;
+        auto& frame = ownFlagLoopReownSnapshots_.back();
+        if (!frame.isDoWhile) return;
+
+        auto state = SaveOwnFlagJoinState();
+        if (!frame.hasExitState)
+        {
+            frame.exitIntersection = std::move(state.definitelyReowned);
+            frame.hasExitState = true;
+            return;
+        }
+        for (auto it = frame.exitIntersection.begin(); it != frame.exitIntersection.end();)
+        {
+            if (!state.definitelyReowned.contains(*it)) it = frame.exitIntersection.erase(it);
+            else ++it;
+        }
+}
+
+LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::SaveOwnFlagJoinState()
+{
+        OwnFlagJoinSnapshot state;
+        std::unordered_set<const llvm::Value*> activeViewSlots;
+        auto saveOne = [&](const NamedVariable& namedVar) {
+            if (namedVar.Storage == nullptr) return;
+            if (namedVar.OwnFlagMayBeFalse)
+                state.mayBeFalsePaths[namedVar.Storage] = namedVar.OwnFlagMayBeFalseControlPath;
+            if (namedVar.TypeAndValue.IsArrayView
+                && llvm::isa<llvm::AllocaInst>(namedVar.Storage) && namedVar.FieldName.empty())
+                activeViewSlots.insert(namedVar.Storage);
+        };
+        for (const auto& frame : stackNamedVariable)
+        {
+            for (const auto& [name, namedVar] : frame.functionArgument) saveOne(namedVar);
+            for (const auto& [name, namedVar] : frame.namedVariable) saveOne(namedVar);
+        }
+        for (auto it = ownFlagDefinitelyReowned_.begin(); it != ownFlagDefinitelyReowned_.end();)
+        {
+            if (activeViewSlots.contains(*it))
+            {
+                state.definitelyReowned.insert(*it);
+                ++it;
+            }
+            else it = ownFlagDefinitelyReowned_.erase(it);
+        }
+        return state;
+}
+
+void LLVMBackend::RestoreOwnFlagJoinState(const OwnFlagJoinSnapshot& state)
+{
+        auto restoreOne = [&](NamedVariable& namedVar) {
+            if (namedVar.Storage == nullptr) return;
+            auto it = state.mayBeFalsePaths.find(namedVar.Storage);
+            namedVar.OwnFlagMayBeFalse = it != state.mayBeFalsePaths.end();
+            namedVar.OwnFlagMayBeFalseControlPath = it != state.mayBeFalsePaths.end()
+                ? it->second : std::vector<uint64_t>{};
+        };
+        for (auto& frame : stackNamedVariable)
+        {
+            for (auto& [name, namedVar] : frame.functionArgument) restoreOne(namedVar);
+            for (auto& [name, namedVar] : frame.namedVariable) restoreOne(namedVar);
+        }
+        ownFlagDefinitelyReowned_ = state.definitelyReowned;
+}
+
+LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::MergeOwnFlagJoinStates(
+        const OwnFlagJoinSnapshot& first, const OwnFlagJoinSnapshot& second,
+        bool keepMayBeFalse) const
+{
+        OwnFlagJoinSnapshot merged;
+        for (const auto* storage : first.definitelyReowned)
+            if (second.definitelyReowned.contains(storage))
+                merged.definitelyReowned.insert(storage);
+
+        std::unordered_set<const llvm::Value*> storages;
+        for (const auto& [storage, path] : first.mayBeFalsePaths) storages.insert(storage);
+        for (const auto& [storage, path] : second.mayBeFalsePaths) storages.insert(storage);
+        for (const auto* storage : storages)
+        {
+            auto firstPath = first.mayBeFalsePaths.find(storage);
+            auto secondPath = second.mayBeFalsePaths.find(storage);
+            const bool keepFirstMayBeFalse = keepMayBeFalse
+                && firstPath != first.mayBeFalsePaths.end()
+                && HasOwnershipControlFrameBetween(firstPath->second, OwnFlagLoopFrame);
+            const bool keepSecondMayBeFalse = keepMayBeFalse
+                && secondPath != second.mayBeFalsePaths.end()
+                && HasOwnershipControlFrameBetween(secondPath->second, OwnFlagLoopFrame);
+            const bool firstMayBeFalse = firstPath != first.mayBeFalsePaths.end()
+                && (keepFirstMayBeFalse || !first.definitelyReowned.contains(storage));
+            const bool secondMayBeFalse = secondPath != second.mayBeFalsePaths.end()
+                && (keepSecondMayBeFalse || !second.definitelyReowned.contains(storage));
+            if (!firstMayBeFalse && !secondMayBeFalse) continue;
+
+            std::vector<uint64_t> path = firstMayBeFalse
+                ? firstPath->second : secondPath->second;
+            if (firstMayBeFalse && secondMayBeFalse)
+            {
+                size_t common = 0;
+                while (common < path.size() && common < secondPath->second.size()
+                    && path[common] == secondPath->second[common])
+                    ++common;
+                path.resize(common);
+            }
+            merged.mayBeFalsePaths.emplace(storage, std::move(path));
+        }
+        return merged;
+}
+
+LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::NormalizeOwnFlagJoinState(
+        const OwnFlagJoinSnapshot& state, bool keepMayBeFalse) const
+{
+        return MergeOwnFlagJoinStates(state, state, keepMayBeFalse);
+}
+
+bool LLVMBackend::IsInsideOwnershipControlFrame(uint8_t frameKinds) const
+{
+        for (uint8_t kind : ownFlagControlKind_)
+            if (kind & frameKinds) return true;
+        return false;
+}
+
+bool LLVMBackend::HasOwnershipControlFrameBetween(const std::vector<uint64_t>& originPath,
+                                                   uint8_t frameKinds) const
+{
+        size_t common = 0;
+        while (common < originPath.size() && common < ownFlagControlPath_.size()
+            && originPath[common] == ownFlagControlPath_[common])
+            ++common;
+        for (size_t i = common; i < ownFlagControlKind_.size(); ++i)
+            if (ownFlagControlKind_[i] & frameKinds) return true;
+        return false;
 }
 
 void LLVMBackend::ReanchorOwnFlagJoinsOutOf(uint8_t targetKinds)
@@ -1261,6 +1431,13 @@ void LLVMBackend::SetVariableOwning(const std::string& varName, bool value)
             if (it != frame.namedVariable.end())
             {
                 it->second.IsOwning = value;
+                if (it->second.TypeAndValue.IsArrayView && it->second.Storage != nullptr
+                    && llvm::isa<llvm::AllocaInst>(it->second.Storage)
+                    && it->second.FieldName.empty())
+                {
+                    if (value) ownFlagDefinitelyReowned_.insert(it->second.Storage);
+                    else ownFlagDefinitelyReowned_.erase(it->second.Storage);
+                }
                 if (it->second.OwnFlagMayBeFalse
                     && IsOutsideOwnFlagControlPath(it->second))
                 {
@@ -1287,6 +1464,13 @@ void LLVMBackend::SetVariableOwnFlagValue(const std::string& varName, bool mayOw
             if (it == frame.namedVariable.end()) continue;
             auto& namedVar = it->second;
             namedVar.IsOwning = mayOwn;
+            if (namedVar.TypeAndValue.IsArrayView && namedVar.Storage != nullptr
+                && llvm::isa<llvm::AllocaInst>(namedVar.Storage) && namedVar.FieldName.empty())
+            {
+                if (mayOwn && !runtimeCanBeFalse)
+                    ownFlagDefinitelyReowned_.insert(namedVar.Storage);
+                else ownFlagDefinitelyReowned_.erase(namedVar.Storage);
+            }
             if (runtimeCanBeFalse)
             {
                 namedVar.OwnFlagMayBeFalse = true;
@@ -2178,6 +2362,20 @@ void LLVMBackend::RegisterOwnedStringTemp(llvm::Value* value)
         pendingOwnedStringTemps.emplace_back(value, builder->GetInsertBlock());
     }
 
+void LLVMBackend::RegisterOwnedStringRvalueArguments(const std::vector<NamedVariable>& args)
+{
+        auto* stringTy = llvm::StructType::getTypeByName(*context, "string");
+        if (stringTy == nullptr) return;
+        for (const auto& arg : args)
+        {
+            if (!arg.IsRvalue || ResolveTypeAlias(arg.TypeAndValue.TypeName) != "string"
+                || arg.Primary == nullptr || arg.Primary->getType() != stringTy
+                || !IsProducedTempValue(arg.Primary))
+                continue;
+            RegisterOwnedStringTemp(arg.Primary);
+        }
+    }
+
 bool LLVMBackend::IsPendingOwnedStringTemp(llvm::Value* value) const
 {
         if (value == nullptr) return false;
@@ -2198,25 +2396,40 @@ bool LLVMBackend::TryAdoptAliasReturnStringTemp(llvm::Value*& result,
             || ResolveTypeAlias(returnType.TypeName) != "string")
             return false;
 
-        std::vector<llvm::Value*> stringTemps;
+        struct StringTempSource
+        {
+            llvm::Value* Value;
+            bool TransfersOwner;
+        };
+        std::vector<StringTempSource> stringTemps;
         for (size_t i = 0; i < params.size() && i < args.size(); ++i)
         {
             const auto& param = params[i];
             if ((requireReturnSinkParam && !param.IsReturnInferredSink)
                 || param.Pointer || param.ElemPointer || param.IsAlias || param.IsMove
-                || ((param.IsOwningSink || param.IsConsumeInferredSink)
+                || ((param.IsOwningSink || param.IsConsumeInferredSink || param.IsWriteInferredSink)
                     && !param.IsReturnInferredSink)
                 || ResolveTypeAlias(param.TypeName) != "string")
                 continue;
             llvm::Value* value = args[i];
             if (value == nullptr || value->getType() != stringTy)
                 continue;
+            const bool paramTransfersOwner = param.IsMove
+                || (param.IsOwningSink && OwningSinkConsumesConcrete(param));
             const bool isOwnedRvalue = argNVs != nullptr && i < argNVs->size()
                 && (*argNVs)[i].IsRvalue && (*argNVs)[i].TypeAndValue.IsMove;
-            if (!IsPendingOwnedStringTemp(value) && !isOwnedRvalue)
+            const bool isTransferredNamedOwner = argNVs != nullptr && i < argNVs->size()
+                && paramTransfersOwner && !(*argNVs)[i].IsRvalue
+                && ((*argNVs)[i].IsOwningString || (*argNVs)[i].IsOwning
+                    || (*argNVs)[i].IsExplicitMove);
+            if (!IsPendingOwnedStringTemp(value) && !isOwnedRvalue && !isTransferredNamedOwner)
                 continue;
-            if (std::find(stringTemps.begin(), stringTemps.end(), value) == stringTemps.end())
-                stringTemps.push_back(value);
+            auto source = std::find_if(stringTemps.begin(), stringTemps.end(),
+                [&](const auto& candidate) { return candidate.Value == value; });
+            if (source == stringTemps.end())
+                stringTemps.push_back({ value, paramTransfersOwner });
+            else
+                source->TransfersOwner = source->TransfersOwner || paramTransfersOwner;
         }
 
         if (stringTemps.empty()) return false;
@@ -2225,8 +2438,9 @@ bool LLVMBackend::TryAdoptAliasReturnStringTemp(llvm::Value*& result,
         auto* resultLen = builder->CreateExtractValue(result, { 1u }, "aliasret.str.len");
         llvm::Value* selectedAny = builder->getFalse();
         auto* handoffBlock = builder->GetInsertBlock();
-        for (llvm::Value* source : stringTemps)
+        for (const auto& sourceInfo : stringTemps)
         {
+            llvm::Value* source = sourceInfo.Value;
             auto* sourcePtr = builder->CreateExtractValue(source, { 0u }, "aliasret.src.ptr");
             auto* sourceLen = builder->CreateExtractValue(source, { 1u }, "aliasret.src.len");
             auto* ptrMatches = builder->CreateICmpEQ(resultPtr, sourcePtr,
@@ -2241,9 +2455,11 @@ bool LLVMBackend::TryAdoptAliasReturnStringTemp(llvm::Value*& result,
 
             auto* borrowedLen = builder->CreateAnd(sourceLen, builder->getInt32(0x7FFFFFFF),
                                                    "aliasret.src.borrowed");
-            auto* ownedLen = builder->CreateSelect(selected, borrowedLen, sourceLen,
-                                                   "aliasret.src.len.next");
-            auto* updatedSource = builder->CreateInsertValue(source, ownedLen, { 1u },
+            auto* handoffLen = sourceInfo.TransfersOwner
+                ? borrowedLen
+                : builder->CreateSelect(selected, borrowedLen, sourceLen,
+                                        "aliasret.src.len.next");
+            auto* updatedSource = builder->CreateInsertValue(source, handoffLen, { 1u },
                                                              "aliasret.src.next");
             for (auto& pending : pendingOwnedStringTemps)
                 if (pending.first == source)

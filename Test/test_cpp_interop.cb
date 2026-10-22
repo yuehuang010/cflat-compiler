@@ -2633,6 +2633,13 @@ int t365CppUniqueSlotCall()
     return result * 10 + (owner != nullptr && *owner == 19 ? 1 : 0);
 }
 
+string T381ReturnString()
+{
+    string base = "abc";
+    return base.length() == 0 ? "lit" : base;
+}
+int T381ConsumeString(string value) { return value.length(); }
+
 extern int main()
 {
     if (t365CppUniqueSlotCall() != 191) return 36501;
@@ -18394,6 +18401,24 @@ int LoweredUserDtorAssignLegs(int argc)
         int value = cppt331.call_private_copy(&object, 7);
         if (value != 7 || t340PrivateCopyCalls != 1
             || cppt331.PrivateCopyBase.intCalls != 0) return 34006;
+    }
+    // T381: post-parse string-arm copies keep each invoke continuation as a PHI predecessor.
+    {
+        string base = "abc";
+        string original = base.length() == 0 ? "lit" : base;
+        if (original.length() != 3) return 38101;
+        string swapped = base.length() == 0 ? base : "lit";
+        if (swapped.length() != 3) return 38102;
+        string literals = true ? "lit" : "xyz";
+        if (literals.length() != 3) return 38103;
+        string nested = base.length() == 0 ? "lit"
+            : (base.length() == 3 ? "xyz" : base);
+        if (nested.length() != 3) return 38104;
+        if (T381ReturnString().length() != 3) return 38105;
+        if (T381ConsumeString(base.length() == 0 ? "lit" : base) != 3) return 38106;
+        string assigned = "";
+        assigned = base.length() == 0 ? "lit" : base;
+        if (assigned.length() != 3) return 38107;
     }
     return 0;
 }

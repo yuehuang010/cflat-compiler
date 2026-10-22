@@ -792,6 +792,8 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                     result.Storage = assignmentResult.Storage;
                     result.ChainedAssignSlot = assignmentResult.ChainedAssignSlot;
                     result.ChainedAssignName = assignmentResult.ChainedAssignName;
+                    result.IsUniqueFieldAssignmentResult =
+                        assignmentResult.IsUniqueFieldAssignmentResult;
                     // All of it: an owning struct destination carries its borrow provenance.
                     AdoptWrapperProvenance(result, assignmentResult);
                 }
@@ -1042,48 +1044,7 @@ llvm::Value* MainListener::BoxConcreteIntoInterface(antlr4::ParserRuleContext* e
     }
 
 bool MainListener::BindingKeepsOwnershipOfBoxedObject(const LLVMBackend::NamedVariable* nv) const {
-        if (nv == nullptr) return false;
-        if (!nv->BorrowedUniqueField.empty()) return true;
-        if (nv->Storage == nullptr) return false;
-        bool isCoreUniqueValue = compilerLLVM->IsCoreUniqueType(nv->TypeAndValue.TypeName)
-            && !nv->TypeAndValue.Pointer;
-        // A `unique` field's synthesized destructor frees it. Field-specific and proven by the
-        // field itself, so it is asked before the direct-binding gate below excludes field reads.
-        if (nv->IsUniqueFieldAlias
-            || nv->TypeAndValue.IsUnique || isCoreUniqueValue) return true;
-        // A call RESULT proven to read a live `unique` field: the field frees it, so the box would
-        // be a second owner. Value-keyed, so it answers for a temporary with no binding at all.
-        if (nv->Primary != nullptr
-            && compilerLLVM->FindUniqueFieldBorrowResult(nv->Primary) != nullptr
-            && !nv->TypeAndValue.IsMove)
-            return true;
-        // Direct bindings only below: a FIELD read's Storage is a GEP and its CallerName names the
-        // BASE object, so without this gate a plain field read is blamed on the enclosing parameter.
-        if (!llvm::isa<llvm::AllocaInst>(nv->Storage)) return false;
-        if (nv->IsOwning) return true;
-        // Refreshed by the same '=' that sets PointerRebound, so both outrank it. A '??=' returns
-        // before that refresh, so its element fact may be stale and is not a proof on its own -
-        // the join proof below carries the case where the '??=' RHS proved an owner too.
-        if (nv->BorrowsOwnedElement && !nv->CoalesceRebound) return true;
-        if (nv->InheritedKeepsOwner) return true;
-        // Recorded where the join's arms were in hand, and refreshed by every later '=', so it
-        // outranks the retirement below for the same reason InheritedKeepsOwner does. Every ARM's
-        // liveness is re-asked here too, or nulling an arm would leave a stale false rejection.
-        if (JoinArmsStillKeepOwner(*nv)) return true;
-        // A rebound pointer no longer points at whatever its declaration established an owner for.
-        if (nv->PointerRebound) return false;
-        // A local that aliases a borrowed parameter. Retired above by any reassignment, which is
-        // what makes it safe to consult here - `IS s = b;` must not launder what `delete b;` rejects.
-        // Same pair of conditions the raw-delete guard uses, so the two spellings agree exactly.
-        if (nv->IsBorrowed && !nv->BorrowedOrigin.empty()
-            && !compilerLLVM->BorrowProofRetiredByRebind(*nv)) return true;
-        // A plain copy of an OWNING local, established at ITS declaration - so it belongs below the
-        // retirement with the other declaration-time clauses. The raw `delete b;` guard uses the
-        // same pair of conditions, so the boxed and raw spellings reject exactly the same set.
-        if (compilerLLVM->OwningLocalCopyStillAliases(*nv)) return true;
-        // Identity, never spelling: a local SHADOWING a parameter's name is a different binding.
-        return !nv->TypeAndValue.IsMove
-            && compilerLLVM->IsFunctionParameterStorage(nv->Storage);
+        return compilerLLVM->BindingKeepsOwnershipOfBoxedObject(nv);
     }
 
 std::string MainListener::DescribeBoxedSourceOwner(llvm::Value* dataPtr,
@@ -1216,23 +1177,7 @@ bool MainListener::JoinArmIsProvablyNull(llvm::Value* arm, int depth) const {
     }
 
 bool MainListener::JoinArmsStillKeepOwner(const LLVMBackend::NamedVariable& nv, int depth) const {
-        if (!nv.JoinKeepsOwner || nv.JoinKeepsOwnerSlots.empty()) return false;
-        if (depth > 4) return false;
-        for (auto* slot : nv.JoinKeepsOwnerSlots)
-        {
-            if (slot == nullptr || slot == nv.Storage) return false;
-            const auto* arm = compilerLLVM->FindVariableByStorage(slot);
-            if (arm == nullptr || arm->PointerRebound) return false;
-            // A join OF joins re-asks the inner arms and stops there: re-entering
-            // BindingKeepsOwnershipOfBoxedObject at depth 0 would loop on a cyclic arm graph.
-            if (arm->JoinKeepsOwner)
-            {
-                if (!JoinArmsStillKeepOwner(*arm, depth + 1)) return false;
-                continue;
-            }
-            if (!BindingKeepsOwnershipOfBoxedObject(arm)) return false;
-        }
-        return true;
+        return compilerLLVM->JoinArmsStillKeepOwner(nv, depth);
     }
 
 bool MainListener::InterfaceBoxBorrowStillKeepsOwner(
@@ -4204,6 +4149,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 if (!namedVar.CallerName.empty())
                     compiler->MarkVariableFieldUnmoved(namedVar.CallerName, movePath);
             };
+            bool uniqueFieldAssignmentResultProduced = false;
+            llvm::Value* assignmentRhsValue = nullptr;
             auto finishStore = [&](llvm::Value* v) -> llvm::Value* {
                 llvm::Value* resultValue = v;
                 // A '=' store re-initializes a destination field path AFTER any source consume, so
@@ -4235,6 +4182,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     assignmentResult->Primary = resultValue;
                     assignmentResult->BaseType = resultValue != nullptr
                         ? resultValue->getType() : namedVar.BaseType;
+                    assignmentResult->IsUniqueFieldAssignmentResult =
+                        (uniqueFieldAssignmentResultProduced
+                            || (assignmentRhsValue != nullptr
+                                && resultValue == assignmentRhsValue))
+                        && coalesceResume == nullptr;
                     // An owning struct destination is named too: `T x = (w += 2)` / `return (w = y)`
                     // then consume `w` exactly as `T x = w` does, instead of adopting its bytes twice.
                     const bool ownedStructDest = !namedVar.TypeAndValue.Pointer
@@ -4281,7 +4233,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             // takes its return type from, exactly as a declarator's type is.
             std::optional<DeclExpectedTypeScope> assignExpectedScope;
             if (operatorText == "=")
-                assignExpectedScope.emplace(&declExpectedType, namedVar.TypeAndValue);
+                assignExpectedScope.emplace(&declExpectedType, namedVar.TypeAndValue, true);
 
             // Thread expected function-pointer type into lambda RHS (for f = (x) => {...} reassignment)
             if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer)
@@ -4793,6 +4745,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             compiler->lastAllocAlignment = 0;
             compiler->lastCallReturnsAllocAlign = 0;
             auto right = LoadNamedVariable(rightNV);
+            assignmentRhsValue = right;
             // Trivially-copyable imported records still have declared C++ assignment operators.
             // Use the nontrivial-class selector before aggregate storage rejects a scalar RHS.
             if (operatorText == "=" && destination != nullptr
@@ -5434,6 +5387,30 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 compiler->lastCallReturnsOwned = false;
                 // The result load reads the LHS copy, so revive it before the load, not in finishStore.
                 reviveStoredField();
+                // `reset` loaded this wrapper before storing, so namedVar.Primary is stale here.
+                // Build the assignment value from the RHS without re-reading the field.
+                if (destinationIsField && right != nullptr && right->getType()->isPointerTy()
+                    && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName))
+                {
+                    auto* wrapperTy = llvm::dyn_cast_or_null<llvm::StructType>(
+                        compiler->GetType(namedVar.TypeAndValue));
+                    if (wrapperTy != nullptr)
+                    {
+                        const auto& uniqueData = compiler->GetDataStructure(
+                            namedVar.TypeAndValue.TypeName);
+                        for (size_t i = 0; i < uniqueData.StructFields.size(); i++)
+                        {
+                            if (uniqueData.StructFields[i].VariableName != "_p"
+                                || wrapperTy->getElementType((unsigned)i) != right->getType())
+                                continue;
+                            auto* assignedWrapper = compiler->builder->CreateInsertValue(
+                                llvm::ConstantAggregateZero::get(wrapperTy), right,
+                                { (unsigned)i }, "unique.assign.value");
+                            uniqueFieldAssignmentResultProduced = true;
+                            return finishStore(assignedWrapper);
+                        }
+                    }
+                }
                 return finishStore(LoadNamedVariable(namedVar));
             }
 
@@ -6436,6 +6413,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     llvm::ConstantAggregateZero::get(right->getType()), rightNV.Storage);
                 if (!rightNV.CallerName.empty())
                     compiler->MarkVariableMoved(rightNV.CallerName);
+                uniqueFieldAssignmentResultProduced = true;
                 return finishStore(right);
             }
 
@@ -6830,6 +6808,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                         namedVar.TypeAndValue.TypeName))
                     compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
                 auto* stored = derefAssign(right, rhsUnsigned);
+                uniqueFieldAssignmentResultProduced = true;
                 return finishStore(stored);
             }
 
@@ -6962,24 +6941,26 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 if (IsOwningTempUniqueFieldEscape(rightNV)) return finishStore(right);
             }
 
-            // Assigning a named string LOCAL into a string field. THE FLIP: a NAMED OWNED source
-            // (IsOwningString, not a field-borrow) COPIES into the field (independent buffer),
-            // leaving the source live; the old field value is destructed below before the copy is
-            // stored. A pure field-BORROW source (BorrowsOwnedString, not owning) stays REJECTED -
-            // copying it would silently turn a deliberate borrow into an owned duplicate (e.g.
-            // xml.cb's `b._rootTag = rt`).
+            // A named owner or program-lifetime string source copies into the field. Field borrows
+            // stay rejected because copying them would silently change the deliberate borrow.
+            const bool rightHasProgramLifetimeStorage = IsProgramLifetimeStorage(rightNV);
             if (operatorText == "=" && right && right->getType()->isStructTy()
                 && destIsStructField
                 && NamedVarIsString(namedVar)
                 && rightNV.TypeAndValue.TypeName == "string"
-                && (rightNV.IsOwningString || rightNV.BorrowsOwnedString)
+                && (rightNV.IsOwningString || rightNV.BorrowsOwnedString
+                    || rightHasProgramLifetimeStorage)
                 && rightNV.Storage != nullptr
                 && !rightNV.TypeAndValue.IsMove
                 && !rightStringImplicitCopied
                 && !sameFieldStore)
             {
-                if (rightNV.IsOwningString && !rightNV.BorrowsOwnedString)
-                right = compiler->EmitOwnedStringDeepCopy(right);
+                if ((rightNV.IsOwningString || rightHasProgramLifetimeStorage)
+                    && !rightNV.BorrowsOwnedString)
+                {
+                    right = compiler->EmitOwnedStringDeepCopy(right);
+                    rightStringImplicitCopied = true;
+                }
                 else
                 {
                     LogErrorContext(ctx, std::format(
@@ -10666,8 +10647,22 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         // Do arm-local conversions before adding their jumps. In particular, a runtime char*
         // converted to string emits a call to operator string and cannot be inserted after a
         // terminator.
-        auto atTrue  = [&]() { compiler->builder->SetInsertPoint(trueEnd); };
-        auto atFalse = [&]() { compiler->builder->SetInsertPoint(falseEnd); };
+        // Arm-local calls can emit invokes; save their continuation before switching arms.
+        llvm::BasicBlock** activeArmEnd = nullptr;
+        auto saveActiveArmEnd = [&]() {
+            if (activeArmEnd != nullptr)
+                if (auto* block = compiler->builder->GetInsertBlock()) *activeArmEnd = block;
+        };
+        auto atTrue = [&]() {
+            saveActiveArmEnd();
+            compiler->builder->SetInsertPoint(trueEnd);
+            activeArmEnd = &trueEnd;
+        };
+        auto atFalse = [&]() {
+            saveActiveArmEnd();
+            compiler->builder->SetInsertPoint(falseEnd);
+            activeArmEnd = &falseEnd;
+        };
         bool joinUnsigned = TernaryJoinIsUnsigned(
             trueUnsigned,  trueValue->getType()->isIntegerTy()  ? trueValue->getType()->getIntegerBitWidth()  : 0,
             falseUnsigned, falseValue->getType()->isIntegerTy() ? falseValue->getType()->getIntegerBitWidth() : 0);
@@ -11477,6 +11472,27 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
         CFlatParser::ConditionalExpressionContext* ctx, ResultUse use) {
         LLVMBackend::TypeAndValue outerExpected = declExpectedType;
         auto* compiler = Compiler(ctx);
+        if (ctx->expression() != nullptr && ctx->conditionalExpression() != nullptr
+            && IsGenericFunctionScalarDestination(compiler, outerExpected))
+        {
+            auto rejectGenericArm = [&](antlr4::tree::ParseTree* arm) {
+                auto* identifier = BareGenericFunctionValueIdentifierInExpression(arm);
+                if (identifier == nullptr) return false;
+                const std::string name = identifier->getText();
+                if (NamesVisibleVariable(compiler, name)) return false;
+                const std::string genericBase = compiler->ResolveGenericFunctionBase(name);
+                if (!genericFunctionTemplates.count(genericBase)) return false;
+                const std::string qualified = compiler->ResolveQualifiedName(name);
+                if (compiler->GetFunction(name) != nullptr
+                    || compiler->GetFunction(qualified) != nullptr)
+                    return false;
+                LogErrorContext(identifier, GenericFunctionScalarValueDiagnostic(compiler, name));
+                return true;
+            };
+            if (rejectGenericArm(ctx->expression())
+                || rejectGenericArm(ctx->conditionalExpression()))
+                return {};
+        }
         std::optional<OwnershipControlScope> nullCoalesceControlScope;
         const bool autoDeclTernary = std::exchange(autoDeclTernaryInit_, false);
         DeclExpectedTypeGate declExpectedGate(&declExpectedType,
@@ -20991,9 +21007,15 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                             std::string genericBase;
                             auto* genericSpec = GenericSpecOf(typeSpec, genericBase);
                             if (genericSpec == nullptr) continue;
-                            resolvesAsType = compiler->AnyGenericTypeTemplateNamed(genericBase)
-                                || genericBase == "function" || genericBase == "Lambda";
-                            if (!resolvesAsType)
+                            const auto scopes = EnclosingAggregateScopesFromContext(compiler, typeSpec);
+                            const std::string resolvedBase = ResolveGenericTemplateBaseAtScope(
+                                compiler, genericBase, scopes, typeSpec, genericBase);
+                            const bool scopeRejected = resolvedBase.empty();
+                            resolvesAsType = !scopeRejected
+                                && (compiler->IsGenericTemplateKey(resolvedBase)
+                                    || compiler->AnyGenericTypeTemplateNamed(resolvedBase)
+                                    || genericBase == "function" || genericBase == "Lambda");
+                            if (!resolvesAsType && !scopeRejected)
                             {
                                 std::vector<std::string> typeArgs;
                                 for (auto* entry : genericSpec->typeParameterList()->typeParameterEntry())
@@ -21346,7 +21368,11 @@ std::string MainListener::ParseTypeSpecifierName(
             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                 args.push_back(ResolveTypeArgEntry(entry));
             ResolveEnumTypeArguments(args);
-            Compiler(ctx)->ResolveGenericAliasSpelling(base, args);
+            const std::string spelledBase = base;
+            const std::string enclosingScope = !structScopeStack.empty() ? structScopeStack.back()
+                : EnclosingAggregateScopeFromContext(Compiler(ctx), genParams);
+            base = ResolveGenericTemplateSpellingAtScope(
+                Compiler(ctx), spelledBase, args, enclosingScope, genParams, spelledBase, true);
             Compiler(ctx)->CompleteCxxTemplateTypeArgs(base, args);
             std::string mangledName = MangledGenericName(base, args);
             if (Compiler(ctx)->AnyGenericTypeTemplateNamed(base))
@@ -22812,6 +22838,7 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
         if (field.AllocAlignValue > LLVMBackend::kDefaultNewAlign
             && AsDirectNew(ae) != nullptr)
             compiler->pendingInitAllocAlign = field.AllocAlignValue;
+        DeclExpectedTypeScope fieldExpectedScope(&declExpectedType, field, true);
         auto nv = ParseAssignmentExpressionNamed(ae);
         // A field default initializer is a field store (`cppi.CrPair* p = &crConst;` is refused).
         RejectConstRecordPointeeStore(ae, field, nv, "field", field.VariableName);
@@ -24027,7 +24054,7 @@ void MainListener::EmitFieldInitializer(
                 }
                 // The FIELD's type is the context for an immediately-invoked literal in its
                 // initializer, the same way a declarator's type is.
-                fieldExpectedScope.emplace(&declExpectedType, field);
+                fieldExpectedScope.emplace(&declExpectedType, field, true);
                 if (field.AllocAlignValue > LLVMBackend::kDefaultNewAlign
                     && AsDirectNew(fi->assignmentExpression(0)) != nullptr)
                     compiler->pendingInitAllocAlign = field.AllocAlignValue;
@@ -24550,13 +24577,16 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
             }
             auto elementOwnedTempMark = compiler->MarkOwnedTemps();
             LLVMBackend::NamedVariable nv;
-            if (loweredCxxElement && moveExpr != nullptr)
             {
-                LoweredBraceMoveScope deferMove(*this, moveExpr, tv.TypeName, elemPtr);
-                nv = ParseAssignmentExpressionNamed(assignment);
+                DeclExpectedTypeScope elementExpectedScope(&declExpectedType, fixedElemTV);
+                if (loweredCxxElement && moveExpr != nullptr)
+                {
+                    LoweredBraceMoveScope deferMove(*this, moveExpr, tv.TypeName, elemPtr);
+                    nv = ParseAssignmentExpressionNamed(assignment);
+                }
+                else
+                    nv = ParseAssignmentExpressionNamed(assignment);
             }
-            else
-                nv = ParseAssignmentExpressionNamed(assignment);
             const bool cxxSretConsumed = cxxSretArmed
                 && compiler->pendingCxxSretDest_ == nullptr;
             if (cxxSretArmed)
@@ -25638,7 +25668,11 @@ void MainListener::EmitArrayViewInferredInit(
         for (size_t i = 0; i < elements.size(); i++)
         {
             auto* fi = elements[i];
-            auto nv = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
+            LLVMBackend::NamedVariable nv;
+            {
+                DeclExpectedTypeScope elementExpectedScope(&declExpectedType, elemTV);
+                nv = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
+            }
             llvm::Value* val = LoadNamedVariable(nv);
             if (!val) continue;
 

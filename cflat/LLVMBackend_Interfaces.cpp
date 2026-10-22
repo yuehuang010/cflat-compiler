@@ -728,6 +728,17 @@ bool LLVMBackend::IsGenericTemplateKey(const std::string& key) const
             || gts.scannedGenericInterfaceNames.count(key) != 0;
     }
 
+antlr4::ParserRuleContext* LLVMBackend::GetGenericTemplateDefinitionContext(const std::string& key) const
+{
+        if (auto it = gts.genericStructTemplates.find(key); it != gts.genericStructTemplates.end())
+            return it->second;
+        if (auto it = gts.genericClassTemplates.find(key); it != gts.genericClassTemplates.end())
+            return it->second;
+        if (auto it = gts.genericInterfaceTemplates.find(key); it != gts.genericInterfaceTemplates.end())
+            return it->second;
+        return nullptr;
+    }
+
 std::string LLVMBackend::ResolveGenericTemplateBase(const std::string& base) const
 {
         if (base.empty()) return base;
@@ -2768,7 +2779,16 @@ void LLVMBackend::RecordScannedStructInterfaces(const std::string& structName, s
 
 void LLVMBackend::RecordUncertainInterfaceImpl(const std::string& ifaceName)
 {
-        if (!ifaceName.empty()) uncertainInterfaceImpls.insert(ifaceName);
+        if (ifaceName.empty()) return;
+        uncertainInterfaceImpls.insert(ifaceName);
+        uncertainOtherInterfaceImpls_.insert(ifaceName);
+    }
+
+void LLVMBackend::RecordUncertainGenericClassInterfaceImpl(const std::string& ifaceName)
+{
+        if (ifaceName.empty()) return;
+        uncertainInterfaceImpls.insert(ifaceName);
+        uncertainGenericClassInterfaceImpls_.insert(ifaceName);
     }
 
 void LLVMBackend::RecordCertainInstantiatedInterface(const std::string& mangledName)
@@ -2889,11 +2909,20 @@ bool LLVMBackend::AnyTypeMayProvideInterface(const std::string& ifaceName) const
  * must read as "no proof" - the unknown-accepts polarity the ownership guards are built on.
  */
 bool LLVMBackend::EnumerateInterfaceImplementors(const std::string& ifaceNameIn,
-                                                 std::vector<std::string>& out) const
+                                                 std::vector<std::string>& out,
+                                                 bool allowKnownGenericClassInstances) const
 {
         std::string ifaceName = ResolveTypeAlias(ifaceNameIn);
         if (ifaceName.empty() || !IsInterfaceType(ifaceName)) return false;
-        if (InterfaceImplementorSetIsUncertain(ifaceName)) return false;
+        if (InterfaceImplementorSetIsUncertain(ifaceName))
+        {
+            bool onlyGenericClassUncertainty = allowKnownGenericClassInstances
+                && importCompileDepth_ == 0
+                && uncertainInterfaceImpls.count(ifaceName) > 0
+                && uncertainGenericClassInterfaceImpls_.count(ifaceName) > 0
+                && uncertainOtherInterfaceImpls_.count(ifaceName) == 0;
+            if (!onlyGenericClassUncertainty) return false;
+        }
         std::unordered_set<std::string> seen;
         auto consider = [&](const std::string& name)
         {

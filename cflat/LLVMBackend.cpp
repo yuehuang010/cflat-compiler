@@ -4837,6 +4837,8 @@ void LLVMBackend::ResetForReanalysis()
     ownFlagControlPath_.clear();
     ownFlagControlKind_.clear();
     nextOwnFlagControlFrameId_ = 1;
+    ownFlagDefinitelyReowned_.clear();
+    ownFlagLoopReownSnapshots_.clear();
     ownReleaseGates_.clear();
     receiverScanFacts_.clear();
     readOnlyMethodMemo_.clear();
@@ -5192,6 +5194,8 @@ void LLVMBackend::ResetForReanalysis()
     coreInterfaceDefs_.clear();
     scannedInterfaceImpls.clear();
     uncertainInterfaceImpls.clear();
+    uncertainGenericClassInterfaceImpls_.clear();
+    uncertainOtherInterfaceImpls_.clear();
     certainInstantiatedInterfaces_.clear();
     ifConstGuardedImpls_.clear();
     analyzedRootPath_.clear();
@@ -5225,6 +5229,7 @@ void LLVMBackend::ResetForReanalysis()
     activeGenericEnumSpecialization_.clear();
     activeLocalEnumFunction_.clear();
     activeLocalEnumScopes_.clear();
+    activeLexicalLocalTypeNames_.clear();
     autoVaListAlloca = nullptr;
     ClearStaticLocalRequest();
     autoReturnCapture = std::nullopt;
@@ -8284,6 +8289,8 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     coreInterfaceDefs_.clear();
     scannedInterfaceImpls.clear();
     uncertainInterfaceImpls.clear();
+    uncertainGenericClassInterfaceImpls_.clear();
+    uncertainOtherInterfaceImpls_.clear();
     certainInstantiatedInterfaces_.clear();
     ifConstGuardedImpls_.clear();
     importCompileDepth_ = 0;   // a throw out of an import walk can leave the RAII depth stranded

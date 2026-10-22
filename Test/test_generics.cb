@@ -3,6 +3,9 @@ import "list.cb";
 import "dictionary.cb";
 import "tuple.cb";
 import "library/t60_generic_enum.cb";
+import "unique.cb";
+import "string.cb";
+import "diagnostic/heap_audit.cb";
 
 // =============================================================
 // Generic struct tests (compile-time only monomorphization)
@@ -6007,6 +6010,236 @@ bool testGenericLaterRecords()
     return result;
 }
 
+struct T374Outer
+{
+    using P = int;
+    struct Inner<T> { P value = default; T other = default; };
+    Inner<int> b;
+    P tail = default;
+};
+struct T374TwiceOuter
+{
+    struct Inner<T> { T value = default; };
+    Inner<int> first;
+    Inner<i64> second;
+};
+struct T374GenericOuter<U>
+{
+    using P = U;
+    struct Inner<T> { P base = default; T other = default; };
+    Inner<U> b;
+};
+struct T374ClassOuter
+{
+    class Inner<T> { T value = default; };
+    Inner<int> b;
+};
+struct T374AliasOuter
+{
+    using P = int;
+    static int Seed() { return 13; }
+    struct Inner<T> { P value = default; T other = default; int seed = T374AliasOuter.Seed(); };
+    Inner<int> b;
+};
+struct T374PointerOuter
+{
+    struct Inner<T> { T value = default; T374PointerOuter* back = default; };
+    Inner<int> b;
+};
+struct T374SizeOuter
+{
+    using P = int;
+    struct Inner<T> { P value = default; T other = default; };
+    Inner<int> b;
+    P tail = default;
+};
+int t374DtorCount = 0;
+struct T374Resource { ~T374Resource() { t374DtorCount++; } };
+struct T374OwningOuter
+{
+    struct Inner<T> { unique<T374Resource> owned = default; string text = "x"; T marker = default; };
+    Inner<int> b;
+};
+
+bool testT374NestedTemplateFields()
+{
+    bool result = true;
+    T374Outer outer = default;
+    outer.b.value = 7;
+    outer.b.other = 9;
+    outer.tail = 11;
+    result &= Test("t374 nested field repro", outer.b.value + outer.b.other + outer.tail, 27);
+
+    T374TwiceOuter twice = default;
+    twice.first.value = 2;
+    twice.second.value = 5;
+    result &= Test("t374 nested fields distinct args", twice.first.value + (int)twice.second.value, 7);
+
+    T374GenericOuter<int> genericOuter = default;
+    genericOuter.b.base = 6;
+    genericOuter.b.other = 10;
+    result &= Test("t374 generic enclosing field", genericOuter.b.base + genericOuter.b.other, 16);
+
+    T374ClassOuter classOuter = default;
+    classOuter.b.value = 23;
+    result &= Test("t374 nested class field", classOuter.b.value, 23);
+
+    T374AliasOuter aliasOuter = default;
+    aliasOuter.b.value = 2;
+    aliasOuter.b.other = 3;
+    result &= Test("t374 enclosing alias and static member", aliasOuter.b.value + aliasOuter.b.other + aliasOuter.b.seed, 18);
+
+    T374PointerOuter pointerOuter = default;
+    pointerOuter.b.value = 17;
+    pointerOuter.b.back = &pointerOuter;
+    result &= Test("t374 enclosing pointer backref", pointerOuter.b.back->b.value, 17);
+    result &= Test("t374 nested sizeof", (int)sizeof(T374SizeOuter), 12);
+
+    HeapAudit.enable();
+    u64 before = HeapAudit.reportLeaks();
+    t374DtorCount = 0;
+    {
+        T374OwningOuter owningOuter = default;
+        owningOuter.b.owned.reset(new T374Resource());
+        owningOuter.b.text = "nested template field payload";
+        owningOuter.b.marker = 19;
+        result &= Test("t374 nested owning field value", owningOuter.b.marker, 19);
+        result &= Test("t374 nested string field value", (int)owningOuter.b.text.length(), 29);
+    }
+    result &= Test("t374 nested field destructor once", t374DtorCount, 1);
+    result &= Test("t374 nested field heap audit", HeapAudit.reportLeaks(), before);
+    return result;
+}
+
+struct T383Generic<T> { T a = default; T b = default; T c = default; };
+using T383Inner = T383Generic;
+struct T383AliasOuter
+{
+    struct T383Inner<T> { T a = default; };
+    T383Inner<int> field;
+    int Read() { T383Inner<int> local = default; local.a = 5; return local.a + (int)sizeof(local); }
+    int ReadSizeof() { return (int)sizeof(T383Inner<int>) + 1; }
+};
+namespace T383Ns
+{
+    struct T383Generic<T> { T a = default; T b = default; T c = default; };
+    using T383Inner = T383Generic;
+    struct Outer { struct T383Inner<T> { T value = default; }; T383Inner<int> field; };
+    int Size() { return (int)sizeof(Outer); }
+}
+struct T383NoNestedOuter { T383Inner<int> field; };
+struct T383GenericOuter<U>
+{
+    struct T383Inner<T> { U a = default; T b = default; };
+    T383Inner<U> field;
+};
+int t383AliasOutside()
+{
+    T383Inner<int> value = default;
+    value.a = 3; value.b = 4; value.c = 5;
+    return value.a + value.b + value.c;
+}
+int t383AliasInsideNoNested()
+{
+    T383NoNestedOuter value = default;
+    value.field.a = 4; value.field.b = 5; value.field.c = 6;
+    return value.field.a + value.field.b + value.field.c;
+}
+bool testT383AliasShadowsNestedTemplate()
+{
+    bool result = true;
+    result &= Test("t383 nested field size", (int)sizeof(T383AliasOuter), 4);
+    T383AliasOuter outer = default;
+    result &= Test("t383 nested method local", outer.Read(), 9);
+    result &= Test("t383 nested method sizeof type", outer.ReadSizeof(), 5);
+    result &= Test("t383 alias outside aggregate", t383AliasOutside(), 12);
+    result &= Test("t383 alias without nested template", t383AliasInsideNoNested(), 15);
+    result &= Test("t383 namespace nested size", T383Ns.Size(), 4);
+    T383GenericOuter<int> genericOuter = default;
+    genericOuter.field.a = 4; genericOuter.field.b = 6;
+    result &= Test("t383 generic enclosing template", (int)sizeof(T383GenericOuter<int>)
+        + genericOuter.field.a + genericOuter.field.b, 18);
+    return result;
+}
+
+struct T384TwoLevelOuter
+{
+    struct Inner<T> { T x = default; };
+    struct Mid
+    {
+        Inner<int> f;
+        int Run() { f.x = 7; return (int)sizeof(Inner<int>) + f.x; }
+    };
+};
+namespace T384AliasNs
+{
+    struct AliasSource<T> { T x = default; T y = default; T z = default; };
+    using Inner = AliasSource;
+    struct Outer
+    {
+        struct Inner<T> { T x = default; };
+        struct Mid { Inner<int> f; int Run() { f.x = 7; return (int)sizeof(Inner<int>) + f.x; } };
+    };
+    int Value() { Outer.Mid x = default; return (int)sizeof(x) * 10 + x.Run(); }
+}
+struct T384ThreeLevelOuter
+{
+    struct Inner<T> { T x = default; };
+    struct Mid { struct Deep { Inner<int> f; int Run() { f.x = 6; return (int)sizeof(Inner<int>) + f.x; } }; };
+};
+struct T384OwnInnerOuter
+{
+    struct Inner<T> { T x = default; };
+    struct Mid
+    {
+        struct Inner<T> { T x = default; T y = default; };
+        Inner<int> f;
+        int Run() { return (int)sizeof(f); }
+    };
+};
+struct T384MethodOuter
+{
+    struct Inner<T> { T x = default; };
+    struct Mid { int Run() { Inner<int> x = default; x.x = 5; return x.x + (int)sizeof(x); } };
+};
+struct T384GenericOuter<U>
+{
+    struct Inner<T> { U a = default; T b = default; };
+    struct Mid
+    {
+        Inner<U> f;
+        int Run() { f.a = 5; f.b = 6; return f.a + f.b + (int)sizeof(f); }
+    };
+    Mid mid;
+    U value = default;
+};
+namespace T384Ns
+{
+    struct Outer
+    {
+        struct Inner<T> { T x = default; };
+        struct Mid { Inner<int> f; int Run() { f.x = 7; return (int)sizeof(Inner<int>) + f.x; } };
+    };
+    int Value() { Outer.Mid x = default; return (int)sizeof(x) * 10 + x.Run(); }
+}
+bool testT384TwoLevelNestedTemplates()
+{
+    bool result = true;
+    T384TwoLevelOuter.Mid noAlias = default;
+    result &= Test("t384 two-level no alias", (int)sizeof(T384TwoLevelOuter.Mid) * 10 + noAlias.Run(), 51);
+    result &= Test("t384 nested template before alias", T384AliasNs.Value(), 51);
+    T384ThreeLevelOuter.Mid.Deep deep = default;
+    result &= Test("t384 three-level enclosing template", (int)sizeof(T384ThreeLevelOuter.Mid.Deep) * 10 + deep.Run(), 50);
+    T384OwnInnerOuter.Mid own = default;
+    result &= Test("t384 innermost template wins", (int)sizeof(T384OwnInnerOuter.Mid) * 10 + own.Run(), 88);
+    T384MethodOuter.Mid method = default;
+    result &= Test("t384 method body enclosing template", method.Run(), 9);
+    T384GenericOuter<int> generic = default;
+    result &= Test("t384 generic outer with mid", (int)sizeof(T384GenericOuter<int>) * 10 + generic.mid.Run(), 139);
+    result &= Test("t384 namespace two-level", T384Ns.Value(), 51);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -6177,6 +6410,9 @@ extern int main()
     total++; passed += testMemberTypeValueParens()                   ? 1 : 0;
     total++; passed += testMemberTypeForwardRecords()                ? 1 : 0;
     total++; passed += testGenericLaterRecords()                      ? 1 : 0;
+    total++; passed += testT374NestedTemplateFields()                  ? 1 : 0;
+    total++; passed += testT383AliasShadowsNestedTemplate()            ? 1 : 0;
+    total++; passed += testT384TwoLevelNestedTemplates()                ? 1 : 0;
     total++; passed += testPointerOnlyLaterStruct()                  ? 1 : 0;
     total++; passed += testConstGenerics()                           ? 1 : 0;
     total++; passed += testConstGenericList()                        ? 1 : 0;

@@ -1,0 +1,10 @@
+import "unique.cb";
+struct PS { int v = 0; PS(int x) { v = x; } };
+struct U { unique PS* p = nullptr; };
+U gU = default;
+
+expect_error("cannot consume owning value 'gU.p' out of storage that outlives this function") {
+    void badGlobalFieldChain() { unique PS* o = gU.p = new PS(18); }
+}
+
+extern int main() { return 0; }

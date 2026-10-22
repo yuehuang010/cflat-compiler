@@ -1654,6 +1654,7 @@ void LLVMBackend::ApplyFuncPtrSinkTransfer(const std::string& functionName,
         const std::vector<TypeAndValue::FuncPtrParam>& params,
         const std::vector<NamedVariable>& args, bool beforeCall)
 {
+        if (beforeCall) RegisterOwnedStringRvalueArguments(args);
         bool anySink = false;
         for (const auto& p : params)
             anySink = anySink || p.IsOwningSink || p.IsConsumeInferredSink || p.IsMove;
@@ -1707,6 +1708,54 @@ void LLVMBackend::LogOwningLocalCopyMoveSinkError(const std::string& sourceName,
               ownerName, ownerName });
 }
 
+bool LLVMBackend::BindingKeepsOwnershipOfBoxedObject(const NamedVariable* nv) const
+{
+        if (nv == nullptr) return false;
+        if (!nv->BorrowedUniqueField.empty()) return true;
+        if (nv->Storage == nullptr) return false;
+        bool isCoreUniqueValue = IsCoreUniqueType(nv->TypeAndValue.TypeName)
+            && !nv->TypeAndValue.Pointer;
+        if (nv->IsUniqueFieldAlias || nv->TypeAndValue.IsUnique || isCoreUniqueValue)
+            return true;
+        if (nv->Primary != nullptr
+            && FindUniqueFieldBorrowResult(nv->Primary) != nullptr
+            && !nv->TypeAndValue.IsMove)
+            return true;
+        if (!llvm::isa<llvm::AllocaInst>(nv->Storage)) return false;
+        if (nv->IsOwning) return true;
+        if (nv->BorrowsOwnedElement && !nv->CoalesceRebound) return true;
+        if (nv->InheritedKeepsOwner) return true;
+        if (JoinArmsStillKeepOwner(*nv)) return true;
+        // A rebind retires declaration-time borrow/copy proofs before their fallbacks can apply.
+        if (nv->PointerRebound) return false;
+        if (nv->IsBorrowed && !nv->BorrowedOrigin.empty()
+            && !BorrowProofRetiredByRebind(*nv)) return true;
+        if (OwningLocalCopyStillAliases(*nv)) return true;
+        // Compare storage identity because an inner local can shadow a parameter's name.
+        return !nv->TypeAndValue.IsMove && IsFunctionParameterStorage(nv->Storage);
+}
+
+bool LLVMBackend::JoinArmsStillKeepOwner(const NamedVariable& nv, int depth) const
+{
+        if (!nv.JoinKeepsOwner || nv.JoinKeepsOwnerSlots.empty()) return false;
+        // The depth bound prevents cycles from being mistaken for a complete owner proof.
+        if (depth > 4) return false;
+        for (auto* slot : nv.JoinKeepsOwnerSlots)
+        {
+            if (slot == nullptr || slot == nv.Storage) return false;
+            const auto* arm = FindVariableByStorage(slot);
+            // Recheck each arm after binding so a later rebind retires its old proof.
+            if (arm == nullptr || arm->PointerRebound) return false;
+            if (arm->JoinKeepsOwner)
+            {
+                if (!JoinArmsStillKeepOwner(*arm, depth + 1)) return false;
+                continue;
+            }
+            if (!BindingKeepsOwnershipOfBoxedObject(arm)) return false;
+        }
+        return true;
+}
+
 void LLVMBackend::DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
         const std::string& paramName, const NamedVariable& arg)
 {
@@ -1716,6 +1765,21 @@ void LLVMBackend::DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
             && llvm::isa<llvm::AllocaInst>(arg.Storage);
         if (!storageIsLocalSlot || !arg.FieldName.empty()) return;
         const NamedVariable* live = FindVariableByStorage(arg.Storage);
+        const bool allJoinArmsKeepOwner = live != nullptr && !live->IsOwning
+            && JoinArmsStillKeepOwner(*live) && !live->JoinKeepsOwnerSource.empty();
+        if (live != nullptr && arg.TypeAndValue.IsArrayView
+            && (live->OwnFlagMayBeFalse || allJoinArmsKeepOwner))
+        {
+            const std::string sourceName = arg.CallerName.empty()
+                ? FindVariableNameByStorage(arg.Storage) : arg.CallerName;
+            LogError(std::format(
+                "cannot move array view '{}' into move parameter '{}' of '{}' - the view may be "
+                "borrowed on a runtime path, so the sink could free storage the real owner still "
+                "holds. Reassign it from an owned source before passing it to a move parameter.",
+                sourceName.empty() ? SpellType(*this, arg.TypeAndValue) : sourceName,
+                paramName, SpellFunctionSymbol(*this, functionName)));
+            return;
+        }
         const bool argOwns = arg.IsOwning || arg.IsOwningStruct || arg.IsOwningString
             || arg.OwnsInterfaceBox
             || (live != nullptr && (live->IsOwning || live->IsOwningStruct
@@ -1796,6 +1860,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args,
         bool paramsCarryAllocAlign, bool calleeIsMethod, bool beforeCall, bool calleeIsCxx)
 {
+        if (beforeCall) RegisterOwnedStringRvalueArguments(args);
         for (size_t i = 0; i < params.size() && i < args.size(); i++)
         {
             // C++ class by-value transfer constructs a separate parameter object. The source
@@ -1911,6 +1976,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 && (args[i].IsOwning || args[i].IsOwningString || args[i].IsOwningStruct
                     || IsVariableOwning(sourceName) || IsVariableOwningString(sourceName)
                     || IsOwnedClosureTemp(args[i].Primary)
+                    || IsPendingOwnedStringTemp(args[i].Primary)
                     || std::any_of(args[i].ConditionalMoveSources.begin(),
                         args[i].ConditionalMoveSources.end(), [](const auto& source) {
                             return !source.BorrowedPointer;
@@ -3064,6 +3130,96 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         if (userReceiver != nullptr && !methodInfo->IsConst)
             RefuseConstInterfaceReceiverCall(*userReceiver, ifaceName, methodName);
 
+        // An inferred body sink is not written in the interface declaration. Use it only when
+        // every known implementor of this slot has the same summary; otherwise keep the contract.
+        std::vector<TypeAndValue> transferParams = methodInfo->Parameters;
+        std::vector<std::string> implementors;
+        const bool hasImplementorSet = EnumerateInterfaceImplementors(
+            ifaceName, implementors, /*allowKnownGenericClassInstances*/ true);
+        if (hasImplementorSet)
+        {
+            std::vector<std::string> concreteImplementors;
+            bool allGenericTemplatesResolved = true;
+            for (const auto& implementor : implementors)
+            {
+                if (gts.genericClassTemplates.count(implementor) == 0)
+                {
+                    concreteImplementors.push_back(implementor);
+                    continue;
+                }
+
+                bool foundInstantiation = false;
+                for (const auto& entry : dataStructures)
+                {
+                    const std::string& typeKey = entry.first;
+                    TypeSpelling spelling;
+                    if (!DemangleType(*this, typeKey, spelling) || spelling.base != implementor
+                        || !TypeMayProvideInterface(typeKey, ifaceName))
+                        continue;
+                    concreteImplementors.push_back(typeKey);
+                    foundInstantiation = true;
+                }
+                if (!foundInstantiation) allGenericTemplatesResolved = false;
+            }
+            std::sort(concreteImplementors.begin(), concreteImplementors.end());
+            concreteImplementors.erase(std::unique(concreteImplementors.begin(),
+                                                    concreteImplementors.end()),
+                                       concreteImplementors.end());
+            std::vector<TypeAndValue> commonSummary;
+            bool haveSummary = false;
+            bool consistent = allGenericTemplatesResolved && !concreteImplementors.empty();
+            for (const auto& implementor : concreteImplementors)
+            {
+                llvm::Function* implementation = LookupInterfaceMethodImpl(implementor, *methodInfo);
+                auto symbols = functionTable.find(methodInfo->Name);
+                const FunctionSymbol* symbol = nullptr;
+                if (implementation != nullptr && symbols != functionTable.end())
+                    for (const auto& candidate : symbols->second)
+                        if (candidate.Function == implementation)
+                        {
+                            symbol = &candidate;
+                            break;
+                        }
+                if (symbol == nullptr || symbol->Parameters.size() != methodInfo->Parameters.size() + 1)
+                {
+                    consistent = false;
+                    break;
+                }
+                if (!haveSummary)
+                {
+                    commonSummary.assign(symbol->Parameters.begin() + 1, symbol->Parameters.end());
+                    haveSummary = true;
+                    continue;
+                }
+                for (size_t i = 0; i < methodInfo->Parameters.size(); ++i)
+                {
+                    const auto& current = symbol->Parameters[i + 1];
+                    const auto& common = commonSummary[i];
+                    if (current.IsOwningSink != common.IsOwningSink
+                        || current.IsConsumeInferredSink != common.IsConsumeInferredSink
+                        || current.IsReturnInferredSink != common.IsReturnInferredSink
+                        || current.IsWriteInferredSink != common.IsWriteInferredSink)
+                    {
+                        consistent = false;
+                        break;
+                    }
+                }
+                if (!consistent) break;
+            }
+            if (consistent && haveSummary)
+                for (size_t i = 0; i < transferParams.size(); ++i)
+                {
+                    transferParams[i].IsOwningSink = transferParams[i].IsOwningSink
+                        || commonSummary[i].IsOwningSink;
+                    transferParams[i].IsConsumeInferredSink = transferParams[i].IsConsumeInferredSink
+                        || commonSummary[i].IsConsumeInferredSink;
+                    transferParams[i].IsReturnInferredSink = transferParams[i].IsReturnInferredSink
+                        || commonSummary[i].IsReturnInferredSink;
+                    transferParams[i].IsWriteInferredSink = transferParams[i].IsWriteInferredSink
+                        || commonSummary[i].IsWriteInferredSink;
+                }
+        }
+
         for (size_t i = 0; i < methodInfo->Parameters.size() && i < callArgNVs.size(); i++)
         {
             if (!callArgNVs[i].IsBonded) continue;
@@ -3333,7 +3489,7 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         }
 
         moveTransferConsumedTemps_.clear();
-        ApplyMoveParamTransfer(ifaceName + "." + methodName, methodInfo->Parameters, callArgNVs,
+        ApplyMoveParamTransfer(ifaceName + "." + methodName, transferParams, callArgNVs,
             true, false, true);
         // The implementation is a CFlat method, so it may throw through: invoke when this frame
         // owes cleanup. Its pad leaves the sink arguments to the callee.
@@ -3371,8 +3527,7 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             aliasCallArgs.push_back(argIndex < callArgs.size() ? callArgs[argIndex] : nullptr);
         }
         bool aliasStringTempMayOwn = TryAdoptAliasReturnStringTemp(resultValue, rt,
-            rt.IsMove, rt.IsAlias, methodInfo->Parameters, aliasCallArgs, &callArgNVs,
-            /*requireReturnSinkParam*/ false);
+            rt.IsMove, rt.IsAlias, transferParams, aliasCallArgs, &callArgNVs);
 
         // An `adopt` parameter publishes an owned interface box into callee-managed storage.
         // The source remains readable, but its local teardown ownership is retired.
@@ -3407,8 +3562,8 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         for (size_t i = 0; i < methodInfo->Parameters.size() && i < callArgNVs.size(); i++)
             DiagnoseExplicitMoveToBorrowParam(SpellType(*this, TypeAndValue{ .TypeName = ifaceName })
                 + "." + methodName,
-                methodInfo->Parameters[i], callArgNVs[i]);
-        ApplyMoveParamTransfer(ifaceName + "." + methodName, methodInfo->Parameters, callArgNVs,
+                transferParams[i], callArgNVs[i]);
+        ApplyMoveParamTransfer(ifaceName + "." + methodName, transferParams, callArgNVs,
             true, false, false);
 
         // A temp's `unique` field handed to a PLAIN `T*` parameter of a VIRTUAL slot. Same point

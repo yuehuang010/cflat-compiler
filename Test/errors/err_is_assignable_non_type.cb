@@ -1,0 +1,33 @@
+struct LocalT { const int n = 0; };
+struct ParamT { const int n = 0; };
+struct FieldT { const int n = 0; };
+struct ExprT { const int n = 0; };
+int globalValue = 0;
+
+expect_error("is_assignable expects a type operand.") {
+    int localShadow() { int LocalT = 0; return is_assignable((LocalT)); }
+}
+expect_error("is_assignable expects a type operand.") {
+    int paramShadow(int ParamT) { return is_assignable((ParamT)); }
+}
+expect_error("is_assignable expects a type operand.") {
+    struct FieldHost { int FieldT = 0; int read() { return is_assignable((FieldT)); } };
+}
+expect_error("is_assignable expects a type operand.") {
+    int globalShadow() { return is_assignable((globalValue)); }
+}
+expect_error("is_assignable expects a type operand.") {
+    int expressionOperand() { return is_assignable((ExprT())); }
+}
+
+extern int main()
+{
+    int x = 0;
+    expect_error("is_assignable expects a type operand.") {
+        int result = is_assignable((x));
+    }
+    expect_error("is_assignable expects a type operand.") {
+        int result = is_assignable((missing));
+    }
+    return 0;
+}

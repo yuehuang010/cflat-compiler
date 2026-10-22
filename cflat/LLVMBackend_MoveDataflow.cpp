@@ -2658,6 +2658,15 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
                         }
                         for (auto& [varName, nv] : frame.functionArgument)
                         {
+                            if (nv.Storage == srcAlloca && nv.IsOwningString
+                                && nv.TypeAndValue.IsConsumeInferredSink
+                                && ResolveTypeAlias(nv.TypeAndValue.TypeName) == "string")
+                            {
+                                ownedStringReturnVar = &nv;
+                                builder->CreateStore(
+                                    llvm::Constant::getNullValue(loadInst->getType()), srcAlloca);
+                                return;
+                            }
                             if (nv.Storage == srcAlloca && IsOwnedAtScopeExit(nv))
                             {
                                 ownedPtrReturnVar = &nv;

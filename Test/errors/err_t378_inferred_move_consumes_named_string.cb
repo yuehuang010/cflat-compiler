@@ -1,0 +1,14 @@
+string t378ConditionalMoveReturn(string s, int k)
+{
+    if (k == 1) { _ = move s; return "x".copy(); }
+    return s;
+}
+
+expect_error("use of moved variable 'a'") {
+    int t378_move_consumes_named_string(int argc)
+    {
+        string a = "a".copy();
+        string result = t378ConditionalMoveReturn(a, 1);
+        return (int)a.length();
+    }
+}

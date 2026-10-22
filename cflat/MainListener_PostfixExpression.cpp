@@ -3912,6 +3912,24 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 interfaceVar = {};
                                 break;
                             }
+                            // A local type can mask an outer function value before the normal
+                            // identifier lookup runs. Keep type-qualified member access intact.
+                            auto* nextSuffix = childIndex < childLimit
+                                ? dynamic_cast<antlr4::tree::TerminalNode*>(ctx->children[childIndex])
+                                : nullptr;
+                            const bool followedByCall = nextSuffix != nullptr
+                                && nextSuffix->getSymbol()->getType() == CFlatParser::LeftParen;
+                            const bool followedByDot = IsFollowedByDot(ctx, parseTree);
+                            const bool localTypeShadowsValue = LexicalLocalTypeShadowsValue(
+                                Compiler(ctx), prevPrimary->genericIdentifier()->Identifier(), idName);
+                            if (!followedByDot && !followedByCall && localTypeShadowsValue)
+                            {
+                                LogErrorContext(prevPrimary->genericIdentifier()->Identifier(),
+                                    std::format("'{}' names a type, not a value.", idName));
+                                namedVar = {};
+                                structVar = {};
+                                break;
+                            }
                             // A VARIABLE of the same name shadows a namespace; without this the
                             // primary yielded an EMPTY NamedVariable with no diagnostic. A FIELD of
                             // the enclosing struct, read bare through the implicit 'this', counts.
@@ -3920,8 +3938,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 || Compiler(ctx)->GetFunctionArgument(idName).GetValue() != nullptr
                                 || Compiler(ctx)->HasMemberVariable(idName)
                                 || Compiler(ctx)->GetGlobalVariableNV(idName).Storage != nullptr;
+                            const bool localTypeMember = followedByDot && localTypeShadowsValue;
                             if ((Compiler(ctx)->IsNamespace(idName) || Compiler(ctx)->IsCxxNamespace(idName))
-                                && !nameIsVariable)
+                                && (!nameIsVariable || localTypeMember))
                             {
                                 namespaceContext = Compiler(ctx)->IsCxxNamespace(idName)
                                     ? idName : Compiler(ctx)->ResolveNamespace(idName);
@@ -3931,9 +3950,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             else if (prevPrimary->genericIdentifier()->genericTypeParameters() == nullptr
                                      && Compiler(ctx)->IsDataStructure(
                                          Compiler(ctx)->ResolveQualifiedName(prevPrimary->getText()))
-                                     && Compiler(ctx)->GetLocalVariable(idName).Storage == nullptr
-                                     && Compiler(ctx)->GetFunctionArgument(idName).GetValue() == nullptr
-                                     && !Compiler(ctx)->HasMemberVariable(idName))
+                                     && (localTypeMember
+                                         || (Compiler(ctx)->GetLocalVariable(idName).Storage == nullptr
+                                             && Compiler(ctx)->GetFunctionArgument(idName).GetValue() == nullptr
+                                             && !Compiler(ctx)->HasMemberVariable(idName))))
                             {
                                 // Type name used as qualifier for static method access: ClassName.Method()
                                 // Constructor calls (ClassName()) still work because functionName = "ClassName".
@@ -4352,7 +4372,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // negative offset. Single evaluation - do not also call ParseExpression.
                         LLVMBackend::TypeAndValue indexExpectedType;
                         indexExpectedType.TypeName = "int";
-                        DeclExpectedTypeScope indexExpectedScope(&declExpectedType, indexExpectedType);
+                            DeclExpectedTypeScope indexExpectedScope(&declExpectedType, indexExpectedType, true);
                         auto idxNamed = ParseAssignmentExpressionNamed(expressCtx->assignmentExpression());
                         bool idxIsUnsigned = idxNamed.TypeAndValue.IsUnsignedInteger() != -1;
                         auto rvalue = LoadNamedVariable(idxNamed);
@@ -5312,7 +5332,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 break;
                             }
 
-                            DeclExpectedTypeScope expected(&declExpectedType, destType);
+                            DeclExpectedTypeScope expected(&declExpectedType, destType, true);
                             compiler->lastCxxRetTemp_ = nullptr;
                             compiler->lastCxxRetValue_ = nullptr;
                             auto ownedTempMark = compiler->MarkOwnedTemps();
@@ -6524,7 +6544,45 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 {
                                     auto* be = Compiler(ctx);
                                     auto* argExpr = namedArgCtx[0]->assignmentExpression();
-                                    std::string base = argExpr->getText();
+                                    auto* typeOperandExpr = UnwrapInitializerParens(argExpr);
+                                    if (typeOperandExpr == nullptr)
+                                        LogErrorContext(ctx, "is_assignable expects a type operand.");
+                                    std::string base = typeOperandExpr != nullptr ? typeOperandExpr->getText() : std::string();
+
+                                    // A bare name can resolve as a value before it can name a type.
+                                    // Follow the expression tree's root and codegen lookup order.
+                                    antlr4::tree::ParseTree* rootNode = typeOperandExpr;
+                                    CFlatParser::PrimaryExpressionContext* rootPrimary = nullptr;
+                                    std::string rootName;
+                                    std::string qualifiedName;
+                                    bool rootIsNamespace = false;
+                                    while (rootNode != nullptr)
+                                    {
+                                        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(rootNode))
+                                        {
+                                            rootPrimary = postfix->primaryExpression();
+                                            break;
+                                        }
+                                        auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(rootNode);
+                                        if (rule == nullptr || rule->children.empty()) break;
+                                        rootNode = rule->children.front();
+                                    }
+                                    if (rootPrimary != nullptr && rootPrimary->genericIdentifier() != nullptr
+                                        && rootPrimary->genericIdentifier()->Identifier() != nullptr)
+                                    {
+                                        rootName = rootPrimary->genericIdentifier()->Identifier()->getText();
+                                        qualifiedName = be->ResolveQualifiedName(rootName);
+                                        rootIsNamespace = be->IsNamespace(rootName)
+                                            || be->IsCxxNamespace(rootName);
+                                        bool valueName =
+                                            !be->GetScopedLocalOrArgument(rootName).CallerName.empty()
+                                            || be->HasMemberVariable(rootName)
+                                            || be->GetGlobalVariableNV(rootName).Storage != nullptr;
+                                        if (!valueName && !rootIsNamespace && qualifiedName != rootName)
+                                            valueName = be->GetGlobalVariableNV(qualifiedName).Storage != nullptr;
+                                        if (valueName)
+                                            LogErrorContext(ctx, "is_assignable expects a type operand.");
+                                    }
                                     bool isPointer = false;
                                     if (auto substIt = activeTypeSubstitutions.find(base);
                                         substIt != activeTypeSubstitutions.end())
@@ -6533,6 +6591,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         base = LegacyUniqueSubstitutionSpelling(be, substIt->second);
                                         StripOwnershipQualifiers(base);
                                         isPointer = !base.empty() && base.back() == '*';
+                                        if (base.empty())
+                                            LogErrorContext(ctx, "is_assignable expects a type operand.");
                                     }
                                     else
                                     {
@@ -6551,43 +6611,72 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             auto operand = ParseTypeName(parsedTypeName, true, ctx);
                                             if (!operand.TypeName.empty())
                                             {
-                                                resolved = true;
                                                 base = operand.TypeName;
+                                                if (!operand.IsFunctionPointer
+                                                    && !be->IsKnownTypeName(base)
+                                                    && !be->IsCxxRecord(base)
+                                                    && be->FindFunctionTypeAlias(base) == nullptr)
+                                                    LogErrorContext(ctx,
+                                                        "is_assignable expects a type operand.");
+                                                resolved = true;
                                                 isPointer = operand.Pointer || operand.IsArrayView;
-                                                llvm::Type* argType = isPointer ? nullptr
-                                                    : be->GetType(operand, nullptr, true);
-                                                be->TouchWaitingLayout(argType);
-                                                while (argType != nullptr && argType->isArrayTy())
-                                                    argType = argType->getArrayElementType();
-                                                auto* st = llvm::dyn_cast_or_null<llvm::StructType>(argType);
-                                                TypeSpelling spelling;
-                                                if (st != nullptr && !st->isSized() && st->hasName()
-                                                    && DemangleType(*be, st->getName().str(), spelling) && !spelling.args.empty())
+                                                if (!isPointer)
                                                 {
-                                                    // A generic named only here (no instantiating use) is built now, as a
-                                                    // by-value declaration would.
-                                                    std::vector<std::string> typeArgs;
-                                                    for (const auto& arg : spelling.args)
-                                                        typeArgs.push_back(MangleType(*be, arg));
-                                                    QueueGenericInstantiation(spelling.base, typeArgs, st->getName().str(), ctx);
-                                                    LLVMBackend::BuilderStateGuard savedState(be);
-                                                    ProcessPendingInstantiations();
-                                                }
-                                                if (st != nullptr)
-                                                {
-                                                    if (st->hasName() && be->dataStructures.count(st->getName().str()) != 0)
-                                                        base = st->getName().str();
-                                                    if (!st->isSized() && !be->IsCxxRecord(base))
-                                                        LogErrorContext(ctx, std::format(
-                                                            "type '{}' is incomplete here (its layout is not available at this point); "
-                                                            "it can only be used through a pointer", SpellType(*be, operand)));
+                                                    llvm::Type* argType = be->GetType(operand, nullptr, true);
+                                                    be->TouchWaitingLayout(argType);
+                                                    while (argType != nullptr && argType->isArrayTy())
+                                                        argType = argType->getArrayElementType();
+                                                    auto* st = llvm::dyn_cast_or_null<llvm::StructType>(argType);
+                                                    TypeSpelling spelling;
+                                                    if (st != nullptr && !st->isSized() && st->hasName()
+                                                        && DemangleType(*be, st->getName().str(), spelling)
+                                                        && !spelling.args.empty())
+                                                    {
+                                                        // Build a generic named only by this type operand.
+                                                        std::vector<std::string> typeArgs;
+                                                        for (const auto& arg : spelling.args)
+                                                            typeArgs.push_back(MangleType(*be, arg));
+                                                        QueueGenericInstantiation(
+                                                            spelling.base, typeArgs, st->getName().str(), ctx);
+                                                        LLVMBackend::BuilderStateGuard savedState(be);
+                                                        ProcessPendingInstantiations();
+                                                    }
+                                                    if (st != nullptr)
+                                                    {
+                                                        if (st->hasName()
+                                                            && be->dataStructures.count(st->getName().str()) != 0)
+                                                            base = st->getName().str();
+                                                        if (!st->isSized() && !be->IsCxxRecord(base))
+                                                            LogErrorContext(ctx, std::format(
+                                                                "type '{}' is incomplete here (its layout is not available at this point); "
+                                                                "it can only be used through a pointer",
+                                                                SpellType(*be, operand)));
+                                                    }
                                                 }
                                             }
                                         }
                                         if (!resolved)
+                                            LogErrorContext(ctx, "is_assignable expects a type operand.");
+                                    }
+                                    if (!rootName.empty() && !rootIsNamespace)
+                                    {
+                                        auto findResolvedFunction = [&](const std::string& name) {
+                                            auto it = be->functionTable.find(name);
+                                            if (it != be->functionTable.end() && !it->second.empty())
+                                                return it->second.front().Function;
+                                            return be->module->getFunction(name);
+                                        };
+                                        llvm::Function* function = qualifiedName != rootName
+                                            ? findResolvedFunction(qualifiedName) : nullptr;
+                                        if (function == nullptr) function = findResolvedFunction(rootName);
+                                        if (function != nullptr)
                                         {
-                                            StripOwnershipQualifiers(base);
-                                            isPointer = !base.empty() && base.back() == '*';
+                                            const auto* symbol = be->FindSymbolForFunction(function);
+                                            if (symbol == nullptr
+                                                || be->ResolveTypeAlias(symbol->ReturnType.TypeName)
+                                                    != be->ResolveTypeAlias(base))
+                                                LogErrorContext(ctx,
+                                                    "is_assignable expects a type operand.");
                                         }
                                     }
                                     std::string constField;
@@ -7021,7 +7110,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         {
                                             argExpectedDest = Compiler(ctx)->FuncPtrParamAsTypeAndValue(
                                                 funcPtrTV.FuncPtrParams[argParamIndex], argParamIndex);
-                                            argExpectedScope.emplace(&declExpectedType, argExpectedDest);
+                                            argExpectedScope.emplace(&declExpectedType, argExpectedDest, true);
                                         }
                                         CallArgumentScope callArgumentScope(
                                             inCallArgument_, ternaryCallArgumentDepth_);
@@ -7184,7 +7273,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         Compiler(ctx)->lastCallReturnType,
                                         funcPtrTV.FuncPtrReturnOwned,
                                         funcPtrTV.FuncPtrReturnAlias, indirectParams, callArgs,
-                                        &argNVs, /*requireReturnSinkParam*/ false);
+                                        &argNVs);
                                 Compiler(ctx)->lastCallReturnsOwned =
                                     funcPtrTV.FuncPtrReturnOwned || aliasStringTempMayOwn;
                                 if (result != nullptr && funcPtrTV.FuncPtrReturnOwned)
@@ -7504,7 +7593,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     size_t savedCastOcc = Compiler(ctx)->BeginCastOccurrence();
                                     size_t thisCastOcc = Compiler(ctx)->CurrentCastOccurrence();
                                     std::optional<DeclExpectedTypeScope> ifaceArgExpectedScope;
-                                    ifaceArgExpectedScope.emplace(&declExpectedType, ifaceArgExpectedDest);
+                                    ifaceArgExpectedScope.emplace(&declExpectedType, ifaceArgExpectedDest, true);
                                     CallArgumentScope callArgumentScope(
                                         inCallArgument_, ternaryCallArgumentDepth_);
                                     auto argNV = ParseCallArgument([&] {
@@ -8475,13 +8564,97 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             defaultArgument = true;
                                         }
                                     }
+                                    if (!argExpectedDest.FuncPtrReturnTypeName.empty())
+                                    {
+                                        auto* callbackIdentifier = BareGenericFunctionValueIdentifier(
+                                            namedArgument->assignmentExpression());
+                                        if (callbackIdentifier != nullptr
+                                            && !NamesVisibleVariable(Compiler(ctx), callbackIdentifier->getText()))
+                                        {
+                                            const std::string genericBase = Compiler(ctx)->ResolveGenericFunctionBase(
+                                                callbackIdentifier->getText());
+                                            if (genericFunctionTemplates.count(genericBase) != 0)
+                                            {
+                                                std::vector<LLVMBackend::TypeAndValue> callbackCandidates;
+                                                auto functionIt = Compiler(ctx)->functionTable.find(functionName);
+                                                if (functionIt != Compiler(ctx)->functionTable.end())
+                                                {
+                                                    std::vector<std::string> argNames;
+                                                    argNames.reserve(namedArgCtx.size());
+                                                    for (const auto& na : namedArgCtx)
+                                                        argNames.push_back(na->Identifier()
+                                                            ? na->Identifier()->getText() : std::string());
+                                                    // `arguments` already holds earlier evaluated args; only the receiver
+                                                    // (paramOffset) is a leading slot. Defaults are honored by the binder.
+                                                    for (const auto& candidate : functionIt->second)
+                                                    {
+                                                        if (paramOffset == 1
+                                                            && (candidate.Parameters.empty()
+                                                                || candidate.Parameters.front().TypeName
+                                                                    != arguments.front().TypeAndValue.TypeName))
+                                                            continue;
+                                                        auto binding = LLVMBackend::ComputeArgumentPositions(
+                                                            argNames, candidate.Parameters,
+                                                            candidate.Variadic, paramOffset,
+                                                            &candidate.DefaultArguments);
+                                                        if (!binding.Ok || argIdx >= binding.PosMap.size()
+                                                            || binding.PosMap[argIdx] < 0)
+                                                            continue;
+                                                        const size_t parameterIndex = static_cast<size_t>(
+                                                            binding.PosMap[argIdx]);
+                                                        if (parameterIndex >= candidate.Parameters.size()) continue;
+                                                        const auto& callbackSignature =
+                                                            candidate.Parameters[parameterIndex];
+                                                        if (callbackSignature.FuncPtrReturnTypeName.empty()) continue;
+                                                        callbackCandidates.push_back(callbackSignature);
+                                                    }
+                                                }
+                                                if (!callbackCandidates.empty())
+                                                {
+                                                    auto formatCandidates = [&](const std::vector<size_t>& indices) {
+                                                        std::string list;
+                                                        for (size_t i = 0; i < indices.size(); ++i)
+                                                        {
+                                                            if (i != 0)
+                                                                list += i + 1 == indices.size() ? " and " : ", ";
+                                                            list += "'" + Compiler(ctx)->FuncPtrSpellingOf(
+                                                                callbackCandidates[indices[i]]) + "'";
+                                                        }
+                                                        return list;
+                                                    };
+                                                    auto deducedIndices = DeduceGenericFunctionCallbackCandidates(
+                                                        genericBase, callbackCandidates);
+                                                    if (deducedIndices.size() > 1)
+                                                    {
+                                                        LogErrorContext(namedArgument, std::format(
+                                                            "ambiguous generic function '{}' for callback candidates {}",
+                                                            callbackIdentifier->getText(),
+                                                            formatCandidates(deducedIndices)));
+                                                        return;
+                                                    }
+                                                    if (deducedIndices.empty())
+                                                    {
+                                                        std::vector<size_t> allIndices;
+                                                        for (size_t i = 0; i < callbackCandidates.size(); ++i)
+                                                            allIndices.push_back(i);
+                                                        LogErrorContext(namedArgument, std::format(
+                                                            "generic function '{}' has no matching callback candidates: {}",
+                                                            callbackIdentifier->getText(),
+                                                            formatCandidates(allIndices)));
+                                                        return;
+                                                    }
+                                                    argExpectedDest = callbackCandidates[deducedIndices.front()];
+                                                }
+                                            }
+                                        }
+                                    }
                                     auto argName = namedArgument->Identifier();
                                     // Occurrence-scope this argument (see codeValueDataCasts_): a
                                     // cast here must not launder a sibling argument's join arm.
                                     size_t savedCastOcc = Compiler(ctx)->BeginCastOccurrence();
                                     size_t thisCastOcc = Compiler(ctx)->CurrentCastOccurrence();
                                     std::optional<DeclExpectedTypeScope> argExpectedScope;
-                                    argExpectedScope.emplace(&declExpectedType, argExpectedDest);
+                                    argExpectedScope.emplace(&declExpectedType, argExpectedDest, true);
                                     CallArgumentScope callArgumentScope(
                                         inCallArgument_, ternaryCallArgumentDepth_);
                                     const bool cxxMemberReceiver = structVar.BaseType != nullptr
@@ -10670,6 +10843,7 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
 
 LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::LambdaExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
+        LexicalLocalTypeScope lexicalLocalTypeScope(compiler);
         if (ctx->trailingConst() != nullptr)
             LogErrorContext(ctx->trailingConst(),
                 "'const' after a parameter list is only allowed on a member function");
@@ -10723,7 +10897,8 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         // the body consumes a by-value owning param the caller still owns, and both free it.
         {
             std::vector<LLVMBackend::TypeAndValue> sinkParams(params.begin(), params.end());
-            ApplyOwningSinkInferenceToBody(compiler, ctx->lambdaBody(), sinkParams, SinkIfConstEvaluator());
+            ApplyOwningSinkInferenceToBody(compiler, ctx->lambdaBody(), sinkParams,
+                                           SinkIfConstEvaluator(), ctx);
             for (size_t i = 0; i < params.size(); i++)
             {
                 params[i].IsOwningSink = sinkParams[i].IsOwningSink;
@@ -11133,7 +11308,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         LLVMBackend::TypeAndValue bodyExpectedDest;
         if (!returnTypeInferred)
             bodyExpectedDest = returnType;
-        DeclExpectedTypeScope lambdaBodyExpectedScope(&declExpectedType, bodyExpectedDest);
+        DeclExpectedTypeScope lambdaBodyExpectedScope(&declExpectedType, bodyExpectedDest, true);
 
         if (auto* body = ctx->lambdaBody())
         {
@@ -12073,6 +12248,12 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
             }
         }
 
+        if (LexicalLocalTypeShadowsValue(compiler, node, name))
+        {
+            LogErrorContext(node, std::format("'{}' names a type, not a value.", name));
+            return {};
+        }
+
         // Locals and parameters resolved together with correct lexical precedence (innermost
         // frame first; a local shadows a parameter within a frame). A separate local-then-argument
         // lookup would let an ENCLOSING function's local beat a lambda's own parameter of the same
@@ -12114,6 +12295,208 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
             return memberVar;
         }
 
+        LLVMBackend::TypeAndValue functionDestination = declExpectedType;
+        if (functionDestination.FuncPtrReturnTypeName.empty() && !functionDestination.Pointer)
+            if (const auto* encoded = compiler->GetEncodedClosureType(functionDestination.TypeName))
+                functionDestination = *encoded;
+        const bool hasFunctionDestination = !functionDestination.FuncPtrReturnTypeName.empty();
+        auto rejectsGenericScalarValue = [&]() {
+            auto isBinaryOperator = [](antlr4::tree::ParseTree* parent) {
+                return (dynamic_cast<CFlatParser::AdditiveExpressionContext*>(parent) != nullptr
+                        || dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(parent) != nullptr
+                        || dynamic_cast<CFlatParser::ShiftExpressionContext*>(parent) != nullptr
+                        || dynamic_cast<CFlatParser::RelationalExpressionContext*>(parent) != nullptr
+                        || dynamic_cast<CFlatParser::EqualityExpressionContext*>(parent) != nullptr
+                        || dynamic_cast<CFlatParser::AndExpressionContext*>(parent) != nullptr
+                        || dynamic_cast<CFlatParser::ExclusiveOrExpressionContext*>(parent) != nullptr
+                        || dynamic_cast<CFlatParser::InclusiveOrExpressionContext*>(parent) != nullptr)
+                    && parent->children.size() > 1;
+            };
+            auto ternaryHasScalarConsumer = [&](CFlatParser::ConditionalExpressionContext* ternary) {
+                antlr4::tree::ParseTree* inner = ternary;
+                for (antlr4::tree::ParseTree* parent = ternary->parent; parent != nullptr;
+                     inner = parent, parent = parent->parent)
+                {
+                    if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(parent);
+                        primary != nullptr && primary->LeftParen() != nullptr
+                        && primary->expression() == inner)
+                        continue;
+                    if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(parent))
+                    {
+                        antlr4::tree::ParseTree* directChild = ternary;
+                        while (directChild->parent != nullptr && directChild->parent != postfix)
+                            directChild = directChild->parent;
+                        if (directChild->parent == postfix && IsFollowedByCall(postfix, directChild))
+                            return false;
+                        if (dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(directChild) != nullptr)
+                            return IsGenericFunctionScalarDestination(compiler, functionDestination);
+                        if (directChild == postfix->primaryExpression() && postfix->children.size() > 1)
+                            return !postfix->PlusPlus().empty() || !postfix->MinusMinus().empty();
+                        for (auto* index : postfix->expression())
+                            if (index == directChild) return true;
+                    }
+                    if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(parent);
+                        cast != nullptr && cast->castTypeName() != nullptr)
+                        return true;
+                    if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(parent);
+                        unary != nullptr && unary->unaryOperator() != nullptr)
+                        return unary->unaryOperator()->And() == nullptr;
+                    if (isBinaryOperator(parent)
+                        || ((dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(parent) != nullptr
+                             || dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(parent) != nullptr)
+                            && parent->children.size() > 1))
+                        return true;
+                    if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(parent))
+                    {
+                        if (conditional->Question() != nullptr && conditional->logicalOrExpression() == inner)
+                            return true;
+                        continue;
+                    }
+                    if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent);
+                        assignment != nullptr && assignment->assignmentOperator() != nullptr
+                        && assignment->assignmentExpression() == inner)
+                        return assignment->assignmentOperator()->Assign() == nullptr
+                            || IsGenericFunctionScalarDestination(compiler, functionDestination);
+                    if (auto* selection = dynamic_cast<CFlatParser::SelectionStatementContext*>(parent);
+                        selection != nullptr && selection->expression() == inner)
+                        return true;
+                    if (auto* iteration = dynamic_cast<CFlatParser::IterationStatementContext*>(parent);
+                        iteration != nullptr && (iteration->While() != nullptr || iteration->Do() != nullptr)
+                        && iteration->expression() == inner)
+                        return true;
+                    if (auto* forCondition = dynamic_cast<CFlatParser::ForConditionContext*>(parent);
+                        forCondition != nullptr && forCondition->assignmentExpression() == inner)
+                        return true;
+                }
+                return IsGenericFunctionScalarDestination(compiler, functionDestination);
+            };
+            bool scalarOperand = false;
+            bool valueConsumer = false;
+            antlr4::tree::ParseTree* child = node;
+            for (antlr4::tree::ParseTree* parent = node->parent; parent != nullptr;
+                 child = parent, parent = parent->parent)
+            {
+                if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(parent);
+                    primary != nullptr && primary->LeftParen() != nullptr
+                    && primary->expression() == child)
+                    continue;
+                if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(parent);
+                    cast != nullptr && cast->castTypeName() != nullptr)
+                {
+                    valueConsumer = true;
+                    break;
+                }
+                if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(parent))
+                {
+                    if (unary->unaryOperator() != nullptr)
+                    {
+                        if (unary->unaryOperator()->And() == nullptr)
+                            scalarOperand = true;
+                        else
+                            valueConsumer = true;
+                        break;
+                    }
+                    if (!unary->Sizeof().empty())
+                    {
+                        valueConsumer = true;
+                        break;
+                    }
+                }
+                if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(parent))
+                {
+                    antlr4::tree::ParseTree* directChild = node;
+                    while (directChild->parent != nullptr && directChild->parent != postfix)
+                        directChild = directChild->parent;
+                    if (directChild->parent == postfix && IsFollowedByCall(postfix, directChild))
+                    {
+                        valueConsumer = true;
+                        break;
+                    }
+                    if (dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(directChild) != nullptr)
+                    {
+                        scalarOperand = IsGenericFunctionScalarDestination(compiler, functionDestination);
+                        valueConsumer = !scalarOperand;
+                        break;
+                    }
+                    if (directChild == postfix->primaryExpression() && postfix->children.size() > 1)
+                    {
+                        scalarOperand = !postfix->PlusPlus().empty() || !postfix->MinusMinus().empty();
+                        valueConsumer = !scalarOperand;
+                        break;
+                    }
+                    for (auto* index : postfix->expression())
+                        if (index == directChild)
+                        {
+                            scalarOperand = true;
+                            break;
+                        }
+                    if (scalarOperand) break;
+                }
+                if (isBinaryOperator(parent)
+                    || ((dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(parent) != nullptr
+                         || dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(parent) != nullptr)
+                        && parent->children.size() > 1))
+                {
+                    scalarOperand = true;
+                    break;
+                }
+                if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent);
+                    assignment != nullptr && assignment->assignmentOperator() != nullptr
+                    && assignment->assignmentExpression() == child)
+                {
+                    scalarOperand = assignment->assignmentOperator()->Assign() == nullptr
+                        || IsGenericFunctionScalarDestination(compiler, functionDestination);
+                    valueConsumer = !scalarOperand;
+                    break;
+                }
+                if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(parent))
+                {
+                    if (conditional->Question() != nullptr)
+                    {
+                        if (conditional->logicalOrExpression() == child)
+                            scalarOperand = true;
+                        else
+                        {
+                            scalarOperand = IsGenericFunctionScalarDestination(compiler, functionDestination)
+                                || ternaryHasScalarConsumer(conditional);
+                            valueConsumer = !scalarOperand;
+                        }
+                        break;
+                    }
+                    if (conditional->QuestionQuestion() != nullptr)
+                    {
+                        scalarOperand = IsGenericFunctionScalarDestination(compiler, functionDestination);
+                        valueConsumer = !scalarOperand;
+                        break;
+                    }
+                }
+                if (auto* selection = dynamic_cast<CFlatParser::SelectionStatementContext*>(parent);
+                    selection != nullptr && selection->expression() == child)
+                {
+                    scalarOperand = true;
+                    break;
+                }
+                if (auto* iteration = dynamic_cast<CFlatParser::IterationStatementContext*>(parent);
+                    iteration != nullptr && (iteration->While() != nullptr || iteration->Do() != nullptr)
+                    && iteration->expression() == child)
+                {
+                    scalarOperand = true;
+                    break;
+                }
+                if (auto* forCondition = dynamic_cast<CFlatParser::ForConditionContext*>(parent);
+                    forCondition != nullptr && forCondition->assignmentExpression() == child)
+                {
+                    scalarOperand = true;
+                    break;
+                }
+            }
+            if (valueConsumer || (!scalarOperand
+                && !IsGenericFunctionScalarDestination(compiler, functionDestination)))
+                return false;
+            LogErrorContext(node, GenericFunctionScalarValueDiagnostic(compiler, name));
+            return true;
+        };
+
         // Enclosing-namespace variable before the global variable and any function of the same
         // name: inside "namespace N" a bare `lo` names N.lo (C++ lookup, innermost scope first).
         const std::string nsQualified = compiler->ResolveQualifiedName(name);
@@ -12132,7 +12515,10 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
             }
             // The enclosing-namespace FUNCTION family shadows the global variable too; return-block and
             // generic-template siblings have no IR entry yet and defer to the call-site dispatch.
-            if (compiler->GetFunction(nsQualified))
+            const std::string nsGenericBase = compiler->ResolveGenericFunctionBase(nsQualified);
+            const bool hasNsGenericTemplate = genericFunctionTemplates.count(nsGenericBase) != 0;
+            if (compiler->GetFunction(nsQualified)
+                && !(hasNsGenericTemplate && hasFunctionDestination))
             {
                 namedVar.Primary = compiler->GetFunctionForFuncPtr(nsQualified);
                 namedVar.CallerName = nsQualified;
@@ -12140,8 +12526,12 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
             }
             if (compiler->GetReturnBlock(nsQualified) != nullptr)
                 return {};
-            if (genericFunctionTemplates.count(nsQualified))
+            if (hasNsGenericTemplate && !hasFunctionDestination)
+            {
+                if (rejectsGenericScalarValue())
+                    return {};
                 return {};
+            }
         }
 
         // try getting global variable
@@ -12182,6 +12572,141 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
             }
         }
 
+        const std::string genericBase = compiler->ResolveGenericFunctionBase(name);
+        if (genericFunctionTemplates.count(genericBase) != 0
+            && !functionDestination.FuncPtrReturnTypeName.empty())
+        {
+            // A generic callee is inferred from call arguments by the existing call path. Only
+            // a bare primary used as a value takes its type arguments from this destination.
+            bool bareValue = true;
+            antlr4::tree::ParseTree* child = node;
+            for (antlr4::tree::ParseTree* parent = node->parent; parent != nullptr;
+                 child = parent, parent = parent->parent)
+            {
+                auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(parent);
+                if (rule == nullptr) continue;
+                auto* parenthesized = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(rule);
+                const bool wrapsParenthesizedValue = parenthesized != nullptr
+                    && parenthesized->expression() == child
+                    && parenthesized->children.size() == 3;
+                if (!wrapsParenthesizedValue && rule->children.size() != 1)
+                {
+                    bareValue = false;
+                    break;
+                }
+                if (dynamic_cast<CFlatParser::AssignmentExpressionContext*>(rule) != nullptr)
+                    break;
+            }
+            if (bareValue)
+            {
+                auto signatureExact = [&](const LLVMBackend::TypeAndValue& candidate) {
+                    std::vector<LLVMBackend::FuncPtrComponent> actual, expected;
+                    if (!compiler->FuncPtrSignatureOf(candidate, actual)
+                        || !compiler->FuncPtrSignatureOf(functionDestination, expected)
+                        || actual.size() != expected.size()
+                        || candidate.FuncPtrVariadic != functionDestination.FuncPtrVariadic)
+                        return false;
+                    auto componentExact = [](const auto& a, const auto& b) {
+                        return a.Known && b.Known && a.Canon == b.Canon
+                            && (a.PointerDepth == 0 || b.PointerDepth == 0
+                                || a.PointerDepth == b.PointerDepth)
+                            && a.StructKey == b.StructKey;
+                    };
+                    for (size_t i = 0; i < actual.size(); ++i)
+                        if (!componentExact(actual[i], expected[i])) return false;
+                    if (candidate.FuncPtrReturnConstMask >= 0
+                        && functionDestination.FuncPtrReturnConstMask >= 0
+                        && candidate.FuncPtrReturnConstMask != functionDestination.FuncPtrReturnConstMask)
+                        return false;
+                    for (size_t i = 0; i < candidate.FuncPtrParams.size(); ++i)
+                        if (candidate.FuncPtrParams[i].ConstMask >= 0
+                            && functionDestination.FuncPtrParams[i].ConstMask >= 0
+                            && candidate.FuncPtrParams[i].ConstMask
+                                != functionDestination.FuncPtrParams[i].ConstMask)
+                            return false;
+                    return true;
+                };
+                auto hasBindableConcrete = [&]() {
+                    auto it = compiler->functionTable.find(compiler->ResolveQualifiedName(name));
+                    if (it == compiler->functionTable.end()) return false;
+                    for (const auto& symbol : it->second)
+                        if (!symbol.IsMethod
+                            && compiler->DescribeFuncPtrBindMismatch(name,
+                                compiler->FuncPtrSigOfSymbol(symbol), functionDestination).empty())
+                            return true;
+                    return false;
+                };
+                auto bindConcrete = [&]() {
+                    namedVar.Primary = compiler->GetFunctionForFuncPtr(
+                        name, -1, nullptr, &functionDestination);
+                    namedVar.CallerName = name;
+                    namedVar.IdentifierLine = (int)node->getSymbol()->getLine();
+                    namedVar.IdentifierColumn = (int)node->getSymbol()->getCharPositionInLine();
+                };
+
+                auto concreteIt = compiler->functionTable.find(compiler->ResolveQualifiedName(name));
+                if (concreteIt != compiler->functionTable.end()
+                    && std::any_of(concreteIt->second.begin(), concreteIt->second.end(), [&](const auto& symbol) {
+                           return !symbol.IsMethod
+                               && compiler->DescribeFuncPtrBindMismatch(name,
+                                   compiler->FuncPtrSigOfSymbol(symbol), functionDestination).empty()
+                               && signatureExact(compiler->FuncPtrSigOfSymbol(symbol));
+                       }))
+                {
+                    bindConcrete();
+                    return namedVar;
+                }
+
+                std::string refusal;
+                const std::string mangled = TryInferAndInstantiateFromFuncPtr(
+                    genericBase, functionDestination, refusal);
+                if (!mangled.empty())
+                {
+                    auto instantiated = compiler->functionTable.find(
+                        compiler->ResolveQualifiedName(mangled));
+                    if (instantiated != compiler->functionTable.end()
+                        && !instantiated->second.empty())
+                    {
+                        const bool bindable = std::any_of(instantiated->second.begin(),
+                            instantiated->second.end(), [&](const auto& symbol) {
+                                return compiler->DescribeFuncPtrBindMismatch(mangled,
+                                    compiler->FuncPtrSigOfSymbol(symbol), functionDestination).empty();
+                            });
+                        if (!bindable)
+                        {
+                            for (const auto& symbol : instantiated->second)
+                            {
+                                if (symbol.IsMethod) continue;
+                                const std::string mismatch = compiler->DescribeFuncPtrBindMismatch(
+                                    mangled, compiler->FuncPtrSigOfSymbol(symbol), functionDestination);
+                                if (mismatch.empty()) continue;
+                                LogErrorContext(node, mismatch);
+                                return {};
+                            }
+                        }
+                    }
+                    namedVar.Primary = compiler->GetFunctionForFuncPtr(
+                        mangled, -1, nullptr, &functionDestination);
+                    namedVar.CallerName = mangled;
+                    namedVar.GenericFunctionValue = true;
+                    namedVar.IdentifierLine = (int)node->getSymbol()->getLine();
+                    namedVar.IdentifierColumn = (int)node->getSymbol()->getCharPositionInLine();
+                    return namedVar;
+                }
+                if (hasBindableConcrete())
+                {
+                    bindConcrete();
+                    return namedVar;
+                }
+                if (refusal.empty())
+                    refusal = std::format(
+                        "cannot deduce generic function '{}' from destination '{}'",
+                        genericBase, compiler->FuncPtrSpellingOf(functionDestination));
+                LogErrorContext(node, refusal);
+                return {};
+            }
+        }
+
         if (compiler->GetFunction(name))
         {
             // Use GetFunctionForFuncPtr so that a plain name resolves to the top-level
@@ -12200,8 +12725,33 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
         // calls TryInferAndInstantiateFromArgs once the arguments are known. The bare spelling is
         // resolved to its namespace's key here: the ResolveQualifiedName fallback below has no
         // generic-function-only key in its accept set, so it can never rescue this.
-        if (genericFunctionTemplates.count(compiler->ResolveGenericFunctionBase(name)))
+        const std::string unresolvedGeneric = compiler->ResolveGenericFunctionBase(name);
+        if (genericFunctionTemplates.count(unresolvedGeneric))
+        {
+            if (rejectsGenericScalarValue())
+                return {};
+            if (inCxxCallArgument_ && !hasFunctionDestination)
+            {
+                bool followedByCall = false;
+                for (antlr4::tree::ParseTree* parent = node->parent;
+                     parent != nullptr; parent = parent->parent)
+                {
+                    auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(parent);
+                    if (postfix == nullptr) continue;
+                    antlr4::tree::ParseTree* child = node;
+                    while (child->parent != nullptr && child->parent != postfix)
+                        child = child->parent;
+                    if (child->parent == postfix)
+                        followedByCall = IsFollowedByCall(postfix, child);
+                    break;
+                }
+                if (!followedByCall)
+                    LogErrorContext(node, std::format(
+                        "cannot use generic function '{}' as a C++ call argument without a function-pointer destination",
+                        unresolvedGeneric));
+            }
             return {};
+        }
 
         // Compiler intrinsics handled at the call site - not in the function table.
         static const std::unordered_set<std::string> kIntrinsics = {
@@ -12800,6 +13350,15 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                     // GenericSpecOf covers both spellings: bare 'Box<int>' and qualified 'NS.Box<int>'.
                     if (auto* genParams = GenericSpecOf(typeSpec, baseName))
                     {
+                        auto* compiler = Compiler(typeSpec);
+                        const std::string spelledBase = baseName;
+                        const bool spelledGenericBaseAlias = compiler->IsGenericBaseAlias(spelledBase)
+                            && !compiler->HasCxxAliasTemplate(spelledBase);
+                        const std::string enclosingScope = !structScopeStack.empty() ? structScopeStack.back()
+                            : EnclosingAggregateScopeFromContext(compiler, typeSpec);
+                        baseName = ResolveGenericTemplateBaseAtScope(
+                            compiler, baseName, enclosingScope, typeSpec, spelledBase);
+                        if (baseName.empty()) continue;
                         if (insideScopedExpectation && isCflatTemplate(Compiler(typeSpec), baseName))
                             continue;  // Drain this CFlat body while the scoped expectation is armed.
                         if (GenericArgumentsNeedFunctionLocalEnumDeferral(
@@ -12813,7 +13372,6 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                         for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                             typeArgs.push_back(ResolveTypeArgEntry(entry));
                         ResolveEnumTypeArguments(typeArgs);
-                        auto* compiler = Compiler(typeSpec);
                         compiler->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
                         bool resolvesAsType = compiler->IsKnownTypeName(baseName)
                             || compiler->AnyGenericTypeTemplateNamed(baseName)
@@ -12821,7 +13379,7 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                             || baseName == "function" || baseName == "Lambda";
                         if (!resolvesAsType)
                         {
-                            std::string candidate = MangledGenericName(baseName, typeArgs);
+                            std::string candidate = MangledGenericName(baseName, typeArgs, typeSpec);
                             std::string cxxError;
                             resolvesAsType = compiler->TryRequestCxxType(
                                 baseName, typeArgs, candidate, cxxError);
@@ -12829,13 +13387,17 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                         if (!resolvesAsType)
                             continue;
                         // Queue PRE-SCAN: the declaration path reports a refused pattern.
-                        compiler->ResolveGenericAliasSpelling(baseName, typeArgs, false);
+                        // The scoped helper already returned a generic-base alias's canonical target.
+                        if (!spelledGenericBaseAlias)
+                            compiler->ResolveGenericAliasSpelling(baseName, typeArgs, false);
                         compiler->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
                         // One queue funnel: it also pre-creates the opaque shell, so a LATER
                         // instantiation naming this one as a field type finds a type even when
                         // the forward scan spelled the shell differently (e.g. an alias arg).
                         QueueGenericInstantiation(baseName, typeArgs,
-                                                  MangledGenericName(baseName, typeArgs), genParams,
+                                                  spelledGenericBaseAlias
+                                                      ? MangleGenericInstance(*compiler, baseName, typeArgs)
+                                                      : MangledGenericName(baseName, typeArgs, typeSpec), genParams,
                                                   IsPointerOnlyTypeUse(typeSpec));
                     }
                     break;
@@ -12849,6 +13411,9 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                     {
                         auto* genericParams = primaryExpr->genericIdentifier()->genericTypeParameters();
                         std::string baseName = primaryExpr->genericIdentifier()->Identifier()->getText();
+                        const std::string spelledBase = baseName;
+                        const bool spelledGenericBaseAlias = Compiler()->IsGenericBaseAlias(spelledBase)
+                            && !Compiler()->HasCxxAliasTemplate(spelledBase);
                         auto* compiler = Compiler(primaryExpr);
                         if (insideScopedExpectation
                             && (isCflatTemplate(compiler, baseName)
@@ -12872,7 +13437,9 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                         Compiler()->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
                         // Same single funnel as the typeSpecifier arm above.
                         QueueGenericInstantiation(baseName, typeArgs,
-                            MangledGenericName(baseName, typeArgs),
+                            spelledGenericBaseAlias
+                                ? MangleGenericInstance(*Compiler(), baseName, typeArgs)
+                                : MangledGenericName(baseName, typeArgs),
                             genericParams);
                     }
                     break;

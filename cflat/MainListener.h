@@ -119,6 +119,31 @@ inline CFlatParser::AssignmentExpressionContext* UnwrapInitializerParens(
     return assign;
 }
 
+inline CFlatParser::PostfixExpressionContext* SolePostfixExpressionShape(
+    antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return nullptr;
+    if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node)) return postfix;
+    auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+    if (rule == nullptr) return nullptr;
+    if (rule->children.size() == 1) return SolePostfixExpressionShape(rule->children[0]);
+    if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(rule);
+        primary != nullptr && primary->expression() != nullptr)
+        return SolePostfixExpressionShape(primary->expression());
+    return nullptr;
+}
+
+inline antlr4::tree::TerminalNode* BareGenericFunctionValueIdentifier(
+    CFlatParser::AssignmentExpressionContext* assign)
+{
+    auto* postfix = SolePostfixExpressionShape(UnwrapInitializerParens(assign));
+    if (postfix == nullptr || postfix->children.size() != 1) return nullptr;
+    auto* primary = postfix->primaryExpression();
+    auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+    if (generic == nullptr || generic->genericTypeParameters() != nullptr) return nullptr;
+    return generic->Identifier();
+}
+
 // Every '(' suffix and parenthesized primary under `node`: a single-call initializer has exactly one.
 inline size_t CountCallParens(antlr4::tree::ParseTree* node)
 {
@@ -480,9 +505,42 @@ static std::string CanonicalDeclarationTypeName(
         ? canonical : fallback;
 }
 
-// True when `name` resolves as a variable the way ParseIdentifier resolves it: a local, parameter
-// or capture (every scope frame), a field through the implicit 'this', a global, or a global of an
-// enclosing namespace (the ResolveQualifiedName sibling fallback).
+// True for non-pointer primitive destinations, excluding function-pointer types.
+static bool IsGenericFunctionScalarDestination(LLVMBackend* compiler,
+                                               LLVMBackend::TypeAndValue destination)
+{
+    if (compiler == nullptr || destination.TypeName.empty() || destination.TypeName == "auto"
+        || destination.Pointer || destination.ElemPointer || destination.PointerDepth > 0
+        || destination.IsArrayView || destination.IsFunctionPointer
+        || !destination.FuncPtrReturnTypeName.empty())
+        return false;
+    destination.TypeName = compiler->ResolveTypeAlias(destination.TypeName);
+    return destination.TypeName != "void" && destination.IsPrimitive();
+}
+
+static std::string GenericFunctionScalarValueDiagnostic(LLVMBackend* compiler,
+                                                        const std::string& functionName)
+{
+    std::string spelling = SpellFunctionSymbol(*compiler, functionName);
+    if (spelling == functionName)
+        spelling = SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = functionName });
+    return std::format(
+        "'{}' is a function used as a value - did you mean '{}()'? (a bare function name is only valid as a function<T> value)",
+        spelling, spelling);
+}
+
+inline antlr4::tree::TerminalNode* BareGenericFunctionValueIdentifierInExpression(
+    antlr4::tree::ParseTree* expression)
+{
+    auto* postfix = SolePostfixExpressionShape(expression);
+    if (postfix == nullptr || postfix->children.size() != 1) return nullptr;
+    auto* primary = postfix->primaryExpression();
+    auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+    if (generic == nullptr || generic->genericTypeParameters() != nullptr) return nullptr;
+    return generic->Identifier();
+}
+
+// True when `name` resolves as a visible variable in ParseIdentifier lookup order.
 static bool NamesVisibleVariable(LLVMBackend* compiler, const std::string& name)
 {
     if (compiler->FindVariableScopeDepth(name) != SIZE_MAX
@@ -1356,6 +1414,255 @@ static bool LexicalDeclaresTypeNamed(CFlatParser::DeclarationContext* decl, cons
     }
     return false;
 }
+enum class LexicalBlockBindingKind { None, Value, Type };
+struct LexicalBlockBinding
+{
+    LexicalBlockBindingKind Kind = LexicalBlockBindingKind::None;
+    CFlatParser::DeclarationSpecifiersContext* Specifiers = nullptr;
+    CFlatParser::InitDeclaratorContext* Declarator = nullptr;
+    bool HasVisibleValue = false;
+};
+// The latest visible binding in one block item list; shared by const folding and value lookup.
+static LexicalBlockBinding FindLexicalBlockBinding(CFlatParser::BlockItemListContext* list,
+    antlr4::tree::ParseTree* use, const std::string& name)
+{
+    LexicalBlockBinding binding;
+    if (list == nullptr) return binding;
+    for (auto* item : list->blockItem())
+    {
+        auto* decl = item->declaration();
+        bool self = false;
+        auto* visible = decl != nullptr
+            ? LexicalVisibleDeclarator(decl, decl->initDeclaratorList(), name, use, &self) : nullptr;
+        if (self)
+        {
+            binding.Kind = LexicalBlockBindingKind::Value;
+            binding.Specifiers = nullptr;
+            binding.Declarator = nullptr;
+            binding.HasVisibleValue = true;
+            return binding;
+        }
+        if (visible != nullptr)
+        {
+            binding.Kind = LexicalBlockBindingKind::Value;
+            binding.Specifiers = decl->declarationSpecifiers();
+            binding.Declarator = visible;
+            binding.HasVisibleValue = true;
+        }
+        if (item == use) break;
+        if (decl != nullptr && LexicalDeclaresTypeNamed(decl, name))
+        {
+            binding.Kind = LexicalBlockBindingKind::Type;
+            binding.Specifiers = nullptr;
+            binding.Declarator = nullptr;
+        }
+        if (auto* destructure = item->destructuringDeclaration())
+            for (auto* entry : destructure->destructuringEntry())
+                if (entry->Identifier() != nullptr && entry->Identifier()->getText() == name)
+                {
+                    binding.Kind = LexicalBlockBindingKind::Value;
+                    binding.Specifiers = nullptr;
+                    binding.Declarator = nullptr;
+                    binding.HasVisibleValue = true;
+                }
+        if (auto* alias = item->usingDeclaration(); alias != nullptr && alias->Identifier() != nullptr
+            && alias->Identifier()->getText() == name)
+        {
+            binding.Kind = LexicalBlockBindingKind::Type;
+            binding.Specifiers = nullptr;
+            binding.Declarator = nullptr;
+        }
+    }
+    return binding;
+}
+static bool LexicalFunctionHasParameter(CFlatParser::FunctionDefinitionContext* fn,
+    const std::string& name)
+{
+    auto* types = fn != nullptr ? fn->parameterTypeList() : nullptr;
+    auto* parameters = types != nullptr ? types->parameterList() : nullptr;
+    if (parameters == nullptr) return false;
+    for (auto* param : parameters->parameterDeclaration())
+        if (param->declarator() != nullptr && param->declarator()->directDeclarator() != nullptr
+            && getDirectDeclName(param->declarator()->directDeclarator()) == name)
+            return true;
+    return false;
+}
+static bool LexicalLambdaHasParameter(CFlatParser::LambdaExpressionContext* lambda,
+    const std::string& name)
+{
+    if (lambda == nullptr || lambda->lambdaParamList() == nullptr) return false;
+    for (auto* param : lambda->lambdaParamList()->lambdaParam())
+        if (param->Identifier() != nullptr && param->Identifier()->getText() == name)
+            return true;
+    return false;
+}
+static bool LexicalBodyHasValueParameter(CFlatParser::BlockItemListContext* list,
+    const std::string& name)
+{
+    auto* compound = list != nullptr
+        ? dynamic_cast<CFlatParser::CompoundStatementContext*>(list->parent) : nullptr;
+    if (compound == nullptr) return false;
+    if (auto* fn = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(compound->parent))
+        return LexicalFunctionHasParameter(fn, name);
+    return LexicalLambdaHasParameter(
+        dynamic_cast<CFlatParser::LambdaExpressionContext*>(compound->parent), name);
+}
+enum class LexicalBindingEventKind
+{
+    Block, FunctionParameter, GenericParameter, LambdaParameter, CaseBinding,
+    RangeBinding, ForDeclaration
+};
+struct LexicalBindingEvent
+{
+    LexicalBindingEventKind Kind;
+    LexicalBlockBinding BlockBinding;
+    CFlatParser::BlockItemListContext* Block = nullptr;
+    CFlatParser::DeclarationSpecifiersContext* Specifiers = nullptr;
+    CFlatParser::InitDeclaratorContext* Declarator = nullptr;
+    bool Self = false;
+    bool HasSameScopeParameter = false;
+};
+// Both lexical const folding and name lookup consume binders in the same ancestor order.
+template <typename Visitor>
+static void WalkLexicalBindings(antlr4::tree::ParseTree* use, const std::string& name,
+    Visitor&& visit)
+{
+    for (antlr4::tree::ParseTree* node = use; node != nullptr && node->parent != nullptr;
+         node = node->parent)
+    {
+        auto* parent = node->parent;
+        if (auto* lambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent);
+            lambda != nullptr && LexicalLambdaHasParameter(lambda, name))
+            if (visit(LexicalBindingEvent{ LexicalBindingEventKind::LambdaParameter })) return;
+        if (auto* arm = dynamic_cast<CFlatParser::LabeledStatementContext*>(parent);
+            arm != nullptr && arm->typeSpecifier() != nullptr && arm->Identifier() != nullptr
+            && node == arm->statement() && arm->Identifier()->getText() == name)
+            if (visit(LexicalBindingEvent{ LexicalBindingEventKind::CaseBinding })) return;
+        if (auto* loop = dynamic_cast<CFlatParser::IterationStatementContext*>(parent))
+        {
+            if (loop->In() != nullptr && node == loop->statement() && loop->Identifier() != nullptr
+                && loop->Identifier()->getText() == name)
+                if (visit(LexicalBindingEvent{ LexicalBindingEventKind::RangeBinding })) return;
+            if (loop->forCondition() != nullptr)
+                if (auto* forDecl = loop->forCondition()->forDeclaration())
+                {
+                    bool self = false;
+                    auto* match = LexicalVisibleDeclarator(
+                        forDecl, forDecl->initDeclaratorList(), name, use, &self);
+                    if (self || match != nullptr)
+                    {
+                        LexicalBindingEvent event{ LexicalBindingEventKind::ForDeclaration };
+                        event.Specifiers = forDecl->declarationSpecifiers();
+                        event.Declarator = match;
+                        event.Self = self;
+                        if (visit(event)) return;
+                    }
+                }
+        }
+        if (auto* fn = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent))
+        {
+            if (LexicalFunctionHasParameter(fn, name))
+                if (visit(LexicalBindingEvent{ LexicalBindingEventKind::FunctionParameter })) return;
+            if (LexicalGenericParamNamed(fn->genericTypeParameters(), name))
+                if (visit(LexicalBindingEvent{ LexicalBindingEventKind::GenericParameter })) return;
+        }
+        if (auto* sd = dynamic_cast<CFlatParser::StructDefinitionContext*>(parent))
+            if (LexicalGenericParamNamed(sd->genericTypeParameters(), name))
+                if (visit(LexicalBindingEvent{ LexicalBindingEventKind::GenericParameter })) return;
+        if (auto* list = dynamic_cast<CFlatParser::BlockItemListContext*>(parent))
+        {
+            const auto binding = FindLexicalBlockBinding(list, node, name);
+            if (binding.Kind != LexicalBlockBindingKind::None)
+            {
+                LexicalBindingEvent event{ LexicalBindingEventKind::Block };
+                event.BlockBinding = binding;
+                event.Block = list;
+                event.HasSameScopeParameter = LexicalBodyHasValueParameter(list, name);
+                if (visit(event)) return;
+            }
+        }
+    }
+}
+static bool LexicalLocalTypeShadowsValue(LLVMBackend* compiler, antlr4::tree::ParseTree* use,
+    const std::string& name)
+{
+    if (compiler == nullptr || !compiler->HasLexicalLocalTypeName(name)) return false;
+    bool shadows = false;
+    WalkLexicalBindings(use, name, [&](const LexicalBindingEvent& event) {
+        switch (event.Kind)
+        {
+        case LexicalBindingEventKind::Block:
+            if (event.BlockBinding.Kind == LexicalBlockBindingKind::Type)
+            {
+                shadows = !event.BlockBinding.HasVisibleValue && !event.HasSameScopeParameter;
+                return true;
+            }
+            if (event.BlockBinding.Kind == LexicalBlockBindingKind::Value)
+            {
+                shadows = false;
+                return true;
+            }
+            return false;
+        case LexicalBindingEventKind::FunctionParameter:
+        case LexicalBindingEventKind::LambdaParameter:
+        case LexicalBindingEventKind::CaseBinding:
+        case LexicalBindingEventKind::RangeBinding:
+        case LexicalBindingEventKind::ForDeclaration:
+            shadows = false;
+            return true;
+        case LexicalBindingEventKind::GenericParameter:
+            shadows = false;
+            return true;
+        }
+        return false;
+    });
+    return shadows;
+}
+static bool LexicalHasFunctionScope(antlr4::tree::ParseTree* node)
+{
+    for (; node != nullptr; node = node->parent)
+        if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(node) != nullptr
+            || dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr
+            || dynamic_cast<CFlatParser::DestructorDefinitionContext*>(node) != nullptr)
+            return true;
+    return false;
+}
+static void RegisterLexicalLocalTypeName(LLVMBackend* compiler,
+    antlr4::tree::ParseTree* declaration, const std::string& name)
+{
+    if (compiler != nullptr && !name.empty() && LexicalHasFunctionScope(declaration))
+        compiler->RegisterLexicalLocalTypeName(name);
+}
+static void RegisterLexicalStructNamesInDeclaration(LLVMBackend* compiler,
+    CFlatParser::DeclarationContext* declaration)
+{
+    if (compiler == nullptr || declaration == nullptr || !LexicalHasFunctionScope(declaration)) return;
+    std::vector<antlr4::tree::ParseTree*> pending;
+    if (declaration->declarationSpecifiers() != nullptr)
+        pending.push_back(declaration->declarationSpecifiers());
+    while (!pending.empty())
+    {
+        auto* tree = pending.back();
+        pending.pop_back();
+        if (auto* su = dynamic_cast<CFlatParser::StructOrUnionSpecifierContext*>(tree);
+            su != nullptr && su->LeftBrace() != nullptr && su->genericIdentifier() != nullptr
+            && su->genericIdentifier()->Identifier() != nullptr)
+            compiler->RegisterLexicalLocalTypeName(su->genericIdentifier()->Identifier()->getText());
+        for (auto* child : tree->children) pending.push_back(child);
+    }
+}
+struct LexicalLocalTypeScope
+{
+    LLVMBackend* Compiler;
+    explicit LexicalLocalTypeScope(LLVMBackend* compiler) : Compiler(compiler)
+    {
+        if (Compiler != nullptr) Compiler->PushLexicalLocalTypeScope();
+    }
+    ~LexicalLocalTypeScope()
+    {
+        if (Compiler != nullptr) Compiler->PopLexicalLocalTypeScope();
+    }
+};
 static std::optional<int64_t> FoldLexicalConstLocal(LLVMBackend* compiler, antlr4::tree::ParseTree* use,
     const std::string& name, const LexicalConstTypeParser& parseType, bool* found = nullptr)
 {
@@ -1379,98 +1686,38 @@ static std::optional<int64_t> FoldLexicalConstLocal(LLVMBackend* compiler, antlr
         if (!folded || !ConstLocalFoldFits(intTy, *folded)) return std::nullopt;
         return folded;
     };
-    for (antlr4::tree::ParseTree* node = use; node != nullptr && node->parent != nullptr;
-         node = node->parent)
-    {
-        auto* parent = node->parent;
-        if (auto* fn = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent))
+    std::optional<int64_t> result;
+    WalkLexicalBindings(use, name, [&](const LexicalBindingEvent& event) {
+        switch (event.Kind)
         {
-            if (auto* types = fn->parameterTypeList(); types != nullptr && types->parameterList() != nullptr)
-                for (auto* param : types->parameterList()->parameterDeclaration())
-                    if (param->declarator() != nullptr && param->declarator()->directDeclarator() != nullptr
-                        && getDirectDeclName(param->declarator()->directDeclarator()) == name)
-                        return shadow();
-            if (LexicalGenericParamNamed(fn->genericTypeParameters(), name)) return shadow();
-            continue;
-        }
-        if (auto* sd = dynamic_cast<CFlatParser::StructDefinitionContext*>(parent))
-        {
-            if (LexicalGenericParamNamed(sd->genericTypeParameters(), name)) return shadow();
-            continue;
-        }
-        if (auto* lambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent))
-        {
-            // A capture is the outer binding itself, so only the lambda's own parameters shadow.
-            if (lambda->lambdaParamList() != nullptr)
-                for (auto* param : lambda->lambdaParamList()->lambdaParam())
-                    if (param->Identifier() != nullptr && param->Identifier()->getText() == name)
-                        return shadow();
-            continue;
-        }
-        if (auto* arm = dynamic_cast<CFlatParser::LabeledStatementContext*>(parent))
-        {
-            if (arm->typeSpecifier() != nullptr && arm->Identifier() != nullptr
-                && node == arm->statement() && arm->Identifier()->getText() == name)
-                return shadow();
-            continue;
-        }
-        if (auto* loop = dynamic_cast<CFlatParser::IterationStatementContext*>(parent))
-        {
-            if (loop->In() != nullptr && node == loop->statement() && loop->Identifier() != nullptr
-                && loop->Identifier()->getText() == name)
-                return shadow();
-            if (loop->forCondition() != nullptr)
-                if (auto* forDecl = loop->forCondition()->forDeclaration())
-                {
-                    bool self = false;
-                    auto* match = LexicalVisibleDeclarator(forDecl, forDecl->initDeclaratorList(), name, use, &self);
-                    if (self) return shadow();
-                    if (match != nullptr) return fold(forDecl->declarationSpecifiers(), match);
-                }
-            continue;
-        }
-        auto* list = dynamic_cast<CFlatParser::BlockItemListContext*>(parent);
-        if (list == nullptr) continue;
-        CFlatParser::InitDeclaratorContext* match = nullptr;
-        CFlatParser::DeclarationSpecifiersContext* matchSpecs = nullptr;
-        bool shadowed = false;
-        for (auto* item : list->blockItem())
-        {
-            auto* decl = item->declaration();
-            bool self = false;
-            auto* visible = decl != nullptr
-                ? LexicalVisibleDeclarator(decl, decl->initDeclaratorList(), name, use, &self) : nullptr;
-            if (self) return shadow();
-            if (visible != nullptr)
+        case LexicalBindingEventKind::Block:
+            if (event.BlockBinding.Kind == LexicalBlockBindingKind::Type)
             {
-                match = visible;
-                matchSpecs = decl->declarationSpecifiers();
-                shadowed = false;
+                result = shadow();
+                return true;
             }
-            if (item == node) break;
-            if (decl != nullptr && LexicalDeclaresTypeNamed(decl, name))
+            if (event.BlockBinding.Kind == LexicalBlockBindingKind::Value)
             {
-                match = nullptr;
-                shadowed = true;
+                result = event.BlockBinding.Declarator != nullptr
+                    ? fold(event.BlockBinding.Specifiers, event.BlockBinding.Declarator)
+                    : shadow();
+                return true;
             }
-            if (auto* destructure = item->destructuringDeclaration())
-                for (auto* entry : destructure->destructuringEntry())
-                    if (entry->Identifier() != nullptr && entry->Identifier()->getText() == name)
-                    {
-                        match = nullptr;
-                        shadowed = true;
-                    }
-            if (auto* alias = item->usingDeclaration(); alias != nullptr && alias->Identifier() != nullptr
-                && alias->Identifier()->getText() == name)
-            {
-                match = nullptr;
-                shadowed = true;
-            }
+            return false;
+        case LexicalBindingEventKind::ForDeclaration:
+            result = event.Self ? shadow() : fold(event.Specifiers, event.Declarator);
+            return true;
+        case LexicalBindingEventKind::FunctionParameter:
+        case LexicalBindingEventKind::GenericParameter:
+        case LexicalBindingEventKind::LambdaParameter:
+        case LexicalBindingEventKind::CaseBinding:
+        case LexicalBindingEventKind::RangeBinding:
+            result = shadow();
+            return true;
         }
-        if (shadowed) return shadow();
-        if (match != nullptr) return fold(matchSpecs, match);
-    }
-    return std::nullopt;
+        return false;
+    });
+    return result;
 }
 
 // A bare identifier that names a compile-time integer: a -D define or a platform builtin
@@ -2058,6 +2305,298 @@ static CFlatParser::GenericTypeParametersContext* GenericSpecOf(
     return nullptr;
 }
 
+struct EnclosingAggregateLookupScope
+{
+    std::string Name;
+    antlr4::ParserRuleContext* Definition = nullptr;
+};
+
+static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesFromContext(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node)
+{
+    if (compiler == nullptr) return {};
+    std::vector<std::pair<std::string, antlr4::ParserRuleContext*>> aggregates;
+    for (auto* parent = node != nullptr ? node->parent : nullptr;
+         parent != nullptr; parent = parent->parent)
+    {
+        if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(parent))
+            aggregates.emplace_back(structure->directDeclarator()->getText(), structure);
+        else if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(parent))
+            aggregates.emplace_back(classDefinition->directDeclarator()->getText(), classDefinition);
+    }
+    std::string scope = compiler->GetCurrentNamespace();
+    std::vector<EnclosingAggregateLookupScope> scopes;
+    for (auto it = aggregates.rbegin(); it != aggregates.rend(); ++it)
+    {
+        scope += (scope.empty() ? "" : ".") + it->first;
+        scopes.push_back({ scope, it->second });
+    }
+    std::reverse(scopes.begin(), scopes.end());
+    if (!compiler->GetCurrentNamespace().empty())
+        scopes.push_back({ compiler->GetCurrentNamespace(), nullptr });
+    return scopes;
+}
+
+static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesFromName(
+    const std::string& scopeName)
+{
+    std::vector<EnclosingAggregateLookupScope> scopes;
+    std::string prefix;
+    size_t begin = 0;
+    while (begin < scopeName.size())
+    {
+        const size_t end = scopeName.find('.', begin);
+        const std::string part = scopeName.substr(begin,
+            end == std::string::npos ? std::string::npos : end - begin);
+        prefix += (prefix.empty() ? "" : ".") + part;
+        scopes.push_back({ prefix, nullptr });
+        if (end == std::string::npos) break;
+        begin = end + 1;
+    }
+    std::reverse(scopes.begin(), scopes.end());
+    return scopes;
+}
+
+static std::string EnclosingAggregateScopeFromContext(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node)
+{
+    const auto scopes = EnclosingAggregateScopesFromContext(compiler, node);
+    return scopes.empty() ? std::string{} : scopes.front().Name;
+}
+
+// A function or destructor body is a complete-class context: every member of the enclosing
+// aggregate is visible there, declared later or not. Field types and signatures keep order.
+static bool IsCompleteClassBodyUse(antlr4::tree::ParseTree* node)
+{
+    for (auto* parent = node != nullptr ? node->parent : nullptr; parent != nullptr; parent = parent->parent)
+    {
+        if (dynamic_cast<CFlatParser::CompoundStatementContext*>(parent) != nullptr) return true;
+        if (dynamic_cast<CFlatParser::AggregateMemberContext*>(parent) != nullptr) return false;
+    }
+    return false;
+}
+
+static bool HasVisibleNonGenericAggregateName(
+    const EnclosingAggregateLookupScope& scope, const std::string& name,
+    antlr4::tree::ParseTree* useSite)
+{
+    auto* use = dynamic_cast<antlr4::ParserRuleContext*>(useSite);
+    if (scope.Definition == nullptr || use == nullptr || use->getStart() == nullptr) return false;
+    const size_t useToken = use->getStart()->getTokenIndex();
+    const bool completeClass = IsCompleteClassBodyUse(useSite);
+    auto matches = [&](antlr4::ParserRuleContext* definition,
+                       CFlatParser::DirectDeclaratorContext* declarator,
+                       bool isGeneric)
+    {
+        return definition != nullptr && definition->getStart() != nullptr && declarator != nullptr
+            && !isGeneric && declarator->getText() == name
+            && (completeClass || definition->getStart()->getTokenIndex() < useToken);
+    };
+    if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(scope.Definition))
+    {
+        for (auto* member : structure->aggregateMember())
+        {
+            if (auto* nested = member->structDefinition(); nested != nullptr
+                && matches(nested, nested->directDeclarator(), nested->genericTypeParameters() != nullptr))
+                return true;
+            if (auto* nested = member->classDefinition(); nested != nullptr
+                && matches(nested, nested->directDeclarator(), nested->genericTypeParameters() != nullptr))
+                return true;
+        }
+    }
+    else if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(scope.Definition))
+    {
+        for (auto* member : classDefinition->aggregateMember())
+        {
+            if (auto* nested = member->structDefinition(); nested != nullptr
+                && matches(nested, nested->directDeclarator(), nested->genericTypeParameters() != nullptr))
+                return true;
+            if (auto* nested = member->classDefinition(); nested != nullptr
+                && matches(nested, nested->directDeclarator(), nested->genericTypeParameters() != nullptr))
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool HasEnclosingAggregateContext(antlr4::tree::ParseTree* node)
+{
+    for (auto* parent = node != nullptr ? node->parent : nullptr;
+         parent != nullptr; parent = parent->parent)
+        if (dynamic_cast<CFlatParser::StructDefinitionContext*>(parent) != nullptr
+            || dynamic_cast<CFlatParser::ClassDefinitionContext*>(parent) != nullptr)
+            return true;
+    return false;
+}
+
+static bool IsAggregateMemberDeclarationTypeUse(antlr4::tree::ParseTree* node)
+{
+    for (auto* parent = node != nullptr ? node->parent : nullptr;
+         parent != nullptr; parent = parent->parent)
+    {
+        if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent) != nullptr)
+            return false;
+        if (auto* member = dynamic_cast<CFlatParser::AggregateMemberContext*>(parent))
+            return member->declaration() != nullptr;
+    }
+    return false;
+}
+
+static bool GenericTemplateDeclaredBeforeUse(
+    LLVMBackend* compiler, const std::string& base, antlr4::tree::ParseTree* useSite)
+{
+    auto* useContext = dynamic_cast<antlr4::ParserRuleContext*>(useSite);
+    if (compiler == nullptr || useContext == nullptr || useContext->getStart() == nullptr) return true;
+    auto* definition = compiler->GetGenericTemplateDefinitionContext(base);
+    return definition == nullptr || definition->getStart() == nullptr
+        || definition->getStart()->getTokenIndex() < useContext->getStart()->getTokenIndex();
+}
+
+static bool GenericTemplateKeyNestedInScope(const std::string& key, const std::string& scope)
+{
+    return !scope.empty() && key.size() > scope.size()
+        && key.compare(0, scope.size(), scope) == 0 && key[scope.size()] == '.';
+}
+
+static bool GenericTemplateKeyNestedInAnyScope(
+    const std::string& key, const std::vector<EnclosingAggregateLookupScope>& scopes)
+{
+    for (const auto& scope : scopes)
+        if (GenericTemplateKeyNestedInScope(key, scope.Name)) return true;
+    return false;
+}
+
+static std::string ResolveGenericTemplateBaseAtScope(
+    LLVMBackend* compiler, const std::string& spelledBase,
+    const std::vector<EnclosingAggregateLookupScope>& enclosingScopes,
+    antlr4::tree::ParseTree* useSite = nullptr, const std::string& lookupName = {},
+    bool* nonGenericRefusal = nullptr)
+{
+    if (compiler == nullptr || spelledBase.empty()) return spelledBase;
+    const std::string& lexicalName = lookupName.empty() ? spelledBase : lookupName;
+    const bool lexicalBareName = lexicalName.find('.') == std::string::npos;
+    const bool hasExactKey = compiler->IsGenericTemplateKey(spelledBase);
+    if (lexicalBareName)
+    {
+        for (const auto& scope : enclosingScopes)
+        {
+            const std::string nested = scope.Name + "." + lexicalName;
+            if (compiler->IsGenericTemplateKey(nested))
+            {
+                if (IsAggregateMemberDeclarationTypeUse(useSite)
+                    && !GenericTemplateDeclaredBeforeUse(compiler, nested, useSite))
+                {
+                    const std::string fallback = hasExactKey ? spelledBase
+                        : compiler->ResolveGenericBaseAlias(spelledBase);
+                    if (!compiler->IsGenericTemplateKey(fallback)
+                        || GenericTemplateKeyNestedInAnyScope(fallback, enclosingScopes)) return {};
+                    return fallback;
+                }
+                return nested;
+            }
+            if (HasVisibleNonGenericAggregateName(scope, lexicalName, useSite))
+            {
+                if (nonGenericRefusal != nullptr) *nonGenericRefusal = true;
+                return {};
+            }
+        }
+    }
+    if (compiler->HasCxxAliasTemplate(lexicalName)) return spelledBase;
+    if (compiler->IsGenericBaseAlias(lexicalName))
+        return compiler->ResolveGenericBaseAlias(lexicalName);
+    if (hasExactKey)
+    {
+        if (IsAggregateMemberDeclarationTypeUse(useSite)
+            && GenericTemplateKeyNestedInAnyScope(spelledBase, enclosingScopes)
+            && !GenericTemplateDeclaredBeforeUse(compiler, spelledBase, useSite)) return {};
+        return spelledBase;
+    }
+    const std::string base = compiler->ResolveGenericBaseAlias(spelledBase);
+    if (compiler->IsGenericTemplateKey(base))
+    {
+        if (IsAggregateMemberDeclarationTypeUse(useSite)
+            && GenericTemplateKeyNestedInAnyScope(base, enclosingScopes)
+            && !GenericTemplateDeclaredBeforeUse(compiler, base, useSite)) return {};
+        return base;
+    }
+    for (const auto& scope : enclosingScopes)
+    {
+        const std::string nested = scope.Name + "." + base;
+        if (compiler->IsGenericTemplateKey(nested))
+        {
+            if (IsAggregateMemberDeclarationTypeUse(useSite)
+                && !GenericTemplateDeclaredBeforeUse(compiler, nested, useSite))
+            {
+                const std::string fallback = compiler->ResolveGenericTemplateBase(base);
+                if (!compiler->IsGenericTemplateKey(fallback)
+                    || (GenericTemplateKeyNestedInAnyScope(fallback, enclosingScopes)
+                        && !GenericTemplateDeclaredBeforeUse(compiler, fallback, useSite))) return {};
+                return fallback;
+            }
+            return nested;
+        }
+        if (HasVisibleNonGenericAggregateName(scope, base, useSite))
+        {
+            if (nonGenericRefusal != nullptr) *nonGenericRefusal = true;
+            return {};
+        }
+    }
+    return compiler->ResolveGenericTemplateBase(base);
+}
+
+static std::string ResolveGenericTemplateSpellingAtScope(
+    LLVMBackend* compiler, const std::string& spelledBase, std::vector<std::string>& args,
+    const std::vector<EnclosingAggregateLookupScope>& enclosingScopes,
+    antlr4::tree::ParseTree* useSite,
+    const std::string& lookupName, bool report, bool* nonGenericRefusal = nullptr)
+{
+    if (compiler == nullptr || spelledBase.empty()) return spelledBase;
+    std::string base = ResolveGenericTemplateBaseAtScope(
+        compiler, spelledBase, enclosingScopes, useSite, lookupName, nonGenericRefusal);
+    if (base.empty() || base == spelledBase)
+    {
+        base = spelledBase;
+        compiler->ResolveGenericAliasSpelling(base, args, report);
+        base = ResolveGenericTemplateBaseAtScope(
+            compiler, base, enclosingScopes, useSite, lookupName, nonGenericRefusal);
+    }
+    return base;
+}
+
+static std::vector<EnclosingAggregateLookupScope> EnclosingScopesForLegacyScope(
+    LLVMBackend* compiler, const std::string& scopeName, antlr4::tree::ParseTree* useSite)
+{
+    auto scopes = EnclosingAggregateScopesFromContext(compiler, useSite);
+    if (scopeName.empty()) return scopes;
+    // The legacy string names the scope being lowered (an instantiation may spell it differently
+    // from the template's parse tree); the parse tree only supplies each level's definition.
+    auto named = EnclosingAggregateScopesFromName(scopeName);
+    for (auto& scope : named)
+        for (const auto& candidate : scopes)
+            if (candidate.Name == scope.Name) { scope.Definition = candidate.Definition; break; }
+    return named;
+}
+
+static std::string ResolveGenericTemplateBaseAtScope(
+    LLVMBackend* compiler, const std::string& spelledBase, const std::string& enclosingScope,
+    antlr4::tree::ParseTree* useSite = nullptr, const std::string& lookupName = {},
+    bool* nonGenericRefusal = nullptr)
+{
+    return ResolveGenericTemplateBaseAtScope(compiler, spelledBase,
+        EnclosingScopesForLegacyScope(compiler, enclosingScope, useSite), useSite, lookupName,
+        nonGenericRefusal);
+}
+
+static std::string ResolveGenericTemplateSpellingAtScope(
+    LLVMBackend* compiler, const std::string& spelledBase, std::vector<std::string>& args,
+    const std::string& enclosingScope, antlr4::tree::ParseTree* useSite,
+    const std::string& lookupName, bool report, bool* nonGenericRefusal = nullptr)
+{
+    return ResolveGenericTemplateSpellingAtScope(compiler, spelledBase, args,
+        EnclosingScopesForLegacyScope(compiler, enclosingScope, useSite), useSite, lookupName, report,
+        nonGenericRefusal);
+}
+
 using TypeNameArgumentResolver = std::function<std::string(CFlatParser::TypeParameterEntryContext*)>;
 using TypeNameMemberResolver = std::function<std::string(CFlatParser::MemberTypeSpecifierContext*)>;
 using TypeNameTupleResolver = std::function<std::string(CFlatParser::TupleTypeSpecifierContext*)>;
@@ -2114,8 +2653,11 @@ static bool ResolveCanonicalTypeSpecifier(
             for (auto& arg : out.GenericArgs)
                 if (std::string enumKey = compiler->ResolveEnumTypeName(arg); !enumKey.empty())
                     arg = std::move(enumKey);
-            compiler->ResolveGenericAliasSpelling(
-                out.GenericBase, out.GenericArgs, reportGenericAlias);
+            const std::string spelledBase = out.GenericBase;
+            out.GenericBase = ResolveGenericTemplateSpellingAtScope(
+                compiler, spelledBase, out.GenericArgs,
+                EnclosingAggregateScopesFromContext(compiler, typeSpec), typeSpec,
+                spelledBase, reportGenericAlias);
             compiler->CompleteCxxTemplateTypeArgs(out.GenericBase, out.GenericArgs);
             out.TypeName = MangleGenericInstance(*compiler, out.GenericBase, out.GenericArgs);
         }
@@ -3756,7 +4298,7 @@ static ValueStructReturnKind ClassifyValueStructReturns(
             if (p.Pointer || p.ElemPointer || p.IsMove || p.IsAlias) continue;
             // A param the body also consumes (`w += k; return w;`) is owned by the callee, so its
             // return hands out that value; only a return-only sink is still a borrow here.
-            if (p.IsOwningSink && !p.IsReturnInferredSink) continue;
+            if (p.IsOwningSink && (!p.IsReturnInferredSink || p.IsWriteInferredSink)) continue;
             isBorrowedParam = true;
             if (outBorrowedParamName && outBorrowedParamName->empty()) *outBorrowedParamName = p.VariableName;
             break;
@@ -3912,6 +4454,20 @@ inline bool SubtreeContainsFunctionReturn(antlr4::tree::ParseTree* node, ReturnS
 // Supplied by the main pass (where type substitutions are active); empty for the scanner.
 using IfConstEvaluator = std::function<int(CFlatParser::ExpressionContext*)>;
 
+inline bool TryGetKnownIfConstBranch(CFlatParser::SelectionStatementContext* sel,
+                                     const IfConstEvaluator& evalIfConst,
+                                     antlr4::tree::ParseTree*& liveBranch)
+{
+    liveBranch = nullptr;
+    if (sel == nullptr || !evalIfConst || !sel->If() || !sel->Const()) return false;
+    const int taken = evalIfConst(sel->expression());
+    if (taken < 0) return false;
+    auto inner = sel->statement();
+    if (taken == 1 && inner.size() > 0) liveBranch = inner[0];
+    else if (taken == 0 && inner.size() > 1) liveBranch = inner[1];
+    return true;
+}
+
 // Collect names UNCONDITIONALLY moved by the function body: a top-level `move <bare-param>`
 // not nested inside any runtime conditional/loop/labeled construct, ternary, or lambda, AND not
 // preceded by a statement that can return early. Drives the owning-value move-sink inference;
@@ -3925,18 +4481,9 @@ inline void CollectUnconditionalMovedNames(antlr4::tree::ParseTree* node, std::u
     if (node == nullptr) return;
     if (auto* sel = AsRuleCtx<CFlatParser::SelectionStatementContext>(node))
     {
-        // `if const (COND)`: the live branch (COND-true, or the else on COND-false) executes
-        // unconditionally for this instantiation, so descend into it. A dead branch is skipped;
-        // an undecidable condition (-1) is treated conservatively as runtime-conditional.
-        if (evalIfConst && sel->If() && sel->Const())
-        {
-            int taken = evalIfConst(sel->expression());
-            auto inner = sel->statement();
-            if (taken == 1 && inner.size() > 0)
-                CollectUnconditionalMovedNames(inner[0], out, evalIfConst, returnScanMemo);
-            else if (taken == 0 && inner.size() > 1)
-                CollectUnconditionalMovedNames(inner[1], out, evalIfConst, returnScanMemo);
-        }
+        antlr4::tree::ParseTree* liveBranch = nullptr;
+        if (TryGetKnownIfConstBranch(sel, evalIfConst, liveBranch) && liveBranch != nullptr)
+            CollectUnconditionalMovedNames(liveBranch, out, evalIfConst, returnScanMemo);
         // A runtime `if`/`switch` (or an undecidable if-const) is conditional - stop descending.
         return;
     }
@@ -3979,7 +4526,8 @@ inline void CollectPositionalBraceElementNames(CFlatParser::InitializerListConte
 // True when `name` at `use` names a LOCAL declared earlier in an enclosing block (or a `for`
 // header) of the same function / lambda body, not the parameter of that name. The consume scans
 // are name-based; the write / return triggers must not claim a shadowing local's use.
-inline bool NameShadowedByEnclosingLocal(antlr4::tree::ParseTree* use, const std::string& name)
+inline bool NameShadowedByEnclosingLocal(antlr4::tree::ParseTree* use, const std::string& name,
+        const CFlatParser::LambdaExpressionContext* functionLambda = nullptr)
 {
     auto* useCtx = dynamic_cast<antlr4::ParserRuleContext*>(use);
     if (useCtx == nullptr || useCtx->getStart() == nullptr || name.empty()) return false;
@@ -4000,6 +4548,7 @@ inline bool NameShadowedByEnclosingLocal(antlr4::tree::ParseTree* use, const std
     {
         if (auto* lambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent))
         {
+            if (lambda == functionLambda) break;
             auto* params = lambda->lambdaParamList();
             if (params != nullptr)
                 for (auto* param : params->lambdaParam())
@@ -4049,11 +4598,25 @@ inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unorde
                                       WrappedSourceNames* wrapped = nullptr,
                                       std::unordered_set<std::string>* returned = nullptr,
                                       WrappedSourceNames* returnedWrapped = nullptr,
-                                      std::unordered_set<std::string>* written = nullptr)
+                                      std::unordered_set<std::string>* written = nullptr,
+                                      const CFlatParser::LambdaExpressionContext* functionLambda = nullptr,
+                                      std::unordered_set<std::string>* explicitMoves = nullptr,
+                                      const IfConstEvaluator& evalIfConst = {})
 {
     if (node == nullptr) return;
     if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node)) return;
     if (AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node)) return;
+    if (auto* sel = AsRuleCtx<CFlatParser::SelectionStatementContext>(node))
+    {
+        antlr4::tree::ParseTree* liveBranch = nullptr;
+        if (TryGetKnownIfConstBranch(sel, evalIfConst, liveBranch))
+        {
+            if (liveBranch != nullptr)
+                CollectConsumedStoreNames(liveBranch, out, wrapped, returned, returnedWrapped, written,
+                                          functionLambda, explicitMoves, evalIfConst);
+            return;
+        }
+    }
     if (auto* asn = AsRuleCtx<CFlatParser::AssignmentExpressionContext>(node))
         if (asn->assignmentOperator() != nullptr && asn->assignmentExpression() != nullptr)
         {
@@ -4064,7 +4627,7 @@ inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unorde
             if (asn->unaryExpression() != nullptr)
             {
                 std::string dest = BareSourceText(asn->unaryExpression());
-                if (!NameShadowedByEnclosingLocal(asn, dest))
+                if (!NameShadowedByEnclosingLocal(asn, dest, functionLambda))
                     (written != nullptr ? *written : out).insert(dest);
             }
         }
@@ -4072,7 +4635,7 @@ inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unorde
     // Kept apart when asked: a unique-owning passthrough is an inferred 'alias' return instead.
     if (auto* jump = AsRuleCtx<CFlatParser::JumpStatementContext>(node))
         if (jump->expression() != nullptr
-            && !NameShadowedByEnclosingLocal(jump, BareSourceText(jump->expression())))
+            && !NameShadowedByEnclosingLocal(jump, BareSourceText(jump->expression()), functionLambda))
             RecordConsumeSourceName(jump->expression(), returned != nullptr ? *returned : out,
                                     returned != nullptr ? returnedWrapped : wrapped);
     // `construct_at(slot, value)` is the explicit raw-slot spelling of the same native
@@ -4097,18 +4660,27 @@ inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unorde
         // `T[N] d { p };` - the brace-ctor alternative hangs the list off the declarator itself.
         CollectPositionalBraceElementNames(init->initializerList(), out, wrapped);
     }
-    if (auto* mv = AsRuleCtx<CFlatParser::MoveExpressionContext>(node))
-        if (auto* u = mv->unaryExpression())
-            out.insert(BareSourceText(u));
+    if (auto* moved = AsRuleCtx<CFlatParser::MoveExpressionContext>(node))
+        if (auto* source = moved->unaryExpression())
+        {
+            std::string name = BareSourceText(source);
+            if (!NameShadowedByEnclosingLocal(moved, name, functionLambda))
+            {
+                out.insert(name);
+                if (explicitMoves != nullptr) explicitMoves->insert(name);
+            }
+        }
     for (auto* child : node->children)
-        CollectConsumedStoreNames(child, out, wrapped, returned, returnedWrapped, written);
+        CollectConsumedStoreNames(child, out, wrapped, returned, returnedWrapped, written,
+                                  functionLambda, explicitMoves, evalIfConst);
 }
 
 // Collect the bare names a body stores INTO as a whole (`w = v`, `w += k`). Lambdas and nested
 // functions are a different scope. Drives the copy-on-entry of a written copyable parameter.
 inline void CollectWholeNameStoreDestinations(antlr4::tree::ParseTree* node,
                                               std::unordered_set<std::string>& out,
-                                              bool skipLambdas = false)
+                                              bool skipLambdas = false,
+                                              const CFlatParser::LambdaExpressionContext* functionLambda = nullptr)
 {
     if (node == nullptr) return;
     if (AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node)) return;
@@ -4117,11 +4689,11 @@ inline void CollectWholeNameStoreDestinations(antlr4::tree::ParseTree* node,
         if (asn->assignmentOperator() != nullptr && asn->unaryExpression() != nullptr)
         {
             std::string dest = BareSourceText(asn->unaryExpression());
-            if (!NameShadowedByEnclosingLocal(asn, dest))
+            if (!NameShadowedByEnclosingLocal(asn, dest, functionLambda))
                 out.insert(dest);
         }
     for (auto* child : node->children)
-        CollectWholeNameStoreDestinations(child, out, skipLambdas);
+        CollectWholeNameStoreDestinations(child, out, skipLambdas, functionLambda);
 }
 
 // First character of a rule's source text without building the subtree string (getText()
@@ -4137,7 +4709,8 @@ inline void CollectAddressAliasWholeNameStores(
         antlr4::tree::ParseTree* body,
         const std::vector<LLVMBackend::TypeAndValue>& params,
         std::unordered_set<std::string>& writtenNames,
-        bool addressMayWrite = false)
+        bool addressMayWrite = false,
+        const CFlatParser::LambdaExpressionContext* functionLambda = nullptr)
 {
     if (std::none_of(params.begin(), params.end(), [](const auto& p) { return !p.VariableName.empty(); }))
         return;
@@ -4157,7 +4730,8 @@ inline void CollectAddressAliasWholeNameStores(
                 {
                     const std::string target = source.substr(1);
                     for (const auto& p : params)
-                        if (p.VariableName == target && !NameShadowedByEnclosingLocal(init, target))
+                        if (p.VariableName == target
+                            && !NameShadowedByEnclosingLocal(init, target, functionLambda))
                             pointerRoots[direct->Identifier()->getText()] = {
                                 target, (size_t)init->getStart()->getTokenIndex() };
                 }
@@ -4176,7 +4750,7 @@ inline void CollectAddressAliasWholeNameStores(
                     const std::string alias = BareSourceText(dest);
                     for (const auto& p : params)
                         if (p.VariableName == target && !alias.empty()
-                            && !NameShadowedByEnclosingLocal(asn, target))
+                            && !NameShadowedByEnclosingLocal(asn, target, functionLambda))
                             pointerRoots[alias] = {
                                 target, (size_t)asn->getStart()->getTokenIndex() };
                 }
@@ -4241,10 +4815,10 @@ inline void CollectAddressAliasWholeNameStores(
                         && (text[p.VariableName.size() + 1] == '.'
                             || text[p.VariableName.size() + 1] == '>'
                             || text[p.VariableName.size() + 1] == '[')
-                        && !NameShadowedByEnclosingLocal(unary, p.VariableName))
+                        && !NameShadowedByEnclosingLocal(unary, p.VariableName, functionLambda))
                         writtenNames.insert(p.VariableName);
                     else if (!p.VariableName.empty() && text == "&" + p.VariableName
-                        && !NameShadowedByEnclosingLocal(unary, p.VariableName))
+                        && !NameShadowedByEnclosingLocal(unary, p.VariableName, functionLambda))
                         writtenNames.insert(p.VariableName);
             }
         }
@@ -4277,21 +4851,16 @@ inline bool ParamIsOwningSinkEligible(const LLVMBackend::TypeAndValue& p)
 }
 
 // Owning-value move-sink inference: a plain by-value parameter is a synthesized sink (IsOwningSink)
-// so the caller's owning source is nulled at the call site. Two triggers:
-//  (1) an UNCONDITIONAL top-level `move <param>` - the explicit opt-out; consumes any owner.
-//  (2) STEP R1 (8b): the body CONSUMES the param via a plain `=`/slot store or a conditional `move`
-//      on at least one path. This is flagged STRUCTURALLY (IsConsumeInferredSink) because the
-//      scanner cannot resolve a struct's copyability during the forward pass; the concrete
-//      NON-COPYABLE-owner gate runs later (OwningSinkConsumesConcrete) at the call site / definition
-//      where the monomorphized type is fully known. A copyable owner's store is a COPY, so it stays
-//      a borrow there. Both scans are structural (independent of T), so this runs on generic-class
-//      instantiations too - ParseFunctionDefinition calls it on the monomorphized param list.
+// so the caller's owning source is nulled at the call site. An unconditional top-level move consumes
+// any owner; stores and conditional moves remain structural until concrete copyability is known.
+// This also runs on generic-class instantiations against the monomorphized param list.
 // Body-taking core. A lambda literal has no FunctionDefinitionContext but is a function all the
 // same, so its parameter list runs the identical inference against its own body.
 inline void ApplyOwningSinkInferenceToBody(const LLVMBackend* compiler,
                                      antlr4::tree::ParseTree* body,
                                      std::vector<LLVMBackend::TypeAndValue>& allParams,
-                                     const IfConstEvaluator& evalIfConst = {})
+                                     const IfConstEvaluator& evalIfConst = {},
+                                     const CFlatParser::LambdaExpressionContext* functionLambda = nullptr)
 {
     if (body == nullptr) return;
     // The scans only feed eligible parameters; a body with none (`main()`) skips them - their
@@ -4304,14 +4873,15 @@ inline void ApplyOwningSinkInferenceToBody(const LLVMBackend* compiler,
     CollectUnconditionalMovedNames(body, movedNames, evalIfConst, &returnScanMemo);
     std::unordered_set<std::string> consumedNames;
     WrappedSourceNames wrappedConsumed;
+    std::unordered_set<std::string> explicitMoves;
     std::unordered_set<std::string> returnedNames;
     WrappedSourceNames wrappedReturned;
     std::unordered_set<std::string> writtenNames;
     CollectConsumedStoreNames(body, consumedNames, &wrappedConsumed, &returnedNames, &wrappedReturned,
-                              &writtenNames);
-    CollectWholeNameStoreDestinations(body, writtenNames);
+                              &writtenNames, functionLambda, &explicitMoves, evalIfConst);
+    CollectWholeNameStoreDestinations(body, writtenNames, false, functionLambda);
 
-    CollectAddressAliasWholeNameStores(body, allParams, writtenNames);
+    CollectAddressAliasWholeNameStores(body, allParams, writtenNames, false, functionLambda);
     for (auto& p : allParams)
     {
         if (p.VariableName.empty() || !ParamIsOwningSinkEligible(p)) continue;
@@ -4327,24 +4897,43 @@ inline void ApplyOwningSinkInferenceToBody(const LLVMBackend* compiler,
         bool wrappedReturn = false;
         if (auto it = wrappedReturned.find(p.VariableName); it != wrappedReturned.end())
             wrappedReturn = AllWrapperTypesName(compiler, it->second, p.TypeName);
+        const bool returnsParam = returnedNames.count(p.VariableName) || wrappedReturn;
+        const bool isStringParam = compiler != nullptr
+            && compiler->ResolveTypeAlias(p.TypeName) == "string";
         if (movedNames.count(p.VariableName))
+        {
             p.IsOwningSink = true;
+            // An explicit string move consumes; copy-only string uses stay borrowed.
+            if (isStringParam) p.IsConsumeInferredSink = true;
+            if (returnsParam)
+            {
+                p.IsReturnInferredSink = true;
+                p.IsWriteInferredSink = true;
+                if (isStringParam) p.IsConsumeInferredSink = true;
+            }
+        }
         else if (consumedNames.count(p.VariableName) || wrappedConsume)
         {
             p.IsOwningSink = true;
-            p.IsConsumeInferredSink = true;
+            p.IsConsumeInferredSink = !isStringParam
+                || explicitMoves.count(p.VariableName) != 0;
+            if (returnsParam)
+            {
+                p.IsReturnInferredSink = true;
+                p.IsWriteInferredSink = true;
+            }
         }
         else if (cxxClass)
             continue;
         else if (writtenNames.count(p.VariableName))
         {
-            // A whole write drops the caller's value; nothing escapes, so a bonded argument is
-            // refused only when the concrete type is consumed (IsWriteInferredSink).
+            // A whole write is structural consume for non-strings; strings copy on entry, so the
+            // caller keeps its buffer. Concrete copyability is decided at the call site.
             p.IsOwningSink = true;
             p.IsConsumeInferredSink = true;
             p.IsWriteInferredSink = true;
         }
-        else if (returnedNames.count(p.VariableName) || wrappedReturn)
+        else if (returnsParam)
         {
             // Only `return p` consumes it: OwningSinkConsumesConcrete leaves a unique-owning
             // type to the inferred 'alias' return (ClassifyValueStructReturns) as before.
@@ -4368,16 +4957,10 @@ inline void AdoptInferredParamSinks(LLVMBackend::TypeAndValue& dest,
         auto& d = dest.FuncPtrParams[i];
         if (d.AllocAlignValue == 0)
             d.AllocAlignValue = src[i].AllocAlignValue;
-        // Return-only survives only when every sink claim being merged is return-only; the
-        // no-store flag (write and/or return) only when no claim is a store/move consume.
-        const bool returnOnly = (!d.IsOwningSink || d.IsReturnInferredSink)
-            && (!src[i].IsOwningSink || src[i].IsReturnInferredSink);
-        const bool noStore = (!d.IsOwningSink || d.IsReturnInferredSink || d.IsWriteInferredSink)
-            && (!src[i].IsOwningSink || src[i].IsReturnInferredSink || src[i].IsWriteInferredSink);
         d.IsOwningSink = d.IsOwningSink || src[i].IsOwningSink;
         d.IsConsumeInferredSink = d.IsConsumeInferredSink || src[i].IsConsumeInferredSink;
-        d.IsReturnInferredSink = d.IsOwningSink && returnOnly;
-        d.IsWriteInferredSink = d.IsOwningSink && noStore && !returnOnly;
+        d.IsReturnInferredSink = d.IsReturnInferredSink || src[i].IsReturnInferredSink;
+        d.IsWriteInferredSink = d.IsWriteInferredSink || src[i].IsWriteInferredSink;
     }
 }
 
@@ -5179,7 +5762,7 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
                 std::vector<std::string> candidates;
                 AppendInterfaceNameCandidates(compiler, namespaceName, BaseSpecifierName(spec), candidates);
                 for (const auto& c : candidates)
-                    compiler->RecordUncertainInterfaceImpl(c);
+                    compiler->RecordUncertainGenericClassInterfaceImpl(c);
             }
             return;
         }
@@ -5205,7 +5788,9 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
                     std::vector<std::string> typeArgs;
                     for (auto* entry : generic->typeParameterList()->typeParameterEntry())
                         typeArgs.push_back(ResolveForwardTypeArg(entry));
-                    compiler->ResolveGenericAliasSpelling(baseName, typeArgs, false);
+                    const std::string spelledBase = baseName;
+                    baseName = ResolveGenericTemplateSpellingAtUse(
+                        compiler, spelledBase, typeArgs, generic, spelledBase, false);
                     compiler->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
                     baseIdentity = MangleGenericInstance(*compiler, baseName, typeArgs);
                     std::string cxxError;
@@ -5528,6 +6113,12 @@ public:
     // correctly during the main pass, before ProcessPendingInstantiations runs.
     void ScanGenericTypeUses(antlr4::RuleContext* ctx,
         const std::unordered_set<std::string>* localEnumNames = nullptr);
+    std::string ResolveGenericTemplateBaseAtUse(LLVMBackend* compiler,
+        const std::string& spelledBase, antlr4::tree::ParseTree* useSite,
+        const std::string& lookupName = {});
+    std::string ResolveGenericTemplateSpellingAtUse(LLVMBackend* compiler,
+        const std::string& spelledBase, std::vector<std::string>& args,
+        antlr4::tree::ParseTree* useSite, const std::string& lookupName, bool report);
 
     // Build the function-pointer TypeAndValue for a `function<R(Args)>` spec - the resolved form
     // a `using Cb = function<R(Args)>;` alias stores and that ParseDeclarationSpecifiers expands.
@@ -5586,6 +6177,18 @@ enum class PointerValueRootKind { Borrowed, Undecided, Owned, OwnedLocal, AliasO
 class MainListener : public CFlatBaseListener
 {
 private:
+    // Names the function whose body is being emitted, so block-scope enums are keyed to it.
+    struct ActiveLocalEnumFunctionScope
+    {
+        LLVMBackend* backend;
+        std::string saved;
+        ActiveLocalEnumFunctionScope(LLVMBackend* b, const std::string& name)
+            : backend(b), saved(std::move(b->activeLocalEnumFunction_))
+        {
+            backend->activeLocalEnumFunction_ = name;
+        }
+        ~ActiveLocalEnumFunctionScope() { backend->activeLocalEnumFunction_ = std::move(saved); }
+    };
     CFlatParser* parser;
     LLVMBackend* compilerLLVM;
     std::string sourceFileName;
@@ -5879,6 +6482,7 @@ private:
 
     std::unordered_map<std::string, CFlatParser::StructDefinitionContext*>&     genericStructTemplates;
     std::unordered_map<std::string, CFlatParser::ClassDefinitionContext*>&      genericClassTemplates;
+    std::unordered_map<std::string, std::vector<LLVMBackend::AliasScopeFrame>> genericLexicalAliasScopes_;
     std::unordered_map<std::string, std::vector<std::string>>&                  genericStructTypeParams;
     std::unordered_map<std::string, std::vector<std::string>>&                  genericStructValueParams;
     std::unordered_set<std::string>&                                            instantiatedGenerics;
@@ -6026,6 +6630,8 @@ private:
         // Labels merge preSwitchMoved in (dispatch may skip earlier cases); resume merges all exits.
         LLVMBackend::MovedStateSnapshot preSwitchMoved;
         std::vector<LLVMBackend::MovedStateSnapshot> exitMoved;
+        LLVMBackend::OwnFlagJoinSnapshot preSwitchOwnFlag;
+        std::vector<LLVMBackend::OwnFlagJoinSnapshot> exitOwnFlag;
         size_t loopDepth = 0;                     // loopBreakMovedStates_ depth at the switch
     };
 
@@ -6129,17 +6735,19 @@ private:
         ~LambdaExpectedTypeRestoreGuard() { *value = saved; }
     };
 
-    // Scopes declExpectedType to one destination position - a declarator, an assignment target, a
-    // brace-init field, a return type, or a matched call parameter. Always ASSIGNS (clearing for a
-    // function-pointer or `auto` destination), so an inner position cannot inherit an outer one.
+    // Scopes declExpectedType to one destination position - a declarator, assignment target,
+    // field, return type, or matched call parameter. Function signatures are opt-in at bind sites.
     struct DeclExpectedTypeScope {
         LLVMBackend::TypeAndValue* slot;
         LLVMBackend::TypeAndValue saved;
-        DeclExpectedTypeScope(LLVMBackend::TypeAndValue* s, const LLVMBackend::TypeAndValue& dest)
+        DeclExpectedTypeScope(LLVMBackend::TypeAndValue* s, const LLVMBackend::TypeAndValue& dest,
+                             bool includeFunctionPointer = false)
             : slot(s), saved(*s)
         {
             *slot = {};
-            if (!dest.IsFunctionPointer && !dest.TypeName.empty() && dest.TypeName != "auto")
+            const bool hasDestination = (!dest.TypeName.empty() && dest.TypeName != "auto")
+                || (dest.IsFunctionPointer && !dest.FuncPtrReturnTypeName.empty());
+            if ((!dest.IsFunctionPointer || includeFunctionPointer) && hasDestination)
                 *slot = dest;
         }
         ~DeclExpectedTypeScope() { *slot = saved; }
@@ -6598,6 +7206,14 @@ public:
     // Handles simple positional matching: where parameter type == type param name, bind to arg TypeName.
     std::string TryInferAndInstantiateFromArgs(const std::string& funcName,
                                                const std::vector<LLVMBackend::NamedVariable>& args);
+
+    // Infer a bare function template's arguments from a function-pointer destination.
+    std::string TryInferAndInstantiateFromFuncPtr(const std::string& funcName,
+        const LLVMBackend::TypeAndValue& destSig, std::string& refusal);
+
+    std::vector<size_t> DeduceGenericFunctionCallbackCandidates(
+        const std::string& funcName,
+        const std::vector<LLVMBackend::TypeAndValue>& callbackCandidates);
 
     // Build the function-pointer TypeAndValue for a `function<R(Args)>` spec (the resolved form a
     // `using Cb = function<R(Args)>;` alias stores). Duplicated from the ForwardRefScanner copy -
@@ -9724,7 +10340,8 @@ public:
     void QueueInstantiateGenericType(CFlatParser::DeclarationSpecifiersContext* declSpec);
 
     // Compute the mangled name for a generic instantiation, e.g. Box<int, float> -> "Box$int$float".
-    std::string MangledGenericName(const std::string& baseName, const std::vector<std::string>& typeArgs);
+    std::string MangledGenericName(const std::string& baseName, const std::vector<std::string>& typeArgs,
+                                   antlr4::tree::ParseTree* useSite = nullptr);
     void ResolveEnumTypeArguments(std::vector<std::string>& typeArgs);
     bool QueueAndProcessLocalEnumInstantiation(
         CFlatParser::GenericTypeParametersContext* params,
