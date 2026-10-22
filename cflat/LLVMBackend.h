@@ -141,6 +141,10 @@ inline const char* CxxCompactIntegerSpellingToCflat(std::string_view compact)
 #include "LspSymbolIndex.h"
 #include "CFlatErrorListener.h"
 #include "CFlatErrorStrategy.h"
+
+// Rebuilds for-init `S s;` trees into the statement shape. Call on every tree straight after
+// CFlatParser produces it, before it is cached or shared across threads; never later.
+void NormalizeForInitTree(CFlatParser& parser, antlr4::tree::ParseTree* root);
 #include "VcpkgResolver.h"
 #include "NugetResolver.h"
 #include "LlvmHelpers.h"
@@ -906,6 +910,7 @@ public:
         bool IsBorrowOfAliasElement = false;
         bool IsBond = false;     // parameter declared with 'bond' - return value borrows from this parameter; return must not outlive it
         bool IsUnique = false;   // struct/interface field declared with 'unique' - the owner owns this raw pointer; the synthesized destructor deletes it. On an interface it is contract: every implementor must agree (VerifyInterfaceFields)
+        bool IsCoreUniqueOwner = false; // local/global core unique<T> lowered to a thin pointer; address-of recovers the wrapper slot type
         CallingConv CallConv = CallingConv::Default; // calling convention for extern declarations (Stdcall/Cdecl; Default = compiler-chosen)
 
         // Function pointer fields (IsFunctionPointer == true)
@@ -962,6 +967,7 @@ public:
         {
             std::string TypeName;
             bool Pointer = false;
+            bool IsArrayView = false;
             uint64_t AllocAlignValue = 0;
             bool IsMove = false;
             // Inferred owning sink (never spelled): lets the indirect call site transfer like
@@ -975,6 +981,9 @@ public:
             int PointerDepth = 0;   // 0 = not recorded; see FuncPtrReturnPointerDepth
             std::string ResolvedTypeKey;  // "" = not recorded; see FuncPtrReturnResolvedKey
             int ConstMask = -1;     // -1 = not recorded; see FuncPtrReturnConstMask
+            // Diagnostic spelling of a named pointer alias param ("" = none). TypeName/Pointer
+            // hold the resolved base and depth; printing uses this spelling plus its written stars.
+            std::string AliasSpelling;
         };
         std::vector<FuncPtrParam> FuncPtrParams;
 
@@ -1183,12 +1192,19 @@ public:
             return ((ConstMask >> depth) & 1u) != 0;
         }
 
-        // The pointee levels of ConstMask (top level dropped), as a function-type component keeps
-        // them. A view's elements are not modelled in a function type, so it records none.
+        // Pointee levels for pointer components. A view's element const is read by
+        // FunctionParamConstMask because its outer view pointer is not part of the element type.
         int PointeeConstMask() const
         {
             const int depth = ValuePointerDepth();
             if (IsArrayView || depth <= 0) return 0;
+            return ConstMask & ((1 << depth) - 1);
+        }
+
+        int FunctionParamConstMask() const
+        {
+            const int depth = ValuePointerDepth();
+            if (depth <= 0) return 0;
             return ConstMask & ((1 << depth) - 1);
         }
 
@@ -1382,6 +1398,7 @@ public:
         bool IsBorrowOfAliasElement = false;
         bool IsBond = false;
         bool IsUnique = false;
+        bool IsCoreUniqueOwner = false;
         CallingConv CallConv = CallingConv::Default;
         bool LockThis = false;
         LockMode LockThisMode = LockMode::Exclusive;
@@ -1400,6 +1417,7 @@ public:
         {
             std::string TypeName;
             bool Pointer = false;
+            bool IsArrayView = false;
             uint64_t AllocAlignValue = 0;
             bool IsMove = false;
             bool IsOwningSink = false;
@@ -1411,6 +1429,7 @@ public:
             int PointerDepth = 0;
             std::string ResolvedTypeKey;
             int ConstMask = -1;
+            std::string AliasSpelling;  // "" = none; see TypeAndValue::FuncPtrParam
         };
         std::vector<FuncPtrParam> FuncPtrParams;
         uint64_t ConstArraySize = 0;
@@ -1456,6 +1475,7 @@ public:
             s.IsBorrowOfAliasElement = t.IsBorrowOfAliasElement;
             s.IsBond = t.IsBond;
             s.IsUnique = t.IsUnique;
+            s.IsCoreUniqueOwner = t.IsCoreUniqueOwner;
             s.CallConv = t.CallConv;
             s.LockThis = t.LockThis;
             s.LockThisMode = t.LockThisMode;
@@ -1475,6 +1495,7 @@ public:
                 FuncPtrParam q;
                 q.TypeName = p.TypeName;
                 q.Pointer = p.Pointer;
+                q.IsArrayView = p.IsArrayView;
                 q.AllocAlignValue = p.AllocAlignValue;
                 q.IsMove = p.IsMove;
                 q.IsOwningSink = p.IsOwningSink;
@@ -1486,6 +1507,7 @@ public:
                 q.PointerDepth = p.PointerDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
                 q.ConstMask = p.ConstMask;
+                q.AliasSpelling = p.AliasSpelling;
                 s.FuncPtrParams.push_back(std::move(q));
             }
             s.ConstArraySize = t.ConstArraySize;
@@ -1531,6 +1553,7 @@ public:
             t.IsBorrowOfAliasElement = IsBorrowOfAliasElement;
             t.IsBond = IsBond;
             t.IsUnique = IsUnique;
+            t.IsCoreUniqueOwner = IsCoreUniqueOwner;
             t.CallConv = CallConv;
             t.LockThis = LockThis;
             t.LockThisMode = LockThisMode;
@@ -1550,6 +1573,7 @@ public:
                 TypeAndValue::FuncPtrParam q;
                 q.TypeName = p.TypeName;
                 q.Pointer = p.Pointer;
+                q.IsArrayView = p.IsArrayView;
                 q.AllocAlignValue = p.AllocAlignValue;
                 q.IsMove = p.IsMove;
                 q.IsOwningSink = p.IsOwningSink;
@@ -1561,6 +1585,7 @@ public:
                 q.PointerDepth = p.PointerDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
                 q.ConstMask = p.ConstMask;
+                q.AliasSpelling = p.AliasSpelling;
                 t.FuncPtrParams.push_back(std::move(q));
             }
             t.ConstArraySize = ConstArraySize;
@@ -1999,6 +2024,9 @@ public:
         llvm::AllocaInst* OwnFlag = nullptr;
         llvm::StoreInst* OwnFlagInit = nullptr;
         bool OwnFlagActive = false;
+        // True when a view's OwnFlag can be false on a runtime path after a mixed ternary join.
+        bool OwnFlagMayBeFalse = false;
+        std::vector<uint64_t> OwnFlagMayBeFalseControlPath;
         // Same question for an `alias`-BORROW local root (`Box k = w.get(); move k.item;`): answered
         // where the root binding is RESOLVED, since a downstream name lookup cannot see a shadow.
         bool RootIsAliasBorrowLocal = false;
@@ -2449,6 +2477,8 @@ public:
         llvm::Value* Count;
         uint64_t AllocAlign = 0;
         bool Owns = false;
+        llvm::Value* RuntimeOwns = nullptr;
+        bool IsArrayView = false;
     };
     std::vector<RawArrayResult> rawArrayResults_;
 
@@ -4053,6 +4083,8 @@ private:
     mutable bool cxxRecordSpellingIndexDirty_ = true;
     // CFlat name -> the C++ source spelling it was requested with, for nested template arguments.
     std::unordered_map<std::string, std::string> cxxCflatToCxxSpelling_;
+    // Clang's class-template declarations, including their trailing default arguments.
+    std::unordered_map<std::string, cflat_cinterop::RawClassTemplate> cxxClassTemplateParameters_;
     // A C++ alias of a specialization CFlat cannot spell itself (`using json = basic_json<>;`):
     // alias name -> the C++ spelling, requested under the alias's own name on first use.
     std::unordered_map<std::string, std::string> cxxLazyAliasSpecializations_;
@@ -4125,6 +4157,9 @@ public:
      */
     std::vector<llvm::Function*> cflatGlobalCxxInitFns_;
     void FinalizeGlobalConstructorOrder();
+    // Ownership control-frame kinds (EnterOwnershipControlRegion / ReanchorOwnFlagJoinsOutOf).
+    static constexpr uint8_t OwnFlagLoopFrame = 1;
+    static constexpr uint8_t OwnFlagSwitchFrame = 2;
 private:
     std::string cppStandard_ = "c++20";
     // --error-on-cpp-reparse: at most 1 clang parse (or cache load in its place) per translation unit.
@@ -4142,6 +4177,10 @@ private:
     // Module-bound values - cleared by ResetForReanalysis.
     bool sanitizeOwnership_ = false;
     std::unordered_map<llvm::Value*, llvm::Value*> ownOriginSlots_;
+    std::vector<uint64_t> ownFlagControlPath_;
+    // Parallel to ownFlagControlPath_: the OwnFlagLoopFrame/OwnFlagSwitchFrame bits of each frame.
+    std::vector<uint8_t> ownFlagControlKind_;
+    uint64_t nextOwnFlagControlFrameId_ = 1;
 
     struct UniqueFieldBorrowReturn
     {
@@ -4507,6 +4546,7 @@ private:
         std::string targetTriple;
         std::vector<CSigEntry> sigs;
         std::vector<cflat_cinterop::RawFunctionTemplate> functionTemplates;
+        std::vector<cflat_cinterop::RawClassTemplate> classTemplates;
         std::vector<std::string> classTemplateNames;
         std::vector<std::string> classTemplateSpecializations;
         // Namespace leads a C++ header extraction seeded into its import group (signature
@@ -4572,7 +4612,8 @@ private:
     static constexpr size_t kCFileSigBitcodeBytesPerRow = 2048;
     static size_t CFileSigEntryRows(const CFileSigCacheEntry& entry)
     {
-        return entry.sigs.size() + entry.functionTemplates.size() + entry.classTemplateNames.size()
+        return entry.sigs.size() + entry.functionTemplates.size() + entry.classTemplates.size()
+             + entry.classTemplateNames.size()
              + entry.classTemplateSpecializations.size()
              + entry.cxxGroupNamespaces.size() + entry.enums.size() + entry.records.size()
              + entry.macros.size() + entry.funcMacros.size() + entry.globals.size()
@@ -4928,6 +4969,12 @@ private:
     void SetVariableOwnsInterfaceBox(const std::string& varName, bool value);
     void SetVariableRawNewArray(const std::string& varName, bool value,
                                 llvm::Value* rawArrayLength = nullptr);
+    void SetVariableOwnFlagValue(const std::string& varName, bool mayOwn, llvm::Value* value,
+                                 bool runtimeCanBeFalse);
+    bool IsOutsideOwnFlagControlPath(const NamedVariable& namedVar) const;
+    // A jump or case label leaves the innermost frame of targetKinds: joins recorded inside it move to
+    // its parent path, so only a store after that construct can clear them.
+    void ReanchorOwnFlagJoinsOutOf(uint8_t targetKinds);
     // Record the per-site allocation alignment a reassignment delivered, so the free site picks
     // __delete_aligned. Monotonic: an unaligned source never retires a recorded over-alignment.
     void SetVariableAllocAlignment(const std::string& varName, uint64_t allocAlign);
@@ -5589,10 +5636,13 @@ private:
     bool IsOwnedNewTemp(llvm::Value* value) const;
 
     void RegisterRawArrayResult(llvm::Value* value, llvm::Value* count,
-                                uint64_t allocAlign = 0, bool owns = true);
+                                uint64_t allocAlign = 0, bool owns = true,
+                                llvm::Value* runtimeOwns = nullptr,
+                                bool isArrayView = false);
     const RawArrayResult* FindRawArrayResult(llvm::Value* value) const;
     bool IsRawArrayResult(llvm::Value* value) const;
     bool RawArrayResultOwns(llvm::Value* value) const;
+    bool RawArrayResultMayOwn(llvm::Value* value) const;
     llvm::Value* RawArrayCountOf(llvm::Value* value) const;
 
     // Carry the owning bit from an arm value onto a derived value ('?:' phi / select result).
@@ -7305,7 +7355,8 @@ private:
                              std::vector<std::pair<std::string, std::string>>* outNamespaceAliases = nullptr,
                              std::vector<std::string>* outClassTemplateNames = nullptr,
                              std::vector<std::pair<std::string, std::string>>* outClassUsings = nullptr,
-                             std::vector<std::string>* outClassTemplateSpecializations = nullptr);
+                             std::vector<std::string>* outClassTemplateSpecializations = nullptr,
+                             std::vector<cflat_cinterop::RawClassTemplate>* outClassTemplates = nullptr);
 
     // Extract externally-linkable functions a .c file DEFINES, via the clang C++ API. Records
     // are registered up front (struct-by-value). Used by the .c auto-extern path.
@@ -7465,6 +7516,11 @@ private:
     Operation ParseOperation(const std::string& operationText);
 
 public:
+    // Fill omitted trailing C++ class-template arguments from Clang's imported declaration.
+    bool HasCxxClassTemplate(const std::string& baseName) const;
+    bool CompleteCxxTemplateTypeArgs(const std::string& baseName,
+                                     std::vector<std::string>& typeArgs);
+
     LLVMBackend()
     {
         Init();
@@ -8731,6 +8787,8 @@ public:
     // bare-pointer element slot transfers), and is passed only by the direct-call path.
     // beforeCall clears the caller's source storage; the second call keeps post-call temp cleanup
     // and compile-time moved marking in their existing order.
+    std::string ImplicitOutlivingOwnerConsumeError(const NamedVariable& source,
+                                                   bool sourceIsMove) const;
     void ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args,
         bool paramsCarryAllocAlign = true, bool calleeIsMethod = false, bool beforeCall = false,
@@ -8746,6 +8804,8 @@ public:
     // The synthesized TypeAndValue a funcptr parameter's per-param facts stand for. Interface
     // classification is recovered from the backend because FuncPtrParam stores only its spelling.
     TypeAndValue FuncPtrParamAsTypeAndValue(const TypeAndValue::FuncPtrParam& p, size_t index) const;
+    // Display text of a named-pointer-alias param (its AliasSpelling plus the written stars).
+    std::string FuncPtrAliasParamSpelling(const TypeAndValue::FuncPtrParam& p) const;
 
     // Is this argument PROVABLY a data pointer being passed to a closure parameter? Deliberately
     // one-sided: it answers yes only when the frontend positively recorded a pointer that is not
@@ -8874,6 +8934,10 @@ public:
      * parameter is required before anything is refused. Returns the diagnostic clause, or "".
      */
     std::string FuncPtrArgDepthMismatch(const NamedVariable& arg, const TypeAndValue::FuncPtrParam& p) const;
+
+    // A marked address of a core unique owner is its raw T* storage slot and can bind to T**.
+    bool IsAddressedUniqueSlotToRawSlot(const NamedVariable& arg, const TypeAndValue& source,
+        const TypeAndValue& param) const;
 
     /*
      * The same proof for a by-value PRIMITIVE parameter, which needs its own form: a primitive
@@ -9294,6 +9358,9 @@ public:
 
     llvm::BasicBlock* CreateBasicBlock(std::string name, llvm::Function* fn = nullptr);
 
+    void EnterOwnershipControlRegion(uint8_t frameKind = 0);
+    void LeaveOwnershipControlRegion();
+
     void SwitchToBlock(llvm::BasicBlock* block);
 
     llvm::UncondBrInst* CreateJump(llvm::BasicBlock* block);
@@ -9336,6 +9403,11 @@ public:
                                     std::vector<llvm::Value*> args,
                                     const std::vector<NamedVariable>* argNVs = nullptr,
                                     const std::vector<llvm::Value*>* rawArrayCounts = nullptr);
+
+    bool TryAdoptAliasReturnStringTemp(llvm::Value*& result, const TypeAndValue& returnType,
+        bool returnsOwned, bool returnsAlias, const std::vector<TypeAndValue>& params,
+        const std::vector<llvm::Value*>& args, const std::vector<NamedVariable>* argNVs,
+        bool requireReturnSinkParam);
 
     llvm::SwitchInst* CreateSwitchInst(llvm::Value* cond, llvm::BasicBlock* defaultBlock, unsigned numCases);
 
@@ -10911,6 +10983,8 @@ public:
     {
         bool Known = false;
         bool VoidPointee = false;   // `void*`: a wildcard over every pointee
+        bool IsArrayView = false;
+        int ConstMask = -1;
         std::string Canon;          // "i32", "f64", "p:v", "s", "p:s", ...
         // The ONE registered struct key this component names, when Canon is "s"/"p:s". Empty
         // means the spelling named no registered struct, which is Known == false.
@@ -10980,7 +11054,8 @@ public:
      * read: it carries Pointer == false yet interconverts with `char*`/`i8*` at every call site.
      */
     FuncPtrComponent FuncPtrComponentOf(const std::string& typeName, bool pointer,
-        int pointerDepth = 0, const std::string& resolvedKey = "") const;
+        int pointerDepth = 0, const std::string& resolvedKey = "",
+        bool isArrayView = false, int constMask = -1) const;
 
     /*
      * One-sided: true only when BOTH components resolve AND name provably different types.
@@ -11344,7 +11419,9 @@ public:
                                               const std::string& displayName = {},
                                               const std::string& cxxMemberReceiver = {},
                                               bool postfixMemberCall = false,
-                                              const std::string& enclosingFunctionName = {});
+                                              const std::string& enclosingFunctionName = {},
+                                              bool allowOperatorAliasReturnStringTemp = false,
+                                              llvm::Value* operatorReceiverStorage = nullptr);
 
     llvm::Function* GetFunction(const std::string& functionName);
 
@@ -12992,7 +13069,9 @@ public:
     // 272: interim C++ const bits ("ccc", "nch") gone; a const C/C++ global's object level is in its ConstMask ("cm").
     // 273: a C++ `const T&&` parameter records its referent const in ConstMask (T337).
     // 274: static C++ data members carry their declared ConstMask (T346).
-    static constexpr int kCHeaderCacheVersion = 274;
+    // 275: class-template default arguments are cached for canonical specialization names (T358).
+    // 276: non-type defaults store evaluated values; unsupported dependent values stay absent (T358 r2).
+    static constexpr int kCHeaderCacheVersion = 276;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by
@@ -13479,6 +13558,7 @@ private:
         state.parser->setErrorHandler(std::make_shared<CFlatErrorStrategy>(localizeMessage));
         state.tokens->fill();
         auto* cu = state.parser->compilationUnit();
+        NormalizeForInitTree(*state.parser, cu);
         CtxT* ctx = extract(cu);
         it->second = ctx;
         syntheticParseStates_.push_back(std::move(state));

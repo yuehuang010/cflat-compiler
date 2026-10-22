@@ -1,0 +1,9 @@
+// An inner bare expect_error that consumes its own error must not satisfy the enclosing scoped block:
+// qA never occurs, so the compile must fail naming qA (the .flags sidecar expects that failure).
+extern int main() {
+    expect_error("Undefined variable qA") {
+        expect_error("Undefined variable qB");
+        int b = qB;
+    }
+    return 0;
+}

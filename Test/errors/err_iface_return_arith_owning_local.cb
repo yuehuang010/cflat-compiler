@@ -82,6 +82,46 @@ expect_error("returning a heap object boxed into interface 'IThing' from a non-'
     }
 }
 
+function<move Thing*()> gMakeMoveThing = mkT;
+
+expect_error("Pointer arithmetic may produce an interior pointer that cannot be safely treated as an owned interface object") {
+    IThing returnDispatchedMoveArithmetic()
+    {
+        IThingFactory f = &gThingFactory;
+        return f.make() + 1;
+    }
+}
+
+expect_error("Pointer arithmetic may produce an interior pointer that cannot be safely treated as an owned interface object") {
+    IThing returnFunctionPointerMoveArithmetic()
+    {
+        return gMakeMoveThing() + 1;
+    }
+}
+
+expect_error("Pointer arithmetic may produce an interior pointer that cannot be safely treated as an owned interface object") {
+    IThing returnLambdaMoveArithmetic()
+    {
+        Lambda<move Thing*()> fp = () => { return mkT(); };
+        return fp() + 1;
+    }
+}
+
+interface IGenericThingFactory<T> { move T* make(); };
+class GenericThingFactory : IGenericThingFactory<Thing>
+{
+    move Thing* make() { return mkT(); }
+};
+GenericThingFactory gGenericThingFactory = default;
+
+expect_error("Pointer arithmetic may produce an interior pointer that cannot be safely treated as an owned interface object") {
+    IThing returnGenericDispatchedMoveArithmetic()
+    {
+        IGenericThingFactory<Thing> f = &gGenericThingFactory;
+        return f.make() + 1;
+    }
+}
+
 extern int main()
 {
     return 0;

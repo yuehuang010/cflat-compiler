@@ -1,0 +1,14 @@
+expect_error("for-init declaration must declare a variable") {
+    extern int main() {
+        for (int; false; ) { }
+        return 0;
+    }
+}
+
+// A C-style array for-init is the same diagnostic as the statement `int a[3];` (T355).
+expect_error("C-style array declaration 'a[3]' is not allowed") {
+    extern int main() {
+        for (int a[3]; false; ) { }
+        return 0;
+    }
+}

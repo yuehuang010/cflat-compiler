@@ -794,7 +794,7 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
             int retConst = 0;
             tv.FuncPtrReturnTypeName = ResolveSigComponentConstCodegen(
                 fpSpec->typeSpecifier(), retPtr, retStars, retConst,
-                fpSpec->multiWordTypeSuffix(), aliasReturn, true);
+                fpSpec->multiWordTypeSuffix(), aliasReturn);
             tv.FuncPtrReturnConstMask = retConst;
             tv.FuncPtrReturnPointer  = retPtr;
             tv.FuncPtrReturnOwned = returnQualifierText == "move";
@@ -805,17 +805,26 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
                 for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
                 {
                     LLVMBackend::TypeAndValue::FuncPtrParam p;
-                    bool pPtr = param->pointer() != nullptr;
-                    int pStars = PointerDepthOf(param->pointer());
+                    if (auto suffixError = FunctionTypeArraySuffixError(param);
+                        !suffixError.empty())
+                        LogErrorContext(param, suffixError);
+                    const bool pIsArrayView = param->arrayTypeSuffix() != nullptr;
+                    bool pPtr = param->pointer() != nullptr || pIsArrayView;
+                    int pStars = PointerDepthOf(param->pointer()) + (pIsArrayView ? 1 : 0);
                     ValidateConstAfterPointerStar(param->pointer(),
                         SpelledTypeNameBase(param->typeSpecifier(), param->multiWordTypeSuffix()));
                     int pConst = 0;
                     p.TypeName = ResolveSigComponentConstCodegen(
-                        param->typeSpecifier(), pPtr, pStars, pConst, param->multiWordTypeSuffix());
+                        param->typeSpecifier(), pPtr, pStars, pConst, param->multiWordTypeSuffix(),
+                            false, &p.AliasSpelling);
+                    p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
+                    if (p.PointerDepth > PointerDepthCap)
+                        LogErrorContext(param, PointerDepthCapMessage(
+                            std::format("function type parameter '{}'", p.TypeName), p.PointerDepth));
                     p.ConstMask = pConst;
                     p.Pointer  = pPtr;
+                    p.IsArrayView = pIsArrayView;
                     p.IsMove   = param->Move() != nullptr;
-                    p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
                     CanonicalizeUniqueSigComponent(compilerLLVM, p.TypeName, p.Pointer,
                                                    p.PointerDepth);
                     p.ResolvedTypeKey = SigComponentResolvedKey(p.TypeName);
@@ -875,6 +884,7 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
             // Instantiation PRE-SCAN: opportunistic, so a refused pattern is reported by the
             // declaration path instead, inside whatever scope the spelling actually sits in.
             Compiler()->ResolveGenericAliasSpelling(baseName, typeArgs, false);
+            Compiler()->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
 
             std::string mangledName = MangledGenericName(baseName, typeArgs);
 
@@ -1300,7 +1310,7 @@ void MainListener::PreDeclareInstantiationMembers(
             if (!isStaticLike)
                 RecordReceiverScan(compiler, func, declName, declReturnType, declAllParams, declVarargs,
                                    SinkIfConstEvaluator());
-            bool declReturnsOwned = ComputeReturnsOwned(declReturnType, declName, declAllParams);
+            bool declReturnsOwned = ComputeReturnsOwned(declReturnType, func, declAllParams);
             compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs, declReturnsOwned, !isStaticLike);
         }
     }

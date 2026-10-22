@@ -2499,9 +2499,27 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             else
                             {
                                 qualifiedName = namespaceContext + "." + memberName;
+                                const std::string spelledQualifiedName = qualifiedName;
                                 // C++ using-directives are lookup-time namespace re-exports. Keep
                                 // the exact member first, then resolve a nominated namespace.
                                 qualifiedName = Compiler(ctx)->ResolveQualifiedName(qualifiedName);
+                                const bool followedByGenericTypeParameters = childIndex < ctx->children.size()
+                                    && dynamic_cast<CFlatParser::GenericTypeParametersContext*>(
+                                        ctx->children[childIndex]) != nullptr;
+                                if (followedByGenericTypeParameters
+                                    && Compiler(ctx)->HasCxxImportGroup()
+                                    && Compiler(ctx)->HasCxxClassTemplate(spelledQualifiedName)
+                                    && !genericClassTemplates.count(spelledQualifiedName)
+                                    && !genericStructTemplates.count(spelledQualifiedName)
+                                    && !genericFunctionTemplates.count(spelledQualifiedName)
+                                    && !Compiler(ctx)->HasCxxFunctionTemplate(spelledQualifiedName))
+                                {
+                                    // A bound specialization can alias the bare template name to
+                                    // its first concrete type; keep the written base for <...>.
+                                    primaryIdentifier = memberName;
+                                    namedVar = {};
+                                    break;
+                                }
                             }
                             std::string owner = Compiler(ctx)->IsDataStructure(namespaceContext)
                                 ? namespaceContext : Compiler(ctx)->ResolveTypeAlias(namespaceContext);
@@ -3735,6 +3753,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 typeArgs.push_back(ResolveTypeArgEntry(entry));
                             }
                             ResolveEnumTypeArguments(typeArgs);
+                            Compiler(ctx)->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
                             mangledName = MangleGenericInstance(*Compiler(), baseName, typeArgs);
                             bool isFollowedByCall = false;
                             for (size_t i = 0; i + 1 < ctx->children.size(); i++)
@@ -3837,6 +3856,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 std::vector<std::string> aliasArgs = typeArgs;
                                 ResolveEnumTypeArguments(aliasArgs);
                                 Compiler(ctx)->ResolveGenericAliasSpelling(aliasBase, aliasArgs);
+                                Compiler(ctx)->CompleteCxxTemplateTypeArgs(aliasBase, aliasArgs);
                                 std::string aliasMangled =
                                     MangleGenericInstance(*Compiler(), aliasBase, aliasArgs);
                                 std::string cxxError;
@@ -3908,7 +3928,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar = {};
                                 structVar = {};
                             }
-                            else if (Compiler(ctx)->IsDataStructure(
+                            else if (prevPrimary->genericIdentifier()->genericTypeParameters() == nullptr
+                                     && Compiler(ctx)->IsDataStructure(
                                          Compiler(ctx)->ResolveQualifiedName(prevPrimary->getText()))
                                      && Compiler(ctx)->GetLocalVariable(idName).Storage == nullptr
                                      && Compiler(ctx)->GetFunctionArgument(idName).GetValue() == nullptr
@@ -4782,6 +4803,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // names the aliased template; only the target has an identity to
                             // request, which is the hop the DECLARATION path already performs.
                             Compiler(ctx)->ResolveGenericAliasSpelling(baseName, typeArgs);
+                            Compiler(ctx)->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
                             std::string mangled = MangleGenericInstance(*Compiler(), baseName,
                                                                         typeArgs);
                             // `std.numbers.pi_v<double>` used as a value: a variable template
@@ -7152,12 +7174,32 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     result = Compiler(ctx)->MarkCastQualification(result,
                                         Compiler(ctx)->lastCallReturnType, functionName + "()");
                                 Compiler(ctx)->unwindCallConsumedTemps_.clear();
-                                Compiler(ctx)->lastCallReturnsOwned = funcPtrTV.FuncPtrReturnOwned;
+                                std::vector<LLVMBackend::TypeAndValue> indirectParams;
+                                indirectParams.reserve(funcPtrTV.FuncPtrParams.size());
+                                for (size_t i = 0; i < funcPtrTV.FuncPtrParams.size(); ++i)
+                                    indirectParams.push_back(Compiler(ctx)->FuncPtrParamAsTypeAndValue(
+                                        funcPtrTV.FuncPtrParams[i], i));
+                                bool aliasStringTempMayOwn =
+                                    Compiler(ctx)->TryAdoptAliasReturnStringTemp(result,
+                                        Compiler(ctx)->lastCallReturnType,
+                                        funcPtrTV.FuncPtrReturnOwned,
+                                        funcPtrTV.FuncPtrReturnAlias, indirectParams, callArgs,
+                                        &argNVs, /*requireReturnSinkParam*/ false);
+                                Compiler(ctx)->lastCallReturnsOwned =
+                                    funcPtrTV.FuncPtrReturnOwned || aliasStringTempMayOwn;
                                 if (result != nullptr && funcPtrTV.FuncPtrReturnOwned)
                                 {
                                     auto returnType = Compiler(ctx)->lastCallReturnType;
                                     returnType.IsMove = true;
                                     Compiler(ctx)->RegisterOwnedReturnTemp(result, functionName, returnType);
+                                }
+                                else if (result != nullptr && aliasStringTempMayOwn)
+                                {
+                                    auto returnType = Compiler(ctx)->lastCallReturnType;
+                                    returnType.IsMove = true;
+                                    Compiler(ctx)->RegisterOwnedReturnTemp(
+                                        result, functionName, returnType, /*checkDiscard*/ false);
+                                    Compiler(ctx)->RegisterOwnedStringTemp(result);
                                 }
                                 // A by-value owning-value struct return owns through a funcptr as through a
                                 // direct call (no `move` on the type), so ledger it; `alias` returns stay out.
@@ -7523,6 +7565,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.TernaryTempAlreadyRegistered = argNV.TernaryTempAlreadyRegistered;
                                     argVar.ConditionalMoveSources = argNV.ConditionalMoveSources;
                                     argVar.Storage = argNV.Storage;
+                                    argVar.AddressedUniqueSlot = argNV.AddressedUniqueSlot;
+                                    argVar.AddressedUniqueTypeName = argNV.AddressedUniqueTypeName;
                                     argVar.IsOwning = argNV.IsOwning;
                                     argVar.OwnsInterfaceBox = argNV.OwnsInterfaceBox;
                                     argVar.IsAdoptable = argNV.IsAdoptable;
@@ -8699,6 +8743,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     LLVMBackend::NamedVariable argVar;
                                     argVar.OriginalArgumentType = argNV.TypeAndValue;
                                     argVar.HasOriginalArgumentType = true;
+                                    argVar.AddressedUniqueSlot = argNV.AddressedUniqueSlot;
+                                    argVar.AddressedUniqueTypeName = argNV.AddressedUniqueTypeName;
                                     argVar.IsTopLevelConst = argNV.IsTopLevelConst;
                                     argVar.IsCxxDirectConstruction = argNV.IsCxxDirectConstruction;
                                     argVar.CxxDirectConstructionUsesBraces =
@@ -9018,42 +9064,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     || symbol->ReturnType.TypeName != "char"
                                     || !symbol->ReturnType.Pointer)
                                     return;
-                                if (!IsBorrowedByValueParamBinding(compiler, receiver))
-                                    return;
-                                // An inferred move-sink parameter already owns the caller's buffer.
-                                if (compiler->OwningSinkConsumesConcrete(
-                                        compiler->GetFunctionArgument(receiver.TypeAndValue.VariableName).TypeAndValue))
-                                    return;
-
-                                // A by-value string parameter borrows its caller's buffer. Clear the
-                                // copied descriptor in the entry block so data_mut installs a private
-                                // buffer; its runtime owned bit then gates the ordinary param cleanup.
-                                llvm::StoreInst* lastParamStore = nullptr;
-                                if (compiler->currentFunction == nullptr || receiver.Storage == nullptr)
-                                    return;
-                                auto* entry = &compiler->currentFunction->getEntryBlock();
-                                for (auto& instruction : *entry)
-                                    if (auto* store = llvm::dyn_cast<llvm::StoreInst>(&instruction))
-                                    {
-                                        llvm::Value* destination = store->getPointerOperand()->stripPointerCasts();
-                                        while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(destination))
-                                            destination = gep->getPointerOperand()->stripPointerCasts();
-                                        if (destination == receiver.Storage)
-                                            lastParamStore = store;
-                                    }
-                                if (lastParamStore == nullptr)
-                                    return;
-                                auto* stringTy = llvm::StructType::getTypeByName(*compiler->context, "string");
-                                if (stringTy == nullptr) return;
-                                auto savedIP = compiler->builder->saveIP();
-                                if (auto* next = lastParamStore->getNextNode())
-                                    compiler->builder->SetInsertPoint(next);
-                                else
-                                    compiler->builder->SetInsertPoint(entry);
-                                auto* value = compiler->builder->CreateLoad(stringTy, receiver.Storage);
-                                compiler->builder->CreateStore(compiler->ClearStringOwnedBit(value), receiver.Storage);
-                                compiler->builder->restoreIP(savedIP);
-                                compiler->MarkVariableOwningString(receiver.TypeAndValue.VariableName);
+                                PrepareBorrowedStringParamForDataMut(compiler, receiver);
                             };
                             // Receiver's C++ class name, so a failed `obj.name(...)` resolution
                             // reports that class's member set instead of CFlat's free functions.
@@ -10420,6 +10431,7 @@ llvm::Value* MainListener::ParseFormatString(CFlatParser::PrimaryExpressionConte
                 auto localizeMessage = compilerLLVM->MakeDiagnosticLocalizer();
                 exprParser.setErrorHandler(std::make_shared<CFlatErrorStrategy>(localizeMessage));
                 auto* exprCtx = exprParser.assignmentExpression();
+                NormalizeForInitTree(exprParser, exprCtx);
 
                 // The braces must enclose exactly one complete expression. Leftover tokens
                 // or syntax errors mean this was almost certainly not meant as interpolation
@@ -11214,8 +11226,9 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             LLVMBackend::TypeAndValue::FuncPtrParam fp;
             fp.TypeName = p.TypeName;
             fp.Pointer  = p.Pointer;
+            fp.IsArrayView = p.IsArrayView;
             fp.PointerDepth = p.ValuePointerDepth();
-            fp.ConstMask = p.PointeeConstMask();
+            fp.ConstMask = p.FunctionParamConstMask();
             // Carry the inferred sink onto the TYPE so the indirect call site can null the
             // caller's source; a declared Lambda<...> spelling never sets these.
             fp.IsOwningSink = p.IsOwningSink;
@@ -11224,7 +11237,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             fp.IsWriteInferredSink = p.IsWriteInferredSink;
             // A SPELLED `move` param rides the type, exactly as a named function's does.
             fp.IsMove = p.IsMove;
-            fp.IsPointeeConst = (p.PointeeConstMask() & 1u) != 0;
+            fp.IsPointeeConst = (fp.ConstMask & 1) != 0;
             tv.FuncPtrParams.push_back(fp);
         }
         // Bound literals use the named-function bind rule on the user arity (fewer legal, more or
@@ -12801,6 +12814,7 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                             typeArgs.push_back(ResolveTypeArgEntry(entry));
                         ResolveEnumTypeArguments(typeArgs);
                         auto* compiler = Compiler(typeSpec);
+                        compiler->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
                         bool resolvesAsType = compiler->IsKnownTypeName(baseName)
                             || compiler->AnyGenericTypeTemplateNamed(baseName)
                             || compiler->IsGenericInterfaceTemplateName(baseName)
@@ -12816,6 +12830,7 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                             continue;
                         // Queue PRE-SCAN: the declaration path reports a refused pattern.
                         compiler->ResolveGenericAliasSpelling(baseName, typeArgs, false);
+                        compiler->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
                         // One queue funnel: it also pre-creates the opaque shell, so a LATER
                         // instantiation naming this one as a field type finds a type even when
                         // the forward scan spelled the shell differently (e.g. an alias arg).
@@ -12854,6 +12869,7 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                         ResolveEnumTypeArguments(typeArgs);
                         // Queue PRE-SCAN: the declaration path reports a refused pattern.
                         Compiler()->ResolveGenericAliasSpelling(baseName, typeArgs, false);
+                        Compiler()->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
                         // Same single funnel as the typeSpecifier arm above.
                         QueueGenericInstantiation(baseName, typeArgs,
                             MangledGenericName(baseName, typeArgs),

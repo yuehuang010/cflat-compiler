@@ -1,0 +1,7 @@
+expect_error("parameter 1 differs") {
+    int t370SumFloatView(float[] values) { return values == nullptr ? 0 : (int)values[0]; }
+    int main() {
+        function<int(int[])> fn = t370SumFloatView;
+        return 0;
+    }
+}

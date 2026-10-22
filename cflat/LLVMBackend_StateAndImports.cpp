@@ -2166,6 +2166,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
                 nlohmann::json pj;
                 pj["t"] = p.TypeName;
                 if (p.Pointer) pj["p"]  = true;
+                if (p.IsArrayView) pj["av"] = true;
                 if (p.AllocAlignValue > 0) pj["aav"] = static_cast<int64_t>(p.AllocAlignValue);
                 if (p.IsMove)  pj["mv"] = true;
                 if (p.IsOwningSink) pj["osk"] = true;
@@ -2177,6 +2178,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
                 if (p.PointerDepth > 1) pj["pd"] = p.PointerDepth;
                 if (!p.ResolvedTypeKey.empty()) pj["rk"] = p.ResolvedTypeKey;
                 if (p.ConstMask >= 0) pj["cm"] = p.ConstMask;
+                if (!p.AliasSpelling.empty()) pj["as"] = p.AliasSpelling;
                 fps.push_back(pj);
             }
             j["fpp"] = fps;
@@ -2243,6 +2245,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
                     SerializedTav::FuncPtrParam p;
                     p.TypeName = pj.value("t", std::string{});
                     p.Pointer = pj.value("p", false);
+                    p.IsArrayView = pj.value("av", false);
                     p.AllocAlignValue = pj.value("aav", uint64_t{0});
                     p.IsMove = pj.value("mv", false);
                     p.IsOwningSink = pj.value("osk", false);
@@ -2254,6 +2257,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
                     p.PointerDepth = pj.value("pd", p.PointerDepth);
                     p.ResolvedTypeKey = pj.value("rk", std::string{});
                     p.ConstMask = pj.value("cm", -1);
+                    p.AliasSpelling = pj.value("as", std::string{});
                     s.FuncPtrParams.push_back(std::move(p));
                 }
         }
@@ -3413,6 +3417,25 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
             if (j.contains("functionTemplates"))
                 for (const auto& t : j["functionTemplates"])
                     entry.functionTemplates.push_back(FunctionTemplateFromJson(t, files));
+            if (j.contains("classTemplates"))
+                for (const auto& t : j["classTemplates"])
+                {
+                    cflat_cinterop::RawClassTemplate classTemplate;
+                    classTemplate.name = t.value("name", std::string{});
+                    if (t.contains("parameters"))
+                        for (const auto& p : t["parameters"])
+                        {
+                            cflat_cinterop::RawClassTemplateParameter parameter;
+                            parameter.name = p.value("name", std::string{});
+                            const std::string kind = p.value("kind", std::string("T"));
+                            parameter.kind = kind.empty() ? 'T' : kind.front();
+                            parameter.hasDefault = p.value("defaulted", false);
+                            parameter.defaultParameterIndex = p.value("defaultIndex", -1);
+                            parameter.defaultArgument = p.value("default", std::string{});
+                            classTemplate.parameters.push_back(std::move(parameter));
+                        }
+                    entry.classTemplates.push_back(std::move(classTemplate));
+                }
             if (j.contains("classTemplateNames"))
                 entry.classTemplateNames = j["classTemplateNames"].to_string_vector();
             if (j.contains("classTemplateSpecializations"))
@@ -3856,6 +3879,18 @@ void LLVMBackend::WriteCHeaderDiskCache(
         for (const auto& t : entry.functionTemplates)
             functionTemplates.push_back(FunctionTemplateToJson(t, &files));
         j["functionTemplates"] = std::move(functionTemplates);
+        nlohmann::json classTemplates = nlohmann::json::array();
+        for (const auto& t : entry.classTemplates)
+        {
+            nlohmann::json parameters = nlohmann::json::array();
+            for (const auto& p : t.parameters)
+                parameters.push_back({ {"name", p.name}, {"kind", std::string(1, p.kind)},
+                                       {"defaulted", p.hasDefault},
+                                       {"defaultIndex", p.defaultParameterIndex},
+                                       {"default", p.defaultArgument} });
+            classTemplates.push_back({ {"name", t.name}, {"parameters", std::move(parameters)} });
+        }
+        j["classTemplates"] = std::move(classTemplates);
         j["classTemplateNames"] = entry.classTemplateNames;
         j["classTemplateSpecializations"] = entry.classTemplateSpecializations;
         if (!entry.cxxGroupNamespaces.empty()) j["cxxGroupNamespaces"] = entry.cxxGroupNamespaces;

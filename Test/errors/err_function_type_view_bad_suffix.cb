@@ -1,0 +1,30 @@
+int t370BadSuffixView(int[] values) { return values == nullptr ? 3 : values[0]; }
+struct T370BadSuffixTag<T> { int value = 42; };
+
+expect_error("only bracketed form valid as a function-type parameter") {
+    function<int(int[3])> t370BadSizedSuffix = default;
+}
+
+expect_error("only bracketed form valid as a function-type parameter") {
+    function<int(int[][])> t370BadMultiDimSuffix = default;
+}
+
+expect_error("only bracketed form valid as a function-type parameter") {
+    function<int(int[]*)> t370BadPointerSuffix = default;
+}
+
+expect_error("only bracketed form valid as a function-type parameter") {
+    function<int(int[3]*)> t370BadSizedPointerSuffix = default;
+}
+
+expect_error("only bracketed form valid as a function-type parameter") {
+    T370BadSuffixTag<int(int[3])> t370BadPlainFunctionArg = default;
+}
+
+expect_error("only bracketed form valid as a function-type parameter") {
+    T370BadSuffixTag<function<int(int[3])>> t370BadNestedClosureArg = default;
+}
+
+expect_error("only bracketed form valid as a function-type parameter") {
+    using T370BadSuffixAlias = function<int(int[3])>;
+}

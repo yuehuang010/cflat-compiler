@@ -530,13 +530,15 @@ static int FunctionComponentConstDepth(int constMask, bool pointer, int pointerD
 
 std::string MangleFunctionComponent(const LLVMBackend& compiler, std::string_view name,
                                     bool pointer, int pointerDepth, bool alias = false,
-                                    int constMask = -1)
+                                    int constMask = -1, bool isArrayView = false)
 {
     LLVMBackend::TypeAndValue component;
     component.TypeName = name.empty() ? "void" : MangleTypeArgument(compiler, name);
-    component.Pointer = pointer;
-    component.ElemPointer = pointer && pointerDepth >= 2;
+    component.Pointer = pointer || isArrayView;
+    component.IsArrayView = isArrayView;
+    component.ElemPointer = component.Pointer && pointerDepth >= 2;
     component.PointerDepth = pointer ? std::max(pointerDepth, 1) : 0;
+    if (isArrayView) component.PointerDepth = std::max(pointerDepth, 1);
     component.IsAlias = alias;
     std::string mangled = MangleType(compiler, component);
     // Pointee const is part of a function type's identity: ".c1$.p$char" for `(const char)*`.
@@ -567,7 +569,8 @@ std::string MangleFunctionType(const LLVMBackend& compiler,
         result += "$";
         if (param.IsMove) result += ".m$";
         result += MangleFunctionComponent(compiler, param.TypeName,
-                                          param.Pointer, param.PointerDepth, false, param.ConstMask);
+                                          param.Pointer, param.PointerDepth, false, param.ConstMask,
+                                          param.IsArrayView);
     }
 #ifndef NDEBUG
     TypeSpelling spelling;
@@ -768,7 +771,8 @@ std::string MangleGenericInstance(const LLVMBackend& compiler, std::string_view 
 std::string MangleClosureType(const LLVMBackend& compiler, bool isThin,
                               const std::string& ret, int retDepth,
                               const std::vector<std::pair<std::string, int>>& params,
-                              int retConstMask, const std::vector<int>* paramConstMasks)
+                              int retConstMask, const std::vector<int>* paramConstMasks,
+                              const std::vector<bool>* paramArrayViews)
 {
     std::string result = isThin ? "cfn$." : "fatfn$.";
     result += std::to_string(params.size()) + "$"
@@ -776,7 +780,8 @@ std::string MangleClosureType(const LLVMBackend& compiler, bool isThin,
     for (size_t i = 0; i < params.size(); i++)
         result += "$" + MangleFunctionComponent(compiler, params[i].first, params[i].second > 0,
             params[i].second, false,
-            paramConstMasks != nullptr && i < paramConstMasks->size() ? (*paramConstMasks)[i] : -1);
+            paramConstMasks != nullptr && i < paramConstMasks->size() ? (*paramConstMasks)[i] : -1,
+            paramArrayViews != nullptr && i < paramArrayViews->size() && (*paramArrayViews)[i]);
 #ifndef NDEBUG
     TypeSpelling spelling;
     assert(DemangleType(compiler, result, spelling));

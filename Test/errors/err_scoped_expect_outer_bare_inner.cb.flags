@@ -1,0 +1,2 @@
+expect_exit=nonzero
+expect_output=expected error 'Undefined variable qA' did not occur

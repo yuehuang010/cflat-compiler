@@ -1,0 +1,41 @@
+expect_error("parameter 1 differs") {
+    int t370SumPointer(int* values) { return values == nullptr ? 0 : values[0]; }
+    int main() {
+        function<int(int[])> fn = t370SumPointer;
+        return 0;
+    }
+}
+
+int t370R2SumView(int[] values) { return values == nullptr ? 0 : values[0]; }
+int t370R2ApplyPointer(function<int(int*)> fn, int* value) { return fn(value); }
+T t370R2ApplyPointerGeneric<T>(function<T(T*)> fn, T* value) { return fn(value); }
+
+expect_error("parameter 1 differs") {
+    void t370R2ReverseDirectBinding()
+    {
+        function<int(int*)> fn = t370R2SumView;
+    }
+}
+
+expect_error("no overload of 't370R2ApplyPointer' matches") {
+    void t370R2ReverseFunctionArgument()
+    {
+        int value = 7;
+        int result = t370R2ApplyPointer(t370R2SumView, &value);
+    }
+}
+
+expect_error("no overload of 't370R2ApplyPointerGeneric<int>' matches") {
+    void t370R2ReverseGenericArgument()
+    {
+        int value = 7;
+        int result = t370R2ApplyPointerGeneric<int>(t370R2SumView, &value);
+    }
+}
+
+expect_error("parameter 1 differs") {
+    void t370R2ReverseLambdaBinding()
+    {
+        Lambda<int(int*)> fn = t370R2SumView;
+    }
+}

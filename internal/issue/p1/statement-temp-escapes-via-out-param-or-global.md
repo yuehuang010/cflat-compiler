@@ -4,10 +4,13 @@ T241/T242/T245 closed the direct, join-arm, later-defined void / non-void and C+
 T251 fixed the two field-pointer use-after-free cases: unwind cleanup now carries the deferred release
 gate, and the pre-call walk follows a field GEP through `??` / `?:` arms.
 
-Remaining from T242 review 1 (repros in scratch/repro_keep/t242_rev/):
-- (leak) `f(vn ?? new E(5))` into an earlier-defined read-only CFlat `f(void*)` leaks the C++ class temp.
-- (accepts-invalid) a `void*` join `vn ?? new E` passes to an `E*` param and `c ? new E : F*` to a `void*`
-  param (CFlat and C++ callees); clang refuses all four.
+Remaining from T242 review 1 (repros in scratch/repro_keep/t242_rev/), re-measured by T366 (2026-10-20):
+- (NEEDS RULING) `void*` joins: `vn ?? new E(5)` into an `E*` param and `c ? new E() : fp` (unrelated `F*`) into a `void*` param are
+  accepted for CFlat and C++ callees; clang refuses all four. CFlat accepts the SAME joins in declarations, assignments and returns, so
+  a call-only refusal would be a new rule. Ruling needed: keep these join conversions everywhere, or refuse them in every context
+  (pointer-not-number ruling family). Matrix: scratch/repro_keep/box1021/t366/t366_matrix.md.
+- (closed, not a bug) the earlier-defined read-only `f(void*)` leak did not reproduce: the repro sampled and reset the counters
+  inside `show` while the statement temp was still live; measured after the full expression it frees once.
 
 From T251 review 1 (repros scratch/repro_keep/t251_rev/cases/):
 - (trade-off) a callee that stores into the caller's out-param and then throws now keeps (leaks) the temp

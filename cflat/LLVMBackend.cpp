@@ -73,6 +73,94 @@ extern "C" unsigned char RtlAddFunctionTable(
     void* FunctionTable, unsigned long EntryCount, unsigned long long BaseAddress);
 #endif
 
+// A for-init `S s;` parses as declarationSpecifiers alone: the greedy specifier loop takes the
+// declarator name `s` as a typedef-name. Rebuild that trailing bare name as the initDeclaratorList
+// so the for-init tree is the statement `S s;` tree (ParseDeclaration reads it unchanged).
+static void SplitForInitDeclarator(CFlatParser& parser, CFlatParser::ForDeclarationContext* forDecl)
+{
+    auto* specs = forDecl->declarationSpecifiers();
+    if (specs == nullptr || forDecl->initDeclaratorList() != nullptr) return;
+    if (forDecl->children.size() != 2 || forDecl->children[1]->getText() != ";") return;
+    auto& specList = specs->children;
+    if (specList.size() < 2) return;
+    auto* last = dynamic_cast<CFlatParser::DeclarationSpecifierContext*>(specList.back());
+    if (last == nullptr || last->typeSpecifier() == nullptr
+        || last->typeSpecifier()->children.size() != 1 || last->typeSpecifier()->genericIdentifier() == nullptr
+        || last->typeSpecifier()->genericIdentifier()->children.size() != 1)
+        return;
+    // Optional single-group suffix `a[N]`: the C-style form the statement path also diagnoses.
+    CFlatParser::ArrayDimSpecContext* arrayDim = nullptr;
+    if (last->children.size() == 2)
+    {
+        auto* suffix = dynamic_cast<CFlatParser::ArrayTypeSuffixContext*>(last->children[1]);
+        if (suffix == nullptr || suffix->arrayPtrSuffix() != nullptr || suffix->arrayDimSpec() == nullptr
+            || suffix->arrayDimSpec()->children.size() != 3)
+            return;
+        arrayDim = suffix->arrayDimSpec();
+    }
+    else if (last->children.size() != 1)
+        return;
+    // A type specifier must precede the name: `for (x;)` stays a for-init error.
+    bool precededByType = false;
+    for (size_t i = 0; i + 1 < specList.size(); ++i)
+        if (auto* spec = dynamic_cast<CFlatParser::DeclarationSpecifierContext*>(specList[i]);
+            spec != nullptr && spec->typeSpecifier() != nullptr)
+            precededByType = true;
+    if (!precededByType) return;
+    auto* name = last->typeSpecifier()->genericIdentifier()->Identifier();
+    auto* previous = dynamic_cast<antlr4::ParserRuleContext*>(specList[specList.size() - 2]);
+    if (name == nullptr || previous == nullptr) return;
+    specList.pop_back();
+    specs->stop = previous->stop;
+    auto& tracker = parser.getTreeTracker();
+    const size_t state = forDecl->invokingState;
+    auto* list = tracker.createInstance<CFlatParser::InitDeclaratorListContext>(forDecl, state);
+    auto* init = tracker.createInstance<CFlatParser::InitDeclaratorContext>(list, state);
+    auto* declarator = tracker.createInstance<CFlatParser::DeclaratorContext>(init, state);
+    auto* direct = tracker.createInstance<CFlatParser::DirectDeclaratorContext>(declarator, state);
+    direct->addChild(name);
+    name->setParent(direct);
+    if (arrayDim != nullptr)
+    {
+        // Declarator form `name '[' expr ']'`; the bracket and expression nodes move with it.
+        for (auto* part : arrayDim->children)
+        {
+            part->parent = direct;
+            direct->children.push_back(part);
+        }
+    }
+    antlr4::Token* token = name->getSymbol();
+    antlr4::Token* stopToken = arrayDim != nullptr ? arrayDim->stop : token;
+    for (antlr4::ParserRuleContext* node : {static_cast<antlr4::ParserRuleContext*>(list),
+                                            static_cast<antlr4::ParserRuleContext*>(init),
+                                            static_cast<antlr4::ParserRuleContext*>(declarator),
+                                            static_cast<antlr4::ParserRuleContext*>(direct)})
+    {
+        node->start = token;
+        node->stop = stopToken;
+    }
+    declarator->addChild(direct);
+    init->addChild(declarator);
+    list->addChild(init);
+    forDecl->children.insert(forDecl->children.begin() + 1, list);
+}
+
+void NormalizeForInitTree(CFlatParser& parser, antlr4::tree::ParseTree* root)
+{
+    std::vector<antlr4::tree::ParseTree*> pending;
+    if (root != nullptr) pending.push_back(root);
+    while (!pending.empty())
+    {
+        antlr4::tree::ParseTree* node = pending.back();
+        pending.pop_back();
+        if (!antlr4::RuleContext::is(*node)) continue;
+        auto* ctx = static_cast<antlr4::RuleContext*>(node);
+        if (ctx->getRuleIndex() == CFlatParser::RuleForDeclaration)
+            SplitForInitDeclarator(parser, static_cast<CFlatParser::ForDeclarationContext*>(ctx));
+        pending.insert(pending.end(), node->children.begin(), node->children.end());
+    }
+}
+
 llvm::Error cflat_jit::SehRegistrationPlugin::RegisterUnwindInfo(llvm::jitlink::LinkGraph& G)
 {
     char nosehBuf[16]; size_t nosehLen = 0;
@@ -1713,6 +1801,7 @@ bool LLVMBackend::CheckGrammar(const std::string& filename)
 
     tokens.fill();
     auto* compilationUnit = parser.compilationUnit();
+    NormalizeForInitTree(parser, compilationUnit);
 
     // With -v, print the full parse-tree rule stack so the grammar match can be
     // inspected rule by rule. Printed even when there are syntax errors - the
@@ -2092,6 +2181,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             llvm::TimeTraceScope parseScope("Parse", sourceFileName);
             tokens.fill();
             computeUnit = parser.compilationUnit();
+            NormalizeForInitTree(parser, computeUnit);
         }
         if (verbose) std::cout << std::format("[verbose]   parse complete ({} tokens)\n", tokens.getTokens().size());
 
@@ -2987,6 +3077,7 @@ std::shared_ptr<LLVMBackend::CachedParseTree> LLVMBackend::ParseFileForCache(con
         llvm::TimeTraceScope parseScope("Parse", displayName);
         entry->tokens->fill();
         entry->unit = entry->parser->compilationUnit();
+        NormalizeForInitTree(*entry->parser, entry->unit);
     }
     if (verbose) std::cout << std::format("[verbose]   parse complete ({} tokens)\n", entry->tokens->getTokens().size());
 
@@ -3743,7 +3834,7 @@ void LLVMBackend::ProcessPendingMacroSources()
             continue;
         }
         CFlatParser::CompilationUnitContext* cu = nullptr;
-        try { cu = state.parser->compilationUnit(); } catch (...) {
+        try { cu = state.parser->compilationUnit(); NormalizeForInitTree(*state.parser, cu); } catch (...) {
             if (verbose) std::cout << std::format("[verbose]   parse failed for {}, dropping batch\n", state.label);
             continue;
         }
@@ -4530,6 +4621,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                 tokens.fill();
             }
             computeUnit = parser.compilationUnit();
+            NormalizeForInitTree(parser, computeUnit);
         }
 
         if (analyzeErrorListener.hasErrors())
@@ -4742,6 +4834,9 @@ void LLVMBackend::ResetForReanalysis()
 {
     JoinCHeaderDiskCacheWriters();
     EndActiveRoot();
+    ownFlagControlPath_.clear();
+    ownFlagControlKind_.clear();
+    nextOwnFlagControlFrameId_ = 1;
     ownReleaseGates_.clear();
     receiverScanFacts_.clear();
     readOnlyMethodMemo_.clear();
@@ -4827,6 +4922,7 @@ void LLVMBackend::ResetForReanalysis()
     // Holds llvm::Function* into the module this reset is about to replace.
     cflatGlobalCxxInitFns_.clear();
     cxxCflatToCxxSpelling_.clear();
+    cxxClassTemplateParameters_.clear();
     cxxLazyAliasSpecializations_.clear();
     cxxLazyGlobalTypedefs_.clear();
     cxxForeignRequests_.clear();
@@ -7089,6 +7185,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.IsBorrowOfAliasElement) o["bae"] = true;
     if (s.IsBond)                 o["bd"]  = true;
     if (s.IsUnique)               o["uq"]  = true;
+    if (s.IsCoreUniqueOwner)      o["cuo"] = true;
     if (s.CallConv != LLVMBackend::CallingConv::Default) o["cc"] = static_cast<int64_t>(s.CallConv);
     if (s.LockThis)               o["lt"]  = true;
     if (s.LockThisMode != LockMode::Exclusive) o["ltm"] = static_cast<int64_t>(s.LockThisMode);
@@ -7112,6 +7209,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
             llvm::json::Object po;
             po["t"] = p.TypeName;
             if (p.Pointer) po["p"] = true;
+            if (p.IsArrayView) po["av"] = true;
             if (p.AllocAlignValue > 0) po["aav"] = static_cast<int64_t>(p.AllocAlignValue);
             if (p.IsMove)  po["mv"] = true;
             if (p.IsOwningSink) po["osk"] = true;
@@ -7123,6 +7221,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
             if (p.PointerDepth > 1) po["pd"] = static_cast<int64_t>(p.PointerDepth);
             if (!p.ResolvedTypeKey.empty()) po["rk"] = p.ResolvedTypeKey;
             if (p.ConstMask >= 0) po["cm"] = static_cast<int64_t>(p.ConstMask);
+            if (!p.AliasSpelling.empty()) po["as"] = p.AliasSpelling;
             fps.push_back(std::move(po));
         }
         o["fpp"] = std::move(fps);
@@ -7181,6 +7280,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("bae")) s.IsBorrowOfAliasElement = *v;
     if (auto v = o.getBoolean("bd")) s.IsBond = *v;
     if (auto v = o.getBoolean("uq")) s.IsUnique = *v;
+    if (auto v = o.getBoolean("cuo")) s.IsCoreUniqueOwner = *v;
     if (auto v = o.getInteger("cc")) s.CallConv = static_cast<LLVMBackend::CallingConv>(*v);
     if (auto v = o.getBoolean("lt")) s.LockThis = *v;
     if (auto v = o.getInteger("ltm")) s.LockThisMode = static_cast<LockMode>(*v);
@@ -7205,6 +7305,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
                     LLVMBackend::SerializedTav::FuncPtrParam p;
                     if (auto v = po->getString("t"))  p.TypeName = v->str();
                     if (auto v = po->getBoolean("p")) p.Pointer = *v;
+                    if (auto v = po->getBoolean("av")) p.IsArrayView = *v;
                     if (auto v = po->getInteger("aav")) p.AllocAlignValue = static_cast<uint64_t>(*v);
                     if (auto v = po->getBoolean("mv"))p.IsMove = *v;
                     if (auto v = po->getBoolean("osk")) p.IsOwningSink = *v;
@@ -7217,6 +7318,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
                     if (auto v = po->getInteger("pd")) p.PointerDepth = static_cast<int>(*v);
                     if (auto v = po->getString("rk")) p.ResolvedTypeKey = v->str();
                     if (auto v = po->getInteger("cm")) p.ConstMask = static_cast<int>(*v);
+                    if (auto v = po->getString("as")) p.AliasSpelling = v->str();
                     s.FuncPtrParams.push_back(std::move(p));
                 }
     }

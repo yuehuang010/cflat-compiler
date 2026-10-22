@@ -618,6 +618,10 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
             resolved = nested.TypeName + std::string(nested.PointerDepth, '*');
             argConstDepth = std::popcount(nested.ConstMask);
         }
+        else if (typeSpec != nullptr && typeSpec->tupleTypeSpecifier() != nullptr)
+        {
+            resolved = ParseTupleTypeSpecifier(typeSpec->tupleTypeSpecifier());
+        }
         else if (auto* innerParams = GenericSpecOf(typeSpec, innerBase))
         {
             // Nested generic (e.g., Box<T>): recurse into each type argument
@@ -626,6 +630,8 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
                 innerArgs.push_back(ResolveTypeArgEntry(innerEntry));
             ResolveEnumTypeArguments(innerArgs);
             Compiler()->ResolveGenericAliasSpelling(innerBase, innerArgs);
+            Compiler()->CompleteCxxTemplateTypeArgs(innerBase, innerArgs);
+            ResolveEnumTypeArguments(innerArgs);
             resolved = MangledGenericName(innerBase, innerArgs);
             // A foreign C++ specialization used as a type argument (`list<std.vector<int>>`, or
             // the inner `std.string` of `std.vector<std.string>`) must be registered before the
@@ -955,6 +961,7 @@ std::string MainListener::ResolveSigComponentCodegen(
             for (auto* entry : ts->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
                 innerArgs.push_back(ResolveTypeArgEntry(entry));
             ResolveEnumTypeArguments(innerArgs);
+            Compiler(ts)->CompleteCxxTemplateTypeArgs(baseName, innerArgs);
             std::string mangled = MangledGenericName(baseName, innerArgs);
             QueueGenericInstantiation(baseName, innerArgs, mangled, ts);
             // A local-enum argument was deferred by the pre-scan; the signature needs the layout now.
@@ -986,7 +993,8 @@ std::string MainListener::ResolveSigComponentCodegen(
 
 std::string MainListener::ResolveSigComponentConstCodegen(
     CFlatParser::TypeSpecifierContext* ts, bool& outPointer, int& stars, int& constMask,
-    CFlatParser::MultiWordTypeSuffixContext* suffix, bool preserveAliasReferentConst, bool returnComponent) {
+    CFlatParser::MultiWordTypeSuffixContext* suffix, bool preserveAliasReferentConst,
+    std::string* aliasSpelling) {
         constMask = 0;
         if (ts != nullptr && ts->typeName() != nullptr)
         {
@@ -995,24 +1003,30 @@ std::string MainListener::ResolveSigComponentConstCodegen(
             stars += nested.ValuePointerDepth();
             outPointer = stars > 0;
             constMask = PointeeConstOfComponent(nested.ConstMask, stars, preserveAliasReferentConst);
-            return nested.TypeName;
+            return SignatureComponentAliasBase(Compiler(ts), nested.TypeName);
         }
-        std::string name = ResolveSigComponentCodegen(ts, outPointer, suffix);
+        // A member alias (`A<int>.CP`) keeps its stars and its const mask: both come from the owner.
+        uint8_t memberMask = 0;
+        const bool memberSpelled = ts != nullptr && ts->memberTypeSpecifier() != nullptr;
+        std::string name = memberSpelled
+            ? Compiler()->ResolveTypeAlias(ResolveMemberTypeSpecifier(ts->memberTypeSpecifier(), &memberMask))
+            : ResolveSigComponentCodegen(ts, outPointer, suffix);
         int depth = ReconcilePointerDepth(outPointer, stars);
         // A pointer alias (`using CStr = (const char)*`) brings its own levels and their const.
         std::string aliased = Compiler()->ResolveTypeAlias(name);
-        int aliasStars = 0;
-        while (aliasStars < (int)aliased.size() && aliased[aliased.size() - 1 - aliasStars] == '*') ++aliasStars;
-        int mask = Compiler()->ResolveTypeAliasConstMask(name);
+        int aliasStars = PeelAliasPointerStars(aliased);
+        int mask = memberSpelled ? memberMask : Compiler()->ResolveTypeAliasConstMask(name);
         if (int substituted = SubstitutedConstDepth(ts, suffix); substituted > 0)
             mask |= (1 << std::min(substituted, 7)) - 1;
         constMask = PointeeConstOfComponent(mask, depth + aliasStars, preserveAliasReferentConst);
-        // A named pointer alias records its resolved shape, as a spelled `(T)*` does: base name, stars, pointer.
-        if (aliasStars > 0 && returnComponent)
+        if (aliasStars > 0)
         {
-            stars += aliasStars;
+            // Matching uses the resolved base and depth; diagnostics keep the alias spelling.
+            if (aliasSpelling != nullptr)
+                *aliasSpelling = (memberSpelled ? ts->getText() : name) + std::string(depth, '*');
+            stars = depth + aliasStars;
             outPointer = true;
-            return aliased.substr(0, aliased.size() - aliasStars);
+            return aliased;
         }
         return name;
     }
@@ -1033,21 +1047,25 @@ void MainListener::RejectFatClosurePointerArg(antlr4::ParserRuleContext* ctx, bo
 std::string MainListener::ClosureArgSpelling(LLVMBackend* compiler, const std::string& encodedName) {
         const auto* sig = compiler->GetEncodedClosureType(encodedName);
         if (sig == nullptr) return encodedName;
-        auto comp = [&](const std::string& n, bool ptr, int depth) {
+        auto comp = [&](const std::string& n, bool ptr, int depth, bool isArrayView, int constMask) {
             LLVMBackend::TypeAndValue tv;
             tv.TypeName = n;
-            tv.Pointer = ptr;
+            tv.Pointer = ptr || isArrayView;
+            tv.IsArrayView = isArrayView;
             tv.PointerDepth = depth;
-            return SpellType(*compiler, tv);
+            tv.ElemPointer = tv.Pointer && depth >= 2;
+            if (constMask >= 0) tv.ConstMask = static_cast<uint8_t>(constMask);
+            return constMask > 0 ? SpellTypeForSymbolDump(*compiler, tv) : SpellType(*compiler, tv);
         };
         std::string s = sig->IsThinFnPtr() ? "function<" : "Lambda<";
-        s += comp(sig->FuncPtrReturnTypeName, sig->FuncPtrReturnPointer, sig->FuncPtrReturnPointerDepth);
+        s += comp(sig->FuncPtrReturnTypeName, sig->FuncPtrReturnPointer,
+                  sig->FuncPtrReturnPointerDepth, false, sig->FuncPtrReturnConstMask);
         s += "(";
         for (size_t i = 0; i < sig->FuncPtrParams.size(); i++)
         {
             if (i != 0) s += ", ";
-            s += comp(sig->FuncPtrParams[i].TypeName, sig->FuncPtrParams[i].Pointer,
-                      sig->FuncPtrParams[i].PointerDepth);
+            const auto& p = sig->FuncPtrParams[i];
+            s += comp(p.TypeName, p.Pointer, p.PointerDepth, p.IsArrayView, p.ConstMask);
         }
         s += ")>";
         return s;
@@ -1093,7 +1111,7 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
         const bool aliasReturn = returnQualifierText == "alias";
         int retConst = 0;
         std::string retName = ResolveSigComponentConstCodegen(fpSpec->typeSpecifier(), retPtr,
-            retStars, retConst, fpSpec->multiWordTypeSuffix(), aliasReturn, true);
+            retStars, retConst, fpSpec->multiWordTypeSuffix(), aliasReturn);
         sig.FuncPtrReturnConstMask = retConst;
         // A signature component over the cap can never be matched: no function may declare a
         // 3-star return or parameter, so the closure type would be unpopulatable.
@@ -1107,32 +1125,42 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
         sig.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
         sig.FuncPtrReturnResolvedKey = SigComponentResolvedKey(retName);
         std::vector<std::pair<std::string, int>> encParams;
+        std::vector<bool> paramArrayViews;
         if (fpSpec->functionPointerParamList() != nullptr)
             for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
             {
-                bool pPtr = param->pointer() != nullptr;
-                int pStars = PointerDepthOf(param->pointer());
+                if (auto suffixError = FunctionTypeArraySuffixError(param); !suffixError.empty())
+                    LogErrorContext(param, suffixError);
+                const bool pIsArrayView = param->arrayTypeSuffix() != nullptr;
+                bool pPtr = param->pointer() != nullptr || pIsArrayView;
+                int pStars = PointerDepthOf(param->pointer()) + (pIsArrayView ? 1 : 0);
                 ValidateConstAfterPointerStar(param->pointer(),
                     SpelledTypeNameBase(param->typeSpecifier(), param->multiWordTypeSuffix()));
                 int pConst = 0;
+                std::string pSpelling;
                 std::string pName = ResolveSigComponentConstCodegen(param->typeSpecifier(), pPtr,
-                                                                    pStars, pConst, param->multiWordTypeSuffix());
-                if (pStars > PointerDepthCap)
+                                                                    pStars, pConst, param->multiWordTypeSuffix(),
+                                                                    false, &pSpelling);
+                const int pDepth = ReconcilePointerDepth(pPtr, pStars);
+                if (pDepth > PointerDepthCap)
                     LogErrorContext(param, PointerDepthCapMessage(
-                        std::format("function type parameter '{}'", pName), pStars));
-                int pDepth = ReconcilePointerDepth(pPtr, pStars);
+                        std::format("function type parameter '{}'", pName), pDepth));
                 encParams.push_back({ pName, pDepth });
+                paramArrayViews.push_back(pIsArrayView);
                 LLVMBackend::TypeAndValue::FuncPtrParam fp;
                 fp.TypeName = pName; fp.Pointer = pPtr; fp.IsMove = param->Move() != nullptr;
+                fp.IsArrayView = pIsArrayView;
                 fp.PointerDepth = pDepth;
                 fp.ResolvedTypeKey = SigComponentResolvedKey(pName);
                 fp.ConstMask = pConst;
+                fp.AliasSpelling = pSpelling;
                 sig.FuncPtrParams.push_back(fp);
             }
         std::vector<int> paramConsts;
         for (const auto& fp : sig.FuncPtrParams) paramConsts.push_back(fp.ConstMask);
         std::string encoded = BuildEncodedClosureName(Compiler(), isThin, retName,
-            sig.FuncPtrReturnPointerDepth, encParams, sig.FuncPtrReturnConstMask, &paramConsts);
+            sig.FuncPtrReturnPointerDepth, encParams, sig.FuncPtrReturnConstMask,
+            &paramConsts, &paramArrayViews);
         Compiler(fpSpec)->RegisterEncodedClosureType(encoded, sig);
         return encoded;
     }
@@ -1146,8 +1174,10 @@ std::string MainListener::EncodePlainFunctionTypeCodegen(
         int retStars = PointerDepthOf(fnSpec->pointer());
         ValidateConstAfterPointerStar(fnSpec->pointer(),
             SpelledTypeNameBase(fnSpec->typeSpecifier(), fnSpec->multiWordTypeSuffix()));
-        sig.FuncPtrReturnTypeName = ResolveSigComponentCodegen(fnSpec->typeSpecifier(), retPtr,
-                                                               fnSpec->multiWordTypeSuffix());
+        int retConst = 0;
+        sig.FuncPtrReturnTypeName = ResolveSigComponentConstCodegen(fnSpec->typeSpecifier(), retPtr,
+            retStars, retConst, fnSpec->multiWordTypeSuffix());
+        sig.FuncPtrReturnConstMask = retConst;
         sig.FuncPtrReturnPointer = retPtr;
         sig.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
         sig.FuncPtrReturnResolvedKey = SigComponentResolvedKey(sig.FuncPtrReturnTypeName);
@@ -1155,13 +1185,19 @@ std::string MainListener::EncodePlainFunctionTypeCodegen(
             for (auto* param : fnSpec->functionPointerParamList()->functionPointerParam())
             {
                 LLVMBackend::TypeAndValue::FuncPtrParam p;
-                bool pPtr = param->pointer() != nullptr;
-                int pStars = PointerDepthOf(param->pointer());
+                if (auto suffixError = FunctionTypeArraySuffixError(param); !suffixError.empty())
+                    LogErrorContext(param, suffixError);
+                const bool pIsArrayView = param->arrayTypeSuffix() != nullptr;
+                bool pPtr = param->pointer() != nullptr || pIsArrayView;
+                int pStars = PointerDepthOf(param->pointer()) + (pIsArrayView ? 1 : 0);
                 ValidateConstAfterPointerStar(param->pointer(),
                     SpelledTypeNameBase(param->typeSpecifier(), param->multiWordTypeSuffix()));
-                p.TypeName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr,
-                                                        param->multiWordTypeSuffix());
+                int pConst = 0;
+                p.TypeName = ResolveSigComponentConstCodegen(param->typeSpecifier(), pPtr,
+                    pStars, pConst, param->multiWordTypeSuffix(), false, &p.AliasSpelling);
+                p.ConstMask = pConst;
                 p.Pointer = pPtr;
+                p.IsArrayView = pIsArrayView;
                 p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
                 p.IsMove = param->Move() != nullptr;
                 p.ResolvedTypeKey = SigComponentResolvedKey(p.TypeName);
@@ -1176,14 +1212,16 @@ std::string MainListener::EncodePlainFunctionTypeCodegen(
 std::string MainListener::EncodeClosureFromSig(LLVMBackend* compiler, const LLVMBackend::TypeAndValue& sig) {
         std::vector<std::pair<std::string, int>> params;
         std::vector<int> paramConsts;
+        std::vector<bool> paramArrayViews;
         for (const auto& p : sig.FuncPtrParams)
         {
             params.push_back({ p.TypeName, ReconcilePointerDepth(p.Pointer, p.PointerDepth) });
             paramConsts.push_back(p.ConstMask);
+            paramArrayViews.push_back(p.IsArrayView);
         }
         std::string encoded = BuildEncodedClosureName(compiler, sig.IsThinFnPtr(), sig.FuncPtrReturnTypeName,
             ReconcilePointerDepth(sig.FuncPtrReturnPointer, sig.FuncPtrReturnPointerDepth), params,
-            sig.FuncPtrReturnConstMask, &paramConsts);
+            sig.FuncPtrReturnConstMask, &paramConsts, &paramArrayViews);
         compiler->RegisterEncodedClosureType(encoded, sig);
         return encoded;
     }
@@ -1371,8 +1409,12 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                     "tuple element; a sized 'T[N]', an unsized multi-dimensional "
                                     "'T[][]' and a pointer-to-array 'T[]*' are not");
                             PrimitiveTypeError argError;
-                            std::string argName = CanonicalTypeSpecifierText(
-                                entry->typeSpecifier(), entry->multiWordTypeSuffix(), false, &argError);
+                            std::string argName;
+                            if (auto* nested = entry->typeSpecifier()->tupleTypeSpecifier())
+                                argName = ParseTupleTypeSpecifier(nested);
+                            else
+                                argName = CanonicalTypeSpecifierText(
+                                    entry->typeSpecifier(), entry->multiWordTypeSuffix(), false, &argError);
                             if (HasPrimitiveTypeError(argError))
                                 LogErrorContext(entry, LocalizePrimitiveTypeError(Compiler(), argError));
                             int argDepth = PointerDepthOf(entry->pointer());
@@ -1461,7 +1503,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         int retConst = 0;
                         declType.FuncPtrReturnTypeName = ResolveSigComponentConstCodegen(
                             fpSpec->typeSpecifier(), retPtr, retStars, retConst,
-                            fpSpec->multiWordTypeSuffix(), aliasReturn, true);
+                            fpSpec->multiWordTypeSuffix(), aliasReturn);
                         declType.FuncPtrReturnConstMask = retConst;
                         declType.FuncPtrReturnOwned = returnQualifierText == "move";
                         declType.FuncPtrReturnAlias = aliasReturn;
@@ -1479,25 +1521,34 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                             for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
                             {
                                 LLVMBackend::TypeAndValue::FuncPtrParam p;
-                                bool pPtr = param->pointer() != nullptr;
-                                int pStars = PointerDepthOf(param->pointer());
+                                if (auto suffixError = FunctionTypeArraySuffixError(param);
+                                    !suffixError.empty())
+                                    LogErrorContext(param, suffixError);
+                                const bool pIsArrayView = param->arrayTypeSuffix() != nullptr;
+                                bool pPtr = param->pointer() != nullptr || pIsArrayView;
+                                int pStars = PointerDepthOf(param->pointer()) + (pIsArrayView ? 1 : 0);
                                 ValidateConstAfterPointerStar(param->pointer(),
                                     SpelledTypeNameBase(param->typeSpecifier(), param->multiWordTypeSuffix()));
                                 int pConst = 0;
                                 p.TypeName = ResolveSigComponentConstCodegen(
-                                    param->typeSpecifier(), pPtr, pStars, pConst, param->multiWordTypeSuffix());
+                                    param->typeSpecifier(), pPtr, pStars, pConst, param->multiWordTypeSuffix(),
+                                        false, &p.AliasSpelling);
                                 p.ConstMask = pConst;
+                                const int pDepth = ReconcilePointerDepth(pPtr, pStars);
                                 LLVMBackend::TypeAndValue pType;
                                 pType.TypeName = p.TypeName;
                                 pType.Pointer = pPtr;
-                                pType.PointerDepth = pStars;
-                                if (pStars > PointerDepthCap)
+                                pType.IsArrayView = pIsArrayView;
+                                pType.PointerDepth = pDepth;
+                                pType.ElemPointer = pDepth >= 2;
+                                if (pDepth > PointerDepthCap)
                                     LogErrorContext(param, PointerDepthCapMessage(
                                         std::format("function type parameter '{}'",
-                                            SpellType(*Compiler(declSpecs), pType)), pStars));
+                                            SpellType(*Compiler(declSpecs), pType)), pDepth));
                                 p.Pointer  = pPtr;
+                                p.IsArrayView = pIsArrayView;
                                 p.IsMove   = param->Move() != nullptr;
-                                p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
+                                p.PointerDepth = pDepth;
                                 CanonicalizeUniqueSigComponent(Compiler(declSpecs), p.TypeName,
                                                                p.Pointer, p.PointerDepth);
                                 p.ResolvedTypeKey = SigComponentResolvedKey(p.TypeName);
@@ -1601,6 +1652,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // may fix, reorder or partially bind the target's parameters.
                     baseName = spelledBase;
                     Compiler(declSpecs)->ResolveGenericAliasSpelling(baseName, typeArgs);
+                    ResolveEnumTypeArguments(typeArgs);
+                    Compiler(declSpecs)->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
                     ResolveEnumTypeArguments(typeArgs);
                     if (typeArgs.empty())
                     {
@@ -1744,8 +1797,9 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 }
                 else
                 {
+                    uint8_t memberMask = 0;  // a member alias brings its owner's const mask
                     auto* memberType = typeSpec->memberTypeSpecifier();
-                    typeName = memberType != nullptr ? ResolveMemberTypeSpecifier(memberType)
+                    typeName = memberType != nullptr ? ResolveMemberTypeSpecifier(memberType, &memberMask)
                                                      : typeSpec->getText();
                     // Resolve namespace-scope C++ using-directives before a lazy foreign-type
                     // request so `using namespace inner; outer.Type` requests the real type.
@@ -1805,6 +1859,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     }
                     // Resolve type aliases (e.g. user-defined aliases)
                     declType.ConstMask |= Compiler(declSpecs)->ResolveTypeAliasConstMask(typeName);
+                    if (memberType != nullptr) declType.ConstMask |= memberMask;
                     typeName = Compiler(declSpecs)->ResolveTypeAlias(typeName);
                     // `Owner.name` naming a member type (`Plain.Id`, `T.value_type` in a body).
                     if (!wasSubstituted && typeSpec->qualifiedGenericIdentifier() != nullptr
@@ -3279,16 +3334,19 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
             if (HasPrimitiveTypeError(canonicalError))
                 LogErrorContext(ctx, LocalizePrimitiveTypeError(compiler, canonicalError));
             if (auto* memberType = typeSpec->memberTypeSpecifier())
-                target = ResolveMemberTypeSpecifier(memberType);
-            else if (auto subst = activeTypeSubstitutions.find(target); subst != activeTypeSubstitutions.end())
+                target = ResolveMemberTypeSpecifier(memberType, &targetConstMask);  // member alias keeps its owner's mask
+            else
             {
-                // A pointee-const argument (T = (const int)*) keeps its const depth through the alias.
-                substConstDepth = activeTypeSubstitutions.ConstDepth(target);
-                target = subst->second;
+                if (auto subst = activeTypeSubstitutions.find(target); subst != activeTypeSubstitutions.end())
+                {
+                    // A pointee-const argument (T = (const int)*) keeps its const depth through the alias.
+                    substConstDepth = activeTypeSubstitutions.ConstDepth(target);
+                    target = subst->second;
+                }
+                targetConstMask = compiler->ResolveTypeAliasConstMask(target);
+                if (substConstDepth > 0)
+                    targetConstMask |= static_cast<uint8_t>((1u << std::min(substConstDepth, 7)) - 1u);
             }
-            targetConstMask = compiler->ResolveTypeAliasConstMask(target);
-            if (substConstDepth > 0)
-                targetConstMask |= static_cast<uint8_t>((1u << std::min(substConstDepth, 7)) - 1u);
         }
         // A pointer alias (using Handle = void*) stores its trailing stars in the alias string;
         // the stars are peeled back onto the pointer flags at the resolution site (GetType /
@@ -3370,6 +3428,7 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
                 typeArgs.push_back(ResolveTypeArgEntry(entry));
             ResolveEnumTypeArguments(typeArgs);
             compiler->ResolveGenericAliasSpelling(baseName, typeArgs);
+            compiler->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
             std::string mangledName = MangledGenericName(baseName, typeArgs);
 
             if (genericStructTemplates.count(baseName) != 0
@@ -3608,7 +3667,8 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                 }
                 catch (const ExpectedErrorReceived&)
                 {
-                    errorReceived = true;
+                    size_t caughtExpectScope = compilerLLVM->activeExpectScope_;
+                    errorReceived = caughtExpectScope == expectScope;
                     RestoreExpectErrorRecoveryState(recoveryMark, nullptr);
                     // ForwardRefScanner may have queued generic work for this failed declaration
                     // before the scoped expectation ran. Let later source uses queue it again.
@@ -3671,7 +3731,7 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                     compilerLLVM->AbortFunctionBlocks(0);
                     compilerLLVM->DiscardOwnedTempsSince(ownedTempMark);
                     compilerLLVM->ClearCurrentSubprogram();
-                    compilerLLVM->RestoreExpectScope(expectScope);
+                    compilerLLVM->RestoreExpectScope(caughtExpectScope);
                     // The throw unwound past the `global_scope = true` restore in the
                     // function branch; recovery resumes at file scope, so re-assert it.
                     global_scope = true;
@@ -4338,7 +4398,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                 == ValueStructReturnKind::AllBorrowedParam;
         }
 
-        bool returnsOwned = ComputeReturnsOwned(returnType, name, allParams);
+        bool returnsOwned = ComputeReturnsOwned(returnType, func, allParams);
 
         // Pre-scan parameter types, return type, and function body to queue and emit any
         // generic struct instantiations before the function's IR block is opened.
@@ -5037,6 +5097,8 @@ MainListener::StaticLocalGuardScope::~StaticLocalGuardScope() {
 std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseForDeclaration(CFlatParser::ForDeclarationContext* ctx) {
         auto declSpec = ctx->declarationSpecifiers();
         auto initDecl = ctx->initDeclaratorList();
+        if (initDecl == nullptr)
+            LogErrorContext(ctx, "for-init declaration must declare a variable");
         return ParseDeclaration(declSpec, initDecl);
     }
 
@@ -7639,9 +7701,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 bool hasBraceInitializer = braceInitializerList != nullptr
                     || (braceInitializer != nullptr && braceInitializer->LeftBrace() != nullptr)
                     || initDecl->LeftBrace() != nullptr;
-                if (compiler->IsCoreUniqueType(typeAndValue.TypeName)
+                if (!typeAndValue.Pointer && !typeAndValue.ElemPointer
+                    && compiler->IsCoreUniqueType(typeAndValue.TypeName)
                     && (hasBraceInitializer || direct->assignmentExpression() != nullptr))
                 {
+                    typeAndValue.IsCoreUniqueOwner = true;
                     typeAndValue.TypeName = MangledGenericArgument(
                         *compiler, typeAndValue.TypeName);
                     typeAndValue.Pointer = true;
@@ -10773,42 +10837,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             srcTempProbe.Primary = srcPrimary;
                             srcTempProbe.Storage = srcStorage;
                             srcIsOwnedTemp = compiler->IsOwnedTempValue(srcTempProbe);
-                            auto* initPostfix = tryGetPostfixExpression(initializer->assignmentExpression());
-                            bool directSubscript = initPostfix != nullptr
-                                && initPostfix->LeftBracket().size() == 1
-                                && initPostfix->expression().size() == 1
-                                && initPostfix->LeftParen().empty()
-                                && initPostfix->Dot().empty() && initPostfix->Arrow().empty()
-                                && initPostfix->QuestionDot().empty()
-                                && initPostfix->primaryExpression() != nullptr
-                                && (initPostfix->primaryExpression()->Identifier() != nullptr
-                                    || initPostfix->primaryExpression()->genericIdentifier() != nullptr)
-                                && !initPostfix->RightBracket().empty()
-                                && initPostfix->children.back() == initPostfix->RightBracket().back();
-                            llvm::Value* subscriptBase = nullptr;
-                            if (srcInitGep != nullptr && srcInitGep->getNumIndices() == 1)
-                                subscriptBase = srcInitGep->getPointerOperand();
-                            else if (srcInitGep == nullptr)
-                                if (auto* sourceLoad = llvm::dyn_cast<llvm::LoadInst>(right))
-                                    subscriptBase = sourceLoad->getPointerOperand();
-                            auto* pointerLoad = llvm::dyn_cast_or_null<llvm::LoadInst>(subscriptBase);
-                            llvm::Value* pointerSlot = pointerLoad != nullptr
-                                ? pointerLoad->getPointerOperand() : subscriptBase;
-                            const auto* pointerBinding = directSubscript
-                                ? compiler->FindVariableByStorage(pointerSlot) : nullptr;
-                            bool isNamedPointerSlot = pointerSlot != nullptr
-                                && (llvm::isa<llvm::AllocaInst>(pointerSlot)
-                                    || llvm::isa<llvm::Argument>(pointerSlot)
-                                    || llvm::isa<llvm::GlobalVariable>(pointerSlot));
-                            srcIsPointerVariableSubscript = directSubscript
-                                && (srcInitGep == nullptr || srcInitGep->getNumIndices() == 1)
-                                && isNamedPointerSlot && pointerBinding != nullptr
-                                && pointerBinding->TypeAndValue.Pointer
-                                && !pointerBinding->TypeAndValue.IsArrayView
-                                && !pointerBinding->IsElementAccess
-                                && pointerBinding->FieldName.empty()
-                                && pointerBinding->OwningStructName.empty()
-                                && !pointerBinding->AllocatedByRawNewArray;
+                            srcIsPointerVariableSubscript = IsDeclaredPointerSubscriptString(
+                                initializer->assignmentExpression(), right, srcStorage);
                         }
                         bool srcIsNamedSlot = srcStorage != nullptr
                             && (llvm::isa<llvm::AllocaInst>(srcStorage)
@@ -11384,9 +11414,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && !srcMovableTempField && !didDeepCopyBorrowString)
                             compiler->SetVariableBorrowsOwnedString(name, true);
 
-                        // Propagate ownership: if the RHS was a heap-allocating string call,
-                        // mark this local as owning so the destructor frees the buffer on scope exit.
-                        if (typeAndValue.TypeName == "string" && compiler->lastCallReturnsOwned)
+                        // Adopt a heap-allocating call or tracked operator result into this local.
+                        if (typeAndValue.TypeName == "string"
+                            && (compiler->lastCallReturnsOwned
+                                || compiler->IsPendingOwnedStringTemp(right)))
                         {
                             auto& nv = compiler->GetOrCreateStackVariable(name);
                             nv.IsOwningString = true;
@@ -11469,7 +11500,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                          * own release paths and keep the channel's plain reading.
                          */
                         auto* initAssignExprOwn = initializer ? initializer->assignmentExpression() : nullptr;
-                        bool initResultOwns = compiler->lastOwningResult
+                        bool initResultOwns = (compiler->lastOwningResult
                             && (!typeAndValue.Pointer
                                 || (initAssignExprOwn != nullptr
                                     && (AsDirectNew(initAssignExprOwn) != nullptr
@@ -11477,7 +11508,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         || compiler->IsOwnedNewTemp(srcPrimary)
                                         || compiler->RawArrayResultOwns(srcPrimary)
                                         || compiler->IsOwningPtrTempValue(srcPrimary)
-                                || compiler->IsMovedOutPtrValue(srcPrimary));
+                                || compiler->IsMovedOutPtrValue(srcPrimary)))
+                            || (typeAndValue.IsArrayView
+                                && compiler->RawArrayResultMayOwn(srcPrimary));
                         /*
                          * `move` of a BORROWED pointer transfers nothing - the real owner still frees
                          * the pointee, so a destination that ADOPTS here frees it twice. A `unique`
@@ -11530,6 +11563,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             compiler->lastOwningResult = false;
                             compiler->lastAllocAlignment = 0;
                         }
+                        if (typeAndValue.IsArrayView)
+                            if (const auto* raw = compiler->FindRawArrayResult(srcPrimary);
+                                raw != nullptr && raw->RuntimeOwns != nullptr
+                                && compiler->RawArrayResultMayOwn(srcPrimary))
+                                compiler->SetVariableOwnFlagValue(
+                                    name, true, raw->RuntimeOwns, !raw->Owns);
                         // Borrow provenance for the DECLARATION door: `T* p = &x;` binds an
                         // address-of result, which never owns. Carried on the binding so a later
                         // '?:' arm can be PROVEN a borrow instead of merely unproven.
@@ -13950,10 +13989,10 @@ LLVMBackend::NamedVariable MainListener::FinishAssignmentExpressionNamed(
             compilerLLVM->RegisterTempFieldValue(nv.Primary);
         if (const auto* raw = compilerLLVM->FindRawArrayResult(nv.Primary))
         {
-            nv.AllocatedByRawNewArray = true;
+            nv.AllocatedByRawNewArray = !raw->IsArrayView;
             nv.RawArrayLength = raw->Count;
             nv.AllocAlignment = raw->AllocAlign;
-            nv.IsOwning = raw->Owns;
+            nv.IsOwning = compilerLLVM->RawArrayResultMayOwn(nv.Primary);
         }
         if (compilerLLVM->lastCallReturnsAllocAlign > 0)
             nv.AllocAlignment = compilerLLVM->lastCallReturnsAllocAlign;
@@ -14157,15 +14196,20 @@ bool MainListener::EnsureAggregateAliases(const std::string& owner) {
         return collected;
 }
 
-std::string MainListener::ResolveMemberTypeSpecifier(CFlatParser::MemberTypeSpecifierContext* ctx) {
+std::string MainListener::ResolveMemberTypeSpecifier(CFlatParser::MemberTypeSpecifierContext* ctx,
+        uint8_t* constMask) {
         auto* ownerCtx = ctx->memberTypeOwner();
         const std::string ownerText = ownerCtx->getText();
         std::vector<std::pair<std::string, antlr4::ParserRuleContext*>> members;
         for (auto* member : ctx->memberNameToken())
             members.emplace_back(member->getText(), member);
+        std::string lastOwner;
         std::string resolved = ResolveMemberTypeChain(ownerText.substr(0, ownerText.find('<')),
                                                       ownerCtx->genericTypeParameters(), ownerText,
-                                                      members, ownerCtx, /*report*/ memberTypeSilentDepth_ == 0);
+                                                      members, ownerCtx, /*report*/ memberTypeSilentDepth_ == 0,
+                                                      &lastOwner);
+        if (constMask != nullptr && !members.empty() && !resolved.empty())
+            *constMask = Compiler(ctx)->ResolveTypeAliasConstMask(lastOwner + "." + members.back().first);
         return resolved.empty() ? "int" : resolved;   // recover as a scalar so the error does not cascade
 }
 
@@ -14183,12 +14227,13 @@ bool MainListener::MemberTypeSpecifierNamesType(CFlatParser::MemberTypeSpecifier
 std::string MainListener::ResolveMemberTypeChain(
     std::string base, CFlatParser::GenericTypeParametersContext* ownerArgs, const std::string& ownerText,
     const std::vector<std::pair<std::string, antlr4::ParserRuleContext*>>& members,
-    antlr4::ParserRuleContext* site, bool report) {
+    antlr4::ParserRuleContext* site, bool report, std::string* lastOwner) {
         auto* compiler = Compiler(site);
         std::vector<std::string> args;
         for (auto* entry : ownerArgs->typeParameterList()->typeParameterEntry())
             args.push_back(ResolveTypeArgEntry(entry));
         compiler->ResolveGenericAliasSpelling(base, args);
+        compiler->CompleteCxxTemplateTypeArgs(base, args);
         std::string owner = MangledGenericName(base, args);
         {
             std::string cxxError;
@@ -14201,6 +14246,7 @@ std::string MainListener::ResolveMemberTypeChain(
         std::string display = ownerText;
         for (const auto& [name, memberSite] : members)
         {
+            if (lastOwner != nullptr) *lastOwner = owner;
             LLVMBackend::MemberTypeResult result;
             std::string next = compiler->ResolveMemberType(owner, name, result);
             if (next.empty())

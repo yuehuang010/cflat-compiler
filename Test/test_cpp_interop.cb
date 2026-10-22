@@ -2560,8 +2560,82 @@ int c05bCpPick(function<alias int*()> f) { return 22; }
 int c05bCpPickL(Lambda<alias C05bCP()> f) { return 11; }
 int c05bCpPickL(Lambda<alias int*()> f) { return 22; }
 
+// T350: named pointer aliases must keep their base, depth and pointee const in every signature component.
+using T350CP = (const int)*;
+using T350CPChain = T350CP;
+namespace t350_ns { using CP = (const int)*; }
+using T350ShadowMutCP = int*;
+namespace t350_shadow { using CP = (const int)*; }
+int t350CallbackValue = 7;
+int t350ConstParam(T350CP p) { return p == nullptr ? 0 : 1; }
+int t350MutParam(int* p) { return p == nullptr ? 0 : 2; }
+int t350ParamPickPlain(function<int(T350CP)> f) { return 11; }
+int t350ParamPickPlain(function<int(int*)> f) { return 22; }
+int t350ParamPickNs(function<int(t350_ns.CP)> f) { return 11; }
+int t350ParamPickNs(function<int(int*)> f) { return 22; }
+int t350ParamPickChain(function<int(T350CPChain)> f) { return 11; }
+int t350ParamPickChain(function<int(int*)> f) { return 22; }
+int t350ParamPickShadow(function<int(t350_shadow.CP)> f) { return 11; }
+int t350ParamPickShadow(function<int(T350ShadowMutCP)> f) { return 22; }
+int t350ParamPickPlainL(Lambda<int(T350CP)> f) { return 11; }
+int t350ParamPickPlainL(Lambda<int(int*)> f) { return 22; }
+int t350ParamPickNsL(Lambda<int(t350_ns.CP)> f) { return 11; }
+int t350ParamPickNsL(Lambda<int(int*)> f) { return 22; }
+int t350ParamPickChainL(Lambda<int(T350CPChain)> f) { return 11; }
+int t350ParamPickChainL(Lambda<int(int*)> f) { return 22; }
+int t350ParamPickShadowL(Lambda<int(t350_shadow.CP)> f) { return 11; }
+int t350ParamPickShadowL(Lambda<int(T350ShadowMutCP)> f) { return 22; }
+alias T350CP t350ConstRet() { return &t350CallbackValue; }
+alias int* t350MutRet() { return &t350CallbackValue; }
+alias t350_ns.CP t350NsConstRet() { return &t350CallbackValue; }
+alias T350CPChain t350ChainConstRet() { return &t350CallbackValue; }
+alias t350_shadow.CP t350ShadowConstRet() { return &t350CallbackValue; }
+int t350ReturnPick(function<alias T350CP()> f) { return 11; }
+int t350ReturnPick(function<alias int*()> f) { return 22; }
+int t350ReturnPickL(Lambda<alias T350CP()> f) { return 11; }
+int t350ReturnPickL(Lambda<alias int*()> f) { return 22; }
+int t350GenericReturnPick<T>(function<alias T()> f) { return t350ReturnPick(f); }
+int t350GenericReturnPickL<T>(Lambda<alias T()> f) { return t350ReturnPickL(f); }
+struct T350CallbackBox<T>
+{
+    int returnPick(function<alias T()> f) { return 11; }
+    int returnPick(function<alias int*()> f) { return 22; }
+};
+struct T350LambdaCallbackBox<T>
+{
+    int returnPick(Lambda<alias T()> f) { return 11; }
+    int returnPick(Lambda<alias int*()> f) { return 22; }
+};
+struct T350MOwner<T> { using CP = (const int)*; };
+struct T350MOwner2<T> { using CP = (const int)**; };
+int t350mC(T350MOwner<int>.CP p) { return 3; }
+int t350mM(int* p) { return 4; }
+int t350mPick(function<int(T350MOwner<int>.CP)> f) { return 11; }
+int t350mPick(function<int(int*)> f) { return 22; }
+int t350mC2(T350MOwner2<int>.CP p) { return 3; }
+int t350mM2(int** p) { return 4; }
+int t350mPick2(function<int(T350MOwner2<int>.CP)> f) { return 11; }
+int t350mPick2(function<int(int**)> f) { return 22; }
+using T350MQ = T350MOwner<int>.CP;
+struct T350MOwner3<T> { using Q = T350MOwner<T>.CP; };
+int t350mC3(T350MQ p) { return 3; }
+int t350mPick3(function<int(T350MQ)> f) { return 11; }
+int t350mPick3(function<int(int*)> f) { return 22; }
+int t350mC4(T350MOwner3<int>.Q p) { return 3; }
+int t350mPick4(function<int(T350MOwner3<int>.Q)> f) { return 11; }
+int t350mPick4(function<int(int*)> f) { return 22; }
+int t350mTakeP(function<int(T350MOwner<int>.CP*)> f) { return 0; }
+
+int t365CppUniqueSlotCall()
+{
+    unique<int> owner = unique<int>(new int(19));
+    int result = t24arg.take_int_pointer_pointer(&owner);
+    return result * 10 + (owner != nullptr && *owner == 19 ? 1 : 0);
+}
+
 extern int main()
 {
+    if (t365CppUniqueSlotCall() != 191) return 36501;
     // T217: mutable fields stay writable through const C++ storage, including constexpr globals.
     t217_constexpr.m = 7;
     if (t217_constexpr.m != 7 || t217_constexpr.n != 2) return 4219;
@@ -16145,6 +16219,73 @@ extern int main()
         function<alias (const int)*()> c05bCpFn = c05bCpGet;
         Lambda<alias (const int)*()> c05bCpLambda = c05bCpGet;
         if (c05bCpPick(c05bCpFn) != 11 || c05bCpPickL(c05bCpLambda) != 11)       return 99138;
+
+        // T350: callback parameter aliases keep the same overload identity in both closure forms.
+        function<int(T350CP)> t350ParamPlainF = t350ConstParam;
+        function<int(int*)> t350ParamMutF = t350MutParam;
+        function<int(t350_ns.CP)> t350ParamNsF = t350ConstParam;
+        function<int(T350CPChain)> t350ParamChainF = t350ConstParam;
+        function<int(t350_shadow.CP)> t350ParamShadowF = t350ConstParam;
+        function<int(T350ShadowMutCP)> t350ParamShadowMutF = t350MutParam;
+        Lambda<int(T350CP)> t350ParamPlainL = t350ConstParam;
+        Lambda<int(int*)> t350ParamMutL = t350MutParam;
+        Lambda<int(t350_ns.CP)> t350ParamNsL = t350ConstParam;
+        Lambda<int(T350CPChain)> t350ParamChainL = t350ConstParam;
+        Lambda<int(t350_shadow.CP)> t350ParamShadowL = t350ConstParam;
+        Lambda<int(T350ShadowMutCP)> t350ParamShadowMutL = t350MutParam;
+        if (t350ParamPickPlain(t350ParamPlainF) != 11 || t350ParamPickPlain(t350ParamMutF) != 22
+            || t350ParamPickPlainL(t350ParamPlainL) != 11 || t350ParamPickPlainL(t350ParamMutL) != 22)
+            return 99139;
+        if (t350ParamPickNs(t350ParamNsF) != 11 || t350ParamPickNs(t350ParamMutF) != 22
+            || t350ParamPickNsL(t350ParamNsL) != 11 || t350ParamPickNsL(t350ParamMutL) != 22)
+            return 99140;
+        if (t350ParamPickChain(t350ParamChainF) != 11 || t350ParamPickChain(t350ParamMutF) != 22
+            || t350ParamPickChainL(t350ParamChainL) != 11 || t350ParamPickChainL(t350ParamMutL) != 22)
+            return 99141;
+        if (t350ParamPickShadow(t350ParamShadowF) != 11 || t350ParamPickShadow(t350ParamShadowMutF) != 22
+            || t350ParamPickShadowL(t350ParamShadowL) != 11 || t350ParamPickShadowL(t350ParamShadowMutL) != 22)
+            return 99142;
+
+        // Return aliases and T=CP retain the mutable callback overload for both thin and fat closures.
+        function<alias T350CP()> t350ReturnPlainF = t350ConstRet;
+        function<alias int*()> t350ReturnMutF = t350MutRet;
+        Lambda<alias T350CP()> t350ReturnPlainL = t350ConstRet;
+        Lambda<alias int*()> t350ReturnMutL = t350MutRet;
+        if (t350ReturnPick(t350ReturnPlainF) != 11 || t350ReturnPick(t350ReturnMutF) != 22
+            || t350ReturnPickL(t350ReturnPlainL) != 11 || t350ReturnPickL(t350ReturnMutL) != 22)
+            return 99143;
+        if (t350GenericReturnPick<T350CP>(t350ReturnPlainF) != 11
+            || t350GenericReturnPick<int*>(t350ReturnMutF) != 22
+            || t350GenericReturnPickL<T350CP>(t350ReturnPlainL) != 11
+            || t350GenericReturnPickL<int*>(t350ReturnMutL) != 22)
+            return 99144;
+        T350CallbackBox<T350CP> t350Box = default;
+        if (t350Box.returnPick(t350ReturnPlainF) != 11 || t350Box.returnPick(t350ReturnMutF) != 22)
+            return 99145;
+        T350LambdaCallbackBox<T350CP> t350LambdaBox = default;
+        if (t350LambdaBox.returnPick(t350ReturnPlainL) != 11 || t350LambdaBox.returnPick(t350ReturnMutL) != 22)
+            return 99145;
+        function<int(T350MOwner<int>.CP)> t350mFc = t350mC;
+        function<int(int*)> t350mFm = t350mM;
+        if (t350mFc(nullptr) != 3 || t350mFm(nullptr) != 4)
+            return 99146;
+        if (t350mPick(t350mFc) != 11 || t350mPick(t350mFm) != 22)
+            return 99147;
+        function<int(T350MOwner2<int>.CP)> t350mFc2 = t350mC2;
+        function<int(int**)> t350mFm2 = t350mM2;
+        if (t350mFc2(nullptr) != 3 || t350mFm2(nullptr) != 4 || t350mPick2(t350mFc2) != 11 || t350mPick2(t350mFm2) != 22)
+            return 99148;
+        function<int(T350MQ)> t350mFc3 = t350mC3;
+        function<int(int*)> t350mFm3 = t350mM;
+        if (t350mFc3(nullptr) != 3 || t350mFm3(nullptr) != 4 || t350mPick3(t350mFc3) != 11 || t350mPick3(t350mFm3) != 22)
+            return 99149;
+        function<int(T350MOwner3<int>.Q)> t350mFc4 = t350mC4;
+        if (t350mFc4(nullptr) != 3 || t350mPick4(t350mFc4) != 11 || t350mPick4(t350mFm3) != 22)
+            return 99150;
+        expect_error("'function<int(T350MOwner<int>.CP*)>'") {
+            function<int(int**)> t350mFmD = t350mM2;
+            t350mTakeP(t350mFmD);
+        }
     }
     return 0;
 }

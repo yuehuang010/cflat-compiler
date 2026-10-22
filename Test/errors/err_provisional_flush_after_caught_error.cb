@@ -56,3 +56,24 @@ int t354BareOuterScopedInner()
     int t354Outer = t354BareOuterMissing;
     return 0;
 }
+
+// T372: an inner bare expectation and the file-scope outer expectation can both match.
+expect_error("Undefined variable t372Outer") {
+    int t372InnerFunction() {
+        expect_error("Undefined variable t372Inner");
+        int t372InnerValue = t372Inner;
+        return 0;
+    }
+    int t372OuterFunction() { return t372Outer; }
+}
+
+// T372: each level in a three-deep scoped stack owns its own diagnostic.
+expect_error("Undefined variable t372A") {
+    expect_error("Undefined variable t372B") {
+        expect_error("Undefined variable t372C") {
+            int t372CFunction() { return t372C; }
+        }
+        int t372BFunction() { return t372B; }
+    }
+    int t372AFunction() { return t372A; }
+}

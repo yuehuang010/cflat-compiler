@@ -1,0 +1,45 @@
+// A view joined from a `?:` with a borrowed arm, then re-owned on only some paths, must not be
+// returned as owned: the re-own may be skipped by a case-group entry or a break/continue.
+
+struct Cell { int id = 0; };
+
+// The re-own sits in a case group that a later label or fallthrough can skip the join for.
+expect_error("function declares 'move' return type but returned expression is not owned") {
+    move Cell[] switchCaseReown(int c, int d, int e)
+    {
+        Cell[] w = new Cell[4];
+        Cell[] v = c ? new Cell[3] : w;
+        int k = 0;
+        switch (e) { case 1: k += 0; v = new Cell[5]; break; default: break; }
+        Cell[] a = new Cell[2];
+        return d ? move v : move a;
+    }
+}
+
+// A break between the join and the re-own skips the re-own on some iterations.
+expect_error("function declares 'move' return type but returned expression is not owned") {
+    move Cell[] loopBreakReown(int c, int d, int e)
+    {
+        Cell[] w = new Cell[4];
+        Cell[] v = new Cell[1];
+        int i = 0;
+        while (i < 1) { i++; v = c ? new Cell[3] : w; if (e) break; v = new Cell[5]; }
+        Cell[] a = new Cell[2];
+        return d ? move v : move a;
+    }
+}
+
+// Same with continue.
+expect_error("function declares 'move' return type but returned expression is not owned") {
+    move Cell[] loopContinueReown(int c, int d, int e)
+    {
+        Cell[] w = new Cell[4];
+        Cell[] v = new Cell[1];
+        int i = 0;
+        while (i < 1) { i++; v = c ? new Cell[3] : w; if (e) continue; v = new Cell[5]; }
+        Cell[] a = new Cell[2];
+        return d ? move v : move a;
+    }
+}
+
+extern int main() { return 0; }

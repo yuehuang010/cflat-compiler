@@ -6073,6 +6073,90 @@ bool testT283AliasDeclCopy()
 }
 
 
+int t370SumView(int[] values)
+{
+    if (values == nullptr) return 7;
+    return values[0] + values[1];
+}
+
+int t370ReadConstView((const int)[] values) { return values[0]; }
+int t370R2FirstPointerView(int*[] values) { return values[0][0]; }
+T t370FirstView<T>(T[] values) { return values[0]; }
+T t370CallFirstView<T>(T[] values)
+{
+    function<T(T[])> first = t370FirstView<T>;
+    return first(values);
+}
+
+int t370InvokeLambdaView(Lambda<int(int[])> fn, int[] values) { return fn(values); }
+
+struct T370ViewFnField { function<int(int[])> fn = default; };
+struct T370FunctionTypeTag<T> { int value = 42; };
+
+bool testT370FunctionViewCalls()
+{
+    int[2] fixed;
+    fixed[0] = 3;
+    fixed[1] = 4;
+    int[] listView = { 5, 6 };
+    function<int(int[])> fn = t370SumView;
+    bool result = true;
+    result &= Test("t370 view function fixed array", fn(fixed), 7);
+    result &= Test("t370 view function brace-list view", fn(listView), 11);
+    result &= Test("t370 view function nullptr", fn(nullptr), 7);
+    return result;
+}
+
+bool testT370OrdinaryViewAcceptSet()
+{
+    int[2] fixed;
+    fixed[0] = 3;
+    fixed[1] = 4;
+    int[] listView = { 5, 6 };
+    bool result = true;
+    result &= Test("t370 ordinary view fixed array", t370SumView(fixed), 7);
+    result &= Test("t370 ordinary view brace-list view", t370SumView(listView), 11);
+    result &= Test("t370 ordinary view nullptr", t370SumView(nullptr), 7);
+    return result;
+}
+
+bool testT370LambdaViewSignature()
+{
+    int[2] fixed;
+    fixed[0] = 8;
+    fixed[1] = 9;
+    Lambda<int(int[])> closure = t370SumView;
+    function<int(int[])> fn = closure.toFunction();
+    return Test("t370 Lambda view parameter", t370InvokeLambdaView(closure, fixed), 17)
+        && Test("t370 Lambda to thin view function", fn(fixed), 17);
+}
+
+bool testT370ConstAndAggregateViews()
+{
+    int[2] fixed;
+    fixed[0] = 13;
+    fixed[1] = 14;
+    function<int((const int)[])> reader = t370ReadConstView;
+    T370ViewFnField field = default;
+    field.fn = t370SumView;
+    T370FunctionTypeTag<int(int[])> rawType = default;
+    return Test("t370 const element view", reader(fixed), 13)
+        && Test("t370 function view struct field", field.fn(fixed), 27)
+        && Test("t370 raw function type argument", rawType.value, 42)
+        && Test("t370 generic function<T(T[])>", t370CallFirstView<int>(fixed), 13);
+}
+
+bool testT370R2AcceptSet()
+{
+    int value = 9;
+    int*[1] pointers;
+    pointers[0] = &value;
+    function<int(int*[])> pointerView = t370R2FirstPointerView;
+    T370FunctionTypeTag<int(int***)> deepPointerType = default;
+    return Test("t370 r2 pointer-element view", pointerView(pointers), 9)
+        && Test("t370 r2 triple-pointer function-type arg", deepPointerType.value, 42);
+}
+
 extern int main(int argc, char** argv)
 {
     // The tooling regression harness passes one argument and calls this twice. The second call
@@ -6089,6 +6173,11 @@ extern int main(int argc, char** argv)
 
     // Function pointer tests
     total++; passed += Test("global address picks int pointer", i1_pick_pointer(&i1_global), 11) ? 1 : 0;
+    total++; passed += testT370OrdinaryViewAcceptSet() ? 1 : 0;
+    total++; passed += testT370FunctionViewCalls() ? 1 : 0;
+    total++; passed += testT370LambdaViewSignature() ? 1 : 0;
+    total++; passed += testT370ConstAndAggregateViews() ? 1 : 0;
+    total++; passed += testT370R2AcceptSet() ? 1 : 0;
     total++; passed += testExplicitFunctionPointer()   ? 1 : 0;
     total++; passed += testBareFunctionPointer()       ? 1 : 0;
     total++; passed += testFunctionPointerAsArgument() ? 1 : 0;

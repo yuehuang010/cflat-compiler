@@ -399,7 +399,7 @@ functionPointerParamList
     ;
 
 functionPointerParam
-    : Move? typeSpecifier multiWordTypeSuffix? pointer?
+    : Move? typeSpecifier multiWordTypeSuffix? pointer? arrayTypeSuffix?
     ;
 
 lambdaExpression
@@ -722,11 +722,11 @@ iterationStatement
 //    |   For '(' declaration  expression? ';' expression? ')' statement
 
 forCondition
-    : (forDeclaration | expression?) ';' assignmentExpression ';' forExpression?
+    : (expressionStatement | forDeclaration) assignmentExpression ';' forExpression?
     ;
 
 forDeclaration
-    : declarationSpecifiers initDeclaratorList?
+    : declarationSpecifiers initDeclaratorList? ';'
     ;
 
 forExpression

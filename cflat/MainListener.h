@@ -611,6 +611,13 @@ static bool IsBadArrayArg(Ctx* c)
     if (DimSpecIsUnsizedMultiDim(dims)) return true;
     return dims != nullptr && !dims->assignmentExpression().empty();
 }
+template <class Ctx>
+static std::string FunctionTypeArraySuffixError(Ctx* c)
+{
+    if (c == nullptr || c->arrayTypeSuffix() == nullptr || !IsBadArrayArg(c)) return {};
+    return "'T[]' is the only bracketed form valid as a function-type parameter; a sized 'T[N]', "
+        "an unsized multi-dimensional 'T[][]' and a pointer-to-array 'T[]*' are not";
+}
 // Number of '*' written on a pointer() context. The grammar is ('*' typeQualifierList?)+, so the
 // depth is Star().size(); the funcptr signature sites used to collapse it to a bool.
 static int PointerDepthOf(CFlatParser::PointerContext* p)
@@ -681,6 +688,14 @@ static int PeelAliasPointerStars(std::string& name)
     return depth;
 }
 
+// Function signatures store pointer shape separately from the base type name.
+static std::string SignatureComponentAliasBase(const LLVMBackend* compiler, std::string name)
+{
+    if (compiler != nullptr) name = compiler->ResolveTypeAlias(name);
+    PeelAliasPointerStars(name);
+    return name;
+}
+
 // Fold a POINTER alias (`using IP = int*;`) into a type-ARGUMENT spelling: rebinds `name` to the
 // alias target's bare base and adds the target's stars to `stars` (the ELEMENT depth for a view).
 // One rule for every type-argument encoder, so `V<IP[]>` and `V<int*[]>` are one instantiation.
@@ -705,11 +720,31 @@ static std::string TupleEntryArgName(const LLVMBackend* compiler,
                                      PrimitiveTypeError* errorOut = nullptr)
 {
     PrimitiveTypeError error;
-    std::string writtenName = CanonicalTypeSpecifierText(
-        entry->typeSpecifier(), entry->multiWordTypeSuffix(), false, &error);
+    std::string writtenName;
+    auto* typeSpec = entry->typeSpecifier();
+    auto* nestedTuple = typeSpec != nullptr ? typeSpec->tupleTypeSpecifier() : nullptr;
+    if (compiler != nullptr && nestedTuple != nullptr
+        && nestedTuple->tupleTypePackEntry() == nullptr)
+    {
+        std::vector<std::string> nestedArgs;
+        for (auto* nestedEntry : nestedTuple->tupleTypeEntry())
+        {
+            PrimitiveTypeError nestedError;
+            nestedArgs.push_back(TupleEntryArgName(compiler, nestedEntry, &nestedError));
+            if (!HasPrimitiveTypeError(error) && HasPrimitiveTypeError(nestedError))
+                error = nestedError;
+        }
+        writtenName = MangleGenericInstance(*compiler, "tuple", nestedArgs);
+    }
+    else
+        writtenName = CanonicalTypeSpecifierText(
+            typeSpec, entry->multiWordTypeSuffix(), false, &error);
     if (errorOut != nullptr) *errorOut = error;
     std::string argName = compiler != nullptr
         ? compiler->ResolveTypeArgBaseName(writtenName) : writtenName;
+    if (compiler != nullptr)
+        if (std::string enumName = compiler->ResolveEnumTypeName(argName); !enumName.empty())
+            argName = std::move(enumName);
     // Stars are counted, not flagged: a `(C**, int)` element must not mangle as `(C*, int)`.
     // On a view they decorate the ELEMENT, so `(int*[], int)` keeps its star: "int*[]".
     int stars = PointerDepthOf(entry->pointer());
@@ -2081,6 +2116,7 @@ static bool ResolveCanonicalTypeSpecifier(
                     arg = std::move(enumKey);
             compiler->ResolveGenericAliasSpelling(
                 out.GenericBase, out.GenericArgs, reportGenericAlias);
+            compiler->CompleteCxxTemplateTypeArgs(out.GenericBase, out.GenericArgs);
             out.TypeName = MangleGenericInstance(*compiler, out.GenericBase, out.GenericArgs);
         }
         else if (auto* memberType = typeSpec->memberTypeSpecifier())
@@ -2238,21 +2274,48 @@ static std::unordered_set<std::string> CollectFunctionLocalEnumNames(
 
 static bool TypeArgumentNamesFunctionLocalEnum(
     CFlatParser::TypeParameterEntryContext* entry,
+    const std::unordered_set<std::string>& localEnumNames);
+
+static std::string SimpleTypeSpecifierName(CFlatParser::TypeSpecifierContext* typeSpec)
+{
+    if (typeSpec == nullptr) return {};
+    auto* generic = typeSpec->genericIdentifier();
+    if (generic == nullptr || generic->genericTypeParameters() != nullptr
+        || generic->Identifier() == nullptr)
+        return {};
+    return generic->Identifier()->getText();
+}
+
+static bool TypeSpecifierNamesFunctionLocalEnum(
+    CFlatParser::TypeSpecifierContext* typeSpec,
     const std::unordered_set<std::string>& localEnumNames)
 {
-    if (entry == nullptr || entry->typeSpecifier() == nullptr) return false;
-    auto* typeSpec = entry->typeSpecifier();
+    if (typeSpec == nullptr) return false;
+    if (auto* typeName = typeSpec->typeName())
+        if (auto* spec = typeName->specifierQualifierList())
+            for (auto* nested : spec->typeSpecifier())
+                if (TypeSpecifierNamesFunctionLocalEnum(nested, localEnumNames)) return true;
+    if (auto* tuple = typeSpec->tupleTypeSpecifier())
+        for (auto* entry : tuple->tupleTypeEntry())
+            if (TypeSpecifierNamesFunctionLocalEnum(entry->typeSpecifier(), localEnumNames)) return true;
     std::string nestedBase;
     if (auto* nested = GenericSpecOf(typeSpec, nestedBase))
-        for (auto* nestedEntry : nested->typeParameterList()->typeParameterEntry())
-            if (TypeArgumentNamesFunctionLocalEnum(nestedEntry, localEnumNames)) return true;
+        for (auto* entry : nested->typeParameterList()->typeParameterEntry())
+            if (TypeArgumentNamesFunctionLocalEnum(entry, localEnumNames)) return true;
     if (auto* memberType = typeSpec->memberTypeSpecifier())
         if (auto* ownerParams = memberType->memberTypeOwner()->genericTypeParameters())
-            for (auto* nestedEntry : ownerParams->typeParameterList()->typeParameterEntry())
-                if (TypeArgumentNamesFunctionLocalEnum(nestedEntry, localEnumNames)) return true;
-    // The grammar can represent a plain name through either identifier rule as it grows
-    // qualified type syntax. Match the full plain type spelling after nested args were checked.
-    return localEnumNames.count(typeSpec->getText()) != 0;
+            for (auto* entry : ownerParams->typeParameterList()->typeParameterEntry())
+                if (TypeArgumentNamesFunctionLocalEnum(entry, localEnumNames)) return true;
+    const std::string simpleName = SimpleTypeSpecifierName(typeSpec);
+    return !simpleName.empty() && localEnumNames.count(simpleName) != 0;
+}
+
+static bool TypeArgumentNamesFunctionLocalEnum(
+    CFlatParser::TypeParameterEntryContext* entry,
+    const std::unordered_set<std::string>& localEnumNames)
+{
+    return entry != nullptr
+        && TypeSpecifierNamesFunctionLocalEnum(entry->typeSpecifier(), localEnumNames);
 }
 
 static bool GenericArgumentsNameFunctionLocalEnum(
@@ -2270,10 +2333,25 @@ static bool TypeArgumentNeedsFunctionLocalEnumDeferral(
     const std::unordered_set<std::string>& localEnumNames,
     LLVMBackend* compiler,
     const std::unordered_set<std::string>* scannedNonLocalEnumNames,
+    const std::unordered_set<std::string>* scannedTypeNames);
+
+static bool TypeSpecifierNeedsFunctionLocalEnumDeferral(
+    CFlatParser::TypeSpecifierContext* typeSpec,
+    const std::unordered_set<std::string>& localEnumNames,
+    LLVMBackend* compiler,
+    const std::unordered_set<std::string>* scannedNonLocalEnumNames,
     const std::unordered_set<std::string>* scannedTypeNames)
 {
-    if (entry == nullptr || entry->typeSpecifier() == nullptr || compiler == nullptr) return false;
-    auto* typeSpec = entry->typeSpecifier();
+    if (typeSpec == nullptr || compiler == nullptr) return false;
+    if (auto* typeName = typeSpec->typeName())
+        if (auto* spec = typeName->specifierQualifierList())
+            for (auto* nested : spec->typeSpecifier())
+                if (TypeSpecifierNeedsFunctionLocalEnumDeferral(nested, localEnumNames, compiler,
+                        scannedNonLocalEnumNames, scannedTypeNames)) return true;
+    if (auto* tuple = typeSpec->tupleTypeSpecifier())
+        for (auto* tupleEntry : tuple->tupleTypeEntry())
+            if (TypeSpecifierNeedsFunctionLocalEnumDeferral(tupleEntry->typeSpecifier(),
+                    localEnumNames, compiler, scannedNonLocalEnumNames, scannedTypeNames)) return true;
     std::string nestedBase;
     if (auto* nested = GenericSpecOf(typeSpec, nestedBase))
         for (auto* nestedEntry : nested->typeParameterList()->typeParameterEntry())
@@ -2288,8 +2366,8 @@ static bool TypeArgumentNeedsFunctionLocalEnumDeferral(
                         scannedNonLocalEnumNames, scannedTypeNames))
                     return true;
 
-    const std::string spelling = typeSpec->getText();
-    if (localEnumNames.count(spelling) == 0) return false;
+    const std::string spelling = SimpleTypeSpecifierName(typeSpec);
+    if (spelling.empty() || localEnumNames.count(spelling) == 0) return false;
     const std::string resolved = compiler->ResolveTypeArgBaseName(spelling);
     const std::string enumKey = compiler->ResolveEnumTypeName(spelling);
     if (!enumKey.empty())
@@ -2310,6 +2388,18 @@ static bool TypeArgumentNeedsFunctionLocalEnumDeferral(
         isScannedNonLocalType, ScopedLookupOptions{ .ResolveFirstComponentAlias = false }).empty();
 }
 
+static bool TypeArgumentNeedsFunctionLocalEnumDeferral(
+    CFlatParser::TypeParameterEntryContext* entry,
+    const std::unordered_set<std::string>& localEnumNames,
+    LLVMBackend* compiler,
+    const std::unordered_set<std::string>* scannedNonLocalEnumNames,
+    const std::unordered_set<std::string>* scannedTypeNames)
+{
+    return entry != nullptr
+        && TypeSpecifierNeedsFunctionLocalEnumDeferral(entry->typeSpecifier(), localEnumNames,
+            compiler, scannedNonLocalEnumNames, scannedTypeNames);
+}
+
 static bool GenericArgumentsNeedFunctionLocalEnumDeferral(
     CFlatParser::GenericTypeParametersContext* params,
     const std::unordered_set<std::string>* localEnumNames,
@@ -2328,10 +2418,22 @@ static bool GenericArgumentsNeedFunctionLocalEnumDeferral(
 static bool TypeArgumentUsesRegisteredLocalEnum(
     CFlatParser::TypeParameterEntryContext* entry,
     LLVMBackend* compiler,
-    const std::unordered_map<std::string, std::string>* substitutions = nullptr)
+    const std::unordered_map<std::string, std::string>* substitutions = nullptr);
+
+static bool TypeSpecifierUsesRegisteredLocalEnum(
+    CFlatParser::TypeSpecifierContext* typeSpec,
+    LLVMBackend* compiler,
+    const std::unordered_map<std::string, std::string>* substitutions)
 {
-    if (entry == nullptr || entry->typeSpecifier() == nullptr || compiler == nullptr) return false;
-    auto* typeSpec = entry->typeSpecifier();
+    if (typeSpec == nullptr || compiler == nullptr) return false;
+    if (auto* typeName = typeSpec->typeName())
+        if (auto* spec = typeName->specifierQualifierList())
+            for (auto* nested : spec->typeSpecifier())
+                if (TypeSpecifierUsesRegisteredLocalEnum(nested, compiler, substitutions)) return true;
+    if (auto* tuple = typeSpec->tupleTypeSpecifier())
+        for (auto* tupleEntry : tuple->tupleTypeEntry())
+            if (TypeSpecifierUsesRegisteredLocalEnum(tupleEntry->typeSpecifier(), compiler,
+                    substitutions)) return true;
     std::string nestedBase;
     if (auto* nested = GenericSpecOf(typeSpec, nestedBase))
         for (auto* nestedEntry : nested->typeParameterList()->typeParameterEntry())
@@ -2342,6 +2444,26 @@ static bool TypeArgumentUsesRegisteredLocalEnum(
                 if (TypeArgumentUsesRegisteredLocalEnum(nestedEntry, compiler, substitutions))
                     return true;
 
+    std::string spelling = SimpleTypeSpecifierName(typeSpec);
+    if (spelling.empty()) return false;
+    if (substitutions != nullptr)
+        if (auto it = substitutions->find(spelling); it != substitutions->end()) spelling = it->second;
+    const std::string enumKey = compiler->ResolveEnumTypeName(spelling);
+    return !enumKey.empty() && compiler->IsGenericLocalEnumKey(enumKey);
+}
+
+static bool TypeArgumentUsesRegisteredLocalEnum(
+    CFlatParser::TypeParameterEntryContext* entry,
+    LLVMBackend* compiler,
+    const std::unordered_map<std::string, std::string>* substitutions)
+{
+    if (entry == nullptr || entry->typeSpecifier() == nullptr || compiler == nullptr) return false;
+    auto* typeSpec = entry->typeSpecifier();
+    std::string genericBase;
+    if (typeSpec->tupleTypeSpecifier() != nullptr || typeSpec->typeName() != nullptr
+        || GenericSpecOf(typeSpec, genericBase) != nullptr
+        || typeSpec->memberTypeSpecifier() != nullptr)
+        return TypeSpecifierUsesRegisteredLocalEnum(typeSpec, compiler, substitutions);
     std::string spelling = CanonicalTemplateTypeArgument(entry);
     if (substitutions != nullptr)
         if (auto it = substitutions->find(spelling); it != substitutions->end()) spelling = it->second;
@@ -2401,10 +2523,12 @@ static int PointeeConstOfComponent(int mask, int depth, bool preserveAliasRefere
 static std::string BuildEncodedClosureName(const LLVMBackend* compiler, bool isThin,
     const std::string& ret, int retDepth,
     const std::vector<std::pair<std::string, int>>& params,
-    int retConstMask = -1, const std::vector<int>* paramConstMasks = nullptr)
+    int retConstMask = -1, const std::vector<int>* paramConstMasks = nullptr,
+    const std::vector<bool>* paramArrayViews = nullptr)
 {
     if (compiler == nullptr) return ret;
-    return MangleClosureType(*compiler, isThin, ret, retDepth, params, retConstMask, paramConstMasks);
+    return MangleClosureType(*compiler, isThin, ret, retDepth, params, retConstMask,
+        paramConstMasks, paramArrayViews);
 }
 
 
@@ -3185,20 +3309,35 @@ inline void RecordConsumeSourceName(antlr4::tree::ParseTree* node,
     }
 }
 
-// Detect functions that heap-allocate and return a new owned value, so call sites
-// register the result as an owned temp and free it. operator+ always allocates;
-// operator string(i32) uses malloc; user functions opt in via 'move string' /
-// 'move T*' / 'move <interface>'. Shared by the forward-decl, definition, and
-// interface-method-decl paths so the three copies cannot drift apart.
+// Detect functions that heap-allocate and return a new owned value. Core string
+// concatenation signatures and operator string(i32) allocate; user functions opt
+// in via 'move string' / 'move T*' / 'move <interface>'.
 static bool ComputeReturnsOwned(const LLVMBackend::DeclTypeAndValue& returnType,
-                                const std::string& name,
+                                CFlatParser::FunctionDefinitionContext* func,
                                 const std::vector<LLVMBackend::TypeAndValue>& allParams)
 {
     if (returnType.TypeName == "string")
     {
-        if (name == "operator+")
+        auto* opId = func != nullptr ? func->operatorFunctionId() : nullptr;
+        const bool isPlusOperator = opId != nullptr && opId->Plus() != nullptr;
+        const bool isStringConversion = opId != nullptr && opId->String() != nullptr;
+        const auto isStringValue = [](const LLVMBackend::TypeAndValue& p) {
+            return p.TypeName == "string" && !p.Pointer && !p.ElemPointer;
+        };
+        const auto isCString = [](const LLVMBackend::TypeAndValue& p) {
+            return p.TypeName == "char" && p.Pointer && !p.ElemPointer;
+        };
+        const auto isStringOperand = [&](const LLVMBackend::TypeAndValue& p) {
+            return isStringValue(p) || isCString(p);
+        };
+        const bool coreStringConcat = isPlusOperator && allParams.size() == 2
+            && ((isStringValue(allParams[0])
+                    && (isStringOperand(allParams[1])
+                        || (allParams[1].TypeName == "IString" && !allParams[1].Pointer)))
+                || (isCString(allParams[0]) && isStringOperand(allParams[1])));
+        if (coreStringConcat)
             return true;
-        if (name == "operator string" && allParams.size() == 1 && allParams[0].TypeName == "i32")
+        if (isStringConversion && allParams.size() == 1 && allParams[0].TypeName == "i32")
             return true;
         if (returnType.IsMove)
             return true;
@@ -4952,6 +5091,8 @@ class ForwardRefScanner
 private:
     LLVMBackend* compilerLLVM;
     antlr4::BufferedTokenStream* tokens_ = nullptr;
+    // The eager generic-use scan runs before scoped expect_error handlers are armed.
+    unsigned genericTypeUseScanDepth_ = 0;
 
     // Kept in sync with the codegen parser: only a declaration nested in a function body is a
     // local; return types, parameters, fields, and generic arguments keep their builtin shape.
@@ -5065,6 +5206,7 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
                     for (auto* entry : generic->typeParameterList()->typeParameterEntry())
                         typeArgs.push_back(ResolveForwardTypeArg(entry));
                     compiler->ResolveGenericAliasSpelling(baseName, typeArgs, false);
+                    compiler->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
                     baseIdentity = MangleGenericInstance(*compiler, baseName, typeArgs);
                     std::string cxxError;
                     compiler->TryRequestCxxType(baseName, typeArgs, baseIdentity, cxxError,
@@ -5288,11 +5430,11 @@ public:
     // match MangledGenericName; a nested closure encodes recursively. Names only (no queue/register).
     std::string ResolveSigComponentScanner(CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
                                            CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
-    // Resolve a function signature component; alias returns also keep const on the referent.
+    // Resolve a function signature component; pointer aliases become a base name plus depth.
     // This is the scanner twin of the main pass copy.
     std::string ResolveSigComponentConstScanner(CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
         int& stars, int& constMask, CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr,
-        bool preserveAliasReferentConst = false, bool returnComponent = false);
+        bool preserveAliasReferentConst = false, std::string* aliasSpelling = nullptr);
 
     /*
      * Scanner counterpart of MainListener::SigComponentResolvedKey. Both are one line onto the
@@ -5395,11 +5537,12 @@ public:
     void ScanUsingDeclaration(CFlatParser::UsingDeclarationContext* ctx);
     // `Spec<args>.name` in type position: the member type's spelling, or the written text when
     // the scan cannot resolve it yet (the main pass reports).
-    std::string ResolveMemberTypeSpecifier(CFlatParser::MemberTypeSpecifierContext* ctx);
+    std::string ResolveMemberTypeSpecifier(CFlatParser::MemberTypeSpecifierContext* ctx,
+        uint8_t* constMask = nullptr);
     // Collects the `using` members of the CFlat generic instantiation `owner` (template `base`,
     // arguments `args`) as a provisional frame, binding the template parameters textually.
     bool ScanTemplateAggregateAliases(const std::string& owner, const std::string& base,
-                                      const std::vector<std::string>& args);
+                                      const std::vector<std::string>& args, bool scanSignatures = false);
     // Template parameter -> argument while ScanTemplateAggregateAliases evaluates a body's aliases.
     std::unordered_map<std::string, std::string> scanTypeSubstitutions_;
     // Generic struct/class templates of this file by qualified name, from the name scan, and
@@ -5479,6 +5622,8 @@ public:
         ForwardRefScanner scanner(Compiler(ctx));
         scanner.ValidateIsolatedIntegralPointerCasts(ctx);
     }
+
+    void exitTranslationUnit(CFlatParser::TranslationUnitContext* ctx) override;
 
     void enterProgramDefinition(CFlatParser::ProgramDefinitionContext* ctx) override
     {
@@ -5754,6 +5899,31 @@ private:
     // Active pack substitutions during instantiation: pack-param-name -> ["int", "float", "string"]
     std::unordered_map<std::string, std::vector<std::string>> activePackSubstitutions;
 
+    enum class DeferredGenericMemberKind : uint8_t { Function, Constructor, Destructor };
+    struct DeferredGenericMemberBody
+    {
+        DeferredGenericMemberKind kind = DeferredGenericMemberKind::Function;
+        CFlatParser::FunctionDefinitionContext* function = nullptr;
+        CFlatParser::DestructorDefinitionContext* destructor = nullptr;
+        std::string ownerName;
+        std::string templateName;
+        std::string nameOverride;
+        bool suppliesNoArgCtor = false;
+        size_t cppCtorIndex = SIZE_MAX;
+        bool hasExplicitNoArgCtor = false;
+        TypeSubstitutionMap typeSubstitutions;
+        std::unordered_map<std::string, std::string> valueSubstitutions;
+        std::unordered_map<std::string, std::vector<std::string>> packSubstitutions;
+    };
+    std::vector<DeferredGenericMemberBody> deferredGenericMemberBodies_;
+    bool GenericMemberNeedsDeferredBody(antlr4::ParserRuleContext* member);
+    void DeferGenericMemberBody(antlr4::ParserRuleContext* member,
+        antlr4::ParserRuleContext* aggregate, const std::string& ownerName,
+        DeferredGenericMemberKind kind, const std::string& nameOverride = {},
+        bool suppliesNoArgCtor = false, size_t cppCtorIndex = SIZE_MAX,
+        bool hasExplicitNoArgCtor = false);
+    void ProcessDeferredGenericMemberBodies();
+
     // True while monomorphizing a generic template body. The body's tokens come from the
     // template's own file (e.g. core/list.cb), but currentSourceFilePath_ is the use-site
     // file that triggered the instantiation, so a token's line number does not map onto it.
@@ -5939,6 +6109,17 @@ private:
         bool* flag; bool saved;
         explicit ReturnFlagGuard(bool* f) : flag(f), saved(*f) {}
         ~ReturnFlagGuard() { *flag = saved; }
+    };
+
+    struct OwnershipControlScope {
+        LLVMBackend* compiler;
+        explicit OwnershipControlScope(LLVMBackend* c, uint8_t frameKind = 0) : compiler(c)
+        {
+            compiler->EnterOwnershipControlRegion(frameKind);
+        }
+        ~OwnershipControlScope() { compiler->LeaveOwnershipControlRegion(); }
+        OwnershipControlScope(const OwnershipControlScope&) = delete;
+        OwnershipControlScope& operator=(const OwnershipControlScope&) = delete;
     };
 
     struct LambdaExpectedTypeRestoreGuard {
@@ -6186,11 +6367,11 @@ private:
     // byte-identical to the pre-existing raw-getText() behavior (no alias resolution added).
     std::string ResolveSigComponentCodegen(CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
                                            CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
-    // Resolve a function signature component; alias returns also keep const on the referent.
+    // Resolve a function signature component; pointer aliases become a base name plus depth.
     // This is the main pass twin of the scanner copy.
     std::string ResolveSigComponentConstCodegen(CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
         int& stars, int& constMask, CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr,
-        bool preserveAliasReferentConst = false, bool returnComponent = false);
+        bool preserveAliasReferentConst = false, std::string* aliasSpelling = nullptr);
 
     /*
      * The declaring-scope-resolved key for a signature component, recorded ALONGSIDE the raw
@@ -6426,13 +6607,14 @@ public:
     void ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* ctx);
     // `Spec<args>.name[.name...]` in type position: instantiates the owner and returns the
     // member type's spelling; reports a name that is not a member type of the owner.
-    std::string ResolveMemberTypeSpecifier(CFlatParser::MemberTypeSpecifierContext* ctx);
+    std::string ResolveMemberTypeSpecifier(CFlatParser::MemberTypeSpecifierContext* ctx,
+        uint8_t* constMask = nullptr);
     // The shared walk: instantiate `base<ownerArgs>`, then resolve each member in turn. Returns ""
     // when a member is not a member type (reported only when `report`).
     std::string ResolveMemberTypeChain(
         std::string base, CFlatParser::GenericTypeParametersContext* ownerArgs, const std::string& ownerText,
         const std::vector<std::pair<std::string, antlr4::ParserRuleContext*>>& members,
-        antlr4::ParserRuleContext* site, bool report);
+        antlr4::ParserRuleContext* site, bool report, std::string* lastOwner = nullptr);
     // A sizeof/typeof operand the parser read as an expression (`Spec<args>.name`): the member
     // type it names by lookup, or "" when it names none (it then stays a value expression).
     std::string TryPostfixAsMemberType(CFlatParser::PostfixExpressionContext* postfix);
@@ -7982,6 +8164,9 @@ public:
 
     llvm::Value* ParseAssignmentExpression(CFlatParser::AssignmentExpressionContext* ctx,
                                            LLVMBackend::NamedVariable* assignmentResult = nullptr);
+    bool IsDeclaredPointerSubscriptString(
+        CFlatParser::AssignmentExpressionContext* expression,
+        llvm::Value* value, llvm::Value* storage);
 
     // Box a THIN '?:' arm (`new T()` / `nullptr` / a borrowed pointer) into the interface fat
     // struct, matching a sibling arm already fat (e.g. `move` of an interface-typed local).
@@ -9174,6 +9359,8 @@ public:
                                    const std::vector<LLVMBackend::TypeAndValue>& params);
     bool IsBorrowedByValueParamBinding(
         LLVMBackend* compiler, const LLVMBackend::NamedVariable& nv);
+    void PrepareBorrowedStringParamForDataMut(
+        LLVMBackend* compiler, const LLVMBackend::NamedVariable& receiver);
 
     // A 'move' by-value struct parameter whose type owns storage (e.g. `move Holder h` where
     // Holder holds a unique pointer). Returning such a parameter by a PLAIN `return h` copies

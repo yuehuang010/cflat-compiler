@@ -1394,6 +1394,7 @@ namespace cflat_cinterop
             std::unordered_set<std::string> functionPointerAbiSeen;
             std::unordered_set<const FunctionTemplateDecl*> emittedFunctionTemplates;
             std::unordered_set<std::string> emittedClassTemplateNames;
+            std::unordered_map<std::string, size_t> classTemplateIndices;
             // cxxMode only: (index into out.records, index into that record's members, decl).
             struct MemberAbiWork { size_t recordIdx; size_t memberIdx; const CXXMethodDecl* md; };
             std::vector<MemberAbiWork> memberAbiWork;
@@ -2049,6 +2050,112 @@ namespace cflat_cinterop
                 const std::string name = CxxQualifiedName(ctd->getTemplatedDecl());
                 if (!name.empty() && st.emittedClassTemplateNames.insert(name).second)
                     st.out.classTemplateNames.push_back(name);
+                if (name.empty()) return true;
+
+                auto printArgument = [&](const TemplateArgument& arg) {
+                    std::string text;
+                    llvm::raw_string_ostream os(text);
+                    PrintingPolicy policy = ctx.getPrintingPolicy();
+                    policy.FullyQualifiedName = true;
+                    policy.SuppressScope = false;
+                    arg.print(policy, os, /*IncludeType=*/false);
+                    os.flush();
+                    return text;
+                };
+                RawClassTemplate templateInfo;
+                templateInfo.name = name;
+                for (const NamedDecl* param : *ctd->getTemplateParameters())
+                {
+                    RawClassTemplateParameter info;
+                    info.name = param->getNameAsString();
+                    const TemplateArgumentLoc* fallback = nullptr;
+                    if (const auto* typeParam = llvm::dyn_cast<TemplateTypeParmDecl>(param))
+                    {
+                        info.kind = 'T';
+                        if (typeParam->hasDefaultArgument())
+                            fallback = &typeParam->getDefaultArgument();
+                    }
+                    else if (const auto* valueParam =
+                                 llvm::dyn_cast<NonTypeTemplateParmDecl>(param))
+                    {
+                        info.kind = 'N';
+                        if (valueParam->hasDefaultArgument())
+                            fallback = &valueParam->getDefaultArgument();
+                    }
+                    else if (const auto* templateParam =
+                                 llvm::dyn_cast<TemplateTemplateParmDecl>(param))
+                    {
+                        info.kind = 'M';
+                        if (templateParam->hasDefaultArgument())
+                            fallback = &templateParam->getDefaultArgument();
+                    }
+                    if (fallback != nullptr)
+                    {
+                        const TemplateArgument& argument = fallback->getArgument();
+                        if (info.kind == 'N')
+                        {
+                            const auto* valueParam = llvm::dyn_cast<NonTypeTemplateParmDecl>(param);
+                            llvm::APSInt value;
+                            bool evaluated = false;
+                            if (argument.getKind() == TemplateArgument::Integral)
+                            {
+                                value = argument.getAsIntegral();
+                                evaluated = true;
+                            }
+                            else if (argument.getKind() == TemplateArgument::Expression)
+                            {
+                                const Expr* expression = argument.getAsExpr();
+                                if (expression != nullptr && !expression->isValueDependent()
+                                    && !expression->isTypeDependent())
+                                {
+                                    Expr::EvalResult result;
+                                    evaluated = expression->EvaluateAsInt(result, ctx)
+                                        && result.Val.isInt();
+                                    if (evaluated) value = result.Val.getInt();
+                                }
+                            }
+                            // An enum default has no integer spelling as a C++ argument; keep the old path.
+                            if (evaluated && valueParam != nullptr && !valueParam->getType()->isEnumeralType())
+                            {
+                                info.hasDefault = true;
+                                if (valueParam->getType()->isBooleanType())
+                                    info.defaultArgument = value.getBoolValue() ? "true" : "false";
+                                else
+                                {
+                                    llvm::SmallString<32> decimal;
+                                    value.toString(decimal, 10);
+                                    info.defaultArgument = decimal.str().str();
+                                }
+                            }
+                        }
+                        else
+                        {
+                            info.hasDefault = true;
+                            info.defaultArgument = printArgument(argument);
+                            if (info.kind == 'T' && argument.getKind() == TemplateArgument::Type)
+                            {
+                                if (const auto* typeParam =
+                                        argument.getAsType()->getAs<TemplateTypeParmType>())
+                                    info.defaultParameterIndex = (int)typeParam->getIndex();
+                            }
+                        }
+                    }
+                    templateInfo.parameters.push_back(std::move(info));
+                }
+                auto existing = st.classTemplateIndices.find(name);
+                if (existing == st.classTemplateIndices.end())
+                {
+                    st.classTemplateIndices.emplace(name, st.out.classTemplates.size());
+                    st.out.classTemplates.push_back(std::move(templateInfo));
+                }
+                else
+                {
+                    auto& prior = st.out.classTemplates[existing->second];
+                    if (prior.parameters.size() == templateInfo.parameters.size())
+                        for (size_t i = 0; i < prior.parameters.size(); ++i)
+                            if (!prior.parameters[i].hasDefault && templateInfo.parameters[i].hasDefault)
+                                prior.parameters[i] = std::move(templateInfo.parameters[i]);
+                }
                 return true;
             }
 

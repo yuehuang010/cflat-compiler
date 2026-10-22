@@ -2481,6 +2481,79 @@ bool testTupleInterfaces()
     return (42, 2.7f, true);
 }
 
+struct T369NestedHolder { ((int,int),int) value; };
+int t369NestedSum(((int,int),int) value)
+{
+    return value.item_0.item_0 + value.item_0.item_1 + value.item_1;
+}
+int t369NestedPointerSum(((int,int),int)* value)
+{
+    return value->item_0.item_0 + value->item_0.item_1 + value->item_1;
+}
+int t369NestedConstSum(const(((int,int),int))* value)
+{
+    return value->item_0.item_0 + value->item_0.item_1 + value->item_1;
+}
+((int,int),int) t369MakeNested() { return ((20, 21), 1); }
+
+bool testNestedTupleTypeResolution()
+{
+    bool result = true;
+    ((int,int),int) defaultValue = default;
+    defaultValue.item_0.item_0 = 20;
+    defaultValue.item_0.item_1 = 21;
+    defaultValue.item_1 = 1;
+    result &= Test("t369 nested default local", t369NestedSum(defaultValue), 42);
+    result &= Test("t369 nested by value parameter", t369NestedSum(((20, 21), 1)), 42);
+
+    ((int,int),int) braceValue = {item_0 = {item_0 = 20, item_1 = 21}, item_1 = 1};
+    result &= Test("t369 nested named brace init", t369NestedSum(braceValue), 42);
+    ((int,int),int) literalValue = ((20, 21), 1);
+    result &= Test("t369 nested tuple literal init", t369NestedSum(literalValue), 42);
+
+    ((int,int),int)* pointerValue = &literalValue;
+    result &= Test("t369 nested pointer parameter", t369NestedPointerSum(pointerValue), 42);
+    result &= Test("t369 nested const wrapper", t369NestedConstSum(pointerValue), 42);
+    result &= Test("t369 nested return type", t369NestedSum(t369MakeNested()), 42);
+
+    T369NestedHolder holder = default;
+    holder.value = t369MakeNested();
+    result &= Test("t369 nested struct field", t369NestedSum(holder.value), 42);
+    pointerValue->item_0.item_1 = 21;
+    result &= Test("t369 nested pointer read write", t369NestedPointerSum(pointerValue), 42);
+    result &= Test("t369 nested sizeof", (int)sizeof(*pointerValue), 12);
+
+    (((int,int),int),int) deep = default;
+    deep.item_0.item_0.item_0 = 10;
+    deep.item_0.item_0.item_1 = 11;
+    deep.item_0.item_1 = 12;
+    deep.item_1 = 9;
+    result &= Test("t369 three deep tuple value",
+        deep.item_0.item_0.item_0 + deep.item_0.item_0.item_1
+            + deep.item_0.item_1 + deep.item_1, 42);
+    result &= Test("t369 three deep sizeof", (int)sizeof(deep), 16);
+
+    list<((int,int),int)> nestedValues = default;
+    nestedValues.add(((20, 21), 1));
+    result &= Test("t369 nested tuple generic argument",
+        t369NestedSum(nestedValues.get(0)), 42);
+
+    enum T369Local : int { First = 20 };
+    ((T369Local,int),int) localEnumTuple = ((T369Local.First, 21), 1);
+    result &= Test("t369 nested tuple local enum leaf",
+        (int)localEnumTuple.item_0.item_0
+            + localEnumTuple.item_0.item_1 + localEnumTuple.item_1, 42);
+
+    list<((T369Local,int),int)> localEnumValues = default;
+    localEnumValues.add(((T369Local.First, 21), 1));
+    result &= Test("t369 nested tuple local enum generic argument",
+        (int)localEnumValues.get(0).item_0.item_0
+            + localEnumValues.get(0).item_0.item_1
+            + localEnumValues.get(0).item_1, 42);
+
+    return result;
+}
+
 bool testTupleTypeSyntax()
 {
     bool result = true;
@@ -5733,6 +5806,207 @@ bool testPointerOnlyLaterStruct()
     return result;
 }
 
+struct T368AliasRecord<T> { using Rec = T368LaterPayload; };
+struct T368PlainLater<T> {
+    T368LaterPayload make() {
+        T368LaterPayload p;
+        p.value = 149;
+        return p;
+    }
+};
+T368PlainLater<int> t368PlainLater = default;
+struct T368ParamLater<T> {
+    int read(T368LaterPayload p) { return p.value; }
+};
+T368ParamLater<int> t368ParamLater = default;
+struct T368LocalLater<T> {
+    int read() {
+        T368LaterPayload p;
+        p.value = 131;
+        return p.value;
+    }
+};
+T368LocalLater<int> t368LocalLater = default;
+struct T368PointerLater<T> {
+    int check() {
+        T368LaterPayload* p = nullptr;
+        return p == nullptr ? 157 : 0;
+    }
+};
+T368PointerLater<int> t368PointerLater = default;
+struct T368MemberLater<T> {
+    T368AliasRecord<T>.Rec field = default;
+    T368AliasRecord<T>.Rec make() {
+        T368AliasRecord<T>.Rec p;
+        p.value = 137;
+        return p;
+    }
+};
+T368MemberLater<int> t368MemberLater = default;
+struct T368ListLater<T> {
+    int read() {
+        list<T368LaterPayload> values = default;
+        T368LaterPayload p;
+        p.value = 167;
+        values.add(p);
+        return values[0].value;
+    }
+};
+T368ListLater<int> t368ListLater = default;
+struct T368MutualLater<T> {
+    int read() {
+        T368LeftLater left;
+        T368RightLater right;
+        left.value = 173;
+        right.value = 179;
+        left.next = &right;
+        right.next = &left;
+        return left.value + right.value;
+    }
+};
+T368MutualLater<int> t368MutualLater = default;
+struct T368TwiceLater<T> {
+    T368LaterPayload make() {
+        T368LaterPayload p;
+        p.value = (int)sizeof(T) + 181;
+        return p;
+    }
+};
+T368TwiceLater<int> t368TwiceInt = default;
+T368TwiceLater<i64> t368TwiceI64 = default;
+// The scoped expectation must own the nullable diagnostic, then the method must return 3.
+struct T368ExpectedErrorBody<T> {
+    int read() {
+        expect_error("nullable '?' is not allowed on primitive type 'int'") {
+            int? x = 0;
+        }
+        return 3;
+    }
+};
+T368ExpectedErrorBody<int> t368ExpectedErrorBody = default;
+// The incomplete by-value payload is only in the constructor body; seed proves field init ran.
+struct T368CtorBodyLater<T> {
+    int seed = 4;
+    int value = default;
+    T368CtorBodyLater() {
+        T368LaterPayload p;
+        p.value = 5;
+        value = seed + p.value;
+    }
+};
+T368CtorBodyLater<int> t368CtorBodyLater;
+// The local alias is declared before its by-value use and must resolve without registration.
+struct T368LocalUsingLater<T> {
+    int read() {
+        using Later = T368LaterPayload;
+        Later p;
+        p.value = 5;
+        return p.value;
+    }
+};
+T368LocalUsingLater<int> t368LocalUsingLater = default;
+int t368DeferredDtorEvents = 0;
+int t368DeferredDtorCount = 0;
+struct T368DtorChild {
+    int id = 0;
+    T368DtorChild(int value) {
+        id = value;
+        t368DeferredDtorEvents = t368DeferredDtorEvents * 10 + id;
+    }
+    ~T368DtorChild() {
+        t368DeferredDtorEvents = t368DeferredDtorEvents * 10 + id + 6;
+        t368DeferredDtorCount++;
+    }
+};
+// The later payload forces dtor deferral; events and count pin body-before-field teardown.
+struct T368DtorBodyLater<T> {
+    T368DtorChild first = T368DtorChild(1);
+    T368DtorChild second = T368DtorChild(2);
+    ~T368DtorBodyLater() {
+        T368DtorLaterPayload p;
+        p.value = 9;
+        t368DeferredDtorEvents = t368DeferredDtorEvents * 10 + 4;
+    }
+};
+T368DtorBodyLater<int> t368DtorBodyLater;
+struct T368DtorLaterPayload {
+    int value = 0;
+    ~T368DtorLaterPayload() {
+        t368DeferredDtorEvents = t368DeferredDtorEvents * 10 + 6;
+        t368DeferredDtorCount++;
+    }
+};
+struct T368LeftLater { T368RightLater* next = nullptr; int value = default; };
+struct T368RightLater { T368LeftLater* next = nullptr; int value = default; };
+struct T368LaterPayload { int value = default; };
+
+int t368LifecycleEvents = 0;
+int t368LifecycleDtorCount = 0;
+struct T368LifecycleChild {
+    int id = 0;
+    T368LifecycleChild(int value) { id = value; t368LifecycleEvents = t368LifecycleEvents * 10 + id; }
+    ~T368LifecycleChild() {
+        t368LifecycleEvents = t368LifecycleEvents * 10 + id + 6;
+        t368LifecycleDtorCount++;
+    }
+};
+struct T368LifecyclePayload {
+    int value = 0;
+    ~T368LifecyclePayload() {
+        t368LifecycleEvents = t368LifecycleEvents * 10 + 6;
+        t368LifecycleDtorCount++;
+    }
+};
+// Non-deferred control freezes master field-init and member-dtor ordering.
+struct T368LifecycleControl<T> {
+    T368LifecycleChild first = T368LifecycleChild(1);
+    T368LifecycleChild second = T368LifecycleChild(2);
+    int value = default;
+    T368LifecycleControl() {
+        T368LifecyclePayload p;
+        p.value = 5;
+        t368LifecycleEvents = t368LifecycleEvents * 10 + 3;
+        value = p.value;
+    }
+    ~T368LifecycleControl() {
+        T368LifecyclePayload p;
+        t368LifecycleEvents = t368LifecycleEvents * 10 + 4;
+    }
+};
+T368LifecycleControl<int> t368LifecycleControl = default;
+
+bool testGenericLaterRecords()
+{
+    bool result = true;
+    T368LaterPayload input;
+    input.value = 151;
+    t368MemberLater.field.value = 139;
+    result &= Test("t368_plain_return", t368PlainLater.make().value, 149);
+    result &= Test("t368_by_value_parameter", t368ParamLater.read(input), 151);
+    result &= Test("t368_by_value_local", t368LocalLater.read(), 131);
+    result &= Test("t368_pointer_local_control", t368PointerLater.check(), 157);
+    result &= Test("t368_member_type_return", t368MemberLater.make().value, 137);
+    result &= Test("t368_later_field_control", t368MemberLater.field.value, 139);
+    result &= Test("t368_nested_generic_argument", t368ListLater.read(), 167);
+    result &= Test("t368_mutual_later_records", t368MutualLater.read(), 352);
+    result &= Test("t368_two_instantiations_int", t368TwiceInt.make().value, 185);
+    result &= Test("t368_two_instantiations_i64", t368TwiceI64.make().value, 189);
+    result &= Test("t368_expect_error_in_generic_body", t368ExpectedErrorBody.read(), 3);
+    result &= Test("t368_deferred_constructor_field_init", t368CtorBodyLater.value, 9);
+    result &= Test("t368_deferred_local_using_alias", t368LocalUsingLater.read(), 5);
+    t368DeferredDtorEvents = 0;
+    t368DeferredDtorCount = 0;
+    { T368DtorBodyLater<int> local; }
+    result &= Test("t368_deferred_destructor_member_order", t368DeferredDtorEvents, 124678);
+    result &= Test("t368_deferred_destructor_count", t368DeferredDtorCount, 3);
+    t368LifecycleEvents = 0;
+    t368LifecycleDtorCount = 0;
+    { T368LifecycleControl<int> local; }
+    result &= Test("t368_non_deferred_lifecycle_order", t368LifecycleEvents, 12364678);
+    result &= Test("t368_non_deferred_lifecycle_dtor_count", t368LifecycleDtorCount, 4);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -5793,6 +6067,7 @@ extern int main()
     total++; passed += testTupleTypeSyntax()             ? 1 : 0;
     total++; passed += testTupleConstruct()              ? 1 : 0;
     total++; passed += testTupleReturnAndDestructure()   ? 1 : 0;
+    total++; passed += testNestedTupleTypeResolution()   ? 1 : 0;
     total++; passed += testTupleArrayView()              ? 1 : 0;
     total++; passed += testITuple()                      ? 1 : 0;
     total++; passed += testImplicitStringLiteral()        ? 1 : 0;
@@ -5901,6 +6176,7 @@ extern int main()
     total++; passed += testMemberTypeNames()                         ? 1 : 0;
     total++; passed += testMemberTypeValueParens()                   ? 1 : 0;
     total++; passed += testMemberTypeForwardRecords()                ? 1 : 0;
+    total++; passed += testGenericLaterRecords()                      ? 1 : 0;
     total++; passed += testPointerOnlyLaterStruct()                  ? 1 : 0;
     total++; passed += testConstGenerics()                           ? 1 : 0;
     total++; passed += testConstGenericList()                        ? 1 : 0;

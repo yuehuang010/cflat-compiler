@@ -1,0 +1,7 @@
+expect_error("parameter 1 differs") {
+    int t370ReadConstView((const int)[] values) { return values[0]; }
+    int main() {
+        function<int(int[])> fn = t370ReadConstView;
+        return 0;
+    }
+}

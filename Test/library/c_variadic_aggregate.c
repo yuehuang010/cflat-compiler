@@ -1,6 +1,8 @@
 #include <stdarg.h>
 #include "c_variadic_fnptr.h"
 
+int t365_c_raw_slot(int** p) { return **p; }
+
 // C variadic callees for the aggregate-in-`...` refusal (Test/errors/err_c_variadic_aggregate.cb).
 struct T145Pair { int a; int b; };
 

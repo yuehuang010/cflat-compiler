@@ -862,7 +862,12 @@ void LLVMBackend::EnsureClosureLifetimeRegistered()
 
 void LLVMBackend::RegisterEncodedClosureType(const std::string& encodedName, const TypeAndValue& sig)
 {
-        if (encodedClosureTypes_.count(encodedName)) return;
+        if (auto existing = encodedClosureTypes_.find(encodedName); existing != encodedClosureTypes_.end())
+        {
+            if (existing->second.DiagnosticTypeName.empty() && !sig.DiagnosticTypeName.empty())
+                existing->second.DiagnosticTypeName = sig.DiagnosticTypeName;
+            return;
+        }
         encodedClosureTypes_[encodedName] = sig;
         EnsureClosureLifetimeRegistered();
 
@@ -2238,6 +2243,11 @@ std::string LLVMBackend::DescribeLostClosureSink(const TypeAndValue& dest, size_
 {
         // Rebuild the destination's own spelling with `move` added at the offending parameter.
         std::string family = dest.IsThinFnPtr() ? "function" : "Lambda";
+        auto spellParam = [this](const TypeAndValue::FuncPtrParam& p, size_t i)
+        {
+            TypeAndValue tv = FuncPtrParamAsTypeAndValue(p, i);
+            return tv.DiagnosticTypeName.empty() ? SpellType(*this, tv) : tv.DiagnosticTypeName;
+        };
         TypeAndValue returnType;
         returnType.TypeName = dest.FuncPtrReturnTypeName;
         returnType.Pointer = dest.FuncPtrReturnPointer;
@@ -2247,14 +2257,14 @@ std::string LLVMBackend::DescribeLostClosureSink(const TypeAndValue& dest, size_
         {
             if (i > 0) spelled += ", ";
             if (i == index || dest.FuncPtrParams[i].IsMove) spelled += "move ";
-            spelled += SpellType(*this, FuncPtrParamAsTypeAndValue(dest.FuncPtrParams[i], i));
+            spelled += spellParam(dest.FuncPtrParams[i], i);
         }
         spelled += ")>";
         return std::format(
             "this closure CONSUMES parameter {} ('{}'), but {} does not spell it - ownership cannot "
             "travel with a closure value, so the caller would free it again. Spell the sink in the "
             "type: '{}'",
-            index + 1, SpellType(*this, FuncPtrParamAsTypeAndValue(dest.FuncPtrParams[index], index)),
+            index + 1, spellParam(dest.FuncPtrParams[index], index),
             destDescription, spelled);
     }
 

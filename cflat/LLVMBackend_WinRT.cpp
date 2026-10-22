@@ -1629,14 +1629,19 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrParamAsTypeAndValue(const TypeAndV
 {
         TypeAndValue tv;
         tv.TypeName = p.TypeName;
-        tv.Pointer  = p.Pointer;
+        tv.Pointer  = p.Pointer || p.IsArrayView;
+        tv.IsArrayView = p.IsArrayView;
         tv.PointerDepth = p.PointerDepth;
+        tv.ElemPointer = tv.Pointer && p.PointerDepth >= 2;
+        if (p.ConstMask >= 0) tv.ConstMask = static_cast<uint8_t>(p.ConstMask);
         tv.IsInterface = IsInterfaceType(p.TypeName);
         tv.AllocAlignValue = p.AllocAlignValue;
         tv.IsOwningSink = p.IsOwningSink;
         tv.IsConsumeInferredSink = p.IsConsumeInferredSink;
         tv.IsReturnInferredSink = p.IsReturnInferredSink;
         tv.IsWriteInferredSink = p.IsWriteInferredSink;
+        // Diagnostics print the alias the user wrote; TypeName keeps the resolved base for analysis.
+        if (!p.AliasSpelling.empty()) tv.DiagnosticTypeName = FuncPtrAliasParamSpelling(p);
         // A param whose funcptr TYPE spells `move` takes the DECLARED move path, exactly as a
         // direct call does. An INFERRED sink leaves IsMove false - see ApplyFuncPtrSinkTransfer.
         tv.IsMove = p.IsMove;
@@ -1751,6 +1756,40 @@ void LLVMBackend::DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
                 arg.CallerName.empty() ? FindVariableNameByStorage(arg.Storage) : arg.CallerName,
                 copy.OwningLocalOrigin, paramName, SpellFunctionSymbol(*this, functionName),
                 copy.OwningLocalStorage);
+}
+
+std::string LLVMBackend::ImplicitOutlivingOwnerConsumeError(const NamedVariable& srcNV,
+        bool srcIsMove) const
+{
+        if (srcIsMove || srcNV.TypeAndValue.IsMove || srcNV.IsExplicitMove
+            || srcNV.Storage == nullptr)
+            return {};
+        // Field and element Storage is a GEP; ask about its root allocation.
+        const llvm::Value* obj = srcNV.Storage;
+        for (int hop = 0; hop < 8; hop++)
+        {
+            if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(obj))
+            { obj = gep->getPointerOperand(); continue; }
+            if (auto* bc = llvm::dyn_cast<llvm::BitCastOperator>(obj))
+            { obj = bc->getOperand(0); continue; }
+            break;
+        }
+        if (!llvm::isa_and_nonnull<llvm::GlobalVariable>(obj)) return {};
+        // User globals are recorded here; compiler globals (literal pools, vtables) are not.
+        const std::string globalName = obj->getName().str();
+        if (globalVariableTypes.find(globalName) == globalVariableTypes.end()) return {};
+
+        std::string spelling = srcNV.CallerName.empty() ? globalName : srcNV.CallerName;
+        std::string movePath = FieldMoveKey(srcNV);
+        if (movePath.empty() && !srcNV.FieldName.empty()) movePath = srcNV.FieldName;
+        if (!movePath.empty())
+            spelling += movePath.front() == '[' ? movePath : "." + movePath;
+        return std::format(
+            "cannot consume owning value '{}' out of storage that outlives this function - a global "
+            "or 'static' local is never re-initialized between entries, so this store empties it and "
+            "the next execution reads an empty value. Write 'move {}' to take the value and "
+            "re-initialize the storage, or give '{}' a 'copy()' method and copy it.",
+            spelling, spelling, SpellType(*this, srcNV.TypeAndValue));
 }
 
 void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
@@ -1884,6 +1923,20 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     || (!params[i].Pointer && !params[i].IsAlias
                         && IsCoreUniqueType(params[i].TypeName)))
                 && argIsOwner && (paramOwnsResource || foreignCxxPointerSink);
+            const bool sourceIsOwning = args[i].TypeAndValue.IsUnique
+                || IsCoreUniqueType(args[i].TypeAndValue.TypeName)
+                || (!args[i].TypeAndValue.Pointer && IsOwningValueOrClosureType(args[i].TypeAndValue.TypeName))
+                || args[i].IsOwning || args[i].IsOwningString || args[i].IsOwningStruct;
+            const bool paramConsumesSource = params[i].IsMove
+                || (!params[i].Pointer && !params[i].IsAlias
+                    && IsCoreUniqueType(params[i].TypeName))
+                || params[i].IsOwningSink || sinkConsumes || forcedOperatorConsume;
+            // Dynamic-index moves stay untracked and keep their pre-T367 call behavior.
+            if (beforeCall && paramConsumesSource && sourceIsOwning
+                && !args[i].MovePathHasDynamicIndex)
+                if (std::string error = ImplicitOutlivingOwnerConsumeError(args[i], false);
+                    !error.empty())
+                    LogError(error);
             // Ownership-laundering guard: the arg is a value this function only BORROWS (a plain
             // by-value owning-value param of the current function) but the callee's param CONSUMES
             // it (a sink / `move` / unique). Transferring would null this function's alias while the
@@ -2721,6 +2774,18 @@ bool LLVMBackend::PointerArgIntoByValuePrimitiveParam(const NamedVariable& arg, 
             && param.IsPrimitive() && param.TypeName != "void";
     }
 
+bool LLVMBackend::IsAddressedUniqueSlotToRawSlot(const NamedVariable& arg,
+        const TypeAndValue& source, const TypeAndValue& param) const
+{
+        return arg.AddressedUniqueSlot != nullptr
+            && source.IsProvenSinglePointerDepth()
+            && IsCoreUniqueType(source.TypeName)
+            && param.IsProvenDoublePointer()
+            && !param.IsInterface && !param.IsFunctionPointer
+            && MangledGenericArgument(*this, source.TypeName) == param.TypeName
+            && !IsInterfaceType(param.TypeName);
+}
+
 std::string LLVMBackend::FuncPtrArgDepthMismatch(const NamedVariable& arg,
         const TypeAndValue::FuncPtrParam& p) const
 {
@@ -2733,7 +2798,8 @@ std::string LLVMBackend::FuncPtrArgDepthMismatch(const NamedVariable& arg,
         param.Pointer = true;
         param.PointerDepth = p.PointerDepth;
         param.ElemPointer = p.PointerDepth >= 2;
-        if (!arg.TypeAndValue.PointerDepthRefuses(param))
+        if (IsAddressedUniqueSlotToRawSlot(arg, arg.TypeAndValue, param)
+            || !arg.TypeAndValue.PointerDepthRefuses(param))
             return "";
 
         TypeAndValue parameterBase;
@@ -2759,6 +2825,8 @@ bool LLVMBackend::DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceN
         const std::string displayIface = SpellType(*this, TypeAndValue{ .TypeName = ifaceName });
         for (size_t i = 0; i < args.size() && i < params.size(); i++)
         {
+            if (IsAddressedUniqueSlotToRawSlot(args[i], args[i].TypeAndValue, params[i]))
+                continue;
             if (ArgumentProvablyMismatchesParameter(args[i], params[i]))
             {
                 std::string why = DescribeFuncPtrSignatureMismatch(args[i].TypeAndValue, params[i]);
@@ -3089,6 +3157,7 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         // callArgNVs is arity-matched to Parameters by the resolver, so no clamp here: a
         // mismatched arity was already rejected instead of silently truncating the call.
         std::vector<llvm::Value*> callArgs;
+        std::vector<size_t> paramCallArgIndexes;
         if (cxxSretReturn)
             callArgs.push_back(cxxSretDest);
         callArgs.push_back(dataPtr);
@@ -3096,6 +3165,7 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         {
             const auto& nv = callArgNVs[i];
             const auto& param = methodInfo->Parameters[i];
+            const size_t firstCallArg = callArgs.size();
 
             const size_t recipeIndex = i + 1; // slot zero is the interface receiver
             if (recipeIndex < cxxSretRecipe.paramSlots.size()
@@ -3132,6 +3202,7 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                 callArgs.push_back(temp);
                 if (ParameterCarriesRawArrayCount(param))
                     callArgs.push_back(RawArrayCountArgument(nv));
+                paramCallArgIndexes.push_back(firstCallArg);
                 continue;
             }
 
@@ -3246,6 +3317,7 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             }
             if (ParameterCarriesRawArrayCount(param))
                 callArgs.push_back(RawArrayCountArgument(nv));
+            paramCallArgIndexes.push_back(firstCallArg);
         }
 
         // Restore the virtual method result side-channel after any nested core constructor call.
@@ -3268,12 +3340,15 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         unwindCallConsumedTemps_ = std::move(moveTransferConsumedTemps_);
         moveTransferConsumedTemps_.clear();
         auto* callResult = CreateCallOrInvoke(fnTy, fnPtr, callArgs, /*mayUnwind=*/true);
+        if (methodInfo->ReturnType.Pointer && !methodInfo->ReturnType.IsMove)
+            callResult->setMetadata("cflat.borrowed-pointer-return", llvm::MDNode::get(*context, {}));
         unwindCallConsumedTemps_.clear();
         // Dispatch has no body to prove the callee borrows; keep retained join-arm temps.
         DropRetainedJoinArmPtrTemps(callResult);
         if (cxxSretRecipe.hasLowering)
             ApplyAbiCallAttributes(callResult, cxxSretRecipe);
         llvm::Value* resultValue = callResult;
+        const auto& rt = methodInfo->ReturnType;
         if (cxxSretReturn)
         {
             resultValue = CreateLoad(cxxSretDest);
@@ -3287,6 +3362,17 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         }
         RegisterRawArrayCallResult(callResult, rawReturnCountSlot,
                                    methodInfo->ReturnType.AllocAlignValue);
+        std::vector<llvm::Value*> aliasCallArgs;
+        aliasCallArgs.reserve(methodInfo->Parameters.size());
+        for (size_t i = 0; i < methodInfo->Parameters.size(); ++i)
+        {
+            const size_t argIndex = i < paramCallArgIndexes.size()
+                ? paramCallArgIndexes[i] : callArgs.size();
+            aliasCallArgs.push_back(argIndex < callArgs.size() ? callArgs[argIndex] : nullptr);
+        }
+        bool aliasStringTempMayOwn = TryAdoptAliasReturnStringTemp(resultValue, rt,
+            rt.IsMove, rt.IsAlias, methodInfo->Parameters, aliasCallArgs, &callArgNVs,
+            /*requireReturnSinkParam*/ false);
 
         // An `adopt` parameter publishes an owned interface box into callee-managed storage.
         // The source remains readable, but its local teardown ownership is retired.
@@ -3336,18 +3422,19 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         // inline-used owned STRING result is registered for end-of-full-expression cleanup
         // (mirrors the direct path's RegisterOwnedStringTemp) so e.g. `tree.toJson().data()`
         // does not leak. Without this the virtual path left the result classified as a borrow.
-        const auto& rt = methodInfo->ReturnType;
         // Same argument-list retirement as the direct-call path: the result is a different value
         // than anything a `new`/`move` in the argument list produced.
         lastOwningResult = false;
         lastAllocAlignment = 0;
         // A core unique return owns like `move` (see the direct-call path).
         lastCallReturnsOwned = (rt.IsMove
+            || aliasStringTempMayOwn
             || (!rt.IsAlias && IsCoreUniqueType(rt.TypeName)))
             && (rt.TypeName == "string" || rt.Pointer || rt.IsInterface
                 || IsCoreUniqueType(rt.TypeName));
         if (lastCallReturnsOwned)
-            RegisterOwnedReturnTemp(resultValue, ifaceName + "." + methodName, rt);
+            RegisterOwnedReturnTemp(resultValue, ifaceName + "." + methodName, rt,
+                                    !aliasStringTempMayOwn);
         lastCallReturnsAllocAlign = rt.AllocAlignValue;
         if (lastCallReturnsOwned
             && resultValue->getType() == llvm::StructType::getTypeByName(*context, "string"))

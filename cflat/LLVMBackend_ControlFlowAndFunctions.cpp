@@ -493,6 +493,7 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
             TypeAndValue::FuncPtrParam fp;
             fp.TypeName = p.TypeName;
             fp.Pointer = p.Pointer;
+            fp.IsArrayView = p.IsArrayView;
             fp.AllocAlignValue = p.AllocAlignValue;
             fp.IsMove = p.IsMove;
             // Same as the Lookup twin: an inferred sink belongs to the function's signature.
@@ -501,8 +502,8 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
             fp.IsReturnInferredSink = p.IsReturnInferredSink;
             fp.IsWriteInferredSink = p.IsWriteInferredSink;
             fp.PointerDepth = p.ValuePointerDepth();
-            fp.ConstMask = p.PointeeConstMask();
-            fp.IsPointeeConst = (p.PointeeConstMask() & 1u) != 0;
+            fp.ConstMask = p.FunctionParamConstMask();
+            fp.IsPointeeConst = (fp.ConstMask & 1) != 0;
             tv.FuncPtrParams.push_back(fp);
         }
         return tv;
@@ -645,6 +646,11 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 RecordOpaqueReturnCall(call, funcPtrType.FuncPtrReturnTypeName,
                                        funcPtrType.VariableName);
             }
+        };
+        auto markBorrowedPointerReturn = [&](llvm::Value* result, const TypeAndValue& returnType) {
+            if (!returnType.Pointer || returnType.IsMove) return;
+            if (auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(result))
+                call->setMetadata("cflat.borrowed-pointer-return", llvm::MDNode::get(*context, {}));
         };
         auto publishIndirectSretValue = [&](const TypeAndValue& retTV, llvm::Value* value) {
             if (IsLoweredCFlatOnlyStruct(retTV.TypeName))
@@ -851,6 +857,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             }
             PreserveRetainedJoinArmTempsBeforeCall(nullptr, abiArgs);
             auto* result = CreateCallOrInvoke(cFnTy, fnPtr, abiArgs, /*mayUnwind=*/true);
+            markBorrowedPointerReturn(result, retTV);
             // thin function<> = bare C pointer: the callee may be clang -O2 C code (see the helper).
             if (auto* callBase = llvm::dyn_cast_or_null<llvm::CallBase>(result))
             {
@@ -1006,6 +1013,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         lastCallReturnType = retTV;
         PreserveRetainedJoinArmTempsBeforeCall(nullptr, fullArgs);
         auto* result = CreateCallOrInvoke(invokerTy, fnPtr, fullArgs, /*mayUnwind=*/true);
+        markBorrowedPointerReturn(result, retTV);
         DropRetainedJoinArmPtrTemps(result);
         if (cxxSretRecipe.hasLowering)
             ApplyAbiCallAttributes(result, cxxSretRecipe);

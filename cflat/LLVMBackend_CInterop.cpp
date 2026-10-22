@@ -5896,7 +5896,8 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                              std::vector<std::pair<std::string, std::string>>* outNamespaceAliases,
                              std::vector<std::string>* outClassTemplateNames,
                              std::vector<std::pair<std::string, std::string>>* outClassUsings,
-                             std::vector<std::string>* outClassTemplateSpecializations)
+                             std::vector<std::string>* outClassTemplateSpecializations,
+                             std::vector<cflat_cinterop::RawClassTemplate>* outClassTemplates)
 {
         if (headerPaths.empty()) return false;
         if (outHeaderFailure) *outHeaderFailure = false;
@@ -6175,6 +6176,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
             *outLongDoubleIsIEEEDouble = raw.longDoubleIsIEEEDouble;
         if (outTargetTriple) *outTargetTriple = raw.targetTriple;
         if (outFunctionTemplates) *outFunctionTemplates = raw.functionTemplates;
+        if (outClassTemplates) *outClassTemplates = raw.classTemplates;
         if (outClassTemplateNames) *outClassTemplateNames = raw.classTemplateNames;
         if (outClassTemplateSpecializations)
             *outClassTemplateSpecializations = raw.classTemplateSpecializations;
@@ -19993,6 +19995,132 @@ void LLVMBackend::RequestCxxMemberTypes(const std::vector<CRecordEntry>& records
         }
 }
 
+bool LLVMBackend::HasCxxClassTemplate(const std::string& baseName) const
+{
+        if (baseName.empty()) return false;
+        if (cxxClassTemplateParameters_.count(baseName) != 0) return true;
+        return cxxClassTemplateParameters_.count(ResolveQualifiedName(baseName)) != 0;
+}
+
+bool LLVMBackend::CompleteCxxTemplateTypeArgs(const std::string& baseName,
+                                               std::vector<std::string>& typeArgs)
+{
+        if (AnyGenericTypeTemplateNamed(baseName)) return false;
+        auto found = cxxClassTemplateParameters_.find(baseName);
+        if (found == cxxClassTemplateParameters_.end())
+        {
+            const std::string qualified = ResolveQualifiedName(baseName);
+            found = cxxClassTemplateParameters_.find(qualified);
+        }
+        if (found == cxxClassTemplateParameters_.end()
+            || typeArgs.size() >= found->second.parameters.size())
+            return false;
+
+        std::vector<std::string> completed = typeArgs;
+        const auto& parameters = found->second.parameters;
+        auto substituteTemplateParameter = [](std::string spelling, const std::string& name,
+                                              const std::string& replacement) {
+            if (name.empty()) return spelling;
+            auto isIdentifierChar = [](unsigned char ch) {
+                return std::isalnum(ch) || ch == '_';
+            };
+            size_t pos = 0;
+            while ((pos = spelling.find(name, pos)) != std::string::npos)
+            {
+                const size_t end = pos + name.size();
+                const bool leftBoundary = pos == 0
+                    || !isIdentifierChar(static_cast<unsigned char>(spelling[pos - 1]));
+                const bool rightBoundary = end == spelling.size()
+                    || !isIdentifierChar(static_cast<unsigned char>(spelling[end]));
+                if (leftBoundary && rightBoundary)
+                {
+                    spelling.replace(pos, name.size(), replacement);
+                    pos += replacement.size();
+                }
+                else
+                    pos = end;
+            }
+            return spelling;
+        };
+        for (size_t i = completed.size(); i < parameters.size(); ++i)
+        {
+            const auto& parameter = parameters[i];
+            if (!parameter.hasDefault) return false;
+            if (parameter.defaultParameterIndex >= 0)
+            {
+                const size_t index = (size_t)parameter.defaultParameterIndex;
+                if (index >= completed.size()) return false;
+                completed.push_back(completed[index]);
+            }
+            else if (parameter.kind == 'T')
+            {
+                std::string defaultSpelling = parameter.defaultArgument;
+                for (size_t prior = 0; prior < i; ++prior)
+                {
+                    std::string cxxArgument = completed[prior];
+                    if (parameters[prior].kind != 'N'
+                        && !CxxTemplateArgSpellingForCflatType(completed[prior], cxxArgument))
+                            return false;
+                    defaultSpelling = substituteTemplateParameter(
+                        std::move(defaultSpelling), parameters[prior].name, cxxArgument);
+                }
+                TypeAndValue defaultType;
+                if (!MapCTypeToTypeAndValue(defaultSpelling, defaultType,
+                                            /*cxxBoundary*/ true))
+                    return false;
+                if (defaultType.ConstMask != 0 || defaultType.IsCxxPointeeVolatile)
+                    return false;
+                auto defaultSpellingRoundTrips = [&](const TypeAndValue& mappedType,
+                                                     const std::string& originalSpelling) {
+                    std::string cflatArgument = mappedType.TypeName;
+                    cflatArgument.append((size_t)mappedType.ValuePointerDepth(), '*');
+                    std::string roundTrip;
+                    return CxxTemplateArgSpellingForCflatType(cflatArgument, roundTrip)
+                        && CanonicalCxxForeignIdentity(roundTrip)
+                            == CanonicalCxxForeignIdentity(originalSpelling);
+                };
+                if (defaultType.IsFunctionPointer)
+                {
+                    std::vector<std::pair<std::string, int>> fnParams;
+                    std::vector<int> fnParamConsts;
+                    for (const auto& fnParam : defaultType.FuncPtrParams)
+                    {
+                        fnParams.push_back({ fnParam.TypeName,
+                            ReconcilePointerDepth(fnParam.Pointer, fnParam.PointerDepth) });
+                        fnParamConsts.push_back(fnParam.ConstMask);
+                    }
+                    std::string encoded = BuildEncodedClosureName(this, true,
+                        defaultType.FuncPtrReturnTypeName,
+                        ReconcilePointerDepth(defaultType.FuncPtrReturnPointer,
+                                              defaultType.FuncPtrReturnPointerDepth),
+                        fnParams, defaultType.FuncPtrReturnConstMask, &fnParamConsts);
+                    RegisterEncodedClosureType(encoded, defaultType);
+                    std::string roundTrip;
+                    if (!CxxTemplateArgSpellingForCflatType(encoded, roundTrip)
+                        || CanonicalCxxForeignIdentity(roundTrip)
+                            != CanonicalCxxForeignIdentity(defaultSpelling))
+                        return false;
+                    completed.push_back(std::move(encoded));
+                    continue;
+                }
+                std::string argument = defaultType.TypeName;
+                argument.append((size_t)defaultType.ValuePointerDepth(), '*');
+                if (!defaultSpellingRoundTrips(defaultType, defaultSpelling)) return false;
+                completed.push_back(std::move(argument));
+            }
+            else if (parameter.kind == 'N')
+            {
+                if (parameter.defaultArgument.empty()) return false;
+                const std::string& value = parameter.defaultArgument;
+                completed.push_back(value == "true" ? "1" : value == "false" ? "0" : value);
+            }
+            else
+                return false;
+        }
+        typeArgs = std::move(completed);
+        return true;
+}
+
 /*
  * Entry point for both ParseDeclarationSpecifiers copies: build the C++ spelling from the CFlat
  * name (`std.vector` + { int } -> `std::vector<int>`) and request it. `typeArgs` empty means a
@@ -28273,6 +28401,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<std::pair<std::string, std::string>> hitNamespaceAliases;
         std::vector<std::pair<std::string, std::string>> hitClassUsings;
         std::vector<cflat_cinterop::RawFunctionTemplate> hitFunctionTemplates;
+        std::vector<cflat_cinterop::RawClassTemplate> hitClassTemplates;
         std::vector<std::string> hitClassTemplateNames;
         std::vector<std::string> hitClassTemplateSpecializations;
         std::vector<std::string> hitGroupNamespaces;
@@ -28305,6 +28434,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitNamespaceAliases = entry.namespaceAliases;
                     hitClassUsings = entry.classUsings;
                     hitFunctionTemplates = entry.functionTemplates;
+                    hitClassTemplates = entry.classTemplates;
                     hitClassTemplateNames = entry.classTemplateNames;
                     hitClassTemplateSpecializations = entry.classTemplateSpecializations;
                     hitGroupNamespaces = entry.cxxGroupNamespaces;
@@ -28328,6 +28458,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitNamespaceAliases = entry.namespaceAliases;
                     hitClassUsings = entry.classUsings;
                     hitFunctionTemplates = entry.functionTemplates;
+                    hitClassTemplates = entry.classTemplates;
                     hitClassTemplateNames = entry.classTemplateNames;
                     hitClassTemplateSpecializations = entry.classTemplateSpecializations;
                     hitGroupNamespaces = entry.cxxGroupNamespaces;
@@ -28340,6 +28471,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         }
         if (hit)
         {
+            for (const auto& classTemplate : hitClassTemplates)
+                cxxClassTemplateParameters_[classTemplate.name] = classTemplate;
             if (!cppMode && std::ranges::any_of(hitSigs, [](const CSigEntry& sig) { return sig.isInline; }))
             {
                 std::vector<std::string> hashFiles = hitDepPaths;
@@ -28471,6 +28604,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 }
                 if (cppMode) RememberCxxGroupReachableFiles(cxxGroupIndex, diskDepPaths);
                 if (cppMode) RememberCxxGroupClosureContent(cxxGroupIndex, diskEntry.deps);
+                for (const auto& classTemplate : diskEntry.classTemplates)
+                    cxxClassTemplateParameters_[classTemplate.name] = classTemplate;
                 replayCxxGroupNamespaces(diskEntry.cxxGroupNamespaces);
                 if (verbose) std::cout << std::format("[verbose] C header disk cache hit for {}\n", fileForLsp);
                 {
@@ -28578,6 +28713,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<std::pair<std::string, std::string>> aliases;
         std::vector<CTypeAliasEntry> typeAliases;
         std::vector<cflat_cinterop::RawFunctionTemplate> functionTemplates;
+        std::vector<cflat_cinterop::RawClassTemplate> classTemplates;
         std::vector<std::string> classTemplateNames;
         std::vector<std::string> classTemplateSpecializations;
         std::vector<std::pair<std::string, std::string>> usingDirectives;
@@ -28620,7 +28756,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                                      &functionPointerAbis, &longDoubleWidth,
                                      &longDoubleIsIEEEDouble, &targetTriple, &functionTemplates,
                                      &usingDirectives, &namespaceAliases, &classTemplateNames,
-                                     &classUsings, &classTemplateSpecializations))
+                                     &classUsings, &classTemplateSpecializations, &classTemplates))
             {
                 if (prereqFailure)
                     ReportOrphanHeader(headerPaths, prereqMsg, cppMode);
@@ -28655,6 +28791,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     }
             }
         }
+        for (const auto& classTemplate : classTemplates)
+            cxxClassTemplateParameters_[classTemplate.name] = classTemplate;
         if (cppMode) RememberCxxGroupReachableFiles(cxxGroupIndex, includes);
         if (cppMode && cxxGroupIndex < cxxImportGroups_.size())
             cxxImportGroups_[cxxGroupIndex].specializedTemplates.insert(
@@ -28678,6 +28816,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             entry.targetTriple = targetTriple;
             entry.sigs  = sigs;
             entry.functionTemplates = functionTemplates;
+            entry.classTemplates = classTemplates;
             entry.classTemplateNames = classTemplateNames;
             entry.classTemplateSpecializations = classTemplateSpecializations;
             entry.cxxGroupNamespaces = seededGroupNamespaces;

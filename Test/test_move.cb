@@ -6,6 +6,7 @@ import "queue.cb";
 import "dictionary.cb";
 import "diagnostic/heap_audit.cb";
 import "test_helper.cb";
+import "library/c_variadic_aggregate.c";
 
 int dtorCount = 0;
 int conditionalNewCount = 0;
@@ -113,6 +114,68 @@ struct Resource
     // Reads an argument only; used as the '?.' guarded-chain receiver in the arm-flush legs.
     int readId(int v) { return v; }
 };
+
+move Resource[] t362ReturnMovedView(bool c)
+{
+    Resource[] a = new Resource[2];
+    Resource[] b = new Resource[3];
+    a[0].id = 2;
+    b[0].id = 3;
+    return c ? move a : move b;
+}
+
+move Resource[] t362ReturnMixedMoveNew(bool c)
+{
+    Resource[] a = new Resource[2];
+    a[0].id = 2;
+    return c ? move a : new Resource[3];
+}
+
+move Resource[] t362ReassignMixedViewDirect(int c, int d)
+{
+    Resource[] w = new Resource[4];
+    Resource[] v = c ? new Resource[3] : w;
+    v = new Resource[5];
+    v[0].id = 50;
+    Resource[] a = new Resource[2];
+    a[0].id = 20;
+    return d ? move v : move a;
+}
+
+move Resource[] t362ReassignMixedViewTernary(int c, int d)
+{
+    Resource[] w = new Resource[4];
+    Resource[] v = c ? new Resource[3] : w;
+    v = d ? new Resource[5] : new Resource[6];
+    v[0].id = d ? 50 : 60;
+    Resource[] a = new Resource[2];
+    a[0].id = 20;
+    return d ? move v : move a;
+}
+
+move Resource[] t362ReassignMixedViewAfterTernary(int c, int d, int e)
+{
+    Resource[] w = new Resource[4];
+    Resource[] v = c ? new Resource[3] : w;
+    int z = e ? 0 : 1;
+    v = new Resource[5];
+    v[0].id = 50;
+    Resource[] a = new Resource[2];
+    a[0].id = 20;
+    return d ? move v : move a;
+}
+
+move Resource[] t362ReassignMixedViewAfterIf(int c, int d, int e)
+{
+    Resource[] w = new Resource[4];
+    Resource[] v = c ? new Resource[3] : w;
+    if (e) { dtorCount += 0; }
+    v = new Resource[5];
+    v[0].id = 50;
+    Resource[] a = new Resource[2];
+    a[0].id = 20;
+    return d ? move v : move a;
+}
 
 alias Resource* manualResource()
 {
@@ -6635,6 +6698,318 @@ int testOwningAssignIntoArrayViewElement()
         delete[_] heap3;
     }
 
+    return passed;
+}
+
+int testT362OwningViewTernaryMixedArm()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    i64 leakBaseline = (i64)HeapAudit.reportLeaks();
+
+    dtorCount = 0;
+    int selected = -1;
+    {
+        Resource[] w = new Resource[3];
+        w[0].id = 3;
+        Resource[] v = true ? new Resource[2] : w;
+        selected = v[0].id;
+    }
+    passed += Test("t362_view_decl_new_arm", (i64)selected * 100000
+        + (i64)dtorCount * 1000, (i64)5000);
+
+    dtorCount = 0;
+    {
+        Resource[] w = new Resource[3];
+        w[0].id = 3;
+        Resource[] v = new Resource[1];
+        v = true ? new Resource[2] : w;
+        selected = v[0].id;
+    }
+    passed += Test("t362_view_assign_new_arm", (i64)selected * 100000
+        + (i64)dtorCount * 1000, (i64)6000);
+
+    dtorCount = 0;
+    {
+        Resource[] w = new Resource[3];
+        w[0].id = 3;
+        int outer = 1;
+        int inner = 1;
+        Resource[] v = outer ? (inner ? new Resource[2] : w) : w;
+        selected = v[0].id;
+    }
+    passed += Test("t362_view_nested_new_arm", (i64)selected * 100000
+        + (i64)dtorCount * 1000, (i64)5000);
+
+    dtorCount = 0;
+    {
+        Resource[] a = new Resource[2];
+        Resource[] b = new Resource[3];
+        a[0].id = 2;
+        b[0].id = 3;
+        Resource[] v = true ? move a : move b;
+        selected = v[0].id;
+    }
+    passed += Test("t362_view_move_unequal_true", (i64)selected * 100000
+        + (i64)dtorCount * 1000, (i64)205000);
+
+    dtorCount = 0;
+    {
+        Resource[] a = new Resource[2];
+        Resource[] b = new Resource[3];
+        a[0].id = 2;
+        b[0].id = 3;
+        Resource[] v = false ? move a : move b;
+        selected = v[0].id;
+    }
+    passed += Test("t362_view_move_unequal_false", (i64)selected * 100000
+        + (i64)dtorCount * 1000, (i64)305000);
+
+    dtorCount = 0;
+    {
+        Resource[] a = new Resource[2];
+        Resource[] b = new Resource[2];
+        a[0].id = 2;
+        b[0].id = 3;
+        Resource[] v = true ? move a : move b;
+        selected = v[0].id;
+    }
+    passed += Test("t362_view_move_equal_true", (i64)selected * 100000
+        + (i64)dtorCount * 1000, (i64)204000);
+
+    dtorCount = 0;
+    {
+        Resource[] a = new Resource[2];
+        Resource[] b = new Resource[2];
+        a[0].id = 2;
+        b[0].id = 3;
+        Resource[] v = false ? move a : move b;
+        selected = v[0].id;
+    }
+    passed += Test("t362_view_move_equal_false", (i64)selected * 100000
+        + (i64)dtorCount * 1000, (i64)304000);
+    i64 leaks = (i64)HeapAudit.reportLeaks() - leakBaseline;
+    passed += Test("t362_view_heap_audit_no_leaks", leaks, 0);
+    return passed;
+}
+
+int testT362MovedViewReturns()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    i64 before = (i64)HeapAudit.reportLeaks();
+    int selected = -1;
+
+    dtorCount = 0;
+    {
+        Resource[] value = t362ReturnMovedView(true);
+        selected = value[0].id;
+    }
+    passed += Test("t362_return_moved_true_value_dtors",
+        (i64)selected * 100000 + (i64)dtorCount * 1000, (i64)205000);
+    passed += Test("t362_return_moved_true_no_leak",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    {
+        Resource[] value = t362ReturnMovedView(false);
+        selected = value[0].id;
+    }
+    passed += Test("t362_return_moved_false_value_dtors",
+        (i64)selected * 100000 + (i64)dtorCount * 1000, (i64)305000);
+    passed += Test("t362_return_moved_false_no_leak",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    {
+        Resource[] value = t362ReturnMixedMoveNew(true);
+        selected = value[0].id;
+    }
+    passed += Test("t362_return_mixed_move_true_value_dtors",
+        (i64)selected * 100000 + (i64)dtorCount * 1000, (i64)202000);
+    passed += Test("t362_return_mixed_move_true_no_leak",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    {
+        Resource[] value = t362ReturnMixedMoveNew(false);
+        selected = value[0].id;
+    }
+    passed += Test("t362_return_mixed_move_false_value_dtors",
+        (i64)selected * 100000 + (i64)dtorCount * 1000, (i64)5000);
+    passed += Test("t362_return_mixed_move_false_no_leak",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+int checkT362ReassignmentCase(string label, bool useTernaryAssign, int c, int d,
+                              int expectedId, int expectedDtors)
+{
+    int selected = -1;
+    int passed = 0;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        if (useTernaryAssign)
+        {
+            Resource[] result = t362ReassignMixedViewTernary(c, d);
+            selected = result[0].id;
+        }
+        else
+        {
+            Resource[] result = t362ReassignMixedViewDirect(c, d);
+            selected = result[0].id;
+        }
+    }
+    passed += Test(label.data(), selected == expectedId && dtorCount == expectedDtors
+        && (i64)HeapAudit.reportLeaks() - before == 0, true);
+    return passed;
+}
+
+int testT362StraightLineMixedViewReassignments()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    passed += checkT362ReassignmentCase("t362_reassign_direct_c0d0", false, 0, 0, 20, 11);
+    passed += checkT362ReassignmentCase("t362_reassign_direct_c0d1", false, 0, 1, 50, 11);
+    passed += checkT362ReassignmentCase("t362_reassign_direct_c1d0", false, 1, 0, 20, 14);
+    passed += checkT362ReassignmentCase("t362_reassign_direct_c1d1", false, 1, 1, 50, 14);
+    passed += checkT362ReassignmentCase("t362_reassign_ternary_c0d0", true, 0, 0, 20, 12);
+    passed += checkT362ReassignmentCase("t362_reassign_ternary_c0d1", true, 0, 1, 50, 11);
+    passed += checkT362ReassignmentCase("t362_reassign_ternary_c1d0", true, 1, 0, 20, 15);
+    passed += checkT362ReassignmentCase("t362_reassign_ternary_c1d1", true, 1, 1, 50, 14);
+    return passed;
+}
+
+int checkT362ControlSeparatedReown(string label, bool afterIf, int c, int d, int e)
+{
+    int selected = -1;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    if (afterIf)
+    {
+        Resource[] result = t362ReassignMixedViewAfterIf(c, d, e);
+        selected = result[0].id;
+    }
+    else
+    {
+        Resource[] result = t362ReassignMixedViewAfterTernary(c, d, e);
+        selected = result[0].id;
+    }
+    i64 leaks = (i64)HeapAudit.reportLeaks() - before;
+    int expectedId = d ? 50 : 20;
+    int expectedDtors = c ? 14 : 11;
+    return Test(label.data(), selected == expectedId && dtorCount == expectedDtors && leaks == 0, true);
+}
+
+int testT362ControlSeparatedMixedViewReown()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    passed += checkT362ControlSeparatedReown("t362_after_ternary_c0d0", false, 0, 0, 0);
+    passed += checkT362ControlSeparatedReown("t362_after_ternary_c0d1", false, 0, 1, 1);
+    passed += checkT362ControlSeparatedReown("t362_after_ternary_c1d0", false, 1, 0, 1);
+    passed += checkT362ControlSeparatedReown("t362_after_ternary_c1d1", false, 1, 1, 0);
+    passed += checkT362ControlSeparatedReown("t362_after_if_c0d0", true, 0, 0, 1);
+    passed += checkT362ControlSeparatedReown("t362_after_if_c0d1", true, 0, 1, 0);
+    passed += checkT362ControlSeparatedReown("t362_after_if_c1d0", true, 1, 0, 0);
+    passed += checkT362ControlSeparatedReown("t362_after_if_c1d1", true, 1, 1, 1);
+    return passed;
+}
+
+// Joins in an outer loop, then an inner break/continue or switch that skips no re-own: accepted.
+move Resource[] t362NestedBreakReown(int c, int d, int e)
+{
+    Resource[] w = new Resource[4];
+    Resource[] v = new Resource[1];
+    int i = 0;
+    while (i < 1) { i++; v = c ? new Resource[3] : w; while (e) { break; } v = new Resource[5]; v[0].id = 50; }
+    Resource[] a = new Resource[2];
+    a[0].id = 20;
+    return d ? move v : move a;
+}
+
+move Resource[] t362NestedContinueReown(int c, int d, int e)
+{
+    Resource[] w = new Resource[4];
+    Resource[] v = new Resource[1];
+    int i = 0;
+    while (i < 1) { i++; v = c ? new Resource[3] : w; int j = 0; while (j < 1) { j++; continue; } v = new Resource[5]; v[0].id = 50; }
+    Resource[] a = new Resource[2];
+    a[0].id = 20;
+    return d ? move v : move a;
+}
+
+move Resource[] t362SwitchNoJoinReown(int c, int d, int e)
+{
+    Resource[] w = new Resource[4];
+    Resource[] v = new Resource[1];
+    int i = 0;
+    while (i < 1) { i++; v = c ? new Resource[3] : w; switch (e) { case 0: dtorCount += 0; break; default: break; } v = new Resource[5]; v[0].id = 50; }
+    Resource[] a = new Resource[2];
+    a[0].id = 20;
+    return d ? move v : move a;
+}
+
+int checkT362NestedReown(string label, int shape, int c, int d, int e)
+{
+    int selected = -1;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        if (shape == 0)
+        {
+            Resource[] result = t362NestedBreakReown(c, d, e);
+            selected = result[0].id;
+        }
+        else if (shape == 1)
+        {
+            Resource[] result = t362NestedContinueReown(c, d, e);
+            selected = result[0].id;
+        }
+        else
+        {
+            Resource[] result = t362SwitchNoJoinReown(c, d, e);
+            selected = result[0].id;
+        }
+    }
+    i64 leaks = (i64)HeapAudit.reportLeaks() - before;
+    int expectedId = d ? 50 : 20;
+    int expectedDtors = c ? 15 : 12;
+    return Test(label.data(), selected == expectedId && dtorCount == expectedDtors && leaks == 0, true);
+}
+
+int testT362NestedLoopSwitchReown()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    passed += checkT362NestedReown("t362_nested_break_c0d0e0", 0, 0, 0, 0);
+    passed += checkT362NestedReown("t362_nested_break_c0d0e1", 0, 0, 0, 1);
+    passed += checkT362NestedReown("t362_nested_break_c0d1e0", 0, 0, 1, 0);
+    passed += checkT362NestedReown("t362_nested_break_c0d1e1", 0, 0, 1, 1);
+    passed += checkT362NestedReown("t362_nested_break_c1d0e0", 0, 1, 0, 0);
+    passed += checkT362NestedReown("t362_nested_break_c1d0e1", 0, 1, 0, 1);
+    passed += checkT362NestedReown("t362_nested_break_c1d1e0", 0, 1, 1, 0);
+    passed += checkT362NestedReown("t362_nested_break_c1d1e1", 0, 1, 1, 1);
+    passed += checkT362NestedReown("t362_nested_continue_c0d0e0", 1, 0, 0, 0);
+    passed += checkT362NestedReown("t362_nested_continue_c0d0e1", 1, 0, 0, 1);
+    passed += checkT362NestedReown("t362_nested_continue_c0d1e0", 1, 0, 1, 0);
+    passed += checkT362NestedReown("t362_nested_continue_c0d1e1", 1, 0, 1, 1);
+    passed += checkT362NestedReown("t362_nested_continue_c1d0e0", 1, 1, 0, 0);
+    passed += checkT362NestedReown("t362_nested_continue_c1d0e1", 1, 1, 0, 1);
+    passed += checkT362NestedReown("t362_nested_continue_c1d1e0", 1, 1, 1, 0);
+    passed += checkT362NestedReown("t362_nested_continue_c1d1e1", 1, 1, 1, 1);
+    passed += checkT362NestedReown("t362_switch_no_join_c0d0e0", 2, 0, 0, 0);
+    passed += checkT362NestedReown("t362_switch_no_join_c0d0e1", 2, 0, 0, 1);
+    passed += checkT362NestedReown("t362_switch_no_join_c0d1e0", 2, 0, 1, 0);
+    passed += checkT362NestedReown("t362_switch_no_join_c0d1e1", 2, 0, 1, 1);
+    passed += checkT362NestedReown("t362_switch_no_join_c1d0e0", 2, 1, 0, 0);
+    passed += checkT362NestedReown("t362_switch_no_join_c1d0e1", 2, 1, 0, 1);
+    passed += checkT362NestedReown("t362_switch_no_join_c1d1e0", 2, 1, 1, 0);
+    passed += checkT362NestedReown("t362_switch_no_join_c1d1e1", 2, 1, 1, 1);
     return passed;
 }
 
@@ -13303,6 +13678,10 @@ int testT277LocalReinitAccept()
 }
 
 struct T281ArrayBox { unique Resource* item = nullptr; };
+T281ArrayBox t367GlobalField;
+T281ArrayBox[2] t367GlobalArray;
+Resource* t367GlobalRaw = nullptr;
+int t367BorrowRead(Resource* value) { return value->id; }
 
 int testT281ArrayElementAcceptSet()
 {
@@ -13422,6 +13801,63 @@ int testT281PlainOwnerArrayAcceptSet()
         passed += Test("t281_plain_live_sibling_after_move_dtor", dtorCount, 1);
     }
     passed += Test("t281_plain_live_sibling_scope_dtor", dtorCount, 2);
+
+    return passed;
+}
+
+int testT367GlobalMoveAcceptSet()
+{
+    int passed = 0;
+
+    dtorCount = 0;
+    t367GlobalField.item = t266MakeResource(3671);
+    passed += Test("t367_global_field_borrow_value",
+                   t367BorrowRead(t367GlobalField.item), 3671);
+    t266ConsumeResource(move t367GlobalField.item);
+    passed += Test("t367_global_field_move_null", t367GlobalField.item == nullptr, true);
+    passed += Test("t367_global_field_move_destroyed", dtorCount, 1);
+    t367GlobalField.item = t266MakeResource(3672);
+    passed += Test("t367_global_field_reinit_value", t367GlobalField.item->id, 3672);
+    t266ConsumeResource(move t367GlobalField.item);
+    passed += Test("t367_global_field_freed_once_each", dtorCount, 2);
+
+    dtorCount = 0;
+    t367GlobalArray[0].item = t266MakeResource(3681);
+    t266ConsumeResource(move t367GlobalArray[0].item);
+    passed += Test("t367_global_array_move_null", t367GlobalArray[0].item == nullptr, true);
+    passed += Test("t367_global_array_move_destroyed", dtorCount, 1);
+    t367GlobalArray[0].item = t266MakeResource(3682);
+    passed += Test("t367_global_array_reinit_value", t367GlobalArray[0].item->id, 3682);
+    t266ConsumeResource(move t367GlobalArray[0].item);
+    passed += Test("t367_global_array_freed_once_each", dtorCount, 2);
+
+    dtorCount = 0;
+    t367GlobalArray[0].item = t266MakeResource(3683);
+    t367GlobalArray[1].item = t266MakeResource(3684);
+    int i = 1;
+    t266ConsumeResource(t367GlobalArray[i].item);
+    passed += Test("t367_global_dynamic_other_index_value", t367GlobalArray[0].item->id, 3683);
+    passed += Test("t367_global_dynamic_move_freed", dtorCount, 1);
+    t266ConsumeResource(move t367GlobalArray[0].item);
+    passed += Test("t367_global_dynamic_freed_once_each", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        T281ArrayBox local = default;
+        local.item = t266MakeResource(3691);
+        t266ConsumeResource(local.item);
+        local.item = t266MakeResource(3692);
+        passed += Test("t367_local_field_reinit_value", local.item->id, 3692);
+        passed += Test("t367_local_field_move_destroyed", dtorCount, 1);
+    }
+    passed += Test("t367_local_field_freed_once_each", dtorCount, 2);
+
+    // A plain (non-unique) global pointer to a destructible struct is not owning storage.
+    dtorCount = 0;
+    t367GlobalRaw = new Resource{ id = 3693 };
+    t266ConsumeResource(t367GlobalRaw);
+    passed += Test("t367_global_raw_ptr_consume_null", t367GlobalRaw == nullptr, true);
+    passed += Test("t367_global_raw_ptr_consume_destroyed", dtorCount, 1);
 
     return passed;
 }
@@ -14084,6 +14520,8 @@ extern int main()
 
     passed += testT281ArrayElementAcceptSet();
     total += 19;
+    passed += testT367GlobalMoveAcceptSet();
+    total += 17;
     passed += testT281PlainOwnerArrayAcceptSet();
     total += 10;
     passed += testT281ArrayIfElseReinit(0, 2873);
@@ -14510,6 +14948,8 @@ extern int main()
     total += 7;
     passed += testUniqueMoveThroughDeref();
     total += 28;
+    passed += testT365UniqueSlotPtr();
+    total += 17;
     passed += testChainedRawIntoUnique();
     total += 7;
     passed += testChainedRawShapes();
@@ -14552,10 +14992,32 @@ extern int main()
 
     passed += testC15DataMutHeap();
     total += 12;
+    total += 6;
 
     passed += testT357AliasReturnTemp();
     total += 32;
+
+    passed += testT360AliasReturnTemp();
+    total += 11;
     total += 3;
+
+    passed += testT364NativeOperatorReturnFacts();
+    total += 15;
+
+    passed += testT362OwningViewTernaryMixedArm();
+    total += 8;
+
+    passed += testT362MovedViewReturns();
+    total += 8;
+
+    passed += testT362StraightLineMixedViewReassignments();
+    total += 8;
+
+    passed += testT362ControlSeparatedMixedViewReown();
+    total += 8;
+
+    passed += testT362NestedLoopSwitchReown();
+    total += 24;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
@@ -15163,6 +15625,67 @@ int testUniqueMoveThroughDeref()
     t199LoopBodyDiscardUniqDecl();
     passed += Test("t199_loop_body_discard_uniq_decl_dtors", gT199Dtors, 2);
     passed += Test("t199_loop_body_discard_uniq_decl_value", gT199Last, 7);
+    return passed;
+}
+
+int gT365Dtors = 0;
+struct T365Res { int v = 0; ~T365Res() { gT365Dtors = gT365Dtors + 1; } };
+struct T365Hold { unique<T365Res>* p = nullptr; };
+
+int t365Pick(unique<T365Res>* p) { return p->get()->v + 100; }
+int t365Pick(T365Res** p) { return (**p).v + 200; }
+int t365RawOnly(T365Res** p) { return (**p).v; }
+int t365Generic<T>(unique<T>* p) { return p->get() == nullptr ? -1 : p->get()->v; }
+interface T365RawSlotIface { int raw(T365Res** p); };
+class T365RawSlotImpl : T365RawSlotIface
+{
+    int raw(T365Res** p) { return (**p).v; }
+};
+
+int testT365UniqueSlotPtr()
+{
+    int passed = 0;
+    gT365Dtors = 0;
+    {
+        unique<T365Res> first = unique<T365Res>(new T365Res());
+        unique<T365Res> second = unique<T365Res>(new T365Res());
+        first->v = 17;
+        second->v = 29;
+        T365Hold h;
+        h.p = &first;
+        passed += Test("t365_unique_slot_field_arrow", h.p->get()->v, 17);
+        passed += Test("t365_unique_slot_field_deref", (*h.p).get()->v, 17);
+        h.p = &second;
+        passed += Test("t365_unique_slot_field_reassign", h.p->get()->v, 29);
+        h.p = nullptr;
+        passed += Test("t365_unique_slot_field_null", h.p == nullptr, true);
+    }
+    passed += Test("t365_unique_slot_field_owners_freed_once", gT365Dtors, 2);
+
+    gT365Dtors = 0;
+    {
+        unique<T365Res> owner = unique<T365Res>(new T365Res());
+        owner->v = 17;
+        passed += Test("t365_unique_slot_overload", t365Pick(&owner), 117);
+        passed += Test("t365_unique_slot_generic", t365Generic<T365Res>(&owner), 17);
+        passed += Test("t365_unique_slot_raw_only_compat", t365RawOnly(&owner), 17);
+        function<int(T365Res**)> rawFn = t365RawOnly;
+        passed += Test("t365_unique_slot_function_value", rawFn(&owner), 17);
+        function<int(T365Res**)>* rawFnPtr = &rawFn;
+        passed += Test("t365_unique_slot_function_pointer", (*rawFnPtr)(&owner), 17);
+        T365RawSlotIface rawIface = T365RawSlotImpl();
+        passed += Test("t365_unique_slot_interface", rawIface.raw(&owner), 17);
+        unique<int> scalarOwner = unique<int>(new int(19));
+        passed += Test("t365_unique_slot_c_import", t365_c_raw_slot(&scalarOwner), 19);
+        passed += Test("t365_unique_slot_foreign_calls_keep_owner", *scalarOwner, 19);
+        unique<T365Res>* slot = &owner;
+        unique<T365Res>** doubleSlot = &slot;
+        passed += Test("t365_unique_slot_double_pointer", (*doubleSlot)->get()->v, 17);
+        unique<T365Res> moved = move (*slot);
+        passed += Test("t365_unique_slot_move_value", moved->v, 17);
+        passed += Test("t365_unique_slot_move_nulls_owner", owner == nullptr, true);
+    }
+    passed += Test("t365_unique_slot_move_frees_once", gT365Dtors, 1);
     return passed;
 }
 
@@ -16258,6 +16781,36 @@ int c15DataMutOwnedSource()
     return value == (int)'P' && source.data()[0] == 'a' ? 1 : 0;
 }
 
+int t361DataMutPointerAlias(string s)
+{
+    string* p = &s;
+    p->data_mut()[0] = 'X';
+    return (int)s.data()[0];
+}
+
+int t361DataMutParenAlias(string s)
+{
+    string* p = &s;
+    (*p).data_mut()[0] = 'Y';
+    return (int)s.data()[0];
+}
+
+int t361DataMutAliasChain(string s)
+{
+    string* p = &s;
+    string* q = p;
+    q->data_mut()[0] = 'Z';
+    return (int)s.data()[0];
+}
+
+int t361DataMutReassignedAlias(string first, string target)
+{
+    string* p = &first;
+    p = &target;
+    p->data_mut()[0] = 'T';
+    return (int)target.data()[0];
+}
+
 int testC15DataMutHeap()
 {
     int passed = 0;
@@ -16307,6 +16860,51 @@ int testC15DataMutHeap()
     after = (i64)HeapAudit.reportLeaks();
     passed += Test("c15_data_mut_owned_source_unchanged", ownedSourceValue, 1);
     passed += Test("c15_data_mut_owned_source_freed", after - before, (i64)0);
+
+    string pointerAliasSource = "abc".copy();
+    before = (i64)HeapAudit.reportLeaks();
+    int pointerAliasValue = t361DataMutPointerAlias(pointerAliasSource);
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t361_data_mut_pointer_alias_value_caller_heap",
+        pointerAliasValue == (int)'X' && pointerAliasSource == "abc"
+            && after - before == (i64)0, true);
+
+    string parenAliasSource = "abc".copy();
+    before = (i64)HeapAudit.reportLeaks();
+    int parenAliasValue = t361DataMutParenAlias(parenAliasSource);
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t361_data_mut_paren_alias_value_caller_heap",
+        parenAliasValue == (int)'Y' && parenAliasSource == "abc"
+            && after - before == (i64)0, true);
+
+    string aliasChainSource = "abc".copy();
+    before = (i64)HeapAudit.reportLeaks();
+    int aliasChainValue = t361DataMutAliasChain(aliasChainSource);
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t361_data_mut_alias_chain_value_caller_heap",
+        aliasChainValue == (int)'Z' && aliasChainSource == "abc"
+            && after - before == (i64)0, true);
+
+    string reassignedFirst = "abc".copy();
+    string reassignedTarget = "def".copy();
+    before = (i64)HeapAudit.reportLeaks();
+    int reassignedValue = t361DataMutReassignedAlias(reassignedFirst, reassignedTarget);
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t361_data_mut_reassigned_alias_value_callers_heap",
+        reassignedValue == (int)'T' && reassignedFirst == "abc" && reassignedTarget == "def"
+            && after - before == (i64)0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    int literalAliasValue = t361DataMutPointerAlias("lit");
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t361_data_mut_literal_alias_value_heap",
+        literalAliasValue == (int)'X' && after - before == (i64)0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    int emptyAliasValue = t361DataMutPointerAlias("");
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t361_data_mut_empty_alias_value_heap",
+        emptyAliasValue == (int)'X' && after - before == (i64)0, true);
     return passed;
 }
 
@@ -16518,5 +17116,382 @@ int testT357AliasReturnTemp()
     }
     after = (i64)HeapAudit.reportLeaks();
     passed += Test("t357_named_arg_owner_cleanup", after - before, (i64)0);
+    return passed;
+}
+
+struct T360AliasMethod { string f(string s) { return s; } };
+struct T360AliasGeneric<T> { string f(string s) { return s; } };
+interface T360AliasIface { string f(string s); };
+class T360AliasImpl : T360AliasIface { string f(string s) { return s; } };
+struct T360AliasHolder { string value = default; };
+struct T360AliasReceiver { string f(string s) { return s; } };
+struct T360AliasOperator { int k = 0; string operator+(string s) { return s; } };
+move string t360AliasMake() { return "mk-t360".copy(); }
+move T360AliasReceiver t360AliasMakeReceiver() { return default; }
+string t360AliasNamed(string s) { return s; }
+string t360AliasReturnMethod()
+{
+    T360AliasMethod method = default;
+    return method.f(t360AliasMake());
+}
+
+int testT360AliasReturnTemp()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    i64 before = 0;
+    i64 live = 0;
+    i64 after = 0;
+    int value = 0;
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T360AliasMethod method = default;
+        string result = method.f("method-t360".copy());
+        value = (int)result.data()[0];
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t360_method_copy_value_and_cleanup",
+                   value == (int)'m' && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        Lambda<string(string)> fn = (string s) => { _ = move s; return "q".copy(); };
+        string result = fn(t360AliasMake());
+        value = (int)result.data()[0];
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t360_lambda_consume_fresh_return_value_and_cleanup",
+                   value == (int)'q' && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        function<string(string)> fn = (string s) => { _ = move s; return "mk-wxyz".copy(); };
+        string result = fn(t360AliasMake());
+        value = (int)result.data()[3];
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t360_function_consume_fresh_return_value_and_cleanup",
+                   value == (int)'w' && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T360AliasOperator x = default;
+        string result = x + t360AliasMake();
+        value = (int)result.data()[0];
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t360_member_operator_alias_value_and_cleanup",
+                   value == (int)'m' && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T360AliasGeneric<int> generic = default;
+        string result = default;
+        result = generic.f(t360AliasMake());
+        value = (int)result.data()[0];
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t360_generic_mk_value_and_cleanup",
+                   value == (int)'m' && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T360AliasImpl impl = default;
+        T360AliasIface iface = impl;
+        T360AliasHolder holder = default;
+        holder.value = iface.f("iface-t360".copy());
+        value = (int)holder.value.data()[0];
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t360_interface_copy_value_and_cleanup",
+                   value == (int)'i' && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        Lambda<string(string)> fn = (string s) => { return s; };
+        string result = fn(t360AliasMake());
+        value = (int)result.data()[0];
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t360_lambda_mk_value_and_cleanup",
+                   value == (int)'m' && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        function<string(string)> fn = (string s) => { return s; };
+        string result = fn("function-lambda-t360".copy());
+        value = (int)result.data()[0];
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t360_function_lambda_copy_value_and_cleanup",
+                   value == (int)'f' && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        function<string(string)> fn = t360AliasNamed;
+        string result = fn(t360AliasMake());
+        value = (int)result.data()[0];
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t360_function_named_mk_value_and_cleanup",
+                   value == (int)'m' && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        string valueString = t360AliasMakeReceiver().f(t360AliasMake());
+        value = (int)valueString.data()[0];
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t360_temporary_receiver_mk_value_and_cleanup",
+                   value == (int)'m' && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        string result = t360AliasReturnMethod();
+        value = (int)result.data()[0];
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t360_method_return_context_value_and_cleanup",
+                   value == (int)'m' && live == 1 && after == 0, true);
+    return passed;
+}
+
+struct T364FieldOperator
+{
+    string field = default;
+    string operator+(string s) { return field; }
+};
+struct T364StoreOperator
+{
+    string field = default;
+    string operator+(string s) { field = s; return field; }
+};
+struct T364ParamOperator { string operator+(string s) { return s; } };
+struct T364FreeParamOperator { int value = 0; };
+struct T364FreeFieldOperator { string field = default; };
+struct T364FreshFreeOperator { string field = default; };
+string operator+(T364FreeParamOperator value, string s) { return s; }
+string operator+(T364FreeFieldOperator value, string s) { return value.field; }
+string operator+(T364FreshFreeOperator a, T364FreshFreeOperator b)
+{
+    string result = a.field + b.field;
+    return result;
+}
+move string t364OperatorMake() { return "mk-t364".copy(); }
+T364FieldOperator t364OperatorMakeReceiver()
+{
+    T364FieldOperator value = default;
+    value.field = "temp-t364".copy();
+    return value;
+}
+T364FreeFieldOperator t364OperatorMakeFreeFieldReceiver()
+{
+    T364FreeFieldOperator value = default;
+    value.field = "nm-abcd".copy();
+    return value;
+}
+string t364OperatorRelay(T364FieldOperator* value) { return *value + t364OperatorMake(); }
+int t364OperatorReadFirst(string value) { return (int)value.data()[0]; }
+
+int testT364NativeOperatorReturnFacts()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    i64 before = 0;
+    i64 live = 0;
+    i64 after = 0;
+    int value = 0;
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T364FieldOperator op = default;
+        op.field = "field-t364".copy();
+        string result = op + t364OperatorMake();
+        value = (int)result.data()[0];
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t364_member_field_result_value_and_cleanup",
+                   value == (int)'f' && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T364FieldOperator op = default;
+        op.field = "FIELD-named".copy();
+        string named = "named-arg".copy();
+        string result = op + named;
+        value = result.data()[0] == (char)'F' && op.field.data()[0] == (char)'F' ? 1 : 0;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t364_member_field_named_arg_value_and_cleanup",
+                   value == 1 && live == 2 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T364FieldOperator op = default;
+        op.field = "LITERAL-field".copy();
+        string result = op + "literal-arg";
+        value = result.data()[0] == (char)'L' && op.field.data()[0] == (char)'L' ? 1 : 0;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t364_member_field_literal_arg_value_and_cleanup",
+                   value == 1 && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T364ParamOperator op = default;
+        string named = "param-named".copy();
+        string result = op + named;
+        value = result.data()[0] == (char)'p' && named.data()[0] == (char)'p' ? 1 : 0;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t364_member_param_named_arg_value_and_cleanup",
+                   value == 1 && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T364StoreOperator op = default;
+        string result = op + t364OperatorMake();
+        value = result.data()[0] == (char)'m' && op.field.data()[0] == (char)'m' ? 1 : 0;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t364_member_store_param_result_value_and_cleanup",
+                   value == 1 && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T364FreeParamOperator op = default;
+        string named = "free-named".copy();
+        string result = op + named;
+        value = result.data()[0] == (char)'f' && named.data()[0] == (char)'f' ? 1 : 0;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t364_free_param_named_arg_value_and_cleanup",
+                   value == 1 && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T364FreeFieldOperator op = default;
+        op.field = "FIELD-free".copy();
+        string named = "named-free".copy();
+        string result = op + named;
+        value = result.data()[0] == (char)'F' && op.field.data()[0] == (char)'F' ? 1 : 0;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t364_free_field_result_value_and_cleanup",
+                   value == 1 && live == 3 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        string result = t364OperatorMakeFreeFieldReceiver() + "q";
+        value = result.data()[0] == (char)'n' ? 1 : 0;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t364_free_field_temp_result_value_and_cleanup",
+                   value == 1 && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T364FieldOperator op = default;
+        op.field = "assign-field".copy();
+        string result = default;
+        result = op + t364OperatorMake();
+        value = (int)result.data()[0];
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t364_member_field_assigned_result_value_and_cleanup",
+                   value == (int)'a' && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T364FieldOperator op = default;
+        op.field = "relay-field".copy();
+        string result = t364OperatorRelay(&op);
+        value = (int)result.data()[0];
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t364_member_field_returned_result_value_and_cleanup",
+                   value == (int)'r' && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T364FieldOperator op = default;
+        op.field = "passed-field".copy();
+        value = t364OperatorReadFirst(op + t364OperatorMake());
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t364_member_field_passed_result_value_and_cleanup",
+                   value == (int)'p' && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T364FieldOperator op = default;
+        op.field = "discard-field".copy();
+        int length = (op + t364OperatorMake()).length();
+        value = length;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t364_member_field_discarded_result_value_and_cleanup",
+                   value == 13 && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T364ParamOperator op = default;
+        string left = "a".copy();
+        string right = "b".copy();
+        string result = op + left + right;
+        value = result.data()[0] == (char)'a' && result.data()[1] == (char)'b' ? 1 : 0;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t364_member_operator_compound_value_and_cleanup",
+                   value == 1 && live == 3 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        string result = (t364OperatorMakeReceiver() + t364OperatorMake()).copy();
+        value = (int)result.data()[0];
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t364_temp_receiver_field_copy_value_and_cleanup",
+                   value == (int)'t' && live == 1 && after == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T364FreshFreeOperator left = default;
+        left.field = "ab".copy();
+        T364FreshFreeOperator right = default;
+        right.field = "cd".copy();
+        left + right;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t364_free_fresh_operator_discard_and_cleanup",
+                   live == 2 && after == 0, true);
+
     return passed;
 }

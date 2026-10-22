@@ -915,6 +915,7 @@ bool MainListener::ConditionIsSentinel(antlr4::tree::ParseTree* node) {
     }
 
 void MainListener::ParseControlledBody(CFlatParser::StatementContext* body) {
+        OwnershipControlScope controlScope(Compiler());
         ParseStatement(body);
         if (body != nullptr && body->compoundStatement() == nullptr)
             Compiler(body)->FlushOwnedTemps();
@@ -2757,12 +2758,23 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
 
         if (ReturnLeaksOwnershipIntoInterface(right, compiler, returnNV.IsPointerArithmeticResult))
         {
-            LogErrorContext(errCtx, std::format(
-                "returning a heap object boxed into interface '{}' from a non-'move' function "
-                "transfers ownership the caller cannot see - it will leak. Declare the return "
-                "type 'move {}' so the caller knows to 'delete' it.",
-                CurrentReturnTypeSpelling(compiler),
-                CurrentReturnTypeSpelling(compiler)));
+            if (returnNV.IsPointerArithmeticResult)
+            {
+                LogErrorContext(errCtx, std::format(
+                    "returning a heap object boxed into interface '{}' from a non-'move' function "
+                    "may leak because the caller cannot see ownership. Pointer arithmetic may "
+                    "produce an interior pointer that cannot be safely treated as an owned "
+                    "interface object. Return a borrow rooted in a longer-lived owner, or return "
+                    "the original owner through an ownership-carrying pointer type.",
+                    CurrentReturnTypeSpelling(compiler)));
+            }
+            else
+                LogErrorContext(errCtx, std::format(
+                    "returning a heap object boxed into interface '{}' from a non-'move' function "
+                    "transfers ownership the caller cannot see - it will leak. Declare the return "
+                    "type 'move {}' so the caller knows to 'delete' it.",
+                    CurrentReturnTypeSpelling(compiler),
+                    CurrentReturnTypeSpelling(compiler)));
         }
 
         // A FRESH ALLOCATION handed back through a BARE pointer return type gives the
@@ -3591,6 +3603,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
         {
             // Dispatch may reach this label directly, skipping earlier cases: merge the pre-switch state.
             compiler->MergeMovedStateInto(switchStack.back().preSwitchMoved);
+            // Dispatch may skip earlier case groups: joins made inside the switch move out of its frame.
+            compiler->ReanchorOwnFlagJoinsOutOf(LLVMBackend::OwnFlagSwitchFrame);
             auto& ctx = switchStack.back();
             llvm::BasicBlock* targetBlock = nullptr;
 
@@ -3716,6 +3730,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 // continue re-tests the condition; an always-true condition never exits the loop there.
                 if (loopConditionAlwaysTrue_.empty() || !loopConditionAlwaysTrue_.back())
                     RecordLoopExitMovedState();
+                // The jump skips later stores inside the loop: joins made there move out of it.
+                compiler->ReanchorOwnFlagJoinsOutOf(LLVMBackend::OwnFlagLoopFrame);
                 straightLineJumped_ = true;
                 compiler->CreateContinueCall();
                 return;
@@ -3727,6 +3743,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     switchStack.back().exitMoved.push_back(compiler->SaveMovedState());
                 else
                     RecordLoopExitMovedState();
+                // The jump skips later stores inside the exited construct: joins made there move out of it.
+                compiler->ReanchorOwnFlagJoinsOutOf(LLVMBackend::OwnFlagLoopFrame | LLVMBackend::OwnFlagSwitchFrame);
                 straightLineJumped_ = true;
                 compiler->CreateBreakCall();
                 return;
@@ -3805,6 +3823,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
             // non-null for both rules. Do() is unambiguous and must be tested first.
             if (iterationStatement->Do())
             {
+                OwnershipControlScope loopControlScope(compiler, LLVMBackend::OwnFlagLoopFrame);
                 auto expression = iterationStatement->expression();
                 auto innerStatement = iterationStatement->statement();
                 MarkLoopBackEdgeCxxConstPointers(compiler, iterationStatement);
@@ -3837,6 +3856,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
             }
             else if (iterationStatement->While())
             {
+                OwnershipControlScope loopControlScope(compiler, LLVMBackend::OwnFlagLoopFrame);
                 auto expression = iterationStatement->expression();
                 auto innerStatement = iterationStatement->statement();
                 MarkLoopBackEdgeCxxConstPointers(compiler, iterationStatement);
@@ -3902,7 +3922,9 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 {
                     auto forCondition = iterationStatement->forCondition();
                     auto declaration = forCondition->forDeclaration();
-                    auto expressionCtx = forCondition->expression();
+                    auto expressionStatementCtx = forCondition->expressionStatement();
+                    auto expressionCtx = expressionStatementCtx != nullptr
+                        ? expressionStatementCtx->expression() : nullptr;
                     auto forIncrementCtx = forCondition->forExpression();
                     auto compareCtx = forCondition->assignmentExpression();
                     auto innerStatement = iterationStatement->statement();
@@ -3933,8 +3955,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     }
                     if (expressionCtx)
                     {
-                        // for-init is a discard position too: a bare owning-return call must error
-                        // and any owned temp must be freed here (mirrors the statement/for-update).
+                        // Evaluate the initializer with the same discarded-expression semantics as a statement.
                         auto* initAssign = expressionCtx->assignmentExpression();
                         bool bareExpr = initAssign->assignmentOperator() == nullptr;
                         auto nv = ParseAssignmentExpressionNamed(initAssign, ResultUse::Discard);
@@ -3944,6 +3965,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         compiler->FlushOwnedTemps();
                     }
 
+                    OwnershipControlScope loopControlScope(compiler, LLVMBackend::OwnFlagLoopFrame);
                     MarkLoopBackEdgeCxxConstPointers(compiler, iterationStatement);
 
                     compiler->CreateBlockBreak(blockCondition, false);
@@ -5272,8 +5294,12 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 switchCtx.loopDepth = loopBreakMovedStates_.size();
                 switchStack.push_back(switchCtx);
 
-                if (body && body->blockItemList())
-                    ParseBlockItemList(body->blockItemList());
+                {
+                    // One frame for the whole body: every statement of a case group is conditional on its label.
+                    OwnershipControlScope switchBodyControlScope(compiler, LLVMBackend::OwnFlagSwitchFrame);
+                    if (body && body->blockItemList())
+                        ParseBlockItemList(body->blockItemList());
+                }
 
                 // Fallthrough at end of switch body -> resume
                 compiler->CreateBlockBreak(switchCtx.resumeBlock, true);
@@ -5331,7 +5357,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 }
                 catch (const ExpectedErrorReceived&)
                 {
-                    errorReceived = true;
+                    size_t caughtExpectScope = compilerLLVM->activeExpectScope_;
+                    errorReceived = caughtExpectScope == expectScope;
                     RestoreExpectErrorRecoveryState(recoveryMark, markedFn);
                     // The rest of the block never ran (see the file-scope catch). Today the grammar
                     // puts no classDefinition in a function body, so this is a defensive no-op.
@@ -5382,7 +5409,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         compilerLLVM->builder->SetInsertPoint(resume);
                         expectErrorRecoveryBlock_ = resume;
                     }
-                    compilerLLVM->RestoreExpectScope(expectScope);
+                    compilerLLVM->RestoreExpectScope(caughtExpectScope);
                 }
 
                 if (!errorReceived)

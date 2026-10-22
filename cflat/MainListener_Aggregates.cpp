@@ -516,6 +516,355 @@ bool MainListener::EmitFreshBraceInitializeAggregate(
     return true;
 }
 
+bool MainListener::GenericMemberNeedsDeferredBody(antlr4::ParserRuleContext* member)
+{
+        if (member == nullptr) return false;
+        auto* compiler = Compiler(member);
+        using LocalAliasScope = std::unordered_map<std::string, bool>;
+        std::vector<LocalAliasScope> localAliasScopes;
+
+        auto localAlias = [&](const std::string& name) -> const bool* {
+            for (auto it = localAliasScopes.rbegin(); it != localAliasScopes.rend(); ++it)
+                if (auto found = it->find(name); found != it->end()) return &found->second;
+            return nullptr;
+        };
+        auto resolveAliasWithoutMaterializing = [&](std::string name)
+        {
+            for (size_t depth = 0; depth < 16; ++depth)
+            {
+                const std::string* target = nullptr;
+                for (auto frame = compiler->aliasScopeStack_.rbegin();
+                     frame != compiler->aliasScopeStack_.rend() && target == nullptr; ++frame)
+                    if (auto found = frame->typeAliases.find(name); found != frame->typeAliases.end())
+                        target = &found->second;
+                if (target == nullptr)
+                    target = compiler->FindFirstVisibleScoped(compiler->typeAliases, name);
+                if (target == nullptr || *target == name) break;
+                name = *target;
+            }
+            return name;
+        };
+
+        auto isOpaqueName = [&](const std::string& spelling)
+        {
+            if (spelling.empty()) return false;
+            std::string name = compiler->ResolveQualifiedName(spelling);
+            bool wasSubstituted = false;
+            if (auto substituted = activeTypeSubstitutions.find(name);
+                substituted != activeTypeSubstitutions.end())
+            {
+                name = substituted->second;
+                wasSubstituted = true;
+            }
+            if (!wasSubstituted)
+                if (const bool* alias = localAlias(spelling)) return *alias;
+            if (name.starts_with("alias ")) name.erase(0, 6);
+            while (!name.empty() && name.back() == '*') name.pop_back();
+            if (name.ends_with("[]")) return false;
+            name = resolveAliasWithoutMaterializing(name);
+            auto found = compiler->dataStructures.find(name);
+            if (found == compiler->dataStructures.end() || found->second.StructType == nullptr)
+            {
+                if (!structScopeStack.empty())
+                {
+                    std::string nestedName = structScopeStack.back() + "." + name;
+                    found = compiler->dataStructures.find(nestedName);
+                }
+            }
+            return found != compiler->dataStructures.end() && found->second.StructType != nullptr
+                && found->second.StructType->isOpaque();
+        };
+        auto isOpaqueMemberAlias = [&](CFlatParser::MemberTypeSpecifierContext* memberType)
+        {
+            auto* owner = memberType == nullptr ? nullptr : memberType->memberTypeOwner();
+            if (owner == nullptr || owner->genericTypeParameters() == nullptr) return false;
+            std::string ownerText = owner->getText();
+            std::string base = ownerText.substr(0, ownerText.find('<'));
+            base = compiler->ResolveQualifiedName(base);
+            auto* args = owner->genericTypeParameters()->typeParameterList();
+            if (args == nullptr) return false;
+            auto entries = args->typeParameterEntry();
+            for (const auto& [ownerName, aliasFrame] : compiler->aggregateAliasScopes_)
+            {
+                if (MangledBase(ownerName) != base) continue;
+                bool matches = true;
+                for (size_t i = 0; i < entries.size(); ++i)
+                {
+                    auto* entry = entries[i];
+                    auto* type = entry->typeSpecifier();
+                    auto* generic = type == nullptr ? nullptr : type->genericIdentifier();
+                    if (generic == nullptr || generic->Identifier() == nullptr
+                        || generic->genericTypeParameters() != nullptr || entry->pointer() != nullptr
+                        || entry->arrayTypeSuffix() != nullptr)
+                    {
+                        matches = false;
+                        break;
+                    }
+                    std::string argName = generic->Identifier()->getText();
+                    argName = compiler->ResolveQualifiedName(argName);
+                    if (auto substituted = activeTypeSubstitutions.find(argName);
+                        substituted != activeTypeSubstitutions.end())
+                        argName = substituted->second;
+                    else
+                        argName = resolveAliasWithoutMaterializing(argName);
+                    LLVMBackend::TypeAndValue argType{ .TypeName = argName };
+                    if (MangledGenericArgument(*compiler, ownerName, i) != MangleType(*compiler, argType))
+                    {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (!matches) continue;
+                for (auto* memberName : memberType->memberNameToken())
+                    if (auto alias = aliasFrame.typeAliases.find(memberName->getText());
+                        alias != aliasFrame.typeAliases.end())
+                        return isOpaqueName(alias->second);
+            }
+            return false;
+        };
+
+        std::function<bool(CFlatParser::TypeSpecifierContext*)> isOpaqueTypeSpecifier;
+        std::function<bool(CFlatParser::TypeNameContext*)> isOpaqueTypeName;
+        std::function<bool(CFlatParser::DeclarationSpecifiersContext*)> isOpaqueDeclarationType;
+        isOpaqueTypeName = [&](CFlatParser::TypeNameContext* typeName)
+        {
+            if (typeName == nullptr) return false;
+            auto* specifiers = typeName->specifierQualifierList();
+            if (specifiers == nullptr) return false;
+            bool indirect = typeName->abstractDeclarator() != nullptr
+                && (typeName->abstractDeclarator()->pointer() != nullptr
+                    || (typeName->abstractDeclarator()->arrayTypeSuffix() != nullptr
+                        && typeName->abstractDeclarator()->arrayTypeSuffix()->arrayDimSpec()
+                            ->assignmentExpression().empty()));
+            if (indirect) return false;
+            for (auto* specifier : specifiers->typeSpecifier())
+                if (isOpaqueTypeSpecifier(specifier)) return true;
+            return false;
+        };
+        isOpaqueTypeSpecifier = [&](CFlatParser::TypeSpecifierContext* typeSpecifier)
+        {
+            if (typeSpecifier == nullptr) return false;
+            if (auto* nested = typeSpecifier->typeName()) return isOpaqueTypeName(nested);
+            if (auto* generic = typeSpecifier->genericIdentifier())
+            {
+                if (auto* args = generic->genericTypeParameters())
+                {
+                    auto* list = args->typeParameterList();
+                    if (list != nullptr)
+                        for (auto* entry : list->typeParameterEntry())
+                        {
+                            if (entry->typeSpecifier() == nullptr || entry->pointer() != nullptr
+                                || entry->arrayTypeSuffix() != nullptr) continue;
+                            if (isOpaqueTypeSpecifier(entry->typeSpecifier())) return true;
+                        }
+                    return false;
+                }
+                return generic->Identifier() != nullptr
+                    && isOpaqueName(generic->Identifier()->getText());
+            }
+            if (auto* qualified = typeSpecifier->qualifiedGenericIdentifier())
+            {
+                if (auto* args = qualified->genericTypeParameters())
+                {
+                    auto* list = args->typeParameterList();
+                    if (list != nullptr)
+                        for (auto* entry : list->typeParameterEntry())
+                        {
+                            if (entry->typeSpecifier() == nullptr || entry->pointer() != nullptr
+                                || entry->arrayTypeSuffix() != nullptr) continue;
+                            if (isOpaqueTypeSpecifier(entry->typeSpecifier())) return true;
+                        }
+                    return false;
+                }
+                return isOpaqueName(qualified->getText());
+            }
+            if (auto* memberType = typeSpecifier->memberTypeSpecifier())
+                return isOpaqueMemberAlias(memberType);
+            if (auto* tuple = typeSpecifier->tupleTypeSpecifier())
+            {
+                if (tuple->tupleTypePackEntry() != nullptr)
+                    return isOpaqueTypeSpecifier(tuple->tupleTypePackEntry()->typeSpecifier());
+                for (auto* entry : tuple->tupleTypeEntry())
+                    if (entry->pointer() == nullptr && entry->arrayTypeSuffix() == nullptr
+                        && isOpaqueTypeSpecifier(entry->typeSpecifier())) return true;
+            }
+            return false;
+        };
+        isOpaqueDeclarationType = [&](CFlatParser::DeclarationSpecifiersContext* specs)
+        {
+            if (specs == nullptr) return false;
+            for (auto* spec : specs->declarationSpecifier())
+            {
+                auto* type = spec->typeSpecifier();
+                if (type == nullptr) continue;
+                const std::string softWord = type->getText();
+                if (softWord == "alias" || softWord == "adopt" || softWord == "bond"
+                    || softWord == "unique" || softWord == "manifest" || softWord == "application"
+                    || softWord == "virtual" || softWord == "override") continue;
+                if (spec->pointer() != nullptr || spec->Question() != nullptr) continue;
+                auto* suffix = spec->arrayTypeSuffix();
+                if (suffix != nullptr && suffix->arrayDimSpec()->assignmentExpression().empty()) continue;
+                if (isOpaqueTypeSpecifier(type)) return true;
+            }
+            return false;
+        };
+
+        bool incompleteByValue = false;
+        CFlatParser::CompoundStatementContext* body = nullptr;
+        if (auto* function = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(member))
+        {
+            body = function->compoundStatement();
+            incompleteByValue = isOpaqueDeclarationType(function->declarationSpecifiers());
+            if (auto* parameterList = function->parameterTypeList() == nullptr
+                    ? nullptr : function->parameterTypeList()->parameterList())
+                for (auto* parameter : parameterList->parameterDeclaration())
+                    incompleteByValue = incompleteByValue
+                        || isOpaqueDeclarationType(parameter->declarationSpecifiers());
+        }
+        else if (auto* destructor = dynamic_cast<CFlatParser::DestructorDefinitionContext*>(member))
+            body = destructor->compoundStatement();
+
+        bool incompleteLocal = false;
+        std::function<void(antlr4::tree::ParseTree*)> scanLocals = [&](antlr4::tree::ParseTree* node)
+        {
+            if (node == nullptr || incompleteLocal) return;
+            if (dynamic_cast<CFlatParser::ExpectErrorStatementContext*>(node) != nullptr
+                || dynamic_cast<CFlatParser::ExpectErrorDeclarationContext*>(node) != nullptr)
+                return;
+            if (auto* compound = dynamic_cast<CFlatParser::CompoundStatementContext*>(node))
+            {
+                localAliasScopes.emplace_back();
+                for (auto* child : compound->children) scanLocals(child);
+                localAliasScopes.pop_back();
+                return;
+            }
+            if (auto* usingDecl = dynamic_cast<CFlatParser::UsingDeclarationContext*>(node))
+            {
+                if (usingDecl->Identifier() != nullptr && !localAliasScopes.empty())
+                {
+                    bool opaque = false;
+                    auto* suffix = usingDecl->arrayTypeSuffix();
+                    const bool isView = suffix != nullptr
+                        && suffix->arrayDimSpec()->assignmentExpression().empty();
+                    if (usingDecl->pointer() == nullptr && !isView
+                        && usingDecl->typeSpecifier() != nullptr)
+                        opaque = isOpaqueTypeSpecifier(usingDecl->typeSpecifier());
+                    localAliasScopes.back()[usingDecl->Identifier()->getText()] = opaque;
+                }
+                return;
+            }
+            if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(node))
+            {
+                if (isOpaqueDeclarationType(declaration->declarationSpecifiers()))
+                    incompleteLocal = true;
+                if (incompleteLocal) return;
+            }
+            for (auto* child : node->children) scanLocals(child);
+        };
+        if (!incompleteByValue) scanLocals(body);
+        if (!incompleteByValue && !incompleteLocal) return false;
+        return true;
+}
+
+void MainListener::DeferGenericMemberBody(antlr4::ParserRuleContext* member,
+    antlr4::ParserRuleContext* aggregate, const std::string& ownerName,
+    DeferredGenericMemberKind kind, const std::string& nameOverride,
+    bool suppliesNoArgCtor, size_t cppCtorIndex, bool hasExplicitNoArgCtor)
+{
+        std::string templateName;
+        if (auto* structCtx = dynamic_cast<CFlatParser::StructDefinitionContext*>(aggregate))
+            for (const auto& [name, ctx] : genericStructTemplates)
+                if (ctx == structCtx) { templateName = name; break; }
+        if (auto* classCtx = dynamic_cast<CFlatParser::ClassDefinitionContext*>(aggregate))
+            for (const auto& [name, ctx] : genericClassTemplates)
+                if (ctx == classCtx) { templateName = name; break; }
+        if (templateName.empty()) return;
+        DeferredGenericMemberBody deferred;
+        deferred.kind = kind;
+        deferred.function = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(member);
+        deferred.destructor = dynamic_cast<CFlatParser::DestructorDefinitionContext*>(member);
+        deferred.ownerName = ownerName;
+        deferred.templateName = templateName;
+        deferred.nameOverride = nameOverride;
+        deferred.suppliesNoArgCtor = suppliesNoArgCtor;
+        deferred.cppCtorIndex = cppCtorIndex;
+        deferred.hasExplicitNoArgCtor = hasExplicitNoArgCtor;
+        deferred.typeSubstitutions = activeTypeSubstitutions;
+        deferred.valueSubstitutions = activeValueSubstitutions;
+        deferred.packSubstitutions = activePackSubstitutions;
+        deferredGenericMemberBodies_.push_back(std::move(deferred));
+}
+
+void MainListener::ProcessDeferredGenericMemberBodies()
+{
+        size_t next = 0;
+        while (next < deferredGenericMemberBodies_.size())
+        {
+            auto deferred = deferredGenericMemberBodies_[next++];
+            auto savedTypes = activeTypeSubstitutions;
+            auto savedValues = activeValueSubstitutions;
+            auto savedPacks = activePackSubstitutions;
+            struct RestoreSubstitutions
+            {
+                TypeSubstitutionMap& types;
+                std::unordered_map<std::string, std::string>& values;
+                std::unordered_map<std::string, std::vector<std::string>>& packs;
+                TypeSubstitutionMap savedTypes;
+                std::unordered_map<std::string, std::string> savedValues;
+                std::unordered_map<std::string, std::vector<std::string>> savedPacks;
+                ~RestoreSubstitutions()
+                {
+                    types = std::move(savedTypes);
+                    values = std::move(savedValues);
+                    packs = std::move(savedPacks);
+                }
+            } restore{ activeTypeSubstitutions, activeValueSubstitutions, activePackSubstitutions,
+                       std::move(savedTypes), std::move(savedValues), std::move(savedPacks) };
+            activeTypeSubstitutions = deferred.typeSubstitutions;
+            activeValueSubstitutions = deferred.valueSubstitutions;
+            activePackSubstitutions = deferred.packSubstitutions;
+
+            GenericValueMacroScope valueMacros(compilerLLVM);
+            for (const auto& [name, value] : activeValueSubstitutions)
+                valueMacros.Bind(name, ParseValueArg(value));
+            TemplateNamespaceScope namespaceScope(compilerLLVM, deferred.templateName);
+            LLVMBackend::AliasScopeGuard aliasScope(compilerLLVM, deferred.ownerName);
+            struct RestoreMemberContext
+            {
+                std::vector<std::string>& stack;
+                bool& globalScope;
+                bool wasGlobal;
+                RestoreMemberContext(std::vector<std::string>& s, bool& g, const std::string& owner)
+                    : stack(s), globalScope(g), wasGlobal(g)
+                {
+                    stack.push_back(owner);
+                    globalScope = false;
+                }
+                ~RestoreMemberContext()
+                {
+                    stack.pop_back();
+                    globalScope = wasGlobal;
+                }
+            } memberContext(structScopeStack, global_scope, deferred.ownerName);
+            if (deferred.kind == DeferredGenericMemberKind::Constructor)
+                ParseConstructorDefinition(deferred.function, deferred.ownerName,
+                    deferred.suppliesNoArgCtor, deferred.cppCtorIndex,
+                    deferred.hasExplicitNoArgCtor);
+            else if (deferred.kind == DeferredGenericMemberKind::Destructor)
+                ParseDestructorDefinition(deferred.destructor, deferred.ownerName);
+            else if (deferred.nameOverride.empty())
+                ParseFunctionDefinition(deferred.function, deferred.ownerName);
+            else
+                ParseFunctionDefinition(deferred.function, {}, {}, deferred.nameOverride);
+        }
+        deferredGenericMemberBodies_.clear();
+}
+
+void MainListener::exitTranslationUnit(CFlatParser::TranslationUnitContext*)
+{
+        ProcessDeferredGenericMemberBodies();
+}
+
 void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& nameOverride, const std::string& namespaceName) {
         ResolvedMembersScope memberScope_(resolvedMembers_, (const void*)ctx);
         auto* compiler = Compiler(ctx);
@@ -1378,6 +1727,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     for (auto* entry : generic->typeParameterList()->typeParameterEntry())
                         initializerArgs.push_back(ResolveTypeArgEntry(entry));
                     compiler->ResolveGenericAliasSpelling(initializerName, initializerArgs);
+                    compiler->CompleteCxxTemplateTypeArgs(initializerName, initializerArgs);
                     initializerName = MangledGenericName(initializerName, initializerArgs);
                 }
                 if (initializerName != cppBaseName)
@@ -1958,8 +2308,14 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     // no bare 'T()' was written - it must seed fields itself, not self-delegate.
                     bool suppliesNoArgCtor = !isUnion && !hasBareNoArgCtor
                         && AllParametersDefaulted(func->parameterTypeList());
-                    ParseConstructorDefinition(func, structName, suppliesNoArgCtor,
-                        isCppStruct ? cppCtorIndex++ : SIZE_MAX, hasExplicitNoArgCtor);
+                    const size_t ctorIndex = isCppStruct ? cppCtorIndex++ : SIZE_MAX;
+                    if (!nameOverride.empty() && GenericMemberNeedsDeferredBody(func))
+                        DeferGenericMemberBody(func, ctx, structName,
+                            DeferredGenericMemberKind::Constructor, {}, suppliesNoArgCtor,
+                            ctorIndex, hasExplicitNoArgCtor);
+                    else
+                        ParseConstructorDefinition(func, structName, suppliesNoArgCtor,
+                            ctorIndex, hasExplicitNoArgCtor);
                     continue;
                 }
                 // A generic member method - static or instance - is stored as a template keyed by
@@ -1987,6 +2343,12 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     Compiler()->gts.genericFunctionValueDefaults[qualifiedName] = valueDefaults;
                     genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
                 }
+                else if (!nameOverride.empty() && GenericMemberNeedsDeferredBody(func))
+                    DeferGenericMemberBody(func, ctx, structName,
+                        DeferredGenericMemberKind::Function,
+                        (funcName == "operator new" || funcName == "operator delete"
+                         || funcName == "operator bool" || isFunctionStatic(func))
+                            ? structName + "." + funcName : std::string{});
                 else if (funcName == "operator new" || funcName == "operator delete"
                          || funcName == "operator bool" || isFunctionStatic(func))
                 {
@@ -2010,6 +2372,9 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     if (func->declarationSpecifiers() == nullptr && getFunctionName(func) == baseName)
                         Compiler(func)->LogError(std::format(
                             "constructor '{}' is not allowed inside a lock field group", baseName));
+                    else if (!nameOverride.empty() && GenericMemberNeedsDeferredBody(func))
+                        DeferGenericMemberBody(func, ctx, structName,
+                            DeferredGenericMemberKind::Function);
                     else
                         ParseFunctionDefinition(func, structName);
                 }
@@ -2077,7 +2442,11 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             for (auto dtor : MemberDestructorDefinitions(ctx))
             {
                 global_scope = false;
-                ParseDestructorDefinition(dtor, structName);
+                if (!nameOverride.empty() && GenericMemberNeedsDeferredBody(dtor))
+                    DeferGenericMemberBody(dtor, ctx, structName,
+                        DeferredGenericMemberKind::Destructor);
+                else
+                    ParseDestructorDefinition(dtor, structName);
             }
         }
 
@@ -4739,8 +5108,13 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     // no bare 'T()' was written - it must seed fields itself, not self-delegate.
                     bool suppliesNoArgCtor = !hasBareNoArgCtor
                         && AllParametersDefaulted(func->parameterTypeList());
-                    ParseConstructorDefinition(func, structName, suppliesNoArgCtor, SIZE_MAX,
-                                               hasExplicitNoArgCtor);
+                    if (!nameOverride.empty() && GenericMemberNeedsDeferredBody(func))
+                        DeferGenericMemberBody(func, ctx, structName,
+                            DeferredGenericMemberKind::Constructor, {}, suppliesNoArgCtor,
+                            SIZE_MAX, hasExplicitNoArgCtor);
+                    else
+                        ParseConstructorDefinition(func, structName, suppliesNoArgCtor, SIZE_MAX,
+                                                   hasExplicitNoArgCtor);
                     continue;
                 }
                 // A generic member method - static or instance - is stored as a template keyed by
@@ -4763,6 +5137,11 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     Compiler()->gts.genericFunctionValueDefaults[qualifiedName] = valueDefaults;
                     genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
                 }
+                else if (!nameOverride.empty() && GenericMemberNeedsDeferredBody(func))
+                    DeferGenericMemberBody(func, ctx, structName,
+                        DeferredGenericMemberKind::Function,
+                        (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
+                            ? structName + "." + funcName : std::string{});
                 else if (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
                 {
                     ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
@@ -4785,6 +5164,9 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     if (func->declarationSpecifiers() == nullptr && getFunctionName(func) == baseName)
                         Compiler(func)->LogError(std::format(
                             "constructor '{}' is not allowed inside a lock field group", baseName));
+                    else if (!nameOverride.empty() && GenericMemberNeedsDeferredBody(func))
+                        DeferGenericMemberBody(func, ctx, structName,
+                            DeferredGenericMemberKind::Function);
                     else
                         ParseFunctionDefinition(func, structName);
                 }
@@ -4797,7 +5179,11 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             for (auto dtor : MemberDestructorDefinitions(ctx))
             {
                 global_scope = false;
-                ParseDestructorDefinition(dtor, structName);
+                if (!nameOverride.empty() && GenericMemberNeedsDeferredBody(dtor))
+                    DeferGenericMemberBody(dtor, ctx, structName,
+                        DeferredGenericMemberKind::Destructor);
+                else
+                    ParseDestructorDefinition(dtor, structName);
             }
         }
 

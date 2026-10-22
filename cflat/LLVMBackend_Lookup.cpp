@@ -1075,14 +1075,21 @@ std::string LLVMBackend::FuncPtrComponentDeclaringKey(const std::string& name) c
     }
 
 LLVMBackend::FuncPtrComponent LLVMBackend::FuncPtrComponentOf(const std::string& typeName, bool pointer,
-        int pointerDepth, const std::string& resolvedKey) const
+        int pointerDepth, const std::string& resolvedKey, bool isArrayView, int constMask) const
 {
         FuncPtrComponent c;
+        c.IsArrayView = isArrayView;
+        c.ConstMask = constMask;
         c.PointerDepth = pointer ? pointerDepth : 0;
         std::string resolved = ResolveFuncPtrTypeSpelling(typeName);
         if (resolved.empty()) return c;
         // `string` normalizes to char*, a single level - it cannot carry a written '*' count.
-        if (resolved == "string") { resolved = "char"; pointer = true; c.PointerDepth = 1; }
+        if (resolved == "string" && !isArrayView)
+        {
+            resolved = "char";
+            pointer = true;
+            c.PointerDepth = 1;
+        }
 
         std::string scalar = FuncPtrScalarCanon(resolved);
         if (!pointer)
@@ -1110,6 +1117,10 @@ LLVMBackend::FuncPtrComponent LLVMBackend::FuncPtrComponentOf(const std::string&
 bool LLVMBackend::ComponentsProvablyDiffer(const FuncPtrComponent& a, const FuncPtrComponent& b)
 {
         if (!a.Known || !b.Known) return false;
+        if (a.IsArrayView != b.IsArrayView) return true;
+        if ((a.IsArrayView || b.IsArrayView)
+            && a.ConstMask >= 0 && b.ConstMask >= 0 && a.ConstMask != b.ConstMask)
+            return true;
         if (a.VoidPointee || b.VoidPointee)
         {
             bool aPtr = a.Canon.rfind("p:", 0) == 0;
@@ -1140,7 +1151,8 @@ bool LLVMBackend::FuncPtrSignatureOf(const LLVMBackend::TypeAndValue& tv, std::v
         out.push_back(FuncPtrComponentOf(signature.FuncPtrReturnTypeName, signature.FuncPtrReturnPointer,
             signature.FuncPtrReturnPointerDepth, signature.FuncPtrReturnResolvedKey));
         for (const auto& p : signature.FuncPtrParams)
-            out.push_back(FuncPtrComponentOf(p.TypeName, p.Pointer, p.PointerDepth, p.ResolvedTypeKey));
+            out.push_back(FuncPtrComponentOf(p.TypeName, p.Pointer, p.PointerDepth,
+                p.ResolvedTypeKey, p.IsArrayView, p.ConstMask));
         return true;
     }
 
@@ -1199,6 +1211,7 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
             TypeAndValue::FuncPtrParam fp;
             fp.TypeName = p.TypeName;
             fp.Pointer = p.Pointer;
+            fp.IsArrayView = p.IsArrayView;
             fp.AllocAlignValue = p.AllocAlignValue;
             fp.IsMove = p.IsMove;
             // The function's INFERRED owning sinks are part of what a funcptr bound to it must
@@ -1208,8 +1221,8 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
             fp.IsReturnInferredSink = p.IsReturnInferredSink;
             fp.IsWriteInferredSink = p.IsWriteInferredSink;
             fp.PointerDepth = p.ValuePointerDepth();
-            fp.ConstMask = p.PointeeConstMask();
-            fp.IsPointeeConst = (p.PointeeConstMask() & 1u) != 0;
+            fp.ConstMask = p.FunctionParamConstMask();
+            fp.IsPointeeConst = (fp.ConstMask & 1) != 0;
             sig.FuncPtrParams.push_back(fp);
         }
         return sig;
@@ -1264,35 +1277,60 @@ bool LLVMBackend::NamedFunctionArgMismatches(const NamedVariable& arg, const Typ
         return NamedFunctionProvablyMismatchesFuncPtr(arg.CallerName, param);
     }
 
+std::string LLVMBackend::FuncPtrAliasParamSpelling(const TypeAndValue::FuncPtrParam& p) const
+{
+        // The alias name already carries its own levels and const, so only the written stars
+        // print here; reapplying the mask would put the alias's pointee const on the wrong level.
+        std::string name = p.AliasSpelling;
+        int written = 0;
+        while (!name.empty() && name.back() == '*') { name.pop_back(); ++written; }
+        TypeAndValue type;
+        type.TypeName = name;
+        type.PointerDepth = written;
+        type.Pointer = written > 0;
+        return SpellType(*this, type);
+}
+
 std::string LLVMBackend::FuncPtrSpellingOf(const LLVMBackend::TypeAndValue& tv) const
 {
         TypeAndValue signature = tv;
         if (signature.FuncPtrReturnTypeName.empty() && !signature.Pointer)
             if (const auto* encoded = GetEncodedClosureType(signature.TypeName))
                 signature = *encoded;
+        const std::string familyName = signature.IsThinFnPtr() ? "function<" : "Lambda<";
+        if (signature.DiagnosticTypeName.starts_with(familyName)
+            && signature.DiagnosticTypeName.ends_with(">"))
+            return signature.DiagnosticTypeName.substr(familyName.size(),
+                signature.DiagnosticTypeName.size() - familyName.size() - 1);
         // One '*' per recorded level, so a depth mismatch is visible as `int**` vs `int*` rather
         // than as two identical-looking spellings; recorded pointee const prints whole-word.
-        auto component = [&](const std::string& name, bool pointer, int depth, int constMask) {
+        auto component = [&](const std::string& name, bool pointer, int depth,
+                             int constMask, bool isArrayView) {
             TypeAndValue type;
             type.TypeName = name;
-            type.Pointer = pointer;
+            type.Pointer = pointer || isArrayView;
+            type.IsArrayView = isArrayView;
             type.PointerDepth = depth;
-            if (pointer && constMask > 0)
+            type.ElemPointer = type.Pointer && depth >= 2;
+            if (constMask >= 0) type.ConstMask = static_cast<uint8_t>(constMask);
+            if ((pointer || isArrayView) && constMask > 0)
             {
                 type.PointerDepth = std::max(depth, 1);
                 type.ElemPointer = type.PointerDepth >= 2;
-                type.ConstMask = static_cast<uint8_t>(constMask);
                 return SpellTypeForSymbolDump(*this, type);
             }
             return SpellType(*this, type);
         };
         std::string s = component(signature.FuncPtrReturnTypeName, signature.FuncPtrReturnPointer,
-            signature.FuncPtrReturnPointerDepth, signature.FuncPtrReturnConstMask) + "(";
+            signature.FuncPtrReturnPointerDepth, signature.FuncPtrReturnConstMask, false) + "(";
         for (size_t i = 0; i < signature.FuncPtrParams.size(); i++)
         {
             if (i > 0) s += ", ";
             const auto& p = signature.FuncPtrParams[i];
-            s += component(p.TypeName, p.Pointer, p.PointerDepth, p.ConstMask);
+            if (!p.AliasSpelling.empty())
+                s += FuncPtrAliasParamSpelling(p);
+            else
+                s += component(p.TypeName, p.Pointer, p.PointerDepth, p.ConstMask, p.IsArrayView);
         }
         if (signature.FuncPtrVariadic) s += signature.FuncPtrParams.empty() ? "..." : ", ...";
         return s + ")";

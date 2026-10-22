@@ -1212,6 +1212,47 @@ bool LLVMBackend::HasRawNewArrayProvenance(const NamedVariable& namedVar) const
             && !namedVar.TypeAndValue.IsMove;
     }
 
+void LLVMBackend::EnterOwnershipControlRegion(uint8_t frameKind)
+{
+        ownFlagControlPath_.push_back(nextOwnFlagControlFrameId_++);
+        ownFlagControlKind_.push_back(frameKind);
+}
+
+void LLVMBackend::LeaveOwnershipControlRegion()
+{
+        if (ownFlagControlPath_.empty()) return;
+        ownFlagControlPath_.pop_back();
+        ownFlagControlKind_.pop_back();
+}
+
+void LLVMBackend::ReanchorOwnFlagJoinsOutOf(uint8_t targetKinds)
+{
+        // Depth = path length through the innermost target frame; no such frame leaves joins alone.
+        size_t depth = 0;
+        for (size_t i = ownFlagControlKind_.size(); i-- > 0;)
+            if (ownFlagControlKind_[i] & targetKinds) { depth = i + 1; break; }
+        if (depth == 0) return;
+        for (auto& frame : stackNamedVariable)
+            for (auto& entry : frame.namedVariable)
+            {
+                auto& namedVar = entry.second;
+                auto& joinPath = namedVar.OwnFlagMayBeFalseControlPath;
+                // Only joins made inside the target frame (path prefix) move; a join before it is untouched.
+                if (!namedVar.OwnFlagMayBeFalse || joinPath.size() < depth
+                    || !std::equal(ownFlagControlPath_.begin(), ownFlagControlPath_.begin() + depth,
+                                   joinPath.begin()))
+                    continue;
+                joinPath.resize(depth - 1);
+            }
+}
+
+bool LLVMBackend::IsOutsideOwnFlagControlPath(const NamedVariable& namedVar) const
+{
+        const auto& joinPath = namedVar.OwnFlagMayBeFalseControlPath;
+        return ownFlagControlPath_.size() <= joinPath.size()
+            && std::equal(ownFlagControlPath_.begin(), ownFlagControlPath_.end(), joinPath.begin());
+}
+
 void LLVMBackend::SetVariableOwning(const std::string& varName, bool value)
 {
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
@@ -1220,6 +1261,12 @@ void LLVMBackend::SetVariableOwning(const std::string& varName, bool value)
             if (it != frame.namedVariable.end())
             {
                 it->second.IsOwning = value;
+                if (it->second.OwnFlagMayBeFalse
+                    && IsOutsideOwnFlagControlPath(it->second))
+                {
+                    it->second.OwnFlagMayBeFalse = false;
+                    it->second.OwnFlagMayBeFalseControlPath.clear();
+                }
                 // Keep an active ownership flag in step at the program point of the ownership event.
                 auto* flag = it->second.OwnFlag;
                 if (it->second.OwnFlagActive && flag != nullptr && IsInsertBlockLive()
@@ -1227,6 +1274,43 @@ void LLVMBackend::SetVariableOwning(const std::string& varName, bool value)
                     builder->CreateStore(builder->getInt1(value), flag);
                 return;
             }
+        }
+    }
+
+void LLVMBackend::SetVariableOwnFlagValue(const std::string& varName, bool mayOwn,
+                                         llvm::Value* value, bool runtimeCanBeFalse)
+{
+        if (varName.empty() || value == nullptr || !value->getType()->isIntegerTy(1)) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            auto it = frame.namedVariable.find(varName);
+            if (it == frame.namedVariable.end()) continue;
+            auto& namedVar = it->second;
+            namedVar.IsOwning = mayOwn;
+            if (runtimeCanBeFalse)
+            {
+                namedVar.OwnFlagMayBeFalse = true;
+                namedVar.OwnFlagMayBeFalseControlPath = ownFlagControlPath_;
+            }
+            else if (!namedVar.OwnFlagMayBeFalse
+                || IsOutsideOwnFlagControlPath(namedVar))
+            {
+                namedVar.OwnFlagMayBeFalse = false;
+                namedVar.OwnFlagMayBeFalseControlPath.clear();
+            }
+            if (namedVar.OwnFlag == nullptr) return;
+            if (namedVar.OwnFlagInit != nullptr)
+            {
+                namedVar.OwnFlagInit->setOperand(0, builder->getInt1(false));
+                namedVar.OwnFlagInit = nullptr;
+            }
+            if (IsInsertBlockLive()
+                && namedVar.OwnFlag->getFunction() == builder->GetInsertBlock()->getParent())
+            {
+                namedVar.OwnFlagActive = true;
+                builder->CreateStore(value, namedVar.OwnFlag);
+            }
+            return;
         }
     }
 
@@ -2102,6 +2186,84 @@ bool LLVMBackend::IsPendingOwnedStringTemp(llvm::Value* value) const
         return false;
     }
 
+bool LLVMBackend::TryAdoptAliasReturnStringTemp(llvm::Value*& result,
+        const TypeAndValue& returnType, bool returnsOwned, bool returnsAlias,
+        const std::vector<TypeAndValue>& params, const std::vector<llvm::Value*>& args,
+        const std::vector<NamedVariable>* argNVs, bool requireReturnSinkParam)
+{
+        auto* stringTy = llvm::StructType::getTypeByName(*context, "string");
+        if (result == nullptr || stringTy == nullptr || result->getType() != stringTy
+            || returnsOwned || returnsAlias || returnType.IsMove || returnType.IsAlias
+            || returnType.Pointer || returnType.ElemPointer
+            || ResolveTypeAlias(returnType.TypeName) != "string")
+            return false;
+
+        std::vector<llvm::Value*> stringTemps;
+        for (size_t i = 0; i < params.size() && i < args.size(); ++i)
+        {
+            const auto& param = params[i];
+            if ((requireReturnSinkParam && !param.IsReturnInferredSink)
+                || param.Pointer || param.ElemPointer || param.IsAlias || param.IsMove
+                || ((param.IsOwningSink || param.IsConsumeInferredSink)
+                    && !param.IsReturnInferredSink)
+                || ResolveTypeAlias(param.TypeName) != "string")
+                continue;
+            llvm::Value* value = args[i];
+            if (value == nullptr || value->getType() != stringTy)
+                continue;
+            const bool isOwnedRvalue = argNVs != nullptr && i < argNVs->size()
+                && (*argNVs)[i].IsRvalue && (*argNVs)[i].TypeAndValue.IsMove;
+            if (!IsPendingOwnedStringTemp(value) && !isOwnedRvalue)
+                continue;
+            if (std::find(stringTemps.begin(), stringTemps.end(), value) == stringTemps.end())
+                stringTemps.push_back(value);
+        }
+
+        if (stringTemps.empty()) return false;
+
+        auto* resultPtr = builder->CreateExtractValue(result, { 0u }, "aliasret.str.ptr");
+        auto* resultLen = builder->CreateExtractValue(result, { 1u }, "aliasret.str.len");
+        llvm::Value* selectedAny = builder->getFalse();
+        auto* handoffBlock = builder->GetInsertBlock();
+        for (llvm::Value* source : stringTemps)
+        {
+            auto* sourcePtr = builder->CreateExtractValue(source, { 0u }, "aliasret.src.ptr");
+            auto* sourceLen = builder->CreateExtractValue(source, { 1u }, "aliasret.src.len");
+            auto* ptrMatches = builder->CreateICmpEQ(resultPtr, sourcePtr,
+                                                     "aliasret.src.ptr.matches");
+            auto* sourceOwnedBit = builder->CreateAnd(sourceLen,
+                builder->getInt32(0x80000000u), "aliasret.src.owned.bit");
+            auto* sourceIsOwned = builder->CreateICmpNE(sourceOwnedBit,
+                builder->getInt32(0), "aliasret.src.is.owned");
+            auto* selected = builder->CreateAnd(ptrMatches, sourceIsOwned,
+                                                "aliasret.src.selected");
+            selectedAny = builder->CreateOr(selectedAny, selected, "aliasret.any.selected");
+
+            auto* borrowedLen = builder->CreateAnd(sourceLen, builder->getInt32(0x7FFFFFFF),
+                                                   "aliasret.src.borrowed");
+            auto* ownedLen = builder->CreateSelect(selected, borrowedLen, sourceLen,
+                                                   "aliasret.src.len.next");
+            auto* updatedSource = builder->CreateInsertValue(source, ownedLen, { 1u },
+                                                             "aliasret.src.next");
+            for (auto& pending : pendingOwnedStringTemps)
+                if (pending.first == source)
+                {
+                    pending.first = updatedSource;
+                    pending.second = handoffBlock;
+                }
+        }
+
+        auto* resultOwnedLen = builder->CreateOr(resultLen, builder->getInt32(0x80000000u),
+                                                 "aliasret.str.owned");
+        auto* resultLenNext = builder->CreateSelect(selectedAny, resultOwnedLen, resultLen,
+                                                    "aliasret.str.len.next");
+        auto* ownedResult = builder->CreateInsertValue(result, resultLenNext, { 1u },
+                                                       "aliasret.str.next");
+        PropagateProducedTempValue(result, ownedResult);
+        result = ownedResult;
+        return true;
+}
+
 void LLVMBackend::UnregisterOwnedStringTemp(llvm::Value* value)
 {
         if (value == nullptr) return;
@@ -2854,6 +3016,13 @@ bool LLVMBackend::TernaryArmJoinsOwning(llvm::Value* arm)
 {
         if (arm == nullptr) return false;
         if (auto* c = llvm::dyn_cast<llvm::Constant>(arm); c != nullptr && c->isNullValue()) return true;
+        if (const auto* raw = FindRawArrayResult(arm);
+            raw != nullptr && !raw->Owns && raw->RuntimeOwns != nullptr)
+        {
+            if (auto* constant = llvm::dyn_cast<llvm::ConstantInt>(raw->RuntimeOwns))
+                return !constant->isZero();
+            return false;
+        }
         if (IsOwningPtrTempValue(arm) || IsMovedOutPtrValue(arm)
             || RawArrayResultOwns(arm)) return true;
         // A bare `new` arm hoisted into its conditional slot (call argument) still owns it.
@@ -4342,18 +4511,22 @@ bool LLVMBackend::IsOwnedNewTemp(llvm::Value* value) const
     }
 
 void LLVMBackend::RegisterRawArrayResult(llvm::Value* value, llvm::Value* count,
-                                         uint64_t allocAlign, bool owns)
+                                         uint64_t allocAlign, bool owns,
+                                         llvm::Value* runtimeOwns, bool isArrayView)
 {
-        if (value == nullptr || count == nullptr || !value->getType()->isPointerTy()) return;
+        if (value == nullptr || !value->getType()->isPointerTy()
+            || (count == nullptr && !owns && runtimeOwns == nullptr)) return;
         for (auto& entry : rawArrayResults_)
             if (entry.Value == value)
             {
-                entry.Count = count;
+                if (count != nullptr) entry.Count = count;
                 entry.AllocAlign = allocAlign;
                 entry.Owns = entry.Owns || owns;
+                if (runtimeOwns != nullptr) entry.RuntimeOwns = runtimeOwns;
+                entry.IsArrayView = entry.IsArrayView || isArrayView;
                 return;
             }
-        rawArrayResults_.push_back({ value, count, allocAlign, owns });
+        rawArrayResults_.push_back({ value, count, allocAlign, owns, runtimeOwns, isArrayView });
     }
 
 const LLVMBackend::RawArrayResult* LLVMBackend::FindRawArrayResult(llvm::Value* value) const
@@ -4373,6 +4546,16 @@ bool LLVMBackend::RawArrayResultOwns(llvm::Value* value) const
 {
         const auto* entry = FindRawArrayResult(value);
         return entry != nullptr && entry->Owns;
+    }
+
+bool LLVMBackend::RawArrayResultMayOwn(llvm::Value* value) const
+{
+        const auto* entry = FindRawArrayResult(value);
+        if (entry == nullptr) return false;
+        if (entry->Owns) return true;
+        if (auto* constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(entry->RuntimeOwns))
+            return !constant->isZero();
+        return entry->RuntimeOwns != nullptr;
     }
 
 llvm::Value* LLVMBackend::RawArrayCountOf(llvm::Value* value) const

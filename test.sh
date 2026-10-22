@@ -270,7 +270,7 @@ run_err() {
   fi
   load_err_flags "$f.flags"
   $TIMEOUT "${compiler_env[@]}" "$CFLAT" "$f" -i "$LIB" --locale pseudo --locale-dir "$LOCALE_DIR" --check \
-    ${tu_check[@]+"${tu_check[@]}"} "${ERR_FLAGS[@]}" >"$log" 2>&1 || rc=$?
+    ${tu_check[@]+"${tu_check[@]}"} ${ERR_FLAGS[@]+"${ERR_FLAGS[@]}"} >"$log" 2>&1 || rc=$?
   if check_err_result "$rc" "$log"; then
     write_result "$n" "PASS" "$t0"
   else
@@ -290,7 +290,7 @@ run_err_warm() {
   fi
   load_err_flags "$f.flags"
   $TIMEOUT "${compiler_env[@]}" "$CFLAT" "$f" -i "$LIB" --locale pseudo --locale-dir "$LOCALE_DIR" --check \
-    "${ERR_FLAGS[@]}" >"$log" 2>&1 || rc=$?
+    ${ERR_FLAGS[@]+"${ERR_FLAGS[@]}"} >"$log" 2>&1 || rc=$?
   if check_err_result "$rc" "$log"; then
     write_result "$n" "PASS" "$t0"
   else
@@ -390,7 +390,7 @@ if [ "$RUN_MODE" -eq 0 ]; then
     [ -f "$f" ] || continue
     load_err_flags "$f.flags"
     "$CFLAT" --locale pseudo --update-locale en-pseudo --locale-dir "$LOCALE_DIR" \
-      --check -i "$LIB" "${ERR_FLAGS[@]}" "$f" >"$RES/$(basename "$f").locale.log" 2>&1 || true
+      --check -i "$LIB" ${ERR_FLAGS[@]+"${ERR_FLAGS[@]}"} "$f" >"$RES/$(basename "$f").locale.log" 2>&1 || true
   done
 fi
 

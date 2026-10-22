@@ -2295,6 +2295,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
             for (const auto& arg : arguments)
             {
                 int result = -1;
+                bool coreUniqueAddressToRawSlot = false;
                 if (arg.IsDefaultArgument && candidateParamItr != candidate.Parameters.end()
                     && IsReferenceOrSinkParameter(*candidateParamItr))
                     defaultArgumentNotViable = true;
@@ -2521,8 +2522,20 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     // proof. Only at equal shape - a shape mismatch stays score-1 bindable.
                     const TypeAndValue& functionPointerArgument = arg.HasOriginalArgumentType
                         ? arg.OriginalArgumentType : arg.TypeAndValue;
-                    if (result == 0
-                        && FuncPtrSignaturesProvablyDiffer(functionPointerArgument, *candidateParamItr))
+                    bool callbackSignatureDiffers = false;
+                    bool callbackConstDiffers = false;
+                    if (result == 0)
+                    {
+                        std::string callbackConstFrom, callbackConstTo;
+                        callbackSignatureDiffers =
+                            FuncPtrSignaturesProvablyDiffer(functionPointerArgument, *candidateParamItr);
+                        // A pointee-const-only difference ranks below an exact twin but stays
+                        // bindable, so a lone candidate still reports the discarded const.
+                        callbackConstDiffers = !callbackSignatureDiffers
+                            && FuncPtrPointeeConstDiffers(functionPointerArgument, *candidateParamItr,
+                                callbackConstFrom, callbackConstTo);
+                    }
+                    if (callbackSignatureDiffers)
                     {
                         if (FuncPtrFewerParamsCanAdapt(functionPointerArgument, *candidateParamItr)
                             && ClosureValueCanAdaptToSlot(arg, *candidateParamItr))
@@ -2530,6 +2543,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         else
                             result = -1;
                     }
+                    else if (callbackConstDiffers)
+                        result = 1;
                     // A NAMED function argument carries its signature in the function table, not
                     // on the argument, so it needs the overload-set form of the same proof.
                     if (result != -1 && NamedFunctionArgMismatches(arg, *candidateParamItr))
@@ -2566,6 +2581,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     bool coreUniqueOutParam = tmpParam.Pointer && !tmpParam.ElemPointer
                         && tmpArg.Pointer && IsCoreUniqueType(tmpParam.TypeName)
                         && MangledGenericArgument(*this, tmpParam.TypeName) == tmpArg.TypeName;
+                    // Preserve legacy CFlat calls that used `&owner` as `T**`; an exact
+                    // `unique<T>*` overload still outranks this slot-address compatibility.
+                    coreUniqueAddressToRawSlot = IsAddressedUniqueSlotToRawSlot(arg, tmpArg, tmpParam);
                     const size_t paramIndex = std::distance(candidate.Parameters.begin(), candidateParamItr);
                     const bool cxxByValueParam = candidate.IsCxx
                         && ((paramIndex < candidate.Recipe.paramSlots.size()
@@ -2610,6 +2628,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         && !ScoreCxxConversionOperatorArgument(
                                 arg, *candidateParamItr, !candidate.IsCxx, needsStandard, userConversions,
                                 userConversionCost, userConversionNames).empty())
+                        result = 1;
+                    else if (coreUniqueAddressToRawSlot)
                         result = 1;
                     else if (coreUniqueValueReceiver || rawPointerToCoreUnique || coreUniqueToRawPointer
                         || coreUniqueOutParam
@@ -3128,7 +3148,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     depthParam.ElemPointer = false;
                     depthParam.PointerDepth = 1;
                 }
-                if (result >= 0 && !(candidate.IsCxx && IsCxxNullTypedArgument(arg))
+                if (result >= 0 && !coreUniqueAddressToRawSlot
+                    && !(candidate.IsCxx && IsCxxNullTypedArgument(arg))
                     && arg.TypeAndValue.PointerDepthRefuses(depthParam))
                     result = -1;
 
@@ -4945,7 +4966,8 @@ bool LLVMBackend::CxxImplicitObjectViable(int receiverCv, bool receiverRvalue,
 
 llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot,
         const std::string& displayName, const std::string& cxxMemberReceiver,
-        bool postfixMemberCall, const std::string& enclosingFunctionName)
+        bool postfixMemberCall, const std::string& enclosingFunctionName,
+        bool allowOperatorAliasReturnStringTemp, llvm::Value* operatorReceiverStorage)
 {
         // These describe only the call being lowered. Clear them before overload probing so a
         // later non-C++ call cannot make a chained result reuse an earlier sret temporary.
@@ -8334,6 +8356,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         }
         // A non-lowered virtual call reaches the vtable slot directly. A variadic member's scalar
         // tail takes the same default promotions as every other variadic call (T161 r3).
+        // A native member string operator uses the same receiver storage as a method call.
+        if (allowOperatorAliasReturnStringTemp && operatorReceiverStorage != nullptr
+            && !candidate.IsCxx && !candidate.External && candidate.IsMethod
+            && candidate.ReturnType.TypeName == "string"
+            && !candidate.Parameters.empty() && candidate.Parameters[0].Pointer
+            && !arguments.empty()
+            && arguments[0].TypeAndValue.TypeName == candidate.Parameters[0].TypeName
+            && !argList.empty() && argList[0]->getType() == operatorReceiverStorage->getType())
+            argList[0] = operatorReceiverStorage;
         const auto emitVirtualCall = [&]() -> llvm::Value*
         {
             auto* fnTy = candidate.Function->getFunctionType();
@@ -8356,82 +8387,16 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 : CreateFunctionCall(candidate.Function, argList, calleeMayUnwind));
         RecordOpaqueReturnCall(result, candidate.ReturnType.TypeName, functionName);
         unwindCallConsumedTemps_.clear();
-        // An inferred return-sink string parameter is returned as a borrow. Transfer a pending
-        // temp only when the result matches its buffer and runtime OWNED bit.
-        bool aliasStringTempMayOwn = false;
-        auto* cflatStringTy = llvm::StructType::getTypeByName(*context, "string");
-        if (result != nullptr && cflatStringTy != nullptr && result->getType() == cflatStringTy
-            && !candidate.IsCxx && !candidate.External && !candidate.IsMethod
-            && !candidate.ReturnsOwned && !candidate.ReturnsAlias
-            && !candidate.ReturnType.Pointer && !candidate.ReturnType.ElemPointer
-            && ResolveTypeAlias(candidate.ReturnType.TypeName) == "string")
-        {
-            std::vector<llvm::Value*> stringTemps;
-            for (size_t i = 0; i < candidate.Parameters.size() && i < argList.size(); ++i)
-            {
-                const auto& param = candidate.Parameters[i];
-                if (!param.IsReturnInferredSink || param.Pointer || param.ElemPointer
-                    || param.IsAlias || param.IsMove
-                    || ResolveTypeAlias(param.TypeName) != "string")
-                    continue;
-                llvm::Value* value = argList[i];
-                if (value == nullptr || value->getType() != cflatStringTy
-                    || !IsPendingOwnedStringTemp(value))
-                    continue;
-                if (std::find(stringTemps.begin(), stringTemps.end(), value) == stringTemps.end())
-                    stringTemps.push_back(value);
-            }
-
-            if (!stringTemps.empty())
-            {
-                auto* resultPtr = builder->CreateExtractValue(result, { 0u }, "aliasret.str.ptr");
-                auto* resultLen = builder->CreateExtractValue(result, { 1u }, "aliasret.str.len");
-                llvm::Value* selectedAny = builder->getFalse();
-                auto* handoffBlock = builder->GetInsertBlock();
-                for (llvm::Value* source : stringTemps)
-                {
-                    auto* sourcePtr = builder->CreateExtractValue(source, { 0u }, "aliasret.src.ptr");
-                    auto* sourceLen = builder->CreateExtractValue(source, { 1u }, "aliasret.src.len");
-                    auto* ptrMatches = builder->CreateICmpEQ(resultPtr, sourcePtr,
-                                                             "aliasret.src.ptr.matches");
-                    auto* sourceOwnedBit = builder->CreateAnd(sourceLen,
-                        builder->getInt32(0x80000000u), "aliasret.src.owned.bit");
-                    auto* sourceIsOwned = builder->CreateICmpNE(sourceOwnedBit,
-                        builder->getInt32(0), "aliasret.src.is.owned");
-                    auto* selected = builder->CreateAnd(ptrMatches, sourceIsOwned,
-                                                        "aliasret.src.selected");
-                    selectedAny = builder->CreateOr(selectedAny, selected, "aliasret.any.selected");
-
-                    auto* borrowedLen = builder->CreateAnd(sourceLen, builder->getInt32(0x7FFFFFFF),
-                                                          "aliasret.src.borrowed");
-                    auto* ownedLen = builder->CreateSelect(selected, borrowedLen, sourceLen,
-                                                           "aliasret.src.len.next");
-                    auto* updatedSource = builder->CreateInsertValue(source, ownedLen, { 1u },
-                                                                     "aliasret.src.next");
-                    for (auto& pending : pendingOwnedStringTemps)
-                        if (pending.first == source)
-                        {
-                            pending.first = updatedSource;
-                            pending.second = handoffBlock;
-                        }
-                }
-
-                auto* resultOwnedLen = builder->CreateOr(resultLen, builder->getInt32(0x80000000u),
-                                                         "aliasret.str.owned");
-                auto* resultLenNext = builder->CreateSelect(selectedAny, resultOwnedLen, resultLen,
-                                                            "aliasret.str.len.next");
-                auto* ownedResult = builder->CreateInsertValue(result, resultLenNext, { 1u },
-                                                               "aliasret.str.next");
-                PropagateProducedTempValue(result, ownedResult);
-                result = ownedResult;
-                aliasStringTempMayOwn = true;
-            }
-        }
+        bool aliasStringTempMayOwn = !candidate.IsCxx && !candidate.External
+            && TryAdoptAliasReturnStringTemp(result, candidate.ReturnType,
+                candidate.ReturnsOwned, candidate.ReturnsAlias,
+                candidate.Parameters,
+                argList, &matched, !allowOperatorAliasReturnStringTemp);
         // Settle the copy slots of an alias-return call. When every possible source slot holds a
         // temporary, the result is one of them: it owns that value, and a slot the result does not
         // name is destroyed at the end of the full expression (runtime-compared with several).
         // A named source keeps today's non-owning alias; a mixed call frees its temps as before.
-        bool resultIsAlias = candidate.ReturnsAlias;
+        bool resultIsAlias = candidate.ReturnsAlias && !aliasStringTempMayOwn;
         if (!aliasSlots.empty() && result != nullptr && result->getType()->isPointerTy())
         {
             const bool allTemps = std::all_of(aliasSlots.begin(), aliasSlots.end(),
@@ -8727,8 +8692,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // expression. Exclude the 'copy' clone: the synthesized memberwise copy stores its result
         // straight into a struct field (GetOrCreateMemberwiseCopy), bypassing the assignment-path
         // unregister, so flushing it would double-free a now-owned field - same reasoning as closures.
+        // A fresh native operator string can own a buffer without a ReturnsOwned signature fact.
+        const bool freshNativeOperatorStringResult = allowOperatorAliasReturnStringTemp
+            && !candidate.IsCxx && !candidate.External
+            && !candidate.ReturnsAlias && !candidate.ReturnsAliasOfByValueParam
+            && !resultIsAlias;
         if (result != nullptr
-            && (candidate.ReturnsOwned || aliasStringTempMayOwn)
+            && (candidate.ReturnsOwned || aliasStringTempMayOwn || freshNativeOperatorStringResult)
             && functionName != "copy"
             && result->getType() == llvm::StructType::getTypeByName(*context, "string"))
             RegisterOwnedStringTemp(result);

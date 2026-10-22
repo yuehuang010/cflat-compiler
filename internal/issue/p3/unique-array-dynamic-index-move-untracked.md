@@ -28,7 +28,3 @@ The compiler does not retain a stable runtime index identity for a move. Treatin
 ## Fix direction
 
 Keep exact paths for compile-time constant indices. Do not track dynamic-index field moves or use them to reject later reads. Do not add a runtime check or wildcard family here.
-
-- Pre-existing (T281 round 3): a GLOBAL array is untracked: `Box[2] a` global, `consume(a[0].p)`, then `a[0].p->v` runs 139 (scratch/rev_t281_sol_tmp/global.cb; rc 139 on master and fix).
-- Pre-existing (T281 round 3): a LOCAL const index is not folded: `const int K=1`, `consume(a[K].p)`, then the read `a[1].p->v` runs 139 (scratch/rev_t281_sol_tmp/const_index.cb; rc 139 on master and fix).
-- Pre-existing (T281 round 4): a moved slot read as a CALL ARGUMENT is not checked: `read(a[0].p) == 0` (scratch/rev_t281_sol_tmp/r2b_call_deref.cb) and the field twin `read(s.p) == 0` (scratch/rev_t281_sol_tmp/r2d_field_call.cb) run 139 on master and fix.

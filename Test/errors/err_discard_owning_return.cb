@@ -100,3 +100,27 @@ expect_error("owning return value of 'f' must not be discarded") {
     move R10* makePtr10() { return new R10; }
     void useIt10() { function<R10*()> f = makePtr10; f(); }
 }
+
+// A bare `move p;` of an owning local is not a release spelling: `_ = move p;` is. The for-init
+// form is the same discard, so it is refused the same way (T355).
+expect_error("owning return value of '<call>' must not be discarded") {
+    class T355R1 { int id = default; };
+    void t355BareMoveStmt() { unique T355R1* p = new T355R1(); move p; }
+}
+
+expect_error("owning return value of '<call>' must not be discarded") {
+    class T355R2 { int id = default; };
+    void t355BareMoveFor() { unique T355R2* p = new T355R2(); for (move p; false; ) { } }
+}
+
+expect_error("'move' expression requires an addressable source") {
+    class T355R3 { int id = default; };
+    move T355R3* t355MakeR3() { return new T355R3; }
+    void t355MoveCallStmt() { move t355MakeR3(); }
+}
+
+expect_error("'move' expression requires an addressable source") {
+    class T355R4 { int id = default; };
+    move T355R4* t355MakeR4() { return new T355R4; }
+    void t355MoveCallFor() { for (move t355MakeR4(); false; ) { } }
+}

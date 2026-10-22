@@ -252,6 +252,21 @@ namespace cflat_cinterop
         int col = 0;
     };
 
+    struct RawClassTemplateParameter
+    {
+        std::string name;
+        char kind = 'T';
+        bool hasDefault = false;
+        int defaultParameterIndex = -1;
+        std::string defaultArgument;
+    };
+
+    struct RawClassTemplate
+    {
+        std::string name;
+        std::vector<RawClassTemplateParameter> parameters;
+    };
+
     struct RawEnum
     {
         std::string name;
@@ -784,6 +799,7 @@ namespace cflat_cinterop
         std::string targetTriple;
         std::vector<RawSig> sigs;
         std::vector<RawFunctionTemplate> functionTemplates;
+        std::vector<RawClassTemplate> classTemplates;
         std::vector<std::string> classTemplateNames;
         std::vector<std::string> classTemplateSpecializations;
         std::vector<RawEnum> enums;

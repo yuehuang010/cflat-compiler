@@ -5219,6 +5219,105 @@ bool testPointerArithmeticBorrowProvenance()
     return ok;
 }
 
+// T363: indirect pointer returns are borrowed unless their declared return uses `move`.
+Square[3] t363Squares = default;
+Square* t363GetBorrow() { return &t363Squares[0]; }
+
+interface T363Holder { Square* peek(); };
+class T363HolderImpl : T363Holder { Square* peek() { return &t363Squares[0]; } };
+T363HolderImpl t363Holder = default;
+
+interface T363GenericHolder<T> { T* peek(); };
+class T363GenericHolderImpl : T363GenericHolder<Square>
+{
+    Square* peek() { return &t363Squares[0]; }
+};
+T363GenericHolderImpl t363GenericHolder = default;
+
+class T363Node : IShape
+{
+    int s = 0;
+    T363Node* next = nullptr;
+    int area() { return s * s; }
+};
+T363Node[3] t363Nodes = default;
+interface T363NodeHolder { T363Node* peek(); };
+class T363NodeHolderImpl : T363NodeHolder { T363Node* peek() { return &t363Nodes[2]; } };
+T363NodeHolderImpl t363NodeHolder = default;
+
+IShape t363ReturnInterfaceMethod()
+{
+    T363Holder i = &t363Holder;
+    return i.peek() + 1;
+}
+
+IShape t363ReturnFunctionPointer()
+{
+    function<Square*()> fp = t363GetBorrow;
+    return fp() + 1;
+}
+
+IShape t363ReturnFunctionParameter(function<Square*()> fp) { return fp() + 1; }
+
+IShape t363ReturnLambda()
+{
+    Lambda<Square*()> fp = () => { return &t363Squares[0]; };
+    return fp() + 1;
+}
+
+IShape t363ReturnGenericInterface()
+{
+    T363GenericHolder<Square> i = &t363GenericHolder;
+    return i.peek() + 1;
+}
+
+IShape t363ReturnChainedField()
+{
+    T363NodeHolder i = &t363NodeHolder;
+    return i.peek()->next + 1;
+}
+
+IShape t363ReturnBoundPointer()
+{
+    T363Holder i = &t363Holder;
+    Square* b = i.peek();
+    return b + 1;
+}
+
+IShape t363ReturnPlain() { T363Holder i = &t363Holder; return i.peek(); }
+
+bool testPointerArithmeticIndirectBorrowReturns()
+{
+    HeapAudit.enable();
+    int heapBase = (int)HeapAudit.reportLeaks();
+    t363Squares[0].s = 2;
+    t363Squares[1].s = 3;
+    t363Squares[2].s = 4;
+    t363Nodes[0].s = 2;
+    t363Nodes[1].s = 3;
+    t363Nodes[2].s = 4;
+    t363Nodes[2].next = &t363Nodes[0];
+    IShape iface = t363ReturnInterfaceMethod();
+    IShape functionPointer = t363ReturnFunctionPointer();
+    IShape functionParameter = t363ReturnFunctionParameter(t363GetBorrow);
+    IShape lambda = t363ReturnLambda();
+    IShape genericInterface = t363ReturnGenericInterface();
+    IShape chainedField = t363ReturnChainedField();
+    IShape boundPointer = t363ReturnBoundPointer();
+    IShape plain = t363ReturnPlain();
+    bool passed = true;
+    passed &= Test("t363_iface_method_arith", iface.area(), 9);
+    passed &= Test("t363_function_ptr_arith", functionPointer.area(), 9);
+    passed &= Test("t363_function_param_arith", functionParameter.area(), 9);
+    passed &= Test("t363_lambda_arith", lambda.area(), 9);
+    passed &= Test("t363_generic_iface_arith", genericInterface.area(), 9);
+    passed &= Test("t363_chained_field_arith", chainedField.area(), 9);
+    passed &= Test("t363_bound_pointer_arith", boundPointer.area(), 9);
+    passed &= Test("t363_plain_return_control", plain.area(), 4);
+    passed &= Test("t363_borrow_heap_delta", (int)HeapAudit.reportLeaks(), heapBase);
+    return passed;
+}
+
 // T91: the accept set of the interface-return dangle check. Each shape compiles and returns the
 // element its arithmetic names; an owned heap box is freed through the caller's interface local.
 struct T91Box { Square[3] arr = default; };
@@ -5552,6 +5651,7 @@ extern int main()
     total++; passed += testPointerArithmeticBoxesIntoInterface()       ? 1 : 0;
     total++; passed += testPointerArithmeticReturnsAsInterface()       ? 1 : 0;
     total++; passed += testPointerArithmeticBorrowProvenance()         ? 1 : 0;
+    total++; passed += testPointerArithmeticIndirectBorrowReturns()    ? 1 : 0;
     total++; passed += testInterfaceReturnAcceptSet()                    ? 1 : 0;
     total++; passed += testInterfaceFieldZeroOwnerReturn()                 ? 1 : 0;
 

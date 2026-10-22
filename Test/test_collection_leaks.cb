@@ -16,6 +16,7 @@
 //      so `value`'s scope-exit destructor freed a buffer the slot now aliased - a double
 //      free for a value-type V with a real destructor (e.g. a nested list<string>).
 import "string.cb";
+import "tuple.cb";
 import "list.cb";
 import "dictionary.cb";
 import "hashset.cb";
@@ -39,6 +40,18 @@ bool t352ReadUnique = false;
 bool t352ReadList = false;
 bool t352ReadValue = false;
 bool t352ReadDict = false;
+struct T355ForInitOwner
+{
+    string f = default;
+    void seed() { f = "t355 for-init field move".copy(); }
+};
+// Generic `T t;` for-init: the declaration is the same as the statement `T t;` in the body.
+int t355ForInitGeneric<T>()
+{
+    int n = 0;
+    for (T t; n < 1; n++) { }
+    return n;
+}
 struct T352ProbeValue
 {
     int kind = 0;
@@ -239,6 +252,49 @@ int t356ReadPointerIndex1DerefString(string* ps)
 {
     string t = ps[1];
     return t.length();
+}
+int t359StorePointerIndexField(string* ps)
+{
+    T356StringHolder holder = default;
+    holder.value = ps[0];
+    return holder.value.length();
+}
+int t359AssignPointerIndex(string* ps)
+{
+    string t = "old".copy();
+    t = ps[0];
+    return t.length();
+}
+int t359ReadParenthesizedPointerIndex(string* ps)
+{
+    string t = (ps)[0];
+    return t.length();
+}
+void* t359SelfAssignBuffer = nullptr;
+u64 t359SelfAssignAllocations = 0;
+u64 t359SelfAssignFrees = 0;
+void t359SelfAssignCountAlloc(void* pointer, u64 size)
+{
+    t359SelfAssignAllocations++;
+    cflat_heap_audit_alloc(pointer, size);
+}
+void t359SelfAssignPoisonFree(void* pointer)
+{
+    t359SelfAssignFrees++;
+    cflat_heap_audit_free(pointer);
+    if (pointer == t359SelfAssignBuffer)
+    {
+        char* bytes = (char*)pointer;
+        for (int i = 0; i < 47; i++) bytes[i] = (char)88;
+    }
+}
+bool t359SelfAssignPointerIndex()
+{
+    string t = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+    string* ps = &t;
+    t359SelfAssignBuffer = (void*)t.data();
+    t = ps[0];
+    return t.length() == 46 && t.charAt(0) == (i8)97;
 }
 string* t356GetStringPointer(string* ps) { return ps; }
 int t356ReadCallDerefString(string* ps) { string t = *t356GetStringPointer(ps); return t.length(); }
@@ -1528,6 +1584,21 @@ extern int main()
     int passed = 0;
     int total = 0;
 
+    {
+        u64 before = HeapAudit.reportLeaks();
+        bool value = false;
+        {
+            ((int,float),string) nested = default;
+            nested.item_0.item_0 = 20;
+            nested.item_0.item_1 = 21.0f;
+            nested.item_1 = "nested tuple owns this buffer".copy();
+            value = nested.item_0.item_0 == 20 && nested.item_0.item_1 == 21.0f
+                && nested.item_1 == "nested tuple owns this buffer";
+        }
+        bool freedOnce = HeapAudit.reportLeaks() == before;
+        total++; passed += Test("t369 nested tuple string frees once", value && freedOnce, true);
+    }
+
     // T352 moved-field discard coverage (45 matrix cells + 4 shared helper callers).
     {
         u64 before = HeapAudit.reportLeaks();
@@ -1685,6 +1756,42 @@ extern int main()
         bool clean = HeapAudit.reportLeaks() == before && value == 46
             && t356AuditAllocations == 3u && t356AuditFrees == 3u;
         total++; passed += Test("t356_deref_string_pointer_index1", clean, true);
+    }
+    // T359: copy a self-assigned pointer subscript before freeing its source buffer.
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t359SelfAssignBuffer = nullptr;
+        t359SelfAssignAllocations = 0;
+        t359SelfAssignFrees = 0;
+        __alloc_audit_hook = t359SelfAssignCountAlloc;
+        __free_audit_hook = t359SelfAssignPoisonFree;
+        bool value = t359SelfAssignPointerIndex();
+        __alloc_audit_hook = cflat_heap_audit_alloc;
+        __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before
+            && t359SelfAssignAllocations == 2u && t359SelfAssignFrees == 2u;
+        total++; passed += Test("t359_self_assign_subscript", clean && value, true);
+    }
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        u64 before = HeapAudit.reportLeaks();
+        int value = t359StorePointerIndexField(&source);
+        bool clean = HeapAudit.reportLeaks() == before && value == 46;
+        total++; passed += Test("t359_field_store_subscript", clean, true);
+    }
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        u64 before = HeapAudit.reportLeaks();
+        int value = t359AssignPointerIndex(&source);
+        bool clean = HeapAudit.reportLeaks() == before && value == 46;
+        total++; passed += Test("t359_plain_assignment_subscript", clean, true);
+    }
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        u64 before = HeapAudit.reportLeaks();
+        int value = t359ReadParenthesizedPointerIndex(&source);
+        bool clean = HeapAudit.reportLeaks() == before && value == 46;
+        total++; passed += Test("t359_parenthesized_subscript", clean, true);
     }
     {
         u64 before = HeapAudit.reportLeaks();
@@ -2255,6 +2362,116 @@ extern int main()
             clean = HeapAudit.reportLeaks() == before;
         }
         total++; passed += Test("t352_for_init_discarded_field_move", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        bool clean = false;
+        {
+            T355ForInitOwner b = default;
+            b.seed();
+            for (move b.f; false; ) { }
+            clean = b.f.length() == 0 && HeapAudit.reportLeaks() == before;
+        }
+        total++; passed += Test("t355_for_init_bare_field_move", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        bool clean = false;
+        {
+            string s = "t355 for-init local string move".copy();
+            string* source = &s;
+            for (move s; false; ) { }
+            clean = source->length() == 0 && HeapAudit.reportLeaks() == before;
+        }
+        total++; passed += Test("t355_for_init_bare_string_move", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        bool clean = false;
+        {
+            unique T352ProbeValue* p = new T352ProbeValue();
+            p->kind = 1;
+            for (_ = move p; false; ) { }
+            clean = t352UniqueDtor == dtorBefore + 1
+                && HeapAudit.reportLeaks() == before;
+        }
+        total++; passed += Test("t355_for_init_bare_unique_move", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        bool clean = false;
+        {
+            for (move returnOwnedLocal(); false; ) { }
+            clean = HeapAudit.reportLeaks() == before;
+        }
+        total++; passed += Test("t355_for_init_moved_call", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int seen = 0;
+        bool clean = false;
+        {
+            for (T355ForInitOwner o; seen < 1; seen++) { o.seed(); }
+            clean = seen == 1 && HeapAudit.reportLeaks() == before;
+        }
+        total++; passed += Test("t355_for_init_named_struct", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int n = 0;
+        bool clean = false;
+        {
+            for (list<int> l; n < 2; n++) { l.add(n); }
+            clean = n == 2 && HeapAudit.reportLeaks() == before;
+        }
+        total++; passed += Test("t355_for_init_list_declaration", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        bool clean = false;
+        {
+            clean = t355ForInitGeneric<T355ForInitOwner>() == 1 && HeapAudit.reportLeaks() == before;
+        }
+        total++; passed += Test("t355_for_init_generic_declaration", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int n = 0;
+        bool clean = false;
+        {
+            for (move string s; n < 1; n++) { }
+            clean = n == 1 && HeapAudit.reportLeaks() == before;
+        }
+        total++; passed += Test("t355_for_init_move_string_declaration", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        bool clean = false;
+        {
+            unique T352ProbeValue* p = new T352ProbeValue();
+            p->kind = 1;
+            _ = move p;
+            clean = t352UniqueDtor == dtorBefore + 1
+                && HeapAudit.reportLeaks() == before;
+        }
+        total++; passed += Test("t355_statement_bare_unique_move", clean, true);
+    }
+    {
+        int i = 0;
+        for (i; i < 3; i++) { }
+        total++; passed += Test("t355_for_init_bare_variable_expression", i, 3);
+    }
+    {
+        T352ProbeValue s = default;
+        for (s.kind; s.kind < 3; s.kind++) { }
+        total++; passed += Test("t355_for_init_bare_member_expression", s.kind, 3);
+    }
+    {
+        int moveCount = 0;
+        for (moveCount; moveCount < 4; moveCount++) { }
+        total++; passed += Test("t355_for_init_bare_movecount_expression", moveCount, 4);
     }
     {
         u64 before = HeapAudit.reportLeaks();

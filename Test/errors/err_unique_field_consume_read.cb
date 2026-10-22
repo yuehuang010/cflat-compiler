@@ -486,6 +486,34 @@ expect_error("dereference of moved variable 's.p'") {
     }
 }
 
+// q11 applies to every owning slot in global storage; explicit `move` is the reinitializing form.
+S t367GlobalField;
+S[2] t367GlobalArray;
+unique P* t367GlobalPointer = nullptr;
+expect_error("cannot consume owning value 't367GlobalField.p' out of storage that outlives this function") {
+    void implicitGlobalFieldCallConsume()
+    {
+        t367GlobalField.p = new P();
+        mvP(t367GlobalField.p);
+    }
+}
+
+expect_error("cannot consume owning value 't367GlobalArray[0].p' out of storage that outlives this function") {
+    void implicitGlobalArrayFieldCallConsume()
+    {
+        t367GlobalArray[0].p = new P();
+        mvP(t367GlobalArray[0].p);
+    }
+}
+
+expect_error("cannot consume owning value 't367GlobalPointer' out of storage that outlives this function") {
+    void implicitGlobalPointerCallConsume()
+    {
+        t367GlobalPointer = new P();
+        mvP(t367GlobalPointer);
+    }
+}
+
 extern int main()
 {
     return 0;
