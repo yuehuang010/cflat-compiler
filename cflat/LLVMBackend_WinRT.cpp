@@ -1756,6 +1756,174 @@ bool LLVMBackend::JoinArmsStillKeepOwner(const NamedVariable& nv, int depth) con
         return true;
 }
 
+bool LLVMBackend::SameNonLocalViewStorage(const llvm::Value* left,
+        const llvm::Value* right) const
+{
+        if (left == right) return true;
+        if (left == nullptr || right == nullptr) return false;
+        struct StoragePath
+        {
+            const llvm::Value* Root = nullptr;
+            std::vector<const llvm::Value*> Indices;
+        };
+        auto normalize = [](const llvm::Value* value) {
+            StoragePath path;
+            while (value != nullptr)
+            {
+                value = value->stripPointerCasts();
+                if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+                {
+                    value = load->getPointerOperand();
+                    continue;
+                }
+                if (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
+                {
+                    std::vector<const llvm::Value*> segment;
+                    for (auto index = gep->idx_begin(); index != gep->idx_end(); ++index)
+                        segment.push_back(*index);
+                    path.Indices.insert(path.Indices.begin(), segment.begin(), segment.end());
+                    value = gep->getPointerOperand();
+                    continue;
+                }
+                break;
+            }
+            path.Root = value != nullptr ? value->stripPointerCasts() : value;
+            return path;
+        };
+        const StoragePath leftPath = normalize(left);
+        const StoragePath rightPath = normalize(right);
+        if (leftPath.Root != rightPath.Root
+            || leftPath.Indices.size() != rightPath.Indices.size())
+            return false;
+        for (size_t i = 0; i < leftPath.Indices.size(); ++i)
+        {
+            const auto* leftIndex = leftPath.Indices[i];
+            const auto* rightIndex = rightPath.Indices[i];
+            if (leftIndex == rightIndex) continue;
+            const auto* leftConstant = llvm::dyn_cast<llvm::ConstantInt>(leftIndex);
+            const auto* rightConstant = llvm::dyn_cast<llvm::ConstantInt>(rightIndex);
+            if (leftConstant != nullptr && rightConstant != nullptr
+                && leftConstant->getValue() != rightConstant->getValue())
+                return false;
+        }
+        return true;
+}
+
+// Two element-path keys ("root|path") alias when the roots and paths match, or a dynamic index
+// ('*') on either side names the same leaf field: a dynamic element may be any element.
+static bool NonLocalPathKeysAlias(const std::string& left, const std::string& right)
+{
+        const size_t leftBar = left.find('|');
+        const size_t rightBar = right.find('|');
+        if (leftBar == std::string::npos || rightBar == std::string::npos) return false;
+        if (left.compare(0, leftBar, right, 0, rightBar) != 0) return false;
+        const std::string leftPath = left.substr(leftBar + 1);
+        const std::string rightPath = right.substr(rightBar + 1);
+        if (leftPath == rightPath) return true;
+        if (leftPath.empty() || rightPath.empty()
+            || (leftPath[0] != '*' && rightPath[0] != '*')) return false;
+        auto leaf = [](const std::string& path) {
+            const size_t dot = path.rfind('.');
+            return dot == std::string::npos ? path : path.substr(dot + 1);
+        };
+        return leaf(leftPath) == leaf(rightPath);
+}
+
+std::string LLVMBackend::NonLocalElementPathKey(const NamedVariable& nv) const
+{
+        // Only element-field paths need a name key; every other slot matches by storage.
+        if (nv.FieldName.empty() || nv.FieldPathRoot.empty()) return {};
+        if (!nv.MovePathHasDynamicIndex && nv.MovePathKey.find('[') == std::string::npos)
+            return {};
+        // Key the root by its resolved binding: same-named locals in nested scopes are distinct.
+        const llvm::Value* rootStorage = FindVariableStorage(nv.FieldPathRoot).Storage;
+        const std::string root = rootStorage != nullptr
+            ? std::to_string(reinterpret_cast<uintptr_t>(rootStorage))
+            : "name:" + nv.FieldPathRoot;
+        if (nv.MovePathHasDynamicIndex)
+            return root + "|*." + nv.FieldName;
+        return root + "|" + nv.MovePathKey;
+}
+
+void LLVMBackend::TrackNonLocalViewAssignment(llvm::Value* storage, llvm::Value* value,
+        const llvm::Value* sourceStorage, bool sourceTransfersOwnership,
+        const std::string& pathKey, bool sourceKnownBorrowed)
+{
+        if (storage == nullptr || builder == nullptr || builder->GetInsertBlock() == nullptr)
+            return;
+        if (sourceStorage != nullptr && SameNonLocalViewStorage(storage, sourceStorage))
+            return;
+        bool mayBeBorrowed = !sourceTransfersOwnership;
+        if (const auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(value);
+            constant != nullptr && constant->isNullValue())
+            mayBeBorrowed = false;
+        // A tracked borrowed source is proof; the moved value's raw flags must not override it.
+        else if (sourceKnownBorrowed)
+            mayBeBorrowed = true;
+        else if (const auto* raw = FindRawArrayResult(value))
+        {
+            if (raw->Owns) mayBeBorrowed = false;
+            // A tracked move source proves the transfer; a moved global's raw flags read as not
+            // owned. A mixed join (no tracked source) keeps the raw borrowed signal.
+            else if (sourceTransfersOwnership && sourceStorage != nullptr) mayBeBorrowed = false;
+            else if (const auto* owns = llvm::dyn_cast_or_null<llvm::ConstantInt>(raw->RuntimeOwns))
+                mayBeBorrowed = owns->isZero();
+            else mayBeBorrowed = true;
+        }
+        llvm::Function* function = builder->GetInsertBlock()->getParent();
+        for (auto& state : nonLocalViewOwnershipStates_)
+            if (state.Function == function && SameNonLocalViewStorage(state.Storage, storage))
+            {
+                state.MayBeBorrowed = mayBeBorrowed;
+                return;
+            }
+        nonLocalViewOwnershipStates_.push_back({ storage, function, mayBeBorrowed, pathKey });
+}
+
+std::optional<bool> LLVMBackend::NonLocalViewMayBeBorrowed(const llvm::Value* storage,
+        const std::string& pathKey) const
+{
+        if ((storage == nullptr && pathKey.empty())
+            || builder == nullptr || builder->GetInsertBlock() == nullptr)
+            return std::nullopt;
+        const auto* function = builder->GetInsertBlock()->getParent();
+        // A dynamic index may name any aliased element: every candidate counts, and one
+        // may-borrowed candidate outweighs any number of owned ones.
+        std::optional<bool> result;
+        for (const auto& state : nonLocalViewOwnershipStates_)
+        {
+            if (state.Function != function) continue;
+            const bool sameSlot = storage != nullptr
+                && SameNonLocalViewStorage(state.Storage, storage);
+            const bool samePath = !pathKey.empty() && !state.PathKey.empty()
+                && NonLocalPathKeysAlias(state.PathKey, pathKey);
+            if (!sameSlot && !samePath) continue;
+            if (state.MayBeBorrowed) return true;
+            result = false;
+        }
+        return result;
+}
+
+void LLVMBackend::CheckOwnFlagLoopBackEdge()
+{
+        if (ownFlagLoopReownSnapshots_.empty()
+            || !IsInsertBlockLive() || IsCurrentBlockUnreachable())
+            return;
+        const auto& frame = ownFlagLoopReownSnapshots_.back();
+        for (const auto& sink : frame.moveSinkViews)
+        {
+            const auto* live = FindVariableByStorage(sink.Storage);
+            const bool localMayBeBorrowed = live != nullptr
+                && live->TypeAndValue.IsArrayView && live->OwnFlagMayBeFalse;
+            const bool nonLocalMayBeBorrowed = NonLocalViewMayBeBorrowed(
+                sink.Storage, sink.PathKey).value_or(false);
+            if (!localMayBeBorrowed && !nonLocalMayBeBorrowed) continue;
+            ReportingFileScope report(this, sink.File, sink.Line, sink.Column);
+            LogError(sink.Diagnostic);
+            return;
+        }
+}
+
 void LLVMBackend::DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
         const std::string& paramName, const NamedVariable& arg)
 {
@@ -1763,23 +1931,66 @@ void LLVMBackend::DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
         // binding itself - ask the live variable, not the copy. Unknown provenance ACCEPTS.
         const bool storageIsLocalSlot = arg.Storage != nullptr
             && llvm::isa<llvm::AllocaInst>(arg.Storage);
-        if (!storageIsLocalSlot || !arg.FieldName.empty()) return;
         const NamedVariable* live = FindVariableByStorage(arg.Storage);
         const bool allJoinArmsKeepOwner = live != nullptr && !live->IsOwning
             && JoinArmsStillKeepOwner(*live) && !live->JoinKeepsOwnerSource.empty();
-        if (live != nullptr && arg.TypeAndValue.IsArrayView
-            && (live->OwnFlagMayBeFalse || allJoinArmsKeepOwner))
-        {
-            const std::string sourceName = arg.CallerName.empty()
-                ? FindVariableNameByStorage(arg.Storage) : arg.CallerName;
-            LogError(std::format(
+
+        // Non-local views have no runtime own flag; preserve the last assignment's proof instead.
+        const bool nonLocalMayBeBorrowed = !storageIsLocalSlot
+            && arg.TypeAndValue.IsArrayView
+            && NonLocalViewMayBeBorrowed(arg.Storage, arg.MoveSourcePathKey.empty()
+                ? NonLocalElementPathKey(arg) : arg.MoveSourcePathKey).value_or(false);
+        const bool localMayBeBorrowed = live != nullptr
+            && (live->OwnFlagMayBeFalse || allJoinArmsKeepOwner);
+        auto makeDiagnostic = [&]() {
+            const std::string sourceName = !arg.FieldPathText.empty()
+                ? arg.FieldPathText
+                : (arg.CallerName.empty() ? FindVariableNameByStorage(arg.Storage)
+                                          : arg.CallerName);
+            return std::format(
                 "cannot move array view '{}' into move parameter '{}' of '{}' - the view may be "
                 "borrowed on a runtime path, so the sink could free storage the real owner still "
                 "holds. Reassign it from an owned source before passing it to a move parameter.",
                 sourceName.empty() ? SpellType(*this, arg.TypeAndValue) : sourceName,
-                paramName, SpellFunctionSymbol(*this, functionName)));
+                paramName, SpellFunctionSymbol(*this, functionName));
+        };
+        if (arg.TypeAndValue.IsArrayView && (localMayBeBorrowed || nonLocalMayBeBorrowed))
+        {
+            LogError(makeDiagnostic());
             return;
         }
+        if (arg.TypeAndValue.IsArrayView && !ownFlagLoopReownSnapshots_.empty())
+        {
+            const std::string rootName = !arg.FieldPathRoot.empty()
+                ? arg.FieldPathRoot : arg.CallerName;
+            const llvm::Value* scopeStorage = arg.Storage;
+            if (!rootName.empty())
+                if (auto* resolved = FindVariableStorage(rootName).Storage) scopeStorage = resolved;
+
+            bool hasScope = false;
+            size_t scopeIndex = 0;
+            for (size_t i = 0; i < stackNamedVariable.size() && !hasScope; ++i)
+            {
+                const auto& scope = stackNamedVariable[i];
+                for (const auto& [name, variable] : scope.functionArgument)
+                    if (variable.Storage == scopeStorage) { scopeIndex = i; hasScope = true; break; }
+                if (hasScope) break;
+                for (const auto& [name, variable] : scope.namedVariable)
+                    if (variable.Storage == scopeStorage) { scopeIndex = i; hasScope = true; break; }
+            }
+            const bool isGlobal = llvm::isa_and_nonnull<llvm::GlobalVariable>(scopeStorage);
+            if (hasScope || isGlobal)
+            {
+                const std::string pathKey = arg.MoveSourcePathKey.empty()
+                    ? NonLocalElementPathKey(arg) : arg.MoveSourcePathKey;
+                const std::string diagnostic = makeDiagnostic();
+                for (auto& frame : ownFlagLoopReownSnapshots_)
+                    if (isGlobal || scopeIndex < frame.scopeDepth)
+                        frame.moveSinkViews.push_back({ arg.Storage, pathKey, diagnostic,
+                            sourceFileName, currentLine, currentColumn });
+            }
+        }
+        if (!storageIsLocalSlot || !arg.FieldName.empty()) return;
         const bool argOwns = arg.IsOwning || arg.IsOwningStruct || arg.IsOwningString
             || arg.OwnsInterfaceBox
             || (live != nullptr && (live->IsOwning || live->IsOwningStruct
@@ -1826,11 +2037,12 @@ std::string LLVMBackend::ImplicitOutlivingOwnerConsumeError(const NamedVariable&
         bool srcIsMove) const
 {
         if (srcIsMove || srcNV.TypeAndValue.IsMove || srcNV.IsExplicitMove
-            || srcNV.Storage == nullptr)
+            || (srcNV.Storage == nullptr && !srcNV.IsStaticLocal
+                && !srcNV.FieldPathHasPointerDereference))
             return {};
         // Field and element Storage is a GEP; ask about its root allocation.
         const llvm::Value* obj = srcNV.Storage;
-        for (int hop = 0; hop < 8; hop++)
+        for (int hop = 0; obj != nullptr && hop < 8; hop++)
         {
             if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(obj))
             { obj = gep->getPointerOperand(); continue; }
@@ -1838,16 +2050,41 @@ std::string LLVMBackend::ImplicitOutlivingOwnerConsumeError(const NamedVariable&
             { obj = bc->getOperand(0); continue; }
             break;
         }
-        if (!llvm::isa_and_nonnull<llvm::GlobalVariable>(obj)) return {};
-        // User globals are recorded here; compiler globals (literal pools, vtables) are not.
-        const std::string globalName = obj->getName().str();
-        if (globalVariableTypes.find(globalName) == globalVariableTypes.end()) return {};
+        std::string globalName;
+        if (auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(obj))
+        {
+            globalName = global->getName().str();
+            // User globals are recorded here; compiler globals (literal pools, vtables) are not.
+            if (globalVariableTypes.find(globalName) == globalVariableTypes.end())
+                globalName.clear();
+        }
+        const bool outlivingGlobal = !globalName.empty();
+        const bool alreadyCheckedBorrow = srcNV.RootIsBorrowedByValueParam
+            || srcNV.RootIsAliasBorrowLocal || srcNV.PointsToBorrowedByValueParam
+            || (srcNV.IsBorrowed && !srcNV.BorrowedOrigin.empty()
+                && IsFunctionParameter(srcNV.BorrowedOrigin));
+        const bool outlivingPointer = srcNV.FieldPathHasPointerDereference
+            && (srcNV.TypeAndValue.IsUnique || srcNV.IsUniqueFieldAlias)
+            && !srcNV.FieldPathPointerFrameLocal && !alreadyCheckedBorrow;
+        if (!srcNV.IsStaticLocal && !outlivingGlobal && !outlivingPointer) return {};
 
-        std::string spelling = srcNV.CallerName.empty() ? globalName : srcNV.CallerName;
+        std::string spelling = outlivingPointer && !srcNV.FieldPathRoot.empty()
+            ? srcNV.FieldPathRoot : srcNV.CallerName;
+        if (spelling.empty())
+            spelling = !globalName.empty() ? globalName
+                : !srcNV.FieldPathRoot.empty() ? srcNV.FieldPathRoot : srcNV.FieldName;
         std::string movePath = FieldMoveKey(srcNV);
         if (movePath.empty() && !srcNV.FieldName.empty()) movePath = srcNV.FieldName;
         if (!movePath.empty())
             spelling += movePath.front() == '[' ? movePath : "." + movePath;
+        if (outlivingPointer && !srcNV.IsStaticLocal && !outlivingGlobal)
+            return std::format(
+                "cannot consume owning value '{}' out of storage that outlives this function - "
+                "the pointer target is not proven local to this frame, so the owning field may "
+                "still be responsible for cleanup when this function returns. Write 'move {}' to "
+                "take the value and re-initialize the storage, or give '{}' a 'copy()' method "
+                "and copy it.",
+                spelling, spelling, SpellType(*this, srcNV.TypeAndValue));
         return std::format(
             "cannot consume owning value '{}' out of storage that outlives this function - a global "
             "or 'static' local is never re-initialized between entries, so this store empties it and "

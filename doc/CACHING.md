@@ -289,13 +289,14 @@ group's header stamp, clang driver arguments, the cache schema version, and whet
 are emitted. A changed header, argument set, cache format, or emit mode is therefore a miss.
 Missing, truncated, or hash-mismatched sidecars are misses and are rewritten with the request entry.
 
-By default neither header nor request entries depend on the cflat build: they survive a rebuild,
-so `kCHeaderCacheVersion` must be bumped with any change to what the extractor harvests. With
-`CFLAT_CACHE_BUILD_STAMP=1`, every entry records the build that wrote it (`cstamp`, the cflat
-binary's mtime and size) and a load by another build is a `compiler build` miss that rewrites the
-entry in place; demand companions are then keyed per build too. The default flips to ON once a
-cold cflat compile is within 1.1x of clang++ cold (the p1 target); until then a rebuild must not
-make every header cold. The switch is `LLVMBackend::CacheBuildStampEnabled()`.
+By default header, request, and core bitcode metadata record the compiler build that wrote them
+(`cstamp`, the cflat binary's mtime and size). A load by another build is a `compiler build` miss;
+header/request entries are rewritten in place, and demand companions are keyed per build too. Set
+`CFLAT_CACHE_BUILD_STAMP=0` to omit these stamps and let those entries survive a rebuild. PCH keys
+always include the build stamp because a PCH belongs to the clang that wrote it. The cache schema
+still must be bumped when the extractor's harvested data changes. The switch is
+`LLVMBackend::CacheBuildStampEnabled()`. Core bitcode is written only by `--init` / `--init-local`, so
+after a rebuild every compile misses it until `--init` is re-run (output stays correct).
 
 Request entries are written whenever the request is accepted: the records are non-empty and, for
 a request carrying a generated prefix source, clang reported no error. A tolerated clang error

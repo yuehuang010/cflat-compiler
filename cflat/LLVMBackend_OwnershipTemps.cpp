@@ -1221,6 +1221,8 @@ void LLVMBackend::EnterOwnershipControlRegion(uint8_t frameKind)
             OwnFlagLoopReownFrame frame;
             frame.entrySnapshot = ownFlagDefinitelyReowned_;
             frame.isDoWhile = (frameKind & OwnFlagDoWhileFrame) != 0;
+            frame.hasIncrement = (frameKind & OwnFlagLoopIncrementFrame) != 0;
+            frame.scopeDepth = stackNamedVariable.size();
             ownFlagLoopReownSnapshots_.push_back(std::move(frame));
         }
 }
@@ -1285,19 +1287,37 @@ LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::SaveOwnFlagJoinState()
 {
         OwnFlagJoinSnapshot state;
         std::unordered_set<const llvm::Value*> activeViewSlots;
-        auto saveOne = [&](const NamedVariable& namedVar) {
+        // Scope depth where the innermost loop began; deeper frames hold per-iteration slots.
+        const size_t iterationDepth = ownFlagLoopReownSnapshots_.empty()
+            ? stackNamedVariable.size() : ownFlagLoopReownSnapshots_.back().scopeDepth;
+        auto saveOne = [&](const NamedVariable& namedVar, size_t frameIndex) {
             if (namedVar.Storage == nullptr) return;
             if (namedVar.OwnFlagMayBeFalse)
                 state.mayBeFalsePaths[namedVar.Storage] = namedVar.OwnFlagMayBeFalseControlPath;
             if (namedVar.TypeAndValue.IsArrayView
                 && llvm::isa<llvm::AllocaInst>(namedVar.Storage) && namedVar.FieldName.empty())
+            {
                 activeViewSlots.insert(namedVar.Storage);
+                // Owned on this arm without a re-own event (an owning declaration): a re-own
+                // on the other arm then agrees; a borrowed declaration is not owned.
+                if (namedVar.IsOwning && !namedVar.OwnFlagMayBeFalse)
+                {
+                    state.ownedViewSlots.insert(namedVar.Storage);
+                    if (frameIndex >= iterationDepth)
+                        state.iterationOwnedViewSlots.insert(namedVar.Storage);
+                }
+            }
         };
-        for (const auto& frame : stackNamedVariable)
+        for (size_t frameIndex = 0; frameIndex < stackNamedVariable.size(); ++frameIndex)
         {
-            for (const auto& [name, namedVar] : frame.functionArgument) saveOne(namedVar);
-            for (const auto& [name, namedVar] : frame.namedVariable) saveOne(namedVar);
+            const auto& frame = stackNamedVariable[frameIndex];
+            for (const auto& [name, namedVar] : frame.functionArgument) saveOne(namedVar, frameIndex);
+            for (const auto& [name, namedVar] : frame.namedVariable) saveOne(namedVar, frameIndex);
         }
+        llvm::Function* activeFunction = builder != nullptr && builder->GetInsertBlock() != nullptr
+            ? builder->GetInsertBlock()->getParent() : nullptr;
+        for (const auto& viewState : nonLocalViewOwnershipStates_)
+            if (viewState.Function == activeFunction) state.nonLocalViews.push_back(viewState);
         for (auto it = ownFlagDefinitelyReowned_.begin(); it != ownFlagDefinitelyReowned_.end();)
         {
             if (activeViewSlots.contains(*it))
@@ -1324,6 +1344,13 @@ void LLVMBackend::RestoreOwnFlagJoinState(const OwnFlagJoinSnapshot& state)
             for (auto& [name, namedVar] : frame.functionArgument) restoreOne(namedVar);
             for (auto& [name, namedVar] : frame.namedVariable) restoreOne(namedVar);
         }
+        llvm::Function* activeFunction = builder != nullptr && builder->GetInsertBlock() != nullptr
+            ? builder->GetInsertBlock()->getParent() : nullptr;
+        std::erase_if(nonLocalViewOwnershipStates_,
+            [&](const auto& current) { return current.Function == activeFunction; });
+        for (const auto& viewState : state.nonLocalViews)
+            if (viewState.Function == activeFunction)
+                nonLocalViewOwnershipStates_.push_back(viewState);
         ownFlagDefinitelyReowned_ = state.definitelyReowned;
 }
 
@@ -1336,13 +1363,63 @@ LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::MergeOwnFlagJoinStates(
             if (second.definitelyReowned.contains(storage))
                 merged.definitelyReowned.insert(storage);
 
+        for (const auto& state : first.nonLocalViews)
+        {
+            auto other = std::ranges::find_if(second.nonLocalViews, [&](const auto& candidate) {
+                return candidate.Function == state.Function
+                    && SameNonLocalViewStorage(candidate.Storage, state.Storage);
+            });
+            if (other != second.nonLocalViews.end())
+                merged.nonLocalViews.push_back({ state.Storage, state.Function,
+                    state.MayBeBorrowed || other->MayBeBorrowed,
+                    state.PathKey.empty() ? other->PathKey : state.PathKey });
+            else if (state.MayBeBorrowed)
+                merged.nonLocalViews.push_back(state);
+        }
+        for (const auto& state : second.nonLocalViews)
+        {
+            const bool presentInFirst = std::ranges::any_of(first.nonLocalViews,
+                [&](const auto& candidate) {
+                    return candidate.Function == state.Function
+                        && SameNonLocalViewStorage(candidate.Storage, state.Storage);
+                });
+            if (!presentInFirst && state.MayBeBorrowed)
+                merged.nonLocalViews.push_back(state);
+        }
+
+        const bool insideLoop = std::ranges::any_of(ownFlagControlKind_,
+            [](uint8_t kind) { return (kind & OwnFlagLoopFrame) != 0; });
         std::unordered_set<const llvm::Value*> storages;
         for (const auto& [storage, path] : first.mayBeFalsePaths) storages.insert(storage);
         for (const auto& [storage, path] : second.mayBeFalsePaths) storages.insert(storage);
+        storages.insert(first.definitelyReowned.begin(), first.definitelyReowned.end());
+        storages.insert(second.definitelyReowned.begin(), second.definitelyReowned.end());
+        storages.insert(first.ownedViewSlots.begin(), first.ownedViewSlots.end());
+        storages.insert(second.ownedViewSlots.begin(), second.ownedViewSlots.end());
+        // An owning declaration agrees with a re-own outside a loop, and inside one only when
+        // the slot is declared in this iteration. An outer slot reaching the back-edge is not
+        // modeled, so its disagreement stays conservative.
+        // A slot no enclosing loop rebinds from a non-`new` value cannot carry a borrow around any
+        // back-edge, so its owned declaration agrees too; an unknown name stays conservative.
+        const auto loopMayRebindSlot = [&](const llvm::Value* slot) {
+            const std::string name = FindVariableNameByStorage(slot);
+            return name.empty() || std::ranges::any_of(ownFlagLoopReownSnapshots_,
+                [&](const OwnFlagLoopReownFrame& frame) { return frame.nonNewViewAssigns.contains(name); });
+        };
+        const auto ownedDeclAgrees = [&](const OwnFlagJoinSnapshot& arm, const llvm::Value* slot) {
+            return arm.ownedViewSlots.contains(slot)
+                && (!insideLoop || arm.iterationOwnedViewSlots.contains(slot)
+                    || !loopMayRebindSlot(slot));
+        };
         for (const auto* storage : storages)
         {
             auto firstPath = first.mayBeFalsePaths.find(storage);
             auto secondPath = second.mayBeFalsePaths.find(storage);
+            const bool firstDefinitelyReowned = first.definitelyReowned.contains(storage)
+                || ownedDeclAgrees(first, storage);
+            const bool secondDefinitelyReowned = second.definitelyReowned.contains(storage)
+                || ownedDeclAgrees(second, storage);
+            const bool ownershipDisagrees = firstDefinitelyReowned != secondDefinitelyReowned;
             const bool keepFirstMayBeFalse = keepMayBeFalse
                 && firstPath != first.mayBeFalsePaths.end()
                 && HasOwnershipControlFrameBetween(firstPath->second, OwnFlagLoopFrame);
@@ -1353,18 +1430,21 @@ LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::MergeOwnFlagJoinStates(
                 && (keepFirstMayBeFalse || !first.definitelyReowned.contains(storage));
             const bool secondMayBeFalse = secondPath != second.mayBeFalsePaths.end()
                 && (keepSecondMayBeFalse || !second.definitelyReowned.contains(storage));
-            if (!firstMayBeFalse && !secondMayBeFalse) continue;
+            if (!firstMayBeFalse && !secondMayBeFalse && !ownershipDisagrees) continue;
 
-            std::vector<uint64_t> path = firstMayBeFalse
-                ? firstPath->second : secondPath->second;
-            if (firstMayBeFalse && secondMayBeFalse)
+            std::vector<uint64_t> path;
+            if (ownershipDisagrees)
+                path = ownFlagControlPath_;
+            else if (firstMayBeFalse && secondMayBeFalse)
             {
+                path = firstPath->second;
                 size_t common = 0;
                 while (common < path.size() && common < secondPath->second.size()
                     && path[common] == secondPath->second[common])
                     ++common;
                 path.resize(common);
             }
+            else path = firstMayBeFalse ? firstPath->second : secondPath->second;
             merged.mayBeFalsePaths.emplace(storage, std::move(path));
         }
         return merged;
@@ -1393,6 +1473,12 @@ bool LLVMBackend::HasOwnershipControlFrameBetween(const std::vector<uint64_t>& o
         for (size_t i = common; i < ownFlagControlKind_.size(); ++i)
             if (ownFlagControlKind_[i] & frameKinds) return true;
         return false;
+}
+
+void LLVMBackend::NoteLoopViewAssignments(const std::unordered_set<std::string>& names)
+{
+        if (ownFlagLoopReownSnapshots_.empty()) return;
+        ownFlagLoopReownSnapshots_.back().nonNewViewAssigns = names;
 }
 
 void LLVMBackend::ReanchorOwnFlagJoinsOutOf(uint8_t targetKinds)
@@ -1455,7 +1541,8 @@ void LLVMBackend::SetVariableOwning(const std::string& varName, bool value)
     }
 
 void LLVMBackend::SetVariableOwnFlagValue(const std::string& varName, bool mayOwn,
-                                         llvm::Value* value, bool runtimeCanBeFalse)
+                                         llvm::Value* value, bool runtimeCanBeFalse,
+                                         bool updateRuntimeFlag)
 {
         if (varName.empty() || value == nullptr || !value->getType()->isIntegerTy(1)) return;
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
@@ -1482,7 +1569,7 @@ void LLVMBackend::SetVariableOwnFlagValue(const std::string& varName, bool mayOw
                 namedVar.OwnFlagMayBeFalse = false;
                 namedVar.OwnFlagMayBeFalseControlPath.clear();
             }
-            if (namedVar.OwnFlag == nullptr) return;
+            if (!updateRuntimeFlag || namedVar.OwnFlag == nullptr) return;
             if (namedVar.OwnFlagInit != nullptr)
             {
                 namedVar.OwnFlagInit->setOperand(0, builder->getInt1(false));
@@ -6177,6 +6264,7 @@ void LLVMBackend::DiscardOwnedTempsSince(const OwnedTempMark& mark)
         ptrToIntOfTemps_.clear();
         nullConditionalTempResults_.clear();
         rawArrayResults_.clear();
+        nonLocalViewOwnershipStates_.clear();
         valueElementTypeNames_.clear();
         fatInterfaceValueTypeNames_.clear();
         viewJoinTypes_.clear();
@@ -6201,6 +6289,7 @@ LLVMBackend::DetectionLedgerSnapshot LLVMBackend::SnapshotDetectionLedgers() con
         snapshot.ptrToIntOfTemps_ = ptrToIntOfTemps_;
         snapshot.nullConditionalTempResults_ = nullConditionalTempResults_;
         snapshot.rawArrayResults_ = rawArrayResults_;
+        snapshot.nonLocalViewOwnershipStates_ = nonLocalViewOwnershipStates_;
         snapshot.valueElementTypeNames_ = valueElementTypeNames_;
         snapshot.fatInterfaceValueTypeNames_ = fatInterfaceValueTypeNames_;
         snapshot.viewJoinTypes_ = viewJoinTypes_;
@@ -6225,6 +6314,7 @@ void LLVMBackend::RestoreDetectionLedgers(DetectionLedgerSnapshot snapshot)
         ptrToIntOfTemps_ = std::move(snapshot.ptrToIntOfTemps_);
         nullConditionalTempResults_ = std::move(snapshot.nullConditionalTempResults_);
         rawArrayResults_ = std::move(snapshot.rawArrayResults_);
+        nonLocalViewOwnershipStates_ = std::move(snapshot.nonLocalViewOwnershipStates_);
         valueElementTypeNames_ = std::move(snapshot.valueElementTypeNames_);
         fatInterfaceValueTypeNames_ = std::move(snapshot.fatInterfaceValueTypeNames_);
         viewJoinTypes_ = std::move(snapshot.viewJoinTypes_);

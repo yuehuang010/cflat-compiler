@@ -11,6 +11,20 @@ import "library/c_variadic_aggregate.c";
 int dtorCount = 0;
 int conditionalNewCount = 0;
 int conditionalDtorCount = 0;
+int t382ProbeDtorCount = 0;
+
+struct T382PS
+{
+    int v = 0;
+    T382PS(int value) { v = value; }
+    ~T382PS() { t382ProbeDtorCount = t382ProbeDtorCount + 1; }
+};
+
+struct T382U { unique T382PS* p = default; };
+struct T382LocalHolder { unique T382U* pu = default; };
+struct T382LocalRoot { unique T382U* b = default; };
+struct T382RawLocalRoot { T382U* b = default; };
+T382U t382GlobalU = default;
 
 struct CS
 {
@@ -6849,6 +6863,24 @@ void t377MoveViewSink(move Resource[] p) { }
 
 int t377ReadView(Resource[] p) { return p[0].id; }
 
+struct T387FieldHolder { Resource[] view = default; };
+struct T387ElemHolder { T387FieldHolder hs[2]; };
+
+class T387ImplicitHolder
+{
+    Resource[] view = default;
+    int run(int id)
+    {
+        view = new Resource[1];
+        view[0].id = id;
+        int selected = view[0].id;
+        t377MoveViewSink(move view);
+        return selected;
+    }
+};
+
+Resource[] t387GlobalOwnedView = default;
+
 int checkT377OwnedJoinMove(string label, bool c, int expectedId, int expectedDtors)
 {
     int selected = -1;
@@ -7168,6 +7200,512 @@ int testT377ViewMoveAcceptSet()
     passed += checkT377LoopArmBreak("t377_loop_break_owned_reown", true, false, true, 224, 8);
     passed += checkT377LoopArmBreak("t377_loop_break_borrowed_skip", false, false, false, 40, 3);
     passed += checkT377LoopArmBreak("t377_loop_break_owned_skip", true, false, false, 41, 5);
+    return passed;
+}
+
+int checkT387FieldOwnedSink()
+{
+    int selected = -1;
+    int passed = 0;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        T387FieldHolder h = default;
+        h.view = new Resource[1];
+        h.view[0].id = 801;
+        selected = h.view[0].id;
+        t377MoveViewSink(move h.view);
+    }
+    i64 leaks = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t387_field_owned_sink_value", selected, 801);
+    passed += Test("t387_field_owned_sink_dtors", dtorCount, 1);
+    passed += Test("t387_field_owned_sink_leaks", leaks, (i64)0);
+    return passed;
+}
+
+int checkT387GlobalOwnedSink()
+{
+    int selected = -1;
+    int passed = 0;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    t387GlobalOwnedView = new Resource[1];
+    t387GlobalOwnedView[0].id = 802;
+    selected = t387GlobalOwnedView[0].id;
+    t377MoveViewSink(move t387GlobalOwnedView);
+    i64 leaks = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t387_global_owned_sink_value", selected, 802);
+    passed += Test("t387_global_owned_sink_dtors", dtorCount, 1);
+    passed += Test("t387_global_owned_sink_leaks", leaks, (i64)0);
+    return passed;
+}
+
+int checkT387ImplicitOwnedSink()
+{
+    int passed = 0;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    int selected = -1;
+    {
+        T387ImplicitHolder h = default;
+        selected = h.run(803);
+    }
+    i64 leaks = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t387_implicit_field_owned_sink_value", selected, 803);
+    passed += Test("t387_implicit_field_owned_sink_dtors", dtorCount, 1);
+    passed += Test("t387_implicit_field_owned_sink_leaks", leaks, (i64)0);
+    return passed;
+}
+
+int checkT387IfBothOwnSink(bool arm)
+{
+    int selected = -1;
+    int passed = 0;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] w = new Resource[3];
+        Resource[] v = w;
+        if (arm)
+        {
+            v = new Resource[2];
+            v[0].id = 811;
+        }
+        else
+        {
+            v = new Resource[4];
+            v[0].id = 812;
+        }
+        selected = v[0].id;
+        t377MoveViewSink(move v);
+    }
+    i64 leaks = (i64)HeapAudit.reportLeaks() - before;
+    if (arm)
+    {
+        passed += Test("t387_if_both_own_true_value", selected, 811);
+        passed += Test("t387_if_both_own_true_dtors", dtorCount, 5);
+        passed += Test("t387_if_both_own_true_leaks", leaks, (i64)0);
+    }
+    else
+    {
+        passed += Test("t387_if_both_own_false_value", selected, 812);
+        passed += Test("t387_if_both_own_false_dtors", dtorCount, 7);
+        passed += Test("t387_if_both_own_false_leaks", leaks, (i64)0);
+    }
+    return passed;
+}
+
+int checkT387SwitchBothOwnSink(bool arm)
+{
+    int selected = -1;
+    int passed = 0;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] w = new Resource[3];
+        Resource[] v = w;
+        switch (arm ? 1 : 2)
+        {
+        case 1:
+            v = new Resource[2];
+            v[0].id = 821;
+            break;
+        default:
+            v = new Resource[4];
+            v[0].id = 822;
+            break;
+        }
+        selected = v[0].id;
+        t377MoveViewSink(move v);
+    }
+    i64 leaks = (i64)HeapAudit.reportLeaks() - before;
+    if (arm)
+    {
+        passed += Test("t387_switch_both_own_true_value", selected, 821);
+        passed += Test("t387_switch_both_own_true_dtors", dtorCount, 5);
+        passed += Test("t387_switch_both_own_true_leaks", leaks, (i64)0);
+    }
+    else
+    {
+        passed += Test("t387_switch_both_own_false_value", selected, 822);
+        passed += Test("t387_switch_both_own_false_dtors", dtorCount, 7);
+        passed += Test("t387_switch_both_own_false_leaks", leaks, (i64)0);
+    }
+    return passed;
+}
+
+int checkT387BorrowedThenOwnedSink()
+{
+    int selected = -1;
+    int passed = 0;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] w = new Resource[3];
+        Resource[] v = w;
+        v = new Resource[2];
+        v[0].id = 831;
+        selected = v[0].id;
+        t377MoveViewSink(move v);
+    }
+    i64 leaks = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t387_borrowed_then_owned_sink_value", selected, 831);
+    passed += Test("t387_borrowed_then_owned_sink_dtors", dtorCount, 5);
+    passed += Test("t387_borrowed_then_owned_sink_leaks", leaks, (i64)0);
+    return passed;
+}
+
+int testT387ViewMoveAcceptSet()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    passed += checkT387FieldOwnedSink();
+    passed += checkT387GlobalOwnedSink();
+    passed += checkT387ImplicitOwnedSink();
+    passed += checkT387IfBothOwnSink(false);
+    passed += checkT387IfBothOwnSink(true);
+    passed += checkT387SwitchBothOwnSink(false);
+    passed += checkT387SwitchBothOwnSink(true);
+    passed += checkT387BorrowedThenOwnedSink();
+    return passed;
+}
+
+int checkT387IfNewFallthrough(bool arm)
+{
+    int passed = 0;
+    int selected = -1;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] v = new Resource[1];
+        v[0].id = 841;
+        if (arm)
+        {
+            v = new Resource[2];
+            v[0].id = 842;
+        }
+        selected = v[0].id;
+        t377MoveViewSink(move v);
+    }
+    passed += Test("t387_if_new_true_value", selected, arm ? 842 : 841);
+    passed += Test("t387_if_new_true_dtors", dtorCount, arm ? 3 : 1);
+    passed += Test("t387_if_new_true_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+int checkT387IfMoveLocal(bool arm)
+{
+    int passed = 0;
+    int selected = -1;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] a = new Resource[2];
+        a[0].id = 852;
+        Resource[] v = new Resource[1];
+        v[0].id = 851;
+        if (arm) v = move a;
+        selected = v[0].id;
+        t377MoveViewSink(move v);
+    }
+    passed += Test("t387_if_move_true_value", selected, arm ? 852 : 851);
+    passed += Test("t387_if_move_true_dtors", dtorCount, 3);
+    passed += Test("t387_if_move_true_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+int checkT387IfOwnedCall(bool arm)
+{
+    int passed = 0;
+    int selected = -1;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] v = new Resource[1];
+        v[0].id = 861;
+        if (arm) v = t362ReturnMovedView(true);
+        selected = v[0].id;
+        t377MoveViewSink(move v);
+    }
+    passed += Test("t387_if_call_true_value", selected, arm ? 2 : 861);
+    passed += Test("t387_if_call_true_dtors", dtorCount, arm ? 6 : 1);
+    passed += Test("t387_if_call_true_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+int checkT387FieldMoveField()
+{
+    int passed = 0;
+    int selected = -1;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        T387FieldHolder h = default;
+        h.view = new Resource[1];
+        h.view[0].id = 871;
+        T387FieldHolder k = default;
+        k.view = move h.view;
+        selected = k.view[0].id;
+        t377MoveViewSink(move k.view);
+    }
+    passed += Test("t387_field_move_field_value", selected, 871);
+    passed += Test("t387_field_move_field_dtors", dtorCount, 1);
+    passed += Test("t387_field_move_field_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+int checkT387FieldMoveGlobal()
+{
+    int passed = 0;
+    int selected = -1;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        t387GlobalOwnedView = new Resource[1];
+        t387GlobalOwnedView[0].id = 881;
+        T387FieldHolder h = default;
+        h.view = move t387GlobalOwnedView;
+        selected = h.view[0].id;
+        t377MoveViewSink(move h.view);
+    }
+    passed += Test("t387_field_move_global_value", selected, 881);
+    passed += Test("t387_field_move_global_dtors", dtorCount, 1);
+    passed += Test("t387_field_move_global_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+int checkT387FieldFromOwningLocal()
+{
+    int passed = 0;
+    int selected = -1;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        Resource[] w = new Resource[1];
+        w[0].id = 891;
+        T387FieldHolder h = default;
+        h.view = w;
+        selected = h.view[0].id;
+        t377MoveViewSink(move h.view);
+    }
+    passed += Test("t387_field_from_local_value", selected, 891);
+    passed += Test("t387_field_from_local_dtors", dtorCount, 1);
+    passed += Test("t387_field_from_local_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+int checkT387FieldSelfAssign()
+{
+    int passed = 0;
+    int selected = -1;
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        T387FieldHolder h = default;
+        h.view = new Resource[1];
+        h.view[0].id = 901;
+        h.view = h.view;
+        selected = h.view[0].id;
+        t377MoveViewSink(move h.view);
+    }
+    passed += Test("t387_field_self_assign_value", selected, 901);
+    passed += Test("t387_field_self_assign_dtors", dtorCount, 1);
+    passed += Test("t387_field_self_assign_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+// A declaration inside a loop body is re-owned per iteration: the if-merge agrees with it.
+int checkT387LoopInnerDecl(bool arm)
+{
+    int passed = 0;
+    int total = 0;
+    for (int i = 0; i < 2; i++)
+    {
+        Resource[] v = new Resource[1];
+        if (arm) v = new Resource[2];
+        v[0].id = 7;
+        total += v[0].id;
+        t377MoveViewSink(move v);
+    }
+    passed += Test("t387_loop_inner_decl_value", total, 14);
+    return passed;
+}
+
+// A loop nest: the outer declaration is only re-owned by the inner loop, so no back-edge carries a borrow.
+int checkT387NestedLoopOuterDecl(bool arm)
+{
+    int passed = 0;
+    int total = 0;
+    for (int i = 0; i < 2; i++)
+    {
+        Resource[] v = new Resource[1];
+        for (int j = 0; j < 1; j++)
+        {
+            if (arm) v = new Resource[2];
+            v[0].id = 7;
+            total += v[0].id;
+        }
+        t377MoveViewSink(move v);
+    }
+    passed += Test("t387_nested_loop_outer_decl_value", total, 14);
+    return passed;
+}
+
+// A same-named local in an inner scope must not inherit the outer element's borrow state.
+int checkT387ScopeShadowKey(bool arm)
+{
+    int passed = 0;
+    int selected = -1;
+    dtorCount = 0;
+    {
+        Resource[] w = new Resource[2];
+        T387ElemHolder a = default;
+        a.hs[0].view = arm ? new Resource[1] : w;
+        {
+            T387ElemHolder a = default;
+            a.hs[0].view = new Resource[1];
+            a.hs[0].view[0].id = 911;
+            selected = a.hs[0].view[0].id;
+            t377MoveViewSink(move a.hs[0].view);
+        }
+    }
+    passed += Test("t387_scope_shadow_key_value", selected, 911);
+    passed += Test("t387_scope_shadow_key_dtors", dtorCount, 3);
+    return passed;
+}
+
+int testT387ReviewAcceptSet()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    passed += checkT387IfNewFallthrough(false);
+    passed += checkT387IfNewFallthrough(true);
+    passed += checkT387IfMoveLocal(false);
+    passed += checkT387IfMoveLocal(true);
+    passed += checkT387IfOwnedCall(false);
+    passed += checkT387IfOwnedCall(true);
+    passed += checkT387FieldMoveField();
+    passed += checkT387FieldMoveGlobal();
+    passed += checkT387FieldFromOwningLocal();
+    passed += checkT387FieldSelfAssign();
+    passed += checkT387LoopInnerDecl(false);
+    passed += checkT387LoopInnerDecl(true);
+    passed += checkT387ScopeShadowKey(false);
+    passed += checkT387ScopeShadowKey(true);
+    passed += checkT387NestedLoopOuterDecl(false);
+    passed += checkT387NestedLoopOuterDecl(true);
+    return passed;
+}
+
+bool t393ReownNewOnly()
+{
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    int total = 0;
+    {
+        Resource[] u = new Resource[1];
+        u[0].id = 11;
+        for (int i = 0; i < 2; i++)
+        {
+            total += u[0].id;
+            t377MoveViewSink(move u);
+            u = new Resource[1];
+            u[0].id = 12 + i;
+        }
+    }
+    return total == 23 && dtorCount == 3
+        && (i64)HeapAudit.reportLeaks() - before == 0;
+}
+
+bool t393AllOwnedIfMerge(bool c)
+{
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    int total = 0;
+    {
+        Resource[] u = new Resource[1];
+        u[0].id = 21;
+        for (int i = 0; i < 2; i++)
+        {
+            total += u[0].id;
+            t377MoveViewSink(move u);
+            if (c) u = new Resource[2];
+            else u = new Resource[1];
+            u[0].id = 22 + i;
+        }
+    }
+    int expectedDtors = c ? 5 : 3;
+    return total == 43 && dtorCount == expectedDtors
+        && (i64)HeapAudit.reportLeaks() - before == 0;
+}
+
+bool t393BreakAfterJoin(bool c)
+{
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    int total = 0;
+    {
+        Resource[] w = new Resource[3];
+        Resource[] u = new Resource[1];
+        u[0].id = 31;
+        for (int i = 0; i < 2; i++)
+        {
+            total += u[0].id;
+            t377MoveViewSink(move u);
+            u = c ? new Resource[2] : w;
+            break;
+        }
+    }
+    int expectedDtors = c ? 6 : 4;
+    return total == 31 && dtorCount == expectedDtors
+        && (i64)HeapAudit.reportLeaks() - before == 0;
+}
+
+bool t393DifferentOuterView(bool c)
+{
+    dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    int total = 0;
+    {
+        Resource[] w = new Resource[3];
+        Resource[] u = new Resource[1];
+        Resource[] v = default;
+        u[0].id = 41;
+        for (int i = 0; i < 2; i++)
+        {
+            total += u[0].id;
+            t377MoveViewSink(move u);
+            u = new Resource[1];
+            u[0].id = 42 + i;
+            if (i == 0) v = c ? new Resource[2] : w;
+        }
+    }
+    int expectedDtors = c ? 8 : 6;
+    return total == 83 && dtorCount == expectedDtors
+        && (i64)HeapAudit.reportLeaks() - before == 0;
+}
+
+int testT393LoopSinkAcceptSet()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    passed += Test("t393_loop_reown_new_only", t393ReownNewOnly(), true);
+    bool allOwnedFalse = t393AllOwnedIfMerge(false);
+    bool allOwnedTrue = t393AllOwnedIfMerge(true);
+    passed += Test("t393_loop_all_owned_if_merge", allOwnedFalse && allOwnedTrue, true);
+    bool breakBorrowed = t393BreakAfterJoin(false);
+    bool breakOwned = t393BreakAfterJoin(true);
+    passed += Test("t393_loop_break_after_join", breakBorrowed && breakOwned, true);
+    bool otherBorrowed = t393DifferentOuterView(false);
+    bool otherOwned = t393DifferentOuterView(true);
+    passed += Test("t393_loop_different_outer_view", otherBorrowed && otherOwned, true);
     return passed;
 }
 
@@ -15320,6 +15858,10 @@ extern int main()
     total += 8;
     passed += testT376ChainedUniqueField();
     total += 12;
+    passed += testT388AcceptSet();
+    total += 12;
+    passed += testT388ArrayFieldConsume();
+    total += 16;
     passed += testArrowOwnedTempMember();
     total += 34;
     passed += testT256AliasCallField();
@@ -15376,6 +15918,10 @@ extern int main()
 
     passed += testT364NativeOperatorReturnFacts();
     total += 15;
+    total += 16;
+    total += 16;
+    total += 8;
+    total += 4;
 
     passed += testT362OwningViewTernaryMixedArm();
     total += 8;
@@ -15383,6 +15929,15 @@ extern int main()
     passed += testT377ViewMoveAcceptSet();
     passed += testT377DoWhileExitIntersection();
     total += 35;
+
+    passed += testT387ViewMoveAcceptSet();
+    total += 24;
+
+    passed += testT387ReviewAcceptSet();
+    total += 38;
+
+    passed += testT393LoopSinkAcceptSet();
+    total += 4;
 
     passed += testT362MovedViewReturns();
     total += 8;
@@ -17104,6 +17659,8 @@ struct T376PS
 struct T376Inner { unique T376PS* p = nullptr; };
 struct T376Nested { T376Inner a = default; };
 struct T376Outer { unique T376PS* q = nullptr; };
+struct T388ArrayField { unique T376PS*[2] q; };
+struct T388NestedArrayField { T388ArrayField a = default; };
 struct T376Implicit
 {
     unique T376PS* p = nullptr;
@@ -17296,6 +17853,175 @@ int testT376ChainedUniqueField()
     after = (i64)HeapAudit.reportLeaks() - before;
     passed += Test("t376_field_to_field_two_statement_value_dtor_heap",
         value == 106 && sourceNull && t376ChainDtors == 1 && live == 1 && after == 0, true);
+    return passed;
+}
+
+int testT388AcceptSet()
+{
+    int passed = 0;
+    int value = 0;
+    bool sourceNull = false;
+    int dtorsAtSourceEnd = 0;
+    i64 before = 0;
+    i64 live = 0;
+    i64 after = 0;
+    HeapAudit.enable();
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T388ArrayField a = default;
+        unique T376PS* o = nullptr;
+        int i = 0;
+        a.q[i] = new T376PS(201);
+        o = a.q[i];
+        value = o->v;
+        sourceNull = a.q[i] == nullptr;
+    }
+    dtorsAtSourceEnd = t376ChainDtors;
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t388_accept_dynamic_value", value, 201);
+    passed += Test("t388_accept_dynamic_source_kept", sourceNull, false);
+    passed += Test("t388_accept_dynamic_one_dtor", dtorsAtSourceEnd, 1);
+    passed += Test("t388_accept_dynamic_heap_clean", after, (i64)0);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    int valueAfterSource = 0;
+    {
+        unique T376PS* o = nullptr;
+        {
+            T388ArrayField a = default;
+            a.q[0] = new T376PS(202);
+            o = move a.q[0];
+            sourceNull = a.q[0] == nullptr;
+        }
+        dtorsAtSourceEnd = t376ChainDtors;
+        valueAfterSource = o->v;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t388_accept_explicit_move_value", valueAfterSource, 202);
+    passed += Test("t388_accept_explicit_move_source_null", sourceNull, true);
+    passed += Test("t388_accept_explicit_move_dtor_order",
+        dtorsAtSourceEnd == 0 && t376ChainDtors == 1, true);
+    passed += Test("t388_accept_explicit_move_heap", live == 1 && after == 0, true);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T388ArrayField a = default;
+        unique T376PS* o = a.q[0] = new T376PS(203);
+        value = o->v;
+        sourceNull = a.q[0] == nullptr;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t388_accept_decl_chain_value", value, 203);
+    passed += Test("t388_accept_decl_chain_source_null", sourceNull, true);
+    passed += Test("t388_accept_decl_chain_one_dtor", t376ChainDtors, 1);
+    passed += Test("t388_accept_decl_chain_heap", live == 1 && after == 0, true);
+    return passed;
+}
+
+int testT388ArrayFieldConsume()
+{
+    int passed = 0;
+    int valueAfterSource = -1;
+    bool sourceNull = false;
+    int dtorsAtSourceEnd = 0;
+    i64 before = 0;
+    i64 liveAtSourceEnd = 0;
+    i64 after = 0;
+    HeapAudit.enable();
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        unique T376PS* o = nullptr;
+        {
+            T388ArrayField a = default;
+            a.q[0] = new T376PS(301);
+            o = a.q[0];
+            sourceNull = a.q[0] == nullptr;
+        }
+        dtorsAtSourceEnd = t376ChainDtors;
+        liveAtSourceEnd = (i64)HeapAudit.reportLeaks() - before;
+        if (sourceNull && o != nullptr) valueAfterSource = o->v;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t388_q0_value_after_source", valueAfterSource, 301);
+    passed += Test("t388_q0_source_null", sourceNull, true);
+    passed += Test("t388_q0_dtor_order",
+        dtorsAtSourceEnd == 0 && t376ChainDtors == 1, true);
+    passed += Test("t388_q0_heap", liveAtSourceEnd == 1 && after == 0, true);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    valueAfterSource = -1;
+    {
+        unique T376PS* o = nullptr;
+        {
+            T388ArrayField a = default;
+            a.q[1] = new T376PS(302);
+            o = a.q[1];
+            sourceNull = a.q[1] == nullptr;
+        }
+        dtorsAtSourceEnd = t376ChainDtors;
+        liveAtSourceEnd = (i64)HeapAudit.reportLeaks() - before;
+        if (sourceNull && o != nullptr) valueAfterSource = o->v;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t388_q1_value_after_source", valueAfterSource, 302);
+    passed += Test("t388_q1_source_null", sourceNull, true);
+    passed += Test("t388_q1_dtor_order",
+        dtorsAtSourceEnd == 0 && t376ChainDtors == 1, true);
+    passed += Test("t388_q1_heap", liveAtSourceEnd == 1 && after == 0, true);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    valueAfterSource = -1;
+    {
+        unique T376PS* o = nullptr;
+        {
+            T388NestedArrayField b = default;
+            b.a.q[0] = new T376PS(303);
+            o = b.a.q[0];
+            sourceNull = b.a.q[0] == nullptr;
+        }
+        dtorsAtSourceEnd = t376ChainDtors;
+        liveAtSourceEnd = (i64)HeapAudit.reportLeaks() - before;
+        if (sourceNull && o != nullptr) valueAfterSource = o->v;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t388_nested_value_after_source", valueAfterSource, 303);
+    passed += Test("t388_nested_source_null", sourceNull, true);
+    passed += Test("t388_nested_dtor_order",
+        dtorsAtSourceEnd == 0 && t376ChainDtors == 1, true);
+    passed += Test("t388_nested_heap", liveAtSourceEnd == 1 && after == 0, true);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    valueAfterSource = -1;
+    {
+        unique T376PS* o = nullptr;
+        {
+            T388ArrayField a = default;
+            T388ArrayField* pa = &a;
+            pa->q[0] = new T376PS(304);
+            o = pa->q[0];
+            sourceNull = pa->q[0] == nullptr;
+        }
+        dtorsAtSourceEnd = t376ChainDtors;
+        liveAtSourceEnd = (i64)HeapAudit.reportLeaks() - before;
+        if (sourceNull && o != nullptr) valueAfterSource = o->v;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t388_pointer_value_after_source", valueAfterSource, 304);
+    passed += Test("t388_pointer_source_null", sourceNull, true);
+    passed += Test("t388_pointer_dtor_order",
+        dtorsAtSourceEnd == 0 && t376ChainDtors == 1, true);
+    passed += Test("t388_pointer_heap", liveAtSourceEnd == 1 && after == 0, true);
     return passed;
 }
 
@@ -18687,6 +19413,252 @@ int testT364NativeOperatorReturnFacts()
     after = (i64)HeapAudit.reportLeaks() - before;
     passed += Test("t364_free_fresh_operator_discard_and_cleanup",
                    live == 2 && after == 0, true);
+
+    HeapAudit.enable();
+    i64 t382Base = (i64)HeapAudit.reportLeaks();
+    int t382DtorBase = t382ProbeDtorCount;
+    int t382Value = 0;
+    i64 t382Live = 0;
+    {
+        T382U local = default;
+        local.p = new T382PS(32);
+        T382U* localPtr = &local;
+        {
+            unique T382PS* owner = nullptr;
+            owner = localPtr->p;
+            t382Value = (owner == nullptr ? -1 : owner->v) * 10
+                + (localPtr->p == nullptr ? 1 : 0);
+            t382Live = (i64)HeapAudit.reportLeaks() - t382Base;
+        }
+    }
+    passed += Test("t382_frame_pointer_field_value", t382Value, 321);
+    passed += Test("t382_frame_pointer_field_live_heap", t382Live, 1);
+    passed += Test("t382_frame_pointer_field_dtor_count",
+                   t382ProbeDtorCount - t382DtorBase, 1);
+    passed += Test("t382_frame_pointer_field_no_leak",
+                   (i64)HeapAudit.reportLeaks() - t382Base, 0);
+
+    t382Base = (i64)HeapAudit.reportLeaks();
+    t382DtorBase = t382ProbeDtorCount;
+    t382Value = 0;
+    t382Live = 0;
+    {
+        static T382U source = default;
+        source.p = new T382PS(33);
+        {
+            unique T382PS* owner = move source.p;
+            t382Value = (owner == nullptr ? -1 : owner->v) * 10
+                + (source.p == nullptr ? 1 : 0);
+            t382Live = (i64)HeapAudit.reportLeaks() - t382Base;
+        }
+    }
+    passed += Test("t382_move_static_field_value", t382Value, 331);
+    passed += Test("t382_move_static_field_live_heap", t382Live, 1);
+    passed += Test("t382_move_static_field_dtor_count",
+                   t382ProbeDtorCount - t382DtorBase, 1);
+    passed += Test("t382_move_static_field_no_leak",
+                   (i64)HeapAudit.reportLeaks() - t382Base, 0);
+
+    t382Base = (i64)HeapAudit.reportLeaks();
+    t382DtorBase = t382ProbeDtorCount;
+    t382Value = 0;
+    t382Live = 0;
+    t382GlobalU.p = new T382PS(34);
+    {
+        unique T382PS* owner = move t382GlobalU.p;
+        t382Value = (owner == nullptr ? -1 : owner->v) * 10
+            + (t382GlobalU.p == nullptr ? 1 : 0);
+        t382Live = (i64)HeapAudit.reportLeaks() - t382Base;
+    }
+    passed += Test("t382_move_global_field_value", t382Value, 341);
+    passed += Test("t382_move_global_field_live_heap", t382Live, 1);
+    passed += Test("t382_move_global_field_dtor_count",
+                   t382ProbeDtorCount - t382DtorBase, 1);
+    passed += Test("t382_move_global_field_no_leak",
+                   (i64)HeapAudit.reportLeaks() - t382Base, 0);
+
+    t382Base = (i64)HeapAudit.reportLeaks();
+    t382DtorBase = t382ProbeDtorCount;
+    t382Value = 0;
+    t382Live = 0;
+    t382GlobalU.p = new T382PS(35);
+    T382U* t382GlobalPtr = &t382GlobalU;
+    {
+        unique T382PS* owner = move t382GlobalPtr->p;
+        t382Value = (owner == nullptr ? -1 : owner->v) * 10
+            + (t382GlobalU.p == nullptr ? 1 : 0);
+        t382Live = (i64)HeapAudit.reportLeaks() - t382Base;
+    }
+    passed += Test("t382_move_global_pointer_field_value", t382Value, 351);
+    passed += Test("t382_move_global_pointer_field_live_heap", t382Live, 1);
+    passed += Test("t382_move_global_pointer_field_dtor_count",
+                   t382ProbeDtorCount - t382DtorBase, 1);
+    passed += Test("t382_move_global_pointer_field_no_leak",
+                   (i64)HeapAudit.reportLeaks() - t382Base, 0);
+
+    t382Base = (i64)HeapAudit.reportLeaks();
+    t382DtorBase = t382ProbeDtorCount;
+    t382Value = 0;
+    t382Live = 0;
+    {
+        T382U left = default;
+        T382U right = default;
+        left.p = new T382PS(36);
+        int condition = 1;
+        T382U* selected = condition == 1 ? &left : &right;
+        {
+            unique T382PS* owner = nullptr;
+            owner = selected->p;
+            t382Value = (owner == nullptr ? -1 : owner->v) * 10
+                + (selected->p == nullptr ? 1 : 0);
+            t382Live = (i64)HeapAudit.reportLeaks() - t382Base;
+        }
+    }
+    passed += Test("t382_local_pointer_join_value", t382Value, 361);
+    passed += Test("t382_local_pointer_join_live_heap", t382Live, 1);
+    passed += Test("t382_local_pointer_join_dtor_count",
+                   t382ProbeDtorCount - t382DtorBase, 1);
+    passed += Test("t382_local_pointer_join_no_leak",
+                   (i64)HeapAudit.reportLeaks() - t382Base, 0);
+
+    t382Base = (i64)HeapAudit.reportLeaks();
+    t382DtorBase = t382ProbeDtorCount;
+    t382Value = 0;
+    t382Live = 0;
+    {
+        T382U local = default;
+        local.p = new T382PS(37);
+        T382U* pointer = &local;
+        {
+            unique T382PS* owner = nullptr;
+            owner = (*pointer).p;
+            t382Value = (owner == nullptr ? -1 : owner->v) * 10
+                + ((*pointer).p == nullptr ? 1 : 0);
+            t382Live = (i64)HeapAudit.reportLeaks() - t382Base;
+        }
+    }
+    passed += Test("t382_local_deref_field_value", t382Value, 371);
+    passed += Test("t382_local_deref_field_live_heap", t382Live, 1);
+    passed += Test("t382_local_deref_field_dtor_count",
+                   t382ProbeDtorCount - t382DtorBase, 1);
+    passed += Test("t382_local_deref_field_no_leak",
+                   (i64)HeapAudit.reportLeaks() - t382Base, 0);
+
+    t382Base = (i64)HeapAudit.reportLeaks();
+    t382DtorBase = t382ProbeDtorCount;
+    t382Value = 0;
+    t382Live = 0;
+    {
+        T382U* pu = new T382U();
+        pu->p = new T382PS(38);
+        {
+            unique T382PS* owner = nullptr;
+            owner = pu->p;
+            t382Value = (owner == nullptr ? -1 : owner->v) * 10
+                + (pu->p == nullptr ? 1 : 0);
+            t382Live = (i64)HeapAudit.reportLeaks() - t382Base;
+        }
+        delete pu;
+    }
+    passed += Test("t382_heap_new_pointer_field_value", t382Value, 381);
+    passed += Test("t382_heap_new_pointer_field_live_heap", t382Live, 2);
+    passed += Test("t382_heap_new_pointer_field_dtor_count",
+                   t382ProbeDtorCount - t382DtorBase, 1);
+    passed += Test("t382_heap_new_pointer_field_no_leak",
+                   (i64)HeapAudit.reportLeaks() - t382Base, 0);
+
+    t382Base = (i64)HeapAudit.reportLeaks();
+    t382DtorBase = t382ProbeDtorCount;
+    t382Value = 0;
+    t382Live = 0;
+    {
+        unique T382U* pu = new T382U();
+        pu->p = new T382PS(39);
+        {
+            unique T382PS* owner = nullptr;
+            owner = pu->p;
+            t382Value = (owner == nullptr ? -1 : owner->v) * 10
+                + (pu->p == nullptr ? 1 : 0);
+            t382Live = (i64)HeapAudit.reportLeaks() - t382Base;
+        }
+    }
+    passed += Test("t382_unique_heap_pointer_field_value", t382Value, 391);
+    passed += Test("t382_unique_heap_pointer_field_live_heap", t382Live, 2);
+    passed += Test("t382_unique_heap_pointer_field_dtor_count",
+                   t382ProbeDtorCount - t382DtorBase, 1);
+    passed += Test("t382_unique_heap_pointer_field_no_leak",
+                   (i64)HeapAudit.reportLeaks() - t382Base, 0);
+
+    t382Base = (i64)HeapAudit.reportLeaks();
+    t382DtorBase = t382ProbeDtorCount;
+    t382Value = 0;
+    t382Live = 0;
+    {
+        T382LocalHolder local = default;
+        local.pu = new T382U();
+        local.pu->p = new T382PS(40);
+        {
+            unique T382PS* owner = nullptr;
+            owner = local.pu->p;
+            t382Value = (owner == nullptr ? -1 : owner->v) * 10
+                + (local.pu->p == nullptr ? 1 : 0);
+            t382Live = (i64)HeapAudit.reportLeaks() - t382Base;
+        }
+    }
+    passed += Test("t382_local_unique_field_chain_value", t382Value, 401);
+    passed += Test("t382_local_unique_field_chain_live_heap", t382Live, 2);
+    passed += Test("t382_local_unique_field_chain_dtor_count",
+                   t382ProbeDtorCount - t382DtorBase, 1);
+    passed += Test("t382_local_unique_field_chain_no_leak",
+                   (i64)HeapAudit.reportLeaks() - t382Base, 0);
+
+    t382Base = (i64)HeapAudit.reportLeaks();
+    t382DtorBase = t382ProbeDtorCount;
+    t382Value = 0;
+    t382Live = 0;
+    {
+        unique T382LocalRoot* root = new T382LocalRoot();
+        root->b = new T382U();
+        root->b->p = new T382PS(41);
+        {
+            unique T382PS* owner = nullptr;
+            owner = root->b->p;
+            t382Value = (owner == nullptr ? -1 : owner->v) * 10
+                + (root->b->p == nullptr ? 1 : 0);
+            t382Live = (i64)HeapAudit.reportLeaks() - t382Base;
+        }
+    }
+    passed += Test("t382_owned_twohop_unique_field_chain_value", t382Value, 411);
+    passed += Test("t382_owned_twohop_unique_field_chain_live_heap", t382Live, 3);
+    passed += Test("t382_owned_twohop_unique_field_chain_dtor_count",
+                   t382ProbeDtorCount - t382DtorBase, 1);
+    passed += Test("t382_owned_twohop_unique_field_chain_no_leak",
+                   (i64)HeapAudit.reportLeaks() - t382Base, 0);
+
+    t382Base = (i64)HeapAudit.reportLeaks();
+    t382DtorBase = t382ProbeDtorCount;
+    t382Value = 0;
+    t382Live = 0;
+    {
+        T382U local = default;
+        local.p = new T382PS(42);
+        T382RawLocalRoot root = default;
+        root.b = &local;
+        T382RawLocalRoot* pointer = &root;
+        {
+            unique T382PS* owner = nullptr;
+            owner = pointer->b->p;
+            t382Value = (owner == nullptr ? -1 : owner->v) * 10
+                + (pointer->b->p == nullptr ? 1 : 0);
+            t382Live = (i64)HeapAudit.reportLeaks() - t382Base;
+        }
+    }
+    passed += Test("t382_local_raw_twohop_field_value", t382Value, 421);
+    passed += Test("t382_local_raw_twohop_field_live_heap", t382Live, 1);
+    passed += Test("t382_local_raw_twohop_field_dtor_count",
+                   t382ProbeDtorCount - t382DtorBase, 1);
+    passed += Test("t382_local_raw_twohop_field_no_leak",
+                   (i64)HeapAudit.reportLeaks() - t382Base, 0);
 
     return passed;
 }

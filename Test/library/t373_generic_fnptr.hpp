@@ -9,6 +9,7 @@ inline int freeSecond(double (*f)(double, int)) { return 99; }
 inline int freeSecond(int (*f)(int)) { return f(1) + 10; }
 inline int freeNone(int (*f)(int, int)) { return 1; }
 inline int freeNone(double (*f)(double, double)) { return 2; }
+inline void* freeVoid(void* p) { return p; }
 inline int prevAmb(long a, int (*f)(int)) { return f(1) + 10; }
 inline int prevAmb(long a, long (*f)(long)) { return (int)f(1) + 20; }
 inline int defAmb(int (*f)(int), int k = 0) { return f(1) + 10 + k; }

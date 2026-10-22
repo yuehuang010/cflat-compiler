@@ -7961,6 +7961,7 @@ namespace cflat_cinterop
             llvm::TimeTraceScope lateScope("CxxDemandLateBodies");
             std::string failedBody;
             std::string bodyDiagnostic;
+            std::string vtableDiagnostic;
             std::vector<const FunctionDecl*> roots;
             for (const std::string& name : want)
             {
@@ -7970,7 +7971,13 @@ namespace cflat_cinterop
                     roots.push_back(llvm::dyn_cast<FunctionDecl>(
                         GlobalDecl::getFromOpaquePtr(it->second).getDecl()));
             }
-            plan.materializeReachable(std::move(roots), failedBody, bodyDiagnostic);
+            plan.materializeReachable(std::move(roots), failedBody, bodyDiagnostic,
+                                      vtableDiagnostic);
+            if (!vtableDiagnostic.empty())
+            {
+                err = "clang: " + vtableDiagnostic;
+                return false;
+            }
             if (!failedBody.empty())
             {
                 err = "clang: failed to compile inline body '" + failedBody

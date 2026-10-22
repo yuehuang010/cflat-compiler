@@ -1695,6 +1695,9 @@ public:
         llvm::Type* BaseType = nullptr;  // The type of the value, even if it is a pointer.
         llvm::Value* Primary = nullptr;  // The value or result
         llvm::Value* Storage = nullptr;  // The container holding the value, used to load or store.
+        llvm::Value* MoveSourceStorage = nullptr; // Original slot for a detached moved value.
+        // Element-field key of that slot when it has no storage (`move a.hs[0].f`).
+        std::string MoveSourcePathKey;
         // The declaration's top-level const, retained for C++ reference overload selection.
         bool IsTopLevelConst = false;
         // A const integer local with a constant initializer: folds like a file-scope const.
@@ -1880,6 +1883,9 @@ public:
         std::vector<std::string> BondedSources; // names of bond parameters this value borrows from
         bool ContainsBondedClosure = false; // a field stores a closure borrowing the holder's frame
         bool FieldPathThroughPointer = false; // a field path crossed a pointer or heap object
+        bool FieldPathHasPointerDereference = false;
+        bool FieldPathPointerFrameLocal = false; // positive proof that the crossed pointer targets this frame
+        bool FieldPathFromForwardedArrow = false;
         bool CxxLvalueReceiver = false; // operator receiver handed over as the caller's own object
         // The block that established the bond. A rebind in a nested block is conditional at the
         // later source use and must not retire the bond for the whole function.
@@ -2483,6 +2489,16 @@ public:
         bool IsArrayView = false;
     };
     std::vector<RawArrayResult> rawArrayResults_;
+
+    struct NonLocalViewOwnershipState
+    {
+        llvm::Value* Storage = nullptr;
+        llvm::Function* Function = nullptr;
+        bool MayBeBorrowed = false;
+        // Element-field name ("root|hs[0].f" or "root|*.f"): matches a sink with no storage.
+        std::string PathKey;
+    };
+    std::vector<NonLocalViewOwnershipState> nonLocalViewOwnershipStates_;
 
     // Per-(callee, parameter) result of ParameterRetainsArgument. Cached only for callees whose
     // body is complete. Keyed on a raw llvm::Function*, so an entry MUST be dropped before that
@@ -3486,6 +3502,16 @@ private:
     // owning local, bound to the sink. Called by the direct and the indirect call sites.
     void DiagnoseBorrowedMoveSinkArg(const std::string& functionName,
                                      const std::string& paramName, const NamedVariable& arg);
+    void TrackNonLocalViewAssignment(llvm::Value* storage, llvm::Value* value,
+                                     const llvm::Value* sourceStorage,
+                                     bool sourceTransfersOwnership,
+                                     const std::string& pathKey = {},
+                                     bool sourceKnownBorrowed = false);
+    std::optional<bool> NonLocalViewMayBeBorrowed(const llvm::Value* storage,
+                                                  const std::string& pathKey = {}) const;
+    std::string NonLocalElementPathKey(const NamedVariable& nv) const;
+    bool SameNonLocalViewStorage(const llvm::Value* left,
+                                 const llvm::Value* right) const;
     bool BindingKeepsOwnershipOfBoxedObject(const NamedVariable* namedVar) const;
     bool JoinArmsStillKeepOwner(const NamedVariable& namedVar, int depth = 0) const;
     // "'Box' is a generic type; type arguments are required ..." for bare `Box` and `Box<>`.
@@ -4167,6 +4193,10 @@ public:
     static constexpr uint8_t OwnFlagLoopFrame = 1;
     static constexpr uint8_t OwnFlagSwitchFrame = 2;
     static constexpr uint8_t OwnFlagDoWhileFrame = 4;
+    static constexpr uint8_t OwnFlagLoopIncrementFrame = 8;
+    // Records the innermost loop's view-rebind names on its frame (see FindLoopViewRebindTargets).
+    void NoteLoopViewAssignments(const std::unordered_set<std::string>& names);
+    void CheckOwnFlagLoopBackEdge();
 private:
     std::string cppStandard_ = "c++20";
     // --error-on-cpp-reparse: at most 1 clang parse (or cache load in its place) per translation unit.
@@ -4191,10 +4221,25 @@ private:
     std::unordered_set<const llvm::Value*> ownFlagDefinitelyReowned_;
     struct OwnFlagLoopReownFrame
     {
+        struct MoveSinkView
+        {
+            const llvm::Value* Storage = nullptr;
+            std::string PathKey;
+            std::string Diagnostic;
+            std::string File;
+            size_t Line = 0;
+            size_t Column = 0;
+        };
         std::unordered_set<const llvm::Value*> entrySnapshot;
         std::unordered_set<const llvm::Value*> exitIntersection;
         bool isDoWhile = false;
+        bool hasIncrement = false;
         bool hasExitState = false;
+        // Scope-stack depth at loop entry: a view slot in a deeper frame is declared per iteration.
+        size_t scopeDepth = 0;
+        // Names the loop body rebinds by anything other than a bare `new` (may carry a borrow).
+        std::unordered_set<std::string> nonNewViewAssigns;
+        std::vector<MoveSinkView> moveSinkViews;
     };
     std::vector<OwnFlagLoopReownFrame> ownFlagLoopReownSnapshots_;
 
@@ -4988,7 +5033,7 @@ private:
     void SetVariableRawNewArray(const std::string& varName, bool value,
                                 llvm::Value* rawArrayLength = nullptr);
     void SetVariableOwnFlagValue(const std::string& varName, bool mayOwn, llvm::Value* value,
-                                 bool runtimeCanBeFalse);
+                                 bool runtimeCanBeFalse, bool updateRuntimeFlag = true);
     bool IsOutsideOwnFlagControlPath(const NamedVariable& namedVar) const;
     // A jump or case label leaves the innermost frame of targetKinds: joins recorded inside it move to
     // its parent path, so only a store after that construct can clear them.
@@ -5990,6 +6035,7 @@ private:
         decltype(ptrToIntOfTemps_) ptrToIntOfTemps_;
         decltype(nullConditionalTempResults_) nullConditionalTempResults_;
         decltype(rawArrayResults_) rawArrayResults_;
+        decltype(nonLocalViewOwnershipStates_) nonLocalViewOwnershipStates_;
         decltype(valueElementTypeNames_) valueElementTypeNames_;
         decltype(fatInterfaceValueTypeNames_) fatInterfaceValueTypeNames_;
         decltype(viewJoinTypes_) viewJoinTypes_;
@@ -11962,6 +12008,11 @@ public:
     {
         std::unordered_map<const llvm::Value*, std::vector<uint64_t>> mayBeFalsePaths;
         std::unordered_set<const llvm::Value*> definitelyReowned;
+        // Array-view slots owned on this arm without a re-own event (e.g. an owning declaration).
+        std::unordered_set<const llvm::Value*> ownedViewSlots;
+        // Subset of ownedViewSlots declared inside the innermost loop's current iteration.
+        std::unordered_set<const llvm::Value*> iterationOwnedViewSlots;
+        std::vector<NonLocalViewOwnershipState> nonLocalViews;
     };
 
     // Snapshots the IsMoved flag and per-field moved set for all variables in all active scopes.
@@ -12993,11 +13044,10 @@ public:
      * is ENCODED (a signature baseline is keyed on this version, so entries and the baseline they
      * index into can never disagree about the encoding). The numbered history above
      * TryLoadCFileSigCache says what each bump was for. It is the ONLY
-     * guard on entry compatibility for the type-request cache by default: entries are checked
-     * against the compiler build stamp only under CacheBuildStampEnabled(), so otherwise they
-     * survive a cflat rebuild (CI rebuilds every run, and re-harvesting a cold cache is what put
-     * test_cpp_interop_template over test.bat's timeout). The PCH key still folds the build
-     * stamp, since a PCH belongs to the clang that wrote it.
+     * guard on entry compatibility for the type-request cache when stamping is opted out.
+     * By default entries are checked against the compiler build stamp; CFLAT_CACHE_BUILD_STAMP=0
+     * lets them survive a cflat rebuild. The PCH key always folds the build stamp, since a PCH
+     * belongs to the clang that wrote it.
      */
     // 96: generated [cpp] member helpers now expose non-override methods to C++ templates.
     // 97: default-argument wrappers skip ambiguous shortened calls, dedupe, move by-value args.
@@ -13023,8 +13073,7 @@ public:
     // 127: out-of-line inline and implicit-template static data members emit into the companion.
     // 128: C++ pointer results record pointee const (IsCxxPointeeConst); free `T *const &`
     //      returns record CxxConstRef() like member ones.
-    // 129: request markers record entry validity (entries also carry the build stamp when
-    //      CFLAT_CACHE_BUILD_STAMP=1).
+    // 129: request markers record entry validity; entries carry the build stamp by default.
     // 130: flexible / zero-length array record members carry their provenance (IsFlexibleArrayMember).
     // 131: free UNARY operator templates (`- + ! ~`) over a requested class template are published.
     // 132: zero-length `[0]` members are told apart from `[]` (IsZeroLengthArrayMember); anonymous
@@ -13130,9 +13179,8 @@ public:
     static constexpr int kCHeaderCacheVersion = 276;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
-    // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by
-    // default (nothing reads or writes the stamp); CFLAT_CACHE_BUILD_STAMP=1 turns it on. The
-    // default flips to ON once cflat cold is within 1.1x of clang++ cold (p1 target).
+    // entries record and check "cstamp", and demand companion keys fold the stamp. ON by
+    // default; CFLAT_CACHE_BUILD_STAMP=0 opts out. The core bitcode metadata uses the same rule.
     static bool CacheBuildStampEnabled();
 
     static std::string GetCHeaderCacheDir();

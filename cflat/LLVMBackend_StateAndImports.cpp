@@ -358,6 +358,13 @@ void LLVMBackend::CreateContinueCall()
         if (!IsInsertBlockLive())
             return;
 
+        if (!ownFlagLoopReownSnapshots_.empty())
+        {
+            const auto& loop = ownFlagLoopReownSnapshots_.back();
+            if (!loop.isDoWhile && !loop.hasIncrement)
+                CheckOwnFlagLoopBackEdge();
+        }
+
         for (auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (stackFrame.continueBlock)
@@ -1966,7 +1973,7 @@ bool LLVMBackend::CacheBuildStampEnabled()
 {
         static const bool enabled = []() {
             const char* value = std::getenv("CFLAT_CACHE_BUILD_STAMP");
-            return value != nullptr && std::string_view(value) == "1";
+            return value == nullptr || std::string_view(value) != "0";
         }();
         return enabled;
     }

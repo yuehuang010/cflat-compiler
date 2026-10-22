@@ -59,5 +59,19 @@ extern int main() {
     expect_error("operator delete' found in multiple base classes") {
         cppvdtemplate.Ambiguous<int> value;
     }
+    expect_error("attempt to use a deleted function") {
+        r3.Holder<cppvdtemplate.Deleted<short>> value;
+        int result = value.value.value();
+    }
+    expect_error("operator delete' found in multiple base classes") {
+        r3.Holder<cppvdtemplate.Ambiguous<char>> value;
+        int result = value.value.value();
+    }
+    expect_error("operator delete' is a private member") {
+        int result = r3.Build<cppvdtemplate.Private<char>>();
+    }
+    expect_error("attempt to use a deleted function") {
+        int result = r3.UseVal<cppvdtemplate.Deleted<long>>();
+    }
     return 0;
 }

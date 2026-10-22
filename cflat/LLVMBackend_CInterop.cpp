@@ -8739,11 +8739,10 @@ std::string LLVMBackend::CxxTypeRequestCacheKey(const CxxRequestGroup& group,
         }
         key += std::format("|S{:016x}-{}", sourceHash, requestSource.size());
         for (const auto& arg : clangArgs) key += "|A" + arg;
-        // Schema version, NOT the compiler build stamp: a rebuilt cflat that harvests the same
-        // way must reuse these entries. CI rebuilds on every run, and re-harvesting from cold is
-        // what costs the C++ interop tests their wall clock. kCHeaderCacheVersion is what makes
-        // an incompatible entry miss - bump it whenever the harvest changes. (CacheBuildStampEnabled
-        // checks the stamp inside the entry instead, so a rebuild rewrites this key's file.)
+        // Schema version, NOT the compiler build stamp: the build stamp is checked inside the entry
+        // (CacheBuildStampEnabled, on by default), so a rebuild rewrites this key's file in place.
+        // Under CFLAT_CACHE_BUILD_STAMP=0 a rebuilt cflat reuses it; kCHeaderCacheVersion is what
+        // makes an incompatible entry miss - bump it whenever the harvest changes.
         key += "|V" + std::to_string(kCHeaderCacheVersion);
         if (cflat_cinterop::CxxEagerBodies()) key += "|BEAGER";
         return key;

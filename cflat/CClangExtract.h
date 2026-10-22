@@ -651,7 +651,8 @@ namespace cflat_cinterop
         // skipped bodies it names). False when there is none or it does not compile.
         std::function<bool(clang::FunctionDecl*)> materializeBody;
         // Same, for everything CodeGen can reach from the demanded functions (one walk up front).
-        std::function<void(std::vector<const clang::FunctionDecl*>, std::string&, std::string&)>
+        std::function<void(std::vector<const clang::FunctionDecl*>, std::string&, std::string&,
+                           std::string&)>
             materializeReachable;
         // Validate a newly demanded polymorphic record before it reaches demand CodeGen.
         std::function<std::string(const clang::CXXRecordDecl*)> resolveVTableDelete;

@@ -4283,6 +4283,16 @@ extern int main()
     if (t373NativeFirst(id) != 111) return 2848;
     if (t373NativeSecond(id) != 111) return 2849;
     if (t373.defSole(id) != 111) return 2991;
+    // T386: address-of uses the same generic callback deduction and preserves the selected overload.
+    if (t373.freeFirst(&id) != 111) return 3850;
+    if (t373.freeSecond(&id) != 111) return 3851;
+    if (t373Method.first(&id) != 111) return 3853;
+    if (t373NativeFirst(&id) != 111) return 3854;
+    if (t373.freeFirst(&id<int>) != 111) return 3855;
+    {
+        function<int(int)> t386Local = &id;
+        if (t386Local(1) != 101) return 3856;
+    }
     // Another specialization of the same template initializes the declared one in place from
     // the arguments (master behaviour): clang reaches optional's constrained converting ctor.
     {

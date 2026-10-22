@@ -1,6 +1,9 @@
 class T377MoveView { int id = 0; };
 void t377MoveViewSink(move T377MoveView[] p) { }
 int t377MoveViewRead(T377MoveView[] p) { return p[0].id; }
+struct T387FieldHolder { T377MoveView[] view = default; };
+struct T387ArrayFieldHolder { T387FieldHolder hs[2]; };
+T377MoveView[] t387GlobalView = default;
 
 expect_error("the view may be borrowed on a runtime path") {
     void declMixedView(bool c)
@@ -164,5 +167,188 @@ expect_error("the view may be borrowed on a runtime path") {
         while (i < argc - 1) { y = argc > 3 ? new T377MoveView[2] : w; i++; }
         if (argc > 5) { t377MoveViewRead(y); } else { t377MoveViewRead(y); }
         t377MoveViewSink(move y);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void mixedFieldJoinSink(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[3];
+        T387FieldHolder h = default;
+        h.view = c ? new T377MoveView[2] : w;
+        t377MoveViewSink(move h.view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void mixedGlobalJoinSink(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[3];
+        t387GlobalView = c ? new T377MoveView[2] : w;
+        t377MoveViewSink(move t387GlobalView);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    class T387ImplicitHolder
+    {
+        T377MoveView[] view = default;
+        void run(bool c)
+        {
+            T377MoveView[] w = new T377MoveView[3];
+            view = c ? new T377MoveView[2] : w;
+            t377MoveViewSink(move view);
+        }
+    };
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void ifReownThenSink(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[3];
+        T377MoveView[] v = w;
+        if (c) v = new T377MoveView[2];
+        t377MoveViewSink(move v);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void noJoinReownThenBorrowSink(int argc)
+    {
+        T377MoveView[] w = new T377MoveView[3];
+        T377MoveView[] v = new T377MoveView[2];
+        if (argc > 5) { v = new T377MoveView[1]; v = w; }
+        else v = new T377MoveView[2];
+        t377MoveViewSink(move v);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void joinReownThenBorrowSink(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[3];
+        T377MoveView[] v = c ? new T377MoveView[2] : w;
+        v = new T377MoveView[1];
+        v = w;
+        t377MoveViewSink(move v);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void switchMixedJoinSink(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[3];
+        T377MoveView[] v = w;
+        switch (c ? 1 : 2)
+        {
+            case 1: v = new T377MoveView[2]; break;
+            default: break;
+        }
+        t377MoveViewSink(move v);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void mixedArrayElementFieldJoinSink(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[3];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = c ? new T377MoveView[2] : w;
+        t377MoveViewSink(move a.hs[0].view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void mixedDynamicArrayElementFieldJoinSink(int i, bool c)
+    {
+        T377MoveView[] w = new T377MoveView[3];
+        T387ArrayFieldHolder a = default;
+        a.hs[i].view = c ? new T377MoveView[2] : w;
+        t377MoveViewSink(move a.hs[i].view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void mixedFieldMovedIntoField(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[3];
+        T387FieldHolder h = default;
+        T387FieldHolder k = default;
+        h.view = c ? new T377MoveView[2] : w;
+        k.view = move h.view;
+        t377MoveViewSink(move k.view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void mixedFieldMovedIntoFieldReassigned(bool c)
+    {
+        T377MoveView[] w = new T377MoveView[3];
+        T387FieldHolder h = default;
+        T387FieldHolder k = default;
+        h.view = new T377MoveView[1];
+        k.view = move h.view;
+        t377MoveViewSink(move k.view);
+        h.view = c ? new T377MoveView[2] : w;
+        k.view = move h.view;
+        t377MoveViewSink(move k.view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void ownedSiblingHidesBorrowedDynamicElement(int i, bool c)
+    {
+        T377MoveView[] w = new T377MoveView[3];
+        T387ArrayFieldHolder a = default;
+        a.hs[0].view = new T377MoveView[1];
+        a.hs[1].view = c ? new T377MoveView[2] : w;
+        t377MoveViewSink(move a.hs[i].view);
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void loopSinkThenMixedRejoin(int argc)
+    {
+        bool c = argc > 1;
+        T377MoveView[] w = new T377MoveView[3];
+        T377MoveView[] u = new T377MoveView[1];
+        for (int i = 0; i < 2; i++)
+        {
+            t377MoveViewSink(move u);
+            u = c ? new T377MoveView[2] : w;
+        }
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void loopSinkThenNestedMixedRejoin(int argc)
+    {
+        bool c = argc > 1;
+        T377MoveView[] w = new T377MoveView[3];
+        T377MoveView[] u = new T377MoveView[1];
+        for (int i = 0; i < 2; i++)
+        {
+            t377MoveViewSink(move u);
+            u = new T377MoveView[1];
+            for (int j = 0; j < 1; j++) { u = c ? new T377MoveView[2] : w; }
+        }
+    }
+}
+
+expect_error("the view may be borrowed on a runtime path") {
+    void loopNestedSinkThenMixedRejoin(int argc)
+    {
+        bool c = argc > 1;
+        T377MoveView[] w = new T377MoveView[3];
+        T377MoveView[] u = new T377MoveView[1];
+        for (int i = 0; i < 2; i++)
+        {
+            for (int j = 0; j < 1; j++)
+            {
+                t377MoveViewSink(move u);
+                u = new T377MoveView[1];
+            }
+            u = c ? new T377MoveView[2] : w;
+        }
     }
 }

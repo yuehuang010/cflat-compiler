@@ -470,10 +470,11 @@ fi
 # C++ request cache consistency across compiles sharing one cache. (1) A store for program b
 # must not prune program a's still-valid entries once their markers are past the prune grace
 # (the prune used to delete by age alone, under concurrent readers). (2) An entry stamped by
-# another compiler build must be a miss ("compiler build"), and the compile still succeeds.
+# another compiler build must be a miss ("compiler build"), both with =1 and with the default
+# unset switch, and the compile still succeeds.
 # (3)/(4) demand replay across compiles; (5) a store by ANOTHER build must not prune either;
-# (6) with CFLAT_CACHE_BUILD_STAMP unset (default) entries survive a rebuild. Only (2) and (5)
-# set the switch. (7) an edit to a header reached only through another import's #include misses
+# (6) with CFLAT_CACHE_BUILD_STAMP=0 entries survive a rebuild. (2) and (5) exercise stamping;
+# (7) an edit to a header reached only through another import's #include misses
 # that import's entries and demand companion, repeated edits do not grow the request entries,
 # and a touch-only change still hits. (8) a same-stamp primary-header edit invalidates the
 # demand companion even when no type request independently hashes the header. (9) a poisoned
@@ -492,8 +493,8 @@ if [ "$RUN_MODE" -eq 0 ]; then
     '    v.push_back(40.0);' '    v.push_back(2.0);' '    return (int)(v[0] + v[1]) == 42 ? 0 : 1;' '}' \
     >"$cc_dir/b.cb"
   cc_compile() {
-    CFLAT_CACHE_DIR="$cc_dir/cache" $TIMEOUT "$CFLAT" "$cc_dir/$1.cb" -B -o "$cc_dir/$1.bin" "${@:3}" \
-      >"$cc_dir/$2.log" 2>&1 && "$cc_dir/$1.bin"
+    CFLAT_CACHE_DIR="$cc_dir/cache" $TIMEOUT "$CFLAT" "$cc_dir/$1.cb" -B -o "$cc_dir/$2.bin" "${@:3}" \
+      >"$cc_dir/$2.log" 2>&1 && "$cc_dir/$2.bin"
   }
   cc_fail=""
   if ! cc_compile a a_cold || ! cc_compile a a_ctl -v; then cc_fail="compile of a failed"
@@ -508,7 +509,7 @@ if [ "$RUN_MODE" -eq 0 ]; then
       if [ "$cc_now" != "$cc_ctl" ] || [ "${cc_ctl#*/}" = 0 ]; then
         cc_fail="b's store pruned a's live entries (a warm misses/hits: $cc_now, control $cc_ctl)"
       else
-        # (2) runs with the build-stamp switch on (default off): restamp every entry, then forge one.
+        # (2) restamp every entry, then forge one for explicit and default-on checks.
         if ! CFLAT_CACHE_BUILD_STAMP=1 cc_compile a a_stamped; then cc_fail="compile of a with the build stamp on failed"
         else
           cc_entry=$(grep -l '"cxxRequestKey":"|RQstd::vector<int>' "$cc_dir"/cache/cheaders/v*/*.json | head -n 1)
@@ -518,6 +519,11 @@ if [ "$RUN_MODE" -eq 0 ]; then
         elif ! CFLAT_CACHE_BUILD_STAMP=1 cc_compile a a_mixed -v; then cc_fail="compile of a over a foreign-build entry failed"
         elif [ "$(grep -c 'request cache MISS for std::vector<int>.*(compiler build)' "$cc_dir/a_mixed.log")" != 1 ]; then
           cc_fail="an entry stamped by another build was not exactly one 'compiler build' miss"
+        elif ! (perl -pi -e 's/"cstamp":"[^"]*"/"cstamp":"another-build"/' "$cc_entry"; \
+                unset CFLAT_CACHE_BUILD_STAMP; cc_compile a a_default_mixed -v); then
+          cc_fail="compile of a over a foreign-build entry with the default stamp setting failed"
+        elif [ "$(grep -c 'request cache MISS for std::vector<int>.*(compiler build)' "$cc_dir/a_default_mixed.log")" != 1 ]; then
+          cc_fail="the default stamp setting did not produce exactly one 'compiler build' miss"
         else
           # (3) Entries stored by two cold compiles (separate caches, merged) replay into one
           # interpreter for a program needing both: their chunk names must not collide.
@@ -612,7 +618,7 @@ if [ "$RUN_MODE" -eq 0 ]; then
                     fi
                   fi
                 fi
-                unset CFLAT_CACHE_BUILD_STAMP
+                export CFLAT_CACHE_BUILD_STAMP=0
                 if [ -n "$cc_fail" ]; then :
                 elif ! cc_run m5 "$CFLAT" a y_cold || ! cc_run m5 "$CFLAT" a y_ctl -v; then
                   cc_fail="compile of a with the build stamp off failed"
@@ -625,6 +631,7 @@ if [ "$RUN_MODE" -eq 0 ]; then
                     cc_fail="with the build stamp off a rebuild went cold (misses/hits: $cc_now, control $cc_ctl)"
                   fi
                 fi
+                unset CFLAT_CACHE_BUILD_STAMP
                 # (7) An edit to a header the import only INCLUDES (a.h, under h2.h / h3.h) must
                 # miss the requests and demand companions keyed on the importing groups. Keyed on
                 # the top-level headers only, a warm compile replayed the old bodies: (7a) a stale

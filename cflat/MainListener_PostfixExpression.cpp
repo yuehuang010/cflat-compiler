@@ -1812,6 +1812,19 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 structVar.BaseType     = sd.StructType;
                 structVar.TypeAndValue = namedVar.TypeAndValue;
                 structVar.TypeAndValue.Pointer = false;
+                structVar.IsStaticLocal = namedVar.IsStaticLocal;
+                structVar.FieldPathHasPointerDereference = true;
+                structVar.FieldPathFromForwardedArrow = false;
+                const bool frameLocalFieldContainer = namedVar.FieldPathPointerFrameLocal
+                    && !namedVar.FieldName.empty() && !namedVar.OwningStructName.empty()
+                    && !Compiler(ctx)->IsCxxRecord(namedVar.OwningStructName);
+                structVar.FieldPathPointerFrameLocal = PointerRootKindEveryArmLocal(
+                    ptrVal, Compiler(ctx), frameLocalFieldContainer)
+                    || (namedVar.FieldPathFromForwardedArrow
+                        && namedVar.FieldPathPointerFrameLocal);
+                if (namedVar.FieldPathHasPointerDereference)
+                    structVar.FieldPathPointerFrameLocal = structVar.FieldPathPointerFrameLocal
+                        && namedVar.FieldPathPointerFrameLocal;
                 // A class `T&&` result is pointer-shaped until auto-dereference; preserve its xvalue.
                 structVar.IsRvalue = namedVar.TypeAndValue.IsRvalueRef;
                 // Preserve borrow-origin across the auto-deref so 'move param->field'
@@ -1822,6 +1835,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 structVar.MovePathKey = namedVar.MovePathKey;
                 structVar.MovePathHasDynamicIndex = namedVar.MovePathHasDynamicIndex;
                 structVar.FieldPathRoot = namedVar.FieldPathRoot;
+                if (structVar.FieldPathRoot.empty())
+                    structVar.FieldPathRoot = !namedVar.CallerName.empty()
+                        ? namedVar.CallerName : Compiler(ctx)->FindVariableNameByStorage(namedVar.Storage);
                 structVar.ContainsBondedClosure = namedVar.ContainsBondedClosure;
                 structVar.BondedSources = namedVar.BondedSources;
             };
@@ -1901,8 +1917,24 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         compiler->IsCoreUniqueType(receiver.TypeAndValue.TypeName)
                         && (!receiver.FieldName.empty() || receiver.IsUniqueFieldAlias);
                     bool throughPointer = receiver.FieldPathThroughPointer
-                        || throughCoreUniqueField;
+                        || throughCoreUniqueField || arrowResult->getType()->isPointerTy();
+                    const bool ownsLocalCoreUniquePointee =
+                        CoreUniqueOwnerPathIsFrameLocal(compiler, receiver);
+                    bool pointerFrameLocal = PointerRootKindEveryArmLocal(arrowResult, compiler)
+                        || ownsLocalCoreUniquePointee;
+                    if (receiver.FieldPathHasPointerDereference)
+                        pointerFrameLocal = pointerFrameLocal && receiver.FieldPathPointerFrameLocal;
                     std::string pathRoot = receiver.FieldPathRoot;
+                    if (pathRoot.empty())
+                    {
+                        pathRoot = !receiver.CallerName.empty()
+                            ? receiver.CallerName : compiler->FindVariableNameByStorage(receiver.Storage);
+                        if (pathRoot.empty())
+                        {
+                            if (auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(receiver.Storage))
+                                pathRoot = global->getName().str();
+                        }
+                    }
                     std::string movePath = receiver.MovePathKey;
                     bool movePathHasDynamicIndex = receiver.MovePathHasDynamicIndex;
                     receiver = {};
@@ -1910,10 +1942,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     receiver.BaseType     = arrowResult->getType();
                     receiver.TypeAndValue = compiler->lastCallReturnType;
                     receiver.FieldPathThroughPointer = throughPointer;
+                    receiver.FieldPathHasPointerDereference = true;
+                    receiver.FieldPathPointerFrameLocal = pointerFrameLocal;
                     receiver.MovePathKey = movePath;
                     receiver.MovePathHasDynamicIndex = movePathHasDynamicIndex;
                     receiver.FieldPathRoot = pathRoot;
                     PrepareAliasCallResult(ctx, receiver, false);
+                    receiver.FieldPathFromForwardedArrow = true;
 
                     if (++arrowGuard > 32)
                     {
@@ -3401,6 +3436,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         ? structVar.TypeAndValue.VariableName : structVar.FieldPathRoot;
                                     namedVar.FieldPathThroughPointer = structVar.FieldPathThroughPointer
                                         || structVar.TypeAndValue.Pointer;
+                                    namedVar.FieldPathHasPointerDereference =
+                                        structVar.FieldPathHasPointerDereference;
+                                    namedVar.FieldPathPointerFrameLocal =
+                                        structVar.FieldPathPointerFrameLocal;
+                                    namedVar.FieldPathFromForwardedArrow = false;
+                                    namedVar.IsStaticLocal = structVar.IsStaticLocal;
                                     // An alias-return binding can retain the source owner's path label
                                     // while its own alloca is being introduced. Re-resolve the first
                                     // field hop against the local binding so the shallow-copy borrow
@@ -7115,22 +7156,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         CallArgumentScope callArgumentScope(
                                             inCallArgument_, ternaryCallArgumentDepth_);
                                         auto* backend = Compiler(ctx);
-                                        backend->lastCxxRetTemp_ = nullptr;
-                                        backend->lastCxxRetValue_ = nullptr;
-                                        auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
-                                        llvm::Value* retTemp = backend->lastCxxRetTemp_;
-                                        llvm::Value* retValue = backend->lastCxxRetValue_;
-                                        backend->lastCxxRetTemp_ = nullptr;
-                                        backend->lastCxxRetValue_ = nullptr;
-                                        // Consume only this argument's outermost C++ call result.
-                                        if (retTemp != nullptr
-                                            && (argNV.Storage == retTemp || argNV.Primary == retValue))
-                                        {
-                                            argNV.Storage = retTemp;
-                                            argNV.IsRvalue = true;
-                                        }
-                                        NormalizeCxxRvalueReferenceArgument(
-                                            namedArgument->assignmentExpression(), argNV);
+                                        auto argNV = ParseCallArgument([&] {
+                                            return this->ParseAssignmentExpressionNamed(
+                                                namedArgument->assignmentExpression());
+                                        });
                                         if (argNV.ContainsBondedClosure)
                                             Compiler(ctx)->LogError(
                                                 "cannot pass a holder containing a bonded closure to a function - the callee could stash it beyond the captured local's lifetime");
@@ -7654,6 +7683,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.TernaryTempAlreadyRegistered = argNV.TernaryTempAlreadyRegistered;
                                     argVar.ConditionalMoveSources = argNV.ConditionalMoveSources;
                                     argVar.Storage = argNV.Storage;
+                                    argVar.MoveSourcePathKey = argNV.MoveSourcePathKey;
                                     argVar.AddressedUniqueSlot = argNV.AddressedUniqueSlot;
                                     argVar.AddressedUniqueTypeName = argNV.AddressedUniqueTypeName;
                                     argVar.IsOwning = argNV.IsOwning;
@@ -8566,7 +8596,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                     if (!argExpectedDest.FuncPtrReturnTypeName.empty())
                                     {
-                                        auto* callbackIdentifier = BareGenericFunctionValueIdentifier(
+                                        auto* callbackIdentifier = GenericFunctionValueIdentifier(
                                             namedArgument->assignmentExpression());
                                         if (callbackIdentifier != nullptr
                                             && !NamesVisibleVariable(Compiler(ctx), callbackIdentifier->getText()))
@@ -8653,8 +8683,59 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // cast here must not launder a sibling argument's join arm.
                                     size_t savedCastOcc = Compiler(ctx)->BeginCastOccurrence();
                                     size_t thisCastOcc = Compiler(ctx)->CurrentCastOccurrence();
+                                    /*
+                                     * T391: the other arm of a plain `c ? default : x` is a live local of
+                                     * the parameter class itself (resolved symbol, no user conversion).
+                                     */
+                                    auto sameClassLocalOtherArm = [&]() {
+                                        auto* conditional = argumentExpression != nullptr
+                                            && argumentExpression->assignmentOperator() == nullptr
+                                            ? argumentExpression->conditionalExpression() : nullptr;
+                                        if (conditional == nullptr || conditional->Question() == nullptr
+                                            || conditional->expression() == nullptr
+                                            || conditional->conditionalExpression() == nullptr)
+                                            return false;
+                                        const bool trueArmDefault =
+                                            IsDefaultOnlyExpression(conditional->expression());
+                                        if (trueArmDefault == IsDefaultOnlyExpression(
+                                                conditional->conditionalExpression()))
+                                            return false;
+                                        antlr4::tree::ParseTree* otherArm = trueArmDefault
+                                            ? static_cast<antlr4::tree::ParseTree*>(
+                                                conditional->conditionalExpression())
+                                            : static_cast<antlr4::tree::ParseTree*>(conditional->expression());
+                                        auto* postfix = SolePostfixExpressionShape(otherArm);
+                                        if (postfix == nullptr || postfix->children.size() != 1) return false;
+                                        auto* primary = postfix->primaryExpression();
+                                        auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+                                        if (generic == nullptr || generic->genericTypeParameters() != nullptr
+                                            || generic->Identifier() == nullptr)
+                                            return false;
+                                        const auto* local = Compiler(ctx)->FindLiveNamedVariable(
+                                            generic->Identifier()->getText());
+                                        return local != nullptr
+                                            && local->TypeAndValue.TypeName == argExpectedDest.TypeName
+                                            && !local->TypeAndValue.Pointer
+                                            && local->TypeAndValue.PointerDepth == 0;
+                                    };
+                                    // T391: a bound C++ class parameter is an rvalue-ref or const& wrapper slot; a
+                                    // default argument, or a const& `?:` with a same-class local arm, joins into the class.
+                                    LLVMBackend::TypeAndValue ternaryArgDest = argExpectedDest;
+                                    if (funcSym != nullptr && funcSym->IsCxx
+                                        && declaredIdx[argIdx] >= 0
+                                        && argExpectedDest.Pointer && argExpectedDest.PointerDepth == 0
+                                        && (argExpectedDest.IsRvalueRef || argExpectedDest.CxxConstRef())
+                                        && Compiler(ctx)->IsForeignNontrivialCxxClass(argExpectedDest.TypeName)
+                                        && (defaultOnlyArgument
+                                            || (argExpectedDest.CxxConstRef()
+                                                && sameClassLocalOtherArm())))
+                                    {
+                                        ternaryArgDest.Pointer = false;
+                                        ternaryArgDest.IsRvalueRef = false;
+                                        ternaryArgDest.IsAlias = false;
+                                    }
                                     std::optional<DeclExpectedTypeScope> argExpectedScope;
-                                    argExpectedScope.emplace(&declExpectedType, argExpectedDest, true);
+                                    argExpectedScope.emplace(&declExpectedType, ternaryArgDest, true);
                                     CallArgumentScope callArgumentScope(
                                         inCallArgument_, ternaryCallArgumentDepth_);
                                     const bool cxxMemberReceiver = structVar.BaseType != nullptr
@@ -8818,16 +8899,53 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         inCxxCallArgument_, cxxCallArgument);
                                     // Only a by-value class slot names what `default` builds: an indirect
                                     // (pointer / rvalue-ref) wrapper parameter is a lowering, not the destination.
-                                    const bool byValueExpected = !argExpectedDest.Pointer
-                                        && argExpectedDest.PointerDepth == 0 && !argExpectedDest.IsAlias
-                                        && !argExpectedDest.IsRvalueRef;
+                                    const bool byValueExpected = !ternaryArgDest.Pointer
+                                        && ternaryArgDest.PointerDepth == 0 && !ternaryArgDest.IsAlias
+                                        && !ternaryArgDest.IsRvalueRef;
+                                    const bool directCastDefaultArgument = byValueExpected
+                                        && !defaultArgument
+                                        && Compiler(ctx)->IsForeignNontrivialCxxClass(
+                                            Compiler(ctx)->ResolveTypeAlias(ternaryArgDest.TypeName))
+                                        && IsSameTypeCastOfDefault(
+                                            namedArgument->assignmentExpression(),
+                                            ternaryArgDest.TypeName);
+                                    auto* castDefaultArgType = directCastDefaultArgument
+                                        ? Compiler(ctx)->GetType(ternaryArgDest) : nullptr;
+                                    auto* castDefaultArgSlot = castDefaultArgType != nullptr
+                                        ? Compiler(ctx)->AllocaAtEntry(castDefaultArgType, nullptr,
+                                            "cxx.arg.default") : nullptr;
                                     llvm::SaveAndRestore<LLVMBackend::TypeAndValue>
                                         cxxCallArgumentExpectedTypeScope(
                                             cxxCallArgumentExpectedType_, cxxCallArgument && byValueExpected
-                                                ? argExpectedDest : LLVMBackend::TypeAndValue{});
+                                                ? ternaryArgDest : LLVMBackend::TypeAndValue{});
                                     auto argNV = ParseCallArgument([&] {
-                                        return this->ParseAssignmentExpressionNamed(
+                                        auto* backend = Compiler(ctx);
+                                        if (castDefaultArgSlot == nullptr)
+                                            return this->ParseAssignmentExpressionNamed(
+                                                namedArgument->assignmentExpression());
+                                        llvm::SaveAndRestore<llvm::Value*> pendingSretDest(
+                                            backend->pendingCxxSretDest_, castDefaultArgSlot);
+                                        llvm::SaveAndRestore<std::string> pendingSretType(
+                                            backend->pendingCxxSretTypeName_, ternaryArgDest.TypeName);
+                                        auto parsed = this->ParseAssignmentExpressionNamed(
                                             namedArgument->assignmentExpression());
+                                        if (backend->pendingCxxSretDest_ == nullptr)
+                                        {
+                                            parsed = {};
+                                            parsed.TypeAndValue = ternaryArgDest;
+                                            parsed.Primary = backend->CreateLoad(
+                                                castDefaultArgType, castDefaultArgSlot);
+                                            parsed.Primary->setName("cxx.arg.default.value");
+                                            parsed.Storage = castDefaultArgSlot;
+                                            parsed.BaseType = castDefaultArgType;
+                                            parsed.IsRvalue = true;
+                                            parsed.IsCxxPrvalueTemp = true;
+                                            backend->RegisterOwnedStructTemp(
+                                                castDefaultArgSlot, ternaryArgDest.TypeName);
+                                            backend->lastCxxRetTemp_ = castDefaultArgSlot;
+                                            backend->lastCxxRetValue_ = parsed.Primary;
+                                        }
+                                        return parsed;
                                     });
                                     NormalizeCxxReferenceNamed(namedArgument, argNV);
                                     // T235: a C++ class prvalue before a direct construction keeps it out of
@@ -8948,6 +9066,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.MovedFields = argNV.MovedFields;
                                     // Propagate storage and ownership so move-param zeroing works at the call site.
                                     argVar.Storage = argNV.Storage;
+                                    argVar.MoveSourcePathKey = argNV.MoveSourcePathKey;
                                     argVar.IsOwning = argNV.IsOwning;
                                     argVar.OwnsInterfaceBox = argNV.OwnsInterfaceBox;
                                     argVar.IsAdoptable = argNV.IsAdoptable;
@@ -10165,6 +10284,27 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     {
                                         auto inst = TryInferAndInstantiateFromArgs(gfName, arguments);
                                         if (!inst.empty()) resolvedFuncName = inst;
+                                        else
+                                            if (functionArgCounter < argumentList.size())
+                                                for (auto* argument : argumentList[functionArgCounter]
+                                                         ->argumentNamedExpression())
+                                                {
+                                                    auto* identifier = GenericFunctionValueIdentifier(
+                                                        argument->assignmentExpression());
+                                                    if (identifier == nullptr
+                                                        || NamesVisibleVariable(Compiler(primaryCtx),
+                                                            identifier->getText()))
+                                                        continue;
+                                                    const std::string argumentBase =
+                                                        Compiler(primaryCtx)->ResolveGenericFunctionBase(
+                                                            identifier->getText());
+                                                    if (genericFunctionTemplates.count(argumentBase) == 0)
+                                                        continue;
+                                                    LogErrorContext(argument, std::format(
+                                                        "cannot deduce generic function '{}': template argument "
+                                                        "cannot be inferred from generic function name '{}'",
+                                                        gfName, identifier->getText()));
+                                                }
                                     }
                                 }
                                 requestCxxTemplate(resolvedFuncName);
@@ -12578,25 +12718,7 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
         {
             // A generic callee is inferred from call arguments by the existing call path. Only
             // a bare primary used as a value takes its type arguments from this destination.
-            bool bareValue = true;
-            antlr4::tree::ParseTree* child = node;
-            for (antlr4::tree::ParseTree* parent = node->parent; parent != nullptr;
-                 child = parent, parent = parent->parent)
-            {
-                auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(parent);
-                if (rule == nullptr) continue;
-                auto* parenthesized = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(rule);
-                const bool wrapsParenthesizedValue = parenthesized != nullptr
-                    && parenthesized->expression() == child
-                    && parenthesized->children.size() == 3;
-                if (!wrapsParenthesizedValue && rule->children.size() != 1)
-                {
-                    bareValue = false;
-                    break;
-                }
-                if (dynamic_cast<CFlatParser::AssignmentExpressionContext*>(rule) != nullptr)
-                    break;
-            }
+            const bool bareValue = GenericFunctionValueIdentifier(node) == node;
             if (bareValue)
             {
                 auto signatureExact = [&](const LLVMBackend::TypeAndValue& candidate) {

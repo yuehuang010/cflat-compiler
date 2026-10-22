@@ -5886,11 +5886,11 @@ cxx_dtor_ready:
                 }
                 compiler->lastCxxRetTemp_ = nullptr;
                 LLVMBackend::TypeAndValue ctorArgExpected;
-                auto* bareArgIdentifier = BareGenericFunctionValueIdentifier(argAssign);
-                const std::string genericBase = bareArgIdentifier != nullptr
-                    ? compiler->ResolveGenericFunctionBase(bareArgIdentifier->getText()) : std::string();
-                const bool genericFunctionArgument = bareArgIdentifier != nullptr
-                    && !NamesVisibleVariable(compiler, bareArgIdentifier->getText())
+                auto* genericArgIdentifier = GenericFunctionValueIdentifier(argAssign);
+                const std::string genericBase = genericArgIdentifier != nullptr
+                    ? compiler->ResolveGenericFunctionBase(genericArgIdentifier->getText()) : std::string();
+                const bool genericFunctionArgument = genericArgIdentifier != nullptr
+                    && !NamesVisibleVariable(compiler, genericArgIdentifier->getText())
                     && genericFunctionTemplates.count(genericBase) != 0;
                 bool ctorArgExpectedConflict = false;
                 bool genericCtorDestinationResolved = false;
@@ -9144,10 +9144,18 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcBorrowedField = rightNV.FieldName;
                                 srcFieldPathNV.OwningStructName = rightNV.OwningStructName;
                                 srcFieldPathNV.FieldName = rightNV.FieldName;
+                                srcFieldPathNV.Storage = rightNV.Storage;
+                                srcFieldPathNV.CallerName = rightNV.CallerName;
+                                srcFieldPathNV.IsUniqueFieldAlias = rightNV.IsUniqueFieldAlias;
                                 srcFieldPathNV.MovePathKey = rightNV.MovePathKey;
                                 srcFieldPathNV.MovePathHasDynamicIndex = rightNV.MovePathHasDynamicIndex;
                                 srcFieldPathNV.FieldPathText = rightNV.FieldPathText;
                                 srcFieldPathNV.FieldPathRoot = rightNV.FieldPathRoot;
+                                srcFieldPathNV.FieldPathHasPointerDereference =
+                                    rightNV.FieldPathHasPointerDereference;
+                                srcFieldPathNV.FieldPathPointerFrameLocal =
+                                    rightNV.FieldPathPointerFrameLocal;
+                                srcFieldPathNV.IsStaticLocal = rightNV.IsStaticLocal;
                                 srcFieldPathNV.RootIsBorrowedByValueParam =
                                     rightNV.RootIsBorrowedByValueParam;
                                 srcFieldPathNV.RootIsAliasBorrowLocal =
@@ -9162,8 +9170,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // The field's own type decides owning-VALUE vs pointer, so it has
                                 // to travel too - the guard reads it, not the root's type.
                                 srcFieldPathNV.TypeAndValue.TypeName = rightNV.TypeAndValue.TypeName;
+                                srcFieldPathNV.TypeAndValue.IsUnique = rightNV.TypeAndValue.IsUnique;
                                 srcFieldPathNV.TypeAndValue.Pointer = rightNV.TypeAndValue.Pointer;
                                 srcFieldPathNV.TypeAndValue.ElemPointer = rightNV.TypeAndValue.ElemPointer;
+                                srcFieldPathNV.TypeAndValue.IsMove = rightNV.TypeAndValue.IsMove;
+                                srcFieldPathNV.IsExplicitMove = rightNV.IsExplicitMove;
                                 srcFieldPathNV.TypeAndValue.ParentVariableName =
                                     rightNV.TypeAndValue.ParentVariableName;
                                 // Trap B: a plain copy of a `unique` field does not null the field, so the
@@ -11956,6 +11967,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             auto& nv = compiler->GetOrCreateStackVariable(name);
                             if (!nv.IsOwning && !nv.IsNewAllocated)
                             {
+                                if (!srcFieldPathNV.FieldName.empty()
+                                    && !srcFieldPathNV.TypeAndValue.IsMove
+                                    && !srcFieldPathNV.IsExplicitMove
+                                    && IsUniqueFieldRead(srcFieldPathNV)
+                                    && RejectImplicitConsumeOfOutlivingOwner(
+                                        compiler, srcFieldPathNV, false, initDecl))
+                                    return allocList;
                                 const std::string sourceName =
                                     LLVMBackend::BorrowedSourceName(initializerSourceNV);
                                 if (sourceName.empty())
@@ -14100,6 +14118,21 @@ bool MainListener::FieldPathRootIsFrameLocal(llvm::Value* storage) {
             storage = gep->getPointerOperand();
         }
         return true;
+    }
+
+bool MainListener::CoreUniqueOwnerPathIsFrameLocal(
+        LLVMBackend* compiler, const LLVMBackend::NamedVariable& owner) {
+        if (compiler == nullptr || owner.IsStaticLocal
+            || !compiler->IsCoreUniqueType(owner.TypeAndValue.TypeName))
+            return false;
+
+        if (owner.IsOwning && FieldPathRootIsFrameLocal(owner.Storage))
+            return true;
+        if (owner.FieldName.empty() && !owner.IsUniqueFieldAlias)
+            return false;
+        if (owner.FieldPathHasPointerDereference)
+            return owner.FieldPathPointerFrameLocal;
+        return FieldPathRootIsFrameLocal(owner.Storage);
     }
 
 LLVMBackend::NamedVariable MainListener::FinishAssignmentExpressionNamed(

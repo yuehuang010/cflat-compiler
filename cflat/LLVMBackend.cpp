@@ -4998,6 +4998,7 @@ void LLVMBackend::ResetForReanalysis()
     globalAssignBorrowOrigin_.clear();
     globalAssignBorrowedAddress_.clear();
     rawArrayResults_.clear();
+    nonLocalViewOwnershipStates_.clear();
     mayReachReturnInProgress_.clear();
     joinAddressInProgress_.clear();
     pendingReturnDangleChecks_.clear();
@@ -7741,6 +7742,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     root["version"]   = 19;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
+    if (CacheBuildStampEnabled()) root["cstamp"] = CompilerBuildStamp();
 #if defined(__APPLE__)
     if (targetMacOS_) root["macos_deployment"] = cflat::platform::MacDeploymentVersion();
 #endif
@@ -8229,6 +8231,11 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     if (!ver || *ver != 19) return false;
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != coreHash) return false;
+    if (CacheBuildStampEnabled())
+    {
+        auto storedStamp = root->getString("cstamp");
+        if (!storedStamp || storedStamp->str() != CompilerBuildStamp()) return false;
+    }
 #if defined(__APPLE__)
     if (targetMacOS_)
     {

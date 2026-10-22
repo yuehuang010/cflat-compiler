@@ -1,0 +1,29 @@
+struct T388GlobalPS
+{
+    int v = 0;
+    T388GlobalPS(int value) { v = value; }
+};
+struct T388GlobalUA { unique T388GlobalPS*[2] q; };
+T388GlobalUA t388GlobalUA = default;
+
+expect_error("cannot consume owning value 't388GlobalUA.q' out of storage that outlives this function") {
+    int consumeGlobalArrayField()
+    {
+        unique T388GlobalPS* o = nullptr;
+        t388GlobalUA.q[0] = new T388GlobalPS(5);
+        o = t388GlobalUA.q[0];
+        return o == nullptr ? 0 : o->v;
+    }
+}
+
+// A constant-index element read through a borrowed pointer parameter is a field consume, like `pf->p`.
+expect_error("cannot consume field 'T388GlobalUA.q' through borrowed parameter 'pa'") {
+    int consumeParamArrayField(T388GlobalUA* pa)
+    {
+        unique T388GlobalPS* o = nullptr;
+        o = pa->q[0];
+        return o == nullptr ? 0 : o->v;
+    }
+}
+
+extern int main() { return 0; }

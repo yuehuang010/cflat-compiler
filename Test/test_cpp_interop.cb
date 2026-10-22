@@ -2925,6 +2925,31 @@ extern int main()
     if (!(t307_own_eq == t307_own_eq_other)) return 30738;
     t307.OwnLt t307_own_lt = default;
     if (!(t307_own_lt < 1)) return 30739;
+    // T394 frozen accept-set: a nearer const base free and a derived prvalue keep clang's value.
+    t307.T394ConstRankDerived t394_nearer_const = default;
+    if (t394_nearer_const + 1 != 2) return 39401;
+    if (t307.T394MakePrvalue() + 1 != 2) return 39402;
+    // T394: C++20 reversed equality and rewritten spaceship candidates use the full rank set.
+    t307.T394EqDerived t394_eq = default;
+    if (1 == t394_eq) return 39403;
+    t307.T394OrderDerived t394_order = default;
+    if (t394_order < 1) return 39404;
+    if (!(1 < t394_order)) return 39405;
+    t307.T394CompoundDerived t394_compound = default;
+    t394_compound += 1;
+    if (*t307.T394CompoundTagPtr() != 2) return 39406;
+    t307.T394CompoundMinusDerived t394_minus = default;
+    t394_minus -= 1;
+    if (*t307.T394CompoundTagPtr() != 11) return 39407;
+    t307.T394CompoundShiftDerived t394_shift = default;
+    t394_shift <<= 1;
+    if (*t307.T394CompoundTagPtr() != 21) return 39408;
+    t307.T394CompoundLiteralDerived t394_literal = default;
+    t394_literal += 1;
+    if (*t307.T394CompoundTagPtr() != 32) return 39409;
+    t307.T394CompoundFriend t394_friend = default;
+    t394_friend += 1;
+    if (*t307.T394CompoundTagPtr() != 42) return 39410;
     t307.SBCVA t307_samebase_const = default;
     if (t307_samebase_const + 1 != 2) return 30703;
     t307.SBCRA t307_samebase_constref = default;
@@ -6476,6 +6501,13 @@ extern int main()
         int pointerValue = deletedPointerOnly == nullptr ? 29 : 31;
         if (pointerValue != 29) return 33306;
     }
+
+    // T390 accept-set: a usable delete stays valid through a C++ by-value member.
+    {
+        r3.Holder<cppvdtemplate.Fine<char>> fineHolder;
+        if (fineHolder.value.value() != 41) return 39001;
+    }
+    if (r3.RunFineDelete<char>() != 4107) return 39002;
 
     // ---- C++ inheritance and virtual dispatch ---------------------------------------------------
     // Every offset and vtable slot below is clang's own answer, cross-checked against

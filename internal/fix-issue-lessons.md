@@ -3569,3 +3569,12 @@ Per-item detail lives in the named issue file; durable decisions here.
 - Sized class `operator delete(void*, N)` is recognized only when N is the target's size_t, as in clang.- A header defining a virtual dtor whose class-scope operator delete is deleted/private/ambiguous is refused at import,
   even if unused, as in clang (T333). Import-time refusals are tested by new `Test/errors/err_*.cb` files, not legs
   behind a shared import.
+
+## Ruling 2026-10-21: cache entries are build-stamped by default (landed with T397)
+
+The compiler build stamp (`cstamp`: cflat binary mtime + size) keys every persistent cache by default - C/C++ request and header
+JSON rows, demand companions, `--init` core metadata. `CFLAT_CACHE_BUILD_STAMP=0` opts out; unset or any other value is on. This
+supersedes the 2026-09-28 gate (flip only once cold cflat <= 1.1x clang cold). Trigger: a rebased fix worktree reused C++ entries
+written by its pre-rebase exe and the T393 landing bar crashed test_cpp_interop twice (fresh cache: clean). The earlier lessons at the
+top of this file (failed-request entry replayed by later builds; foreign-build `cheaders` false regression) are now closed by default;
+they still apply under `=0`. Cost: the first compile after any rebuild is cold; core bitcode stays cold until `--init` is re-run.

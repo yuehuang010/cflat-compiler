@@ -96,6 +96,8 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
         pendingLaunderTempUniqueFields_.clear();
         dataValueCodeCasts_.clear();
         rawArrayResults_.clear();
+        std::erase_if(nonLocalViewOwnershipStates_,
+            [&](const auto& state) { return state.Function == fn; });
 
         // populate function arguments
         auto itr_nameArg = arguments.begin();

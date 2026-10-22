@@ -270,6 +270,85 @@ int t359ReadParenthesizedPointerIndex(string* ps)
     string t = (ps)[0];
     return t.length();
 }
+u64 t392AuditAllocations = 0;
+u64 t392AuditFrees = 0;
+void t392CountAlloc(void* pointer, u64 size)
+{
+    t392AuditAllocations++;
+    cflat_heap_audit_alloc(pointer, size);
+}
+void t392CountFree(void* pointer)
+{
+    t392AuditFrees++;
+    cflat_heap_audit_free(pointer);
+}
+int t392ReadPtrPtrIndex0()
+{
+    string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+    string* ps = &source;
+    string** pp = &ps;
+    string t = (*pp)[0];
+    return t.length();
+}
+int t392ReadPtrPtrIndex1()
+{
+    string[2] items = default;
+    items[0] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJ".copy();
+    items[1] = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+    string* ps = &items[0];
+    string** pp = &ps;
+    string t = (*pp)[1];
+    return t.length();
+}
+int t392ReadRawNewThroughPtrPtr()
+{
+    string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+    string* raw = new string[2];
+    raw[0] = source;
+    string** pp = &raw;
+    string t = (*pp)[0];
+    int value = t.length();
+    delete[_] raw;
+    return value;
+}
+void t392RebindThroughCallee(string** p)
+{
+    *p = new string[2];
+}
+int t392ReadRawNewRebindByCallee()
+{
+    string* raw = default;
+    string** pp = &raw;
+    t392RebindThroughCallee(pp);
+    raw[0] = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+    string t = (*pp)[0];
+    int value = t.length();
+    delete[_] raw;
+    return value;
+}
+int t392ReadRawNewStoredLaterInLoop()
+{
+    string* raw = default;
+    string** pp = &raw;
+    int value = 0;
+    for (int j = 0; j < 2; j++)
+    {
+        if (j == 1) { string t = (*pp)[0]; value = t.length(); delete[_] raw; }
+        if (j == 0) { *pp = new string[2]; raw[0] = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy(); }
+    }
+    return value;
+}
+int t392ReadRawNewStoredThroughPtrPtr()
+{
+    string* raw = default;
+    string** pp = &raw;
+    *pp = new string[2];
+    raw[0] = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+    string t = (*pp)[0];
+    int value = t.length();
+    delete[_] raw;
+    return value;
+}
 void* t359SelfAssignBuffer = nullptr;
 u64 t359SelfAssignAllocations = 0;
 u64 t359SelfAssignFrees = 0;
@@ -1792,6 +1871,67 @@ extern int main()
         int value = t359ReadParenthesizedPointerIndex(&source);
         bool clean = HeapAudit.reportLeaks() == before && value == 46;
         total++; passed += Test("t359_parenthesized_subscript", clean, true);
+    }
+    // T392: follow a unary dereference when copying borrowed pointer elements.
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t392AuditAllocations = 0; t392AuditFrees = 0;
+        __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+        int value = t392ReadPtrPtrIndex0();
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t392AuditAllocations == 2u && t392AuditFrees == 2u;
+        total++; passed += Test("t392_ptrptr_index0", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t392AuditAllocations = 0; t392AuditFrees = 0;
+        __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+        int value = t392ReadPtrPtrIndex1();
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t392AuditAllocations == 3u && t392AuditFrees == 3u;
+        total++; passed += Test("t392_ptrptr_index1", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t392AuditAllocations = 0; t392AuditFrees = 0;
+        __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+        int value = t392ReadRawNewThroughPtrPtr();
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t392AuditAllocations == 2u && t392AuditFrees == 2u;
+        total++; passed += Test("t392_raw_new_ptrptr_no_copy", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t392AuditAllocations = 0; t392AuditFrees = 0;
+        __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+        int value = t392ReadRawNewStoredThroughPtrPtr();
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t392AuditAllocations == 2u && t392AuditFrees == 2u;
+        total++; passed += Test("t392_raw_new_stored_through_ptrptr_no_copy", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t392AuditAllocations = 0; t392AuditFrees = 0;
+        __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+        int value = t392ReadRawNewRebindByCallee();
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t392AuditAllocations == 2u && t392AuditFrees == 2u;
+        total++; passed += Test("t392_raw_new_rebind_by_callee_no_copy", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t392AuditAllocations = 0; t392AuditFrees = 0;
+        __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+        int value = t392ReadRawNewStoredLaterInLoop();
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t392AuditAllocations == 2u && t392AuditFrees == 2u;
+        total++; passed += Test("t392_raw_new_stored_later_in_loop_no_copy", clean, true);
     }
     {
         u64 before = HeapAudit.reportLeaks();

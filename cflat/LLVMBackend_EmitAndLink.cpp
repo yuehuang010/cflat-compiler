@@ -2964,9 +2964,8 @@ bool LLVMBackend::EmitCxxDemandCompanions()
             companionKey ^= 0xff;
             companionKey *= 1099511628211ULL;
         };
-        // Keyed like its entries (cache version, not build stamp): they survive a rebuild, so
-        // must the companion, or every served group would miss and retry cold. Under
-        // CacheBuildStampEnabled() entries are per build, and so is the companion.
+        // Keyed like its entries: under CacheBuildStampEnabled() (default) entries are per build,
+        // and so is the companion. Under CFLAT_CACHE_BUILD_STAMP=0 both survive a rebuild.
         mix(std::to_string(kCHeaderCacheVersion));
         if (CacheBuildStampEnabled()) mix(CompilerBuildStamp());
         if (cflat_cinterop::CxxEagerBodies()) mix("|BEAGER");

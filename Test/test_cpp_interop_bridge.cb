@@ -1390,6 +1390,191 @@ int bridge_t306_cpp_cast_ctor_ternary_default(bool c)
     return bridge_t299_pack_result(value, baseLive);
 }
 
+// T391: a local class arm into a bound by-value C++ free function leaves no live allocation (clang: 0).
+int bridge_t391_twin_live_delta(bool c)
+{
+    cpptw.Twin tw = default;
+    int baseLive = cpptw.live_allocations();
+    cpptw.take(c ? default : tw);
+    return cpptw.live_allocations() - baseLive;
+}
+
+// T391: `c ? default : v` with a local class arm into C++ (cpp_interop_ternaryref.h), packed as
+// value * 100000 + ctor/copy/move/dtor/live digits. clang: the conditional is a prvalue.
+int bridge_t391_ternref_free_cref(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T391Val v = ternref.T391Val(7);
+        value = ternref.t391_tref(c ? default : v);
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+
+int bridge_t391_ternref_member_cref(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T391Host h = default;
+        ternref.T391Val v = ternref.T391Val(7);
+        value = h.tref(c ? default : v);
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+
+int bridge_t391_ternref_free_take(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T391Val v = ternref.T391Val(7);
+        value = ternref.t391_take(c ? default : v);
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+
+int bridge_t391_ternref_free_take_always_false()
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T391Val v = ternref.T391Val(7);
+        value = ternref.t391_take(false ? default : v);
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+
+cpptw.Twin bridge_t395_rettw() { return cpptw.Twin(7); }
+
+int bridge_t395_decl_ternary(bool c)
+{
+    cpptw.reset_counts();
+    int baseLive = cpptw.live_allocations();
+    int value = -1;
+    { cpptw.Twin x = c ? default : bridge_t395_rettw(); value = x.value(); }
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t395_decl_ternary_branches()
+{
+    return bridge_t395_decl_ternary(false) == 71000010
+        && bridge_t395_decl_ternary(true) == 1000010 ? 1 : 0;
+}
+
+cpptw.Twin bridge_t395_return_ternary(bool c)
+{
+    return c ? default : bridge_t395_rettw();
+}
+
+int bridge_t395_return_ternary_sink(bool c)
+{
+    cpptw.reset_counts();
+    int baseLive = cpptw.live_allocations();
+    int value = -1;
+    { cpptw.Twin x = bridge_t395_return_ternary(c); value = x.value(); }
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t395_return_ternary_branches()
+{
+    return bridge_t395_return_ternary_sink(false) == 71000010
+        && bridge_t395_return_ternary_sink(true) == 1000010 ? 1 : 0;
+}
+
+int bridge_t395_decl_cast_arm(bool c)
+{
+    cpptw.reset_counts();
+    int baseLive = cpptw.live_allocations();
+    int value = -1;
+    { cpptw.Twin x = c ? (cpptw.Twin)default : bridge_t395_rettw(); value = x.value(); }
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+cpptw.Twin bridge_t395_return_cast_arm(bool c)
+{
+    return c ? (cpptw.Twin)default : bridge_t395_rettw();
+}
+
+int bridge_t395_cast_arm_branches()
+{
+    cpptw.reset_counts();
+    int baseLive = cpptw.live_allocations();
+    int value = -1;
+    { cpptw.Twin x = bridge_t395_return_cast_arm(true); value = x.value(); }
+    int returned = bridge_t299_pack_result(value, baseLive);
+    return returned == 1000010 && bridge_t395_decl_cast_arm(false) == 71000010
+        && bridge_t395_decl_cast_arm(true) == 1000010 ? 1 : 0;
+}
+
+int bridge_t395_decl_cast_default()
+{
+    cpptw.reset_counts();
+    int baseLive = cpptw.live_allocations();
+    int value = -1;
+    { cpptw.Twin x = (cpptw.Twin)default; value = x.value(); }
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t395_assign_cast_default()
+{
+    cpptw.reset_counts();
+    int baseLive = cpptw.live_allocations();
+    int value = -1;
+    { cpptw.Twin x = cpptw.Twin(5); x = (cpptw.Twin)default; value = x.value(); }
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t395_take_plain(cpptw.Twin value) { return value.value(); }
+int bridge_t395_take_move(move cpptw.Twin value) { return value.value(); }
+
+int bridge_t395_call_plain_ternary(bool c)
+{
+    cpptw.reset_counts();
+    int baseLive = cpptw.live_allocations();
+    int value = -1;
+    { cpptw.Twin tw = default; value = bridge_t395_take_plain(c ? default : move tw); }
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t395_call_plain_ternary_branches()
+{
+    return bridge_t395_call_plain_ternary(false) == 1010020
+        && bridge_t395_call_plain_ternary(true) == 2000020 ? 1 : 0;
+}
+
+int bridge_t395_call_move_ternary(bool c)
+{
+    cpptw.reset_counts();
+    int baseLive = cpptw.live_allocations();
+    int value = -1;
+    { cpptw.Twin tw = cpptw.Twin(9); value = bridge_t395_take_move(c ? default : move tw); }
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t395_call_move_ternary_branches()
+{
+    return bridge_t395_call_move_ternary(false) == 91010020
+        && bridge_t395_call_move_ternary(true) == 2000020 ? 1 : 0;
+}
+
+int bridge_t395_call_plain_cast_default()
+{
+    cpptw.reset_counts();
+    int baseLive = cpptw.live_allocations();
+    int value = bridge_t395_take_plain((cpptw.Twin)default);
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t395_call_move_cast_default()
+{
+    cpptw.reset_counts();
+    int baseLive = cpptw.live_allocations();
+    int value = bridge_t395_take_move((cpptw.Twin)default);
+    return bridge_t299_pack_result(value, baseLive);
+}
+
 int bridge_t301_pack_result(int value)
 {
     return value * 1000000 + cpptw.ctor_count() * 100000 + cpptw.copy_count() * 10000
@@ -2443,6 +2628,27 @@ int bridge_sret_lambda_run(int selector)
 cpptw.Twin t319_rettw() { return default; }
 cpptw.Twin t319_runl(Lambda<cpptw.Twin()> f) { return f(); }
 cpptw.Twin t319_runc(cpptw.Twin t, Lambda<int()> f) { return cpptw.Twin(cpptw.take(t) + f()); }
+
+cpptw.Twin t389_direct(cpptw.Twin t) { return cpptw.Twin(t.value() + 2); }
+cpptw.Twin t389_return_direct() { return t389_direct(cpptw.Twin(3)); }
+cpptw.Twin t389_return_param(Lambda<cpptw.Twin(cpptw.Twin)> f) { return f(cpptw.Twin(3)); }
+cpptw.Twin t389_return_local() {
+    Lambda<cpptw.Twin(cpptw.Twin)> f = (cpptw.Twin t) => cpptw.Twin(t.value() + 2);
+    return f(cpptw.Twin(3));
+}
+cpptw.Twin t389_return_capture() {
+    int bias = 2;
+    Lambda<cpptw.Twin(cpptw.Twin)> f = (cpptw.Twin t) => cpptw.Twin(t.value() + bias);
+    return f(cpptw.Twin(3));
+}
+cpptw.Twin t389_return_thin(function<cpptw.Twin(cpptw.Twin)> f) { return f(cpptw.Twin(3)); }
+cpptw.Twin t389_return_two(Lambda<cpptw.Twin(cpptw.Twin, cpptw.Twin)> f) {
+    return f(cpptw.Twin(3), cpptw.Twin(4));
+}
+cpptw.Twin t389_return_nested(Lambda<cpptw.Twin(cpptw.Twin)> f,
+                              Lambda<cpptw.Twin(cpptw.Twin)> g) {
+    return f(g(cpptw.Twin(3)));
+}
 
 int bridge_sret_array_dtors = 0;
 struct BridgeSretArrayElem
@@ -5723,6 +5929,36 @@ extern int main(int argc, char** argv)
     cpptw.reset_counts();
     bridge_check("bridge T306 r3 cast ctor ternary default true",
         bridge_t306_cpp_cast_ctor_ternary_default(true), 51000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T391 bound twin ternary live delta false", bridge_t391_twin_live_delta(false), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge T391 bound twin ternary live delta true", bridge_t391_twin_live_delta(true), 0);
+    bridge_check("bridge T391 free const& default ternary false", bridge_t391_ternref_free_cref(false), 711020);
+    bridge_check("bridge T391 free const& default ternary true", bridge_t391_ternref_free_cref(true), 20020);
+    bridge_check("bridge T391 member const& default ternary true", bridge_t391_ternref_member_cref(true), 3020020);
+    bridge_check("bridge T391 free by-value default ternary false", bridge_t391_ternref_free_take(false), 711020);
+    bridge_check("bridge T391 free by-value default ternary true", bridge_t391_ternref_free_take(true), 20020);
+    bridge_check("bridge T391 free by-value always-false ternary",
+        bridge_t391_ternref_free_take_always_false(), 711020);
+
+    bridge_check("bridge T395 default ternary declaration branches",
+        bridge_t395_decl_ternary_branches(), 1);
+    bridge_check("bridge T395 default ternary return branches",
+        bridge_t395_return_ternary_branches(), 1);
+    bridge_check("bridge T395 cast default ternary arm declaration and return",
+        bridge_t395_cast_arm_branches(), 1);
+    bridge_check("bridge T395 cast default declaration",
+        bridge_t395_decl_cast_default(), 1000010);
+    bridge_check("bridge T395 cast default assignment",
+        bridge_t395_assign_cast_default(), 2000120);
+    bridge_check("bridge T395 plain CFlat by-value ternary branches",
+        bridge_t395_call_plain_ternary_branches(), 1);
+    bridge_check("bridge T395 move CFlat by-value ternary branches",
+        bridge_t395_call_move_ternary_branches(), 1);
+    bridge_check("bridge T395 cast default plain CFlat by-value call",
+        bridge_t395_call_plain_cast_default(), 1000010);
+    bridge_check("bridge T395 cast default move CFlat by-value call",
+        bridge_t395_call_move_cast_default(), 1000010);
 
     // T301: a C++ class field after a unique field keeps its C++ layout and destruction counts.
     bridge_check("bridge T301 Twin/unique/Twin value and counts", bridge_t301_twin_unique_twin(), 37200002);
@@ -6404,6 +6640,49 @@ extern int main(int argc, char** argv)
     if (t319By != 7) return 1984;
     if (cpptw.ctor_count() != 2 || cpptw.copy_count() != 0 || cpptw.move_count() != 1
         || cpptw.dtor_count() != 3 || cpptw.live_allocations() != 0) return 1985;
+
+    // T389: an indirect C++ class result must forward the return slot after by-value args are built.
+    cpptw.reset_counts();
+    int t389Param = t389_return_param(
+        (cpptw.Twin t) => cpptw.Twin(t.value() + 2)).value();
+    if (t389Param != 5) return 1986;
+    if (cpptw.ctor_count() != 2 || cpptw.copy_count() != 0 || cpptw.move_count() != 1
+        || cpptw.dtor_count() != 3 || cpptw.live_allocations() != 0) return 1987;
+    cpptw.reset_counts();
+    int t389Local = t389_return_local().value();
+    if (t389Local != 5) return 1988;
+    if (cpptw.ctor_count() != 2 || cpptw.copy_count() != 0 || cpptw.move_count() != 1
+        || cpptw.dtor_count() != 3 || cpptw.live_allocations() != 0) return 1989;
+    cpptw.reset_counts();
+    int t389Capture = t389_return_capture().value();
+    if (t389Capture != 5) return 1990;
+    if (cpptw.ctor_count() != 2 || cpptw.copy_count() != 0 || cpptw.move_count() != 1
+        || cpptw.dtor_count() != 3 || cpptw.live_allocations() != 0) return 1991;
+    cpptw.reset_counts();
+    function<cpptw.Twin(cpptw.Twin)> t389Thin =
+        (cpptw.Twin t) => cpptw.Twin(t.value() + 2);
+    int t389ThinResult = t389_return_thin(t389Thin).value();
+    if (t389ThinResult != 5) return 1992;
+    if (cpptw.ctor_count() != 2 || cpptw.copy_count() != 0 || cpptw.move_count() != 1
+        || cpptw.dtor_count() != 3 || cpptw.live_allocations() != 0) return 1993;
+    cpptw.reset_counts();
+    int t389Direct = t389_return_direct().value();
+    if (t389Direct != 5) return 1994;
+    if (cpptw.ctor_count() != 2 || cpptw.copy_count() != 0 || cpptw.move_count() != 0
+        || cpptw.dtor_count() != 2 || cpptw.live_allocations() != 0) return 1995;
+    cpptw.reset_counts();
+    int t389Two = t389_return_two(
+        (cpptw.Twin a, cpptw.Twin b) => cpptw.Twin(a.value() + b.value())).value();
+    if (t389Two != 7) return 1996;
+    if (cpptw.ctor_count() != 3 || cpptw.copy_count() != 0 || cpptw.move_count() != 2
+        || cpptw.dtor_count() != 5 || cpptw.live_allocations() != 0) return 1997;
+    cpptw.reset_counts();
+    int t389Nested = t389_return_nested(
+        (cpptw.Twin t) => cpptw.Twin(t.value() + 2),
+        (cpptw.Twin t) => cpptw.Twin(t.value() + 1)).value();
+    if (t389Nested != 6) return 1998;
+    if (cpptw.ctor_count() != 3 || cpptw.copy_count() != 0 || cpptw.move_count() != 2
+        || cpptw.dtor_count() != 5 || cpptw.live_allocations() != 0) return 1999;
 
     if (bridge_passed != bridge_checks) return 2000;
 

@@ -433,7 +433,50 @@ std::unordered_set<std::string> FindLoopBackEdgeCxxConstPointerTargets(
         return targets;
 }
 
+// Bare `new` at the top of an assignment right side (same walk as MainListener::AsDirectNew).
+CFlatParser::NewExpressionContext* LoopDirectNew(antlr4::tree::ParseTree* node)
+{
+        while (node != nullptr)
+        {
+            if (auto* ne = dynamic_cast<CFlatParser::NewExpressionContext*>(node)) return ne;
+            if (node->children.size() != 1) return nullptr;
+            node = node->children[0];
+        }
+        return nullptr;
+}
+
+// Names a loop may rebind to a value that is not a bare `new`. Writes through `&v` are not tracked
+// (`S[]*` is refused; the `auto p = &v` slot-address hole is a separate p2), and a lambda body only
+// writes its own params / value captures.
+std::unordered_set<std::string> FindLoopViewRebindTargets(CFlatParser::IterationStatementContext* loop)
+{
+        std::unordered_set<std::string> targets;
+        if (loop == nullptr) return targets;
+        auto visitAssignments = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+            if (node == nullptr || dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr) return;
+            if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
+                assignment != nullptr && assignment->assignmentOperator() != nullptr)
+            {
+                const std::string name = LoopSimpleAssignmentTarget(assignment->unaryExpression());
+                const bool rangeVariable = loop->declarationSpecifiers() != nullptr && loop->In()
+                    && loop->Identifier() != nullptr && loop->Identifier()->getText() == name;
+                if (!name.empty() && !rangeVariable && LoopDirectNew(assignment->assignmentExpression()) == nullptr
+                    && !LoopAssignmentIsShadowed(assignment, loop, name))
+                    targets.insert(name);
+            }
+            for (antlr4::tree::ParseTree* child : node->children) self(self, child);
+        };
+        visitAssignments(visitAssignments, loop);
+        return targets;
+}
+
 } // namespace
+
+// Records the loop's view-rebind targets (parse-tree walk) on the innermost loop frame.
+static void NoteLoopBodyViewAssignments(LLVMBackend* compiler, CFlatParser::IterationStatementContext* loop)
+{
+    compiler->NoteLoopViewAssignments(FindLoopViewRebindTargets(loop));
+}
 
 void MainListener::MarkLoopBackEdgeCxxConstPointers(
         LLVMBackend* compiler, CFlatParser::IterationStatementContext* loop)
@@ -3844,6 +3887,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 auto expression = iterationStatement->expression();
                 auto innerStatement = iterationStatement->statement();
                 MarkLoopBackEdgeCxxConstPointers(compiler, iterationStatement);
+                NoteLoopBodyViewAssignments(compiler, iterationStatement);
 
                 auto blockInner = compiler->CreateBasicBlock("doWhileInner");
                 auto blockCondition = compiler->CreateBasicBlock("doWhileCondition");
@@ -3865,6 +3909,10 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 // (s.toString() != "x")`) here, in the condition block. The block-item flush runs
                 // in the post-loop block, where the dominance guard would drop them and leak.
                 compiler->FlushOwnedTemps();
+                const auto* constantCondition = llvm::dyn_cast<llvm::ConstantInt>(condition);
+                if ((constantCondition == nullptr || !constantCondition->isZero())
+                    && compiler->IsInsertBlockLive() && !compiler->IsCurrentBlockUnreachable())
+                    compiler->CheckOwnFlagLoopBackEdge();
                 compiler->CreateConditionJump(condition, blockInner, blockResume);
 
                 // resume
@@ -3880,6 +3928,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 auto expression = iterationStatement->expression();
                 auto innerStatement = iterationStatement->statement();
                 MarkLoopBackEdgeCxxConstPointers(compiler, iterationStatement);
+                NoteLoopBodyViewAssignments(compiler, iterationStatement);
 
                 auto blockCondition = compiler->CreateBasicBlock("whileCondition");
                 auto blockInner = compiler->CreateBasicBlock("whileInner");
@@ -3985,8 +4034,10 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         compiler->FlushOwnedTemps();
                     }
 
-                    OwnershipControlScope loopControlScope(compiler, LLVMBackend::OwnFlagLoopFrame);
+                    OwnershipControlScope loopControlScope(
+                        compiler, LLVMBackend::OwnFlagLoopFrame | LLVMBackend::OwnFlagLoopIncrementFrame);
                     MarkLoopBackEdgeCxxConstPointers(compiler, iterationStatement);
+                    NoteLoopBodyViewAssignments(compiler, iterationStatement);
 
                     compiler->CreateBlockBreak(blockCondition, false);
 
@@ -4031,6 +4082,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     // Flush HERE, not in the condition block: the increment block does not
                     // dominate the condition, so a temp registered here would never be freed.
                     compiler->FlushOwnedTemps();
+                    compiler->CheckOwnFlagLoopBackEdge();
 
                     compiler->CreateBlockBreak(blockCondition, false);
 
@@ -4057,6 +4109,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     auto collExprCtx = iterationStatement->expression();
                     auto bodyStmt    = iterationStatement->statement();
                     MarkLoopBackEdgeCxxConstPointers(compiler, iterationStatement);
+                    NoteLoopBodyViewAssignments(compiler, iterationStatement);
 
                     std::string varName = varNameTok->getText();
 

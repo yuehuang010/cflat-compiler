@@ -302,6 +302,9 @@ AppKit / Foundation / CoreFoundation / `libobjc` tbd stubs under `~/.cflat/macsd
 | `--cpp-strict-noexcept` | Refuse calls to C++ functions without a `noexcept` specification. Off by default: as with clang, such calls are allowed and an exception escaping into CFlat code terminates the program. |
 | `--cpp-std` | Set one C++ standard for every `import cpp` in this invocation: `c++17`, `c++20` (default), `c++23`, `c++26`, or the matching `gnu++` spelling. |
 
+C/C++ and core bitcode cache entries include the compiler build stamp by default. Set
+`CFLAT_CACHE_BUILD_STAMP=0` to let those entries survive a cflat rebuild.
+
 Cache design and troubleshooting: [`doc/CACHING.md`](CACHING.md).
 
 ## WinMD / COM

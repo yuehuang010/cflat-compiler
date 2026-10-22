@@ -1,0 +1,10 @@
+import cpp "cpp_interop_basic.h";
+
+extern int main()
+{
+    t307.T394CompoundTieDerived value = default;
+    expect_error("and 'int'") {
+        value += 1;
+    }
+    return 0;
+}

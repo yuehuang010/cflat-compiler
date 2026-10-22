@@ -7,6 +7,20 @@ int t373NativeAmb(function<long(long)> f) { return (int)f(1) + 20; }
 int t373NativeNone(function<int(int, int)> f) { return 1; }
 int t373NativeNone(function<double(double, double)> f) { return 2; }
 
+expect_error("ambiguous generic function 'id' for callback candidates 'int(int)' and 'long(long)'") {
+    int t386AddressAmbiguous() { return t373.freeAmb(&id); }
+}
+expect_error("without a function-pointer destination") {
+    int t386AddressVoid() { return t373.freeVoid(&id) != nullptr ? 1 : 0; }
+}
+expect_error("cannot deduce generic function 'g': template argument cannot be inferred from generic function name 'id'") {
+    U g<U>(U f) { return f; }
+    int t386GenericFunctionArgument() { return g(id); }
+}
+expect_error("generic function 'id' has no size") {
+    int t386SizeofGenericFunction() { return sizeof(id); }
+}
+
 expect_error("'id' is a function used as a value - did you mean 'id()'? (a bare function name is only valid as a function<T> value)") {
     int t380R2Compound() { int value = 1; value += id; return value; }
 }

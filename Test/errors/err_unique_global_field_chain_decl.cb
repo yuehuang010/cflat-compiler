@@ -2,9 +2,247 @@ import "unique.cb";
 struct PS { int v = 0; PS(int x) { v = x; } };
 struct U { unique PS* p = nullptr; };
 U gU = default;
+struct T382ChainLocal { U* b = default; };
+struct T382ChainHeap { U* b = default; };
+struct T382ChainOwned { U* b = default; };
+unique U* t382GlobalUnique = default;
+unique U* t382GlobalUniqueArrow = default;
+void t382OverwriteHeapB(T382ChainHeap* value) { value->b = &gU; }
 
 expect_error("cannot consume owning value 'gU.p' out of storage that outlives this function") {
     void badGlobalFieldChain() { unique PS* o = gU.p = new PS(18); }
+}
+
+expect_error("out of storage that outlives this function") {
+    void t382BadStaticDeclChain()
+    {
+        static U sU = default;
+        unique PS* o = sU.p = new PS(20);
+    }
+}
+
+expect_error("out of storage that outlives this function") {
+    void t382BadStaticStmtChain()
+    {
+        static U sU = default;
+        unique PS* o = nullptr;
+        o = sU.p = new PS(21);
+    }
+}
+
+expect_error("out of storage that outlives this function") {
+    void t382BadStaticTwoStatements()
+    {
+        static U sU = default;
+        unique PS* o = nullptr;
+        sU.p = new PS(22);
+        o = sU.p;
+    }
+}
+
+expect_error("out of storage that outlives this function") {
+    void t382BadGlobalPointerDeclChain()
+    {
+        U* pg = &gU;
+        unique PS* o = pg->p = new PS(23);
+    }
+}
+
+expect_error("out of storage that outlives this function") {
+    void t382BadGlobalPointerStmtChain()
+    {
+        U* pg = &gU;
+        unique PS* o = nullptr;
+        o = pg->p = new PS(24);
+    }
+}
+
+expect_error("out of storage that outlives this function") {
+    void t382BadGlobalPointerTwoStatements()
+    {
+        U* pg = &gU;
+        unique PS* o = nullptr;
+        pg->p = new PS(25);
+        o = pg->p;
+    }
+}
+
+expect_error("out of storage that outlives this function") {
+    struct T382StaticMethod
+    {
+        void take()
+        {
+            static U sU = default;
+            sU.p = new PS(26);
+            unique PS* o = nullptr;
+            o = sU.p;
+        }
+    };
+}
+
+expect_error("out of storage that outlives this function") {
+    int t382StaticGeneric<T>(T unused)
+    {
+        static U sU = default;
+        sU.p = new PS(27);
+        unique PS* o = sU.p;
+        return o == nullptr ? 0 : o->v;
+    }
+    int t382InstantiateStaticGeneric() { return t382StaticGeneric<int>(0); }
+}
+
+// The selected arm is gU; the alternate ternary arm is frame-local.
+expect_error("the pointer target is not proven local to this frame") {
+    void t382BadTernaryGlobalArm()
+    {
+        int c = 1;
+        U a = default;
+        gU.p = new PS(28);
+        U* q = c == 1 ? &gU : &a;
+        unique PS* o = nullptr;
+        o = q->p;
+    }
+}
+
+// The false arm selects gU with the global arm written second.
+expect_error("the pointer target is not proven local to this frame") {
+    void t382BadTernarySwappedArms()
+    {
+        int c = 0;
+        U a = default;
+        gU.p = new PS(29);
+        U* q = c == 1 ? &a : &gU;
+        unique PS* o = nullptr;
+        o = q->p;
+    }
+}
+
+// The postfix receiver is the ternary itself, not a named pointer local.
+expect_error("the pointer target is not proven local to this frame") {
+    void t382BadInlineTernary()
+    {
+        int c = 1;
+        U a = default;
+        gU.p = new PS(30);
+        unique PS* o = nullptr;
+        o = (c == 1 ? &gU : &a)->p;
+    }
+}
+
+// q is a local pointer slot, but its dereferenced target is the global object.
+expect_error("the pointer target is not proven local to this frame") {
+    void t382BadExplicitDerefGlobal()
+    {
+        gU.p = new PS(31);
+        U* q = &gU;
+        unique PS* o = nullptr;
+        o = (*q).p;
+    }
+}
+
+// q points to a block-static object that outlives this function.
+expect_error("the pointer target is not proven local to this frame") {
+    void t382BadExplicitDerefStatic()
+    {
+        static U sU = default;
+        sU.p = new PS(32);
+        U* q = &sU;
+        unique PS* o = nullptr;
+        o = (*q).p;
+    }
+}
+
+expect_error("the pointer target is not proven local to this frame") {
+    void t382BadTwoHopLocalToGlobal()
+    {
+        U local = default;
+        T382ChainLocal a = default;
+        a.b = &gU;
+        T382ChainLocal* pa = &a;
+        unique PS* o = nullptr;
+        o = pa->b->p;
+    }
+}
+
+expect_error("the pointer target is not proven local to this frame") {
+    void t382BadTwoHopHeapToGlobal()
+    {
+        T382ChainHeap* pa = new T382ChainHeap();
+        pa->b = &gU;
+        unique PS* o = nullptr;
+        o = pa->b->p;
+    }
+}
+
+expect_error("the pointer target is not proven local to this frame") {
+    void t382BadTwoHopOwnedToGlobal()
+    {
+        unique T382ChainOwned* pa = new T382ChainOwned();
+        pa->b = &gU;
+        unique PS* o = nullptr;
+        o = pa->b->p;
+    }
+}
+
+expect_error("out of storage that outlives this function") {
+    void t382BadGlobalUniqueExplicitDeref()
+    {
+        t382GlobalUnique = new U();
+        t382GlobalUnique->p = new PS(53);
+        unique PS* o = nullptr;
+        o = (*t382GlobalUnique).p;
+    }
+}
+
+expect_error("'t382GlobalUniqueArrow.p'") {
+    void t382BadGlobalUniqueArrowName()
+    {
+        t382GlobalUniqueArrow = new U();
+        t382GlobalUniqueArrow->p = new PS(59);
+        unique PS* o = nullptr;
+        o = t382GlobalUniqueArrow->p;
+    }
+}
+
+expect_error("the pointer target is not proven local to this frame") {
+    void t382BadHeapAliasFieldKill()
+    {
+        U local = default;
+        local.p = new PS(60);
+        gU.p = new PS(61);
+        T382ChainHeap* pa = new T382ChainHeap();
+        T382ChainHeap* pb = pa;
+        pa->b = &local;
+        pb->b = &gU;
+        unique PS* o = nullptr;
+        o = pa->b->p;
+    }
+}
+
+expect_error("the pointer target is not proven local to this frame") {
+    void t382BadHeapCallFieldKill()
+    {
+        U local = default;
+        local.p = new PS(62);
+        gU.p = new PS(63);
+        T382ChainHeap* pa = new T382ChainHeap();
+        pa->b = &local;
+        t382OverwriteHeapB(pa);
+        unique PS* o = nullptr;
+        o = pa->b->p;
+    }
+}
+
+expect_error("the pointer target is not proven local to this frame") {
+    void t382BadHeapContainerToLocal()
+    {
+        U local = default;
+        local.p = new PS(64);
+        T382ChainHeap* pa = new T382ChainHeap();
+        pa->b = &local;
+        unique PS* o = nullptr;
+        o = pa->b->p;
+    }
 }
 
 extern int main() { return 0; }

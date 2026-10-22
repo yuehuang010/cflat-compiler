@@ -49,3 +49,30 @@ inline int RunUsable() {
     return value * 100 + deleteTag;
 }
 }
+
+
+namespace cppvdtemplate {
+template<class T> struct Fine {
+    virtual ~Fine() {}
+    static void operator delete(void* p) { deleteTag = 7; ::operator delete(p); }
+    int value() const { return 41; }
+};
+}
+
+namespace r3 {
+template<class T> struct Holder { T value; };
+template<class T> int Build() { T value; return value.value(); }
+template<class T> T MakeVal() { return T(); }
+template<class T> int RunFineDelete() {
+    cppvdtemplate::deleteTag = 0;
+    auto* value = new cppvdtemplate::Fine<T>();
+    int result = value->value() * 100;
+    delete value;
+    return result + cppvdtemplate::deleteTag;
+}
+}
+
+namespace r3 {
+// Uses the by-value result inside C++ only, so no CFlat local of T exists.
+template<class T> int UseVal() { return MakeVal<T>().value(); }
+}

@@ -1225,6 +1225,7 @@ namespace
         {
             unsigned parsed = 0;
             poisonDiagnostic.clear();
+            vtableDeleteDiagnostic.clear();
             poisonedDecl = nullptr;
             // Bodies this walk reaches before failing: forgotten, so a later walk through
             // them (another wrapper into the same inheriting constructor) fails again.
@@ -1239,6 +1240,14 @@ namespace
                 ~ScopeReset() { if (active) sema.TUScope = nullptr; }
             } scopeReset{*sema, lendScope};
             clang::ASTContext& ctx = sema->getASTContext();
+            auto checkVTableDelete = [&](const clang::CXXRecordDecl* record) {
+                if (record == nullptr || !record->hasDefinition()
+                    || !record->getDefinition()->isDynamicClass())
+                    return;
+                const std::string text = ResolveVTableDelete(record, true);
+                if (!text.empty() && vtableDeleteDiagnostic.empty())
+                    vtableDeleteDiagnostic = text;
+            };
             auto addRecord = [&](const clang::CXXRecordDecl* record, bool forVTable) {
                 if (record == nullptr || !record->hasDefinition()) return;
                 record = record->getDefinition();
@@ -1337,7 +1346,10 @@ namespace
                         if (clang::VarDecl* def = var->getDefinition(); def != nullptr && plan != nullptr)
                             plan->Add(def);
                     for (const clang::CXXRecordDecl* record : walk.constructed)
+                    {
+                        checkVTableDelete(record);
                         addRecord(record, true);
+                    }
                 }
                 if (const auto* ctor = llvm::dyn_cast<clang::CXXConstructorDecl>(target))
                 {
@@ -1359,13 +1371,22 @@ namespace
                     {
                         const clang::CXXRecordDecl* record = ctor->getParent();
                         for (const clang::CXXBaseSpecifier& base : record->bases())
-                            addRecord(base.getType()->getAsCXXRecordDecl(), false);
+                        {
+                            const clang::CXXRecordDecl* baseRecord =
+                                base.getType()->getAsCXXRecordDecl();
+                            checkVTableDelete(baseRecord);
+                            addRecord(baseRecord, false);
+                        }
                         // Variant members are never destroyed implicitly: a union (named or
                         // anonymous) does not odr-use its members' destructors.
                         if (!record->isUnion())
                             for (const clang::FieldDecl* field : record->fields())
-                                addRecord(ctx.getBaseElementType(field->getType())->getAsCXXRecordDecl(),
-                                          false);
+                            {
+                                const clang::CXXRecordDecl* fieldRecord = ctx.getBaseElementType(
+                                    field->getType())->getAsCXXRecordDecl();
+                                checkVTableDelete(fieldRecord);
+                                addRecord(fieldRecord, false);
+                            }
                     }
                 }
                 if (const auto* dtor = llvm::dyn_cast<clang::CXXDestructorDecl>(target))
@@ -3170,9 +3191,11 @@ bool CxxIncrementalGroup::EmitDemandCompanion(const std::vector<std::string>& de
     };
     impl_->plan.materializeReachable = [&](std::vector<const clang::FunctionDecl*> roots,
                                            std::string& bodyFailure,
-                                           std::string& bodyDiagnostic) {
+                                           std::string& bodyDiagnostic,
+                                           std::string& vtableDiagnostic) {
         parsed += lazy.MaterializeReachable(std::move(roots), failure);
         bodyFailure = failure;
+        vtableDiagnostic = std::move(lazy.vtableDeleteDiagnostic);
         if (!failure.empty())
             bodyDiagnostic = diagnostics.consumer.firstErrorLocation.empty()
                 ? diagnostics.consumer.firstError : diagnostics.consumer.firstErrorLocation;

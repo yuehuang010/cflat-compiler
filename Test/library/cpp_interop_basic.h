@@ -3361,6 +3361,117 @@ struct OwnLtBase {};
 struct OwnLtMid : OwnLtBase {};
 struct OwnLt : OwnLtMid { bool operator<(int) { return true; } };
 inline bool operator<(OwnLtMid&, int) { return false; }
+struct T394ConstRankBase { int operator+(int) { return 1; } };
+struct T394ConstRankMid : T394ConstRankBase {};
+struct T394ConstRankDerived : T394ConstRankMid {};
+inline int operator+(const T394ConstRankMid&, int) { return 2; }
+struct T394PrvalueBase { int operator+(int) { return 1; } };
+struct T394PrvalueMid : T394PrvalueBase {};
+struct T394PrvalueDerived : T394PrvalueMid {};
+inline int operator+(const T394PrvalueMid&, int) { return 2; }
+inline T394PrvalueDerived T394MakePrvalue() { return T394PrvalueDerived(); }
+struct T394EqBase { bool operator==(int) const { return true; } };
+struct T394EqMid : T394EqBase {};
+struct T394EqDerived : T394EqMid {};
+inline bool operator==(const T394EqMid&, int) { return false; }
+struct T394OrderBase
+{
+    std::strong_ordering operator<=>(int) const { return std::strong_ordering::less; }
+};
+struct T394OrderMid : T394OrderBase {};
+struct T394OrderDerived : T394OrderMid {};
+inline std::strong_ordering operator<=>(const T394OrderMid&, int)
+{
+    return std::strong_ordering::greater;
+}
+struct T394TieOrderBase
+{
+    std::strong_ordering operator<=>(int) const { return std::strong_ordering::less; }
+};
+struct T394TieOrderMid : T394TieOrderBase {};
+struct T394TieOrderDerived : T394TieOrderMid {};
+inline std::strong_ordering operator<=>(const T394TieOrderBase&, int)
+{
+    return std::strong_ordering::greater;
+}
+inline int* T394CompoundTagPtr() { static int tag = 0; return &tag; }
+struct T394CompoundBase
+{
+    int operator+=(int) { *T394CompoundTagPtr() = 1; return 1; }
+};
+struct T394CompoundMid : T394CompoundBase {};
+struct T394CompoundDerived : T394CompoundMid {};
+inline int operator+=(T394CompoundMid&, int)
+{
+    *T394CompoundTagPtr() = 2;
+    return 2;
+}
+struct T394CompoundMinusBase
+{
+    int operator-=(int) { *T394CompoundTagPtr() = 10; return 10; }
+};
+struct T394CompoundMinusMid : T394CompoundMinusBase {};
+struct T394CompoundMinusDerived : T394CompoundMinusMid {};
+inline int operator-=(T394CompoundMinusMid&, int)
+{
+    *T394CompoundTagPtr() = 11;
+    return 11;
+}
+struct T394CompoundShiftBase
+{
+    int operator<<=(int) { *T394CompoundTagPtr() = 20; return 20; }
+};
+struct T394CompoundShiftMid : T394CompoundShiftBase {};
+struct T394CompoundShiftDerived : T394CompoundShiftMid {};
+inline int operator<<=(T394CompoundShiftMid&, int)
+{
+    *T394CompoundTagPtr() = 21;
+    return 21;
+}
+struct T394CompoundLiteralBase
+{
+    int operator+=(int) { *T394CompoundTagPtr() = 31; return 31; }
+};
+struct T394CompoundLiteralMid : T394CompoundLiteralBase {};
+struct T394CompoundLiteralDerived : T394CompoundLiteralMid {};
+inline int operator+=(T394CompoundLiteralMid&, int)
+{
+    *T394CompoundTagPtr() = 32;
+    return 32;
+}
+inline int operator+=(T394CompoundLiteralMid&, signed char)
+{
+    *T394CompoundTagPtr() = 33;
+    return 33;
+}
+struct T394CompoundFriend
+{
+    friend int operator+=(T394CompoundFriend&, int)
+    {
+        *T394CompoundTagPtr() = 42;
+        return 42;
+    }
+    friend int operator+=(T394CompoundFriend&, signed char)
+    {
+        *T394CompoundTagPtr() = 43;
+        return 43;
+    }
+};
+struct T394CompoundTieBase
+{
+    int operator+=(int) { *T394CompoundTagPtr() = 1; return 1; }
+};
+struct T394CompoundTieMid : T394CompoundTieBase {};
+struct T394CompoundTieDerived : T394CompoundTieMid {};
+inline int operator+=(T394CompoundTieBase&, int)
+{
+    *T394CompoundTagPtr() = 2;
+    return 2;
+}
+struct T394PrivateBase {};
+struct T394PrivateOpBase { int operator+(int) { return 1; } };
+struct T394PrivateDerived : T394PrivateOpBase, private T394PrivateBase {};
+inline int operator+(T394PrivateBase&, int) { return 2; }
 }
 
 // T321: a derived PRVALUE against a base free operator. `RC&&` binds the base by derived-to-base

@@ -133,15 +133,65 @@ inline CFlatParser::PostfixExpressionContext* SolePostfixExpressionShape(
     return nullptr;
 }
 
-inline antlr4::tree::TerminalNode* BareGenericFunctionValueIdentifier(
-    CFlatParser::AssignmentExpressionContext* assign)
+inline antlr4::tree::TerminalNode* GenericFunctionValueIdentifier(
+    antlr4::tree::ParseTree* expression, bool allowAddressOf = true)
 {
-    auto* postfix = SolePostfixExpressionShape(UnwrapInitializerParens(assign));
-    if (postfix == nullptr || postfix->children.size() != 1) return nullptr;
-    auto* primary = postfix->primaryExpression();
-    auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
-    if (generic == nullptr || generic->genericTypeParameters() != nullptr) return nullptr;
-    return generic->Identifier();
+    if (auto* identifier = dynamic_cast<antlr4::tree::TerminalNode*>(expression))
+    {
+        auto* node = identifier->parent;
+        while (node != nullptr
+            && dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node) == nullptr)
+            node = node->parent;
+        return node != nullptr && GenericFunctionValueIdentifier(node, allowAddressOf) == identifier
+            ? identifier : nullptr;
+    }
+
+    auto bareIdentifier = [](antlr4::tree::ParseTree* node)
+        -> antlr4::tree::TerminalNode* {
+        auto* postfix = SolePostfixExpressionShape(node);
+        if (postfix == nullptr || postfix->children.size() != 1) return nullptr;
+        auto* primary = postfix->primaryExpression();
+        auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+        return generic != nullptr && generic->genericTypeParameters() == nullptr
+            ? generic->Identifier() : nullptr;
+    };
+    if (auto* identifier = bareIdentifier(expression))
+        return identifier;
+
+    auto* node = expression;
+    while (node != nullptr)
+    {
+        if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
+            cast != nullptr && cast->castTypeName() != nullptr && cast->castExpression() != nullptr
+            && cast->castTypeName()->typeSpecifier().empty()
+            && cast->castTypeName()->typeQualifier() == nullptr
+            && cast->castTypeName()->abstractDeclarator() == nullptr)
+        {
+            node = cast->castExpression();
+            continue;
+        }
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+            primary != nullptr && primary->expression() != nullptr && primary->children.size() == 3)
+        {
+            node = primary->expression();
+            continue;
+        }
+        auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+        if (rule != nullptr && rule->children.size() == 1)
+        {
+            node = rule->children[0];
+            continue;
+        }
+        break;
+    }
+
+    if (auto* identifier = bareIdentifier(node))
+        return identifier;
+    auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
+    if (!allowAddressOf || unary == nullptr || unary->unaryOperator() == nullptr
+        || unary->unaryOperator()->And() == nullptr || unary->castExpression() == nullptr)
+        return nullptr;
+    return GenericFunctionValueIdentifier(unary->castExpression(), false);
 }
 
 // Every '(' suffix and parenthesized primary under `node`: a single-call initializer has exactly one.
@@ -8315,6 +8365,8 @@ public:
     // Return-position consume/copy of an owning value read out of another object's storage.
     bool ReturnSourceIsIndirectOwningLvalue(const LLVMBackend::NamedVariable& nv, llvm::Value* value);
     bool FieldPathRootIsFrameLocal(llvm::Value* storage);
+    bool CoreUniqueOwnerPathIsFrameLocal(
+        LLVMBackend* compiler, const LLVMBackend::NamedVariable& owner);
 
     // Stamp owned-string ownership onto an expression result and restore the
     // "last call returns owned" flag for downstream consumers. `savedOwned` is the
@@ -8552,6 +8604,8 @@ public:
     bool PointerArithmeticRootLeaks(llvm::Value* value, LLVMBackend* compiler);
     // Classifies the storage root of a pointer value (GEPs and casts stripped, aliases followed).
     PointerValueRootKind PointerRootKind(llvm::Value* value, LLVMBackend* compiler);
+    bool PointerRootKindEveryArmLocal(llvm::Value* value, LLVMBackend* compiler,
+                                      bool frameLocalContainer = false);
 
     // One arm of an interface-bound join: the incoming value and the predecessor block whose
     // terminator the arm's box is emitted before.
@@ -10004,7 +10058,7 @@ public:
     static bool BorrowOriginIsMethodReceiver(LLVMBackend* compiler, const std::string& origin);
     bool RejectConsumeOfBorrowedByValueParamField(
         LLVMBackend* compiler, const LLVMBackend::NamedVariable& srcNV,
-        antlr4::ParserRuleContext* ctx);
+        antlr4::ParserRuleContext* ctx, bool constantUniqueArrayFieldElement = false);
 
     /*
      * q11 ruling point 2: reject an IMPLICIT consuming store whose source is storage that
@@ -10277,6 +10331,8 @@ public:
 
     bool IsDefaultOnlyExpression(antlr4::ParserRuleContext* ctx,
                                  bool allowParentheses = true) const;
+    bool IsSameTypeCastOfDefault(antlr4::ParserRuleContext* ctx,
+                                 const std::string& typeName);
     bool HasDefaultOnlyTernaryArm(antlr4::ParserRuleContext* ctx) const;
     // T142: types and owns a `default` call argument for the parameter it binds.
     void MaterializeDefaultArgument(antlr4::ParserRuleContext* ctx, LLVMBackend::NamedVariable& argNV,
