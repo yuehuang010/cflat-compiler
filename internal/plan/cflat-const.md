@@ -38,7 +38,7 @@ TRAILING CONST RULED 2026-10-19 (R3 -> C), PHASE 8 LANDED 2026-10-19 (87b36b2f1;
 leftovers p3 trailing-const-leftovers-after-c08, p3 duplicate-function-definition-accepted): C++ spelling `int get() const`; explicit const asserts
 (#9), inference stays for unmarked methods, interface methods must spell const (#10). RULED 2026-10-19: function types carry pointee const, exact-match identity (LANDED c14 same day); string data() -> (const char)*, data_mut()
 copies a borrowed string first (rulings in the two p3 issue files). Phase 5 (C++) hold LIFTED 2026-10-20 (maintainer: "it should map
-better"). PHASE 5a LANDED 2026-10-20 (f2e0bb2ea): IsCxxPointeeConst / IsCxxConstRef / IsSpelledPointeeConst / IsCxxConstField folded into
+better"). PHASE 5a LANDED 2026-10-20 (104f84360): IsCxxPointeeConst / IsCxxConstRef / IsSpelledPointeeConst / IsCxxConstField folded into
 ConstMask (CxxRefLevel keeps the reference level), C++ ranking reads native pointee const; interim bits CxxConstChecked /
 NativeConstHidden and the MarkCxxConstFieldAccess slot metadata remain for 5b (boundary refusals) to remove.
 PHASE 5b LANDED 2026-10-20 (C05B): interim bits, constfield/constref metadata and the C++ const global side set removed - ConstMask

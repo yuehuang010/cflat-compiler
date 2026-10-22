@@ -1,5 +1,7 @@
 # p4: global array-VIEW initializer from literals (ruling needed)
 
+**RULED 2026-10-21:** Ratified: infer a hidden backing array for a file-scope view initializer. Buildable. See fix-issue-lessons.md digest.
+
 Moved from p3 2026-08-23. The fixed-size `string[2] g = { ... }` form already works; this is the
 convenience of omitting the count on a global view, plus globals of ctor-needing element types.
 

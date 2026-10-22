@@ -1,5 +1,7 @@
 # A global spelled `= default` / `= { }` zeroes SILENTLY when its construction does not fold
 
+**RULED 2026-10-21:** REFUSE a global whose default construction cannot be computed at compile time (Rust-like, all spellings: `T g;` / `= default` / `= {}`); no zero-fill. About 20 in-tree sites to fix first. See fix-issue-lessons.md digest.
+
 Bucket: full mode (needs a ruling on diagnostic volume before it can land). Filed 2026-09-05 as a
 side finding of fix/string-field-default.
 

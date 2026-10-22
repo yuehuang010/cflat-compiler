@@ -1,5 +1,7 @@
 # p4: owning `string?` (ruling needed)
 
+**RULED 2026-10-21:** The maintainer wants the nullable `T?` feature finished as a planned feature tied into the safety checks (do NOT remove `T?`); a plan is being drafted at internal/plan/nullable-types.md. Today T? == T* except default-null on no initializer (~37 test lines, 16 compiler sites). See fix-issue-lessons.md digest.
+
 Moved from p3 2026-08-23. Not a bug: `T?` is a nullable pointer by definition; `string?` holding
 text is a convenience the type system does not offer yet.
 

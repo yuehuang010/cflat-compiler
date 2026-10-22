@@ -1,5 +1,7 @@
 # Remaining statement-temp join cases (p1)
 
+**RULED 2026-10-21:** Refuse void*/unrelated pointer joins in EVERY context (call, decl, assign, return); explicit cast required, matches clang. See fix-issue-lessons.md digest.
+
 T241/T242/T245 closed the direct, join-arm, later-defined void / non-void and C++ declared callee shapes.
 T251 fixed the two field-pointer use-after-free cases: unwind cleanup now carries the deferred release
 gate, and the pre-call walk follows a field GEP through `??` / `?:` arms.

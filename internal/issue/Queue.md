@@ -230,10 +230,10 @@ The A-H sections above stay the per-issue record; schedule from this table.
 | 3 | NULLCTOR | M/H | p2/cpp-null-constant-ambiguous-ctor-accepted, p3/cpp-nonliteral-zero-to-integral-ctor-refused, p3/cpp-brace-init-null-constant-pointer-ctor-refused, p3/cpp-null-macro-and-nullptr-spellings-refused | C++ ctor null-constant selection: scalar-reference mirror (CInterop ~15375), SelectCxxConstructorListed (~26846), RequestCxxBraceConstructor | NULLPTR-T, CTOR-VIABILITY, PTRRANK, CTOR-BRACE, CONSTMACRO | no |
 | 4 | NSLOOKUP | M/M | p3/cpp-anonymous-typedef-struct-in-namespace-not-found, p3/cpp-struct-identity-underscore-namespace, p3/cpp-namespace-conflict-check-leftovers | CheckCxxNamespaceConflicts + struct identity canonicalization (CInterop) | - | yes, careful on identity |
 | 5 | OPUNARY | M/M | p3/cpp-unary-operator-leftovers-after-d7, p3/unary-deref-leftovers-after-t47, p3/cpp-member-call-on-deref-of-xvalue-refused | unary `*` in ParseUnaryExpression (MainListener_PostfixExpression.cpp) | D2/D3 operator dispatch, CONVOP | yes |
-| 6 | MOVEPARAM | M/H | p2/byvalue-param-owning-leftovers-after-b13, hold/unique-field-heap-array-through-move-param, p3/lowered-struct-byvalue-pass-no-moved-diagnostic | move / by-value owning param at the callee boundary (u) | NEWTEMP, BORROW-PROV | no (Opus reviewer) |
+| 6 | MOVEPARAM | M/H | p2/byvalue-param-owning-leftovers-after-b13, p2/unique-field-heap-array-through-move-param, p3/lowered-struct-byvalue-pass-no-moved-diagnostic | move / by-value owning param at the callee boundary (u) | NEWTEMP, BORROW-PROV | no (Opus reviewer) |
 | 8 | PTRRANK | M/H | p3/cpp-pointer-argument-prefers-char-pointer-over-converting-ctor, p3/cpp-single-level-pointer-unproven-at-call-argument, p3/cpp-operator-address-of-operand-not-converted, p3/cpp-pointer-depth-and-array-pointer-param-gaps | CompareUpconvert (Overloads), IsProvenPrimitiveSinglePointerArg (CInterop), TryBinaryOperatorOverload (supersedes old B3 row) | T89 in flight (same predicate) - after it lands | no |
 | 9 | FIELDCTOR | M/M | p3/cpp-class-field-default-construction-leftovers-after-v20, p3/cpp-field-given-in-brace-init-also-default-constructed | field initializer lowering, MainListener_Aggregates.cpp (u) | - | yes |
-| 10 | CLIBNAME | M/M | p2/o2-builtin-folding-overrides-cflat-definitions (item 1), p3/core-defines-externally-visible-libc-functions | core defines libc names that LLVM folds as builtins | RULING first (nobuiltin on CFlat bodies) | after ruling |
+| 10 | CLIBNAME | M/M | p2/o2-builtin-folding-overrides-cflat-definitions (item 1), p3/core-defines-externally-visible-libc-functions | core defines libc names that LLVM folds as builtins | RULING first (nobuiltin on CFlat bodies) | after ruling RULED 2026-10-21: nobuiltin on CFlat bodies (see lessons digest). |
 | 14 | CONVOP | M/H | p3/cpp-conversion-operator-copy-init-gaps, p3/cpp-conversion-operator-receiver-leftovers, p3/cpp-class-xvalue-pointer-conversion-not-invoked | C++ conversion-operator call path (u) | D2/D3, OPUNARY | no |
 | 15 | ASSIGN | M/H | p3/cpp-assign-operator-route-leftovers, p3/cpp-assignment-result-leftovers-after-b9, p3/cpp-nested-member-class-free-return-and-call-result-assign | C++ assignment route + class-result receivers (u) | T92 in flight (operator=(T)) | no |
 | 16 | REFPARAM | M/H | p3/cpp-reference-param-conversion-gaps-after-t42, p3/cpp-named-scalar-lvalue-to-rvalue-ref-param-refused, p3/cpp-reference-member-leftovers-after-t47 | conversions into C++ reference params (u) | REFBIND pair, CTOR-VIABILITY | no |
@@ -260,9 +260,9 @@ A3's "after A1" condition is met (A1 landed 2026-09-29).
 
 | Issue | Question |
 |-------|----------|
-| p3/immovable-cflat-struct-factory-return | Fresh by-value return of an [immovable] CFlat struct with guaranteed in-place construction (C++17-like)? T90 refuses every by-value return; C++ immovable classes accept fresh operands |
-| p3/cflat-unique-dot-dispatches-to-pointee-member | `.` on CFlat unique<T>: prefer unique's own members (like C++ smart pointers after T46) or keep forwarding? |
-| p4/string-functional-construction-spelling | p4: spelling ruling needed |
+| p3/immovable-cflat-struct-factory-return | Fresh by-value return of an [immovable] CFlat struct with guaranteed in-place construction (C++17-like)? T90 refuses every by-value return; C++ immovable classes accept fresh operands RULED 2026-10-21 (see lessons digest). |
+| p3/cflat-unique-dot-dispatches-to-pointee-member | `.` on CFlat unique<T>: prefer unique's own members (like C++ smart pointers after T46) or keep forwarding? RULED 2026-10-21 (see lessons digest). |
+| p4/string-functional-construction-spelling | p4: RULED 2026-10-21 - string(ptr) and string(ptr, len) borrow (see lessons digest) |
 
 ## Conflict map (never concurrent)
 

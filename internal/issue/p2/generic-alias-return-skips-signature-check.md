@@ -1,11 +1,13 @@
 # Generic `alias T` return of a closure skips the return-type check (run-time crash)
 
+**RULED 2026-10-21:** Option C: `alias` is T&; an alias closure param is a true reference (no by-value ABI copy), so `alias T pass<T>(alias T src) { return src; }` is legal and correct; Lambda<> in list<T> (list.get) must keep working. Plan-sized (ABI). Left hold/. See fix-issue-lessons.md digest.
+
 Found by the T279 review (round 3, 2026-10-15). Pre-existing on master.
 
 ## Repro
 ```cflat
 alias T pass<T>(alias T src) { return src; }
-// main: int k = 4; Lambda<int(int)> n = [k](int x) { return x + k; };
+// main: int k = 4; Lambda<int(int)> n = (int x) => { return x + k; };
 //       Lambda<int(int)> w = pass<Lambda<int(int)>>(n); return w(7);
 ```
 Compiles rc 0, crashes at run time (139 as a binary, 138 under --run), master and after T279. Same for r22 (an explicit

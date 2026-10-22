@@ -1,5 +1,7 @@
 # p4: raw string literal prefix (ruling needed)
 
+**RULED 2026-10-21:** Ratified: Rust-style fully raw `r"..."` and `r#"..."#` - no interpolation and no escapes. Buildable. See fix-issue-lessons.md digest.
+
 Moved from p3 2026-08-23 (was `papercuts-from-the-mempress-port`). Not a bug: every string
 literal is interpolated by design; this is the opt-out convenience.
 

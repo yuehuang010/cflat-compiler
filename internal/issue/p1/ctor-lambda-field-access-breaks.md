@@ -1,5 +1,7 @@
 # A lambda inside a constructor cannot reach the struct's fields
 
+**RULED 2026-10-21:** Common shape: FIX it (stays p1); a refusal is not enough. See fix-issue-lessons.md digest.
+
 Summary: inside a native constructor body, a lambda that writes a field fails:
 - `this.id = i;` in the lambda -> "Module verification failed: Referring to an instruction in another function!"
   (the capture reuses the ctor's `this` value directly instead of capturing it). Release exe; would assert on Debug.

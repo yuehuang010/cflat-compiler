@@ -1,5 +1,7 @@
 # [immovable] CFlat struct: no factory-function return
 
+**RULED 2026-10-21:** Allow by-value return of fresh operands (brace-init, default, same-type call, ternary of those) of an [immovable] CFlat struct, built in the caller's sret slot; named locals stay refused. See fix-issue-lessons.md digest.
+
 Summary: T90 (2026-10-10) refuses every by-value return of an [immovable] CFlat struct, including a
 fresh `return { x = 1 };` / `return default;`. C++ [immovable] classes are accepted for fresh operands
 (C++17 guaranteed elision into the sret slot). CFlat structs have no guaranteed-elision contract yet,

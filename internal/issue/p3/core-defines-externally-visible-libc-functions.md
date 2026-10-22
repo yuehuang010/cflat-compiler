@@ -1,5 +1,7 @@
 # Core defines externally visible C library functions (printf, puts, scanf, ...)
 
+**RULED 2026-10-21:** mark CFlat definitions of libc names `nobuiltin` (LLVM calls the CFlat body); users may still override libc names. See fix-issue-lessons.md digest.
+
 Ruling 2026-09-30 (maintainer): core must not define externally visible functions; a USER program may
 define a C library name (C linkage) and it must win (see p2/o2-builtin-folding item 1).
 

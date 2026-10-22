@@ -1,5 +1,7 @@
 # Alias return of a by-value param: leftovers after B21 and V2
 
+**RULED 2026-10-21:** Refuse `alias string[]`, `alias string?`, and alias of a using-alias of string - resolved on the type, not the spelling; generic alias T stays legal. See fix-issue-lessons.md digest.
+
 Summary: B21 (2026-09-29) fixed `U f(U w) { return w; }` (an inferred 'alias' return of a by-value param) handing back the callee's own dead copy: such params are passed as a pointer to a caller-owned copy slot, a temporary argument transfers to the result, named arguments stay non-owning aliases. W12 (2026-09-30) fixed the mixed named+temp argument case (the temp is destroyed exactly once per call via a run-time drop flag, the declared local stays an alias borrow, nested calls keep the inner temp alive, alias-return-with-temp results into an owning param / list.add are refused) and the function-value refusal location/wording. Probes: scratch/repro_keep/b21/ and scratch/repro_keep/w12/ (rev11 = hdr.cb + run_r3.sh; p/ + h/ = review probes with a corrected counting header - the rev11 hdr.cb counters miscount moved-from shells, use h/hdr.cb).
 
 RULING 2026-09-30 (maintainer): no type-level ABI marker and no address-taken fallback; alias-return functions stay refused as function values (message/location fixed in W12).

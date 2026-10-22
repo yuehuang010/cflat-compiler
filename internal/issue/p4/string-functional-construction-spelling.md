@@ -1,5 +1,7 @@
 # No functional-construction spelling for the builtin `string`
 
+**RULED 2026-10-21:** allow `string(ptr)` and `string(ptr, len)` as non-allocating borrows (same as the cast). Ratified, buildable. See fix-issue-lessons.md digest.
+
 `string` is a hard keyword, so it cannot appear in expression position. `string_view` is an
 ordinary struct and constructs the way the docs show; `string` has no counterpart.
 

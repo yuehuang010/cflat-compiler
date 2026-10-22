@@ -1,5 +1,7 @@
 # p2: interface implementors that disagree on consuming a by-value string param double-free through the vtable (NEEDS RULING)
 
+**RULED 2026-10-21:** The interface signature fixes ownership; an implementation consuming a non-`move` param is refused. Buildable (left hold/). See fix-issue-lessons.md digest.
+
 Pre-existing on master; found by the T378 review (2026-10-21). Repros: scratch/repro_keep/box1021/t378_rev/iface_dis_move_temp.cb,
 iface_dis_mixed_temp.cb. Silent without ASan (bad=0), ASan double free with it, on master and after T378.
 

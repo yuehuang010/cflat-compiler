@@ -1,5 +1,7 @@
 # Owning call-result temp behind a raw pointer local leaks (T205 pointer path)
 
+**RULED 2026-10-21:** Refuse a raw pointer local bound into an owning call-result temporary's field; the diagnostic steers to `alias` (which extends the temp). See fix-issue-lessons.md digest.
+
 Summary: T256 (2026-10-15) fixed `alias` declarations: `alias int x = mk()->v;`, `alias int x = *mk()->heap;`,
 `alias int x = idA(mk()->v);`, `alias int* p = mk()->heap;` and ternary arms now extend the owning receiver temp
 to the alias's scope end (one destructor per iteration); a by-value argument (`alias int x = byval(mk()->v);`)

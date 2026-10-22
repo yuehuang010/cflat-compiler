@@ -1,5 +1,7 @@
 # `move f` into a by-value C++ ctor parameter does not null `f`; misleading ctor-failure prefix
 
+**RULED 2026-10-21:** explicit `move f` of a function<> value nulls the source at every sink, like every other value type; fix once for all sinks. See fix-issue-lessons.md digest.
+
 Found 2026-10-14 by the T248 review (repros scratch/repro_keep/t248_rev/cases/, header h.hpp). Ruled a BUG 2026-10-15:
 the explicit-move-nulls-source ruling already covers it.
 

@@ -1,6 +1,6 @@
 # Const C pointer-depth global gap
 
-Severity p3 (pre-existing; master behaves the same). T346 (9fb804fd7) closed the static C++ member, indirect-call const& result,
+Severity p3 (pre-existing; master behaves the same). T346 (104f84360) closed the static C++ member, indirect-call const& result,
 construct_at-into-const and const static holder items of this file's predecessor.
 
 1. c_depth_write.cb: C header `extern int* const* q;` - `auto x = q; *x = &n;` is accepted on master

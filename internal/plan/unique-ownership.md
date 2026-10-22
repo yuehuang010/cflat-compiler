@@ -296,7 +296,7 @@ move source resolved from the parse tree in scope order, not the live symbol tab
 diagnostic takes the name from the move expression. `2aa0c07` provenance: one
 HasRawNewArrayProvenance gate for return / field store / argument boundary, args carry array
 provenance; the `move T*`-parameter-into-unique-field leg stays OPEN (needs a per-parameter
-"stored into unique field" fact) - internal/issue/hold/unique-field-heap-array-through-move-param.md.
+"stored into unique field" fact) - internal/issue/p2/unique-field-heap-array-through-move-param.md.
 Clean per review: reset() interface arm makes no second owner; fat-vs-fat interface compare is
 identity; multi-declarator reset; new-array discrimination structural; UFCS copy unaffected.
 `7109771` diagnostics: StructSynthCopyUnsafe dead arm and the discarded _v/_p path dropped; DisplayNameOfMangledType takes the core-unique arm only for arity-1 outer templates (Pair__unique__Node__i32 now returns raw, not writable); range-for over unique<T> elements and alias/array unique<T> fields no longer print unique__X or ._p. Round 3 review scoped to 5b167a4..HEAD follows.
@@ -335,7 +335,7 @@ spelling runs; only Test/test_move.cb ~9367 pins the raw reading. Needs a ruling
 return types too, or document the raw-pointer reading. (4) Highest merge risk: unique<T>'s
 destructor does scalar delete, so any unpinned path from `new T[n]` to a unique<T> value is a
 silent wrong-deallocator, not a diagnostic; the `move T*`-parameter leg is still open
-(internal/issue/hold/unique-field-heap-array-through-move-param.md). Do not merge before the
+(internal/issue/p2/unique-field-heap-array-through-move-param.md). Do not merge before the
 structural decision.
 MAINTAINER RULINGS (2026-09-02): (2) filed, not a merge blocker -
 internal/issue/p2/unique-builtin-remnant-decision-is-parse-tree-lookahead.md. (3) fixed: return

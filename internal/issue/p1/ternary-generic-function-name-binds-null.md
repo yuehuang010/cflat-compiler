@@ -1,6 +1,6 @@
 # p2: a `?:` arm naming a GENERIC function binds a null function value silently
 
-Found by the T373 review (2026-10-21). Reproduces on master after T375 (b0047db06).
+Found by the T373 review (2026-10-21). Reproduces on master after T375 (6f09ee372).
 
 ## Repro (scratch/repro_keep/box1021/t373_rev/v09_ternary.cb)
 ```cflat

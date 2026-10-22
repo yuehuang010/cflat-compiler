@@ -1,5 +1,7 @@
 Bucket: p3 (usable-surface gap, conservative refusal) + one silent leak (see item 2)
 
+**RULED 2026-10-21:** A ternary into a unique behaves exactly like if/else - accepted in declaration AND assignment, the selected arm is consumed (later read refused maybe-moved); borrow-returning calls (`a = pick()` of a global) are refused on assignment like the declaration. Probes scratch/rulings1021/{d,a}_*.cb. See fix-issue-lessons.md digest.
+
 # Chained `owner = <inner> = new PS()` - remaining gaps after T250
 
 T203 (raw local) and T250 (ternary-new, parenthesised, declaration inner) now match the two-statement

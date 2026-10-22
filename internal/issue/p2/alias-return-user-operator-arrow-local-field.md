@@ -1,5 +1,7 @@
 # alias return through a user operator-> on a local wrapper is accepted (dangles)
 
+**RULED 2026-10-21:** Refuse: a member operator->/method on a frame-local receiver is frame-rooted for alias returns (extends the 2026-09-24 &ref() gate). Left hold/. See fix-issue-lessons.md digest.
+
 Found in the T274 review (2026-10-15). Pre-existing on master; T274 did not make it worse.
 
 ## Repro

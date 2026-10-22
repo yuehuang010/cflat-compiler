@@ -1,5 +1,7 @@
 # `new T[n]` reaches a `unique T*` FIELD through a `move T*` parameter and is freed as one object
 
+**RULED 2026-10-21:** Static rule: `new T[n]` cannot bind an owning `move T*` sink; keep `move T[]` sinks; exempt trivially destructible T; spike the site count first. Buildable (left hold/). See fix-issue-lessons.md digest.
+
 Found 2026-09-02 by the round-2 Opus review of the unique<T> branch. Memory-safety class:
 n-1 element destructors never run and a `new[]` block is released with scalar `delete`.
 

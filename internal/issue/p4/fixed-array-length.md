@@ -1,5 +1,7 @@
 # Fixed arrays have no safe length operation
 
+**RULED 2026-10-21:** Ratified: no `.length()` on fixed arrays (reads like a struct member); add intrinsic `countof(a)` (C2y name) - compile-time element count, error on pointers/views; sizeof unchanged. Buildable. See fix-issue-lessons.md digest.
+
 ## Summary
 
 A fixed array has no `.length()` operation. The example therefore keeps a named

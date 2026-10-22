@@ -1,5 +1,7 @@
 # Convenience: split a string on whitespace
 
+**RULED 2026-10-21:** add `split(string sep, bool removeEmpty)`. Ratified, buildable. See fix-issue-lessons.md digest.
+
 `string.split` has exactly two overloads: `split(string sep)` and `split(i8 sep)`. Neither
 handles the most common everyday case - break a line or a file into words - because real
 text separates words with runs of mixed ' ', '\t', '\r', '\n', and both overloads also

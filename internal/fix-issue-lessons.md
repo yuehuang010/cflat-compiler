@@ -3557,7 +3557,7 @@ Per-item detail lives in the named issue file; durable decisions here.
 - CFlat structs have no paren/copy-ctor init surface (`new S(mk1())` refused, use braces); parentheses never add a copy.
 - On hold / open: btree `*out = namedAlias` (no btree work), union with non-trivial C++ member (maintainer researching),
   const-local array dimension (waits for enforced const-for-variables, the next feature).
-- Heap array through `move T*` into a unique field (hold/unique-field-heap-array-through-move-param) stays ON HOLD; the
+- Heap array through `move T*` into a unique field (p2/unique-field-heap-array-through-move-param) stays ON HOLD; the
   2026-10-15 discussion (new[] not movable at a call site, `unique T[]`) is recorded in that file, not ruled.
 
 ## Ruling 2026-10-20: owed rulings from fix box 2026-10-16b
@@ -3593,3 +3593,31 @@ they still apply under `=0`. Cost: the first compile after any rebuild is cold; 
 - Pre-existing finds from a review are filed by this table, not by default at p2: p2 only for silent wrong code.
 - Compile-time parity is a perf target tracked outside the gate, in `internal/plan/cpp-import-compile-parity.md` section 7 (the p1 issue was retired 2026-10-21).
 - Severity is measured on a verified master binary (see "On the baseline binary a severity claim is measured against").
+
+## Rulings 2026-10-21/22: open-question sweep
+
+- Verifier failure on a common shape is fixed, not refused: `p1/ctor-lambda-field-access-breaks` stays p1. A Debug-only LLVM/clang assert counts as p1 once reproduced on a fresh Debug exe.
+- T396's refusal of `if (owned) sink(move p->f)` on a maybe-borrowed value is kept.
+- `p2/interface-implementors-disagree-on-param-consume` (left hold/): the interface signature fixes ownership; an implementation consuming a non-`move` param is refused. Buildable.
+- `p2/unique-field-heap-array-through-move-param` (left hold/): static rule - `new T[n]` cannot bind an owning `move T*` sink; keep `move T[]` sinks; exempt trivially destructible T; spike site count first.
+- `p2/generic-alias-return-skips-signature-check` (left hold/): `alias` is T&; an alias closure param is a true reference (no by-value ABI copy), so `alias T pass<T>(alias T src)` is legal; Lambda<> in list<T> must keep working. Plan-sized (ABI). Repro uses inferred captures `(int x) => { return x + k; }`.
+- `p2/alias-return-user-operator-arrow-local-field` (left hold/): refuse - member operator->/method on a frame-local receiver is frame-rooted for alias returns (extends the 2026-09-24 &ref() gate).
+- `p2/statement-temp-escapes-via-out-param-or-global`: refuse void*/unrelated pointer joins in every context (call, decl, assign, return); explicit cast required, matches clang.
+- `p3/union-cxx-field-brace-init-constructs-nothing`: refuse non-trivial C++ class members in CFlat unions for now (NYI refusal).
+- `p3/method-on-global-receiver-consumes-field`: implicit consume of a this-field is refused in EVERY method; `move p` required. Count in-tree sites first.
+- `p3/alias-of-call-result-field-leaks-owner`: refuse a raw pointer local bound into an owning call-result temporary's field; diagnostic steers to `alias`.
+- `p3/alias-return-byvalue-param-leftovers-after-b21`: refuse `alias string[]`, `alias string?`, alias of a using-alias of string (resolved on the type); generic alias T stays legal.
+- `p3/cpp-return-named-local-implicit-move-and-byvalue-elision`: C++20 parity - return of a named local / by-value param tries the && overload first.
+- `p3/chained-assign-raw-inner-into-unique-refused`: ternary into a unique behaves like if/else (declaration and assignment, selected arm consumed); borrow-returning calls refused on assignment like the declaration.
+- `p3/same-scope-value-and-enum-same-name`: refuse with the T371 text.
+- `p3/immovable-cflat-struct-factory-return`: allow by-value return of fresh operands (brace-init, default, same-type call, ternary of those) built in the caller's sret slot; named locals still refused.
+- `p3/cflat-unique-dot-dispatches-to-pointee-member`: `.` on unique<T> resolves unique's own members first, then forwards to T.
+- `p3/global-default-spelling-zeroes-without-the-note`: refuse a global whose default construction is not computable at compile time (all spellings); no zero-fill. About 20 in-tree sites first.
+- `p4/global-string-array-view-initializer`: infer a hidden backing array for a file-scope view initializer. Ratified.
+- `p4/fixed-array-length`: no `.length()` on fixed arrays; add intrinsic `countof(a)` (compile-time count, error on pointers/views); sizeof unchanged. Ratified.
+- `p4/raw-string-literal-prefix`: Rust-style fully raw `r"..."` and `r#"..."#`, no interpolation, no escapes. Ratified.
+- `p4/owning-nullable-string` + `T?` suffix: do NOT remove `T?`; finish the nullable feature as a planned feature tied into the safety checks; plan at internal/plan/nullable-types.md (T? == T* today except default-null; ~37 test lines, 16 compiler sites).
+- `p2/cpp-byvalue-ctor-move-arg-source-not-nulled` (was hold): explicit `move f` of a `function<>` value NULLS the source at every sink (call arg, local, field, C++ ctor/call), like every other value type; fix once for all sinks.
+- `p4/string-split-on-whitespace`: `split(string sep, bool removeEmpty)` overload. Ratified.
+- `p4/string-functional-construction-spelling`: `string(ptr)` and `string(ptr, len)` are non-allocating borrows, same meaning as `(string)ptr`. Ratified.
+- CLIBNAME (`p3/core-defines-externally-visible-libc-functions` + the o2 builtin-folding item): CFlat definitions of libc names are marked `nobuiltin`, so LLVM calls the CFlat body; users may still override libc names.

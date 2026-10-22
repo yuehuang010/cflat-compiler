@@ -1,5 +1,7 @@
 # C++ converting returns of a named local / param pick the const& ctor (C++20 moves); by-value C++ params take an extra move
 
+**RULED 2026-10-21:** C++20 parity: return of a named local / by-value param tries the && overload first. See fix-issue-lessons.md digest.
+
 Filed 2026-10-14 from the T177 Opus review (PRE-EXISTING on master; T177 carries item 1 into a newly accepted shape).
 NEEDS A MAINTAINER RULING before build (item 1).
 

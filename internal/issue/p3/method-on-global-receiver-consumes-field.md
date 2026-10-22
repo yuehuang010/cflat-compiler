@@ -1,5 +1,7 @@
 # p3: a method called on a GLOBAL receiver implicitly consumes the global's unique field (NEEDS RULING)
 
+**RULED 2026-10-21:** Option B: an implicit consume of a this-field (`o = p;` in a method) is refused in EVERY method; `move p` required (Rust-like). Broad tightening - count in-tree sites first. See fix-issue-lessons.md digest.
+
 Pre-existing; found by the T382 review (2026-10-21). Repro: scratch/repro_keep/box1021/t382_rev/gap_method_on_global.cb.
 
 ```cflat

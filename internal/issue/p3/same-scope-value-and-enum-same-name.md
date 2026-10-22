@@ -1,5 +1,7 @@
 # p3: a value and an enum with the same name in ONE scope - misleading "Undefined variable A." (NEEDS RULING)
 
+**RULED 2026-10-21:** Refuse the same-scope enum with the T371 text. See fix-issue-lessons.md digest.
+
 Pre-existing; found by the T379 review (2026-10-21). Repros: scratch/repro_keep/box1021/t379_rev/param_same_name_enum.cb,
 local_same_name_enum.cb, clang oracle same_name_oracle.cpp.
 
