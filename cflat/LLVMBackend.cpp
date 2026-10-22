@@ -4753,6 +4753,7 @@ void LLVMBackend::ResetForReanalysis()
     pendingReceiverText_.clear();
     pendingConstReceiverCalls_.clear();
     deferredExpectations_.clear();
+    expectErrorStack_.clear();
     activeExpectScope_ = 0;
     fallbackOwnerGates_.clear();
     cxxThisEscapeGates_.clear();
@@ -5121,6 +5122,8 @@ void LLVMBackend::ResetForReanalysis()
     lambdaCounter = 0;
     expectedError.clear();
     expectedErrorScopeDepth = SIZE_MAX;
+    expectedErrorScopeFunction_ = nullptr;
+    expectErrorStack_.clear();
     fileScopeExpectedError_.clear();
     currentFunction = nullptr;
     activeGenericEnumSpecialization_.clear();

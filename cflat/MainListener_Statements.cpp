@@ -1,6 +1,125 @@
 #include "MainListener.h"
 #include <llvm/Analysis/ValueTracking.h>
 
+MainListener::ExpectErrorRecoveryMark MainListener::MarkExpectErrorRecoveryState() const
+{
+        ExpectErrorRecoveryMark mark;
+        mark.lambdaExpectedType = lambdaExpectedType;
+        mark.lastLambdaType = lastLambdaType;
+        mark.declExpectedType = declExpectedType;
+        mark.pendingCxxCastInitContext = pendingCxxCastInitContext_;
+        mark.lambdaDiscardRhs = lambdaDiscardRhs_;
+        mark.lambdaLockThisReceiver = lambdaLockThisReceiver;
+        mark.lambdaLockThisMode = lambdaLockThisMode;
+        mark.currentLockSet = currentLockSet;
+        mark.lambdaReturnInferredFn = lambdaReturnInferredFn_;
+        mark.lambdaReturnInferredName = lambdaReturnInferredName_;
+        mark.straightLineReturned = straightLineReturned_;
+        mark.currentFunctionIsVariadic = currentFunctionIsVariadic;
+        mark.addressOfOperandDepth = addressOfOperandDepth_;
+        mark.arrowOwnedTempsSize = arrowOwnedTemps_.size();
+        mark.lastParenExprType = lastParenExprType;
+        mark.lastParenExprStorage = lastParenExprStorage;
+        mark.lastParenExprFromOwningTempField = lastParenExprFromOwningTempField;
+        mark.lastParenExprOwningTempParent = lastParenExprOwningTempParent;
+        mark.lastParenExprOwningStructName = lastParenExprOwningStructName;
+        mark.lastParenExprFieldName = lastParenExprFieldName;
+        mark.lastParenExprCallerName = lastParenExprCallerName;
+        mark.lastParenExprNamed = lastParenExprNamed;
+        mark.lastRedundantAsCtx = lastRedundantAsCtx_;
+        mark.lastRedundantAsNamed = lastRedundantAsNamed_;
+        mark.pendingCxxSretDest = compilerLLVM->pendingCxxSretDest_;
+        mark.pendingCxxSretTypeName = compilerLLVM->pendingCxxSretTypeName_;
+        mark.pendingCxxSretForFixedArray = compilerLLVM->pendingCxxSretForFixedArray_;
+        mark.pendingCxxSretReturn = compilerLLVM->pendingCxxSretReturn_;
+        mark.pendingCxxTernaryDeclDest = compilerLLVM->pendingCxxTernaryDeclDest_;
+        mark.pendingCxxTernaryDeclTypeName = compilerLLVM->pendingCxxTernaryDeclTypeName_;
+        mark.pendingCxxTernaryDeclConsumed = compilerLLVM->pendingCxxTernaryDeclConsumed_;
+        mark.pendingCxxTernaryDeclFailed = compilerLLVM->pendingCxxTernaryDeclFailed_;
+        mark.pendingCxxTernaryDeclArmType = compilerLLVM->pendingCxxTernaryDeclArmType_;
+        mark.pendingCxxTernaryDeclArmCat = compilerLLVM->pendingCxxTernaryDeclArmCat_;
+        mark.lastCxxRetTemp = compilerLLVM->lastCxxRetTemp_;
+        mark.lastCxxRetValue = compilerLLVM->lastCxxRetValue_;
+        mark.lastLoweredRetTemp = compilerLLVM->lastLoweredRetTemp_;
+        mark.lastLoweredRetValue = compilerLLVM->lastLoweredRetValue_;
+        mark.lastLoweredCopyRetTemp = compilerLLVM->lastLoweredCopyRetTemp_;
+        if (compilerLLVM->module != nullptr)
+            for (auto& function : *compilerLLVM->module)
+            {
+                if (function.isDeclaration()) continue;
+                for (auto& block : function)
+                    if (cflat_llvm::GetTerminatorOrNull(&block) == nullptr)
+                    {
+                        mark.openFunctions.insert(&function);
+                        break;
+                    }
+            }
+        return mark;
+}
+
+void MainListener::RestoreExpectErrorRecoveryState(const ExpectErrorRecoveryMark& mark,
+                                                    llvm::Function* resumedFunction)
+{
+        lambdaExpectedType = mark.lambdaExpectedType;
+        lastLambdaType = mark.lastLambdaType;
+        declExpectedType = mark.declExpectedType;
+        pendingCxxCastInitContext_ = mark.pendingCxxCastInitContext;
+        lambdaDiscardRhs_ = mark.lambdaDiscardRhs;
+        lambdaLockThisReceiver = mark.lambdaLockThisReceiver;
+        lambdaLockThisMode = mark.lambdaLockThisMode;
+        currentLockSet = mark.currentLockSet;
+        lambdaReturnInferredFn_ = mark.lambdaReturnInferredFn;
+        lambdaReturnInferredName_ = mark.lambdaReturnInferredName;
+        straightLineReturned_ = mark.straightLineReturned;
+        currentFunctionIsVariadic = mark.currentFunctionIsVariadic;
+        addressOfOperandDepth_ = mark.addressOfOperandDepth;
+        if (arrowOwnedTemps_.size() > mark.arrowOwnedTempsSize)
+            arrowOwnedTemps_.resize(mark.arrowOwnedTempsSize);
+        lastParenExprType = mark.lastParenExprType;
+        lastParenExprStorage = mark.lastParenExprStorage;
+        lastParenExprFromOwningTempField = mark.lastParenExprFromOwningTempField;
+        lastParenExprOwningTempParent = mark.lastParenExprOwningTempParent;
+        lastParenExprOwningStructName = mark.lastParenExprOwningStructName;
+        lastParenExprFieldName = mark.lastParenExprFieldName;
+        lastParenExprCallerName = mark.lastParenExprCallerName;
+        lastParenExprNamed = mark.lastParenExprNamed;
+        lastRedundantAsCtx_ = mark.lastRedundantAsCtx;
+        lastRedundantAsNamed_ = mark.lastRedundantAsNamed;
+        compilerLLVM->pendingCxxSretDest_ = mark.pendingCxxSretDest;
+        compilerLLVM->pendingCxxSretTypeName_ = mark.pendingCxxSretTypeName;
+        compilerLLVM->pendingCxxSretForFixedArray_ = mark.pendingCxxSretForFixedArray;
+        compilerLLVM->pendingCxxSretReturn_ = mark.pendingCxxSretReturn;
+        compilerLLVM->pendingCxxTernaryDeclDest_ = mark.pendingCxxTernaryDeclDest;
+        compilerLLVM->pendingCxxTernaryDeclTypeName_ = mark.pendingCxxTernaryDeclTypeName;
+        compilerLLVM->pendingCxxTernaryDeclConsumed_ = mark.pendingCxxTernaryDeclConsumed;
+        compilerLLVM->pendingCxxTernaryDeclFailed_ = mark.pendingCxxTernaryDeclFailed;
+        compilerLLVM->pendingCxxTernaryDeclArmType_ = mark.pendingCxxTernaryDeclArmType;
+        compilerLLVM->pendingCxxTernaryDeclArmCat_ = mark.pendingCxxTernaryDeclArmCat;
+        compilerLLVM->lastCxxRetTemp_ = mark.lastCxxRetTemp;
+        compilerLLVM->lastCxxRetValue_ = mark.lastCxxRetValue;
+        compilerLLVM->lastLoweredRetTemp_ = mark.lastLoweredRetTemp;
+        compilerLLVM->lastLoweredRetValue_ = mark.lastLoweredRetValue;
+        compilerLLVM->lastLoweredCopyRetTemp_ = mark.lastLoweredCopyRetTemp;
+
+        if (compilerLLVM->module != nullptr)
+            for (auto& function : *compilerLLVM->module)
+            {
+                if (&function == resumedFunction || function.isDeclaration()
+                    || mark.openFunctions.count(&function) != 0)
+                    continue;
+                bool incomplete = false;
+                for (auto& block : function)
+                    if (cflat_llvm::GetTerminatorOrNull(&block) == nullptr)
+                    {
+                        incomplete = true;
+                        break;
+                    }
+                if (!incomplete) continue;
+                compilerLLVM->SealAbandonedFunction(&function);
+                compilerLLVM->DiscardAbandonedFunction(&function);
+            }
+}
+
 namespace {
 
 using LoopConstKind = std::function<int(const LLVMBackend::NamedVariable&)>;
@@ -5190,13 +5309,11 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
         else if (expectErrorStmt)
         {
             std::string rawText = expectErrorStmt->StringLiteral()->getText();
-            compilerLLVM->expectedError = ProcessRawText(rawText);
 
             if (auto* cs = expectErrorStmt->compoundStatement())
             {
                 // Scoped block form: expect_error("msg") { ... } - error must occur inside the braces.
-                compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;  // manual check after block
-                compilerLLVM->ArmExpectScope();
+                size_t expectScope = compilerLLVM->ArmExpectScope(ProcessRawText(rawText), SIZE_MAX);
                 size_t savedDepth = compilerLLVM->stackNamedVariable.size();
                 auto* entryBB = compilerLLVM->builder->GetInsertBlock();
                 bool entryWasUnterminated = entryBB != nullptr && cflat_llvm::GetTerminatorOrNull(entryBB) == nullptr;
@@ -5204,6 +5321,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 // Rewind point for the per-function pending logs (see PendingAnalysisMark).
                 auto* markedFn = entryBB != nullptr ? entryBB->getParent() : nullptr;
                 auto pendingMark = compilerLLVM->MarkPendingAnalyses(markedFn);
+                auto recoveryMark = MarkExpectErrorRecoveryState();
                 compiler->InitializeBlock(nullptr, true);
                 bool errorReceived = false;
                 try
@@ -5214,6 +5332,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 catch (const ExpectedErrorReceived&)
                 {
                     errorReceived = true;
+                    RestoreExpectErrorRecoveryState(recoveryMark, markedFn);
                     // The rest of the block never ran (see the file-scope catch). Today the grammar
                     // puts no classDefinition in a function body, so this is a defensive no-op.
                     ForgetIfConstGuardedImpls(compilerLLVM, cs);
@@ -5263,7 +5382,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         compilerLLVM->builder->SetInsertPoint(resume);
                         expectErrorRecoveryBlock_ = resume;
                     }
-                    compilerLLVM->RestoreFileScopeExpectedError();
+                    compilerLLVM->RestoreExpectScope(expectScope);
                 }
 
                 if (!errorReceived)
@@ -5285,8 +5404,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
             else
             {
                 // Bare-semicolon form: expect_error("msg"); - error must occur before the enclosing scope exits.
-                compilerLLVM->expectedErrorScopeDepth = compilerLLVM->stackNamedVariable.size();
-                compilerLLVM->ArmExpectScope();
+                compilerLLVM->ArmExpectScope(ProcessRawText(rawText), compilerLLVM->stackNamedVariable.size());
             }
             return;
         }

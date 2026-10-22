@@ -1096,7 +1096,10 @@ std::string LLVMBackend::GetTypeAnnotationArg(const std::string& name, const std
 
 void LLVMBackend::RestoreFileScopeExpectedError()
 {
+        expectErrorStack_.clear();
         activeExpectScope_ = 0;
+        expectedErrorScopeFunction_ = nullptr;
+        activeExpectPosition_ = {};
         expectedError = fileScopeExpectedError_;
         expectedErrorScopeDepth = SIZE_MAX;
     }
@@ -2107,16 +2110,19 @@ void LLVMBackend::UnregisterOwnedStringTemp(llvm::Value* value)
     }
 
 void LLVMBackend::RegisterOwnedReturnTemp(llvm::Value* value, const std::string& fnName,
-                                 const TypeAndValue& retType)
+                                 const TypeAndValue& retType, bool checkDiscard)
 {
         if (value == nullptr) return;
         bool isOwningPtr = retType.Pointer && value->getType()->isPointerTy()
             && !retType.IsInterface && !retType.ElemPointer && retType.ConstArraySize == 0;
-        for (auto& e : ownedReturnTemps_)
-            if (e.Value == value) { e.FnName = fnName; break; }
-        if (std::none_of(ownedReturnTemps_.begin(), ownedReturnTemps_.end(),
-                         [&](const OwnedReturnTemp& e) { return e.Value == value; }))
-            ownedReturnTemps_.push_back({ value, fnName });
+        if (checkDiscard)
+        {
+            for (auto& e : ownedReturnTemps_)
+                if (e.Value == value) { e.FnName = fnName; break; }
+            if (std::none_of(ownedReturnTemps_.begin(), ownedReturnTemps_.end(),
+                             [&](const OwnedReturnTemp& e) { return e.Value == value; }))
+                ownedReturnTemps_.push_back({ value, fnName });
+        }
         for (auto& e : ownedReturnReleaseTemps_)
             if (e.Value == value)
             {

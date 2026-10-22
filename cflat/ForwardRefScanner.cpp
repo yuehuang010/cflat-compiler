@@ -2713,7 +2713,7 @@ void ForwardRefScanner::ScanExternalDeclaration(CFlatParser::ExternalDeclaration
                 return;
             // Set expectedError so errors during the scan are caught rather than aborting.
             std::string rawText = expectErrDecl->StringLiteral()->getText();
-            compilerLLVM->expectedError = DequoteStringLiteral(rawText);
+            size_t expectScope = compilerLLVM->ArmExpectScope(DequoteStringLiteral(rawText), SIZE_MAX);
             try
             {
                 for (auto* nested : expectErrDecl->externalDeclaration())
@@ -2722,7 +2722,7 @@ void ForwardRefScanner::ScanExternalDeclaration(CFlatParser::ExternalDeclaration
             catch (const ExpectedErrorReceived&)
             {
             }
-            compilerLLVM->expectedError.clear();
+            compilerLLVM->RestoreExpectScope(expectScope);
             return;
         }
         else if (auto* ifConst = ctx->ifConstDeclaration())

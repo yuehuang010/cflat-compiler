@@ -49,8 +49,9 @@ i32 length(string self)
 
 // Writable pointer to the bytes. A BORROWED string (literal, char* wrap, default) is first
 // copied into an owned NUL-terminated buffer (copy-on-write), so a write never reaches storage
-// the string does not own. An owned string returns its own buffer, unchanged. Call it on a
-// local or a field: a by-value `string` parameter is a borrow, so its copy would not be freed.
+// the string does not own. An owned string returns its own buffer, unchanged. A by-value string
+// parameter stays borrowed from its caller; any buffer data_mut installs is freed by the callee
+// or transferred when the parameter is returned or moved.
 char* data_mut(string* self)
 {
     if ((self->_len & (i32)0x80000000) == 0)

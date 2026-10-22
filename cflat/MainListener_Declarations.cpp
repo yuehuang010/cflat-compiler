@@ -3583,18 +3583,14 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                 if (!namespaceName.empty())
                 {
                     std::string rawText = expectErrDecl->StringLiteral()->getText();
-                    compilerLLVM->expectedError = ProcessRawText(rawText);
-                    compilerLLVM->expectedErrorScopeDepth = compilerLLVM->stackNamedVariable.size();
-                    compilerLLVM->ArmExpectScope();
+                    compilerLLVM->ArmExpectScope(ProcessRawText(rawText), compilerLLVM->stackNamedVariable.size());
                 }
             }
             else
             {
                 // Scoped block form at file scope: expect_error("msg") { functionDef / structDef / ... }
                 std::string rawText = expectErrDecl->StringLiteral()->getText();
-                compilerLLVM->expectedError = ProcessRawText(rawText);
-                compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;
-                compilerLLVM->ArmExpectScope();
+                size_t expectScope = compilerLLVM->ArmExpectScope(ProcessRawText(rawText), SIZE_MAX);
                 auto ownedTempMark = compilerLLVM->MarkOwnedTemps();
                 std::unordered_set<std::string> typesBefore;
                 for (const auto& [name, _] : compilerLLVM->dataStructures)
@@ -3603,6 +3599,7 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                 for (const auto& global : compilerLLVM->module->globals())
                     globalsBefore.insert(global.getName().str());
 
+                auto recoveryMark = MarkExpectErrorRecoveryState();
                 bool errorReceived = false;
                 try
                 {
@@ -3612,6 +3609,7 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                 catch (const ExpectedErrorReceived&)
                 {
                     errorReceived = true;
+                    RestoreExpectErrorRecoveryState(recoveryMark, nullptr);
                     // ForwardRefScanner may have queued generic work for this failed declaration
                     // before the scoped expectation ran. Let later source uses queue it again.
                     for (const auto& pending : pendingInstantiations)
@@ -3673,7 +3671,7 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                     compilerLLVM->AbortFunctionBlocks(0);
                     compilerLLVM->DiscardOwnedTempsSince(ownedTempMark);
                     compilerLLVM->ClearCurrentSubprogram();
-                    compilerLLVM->RestoreFileScopeExpectedError();
+                    compilerLLVM->RestoreExpectScope(expectScope);
                     // The throw unwound past the `global_scope = true` restore in the
                     // function branch; recovery resumes at file scope, so re-assert it.
                     global_scope = true;
@@ -4532,6 +4530,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         CopyWrittenCopyableParams(func, allParams);
 
         auto blockItemList = func->compoundStatement()->blockItemList();
+        auto recoveryMark = MarkExpectErrorRecoveryState();
 
         bool expectErrorHandled = false;
         if (blockItemList)
@@ -4546,13 +4545,15 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                 // (bare-semicolon form inside this function body).
                 // File-scope scoped-block form sets expectedErrorScopeDepth = SIZE_MAX - re-throw.
                 if (!compilerLLVM->expectedError.empty() &&
-                    compilerLLVM->expectedErrorScopeDepth == funcDepth)
+                    compilerLLVM->expectedErrorScopeDepth == funcDepth &&
+                    compilerLLVM->ActiveExpectScopeOwnsFunction(fn))
                 {
+                    RestoreExpectErrorRecoveryState(recoveryMark, fn);
                     // The rest of the body never ran; defensive no-op while the grammar puts no
                     // classDefinition in a function body (see the file-scope catch for the real case).
                     ForgetIfConstGuardedImpls(compilerLLVM, blockItemList);
-                    compilerLLVM->AbortFunctionBlocks(funcDepth - 1);
-                    compilerLLVM->RestoreFileScopeExpectedError();
+                    compilerLLVM->AbortFunctionBlocks(funcDepth - 1, fn);
+                    compilerLLVM->RestoreExpectScope(compilerLLVM->activeExpectScope_);
                     compiler->ClearCurrentSubprogram();
                     // The body was aborted mid-way: its CFG is partial, so its null-state log
                     // must be dropped rather than analyzed by the end-of-module sweep.
@@ -7320,20 +7321,34 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
             return allocList;
         }
 
-        // Queue any pending generic instantiation for this declaration's type.
-        // Actual instantiation happens later in ProcessPendingInstantiations() at top-level scope.
+        // Queue this type; most requests wait until the current function body is pre-scanned.
         QueueInstantiateGenericType(declSpec);
-        // The desugared local calls unique<T>'s constructor immediately, so its deferred body and
-        // overload set must be available before this declaration evaluates its initializer.
-        if (compiler->IsCoreUniqueType(typeAndValue.TypeName))
+        // Expected-error declarations of CFlat templates must drain their body while the
+        // expectation is armed; C++ template requests are resolved by the declaration path itself.
+        bool expectedCflatTemplate = false;
+        if (!compiler->expectedError.empty())
+            for (auto* spec : declSpec->declarationSpecifier())
+                if (auto* typeSpec = spec->typeSpecifier())
+                {
+                    std::string baseName;
+                    if (GenericSpecOf(typeSpec, baseName) != nullptr)
+                    {
+                        const std::string resolvedBase = compiler->ResolveGenericTemplateBase(baseName);
+                        const size_t dot = baseName.rfind('.');
+                        const bool cxxNamespaceTemplate = dot != std::string::npos
+                            && compiler->IsCxxNamespacePath(baseName.substr(0, dot));
+                        expectedCflatTemplate = !cxxNamespaceTemplate
+                            && (genericStructTemplates.count(resolvedBase) != 0
+                                || genericClassTemplates.count(resolvedBase) != 0
+                                || genericInterfaceTemplates.count(resolvedBase) != 0);
+                    }
+                    if (expectedCflatTemplate) break;
+                }
+        if (expectedCflatTemplate || compiler->IsCoreUniqueType(typeAndValue.TypeName))
         {
             auto savedState = compiler->SaveBuilderState();
             auto savedStack = std::move(compiler->stackNamedVariable);
-            auto savedExpectedError = compiler->expectedError;
-            auto savedExpectedErrorScopeDepth = compiler->expectedErrorScopeDepth;
             compiler->stackNamedVariable.clear();
-            compiler->expectedError.clear();
-            compiler->expectedErrorScopeDepth = SIZE_MAX;
             try
             {
                 ProcessPendingInstantiations();
@@ -7341,14 +7356,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
             catch (...)
             {
                 compiler->stackNamedVariable = std::move(savedStack);
-                compiler->expectedError = std::move(savedExpectedError);
-                compiler->expectedErrorScopeDepth = savedExpectedErrorScopeDepth;
                 compiler->RestoreBuilderState(savedState);
                 throw;
             }
             compiler->stackNamedVariable = std::move(savedStack);
-            compiler->expectedError = std::move(savedExpectedError);
-            compiler->expectedErrorScopeDepth = savedExpectedErrorScopeDepth;
             compiler->RestoreBuilderState(savedState);
         }
 
@@ -10748,6 +10759,57 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             }
                         }
                         auto* srcInitGep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(srcStorage);
+                        bool srcIsStorageJoin = false;
+                        bool srcIsOwnedTemp = false;
+                        bool srcIsPointerVariableSubscript = false;
+                        if (typeAndValue.TypeName == "string" && right != nullptr
+                            && right->getType()->isStructTy()
+                            && initializer != nullptr && initializer->assignmentExpression() != nullptr)
+                        {
+                            srcIsStorageJoin = srcStorage != nullptr
+                                && (llvm::isa<llvm::PHINode>(srcStorage)
+                                    || llvm::isa<llvm::SelectInst>(srcStorage));
+                            LLVMBackend::NamedVariable srcTempProbe;
+                            srcTempProbe.Primary = srcPrimary;
+                            srcTempProbe.Storage = srcStorage;
+                            srcIsOwnedTemp = compiler->IsOwnedTempValue(srcTempProbe);
+                            auto* initPostfix = tryGetPostfixExpression(initializer->assignmentExpression());
+                            bool directSubscript = initPostfix != nullptr
+                                && initPostfix->LeftBracket().size() == 1
+                                && initPostfix->expression().size() == 1
+                                && initPostfix->LeftParen().empty()
+                                && initPostfix->Dot().empty() && initPostfix->Arrow().empty()
+                                && initPostfix->QuestionDot().empty()
+                                && initPostfix->primaryExpression() != nullptr
+                                && (initPostfix->primaryExpression()->Identifier() != nullptr
+                                    || initPostfix->primaryExpression()->genericIdentifier() != nullptr)
+                                && !initPostfix->RightBracket().empty()
+                                && initPostfix->children.back() == initPostfix->RightBracket().back();
+                            llvm::Value* subscriptBase = nullptr;
+                            if (srcInitGep != nullptr && srcInitGep->getNumIndices() == 1)
+                                subscriptBase = srcInitGep->getPointerOperand();
+                            else if (srcInitGep == nullptr)
+                                if (auto* sourceLoad = llvm::dyn_cast<llvm::LoadInst>(right))
+                                    subscriptBase = sourceLoad->getPointerOperand();
+                            auto* pointerLoad = llvm::dyn_cast_or_null<llvm::LoadInst>(subscriptBase);
+                            llvm::Value* pointerSlot = pointerLoad != nullptr
+                                ? pointerLoad->getPointerOperand() : subscriptBase;
+                            const auto* pointerBinding = directSubscript
+                                ? compiler->FindVariableByStorage(pointerSlot) : nullptr;
+                            bool isNamedPointerSlot = pointerSlot != nullptr
+                                && (llvm::isa<llvm::AllocaInst>(pointerSlot)
+                                    || llvm::isa<llvm::Argument>(pointerSlot)
+                                    || llvm::isa<llvm::GlobalVariable>(pointerSlot));
+                            srcIsPointerVariableSubscript = directSubscript
+                                && (srcInitGep == nullptr || srcInitGep->getNumIndices() == 1)
+                                && isNamedPointerSlot && pointerBinding != nullptr
+                                && pointerBinding->TypeAndValue.Pointer
+                                && !pointerBinding->TypeAndValue.IsArrayView
+                                && !pointerBinding->IsElementAccess
+                                && pointerBinding->FieldName.empty()
+                                && pointerBinding->OwningStructName.empty()
+                                && !pointerBinding->AllocatedByRawNewArray;
+                        }
                         bool srcIsNamedSlot = srcStorage != nullptr
                             && (llvm::isa<llvm::AllocaInst>(srcStorage)
                                 || llvm::isa<llvm::GlobalVariable>(srcStorage))
@@ -10888,6 +10950,30 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     compiler->GetOrCreateStackVariable(name).IsOwningString = true;
                                 }
                             }
+                        }
+                        // Deref / declared-pointer subscript string lvalue: copy, else the local frees the caller's
+                        // buffer (joins, owned temps, raw-new/view/container slots excepted).
+                        else if (!global_scope
+                            && typeAndValue.TypeName == "string"
+                            && !typeAndValue.Pointer
+                            && right->getType()->isStructTy()
+                            && initializer != nullptr
+                            && initializer->assignmentExpression() != nullptr
+                            && (srcStorage != nullptr || srcIsPointerVariableSubscript)
+                            && !srcIsNamedSlot
+                            && !srcIsMove
+                            && !srcIsAlias
+                            && !srcMovableTempField
+                            && !srcBorrowsOwnedString
+                            && !srcIsOwningArrayStringElem
+                            && !srcIsRawHeapStringElem
+                            && !srcIsViewElem
+                            && ((srcInitGep == nullptr && !srcIsStorageJoin && !srcIsOwnedTemp)
+                                || srcIsPointerVariableSubscript))
+                        {
+                            right = compiler->EmitOwnedStringDeepCopy(right);
+                            compiler->GetOrCreateStackVariable(name).IsOwningString = true;
+                            didDeepCopyBorrowString = true;
                         }
                         // String BORROW bound to an owning local via a DIRECT read of an owning string
                         // FIELD the local does not own: `string x = obj.name`. srcBorrowsOwnedString

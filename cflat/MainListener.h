@@ -5678,6 +5678,55 @@ private:
     // LockMode::Exclusive grants a write (see CheckGuardedWrite).
     std::unordered_map<std::string, LockMode> currentLockSet;
 
+    // State a failed parse can leave behind when LogError unwinds out of a nested lambda.
+    // Scoped expect_error recovery restores this checkpoint before resuming the outer walk.
+    struct ExpectErrorRecoveryMark
+    {
+        std::unordered_set<llvm::Function*> openFunctions;
+        LLVMBackend::TypeAndValue lambdaExpectedType;
+        LLVMBackend::TypeAndValue lastLambdaType;
+        LLVMBackend::TypeAndValue declExpectedType;
+        CFlatParser::CastExpressionContext* pendingCxxCastInitContext = nullptr;
+        CFlatParser::AssignmentExpressionContext* lambdaDiscardRhs = nullptr;
+        std::string lambdaLockThisReceiver;
+        LockMode lambdaLockThisMode = LockMode::Exclusive;
+        std::unordered_map<std::string, LockMode> currentLockSet;
+        llvm::Function* lambdaReturnInferredFn = nullptr;
+        std::string lambdaReturnInferredName;
+        bool straightLineReturned = false;
+        bool currentFunctionIsVariadic = false;
+        unsigned addressOfOperandDepth = 0;
+        size_t arrowOwnedTempsSize = 0;
+        LLVMBackend::TypeAndValue lastParenExprType;
+        llvm::Value* lastParenExprStorage = nullptr;
+        bool lastParenExprFromOwningTempField = false;
+        bool lastParenExprOwningTempParent = false;
+        std::string lastParenExprOwningStructName;
+        std::string lastParenExprFieldName;
+        std::string lastParenExprCallerName;
+        LLVMBackend::NamedVariable lastParenExprNamed;
+        CFlatParser::TypeCheckExpressionContext* lastRedundantAsCtx = nullptr;
+        LLVMBackend::NamedVariable lastRedundantAsNamed;
+        llvm::Value* pendingCxxSretDest = nullptr;
+        std::string pendingCxxSretTypeName;
+        bool pendingCxxSretForFixedArray = false;
+        bool pendingCxxSretReturn = false;
+        llvm::Value* pendingCxxTernaryDeclDest = nullptr;
+        std::string pendingCxxTernaryDeclTypeName;
+        bool pendingCxxTernaryDeclConsumed = false;
+        bool pendingCxxTernaryDeclFailed = false;
+        std::string pendingCxxTernaryDeclArmType;
+        int pendingCxxTernaryDeclArmCat = 0;
+        llvm::Value* lastCxxRetTemp = nullptr;
+        llvm::Value* lastCxxRetValue = nullptr;
+        llvm::Value* lastLoweredRetTemp = nullptr;
+        llvm::Value* lastLoweredRetValue = nullptr;
+        llvm::Value* lastLoweredCopyRetTemp = nullptr;
+    };
+    ExpectErrorRecoveryMark MarkExpectErrorRecoveryState() const;
+    void RestoreExpectErrorRecoveryState(const ExpectErrorRecoveryMark& mark,
+                                         llvm::Function* resumedFunction);
+
     // Generic template state lives on the backend so each LLVMBackend instance
     // owns its own copy. References below alias compilerLLVM->gts.<field> and are
     // bound in the constructor's member initializer list.
@@ -9480,7 +9529,8 @@ public:
     // topLevel pushes a scratch alias frame: body-scope `using` renames this pre-scan meets
     // bind in source order and are discarded before the real walk registers them again.
     void ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool topLevel = true,
-        const std::unordered_set<std::string>* localEnumNames = nullptr);
+        const std::unordered_set<std::string>* localEnumNames = nullptr,
+        bool insideScopedExpectation = false, bool afterBareExpectation = false);
 
     // Check if a declaration uses a generic type and queue it for instantiation if needed.
     // Instantiation is deferred to avoid interrupting code generation in the current context.

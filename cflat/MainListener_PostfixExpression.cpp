@@ -1516,6 +1516,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
 
             int functionArgCounter = 0;
             bool nullConditionalPending = false;
+            // Set by a parenthesized join whose class hint typed it; read by the next suffix only.
+            bool joinHintReceiver = false;
             // The owned temp (`new` or an owning call result) the chain's first member link runs on.
             // A `?.` chain ending on a scalar releases it at the end of the full expression (see the
             // end of the whole-chain merge). A call made on the chain (ncChainCalled) keeps the root
@@ -1924,6 +1926,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             for (auto parseTree : ctx->children)
             {
                 if (childIndex++ >= childLimit) break;
+                const bool receiverFromJoinHint = joinHintReceiver;
+                joinHintReceiver = false;
                 bool memberNameToken = false;
                 if (auto* rule = dynamic_cast<antlr4::RuleContext*>(parseTree);
                     rule != nullptr && rule->getRuleIndex() == CFlatParser::RuleMemberNameToken
@@ -1986,9 +1990,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 && Compiler(ctx)->IsOwningPtrTempValue(namedVar.Primary))
                                 ncChainRootTemp = namedVar.Primary;
                         }
-                        // The receiver's own type decides whether `->` / `.` reaches a const
-                        // pointee (call result, cast, union arm, field). An untyped join is decided from its arms.
-                        if (namedVar.TypeAndValue.Pointer && namedVar.Primary != nullptr)
+                        // The receiver's own type decides whether `->` / `.` reaches a const pointee; an untyped
+                        // or join-hinted receiver takes its const from the join arms, never from the hint.
+                        if (namedVar.TypeAndValue.Pointer && namedVar.Primary != nullptr && !receiverFromJoinHint)
                         {
                             std::string receiverText;
                             for (auto* child : ctx->children)
@@ -4133,11 +4137,31 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar.CxxDirectConstructionArguments =
                                     parenInnerNamed.CxxDirectConstructionArguments;
                             }
-                            // And a parenthesized class-pointer `?:` keeps its joined pointee class.
+                            // A member receiver can use a joined class-pointer pointee hint.
                             if (prevPrimary->expression() != nullptr && namedVar.Primary == parenInnerNamed.Primary)
                             {
                                 namedVar.JoinClassPointee = parenInnerNamed.JoinClassPointee;
                                 namedVar.JoinClassPointeeDepth = parenInnerNamed.JoinClassPointeeDepth;
+                                auto* nextSuffix = childLimit > 1
+                                    ? dynamic_cast<antlr4::tree::TerminalNode*>(ctx->children[1]) : nullptr;
+                                const size_t nextToken = nextSuffix == nullptr
+                                    ? 0 : nextSuffix->getSymbol()->getType();
+                                const bool memberReceiver = nextToken == CFlatParser::Dot
+                                    || nextToken == CFlatParser::Arrow
+                                    || nextToken == CFlatParser::QuestionDot;
+                                if (memberReceiver && namedVar.TypeAndValue.TypeName.empty()
+                                    && !parenInnerNamed.JoinClassPointee.empty()
+                                    && namedVar.Primary != nullptr
+                                    && namedVar.Primary->getType()->isPointerTy())
+                                {
+                                    namedVar.TypeAndValue.TypeName = parenInnerNamed.JoinClassPointee;
+                                    namedVar.TypeAndValue.Pointer = true;
+                                    namedVar.TypeAndValue.PointerDepth =
+                                        parenInnerNamed.JoinClassPointeeDepth;
+                                    namedVar.TypeAndValue.ElemPointer =
+                                        parenInnerNamed.JoinClassPointeeDepth > 1;
+                                    joinHintReceiver = true;
+                                }
                             }
                             if (prevPrimary->expression() != nullptr && parenInnerNamed.IsCxxMacroGlobal)
                             {
@@ -8979,6 +9003,58 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // normal overloaded (member/free/extension) function call.
                             // `winrtSlot` is resolved above at [PFX-7-slot].
                             auto* compiler = Compiler(ctx);
+                            auto markDataMutParamOwning = [&](const LLVMBackend::NamedVariable& receiver,
+                                                              llvm::Value* callValue)
+                            {
+                                auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(callValue);
+                                auto* callee = call != nullptr ? call->getCalledFunction() : nullptr;
+                                const auto* symbol = callee != nullptr
+                                    ? compiler->GetFunctionSymbol(callee) : nullptr;
+                                if (symbol == nullptr || !symbol->IsCoreLibraryFunction
+                                    || symbol->SourceName != "data_mut"
+                                    || symbol->Parameters.size() != 1
+                                    || symbol->Parameters.front().TypeName != "string"
+                                    || !symbol->Parameters.front().Pointer
+                                    || symbol->ReturnType.TypeName != "char"
+                                    || !symbol->ReturnType.Pointer)
+                                    return;
+                                if (!IsBorrowedByValueParamBinding(compiler, receiver))
+                                    return;
+                                // An inferred move-sink parameter already owns the caller's buffer.
+                                if (compiler->OwningSinkConsumesConcrete(
+                                        compiler->GetFunctionArgument(receiver.TypeAndValue.VariableName).TypeAndValue))
+                                    return;
+
+                                // A by-value string parameter borrows its caller's buffer. Clear the
+                                // copied descriptor in the entry block so data_mut installs a private
+                                // buffer; its runtime owned bit then gates the ordinary param cleanup.
+                                llvm::StoreInst* lastParamStore = nullptr;
+                                if (compiler->currentFunction == nullptr || receiver.Storage == nullptr)
+                                    return;
+                                auto* entry = &compiler->currentFunction->getEntryBlock();
+                                for (auto& instruction : *entry)
+                                    if (auto* store = llvm::dyn_cast<llvm::StoreInst>(&instruction))
+                                    {
+                                        llvm::Value* destination = store->getPointerOperand()->stripPointerCasts();
+                                        while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(destination))
+                                            destination = gep->getPointerOperand()->stripPointerCasts();
+                                        if (destination == receiver.Storage)
+                                            lastParamStore = store;
+                                    }
+                                if (lastParamStore == nullptr)
+                                    return;
+                                auto* stringTy = llvm::StructType::getTypeByName(*compiler->context, "string");
+                                if (stringTy == nullptr) return;
+                                auto savedIP = compiler->builder->saveIP();
+                                if (auto* next = lastParamStore->getNextNode())
+                                    compiler->builder->SetInsertPoint(next);
+                                else
+                                    compiler->builder->SetInsertPoint(entry);
+                                auto* value = compiler->builder->CreateLoad(stringTy, receiver.Storage);
+                                compiler->builder->CreateStore(compiler->ClearStringOwnedBit(value), receiver.Storage);
+                                compiler->builder->restoreIP(savedIP);
+                                compiler->MarkVariableOwningString(receiver.TypeAndValue.VariableName);
+                            };
                             // Receiver's C++ class name, so a failed `obj.name(...)` resolution
                             // reports that class's member set instead of CFlat's free functions.
                             auto cxxMemberReceiverType = [&]() -> std::string {
@@ -9844,6 +9920,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     isPostfixMemberCall && !isStaticTemplateThroughObject
                                         && !callHasCxxBraceArguments,
                                     enclosingFunctionName);
+                                markDataMutParamOwning(structVar, namedVar.Primary);
                                 globalScopeCall = false;
                                 Compiler(ctx)->pendingCallSite_ = nullptr;
                                 Compiler(ctx)->pendingReceiverText_.clear();
@@ -9920,6 +9997,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     isPostfixMemberCall && !isStaticTemplateThroughObject
                                         && !callHasCxxBraceArguments,
                                     enclosingFunctionName);
+                                markDataMutParamOwning(structVar, namedVar.Primary);
                                 globalScopeCall = false;
                                 Compiler(ctx)->pendingCallSite_ = nullptr;
                                 Compiler(ctx)->pendingReceiverText_.clear();
@@ -12311,10 +12389,67 @@ llvm::Value* MainListener::ParseExpression(CFlatParser::ExpressionContext* ctx) 
 void MainListener::RegisterDiscardedOwningStructTemp(const LLVMBackend::NamedVariable& nv, bool bare) {
         Compiler()->MarkOpaqueReturnDiscard(nv.Primary, nv.CallerName, bare);
         const std::string& typeName = nv.TypeAndValue.TypeName;
-        if (nv.Primary == nullptr || nv.Storage != nullptr || nv.BaseType == nullptr) return;
+        if (nv.Primary == nullptr || nv.BaseType == nullptr) return;
         if (typeName.empty()) return;
         auto* compiler = Compiler();
-        if (!compiler->IsProducedTempValue(nv.Primary)) return;
+        const bool producedTemp = compiler->IsProducedTempValue(nv.Primary);
+        const bool movedStorage = nv.IsExplicitMove && nv.TypeAndValue.IsMove
+            && nv.Storage != nullptr;
+        if (nv.Storage != nullptr && !movedStorage) return;
+        if (!producedTemp && !nv.IsExplicitMove) return;
+        if (nv.IsExplicitMove && !producedTemp)
+        {
+            if (typeName == "string")
+            {
+                compiler->RegisterOwnedStringTemp(nv.Primary);
+                return;
+            }
+            // A consumed alias capture can own the detached value; IsMove proves its source slot
+            // was cleared even when this result no longer carries that slot.
+            if ((nv.IsAliasBorrow || nv.TypeAndValue.IsAlias) && !nv.TypeAndValue.IsMove) return;
+            if (typeName == "__closure_fat_ptr")
+            {
+                if (!compiler->IsOwnedClosureTemp(nv.Primary))
+                    compiler->RegisterOwnedClosureTemp(nv.Primary);
+                return;
+            }
+
+            // A moved field is zeroed and detached: a nontrivial lowered value is restored to its source
+            // slot so destruction runs in place; other resources drop from a short-lived spill.
+            if (!nv.TypeAndValue.Pointer && nv.BaseType->isStructTy()
+                && compiler->IsLoweredCFlatOnlyStruct(typeName))
+            {
+                llvm::Value* sourceSlot = movedStorage ? nv.Storage : nullptr;
+                if (sourceSlot == nullptr)
+                    if (auto* load = llvm::dyn_cast<llvm::LoadInst>(nv.Primary))
+                        sourceSlot = load->getPointerOperand();
+                if (sourceSlot != nullptr)
+                {
+                    compiler->builder->CreateStore(nv.Primary, sourceSlot);
+                    if (auto* dtor = compiler->GetOrCreateFullDestructor(typeName))
+                        compiler->builder->CreateCall(dtor->getFunctionType(), dtor,
+                                                      { sourceSlot });
+                    compiler->builder->CreateStore(
+                        llvm::Constant::getNullValue(nv.Primary->getType()), sourceSlot);
+                    return;
+                }
+            }
+
+            if (nv.TypeAndValue.Pointer
+                && !nv.TypeAndValue.IsUnique && !nv.IsOwning) return;
+            auto* temp = compiler->CreateAlloca(nv.BaseType);
+            compiler->builder->CreateStore(nv.Primary, temp);
+            LLVMBackend::NamedVariable moved = nv;
+            moved.Storage = temp;
+            moved.CallerName.clear();
+            moved.FieldName.clear();
+            moved.OwningStructName.clear();
+            moved.IsElementAccess = false;
+            moved.IsOwning = true;
+            if (compiler->OwnsDroppableResource(moved))
+                compiler->DropValue(moved);
+            return;
+        }
         if (typeName == "string")
         {
             compiler->RegisterOwnedStringTemp(nv.Primary);
@@ -12463,7 +12598,8 @@ void MainListener::ProcessPlusPlus() {
     }
 
 void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool topLevel,
-    const std::unordered_set<std::string>* localEnumNames) {
+    const std::unordered_set<std::string>* localEnumNames, bool insideScopedExpectation,
+    bool afterBareExpectation) {
         if (!ctx) return;
         std::unordered_set<std::string> discoveredLocalEnumNames;
         if (localEnumNames == nullptr)
@@ -12480,6 +12616,33 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
         if (topLevel) scanAliasScope.emplace(Compiler());
         ++memberTypeSilentDepth_;
         struct SilentExit { int& d; ~SilentExit() { --d; } } silentExit{memberTypeSilentDepth_};
+        auto isCflatTemplate = [&](LLVMBackend* compiler, const std::string& baseName) {
+            const size_t dot = baseName.rfind('.');
+            if (dot != std::string::npos
+                && compiler->IsCxxNamespacePath(baseName.substr(0, dot)))
+                return false;
+            const std::string resolved = compiler->ResolveGenericTemplateBase(baseName);
+            return genericStructTemplates.count(resolved) != 0
+                || genericClassTemplates.count(resolved) != 0
+                || genericInterfaceTemplates.count(resolved) != 0;
+        };
+        if (ctx->getRuleIndex() == CFlatParser::RuleBlockItemList)
+        {
+            bool bareExpectationArmed = afterBareExpectation;
+            for (auto* item : static_cast<CFlatParser::BlockItemListContext*>(ctx)->blockItem())
+            {
+                auto* expectError = item->statement() != nullptr
+                    ? item->statement()->expectErrorStatement() : nullptr;
+                if (expectError != nullptr && expectError->compoundStatement() == nullptr)
+                {
+                    bareExpectationArmed = true;
+                    continue;
+                }
+                ScanAndQueueGenericTypeUses(item, /*topLevel*/ false, localEnumNames,
+                    insideScopedExpectation, bareExpectationArmed);
+            }
+            return;
+        }
         for (auto* child : ctx->children)
         {
             auto* ruleCtx = dynamic_cast<antlr4::RuleContext*>(child);
@@ -12488,6 +12651,15 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
             // Use getRuleIndex() (integer compare) instead of dynamic_cast for each node type.
             switch (ruleCtx->getRuleIndex())
             {
+            case CFlatParser::RuleExpectErrorStatement:
+            {
+                auto* expectError = static_cast<CFlatParser::ExpectErrorStatementContext*>(ruleCtx);
+                if (expectError->compoundStatement() != nullptr)
+                    ScanAndQueueGenericTypeUses(expectError->compoundStatement()->blockItemList(),
+                        /*topLevel*/ false, localEnumNames, /*insideScopedExpectation*/ true,
+                        afterBareExpectation);
+                continue;
+            }
             case CFlatParser::RuleStructDefinition:
                 // Skip generic template struct/class definition bodies (contain unbound T)
                 if (static_cast<CFlatParser::StructDefinitionContext*>(ruleCtx)->genericTypeParameters() != nullptr)
@@ -12515,7 +12687,8 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                 // Declaration/member `if const`: same reason as the statement form - an alias an
                 // arm declares is confined to a frame of its own and never reaches the file map.
                 LLVMBackend::AliasScopeGuard armAliasScope(Compiler());
-                ScanAndQueueGenericTypeUses(ruleCtx, /*topLevel*/ false, localEnumNames);
+                ScanAndQueueGenericTypeUses(ruleCtx, /*topLevel*/ false, localEnumNames,
+                    insideScopedExpectation, afterBareExpectation);
                 continue;
             }
             case CFlatParser::RuleSelectionStatement:
@@ -12531,7 +12704,8 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                         // Undecidable at scan time: no arm's alias may bind, so every arm scans in
                         // a frame of its own - the main pass stays the only one that decides.
                         LLVMBackend::AliasScopeGuard armAliasScope(Compiler());
-                        ScanAndQueueGenericTypeUses(ruleCtx, /*topLevel*/ false, localEnumNames);
+                        ScanAndQueueGenericTypeUses(ruleCtx, /*topLevel*/ false, localEnumNames,
+                            insideScopedExpectation, afterBareExpectation);
                         continue;
                     }
                     auto arms = sel->statement();
@@ -12540,14 +12714,17 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                                          : (arms.size() > 1 ? arms[1] : nullptr);
                     auto* dead = isTrue ? (arms.size() > 1 ? arms[1] : nullptr)
                                         : (arms.empty() ? nullptr : arms[0]);
-                    ScanAndQueueGenericTypeUses(sel->expression(), /*topLevel*/ false, localEnumNames);
+                    ScanAndQueueGenericTypeUses(sel->expression(), /*topLevel*/ false, localEnumNames,
+                        insideScopedExpectation, afterBareExpectation);
                     if (dead != nullptr)
                     {
                         LLVMBackend::AliasScopeGuard deadArmAliasScope(Compiler());
-                        ScanAndQueueGenericTypeUses(dead, /*topLevel*/ false, localEnumNames);
+                        ScanAndQueueGenericTypeUses(dead, /*topLevel*/ false, localEnumNames,
+                            insideScopedExpectation, afterBareExpectation);
                     }
                     if (taken != nullptr)
-                        ScanAndQueueGenericTypeUses(taken, /*topLevel*/ false, localEnumNames);
+                        ScanAndQueueGenericTypeUses(taken, /*topLevel*/ false, localEnumNames,
+                            insideScopedExpectation, afterBareExpectation);
                     continue;
                 }
                 break;
@@ -12610,6 +12787,8 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                     // GenericSpecOf covers both spellings: bare 'Box<int>' and qualified 'NS.Box<int>'.
                     if (auto* genParams = GenericSpecOf(typeSpec, baseName))
                     {
+                        if (insideScopedExpectation && isCflatTemplate(Compiler(typeSpec), baseName))
+                            continue;  // Drain this CFlat body while the scoped expectation is armed.
                         if (GenericArgumentsNeedFunctionLocalEnumDeferral(
                                 genParams, localEnumNames, Compiler(typeSpec),
                                 &Compiler(typeSpec)->gts.scannedNonLocalEnumNames,
@@ -12654,13 +12833,21 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                     if (primaryExpr->genericIdentifier() != nullptr && primaryExpr->genericIdentifier()->genericTypeParameters() != nullptr && primaryExpr->genericIdentifier()->Identifier() != nullptr)
                     {
                         auto* genericParams = primaryExpr->genericIdentifier()->genericTypeParameters();
+                        std::string baseName = primaryExpr->genericIdentifier()->Identifier()->getText();
+                        auto* compiler = Compiler(primaryExpr);
+                        if (insideScopedExpectation
+                            && (isCflatTemplate(compiler, baseName)
+                                || genericFunctionTemplates.count(compiler->ResolveGenericFunctionBase(baseName)) != 0))
+                            continue;
+                        auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(primaryExpr->parent);
+                        if (afterBareExpectation && postfix != nullptr
+                            && IsFollowedByCall(postfix, genericParams))
+                            continue;
                         if (GenericArgumentsNeedFunctionLocalEnumDeferral(
                                 genericParams, localEnumNames, Compiler(primaryExpr),
                                 &Compiler(primaryExpr)->gts.scannedNonLocalEnumNames,
                                 &Compiler(primaryExpr)->gts.scannedTypeNames))
                             continue;  // Queue after the declaration registers the local enum.
-                        std::string baseName =
-                            primaryExpr->genericIdentifier()->Identifier()->getText();
                         std::vector<std::string> typeArgs;
                         for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
                             typeArgs.push_back(ResolveTypeArgEntry(entry));
@@ -12676,6 +12863,7 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                 }
             }
 
-            ScanAndQueueGenericTypeUses(ruleCtx, /*topLevel*/ false, localEnumNames);
+            ScanAndQueueGenericTypeUses(ruleCtx, /*topLevel*/ false, localEnumNames,
+                insideScopedExpectation, afterBareExpectation);
         }
     }

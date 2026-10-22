@@ -14111,7 +14111,7 @@ extern int main()
     total += 3;
 
     passed += testCopyOnAssignFlip();
-    total += 12;
+    total += 14;
 
     passed += testUniqueLocalAndParam();
     total += 24;
@@ -14551,7 +14551,11 @@ extern int main()
     total += 21;
 
     passed += testC15DataMutHeap();
-    total += 2;
+    total += 12;
+
+    passed += testT357AliasReturnTemp();
+    total += 32;
+    total += 3;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
@@ -16213,6 +16217,47 @@ int c15DataMutRound()
     return got;
 }
 
+int c15DataMutSinkRead(move string t) { return (int)t.data()[0]; }
+int c15DataMutSink(string s, int k)
+{
+    if (k > 0) { s.data_mut()[0] = 'x'; }
+    return c15DataMutSinkRead(move s);
+}
+
+int c15DataMutParam(string s)
+{
+    s.data_mut()[0] = 'P';
+    return (int)s.data()[0];
+}
+
+string c15DataMutReturn(string s)
+{
+    s.data_mut()[0] = 'R';
+    return s;
+}
+
+int c15DataMutRead(string s) { return (int)s.data()[0]; }
+int c15DataMutPass(string s)
+{
+    s.data_mut()[0] = 'A';
+    return c15DataMutRead(s);
+}
+
+int c15DataMutLoop()
+{
+    int total = 0;
+    int i = 0;
+    while (i < 10) { total = total + c15DataMutParam("abc"); i++; }
+    return total;
+}
+
+int c15DataMutOwnedSource()
+{
+    string source = "abc".copy();
+    int value = c15DataMutParam(source);
+    return value == (int)'P' && source.data()[0] == 'a' ? 1 : 0;
+}
+
 int testC15DataMutHeap()
 {
     int passed = 0;
@@ -16222,5 +16267,256 @@ int testC15DataMutHeap()
     i64 after = (i64)HeapAudit.reportLeaks();
     passed += Test("c15_data_mut_values", got, 15);
     passed += Test("c15_data_mut_heap_delta", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    int paramValue = c15DataMutParam("abc");
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("c15_data_mut_param_value", paramValue, (int)'P');
+    passed += Test("c15_data_mut_param_freed", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    int sinkValue = c15DataMutSink("abc".copy(), 0) + c15DataMutSink("abc".copy(), 1);
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("c15_data_mut_sink_value", sinkValue, (int)'a' + (int)'x');
+    passed += Test("c15_data_mut_sink_freed", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    int returnedValue = 0;
+    {
+        string returned = c15DataMutReturn("abc");
+        returnedValue = (int)returned.data()[0];
+    }
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("c15_data_mut_return_value", returnedValue, (int)'R');
+    passed += Test("c15_data_mut_return_transfers_once", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    int passedValue = c15DataMutPass("abc");
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("c15_data_mut_pass_value", passedValue, (int)'A');
+    passed += Test("c15_data_mut_pass_freed", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    int loopValue = c15DataMutLoop();
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("c15_data_mut_loop_value", loopValue, 10 * (int)'P');
+    passed += Test("c15_data_mut_loop_freed", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    int ownedSourceValue = c15DataMutOwnedSource();
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("c15_data_mut_owned_source_unchanged", ownedSourceValue, 1);
+    passed += Test("c15_data_mut_owned_source_freed", after - before, (i64)0);
+    return passed;
+}
+
+struct T357AliasStringHolder { string value = default; };
+
+string t357AliasString(string value) { return value; }
+string t357PickAliasString(string first, string second, bool chooseFirst)
+{
+    return chooseFirst ? first : second;
+}
+move string t357MakeAliasString() { return "mk-t357-owned-string".copy(); }
+move string t357MakeAliasLiteral() { return "literal-t357"; }
+string t357ReturnAliasCopy() { return t357AliasString("copy-t357-return".copy()); }
+string t357ReturnAliasMake() { return t357AliasString(t357MakeAliasString()); }
+int t357AliasStringFirst(string value) { return (int)value.data()[0]; }
+
+int testT357AliasReturnTemp()
+{
+    int passed = 0;
+    HeapAudit.enable();
+    i64 before = (i64)HeapAudit.reportLeaks();
+    i64 live = 0;
+    i64 after = 0;
+    int value = 0;
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        string result = t357AliasString("copy-t357-decl".copy());
+        value = t357AliasStringFirst(result);
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_decl_copy_value_and_owner", value == (int)'c' && live == 1, true);
+    passed += Test("t357_decl_copy_cleanup", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        string result = t357AliasString(t357MakeAliasString());
+        value = t357AliasStringFirst(result);
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_decl_mk_value_and_owner", value == (int)'m' && live == 1, true);
+    passed += Test("t357_decl_mk_cleanup", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        string result = t357AliasString(t357MakeAliasLiteral());
+        value = t357AliasStringFirst(result);
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_decl_literal_value_and_no_owner", value == (int)'l' && live == 0, true);
+    passed += Test("t357_decl_literal_no_heap_delta", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        string result = default;
+        result = t357AliasString("copy-t357-assign".copy());
+        value = t357AliasStringFirst(result);
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_assign_copy_value_and_owner", value == (int)'c' && live == 1, true);
+    passed += Test("t357_assign_copy_cleanup", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        string result = default;
+        result = t357AliasString(t357MakeAliasString());
+        value = t357AliasStringFirst(result);
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_assign_mk_value_and_owner", value == (int)'m' && live == 1, true);
+    passed += Test("t357_assign_mk_cleanup", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        string result = t357ReturnAliasCopy();
+        value = t357AliasStringFirst(result);
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_return_copy_value_and_owner", value == (int)'c' && live == 1, true);
+    passed += Test("t357_return_copy_cleanup", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        string result = t357ReturnAliasMake();
+        value = t357AliasStringFirst(result);
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_return_mk_value_and_owner", value == (int)'m' && live == 1, true);
+    passed += Test("t357_return_mk_cleanup", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T357AliasStringHolder holder = default;
+        holder.value = t357AliasString("copy-t357-field".copy());
+        value = t357AliasStringFirst(holder.value);
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_field_copy_value_and_owner", value == (int)'c' && live == 1, true);
+    passed += Test("t357_field_copy_cleanup", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T357AliasStringHolder holder = default;
+        holder.value = t357AliasString(t357MakeAliasString());
+        value = t357AliasStringFirst(holder.value);
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_field_mk_value_and_owner", value == (int)'m' && live == 1, true);
+    passed += Test("t357_field_mk_cleanup", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    value = t357AliasStringFirst(t357AliasString("copy-t357-callarg".copy()));
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_callarg_copy_value_and_cleanup",
+                   value == (int)'c' && after - before == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    value = t357AliasStringFirst(t357AliasString(t357MakeAliasString()));
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_callarg_mk_value_and_cleanup",
+                   value == (int)'m' && after - before == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    _ = t357AliasString("copy-t357-discard".copy());
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_discard_copy_cleanup", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    t357AliasString("copy-t357-discard-bare".copy());
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_discard_bare_copy_cleanup", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    _ = t357AliasString(t357MakeAliasString());
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_discard_mk_cleanup", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        string result = t357AliasString("borrowed-literal-t357");
+        value = t357AliasStringFirst(result);
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_literal_borrowed_value", value == (int)'b' && live == 0, true);
+    passed += Test("t357_literal_no_heap_delta", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        string named = "named-t357".copy();
+        i64 namedBase = (i64)HeapAudit.reportLeaks();
+        i64 selectedLive = 0;
+        i64 selectedAfter = 0;
+        {
+            string result = t357PickAliasString("temp-t357".copy(), named, true);
+            value = t357AliasStringFirst(result);
+            selectedLive = (i64)HeapAudit.reportLeaks() - namedBase;
+        }
+        selectedAfter = (i64)HeapAudit.reportLeaks() - namedBase;
+        passed += Test("t357_mixed_temp_selected_value_and_owner",
+                       value == (int)'t' && selectedLive == 1, true);
+        passed += Test("t357_mixed_temp_selected_cleanup", selectedAfter, (i64)0);
+    }
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_mixed_temp_selected_named_cleanup", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        string named = "named-t357".copy();
+        i64 namedBase = (i64)HeapAudit.reportLeaks();
+        i64 namedLive = 0;
+        i64 namedAfter = 0;
+        {
+            string result = t357PickAliasString("temp-t357".copy(), named, false);
+            value = t357AliasStringFirst(result);
+            namedLive = (i64)HeapAudit.reportLeaks() - namedBase;
+        }
+        namedAfter = (i64)HeapAudit.reportLeaks() - namedBase;
+        passed += Test("t357_mixed_named_selected_value", value, (int)'n');
+        passed += Test("t357_mixed_named_selected_copy_owner", namedLive, (i64)1);
+        passed += Test("t357_mixed_named_selected_temp_cleanup", namedAfter, (i64)0);
+        passed += Test("t357_mixed_named_source_stays_live",
+                       t357AliasStringFirst(named), (int)'n');
+    }
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_mixed_named_selected_owner_cleanup", after - before, (i64)0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        string named = "named-t357".copy();
+        i64 namedBase = (i64)HeapAudit.reportLeaks();
+        i64 namedLive = 0;
+        {
+            string result = t357AliasString(named);
+            value = t357AliasStringFirst(result);
+            namedLive = (i64)HeapAudit.reportLeaks() - namedBase;
+        }
+        after = (i64)HeapAudit.reportLeaks();
+        passed += Test("t357_named_arg_stays_borrowed", value == (int)'n' && namedLive == 0, true);
+    }
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t357_named_arg_owner_cleanup", after - before, (i64)0);
     return passed;
 }

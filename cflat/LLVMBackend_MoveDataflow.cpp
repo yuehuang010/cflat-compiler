@@ -3521,7 +3521,7 @@ bool LLVMBackend::DeferExpectationVerdict()
                         [&](const auto& e) { return e.Owner == scope; }))
         return false;
     deferredExpectations_.push_back(activeExpectPosition_);
-    RestoreFileScopeExpectedError();
+    RestoreExpectScope(scope);
     return true;
 }
 

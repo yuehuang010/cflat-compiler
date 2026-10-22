@@ -8356,6 +8356,77 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 : CreateFunctionCall(candidate.Function, argList, calleeMayUnwind));
         RecordOpaqueReturnCall(result, candidate.ReturnType.TypeName, functionName);
         unwindCallConsumedTemps_.clear();
+        // An inferred return-sink string parameter is returned as a borrow. Transfer a pending
+        // temp only when the result matches its buffer and runtime OWNED bit.
+        bool aliasStringTempMayOwn = false;
+        auto* cflatStringTy = llvm::StructType::getTypeByName(*context, "string");
+        if (result != nullptr && cflatStringTy != nullptr && result->getType() == cflatStringTy
+            && !candidate.IsCxx && !candidate.External && !candidate.IsMethod
+            && !candidate.ReturnsOwned && !candidate.ReturnsAlias
+            && !candidate.ReturnType.Pointer && !candidate.ReturnType.ElemPointer
+            && ResolveTypeAlias(candidate.ReturnType.TypeName) == "string")
+        {
+            std::vector<llvm::Value*> stringTemps;
+            for (size_t i = 0; i < candidate.Parameters.size() && i < argList.size(); ++i)
+            {
+                const auto& param = candidate.Parameters[i];
+                if (!param.IsReturnInferredSink || param.Pointer || param.ElemPointer
+                    || param.IsAlias || param.IsMove
+                    || ResolveTypeAlias(param.TypeName) != "string")
+                    continue;
+                llvm::Value* value = argList[i];
+                if (value == nullptr || value->getType() != cflatStringTy
+                    || !IsPendingOwnedStringTemp(value))
+                    continue;
+                if (std::find(stringTemps.begin(), stringTemps.end(), value) == stringTemps.end())
+                    stringTemps.push_back(value);
+            }
+
+            if (!stringTemps.empty())
+            {
+                auto* resultPtr = builder->CreateExtractValue(result, { 0u }, "aliasret.str.ptr");
+                auto* resultLen = builder->CreateExtractValue(result, { 1u }, "aliasret.str.len");
+                llvm::Value* selectedAny = builder->getFalse();
+                auto* handoffBlock = builder->GetInsertBlock();
+                for (llvm::Value* source : stringTemps)
+                {
+                    auto* sourcePtr = builder->CreateExtractValue(source, { 0u }, "aliasret.src.ptr");
+                    auto* sourceLen = builder->CreateExtractValue(source, { 1u }, "aliasret.src.len");
+                    auto* ptrMatches = builder->CreateICmpEQ(resultPtr, sourcePtr,
+                                                             "aliasret.src.ptr.matches");
+                    auto* sourceOwnedBit = builder->CreateAnd(sourceLen,
+                        builder->getInt32(0x80000000u), "aliasret.src.owned.bit");
+                    auto* sourceIsOwned = builder->CreateICmpNE(sourceOwnedBit,
+                        builder->getInt32(0), "aliasret.src.is.owned");
+                    auto* selected = builder->CreateAnd(ptrMatches, sourceIsOwned,
+                                                        "aliasret.src.selected");
+                    selectedAny = builder->CreateOr(selectedAny, selected, "aliasret.any.selected");
+
+                    auto* borrowedLen = builder->CreateAnd(sourceLen, builder->getInt32(0x7FFFFFFF),
+                                                          "aliasret.src.borrowed");
+                    auto* ownedLen = builder->CreateSelect(selected, borrowedLen, sourceLen,
+                                                           "aliasret.src.len.next");
+                    auto* updatedSource = builder->CreateInsertValue(source, ownedLen, { 1u },
+                                                                     "aliasret.src.next");
+                    for (auto& pending : pendingOwnedStringTemps)
+                        if (pending.first == source)
+                        {
+                            pending.first = updatedSource;
+                            pending.second = handoffBlock;
+                        }
+                }
+
+                auto* resultOwnedLen = builder->CreateOr(resultLen, builder->getInt32(0x80000000u),
+                                                         "aliasret.str.owned");
+                auto* resultLenNext = builder->CreateSelect(selectedAny, resultOwnedLen, resultLen,
+                                                            "aliasret.str.len.next");
+                auto* ownedResult = builder->CreateInsertValue(result, resultLenNext, { 1u },
+                                                               "aliasret.str.next");
+                PropagateProducedTempValue(result, ownedResult);
+                result = ownedResult;
+                aliasStringTempMayOwn = true;
+            }
+        }
         // Settle the copy slots of an alias-return call. When every possible source slot holds a
         // temporary, the result is one of them: it owns that value, and a slot the result does not
         // name is destroyed at the end of the full expression (runtime-compared with several).
@@ -8515,6 +8586,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // A core unique return owns like `move`.
         lastCallReturnsOwned = uniqueFieldBorrow == nullptr
             && (candidate.ReturnsOwned
+                || aliasStringTempMayOwn
                 || (!resultIsAlias && !candidate.ReturnType.Pointer
                     && IsCoreUniqueType(candidate.ReturnType.TypeName)));
         // Ledger the owning-return result by value for the no-discard check: string / pointer /
@@ -8525,7 +8597,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             && IsOwningValueType(candidate.ReturnType.TypeName);
         if (lastCallReturnsOwned || ownedValueStructReturn)
         {
-            RegisterOwnedReturnTemp(result, functionName, candidate.ReturnType);
+            RegisterOwnedReturnTemp(result, functionName, candidate.ReturnType,
+                                    !aliasStringTempMayOwn);
             // An `alias` return hands back a BORROW the callee still owns. Keep the entry VISIBLE
             // to the no-discard check, but never let it answer an ownership question - otherwise a
             // '?:' arm scores it owning and the receiving local destroys the callee's live value.
@@ -8655,7 +8728,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // straight into a struct field (GetOrCreateMemberwiseCopy), bypassing the assignment-path
         // unregister, so flushing it would double-free a now-owned field - same reasoning as closures.
         if (result != nullptr
-            && candidate.ReturnsOwned
+            && (candidate.ReturnsOwned || aliasStringTempMayOwn)
             && functionName != "copy"
             && result->getType() == llvm::StructType::getTypeByName(*context, "string"))
             RegisterOwnedStringTemp(result);

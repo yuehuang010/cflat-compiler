@@ -857,8 +857,9 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                     result.TypeAndValue.ElemPointer = joinShape.elemPointer;
                 }
                 // Both arms point at one native class: rank the call argument as that class
-                // pointer. Call arguments only - other consumers resolve each arm themselves.
+                // pointer. Call arguments only, and `?:` only - a '??' join keeps its arms' ranking.
                 else if (joinShape.value == result.Primary && !joinShape.joinClassPointee.empty()
+                         && condCtx->Question() != nullptr
                          && inCallArgument_ && IsCallArgumentThroughParens(ctx)
                          && InferTernaryArmType(result.Primary).TypeName.empty())
                 {
@@ -6962,12 +6963,33 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             bool srcIsOwningAssignLvalue = rightNV.Storage != nullptr
                 && !SourceIsDanglingAliasBorrow(compiler, rightNV)
                 && (srcIsNamedSlot || rightNV.TypeAndValue.TypeName != "string");
-            // A dereferenced pointer has raw loaded-address Storage and must use the deref arm;
-            // treating that address as a named whole-value slot loses pointer-mediated self-assign.
+            // String-field copies must not recopy a materialized ternary join or owned temporary.
+            const bool stringFieldCopy = right != nullptr && right->getType()->isStructTy()
+                && destIsStructField && NamedVarIsString(namedVar)
+                && rightNV.TypeAndValue.TypeName == "string";
+            const bool srcIsStorageJoin = stringFieldCopy && rightNV.Storage != nullptr
+                && (llvm::isa<llvm::PHINode>(rightNV.Storage)
+                    || llvm::isa<llvm::SelectInst>(rightNV.Storage));
+            const bool srcIsOwnedTemp = stringFieldCopy && compiler->IsOwnedTempValue(rightNV);
             bool srcIsDerefLvalue = rightNV.Storage != nullptr && rightNV.BaseType != nullptr
                 && !llvm::isa<llvm::AllocaInst>(rightNV.Storage)
                 && !llvm::isa<llvm::GlobalVariable>(rightNV.Storage)
-                && !llvm::isa<llvm::GetElementPtrInst>(rightNV.Storage);
+                && !llvm::isa<llvm::GetElementPtrInst>(rightNV.Storage)
+                && (!stringFieldCopy || (!srcIsStorageJoin && !srcIsOwnedTemp));
+            // A string loaded through a pointer loses the pointee's owner/borrow marker at the
+            // dereference. A field destination outlives this expression, so preserve the source
+            // and store an independent string copy just like a plain string local source.
+            if (operatorText == "=" && right != nullptr && right->getType()->isStructTy()
+                && destIsStructField && NamedVarIsString(namedVar)
+                && rightNV.TypeAndValue.TypeName == "string"
+                && srcIsDerefLvalue
+                && !rightNV.TypeAndValue.IsMove
+                && !rightNV.TypeAndValue.IsAlias && !rightNV.IsAliasBorrow
+                && !rightStringImplicitCopied)
+            {
+                right = compiler->EmitOwnedStringDeepCopy(right);
+                rightStringImplicitCopied = true;
+            }
             if (operatorText == "=" && right && right->getType()->isStructTy()
                 && !namedVar.TypeAndValue.IsInterface
                 && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination))
@@ -9031,10 +9053,11 @@ void MainListener::JoinTernaryPointerShape(LLVMBackend::TypedValue& result,
     }
 
 /*
- * A `?:` over two pointers to ONE native class at one depth (or one such arm and a null arm) has
- * that class as its pointee, as C++'s composite pointer type. Recorded only on the transient
- * TypedValue for call-argument overload ranking: the element ledger and sourceTypeName stay
- * untouched, so interface boxing and ownership guards keep resolving each arm on its own.
+ * A conditional join (`?:`, `??`) over pointers to ONE class at one depth (or one such arm and a
+ * null arm) has that class as its pointee, as C++'s composite pointer type. Recorded only on the
+ * transient TypedValue: the element ledger and sourceTypeName stay untouched, so interface boxing
+ * and ownership guards keep resolving each arm on its own. Call-argument ranking reads it for `?:`
+ * only; a member receiver recovers it (see ParsePostfixExpressionInner).
  */
 void MainListener::JoinTernaryClassPointee(LLVMBackend::TypedValue& result,
                                            const LLVMBackend::TypedValue& trueArm,
@@ -9062,8 +9085,9 @@ void MainListener::JoinTernaryClassPointee(LLVMBackend::TypedValue& result,
             if (depth < 1 || type.ElemPointer != (depth > 1)) return {};
             const std::string name = compiler->ResolveTypeAlias(type.TypeName);
             if (name.empty() || LLVMBackend::IsPrimitiveTypeName(name)
-                || compiler->IsCxxRecord(name) || compiler->IsInterfaceType(name)
-                || compiler->dataStructures.find(name) == compiler->dataStructures.end())
+                || compiler->IsInterfaceType(name)
+                || (!compiler->IsCxxRecord(name)
+                    && compiler->dataStructures.find(name) == compiler->dataStructures.end()))
                 return {};
             return name;
         };
@@ -10334,6 +10358,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             result.isAlias = trueBr != nullptr ? trueAlias : falseAlias;
             result.storage = trueBr != nullptr ? trueStorage : falseStorage;
             JoinTernaryPointerShape(result, trueBr != nullptr ? trueShape : falseShape,
+                                    trueBr != nullptr ? trueShape : falseShape);
+            JoinTernaryClassPointee(result, trueBr != nullptr ? trueShape : falseShape,
                                     trueBr != nullptr ? trueShape : falseShape);
             return result;
         }
@@ -11688,6 +11714,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             LLVMBackend::TypedValue result{ joined, false };
             // Both arms named one raw pointer shape: the '??' join carries it like a '?:' join.
             JoinTernaryPointerShape(result, lhsTv, rhsShape);
+            JoinTernaryClassPointee(result, lhsTv, rhsShape);
             if (inCallArgument_ && joined != nullptr && joined->getType()->isPointerTy()
                 && lhsBr != nullptr && rhsBr != nullptr)
             {
@@ -20454,6 +20481,9 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                 namedVar.Storage  = loadedPtr;
                 namedVar.Primary  = nullptr;
                 namedVar.BaseType = pointeeType;
+                // `w[i]` identifies a pointer slot in an array view; after `*w[i]`, the result
+                // is the pointed-to lvalue and no longer belongs to the view's element storage.
+                namedVar.IsViewElement = false;
             }
             else if (opText == "!")
             {
@@ -28166,6 +28196,9 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                 result.TypeAndValue = argNV.TypeAndValue;
                 result.TypeAndValue.IsMove = true;
                 result.IsExplicitMove = true;
+                result.IsAliasBorrow = argNV.IsAliasBorrow;
+                result.BorrowsOwnedString = argNV.BorrowsOwnedString;
+                result.FromOwningTempField = argNV.FromOwningTempField;
                 result.IsBonded = argNV.IsBonded;
                 result.BondByAddress = argNV.BondByAddress;
                 result.BondedSources = argNV.BondedSources;
@@ -28340,6 +28373,7 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         // like the already-blocked `delete b`) is rejected, and so a PLAIN `T*` destination declines
         // to adopt, instead of double-freeing.
         result.IsBorrowed     = srcBorrowLive;
+        result.IsOwning       = argNV.IsOwning;
         result.BorrowedOrigin = srcBorrowLive ? argNV.BorrowedOrigin : std::string();
         return result;
     }

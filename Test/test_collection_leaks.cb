@@ -28,6 +28,232 @@ import "spsc_queue.cb";
 import "diagnostic/heap_audit.cb";
 import "test_helper.cb";
 
+// T352: moved owning fields must be destroyed by every discard path. The counters prove the
+// destructor ran; HeapAudit proves each buffer or allocation was released exactly once.
+int t352UniqueDtor = 0;
+int t352ListDtor = 0;
+int t352ValueDtor = 0;
+int t352DictDtor = 0;
+bool t352ReadString = false;
+bool t352ReadUnique = false;
+bool t352ReadList = false;
+bool t352ReadValue = false;
+bool t352ReadDict = false;
+struct T352ProbeValue
+{
+    int kind = 0;
+    string payload = default;
+    ~T352ProbeValue()
+    {
+        if (kind == 1) t352UniqueDtor++;
+        if (kind == 2) t352ListDtor++;
+        if (kind == 3) t352ValueDtor++;
+        if (kind == 4) t352DictDtor++;
+    }
+};
+struct T352ProbeResources
+{
+    string s = default;
+    unique T352ProbeValue* u = nullptr;
+    list<unique T352ProbeValue*> l = default;
+    T352ProbeValue v = default;
+    dictionary<int, unique T352ProbeValue*> d = default;
+    void seedString() { s = "t352 owned string field value long enough to allocate".copy(); }
+    void seedUnique() { u = new T352ProbeValue(); u->kind = 1; }
+    void seedList() { l.add(new T352ProbeValue()); l[0]->kind = 2; }
+    void seedValue() { v.kind = 3; v.payload = "t352 owned nested struct value field buffer".copy(); }
+    void seedDictionary() { d.add(1, new T352ProbeValue()); d.get(1)->kind = 4; }
+    void releaseThisString() { _ = move this.s; }
+    void releaseThisUnique() { _ = move this.u; }
+    void releaseThisList() { _ = move this.l; }
+    void releaseThisValue() { _ = move this.v; }
+    void releaseThisDictionary() { _ = move this.d; }
+    void releaseImplicitString() { _ = move s; }
+    void releaseImplicitUnique() { _ = move u; }
+    void releaseImplicitList() { _ = move l; }
+    void releaseImplicitValue() { _ = move v; }
+    void releaseImplicitDictionary() { _ = move d; }
+    void releaseParameterString(T352ProbeResources* p) { _ = move p->s; }
+    void releaseParameterUnique(T352ProbeResources* p) { _ = move p->u; }
+    void releaseParameterList(T352ProbeResources* p) { _ = move p->l; }
+    void releaseParameterValue(T352ProbeResources* p) { _ = move p->v; }
+    void releaseParameterDictionary(T352ProbeResources* p) { _ = move p->d; }
+    ~T352ProbeResources()
+    {
+        _ = move this.s;
+        _ = move this.u;
+        _ = move this.l;
+        _ = move this.v;
+        _ = move this.d;
+        t352ReadString = this.s.length() == 0;
+        t352ReadUnique = this.u == nullptr;
+        t352ReadList = this.l.count() == 0;
+        t352ReadValue = this.v.kind == 0 && this.v.payload.length() == 0;
+        t352ReadDict = this.d.count() == 0;
+    }
+};
+struct T352ProbeImplicitDtor
+{
+    string s = default;
+    unique T352ProbeValue* u = nullptr;
+    list<unique T352ProbeValue*> l = default;
+    T352ProbeValue v = default;
+    dictionary<int, unique T352ProbeValue*> d = default;
+    void seedString() { this.s = "t352 owned string field value long enough to allocate".copy(); }
+    void seedUnique() { this.u = new T352ProbeValue(); this.u->kind = 1; }
+    void seedList() { this.l.add(new T352ProbeValue()); this.l[0]->kind = 2; }
+    void seedValue() { this.v.kind = 3; this.v.payload = "t352 owned nested struct value field buffer".copy(); }
+    void seedDictionary() { this.d.add(1, new T352ProbeValue()); this.d.get(1)->kind = 4; }
+    ~T352ProbeImplicitDtor()
+    {
+        _ = move s;
+        _ = move u;
+        _ = move l;
+        _ = move v;
+        _ = move d;
+        t352ReadString = this.s.length() == 0;
+        t352ReadUnique = this.u == nullptr;
+        t352ReadList = this.l.count() == 0;
+        t352ReadValue = this.v.kind == 0 && this.v.payload.length() == 0;
+        t352ReadDict = this.d.count() == 0;
+    }
+};
+struct T352ProbeNode
+{
+    T352ProbeResources b = default;
+};
+struct T352ProbeNested
+{
+    T352ProbeNode a = default;
+    void releaseNestedString() { _ = move a.b.s; }
+    void releaseNestedUnique() { _ = move a.b.u; }
+    void releaseNestedList() { _ = move a.b.l; }
+    void releaseNestedValue() { _ = move a.b.v; }
+    void releaseNestedDictionary() { _ = move a.b.d; }
+    ~T352ProbeNested()
+    {
+        _ = move a.b.s;
+        _ = move a.b.u;
+        _ = move a.b.l;
+        _ = move a.b.v;
+        _ = move a.b.d;
+        t352ReadString = a.b.s.length() == 0;
+        t352ReadUnique = a.b.u == nullptr;
+        t352ReadList = a.b.l.count() == 0;
+        t352ReadValue = a.b.v.kind == 0 && a.b.v.payload.length() == 0;
+        t352ReadDict = a.b.d.count() == 0;
+    }
+};
+void freeNestedString(T352ProbeNode* a) { _ = move a->b.s; }
+void freeNestedUnique(T352ProbeNode* a) { _ = move a->b.u; }
+void freeNestedList(T352ProbeNode* a) { _ = move a->b.l; }
+void freeNestedValue(T352ProbeNode* a) { _ = move a->b.v; }
+void freeNestedDictionary(T352ProbeNode* a) { _ = move a->b.d; }
+void freePointerString(T352ProbeResources* p) { _ = move p->s; }
+void freePointerUnique(T352ProbeResources* p) { _ = move p->u; }
+void freePointerList(T352ProbeResources* p) { _ = move p->l; }
+void freePointerValue(T352ProbeResources* p) { _ = move p->v; }
+void freePointerDictionary(T352ProbeResources* p) { _ = move p->d; }
+bool t352ReadArray = false;
+struct T352ProbeArray
+{
+    string[2] arr = default;
+    void seedArray() { arr[0] = "t352 array string field buffer allocation".copy(); }
+    void releaseThisArray() { _ = move this.arr[0]; }
+    void releaseImplicitArray() { _ = move arr[0]; }
+    ~T352ProbeArray()
+    {
+        _ = move arr[0];
+        t352ReadArray = arr[0].length() == 0;
+    }
+};
+void freePointerArray(T352ProbeArray* p) { _ = move p->arr[0]; }
+
+// T356: string lvalues reached through a pointer must copy when they escape the expression.
+struct T356StringHolder { string value = default; };
+u64 t356AuditAllocations = 0;
+u64 t356AuditFrees = 0;
+bool t356ForwardAudit = true;
+void t356CountAlloc(void* pointer, u64 size)
+{
+    t356AuditAllocations++;
+    if (t356ForwardAudit) cflat_heap_audit_alloc(pointer, size);
+}
+void t356CountFree(void* pointer)
+{
+    t356AuditFrees++;
+    if (t356ForwardAudit) cflat_heap_audit_free(pointer);
+}
+int t356ReadDerefString(string* ps) { string t = *ps; return t.length(); }
+bool t356MutateDerefString(string* ps)
+{
+    string t = *ps;
+    char* bytes = t.data_mut();
+    bytes[0] = (char)90;
+    return t.charAt(0) == (i8)90 && ps->charAt(0) == (i8)97;
+}
+string t356ReturnDerefString(string* ps) { string t = *ps; return t; }
+int t356StoreDerefString(string* ps)
+{
+    T356StringHolder holder = default;
+    holder.value = *ps;
+    return holder.value.length();
+}
+int t356MoveDiscardDerefString(string* ps)
+{
+    string t = *ps;
+    int value = t.length();
+    _ = move t;
+    return value;
+}
+int t356MoveInitDerefString(string* ps)
+{
+    string t = *ps;
+    string u = move t;
+    return u.length();
+}
+int t356ReadDoubleDerefString(string** pp) { string t = **pp; return t.length(); }
+int t356ReadArrayDerefString(string** slots) { string t = *slots[0]; return t.length(); }
+int t356ReadTernaryDerefString(string* a, string* b, bool c)
+{
+    string t = c ? *a : *b;
+    return t.length();
+}
+int t356StoreTernaryDerefString(string* a, string* b, bool c)
+{
+    T356StringHolder holder = default;
+    holder.value = c ? *a : *b;
+    return holder.value.length();
+}
+int t356ReadViewElementDerefString(string*[] w)
+{
+    string t = *w[0];
+    return t.length();
+}
+int t356ReadPointerIndex0DerefString(string* ps)
+{
+    string t = ps[0];
+    return t.length();
+}
+int t356ReadPointerIndex1DerefString(string* ps)
+{
+    string t = ps[1];
+    return t.length();
+}
+string* t356GetStringPointer(string* ps) { return ps; }
+int t356ReadCallDerefString(string* ps) { string t = *t356GetStringPointer(ps); return t.length(); }
+int t356AssignDerefString(string* ps)
+{
+    string t = "old".copy();
+    t = *ps;
+    return t.length();
+}
+int t356PassStringByValue(string value) { return value.length(); }
+int t356PassDerefString(string* ps)
+{
+    return t356PassStringByValue(*ps);
+}
+
 // Owning aggregates with managed fields and NO user copy() - exercise the synthesized
 // memberwise copy() and the field-reassignment destruct-old (Bugs 5 and 6 below).
 struct LeakRow { string name = default; };
@@ -659,6 +885,39 @@ int t260ReadNonNullCall(int c) { T260Temp* e = new T260Temp(59); g_t260Seen = t2
 void t260KeepLater(int* p) { g_t260Kept = p; }
 int t260ReadLater(int* p) { return *p; }
 
+// T351: nested class-pointer joins keep their pointee for field reads and address escapes.
+int g_t351Dtor = 0;
+int g_t351Made = 0;
+int g_t351Seen = 0;
+int* g_t351Keep = nullptr;
+struct T351Temp
+{
+    int v = 0;
+    T351Temp(int x) { v = x; g_t351Made = g_t351Made + 1; }
+    ~T351Temp() { g_t351Dtor = g_t351Dtor + 1; }
+};
+void t351ReadLater(int* p) { g_t351Seen = *p; }
+void t351KeepLater(int* p);
+void t351BReadAddress(bool c)
+{ T351Temp* e = nullptr; t351ReadLater(&(c ? (e ?? new T351Temp(5)) : e)->v); }
+void t351BKeepAddress(bool c)
+{ T351Temp* e = nullptr; t351KeepLater(&(c ? (e ?? new T351Temp(5)) : e)->v); }
+int t351BPlain(bool c)
+{ T351Temp* e = nullptr; return (c ? (e ?? new T351Temp(5)) : e)->v; }
+void t351CReadAddress(bool c, bool d)
+{ t351ReadLater(&(c ? new T351Temp(1) : d ? new T351Temp(2) : new T351Temp(3))->v); }
+void t351CKeepAddress(bool c, bool d)
+{ t351KeepLater(&(c ? new T351Temp(1) : d ? new T351Temp(2) : new T351Temp(3))->v); }
+int t351CPlain(bool c, bool d)
+{ return (c ? new T351Temp(1) : d ? new T351Temp(2) : new T351Temp(3))->v; }
+void t351DReadAddress(bool c)
+{ T351Temp* e = nullptr; T351Temp* f = nullptr; t351ReadLater(&(c ? (e ?? new T351Temp(5)) : (f ?? new T351Temp(6)))->v); }
+void t351DKeepAddress(bool c)
+{ T351Temp* e = nullptr; T351Temp* f = nullptr; t351KeepLater(&(c ? (e ?? new T351Temp(5)) : (f ?? new T351Temp(6)))->v); }
+int t351DPlain(bool c)
+{ T351Temp* e = nullptr; T351Temp* f = nullptr; return (c ? (e ?? new T351Temp(5)) : (f ?? new T351Temp(6)))->v; }
+void t351KeepLater(int* p) { g_t351Keep = p; }
+
 // Regression: a value struct with a USER destructor over a RAW pointer field (not `unique`) and NO
 // copy() is NON-copyable - the memberwise synth would shallow-share the pointer while the dtor frees
 // it on both copies (double-free). IsCopyableType now rejects that shape, so `RawResLeak b = a;`
@@ -1268,6 +1527,761 @@ extern int main()
 
     int passed = 0;
     int total = 0;
+
+    // T352 moved-field discard coverage (45 matrix cells + 4 shared helper callers).
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        { T352ProbeResources o = default; o.seedString(); }
+        bool clean = HeapAudit.reportLeaks() == before && t352UniqueDtor == dtorBefore + 0 && t352ReadString;
+        total++; passed += Test("t352_dtor_this_string", clean, true);
+    }
+    // T356: a string dereference is copied into an escaping local, return, or field.
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        u64 before = HeapAudit.reportLeaks();
+        int value = t356ReadDerefString(&source);
+        bool clean = HeapAudit.reportLeaks() == before && value == 46;
+        total++; passed += Test("t356_deref_string_read", clean, true);
+    }
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        u64 before = HeapAudit.reportLeaks();
+        bool isolated = t356MutateDerefString(&source);
+        bool clean = HeapAudit.reportLeaks() == before && isolated;
+        total++; passed += Test("t356_deref_string_mutate", clean, true);
+    }
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        u64 before = HeapAudit.reportLeaks();
+        bool value = false;
+        { string result = t356ReturnDerefString(&source); value = result.length() == 46; }
+        bool clean = HeapAudit.reportLeaks() == before && value;
+        total++; passed += Test("t356_deref_string_return", clean, true);
+    }
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        u64 before = HeapAudit.reportLeaks();
+        int value = t356StoreDerefString(&source);
+        bool clean = HeapAudit.reportLeaks() == before && value == 46;
+        total++; passed += Test("t356_deref_string_field", clean, true);
+    }
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        u64 before = HeapAudit.reportLeaks();
+        int value = t356MoveDiscardDerefString(&source);
+        bool clean = HeapAudit.reportLeaks() == before && value == 46;
+        total++; passed += Test("t356_deref_string_move_discard", clean, true);
+    }
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        u64 before = HeapAudit.reportLeaks();
+        int value = t356MoveInitDerefString(&source);
+        bool clean = HeapAudit.reportLeaks() == before && value == 46;
+        total++; passed += Test("t356_deref_string_move_init", clean, true);
+    }
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        string* pointer = &source;
+        string** pp = &pointer;
+        u64 before = HeapAudit.reportLeaks();
+        int value = t356ReadDoubleDerefString(pp);
+        bool clean = HeapAudit.reportLeaks() == before && value == 46;
+        total++; passed += Test("t356_deref_string_double_pointer", clean, true);
+    }
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        string* slots[1];
+        slots[0] = &source;
+        u64 before = HeapAudit.reportLeaks();
+        int value = t356ReadArrayDerefString(slots);
+        bool clean = HeapAudit.reportLeaks() == before && value == 46;
+        total++; passed += Test("t356_deref_string_array_pointer", clean, true);
+    }
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        u64 before = HeapAudit.reportLeaks();
+        int value = t356ReadCallDerefString(&source);
+        bool clean = HeapAudit.reportLeaks() == before && value == 46;
+        total++; passed += Test("t356_deref_string_call_pointer", clean, true);
+    }
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        u64 before = HeapAudit.reportLeaks();
+        int value = t356AssignDerefString(&source);
+        bool clean = HeapAudit.reportLeaks() == before && value == 46;
+        total++; passed += Test("t356_deref_string_assignment", clean, true);
+    }
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        u64 before = HeapAudit.reportLeaks();
+        int value = t356PassDerefString(&source);
+        bool clean = HeapAudit.reportLeaks() == before && value == 46;
+        total++; passed += Test("t356_deref_string_by_value_call", clean, true);
+    }
+    // T356 r2: a ternary dereference already owns the selected arm's copy; do not copy its PHI again.
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        u64 before = HeapAudit.reportLeaks();
+        t356AuditAllocations = 0; t356AuditFrees = 0;
+        __alloc_audit_hook = t356CountAlloc; __free_audit_hook = t356CountFree;
+        int value = t356ReadTernaryDerefString(&source, &source, true);
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t356AuditAllocations == 1u && t356AuditFrees == 1u;
+        total++; passed += Test("t356_deref_string_ternary_local", clean, true);
+    }
+    // The field form keeps the master's one-leak baseline and avoids r1's additional allocation.
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        u64 before = HeapAudit.reportLeaks();
+        t356AuditAllocations = 0; t356AuditFrees = 0;
+        t356ForwardAudit = false;
+        __alloc_audit_hook = t356CountAlloc; __free_audit_hook = t356CountFree;
+        int value = t356StoreTernaryDerefString(&source, &source, true);
+        t356ForwardAudit = true;
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool resource = HeapAudit.reportLeaks() <= before + 1u
+            && t356AuditAllocations == 2u && t356AuditFrees >= 1u && t356AuditFrees <= 2u;
+        total++; passed += Test("t356_deref_string_ternary_field", resource && value == 46, true);
+    }
+    // `*w[0]` dereferences the pointer stored in the view, not the view's slot itself.
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        string* slots[1]; slots[0] = &source;
+        u64 before = HeapAudit.reportLeaks();
+        t356AuditAllocations = 0; t356AuditFrees = 0;
+        __alloc_audit_hook = t356CountAlloc; __free_audit_hook = t356CountFree;
+        int value = t356ReadViewElementDerefString(slots);
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && source.length() == 46 && value == 46
+            && t356AuditAllocations == 1u && t356AuditFrees == 1u;
+        total++; passed += Test("t356_deref_string_view_element", clean, true);
+    }
+    // Indexing a declared pointer parameter is the same indirect read as `*(ps + i)`.
+    {
+        string source = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+        u64 before = HeapAudit.reportLeaks();
+        t356AuditAllocations = 0; t356AuditFrees = 0;
+        __alloc_audit_hook = t356CountAlloc; __free_audit_hook = t356CountFree;
+        int value = t356ReadPointerIndex0DerefString(&source);
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && source.length() == 46 && value == 46
+            && t356AuditAllocations == 1u && t356AuditFrees == 1u;
+        total++; passed += Test("t356_deref_string_pointer_index0", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t356AuditAllocations = 0; t356AuditFrees = 0;
+        __alloc_audit_hook = t356CountAlloc; __free_audit_hook = t356CountFree;
+        int value = 0;
+        {
+            string[2] items = default;
+            items[0] = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+            items[1] = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy();
+            value = t356ReadPointerIndex1DerefString(&items[0]);
+        }
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t356AuditAllocations == 3u && t356AuditFrees == 3u;
+        total++; passed += Test("t356_deref_string_pointer_index1", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        { T352ProbeResources o = default; o.seedUnique(); }
+        bool clean = HeapAudit.reportLeaks() == before && t352UniqueDtor == dtorBefore + 1 && t352ReadUnique;
+        total++; passed += Test("t352_dtor_this_unique", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ListDtor;
+        { T352ProbeResources o = default; o.seedList(); }
+        bool clean = HeapAudit.reportLeaks() == before && t352ListDtor == dtorBefore + 1 && t352ReadList;
+        total++; passed += Test("t352_dtor_this_list", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ValueDtor;
+        { T352ProbeResources o = default; o.seedValue(); }
+        bool clean = HeapAudit.reportLeaks() == before && t352ValueDtor == dtorBefore + 1 && t352ReadValue;
+        total++; passed += Test("t352_dtor_this_value", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352DictDtor;
+        { T352ProbeResources o = default; o.seedDictionary(); }
+        bool clean = HeapAudit.reportLeaks() == before && t352DictDtor == dtorBefore + 1 && t352ReadDict;
+        total++; passed += Test("t352_dtor_this_dictionary", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        { T352ProbeImplicitDtor o = default; o.seedString(); }
+        bool clean = HeapAudit.reportLeaks() == before && t352UniqueDtor == dtorBefore + 0 && t352ReadString;
+        total++; passed += Test("t352_dtor_implicit_string", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        { T352ProbeImplicitDtor o = default; o.seedUnique(); }
+        bool clean = HeapAudit.reportLeaks() == before && t352UniqueDtor == dtorBefore + 1 && t352ReadUnique;
+        total++; passed += Test("t352_dtor_implicit_unique", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ListDtor;
+        { T352ProbeImplicitDtor o = default; o.seedList(); }
+        bool clean = HeapAudit.reportLeaks() == before && t352ListDtor == dtorBefore + 1 && t352ReadList;
+        total++; passed += Test("t352_dtor_implicit_list", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ValueDtor;
+        { T352ProbeImplicitDtor o = default; o.seedValue(); }
+        bool clean = HeapAudit.reportLeaks() == before && t352ValueDtor == dtorBefore + 1 && t352ReadValue;
+        total++; passed += Test("t352_dtor_implicit_value", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352DictDtor;
+        { T352ProbeImplicitDtor o = default; o.seedDictionary(); }
+        bool clean = HeapAudit.reportLeaks() == before && t352DictDtor == dtorBefore + 1 && t352ReadDict;
+        total++; passed += Test("t352_dtor_implicit_dictionary", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        { T352ProbeNested o = default; o.a.b.seedString(); }
+        bool clean = HeapAudit.reportLeaks() == before && t352UniqueDtor == dtorBefore + 0 && t352ReadString;
+        total++; passed += Test("t352_dtor_nested_string", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        { T352ProbeNested o = default; o.a.b.seedUnique(); }
+        bool clean = HeapAudit.reportLeaks() == before && t352UniqueDtor == dtorBefore + 1 && t352ReadUnique;
+        total++; passed += Test("t352_dtor_nested_unique", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ListDtor;
+        { T352ProbeNested o = default; o.a.b.seedList(); }
+        bool clean = HeapAudit.reportLeaks() == before && t352ListDtor == dtorBefore + 1 && t352ReadList;
+        total++; passed += Test("t352_dtor_nested_list", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ValueDtor;
+        { T352ProbeNested o = default; o.a.b.seedValue(); }
+        bool clean = HeapAudit.reportLeaks() == before && t352ValueDtor == dtorBefore + 1 && t352ReadValue;
+        total++; passed += Test("t352_dtor_nested_value", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352DictDtor;
+        { T352ProbeNested o = default; o.a.b.seedDictionary(); }
+        bool clean = HeapAudit.reportLeaks() == before && t352DictDtor == dtorBefore + 1 && t352ReadDict;
+        total++; passed += Test("t352_dtor_nested_dictionary", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedString();
+          o.releaseThisString();
+          movedFromEmpty = o.s.length() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352UniqueDtor == dtorBefore + 0;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_this_string", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedUnique();
+          o.releaseThisUnique();
+          movedFromEmpty = o.u == nullptr;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352UniqueDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_this_unique", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ListDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedList();
+          o.releaseThisList();
+          movedFromEmpty = o.l.count() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352ListDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_this_list", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ValueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedValue();
+          o.releaseThisValue();
+          movedFromEmpty = o.v.kind == 0 && o.v.payload.length() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352ValueDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_this_value", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352DictDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedDictionary();
+          o.releaseThisDictionary();
+          movedFromEmpty = o.d.count() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352DictDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_this_dictionary", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedString();
+          o.releaseImplicitString();
+          movedFromEmpty = o.s.length() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352UniqueDtor == dtorBefore + 0;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_implicit_string", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedUnique();
+          o.releaseImplicitUnique();
+          movedFromEmpty = o.u == nullptr;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352UniqueDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_implicit_unique", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ListDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedList();
+          o.releaseImplicitList();
+          movedFromEmpty = o.l.count() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352ListDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_implicit_list", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ValueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedValue();
+          o.releaseImplicitValue();
+          movedFromEmpty = o.v.kind == 0 && o.v.payload.length() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352ValueDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_implicit_value", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352DictDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedDictionary();
+          o.releaseImplicitDictionary();
+          movedFromEmpty = o.d.count() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352DictDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_implicit_dictionary", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedString();
+          o.releaseParameterString(&o);
+          movedFromEmpty = o.s.length() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352UniqueDtor == dtorBefore + 0;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_pointer_string", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedUnique();
+          o.releaseParameterUnique(&o);
+          movedFromEmpty = o.u == nullptr;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352UniqueDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_pointer_unique", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ListDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedList();
+          o.releaseParameterList(&o);
+          movedFromEmpty = o.l.count() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352ListDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_pointer_list", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ValueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedValue();
+          o.releaseParameterValue(&o);
+          movedFromEmpty = o.v.kind == 0 && o.v.payload.length() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352ValueDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_pointer_value", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352DictDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedDictionary();
+          o.releaseParameterDictionary(&o);
+          movedFromEmpty = o.d.count() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352DictDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_pointer_dictionary", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeNested o = default; o.a.b.seedString();
+          o.releaseNestedString();
+          movedFromEmpty = o.a.b.s.length() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352UniqueDtor == dtorBefore + 0;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_nested_string", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeNested o = default; o.a.b.seedUnique();
+          o.releaseNestedUnique();
+          movedFromEmpty = o.a.b.u == nullptr;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352UniqueDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_nested_unique", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ListDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeNested o = default; o.a.b.seedList();
+          o.releaseNestedList();
+          movedFromEmpty = o.a.b.l.count() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352ListDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_nested_list", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ValueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeNested o = default; o.a.b.seedValue();
+          o.releaseNestedValue();
+          movedFromEmpty = o.a.b.v.kind == 0 && o.a.b.v.payload.length() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352ValueDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_nested_value", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352DictDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeNested o = default; o.a.b.seedDictionary();
+          o.releaseNestedDictionary();
+          movedFromEmpty = o.a.b.d.count() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352DictDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_method_nested_dictionary", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedString();
+          freePointerString(&o);
+          movedFromEmpty = o.s.length() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352UniqueDtor == dtorBefore + 0;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_free_pointer_string", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedUnique();
+          freePointerUnique(&o);
+          movedFromEmpty = o.u == nullptr;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352UniqueDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_free_pointer_unique", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ListDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedList();
+          freePointerList(&o);
+          movedFromEmpty = o.l.count() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352ListDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_free_pointer_list", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ValueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedValue();
+          freePointerValue(&o);
+          movedFromEmpty = o.v.kind == 0 && o.v.payload.length() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352ValueDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_free_pointer_value", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352DictDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeResources o = default; o.seedDictionary();
+          freePointerDictionary(&o);
+          movedFromEmpty = o.d.count() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352DictDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_free_pointer_dictionary", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeNode o = default; o.b.seedString();
+          freeNestedString(&o);
+          movedFromEmpty = o.b.s.length() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352UniqueDtor == dtorBefore + 0;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_free_nested_string", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352UniqueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeNode o = default; o.b.seedUnique();
+          freeNestedUnique(&o);
+          movedFromEmpty = o.b.u == nullptr;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352UniqueDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_free_nested_unique", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ListDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeNode o = default; o.b.seedList();
+          freeNestedList(&o);
+          movedFromEmpty = o.b.l.count() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352ListDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_free_nested_list", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352ValueDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeNode o = default; o.b.seedValue();
+          freeNestedValue(&o);
+          movedFromEmpty = o.b.v.kind == 0 && o.b.v.payload.length() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352ValueDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_free_nested_value", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        int dtorBefore = t352DictDtor;
+        bool resourcesReleased = false;
+        bool movedFromEmpty = false;
+        bool dtorRan = false;
+        { T352ProbeNode o = default; o.b.seedDictionary();
+          freeNestedDictionary(&o);
+          movedFromEmpty = o.b.d.count() == 0;
+          resourcesReleased = HeapAudit.reportLeaks() == before;
+          dtorRan = t352DictDtor == dtorBefore + 1;
+        }
+        bool clean = resourcesReleased && movedFromEmpty && dtorRan;
+        total++; passed += Test("t352_free_nested_dictionary", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        bool clean = false;
+        {
+            T352ProbeResources b = default;
+            b.seedString();
+            move b.s;
+            clean = HeapAudit.reportLeaks() == before;
+        }
+        total++; passed += Test("t352_statement_discarded_field_move", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        bool clean = false;
+        {
+            T352ProbeResources b = default;
+            b.seedString();
+            for ((move b.s); false; ) { }
+            clean = HeapAudit.reportLeaks() == before;
+        }
+        total++; passed += Test("t352_for_init_discarded_field_move", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        bool clean = false;
+        {
+            T352ProbeResources b = default;
+            b.seedString();
+            int i = 0;
+            for (i = 0; i < 1; move b.s) { i++; }
+            clean = HeapAudit.reportLeaks() == before;
+        }
+        total++; passed += Test("t352_for_update_discarded_field_move", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        bool clean = false;
+        {
+            T352ProbeResources b = default;
+            b.seedString();
+            {
+                Lambda<void()> f = () => move b.s;
+                f();
+            }
+            clean = HeapAudit.reportLeaks() == before;
+        }
+        total++; passed += Test("t352_lambda_discarded_field_move", clean, true);
+    }
 
     // A by-value queue field is copied only for its mutating method use. Growth past capacity
     // stays isolated from the caller and every tracked element is destroyed once.
@@ -4894,6 +5908,58 @@ extern int main()
         total++; passed += Test("T260 non-null coalesce LHS value and scope dtor", t260NonNullResult, 5910);
         total++; passed += Test("T260 non-null coalesce LHS constructs no fallback", g_t260Made, 1);
         total++; passed += Test("T260 non-null coalesce LHS releases once", g_t260Dtor, 1);
+
+        // T351: nested joins resolve ->v, and each selected temporary is released or retained once.
+        g_t351Dtor = 0; g_t351Made = 0; g_t351Seen = 0;
+        t351BReadAddress(true);
+        total++; passed += Test("T351 native B addressed read value and frees once",
+                                g_t351Seen == 5 && g_t351Made == 1 && g_t351Dtor == 1, true);
+        g_t351Dtor = 0; g_t351Made = 0; g_t351Keep = nullptr;
+        t351BKeepAddress(true);
+        int t351BKeptValue = g_t351Keep != nullptr ? *g_t351Keep : -999;
+        total++; passed += Test("T351 native B kept value remains live",
+                                t351BKeptValue == 5 && g_t351Made == 1 && g_t351Dtor == 0, true);
+        if (g_t351Keep != nullptr && g_t351Dtor == 0) delete (T351Temp*)g_t351Keep;
+        g_t351Keep = nullptr;
+        total++; passed += Test("T351 native B kept temp freed once by owner", g_t351Dtor, 1);
+        g_t351Dtor = 0; g_t351Made = 0;
+        int t351BValue = t351BPlain(true);
+        total++; passed += Test("T351 native B plain field read frees once",
+                                t351BValue == 5 && g_t351Made == 1 && g_t351Dtor == 1, true);
+
+        g_t351Dtor = 0; g_t351Made = 0; g_t351Seen = 0;
+        t351CReadAddress(false, true);
+        total++; passed += Test("T351 native C addressed read takes middle arm and frees once",
+                                g_t351Seen == 2 && g_t351Made == 1 && g_t351Dtor == 1, true);
+        g_t351Dtor = 0; g_t351Made = 0; g_t351Keep = nullptr;
+        t351CKeepAddress(false, false);
+        int t351CKeptValue = g_t351Keep != nullptr ? *g_t351Keep : -999;
+        total++; passed += Test("T351 native C kept final arm remains live",
+                                t351CKeptValue == 3 && g_t351Made == 1 && g_t351Dtor == 0, true);
+        if (g_t351Keep != nullptr && g_t351Dtor == 0) delete (T351Temp*)g_t351Keep;
+        g_t351Keep = nullptr;
+        total++; passed += Test("T351 native C kept temp freed once by owner", g_t351Dtor, 1);
+        g_t351Dtor = 0; g_t351Made = 0;
+        int t351CValue = t351CPlain(true, true);
+        total++; passed += Test("T351 native C plain field read takes outer arm and frees once",
+                                t351CValue == 1 && g_t351Made == 1 && g_t351Dtor == 1, true);
+
+        g_t351Dtor = 0; g_t351Made = 0; g_t351Seen = 0;
+        t351DReadAddress(false);
+        total++; passed += Test("T351 native D addressed read takes right coalesce and frees once",
+                                g_t351Seen == 6 && g_t351Made == 1 && g_t351Dtor == 1, true);
+        g_t351Dtor = 0; g_t351Made = 0; g_t351Keep = nullptr;
+        t351DKeepAddress(true);
+        int t351DKeptValue = g_t351Keep != nullptr ? *g_t351Keep : -999;
+        total++; passed += Test("T351 native D kept left coalesce remains live",
+                                t351DKeptValue == 5 && g_t351Made == 1 && g_t351Dtor == 0, true);
+        if (g_t351Keep != nullptr && g_t351Dtor == 0) delete (T351Temp*)g_t351Keep;
+        g_t351Keep = nullptr;
+        total++; passed += Test("T351 native D kept temp freed once by owner", g_t351Dtor, 1);
+        g_t351Dtor = 0; g_t351Made = 0;
+        int t351DValue = t351DPlain(true);
+        total++; passed += Test("T351 native D plain field read frees once",
+                                t351DValue == 5 && g_t351Made == 1 && g_t351Dtor == 1, true);
 
     }
 

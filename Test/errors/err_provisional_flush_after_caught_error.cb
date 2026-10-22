@@ -25,3 +25,34 @@ expect_error("calling convention cannot be repaired") {
 expect_error("calling convention cannot be repaired") {
     struct Never { long a; long b; long c; };
 }
+
+expect_error("t354OuterMissing") {
+    expect_error("t354InnerMissing") { int t354Inner = t354InnerMissing; }
+    int t354Outer = t354OuterMissing;
+}
+
+expect_error("t354Outer3Missing") {
+    expect_error("t354Middle3Missing") {
+        expect_error("t354Inner3Missing") { int t354Inner = t354Inner3Missing; }
+        int t354Middle = t354Middle3Missing;
+    }
+    int t354Outer = t354Outer3Missing;
+}
+
+expect_error("t354ScopedOuterMissing") {
+    int t354ScopedOuterBare()
+    {
+        expect_error("t354BareInnerMissing");
+        int t354Inner = t354BareInnerMissing;
+        return 0;
+    }
+    int t354Outer = t354ScopedOuterMissing;
+}
+
+int t354BareOuterScopedInner()
+{
+    expect_error("t354BareOuterMissing");
+    expect_error("t354ScopedInnerMissing") { int t354Inner = t354ScopedInnerMissing; }
+    int t354Outer = t354BareOuterMissing;
+    return 0;
+}

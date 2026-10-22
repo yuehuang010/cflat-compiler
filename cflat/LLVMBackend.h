@@ -1719,7 +1719,7 @@ public:
         bool IsCxxNullIntegerMacro = false;
         // A `?:` whose two arms are both imported macro constants: a C++ prvalue. Transient.
         bool IsCxxMacroJoin = false;
-        // Transient: TypedValue::joinClassPointee of a `?:` result, so a nested arm keeps it.
+        // Transient: TypedValue::joinClassPointee of a conditional join, so a nested arm keeps it.
         std::string JoinClassPointee;
         int JoinClassPointeeDepth = 0;
         // Transient: an imported enumerator / integer macro's value as a brace-list literal, set before
@@ -4677,22 +4677,35 @@ private:
     }
     int lambdaCounter = 0;
     int pipeStreamCounter = 0;   // uniquifies synthesized hidden `stream` locals for `producer >> consumer` piping
+    struct DeferredExpectation
+    {
+        size_t Scope = 0;
+        std::string Expected;
+        std::string File;
+        size_t Line = 0;
+        size_t Column = 0;
+    };
+    struct ExpectErrorScopeState
+    {
+        size_t Scope = 0;
+        std::string PreviousExpected;
+        size_t PreviousDepth = SIZE_MAX;
+        size_t PreviousScope = 0;
+        llvm::Function* PreviousFunction = nullptr;
+        DeferredExpectation PreviousPosition;
+    };
     std::string expectedError;
     // While set, LogError throws SpeculativeEvalAbort instead of emitting/exiting - used by
     // speculative compile-time probing (owning-sink if-const evaluation) to bail cleanly.
     bool suppressErrors_ = false;
     size_t expectedErrorScopeDepth = SIZE_MAX;  // SIZE_MAX = scoped block form (checked manually after block); else stackNamedVariable depth for bare-semicolon form
+    llvm::Function* expectedErrorScopeFunction_ = nullptr;
     // Armed before ProcessImports so import-time errors can match. An unmatched expectation
     // at end of compilation is a did-not-occur failure.
     std::string fileScopeExpectedError_;
+    std::vector<ExpectErrorScopeState> expectErrorStack_;
 
-    /*
-     * A nested (scoped or statement-level) expect_error OVERWRITES the armed file-scope bare
-     * expectation while it runs, so clearing it on completion would drop the file-scope one for
-     * the rest of the compile. Re-arm instead. This is what lets one file combine the two forms,
-     * which a MODULE-END diagnostic needs: only the bare file-scope form is still armed then.
-     * Empty fileScopeExpectedError_ makes this exactly the old clear().
-     */
+    // Restore the module-level bare expectation after module-end deferred diagnostics.
     void RestoreFileScopeExpectedError();
 
     // Compile-time macros (constant throughout compilation, set early)
@@ -5051,10 +5064,9 @@ private:
 
     void UnregisterOwnedStringTemp(llvm::Value* value);
 
-    // Record an owning-RETURN call result for the no-discard check (see ownedReturnTemps_).
-    // `retType` also carries the pointee type/alignment the owned-pointer temp cleanup needs.
+    // Record release metadata for an owning return; optionally add its no-discard entry.
     void RegisterOwnedReturnTemp(llvm::Value* value, const std::string& fnName,
-                                 const TypeAndValue& retType);
+                                 const TypeAndValue& retType, bool checkDiscard = true);
 
     // Propagate an existing ledger entry onto a derived value (e.g. a '?:' select result).
     // Detection and release entries propagate independently.
@@ -7474,7 +7486,7 @@ public:
 
     // Terminate all unterminated blocks in the module (lambdas mean outer function blocks may
     // also be unterminated), then pop stack frames to targetDepth without running destructors.
-    void AbortFunctionBlocks(size_t targetDepth);
+    void AbortFunctionBlocks(size_t targetDepth, llvm::Function* onlyFunction = nullptr);
 
     struct BuilderState
     {
@@ -12174,9 +12186,8 @@ public:
     }
     /*
      * #8 is decided once every body is emitted: a call on a const receiver records the callee
-     * and its finished diagnostic. Owner: the scoped / bare expect_error armed when it was
-     * queued (0 = module level). A scope that catches an error drops what it owns; one that ends
-     * without an error but owns entries defers its verdict to the module-end resolution.
+     * and its finished diagnostic. A scope that catches an error drops what it owns; one that
+     * ends without an error but owns entries defers its verdict to the module-end resolution.
      */
     struct PendingConstReceiverCall
     {
@@ -12189,24 +12200,49 @@ public:
         // #10: Message ends in "but writes '"; the inferred cause and the closing quote follow.
         bool AppendsCause = false;
     };
-    struct DeferredExpectation
-    {
-        size_t Scope = 0;
-        std::string Expected;
-        std::string File;
-        size_t Line = 0;
-        size_t Column = 0;
-    };
     std::vector<PendingConstReceiverCall> pendingConstReceiverCalls_;
     std::vector<DeferredExpectation> deferredExpectations_;
     size_t activeExpectScope_ = 0;
     size_t expectScopeCounter_ = 0;
     DeferredExpectation activeExpectPosition_;
-    // A scoped / bare expect_error was armed at the current source position.
-    void ArmExpectScope()
+    // Push a scoped / bare expect_error while retaining the enclosing expectation.
+    size_t ArmExpectScope(std::string expected, size_t scopeDepth)
     {
-        activeExpectScope_ = ++expectScopeCounter_;
+        ExpectErrorScopeState state;
+        state.Scope = ++expectScopeCounter_;
+        state.PreviousExpected = expectedError;
+        state.PreviousDepth = expectedErrorScopeDepth;
+        state.PreviousScope = activeExpectScope_;
+        state.PreviousFunction = expectedErrorScopeFunction_;
+        state.PreviousPosition = activeExpectPosition_;
+        expectErrorStack_.push_back(std::move(state));
+        expectedError = std::move(expected);
+        expectedErrorScopeDepth = scopeDepth;
+        expectedErrorScopeFunction_ = scopeDepth == SIZE_MAX ? nullptr : currentFunction;
+        activeExpectScope_ = expectErrorStack_.back().Scope;
         activeExpectPosition_ = { activeExpectScope_, expectedError, sourceFileName, currentLine, currentColumn };
+        return activeExpectScope_;
+    }
+    void RestoreExpectScope(size_t scope)
+    {
+        auto it = std::find_if(expectErrorStack_.begin(), expectErrorStack_.end(),
+            [&](const auto& state) { return state.Scope == scope; });
+        if (it == expectErrorStack_.end())
+        {
+            RestoreFileScopeExpectedError();
+            return;
+        }
+        const auto state = *it;
+        expectErrorStack_.erase(it, expectErrorStack_.end());
+        expectedError = state.PreviousExpected;
+        expectedErrorScopeDepth = state.PreviousDepth;
+        activeExpectScope_ = state.PreviousScope;
+        expectedErrorScopeFunction_ = state.PreviousFunction;
+        activeExpectPosition_ = state.PreviousPosition;
+    }
+    bool ActiveExpectScopeOwnsFunction(const llvm::Function* function) const
+    {
+        return activeExpectScope_ != 0 && expectedErrorScopeFunction_ == function;
     }
     // Its scope ended without an error: true (and disarmed) when pending #8 entries decide it.
     bool DeferExpectationVerdict();

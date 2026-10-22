@@ -1212,12 +1212,22 @@ void MainListener::ProcessPendingInstantiations() {
                 continue;
             }
 
+            try
             {
                 TemplateNamespaceScope nsScope(compilerLLVM, pending.templateName);
                 if (isStruct)
                     ParseStructDefinition(structCtx, pending.mangledName);
                 else
                     ParseClassDefinition(classCtx, pending.mangledName);
+            }
+            catch (const ExpectedErrorReceived&)
+            {
+                instantiatedGenerics.erase(pending.mangledName);
+                activeTypeSubstitutions = savedSubst;
+                activeValueSubstitutions = savedValueSubst;
+                activePackSubstitutions = savedPackSubst;
+                valueMacros.Restore();
+                throw;
             }
 
             activeTypeSubstitutions = savedSubst;

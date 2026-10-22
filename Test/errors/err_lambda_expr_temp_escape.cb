@@ -45,3 +45,48 @@ expect_error("cannot infer the return type of lambda") {
 }
 
 extern int main() { return 0; }
+
+// T349: each scoped expectation must discard an unfinished lambda invoker and restore the outer
+// emission state before later declarations and constructors are analyzed.
+struct T349S { int id = 0; Lambda<int()> f = default; T349S() { this.f = () => { return 4; }; } };
+struct T349R { int id = 5; };
+
+void t349RecoverBareExpectationAtFunctionEnd()
+{
+    expect_error("Undefined variable missing.");
+    Lambda<int()> f = () => { return missing; };
+}
+
+T349S t349MakeS() { T349S s = T349S(); s.id = 9; return s; }
+
+void t349RecoverLambdaShapes()
+{
+    expect_error("Undefined variable missing.") { Lambda<int()> f = () => { return missing; }; }
+    expect_error("Undefined variable missing.") { Lambda<void()> f = () => { int x = missing; }; }
+    expect_error("Undefined variable missing.") { Lambda<T349R()> f = () => { return missing; }; }
+    expect_error("Undefined variable missing.") {
+        Lambda<int()> outer = () => { Lambda<int()> inner = () => { return missing; }; return inner(); };
+    }
+    expect_error("Undefined variable missing.") { Lambda<T349S()> f = () => { return missing; }; }
+    T349S a = T349S();
+    T349S b = default;
+    T349S* c = new T349S();
+    T349S d = t349MakeS();
+    delete c;
+}
+
+void t349RecoverSecondExpectation()
+{
+    expect_error("Undefined variable missing.") { Lambda<int()> a = () => { return missing; }; }
+    expect_error("Undefined variable missing.") { Lambda<void()> b = () => { int x = missing; }; }
+    T349S s = T349S();
+}
+
+struct T349CtorRecovery
+{
+    int id = 9;
+    T349CtorRecovery()
+    {
+        expect_error("Undefined variable missing.") { Lambda<int()> f = () => { return missing; }; }
+    }
+};

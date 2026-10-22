@@ -2448,6 +2448,8 @@ struct T236Node { int v = default; };
 cppon.Esc* T242LateKept = nullptr;
 int* T251LateKeptField = nullptr;
 int* T260KeptField = nullptr;
+int* T351CppKeptField = nullptr;
+int T351CppSeen = 0;
 // T256: an alias bound into a call-result temp is destroyed once when a later call in its initializer throws.
 int g_t256Dtor = 0;
 struct T256AR { int v = 7; ~T256AR() { g_t256Dtor = g_t256Dtor + 1; } };
@@ -15654,6 +15656,83 @@ extern int main()
             if (!T260CheckRetain(false, true, t260x)) return 3822;
             if (!T260CheckRetain(true, true, t260x)) return 3823;
         }
+
+        // T351: nested C++ class-pointer joins preserve field lookup and statement-temp ownership.
+        T351CppSeen = 0;
+        cppon.reset();
+        T351CppBReadAddress(true);
+        if (T351CppSeen != 5 || cppon.live() != 0 || cppon.clsNew() != 1
+            || cppon.clsDel() != 1 || cppon.dtors() != 1) return 35101;
+        T351CppKeptField = nullptr;
+        cppon.reset();
+        T351CppBKeepAddress(true);
+        if (T351CppKeptField == nullptr || *T351CppKeptField != 5 || cppon.live() != 1
+            || cppon.clsNew() != 1 || cppon.clsDel() != 0 || cppon.dtors() != 0)
+        {
+            if (T351CppKeptField != nullptr && cppon.live() == 1)
+                delete (cppon.Esc*)T351CppKeptField;
+            T351CppKeptField = nullptr;
+            return 35102;
+        }
+        cppon.Esc* t351CppKept = (cppon.Esc*)T351CppKeptField;
+        T351CppKeptField = nullptr;
+        delete t351CppKept;
+        if (cppon.live() != 0 || cppon.clsDel() != 1 || cppon.dtors() != 1) return 35103;
+        cppon.reset();
+        int t351CppBValue = T351CppBPlain(true);
+        if (t351CppBValue != 5 || cppon.live() != 0 || cppon.clsNew() != 1
+            || cppon.clsDel() != 1 || cppon.dtors() != 1) return 35104;
+
+        T351CppSeen = 0;
+        cppon.reset();
+        T351CppCReadAddress(false, true);
+        if (T351CppSeen != 2 || cppon.live() != 0 || cppon.clsNew() != 1
+            || cppon.clsDel() != 1 || cppon.dtors() != 1) return 35105;
+        T351CppKeptField = nullptr;
+        cppon.reset();
+        T351CppCKeepAddress(false, false);
+        if (T351CppKeptField == nullptr || *T351CppKeptField != 3 || cppon.live() != 1
+            || cppon.clsNew() != 1 || cppon.clsDel() != 0 || cppon.dtors() != 0)
+        {
+            if (T351CppKeptField != nullptr && cppon.live() == 1)
+                delete (cppon.Esc*)T351CppKeptField;
+            T351CppKeptField = nullptr;
+            return 35106;
+        }
+        t351CppKept = (cppon.Esc*)T351CppKeptField;
+        T351CppKeptField = nullptr;
+        delete t351CppKept;
+        if (cppon.live() != 0 || cppon.clsDel() != 1 || cppon.dtors() != 1) return 35107;
+        cppon.reset();
+        int t351CppCValue = T351CppCPlain(true, true);
+        if (t351CppCValue != 1 || cppon.live() != 0 || cppon.clsNew() != 1
+            || cppon.clsDel() != 1 || cppon.dtors() != 1) return 35108;
+
+        T351CppSeen = 0;
+        cppon.reset();
+        T351CppDReadAddress(false);
+        if (T351CppSeen != 6 || cppon.live() != 0 || cppon.clsNew() != 1
+            || cppon.clsDel() != 1 || cppon.dtors() != 1) return 35109;
+        T351CppKeptField = nullptr;
+        cppon.reset();
+        T351CppDKeepAddress(true);
+        if (T351CppKeptField == nullptr || *T351CppKeptField != 5 || cppon.live() != 1
+            || cppon.clsNew() != 1 || cppon.clsDel() != 0 || cppon.dtors() != 0)
+        {
+            if (T351CppKeptField != nullptr && cppon.live() == 1)
+                delete (cppon.Esc*)T351CppKeptField;
+            T351CppKeptField = nullptr;
+            return 35110;
+        }
+        t351CppKept = (cppon.Esc*)T351CppKeptField;
+        T351CppKeptField = nullptr;
+        delete t351CppKept;
+        if (cppon.live() != 0 || cppon.clsDel() != 1 || cppon.dtors() != 1) return 35111;
+        cppon.reset();
+        int t351CppDValue = T351CppDPlain(true);
+        if (t351CppDValue != 5 || cppon.live() != 0 || cppon.clsNew() != 1
+            || cppon.clsDel() != 1 || cppon.dtors() != 1) return 35112;
+
         g_t256Dtor = 0;
         if (cppunw.guarded(T256AliasThrowInit, 0) != 7 || g_t256Dtor != 1) return 256001;
         if (cppunw.guarded(T256AliasThrowInit, 5) != -5 || g_t256Dtor != 2) return 256002;
@@ -18438,6 +18517,27 @@ bool T260CheckRetain(bool leftJoin, bool laterCallee, int x)
     }
     return valid && cppon.live() == 0 && cppon.clsDel() == 1 && cppon.dtors() == 1;
 }
+
+void T351CppRead(int* p) { T351CppSeen = *p; }
+void T351CppKeep(int* p) { T351CppKeptField = p; }
+void T351CppBReadAddress(bool c)
+{ cppon.Esc* e = nullptr; T351CppRead(&(c ? (e ?? new cppon.Esc(5)) : e)->v); }
+void T351CppBKeepAddress(bool c)
+{ cppon.Esc* e = nullptr; T351CppKeep(&(c ? (e ?? new cppon.Esc(5)) : e)->v); }
+int T351CppBPlain(bool c)
+{ cppon.Esc* e = nullptr; return (c ? (e ?? new cppon.Esc(5)) : e)->v; }
+void T351CppCReadAddress(bool c, bool d)
+{ T351CppRead(&(c ? new cppon.Esc(1) : d ? new cppon.Esc(2) : new cppon.Esc(3))->v); }
+void T351CppCKeepAddress(bool c, bool d)
+{ T351CppKeep(&(c ? new cppon.Esc(1) : d ? new cppon.Esc(2) : new cppon.Esc(3))->v); }
+int T351CppCPlain(bool c, bool d)
+{ return (c ? new cppon.Esc(1) : d ? new cppon.Esc(2) : new cppon.Esc(3))->v; }
+void T351CppDReadAddress(bool c)
+{ cppon.Esc* e = nullptr; cppon.Esc* f = nullptr; T351CppRead(&(c ? (e ?? new cppon.Esc(5)) : (f ?? new cppon.Esc(6)))->v); }
+void T351CppDKeepAddress(bool c)
+{ cppon.Esc* e = nullptr; cppon.Esc* f = nullptr; T351CppKeep(&(c ? (e ?? new cppon.Esc(5)) : (f ?? new cppon.Esc(6)))->v); }
+int T351CppDPlain(bool c)
+{ cppon.Esc* e = nullptr; cppon.Esc* f = nullptr; return (c ? (e ?? new cppon.Esc(5)) : (f ?? new cppon.Esc(6)))->v; }
 
 // T249 helpers (legs 98920-98930): each observes [v, h1.v, h2.v, ctors, copies, moves, dtors].
 struct T249Host { cppbv.CntA c = cppbv.CntA(0); };

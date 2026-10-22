@@ -151,19 +151,21 @@ void LLVMBackend::ClearCurrentSubprogram()
         builder->SetCurrentDebugLocation(llvm::DebugLoc());
     }
 
-void LLVMBackend::AbortFunctionBlocks(size_t targetDepth)
+void LLVMBackend::AbortFunctionBlocks(size_t targetDepth, llvm::Function* onlyFunction)
 {
-        for (auto& fn : *module)
-        {
+        auto abortBlocks = [&](llvm::Function& fn) {
             for (auto& bb : fn)
-            {
                 if (!cflat_llvm::GetTerminatorOrNull(&bb))
                 {
                     builder->SetInsertPoint(&bb);
                     builder->CreateUnreachable();
                 }
-            }
-        }
+        };
+        if (onlyFunction != nullptr)
+            abortBlocks(*onlyFunction);
+        else
+            for (auto& fn : *module)
+                abortBlocks(fn);
         while (stackNamedVariable.size() > targetDepth)
             stackNamedVariable.pop_back();
     }
@@ -1285,6 +1287,7 @@ llvm::UncondBrInst* LLVMBackend::CreateBlockBreak(llvm::BasicBlock* resumeBlock,
             // Bare-semicolon form: expect_error("msg"); - if the expected error never fired before this scope exits, report failure.
             // A deferred #8 owned by it decides it at module end instead.
             if (!expectedError.empty() && expectedErrorScopeDepth == stackNamedVariable.size()
+                && (expectedErrorScopeFunction_ == nullptr || expectedErrorScopeFunction_ == currentFunction)
                 && !DeferExpectationVerdict())
             {
                 std::cout << std::format("FAIL: expected error '{}' did not occur\n", expectedError);

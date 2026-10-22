@@ -81,6 +81,35 @@ int gavBadBody<T>(T x) { return gavUndefinedName; }
 // outer's own emission, so BOTH instantiations have to give their registrations back.
 int gavOuterBadBody<T>(T x) { return gavBadBody<T>(x) + 1; }
 
+// T354: the bare expectation belongs to this generic caller, not its instantiated callee.
+int gavBareBadLeaf<T>() { return gavBareUndefinedName; }
+int gavBareOuter<T>()
+{
+    expect_error("Undefined variable gavBareUndefinedName");
+    return gavBareBadLeaf<T>();
+}
+
+struct GavScopedBadMethod<T> { int bad() { return gavMethodUndefinedName; } };
+struct GavUniqueBadMethod<T> { int bad() { return gavMethodUndefinedName; } };
+
+int gavMethodScoped()
+{
+    expect_error("Undefined variable gavMethodUndefinedName") {
+        GavScopedBadMethod<int> box = default;
+        int value = box.bad();
+    }
+    return 0;
+}
+
+int gavMethodUnique()
+{
+    expect_error("Undefined variable gavMethodUndefinedName") {
+        unique<GavUniqueBadMethod<int>> box = new GavUniqueBadMethod<int>();
+        int value = box.bad();
+    }
+    return 0;
+}
+
 extern int main()
 {
     int gavLocal = 7;
@@ -99,6 +128,9 @@ extern int main()
     expect_error("Undefined variable gavUndefinedName") {
         int m2 = gavOuterBadBody<int>(4);
     }
+    int gavBareResult = gavBareOuter<int>();
+    gavMethodScoped();
+    gavMethodUnique();
     // The instantiation moved this function's locals aside; recovery must put them back.
     return gavLocal - 7;
 }
