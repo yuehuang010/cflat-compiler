@@ -42,7 +42,7 @@ MainListener::ExpectErrorRecoveryMark MainListener::MarkExpectErrorRecoveryState
         mark.lastCxxRetValue = compilerLLVM->lastCxxRetValue_;
         mark.lastLoweredRetTemp = compilerLLVM->lastLoweredRetTemp_;
         mark.lastLoweredRetValue = compilerLLVM->lastLoweredRetValue_;
-        mark.lastLoweredCopyRetTemp = compilerLLVM->lastLoweredCopyRetTemp_;
+        mark.lastLoweredCopyRetTemp = compilerLLVM->lastLoweredInPlaceRetTemp_;
         if (compilerLLVM->module != nullptr)
             for (auto& function : *compilerLLVM->module)
             {
@@ -99,7 +99,7 @@ void MainListener::RestoreExpectErrorRecoveryState(const ExpectErrorRecoveryMark
         compilerLLVM->lastCxxRetValue_ = mark.lastCxxRetValue;
         compilerLLVM->lastLoweredRetTemp_ = mark.lastLoweredRetTemp;
         compilerLLVM->lastLoweredRetValue_ = mark.lastLoweredRetValue;
-        compilerLLVM->lastLoweredCopyRetTemp_ = mark.lastLoweredCopyRetTemp;
+        compilerLLVM->lastLoweredInPlaceRetTemp_ = mark.lastLoweredCopyRetTemp;
 
         if (compilerLLVM->module != nullptr)
             for (auto& function : *compilerLLVM->module)
@@ -1172,6 +1172,10 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 SpellDiagnosticType(*compiler, compiler->currentFunctionReturnTV)));
             return;
         }
+        // T407: a by-value native struct return relocates the object; decided at module end.
+        if (!compiler->currentFunctionReturnTV.Pointer && !compiler->currentFunctionReturnTV.IsAlias)
+            compiler->NoteThisClosureCopySite(compiler->currentFunctionReturnTypeName,
+                                              LLVMBackend::ThisClosureCopyKind::Return);
         if (defaultValue && !compiler->currentFunctionReturnTV.Pointer
             && compiler->IsCxxRecord(compiler->currentFunctionReturnTypeName))
         {

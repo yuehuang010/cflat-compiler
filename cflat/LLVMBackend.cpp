@@ -5110,7 +5110,11 @@ void LLVMBackend::ResetForReanalysis()
     lastCxxRetValue_ = nullptr;
     lastLoweredRetTemp_ = nullptr;
     lastLoweredRetValue_ = nullptr;
-    lastLoweredCopyRetTemp_ = nullptr;
+    lastLoweredInPlaceRetTemp_ = nullptr;
+    thisClosureCopySites_.clear();
+    byValueCtorStructs_.clear();
+    pendingNativeCtorResults_.clear();
+    ctorThisClosure_ = nullptr;
     opaqueReturnIndirectCalls_.clear();
     opaqueReturnDiscardSites_.clear();
     // RegisterEncodedClosureType memoizes on this map but writes the encoded closure's backing
@@ -7739,7 +7743,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     // const floating global admission names; v13 stores function origin metadata; v16 adds
     // const interface methods; v17 function-type pointee const masks; v18 C/C++ pointee, reference
     // and field const folded into ConstMask).
-    root["version"]   = 19;
+    root["version"]   = 20;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
     if (CacheBuildStampEnabled()) root["cstamp"] = CompilerBuildStamp();
@@ -7871,6 +7875,8 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
             }
             if (sd.UserRequestedAlignment > 0)
                 so["user_align"] = static_cast<int64_t>(sd.UserRequestedAlignment);
+            if (sd.StoresThisClosure)
+                so["stores_this_closure"] = true;
             if (sd.Destructor)
                 so["destructor"] = std::string(sd.Destructor->getName());
             if (sd.typeDescriptor)
@@ -8228,7 +8234,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 19) return false;
+    if (!ver || *ver != 20) return false;
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != coreHash) return false;
     if (CacheBuildStampEnabled())
@@ -8487,6 +8493,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
                 for (auto& element : *elements)
                     if (auto n = element.getAsInteger()) sd.CxxFieldElements.push_back(static_cast<unsigned>(*n));
             if (auto v = so->getInteger("user_align"))  sd.UserRequestedAlignment = static_cast<uint64_t>(*v);
+            if (auto v = so->getBoolean("stores_this_closure")) sd.StoresThisClosure = *v;
             if (auto v = so->getString("destructor"))   sd.Destructor = module->getFunction(v->str());
             if (auto v = so->getString("type_desc"))    sd.typeDescriptor = module->getNamedGlobal(v->str());
 

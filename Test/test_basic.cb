@@ -4847,6 +4847,148 @@ int pointerPositiveFn(int x) { return x + 1; }
 int* pointerNullReturnZero() { return 0; }
 int pointerNullArg(int* p) { return p == nullptr ? 1 : 0; }
 
+struct T345CtorLambda
+{
+    int id = 0;
+    Lambda<int()> stored = default;
+    int get() { return id; }
+    int methodBareField() { Lambda<int()> f = () => { return id + 1; }; return f(); }
+    T345CtorLambda(int i)
+    {
+        Lambda<int()> init = () => { this.id = i; return this.id; };
+        init();
+        this.stored = () => { return id + this.get() + i; };
+    }
+};
+
+struct T345GenericCtorLambda<T>
+{
+    T value = default;
+    int id = 0;
+    Lambda<int()> stored = default;
+    int get() { return id + (int)value; }
+    T345GenericCtorLambda(T value, int i)
+    {
+        this.value = value;
+        this.id = i;
+        this.stored = () => { return this.get() + i; };
+    }
+};
+
+struct T345CtorLambdaValue
+{
+    int id = 0;
+    Lambda<int()> f = default;
+    T345CtorLambdaValue() { this.f = () => { return this.id; }; }
+};
+struct T345CtorLambdaExplicitParent
+{
+    T345CtorLambdaValue value = T345CtorLambdaValue();
+    Lambda<int()> dummy = default;
+    T345CtorLambdaExplicitParent() {}
+};
+struct T345CtorLambdaDefaultParent
+{
+    T345CtorLambdaValue value = default;
+    Lambda<int()> dummy = default;
+};
+
+int t345DtorLambdaResult = 0;
+int t345DtorExplicitLambdaResult = 0;
+struct T345DtorLambda
+{
+    int id = 8;
+    int get() { return id + 1; }
+    ~T345DtorLambda()
+    {
+        Lambda<int()> f = () => { return id + this.get(); };
+        Lambda<int()> explicitThis = () => { return this.id + this.get(); };
+        t345DtorLambdaResult = f();
+        t345DtorExplicitLambdaResult = explicitThis();
+    }
+};
+
+// T407: a ctor lambda only called in the ctor is not kept, so copies stay legal; a kept one is
+// reached through a local or a nested lambda and its object is built, moved or pointed to in place.
+struct T407OnlyCalled
+{
+    int id = 0;
+    int sum = 0;
+    T407OnlyCalled(int i) { Lambda<int()> add = () => { sum = sum + id + i; return sum; }; id = 2; add(); add(); }
+};
+struct T407Kept
+{
+    int id = 0;
+    Lambda<int()> f = default;
+    Lambda<int()> g = default;
+    T407Kept(int i)
+    {
+        this.id = i;
+        Lambda<int()> h = () => { return id + 1; };
+        this.f = h;
+        Lambda<int()> init = () => { this.g = () => { return this.id * 2; }; return 0; };
+        init();
+    }
+};
+int t407KeptThroughPointer(T407Kept* k) { k.id = 20; return k.f() + k.g(); }
+T407OnlyCalled t407MakeOnlyCalled(int i) { T407OnlyCalled s = T407OnlyCalled(i); return s; }
+
+bool testT407ConstructorClosureCopies()
+{
+    bool result = true;
+    T407OnlyCalled a = T407OnlyCalled(3);
+    T407OnlyCalled b = a;
+    T407OnlyCalled c = t407MakeOnlyCalled(1);
+    result &= Test("t407_only_called_copy", b.sum, 10);
+    result &= Test("t407_only_called_return", c.sum, 6);
+    T407Kept k = T407Kept(4);
+    k.id = 10;
+    result &= Test("t407_kept_local_then_field", k.f(), 11);
+    result &= Test("t407_kept_nested_lambda", k.g(), 20);
+    result &= Test("t407_kept_through_pointer", t407KeptThroughPointer(&k), 61);
+    T407Kept moved = move k;
+    result &= Test("t407_kept_moved", moved.id, 20);
+    T407Kept[2] arr = { T407Kept(1), T407Kept(2) };
+    arr[1].id = 7;
+    result &= Test("t407_kept_array_in_place", arr[1].f() + arr[1].g(), 22);
+    T407Kept* heap = new T407Kept(5);
+    heap.id = 6;
+    result &= Test("t407_kept_new", heap.f(), 7);
+    delete heap;
+    return result;
+}
+
+bool testT345ConstructorLambdas()
+{
+    bool result = true;
+    // The object a ctor lambda captures is the final one: default local and field slots.
+    T345CtorLambdaValue defaultValue = default;
+    defaultValue.id = 9;
+    result &= Test("t345_ctor_lambda_default_local", defaultValue.f(), 9);
+    T345CtorLambdaExplicitParent explicitParent = T345CtorLambdaExplicitParent();
+    explicitParent.value.id = 9;
+    result &= Test("t345_ctor_lambda_explicit_parent_field", explicitParent.value.f(), 9);
+    T345CtorLambdaDefaultParent defaultParent = default;
+    defaultParent.value.id = 9;
+    result &= Test("t345_ctor_lambda_default_parent_field", defaultParent.value.f(), 9);
+
+    T345CtorLambda s = T345CtorLambda(4);
+    result &= Test("t345_ctor_lambda_stored_before_mutation", s.stored(), 12);
+    s.id = 10;
+    result &= Test("t345_ctor_lambda_stored_after_mutation", s.stored(), 24);
+    result &= Test("t345_method_lambda_bare_field", s.methodBareField(), 11);
+
+    T345GenericCtorLambda<int> g = T345GenericCtorLambda<int>(1, 4);
+    result &= Test("t345_generic_ctor_lambda_stored", g.stored(), 9);
+
+    t345DtorLambdaResult = 0;
+    t345DtorExplicitLambdaResult = 0;
+    { T345DtorLambda d = default; }
+    result &= Test("t345_dtor_lambda_bare_field", t345DtorLambdaResult, 17);
+    result &= Test("t345_dtor_lambda_explicit_this", t345DtorExplicitLambdaResult, 17);
+    return result;
+}
+
 bool testPointerScalarAcceptSet()
 {
     bool result = true;
@@ -5932,6 +6074,8 @@ extern int main()
     total++; passed += testConstTrailing() ? 1 : 0;
     total++; passed += testStringDataMut() ? 1 : 0;
     total++; passed += testConstFunctionType() ? 1 : 0;
+    total++; passed += testT345ConstructorLambdas() ? 1 : 0;
+    total++; passed += testT407ConstructorClosureCopies() ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }

@@ -1,0 +1,105 @@
+import "list.cb";
+
+// T407: a constructor lambda that captures `this` and is kept by the object points at that
+// object. A by-value copy or relocation would keep pointing at the original, so it is refused;
+// the decision is made at module end, once every constructor body (generic instances too) is known.
+
+struct T407S { int id = 0; Lambda<int()> f = default; T407S(int i) { this.id = i; this.f = () => { return id; }; } };
+
+void t407Assign()
+{
+    expect_error("copying 'T407S' would leave its stored closure pointing at the original object ('this' captured in T407S's constructor)") {
+        T407S a = T407S(3);
+        T407S b = T407S(1);
+        b = a;
+    }
+}
+
+void t407ExplicitCopy()
+{
+    expect_error("copying 'T407S' would leave its stored closure") {
+        T407S a = T407S(3);
+        T407S b = a.copy();
+    }
+}
+
+void t407BraceArray()
+{
+    expect_error("copying 'T407S' would leave its stored closure") {
+        T407S a = T407S(3);
+        T407S[2] arr = { a, a };
+    }
+}
+
+void t407ListAdd()
+{
+    expect_error("copying 'T407S' would leave its stored closure") {
+        list<T407S> l = default;
+        T407S a = T407S(3);
+        l.add(a);
+    }
+}
+
+expect_error("returning 'T407S' by value would leave its stored closure pointing at the returned-from object") {
+    T407S t407ReturnLocal() { T407S a = T407S(3); return a; }
+}
+
+expect_error("returning 'T407S' by value would leave its stored closure") {
+    T407S t407ReturnFresh() { return T407S(3); }
+}
+
+int t407Take(T407S s) { return s.id; }
+void t407FreshArgument()
+{
+    expect_error("passing a new 'T407S' by value would leave its stored closure pointing at the temporary") {
+        int r = t407Take(T407S(3));
+    }
+}
+
+void t407FreshAssign()
+{
+    expect_error("moving a new 'T407S' out of its temporary would leave its stored closure") {
+        T407S s = T407S(1);
+        s = T407S(4);
+    }
+}
+
+// The closure reaches the field through a local, or from a lambda nested in a ctor lambda.
+struct T407Local { int id = 0; Lambda<int()> f = default; T407Local(int i) { this.id = i; Lambda<int()> h = () => { return id + 1; }; this.f = h; } };
+struct T407Nested { int id = 0; Lambda<int()> f = default; T407Nested(int i) { this.id = i; Lambda<int()> init = () => { this.f = () => { return this.id; }; return 0; }; init(); } };
+struct T407Generic<T> { T v = default; Lambda<int()> f = default; T407Generic(T v) { this.v = v; this.f = () => { return (int)this.v; }; } };
+
+void t407LocalThenField()
+{
+    expect_error("copying 'T407Local' would leave its stored closure") {
+        T407Local a = T407Local(3);
+        T407Local b = a;
+    }
+}
+
+void t407NestedLambda()
+{
+    expect_error("copying 'T407Nested' would leave its stored closure") {
+        T407Nested a = T407Nested(3);
+        T407Nested b = a;
+    }
+}
+
+void t407GenericCtor()
+{
+    expect_error("copying 'T407Generic<int>' would leave its stored closure") {
+        T407Generic<int> a = T407Generic<int>(3);
+        T407Generic<int> b = a;
+    }
+}
+
+// A struct holding one by value without a closure field of its own returns from its ctor by value.
+struct T407D { int id = 0; Lambda<int()> f = default; T407D() { this.f = () => { return this.id; }; } };
+expect_error("the constructor of 'T407Holder' returns the object by value, which would leave its stored closure pointing at the constructor's temporary ('this' captured in T407D's constructor)") {
+    struct T407Holder { T407D d = default; int x = 0; };
+}
+
+extern int main()
+{
+    return 0;
+}

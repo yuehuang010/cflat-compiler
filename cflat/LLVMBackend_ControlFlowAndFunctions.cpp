@@ -53,6 +53,38 @@
 
 // ---- Definitions moved out of LLVMBackend.h (ControlFlowAndFunctions) ----
 
+bool LLVMBackend::IsNativeValueConstructor(
+    const std::string& functionName, const TypeAndValue& returnType,
+    const std::vector<TypeAndValue>& arguments)
+{
+    if (functionName != returnType.TypeName || returnType.Pointer || returnType.IsAlias
+        || !IsDataStructure(functionName) || programTable.contains(functionName)
+        || IsCppStructName(functionName))
+        return false;
+    const auto data = GetDataStructure(functionName);
+    const bool storesClosure = std::any_of(data.StructFields.begin(), data.StructFields.end(),
+        [this](const TypeAndValue& field) {
+            return field.TypeName == "__closure_fat_ptr"
+                || IsFatEncodedClosureType(field.TypeName);
+        });
+    if (!storesClosure) return false;
+    return arguments.empty() || arguments.front().VariableName != functionName + "__"
+        || !arguments.front().Pointer;
+}
+
+LLVMBackend::AbiRecipe LLVMBackend::NativeValueConstructorRecipe(
+    const TypeAndValue& returnType, size_t parameterCount)
+{
+    AbiRecipe recipe;
+    auto data = GetDataStructure(returnType.TypeName);
+    recipe.retSlot.kind = AbiSlot::SRetReturn;
+    recipe.retSlot.structTy = data.StructType;
+    recipe.retSlot.align = module->getDataLayout().getABITypeAlign(data.StructType).value();
+    recipe.paramSlots.resize(parameterCount);
+    recipe.hasLowering = true;
+    return recipe;
+}
+
 void LLVMBackend::DumpState() const
 {
         std::cout << std::format("  File: {}\n", sourceFileName.empty() ? "<unknown>" : sourceFileName);
@@ -2399,6 +2431,8 @@ void LLVMBackend::FlushPendingFunctionDeclarations()
                 else
                 {
                     recipe = ComputeCxxReturnAbiRecipe(d.ReturnType, d.Arguments);
+                    if (IsNativeValueConstructor(d.FunctionName, d.ReturnType, d.Arguments))
+                        recipe = NativeValueConstructorRecipe(d.ReturnType, d.Arguments.size());
                     useRecipe = recipe.hasLowering;
                 }
                 const bool cflatAbiLowering = !d.External && recipe.hasLowering;
@@ -2568,6 +2602,8 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
         else if (!external && !provisional)
         {
             recipe = ComputeCxxReturnAbiRecipe(returnType, arguments);
+            if (IsNativeValueConstructor(functionName, returnType, arguments))
+                recipe = NativeValueConstructorRecipe(returnType, arguments.size());
             useRecipe = recipe.hasLowering;
         }
 
@@ -3071,6 +3107,8 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
         else
         {
             recipe = ComputeCxxReturnAbiRecipe(returnType, arguments);
+            if (IsNativeValueConstructor(functionName, returnType, arguments))
+                recipe = NativeValueConstructorRecipe(returnType, arguments.size());
             useRecipe = recipe.hasLowering;
         }
         const bool cflatAbiLowering = !external && recipe.hasLowering;
@@ -3213,6 +3251,12 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
         createFunctionBlock(fn, functionName, arguments, returnsOwned, returnType.IsArrayView,
                             returnType.TypeName, useRecipe ? &recipe : nullptr,
                             cflatAbiLowering);
+        if (isMethod && !arguments.empty() && arguments.front().Pointer)
+        {
+            const auto receiver = GetFunctionArgument(arguments.front().VariableName);
+            if (receiver.Storage != nullptr)
+                RegisterThisPointer(arguments.front(), receiver.Storage, receiver.BaseType);
+        }
         // Sibling of the currentFunctionReturn* fields set inside createFunctionBlock: retain the
         // full return TypeAndValue so a returned lambda literal can adopt a function<> return type.
         currentFunctionReturnTV = returnType;

@@ -10852,6 +10852,66 @@ llvm::Value* MainListener::ParseFormatString(CFlatParser::PrimaryExpressionConte
         return compiler->CreateOverloadedFunctionCall("__strconcat", { nvPtrs, nvLens, nvCount });
     }
 
+static bool LambdaLocallyBindsName(CFlatParser::LambdaExpressionContext* lambda,
+                                   antlr4::tree::ParseTree* use, const std::string& name)
+{
+    for (auto* node = use; node != nullptr && node != lambda && node->parent != nullptr;
+         node = node->parent)
+    {
+        auto* parent = node->parent;
+        if (parent == lambda)
+        {
+            if (lambda->lambdaParamList() != nullptr)
+                for (auto* param : lambda->lambdaParamList()->lambdaParam())
+                    if (param->Identifier() != nullptr && param->Identifier()->getText() == name)
+                        return true;
+            break;
+        }
+        if (auto* loop = dynamic_cast<CFlatParser::IterationStatementContext*>(parent))
+        {
+            if (loop->In() != nullptr && loop->Identifier() != nullptr
+                && loop->Identifier()->getText() == name
+                && LexicalIsUnder(use, loop->statement()))
+                return true;
+            if (loop->forCondition() != nullptr)
+                if (auto* declaration = loop->forCondition()->forDeclaration())
+                {
+                    bool self = false;
+                    if (LexicalVisibleDeclarator(declaration, declaration->initDeclaratorList(),
+                                                 name, use, &self) != nullptr || self)
+                        return true;
+                }
+        }
+        if (auto* arm = dynamic_cast<CFlatParser::LabeledStatementContext*>(parent))
+            if (arm->typeSpecifier() != nullptr && arm->Identifier() != nullptr
+                && arm->Identifier()->getText() == name && node == arm->statement())
+                return true;
+
+        auto* list = dynamic_cast<CFlatParser::BlockItemListContext*>(parent);
+        if (list == nullptr) continue;
+        for (auto* item : list->blockItem())
+        {
+            auto* declaration = item->declaration();
+            bool self = false;
+            if (declaration != nullptr
+                && (LexicalVisibleDeclarator(declaration, declaration->initDeclaratorList(),
+                                             name, use, &self) != nullptr || self))
+                return true;
+            if (item == node) break;
+            if (declaration != nullptr && LexicalDeclaresTypeNamed(declaration, name))
+                return true;
+            if (auto* destructuring = item->destructuringDeclaration())
+                for (auto* entry : destructuring->destructuringEntry())
+                    if (entry->Identifier() != nullptr && entry->Identifier()->getText() == name)
+                        return true;
+            if (auto* alias = item->usingDeclaration(); alias != nullptr
+                && alias->Identifier() != nullptr && alias->Identifier()->getText() == name)
+                return true;
+        }
+    }
+    return false;
+}
+
 std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
         antlr4::ParserRuleContext* bodyCtx,
         const std::set<std::string>& lambdaParamNames,
@@ -10862,8 +10922,44 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
         // `shadowed` grows as we descend into nested lambdas: it holds the parameter names of the
         // nested lambdas currently being walked, so a nested parameter that shadows an enclosing
         // name is not mis-captured.
-        std::function<void(antlr4::tree::ParseTree*, const std::set<std::string>&)> walk =
-            [&](antlr4::tree::ParseTree* node, const std::set<std::string>& shadowed)
+        auto captureThis = [&]()
+        {
+            if (seenNames.count("this") || lambdaParamNames.count("this")) return;
+            auto thisPtr = compiler->GetThisPointer();
+            llvm::Value* thisValue = thisPtr.Primary;
+            if (thisValue == nullptr && thisPtr.Storage != nullptr)
+                thisValue = compiler->builder->CreateLoad(
+                    compiler->GetType(thisPtr.TypeAndValue), thisPtr.Storage, "capture_this");
+            if (thisValue == nullptr) return;
+
+            seenNames.insert("this");
+            CaptureInfo ci;
+            ci.Name = "this";
+            ci.TV = thisPtr.TypeAndValue;
+            ci.TV.Pointer = true;
+            ci.OuterStorage = thisValue;
+            ci.ByReference = false;
+            ci.IsThis = true;
+            captures.push_back(ci);
+        };
+
+        auto resolvesToThis = [&](const LLVMBackend::NamedVariable& binding)
+        {
+            const auto thisPtr = compiler->GetThisPointer();
+            return (thisPtr.Primary != nullptr
+                    && (binding.Primary == thisPtr.Primary || binding.Storage == thisPtr.Primary))
+                || (thisPtr.Storage != nullptr
+                    && (binding.Primary == thisPtr.Storage || binding.Storage == thisPtr.Storage));
+        };
+
+        auto* rootLambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(bodyCtx);
+        for (antlr4::tree::ParseTree* node = bodyCtx;
+             node != nullptr && rootLambda == nullptr; node = node->parent)
+            rootLambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(node);
+        std::function<void(antlr4::tree::ParseTree*, const std::set<std::string>&,
+                           CFlatParser::LambdaExpressionContext*)> walk =
+            [&](antlr4::tree::ParseTree* node, const std::set<std::string>& shadowed,
+                CFlatParser::LambdaExpressionContext* currentLambda)
         {
             if (!node) return;
 
@@ -10881,7 +10977,7 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
                     for (auto* p : pl->lambdaParam())
                         inner.insert(p->Identifier()->getText());
                 if (auto* body = nested->lambdaBody())
-                    walk(body, inner);
+                    walk(body, inner, nested);
                 return;
             }
 
@@ -10889,59 +10985,44 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
             // standalone identifier (not a member name after '.' or a named-arg label).
             if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
             {
-                if (auto* gi = primary->genericIdentifier())
+                // `global::name` names the global, never a local or a member: nothing to capture.
+                if (auto* gi = primary->genericIdentifier(); gi != nullptr && primary->DoubleColon() == nullptr)
                 {
                     std::string name = gi->Identifier()->getText();
-                    // 'this' inside a method body is the implicit self pointer (Storage==nullptr,
-                    // Primary-backed), so the storage-keyed frame search below skips it. Capture it
-                    // explicitly: store the self pointer by value into the env and re-register it as
-                    // 'this' in the invoker so member access / bare method calls resolve normally.
-                    if (name == "this" && !seenNames.count("this") && !lambdaParamNames.count("this"))
-                    {
-                        auto thisPtr = compiler->GetThisPointer();
-                        if (thisPtr.Storage != nullptr)
-                        {
-                            seenNames.insert("this");
-                            CaptureInfo ci;
-                            ci.Name         = "this";
-                            ci.TV           = thisPtr.TypeAndValue;  // {TypeName=struct, Pointer=true}
-                            ci.TV.Pointer   = true;
-                            ci.OuterStorage = thisPtr.Storage;
-                            ci.ByReference  = false;
-                            ci.IsThis       = true;
-                            captures.push_back(ci);
-                        }
-                        return;
-                    }
                     // NOTE: functionTable / dataStructures are deliberately NOT excluded
                     // here. A local variable or parameter shadows a same-named function,
-                    // method, or struct, so the enclosing-scope frame search below is the
-                    // authoritative gate: if `name` resolves to a local/arg with storage we
-                    // capture it; otherwise (a real function/type reference) the search
-                    // finds nothing and we capture nothing. Excluding on functionTable here
+                    // method, or struct, so the enclosing-scope binding lookup below is the
+                    // authoritative gate: a resolved local/arg is captured; otherwise (a real
+                    // function/type reference) no capture is added. Excluding on functionTable here
                     // dropped captures whose name collided with an in-scope method (e.g. a
                     // captured `seed` when random.cb defines Random.seed), leaving the body
                     // to reference the OUTER storage across the closure boundary. Globals are not
                     // excluded either, for the same reason: a local shadows a same-named global
                     // (CFlat or C/C++-imported), and the body resolves the local first, so the
-                    // capture must too. A plain global reference finds no frame entry.
+                    // capture must too. A plain global reference has no local/arg binding.
                     if (!seenNames.count(name)
                         && !lambdaParamNames.count(name)
-                        && !shadowed.count(name))
+                        && !shadowed.count(name)
+                        && !LambdaLocallyBindsName(currentLambda, primary, name))
                     {
-                        for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
+                        bool resolvedOuterBinding = false;
+                        auto binding = compiler->GetScopedLocalOrArgument(name);
+                        if (binding.Storage != nullptr || binding.Primary != nullptr)
                         {
-                            auto localIt = frame.namedVariable.find(name);
-                            auto addCapture = [&](const LLVMBackend::NamedVariable& nv)
+                            resolvedOuterBinding = true;
+                            if (resolvesToThis(binding))
                             {
-                                if (!nv.Storage) return;
+                                captureThis();
+                            }
+                            else if (binding.Storage != nullptr)
+                            {
                                 seenNames.insert(name);
                                 CaptureInfo ci;
                                 ci.Name = name;
-                                ci.TV   = nv.TypeAndValue;
-                                ci.OuterStorage = nv.Storage;
-                                ci.SourceIsStaticLocal = nv.IsStaticLocal;
-                                ci.ConstFoldInt = nv.ConstFoldInt;
+                                ci.TV   = binding.TypeAndValue;
+                                ci.OuterStorage = binding.Storage;
+                                ci.SourceIsStaticLocal = binding.IsStaticLocal;
+                                ci.ConstFoldInt = binding.ConstFoldInt;
                                 // Every non-pointer struct value captures BY REFERENCE, as
                                 // doc/LANGUAGE.md "Reference capture" documents - a container
                                 // (list/dictionary) is a struct like any other, and value-capturing
@@ -10956,28 +11037,19 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
                                     && ci.TV.TypeName != "__closure_fat_ptr"
                                     && compiler->dataStructures.count(ci.TV.TypeName);
                                 captures.push_back(ci);
-                            };
-                            if (localIt != frame.namedVariable.end())
-                            {
-                                addCapture(localIt->second);
-                                break;
-                            }
-                            auto argIt = frame.functionArgument.find(name);
-                            if (argIt != frame.functionArgument.end())
-                            {
-                                addCapture(argIt->second);
-                                break;
                             }
                         }
+                        if (!resolvedOuterBinding && compiler->HasMemberVariable(name))
+                            captureThis();
                     }
                 }
             }
 
             for (size_t i = 0; i < node->children.size(); i++)
-                walk(node->children[i], shadowed);
+                walk(node->children[i], shadowed, currentLambda);
         };
 
-        if (bodyCtx) walk(bodyCtx, {});
+        if (bodyCtx) walk(bodyCtx, {}, rootLambda);
         return captures;
     }
 
@@ -11189,7 +11261,11 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             for (size_t i = 0; i < captures.size(); i++)
             {
                 auto* fieldGEP = compiler->builder->CreateStructGEP(closureStructTy, envCaptureBase, (unsigned)i);
-                if (captures[i].ByReference)
+                if (captures[i].IsThis)
+                {
+                    compiler->builder->CreateStore(captures[i].OuterStorage, fieldGEP);
+                }
+                else if (captures[i].ByReference)
                 {
                     // Store pointer to outer struct (alloca address) in closure field.
                     compiler->builder->CreateStore(captures[i].OuterStorage, fieldGEP);
@@ -11240,6 +11316,19 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             }
         }
 
+        // T407: inside a native ctor (or a lambda nested in one) a `this` capture is a source for
+        // the ctor's escape analysis, and this lambda's invoker joins the ctor's family.
+        auto* ctorClosure = compiler->ctorThisClosure_;
+        if (ctorClosure != nullptr)
+        {
+            auto* outerBlock = compiler->builder->GetInsertBlock();
+            if (outerBlock == nullptr || !ctorClosure->Family.count(outerBlock->getParent()))
+                ctorClosure = nullptr;
+        }
+        if (ctorClosure != nullptr && envForFatTagged != nullptr
+            && std::any_of(captures.begin(), captures.end(), [](const CaptureInfo& c) { return c.IsThis; }))
+            ctorClosure->Sources.push_back(envForFatTagged);
+
         // Save builder position - invoker emits into a separate LLVM function.
         LLVMBackend::BuilderStateGuard savedState(compiler);
         // The lambda body's own returns must not see (or clear) an enclosing statement's armed
@@ -11283,6 +11372,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         allParams.push_back(envParam);
 
         auto* fn = compiler->CreateFunctionDefinition(lambdaName, returnType, allParams);
+        if (ctorClosure != nullptr) ctorClosure->Family.insert(fn);
         compiler->InitializeBlock(&fn->front(), false);
         LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         struct LambdaDeferredCheckGuard
@@ -11824,8 +11914,23 @@ llvm::Value* MainListener::EmitHeapDefaultConstruct(LLVMBackend* compiler, const
             typedPtr, typeName, useAligned ? effAlign : 0, sizeVal);
         if (compiler->GetFunction(typeName))
         {
+            const bool nativeCtorSret = compiler->IsNativeValueConstructor(
+                typeName, LLVMBackend::TypeAndValue{ .TypeName = typeName }, {});
+            if (nativeCtorSret)
+            {
+                compiler->pendingCxxSretDest_ = typedPtr;
+                compiler->pendingCxxSretTypeName_ = typeName;
+                compiler->pendingCxxSretReturn_ = true;
+            }
             llvm::Value* structVal = compiler->CreateOverloadedFunctionCall(typeName, {});
-            if (structVal)
+            const bool builtInPlace = nativeCtorSret && compiler->pendingCxxSretDest_ == nullptr;
+            if (nativeCtorSret)
+            {
+                compiler->pendingCxxSretDest_ = nullptr;
+                compiler->pendingCxxSretTypeName_.clear();
+                compiler->pendingCxxSretReturn_ = false;
+            }
+            if (structVal && !builtInPlace)
                 compiler->builder->CreateStore(structVal, typedPtr);
         }
         return typedPtr;

@@ -2201,6 +2201,9 @@ public:
         // Cached NeedsCxxLoweringType answer; Known is set once the field graph was complete.
         bool NeedsCxxLowering = false;
         bool NeedsCxxLoweringKnown = false;
+        // A constructor stores a closure capturing `this` where a copy of the object would keep
+        // it (decided from the emitted IR; a memberwise copy of the type is then refused).
+        bool StoresThisClosure = false;
     };
 
     struct ProgramData
@@ -9640,6 +9643,11 @@ public:
     AbiRecipe ComputeCxxReturnAbiRecipe(const TypeAndValue& retType,
                                          const std::vector<TypeAndValue>& params);
 
+    bool IsNativeValueConstructor(const std::string& functionName,
+        const TypeAndValue& returnType, const std::vector<TypeAndValue>& arguments);
+    AbiRecipe NativeValueConstructorRecipe(const TypeAndValue& returnType,
+        size_t parameterCount);
+
     // Parse the LLVM IR type TEXT clang serialized into a RawAbiSlot ("i64", "[2 x i64]",
     // "{ i64, i32 }", "<2 x float>", "float", "ptr"). Returns nullptr on anything outside that
     // grammar - the caller turns that into a LogError rather than guessing.
@@ -10632,14 +10640,13 @@ public:
     // stores the value when the ABI returned the object in registers.
     llvm::Value* lastCxxRetTemp_ = nullptr;
     llvm::Value* lastCxxRetValue_ = nullptr;
-    // The same pair for a classified CFlat-only struct result (NOT on the owned-temp list: the
-    // loaded value keeps CFlat by-value ownership). Read only by the declaration that adopts
+    // The same pair for lowered CFlat struct results. Read only by the declaration that adopts
     // the slot as its storage; every other consumer sees a plain by-value result.
     llvm::Value* lastLoweredRetTemp_ = nullptr;
     llvm::Value* lastLoweredRetValue_ = nullptr;
-    // Identity-only: the sret temp of the last member copy() call that returned a lowered
-    // struct. A declaration adopts it only when its initializer IS that call's result.
-    llvm::Value* lastLoweredCopyRetTemp_ = nullptr;
+    // Identity-only: an sret result safe to adopt in place (native ctor or lowered copy).
+    // A declaration adopts it only when its initializer IS that call's result.
+    llvm::Value* lastLoweredInPlaceRetTemp_ = nullptr;
     // Indirect calls emitted while their by-value return type was still opaque; rewritten to
     // sret once the type completes classified (the stored function value is the sret shim).
     struct OpaqueReturnIndirectCall { llvm::WeakTrackingVH call; std::string typeName; };
@@ -12437,7 +12444,73 @@ public:
     {
         if (scope == 0) return;
         std::erase_if(pendingConstReceiverCalls_, [&](const auto& e) { return e.Owner == scope; });
+        std::erase_if(thisClosureCopySites_, [&](const auto& e) { return e.Owner == scope; });
     }
+
+    /*
+     * T407: a native constructor whose lambda captures `this` and stores that closure where the
+     * object keeps it makes a by-value copy of the object dangle (the copy's closure still points
+     * at the original). The ctor body is analysed on its emitted IR (StoresThisClosure); every
+     * memberwise copy / by-value relocation of a native struct is recorded without deciding and
+     * refused at module end, once every constructor body is known.
+     */
+    struct CtorThisClosureState
+    {
+        std::string StructName;
+        llvm::Value* This = nullptr;
+        // The ctor function and the invokers of lambdas nested in it.
+        std::unordered_set<const llvm::Function*> Family;
+        // Envs of lambdas in Family that captured `this`.
+        std::vector<llvm::Value*> Sources;
+    };
+    CtorThisClosureState* ctorThisClosure_ = nullptr;
+    struct CtorThisClosureScope
+    {
+        LLVMBackend* backend;
+        CtorThisClosureState state;
+        CtorThisClosureState* saved;
+        CtorThisClosureScope(LLVMBackend* b, const std::string& structName, llvm::Value* thisStorage)
+            : backend(b), saved(b->ctorThisClosure_)
+        {
+            state.StructName = structName;
+            state.This = thisStorage;
+            if (auto* block = b->builder->GetInsertBlock()) state.Family.insert(block->getParent());
+            b->ctorThisClosure_ = &state;
+        }
+        ~CtorThisClosureScope() { backend->ctorThisClosure_ = saved; }
+        CtorThisClosureScope(const CtorThisClosureScope&) = delete;
+        CtorThisClosureScope& operator=(const CtorThisClosureScope&) = delete;
+    };
+    // True when a this-capturing closure of the ctor in `state` may outlive the ctor call in a
+    // place other than a local (a field of `this`, a global, the heap, an unknown callee).
+    bool CtorThisClosureEscapes(const CtorThisClosureState& state) const;
+    enum class ThisClosureCopyKind { Copy, FreshStore, FreshArgument, Return, CtorReturn };
+    struct ThisClosureCopySite
+    {
+        std::string TypeName;
+        ThisClosureCopyKind Kind = ThisClosureCopyKind::Copy;
+        std::string File;
+        size_t Line = 0;
+        size_t Column = 0;
+        size_t Owner = 0;
+        const llvm::Function* Function = nullptr;   // identity only
+    };
+    std::vector<ThisClosureCopySite> thisClosureCopySites_;
+    // Ctor functions returning their object by value: their CtorReturn site stands for every
+    // relocation inside them.
+    std::unordered_map<const llvm::Function*, std::string> byValueCtorStructs_;
+    bool MakeThisClosureCopySite(const std::string& typeName, ThisClosureCopyKind kind,
+                                 ThisClosureCopySite& site);
+    void NoteThisClosureCopySite(const std::string& typeName, ThisClosureCopyKind kind);
+    // The type itself, or one held by value in it, that stores a this-capturing closure; empty
+    // when none does.
+    std::string ThisClosureStoringType(const std::string& typeName) const;
+    bool ThisClosureSiteRefused(const ThisClosureCopySite& site) const;
+    void ReportThisClosureCopySite(const ThisClosureCopySite& site);
+    // Native ctor results loaded out of their temporary; at the statement flush one moved
+    // elsewhere by value (store, aggregate insert, by-value argument) is recorded as a site.
+    std::vector<std::pair<llvm::WeakVH, ThisClosureCopySite>> pendingNativeCtorResults_;
+    void NoteNativeCtorResultRelocations();
     void ResolvePendingConstReceiverCalls(bool aborted = false);
     const TypeAndValue* DeclaredConstSlot(const llvm::Value* slot, std::string& name, int depth = 0) const;
     bool PointerValuePointeeConst(const llvm::Value* pointer, std::string& name, int depth = 0) const;

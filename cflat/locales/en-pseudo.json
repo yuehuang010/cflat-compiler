@@ -727,6 +727,10 @@
       "int",
       "int"
     ],
+    "copyingarg0wouldleav...sitbypointerormoveitdee098b7c25690cc": [
+      "T407S",
+      "T407S"
+    ],
     "couldnotcompletethes...uestreturnednorecord0006623b57858e8d": [
       "cppi_expr.VecBase$cppi_expr.Vec3"
     ],
@@ -850,6 +854,10 @@
       "'{'"
     ],
     "missingatendofstatement": [],
+    "movinganewarg0outofi...initializerorwithnewe436841fea1341f2": [
+      "T407S",
+      "T407S"
+    ],
     "multiplebasesarenotsupportedyet": [],
     "namedargumentarg0doe...notmatchanyparameter54ee4c123914315f": [
       "z"
@@ -894,10 +902,18 @@
       "t",
       "cppi.take_rvalue"
     ],
+    "passinganewarg0byval...landpassapointertoit7f1a0c05acf35f5a": [
+      "T407S",
+      "T407S"
+    ],
     "redefinitionofarg0th...areoneoverloadnottwod3edf872df7d2d1d": [
       "dupExact",
       "err_declarations.cb",
       "103"
+    ],
+    "returningarg0byvalue...xamplefromnewinsteadc55e90d63bb77213": [
+      "T407S",
+      "T407S"
     ],
     "simdelementtypemustb...rarg4foramaskgotarg580538da9e2d1ea22": [
       "i8..i64",
@@ -910,6 +926,11 @@
     "switchexpressionmustbeanintegertype": [],
     "thecclassarg0hasnode...rsocflatcannotcallitd92871eaa171e095": [
       "t63.TwoOnly"
+    ],
+    "theconstructorofarg0...oldthevaluebypointer5d5e6d6cb5138938": [
+      "T407Holder",
+      "T407D",
+      "T407Holder"
     ],
     "unknowntypearg0": [
       "GiDeadOnly__i32"
@@ -2108,6 +2129,7 @@
     "conversionfromarg0to...versionsowntypefirst7a5cfbd608174216": "conversion from '{0}' to '{1}' is ambiguous: {2} each reach it through one standard conversion. Cast to the conversion's own type first.",
     "coperatorarg0cannott...itexplicitlywitharg326f492c0fed976a8": "C++ operator{0} cannot take a '{1}' operand for its 'const {2}&' parameter: an int <-> floating conversion is not allowed at a call argument - cast it explicitly with '({3})'",
     "coperatorarg0cannott...itexplicitlywitharg37649373e75fbe9db": "C++ operator{0} cannot take a '{1}' operand for its 'const {2}&' parameter: integer narrowing is not allowed at a call argument - cast it explicitly with '({3})'",
+    "copyingarg0wouldleav...sitbypointerormoveitdee098b7c25690cc": "copying '{0}' would leave its stored closure pointing at the original object ('this' captured in {1}'s constructor); pass it by pointer or move it",
     "couldnotcompletethes...uestreturnednorecord0006623b57858e8d": "could not complete the special members of C++ record '{0}' for its first use: the completion request returned no record",
     "cppstructarg0hasanun...fieldarg1useapointer9576d7fd975b25ee": "[cpp] struct '{0}' has an unsized field '{1}'; use a pointer",
     "cppstructcannotbeaunion": "[cpp] struct cannot be a union",
@@ -2174,6 +2196,7 @@
     "mismatchedinputarg0expectingarg1": "mismatched input {0} expecting {1}",
     "missingarg0atarg1": "missing {0} at {1}",
     "missingatendofstatement": "missing ';' at end of statement",
+    "movinganewarg0outofi...initializerorwithnewe436841fea1341f2": "moving a new '{0}' out of its temporary would leave its stored closure pointing at the temporary ('this' captured in {1}'s constructor); construct it in place (a declaration, a field or element initializer) or with 'new'",
     "multiplebasesarenotsupportedyet": "multiple bases are not supported yet",
     "namedargumentarg0doe...notmatchanyparameter54ee4c123914315f": "named argument '{0}' does not match any parameter",
     "noarg0compilerdriver...dtolinktheexecutable11639c2d0b9f1811": "no {0} compiler driver found to link the executable.",
@@ -2188,6 +2211,7 @@
     "parameterarg0cannotp...toftheirsourcesscope0c92f2fcfe931fdb": "parameter '{0}': cannot pass bonded value to '{1}' parameter - bonded values cannot be transferred out of their source's scope",
     "parameterarg0ofarg1i...anrvaluepassanlvalueec25f7364020bcfb": "parameter '{0}' of '{1}' is a non-const lvalue reference and cannot bind an rvalue; pass an lvalue",
     "parameterarg0ofarg1i...smoveargoratemporarydf5863f826e239c2": "parameter '{0}' of '{1}' is an rvalue reference; pass 'move <arg>' or a temporary",
+    "passinganewarg0byval...landpassapointertoit7f1a0c05acf35f5a": "passing a new '{0}' by value would leave its stored closure pointing at the temporary ('this' captured in {1}'s constructor); declare it as a local and pass a pointer to it",
     "programdefinitionsrequireatrailing": "program definitions require a trailing ';'",
     "redefinitionofarg0th...areoneoverloadnottwod3edf872df7d2d1d": "redefinition of '{0}' - the same overload is already defined at {1}({2}). Two parameter lists that differ only in a SPELLING of one type ('int' and 'i32' name the same type) are one overload, not two.",
     "reflectfailedtocreatefunctionforarg0": "reflect: failed to create function for '{0}'",
@@ -2195,12 +2219,14 @@
     "reflectisnotsupportedonuniontypearg0": "reflect is not supported on union type '{0}'",
     "reflectstructarg0hasnollvmtype": "reflect: struct '{0}' has no LLVM type",
     "reflectunknownstructarg0": "reflect: unknown struct '{0}'",
+    "returningarg0byvalue...xamplefromnewinsteadc55e90d63bb77213": "returning '{0}' by value would leave its stored closure pointing at the returned-from object ('this' captured in {1}'s constructor); return a pointer (for example from 'new') instead",
     "runcflatinitforthefi...imetofinishsettingup781292498c2143fa": "Run cflat --init for the first time to finish setting up.",
     "simdelementtypemustb...rarg4foramaskgotarg580538da9e2d1ea22": "simd element type must be a numeric scalar ({0}, {1}, {2}, {3}) or {4} for a mask, got '{5}'",
     "structclassdefinitionsrequireatrailing": "struct/class definitions require a trailing ';'",
     "structscannotimpleme...facesuseclassinstead717a4040b2a990a4": "structs cannot implement interfaces; use 'class' instead",
     "switchexpressionmustbeanintegertype": "switch expression must be an integer type",
     "thecclassarg0hasnode...rsocflatcannotcallitd92871eaa171e095": "the C++ class '{0}' has no default constructor, so cflat cannot call it",
+    "theconstructorofarg0...oldthevaluebypointer5d5e6d6cb5138938": "the constructor of '{0}' returns the object by value, which would leave its stored closure pointing at the constructor's temporary ('this' captured in {1}'s constructor); declare a 'Lambda' field directly in '{2}' so it is built in place, or hold the value by pointer",
     "unclosedcheckforamissingclosingbrace": "unclosed '{{' - check for a missing closing brace",
     "unexpectedcharacterarg0": "unexpected character: {0}",
     "unknownfunctionarg0": "unknown function '{0}'",

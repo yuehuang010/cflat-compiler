@@ -6330,6 +6330,7 @@ void LLVMBackend::RestoreDetectionLedgers(DetectionLedgerSnapshot snapshot)
 
 void LLVMBackend::FlushOwnedTemps()
 {
+        NoteNativeCtorResultRelocations();
         FlushOwnedStringTemps();
         FlushOwnedClosureTemps();
         FlushOwnedStructTemps();
@@ -7663,3 +7664,302 @@ LLVMBackend::~LLVMBackend()
         // context is last to be released.
         context.release();
     }
+
+// ---- T407: constructor lambdas capturing `this` vs by-value copies of the object ----
+
+bool LLVMBackend::MakeThisClosureCopySite(const std::string& typeName, ThisClosureCopyKind kind,
+                                          ThisClosureCopySite& site)
+{
+        if (typeName.empty() || !IsDataStructure(typeName) || IsCppStructName(typeName)) return false;
+        site.TypeName = typeName;
+        site.Kind = kind;
+        site.File = sourceFileName;
+        site.Line = currentLine;
+        site.Column = currentColumn;
+        // Inside a generic body instantiated for the type: report at the use that instantiated it.
+        if (const auto& origin = gts.activeInstantiationOrigin; origin.valid)
+        {
+            site.File = origin.file;
+            site.Line = origin.line;
+            site.Column = origin.column;
+        }
+        if (auto* block = builder->GetInsertBlock()) site.Function = block->getParent();
+        if (!expectedError.empty() && expectedError != fileScopeExpectedError_)
+            site.Owner = activeExpectScope_;
+        return true;
+}
+
+void LLVMBackend::NoteThisClosureCopySite(const std::string& typeName, ThisClosureCopyKind kind)
+{
+        ThisClosureCopySite site;
+        if (!MakeThisClosureCopySite(typeName, kind, site)) return;
+        if (kind == ThisClosureCopyKind::CtorReturn && site.Function != nullptr)
+            byValueCtorStructs_[site.Function] = typeName;
+        thisClosureCopySites_.push_back(std::move(site));
+}
+
+std::string LLVMBackend::ThisClosureStoringType(const std::string& typeName) const
+{
+        std::unordered_set<std::string> seen;
+        std::function<std::string(const std::string&)> walk = [&](const std::string& name) {
+            if (!seen.insert(name).second) return std::string();
+            auto it = dataStructures.find(name);
+            if (it == dataStructures.end()) return std::string();
+            if (it->second.StoresThisClosure) return name;
+            for (const auto& field : it->second.StructFields)
+            {
+                if (field.Pointer || field.ElemPointer || field.IsArrayView || field.IsAlias)
+                    continue;
+                if (std::string found = walk(field.TypeName); !found.empty()) return found;
+            }
+            return std::string();
+        };
+        return walk(typeName);
+}
+
+bool LLVMBackend::ThisClosureSiteRefused(const ThisClosureCopySite& site) const
+{
+        if (site.Kind != ThisClosureCopyKind::CtorReturn)
+            if (auto it = byValueCtorStructs_.find(site.Function); it != byValueCtorStructs_.end()
+                && !ThisClosureStoringType(it->second).empty())
+                return false;
+        return !ThisClosureStoringType(site.TypeName).empty();
+}
+
+void LLVMBackend::ReportThisClosureCopySite(const ThisClosureCopySite& site)
+{
+        if (!ThisClosureSiteRefused(site)) return;
+        const std::string owner = ThisClosureStoringType(site.TypeName);
+        if (owner.empty()) return;
+        ReportingFileScope fileScope(this, site.File, site.Line, site.Column);
+        const std::string type = SpellType(*this, TypeAndValue{ .TypeName = site.TypeName });
+        const std::string ownerType = SpellType(*this, TypeAndValue{ .TypeName = owner });
+        switch (site.Kind)
+        {
+        case ThisClosureCopyKind::Copy:
+            LogErrorMessage("copying '{}' would leave its stored closure pointing at the original "
+                "object ('this' captured in {}'s constructor); pass it by pointer or move it",
+                { type, ownerType });
+            break;
+        case ThisClosureCopyKind::FreshStore:
+            LogErrorMessage("moving a new '{}' out of its temporary would leave its stored closure "
+                "pointing at the temporary ('this' captured in {}'s constructor); construct it in "
+                "place (a declaration, a field or element initializer) or with 'new'",
+                { type, ownerType });
+            break;
+        case ThisClosureCopyKind::FreshArgument:
+            LogErrorMessage("passing a new '{}' by value would leave its stored closure pointing at "
+                "the temporary ('this' captured in {}'s constructor); declare it as a local and "
+                "pass a pointer to it", { type, ownerType });
+            break;
+        case ThisClosureCopyKind::Return:
+            LogErrorMessage("returning '{}' by value would leave its stored closure pointing at the "
+                "returned-from object ('this' captured in {}'s constructor); return a pointer (for "
+                "example from 'new') instead", { type, ownerType });
+            break;
+        case ThisClosureCopyKind::CtorReturn:
+            LogErrorMessage("the constructor of '{}' returns the object by value, which would leave "
+                "its stored closure pointing at the constructor's temporary ('this' captured in "
+                "{}'s constructor); declare a 'Lambda' field directly in '{}' so it is built in "
+                "place, or hold the value by pointer", { type, ownerType, type });
+            break;
+        }
+}
+
+void LLVMBackend::NoteNativeCtorResultRelocations()
+{
+        if (pendingNativeCtorResults_.empty()) return;
+        enum class Use { None, Store, Argument };
+        std::function<Use(llvm::Value*, llvm::Value*, int)> useOf =
+            [&](llvm::Value* value, llvm::Value* home, int depth) -> Use {
+            for (auto* user : value->users())
+            {
+                if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+                {
+                    if (store->getValueOperand() == value && store->getPointerOperand() != home)
+                        return Use::Store;
+                }
+                else if (auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(user))
+                {
+                    if (insert->getInsertedValueOperand() == value) return Use::Store;
+                }
+                else if (auto* call = llvm::dyn_cast<llvm::CallBase>(user))
+                {
+                    if (call->getCalledOperand() != value) return Use::Argument;
+                }
+                else if ((llvm::isa<llvm::PHINode>(user) || llvm::isa<llvm::SelectInst>(user))
+                         && depth < 4)
+                {
+                    if (Use u = useOf(user, home, depth + 1); u != Use::None) return u;
+                }
+            }
+            return Use::None;
+        };
+        auto pending = std::move(pendingNativeCtorResults_);
+        pendingNativeCtorResults_.clear();
+        for (auto& [handle, site] : pending)
+        {
+            auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(static_cast<llvm::Value*>(handle));
+            if (load == nullptr) continue;
+            // Not consumed yet (a flush inside the expression): look again at the next flush.
+            if (load->use_empty())
+            {
+                pendingNativeCtorResults_.emplace_back(handle, site);
+                continue;
+            }
+            const Use use = useOf(load, load->getPointerOperand(), 0);
+            if (use == Use::None) continue;
+            site.Kind = use == Use::Argument
+                ? ThisClosureCopyKind::FreshArgument : ThisClosureCopyKind::FreshStore;
+            thisClosureCopySites_.push_back(site);
+        }
+}
+
+bool LLVMBackend::CtorThisClosureEscapes(const CtorThisClosureState& state) const
+{
+        if (state.Sources.empty()) return false;
+        std::unordered_set<const llvm::Value*> tainted;   // values carrying a source env
+        std::unordered_set<const llvm::Value*> memory;    // local slots holding one
+        std::vector<const llvm::Value*> values, slots;
+        auto taint = [&](const llvm::Value* v) { if (tainted.insert(v).second) values.push_back(v); };
+        auto holdIn = [&](const llvm::Value* a) { if (memory.insert(a).second) slots.push_back(a); };
+        for (const llvm::Value* source : state.Sources) taint(source);
+        auto closureHelper = [](const llvm::Function* f) {
+            return f != nullptr && f->getName().contains("__closure_");
+        };
+        // Base object of an address: through GEPs, casts and the env pointer's low-bit tag.
+        auto baseOf = [](const llvm::Value* v) {
+            for (int i = 0; i < 64 && v != nullptr; i++)
+            {
+                if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(v)) { v = gep->getPointerOperand(); continue; }
+                auto* op = llvm::dyn_cast<llvm::Operator>(v);
+                if (op == nullptr) break;
+                const unsigned code = op->getOpcode();
+                if (code == llvm::Instruction::BitCast || code == llvm::Instruction::IntToPtr
+                    || code == llvm::Instruction::PtrToInt || code == llvm::Instruction::AddrSpaceCast
+                    || code == llvm::Instruction::And || code == llvm::Instruction::Or
+                    || code == llvm::Instruction::Add || code == llvm::Instruction::Sub)
+                {
+                    v = op->getOperand(0);
+                    continue;
+                }
+                break;
+            }
+            return v;
+        };
+        // A source closure written to `address`: a local slot or another env now holds it.
+        auto storeInto = [&](const llvm::Value* address) {
+            const llvm::Value* base = baseOf(address);
+            if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(base); alloca != nullptr && base != state.This)
+            {
+                holdIn(alloca);
+                return true;
+            }
+            if (auto* call = llvm::dyn_cast<llvm::CallBase>(base); call != nullptr
+                && closureHelper(call->getCalledFunction()))
+            {
+                taint(call);
+                return true;
+            }
+            return false;
+        };
+        while (!values.empty() || !slots.empty())
+        {
+            if (!values.empty())
+            {
+                const llvm::Value* v = values.back();
+                values.pop_back();
+                for (const llvm::User* user : v->users())
+                {
+                    if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+                    {
+                        if (store->getValueOperand() == v && !storeInto(store->getPointerOperand()))
+                            return true;
+                    }
+                    else if (llvm::isa<llvm::LoadInst>(user) || llvm::isa<llvm::CmpInst>(user)
+                             || llvm::isa<llvm::BranchInst>(user) || llvm::isa<llvm::SwitchInst>(user))
+                        continue;
+                    else if (llvm::isa<llvm::CastInst>(user) || llvm::isa<llvm::BinaryOperator>(user)
+                             || llvm::isa<llvm::GetElementPtrInst>(user)
+                             || llvm::isa<llvm::InsertValueInst>(user)
+                             || llvm::isa<llvm::ExtractValueInst>(user) || llvm::isa<llvm::PHINode>(user)
+                             || llvm::isa<llvm::SelectInst>(user) || llvm::isa<llvm::FreezeInst>(user))
+                        taint(user);
+                    else if (auto* call = llvm::dyn_cast<llvm::CallBase>(user))
+                    {
+                        if (call->getCalledOperand() == v) continue;
+                        const llvm::Function* callee = call->getCalledFunction();
+                        if (callee == nullptr)
+                        {
+                            // Invoking the closure itself: its code pointer carries the taint too.
+                            if (!tainted.count(call->getCalledOperand())) return true;
+                            continue;
+                        }
+                        if (callee->isIntrinsic())
+                        {
+                            const auto id = callee->getIntrinsicID();
+                            if ((id == llvm::Intrinsic::memcpy || id == llvm::Intrinsic::memmove)
+                                && call->getArgOperand(1) == v)
+                                return true;
+                            continue;
+                        }
+                        if (closureHelper(callee))
+                        {
+                            if (!call->getType()->isVoidTy()) taint(call);
+                            continue;
+                        }
+                        // The lambda's own invoker gets its env as the last argument.
+                        if (state.Family.count(callee) != 0 && call->arg_size() > 0
+                            && call->getArgOperand(call->arg_size() - 1) == v)
+                            continue;
+                        return true;
+                    }
+                    else
+                        return true;
+                }
+                continue;
+            }
+            // Every address into a local slot that holds a source closure.
+            std::vector<const llvm::Value*> addresses{ slots.back() };
+            slots.pop_back();
+            std::unordered_set<const llvm::Value*> seen;
+            while (!addresses.empty())
+            {
+                const llvm::Value* p = addresses.back();
+                addresses.pop_back();
+                if (!seen.insert(p).second) continue;
+                for (const llvm::User* user : p->users())
+                {
+                    if (auto* load = llvm::dyn_cast<llvm::LoadInst>(user))
+                        taint(load);
+                    else if (auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+                    {
+                        if (store->getValueOperand() == p) return true;
+                    }
+                    else if (llvm::isa<llvm::GetElementPtrInst>(user) || llvm::isa<llvm::BitCastInst>(user)
+                             || llvm::isa<llvm::AddrSpaceCastInst>(user) || llvm::isa<llvm::PHINode>(user)
+                             || llvm::isa<llvm::SelectInst>(user))
+                        addresses.push_back(user);
+                    else if (llvm::isa<llvm::CmpInst>(user) || llvm::isa<llvm::PtrToIntInst>(user))
+                        continue;
+                    else if (auto* call = llvm::dyn_cast<llvm::CallBase>(user))
+                    {
+                        const llvm::Function* callee = call->getCalledFunction();
+                        if (callee != nullptr && callee->isIntrinsic())
+                        {
+                            const auto id = callee->getIntrinsicID();
+                            if ((id == llvm::Intrinsic::memcpy || id == llvm::Intrinsic::memmove)
+                                && call->getArgOperand(1) == p && !storeInto(call->getArgOperand(0)))
+                                return true;
+                            continue;
+                        }
+                        if (closureHelper(callee)) continue;
+                        return true;
+                    }
+                    else
+                        return true;
+                }
+            }
+        }
+        return false;
+}

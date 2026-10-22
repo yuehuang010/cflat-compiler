@@ -8079,10 +8079,20 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         std::vector<llvm::Value*> cxxIndirectArgAddrs;
         llvm::Value* cxxSretDest = nullptr;
         llvm::Value* cxxRetTemp = nullptr;
+        // T407: a memberwise copy of a native struct, decided at module end. Not the synth's own
+        // field copies (the outer copy site stands for them).
+        if (functionName == "copy" && candidate.UniqueName.ends_with(".copy.synth")
+            && builder->GetInsertBlock() != nullptr
+            && !builder->GetInsertBlock()->getParent()->getName().contains(".copy.synth"))
+            NoteThisClosureCopySite(candidate.ReturnType.TypeName, ThisClosureCopyKind::Copy);
         const bool cxxClassReturn = candidate.Recipe.hasLowering
             && candidate.Recipe.retSlot.kind == AbiSlot::SRetReturn
             && !candidate.ReturnType.Pointer
             && ReturnsViaCxxSret(candidate.ReturnType.TypeName);
+        const bool nativeValueConstructor = candidate.Recipe.hasLowering
+            && candidate.Recipe.retSlot.kind == AbiSlot::SRetReturn
+            && IsNativeValueConstructor(functionName, candidate.ReturnType,
+                                        candidate.Parameters);
         const bool cxxClassParam = std::any_of(candidate.Recipe.paramSlots.begin(),
             candidate.Recipe.paramSlots.end(), [&](const AbiSlot& slot) {
                 return slot.kind == AbiSlot::ByVal && slot.structTy != nullptr;
@@ -8241,6 +8251,22 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                                 "cxx.rettemp", candidate.Recipe.retSlot.align);
                     cxxRetTemp = cxxSretDest;
                 }
+            }
+        }
+        if (nativeValueConstructor)
+        {
+            if (pendingCxxSretDest_ != nullptr
+                && candidate.ReturnType.TypeName == pendingCxxSretTypeName_)
+            {
+                cxxSretDest = pendingCxxSretDest_;
+                pendingCxxSretDest_ = nullptr;
+                pendingCxxSretTypeName_.clear();
+            }
+            else
+            {
+                cxxSretDest = AllocaAtEntry(candidate.Recipe.retSlot.structTy, nullptr,
+                                            "native.ctor.rettemp", candidate.Recipe.retSlot.align);
+                cxxRetTemp = cxxSretDest;
             }
         }
 
@@ -8436,25 +8462,32 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         {
             // A classified CFlat struct result keeps CFlat by-value ownership (the loaded value
             // is the owned temporary, as before sret); only C++ class results own the slot.
-            if (!IsLoweredCFlatOnlyStruct(candidate.ReturnType.TypeName))
+            // A native ctor result keeps CFlat by-value ownership too (its temp is not owned).
+            if (!IsLoweredCFlatOnlyStruct(candidate.ReturnType.TypeName) && !nativeValueConstructor)
                 RegisterOwnedStructTemp(cxxRetTemp, candidate.ReturnType.TypeName);
             result = builder->CreateLoad(candidate.Recipe.retSlot.structTy, cxxRetTemp);
             // The loaded value stands for the call result: a produced temporary, exactly like
             // the by-value CallInst it replaces (discard and ownership checks key on that).
-            if (IsLoweredCFlatOnlyStruct(candidate.ReturnType.TypeName))
+            if (IsLoweredCFlatOnlyStruct(candidate.ReturnType.TypeName) || nativeValueConstructor)
                 nullConditionalTempResults_.push_back(result);
+            if (ThisClosureCopySite site; nativeValueConstructor
+                && MakeThisClosureCopySite(candidate.ReturnType.TypeName,
+                                           ThisClosureCopyKind::FreshStore, site))
+                pendingNativeCtorResults_.emplace_back(result, std::move(site));
         }
         if (candidate.Recipe.hasLowering
-            && (candidate.IsCxx || cxxClassReturn)
+            && (candidate.IsCxx || cxxClassReturn || nativeValueConstructor)
             && !candidate.ReturnType.Pointer && result != nullptr && result->getType()->isStructTy())
         {
             // Remembered for a declaration initialized by this call: the temp (sret) or null
             // when the ABI returned the object in registers (trivial for calls, a plain store).
-            if (!candidate.IsCxx && IsLoweredCFlatOnlyStruct(candidate.ReturnType.TypeName))
+            if (!candidate.IsCxx && (IsLoweredCFlatOnlyStruct(candidate.ReturnType.TypeName)
+                                     || nativeValueConstructor))
             {
                 lastLoweredRetTemp_ = cxxRetTemp;
                 lastLoweredRetValue_ = result;
-                lastLoweredCopyRetTemp_ = (candidate.IsMethod && functionName == "copy")
+                lastLoweredInPlaceRetTemp_ = (nativeValueConstructor
+                    || (candidate.IsMethod && functionName == "copy"))
                     ? cxxRetTemp : nullptr;
             }
             else
@@ -9145,14 +9178,21 @@ LLVMBackend::NamedVariable LLVMBackend::GetThisPointer()
             std::string structName = key.substr(0, key.size() - 2);
             if (!IsDataStructure(structName))
                 break;
-            // Only a *method* self qualifies here: its storage is an alloca-of-pointer
-            // (the incoming this* param), so loading it yields the struct pointer.
-            // A constructor's self is an alloca-of-struct (value under construction);
-            // leave that to the existing `this`-handling path.
             auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(nv.Storage);
-            if (!alloca || !alloca->getAllocatedType()->isPointerTy())
+            if (alloca && alloca->getAllocatedType()->isPointerTy())
+            {
+                NamedVariable thisVar = nv;
+                thisVar.CallerName = "this";
+                thisVar.TypeAndValue.TypeName = structName;
+                thisVar.TypeAndValue.Pointer = true;
+                return thisVar;
+            }
+
+            // Constructors register `this` as the pointer to their in-progress value.
+            auto directThis = functionArguments.find("this");
+            if (directThis == functionArguments.end() || directThis->second.Primary == nullptr)
                 break;
-            NamedVariable thisVar = nv;
+            NamedVariable thisVar = directThis->second;
             thisVar.CallerName = "this";
             thisVar.TypeAndValue.TypeName = structName;
             thisVar.TypeAndValue.Pointer = true;

@@ -24085,8 +24085,10 @@ llvm::Value* MainListener::EmitFieldDefaultFixedArrayBrace(
 static llvm::Value* ConstructDefaultArrayElement(LLVMBackend* compiler, const std::string& typeName,
                                                  llvm::Value* elemPtr, bool forceRoot)
 {
-        const bool armElemSret = compiler->IsLoweredCFlatOnlyStruct(typeName)
-            && compiler->ReturnsViaCxxSret(typeName);
+        const bool nativeCtorSret = compiler->IsNativeValueConstructor(
+            typeName, LLVMBackend::TypeAndValue{ .TypeName = typeName }, {});
+        const bool armElemSret = (compiler->IsLoweredCFlatOnlyStruct(typeName)
+            && compiler->ReturnsViaCxxSret(typeName)) || nativeCtorSret;
         if (armElemSret)
         {
             compiler->pendingCxxSretDest_ = elemPtr;
@@ -24733,7 +24735,9 @@ void MainListener::EmitFieldInitializer(
             if (destinationIsFresh && initField != nullptr && !initField->Pointer
                 && !initField->IsAlias && !initField->IsArrayView
                 && initField->ConstArraySize == 0
-                && compiler->ReturnsViaCxxSret(initField->TypeName)
+                && (compiler->ReturnsViaCxxSret(initField->TypeName)
+                    || compiler->IsNativeValueConstructor(initField->TypeName,
+                        LLVMBackend::TypeAndValue{ .TypeName = initField->TypeName }, {}))
                 && FieldInitializerIsSingleCall(fi->assignmentExpression(0)))
             {
                 fieldDestination = sd.IsUnion ? structPtr
@@ -25251,6 +25255,18 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                     compiler->pendingCxxSretForFixedArray_ = true;
                     cxxSretArmed = true;
                 }
+            }
+            // A native ctor that may capture `this` builds the element in its slot (one ctor call).
+            else if (!cxxElement && moveExpr == nullptr && !fixedElemTV.Pointer
+                && !fixedElemTV.ElemPointer && !fixedElemTV.IsArrayView
+                && compiler->IsNativeValueConstructor(tv.TypeName,
+                    LLVMBackend::TypeAndValue{ .TypeName = tv.TypeName }, {})
+                && FieldInitializerIsSingleCall(assignment))
+            {
+                compiler->pendingCxxSretDest_ = elemPtr;
+                compiler->pendingCxxSretTypeName_ = tv.TypeName;
+                compiler->pendingCxxSretForFixedArray_ = true;
+                cxxSretArmed = true;
             }
             auto elementOwnedTempMark = compiler->MarkOwnedTemps();
             LLVMBackend::NamedVariable nv;
@@ -26656,6 +26672,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         }
 
         LLVMBackend::TypeAndValue typeInfo{ .TypeName = typeName, .Pointer = typeIsPtr };
+        const bool nativeCtorSret = compiler->IsNativeValueConstructor(typeName, typeInfo, {});
         llvm::Type* elemType = compiler->GetType(typeInfo);
         auto* braceInitList = ctx->initializerList();
         auto* braceArgs = ctx->argumentExpressionList();
@@ -27263,8 +27280,22 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             {
                 LLVMBackend::UnwindPartialScope builtElements(*compiler);
                 compiler->NoteUnwindArrayPrefix(typedPtr, elemType, idx2, typeName);
+                if (nativeCtorSret)
+                {
+                    compiler->pendingCxxSretDest_ = elemPtr;
+                    compiler->pendingCxxSretTypeName_ = typeName;
+                    compiler->pendingCxxSretForFixedArray_ = true;
+                }
                 llvm::Value* structVal = compiler->CreateOverloadedFunctionCall(typeName, {});
-                if (structVal)
+                const bool builtInPlace = nativeCtorSret
+                    && compiler->pendingCxxSretDest_ == nullptr;
+                if (nativeCtorSret)
+                {
+                    compiler->pendingCxxSretDest_ = nullptr;
+                    compiler->pendingCxxSretTypeName_.clear();
+                    compiler->pendingCxxSretForFixedArray_ = false;
+                }
+                if (structVal && !builtInPlace)
                     compiler->builder->CreateStore(structVal, elemPtr);
             }
             auto* next = compiler->builder->CreateAdd(idx2, compiler->builder->getInt64(1));
@@ -27312,8 +27343,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                 }
             }
             newCallPostfix.Flush();
-            const bool armLoweredSret = compiler->IsLoweredCFlatOnlyStruct(typeName)
-                && compiler->ReturnsViaCxxSret(typeName);
+            const bool armLoweredSret = (compiler->IsLoweredCFlatOnlyStruct(typeName)
+                && compiler->ReturnsViaCxxSret(typeName)) || nativeCtorSret;
             if (armLoweredSret)
             {
                 compiler->pendingCxxSretDest_ = typedPtr;

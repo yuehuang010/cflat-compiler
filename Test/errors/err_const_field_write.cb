@@ -98,3 +98,6 @@ expect_error("cannot assign to 'u.a': field 'a' is const") {
     union C02U { const int a; float b; };
     void c02UnionArm() { C02U u = default; u.b = 1.0; u.a = 3; }
 }
+expect_error("cannot assign to 'this.id': field 'id' is const and can only be set during construction") {
+    struct C02M11 { const int id = 0; C02M11(int i) { Lambda<int()> f = () => { this.id = i; return 0; }; f(); } };
+}

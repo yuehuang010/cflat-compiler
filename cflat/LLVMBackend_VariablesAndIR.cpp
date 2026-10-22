@@ -567,24 +567,23 @@ llvm::AllocaInst* LLVMBackend::CreateAlloca(llvm::Type* type)
 
 void LLVMBackend::RegisterThisPointer(const TypeAndValue& tv, llvm::Value* storage, llvm::Type* baseType)
 {
-        NamedVariable namedVar{
-            .TypeAndValue = tv,
-            .BaseType = baseType,
-            .Primary = nullptr,
-            .Storage = storage,
-        };
+        NamedVariable namedVar;
+        if (!stackNamedVariable.empty())
+            if (auto it = stackNamedVariable.back().functionArgument.find(tv.VariableName);
+                it != stackNamedVariable.back().functionArgument.end())
+                namedVar = it->second;
+        namedVar.TypeAndValue = tv;
+        namedVar.BaseType = baseType;
+        namedVar.Primary = nullptr;
+        namedVar.Storage = storage;
         RegisterFunctionArgument(tv.VariableName, namedVar);
 
         // Also register under "this" so `this->field` resolves correctly.
         // Primary=storage makes LoadNamedVariable return the pointer, not load through it.
-        TypeAndValue thisTv = tv;
-        thisTv.VariableName = "this";
-        NamedVariable thisVar{
-            .TypeAndValue = thisTv,
-            .BaseType = baseType,
-            .Primary = storage,
-            .Storage = nullptr,
-        };
+        NamedVariable thisVar = namedVar;
+        thisVar.TypeAndValue.VariableName = "this";
+        thisVar.Primary = storage;
+        thisVar.Storage = nullptr;
         RegisterFunctionArgument("this", thisVar);
 }
 

@@ -184,12 +184,21 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
         if (destination != nullptr && fieldIndex < structType->getNumElements())
             fieldDestination = compiler->builder->CreateStructGEP(
                 structType, destination, (unsigned)fieldIndex, field.VariableName);
+        // A native ctor that may capture `this` builds the child in its field slot too
+        // (one ctor call or `= default`), never a temporary copied in.
+        const bool nativeFieldCtor = !compiler->ReturnsViaCxxSret(field.TypeName)
+            && field.Initializer != nullptr && FieldDefaultBraceList(field) == nullptr
+            && !FieldHasEmptyCxxBraceInitializer(field)
+            && compiler->IsNativeValueConstructor(field.TypeName,
+                LLVMBackend::TypeAndValue{ .TypeName = field.TypeName }, {})
+            && (field.Initializer->Default() != nullptr
+                || FieldInitializerIsSingleCall(field.Initializer->assignmentExpression()));
         const bool armFieldSret = fieldDestination != nullptr && !field.Pointer
             && !field.IsAlias && !field.IsArrayView && field.ConstArraySize == 0
-            && compiler->ReturnsViaCxxSret(field.TypeName)
+            && (nativeFieldCtor || (compiler->ReturnsViaCxxSret(field.TypeName)
             && (FieldDefaultBraceList(field) != nullptr || field.Initializer == nullptr
                 || FieldHasEmptyCxxBraceInitializer(field)
-                || FieldInitializerIsSingleCall(field.Initializer->assignmentExpression()));
+                || FieldInitializerIsSingleCall(field.Initializer->assignmentExpression()))));
         bool initializedArrayInPlace = false;
         // `= default` on a C++-field array is built in place like a field with no initializer:
         // a bit-copied temporary would move a self-referential member (std::list sentinel).
@@ -2071,9 +2080,14 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         {
             auto funcDef = compiler->CreateFunctionDefinition(structName, returnType, {});
 
-            const bool sretCtor = !isUnion && compiler->NeedsCxxLoweringType(structName)
+            // A native ctor result (closure fields) is in its final slot too: fields build there.
+            const bool sretCtor = !isUnion && (compiler->NeedsCxxLoweringType(structName)
+                    || compiler->IsNativeValueConstructor(structName, returnType, {}))
                 && compiler->currentFunctionAbiRecipe.retSlot.kind
                     == LLVMBackend::AbiSlot::SRetReturn;
+            // T407: a by-value ctor result is copied out of the ctor's frame (decided at module end).
+            if (!isUnion && !sretCtor)
+                compiler->NoteThisClosureCopySite(structName, LLVMBackend::ThisClosureCopyKind::CtorReturn);
             if (isUnion)
             {
                 EmitUnionDefaultConstructorBody(ctx, structName, structType, declList);
@@ -5846,11 +5860,12 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
 
         // Classified values are built in their caller-owned sret slot.
         llvm::Value* thisAlloca = nullptr;
-        const bool cxxSretCtor = compiler->NeedsCxxLoweringType(structName)
-            && compiler->currentFunctionAbiRecipe.hasLowering
+        const bool sretCtor = compiler->currentFunctionAbiRecipe.hasLowering
             && compiler->currentFunctionAbiRecipe.retSlot.kind
                 == LLVMBackend::AbiSlot::SRetReturn;
-        if (cxxSretCtor && compiler->currentFunction != nullptr)
+        if (!sretCtor)
+            compiler->NoteThisClosureCopySite(structName, LLVMBackend::ThisClosureCopyKind::CtorReturn);
+        if (sretCtor && compiler->currentFunction != nullptr)
             thisAlloca = compiler->currentFunction->getArg(
                 compiler->SRetArgIndex(compiler->currentFunctionAbiRecipe));
         else
@@ -5920,7 +5935,9 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                     {
                         const bool armFieldSret = fieldPtr != nullptr && !field.Pointer
                             && !field.IsAlias && !field.IsArrayView && field.ConstArraySize == 0
-                            && compiler->ReturnsViaCxxSret(field.TypeName)
+                            && (compiler->ReturnsViaCxxSret(field.TypeName)
+                                || compiler->IsNativeValueConstructor(field.TypeName,
+                                    LLVMBackend::TypeAndValue{ .TypeName = field.TypeName }, {}))
                             && FieldInitializerIsSingleCall(assignExpr);
                         if (armFieldSret)
                         {
@@ -6095,12 +6112,19 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
         // Parse user-written constructor body; its own const fields are still being built.
         {
             LLVMBackend::ConstructingScope constructing(compiler, thisAlloca);
+            LLVMBackend::CtorThisClosureScope ctorClosures(compiler, structName, thisAlloca);
             if (auto* blockItemList = func->compoundStatement()->blockItemList())
                 ParseBlockItemList(blockItemList);
+            // T407: a closure capturing `this` that the object keeps makes its copies dangle.
+            if (compiler->CtorThisClosureEscapes(ctorClosures.state))
+            {
+                if (compiler->dataStructures.count(structName))
+                    compiler->dataStructures[structName].StoresThisClosure = true;
+            }
         }
 
         // Classified aggregates already occupy the caller's sret slot.
-        if (cxxSretCtor)
+        if (sretCtor)
             compiler->CreateReturnCall(nullptr);
         else
         {
@@ -6179,6 +6203,10 @@ void MainListener::ParseDestructorDefinition(CFlatParser::DestructorDefinitionCo
         // exit so a nested lambda's return does not leak into the surrounding expression.
         ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
         straightLineReturned_ = false;
+
+        const auto receiver = compiler->GetFunctionArgument(params.front().VariableName);
+        if (receiver.Storage != nullptr)
+            compiler->RegisterThisPointer(params.front(), receiver.Storage, receiver.BaseType);
 
         auto blockItemList = ctx->compoundStatement()->blockItemList();
         if (blockItemList)

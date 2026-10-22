@@ -3526,8 +3526,10 @@ bool LLVMBackend::DeferExpectationVerdict()
 {
     const size_t scope = activeExpectScope_;
     if (scope == 0 || expectedError.empty()
-        || std::none_of(pendingConstReceiverCalls_.begin(), pendingConstReceiverCalls_.end(),
-                        [&](const auto& e) { return e.Owner == scope; }))
+        || (std::none_of(pendingConstReceiverCalls_.begin(), pendingConstReceiverCalls_.end(),
+                         [&](const auto& e) { return e.Owner == scope; })
+            && std::none_of(thisClosureCopySites_.begin(), thisClosureCopySites_.end(),
+                            [&](const auto& e) { return e.Owner == scope; })))
         return false;
     deferredExpectations_.push_back(activeExpectPosition_);
     RestoreExpectScope(scope);
@@ -3567,6 +3569,19 @@ void LLVMBackend::ResolvePendingConstReceiverCalls(bool aborted)
             answered = true;
             break;
         }
+        // T407 copy sites owned by the scope, once every constructor body is known.
+        for (const auto& site : thisClosureCopySites_)
+        {
+            if (answered) break;
+            if (site.Owner != expectation.Scope || !ThisClosureSiteRefused(site)) continue;
+            expectedError = expectation.Expected;
+            expectedErrorScopeDepth = SIZE_MAX;
+            activeExpectScope_ = 0;
+            try { ReportThisClosureCopySite(site); }
+            catch (const ExpectedErrorReceived&) {}
+            RestoreFileScopeExpectedError();
+            answered = true;
+        }
         if (answered) continue;
         ReportingFileScope fileScope(this, expectation.File, expectation.Line, expectation.Column);
         if (undecided)
@@ -3588,4 +3603,9 @@ void LLVMBackend::ResolvePendingConstReceiverCalls(bool aborted)
         ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
         LogError(PendingConstMessage(entry, readOnlyCauseMemo_));
     }
+    std::vector<ThisClosureCopySite> sites;
+    sites.swap(thisClosureCopySites_);
+    for (const auto& site : sites)
+        if (deferredScopes.count(site.Owner) == 0 && ThisClosureSiteRefused(site))
+            ReportThisClosureCopySite(site);
 }

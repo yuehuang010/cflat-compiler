@@ -7072,7 +7072,10 @@ llvm::Value* MainListener::EmitStructDefaultInto(llvm::Value* destination,
                                                  const std::string& typeName)
 {
     auto* compiler = Compiler();
-    const bool arm = destination != nullptr && compiler->ReturnsViaCxxSret(typeName);
+    const bool nativeCtorSret = compiler->IsNativeValueConstructor(
+        typeName, LLVMBackend::TypeAndValue{ .TypeName = typeName }, {});
+    const bool arm = destination != nullptr
+        && (compiler->ReturnsViaCxxSret(typeName) || nativeCtorSret);
     if (arm)
     {
         compiler->pendingCxxSretDest_ = destination;
@@ -8035,7 +8038,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         && typeAndValue.ConstArraySize == 0
                         && compiler->lastLoweredRetTemp_ != nullptr
                         && right == compiler->lastLoweredRetValue_
-                        && compiler->NeedsCxxLoweringType(typeAndValue.TypeName))
+                        && (compiler->NeedsCxxLoweringType(typeAndValue.TypeName)
+                            || compiler->IsNativeValueConstructor(typeAndValue.TypeName,
+                                LLVMBackend::TypeAndValue{ .TypeName = typeAndValue.TypeName }, {})))
                     {
                         srcCxxRetTemp = compiler->lastLoweredRetTemp_;
                         srcCxxRetTempFromDefault = true;
@@ -8596,14 +8601,16 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && compiler->ReturnsViaCxxSret(
                                         rightNV.TypeAndValue.TypeName))
                                     srcCxxRetTemp = compiler->lastCxxRetTemp_;
-                                // A classified CFlat-only call result: the local adopts the
-                                // call's sret slot when the initializer IS that loaded value.
+                                // A native constructor or classified CFlat-only call result can
+                                // be adopted in place when the initializer is that loaded value.
                                 else if (compiler->lastLoweredRetTemp_ != nullptr
                                     && rightNV.Storage == nullptr && rightNV.Primary != nullptr
                                     && rightNV.Primary == compiler->lastLoweredRetValue_
                                     && !rightNV.TypeAndValue.Pointer
-                                    && compiler->IsLoweredCFlatOnlyStruct(
-                                        rightNV.TypeAndValue.TypeName))
+                                    && (compiler->IsLoweredCFlatOnlyStruct(
+                                            rightNV.TypeAndValue.TypeName)
+                                        || compiler->lastLoweredRetTemp_
+                                            == compiler->lastLoweredInPlaceRetTemp_))
                                     srcCxxRetTemp = compiler->lastLoweredRetTemp_;
                                 // `auto x = T(args)`: the constructed temporary is adopted too. A
                                 // `static T x = T(args)` adopts it the same way (T62 in-place path).
@@ -10648,12 +10655,15 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 folded && ConstLocalFoldFits(intTy, *folded))
                                 compiler->GetOrCreateStackVariable(name).ConstFoldInt = *folded;
                         }
+                    // A native constructor's default result is adopted like `T x = T()`: the
+                    // ctor may have captured `this`, so a copy would leave its lambdas dangling.
+                    const bool nativeDefaultCtorResult = srcCxxRetTempFromDefault
+                        && !compiler->NeedsCxxLoweringType(typeAndValue.TypeName);
                     const bool loweredSretResult = srcCxxRetTemp != nullptr
                         && !typeAndValue.Pointer
-                        && !srcCxxRetTempFromDefault
-                        && srcInferredTypeName == typeAndValue.TypeName
-                        && srcCxxRetTemp == compiler->lastLoweredCopyRetTemp_
-                        && compiler->IsLoweredCFlatOnlyStruct(typeAndValue.TypeName);
+                        && (!srcCxxRetTempFromDefault || nativeDefaultCtorResult)
+                        && (srcInferredTypeName == typeAndValue.TypeName || nativeDefaultCtorResult)
+                        && srcCxxRetTemp == compiler->lastLoweredInPlaceRetTemp_;
                     const bool elideCxxReturn = srcCxxRetTemp != nullptr
                         && !typeAndValue.Pointer
                         && !initializerHasTopLevelMove
