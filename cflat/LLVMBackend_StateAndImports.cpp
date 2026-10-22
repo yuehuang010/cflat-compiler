@@ -3156,6 +3156,17 @@ void LLVMBackend::ScheduleCHeaderDiskCacheWrite(
         CxxRequestGroup ownedGroup;
         const bool haveGroup = requestGroup != nullptr;
         if (haveGroup) ownedGroup = *requestGroup;
+        // Bound the unjoined writers: a cold C++ compile schedules thousands of writes, and one
+        // live thread each exhausts the per-process thread limit (std::thread throws EAGAIN).
+        constexpr size_t kMaxPendingWriters = 128;
+        if (cHeaderDiskCacheWriters_.size() >= kMaxPendingWriters)
+        {
+            llvm::TimeTraceScope waitScope("CHeaderCacheWriterWait");
+            const auto oldest = cHeaderDiskCacheWriters_.begin() + kMaxPendingWriters / 2;
+            for (auto it = cHeaderDiskCacheWriters_.begin(); it != oldest; ++it)
+                if (it->thread.joinable()) it->thread.join();
+            cHeaderDiskCacheWriters_.erase(cHeaderDiskCacheWriters_.begin(), oldest);
+        }
         CHeaderDiskCacheWriter& writer = cHeaderDiskCacheWriters_.emplace_back();
         writer.target = (cacheDir / std::format("{:016x}.json", diskKey)).lexically_normal();
         const bool traceEnabled = llvm::timeTraceProfilerEnabled();
