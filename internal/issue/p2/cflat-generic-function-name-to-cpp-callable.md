@@ -13,7 +13,6 @@ mismatches. The remaining gaps are:
 - (T208 review, pre-existing) `Lambda<std.string()>` / `function<std.vector<int>()>` spelled directly report "cannot find
   the type" (aliases work); a CFlat function with a `function<alias-of-C++-class()>` parameter is never defined (link fails).
 - Function-pointer spellings in bind diagnostics drop `move` on the return (both sides print 'Pl*(int)').
-- (T287 review, pre-existing) a lambda literal with a `move` parameter RETURNED as a borrowed callable, or used to
-  initialize a struct field of borrowed callable type, aborts rc 134 (double delete) on master and after T287: T287's
-  FuncPtrValueOwnershipReason check covers call arguments, declarators and assignment binds, not returns or field
-  initializers. Repros scratch/repro_keep/wt_t287/rev_t287_sol_tmp/{return_mismatch,field_mismatch}.cb.
+- (T399 review, pre-existing) an OVERLOADED function name stored as a field default (`f = g`) or in an inferred array view (`{ g }`)
+  binds the first-declared overload instead of the one the callable slot matches: `int g(move long*)` declared before `int g(Pl*)`,
+  slot `function<int(Pl*)>` -> run-time abort (rc 133) on master. Returns and declarators pick the matching overload.

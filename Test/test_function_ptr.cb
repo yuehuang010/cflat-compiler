@@ -1982,6 +1982,161 @@ bool testT208FunctionArgAcceptSet()
     return result;
 }
 
+function<int(T208CallArgPayload*)> t399MakeBorrowedReturn()
+{
+    return (T208CallArgPayload* p) => p->value + 1;
+}
+function<int(move T208CallArgPayload*)> t399MakeMoveReturn()
+{
+    return (move T208CallArgPayload* p) => { int v = p->value; delete p; return v; };
+}
+function<int(move T208CallArgPayload*)> t399MakeNamedMoveReturn()
+{
+    return t208CallArgConsumeMove;
+}
+function<int(T208CallArgPayload*)> t399MakeBoundReturn()
+{
+    function<int(T208CallArgPayload*)> bound = (T208CallArgPayload* p) => p->value + 2;
+    return bound;
+}
+Lambda<int(T208CallArgPayload*)> t399MakeTernaryReturn(bool choose)
+{
+    return choose ? (T208CallArgPayload* p) => p->value + 3
+                  : (T208CallArgPayload* p) => p->value + 4;
+}
+Lambda<int(int)> t399MakeGenericLambda<T>(T seed)
+{
+    return (int x) => x + (int)seed;
+}
+
+// Overloaded name returned into a borrowed callable: the borrowed overload binds even when a 'move'
+// overload is declared first (the first-declared overload must not decide the ownership check).
+int t399OverloadedPick(move long* p) { delete p; return 0; }
+int t399OverloadedPick(T208CallArgPayload* p) { return p->value + 5; }
+function<int(T208CallArgPayload*)> t399MakeOverloadedReturn() { return t399OverloadedPick; }
+struct T399BorrowField { function<int(T208CallArgPayload*)> f; };
+struct T399MoveField { function<int(move T208CallArgPayload*)> f; };
+struct T399DefaultMoveField
+{
+    function<int(move T208CallArgPayload*)> f = t208CallArgConsumeMove;
+};
+struct T399UserCtorDefaultMoveField
+{
+    function<int(move T208CallArgPayload*)> f = t208CallArgConsumeMove;
+    T399UserCtorDefaultMoveField() { }
+};
+struct T399CtorMoveField
+{
+    function<int(move T208CallArgPayload*)> f;
+    T399CtorMoveField()
+    {
+        f = (move T208CallArgPayload* p) => { int v = p->value; delete p; return v; };
+    }
+};
+
+bool testT399CallableReturnAndFieldAcceptSet()
+{
+    bool result = true;
+    t208CallArgDtorCount = 0;
+    function<int(T208CallArgPayload*)> borrowedReturn = t399MakeBorrowedReturn();
+    T208CallArgPayload* p = new T208CallArgPayload();
+    p->value = 10;
+    result &= Test("t399 borrowed lambda return value", borrowedReturn(p), 11);
+    delete p;
+    result &= Test("t399 borrowed lambda return dtor once", t208CallArgDtorCount, 1);
+
+    t208CallArgDtorCount = 0;
+    function<int(move T208CallArgPayload*)> moveReturn = t399MakeMoveReturn();
+    p = new T208CallArgPayload();
+    p->value = 11;
+    result &= Test("t399 matching move lambda return value", moveReturn(p), 11);
+    result &= Test("t399 matching move lambda return dtor once", t208CallArgDtorCount, 1);
+
+    t208CallArgDtorCount = 0;
+    function<int(move T208CallArgPayload*)> namedReturn = t399MakeNamedMoveReturn();
+    p = new T208CallArgPayload();
+    p->value = 12;
+    result &= Test("t399 named move function return value", namedReturn(p), 12);
+    result &= Test("t399 named move function return dtor once", t208CallArgDtorCount, 1);
+
+    t208CallArgDtorCount = 0;
+    function<int(T208CallArgPayload*)> boundReturn = t399MakeBoundReturn();
+    p = new T208CallArgPayload();
+    p->value = 13;
+    result &= Test("t399 bound function variable return value", boundReturn(p), 15);
+    delete p;
+    result &= Test("t399 bound function variable return dtor once", t208CallArgDtorCount, 1);
+
+    t208CallArgDtorCount = 0;
+    Lambda<int(T208CallArgPayload*)> ternaryTrue = t399MakeTernaryReturn(true);
+    Lambda<int(T208CallArgPayload*)> ternaryFalse = t399MakeTernaryReturn(false);
+    p = new T208CallArgPayload();
+    p->value = 14;
+    result &= Test("t399 ternary lambda return true arm", ternaryTrue(p), 17);
+    result &= Test("t399 ternary lambda return false arm", ternaryFalse(p), 18);
+    delete p;
+    result &= Test("t399 ternary lambda return dtor once", t208CallArgDtorCount, 1);
+
+    Lambda<int(int)> generic = t399MakeGenericLambda<int>(7);
+    result &= Test("t399 generic function returning Lambda value", generic(21), 28);
+
+    t208CallArgDtorCount = 0;
+    T399BorrowField borrowedField = { f = (T208CallArgPayload* p) => p->value + 5 };
+    p = new T208CallArgPayload();
+    p->value = 20;
+    result &= Test("t399 designated borrowed field value", borrowedField.f(p), 25);
+    delete p;
+    result &= Test("t399 designated borrowed field dtor once", t208CallArgDtorCount, 1);
+
+    t208CallArgDtorCount = 0;
+    T399MoveField moveField = { f = (move T208CallArgPayload* p) => { int v = p->value; delete p; return v; } };
+    p = new T208CallArgPayload();
+    p->value = 21;
+    result &= Test("t399 designated move field value", moveField.f(p), 21);
+    result &= Test("t399 designated move field dtor once", t208CallArgDtorCount, 1);
+
+    t208CallArgDtorCount = 0;
+    T399DefaultMoveField defaultMoveField = {};
+    p = new T208CallArgPayload();
+    p->value = 22;
+    result &= Test("t399 default field initializer value", defaultMoveField.f(p), 22);
+    result &= Test("t399 default field initializer dtor once", t208CallArgDtorCount, 1);
+
+    t208CallArgDtorCount = 0;
+    T399UserCtorDefaultMoveField userCtorDefaultField;
+    p = new T208CallArgPayload();
+    p->value = 23;
+    result &= Test("t399 user constructor field default value", userCtorDefaultField.f(p), 23);
+    result &= Test("t399 user constructor field default dtor once", t208CallArgDtorCount, 1);
+
+    t208CallArgDtorCount = 0;
+    T399CtorMoveField ctorMoveField;
+    p = new T208CallArgPayload();
+    p->value = 24;
+    result &= Test("t399 constructor assignment field value", ctorMoveField.f(p), 24);
+    result &= Test("t399 constructor assignment field dtor once", t208CallArgDtorCount, 1);
+
+    t208CallArgDtorCount = 0;
+    function<int(move T208CallArgPayload*)> positionalSource = t208CallArgConsumeMove;
+    function<int(move T208CallArgPayload*)>[1] fixed = { positionalSource };
+    T208CallArgPayload* fixedPayload = new T208CallArgPayload();
+    fixedPayload->value = 25;
+    result &= Test("t399 positional fixed array value", fixed[0](fixedPayload), 25);
+    result &= Test("t399 positional fixed array dtor once", t208CallArgDtorCount, 1);
+
+    t208CallArgDtorCount = 0;
+    function<int(move T208CallArgPayload*)>[] view = { positionalSource };
+    T208CallArgPayload* viewPayload = new T208CallArgPayload();
+    viewPayload->value = 26;
+    result &= Test("t399 positional array view value", view[0](viewPayload), 26);
+    result &= Test("t399 positional array view dtor once", t208CallArgDtorCount, 1);
+    function<int(T208CallArgPayload*)> overloaded = t399MakeOverloadedReturn();
+    T208CallArgPayload* overloadedPayload = new T208CallArgPayload{value = 4};
+    result &= Test("t399 overloaded name return binds the borrowed overload", overloaded(overloadedPayload), 9);
+    delete overloadedPayload;
+    return result;
+}
+
 // ── Non-capturing lambda across the C ABI ────────────────────────────────────
 // A C function pointer is a bare code address with no env slot. The closure ABI is
 // env-last, so the invoker of a *non-capturing* lambda is directly callable as a
@@ -6338,6 +6493,7 @@ extern int main(int argc, char** argv)
     // 'move' in function pointer signatures
     total++; passed += testFuncPtrMoveSignature()      ? 1 : 0;
     total++; passed += testT208FunctionArgAcceptSet()  ? 1 : 0;
+    total++; passed += testT399CallableReturnAndFieldAcceptSet() ? 1 : 0;
     total++; passed += testT373GenericFunctionNameDestinations() ? 1 : 0;
     total++; passed += testT380GenericFunctionNameAcceptSet() ? 1 : 0;
     total++; passed += testT380R2GenericFunctionConsumers() ? 1 : 0;

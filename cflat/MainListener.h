@@ -7542,6 +7542,7 @@ public:
     // `j = j + p + ","` would leak. Flush only for the non-compound case (a no-op otherwise).
     // Must run while still in the body block: FlushOwnedTemps' dominance guard frees only temps
     // registered in the current block, so the caller branches to the loop latch / resume after.
+    void PrepareLoopConditionalDropFlags(CFlatParser::StatementContext* body);
     void ParseControlledBody(CFlatParser::StatementContext* body);
     void MarkLoopBackEdgeCxxConstPointers(
         LLVMBackend* compiler, CFlatParser::IterationStatementContext* loop);

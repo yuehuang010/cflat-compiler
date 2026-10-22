@@ -451,6 +451,17 @@ struct BridgeNestedCopyFieldHolder<T>
     BridgeCopyFieldHolder<T> inner = default;
 };
 
+struct BridgeLoweredListTwin
+{
+    cpptw.Twin value = default;
+    std.list<int> items = default;
+};
+
+struct BridgeOuterLoweredListTwin
+{
+    BridgeLoweredListTwin field = default;
+};
+
 struct BridgeArrayCopyFieldHolder<T>
 {
     T[2] values = default;
@@ -937,6 +948,119 @@ int bridge_lowered_move_assign_after_cond_release(bool release)
     if (release) { _ = move a; }
     a = move b;
     return a.value.value();
+}
+
+int bridge_lowered_discard_field_assign()
+{
+    BridgeOuterLoweredListTwin o = default;
+    o.field.value.set(2); o.field.items.push_back(2);
+    BridgeLoweredListTwin b = default;
+    b.value.set(3); b.items.push_back(3);
+    _ = move o.field;
+    o.field = b;
+    return o.field.items.front() * 10 + o.field.value.value();
+}
+
+int bridge_lowered_discard_parenthesized_field_assign()
+{
+    BridgeOuterLoweredListTwin o = default;
+    o.field.value.set(2); o.field.items.push_back(2);
+    BridgeLoweredListTwin b = default;
+    b.value.set(3); b.items.push_back(3);
+    _ = (move o.field);
+    o.field = b;
+    return o.field.items.front() * 10 + o.field.value.value();
+}
+
+int bridge_lowered_discard_field_moved_from()
+{
+    BridgeOuterLoweredListTwin o = default;
+    o.field.value.set(7); o.field.items.push_back(7);
+    _ = move o.field;
+    return o.field.value.value();
+}
+
+int bridge_lowered_loop_release_for()
+{
+    BridgeLoweredListTwin a = default; a.value.set(2); a.items.push_back(2);
+    BridgeLoweredListTwin b = default; b.value.set(3); b.items.push_back(3);
+    int seen = 0;
+    for (int i = 0; i < 2; i++)
+    {
+        a = b; seen = a.items.front() * 10 + a.value[0]; _ = move a;
+    }
+    return seen;
+}
+
+int bridge_lowered_loop_release_while()
+{
+    BridgeLoweredListTwin a = default; a.value.set(2); a.items.push_back(2);
+    BridgeLoweredListTwin b = default; b.value.set(3); b.items.push_back(3);
+    int i = 0; int seen = 0;
+    while (i < 2)
+    {
+        a = b; seen = a.items.front() * 10 + a.value[0]; _ = move a; i++;
+    }
+    return seen;
+}
+
+int bridge_lowered_loop_release_do()
+{
+    BridgeLoweredListTwin a = default; a.value.set(2); a.items.push_back(2);
+    BridgeLoweredListTwin b = default; b.value.set(3); b.items.push_back(3);
+    int i = 0; int seen = 0;
+    do
+    {
+        a = b; seen = a.items.front() * 10 + a.value[0]; _ = move a; i++;
+    } while (i < 2);
+    return seen;
+}
+
+int bridge_lowered_loop_release_range()
+{
+    BridgeLoweredListTwin a = default; a.value.set(2); a.items.push_back(2);
+    BridgeLoweredListTwin b = default; b.value.set(3); b.items.push_back(3);
+    int[2] indexes = {0, 1}; int seen = 0;
+    for (int i in indexes)
+    {
+        a = b; seen = a.items.front() * 10 + a.value[0]; _ = move a;
+    }
+    return seen;
+}
+
+int bridge_lowered_loop_release_one_path()
+{
+    BridgeLoweredListTwin a = default; a.value.set(2); a.items.push_back(2);
+    BridgeLoweredListTwin b = default; b.value.set(3); b.items.push_back(3);
+    int i = 0; int seen = 0;
+    while (i < 2)
+    {
+        a = b; seen = a.items.front() * 10 + a.value[0];
+        if (i == 0) { _ = move a; }
+        i++;
+    }
+    return seen;
+}
+
+int bridge_lowered_loop_release_break()
+{
+    BridgeLoweredListTwin a = default; a.value.set(2); a.items.push_back(2);
+    BridgeLoweredListTwin b = default; b.value.set(3); b.items.push_back(3);
+    int seen = 0;
+    for (int i = 0; i < 2; i++)
+    {
+        a = b; seen = a.items.front() * 10 + a.value[0]; _ = move a; break;
+    }
+    return seen;
+}
+
+int bridge_cpp_local_loop_release()
+{
+    cpptw.Twin a = default; a.set(2);
+    cpptw.Twin b = default; b.set(3);
+    int i = 0; int seen = 0;
+    while (i < 2) { a = b; seen = a[0]; _ = move a; i++; }
+    return seen;
 }
 
 // T149 D3: a dictionary slot is raw storage that was never constructed. The first set, an
@@ -5796,6 +5920,68 @@ extern int main(int argc, char** argv)
     bridge_check("bridge lowered move-assign without cond release C++ move-assign", cpptw.move_assign_count(), 1);
     bridge_check("bridge lowered move-assign without cond release C++ dtor", cpptw.dtor_count(), 2);
     bridge_check("bridge lowered move-assign without cond release C++ live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("bridge lowered discard field assignment value", bridge_lowered_discard_field_assign(), 33);
+    bridge_check("bridge lowered discard field move construction", cpptw.move_count(), 1);
+    bridge_check("bridge lowered discard field copy assignment", cpptw.copy_assign_count(), 1);
+    bridge_check("bridge lowered discard field destructors", cpptw.dtor_count(), 3);
+    bridge_check("bridge lowered discard field live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge lowered parenthesized discard field value", bridge_lowered_discard_parenthesized_field_assign(), 33);
+    bridge_check("bridge lowered parenthesized discard field move", cpptw.move_count(), 1);
+    bridge_check("bridge lowered parenthesized discard field copy assign", cpptw.copy_assign_count(), 1);
+    bridge_check("bridge lowered parenthesized discard field destructors", cpptw.dtor_count(), 3);
+    bridge_check("bridge lowered parenthesized discard field live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge lowered discard field moved-from value", bridge_lowered_discard_field_moved_from(), -1);
+    bridge_check("bridge lowered discard field moved-from move", cpptw.move_count(), 1);
+    bridge_check("bridge lowered discard field moved-from destructors", cpptw.dtor_count(), 2);
+    bridge_check("bridge lowered discard field moved-from live", cpptw.live_allocations(), 0);
+
+    cpptw.reset_counts();
+    bridge_check("bridge lowered for release value", bridge_lowered_loop_release_for(), 33);
+    bridge_check("bridge lowered for release copy ctor", cpptw.copy_count(), 1);
+    bridge_check("bridge lowered for release copy assign", cpptw.copy_assign_count(), 1);
+    bridge_check("bridge lowered for release destructors", cpptw.dtor_count(), 3);
+    bridge_check("bridge lowered for release live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge lowered while release value", bridge_lowered_loop_release_while(), 33);
+    bridge_check("bridge lowered while release copy ctor", cpptw.copy_count(), 1);
+    bridge_check("bridge lowered while release copy assign", cpptw.copy_assign_count(), 1);
+    bridge_check("bridge lowered while release destructors", cpptw.dtor_count(), 3);
+    bridge_check("bridge lowered while release live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge lowered do release value", bridge_lowered_loop_release_do(), 33);
+    bridge_check("bridge lowered do release copy ctor", cpptw.copy_count(), 1);
+    bridge_check("bridge lowered do release copy assign", cpptw.copy_assign_count(), 1);
+    bridge_check("bridge lowered do release destructors", cpptw.dtor_count(), 3);
+    bridge_check("bridge lowered do release live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge lowered range release value", bridge_lowered_loop_release_range(), 33);
+    bridge_check("bridge lowered range release copy ctor", cpptw.copy_count(), 1);
+    bridge_check("bridge lowered range release copy assign", cpptw.copy_assign_count(), 1);
+    bridge_check("bridge lowered range release destructors", cpptw.dtor_count(), 3);
+    bridge_check("bridge lowered range release live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge lowered conditional loop release value", bridge_lowered_loop_release_one_path(), 33);
+    bridge_check("bridge lowered conditional loop release copy ctor", cpptw.copy_count(), 1);
+    bridge_check("bridge lowered conditional loop release copy assign", cpptw.copy_assign_count(), 1);
+    bridge_check("bridge lowered conditional loop release destructors", cpptw.dtor_count(), 3);
+    bridge_check("bridge lowered conditional loop release live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge lowered break release value", bridge_lowered_loop_release_break(), 33);
+    bridge_check("bridge lowered break release copy ctor", cpptw.copy_count(), 0);
+    bridge_check("bridge lowered break release copy assign", cpptw.copy_assign_count(), 1);
+    bridge_check("bridge lowered break release destructors", cpptw.dtor_count(), 2);
+    bridge_check("bridge lowered break release live", cpptw.live_allocations(), 0);
+    cpptw.reset_counts();
+    bridge_check("bridge C++ local loop release value", bridge_cpp_local_loop_release(), 3);
+    bridge_check("bridge C++ local loop release copy ctor", cpptw.copy_count(), 1);
+    bridge_check("bridge C++ local loop release copy assign", cpptw.copy_assign_count(), 1);
+    bridge_check("bridge C++ local loop release destructors", cpptw.dtor_count(), 3);
+    bridge_check("bridge C++ local loop release live", cpptw.live_allocations(), 0);
+
     bridge_check("bridge lowered trivial operator= field value", bridge_lowered_trivial_assign_field(), 39);
     bridge_check("bridge lowered trivial operator= field C++ copy", cpptw.trivial_assign_copy_count(), 0);
     bridge_check("bridge lowered trivial operator= field C++ dtor", cpptw.trivial_assign_dtor_count(), 3);

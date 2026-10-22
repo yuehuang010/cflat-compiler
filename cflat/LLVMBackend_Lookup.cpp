@@ -1518,6 +1518,43 @@ std::string LLVMBackend::FuncPtrValueOwnershipReason(const LLVMBackend::TypeAndV
         return "";
     }
 
+std::string LLVMBackend::FuncPtrValueOwnershipReason(const LLVMBackend::NamedVariable& value,
+        const LLVMBackend::TypeAndValue& slot)
+{
+        TypeAndValue source = value.TypeAndValue;
+        const FunctionSymbol* symbol = nullptr;
+        if (auto* fn = llvm::dyn_cast_or_null<llvm::Function>(value.Primary))
+            if ((symbol = FindSymbolForFunction(fn)))
+                source = FuncPtrSigOfSymbol(*symbol);
+        std::string reason = FuncPtrValueOwnershipReason(source, slot);
+        // Primary is the first-declared overload; one that binds the slot exactly (same arity, types
+        // and 'move' modifiers) clears the name, since that is the overload the slot resolves to.
+        TypeAndValue dst = slot;
+        if (dst.FuncPtrReturnTypeName.empty() && !dst.Pointer)
+            if (const auto* encoded = GetEncodedClosureType(dst.TypeName))
+                dst = *encoded;
+        // Identity, not the binder's compatibility: a void* overload binds any pointer but is not
+        // the overload the slot resolves to.
+        auto bindsExactly = [&](const TypeAndValue& sig) {
+            std::vector<FuncPtrComponent> sa, sb;
+            if (sig.FuncPtrParams.size() != dst.FuncPtrParams.size() || sig.FuncPtrVariadic != dst.FuncPtrVariadic
+                || !FuncPtrSignatureOf(sig, sa) || !FuncPtrSignatureOf(dst, sb) || sa.size() != sb.size())
+                return false;
+            for (size_t i = 0; i < sa.size(); i++)
+                if (!sa[i].Known || !sb[i].Known || sa[i].VoidPointee != sb[i].VoidPointee
+                    || sa[i].IsArrayView != sb[i].IsArrayView || sa[i].Canon != sb[i].Canon
+                    || sa[i].StructKey != sb[i].StructKey || sa[i].PointerDepth != sb[i].PointerDepth)
+                    return false;
+            return FuncPtrValueOwnershipReason(sig, slot).empty();
+        };
+        if (!reason.empty() && symbol != nullptr)
+            if (auto it = functionTable.find(symbol->SourceName); it != functionTable.end())
+                for (const auto& overload : it->second)
+                    if (!overload.IsMethod && bindsExactly(FuncPtrSigOfSymbol(overload)))
+                        return "";
+        return reason;
+    }
+
 bool LLVMBackend::FuncPtrFewerParamsCanAdapt(const TypeAndValue& source,
         const TypeAndValue& slot) const
 {

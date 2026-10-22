@@ -1,6 +1,6 @@
 # CFlat structs with non-relocatable C++ fields: remaining V1b items and dictionary copy()
 
-Summary: the V1b review (2026-10-01) found R1-R3 and the nits below. D3 (dictionary slots), D4 (list.take leak) and
+Summary: the V1b review (2026-10-01) found R3 and the nits below. R1/R2 were fixed in T398. D3 (dictionary slots), D4 (list.take leak) and
 D5 (fixed-array field of a lowered struct) were fixed in the T149 round 1 change (regression legs in
 Test/test_cpp_interop_bridge.cb, T149 block). Probes for the remaining items: scratch/repro_keep/v1b/rv5/ (run.sh is the branch, runm.sh is master).
 
@@ -11,13 +11,7 @@ Found in T149 round 1, not fixed (all reproduce identically on master):
   eagerly and `result._values[i] = _values[i].copy()` is refused ("cannot assign to C++ class ... from this expression"
   for std.list, "cannot copy 'cpptw.Twin'" for Twin; the diagnostic points at dictionary.cb:529). Repro: scratch/t149/pc5.cb.
 
-V1b r5 review (2026-10-01, V1b landed 52a77168). These also crash on master; probes are in scratch/repro_keep/v1b/rv5/ (run.sh is the branch, runm.sh is master):
-- R1: `_ = move o.s; o.s = b;` on a lowered field (f1.cb, f1b.cb).
-  The field is zeroed without running its destructor (leak). Scope end then destroys zeroed bytes, and the assignment runs operator= on a zeroed std::list (rc 139).
-  Fix direction: the discard path in MainListener_Expressions.cpp (~1782-1840) materializes the move like `S x = move o.s` (f1c.cb works) and destroys the temp.
-- R2: a release carried across a loop back edge, as in `for (...) { a = b; _ = move a; }` (f5.cb).
-  The second iteration's assignment hits the destroyed `a` (rc 139). The foreign C++ class path has the same flaw (h5.cb).
-  Fix direction: a release inside the loop body gives the variable a conditional drop flag at the loop head.
+V1b r5 review (2026-10-01, V1b landed 52a77168). Remaining crash: R3 also reproduces on master; probes are in scratch/repro_keep/v1b/rv5/ (run.sh is the branch, runm.sh is master):
 - R3: `_ = move arr[0]; arr[0] = b;` (f2.cb; the foreign class path is the same, h2.cb). The element state is not known statically.
 - Note: `*p = b` after a release through a pointer is untracked (f3b.cb). This falls under the borrowed-pointer ruling and is not a bug.
 - Nit: a user-declared `operator=(const DA&) = default;` that is trivial is refused (d2_DA). Look up the copy-assignment decl and test `isTrivial() && !isDeleted()`, not `hasSimpleCopyAssignment()`.

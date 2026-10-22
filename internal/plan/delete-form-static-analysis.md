@@ -35,7 +35,7 @@ Checks to add, cheapest first:
 3. Provenance through a `move T*` parameter: the count slot is already there; the checker's
    job is to make explicit `delete p` on such a parameter route through the counted destructor
    (landed as e2c4a1e for the scope-exit path; this is the explicit-delete sibling).
-4. Adoption into `unique<T>` (`p2/unique-field-heap-array-through-move-param`): a static reject
+4. Adoption into `unique<T>` (`hold/unique-field-heap-array-through-move-param`): a static reject
    where provenance is precise, and the runtime trap at the core ctor/reset when it is not.
    Both options are back on the table under this ruling.
 5. Escapes the analysis cannot see (stored into a struct field, returned as bare `T*`) stay

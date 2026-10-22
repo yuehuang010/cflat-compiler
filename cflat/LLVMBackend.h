@@ -6059,7 +6059,8 @@ private:
     void DropValue(const NamedVariable& namedVar);
 
     bool NeedsConditionalDropFlag(const NamedVariable& namedVar) const;
-    void EnsureConditionalDropFlag(NamedVariable& namedVar);
+    void EnsureConditionalDropFlag(NamedVariable& namedVar, bool initiallyLive = true);
+    void EnsureLoopConditionalDropFlag(NamedVariable& namedVar, bool initiallyLive = true);
     void RearmConditionalDropFlag(NamedVariable& namedVar);
     void EmitConditionalFullDestructor(const NamedVariable& namedVar, llvm::Function* dtor);
 
@@ -11263,6 +11264,8 @@ public:
     // crossing a declared slot: owning return into a borrowed return, and each parameter's 'move'.
     // Empty when they agree. Shared by the declarator, assignment and call-argument paths.
     std::string FuncPtrValueOwnershipReason(const LLVMBackend::TypeAndValue& source,
+        const LLVMBackend::TypeAndValue& slot);
+    std::string FuncPtrValueOwnershipReason(const LLVMBackend::NamedVariable& source,
         const LLVMBackend::TypeAndValue& slot);
 
     /*

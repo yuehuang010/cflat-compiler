@@ -211,3 +211,90 @@ expect_error("differs in 'move' modifier") {
         function<int(move int*)> f = (int* p) => { return *p; };
     }
 }
+
+// The return slot must check the lambda's resolved parameter ownership.
+expect_error("differs in 'move' modifier") {
+    function<int(int*)> t399ReturnLambda() {
+        return (move int* p) => { int v = *p; delete p; return v; };
+    }
+}
+
+// A named function with a move parameter has the same return-slot constraint.
+expect_error("differs in 'move' modifier") {
+    int t399ReturnConsume(move int* p) { int v = *p; delete p; return v; }
+    function<int(int*)> t399ReturnNamed() { return t399ReturnConsume; }
+}
+
+// Named brace field initialization must reject a move lambda in a borrowed slot.
+expect_error("differs in 'move' modifier") {
+    struct T399BraceHolder { function<int(int*)> f; };
+    void t399BraceField() {
+        T399BraceHolder h = { f = (move int* p) => { int v = *p; delete p; return v; } };
+    }
+}
+
+// Field defaults use the same guard when a struct is constructed.
+expect_error("differs in 'move' modifier") {
+    int t399DefaultConsume(move int* p) { int v = *p; delete p; return v; }
+    struct T399DefaultHolder { function<int(int*)> f = t399DefaultConsume; };
+    void t399DefaultField() { T399DefaultHolder h = {}; }
+}
+
+expect_error("differs in 'move' modifier") {
+    int t399DefaultFatConsume(move int* p) { int v = *p; delete p; return v; }
+    struct T399DefaultFatHolder { Lambda<int(int*)> f = t399DefaultFatConsume; };
+    void t399DefaultFatField() { T399DefaultFatHolder h = {}; }
+}
+
+// Positional fixed-array and inferred array-view stores are separate brace paths.
+expect_error("differs in 'move' modifier") {
+    int t399ArrayConsume(move int* p) { int v = *p; delete p; return v; }
+    void t399FixedArray() {
+        function<int(move int*)> source = t399ArrayConsume;
+        function<int(int*)>[1] arr = { source };
+    }
+}
+
+expect_error("differs in 'move' modifier") {
+    int t399ViewConsume(move int* p) { int v = *p; delete p; return v; }
+    void t399ArrayView() {
+        function<int(move int*)> source = t399ViewConsume;
+        function<int(int*)>[] arr = { source };
+    }
+}
+
+expect_error("differs in 'move' modifier") {
+    struct T399FatHolder { Lambda<int(int*)> f; };
+    void t399FatField() {
+        T399FatHolder h = { f = (move int* p) => { int v = *p; delete p; return v; } };
+    }
+}
+
+// An overload of another arity or parameter type does not clear a move-param name for a borrowed slot.
+expect_error("differs in 'move' modifier") {
+    struct T399Arity { int v = 0; };
+    int t399ArityPick(move T399Arity* p) { delete p; return 1; }
+    int t399ArityPick(int x, int y) { return 2; }
+    function<int(T399Arity*)> t399ArityReturn() { return t399ArityPick; }
+}
+
+expect_error("differs in 'move' modifier") {
+    struct T399TypePick { int v = 0; };
+    int t399TypedPick(move T399TypePick* p) { delete p; return 1; }
+    int t399TypedPick(long* p) { return 2; }
+    function<int(T399TypePick*)> t399TypedReturn() { return t399TypedPick; }
+}
+
+expect_error("differs in 'move' modifier") {
+    struct T399VoidPick { int v = 0; };
+    int t399VoidOverload(move T399VoidPick* p) { delete p; return 1; }
+    int t399VoidOverload(void* p) { return 2; }
+    function<int(T399VoidPick*)> t399VoidReturn() { return t399VoidOverload; }
+}
+
+expect_error("differs in 'move' modifier") {
+    struct T399VariadicPick { int v = 0; };
+    int t399VariadicOverload(move T399VariadicPick* p) { delete p; return 1; }
+    int t399VariadicOverload(T399VariadicPick* p, ...) { return 2; }
+    function<int(T399VariadicPick*)> t399VariadicReturn() { return t399VariadicOverload; }
+}

@@ -957,11 +957,41 @@ bool MainListener::ConditionIsSentinel(antlr4::tree::ParseTree* node) {
         return hasEquality && !hasRelational;
     }
 
+void MainListener::PrepareLoopConditionalDropFlags(CFlatParser::StatementContext* body) {
+        auto* compiler = Compiler(body);
+        std::function<void(antlr4::tree::ParseTree*)> prepareLoopMoves =
+            [&](antlr4::tree::ParseTree* node) {
+                if (node == nullptr
+                    || dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr)
+                    return;
+                if (auto* move = dynamic_cast<CFlatParser::MoveExpressionContext*>(node))
+                {
+                    auto* unary = move->unaryExpression();
+                    auto* postfix = unary != nullptr ? unary->postfixExpression() : nullptr;
+                    auto* primary = postfix != nullptr && postfix->children.size() == 1
+                        ? postfix->primaryExpression() : nullptr;
+                    auto* identifier = primary != nullptr
+                        ? primary->genericIdentifier() : nullptr;
+                    if (identifier != nullptr && identifier->genericTypeParameters() == nullptr)
+                    {
+                        const auto name = identifier->Identifier()->getText();
+                        if (auto* namedVar = compiler->FindLiveNamedVariable(name))
+                            compiler->EnsureLoopConditionalDropFlag(
+                                *namedVar, !namedVar->ExplicitlyMovedNull);
+                    }
+                }
+                for (auto* child : node->children)
+                    prepareLoopMoves(child);
+            };
+        prepareLoopMoves(body);
+    }
+
 void MainListener::ParseControlledBody(CFlatParser::StatementContext* body) {
-        OwnershipControlScope controlScope(Compiler());
+        auto* compiler = Compiler(body);
+        OwnershipControlScope controlScope(compiler);
         ParseStatement(body);
         if (body != nullptr && body->compoundStatement() == nullptr)
-            Compiler(body)->FlushOwnedTemps();
+            compiler->FlushOwnedTemps();
     }
 
 llvm::AllocaInst* MainListener::FrameLocalDataPointer(llvm::Value* data,
@@ -1267,19 +1297,30 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             // A returned function-pointer VALUE must match the declared return slot (variadic-ness and bind rule).
             const auto* encodedReturnSource = returnNV.TypeAndValue.Pointer
                 ? nullptr : compiler->GetEncodedClosureType(returnNV.TypeAndValue.TypeName);
+            const bool returnIsNamedFunction =
+                llvm::isa_and_nonnull<llvm::Function>(returnNV.Primary);
             if (returnFnPtrTV.IsFunctionPointer
-                && (returnNV.TypeAndValue.IsFunctionPointer || encodedReturnSource != nullptr))
+                && (returnNV.TypeAndValue.IsFunctionPointer || encodedReturnSource != nullptr
+                    || returnIsNamedFunction))
             {
-                if (!encodedAliasReturnSlot
-                    && compiler->ClosureValueCanAdaptToSlot(returnNV, returnFnPtrTV))
-                    compiler->AdaptClosureValueToSlot(
-                        LoadNamedVariable(returnNV), returnNV, returnFnPtrTV);
-                if (std::string why = compiler->DescribeFuncPtrValueMismatch(
-                        returnFnPtrTV, returnNV); !why.empty())
-                    LogErrorContext(errCtx, why);
-                else if (std::string constWhy = compiler->DescribeFuncPtrConstMismatch(returnFnPtrTV,
-                        returnNV, LLVMBackend::FuncPtrConstRole::Return); !constWhy.empty())
-                    LogErrorContext(errCtx, constWhy);
+                if (std::string why = compiler->FuncPtrValueOwnershipReason(
+                        returnNV, returnFnPtrTV); !why.empty())
+                    LogErrorContext(errCtx, std::format(
+                        "incompatible function pointer return: {}", why));
+                if (!returnIsNamedFunction || returnNV.TypeAndValue.IsFunctionPointer
+                    || encodedReturnSource != nullptr)
+                {
+                    if (!encodedAliasReturnSlot
+                        && compiler->ClosureValueCanAdaptToSlot(returnNV, returnFnPtrTV))
+                        compiler->AdaptClosureValueToSlot(
+                            LoadNamedVariable(returnNV), returnNV, returnFnPtrTV);
+                    if (std::string why = compiler->DescribeFuncPtrValueMismatch(
+                            returnFnPtrTV, returnNV); !why.empty())
+                        LogErrorContext(errCtx, why);
+                    else if (std::string constWhy = compiler->DescribeFuncPtrConstMismatch(returnFnPtrTV,
+                            returnNV, LLVMBackend::FuncPtrConstRole::Return); !constWhy.empty())
+                        LogErrorContext(errCtx, constWhy);
+                }
             }
             // [immovable] C++ record: C++17 elision builds a fresh prvalue in the sret slot, so only a place
             // operand (variable, field, element, deref) is refused; a fresh one stays legal.
@@ -3896,6 +3937,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 compiler->CreateBlockBreak(blockInner, false);
 
                 compiler->InitializeBlock(blockInner, true, blockCondition, blockResume, blockResume);
+                PrepareLoopConditionalDropFlags(innerStatement);
                 ParseControlledBody(innerStatement);
                 if ((loopConditionAlwaysTrue_.empty() || !loopConditionAlwaysTrue_.back())
                     && compiler->IsInsertBlockLive() && !compiler->IsCurrentBlockUnreachable())
@@ -3965,6 +4007,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     // outside the lexical body inherits the flags (and outer scopes compose).
                     llvm::FastMathFlags prevFMF = compiler->builder->getFastMathFlags();
                     ApplyVectorizeFpTier(compiler, fpTier);
+                    PrepareLoopConditionalDropFlags(innerStatement);
                     ParseControlledBody(innerStatement);
                     compiler->builder->setFastMathFlags(prevFMF);
                     currentVectorizeBodyLine_ = prevBody;
@@ -4057,6 +4100,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         // Apply the FP-math tier to every FP op the body emits (see while-form).
                         llvm::FastMathFlags prevFMF = compiler->builder->getFastMathFlags();
                         ApplyVectorizeFpTier(compiler, fpTier);
+                        PrepareLoopConditionalDropFlags(innerStatement);
                         ParseControlledBody(innerStatement);
                         compiler->builder->setFastMathFlags(prevFMF);
                         currentVectorizeBodyLine_ = prevBody;
@@ -4252,6 +4296,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         auto* elemOut = compiler->builder->CreateBitCast(elemAlloca, i8PtrTy);
                         compiler->EmitWinrtThinSlotCall(iterI, iteratorName, "get_Current", { elemOut });
                         compiler->RecordMoveGenBind(varName); // element is a fresh binding each iteration
+                        PrepareLoopConditionalDropFlags(bodyStmt);
                         ParseControlledBody(bodyStmt);
                         compiler->CreateContinueCall();
 
@@ -4734,6 +4779,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                             rangeCtx.elementType = actualElement;
                             rangeForStack_.push_back(std::move(rangeCtx));
                             compiler->RecordMoveGenBind(varName);
+                            PrepareLoopConditionalDropFlags(bodyStmt);
                             ParseControlledBody(bodyStmt);
                             rangeForStack_.pop_back();
                             compiler->CreateContinueCall();
@@ -4977,6 +5023,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     rangeCtx.isInterface = isFaceType;
                     rangeForStack_.push_back(std::move(rangeCtx));
                     compiler->RecordMoveGenBind(varName); // element is a fresh binding each iteration
+                    PrepareLoopConditionalDropFlags(bodyStmt);
                     ParseControlledBody(bodyStmt);
                     rangeForStack_.pop_back();
                     compiler->CreateContinueCall();

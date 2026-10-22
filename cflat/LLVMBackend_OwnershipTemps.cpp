@@ -6382,6 +6382,9 @@ bool LLVMBackend::NeedsConditionalDropFlag(const NamedVariable& namedVar) const
         auto* moveBlock = builder->GetInsertBlock();
         if (moveBlock == nullptr) return false;
         if (namedVar.DeclarationScopeDepth < stackNamedVariable.size()) return true;
+        if (IsInsideOwnershipControlFrame(OwnFlagLoopFrame)
+            && namedVar.DeclarationBlock != moveBlock)
+            return true;
         if (namedVar.DeclarationBlock == nullptr || moveBlock == namedVar.DeclarationBlock)
             return false;
 
@@ -6414,7 +6417,15 @@ llvm::GlobalVariable* LLVMBackend::EnsureGlobalCxxLiveFlag(const NamedVariable& 
         return flag;
     }
 
-void LLVMBackend::EnsureConditionalDropFlag(NamedVariable& namedVar)
+void LLVMBackend::EnsureLoopConditionalDropFlag(NamedVariable& namedVar, bool initiallyLive)
+{
+        if (!IsInsideOwnershipControlFrame(OwnFlagLoopFrame) || namedVar.IsStaticLocal
+            || namedVar.IsRangeForBorrow || namedVar.AddressEscaped)
+            return;
+        EnsureConditionalDropFlag(namedVar, initiallyLive);
+    }
+
+void LLVMBackend::EnsureConditionalDropFlag(NamedVariable& namedVar, bool initiallyLive)
 {
         if (namedVar.ConditionalDropFlag != nullptr || !NeedsConditionalDropFlag(namedVar)) return;
         auto* savedBlock = builder->GetInsertBlock();
@@ -6434,7 +6445,7 @@ void LLVMBackend::EnsureConditionalDropFlag(NamedVariable& namedVar)
         }
         // A nested compound can share its LLVM block with the declaration. In that case the
         // first move is the first point at which the lazily-created flag can be initialized.
-        builder->CreateStore(builder->getInt1(true), namedVar.ConditionalDropFlag);
+        builder->CreateStore(builder->getInt1(initiallyLive), namedVar.ConditionalDropFlag);
         if (savedBlock != nullptr) builder->SetInsertPoint(savedBlock, savedPoint);
     }
 

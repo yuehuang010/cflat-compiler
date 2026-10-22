@@ -284,7 +284,7 @@ by clang++'s own 0.86 s PerformPendingInstantiations for the same program).
 Harness: `test_libs_parity.ps1 -N 3` (repo root; Windows counterpart of parity.sh). It covers every test_libs
 C++-interop case with a `<case>.cpp` twin: fmt (4), json (3), simdjson (2) and torch (11). Both baselines:
 clang++ -O0 compile+link vs cflat `-o` cold/warm, and clang++ -fsyntax-only vs `cflat --check`. Idle machine,
-pinned 0x55. Full per-case table + method: internal/issue/p1/cpp-import-compile-time-parity-with-clang.md
+pinned 0x55. Full per-case table + method: git history of the retired p1 issue (see section 7)
 ("Windows full baseline incl. libtorch").
 
 | sample | clang++ link | cold (x clang++) | warm (x clang++) | check cold vs -fsyntax-only |
@@ -341,3 +341,59 @@ Perf changes landed on master (newest first; torch train.cb = macOS sample, othe
   to Zig source, cached by content hash of the generated C source + flags. C only (no templates, no
   bodies to instantiate), so no persistent Sema is needed. Lesson: the cache granularity is the whole
   import block, not per-symbol - matching the group snapshot in 3.4.
+
+---
+
+## 7. Ongoing target and remaining work (folded from the p1 issue, 2026-10-21)
+
+Compile-time parity is an ongoing perf target, not a bug: it lived in
+`internal/issue/p1/cpp-import-compile-time-parity-with-clang.md` until 2026-10-21 (full status history,
+per-case tables and spike notes are in git history of that file). Outside the ship gate per the
+2026-10-21 bucket ruling.
+
+**Target (maintainer, 2026-09-27).** A CFlat program importing a C++ header compiles within 10% of
+`clang++ -std=c++20` on the equivalent C++ program (compile + link), cold (empty header cache, warm core)
+and warm. Measure with scratch/cmp/libs_parity.sh N=3 on a quiet machine; every ff-merge also runs
+scratch/libs_perf.sh against the previous master log (no compile-time regression from fixes).
+
+**Status 2026-09-30 (master 26b8647e, macOS arm64, PGO LLVM).** All C++ twins include <string> (fair
+baseline ruling). Geomean cold 1.09x, warm 0.24x - both met in aggregate. Met: fmt 0.91-1.00x, json_03
+1.10x, simdjson_01 1.09x, torch_01/02/90-93 0.98-1.10x. Open: json_01 1.28x, json_02 1.21x, simdjson_02
+1.21x, torch_05 1.20x, torch_06 1.20x, torch_07 1.16x, torch_03 1.14x, torch_04 1.11x. Header parse is
+below clang's frontend everywhere; torch fixed costs (register ~355 ms, ABI ~290 ms) are the same in met
+and open cases. The open ones differ in CodeGeneration (410-718 vs 86 ms) and demand companions
+(184-325 vs 125 ms). Stage profile: scratch/bench_2026-09-30/SUMMARY.md.
+
+**Remaining ideas, ranked.**
+1. Demand set up front (torch): slow cases take 2-3 demand-companion rounds, each re-hands all lazy
+   decls (~53 ms) and re-emits the module (~34 ms). Compute the closure before round 1 (D1's
+   between-round delta failed; an up-front closure is untried). Est. -3..-5% on torch_02..07.
+2. Retry D4 lazy C++ declarations after p3/cpp-signature-registration-projects-records (N37): separate
+   member-operator overload ordering from record projection first. Upper bound -3.6% torch instructions.
+3. Lazy ABI recipes: RegisterCSignatures ~308 ms per torch case (BuildAbiRecipeFromClangPlan -> GetType
+   -> EnsureCxxRecordProjected -> CompleteCxxRecordSpecialMembers for every harvested function). Likely
+   overlaps idea 2.
+4. CxxAbiArrange ~353 ms per torch case (DefinitionEmit 166 ms after D8): find more emission to move to
+   demand, as D8 did.
+5. json profile: no single lever (json_01 InstantiateFunction ~130 ms, AbiArrange ~77, DemandCompanions
+   ~71). Start with a -ftime-trace A/B against clang++ -ftime-trace.
+6. Spike first: overlap CFlat-side work with the clang header-group parse on another thread (compile is
+   almost all main-thread; risks: shared backend state, diagnostic order).
+7. Needs a ruling or large work: background cache warmer (cold does demand-only work, a detached
+   `--warm-cache` fills the eager harvest; changes warm = 0 from "always" to "eventually"; lazy harvest
+   alone breaks warm-0 on 10/10 sibling torch fixtures, scratch/lazy_harvest_spike.md); PCH /
+   ExternalASTSource-aware harvest (scratch/pch_spike.md).
+
+**Dropped - do not retry as-is** (reports in scratch/repro_keep/<id>/ where kept):
+- J1 delayed template parsing: rejected by ruling.
+- D1 demand delta rounds: always abandon on torch. D3 request prologue reuse: no gain.
+- D7 stage-1 request batching: the gain was truncated payloads.
+- D9 registration without special-member completion: breaks lifetime diagnostics.
+- PF4 deferring json_01's candidate-only requests: needs a signature-only candidate path (N37 blocker).
+- PF5 torch_06/07: no case-specific phase; the gap is 30-50 ms codegen-to-backend plus run-to-run noise.
+- S4 re-harvest projection replay (no torch gain); PCH in the baseline (clang++ uses none, cannot count).
+- BI lazy implicit defs (ABI/linkage drift on 2044 records); dependent spelling request filter and
+  wrapper direct param spellings (no gain); BR speculative Interpreter parse of scope-open headers (hangs).
+- LSP analysis writing its |EDECL request-cache entries (2026-09-26): slower sweep (20 pool slots
+  writing the same entries) and a body-less entry replays a generated-prefix dependency its key does not
+  carry. A retry must put the generated prefix in the LSP request key and throttle writes across slots.

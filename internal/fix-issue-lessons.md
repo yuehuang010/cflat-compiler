@@ -9,7 +9,7 @@ file is deleted when its bug is fixed; a lesson that changed an outcome more tha
 not be deleted with it. Every note below cost at least one confirmed defect to learn, and most
 of them cost the same defect twice.
 
-Active issues live one file per issue under `internal/issue/` (`p1/`-`p3/` bugs by severity, `p4/` small ratified-first features, `ui/`). The old
+Active issues live one file per issue under `internal/issue/` (`p1/`-`p3/` bugs by severity, `p4/` small ratified-first features, `hold/` parked or awaiting a ruling; the `ui/` bucket was retired 2026-10-21 into p3). The old
 `internal/issue/interface-issue-queue.md` index was retired on 2026-08-08; its durable lessons
 were folded in below and its landed design records survive as the digest at the bottom of this
 file. `internal/testing-notes.md` holds the mechanics of the suites.
@@ -3557,7 +3557,7 @@ Per-item detail lives in the named issue file; durable decisions here.
 - CFlat structs have no paren/copy-ctor init surface (`new S(mk1())` refused, use braces); parentheses never add a copy.
 - On hold / open: btree `*out = namedAlias` (no btree work), union with non-trivial C++ member (maintainer researching),
   const-local array dimension (waits for enforced const-for-variables, the next feature).
-- Heap array through `move T*` into a unique field (p2/unique-field-heap-array-through-move-param) stays ON HOLD; the
+- Heap array through `move T*` into a unique field (hold/unique-field-heap-array-through-move-param) stays ON HOLD; the
   2026-10-15 discussion (new[] not movable at a call site, `unique T[]`) is recorded in that file, not ruled.
 
 ## Ruling 2026-10-20: owed rulings from fix box 2026-10-16b
@@ -3578,3 +3578,18 @@ supersedes the 2026-09-28 gate (flip only once cold cflat <= 1.1x clang cold). T
 written by its pre-rebase exe and the T393 landing bar crashed test_cpp_interop twice (fresh cache: clean). The earlier lessons at the
 top of this file (failed-request entry replayed by later builds; foreign-build `cheaders` false regression) are now closed by default;
 they still apply under `=0`. Cost: the first compile after any rebuild is cold; core bitcode stays cold until `--init` is re-run.
+
+## Ruling 2026-10-21: issue bucket meanings and the ship gate
+
+| Bucket | Means | Ship gate |
+|---|---|---|
+| `p1/` | compiler crash / assert / LLVM verifier failure from plain source, or silent wrong code in common, idiomatic programs | must be zero |
+| `p2/` | silent wrong code (wrong value, double free, use-after-free, leak) that needs an unusual shape - aliasing through pointers, helpers, rebinds, rare C++ interop forms | fix, or turn into a located compile error |
+| `p3/` | safe but imperfect: false-positive refusal, extra copy/move vs clang, missing feature with a clear error, poor diagnostic, perf gap | does not block |
+| `p4/` | small unratified feature (ruling before build) | does not block |
+| `hold/` | a bug parked by the maintainer or waiting on a ruling (NEEDS RULING / ON HOLD); leaves `hold/` for its severity bucket once ruled | does not count against p1/p2 |
+
+- A refusal with a correct located diagnostic moves an item from p2 to p3 (refuse first, refine later).
+- Pre-existing finds from a review are filed by this table, not by default at p2: p2 only for silent wrong code.
+- Compile-time parity is a perf target tracked outside the gate, in `internal/plan/cpp-import-compile-parity.md` section 7 (the p1 issue was retired 2026-10-21).
+- Severity is measured on a verified master binary (see "On the baseline binary a severity claim is measured against").

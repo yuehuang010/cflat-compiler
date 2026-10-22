@@ -2895,6 +2895,34 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     return rhsNV.Primary;
                 }
 
+                // Move a lowered field into a temp, then drop the moved-to object. Its source
+                // C++ fields remain valid moved-from objects for assignment and scope cleanup.
+                if (rhsNV.IsExplicitMove && rhsNV.TypeAndValue.IsMove
+                    && !rhsNV.TypeAndValue.Pointer && rhsNV.BaseType != nullptr
+                    && rhsNV.BaseType->isStructTy()
+                    && compiler->IsLoweredCFlatOnlyStruct(rhsNV.TypeAndValue.TypeName)
+                    && compiler->HasForeignNontrivialCxxField(rhsNV.TypeAndValue.TypeName)
+                    && rhsNV.MoveSourceStorage != nullptr)
+                {
+                    auto* temp = compiler->CreateAlloca(rhsNV.BaseType);
+                    compiler->builder->CreateStore(rhsNV.Primary, rhsNV.MoveSourceStorage);
+                    if (compiler->EmitLoweredMemberwiseMove(rhsNV.TypeAndValue.TypeName,
+                            rhsNV.BaseType, temp, rhsNV.MoveSourceStorage,
+                            "discarding a moved lowered field"))
+                    {
+                        LLVMBackend::NamedVariable moved = rhsNV;
+                        moved.Storage = temp;
+                        moved.CallerName.clear();
+                        moved.FieldName.clear();
+                        moved.OwningStructName.clear();
+                        moved.IsOwning = true;
+                        if (compiler->OwnsDroppableResource(moved))
+                            compiler->DropValue(moved);
+                        compiler->lastOwningResult = false;
+                        return rhsNV.Primary;
+                    }
+                }
+
                 // `_ = <call>();` on an owning-POINTER return (`move R*`): the thing being dropped
                 // is the returned POINTER, so free THAT (dtor + delete) at end-of-full-expression.
                 if (const auto* owned = compiler->FindOwnedReturnEntry(rhsNV.Primary);
@@ -23478,6 +23506,8 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
             compiler->pendingInitAllocAlign = field.AllocAlignValue;
         DeclExpectedTypeScope fieldExpectedScope(&declExpectedType, field, true);
         auto nv = ParseAssignmentExpressionNamed(ae);
+        if (std::string why = compiler->FuncPtrValueOwnershipReason(nv, field); !why.empty())
+            LogErrorContext(ae, std::format("incompatible function pointer initializer: {}", why));
         // A field default initializer is a field store (`cppi.CrPair* p = &crConst;` is refused).
         RejectConstRecordPointeeStore(ae, field, nv, "field", field.VariableName);
         compiler->RejectImplicitIntegerPointeePointerConversion(nv.TypeAndValue, field);
@@ -24840,18 +24870,27 @@ void MainListener::EmitFieldInitializer(
             if (initSourceSig.FuncPtrReturnTypeName.empty() && !initSourceSig.Pointer)
                 if (const auto* enc = compiler->GetEncodedClosureType(initSourceSig.TypeName))
                     initSourceSig = *enc;
+            const bool initSourceIsNamedFunction =
+                llvm::isa_and_nonnull<llvm::Function>(rightNV.Primary);
             if (initField != nullptr && initSlotSig.IsFunctionPointer
-                && initSourceSig.IsFunctionPointer)
+                && (initSourceSig.IsFunctionPointer || initSourceIsNamedFunction))
             {
-                if (compiler->ClosureValueCanAdaptToSlot(rightNV, initSlotSig))
-                    compiler->AdaptClosureValueToSlot(
-                        LoadNamedVariable(rightNV), rightNV, initSlotSig);
-                if (std::string why = compiler->DescribeFuncPtrValueMismatch(
-                        initSlotSig, rightNV); !why.empty())
-                    LogErrorContext(fi, why);
-                else if (std::string constWhy = compiler->DescribeFuncPtrConstMismatch(
-                        initSlotSig, rightNV); !constWhy.empty())
-                    LogErrorContext(fi, constWhy);
+                if (std::string why = compiler->FuncPtrValueOwnershipReason(
+                        rightNV, initSlotSig); !why.empty())
+                    LogErrorContext(fi, std::format(
+                        "incompatible function pointer initializer: {}", why));
+                if (initSourceSig.IsFunctionPointer)
+                {
+                    if (compiler->ClosureValueCanAdaptToSlot(rightNV, initSlotSig))
+                        compiler->AdaptClosureValueToSlot(
+                            LoadNamedVariable(rightNV), rightNV, initSlotSig);
+                    if (std::string why = compiler->DescribeFuncPtrValueMismatch(
+                            initSlotSig, rightNV); !why.empty())
+                        LogErrorContext(fi, why);
+                    else if (std::string constWhy = compiler->DescribeFuncPtrConstMismatch(
+                            initSlotSig, rightNV); !constWhy.empty())
+                        LogErrorContext(fi, constWhy);
+                }
             }
             lambdaExpectedType = {};
             if (!stdFunctionField.empty())
@@ -25225,6 +25264,9 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                 else
                     nv = ParseAssignmentExpressionNamed(assignment);
             }
+            if (std::string why = compiler->FuncPtrValueOwnershipReason(nv, fixedElemTV); !why.empty())
+                LogErrorContext(assignment, std::format(
+                    "incompatible function pointer initializer: {}", why));
             const bool cxxSretConsumed = cxxSretArmed
                 && compiler->pendingCxxSretDest_ == nullptr;
             if (cxxSretArmed)
@@ -26311,6 +26353,9 @@ void MainListener::EmitArrayViewInferredInit(
                 DeclExpectedTypeScope elementExpectedScope(&declExpectedType, elemTV);
                 nv = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
             }
+            if (std::string why = compiler->FuncPtrValueOwnershipReason(nv, elemTV); !why.empty())
+                LogErrorContext(fi, std::format(
+                    "incompatible function pointer initializer: {}", why));
             llvm::Value* val = LoadNamedVariable(nv);
             if (!val) continue;
 
@@ -29130,6 +29175,7 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                 LLVMBackend::NamedVariable result;
                 result.Primary      = ptrVal;       // original value captured before zeroing
                 result.Storage      = nullptr;      // prevent re-load from zeroed storage
+                result.MoveSourceStorage = argNV.Storage;
                 result.BaseType     = argNV.BaseType;
                 result.TypeAndValue = argNV.TypeAndValue;
                 result.TypeAndValue.IsMove = true;
