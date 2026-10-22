@@ -4933,6 +4933,14 @@ struct T407Kept
 int t407KeptThroughPointer(T407Kept* k) { k.id = 20; return k.f() + k.g(); }
 T407OnlyCalled t407MakeOnlyCalled(int i) { T407OnlyCalled s = T407OnlyCalled(i); return s; }
 
+// A name bound in an enclosing ctor lambda (local, for-init) is not a member use, so no `this`
+// capture and copies stay legal; a same-named binding out of scope leaves the member use.
+int t407OuterId = 3;
+struct T407OuterLocal { int id = 4; Lambda<int()> f = default; T407OuterLocal() { this.f = () => { int id = 7; Lambda<int()> g = () => { return id; }; return g(); }; } };
+struct T407OuterFor { int id = 4; Lambda<int()> f = default; T407OuterFor() { this.f = () => { int r = 0; for (int id = 7; id < 8; id++) { Lambda<int()> g = () => { return id; }; r = g(); } return r; }; } };
+struct T407OuterGlobal { int t407OuterId = 4; Lambda<int()> f = default; T407OuterGlobal() { this.f = () => { int t407OuterId = 7; Lambda<int()> g = () => { return t407OuterId; }; return g(); }; } };
+struct T407OuterScope { int id = 4; Lambda<int()> f = default; T407OuterScope() { this.f = () => { for (int id = 7; id < 8; id++) {} Lambda<int()> g = () => { return id; }; return g(); }; } };
+
 bool testT407ConstructorClosureCopies()
 {
     bool result = true;
@@ -4955,6 +4963,17 @@ bool testT407ConstructorClosureCopies()
     heap.id = 6;
     result &= Test("t407_kept_new", heap.f(), 7);
     delete heap;
+    T407OuterLocal ol = T407OuterLocal();
+    T407OuterLocal olCopy = ol;
+    result &= Test("t407_outer_lambda_local", olCopy.f(), 7);
+    T407OuterFor of = T407OuterFor();
+    T407OuterFor ofCopy = of;
+    result &= Test("t407_outer_lambda_for", ofCopy.f(), 7);
+    T407OuterGlobal og = T407OuterGlobal();
+    T407OuterGlobal ogCopy = og;
+    result &= Test("t407_outer_lambda_local_global", ogCopy.f(), 7);
+    T407OuterScope os = T407OuterScope();
+    result &= Test("t407_outer_lambda_out_of_scope_member", os.f(), 4);
     return result;
 }
 

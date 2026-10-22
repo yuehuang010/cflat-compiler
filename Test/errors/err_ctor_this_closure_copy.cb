@@ -93,6 +93,17 @@ void t407GenericCtor()
     }
 }
 
+// A same-named binding in the enclosing lambda but out of scope at the use leaves a member use.
+struct T407OutScope { int id = 4; Lambda<int()> f = default; T407OutScope() { this.f = () => { { int id = 7; } Lambda<int()> g = () => { return id; }; return g(); }; } };
+
+void t407OuterOutOfScope()
+{
+    expect_error("copying 'T407OutScope' would leave its stored closure") {
+        T407OutScope a = T407OutScope();
+        T407OutScope b = a;
+    }
+}
+
 // A struct holding one by value without a closure field of its own returns from its ctor by value.
 struct T407D { int id = 0; Lambda<int()> f = default; T407D() { this.f = () => { return this.id; }; } };
 expect_error("the constructor of 'T407Holder' returns the object by value, which would leave its stored closure pointing at the constructor's temporary ('this' captured in T407D's constructor)") {

@@ -10956,10 +10956,8 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
         for (antlr4::tree::ParseTree* node = bodyCtx;
              node != nullptr && rootLambda == nullptr; node = node->parent)
             rootLambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(node);
-        std::function<void(antlr4::tree::ParseTree*, const std::set<std::string>&,
-                           CFlatParser::LambdaExpressionContext*)> walk =
-            [&](antlr4::tree::ParseTree* node, const std::set<std::string>& shadowed,
-                CFlatParser::LambdaExpressionContext* currentLambda)
+        std::function<void(antlr4::tree::ParseTree*, const std::set<std::string>&)> walk =
+            [&](antlr4::tree::ParseTree* node, const std::set<std::string>& shadowed)
         {
             if (!node) return;
 
@@ -10977,7 +10975,7 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
                     for (auto* p : pl->lambdaParam())
                         inner.insert(p->Identifier()->getText());
                 if (auto* body = nested->lambdaBody())
-                    walk(body, inner, nested);
+                    walk(body, inner);
                 return;
             }
 
@@ -11003,7 +11001,8 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
                     if (!seenNames.count(name)
                         && !lambdaParamNames.count(name)
                         && !shadowed.count(name)
-                        && !LambdaLocallyBindsName(currentLambda, primary, name))
+                        // Walk up through the root lambda: an enclosing lambda's local also binds it.
+                        && !LambdaLocallyBindsName(rootLambda, primary, name))
                     {
                         bool resolvedOuterBinding = false;
                         auto binding = compiler->GetScopedLocalOrArgument(name);
@@ -11046,10 +11045,10 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
             }
 
             for (size_t i = 0; i < node->children.size(); i++)
-                walk(node->children[i], shadowed, currentLambda);
+                walk(node->children[i], shadowed);
         };
 
-        if (bodyCtx) walk(bodyCtx, {}, rootLambda);
+        if (bodyCtx) walk(bodyCtx, {});
         return captures;
     }
 
