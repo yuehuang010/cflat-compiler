@@ -8,12 +8,9 @@ T311 fixed the C `NULL` macro item (see Test/test_function_ptr.cb testFunctionSl
   Same literal-0 rule; leave as is.
 - Literal 0 into a generic T = function<> parameter (`isNull<function<int(int)>>(0)`, `Box<function<..>>.set(0)`) ->
   "no overload matches"; nullptr and named functions work. Same literal-0 rule.
-- OPEN (needs maintainer ruling): `k ? p : nullptr` with p a Lambda variable into a function<> slot is refused
-  ("ternary branches have incompatible types '__closure_fat_ptr' and 'pointer'"). Not implemented: the declaration gate
-  (MainListener_Declarations.cpp, "stored Lambda<> value cannot carry captures") refuses even a non-capturing Lambda
-  variable (`function<int(int)> s = p;`), so accepting only the ternary would either be inconsistent or drop a capture
-  env. clang++ -std=c++20 accepts the captureless case. Ruling needed: keep refused, or accept a provably
-  non-capturing variable at both the join and the plain assignment.
+- RULED 2026-10-20 (T311(b)): keep refused. `function<>` is thin and never carries an env; a `Lambda<>` value does not
+  convert implicitly to `function<>` (doc/LANGUAGE.md Function types), at a plain assignment or a `?:` join alike. The
+  spelling is `k ? p.toFunction() : nullptr` (verified, runs). Not a fix item.
 Fix direction for the literal-0 items: none in this issue (literal 0 is out of scope by design).
 
 ## After T311 review 1 (2026-10-16, all same on master)

@@ -1588,7 +1588,7 @@ void LLVMBackend::DiagnoseExplicitMoveToBorrowParam(const std::string& functionN
         bool inferredSinkConsumes = param.IsConsumeInferredSink
             && OwningSinkConsumesConcrete(param);
         bool foreignCxxPointerSink = foreignCxxCallee && param.Pointer && !param.IsAlias
-            && !param.IsRvalueRef && !param.IsCxxRefToPointer && !param.IsCxxConstRef;
+            && !param.IsRvalueRef && !param.IsCxxRefToPointer && !param.CxxConstRef();
         bool paramIsSink = param.IsMove
             || param.IsRvalueRef
             || (!param.Pointer && !param.IsAlias && IsCoreUniqueType(param.TypeName))
@@ -1855,7 +1855,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
             bool foreignCxxPointerSink = calleeIsCxx && args[i].IsExplicitMove
                 && params[i].Pointer && !params[i].IsAlias
                 && !params[i].IsRvalueRef && !params[i].IsCxxRefToPointer
-                && !params[i].IsCxxConstRef;
+                && !params[i].CxxConstRef();
             bool inferredSinkConsumes = params[i].IsConsumeInferredSink
                 && OwningSinkConsumesConcrete(params[i]);
             // A borrow/alias arg has no ownership to transfer - nulling it would orphan a value

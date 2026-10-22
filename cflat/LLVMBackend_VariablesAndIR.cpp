@@ -697,35 +697,101 @@ llvm::Value* LLVMBackend::CreateCxxFieldGEP(llvm::IRBuilder<>& irBuilder, const 
         return markMutableField(gep);
 }
 
-void LLVMBackend::MarkCxxConstReferent(llvm::Value* referenceResult)
-{
-        if (auto* inst = llvm::dyn_cast_or_null<llvm::Instruction>(referenceResult))
-            inst->setMetadata("cflat.cxx.constref", llvm::MDNode::get(*context, {}));
-}
-
+/*
+ * The storage a C++ `const T&` / `T *const &` produced: a call whose return type is a const
+ * reference (its ConstMask), or a load of a C++ class's const-reference member.
+ */
 bool LLVMBackend::IsCxxConstReferent(llvm::Value* destination) const
 {
         if (destination == nullptr) return false;
-        auto* inst = llvm::dyn_cast<llvm::Instruction>(llvm::getUnderlyingObject(destination));
-        return inst != nullptr && inst->getMetadata("cflat.cxx.constref") != nullptr;
-}
-
-void LLVMBackend::MarkCxxConstFieldAccess(llvm::Value* fieldAddress)
-{
-        if (IsCxxMutableFieldAccess(fieldAddress)) return;
-        if (auto* global = llvm::dyn_cast_or_null<llvm::GlobalVariable>(fieldAddress))
+        const llvm::Value* object = llvm::getUnderlyingObject(destination);
+        if (auto* call = llvm::dyn_cast<llvm::CallBase>(object))
         {
-            cxxConstGlobalSymbols_.insert(global->getName().str());
-            return;
+            const llvm::Function* callee = call->getCalledFunction();
+            if (callee != nullptr)
+            {
+                if (auto known = constRefReturnCache_.find(callee); known != constRefReturnCache_.end())
+                    return known->second;
+                const FunctionSymbol* symbol = FindSymbolForFunction(callee);
+                if (symbol == nullptr) return false;     // not cached: may register later
+                const bool constRef = symbol->IsCxx && symbol->ReturnType.CxxConstRef();
+                constRefReturnCache_.emplace(callee, constRef);
+                return constRef;
+            }
+            const TypeAndValue* calledType = nullptr;
+            const llvm::Value* called = call->getCalledOperand()->stripPointerCasts();
+            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(called))
+            {
+                const llvm::Value* slot = load->getPointerOperand();
+                calledType = FindDeclaredTypeAndValueForStorage(slot);
+                if (calledType == nullptr) calledType = FindDeclaredFieldTypeAndValueForStorage(slot);
+            }
+            if (calledType == nullptr || !calledType->IsFunctionPointer
+                || calledType->FuncPtrReturnConstMask <= 0)
+                return false;
+            const int mask = calledType->FuncPtrReturnConstMask;
+            return calledType->FuncPtrReturnPointer
+                ? IsCxxRecord(calledType->FuncPtrReturnTypeName) && (mask & 1) != 0
+                : calledType->FuncPtrReturnAlias && (mask & 1) != 0;
         }
-        if (auto* inst = llvm::dyn_cast_or_null<llvm::Instruction>(fieldAddress))
-            inst->setMetadata("cflat.cxx.constfield", llvm::MDNode::get(*context, {}));
+        auto* load = llvm::dyn_cast<llvm::LoadInst>(object);
+        auto* gep = load != nullptr ? llvm::dyn_cast<llvm::GEPOperator>(load->getPointerOperand()) : nullptr;
+        if (gep == nullptr) return false;
+        const TypeAndValue* field = FindDeclaredFieldTypeAndValueForStorage(gep);
+        std::string owner;
+        if (field == nullptr)
+        {
+            auto* structType = llvm::dyn_cast<llvm::StructType>(gep->getSourceElementType());
+            auto* index = gep->getNumIndices() == 2
+                ? llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(2)) : nullptr;
+            if (structType == nullptr || !structType->hasName() || index == nullptr) return false;
+            owner = structType->getName().str();
+            field = FindDeclaredFieldOfStructType(structType, index->getZExtValue());
+        }
+        else if (auto* inst = llvm::dyn_cast<llvm::Instruction>(gep))
+            if (const llvm::MDNode* md = inst->getMetadata("cflat.cxx.field"); md != nullptr && md->getNumOperands() == 2)
+                if (auto* name = llvm::dyn_cast<llvm::MDString>(md->getOperand(0))) owner = name->getString().str();
+        if (auto* structType = llvm::dyn_cast<llvm::StructType>(gep->getSourceElementType());
+            owner.empty() && structType != nullptr && structType->hasName())
+            owner = structType->getName().str();
+        return field != nullptr && field->CxxConstRef() && IsCxxRecord(owner);
 }
 
-bool LLVMBackend::IsCxxConstFieldAccess(llvm::Value* fieldAddress) const
+void LLVMBackend::MarkCxxConstGlobal(llvm::GlobalVariable* global)
 {
-        auto* inst = llvm::dyn_cast_or_null<llvm::Instruction>(fieldAddress);
-        return inst != nullptr && inst->getMetadata("cflat.cxx.constfield") != nullptr;
+        if (global != nullptr) cxxHeaderGlobalSymbols_.insert(global->getName().str());
+}
+
+const LLVMBackend::TypeAndValue* LLVMBackend::GlobalTypeOf(const llvm::GlobalVariable* global) const
+{
+        if (global == nullptr) return nullptr;
+        if (auto known = globalTypeCache_.find(global); known != globalTypeCache_.end()) return known->second;
+        const TypeAndValue* found = nullptr;
+        const std::string symbol = global->getName().str();
+        if (auto direct = globalNamedVariable.find(symbol);
+            direct != globalNamedVariable.end() && direct->second == global)
+        {
+            if (auto tv = globalVariableTypes.find(symbol); tv != globalVariableTypes.end()) found = &tv->second;
+        }
+        else
+            for (const auto& [varName, slot] : globalNamedVariable)
+                if (slot == global)
+                    if (auto tv = globalVariableTypes.find(varName); tv != globalVariableTypes.end())
+                    {
+                        found = &tv->second;
+                        break;
+                    }
+        if (found != nullptr) globalTypeCache_.emplace(global, found);
+        return found;
+}
+
+bool LLVMBackend::IsConstHeaderGlobal(const llvm::GlobalVariable* global) const
+{
+        if (global == nullptr) return false;
+        const std::string symbol = global->getName().str();
+        if (cGlobalSymbols_.count(symbol) == 0 && cxxHeaderGlobalSymbols_.count(symbol) == 0) return false;
+        const TypeAndValue* tv = GlobalTypeOf(global);
+        return tv != nullptr && tv->IsConstObject();
 }
 
 bool LLVMBackend::IsCxxMutableFieldAccess(llvm::Value* fieldAddress) const
@@ -735,7 +801,7 @@ bool LLVMBackend::IsCxxMutableFieldAccess(llvm::Value* fieldAddress) const
         while (auto* inst = llvm::dyn_cast_or_null<llvm::Instruction>(current))
         {
             const TypeAndValue* field = FindDeclaredFieldTypeAndValueForStorage(current);
-            if (field != nullptr && field->IsCxxDeclaredConstField) return false;
+            if (field != nullptr && field->IsConstObject()) return false;
             if (inst->getMetadata("cflat.cxx.mutablefield") != nullptr) return true;
             if (field != nullptr && field->IsCxxMutableField) return true;
             auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(inst);
@@ -756,18 +822,30 @@ int LLVMBackend::CxxConstReceiverKind(const NamedVariable& receiver) const
         for (llvm::Value* v : { receiver.Storage, receiver.Primary })
         {
             if (v == nullptr || !v->getType()->isPointerTy()) continue;
-            if (IsCxxConstFieldAccess(v)) return 1;
             if (receiver.TypeAndValue.ParentVariableName.empty())
             {
                 if (IsCxxConstReferent(v)) return 3;
                 auto* global = llvm::dyn_cast<llvm::GlobalVariable>(llvm::getUnderlyingObject(v));
-                if (global != nullptr && cxxConstGlobalSymbols_.count(global->getName().str()) != 0)
-                    return 2;
+                if (IsConstHeaderGlobal(global)) return 2;
             }
         }
-        if (t.IsCxxPointeeConst && !t.IsFunctionPointer) return 1;
-        if (t.IsCxxConstRef && !t.Pointer && !t.IsCxxRefToPointer) return 1;
-        if (t.IsCxxConstField && !t.Pointer && !t.IsCxxRefToPointer) return 1;
+        // An object stored by value inside const storage (a const field, an element or field of a
+        // const object, the pointee of a pointer to const): the ConstMask of what declared it.
+        // The object's address: a pointer-shaped receiver's value, else its storage.
+        llvm::Value* object = t.IsCxxRefToPointer || t.IsFunctionPointer ? nullptr
+            : t.Pointer ? (t.ValuePointerDepth() == 1 ? receiver.Primary : nullptr) : receiver.Storage;
+        if (object != nullptr && object->getType()->isPointerTy())
+        {
+            if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(llvm::getUnderlyingObject(object));
+                IsConstHeaderGlobal(global) && !receiver.TypeAndValue.ParentVariableName.empty()
+                && !IsCxxMutableFieldAccess(object))
+                return 1;
+            if (FindConstWriteCause(object).Kind != ConstWriteCause::CauseKind::None)
+                return 1;
+        }
+        if (t.PointeeConstBit() && !t.IsFunctionPointer) return 1;
+        if (t.CxxConstRef() && !t.Pointer && !t.IsCxxRefToPointer) return 1;
+        if (IsCxxConstClassObject(t)) return 1;
         return 0;
 }
 
@@ -777,12 +855,12 @@ bool LLVMBackend::IsCConstObjectArgument(const NamedVariable& arg, std::string* 
         // global is not, its pointee is writable.
         if (arg.Primary != nullptr && arg.Primary->getType()->isPointerTy())
             if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(llvm::getUnderlyingObject(arg.Primary));
-                global != nullptr && cxxConstGlobalSymbols_.count(global->getName().str()) != 0)
+                IsConstHeaderGlobal(global))
             {
                 if (objectName != nullptr) *objectName = global->getName().str();
                 return true;
             }
-        if (!(arg.TypeAndValue.IsCxxPointeeConst && arg.TypeAndValue.Pointer)) return false;
+        if (!(arg.TypeAndValue.PointeeConstBit() && arg.TypeAndValue.Pointer)) return false;
         // A pointer whose pointee is const (`const int *` global): name the global it was loaded from.
         if (objectName != nullptr)
             for (llvm::Value* v : { arg.Storage, arg.Primary })
@@ -814,6 +892,13 @@ int LLVMBackend::CxxReceiverCv(const NamedVariable& receiver) const
             && !receiver.TypeAndValue.IsFunctionPointer)
             cv |= 2;
         return cv;
+}
+
+int LLVMBackend::CxxOperandObjectCv(const NamedVariable& operand) const
+{
+        const TypeAndValue& t = operand.TypeAndValue;
+        if (!IsCxxRecord(t.TypeName) || (t.Pointer && !t.IsCxxRef())) return 0;
+        return CxxReceiverCv(operand) | (t.CxxConstRef() ? 1 : 0);
 }
 
 bool LLVMBackend::IsCxxObjectRvalue(const NamedVariable& receiver) const

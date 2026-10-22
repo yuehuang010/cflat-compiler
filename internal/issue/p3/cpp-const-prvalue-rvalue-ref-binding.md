@@ -1,14 +1,23 @@
-# A const C++ class prvalue binds to a non-const `R&&` parameter
+P3: Remaining C++ const-prvalue reference-binding edge cases
 
-Summary: when a C++ function returns `const R` by value, its result binds to an `R&&` parameter. Clang treats the result as a const
-prvalue: it refuses `R&&` and picks a `const R&&` overload. T322 (2026-10-16) made the result a const receiver for member calls, but it
-did not change argument binding. Found by the T322 round-1 review; the wrong behaviour is identical on master and the T322 branch.
+## Constructor-only const prvalue to non-const R&&
 
-Repro (header): `struct R { int v = 0; }; inline const R make() { return {}; }`
-`inline int bind(R&& r) { return 11; } inline int bind(const R&& r) { return 12; } inline int onlyrv(R&& r) { return 13; }`
-- `return rv322.bind(rv322.make());` -> CFlat 11, clang 12.
-- `return rv322.onlyrv(rv322.make());` -> CFlat 13, clang refuses (binding `R&&` to a const value discards qualifiers).
+Repro: `struct R {}; inline const R make() { return {}; } struct O { O(R&&) {} }; O value = O(make());`
 
-Fix direction: overload ranking and reference-binding admissibility should read the call-result top-level const that T322 carries
-(the TypeAndValue marker transferred into IsTopLevelConst). A const prvalue must not bind to non-const `R&&` or `R&`. It can bind to
-`const R&&` (preferred) and to `const R&`.
+- CFlat accepts and returns the constructor's value (round-1 and round-2: 23).
+- Clang C++20 rejects binding `R&&` to the const `R` prvalue because it discards qualifiers.
+
+Deferred boundary: `RequestCxxVariadicConstructor` marks its generated forwarding symbol as
+`IsCxxConstructorForwardingWrapper` in `cflat/LLVMBackend_CInterop.cpp` near line 17935.
+Overload ranking exempts that wrapper. Keep the exemption until constructor viability can be
+checked without rejecting the valid forwarding-constructor cases it serves.
+
+## Pre-existing const lvalue to non-const R& acceptance
+
+Repro: with `inline const R& ref()`, `return q.lr(q.ref());` where `int lr(R&)` returns 14.
+
+- CFlat accepts and returns 14 on master, round-1, and round-2.
+- Clang C++20 rejects binding `R&` to `const R&` because it discards qualifiers.
+
+This is a separate pre-existing reference-binding inconsistency. The round-2 rvalue-reference
+filter deliberately does not claim or change this lvalue-reference path.

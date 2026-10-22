@@ -937,7 +937,7 @@ bool LLVMBackend::CxxEnumParameterRefusesArgument(const NamedVariable& arg,
                                                   const TypeAndValue& param) const
 {
         if (param.ElemPointer || param.IsArrayView || param.IsFunctionPointer) return false;
-        if (param.Pointer && !(param.IsAlias || param.IsRvalueRef || param.IsCxxConstRef))
+        if (param.Pointer && !(param.IsAlias || param.IsRvalueRef || param.CxxConstRef()))
             return false;
         const bool paramIsEnum = param.IsScopedEnum || !param.EnumBacking.empty()
             || IsScopedEnumTypeName(param.TypeName) || !ResolveEnumTypeName(param.TypeName).empty();
@@ -971,7 +971,7 @@ bool LLVMBackend::CxxDistinctEnumArgument(const NamedVariable& argVar, const Typ
         const TypeAndValue& arg = argVar.TypeAndValue;
         if (arg.Pointer || arg.ElemPointer || param.ElemPointer || param.IsArrayView || param.IsFunctionPointer)
             return false;
-        if (param.Pointer && !(param.IsAlias || param.IsRvalueRef || param.IsCxxConstRef)) return false;
+        if (param.Pointer && !(param.IsAlias || param.IsRvalueRef || param.CxxConstRef())) return false;
         if (!param.IsScopedEnum && !IsScopedEnumTypeName(param.TypeName)) return false;
         // A signed/unscoped source enum keeps its identity only in InferSourceTypeName.
         std::string argKey = ResolveEnumTypeName(arg.TypeName);
@@ -2132,14 +2132,10 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.IsAlias)        j["al"]  = true;
         if (s.IsRvalueRef)    j["rr"]  = true;
         if (s.IsCxxRefToPointer) j["crp"] = true;
-        if (s.IsCxxConstRef) j["ccr"] = true;
-        if (s.IsCxxPointeeConst) j["cpc"] = true;
+        if (s.CxxRefLevel >= 0) j["cxr"] = static_cast<int>(s.CxxRefLevel);
         if (s.IsCxxPointeeVolatile) j["cpv"] = true;
-        if (s.IsSpelledPointeeConst) j["spc"] = true;
         if (s.ConstMask) j["cm"] = static_cast<int64_t>(s.ConstMask);
         if (s.IsCxxNullptrT) j["cnt"] = true;
-        if (s.IsCxxConstField) j["ccf"] = true;
-        if (s.IsCxxDeclaredConstField) j["ccdf"] = true;
         if (s.IsCxxMutableField) j["cmf"] = true;
         if (s.IsOwningSink)   j["osk"] = true;
         if (s.IsConsumeInferredSink) j["cis"] = true;
@@ -2213,14 +2209,10 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsAlias = j.value("al", false);
         s.IsRvalueRef = j.value("rr", false);
         s.IsCxxRefToPointer = j.value("crp", false);
-        s.IsCxxConstRef = j.value("ccr", false);
-        s.IsCxxPointeeConst = j.value("cpc", false);
+        s.CxxRefLevel = static_cast<int8_t>(j.value("cxr", -1));
         s.IsCxxPointeeVolatile = j.value("cpv", false);
-        s.IsSpelledPointeeConst = j.value("spc", false);
         s.ConstMask = static_cast<uint8_t>(j.value("cm", 0));
         s.IsCxxNullptrT = j.value("cnt", false);
-        s.IsCxxConstField = j.value("ccf", false);
-        s.IsCxxDeclaredConstField = j.value("ccdf", false);
         s.IsCxxMutableField = j.value("cmf", false);
         s.IsOwningSink = j.value("osk", false);
         s.IsConsumeInferredSink = j.value("cis", false);
@@ -2821,6 +2813,7 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
         // M4 class surface. Same rule as the ABI arrangement above: the warm path never rebuilds
         // a clang session, so a dropped triviality bit or member list silently unbinds the class.
         if (r.isPolymorphic)         j["po"] = true;
+        if (!r.vtableDeleteVerdict.empty()) j["vdv"] = r.vtableDeleteVerdict;
         if (r.hasBases)              j["hb"] = true;
         if (r.hasTrivialDefaultCtor) j["tdc"] = true;
         if (r.hasTrivialCopyCtor)    j["tcc"] = true;
@@ -2931,6 +2924,7 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
         r.sizeBytes  = j.value("sz", (uint64_t)0);
         r.alignBytes = j.value("al", (uint64_t)0);
         r.isPolymorphic         = j.value("po", false);
+        r.vtableDeleteVerdict   = j.value("vdv", std::string());
         r.hasBases              = j.value("hb", false);
         r.hasTrivialDefaultCtor = j.value("tdc", false);
         r.hasTrivialCopyCtor    = j.value("tcc", false);
@@ -3308,7 +3302,7 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // carries the "return type ... is unsupported" refusal for such a signature.
         // v71 harvests C++ namespace aliases and refuses a 'consteval' function: an older cache
         // has no alias pairs and carries a bindable signature for an immediate function.
-        // v72 records `const` on a C++ reference parameter (IsCxxConstRef): an older cache
+        // v72 records `const` on a C++ reference parameter: an older cache
         // carries the flag as false, so an rvalue would not bind a `const T&` scalar parameter.
         // v74 publishes FREE BINARY OPERATOR templates: an older cache has none, so a binary
         // operator over a class template (every libc++ basic_string operator) finds no candidate.
@@ -3771,7 +3765,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         // v69 makes cached C++ signature payloads key-pure by remapping foreign types on replay.
         // v70 maps a std::function return to its std.function specialization.
         // v71 harvests C++ namespace aliases and refuses a 'consteval' function.
-        // v72 records `const` on a C++ reference parameter (IsCxxConstRef).
+        // v72 records `const` on a C++ reference parameter.
         // v73 records an alias template's target base, argument pattern and parameter defaults
         // (catb/caa/cad). v74 publishes FREE BINARY OPERATOR templates.
         // v76 records `explicit` on a C++ conversion operator too (xpl).

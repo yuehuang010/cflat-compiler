@@ -1281,7 +1281,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     const int depth = param.PointerDepth > 0 ? param.PointerDepth
                         : (param.Pointer ? (param.ElemPointer ? 2 : 1) : 0);
                     if (depth == 0 && param.IsRvalueRef) spelling += " &&";
-                    else if (depth == 0 && param.IsCxxConstRef) spelling += " const&";
+                    else if (depth == 0 && param.CxxConstRef()) spelling += " const&";
                 }
                 if (!spellable) continue;
                 const size_t ordinal = cppMethodOrdinals[methodName]++;
@@ -1461,17 +1461,62 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 source += "void __cflat_move_" + shortName + "(" + cxxName
                        + "* dst, " + cxxName + "* src) noexcept;\n";
             source += "void __cflat_dtor_" + shortName + "(" + cxxName + "* dst) noexcept;\n";
+            auto isByValueCxxRecord = [&](const LLVMBackend::DeclTypeAndValue& param) {
+                if (param.Pointer || param.PointerDepth != 0 || param.IsArrayView
+                    || param.IsAlias || param.IsRvalueRef || param.CxxConstRef()
+                    || param.IsCxxRefToPointer)
+                    return false;
+                return compiler->GetCxxClassInfo(param.TypeName) != nullptr;
+            };
+            auto isBorrowedCxxOverrideParam = [&](const LLVMBackend::DeclTypeAndValue& param) {
+                return isByValueCxxRecord(param)
+                    && compiler->CxxClassOverrideParamIsBorrowed(param.TypeName);
+            };
+            const bool hasByValueCxxRecordOverrideParam = std::any_of(
+                overrides.begin(), overrides.end(), [&](const auto& overrideInfo) {
+                    return std::any_of(overrideInfo.Params.begin(), overrideInfo.Params.end(),
+                                       isByValueCxxRecord);
+                });
+            source += "}\n";
+            if (hasByValueCxxRecordOverrideParam)
+            {
+                source += "template <class T> static decltype(auto) __cflat_forward_by_value_"
+                    + shortName + "(T& value) { if constexpr (requires(T&& source) { "
+                    "T(static_cast<T&&>(source)); }) return static_cast<T&&>(value); "
+                    "else if constexpr (requires(const T& source) { T(source); }) "
+                    "return static_cast<const T&>(value); else return static_cast<T&>(value); }\n";
+                source += "template <class T, bool Borrowed> struct __cflat_override_param_"
+                    + shortName + " { using type = T; };\n";
+                source += "template <class T> struct __cflat_override_param_" + shortName
+                    + "<T, true> { using type = T&; };\n";
+                source += "template <class T, bool Borrowed> using __cflat_override_param_type_"
+                    + shortName + " = typename __cflat_override_param_" + shortName
+                    + "<T, Borrowed>::type;\n";
+            }
+            source += "extern \"C\" {\n";
             for (const auto& overrideInfo : overrides)
             {
                 const auto& raw = overrideInfo.BaseMethod.raw;
                 source += raw.retType + " " + overrideInfo.StableName + "("
                     + (raw.isConst ? "const " : "") + cxxName + "*";
                 for (size_t i = 1; i < raw.paramTypes.size(); ++i)
-                    source += ", " + raw.paramTypes[i] + " "
-                        + (i - 1 < overrideInfo.Params.size()
-                           && !overrideInfo.Params[i - 1].VariableName.empty()
-                           ? overrideInfo.Params[i - 1].VariableName
-                           : "p" + std::to_string(i - 1));
+                {
+                    const size_t paramIndex = i - 1;
+                    std::string paramType = raw.paramTypes[i];
+                    if (paramIndex < overrideInfo.Params.size()
+                        && isByValueCxxRecord(overrideInfo.Params[paramIndex]))
+                    {
+                        const bool borrowed = isBorrowedCxxOverrideParam(
+                            overrideInfo.Params[paramIndex]);
+                        paramType = "__cflat_override_param_type_" + shortName
+                            + "<" + paramType + ", " + (borrowed ? "true" : "false") + ">";
+                    }
+                    source += ", " + paramType + " "
+                        + (paramIndex < overrideInfo.Params.size()
+                           && !overrideInfo.Params[paramIndex].VariableName.empty()
+                           ? overrideInfo.Params[paramIndex].VariableName
+                           : "p" + std::to_string(paramIndex));
+                }
                 source += ");\n";
             }
             for (const auto& method : cppMethods)
@@ -1483,7 +1528,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     std::string spelling;
                     appendParamSpelling(method.Params[i], spelling);
                     if (method.Params[i].IsRvalueRef) spelling += " &&";
-                    else if (method.Params[i].IsCxxConstRef) spelling += " const&";
+                    else if (method.Params[i].CxxConstRef()) spelling += " const&";
                     source += ", " + spelling + " "
                         + (method.Params[i].VariableName.empty()
                            ? "p" + std::to_string(i) : method.Params[i].VariableName);
@@ -1514,24 +1559,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             if (fwdDel) source += "void __cflat_opdel_" + shortName + "(void* p);\n";
             if (fwdDelSized)
                 source += "void __cflat_opdels_" + shortName + "(void* p, decltype(sizeof(0)) n);\n";
-            auto isByValueCxxRecord = [&](const LLVMBackend::DeclTypeAndValue& param) {
-                if (param.Pointer || param.PointerDepth != 0 || param.IsArrayView
-                    || param.IsAlias || param.IsRvalueRef || param.IsCxxConstRef
-                    || param.IsCxxRefToPointer)
-                    return false;
-                return compiler->GetCxxClassInfo(param.TypeName) != nullptr;
-            };
-            const bool hasByValueCxxRecordOverrideParam = std::any_of(
-                overrides.begin(), overrides.end(), [&](const auto& overrideInfo) {
-                    return std::any_of(overrideInfo.Params.begin(), overrideInfo.Params.end(),
-                                       isByValueCxxRecord);
-                });
             source += "}\n";
-            if (hasByValueCxxRecordOverrideParam)
-                source += "template <class T> static decltype(auto) __cflat_forward_by_value_"
-                    + shortName + "(T& value) { if constexpr (requires(T&& source) { "
-                    "T(static_cast<T&&>(source)); }) return static_cast<T&&>(value); "
-                    "else return static_cast<const T&>(value); }\n";
             source += "namespace __cflat_user {\nstruct " + shortName + " final";
             if (!baseCxxName.empty()) source += " : public " + baseCxxName;
             source += " {\n";
@@ -1614,7 +1642,13 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                         ? "p" + std::to_string(i) : param.VariableName;
                     source += ", ";
                     if (isByValueCxxRecord(param))
-                        source += "__cflat_forward_by_value_" + shortName + "(" + paramName + ")";
+                    {
+                        if (isBorrowedCxxOverrideParam(param))
+                            source += paramName;
+                        else
+                            source += "__cflat_forward_by_value_" + shortName
+                                + "(" + paramName + ")";
+                    }
                     else
                         source += paramName;
                 }
@@ -1629,7 +1663,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     std::string spelling;
                     appendParamSpelling(method.Params[i], spelling);
                     if (method.Params[i].IsRvalueRef) spelling += " &&";
-                    else if (method.Params[i].IsCxxConstRef) spelling += " const&";
+                    else if (method.Params[i].CxxConstRef()) spelling += " const&";
                     source += spelling + " " + (method.Params[i].VariableName.empty()
                         ? "p" + std::to_string(i) : method.Params[i].VariableName);
                 }

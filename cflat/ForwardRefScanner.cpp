@@ -185,10 +185,17 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                             // Resolve generic signature types (gap b) to match the main pass.
                             bool retPtr = fpSpec->pointer() != nullptr;
                             int retStars = PointerDepthOf(fpSpec->pointer());
+                            auto* returnQualifier = fpSpec->functionReturnQualifier();
+                            const std::string returnQualifierText = returnQualifier != nullptr
+                                ? returnQualifier->getText() : "";
+                            const bool aliasReturn = returnQualifierText == "alias";
                             int retConst = 0;
                             declType.FuncPtrReturnTypeName = ResolveSigComponentConstScanner(
-                                fpSpec->typeSpecifier(), retPtr, retStars, retConst, fpSpec->multiWordTypeSuffix());
+                                fpSpec->typeSpecifier(), retPtr, retStars, retConst,
+                                fpSpec->multiWordTypeSuffix(), aliasReturn, true);
                             declType.FuncPtrReturnConstMask = retConst;
+                            declType.FuncPtrReturnOwned = returnQualifierText == "move";
+                            declType.FuncPtrReturnAlias = aliasReturn;
                             declType.FuncPtrReturnPointer = retPtr;
                             declType.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
                             declType.FuncPtrReturnResolvedKey = SigComponentResolvedKeyScanner(declType.FuncPtrReturnTypeName);
@@ -599,9 +606,6 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                 hasConstQualifier = true;
         if (hasConstQualifier)
             declType.ApplyWholeWordConst();
-        if (hasConstQualifier && declType.Pointer && compiler->IsCxxRecord(declType.TypeName))
-            declType.IsCxxPointeeConst = true;
-        declType.IsSpelledPointeeConst = (declType.ConstMask & 1) != 0 && declType.Pointer;
         return declType;
     }
 
@@ -666,6 +670,17 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         }
         auto* paramTypeList = func->parameterTypeList();
         auto params = ParseParameterTypeList(paramTypeList);
+        std::string cppBaseType;
+        const bool borrowedCppOverride = !structName.empty()
+            && compiler->IsCppStructName(structName)
+            && compiler->GetCppStructBase(structName, cppBaseType)
+            && HasSoftDeclarationSpecifier(func->declarationSpecifiers(), "override");
+        if (borrowedCppOverride)
+            for (auto& param : params)
+                if (!param.Pointer && !param.IsAlias && !param.IsRvalueRef
+                    && !param.CxxConstRef()
+                    && compiler->CxxClassOverrideParamIsBorrowed(param.TypeName))
+                    param.IsAlias = true;
         bool varargs = paramTypeList && paramTypeList->Ellipsis() != nullptr;
 
         // Operator new/delete/string and static methods are scoped to struct but have no 'this' param
@@ -1510,7 +1525,7 @@ std::string ForwardRefScanner::ResolveSigComponentScanner(
 
 std::string ForwardRefScanner::ResolveSigComponentConstScanner(
     CFlatParser::TypeSpecifierContext* ts, bool& outPointer, int& stars, int& constMask,
-    CFlatParser::MultiWordTypeSuffixContext* suffix) {
+    CFlatParser::MultiWordTypeSuffixContext* suffix, bool preserveAliasReferentConst, bool returnComponent) {
         constMask = 0;
         if (ts != nullptr && ts->typeName() != nullptr)
         {
@@ -1522,7 +1537,7 @@ std::string ForwardRefScanner::ResolveSigComponentConstScanner(
                 return ts->getText();
             stars += shape.PointerDepth;
             outPointer = stars > 0;
-            constMask = PointeeConstOfComponent(shape.ConstMask, stars);
+            constMask = PointeeConstOfComponent(shape.ConstMask, stars, preserveAliasReferentConst);
             return shape.TypeName;
         }
         std::string name = ResolveSigComponentScanner(ts, outPointer, suffix);
@@ -1530,7 +1545,20 @@ std::string ForwardRefScanner::ResolveSigComponentConstScanner(
         std::string aliased = compilerLLVM->ResolveTypeAlias(name);
         int aliasStars = 0;
         while (aliasStars < (int)aliased.size() && aliased[aliased.size() - 1 - aliasStars] == '*') ++aliasStars;
-        constMask = PointeeConstOfComponent(compilerLLVM->ResolveTypeAliasConstMask(name), depth + aliasStars);
+        uint8_t aliasMask = compilerLLVM->ResolveTypeAliasConstMask(name);
+        // `name` is already alias-resolved here; read the mask off the spelled alias, as codegen does.
+        if (aliasMask == 0 && ts != nullptr && ts->functionPointerSpecifier() == nullptr
+            && ts->memberTypeSpecifier() == nullptr
+            && (ts->genericIdentifier() == nullptr || ts->genericIdentifier()->genericTypeParameters() == nullptr))
+            aliasMask = compilerLLVM->ResolveTypeAliasConstMask(CanonicalTypeSpecifierText(ts, suffix));
+        constMask = PointeeConstOfComponent(aliasMask, depth + aliasStars, preserveAliasReferentConst);
+        // A named pointer alias records its resolved shape, as a spelled `(T)*` does: base name, stars, pointer.
+        if (aliasStars > 0 && returnComponent)
+        {
+            stars += aliasStars;
+            outPointer = true;
+            return aliased.substr(0, aliased.size() - aliasStars);
+        }
         return name;
     }
 
@@ -1544,9 +1572,11 @@ std::string ForwardRefScanner::EncodeClosureScanner(CFlatParser::FunctionPointer
             return isThin ? "__c_fn_ptr" : "__closure_fat_ptr";  // main pass reports the error
         bool retPtr = fpSpec->pointer() != nullptr;
         int retStars = PointerDepthOf(fpSpec->pointer());
+        const bool aliasReturn = fpSpec->functionReturnQualifier() != nullptr
+            && fpSpec->functionReturnQualifier()->getText() == "alias";
         int retConst = 0;
         std::string retName = ResolveSigComponentConstScanner(fpSpec->typeSpecifier(), retPtr,
-                                                              retStars, retConst, fpSpec->multiWordTypeSuffix());
+            retStars, retConst, fpSpec->multiWordTypeSuffix(), aliasReturn, true);
         std::vector<std::pair<std::string, int>> encParams;
         std::vector<int> paramConsts;
         if (fpSpec->functionPointerParamList() != nullptr)
@@ -2168,11 +2198,18 @@ LLVMBackend::TypeAndValue ForwardRefScanner::BuildFuncPtrAliasType(CFlatParser::
             // Resolve generic signature types (gap b) to match the main pass.
             bool retPtr = fpSpec->pointer() != nullptr;
             int retStars = PointerDepthOf(fpSpec->pointer());
+            auto* returnQualifier = fpSpec->functionReturnQualifier();
+            const std::string returnQualifierText = returnQualifier != nullptr
+                ? returnQualifier->getText() : "";
+            const bool aliasReturn = returnQualifierText == "alias";
             int retConst = 0;
             tv.FuncPtrReturnTypeName = ResolveSigComponentConstScanner(
-                fpSpec->typeSpecifier(), retPtr, retStars, retConst, fpSpec->multiWordTypeSuffix());
+                fpSpec->typeSpecifier(), retPtr, retStars, retConst,
+                fpSpec->multiWordTypeSuffix(), aliasReturn, true);
             tv.FuncPtrReturnConstMask = retConst;
             tv.FuncPtrReturnPointer  = retPtr;
+            tv.FuncPtrReturnOwned = returnQualifierText == "move";
+            tv.FuncPtrReturnAlias = aliasReturn;
             tv.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
             tv.FuncPtrReturnResolvedKey = SigComponentResolvedKeyScanner(tv.FuncPtrReturnTypeName);
             if (fpSpec->functionPointerParamList() != nullptr)

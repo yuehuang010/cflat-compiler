@@ -986,7 +986,7 @@ std::string MainListener::ResolveSigComponentCodegen(
 
 std::string MainListener::ResolveSigComponentConstCodegen(
     CFlatParser::TypeSpecifierContext* ts, bool& outPointer, int& stars, int& constMask,
-    CFlatParser::MultiWordTypeSuffixContext* suffix) {
+    CFlatParser::MultiWordTypeSuffixContext* suffix, bool preserveAliasReferentConst, bool returnComponent) {
         constMask = 0;
         if (ts != nullptr && ts->typeName() != nullptr)
         {
@@ -994,7 +994,7 @@ std::string MainListener::ResolveSigComponentConstCodegen(
             nested.ApplyWholeWordConst();
             stars += nested.ValuePointerDepth();
             outPointer = stars > 0;
-            constMask = PointeeConstOfComponent(nested.ConstMask, stars);
+            constMask = PointeeConstOfComponent(nested.ConstMask, stars, preserveAliasReferentConst);
             return nested.TypeName;
         }
         std::string name = ResolveSigComponentCodegen(ts, outPointer, suffix);
@@ -1006,7 +1006,14 @@ std::string MainListener::ResolveSigComponentConstCodegen(
         int mask = Compiler()->ResolveTypeAliasConstMask(name);
         if (int substituted = SubstitutedConstDepth(ts, suffix); substituted > 0)
             mask |= (1 << std::min(substituted, 7)) - 1;
-        constMask = PointeeConstOfComponent(mask, depth + aliasStars);
+        constMask = PointeeConstOfComponent(mask, depth + aliasStars, preserveAliasReferentConst);
+        // A named pointer alias records its resolved shape, as a spelled `(T)*` does: base name, stars, pointer.
+        if (aliasStars > 0 && returnComponent)
+        {
+            stars += aliasStars;
+            outPointer = true;
+            return aliased.substr(0, aliased.size() - aliasStars);
+        }
         return name;
     }
 
@@ -1075,9 +1082,18 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
         int retStars = PointerDepthOf(fpSpec->pointer());
         ValidateConstAfterPointerStar(fpSpec->pointer(),
             SpelledTypeNameBase(fpSpec->typeSpecifier(), fpSpec->multiWordTypeSuffix()));
+        auto* returnQualifier = fpSpec->functionReturnQualifier();
+        std::string returnQualifierText;
+        if (returnQualifier != nullptr)
+        {
+            returnQualifierText = returnQualifier->getText();
+            if (returnQualifierText != "move" && returnQualifierText != "alias")
+                LogErrorContext(returnQualifier, "function return qualifier must be 'move' or 'alias'");
+        }
+        const bool aliasReturn = returnQualifierText == "alias";
         int retConst = 0;
         std::string retName = ResolveSigComponentConstCodegen(fpSpec->typeSpecifier(), retPtr,
-                                                              retStars, retConst, fpSpec->multiWordTypeSuffix());
+            retStars, retConst, fpSpec->multiWordTypeSuffix(), aliasReturn, true);
         sig.FuncPtrReturnConstMask = retConst;
         // A signature component over the cap can never be matched: no function may declare a
         // 3-star return or parameter, so the closure type would be unpopulatable.
@@ -1086,14 +1102,8 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
                 std::format("function type return '{}'", retName), retStars));
         sig.FuncPtrReturnTypeName = retName;
         sig.FuncPtrReturnPointer  = retPtr;
-        if (auto* qualifier = fpSpec->functionReturnQualifier(); qualifier != nullptr)
-        {
-            std::string text = qualifier->getText();
-            if (text != "move" && text != "alias")
-                LogErrorContext(qualifier, "function return qualifier must be 'move' or 'alias'");
-            sig.FuncPtrReturnOwned = text == "move";
-            sig.FuncPtrReturnAlias = text == "alias";
-        }
+        sig.FuncPtrReturnOwned = returnQualifierText == "move";
+        sig.FuncPtrReturnAlias = aliasReturn;
         sig.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
         sig.FuncPtrReturnResolvedKey = SigComponentResolvedKey(retName);
         std::vector<std::pair<std::string, int>> encParams;
@@ -1439,18 +1449,22 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         int retStars = PointerDepthOf(fpSpec->pointer());
                         ValidateConstAfterPointerStar(fpSpec->pointer(),
                             SpelledTypeNameBase(fpSpec->typeSpecifier(), fpSpec->multiWordTypeSuffix()));
+                        auto* returnQualifier = fpSpec->functionReturnQualifier();
+                        std::string returnQualifierText;
+                        if (returnQualifier != nullptr)
+                        {
+                            returnQualifierText = returnQualifier->getText();
+                            if (returnQualifierText != "move" && returnQualifierText != "alias")
+                                LogErrorContext(returnQualifier, "function return qualifier must be 'move' or 'alias'");
+                        }
+                        const bool aliasReturn = returnQualifierText == "alias";
                         int retConst = 0;
                         declType.FuncPtrReturnTypeName = ResolveSigComponentConstCodegen(
-                            fpSpec->typeSpecifier(), retPtr, retStars, retConst, fpSpec->multiWordTypeSuffix());
+                            fpSpec->typeSpecifier(), retPtr, retStars, retConst,
+                            fpSpec->multiWordTypeSuffix(), aliasReturn, true);
                         declType.FuncPtrReturnConstMask = retConst;
-                        if (auto* qualifier = fpSpec->functionReturnQualifier(); qualifier != nullptr)
-                        {
-                            std::string text = qualifier->getText();
-                            if (text != "move" && text != "alias")
-                                LogErrorContext(qualifier, "function return qualifier must be 'move' or 'alias'");
-                            declType.FuncPtrReturnOwned = text == "move";
-                            declType.FuncPtrReturnAlias = text == "alias";
-                        }
+                        declType.FuncPtrReturnOwned = returnQualifierText == "move";
+                        declType.FuncPtrReturnAlias = aliasReturn;
                         // Over the cap here too: no declarable function can supply this signature.
                                 if (retStars > PointerDepthCap)
                                     LogErrorContext(fpSpec, PointerDepthCapMessage(
@@ -2099,9 +2113,6 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 hasConstQualifier = true;
         if (hasConstQualifier)
             declType.ApplyWholeWordConst();
-        if (hasConstQualifier && declType.Pointer && Compiler(declSpecs)->IsCxxRecord(declType.TypeName))
-            declType.IsCxxPointeeConst = true;
-        declType.IsSpelledPointeeConst = (declType.ConstMask & 1) != 0 && declType.Pointer;
 
         return declType;
     }
@@ -4132,6 +4143,13 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         auto returnType = this->getFunctionReturnType(func);
         CFlatParser::ParameterTypeListContext* paramTypeList = func->parameterTypeList();
         auto params = this->ParseParameterTypeList(paramTypeList);
+        if (cppOverrideContext
+            && HasSoftDeclarationSpecifier(func->declarationSpecifiers(), "override"))
+            for (auto& param : params)
+                if (!param.Pointer && !param.IsAlias && !param.IsRvalueRef
+                    && !param.CxxConstRef()
+                    && compiler->CxxClassOverrideParamIsBorrowed(param.TypeName))
+                    param.IsAlias = true;
         if (auto* s = compiler->GetSymbolSink(); s && !InGenericInstantiation()
             && paramTypeList && paramTypeList->parameterList())
         {
@@ -5459,6 +5477,8 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(slotValue);
         allocList.push_back(std::pair(name, slot));
         if (slotValue == nullptr) return true;
+        // The slot is under construction: a const local is still writable by its constructor.
+        LLVMBackend::ConstructingScope constructingSlot(compiler, slotValue);
         // Plan converting-constructors.md point 1: `T t = u;` is `T t = T(u);` - the converting
         // constructor builds straight into the slot. False leaves the caller's refusal.
         auto convertInto = [&](LLVMBackend::NamedVariable source) {
@@ -6477,7 +6497,7 @@ cxx_dtor_ready:
             {
                 std::string refusal;
                 if (!compiler->EmitCxxXvalueTransfer(typeName, slot, rightNV.Primary,
-                        rightNV.TypeAndValue.IsCxxConstRef, false, refusal))
+                        rightNV.TypeAndValue.CxxConstRef(), false, refusal))
                     LogErrorContext(assign, refusal);
                 return true;
             }
@@ -6586,7 +6606,7 @@ cxx_dtor_ready:
                 // `*opt_temp()` (operator*() &&) is an xvalue: clang selects the constructor.
                 std::string refusal;
                 if (!compiler->EmitCxxXvalueTransfer(typeName, slot, rightNV.Storage,
-                        rightNV.TypeAndValue.IsCxxConstRef, false, refusal))
+                        rightNV.TypeAndValue.CxxConstRef(), false, refusal))
                     LogErrorContext(assign, refusal);
                 return true;
             }
@@ -6672,15 +6692,13 @@ bool MainListener::TryDeclareForeignCxxAutoLocal(CFlatParser::DirectDeclaratorCo
         auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(slotValue);
         allocList.push_back(std::pair(name, slot));
         if (slot == nullptr) return true;
-        if (constQualified && compiler->IsCxxRecord(typeName))
-            compiler->MarkCxxConstFieldAccess(slot);
 
         if (xvalue)
         {
             compiler->SetCurrentDebugLocation(line);
             std::string refusal;
             if (!compiler->EmitCxxXvalueTransfer(typeName, slot, sourceNV.Primary,
-                    sourceNV.TypeAndValue.IsCxxConstRef, false, refusal))
+                    sourceNV.TypeAndValue.CxxConstRef(), false, refusal))
                 LogErrorContext(assign != nullptr ? static_cast<antlr4::ParserRuleContext*>(assign)
                                                   : direct, refusal);
             return true;
@@ -7222,12 +7240,14 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                           ? " (it is deleted)" : "" }));
             }
         };
+        // A `const` C++ class object binds like a const reference at C++ calls; a `const` C++
+        // class pointer's pointee is read-only to the C++ checks.
         if (DeclSpecHasConst(declSpec) && !typeAndValue.Pointer
             && compiler->IsCxxRecord(typeAndValue.TypeName))
-            typeAndValue.IsCxxConstRef = true;
+            typeAndValue.SetCxxConstRef(true);
         if (DeclSpecHasConst(declSpec) && typeAndValue.Pointer
             && compiler->IsCxxRecord(typeAndValue.TypeName))
-            typeAndValue.IsCxxPointeeConst = true;
+            typeAndValue.SetPointeeConstBit(true);
         // A generic parameter can itself be bound to a core unique wrapper. It is already a
         // concrete value type, but its ordinary copy-shaped helper bodies must not be mistaken
         // for a direct `unique` declaration diagnostic.
@@ -8455,7 +8475,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         || typeAndValue.TypeName == rightNV.TypeAndValue.TypeName))
                                 {
                                     std::string refusal;
-                                    const bool constSource = rightNV.TypeAndValue.IsCxxConstRef;
+                                    const bool constSource = rightNV.TypeAndValue.CxxConstRef();
                                     // A nontrivial class in a `static` local is constructed straight
                                     // into the static's storage: relocating it breaks `this` capture.
                                     if (isStaticLocal && compiler->IsForeignNontrivialCxxClass(
@@ -9035,7 +9055,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && rightNV.TypeAndValue.IsFunctionPointer
                                     && !rightNV.TypeAndValue.Pointer)
                                     srcClosureFnPtr = rightNV.TypeAndValue;
-                                srcCxxPointeeConst = rightNV.TypeAndValue.IsCxxPointeeConst
+                                srcCxxPointeeConst = rightNV.TypeAndValue.PointeeConstBit()
                                     && rightNV.TypeAndValue.Pointer;
                                 srcCxxNullptrT = rightNV.TypeAndValue.IsCxxNullptrT;
                                 srcConstArraySize = rightNV.TypeAndValue.ConstArraySize;
@@ -9971,7 +9991,6 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         typeAndValue.Pointer = srcInferredPointer;
                         typeAndValue.ElemPointer = srcInferredElemPointer;
                         typeAndValue.IsInterface = compiler->IsInterfaceType(srcInferredTypeName);
-                        typeAndValue.IsCxxPointeeConst = srcCxxPointeeConst && srcInferredPointer;
                         typeAndValue.IsCxxNullptrT = srcCxxNullptrT;
                         // C++ deduction: the initializer's top-level const is dropped, pointee const is kept.
                         const bool declaredConst = typeAndValue.IsConstObject();
@@ -9981,7 +10000,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     }
                 }
                 if (typeAndValue.Pointer && srcCxxPointeeConst)
-                    typeAndValue.IsCxxPointeeConst = true;
+                    typeAndValue.SetPointeeConstBit(true);
                 // `auto v = nullptr;` declares a std::nullptr_t (C++ deduction), not a void*.
                 if (typeAndValue.TypeName == "auto" && srcInferredTypeName.empty()
                     && !srcInferredPointer && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(right))
@@ -10205,7 +10224,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         srcIsUnsigned);
                     if (DeclSpecHasConst(declSpec) && !typeAndValue.Pointer
                         && compiler->IsCxxRecord(typeAndValue.TypeName))
-                        compiler->MarkCxxConstFieldAccess(global);
+                        compiler->MarkCxxConstGlobal(global);
                     // `S[N] g = default;` / `= {}` of a CFlat struct array that is still zero here: the
                     // element's constructor may not be emitted yet (an unmaterialized generic), so the
                     // fold is retried at module end. Fold-only: a failing retry keeps the zero constant.
@@ -10458,12 +10477,6 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         }
                         compiler->UnregisterOwnedStructTemp(srcCxxRetTemp);
                     }
-                    // `auto` resolves to the C++ record only after its initializer is parsed.
-                    // Preserve an explicit const on the local slot (after return elision picks it) for receiver lookup.
-                    // C++ records only: CFlat const itself stays unenforced (scalars, CFlat structs).
-                    if (DeclSpecHasConst(declSpec) && !typeAndValue.Pointer
-                        && compiler->IsCxxRecord(typeAndValue.TypeName))
-                        compiler->MarkCxxConstFieldAccess(alloc);
                     allocList.push_back(std::pair(name, llvm::dyn_cast<llvm::AllocaInst>(alloc)));
                     if (!typeAndValue.Pointer && compiler->IsCoreUniqueType(typeAndValue.TypeName))
                         compiler->GetOrCreateStackVariable(name).IsOwning = true;

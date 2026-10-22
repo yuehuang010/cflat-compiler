@@ -22,8 +22,8 @@ extern int main()
     if (ba.what() == nullptr || bl.what() == nullptr) { printf("FAIL bad_alloc what\n"); failures |= 8; }
     std.initializer_list<int> il = std.initializer_list<int>({3, 9, 4});
     int sum = 0;
-    for (int* it = il.begin(); it != il.end(); it++) sum += *it;
-    int* first = std.begin(il);
+    for ((const int)* it = il.begin(); it != il.end(); it++) sum += *it;
+    (const int)* first = std.begin(il);
     if (il.size() != 3 || sum != 16 || *first != 3 || std.end(il) - std.begin(il) != 3 || std.max(il) != 9 || std.min(il) != 3)
     { printf("FAIL initializer_list\n"); failures |= 16; }
     if (failures == 0) printf("PASS std_full_11_new_initializer_list\n");

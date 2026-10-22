@@ -229,6 +229,7 @@
 
 import cpp "library/cpp_interop_basic.h";
 import cpp "library/cpp_t322_constretcv.hpp";
+import cpp "library/cpp_t337_constretcv_umbrella.hpp";
 import cpp "library/cpp_t217_mutable.hpp";
 import "library/cpp_t103_nullctor_c.h";
 import cpp "library/cpp_t103_nullctor.hpp";
@@ -305,6 +306,8 @@ import cpp "library/cpp_interop_poly.cpp";
 // duplicate-definition (ODR merge) check.
 import cpp "library/cpp_interop_inline.h";
 import cpp "library/cpp_interop_inline_again.h";
+import cpp "library/cpp_interop_vdtor_unused_accept.h";
+import cpp "library/cpp_vdtor_opdelete_template.h";
 import cpp "library/cpp_inline_static_a.hpp";
 import cpp "library/cpp_inline_static_b.hpp";
 import cpp "library/cpp_derefcopy.hpp";
@@ -1350,10 +1353,10 @@ struct RgFields { cpprefgate.B* r = default; };
 struct RgFieldDefault { cpprefgate.B* r = cpprefgate.bref(); };
 
 cppi.RefCell* RrCell() { return cppi.ref_cell(); }
-cppi.RefCell* RrCellConst() { return cppi.ref_cell_const(); }
+(const cppi.RefCell)* RrCellConst() { return cppi.ref_cell_const(); }
 struct RrHolder { cppi.RefBox box; };
 cppi.RefCell* RrHeld(RrHolder* h) { return h.box.get(); }
-cppi.RefCell* RrHeldConst(RrHolder* h) { return h.box.cget(); }
+(const cppi.RefCell)* RrHeldConst(RrHolder* h) { return h.box.cget(); }
 cpppoly.Shape* RrShapeFromRef() { return cpppoly.circle_ref(); }
 cpppoly.Right* RrRightFromRef() { return cpppoly.both_ref(); }
 cpppoly.Right* RrRightFromPtr(cpppoly.Both* b) { return b; }
@@ -1565,7 +1568,7 @@ T mtConstIdent<T>(T value) { return value; }
 int crCallGet(cppi.CrPair* p) { return p->get(); }
 struct CrConstPointerHolder
 {
-    const cppi.CrReceiverValue* pc = default;
+    (const cppi.CrReceiverValue)* pc = default;
     cppi.CrReceiverValue* pm = default;
 };
 int crConstPointerParam(const cppi.CrReceiverValue* p) { return p->get(); }
@@ -2454,11 +2457,11 @@ int T256AliasThrowInit(int t) { alias int a = T256Id(T256Mk()->v, cppunw.thrower
 using T257NAlias = cppnewtriv.NA;
 move T* T257NewCopy<T>(T* source) { return new T(*source); }
 // T324: a const pointee stored in a global or field resolves to the const twin; a mutable one does not.
-const cppi.CrPair* t324ConstGlobal;
+(const cppi.CrPair)* t324ConstGlobal;
 cppi.CrPair* t324MutGlobal;
 struct T324ConstHolder
 {
-    const cppi.CrPair* p;
+    (const cppi.CrPair)* p;
     int set() { p = &cppi.crConst; return 0; }
     int run() { return this->p->get(); }
 };
@@ -2482,6 +2485,78 @@ int t335SetThroughConstParam(const T217KM* p)
 cpi_t42.T339Box T339ReturnCastBox() {
     return (cpi_t42.T339Box)cpi_t42.t339_make_box();
 }
+
+int t340ImmovableCalls = 0;
+int t340ThrowCalls = 0;
+int t340MixedCalls = 0;
+int t340TrivialDtorCalls = 0;
+int t340NonConstCopyCalls = 0;
+int t340PrivateCopyCalls = 0;
+[cpp] struct T340ImmovableOverride : cppt331.ImmovableBase
+{
+    override int use(cppt331.Immovable value)
+    {
+        t340ImmovableCalls = t340ImmovableCalls + 1;
+        return value.value;
+    }
+};
+[cpp] struct T340ThrowOverride : cppt331.ImmovableBase
+{
+    override int use(cppt331.Immovable value)
+    {
+        t340ThrowCalls = t340ThrowCalls + 1;
+        return cppt331.throw_if_positive(value.value);
+    }
+};
+[cpp] struct T340MixedOverride : cppt331.MixedBase
+{
+    override int use(cppt331.Immovable immovable, cppt331.Counted counted)
+    {
+        t340MixedCalls = t340MixedCalls + 1;
+        return immovable.value + counted.value;
+    }
+};
+
+[cpp] struct T340TrivialDtorOverride : cppt331.TrivialDtorBase
+{
+    override int use(cppt331.TrivialDtorImmovable value)
+    {
+        t340TrivialDtorCalls = t340TrivialDtorCalls + 1;
+        return value.value;
+    }
+};
+
+[cpp] struct T340NonConstCopyOverride : cppt331.NonConstCopyBase
+{
+    override int use(cppt331.NonConstCopy value)
+    {
+        t340NonConstCopyCalls = t340NonConstCopyCalls + 1;
+        return value.value;
+    }
+};
+
+[cpp] struct T340PrivateCopyOverride : cppt331.PrivateCopyBase
+{
+    override int use(cppt331.PrivateCopy value)
+    {
+        t340PrivateCopyCalls = t340PrivateCopyCalls + 1;
+        return value.value;
+    }
+};
+
+// T346 r3: native alias results at depth 0 (`alias (const int)`, `alias int`) bind function<> and Lambda<>.
+const int c05bNativeObj = 7;
+int c05bNativeInt = 7;
+alias (const int) c05bNativeConst() { return c05bNativeObj; }
+alias int c05bNativeIntRef() { return c05bNativeInt; }
+// T346 r5: a named const pointer alias result stays distinct from int* in overload ranking (clang: 11).
+using C05bCP = (const int)*;
+C05bCP c05bCpPtr = &c05bNativeInt;
+alias C05bCP c05bCpGet() { return c05bCpPtr; }
+int c05bCpPick(function<alias C05bCP()> f) { return 11; }
+int c05bCpPick(function<alias int*()> f) { return 22; }
+int c05bCpPickL(Lambda<alias C05bCP()> f) { return 11; }
+int c05bCpPickL(Lambda<alias int*()> f) { return 22; }
 
 extern int main()
 {
@@ -6298,6 +6373,27 @@ extern int main()
     }
     if (cppi.dtor_count() != 1)                  return 410;
 
+    // T333 accept-set, frozen before the unused-virtual-dtor delete lookup.
+    if (cppvdaccept.RunValid() != 701
+        || cppvdaccept.public_delete_tag != 7 || cppvdaccept.public_dtor_count != 1) return 33301;
+    if (cppvdaccept.OwnPrivateDelete.Run() != 501
+        || cppvdaccept.private_delete_tag != 5 || cppvdaccept.private_dtor_count != 1) return 33302;
+    if (cppvdaccept.RunTemplateBoundary() != 29) return 33303;
+
+    // T344: instantiate a usable template specialization and verify its selected delete.
+    {
+        cppvdtemplate.Usable<int> templateDelete;
+        if (templateDelete.value() != 37) return 33304;
+    }
+    if (cppvdtemplate.RunUsable() != 3707) return 33305;
+
+    // T344 r2: a null pointer must not demand this type's destructor or vtable.
+    {
+        cppvdtemplate.Deleted<int>* deletedPointerOnly = nullptr;
+        int pointerValue = deletedPointerOnly == nullptr ? 29 : 31;
+        if (pointerValue != 29) return 33306;
+    }
+
     // ---- C++ inheritance and virtual dispatch ---------------------------------------------------
     // Every offset and vtable slot below is clang's own answer, cross-checked against
     // `clang++ -S -emit-llvm -O0` for the same calls: Shape::area is vtable slot 2, the deleting
@@ -9167,17 +9263,17 @@ extern int main()
     std.string fopA = std.string("hello");
     std.string fopB = std.string(" world");
     std.string fopCat = fopA + fopB;
-    char* fopCatP = fopCat.c_str();
+    (const char)* fopCatP = fopCat.c_str();
     if ((int)fopCat.size() != 11)                                              return 2100;
     if (fopCatP[0] != 'h' || fopCatP[5] != ' ' || fopCatP[10] != 'd')          return 2101;
     // A string LITERAL on either side reaches the `const CharT*` overloads of the same template.
     std.string fopRight = fopA + " there";
-    char* fopRightP = fopRight.c_str();
+    (const char)* fopRightP = fopRight.c_str();
     if ((int)fopRight.size() != 11 || fopRightP[5] != ' ' || fopRightP[10] != 'e') return 2102;
     std.string fopRaw = fopA + fopB.c_str();
     if ((int)fopRaw.size() != 11 || fopRaw.c_str()[10] != 'd')               return 10134;
     std.string fopLeft = "say " + fopA;
-    char* fopLeftP = fopLeft.c_str();
+    (const char)* fopLeftP = fopLeft.c_str();
     if ((int)fopLeft.size() != 9 || fopLeftP[0] != 's' || fopLeftP[4] != 'h')  return 2103;
     // Equality, both operand orders and both answers.
     std.string fopSame = std.string("hello");
@@ -14406,8 +14502,8 @@ extern int main()
     if (mtcCopyL != 55 || mtcAutoL != 7 || mtcH.lv != 5) return 7965;
     mtcH.cpr() = mtcH.cpv();
     auto mtcAutoP = mtcH.cpr();
-    mtcAutoP->v = 18;
-    if (mtcH.s.v != 18) return 7966;
+    mtcH.s.v = 18;
+    if (mtcAutoP->v != 18) return 7966;
     cppi.MtConstObj mtcNine = cppi.MtConstObj();
     mtcNine.v = 99;
     mtcH.sr() = mtcNine;
@@ -14433,6 +14529,55 @@ extern int main()
     if (cppi322.make2().f() != 1) return 32204;
     if (cppi322.ptr()->f() != 2) return 32205;
     if (cppi322.make().onlyConst() != 3) return 32206;
+
+    // T337: the const prvalue's rvalue-reference binding matches clang (12, not 11).
+    if (cppi322.const_arg_pick(cppi322.make()) != 12) return 32207;
+    if (cppi322.const_arg_pick(cppi322.holder.get()) != 12) return 32208;
+    if (cppi322.const_arg_pick(cppi322.make_template<cppi322.R>()) != 12) return 32209;
+    if (cppi322.const_arg_pick((cppi322.make())) != 12) return 32210;
+    if (cppi322.const_arg_pick((cppi322.holder.get())) != 12) return 32212;
+    if (cppi322.const_arg_pick((cppi322.make_template<cppi322.R>())) != 12) return 32213;
+    // T337 accept-set: these already-correct bindings must retain their C++ results.
+    if (cppi322.const_arg_constref(cppi322.make()) != 14
+        || cppi322.const_arg_byvalue(cppi322.make()) != 15
+        || cppi322.const_arg_lref_pick(cppi322.make()) != 17
+        || cppi322.mutable_arg_pick(cppi322.make2()) != 18) return 32211;
+    if (cppi322.const_base_arg_pick(cppi322.make_derived()) != 22) return 32214;
+
+    // T337 round 2: forwarding wrappers retain source constness through C++ template deduction.
+    if (cppi322.forwarding_const(cppi322.make()) != 18) return 33701;
+    if (cppi322.const_arg_pick(std.move(cppi322.make())) != 12) return 33702;
+    if (cppi322.const_arg_pick(std.forward<cppi322.CR>(cppi322.make())) != 12) return 33703;
+    std.vector<cppi322.EmplaceR> t337EmplaceItems;
+    t337EmplaceItems.emplace_back(cppi322.make_emplace());
+    if (t337EmplaceItems[0].value != 43) return 33704;
+    // The imported target's reference cv spelling must survive its one-header umbrella.
+    if (cppi337.const_arg_pick(cppi337.make()) != 12) return 33705;
+    // T337 r3: a member `const R&&` sibling binds beside `R&&`; operator operands keep their cv.
+    if (cppi322.caller.choose(cppi322.make()) != 42) return 33706;
+    if (cppi322.caller.choose(cppi322.make2()) != 41) return 33707;
+    if (cppi322.caller.choose(cppi322.const_xvalue()) != 42) return 33708;
+    if (cppi322.caller.bind(cppi322.ref()) != 44) return 33709;
+    if (cppi322.opTag + cppi322.make() != 52) return 33710;
+    if (cppi322.opTag + cppi322.make2() != 51) return 33711;
+    if (cppi322.opTag + cppi322.const_xvalue() != 52) return 33712;
+    if (cppi322.make() + cppi322.opLeft != 55 || cppi322.make2() + cppi322.opLeft != 54) return 33713;
+    if (cppi322.opMember + cppi322.make() != 57 || cppi322.opMember + cppi322.make2() != 56) return 33714;
+    // T337 r4: = and += pick the const R&& sibling for a const prvalue, R&& for a mutable one.
+    cppi322.AssignC t337Assign;
+    t337Assign += cppi322.make();
+    if (t337Assign.n != 82) return 33715;
+    t337Assign += cppi322.make2();
+    if (t337Assign.n != 81) return 33716;
+    t337Assign = cppi322.make();
+    if (t337Assign.n != 84) return 33717;
+    t337Assign = cppi322.make2();
+    if (t337Assign.n != 83) return 33718;
+    cppi322.AssignTag t337AssignTag;
+    t337AssignTag += cppi322.make();
+    if (t337AssignTag.n != 86) return 33719;
+    t337AssignTag += cppi322.make2();
+    if (t337AssignTag.n != 85) return 33720;
 
     if (cppi.crConst.add(1) != 4 || cppi.cr_const_ref().add(2) != 5) return 7970;
     if (cppi.crConst + 1 != 104 || cppi.cr_const_ref() + 2 != 105 || cppi.crConst.conly() != 1003)
@@ -14490,9 +14635,9 @@ extern int main()
     const cppi.CrReceiverValue* w13ConstPointer = &crTemplateLocal;
     if (cppi.cr_take_mut(w13MutablePointer) != 7
         || cppi.cr_take_const(w13ConstPointer) != 3) return 8004;
-    // CFlat const on a scalar is not C++ const: the template deduces int*, not const int*.
+    // CFlat const on a scalar is C++ const: the template deduces const int*, and its store is refused.
     const int crPlainConst = 3;
-    if (cppi.cr_template_store(&crPlainConst) != 5) return 8001;
+    expect_error("no instantiation of C++ function template 'cppi.cr_template_store'") { int crStored = cppi.cr_template_store(&crPlainConst); }
     // Taking an address from a const slot and a const array element carries pointee const.
     const auto crConstSlot = cppi.crFieldMutable.mu;
     auto crConstSlotAddress = &crConstSlot;
@@ -14523,7 +14668,7 @@ extern int main()
         return 7993;
     const cppi.Tm tmConstObject = default;
     if (tmConstObject.ts(2) != 43 || cppi.Tm.ts(2) != 43) return 7994;
-    auto crAddress = &cppi.crMutable;
+    (const cppi.CrPair)* crAddress = &cppi.crMutable;
     crAddress = &cppi.cr_const_ref();
     if (crAddress->get() != 3) return 7979;
     cppi.crMutable.v = 3;
@@ -14533,9 +14678,9 @@ extern int main()
     if (cppi.cr_vb_ref().get() != 63 || cppi.cr_vb_ptr()->get() != 63 || cppi.cr_abs_ref().get() != 73
         || cppi.crVd.v != 3 || cppi.crImpl.v != 3) return 7977;
     cppi.crMutable.v = 3;
-    cppi.CrPair* crLocalConstPointee = cppi.cr_const_ptr();
+    (const cppi.CrPair)* crLocalConstPointee = cppi.cr_const_ptr();
     auto crCopiedConstPointee = crLocalConstPointee;
-    cppi.CrPair* crAssignedConstPointee = &cppi.crMutable;
+    (const cppi.CrPair)* crAssignedConstPointee = &cppi.crMutable;
     crAssignedConstPointee = crLocalConstPointee;
     if (crLocalConstPointee->get() != 3 || crCopiedConstPointee->get() != 3
         || crAssignedConstPointee->get() != 3 || cppi.crMutable.v != 3) return 7978;
@@ -14548,7 +14693,7 @@ extern int main()
     if (crBranchConstPointee->get() != 3 || cppi.crMutable.v != 3) return 7981;
     // T225: a const pointee assigned on a loop back-edge makes the loop receiver maybe-const.
     cppi.crMutable.v = 3;
-    cppi.CrPair* t225While = &cppi.crMutable;
+    (const cppi.CrPair)* t225While = &cppi.crMutable;
     int t225WhileIndex = 0;
     while (t225WhileIndex < 2)
     {
@@ -14557,12 +14702,12 @@ extern int main()
         t225WhileIndex = t225WhileIndex + 1;
     }
     cppi.crMutable.v = 3;
-    cppi.CrPair* t225For = &cppi.crMutable;
+    (const cppi.CrPair)* t225For = &cppi.crMutable;
     for (int t225ForIndex = 0; t225ForIndex < 2;
          t225For = &cppi.crConst, t225ForIndex = t225ForIndex + 1)
         if (t225For->get() != 3) return 8011;
     cppi.crMutable.v = 3;
-    cppi.CrPair* t225Do = &cppi.crMutable;
+    (const cppi.CrPair)* t225Do = &cppi.crMutable;
     int t225DoIndex = 0;
     do
     {
@@ -14572,7 +14717,7 @@ extern int main()
     }
     while (t225DoIndex < 2);
     cppi.crMutable.v = 3;
-    cppi.CrPair* t225Return = &cppi.crMutable;
+    (const cppi.CrPair)* t225Return = &cppi.crMutable;
     int t225ReturnIndex = 0;
     while (t225ReturnIndex < 2)
     {
@@ -14581,7 +14726,7 @@ extern int main()
         t225ReturnIndex = t225ReturnIndex + 1;
     }
     cppi.crMutable.v = 3;
-    cppi.CrPair* t225Ternary = &cppi.crMutable;
+    (const cppi.CrPair)* t225Ternary = &cppi.crMutable;
     int t225TernaryIndex = 0;
     while (t225TernaryIndex < 2)
     {
@@ -14592,7 +14737,7 @@ extern int main()
     }
     cppi.crMutable.v = 3;
     const cppi.CrPair t225ConstLocal = default;
-    cppi.CrPair* t225LocalAddress = &cppi.crMutable;
+    (const cppi.CrPair)* t225LocalAddress = &cppi.crMutable;
     int t225LocalAddressIndex = 0;
     while (t225LocalAddressIndex < 2)
     {
@@ -14602,7 +14747,7 @@ extern int main()
     }
     cppi.crMutable.v = 3;
     const cppi.CrPair* t225ConstSource = &cppi.crConst;
-    cppi.CrPair* t225ConstAlias = &cppi.crMutable;
+    (const cppi.CrPair)* t225ConstAlias = &cppi.crMutable;
     int t225ConstAliasIndex = 0;
     while (t225ConstAliasIndex < 2)
     {
@@ -14611,8 +14756,8 @@ extern int main()
         t225ConstAliasIndex = t225ConstAliasIndex + 1;
     }
     // T225 review: an alias made const later in the same loop body (q, then p = q) is const too.
-    cppi.CrPair* t225LateAlias = &cppi.crMutable;
-    cppi.CrPair* t225LateSource = &cppi.crMutable;
+    (const cppi.CrPair)* t225LateAlias = &cppi.crMutable;
+    (const cppi.CrPair)* t225LateSource = &cppi.crMutable;
     int t225LateIndex = 0;
     while (t225LateIndex < 2)
     {
@@ -14628,7 +14773,7 @@ extern int main()
     while (t225ShadowIndex < 1)
     {
         {
-            cppi.CrPair* t225Shadow = &cppi.crMutable;
+            (const cppi.CrPair)* t225Shadow = &cppi.crMutable;
             t225Shadow = &cppi.crConst;
             if (t225Shadow->get() != 3) return 8015;
         }
@@ -14636,7 +14781,7 @@ extern int main()
         t225ShadowIndex = t225ShadowIndex + 1;
     }
     cppi.crMutable.v = 3;
-    if (crCallGet(crCopiedConstPointee) != 13 || cppi.crMutable.v != 13) return 7979;
+    if (crCallGet((cppi.CrPair*)crCopiedConstPointee) != 13 || cppi.crMutable.v != 13) return 7979;
     // T324 legs: clang gives 3 (const twin), 3 (field const twin), 13 (mutable twin, writes crMutable).
     cppi.crMutable.v = 3;
     t324ConstGlobal = &cppi.crConst;
@@ -15827,6 +15972,100 @@ extern int main()
     expect_error("is declared explicit, so it is not offered as an implicit conversion") {
         t317rawarr.XE t317x = default;
         t317x = new int[3];
+    }
+    // c05a: a native const pointee (cast or declared slot) picks the `const char*` overload (clang 6 6 6 5).
+    {
+        char[2] c05aBuf = { 'a', 0 };
+        char* c05aP = &c05aBuf[0];
+        const char* c05aCs = c05aP;
+        if (cpppa.rk_cc((const char*)c05aP) != 6)                                return 99110;
+        if (cpppa.rk_cc(c05aCs) != 6)                                            return 99111;
+        if (cpppa.rk_cc(((const char)*)c05aP) != 6)                              return 99112;
+        if (cpppa.rk_cc(c05aP) != 5)                                             return 99113;
+        cpppa.RkNull c05aNull = default;
+        if ((c05aNull == (const int*)nullptr) != 42)                             return 99114;
+        if ((c05aNull == (int*)nullptr) != 41)                                   return 99115;
+    }
+    // c05b: a (const R)* receiver picks the const member and the const overload; a const class
+    // pointer cast (object or typed null) keeps its pointee const. clang: 2 2, 2 2, 2 1, 8 7.
+    {
+        (const cpppa.C5bR)* c05bP = cpppa.c5b_mr();
+        if (c05bP->which() != 2 || cpppa.c5b_pick(c05bP) != 2)                   return 99116;
+        if (cpppa.c5b_pick((const cpppa.C5bR*)cpppa.c5b_mr()) != 2)              return 99117;
+        if (cpppa.c5b_pick(((const cpppa.C5bR)*)cpppa.c5b_mr()) != 2)            return 99118;
+        if (cpppa.c5b_pick((const cpppa.C5bR*)nullptr) != 2)                     return 99119;
+        if (cpppa.c5b_pick((cpppa.C5bR*)nullptr) != 1)                           return 99120;
+        cpppa.C5bQ c05bQ = default;
+        if ((c05bQ == (const cpppa.C5bR*)nullptr) != 8)                          return 99121;
+        if ((c05bQ == (cpppa.C5bR*)nullptr) != 7)                                return 99122;
+        // A `mutable const T*` member of a const object is reseatable (clang 10).
+        cpppa.c5bPtr.p = &cpppa.c5bOther2;
+        if (cpppa.c5bPtr.p->x != 10)                                             return 99123;
+        // The address of a const C++ global and its decayed array bind a (const R)* (clang 2 2).
+        (const cpppa.C5bR)* c05bGlobal = &cpppa.c5bConstR;
+        (const cpppa.C5bR)* c05bDecayed = cpppa.c5bConstRs;
+        if (c05bGlobal->which() != 2 || cpppa.c5b_pick(&c05bDecayed[1]) != 2)    return 99124;
+        // C++ const is shallow: a `C5bObj* p` member of a const object is a writable pointee
+        // (local, call and copied-pointer forms; clang accepts all three).
+        (const cpppa.C5bMH)* c05bMh = cpppa.c5b_mh();
+        c05bMh->p->v = 8;
+        cpppa.c5b_mh()->p->v = cpppa.c5b_mh()->p->v + 1;
+        cpppa.C5bObj* c05bMp = c05bMh->p;
+        c05bMp->v = c05bMp->v + 1;
+        if (cpppa.c5bMObj.v != 10)                                               return 99125;
+        // A const C++ class local is constructed in place (its ctor wrapper writes the slot).
+        const std.optional<int> c05bOpt = std.optional<int>(7);
+        if (!c05bOpt.has_value() || c05bOpt.value() != 7)                        return 99126;
+        // `R* const*` protects only the middle pointer: the final R stays writable after a local
+        // copy and through a call result (clang: v == 13, pick(R*) == 1).
+        const cpppa.C5bPcp c05bPcp = default;
+        auto c05bQ2 = c05bPcp.p;
+        (*c05bQ2)->v = 12;
+        (*cpppa.c5b_pcp())->v = (*cpppa.c5b_pcp())->v + 1;
+        if (cpppa.c5bMObj.v != 13 || cpppa.c5b_pk(*c05bQ2) != 1
+            || cpppa.c5b_pk(*cpppa.c5b_pcp()) != 1)                              return 99127;
+        // A mutable static member pointee is writable, and static const-pointee pointer p is reseatable.
+        cpppa.C5bR.mutableP->v = 9;
+        cpppa.C5bR.p = &cpppa.C5bR.secondObj;
+        if (cpppa.C5bR.mutableObj.v != 9 || cpppa.C5bR.p->v != 7)         return 99128;
+        // An indirect C++ mutable reference result remains writable.
+        auto c05bMutableRefFn = cpppa.c5b_mutref_fn();
+        c05bMutableRefFn().v = 8;
+        if (c05bMutableRefFn().v != 8)                                           return 99129;
+        // An indirect C++ const reference result selects the const overload (clang: 2).
+        auto c05bConstRefFn = cpppa.c5b_constref_fn();
+        if (c05bConstRefFn().which() != 2)                                        return 99130;
+        // Lambda<> and function<> calls keep the nested C++ function type's const reference.
+        Lambda<int()> c05bRefLambda = () => { auto f = cpppa.c5b_constref_fn(); return f().which(); };
+        function<int()> c05bRefFunction = () => { auto f = cpppa.c5b_constref_fn(); return f().which(); };
+        if (c05bRefLambda() != 2 || c05bRefFunction() != 2)                      return 99131;
+        // Mutable native construct_at initializes the requested slot.
+        cpppa.C5bR c05bPlacement = default;
+        construct_at(&c05bPlacement, cpppa.C5bR());
+        if (c05bPlacement.v != 1)                                                return 99132;
+        // An indirect const pointer result selects the const overload (clang: 2).
+        auto c05bConstPtrFn = cpppa.c5b_constptr_fn();
+        if (cpppa.c5b_pick(c05bConstPtrFn()) != 2)                               return 99133;
+        // Explicit alias signatures keep const on reference results for function and Lambda.
+        function<alias (const cpppa.C5bR)()> c05bExplicitRefFn = cpppa.c5b_constref;
+        Lambda<alias (const cpppa.C5bR)()> c05bExplicitRefLambda = cpppa.c5b_constref;
+        function<(const cpppa.C5bR)*()> c05bExplicitPtrFn = cpppa.c5b_constptr;
+        if (c05bExplicitRefFn().which() != 2 || c05bExplicitRefLambda().which() != 2
+            || c05bExplicitPtrFn()->which() != 2)                              return 99134;
+        // Native const alias result binds function<> and Lambda<> with its value (clang: 7).
+        function<alias (const int)()> c05bNativeConstFn = c05bNativeConst;
+        Lambda<alias (const int)()> c05bNativeConstLambda = c05bNativeConst;
+        if (c05bNativeConstFn() != 7 || c05bNativeConstLambda() != 7)            return 99135;
+        // Adding const to a native alias result binds; dropping it keeps master's acceptance (clang: 7 7).
+        function<alias (const int)()> c05bNativeIntFn = c05bNativeIntRef;
+        function<alias int()> c05bNativeDropFn = c05bNativeConst;
+        if (c05bNativeIntFn() != 7 || c05bNativeDropFn() != 7)                   return 99136;
+        // A C++ mutable reference result binds a const alias slot (clang: 2).
+        function<alias (const cpppa.C5bR)()> c05bMutToConstFn = cpppa.c5b_mutref;
+        if (c05bMutToConstFn().which() != 2)                                      return 99137;
+        function<alias (const int)*()> c05bCpFn = c05bCpGet;
+        Lambda<alias (const int)*()> c05bCpLambda = c05bCpGet;
+        if (c05bCpPick(c05bCpFn) != 11 || c05bCpPickL(c05bCpLambda) != 11)       return 99138;
     }
     return 0;
 }
@@ -17870,6 +18109,71 @@ int LoweredUserDtorAssignLegs(int argc)
         if (thrown != -13 || t331OverrideCalls != 1 || cppt331.Counted.ctors != 1
             || cppt331.Counted.copies != 0 || cppt331.Counted.moves != 1
             || cppt331.Counted.dtors != 2 || cppt331.Counted.live != 0) return 33102;
+    }
+    // T340: an immovable by-value C++ parameter reaches the CFlat body without construction.
+    {
+        T340ImmovableOverride object = default;
+        cppt331.Immovable.reset();
+        cppt331.ImmovableBase.reset();
+        t340ImmovableCalls = 0;
+        int value = cppt331.call_immovable(&object, 7);
+        if (value != 7 || t340ImmovableCalls != 1 || cppt331.ImmovableBase.intCalls != 0
+            || cppt331.Immovable.ctors != 1 || cppt331.Immovable.dtors != 1
+            || cppt331.Immovable.live != 0) return 34001;
+    }
+    // T340: unwinding from the body destroys the caller's immovable parameter once.
+    {
+        T340ThrowOverride object = default;
+        cppt331.Immovable.reset();
+        cppt331.ImmovableBase.reset();
+        t340ThrowCalls = 0;
+        int value = cppt331.catch_immovable(&object, 13);
+        if (value != -13 || t340ThrowCalls != 1 || cppt331.ImmovableBase.intCalls != 0
+            || cppt331.Immovable.ctors != 1 || cppt331.Immovable.dtors != 1
+            || cppt331.Immovable.live != 0) return 34002;
+    }
+    // T340: immovable and movable by-value parameters keep independent construction paths.
+    {
+        T340MixedOverride object = default;
+        cppt331.Immovable.reset();
+        cppt331.MixedBase.reset();
+        cppt331.Counted.reset();
+        t340MixedCalls = 0;
+        int value = cppt331.call_mixed(&object, 7, 5);
+        if (value != 12 || t340MixedCalls != 1 || cppt331.MixedBase.intCalls != 0
+            || cppt331.Immovable.ctors != 1 || cppt331.Immovable.dtors != 1
+            || cppt331.Immovable.live != 0 || cppt331.Counted.ctors != 1
+            || cppt331.Counted.copies != 0 || cppt331.Counted.moves != 1
+            || cppt331.Counted.dtors != 2 || cppt331.Counted.live != 0) return 34003;
+    }
+    // T340: a trivial-destructor immovable parameter also stays borrowed by the body.
+    {
+        T340TrivialDtorOverride object = default;
+        cppt331.TrivialDtorImmovable.reset();
+        cppt331.TrivialDtorBase.reset();
+        t340TrivialDtorCalls = 0;
+        int value = cppt331.call_trivial_dtor(&object, 7);
+        if (value != 7 || t340TrivialDtorCalls != 1
+            || cppt331.TrivialDtorBase.intCalls != 0
+            || cppt331.TrivialDtorImmovable.ctors != 1) return 34004;
+    }
+    // T340: a public non-const copy constructor is not a forwarding transfer.
+    {
+        T340NonConstCopyOverride object = default;
+        cppt331.NonConstCopyBase.reset();
+        t340NonConstCopyCalls = 0;
+        int value = cppt331.call_nonconst_copy(&object, 7);
+        if (value != 7 || t340NonConstCopyCalls != 1
+            || cppt331.NonConstCopyBase.intCalls != 0) return 34005;
+    }
+    // T340: private defaulted copy and move constructors stay inaccessible to the helper.
+    {
+        T340PrivateCopyOverride object = default;
+        cppt331.PrivateCopyBase.reset();
+        t340PrivateCopyCalls = 0;
+        int value = cppt331.call_private_copy(&object, 7);
+        if (value != 7 || t340PrivateCopyCalls != 1
+            || cppt331.PrivateCopyBase.intCalls != 0) return 34006;
     }
     return 0;
 }

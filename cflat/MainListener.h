@@ -2380,12 +2380,16 @@ static int ReconcilePointerDepth(bool pointer, int stars)
     return stars > 0 ? stars : 1;
 }
 
-// The pointee half of a component's ConstMask at `depth` levels: a function type ignores the
-// component's own top-level const, as C does.
-static int PointeeConstOfComponent(int mask, int depth)
+// Keep pointee const at `depth` levels. An alias result at depth 0 also keeps its referent's const
+// (the value itself); a pointer alias's referent is its pointee, already kept. By-value results drop
+// their top-level const.
+static int PointeeConstOfComponent(int mask, int depth, bool preserveAliasReferentConst = false)
 {
-    if (mask <= 0 || depth <= 0) return 0;
-    return mask & ((1 << std::min(depth, 7)) - 1);
+    if (mask <= 0) return 0;
+    if (preserveAliasReferentConst && depth <= 0) return mask & 1;
+    const int constLevels = std::min(depth, 7);
+    if (constLevels <= 0) return 0;
+    return mask & ((1 << constLevels) - 1);
 }
 
 // Each component folds its pointer DEPTH in via MangleTypeArg ("int*" -> ".p$int", "int**" ->
@@ -5284,10 +5288,11 @@ public:
     // match MangledGenericName; a nested closure encodes recursively. Names only (no queue/register).
     std::string ResolveSigComponentScanner(CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
                                            CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
-    // A component spelled `(const T)` / `const(T)`: folds T's own stars into `stars` and returns its
-    // pointee const (bottom-relative, top level dropped) in `constMask`. Twin of the main pass copy.
+    // Resolve a function signature component; alias returns also keep const on the referent.
+    // This is the scanner twin of the main pass copy.
     std::string ResolveSigComponentConstScanner(CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
-        int& stars, int& constMask, CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
+        int& stars, int& constMask, CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr,
+        bool preserveAliasReferentConst = false, bool returnComponent = false);
 
     /*
      * Scanner counterpart of MainListener::SigComponentResolvedKey. Both are one line onto the
@@ -6132,10 +6137,11 @@ private:
     // byte-identical to the pre-existing raw-getText() behavior (no alias resolution added).
     std::string ResolveSigComponentCodegen(CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
                                            CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
-    // A component spelled `(const T)` / `const(T)`: folds T's own stars into `stars` and returns its
-    // pointee const (bottom-relative, top level dropped) in `constMask`. Twin of the scanner copy.
+    // Resolve a function signature component; alias returns also keep const on the referent.
+    // This is the main pass twin of the scanner copy.
     std::string ResolveSigComponentConstCodegen(CFlatParser::TypeSpecifierContext* ts, bool& outPointer,
-        int& stars, int& constMask, CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
+        int& stars, int& constMask, CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr,
+        bool preserveAliasReferentConst = false, bool returnComponent = false);
 
     /*
      * The declaring-scope-resolved key for a signature component, recorded ALONGSIDE the raw
@@ -8487,7 +8493,10 @@ public:
         bool rhsCxxNullptrT = false,
         // lhsStorage is a materialized copy of a prvalue left operand, not the caller's lvalue.
         bool lhsMaterializedPrvalue = false,
-        bool lhsCxxPointeeConst = false);
+        bool lhsCxxPointeeConst = false,
+        // CxxOperandObjectCv of each operand: a reference parameter is judged against the
+        // operand's own cv as a call argument is. Every C++-reachable caller passes both.
+        int lhsObjectCv = 0, int rhsObjectCv = 0);
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);
@@ -9590,11 +9599,19 @@ public:
     void CheckGuardedWrite(antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& target);
     // The write target is a C-declared global, or a pointer loaded from one (wording only).
     bool IsReachedFromCGlobal(llvm::Value* destination);
-    // Refuses a store whose target is reached through a C++ const reference result or, for
-    // `++` / `--`, is a const C++ namespace object. constElement: the target is an element of a
-    // C++ const array reference (any write operator), refused on its own.
-    void RefuseCxxConstReferentWrite(antlr4::ParserRuleContext* ctx, llvm::Value* destination,
-                                     const std::string& operation, bool constElement = false);
+    // The C (cGlobalsOnly) or const C/C++ global behind a write target, or null.
+    llvm::GlobalVariable* GlobalBehindWrite(llvm::Value* destination, bool cGlobalsOnly);
+    // Refuses a store reached through a C++ const reference or const pointer result, or, for
+    // `++` / `--`, is a const C/C++ namespace object (C/C++ wording; true when it refused).
+    // fallback: only the last-resort refusal of a const element no other check proved.
+    bool RefuseCxxConstReferentWrite(antlr4::ParserRuleContext* ctx, llvm::Value* destination,
+                                     const std::string& operation, bool constElement = false,
+                                     bool fallback = false);
+    // Every write path: the C/C++ wording first, then the native const checks, then the fallback.
+    // True when it refused.
+    bool RefuseConstWrite(antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& target,
+                          llvm::Value* destination, const std::string& nativeOperation,
+                          const std::string& cxxOperation);
     // Refuses a write (assign / compound / ++ / -- / explicit move) whose destination lands by
     // value in a native const object; the one predicate every write path calls. True if refused.
     // A native const global with a constant initializer and no startup construction -> rodata.

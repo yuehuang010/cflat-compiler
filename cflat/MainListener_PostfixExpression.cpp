@@ -2333,11 +2333,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         CheckGuardedWrite(ctx, namedVar);
                         llvm::Value* incrementStorage = namedVar.Storage
                             ? namedVar.Storage : parenthesizedPostfixStorage;
-                        const bool constElement = namedVar.TypeAndValue.IsCxxPointeeConst
-                            && (namedVar.IsElementAccess || !namedVar.TypeAndValue.Pointer);
-                        if (constElement || !namedVar.TypeAndValue.IsCxxMutableField)   // a mutable member is writable
-                            RefuseCxxConstReferentWrite(ctx, incrementStorage, "increment", constElement);
-                        RefuseConstObjectWrite(ctx, namedVar, incrementStorage, "increment");
+                        RefuseConstWrite(ctx, namedVar, incrementStorage, "increment", "increment");
                         if (incrementStorage)
                         {
                             namedVar.Primary = namedVar.Primary
@@ -2415,11 +2411,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         CheckGuardedWrite(ctx, namedVar);
                         llvm::Value* decrementStorage = namedVar.Storage
                             ? namedVar.Storage : parenthesizedPostfixStorage;
-                        const bool constElement = namedVar.TypeAndValue.IsCxxPointeeConst
-                            && (namedVar.IsElementAccess || !namedVar.TypeAndValue.Pointer);
-                        if (constElement || !namedVar.TypeAndValue.IsCxxMutableField)   // a mutable member is writable
-                            RefuseCxxConstReferentWrite(ctx, decrementStorage, "decrement", constElement);
-                        RefuseConstObjectWrite(ctx, namedVar, decrementStorage, "decrement");
+                        RefuseConstWrite(ctx, namedVar, decrementStorage, "decrement", "decrement");
                         if (decrementStorage)
                         {
                             namedVar.Primary = namedVar.Primary
@@ -3198,14 +3190,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         namedVar.UnionFieldType = nullptr;
                                         namedVar.Storage = Compiler(ctx)->CreateCxxFieldGEP(dataStructure, structVar.Storage, fieldIndex);
                                         if (lazyStdField) namedVar.Storage = lazyStdFieldAddress(namedVar.Storage);
-                                        if (fieldType.IsCxxConstField
-                                            || (!fieldType.Pointer && !fieldType.IsCxxRefToPointer
-                                                && !fieldType.IsCxxMutableField
-                                                && !structVar.TypeAndValue.IsCxxConstRef
-                                                && (Compiler(ctx)->CxxConstReceiverKind(structVar) == 2
-                                                    || Compiler(ctx)->IsCxxConstFieldAccess(structVar.Storage)
-                                                    || Compiler(ctx)->IsCxxConstFieldAccess(structVar.Primary))))
-                                            Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Storage);
                                         if (llvm::isa<llvm::ArrayType>(fieldLLVMType))
                                         {
                                             namedVar.Primary = nullptr;
@@ -3218,17 +3202,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                     }
                                     namedVar.TypeAndValue = fieldType;
-                                    if (fieldType.IsCxxConstField
-                                        || (!fieldType.Pointer && !fieldType.IsCxxRefToPointer
-                                            && !fieldType.IsCxxMutableField
-                                            && !structVar.TypeAndValue.IsCxxConstRef
-                                            && (Compiler(ctx)->CxxConstReceiverKind(structVar) == 2
-                                                || Compiler(ctx)->IsCxxConstFieldAccess(structVar.Storage)
-                                                || Compiler(ctx)->IsCxxConstFieldAccess(structVar.Primary))))
-                                    {
-                                        Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Storage);
-                                        Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Primary);
-                                    }
                                     namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
                                     namedVar.GuardLockKey = guardLockKeyHeld;
                                     namedVar.ContainsBondedClosure = structVar.ContainsBondedClosure
@@ -3286,14 +3259,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             namedVar.UnionFieldType = nullptr;
                                             namedVar.Storage = Compiler(ctx)->CreateCxxFieldGEP(dataStructure, structVar.Storage, fieldIndex);
                                             if (lazyStdField) namedVar.Storage = lazyStdFieldAddress(namedVar.Storage);
-                                            if (fieldType.IsCxxConstField
-                                                || (!fieldType.Pointer && !fieldType.IsCxxRefToPointer
-                                                    && !fieldType.IsCxxMutableField
-                                                    && !structVar.TypeAndValue.IsCxxConstRef
-                                                    && (Compiler(ctx)->CxxConstReceiverKind(structVar) == 2
-                                                        || Compiler(ctx)->IsCxxConstFieldAccess(structVar.Storage)
-                                                        || Compiler(ctx)->IsCxxConstFieldAccess(structVar.Primary))))
-                                                Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Storage);
                                             if (llvm::isa<llvm::ArrayType>(fieldLLVMType))
                                             {
                                                 // Array field: keep GEP pointer; don't load the whole array
@@ -3372,17 +3337,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                     }
                                     namedVar.TypeAndValue = fieldType;
-                                    if (fieldType.IsCxxConstField
-                                        || (!fieldType.Pointer && !fieldType.IsCxxRefToPointer
-                                            && !fieldType.IsCxxMutableField
-                                            && !structVar.TypeAndValue.IsCxxConstRef
-                                            && (Compiler(ctx)->CxxConstReceiverKind(structVar) == 2
-                                                || Compiler(ctx)->IsCxxConstFieldAccess(structVar.Storage)
-                                                || Compiler(ctx)->IsCxxConstFieldAccess(structVar.Primary))))
-                                    {
-                                        Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Storage);
-                                        Compiler(ctx)->MarkCxxConstFieldAccess(namedVar.Primary);
-                                    }
                                     namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
                                     namedVar.GuardLockKey = guardLockKeyHeld;
                                     namedVar.ContainsBondedClosure = structVar.ContainsBondedClosure
@@ -3489,16 +3443,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         namedVar.Storage = namedVar.Primary;
                                         namedVar.Primary = Compiler(ctx)->CreateLoad(referentLLVM, namedVar.Storage);
                                         namedVar.BaseType = referentLLVM;
+                                        namedVar.TypeAndValue.DropCxxRef();
                                         namedVar.TypeAndValue.Pointer = referent.Pointer;
                                         namedVar.TypeAndValue.ElemPointer = referent.ElemPointer;
                                         namedVar.TypeAndValue.PointerDepth = referent.PointerDepth;
                                         namedVar.TypeAndValue.IsAlias = false;
                                         namedVar.TypeAndValue.IsCxxRefToPointer = false;
                                         // Const is the slot's (refused above); a pointee is const only if its type is.
-                                        namedVar.TypeAndValue.IsCxxConstRef = fieldType.IsCxxConstRef && !referent.Pointer;
-                                        // `const T&` / `T *const &`: the slot is read-only at every write door.
-                                        if (fieldType.IsCxxConstRef)
-                                            Compiler(ctx)->MarkCxxConstReferent(namedVar.Storage);
+                                        namedVar.TypeAndValue.SetCxxConstRef(fieldType.CxxConstRef() && !referent.Pointer);
                                     }
                                     namedVar.AllocAlignment   = fieldType.AllocAlignValue;
                                     // Propagate borrow-origin so 'move param->field' can detect
@@ -4014,7 +3966,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     ctxTv.FuncPtrReturnTypeName = declExpectedType.TypeName;
                                     ctxTv.FuncPtrReturnPointer  = declExpectedType.Pointer;
                                     ctxTv.FuncPtrReturnPointerDepth = declExpectedType.ValuePointerDepth();
-                                    ctxTv.FuncPtrReturnConstMask = declExpectedType.PointeeConstMask();
+                                    ctxTv.FuncPtrReturnConstMask = declExpectedType.FunctionReturnConstMask();
                                     // A `unique` destination is an owning LOCATION; the return
                                     // spelling that fills it is `move`, so both map to Owned.
                                     ctxTv.FuncPtrReturnOwned    = declExpectedType.IsMove
@@ -4128,6 +4080,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             {
                                 namedVar.Storage = lastParenExprStorage;
                                 namedVar.CxxRefValueType = lastParenExprNamed.CxxRefValueType;
+                                namedVar.IsTopLevelConst = lastParenExprNamed.IsTopLevelConst;
                                 // Parentheses do not turn a temporary into an lvalue: keep the
                                 // inner expression's rvalue-ness (a `?:` join over a temp arm).
                                 if (lastParenExprNamed.IsRvalue) namedVar.IsRvalue = true;
@@ -4605,9 +4558,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             llvm::Value* zero = Compiler(ctx)->builder->getInt64(0);
                             llvm::Value* elemPtr = Compiler(ctx)->builder->CreateGEP(
                                 arrTy, namedVar.Storage, {zero, rvalue}, "arrayelemptr");
-                            const bool constArraySlot = Compiler(ctx)->CxxConstReceiverKind(namedVar) != 0;
-                            if (constArraySlot)
-                                Compiler(ctx)->MarkCxxConstFieldAccess(elemPtr);
                             // When the array lives in a GLOBAL, the base pointer is a constant, so a
                             // constant index (e.g. g[0], whose all-zero GEP is a no-op) folds the GEP
                             // back into a Constant - the GlobalVariable itself or a ConstantExpr. Such
@@ -4620,8 +4570,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 elemPtr = Compiler(ctx)->builder->Insert(
                                     llvm::GetElementPtrInst::CreateInBounds(
                                         arrTy, namedVar.Storage, {zero, rvalue}, "arrayelemptr"));
-                            if (constArraySlot)
-                                Compiler(ctx)->MarkCxxConstFieldAccess(elemPtr);
                             namedVar.Storage = elemPtr;
                             namedVar.BaseType = arrTy->getElementType();
                             namedVar.TypeAndValue.ConstArraySize = 0;
@@ -4960,10 +4908,17 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // of looking it up as a type name.
                                 const bool valueArg = entry->shiftExpression() != nullptr
                                     && entry->typeSpecifier() == nullptr;
+                                std::string explicitArgument = valueArg
+                                    ? ResolveTypeArgEntry(entry) : resolveCxxTypeArg(entry);
+                                // CFlat's generic key drops top-level const; C++ template arguments do not.
+                                if (!valueArg && entry->typeSpecifier() != nullptr
+                                    && entry->pointer() == nullptr
+                                    && entry->arrayTypeSuffix() == nullptr
+                                    && Compiler(ctx)->IsCxxTopLevelConstTypeAlias(
+                                        entry->typeSpecifier()->getText()))
+                                    explicitArgument = entry->typeSpecifier()->getText();
                                 cxxExplicitTemplateArgs.push_back(
-                                    (valueArg ? "#" : "")
-                                        + (valueArg ? ResolveTypeArgEntry(entry)
-                                                    : resolveCxxTypeArg(entry)));
+                                    (valueArg ? "#" : "") + explicitArgument);
                             }
                         }
                         break;
@@ -5304,6 +5259,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 destType.PointerDepth = elementPointerDepth;
                             }
                             destType.VariableName.clear();
+                            if (destType.IsConstObject())
+                            {
+                                LogErrorContext(ctx, "construct_at destination is const");
+                                namedVar = {};
+                                break;
+                            }
 
                             DeclExpectedTypeScope expected(&declExpectedType, destType);
                             compiler->lastCxxRetTemp_ = nullptr;
@@ -7573,9 +7534,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // without its alignment tag is rejected instead of mis-freed.
                                     argVar.AllocAlignment = argNV.AllocAlignment;
                                     argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
-                                    argVar.TypeAndValue.IsCxxConstRef = argNV.TypeAndValue.IsCxxConstRef;
-                                    argVar.TypeAndValue.IsCxxPointeeConst =
-                                        argNV.TypeAndValue.IsCxxPointeeConst;
+                                    argVar.TypeAndValue.SetCxxConstRef(argNV.TypeAndValue.CxxConstRef());
+                                    argVar.TypeAndValue.SetPointeeConstBit(argNV.TypeAndValue.PointeeConstBit());
                                     argVar.TypeAndValue.IsCxxNullptrT = argNV.TypeAndValue.IsCxxNullptrT;
                                     argVar.TypeAndValue.DiagnosticTypeName =
                                         argNV.TypeAndValue.DiagnosticTypeName;
@@ -8771,9 +8731,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // without its alignment tag is rejected instead of mis-freed.
                                     argVar.AllocAlignment = argNV.AllocAlignment;
                                     argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
-                                    argVar.TypeAndValue.IsCxxConstRef = argNV.TypeAndValue.IsCxxConstRef;
-                                    argVar.TypeAndValue.IsCxxPointeeConst =
-                                        argNV.TypeAndValue.IsCxxPointeeConst;
+                                    argVar.TypeAndValue.SetCxxConstRef(argNV.TypeAndValue.CxxConstRef());
+                                    argVar.TypeAndValue.SetPointeeConstBit(argNV.TypeAndValue.PointeeConstBit());
                                     argVar.TypeAndValue.IsCxxNullptrT = argNV.TypeAndValue.IsCxxNullptrT;
                                     argVar.TypeAndValue.IsMove = argNV.TypeAndValue.IsMove;
                                     argVar.TypeAndValue.IsUnique = argNV.TypeAndValue.IsUnique;
@@ -9171,8 +9130,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                         // sibling may deduce `T = const Rec` instead.
                                                         && (!parameter.Pointer || valueReceiver
                                                             || !compiler->IsCxxRecord(parameter.TypeName)
-                                                            || parameter.IsCxxPointeeConst
-                                                                   == argument.TypeAndValue.IsCxxPointeeConst);
+                                                            || parameter.PointeeConstBit()
+                                                                   == argument.TypeAndValue.PointeeConstBit());
                                                 }
                                                 hasExactNonWrapper = hasExactNonWrapper || exact;
                                             }
@@ -10697,11 +10656,16 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         returnType.IsMove = lambdaExpectedType.FuncPtrReturnOwned;
         returnType.IsAlias = lambdaExpectedType.FuncPtrReturnAlias;
         // The slot's pointee const on the return binds the body's `return` (#7).
-        if (returnType.Pointer && lambdaExpectedType.FuncPtrReturnConstMask > 0)
+        if ((returnType.Pointer || returnType.IsAlias)
+            && lambdaExpectedType.FuncPtrReturnConstMask > 0)
         {
-            returnType.PointerDepth = std::max(lambdaExpectedType.FuncPtrReturnPointerDepth, 1);
-            returnType.ElemPointer = returnType.PointerDepth >= 2;
+            if (returnType.Pointer)
+            {
+                returnType.PointerDepth = std::max(lambdaExpectedType.FuncPtrReturnPointerDepth, 1);
+                returnType.ElemPointer = returnType.PointerDepth >= 2;
+            }
             returnType.ConstMask = static_cast<uint8_t>(lambdaExpectedType.FuncPtrReturnConstMask);
+            if (returnType.IsAlias) returnType.MarkCxxRef();
         }
         // An EMPTY expected return type means no context supplied one (e.g. an immediately-invoked
         // literal). "void" is a fallback, not a declaration, and the two must not be confused: a
@@ -11166,7 +11130,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         tv.FuncPtrReturnOwned = returnType.IsMove;
         tv.FuncPtrReturnAlias = returnType.IsAlias;
         tv.FuncPtrReturnPointerDepth = returnType.ValuePointerDepth();
-        tv.FuncPtrReturnConstMask = returnType.PointeeConstMask();
+        tv.FuncPtrReturnConstMask = returnType.FunctionReturnConstMask();
         for (const auto& p : params)
         {
             LLVMBackend::TypeAndValue::FuncPtrParam fp;
@@ -11182,7 +11146,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             fp.IsWriteInferredSink = p.IsWriteInferredSink;
             // A SPELLED `move` param rides the type, exactly as a named function's does.
             fp.IsMove = p.IsMove;
-            fp.IsPointeeConst = p.IsSpelledPointeeConst;
+            fp.IsPointeeConst = (p.PointeeConstMask() & 1u) != 0;
             tv.FuncPtrParams.push_back(fp);
         }
         // Bound literals use the named-function bind rule on the user arity (fewer legal, more or

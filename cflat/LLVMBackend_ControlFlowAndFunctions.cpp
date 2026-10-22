@@ -484,9 +484,8 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
         tv.FuncPtrReturnAlias = chosen->ReturnType.IsAlias;
         tv.FuncPtrVariadic = chosen->Variadic;
         tv.FuncPtrReturnPointerDepth = chosen->ReturnType.ValuePointerDepth();
-        // Pointee const is part of the function type; a C++ function's stays unrecorded (phase 5).
-        if (!chosen->IsCxx)
-            tv.FuncPtrReturnConstMask = chosen->ReturnType.PointeeConstMask();
+        // Pointee const is part of the function type, a C++ function's included.
+        tv.FuncPtrReturnConstMask = chosen->ReturnType.FunctionReturnConstMask();
         for (const auto& p : chosen->Parameters)
         {
             TypeAndValue::FuncPtrParam fp;
@@ -500,9 +499,8 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
             fp.IsReturnInferredSink = p.IsReturnInferredSink;
             fp.IsWriteInferredSink = p.IsWriteInferredSink;
             fp.PointerDepth = p.ValuePointerDepth();
-            if (!chosen->IsCxx) fp.ConstMask = p.PointeeConstMask();
-            fp.IsPointeeConst = p.IsSpelledPointeeConst
-                || (chosen->IsCxx && p.IsCxxPointeeConst);
+            fp.ConstMask = p.PointeeConstMask();
+            fp.IsPointeeConst = (p.PointeeConstMask() & 1u) != 0;
             tv.FuncPtrParams.push_back(fp);
         }
         return tv;
@@ -511,10 +509,15 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
 // A call through a function value returns its type's pointee const (`function<(const char)*()>`).
 void LLVMBackend::ApplyFuncPtrReturnConst(const TypeAndValue& funcPtrType, TypeAndValue& retTV)
 {
-        if (!funcPtrType.FuncPtrReturnPointer || funcPtrType.FuncPtrReturnConstMask <= 0) return;
-        retTV.PointerDepth = std::max(funcPtrType.FuncPtrReturnPointerDepth, 1);
+        if (funcPtrType.FuncPtrReturnConstMask < 0
+            && (!funcPtrType.FuncPtrReturnAlias || !funcPtrType.FuncPtrReturnPointer)) return;
+        retTV.PointerDepth = std::max(funcPtrType.FuncPtrReturnPointerDepth,
+                                      funcPtrType.FuncPtrReturnPointer ? 1 : 0);
         retTV.ElemPointer = retTV.PointerDepth >= 2;
-        retTV.ConstMask = static_cast<uint8_t>(funcPtrType.FuncPtrReturnConstMask);
+        if (funcPtrType.FuncPtrReturnConstMask >= 0)
+            retTV.ConstMask = static_cast<uint8_t>(funcPtrType.FuncPtrReturnConstMask);
+        if (funcPtrType.FuncPtrReturnAlias && funcPtrType.FuncPtrReturnConstMask > 0)
+            retTV.MarkCxxRef();
     }
 
 void LLVMBackend::CheckIndirectCallArgShape(llvm::Value* arg, llvm::Type* destTy, size_t index,
@@ -1535,7 +1538,8 @@ LLVMBackend::AbiSlot LLVMBackend::ClassifyAbiParam(const TypeAndValue& tv)
 LLVMBackend::AbiSlot LLVMBackend::ClassifyAbiReturn(const TypeAndValue& tv)
 {
         AbiSlot slot;
-        if (!IsByValueStructTV(tv)) return slot; // Direct
+        // Alias results use the pointer return ABI even when their referent is a record.
+        if (tv.IsAlias || !IsByValueStructTV(tv)) return slot; // Direct
         auto* st = dataStructures.at(tv.TypeName).StructType;
         const llvm::DataLayout& dl = module->getDataLayout();
         uint64_t size  = dl.getTypeAllocSize(st);
@@ -2946,17 +2950,17 @@ llvm::Type* LLVMBackend::GetFunctionReturnABIType(const TypeAndValue& returnType
  */
 bool LLVMBackend::CxxConstScalarRefReferent(const TypeAndValue& param, TypeAndValue& referent) const
 {
-        if (!param.IsCxxConstRef || !param.IsAlias || !param.Pointer) return false;
+        if (!param.CxxConstRef() || !param.IsAlias || !param.Pointer) return false;
         if (param.ElemPointer || param.IsCxxRefToPointer || param.IsRvalueRef) return false;
         if (param.IsFunctionPointer || param.IsInterface || param.IsArrayView) return false;
         if (param.ConstArraySize > 0 || param.IsSimd || param.IsMove) return false;
         if (dataStructures.count(param.TypeName) != 0) return false;
         referent = param;
+        referent.DropCxxRef();
         referent.Pointer = false;
         referent.ElemPointer = false;
         referent.PointerDepth = 0;
         referent.IsAlias = false;
-        referent.IsCxxConstRef = false;
         llvm::Type* type = GetType(referent);
         return type != nullptr && (type->isIntegerTy() || type->isFloatingPointTy());
 }

@@ -1,0 +1,63 @@
+import cpp "cpp_vdtor_opdelete_template.h";
+
+expect_error("attempt to use a deleted function") {
+    int T344UseByValue(cppvdtemplate.Deleted<float> value) { return value.value(); }
+    int T344CallByValue() {
+        cppvdtemplate.Deleted<float>* pointer = nullptr;
+        return T344UseByValue(*pointer);
+    }
+}
+
+expect_error("attempt to use a deleted function") {
+    cppvdtemplate.Deleted<double> T344Return() { return cppvdtemplate.Deleted<double>(); }
+}
+
+expect_error("attempt to use a deleted function") {
+    struct T344FieldHolder { cppvdtemplate.Deleted<i64> value = default; };
+    int T344UseField() {
+        T344FieldHolder value = default;
+        return value.value.value();
+    }
+}
+
+// r4: file-scope private / ambiguous refusals must not reach clang's deferred CodeGen.
+expect_error("operator delete' is a private member") {
+    int T344PrivateLocal() { cppvdtemplate.Private<short> value; return value.value(); }
+}
+
+expect_error("operator delete' found in multiple base classes") {
+    int T344AmbiguousLocal() { cppvdtemplate.Ambiguous<short> value; return value.value(); }
+}
+
+expect_error("operator delete' is a private member") {
+    cppvdtemplate.Private<double> T344PrivateReturn() { return cppvdtemplate.Private<double>(); }
+}
+
+expect_error("operator delete' found in multiple base classes") {
+    cppvdtemplate.Ambiguous<double> T344AmbiguousReturn() {
+        return cppvdtemplate.Ambiguous<double>();
+    }
+}
+
+int T344ForceGeneric<T>() { T value = default; return 43; }
+expect_error("attempt to use a deleted function") {
+    int T344TriggerGeneric() {
+        return T344ForceGeneric<cppvdtemplate.Deleted<bool>>();
+    }
+}
+
+extern int main() {
+    expect_error("attempt to use a deleted function") {
+        cppvdtemplate.Deleted<int> local;
+    }
+    expect_error("attempt to use a deleted function") {
+        cppvdtemplate.Deleted<char>* value = new cppvdtemplate.Deleted<char>;
+    }
+    expect_error("operator delete' is a private member") {
+        cppvdtemplate.Private<int> value;
+    }
+    expect_error("operator delete' found in multiple base classes") {
+        cppvdtemplate.Ambiguous<int> value;
+    }
+    return 0;
+}

@@ -2810,6 +2810,8 @@ namespace cflat_cinterop
                                    std::vector<const CXXMethodDecl*>& outDecls)
             {
                 rec.isPolymorphic = cxx->isPolymorphic() || cxx->getNumVBases() > 0;
+                if (rec.isPolymorphic && st.req.vtableDeleteVerdict)
+                    rec.vtableDeleteVerdict = st.req.vtableDeleteVerdict(cxx);
                 // A polymorphic class needs a vtable. Clang decides whether this translation unit
                 // owns it (all-inline: linkonce_odr here) or whether a key function anchors it in
                 // the bound library (external declaration); asking is always safe.
@@ -7872,15 +7874,90 @@ namespace cflat_cinterop
             }
         }
         /*
+         * A demanded constructor installs the vtable, so it emits the deleting destructor of a
+         * class with a virtual destructor, which needs the operator delete Sema resolves for it;
+         * so does a demanded deleting destructor itself. Destroying an object (complete or base
+         * destructor) never does. Check the class itself: the vtable loop below sees only wanted
+         * vtables, and a warm compile reaches here with no live group to ask at codegen time.
+         */
+        if (plan.resolveVTableDelete != nullptr)
+            for (const std::string& name : want)
+            {
+                GlobalDecl gd;
+                if (auto it = held.find(name); it != held.end())
+                    gd = it->second;
+                else if (auto bound = plan.bound.find(name); bound != plan.bound.end())
+                    gd = GlobalDecl::getFromOpaquePtr(bound->second);
+                const Decl* d = gd.getDecl();
+                const CXXRecordDecl* owner = nullptr;
+                if (const auto* ctor = llvm::dyn_cast_or_null<CXXConstructorDecl>(d))
+                    owner = ctor->getParent();
+                else if (const auto* dtor = llvm::dyn_cast_or_null<CXXDestructorDecl>(d);
+                         dtor != nullptr && gd.getDtorType() == Dtor_Deleting)
+                    owner = dtor->getParent();
+                if (owner == nullptr) continue;
+                if (const std::string diagnostic = plan.resolveVTableDelete(owner);
+                    !diagnostic.empty())
+                {
+                    err = "clang: " + diagnostic;
+                    return false;
+                }
+            }
+        /*
          * The Microsoft ABI's vftables are handed unconditionally below, and each one emits its
          * deleting destructor. Sema resolves that destructor's operator delete only when it
          * finishes the destructor body, which a skipped inline body never did; CodeGen would
          * dereference the null. Likewise the destructor's exception spec: Sema resolves an
          * unevaluated one only on odr-use, and CodeGen's EH-spec query on it is unreachable.
          */
-        for (const auto& [name, record] : plan.vtables)
+        std::unordered_map<const clang::CXXRecordDecl*, bool> classDeleteCache;
+        const clang::DeclarationName deleteName = ci.getASTContext().DeclarationNames
+            .getCXXOperatorName(clang::OO_Delete);
+        std::function<bool(const clang::CXXRecordDecl*)> hasClassSpecificDelete =
+            [&](const clang::CXXRecordDecl* record) {
+                if (record == nullptr) return false;
+                const clang::CXXRecordDecl* definition = record->getDefinition();
+                if (definition == nullptr) return false;
+                const clang::CXXRecordDecl* canonical = definition->getCanonicalDecl();
+                if (auto cached = classDeleteCache.find(canonical);
+                    cached != classDeleteCache.end()) return cached->second;
+                bool found = !definition->lookup(deleteName).empty();
+                if (!found)
+                    for (const clang::CXXBaseSpecifier& base : definition->bases())
+                        if (hasClassSpecificDelete(
+                                base.getType()->getAsCXXRecordDecl()))
+                        {
+                            found = true;
+                            break;
+                        }
+                classDeleteCache.emplace(canonical, found);
+                return found;
+            };
+        const bool isMicrosoftAbi = ctx.getTargetInfo().getCXXABI().isMicrosoft();
+        std::unordered_set<std::string> unusableVftables;
+        for (const auto& entry : plan.vtables)
         {
-            if (!name.starts_with("vftable:")) continue;
+            const bool wanted = want.count(entry.first) != 0;
+            const bool vtableWillBeEmitted = wanted
+                || (isMicrosoftAbi && entry.first.starts_with("vftable:"));
+            if (!vtableWillBeEmitted) continue;
+            const clang::CXXRecordDecl* record = entry.second;
+            if (plan.resolveVTableDelete != nullptr)
+            {
+                const std::string diagnostic = plan.resolveVTableDelete(record);
+                if (!diagnostic.empty())
+                {
+                    // MS hands every unnamed vftable; no ctor / deleting dtor of this record was
+                    // demanded (refused above), so a pointer-only use leaves it out, as Itanium does.
+                    if (!wanted)
+                    {
+                        unusableVftables.insert(entry.first);
+                        continue;
+                    }
+                    err = "clang: " + diagnostic;
+                    return false;
+                }
+            }
             auto* dtor = record->getDestructor();
             if (dtor == nullptr || !dtor->isVirtual() || dtor->isDeleted()) continue;
             if (const auto* fpt = dtor->getType()->getAs<clang::FunctionProtoType>();
@@ -7891,6 +7968,9 @@ namespace cflat_cinterop
                       "destructor of '" + record->getQualifiedNameAsString() + "'";
                 return false;
             }
+            // MS emits the scalar deleting dtor with every vftable, so it always needs the
+            // (possibly global) operator delete; Itanium's D0 only matters for a class-scope one.
+            if (!isMicrosoftAbi && !hasClassSpecificDelete(record)) continue;
             if (dtor->getOperatorDelete() != nullptr) continue;
             clang::Sema& sema = ci.getSema();
             clang::Sema::ContextRAII inDtor(sema, dtor);
@@ -7937,7 +8017,7 @@ namespace cflat_cinterop
                     cg->HandleVTable(const_cast<CXXRecordDecl*>(it->second));
             }
             for (const auto& [name, record] : plan.vtables)
-                if (name.starts_with("vftable:"))
+                if (name.starts_with("vftable:") && unusableVftables.count(name) == 0)
                     cg->HandleVTable(const_cast<CXXRecordDecl*>(record));
             {
                 llvm::TimeTraceScope flushScope("CxxDemandFlush");

@@ -202,6 +202,67 @@ inline int rk_br(const RkBase& b) { return 53; }
 // vs non-template, non-const conversion operator vs const-reference converting constructor.
 inline int rk_cc(char* p) { return 5; }
 inline int rk_cc(const char* p) { return 6; }
+// c05a: typed null operand of a free operator keeps its pointee const (clang 41 / 42).
+struct RkNull {};
+inline int operator==(const RkNull&, int*) { return 41; }
+inline int operator==(const RkNull&, const int*) { return 42; }
+// c05b: C++ const pointees, const fields and const results at CFlat use sites (clang verdicts in legs).
+struct C5bIn { int x = 1; };
+struct C5bOut { C5bIn in; int y = 2; };
+inline const C5bOut* c5b_outp() { static C5bOut o; return &o; }
+struct C5bObj { int v = 3; };
+struct C5bHolder { C5bObj o; const C5bObj* p = &o; const C5bObj*& cpr() { return p; } };
+struct C5bLeaf { int x; const int k; };
+struct C5bPtr { mutable const C5bLeaf* p; };
+inline const C5bLeaf c5bOther{8, 9};
+inline const C5bLeaf c5bOther2{10, 11};
+inline const C5bPtr c5bPtr{&c5bOther};
+struct C5bH { const int ci = 4; int mi = 5; };
+inline C5bH* c5b_ph() { static C5bH h; return &h; }
+struct C5bR
+{
+    inline static C5bObj mutableObj{3};
+    inline static C5bObj secondObj{7};
+    inline static C5bObj* mutableP = &mutableObj;
+    inline static const C5bObj* p = &mutableObj;
+    inline static const C5bObj* const q = &mutableObj;
+    inline static const C5bHolder constHolder{};
+    int v = 1;
+    int which() { return 1; }
+    int which() const { return 2; }
+    int set(int x) { v = x; return 1; }
+    int get() const { return v; }
+};
+inline C5bR* c5b_mr() { static C5bR r; return &r; }
+inline const C5bR* c5b_cr() { static C5bR r; return &r; }
+inline const C5bR c5bConstR{};
+inline const C5bR c5bConstRs[2]{};
+inline const C5bOut c5bConstOut{};
+inline int c5b_pick(C5bR*) { return 1; }
+inline int c5b_pick(const C5bR*) { return 2; }
+inline int c5b_taker(C5bR* r) { return 1; }
+inline int c5b_take(int* p) { return 1; }
+inline const int* c5b_cptr() { static int v = 7; return &v; }
+inline const char* c5b_cname() { static char b[4] = "ab"; return b; }
+struct C5bQ { int k = 0; };
+inline int operator==(const C5bQ&, C5bR*) { return 7; }
+inline int operator==(const C5bQ&, const C5bR*) { return 8; }
+struct C5bMH { C5bObj* p; };
+inline C5bObj c5bMObj;
+inline const C5bMH c5bMH{&c5bMObj};
+inline const C5bMH* c5b_mh() { return &c5bMH; }
+inline C5bObj* c5bRp = &c5bMObj;
+inline C5bObj* const* c5b_pcp() { return &c5bRp; }
+struct C5bPcp { C5bObj* const* p = &c5bRp; };
+inline int c5b_pk(C5bObj*) { return 1; }
+inline int c5b_pk(const C5bObj*) { return 2; }
+inline C5bR c5bIndirectR{};
+inline C5bR& c5b_mutref() { return c5bIndirectR; }
+inline const C5bR& c5b_constref() { return c5bIndirectR; }
+inline C5bR& (*c5b_mutref_fn())() { return &c5b_mutref; }
+inline const C5bR& (*c5b_constref_fn())() { return &c5b_constref; }
+inline const C5bR* c5b_constptr() { return &c5bIndirectR; }
+inline const C5bR* (*c5b_constptr_fn())() { return &c5b_constptr; }
 enum RkE { RK_EA, RK_EB };
 enum RkSmall : unsigned char { RK_SA };
 inline int rk_en(int x) { return 9; }

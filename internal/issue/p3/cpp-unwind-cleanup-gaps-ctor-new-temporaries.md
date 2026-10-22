@@ -28,5 +28,6 @@ Repro base: Test/library/cpp_interop_unwind.h / .cpp and the unwind section of T
 `new S{ z = rv.bval(1) }` where S holds a C++ class plus an int and is not eligible for the fresh in-place brace path:
 when the element initializer throws, no UserNewHeap unwind entry is recorded, so the block leaks (user delete count 0,
 master same). The tag form, `new T(args)` and fresh-eligible `new T{...}` are covered by T313 (EmitUserNewHeapFree).
-Also from T313 review 3, for a ruling only: the sized class `operator delete(void*, N)` is recognized for ANY non-pointer
+Also from T313 review 3, RULED 2026-10-20 match clang (fix item): the sized class `operator delete(void*, N)` is recognized for ANY non-pointer
 64-bit integer N (i64 or u64); clang accepts only std::size_t (long long / unsigned long long free nothing there).
+Fix: recognize the size parameter only when it is the target's size_t, exactly as clang does.

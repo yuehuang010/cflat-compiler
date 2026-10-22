@@ -143,7 +143,7 @@ bool LoopConstObjectAddress(CFlatParser::CastExpressionContext* expression,
         if (isCall)
         {
             const auto result = LoopFunctionReturn(compiler, name);
-            return result.IsCxxConstRef || (result.Pointer && result.IsCxxPointeeConst);
+            return result.CxxConstRef() || (result.Pointer && result.PointeeConstBit());
         }
         auto source = LoopLookupLoopValue(compiler, name);
         return source.Storage != nullptr && constKind(source) != 0;
@@ -174,7 +174,7 @@ bool LoopUnaryValueMayPointToConstCxxObject(CFlatParser::UnaryExpressionContext*
         if (isCall)
         {
             const auto result = LoopFunctionReturn(compiler, name);
-            return result.Pointer && result.IsCxxPointeeConst;
+            return result.Pointer && result.PointeeConstBit();
         }
         auto source = LoopLookupLoopValue(compiler, name);
         return source.Storage != nullptr && source.TypeAndValue.Pointer
@@ -333,10 +333,10 @@ void MainListener::MarkLoopBackEdgeCxxConstPointers(
                 if (auto* variable = compiler->FindLiveNamedVariable(name);
                     variable != nullptr && variable->TypeAndValue.Pointer
                     && !variable->TypeAndValue.IsFunctionPointer
-                    && !variable->TypeAndValue.IsCxxPointeeConst
+                    && !variable->TypeAndValue.PointeeConstBit()
                     && compiler->IsCxxRecord(variable->TypeAndValue.TypeName))
                 {
-                    variable->TypeAndValue.IsCxxPointeeConst = true;
+                    variable->TypeAndValue.SetPointeeConstBit(true);
                     marked = true;
                 }
         }
@@ -1138,7 +1138,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 && !compiler->IsForeignNontrivialCxxClass(returnNV.TypeAndValue.TypeName))
             {
                 const std::string tn = returnNV.TypeAndValue.TypeName;
-                const bool constSource = returnNV.TypeAndValue.IsCxxConstRef;
+                const bool constSource = returnNV.TypeAndValue.CxxConstRef();
                 llvm::Type* recordType = compiler->GetType(LLVMBackend::TypeAndValue{ .TypeName = tn });
                 llvm::Value* source = returnNV.Primary;
                 if (recordType != nullptr && compiler->CxxTrivialMoveNeedsTransfer(tn, constSource, false))
@@ -1604,7 +1604,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             {
                 // A `T&&` / `const T&&` result (std.move(x)) is an xvalue: clang selects the
                 // constructor into the return slot.
-                xvalueConstSource = returnNV.TypeAndValue.IsCxxConstRef;
+                xvalueConstSource = returnNV.TypeAndValue.CxxConstRef();
                 xvalueReturn = true;
                 source.Storage = returnNV.Primary;
                 source.TypeAndValue.Pointer = false;
@@ -2319,8 +2319,16 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             retFunctionSlot ? "the function value" : "the pointer");
         RejectStringLiteralIntoStructPointer(errCtx, compiler->currentFunctionReturnTV, right,
                                              "the return value");
+        auto constCheckReturnTV = retTV;
+        if (aliasRefReturn && !retTV.IsFunctionPointer
+            && compiler->GetEncodedClosureType(compiler->ResolveTypeAlias(retTV.TypeName)) == nullptr)
+        {
+            constCheckReturnTV.IsAlias = false;
+            constCheckReturnTV.Pointer = true;
+        }
         if (std::string from, to; right != nullptr && !retFunctionSlot
-            && compiler->ConversionDiscardsConst(right, returnNV.TypeAndValue, retTV, from, to))
+            && compiler->ConversionDiscardsConst(
+                right, returnNV.TypeAndValue, constCheckReturnTV, from, to))
             LogErrorContext(errCtx, std::format("cannot return '{}' as '{}': the conversion discards const",
                 from, to));
         // Coerce the returned value to the function-pointer return type (thin vs

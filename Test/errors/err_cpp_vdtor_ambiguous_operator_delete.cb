@@ -1,0 +1,8 @@
+// Import-time refusal: a virtual destructor whose operator delete is ambiguous between two bases.
+expect_error("member 'operator delete' found in multiple base classes of different types");
+import cpp "cpp_vdtor_opdelete_ambig.h";
+
+extern int main()
+{
+    return 0;
+}

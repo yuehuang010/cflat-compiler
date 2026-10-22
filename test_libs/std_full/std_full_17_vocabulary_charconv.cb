@@ -68,7 +68,7 @@ extern int main()
     char* hp = hex.data();
     char* hp_end = hp + hex.size();
     auto fr4 = std.from_chars(hp, hp_end, hv, 16);
-    char* stop = fr.ptr;
+    (const char)* stop = fr.ptr;
     if (fr.ec != std.errc() || dv != 3.75 || *stop != 'x' || fr2.ec != std.errc() || fv != -0.5f || fr3.ec != inv || fr4.ec != std.errc() || hv != 255) { printf("FAIL from_chars\n"); failures |= 256; }
     if (failures == 0) printf("PASS std_full_17_vocabulary_charconv\n");
     return failures;

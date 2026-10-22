@@ -782,19 +782,23 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
             int retStars = PointerDepthOf(fpSpec->pointer());
             ValidateConstAfterPointerStar(fpSpec->pointer(),
                 SpelledTypeNameBase(fpSpec->typeSpecifier(), fpSpec->multiWordTypeSuffix()));
+            auto* returnQualifier = fpSpec->functionReturnQualifier();
+            std::string returnQualifierText;
+            if (returnQualifier != nullptr)
+            {
+                returnQualifierText = returnQualifier->getText();
+                if (returnQualifierText != "move" && returnQualifierText != "alias")
+                    LogErrorContext(returnQualifier, "function return qualifier must be 'move' or 'alias'");
+            }
+            const bool aliasReturn = returnQualifierText == "alias";
             int retConst = 0;
             tv.FuncPtrReturnTypeName = ResolveSigComponentConstCodegen(
-                fpSpec->typeSpecifier(), retPtr, retStars, retConst, fpSpec->multiWordTypeSuffix());
+                fpSpec->typeSpecifier(), retPtr, retStars, retConst,
+                fpSpec->multiWordTypeSuffix(), aliasReturn, true);
             tv.FuncPtrReturnConstMask = retConst;
             tv.FuncPtrReturnPointer  = retPtr;
-            if (auto* qualifier = fpSpec->functionReturnQualifier(); qualifier != nullptr)
-            {
-                std::string text = qualifier->getText();
-                if (text != "move" && text != "alias")
-                    LogErrorContext(qualifier, "function return qualifier must be 'move' or 'alias'");
-                tv.FuncPtrReturnOwned = text == "move";
-                tv.FuncPtrReturnAlias = text == "alias";
-            }
+            tv.FuncPtrReturnOwned = returnQualifierText == "move";
+            tv.FuncPtrReturnAlias = aliasReturn;
             tv.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
             tv.FuncPtrReturnResolvedKey = SigComponentResolvedKey(tv.FuncPtrReturnTypeName);
             if (fpSpec->functionPointerParamList() != nullptr)

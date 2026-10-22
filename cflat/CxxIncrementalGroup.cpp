@@ -727,11 +727,14 @@ namespace
         std::unordered_map<clang::FunctionDecl*, Body> bodies;
         std::unordered_set<std::string> noDeferBodyKeys;
         std::vector<std::string> lookupTaintedBodyKeys;
+        std::vector<clang::CXXDestructorDecl*> skippedVirtualDtors;
+        std::unordered_map<const clang::CXXRecordDecl*, bool> classDeleteCache;
+        std::unordered_map<const clang::CXXRecordDecl*, std::string> vtableDeleteResults;
         cflat_cinterop::CxxDemandPlan* plan = nullptr;   // the group's, for the demand pass
         const std::unordered_map<const clang::FunctionDecl*, std::string>* poisoned = nullptr;
         const std::unordered_map<const clang::FunctionDecl*, std::string>* causes = nullptr;
         std::string poisonDiagnostic;
-        // Clang's error for a used virtual destructor whose operator delete is unusable.
+        // Clang's error for a virtual destructor whose operator delete is unusable.
         std::string vtableDeleteDiagnostic;
         // Impl::causes: a use that walks into the destructor is refused with its clang text.
         std::unordered_map<const clang::FunctionDecl*, std::string>* vtableCauses = nullptr;
@@ -750,6 +753,90 @@ namespace
             }
             recent.push_back(token);
             if (recent.size() > 64) recent.pop_front();
+        }
+
+        bool HasClassSpecificDelete(const clang::CXXRecordDecl* record)
+        {
+            if (record == nullptr || sema == nullptr) return false;
+            const clang::CXXRecordDecl* definition = record->getDefinition();
+            if (definition == nullptr) return false;
+            const clang::CXXRecordDecl* canonical = definition->getCanonicalDecl();
+            if (auto cached = classDeleteCache.find(canonical); cached != classDeleteCache.end())
+                return cached->second;
+
+            const clang::DeclarationName deleteName =
+                sema->getASTContext().DeclarationNames.getCXXOperatorName(clang::OO_Delete);
+            bool found = !definition->lookup(deleteName).empty();
+            if (!found)
+                for (const clang::CXXBaseSpecifier& base : definition->bases())
+                    if (HasClassSpecificDelete(base.getType()->getAsCXXRecordDecl()))
+                    {
+                        found = true;
+                        break;
+                    }
+            classDeleteCache.emplace(canonical, found);
+            return found;
+        }
+
+        // poison: mark the destructor invalid on failure so CodeGen never reaches it. Extraction
+        // passes false: it only records the verdict, and a poisoned destructor is then unfindable.
+        std::string ResolveVTableDelete(const clang::CXXRecordDecl* record,
+                                        bool classSpecificOnly = false, bool poison = true)
+        {
+            if (record == nullptr || sema == nullptr) return {};
+            const clang::CXXRecordDecl* definition = record->getDefinition();
+            if (definition == nullptr || definition->isDependentContext()
+                || definition->isInvalidDecl()) return {};
+            if (classSpecificOnly && !HasClassSpecificDelete(definition)) return {};
+            const clang::CXXRecordDecl* canonical = definition->getCanonicalDecl();
+            auto* dtor = definition->getDestructor();
+            if (auto cached = vtableDeleteResults.find(canonical);
+                cached != vtableDeleteResults.end())
+            {
+                // Extraction cached the verdict unpoisoned; a later demand must still poison the
+                // destructor, or CodeGen's deferred emission reaches it with no operator delete.
+                if (poison && !cached->second.empty() && dtor != nullptr
+                    && !dtor->isInvalidDecl())
+                {
+                    dtor->setInvalidDecl();
+                    if (vtableCauses != nullptr) vtableCauses->emplace(dtor, cached->second);
+                }
+                return cached->second;
+            }
+
+            const clang::FunctionDecl* body = nullptr;
+            if (dtor == nullptr || !dtor->isVirtual() || dtor->isDeleted()
+                || dtor->isInvalidDecl() || !dtor->isDefined(body)
+                || body == nullptr || body->isInvalidDecl()
+                || (dtor->getOperatorDelete() != nullptr
+                    && !HasClassSpecificDelete(definition)))
+            {
+                vtableDeleteResults.emplace(canonical, std::string());
+                return {};
+            }
+
+            clang::Sema::ContextRAII inDtor(*sema, dtor);
+            std::optional<DiagnosticScope> isolatedDiagnostics;
+            if (classSpecificOnly)
+                isolatedDiagnostics.emplace(sema->getDiagnostics());
+            auto* counting = dynamic_cast<CountingDiagnosticConsumer*>(
+                sema->getDiagnostics().getClient());
+            const unsigned before = counting != nullptr ? counting->errors : 0;
+            const bool failed = sema->CheckDestructor(dtor)
+                || dtor->getOperatorDelete() == nullptr;
+            if (!failed)
+            {
+                vtableDeleteResults.emplace(canonical, std::string());
+                return {};
+            }
+
+            if (poison) dtor->setInvalidDecl();
+            std::string text = counting != nullptr && counting->errors > before
+                ? counting->lastError
+                : "'operator delete' of a virtual destructor is unusable";
+            vtableDeleteResults.emplace(canonical, text);
+            if (poison && vtableCauses != nullptr) vtableCauses->emplace(dtor, text);
+            return text;
         }
 
         bool Skip(clang::Decl* decl)
@@ -785,6 +872,12 @@ namespace
                 else if (token.is(clang::tok::r_brace)) --depth;
             }
             if (depth != 0) capturing = &body;
+            // Recorded now, filtered later: the body is parsed mid-class, so a delete declared
+            // after the destructor is not in the class's lookup yet.
+            if (auto* dtor = llvm::dyn_cast<clang::CXXDestructorDecl>(fd);
+                dtor != nullptr && dtor->isVirtual() && !dtor->isDeleted()
+                && !dtor->isInvalidDecl() && !dtor->getParent()->isDependentContext())
+                skippedVirtualDtors.push_back(dtor);
             return true;
         }
 
@@ -1296,16 +1389,19 @@ namespace
         }
 
         /*
-         * Sema picks a virtual destructor's operator delete when it finishes the body (or, MS
-         * ABI, when the vtable is used and the destructor is undefined). A skipped body counts as
-         * defined yet never finished, so a used vtable's deleting destructor - which MS CodeGen
-         * emits with the vftable, body or not - found it null. Finish that check for every class
-         * whose vtable Sema marked used, before any CodeGen sees it.
+         * Sema normally picks operator delete while finishing a virtual destructor body. Check
+         * skipped definitions with class-specific deletes without replaying those bodies; the
+         * VTablesUsed pass also covers the used-vtable case where CodeGen needs the selection.
          */
         void ResolveUsedVTableDeletes()
         {
             if (sema == nullptr) return;
             std::vector<clang::CXXDestructorDecl*> pending;
+            std::unordered_set<clang::CXXDestructorDecl*> queued;
+            auto queue = [&](clang::CXXDestructorDecl* dtor)
+            {
+                if (queued.insert(dtor).second) pending.push_back(dtor);
+            };
             for (const auto& entry : sema->VTablesUsed)
             {
                 const clang::CXXRecordDecl* def = entry.first->getDefinition();
@@ -1317,23 +1413,25 @@ namespace
                     && (body->hasSkippedBody()
                         || bodies.count(const_cast<clang::FunctionDecl*>(body)) != 0)
                     && !body->isInvalidDecl())
-                    pending.push_back(dtor);
+                    queue(dtor);
+            }
+            for (clang::CXXDestructorDecl* dtor : skippedVirtualDtors)
+            {
+                const clang::FunctionDecl* body = nullptr;
+                if (dtor != nullptr && !dtor->isInvalidDecl() && !dtor->isDeleted()
+                    && dtor->getOperatorDelete() == nullptr
+                    && HasClassSpecificDelete(dtor->getParent())
+                    && dtor->isDefined(body)
+                    && (body->hasSkippedBody()
+                        || bodies.count(const_cast<clang::FunctionDecl*>(body)) != 0)
+                    && !body->isInvalidDecl())
+                    queue(dtor);
             }
             // CheckDestructor may mark more vtables used; never mutate the map mid-walk.
             for (clang::CXXDestructorDecl* dtor : pending)
             {
-                clang::Sema::ContextRAII inDtor(*sema, dtor);
-                auto* counting = dynamic_cast<CountingDiagnosticConsumer*>(
-                    sema->getDiagnostics().getClient());
-                const unsigned before = counting != nullptr ? counting->errors : 0;
-                const bool failed = sema->CheckDestructor(dtor)
-                    || dtor->getOperatorDelete() == nullptr;
-                if (!failed) continue;
-                dtor->setInvalidDecl();
-                std::string text = counting != nullptr && counting->errors > before
-                    ? counting->lastError
-                    : "'operator delete' of a virtual destructor is unusable";
-                if (vtableCauses != nullptr) vtableCauses->emplace(dtor, text);
+                std::string text = ResolveVTableDelete(dtor->getParent());
+                if (text.empty()) continue;
                 if (vtableDeleteDiagnostic.empty()) vtableDeleteDiagnostic = std::move(text);
             }
         }
@@ -2542,6 +2640,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
     // A drop over a not-yet-defined CFlat record: the request reports that error as firstError.
     // Any other drop is an ordinary recovery.
     std::string recoveredError;
+    std::string recoveredFirstError;
     for (unsigned attempt = 0;; ++attempt)
     {
         DiagnosticScope diagnostics(impl_->interpreter->getCompilerInstance()->getDiagnostics());
@@ -2662,6 +2761,7 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         }
         emptyFailedFunctions();
         if (recoveredError.empty()) recoveredError = diagnostics.consumer.incompleteRecordError;
+        if (recoveredFirstError.empty()) recoveredFirstError = diagnostics.consumer.firstError;
         if (impl_->verbose && req.cxxMacroProbes.empty())
             std::cout << std::format("[verbose] incremental request dropped declarations after "
                                      "'{}':\n{}", error, dropped);
@@ -2690,6 +2790,26 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
     if (effective.emitDefinitions || wrapperBatch) effective.demandPlan = &impl_->plan;
     effective.operatorIndex = &impl_->operatorIndex;
     effective.specialMemberRecords = &impl_->specialMemberRecords;
+    effective.vtableDeleteVerdict = [this](const clang::CXXRecordDecl* record) -> std::string {
+        // Only a class-scope operator delete can make the deleting destructor unusable.
+        if (record == nullptr || impl_->lazy.sema == nullptr
+            || !impl_->lazy.HasClassSpecificDelete(record))
+            return {};
+        const clang::CXXRecordDecl* definition = record->getDefinition();
+        if (definition == nullptr || definition->isDependentContext()) return {};
+        // A template's virtual destructor body is instantiated only on use; instantiate it so
+        // ResolveVTableDelete sees the body Sema would have checked for the vtable.
+        if (const clang::CXXDestructorDecl* dtor = definition->getDestructor();
+            dtor != nullptr && dtor->isVirtual() && !dtor->isDeleted() && !dtor->isDefined())
+        {
+            impl_->lazy.sema->MarkFunctionReferenced(
+                dtor->getLocation(), const_cast<clang::CXXDestructorDecl*>(dtor),
+                /*MightBeOdrUse*/ true);
+            impl_->lazy.sema->PerformPendingInstantiations();
+        }
+        return impl_->lazy.ResolveVTableDelete(definition, /*classSpecificOnly*/ true,
+                                               /*poison*/ false);
+    };
     // A retry renamed the thunks with its tag; the extractor looks them up by that name.
     if (parsedAttempt > 0 && !effective.cxxThunkSuffix.empty())
         effective.cxxThunkSuffix = PrepareRetryChunk(effective.cxxThunkSuffix, parsedAttempt);
@@ -2759,7 +2879,9 @@ bool CxxIncrementalGroup::ParseRequest(const cflat_cinterop::ExtractRequest& req
         std::sort(replay.poisonedBodies.begin(), replay.poisonedBodies.end());
         impl_->demandChunkSources.push_back(replay.source);
     }
-    if (harvested && out.firstError.empty()) out.firstError = recoveredError;
+    if (harvested && out.firstError.empty())
+        out.firstError = !recoveredError.empty() ? recoveredError
+            : out.records.empty() ? recoveredFirstError : std::string();
     if (harvested && !renamedWrappers.empty())
     {
         if (out.demandRecorded)
@@ -2967,6 +3089,36 @@ int CxxIncrementalGroup::CheckDemand(const std::string& symbol, std::string& err
     std::string failure;
     impl_->lazy.plan = &impl_->plan;
     impl_->lazy.MaterializeReachable({fd}, failure);
+    if (!impl_->lazy.vtableDeleteDiagnostic.empty())
+    {
+        error = "clang: " + impl_->lazy.vtableDeleteDiagnostic;
+        impl_->lazy.vtableDeleteDiagnostic.clear();
+        return -1;
+    }
+    if (const auto* method = llvm::dyn_cast<clang::CXXMethodDecl>(fd);
+        method != nullptr
+        && (llvm::isa<clang::CXXConstructorDecl>(method)
+            || llvm::isa<clang::CXXDestructorDecl>(method)))
+    {
+        const clang::CXXRecordDecl* record = method->getParent()->getDefinition();
+        const clang::CXXRecordDecl* canonical =
+            record != nullptr ? record->getCanonicalDecl() : nullptr;
+        const bool vtableCandidate = canonical != nullptr
+            && std::any_of(impl_->plan.vtables.begin(), impl_->plan.vtables.end(),
+                [&](const auto& entry) {
+                    return entry.second != nullptr
+                        && entry.second->getCanonicalDecl() == canonical;
+                });
+        if (vtableCandidate)
+        {
+            const std::string diagnostic = impl_->lazy.ResolveVTableDelete(record, true);
+            if (!diagnostic.empty())
+            {
+                error = "clang: " + diagnostic;
+                return -1;
+            }
+        }
+    }
     if (failure.empty() && diagnostics.consumer.firstError.empty()) return 1;
     // Sema can instantiate a helper before the callee walk reaches it. Keep its cold verdict.
     if (impl_->lazy.poisonDiagnostic.empty())
@@ -3035,9 +3187,14 @@ bool CxxIncrementalGroup::EmitDemandCompanion(const std::vector<std::string>& de
     };
     lazy.MarkPending(/*forCodeGen*/ true);
     const auto companionStart = std::chrono::steady_clock::now();
+    const auto previousResolver = impl_->plan.resolveVTableDelete;
+    impl_->plan.resolveVTableDelete = [this](const clang::CXXRecordDecl* record) {
+        return impl_->lazy.ResolveVTableDelete(record, /*classSpecificOnly*/ true);
+    };
     const bool ok = cflat_cinterop::EmitCxxDemandCompanion(
         *impl_->interpreter->getCompilerInstance(), impl_->plan, demand, &impl_->poisoned,
         impl_->verbose, bitcode, stats, error, targetContext, moduleOut);
+    impl_->plan.resolveVTableDelete = previousResolver;
     lazy.MarkPending(/*forCodeGen*/ false);
     impl_->plan.materializeBody = nullptr;
     impl_->plan.materializeReachable = nullptr;

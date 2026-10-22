@@ -4797,6 +4797,8 @@ void LLVMBackend::ResetForReanalysis()
     cxxFunctionTemplates_.clear();
     cxxFunctionTemplateOwnerGroup_.clear();
     cxxFunctionSignatures_.clear();
+    cxxFunctionParameterSpellingsByLinkage_.clear();
+    cxxTopLevelConstTypeAliases_.clear();
     cxxDefaultWrapperRequests_.clear();
     cxxRvalueRefBindVerdicts_.clear();
     cxxFunctionBindAttempts_.clear();
@@ -4812,7 +4814,9 @@ void LLVMBackend::ResetForReanalysis()
     cxxPendingSpecialBySpelling_.clear();
     cxxForeignNamespaces_.clear();
     cxxNestedNamespaceNames_.clear();
-    cxxConstGlobalSymbols_.clear();
+    cxxHeaderGlobalSymbols_.clear();
+    globalTypeCache_.clear();
+    constRefReturnCache_.clear();
     cGlobalSymbols_.clear();
     cxxUsingDirectives_.clear();
     cxxForeignTypeSpellings_.clear();
@@ -7070,14 +7074,10 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.IsAlias)                o["al"]  = true;
     if (s.IsRvalueRef)             o["rr"]  = true;
     if (s.IsCxxRefToPointer)      o["crp"] = true;
-    if (s.IsCxxConstRef)          o["ccr"] = true;
+    if (s.CxxRefLevel >= 0)       o["cxr"] = static_cast<int64_t>(s.CxxRefLevel);
     if (s.IsCxxConstValueReturn)  o["ccv"] = true;
-    if (s.IsCxxPointeeConst)      o["cpc"] = true;
     if (s.IsCxxPointeeVolatile)   o["cpv"] = true;
-    if (s.IsSpelledPointeeConst)  o["spc"] = true;
     if (s.IsCxxNullptrT)          o["cnt"] = true;
-    if (s.IsCxxConstField)        o["ccf"] = true;
-    if (s.IsCxxDeclaredConstField) o["ccdf"] = true;
     if (s.IsCxxMutableField)      o["cmf"] = true;
     if (s.IsOwningSink)           o["osk"] = true;
     if (s.IsConsumeInferredSink)  o["cis"] = true;
@@ -7166,14 +7166,10 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("al")) s.IsAlias = *v;
     if (auto v = o.getBoolean("rr")) s.IsRvalueRef = *v;
     if (auto v = o.getBoolean("crp")) s.IsCxxRefToPointer = *v;
-    if (auto v = o.getBoolean("ccr")) s.IsCxxConstRef = *v;
+    if (auto v = o.getInteger("cxr")) s.CxxRefLevel = static_cast<int8_t>(*v);
     if (auto v = o.getBoolean("ccv")) s.IsCxxConstValueReturn = *v;
-    if (auto v = o.getBoolean("cpc")) s.IsCxxPointeeConst = *v;
     if (auto v = o.getBoolean("cpv")) s.IsCxxPointeeVolatile = *v;
-    if (auto v = o.getBoolean("spc")) s.IsSpelledPointeeConst = *v;
     if (auto v = o.getBoolean("cnt")) s.IsCxxNullptrT = *v;
-    if (auto v = o.getBoolean("ccf")) s.IsCxxConstField = *v;
-    if (auto v = o.getBoolean("ccdf")) s.IsCxxDeclaredConstField = *v;
     if (auto v = o.getBoolean("cmf")) s.IsCxxMutableField = *v;
     if (auto v = o.getBoolean("osk")) s.IsOwningSink = *v;
     if (auto v = o.getBoolean("cis")) s.IsConsumeInferredSink = *v;
@@ -7441,6 +7437,7 @@ static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
     if (s.IsCxx)        o["cxx"] = true;
     if (s.IsCoreLibraryFunction) o["core"] = true;
     if (s.IsCInteropDeclaration) o["cinterop"] = true;
+    if (s.IsCxxConstructorForwardingWrapper) o["cxxctorwrap"] = true;
     if (s.CxxRefQualifier != cflat_cinterop::CxxRefQualifierNone)
         o["cxxrq"] = s.CxxRefQualifier;
     if (s.CxxVolatile)  o["cxxvol"] = true;
@@ -7629,8 +7626,9 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     // than silently reused (v6 includes the LSP core-variable replay state; v8 is the non-pointer
     // `alias T` parameter reference ABI; v11 adds closure capture-cleanup MOVE mode 2; v12 adds
     // const floating global admission names; v13 stores function origin metadata; v16 adds
-    // const interface methods; v17 function-type pointee const masks).
-    root["version"]   = 17;
+    // const interface methods; v17 function-type pointee const masks; v18 C/C++ pointee, reference
+    // and field const folded into ConstMask).
+    root["version"]   = 19;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
 #if defined(__APPLE__)
@@ -8118,7 +8116,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 17) return false;
+    if (!ver || *ver != 19) return false;
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != coreHash) return false;
 #if defined(__APPLE__)
@@ -8322,6 +8320,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (auto v = fo->getBoolean("cxx")) sym.IsCxx = *v;
             if (auto v = fo->getBoolean("core")) sym.IsCoreLibraryFunction = *v;
             if (auto v = fo->getBoolean("cinterop")) sym.IsCInteropDeclaration = *v;
+            if (auto v = fo->getBoolean("cxxctorwrap")) sym.IsCxxConstructorForwardingWrapper = *v;
             if (auto v = fo->getInteger("cxxrq")) sym.CxxRefQualifier = (int)*v;
             if (auto v = fo->getBoolean("cxxvol")) sym.CxxVolatile = *v;
             if (auto v = fo->getBoolean("cxxconst")) sym.CxxConst = *v;

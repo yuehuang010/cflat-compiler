@@ -753,6 +753,7 @@ bool LLVMBackend::IsCxxRvalueReferenceArgument(const NamedVariable& arg) const
         // Every imported macro constant, and a `?:` joining two of them, is a C++ prvalue.
         if (arg.IsCxxMacroGlobal || arg.IsCxxMacroJoin) return true;
         if (arg.IsExplicitMove) return true;
+        if (IsCxxRvalueRefClassResult(arg)) return true;
         if (arg.IsRvalue && arg.TypeAndValue.Pointer) return true;
         if (arg.IsRvalue && arg.TypeAndValue.IsRvalueRef) return true;
         if (arg.IsRvalue && IsConsumableTemporary(arg)) return true;
@@ -839,6 +840,10 @@ std::string LLVMBackend::CxxReferenceParameterSpelling(const FunctionSymbol& can
                     if (raw.linkageName == *linkage
                         && index < raw.paramSpellings.size())
                         return raw.paramSpellings[index];
+            if (auto spelling = cxxFunctionParameterSpellingsByLinkage_.find(*linkage);
+                spelling != cxxFunctionParameterSpellingsByLinkage_.end()
+                && index < spelling->second.size())
+                return spelling->second[index];
             if (auto memo = cxxMethodLinkageMemo_.find(*linkage); memo != cxxMethodLinkageMemo_.end())
                 if (auto record = cxxRecordEntries_.find(memo->second.first);
                     record != cxxRecordEntries_.end() && memo->second.second < record->second.members.size())
@@ -861,6 +866,11 @@ std::string LLVMBackend::CxxReferenceParameterSpelling(const FunctionSymbol& can
             if (declared == candidate.UniqueName) break;
         }
         return {};
+}
+
+bool LLVMBackend::IsCxxTopLevelConstTypeAlias(const std::string& name) const
+{
+        return cxxTopLevelConstTypeAliases_.count(name) != 0;
 }
 
 bool LLVMBackend::CxxReferenceArgumentMatches(const TypeAndValue& param,
@@ -910,12 +920,12 @@ bool LLVMBackend::CxxReferenceArgumentMatches(const TypeAndValue& param,
         if (!param.TypeName.empty() && param.TypeName == arg.TypeAndValue.TypeName)
             return true;
         TypeAndValue referent = param;
+        referent.DropCxxRef();
         referent.Pointer = false;
         referent.ElemPointer = false;
         referent.PointerDepth = 0;
         referent.IsAlias = false;
         referent.IsRvalueRef = false;
-        referent.IsCxxConstRef = false;
         return arg.BaseType != nullptr && GetType(referent) == arg.BaseType;
 }
 
@@ -1180,9 +1190,10 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
         sig.FuncPtrReturnAlias = sym.ReturnType.IsAlias;
         sig.FuncPtrVariadic = sym.Variadic;
         sig.FuncPtrReturnPointerDepth = sym.ReturnType.ValuePointerDepth();
-        // Pointee const is part of the function type; a C++ function's stays unrecorded (phase 5).
-        if (!sym.IsCxx)
-            sig.FuncPtrReturnConstMask = sym.ReturnType.PointeeConstMask();
+        // Pointee const is part of the function type, a C++ function's included.
+        sig.FuncPtrReturnConstMask = sym.ReturnType.FunctionReturnConstMask();
+        // A C++ reference result keeps its reference level: binding checks tell its const from a native alias's.
+        sig.CxxRefLevel = sym.ReturnType.CxxRefLevel;
         for (const auto& p : sym.Parameters)
         {
             TypeAndValue::FuncPtrParam fp;
@@ -1197,9 +1208,8 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
             fp.IsReturnInferredSink = p.IsReturnInferredSink;
             fp.IsWriteInferredSink = p.IsWriteInferredSink;
             fp.PointerDepth = p.ValuePointerDepth();
-            if (!sym.IsCxx) fp.ConstMask = p.PointeeConstMask();
-            // A C++ member's mapped pointee const is recorded only as IsCxxPointeeConst.
-            fp.IsPointeeConst = p.IsSpelledPointeeConst || (sym.IsCxx && p.IsCxxPointeeConst);
+            fp.ConstMask = p.PointeeConstMask();
+            fp.IsPointeeConst = (p.PointeeConstMask() & 1u) != 0;
             sig.FuncPtrParams.push_back(fp);
         }
         return sig;
@@ -1288,6 +1298,8 @@ std::string LLVMBackend::FuncPtrSpellingOf(const LLVMBackend::TypeAndValue& tv) 
         return s + ")";
     }
 
+// A native value alias result's const is not compared (adding const binds; master accepts dropping it).
+// A C++ reference result refuses only a const referent bound to a mutable alias slot.
 bool LLVMBackend::FuncPtrPointeeConstDiffers(const TypeAndValue& value, const TypeAndValue& slot,
         std::string& valueSpelled, std::string& slotSpelled) const
 {
@@ -1302,8 +1314,13 @@ bool LLVMBackend::FuncPtrPointeeConstDiffers(const TypeAndValue& value, const Ty
             || !target.IsFunctionPointer)
             return false;
         auto differ = [](int a, int b) { return a >= 0 && b >= 0 && a != b; };
-        // A by-value component records 0; a pointer alias component (`CStr`) records its alias's levels.
-        bool differs = differ(source.FuncPtrReturnConstMask, target.FuncPtrReturnConstMask);
+        const bool nativeValueAlias = source.FuncPtrReturnAlias && !source.IsCxxRef() && !source.FuncPtrReturnPointer;
+        bool differs = false;
+        if (!nativeValueAlias && source.IsCxxRef() && target.FuncPtrReturnAlias)
+            differs = source.FuncPtrReturnConstMask >= 0 && target.FuncPtrReturnConstMask >= 0
+                && (source.FuncPtrReturnConstMask & ~target.FuncPtrReturnConstMask) != 0;
+        else if (!nativeValueAlias)
+            differs = differ(source.FuncPtrReturnConstMask, target.FuncPtrReturnConstMask);
         // The shared prefix: an arity difference is the bind rule's business.
         for (size_t i = 0; i < source.FuncPtrParams.size() && i < target.FuncPtrParams.size(); i++)
             differs = differs || differ(source.FuncPtrParams[i].ConstMask, target.FuncPtrParams[i].ConstMask);

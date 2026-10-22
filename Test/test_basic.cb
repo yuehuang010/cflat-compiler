@@ -8713,6 +8713,20 @@ using TcIntPtr = int*;
 int tcGenericFirst<T>(const T p) { return p[0]; }   // T = int*: `const T` is `const int*`
 T tcGenericBump<T>(T v) { v++; return v; }           // a const argument deduces T = int
 
+int[2] t342GlobalViewA = { 1, 2 };
+int[2] t342GlobalViewB = { 3, 4 };
+(const int)[] t342GlobalView = t342GlobalViewA;
+struct T342ConstViewField { (const int)[] v = default; };
+int t342ConstViewParam((const int)[] v, int[] b) { v = b; return v[0] + v[1]; }
+int t342ConstViewGeneric<T>(T v, int[] b) { v = b; return v[0] + v[1]; }
+int t342IsConst<T>(T v) { if const (is_const(T)) return 1; else return 0; }
+int t342IsAssignable<T>(T v) { if const (is_assignable(T)) return 1; else return 0; }
+int t342ConstViewGlobalReseat()
+{
+    t342GlobalView = t342GlobalViewB;
+    return t342GlobalView[0] + t342GlobalView[1];
+}
+
 bool testConstWholeWord()
 {
     bool result = true;
@@ -8735,6 +8749,27 @@ bool testConstWholeWord()
     result &= Test("const_using_typeof", typeof(aliasView), typeof(spelledView));
     result &= Test("const_using_typeof_whole", typeof(aliasConstPtr), typeof(spelledConstPtr));
     result &= Test("const_using_typeof_text", typeof(aliasConstPtr), "const int*");
+
+    int[2] t342A = { 1, 2 };
+    int[2] t342B = { 3, 4 };
+    (const int)[] t342View = t342A;
+    t342View = t342B;
+    result &= Test("const_view_local_reseat", t342View[0] + t342View[1], 7);
+    const (int)[] t342ParenView = t342A;
+    t342ParenView = t342B;
+    result &= Test("const_paren_element_view_reseat", t342ParenView[0] + t342ParenView[1], 7);
+    result &= Test("const_view_param_reseat", t342ConstViewParam(t342A, t342B), 7);
+    T342ConstViewField t342Field = { v = t342A };
+    t342Field.v = t342B;
+    result &= Test("const_view_field_reseat", t342Field.v[0] + t342Field.v[1], 7);
+    result &= Test("const_view_global_reseat", t342ConstViewGlobalReseat(), 7);
+    // Start the generic legs on t342A so only a real reseat onto t342B yields 7.
+    (const int)[] t342GenView = t342A;
+    result &= Test("const_view_generic_explicit_reseat",
+                   t342ConstViewGeneric<(const int)[]>(t342GenView, t342B), 7);
+    result &= Test("const_view_generic_deduced_reseat", t342ConstViewGeneric(t342GenView, t342B), 7);
+    result &= Test("const_view_is_const", t342IsConst<(const int)[]>(t342View), 1);
+    result &= Test("const_view_is_assignable", t342IsAssignable<(const int)[]>(t342View), 1);
     return result;
 }
 
@@ -8753,6 +8788,11 @@ struct C08TBox
     void Set(int v) { n = v; }
     C08TBox operator+(C08TBox other) const { C08TBox r = { n = n + other.n }; return r; }
 };
+struct T343AliasInferred
+{
+    int value = 51;
+    alias int Ref() { return value; }
+};
 struct C08TCell<T> { T v = default; T Read() const { return v; } };
 interface IC08TRead { int read() const; void write(int v); };
 class C08TMarked : IC08TRead { int n = 70; int read() const { return n; } void write(int v) { n = v; } };
@@ -8765,6 +8805,10 @@ int c08TViaHolder(const C08TIfaceHolder h) { return h.r.read(); }
 bool testConstTrailing()
 {
     bool result = true;
+    T343AliasInferred aliasInferred = default;
+    alias int aliasValue = aliasInferred.Ref();
+    aliasValue = 52;
+    result &= Test("t343_inferred_alias_return", aliasInferred.value, 52);
     int target = 3;
     const C08TBox box = { n = 5, p = &target };
     C08TBox m = default;

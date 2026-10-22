@@ -445,6 +445,10 @@ namespace cflat_cinterop
         bool specialMembersPending = false;
         // M4 class surface. Every flag is Clang's own answer, never derived from the member list.
         bool isPolymorphic = false;         // has a virtual function or a virtual base
+        // Clang's verdict on the class's deleting destructor, computed at extraction and cached
+        // with the record: the text of why it is unusable ("" = usable or no class-scope delete).
+        // Read at each object demand so a warm compile needs no live group to refuse it.
+        std::string vtableDeleteVerdict;
         bool hasBases = false;              // any base class
         bool hasVirtualBases = false;       // virtual inheritance: rejected, the VTT is not modelled
         bool isFinal = false;               // final class: a reference to it names a complete object
@@ -634,6 +638,8 @@ namespace cflat_cinterop
         // Same, for everything CodeGen can reach from the demanded functions (one walk up front).
         std::function<void(std::vector<const clang::FunctionDecl*>, std::string&, std::string&)>
             materializeReachable;
+        // Validate a newly demanded polymorphic record before it reaches demand CodeGen.
+        std::function<std::string(const clang::CXXRecordDecl*)> resolveVTableDelete;
 
         void Add(clang::Decl* decl)
         {
@@ -756,6 +762,8 @@ namespace cflat_cinterop
         // header harvest, read by a completion request (whose markers are placeholders, so a
         // private nested record completes too).
         std::unordered_map<std::string, const clang::CXXRecordDecl*>* specialMemberRecords = nullptr;
+        // Fills RawRecord::vtableDeleteVerdict for a polymorphic record; unset = no verdict.
+        std::function<std::string(const clang::CXXRecordDecl*)> vtableDeleteVerdict;
         /*
          * Destination for a PCH built from `source` (an include-only prologue) instead of an
          * extraction. The caller supplies driver args selecting `-x c++-header`; the output path

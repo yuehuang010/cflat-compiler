@@ -3451,7 +3451,7 @@ extern int main()
         nest.Cell *crpFreeReturn = nest.constref_return();
         if (crpFreeReturn->b != 3)                                           return 2468;
         nest.constref_set_const_slot(crp);
-        nest.Cell *crpFreeConstReturn = nest.constref_const_return();
+        (const nest.Cell)* crpFreeConstReturn = nest.constref_const_return();
         if (crpFreeConstReturn->a != 2)                                      return 2469;
         int *crpFreeIntReturn = cppt.constref_int_return();
         if (*crpFreeIntReturn != 8)                                          return 2470;

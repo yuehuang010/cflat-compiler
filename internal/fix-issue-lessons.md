@@ -3559,3 +3559,13 @@ Per-item detail lives in the named issue file; durable decisions here.
   const-local array dimension (waits for enforced const-for-variables, the next feature).
 - Heap array through `move T*` into a unique field (p2/unique-field-heap-array-through-move-param) stays ON HOLD; the
   2026-10-15 discussion (new[] not movable at a call site, `unique T[]`) is recorded in that file, not ruled.
+
+## Ruling 2026-10-20: owed rulings from fix box 2026-10-16b
+- Lowered struct (CFlat struct with a C++ class field): `move v` into a by-value parameter is a real C++ move-construct
+  (lowering rule A; T130 and bridge legs stand), and a by-value L parameter is an owned copy, so forwarding it into a move
+  sink is legal. p3 lowered-struct-move-sink-leftovers closed as intended; the T303 parked patch is not to be landed.
+- A `Lambda<>` value never converts implicitly to thin `function<>` (assignment or `?:` join); spell `.toFunction()` and
+  null-check. No provably-captureless exception.
+- Sized class `operator delete(void*, N)` is recognized only when N is the target's size_t, as in clang.- A header defining a virtual dtor whose class-scope operator delete is deleted/private/ambiguous is refused at import,
+  even if unused, as in clang (T333). Import-time refusals are tested by new `Test/errors/err_*.cb` files, not legs
+  behind a shared import.

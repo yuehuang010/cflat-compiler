@@ -1,0 +1,8 @@
+// Import-time refusal: a virtual destructor whose inherited operator delete is private.
+expect_error("'operator delete' is a private member of");
+import cpp "cpp_vdtor_opdelete_private.h";
+
+extern int main()
+{
+    return 0;
+}

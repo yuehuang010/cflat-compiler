@@ -1,0 +1,100 @@
+// Const phase 5b: writes through a const C++ pointee, to a const C++ field, through a
+// `mutable const T*` member and to a const C++ field of a CFlat struct are refused like clang.
+import cpp "cpp_interop_proxy_assign.h";
+
+struct C5bWrap { const cpppa.C5bIn l = default; };
+struct C5bWrapR { const cpppa.C5bIn r = default; };
+
+// A named pointer alias result: its resolved (const int)* return must not bind a mutable int* slot.
+using C5bNamedPtr = (const int)*;
+int c5bNamedObj = 7;
+C5bNamedPtr c5bNamedP = &c5bNamedObj;
+alias C5bNamedPtr c5bNamedGet() { return c5bNamedP; }
+
+extern int main()
+{
+    // clang: cannot assign to return value because function 'c5b_outp' returns a const value
+    expect_error("cannot assign to 'cpppa.c5b_outp()->in.x': it is reached through a pointer to const ('cpppa.c5b_outp()')") {
+        cpppa.c5b_outp()->in.x = 5;
+    }
+    // clang: read-only variable is not assignable
+    expect_error("cannot assign to '(*cpppa.c5b_outp()).in.x': it is reached through a pointer to const ('cpppa.c5b_outp()')") {
+        (*cpppa.c5b_outp()).in.x = 5;
+    }
+    // clang: cannot assign to variable 'p' with const-qualified type 'const C5bOut *'
+    expect_error("cannot assign to 'c5bAutoOut->y': it is reached through a pointer to const ('c5bAutoOut')") {
+        auto c5bAutoOut = cpppa.c5b_outp();
+        c5bAutoOut->y = 1;
+    }
+    // A `const T*&` result read into an auto local keeps its const pointee.
+    expect_error("cannot assign to 'c5bRefOut->v': it is reached through a pointer to const ('c5bRefOut')") {
+        cpppa.C5bHolder c5bHolder = default;
+        auto c5bRefOut = c5bHolder.cpr();
+        c5bRefOut->v = 18;
+    }
+    // clang: read-only variable is not assignable (`mutable const C5bLeaf* p`)
+    expect_error("cannot assign to 'cpppa.c5bPtr.p->x': it is reached through a pointer to const ('cpppa.c5bPtr.p')") {
+        cpppa.c5bPtr.p->x = 11;
+    }
+    // clang: cannot assign to non-static data member 'ci' with const-qualified type 'const int'
+    expect_error("cannot assign to 'c5bH->ci': field 'ci' is const and can only be set during construction") {
+        cpppa.C5bH* c5bH = cpppa.c5b_ph();
+        c5bH->ci = 5;
+    }
+    // clang: cannot assign to non-static data member 'l' with const-qualified type 'const In'
+    expect_error("cannot assign to 'c5bWrap.l.x': field 'l' is const and can only be set during construction") {
+        C5bWrap c5bWrap = default;
+        c5bWrap.l.x = 11;
+    }
+    // clang: 'this' argument to member function 'set' has type 'const R', but function is not marked const
+    expect_error("cannot call non-const member 'set' on 'c5bConstR'") {
+        (const cpppa.C5bR)* c5bConstR = cpppa.c5b_mr();
+        c5bConstR->set(2);
+    }
+    // clang: cannot assign to variable 'p' with const-qualified type 'const R *'
+    expect_error("cannot assign to 'c5bAutoR->v': it is reached through a pointer to const ('c5bAutoR')") {
+        auto c5bAutoR = cpppa.c5b_cr();
+        c5bAutoR->v = 3;
+    }
+    // clang: copy assignment operator is implicitly deleted (const member 'r' of class type)
+    expect_error("cannot assign a whole 'C5bWrapR': field 'r' is const") {
+        C5bWrapR c5bWa = default;
+        C5bWrapR c5bWb = default;
+        c5bWa = c5bWb;
+    }
+    expect_error("cannot assign to 'cpppa.C5bR.p->v':") {
+        cpppa.C5bR.p->v = 11;
+    }
+    expect_error("cannot assign to 'cpppa.C5bR.q->v':") {
+        cpppa.C5bR.q->v = 12;
+    }
+    expect_error("cannot assign to 'cpppa.C5bR.q':") {
+        cpppa.C5bR.q = &cpppa.C5bR.secondObj;
+    }
+    expect_error("cannot assign to 'cpppa.C5bR.constHolder.p':") {
+        cpppa.C5bR.constHolder.p = &cpppa.C5bR.secondObj;
+    }
+    expect_error("cannot assign to 'c5bConstRefFn().v':") {
+        auto c5bConstRefFn = cpppa.c5b_constref_fn();
+        c5bConstRefFn().v = 13;
+    }
+    expect_error("cannot assign to 'c5bConstPtrFn()->v':") {
+        auto c5bConstPtrFn = cpppa.c5b_constptr_fn();
+        c5bConstPtrFn()->v = 14;
+    }
+    expect_error("construct_at destination is const") {
+        const cpppa.C5bR c5bConstPlacement = default;
+        construct_at(&c5bConstPlacement, cpppa.C5bR());
+    }
+    expect_error("conversion discards const") {
+        function<alias cpppa.C5bR()> c05bMutableAlias = cpppa.c5b_constref;
+    }
+    expect_error("conversion discards const") {
+        Lambda<alias cpppa.C5bR()> c05bMutableLambda = cpppa.c5b_constref;
+    }
+    expect_error("conversion discards const") {
+        function<alias C5bNamedPtr()> c5bNamedFn = c5bNamedGet;
+        function<alias int*()> c5bNamedDrop = c5bNamedFn;
+    }
+    return 0;
+}

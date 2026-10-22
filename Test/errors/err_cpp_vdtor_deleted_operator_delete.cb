@@ -1,0 +1,8 @@
+// Import-time refusal: a virtual destructor whose class-scope operator delete is deleted.
+expect_error("attempt to use a deleted function");
+import cpp "cpp_vdtor_opdelete_deleted.h";
+
+extern int main()
+{
+    return 0;
+}

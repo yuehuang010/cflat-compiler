@@ -54,6 +54,22 @@ expect_error("cannot return '(const int)*' as 'int*': the conversion discards co
     struct C08R4<T> { T v = default; T Read() const { return v; } };
     int c08R4Use() { int k = 1; C08R4<int*> c = { v = &k }; return *c.Read(); }
 }
+expect_error("cannot return '(const int)*' as 'int*': the conversion discards const")
+{
+    struct T343AliasBare { int v = 0; alias int Ref() const { return v; } };
+}
+expect_error("cannot return '(const int)*' as 'int*': the conversion discards const")
+{
+    struct T343AliasThisDot { int v = 0; alias int Ref() const { return this.v; } };
+}
+expect_error("cannot return '(const int)*' as 'int*': the conversion discards const")
+{
+    struct T343AliasThisArrow { int v = 0; alias int Ref() const { return this->v; } };
+}
+expect_error("cannot return '(const int)*' as 'int*': the conversion discards const")
+{
+    alias int t343AliasFromConstParam(const alias int value) { return value; }
+}
 expect_error("cannot convert '(const int)*' to 'int*': the conversion discards const")
 {
     struct C08R2 { int n = 0; int Grab() const { int* q = &n; return *q; } };

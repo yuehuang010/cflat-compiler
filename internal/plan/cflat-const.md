@@ -37,7 +37,14 @@ cache v266. C function-pointer results/params stay unconst (p3 function-type-can
 TRAILING CONST RULED 2026-10-19 (R3 -> C), PHASE 8 LANDED 2026-10-19 (87b36b2f1; constructors cannot be const;
 leftovers p3 trailing-const-leftovers-after-c08, p3 duplicate-function-definition-accepted): C++ spelling `int get() const`; explicit const asserts
 (#9), inference stays for unmarked methods, interface methods must spell const (#10). RULED 2026-10-19: function types carry pointee const, exact-match identity (LANDED c14 same day); string data() -> (const char)*, data_mut()
-copies a borrowed string first (rulings in the two p3 issue files). Phase 5 (C++) ON HOLD.
+copies a borrowed string first (rulings in the two p3 issue files). Phase 5 (C++) hold LIFTED 2026-10-20 (maintainer: "it should map
+better"). PHASE 5a LANDED 2026-10-20 (f2e0bb2ea): IsCxxPointeeConst / IsCxxConstRef / IsSpelledPointeeConst / IsCxxConstField folded into
+ConstMask (CxxRefLevel keeps the reference level), C++ ranking reads native pointee const; interim bits CxxConstChecked /
+NativeConstHidden and the MarkCxxConstFieldAccess slot metadata remain for 5b (boundary refusals) to remove.
+PHASE 5b LANDED 2026-10-20 (C05B): interim bits, constfield/constref metadata and the C++ const global side set removed - ConstMask
+is the one C/C++ const source; C++ const is shallow (owner record, exact spelled levels); RefuseConstWrite at =, op= and ++/--; header
+cache 272, core cache 19. Left for phase 5 closure: p3/cpp-const-gaps-static-member-indirect-ref-construct-at (T346),
+p3/native-auto-copy-drops-transitive-const.
 RULED 2026-10-19: a `(const E)[]` generic argument is its own instantiation, mangled distinctly like `(const E)*` (phase 7);
 element const is enforced in the body and is_const answers 1 (today it binds as `E[]`, so a const view cannot be passed
 to a generic at all - fails safe). VIEW RULING LANDED 2026-10-19 (74834c205; mangled .c1$.v$, depth-1 like pointers; function-type view params = p3 function-type-view-param-rejected). IS_CONST(T) LANDED 2026-10-19 (c44b629c3; view args answer 1). STRING data()/data_mut() LANDED (076a9dd31). Open:
@@ -171,9 +178,9 @@ Breakage estimate: write-refusal phases break little (const is mostly on read-on
 as `const char*`.
 
 Open issues this plan closes (delete on landing, move durable records to fix-issue-lessons digest
-first): `p3/c-const-leftovers-after-t183`, `p3/cpp-const-pointee-dropped-at-pointer-init-and-const-result-writes`,
+first): `p3/c-const-leftovers-after-t183`, ~~`p3/cpp-const-pointee-dropped-at-pointer-init-and-const-result-writes`~~ (closed 5b),
 `p3/array-dimension-constant-lookup-leftovers` (const-local leg). Touches:
-`p3/cpp-const-byvalue-return-receiver-cv`, `p3/cpp-typed-null-operand-loses-pointee-const-in-operator-ranking`.
+`p3/cpp-const-byvalue-return-receiver-cv`, ~~`p3/cpp-typed-null-operand-loses-pointee-const-in-operator-ranking`~~ (closed 5b).
 
 ## 2. Semantics (proposed)
 

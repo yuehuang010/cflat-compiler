@@ -865,27 +865,18 @@ public:
         bool IsRvalueRef = false; // C++ T&& parameter: borrowed address, but only rvalues bind
         bool IsCxxRefToPointer = false; // C++ T*&: the value is the address of a T* slot
         /*
-         * C++ reference whose REFERENT is const (`const T&`, `const T&&`, `T *const &`): an rvalue
-         * may bind it, and a write through it is refused. On a pointer shape the referent is the
-         * pointer slot, never the pointee - pointee const is IsCxxPointeeConst.
+         * C++ reference shape (`T&`, `const T&`, `T&&`, `T *const &`, or a const operand bound as
+         * one): the ConstMask level of its referent, fixed when marked, -1 when not a reference.
+         * Whether the referent is const is that ConstMask bit; CxxConstRef() reads the two together.
          */
-        bool IsCxxConstRef = false;
+        int8_t CxxRefLevel = -1;
         // Top-level const on a C++ class returned by value; applies to its call-result prvalue.
         bool IsCxxConstValueReturn = false;
-        // C++ pointer result whose innermost POINTEE is const (`const T*`, `const T*&`,
-        // `T const *const &`, `const T *const *`). Internal only: overload ranking and receivers.
-        bool IsCxxPointeeConst = false;
         // C++ receiver whose innermost pointee or referent is volatile.
         bool IsCxxPointeeVolatile = false;
-        // Spelled `const T*` (pointee const). CFlat drops const; only the C++ spelling of a CFlat
-        // function's type reads it, so `int f(const void*)` crosses as clang spells it.
-        bool IsSpelledPointeeConst = false;
         // Declared std::nullptr_t (CFlat spells it void*): only such a value, a nullptr literal
         // or 0 binds a C++ nullptr_t parameter. Internal only: overload viability.
         bool IsCxxNullptrT = false;
-        bool IsCxxConstField = false;
-        // Explicit const on this C++ field, separate from constness inherited from its receiver.
-        bool IsCxxDeclaredConstField = false;
         // C++ mutable field; the member object ignores constness of its parent.
         bool IsCxxMutableField = false;
         // Set by the ForwardRefScanner body-scan on a plain by-value parameter the callee body
@@ -980,7 +971,7 @@ public:
             bool IsReturnInferredSink = false;
             bool IsWriteInferredSink = false;
             bool IsRvalueRef = false;
-            bool IsPointeeConst = false;  // spelled `const T*`; see IsSpelledPointeeConst
+            bool IsPointeeConst = false;  // spelled `const T*` (a C++ signature: ConstMask is -1)
             int PointerDepth = 0;   // 0 = not recorded; see FuncPtrReturnPointerDepth
             std::string ResolvedTypeKey;  // "" = not recorded; see FuncPtrReturnResolvedKey
             int ConstMask = -1;     // -1 = not recorded; see FuncPtrReturnConstMask
@@ -1181,15 +1172,14 @@ public:
 
         void ApplyWholeWordConst()
         {
-            const int depth = IsArrayView ? (ElemPointer ? 1 : 0) : ValuePointerDepth();
+            const int depth = ValuePointerDepth();
             ConstMask = static_cast<uint8_t>((1u << (depth + 1)) - 1u);
         }
 
-        // The declared OBJECT itself is const: the ConstMask bit at the level ApplyWholeWordConst
-        // treats as the object (`const int* p` and `const int x` yes, `(const int)* q` no).
+        // The declared object is the value's top pointer level; a view's element is one level below.
         bool IsConstObject() const
         {
-            const int depth = IsArrayView ? (ElemPointer ? 1 : 0) : ValuePointerDepth();
+            const int depth = ValuePointerDepth();
             return ((ConstMask >> depth) & 1u) != 0;
         }
 
@@ -1200,6 +1190,69 @@ public:
             const int depth = ValuePointerDepth();
             if (IsArrayView || depth <= 0) return 0;
             return ConstMask & ((1 << depth) - 1);
+        }
+
+        // A function type stores pointer pointee const, or the ConstMask of a reference result.
+        int FunctionReturnConstMask() const
+        {
+            return IsCxxRef() ? static_cast<int>(ConstMask) : PointeeConstMask();
+        }
+
+        // The ConstMask level of a C++ reference's referent: a `const T&` modelled as a pointer to T
+        // is its pointee (0), a `T *const &` its pointer slot, a by-value shape the object itself.
+        int CxxReferentLevel() const
+        {
+            if (CxxRefLevel >= 0) return CxxRefLevel;
+            const int depth = ValuePointerDepth();
+            return !IsCxxRefToPointer && Pointer && (IsAlias || IsRvalueRef) && depth > 0 ? depth - 1 : depth;
+        }
+        bool IsCxxRef() const { return CxxRefLevel >= 0; }
+        // Marks a reference of the current (final) shape; its referent level stays put after.
+        void MarkCxxRef()
+        {
+            if (CxxRefLevel < 0) CxxRefLevel = static_cast<int8_t>(CxxReferentLevel());
+        }
+        // `const T&`, `const T&&`, `T *const &`: a C++ reference whose referent is const.
+        bool CxxConstRef() const { return IsCxxRef() && ((ConstMask >> CxxRefLevel) & 1u) != 0; }
+        void SetCxxConstRef(bool isConst)
+        {
+            if (isConst)
+            {
+                MarkCxxRef();
+                ConstMask |= static_cast<uint8_t>(1u << CxxRefLevel);
+            }
+            else if (IsCxxRef())
+                ConstMask &= static_cast<uint8_t>(~(1u << CxxRefLevel));
+        }
+        // Bit 0 is a reference's own referent, not a pointee: a `const T&` object or alias shape.
+        // A plain pointer taken from it (`&ref`) keeps its bit 0 as the pointee.
+        bool CxxRefOwnsBit0() const
+        {
+            return IsCxxRef() && CxxRefLevel == 0 && !(Pointer && !IsAlias && !IsRvalueRef);
+        }
+        // No longer a reference (the referent itself, or a value re-shaped from it).
+        void DropCxxRef()
+        {
+            SetCxxConstRef(false);
+            CxxRefLevel = -1;
+        }
+        // Innermost pointee (or array element) const of a pointer, array or view shape. A
+        // reference to a non-pointer referent has none: its bit 0 is the referent.
+        bool PointeeConst() const
+        {
+            if ((ConstMask & 1u) == 0) return false;
+            if (CxxRefOwnsBit0()) return false;
+            return Pointer || IsArrayView || ConstArraySize > 0 || IsCxxRefToPointer;
+        }
+        // Bit 0 as a pointee, or as the object a `->` reached through such a pointer (never a
+        // reference's own referent): what the C/C++ boundary checks read.
+        bool PointeeConstBit() const { return (ConstMask & 1u) != 0 && !CxxRefOwnsBit0(); }
+        void SetPointeeConstBit(bool isConst)
+        {
+            if (isConst)
+                ConstMask |= 1u;
+            else if (!CxxRefOwnsBit0())
+                ConstMask &= static_cast<uint8_t>(~1u);
         }
 
         // A plain `T**` value, proven either by the ElemPointer bit or by a recorded depth >= 2
@@ -1317,14 +1370,10 @@ public:
         bool IsAlias = false;
         bool IsRvalueRef = false;
         bool IsCxxRefToPointer = false;
-        bool IsCxxConstRef = false;
+        int8_t CxxRefLevel = -1;
         bool IsCxxConstValueReturn = false;
-        bool IsCxxPointeeConst = false;
         bool IsCxxPointeeVolatile = false;
-        bool IsSpelledPointeeConst = false;
         bool IsCxxNullptrT = false;
-        bool IsCxxConstField = false;
-        bool IsCxxDeclaredConstField = false;
         bool IsCxxMutableField = false;
         bool IsOwningSink = false;
         bool IsConsumeInferredSink = false;
@@ -1395,14 +1444,10 @@ public:
             s.IsAlias = t.IsAlias;
             s.IsRvalueRef = t.IsRvalueRef;
             s.IsCxxRefToPointer = t.IsCxxRefToPointer;
-            s.IsCxxConstRef = t.IsCxxConstRef;
+            s.CxxRefLevel = t.CxxRefLevel;
             s.IsCxxConstValueReturn = t.IsCxxConstValueReturn;
-            s.IsCxxPointeeConst = t.IsCxxPointeeConst;
             s.IsCxxPointeeVolatile = t.IsCxxPointeeVolatile;
-            s.IsSpelledPointeeConst = t.IsSpelledPointeeConst;
             s.IsCxxNullptrT = t.IsCxxNullptrT;
-            s.IsCxxConstField = t.IsCxxConstField;
-            s.IsCxxDeclaredConstField = t.IsCxxDeclaredConstField;
             s.IsCxxMutableField = t.IsCxxMutableField;
             s.IsOwningSink = t.IsOwningSink;
             s.IsConsumeInferredSink = t.IsConsumeInferredSink;
@@ -1474,14 +1519,10 @@ public:
             t.IsAlias = IsAlias;
             t.IsRvalueRef = IsRvalueRef;
             t.IsCxxRefToPointer = IsCxxRefToPointer;
-            t.IsCxxConstRef = IsCxxConstRef;
+            t.CxxRefLevel = CxxRefLevel;
             t.IsCxxConstValueReturn = IsCxxConstValueReturn;
-            t.IsCxxPointeeConst = IsCxxPointeeConst;
             t.IsCxxPointeeVolatile = IsCxxPointeeVolatile;
-            t.IsSpelledPointeeConst = IsSpelledPointeeConst;
             t.IsCxxNullptrT = IsCxxNullptrT;
-            t.IsCxxConstField = IsCxxConstField;
-            t.IsCxxDeclaredConstField = IsCxxDeclaredConstField;
             t.IsCxxMutableField = IsCxxMutableField;
             t.IsOwningSink = IsOwningSink;
             t.IsConsumeInferredSink = IsConsumeInferredSink;
@@ -2059,8 +2100,11 @@ public:
         std::string  cxxArithIdentity;
         TypeAndValue sourceType;
         bool hasSourceType = false;
-        // TypeAndValue::IsCxxPointeeConst of a pointer operand, so a `?:` join keeps it.
+        // TypeAndValue::PointeeConstBit() of a pointer operand, so a `?:` join keeps it.
         bool         cxxPointeeConst = false;
+        // CxxReceiverCv of a C++ object operand (a const prvalue or xvalue included), kept for
+        // operator ranking once the NamedVariable is gone.
+        int          cxxObjectCv = 0;
         // A `?:` over pointers to ONE native class (a null arm adopts the other): that class. Read
         // only by call-argument overload ranking; transient, never stamped into the element ledger.
         std::string  joinClassPointee;
@@ -2249,6 +2293,7 @@ public:
         bool IsCoreLibraryFunction = false; // implicit core origin; explicit C/C++ imports remain declarations
         bool IsDeleted = false;    // retained as a C++ overload candidate, rejected if selected
         bool IsCxxTemplateSpecialization = false;
+        bool IsCxxConstructorForwardingWrapper = false;
         int CxxRefQualifier = cflat_cinterop::CxxRefQualifierNone;
         bool CxxVolatile = false;  // volatile-qualified C++ member declaration
         bool CxxConst = false;     // const-qualified C++ instance member
@@ -3913,21 +3958,24 @@ private:
     // Namespace names spelled inside an imported C++ header, INCLUDING a system header whose
     // own namespaces are otherwise not harvested. Used only to recognize a namespace path.
     std::unordered_set<std::string> cxxNestedNamespaceNames_;
-    // Emitted symbol names of bound C++ const/constexpr namespace-scope objects. Their storage is
-    // read-only, so a store through one traps at run time; the assignment site rejects it instead.
-    std::unordered_set<std::string> cxxConstGlobalSymbols_;
-    // Emitted symbols of globals declared by a C header (any constness). Only picks the wording
-    // of a refusal already decided by cxxConstGlobalSymbols_: "const C object", not "C++".
+    // Emitted symbols of globals a C++ header declares, plus CFlat const globals of C++ class
+    // type (any constness). Origin only: it picks the C/C++ wording; ConstMask decides const.
+    std::unordered_set<std::string> cxxHeaderGlobalSymbols_;
+    // Emitted symbols of globals declared by a C header (any constness). Wording only, as above.
     std::unordered_set<std::string> cGlobalSymbols_;
+    // A C/C++ header global (or CFlat const C++ class global) whose ConstMask object level is const.
+    bool IsConstHeaderGlobal(const llvm::GlobalVariable* global) const;
+    const TypeAndValue* GlobalTypeOf(const llvm::GlobalVariable* global) const;
+    mutable std::unordered_map<const llvm::GlobalVariable*, const TypeAndValue*> globalTypeCache_;
     // Operator candidates hidden for one call by the const/rvalue reference filter; the
     // no-overload diagnostic names them. Set and cleared around that call only.
     std::vector<FunctionSymbol> cxxFilteredOperatorCandidates_;
-    // Tags / tests the C++ call whose result is a reference to a const referent; a store whose
-    // underlying object is that call writes through it.
-    void MarkCxxConstReferent(llvm::Value* referenceResult);
+    // Storage a C++ const reference produced (a const-reference call result or member), derived
+    // from the callee's / member's ConstMask; a store whose underlying object is it writes through it.
     bool IsCxxConstReferent(llvm::Value* destination) const;
-    void MarkCxxConstFieldAccess(llvm::Value* fieldAddress);
-    bool IsCxxConstFieldAccess(llvm::Value* fieldAddress) const;
+    mutable std::unordered_map<const llvm::Function*, bool> constRefReturnCache_;
+    // A CFlat-declared const global of C++ class type joins cxxHeaderGlobalSymbols_ (C++ wording).
+    void MarkCxxConstGlobal(llvm::GlobalVariable* global);
     bool IsCxxMutableFieldAccess(llvm::Value* fieldAddress) const;
     // A const C++ member whose non-const twin owns the CFlat name registers under this name.
     static std::string CxxConstTwinName(const std::string& member)
@@ -3943,7 +3991,7 @@ private:
     /*
      * 0 = the receiver of a member call is not known const; 1 = it is const through its type
      * (pointee-const pointer, const reference); 2 = a const namespace object; 3 = reached
-     * through a C++ const reference result. 2 and 3 are read-only storage.
+     * through a C++ const reference or pointer result. 2 and 3 are read-only storage.
      */
     int CxxConstReceiverKind(const NamedVariable& receiver) const;
     // True when a C argument points at read-only C storage (const pointee or const global address).
@@ -3951,6 +3999,25 @@ private:
     // True when the object the argument addresses is a C-declared global (see cGlobalSymbols_).
     bool IsCConstGlobalObject(const NamedVariable& arg) const;
     int CxxReceiverCv(const NamedVariable& receiver) const;
+    // CxxReceiverCv of a C++ class object operand (a `const T&&` result included), else 0.
+    int CxxOperandObjectCv(const NamedVariable& operand) const;
+    // [dcl.init.ref] the one cv rule of every C++ reference binding: the target's cv must cover
+    // the object's (a const prvalue or xvalue never binds `T&&`, only `const T&&` / `const T&`).
+    static bool CxxReferenceDropsCv(int sourceCv, int targetCv)
+    {
+        return (sourceCv & ~targetCv) != 0;
+    }
+    // cv bits (const = 1, volatile = 2) leading a C++ type spelling.
+    static int CxxSpellingCv(std::string_view spelling);
+    // False for a forwarding-reference parameter of a template specialization (cv is deduced).
+    bool CxxReferenceCvIsKnown(const FunctionSymbol& candidate, size_t index,
+                               const std::string& spelling) const;
+    // Parameter `index` is a `T&&` that would drop the cv of the class object `arg`.
+    bool CxxRvalueReferenceDropsObjectCv(const FunctionSymbol& candidate, size_t index,
+                                         const NamedVariable& arg) const;
+    // Some argument of a C++ candidate hits CxxRvalueReferenceDropsObjectCv: not viable.
+    bool CxxCandidateReferenceDropsCv(const std::vector<NamedVariable>& arguments,
+                                      const FunctionSymbol& candidate) const;
     // cv bits (const = 1, volatile = 2) of a C++ candidate's by-value return (0 for a pointer or
     // reference); an inherited member is looked up in its declaring class (CxxInheritedOwner).
     int CxxReturnValueCv(const FunctionSymbol& candidate);
@@ -3989,6 +4056,7 @@ private:
     // A C++ alias of a specialization CFlat cannot spell itself (`using json = basic_json<>;`):
     // alias name -> the C++ spelling, requested under the alias's own name on first use.
     std::unordered_map<std::string, std::string> cxxLazyAliasSpecializations_;
+    std::unordered_set<std::string> cxxTopLevelConstTypeAliases_;
     // A global-scope C++-import typedef of a non-record type (DWORD, a function pointer): name ->
     // clang's canonical spelling, mapped and bound as an alias on first lookup of the name.
     std::unordered_map<std::string, std::string> cxxLazyGlobalTypedefs_;
@@ -4207,6 +4275,7 @@ private:
     // Raw C++ free-function signatures are retained because a brace-capable wrapper may be
     // needed even when the ordinary CFlat signature was refused as unmappable.
     std::map<std::string, std::vector<CSigEntry>> cxxFunctionSignatures_;
+    std::unordered_map<std::string, std::vector<std::string>> cxxFunctionParameterSpellingsByLinkage_;
     struct CxxDefaultWrapperRequest
     {
         std::string owner;
@@ -4346,6 +4415,8 @@ private:
         bool hasVirtualBases = false;
         bool isFinal = false;
         bool isAbstract = false;
+        // Clang's deleting-destructor verdict ("" = usable); see RawRecord::vtableDeleteVerdict.
+        std::string vtableDeleteVerdict;
         bool hasFriendOperators = false;   // a friend operator: ADL may find what was not registered
         std::vector<cflat_cinterop::RawCxxBase> bases;
         std::vector<cflat_cinterop::RawCxxBase> virtualBases;   // see RawRecord::virtualBases
@@ -6831,6 +6902,7 @@ private:
     bool CxxSpellingForCflatType(const std::string& cflatType, std::string& out) const;
     bool CxxTemplateArgSpellingForCflatType(const std::string& cflatType,
                                              std::string& out) const;
+    bool IsCxxTopLevelConstTypeAlias(const std::string& name) const;
 
     // The operand's DECLARED primitive name, for an argument whose machine type cannot recover
     // its C++ identity (i8 is `char` or `i8`, i32 is `int` or `wchar`, i64 is `long` or `i64`).
@@ -9475,6 +9547,8 @@ public:
         bool hasVirtualBases = false;
         bool isFinal = false;
         bool isAbstract = false;
+        // Clang's deleting-destructor verdict ("" = usable); see RawRecord::vtableDeleteVerdict.
+        std::string vtableDeleteVerdict;
         // Non-empty when the C++ layout could not be flattened (virtual inheritance, or a
         // bitfield / anonymous member inside a hierarchy). The type stays an opaque shell.
         std::string layoutRefusal;
@@ -9622,6 +9696,7 @@ public:
     std::vector<CxxClassInfo::Method> FindCxxBaseVirtualMethods(
         const std::string& baseType) const;
     bool CxxBaseHasAccessibleMoveOrCopy(const std::string& baseType) const;
+    bool CxxClassOverrideParamIsBorrowed(const std::string& typeName) const;
     void RecordCppStructBase(const std::string& structName, const std::string& baseName);
     void RegisterCppStructName(const std::string& structName);
     bool IsCppStructName(const std::string& structName) const;
@@ -9643,6 +9718,12 @@ public:
                                                 const std::string& methodName,
                                                 const std::vector<TypeAndValue>& params);
     bool IsCxxRecord(const std::string& typeName) const { return cxxRecords_.count(typeName) != 0; }
+    // A C++ class object (not a pointer or reference to one) that is itself const.
+    bool IsCxxConstClassObject(const TypeAndValue& t) const
+    {
+        return !t.IsCxxRef() && !t.Pointer && !t.IsCxxRefToPointer && (t.ConstMask & 1u) != 0
+            && IsCxxRecord(t.TypeName);
+    }
     // T272: true when a CFlat struct declares no constructor that takes parameters (only the
     // synthesized no-arg one, or none): a constructor call with arguments can never bind to it.
     bool CFlatStructHasOnlyNoArgCtor(const std::string& typeName) const
@@ -9828,6 +9909,8 @@ public:
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
         return info != nullptr && info->dtorDeletingVtableIndex >= 0;
     }
+    std::string ValidateCxxVTableDeleteDemand(const std::string& typeName);
+    bool IsCxxConstructingStructor(const std::string& typeName, const CxxClassInfo::Structor& st);
     /*
      * `delete p` on a foreign C++ class with a VIRTUAL destructor: call the DELETING destructor
      * (Itanium D0) out of the vtable, which runs the derived destructor chain AND releases the
@@ -10070,7 +10153,7 @@ public:
             || param.ElemPointer)
             return false;
         if (param.IsAlias || param.IsRvalueRef)
-            return param.IsCxxConstRef || param.IsRvalueRef;
+            return param.CxxConstRef() || param.IsRvalueRef;
         return !param.Pointer;
     }
     // A non-rvalue argument of a type NOT reference-related to the `X&&` parameter's class that
@@ -11861,10 +11944,16 @@ public:
     }
     /*
      * Pointee-const relation of a C++ record (or same-primitive) pointer argument to a C++ pointer
-     * parameter at the level IsCxxPointeeConst describes. Single level: same class or derived-to-base.
-     * Pointer-to-pointer: same class only; C++ forbids adding or dropping the inner const there.
+     * parameter at the innermost ConstMask level (TypeAndValue::PointeeConst). Single level: same
+     * class or derived-to-base. Pointer-to-pointer: same class only; C++ forbids adding or
+     * dropping the inner const there.
      */
     enum class CxxPointeeConstRelation { Unrelated, Same, Adds, Drops };
+    static CxxPointeeConstRelation CxxPointeeConstRelationOf(const TypeAndValue& from, bool toConst)
+    {
+        if (from.PointeeConst() == toConst) return CxxPointeeConstRelation::Same;
+        return toConst ? CxxPointeeConstRelation::Adds : CxxPointeeConstRelation::Drops;
+    }
     CxxPointeeConstRelation CxxRecordPointeeConstRelation(const TypeAndValue& from,
                                                           const TypeAndValue& to) const
     {
@@ -11888,13 +11977,15 @@ public:
         else if (from.TypeName != to.TypeName
             && (from.ElemPointer || !IsCxxBaseOf(to.TypeName, from.TypeName)))
             return CxxPointeeConstRelation::Unrelated;
-        if (from.IsCxxPointeeConst == to.IsCxxPointeeConst)
-            return CxxPointeeConstRelation::Same;
-        return from.IsCxxPointeeConst ? CxxPointeeConstRelation::Drops
-                                      : CxxPointeeConstRelation::Adds;
+        // A `const T&` parameter's referent is const too (its bit 0 belongs to the reference).
+        return CxxPointeeConstRelationOf(from, to.PointeeConst()
+            || (to.CxxConstRef() && to.CxxRefOwnsBit0() && !to.IsCxxRefToPointer));
     }
     // Candidate relation restores fixed-array element names before decay and handles class
     // pointers at C++ `void*` slots by the declared parameter spelling.
+    // Pointee const of a pointer argument for C++ overload ranking: its ConstMask, else the const
+    // its value carries (a native declared slot, a cast).
+    bool CxxArgumentPointeeConst(const NamedVariable& argument) const;
     CxxPointeeConstRelation CxxCandidatePointeeConstRelation(const FunctionSymbol& candidate,
                                                              size_t index,
                                                              const NamedVariable& from,
@@ -11956,6 +12047,11 @@ public:
         CauseKind Kind = CauseKind::None;
         ConstObjectRoot Root;   // Object, and the holder of a pointer slot reached transitively
         std::string Name;       // Field: the const field; ThroughPointer: the pointer
+        // Object: a C++ class object; Field: a C++ class member of a C++ class. Wording only.
+        bool CxxObject = false;
+        // The const level is a C++ class's (its field, or a C++ class object): C++ const is shallow,
+        // so a pointer read out of it keeps its own pointee qualification.
+        bool CxxShallow = false;
     };
     ConstWriteCause FindConstWriteCause(const llvm::Value* address) const;
 
@@ -12132,7 +12228,6 @@ public:
     uint8_t DeclaredPointeeConstLevels(const TypeAndValue& tv) const;
     static bool QualificationDiscardsConst(uint8_t source, uint8_t target, int depth);
     llvm::Value* ArgumentPointerValue(const NamedVariable& arg) const;
-    TypeAndValue ParameterQualification(const FunctionSymbol& candidate, const TypeAndValue& param) const;
     // A C header parameter's ConstMask holds its exact spelled levels (`int *const *`), not filled.
     static bool ParameterHasExactLevels(const FunctionSymbol& candidate, const TypeAndValue& param)
     {
@@ -12758,7 +12853,7 @@ public:
     // 124: demand entries store their request chunks (header wrapper batch included) for replay.
     // 127: out-of-line inline and implicit-template static data members emit into the companion.
     // 128: C++ pointer results record pointee const (IsCxxPointeeConst); free `T *const &`
-    //      returns record IsCxxConstRef like member ones.
+    //      returns record CxxConstRef() like member ones.
     // 129: request markers record entry validity (entries also carry the build stamp when
     //      CFLAT_CACHE_BUILD_STAMP=1).
     // 130: flexible / zero-length array record members carry their provenance (IsFlexibleArrayMember).
@@ -12855,7 +12950,13 @@ public:
     // 266: C globals, field top-level const and C results carry ConstMask (const item 10).
     // 267: C header signatures retain result pointee record identity and anonymous typedef layout.
     // 268: C function-pointer results and parameters carry pointee ConstMask.
-    static constexpr int kCHeaderCacheVersion = 268;
+    // 269: a header whose unused virtual destructor has an unusable operator delete is refused (T333).
+    // 270: C/C++ pointee, reference and field const fold into ConstMask ("cxr", "ccc", "nch").
+    // 271: per-record virtual-dtor operator delete verdict persisted ("vdv", T344).
+    // 272: interim C++ const bits ("ccc", "nch") gone; a const C/C++ global's object level is in its ConstMask ("cm").
+    // 273: a C++ `const T&&` parameter records its referent const in ConstMask (T337).
+    // 274: static C++ data members carry their declared ConstMask (T346).
+    static constexpr int kCHeaderCacheVersion = 274;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. OFF by

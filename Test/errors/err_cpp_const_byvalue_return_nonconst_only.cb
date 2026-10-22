@@ -3,3 +3,55 @@ import cpp "cpp_t322_constretcv.hpp";
 expect_error("only a const member function may be called") {
     int invalid() { return cppi322.makeOnly().f(); }
 }
+
+expect_error("discards qualifiers") {
+    int t337_const_rvalue_ref_only() {
+        return cppi322.const_arg_only_rv(cppi322.make());
+    }
+}
+
+expect_error("discards qualifiers") {
+    int t337_const_derived_rvalue_ref_only() {
+        return cppi322.const_base_arg_only_rv(cppi322.make_derived());
+    }
+}
+
+expect_error("discards qualifiers") {
+    int t337_const_member_rvalue_ref_only() {
+        return cppi322.caller.only(cppi322.make());
+    }
+}
+
+expect_error("discards qualifiers") {
+    int t337_const_operator_rvalue_ref_only() {
+        return cppi322.opTag - cppi322.make();
+    }
+}
+
+expect_error("discards qualifiers") {
+    int t337_const_xvalue_rvalue_ref_only() {
+        return cppi322.const_arg_only_rv(cppi322.const_xvalue());
+    }
+}
+
+expect_error("discards qualifiers") {
+    int t337_const_xvalue_operator_rvalue_ref_only() {
+        return cppi322.opTag - cppi322.const_xvalue();
+    }
+}
+
+expect_error("discards qualifiers") {
+    int t337_const_member_compound_rvalue_ref_only() {
+        cppi322.AssignOnly c;
+        c += cppi322.make();
+        return c.n;
+    }
+}
+
+expect_error("discards qualifiers") {
+    int t337_const_free_compound_rvalue_ref_only() {
+        cppi322.AssignTagOnly c;
+        c += cppi322.make();
+        return c.n;
+    }
+}

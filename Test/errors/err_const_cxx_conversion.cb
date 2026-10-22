@@ -1,0 +1,62 @@
+// Const phase 5b: a C++ const result never converts to a CFlat mutable pointer (init, assign,
+// return, argument), and a native const pointee never binds a mutable C++ parameter.
+import cpp "cpp_interop_proxy_assign.h";
+
+// clang: cannot initialize return object of type 'int *' with an rvalue of type 'const int *'
+expect_error("cannot return '(const int)*' as 'int*': the conversion discards const") {
+    int* c5bReturnMutable() { return cpppa.c5b_cptr(); }
+}
+
+void c5bTakeMutable(int* p) { }
+
+extern int main()
+{
+    // clang: cannot initialize a variable of type 'int *' with an rvalue of type 'const int *'
+    expect_error("cannot convert '(const int)*' to 'int*': the conversion discards const") {
+        int* c5bInt = cpppa.c5b_cptr();
+    }
+    expect_error("cannot convert '(const char)*' to 'char*': the conversion discards const") {
+        char* c5bName = cpppa.c5b_cname();
+    }
+    // clang: assigning to 'char *' from 'const char *' discards qualifiers
+    expect_error("cannot convert '(const char)*' to 'char*': the conversion discards const") {
+        char* c5bAssigned = default;
+        c5bAssigned = cpppa.c5b_cname();
+    }
+    // clang: cannot initialize a variable of type 'R *' with an rvalue of type 'const R *'
+    expect_error("cannot convert '(const cpppa.C5bR)*' to 'cpppa.C5bR*': the conversion discards const") {
+        cpppa.C5bR* c5bR = cpppa.c5b_cr();
+    }
+    // The address of a const C++ global (object, field, decayed array) is a const pointee.
+    // clang: cannot initialize a variable of type 'R *' with an rvalue of type 'const R *'
+    expect_error("cannot convert '(const cpppa.C5bR)*' to 'cpppa.C5bR*': the conversion discards const") {
+        cpppa.C5bR* c5bGlobalAddress = &cpppa.c5bConstR;
+    }
+    expect_error("cannot convert '(const cpppa.C5bIn)*' to 'cpppa.C5bIn*': the conversion discards const") {
+        cpppa.C5bIn* c5bFieldAddress = &cpppa.c5bConstOut.in;
+    }
+    expect_error("cannot convert '(const cpppa.C5bR)*' to 'cpppa.C5bR*': the conversion discards const") {
+        cpppa.C5bR* c5bDecayed = cpppa.c5bConstRs;
+    }
+    // clang: assigning to 'R *' from 'const R *' discards qualifiers
+    expect_error("cannot convert '(const cpppa.C5bR)*' to 'cpppa.C5bR*': the conversion discards const") {
+        cpppa.C5bR* c5bReseated = cpppa.c5b_mr();
+        c5bReseated = &cpppa.c5bConstR;
+    }
+    // clang: no matching function for call to 'f'
+    expect_error("cannot pass argument 1 ('(const int)*') to parameter 'p' ('int*'): the conversion discards const") {
+        c5bTakeMutable(cpppa.c5b_cptr());
+    }
+    // clang: no matching function for call to 'taker'
+    expect_error("cannot pass C++ const pointer argument 1 ('c5bConstR') to mutable C++ pointer parameter 'r'") {
+        (const cpppa.C5bR)* c5bConstR = cpppa.c5b_mr();
+        int c5bTaken = cpppa.c5b_taker(c5bConstR);
+    }
+    // clang: no matching function for call to 'take'
+    expect_error("cannot pass C++ const pointer argument 1 ('c5bConstInt') to mutable C++ pointer parameter 'p'") {
+        int c5bValue = 1;
+        (const int)* c5bConstInt = &c5bValue;
+        int c5bTook = cpppa.c5b_take(c5bConstInt);
+    }
+    return 0;
+}

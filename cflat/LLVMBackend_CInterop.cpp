@@ -1787,6 +1787,15 @@ bool LLVMBackend::IsLongDoubleSpelling(const std::string& spelling)
 }
 
 static uint8_t CSpellingPointeeConstMask(const std::string& spelling, int depth);
+static uint8_t CxxSpellingPointeeConstMask(const std::string& spelling, int depth);
+
+// A C++ field declared const: its object level.
+static void MarkCxxDeclaredConstField(LLVMBackend::TypeAndValue& tv, bool isConst)
+{
+        if (!isConst) return;
+        const int depth = tv.IsArrayView ? (tv.ElemPointer ? 1 : 0) : tv.ValuePointerDepth();
+        tv.ConstMask |= static_cast<uint8_t>(1u << depth);
+}
 
 bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndValue& out,
                                        std::unordered_set<std::string>& visited,
@@ -1875,6 +1884,11 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
         if (!MapCTypeToTypeAndValueImpl(retSpelling, retTV, visited, cxxBoundary)) return false;
         // Function pointers returning function pointers are not supported here.
         if (retTV.IsFunctionPointer) return false;
+        const bool cxxReferenceReturn = cxxBoundary
+            && (retSpelling.ends_with('&') || retSpelling.ends_with("&&"));
+        if (cxxReferenceReturn) MarkCxxReferenceField(retSpelling, retTV, true);
+        if (cxxBoundary && retTV.Pointer)
+            retTV.ConstMask |= CxxSpellingPointeeConstMask(retSpelling, retTV.ValuePointerDepth());
 
         out = TypeAndValue();
         out.IsFunctionPointer = true;
@@ -1884,18 +1898,22 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
             out.Pointer = true;
             out.IsAlias = functionPointerLvalueRef;
             out.IsRvalueRef = functionPointerRvalueRef;
-            out.IsCxxConstRef = functionPointerConst;
+            out.MarkCxxRef();
+            out.SetCxxConstRef(functionPointerConst);
         }
         out.FuncPtrReturnTypeName = retTV.TypeName;
         out.FuncPtrReturnPointer = retTV.Pointer;
-        // A C function type keeps its result and parameter pointee const (exact-match identity);
-        // a C++ one stays unrecorded (phase 5).
+        // Keep the ABI reference slot pointer-shaped at this indirect-call door.
+        out.FuncPtrReturnAlias = cxxReferenceReturn ? false : retTV.IsAlias;
+        out.FuncPtrReturnPointerDepth = retTV.ValuePointerDepth();
+        // ConstMask is part of the C++ callable's return type, including a reference referent.
         if (!cxxBoundary)
         {
             int mask = CSpellingPointeeConstMask(retSpelling, retTV.ValuePointerDepth());
             out.FuncPtrReturnConstMask = mask != 0 ? mask : retTV.PointeeConstMask();
-            if (out.FuncPtrReturnConstMask > 0) out.FuncPtrReturnPointerDepth = retTV.ValuePointerDepth();
         }
+        else
+            out.FuncPtrReturnConstMask = retTV.FunctionReturnConstMask();
 
         auto trim = [](std::string v) {
             size_t a = 0; while (a < v.size() && std::isspace((unsigned char)v[a])) ++a;
@@ -3404,6 +3422,13 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                         && old.retSpelling == e.retSpelling;
                 });
                 if (!duplicate) rawEntries.push_back(e);
+                if (e.isCxx && !e.linkageName.empty())
+                {
+                    auto [spellings, inserted] = cxxFunctionParameterSpellingsByLinkage_.try_emplace(
+                        e.linkageName, e.paramSpellings);
+                    if (!inserted && spellings->second != e.paramSpellings)
+                        spellings->second.clear();
+                }
                 if (activeCxxRequestGroup_ != nullptr)
                     cxxFunctionOwnerGroup_.emplace(e.name, activeCxxRequestGroup_->primary);
             }
@@ -3966,7 +3991,7 @@ void LLVMBackend::MarkCxxReferenceField(const std::string& ctype, TypeAndValue& 
             ? arrayRefOpen : arrayRefParen;
         if (isCxx && arrayRefAt != std::string::npos
             && s.substr(0, arrayRefAt).find("const") != std::string::npos)
-            tv.IsCxxPointeeConst = true;
+            tv.SetPointeeConstBit(true);
         if (tv.IsArrayView)
         {
             return;
@@ -3984,9 +4009,10 @@ void LLVMBackend::MarkCxxReferenceField(const std::string& ctype, TypeAndValue& 
         tv.PointerDepth = mapped ? referentTv.ValuePointerDepth() : 0;
         tv.IsCxxRefToPointer = tv.PointerDepth > 0;
         tv.IsAlias = true;
-        tv.IsCxxConstRef = rvalue ? CxxRvalueReferenceIsConst(s)
+        tv.MarkCxxRef();
+        tv.SetCxxConstRef(rvalue ? CxxRvalueReferenceIsConst(s)
             : CxxParamIsConstLvalueReference(s)
-            || (tv.IsCxxRefToPointer && CxxParamIsConstRefToPointer(s));
+            || (tv.IsCxxRefToPointer && CxxParamIsConstRefToPointer(s)));
 }
 
 static bool CxxParamIsConstRefToPointer(const std::string& spelling)
@@ -4066,6 +4092,20 @@ static bool CxxSpellingHasConstPointee(const std::string& spelling)
         return false;
 }
 
+/*
+ * Pointee const levels of a C++ pointer spelling, bottom-relative like ConstMask: the C helper's
+ * levels once a trailing reference is dropped, and the innermost pointee from the template-aware
+ * head scan the C helper does not attempt (`const std::vector<int> *`).
+ */
+static uint8_t CxxSpellingPointeeConstMask(const std::string& spelling, int depth)
+{
+        std::string s = spelling;
+        while (!s.empty() && (s.back() == ' ' || s.back() == '&')) s.pop_back();
+        uint8_t mask = CSpellingPointeeConstMask(s, depth);
+        if (depth > 0 && CxxSpellingHasConstPointee(spelling)) mask |= 1u;
+        return mask;
+}
+
 static bool CxxSpellingHasTopLevelConst(const std::string& spelling)
 {
         int templateDepth = 0;
@@ -4081,6 +4121,31 @@ static bool CxxSpellingHasTopLevelConst(const std::string& spelling)
             const size_t end = i + 5;
             const bool rightOk = end == spelling.size()
                 || !(std::isalnum((unsigned char)spelling[end]) || spelling[end] == '_');
+            if (leftOk && rightOk) return true;
+        }
+        return false;
+}
+
+static bool CxxSpellingHasTopLevelObjectConst(const std::string& spelling)
+{
+        size_t lastStar = std::string::npos;
+        int templateDepth = 0;
+        for (size_t i = 0; i < spelling.size(); ++i)
+        {
+            if (spelling[i] == '<') ++templateDepth;
+            else if (spelling[i] == '>' && templateDepth > 0) --templateDepth;
+            else if (templateDepth == 0 && spelling[i] == '*') lastStar = i;
+        }
+        if (lastStar == std::string::npos) return CxxSpellingHasTopLevelConst(spelling);
+        const std::string suffix = spelling.substr(lastStar + 1);
+        for (size_t at = suffix.find("const"); at != std::string::npos;
+             at = suffix.find("const", at + 5))
+        {
+            const bool leftOk = at == 0 || !(std::isalnum((unsigned char)suffix[at - 1])
+                                             || suffix[at - 1] == '_');
+            const size_t end = at + 5;
+            const bool rightOk = end >= suffix.size()
+                || !(std::isalnum((unsigned char)suffix[end]) || suffix[end] == '_');
             if (leftOk && rightOk) return true;
         }
         return false;
@@ -4197,22 +4262,22 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
                     e.ret.Pointer = false;
             }
             e.ret.IsAlias = true;
+            e.ret.MarkCxxRef();
             if (CxxParamIsConstLvalueReference(r.retType)
                 || (cxxScalarRvalueReferenceReturn
                     && CxxRvalueReferenceIsConst(r.retType))
                 || (e.ret.IsCxxRefToPointer && CxxParamIsConstRefToPointer(r.retType)))
-                e.ret.IsCxxConstRef = true;
+                e.ret.SetCxxConstRef(true);
         }
         // A class `const T&&` result keeps its pointer shape; the flag tells a move site to copy.
         if (r.isCxx && e.ret.Pointer && e.ret.IsRvalueRef && !e.ret.IsFunctionPointer
             && IsCxxRecord(e.ret.TypeName) && CxxRvalueReferenceIsConst(r.retType))
-            e.ret.IsCxxConstRef = true;
+            e.ret.SetCxxConstRef(true);
         if (r.isCxx && !e.ret.Pointer && !e.ret.IsAlias && !e.ret.IsFunctionPointer
             && IsCxxRecord(e.ret.TypeName) && CxxSpellingHasTopLevelConst(r.retType))
             e.ret.IsCxxConstValueReturn = true;
-        if (r.isCxx && e.ret.Pointer && !e.ret.IsFunctionPointer
-            && CxxSpellingHasConstPointee(r.retType))
-            e.ret.IsCxxPointeeConst = true;
+        if (r.isCxx && e.ret.Pointer && !e.ret.IsFunctionPointer)
+            e.ret.ConstMask |= CxxSpellingPointeeConstMask(r.retType, e.ret.ValuePointerDepth());
         // A C result keeps its spelled pointee levels like a C parameter (`const char *` -> 1).
         if (!r.isCxx && e.ret.Pointer && !e.ret.IsFunctionPointer && !e.ret.IsArrayView)
             if (const uint8_t mask = CSpellingPointeeConstMask(r.retType, e.ret.ValuePointerDepth());
@@ -4290,9 +4355,18 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
                     ptv.ElemPointer = false;
                     ptv.IsCxxRefToPointer = true;
                 }
-                ptv.IsCxxConstRef = CxxParamIsConstLvalueReference(r.paramTypes[i])
+                ptv.MarkCxxRef();
+                ptv.SetCxxConstRef(CxxParamIsConstLvalueReference(r.paramTypes[i])
                     || (ptv.IsCxxRefToPointer
-                        && CxxParamIsConstRefToPointer(r.paramTypes[i]));
+                        && CxxParamIsConstRefToPointer(r.paramTypes[i])));
+            }
+            // `const T&&`: its referent is const in ConstMask, as the other C++ reference mappers record.
+            else if (r.isCxx && !cxxArrayReference && ptv.IsRvalueRef && ptv.Pointer
+                && !ptv.IsFunctionPointer && !ptv.IsCxxRefToPointer
+                && CxxRvalueReferenceIsConst(r.paramTypes[i]))
+            {
+                ptv.MarkCxxRef();
+                ptv.SetCxxConstRef(true);
             }
             if (r.isCxx && ptv.IsFunctionPointer && ptv.Pointer
                 && (ptv.IsAlias || ptv.IsRvalueRef))
@@ -4305,19 +4379,30 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
                     r.name, pname);
                 return true;
             }
-            // C `const T *` parameters keep their pointee const too: a const C object may
-            // be passed to them but never to a mutable pointer parameter (T183).
-            if (ptv.Pointer && !ptv.IsFunctionPointer
-                && CxxSpellingHasConstPointee(r.paramTypes[i]))
-                ptv.IsCxxPointeeConst = true;
-            // A C parameter keeps the levels it spells (`const int **` is const at the int only).
-            if (!r.isCxx && ptv.Pointer && !ptv.IsFunctionPointer && !ptv.IsArrayView)
-                ptv.ConstMask = CSpellingPointeeConstMask(r.paramTypes[i], ptv.ValuePointerDepth());
+            /*
+             * A C parameter keeps the levels it spells (`const int **` is const at the int only);
+             * one the level parser cannot read but whose pointee is const is read-only at every
+             * level. A const C object may be passed to it but never to a mutable pointer parameter
+             * (T183). A C++ parameter's levels come from its C++ spelling.
+             */
+            if (ptv.Pointer && !ptv.IsFunctionPointer)
+            {
+                if (r.isCxx)
+                    ptv.ConstMask |= CxxSpellingPointeeConstMask(r.paramTypes[i], ptv.ValuePointerDepth());
+                else
+                {
+                    if (!ptv.IsArrayView)
+                        ptv.ConstMask = CSpellingPointeeConstMask(r.paramTypes[i], ptv.ValuePointerDepth());
+                    if (CxxSpellingHasConstPointee(r.paramTypes[i]))
+                    {
+                        if (ptv.ConstMask == 0)
+                            ptv.ConstMask = static_cast<uint8_t>((1u << ptv.ValuePointerDepth()) - 1u);
+                        ptv.SetPointeeConstBit(true);
+                    }
+                }
+            }
             if (r.isCxx && CxxSpellingHasVolatileTarget(r.paramTypes[i]))
                 ptv.IsCxxPointeeVolatile = true;
-            // The spelled pointee const rides a named imported function's funcptr signature.
-            if (ptv.Pointer && !ptv.IsFunctionPointer && CxxSpellingHasConstPointee(r.paramTypes[i]))
-                ptv.IsSpelledPointeeConst = true;
             if (i < r.paramNames.size()) ptv.VariableName = r.paramNames[i];
             e.params.push_back(std::move(ptv));
         }
@@ -5105,18 +5190,7 @@ bool LLVMBackend::MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEnt
             e.type.ConstArraySize = arrayDims.front();
             if (arrayDims.size() > 1)
                 e.type.ConstInnerDimensions.assign(arrayDims.begin() + 1, arrayDims.end());
-            if (r.isConst)
-                e.type.IsCxxPointeeConst = true;
         }
-        // A C `const int *` global: the pointer is writable, its pointee is read-only.
-        else if (!cxxBoundary && e.type.Pointer && !e.type.IsFunctionPointer
-                 && CxxSpellingHasConstPointee(r.ctype))
-            e.type.IsCxxPointeeConst = true;
-        // A C++ `const int *` global keeps its spelled pointee const, so a ctor wrapper spells the
-        // argument as clang sees it (`const int *&` binds only a const pointee).
-        if (cxxBoundary && e.type.Pointer && !e.type.IsFunctionPointer
-            && CxxSpellingHasConstPointee(r.ctype))
-            e.type.IsSpelledPointeeConst = true;
         // A C global carries the ConstMask of its native spelling (an array's mask is its element's);
         // only a downward-closed mask is a CFlat spelling (R11), so `int* const` keeps none.
         if (!cxxBoundary && !e.type.IsFunctionPointer && !e.type.IsArrayView)
@@ -5126,6 +5200,25 @@ bool LLVMBackend::MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEnt
                 | (r.isConst ? (1u << depth) : 0u));
             if (mask != 0 && (mask & (mask + 1u)) == 0) e.type.ConstMask = mask;
         }
+        // A C const array, or a C `const int *` global (the pointer is writable, its pointee is
+        // read-only), is read-only C storage to the boundary checks.
+        if (isArray)
+        {
+            if (r.isConst) e.type.SetPointeeConstBit(true);
+        }
+        else if (!cxxBoundary && e.type.Pointer && !e.type.IsFunctionPointer
+                 && CxxSpellingHasConstPointee(r.ctype))
+        {
+            e.type.SetPointeeConstBit(true);
+        }
+        // A C++ `const int *` global keeps its spelled pointee const, so a ctor wrapper spells the
+        // argument as clang sees it (`const int *&` binds only a const pointee).
+        if (cxxBoundary && e.type.Pointer && !e.type.IsFunctionPointer)
+            e.type.ConstMask |= CxxSpellingPointeeConstMask(r.ctype, e.type.ValuePointerDepth());
+        // The global's own const is its object level in ConstMask (C and C++, `T *const` too): the
+        // one source the boundary checks read. A header global's levels are exact, never filled.
+        if (r.isConst && !e.type.IsArrayView)
+            e.type.ConstMask |= static_cast<uint8_t>(1u << (isArray ? 0 : e.type.ValuePointerDepth()));
         e.type.VariableName = r.name;
         if (auto it = cxxBindingRefusals_.find(e.name);
             it != cxxBindingRefusals_.end() && it->second.starts_with("global array '"))
@@ -5387,6 +5480,11 @@ void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& a
                     const bool mapped = MapCTypeToTypeAndValue(a.target, mappedTarget, cxxBoundary);
                     if (mapped)
                     {
+                        if (cxxBoundary && !mappedTarget.Pointer && !mappedTarget.ElemPointer
+                            && !mappedTarget.IsFunctionPointer
+                            && IsCxxRecord(mappedTarget.TypeName)
+                            && CxxSpellingHasTopLevelConst(a.target))
+                            cxxTopLevelConstTypeAliases_.insert(a.qualifiedName);
                         qualifiedTarget = mappedTarget.TypeName;
                         if (mappedTarget.Pointer) qualifiedTarget += "*";
                         if (mappedTarget.ElemPointer) qualifiedTarget += "*";
@@ -5678,6 +5776,7 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
             rec.file = r.file;
             rec.inScope = r.inScope;
             rec.isPolymorphic = r.isPolymorphic; rec.hasBases = r.hasBases;
+            rec.vtableDeleteVerdict = r.vtableDeleteVerdict;
             rec.hasVirtualBases = r.hasVirtualBases; rec.isAbstract = r.isAbstract;
             rec.isFinal = r.isFinal;
             rec.hasFriendOperators = r.hasFriendOperators;
@@ -7371,7 +7470,7 @@ std::string LLVMBackend::CxxConstructorCopySinkError(
             const NamedVariable& argument = arguments[i];
             const TypeAndValue& parameter = selected->params[i + 1];
             if (!IsCopyDeletedCxxLvalue(argument) || !parameter.Pointer || parameter.ElemPointer
-                || !parameter.IsCxxConstRef
+                || !parameter.CxxConstRef()
                 || parameter.TypeName != argument.TypeAndValue.TypeName)
                 continue;
             std::string name = std::format("parameter {}", i + 1);
@@ -8787,6 +8886,7 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
         raw.isTriviallyRelocatable = cached.isTriviallyRelocatable;
         raw.scopeNames = cached.scopeNames;
         raw.isPolymorphic = cached.isPolymorphic;
+        raw.vtableDeleteVerdict = cached.vtableDeleteVerdict;
         raw.hasBases = cached.hasBases;
         raw.hasVirtualBases = cached.hasVirtualBases;
         raw.isFinal = cached.isFinal;
@@ -9339,7 +9439,7 @@ bool LLVMBackend::GetUniqueCxxConstructorValueParameter(const std::string& typeN
                 }
             if (!arityFits) continue;
             const auto& parameter = ctor.params[parameterIndex + 1];
-            if (parameter.IsAlias || parameter.IsRvalueRef || parameter.IsCxxConstRef)
+            if (parameter.IsAlias || parameter.IsRvalueRef || parameter.CxxConstRef())
                 continue;
             if (match != nullptr) return false;
             match = &ctor;
@@ -11454,7 +11554,7 @@ bool LLVMBackend::CxxExplicitMoveNeedsTransfer(const std::string& typeName, bool
             for (const auto* m : members)
             {
                 ++count;
-                constRef = m->params.size() == 2 && m->params[1].IsCxxConstRef;
+                constRef = m->params.size() == 2 && m->params[1].CxxConstRef();
             }
             return count == 1 && !constRef;
         };
@@ -11722,7 +11822,7 @@ bool LLVMBackend::CxxNonTemplateOverloadsTakePointerConstRef(const std::string& 
                 || (!owner.empty() && candidate.Parameters[0].TypeName != owner))
                 continue;
             const TypeAndValue& parameter = candidate.Parameters[index];
-            if (!(parameter.IsCxxRefToPointer && parameter.IsCxxConstRef)) return false;
+            if (!(parameter.IsCxxRefToPointer && parameter.CxxConstRef())) return false;
         }
         return true;
 }
@@ -12220,7 +12320,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             const NamedVariable& receiver = arguments.front();
             std::string receiverSpelling = ownerSpelling;
             // `p->` keeps p's flags on the object: pointee const makes it const, while
-            // IsCxxConstRef on a pointer shape (`T *const &`) is the slot, not the object.
+            // CxxConstRef() on a pointer shape (`T *const &`) is the slot, not the object.
             const bool receiverIsConst = CxxConstReceiverKind(receiver) != 0;
             constSpelled = receiverIsConst;
             const bool receiverIsRvalue = IsCxxObjectRvalue(receiver);
@@ -12394,7 +12494,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 const TypeAndValue& selectedParam = selectedCtor->params[index + 1];
                 const bool selectedReference = rvalueReference
                     ? selectedParam.IsRvalueRef
-                    : selectedParam.IsAlias || selectedParam.IsCxxConstRef
+                    : selectedParam.IsAlias || selectedParam.CxxConstRef()
                         || selectedParam.IsRvalueRef;
                 if (!selectedReference)
                     return false;
@@ -12759,21 +12859,19 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
             }
             else if (!cxxTemplateArgumentSpelling(cflatType, spelling))
                 return noMatch("an argument type cannot be spelled in C++");
-            if (arg.TypeAndValue.IsCxxConstRef && !arg.TypeAndValue.Pointer
+            if (arg.TypeAndValue.CxxConstRef() && !arg.TypeAndValue.Pointer
                 && !arg.TypeAndValue.IsCxxRefToPointer)
             {
                 spelling = "const " + spelling;
                 constSpelled = true;
             }
-            // A const C++ object lvalue (a `const T` local or field) is spelled const as well.
-            else if (classArgument && !arg.IsRvalue && arg.Storage != nullptr
-                     && !arg.TypeAndValue.Pointer && !arg.TypeAndValue.IsCxxRefToPointer
-                     && CxxConstReceiverKind(arg) != 0)
+            // Preserve top-level const on both class lvalues and by-value prvalues.
+            else if (classArgument && CxxConstReceiverKind(arg) != 0)
             {
                 spelling = "const " + spelling;
                 constSpelled = true;
             }
-            else if (arg.TypeAndValue.IsCxxPointeeConst && arg.TypeAndValue.Pointer
+            else if (arg.TypeAndValue.PointeeConstBit() && arg.TypeAndValue.Pointer
                      && !arg.TypeAndValue.IsFunctionPointer && spelling.ends_with("*")
                      && !spelling.starts_with("const "))
             {
@@ -13175,7 +13273,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                                 continue;
                             const auto& p = symbol.Parameters[sinkIndex + 1];
                             boundMoveSink = boundMoveSink || p.IsRvalueRef
-                                || (!p.IsAlias && !p.IsCxxConstRef && !p.Pointer
+                                || (!p.IsAlias && !p.CxxConstRef() && !p.Pointer
                                     && p.TypeName == sinkType);
                         }
                     error = CxxDeletedCopyMessage(userArgs[sinkIndex], sinkParam, bareName,
@@ -13743,7 +13841,7 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 const TypeAndValue& selectedParam = selectedCtor->params[index + 1];
                 const bool selectedReference = rvalueReference
                     ? selectedParam.IsRvalueRef
-                    : selectedParam.IsAlias || selectedParam.IsCxxConstRef
+                    : selectedParam.IsAlias || selectedParam.CxxConstRef()
                         || selectedParam.IsRvalueRef;
                 if (!selectedReference)
                     return false;
@@ -13976,7 +14074,7 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 continue;
             }
             // An imported `const T*` (c_str()) keeps its const pointee, as in the template path.
-            if (type.IsCxxPointeeConst && type.Pointer
+            if (type.PointeeConstBit() && type.Pointer
                 && !arg.TypeAndValue.IsFunctionPointer && spelling.ends_with("*")
                 && !spelling.starts_with("const "))
             {
@@ -13990,8 +14088,12 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
             {
                 if (IsCxxRvalueReferenceArgument(arg))
                 {
-                    parameterSpellings.push_back(spelling + " &&");
-                    callArguments.push_back("static_cast<" + spelling + " &&>(p"
+                    const bool constObject = CxxConstReceiverKind(arg) != 0;
+                    constSpelled = constSpelled || constObject;
+                    const std::string valueSpelling = constObject && !spelling.starts_with("const ")
+                        ? "const " + spelling : spelling;
+                    parameterSpellings.push_back(valueSpelling + " &&");
+                    callArguments.push_back("static_cast<" + valueSpelling + " &&>(p"
                                             + std::to_string(parameterIndex) + ")");
                 }
                 else
@@ -16839,12 +16941,12 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             const bool pointerXvalue = pointerValue && IsCxxRvalueReferenceArgument(elements[i]);
             if (pointerValue)
             {
-                if ((type.IsCxxPointeeConst || type.IsSpelledPointeeConst)
+                if ((type.PointeeConstBit() || (type.PointeeConstMask() & 1u) != 0)
                     && !spelling.starts_with("const "))
                     spelling = "const " + spelling;
                 if (type.IsCxxPointeeVolatile && !spelling.starts_with("volatile "))
                     spelling = "volatile " + spelling;
-                if (type.IsCxxRefToPointer && type.IsCxxConstRef && !pointerXvalue)
+                if (type.IsCxxRefToPointer && type.CxxConstRef() && !pointerXvalue)
                     spelling += " const";
                 spelling += pointerXvalue ? " &&" : " &";
             }
@@ -16967,7 +17069,7 @@ bool LLVMBackend::CxxCtorForwardsScalarReference(const std::string& typeName,
                 const TypeAndValue& got = argTypes[i];
                 if (got.Pointer || !scalar(got)) continue;
                 if (want.Pointer && !want.IsCxxRefToPointer
-                    && (want.IsAlias || want.IsRvalueRef || want.IsCxxConstRef) && scalar(want))
+                    && (want.IsAlias || want.IsRvalueRef || want.CxxConstRef()) && scalar(want))
                     return true;
             }
         }
@@ -17000,7 +17102,7 @@ std::string LLVMBackend::CxxCtorSelectedNarrowingError(const std::string& typeNa
         };
         // The value a scalar reference parameter binds, `const T&` included.
         const auto referent = [](TypeAndValue param) {
-            if (param.Pointer && !param.ElemPointer && !param.IsCxxRefToPointer && param.IsCxxConstRef)
+            if (param.Pointer && !param.ElemPointer && !param.IsCxxRefToPointer && param.CxxConstRef())
                 param.IsAlias = true;
             return ScalarArgumentReferent(param);
         };
@@ -17039,7 +17141,7 @@ std::string LLVMBackend::CxxCtorSelectedNarrowingError(const std::string& typeNa
             for (size_t i = 1; i < sym.Parameters.size(); ++i)
             {
                 const TypeAndValue& p = sym.Parameters[i];
-                if (!p.Pointer || p.ElemPointer || p.IsCxxRefToPointer || !p.IsCxxConstRef
+                if (!p.Pointer || p.ElemPointer || p.IsCxxRefToPointer || !p.CxxConstRef()
                     || p.IsRvalueRef)
                     continue;
                 TypeAndValue value = referent(p);
@@ -17306,7 +17408,7 @@ bool LLVMBackend::CxxConstructorNeedsClangResolution(
             if (want.Pointer == got.Pointer && want.ElemPointer == got.ElemPointer) continue;
             // A reference parameter is an indirect pointer here; binding it to a value of
             // exactly its referent type is still an identity conversion.
-            const bool reference = want.IsAlias || want.IsRvalueRef || want.IsCxxConstRef;
+            const bool reference = want.IsAlias || want.IsRvalueRef || want.CxxConstRef();
             if (reference && want.Pointer && !want.ElemPointer && !got.Pointer) continue;
             return true;
         }
@@ -17335,14 +17437,15 @@ bool LLVMBackend::CxxCtorSetRequiresFloatToInteger(
 
             const TypeAndValue& param = ctor.params[1];
             const bool reference = param.Pointer && !param.ElemPointer
-                && (param.IsAlias || param.IsRvalueRef || param.IsCxxConstRef);
+                && (param.IsAlias || param.IsRvalueRef || param.CxxConstRef());
             // A floating argument never reaches a pointer parameter, nor a non-const lvalue
             // reference; `const T&` and `T&&` bind a converted temporary like `T`.
             if (param.Pointer && !reference) continue;
-            if (reference && !param.IsCxxConstRef && !param.IsRvalueRef) continue;
+            if (reference && !param.CxxConstRef() && !param.IsRvalueRef) continue;
             TypeAndValue arithmetic = param;
+            arithmetic.DropCxxRef();
             arithmetic.Pointer = false;
-            arithmetic.IsAlias = arithmetic.IsRvalueRef = arithmetic.IsCxxConstRef = false;
+            arithmetic.IsAlias = arithmetic.IsRvalueRef = false;
             if (arithmetic.IsInteger() == -1 && arithmetic.IsFloatingPoint() == -1) continue;
             if (arithmetic.IsFloatingPoint() != -1) return false;
             sawCandidate = true;
@@ -17365,11 +17468,12 @@ void LLVMBackend::ConvertCxxCtorThunkArguments(const std::string& wrapperName,
             if (!have->isIntegerTy() && !have->isFloatingPointTy()) continue;
             // A reference parameter is a pointer to the scalar; a by-value one is the scalar.
             const bool reference = param.Pointer && !param.ElemPointer
-                && (param.IsAlias || param.IsRvalueRef || param.IsCxxConstRef);
+                && (param.IsAlias || param.IsRvalueRef || param.CxxConstRef());
             if (param.Pointer && !reference) continue;
             TypeAndValue scalar = param;
+            scalar.DropCxxRef();
             scalar.Pointer = false;
-            scalar.IsAlias = scalar.IsRvalueRef = scalar.IsCxxConstRef = false;
+            scalar.IsAlias = scalar.IsRvalueRef = false;
             llvm::Type* want = GetType(scalar);
             if (want == nullptr || want == have
                 || (!want->isIntegerTy() && !want->isFloatingPointTy())) continue;
@@ -17549,7 +17653,7 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         // loses it on the identifier path, so a local or a global is read back from its owner.
         const auto declaredPointeeConst = [&](const NamedVariable& arg) {
             const auto spelledConst = [](const TypeAndValue& t) {
-                return t.IsCxxPointeeConst || t.IsSpelledPointeeConst;
+                return t.PointeeConstBit() || (t.PointeeConstMask() & 1u) != 0;
             };
             if (spelledConst(arg.TypeAndValue)) return true;
             if (!arg.CallerName.empty())
@@ -17697,7 +17801,7 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
                 if (arg.TypeAndValue.IsCxxPointeeVolatile && !spelling.starts_with("volatile "))
                     spelling = "volatile " + spelling;
                 const bool xvalue = stringLiteral || IsCxxRvalueReferenceArgument(arg);
-                if (arg.TypeAndValue.IsCxxRefToPointer && arg.TypeAndValue.IsCxxConstRef && !xvalue)
+                if (arg.TypeAndValue.IsCxxRefToPointer && arg.TypeAndValue.CxxConstRef() && !xvalue)
                     spelling += " const";
                 if (xvalue)
                 {
@@ -18066,9 +18170,12 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         bound.name = wrapperName;
         RegisterCSignatures({ bound }, group.headers.front());
         if (auto it = functionTable.find(wrapperName); it != functionTable.end())
-            for (const auto& symbol : it->second)
+            for (auto& symbol : it->second)
                 if (symbol.External && symbol.UniqueName == wrapperName)
+                {
+                    symbol.IsCxxConstructorForwardingWrapper = true;
                     return true;
+                }
         return giveUp("the generated C++ variadic constructor wrapper could not be registered");
 }
 
@@ -18943,12 +19050,17 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
                         return fail(probe.invalidCxxTypeRequestError);
                     }
                 }
+                const bool generatedRequestMissing = generatedCxxRecords_.count(cflatName) != 0
+                    && probe.records.empty();
                 if (rejectClangErrors && !probe.firstError.empty()
-                    && !allowsIncompleteUniquePtrDiagnostic(probe.firstError))
+                    && !allowsIncompleteUniquePtrDiagnostic(probe.firstError)
+                    && !generatedRequestMissing)
                     return failDeterministic(std::format("C++ type '{}' could not be parsed: {}",
                                             cxxSpelling, FirstCxxErrorLine(probe.firstError)));
                 if (probe.records.empty())
                 {
+                    if (generatedRequestMissing && !probe.firstError.empty())
+                        return fail("clang: " + FirstCxxErrorLine(probe.firstError));
                     std::vector<CEnumEntry> requestEnums;
                     for (const auto& re : probe.enums)
                     {
@@ -19238,12 +19350,17 @@ bool LLVMBackend::RequestCxxForeignType(const std::string& cflatName, const std:
             }
             else
                 raw = std::move(probe);
+            const bool generatedRequestMissing = !finalCached
+                && generatedCxxRecords_.count(cflatName) != 0 && raw.records.empty();
             if (!finalCached && rejectClangErrors && !raw.firstError.empty()
-                && !allowsIncompleteUniquePtrDiagnostic(raw.firstError))
+                && !allowsIncompleteUniquePtrDiagnostic(raw.firstError)
+                && !generatedRequestMissing)
                 return fail(std::format("C++ type '{}' could not be parsed: {}",
                                         cxxSpelling, FirstCxxErrorLine(raw.firstError)));
             if (!finalCached && raw.records.empty())
             {
+                if (generatedCxxRecords_.count(cflatName) != 0 && !raw.firstError.empty())
+                    return fail("clang: " + FirstCxxErrorLine(raw.firstError));
                 return fail(std::format("'{}' does not name a C++ class type in the imported headers",
                                         cxxSpelling));
             }
@@ -21454,13 +21571,12 @@ void LLVMBackend::RegisterCGlobals(const std::vector<CGlobalEntry>& globals, con
             if (e.isDllImport && global != nullptr && global->isDeclaration())
                 global->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
             if (global != nullptr && !e.fromCxxHeader) cGlobalSymbols_.insert(global->getName().str());
+            if (global != nullptr && e.fromCxxHeader) cxxHeaderGlobalSymbols_.insert(global->getName().str());
             if (isConstant)
             {
                 SetConstGlobalInt(e.name, e.constantValue);
                 SetConstGlobalInt(global->getName().str(), e.constantValue);
             }
-            else if (e.isConst)
-                cxxConstGlobalSymbols_.insert(global->getName().str());
 
             if (auto* s = GetSymbolSink())
             {
@@ -21846,7 +21962,7 @@ bool LLVMBackend::MakeOpaqueFieldBlob(const CRecordFieldEntry& f, DeclTypeAndVal
         out.ConstArraySize = f.sizeBytes / unit;
         if (f.alignBytes > 8) out.UserAlignValue = f.alignBytes;
         out.VariableName = f.name;
-        out.IsCxxDeclaredConstField = f.isConst;
+        MarkCxxDeclaredConstField(out, f.isConst);
         out.IsCxxMutableField = f.isMutable;
         return true;
 }
@@ -22881,7 +22997,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                         }
                         tv.IsFlexibleArrayMember = f.isZeroSize && !arrDims.empty();
                         tv.IsZeroLengthArrayMember = tv.IsFlexibleArrayMember && zeroLengthArray;
-                        tv.IsCxxDeclaredConstField = r.isCxx && f.isConst;
+                        MarkCxxDeclaredConstField(tv, r.isCxx && f.isConst);
                         tv.IsCxxMutableField = f.isMutable;
                         MarkCxxReferenceField(f.ctype, tv, r.isCxx);
                         static_cast<TypeAndValue&>(d) = tv;
@@ -22957,7 +23073,7 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                         descriptor.name = field.VariableName;
                         descriptor.ctype = field.TypeName;
                         descriptor.access = cflat_cinterop::AccessPublic;
-                        descriptor.isConst = field.IsCxxDeclaredConstField;
+                        descriptor.isConst = field.IsConstObject();
                         descriptor.isMutable = field.IsCxxMutableField;
                         descriptor.offsetBytes = blockOffset + layout->getElementOffset((unsigned)fi);
                         auto* fieldType = GetType(field);
@@ -23027,13 +23143,14 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                     ok = false;
                     break;
                 }
-                tv.IsCxxDeclaredConstField = r.isCxx && f.isConst;
                 tv.IsCxxMutableField = f.isMutable;
                 MarkCxxReferenceField(f.ctype, tv, r.isCxx);
-                // `const char* p`: the pointee stays const for C++ overload choice.
-                if (r.isCxx && tv.Pointer && !tv.IsFunctionPointer
-                    && CxxSpellingHasConstPointee(f.ctype))
-                    tv.IsCxxPointeeConst = true;
+                // `const char* p`: the pointee stays const for C++ overload choice; a class-typed
+                // const field makes its object read-only to the C++ receiver checks.
+                if (r.isCxx && tv.Pointer && !tv.IsFunctionPointer)
+                    tv.ConstMask |= CxxSpellingPointeeConstMask(f.ctype, tv.ValuePointerDepth());
+                if (r.isCxx)
+                    MarkCxxDeclaredConstField(tv, f.isConst && !f.isMutable);
                 // A C field keeps its spelled pointee const (`const char* p`, a `PCSTR`; ctype is
                 // canonical), and its own top-level const (an array's is its element's). Only a
                 // downward-closed mask is a CFlat spelling (R11).
@@ -23046,8 +23163,6 @@ void LLVMBackend::RegisterCRecords(std::vector<CRecordEntry>& records, const std
                 }
                 if (r.isCxx && CxxSpellingHasVolatileTarget(f.ctype))
                     tv.IsCxxPointeeVolatile = true;
-                tv.IsCxxConstField = f.isConst && !f.isMutable && !tv.Pointer
-                    && !tv.IsCxxRefToPointer && IsCxxRecord(tv.TypeName);
                 const bool incompleteArray = f.ctype.find("[]") != std::string::npos;
                 const bool zeroLengthArray = f.ctype.find("[0]") != std::string::npos;
                 if (!arrDims.empty())
@@ -23776,6 +23891,28 @@ LLVMBackend::CxxSpelledParamRelation LLVMBackend::CxxSpelledClassPointerRelation
         return routes.unknown || argSpelling.empty() ? Rel::None : Rel::Unrelated;
 }
 
+bool LLVMBackend::CxxArgumentPointeeConst(const NamedVariable& argument) const
+{
+        const TypeAndValue& t = argument.TypeAndValue;
+        if (!t.Pointer || t.IsFunctionPointer || t.IsInterface) return false;
+        if (t.PointeeConst()) return true;
+        if (argument.Primary == nullptr || !argument.Primary->getType()->isPointerTy()
+            || llvm::isa<llvm::ConstantPointerNull>(argument.Primary))
+            return false;
+        const int depth = t.ValuePointerDepth();
+        std::string slotName;
+        if (depth >= 1 && ((StoredConstLevels(argument.Primary, slotName) >> (depth - 1)) & 1u) != 0)
+            return true;
+        // The provenance walk skips C++ record slots: read a native slot's own spelling (an
+        // explicit cast stamps its own qualification on the load).
+        auto* load = llvm::dyn_cast<llvm::LoadInst>(argument.Primary);
+        if (load != nullptr && IsCxxRecord(t.TypeName) && load->getMetadata("cflat.const.cast") == nullptr)
+            if (const TypeAndValue* slot = DeclaredConstSlot(load->getPointerOperand(), slotName))
+                return slot->Pointer && !slot->IsArrayView && slot->ValuePointerDepth() == depth
+                    && (slot->ConstMask & 1u) != 0;
+        return false;
+}
+
 LLVMBackend::CxxPointeeConstRelation LLVMBackend::CxxCandidatePointeeConstRelation(
     const FunctionSymbol& candidate, size_t index, const NamedVariable& fromArgument,
     const TypeAndValue& to) const
@@ -23785,6 +23922,9 @@ LLVMBackend::CxxPointeeConstRelation LLVMBackend::CxxCandidatePointeeConstRelati
         TypeAndValue decayedFrom = fromArgument.TypeAndValue;
         if (decayedFrom.TypeName.empty() && !fromArgument.InferSourceTypeName.empty())
             decayedFrom.TypeName = fromArgument.InferSourceTypeName;
+        // A native pointer's pointee const lives on its value, not the loaded TypeAndValue.
+        if (decayedFrom.Pointer && !decayedFrom.PointeeConst() && CxxArgumentPointeeConst(fromArgument))
+            decayedFrom.ConstMask |= 1u;
         if (decayedFrom.ConstArraySize > 0 && !decayedFrom.Pointer
             && !decayedFrom.ElemPointer && !decayedFrom.IsArrayView
             && !decayedFrom.IsFunctionPointer && !decayedFrom.IsInterface)
@@ -23825,11 +23965,7 @@ LLVMBackend::CxxPointeeConstRelation LLVMBackend::CxxCandidatePointeeConstRelati
             {
                 const size_t open = spelling.find('(');
                 const std::string pointeeSpelling = spelling.substr(0, open) + " *";
-                const bool targetConst = CxxSpellingHasConstPointee(pointeeSpelling);
-                if (decayedFrom.IsCxxPointeeConst == targetConst)
-                    return CxxPointeeConstRelation::Same;
-                return decayedFrom.IsCxxPointeeConst
-                    ? CxxPointeeConstRelation::Drops : CxxPointeeConstRelation::Adds;
+                return CxxPointeeConstRelationOf(decayedFrom, CxxSpellingHasConstPointee(pointeeSpelling));
             }
         }
         const auto relation = CxxRecordPointeeConstRelation(decayedFrom, to);
@@ -23847,7 +23983,7 @@ LLVMBackend::CxxPointeeConstRelation LLVMBackend::CxxCandidatePointeeConstRelati
             == CxxSpelledParamRelation::Unrelated)
             return relation;
         // The pointee const is whatever the spelling puts before its single `*`.
-        bool toConst = to.IsCxxPointeeConst;
+        bool toConst = to.PointeeConst();
         const std::string spelling = CxxReferenceParameterSpelling(candidate, index);
         if (const size_t star = spelling.find('*');
             star != std::string::npos && spelling.find('*', star + 1) == std::string::npos
@@ -23856,9 +23992,7 @@ LLVMBackend::CxxPointeeConstRelation LLVMBackend::CxxCandidatePointeeConstRelati
             const std::string referent = " " + spelling.substr(0, star) + " ";
             toConst = referent.find(" const ") != std::string::npos;
         }
-        if (decayedFrom.IsCxxPointeeConst == toConst) return CxxPointeeConstRelation::Same;
-        return decayedFrom.IsCxxPointeeConst ? CxxPointeeConstRelation::Drops
-                                             : CxxPointeeConstRelation::Adds;
+        return CxxPointeeConstRelationOf(decayedFrom, toConst);
 }
 
 /*
@@ -24314,6 +24448,12 @@ bool LLVMBackend::EmitCxxVirtualDelete(const std::string& typeName, llvm::Value*
 {
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
         if (info == nullptr || info->dtorDeletingVtableIndex < 0 || ptr == nullptr) return false;
+        // Refused: emit nothing, so the destructor never reaches the demand companion either.
+        if (const std::string error = ValidateCxxVTableDeleteDemand(typeName); !error.empty())
+        {
+            LogError(error);
+            return true;
+        }
         AbiRecipe recipe;
         llvm::Function* proto = GetOrCreateCxxStructor(typeName, info->destructor, recipe);
         if (proto == nullptr) return false;
@@ -24702,6 +24842,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
         else
         {
             info.isPolymorphic         = r.isPolymorphic;
+            info.vtableDeleteVerdict   = r.vtableDeleteVerdict;
             info.hasBases              = r.hasBases;
             info.hasVirtualBases       = r.hasVirtualBases;
             info.isFinal               = r.isFinal;
@@ -24844,7 +24985,13 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             {
                 CxxReferenceKind refKind = CxxReferenceKind::None;
                 std::string t = CxxSpellingWithoutRef(m.paramTypes[p], &refKind);
-                if (t.rfind("const ", 0) == 0) t = t.substr(6);
+                // Top-level const of a by-value parameter is not part of the signature; the
+                // referent const of `T&` / `T&&` is (`f(R&&)` and `f(const R&&)` both rank).
+                const bool constReferent = t.rfind("const ", 0) == 0;
+                if (constReferent) t = t.substr(6);
+                if (constReferent && (refKind == CxxReferenceKind::Lvalue
+                                      || refKind == CxxReferenceKind::Rvalue))
+                    t += "|const-referent";
                 // CFlat drops pointee cv from its surface type, but C++ distinguishes `T*`
                 // from `const T*` overloads. Keep both in the candidate set for C++ ranking.
                 if (CxxSpellingHasConstPointee(m.paramTypes[p])) t += "|const-pointee";
@@ -24936,13 +25083,15 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 if (tv.ElemPointer && !tv.IsCxxRefToPointer) tv.ElemPointer = false;
                 tv.IsCxxRefToPointer = true;
                 tv.IsAlias = true;
-                tv.IsCxxConstRef = CxxParamIsConstRefToPointer(spelling);
+                tv.MarkCxxRef();
+                tv.SetCxxConstRef(CxxParamIsConstRefToPointer(spelling));
             }
             if (refKind == CxxReferenceKind::Lvalue && tv.Pointer
                 && !tv.ElemPointer && !tv.IsFunctionPointer)
             {
                 tv.IsAlias = true;
-                tv.IsCxxConstRef = CxxParamIsConstLvalueReference(spelling);
+                tv.MarkCxxRef();
+                tv.SetCxxConstRef(CxxParamIsConstLvalueReference(spelling));
             }
         };
         /*
@@ -25252,14 +25401,15 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 else
                     tv.Pointer = false;
                 tv.IsAlias = true;
-                tv.IsCxxConstRef = CxxParamIsConstLvalueReference(spelling)
+                tv.MarkCxxRef();
+                tv.SetCxxConstRef(CxxParamIsConstLvalueReference(spelling)
                     || (refKind == CxxReferenceKind::Rvalue
                         && CxxRvalueReferenceIsConst(spelling))
-                    || (tv.IsCxxRefToPointer && CxxParamIsConstRefToPointer(spelling));
+                    || (tv.IsCxxRefToPointer && CxxParamIsConstRefToPointer(spelling)));
             };
             if (aliasRefs) asAliasIfRef(m.retType, ret, true);
-            if (ret.Pointer && !ret.IsFunctionPointer && CxxSpellingHasConstPointee(m.retType))
-                ret.IsCxxPointeeConst = true;
+            if (ret.Pointer && !ret.IsFunctionPointer)
+                ret.ConstMask |= CxxSpellingPointeeConstMask(m.retType, ret.ValuePointerDepth());
             if (CxxSpellingHasVolatileTarget(m.retType))
                 ret.IsCxxPointeeVolatile = true;
             std::vector<TypeAndValue> params;
@@ -25302,6 +25452,22 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 if (isStructor && m.kind == Member::Constructor)
                     markConstructorReference(m.paramTypes[p], tv);
                 else if (aliasRefs) asAliasIfRef(m.paramTypes[p], tv);
+                // An R&& to a record not yet projectable stays void* (asAliasIfRef keeps rvalue
+                // params as-is); refuse it like the const R& twin so a later projection retries.
+                if (aliasRefs && tv.Pointer && !tv.ElemPointer && !tv.IsFunctionPointer
+                    && tv.TypeName == "void" && !tv.IsCxxNullptrT)
+                {
+                    CxxReferenceKind rk = CxxReferenceKind::None;
+                    const std::string rb = CxxSpellingWithoutRef(m.paramTypes[p], &rk);
+                    if (rk == CxxReferenceKind::Rvalue && rb.find('*') == std::string::npos
+                        && !CxxSpellingIsBareNullptrT(rb) && rb.find("void") == std::string::npos)
+                    {
+                        refuse(std::format("takes unsupported type '{}'", m.paramTypes[p]));
+                        paramsOk = false;
+                        unmappableParam = p;
+                        break;
+                    }
+                }
                 // libc++ keeps vector<T*>::push_back's reference in the dependent
                 // value_type spelling on some Clang versions, which canonicalizes without
                 // exposing '&'. Its ABI is still the T*& slot shape.
@@ -25314,9 +25480,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                 }
                 tv.VariableName = p < m.paramNames.size() && !m.paramNames[p].empty()
                     ? m.paramNames[p] : std::format("p{}", p);
-                if (tv.Pointer && !tv.IsFunctionPointer
-                    && CxxSpellingHasConstPointee(m.paramTypes[p]))
-                    tv.IsCxxPointeeConst = true;
+                if (tv.Pointer && !tv.IsFunctionPointer)
+                    tv.ConstMask |= CxxSpellingPointeeConstMask(m.paramTypes[p], tv.ValuePointerDepth());
                 if (CxxSpellingHasVolatileTarget(m.paramTypes[p]))
                     tv.IsCxxPointeeVolatile = true;
                 // The mapped LLVM type must be a legal function argument (never void, a bare
@@ -25571,6 +25736,8 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
                     : "clang: " + sv.initializerFailure;
             TypeAndValue tv;
             if (!mapType(sv.ctype, tv)) continue;
+            tv.ConstMask |= CxxSpellingPointeeConstMask(sv.ctype, tv.ValuePointerDepth());
+            MarkCxxDeclaredConstField(tv, CxxSpellingHasTopLevelObjectConst(sv.ctype));
             const std::string regName = r.name + "." + sv.name;
             if (globalNamedVariable.count(regName)) continue;
             for (size_t pos = 0; (pos = regName.find('.', pos)) != std::string::npos; ++pos)
@@ -25593,6 +25760,7 @@ void LLVMBackend::RegisterCxxClassMembers(const CRecordEntry& r, const std::stri
             auto* staticGlobal = CreateGlobalVariable(tv, init, /*threadLocal*/ false, /*userAlign*/ 0,
                                  /*externalDecl*/ !sv.isCompileTimeConstant,
                                  /*srcIsUnsigned*/ false, sv.linkageName);
+            MarkCxxConstGlobal(staticGlobal);
             if (!sv.isCompileTimeConstant)
                 cxxStaticMemberSymbols_.insert(staticGlobal->getName().str());
             if (sv.isCompileTimeConstant)
@@ -26358,6 +26526,26 @@ bool LLVMBackend::CxxBaseHasAccessibleMoveOrCopy(const std::string& baseType) co
         return info->hasCopyCtor && !info->hasDeletedCopyCtor;
 }
 
+bool LLVMBackend::CxxClassOverrideParamIsBorrowed(const std::string& typeName) const
+{
+        const_cast<LLVMBackend*>(this)->EnsureCxxMemberProjected(typeName, "__ctor");
+        const auto* info = GetCxxClassInfo(typeName);
+        if (info == nullptr) return false;
+
+        bool canTransfer = false;
+        for (const auto& ctor : info->constructors)
+        {
+            if (!ctor.isCopyCtor && !ctor.isMoveCtor) continue;
+            if (ctor.isDeleted || ctor.access != cflat_cinterop::AccessPublic) continue;
+            // The generated wrapper can forward through T&& or const T&, but not T&.
+            if (ctor.isMoveCtor
+                || (ctor.isCopyCtor && ctor.params.size() == 2
+                    && ctor.params[1].CxxConstRef()))
+                canTransfer = true;
+        }
+        return !canTransfer;
+}
+
 void LLVMBackend::RecordCppStructBase(const std::string& structName,
                                       const std::string& baseName)
 {
@@ -26490,6 +26678,36 @@ bool LLVMBackend::GetCxxTypeOwnerGroup(const std::string& typeName, size_t& grou
         return true;
 }
 
+bool LLVMBackend::IsCxxConstructingStructor(const std::string& typeName,
+                                            const CxxClassInfo::Structor& st)
+{
+        // Every structor EmitCxxStructorCall sees constructs, except the destructor and the
+        // assignment operators (the object already exists).
+        const CxxClassInfo* info = GetCxxClassInfo(ResolveTypeAlias(typeName));
+        if (info == nullptr) return true;
+        const std::string& name = st.linkageName;
+        if (name == info->destructor.linkageName || name == info->copyAssign.linkageName
+            || name == info->moveAssign.linkageName)
+            return false;
+        for (const auto* list : { &info->copyAssignOverloads, &info->moveAssignOverloads })
+            for (const CxxClassInfo::Structor& op : *list)
+                if (op.linkageName == name) return false;
+        for (const auto& [key, transfer] : info->xvalueTransfers)
+            if (key.starts_with("assign") && transfer.linkageName == name) return false;
+        return true;
+}
+
+std::string LLVMBackend::ValidateCxxVTableDeleteDemand(const std::string& typeName)
+{
+        // The verdict was computed at extraction and cached with the record, so a warm compile
+        // refuses here exactly like a cold one, with no live group and no clang request.
+        const std::string resolvedType = ResolveTypeAlias(typeName);
+        if (!CxxHasVirtualDestructor(resolvedType)) return {};
+        const CxxClassInfo* info = GetCxxClassInfo(resolvedType);
+        if (info == nullptr || info->vtableDeleteVerdict.empty()) return {};
+        return "clang: " + info->vtableDeleteVerdict;
+}
+
 static std::string CppStructOverrideNameKey(const std::string& structName,
                                             const std::string& methodName,
                                             const std::vector<LLVMBackend::TypeAndValue>& params)
@@ -26590,10 +26808,20 @@ llvm::Function* LLVMBackend::EmitCppStructOverrideThunk(
                 std::string mismatch;
                 const cflat_cinterop::RawAbi* helperAbiPlan = nullptr;
                 AbiRecipe fallbackHelperRecipe;
+                const FunctionSymbol* helperSymbol = nullptr;
                 if (auto* helperFunction = module->getFunction(stableName))
-                    if (const FunctionSymbol* helperSymbol = GetFunctionSymbol(helperFunction);
-                        helperSymbol != nullptr && helperSymbol->CxxAbi.valid)
+                    if ((helperSymbol = GetFunctionSymbol(helperFunction)) != nullptr
+                        && helperSymbol->CxxAbi.valid)
+                    {
                         helperAbiPlan = &helperSymbol->CxxAbi;
+                        plan.ret = helperSymbol->ReturnType;
+                        plan.params = helperSymbol->Parameters;
+                        if (!plan.params.empty())
+                        {
+                            plan.params[0].TypeName = structName;
+                            plan.params[0].Pointer = true;
+                        }
+                    }
                 const CSigEntry* helperSig = nullptr;
                 for (const auto& [name, signatures] : cxxFunctionSignatures_)
                 {
@@ -26610,7 +26838,16 @@ llvm::Function* LLVMBackend::EmitCppStructOverrideThunk(
                 if (helperAbiPlan == nullptr)
                 {
                     if (helperSig != nullptr)
+                    {
                         helperAbiPlan = &helperSig->abi;
+                        plan.ret = helperSig->ret;
+                        plan.params = helperSig->params;
+                        if (!plan.params.empty())
+                        {
+                            plan.params[0].TypeName = structName;
+                            plan.params[0].Pointer = true;
+                        }
+                    }
                     else
                     {
                         // The thunk calls a free C helper: classify its actual signature,
@@ -28875,6 +29112,11 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
             callArgs = &loweredExtraArgs;
         }
         ValidateCxxDemandAtUseSite(st.linkageName);
+        // Constructing the object installs its vtable, whose deleting destructor needs a usable
+        // operator delete. Destroying or assigning one never does, so only construction checks.
+        if (const std::string error = ValidateCxxVTableDeleteDemand(typeName);
+            !error.empty() && IsCxxConstructingStructor(typeName, st))
+            LogError(error);
         AbiRecipe recipe;
         llvm::Function* fn = GetOrCreateCxxStructor(typeName, st, recipe);
         if (fn == nullptr) return false;
@@ -28900,7 +29142,7 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
             {
                 const NamedVariable& source = (*callArgVars)[i];
                 if (param->IsFunctionPointer && param->Pointer && !param->ElemPointer
-                    && (param->IsAlias || param->IsRvalueRef || param->IsCxxConstRef))
+                    && (param->IsAlias || param->IsRvalueRef || param->CxxConstRef()))
                 {
                     if (source.TypeAndValue.IsFunctionPointer && source.Storage != nullptr)
                         a = source.Storage;
@@ -28967,7 +29209,7 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                 // An opaque `void&` whose harvested referent is a base of the argument class
                 // binds the base subobject, not the object start.
                 else if (!source.TypeAndValue.Pointer && param->Pointer && !param->ElemPointer
-                         && (param->IsAlias || param->IsRvalueRef || param->IsCxxConstRef)
+                         && (param->IsAlias || param->IsRvalueRef || param->CxxConstRef())
                          && param->TypeName == "void"
                          && IsForeignCxxClassWithConstructors(source.TypeAndValue.TypeName)
                          && (source.Storage != nullptr
@@ -29003,7 +29245,7 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                 // A C++ reference parameter takes the ARGUMENT's address, the same binding the
                 // free and member call paths use; a copy loses every write the callee makes.
                 else if (!source.TypeAndValue.Pointer && param->Pointer && !param->ElemPointer
-                         && (param->IsAlias || param->IsRvalueRef || param->IsCxxConstRef)
+                         && (param->IsAlias || param->IsRvalueRef || param->CxxConstRef())
                          && source.Storage != nullptr
                          && (param->TypeName == source.TypeAndValue.TypeName
                              || (param->TypeName == "void"
@@ -29037,14 +29279,14 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
             if (param != nullptr && param->Pointer && a != nullptr
                 && !a->getType()->isPointerTy()
                 && (a->getType()->isStructTy()
-                    || ((param->IsAlias || param->IsRvalueRef || param->IsCxxConstRef)
+                    || ((param->IsAlias || param->IsRvalueRef || param->CxxConstRef())
                         && !param->ElemPointer
                         && llvm::FunctionType::isValidArgumentType(a->getType()))))
             {
                 // The temporary holds the REFERENT, not the argument: a CFlat integer literal
                 // arrives as i8, and a 1-byte buffer read back as `int` is garbage.
                 llvm::Type* refTy = a->getType();
-                if ((param->IsAlias || param->IsRvalueRef || param->IsCxxConstRef)
+                if ((param->IsAlias || param->IsRvalueRef || param->CxxConstRef())
                     && !param->ElemPointer)
                 {
                     TypeAndValue referent = *param;
@@ -29605,7 +29847,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                 // C++ permits an object pointer to convert to void*. The reverse conversion
                 // still needs an explicit cast, and function pointers are not object pointers.
                 if (want.TypeName == "void" && !want.ElemPointer && !got.IsFunctionPointer
-                    && (!got.IsCxxPointeeConst || want.IsCxxPointeeConst))
+                    && (!got.PointeeConstBit() || want.PointeeConstBit()))
                     return true;
                 // A pointer to a PRIMITIVE may be spelled with a CFlat synonym (`long`) while the
                 // C++ declaration uses another name for the same width (`long long`, i.e. int64_t
@@ -29779,7 +30021,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
             if (!param.Pointer) return size_t(0);
             if (param.IsRvalueRef) return rvalue ? size_t(2) : size_t(0);
             if (!param.IsAlias) return size_t(0);
-            return param.IsCxxConstRef ? size_t(1) : (rvalue ? size_t(0) : size_t(2));
+            return param.CxxConstRef() ? size_t(1) : (rvalue ? size_t(0) : size_t(2));
         };
         struct Viable
         {
@@ -29835,7 +30077,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(argument.Primary);
                     if (argument.IsStringLiteral
                         || (constant != nullptr && IsStringLiteralConstant(constant)))
-                        got.IsCxxPointeeConst = true;
+                        got.SetPointeeConstBit(true);
                 }
                 // A bare `nullptr` has no CFlat type: it binds a by-value pointer or function
                 // pointer (a null pointer conversion), or exactly a `std::nullptr_t` by value or
@@ -29884,7 +30126,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     && (got.IsFunctionPointer || originalFunctionPointer)
                     && CxxConstReceiverKind((*argVars)[i]) != 0;
                 if (constFunctionPointerLvalue && want.IsFunctionPointer && want.IsAlias
-                    && !want.IsCxxConstRef && !want.IsRvalueRef)
+                    && !want.CxxConstRef() && !want.IsRvalueRef)
                 {
                     ok = false;
                     break;
@@ -29928,7 +30170,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                 }
                 if (sameReferenceReferent && want.Pointer
                     && (want.IsAlias || want.IsCxxRefToPointer)
-                    && !want.IsRvalueRef && !want.IsCxxConstRef
+                    && !want.IsRvalueRef && !want.CxxConstRef()
                     && rvalue)
                 {
                     if (!blocked && !softRefused && !c.needsLocalDefinition && referenceRejection.empty())
@@ -29939,7 +30181,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     ok = false;
                     break;
                 }
-                if (want.IsFunctionPointer && want.IsAlias && !want.IsCxxConstRef
+                if (want.IsFunctionPointer && want.IsAlias && !want.CxxConstRef()
                     && argVars != nullptr && i < argVars->size()
                     && (*argVars)[i].Storage == nullptr
                     && !(*argVars)[i].CallerName.empty())
@@ -30040,7 +30282,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
                     // A const reference and an rvalue reference both materialize a temporary, and
                     // so does an lvalue whose address the front end did not keep. Only a PROVEN
                     // rvalue is refused by a non-const lvalue reference.
-                    if (!want.IsCxxConstRef && !want.IsRvalueRef && rvalue)
+                    if (!want.CxxConstRef() && !want.IsRvalueRef && rvalue)
                     {
                         if (!blocked && !softRefused && !c.needsLocalDefinition && referenceRejection.empty())
                             referenceRejection = std::format(
@@ -30496,7 +30738,7 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
         // R5: a raw T* (or nullptr) at a std::unique_ptr<T> parameter - the `unique T*` sugar -
         // adopts through unique_ptr(pointer); a non-const lvalue reference still takes no temp.
         if (!param.IsInterface && IsRawPointerForCxxUniquePtr(param.TypeName, arg))
-            return param.IsAlias && !param.IsRvalueRef && !param.IsCxxConstRef
+            return param.IsAlias && !param.IsRvalueRef && !param.CxxConstRef()
                     && !param.ElemPointer && !cxxByValueParam
                 ? CxxArgConversion::NonConstLvalueRef : CxxArgConversion::Convertible;
         // A CFlat closure handed to C++ constructs the class from its owning __cflat_closure<>;
@@ -30506,7 +30748,7 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
             if (param.TypeName.empty() || param.Pointer || param.IsInterface
                 || !IsForeignCxxClassWithConstructors(param.TypeName))
                 return CxxArgConversion::NotApplicable;
-            return param.IsAlias && !param.IsRvalueRef && !param.IsCxxConstRef
+            return param.IsAlias && !param.IsRvalueRef && !param.CxxConstRef()
                     && !param.ElemPointer && !cxxByValueParam
                 ? CxxArgConversion::NonConstLvalueRef : CxxArgConversion::Convertible;
         }
@@ -30540,9 +30782,9 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
         // Constructor templates are absent from the extracted list, so ask clang to prove this
         // class-to-class user-defined sequence before ranking a C++ value/rvalue parameter.
         // A lone candidate's `const X&` / `X&&` binds the converted temporary too ([dcl.init.ref]).
-        if ((allowTemplateClassConversion || param.IsRvalueRef || param.IsCxxConstRef)
+        if ((allowTemplateClassConversion || param.IsRvalueRef || param.CxxConstRef())
             && IsCxxRecord(argType.TypeName)
-            && (cxxByValueParam || param.IsRvalueRef || param.IsCxxConstRef))
+            && (cxxByValueParam || param.IsRvalueRef || param.CxxConstRef()))
         {
             const CxxClassInfo* target = GetCxxClassInfoWithConstructors(param.TypeName);
             if (target != nullptr && target->hasCtorTemplate
@@ -30571,7 +30813,7 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
         // A non-const lvalue reference never takes a user-defined conversion - the temporary has
         // no address. A member's reference arrives bare with IsAlias, so key on IsAlias alone.
         const bool nonConstLvalueRef = param.IsAlias && !param.IsRvalueRef
-            && !param.IsCxxConstRef && !param.ElemPointer && !cxxByValueParam;
+            && !param.CxxConstRef() && !param.ElemPointer && !cxxByValueParam;
         auto answer = [&](CxxArgConversion found) {
             return nonConstLvalueRef ? CxxArgConversion::NonConstLvalueRef : found;
         };
@@ -30616,7 +30858,7 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
                     && !ctorArg->IsCxxRefToPointer && !ctorArg->IsRvalueRef;
                 const bool constPointerRef = ctorArg != nullptr && ctorArg->Pointer
                     && !ctorArg->ElemPointer && ctorArg->IsAlias
-                    && ctorArg->IsCxxRefToPointer && ctorArg->IsCxxConstRef
+                    && ctorArg->IsCxxRefToPointer && ctorArg->CxxConstRef()
                     && !ctorArg->IsRvalueRef;
                 if (!pointerByValue && !constPointerRef)
                     return CxxArgConversion::NotApplicable;
@@ -30635,7 +30877,7 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
             return answer(CxxArgConversion::ExplicitCtor);
         // A class source whose only route is its `operator X()` into a `const X&` / `X&&`:
         // clang copy-initializes the temporary (an ambiguous or explicit route refuses there).
-        if ((param.IsRvalueRef || param.IsCxxConstRef) && !argType.Pointer
+        if ((param.IsRvalueRef || param.CxxConstRef()) && !argType.Pointer
             && IsCxxRecord(argType.TypeName) && HasImplicitClassConversionOperator(argType.TypeName))
         {
             NamedVariable probe = arg;
@@ -30678,7 +30920,7 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
         // re-registers the class. The probe copy-initializes: an explicit ctor never converts.
         const auto* info = GetCxxClassInfoWithConstructors(param.TypeName);
         const bool plainClassReferenceCtor
-            = (param.IsRvalueRef || param.IsCxxConstRef)
+            = (param.IsRvalueRef || param.CxxConstRef())
                 && argType.TypeName.find('$') == std::string::npos
                 && param.TypeName.find('$') == std::string::npos;
         if (info == nullptr || (!info->constructors.empty()
@@ -30790,7 +31032,7 @@ std::string LLVMBackend::CxxRvalueRefBindKey(const NamedVariable& arg, const Typ
             || !CxxSpellingForCflatType(param.TypeName, targetSpelling))
             return {};
         if (argType.Pointer)
-            parameter = (argType.IsCxxPointeeConst ? "const " : "") + sourceSpelling
+            parameter = (argType.PointeeConstBit() ? "const " : "") + sourceSpelling
                 + (argType.ElemPointer ? " **" : " *");
         else
             parameter = (CxxConstReceiverKind(arg) != 0 ? "const " : "") + sourceSpelling + " &";
@@ -31202,13 +31444,13 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
         const bool plainClassPair = sourceTemplate == std::string::npos
             && targetTemplate == std::string::npos;
         const bool classTemplateConversion
-            = (allowTemplateClassConversion || param.IsRvalueRef || param.IsCxxConstRef)
+            = (allowTemplateClassConversion || param.IsRvalueRef || param.CxxConstRef())
             && info != nullptr && info->hasCtorTemplate
             && (bothTemplateSpecializations || plainClassPair)
             && IsCxxRecord(argType.TypeName);
         // Only an `operator X()` converts a class source into a reference parameter (above).
         const bool operatorOnly = ctor == nullptr && !slicesToBase && !argType.Pointer
-            && (param.IsRvalueRef || param.IsCxxConstRef) && IsCxxRecord(argType.TypeName)
+            && (param.IsRvalueRef || param.CxxConstRef()) && IsCxxRecord(argType.TypeName)
             && HasImplicitClassConversionOperator(argType.TypeName);
         const bool wrapped = info != nullptr
             && (operatorBindsBetter || classTemplateConversion || operatorOnly || zeroTie
@@ -31291,7 +31533,7 @@ bool LLVMBackend::MaterializeImplicitCxxClassArgument(NamedVariable& arg,
                  && ctor->params[1].IsCxxRefToPointer && ctor->params[1].IsAlias
                  && !ctor->params[1].IsRvalueRef)
         {
-            if (!ctor->params[1].IsCxxConstRef)
+            if (!ctor->params[1].CxxConstRef())
             {
                 // A non-const `T*&` binds the argument's own pointer slot (a write must reach
                 // it); only an lvalue of exactly that pointer type can bind, as in C++.
@@ -31490,7 +31732,7 @@ llvm::Value* LLVMBackend::ConvertCxxXvalueToPointer(const NamedVariable& source,
         if (!CxxSpellingForCflatType(sourceType, sourceSpelling)
             || !CxxSpellingForCflatType(pointerType.TypeName, pointeeSpelling))
             return nullptr;
-        const bool pointeeConst = pointerType.IsCxxPointeeConst;
+        const bool pointeeConst = pointerType.PointeeConstBit();
         const std::string key = sourceType + "|" + pointerType.TypeName
             + (pointeeConst ? "|const" : "|");
         auto owner = cxxTypeOwnerGroup_.find(sourceType);
@@ -32661,7 +32903,7 @@ std::string LLVMBackend::CxxConversionOperatorTo(const std::string& sourceTypeNa
                 if (classReferenceTarget)
                 {
                     // A const referent (`operator const X&`) never binds a mutable X& or X&&.
-                    if (ret.IsCxxConstRef && !dest.IsCxxConstRef) continue;
+                    if (ret.CxxConstRef() && !dest.CxxConstRef()) continue;
                     if (ret.TypeName == dest.TypeName && !ret.ElemPointer
                         && ret.IsAlias)
                     {
@@ -32834,7 +33076,7 @@ bool LLVMBackend::ApplyCxxConversionOperator(NamedVariable& nv, const TypeAndVal
             nv.BaseType = GetType(const_cast<TypeAndValue&>(dest));
             nv.TypeAndValue = dest;
             // The referent stays const through lowering: a const result never reaches a mutable dest.
-            nv.TypeAndValue.IsCxxConstRef = dest.IsCxxConstRef || conversionReturnType.IsCxxConstRef;
+            nv.TypeAndValue.SetCxxConstRef(dest.CxxConstRef() || conversionReturnType.CxxConstRef());
             nv.TypeAndValue.VariableName.clear();
             return true;
         }

@@ -98,3 +98,40 @@ int c07ViewField()
     h.v[0] = 5;
     return a[0];
 }
+
+int c07DirectViewElementWrite()
+{
+    int[2] a = {1, 2};
+    (const int)[] cv = a;
+    expect_error("cannot assign to 'cv[0]': it is reached through a pointer to const");
+    cv[0] = 5;
+    return a[0];
+}
+
+int c07WholeWordViewReseat()
+{
+    int[2] a = {1, 2};
+    int[2] b = {3, 4};
+    const int[] w = a;
+    expect_error("cannot assign to 'w': it is declared const");
+    w = b;
+    return w[0];
+}
+
+int c07ParenthesizedElementWrite()
+{
+    int[2] a = {1, 2};
+    const (int)[] cv = a;
+    expect_error("cannot assign to 'cv[0]': it is reached through a pointer to const");
+    cv[0] = 5;
+    return a[0];
+}
+
+int c07ConstViewDiscard()
+{
+    int[2] a = {1, 2};
+    (const int)[] cv = a;
+    expect_error("conversion discards const");
+    int[] bad = cv;
+    return bad[0];
+}
