@@ -73,6 +73,7 @@
 
 #include "llvm/Support/TimeProfiler.h"
 
+#include <map>
 #include <set>
 #include <array>
 #include <algorithm>
@@ -87,6 +88,14 @@
 namespace cflat_cinterop
 {
     using namespace clang;
+
+    static bool HasTrivialUsableCopyAssignment(const CXXRecordDecl* record)
+    {
+        for (const CXXMethodDecl* method : record->methods())
+            if (method->isCopyAssignmentOperator())
+                return method->isTrivial() && !method->isDeleted();
+        return record->hasSimpleCopyAssignment() && record->hasTrivialCopyAssignment();
+    }
 
     std::string AliasCxxNestedSpecializationNames(const std::string& source)
     {
@@ -2820,8 +2829,7 @@ namespace cflat_cinterop
                                     && st.ci->getSema().IsCXXTriviallyRelocatableType(*anonCxx);
                                 nested.hasTrivialDefaultCtor = anonCxx->hasTrivialDefaultConstructor();
                                 nested.hasTrivialCopyCtor = anonCxx->hasTrivialCopyConstructor();
-                                nested.hasTrivialCopyAssign = anonCxx->hasSimpleCopyAssignment()
-                                    && anonCxx->hasTrivialCopyAssignment();
+                                nested.hasTrivialCopyAssign = HasTrivialUsableCopyAssignment(anonCxx);
                                 nested.hasTrivialMoveAssign = anonCxx->hasSimpleMoveAssignment()
                                     && anonCxx->hasTrivialMoveAssignment();
                                 nested.hasTrivialDtor = !anonCxx->hasNonTrivialDestructor();
@@ -2999,8 +3007,7 @@ namespace cflat_cinterop
                         }
                 rec.hasTrivialDefaultCtor = cxx->hasTrivialDefaultConstructor();
                 rec.hasTrivialCopyCtor = cxx->hasTrivialCopyConstructor();
-                rec.hasTrivialCopyAssign = cxx->hasSimpleCopyAssignment()
-                                        && cxx->hasTrivialCopyAssignment();
+                rec.hasTrivialCopyAssign = HasTrivialUsableCopyAssignment(cxx);
                 rec.hasTrivialMoveAssign = cxx->hasSimpleMoveAssignment()
                                         && cxx->hasTrivialMoveAssignment();
                 rec.hasTrivialDtor = !cxx->hasNonTrivialDestructor();
@@ -3988,7 +3995,10 @@ namespace cflat_cinterop
                 rec.inScope = forcedBase || !nameOverride.empty() || !st.req.requireInScope
                            || st.InScope(file);
                 if (st.req.cxxMode && llvm::isa<CXXRecordDecl>(rd))
+                {
                     rec.canonicalCtype = CanonicalSpelling(ctx, ctx.getCanonicalTagType(rd));
+                    rec.stdOwnedType = StdOwnedElementSpelling(rd);
+                }
                 const ASTRecordLayout& layout = ctx.getASTRecordLayout(rd);
                 rec.sizeBytes = layout.getSize().getQuantity();
                 rec.alignBytes = layout.getAlignment().getQuantity();
@@ -4093,6 +4103,7 @@ namespace cflat_cinterop
                         rec.fields.clear();
                         rec.layoutRefusal.clear();
                         EmitBlobStorage(rec);
+                        CollectBlobIndirections(rd, rec.blobIndirections);
                     }
                 }
                 else if (!flattened) CollectFields(rd, rec.name, rec);
@@ -4133,6 +4144,107 @@ namespace cflat_cinterop
              * that is byte-compatible with the C++ object, which is all a foreign class needs -
              * construction, destruction and every member call go through Clang's own symbols.
              */
+            /*
+             * Facts about what an opaque blob refers to, as clang's layout sees it: "R:<T>" for a
+             * reference member, "P:<T>" for a raw pointer member, T = the canonical cv-qualified
+             * IMMEDIATE pointee (records only). Walks fields (arrays stripped, private/anonymous
+             * included), bases and by-value nested records, with no depth or count cutoff: the
+             * by-value graph is finite and acyclic, and each record's summary is memoized.
+             * A raw T* inside a class-template specialization that is non-trivially destructible
+             * and takes T as a by-value type argument (vector<T>, shared_ptr<T>, unique_ptr<T>)
+             * addresses an owned copy: dropped from that specialization's summary.
+             * Type-erased storage (a byte buffer) stays invisible.
+             */
+            using BlobFact = std::pair<bool, QualType>;   // (is reference, canonical pointee)
+            std::map<const RecordDecl*, std::vector<BlobFact>> blobFactMemo;
+
+            const std::vector<BlobFact>& BlobFacts(const RecordDecl* rd)
+            {
+                auto found = blobFactMemo.find(rd);
+                if (found != blobFactMemo.end()) return found->second;
+                blobFactMemo[rd];   // cycle guard; a by-value layout cannot recurse
+                std::vector<BlobFact> facts;
+                std::set<std::pair<bool, const void*>> seen;
+                auto add = [&](const BlobFact& fact) {
+                    if (seen.insert({ fact.first, fact.second.getAsOpaquePtr() }).second)
+                        facts.push_back(fact);
+                };
+                auto addNested = [&](const RecordDecl* nested) {
+                    if (nested == nullptr || (nested = nested->getDefinition()) == nullptr) return;
+                    for (const BlobFact& fact : BlobFacts(nested)) add(fact);
+                };
+                const auto* cxx = llvm::dyn_cast<CXXRecordDecl>(rd);
+                if (cxx != nullptr)
+                    for (const CXXBaseSpecifier& b : cxx->bases())
+                        addNested(b.getType()->getAsRecordDecl());
+                for (const FieldDecl* f : rd->fields())
+                {
+                    QualType t = f->getType().getCanonicalType();
+                    while (const ArrayType* at = ctx.getAsArrayType(t))
+                        t = at->getElementType().getCanonicalType();
+                    if (t->isDependentType()) continue;
+                    if (t->isReferenceType() || t->isPointerType())
+                    {
+                        const QualType pointee = t->getPointeeType().getCanonicalType();   // cv kept
+                        if (pointee->isRecordType()) add({ t->isReferenceType(), pointee });
+                    }
+                    else addNested(t->getAsRecordDecl());
+                }
+                if (const auto* spec = llvm::dyn_cast_or_null<ClassTemplateSpecializationDecl>(cxx);
+                    spec != nullptr && !spec->hasTrivialDestructor())
+                {
+                    std::set<const void*> owned;
+                    for (const TemplateArgument& arg : spec->getTemplateArgs().asArray())
+                        if (arg.getKind() == TemplateArgument::Type)
+                            owned.insert(arg.getAsType().getCanonicalType().getAsOpaquePtr());
+                    std::erase_if(facts, [&](const BlobFact& fact) {
+                        return !fact.first && owned.count(fact.second.getAsOpaquePtr()) != 0;
+                    });
+                }
+                return blobFactMemo[rd] = std::move(facts);
+            }
+
+            void CollectBlobIndirections(const RecordDecl* rd, std::vector<std::string>& out)
+            {
+                if (rd == nullptr || (rd = rd->getDefinition()) == nullptr) return;
+                std::set<std::string> spelled;
+                for (const BlobFact& fact : BlobFacts(rd))
+                {
+                    std::string spelling = CanonicalSpelling(ctx, fact.second);
+                    if (!spelling.empty() && spelled.insert(spelling = (fact.first ? "R:" : "P:") + spelling).second)
+                        out.push_back(std::move(spelling));
+                }
+            }
+
+            /*
+             * The element type a standard-library owning template owns, from clang's decl (never
+             * the spelling): std shared_ptr<T>, unique_ptr<T, default_delete<T>>, vector<T,
+             * allocator<T>>, optional<T>. Inline namespaces (std::__1) count as std. Else "".
+             */
+            std::string StdOwnedElementSpelling(const RecordDecl* rd)
+            {
+                const auto* spec = llvm::dyn_cast<ClassTemplateSpecializationDecl>(rd);
+                if (spec == nullptr || !spec->isInStdNamespace()) return {};
+                const TemplateArgumentList& args = spec->getTemplateArgs();
+                if (args.size() == 0 || args[0].getKind() != TemplateArgument::Type) return {};
+                const QualType element = args[0].getAsType().getCanonicalType();   // cv kept: matches the T* pointee
+                auto isStdOf = [&](unsigned index, llvm::StringRef name) {
+                    if (args.size() <= index || args[index].getKind() != TemplateArgument::Type) return false;
+                    const auto* helper = llvm::dyn_cast_or_null<ClassTemplateSpecializationDecl>(
+                        args[index].getAsType()->getAsRecordDecl());
+                    return helper != nullptr && helper->isInStdNamespace() && helper->getName() == name
+                        && helper->getTemplateArgs().size() >= 1
+                        && helper->getTemplateArgs()[0].getKind() == TemplateArgument::Type
+                        && ctx.hasSameUnqualifiedType(helper->getTemplateArgs()[0].getAsType(), element);
+                };
+                const llvm::StringRef name = spec->getName();
+                const bool owner = (name == "shared_ptr" && args.size() == 1)
+                    || (name == "optional" && args.size() == 1)
+                    || (name == "unique_ptr" && args.size() == 2 && isStdOf(1, "default_delete"))
+                    || (name == "vector" && args.size() == 2 && isStdOf(1, "allocator"));
+                return owner ? CanonicalSpelling(ctx, element) : std::string();
+            }
+
             void EmitBlobStorage(RawRecord& rec)
             {
                 uint64_t align = rec.alignBytes == 0 ? 1 : rec.alignBytes;

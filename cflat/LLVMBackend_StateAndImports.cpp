@@ -2857,6 +2857,12 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
         // The canonical C++ spelling: a template argument naming this class needs it, so a warm
         // cache that dropped it would refuse `cppt.Box<cppi.Tracked>` the second time around.
         if (!r.canonicalCtype.empty()) j["can"] = r.canonicalCtype;
+        if (!r.stdOwnedType.empty()) j["sown"] = r.stdOwnedType;
+        if (!r.blobIndirections.empty()) j["bind"] = [&] {
+            std::string packed;
+            for (const std::string& s : r.blobIndirections) packed += s + "\n";
+            return packed;
+        }();
         if (!r.bases.empty())
         {
             nlohmann::json bs = nlohmann::json::array();
@@ -2964,6 +2970,17 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
         r.hasFriendOperators    = j.value("fop", false);
         r.layoutRefusal         = j.value("lref", std::string{});
         r.canonicalCtype        = j.value("can", std::string{});
+        r.stdOwnedType          = j.value("sown", std::string{});
+        {
+            const std::string packed = j.value("bind", std::string{});
+            for (size_t start = 0; start < packed.size();)
+            {
+                size_t end = packed.find('\n', start);
+                if (end == std::string::npos) end = packed.size();
+                r.blobIndirections.push_back(packed.substr(start, end - start));
+                start = end + 1;
+            }
+        }
         if (j.contains("bs"))
             for (const auto& b : j["bs"])
             {

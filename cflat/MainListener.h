@@ -10384,6 +10384,14 @@ public:
     bool IsSameTypeCastOfDefault(antlr4::ParserRuleContext* ctx,
                                  const std::string& typeName);
     bool HasDefaultOnlyTernaryArm(antlr4::ParserRuleContext* ctx) const;
+    // T418: the `?:` tree of a C++ call argument whose leaves are `default` or a live local of a
+    // nontrivial C++ class; fills the place leaves' common type. False for any other shape.
+    bool IsCxxDeferrableDefaultTernary(antlr4::ParserRuleContext* ctx, std::string& placeType);
+    bool IsCxxInertCallArgument(antlr4::ParserRuleContext* ctx, bool condition = false);
+    bool IsCxxTernaryArgument(antlr4::ParserRuleContext* ctx);
+    // T418: builds the deferred argument (selector + place leaves) for the C++ wrapper to evaluate.
+    bool BuildCxxDeferredDefaultTernary(antlr4::ParserRuleContext* ctx, const std::string& defaultType,
+        LLVMBackend::NamedVariable& out);
     // T142: types and owns a `default` call argument for the parameter it binds.
     void MaterializeDefaultArgument(antlr4::ParserRuleContext* ctx, LLVMBackend::NamedVariable& argNV,
         const LLVMBackend::TypeAndValue& dest, bool directLoweredSret = false);

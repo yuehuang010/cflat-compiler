@@ -15901,6 +15901,8 @@ extern int main()
     total += 7;
     passed += testT408AliasReturnAcceptSet();
     total += 9;
+    passed += testT423NullishReturnAcceptSet();
+    total += 9;
 
     passed += testT227SlotMoveSinks();
     total += 19;
@@ -17280,6 +17282,41 @@ int testT408AliasReturnAcceptSet()
     passed += Test("t408_non_alias_local_getter_stays_legal", t408LocalGetterValue(), 52);
     T408BorrowArrow moved = t408MoveReturnArrow();
     passed += Test("t408_move_return_stays_legal", moved.node.value, 58);
+    return passed;
+}
+
+int t423NullishGlobalValue = 71;
+int* t423NullishGlobalPointer = &t423NullishGlobalValue;
+struct T423NullishGlobalStruct { int f = 73; };
+T423NullishGlobalStruct t423NullishGlobalStruct = default;
+int* t423NullishGlobalArm(int* q) { return q ?? t423NullishGlobalPointer; }
+int* t423NullishParamArm(int* q, int* r) { return q ?? r; }
+int* t423NullishGlobalFieldArm(int* q) { return q ?? &t423NullishGlobalStruct.f; }
+int* t423NullishAliasParamArm(int* q, alias int r) { return q ?? &r; }
+
+int testT423NullishReturnAcceptSet()
+{
+    int passed = 0;
+    int* globalValue = t423NullishGlobalArm(nullptr);
+    passed += Test("t423_nullish_global_arm_value", *globalValue, 71);
+    passed += Test("t423_nullish_global_arm_identity", globalValue == &t423NullishGlobalValue ? 1 : 0, 1);
+
+    int paramValue = 79;
+    int* param = t423NullishParamArm(nullptr, &paramValue);
+    passed += Test("t423_nullish_param_arm_value", *param, 79);
+    passed += Test("t423_nullish_param_arm_identity", param == &paramValue ? 1 : 0, 1);
+
+    int* globalField = t423NullishGlobalFieldArm(nullptr);
+    passed += Test("t423_nullish_global_field_arm_value", *globalField, 73);
+    passed += Test("t423_nullish_global_field_arm_identity",
+        globalField == &t423NullishGlobalStruct.f ? 1 : 0, 1);
+
+    int aliasValue = 83;
+    int* aliasParam = t423NullishAliasParamArm(nullptr, aliasValue);
+    passed += Test("t423_nullish_alias_param_arm_value", *aliasParam, 83);
+    passed += Test("t423_nullish_alias_param_arm_identity", aliasParam == &aliasValue ? 1 : 0, 1);
+    *aliasParam = 89;
+    passed += Test("t423_nullish_alias_param_arm_mutates_caller", aliasValue, 89);
     return passed;
 }
 

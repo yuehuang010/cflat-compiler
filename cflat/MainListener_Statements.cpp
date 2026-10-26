@@ -1588,7 +1588,6 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             // A local or by-value parameter owns addressable storage. Parameters are moved too:
             // the callee then destroys the moved-from parameter after filling the return slot.
             bool namedLocal = false;
-            bool namedParam = false;
             llvm::Value* localStorage = nullptr;
             std::string returnedLocalName = retText;
             while (returnedLocalName.size() >= 2 && returnedLocalName.front() == '('
@@ -1604,7 +1603,6 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                         namedLocal = !it->second.TypeAndValue.Pointer
                             && it->second.TypeAndValue.TypeName == returnTypeName
                             && it->second.Storage != nullptr;
-                        namedParam = true;
                         localStorage = it->second.Storage;
                         break;
                     }
@@ -1619,17 +1617,15 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     }
                 }
             }
-            auto finishReturnedLocal = [&](llvm::Value* storage, bool parameter) {
+            auto finishReturnedLocal = [&](llvm::Value* storage) {
                 llvm::Value* prevSkip = compiler->returnedStructDtorSkipAlloca;
                 llvm::Value* prevShellStorage = compiler->returnedStructDtorShellAlloca;
                 llvm::Function* prevShell = compiler->returnedStructDtorShellFunction;
-                if (!parameter)
-                {
-                    compiler->returnedStructDtorSkipAlloca = storage;
-                    compiler->returnedStructDtorShellAlloca = storage;
-                    compiler->returnedStructDtorShellFunction =
-                        compiler->GetOrCreateMovedFromShellDestructor(returnTypeName);
-                }
+                // The return slot owns the transferred value; source cleanup destroys only its C++ fields.
+                compiler->returnedStructDtorSkipAlloca = storage;
+                compiler->returnedStructDtorShellAlloca = storage;
+                compiler->returnedStructDtorShellFunction =
+                    compiler->GetOrCreateMovedFromShellDestructor(returnTypeName);
                 finishLoweredReturn();
                 compiler->returnedStructDtorSkipAlloca = prevSkip;
                 compiler->returnedStructDtorShellAlloca = prevShellStorage;
@@ -1657,9 +1653,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 if (compiler->EmitLoweredMemberwiseMove(returnTypeName, structType, cxxSretDest,
                                                         localStorage, "into the return slot"))
                 {
-                    // Parameters retain their ordinary teardown; a returned local replaces
-                    // its normal scope destructor with a moved-from C++ shell destructor.
-                    finishReturnedLocal(localStorage, namedParam);
+                    // A returned local or parameter keeps only its moved-from C++ shell cleanup.
+                    finishReturnedLocal(localStorage);
                     return;
                 }
             }
@@ -1715,8 +1710,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                                 }
                             if (movedParameter) break;
                         }
-                        finishReturnedLocal(localStorage == nullptr ? source : localStorage,
-                                            movedParameter);
+                        finishReturnedLocal(localStorage == nullptr ? source : localStorage);
                         return;
                     }
                 }
@@ -2268,7 +2262,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 bool sawReferenceResultCall = false;
                 bool onlyReferenceResultArms = true;
                 const bool sourceIsJoin = llvm::isa_and_nonnull<llvm::PHINode>(cxxReturnSource)
-                    || llvm::isa_and_nonnull<llvm::SelectInst>(cxxReturnSource);
+                    || llvm::isa_and_nonnull<llvm::SelectInst>(cxxReturnSource)
+                    || compiler->FindNullCoalesceJoin(cxxReturnSource) != nullptr;
                 // An argument is frame-rooted directly, or through a nested C++ reference-result
                 // call whose own receiver/arguments are (`local_ref(local_ref(lc))`).
                 std::function<bool(llvm::Value*, unsigned)> argumentRootedInFrame;
@@ -2306,6 +2301,12 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     {
                         rejectFrameRootedReferenceArm(select->getTrueValue());
                         rejectFrameRootedReferenceArm(select->getFalseValue());
+                        return;
+                    }
+                    if (const auto* join = compiler->FindNullCoalesceJoin(value))
+                    {
+                        for (const auto& arm : join->Arms)
+                            rejectFrameRootedReferenceArm(arm.Value);
                         return;
                     }
                     if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
@@ -2367,12 +2368,11 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             }
         }
         /*
-         * Address-of a frame local must not escape through a raw pointer return. A PHI/select
-         * obscures the arm from PointsIntoStackFrame, so inspect nested joins before testing each
-         * address. Loaded pointer values and caller/global/static storage do not root here.
+         * Address-of a frame local must not escape through a raw pointer return. PHI/select joins
+         * expose arms in IR; slot-backed `??` joins expose them through the null-coalesce ledger.
          */
         bool frameLocalPointerReturn = false;
-        bool frameLocalArmUnderJoin = false;  // the frame-local arm sat under a '?:' / '??' join
+        std::string frameLocalArmJoin;
         bool cflatAliasJoinArm = false;
         if (!aliasRefReturn && assignExpr != nullptr && cxxRefReturnAddr == nullptr
             && !cxxReferenceResultTernaryJoin && compiler->currentFunctionReturnTV.Pointer)
@@ -2387,35 +2387,42 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 return sym != nullptr && !sym->IsCxx && !sym->ReturnType.Pointer
                     && (sym->ReturnType.IsAlias || sym->ReturnsAlias);
             };
-            std::function<void(llvm::Value*, bool)> walkJoinArms;
-            walkJoinArms = [&](llvm::Value* value, bool underJoin) {
+            std::function<void(llvm::Value*, const char*)> walkJoinArms;
+            walkJoinArms = [&](llvm::Value* value, const char* armJoin) {
                 if (value == nullptr || frameLocalPointerReturn || cflatAliasJoinArm) return;
                 value = value->stripPointerCasts();
                 if (!visitedArms.insert(value).second) return;
                 if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
                 {
                     for (llvm::Value* incoming : phi->incoming_values())
-                        walkJoinArms(incoming, true);
+                        walkJoinArms(incoming, "?:");
                     return;
                 }
                 if (auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
                 {
-                    walkJoinArms(select->getTrueValue(), true);
-                    walkJoinArms(select->getFalseValue(), true);
+                    walkJoinArms(select->getTrueValue(), "?:");
+                    walkJoinArms(select->getFalseValue(), "?:");
+                    return;
+                }
+                if (const auto* join = compiler->FindNullCoalesceJoin(value))
+                {
+                    for (const auto& arm : join->Arms)
+                        walkJoinArms(arm.Value, "??");
                     return;
                 }
                 if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
                 {
-                    walkJoinArms(gep->getPointerOperand(), underJoin);
+                    walkJoinArms(gep->getPointerOperand(), armJoin);
                     return;
                 }
                 frameLocalPointerReturn = PointsIntoStackFrame(value)
                     || IsFrameOwnedBorrowingMemberCall(compiler, value);
-                frameLocalArmUnderJoin = frameLocalPointerReturn && underJoin;
-                if (!frameLocalPointerReturn && underJoin && isCflatAliasCall(value))
+                if (frameLocalPointerReturn && armJoin != nullptr)
+                    frameLocalArmJoin = armJoin;
+                if (!frameLocalPointerReturn && armJoin != nullptr && isCflatAliasCall(value))
                     cflatAliasJoinArm = true;
             };
-            walkJoinArms(returnNV.Primary, false);
+            walkJoinArms(returnNV.Primary, nullptr);
         }
         bool coreUniqueRawReturn = !aliasRefReturn && cxxRefReturnAddr == nullptr
             && compiler->IsCoreUniqueToRawPointer(returnNV, compiler->currentFunctionReturnTV);
@@ -3042,7 +3049,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         {
             const std::string what = !returnNV.CallerName.empty()
                 ? "'" + returnNV.CallerName + "'"
-                : frameLocalArmUnderJoin ? std::string("a '?:' arm") : std::string("this value");
+                : frameLocalArmJoin == "??" ? std::string("a '??' arm")
+                : !frameLocalArmJoin.empty() ? std::string("a '?:' arm")
+                : std::string("this value");
             LogErrorContext(errCtx, std::format("cannot return the address of {}: it points into "
                 "this function's own frame and would dangle once the function returns (an 'alias' "
                 "return does not change that). Return a pointer into caller-owned, global or heap "

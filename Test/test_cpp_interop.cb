@@ -3673,6 +3673,48 @@ extern int main()
     t63.CallT232WSel t232W = t63.CallT232WSel(t232WInput, t63.call_bump_choice(&t232WInput));
     if (t232W.value * 10 + t232WInput != 1011) return 9397;
     if (t63.call_t232_w_copy_count() != t232WCopies) return 9398;
+    // T416: a function-pointer reference overload set binds the caller's slot; a const lvalue picks const Fn&.
+    function<int(int)> t416NonConst = t63.call_plus_one;
+    if (t63.call_t248_free_pick(t416NonConst) != 104) return 9409;
+    const function<int(int)> t416Const = t63.call_plus_one;
+    if (t63.call_t248_free_pick(t416Const) != 204) return 9410;
+    // T416: a by-value class ctor parameter in call-argument position snapshots x before bump runs.
+    int t416WInput = 0;
+    int t416WResult = t63.call_t416_wsel_value(t63.CallT232WSel(t416WInput, t63.call_bump_choice(&t416WInput)));
+    if (t416WResult * 10 + t416WInput != 1011) return 9411;
+    // T416: a C-variadic ctor's by-value int snapshots x too when an extra variadic argument follows.
+    int t416VarInput = 0;
+    int t416VarExtra = 5;
+    int t416VarResult = t63.call_t232_varsel(t63.CallT232VarSel(
+        t416VarInput, t63.call_bump_choice(&t416VarInput), t416VarExtra));
+    if (t416VarResult * 10 + t416VarInput != 1011) return 9412;
+    // T416 round 2: a reference ctor selected through a user conversion on the other argument.
+    int t416RcInput = 0;
+    int t416RcResult = t63.t416_refconvert_value(t63.T416RefConvert(t416RcInput, 2));
+    if (t416RcResult * 100 + t416RcInput != 71210) return 9413;
+    int t416RcTplInput = 0;
+    int t416RcTplResult = t63.t416_refconvert_tpl(t63.T416RefConvert(t416RcTplInput, 2), 1);
+    if (t416RcTplResult * 100 + t416RcTplInput != 71210) return 9414;
+    // T416 round 2: a ctor template that cannot bind the scalar leaves it by value beside a variadic ctor.
+    int t416VtInput = 0;
+    int t416VtResult = t63.t416_has_template_value(t63.T416HasTemplate(
+        t416VtInput, t63.t416_bump(&t416VtInput), 5));
+    if (t416VtResult * 10 + t416VtInput != 1011) return 9415;
+    // T416 round 3: a ctor template that cannot take three arguments leaves x by value (eager snapshot).
+    int t416ArInput = 0;
+    int t416ArResult = t63.t416_arity_value(t63.T416Arity(t416ArInput, t63.t416_bump(&t416ArInput), 5));
+    if (t416ArResult * 10 + t416ArInput != 1011) return 9416;
+    int t416PkInput = 0;
+    int t416PkResult = t63.t416_pack_value(t63.T416Pack(t416PkInput));
+    if (t416PkResult * 10 + t416PkInput != 2010) return 9417;
+    int t416PkY = 2;
+    int t416PkZ = 3;
+    t416PkInput = 0;
+    t416PkResult = t63.t416_pack_value(t63.T416Pack(t416PkInput, t416PkY, t416PkZ));
+    if (t416PkResult * 10 + t416PkInput != 2030) return 9418;
+    t416PkInput = 0;
+    t416PkResult = t63.t416_pack_tail_value(t63.T416PackTail(t416PkInput));
+    if (t416PkResult * 10 + t416PkInput != 2010) return 9419;
     t63.ExplicitOnly t63ExplicitDirect{6, 8};
     if (t63ExplicitDirect.first != 6 || t63ExplicitDirect.second != 8) return 9307;
     t63.ClassNew t63ClassNew{1, 2, 3};
@@ -4918,6 +4960,28 @@ extern int main()
         if (t69Holder.run(5) != 20) return 69003;
         auto t69Tag = t28.tagonly(t69Closure);
         if (t69Tag.run(5) != 5) return 69012;
+    }
+    {
+        // T419: opaque-blob results holding the closure by value (or an unrelated pointer) stay accepted.
+        int t419Capture = 4;
+        Lambda<int(int)> t419Closure = (int v) => v * t419Capture;
+        auto t419PrivCopy = t28.holdprivcopy(t419Closure);
+        auto t419TupCopy = t28.holdtupcopy(t419Closure);
+        auto t419OptCopy = t28.holdoptcopy(t419Closure);
+        t28.scribble();
+        if (t419PrivCopy.run(5) != 20) return 41901;
+        if (t28.run0(t419TupCopy) != 20) return 41902;
+        if (t28.runopt(t419OptCopy) != 20) return 41903;
+        auto t419Vec = t28.holdvec(t419Closure);
+        auto t419Shared = t28.holdshared(t419Closure);
+        auto t419Tagged = t28.holdtagged(t419Closure);
+        t28.scribble();
+        if (t28.runat0(t419Vec) != 20) return 41904;
+        if (t28.runopt(t419Shared) != 20) return 41905;
+        if (t419Tagged.run(5) != 20) return 41906;
+        auto t419SharedConst = t28.holdsharedconst(t419Closure);
+        t28.scribble();
+        if (t28.runopt(t419SharedConst) != 20) return 41908;
     }
     if ((int)HeapAudit.reportLeaks() != t69HeapBase) return 69004;
     // A borrowed closure wrapper leaves the owning environment count unchanged.
@@ -16697,6 +16761,113 @@ LdtLockHolder LdtMakeLocked()
 namespace cpp_t61 { struct T61Cflat { int v = 5; }; int t61CflatFn() { return 2; } }
 namespace cpp_t61.ext { int t61Ext() { return 1; } }
 t26v.left t26GlobalLeft = default;
+// T418: `c ? default : local` into C++ (cpp_interop_lastuse.h), packed as value * 100000 +
+// ctor/copy/move/dtor/live digits. Expected values are clang's for the same C++ conditional.
+int T418Pack(int value) { return value * 100000 + t418.stats(); }
+int T418ConvByValue(bool c)
+{
+    t418.reset();
+    int value = 0;
+    { t418.Conv cv = default; value = t418.take_conv(c ? default : cv); }
+    return T418Pack(value);
+}
+int T418ConvRef(bool c)
+{
+    t418.reset();
+    int value = 0;
+    { t418.Conv cv = default; value = t418.tref(c ? default : cv); }
+    return T418Pack(value);
+}
+int T418MemberRef(bool c)
+{
+    t418.reset();
+    int value = 0;
+    { t418.Host h = default; t418.Val v = t418.Val(7); value = h.member(c ? default : v); }
+    return T418Pack(value);
+}
+int T418RvalueOverload(bool c)
+{
+    t418.reset();
+    int value = 0;
+    { t418.Host h = default; t418.Val v = t418.Val(7); value = h.rr(c ? default : v); }
+    return T418Pack(value);
+}
+// A const local copies through CV(const CV&) (+200); a later argument that writes the local runs after the copy.
+int T418ConstCopy() { const t418.CV x = t418.CV(7); t418.Host h = default; return h.cvmember(false ? default : x); }
+int T418LaterWrite() { t418.Host h = default; t418.Val x = t418.Val(7); return h.later(false ? default : x, t418.mutate(x)); }
+int T418LaterCondition()
+{
+    t418.reset();
+    int value = 0;
+    {
+        t418.Host h = default; t418.Val x = t418.Val(7); t418.Val y = t418.Val(2); t418.Flag b = default;
+        t418.aim(x);
+        value = h.same(false ? default : x, b ? default : y);
+    }
+    return T418Pack(value);
+}
+int T418OverloadPartial(bool c)
+{
+    t418.reset();
+    int value = 0;
+    {
+        t418.Host h = default; t418.Val x = t418.Val(7); t418.Val y = t418.Val(2); t418.Val z = t418.Val(3);
+        value = h.take3(c ? default : x, c ? default : y, c ? default : z);
+    }
+    return T418Pack(value);
+}
+int T418TemplateSingle(bool c)
+{
+    t418.reset();
+    int value = 0;
+    { t418.Host h = default; t418.Val x = t418.Val(7); value = h.pick(c ? default : x); }
+    return value;  // copies stay master's (one extra per arm, pre-existing); the guard is acceptance
+}
+int T418TemplateCompeting(bool c)
+{
+    t418.reset();
+    int value = 0;
+    { t418.Host h = default; t418.Val x = t418.Val(7); t418.Val y = t418.Val(2); value = h.pick2(c ? default : x, c ? default : y); }
+    return value;  // copies stay master's (one extra per arm, pre-existing); the guard is acceptance
+}
+int T420Pack(int value, int baseLive)
+{
+    return value * 10000000 + cpptw.ctor_count() * 1000000 + cpptw.copy_count() * 100000
+        + cpptw.move_count() * 10000 + cpptw.copy_assign_count() * 1000
+        + cpptw.move_assign_count() * 100 + cpptw.dtor_count() * 10
+        + cpptw.live_allocations() - baseLive;
+}
+int T420MovedValue = 0;
+int T420Field(bool c)
+{
+    cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0;
+    { t420field.Wrap w = default; value = t420field.take(c ? default : w.tw); }
+    return T420Pack(value, baseLive);
+}
+int T420Move(bool c)
+{
+    cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0;
+    int after = 0;
+    { cpptw.Twin tw = default; value = t420move.take(c ? default : move tw); after = tw.value(); }
+    T420MovedValue = after;
+    return T420Pack(value, baseLive);
+}
+int T420Look(bool c)
+{
+    cpptw.reset_counts(); int baseLive = cpptw.live_allocations(); int value = 0;
+    { t420look.Look lk = default; value = t420look.take(c ? default : lk); }
+    return T420Pack(value, baseLive);
+}
+int T420R2LookSelf(bool c)
+{
+    t420r2self.L2 lk = default; lk.field = 7;
+    return t420r2self.take(c ? default : lk);
+}
+int T420R2Overload(bool c)
+{
+    t420r2overload.L2 lk = default; lk.field = 7;
+    return t420r2overload.take(c ? default : lk);
+}
 int LoweredUserDtorAssignLegs(int argc)
 {
     LdtHolder a; a.id = 1;
@@ -18527,6 +18698,34 @@ int LoweredUserDtorAssignLegs(int argc)
         assigned = base.length() == 0 ? "lit" : base;
         if (assigned.length() != 3) return 38107;
     }
+    // T418: the C++ conditional's type, category and overload pick (clang values).
+    if (T418ConvByValue(false) != 410010) return 41801;
+    if (T418ConvByValue(true) != 10010) return 41802;
+    if (T418ConvRef(false) != 2410010) return 41803;
+    if (T418ConvRef(true) != 2010010) return 41804;
+    if (T418MemberRef(false) != 3711020) return 41805;
+    if (T418MemberRef(true) != 3020020) return 41806;
+    if (T418RvalueOverload(false) != 10711020) return 41807;
+    if (T418RvalueOverload(true) != 10020020) return 41808;
+    if (T418ConstCopy() != 207) return 41809;
+    if (T418LaterWrite() != 702) return 41810;
+    if (T418LaterCondition() != 70222040) return 41811;
+    if (T418OverloadPartial(false) != 72333060) return 41812;
+    if (T418OverloadPartial(true) != 60060) return 41813;
+    if (T418TemplateSingle(false) != 17) return 41814;
+    if (T418TemplateSingle(true) != 10) return 41815;
+    if (T418TemplateCompeting(false) != 82) return 41816;
+    if (T418TemplateCompeting(true) != 10) return 41817;
+    if (T420Field(false) != 1100020) return 42001;
+    if (T420Field(true) != 2000020) return 42002;
+    if (T420Move(false) != 1010020 || T420MovedValue != -1) return 42003;
+    if (T420Move(true) != 2000020 || T420MovedValue != 0) return 42004;
+    if (T420Look(false) != 41000010) return 42005;
+    if (T420Look(true) != 1000010) return 42006;
+    if (T420R2LookSelf(false) != 107) return 42007;
+    if (T420R2LookSelf(true) != 104) return 42008;
+    if (T420R2Overload(false) != 107) return 42009;
+    if (T420R2Overload(true) != 104) return 42010;
     return 0;
 }
 

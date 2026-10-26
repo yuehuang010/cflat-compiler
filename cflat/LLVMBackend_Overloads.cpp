@@ -7352,6 +7352,32 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         { candParamItr->VariableName, diagnosticFunctionName });
                 argList.push_back(converted);
             }
+            // A C++ function-pointer lvalue reference binds the argument's slot, not its code address.
+            else if (!inVariadicRange && candidate.IsCxx && candParamItr->IsFunctionPointer
+                     && candParamItr->Pointer && candParamItr->IsAlias)
+            {
+                const bool sourceFunctionPointer = arg.TypeAndValue.IsFunctionPointer
+                    || (arg.HasOriginalArgumentType
+                        && (arg.OriginalArgumentType.IsFunctionPointer
+                            || !arg.OriginalArgumentType.FuncPtrReturnTypeName.empty()
+                            || arg.OriginalArgumentType.TypeName == "__c_fn_ptr"));
+                if (sourceFunctionPointer && arg.Storage != nullptr)
+                    argList.push_back(arg.Storage);
+                else
+                {
+                    llvm::Value* code = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
+                    llvm::Type* functionPointerType = BuildThinFnPtrType(*candParamItr);
+                    if (functionPointerType == nullptr || code == nullptr)
+                    {
+                        LogErrorMessage("cannot lower function-pointer reference argument '{}' of '{}'",
+                            { candParamItr->VariableName, diagnosticFunctionName });
+                        return nullptr;
+                    }
+                    auto* temporary = AllocaAtEntry(functionPointerType, nullptr, "cxx.fnref.arg");
+                    builder->CreateStore(code, temporary);
+                    argList.push_back(temporary);
+                }
+            }
             else if (!inVariadicRange && candParamItr->Pointer)
             {
                 bool coreUniqueToRawPointer = IsCoreUniqueToRawPointer(arg, *candParamItr);

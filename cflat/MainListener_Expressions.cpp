@@ -9098,6 +9098,307 @@ bool MainListener::HasDefaultOnlyTernaryArm(antlr4::ParserRuleContext* ctx) cons
 }
 
 /*
+ * T418: the `?:` of a C++ call argument, through parentheses: `c ? default : x`, `(c ? x : default)`.
+ * Null for anything else (an assignment, a cast, a comma list).
+ */
+static CFlatParser::ConditionalExpressionContext* DeferrableTernaryNode(antlr4::tree::ParseTree* node)
+{
+        while (node != nullptr)
+        {
+            if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node);
+                conditional != nullptr && conditional->Question() != nullptr)
+                return conditional;
+            if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
+                assignment != nullptr && assignment->assignmentOperator() != nullptr)
+                return nullptr;
+            auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+            if (rule == nullptr) return nullptr;
+            if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(rule);
+                primary != nullptr && primary->expression() != nullptr)
+            {
+                node = primary->expression();
+                continue;
+            }
+            if (rule->children.size() != 1) return nullptr;
+            node = rule->children.front();
+        }
+        return nullptr;
+}
+
+static bool CxxInertLocalReadType(LLVMBackend* compiler,
+                                  const LLVMBackend::TypeAndValue& type,
+                                  bool condition)
+{
+        if (type.Pointer || type.PointerDepth != 0) return true;
+        if (condition) return type.IsPrimitive();
+        if (compiler->IsForeignNontrivialCxxClass(type.TypeName)) return true;
+        return !compiler->IsDataStructure(compiler->ResolveTypeAlias(type.TypeName));
+}
+
+static bool ResolveCxxDeferredLocalField(
+        LLVMBackend* compiler,
+        antlr4::tree::ParseTree* node,
+        LLVMBackend::NamedVariable& container,
+        LLVMBackend::DeclTypeAndValue& field,
+        CFlatParser::PostfixExpressionContext** outPostfix = nullptr)
+{
+        container = {};
+        field = {};
+        if (outPostfix != nullptr) *outPostfix = nullptr;
+        auto* postfix = SolePostfixExpressionShape(node);
+        if (postfix == nullptr || postfix->children.size() != 3
+            || postfix->argumentExpressionList().size() != 0
+            || postfix->expression().size() != 0
+            || postfix->memberNameToken().size() != 1
+            || postfix->genericTypeParameters().size() != 0)
+            return false;
+        auto* primary = postfix->primaryExpression();
+        auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+        auto* member = dynamic_cast<CFlatParser::MemberNameTokenContext*>(postfix->children[2]);
+        auto* memberIdentifier = member != nullptr ? member->Identifier() : nullptr;
+        auto* memberOperator = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[1]);
+        if (generic == nullptr || generic->genericTypeParameters() != nullptr
+            || memberIdentifier == nullptr || memberOperator == nullptr
+            || memberOperator->getSymbol()->getType() != CFlatParser::Dot)
+            return false;
+        auto* baseIdentifier = generic->Identifier();
+        if (baseIdentifier == nullptr) return false;
+        auto local = compiler->GetScopedLocalOrArgument(baseIdentifier->getText());
+        if (local.Storage == nullptr || local.TypeAndValue.Pointer
+            || local.TypeAndValue.PointerDepth != 0 || local.TypeAndValue.IsAlias
+            || !CxxInertLocalReadType(compiler, local.TypeAndValue, false))
+            return false;
+        auto structure = compiler->GetDataStructure(local.TypeAndValue.TypeName);
+        if (structure.StructType == nullptr)
+            structure = compiler->GetDataStructure(compiler->ResolveTypeAlias(local.TypeAndValue.TypeName));
+        if (structure.StructType == nullptr) return false;
+        const std::string& memberName = memberIdentifier->getText();
+        for (const auto& candidate : structure.StructFields)
+        {
+            if (candidate.VariableName != memberName) continue;
+            if (candidate.Pointer || candidate.PointerDepth != 0 || candidate.ElemPointer
+                || candidate.IsAlias || candidate.IsArrayView || candidate.ConstArraySize != 0
+                || !compiler->IsForeignNontrivialCxxClass(candidate.TypeName))
+                return false;
+            container = std::move(local);
+            field = candidate;
+            if (outPostfix != nullptr) *outPostfix = postfix;
+            return true;
+        }
+        return false;
+}
+
+bool MainListener::IsCxxDeferrableDefaultTernary(antlr4::ParserRuleContext* ctx, std::string& placeType)
+{
+        placeType.clear();
+        auto* root = DeferrableTernaryNode(ctx);
+        if (root == nullptr) return false;
+        bool sawDefault = false;
+        bool sawPlace = false;
+        bool mixedPlaces = false;
+        auto notePlace = [&](const LLVMBackend::TypeAndValue& type) {
+            if (type.Pointer || type.PointerDepth != 0 || type.IsAlias
+                || !Compiler()->IsForeignNontrivialCxxClass(type.TypeName))
+                return false;
+            if (sawPlace && placeType != type.TypeName) mixedPlaces = true;
+            placeType = type.TypeName;
+            sawPlace = true;
+            return true;
+        };
+        auto visit = [&](auto&& self, antlr4::ParserRuleContext* node) -> bool {
+            if (auto* conditional = DeferrableTernaryNode(node))
+                return self(self, conditional->expression())
+                    && self(self, conditional->conditionalExpression());
+            if (IsDefaultOnlyExpression(node))
+            {
+                sawDefault = true;
+                return true;
+            }
+            if (auto* move = TopLevelMoveExpression(node))
+            {
+                auto* identifier = BareIdentifierInExpression(move->unaryExpression());
+                if (identifier == nullptr) return false;
+                const auto* local = Compiler()->FindLiveNamedVariable(identifier->getText());
+                return local != nullptr && local->Storage != nullptr
+                    && notePlace(local->TypeAndValue);
+            }
+            auto* identifier = BareIdentifierInExpression(node);
+            if (identifier != nullptr)
+            {
+                const auto* local = Compiler()->FindLiveNamedVariable(identifier->getText());
+                return local != nullptr && local->Storage != nullptr && notePlace(local->TypeAndValue);
+            }
+            LLVMBackend::NamedVariable container;
+            LLVMBackend::DeclTypeAndValue field;
+            if (!ResolveCxxDeferredLocalField(Compiler(), node, container, field))
+                return false;
+            return notePlace(field);
+        };
+        if (!visit(visit, root->expression()) || !visit(visit, root->conditionalExpression())
+            || !sawDefault || !sawPlace || mixedPlaces)
+        {
+            placeType.clear();
+            return false;
+        }
+        return true;
+}
+
+bool MainListener::IsCxxTernaryArgument(antlr4::ParserRuleContext* ctx)
+{
+        return DeferrableTernaryNode(ctx) != nullptr;
+}
+
+/*
+ * T418: every other argument must be inert because the wrapper reads the selected place after the
+ * caller's arguments. A class prvalue beside it also pays the wrapper's extra copy.
+ */
+bool MainListener::IsCxxInertCallArgument(antlr4::ParserRuleContext* ctx, bool condition)
+{
+        if (ctx == nullptr) return false;
+        if (!condition && IsDefaultOnlyExpression(ctx)) return true;
+        if (auto* conditional = DeferrableTernaryNode(ctx); conditional != nullptr && !condition)
+        {
+            std::string placeType;
+            if (!IsCxxDeferrableDefaultTernary(conditional, placeType)) return false;
+            auto safeBranch = [&](auto&& self, antlr4::tree::ParseTree* branch) -> bool {
+                auto* nested = DeferrableTernaryNode(branch);
+                if (nested == nullptr) return true; // its leaf shape was checked above
+                return IsCxxInertCallArgument(nested->logicalOrExpression(), true)
+                    && self(self, nested->expression())
+                    && self(self, nested->conditionalExpression());
+            };
+            return IsCxxInertCallArgument(conditional->logicalOrExpression(), true)
+                && safeBranch(safeBranch, conditional->expression())
+                && safeBranch(safeBranch, conditional->conditionalExpression());
+        }
+        if (!condition)
+        {
+            LLVMBackend::NamedVariable container;
+            LLVMBackend::DeclTypeAndValue field;
+            if (ResolveCxxDeferredLocalField(Compiler(), ctx, container, field)
+                && !field.TypeName.empty()) return true;
+        }
+        auto* postfix = SolePostfixExpressionShape(ctx);
+        if (postfix == nullptr || postfix->children.size() != 1) return false;
+        auto* primary = postfix->primaryExpression();
+        if (primary == nullptr) return false;
+        if (primary->Constant() != nullptr || !primary->StringLiteral().empty()) return true;
+        auto* identifier = BareIdentifierInExpression(ctx);
+        if (identifier == nullptr) return false;
+        const auto* local = Compiler()->FindLiveNamedVariable(identifier->getText());
+        if (local == nullptr || local->Storage == nullptr) return false;
+        // A condition must be a builtin read; overloaded operator bool may mutate an earlier leaf.
+        return CxxInertLocalReadType(Compiler(), local->TypeAndValue, condition);
+}
+
+bool MainListener::BuildCxxDeferredDefaultTernary(antlr4::ParserRuleContext* ctx,
+        const std::string& defaultType, LLVMBackend::NamedVariable& out)
+{
+        auto* compiler = Compiler();
+        auto* root = DeferrableTernaryNode(ctx);
+        auto* objectType = compiler->GetType(LLVMBackend::TypeAndValue{ .TypeName = defaultType });
+        if (root == nullptr || objectType == nullptr) return false;
+        auto* int32 = compiler->builder->getInt32Ty();
+        auto* selector = compiler->AllocaAtEntry(int32, nullptr, "cxx.ternary.sel");
+        std::vector<LLVMBackend::NamedVariable> children(1);
+        int leafCount = 0;
+        bool ok = true;
+        std::unordered_map<antlr4::tree::ParseTree*, LLVMBackend::NamedVariable> deferredFieldPlaces;
+        auto prepareFieldPlaces = [&](auto&& self, antlr4::tree::ParseTree* node) -> bool {
+            if (auto* conditional = DeferrableTernaryNode(node))
+                return self(self, conditional->expression())
+                    && self(self, conditional->conditionalExpression());
+            auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
+            if ((rule != nullptr && IsDefaultOnlyExpression(rule))
+                || TopLevelMoveExpression(node) != nullptr
+                || BareIdentifierInExpression(node) != nullptr)
+                return true;
+            LLVMBackend::NamedVariable container;
+            LLVMBackend::DeclTypeAndValue field;
+            CFlatParser::PostfixExpressionContext* fieldPostfix = nullptr;
+            if (!ResolveCxxDeferredLocalField(compiler, node, container, field, &fieldPostfix))
+                return true;
+            if (field.TypeName.empty()) return false;
+            auto place = ParsePostfixExpression(fieldPostfix, true);
+            if (place.Storage == nullptr) return false;
+            place.Primary = nullptr; // keep the lvalue address; the wrapper reads it only in its selected arm
+            deferredFieldPlaces.emplace(node, std::move(place));
+            return true;
+        };
+        if (!prepareFieldPlaces(prepareFieldPlaces, root)) return false;
+        // Leaves are numbered left to right; a subtree covers a contiguous range, so `sel < m` picks its true side.
+        auto emit = [&](auto&& self, antlr4::ParserRuleContext* node) -> std::string {
+            if (!ok) return {};
+            if (auto* conditional = DeferrableTernaryNode(node))
+            {
+                std::optional<BranchPostfixScope> condPostfix;
+                condPostfix.emplace(this);
+                const auto mark = compiler->MarkOwnedTemps();
+                auto condTv = ParseLogicalOrExpression(conditional->logicalOrExpression(), ResultUse::Value);
+                condPostfix->Flush();
+                condPostfix.reset();
+                if (condTv.value == nullptr) { ok = false; return {}; }
+                EnsureOperatorBoolForValue(condTv.value);
+                auto* condition = compiler->CoerceToBoolCondition(condTv.value);
+                compiler->FlushOwnedTempsSince(mark, nullptr, nullptr);
+                auto* trueBlock = compiler->CreateBasicBlock("cxx_ternary_sel_true");
+                auto* falseBlock = compiler->CreateBasicBlock("cxx_ternary_sel_false");
+                auto* resumeBlock = compiler->CreateBasicBlock("cxx_ternary_sel_resume");
+                compiler->CreateConditionJump(condition, trueBlock, falseBlock);
+                std::string trueShape = self(self, conditional->expression());
+                const int split = leafCount;
+                compiler->CreateJump(resumeBlock);
+                compiler->SwitchToBlock(falseBlock);
+                std::string falseShape = self(self, conditional->conditionalExpression());
+                compiler->CreateJump(resumeBlock);
+                compiler->SwitchToBlock(resumeBlock);
+                return std::format("(@S < {} ? {} : {})", split, trueShape, falseShape);
+            }
+            compiler->builder->CreateStore(compiler->builder->getInt32(leafCount++), selector);
+            if (IsDefaultOnlyExpression(node)) return "@D";
+            LLVMBackend::NamedVariable place;
+            if (auto* move = TopLevelMoveExpression(node))
+                place = ParseMoveExpression(move);
+            else if (auto field = deferredFieldPlaces.find(node); field != deferredFieldPlaces.end())
+                place = field->second;
+            else
+                place = ParseIdentifier(BareIdentifierInExpression(node));
+            llvm::Value* loaded = place.Primary != nullptr ? place.Primary : LoadNamedVariable(place);
+            if (loaded == nullptr || place.Storage == nullptr) { ok = false; return {}; }
+            place.Primary = loaded;
+            place.BaseType = loaded->getType();
+            const bool movedLeaf = place.IsExplicitMove;
+            place.IsExplicitMove = false; // the wrapper parameter receives the caller's lvalue
+            place.IsRvalue = false;
+            place.TypeAndValue.VariableName.clear();  // a positional child, not a named argument
+            const size_t childIndex = children.size();
+            children.push_back(std::move(place));
+            return movedLeaf ? "@M" + std::to_string(childIndex)
+                             : "@" + std::to_string(childIndex);
+        };
+        const std::string shape = emit(emit, root);
+        if (!ok || shape.empty()) return false;
+        // A leaf was read inside its arm block; the call after the join reads the slot again.
+        for (size_t i = 1; i < children.size(); ++i)
+            children[i].Primary = compiler->CreateLoad(children[i].BaseType, children[i].Storage);
+        LLVMBackend::NamedVariable& sel = children.front();
+        sel.Primary = compiler->CreateLoad(int32, selector);
+        sel.BaseType = int32;
+        sel.TypeAndValue.TypeName = "int";
+        sel.IsRvalue = true;
+        out = {};
+        out.Primary = llvm::UndefValue::get(objectType);
+        out.BaseType = objectType;
+        out.TypeAndValue.TypeName = defaultType;
+        out.IsRvalue = true;
+        out.IsCxxDirectConstruction = true;
+        out.CxxDirectConstructionType = defaultType;
+        out.CxxDirectConstructionArguments = std::move(children);
+        out.CxxDeferredTernaryShape = shape;
+        return true;
+}
+
+/*
  * A view read out of a struct FIELD names no declared slot, so recover the element from the
  * field's own declaration. Three addressings, one question: the field GEP handed in as storage,
  * a load off that GEP, or an `extractvalue` out of a by-value struct that never reached memory

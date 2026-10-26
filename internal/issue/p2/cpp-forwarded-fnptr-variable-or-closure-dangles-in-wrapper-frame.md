@@ -78,12 +78,34 @@ until caller-frame C++ closure materialization and the free non-template target 
 - Pre-existing and still open: a nullptr ternary arm into the C++ template is refused although clang accepts it;
   the non-template type-erased result `Erased { void* p; ... }` is accepted and dangles in both orders (master does
   the same); mismatched-signature ternaries are rejected by clang too, but the CFlat diagnostic prints `<unknown>`.
-- Still open (T69 review 2, master same, accepted in both orders, clang 20): results projected as an opaque blob
-  (no public fields - CClangExtract.cpp ~3760-3779 clears the field list) are invisible to the shared predicate:
-  a holder whose only field is a private `F* p` dangles (rc 138/139); a returned `std::tuple<F&>` and
-  `std::optional<std::reference_wrapper<F>>` print 5. Fix direction: keep field types (or a "holds a closure
-  pointer/reference" flag) for blob records in the extractor (cached data - header cache version bump).
-  Same type-erased family: `std::function<int(int)>(std::ref(f))` returned from the template prints 5.
-  Repros: scratch/repro_keep/t69_rev/r2/ (p_holdpriv_*, p_holdtup_*, p_holdoptrw_*, q_holdprivnoctor.cb).
+- Fixed (T419): results projected as an opaque blob (no public field) carry clang's layout facts
+  (`blobIndirections`: "R:<T>" per reference member, "P:<T>" per raw pointer member, T the IMMEDIATE canonical
+  pointee record, through members, bases and nested records; no depth/width/count cutoff - each record's summary
+  is memoized, facts deduped by pointee). Only a pointee that IS the closure type counts (a
+  `Tag<F*>*` is not a pointer to F). Ownership rule: a raw `T*` is skipped when an enclosing class-template
+  specialization on the layout path is non-trivially destructible and takes T as a by-value type argument
+  (vector<F>, shared_ptr<F>, unique_ptr<F>, libstdc++ `_Vector_base<F, A>`). VISIBLE (flattened) fields use a
+  stricter rule (ruling 2026-10-22): a `T*` is owned only inside a std owning template identified from clang's
+  decl (namespace std incl. inline namespaces; shared_ptr<T>, unique_ptr<T, default_delete<T>>,
+  vector<T, allocator<T>>, optional<T>), carried down bases/members - so MSVC's shared_ptr<F> (`F* _Ptr` in base
+  `std::_Ptr_base<F>`) is exempt, while a user template with a destructor keeps master's refusal. References
+  always count. So a
+  private `F* p` holder, `std::tuple<F&>` and `std::optional<std::reference_wrapper<F>>` (reference_wrapper is
+  trivially destructible) are refused; owning containers and by-value blobs stay accepted.
+  Known blind spots of the rule: a NON-owning `F*` inside a non-trivially-destructible template taking F by value
+  (e.g. a holder with a user destructor) is accepted (master behaviour); an owning `F*` in a trivially
+  destructible holder (leaking/arena) would be refused; `F**` and pointers to bases of F are not matched.
+  Example of the first: `BorrowDtor<F> { F* p; ~BorrowDtor() {} }` still dangles (rc 138, master same).
+- Still open (type-erased, master same, clang 20): `std::function<int(int)>(std::ref(f))` returned from the
+  template prints 5. std::function keeps the callable in a raw byte buffer behind a vtable pointer, so no layout
+  fact names `F&`; refusing every std::function result would regress the by-value `std::function(f)` copy that
+  runs correctly. Needs a construction-site fact (which callable type was erased), not a layout one.
 - Pre-existing: a generic-instantiation ternary arm `rv.c5(p ? dbl<int> : add1)` is refused with an empty
   argument-type list in the message.
+
+Pre-existing shapes found by the T419 reviews (2026-10-22), all also wrong on master:
+- `Mixed<F>` holding an `Owner<F>` and a `Borrow<F>` member: its implicit non-trivial destructor makes the
+  blob rule treat the borrowed pointer as owned -> prints 5 (clang 20).
+- `std::unique_ptr<F, NoOp>` borrowing `&f`: prints 5 (clang 20); only `default_delete` counts as owning.
+- `std::optional<Mixed<F, G>>` with a borrowed, different-signature `G` base: exit 139 (clang 12).
+- An owner template `Decor<int*, F>` fails wrapper registration (clang 20).

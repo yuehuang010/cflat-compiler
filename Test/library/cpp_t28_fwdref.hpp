@@ -1,5 +1,10 @@
 #pragma once
 #include <type_traits>
+#include <functional>
+#include <memory>
+#include <vector>
+#include <optional>
+#include <tuple>
 // forward_as_tuple-shaped templates whose result refers to their arguments (t28): a string
 // literal or function name forwarded through a generated wrapper must not leave the reference
 // pointing into the wrapper's dead frame.
@@ -73,6 +78,56 @@ template<class F> struct PointerHolder { F* f; int run(int x) { return (*f)(x); 
 template<class F> PointerHolder<std::remove_reference_t<F>> holdptr(F&& f) { return { &f }; }
 template<class F> struct ConstRefHolder { const F& f; int run(int x) const { return f(x); } };
 template<class F> ConstRefHolder<std::remove_reference_t<F>> holdcref(F&& f) { return { f }; }
+// T419: results projected as opaque blobs (no public field) still reveal a held F* / F&.
+template<class F> class PrivPtr { F* p; public: PrivPtr(F* q) : p(q) {} int run(int x) { return (*p)(x); } };
+template<class F> PrivPtr<std::remove_reference_t<F>> holdpriv(F&& f) { return PrivPtr<std::remove_reference_t<F>>(&f); }
+template<class F> class PrivNest { PrivPtr<F> in; public: PrivNest(F* q) : in(q) {} int run(int x) { return in.run(x); } };
+template<class F> PrivNest<std::remove_reference_t<F>> holdnest(F&& f) { return PrivNest<std::remove_reference_t<F>>(&f); }
+template<class F> std::tuple<std::remove_reference_t<F>&> holdtup(F&& f) { return std::tuple<std::remove_reference_t<F>&>(f); }
+template<class F> std::optional<std::reference_wrapper<std::remove_reference_t<F>>> holdoptrw(F&& f) { return std::ref(f); }
+// Blob controls: the closure by value, or an unrelated pointer - nothing refers to the argument.
+template<class F> class PrivCopy { int* p; F f; public: PrivCopy(F g) : p(nullptr), f(g) {} int run(int x) { return p ? 0 : f(x); } };
+template<class F> PrivCopy<std::remove_reference_t<F>> holdprivcopy(F&& f) { return PrivCopy<std::remove_reference_t<F>>(f); }
+template<class F> std::tuple<std::remove_reference_t<F>, int*> holdtupcopy(F&& f) { return std::tuple<std::remove_reference_t<F>, int*>(f, nullptr); }
+template<class F> std::optional<std::remove_reference_t<F>> holdoptcopy(F&& f) { return std::optional<std::remove_reference_t<F>>(f); }
+// A borrowed F* deep in the layout, behind a wide (4095-record) sibling, or behind 64 unrelated pointers.
+template<int N, class F> class DeepHold { DeepHold<N - 1, F> in; public: DeepHold(F& f) : in(f) {} int run(int x) { return in.run(x); } };
+template<class F> class DeepHold<0, F> { F* p; public: DeepHold(F& f) : p(&f) {} int run(int x) { return (*p)(x); } };
+template<class F> DeepHold<14, std::remove_reference_t<F>> holddeep(F&& f) { return { f }; }
+template<int N> struct FillBlock { FillBlock<N - 1> a, b; };
+template<> struct FillBlock<0> { char x = 0; };
+template<class F> class WideHold { FillBlock<11> fill; DeepHold<0, F> tail; public: WideHold(F& f) : tail(f) {} int run(int x) { return tail.run(x); } };
+template<class F> WideHold<std::remove_reference_t<F>> holdwide(F&& f) { return { f }; }
+template<int N> struct SlotTag {};
+template<class F, class Seq> class Crowd;
+template<class F, int... I> class Crowd<F, std::integer_sequence<int, I...>> { std::tuple<SlotTag<I>*...> slots; F* tail; public: Crowd(F& f) : slots(), tail(&f) {} int run(int x) { return (*tail)(x); } };
+template<class F> Crowd<std::remove_reference_t<F>, std::make_integer_sequence<int, 64>> holdcrowd(F&& f) { return { f }; }
+// Owning containers point at their OWN copy; a pointer to Tag<F*> is not a pointer to F.
+template<class F> std::vector<std::remove_reference_t<F>> holdvec(F&& f) { return { f }; }
+template<class F> std::shared_ptr<std::remove_reference_t<F>> holdshared(F&& f) { return std::make_shared<std::remove_reference_t<F>>(f); }
+template<class F> std::shared_ptr<const std::remove_reference_t<F>> holdsharedconst(F&& f) { return std::make_shared<const std::remove_reference_t<F>>(f); }
+template<class T> struct PtrTag {};
+template<class F> class Tagged { PtrTag<F*>* p; F f; public: Tagged(F g) : p(nullptr), f(g) {} int run(int x) { return p ? 0 : f(x); } };
+template<class F> Tagged<std::remove_reference_t<F>> holdtagged(F&& f) { return Tagged<std::remove_reference_t<F>>(f); }
+template<class T> int runat0(T& t) { return t[0](5); }
+// A user destructor is no ownership evidence: these borrow &f (direct, through a base, nested).
+template<class T> struct DtorBorrow { T* p; ~DtorBorrow() {} int run(int x) { return (*p)(x); } };
+template<class F> DtorBorrow<std::remove_reference_t<F>> holddtorborrow(F&& f) { return { &f }; }
+template<class T> struct DtorPtrBase { T* p; };
+template<class T> struct DtorDerived : DtorPtrBase<T> { DtorDerived(T& t) { this->p = &t; } ~DtorDerived() {} int run(int x) { return (*this->p)(x); } };
+template<class F> DtorDerived<std::remove_reference_t<F>> holddtorderived(F&& f) { return { f }; }
+template<class T> struct DtorInner { T* p; int run(int x) { return (*p)(x); } };
+template<class T> struct DtorOuter { DtorInner<T> inner; ~DtorOuter() {} int run(int x) { return inner.run(x); } };
+template<class F> DtorOuter<std::remove_reference_t<F>> holddtorouter(F&& f) { return { { &f } }; }
+// MSVC shared_ptr shape: a trivial-dtor base holds T*, the derived owner (non-trivial dtor, T by value) frees it.
+template<class T> class OwnPtrBase { protected: T* p = nullptr; OwnPtrBase() = default; ~OwnPtrBase() = default; };
+template<class T> class OwnedBox : public OwnPtrBase<T> { public: OwnedBox(const T& t) { this->p = new T(t); } OwnedBox(const OwnedBox& o) { this->p = new T(*o.p); } ~OwnedBox() { delete this->p; } int run(int x) { return (*this->p)(x); } };
+template<class F> OwnedBox<std::remove_reference_t<F>> holdownedbox(F&& f) { return OwnedBox<std::remove_reference_t<F>>(f); }
+template<class T> class BorrowBox : public OwnPtrBase<T> { public: BorrowBox(T& t) { this->p = &t; } int run(int x) { return (*this->p)(x); } };
+template<class A, class B> class BoxPair { A a; B b; public: BoxPair(const A& x, const B& y) : a(x), b(y) {} int run(int x) { return b.run(x); } };
+template<class F> BoxPair<OwnedBox<std::remove_reference_t<F>>, BorrowBox<std::remove_reference_t<F>>> holdboxpair(F&& f) { return { OwnedBox<std::remove_reference_t<F>>(f), BorrowBox<std::remove_reference_t<F>>(f) }; }
+template<class T> int run0(T& t) { return std::get<0>(t)(5); }
+template<class T> int runopt(T& t) { return (*t)(5); }
 template<class F> struct Tag { int run(int x) const { return x; } };
 template<class F> Tag<F> tagonly(F&&) { return {}; }
 struct ClosureFactory {

@@ -523,6 +523,11 @@ namespace cflat_cinterop
         // C++ uuid-harvest pass (the C parse never sees it - the SDK gates the attr on __cplusplus).
         std::string uuid;
         std::vector<RawField> fields;
+        // Opaque blob only (fields cleared): "R:<T>"/"P:<T>" per non-owning reference/pointer
+        // subobject, T its immediate pointee; see CollectBlobIndirections.
+        std::vector<std::string> blobIndirections;
+        // StdOwnedElementSpelling: T of a std shared_ptr/unique_ptr/vector/optional<T>, else "".
+        std::string stdOwnedType;
         std::string file;
         std::string physicalFile;  // real file if `#line` / a macro expansion differs from `file`
         int line = 1;

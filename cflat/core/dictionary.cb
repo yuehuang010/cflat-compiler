@@ -515,18 +515,17 @@ struct dictionary<K, V>
                     result._status[i] = _status[i];
                     if (_status[i] == 1)
                     {
-                        // Total .copy() per slot: identity for a primitive/pointer key or value (the
-                        // pointer is BORROWED - both dictionaries share the pointee, freed once by the real
-                        // owner), deep for a copyable owner. The plain `=` slot store must not turn a deep
-                        // copy into an alias, which is why .copy() produces the independent value first. A
-                        // non-copyable owning value keeps its tailored error, in a dead `if const` branch.
-                        // A `unique` key is policy-rejected on the hash path; keep its .copy() out of this
-                        // eager instantiation (a `unique` element would deref-copy the pointee) with a dead
-                        // if const branch, so the real key-policy error still fires first.
+                        // C++ values use their copy constructor; CFlat values use .copy().
+                        // Keep copy expressions in guarded branches so uncopyable types remain usable.
                         if const (is_unique(K)) compile_error("dictionary keys cannot be 'unique'");
                         else                    construct_at(&result._keys[i], _keys[i].copy());
-                        if const (!is_copyable(V)) compile_error("cannot copy this dictionary: its value type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the dictionary instead of copying it");
-                        else                       construct_at(&result._values[i], _values[i].copy());
+                        if const (!is_copyable(V))
+                            compile_error("cannot copy this dictionary: its value type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or 'move' the dictionary instead of copying it");
+                        else
+                        {
+                            if const (is_cpp_class(V)) construct_at(&result._values[i], _values[i]);
+                            else                       construct_at(&result._values[i], _values[i].copy());
+                        }
                     }
                     i++;
                 }

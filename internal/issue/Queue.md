@@ -69,10 +69,9 @@ Ruling refs: L = fix-issue-lessons.md "Rulings 2026-10-21/22: open-question swee
 |---|---|---|---|---|---|---|---|
 | R7 | p2/statement-temp-escapes-via-out-param-or-global | void*/unrelated pointer joins accepted; C-callee keeps freed temp (use-after-free) | Join refusal landed (T410). Left: C-callee/indirect-fn policy | pointer join conversion, statement-temp release (MainListener_Expressions), C callee policy | M | Luna | yes |
 | R9 | p2/unique-field-heap-array-through-move-param | `new T[n]` reaches `move T*`/unique field, freed as one object | PARKED 2026-10-22: T415 spike hit 75 Test sites + core btree (see issue Spike section); needs re-ruling. Was: static refusal: `new T[n]` cannot bind owning `move T*` sink; keep `move T[]`; exempt trivially destructible T (L). Spike in-tree site count first | param sink check, new T[n] typing (MainListener_Expressions, LLVMBackend) | M | Luna (spike gate) | no |
-| R11 | p2/cpp-by-value-ctor-leftovers-after-t146 | Const fn-ptr local refused; by-value class ctor arg evaluated late (1111 vs 1011) | Per clang oracle: pass slot not code address (T248 patch backed out); eager by-value ctor arg temps in call position | LLVMBackend_Overloads.cpp ~7259, selection helper | M | Haiku (Luna backed out) | yes |
-| R12 | p2/cpp-ternary-default-arm-unbound-callee-wrong-arm | `take(c ? default : x)` into C++ wrong arm/leak in 4 shapes | Arm-dependent move/copy wrapper or construct into wrapper slot; bind callee before parsing args; conversion-op class helper | MainListener_PostfixExpression.cpp, ParseTernaryBranches, C++ call-arg state | L | Opus | yes |
-| R13 | p2/lowered-cxx-field-structs-in-containers-and-array-fields | SPLIT: dictionary<int,cpp> copy() undeclarable; R3 arr slot reuse; Q5 param dtor | SPLIT: (a) C2 dictionary copy() lowered values; (b) Q5 return-by-value-param dtor; (c) R3 element state (needs design). ruled: DESTROY+REBUILD stays | core/dictionary.cb:529, finishReturnedLocal (MainListener_Statements), lowered C++ field machinery | M | Luna (a,b); (c) Opus | yes |
-| R14 | p2/cpp-forwarded-fnptr-variable-or-closure-dangles-in-wrapper-frame | fn-ptr var or closure forwarded to C++ T&& dangles in wrapper frame | See file Fix direction + T56/T69 status; wrapper must own or borrow from caller frame | C++ wrapper/forwarding (CInterop, LLVMBackend_Overloads) | L | Opus | yes |
+| R12 | p2/cpp-ternary-default-arm-unbound-callee-wrong-arm | Bulk landed (T418 default/local leaves, T420 field/move leaves). Left: conversion arm into first unbound wrapper call (unknown signature); call arm; (default) parens; ctor const& | See issue "Still wrong"; extend deferral to move/field leaves, register wrapper param type before arg parse | MainListener_PostfixExpression.cpp, ParseTernaryBranches, C++ call-arg state | L | Opus | yes |
+| R13 | p2/lowered-cxx-field-structs-in-containers-and-array-fields | (a),(b) landed (T417). Left: R3 arr slot reuse `_ = move arr[0]; arr[0] = b` | (c) R3 element state (needs design). ruled: DESTROY+REBUILD stays | lowered C++ field machinery | M | Opus (after design) | yes |
+| R14 | p2/cpp-forwarded-fnptr-variable-or-closure-dangles-in-wrapper-frame | fn-ptr var or closure forwarded to C++ T&& dangles in wrapper frame | Blob-record family landed (T419: std-owner rule, MSVC shared_ptr). Left: see issue (std::function(std::ref(f)), caller-frame materialization, BorrowDtor/Mixed blind spots) | C++ wrapper/forwarding (CInterop, LLVMBackend_Overloads) | L | Opus | yes |
 | R16 | p2/delete-borrow-via-named-local + p2/view-mixed-join-sunk-through-pointer-param-alias | Owner/borrow reaches sink via helper chain or ptr param; double free / UAF | One interprocedural callee summary ("param stored into borrowing container / sinks view field"); path-sensitive provenance. Parked fix/t396-viewalias; not same-function guard (digest) | callee summaries, MemoryOutlivesCall walk, T387 view state | L | Opus | no |
 | R17 | p2/iface-return-dangle-via-calls-aggregates-and-rebinds | Returned interface boxes pointer from local via call/heap/indirect write | Callee-return provenance "returns param N" or borrow-check refusal; needs separate design (see Not ready) | provenance through memory; PointerValueRoot | L | Opus | no |
 
@@ -106,8 +105,10 @@ Windows gate: R6, R7, R11, R12, R13, R14 land after the Windows box passes. R2 i
 
 | Run | Branch | Issue(s) | Notes |
 |-----|--------|----------|-------|
-| R11 | fix/t416-cppleft | (R11 row) | Haiku r1 (T416); Win gate |
-| R13 | fix/t417-lowcxx | (R13 row) | Luna r1 (T417): items a, b (+c nit); R3 element state stays |
+| P3 | fix/t422-globdef | p3/global-default-spelling-zeroes-without-the-note | PARKED (T422 Luna r1 + Haiku r2): ruling conflict with runtime-constructed globals (T136/T368/mempress) - see issue head |
+| P3 | fix/t425-fieldaddr | p3/byvalue-param-field-address-read-refused-as-consume | Luna r1 (T425) |
+| P3 | fix/t426-rawtemp | p3/alias-of-call-result-field-leaks-owner | Luna r1 (T426, RULED 2026-10-21) |
+| P3 | fix/t424-helpertext | p3/cpp-demand-second-use-of-failed-helper-generic-text | Luna r1 (T424) |
 | R16 (parked) | fix/t396-viewalias | p2/view-mixed-join-sunk-through-pointer-param-alias | Sol r2b: 4 INCOMPLETE, needs path-sensitive provenance |
 
 ## Backlog (p3/p4 and plans; groups from earlier builds, unchanged)

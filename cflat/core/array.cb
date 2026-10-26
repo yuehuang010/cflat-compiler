@@ -72,6 +72,7 @@ struct array<T>
             else if const (is_pointer(T))   _ptr[index] = value;
             else if const (is_primitive(T)) _ptr[index] = value;
             else if const (!is_copyable(T)) compile_error("this array element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (a.set(i, move x)) to transfer ownership instead, or give the type a 'copy()' method");
+            else if const (is_cpp_class(T)) construct_at(&_ptr[index], value);
             else                            construct_at(&_ptr[index], value.copy());
         }
     }

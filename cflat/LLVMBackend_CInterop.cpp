@@ -2869,18 +2869,64 @@ bool LLVMBackend::CxxRecordStoresForwardedClosureReference(const std::string& ty
             }
             return false;
         };
-        auto contains = [&](auto&& self, const std::string& name) -> bool {
+        /*
+         * Visible (flattened) fields: a raw T* is an OWNED copy only inside a standard-library owning
+         * template the extractor identified from clang's decl (shared_ptr<T> incl. MSVC's
+         * _Ptr_base<T>::_Ptr, unique_ptr<T, default_delete<T>>, vector<T>, optional<T>). A user
+         * template's destructor is no ownership evidence. Blob facts were filtered at extraction too,
+         * and this std-owner set also covers a blob base or member reached under the owner.
+         */
+        auto stripTag = [&](std::string spelling) {
+            for (const char* tag : { "class ", "struct ", "union " })
+                if (spelling.starts_with(tag)) spelling.erase(0, std::strlen(tag));
+            return SqueezeCxxSpelling(spelling);
+        };
+        auto addOwnedArgs = [&](const CRecordEntry& record, std::set<std::string>& owned) {
+            if (!record.stdOwnedType.empty()) owned.insert(stripTag(record.stdOwnedType));
+        };
+        auto ownedPointer = [&](const std::string& pointerSpelling, const std::set<std::string>& owned) {
+            const std::string squeezed = SqueezeCxxSpelling(pointerSpelling);
+            return !owned.empty() && squeezed.ends_with('*')
+                && owned.count(stripTag(squeezed.substr(0, squeezed.size() - 1))) != 0;
+        };
+        std::function<bool(const std::string&, std::set<std::string>)> contains =
+            [&](const std::string& name, std::set<std::string> owned) -> bool {
             auto record = cxxRecordEntries_.find(name);
-            if (record == cxxRecordEntries_.end() || !visited.insert(name).second) return false;
+            if (record == cxxRecordEntries_.end()) return false;
+            addOwnedArgs(record->second, owned);
+            std::string key = name;
+            for (const std::string& arg : owned) key += "|" + arg;
+            if (!visited.insert(key).second) return false;
             for (const auto& base : record->second.bases)
-                if (self(self, base.name)) return true;
+                if (contains(base.name, owned)) return true;
+            // An opaque blob keeps no fields; clang's layout facts ("R:"/"P:" + immediate pointee)
+            // stand in. Only a pointee that IS the closure type counts, never a template argument.
+            for (const std::string& held : record->second.blobIndirections)
+            {
+                const std::string_view full = std::string_view(held).substr(held.size() > 2 ? 2 : held.size());
+                std::string_view pointee = full;   // cv-qualified pointee: the closure type underneath
+                while (pointee.starts_with("const ") || pointee.starts_with("volatile "))
+                    pointee.remove_prefix(pointee.find(' ') + 1);
+                if (pointee.starts_with("__cflat_closure<") && pointee.ends_with('>'))
+                {
+                    size_t depth = 0, close = std::string_view::npos;
+                    for (size_t i = pointee.find('<'); i < pointee.size(); ++i)
+                        if (pointee[i] == '<') ++depth;
+                        else if (pointee[i] == '>' && --depth == 0) { close = i; break; }
+                    // A std owner's base can itself be a blob (MSVC std::_Ptr_base<T> under shared_ptr<T>).
+                    if (close == pointee.size() - 1
+                        && !(held.starts_with("P:") && ownedPointer(std::string(full) + "*", owned)))
+                        return true;
+                }
+            }
             for (const CRecordFieldEntry& field : record->second.fields)
             {
-                if (closurePointerOrReference(field.ctype))
-                    return true;
                 std::string fieldType = field.ctype;
                 if (const size_t array = fieldType.find('['); array != std::string::npos)
                     fieldType.erase(array);
+                if (ownedPointer(fieldType, owned)) continue;
+                if (closurePointerOrReference(field.ctype))
+                    return true;
                 const std::string squeezedFieldType = SqueezeCxxSpelling(fieldType);
                 if (closureProjectionInResult && fieldType.find('(') == std::string::npos
                     && squeezedFieldType.find("void*") != std::string::npos)
@@ -2888,12 +2934,12 @@ bool LLVMBackend::CxxRecordStoresForwardedClosureReference(const std::string& ty
                 for (const auto& [nestedName, nested] : cxxRecordEntries_)
                     if (!nested.canonicalCtype.empty()
                         && SqueezeCxxSpelling(nested.canonicalCtype) == squeezedFieldType
-                        && self(self, nestedName))
+                        && contains(nestedName, owned))
                         return true;
             }
             return false;
         };
-        return contains(contains, typeName);
+        return contains(typeName, {});
 }
 
 bool LLVMBackend::LowerNonCapturingClosureForCxx(NamedVariable& arg, const TypeAndValue* target)
@@ -4395,17 +4441,6 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
                 ptv.MarkCxxRef();
                 ptv.SetCxxConstRef(true);
             }
-            if (r.isCxx && ptv.IsFunctionPointer && ptv.Pointer
-                && (ptv.IsAlias || ptv.IsRvalueRef))
-            {
-                const std::string pname = i < r.paramNames.size() && !r.paramNames[i].empty()
-                    ? r.paramNames[i] : std::format("p{}", i);
-                e.bindRefusal = std::format(
-                    "'{}' was not bound: parameter '{}' is a reference to a function pointer, "
-                    "which this C++ call path cannot bind",
-                    r.name, pname);
-                return true;
-            }
             /*
              * A C parameter keeps the levels it spells (`const int **` is const at the int only);
              * one the level parser cannot read but whose pointee is const is read-only at every
@@ -5811,6 +5846,8 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
             rec.bases = r.bases; rec.layoutRefusal = r.layoutRefusal;
             rec.virtualBases = r.virtualBases;
             rec.canonicalCtype = r.canonicalCtype;
+            rec.blobIndirections = r.blobIndirections;
+            rec.stdOwnedType = r.stdOwnedType;
             rec.hasTrivialDefaultCtor = r.hasTrivialDefaultCtor;
             rec.hasTrivialCopyCtor = r.hasTrivialCopyCtor;
             rec.hasTrivialCopyAssign = r.hasTrivialCopyAssign;
@@ -12422,7 +12459,7 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
         auto appendDirectConstruction = [&](NamedVariable& construction,
                                              auto&& self,
                                              std::string& expression) -> bool {
-            if (!construction.IsCxxDirectConstruction) return false;
+            if (!construction.IsCxxDirectConstruction || !construction.CxxDeferredTernaryShape.empty()) return false;
             if (const std::string refusal = CxxConstructorRvalueRefBindRefusal(
                     construction.CxxDirectConstructionType,
                     construction.CxxDirectConstructionArguments);
@@ -12520,6 +12557,17 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 const auto* selectedCtor = SelectCxxConstructorListed(
                     construction.CxxDirectConstructionType, argumentTypes, why,
                     /*allowNumericConversions*/ true, &argumentVars, /*allowExplicit*/ true);
+                if (selectedCtor == nullptr && !functionPointer)
+                {
+                    bool selectedReference = false;
+                    if (CxxConstructorThunkParameterIsReference(
+                            construction.CxxDirectConstructionType,
+                            construction.CxxDirectConstructionArguments,
+                            index, rvalueReference, selectedReference, /*forceClangPick*/ true))
+                        return selectedReference;
+                        return hasExactReferenceParameter(index, spelling, functionPointer,
+                                                                          rvalueReference);
+                }
                 if (selectedCtor == nullptr || index + 1 >= selectedCtor->params.size())
                     return fallback();
                 const TypeAndValue& selectedParam = selectedCtor->params[index + 1];
@@ -13775,10 +13823,60 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
         callArguments.reserve(arguments.size());
         // (call argument index, C++ literal spelling) for the literal retry below.
         std::vector<std::pair<size_t, std::string>> literalCallArguments;
+        bool hasDeferredMoveLeaf = false;
         auto appendDirectConstruction = [&](NamedVariable& construction,
                                              auto&& self,
                                              std::string& expression) -> bool {
             if (!construction.IsCxxDirectConstruction) return false;
+            /*
+             * T418: a deferred `?:` argument: the selector is an int, each place leaf the CALLER's
+             * object (lvalue), and the wrapper spells the conditional so clang types and elides it.
+             */
+            if (!construction.CxxDeferredTernaryShape.empty())
+            {
+                std::string defaultSpelling;
+                if (!CxxSpellingForCflatType(construction.CxxDirectConstructionType, defaultSpelling))
+                    return false;
+                std::vector<std::string> childNames;
+                for (size_t c = 0; c < construction.CxxDirectConstructionArguments.size(); ++c)
+                {
+                    const NamedVariable& child = construction.CxxDirectConstructionArguments[c];
+                    std::string spelling = "int";
+                    if (c != 0)
+                    {
+                        if (!CxxSpellingForCflatType(child.TypeAndValue.TypeName, spelling)) return false;
+                        // A const local stays const: `CV(const CV&)` over `CV(CV&)`, and a distinct wrapper key.
+                        spelling = (child.TypeAndValue.IsConstObject() ? "const " : "") + spelling + " &";
+                    }
+                    childNames.push_back("p" + std::to_string(parameterSpellings.size()));
+                    parameterSpellings.push_back(std::move(spelling));
+                }
+                const std::string& shape = construction.CxxDeferredTernaryShape;
+                expression.clear();
+                for (size_t at = 0; at < shape.size(); )
+                {
+                    if (shape[at] != '@') { expression += shape[at++]; continue; }
+                    ++at;
+                    if (at < shape.size() && shape[at] == 'S') { expression += childNames.front(); ++at; continue; }
+                    if (at < shape.size() && shape[at] == 'D') { expression += defaultSpelling + "()"; ++at; continue; }
+                    const bool movedLeaf = at < shape.size() && shape[at] == 'M';
+                    if (movedLeaf) ++at;
+                    size_t end = at;
+                    while (end < shape.size() && std::isdigit(static_cast<unsigned char>(shape[end]))) ++end;
+                    const size_t child = static_cast<size_t>(std::stoul(shape.substr(at, end - at)));
+                    if (child >= childNames.size()) return false;
+                    if (movedLeaf)
+                    {
+                        if (construction.CxxDirectConstructionArguments[child].Storage == nullptr)
+                            return false;
+                        expression += "std::move(" + childNames[child] + ")";
+                        hasDeferredMoveLeaf = true;
+                    }
+                    else expression += childNames[child];
+                    at = end;
+                }
+                return true;
+            }
             if (const std::string refusal = CxxConstructorRvalueRefBindRefusal(
                     construction.CxxDirectConstructionType,
                     construction.CxxDirectConstructionArguments);
@@ -13867,6 +13965,17 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 const auto* selectedCtor = SelectCxxConstructorListed(
                     construction.CxxDirectConstructionType, argumentTypes, why,
                     /*allowNumericConversions*/ true, &argumentVars, /*allowExplicit*/ true);
+                if (selectedCtor == nullptr && !functionPointer)
+                {
+                    bool selectedReference = false;
+                    if (CxxConstructorThunkParameterIsReference(
+                            construction.CxxDirectConstructionType,
+                            construction.CxxDirectConstructionArguments,
+                            index, rvalueReference, selectedReference, /*forceClangPick*/ true))
+                        return selectedReference;
+                        return hasExactReferenceParameter(index, spelling, functionPointer,
+                                                                          rvalueReference);
+                }
                 if (selectedCtor == nullptr || index + 1 >= selectedCtor->params.size())
                     return fallback();
                 const TypeAndValue& selectedParam = selectedCtor->params[index + 1];
@@ -14448,6 +14557,7 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
             wrapper.source += "extern \"C\" __attribute__((weak)) decltype(auto) " + wrapper.name + "("
                 + parameters + ") noexcept(noexcept(" + call + ")) { return " + call + ";"
                 + narrowingCheck + " }\n";
+            if (hasDeferredMoveLeaf) wrapper.source.insert(0, "#include <utility>\n");
             return wrapper;
         };
         /*
@@ -17523,6 +17633,67 @@ void LLVMBackend::ConvertCxxCtorThunkArguments(const std::string& wrapperName,
         }
 }
 
+/*
+ * T416: may any constructor of this arity bind argument `position` by reference? A reference binding
+ * reads the caller's slot at the thunk call, after later arguments ran; a by-value position is copied
+ * when its argument is evaluated.
+ */
+static bool CtorMayBindScalarByReference(const std::vector<cflat_cinterop::RawCxxMember>& members,
+                                         const std::vector<cflat_cinterop::RawCxxCtorTemplate>& templates,
+                                         size_t position, size_t argCount)
+{
+        // Arity viability: a candidate takes this call's argument count when it declares enough
+        // parameters without defaults, and either no more than it declares or a trailing `...`.
+        // `defaulted` is the parameter list's default flags; `first` is the parameters before it.
+        const auto viable = [argCount](size_t paramCount, const auto& defaulted, bool variadic) {
+            size_t required = paramCount;
+            for (size_t i = 0; i < paramCount; ++i)
+                if (i < defaulted.size() && defaulted[i]) { required = i; break; }
+            return argCount >= required && (variadic || argCount <= paramCount);
+        };
+        // A template's parameter list has no `this` entry; a binding by reference keeps the slot.
+        // A parameter pack ("A &...") absorbs any count, so positions at or past it take its spelling.
+        for (const auto& ctorTemplate : templates)
+        {
+            const auto& params = ctorTemplate.paramTypes;
+            size_t pack = params.size();
+            for (size_t i = 0; i < params.size(); ++i)
+                if (params[i].ends_with("...")) { pack = i; break; }
+            if (pack == params.size())
+            {
+                if (position < params.size() && viable(params.size(), ctorTemplate.defaulted, ctorTemplate.variadic)
+                    && params[position].ends_with("&")) return true;
+                continue;
+            }
+            // A non-final pack may deduce empty, shifting later parameters: keep the slot if any may bind it.
+            if (pack + 1 < params.size())
+            {
+                for (size_t i = pack; i < params.size(); ++i)
+                    if (params[i].find('&') != std::string::npos) return true;
+                continue;
+            }
+            if (!viable(pack, ctorTemplate.defaulted, true)) continue;
+            std::string spelling = params[position < pack ? position : pack];
+            if (spelling.ends_with("...")) spelling.resize(spelling.size() - 3);
+            while (!spelling.empty() && spelling.back() == ' ') spelling.pop_back();
+            if (spelling.ends_with("&")) return true;
+        }
+        for (const auto& member : members)
+        {
+            if (member.kind != cflat_cinterop::RawCxxMember::Constructor
+                || position + 1 >= member.paramTypes.size()) continue;
+            // Entry 0 of a member's parameter list is `this`; its defaults align with the same list.
+            std::vector<bool> defaulted;
+            for (size_t i = 1; i < member.paramTypes.size(); ++i)
+                defaulted.push_back(i < member.defaultArgs.size() && !member.defaultArgs[i].kind.empty());
+            if (!viable(member.paramTypes.size() - 1, defaulted, member.variadic)) continue;
+            const std::string& parameter = member.paramTypes[position + 1];
+            if (parameter.ends_with("...")) continue;
+            if (parameter.ends_with("&")) return true;
+        }
+        return false;
+}
+
 bool LLVMBackend::RequestCxxVariadicConstructor(
         const std::string& typeName, const std::vector<NamedVariable>& arguments,
         std::string& wrapperName, std::string& error, bool copyInit)
@@ -17811,7 +17982,14 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
                 // An lvalue borrows its slot only when that slot holds exactly the spelled type;
                 // a converted value has no slot of its own and travels as an xvalue.
                 if (scalar && !IsCxxRvalueReferenceArgument(arg) && GetType(spelled) == valueType)
-                    spelling += " &";
+                {
+                    // T416: no constructor binds this position by reference, so it travels by value.
+                    const auto recordEntry = cxxRecordEntries_.find(typeName);
+                    if (recordEntry == cxxRecordEntries_.end()
+                        || CtorMayBindScalarByReference(recordEntry->second.members,
+                            recordEntry->second.ctorTemplates, i, arguments.size()))
+                        spelling += " &";
+                }
                 else if (scalar)
                 {
                     callArgument = "static_cast<" + spelling + " &&>(" + callArgument + ")";
@@ -29862,7 +30040,7 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructor(
 
 bool LLVMBackend::CxxConstructorThunkParameterIsReference(
         const std::string& typeName, const std::vector<NamedVariable>& arguments,
-        size_t index, bool rvalueReference, bool& isReference)
+        size_t index, bool rvalueReference, bool& isReference, bool forceClangPick)
 {
         isReference = false;
         const CxxClassInfo* classInfo = GetCxxClassInfoWithConstructors(typeName);
@@ -29873,7 +30051,9 @@ bool LLVMBackend::CxxConstructorThunkParameterIsReference(
             if (specialization != std::string::npos)
                 record = cxxRecordEntries_.find(typeName.substr(0, specialization));
         }
-        bool needsClangPick = classInfo != nullptr && classInfo->hasCtorTemplate;
+        // A listed overload set that cannot pick (a user-defined conversion on another argument)
+        // is resolved by clang through the thunk's mirror.
+        bool needsClangPick = forceClangPick || (classInfo != nullptr && classInfo->hasCtorTemplate);
         if (record != cxxRecordEntries_.end())
         {
             needsClangPick = needsClangPick || !record->second.ctorTemplates.empty();

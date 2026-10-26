@@ -1797,6 +1797,9 @@ public:
         bool CxxDirectConstructionUsesBraces = false;
         std::string CxxDirectConstructionType;
         std::vector<NamedVariable> CxxDirectConstructionArguments;
+        // T418: a `c ? default : local` argument evaluated inside the C++ wrapper; the shape spells
+        // the conditional over the children (@S = selector, @D = default arm, @<n> = child n).
+        std::string CxxDeferredTernaryShape;
         // T142: the value of a `default` call argument. Overload ranking refuses it for reference and
         // move/owning-sink parameters (only a by-value parameter takes it).
         bool IsDefaultArgument = false;
@@ -4551,6 +4554,9 @@ private:
         // CFlat spellings of one specialization agree on. Also the source of the C++ spelling a
         // template ARGUMENT needs, so it must round-trip through the header cache.
         std::string canonicalCtype;
+        // See RawRecord::blobIndirections; read by CxxRecordStoresForwardedClosureReference.
+        std::vector<std::string> blobIndirections;
+        std::string stdOwnedType;   // see RawRecord::stdOwnedType
         std::string qualifiedName;
         std::string file;
         bool inScope = true;
@@ -10583,7 +10589,7 @@ public:
     bool CxxConstructorThunkParameterIsReference(const std::string& typeName,
                                                  const std::vector<NamedVariable>& arguments,
                                                  size_t index, bool rvalueReference,
-                                                 bool& isReference);
+                                                 bool& isReference, bool forceClangPick = false);
     // Preserve CFlat's explicit single-float to integer refusal when every arity-compatible ctor
     // requires that conversion. Other unresolved constructor sets may be delegated to clang.
     bool CxxCtorSetRequiresFloatToInteger(const std::string& typeName,
@@ -13295,7 +13301,8 @@ public:
     // 274: static C++ data members carry their declared ConstMask (T346).
     // 275: class-template default arguments are cached for canonical specialization names (T358).
     // 276: non-type defaults store evaluated values; unsupported dependent values stay absent (T358 r2).
-    static constexpr int kCHeaderCacheVersion = 276;
+    // 277: user-declared defaulted trivial copy assignment is harvested as usable (T417).
+    static constexpr int kCHeaderCacheVersion = 282;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. ON by

@@ -2,6 +2,8 @@
 
 **RULED 2026-10-21:** REFUSE a global whose default construction cannot be computed at compile time (Rust-like, all spellings: `T g;` / `= default` / `= {}`); no zero-fill. About 20 in-tree sites to fix first. See fix-issue-lessons.md digest.
 
+**PARKED 2026-10-23 (T422, 2 rounds) - ruling conflict, needs maintainer:** the refuse-if-not-foldable rule also refuses globals that master constructs at RUNTIME by running a CFlat constructor (not zero-fill): `T136Ord t136OrdOne;` (Test/test_cpp_interop.cb:2013, ctor body calls t136ord.mark() - the test asserts C++-style startup ordering), `T368DtorBodyLater<int> t368DtorBodyLater;` (Test/test_generics.cb:5934), and `AppSample _pendingSample = default;` with a list<AppEntry> field (example/ui/11-mempress/mempress_app.cb:30). Question: (a) Rust-strict - refuse these too and rewrite the tests/example (T136/T368 lose their startup-order coverage), or (b) refuse only the silently zero-filled cases and keep runtime construction for types with a user ctor. Round-2 patch (folds all-null/zero defaults incl. Lambda fields, so core __prog_tls passes; 3 err_global_default_*.cb files; C++-field struct no longer dropped): scratch/repro_keep/box1022/t422/t422_r2_attempt.patch + t422_report.md. Worktree cflat-fix-t422-globdef kept.
+
 Bucket: full mode (needs a ruling on diagnostic volume before it can land). Filed 2026-09-05 as a
 side finding of fix/string-field-default.
 

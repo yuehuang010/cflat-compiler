@@ -301,6 +301,7 @@ ProxyCppRecord makeProxyCppRecord()
 // std::function as a MEMBER parameter and as a RETURN type.
 import cpp "library/cpp_interop_stdfn.h";
 import cpp "library/cpp_interop_twin.h";
+import cpp "library/cpp_interop_t417.h";
 import cpp "library/cpp_interop_lastuse.h";
 import cpp "library/cpp_interop_arrayelem.h";
 import "library/cpp_interop_gfield_a.cb";
@@ -1144,6 +1145,224 @@ int bridge_t149_user_ctor_arr()
     BridgeT149UserArr a = default;
     a.arr[0].l.push_back(1); a.arr[1].l.push_back(2); a.arr[1].l.push_back(3);
     return a.arr[0].l.size() * 10 + a.arr[1].l.size();
+}
+
+// T417(a): dictionary copy handles foreign C++ value constructors and defers refusal for move-only values.
+int bridge_t417_dict_twin()
+{
+    cpptw.reset_counts();
+    int original = 0;
+    int copied = 0;
+    {
+        dictionary<int, cpptw.Twin> source = default;
+        cpptw.Twin item = cpptw.Twin(41);
+        if (!source.add(7, item)) return 1;
+        original = source.get(7).value();
+        dictionary<int, cpptw.Twin> duplicate = source.copy();
+        copied = duplicate.get(7).value();
+        if (!duplicate.remove(7) || !source.remove(7)) return 2;
+    }
+    if (original != 41 || copied != 41 || cpptw.copy_count() == 0
+        || cpptw.copy_assign_count() != 0 || cpptw.live_allocations() != 0) return 3;
+    return 0;
+}
+
+int bridge_t417_dict_stdlist()
+{
+    int originalSize = 0;
+    int copiedSize = 0;
+    int copiedFirst = 0;
+    int copiedLast = 0;
+    {
+        std.list<int> item = default;
+        item.push_back(17);
+        item.push_back(29);
+        dictionary<int, std.list<int>> source = default;
+        if (!source.add(5, item)) return 11;
+        dictionary<int, std.list<int>> duplicate = source.copy();
+        source.get(5).push_back(31);
+        originalSize = source.get(5).size();
+        copiedSize = duplicate.get(5).size();
+        copiedFirst = duplicate.get(5).front();
+        copiedLast = duplicate.get(5).back();
+        if (!duplicate.remove(5) || !source.remove(5)) return 12;
+    }
+    return originalSize == 3 && copiedSize == 2 && copiedFirst == 17 && copiedLast == 29 ? 0 : 13;
+}
+
+int bridge_t417_list_twin_copy()
+{
+    cpptw.reset_counts();
+    int original = 0;
+    int copied = 0;
+    {
+        list<cpptw.Twin> source = default;
+        cpptw.Twin item = cpptw.Twin(41);
+        source.add(move item);
+        list<cpptw.Twin> duplicate = source.copy();
+        source[0].set(17);
+        original = source[0].value();
+        copied = duplicate[0].value();
+    }
+    return original == 17 && copied == 41 && cpptw.copy_count() > 0
+        && cpptw.live_allocations() == 0 ? 0 : 14;
+}
+
+int bridge_t417_array_twin_set()
+{
+    cpptw.reset_counts();
+    int value = 0;
+    {
+        array<cpptw.Twin> items;
+        items.init(1);
+        cpptw.Twin item = cpptw.Twin(29);
+        items.set(0, item);
+        value = items.get(0).value();
+    }
+    return value == 29 && cpptw.copy_count() > 0 && cpptw.live_allocations() == 0 ? 0 : 15;
+}
+
+int bridge_t417_dict_unique()
+{
+    int value = 0;
+    {
+        dictionary<int, std.unique_ptr<int>> d = default;
+        std.unique_ptr<int> item = std.unique_ptr<int>(new int(73));
+        if (!d.add(9, move item)) return 21;
+        value = *d.get(9).get();
+        if (!d.remove(9) || d.count() != 0) return 22;
+    }
+    return value == 73 ? 0 : 23;
+}
+
+int bridge_t417_dict_moveonly()
+{
+    t417.reset_move_ops();
+    int value = 0;
+    {
+        dictionary<int, t417.MoveOnly> d = default;
+        t417.MoveOnly item = t417.MoveOnly(73);
+        if (!d.add(9, move item)) return 24;
+        value = d.get(9).value();
+        if (!d.remove(9) || d.count() != 0) return 25;
+    }
+    return value == 73 && t417.move_count() > 0 && t417.move_live_count() == 0 ? 0 : 26;
+}
+
+int bridge_t417_dict_string_copy()
+{
+    dictionary<int, string> source = default;
+    source.add(3, "copy-value");
+    dictionary<int, string> duplicate = source.copy();
+    return source.get(3) == "copy-value" && duplicate.get(3) == "copy-value" ? 0 : 31;
+}
+
+struct BridgeT417DefaultedAssign { t417.DefaultedAssign field = default; char tail = 'z'; int key = 1; };
+int bridge_t417_defaulted_assign()
+{
+    BridgeT417DefaultedAssign left = default;
+    left.field.set(2); left.tail = 'x'; left.key = 1;
+    BridgeT417DefaultedAssign right = default;
+    right.field.set(3); right.tail = 'y'; right.key = 4;
+    left = right;
+    if (left.field.value() != 3 || left.tail != 'y' || left.key != 4) return 41;
+    BridgeT417DefaultedAssign moved = default;
+    moved.field.set(5); moved.tail = 'q'; moved.key = 6;
+    left = move moved;
+    return left.field.value() == 5 && left.tail == 'q' && left.key == 6 ? 0 : 42;
+}
+
+int bridge_t417_q5_users = 0;
+struct BridgeT417ReturnCpp { t417.CopyOnly field = default; int id = 0; ~BridgeT417ReturnCpp() { bridge_t417_q5_users++; } };
+struct BridgeT417ReturnPlain { int field = 0; int id = 0; ~BridgeT417ReturnPlain() { bridge_t417_q5_users++; } };
+
+BridgeT417ReturnCpp bridge_t417_cpp_bare(BridgeT417ReturnCpp w) { return w; }
+BridgeT417ReturnCpp bridge_t417_cpp_paren(BridgeT417ReturnCpp w) { return (w); }
+BridgeT417ReturnCpp bridge_t417_cpp_move(BridgeT417ReturnCpp w) { return move w; }
+BridgeT417ReturnPlain bridge_t417_plain_bare(BridgeT417ReturnPlain w) { return w; }
+BridgeT417ReturnPlain bridge_t417_plain_paren(BridgeT417ReturnPlain w) { return (w); }
+BridgeT417ReturnPlain bridge_t417_plain_move(BridgeT417ReturnPlain w) { return move w; }
+
+BridgeT417ReturnCpp bridge_t417_cpp_make()
+{
+    BridgeT417ReturnCpp w = default; w.id = 7; w.field.set(55); return w;
+}
+
+BridgeT417ReturnPlain bridge_t417_plain_make()
+{
+    BridgeT417ReturnPlain w = default; w.id = 7; w.field = 55; return w;
+}
+
+BridgeT417ReturnCpp bridge_t417_cpp_move_local(BridgeT417ReturnCpp w)
+{
+    BridgeT417ReturnCpp local = default; local.id = 4; return move w;
+}
+
+BridgeT417ReturnPlain bridge_t417_plain_move_local(BridgeT417ReturnPlain w)
+{
+    BridgeT417ReturnPlain local = default; local.id = 4; return move w;
+}
+
+int bridge_t417_q5_cpp_bare()
+{
+    BridgeT417ReturnCpp source = default; source.id = 5; source.field.set(55);
+    BridgeT417ReturnCpp target = default;
+    bridge_t417_q5_users = 0; t417.reset_ops(); target = bridge_t417_cpp_bare(source);
+    return bridge_t417_q5_users * 10000 + target.id * 100 + target.field.value();
+}
+
+int bridge_t417_q5_cpp_paren()
+{
+    BridgeT417ReturnCpp source = default; source.id = 5; source.field.set(55);
+    BridgeT417ReturnCpp target = default;
+    bridge_t417_q5_users = 0; t417.reset_ops(); target = bridge_t417_cpp_paren(source);
+    return bridge_t417_q5_users * 10000 + target.id * 100 + target.field.value();
+}
+
+int bridge_t417_q5_cpp_move()
+{
+    BridgeT417ReturnCpp source = default; source.id = 5; source.field.set(55);
+    BridgeT417ReturnCpp target = default;
+    bridge_t417_q5_users = 0; t417.reset_ops(); target = bridge_t417_cpp_move(source);
+    return bridge_t417_q5_users * 10000 + target.id * 100 + target.field.value();
+}
+
+int bridge_t417_q5_plain_bare()
+{
+    BridgeT417ReturnPlain source = default; source.id = 5; source.field = 55;
+    BridgeT417ReturnPlain target = default;
+    bridge_t417_q5_users = 0; target = bridge_t417_plain_bare(source);
+    return bridge_t417_q5_users * 10000 + target.id * 100 + target.field;
+}
+
+int bridge_t417_q5_plain_paren()
+{
+    BridgeT417ReturnPlain source = default; source.id = 5; source.field = 55;
+    BridgeT417ReturnPlain target = default;
+    bridge_t417_q5_users = 0; target = bridge_t417_plain_paren(source);
+    return bridge_t417_q5_users * 10000 + target.id * 100 + target.field;
+}
+
+int bridge_t417_q5_plain_move()
+{
+    BridgeT417ReturnPlain source = default; source.id = 5; source.field = 55;
+    BridgeT417ReturnPlain target = default;
+    bridge_t417_q5_users = 0; target = bridge_t417_plain_move(source);
+    return bridge_t417_q5_users * 10000 + target.id * 100 + target.field;
+}
+
+int bridge_t417_q5_cpp_move_local()
+{
+    BridgeT417ReturnCpp target = default;
+    bridge_t417_q5_users = 0; t417.reset_ops(); target = bridge_t417_cpp_move_local(bridge_t417_cpp_make());
+    return bridge_t417_q5_users * 10000 + target.id * 100 + target.field.value();
+}
+
+int bridge_t417_q5_plain_move_local()
+{
+    BridgeT417ReturnPlain target = default;
+    bridge_t417_q5_users = 0; target = bridge_t417_plain_move_local(bridge_t417_plain_make());
+    return bridge_t417_q5_users * 10000 + target.id * 100 + target.field;
 }
 
 // T154 D5b: a PARAMETERIZED constructor (alone, beside a no-arg one, or with a defaulted parameter)
@@ -5999,6 +6218,50 @@ extern int main(int argc, char** argv)
     cpptw.reset_counts();
     bridge_check("bridge T149 list take plain value", bridge_t149_take_plain(), 20302);
     bridge_check("bridge T149 list take plain C++ live", cpptw.live_allocations(), 0);
+
+    // T417(a): C++ value copies use the C++ copy constructor; move-only values remain usable.
+    cpptw.reset_counts();
+    bridge_check("bridge T417 dictionary Twin copy ctor and cleanup", bridge_t417_dict_twin(), 0);
+    bridge_check("bridge T417 dictionary Twin live", cpptw.live_allocations(), 0);
+    bridge_check("bridge T417 dictionary std.list independent copy", bridge_t417_dict_stdlist(), 0);
+    bridge_check("bridge T417 core list C++ element copy", bridge_t417_list_twin_copy(), 0);
+    bridge_check("bridge T417 core array C++ set copy constructor", bridge_t417_array_twin_set(), 0);
+    bridge_check("bridge T417 dictionary unique_ptr ordinary use", bridge_t417_dict_unique(), 0);
+    bridge_check("bridge T417 dictionary MoveOnly ordinary use", bridge_t417_dict_moveonly(), 0);
+    bridge_check("bridge T417 dictionary string copy", bridge_t417_dict_string_copy(), 0);
+    bridge_check("bridge T417 user-defaulted trivial C++ assignment", bridge_t417_defaulted_assign(), 0);
+
+    int t417ReturnResult = bridge_t417_q5_cpp_bare();
+    int t417ReturnCopies = t417.copy_count();
+    bridge_check("bridge T417 Q5 bare parameter dtor matches plain",
+                 t417ReturnResult / 10000, bridge_t417_q5_plain_bare() / 10000);
+    bridge_check("bridge T417 Q5 bare parameter value", t417ReturnResult % 10000, 555);
+    bridge_check("bridge T417 Q5 bare parameter uses copy ctor", t417ReturnCopies > 0 ? 1 : 0, 1);
+    bridge_check("bridge T417 Q5 bare parameter field cleanup", t417.live_count(), 0);
+
+    t417ReturnResult = bridge_t417_q5_cpp_paren();
+    t417ReturnCopies = t417.copy_count();
+    bridge_check("bridge T417 Q5 parenthesized parameter dtor matches plain",
+                 t417ReturnResult / 10000, bridge_t417_q5_plain_paren() / 10000);
+    bridge_check("bridge T417 Q5 parenthesized parameter value", t417ReturnResult % 10000, 555);
+    bridge_check("bridge T417 Q5 parenthesized parameter uses copy ctor", t417ReturnCopies > 0 ? 1 : 0, 1);
+    bridge_check("bridge T417 Q5 parenthesized parameter field cleanup", t417.live_count(), 0);
+
+    t417ReturnResult = bridge_t417_q5_cpp_move();
+    t417ReturnCopies = t417.copy_count();
+    bridge_check("bridge T417 Q5 explicit move parameter dtor matches plain",
+                 t417ReturnResult / 10000, bridge_t417_q5_plain_move() / 10000);
+    bridge_check("bridge T417 Q5 explicit move parameter value", t417ReturnResult % 10000, 555);
+    bridge_check("bridge T417 Q5 explicit move parameter uses copy ctor", t417ReturnCopies > 0 ? 1 : 0, 1);
+    bridge_check("bridge T417 Q5 explicit move parameter field cleanup", t417.live_count(), 0);
+
+    t417ReturnResult = bridge_t417_q5_cpp_move_local();
+    t417ReturnCopies = t417.copy_count();
+    bridge_check("bridge T417 Q5 move parameter with local dtor matches plain",
+                 t417ReturnResult / 10000, bridge_t417_q5_plain_move_local() / 10000);
+    bridge_check("bridge T417 Q5 move parameter with local value", t417ReturnResult % 10000, 755);
+    bridge_check("bridge T417 Q5 move parameter with local uses copy ctor", t417ReturnCopies > 0 ? 1 : 0, 1);
+    bridge_check("bridge T417 Q5 move parameter with local field cleanup", t417.live_count(), 0);
 
     // T156: program user fields (C++ list, array of C++-field structs, native) built in the sret slot.
     bridge_check("bridge T156 program field value", bridge_t156_program_fields(), 52105);

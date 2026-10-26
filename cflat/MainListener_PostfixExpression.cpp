@@ -8223,6 +8223,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 return;
                                             }
                                     }
+                                // T418: a `?:` argument with a `default` arm types itself from the callee, so a
+                                // C++ free function bound on first use binds before its arguments parse.
+                                if (std::any_of(namedArgCtx.begin(), namedArgCtx.end(), [&](auto* na) {
+                                        return HasDefaultOnlyTernaryArm(na->assignmentExpression()); }))
+                                    Compiler(ctx)->TryBindCxxFunction(functionName);
                                 // Look up the function signature to set lambdaExpectedType for lambda arguments.
                                 const LLVMBackend::FunctionSymbol* funcSym = nullptr;
                                 {
@@ -8786,8 +8791,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         cxxDirectConstructionArgument_ != nullptr
                                         && SoleCxxConstructionPostfix(cxxDirectConstructionArgument_) == ctx
                                         && Compiler(ctx)->IsForeignCxxClassWithConstructors(functionName);
+                                    // T418: an unbound C++ free wrapper is a C++ call too, so a `default` arm joins as it does bound.
                                     const bool cxxCallArgument = funcSym != nullptr ? funcSym->IsCxx
-                                        : Compiler(ctx)->HasCxxFunctionTemplate(functionName)
+                                        : (cxxFreeWrapper && HasDefaultOnlyTernaryArm(argumentExpression))
+                                            || Compiler(ctx)->HasCxxFunctionTemplate(functionName)
                                             || (structVar.BaseType != nullptr
                                                 && Compiler(ctx)->HasCxxFunctionTemplateMember(
                                                     structVar.TypeAndValue.TypeName, primaryIdentifier))
@@ -8944,8 +8951,83 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         cxxCallArgumentExpectedTypeScope(
                                             cxxCallArgumentExpectedType_, cxxCallArgument && byValueExpected
                                                 ? ternaryArgDest : LLVMBackend::TypeAndValue{});
+                                    /*
+                                     * T418: `c ? default : local` into a C++ free or member function evaluates as the
+                                     * C++ conditional itself, inside the wrapper (clang's categories, conversions,
+                                     * overload pick and elision). A directly bound free function keeps its join
+                                     * unless the arm converts.
+                                     */
+                                    // The type `default` builds when argument `index` defers; empty when it cannot.
+                                    auto deferredTypeFor = [&](size_t index, antlr4::ParserRuleContext* expression) {
+                                        std::string placeType;
+                                        if (!IsCxxDeferrableDefaultTernary(expression, placeType)) return std::string();
+                                        std::string parameterType;
+                                        bool parameterAgrees = true;
+                                        auto fit = Compiler(ctx)->functionTable.find(functionName);
+                                        if (fit != Compiler(ctx)->functionTable.end())
+                                            for (const auto& candidate : fit->second)
+                                            {
+                                                const size_t slot = index + paramOffset;
+                                                if (candidate.Parameters.size() != namedArgCtx.size() + paramOffset
+                                                    || slot >= candidate.Parameters.size()
+                                                    || (cxxMemberReceiver && candidate.Parameters.front().TypeName
+                                                        != structVar.TypeAndValue.TypeName))
+                                                    continue;
+                                                const std::string& type = candidate.Parameters[slot].TypeName;
+                                                if (!parameterType.empty() && parameterType != type)
+                                                    parameterAgrees = false;
+                                                parameterType = type;
+                                            }
+                                        const bool wrapperCallee = funcSym == nullptr
+                                            || funcSym->UniqueName.starts_with("__cflat_free_");
+                                        if (funcSym == nullptr)
+                                            return parameterType.empty() ? placeType : std::string();
+                                        if (parameterAgrees && !parameterType.empty()
+                                            && Compiler(ctx)->IsForeignNontrivialCxxClass(parameterType)
+                                            && (wrapperCallee || cxxNonTemplateMemberWrapper
+                                                || parameterType != placeType))
+                                            return parameterType;
+                                        return std::string();
+                                    };
+                                    std::string deferredDefaultType;
+                                    if ((cxxFreeWrapper || cxxNonTemplateMemberWrapper)
+                                        && !cxxConstructorCall && !cxxTemplateWrapper
+                                        && argumentExpression != nullptr
+                                        && (funcSym == nullptr || funcSym->IsCxx)
+                                        // A set holding any function template may dispatch through the template
+                                        // emitter, which takes no deferred shape.
+                                        && !Compiler(ctx)->HasCxxFunctionTemplate(functionName)
+                                        && !(structVar.BaseType != nullptr
+                                            && Compiler(ctx)->HasCxxFunctionTemplateMember(
+                                                structVar.TypeAndValue.TypeName, primaryIdentifier))
+                                        && std::none_of(namedArgCtx.begin(), namedArgCtx.end(),
+                                            [](auto* na) { return na->Identifier() != nullptr; }))
+                                    {
+                                        deferredDefaultType = deferredTypeFor(argIdx, argumentExpression);
+                                        // Sibling `?:` defer together or not at all (a mixed call pays a copy).
+                                        bool siblingTernary = false;
+                                        for (size_t other = 0; other < namedArgCtx.size() && !deferredDefaultType.empty(); ++other)
+                                        {
+                                            if (other == argIdx) continue;
+                                            auto* expression = namedArgCtx[other]->assignmentExpression();
+                                            if (!IsCxxInertCallArgument(expression)
+                                                || (IsCxxTernaryArgument(expression) && deferredTypeFor(other, expression).empty()))
+                                                deferredDefaultType.clear();
+                                            siblingTernary |= IsCxxTernaryArgument(expression);
+                                        }
+                                        if (siblingTernary && !IsCxxInertCallArgument(argumentExpression))
+                                            deferredDefaultType.clear();
+                                    }
                                     auto argNV = ParseCallArgument([&] {
                                         auto* backend = Compiler(ctx);
+                                        if (!deferredDefaultType.empty())
+                                        {
+                                            LLVMBackend::NamedVariable deferred;
+                                            if (!BuildCxxDeferredDefaultTernary(
+                                                    argumentExpression, deferredDefaultType, deferred))
+                                                return LLVMBackend::NamedVariable{};
+                                            return deferred;
+                                        }
                                         if (castDefaultArgSlot == nullptr)
                                             return this->ParseAssignmentExpressionNamed(
                                                 namedArgument->assignmentExpression());
@@ -9069,6 +9151,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.CxxDirectConstructionType = argNV.CxxDirectConstructionType;
                                     argVar.CxxDirectConstructionArguments =
                                         argNV.CxxDirectConstructionArguments;
+                                    argVar.CxxDeferredTernaryShape = argNV.CxxDeferredTernaryShape;
 
                                     if (argName)
                                         argVar.TypeAndValue.VariableName = argName->getText();

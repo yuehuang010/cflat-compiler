@@ -15,6 +15,12 @@ extern int main()
     expect_error("caller-owned C++ closure slot") {
         t28.holdcref(f);
     }
+    expect_error("caller-owned C++ closure slot") {
+        t28.holdpriv(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        t28.holdtup(f);
+    }
     auto byValue = t28.hold(f);
     if (byValue.run(5) != 20) return 1;
     expect_error("caller-owned C++ closure slot") {
@@ -37,6 +43,46 @@ extern int main()
     }
     expect_error("caller-owned C++ closure slot") {
         std.cflat_t28.fwd(move f);
+    }
+    // T419: opaque-blob results (no public field) holding F* / F& through private members.
+    expect_error("caller-owned C++ closure slot") {
+        t28.holdpriv(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        t28.holdnest(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        t28.holdtup(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        t28.holdoptrw(f);
+    }
+    // T419 r3: no depth, width or fact-count cutoff hides the borrowed F*.
+    expect_error("caller-owned C++ closure slot") {
+        t28.holddeep(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        t28.holdwide(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        t28.holdcrowd(f);
+    }
+    // T419 r4: an owner beside a borrowed sibling sharing the same base does not hide the borrow.
+    expect_error("caller-owned C++ closure slot") {
+        t28.holdboxpair(f);
+    }
+    // T419 r5: only std owning templates exempt a visible T*; a user destructor does not.
+    expect_error("caller-owned C++ closure slot") {
+        t28.holdownedbox(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        t28.holddtorborrow(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        t28.holddtorderived(f);
+    }
+    expect_error("caller-owned C++ closure slot") {
+        t28.holddtorouter(f);
     }
     return 0;
 }

@@ -6645,7 +6645,11 @@ void LLVMBackend::EmitScopeArgumentAndLockCleanups(const StackState& frame)
                 if (namedVar.IsMoved && HasTypeAnnotation(namedVar.TypeAndValue.TypeName, "unique")
                     && !IsCoreUniqueType(namedVar.TypeAndValue.TypeName))
                     continue;
-                if (auto* dtor = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
+                if (namedVar.Storage == returnedStructDtorShellAlloca)
+                    EmitConditionalFullDestructor(namedVar, returnedStructDtorShellFunction);
+                else if (namedVar.Storage == returnedStructDtorSkipAlloca)
+                    continue;
+                else if (auto* dtor = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
                     builder->CreateCall(dtor->getFunctionType(), dtor, { namedVar.Storage });
             }
         }

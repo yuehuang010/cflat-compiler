@@ -133,6 +133,8 @@ struct CallT232WSel {
     CallT232WSel(CallT232W a, int b) : value(100 + a.value * 10 + b) {}
     CallT232WSel(const int& a, const char* s) : value(200 + a) {}
 };
+// T416: a converting W pick in call-argument position (the by-value class parameter snapshots x).
+inline int call_t416_wsel_value(CallT232WSel x) { return x.value; }
 struct CallHost {
     int member(CallEvent x) { return x.value + 200; }
     int member_event(CallEvent x, int y) { return x.value * 1000 + y; }
@@ -211,6 +213,46 @@ inline int countedCopyCount() { return countedCopies; }
 inline int countedMoveCount() { return countedMoves; }
 inline int countedDtorCount() { return countedDtors; }
 inline int countedByVal(Counted value) { return value.value; }
+// T416 round 2: a reference ctor reached through a user conversion on another argument keeps the
+// caller's slot; a ctor template beside a variadic ctor leaves the scalar by value (eager snapshot).
+struct T416RefConvertW { int v; T416RefConvertW(int x) : v(x) {} };
+struct T416RefConvert
+{
+    int v;
+    T416RefConvert(int& a, T416RefConvertW b) { a += 10; v = 700 + a + b.v; }
+    T416RefConvert(long, const char*) : v(800) {}
+};
+inline int t416_refconvert_value(T416RefConvert s) { return s.v; }
+template <class T> inline int t416_refconvert_tpl(T416RefConvert s, T) { return s.v; }
+struct T416HasTemplate
+{
+    int v;
+    T416HasTemplate(int a, int b, ...) : v(100 + a * 10 + b) {}
+    template <class T> T416HasTemplate(T*, const char*) : v(200) {}
+};
+inline int t416_has_template_value(T416HasTemplate s) { return s.v; }
+inline int t416_bump(int* x) { return ++*x; }
+// T416 round 3: a ctor template that cannot take this call's argument count does not keep the slot.
+struct T416Arity
+{
+    int v;
+    T416Arity(int a, int b, ...) : v(100 + a * 10 + b) {}
+    template <class T> T416Arity(T&, const char*) : v(200) {}
+};
+inline int t416_arity_value(T416Arity s) { return s.v; }
+// T416 round 4: a pack constructor's fixed `int&` prefix binds the caller slot for any pack length.
+struct T416Pack
+{
+    int v;
+    template <class... A> T416Pack(int& a, A&... rest) : v(200 + (int)sizeof...(A)) { a += 10; }
+};
+inline int t416_pack_value(T416Pack s) { return s.v; }
+struct T416PackTail
+{
+    int v;
+    template <class... A> T416PackTail(A... rest, int& a) : v(200 + (int)sizeof...(A)) { a += 10; }
+};
+inline int t416_pack_tail_value(T416PackTail s) { return s.v; }
 }
 
 // T278 macro: an integer macro constant that fits (clang oracle 1).
