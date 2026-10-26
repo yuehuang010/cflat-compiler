@@ -909,6 +909,11 @@ bool LLVMBackend::IsScopedEnumTypeName(const std::string& name) const
         return !key.empty() && scopedEnumTypes_.count(key) != 0;
 }
 
+const LLVMBackend::FunctionSymbol* LLVMBackend::GetCurrentFunctionSymbol() const
+{
+        return currentFunction == nullptr ? nullptr : GetFunctionSymbol(currentFunction);
+}
+
 std::string LLVMBackend::GetScopedCppEnumeratorHint(const std::string& name) const
 {
         auto it = scopedCppEnumeratorHints_.find(name);
@@ -2861,6 +2866,11 @@ nlohmann::json LLVMBackend::RecordToJson(const CRecordEntry& r, CCachePathTable*
         if (r.isFinal)               j["fin"] = true;
         if (r.isAbstract)            j["abs"] = true;
         if (r.hasFriendOperators)    j["fop"] = true;
+        if (!r.friendNames.empty()) j["fn"] = [&] {
+            std::string packed;
+            for (const std::string& s : r.friendNames) packed += s + "\n";
+            return packed;
+        }();
         if (!r.layoutRefusal.empty()) j["lref"] = r.layoutRefusal;
         // The canonical C++ spelling: a template argument naming this class needs it, so a warm
         // cache that dropped it would refuse `cppt.Box<cppi.Tracked>` the second time around.
@@ -2976,6 +2986,16 @@ LLVMBackend::CRecordEntry LLVMBackend::RecordFromJson(const SjVal& j, const CCac
         r.isFinal               = j.value("fin", false);
         r.isAbstract            = j.value("abs", false);
         r.hasFriendOperators    = j.value("fop", false);
+        {
+            const std::string packed = j.value("fn", std::string{});
+            for (size_t start = 0; start < packed.size();)
+            {
+                size_t end = packed.find('\n', start);
+                if (end == std::string::npos) end = packed.size();
+                r.friendNames.push_back(packed.substr(start, end - start));
+                start = end + 1;
+            }
+        }
         r.layoutRefusal         = j.value("lref", std::string{});
         r.canonicalCtype        = j.value("can", std::string{});
         r.stdOwnedType          = j.value("sown", std::string{});

@@ -1,0 +1,26 @@
+interface T476ErrorIface { int tag(); };
+
+class T476ErrorImpl : T476ErrorIface
+{
+    int tag() { return 476; }
+};
+
+struct T476ErrorBox
+{
+    unique T476ErrorIface i = default;
+};
+
+extern int main()
+{
+    expect_error("cannot initialize unique<T476ErrorIface> 'o' from borrowed value 'w'") {
+        T476ErrorBox w = default;
+        auto o = w.i = new T476ErrorImpl();
+    }
+
+    expect_error("cannot initialize unique<T476ErrorIface> 'o' from borrowed value 'w'") {
+        T476ErrorBox w = default;
+        auto o = (w.i = new T476ErrorImpl());
+    }
+
+    return 0;
+}

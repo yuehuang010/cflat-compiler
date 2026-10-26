@@ -2785,6 +2785,258 @@ void resetRawCountState()
     g_raw_count_slot_dtors = 0;
 }
 
+int runRawOwnerLoopReown()
+{
+    resetRawCountState();
+    {
+        RawCountElem stack;
+        RawCountElem* p = &stack;
+        RawCountElem* raw = nullptr;
+        unique RawCountElem* owner = nullptr;
+        for (int i = 0; i < 2; i++)
+        {
+            raw = p;
+            raw = new RawCountElem();
+            raw->id = i + 1;
+            owner = raw;
+        }
+    }
+    return g_raw_count_dtors * 100 + g_raw_count_sum;
+}
+
+int runRawOwnerLoopNeverBorrowed()
+{
+    resetRawCountState();
+    {
+        RawCountElem* raw = new RawCountElem();
+        raw->id = 1;
+        unique RawCountElem* owner = nullptr;
+        for (int i = 0; i < 2; i++)
+        {
+            owner = raw;
+            raw = new RawCountElem();
+            raw->id = i + 2;
+        }
+        owner = raw;
+    }
+    return g_raw_count_dtors * 100 + g_raw_count_sum;
+}
+
+int runRawOwnerLoopCtorReown()
+{
+    resetRawCountState();
+    {
+        RawCountElem stack;
+        RawCountElem* p = &stack;
+        RawCountElem* raw = nullptr;
+        for (int i = 0; i < 2; i++)
+        {
+            raw = p;
+            raw = new RawCountElem();
+            raw->id = i + 1;
+            unique RawCountElem* owner = raw;
+        }
+    }
+    return g_raw_count_dtors * 100 + g_raw_count_sum;
+}
+
+int runRawOwnerLoopCtorNeverBorrowed()
+{
+    resetRawCountState();
+    {
+        RawCountElem* raw = new RawCountElem();
+        raw->id = 1;
+        for (int i = 0; i < 2; i++)
+        {
+            unique RawCountElem* owner = raw;
+            raw = new RawCountElem();
+            raw->id = i + 2;
+        }
+    }
+    return g_raw_count_dtors * 100 + g_raw_count_sum;
+}
+
+void rawOwnerMoveTake(move RawCountElem* p)
+{
+    delete p;
+}
+
+int runRawOwnerLoopTopReown()
+{
+    resetRawCountState();
+    RawCountElem stack;
+    RawCountElem* p = &stack;
+    RawCountElem* raw = nullptr;
+    {
+        unique RawCountElem* owner = nullptr;
+        for (int i = 0; i < 3; i++)
+        {
+            raw = new RawCountElem();
+            raw->id = i + 1;
+            owner = raw;
+            raw = p;
+        }
+    }
+    raw = nullptr;
+    return g_raw_count_dtors * 100 + g_raw_count_sum;
+}
+
+int runRawOwnerLoopTopCtorReown()
+{
+    resetRawCountState();
+    RawCountElem stack;
+    RawCountElem* p = &stack;
+    RawCountElem* raw = nullptr;
+    for (int i = 0; i < 3; i++)
+    {
+        raw = new RawCountElem();
+        raw->id = i + 1;
+        unique RawCountElem* owner = raw;
+        raw = p;
+    }
+    raw = nullptr;
+    return g_raw_count_dtors * 100 + g_raw_count_sum;
+}
+
+int runRawOwnerLoopIfElseReown()
+{
+    resetRawCountState();
+    RawCountElem stack;
+    RawCountElem* p = &stack;
+    RawCountElem* raw = nullptr;
+    {
+        unique RawCountElem* owner = nullptr;
+        for (int i = 0; i < 3; i++)
+        {
+            if (i == 0) raw = new RawCountElem();
+            else raw = new RawCountElem();
+            raw->id = i + 1;
+            owner = raw;
+            raw = p;
+        }
+    }
+    raw = nullptr;
+    return g_raw_count_dtors * 100 + g_raw_count_sum;
+}
+
+int runRawOwnerLoopNestedReown()
+{
+    resetRawCountState();
+    RawCountElem stack;
+    RawCountElem* p = &stack;
+    RawCountElem* raw = nullptr;
+    {
+        unique RawCountElem* owner = nullptr;
+        for (int i = 0; i < 3; i++)
+        {
+            for (int j = 0; j < 2; j++)
+            {
+                raw = new RawCountElem();
+                raw->id = i * 2 + j + 1;
+                owner = raw;
+                raw = p;
+            }
+        }
+    }
+    raw = nullptr;
+    return g_raw_count_dtors * 100 + g_raw_count_sum;
+}
+
+int runRawOwnerLoopNestedOuterAssignReown()
+{
+    resetRawCountState();
+    RawCountElem stack;
+    RawCountElem* p = &stack;
+    RawCountElem* raw = nullptr;
+    {
+        unique RawCountElem* owner = nullptr;
+        for (int i = 0; i < 3; i++)
+        {
+            raw = nullptr;
+            for (int j = 0; j < 2; j++)
+            {
+                raw = new RawCountElem();
+                raw->id = i * 2 + j + 1;
+                owner = raw;
+                raw = p;
+            }
+        }
+    }
+    raw = nullptr;
+    return g_raw_count_dtors * 100 + g_raw_count_sum;
+}
+
+int runRawOwnerConsumeThenBorrowReset()
+{
+    resetRawCountState();
+    RawCountElem stack;
+    RawCountElem* p = &stack;
+    RawCountElem* raw = new RawCountElem();
+    raw->id = 1;
+    {
+        unique RawCountElem* owner = nullptr;
+        owner = raw;
+        raw = p;
+    }
+    return g_raw_count_dtors * 100 + g_raw_count_sum;
+}
+
+int runRawOwnerConsumeThenBorrowCtor()
+{
+    resetRawCountState();
+    RawCountElem stack;
+    RawCountElem* p = &stack;
+    RawCountElem* raw = new RawCountElem();
+    raw->id = 1;
+    {
+        unique RawCountElem* owner = raw;
+        raw = p;
+    }
+    return g_raw_count_dtors * 100 + g_raw_count_sum;
+}
+
+int runRawOwnerConsumeThenBorrowMoveAssign()
+{
+    resetRawCountState();
+    RawCountElem stack;
+    RawCountElem* p = &stack;
+    RawCountElem* raw = new RawCountElem();
+    raw->id = 1;
+    {
+        unique RawCountElem* owner = nullptr;
+        owner = move raw;
+        raw = p;
+    }
+    return g_raw_count_dtors * 100 + g_raw_count_sum;
+}
+
+int runRawOwnerConsumeThenBorrowMoveParam()
+{
+    resetRawCountState();
+    RawCountElem stack;
+    RawCountElem* p = &stack;
+    RawCountElem* raw = new RawCountElem();
+    raw->id = 1;
+    rawOwnerMoveTake(move raw);
+    raw = p;
+    return g_raw_count_dtors * 100 + g_raw_count_sum;
+}
+
+int runRawOwnerConsumeThenBorrowResetCall()
+{
+    resetRawCountState();
+    RawCountElem stack;
+    RawCountElem* p = &stack;
+    RawCountElem* raw = new RawCountElem();
+    raw->id = 1;
+    {
+        unique<RawCountElem> owner;
+        owner.reset(raw);
+        raw = p;
+    }
+    return g_raw_count_dtors * 100 + g_raw_count_sum;
+}
+
 // `unique<T>` owns a single object, so the counted heap-array shapes below live on a raw `T*`
 // local and are released through a `move T*` sink - the count still travels with the pointer,
 // which is exactly what these tests pin.
@@ -4381,6 +4633,35 @@ int testRawArrayRuntimeCount()
     }
     passed += Test("raw count later assignment order", g_raw_count_order, 321);
 
+    passed += Test("raw owner loop re-owns before consume and destructs once",
+                   runRawOwnerLoopReown(), 303);
+    passed += Test("raw owner loop without a borrow destructs once",
+                   runRawOwnerLoopNeverBorrowed(), 306);
+    passed += Test("raw owner constructor loop re-owns before consume",
+                   runRawOwnerLoopCtorReown(), 303);
+    passed += Test("raw owner constructor loop without a borrow",
+                   runRawOwnerLoopCtorNeverBorrowed(), 306);
+    passed += Test("raw owner loop re-owns before reset sink",
+                   runRawOwnerLoopTopReown(), 306);
+    passed += Test("raw owner loop re-owns before constructor sink",
+                   runRawOwnerLoopTopCtorReown(), 306);
+    passed += Test("raw owner loop re-owns on both if arms",
+                   runRawOwnerLoopIfElseReown(), 306);
+    passed += Test("raw owner nested loop re-owns before sink",
+                   runRawOwnerLoopNestedReown(), 621);
+    passed += Test("raw owner nested loop re-owns after an outer assignment",
+                   runRawOwnerLoopNestedOuterAssignReown(), 621);
+    passed += Test("unique reset clears consumed raw own flag",
+                   runRawOwnerConsumeThenBorrowReset(), 101);
+    passed += Test("unique constructor clears consumed raw own flag",
+                   runRawOwnerConsumeThenBorrowCtor(), 101);
+    passed += Test("unique move assignment clears consumed raw own flag",
+                   runRawOwnerConsumeThenBorrowMoveAssign(), 101);
+    passed += Test("move parameter clears consumed raw own flag",
+                   runRawOwnerConsumeThenBorrowMoveParam(), 101);
+    passed += Test("unique reset call clears consumed raw own flag",
+                   runRawOwnerConsumeThenBorrowResetCall(), 101);
+
     resetRawCountState();
     {
         RawCountElem* values = nullptr;
@@ -4930,7 +5211,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 101;
+    r = testRawArrayRuntimeCount(); passed += r; total += 115;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 89;

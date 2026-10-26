@@ -1,0 +1,8 @@
+expect_error("call to non-static member function 'm' without an object argument") {
+    struct T471StaticInstanceCall
+    {
+        int m(int k) { return k + 10; }
+        static int g() { return m(5); }
+    };
+    int m(int k) { return k + 20; }
+}

@@ -4254,6 +4254,10 @@ public:
     static constexpr uint8_t OwnFlagLoopIncrementFrame = 8;
     // Records the innermost loop's view-rebind names on its frame (see FindLoopViewRebindTargets).
     void NoteLoopViewAssignments(const std::unordered_set<std::string>& names);
+    void RecordUniqueOwnerLoopSink(const NamedVariable& source, const std::string& uniqueType,
+                                   const std::string& destination, bool isReset);
+    void RecordMoveOwnerLoopSink(const NamedVariable& source, const std::string& function,
+                                 const std::string& parameter);
     void CheckOwnFlagLoopBackEdge();
 private:
     std::string cppStandard_ = "c++20";
@@ -4277,6 +4281,8 @@ private:
     std::vector<uint8_t> ownFlagControlKind_;
     uint64_t nextOwnFlagControlFrameId_ = 1;
     std::unordered_set<const llvm::Value*> ownFlagDefinitelyReowned_;
+    std::unordered_set<const llvm::Value*> loopIterationAssigned_;
+    bool AssignedSinceLoopEntry(size_t frameIndex, const llvm::Value* storage) const;
     struct OwnFlagLoopReownFrame
     {
         struct MoveSinkView
@@ -4288,16 +4294,40 @@ private:
             size_t Line = 0;
             size_t Column = 0;
         };
+        struct UniqueOwnerSink
+        {
+            const llvm::Value* Storage = nullptr;
+            std::string UniqueType;
+            std::string Destination;
+            bool IsReset = true;
+            std::string File;
+            size_t Line = 0;
+            size_t Column = 0;
+        };
+        struct MoveOwnerSink
+        {
+            const llvm::Value* Storage = nullptr;
+            std::string Parameter;
+            std::string Function;
+            std::string File;
+            size_t Line = 0;
+            size_t Column = 0;
+        };
         std::unordered_set<const llvm::Value*> entrySnapshot;
         std::unordered_set<const llvm::Value*> exitIntersection;
+        std::unordered_set<const llvm::Value*> entryAssigned;
+        std::unordered_set<const llvm::Value*> exitAssignedIntersection;
         bool isDoWhile = false;
         bool hasIncrement = false;
         bool hasExitState = false;
+        bool hasExitAssigned = false;
         // Scope-stack depth at loop entry: a view slot in a deeper frame is declared per iteration.
         size_t scopeDepth = 0;
         // Names the loop body rebinds by anything other than a bare `new` (may carry a borrow).
         std::unordered_set<std::string> nonNewViewAssigns;
         std::vector<MoveSinkView> moveSinkViews;
+        std::vector<UniqueOwnerSink> uniqueOwnerSinks;
+        std::vector<MoveOwnerSink> moveOwnerSinks;
     };
     std::vector<OwnFlagLoopReownFrame> ownFlagLoopReownSnapshots_;
 
@@ -4578,6 +4608,7 @@ private:
         // Clang's deleting-destructor verdict ("" = usable); see RawRecord::vtableDeleteVerdict.
         std::string vtableDeleteVerdict;
         bool hasFriendOperators = false;   // a friend operator: ADL may find what was not registered
+        std::vector<std::string> friendNames;   // see RawRecord::friendNames
         std::vector<cflat_cinterop::RawCxxBase> bases;
         std::vector<cflat_cinterop::RawCxxBase> virtualBases;   // see RawRecord::virtualBases
         std::string layoutRefusal;
@@ -6873,6 +6904,9 @@ private:
                                 bool adlCall = false,
                                 const std::vector<std::pair<size_t, size_t>>& braceGroups = {},
                                 const std::string& memberOwnerType = {});
+    std::string CxxConstPointerArgumentError(size_t argumentIndex,
+                                             const std::string& argumentName,
+                                             const std::string& parameterName) const;
     /*
      * A free C++ call with brace-list arguments and no bound declaration (std.max({3, 9, 4})):
      * each list's elements become wrapper parameters and the wrapper writes the list back as
@@ -7676,6 +7710,10 @@ public:
     bool HasCxxClassTemplate(const std::string& baseName) const;
     bool CompleteCxxTemplateTypeArgs(const std::string& baseName,
                                      std::vector<std::string>& typeArgs);
+    // Resolve a bare CFlat generic-base alias to its all-defaulted C++ class specialization.
+    bool TryResolveDefaultedCxxGenericBaseAlias(const std::string& alias,
+                                                std::string& resolvedType,
+                                                std::string& error);
     void PushLexicalLocalTypeScope() { activeLexicalLocalTypeNames_.emplace_back(); }
     void PopLexicalLocalTypeScope()
     {
@@ -9783,6 +9821,8 @@ public:
     // set may still be used through a pointer; only by-value crossings consult it.
     std::set<std::string> cxxTriviallyCopyableRecords_;
     std::set<std::string> cxxRecords_;
+    // Simple names of every friend function of a stored C++ record: the ADL-only candidates.
+    std::set<std::string> cxxFriendNames_;
     // Synthetic anonymous-member records whose clang-offset layout failed verification;
     // the enclosing C++ record refuses with the detail.
     std::map<std::string, std::string> cxxAnonLayoutRefusals_;
@@ -9994,6 +10034,10 @@ public:
                                                 const std::string& methodName,
                                                 const std::vector<TypeAndValue>& params);
     bool IsCxxRecord(const std::string& typeName) const { return cxxRecords_.count(typeName) != 0; }
+    bool IsCxxFriendName(const std::string& simpleName) const
+    {
+        return cxxFriendNames_.count(simpleName) != 0;
+    }
     // A C++ class object (not a pointer or reference to one) that is itself const.
     bool IsCxxConstClassObject(const TypeAndValue& t) const
     {
@@ -11636,7 +11680,9 @@ public:
                                               bool postfixMemberCall = false,
                                               const std::string& enclosingFunctionName = {},
                                               bool allowOperatorAliasReturnStringTemp = false,
-                                              llvm::Value* operatorReceiverStorage = nullptr);
+                                              llvm::Value* operatorReceiverStorage = nullptr,
+                                              const NamedVariable* implicitReceiver = nullptr,
+                                              const std::vector<std::string>& lexicalAggregateScopes = {});
 
     llvm::Function* GetFunction(const std::string& functionName);
 
@@ -12139,6 +12185,7 @@ public:
     {
         std::unordered_map<const llvm::Value*, std::vector<uint64_t>> mayBeFalsePaths;
         std::unordered_set<const llvm::Value*> definitelyReowned;
+        std::unordered_set<const llvm::Value*> loopIterationAssigned;
         // Array-view slots owned on this arm without a re-own event (e.g. an owning declaration).
         std::unordered_set<const llvm::Value*> ownedViewSlots;
         // Subset of ownedViewSlots declared inside the innermost loop's current iteration.
@@ -12864,6 +12911,7 @@ public:
     std::string DefinitionSitePath() const;
 
     std::string GetCurrentFunctionName() const;
+    const FunctionSymbol* GetCurrentFunctionSymbol() const;
 
     void RegisterReturnBlock(const std::string& name, CFlatParser::CompoundStatementContext* body, std::vector<DeclTypeAndValue> params, TypeAndValue returnType);
 
@@ -13379,9 +13427,9 @@ public:
     // 277: user-declared defaulted trivial copy assignment is harvested as usable (T417).
     // 283: namespace-scope variable-template names are cached for C++ conflict checks (T436).
     // 284: C++ alias-template parameter-pack flags are cached per parameter (T458 r2).
-    // 285: reserved for T460. 286: [cpp] struct wrapper spellings use an injective CFlat-name
-    // encoding (T464).
-    static constexpr int kCHeaderCacheVersion = 286;
+    // 285: unused. 286: [cpp] struct wrapper spellings use an injective CFlat-name
+    // encoding (T464). 287: free operator built-in conversion candidates (T460).
+    static constexpr int kCHeaderCacheVersion = 287;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. ON by

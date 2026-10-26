@@ -1,9 +1,15 @@
-# Ternary arm lvalue leftovers after T325: scalar postfix arm binds the slot; string literal arms bind char*&
+# Ternary arm lvalue leftover after T475: string-literal arms bind a C++ `const char*&` parameter
 
-Found by T325 review 1 (2026-10-16), both PRE-EXISTING on master.
-- `ibump(t ? i++ : j)` (C++ `int&` param) binds `i` itself (i ends at 2); clang refuses (`i++` is a prvalue). The arm-storage
-  load fallback in MainListener_Expressions.cpp (ternary arms, "An arm value loaded from storage keeps that storage") takes
-  the slot of a load that is followed by a store to the same slot. T325 guards only its pointer join (loadSlotRewrittenAfter);
-  the scalar join (scalarLvalueJoin) needs the same guard, minus explicit `move` arms (they also store the source).
-- `cbump(t ? "ab" : "cd")` with a C++ `const char*&` param is accepted; clang refuses.
-  Note: a false-arm postfix store is queued in PlusPlus until the arm's postfix flush (not yet emitted at the scan) - T325 checks PlusPlus.count(slot) too; copy both checks.
+Found by T325 review 1 (2026-10-16), PRE-EXISTING on master. T475 (2026-10-24) fixed the scalar postfix arm
+(`ibump(t ? i++ : j)`, `t ? j : i++`, `t ? i-- : j` now refused like clang; legs Test/errors/err_cpp_ternary_prvalue_arm_lvalue_ref.cb).
+
+Still open: `cbump(t ? "ab" : "cd")` with a C++ `void cbump(const char*& r)` (Test/library/cpp_t67_postinc.hpp) is
+accepted; clang refuses (array-to-pointer conversion makes the conditional a pointer prvalue). Master passes the pointer
+PHI through `%cxx.refptr.arg`. T475 tried marking a pointer join with a string-literal arm as a prvalue (sourceType
+`const char*`, fresh) in ParseTernaryBranches near the storage-join publish; no diagnostic fired after three attempts -
+the C++ reference-argument binder (`cxx.refptr.arg` path) does not consult that flag. Fix direction: find where a
+pointer rvalue is materialized into `cxx.refptr.arg` for a `T*&` parameter and refuse a non-lvalue (no storage) source
+there, the way plain `cbump("ab")` is refused (probe that first).
+
+Also open (T475 review, PRE-EXISTING): `int* p = &(t ? i++ : j);` takes the address of `i` (master and T475); clang refuses
+("cannot take the address of an rvalue"). The `&` path does not go through scalarLvalueJoin.

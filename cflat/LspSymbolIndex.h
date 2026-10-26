@@ -39,6 +39,15 @@ struct FunctionRange
     int endLine = 0;
 };
 
+struct ResolvedCallReference
+{
+    std::string file;
+    int line = 0;
+    int column = 0;
+    int length = 0;
+    std::string targetName;
+};
+
 // A definition that is a candidate for the "unused code" check. Recorded during
 // analysis at each declaration site; consumed post-analysis by the LSP server,
 // which cross-references it against an identifier-occurrence scan of the document.
@@ -65,6 +74,10 @@ public:
     void RegisterDefinition(const SymbolDef& def);
     void RegisterFunctionRange(const std::string& name, const std::string& file,
                                int startLine, int endLine);
+    void RegisterResolvedCall(const std::string& file, int line, int column,
+                              int length, const std::string& targetName);
+    const SymbolDef* LookupResolvedCall(const std::string& file, int line,
+                                        int column) const;
     void MergeFrom(const LspSymbolIndex& other);
     void MergeVariablesFrom(const LspSymbolIndex& other);
     const SymbolDef* Lookup(const std::string& name) const;
@@ -110,6 +123,7 @@ private:
     std::unordered_map<std::string, SymbolDef> symbols_;
     std::unordered_map<std::string, std::vector<std::string>> displayNameKeys_;
     std::vector<FunctionRange> functionRanges_;
+    std::vector<ResolvedCallReference> resolvedCalls_;
     std::unordered_map<std::string, VariableInfo> variables_;
     std::unordered_map<std::string, std::vector<VariableInfo>> variableLocations_;
     std::vector<UnusedCandidate> candidates_;

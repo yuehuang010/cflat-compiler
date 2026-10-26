@@ -90,6 +90,7 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
     std::vector<char> initializerUnsigned;
     std::vector<char> initializedInPlace;
     std::vector<char> skippedOverride;
+    std::vector<llvm::Value*> fieldDestinations(fields.size(), nullptr);
     std::unordered_set<std::string> skippedFields;
     // `f = {}` fields the seed builds itself (below), from their type alone.
     std::unordered_set<std::string> emptyBraceFields;
@@ -185,6 +186,7 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
         if (destination != nullptr && fieldIndex < structType->getNumElements())
             fieldDestination = compiler->builder->CreateStructGEP(
                 structType, destination, (unsigned)fieldIndex, field.VariableName);
+        fieldDestinations[fieldIndex] = fieldDestination;
         // A native ctor that may capture `this` builds the child in its field slot too
         // (one ctor call or `= default`), never a temporary copied in.
         const bool nativeFieldCtor = !compiler->ReturnsViaInPlaceSret(field.TypeName)
@@ -341,10 +343,21 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                 || fi->Identifier()->getText() != field.VariableName
                 || fi->initializerList() == nullptr)
                 continue;
-            const bool fieldAlreadyBuilt = field.ConstArraySize > 0 && !field.Pointer
-                && !field.ElemPointer && !field.IsArrayView;
-            EmitFieldInitializer(destination, structName, braceOverrides, !fieldAlreadyBuilt,
-                                 &field.VariableName);
+            if (field.ConstArraySize == 0 && fieldIndex < fieldDestinations.size()
+                && fieldDestinations[fieldIndex] != nullptr)
+            {
+                auto* fieldDestination = fieldDestinations[fieldIndex];
+                EmitFieldInitializer(fieldDestination, field.TypeName, fi->initializerList(),
+                                     false, nullptr, false,
+                                     fieldDestination, &field.TypeName);
+            }
+            else
+            {
+                const bool fieldAlreadyBuilt = field.ConstArraySize > 0 && !field.Pointer
+                    && !field.ElemPointer && !field.IsArrayView;
+                EmitFieldInitializer(destination, structName, braceOverrides, !fieldAlreadyBuilt,
+                                     &field.VariableName);
+            }
             return;
         }
     };

@@ -1257,6 +1257,9 @@ void LLVMBackend::EnterOwnershipControlRegion(uint8_t frameKind)
         {
             OwnFlagLoopReownFrame frame;
             frame.entrySnapshot = ownFlagDefinitelyReowned_;
+            frame.entryAssigned = loopIterationAssigned_;
+            // Each loop tracks its own iteration; the enclosing state comes back on leave.
+            loopIterationAssigned_.clear();
             frame.isDoWhile = (frameKind & OwnFlagDoWhileFrame) != 0;
             frame.hasIncrement = (frameKind & OwnFlagLoopIncrementFrame) != 0;
             frame.scopeDepth = stackNamedVariable.size();
@@ -1271,6 +1274,10 @@ void LLVMBackend::LeaveOwnershipControlRegion()
             && !ownFlagLoopReownSnapshots_.empty())
         {
             const auto& frame = ownFlagLoopReownSnapshots_.back();
+            loopIterationAssigned_ = frame.entryAssigned;
+            if (frame.isDoWhile && frame.hasExitAssigned)
+                loopIterationAssigned_.insert(frame.exitAssignedIntersection.begin(),
+                                              frame.exitAssignedIntersection.end());
             if (frame.isDoWhile && frame.hasExitState)
             {
                 ownFlagDefinitelyReowned_ = frame.exitIntersection;
@@ -1307,6 +1314,21 @@ void LLVMBackend::RecordOwnFlagLoopExitState()
         if (!frame.isDoWhile) return;
 
         auto state = SaveOwnFlagJoinState();
+        if (!frame.hasExitAssigned)
+        {
+            frame.exitAssignedIntersection = state.loopIterationAssigned;
+            frame.hasExitAssigned = true;
+        }
+        else
+        {
+            for (auto it = frame.exitAssignedIntersection.begin();
+                 it != frame.exitAssignedIntersection.end();)
+            {
+                if (!state.loopIterationAssigned.contains(*it))
+                    it = frame.exitAssignedIntersection.erase(it);
+                else ++it;
+            }
+        }
         if (!frame.hasExitState)
         {
             frame.exitIntersection = std::move(state.definitelyReowned);
@@ -1355,6 +1377,7 @@ LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::SaveOwnFlagJoinState()
             ? builder->GetInsertBlock()->getParent() : nullptr;
         for (const auto& viewState : nonLocalViewOwnershipStates_)
             if (viewState.Function == activeFunction) state.nonLocalViews.push_back(viewState);
+        state.loopIterationAssigned = loopIterationAssigned_;
         for (auto it = ownFlagDefinitelyReowned_.begin(); it != ownFlagDefinitelyReowned_.end();)
         {
             if (activeViewSlots.contains(*it))
@@ -1389,6 +1412,7 @@ void LLVMBackend::RestoreOwnFlagJoinState(const OwnFlagJoinSnapshot& state)
             if (viewState.Function == activeFunction)
                 nonLocalViewOwnershipStates_.push_back(viewState);
         ownFlagDefinitelyReowned_ = state.definitelyReowned;
+        loopIterationAssigned_ = state.loopIterationAssigned;
 }
 
 LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::MergeOwnFlagJoinStates(
@@ -1396,6 +1420,9 @@ LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::MergeOwnFlagJoinStates(
         bool keepMayBeFalse) const
 {
         OwnFlagJoinSnapshot merged;
+        for (const auto* storage : first.loopIterationAssigned)
+            if (second.loopIterationAssigned.contains(storage))
+                merged.loopIterationAssigned.insert(storage);
         for (const auto* storage : first.definitelyReowned)
             if (second.definitelyReowned.contains(storage))
                 merged.definitelyReowned.insert(storage);
@@ -1516,6 +1543,114 @@ void LLVMBackend::NoteLoopViewAssignments(const std::unordered_set<std::string>&
 {
         if (ownFlagLoopReownSnapshots_.empty()) return;
         ownFlagLoopReownSnapshots_.back().nonNewViewAssigns = names;
+}
+
+void LLVMBackend::RecordUniqueOwnerLoopSink(const NamedVariable& source,
+        const std::string& uniqueType, const std::string& destination, bool isReset)
+{
+        if (source.Storage == nullptr || !source.TypeAndValue.Pointer
+            || source.TypeAndValue.IsArrayView || !source.FieldName.empty()
+            || !llvm::isa<llvm::AllocaInst>(source.Storage)
+            || ownFlagLoopReownSnapshots_.empty())
+            return;
+
+        size_t scopeIndex = 0;
+        bool hasScope = false;
+        for (size_t i = 0; i < stackNamedVariable.size() && !hasScope; ++i)
+        {
+            const auto& scope = stackNamedVariable[i];
+            for (const auto& [name, variable] : scope.functionArgument)
+                if (variable.Storage == source.Storage)
+                {
+                    scopeIndex = i;
+                    hasScope = true;
+                    break;
+                }
+            if (hasScope) break;
+            for (const auto& [name, variable] : scope.namedVariable)
+                if (variable.Storage == source.Storage)
+                {
+                    scopeIndex = i;
+                    hasScope = true;
+                    break;
+                }
+        }
+        if (!hasScope) return;
+
+        for (size_t k = 0; k < ownFlagLoopReownSnapshots_.size(); ++k)
+        {
+            auto& frame = ownFlagLoopReownSnapshots_[k];
+            if (scopeIndex >= frame.scopeDepth) continue;
+            if (AssignedSinceLoopEntry(k, source.Storage))
+                continue;
+            const bool duplicate = std::ranges::any_of(frame.uniqueOwnerSinks,
+                [&](const auto& sink) {
+                    return sink.Storage == source.Storage && sink.Line == currentLine
+                        && sink.Column == currentColumn && sink.Destination == destination
+                        && sink.IsReset == isReset;
+                });
+            if (!duplicate)
+                frame.uniqueOwnerSinks.push_back({ source.Storage, uniqueType, destination,
+                    isReset, sourceFileName, currentLine, currentColumn });
+        }
+}
+
+// Assigned in loop frame k's current iteration: the live set plus what each deeper loop saved on entry.
+bool LLVMBackend::AssignedSinceLoopEntry(size_t frameIndex, const llvm::Value* storage) const
+{
+        if (loopIterationAssigned_.contains(storage)) return true;
+        for (size_t k = frameIndex + 1; k < ownFlagLoopReownSnapshots_.size(); ++k)
+            if (ownFlagLoopReownSnapshots_[k].entryAssigned.contains(storage)) return true;
+        return false;
+}
+
+void LLVMBackend::RecordMoveOwnerLoopSink(const NamedVariable& source,
+        const std::string& function, const std::string& parameter)
+{
+        if (source.Storage == nullptr || !source.TypeAndValue.Pointer
+            || source.TypeAndValue.IsArrayView || source.TypeAndValue.IsFunctionPointer
+            || !source.FieldName.empty() || !llvm::isa<llvm::AllocaInst>(source.Storage)
+            || ownFlagLoopReownSnapshots_.empty())
+            return;
+
+        size_t scopeIndex = 0;
+        bool hasScope = false;
+        for (size_t i = 0; i < stackNamedVariable.size() && !hasScope; ++i)
+        {
+            const auto& scope = stackNamedVariable[i];
+            for (const auto& [name, variable] : scope.functionArgument)
+                if (variable.Storage == source.Storage)
+                {
+                    scopeIndex = i;
+                    hasScope = true;
+                    break;
+                }
+            if (hasScope) break;
+            for (const auto& [name, variable] : scope.namedVariable)
+                if (variable.Storage == source.Storage)
+                {
+                    scopeIndex = i;
+                    hasScope = true;
+                    break;
+                }
+        }
+        if (!hasScope) return;
+
+        for (size_t k = 0; k < ownFlagLoopReownSnapshots_.size(); ++k)
+        {
+            auto& frame = ownFlagLoopReownSnapshots_[k];
+            if (scopeIndex >= frame.scopeDepth || AssignedSinceLoopEntry(k, source.Storage))
+                continue;
+            const bool duplicate = std::ranges::any_of(frame.moveOwnerSinks,
+                [&](const auto& sink) {
+                    return sink.Storage == source.Storage && sink.Line == currentLine
+                        && sink.Column == currentColumn && sink.Function == function
+                        && sink.Parameter == parameter;
+                });
+            if (!duplicate)
+                frame.moveOwnerSinks.push_back({ source.Storage, parameter, function,
+                    sourceFileName, currentLine, currentColumn });
+        }
 }
 
 void LLVMBackend::ReanchorOwnFlagJoinsOutOf(uint8_t targetKinds)

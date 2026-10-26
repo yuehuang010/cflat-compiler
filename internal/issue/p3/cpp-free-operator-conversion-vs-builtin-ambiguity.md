@@ -1,15 +1,36 @@
-# Free C++ operator via user conversion is not ranked against built-in candidates
+# Imported enum free operator resolution
 
-Found: T219 Opus review 1 (2026-10-14). `A` has `operator int()`; `B(const A&)`; free `int operator+(const B&, int)`;
-`a + 1`. clang++ -std=c++20: ambiguous (error). master: compiles, built-in route (rc 6). T219: compiles, free operator
-via the B conversion (rc 7). Both accept code clang refuses; T219 changed the value master produced.
-Repro + clang twin: scratch/repro_keep/t219_rev/c02_builtin_vs_free/.
+Remaining T460 item after fixing the original free-operator ambiguity, hidden-friend visibility,
+and global-namespace lookup cases.
 
-Also pre-existing (same review): hidden friends are published as namespace-scope functions (CClangExtract.cpp
-~2075-2082), so they are found without ADL - c06c (exact types) clang refuses, master/T219 return 52; c06a (needs a
-conversion) clang refuses, master refuses, T219 returns 51. A global-namespace free operator over namespaced operands
-is not found (c07d: clang 64, cflat "no operator").
+## Repro
 
-Fix direction: when a free candidate needs a user conversion on a class operand whose class also converts implicitly
-to a scalar that a built-in operator accepts, refuse as ambiguous (clang's built-in candidate set); publish hidden
-friends as ADL-only (reachable only when their class is an operand).
+`Test/library/cpp_interop_scoped_enum.h` defines `cppi_scope::PlainN` and free operators on other
+types in the same namespace. The expression below must use the built-in enum arithmetic and fold
+to 3:
+
+```cflat
+import cpp "library/cpp_interop_scoped_enum.h";
+enum T45Fold : int { Unscoped = cppi_scope.PN_TWO + 1 };
+```
+
+The C++ operator probe is `scratch/t460/enum_operator/m.cb` with twin
+`scratch/t460/enum_operator/o.cpp`: an overloaded `operator+(E, int)` should produce 25. On the
+measured master, it compiles but returns 5; clang++ -std=c++20 returns 25. Experimental enum
+support in this run returned 25 but regressed the constant-expression repro above, so it was
+withdrawn after three unsuccessful fixes.
+
+## Root cause
+
+`cflat/MainListener_Expressions.cpp`, `tryFreeOperator`: enum values have scalar LLVM types and no
+`StructType` name. The current early return excludes them from free-operator lookup. When that gate
+is widened, candidate binding must use the resolved enum identity (`lhsTypeName` / `rhsTypeName`),
+not the empty `leftInfo.second` / `rightInfo.second` values. The empty source name is treated as a
+wildcard by the class-operand binder, so unrelated class overloads are marked viable and produce a
+false no-overload diagnostic instead of letting built-in enum arithmetic fold.
+
+## Fix direction
+
+Add enum operands to free-operator lookup while preserving their resolved enum identity in
+candidate binding. Only send clang a wrapper request when an enum overload candidate can bind; a
+built-in enum expression in a constant-expression context must stay on the native folding path.

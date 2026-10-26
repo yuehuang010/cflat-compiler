@@ -2,6 +2,18 @@
 #include <llvm/Support/SaveAndRestore.h>
 #include <functional>
 
+struct BraceArgumentUnwindScope
+{
+    std::function<void()> release;
+    ~BraceArgumentUnwindScope() { Release(); }
+    void Release()
+    {
+        if (!release) return;
+        auto action = std::move(release);
+        action();
+    }
+};
+
 // True when the postfix node is the operand of a unary `*` (through pass-through unary and cast
 // wrappers). Parse-tree shape only; the operator token decides, never the expression text.
 static bool IsDerefOperandChain(antlr4::tree::ParseTree* node)
@@ -1663,6 +1675,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             // root function: the following call must resolve at root (skip the enclosing-namespace
             // walk). Consumed and cleared by the call dispatch so chained calls do not inherit it.
             bool globalScopeCall = false;
+            bool qualifiedCallPending = false;
             // Storage restored from a parenthesized primary must remain available to ++/--
             // while the suffix walk consumes the restored value.
             llvm::Value* parenthesizedPostfixStorage = nullptr;
@@ -2672,6 +2685,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
 
                         if (!namespaceContext.empty())
                         {
+                            qualifiedCallPending = true;
                             // "$global$:<alias>" sentinel: file-scoped import alias.
                             // Resolve Alias.Symbol -> Symbol only if Symbol is a member of that alias.
                             bool isFileAlias = namespaceContext.starts_with("$global$:");
@@ -4188,14 +4202,52 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // A VARIABLE of the same name shadows a namespace; without this the
                             // primary yielded an EMPTY NamedVariable with no diagnostic. A FIELD of
                             // the enclosing struct, read bare through the implicit 'this', counts.
-                            const bool nameIsVariable =
+                            const bool localTypeMember = followedByDot && localTypeShadowsValue;
+                            const bool localOrMemberVariable =
                                 Compiler(ctx)->GetLocalVariable(idName).Storage != nullptr
                                 || Compiler(ctx)->GetFunctionArgument(idName).GetValue() != nullptr
-                                || Compiler(ctx)->HasMemberVariable(idName)
-                                || Compiler(ctx)->GetGlobalVariableNV(idName).Storage != nullptr;
-                            const bool localTypeMember = followedByDot && localTypeShadowsValue;
-                            if ((Compiler(ctx)->IsNamespace(idName) || Compiler(ctx)->IsCxxNamespace(idName))
-                                && (!nameIsVariable || localTypeMember))
+                                || Compiler(ctx)->HasMemberVariable(idName);
+                            const bool globalVariable =
+                                Compiler(ctx)->GetGlobalVariableNV(idName).Storage != nullptr;
+                            const bool nameIsVariable = localOrMemberVariable || globalVariable;
+                            // The alias checks below also yield to a namespaced global of the name; the
+                            // namespace-vs-variable decision keeps master's rule above.
+                            const bool aliasNameIsVariable = nameIsVariable
+                                || Compiler(ctx)->GetGlobalVariableNV(
+                                    Compiler(ctx)->ResolveQualifiedName(idName)).Storage != nullptr;
+                            bool defaultedCxxBaseAlias = false;
+                            if (followedByCall && !aliasNameIsVariable
+                                && Compiler(ctx)->IsGenericBaseAlias(idName))
+                            {
+                                const std::string aliasBase =
+                                    Compiler(ctx)->ResolveGenericBaseAlias(idName);
+                                std::vector<std::string> defaultArgs;
+                                defaultedCxxBaseAlias = Compiler(ctx)->HasCxxClassTemplate(aliasBase)
+                                    && Compiler(ctx)->CompleteCxxTemplateTypeArgs(aliasBase, defaultArgs);
+                            }
+                            bool namesEnclosingMethod = false;
+                            if (!localOrMemberVariable && followedByCall && !followedByDot)
+                            {
+                                auto methods = Compiler(ctx)->functionTable.find(idName);
+                                if (methods != Compiler(ctx)->functionTable.end())
+                                    for (const auto& scope : EnclosingAggregateScopesForCall(
+                                             Compiler(ctx), parseTree))
+                                    {
+                                        if (scope.Definition == nullptr) continue;
+                                        namesEnclosingMethod = std::any_of(
+                                            methods->second.begin(), methods->second.end(),
+                                            [&](const LLVMBackend::FunctionSymbol& candidate) {
+                                                return candidate.IsMethod
+                                                    && !candidate.Parameters.empty()
+                                                    && candidate.Parameters.front().TypeName
+                                                        == scope.Name;
+                                            });
+                                        if (namesEnclosingMethod) break;
+                                    }
+                            }
+                            if (!namesEnclosingMethod
+                                && (Compiler(ctx)->IsNamespace(idName) || Compiler(ctx)->IsCxxNamespace(idName))
+                                && (!nameIsVariable || localTypeMember) && !defaultedCxxBaseAlias)
                             {
                                 namespaceContext = Compiler(ctx)->IsCxxNamespace(idName)
                                     ? idName : Compiler(ctx)->ResolveNamespace(idName);
@@ -4205,6 +4257,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             else if (prevPrimary->genericIdentifier()->genericTypeParameters() == nullptr
                                      && Compiler(ctx)->IsDataStructure(
                                          Compiler(ctx)->ResolveQualifiedName(prevPrimary->getText()))
+                                     && !namesEnclosingMethod
                                      && (localTypeMember
                                          || (Compiler(ctx)->GetLocalVariable(idName).Storage == nullptr
                                              && Compiler(ctx)->GetFunctionArgument(idName).GetValue() == nullptr
@@ -4218,22 +4271,59 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             }
                             else
                             {
-                                namedVar.Primary = ParsePrimaryExpression(prevPrimary);
-                                namedVar.Storage = nullptr;
-                                if (namedVar.Primary == nullptr)
+                                const std::string qualifiedName =
+                                    Compiler(ctx)->ResolveQualifiedName(idName);
+                                const std::string genericFunctionName =
+                                    Compiler(ctx)->ResolveGenericFunctionBase(qualifiedName);
+                                const bool functionNameIsVisible =
+                                    Compiler(ctx)->GetFunction(qualifiedName) != nullptr
+                                    || Compiler(ctx)->GetFunction(idName) != nullptr
+                                    || Compiler(ctx)->GetReturnBlock(qualifiedName) != nullptr
+                                    || Compiler(ctx)->GetReturnBlock(idName) != nullptr
+                                    || genericFunctionTemplates.count(genericFunctionName) != 0
+                                    || Compiler(ctx)->HasCxxFunctionTemplate(qualifiedName)
+                                    || Compiler(ctx)->HasCxxFunctionTemplate(idName)
+                                    || Compiler(ctx)->IsCxxFunctionMacro(idName);
+                                if (followedByCall && !aliasNameIsVariable && !functionNameIsVisible)
                                 {
-                                    const std::string memberName =
-                                        prevPrimary->genericIdentifier()->Identifier()->getText();
-                                    if (auto thisVar = FindImplicitCxxTemplateThis(memberName);
-                                        thisVar.GetValue() != nullptr)
+                                    std::string defaultedAliasType;
+                                    std::string cxxError;
+                                    if (Compiler(ctx)->TryResolveDefaultedCxxGenericBaseAlias(
+                                            idName, defaultedAliasType, cxxError))
                                     {
-                                        structVar = thisVar;
-                                        danglingMemberOwner = thisVar.TypeAndValue.TypeName;
-                                        danglingIsMethod = true;
+                                        primaryIdentifier = defaultedAliasType;
+                                        namedVar = {};
+                                        structVar = {};
+                                        interfaceVar = {};
+                                        break;
                                     }
-                                    else
-                                        namedVar = ParseIdentifier(
-                                            prevPrimary->genericIdentifier()->Identifier());
+                                    if (!cxxError.empty())
+                                    {
+                                        LogCxxErrorContext(prevPrimary, cxxError);
+                                        break;
+                                    }
+                                }
+                                if (namesEnclosingMethod && globalVariable)
+                                    namedVar = {};
+                                else
+                                {
+                                    namedVar.Primary = ParsePrimaryExpression(prevPrimary);
+                                    namedVar.Storage = nullptr;
+                                    if (namedVar.Primary == nullptr)
+                                    {
+                                        const std::string memberName =
+                                            prevPrimary->genericIdentifier()->Identifier()->getText();
+                                        if (auto thisVar = FindImplicitCxxTemplateThis(memberName);
+                                            thisVar.GetValue() != nullptr)
+                                        {
+                                            structVar = thisVar;
+                                            danglingMemberOwner = thisVar.TypeAndValue.TypeName;
+                                            danglingIsMethod = true;
+                                        }
+                                        else
+                                            namedVar = ParseIdentifier(
+                                                prevPrimary->genericIdentifier()->Identifier());
+                                    }
                                 }
                             }
                         }
@@ -5310,6 +5400,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // Postfix work created by these arguments belongs before the callee runs.
                         // Keep work queued before argument evaluation in the outer expression.
                         CallPostfixScope callArgumentPostfix(this);
+                        const bool callWasQualified = qualifiedCallPending;
+                        qualifiedCallPending = false;
                         // Create Function Call
                         std::string functionName = primaryIdentifier;
                         // Parenthesized `(*namedFunction)` keeps the resolved function value, while
@@ -8406,8 +8498,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             }
 
                             // [PFX-6] argument assembly: prepend the receiver as implicit `this`
-                            // (or inject the enclosing method's `this` for a bare call), then evaluate
-                            // the user arguments into `arguments`.
+                            // for an explicit receiver. Bare-call receivers stay separate until
+                            // overload resolution knows which candidates are methods.
                             if (!structVar.BaseType && !lastMemberReceiverPath.empty()
                                 && Compiler(ctx)->HasCxxFunctionTemplateMemberName(primaryIdentifier))
                             {
@@ -8419,6 +8511,24 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     structVar = receiver;
                             }
                             std::vector<LLVMBackend::NamedVariable> arguments;
+                            std::vector<std::pair<llvm::Value*, std::string>> retainedBraceArgumentUnwinds;
+                            auto releaseBraceArgumentUnwinds = [&]() {
+                                auto& entries = Compiler(ctx)->unwindPartial_;
+                                for (auto slot = retainedBraceArgumentUnwinds.rbegin();
+                                     slot != retainedBraceArgumentUnwinds.rend(); ++slot)
+                                    for (auto entry = entries.rbegin(); entry != entries.rend(); ++entry)
+                                        if (entry->K == LLVMBackend::UnwindPartialEntry::Kind::Slot
+                                            && entry->V == slot->first
+                                            && entry->TypeName == slot->second)
+                                        {
+                                            entries.erase(std::next(entry).base());
+                                            break;
+                                        }
+                                retainedBraceArgumentUnwinds.clear();
+                            };
+                            BraceArgumentUnwindScope braceArgumentUnwind{ releaseBraceArgumentUnwinds };
+                            LLVMBackend::NamedVariable implicitCallReceiver;
+                            std::vector<std::string> lexicalAggregateScopes;
                             if (structVar.BaseType)
                             {
                                 // LoadNamedVariable is not called for receivers, so check here.
@@ -8435,15 +8545,23 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 argumentNamedVar.CallerLockPath = LockPathForOperandText(lastMemberReceiverPath);
                                 arguments.push_back(argumentNamedVar);
                             }
-                            else if (!globalScopeCall)
+                            else if (!globalScopeCall && !callWasQualified && namespaceContext.empty())
                             {
-                                // Bare call inside a member function - inject 'this' automatically
-                                // if the callee is a method of the same struct. A `global::` call
-                                // explicitly targets the root, so never inject an implicit 'this'.
-                                auto thisVar = Compiler(ctx)->GetCurrentMemberThis(functionName);
-                                if (thisVar.Storage != nullptr)
-                                    arguments.push_back(thisVar);
+                                auto thisVar = Compiler(ctx)->GetThisPointer();
+                                if (thisVar.GetValue() == nullptr)
+                                    thisVar = Compiler(ctx)->GetCurrentMemberThis(functionName);
+                                if (thisVar.GetValue() != nullptr)
+                                {
+                                    thisVar.TypeAndValue.VariableName.clear();
+                                    implicitCallReceiver = std::move(thisVar);
+                                }
                             }
+                            if (!globalScopeCall && !callWasQualified && !structVar.BaseType
+                                && Compiler(ctx)->currentFunction != nullptr)
+                                for (const auto& scope : EnclosingAggregateScopesForCall(
+                                         Compiler(ctx), ctx))
+                                    if (scope.Definition != nullptr)
+                                        lexicalAggregateScopes.push_back(scope.Name);
 
                             // [PFX-7-slot] Resolved before [PFX-7] because the '?.' guard below must
                             // skip a COM slot call, which owns its own '?.'/HResult lowering.
@@ -8517,6 +8635,19 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 const LLVMBackend::FunctionSymbol* funcSym = nullptr;
                                 {
                                     auto it = Compiler(ctx)->functionTable.find(functionName);
+                                    bool lexicalScopeFunction = false;
+                                    for (const auto& scope : lexicalAggregateScopes)
+                                    {
+                                        auto scoped = Compiler(ctx)->functionTable.find(
+                                            scope + "." + primaryIdentifier);
+                                        if (scoped != Compiler(ctx)->functionTable.end()
+                                            && !scoped->second.empty())
+                                        {
+                                            it = scoped;
+                                            lexicalScopeFunction = true;
+                                            break;
+                                        }
+                                    }
                                     if (it != Compiler(ctx)->functionTable.end() && !it->second.empty())
                                     {
                                         // Select the overload matching the receiver type (and arity), not
@@ -8524,19 +8655,36 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         // lock(this) release(val, body) vs an unrelated struct's release()).
                                         // front() could read the wrong param list and drop the lock(this)
                                         // guard-seeding, wrongly rejecting access to guarded fields.
-                                        const std::string& recvType = structVar.TypeAndValue.TypeName;
+                                        const std::string& recvType = structVar.TypeAndValue.TypeName.empty()
+                                            ? implicitCallReceiver.TypeAndValue.TypeName
+                                            : structVar.TypeAndValue.TypeName;
                                         if (recvType.empty())
                                         {
                                             funcSym = &it->second.front();
+                                            if (lexicalScopeFunction)
+                                            {
+                                                const size_t wantParams = arguments.size()
+                                                    + namedArgCtx.size();
+                                                for (const auto& cand : it->second)
+                                                    if (cand.Parameters.size() == wantParams)
+                                                    {
+                                                        funcSym = &cand;
+                                                        break;
+                                                    }
+                                            }
                                         }
                                         else
                                         {
-                                            size_t wantParams = arguments.size() + namedArgCtx.size();
+                                            size_t implicitOffset = implicitCallReceiver.GetValue() != nullptr ? 1 : 0;
+                                            size_t wantParams = arguments.size() + namedArgCtx.size()
+                                                + implicitOffset;
                                             const LLVMBackend::FunctionSymbol* typeMatch = nullptr;
                                             for (const auto& cand : it->second)
                                             {
                                                 if (cand.Parameters.empty()
                                                     || cand.Parameters.front().TypeName != recvType)
+                                                    continue;
+                                                if (implicitOffset != 0 && !cand.IsMethod)
                                                     continue;
                                                 if (!typeMatch) typeMatch = &cand;
                                                 if (cand.Parameters.size() == wantParams) { funcSym = &cand; break; }
@@ -8545,7 +8693,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                     }
                                 }
-                                size_t paramOffset = arguments.empty() ? 0 : 1; // offset for implicit 'this'
+                                const bool selectedImplicitMethod = implicitCallReceiver.GetValue() != nullptr
+                                    && funcSym != nullptr && funcSym->IsMethod
+                                    && !funcSym->Parameters.empty()
+                                    && funcSym->Parameters.front().TypeName
+                                        == implicitCallReceiver.TypeAndValue.TypeName;
+                                size_t paramOffset = arguments.empty()
+                                    ? (selectedImplicitMethod ? 1 : 0)
+                                    : 1; // offset for an already assembled receiver
 
                                 // A named argument makes the call-site index diverge from the declared
                                 // one, so map through the same binder MatchFunction uses.
@@ -8656,7 +8811,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                     // "the default-initialized value", so there is no overlay.
                                                     if (initList != nullptr)
                                                         EmitConstructedFieldOverrides(
-                                                            alloca, structType, initList);
+                                                            alloca, structType, initList, true,
+                                                            &retainedBraceArgumentUnwinds);
                                                     llvm::Value* loaded = Compiler(ctx)->CreateLoad(alloca);
                                                     LLVMBackend::NamedVariable argVar;
                                                     argVar.Primary = loaded;
@@ -8935,11 +9091,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                     // (paramOffset) is a leading slot. Defaults are honored by the binder.
                                                     for (const auto& candidate : functionIt->second)
                                                     {
-                                                        if (paramOffset == 1
-                                                            && (candidate.Parameters.empty()
-                                                                || candidate.Parameters.front().TypeName
-                                                                    != arguments.front().TypeAndValue.TypeName))
-                                                            continue;
+                                                        if (paramOffset == 1)
+                                                        {
+                                                            const std::string& receiverType = selectedImplicitMethod
+                                                                ? implicitCallReceiver.TypeAndValue.TypeName
+                                                                : arguments.front().TypeAndValue.TypeName;
+                                                            if (candidate.Parameters.empty()
+                                                                || candidate.Parameters.front().TypeName != receiverType)
+                                                                continue;
+                                                        }
                                                         auto binding = LLVMBackend::ComputeArgumentPositions(
                                                             argNames, candidate.Parameters,
                                                             candidate.Variadic, paramOffset,
@@ -9789,6 +9949,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 if (recv.empty() && structVar.BaseType != nullptr)
                                     if (auto* st = llvm::dyn_cast<llvm::StructType>(structVar.BaseType))
                                         recv = st->getName().str();
+                                if (recv.empty())
+                                    recv = implicitCallReceiver.TypeAndValue.TypeName;
                                 return compiler->GetCxxClassInfo(recv) != nullptr ? recv
                                                                                   : std::string();
                             };
@@ -9812,6 +9974,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 if (receiverType.empty() && structVar.BaseType != nullptr)
                                     if (auto* st = llvm::dyn_cast<llvm::StructType>(structVar.BaseType))
                                         receiverType = st->getName().str();
+                                if (receiverType.empty())
+                                    receiverType = implicitCallReceiver.TypeAndValue.TypeName;
                                 if (receiverType.empty() && !arguments.empty())
                                     receiverType = arguments.front().TypeAndValue.TypeName;
                                 const size_t freeFunctionDot = functionName.rfind('.');
@@ -9885,6 +10049,50 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                     }
                                 }
+                                /*
+                                 * A qualified call reaches a hidden friend only through the namespace
+                                 * that declares an argument's class (master); any other qualifier is
+                                 * refused, since C++ qualified lookup never searches hidden friends.
+                                 * An unqualified call reaches one through its argument's class.
+                                 */
+                                const size_t adlDot = functionName.rfind('.');
+                                const std::string adlQualifier = cxxFreeFunction
+                                    && adlDot != std::string::npos
+                                    ? functionName.substr(0, adlDot) : std::string();
+                                // The argument's associated class: its own C++ class, or the class that
+                                // encloses its enum type ([basic.lookup.argdep]).
+                                const auto associatedCxxClass = [&](const auto& arg) -> std::string {
+                                    const std::string& typeName = arg.TypeAndValue.TypeName;
+                                    if (compiler->IsCxxRecord(typeName)
+                                        || compiler->generatedCxxRecords_.count(typeName) != 0)
+                                        return typeName;
+                                    const size_t enumDot = typeName.rfind('.');
+                                    if (enumDot != std::string::npos
+                                        && !compiler->GetEnumBackingType(typeName).empty()
+                                        && compiler->IsCxxRecord(typeName.substr(0, enumDot)))
+                                        return typeName.substr(0, enumDot);
+                                    return {};
+                                };
+                                const auto cxxClassArgument = [&](const auto& arg) {
+                                    return !associatedCxxClass(arg).empty();
+                                };
+                                const bool adlAssociated = adlDot == std::string::npos
+                                    ? !isPostfixMemberCall && owner.empty()
+                                        && std::any_of(arguments.begin(), arguments.end(), cxxClassArgument)
+                                    : !adlQualifier.empty()
+                                        && std::any_of(arguments.begin(), arguments.end(),
+                                            [&](const auto& arg) {
+                                                const std::string associated = associatedCxxClass(arg);
+                                                const std::string base = associated.substr(0, associated.find('$'));
+                                                const size_t dot = base.rfind('.');
+                                                return dot != std::string::npos
+                                                    && base.substr(0, dot) == adlQualifier;
+                                            });
+                                // The name filter keeps the ADL request off calls no hidden friend shares.
+                                const std::string adlSimpleName = adlDot == std::string::npos
+                                    ? functionName : functionName.substr(adlDot + 1);
+                                const bool adlCandidate = adlAssociated
+                                    && compiler->IsCxxFriendName(adlSimpleName);
                                 if (auto existing = compiler->functionTable.find(resolvedName);
                                     existing != compiler->functionTable.end()
                                     && cxxExplicitTemplateArgs.empty()
@@ -9974,7 +10182,41 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         && !(hasForwardingReferenceTemplate
                                              && hasForwardingReferenceLvalue)
                                         && !templateBesideNonTemplate
-                                        && !needsDirectConstructionWrapper) return;
+                                        && !needsDirectConstructionWrapper)
+                                    {
+                                        // A hidden friend beside a visible overload of the same name is
+                                        // found by ADL before the overload-mismatch diagnostic.
+                                        std::string adlRegisteredName;
+                                        std::string adlError;
+                                        if (adlCandidate && !isTemplate && owner.empty()
+                                            && cxxBraceArguments.empty()
+                                            && compiler->RequestCxxFreeFunction(
+                                                functionName, cxxExplicitTemplateArgs, arguments,
+                                                adlRegisteredName, adlError, {}, {}, {}, /*adlCall*/ true))
+                                        {
+                                            resolvedName = std::move(adlRegisteredName);
+                                            flattenCxxDirectConstructionArguments(arguments);
+                                            cxxExplicitTemplateArgs.clear();
+                                        }
+                                        return;
+                                    }
+                                }
+                                // An unqualified name with no visible overload: only a hidden friend
+                                // can bind it, and it is found by ADL alone.
+                                if (adlCandidate && adlDot == std::string::npos && !isTemplate
+                                    && owner.empty() && cxxBraceArguments.empty()
+                                    && cxxExplicitTemplateArgs.empty())
+                                {
+                                    std::string adlRegisteredName;
+                                    std::string adlError;
+                                    if (compiler->RequestCxxFreeFunction(
+                                            functionName, {}, arguments, adlRegisteredName, adlError,
+                                            {}, {}, {}, /*adlCall*/ true))
+                                    {
+                                        resolvedName = std::move(adlRegisteredName);
+                                        flattenCxxDirectConstructionArguments(arguments);
+                                        return;
+                                    }
                                 }
                                 if (!isTemplate && owner.empty() && cxxBraceArguments.empty())
                                 {
@@ -9989,6 +10231,21 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 functionName, cxxExplicitTemplateArgs, arguments,
                                                 resolvedName, freeError))
                                         {
+                                            if (adlAssociated)
+                                            {
+                                                std::string adlRegisteredName;
+                                                std::string adlError;
+                                                if (compiler->RequestCxxFreeFunction(
+                                                        functionName, cxxExplicitTemplateArgs,
+                                                        arguments, adlRegisteredName, adlError,
+                                                        {}, {}, {}, /*adlCall*/ true))
+                                                {
+                                                    resolvedName = std::move(adlRegisteredName);
+                                                    flattenCxxDirectConstructionArguments(arguments);
+                                                    cxxExplicitTemplateArgs.clear();
+                                                    return;
+                                                }
+                                            }
                                             if (const std::string cflatMove = CflatValueStdMoveError(
                                                     *compiler, functionName, arguments);
                                                 !freeError.empty() && !cflatMove.empty())
@@ -10503,6 +10760,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         compiler->pendingCxxSretReturn_ = false;
                                     }
                                     callArgumentPostfix.Flush();
+                                    braceArgumentUnwind.Release();
                                     compiler->EmitCxxStructorCall(functionName, *ctor, slot, ctorValues,
                                                                   &arguments);
                                     if (!directSret && compiler->IsForeignNontrivialCxxClass(functionName))
@@ -10577,6 +10835,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         auto argVals = buildWinrtArgVals();
                                         std::string rt2; bool rp2 = false;
                                         callArgumentPostfix.Flush();
+                                        braceArgumentUnwind.Release();
                                         auto* okRes = compiler->EmitWinrtSlotCall(
                                             structVar.TypeAndValue.TypeName, functionName, argVals, rt2, rp2);
                                         if (okRes) b->CreateStore(okRes, resAlloca);
@@ -10617,6 +10876,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     std::string winrtResultType;
                                     bool winrtResultPtr = false;
                                     callArgumentPostfix.Flush();
+                                    braceArgumentUnwind.Release();
                                     namedVar.Primary = compiler->EmitWinrtSlotCall(
                                         structVar.TypeAndValue.TypeName, functionName, argVals,
                                         winrtResultType, winrtResultPtr);
@@ -10653,6 +10913,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 callArgumentPostfix.Flush();
                                 Compiler(ctx)->pendingCallSite_ = callParen;
                                 Compiler(ctx)->pendingReceiverText_ = lastMemberReceiverPath;
+                                braceArgumentUnwind.Release();
                                 namedVar.Primary = RefuseCxxConstReceiverCall(ctx, arguments,
                                         cxxMemberReceiverType(), resolvedFuncName,
                                         lastMemberReceiverPath)
@@ -10662,7 +10923,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     cxxMemberReceiverType(),
                                     isPostfixMemberCall && !isStaticTemplateThroughObject
                                         && !callHasCxxBraceArguments,
-                                    enclosingFunctionName);
+                                    enclosingFunctionName, false, nullptr,
+                                    implicitCallReceiver.GetValue() != nullptr
+                                        ? &implicitCallReceiver : nullptr,
+                                    lexicalAggregateScopes);
                                 markDataMutParamOwning(structVar, namedVar.Primary);
                                 globalScopeCall = false;
                                 Compiler(ctx)->pendingCallSite_ = nullptr;
@@ -10778,6 +11042,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 callArgumentPostfix.Flush();
                                 Compiler(ctx)->pendingCallSite_ = callParen;
                                 Compiler(ctx)->pendingReceiverText_ = lastMemberReceiverPath;
+                                braceArgumentUnwind.Release();
                                 namedVar.Primary = RefuseCxxConstReceiverCall(ctx, arguments,
                                         cxxMemberReceiverType(), resolvedFuncName,
                                         lastMemberReceiverPath)
@@ -10787,7 +11052,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     cxxMemberReceiverType(),
                                     isPostfixMemberCall && !isStaticTemplateThroughObject
                                         && !callHasCxxBraceArguments,
-                                    enclosingFunctionName);
+                                    enclosingFunctionName, false, nullptr,
+                                    implicitCallReceiver.GetValue() != nullptr
+                                        ? &implicitCallReceiver : nullptr,
+                                    lexicalAggregateScopes);
                                 markDataMutParamOwning(structVar, namedVar.Primary);
                                 globalScopeCall = false;
                                 Compiler(ctx)->pendingCallSite_ = nullptr;
@@ -13508,6 +13776,17 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                 && call->primaryExpression() != nullptr && call->primaryExpression()->getStart() == node->getSymbol())
                 return {};
         }
+        // A hidden friend is found by ADL from its call alone; the postfix call path requests it.
+        if (compiler->IsCxxFriendName(name))
+        {
+            antlr4::tree::ParseTree* up = node->parent;
+            while (up != nullptr && dynamic_cast<CFlatParser::PostfixExpressionContext*>(up) == nullptr)
+                up = up->parent;
+            auto* call = dynamic_cast<CFlatParser::PostfixExpressionContext*>(up);
+            if (call != nullptr && call->children.size() >= 3 && call->children[1]->getText() == "("
+                && call->primaryExpression() != nullptr && call->primaryExpression()->getStart() == node->getSymbol())
+                return {};
+        }
         // C++ never declares a scoped enumerator in the enclosing scope; name the enum as a hint.
         if (const std::string enumName = compiler->GetScopedCppEnumeratorHint(name); !enumName.empty())
         {
@@ -14109,9 +14388,8 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                         }
                         if (!resolvesAsType)
                             continue;
-                        // Queue PRE-SCAN: the declaration path reports a refused pattern.
-                        // The scoped helper already returned a generic-base alias's canonical target.
-                        if (!spelledGenericBaseAlias)
+                        // Queue PRE-SCAN: run R5 for an alias after it resolves to unique.
+                        if (!spelledGenericBaseAlias || baseName == "unique")
                             compiler->ResolveGenericAliasSpelling(baseName, typeArgs, false);
                         compiler->CompleteCxxTemplateTypeArgs(baseName, typeArgs);
                         // One queue funnel: it also pre-creates the opaque shell, so a LATER

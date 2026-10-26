@@ -225,6 +225,8 @@ std::string ForwardRefScanner::ResolveGenericTemplateSpellingAtUse(
             compiler->ResolveGenericAliasSpelling(base, args, report);
             base = ResolveGenericTemplateBaseAtUse(compiler, base, useSite, lookupName);
         }
+        else if (base == "unique" && compiler->IsGenericBaseAlias(spelledBase))
+            compiler->ResolveGenericAliasSpelling(base, args, report);
         return base;
     }
 
@@ -618,7 +620,16 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         specText = ResolveMemberTypeSpecifier(memberType, &memberMask);
                     // Resolve namespace-scope C++ using-directives before a lazy foreign-type
                     // request so `using namespace inner; outer.Type` requests the real type.
-                    specText = compiler->ResolveQualifiedName(specText);
+                    std::string defaultedAliasType;
+                    std::string defaultedAliasError;
+                    const bool resolvedDefaultedAlias =
+                        compiler->TryResolveDefaultedCxxGenericBaseAlias(
+                            specText, defaultedAliasType, defaultedAliasError);
+                    if (resolvedDefaultedAlias)
+                        specText = defaultedAliasType;
+                    else
+                        specText = compiler->ResolveQualifiedName(specText);
+                    if (!resolvedDefaultedAlias && defaultedAliasError.empty())
                     {
                         std::string cxxError;
                         compiler->TryRequestCxxType(specText, {}, specText, cxxError);
@@ -930,6 +941,7 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
                             || rawFuncName == "operator string"
                             || rawFuncName == "operator bool");
         bool isStaticFunc = isFunctionStatic(func);
+        const bool isMethod = !structName.empty() && !isOperatorFunc && !isStaticFunc;
         if (!structName.empty() && (isOperatorFunc || isStaticFunc))
         {
             name = structName + "." + rawFuncName;
@@ -951,13 +963,13 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         ApplyOwningSinkInference(compiler, func, allParams);
 
         bool returnsOwned = ComputeReturnsOwned(returnType, func, allParams);
-        if (!structName.empty() && !isOperatorFunc && !isStaticFunc)
+        if (isMethod)
             RecordReceiverScan(compiler, func, name, returnType, allParams, varargs);
 
         const std::string linkageName = returnType.external && !namespaceName.empty()
             ? rawFuncName : std::string();
         compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs,
-                                            returnsOwned, false, returnType.CallConv, linkageName);
+                                            returnsOwned, isMethod, returnType.CallConv, linkageName);
         if (returnType.external)
             compiler->NoteCFlatExternBody(name, linkageName.empty() ? name : linkageName);
 
@@ -2715,7 +2727,8 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
         // main-pass maps are still empty here. Authoritative handling is in ParseUsingDeclaration.
         if (suffix.empty() && (compiler->IsWinrtGenericBase(targetBase)
                                || compiler->IsGenericTemplateKey(targetBase)
-                               || compiler->gts.scannedGenericStructNamesUncertain.count(targetBase) != 0))
+                               || compiler->gts.scannedGenericStructNamesUncertain.count(targetBase) != 0
+                               || compiler->HasCxxClassTemplate(targetBase)))
         {
             compiler->RegisterGenericBaseAlias(alias, targetBase);
             return;

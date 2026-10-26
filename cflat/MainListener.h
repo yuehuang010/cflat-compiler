@@ -2579,6 +2579,8 @@ static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesFromCo
             aggregates.emplace_back(structure->directDeclarator()->getText(), structure);
         else if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(parent))
             aggregates.emplace_back(classDefinition->directDeclarator()->getText(), classDefinition);
+        else if (auto* programDefinition = dynamic_cast<CFlatParser::ProgramDefinitionContext*>(parent))
+            aggregates.emplace_back(programDefinition->directDeclarator()->getText(), programDefinition);
     }
     std::string scope = compiler->GetCurrentNamespace();
     std::vector<EnclosingAggregateLookupScope> scopes;
@@ -2661,6 +2663,27 @@ static std::string ResolveContextualTypeName(LLVMBackend* compiler,
     }
     if (isKnownType(resolvedName)) return {};
     return {};
+}
+
+static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesForCall(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node)
+{
+    auto scopes = EnclosingAggregateScopesFromContext(compiler, node);
+    if (compiler == nullptr || scopes.empty()) return scopes;
+    const auto* function = compiler->GetCurrentFunctionSymbol();
+    if (function == nullptr) return scopes;
+
+    std::string owner;
+    if (function->IsMethod && !function->Parameters.empty())
+        owner = function->Parameters.front().TypeName;
+    if (owner.empty())
+    {
+        const size_t dot = function->SourceName.rfind('.');
+        if (dot != std::string::npos) owner = function->SourceName.substr(0, dot);
+    }
+    if (!owner.empty() && compiler->IsDataStructure(owner))
+        scopes.front().Name = owner;
+    return scopes;
 }
 
 static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesFromName(
@@ -2886,6 +2909,8 @@ static std::string ResolveGenericTemplateSpellingAtScope(
         base = ResolveGenericTemplateBaseAtScope(
             compiler, base, enclosingScopes, useSite, lookupName, nonGenericRefusal);
     }
+    else if (base == "unique" && compiler->IsGenericBaseAlias(spelledBase))
+        compiler->ResolveGenericAliasSpelling(base, args, report);
     return base;
 }
 
@@ -9696,6 +9721,13 @@ public:
                                   llvm::Value* lhsStorage,
                                   const ShiftOperand& rhs, const std::string& rhsClass,
                                   llvm::Value* rhsStorage);
+    bool ReportCxxConstPointerOperatorFailure(
+        LLVMBackend* compiler, antlr4::ParserRuleContext* ctx,
+        const std::string& sourceName,
+        const std::vector<LLVMBackend::NamedVariable>& arguments,
+        const std::string& op, const std::string& lhsCxxName = {},
+        const std::string& rhsCxxName = {},
+        bool lhsPointeeConst = false, bool rhsPointeeConst = false);
 
     struct ShiftPairResult
     {
@@ -10345,7 +10377,9 @@ public:
     void EmitConstructedFieldOverrides(
         llvm::Value* structPtr,
         const std::string& typeName,
-        CFlatParser::InitializerListContext* ctx);
+        CFlatParser::InitializerListContext* ctx,
+        bool retainUnwind = false,
+        std::vector<std::pair<llvm::Value*, std::string>>* retainedUnwindSlots = nullptr);
 
     bool RejectNestedNamedBraceInitializer(
         CFlatParser::InitializerListContext* list,

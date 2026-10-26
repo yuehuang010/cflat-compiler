@@ -1,0 +1,32 @@
+// Writes and non-const calls through a returned const C++ pointer are refused like clang.
+import cpp "cpp_t217_mutable.hpp";
+import cpp "cpp_t477_const_ptr.hpp";
+
+int t477_take_mutable(int* p) { return *p; }
+
+extern int main()
+{
+    expect_error("cannot assign to 't217_const_ptr()->n': it is reached through a pointer to const") {
+        t217_const_ptr()->n = 6;
+    }
+    expect_error("cannot assign to 'p->n': it is reached through a pointer to const") {
+        auto p = t217_const_ptr();
+        p->n = 6;
+    }
+    expect_error("cannot modify 't217_const_ptr()->n': it is reached through a pointer to const") {
+        t217_const_ptr()->n += 1;
+    }
+    expect_error("cannot increment 't217_const_ptr()->n': it is reached through a pointer to const") {
+        t217_const_ptr()->n++;
+    }
+    expect_error("cannot assign to 't477_probe_ptr()->inner.x': it is reached through a pointer to const") {
+        t477_probe_ptr()->inner.x = 1;
+    }
+    expect_error("cannot call non-const member 'touch'") {
+        t477_probe_ptr()->touch();
+    }
+    expect_error("cannot pass argument 1 ('(const int)*') to parameter 'p' ('int*'): the conversion discards const") {
+        t477_take_mutable(&t217_const_ptr()->n);
+    }
+    return 0;
+}

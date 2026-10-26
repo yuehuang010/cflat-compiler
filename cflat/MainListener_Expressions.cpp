@@ -8572,6 +8572,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 // owned/alias provenance. Assignment must enforce the same rule as declaration.
                 RejectRawHeapArrayIntoUniqueLocal(
                     rightNV, namedVar.TypeAndValue, namedVar.CallerName, ctx);
+                compiler->RecordUniqueOwnerLoopSink(rightNV,
+                    SpellType(*compiler, namedVar.TypeAndValue), namedVar.CallerName, true);
                 compiler->EmitOwningPtrCleanup(namedVar, right);
                 // When the RHS transfers ownership (owning local, move param, or `new` temp -
                 // exactly what TransferPointerOwnershipOnStore nulls), the destination adopts it.
@@ -12580,7 +12582,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         // an OBJECT, so a C++ `T&` parameter must bind the selected one, not a copy. POINTER
         // joins are excluded - their ownership analysis reads the value, not a joined slot.
         const bool scalarLvalueJoin = !cxxRecordJoin && trueValue != nullptr
-            && (trueValue->getType()->isIntegerTy() || trueValue->getType()->isFloatingPointTy());
+            && (trueValue->getType()->isIntegerTy() || trueValue->getType()->isFloatingPointTy())
+            && (trueShape.isExplicitMove || !trueSlotRewritten)
+            && (falseShape.isExplicitMove || !falseSlotRewritten);
         const bool collapseSinkJoin = collapseLvalueSink && isOwningRecordValue(trueValue)
             && isOwningRecordValue(falseValue)
             && isAddressableLvalue(trueValue, trueStorage)
@@ -16134,6 +16138,45 @@ int8_t MainListener::CxxArgumentLvalueKind(antlr4::tree::ParseTree* tree)
         return 0;
 }
 
+bool MainListener::ReportCxxConstPointerOperatorFailure(
+        LLVMBackend* compiler, antlr4::ParserRuleContext* ctx,
+        const std::string& sourceName,
+        const std::vector<LLVMBackend::NamedVariable>& arguments,
+        const std::string& op, const std::string& lhsCxxName,
+        const std::string& rhsCxxName,
+        bool lhsPointeeConst, bool rhsPointeeConst)
+{
+        // Same request shape as the failed one (an infix operator, no adlCall wrapper).
+        for (size_t i = 0; i < arguments.size(); ++i)
+        {
+            const auto& source = arguments[i].TypeAndValue;
+            const bool pointerArgument = source.Pointer
+                || (arguments[i].Primary != nullptr
+                    && arguments[i].Primary->getType()->isPointerTy());
+            const bool pointeeConst = source.PointeeConstBit()
+                || (i == 0 ? lhsPointeeConst : rhsPointeeConst);
+            if (!pointerArgument || !pointeeConst) continue;
+            std::vector<LLVMBackend::NamedVariable> retry = arguments;
+            retry[i].TypeAndValue.Pointer = true;
+            if (retry[i].TypeAndValue.PointerDepth == 0)
+                retry[i].TypeAndValue.PointerDepth = 1;
+            retry[i].TypeAndValue.SetPointeeConstBit(false);
+            std::string retryName, retryError;
+            if (!compiler->RequestCxxFreeFunction(sourceName, {}, retry, retryName,
+                                                  retryError, op, lhsCxxName,
+                                                  rhsCxxName)
+                || retryName.empty())
+                continue;
+            const std::string argumentName = source.VariableName.empty()
+                ? "<argument>" : source.VariableName;
+            const size_t argumentIndex = i + (lhsCxxName.empty() ? 0 : 1) + 1;
+            LogErrorContext(ctx, compiler->CxxConstPointerArgumentError(
+                argumentIndex, argumentName, {}));
+            return true;
+        }
+        return false;
+}
+
 /*
  * `a << b` / `a >> b` with a C++ class on the left is a C++ expression, so C++ resolves it: a
  * generated `decltype(auto) w(A& p0, B p1) { return p0 << p1; }` sees the members, the free
@@ -16235,6 +16278,9 @@ llvm::Value* MainListener::TryCxxInfixShift(CFlatParser::ShiftExpressionContext*
                                                  error));
                 return nullptr;
             }
+            if (ReportCxxConstPointerOperatorFailure(
+                    compiler, ctx, sourceName, args, op, lhs.cxxName, rhs.cxxName))
+                return nullptr;
             /*
              * The wrapper hands C++ a scalar temporary as an rvalue. When the SAME operands bind
              * once that temporary is an lvalue, the refusal was a non-const `T&` parameter.
@@ -18504,6 +18550,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             };
             addNamespace(leftInfo.second);
             addNamespace(rightInfo.second);
+            if (std::find(namespaces.begin(), namespaces.end(), std::string()) == namespaces.end())
+                namespaces.push_back(std::string());
 
             const std::string opName = "operator" + op;
             /*
@@ -18629,6 +18677,10 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                                                           registeredName, templateError, op)
                         || registeredName.empty())
                     {
+                        if (ReportCxxConstPointerOperatorFailure(
+                                compiler, ctx, sourceName, templateArgs, op,
+                                {}, {}, lhsCxxPointeeConst, rhsCxxPointeeConst))
+                            return nullptr;
                         // Nothing viable AT the infix expression: CFlat's own refusal of the smaller
                         // set says the same. Any other clang refusal (ambiguous, a body) is kept.
                         if (compiler->LastCxxRequestClangRejected() && !templateError.empty()
@@ -18690,7 +18742,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                                              || compiler->generatedCxxRecords_.count(name) != 0);
                 };
                 const bool leftClass = cxxClass(leftInfo.second);
-                if (!leftClass && !cxxClass(rightInfo.second)) return nullptr;
+                const bool rightClass = cxxClass(rightInfo.second);
+                if (!leftClass && !rightClass) return nullptr;
                 // Nothing to find beyond what master's lookup already tried: no clang request.
                 auto mayHide = [&](const std::string& name) {
                     return cxxClass(name) && compiler->CxxClassMayHaveUnregisteredOperators(name);
@@ -18824,6 +18877,40 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     referenceParam.SetCxxConstRef(true);
                     return compiler->CanImplicitlyConstructCxxClass(argument, referenceParam);
                 };
+                auto hasBuiltinScalarConversion = [&](const std::string& sourceType) {
+                    if (sourceType.empty() || !compiler->IsCxxRecord(sourceType)) return false;
+                    std::function<bool(const std::string&, std::set<std::string>, int)> hasInClass;
+                    hasInClass = [&](const std::string& typeName,
+                                     std::set<std::string> hiddenConversions,
+                                     int depth) {
+                        if (depth > 32 || typeName.empty()
+                            || !compiler->IsCxxRecord(typeName)) return false;
+                        compiler->EnsureCxxConversionOperatorsProjected(typeName);
+                        const auto* info = compiler->GetCxxClassInfo(typeName);
+                        if (info == nullptr) return false;
+                        for (const auto& method : info->directMethods)
+                        {
+                            if (!method.raw.isConversion) continue;
+                            const bool hidden = !method.raw.name.empty()
+                                && hiddenConversions.count(method.raw.name) != 0;
+                            if (!method.raw.name.empty())
+                                hiddenConversions.insert(method.raw.name);
+                            // A deleted conversion still ranks (clang); its use is refused after selection.
+                            if (!hidden && method.spellable && !method.raw.isExplicit
+                                && method.raw.bindRefusal.empty()
+                                && method.ret.IsPrimitive() && !method.ret.Pointer)
+                                return true;
+                        }
+                        for (const auto& base : info->bases)
+                        {
+                            std::string baseType = compiler->ResolveCxxBaseIdentity(base);
+                            if (baseType.empty()) baseType = base.name;
+                            if (hasInClass(baseType, hiddenConversions, depth + 1)) return true;
+                        }
+                        return false;
+                    };
+                    return hasInClass(sourceType, {}, 0);
+                };
 
                 bool candidateFound = false;
                 bool hasClassConversionCandidate = false;
@@ -18918,6 +19005,31 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                         }
                         else
                             rightBindsRvalue = true;
+                    }
+                }
+                if (candidateFound && hasClassConversionCandidate)
+                {
+                    const bool leftScalarConversion =
+                        hasBuiltinScalarConversion(leftInfo.second);
+                    const bool rightScalarConversion =
+                        hasBuiltinScalarConversion(rightInfo.second);
+                    const bool hasBuiltinOperandPair =
+                        (leftScalarConversion
+                            && ((rvalue != nullptr && (rvalue->getType()->isIntegerTy()
+                                                      || rvalue->getType()->isFloatingPointTy()))
+                                || rightScalarConversion))
+                        || (rightScalarConversion && lvalue != nullptr
+                            && (lvalue->getType()->isIntegerTy()
+                                || lvalue->getType()->isFloatingPointTy()));
+                    if (hasBuiltinOperandPair)
+                    {
+                        if (llvm::Value* ranked = callOperatorTemplate(sourceName, true))
+                            return ranked;
+                        if (adlClangAmbiguous && ctx != nullptr)
+                        {
+                            cxxAdlAmbiguousCtx_ = ctx;
+                            LogErrorContext(ctx, adlClangRefusal);
+                        }
                     }
                 }
                 // No ordinary free operator binds: the namespace may still declare the operator
@@ -19437,19 +19549,8 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                         for (const auto& method : info->directMethods)
                             if (method.spellable && method.raw.isConversion && !method.raw.isExplicit
                                 && !method.raw.isDeleted && method.raw.bindRefusal.empty()
-                                && method.ret.IsPrimitive()
-                                && ((op != "%" && op != "<<" && op != ">>"
-                                     && op != "&" && op != "|" && op != "^")
-                                    || method.ret.IsUnsignedInteger() != -1
-                                    || method.ret.TypeName == "int"
-                                    || method.ret.TypeName == "bool"
-                                    || method.ret.TypeName == "char"
-                                    || method.ret.TypeName == "short"
-                                    || method.ret.TypeName == "long"
-                                    || method.ret.TypeName == "i8"
-                                    || method.ret.TypeName == "i16"
-                                    || method.ret.TypeName == "i32"
-                                    || method.ret.TypeName == "i64"))
+                                && method.ret.IsPrimitive())
+                                // Any arithmetic result competes for `%` and the bitwise operators too (clang).
                                 conversions.push_back(method.raw.name);
                         std::sort(conversions.begin(), conversions.end());
                         conversions.erase(std::unique(conversions.begin(), conversions.end()),
@@ -23816,6 +23917,12 @@ std::string MainListener::ParseTypeSpecifierName(
         bool wasSubstituted = it != activeTypeSubstitutions.end();
         if (it != activeTypeSubstitutions.end()) name = it->second;
         StripOwnershipQualifiers(name);  // resolve to the underlying LLVM type; storage markers only
+        std::string defaultedAliasType;
+        std::string defaultedAliasError;
+        if (Compiler(ctx)->TryResolveDefaultedCxxGenericBaseAlias(
+                name, defaultedAliasType, defaultedAliasError))
+            return defaultedAliasType;
+        if (!defaultedAliasError.empty()) LogCxxErrorContext(ctx, defaultedAliasError);
         return Compiler(ctx)->ResolveQualifiedName(name, wasSubstituted);
     }
 
@@ -26119,7 +26226,11 @@ void MainListener::EmitFieldInitializer(
     auto* compiler = Compiler(ctx);
         bool completedObjectActive = completedObjectSlot != nullptr
             && completedObjectType != nullptr;
-        auto suspendCompletedObject = [&]() {
+        bool completedObjectSuspended = false;
+        size_t completedObjectUnwindMark = 0;
+        auto suspendCompletedObject = [&](const std::string* replacedField,
+                                           const std::string* retainedField = nullptr,
+                                           llvm::Value* retainedSlot = nullptr) {
             if (!completedObjectActive) return;
             auto& entries = compiler->unwindPartial_;
             for (auto entry = entries.rbegin(); entry != entries.rend(); ++entry)
@@ -26129,16 +26240,51 @@ void MainListener::EmitFieldInitializer(
                 {
                     entries.erase(std::next(entry).base());
                     completedObjectActive = false;
+                    completedObjectSuspended = true;
+                    completedObjectUnwindMark = entries.size();
+                    auto objectIt = compiler->dataStructures.find(*completedObjectType);
+                    if (objectIt == compiler->dataStructures.end() || objectIt->second.IsUnion)
+                        return;
+                    const auto& objectData = objectIt->second;
+                    for (unsigned i = 0; i < objectData.StructFields.size(); ++i)
+                    {
+                        const auto& field = objectData.StructFields[i];
+                        if (replacedField != nullptr && field.VariableName == *replacedField)
+                            continue;
+                        if (field.IsAlias || field.Pointer || field.ElemPointer
+                            || field.IsArrayView || field.IsSimd || field.IsBitfield
+                            || field.IsPadding || field.IsCflatOwned)
+                            continue;
+                        auto* fieldSlot = retainedField != nullptr
+                                && field.VariableName == *retainedField && retainedSlot != nullptr
+                            ? retainedSlot
+                            : compiler->CreateCxxFieldGEP(
+                                objectData, completedObjectSlot, i, field.VariableName + "_unwind");
+                        if (field.ConstArraySize > 0)
+                        {
+                            auto* fieldTy = compiler->GetType(field);
+                            llvm::Type* elemTy = nullptr;
+                            const uint64_t count = LLVMBackend::PeelFixedArrayType(fieldTy, elemTy);
+                            if (count > 0 && elemTy != nullptr)
+                                compiler->NoteUnwindArrayPrefix(fieldSlot, elemTy,
+                                    compiler->builder->getInt64(count), field.TypeName);
+                        }
+                        else
+                            compiler->NoteUnwindPartial(
+                                LLVMBackend::UnwindPartialEntry::Kind::Slot, fieldSlot, field.TypeName);
+                    }
                     return;
                 }
         };
         auto resumeCompletedObject = [&]() {
-            if (completedObjectActive || completedObjectSlot == nullptr
-                || completedObjectType == nullptr)
-                return;
+            if (!completedObjectSuspended) return;
+            auto& entries = compiler->unwindPartial_;
+            if (entries.size() > completedObjectUnwindMark)
+                entries.resize(completedObjectUnwindMark);
             compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot,
                                         completedObjectSlot, *completedObjectType);
             completedObjectActive = true;
+            completedObjectSuspended = false;
         };
     auto spellTypeName = [&](const std::string& name) {
         return SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = name });
@@ -26411,6 +26557,7 @@ void MainListener::EmitFieldInitializer(
                     const bool nestedFresh = destinationIsFresh
                         && !compiler->IsCxxRecord(nestedField.TypeName)
                         && explicitNoArgConstructors_.count(nestedField.TypeName) == 0;
+                    suspendCompletedObject(nullptr, &fieldName, nestedDestination);
                     const bool builtFresh = nestedFresh && EmitFreshBraceInitializeAggregate(
                         nestedDestination, nestedField.TypeName, nested, true);
                     if (builtFresh)
@@ -26419,7 +26566,8 @@ void MainListener::EmitFieldInitializer(
                     else
                         EmitFieldInitializer(nestedDestination, nestedField.TypeName, nested,
                                              nestedFresh, nullptr, false,
-                                             completedObjectSlot, completedObjectType);
+                                             nestedDestination, &nestedField.TypeName);
+                    resumeCompletedObject();
                     continue;
                 }
 
@@ -26642,7 +26790,7 @@ void MainListener::EmitFieldInitializer(
             bool emittedLoweredMove = false;
             if (loweredMoveField)
             {
-                suspendCompletedObject();
+                suspendCompletedObject(&fieldName);
                 emittedLoweredMove = EmitDeferredLoweredMoveIntoField(
                     loweredMoveSlot, initField->TypeName, rightNV, fieldMoveExpr,
                     destinationIsFresh, ownedTempMark);
@@ -26709,7 +26857,7 @@ void MainListener::EmitFieldInitializer(
             }
             rightNV.CastOccurrenceId = thisCastOcc;
             compiler->EndCastOccurrence(savedCastOcc);
-            suspendCompletedObject();
+            suspendCompletedObject(&fieldName);
             EmitOneFieldInit(structPtr, sd, typeName, fieldName, rightNV, ownedTempMark, fi,
                              destinationIsFresh, deferForeignReplacementDrop);
             resumeCompletedObject();
@@ -26719,14 +26867,19 @@ void MainListener::EmitFieldInitializer(
 void MainListener::EmitConstructedFieldOverrides(
         llvm::Value* structPtr,
         const std::string& typeName,
-        CFlatParser::InitializerListContext* ctx) {
+        CFlatParser::InitializerListContext* ctx,
+        bool retainUnwind,
+        std::vector<std::pair<llvm::Value*, std::string>>* retainedUnwindSlots) {
         auto* compiler = Compiler(ctx);
         if (compiler->HasNonTrivialDestructor(typeName))
         {
             // The default constructor completed, so a later override may unwind through the full object.
-            LLVMBackend::UnwindPartialScope completedObject(*compiler);
+            std::optional<LLVMBackend::UnwindPartialScope> completedObject;
+            if (!retainUnwind) completedObject.emplace(*compiler);
             compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot,
                                         structPtr, typeName);
+            if (retainUnwind && retainedUnwindSlots != nullptr)
+                retainedUnwindSlots->emplace_back(structPtr, typeName);
             EmitFieldInitializer(structPtr, typeName, ctx, false, nullptr, false,
                                  structPtr, &typeName);
             return;

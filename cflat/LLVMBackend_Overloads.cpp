@@ -43,6 +43,32 @@
 #include <set>
 #include <charconv>
 
+static antlr4::tree::TerminalNode* RightmostTerminal(antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return nullptr;
+    if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(node)) return terminal;
+    for (auto it = node->children.rbegin(); it != node->children.rend(); ++it)
+        if (auto* terminal = RightmostTerminal(*it)) return terminal;
+    return nullptr;
+}
+
+static antlr4::tree::TerminalNode* PreviousTerminal(antlr4::tree::ParseTree* node)
+{
+    auto* child = node;
+    while (child != nullptr && child->parent != nullptr)
+    {
+        auto* parent = child->parent;
+        auto it = std::find(parent->children.begin(), parent->children.end(), child);
+        while (it != parent->children.begin() && it != parent->children.end())
+        {
+            --it;
+            if (auto* terminal = RightmostTerminal(*it)) return terminal;
+        }
+        child = parent;
+    }
+    return nullptr;
+}
+
 bool LLVMBackend::IsImplicitIntegerPointeePointerConversion(
     const TypeAndValue& from, const TypeAndValue& to) const
 {
@@ -5011,11 +5037,27 @@ bool LLVMBackend::CxxImplicitObjectViable(int receiverCv, bool receiverRvalue,
             && CxxImplicitObjectRefBinds(receiverRvalue, member);
 }
 
-llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot,
+std::string LLVMBackend::CxxConstPointerArgumentError(
+        size_t argumentIndex, const std::string& argumentName,
+        const std::string& parameterName) const
+{
+        const std::string parameter = parameterName.empty()
+            ? std::string() : std::format(" '{}'", parameterName);
+        return std::format(
+            "cannot pass C++ const pointer argument {} ('{}') to mutable C++ pointer "
+            "parameter{}: it points to a const C++ object, so the parameter could write through "
+            "read-only storage",
+            argumentIndex, argumentName, parameter);
+}
+
+llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& inputArguments, bool forceRoot,
         const std::string& displayName, const std::string& cxxMemberReceiver,
         bool postfixMemberCall, const std::string& enclosingFunctionName,
-        bool allowOperatorAliasReturnStringTemp, llvm::Value* operatorReceiverStorage)
+        bool allowOperatorAliasReturnStringTemp, llvm::Value* operatorReceiverStorage,
+        const NamedVariable* implicitReceiver,
+        const std::vector<std::string>& lexicalAggregateScopes)
 {
+        std::vector<NamedVariable> arguments(inputArguments);
         // These describe only the call being lowered. Clear them before overload probing so a
         // later non-C++ call cannot make a chained result reuse an earlier sret temporary.
         lastCxxRetTemp_ = nullptr;
@@ -5184,18 +5226,21 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         std::string bareMemberName = functionName;
         if (const size_t dot = bareMemberName.find_last_of('.'); dot != std::string::npos)
             bareMemberName.erase(0, dot + 1);
-        std::string receiverType = arguments.empty()
-            ? std::string() : arguments.front().TypeAndValue.TypeName;
+        std::string receiverType = implicitReceiver != nullptr
+            ? implicitReceiver->TypeAndValue.TypeName
+            : arguments.empty() ? std::string() : arguments.front().TypeAndValue.TypeName;
         if (receiverType.empty() && !arguments.empty() && arguments.front().BaseType)
             if (auto* receiverStruct = llvm::dyn_cast<llvm::StructType>(
                     arguments.front().BaseType))
                 receiverType = receiverStruct->getName().str();
         // Compiler-synthesized member calls (view decay size/data) name lazy C++ members too.
-        if ((postfixMemberCall || !cxxMemberReceiver.empty()) && IsCxxRecord(receiverType))
+        if ((postfixMemberCall || !cxxMemberReceiver.empty() || implicitReceiver != nullptr)
+            && IsCxxRecord(receiverType))
             EnsureCxxMemberProjected(receiverType, bareMemberName);
         // Rank the full C++ member set together so all receiver cv-qualifiers participate.
         const std::string constTwinPrefix = CxxConstTwinName("");
-        if (!arguments.empty() && !bareMemberName.starts_with(constTwinPrefix)
+        if ((!arguments.empty() || implicitReceiver != nullptr)
+            && !bareMemberName.starts_with(constTwinPrefix)
             && IsCxxRecord(receiverType))
         {
             EnsureCxxMemberProjected(receiverType, bareMemberName);
@@ -5249,9 +5294,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             for (auto& candidate : plainMembers)
                                 twin->second.push_back(std::move(candidate));
                         }
-                        return CreateOverloadedFunctionCall(twinName, arguments, forceRoot,
+                        return CreateOverloadedFunctionCall(twinName, inputArguments, forceRoot,
                             displayName.empty() ? shownFunctionName : displayName,
-                            cxxMemberReceiver, postfixMemberCall, enclosingFunctionName);
+                            cxxMemberReceiver, postfixMemberCall, enclosingFunctionName,
+                            allowOperatorAliasReturnStringTemp, operatorReceiverStorage,
+                            implicitReceiver, lexicalAggregateScopes);
                     }
                 }
             }
@@ -5262,7 +5309,51 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         auto originalFuncSym = functionTable.find(functionName);
         auto funcSym = originalFuncSym;
         std::vector<FunctionSymbol> receiverMemberCandidates;
+        std::vector<FunctionSymbol> lexicalMethodCandidates;
+        std::vector<FunctionSymbol> lexicalAggregateCandidates;
         const auto bareMemberSet = functionTable.find(bareMemberName);
+        for (const auto& scope : lexicalAggregateScopes)
+        {
+            if (bareMemberSet != functionTable.end())
+            {
+                for (const auto& candidate : bareMemberSet->second)
+                    if (candidate.IsMethod && !candidate.Parameters.empty()
+                        && candidate.Parameters.front().TypeName == scope)
+                    {
+                        lexicalMethodCandidates.push_back(candidate);
+                        lexicalAggregateCandidates.push_back(candidate);
+                    }
+            }
+            const auto staticSet = functionTable.find(scope + "." + bareMemberName);
+            if (staticSet != functionTable.end())
+                for (const auto& candidate : staticSet->second)
+                    lexicalAggregateCandidates.push_back(candidate);
+            if (!lexicalAggregateCandidates.empty()) break;
+        }
+        if (implicitReceiver != nullptr && bareMemberSet != functionTable.end())
+        {
+            const std::string& lexicalType = implicitReceiver->TypeAndValue.TypeName;
+            for (const auto& candidate : bareMemberSet->second)
+            {
+                if (!candidate.IsMethod || candidate.Parameters.empty()) continue;
+                const std::string& ownerType = candidate.Parameters.front().TypeName;
+                if (ownerType == lexicalType
+                    || (candidate.IsCxx && IsCxxBaseOf(ownerType, lexicalType)))
+                    if (std::none_of(lexicalMethodCandidates.begin(), lexicalMethodCandidates.end(),
+                            [&](const FunctionSymbol& existing) {
+                                return existing.UniqueName == candidate.UniqueName;
+                            }))
+                    {
+                        lexicalMethodCandidates.push_back(candidate);
+                        lexicalAggregateCandidates.push_back(candidate);
+                    }
+            }
+            if (!lexicalMethodCandidates.empty() || !lexicalAggregateCandidates.empty())
+                funcSym = bareMemberSet;
+        }
+        if (funcSym == functionTable.end() && !lexicalAggregateCandidates.empty()
+            && bareMemberSet != functionTable.end())
+            funcSym = bareMemberSet;
         if ((postfixMemberCall || receiverHasCxxMember) && !arguments.empty()
             && bareMemberSet != functionTable.end())
         {
@@ -5280,10 +5371,26 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         }
         if (funcSym == functionTable.end())
         {
+            if (!lexicalAggregateCandidates.empty())
+                for (const auto& scope : lexicalAggregateScopes)
+                {
+                    auto staticSet = functionTable.find(scope + "." + bareMemberName);
+                    if (staticSet != functionTable.end())
+                    {
+                        funcSym = staticSet;
+                        break;
+                    }
+                }
+        }
+        if (funcSym == functionTable.end())
+        {
             if (TryBindCxxImplicitArgumentConversions(functionName, arguments))
-                return CreateOverloadedFunctionCall(StripCxxConstTwin(functionName), arguments,
+                return CreateOverloadedFunctionCall(StripCxxConstTwin(functionName), inputArguments,
                                                     forceRoot, displayName, cxxMemberReceiver,
-                                                    postfixMemberCall, enclosingFunctionName);
+                                                    postfixMemberCall, enclosingFunctionName,
+                                                    allowOperatorAliasReturnStringTemp,
+                                                    operatorReceiverStorage,
+                                                    implicitReceiver, lexicalAggregateScopes);
             if (std::string refusal = GetCxxBindingRefusal(functionName); !refusal.empty())
                 LogErrorMessage(refusal);
             else if (displayName.empty())
@@ -5294,6 +5401,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         }
 
         const std::vector<FunctionSymbol>* candidateSet = &funcSym->second;
+        if (!lexicalAggregateCandidates.empty())
+            candidateSet = &lexicalAggregateCandidates;
+        else if (!lexicalMethodCandidates.empty())
+            candidateSet = &lexicalMethodCandidates;
         const bool cxxReceiverHasMember = !cxxMemberReceiver.empty()
             && CxxClassHasMemberNamed(cxxMemberReceiver, bareMemberName);
         if ((postfixMemberCall || cxxReceiverHasMember) && !arguments.empty())
@@ -5441,15 +5552,16 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             candidateSet = &cxxOperatorCandidates;
         }
         std::vector<FunctionSymbol> defaultCandidates;
+        const size_t overloadArity = arguments.size() + (lexicalMethodCandidates.empty() ? 0 : 1);
         if (!cxxDefaultWrapperRequests_.empty()
             && std::any_of(candidateSet->begin(), candidateSet->end(), [&](const auto& candidate) {
                 return candidate.UniqueName.starts_with("__cflat_dflt_")
                     || (candidate.IsCxx && !candidate.DefaultArguments.empty()
-                        && candidate.Parameters.size() > arguments.size());
+                        && candidate.Parameters.size() > overloadArity);
             }))
         {
             defaultCandidates = *candidateSet;
-            PrepareCxxDefaultCandidates(defaultCandidates, arguments.size());
+            PrepareCxxDefaultCandidates(defaultCandidates, overloadArity);
             candidateSet = &defaultCandidates;
         }
         const auto& candidates = *candidateSet;
@@ -5507,9 +5619,20 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         }
 
         std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> resolvedCandidate;
+        auto usesImplicitReceiver = [&](const FunctionSymbol& candidate) {
+            if (implicitReceiver == nullptr || candidate.Parameters.empty()) return false;
+            if (candidate.IsMethod) return !lexicalMethodCandidates.empty();
+            return lexicalMethodCandidates.empty() && arguments.empty()
+                && candidate.Parameters.front().Pointer
+                && candidate.Parameters.front().TypeName
+                    == implicitReceiver->TypeAndValue.TypeName;
+        };
 
         for (const auto& candidate : candidates)
         {
+            std::vector<NamedVariable> candidateArguments = arguments;
+            if (usesImplicitReceiver(candidate))
+                candidateArguments.insert(candidateArguments.begin(), *implicitReceiver);
             if (candidate.Variadic)
             {
                 // Route through MatchFunction so named fixed params are reordered correctly.
@@ -5517,7 +5640,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 // out of this loop while a later candidate might still match - see the
                 // non-probed re-run below for how the diagnostic is recovered when nothing
                 // scores at all.
-                auto matched = MatchFunction(arguments, candidate.Parameters, true, true,
+                auto matched = MatchFunction(candidateArguments, candidate.Parameters, true, true,
                                               &candidate.DefaultArguments);
                 if (matched.size() > 0)
                 {
@@ -5526,14 +5649,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     // siblings still score (ComputeOverloadFunction ranks the variadic last).
                     if (!candidate.IsCxx) break;
                 }
-                else if (arguments.empty() && candidate.Parameters.empty() && candidate.IsCxx)
+                else if (candidateArguments.empty() && candidate.Parameters.empty() && candidate.IsCxx)
                 {
                     // `f(...)` is viable with zero actual arguments. MatchFunction's empty
                     // result cannot distinguish that valid bind from a failed bind.
-                    resolvedCandidate.emplace_back(arguments, candidate);
+                    resolvedCandidate.emplace_back(candidateArguments, candidate);
                 }
             }
-            else if (arguments.size() == 0)
+            else if (candidateArguments.size() == 0)
             {
                 auto binding = ComputeArgumentPositions({}, candidate.Parameters, false, 0,
                                                         &candidate.DefaultArguments);
@@ -5564,7 +5687,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             }
                         if (haveDeclaration && !hasClassDefault) continue;
                     }
-                    resolvedCandidate.emplace_back(arguments, candidate);
+                    resolvedCandidate.emplace_back(candidateArguments, candidate);
                     // Native CFlat semantics: the first zero-argument-bindable candidate in
                     // registration order wins outright. Only C++ declarations and the generated
                     // default-argument wrappers need every candidate scored, because a class-typed
@@ -5576,7 +5699,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
             else
             {
-                auto matched = MatchFunction(arguments, candidate.Parameters, false, true,
+                auto matched = MatchFunction(candidateArguments, candidate.Parameters, false, true,
                                               &candidate.DefaultArguments);
                 if (matched.size() > 0)
                 {
@@ -5648,7 +5771,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                            std::pair{functionName, error});
                 llvm::Value* retried = CreateOverloadedFunctionCall(functionName, arguments,
                     forceRoot, displayName, cxxMemberReceiver, postfixMemberCall,
-                    enclosingFunctionName);
+                    enclosingFunctionName, false, nullptr, implicitReceiver,
+                    lexicalAggregateScopes);
                 cxxDemandRefusalRelay_ = std::move(saved);
                 // EmitError does not return: reaching here means the retry bound a sibling.
                 LogError(error);
@@ -5992,9 +6116,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 }
             }
             if (TryBindCxxImplicitArgumentConversions(functionName, arguments))
-                return CreateOverloadedFunctionCall(StripCxxConstTwin(functionName), arguments,
+                return CreateOverloadedFunctionCall(StripCxxConstTwin(functionName), inputArguments,
                                                     forceRoot, displayName, cxxMemberReceiver,
-                                                    postfixMemberCall, enclosingFunctionName);
+                                                    postfixMemberCall, enclosingFunctionName,
+                                                    allowOperatorAliasReturnStringTemp,
+                                                    operatorReceiverStorage,
+                                                    implicitReceiver, lexicalAggregateScopes);
             implicitConversionRefusal = std::move(cxxImplicitConversionRefusal_);
             cxxImplicitConversionRefusal_.clear();
             if (deferredRvalueRef)
@@ -6049,10 +6176,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     const bool rebound = TryBindRefusedCxxMember(retryReceiver, bareMemberName);
                     if (rebound)
                         retried = CreateOverloadedFunctionCall(StripCxxConstTwin(functionName),
-                                                               arguments, forceRoot,
+                                                               inputArguments, forceRoot,
                                                                displayName, cxxMemberReceiver,
                                                                postfixMemberCall,
-                                                               enclosingFunctionName);
+                                                               enclosingFunctionName,
+                                                               allowOperatorAliasReturnStringTemp,
+                                                               operatorReceiverStorage,
+                                                               implicitReceiver,
+                                                               lexicalAggregateScopes);
                     cxxOverloadRebindInFlight_.erase(retryKey);
                     if (rebound) return retried;
                 }
@@ -6272,6 +6403,21 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             if (!receiverType.empty() && IsCxxRecord(receiverType)
                 && ReportCxxMemberThroughNonPublicBase(receiverType, bareMemberName))
                 return nullptr;
+            const bool objectlessInstanceCall = resolvedCandidate.empty()
+                && implicitReceiver == nullptr && !lexicalAggregateScopes.empty()
+                && !candidates.empty()
+                && std::all_of(candidates.begin(), candidates.end(), [&](const auto& candidate) {
+                    return candidate.IsMethod && !candidate.Parameters.empty()
+                        && candidate.Parameters.size() == arguments.size() + 1
+                        && std::any_of(lexicalAggregateScopes.begin(), lexicalAggregateScopes.end(),
+                            [&](const std::string& scope) {
+                                return candidate.Parameters.front().TypeName == scope;
+                            });
+                });
+            if (objectlessInstanceCall)
+                LogError(std::format(
+                    "call to non-static member function '{}' without an object argument",
+                    bareMemberName));
             std::string msg = std::format("no overload of '{}' matches the given arguments.\n", shownFunctionName);
 
             // Recover a named-argument diagnostic only from candidates whose parameter names
@@ -6994,6 +7140,32 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         };
         std::vector<AliasSlotArg> aliasSlots;
         RecordReceiverCallResolution(receiverCallSite, functionName, candidate.UniqueName);
+        if (symbolSink_ != nullptr && receiverCallSite != nullptr)
+        {
+            std::string targetName = candidate.SourceName;
+            if (candidate.IsMethod && !candidate.Parameters.empty())
+            {
+                const size_t dot = targetName.rfind('.');
+                const std::string memberName = targetName.substr(
+                    dot == std::string::npos ? 0 : dot + 1);
+                targetName = candidate.Parameters.front().TypeName + "." + memberName;
+            }
+            auto* site = static_cast<antlr4::tree::ParseTree*>(
+                const_cast<void*>(receiverCallSite));
+            if (auto* name = PreviousTerminal(site); name != nullptr)
+            {
+                const size_t dot = targetName.rfind('.');
+                const std::string shortName = targetName.substr(
+                    dot == std::string::npos ? 0 : dot + 1);
+                if (name->getText() == shortName)
+                {
+                    auto* token = name->getSymbol();
+                    symbolSink_->RegisterResolvedCall(GetSourceFilePath(),
+                        (int)token->getLine(), (int)token->getCharPositionInLine(),
+                        (int)token->getText().size(), targetName);
+                }
+            }
+        }
         // #8: a native method on a const receiver must be read-only (inferred from its body).
         if (!matched.empty() && IsNativeReceiverMethod(candidate))
             RefuseConstReceiverMethodCall(candidate, matched.front(), functionName, receiverText);
@@ -7146,11 +7318,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     const std::string sourceName = !arg.CallerName.empty()
                         ? arg.CallerName : source.VariableName.empty()
                             ? "<argument>" : source.VariableName;
-                    LogError(std::format(
-                        "cannot pass C++ const pointer argument {} ('{}') to mutable C++ pointer "
-                        "parameter '{}': it points to a const C++ object, so the parameter could "
-                        "write through read-only storage",
-                        argIndex + 1, sourceName, param.VariableName));
+                    LogError(CxxConstPointerArgumentError(argIndex + 1, sourceName,
+                                                          param.VariableName));
                 }
             }
 
@@ -7970,6 +8139,26 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 // Temporary blessing until the deferred general move-sink borrow rule lands.
                 bool tempUniqueFieldSource = JoinCarriesOwningTempUniqueField(arg.Primary)
                     || (arg.FromOwningTempField && arg.OwningTempParent);
+                if ((isCoreUniqueConstructor || isCoreUniqueReset) && !isNull && isOwned
+                    && !tempUniqueFieldSource && arg.TypeAndValue.Pointer)
+                {
+                    std::string uniqueType = isCoreUniqueConstructor
+                        ? SpellType(*this, TypeAndValue{ .TypeName = functionName })
+                        : [&] {
+                            TypeAndValue base = candidate.Parameters[0];
+                            base.Pointer = false;
+                            base.ElemPointer = false;
+                            base.PointerDepth = 0;
+                            base.IsArrayView = false;
+                            return SpellType(*this, base);
+                        }();
+                    std::string destinationName;
+                    if (isCoreUniqueReset && !matched.empty())
+                        destinationName = matched[0].CallerName.empty()
+                            ? matched[0].TypeAndValue.VariableName : matched[0].CallerName;
+                    RecordUniqueOwnerLoopSink(arg, uniqueType, destinationName,
+                        isCoreUniqueReset);
+                }
                 if (!isNull && !isOwned && !tempUniqueFieldSource)
                 {
                     const std::string sourceName = BorrowedSourceName(arg);
@@ -9935,6 +10124,11 @@ void LLVMBackend::MarkPointerRebound(const std::string& name, const std::string&
                 nv = &it2->second;
             if (nv == nullptr) continue;
             nv->PointerRebound = true;
+            if (!ownFlagLoopReownSnapshots_.empty() && nv->Storage != nullptr
+                && nv->TypeAndValue.Pointer && !nv->TypeAndValue.IsArrayView
+                && !nv->TypeAndValue.IsFunctionPointer && nv->FieldName.empty()
+                && llvm::isa<llvm::AllocaInst>(nv->Storage))
+                loopIterationAssigned_.insert(nv->Storage);
             // Recorded, not consulted, here: a retiring consumer must also prove the store was
             // reached (same basic block), which is why the block travels with the bit.
             nv->ReboundToOwnedValue = reboundToOwnedValue;

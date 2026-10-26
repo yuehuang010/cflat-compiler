@@ -2098,6 +2098,7 @@ std::string LLVMBackend::AggregatePointeeTag(const std::string& spelling, int& o
 // a known record under the same canonical spelling leaves the index exact, so it stays clean.
 void LLVMBackend::StoreCxxRecordEntry(const std::string& name, const CRecordEntry& record)
 {
+        cxxFriendNames_.insert(record.friendNames.begin(), record.friendNames.end());
         auto [it, inserted] = cxxRecordEntries_.try_emplace(name, record);
         if (!inserted)
         {
@@ -5846,6 +5847,7 @@ void LLVMBackend::MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::v
             rec.hasVirtualBases = r.hasVirtualBases; rec.isAbstract = r.isAbstract;
             rec.isFinal = r.isFinal;
             rec.hasFriendOperators = r.hasFriendOperators;
+            rec.friendNames = r.friendNames;
             rec.bases = r.bases; rec.layoutRefusal = r.layoutRefusal;
             rec.virtualBases = r.virtualBases;
             rec.canonicalCtype = r.canonicalCtype;
@@ -8959,6 +8961,7 @@ uint64_t LLVMBackend::CxxGroupHeaderHash(const CxxRequestGroup& group) const
         raw.isFinal = cached.isFinal;
         raw.isAbstract = cached.isAbstract;
         raw.hasFriendOperators = cached.hasFriendOperators;
+        raw.friendNames = cached.friendNames;
         raw.bases = cached.bases;
         raw.virtualBases = cached.virtualBases;
         raw.layoutRefusal = cached.layoutRefusal;
@@ -13667,7 +13670,7 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                 }
             }
         const bool functionMacro = cxxFunctionMacros_.count(functionName) != 0;
-        if ((functionName.find('.') == std::string::npos && !functionMacro && !memberCall)
+        if ((functionName.find('.') == std::string::npos && !functionMacro && !memberCall && !adlCall)
             || !HasCxxImportGroup())
             return false;
         for (NamedVariable& argument : arguments)
@@ -14525,10 +14528,18 @@ bool LLVMBackend::RequestCxxFreeFunction(const std::string& functionName,
                  */
                 const std::string scope = wrapper.name + "_adl";
                 std::string forward;
+                // Each parameter is forwarded as its declared type: an rvalue-reference one binds a literal.
                 for (size_t i = 0; i < parameterSpellings.size(); ++i)
-                    forward += (i != 0 ? ", p" : "p") + std::to_string(i);
-                wrapper.source = "namespace " + scope + " { void " + target.substr(0, target.find('('))
-                    + "() = delete; inline decltype(auto) call(" + parameters + ") noexcept(noexcept("
+                {
+                    const std::string pi = "p" + std::to_string(i);
+                    forward += (i != 0 ? ", " : "") + std::string("static_cast<decltype(") + pi
+                        + ") &&>(" + pi + ")";
+                }
+                // An unqualified name is an ordinary call plus ADL: the global overloads stay visible.
+                const std::string hideGlobal = functionName.find('.') == std::string::npos
+                    ? std::string() : "void " + target.substr(0, target.find('(')) + "() = delete; ";
+                wrapper.source = "namespace " + scope + " { " + hideGlobal
+                    + "inline decltype(auto) call(" + parameters + ") noexcept(noexcept("
                     + target + ")) { return " + target + "; } }\n";
                 call = scope + "::call(" + forward + ")";
             }
@@ -20372,6 +20383,26 @@ bool LLVMBackend::CompleteCxxTemplateTypeArgs(const std::string& baseName,
         }
         typeArgs = std::move(completed);
         return true;
+}
+
+bool LLVMBackend::TryResolveDefaultedCxxGenericBaseAlias(const std::string& alias,
+                                                          std::string& resolvedType,
+                                                          std::string& error)
+{
+        resolvedType.clear();
+        error.clear();
+        if (!HasCxxImportGroup() || !IsGenericBaseAlias(alias)) return false;
+        const std::string baseName = ResolveGenericBaseAlias(alias);
+        if (!HasCxxClassTemplate(baseName)) return false;
+        std::vector<std::string> typeArgs;
+        if (!CompleteCxxTemplateTypeArgs(baseName, typeArgs)) return false;
+        const std::string mangledName = MangleGenericInstance(*this, baseName, typeArgs);
+        if (!TryRequestCxxType(baseName, typeArgs, mangledName, error)
+            && !IsCxxForeignTypeRegistered(ResolveTypeAlias(mangledName)))
+            return false;
+        error.clear();
+        resolvedType = ResolveTypeAlias(mangledName);
+        return !resolvedType.empty();
 }
 
 /*

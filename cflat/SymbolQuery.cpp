@@ -304,6 +304,7 @@ struct SymbolLineToken
     std::string receiver;
     std::string member;
     bool hasMember = false;
+    size_t start = 0;
     size_t end = 0;
 };
 
@@ -349,6 +350,7 @@ static std::vector<SymbolLineToken> ScanSymbolLine(const std::string& line)
         const size_t start = pos++;
         while (pos < line.size() && IsIdentifierChar(line[pos])) ++pos;
         token.path = line.substr(start, pos - start);
+        token.start = start;
         token.member = token.path;
         token.receiver = token.path;
 
@@ -952,7 +954,9 @@ static void DumpSymbolLine(const LspSymbolIndex& index,
     std::unordered_set<std::string> printed;
     for (const auto& token : ScanSymbolLine(sourceLine))
     {
-        const SymbolDef* def = index.Lookup(token.path);
+        const SymbolDef* def = index.LookupResolvedCall(
+            preferredFile, (int)lineNumber, (int)token.start);
+        if (!def) def = index.Lookup(token.path);
         if (preferredFunction && lineNumber == (size_t)preferredFunction->line)
         {
             const std::string preferredName = SymbolDisplayName(*preferredFunction);

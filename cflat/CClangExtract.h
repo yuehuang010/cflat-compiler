@@ -473,6 +473,9 @@ namespace cflat_cinterop
         bool isFinal = false;               // final class: a reference to it names a complete object
         bool isAbstract = false;            // has an unoverridden pure virtual: cannot be created
         bool hasFriendOperators = false;    // declares a friend operator (found only by ADL)
+        // Simple names of every friend function (hidden friends are never published); a call
+        // to one of these names may reach it through ADL.
+        std::vector<std::string> friendNames;
         std::vector<RawCxxBase> bases;      // DIRECT bases, in declaration order
         // EVERY virtual base, direct or indirect, at its offset in THIS class's complete-object
         // layout - the only place a shared virtual base's offset is fixed.

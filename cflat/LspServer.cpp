@@ -893,16 +893,22 @@ private:
         ExtractTextDocPosition(*params, uri, line, character);
 
         std::string text;
+        std::string filePath;
         {
             std::lock_guard<std::mutex> lock(docsMutex_);
             if (auto it = docs_.find(uri); it != docs_.end())
+            {
                 text = it->second.text;
+                filePath = it->second.filePath;
+            }
         }
 
         std::string word = extractWordAt(text, line, character);
         auto index = GetCurrentIndex();
         std::string receiver;
-        const SymbolDef* def = ResolveQualifiedSymbol(index.get(), text, line, character, word, receiver);
+        const SymbolDef* def = index->LookupResolvedCall(filePath, line + 1, character);
+        if (!def)
+            def = ResolveQualifiedSymbol(index.get(), text, line, character, word, receiver);
 
         std::string value;
         if (!def && !word.empty() && receiver.empty())
@@ -1243,7 +1249,9 @@ private:
         // lookup. An unqualified Lookup(word) on a method name like "get" could
         // otherwise hijack the answer with a same-named top-level function.
         std::string receiver;
-        const SymbolDef* def = ResolveQualifiedSymbol(index.get(), text, line, character, word, receiver);
+        const SymbolDef* def = index->LookupResolvedCall(filePath, line + 1, character);
+        if (!def)
+            def = ResolveQualifiedSymbol(index.get(), text, line, character, word, receiver);
 
         // Cursor is on a variable name. Prefer jumping to the variable's own
         // declaration site when we recorded one; otherwise fall through to

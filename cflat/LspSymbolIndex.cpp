@@ -85,6 +85,28 @@ void LspSymbolIndex::RegisterFunctionRange(const std::string& name, const std::s
     functionRanges_.push_back({name, file, startLine, endLine});
 }
 
+void LspSymbolIndex::RegisterResolvedCall(const std::string& file, int line, int column,
+                                          int length, const std::string& targetName)
+{
+    if (file.empty() || line <= 0 || column < 0 || length <= 0 || targetName.empty()) return;
+    auto existing = std::find_if(resolvedCalls_.begin(), resolvedCalls_.end(), [&](const auto& call) {
+        return call.file == file && call.line == line && call.column == column;
+    });
+    ResolvedCallReference reference{file, line, column, length, targetName};
+    if (existing == resolvedCalls_.end()) resolvedCalls_.push_back(std::move(reference));
+    else *existing = std::move(reference);
+}
+
+const SymbolDef* LspSymbolIndex::LookupResolvedCall(const std::string& file, int line,
+                                                    int column) const
+{
+    for (auto it = resolvedCalls_.rbegin(); it != resolvedCalls_.rend(); ++it)
+        if (it->file == file && it->line == line
+            && column >= it->column && column < it->column + it->length)
+            return Lookup(it->targetName);
+    return nullptr;
+}
+
 void LspSymbolIndex::MergeFrom(const LspSymbolIndex& other)
 {
     for (const auto& [name, def] : other.symbols_)
@@ -97,6 +119,7 @@ void LspSymbolIndex::MergeFrom(const LspSymbolIndex& other)
         if (!variables_.contains(name))
             variables_.emplace(name, info);
     functionRanges_.insert(functionRanges_.end(), other.functionRanges_.begin(), other.functionRanges_.end());
+    resolvedCalls_.insert(resolvedCalls_.end(), other.resolvedCalls_.begin(), other.resolvedCalls_.end());
     candidates_.insert(candidates_.end(), other.candidates_.begin(), other.candidates_.end());
 }
 
@@ -130,6 +153,7 @@ void LspSymbolIndex::Clear()
     variables_.clear();
     variableLocations_.clear();
     functionRanges_.clear();
+    resolvedCalls_.clear();
     candidates_.clear();
 }
 
@@ -286,6 +310,9 @@ void LspSymbolIndex::RemapFile(const std::string& fromFile, const std::string& t
     for (auto& range : functionRanges_)
         if (range.file == fromFile)
             range.file = toFile;
+    for (auto& call : resolvedCalls_)
+        if (call.file == fromFile)
+            call.file = toFile;
     for (auto& cand : candidates_)
         if (cand.file == fromFile)
             cand.file = toFile;

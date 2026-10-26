@@ -282,6 +282,7 @@ import cpp "library/cpp_interop_anon.h";
 import cpp "library/cpp_interop_explicit.h";
 import cpp "library/cpp_t253_brace_move.hpp";
 import cpp "library/cpp_t261_named_unwind.hpp";
+import cpp "library/cpp_t470_braceunwind.hpp";
 import cpp "library/cpp_interop_refgate.h";
 import cpp "library/cpp_interop_basic.cpp";
 import cpp "library/cpp_interop_member_shadow.h";
@@ -367,8 +368,11 @@ import cpp "library/cpp_interop_c2_repeat.h";
 // A C++ CONSTRUCTOR parameter declared `T&` binds the argument's address.
 import cpp "library/cpp_interop_ctorref.h";
 import cpp "library/cpp_interop_tpl.h";
+using T469Gate = cppt.dflt.Gate;
+using T469GateExplicit = cppt.dflt.Gate<cppt.dflt.CountDone>;
 import cpp "library/cpp_interop_varctor.h";
 import cpp "library/cpp_interop_freeoptpl.h";
+import cpp "library/cpp_t460_operator_lookup.hpp";
 import cpp "library/cpp_interop_fixedarray.hpp";
 import cpp "library/cpp_interop_arraybool.hpp";
 // `explicit` constructors are not implicit conversions at a call argument; the non-explicit
@@ -2174,6 +2178,42 @@ int t430CxxCtorLocal(int x) {
     return value.z;
 }
 int t430DtorField(int x) { T430D d0 = default; T430DBox value = { d = d0, b = t261.bval(x) }; return value.b; }
+// T470: replacing a completed brace field and a completed brace argument keep sibling cleanup live.
+struct T470Replace { t470.Counted c; t470.TC t; int z = 0; T470Replace() { z = 3; } };
+struct T470HV { t470.Counted m; int k = 1; };
+struct T470Inner { t470.Counted c; t470.TC t; int z = 0; T470Inner() { z = 3; } };
+struct T470Outer { T470HV h; T470Inner u; int k = 0; };
+int t470Replace(int x) {
+    t470.TC source = default;
+    source.value = 8;
+    t470.set_throw(x);
+    T470Replace value = { t = source };
+    t470.set_throw(0);
+    return value.t.value * 10 + value.z;
+}
+int t470NestedReplace(int x) {
+    T470HV h = default;
+    t470.TC source = default;
+    source.value = 8;
+    t470.set_throw(x);
+    T470Outer value = { h = h, u = { t = source } };
+    t470.set_throw(0);
+    return value.h.m.value * 100 + value.u.t.value * 10 + value.k;
+}
+int t470Built = 0;
+int t470Destroyed = 0;
+int t470ArgDestroyed = 0;
+int t470ArgBuilt = 0;
+struct T470Owned { T470Owned() { t470Built = t470Built + 1; } ~T470Owned() { t470Destroyed = t470Destroyed + 1; } };
+struct T470Arg {
+    unique<T470Owned> p;
+    int z = 0;
+    T470Arg() { t470ArgBuilt = t470ArgBuilt + 1; p = unique<T470Owned>(new T470Owned()); z = 5; }
+    ~T470Arg() { t470ArgDestroyed = t470ArgDestroyed + 1; }
+};
+int t470Take2(T470Arg w, int y) { return w.z + y; }
+int t470CallLaterNamed(int x) { return t470Take2(w: { z = 1 }, y: t470.bval(x)); }
+int t470CallLaterPositional(int x) { return t470Take2({ z = 1 }, t470.bval(x)); }
 // T313: the element block of a tag form (or `new T{...}`) whose attribute throws is freed once,
 // through the operator new/delete pair it came from: the user pair when the struct declares one.
 int t313UnNew = 0;
@@ -2709,6 +2749,9 @@ namespace T465CppNamespaceSizeof
 {
     int Value() { return (int)sizeof(std.string); }
 }
+// T469 r2: a namespaced global named like a namespace keeps master's namespace-call lookup.
+namespace T469NsQ { int c = 3; int f() { return c; } }
+namespace T469NsA { int T469NsQ = 5; int g() { return T469NsQ.f(); } }
 
 union T440TrivialCppUnion { t138.Plain plain; int tag; };
 // A forward by-value CFlat holder is accepted once its body completes.
@@ -2743,6 +2786,8 @@ extern int main()
     t217_const_ptr()->m = 12;
     if (t217_const_ptr()->m != 12 || t217_const_ptr()->n != 4) return 4220;
     if (t217_const.bump() != 22 || t217_const.m != 22 || t217_const.n != 4) return 4220;
+    // T477 accept-set: a const pointer result still selects the const method overload.
+    if (t217_const_ptr()->bump() != 32 || t217_const_ptr()->m != 32 || t217_const_ptr()->n != 4) return 4221;
     t217_outer.inner.m = 11;
     if (t217_outer.inner.m != 11 || t217_outer.inner.n != 6) return 4220;
     const T217Outer t217LocalConst = t217_outer;
@@ -7347,6 +7392,40 @@ extern int main()
         if (dfltLabeler.label("x", cppi.DefSize(3, 0)) != 128)       return 31505;
     }
 
+    if (T469NsA.g() != 3) return 46910;
+    // T469: CFlat aliases of defaulted C++ class templates share each constructor spelling.
+    {
+        int before = cppt.dflt.done_calls();
+        T469Gate value = T469Gate(1);
+        if (value.arrive() != 0 || cppt.dflt.done_calls() != before + 1) return 46901;
+    }
+    {
+        int before = cppt.dflt.done_calls();
+        T469Gate<> value = T469Gate<>(1);
+        if (value.arrive() != 0 || cppt.dflt.done_calls() != before + 1) return 46902;
+    }
+    {
+        int before = cppt.dflt.done_calls();
+        T469Gate value{1};
+        if (value.arrive() != 0 || cppt.dflt.done_calls() != before + 1) return 46903;
+    }
+    {
+        int before = cppt.dflt.done_calls();
+        T469Gate* value = new T469Gate(1);
+        if (value == nullptr || value->arrive() != 0) return 46904;
+        delete value;
+        if (cppt.dflt.done_calls() != before + 1) return 46905;
+    }
+    {
+        int before = cppt.dflt.done_calls();
+        T469GateExplicit value = T469GateExplicit(1);
+        if (value.arrive() != 0 || cppt.dflt.done_calls() != before + 1) return 46906;
+    }
+    {
+        function<int(int)> T469Gate = (int x) => { return x + 40; };
+        if (T469Gate(2) != 42) return 46907;
+    }
+
     // cppi.calls_missing_symbol is an inline body whose callee is declared and
     // never defined; nothing here calls it, so it must not reach the linker. Its neighbour,
     // an ordinary inline function, is called and must run.
@@ -7698,6 +7777,45 @@ extern int main()
     t219.OrderSource t219OrderRight = default; t219OrderRight.v = 4;
     bool t219Less = t219OrderLeft < t219OrderRight;
     if (!t219Less || t219.order_choice != 1044) return 65010;
+
+    // T460 ACCEPT SET: associated hidden friends and the member / explicit-conversion controls.
+    t460.ExactFriend t460ExactA = default; t460ExactA.v = 1;
+    t460.ExactFriend t460ExactB = default; t460ExactB.v = 2;
+    if (t460ExactA + t460ExactB != 43) return 65011;
+    t460.NamedFriend t460Named = default; t460Named.v = 3;
+    if (t460.f(t460Named) != 73) return 65012;
+    t460.MemberBuiltin t460Member = default; t460Member.v = 5;
+    if (t460Member + 1 != 106) return 65013;
+    t460.ExplicitSource t460Explicit = default; t460Explicit.v = 5;
+    if (t460Explicit + 1 != 78) return 65014;
+    // T460: ordinary global lookup finds this operator for namespaced converted operands.
+    t460.GlobalSource t460GlobalA = default;
+    t460.GlobalSource t460GlobalB = default;
+    if (t460GlobalA + t460GlobalB != 64) return 65016;
+    t460r2.ScopedSource t460ScopedConversion = default;
+    if (t460ScopedConversion % 2 != 47) return 65017;
+    if ((t460ScopedConversion & 2) != 48) return 65018;
+    if ((t460ScopedConversion | 2) != 49) return 65019;
+    if ((t460ScopedConversion ^ 2) != 50) return 65020;
+    if ((t460ScopedConversion << 2) != 51) return 65021;
+    if ((t460ScopedConversion >> 2) != 52) return 65022;
+    t460r2.ExplicitOverride t460ExplicitOverride = default;
+    if (t460ExplicitOverride + 1 != 72) return 65023;
+    // T460 r3: a hidden friend beside a visible same-name overload (ADL), and a hidden friend of a namespace that declares no f.
+    t460r2.Associated t460Assoc = default; t460Assoc.v = 3;
+    if (t460r2.f(t460Assoc) != 73 || t460r2.f(5) != 15) return 65024;
+    t460.NamedFriend t460NamedTwo = default; t460NamedTwo.v = 2;
+    if (t460.f(t460NamedTwo) != 72) return 65025;
+    // T460 r4: an unqualified hidden friend of a global class, beside a visible overload, and ranked
+    // against a visible overload of a namespace (ADL reaches both).
+    T460GlobalHidden t460GlobalHiddenValue = default;
+    if (t460_global_f(t460GlobalHiddenValue) != 84) return 65026;
+    T460GlobalBeside t460GlobalBesideValue = default;
+    if (t460_beside_f(t460GlobalBesideValue) != 85 || t460_beside_f(5) != 33) return 65027;
+    // A hidden friend reached through an enum nested in its class (ADL associated class).
+    if (t460_enum_f(T460EnumHolder.E.one) != 89) return 65040;
+    t460gate.X t460GateValue = default;
+    if (t460gate.f(t460GateValue, 2) != 82) return 65028;
 
     // ---- scalar-to-class reference conversion and chained class returns -------------------------
     double screfScalar = 2.5;
@@ -17697,6 +17815,15 @@ int LoweredUserDtorAssignLegs(int argc)
     expect_error("cannot bind an rvalue") {
         cpp_t67.ptr_bump(t325F ? t325P : t325O++);   // false-arm postfix is queued until the arm flush
     }
+    int t475I = 10;
+    int t475J = 20;
+    cpp_t67.ibump(t325T ? t475I : t475J);
+    if (t475I != 11 || t475J != 20) return 67047;
+    cpp_t67.ibump(t325F ? t475I : t475J);
+    if (t475I != 11 || t475J != 21) return 67048;
+    int* t475ArmPtr = &(t325T ? t475I : t475J);
+    *t475ArmPtr = 12;
+    if (t475I != 12 || t475J != 21) return 67049;
     t67CallCount = 0;
     if (cpp_t67.by_value(t67NextValue()) != 101 || t67CallCount != 1) return 67013;
     t67CallCount = 0;
@@ -18499,6 +18626,37 @@ int LoweredUserDtorAssignLegs(int argc)
     t430DtorCount = 0;
     t258A = t261.guarded(t430DtorField, 0);
     if (t258A != 0 || t430DtorCount != 3) return 25431;
+    // T470: the replaced field is destroyed once, and every completed sibling is unwound once.
+    t470.reset();
+    t258A = t470.guarded(t470Replace, 1);
+    t470.set_throw(0);
+    if (t258A != -7 || t470.copyAttempts() != 1 || t470.live() != 0
+        || t470.countedLive() != 0 || t470.tcLive() != 0
+        || t470.ctors() + t470.copies() + t470.moves() != t470.dtors()) return 25432;
+    t470.reset();
+    t258A = t470.guarded(t470Replace, 0);
+    if (t258A != 83 || t470.copies() != 1 || t470.live() != 0
+        || t470.ctors() + t470.copies() + t470.moves() != t470.dtors()) return 25433;
+    t470.reset();
+    t258A = t470.guarded(t470NestedReplace, 0);
+    if (t258A != 80 || t470.copies() != 2 || t470.live() != 0
+        || t470.ctors() + t470.copies() + t470.moves() != t470.dtors()) return 25435;
+    t470Built = t470Destroyed = t470ArgDestroyed = t470ArgBuilt = 0;
+    t258A = t470.guarded(t470CallLaterNamed, 1);
+    if (t258A != -7 || t470ArgBuilt != 1 || t470Built != 1
+        || t470Destroyed != 1 || t470ArgDestroyed != 1) return 25436;
+    t470Built = t470Destroyed = t470ArgDestroyed = t470ArgBuilt = 0;
+    t258A = t470.guarded(t470CallLaterNamed, 0);
+    if (t258A != 1 || t470ArgBuilt != 1 || t470Built != 1
+        || t470Destroyed != 1 || t470ArgDestroyed != 1) return 25437;
+    t470Built = t470Destroyed = t470ArgDestroyed = t470ArgBuilt = 0;
+    t258A = t470.guarded(t470CallLaterPositional, 1);
+    if (t258A != -7 || t470ArgBuilt != 1 || t470Built != 1
+        || t470Destroyed != 1 || t470ArgDestroyed != 1) return 25438;
+    t470Built = t470Destroyed = t470ArgDestroyed = t470ArgBuilt = 0;
+    t258A = t470.guarded(t470CallLaterPositional, 0);
+    if (t258A != 1 || t470ArgBuilt != 1 || t470Built != 1
+        || t470Destroyed != 1 || t470ArgDestroyed != 1) return 25439;
     // T313: a tag-form block freed when an attribute throws (heap audit: no leak), then the user pair.
     HeapAudit.enable();
     int t313Base = (int)HeapAudit.reportLeaks();

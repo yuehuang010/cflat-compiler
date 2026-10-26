@@ -6111,6 +6111,7 @@ extern int main()
     total++; passed += testConstStringLiterals() ? 1 : 0;
     total++; passed += testConstWholeWord() ? 1 : 0;
     total++; passed += testConstTrailing() ? 1 : 0;
+    total++; passed += testT471BareCalls() ? 1 : 0;
     total++; passed += testStringDataMut() ? 1 : 0;
     total++; passed += testConstFunctionType() ? 1 : 0;
     total++; passed += testT345ConstructorLambdas() ? 1 : 0;
@@ -9272,6 +9273,73 @@ struct C08TIfaceHolder { IC08TRead r; int k = 0; };
 int c08TViaConst(const IC08TRead r) { return r.read(); }
 int c08TViaAlias(const alias IC08TRead r) { return r.read(); }
 int c08TViaHolder(const C08TIfaceHolder h) { return h.r.read(); }
+
+struct T471BareCall
+{
+    int value = 5;
+    int callFree() { return t471BareFree(this); }
+    int callConstFree() const { return t471BareFreeConst(this); }
+    int callLocalFree() { T471BareCall* self = this; return t471BareLocal(self); }
+    int t471BareCollision(T471BareCall* self) { return value + self->value; }
+    int callCollision() { return t471BareCollision(this); }
+    static int t471BareStatic(int n) { return n + 10; }
+    static int callStatic() { return t471BareStatic(5); }
+    static int t471BareStaticLambda(function<int(int)> fn) { return fn(2) + 10; }
+    static int callStaticLambda() { return t471BareStaticLambda((int n) => { return n + 1; }); }
+};
+int t471BareFree(T471BareCall* value) { return value->value + 10; }
+int t471BareFreeConst(const T471BareCall* value) { return value->value + 20; }
+int t471BareLocal(T471BareCall* value) { return value->value + 10; }
+int t471BareCollision(T471BareCall* value) { return value->value + 20; }
+int t471BareStatic(int n) { return n + 20; }
+int t471BareStaticLambda(function<int(int)> fn) { return fn(2) + 20; }
+
+T t471BareGenericGid<T>(T value) { return value + 1; }
+struct T471BareGenericCallback
+{
+    int value = 5;
+    int first(function<int(int)> fn) { return fn(value) + 10; }
+    int second(int k, function<int(int)> fn) { return fn(value) + k + 10; }
+    int callFirst() { return first(fn: t471BareGenericGid); }
+    int callSecond() { return second(k: (int)10, fn: t471BareGenericGid); }
+};
+
+Lambda<int(int)> t471BareGlobalFpVsMethod = (int k) => { return k + 20; };
+struct T471BareGlobalFpMethod
+{
+    int t471BareGlobalFpVsMethod(int k) { return k + 10; }
+    int call() { return t471BareGlobalFpVsMethod(5); }
+};
+
+int t471BareGenericStaticPick(int k) { return k + 20; }
+struct T471BareGenericStatic<T>
+{
+    static int t471BareGenericStaticPick(int k) { return k + 10; }
+    int fromInstance() { return t471BareGenericStaticPick(5); }
+    static int fromStatic() { return t471BareGenericStaticPick(6); }
+};
+
+bool testT471BareCalls()
+{
+    bool result = true;
+    T471BareCall value = default;
+    result &= Test("t471_bare_free_after", value.callFree(), 15);
+    result &= Test("t471_bare_const_free_after", value.callConstFree(), 25);
+    result &= Test("t471_bare_local_self", value.callLocalFree(), 15);
+    result &= Test("t471_bare_method_hides_free", value.callCollision(), 10);
+    result &= Test("t471_bare_static_member_hides_free", T471BareCall.callStatic(), 15);
+    result &= Test("t471_bare_static_lambda_hides_free", T471BareCall.callStaticLambda(), 13);
+    T471BareGenericCallback callbacks = default;
+    result &= Test("t471_bare_generic_callback_first", callbacks.callFirst(), 16);
+    result &= Test("t471_bare_generic_callback_second", callbacks.callSecond(), 26);
+    T471BareGlobalFpMethod globalFpMethod = default;
+    result &= Test("t471_bare_global_fp_loses_to_method", globalFpMethod.call(), 15);
+    result &= Test("t471_bare_global_fp_still_callable", t471BareGlobalFpVsMethod(5), 25);
+    T471BareGenericStatic<int> genericStatic = default;
+    result &= Test("t471_bare_generic_static_hides_free", genericStatic.fromInstance(), 15);
+    result &= Test("t471_bare_generic_static_from_static", T471BareGenericStatic<int>.fromStatic(), 16);
+    return result;
+}
 
 bool testConstTrailing()
 {

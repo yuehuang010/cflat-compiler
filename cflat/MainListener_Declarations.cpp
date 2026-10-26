@@ -1894,7 +1894,18 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                                      : typeSpec->getText();
                     // Resolve namespace-scope C++ using-directives before a lazy foreign-type
                     // request so `using namespace inner; outer.Type` requests the real type.
-                    typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName);
+                    std::string defaultedAliasType;
+                    std::string defaultedAliasError;
+                    const bool resolvedDefaultedAlias =
+                        Compiler(declSpecs)->TryResolveDefaultedCxxGenericBaseAlias(
+                            typeName, defaultedAliasType, defaultedAliasError);
+                    if (resolvedDefaultedAlias)
+                        typeName = defaultedAliasType;
+                    else if (!defaultedAliasError.empty())
+                        LogCxxErrorContext(typeSpec, defaultedAliasError);
+                    else
+                        typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName);
+                    if (!resolvedDefaultedAlias && defaultedAliasError.empty())
                     {
                         // A plain dotted name from a C++ import: a class, or a typedef for a
                         // specialization (`std.string`). A miss is silent - the ordinary
@@ -1905,6 +1916,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                             LogCxxErrorContext(typeSpec, cxxError);
                     }
                     if (!canonicalTypeName.empty() && memberType == nullptr) typeName = canonicalTypeName;
+                    if (resolvedDefaultedAlias) typeName = defaultedAliasType;
                     // Apply active type parameter substitutions (e.g. T -> int inside a template body)
                     int& substPointerDepth = substArgPtrDepth;
                     bool& substArrayView = substArgIsArrayView;
@@ -3527,7 +3539,8 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
         // A name that only becomes a type once its <...> arguments are supplied.
         auto IsGenericTemplateName = [&](const std::string& n) {
             return genericStructTemplates.count(n) != 0 || genericClassTemplates.count(n) != 0
-                || genericInterfaceTemplates.count(n) != 0 || compiler->IsWinrtGenericBase(n);
+                || genericInterfaceTemplates.count(n) != 0 || compiler->IsWinrtGenericBase(n)
+                || compiler->HasCxxClassTemplate(n);
         };
 
         // Generic RHS (using IL = list<int>): mangle to list$int and pre-declare the shell +
@@ -9288,6 +9301,39 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     rightNV.IsBorrowed = false;
                                     rightNV.BorrowedOrigin.clear();
                                 }
+                                auto* initializerAssignment = typeAndValue.TypeName == "auto"
+                                    ? SoleAssignmentExpression(assignmentExpression) : nullptr;
+                                const bool autoUniqueIfaceFieldBorrow =
+                                    typeAndValue.TypeName == "auto"
+                                    && initializerAssignment != nullptr
+                                    && initializerAssignment->assignmentOperator() != nullptr
+                                    && !rightNV.IsUniqueFieldAssignmentResult
+                                    && IsUniqueFieldRead(rightNV)
+                                    && !rightNV.TypeAndValue.Pointer
+                                    && compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName)
+                                    && compiler->IsInterfaceType(MangledGenericArgument(
+                                        *compiler, rightNV.TypeAndValue.TypeName))
+                                    && !InGenericInstantiation()
+                                    && !rightNV.TypeAndValue.IsMove
+                                    && !rightNV.IsExplicitMove
+                                    && !compiler->lastCallReturnsOwned;
+                                if (right != nullptr && autoUniqueIfaceFieldBorrow)
+                                {
+                                    const std::string sourceName =
+                                        LLVMBackend::BorrowedSourceName(rightNV);
+                                    const std::string uniqueType =
+                                        SpellType(*compiler, rightNV.TypeAndValue);
+                                    if (sourceName.empty())
+                                        LogErrorContext(assignmentExpression, std::format(
+                                            "cannot initialize {} '{}' from a borrowed value - the source still "
+                                            "owns it; use 'new', a 'move' expression, or a move-returning call",
+                                            uniqueType, name));
+                                    else
+                                        LogErrorContext(assignmentExpression, std::format(
+                                            "cannot initialize {} '{}' from borrowed value '{}' - the source still "
+                                            "owns it; use 'new', a 'move' expression, or a move-returning call",
+                                            uniqueType, name, sourceName));
+                                }
                                 // A moved core unique interface wrapper can be reboxed into a
                                 // different core unique interface wrapper; do not bitcast structs.
                                 if (right != nullptr && !typeAndValue.Pointer
@@ -10196,6 +10242,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     initializerIsBorrowed = false;
                                 bool initializerIsNull = llvm::isa<llvm::ConstantPointerNull>(right)
                                     || IsAllNullPhi(right);
+                                if (!initializerIsBorrowed && !initializerIsNull
+                                    && !genericCoreUniqueTypeArg && initializerOwns)
+                                    compiler->RecordUniqueOwnerLoopSink(
+                                        initializerSourceNV, SpellType(*compiler, typeAndValue),
+                                        name, false);
                                 if (initializerIsBorrowed && !initializerIsNull
                                     && !genericCoreUniqueTypeArg)
                                 {

@@ -16213,6 +16213,8 @@ extern int main()
     total++;
     passed += testT376ChainedUniqueField();
     total += 12;
+    passed += testT476AutoUniqueFieldAcceptSet();
+    total += 7;
     passed += testT388AcceptSet();
     total += 12;
     passed += testT388ArrayFieldConsume();
@@ -18700,6 +18702,13 @@ struct T376Nested { T376Inner a = default; };
 struct T376Outer { unique T376PS* q = nullptr; };
 struct T388ArrayField { unique T376PS*[2] q; };
 struct T388NestedArrayField { T388ArrayField a = default; };
+interface T476AutoIface { int tag(); };
+class T476AutoImpl : T476AutoIface
+{
+    int tag() { return 476; }
+    ~T476AutoImpl() { t376ChainDtors = t376ChainDtors + 1; }
+};
+struct T476AutoIfaceBox { unique T476AutoIface i = default; };
 struct T376Implicit
 {
     unique T376PS* p = nullptr;
@@ -18915,6 +18924,111 @@ int testT376ChainedUniqueField()
     after = (i64)HeapAudit.reportLeaks() - before;
     passed += Test("t376_field_to_field_two_statement_value_dtor_heap",
         value == 106 && sourceNull && t376ChainDtors == 1 && live == 1 && after == 0, true);
+    return passed;
+}
+
+int testT476AutoUniqueFieldAcceptSet()
+{
+    int passed = 0;
+    int value = 0;
+    bool sourceState = false;
+    i64 before = 0;
+    i64 live = 0;
+    i64 after = 0;
+    HeapAudit.enable();
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T476AutoIfaceBox w = default;
+        T476AutoIface borrowed = w.i = new T476AutoImpl();
+        value = borrowed.tag();
+        sourceState = w.i != nullptr;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t476_iface_borrow_chain_value_field_dtor_heap",
+        value == 476 && sourceState && t376ChainDtors == 1 && live == 1 && after == 0, true);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T476AutoIfaceBox w = default;
+        unique T476AutoIface x = new T476AutoImpl();
+        auto owner = w.i = move x;
+        value = owner.tag();
+        sourceState = w.i == nullptr;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t476_iface_auto_move_chain_value_dtor_heap",
+        value == 476 && sourceState && t376ChainDtors == 1 && live == 1 && after == 0, true);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T476AutoIfaceBox w = default;
+        unique T476AutoIface x = new T476AutoImpl();
+        unique T476AutoIface owner = w.i = move x;
+        value = owner.tag();
+        sourceState = w.i == nullptr;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t476_iface_unique_move_chain_value_dtor_heap",
+        value == 476 && sourceState && t376ChainDtors == 1 && live == 1 && after == 0, true);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T476AutoIfaceBox w = default;
+        w.i = new T476AutoImpl();
+        auto owner = w.i;
+        value = owner.tag();
+        sourceState = w.i == nullptr;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t476_iface_auto_field_read_move_value_dtor_heap",
+        value == 476 && sourceState && t376ChainDtors == 1 && live == 1 && after == 0, true);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        auto owner = new T476AutoImpl();
+        value = owner.tag();
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t476_iface_auto_direct_new_value_dtor_heap",
+        value == 476 && t376ChainDtors == 1 && live == 1 && after == 0, true);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T376Inner w = default;
+        auto owner = w.p = new T376PS(476);
+        value = owner->v;
+        sourceState = w.p == nullptr;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t476_struct_auto_field_chain_value_dtor_heap",
+        value == 476 && sourceState && t376ChainDtors == 1 && live == 1 && after == 0, true);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T376Inner w = default;
+        w.p = new T376PS(476);
+        auto owner = w.p;
+        value = owner->v;
+        sourceState = w.p == nullptr;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t476_struct_auto_field_read_move_value_dtor_heap",
+        value == 476 && sourceState && t376ChainDtors == 1 && live == 1 && after == 0, true);
     return passed;
 }
 

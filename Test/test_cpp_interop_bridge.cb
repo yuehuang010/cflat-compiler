@@ -97,6 +97,7 @@ import cpp "library/cpp_interop_inline.h";
 import cpp "vector";
 import cpp "string";
 import cpp "memory";
+import cpp "library/t473_unique_alias.hpp";
 import cpp "functional";
 import "diagnostic/heap_audit.cb";
 import cpp "chrono";
@@ -4119,6 +4120,10 @@ int bridge_global_field_static_value()
 // R5 (ruling 2026-09-23): the `unique` keyword on a C++ class IS std::unique_ptr<T> (3550-3559).
 // Every leg hands the owner to a C++ API typed std::unique_ptr (peek/take/take_rr), which a
 // core unique<T> cannot bind, and counts Widget structors to prove single destruction.
+using T473UQ = unique;
+using T473UQW = unique<uqp.W>;
+namespace T473UQNs { using UQ = unique; }
+struct T473Native { int v = 0; };
 struct UqHolder { unique cpuq.Widget* w = default; int tag = 0; };
 struct UqDefaultHolder { unique cpuq.Widget* w = new cpuq.Widget(31); int tag = 0; };
 unique cpuq.Widget* UqMakeNew(int v) { return new cpuq.Widget(v); }
@@ -4306,6 +4311,43 @@ int uq_null_compare()
         if (w == nullptr || nullptr == w || cpuq.peek(w) != 20) return 3559;
     }
     if (cpuq.dtors() != 1) return 3559;
+    return 0;
+}
+int uq_alias_base()
+{
+    uqp.reset_counts();
+    {
+        T473UQ<uqp.W> p = new uqp.W(21);
+        std.unique_ptr<uqp.W> q = move p;
+        if (q == nullptr || q->v != 21) return 4740;
+        if (uqp.moves() != 0 || uqp.dtors() != 0) return 4741;
+    }
+    if (uqp.moves() != 0 || uqp.dtors() != 1) return 4742;
+
+    uqp.reset_counts();
+    {
+        T473UQNs.UQ<uqp.W> p = new uqp.W(22);
+        std.unique_ptr<uqp.W> q = move p;
+        if (q == nullptr || q->v != 22) return 4743;
+        if (uqp.moves() != 0 || uqp.dtors() != 0) return 4744;
+    }
+    if (uqp.moves() != 0 || uqp.dtors() != 1) return 4745;
+
+    uqp.reset_counts();
+    {
+        T473UQW p = new uqp.W(23);
+        std.unique_ptr<uqp.W> q = move p;
+        if (q == nullptr || q->v != 23) return 4746;
+        if (uqp.moves() != 0 || uqp.dtors() != 0) return 4747;
+    }
+    if (uqp.moves() != 0 || uqp.dtors() != 1) return 4748;
+
+    {
+        T473UQ<T473Native> p = new T473Native();
+        p.v = 17;
+        T473Native q = move *p;
+        if (q.v != 17) return 4749;
+    }
     return 0;
 }
 
@@ -7974,6 +8016,7 @@ extern int main(int argc, char** argv)
     if (uqResult == 0) uqResult = uq_null_compare();
     if (uqResult == 0) uqResult = uq_reinit_after_consume();
     if (uqResult == 0) uqResult = uq_reinit_spelled_after_consume();
+    if (uqResult == 0) uqResult = uq_alias_base();
     if (uqResult != 0) return uqResult;
 
     // ---- CFlat method before protected C++ base member (3570-3579) ---------------------

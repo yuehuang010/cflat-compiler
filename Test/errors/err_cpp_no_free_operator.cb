@@ -1,6 +1,7 @@
 import cpp "cpp_interop_basic.h";
 import cpp "cpp_interop_strop.h";
 import cpp "cpp_interop_freeoptpl.h";
+import cpp "cpp_t460_operator_lookup.hpp";
 
 struct NativeNoPlus { int v; };
 
@@ -117,6 +118,75 @@ extern int main()
         t219.AmbigSource a = default;
         t219.AmbigSource b = default;
         int rejected = a + b;
+    }
+    // T460: clang ranks the free conversion candidate with the built-in A-to-int candidate.
+    expect_error("clang: use of overloaded operator '+' is ambiguous") {
+        t460.BuiltinAmbA a = default;
+        int rejected = a + 1;
+    }
+    // T460: converting to the hidden friend's parameter type does not add that type to ADL.
+    expect_error("no operator '+' for type 't460.HiddenConvSource'") {
+        t460.HiddenConvSource a = default;
+        int rejected = a + a;
+    }
+    // T460: a friend declared by an unrelated class is not namespace-visible.
+    expect_error("no operator '+' for type 't460.UnrelatedOperand'") {
+        t460.UnrelatedOperand a = default;
+        int rejected = a + a;
+    }
+    // A qualified call takes a hidden friend only through the class's own namespace (r declares no f).
+    expect_error("'f' is not a member of namespace 'r'") {
+        t460r2.Associated a = default;
+        int rejected = r.f(a);
+    }
+    expect_error("cannot pass C++ const pointer argument 2") {
+        t460r2.MutablePointerPlus w = default;
+        t460r2.Text text = default;
+        int rejected = w + text.c_str();
+    }
+    expect_error("clang: use of overloaded operator '+' is ambiguous") {
+        t460r2.InheritedInt d = default;
+        int rejected = d + 1;
+    }
+    expect_error("clang: use of overloaded operator '+' is ambiguous") {
+        t460r2.PrivateBaseDerived d = default;
+        int rejected = d + 1;
+    }
+    expect_error("clang: use of overloaded operator '%' is ambiguous") {
+        t460r2.DoubleSource a = default;
+        int rejected = a % 2;
+    }
+    expect_error("clang: use of overloaded operator '&' is ambiguous") {
+        t460r2.DoubleSource a = default;
+        int rejected = a & 2;
+    }
+    expect_error("clang: use of overloaded operator '|' is ambiguous") {
+        t460r2.DoubleSource a = default;
+        int rejected = a | 2;
+    }
+    expect_error("clang: use of overloaded operator '^' is ambiguous") {
+        t460r2.DoubleSource a = default;
+        int rejected = a ^ 2;
+    }
+    expect_error("clang: use of overloaded operator '<<' is ambiguous") {
+        t460r2.DoubleSource a = default;
+        int rejected = a << 2;
+    }
+    expect_error("clang: use of overloaded operator '>>' is ambiguous") {
+        t460r2.DoubleSource a = default;
+        int rejected = a >> 2;
+    }
+    expect_error("clang: use of overloaded operator '%' is ambiguous") {
+        t460r2.FloatSource a = default;
+        int rejected = a % 2;
+    }
+    expect_error("clang: use of overloaded operator '%' is ambiguous") {
+        t460r2.BoolSource a = default;
+        int rejected = a % 2;
+    }
+    expect_error("clang: use of overloaded operator '+' is ambiguous") {
+        t460del.Deleted a = default;
+        int rejected = a + 1;
     }
     return 0;
 }

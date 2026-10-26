@@ -1,0 +1,95 @@
+struct R { int value = 0; };
+
+expect_error("cannot reset unique<R> 'owner' from borrowed value") {
+    void rawOwnerForBackedge()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        unique R* owner = nullptr;
+        for (int i = 0; i < 2; i++) { owner = raw; raw = p; }
+    }
+}
+
+expect_error("cannot reset unique<R> 'owner' from borrowed value") {
+    void rawOwnerWhileBackedge()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        unique R* owner = nullptr;
+        int i = 0;
+        while (i < 2) { owner = raw; raw = p; i++; }
+    }
+}
+
+expect_error("cannot reset unique<R> 'owner' from borrowed value") {
+    void rawOwnerDoWhileBackedge()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        unique R* owner = nullptr;
+        int i = 0;
+        do { owner = raw; raw = p; i++; } while (i < 2);
+    }
+}
+
+expect_error("cannot reset unique<R> 'owner' from borrowed value") {
+    void rawOwnerRangeBackedge()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        unique R* owner = nullptr;
+        int[2] iterations = {0, 1};
+        for (int i in iterations) { owner = raw; raw = p; }
+    }
+}
+
+expect_error("cannot reset unique<R> 'owner' from borrowed value") {
+    void rawOwnerContinueBackedge()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        unique R* owner = nullptr;
+        for (int i = 0; i < 2; i++)
+        {
+            owner = raw;
+            if (i == 0) { raw = p; continue; }
+            raw = new R();
+        }
+    }
+}
+
+expect_error("cannot initialize unique<R> 'owner' from borrowed value") {
+    void rawOwnerConstructorBackedge()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        for (int i = 0; i < 2; i++)
+        {
+            unique R* owner = raw;
+            raw = p;
+        }
+    }
+}
+
+expect_error("cannot pass borrowed pointer 'raw' to move parameter 'p' of 'takeRaw'") {
+    void takeRaw(move R* p) { delete p; }
+    void rawOwnerMoveSinkBackedge()
+    {
+        R stack;
+        R* p = &stack;
+        R* raw = new R();
+        for (int i = 0; i < 2; i++)
+        {
+            takeRaw(move raw);
+            raw = p;
+        }
+    }
+}
+
+extern int main() { return 0; }

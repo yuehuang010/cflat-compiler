@@ -6,16 +6,17 @@ extern int main()
     std.error_condition condition = std.make_error_condition(std.errc.invalid_argument);
     int value = 22;
     cppfopun.EB explicitBool = default;
-    // MSVC STL declares the error_code/error_condition operator== differently: same refusal, other text.
+    // MSVC STL declares the error_code/error_condition operator== as hidden friends; since T460 the refusal
+    // text matches the other platforms.
     if const (__WINDOWS__)
     {
-        expect_error("no overload of 'std.operator==' matches") {
+        expect_error("invalid operands to binary expression") {
             bool rejected = code == 22;
         }
-        expect_error("no overload of 'std.operator==' matches") {
+        expect_error("invalid operands to binary expression") {
             bool rejected = code == value;
         }
-        expect_error("no overload of 'std.operator==' matches") {
+        expect_error("invalid operands to binary expression") {
             bool rejected = condition == 22;
         }
     }

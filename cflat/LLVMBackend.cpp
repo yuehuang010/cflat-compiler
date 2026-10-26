@@ -4838,6 +4838,7 @@ void LLVMBackend::ResetForReanalysis()
     ownFlagControlKind_.clear();
     nextOwnFlagControlFrameId_ = 1;
     ownFlagDefinitelyReowned_.clear();
+    loopIterationAssigned_.clear();
     ownFlagLoopReownSnapshots_.clear();
     ownReleaseGates_.clear();
     receiverScanFacts_.clear();
@@ -5068,6 +5069,7 @@ void LLVMBackend::ResetForReanalysis()
     cxxTriviallyRelocatableRecords_.clear();
     cxxClasses_.clear();
     cxxRecordEntries_.clear();
+    cxxFriendNames_.clear();
     cxxMethodLinkageMemo_.clear();
     cxxGroupHeaderHashMemo_.clear();
     cxxGroupHeaderStampMemo_.clear();

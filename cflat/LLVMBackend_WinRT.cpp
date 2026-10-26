@@ -1911,6 +1911,59 @@ void LLVMBackend::CheckOwnFlagLoopBackEdge()
             || !IsInsertBlockLive() || IsCurrentBlockUnreachable())
             return;
         const auto& frame = ownFlagLoopReownSnapshots_.back();
+        for (const auto& sink : frame.uniqueOwnerSinks)
+        {
+            const auto* live = FindVariableByStorage(sink.Storage);
+            if (live == nullptr) continue;
+            bool owningLocalCopyWasRebound = false;
+            if (live->BorrowsOwningLocal && live->OwningLocalStorage != nullptr)
+            {
+                auto* owner = FindVariableByStorage(live->OwningLocalStorage);
+                owningLocalCopyWasRebound = live->PointerRebound
+                    || (owner != nullptr && owner->PointerRebound);
+            }
+            const bool localMayBeBorrowed = live->IsBorrowed || live->IsAliasBorrow
+                || live->TypeAndValue.IsAlias || live->BorrowsOwnedElement
+                || (live->BorrowsOwningLocal && !owningLocalCopyWasRebound);
+            if (!localMayBeBorrowed) continue;
+            ReportingFileScope report(this, sink.File, sink.Line, sink.Column);
+            const std::string sourceName = BorrowedSourceName(*live);
+            const std::string action = sink.IsReset ? "reset" : "initialize";
+            if (sourceName.empty())
+                LogError(std::format("cannot {} {} '{}' from a borrowed value - the source still owns it; "
+                    "use 'new', a 'move' expression, or a move-returning call",
+                    action, sink.UniqueType, sink.Destination));
+            else
+                LogError(std::format("cannot {} {} '{}' from borrowed value '{}' - the source still owns it; "
+                    "use 'new', a 'move' expression, or a move-returning call",
+                    action, sink.UniqueType, sink.Destination, sourceName));
+            return;
+        }
+        for (const auto& sink : frame.moveOwnerSinks)
+        {
+            const auto* live = FindVariableByStorage(sink.Storage);
+            if (live == nullptr) continue;
+            bool owningLocalCopyWasRebound = false;
+            if (live->BorrowsOwningLocal && live->OwningLocalStorage != nullptr)
+            {
+                auto* owner = FindVariableByStorage(live->OwningLocalStorage);
+                owningLocalCopyWasRebound = live->PointerRebound
+                    || (owner != nullptr && owner->PointerRebound);
+            }
+            const bool localMayBeBorrowed = live->IsBorrowed || live->IsAliasBorrow
+                || live->TypeAndValue.IsAlias || live->BorrowsOwnedElement
+                || (live->BorrowsOwningLocal && !owningLocalCopyWasRebound);
+            if (!localMayBeBorrowed) continue;
+            ReportingFileScope report(this, sink.File, sink.Line, sink.Column);
+            const std::string sourceName = FindVariableNameByStorage(sink.Storage);
+            const std::string borrowedSource = BorrowedSourceName(*live);
+            LogError(std::format(
+                "cannot pass borrowed pointer '{}' to move parameter '{}' of '{}' - it may "
+                "refer to borrowed storage '{}', which the sink does not own",
+                sourceName.empty() ? borrowedSource : sourceName, sink.Parameter,
+                SpellFunctionSymbol(*this, sink.Function), borrowedSource));
+            return;
+        }
         for (const auto& sink : frame.moveSinkViews)
         {
             const auto* live = FindVariableByStorage(sink.Storage);
@@ -2320,6 +2373,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 || IsCoreUniqueType(args[i].TypeAndValue.TypeName)
                 || (!args[i].TypeAndValue.Pointer && IsOwningValueOrClosureType(args[i].TypeAndValue.TypeName))
                 || args[i].IsOwning || args[i].IsOwningString || args[i].IsOwningStruct;
+            const bool sourceBindingOwns = sourceIsOwning
+                || (!sourceName.empty() && IsVariableOwning(sourceName));
             const bool paramConsumesSource = params[i].IsMove
                 || (!params[i].Pointer && !params[i].IsAlias
                     && IsCoreUniqueType(params[i].TypeName))
@@ -2569,7 +2624,13 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     {
                         if (auto* ptrTy = llvm::dyn_cast_or_null<llvm::PointerType>(srcBaseTy))
                         {
+                            if (params[i].IsMove && sourceBindingOwns)
+                                RecordMoveOwnerLoopSink(args[i], functionName,
+                                    params[i].VariableName);
                             builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), srcStorage);
+                            if (sourceBindingOwns && wholeBindingSource
+                                && !sourceName.empty())
+                                ClearOwnFlag(sourceName);
                             // A field or element slot holds one scalar; only a whole binding owns a count.
                             if (args[i].FieldName.empty() && args[i].OwningStructName.empty()
                                 && !args[i].IsElementAccess)

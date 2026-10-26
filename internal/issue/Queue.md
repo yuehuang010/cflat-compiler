@@ -108,11 +108,7 @@ Windows gate: R6, R7, R11, R12, R13, R14 land after the Windows box passes. R2 i
 | P3 | fix/t422-globdef | p3/global-default-spelling-zeroes-without-the-note | PARKED (T422 Luna r1 + Haiku r2): ruling conflict with runtime-constructed globals (T136/T368/mempress) - see issue head |
 | P3 | fix/t427-fnpointee | p3/function-type-unrelated-pointee-param-accepted | PARKED (T427): exact function-type pointee match conflicts with the deliberate int*/void* crossing leg - see issue head |
 | P3 | fix/t438-uniqdot | p3/cflat-unique-dot-dispatches-to-pointee-member | PARKED: needs ruling on name hiding + `->` (see issue file) (T438) |
-| P3 | fix/t460-builtinamb | p3/cpp-free-operator-conversion-vs-builtin-ambiguity | Windows gate (Sol r3 enum ADL fixed in r5) (T460) |
-| P3 | fix/t469-cppalias | p3/cpp-template-empty-argument-list-leftovers | Windows gate (r2 namespace-call fix) (T469) |
-| P3 | fix/t470-braceunwind | p3/named-brace-init-partial-unwind | Luna r1 (T470) |
-| P3 | fix/t471-barecall | p3/trailing-const-leftovers-after-c08 | Luna r1 (T471) |
-| P3 | fix/t472-viewleak | p3/owned-view-overwrite-and-unsunk-field-leak | Luna r1 (T472) |
+| P3 | fix/t472-viewleak | p3/owned-view-overwrite-and-unsunk-field-leak | PARKED after 3 Luna rounds (T472): r3 52c8f3161 blocked by const-method predicate regression + getter UAF; needs ruling (a)/(b), see issue head |
 | R16 (parked) | fix/t396-viewalias | p2/view-mixed-join-sunk-through-pointer-param-alias | Sol r2b: 4 INCOMPLETE, needs path-sensitive provenance |
 
 ## Backlog (p3/p4 and plans; groups from earlier builds, unchanged)
@@ -150,13 +146,12 @@ Rows that named only p1/p2 issues moved to the ship-gate section above and were 
 | W13b | p3/cpp-overload-variadic-and-conversion-gaps | variadic-set ambiguity, defaulted param before ellipsis, member variadics, user conversions at C++ call args, inline variadic link, non-record const pointers | NEW 2026-09-30 (W13 reviews) |
 | G6 | p3/header-cache-residual-growth | in-version prune age rule (sigbase, dead request configs, cxxdemand) | NEW 2026-09-29 (split from G5) |
 | B2 | PARKED 2026-09-28 after 3 Codex rounds (scratch/b2_parked.patch): p3/cpp-string-literal-template-deduction-and-unspellable-char-args + p3/cpp-std-min-long-and-pointer-arguments-refused. Free-array issue closed (premise disproved, [over.ics.rank]/3.2.1). Restart from master on opus with the narrower design in the issue files | RequestCxxFunctionTemplate argument spelling (CxxStringLiteralSpelling, InferImplicitCxxArgumentType) | NEW. One mechanism: spell array / literal lvalues as `*reinterpret_cast<E (*)[N]>(p)` like the member path (e6c60220); give `long` arithmetic, `char*` and pointer-arithmetic rvalues a C++ spelling |
-| B3 | p3/cpp-pointer-argument-prefers-char-pointer-over-converting-ctor + p3/cpp-single-level-pointer-unproven-at-call-argument + p3/cpp-operator-address-of-operand-not-converted | IsProvenPrimitiveSinglePointerArg / CompareUpconvert | old bucket 2b (2a landed as AT). Pointer-is-not-a-number ruling |
+| B3 | p3/cpp-single-level-pointer-unproven-at-call-argument | IsProvenPrimitiveSinglePointerArg / CompareUpconvert | old bucket 2b (2a landed as AT). Pointer-is-not-a-number ruling |
 
 ### C - wrongly accepted (adds a rejection)
 
 | Run | Issue(s) | Site | Notes |
 |-----|----------|------|-------|
-| - | p3/cpp-conflict-check-variable-template-and-split-explicit-spec | CheckCxxNamespaceConflicts | struct vs variable template accepted (clang refuses); explicit spec in a second header refused (T94 review 1, pre-existing) |
 | - | p3/cpp-operator-template-set-ambiguity-without-drop-accepted | C++ operator ranking | free-only ambiguous operator template set with no dropped candidate accepted (clang ambiguous); int*/void*/template no-drop case (T85 reviews 3-4, pre-existing) |
 
 ### D - wrongly refused (acceptance gaps)
@@ -164,9 +159,8 @@ Rows that named only p1/p2 issues moved to the ship-gate section above and were 
 | Run | Issue(s) | Site | Mode |
 |-----|----------|------|------|
 | - | p3/cpp-static-local-derived-to-base-and-lvalue-ternary-copies | static-local C++ init | derived-to-base static refused with array-decay text; lvalue-arm ternary static skips the copy ctor; temp dtor exception not propagated (T93 review 1, pre-existing) |
-| - | p3/iface-return-arith-on-borrowed-indirect-call-refused | PointerValueDerivesFromOwner | `return i.peek() + 1;` / `fp() + 1` refused (indirect call = unknown ownership), misleading leak text (T81 review 5) |
 | - | p3/cpp-null-macro-and-nullptr-spellings-refused | null-constant classifier + converting ctor | full; NULL/__null/nullptr macros, nullptr -> std::function (T52 review, pre-existing; AFTER T52) |
-| D1b | p3/cpp-nullptr-t-free-function-and-void-pointer-gaps + p3/cpp-unguarded-header-class-template-lookup-fails-cold (cold-cache only) | free-function selection; incremental request units | NEW 2026-09-28 (D1 leftovers) |
+| D1b | p3/cpp-unguarded-header-class-template-lookup-fails-cold (cold-cache only) | free-function selection; incremental request units | NEW 2026-09-28 (D1 leftovers) |
 | - | p3/cpp-expression-template-to-cflat-byvalue-class-param-refused (NEW) | converting-ctor path | absorbed by P1 (converting constructors); land there |
 
 ### E - temporary lifetime, leak, dangle (one issue per run, opus-tier area)
@@ -202,7 +196,7 @@ Rows that named only p1/p2 issues moved to the ship-gate section above and were 
 | Id | Item | Notes |
 |----|------|-------|
 | P1 | plan converting-constructors (`internal/plan/converting-constructors.md`) | ruled 2026-09-26; eigen_05; absorbs D-row converting-ctor-raw-array + expression-template-to-cflat-byvalue-param. Largest item, own staging |
-| P2 | plan cflat-struct-nontrivial-cxx-fields (`internal/plan/cflat-struct-nontrivial-cxx-fields.md`) | ruled A 2026-09-27. Phase 0 (stopgap refusal) is small and can go early; phases 1-4 one per branch. Absorbs p2/cpp-struct-list-field-relocated-bitwise, p3/cpp-prvalue-to-cflat-byvalue-param-extra-copy, p3/cpp-typed-local-extra-copy-from-param-and-ctor-arms |
+| P2 | plan cflat-struct-nontrivial-cxx-fields (`internal/plan/cflat-struct-nontrivial-cxx-fields.md`) | ruled A 2026-09-27. Phase 0 (stopgap refusal) is small and can go early; phases 1-4 one per branch. Absorbs p3/cpp-typed-local-extra-copy-from-param-and-ctor-arms |
 | P3 | p3/cpp-std-header-survey-refresh | re-run the std header L0/L1 survey on macOS and Windows to refresh the gap list; untouched headers need a CFlat-surface ruling |
 | P5 | p3/debug-assert-setvisibility-cross-target-elf | cross-target (-p win64) only; fold into p3/cross-target-compile-gaps work |
 | P4 | virtual-base layout (item 2 of p3/cpp-inherited-member-access-and-virtual-base-diagnostics) | refused today ("layout cannot be reproduced", CInterop ~14229); needs a plan |
@@ -224,10 +218,8 @@ Rows that named only p1/p2 issues moved to the ship-gate section above and were 
 | N24 | p3/cpp-unrequested-specialization-pointer-eager-request | Bucket: p3 (C++ interop compile time; left by D6, fix/unrequested-spec-pointer-retry, 2026-09-29) | NEW 2026-09-29 |
 | N28 | p3/cpp-deferred-special-members-mid-size-harvest-cost | R1 deferral costs +1-2% cold on 64..~500-record harvests (interop fixtures); cutoff adjustable later (maintainer) | NEW 2026-09-29 perf |
 | N31 | p3/cpp-interpreter-drops-cc1-only-flags | -Xclang cc1-only flags silently dropped by the Interpreter driver (pre-existing, H1 review) | NEW 2026-09-29 perf |
-| N32b | p3/cpp-ctor-refusal-text-gaps-after-w11 | default-member-init refusal lacks clang: prefix, ctor template names wrong overload (W11 landed the body-failure fix 2026-09-30) | NEW 2026-09-30 |
 | N34 | p3/cpp-deployment-target-env-core-cache-miss | Non-default MACOSX_DEPLOYMENT_TARGET misses the core bitcode cache every compile (R4 review) | NEW 2026-09-29 perf |
 | N35 | p3/cpp-demand-bodies-torch-cold-cost | R4 costs +4.4% cold instructions on torch (json -28%); verdict writes batched in 93b361f6 (-0.55%), rest is clang instantiation | PART 2026-09-29d |
-| N36 | p3/cpp-demand-second-use-of-failed-helper-generic-text | Second use through an already-failed helper refused without clang's text (R4 review) | NEW 2026-09-29 perf |
 | N37 | p3/cpp-signature-registration-projects-records | Registration projects every record a signature names; -3.6% torch only by skipping projection, which breaks overload order (D4) | NEW 2026-09-30 perf |
 | N41 | p3/cpp-variadic-alias-template-refused | in-repo `template<auto... I> using A = S<I...>` refused (alias machinery has no pack support) (ST4, pre-existing) | NEW 2026-10-01 |
 | N42 | p3/cpp-header-unreferenced-global-initializers-skipped | unreferenced C++ header inline globals never run their dynamic initializer (referenced ones + .cpp sources fixed/fine, T44) | DEFERRED p3 2026-10-09 (maintainer: not a blocker, later) |
@@ -249,12 +241,10 @@ Rows that named only p1/p2 issues moved to the ship-gate section above and were 
 | Issue | DISABLED case | Summary |
 |---|---|---|
 | p3/cpp-reference-param-conversion-gaps-after-t42 | (C++ interop) | template ctor from non-template source, inherited operator X(), operator X&/X&& into C++ ref params refused (clang accepts; T42 follow-up) |
-| p3/cpp-template-deduction-identifier-with-e-read-as-double | (C++ interop) | `1 + abcer + 1` deduces double (text-classified literal); fix by source type, never text |
 | p3/cpp-pointer-depth-and-array-pointer-param-gaps | (C++ interop) | non-null int** accepted into C++ int***; member/static array-pointer params refuse valid args |
 | p3/float-literal-plus-variable-computed-in-float | (C++ interop) | `i + 1.0` / `f + 1.0` typed float (clang double); check CFlat literal rule first |
 | p3/generic-overload-not-joining-concrete-overload-set | (none) | generic f<T>(T*) never joins concrete overloads; 12 clang-valid calls refused |
 | p3/member-type-path-remaining-gaps | (none) | `Outer<int>.Inner<long>.type`, closure-alias members, CFlat static data members, C++ statics as value template args (T37 follow-up) |
-| p3/generic-later-record-in-signature-or-local | (none) | generic body: later record in a signature / by-value local refused (master too; T37 follow-up) |
 
 ### Ruled 2026-10-01 - ready to schedule (rulings recorded in each issue file)
 
@@ -277,24 +267,24 @@ The A-H sections above stay the per-issue record; schedule from this table.
 
 | # | Run | C/R | Issues | Shared site / root cause | Not concurrent with | Cheap |
 |---|-----|-----|--------|--------------------------|---------------------|-------|
-| 1 | DIAG-TEXT | M/L | p3/cpp-ctor-refusal-text-gaps-after-w11, p3/cpp-private-base-instance-member-diagnostics, p3/cpp-demand-second-use-of-failed-helper-generic-text, p3/cpp-default-wrapper-tie-list-shows-wrapper-shape, p3/cpp-sink-refusal-cause-lost-under-harvest-suppression, p3/cpp-per-group-static-refusal-hint | shared KIND only (relayed clang / refusal text); no shared function (u) - may split into 2 runs | F1 | yes |
-| 2 | STATIC-INIT | M/M | p3/static-local-init-guard-set-before-throwing-initializer, p3/cpp-explicit-static-ctor-call-initializer-refused, p3/global-default-spelling-zeroes-without-the-note, p3/cpp-class-global-brace-initializer-refused | MainListener_Declarations.cpp static/global init arms (EmitCxxStructorCall ~6475, GenerateDefaultValue global arm ~1620) | - | yes |
-| 3 | NULLCTOR | M/H | p2/cpp-null-constant-ambiguous-ctor-accepted, p3/cpp-nonliteral-zero-to-integral-ctor-refused, p3/cpp-brace-init-null-constant-pointer-ctor-refused, p3/cpp-null-macro-and-nullptr-spellings-refused | C++ ctor null-constant selection: scalar-reference mirror (CInterop ~15375), SelectCxxConstructorListed (~26846), RequestCxxBraceConstructor | NULLPTR-T, CTOR-VIABILITY, PTRRANK, CTOR-BRACE, CONSTMACRO | no |
-| 4 | NSLOOKUP | M/M | p3/cpp-anonymous-typedef-struct-in-namespace-not-found, p3/cpp-struct-identity-underscore-namespace, p3/cpp-namespace-conflict-check-leftovers | CheckCxxNamespaceConflicts + struct identity canonicalization (CInterop) | - | yes, careful on identity |
-| 5 | OPUNARY | M/M | p3/cpp-unary-operator-leftovers-after-d7, p3/unary-deref-leftovers-after-t47, p3/cpp-member-call-on-deref-of-xvalue-refused | unary `*` in ParseUnaryExpression (MainListener_PostfixExpression.cpp) | D2/D3 operator dispatch, CONVOP | yes |
-| 6 | MOVEPARAM | M/H | p2/byvalue-param-owning-leftovers-after-b13, p2/unique-field-heap-array-through-move-param, p3/lowered-struct-byvalue-pass-no-moved-diagnostic | move / by-value owning param at the callee boundary (u) | NEWTEMP, BORROW-PROV | no (Opus reviewer) |
-| 8 | PTRRANK | M/H | p3/cpp-pointer-argument-prefers-char-pointer-over-converting-ctor, p3/cpp-single-level-pointer-unproven-at-call-argument, p3/cpp-operator-address-of-operand-not-converted, p3/cpp-pointer-depth-and-array-pointer-param-gaps | CompareUpconvert (Overloads), IsProvenPrimitiveSinglePointerArg (CInterop), TryBinaryOperatorOverload (supersedes old B3 row) | T89 in flight (same predicate) - after it lands | no |
-| 9 | FIELDCTOR | M/M | p3/cpp-class-field-default-construction-leftovers-after-v20, p3/cpp-field-given-in-brace-init-also-default-constructed | field initializer lowering, MainListener_Aggregates.cpp (u) | - | yes |
-| 10 | CLIBNAME | M/M | p2/o2-builtin-folding-overrides-cflat-definitions (item 1), p3/core-defines-externally-visible-libc-functions | core defines libc names that LLVM folds as builtins | RULING first (nobuiltin on CFlat bodies) | after ruling RULED 2026-10-21: nobuiltin on CFlat bodies (see lessons digest). |
-| 14 | CONVOP | M/H | p3/cpp-conversion-operator-copy-init-gaps, p3/cpp-conversion-operator-receiver-leftovers, p3/cpp-class-xvalue-pointer-conversion-not-invoked | C++ conversion-operator call path (u) | D2/D3, OPUNARY | no |
+| 1 | DIAG-TEXT | M/L | p3/cpp-sink-refusal-cause-lost-under-harvest-suppression | shared KIND only (relayed clang / refusal text); no shared function (u) - may split into 2 runs | F1 | yes |
+| 2 | STATIC-INIT | M/M | p3/global-default-spelling-zeroes-without-the-note | MainListener_Declarations.cpp static/global init arms (EmitCxxStructorCall ~6475, GenerateDefaultValue global arm ~1620) | - | yes |
+| 3 | NULLCTOR | M/H | p3/cpp-null-macro-and-nullptr-spellings-refused | C++ ctor null-constant selection: scalar-reference mirror (CInterop ~15375), SelectCxxConstructorListed (~26846), RequestCxxBraceConstructor | NULLPTR-T, CTOR-VIABILITY, PTRRANK, CTOR-BRACE, CONSTMACRO | no |
+| 4 | NSLOOKUP | M/M | p3/cpp-struct-identity-underscore-namespace | CheckCxxNamespaceConflicts + struct identity canonicalization (CInterop) | - | yes, careful on identity |
+| 5 | OPUNARY | M/M | p3/cpp-unary-operator-leftovers-after-d7 | unary `*` in ParseUnaryExpression (MainListener_PostfixExpression.cpp) | D2/D3 operator dispatch, CONVOP | yes |
+| 6 | MOVEPARAM | M/H | p2/byvalue-param-owning-leftovers-after-b13, p2/unique-field-heap-array-through-move-param | move / by-value owning param at the callee boundary (u) | NEWTEMP, BORROW-PROV | no (Opus reviewer) |
+| 8 | PTRRANK | M/H | p3/cpp-single-level-pointer-unproven-at-call-argument, p3/cpp-pointer-depth-and-array-pointer-param-gaps | CompareUpconvert (Overloads), IsProvenPrimitiveSinglePointerArg (CInterop), TryBinaryOperatorOverload (supersedes old B3 row) | T89 in flight (same predicate) - after it lands | no |
+| 9 | FIELDCTOR | M/M | p3/cpp-class-field-default-construction-leftovers-after-v20 | field initializer lowering, MainListener_Aggregates.cpp (u) | - | yes |
+| 10 | CLIBNAME | M/M | p3/core-defines-externally-visible-libc-functions | core defines libc names that LLVM folds as builtins | RULING first (nobuiltin on CFlat bodies) | after ruling RULED 2026-10-21: nobuiltin on CFlat bodies (see lessons digest). |
+| 14 | CONVOP | M/H | p3/cpp-conversion-operator-receiver-leftovers | C++ conversion-operator call path (u) | D2/D3, OPUNARY | no |
 | 15 | ASSIGN | M/H | p3/cpp-assign-operator-route-leftovers, p3/cpp-assignment-result-leftovers-after-b9, p3/cpp-nested-member-class-free-return-and-call-result-assign | C++ assignment route + class-result receivers (u) | T92 in flight (operator=(T)) | no |
-| 16 | REFPARAM | M/H | p3/cpp-reference-param-conversion-gaps-after-t42, p3/cpp-named-scalar-lvalue-to-rvalue-ref-param-refused, p3/cpp-reference-member-leftovers-after-t47 | conversions into C++ reference params (u) | REFBIND pair, CTOR-VIABILITY | no |
+| 16 | REFPARAM | M/H | p3/cpp-reference-param-conversion-gaps-after-t42, p3/cpp-reference-member-leftovers-after-t47 | conversions into C++ reference params (u) | REFBIND pair, CTOR-VIABILITY | no |
 | 18 | CTOR-VIABILITY | L/H | p3/cpp-ctor-template-viability-not-clang-selected, p3/cpp-ctor-ranking-leftovers, p3/cpp-ctor-template-overload-and-copyinit-gaps, p3/cpp-pointer-ref-overload-ctor-and-direct-member-ranking | CxxCtorSetRequiresNarrowing + ctor wrappers | NULLCTOR, REFPARAM | no |
 | 20 | FNWRAP | L/H | p2/cpp-forwarded-fnptr-variable-or-closure-dangles-in-wrapper-frame, p3/cpp-capturing-closure-to-std-function | wrapper-frame slot for fnptr/closure into C++ T&& (RequestCxxFunctionTemplate) | ELIDE (P2 plan) | no |
-| 21 | CACHE-VALID | M/H | p3/cxx-request-cache-trusts-equal-mtime-and-size, p3/cpp-wrapper-rejection-cache-keyed-by-text-only | request-cache validity key | CACHE-KEY | no |
+| 21 | CACHE-VALID | M/H | p3/cxx-request-cache-trusts-equal-mtime-and-size | request-cache validity key | CACHE-KEY | no |
 | 22 | CHUNK | M/H | p3/cpp-demand-chunk-order-numbering-per-interpreter, p3/cpp-default-wrapper-batch-chunk-stores-stripped-prefix | chunk store, CxxIncrementalGroup ParseRequest | CACHE-KEY, TOPSTMT | no |
 | 25 | CONSTTWIN | M/H | p3/cpp-const-twin-overloads-collapse, p3/cpp-constrained-twin-default-argument-ranking | RegisterCxxClassMembers (~22175) dedupe keeps the non-const twin | CONSTPOINTEE pair | no |
-| 26 | SRCTYPE | L/H | p3/cpp-template-deduction-identifier-with-e-read-as-double, p3/auto-local-of-arithmetic-takes-cflat-width-type-at-cpp-calls, p3/cpp-template-ctor-deduction-enum-and-arith-rvalue | source type not propagated into C++ call construction (CxxArithIdentity) | T92 in flight - after it lands | no |
+| 26 | SRCTYPE | L/H | p3/auto-local-of-arithmetic-takes-cflat-width-type-at-cpp-calls, p3/cpp-template-ctor-deduction-enum-and-arith-rvalue | source type not propagated into C++ call construction (CxxArithIdentity) | T92 in flight - after it lands | no |
 | 27 | CACHE-KEY | L/H | p3/cpp-wrapper-request-group-omits-type-dependencies, p3/cpp-wrapper-request-misses-template-argument-headers, p3/cpp-candidate-tier-differs-cold-vs-warm | RequestGeneratedCxxWrapperUncached, CandidateCxxGroupsFor; partial patch scratch/repro_keep/t70_groupfix.patch | G2, CACHE-VALID | no |
 | 28 | BORROW-PROV | L/H | p2/delete-borrow-via-named-local, p3/consolidate-named-variable-borrow-provenance | borrow provenance of named variables through helpers (silent UAF) | MOVEPARAM; design first | no |
 
@@ -312,7 +302,6 @@ A3's "after A1" condition is met (A1 landed 2026-09-29).
 
 | Issue | Question |
 |-------|----------|
-| p3/immovable-cflat-struct-factory-return | Fresh by-value return of an [immovable] CFlat struct with guaranteed in-place construction (C++17-like)? T90 refuses every by-value return; C++ immovable classes accept fresh operands RULED 2026-10-21 (see lessons digest). |
 | p3/cflat-unique-dot-dispatches-to-pointee-member | `.` on CFlat unique<T>: prefer unique's own members (like C++ smart pointers after T46) or keep forwarding? RULED 2026-10-21 (see lessons digest). |
 | p4/string-functional-construction-spelling | p4: RULED 2026-10-21 - string(ptr) and string(ptr, len) borrow (see lessons digest) |
 

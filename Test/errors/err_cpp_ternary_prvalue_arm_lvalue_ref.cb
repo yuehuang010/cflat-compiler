@@ -1,0 +1,30 @@
+import cpp "cpp_t67_postinc.hpp";
+
+extern int main()
+{
+    expect_error("non-const lvalue reference") {
+        int i = 1;
+        int j = 4;
+        bool t = true;
+        cpp_t67.ibump(t ? i++ : j);
+    }
+    expect_error("non-const lvalue reference") {
+        int i = 1;
+        int j = 4;
+        bool t = false;
+        cpp_t67.ibump(t ? j : i++);
+    }
+    expect_error("non-const lvalue reference") {
+        int i = 3;
+        int j = 4;
+        bool t = true;
+        cpp_t67.ibump(t ? i-- : j);
+    }
+    expect_error("Left side of assignment is not an addressable lvalue") {
+        int i = 1;
+        int j = 4;
+        bool t = true;
+        (t ? i++ : j) = 9;
+    }
+    return 0;
+}

@@ -913,6 +913,12 @@ namespace cflat_cinterop
             return n;
         }
 
+        bool IsHiddenFriend(const FunctionDecl* fd)
+        {
+            return fd != nullptr
+                && fd->getFriendObjectKind() == Decl::FOK_Undeclared;
+        }
+
         /*
          * Enclosing-NAMESPACE-qualified name. A free operator is looked up by the namespace of
          * its class operand ("std" for std.string), while libc++ declares some of its operators
@@ -1952,6 +1958,7 @@ namespace cflat_cinterop
                 const auto* fd = ftd->getTemplatedDecl();
                 if (fd == nullptr || fd->isVariadic() || !fd->hasExternalFormalLinkage())
                     return true;
+                if (IsHiddenFriend(fd)) return true;
                 // A FREE binary operator template has no identifier, so the ordinary gate below
                 // drops it; libc++ declares every basic_string operator that way.
                 const bool isFreeBinaryOperatorTemplate = IsBindableFreeOperatorTemplate(fd);
@@ -2314,6 +2321,7 @@ namespace cflat_cinterop
                 // but CodeGen's ABI arranger cannot inspect it safely.
                 if (fd == nullptr || fd->isInvalidDecl() || fd->getReturnType()->isUndeducedType())
                     return true;
+                if (st.req.cxxMode && IsHiddenFriend(fd)) return true;
                 // The PATTERN of a function template is a FunctionDecl too. Its signature can be
                 // entirely non-dependent (`template <int N> int nth_of(const vector<int>&)`), so
                 // the dependent-type gate below misses it. Publishing it as a plain function
@@ -3015,12 +3023,13 @@ namespace cflat_cinterop
                 rec.isAbstract = cxx->isAbstract();
                 for (const FriendDecl* fr : cxx->friends())
                     if (const auto* named = fr->getFriendDecl())
+                    {
                         if (const auto* fn = named->getAsFunction();
                             fn != nullptr && fn->getOverloadedOperator() != OO_None)
-                        {
                             rec.hasFriendOperators = true;
-                            break;
-                        }
+                        if (llvm::isa<FunctionDecl>(named) || llvm::isa<FunctionTemplateDecl>(named))
+                            rec.friendNames.push_back(named->getNameAsString());
+                    }
                 rec.hasTrivialDefaultCtor = cxx->hasTrivialDefaultConstructor();
                 rec.hasTrivialCopyCtor = cxx->hasTrivialCopyConstructor();
                 rec.hasTrivialCopyAssign = HasTrivialUsableCopyAssignment(cxx);

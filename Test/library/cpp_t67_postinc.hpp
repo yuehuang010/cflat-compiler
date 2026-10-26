@@ -5,6 +5,8 @@ namespace cpp_t67 {
 inline int by_value(int value) { return 100 + value; }
 inline int by_const_ref(const int& value) { return 200 + value; }
 inline int by_rvalue_ref(int&& value) { return 300 + value; }
+inline void ibump(int& value) { ++value; }
+inline void cbump(const char*& value) { value = "changed"; }
 template<class T> inline int by_template(T value) { return 400 + value; }
 inline long ptr_const_ref(int* const& value, int* base) { return value - base; }
 inline long ptr_rvalue_ref(int*&& value, int* base) { return value - base; }
