@@ -68,12 +68,12 @@ Ruling refs: L = fix-issue-lessons.md "Rulings 2026-10-21/22: open-question swee
 | Id | Item (bucket/stem) | What is wrong (<= 15 words) | Fix (<= 20 words, cite ruling if any) | Area | Size | Tier | Win |
 |---|---|---|---|---|---|---|---|
 | R7 | p2/statement-temp-escapes-via-out-param-or-global | void*/unrelated pointer joins accepted; C-callee keeps freed temp (use-after-free) | Join refusal landed (T410). Left: C-callee/indirect-fn policy | pointer join conversion, statement-temp release (MainListener_Expressions), C callee policy | M | Luna | yes |
-| R9 | p2/unique-field-heap-array-through-move-param | `new T[n]` reaches `move T*`/unique field, freed as one object | PARKED 2026-10-22: T415 spike hit 75 Test sites + core btree (see issue Spike section); needs re-ruling. Was: static refusal: `new T[n]` cannot bind owning `move T*` sink; keep `move T[]`; exempt trivially destructible T (L). Spike in-tree site count first | param sink check, new T[n] typing (MainListener_Expressions, LLVMBackend) | M | Luna (spike gate) | no |
+| R9 | p2/unique-field-heap-array-through-move-param | `new T[n]` reaches `move T*`/unique field, freed as one object | RULED 2026-10-25, hold lifted: option 1 - callee-side "adopted into unique<T>" param fact, call-site refusal on precise array provenance; `move T*` keeps the hidden count; also `m = new R()` on a move param releases the old value (see issue head) | param sink check, new T[n] typing (MainListener_Expressions, LLVMBackend) | M | Luna (spike gate) | no |
 | R12 | p2/cpp-ternary-default-arm-unbound-callee-wrong-arm | Bulk landed (T418 default/local leaves, T420 field/move leaves). Left: conversion arm into first unbound wrapper call (unknown signature); call arm; (default) parens; ctor const& | See issue "Still wrong"; extend deferral to move/field leaves, register wrapper param type before arg parse | MainListener_PostfixExpression.cpp, ParseTernaryBranches, C++ call-arg state | L | Opus | yes |
 | R13 | p2/lowered-cxx-field-structs-in-containers-and-array-fields | (a),(b) landed (T417). Left: R3 arr slot reuse `_ = move arr[0]; arr[0] = b` | (c) R3 element state (needs design). ruled: DESTROY+REBUILD stays | lowered C++ field machinery | M | Opus (after design) | yes |
 | R14 | p2/cpp-forwarded-fnptr-variable-or-closure-dangles-in-wrapper-frame | fn-ptr var or closure forwarded to C++ T&& dangles in wrapper frame | Blob-record family landed (T419: std-owner rule, MSVC shared_ptr). Left: see issue (std::function(std::ref(f)), caller-frame materialization, BorrowDtor/Mixed blind spots) | C++ wrapper/forwarding (CInterop, LLVMBackend_Overloads) | L | Opus | yes |
 | R16 | p2/delete-borrow-via-named-local + p2/view-mixed-join-sunk-through-pointer-param-alias | Owner/borrow reaches sink via helper chain or ptr param; double free / UAF | One interprocedural callee summary ("param stored into borrowing container / sinks view field"); path-sensitive provenance. Parked fix/t396-viewalias; not same-function guard (digest) | callee summaries, MemoryOutlivesCall walk, T387 view state | L | Opus | no |
-| R17 | p2/iface-return-dangle-via-calls-aggregates-and-rebinds | Returned interface boxes pointer from local via call/heap/indirect write | Callee-return provenance "returns param N" or borrow-check refusal; needs separate design (see Not ready) | provenance through memory; PointerValueRoot | L | Opus | no |
+| R17 | p2/iface-return-dangle-via-calls-aggregates-and-rebinds | Returned interface boxes pointer from local via call/heap/indirect write | RULED 2026-10-25: Rust lifetime elision - call result borrows from every pointer arg + receiver unless callee summary proves fresh/global/param N; heap aggregate alias refused the same way (see issue head) | provenance through memory; PointerValueRoot | L | Opus | no |
 
 ### Conflict map (never concurrent)
 - R1, R6, R14: function-value / callable binding (ParseTernaryBranches + function<> sinks). R6 before R14.
@@ -93,7 +93,7 @@ Ruling refs: L = fix-issue-lessons.md "Rulings 2026-10-21/22: open-question swee
 Windows gate: R6, R7, R11, R12, R13, R14 land after the Windows box passes. R2 is the long pole; start it in wave 1 and let waves 2-3 refill the other 2 slots as they finish.
 
 ### Not ready
-- R17 iface-return-dangle: separate design ruling (callee-return provenance fact vs borrow-check refusal); heap-aggregate alias and indirect-write sub-items tried 3x by Luna.
+- R17 iface-return-dangle: RULED 2026-10-25 (elision rule, see issue head); heap-aggregate alias and indirect-write sub-items tried 3x by Luna - Opus.
 - p2/string-copy-through-pointer-subscript global-pointer and implicit-this parts: need a runtime provenance design or ruling (compile-time global flag depended on emission order); Luna failed 3 attempts.
 - R13(c) R3 `_ = move arr[0]; arr[0] = b`: element state not static; needs design.
 - R10(d) conditional moved-source read: path-sensitive moved-state design, no plan yet.
@@ -117,12 +117,12 @@ Windows gate: R6, R7, R11, R12, R13, R14 land after the Windows box passes. R2 i
 | P3 | - | p3/call-name-shadowing-leftovers-after-t484 | filed T484 review |
 | P3 | - | p3/function-pointer-double-pointer-address-of-named-function-accepted | filed T478 |
 | P3 | - | p3/nested-type-lookup-leftovers-after-t481 | filed T481 |
-| P3 | - | p3/returned-pointer-from-call-result-field-temp-dangles | T510 residue: unique-field select ruling, raw temp field into unique int* param double free, ternary owner, accepted leaks |
+| P3 | - | p3/returned-pointer-from-call-result-field-temp-dangles | T510 residue: RULED 2026-10-25 item 1 REFUSE (mixed-select legs -> err_); raw temp field into unique int* param double free, ternary owner, accepted leaks |
 | P3 | - | p3/ctor-lambda-this-closure-relocation | T515 residue: by-value return of a this-capturing-closure holder awaits the native return-ABI ruling |
-| P3 | - | p3/self-pointer-struct-return-not-in-place | filed T510: RULING native return ABI for dtor-bearing structs |
+| P3 | - | p3/self-pointer-struct-return-not-in-place | RULED 2026-10-25: C++ guaranteed elision for every ctor-/dtor-bearing native struct (sret + in-place new); plan first |
 | P3 | - | p3/crossed-address-of-state-leaks-call-temporary | T485 leftovers: C2 non-storing callee leak, two-owner pointer difference, pre-existing store3 EARLY FREE |
-| P3 | fix/t422-globdef | p3/global-default-spelling-zeroes-without-the-note | PARKED (T422 Luna r1 + Haiku r2): ruling conflict with runtime-constructed globals (T136/T368/mempress) - see issue head |
-| P3 | fix/t438-uniqdot | p3/cflat-unique-dot-dispatches-to-pointee-member | PARKED: needs ruling on name hiding + `->` (see issue file) (T438) |
+| P3 | fix/t422-globdef | p3/global-default-spelling-zeroes-without-the-note | RULED 2026-10-25: native globals Rust-strict, C++ per clang; land r2 + rewrite the 3 sites (see issue head) |
+| P3 | fix/t438-uniqdot | p3/cflat-unique-dot-dispatches-to-pointee-member | RULED 2026-10-25: own-first strict hiding, `.` == `->`, drop the shape fallback (see issue head) (T438) |
 | R16 (parked) | fix/t396-viewalias | p2/view-mixed-join-sunk-through-pointer-param-alias | Sol r2b: 4 INCOMPLETE, needs path-sensitive provenance |
 
 ## Backlog (p3/p4 and plans; groups from earlier builds, unchanged)
@@ -235,7 +235,7 @@ Rows that named only p1/p2 issues moved to the ship-gate section above and were 
 | N35 | p3/cpp-demand-bodies-torch-cold-cost | R4 costs +4.4% cold instructions on torch (json -28%); verdict writes batched in 93b361f6 (-0.55%), rest is clang instantiation | PART 2026-09-29d |
 | N37 | p3/cpp-signature-registration-projects-records | Registration projects every record a signature names; -3.6% torch only by skipping projection, which breaks overload order (D4) | NEW 2026-09-30 perf |
 | N41 | p3/cpp-variadic-alias-template-refused | in-repo `template<auto... I> using A = S<I...>` refused (alias machinery has no pack support) (ST4, pre-existing) | NEW 2026-10-01 |
-| N42 | p3/cpp-header-unreferenced-global-initializers-skipped | unreferenced C++ header inline globals never run their dynamic initializer (referenced ones + .cpp sources fixed/fine, T44) | DEFERRED p3 2026-10-09 (maintainer: not a blocker, later) |
+| N42 | p3/cpp-header-unreferenced-global-initializers-skipped | unreferenced C++ header inline globals never run their dynamic initializer (referenced ones + .cpp sources fixed/fine, T44) | RULED 2026-10-25: follow clang, run every harvested header global initializer, budget-gated; p3 |
 | N47 | p3/cpp-constant-fold-and-const-static-twin-leftovers | constexpr-call initializer refused by the fold guard; const receiver + static twin overload refused (ST4 re-review leftovers) | NEW 2026-10-01 |
 | N52 | p3/cpp-range-for-member-name-lookup-and-count-probe | range-for member lookup misses enum/nested-type begin/end (accepts invalid); count/get clients pay a failed ADL probe; ST6 follow-up | NEW 2026-10-01 |
 | N58 | p3/cpp-struct-identity-underscore-namespace | [cpp] identity: ns_ namespace decode, global name collision, CRTP base reading a derived field (master too); N51 follow-up | NEW 2026-10-01 |

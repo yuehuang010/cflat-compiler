@@ -1,5 +1,7 @@
 # `new VB()` / `VB v;` of a C++ class with a virtual base is refused (by design)
 
+**RULED 2026-10-25 (maintainer): stays REFUSED** (plan M6, pinned by err_cpp_virtual_base.cb). Reopen only when a real user program needs it. Not buildable; keep as a record.
+
 Found 2026-10-15 by the T247 review (pre-existing on master 68f3b221e). Repro:
 scratch/t290_tmp/p_new.cb (+ vb.hpp, oracle vb_oracle.cpp); T247 case scratch/repro_keep/t247_rev/cases/e_vb.cb.
 

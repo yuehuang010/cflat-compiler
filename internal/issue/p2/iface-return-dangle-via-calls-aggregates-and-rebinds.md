@@ -1,5 +1,7 @@
 # Interface return can dangle through pointer-returning calls
 
+**RULED 2026-10-25 (maintainer): Rust lifetime-elision rule.** A non-owning pointer / interface RESULT of a call borrows from EVERY pointer argument and the receiver of that call, unless the callee's summary proves it returns something fresh, global, or a specific parameter N (then only that one). So `return idt(t)` / `return u.get()` / a lambda over `t` called in the return are refused exactly where `return t` is. Same rule for a frame alias stored into a heap aggregate that leaves the frame (`h->p = alias; return h->p;`): the heap slot carries the frame borrow. Indirect / unknown callees take the full-argument borrow. Design is settled; buildable (R17).
+
 From T91 reviews 1-2 (2026-10-10), pre-existing on master: a returned interface may box a pointer
 borrowed from a local owner when the pointer passes through a call. The owner is freed at scope exit
 while the returned interface still points at it.

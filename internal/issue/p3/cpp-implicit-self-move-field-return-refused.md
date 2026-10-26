@@ -1,5 +1,7 @@
 # `return move p->f;` of a plain CFlat struct field is refused (q06 move-through-borrow leg)
 
+**RULED 2026-10-25 (maintainer): ACCEPT.** `move p->f` of a trivially-copyable / non-owning value field through a borrowed parameter is a plain copy, no nulling, in any position (Rust: moving a Copy type out of a borrow is a copy; clang: std::move of a POD = copy). "Explicit move nulls source" stays scoped to owning slots. The q06 leg in ParseMoveExpression keeps refusing OWNING-value and pointer fields only. Buildable.
+
 Found by T173 (Haiku, 2026-10-14), confirmed by its Sol review, pre-existing on master. The implicit-this
 spelling `return move f;` of a non-copyable C++ class field was fixed by T178 (the bare name now takes the
 field path of `return move this->f;`, MainListener_Statements.cpp EmitReturnExpression).

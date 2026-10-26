@@ -14,6 +14,6 @@ calls now pass on master. Item 13's local-array pointer alias is fixed in this w
    repro directory and the issue has no source body. The older master record is rc=139; this run
    could not remeasure it. Out of scope for T412; needs path-sensitive moved-state design.
 T196 setter bond escape remains out of scope. Master repro
-`/Users/felixhuang/source/cflat-compiler/scratch/repro_keep/t196_rv1/rev_t196_opus_setter_bond_escape.cb`
+`scratch/repro_keep/t196_rv1/rev_t196_opus_setter_bond_escape.cb`
 returns 3 and ASan reports heap-use-after-free when a by-value Lambda param is stored and invoked
 after its captured unique owner leaves scope.

@@ -1,6 +1,6 @@
 ---
 name: squash-headlines
-description: Squash the unpushed commits on master (origin/master..master) into a few topical "major headline" commits, keeping the final tree identical and rewriting old hashes in the issue queue to the grouped commits. Use when the user says "squash commits", "squash to headlines", "squash from origin", or wants local history condensed before a push.
+description: PII-check the repo (Haiku subagent), then squash the unpushed commits on master (origin/master..master) into a few topical "major headline" commits, keeping the final tree identical and rewriting old hashes in the issue queue to the grouped commits. Use when the user says "squash commits", "squash to headlines", "squash from origin", or wants local history condensed before a push.
 ---
 
 # Squash to headlines
@@ -18,7 +18,26 @@ chain with `git merge-tree` / `commit-tree`, so nothing is checked out until `--
    pending work the user wants included first. The tool fetches origin and refuses to run
    unless origin/master is an ancestor of master; if it is not, rebase first.
 
-2. **Survey.** `git log --reverse --format='%h %<(200,trunc)%s' origin/master..master`.
+2. **PII check (Haiku subagent).** Before grouping, spawn one read-only Agent-tool subagent
+   with `model: "haiku"` (the user's explicit choice for this step, overriding the default
+   delegation tier). Brief it, with a token-efficiency directive and "report only, edit nothing":
+   - **Pass 1, `internal/`:** scan the tracked files under `internal/` (`git ls-files internal/`)
+     for PII: personal emails, real names next to account handles, `user@host` SSH targets,
+     private/LAN IPs, home-directory paths carrying a username (`/Users/<name>`,
+     `C:\Users\<name>`), machine names, phone numbers, API keys / tokens / passwords.
+   - **Pass 2, extend hits:** for each distinct value found in pass 1, `git grep -n -F` it
+     across the rest of the tracked repo with `':!scratch/'` (scratch/ is excluded entirely;
+     it is gitignored anyway).
+   - Report: one line per hit, `file:line`, category, the value itself masked to its first
+     few characters. No file dumps.
+
+   Main session reviews the report (Haiku over-flags; the Git author line and `Co-Authored-By`
+   trailers are expected, not PII). Real hits: tell the user and fix them in a commit on
+   master before step 3, so the fix joins the plan. A value already pushed (present in
+   `origin/master`) cannot be scrubbed by squashing - say so; do not rewrite pushed history.
+   No hits: continue.
+
+3. **Survey.** `git log --reverse --format='%h %<(200,trunc)%s' origin/master..master`.
    Group by topic, not by timebox. Past headlines:
    - native ownership / pointer rules
    - C++ semantics like clang (const, overload / operator ranking, layout / binding)
@@ -26,10 +45,10 @@ chain with `git merge-tree` / `commit-tree`, so nothing is checked out until `--
    - C interop ABI
    - issue queue bookkeeping
 
-   Aim for 3-8 groups (chronological fallback in step 4 when topics will not separate). Put queue / resume bookkeeping commits in one final group with
+   Aim for 3-8 groups (chronological fallback in step 5 when topics will not separate). Put queue / resume bookkeeping commits in one final group with
    `"bookkeeping": true`.
 
-3. **Write the plan** to `scratch/squash_<date>/plan.json`:
+4. **Write the plan** to `scratch/squash_<date>/plan.json`:
    ```json
    {"groups": [
      {"title": "<headline: summary of the topic, then key items>", "commits": ["abcd1234", "..."]},
@@ -43,7 +62,7 @@ chain with `git merge-tree` / `commit-tree`, so nothing is checked out until `--
    that carried the wrong message). A single-commit group titled with its own subject keeps its
    message verbatim - use it for an earlier unpushed headline that should stay as is.
 
-4. **Dry run:** `python3 internal/skill/squash-headlines/squash.py scratch/squash_<date>/plan.json`.
+5. **Dry run:** `python3 internal/skill/squash-headlines/squash.py scratch/squash_<date>/plan.json`.
    It prints one line per new commit, the files whose hashes it remapped, and the diff vs master.
    That diff must touch only remapped hash text.
    - Groups are emitted greedily in plan order. When a group's commits textually depend on
@@ -71,7 +90,7 @@ chain with `git merge-tree` / `commit-tree`, so nothing is checked out until `--
    - Check the remap: `git diff master <new tip> | grep '^[-+]' | head`. Only hash text should
      change. Several references collapsing onto one grouped hash is expected.
 
-5. **Apply:** re-run with `--apply`. This creates `backup/master-pre-squash-<date>` at the old
+6. **Apply:** re-run with `--apply`. This creates `backup/master-pre-squash-<date>` at the old
    master and moves master with `git reset --keep`. Verify:
    - `git log --oneline origin/master..master`
    - `git diff --quiet backup/master-pre-squash-<date> master -- . ':!internal/issue'`, which
@@ -79,7 +98,7 @@ chain with `git merge-tree` / `commit-tree`, so nothing is checked out until `--
 
    The tree is unchanged, so no rebuild or suite rerun is needed.
 
-6. **After.** Old hashes stay reachable through the backup branch, and every grouped commit
+7. **After.** Old hashes stay reachable through the backup branch, and every grouped commit
    body lists them as `(was <hash>)`, so `git log --grep <old>` finds the new home. Memory
    files and scratch logs may keep old hashes; update a memory only if it is used for lookups.
    The mapping is saved to `scratch/squash_<date>/plan.remap.json`. Do not push unless the

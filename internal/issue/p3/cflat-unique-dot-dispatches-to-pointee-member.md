@@ -1,5 +1,7 @@
 # `u.get()` on CFlat's own unique<S> calls S::get when S has get()
 
+**RULED 2026-10-25 (maintainer, settles both T438 questions):** `.` and `->` are ONE operator with identical resolution (CFlat goal: the identifier's type deduces the correct usage; master already treats them alike on pointers, values and unique<T> - probed scratch/rulings1025/q1-q13.cb). On a struct with operator-> (unique<T>, Box, any CFlat struct): OWN members first with STRICT name hiding (C++, Rust Deref), both spellings. No shape fallback: a same-named own member that does not fit the arguments is "no overload", never a fall-through to T. A hidden pointee member is reached via `(*u).m` or `u.get().m`. Consequences: the 3 test_generics `ll.get(0).get(0)` legs become `(*ll).get(0)`; master legs where `u.reset(9)` / `u.valid()` / `u->get()` reached S now hit unique's own member; Box own-first legs in test_operators (b)/(c) stand. Unparks fix/t438-uniqdot: drop the shape fallback, keep own-first for `->` too.
+
 **RULED 2026-10-21:** `.` on unique<T> resolves unique's own members first, then forwards to T. See fix-issue-lessons.md digest.
 
 Found by the T46 Opus review (2026-10-05), on master too: `scratch/rev_t46_cu.cb` in worktree cflat-fix-t46-smartdot.

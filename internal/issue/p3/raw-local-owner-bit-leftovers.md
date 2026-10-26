@@ -28,3 +28,8 @@ fix/t207-rawlaunder). All shapes behave the same on master and after T207; none 
 - `for (..) { owner = raw; if (i == 0) { raw = p; break; } raw = new R(); }` - the borrowed state leaves through `break`
   and never reaches the back edge, yet the back-edge check sees it: break-path state must not merge into the back-edge
   state. A real false refusal; fix in the loop frame join (LLVMBackend_OwnershipTemps.cpp loop entry/exit snapshots).
+
+## Ruled 2026-10-25: `move R* m` parameter reassigned by `m = new R();`
+Maintainer ruling (with the R9 hold lift): the assignment RELEASES the moved-in object (destructor + free, honouring the
+hidden raw-array count) before storing the new value - assignment transparency, same as any owning slot. The raw-count legs
+that pin the leak today are updated with the fix. Buildable now.

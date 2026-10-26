@@ -1,5 +1,7 @@
 # p3: call-result temp field pointer escaping through a call - remaining shapes after T510
 
+**RULED 2026-10-25 (maintainer), item 1: REFUSE.** A pointer read from an owning call temporary's field passed to a callee that MAY store it into outliving memory (select / join with any outliving arm: global, heap, out-param) is a compile error, Rust-style ("borrow of a temporary may reach a longer-lived slot"); rewrite with a named owner (`H h = mk(); f(h.heap, c);`). The frozen Test/test_move.cb `temp_uniq_accept_join_dest_local_arm*` and `*_fresh_arm*` legs move to an err_ file; `*_both_local_arms*` (provably local) stays accepted and freed once. Keep-alive (leak) was rejected for this shape. Items 2-3 follow the same rule (unique param: refuse; ternary owner with Unknown callee: existing Unknown = keep alive stands). Buildable.
+
 T510 landed the three-valued store walk: a raw pointer read from an owning call temporary's field and passed to a
 CFlat call is refused when the callee provably stores it outside the call, destroyed at full-expression end when it
 provably does not, and kept alive (leaked, never freed early) when the walk cannot tell (indirect callee, bound

@@ -6,7 +6,7 @@ These five shapes still take the local arm as an lvalue. Master and this branch 
 
 The fixture is `Test/library/cpp_interop_ternaryref.h` (`ternref::T391Val`, which counts ctor, copy,
 move, dtor and live allocations, packed as value * 100000 + counts). Each value below is `c=false` /
-`c=true`; clang++ -std=c++20 is the oracle. Repros: `/Users/felixhuang/source/cflat-compiler/scratch/repro_keep/box1022/t459/`
+`c=true`; clang++ -std=c++20 is the oracle. Repros: `scratch/repro_keep/box1022/t459/`
 (each `.cb` is a CFlat repro, each `.cpp` its clang oracle; `fixture.h` and the header sit beside them).
 Run from that directory: `x64/Release/cflat <name>.cb -o out.exe`, and `clang++ -std=c++20 <name>.cpp`.
 

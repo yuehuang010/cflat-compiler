@@ -1,5 +1,7 @@
 # Self-pointing struct returned by value dangles (no in-place return construction)
 
+**RULED 2026-10-25 (maintainer): C++ guaranteed-elision semantics, scope = every ctor- or dtor-bearing native struct.** A native struct with a user-written ctor body or a destructor is returned by value via sret into the caller's final slot and constructed IN PLACE by `new T()` (heap slot) so `&this->field` stored in the ctor survives. Plain data structs (no user ctor body, no dtor) keep the register / value return. Plan-sized rollout, not a point fix (T510 r3 crashed doing it globally: core unique<T> ctor, duplicate destructor, list.add ASAN) - write internal/plan/ first. Acceptance unchanged: repro prints d=1 c=14; test_move --asan -g clean; T498Res/T510Res may move back off the global pool.
+
 Residue of T510 (p2 landed without it). RULING NEEDED before a fix: return ABI for native structs.
 
 ## Repro (master and after T510)
@@ -35,6 +37,6 @@ Acceptance: the repro prints d=1 c=14; test_move --asan -g clean.
 
 `new T()` constructs T in the constructor's frame and copies the value into the heap allocation, so a constructor that
 stores `&this->field` leaves the heap object pointing into a dead frame (clang constructs in place). The T498Res/T510Res
-test_move fixtures relied on this and read stale stack memory (passed on arm64 by luck, garbage on Windows); e747344da
+test_move fixtures relied on this and read stale stack memory (passed on arm64 by luck, garbage on Windows); 2940475db
 moved them to global pools. The same ruling (in-place construction for dtor-bearing / self-pointing structs) covers
 `new T()`.

@@ -1,5 +1,7 @@
 # C++ header globals the program never references do not run their dynamic initializers
 
+**RULED 2026-10-25 (maintainer): follow clang.** Run the dynamic initializer of every harvested header global (referenced or not) in declaration order, inside the T136 startup initializer. Land only within the test_libs cold/warm compile-time budget (scratch/libs_perf.sh vs previous master log); if it blows the budget, the item comes back with numbers instead of landing. Stays p3.
+
 Found by the ST4 review (2026-10-01), pre-existing on master. Repro: copy of the reviewer's probe
 in scratch/repro_keep/st4_preexisting/dynamic.cb.
 

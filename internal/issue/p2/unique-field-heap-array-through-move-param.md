@@ -1,5 +1,7 @@
 # `new T[n]` reaches a `unique T*` FIELD through a `move T*` parameter and is freed as one object
 
+**RULED 2026-10-25 (maintainer): HOLD LIFTED for option 1 only.** `move T*` stays a counted owning pointer at the ABI level (hidden `.raw_array_count`, the test_core raw-count legs stand). Fix = a callee-side summary fact "parameter adopted into a unique<T>" (set when a `move T*` parameter reaches core `unique<T>(move T*)` / `reset` / a unique field store, propagated through `inner(move p)` forwarding like the move-inference facts); the CALL SITE refuses when an argument with precise array provenance binds such a parameter. Residual: provenance lost through a raw field / arithmetic / cast stays the user's job ("new T[] pure"). Option 4 (runtime trap at core unique adoption) is NOT default; at most a later `--asan`-only layer. Options 2 and the 2026-10-21 static rule are withdrawn. Also ruled: `m = new R();` on a `move R* m` parameter RELEASES the moved-in object (assignment transparency) - see p3/raw-local-owner-bit-leftovers.md.
+
 **RULED 2026-10-21:** Static rule: `new T[n]` cannot bind an owning `move T*` sink; keep `move T[]` sinks; exempt trivially destructible T; spike the site count first. Buildable (left hold/). See fix-issue-lessons.md digest.
 
 Found 2026-09-02 by the round-2 Opus review of the unique<T> branch. Memory-safety class:
