@@ -1,5 +1,7 @@
 # P3 C++ constructor ranking leftovers after C6 round 2
 
+**RULED 2026-10-24 (main session, applies the 2026-10-13 ruling; maintainer may veto):** item 3 - no implicit floating -> integer conversion at C++ constructor arguments in ANY form (`new`, declaration, expression), including binding a double local to `const int&` / `int&&` / `long` reference parameters (the "C6 round 3" acceptances at `new` are wrong and are retired). All three syntactic forms must agree; int -> float and pointer -> bool stay accepted.
+
 ## Summary
 
 Two diagnosed C++ interop gaps remain outside C6 round 2. The ranking fixes for

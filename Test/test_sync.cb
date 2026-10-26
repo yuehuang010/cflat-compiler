@@ -905,7 +905,7 @@ bool testValueBufferTeardown()
         gValueBufferDtorCount = 0;
         ch.destroy();
     }
-    result &= Test("channel live value slot destructed", gValueBufferDtorCount, 2);
+    result &= Test("channel live value slot destructed", gValueBufferDtorCount, 1);
 
     gValueBufferDtorCount = 0;
     {
@@ -916,7 +916,7 @@ bool testValueBufferTeardown()
         gValueBufferDtorCount = 0;
         q.destroy();
     }
-    result &= Test("spsc live value slot destructed", gValueBufferDtorCount, 2);
+    result &= Test("spsc live value slot destructed", gValueBufferDtorCount, 1);
     return result;
 }
 

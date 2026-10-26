@@ -617,6 +617,34 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         lastCxxRetValue_ = nullptr;
         lastLoweredRetTemp_ = nullptr;
         lastLoweredRetValue_ = nullptr;
+        if (argNVs != nullptr)
+        {
+            TypeAndValue indirectReturn;
+            std::vector<TypeAndValue> indirectParams;
+            UnpackFuncPtrSignature(funcPtrType, indirectReturn, indirectParams);
+            for (size_t i = 0; i < argNVs->size() && i < funcPtrType.FuncPtrParams.size(); ++i)
+            {
+                const auto& fp = funcPtrType.FuncPtrParams[i];
+                if (fp.Pointer || fp.IsAlias || IsCxxRecord(fp.TypeName)) continue;
+                TypeAndValue param = FuncPtrParamAsTypeAndValue(fp, i);
+                bool aliasSlotParam = i < indirectParams.size()
+                    && ParamIsAliasReturnSlot(indirectReturn, indirectParams[i]);
+                bool paramTakesOwnership = fp.IsMove
+                    || (aliasSlotParam && !IsCopyableType(fp.TypeName))
+                    || IsCoreUniqueType(fp.TypeName)
+                    || (OwningSinkConsumesConcrete(param)
+                        && (fp.TypeName == "string" || IsOwningValueType(fp.TypeName)));
+                if (!paramTakesOwnership)
+                {
+                    const auto& arg = (*argNVs)[i];
+                    if (!arg.IsCFlatBraceInitTemp) continue;
+                    bool ternaryJoinNeedsRegistration = arg.Primary != nullptr
+                        && llvm::isa<llvm::PHINode>(arg.Primary)
+                        && !arg.TernaryTempAlreadyRegistered;
+                    RegisterBorrowedOwningStructTemp(arg, ternaryJoinNeedsRegistration);
+                }
+            }
+        }
         // #6 through a function value: its recorded parameter pointee const, else the interop
         // flag (then every level is read-only).
         for (size_t i = 0; i < args.size() && i < funcPtrType.FuncPtrParams.size(); ++i)

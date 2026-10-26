@@ -1785,6 +1785,8 @@ public:
         // (string/owning struct/closure). Zeroing is deferred to ApplyMoveParamTransfer so the
         // callee's parameter move-ness is known first. Not part of the --init cache round-trip.
         bool IsExplicitMove = false;
+        // Argument written as `move <call>(...)` with no `?:` between (set by ParseAssignmentExpressionNamed).
+        bool IsDirectMoveCall = false;
         // The generated constructor wrapper hides an underlying C++ reference parameter behind
         // a by-value adapter; retain its selected reference category for move transfer.
         bool IsCxxReferenceSink = false;
@@ -2370,6 +2372,10 @@ public:
         // Parse-tree summary: every 'return' names a module global (`return gRaw;`). Set by
         // the forward-ref scan so a caller's refusal does not depend on definition order.
         bool ReturnsGlobalBorrow = false;
+        // Parse-tree summary: at least one live 'return' resolves to a borrowed pointer parameter.
+        bool ReturnsParameterBorrow = false;
+        // Index when every live return forwards the same pointer parameter; otherwise -1.
+        int ReturnsSingleParameterIndex = -1;
         bool IsMethod = false;    // true when registered as a struct/class method (has implicit self pointer)
         bool IsCxx = false;        // declaration came from a C++ header
         bool IsCoreLibraryFunction = false; // implicit core origin; explicit C/C++ imports remain declarations
@@ -2538,6 +2544,13 @@ public:
     };
     std::vector<RawArrayResult> rawArrayResults_;
 
+    struct NonLocalViewAddressStep
+    {
+        bool IsLoad = false;
+        llvm::Type* SourceType = nullptr;
+        llvm::Type* LoadType = nullptr;
+        std::vector<llvm::Value*> Indices;
+    };
     struct NonLocalViewOwnershipState
     {
         llvm::Value* Storage = nullptr;
@@ -2545,6 +2558,16 @@ public:
         bool MayBeBorrowed = false;
         // Element-field name ("root|hs[0].f" or "root|*.f"): matches a sink with no storage.
         std::string PathKey;
+        // Stack aggregate fields keep runtime ownership outside the aggregate ABI layout.
+        llvm::Value* RootStorage = nullptr;
+        std::string FieldMovePath;
+        TypeAndValue FieldType;
+        llvm::Type* BaseType = nullptr;
+        llvm::AllocaInst* OwnFlag = nullptr;
+        llvm::AllocaInst* RawArrayLengthStorage = nullptr;
+        std::vector<NonLocalViewAddressStep> AddressPath;
+        llvm::Value* RefCountStorage = nullptr;
+        uint64_t AllocAlignment = 0;
     };
     std::vector<NonLocalViewOwnershipState> nonLocalViewOwnershipStates_;
 
@@ -3561,9 +3584,17 @@ private:
                                      const llvm::Value* sourceStorage,
                                      bool sourceTransfersOwnership,
                                      const std::string& pathKey = {},
-                                     bool sourceKnownBorrowed = false);
+                                     bool sourceKnownBorrowed = false,
+                                     const NamedVariable* destination = nullptr,
+                                     const NamedVariable* source = nullptr);
+    void DisarmNonLocalViewFieldsForEscape(const llvm::Value* storage,
+                                           bool includeDescendants = false);
+    llvm::Value* RecomputeNonLocalViewFieldStorage(const NonLocalViewOwnershipState& state);
     std::optional<bool> NonLocalViewMayBeBorrowed(const llvm::Value* storage,
                                                   const std::string& pathKey = {}) const;
+    void MarkNonLocalViewFieldMoved(const llvm::Value* rootStorage,
+                                    const std::string& fieldPath);
+    void DropNonLocalViewFields(const NamedVariable& root);
     std::string NonLocalElementPathKey(const NamedVariable& nv) const;
     bool SameNonLocalViewStorage(const llvm::Value* left,
                                  const llvm::Value* right) const;
@@ -5194,7 +5225,8 @@ private:
 
     // `releaseGate` (i1, optional) additionally skips the cleanup when it is false.
     void EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* replacement = nullptr,
-                              llvm::Value* releaseGate = nullptr);
+                              llvm::Value* releaseGate = nullptr,
+                              bool skipElementDestructor = false);
     // Reassignment of an owning pointer / array-view local: release the old block (destructors,
     // paired free) unless it is null, equal to `replacement`, or not owned (runtime flag).
     // `rhsOwnerSlot`: the owning local a borrowed replacement aliases; `rhsBorrowedParam`: the
@@ -6275,9 +6307,9 @@ private:
     /*
      * Call `dtor` on `storage`: once when it holds a scalar, once per element when it holds a
      * fixed array. `T[N] a;` owns all N elements - calling the destructor on the base pointer
-     * alone destructs element [0] and leaks the rest. `typeName` is the element type: when it
-     * holds a C++ class member (HasCxxClassMember) the elements are destructed last-to-first,
-     * as C++ does; otherwise declaration order is kept.
+     * alone destructs element [0] and leaks the rest. `typeName` is the element type; `reverse`
+     * selects reverse element order for member arrays, and C++-containing element types also
+     * reverse as C++ does.
      */
     void EmitFullDestructorOverStorage(llvm::IRBuilder<>& b, llvm::Value* storage,
                                        llvm::Type* storageTy, llvm::Function* dtor,
@@ -6372,6 +6404,7 @@ private:
      */
     bool HasCxxClassMember(const std::string& typeName) const;
     bool IsOwningValueType(const std::string& typeName);
+    bool ShouldSkipMovedFromStructDestructor(const std::string& typeName) const;
     // An `extern` definition with a CFlat body follows the C ABI: the callee owns (and destroys)
     // each owning by-value param, so a call hands the argument over exactly like a `move` param.
     bool CFlatExternOwnsByValueParam(const TypeAndValue& p);
@@ -11235,7 +11268,6 @@ public:
     struct FuncPtrComponent
     {
         bool Known = false;
-        bool VoidPointee = false;   // `void*`: a wildcard over every pointee
         bool IsArrayView = false;
         bool IsAlias = false;       // by-address ABI identity: an alias param or return
         int ConstMask = -1;
@@ -11313,8 +11345,7 @@ public:
 
     /*
      * One-sided: true only when BOTH components resolve AND name provably different types.
-     * A `void*` on either side is a wildcard over every other POINTER, matching the scorer's own
-     * "any pointer is implicitly convertible to void*" rule; against a non-pointer it is proof.
+     * Ordinary data-pointer conversions do not convert one function signature into another.
      */
     static bool ComponentsProvablyDiffer(const FuncPtrComponent& a, const FuncPtrComponent& b);
 
@@ -12485,6 +12516,9 @@ public:
             const void* Site = nullptr;
         };
         std::vector<Escape> Escapes;
+        // Receiver-rooted values assigned outward; consumed only by lifetime cleanup.
+        struct OutwardViewStore { ReceiverPath Source; bool AddressOf = false; };
+        std::vector<OutwardViewStore> OutwardViewStores;
         /*
          * What an `alias` / pointer return hands back: Kind 0 a receiver-candidate path, 1 rooted
          * elsewhere (an unassigned parameter, a literal, `new`), 2 unknown.
@@ -12499,6 +12533,7 @@ public:
     }
     // A native method may be called on a const receiver (greatest fixed point over its calls).
     bool IsReadOnlyMethod(const FunctionSymbol& method);
+    bool ReceiverMayHandOutViewOrPointer(const FunctionSymbol& method);
     // Native method (has a `this`) whose read-only-ness the call site judges.
     bool IsNativeReceiverMethod(const FunctionSymbol& method) const;
     // #8: refuse a call of a method that is not read-only on a const receiver.

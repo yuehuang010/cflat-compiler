@@ -1,5 +1,7 @@
 # C++ constructor: CFlat `&p` at a pointer-reference parameter vs clang's `T**` reading
 
+**RULED 2026-10-24 (main session, C meaning of `&p` wins; maintainer may veto):** when any viable candidate accepts `&p` read as a `T**` VALUE (exact `T**`, a deducing template, `void*`, `bool`), the clang pick wins - CFlat follows C++ overload resolution there. The CFlat slot-binding reading (`&p` at a `T*&` parameter) is a FALLBACK applied only when no candidate accepts the value reading (T131 behaviour, now the general rule for ctor, postfix-ctor and free-function paths alike). Fix the misleading "arg int** = param int**" detail. Divergences 1-3 above all resolve to the clang pick.
+
 PRE-EXISTING / design (T131 review 1, 2026-10-12). CFlat spells "bind p by reference" as `&p`
 at a reference parameter; C++ reads `&p` as a `T**` prvalue. T131 binds the slot when a constructor
 takes `T*&` and no `T**` / constructor-template candidate exists. Remaining divergences:

@@ -1,0 +1,114 @@
+int t427FromVoid(void* p) { return 41; }
+int t427FromChar(char* p) { return 42; }
+int t427FromConstVoid(const void* p) { return 43; }
+int t427FromConstChar(const char* p) { return 44; }
+void t427FromVoidForInt(void* p) { }
+int t427PickChar(function<int(char*)> f) { return 1; }
+int t427PickConstChar(function<int((const char)*)> f) { return 2; }
+int t427Generic<T>(function<int(T)> f, T p) { return 3; }
+void* t427FromVoidReturn() { return nullptr; }
+int t427PickCharReturn(function<char*()> f) { return 4; }
+int t427FromChar2(char** p) { return 5; }
+int t427FromInt2(int** p) { return 6; }
+int t427PickVoid2(function<int(void**)> f) { return 7; }
+using T427VoidCallback = function<int(void*)>;
+struct T427Holder { function<int(char*)> callback; };
+
+expect_error("function-pointer signature mismatch") {
+    void t427ValueArgument() {
+        function<int(void*)> value = t427FromVoid;
+        t427PickChar(value);
+    }
+}
+
+expect_error("function-pointer signature mismatch") {
+    void t427AliasArgument() {
+        T427VoidCallback value = t427FromVoid;
+        t427PickChar(value);
+    }
+}
+
+expect_error("no overload of 't427PickChar' matches the given arguments") {
+    void t427NamedArgument() { t427PickChar(t427FromVoid); }
+}
+
+expect_error("no overload of 't427PickChar' matches the given arguments") {
+    void t427AddressArgument() { t427PickChar(&t427FromVoid); }
+}
+
+expect_error("no overload of 't427PickChar' matches the given arguments") {
+    void t427LambdaArgument() { t427PickChar((void* p) => 1); }
+}
+
+expect_error("no overload of 't427PickConstChar' matches the given arguments") {
+    void t427ConstPointeeArgument() {
+        function<int((const void)*)> value = t427FromConstVoid;
+        t427PickConstChar(value);
+    }
+}
+
+expect_error("cannot bind function 't427FromVoid'") {
+    void t427DeclarationInit() { function<int(char*)> value = t427FromVoid; }
+}
+
+expect_error("cannot bind function 't427FromVoid'") {
+    void t427Assignment() {
+        function<int(char*)> value = t427FromChar;
+        value = t427FromVoid;
+    }
+}
+
+expect_error("cannot bind function 't427FromVoid'") {
+    function<int(char*)> t427BadReturn() { return t427FromVoid; }
+}
+
+expect_error("different signatures") {
+    void t427TernaryJoin(bool choose) {
+        function<int(void*)> wide = t427FromVoid;
+        function<int(char*)> narrow = t427FromChar;
+        function<int(char*)> joined = choose ? wide : narrow;
+    }
+}
+
+expect_error("cannot bind function 't427FromVoid'") {
+    void t427StructFieldStore() {
+        T427Holder holder;
+        holder.callback = t427FromVoid;
+    }
+}
+
+expect_error("cannot bind function 't427FromVoidForInt'") {
+    void t427VoidToIntPointerSignature() {
+        function<void(int*)> callback = t427FromVoidForInt;
+    }
+}
+
+expect_error("no overload of 't427Generic<char*>' matches the given arguments") {
+    void t427GenericArgument() {
+        function<int(void*)> value = t427FromVoid;
+        t427Generic<char*>(value, nullptr);
+    }
+}
+
+expect_error("no overload of 't427PickCharReturn' matches the given arguments") {
+    void t427ReturnComponentArgument() {
+        function<void*()> value = t427FromVoidReturn;
+        t427PickCharReturn(value);
+    }
+}
+
+expect_error("no overload of 't427PickVoid2' matches the given arguments") {
+    void t427NestedCharPointer() {
+        function<int(char**)> value = t427FromChar2;
+        t427PickVoid2(value);
+    }
+}
+
+expect_error("no overload of 't427PickVoid2' matches the given arguments") {
+    void t427NestedIntPointer() {
+        function<int(int**)> value = t427FromInt2;
+        t427PickVoid2(value);
+    }
+}
+
+extern int main() { return 0; }

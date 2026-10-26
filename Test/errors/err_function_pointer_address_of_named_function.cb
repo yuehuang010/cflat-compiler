@@ -1,0 +1,35 @@
+int t478NamedFunction(int x) { return x * 2; }
+
+expect_error("function value 'function<int(int)>'; drop the '&'") {
+    function<int(int)>* t478BadInit() {
+        function<int(int)>* p = &t478NamedFunction;
+        return p;
+    }
+}
+
+expect_error("function value 'function<int(int)>'; drop the '&'") {
+    int t478BadAssign() {
+        function<int(int)>* p = nullptr;
+        p = &t478NamedFunction;
+        return 0;
+    }
+}
+
+int t478UseSlot(function<int(int)>* p) { return (*p)(6); }
+expect_error("function value 'function<int(int)>'; drop the '&'") {
+    int t478BadArgument() { return t478UseSlot(&t478NamedFunction); }
+}
+
+expect_error("function value 'function<int(int)>'; drop the '&'") {
+    function<int(int)>* t478BadReturn() { return &t478NamedFunction; }
+}
+
+T t478Generic<T>(T x) { return x; }
+expect_error("'&t478Generic<int>' is already the function value") {
+    int t478BadGeneric() {
+        function<int(int)>* p = &t478Generic<int>;
+        return 0;
+    }
+}
+
+extern int main() { return 0; }

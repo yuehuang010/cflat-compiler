@@ -745,6 +745,20 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
                 LogErrorContext(entry, LocalizePrimitiveTypeError(Compiler(), canonicalError));
             if (typeSpec != nullptr && typeSpec->memberTypeSpecifier() != nullptr)
                 resolved = ResolveMemberTypeSpecifier(typeSpec->memberTypeSpecifier());
+            if (IsUnparameterizedNamedTypeSpecifier(typeSpec)
+                && activeTypeSubstitutions.find(resolved) == activeTypeSubstitutions.end())
+            {
+                auto* compiler = Compiler(entry);
+                std::vector<std::string> aggregateScopes;
+                for (auto it = structScopeStack.rbegin(); it != structScopeStack.rend(); ++it)
+                    aggregateScopes.push_back(*it);
+                if (aggregateScopes.empty())
+                    aggregateScopes = EnclosingAggregateNamesFromContext(compiler, typeSpec);
+                const std::string contextual = ResolveContextualTypeName(compiler,
+                    typeSpec->getText(), compiler->ResolveTypeArgBaseName(resolved),
+                    typeSpec, aggregateScopes, NamespaceNameFromContext(compiler, typeSpec));
+                if (!contextual.empty()) resolved = contextual;
+            }
             auto substIt = activeTypeSubstitutions.find(resolved);
             bool substituted = substIt != activeTypeSubstitutions.end();
             if (!substituted && !resolved.empty())
@@ -4892,8 +4906,16 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                     sym.ReturnsAlias = returnType.IsAlias;
                     sym.ReturnsAliasOfByValueParam = aliasOfByValueParam;
                     // Per instance: a generic free function's instances register here, not in ForwardRefScanner.
-                    if (!returnType.external && returnType.Pointer && ReturnsOnlyModuleGlobals(func, allParams))
-                        sym.ReturnsGlobalBorrow = true;
+                    if (!returnType.external && returnType.Pointer)
+                    {
+                        const auto returnIfConst = SinkIfConstEvaluator();
+                        sym.ReturnsGlobalBorrow = ReturnsOnlyModuleGlobals(
+                            func, allParams, returnIfConst);
+                        sym.ReturnsParameterBorrow = ReturnsParameterBorrow(
+                            func, allParams, returnIfConst);
+                        sym.ReturnsSingleParameterIndex = ReturnsSingleParameterIndex(
+                            func, allParams, returnIfConst);
+                    }
                     break;
                 }
             }
@@ -12470,7 +12492,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     compiler, consumeSourceNV, false, initDecl))
                                 return allocList;
                             auto& nv = compiler->GetOrCreateStackVariable(name);
-                            if (!nv.IsOwning && !nv.IsNewAllocated)
+                            const std::string borrowedParamCall = BorrowedParameterCallName(
+                                consumeSourceNV, right);
+                            if ((!nv.IsOwning && !nv.IsNewAllocated)
+                                || !borrowedParamCall.empty())
                             {
                                 if (!srcFieldPathNV.FieldName.empty()
                                     && !srcFieldPathNV.TypeAndValue.IsMove
@@ -12479,8 +12504,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && RejectImplicitConsumeOfOutlivingOwner(
                                         compiler, srcFieldPathNV, false, initDecl))
                                     return allocList;
-                                const std::string sourceName =
-                                    LLVMBackend::BorrowedSourceName(initializerSourceNV);
+                                const std::string sourceName = borrowedParamCall.empty()
+                                    ? LLVMBackend::BorrowedSourceName(initializerSourceNV)
+                                    : borrowedParamCall;
                                 if (sourceName.empty())
                                     LogErrorContext(initDecl, std::format(
                                         "cannot initialize unique '{}' from a borrowed value - the source still "
@@ -14048,10 +14074,16 @@ bool MainListener::EmitLoweredValueIntoSlot(LLVMBackend* compiler, const std::st
         bool fromTemp = false;
         bool movedDetached = false;
         llvm::Value* source = sourceNV.Storage;
-        if (source == nullptr && sourceValue == compiler->lastLoweredRetValue_
-            && compiler->lastLoweredRetTemp_ != nullptr)
+        llvm::Value* producedSlot = compiler->LoweredSretTempOf(sourceValue, valueType);
+        if (source != nullptr && source == producedSlot)
         {
-            source = compiler->lastLoweredRetTemp_;
+            fromTemp = true;
+            if (sourceNV.IsExplicitMove || sourceNV.TypeAndValue.IsMove)
+                compiler->builder->CreateStore(sourceValue, source);
+        }
+        if (source == nullptr && producedSlot != nullptr)
+        {
+            source = producedSlot;
             fromTemp = true;
             // Parenthesized `move (call())` has already zeroed this spill; restore its capture.
             if (sourceNV.IsExplicitMove || sourceNV.TypeAndValue.IsMove)
@@ -14120,6 +14152,7 @@ bool MainListener::EmitLoweredValueIntoSlot(LLVMBackend* compiler, const std::st
             // The moved-from temporary drops only its C++ fields, never the user destructor.
             if (auto* shell = compiler->GetOrCreateMovedFromShellDestructor(typeName))
                 compiler->builder->CreateCall(shell->getFunctionType(), shell, { source });
+            compiler->UnregisterOwnedStructTemp(source);
             return true;
         }
         if (!movedDetached) return true;

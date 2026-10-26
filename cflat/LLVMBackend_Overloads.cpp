@@ -201,6 +201,236 @@ static std::string PointerStars(const LLVMBackend::TypeAndValue& tv)
     return (deep && tv.DepthIsAboutThisValue()) ? "**" : "*";
 }
 
+static bool ContainsViewOrPointer(
+                                  const std::unordered_map<std::string, LLVMBackend::StructData>& structures,
+                                  const LLVMBackend::TypeAndValue& type,
+                                  std::unordered_set<std::string>& visiting)
+{
+    if (type.IsArrayView || type.Pointer || type.PointerDepth > 0 || type.ElemPointer || type.IsAlias)
+        return true;
+    auto structure = structures.find(type.TypeName);
+    if (structure == structures.end() || !visiting.insert(type.TypeName).second)
+        return false;
+    for (const auto& field : structure->second.StructFields)
+        if (ContainsViewOrPointer(structures, field, visiting))
+        {
+            visiting.erase(type.TypeName);
+            return true;
+        }
+    visiting.erase(type.TypeName);
+    return false;
+}
+
+static bool MayHandOutViewOrPointer(
+                                    const std::unordered_map<std::string, LLVMBackend::StructData>& structures,
+                                    const LLVMBackend::FunctionSymbol& method)
+{
+    std::unordered_set<std::string> visiting;
+    if (method.ReturnsAlias || ContainsViewOrPointer(structures, method.ReturnType, visiting))
+        return true;
+    for (size_t i = 1; i < method.Parameters.size(); ++i)
+    {
+        const auto& param = method.Parameters[i];
+        if (param.PointerDepth >= 2 || param.ElemPointer || param.IsCxxRefToPointer)
+            return true;
+        if (param.IsAlias && ContainsViewOrPointer(structures, param, visiting))
+            return true;
+    }
+    return false;
+}
+
+static LLVMBackend::TypeAndValue ReceiverPathPointee(const LLVMBackend::TypeAndValue& type)
+{
+    LLVMBackend::TypeAndValue element = type;
+    element.ConstArraySize = 0;
+    element.ConstMask = 0;
+    if (type.IsArrayView)
+    {
+        element.IsArrayView = false;
+        element.Pointer = type.ElemPointer;
+        element.PointerDepth = type.ElemPointer ? 1 : 0;
+    }
+    else if (type.ElemPointer || type.PointerDepth >= 2)
+    {
+        element.Pointer = true;
+        element.PointerDepth = type.PointerDepth >= 2 ? type.PointerDepth - 1 : 1;
+    }
+    else
+    {
+        element.Pointer = false;
+        element.PointerDepth = 0;
+    }
+    element.ElemPointer = false;
+    return element;
+}
+
+bool LLVMBackend::ReceiverMayHandOutViewOrPointer(const FunctionSymbol& method)
+{
+    auto fieldOf = [&](const std::string& structName, const std::string& name,
+                       TypeAndValue& out) {
+        auto structure = dataStructures.find(structName);
+        if (structure == dataStructures.end()) return false;
+        for (const auto& field : structure->second.StructFields)
+            if (field.VariableName == name) { out = field; return true; }
+        return false;
+    };
+    auto receiverRooted = [&](const std::string& owner, const ReceiverScanFacts& facts,
+                              const ReceiverPath& path, int depth, auto&& self) -> bool {
+        if (depth > 16) return false;
+        if (path.Result >= 0)
+        {
+            if (static_cast<size_t>(path.Result) >= facts.Results.size()) return false;
+            return self(owner, facts, facts.Results[path.Result].Receiver, depth + 1, self);
+        }
+        if (path.IsThis) return true;
+        TypeAndValue type;
+        return fieldOf(facts.StructName, path.Root, type);
+    };
+    auto callTargets = [&](const std::string& owner, const ReceiverScanFacts& facts,
+                           const ReceiverScanFacts::Call& call) {
+        std::vector<const FunctionSymbol*> targets;
+        if (call.Implicit)
+        {
+            TypeAndValue field;
+            if (fieldOf(facts.StructName, call.Member, field)) return targets;
+        }
+        else if (!receiverRooted(owner, facts, call.Receiver, 0, receiverRooted)
+                 || !call.Receiver.IsThis || !call.Receiver.Steps.empty())
+            return targets;
+
+        const std::string& receiverType = facts.StructName;
+        if (auto body = receiverCallResolution_.find(owner); body != receiverCallResolution_.end())
+            if (auto at = body->second.find(call.Site); at != body->second.end())
+            {
+                const auto addSelected = [&](const std::vector<FunctionSymbol>& overloads) {
+                    for (const auto& candidate : overloads)
+                        if (candidate.UniqueName == at->second.second
+                            && IsNativeReceiverMethod(candidate)
+                            && candidate.Parameters.front().TypeName == receiverType)
+                            targets.push_back(&candidate);
+                };
+                if (auto overloads = functionTable.find(at->second.first); overloads != functionTable.end())
+                    addSelected(overloads->second);
+                return targets;
+            }
+
+        auto overloads = functionTable.find(call.Member);
+        if (overloads == functionTable.end()) return targets;
+        for (const auto& candidate : overloads->second)
+            if (IsNativeReceiverMethod(candidate) && candidate.Parameters.front().TypeName == receiverType
+                && (candidate.Parameters.size() - 1 >= call.Arity || candidate.Variadic))
+                targets.push_back(&candidate);
+        return targets;
+    };
+    auto pathMayCarry = [&](const std::string& owner, const ReceiverScanFacts& facts,
+                            const ReceiverPath& path, bool addressOf) {
+        std::vector<TypeAndValue> types;
+        if (path.Result >= 0)
+        {
+            if (static_cast<size_t>(path.Result) >= facts.Results.size()) return false;
+            const auto& call = facts.Results[path.Result];
+            if (!receiverRooted(owner, facts, call.Receiver, 0, receiverRooted)) return false;
+            const auto targets = callTargets(owner, facts, call);
+            for (const auto* target : targets)
+            {
+                if (addressOf || (target->ReturnsAlias && path.Steps.empty())) return true;
+                TypeAndValue type = target->ReturnType;
+                type.IsAlias = false;
+                types.push_back(type);
+            }
+        }
+        else
+        {
+            TypeAndValue type;
+            if (path.IsThis) type.TypeName = facts.StructName;
+            else if (!fieldOf(facts.StructName, path.Root, type)) return false;
+            if (addressOf) return true;
+            types.push_back(type);
+        }
+
+        for (auto& type : types)
+        {
+            bool valid = true;
+            for (const auto& step : path.Steps)
+            {
+                if (step == "=")
+                {
+                    std::unordered_set<std::string> visiting;
+                    if (!ContainsViewOrPointer(dataStructures, type, visiting)) { valid = false; break; }
+                    continue;
+                }
+                if (step.starts_with(".") || step.starts_with("->"))
+                {
+                    const bool arrow = step.starts_with("->");
+                    if (arrow || (type.Pointer && type.ConstArraySize == 0))
+                    {
+                        if (!type.Pointer) { valid = false; break; }
+                        type = ReceiverPathPointee(type);
+                    }
+                    if (type.Pointer || type.IsArrayView
+                        || !fieldOf(type.TypeName, step.substr(arrow ? 2 : 1), type))
+                    { valid = false; break; }
+                    continue;
+                }
+                if (step == "[]")
+                {
+                    if (type.ConstArraySize > 0 && !type.Pointer)
+                    {
+                        type.ConstArraySize = 0;
+                        type.Pointer = type.ElemPointer;
+                        type.PointerDepth = type.ElemPointer ? 1 : 0;
+                        type.ElemPointer = false;
+                    }
+                    else if (type.Pointer || type.IsArrayView)
+                        type = ReceiverPathPointee(type);
+                    else { valid = false; break; }
+                    continue;
+                }
+                if (step == "*")
+                {
+                    if (!type.Pointer && !type.IsArrayView) { valid = false; break; }
+                    type = ReceiverPathPointee(type);
+                    continue;
+                }
+                valid = false;
+                break;
+            }
+            if (!valid) continue;
+            if (addressOf) return true;
+            std::unordered_set<std::string> visiting;
+            if (ContainsViewOrPointer(dataStructures, type, visiting)) return true;
+        }
+        return false;
+    };
+
+    std::unordered_map<std::string, bool> memo;
+    std::unordered_set<std::string> visiting;
+    std::function<bool(const FunctionSymbol&)> visit = [&](const FunctionSymbol& current) {
+        if (auto found = memo.find(current.UniqueName); found != memo.end()) return found->second;
+        if (!visiting.insert(current.UniqueName).second) return false;
+        bool result = MayHandOutViewOrPointer(dataStructures, current);
+        auto facts = receiverScanFacts_.find(current.UniqueName);
+        if (facts != receiverScanFacts_.end())
+        {
+            for (const auto& store : facts->second.OutwardViewStores)
+                if (pathMayCarry(current.UniqueName, facts->second, store.Source, store.AddressOf))
+                { result = true; break; }
+            if (!result)
+                for (const auto& call : facts->second.Calls)
+                {
+                    if (!call.Implicit && (!call.Receiver.IsThis || !call.Receiver.Steps.empty())) continue;
+                    for (const auto* target : callTargets(current.UniqueName, facts->second, call))
+                        if (visit(*target)) { result = true; break; }
+                    if (result) break;
+                }
+        }
+        visiting.erase(current.UniqueName);
+        memo[current.UniqueName] = result;
+        return result;
+    };
+    return visit(method);
+}
+
 // C++ ranks `T*&` above `T*const&` for a modifiable lvalue pointer, and lets only `T*const&`
 // bind a pointer rvalue. 0 = the overload C++ picks, 1 = viable but worse.
 static int CxxRefToPointerScore(const LLVMBackend::NamedVariable& arg,
@@ -8465,6 +8695,34 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                                          candidate.Recipe.paramSlots[i].structTy);
                     if (resultSlot != nullptr)
                     {
+                        const bool explicitMove = matched[i].IsExplicitMove
+                            || matched[i].TypeAndValue.IsMove;
+                        // Only `move <call>` written as the argument: a `?:` join keeps its own temp (T249).
+                        if (explicitMove && matched[i].IsDirectMoveCall)
+                        {
+                            auto* movedArg = AllocaAtEntry(candidate.Recipe.paramSlots[i].structTy,
+                                nullptr, "lowered.move.arg",
+                                candidate.Recipe.paramSlots[i].align);
+                            UnwindPartialScope movedArgCleanup(*this);
+                            NoteUnwindPartial(UnwindPartialEntry::Kind::Members,
+                                              resultSlot, pn);
+                            if (!EmitLoweredMemberwiseMove(pn,
+                                    candidate.Recipe.paramSlots[i].structTy, movedArg,
+                                    resultSlot, "into a by-value parameter"))
+                                continue;
+                            NoteUnwindPartial(UnwindPartialEntry::Kind::Slot, movedArg, pn);
+                            if (auto* shell = GetOrCreateMovedFromShellDestructor(pn))
+                                builder->CreateCall(shell->getFunctionType(), shell, { resultSlot });
+                            cxxIndirectArgAddrs.resize(candidate.Recipe.paramSlots.size(), nullptr);
+                            cxxIndirectArgAddrs[i] = movedArg;
+                            UnregisterOwnedStructTemp(resultSlot);
+                            if (matched[i].Primary == lastLoweredRetValue_)
+                            {
+                                lastLoweredRetTemp_ = nullptr;
+                                lastLoweredRetValue_ = nullptr;
+                            }
+                            continue;
+                        }
                         // A CFlat sret result is already the storage for this by-value parameter.
                         // C++17 prvalue elision binds it directly; the callee owns its lifetime.
                         cxxIndirectArgAddrs.resize(candidate.Recipe.paramSlots.size(), nullptr);
@@ -8641,6 +8899,28 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
          * VIRTUAL member is then reached through the pointer loaded out of the receiver's vptr,
          * indexed by the slot ItaniumVTableContext assigned it.
          */
+        for (size_t i = 0; i < matched.size() && i < candidate.Parameters.size(); ++i)
+        {
+            if (!matched[i].TypeAndValue.IsArrayView || matched[i].Storage == nullptr) continue;
+            const auto& param = candidate.Parameters[i];
+            const bool borrowedView = !candidate.IsCxx && param.IsArrayView
+                && !param.IsMove && !param.IsUnique && !param.IsOwningSink;
+            if (!borrowedView)
+                DisarmNonLocalViewFieldsForEscape(matched[i].Storage, false);
+        }
+        bool receiverMayHandOut = false;
+        if (candidate.IsMethod && !candidate.IsCxx)
+            receiverMayHandOut = ReceiverMayHandOutViewOrPointer(candidate);
+        if (candidate.IsMethod && !arguments.empty()
+            && (!IsReadOnlyMethod(candidate) || receiverMayHandOut))
+        {
+            const llvm::Value* receiverStorage = arguments[0].Storage;
+            if (receiverStorage == nullptr && !matched.empty())
+                receiverStorage = matched[0].Storage;
+            if (receiverStorage != nullptr)
+                DisarmNonLocalViewFieldsForEscape(receiverStorage, true);
+        }
+
         llvm::Value* cxxVirtualCallee = nullptr;
         if (candidate.IsCxx)
         {
@@ -10015,6 +10295,12 @@ void LLVMBackend::MarkVariableMoved(const std::string& name)
                 }
                 RecordMoveKill(name);
                 it->second.IsMoved = true;
+                if (ShouldSkipMovedFromStructDestructor(it->second.TypeAndValue.TypeName))
+                {
+                    EnsureConditionalDropFlag(it->second);
+                    if (it->second.ConditionalDropFlag != nullptr && builder != nullptr)
+                        builder->CreateStore(builder->getInt1(false), it->second.ConditionalDropFlag);
+                }
                 return;
             }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
@@ -10028,6 +10314,12 @@ void LLVMBackend::MarkVariableMoved(const std::string& name)
                 }
                 RecordMoveKill(name);
                 it->second.IsMoved = true;
+                if (ShouldSkipMovedFromStructDestructor(it->second.TypeAndValue.TypeName))
+                {
+                    EnsureConditionalDropFlag(it->second);
+                    if (it->second.ConditionalDropFlag != nullptr && builder != nullptr)
+                        builder->CreateStore(builder->getInt1(false), it->second.ConditionalDropFlag);
+                }
                 return;
             }
         }
@@ -10509,9 +10801,17 @@ void LLVMBackend::MarkVariableFieldMoved(const std::string& name, const std::str
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
-                    { movedf::MarkFieldPathMoved(it->second.MovedFields, field); return; }
+                    {
+                        movedf::MarkFieldPathMoved(it->second.MovedFields, field);
+                        MarkNonLocalViewFieldMoved(it->second.Storage, field);
+                        return;
+                    }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
-                { movedf::MarkFieldPathMoved(it->second.MovedFields, field); return; }
+                {
+                    movedf::MarkFieldPathMoved(it->second.MovedFields, field);
+                    MarkNonLocalViewFieldMoved(it->second.Storage, field);
+                    return;
+                }
         }
     }
 

@@ -272,6 +272,10 @@ edit to any included header - not just the imported one - is a miss. The version
 include dirs are also baked into the key, so an SDK upgrade is a miss without reaching the
 `deps` check.
 
+A dependency whose mtime AND byte count are both unchanged is trusted without re-hashing. An edit
+that keeps the size and restores the old mtime (e.g. `touch -r` or a tool that preserves times) is
+therefore not detected - the same limitation git has. Use `--init-clear` or `-B` after such an edit.
+
 This is **distinct** from the `import package-vcpkg` cache, which is co-located in
 `vcpkg_installed/.cflat-cache/` (a vcpkg package is already version-pinned, so it caches
 unconditionally). `--run` and LSP analysis read the disk cache but never write it.

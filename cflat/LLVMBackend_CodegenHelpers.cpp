@@ -40,6 +40,14 @@
 #include <map>
 #include <set>
 
+namespace {
+template <typename T>
+void ReverseMemberDestructionOrder(std::vector<T>& work)
+{
+    std::reverse(work.begin(), work.end());
+}
+}
+
 #if defined(__APPLE__)
 // Step 3 (macOS self-contained link): harvest libSystem's exported symbols from
 // the live dyld shared cache to synthesize a linker stub, so -o needs no SDK.
@@ -1398,11 +1406,8 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
             // Resolved live (not cached) so a later-registered dtor is picked up.
             return userDtor;
         }
-        // A value holding a C++ class member destroys ALL its members in reverse declaration
-        // order (native and C++ alike), as C++ does. Plain CFlat values keep declaration order.
-        const bool reverseMembers = HasCxxClassMember(typeName);
-        if (reverseMembers)
-            std::reverse(work.begin(), work.end());
+        // C++ destroys every member in reverse declaration order, including native CFlat fields.
+        ReverseMemberDestructionOrder(work);
 
         // Synthesize a wrapper: user dtor first (so hand-written free-and-null logic runs
         // before member teardown), then each member's full destructor.
@@ -1439,8 +1444,8 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
                 EmitUniqueFieldDelete(b, fieldPtr, w.Dtor);
             else
                 // Scalar field: one call; owning fixed-array field: one call per element.
-                // An array field inside a reverse-order value walks its elements last-first too.
-                EmitFullDestructorOverStorage(b, fieldPtr, fieldTy, w.Dtor, w.TypeName, reverseMembers);
+                // Members and their array elements both follow reverse declaration order.
+                EmitFullDestructorOverStorage(b, fieldPtr, fieldTy, w.Dtor, w.TypeName, true);
         }
         b.CreateRetVoid();
         return fn;
@@ -1478,8 +1483,8 @@ llvm::Function* LLVMBackend::GetOrCreateMovedFromShellDestructor(const std::stri
         fullDestructorInProgress_.erase(cacheKey);
         dsIt = dataStructures.find(typeName);
         if (work.empty() || dsIt == dataStructures.end()) return nullptr;
-        // Every member here is a C++ class or a lowered struct: destroy last-declared first.
-        std::reverse(work.begin(), work.end());
+        // Destroy the remaining C++ subobjects in reverse declaration order.
+        ReverseMemberDestructionOrder(work);
 
         auto* structTy = dsIt->second.StructType;
         auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(*context),
@@ -1513,13 +1518,20 @@ void LLVMBackend::EmitCflatOwnedFieldsDestruction(llvm::IRBuilder<>& b,
         if (dsIt == dataStructures.end() || dsIt->second.StructType == nullptr || self == nullptr)
             return;
         llvm::StructType* structTy = dsIt->second.StructType;
-        // A C++ struct's members are destroyed last-declared first, as C++ does.
-        for (unsigned i = static_cast<unsigned>(dsIt->second.StructFields.size()); i-- > 0;)
+        std::vector<unsigned> work;
+        for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
         {
             const auto& f = dsIt->second.StructFields[i];
             if (!f.IsCflatOwned || f.IsAlias || f.IsPadding || f.IsBitfield) continue;
             const unsigned element = CxxFieldElementIndex(dsIt->second, i);
             if (element == std::numeric_limits<unsigned>::max()) continue;
+            work.push_back(i);
+        }
+        ReverseMemberDestructionOrder(work);
+        for (unsigned i : work)
+        {
+            const auto& f = dsIt->second.StructFields[i];
+            const unsigned element = CxxFieldElementIndex(dsIt->second, i);
             auto* fieldPtr = CreateCxxFieldGEP(b, dsIt->second, self, i, "cflat_field");
             auto* fieldTy = structTy->getElementType(element);
             if (f.IsUnique && f.Pointer && !f.ElemPointer && !f.IsArrayView
@@ -2029,6 +2041,40 @@ bool LLVMBackend::HasNonTrivialDestructor(const std::string& typeName)
 bool LLVMBackend::IsOwningValueType(const std::string& typeName)
 {
         return HasTypeAnnotation(typeName, "unique") || HasNonTrivialDestructor(typeName);
+    }
+
+bool LLVMBackend::ShouldSkipMovedFromStructDestructor(const std::string& typeName) const
+{
+        if (typeName.empty() || typeName == "string"
+            || IsForeignNontrivialCxxClass(typeName)
+            || HasForeignNontrivialCxxField(typeName)
+            || GetEncodedClosureType(typeName) != nullptr
+            || TypeOwnsUniquePointer(typeName))
+            return false;
+
+        auto root = dataStructures.find(typeName);
+        if (root == dataStructures.end() || root->second.Destructor == nullptr)
+            return false;
+
+        std::unordered_set<std::string> seen;
+        std::function<bool(const std::string&)> hasOwningField =
+            [&](const std::string& current) {
+                if (current == "string" || GetEncodedClosureType(current) != nullptr) return true;
+                if (!seen.insert(current).second) return false;
+                auto it = dataStructures.find(current);
+                if (it == dataStructures.end()) return false;
+                for (const auto& field : it->second.StructFields)
+                {
+                    if (field.IsAlias) continue;
+                    if (field.Pointer || field.ElemPointer) return true;
+                    if (field.IsArrayView
+                        || field.IsSimd || field.IsBitfield || field.IsPadding)
+                        continue;
+                    if (hasOwningField(field.TypeName)) return true;
+                }
+                return false;
+            };
+        return !hasOwningField(typeName);
     }
 
 bool LLVMBackend::CFlatExternOwnsByValueParam(const TypeAndValue& p)

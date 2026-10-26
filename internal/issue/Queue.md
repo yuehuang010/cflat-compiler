@@ -105,10 +105,22 @@ Windows gate: R6, R7, R11, R12, R13, R14 land after the Windows box passes. R2 i
 
 | Run | Branch | Issue(s) | Notes |
 |-----|--------|----------|-------|
+| P3 | - | p3/cpp-unique-field-move-from-field-refused | RULED 2026-10-24: accept field-path move source `h.w = move g.w` (C++ row: Windows gate) |
+| P3 | - | p3/cpp-ctor-address-of-pointer-spelling-vs-clang | RULED 2026-10-24: `&p` = T** value when any candidate accepts it; slot binding fallback only (C++ row) |
+| P3 | - | p3/cpp-ctor-ranking-leftovers (item 3) | RULED 2026-10-24: no float->int at C++ ctor args in any form incl. reference params (C++ row) |
+| P3 | - | p3/cpp-pointer-return-unrequested-specialization-not-retried | RULED 2026-10-24: no `a @= b` -> `a = a @ b` fallback on C++ classes (C++ row) |
+| P3 | - | p3/named-brace-init-partial-unwind (item 1) | RULED 2026-10-24: keep refusal, reword diagnostic only |
+| P2 | - | p2/unique-array-element-assign-borrow-double-free | filed T486 review 2026-10-24: unique array-element store has no borrow check (double free); route through T486 check |
+| P3 | - | p3/moved-from-struct-leftovers-after-t490 | filed 2026-10-24: reassign-after-move extra dtor, T418 C++ param `_ = move` (immediate release + disarm), field move, raw-pointer-field scope ruling question |
+| P3 | - | p3/local-fixed-array-elements-destroyed-forward | filed T488 review: local `T[3]` dtors forward, C++ reverse; reuse T488 helper |
+| P3 | - | p3/nested-function-type-parameter-not-compared | filed T427 review: function-type component of a function type not compared |
+| P3 | - | p3/call-name-shadowing-leftovers-after-t484 | filed T484 review |
+| P3 | - | p3/function-pointer-double-pointer-address-of-named-function-accepted | filed T478 |
+| P3 | - | p3/nested-type-lookup-leftovers-after-t481 | filed T481 |
+| P3 | - | p3/returned-pointer-from-call-result-field-temp-dangles | filed T480 |
+| P3 | - | p3/crossed-address-of-state-leaks-call-temporary | T485 leftovers: C2 non-storing callee leak, two-owner pointer difference, pre-existing store3 EARLY FREE |
 | P3 | fix/t422-globdef | p3/global-default-spelling-zeroes-without-the-note | PARKED (T422 Luna r1 + Haiku r2): ruling conflict with runtime-constructed globals (T136/T368/mempress) - see issue head |
-| P3 | fix/t427-fnpointee | p3/function-type-unrelated-pointee-param-accepted | PARKED (T427): exact function-type pointee match conflicts with the deliberate int*/void* crossing leg - see issue head |
 | P3 | fix/t438-uniqdot | p3/cflat-unique-dot-dispatches-to-pointee-member | PARKED: needs ruling on name hiding + `->` (see issue file) (T438) |
-| P3 | fix/t472-viewleak | p3/owned-view-overwrite-and-unsunk-field-leak | PARKED after 3 Luna rounds (T472): r3 52c8f3161 blocked by const-method predicate regression + getter UAF; needs ruling (a)/(b), see issue head |
 | R16 (parked) | fix/t396-viewalias | p2/view-mixed-join-sunk-through-pointer-param-alias | Sol r2b: 4 INCOMPLETE, needs path-sensitive provenance |
 
 ## Backlog (p3/p4 and plans; groups from earlier builds, unchanged)
@@ -140,7 +152,7 @@ Rows that named only p1/p2 issues moved to the ship-gate section above and were 
 | B5g | p3/cpp-callback-pointee-const-ranking-gaps | function-pointer values lose pointee const; clang-refused callback sets accepted | NEW 2026-10-03 (T25 rounds 3-5, pre-existing on master) |
 | B5h | p3/cpp-nested-member-class-free-return-and-call-result-assign | free function returning a nested member class; assignment to a class result of operator()/operator* | NEW 2026-10-03 (T30 review 2, pre-existing on master) |
 | B5j | p3/cpp-pointer-ref-overload-ctor-and-direct-member-ranking | `const char *const &` overloads: constructor wrapper path and direct non-template ranking; literal at a `const char *&&` template refused | NEW 2026-10-05 (T28 round 5 matrix, pre-existing on master) |
-| B14 | p3/c-flexible-array-member-leftovers | move a->data (RULING: explicit move of a raw pointer) + 3 pre-existing P3 | OPEN (sizeof/alignof landed 118c2769) |
+| B14 | p3/c-flexible-array-member-leftovers | raw interior-pointer `move` (RULING: explicit move of a raw pointer), implicit-this message, 3 pre-existing P3 | OPEN (array-member move refused T489) |
 | B16 | p3/cpp-operator-move-operand-leftovers | template U&&, elision, cond move into forwarding operator=, member-receiver lhs move | NEW 2026-09-28 (D8 report) |
 | B18 | p3/cpp-assignment-result-leftovers-after-b9 | extra copies (paren call arms, arr elem init) + bare scalar/nested ternary refusals + 3 unrelated | OPEN (P2 landed 1955bd95) |
 | W13b | p3/cpp-overload-variadic-and-conversion-gaps | variadic-set ambiguity, defaulted param before ellipsis, member variadics, user conversions at C++ call args, inline variadic link, non-record const pointers | NEW 2026-09-30 (W13 reviews) |
@@ -180,7 +192,6 @@ Rows that named only p1/p2 issues moved to the ship-gate section above and were 
 
 | Run | Issue(s) | Mode | Notes |
 |-----|----------|------|-------|
-| - | p3/cxx-request-cache-trusts-equal-mtime-and-size | full | stale wrapper outcome after a same-mtime+size header edit; T70 review 4, pre-existing |
 | G2 | p3/cpp-wrapper-request-group-omits-type-dependencies + p3/cpp-candidate-tier-differs-cold-vs-warm | batch | RequestGeneratedCxxWrapperUncached, CandidateCxxGroupsFor. After G1 |
 | G3 | p3/cpp-check-mode-cannot-repopulate-type-request-cache | full | design: --check writing the cache |
 | G4 | p3/cpp-noinc-mode-std-map-lookup-fails | full | root cause not established; investigation first |
@@ -281,7 +292,6 @@ The A-H sections above stay the per-issue record; schedule from this table.
 | 16 | REFPARAM | M/H | p3/cpp-reference-param-conversion-gaps-after-t42, p3/cpp-reference-member-leftovers-after-t47 | conversions into C++ reference params (u) | REFBIND pair, CTOR-VIABILITY | no |
 | 18 | CTOR-VIABILITY | L/H | p3/cpp-ctor-template-viability-not-clang-selected, p3/cpp-ctor-ranking-leftovers, p3/cpp-ctor-template-overload-and-copyinit-gaps, p3/cpp-pointer-ref-overload-ctor-and-direct-member-ranking | CxxCtorSetRequiresNarrowing + ctor wrappers | NULLCTOR, REFPARAM | no |
 | 20 | FNWRAP | L/H | p2/cpp-forwarded-fnptr-variable-or-closure-dangles-in-wrapper-frame, p3/cpp-capturing-closure-to-std-function | wrapper-frame slot for fnptr/closure into C++ T&& (RequestCxxFunctionTemplate) | ELIDE (P2 plan) | no |
-| 21 | CACHE-VALID | M/H | p3/cxx-request-cache-trusts-equal-mtime-and-size | request-cache validity key | CACHE-KEY | no |
 | 22 | CHUNK | M/H | p3/cpp-demand-chunk-order-numbering-per-interpreter, p3/cpp-default-wrapper-batch-chunk-stores-stripped-prefix | chunk store, CxxIncrementalGroup ParseRequest | CACHE-KEY, TOPSTMT | no |
 | 25 | CONSTTWIN | M/H | p3/cpp-const-twin-overloads-collapse, p3/cpp-constrained-twin-default-argument-ranking | RegisterCxxClassMembers (~22175) dedupe keeps the non-const twin | CONSTPOINTEE pair | no |
 | 26 | SRCTYPE | L/H | p3/auto-local-of-arithmetic-takes-cflat-width-type-at-cpp-calls, p3/cpp-template-ctor-deduction-enum-and-arith-rvalue | source type not propagated into C++ call construction (CxxArithIdentity) | T92 in flight - after it lands | no |

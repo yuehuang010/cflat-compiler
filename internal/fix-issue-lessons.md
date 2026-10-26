@@ -3621,3 +3621,24 @@ they still apply under `=0`. Cost: the first compile after any rebuild is cold; 
 - `p4/string-split-on-whitespace`: `split(string sep, bool removeEmpty)` overload. Ratified.
 - `p4/string-functional-construction-spelling`: `string(ptr)` and `string(ptr, len)` are non-allocating borrows, same meaning as `(string)ptr`. Ratified.
 - CLIBNAME (`p3/core-defines-externally-visible-libc-functions` + the o2 builtin-folding item): CFlat definitions of libc names are marked `nobuiltin`, so LLVM calls the CFlat body; users may still override libc names.
+
+## Rulings 2026-10-24: main-session sweep of "needs ruling" items (maintainer may veto any line)
+Ruled from existing direction (C/C++ meaning where CFlat has no safety reason to differ, assignment = declaration,
+silent UAF never acceptable). Per-item detail and probes (scratch/rulings1024/) live in the named issue file.
+- `p2/function-pointer-call-brace-argument-crashes` (T478): `&f` on a named function IS the thin `function<>` (C decay); `function<>* p = &f` refused with a drop-the-& hint; a `function<>*` always addresses a slot.
+- `p3/function-type-unrelated-pointee-param-accepted` (T427): function types match exactly, `void*` is no wildcard pointee (LANGUAGE.md already says so); the int*/void* crossing leg and the "ambiguous void(void*)" err text are rewritten.
+- `p3/owned-view-overwrite-and-unsunk-field-leak` (T472): disarm the local-aggregate own bit when a method can hand out a view/pointer into its object; the read-only predicate rewrite was a regression - restore master's.
+- `p3/chained-assign-raw-inner-into-unique-refused` part 2 (T443): a parameter-borrow-returning call is refused on assignment into a unique like the declaration; the four accept legs that pin a non-owning `unique` become err_ legs.
+- T442: untyped `return { ... }` is supported for EVERY CFlat struct, not only `[immovable]` (movable structs had no brace-return spelling at all). T449: closed by the no-narrowing-at-calls + exact function-type rulings.
+- `p3/member-destruction-declaration-order`: members destroyed in REVERSE declaration order (C++; matches locals and globals). T368 control leg updated.
+- `p3/moved-from-plain-struct-destructed-after-move-param`: a moved-from plain struct is dead - no second destructor (bitwise relocation has no valid shell to destroy).
+- `p3/array-of-non-default-ctor-elements-accepted`: by design - field initializers make every struct default-constructible; a ctor with arguments never deletes that (scalar form behaves the same). Document, then close.
+- `p3/cpp-ctor-address-of-pointer-spelling-vs-clang`: `&p` is a `T**` value whenever any candidate accepts that reading (clang pick wins); the `T*&` slot binding is only a fallback.
+- `p3/cpp-ctor-ranking-leftovers` item 3: no floating -> integer at C++ ctor args in any form (`new` = declaration = expression), reference parameters included.
+- `p3/cpp-pointer-return-unrequested-specialization-not-retried`: no `a @= b` -> `a = a @ b` fallback on imported C++ classes; refuse as clang does.
+- `p3/cpp-unique-field-move-from-field-refused`: a field path is a legal C++ move-assignment source (`h.w = move g.w`), like the CFlat twin.
+- `p3/cxx-request-cache-trusts-equal-mtime-and-size`: accept the git-equivalent restored-mtime limitation; document in doc/CACHING.md.
+- `p3/extern-redeclaration-conflict-gaps`: lowered signature is the linkage identity; same-lowering respellings are working as intended. Closed.
+- `p3/c-flexible-array-member-leftovers`: `move` of an array member (fixed, zero-length or flexible) is refused - nothing to transfer.
+- `p3/named-brace-init-partial-unwind` item 1: `T x = move *p;` keeps refusing a later read through `p`; only the diagnostic wording changes.
+- NOT ruled here (needs the maintainer): T422 global default construction vs runtime-constructed globals, T438 `->` on unique<T> / name hiding, R9 heap array through `move T*`, `move R*` param reassign release, `return move p->f` of a non-owning field, `new` of a virtual-base class. Questions with recommendations: scratch/rulings1024/maintainer_questions_2026-10-24.md.

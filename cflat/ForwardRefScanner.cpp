@@ -997,9 +997,17 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
                                     && a.Pointer == b.Pointer; }))
                             sym.ReturnsAliasOfByValueParam = true;
         }
-        if (!returnType.external && returnType.Pointer && ReturnsOnlyModuleGlobals(func, allParams))
+        if (!returnType.external && returnType.Pointer)
             if (auto it = compiler->functionTable.find(name); it != compiler->functionTable.end())
-                MarkReturnsGlobalBorrow(it->second, allParams);
+            {
+                const IfConstEvaluator scannerIfConst = [this](CFlatParser::ExpressionContext* expr) {
+                    return ScannerDecideIfConst(expr);
+                };
+                SetPointerBorrowReturnSummaries(it->second, allParams,
+                    ReturnsOnlyModuleGlobals(func, allParams, scannerIfConst),
+                    ReturnsParameterBorrow(func, allParams, scannerIfConst),
+                    ReturnsSingleParameterIndex(func, allParams, scannerIfConst));
+            }
 
         // Populate RequiredLocks from the function's lock clause and any extra locks
         // inherited from a positional lock group (extraRequiredLocks).
@@ -1667,6 +1675,16 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
             resolved = typeSpec != nullptr && typeSpec->memberTypeSpecifier() != nullptr
                 ? ResolveMemberTypeSpecifier(typeSpec->memberTypeSpecifier())
                 : Compiler(entry)->ResolveTypeArgBaseName(CanonicalTemplateTypeArgument(entry));
+            if (IsUnparameterizedNamedTypeSpecifier(typeSpec)
+                && scanTypeSubstitutions_.find(resolved) == scanTypeSubstitutions_.end())
+            {
+                auto* compiler = Compiler(entry);
+                const auto aggregateScopes = EnclosingAggregateNamesFromContext(compiler, typeSpec);
+                const std::string contextual = ResolveContextualTypeName(compiler,
+                    typeSpec->getText(), resolved, typeSpec, aggregateScopes,
+                    NamespaceNameFromContext(compiler, typeSpec));
+                if (!contextual.empty()) resolved = contextual;
+            }
             bool substituted = false;
             if (auto subst = scanTypeSubstitutions_.find(resolved); subst != scanTypeSubstitutions_.end())
             {

@@ -1,6 +1,35 @@
 #include "MainListener.h"
 #include <llvm/Support/SaveAndRestore.h>
+#include <llvm/IR/Instructions.h>
 #include <functional>
+
+static CFlatParser::PostfixExpressionContext* DirectPostfixArgument(
+        CFlatParser::AssignmentExpressionContext* expression)
+{
+    antlr4::tree::ParseTree* node = expression;
+    while (auto* rule = dynamic_cast<antlr4::RuleContext*>(node))
+    {
+        if (rule->getRuleIndex() == CFlatParser::RulePostfixExpression)
+            return dynamic_cast<CFlatParser::PostfixExpressionContext*>(rule);
+        if (rule->children.size() != 1) return nullptr;
+        node = rule->children.front();
+    }
+    return nullptr;
+}
+
+struct DirectViewCallArgumentScope
+{
+    const CFlatParser::PostfixExpressionContext*& slot;
+    const CFlatParser::PostfixExpressionContext* saved;
+    DirectViewCallArgumentScope(
+            const CFlatParser::PostfixExpressionContext*& value,
+            CFlatParser::AssignmentExpressionContext* expression)
+        : slot(value), saved(value)
+    {
+        slot = DirectPostfixArgument(expression);
+    }
+    ~DirectViewCallArgumentScope() { slot = saved; }
+};
 
 struct BraceArgumentUnwindScope
 {
@@ -14,27 +43,317 @@ struct BraceArgumentUnwindScope
     }
 };
 
-// True when the postfix node is the operand of a unary `*` (through pass-through unary and cast
-// wrappers). Parse-tree shape only; the operator token decides, never the expression text.
+static bool IsParenthesizedExpression(antlr4::tree::ParseTree* node)
+{
+    auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+    return primary != nullptr && primary->expression() != nullptr && primary->children.size() == 3;
+}
+
+// True when the postfix node contributes a value through unary `*`, including `*(&value)`.
+// Parse-tree shape decides the path; the operator token identifies each unary operation.
 static bool IsDerefOperandChain(antlr4::tree::ParseTree* node)
 {
-    for (antlr4::tree::ParseTree* parent = node->parent; parent != nullptr; parent = parent->parent)
+    bool sawDeref = false;
+    bool valueRead = false;
+    for (antlr4::tree::ParseTree* child = node, *parent = node->parent;
+         parent != nullptr; child = parent, parent = parent->parent)
     {
         if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(parent))
         {
             if (unary->unaryOperator() == nullptr)
             {
-                if (unary->children.size() != 1) return false;
+                if (!unary->Sizeof().empty() || unary->children.size() != 1)
+                    return false;
                 continue;
             }
-            return unary->Sizeof().empty() && unary->unaryOperator()->getText() == "*";
+            if (unary->Sizeof().empty() && unary->unaryOperator()->Star() != nullptr)
+            {
+                sawDeref = true;
+                valueRead = true;
+                continue;
+            }
+            if (unary->Sizeof().empty() && unary->unaryOperator()->And() != nullptr)
+            {
+                valueRead = false;
+                continue;
+            }
+            return false;
         }
         if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(parent))
         {
-            if (cast->children.size() != 1) return false;
+            if (cast->castTypeName() != nullptr)
+            {
+                if (cast->castExpression() != child) return false;
+            }
+            else if (cast->children.size() != 1 || cast->children[0] != child)
+                return false;
             continue;
         }
+        if (auto* additive = dynamic_cast<CFlatParser::AdditiveExpressionContext*>(parent))
+        {
+            if (additive->children.size() > 1) continue;
+        }
+        if (IsParenthesizedExpression(parent)) continue;
+        auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(parent);
+        if (rule != nullptr && rule->children.size() == 1) continue;
+        return sawDeref && valueRead;
+    }
+    return sawDeref && valueRead;
+}
+
+static bool IsSimpleIdentifierType(LLVMBackend* compiler,
+    CFlatParser::PrimaryExpressionContext* primary, LLVMBackend::TypeAndValue& type)
+{
+    if (compiler == nullptr || primary == nullptr || primary->Identifier() == nullptr) return false;
+    const std::string name = primary->Identifier()->getText();
+    auto value = compiler->GetScopedLocalOrArgument(name);
+    if (value.TypeAndValue.TypeName.empty() && value.Storage == nullptr && value.Primary == nullptr
+        && compiler->HasMemberVariable(name))
+        value = compiler->GetMemberVariable(name);
+    if (value.TypeAndValue.TypeName.empty() && value.Storage == nullptr && value.Primary == nullptr)
+        value = compiler->GetGlobalVariableNV(name);
+    if (value.TypeAndValue.TypeName.empty() && value.Storage == nullptr && value.Primary == nullptr)
         return false;
+    type = value.TypeAndValue;
+    return true;
+}
+
+static bool IsPointerTypedArrowField(LLVMBackend* compiler,
+    CFlatParser::PostfixExpressionContext* postfix)
+{
+    if (compiler == nullptr || postfix == nullptr || postfix->primaryExpression() == nullptr
+        || postfix->memberNameToken().size() != 1 || postfix->Arrow().empty())
+        return false;
+
+    LLVMBackend::TypeAndValue baseType;
+    auto* primary = postfix->primaryExpression();
+    if (!IsSimpleIdentifierType(compiler, primary, baseType))
+    {
+        if (postfix->argumentExpressionList().size() != 1
+            || !postfix->argumentExpressionList().front()->argumentNamedExpression().empty()
+            || primary->Identifier() == nullptr)
+            return false;
+        const std::string name = primary->Identifier()->getText();
+        auto* function = compiler->GetFunction(name);
+        if (function == nullptr) return false;
+        baseType = compiler->GetFunctionReturnTypeInfo(name);
+        if (baseType.TypeName.empty()) return false;
+    }
+
+    std::string ownerType = baseType.TypeName;
+    if (baseType.Pointer) {}
+    else if (compiler->IsCoreUniqueType(ownerType))
+    {
+        const size_t open = ownerType.find('<');
+        const size_t close = ownerType.rfind('>');
+        if (open == std::string::npos || close <= open) return false;
+        const auto typeArgs = SplitTopLevelTypeArgs(ownerType.substr(open + 1, close - open - 1));
+        if (typeArgs.empty()) return false;
+        ownerType = typeArgs.front();
+    }
+    else return false;
+
+    const std::string fieldName = postfix->memberNameToken().front()->getText();
+    auto data = compiler->GetDataStructure(ownerType);
+    for (const auto& field : data.StructFields)
+        if (field.VariableName == fieldName) return field.Pointer;
+    return false;
+}
+
+static bool IsPointerTypedExpression(LLVMBackend* compiler, antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return false;
+    if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+    {
+        if (postfix->memberNameToken().size() == 1 && !postfix->Arrow().empty())
+            return IsPointerTypedArrowField(compiler, postfix);
+        if (postfix->argumentExpressionList().empty())
+        {
+            LLVMBackend::TypeAndValue type;
+            return IsSimpleIdentifierType(compiler, postfix->primaryExpression(), type) && type.Pointer;
+        }
+    }
+    if (IsParenthesizedExpression(node))
+    {
+        auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+        return IsPointerTypedExpression(compiler, primary->expression());
+    }
+    if (node->children.size() == 1) return IsPointerTypedExpression(compiler, node->children[0]);
+    return false;
+}
+
+static bool IsPointerDifferenceOperand(LLVMBackend* compiler, antlr4::tree::ParseTree* node)
+{
+    for (antlr4::tree::ParseTree* child = node, *parent = node->parent;
+         parent != nullptr; child = parent, parent = parent->parent)
+    {
+        auto* additive = dynamic_cast<CFlatParser::AdditiveExpressionContext*>(parent);
+        if (additive == nullptr || additive->children.size() < 3) continue;
+        auto position = std::find(additive->children.begin(), additive->children.end(), child);
+        if (position == additive->children.end()) continue;
+        const size_t operand = static_cast<size_t>(position - additive->children.begin());
+        if ((operand % 2) != 0) continue;
+        for (size_t op = 1; op + 1 < additive->children.size(); op += 2)
+        {
+            auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(additive->children[op]);
+            if (terminal == nullptr || terminal->getSymbol()->getType() != CFlatParser::Minus)
+                continue;
+            const size_t left = op - 1;
+            const size_t right = op + 1;
+            if (operand == left && IsPointerTypedExpression(compiler, additive->children[right])) return true;
+            if (operand == right && IsPointerTypedExpression(compiler, additive->children[left])) return true;
+        }
+    }
+    return false;
+}
+
+struct AdditiveCallArgumentPath
+{
+    CFlatParser::PostfixExpressionContext* Call = nullptr;
+    size_t ArgumentIndex = SIZE_MAX;
+    bool NamedArgument = false;
+};
+
+static bool CallResultFlowsIntoAdditiveExpression(
+    CFlatParser::ArgumentNamedExpressionContext* argument, AdditiveCallArgumentPath* path = nullptr)
+{
+    auto* list = argument != nullptr
+        ? dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(argument->parent) : nullptr;
+    auto* call = list != nullptr
+        ? dynamic_cast<CFlatParser::PostfixExpressionContext*>(list->parent) : nullptr;
+    if (call == nullptr) return false;
+    AdditiveCallArgumentPath found;
+    auto arguments = list->argumentNamedExpression();
+    for (size_t i = 0; i < arguments.size(); ++i)
+        if (arguments[i] == argument)
+        {
+            found.ArgumentIndex = i;
+            found.NamedArgument = arguments[i]->Identifier() != nullptr;
+            break;
+        }
+    for (antlr4::tree::ParseTree* parent = call->parent; parent != nullptr; parent = parent->parent)
+    {
+        if (auto* additive = dynamic_cast<CFlatParser::AdditiveExpressionContext*>(parent))
+            if (additive->children.size() > 1)
+            {
+                found.Call = call;
+                if (path != nullptr) *path = found;
+                return true;
+            }
+        if (dynamic_cast<CFlatParser::DeclarationContext*>(parent) != nullptr
+            || dynamic_cast<CFlatParser::StatementContext*>(parent) != nullptr)
+            return false;
+    }
+    return false;
+}
+
+// Keep a borrowed receiver registered for a direct argument or an address read by an additive call.
+static bool IsCallArgumentReadPath(antlr4::tree::ParseTree* node,
+    AdditiveCallArgumentPath* path = nullptr)
+{
+    bool crossedAddressOf = false;
+    for (antlr4::tree::ParseTree* child = node, *parent = node->parent; parent != nullptr;
+         child = parent, parent = parent->parent)
+    {
+        if (dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(parent) != nullptr)
+        {
+            if (!crossedAddressOf) return true;
+            return CallResultFlowsIntoAdditiveExpression(
+                dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(parent), path);
+        }
+        if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(parent))
+        {
+            if (unary->unaryOperator() == nullptr)
+            {
+                if (unary->Sizeof().empty() && unary->children.size() == 1) continue;
+                return false;
+            }
+            if (unary->Sizeof().empty())
+            {
+                if (unary->unaryOperator()->And() != nullptr)
+                {
+                    crossedAddressOf = true;
+                    continue;
+                }
+                if (unary->unaryOperator()->Star() != nullptr)
+                {
+                    crossedAddressOf = false;
+                    continue;
+                }
+            }
+            return false;
+        }
+        if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(parent))
+        {
+            if (conditional->QuestionQuestion() != nullptr
+                || (conditional->children.size() > 1 && conditional->children.size() != 5))
+                return false;
+            continue;
+        }
+        if (auto* additive = dynamic_cast<CFlatParser::AdditiveExpressionContext*>(parent))
+        {
+            if (additive->children.size() > 1) continue;
+        }
+        if (IsParenthesizedExpression(parent)) continue;
+        auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(parent);
+        if (rule == nullptr || rule->children.size() != 1) return false;
+    }
+    return false;
+}
+
+static bool FunctionArgumentMayEscape(const llvm::Function* function, size_t argumentIndex)
+{
+    if (function == nullptr || function->isDeclaration() || argumentIndex >= function->arg_size())
+        return true;
+
+    std::vector<const llvm::Value*> pending{ function->getArg(argumentIndex) };
+    std::unordered_set<const llvm::Value*> visited;
+    while (!pending.empty())
+    {
+        const llvm::Value* value = pending.back();
+        pending.pop_back();
+        if (!visited.insert(value).second) continue;
+        for (const llvm::User* user : value->users())
+        {
+            if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+            {
+                if (store->getValueOperand() == value) return true;
+                if (store->getPointerOperand() == value) continue;
+                return true;
+            }
+            if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(user))
+            {
+                if (load->getPointerOperand() == value) continue;
+                return true;
+            }
+            if (llvm::isa<llvm::ReturnInst>(user)) return true;
+            if (const auto* call = llvm::dyn_cast<llvm::CallBase>(user))
+            {
+                if (call->getCalledOperand() == value) return true;
+                for (unsigned i = 0; i < call->arg_size(); ++i)
+                    if (call->getArgOperand(i) == value) return true;
+                continue;
+            }
+            if (const auto* instruction = llvm::dyn_cast<llvm::Instruction>(user))
+            {
+                switch (instruction->getOpcode())
+                {
+                case llvm::Instruction::BitCast:
+                case llvm::Instruction::AddrSpaceCast:
+                case llvm::Instruction::GetElementPtr:
+                case llvm::Instruction::PHI:
+                case llvm::Instruction::Select:
+                case llvm::Instruction::Freeze:
+                    pending.push_back(instruction);
+                    continue;
+                case llvm::Instruction::ICmp:
+                    continue;
+                default:
+                    return true;
+                }
+            }
+            return true;
+        }
     }
     return false;
 }
@@ -106,6 +425,13 @@ static bool InAliasDeclaration(antlr4::tree::ParseTree* node, bool* crossedAddit
         {
             if (unary->unaryOperator() != nullptr && unary->unaryOperator()->And() != nullptr)
                 crossedAddressOf = true;
+            else if (unary->unaryOperator() != nullptr && unary->unaryOperator()->Star() != nullptr)
+                crossedAddressOf = false;
+            continue;
+        }
+        if (dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(p) != nullptr)
+        {
+            crossedAddressOf = false;
             continue;
         }
         if (dynamic_cast<CFlatParser::AdditiveExpressionContext*>(p))
@@ -152,9 +478,8 @@ static bool AliasDeclarationMayOutlive(antlr4::tree::ParseTree* node,
         && (!crossedAdditive || IsPointerOrArrayValue(value));
 }
 
-// True when a value read through a deref may leave the statement: an alias declaration binds it,
-// a return hands it out unless the enclosing function is not an alias function, and a lambda body
-// may run after the statement. Unknown shapes answer true (the pre-existing no-free path).
+// A dereferenced value may outlive the full expression through an alias, alias return, or lambda.
+// Unknown parent shapes keep the existing no-free path.
 static bool DerefResultMayOutlive(antlr4::tree::ParseTree* node,
     const LLVMBackend::NamedVariable& value)
 {
@@ -179,6 +504,9 @@ static bool DerefResultMayOutlive(antlr4::tree::ParseTree* node,
             }
             return true;
         }
+        if (dynamic_cast<CFlatParser::DeclarationContext*>(p) != nullptr
+            || dynamic_cast<CFlatParser::ForDeclarationContext*>(p) != nullptr)
+            return false;
         if (dynamic_cast<CFlatParser::StatementContext*>(p)) return false;
     }
     return true;
@@ -955,6 +1283,17 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
             DiagnoseAssignmentArguments(argumentList);
         const size_t arrowTempMark = arrowOwnedTemps_.size();
         auto namedVar = ParsePostfixExpressionInner(ctx, lValue, dropTrailingChildren, use);
+        if (!lValue && addressOfOperandDepth_ == 0 && namedVar.Storage != nullptr)
+        {
+            if (namedVar.TypeAndValue.IsArrayView)
+            {
+                if (ctx != directViewCallArgument_)
+                    Compiler(ctx)->DisarmNonLocalViewFieldsForEscape(namedVar.Storage, false);
+            }
+            else if (!namedVar.TypeAndValue.Pointer
+                && Compiler(ctx)->IsDataStructure(namedVar.TypeAndValue.TypeName))
+                Compiler(ctx)->DisarmNonLocalViewFieldsForEscape(namedVar.Storage, true);
+        }
         if (arrowOwnedTemps_.size() > arrowTempMark && !namedVar.FieldName.empty())
         {
             if (addressOfOperandDepth_ != 0 && namedVar.Storage != nullptr)
@@ -963,26 +1302,78 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                 && namedVar.Primary != nullptr)
                 Compiler(ctx)->RegisterOwningTempRawPointerField(namedVar.Primary);
         }
-        // A result that borrows from the receiver temp (pointer, alias) outlives the statement, so
-        // those temps stay unregistered: the pre-existing behaviour, no free. The exception is a
-        // pointer to a scalar that a unary `*` reads in place (`s += *mk()->heap;`): the temp dies
-        // at the end of the statement as for `mk()->v`. An alias declaration's temps stay on the
-        // ledger and are settled by the declarator (bound: scope end; else statement end).
+        // Borrowed pointer or alias results can outlive the full expression, so their receiver temps
+        // stay unregistered. Scalar dereferences and call arguments keep the temp on the cleanup
+        // ledger; alias declarations defer it to the declarator (scope end if bound).
         if (arrowOwnedTemps_.size() > arrowTempMark)
         {
             const bool borrows = namedVar.TypeAndValue.Pointer || namedVar.TypeAndValue.IsAlias
                 || namedVar.IsAliasBorrow;
-            const bool readInPlace = borrows && IsDerefOperandChain(ctx)
-                && PointsToScalar(Compiler(ctx), namedVar) && !DerefResultMayOutlive(ctx, namedVar);
+            const bool pointsToScalar = PointsToScalar(Compiler(ctx), namedVar);
+            auto* valueType = Compiler(ctx)->GetType(namedVar.TypeAndValue);
+            const bool addressDerefScalar = valueType != nullptr
+                && (valueType->isIntegerTy() || valueType->isFloatingPointTy())
+                && IsDerefOperandChain(ctx);
             const bool aliasDecl = AliasDeclarationMayOutlive(ctx, namedVar);
-            if ((borrows || aliasDecl) && !readInPlace)
-                for (size_t i = arrowTempMark; i < arrowOwnedTemps_.size(); ++i)
+            const bool pointerDifference = !aliasDecl && borrows && pointsToScalar
+                && IsPointerDifferenceOperand(Compiler(ctx), ctx);
+            const bool readInPlace = borrows && (pointsToScalar || addressDerefScalar)
+                && (pointerDifference || (IsDerefOperandChain(ctx)
+                    && !DerefResultMayOutlive(ctx, namedVar)));
+            AdditiveCallArgumentPath additiveCallPath;
+            const bool callArgumentReadPath = IsCallArgumentReadPath(ctx, &additiveCallPath);
+            const bool callArgument = !aliasDecl
+                && (IsDirectCallArgument(ctx) || callArgumentReadPath);
+            size_t write = arrowTempMark;
+            for (size_t i = arrowTempMark; i < arrowOwnedTemps_.size(); ++i)
+            {
+                auto temp = arrowOwnedTemps_[i];
+                if (temp.PendingCallResult != nullptr)
                 {
-                    LLVMBackend* backend = Compiler(ctx);
-                    if (!aliasDecl) backend->UnregisterOwnedStructTemp(arrowOwnedTemps_[i]);
-                    else backend->DeferAliasDeclStructTemp(arrowOwnedTemps_[i]);
+                    if (temp.PendingCallResult == ctx)
+                    {
+                        auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(namedVar.Primary);
+                        llvm::Type* callResultType = call != nullptr ? call->getType()
+                            : (namedVar.Primary != nullptr ? namedVar.Primary->getType() : valueType);
+                        const bool scalarNumber = callResultType != nullptr
+                            && (callResultType->isIntegerTy() || callResultType->isFloatingPointTy());
+                        const llvm::Function* function = call != nullptr ? call->getCalledFunction() : nullptr;
+                        if (function == nullptr && call != nullptr)
+                            function = llvm::dyn_cast<llvm::Function>(
+                                call->getCalledOperand()->stripPointerCasts());
+                        size_t parameterIndex = temp.ArgumentIndex;
+                        bool argumentEscapes = temp.NamedArgument || function == nullptr
+                            || parameterIndex == SIZE_MAX;
+                        if (function != nullptr && parameterIndex != SIZE_MAX)
+                        {
+                            const bool exactSimpleCall = call->arg_size() == 1
+                                && function->arg_size() == 1 && parameterIndex == 0;
+                            argumentEscapes = argumentEscapes || !exactSimpleCall
+                                || FunctionArgumentMayEscape(function, parameterIndex);
+                        }
+                        const bool pointerResult = callResultType != nullptr && callResultType->isPointerTy();
+                        if (!scalarNumber || pointerResult || argumentEscapes)
+                            Compiler(ctx)->UnregisterOwnedStructTemp(temp.Storage);
+                        continue;
+                    }
+                    arrowOwnedTemps_[write++] = temp;
+                    continue;
                 }
-            arrowOwnedTemps_.resize(arrowTempMark);
+                if (callArgumentReadPath && additiveCallPath.Call != nullptr && !aliasDecl)
+                {
+                    temp.PendingCallResult = additiveCallPath.Call;
+                    temp.ArgumentIndex = additiveCallPath.ArgumentIndex;
+                    temp.NamedArgument = additiveCallPath.NamedArgument;
+                    arrowOwnedTemps_[write++] = temp;
+                    continue;
+                }
+                if ((borrows || aliasDecl) && !readInPlace && !callArgument)
+                {
+                    if (!aliasDecl) Compiler(ctx)->UnregisterOwnedStructTemp(temp.Storage);
+                    else Compiler(ctx)->DeferAliasDeclStructTemp(temp.Storage);
+                }
+            }
+            arrowOwnedTemps_.resize(write);
         }
         if (namedVar.TypeAndValue.IsFlexibleArrayMember && !lValue && std::find(flexibleArrayKeep_.begin(), flexibleArrayKeep_.end(), ctx) == flexibleArrayKeep_.end())
             DecayFlexibleArrayMember(namedVar);
@@ -2038,9 +2429,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             && compiler->IsOwningValueType(recvType))
                         {
                             if (addressOfOperandDepth_ == 0 || InAliasDeclaration(ctx)
-                                || InPostfixSubscriptIndex(ctx))
+                                || InPostfixSubscriptIndex(ctx) || IsDerefOperandChain(ctx)
+                                || IsCallArgumentReadPath(ctx))
                                 compiler->RegisterOwnedStructTemp(temp, recvType);
-                            arrowOwnedTemps_.push_back(temp);
+                            arrowOwnedTemps_.push_back({ temp });
                         }
                     }
                     else if (receiver.IsParenthesizedProducedTemp
@@ -2055,11 +2447,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     {
                         const LLVMBackend::OwnedTempMark allTemps{};
                         if ((addressOfOperandDepth_ == 0 || InAliasDeclaration(ctx)
-                                || InPostfixSubscriptIndex(ctx))
+                                || InPostfixSubscriptIndex(ctx) || IsDerefOperandChain(ctx)
+                                || IsCallArgumentReadPath(ctx))
                             && !compiler->IsOwnedStructTempSince(allTemps, thisNV.Storage))
                             compiler->RegisterOwnedStructTemp(thisNV.Storage,
                                                               receiver.TypeAndValue.TypeName);
-                        arrowOwnedTemps_.push_back(thisNV.Storage);
+                        arrowOwnedTemps_.push_back({ thisNV.Storage });
                     }
 
                     // A core unique receiver is also a named local read: consult its merged move state.
@@ -3362,6 +3755,25 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 && Compiler(ctx)->IsLoweredCFlatOnlyStruct(structVar.TypeAndValue.TypeName))
                                 Compiler(ctx)->RegisterOwnedStructTemp(structVar.Storage,
                                     structVar.TypeAndValue.TypeName);
+                            // Keep a lowered call result addressable so `move call().field` moves
+                            // from the field slot instead of extracting and copying its bytes.
+                            if (structVar.Storage == nullptr && structVar.Primary != nullptr
+                                && !structVar.TypeAndValue.Pointer
+                                && Compiler(ctx)->IsLoweredCFlatOnlyStruct(structVar.TypeAndValue.TypeName)
+                                && fieldIndex < dataStructure.StructFields.size()
+                                && dataStructure.StructFields[fieldIndex].ConstArraySize == 0
+                                && !dataStructure.StructFields[fieldIndex].IsArrayView
+                                && !dataStructure.StructFields[fieldIndex].IsFlexibleArrayMember
+                                && !llvm::isa<llvm::ArrayType>(Compiler(ctx)->GetType(
+                                    dataStructure.StructFields[fieldIndex])))
+                                if (auto* resultSlot = Compiler(ctx)->LoweredSretTempOf(
+                                        structVar.Primary, structVar.Primary->getType()))
+                                {
+                                    structVar.Storage = resultSlot;
+                                    if (!Compiler(ctx)->IsOwnedTempValue(structVar))
+                                        Compiler(ctx)->RegisterOwnedStructTemp(
+                                            resultSlot, structVar.TypeAndValue.TypeName);
+                                }
                             if (fieldIndex < dataStructure.StructFields.size())
                             {
                                 const auto& fieldType = dataStructure.StructFields[fieldIndex];
@@ -5467,6 +5879,90 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             }
                         }
 
+                        // Reject only when the variable's lookup tier is closer than every same-named function.
+                        // Callable variables have already resolved as function values or operator() above.
+                        const auto* callParen = childIndex >= 2
+                            ? dynamic_cast<antlr4::tree::TerminalNode*>(ctx->children[childIndex - 2])
+                            : nullptr;
+                        const bool directBareCall = childIndex >= 3
+                            && ctx->children[childIndex - 3] == primaryCtx
+                            && callParen != nullptr
+                            && callParen->getSymbol()->getType() == CFlatParser::LeftParen;
+                        auto* bareIdentifier = primaryCtx->children.size() == 1
+                            ? primaryCtx->genericIdentifier() : nullptr;
+                        if (directBareCall && bareIdentifier != nullptr
+                            && bareIdentifier->Identifier() != nullptr)
+                        {
+                            const std::string bareName = bareIdentifier->Identifier()->getText();
+                            auto* compiler = Compiler(ctx);
+                            if (NamesVisibleVariable(compiler, bareName))
+                            {
+                                const size_t localScopeDepth = compiler->FindVariableScopeDepth(bareName);
+                                const bool memberVariable = compiler->HasMemberVariable(bareName);
+                                const std::string qualifiedName = compiler->ResolveQualifiedName(bareName);
+                                const bool namespaceVariable = qualifiedName != bareName
+                                    && compiler->GetGlobalVariableNV(qualifiedName).Storage != nullptr;
+                                const bool rootVariable = compiler->GetGlobalVariableNV(bareName).Storage != nullptr;
+                                const int variableRank = localScopeDepth != SIZE_MAX ? 0
+                                    : memberVariable ? 1 : namespaceVariable ? 2
+                                    : rootVariable ? 3 : 4;
+                                const LLVMBackend::TypeAndValue variableType =
+                                    VisibleVariableType(compiler, bareName);
+                                const std::string resolvedType =
+                                    compiler->ResolveTypeAlias(variableType.TypeName);
+                                const bool callableFunctionValue = variableType.IsFunctionPointer
+                                    || !variableType.FuncPtrReturnTypeName.empty()
+                                    || compiler->GetEncodedClosureType(variableType.TypeName) != nullptr;
+                                const bool callableObject =
+                                    HasOperatorOverloadForFirstParam("operator()", variableType.TypeName)
+                                    || HasOperatorOverloadForFirstParam("operator()", resolvedType)
+                                    || (compiler->IsCxxRecord(resolvedType)
+                                        && compiler->HasCxxFunctionTemplateMember(
+                                            resolvedType, "operator()"))
+                                    || (compiler->IsCxxRecord(resolvedType)
+                                        && compiler->IsCxxStaticMethod(
+                                            resolvedType, "operator()", true))
+                                    || (compiler->IsStdFunctionSpecialization(variableType.TypeName)
+                                        && compiler->IsForeignNontrivialCxxClass(variableType.TypeName)
+                                        && compiler->GetFunction("operator()") != nullptr);
+                                auto hasFunctionDeclaration = [&](const std::string& name) {
+                                    if (name.empty()) return false;
+                                    const auto functions = compiler->functionTable.find(name);
+                                    const bool hasFunction = functions != compiler->functionTable.end()
+                                        && std::any_of(functions->second.begin(), functions->second.end(),
+                                            [](const LLVMBackend::FunctionSymbol& candidate) {
+                                                return !candidate.IsMethod;
+                                            });
+                                    return hasFunction || compiler->GetReturnBlock(name) != nullptr
+                                        || genericFunctionTemplates.count(
+                                            compiler->ResolveGenericFunctionBase(name)) != 0
+                                        || compiler->HasCxxFunctionTemplate(name);
+                                };
+                                const auto thisVariable = compiler->GetThisPointer();
+                                const std::string thisType = thisVariable.TypeAndValue.TypeName;
+                                const bool hasImplicitMemberFunction = !thisType.empty()
+                                    && (HasCFlatMemberMethod(thisType, bareName)
+                                        || !GenericMethodTemplateKey(thisType, bareName).empty());
+                                int nearestFunctionRank = 4;
+                                if (hasImplicitMemberFunction) nearestFunctionRank = 1;
+                                if (qualifiedName != bareName
+                                    && hasFunctionDeclaration(qualifiedName))
+                                    nearestFunctionRank = std::min(nearestFunctionRank, 2);
+                                if (hasFunctionDeclaration(bareName))
+                                    nearestFunctionRank = std::min(nearestFunctionRank, 3);
+                                const bool hasHiddenFunction = nearestFunctionRank != 4
+                                    && variableRank < nearestFunctionRank;
+                                if (hasHiddenFunction && !callableFunctionValue && !callableObject)
+                                {
+                                    LogErrorContext(primaryCtx, std::format(
+                                        "'{}' is a variable of type '{}' and cannot be called; it hides function '{}'",
+                                        bareName, SpellType(*compiler, variableType), bareName));
+                                    namedVar = {};
+                                    break;
+                                }
+                            }
+                        }
+
                         if (functionName == "operator()"
                             && Compiler(ctx)->IsCxxRecord(structVar.TypeAndValue.TypeName)
                             && Compiler(ctx)->RejectInaccessibleCxxMember(
@@ -7520,11 +8016,33 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 else
                                     funcPtr = namedVar.Primary;
                             }
+                            if (funcPtr != nullptr && funcPtrTV.IsThinFnPtr()
+                                && namedVar.TypeAndValue.Pointer
+                                && !namedVar.TypeAndValue.ElemPointer)
+                                funcPtr = Compiler(ctx)->CreateLoad(
+                                    Compiler(ctx)->BuildThinFnPtrType(funcPtrTV), funcPtr);
 
                             if (funcPtr != nullptr)
                             {
                                 std::vector<llvm::Value*> callArgs;
                                 std::vector<LLVMBackend::NamedVariable> argNVs;
+                                std::vector<std::pair<llvm::Value*, std::string>> retainedFnPtrBraceUnwinds;
+                                auto releaseFnPtrBraceUnwinds = [&]() {
+                                    auto& entries = Compiler(ctx)->unwindPartial_;
+                                    for (auto slot = retainedFnPtrBraceUnwinds.rbegin();
+                                         slot != retainedFnPtrBraceUnwinds.rend(); ++slot)
+                                        for (auto entry = entries.rbegin(); entry != entries.rend(); ++entry)
+                                            if (entry->K == LLVMBackend::UnwindPartialEntry::Kind::Slot
+                                                && entry->V == slot->first
+                                                && entry->TypeName == slot->second)
+                                            {
+                                                entries.erase(std::next(entry).base());
+                                                break;
+                                            }
+                                    retainedFnPtrBraceUnwinds.clear();
+                                };
+                                BraceArgumentUnwindScope fnPtrBraceUnwindScope{
+                                    releaseFnPtrBraceUnwinds };
                                 // Consumed-COM sugar ([PFX-2a]): the receiver was redirected through
                                 // lpVtbl, so inject the captured object pointer as the implicit `this`
                                 // first argument. A placeholder NamedVariable keeps argNVs 1:1 with
@@ -7551,11 +8069,76 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                         CallArgumentScope callArgumentScope(
                                             inCallArgument_, ternaryCallArgumentDepth_);
+                                        DirectViewCallArgumentScope directViewArgumentScope(
+                                            directViewCallArgument_, namedArgument->assignmentExpression());
                                         auto* backend = Compiler(ctx);
-                                        auto argNV = ParseCallArgument([&] {
+                                        auto argNV = ParseCallArgument([&]() {
+                                            if (namedArgument->LeftBrace() != nullptr)
+                                            {
+                                                if (argParamIndex >= funcPtrTV.FuncPtrParams.size()
+                                                    || argExpectedDest.Pointer || argExpectedDest.IsAlias
+                                                    || argExpectedDest.PointerDepth != 0)
+                                                    LogErrorContext(namedArgument,
+                                                        "brace argument to a function pointer requires a by-value CFlat struct parameter");
+
+                                                std::string structTypeName = backend->ResolveTypeAlias(
+                                                    argExpectedDest.TypeName);
+                                                if (structTypeName.empty())
+                                                    structTypeName = argExpectedDest.TypeName;
+                                                auto* structType = llvm::dyn_cast_or_null<llvm::StructType>(
+                                                    backend->GetType(argExpectedDest));
+                                                if (structType == nullptr || structType->isOpaque()
+                                                    || backend->IsCxxRecord(structTypeName))
+                                                    LogErrorContext(namedArgument,
+                                                        "brace argument to a function pointer requires a complete by-value CFlat struct parameter");
+
+                                                auto* initList = namedArgument->initializerList();
+                                                auto* slot = backend->CreateAlloca(structType);
+                                                if (initList != nullptr
+                                                    && CanFreshBraceInitializeAggregate(structTypeName, initList))
+                                                {
+                                                    if (!EmitFreshBraceInitializeAggregate(
+                                                            slot, structTypeName, initList))
+                                                        LogErrorContext(namedArgument,
+                                                            "could not initialize brace argument to a function pointer");
+                                                }
+                                                else
+                                                {
+                                                    LLVMBackend::DeclTypeAndValue paramType;
+                                                    paramType.TypeName = structTypeName;
+                                                    llvm::Value* defaultValue = GenerateDefaultValue(paramType);
+                                                    if (defaultValue == nullptr)
+                                                        LogErrorContext(namedArgument,
+                                                            "could not default-initialize brace argument to a function pointer");
+                                                    backend->CreateAssignment(defaultValue, slot);
+                                                    if (initList != nullptr)
+                                                        EmitConstructedFieldOverrides(
+                                                            slot, structTypeName, initList, true,
+                                                            &retainedFnPtrBraceUnwinds);
+                                                }
+
+                                                LLVMBackend::NamedVariable braceValue;
+                                                braceValue.Primary = backend->CreateLoad(slot);
+                                                braceValue.BaseType = structType;
+                                                braceValue.TypeAndValue = argExpectedDest;
+                                                braceValue.IsCFlatBraceInitTemp = true;
+                                                return braceValue;
+                                            }
                                             return this->ParseAssignmentExpressionNamed(
                                                 namedArgument->assignmentExpression());
                                         });
+                                        if (argNV.TypeAndValue.IsArrayView && argNV.Storage != nullptr)
+                                        {
+                                            bool borrowedView = false;
+                                            if (argParamIndex < funcPtrTV.FuncPtrParams.size())
+                                            {
+                                                const auto& param = funcPtrTV.FuncPtrParams[argParamIndex];
+                                                borrowedView = param.IsArrayView && !param.IsMove
+                                                    && !param.IsOwningSink;
+                                            }
+                                            if (!borrowedView)
+                                                backend->DisarmNonLocalViewFieldsForEscape(argNV.Storage, false);
+                                        }
                                         if (argNV.ContainsBondedClosure)
                                             Compiler(ctx)->LogError(
                                                 "cannot pass a holder containing a bonded closure to a function - the callee could stash it beyond the captured local's lifetime");
@@ -8025,10 +8608,21 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     ifaceArgExpectedScope.emplace(&declExpectedType, ifaceArgExpectedDest, true);
                                     CallArgumentScope callArgumentScope(
                                         inCallArgument_, ternaryCallArgumentDepth_);
+                                    DirectViewCallArgumentScope directViewArgumentScope(
+                                        directViewCallArgument_, namedArgument->assignmentExpression());
                                     auto argNV = ParseCallArgument([&] {
                                         return this->ParseAssignmentExpressionNamed(
                                             namedArgument->assignmentExpression());
                                     });
+                                    if (argNV.TypeAndValue.IsArrayView && argNV.Storage != nullptr)
+                                    {
+                                        const auto& param = ifaceArgExpectedDest;
+                                        const bool borrowedView = param.IsArrayView && !param.IsMove
+                                            && !param.IsUnique && !param.IsOwningSink;
+                                        if (!borrowedView)
+                                            Compiler(ctx)->DisarmNonLocalViewFieldsForEscape(
+                                                argNV.Storage, false);
+                                    }
                                     NormalizeCxxReferenceNamed(namedArgument, argNV);
                                     if (ifaceDefaultArgument)
                                         MaterializeDefaultArgument(namedArgument, argNV, ifaceArgExpectedDest);
@@ -8097,6 +8691,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // Explicit 'move' at the call site: drives move-overload selection
                                     // and the borrow-param diagnostic after overload resolution.
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
+                                    argVar.IsDirectMoveCall = argNV.IsDirectMoveCall;
                                     argVar.ClosureEnvKnownFree = argNV.ClosureEnvKnownFree;
                                     argVar.ClosureEnvProvenanceTainted =
                                         argNV.ClosureEnvProvenanceTainted;
@@ -9215,6 +9810,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argExpectedScope.emplace(&declExpectedType, ternaryArgDest, true);
                                     CallArgumentScope callArgumentScope(
                                         inCallArgument_, ternaryCallArgumentDepth_);
+                                    DirectViewCallArgumentScope directViewArgumentScope(
+                                        directViewCallArgument_, namedArgument->assignmentExpression());
                                     const bool cxxMemberReceiver = structVar.BaseType != nullptr
                                         && !structVar.TypeAndValue.TypeName.empty()
                                         && Compiler(ctx)->IsCxxRecord(
@@ -9662,6 +10259,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // Explicit 'move' at the call site: drives move-overload selection
                                     // and the borrow-param diagnostic after overload resolution.
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
+                                    argVar.IsDirectMoveCall = argNV.IsDirectMoveCall;
                                     argVar.IsNormalizedCxxXvalue = argNV.IsNormalizedCxxXvalue;
                                     argVar.IsRvalue = argNV.IsRvalue;
                                     argVar.IsCxxPrvalueTemp = argNV.IsCxxPrvalueTemp;

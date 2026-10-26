@@ -1,0 +1,258 @@
+import "../library/c_macro_helpers.h";
+
+struct T489Fixed { int data[2] = default; };
+struct T489FixedInner { int data[2] = default; };
+struct T489FixedOuter { T489FixedInner inner = default; };
+struct T489ZeroOuter { CBF_ZeroInt inner; };
+
+void T489Sink(move int* p) { }
+
+// T489 discriminator: CFlat fixed-size; t489_fixed_arrow_declaration_init.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_fixed_arrow_declaration_init() { T489Fixed* a = (T489Fixed*)malloc(64); int* out = move a->data; }
+}
+
+// T489 discriminator: CFlat fixed-size; t489_fixed_arrow_assignment.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_fixed_arrow_assignment() { T489Fixed* a = (T489Fixed*)malloc(64); int* out = nullptr; out = move a->data; }
+}
+
+// T489 discriminator: CFlat fixed-size; t489_fixed_arrow_move_param_call.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_fixed_arrow_move_param_call() { T489Fixed* a = (T489Fixed*)malloc(64); T489Sink(move a->data); }
+}
+
+// T489 discriminator: CFlat fixed-size; t489_fixed_arrow_return.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    int* t489_fixed_arrow_return() { T489Fixed* a = (T489Fixed*)malloc(64); return move a->data; }
+}
+
+// T489 discriminator: CFlat fixed-size; t489_fixed_deref_dot_declaration_init.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_fixed_deref_dot_declaration_init() { T489Fixed* a = (T489Fixed*)malloc(64); int* out = move (*a).data; }
+}
+
+// T489 discriminator: CFlat fixed-size; t489_fixed_deref_dot_assignment.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_fixed_deref_dot_assignment() { T489Fixed* a = (T489Fixed*)malloc(64); int* out = nullptr; out = move (*a).data; }
+}
+
+// T489 discriminator: CFlat fixed-size; t489_fixed_deref_dot_move_param_call.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_fixed_deref_dot_move_param_call() { T489Fixed* a = (T489Fixed*)malloc(64); T489Sink(move (*a).data); }
+}
+
+// T489 discriminator: CFlat fixed-size; t489_fixed_deref_dot_return.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    int* t489_fixed_deref_dot_return() { T489Fixed* a = (T489Fixed*)malloc(64); return move (*a).data; }
+}
+
+// T489 discriminator: CFlat fixed-size; t489_fixed_dot_declaration_init.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_fixed_dot_declaration_init() { T489Fixed s = default; int* out = move s.data; }
+}
+
+// T489 discriminator: CFlat fixed-size; t489_fixed_dot_assignment.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_fixed_dot_assignment() { T489Fixed s = default; int* out = nullptr; out = move s.data; }
+}
+
+// T489 discriminator: CFlat fixed-size; t489_fixed_dot_move_param_call.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_fixed_dot_move_param_call() { T489Fixed s = default; T489Sink(move s.data); }
+}
+
+// T489 discriminator: CFlat fixed-size; t489_fixed_dot_return.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    int* t489_fixed_dot_return() { T489Fixed s = default; return move s.data; }
+}
+
+// T489 discriminator: CFlat fixed-size; t489_fixed_nested_declaration_init.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_fixed_nested_declaration_init() { T489FixedOuter s = default; int* out = move s.inner.data; }
+}
+
+// T489 discriminator: CFlat fixed-size; t489_fixed_nested_assignment.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_fixed_nested_assignment() { T489FixedOuter s = default; int* out = nullptr; out = move s.inner.data; }
+}
+
+// T489 discriminator: CFlat fixed-size; t489_fixed_nested_move_param_call.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_fixed_nested_move_param_call() { T489FixedOuter s = default; T489Sink(move s.inner.data); }
+}
+
+// T489 discriminator: CFlat fixed-size; t489_fixed_nested_return.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    int* t489_fixed_nested_return() { T489FixedOuter s = default; return move s.inner.data; }
+}
+
+// T489 discriminator: C header zero-length; t489_zero_arrow_declaration_init.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_zero_arrow_declaration_init() { CBF_ZeroInt* a = (CBF_ZeroInt*)malloc(64); int* out = move a->data; }
+}
+
+// T489 discriminator: C header zero-length; t489_zero_arrow_assignment.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_zero_arrow_assignment() { CBF_ZeroInt* a = (CBF_ZeroInt*)malloc(64); int* out = nullptr; out = move a->data; }
+}
+
+// T489 discriminator: C header zero-length; t489_zero_arrow_move_param_call.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_zero_arrow_move_param_call() { CBF_ZeroInt* a = (CBF_ZeroInt*)malloc(64); T489Sink(move a->data); }
+}
+
+// T489 discriminator: C header zero-length; t489_zero_arrow_return.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    int* t489_zero_arrow_return() { CBF_ZeroInt* a = (CBF_ZeroInt*)malloc(64); return move a->data; }
+}
+
+// T489 discriminator: C header zero-length; t489_zero_deref_dot_declaration_init.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_zero_deref_dot_declaration_init() { CBF_ZeroInt* a = (CBF_ZeroInt*)malloc(64); int* out = move (*a).data; }
+}
+
+// T489 discriminator: C header zero-length; t489_zero_deref_dot_assignment.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_zero_deref_dot_assignment() { CBF_ZeroInt* a = (CBF_ZeroInt*)malloc(64); int* out = nullptr; out = move (*a).data; }
+}
+
+// T489 discriminator: C header zero-length; t489_zero_deref_dot_move_param_call.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_zero_deref_dot_move_param_call() { CBF_ZeroInt* a = (CBF_ZeroInt*)malloc(64); T489Sink(move (*a).data); }
+}
+
+// T489 discriminator: C header zero-length; t489_zero_deref_dot_return.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    int* t489_zero_deref_dot_return() { CBF_ZeroInt* a = (CBF_ZeroInt*)malloc(64); return move (*a).data; }
+}
+
+// T489 discriminator: C header zero-length; t489_zero_dot_declaration_init.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_zero_dot_declaration_init() { CBF_ZeroInt s = default; int* out = move s.data; }
+}
+
+// T489 discriminator: C header zero-length; t489_zero_dot_assignment.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_zero_dot_assignment() { CBF_ZeroInt s = default; int* out = nullptr; out = move s.data; }
+}
+
+// T489 discriminator: C header zero-length; t489_zero_dot_move_param_call.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_zero_dot_move_param_call() { CBF_ZeroInt s = default; T489Sink(move s.data); }
+}
+
+// T489 discriminator: C header zero-length; t489_zero_dot_return.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    int* t489_zero_dot_return() { CBF_ZeroInt s = default; return move s.data; }
+}
+
+// T489 discriminator: C header zero-length; t489_zero_nested_declaration_init.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_zero_nested_declaration_init() { T489ZeroOuter s = default; int* out = move s.inner.data; }
+}
+
+// T489 discriminator: C header zero-length; t489_zero_nested_assignment.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_zero_nested_assignment() { T489ZeroOuter s = default; int* out = nullptr; out = move s.inner.data; }
+}
+
+// T489 discriminator: C header zero-length; t489_zero_nested_move_param_call.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_zero_nested_move_param_call() { T489ZeroOuter s = default; T489Sink(move s.inner.data); }
+}
+
+// T489 discriminator: C header zero-length; t489_zero_nested_return.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    int* t489_zero_nested_return() { T489ZeroOuter s = default; return move s.inner.data; }
+}
+
+// T489 discriminator: C header flexible; t489_flex_arrow_declaration_init.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_flex_arrow_declaration_init() { CBF_FlexInt* a = (CBF_FlexInt*)malloc(64); int* out = move a->data; }
+}
+
+// T489 discriminator: C header flexible; t489_flex_arrow_assignment.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_flex_arrow_assignment() { CBF_FlexInt* a = (CBF_FlexInt*)malloc(64); int* out = nullptr; out = move a->data; }
+}
+
+// T489 discriminator: C header flexible; t489_flex_arrow_move_param_call.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_flex_arrow_move_param_call() { CBF_FlexInt* a = (CBF_FlexInt*)malloc(64); T489Sink(move a->data); }
+}
+
+// T489 discriminator: C header flexible; t489_flex_arrow_return.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    int* t489_flex_arrow_return() { CBF_FlexInt* a = (CBF_FlexInt*)malloc(64); return move a->data; }
+}
+
+// T489 discriminator: C header flexible; t489_flex_deref_dot_declaration_init.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_flex_deref_dot_declaration_init() { CBF_FlexInt* a = (CBF_FlexInt*)malloc(64); int* out = move (*a).data; }
+}
+
+// T489 discriminator: C header flexible; t489_flex_deref_dot_assignment.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_flex_deref_dot_assignment() { CBF_FlexInt* a = (CBF_FlexInt*)malloc(64); int* out = nullptr; out = move (*a).data; }
+}
+
+// T489 discriminator: C header flexible; t489_flex_deref_dot_move_param_call.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_flex_deref_dot_move_param_call() { CBF_FlexInt* a = (CBF_FlexInt*)malloc(64); T489Sink(move (*a).data); }
+}
+
+// T489 discriminator: C header flexible; t489_flex_deref_dot_return.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    int* t489_flex_deref_dot_return() { CBF_FlexInt* a = (CBF_FlexInt*)malloc(64); return move (*a).data; }
+}
+
+// T489 discriminator: C header flexible; t489_flex_dot_declaration_init.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_flex_dot_declaration_init() { CBF_FlexInt s = default; int* out = move s.data; }
+}
+
+// T489 discriminator: C header flexible; t489_flex_dot_assignment.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_flex_dot_assignment() { CBF_FlexInt s = default; int* out = nullptr; out = move s.data; }
+}
+
+// T489 discriminator: C header flexible; t489_flex_dot_move_param_call.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_flex_dot_move_param_call() { CBF_FlexInt s = default; T489Sink(move s.data); }
+}
+
+// T489 discriminator: C header flexible; t489_flex_dot_return.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    int* t489_flex_dot_return() { CBF_FlexInt s = default; return move s.data; }
+}
+
+// T489 discriminator: C header flexible; t489_flex_nested_declaration_init.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_flex_nested_declaration_init() { CBF_FlexNested s = default; int* out = move s.nested.data; }
+}
+
+// T489 discriminator: C header flexible; t489_flex_nested_assignment.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_flex_nested_assignment() { CBF_FlexNested s = default; int* out = nullptr; out = move s.nested.data; }
+}
+
+// T489 discriminator: C header flexible; t489_flex_nested_move_param_call.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_flex_nested_move_param_call() { CBF_FlexNested s = default; T489Sink(move s.nested.data); }
+}
+
+// T489 discriminator: C header flexible; t489_flex_nested_return.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    int* t489_flex_nested_return() { CBF_FlexNested s = default; return move s.nested.data; }
+}
+
+
+// T489 review: an array member reached through a subscripted receiver is still a member.
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_fixed_subscript_dot() { T489Fixed[2] arr; int* out = move arr[0].data; }
+}
+
+expect_error("cannot move an array member; take its address or copy the elements") {
+    void t489_fixed_pointer_subscript_dot(T489Fixed* pa) { int* out = move pa[1].data; }
+}

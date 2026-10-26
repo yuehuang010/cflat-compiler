@@ -2567,6 +2567,25 @@ static bool HasNestedAggregatePathInContext(antlr4::tree::ParseTree* useSite,
     return hasPath(hasPath, owner, 0);
 }
 
+static bool AggregateScopeMatchesContextOwner(const std::string& scope,
+    const std::string& ownerScope)
+{
+    auto stripGenericArguments = [](const std::string& name)
+    {
+        std::string base;
+        int genericDepth = 0;
+        for (char ch : name)
+        {
+            if (ch == '$' && genericDepth == 0) break;
+            if (ch == '<') { ++genericDepth; continue; }
+            if (ch == '>' && genericDepth > 0) { --genericDepth; continue; }
+            if (genericDepth == 0) base.push_back(ch);
+        }
+        return base;
+    };
+    return stripGenericArguments(scope) == stripGenericArguments(ownerScope);
+}
+
 static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesFromContext(
     LLVMBackend* compiler, antlr4::tree::ParseTree* node)
 {
@@ -2634,13 +2653,27 @@ static std::string ResolveContextualTypeName(LLVMBackend* compiler,
     const auto typePath = NamedTypePathFromContext(typeSpec);
     for (size_t i = 0; i < aggregateScopes.size(); i++)
     {
-        const auto& scope = aggregateScopes[i];
-        if (!scope.empty())
+        std::string candidateScope = aggregateScopes[i];
+        if (!candidateScope.empty())
         {
-            const std::string candidate = scope + "." + spelled;
-            const bool ambiguousScope = compiler->IsNamespace(scope);
-            if ((!ambiguousScope || HasNestedAggregatePathInContext(typeSpec, i, typePath))
-                && isKnownType(candidate))
+            const bool declaredInAggregate =
+                HasNestedAggregatePathInContext(typeSpec, i, typePath);
+            if (i > 0 && typeSpec != nullptr && !typePath.empty())
+            {
+                const auto contextScopes = EnclosingAggregateNamesFromContext(compiler, typeSpec);
+                if (i < contextScopes.size()
+                    && !AggregateScopeMatchesContextOwner(candidateScope, contextScopes[i]))
+                {
+                    // The lexical owner of a generic instance (A.P$int.Q) is not a registered type: keep master's lookup.
+                    if (!declaredInAggregate || !isKnownType(resolvedName)
+                        || !isKnownType(contextScopes[i] + "." + spelled)) continue;
+                    candidateScope = contextScopes[i];
+                }
+            }
+            const std::string candidate = candidateScope + "." + spelled;
+            const bool ambiguousScope = compiler->IsNamespace(candidateScope);
+            if ((!ambiguousScope || declaredInAggregate)
+                && (isKnownType(candidate) || declaredInAggregate))
                 return candidate;
         }
     }
@@ -4424,17 +4457,34 @@ inline bool IsLastUseOfForeignCxxParam(
     return found;
 }
 
+// Evaluated in the active generic instance; -1 leaves both branches visible.
+using IfConstEvaluator = std::function<int(CFlatParser::ExpressionContext*)>;
+
 // Collect the 'return <expr>;' expressions a function body owns itself. A nested lambda's
 // returns belong to the lambda, so its subtree is skipped.
 static void CollectOwnReturnExpressions(antlr4::tree::ParseTree* node,
-                                        std::vector<CFlatParser::ExpressionContext*>& out)
+                                        std::vector<CFlatParser::ExpressionContext*>& out,
+                                        const IfConstEvaluator& evalIfConst = {})
 {
     if (node == nullptr) return;
     if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node) != nullptr) return;
+    if (auto* sel = AsRuleCtx<CFlatParser::SelectionStatementContext>(node);
+        sel != nullptr && sel->If() != nullptr && sel->Const() != nullptr && evalIfConst)
+    {
+        const int decision = evalIfConst(sel->expression());
+        if (decision >= 0)
+        {
+            auto branches = sel->statement();
+            const size_t index = decision == 1 ? 0 : 1;
+            if (index < branches.size())
+                CollectOwnReturnExpressions(branches[index], out, evalIfConst);
+            return;
+        }
+    }
     if (auto* jump = AsRuleCtx<CFlatParser::JumpStatementContext>(node))
         if (jump->expression() != nullptr) out.push_back(jump->expression());
     for (auto* child : node->children)
-        CollectOwnReturnExpressions(child, out);
+        CollectOwnReturnExpressions(child, out, evalIfConst);
 }
 
 static void CollectOwnReturnStatements(antlr4::tree::ParseTree* node,
@@ -4744,11 +4794,12 @@ static std::string DottedPathHead(const std::string& text)
 // before the return binds it there. 'nullptr' is not one. A base struct can hide an inherited
 // field, so it yields no summary. Source-only, so definition order cannot matter.
 inline bool ReturnsOnlyModuleGlobals(CFlatParser::FunctionDefinitionContext* func,
-                                     const std::vector<LLVMBackend::TypeAndValue>& allParams)
+                                     const std::vector<LLVMBackend::TypeAndValue>& allParams,
+                                     const IfConstEvaluator& evalIfConst = {})
 {
     if (func == nullptr || func->compoundStatement() == nullptr) return false;
     std::vector<CFlatParser::ExpressionContext*> returns;
-    CollectOwnReturnExpressions(func->compoundStatement(), returns);
+    CollectOwnReturnExpressions(func->compoundStatement(), returns, evalIfConst);
     if (returns.empty()) return false;
 
     antlr4::tree::ParseTree* structNode = nullptr;
@@ -4785,15 +4836,107 @@ inline bool ReturnsOnlyModuleGlobals(CFlatParser::FunctionDefinitionContext* fun
     return true;
 }
 
-// Set the summary on every overload with this exact parameter list (overloads of one name).
-inline void MarkReturnsGlobalBorrow(std::vector<LLVMBackend::FunctionSymbol>& overloads,
-                                    const std::vector<LLVMBackend::TypeAndValue>& allParams)
+static std::string DirectReturnIdentifier(CFlatParser::ExpressionContext* expr)
+{
+    antlr4::tree::ParseTree* node = expr;
+    while (node != nullptr)
+    {
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+        {
+            if (primary->genericIdentifier() != nullptr && node->children.size() == 1
+                && primary->genericIdentifier()->genericTypeParameters() == nullptr)
+                return primary->genericIdentifier()->Identifier()->getText();
+            if (primary->expression() != nullptr)
+            {
+                node = primary->expression();
+                continue;
+            }
+            return {};
+        }
+        if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
+            cast != nullptr && cast->castExpression() != nullptr)
+        {
+            node = cast->castExpression();
+            continue;
+        }
+        if (node->children.size() != 1) return {};
+        node = node->children[0];
+    }
+    return {};
+}
+
+// True when a live return resolves to a non-move pointer parameter. Resolve only a bare identifier
+// expression (with transparent parens/casts), then let visible locals shadow parameters.
+inline int ReturnedPointerParameterIndex(
+    CFlatParser::FunctionDefinitionContext* func,
+    CFlatParser::ExpressionContext* expr,
+    const std::vector<LLVMBackend::TypeAndValue>& allParams)
+{
+    if (func == nullptr || expr == nullptr) return -1;
+    const std::string name = DirectReturnIdentifier(expr);
+    if (name.empty()) return -1;
+    std::unordered_set<antlr4::tree::ParseTree*> enclosing;
+    for (antlr4::tree::ParseTree* p = expr; p != nullptr; p = p->parent)
+        enclosing.insert(p);
+    std::unordered_set<std::string> locals;
+    CollectVisibleLocals(func, enclosing, expr->getStart()->getTokenIndex(), locals);
+    if (locals.count(name) != 0) return -1;
+    for (size_t i = 0; i < allParams.size(); ++i)
+        if (allParams[i].VariableName == name && allParams[i].Pointer
+            && !allParams[i].IsMove && !allParams[i].IsAlias)
+            return static_cast<int>(i);
+    return -1;
+}
+
+inline bool ReturnsParameterBorrow(CFlatParser::FunctionDefinitionContext* func,
+                                   const std::vector<LLVMBackend::TypeAndValue>& allParams,
+                                   const IfConstEvaluator& evalIfConst = {})
+{
+    if (func == nullptr || func->compoundStatement() == nullptr) return false;
+    std::vector<CFlatParser::ExpressionContext*> returns;
+    CollectOwnReturnExpressions(func->compoundStatement(), returns, evalIfConst);
+    for (auto* expr : returns)
+        if (ReturnedPointerParameterIndex(func, expr, allParams) >= 0) return true;
+    return false;
+}
+
+inline int ReturnsSingleParameterIndex(
+    CFlatParser::FunctionDefinitionContext* func,
+    const std::vector<LLVMBackend::TypeAndValue>& allParams,
+    const IfConstEvaluator& evalIfConst = {})
+{
+    if (func == nullptr || func->compoundStatement() == nullptr) return -1;
+    std::vector<CFlatParser::ExpressionContext*> returns;
+    CollectOwnReturnExpressions(func->compoundStatement(), returns, evalIfConst);
+    if (returns.empty()) return -1;
+    const int index = ReturnedPointerParameterIndex(func, returns.front(), allParams);
+    if (index < 0) return -1;
+    for (size_t i = 1; i < returns.size(); ++i)
+        if (ReturnedPointerParameterIndex(func, returns[i], allParams) != index)
+            return -1;
+    return index;
+}
+
+// Set per-instance borrow summaries on the overload with this exact parameter list.
+inline void SetPointerBorrowReturnSummaries(
+    std::vector<LLVMBackend::FunctionSymbol>& overloads,
+    const std::vector<LLVMBackend::TypeAndValue>& allParams,
+    bool returnsGlobal, bool returnsParameter, int singleParameterIndex)
 {
     for (auto& sym : overloads)
         if (sym.ReturnType.Pointer && sym.Parameters.size() == allParams.size()
             && std::equal(allParams.begin(), allParams.end(), sym.Parameters.begin(),
                 [](const auto& a, const auto& b) { return a.TypeName == b.TypeName && a.Pointer == b.Pointer; }))
-            sym.ReturnsGlobalBorrow = true;
+        {
+            sym.ReturnsGlobalBorrow = returnsGlobal;
+            sym.ReturnsParameterBorrow = returnsParameter;
+            sym.ReturnsSingleParameterIndex = singleParameterIndex;
+        }
+}
+
+inline bool UniquePointerSourceIsOwned(const LLVMBackend::NamedVariable& source)
+{
+    return source.IsOwning || source.IsNewAllocated;
 }
 
 // Arrow-normalized form of a lock expression's source text: 'p->m' becomes 'p.m'. The mode
@@ -4935,11 +5078,6 @@ inline bool SubtreeContainsFunctionReturn(antlr4::tree::ParseTree* node, ReturnS
     return false;
 }
 
-
-// Tri-state evaluator for an `if const` condition under the CURRENT monomorphization:
-// returns 1 (branch taken / live), 0 (not taken / dead), or -1 (cannot decide at all).
-// Supplied by the main pass (where type substitutions are active); empty for the scanner.
-using IfConstEvaluator = std::function<int(CFlatParser::ExpressionContext*)>;
 
 inline bool TryGetKnownIfConstBranch(CFlatParser::SelectionStatementContext* sel,
                                      const IfConstEvaluator& evalIfConst,
@@ -5784,6 +5922,15 @@ private:
         return true;
     }
 
+    bool IsOutwardAssignmentTarget(CFlatParser::AssignmentExpressionContext* asn) const
+    {
+        auto* pfx = asn->unaryExpression() != nullptr ? asn->unaryExpression()->postfixExpression() : nullptr;
+        auto* primary = pfx != nullptr ? pfx->primaryExpression() : nullptr;
+        if (primary == nullptr || primary->genericIdentifier() == nullptr) return false;
+        const std::string name = primary->genericIdentifier()->Identifier()->getText();
+        return params_.count(name) == 0 && !NameShadowedByEnclosingLocal(asn, name);
+    }
+
     void RecordCall(antlr4::ParserRuleContext* use, bool bareName, const std::string& calleeName,
                     const std::string& member, const Value& receiver,
                     CFlatParser::ArgumentExpressionListContext* args, const void* site)
@@ -5980,6 +6127,8 @@ private:
                     }
                     else if (!target.Ok || (target.WholeLocal && !target.Borrow))
                         RecordEscape(source, 0, {}, {}, 0, 0, false, asn);
+                    if (source.Ok && IsOutwardAssignmentTarget(asn))
+                        facts_.OutwardViewStores.push_back({ source.P, source.AddressOf });
                 }
             }
         }
@@ -6371,6 +6520,16 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
         // walks the aggregate and saves its authoritative one.
         compiler->SaveAggregateAliasScope(typeName, /*provisional*/ true);
 
+        // Method signatures use nested member types before their full scans run below.
+        auto registerNestedShell = [&](auto* nested)
+        {
+            if (nested->genericTypeParameters() == nullptr)
+                compiler->CreateStructType(typeName + "."
+                    + nested->directDeclarator()->getText(), {});
+        };
+        for (auto* nestedStruct : MemberStructDefinitions(ctx)) registerNestedShell(nestedStruct);
+        for (auto* nestedClass : MemberClassDefinitions(ctx)) registerNestedShell(nestedClass);
+
         // Pre-declare member functions (and detect constructor overloads).
         // Ctor signatures seen so far in this body, keyed by mangled name -> declaring line.
         std::map<std::string, size_t> seenCtorSignatures;
@@ -6719,15 +6878,22 @@ private:
         bool ownSlot = false;
     };
     std::vector<DeferredMovedRead>* deferredMovedReads_ = nullptr;
-    // Owning rvalue receivers of operator-> forwarding (`mk()->v`) registered for end-of-statement
-    // destruction by the postfix chain in progress. ParsePostfixExpression drops them again when the
-    // chain's result borrows from them (pointer, alias), keeping the pre-existing no-free behaviour.
-    std::vector<llvm::Value*> arrowOwnedTemps_;
+    // Owning rvalue receivers of operator-> forwarding (`mk()->v`) registered for cleanup.
+    struct ArrowOwnedTemp
+    {
+        llvm::Value* Storage = nullptr;
+        CFlatParser::PostfixExpressionContext* PendingCallResult = nullptr;
+        size_t ArgumentIndex = SIZE_MAX;
+        bool NamedArgument = false;
+    };
+    std::vector<ArrowOwnedTemp> arrowOwnedTemps_;
     std::unordered_map<CFlatParser::FunctionDefinitionContext*,
         std::unordered_set<std::string>> functionLocalEnumNamesCache_;
 
     LLVMBackend* Compiler(antlr4::ParserRuleContext* ctx);
     inline LLVMBackend* Compiler() { return compilerLLVM; }
+    std::string BorrowedParameterCallName(
+        const LLVMBackend::NamedVariable& source, llvm::Value* value);
     const std::unordered_set<std::string>& FunctionLocalEnumNames(
         CFlatParser::FunctionDefinitionContext* function);
 
@@ -7283,6 +7449,7 @@ private:
     // Marks an expression position where a ternary owning temp may need per-arm cleanup
     // before its value is joined with a borrowed consumer.
     bool inCallArgument_ = false;
+    const CFlatParser::PostfixExpressionContext* directViewCallArgument_ = nullptr;
     bool inCxxCallArgument_ = false;
     LLVMBackend::TypeAndValue cxxCallArgumentExpectedType_;
     CFlatParser::AssignmentExpressionContext* cxxDirectConstructionArgument_ = nullptr;
@@ -8924,6 +9091,8 @@ public:
     // Falls back to value-only for complex expressions (ternary, binary ops, etc.).
     LLVMBackend::NamedVariable ParseAssignmentExpressionNamed(CFlatParser::AssignmentExpressionContext* ctx,
                                                               ResultUse use = ResultUse::Value);
+    LLVMBackend::NamedVariable ParseAssignmentExpressionNamedBody(CFlatParser::AssignmentExpressionContext* ctx,
+                                                                  ResultUse use);
 
     /*
      * Provable shape mismatch on a DIRECT class->interface upcast (decl-init, '=', return, and

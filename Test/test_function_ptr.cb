@@ -3164,9 +3164,10 @@ bool testFuncPtrArgProvenanceAccepts()
     {
         result &= Test("long/i64 crossing", spellCallI64(gl), 15);
     }
-    // Any two pointer types are one class under opaque pointers.
-    function<void(int*)> gp = takeVoidPtr;
-    result &= Test("int*/void* crossing", spellCallVoidPtr(gp), 15);
+    // Function types match exactly (T427): void* is not a wildcard pointee; the int* crossing
+    // is refused in Test/errors/err_function_type_pointee_mismatch.cb.
+    function<void(void*)> gp = takeVoidPtr;
+    result &= Test("void* exact", spellCallVoidPtr(gp), 15);
 
     // Component-wise equivalences. A `string`/`char*` pair compared shape-first false-rejects
     // (string has Pointer == false); an alias compared before resolution false-rejects; a struct
@@ -4303,6 +4304,8 @@ bool testThinFuncPtrGenericArg()
     function<int(int)>* e1 = l.get(1);
     result &= Test("tgp_list_0",     (*e0)(6), 12);
     result &= Test("tgp_list_1",     (*e1)(6), 36);
+    result &= Test("tgp_list_get_slot_deref", (*l.get(1))(6), 36);
+    result &= Test("tgp_list_get_slot_direct", l.get(1)(6), 36);
 
     return result;
 }
@@ -6847,6 +6850,41 @@ bool testT414MoveSourcesNull()
     return result;
 }
 
+int t427AcceptChar(char* p) { return 11; }
+int t427AcceptVoid(void* p) { return 22; }
+int t427AcceptConstChar(const char* p) { return p[0]; }
+int t427AcceptI32(i32* p) { return 33; }
+int t427SelectCallback(function<int(char*)> f) { return 101; }
+int t427SelectCallback(function<int(void*)> f) { return 202; }
+int t427SelectCharCallback(function<int(char*)> f) { return 303; }
+int t427SelectConstCallback(function<int((const char)*)> f) { return 404; }
+int t427SelectIntPointer(function<int(int*)> f) { return 505; }
+int t427InferCallback<T>(T f) { return f("A"); }
+
+bool testT427FunctionPointeeAcceptSet()
+{
+    bool result = true;
+    function<int(char*)> charCallback = t427AcceptChar;
+    function<int((const char)*)> constCallback = t427AcceptConstChar;
+    function<int(i32*)> i32Callback = t427AcceptI32;
+    result &= Test("t427 exact char callback overload", t427SelectCallback(charCallback), 101);
+    result &= Test("t427 exact named char callback overload", t427SelectCallback(t427AcceptChar), 101);
+    result &= Test("t427 exact address char callback overload", t427SelectCallback(&t427AcceptChar), 101);
+    result &= Test("t427 exact lambda callback overload", t427SelectCallback((char* p) => 7), 101);
+    result &= Test("t427 nullptr callback", t427SelectCharCallback(nullptr), 303);
+    result &= Test("t427 exact const callback", t427SelectConstCallback(constCallback), 404);
+    result &= Test("t427 int/i32 pointee alias", t427SelectIntPointer(i32Callback), 505);
+    result &= Test("t427 generic callback deduction", t427InferCallback(constCallback), 65);
+    result &= Test("t427 C callback with same signature", c14CallTake(t427AcceptConstChar, "A"), 66);
+    return result;
+}
+
+bool testT427VoidFunctionPointeeOverload()
+{
+    function<int(void*)> callback = t427AcceptVoid;
+    return Test("t427 exact void callback overload", t427SelectCallback(callback), 202) != 0;
+}
+
 extern int main(int argc, char** argv)
 {
     // The tooling regression harness passes one argument and calls this twice. The second call
@@ -7090,6 +7128,9 @@ extern int main(int argc, char** argv)
     total++; passed += testT411AliasIdentityControls() ? 1 : 0;
     total++; passed += testT411GenericAliasKeys() ? 1 : 0;
     total++; passed += testT411SpelledReturnAliasKeys() ? 1 : 0;
+    // T427: function-pointer values select an exact pointee signature, including overloads.
+    total++; passed += testT427FunctionPointeeAcceptSet() ? 1 : 0;
+    total++; passed += testT427VoidFunctionPointeeOverload() ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

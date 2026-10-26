@@ -1654,9 +1654,15 @@ void MainListener::PreDeclareInstantiationMembers(
                                    SinkIfConstEvaluator());
             bool declReturnsOwned = ComputeReturnsOwned(declReturnType, func, declAllParams);
             compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs, declReturnsOwned, !isStaticLike);
-            if (!declReturnType.external && declReturnType.Pointer && ReturnsOnlyModuleGlobals(func, declAllParams))
+            if (!declReturnType.external && declReturnType.Pointer)
                 if (auto it = compiler->functionTable.find(declName); it != compiler->functionTable.end())
-                    MarkReturnsGlobalBorrow(it->second, declAllParams);
+                {
+                    const auto returnIfConst = SinkIfConstEvaluator();
+                    SetPointerBorrowReturnSummaries(it->second, declAllParams,
+                        ReturnsOnlyModuleGlobals(func, declAllParams, returnIfConst),
+                        ReturnsParameterBorrow(func, declAllParams, returnIfConst),
+                        ReturnsSingleParameterIndex(func, declAllParams, returnIfConst));
+                }
         }
     }
 

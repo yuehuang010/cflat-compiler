@@ -409,9 +409,16 @@ s.num1 = 10;
 int t = s.Total();   // 12
 ```
 
+Struct members are destroyed in reverse declaration order (as in C++), after the user destructor body if
+there is one; elements of a fixed-array member are destroyed in reverse index order.
+
 Every constructor runs the field-initialization phase first. `MyStruct()` then runs the user
 no-argument body, while `MyStruct(args)` runs only its own body; it does not delegate to the
 user no-argument constructor. Use a direct `MyStruct()` call when that body is wanted.
+
+Every struct is default-constructible from its field initializers. A declared constructor with
+arguments is an additional initializer and never removes default construction (unlike C++), so
+`T x;`, `T x = { f = 1 };` and an array `T[3] a;` compile and skip every constructor body.
 
 ### Unions
 

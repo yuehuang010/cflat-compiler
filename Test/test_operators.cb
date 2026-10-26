@@ -42,6 +42,35 @@ struct Callable
     int operator()(float value) { return (int)value + 100; }
 };
 
+T t484ShadowCall<T>(T value) { return value + 100; }
+int t484ShadowTarget(int value) { return value + 10; }
+int t484Box(int value) { return value + 100; }
+int t484BoxTarget(int value) { return value + 50; }
+struct T484BoxHolder { function<int(int)> work = t484BoxTarget; };
+
+int t484CallableVariableLegs()
+{
+    int passed = 0;
+    {
+        function<int(int)> t484ShadowCall = t484ShadowTarget;
+        passed += Test("T484 callable function variable shadows generic",
+            t484ShadowCall(3), 13);
+    }
+    {
+        Callable t484ShadowCall = default;
+        passed += Test("T484 callable operator() variable shadows generic",
+            t484ShadowCall(4), 14);
+    }
+    return passed;
+}
+
+int t484MemberFieldCallLegs()
+{
+    T484BoxHolder t484Box = default;
+    return Test("T484 member field call with same-named function",
+        t484Box.work(3), 53);
+}
+
 using CallableAlias = Callable;
 
 struct CallableHolder
@@ -1134,6 +1163,8 @@ extern int main()
     if (byValueAliasOperatorLegs() != 11) return 61;
     if (cppUnwindThroughHelperLegs() != 0) return 60;
 
+    if (t484CallableVariableLegs() != 2) return 63;
+    if (t484MemberFieldCallLegs() != 1) return 64;
     return (callPassed == 12 && terPassed == 23 && ptrOpPassed == 8 && uPassed == 3
         && unsignedLiteralPassed == 8 && unsignedAcceptPassed == 7
         && chainPassed == 11 && softPassed == 1 && promoPassed == 11

@@ -1307,33 +1307,80 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         bool cflatReturnBraceConstructed = false;
         if (braceInitializer != nullptr)
         {
-            if (!compiler->IsImmovableCFlatStruct(compiler->currentFunctionReturnTypeName)
-                || !cxxSretReturn || cxxSretDest == nullptr)
+            const std::string& typeName = compiler->currentFunctionReturnTypeName;
+            const std::string resolvedTypeName = compiler->ResolveTypeAlias(typeName);
+            const auto returnData = compiler->GetDataStructure(resolvedTypeName);
+            const bool cflatRecordReturn = !compiler->currentFunctionReturnTV.Pointer
+                && !compiler->currentFunctionReturnTV.ElemPointer
+                && !compiler->currentFunctionReturnTV.IsAlias
+                && !compiler->currentFunctionReturnTV.IsArrayView
+                && returnData.StructType != nullptr && !returnData.IsUnion
+                && !compiler->IsCxxRecord(resolvedTypeName)
+                && !compiler->IsForeignNontrivialCxxClass(resolvedTypeName);
+            if (!cflatRecordReturn || (cxxSretReturn && cxxSretDest == nullptr))
             {
                 LogErrorContext(errCtx,
-                    "a return brace initializer requires an immovable CFlat struct return");
+                    "a return brace initializer requires a CFlat struct return");
                 return;
             }
-            const std::string& typeName = compiler->currentFunctionReturnTypeName;
-            auto* fieldList = braceInitializer->initializerList();
-            if (!EmitFreshBraceInitializeAggregate(cxxSretDest, typeName, fieldList, true))
+            llvm::Type* returnType = compiler->GetType(compiler->currentFunctionReturnTV);
+            llvm::Value* returnDest = cxxSretDest;
+            if (!cxxSretReturn)
             {
-                llvm::Value* defaultResult = EmitStructDefaultInto(cxxSretDest, typeName);
-                if (defaultResult != nullptr)
+                if (returnType == nullptr || !returnType->isStructTy())
                 {
-                    LogErrorContext(errCtx, std::format(
-                        "cannot construct immovable return type '{}' directly in its return slot",
-                        SpellDiagnosticType(*compiler, compiler->currentFunctionReturnTV)));
+                    LogErrorContext(errCtx,
+                        "a return brace initializer requires a CFlat struct return");
                     return;
                 }
-                if (fieldList != nullptr && !fieldList->fieldInit().empty())
-                    EmitFieldInitializer(cxxSretDest, typeName, fieldList, false);
+                returnDest = compiler->AllocaAtEntry(returnType, nullptr, "return.brace");
+                compiler->builder->CreateStore(llvm::Constant::getNullValue(returnType), returnDest);
             }
-            cflatReturnBraceConstructed = true;
+            auto* fieldList = braceInitializer->initializerList();
+            // Movable structs follow the declaration path (source-order field evaluation).
+            const bool forceFresh = cxxSretReturn || compiler->IsImmovableCFlatStruct(resolvedTypeName);
+            if (!EmitFreshBraceInitializeAggregate(returnDest, resolvedTypeName, fieldList, forceFresh))
+            {
+                llvm::Value* defaultResult = EmitStructDefaultInto(returnDest, resolvedTypeName);
+                if (defaultResult != nullptr)
+                {
+                    if (compiler->IsImmovableCFlatStruct(resolvedTypeName))
+                    {
+                        LogErrorContext(errCtx, std::format(
+                            "cannot construct immovable return type '{}' directly in its return slot",
+                            SpellDiagnosticType(*compiler, compiler->currentFunctionReturnTV)));
+                        return;
+                    }
+                    compiler->builder->CreateStore(defaultResult, returnDest);
+                }
+                LLVMBackend::TypeAndValue resolvedReturnTV = compiler->currentFunctionReturnTV;
+                resolvedReturnTV.TypeName = resolvedTypeName;
+                resolvedReturnTV.VariableName.clear();
+                if (!TryEmitContainerInitializer(returnDest, resolvedReturnTV, fieldList)
+                    && fieldList != nullptr && !fieldList->fieldInit().empty())
+                    EmitFieldInitializer(returnDest, resolvedTypeName, fieldList, false);
+            }
+            if (cxxSretReturn)
+                cflatReturnBraceConstructed = true;
+            else
+            {
+                returnNV.TypeAndValue = compiler->currentFunctionReturnTV;
+                returnNV.BaseType = returnType;
+                returnNV.Primary = compiler->builder->CreateLoad(
+                    returnType, returnDest, "return.brace.value");
+                returnNV.IsRvalue = true;
+                returnNV.IsOwning = compiler->IsOwningValueType(resolvedTypeName);
+                if (returnNV.IsOwning) compiler->lastOwningResult = true;
+            }
         }
         const bool cxxReturnTernary = cxxSretReturn && assignExpr != nullptr
             && SoleTernaryExpression(assignExpr) != nullptr;
-        if (cxxSretReturn && assignExpr != nullptr && !cxxReturnTernary)
+        const bool loweredCflatReturn = cxxSretReturn
+            && !compiler->IsForeignNontrivialCxxReturnClass(compiler->currentFunctionReturnTypeName);
+        const bool explicitLoweredReturnMove = loweredCflatReturn && assignExpr != nullptr
+            && !cxxReturnTernary && TopLevelMoveExpression(assignExpr) != nullptr;
+        if (cxxSretReturn && assignExpr != nullptr && !cxxReturnTernary
+            && !explicitLoweredReturnMove)
         {
             compiler->pendingCxxSretDest_ = cxxSretDest;
             compiler->pendingCxxSretTypeName_ = compiler->currentFunctionReturnTypeName;
@@ -1341,8 +1388,6 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         }
         // A classified CFlat struct is not a C++ class: its ternary arms share one sret slot,
         // retargeted to the return slot after the parse (below).
-        const bool loweredCflatReturn = cxxSretReturn
-            && !compiler->IsForeignNontrivialCxxReturnClass(compiler->currentFunctionReturnTypeName);
         if (cxxReturnTernary && (!loweredCflatReturn
                 || compiler->IsImmovableCFlatStruct(compiler->currentFunctionReturnTypeName)))
         {
@@ -1591,7 +1636,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             }
         }
         const bool cxxReturnCallConstructed = cxxSretReturn && !defaultValue && !cxxReturnTernary
-            && compiler->pendingCxxSretDest_ == nullptr;
+            && !explicitLoweredReturnMove && compiler->pendingCxxSretDest_ == nullptr;
         const bool cxxReturnTernaryConstructed = cxxReturnTernary
             && compiler->pendingCxxTernaryDeclConsumed_;
         const bool cxxReturnTernaryFailed = cxxReturnTernary
@@ -1633,7 +1678,10 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             // The operand IS a classified call result (a ternary of calls shares one slot):
             // the calls build straight into the return slot instead.
             // A parenthesized operand names the join temp as its storage: the same retarget as the bare form.
-            if (!defaultValue && returnNV.Primary != nullptr
+            if (!defaultValue && !explicitLoweredReturnMove
+                && ((!returnNV.IsExplicitMove && !returnNV.TypeAndValue.IsMove)
+                    || (loweredCflatReturn && cxxReturnTernary))
+                && returnNV.Primary != nullptr
                 && (returnNV.Storage == nullptr || returnNV.Storage == compiler->lastLoweredRetTemp_)
                 && returnNV.Primary == compiler->lastLoweredRetValue_)
                 if (auto* temp = llvm::dyn_cast_or_null<llvm::AllocaInst>(
@@ -1664,6 +1712,25 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     return;
                 }
             }
+
+            if (explicitLoweredReturnMove && returnNV.Primary != nullptr
+                && !returnNV.TypeAndValue.Pointer
+                && returnNV.TypeAndValue.TypeName == returnTypeName)
+                if (auto* sourceSlot = compiler->LoweredSretTempOf(returnNV.Primary,
+                        compiler->GetDataStructure(returnTypeName).StructType))
+                {
+                    auto sourceNV = returnNV;
+                    sourceNV.Storage = sourceSlot;
+                    sourceNV.TypeAndValue.IsMove = true;
+                    sourceNV.IsExplicitMove = true;
+                    sourceNV.IsRvalue = true;
+                    if (EmitLoweredValueIntoSlot(compiler, returnTypeName, cxxSretDest,
+                            sourceNV, returnNV.Primary, errCtx, "into the return slot"))
+                    {
+                        finishLoweredReturn();
+                        return;
+                    }
+                }
 
             // A local or by-value parameter owns addressable storage. Parameters are moved too:
             // the callee then destroys the moved-from parameter after filling the return slot.
@@ -1754,7 +1821,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             // `return move x;`: the move zeroed x after loading it. Put the bytes back, move the
             // C++ fields into the return slot, and leave x a live moved-from object for its owner.
             if (!defaultValue && !namedLocal && structType != nullptr
-                && returnNV.Storage == nullptr && returnNV.IsExplicitMove
+                && !cxxReturnTernary && returnNV.Storage == nullptr && returnNV.IsExplicitMove
                 && !returnNV.TypeAndValue.Pointer
                 && returnNV.TypeAndValue.TypeName == returnTypeName)
                 if (auto* loaded = llvm::dyn_cast_or_null<llvm::LoadInst>(returnNV.Primary))

@@ -1,5 +1,7 @@
 # Named brace initialization move tracking and partial unwind (T470)
 
+**RULED 2026-10-24 (main session; maintainer may veto):** item 1 - keep the conservative behaviour: `T x = move *p;` consumes the pointee and a later read through `p` is refused (safe; clang keeps `p` usable but CFlat has no valid moved-from state for a relocated value). Only the diagnostic text changes: "pointee of 'p' was moved" instead of "dereference of moved variable 'p'" (p itself is not moved).
+
 ## Item 1: raw pointer pointee move
 
 Master accepts `T x = move *p;` and `{ h = move *p }` when there is no later read. Both forms reject a later

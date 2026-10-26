@@ -4609,6 +4609,153 @@ bool testNullConditionalArgOrder()
 // Nested struct / class tests
 // =============================================================
 
+import "array.cb";
+
+namespace T481 {
+    struct Mid { int value = 4; int get() { return value * 11; } };
+    struct S {
+        struct Mid { int value = 16; int extra = 32; int get() { return value * 11; } };
+        Mid field = default;
+        Mid make() { Mid value = default; return value; }
+        static Mid makeStatic() { Mid value = default; return value; }
+        int take(Mid value) { return value.get(); }
+        int a() { return field.get(); }
+        int b() { return make().get(); }
+        int c() { Mid value = default; return take(value); }
+        int d() { auto value = new Mid(); int result = value->get(); delete value; return result; }
+        int mask() {
+            int result = 0;
+            if (a() == 176) result += 1;
+            if (b() == 176) result += 2;
+            if (c() == 176) result += 4;
+            if (d() == 176) result += 8;
+            return result;
+        }
+        int newPick() { auto value = new Mid(); int result = t481Pick(value); delete value; return result; }
+        int arrayNewPick() { auto values = new Mid[3]; return t481ArrayPick(values); }
+        int castPick() { return t481Pick((Mid*)nullptr); }
+        int sizeofMid() { return (int)sizeof(Mid); }
+        int genericPick() { array<Mid> values = default; return t481ArrayPick(values); }
+        int pointerParam(Mid* value) { return t481Pick(value); }
+        int callPointerParam() { Mid value = default; return pointerParam(&value); }
+        int nullableParam(Mid? value) { return t481Pick(value); }
+        int callNullableParam() { Mid value = default; return nullableParam(&value); }
+        static int staticValue() { Mid value = default; return value.get(); }
+    };
+
+    int t481Pick(Mid* value) { return 1; }
+    int t481Pick(S.Mid* value) { return 2; }
+    int t481ArrayPick(array<Mid> value) { return 1; }
+    int t481ArrayPick(array<S.Mid> value) { return 2; }
+
+    struct G<T> {
+        struct Mid { int value = 16; int extra = 32; int get() { return value * 11; } };
+        Mid make() { Mid value = default; return value; }
+        static Mid makeStatic() { Mid value = default; return value; }
+        int methodValue() { return make().get(); }
+        static int staticValue() { Mid value = default; return value.get(); }
+    };
+
+    int callStaticReturn() { return S.makeStatic().get(); }
+    int callStaticValue() { return S.staticValue(); }
+    int callGenericStaticReturn() { return G<int>.makeStatic().get(); }
+    int callGenericStaticValue() { return G<int>.staticValue(); }
+
+    struct WithoutNested { Mid make() { Mid value = default; return value; } int read() { return make().get(); } };
+    Mid outside() { Mid value = default; return value; }
+}
+
+bool testT481NestedTypeLookup()
+{
+    bool result = true;
+    T481.S value = default;
+    result &= Test("T481 nested return mask", value.mask(), 15);
+    result &= Test("T481 new Mid overload", value.newPick(), 2);
+    result &= Test("T481 new Mid[3] overload", value.arrayNewPick(), 2);
+    result &= Test("T481 cast Mid* overload", value.castPick(), 2);
+    result &= Test("T481 sizeof Mid", value.sizeofMid(), 8);
+    result &= Test("T481 array<Mid> overload", value.genericPick(), 2);
+    result &= Test("T481 Mid* parameter", value.callPointerParam(), 2);
+    result &= Test("T481 Mid? parameter", value.callNullableParam(), 2);
+    result &= Test("T481 static return type", T481.callStaticReturn(), 176);
+    result &= Test("T481 static method body", T481.callStaticValue(), 176);
+
+    T481.G<int> generic = default;
+    result &= Test("T481 generic struct method", generic.methodValue(), 176);
+    result &= Test("T481 generic static return", T481.callGenericStaticReturn(), 176);
+    result &= Test("T481 generic static body", T481.callGenericStaticValue(), 176);
+
+    T481.WithoutNested without = default;
+    result &= Test("T481 no nested type falls back", without.read(), 44);
+    result &= Test("T481 outside struct falls back", T481.outside().get(), 44);
+    return result;
+}
+
+namespace T481R2Q {
+    struct Mid { int value = 1; };
+    struct P {
+        struct Mid { int value = 2; };
+        struct G<T> {
+            T item = default;
+            int read() { auto value = new Mid(); int result = value->value; delete value; return result; }
+        };
+    };
+    struct S { int read() { P.G<int> value = default; return value.read(); } };
+}
+
+namespace T481R2R {
+    struct Mid { int value = 1; };
+    struct P {
+        struct Mid { int value = 2; int extra = 0; };
+        struct G<T> {
+            T item = default;
+            array<Mid> readArray() { array<Mid> values = new Mid[1]; return values; }
+            Mid make() { Mid value = default; return value; }
+            int read() { array<Mid> values = readArray(); return values[0].value * 10 + make().value; }
+        };
+    };
+    struct S {
+        struct Mid { int value = 3; int extra = 0; int other = 0; };
+        int read() { P.G<int> value = default; return value.read(); }
+    };
+}
+
+bool testT481NestedGenericFromCaller()
+{
+    bool result = true;
+    T481R2Q.S q = default;
+    T481R2R.S r = default;
+    result &= Test("T481 round 2 generic new uses lexical Mid", q.read(), 2);
+    result &= Test("T481 round 2 generic array and return use lexical Mid", r.read(), 22);
+    return result;
+}
+
+namespace T481R3A {
+    struct Mid { int value = 1; };
+    struct P {
+        struct Mid { int value = 2; int extra = 0; };
+        struct G<T> {
+            T item = default;
+            int read() { auto value = new Mid(); int result = value->value; delete value; return result; }
+        };
+    };
+}
+
+namespace T481R3B {
+    struct P {
+        struct Mid { int value = 3; int extra = 0; int more = 0; };
+        int read() { T481R3A.P.G<int> value = default; return value.read(); }
+    };
+}
+
+bool testT481NestedTypeLeafCollision()
+{
+    bool result = true;
+    T481R3B.P value = default;
+    result &= Test("T481 nested type owner leaf collision", value.read(), 2);
+    return result;
+}
+
 struct OuterStruct {
     struct InnerStruct {
         int x = 0;
@@ -4852,6 +4999,26 @@ bool testPointerTypeAlias()
 }
 
 int pointerPositiveFn(int x) { return x + 1; }
+
+struct T478Arg { int z = default; int y = default; };
+struct T478Big { int a = default; int b = default; int c = default; int d = default; int e = default; };
+int t478ApplySmall(T478Arg a, int k) { return a.z * 10 + k; }
+int t478ApplyBig(T478Big a, int k) { return a.a * 10 + a.e + k; }
+int t478Scalar(int x, int k) { return x + k; }
+T478Arg t478MakeSmall(int z) { T478Arg a; a.z = z; a.y = 2; return a; }
+T478Big t478MakeBig(int a) { T478Big b; b.a = a; b.e = 5; return b; }
+int t478GlobalAddEleven(int x) { return x + 11; }
+function<int(int)> t478GlobalFunction = t478GlobalAddEleven;
+function<int(int)>* t478GlobalSlot = nullptr;
+function<int(int)>* t478GetFp() { return &t478GlobalFunction; }
+int t478RunGlobalSlot() { t478GlobalSlot = &t478GlobalFunction; return (*t478GlobalSlot)(6); }
+int t478OwnerDtorCount = 0;
+struct T478Resource { int id = default; ~T478Resource() { t478OwnerDtorCount++; } };
+struct T478Owner { unique T478Resource* item = nullptr; };
+T478Resource* t478MakeResource() { T478Resource* r = new T478Resource(); r->id = 7; return r; }
+int t478ReadOwner(T478Owner owner) { return owner.item->id; }
+int t478PointerOwnerBrace() { function<int(T478Owner)> fp = t478ReadOwner; return (*fp)({ item = t478MakeResource() }); }
+int t478FunctionOwnerBrace() { function<int(T478Owner)> fn = t478ReadOwner; return fn({ item = t478MakeResource() }); }
 int* pointerNullReturnZero() { return 0; }
 int pointerNullArg(int* p) { return p == nullptr ? 1 : 0; }
 
@@ -5043,6 +5210,57 @@ bool testPointerScalarAcceptSet()
 
     function<int(int)> fn = pointerPositiveFn;
     result &= Test("ptr_scalar_function_pointer", fn(4), 5);
+    function<int(int)> t478AddressValue = &pointerPositiveFn;
+    result &= Test("t478_address_is_function_value", t478AddressValue(4), 5);
+    function<int(int)> t478SlotValue = pointerPositiveFn;
+    function<int(int)>* t478SlotFp = &t478SlotValue;
+    result &= Test("t478_slot_deref_accept", (*t478SlotFp)(4), 5);
+    result &= Test("t478_get_fp_slot", (*t478GetFp())(6), 17);
+    result &= Test("t478_global_slot_reassigned", t478RunGlobalSlot(), 17);
+
+    // T478: thin function pointers use brace-built aggregate args and function designator dereference.
+    T478Arg t478Arg = { z = 1 };
+    function<int(T478Arg,int)> t478Fp = t478ApplySmall;
+    result &= Test("t478_direct_small", t478ApplySmall(t478Arg, 2), 12);
+    result &= Test("t478_pointer_named", t478Fp(t478Arg, 2), 12);
+    result &= Test("t478_pointer_deref_named", (*t478Fp)(t478Arg, 2), 12);
+    result &= Test("t478_pointer_brace", t478Fp({ z = 1 }, 2), 12);
+    result &= Test("t478_pointer_deref_brace", (*t478Fp)({ z = 1 }, 2), 12);
+    function<int(T478Arg,int)> t478Fn = t478ApplySmall;
+    result &= Test("t478_function_named", t478Fn(t478Arg, 2), 12);
+    result &= Test("t478_function_brace", t478Fn({ z = 1 }, 2), 12);
+    function<int(T478Arg,int)> t478SlotArgFn = t478ApplySmall;
+    function<int(T478Arg,int)>* t478SlotArg = &t478SlotArgFn;
+    result &= Test("t478_slot_pointer_brace_deref", (*t478SlotArg)({ z = 1 }, 2), 12);
+    result &= Test("t478_slot_pointer_named_deref", (*t478SlotArg)(t478Arg, 2), 12);
+    result &= Test("t478_slot_pointer_direct_named", t478SlotArg(t478Arg, 2), 12);
+    t478OwnerDtorCount = 0;
+    result &= Test("t478_pointer_owned_brace_value", t478PointerOwnerBrace(), 7);
+    result &= Test("t478_pointer_owned_brace_dtor", t478OwnerDtorCount, 1);
+    t478OwnerDtorCount = 0;
+    result &= Test("t478_function_owned_brace_value", t478FunctionOwnerBrace(), 7);
+    result &= Test("t478_function_owned_brace_dtor", t478OwnerDtorCount, 1);
+
+    function<int(int,int)> t478ScalarFp = t478Scalar;
+    result &= Test("t478_scalar_deref", (*t478ScalarFp)(10, 2), 12);
+    result &= Test("t478_scalar_direct", t478ScalarFp(10, 2), 12);
+
+    T478Big t478Big = { a = 1, e = 5 };
+    function<int(T478Big,int)> t478BigFp = t478ApplyBig;
+    result &= Test("t478_big_pointer_direct", t478BigFp(t478Big, 2), 17);
+    result &= Test("t478_big_pointer_deref", (*t478BigFp)(t478Big, 2), 17);
+    result &= Test("t478_big_pointer_brace", (*t478BigFp)({ a = 1, e = 5 }, 2), 17);
+
+    function<T478Arg(int)> t478ReturnFp = t478MakeSmall;
+    T478Arg t478Return = t478ReturnFp(1);
+    T478Arg t478ReturnDeref = (*t478ReturnFp)(1);
+    result &= Test("t478_small_struct_return", t478Return.z * 10 + t478Return.y, 12);
+    result &= Test("t478_small_struct_return_deref", t478ReturnDeref.z * 10 + t478ReturnDeref.y, 12);
+    function<T478Big(int)> t478BigReturnFp = t478MakeBig;
+    T478Big t478BigReturn = t478BigReturnFp(1);
+    T478Big t478BigReturnDeref = (*t478BigReturnFp)(1);
+    result &= Test("t478_big_struct_return", t478BigReturn.a * 10 + t478BigReturn.e, 15);
+    result &= Test("t478_big_struct_return_deref", t478BigReturnDeref.a * 10 + t478BigReturnDeref.e, 15);
 
     function<int(int)> t126Fn = (int n) => { return n * 2; };
     result &= Test("t126_function_deref_call", (*t126Fn)(2), 4);
@@ -6064,6 +6282,9 @@ extern int main()
     total++; passed += testPointerScalarAcceptSet()      ? 1 : 0;
     total++; passed += testArrayTypeAlias()              ? 1 : 0;
     total++; passed += testNestedStructClass()           ? 1 : 0;
+    total++; passed += testT481NestedTypeLookup()        ? 1 : 0;
+    total++; passed += testT481NestedGenericFromCaller()  ? 1 : 0;
+    total++; passed += testT481NestedTypeLeafCollision()  ? 1 : 0;
     total++; passed += testInPlaceDtor()                 ? 1 : 0;
     total++; passed += testVariadic()                    ? 1 : 0;
     total++; passed += testFixedArrays()                 ? 1 : 0;
@@ -9294,6 +9515,23 @@ int t471BareCollision(T471BareCall* value) { return value->value + 20; }
 int t471BareStatic(int n) { return n + 20; }
 int t471BareStaticLambda(function<int(int)> fn) { return fn(2) + 20; }
 
+int gv = 5;
+namespace T484GlobalGvNS { int gv(int value) { return value + 1; } int call() { return gv(3); } };
+int t484GenericRoot = 5;
+namespace T484GenericGvNS { T t484GenericRoot<T>(T value) { return value + 1; } int call() { return t484GenericRoot(3); } };
+struct T484GvMember { int gv(int value) { return value + 1; } int call() { return gv(3); } };
+
+T t484GenericNoShadow<T>(T value) { return value + 10; }
+int t484PlainNoShadow(int value) { return value + 20; }
+namespace T484CallNS { int id(int value) { return value + 30; } };
+struct T484MethodReceiver { int id(int value) { return value + 40; } };
+struct T484MemberFirst
+{
+    int t484MemberFirst(T484MemberFirst* self, int value) { return value + 10; }
+    int call() { return t484MemberFirst(this, 5); }
+};
+int t484MemberFirst(T484MemberFirst* self, int value) { return value + 20; }
+
 T t471BareGenericGid<T>(T value) { return value + 1; }
 struct T471BareGenericCallback
 {
@@ -9322,6 +9560,18 @@ struct T471BareGenericStatic<T>
 bool testT471BareCalls()
 {
     bool result = true;
+    result &= Test("t484 generic no shadow", t484GenericNoShadow(3), 13);
+    result &= Test("t484 non-generic no shadow", t484PlainNoShadow(3), 23);
+    result &= Test("t484 qualified call with root name", T484CallNS.id(3), 33);
+    T484GvMember gvMember = default;
+    result &= Test("t484 root var vs namespace and member functions",
+        T484GlobalGvNS.call() * 10 + gvMember.call(), 44);
+    result &= Test("t484 root var vs generic namespace function", T484GenericGvNS.call(), 4);
+    T484MethodReceiver t484Receiver = default;
+    int id = 5;
+    result &= Test("t484 explicit method with local name", t484Receiver.id(3), 43);
+    T484MemberFirst t484MemberFirstValue = default;
+    result &= Test("t484 T471 member before free", t484MemberFirstValue.call(), 15);
     T471BareCall value = default;
     result &= Test("t471_bare_free_after", value.callFree(), 15);
     result &= Test("t471_bare_const_free_after", value.callConstFree(), 25);

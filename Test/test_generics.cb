@@ -6276,12 +6276,12 @@ bool testGenericLaterRecords()
     t368DeferredDtorEvents = 0;
     t368DeferredDtorCount = 0;
     { T368DtorBodyLater<int> local; }
-    result &= Test("t368_deferred_destructor_member_order", t368DeferredDtorEvents, 124678);
+    result &= Test("t368_deferred_destructor_member_order", t368DeferredDtorEvents, 124687);
     result &= Test("t368_deferred_destructor_count", t368DeferredDtorCount, 3);
     t368LifecycleEvents = 0;
     t368LifecycleDtorCount = 0;
     { T368LifecycleControl<int> local; }
-    result &= Test("t368_non_deferred_lifecycle_order", t368LifecycleEvents, 12364678);
+    result &= Test("t368_non_deferred_lifecycle_order", t368LifecycleEvents, 12364687);
     result &= Test("t368_non_deferred_lifecycle_dtor_count", t368LifecycleDtorCount, 4);
     return result;
 }

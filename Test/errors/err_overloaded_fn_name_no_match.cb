@@ -12,7 +12,7 @@ extern int main()
     expect_error("no overload of 'n65NoMatch' matches function type 'void(double)'") {
         n65TakeDouble(n65NoMatch);
     }
-    expect_error("ambiguous overload of 'n65Ambiguous' matches function type 'void(void*)'") {
+    expect_error("no overload of 'n65Ambiguous' matches function type 'void(void*)'") {
         n65TakeVoidPointer(n65Ambiguous);
     }
     expect_error("reference to overloaded function could not be resolved") {

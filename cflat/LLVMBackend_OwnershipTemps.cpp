@@ -1406,11 +1406,24 @@ void LLVMBackend::RestoreOwnFlagJoinState(const OwnFlagJoinSnapshot& state)
         }
         llvm::Function* activeFunction = builder != nullptr && builder->GetInsertBlock() != nullptr
             ? builder->GetInsertBlock()->getParent() : nullptr;
+        std::vector<NonLocalViewOwnershipState> branchCreatedViews;
+        for (const auto& current : nonLocalViewOwnershipStates_)
+        {
+            if (current.Function != activeFunction) continue;
+            const bool presentInSnapshot = std::ranges::any_of(state.nonLocalViews,
+                [&](const auto& saved) {
+                    return saved.Function == current.Function
+                        && SameNonLocalViewStorage(saved.Storage, current.Storage);
+                });
+            if (!presentInSnapshot) branchCreatedViews.push_back(current);
+        }
         std::erase_if(nonLocalViewOwnershipStates_,
             [&](const auto& current) { return current.Function == activeFunction; });
         for (const auto& viewState : state.nonLocalViews)
             if (viewState.Function == activeFunction)
                 nonLocalViewOwnershipStates_.push_back(viewState);
+        nonLocalViewOwnershipStates_.insert(nonLocalViewOwnershipStates_.end(),
+            branchCreatedViews.begin(), branchCreatedViews.end());
         ownFlagDefinitelyReowned_ = state.definitelyReowned;
         loopIterationAssigned_ = state.loopIterationAssigned;
 }
@@ -1434,10 +1447,13 @@ LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::MergeOwnFlagJoinStates(
                     && SameNonLocalViewStorage(candidate.Storage, state.Storage);
             });
             if (other != second.nonLocalViews.end())
-                merged.nonLocalViews.push_back({ state.Storage, state.Function,
-                    state.MayBeBorrowed || other->MayBeBorrowed,
-                    state.PathKey.empty() ? other->PathKey : state.PathKey });
-            else if (state.MayBeBorrowed)
+            {
+                auto mergedState = state;
+                mergedState.MayBeBorrowed = state.MayBeBorrowed || other->MayBeBorrowed;
+                if (mergedState.PathKey.empty()) mergedState.PathKey = other->PathKey;
+                merged.nonLocalViews.push_back(std::move(mergedState));
+            }
+            else
                 merged.nonLocalViews.push_back(state);
         }
         for (const auto& state : second.nonLocalViews)
@@ -1447,7 +1463,7 @@ LLVMBackend::OwnFlagJoinSnapshot LLVMBackend::MergeOwnFlagJoinStates(
                     return candidate.Function == state.Function
                         && SameNonLocalViewStorage(candidate.Storage, state.Storage);
                 });
-            if (!presentInFirst && state.MayBeBorrowed)
+            if (!presentInFirst)
                 merged.nonLocalViews.push_back(state);
         }
 
@@ -1827,6 +1843,71 @@ bool LLVMBackend::IsOwnedAtScopeExit(const NamedVariable& nv) const
         return nv.BorrowSuppressedOwner && nv.OwnFlagActive && nv.OwnFlag != nullptr;
     }
 
+void LLVMBackend::MarkNonLocalViewFieldMoved(const llvm::Value* rootStorage,
+                                              const std::string& fieldPath)
+{
+        if (rootStorage == nullptr || fieldPath.empty()) return;
+        for (auto& state : nonLocalViewOwnershipStates_)
+        {
+            if (state.RootStorage != rootStorage || state.FieldMovePath != fieldPath
+                || state.OwnFlag == nullptr || !IsInsertBlockLive()
+                || state.Function != builder->GetInsertBlock()->getParent()) continue;
+            builder->CreateStore(builder->getInt1(false), state.OwnFlag);
+            if (state.RawArrayLengthStorage != nullptr)
+                builder->CreateStore(builder->getInt64(-1), state.RawArrayLengthStorage);
+        }
+}
+
+void LLVMBackend::DropNonLocalViewFields(const NamedVariable& root)
+{
+        if (root.Storage == nullptr || builder == nullptr || !IsInsertBlockLive()) return;
+        auto* function = builder->GetInsertBlock()->getParent();
+        for (auto it = nonLocalViewOwnershipStates_.rbegin();
+             it != nonLocalViewOwnershipStates_.rend(); ++it)
+        {
+            if (it->RootStorage != root.Storage || it->Function != function
+                || it->OwnFlag == nullptr || it->BaseType == nullptr
+                || !it->BaseType->isPointerTy()) continue;
+            auto* fieldStorage = RecomputeNonLocalViewFieldStorage(*it);
+            if (fieldStorage == nullptr) continue;
+            NamedVariable field;
+            field.Storage = fieldStorage;
+            field.BaseType = it->BaseType;
+            field.TypeAndValue = it->FieldType;
+            field.TypeAndValue.Pointer = true;
+            field.IsOwning = true;
+            field.OwnFlag = it->OwnFlag;
+            field.OwnFlagActive = true;
+            field.RawArrayLengthStorage = it->RawArrayLengthStorage;
+            field.RefCountStorage = it->RefCountStorage;
+            field.AllocAlignment = it->AllocAlignment;
+            if (field.RefCountStorage == nullptr)
+                // The aggregate's field owns its backing block, not the view's element lifetime.
+                EmitOwningPtrCleanup(field, nullptr, nullptr,
+                    !CxxClassUsesCxxAllocator(field.TypeAndValue.TypeName));
+            else
+            {
+                auto* releaseBlock = llvm::BasicBlock::Create(
+                    *context, "view.ref.release", function);
+                auto* afterBlock = llvm::BasicBlock::Create(
+                    *context, "view.ref.after", function);
+                auto* owns = builder->CreateLoad(builder->getInt1Ty(), field.OwnFlag);
+                builder->CreateCondBr(owns, releaseBlock, afterBlock);
+                builder->SetInsertPoint(releaseBlock);
+                auto* current = builder->CreateLoad(builder->getInt32Ty(), field.RefCountStorage);
+                auto* remaining = builder->CreateSub(current, builder->getInt32(1), "view.refdec");
+                builder->CreateStore(remaining, field.RefCountStorage);
+                EmitConditionalOwningPtrCleanup(field, remaining);
+                builder->CreateBr(afterBlock);
+                builder->SetInsertPoint(afterBlock);
+            }
+            builder->CreateStore(llvm::ConstantPointerNull::get(
+                llvm::cast<llvm::PointerType>(field.BaseType)), field.Storage);
+            builder->CreateStore(builder->getInt1(false), field.OwnFlag);
+            builder->CreateStore(builder->getInt64(-1), field.RawArrayLengthStorage);
+        }
+}
+
 void LLVMBackend::ActivateParamOwnFlag(NamedVariable& nv)
 {
         // The init store sits right after the flag's alloca in the entry block, so it runs before any
@@ -1898,22 +1979,25 @@ void LLVMBackend::EmitOwnedPtrRelease(const NamedVariable& namedVar, llvm::Value
             llvm::Type* t = namedVar.TypeAndValue.TypeName.empty() ? nullptr : GetType(pointee);
             if (t == nullptr || !t->isSized()) return;
         }
-        // Stored false at entry (no release) until the post-walk alias scan proves it safe.
-        auto* gateSlot = AllocaAtEntry(builder->getInt1Ty(), nullptr,
-                                       namedVar.TypeAndValue.VariableName + ".release");
-        llvm::StoreInst* init = nullptr;
+        llvm::Value* gate = builder->getInt1(true);
+        llvm::StoreInst* releaseGateInit = nullptr;
         {
-            llvm::IRBuilderBase::InsertPointGuard guard(*builder);   // also keeps the !dbg location
-            builder->SetInsertPoint(gateSlot->getParent(), std::next(gateSlot->getIterator()));
-            init = builder->CreateStore(builder->getInt1(false), gateSlot);
+            // Stored false until the post-walk scan proves this slot has no live alias.
+            auto* gateSlot = AllocaAtEntry(builder->getInt1Ty(), nullptr,
+                                           namedVar.TypeAndValue.VariableName + ".release");
+            {
+                llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+                builder->SetInsertPoint(gateSlot->getParent(), std::next(gateSlot->getIterator()));
+                releaseGateInit = builder->CreateStore(builder->getInt1(false), gateSlot);
+            }
+            gate = builder->CreateLoad(builder->getInt1Ty(), gateSlot, "own.gate");
         }
-        // Re-storing the block the local already holds keeps its ownership; any other value is
-        // unowned until SetVariableOwning(true) adopts it later in this statement.
+        // The runtime own bit avoids releasing borrowed values; the alias gate also protects
+        // owners whose block was copied out of this slot before the reassignment.
         auto* old = builder->CreateLoad(namedVar.BaseType, namedVar.Storage, "own.old");
-        ownReleaseGates_.push_back({ slot, init, old });
+        ownReleaseGates_.push_back({ slot, releaseGateInit, old });
         auto* same = builder->CreateICmpEQ(old, replacement, "own.same");
         auto* owned = builder->CreateLoad(builder->getInt1Ty(), namedVar.OwnFlag, "own.owned");
-        auto* gate = builder->CreateLoad(builder->getInt1Ty(), gateSlot, "own.gate");
         // A field escape already cleared the flag (ClearOwnFlag), so an escaped block is never
         // released here; the replacement block starts a fresh field-escape count of one holder.
         auto* preBlock = builder->GetInsertBlock();
@@ -2396,7 +2480,7 @@ void LLVMBackend::EmitOwningPtrDestructor(const NamedVariable& namedVar, llvm::V
     }
 
 void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* replacement,
-                                       llvm::Value* releaseGate)
+                                       llvm::Value* releaseGate, bool skipElementDestructor)
 {
         // Load the current pointer value from the alloca
         auto* ptrVal = builder->CreateLoad(namedVar.BaseType, namedVar.Storage);
@@ -2448,7 +2532,8 @@ void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Valu
         // Call the full destructor (user dtor + member fields) if the type needs one. Resolve
         // through the delete-site resolver: a pointee still incomplete here (self-referential
         // element) binds the deferred stub instead of silently dropping the call.
-        EmitOwningPtrDestructor(namedVar, ptrVal, namedVar.TypeAndValue.TypeName);
+        if (!skipElementDestructor)
+            EmitOwningPtrDestructor(namedVar, ptrVal, namedVar.TypeAndValue.TypeName);
 
         // Free the pointer. An over-aligned block came from the aligned allocator, so it must be
         // freed via __delete_aligned to match. Two sources: the element TYPE's own alignment
@@ -2590,9 +2675,8 @@ void LLVMBackend::EmitOwningUniqueArrayCleanup(const NamedVariable& namedVar)
         bool isIface = namedVar.TypeAndValue.IsFatInterfaceValue();
         bool isCoreUniqueValue = !namedVar.TypeAndValue.Pointer
             && IsCoreUniqueType(namedVar.TypeAndValue.TypeName);
-        for (uint64_t i = 0; i < count; i++)
-        {
-            auto* elemPtr = builder->CreateConstInBoundsGEP2_64(arrTy, namedVar.Storage, 0, i, "uniq.elem");
+        EmitFixedArrayElementWalkReverse(*builder, namedVar.Storage, elemTy, count,
+            [&](llvm::Value* elemPtr) {
             NamedVariable elem = namedVar;
             elem.Storage = elemPtr;
             elem.BaseType = elemTy;
@@ -2606,7 +2690,7 @@ void LLVMBackend::EmitOwningUniqueArrayCleanup(const NamedVariable& namedVar)
             }
             else if (elemTy->isPointerTy())
                 EmitOwningPtrCleanup(elem);
-        }
+        });
     }
 
 void LLVMBackend::RegisterOwnedStringTemp(llvm::Value* value)
@@ -6633,7 +6717,8 @@ bool LLVMBackend::NeedsConditionalDropFlag(const NamedVariable& namedVar) const
         if (namedVar.ConditionalDropFlag != nullptr || namedVar.Storage == nullptr || builder == nullptr)
             return namedVar.ConditionalDropFlag != nullptr;
         const std::string& typeName = namedVar.TypeAndValue.TypeName;
-        if (!(IsForeignNontrivialCxxClass(typeName) || HasForeignNontrivialCxxField(typeName)))
+        if (!(IsForeignNontrivialCxxClass(typeName) || HasForeignNontrivialCxxField(typeName)
+              || ShouldSkipMovedFromStructDestructor(typeName)))
             return false;
         auto* moveBlock = builder->GetInsertBlock();
         if (moveBlock == nullptr) return false;
@@ -6766,7 +6851,11 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
                 auto* cur = builder->CreateLoad(builder->getInt32Ty(), namedVar.RefCountStorage);
                 auto* dec = builder->CreateSub(cur, builder->getInt32(1), "refdec");
                 builder->CreateStore(dec, namedVar.RefCountStorage);
-                EmitConditionalOwningPtrCleanup(namedVar, dec);
+                // The count is now the ownership authority. A field escape may have cleared the
+                // local's OwnFlag, but the final reference still has to destroy the allocation.
+                NamedVariable lastReference = namedVar;
+                lastReference.OwnFlagActive = false;
+                EmitConditionalOwningPtrCleanup(lastReference, dec);
             }
             return;
         }
@@ -6792,6 +6881,8 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
             // on another branch even when merged moved-state marks this source as maybe moved.
             if (namedVar.IsMoved && HasTypeAnnotation(namedVar.TypeAndValue.TypeName, "unique")
                 && !IsCoreUniqueType(namedVar.TypeAndValue.TypeName)) return;
+            if (namedVar.IsMoved && namedVar.ConditionalDropFlag == nullptr
+                && ShouldSkipMovedFromStructDestructor(namedVar.TypeAndValue.TypeName)) return;
             // A foreign nontrivial C++ local released explicitly (`_ = move x;`) already ran its
             // C++ destructor and had its storage zeroed - running it again is a double destruction.
             // A plain `move x` (into another slot or a by-value parameter) does NOT set this flag:
@@ -6810,6 +6901,7 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
             // A fixed-array local (`T[N] a;`) owns every element - destruct all N.
             if (auto* fn = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
                 EmitConditionalFullDestructor(namedVar, fn);
+            DropNonLocalViewFields(namedVar);
         }
     }
 

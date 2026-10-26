@@ -136,6 +136,7 @@ struct Resource
     // Reads an argument only; used as the '?.' guarded-chain receiver in the arm-flush legs.
     int readId(int v) { return v; }
 };
+unique Resource* t486GlobalOwner = nullptr;
 
 move Resource[] t362ReturnMovedView(bool c)
 {
@@ -2923,6 +2924,44 @@ int testUniqueLocalReassignMove()
     }
     passed += Test("unique_reassign_move_call_freed_once", dtorCount, 1);
 
+    dtorCount = 0;
+    {
+        unique Resource* declared = makeIdResource(61);
+        passed += Test("t486_unique_decl_fresh_call_value", declared->id, 61);
+    }
+    passed += Test("t486_unique_decl_fresh_call_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique Resource* assigned = nullptr;
+        assigned = makeIdResource(62);
+        passed += Test("t486_unique_assign_fresh_call_value", assigned->id, 62);
+    }
+    passed += Test("t486_unique_assign_fresh_call_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        UniqueBox box = default;
+        box.item = makeIdResource(64);
+        passed += Test("t486_unique_field_fresh_call_value", box.item->id, 64);
+    }
+    passed += Test("t486_unique_field_fresh_call_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    t486GlobalOwner = makeIdResource(65);
+    passed += Test("t486_unique_global_fresh_call_value", t486GlobalOwner->id, 65);
+    t486GlobalOwner = nullptr;
+    passed += Test("t486_unique_global_fresh_call_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        bool takeFresh = true;
+        unique Resource* joined = nullptr;
+        joined = takeFresh ? makeIdResource(66) : nullptr;
+        passed += Test("t486_unique_ternary_fresh_call_value", joined->id, 66);
+    }
+    passed += Test("t486_unique_ternary_fresh_call_freed_once", dtorCount, 1);
+
     // Chained reassignment moves: ownership walks to the last holder, freed exactly once.
     dtorCount = 0;
     {
@@ -2966,12 +3005,12 @@ int testUniqueLocalReassignMove()
     {
         unique Resource* h = new Resource();
         h->id = 5;
-        unique Resource* borrowed = nullptr;
+        Resource* borrowed = nullptr;
         borrowed = borrowFirstResource(h, new Resource());
-        passed += Test("unique_reassign_borrow_call_value", borrowed->id, 5);
-        passed += Test("unique_reassign_borrow_call_arg_temp_freed", dtorCount, 1);
+        passed += Test("raw_reassign_borrow_call_value", borrowed->id, 5);
+        passed += Test("raw_reassign_borrow_call_arg_temp_freed", dtorCount, 1);
     }
-    passed += Test("unique_reassign_borrow_call_not_adopted", dtorCount, 2);
+    passed += Test("raw_reassign_borrow_call_owner_freed_once", dtorCount, 2);
 
     // A '?:' is a transparent wrapper: an owning `new` in the TAKEN arm reaches the assignment
     // as the ternary's RESULT value, so the unique local adopts it and frees it exactly once.
@@ -3002,35 +3041,6 @@ int testUniqueLocalReassignMove()
         t2 = takeFirst ? new Resource() : new Resource();
     }
     passed += Test("unique_reassign_ternary_both_arms_freed_once", dtorCount, 1);
-
-    // The ternary's owning bit must ride the RESULT value only: a `new` wrapped in a '?:' that
-    // sits in ARGUMENT position still feeds a BORROW return, which must not be adopted. The
-    // selected arm's allocation is a non-retained argument temp, so it is freed at
-    // end-of-full-expression (null-guarded, so the nullptr arm frees nothing); `t3` is the second.
-    dtorCount = 0;
-    {
-        bool useNew = true;
-        unique Resource* t3 = new Resource();
-        t3->id = 9;
-        unique Resource* t4 = nullptr;
-        t4 = borrowFirstResource(t3, useNew ? new Resource() : nullptr);
-        passed += Test("unique_reassign_ternary_arg_borrow_value", t4->id, 9);
-    }
-    passed += Test("unique_reassign_ternary_arg_borrow_not_adopted", dtorCount, 2);
-
-    // Same shape with the nullptr arm selected: nothing was allocated for the argument, so the
-    // end-of-expression release is a no-op and only `t5` is destroyed.
-    dtorCount = 0;
-    {
-        bool useNew = false;
-        unique Resource* t5 = new Resource();
-        t5->id = 11;
-        unique Resource* t6 = nullptr;
-        t6 = borrowFirstResource(t5, useNew ? new Resource() : nullptr);
-        passed += Test("unique_reassign_ternary_arg_null_borrow_value", t6->id, 11);
-        passed += Test("unique_reassign_ternary_arg_null_no_free", dtorCount, 0);
-    }
-    passed += Test("unique_reassign_ternary_arg_null_arm_freed_once", dtorCount, 1);
 
     // Same question at a DECLARATION, which used to read the sticky flag instead of the RHS.
     // A plain `T*` declared from a BORROW-returning call adopted the return whenever a `new` had
@@ -3190,14 +3200,6 @@ int testUniqueLocalReassignMove()
     // Every discriminator the alias proof has to fail, each with the owning temp reaching an
     // owning destination the same way. All still LEAK by design (0 destructors): a free would
     // need a proof none of them supplies, and the value legs prove each result is still live.
-    dtorCount = 0;
-    {
-        unique Resource* m = nullptr;
-        m = mixedReturnResource(makeIdResource(51), true);   // one return is not the argument
-        passed += Test("alias_proof_mixed_return_value", m->id, 51);
-    }
-    passed += Test("alias_proof_mixed_return_not_adopted", dtorCount, 0);
-
     dtorCount = 0;
     {
         unique Resource* f = nullptr;
@@ -7147,6 +7149,67 @@ int t377ReadView(Resource[] p) { return p[0].id; }
 
 struct T387FieldHolder { Resource[] view = default; };
 struct T387ElemHolder { T387FieldHolder hs[2]; };
+struct T472MethodHolder
+{
+    T387FieldHolder hs[2];
+    void put(Resource[] value) { hs[0].view = value; }
+};
+
+Resource[] t472GetterViewOut = default;
+Resource* t472GetterPointerOut = nullptr;
+Resource[] t472OutwardViewOut = default;
+int t472GetterPrintValue = 0;
+
+struct T472GetterHolder
+{
+    Resource[] f = default;
+    Resource[] get() { return f; }
+    Resource* at(int i) { return &f[i]; }
+    int sum() { return f[0].id + f[1].id; }
+    void print() { t472GetterPrintValue = f[0].id; }
+    int publish() { t472OutwardViewOut = f; return 0; }
+    int publishGetter() { t472GetterViewOut = get(); return 0; }
+    int publishAddress() { t472GetterPointerOut = &f[0]; return 0; }
+    void publishInner() { t472OutwardViewOut = f; }
+    void publishViaInner() { publishInner(); }
+};
+
+struct T472GetterRoot
+{
+    T472GetterHolder hs[2];
+    Resource[] get0() { return hs[0].f; }
+};
+
+struct T472ConstPair { int* p = nullptr; int* q = nullptr; };
+struct T472ConstAliasCopy
+{
+    T472ConstPair a;
+    T472ConstPair b;
+    int peek() { auto c = a; c.p = b.q; return 1; }
+};
+
+Resource[] t472FallbackView = default;
+
+Resource[] t472ReturnTernaryView(bool choose)
+{
+    T387FieldHolder h = default;
+    h.view = new Resource[1];
+    h.view[0].id = 958;
+    return choose ? h.view : t472FallbackView;
+}
+
+T387FieldHolder t472MakeFieldHolder(int id)
+{
+    T387FieldHolder h = default;
+    h.view = new Resource[1];
+    h.view[0].id = id;
+    return h;
+}
+
+void t472PutBorrowed(T387ElemHolder* p, Resource[] value)
+{
+    p->hs[0].view = value;
+}
 
 class T387ImplicitHolder
 {
@@ -7808,6 +7871,7 @@ int checkT387LoopInnerDecl(bool arm)
 {
     int passed = 0;
     int total = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
     for (int i = 0; i < 2; i++)
     {
         Resource[] v = new Resource[1];
@@ -7817,6 +7881,8 @@ int checkT387LoopInnerDecl(bool arm)
         t377MoveViewSink(move v);
     }
     passed += Test("t387_loop_inner_decl_value", total, 14);
+    passed += Test("t387_loop_inner_decl_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
     return passed;
 }
 
@@ -7846,6 +7912,7 @@ int checkT387ScopeShadowKey(bool arm)
     int passed = 0;
     int selected = -1;
     dtorCount = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
     {
         Resource[] w = new Resource[2];
         T387ElemHolder a = default;
@@ -7860,6 +7927,237 @@ int checkT387ScopeShadowKey(bool arm)
     }
     passed += Test("t387_scope_shadow_key_value", selected, 911);
     passed += Test("t387_scope_shadow_key_dtors", dtorCount, 3);
+    passed += Test("t387_scope_shadow_key_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)0);
+    return passed;
+}
+
+int checkT472EscapingViews()
+{
+    int passed = 0;
+    int selected = -1;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    {
+        T387FieldHolder h = t472MakeFieldHolder(951);
+        selected = h.view[0].id;
+    }
+    passed += Test("t472_factory_return_value", selected, 951);
+    passed += Test("t472_factory_return_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)1);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    {
+        T387FieldHolder h2 = default;
+        {
+            T387FieldHolder h = default;
+            h.view = new Resource[1];
+            h.view[0].id = 952;
+            h2 = h;
+        }
+        selected = h2.view[0].id;
+    }
+    passed += Test("t472_aggregate_copy_value", selected, 952);
+    passed += Test("t472_aggregate_copy_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)1);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    {
+        Resource[] w = new Resource[1];
+        T387ElemHolder a = default;
+        a.hs[0].view = new Resource[2];
+        t472PutBorrowed(&a, w);
+        w[0].id = 953;
+        selected = a.hs[0].view[0].id;
+    }
+    passed += Test("t472_address_escape_value", selected, 953);
+    passed += Test("t472_address_escape_dtors", dtorCount, 1);
+    passed += Test("t472_address_escape_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)1);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    {
+        Resource[] copiedView = default;
+        {
+            T387ElemHolder a = default;
+            a.hs[0].view = new Resource[1];
+            a.hs[0].view[0].id = 954;
+            Resource[] localCopy = a.hs[0].view;
+            copiedView = localCopy;
+        }
+        selected = copiedView[0].id;
+    }
+    passed += Test("t472_decl_view_copy_value", selected, 954);
+    passed += Test("t472_decl_view_copy_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)1);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    {
+        Resource[] copiedView = default;
+        {
+            T387ElemHolder a = default;
+            a.hs[0].view = new Resource[1];
+            a.hs[0].view[0].id = 955;
+            T387FieldHolder localCopy = a.hs[0];
+            copiedView = localCopy.view;
+        }
+        selected = copiedView[0].id;
+    }
+    passed += Test("t472_decl_aggregate_copy_value", selected, 955);
+    passed += Test("t472_decl_aggregate_copy_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)1);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    {
+        Resource[] value = t472ReturnTernaryView(true);
+        selected = value[0].id;
+    }
+    passed += Test("t472_ternary_return_value", selected, 958);
+    passed += Test("t472_ternary_return_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)1);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    {
+        Resource[] w = new Resource[1];
+        T472MethodHolder a = default;
+        a.hs[0].view = new Resource[2];
+        a.put(w);
+        w[0].id = 959;
+        selected = a.hs[0].view[0].id;
+    }
+    passed += Test("t472_mutating_method_value", selected, 959);
+    passed += Test("t472_mutating_method_dtors", dtorCount, 1);
+    passed += Test("t472_mutating_method_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)1);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    selected = -1;
+    {
+        T387ElemHolder a = default;
+        for (int i = 0; i < 2; i++)
+        {
+            if (i == 1) selected = a.hs[0].view[0].id;
+            a.hs[0].view = new Resource[1];
+            a.hs[0].view[0].id = 960 + i;
+        }
+    }
+    passed += Test("t472_loop_read_before_assign_value", selected, 960);
+    passed += Test("t472_loop_read_before_assign_dtors", dtorCount, 0);
+    passed += Test("t472_loop_read_before_assign_leaks",
+        (i64)HeapAudit.reportLeaks() - before, (i64)1);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T472GetterHolder h = default;
+        h.f = new Resource[1];
+        h.f[0].id = 961;
+        t472GetterViewOut = h.get();
+    }
+    selected = t472GetterViewOut[0].id;
+    passed += Test("t472_view_getter_value_after_scope", selected, 961);
+    passed += Test("t472_view_getter_leaks", (i64)HeapAudit.reportLeaks() - before, (i64)1);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T472GetterRoot a = default;
+        a.hs[0].f = new Resource[1];
+        a.hs[0].f[0].id = 962;
+        t472GetterViewOut = a.hs[0].get();
+    }
+    selected = t472GetterViewOut[0].id;
+    passed += Test("t472_nested_view_getter_value_after_scope", selected, 962);
+    passed += Test("t472_nested_view_getter_leaks", (i64)HeapAudit.reportLeaks() - before, (i64)1);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T472GetterHolder h = default;
+        h.f = new Resource[1];
+        h.f[0].id = 963;
+        t472GetterPointerOut = h.at(0);
+    }
+    selected = t472GetterPointerOut[0].id;
+    passed += Test("t472_pointer_getter_value_after_scope", selected, 963);
+    passed += Test("t472_pointer_getter_leaks", (i64)HeapAudit.reportLeaks() - before, (i64)1);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T472GetterHolder h = default;
+        h.f = new Resource[1];
+        h.f[0].id = 966;
+        h.publishGetter();
+    }
+    selected = t472GetterViewOut[0].id;
+    passed += Test("t472_method_getter_store_value_after_scope", selected, 966);
+    passed += Test("t472_method_getter_store_leaks", (i64)HeapAudit.reportLeaks() - before, (i64)1);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T472GetterHolder h = default;
+        h.f = new Resource[1];
+        h.f[0].id = 967;
+        h.publishAddress();
+    }
+    selected = t472GetterPointerOut[0].id;
+    passed += Test("t472_method_address_store_value_after_scope", selected, 967);
+    passed += Test("t472_method_address_store_leaks", (i64)HeapAudit.reportLeaks() - before, (i64)1);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T472GetterHolder h = default;
+        h.f = new Resource[1];
+        h.f[0].id = 965;
+        h.publish();
+    }
+    selected = t472OutwardViewOut[0].id;
+    passed += Test("t472_global_view_handoff_value_after_scope", selected, 965);
+    passed += Test("t472_global_view_handoff_leaks", (i64)HeapAudit.reportLeaks() - before, (i64)1);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T472GetterHolder h = default;
+        h.f = new Resource[1];
+        h.f[0].id = 968;
+        h.publishViaInner();
+    }
+    selected = t472OutwardViewOut[0].id;
+    passed += Test("t472_transitive_method_store_value_after_scope", selected, 968);
+    passed += Test("t472_transitive_method_store_leaks", (i64)HeapAudit.reportLeaks() - before, (i64)1);
+
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T472GetterRoot a = default;
+        a.hs[0].f = new Resource[1];
+        a.hs[0].f[0].id = 964;
+        t472GetterViewOut = a.get0();
+    }
+    selected = t472GetterViewOut[0].id;
+    passed += Test("t472_root_view_getter_value_after_scope", selected, 964);
+    passed += Test("t472_root_view_getter_leaks", (i64)HeapAudit.reportLeaks() - before, (i64)1);
+
+    before = (i64)HeapAudit.reportLeaks();
+    dtorCount = 0;
+    t472GetterPrintValue = 0;
+    {
+        T472GetterHolder h = default;
+        h.f = new Resource[2];
+        h.f[0].id = 24;
+        h.f[1].id = 25;
+        selected = h.sum();
+        h.print();
+    }
+    passed += Test("t472_non_handing_methods_value", selected, 49);
+    passed += Test("t472_non_handing_print_value", t472GetterPrintValue, 24);
+    passed += Test("t472_non_handing_methods_leaks", (i64)HeapAudit.reportLeaks() - before, (i64)0);
+
+    const T472ConstAliasCopy k = default;
+    passed += Test("t472_const_copy_alias_receiver_value", k.peek(), 1);
     return passed;
 }
 
@@ -7883,6 +8181,7 @@ int testT387ReviewAcceptSet()
     passed += checkT387ScopeShadowKey(true);
     passed += checkT387NestedLoopOuterDecl(false);
     passed += checkT387NestedLoopOuterDecl(true);
+    passed += checkT472EscapingViews();
     return passed;
 }
 
@@ -15373,10 +15672,183 @@ int t425ReadInitElement(T425AddrBox b)
     return p->count();
 }
 
+int t488DtorSequence = 0;
+struct T488DtorItem
+{
+    int id = 0;
+    ~T488DtorItem() { t488DtorSequence = t488DtorSequence * 10 + id; }
+};
+struct T488DtorTriple { T488DtorItem a; T488DtorItem b; T488DtorItem c; };
+struct T488DtorGeneric<T> { T a; T b; T c; };
+struct T488DtorUserBody
+{
+    T488DtorItem a;
+    T488DtorItem b;
+    T488DtorItem c;
+    ~T488DtorUserBody() { t488DtorSequence = t488DtorSequence * 10 + 9; }
+};
+struct T488DtorInner { T488DtorItem a; T488DtorItem b; };
+struct T488DtorOuter { T488DtorInner inner; T488DtorItem c; };
+struct T488DtorArray { T488DtorItem[3] items = default; };
+struct T488DtorUnique
+{
+    unique T488DtorItem* a = default;
+    unique T488DtorItem* b = default;
+    unique T488DtorItem* c = default;
+};
+struct T488DtorUniqueValue
+{
+    unique<T488DtorItem> a = default;
+    unique<T488DtorItem> b = default;
+    unique<T488DtorItem> c = default;
+};
+struct T488DtorUniqueArray { unique T488DtorItem* items[3] = default; };
+interface T488DtorIface { void setId(int value); };
+class T488DtorImpl : T488DtorIface
+{
+    int id = 0;
+    void setId(int value) { id = value; }
+    ~T488DtorImpl() { t488DtorSequence = t488DtorSequence * 10 + id; }
+};
+struct T488DtorUniqueIface
+{
+    unique T488DtorIface a = default;
+    unique T488DtorIface b = default;
+    unique T488DtorIface c = default;
+};
+
+int testT488MemberDestructionOrder()
+{
+    int passed = 0;
+    t488DtorSequence = 0;
+    { T488DtorTriple x = default; x.a.id = 1; x.b.id = 2; x.c.id = 3; }
+    passed += Test("t488_native_members_reverse", t488DtorSequence, 321);
+    t488DtorSequence = 0;
+    { T488DtorGeneric<T488DtorItem> x = default; x.a.id = 1; x.b.id = 2; x.c.id = 3; }
+    passed += Test("t488_generic_members_reverse", t488DtorSequence, 321);
+    t488DtorSequence = 0;
+    { T488DtorUserBody x = default; x.a.id = 1; x.b.id = 2; x.c.id = 3; }
+    passed += Test("t488_user_body_before_reverse_members", t488DtorSequence, 9321);
+    t488DtorSequence = 0;
+    { T488DtorOuter x = default; x.inner.a.id = 1; x.inner.b.id = 2; x.c.id = 3; }
+    passed += Test("t488_nested_members_reverse", t488DtorSequence, 321);
+    t488DtorSequence = 0;
+    { T488DtorArray x = default; x.items[0].id = 1; x.items[1].id = 2; x.items[2].id = 3; }
+    passed += Test("t488_fixed_array_member_reverse", t488DtorSequence, 321);
+    t488DtorSequence = 0;
+    {
+        T488DtorUnique x = default;
+        x.a = new T488DtorItem(); x.a->id = 1;
+        x.b = new T488DtorItem(); x.b->id = 2;
+        x.c = new T488DtorItem(); x.c->id = 3;
+    }
+    passed += Test("t488_unique_pointer_members_reverse", t488DtorSequence, 321);
+    t488DtorSequence = 0;
+    {
+        T488DtorUniqueValue x = default;
+        x.a = new T488DtorItem(); x.a->id = 1;
+        x.b = new T488DtorItem(); x.b->id = 2;
+        x.c = new T488DtorItem(); x.c->id = 3;
+    }
+    passed += Test("t488_unique_value_members_reverse", t488DtorSequence, 321);
+    t488DtorSequence = 0;
+    {
+        T488DtorUniqueArray x = default;
+        x.items[0] = new T488DtorItem(); x.items[0]->id = 1;
+        x.items[1] = new T488DtorItem(); x.items[1]->id = 2;
+        x.items[2] = new T488DtorItem(); x.items[2]->id = 3;
+    }
+    passed += Test("t488_unique_array_member_reverse", t488DtorSequence, 321);
+    t488DtorSequence = 0;
+    {
+        T488DtorUniqueIface x = default;
+        x.a = new T488DtorImpl(); x.a.setId(1);
+        x.b = new T488DtorImpl(); x.b.setId(2);
+        x.c = new T488DtorImpl(); x.c.setId(3);
+    }
+    passed += Test("t488_unique_interface_members_reverse", t488DtorSequence, 321);
+    t488DtorSequence = 0;
+    {
+        T488DtorTriple* value = new T488DtorTriple();
+        value->a.id = 1; value->b.id = 2; value->c.id = 3;
+        delete value;
+    }
+    passed += Test("t488_delete_members_reverse", t488DtorSequence, 321);
+    t488DtorSequence = 0;
+    {
+        T488DtorTriple target = default;
+        T488DtorTriple source = default;
+        target.a.id = 1; target.b.id = 2; target.c.id = 3;
+        source.a.id = 7; source.b.id = 8; source.c.id = 9;
+        t488DtorSequence = 0;
+        target = source;
+        passed += Test("t488_overwrite_old_members_reverse", t488DtorSequence, 321);
+        t488DtorSequence = 0;
+    }
+    t488DtorSequence = 0;
+    {
+        list<T488DtorTriple> items = default;
+        {
+            T488DtorTriple value = default;
+            value.a.id = 1; value.b.id = 2; value.c.id = 3;
+            items.add(move value);
+        }
+        t488DtorSequence = 0;
+    }
+    passed += Test("t488_container_element_members_reverse", t488DtorSequence, 321);
+    return passed;
+}
+
+int t490PlainDtors = 0;
+struct T490Plain
+{
+    int value = 0;
+    ~T490Plain() { t490PlainDtors++; }
+};
+int t490TakePlain(move T490Plain value) { return value.value; }
+T490Plain t490ReturnPlain()
+{
+    T490Plain value = default;
+    value.value = 6;
+    return move value;
+}
+struct T490PlainBox { T490Plain value; };
+int t490RunPlainBranch(bool shouldMove, int value)
+{
+    T490Plain local = default;
+    local.value = value;
+    if (shouldMove) value = t490TakePlain(move local);
+    else value = local.value;
+    return value;
+}
+int t490RunPlainLoop()
+{
+    int value = 0;
+    for (int i = 0; i < 4; i++)
+    {
+        T490Plain local = default;
+        local.value = i + 10;
+        if (i % 2 == 0) value += t490TakePlain(move local);
+    }
+    return value;
+}
+int t490PayloadDtors = 0;
+int t490OwnerDtors = 0;
+struct T490Payload { ~T490Payload() { t490PayloadDtors++; } };
+struct T490Owner
+{
+    unique T490Payload* item = nullptr;
+    ~T490Owner() { t490OwnerDtors++; }
+};
+void t490TakeOwner(move T490Owner value) { }
+
 extern int main()
 {
     int passed = 0;
     int total  = 0;
+
+    total += 12;
+    passed += testT488MemberDestructionOrder();
 
     T425AddrBox t425Addr = default;
     t425Addr.xs.add(13);
@@ -15808,7 +16280,7 @@ extern int main()
     total += 24;
 
     passed += testUniqueLocalReassignMove();
-    total += 95;
+    total += 98;
 
     passed += testValueMoveArgDeferred();
     total += 5;
@@ -15965,6 +16437,8 @@ extern int main()
     total += 8;
     passed += testImmovable();
     total += 26;
+    passed += testT487ReturnBrace();
+    total += 21;
     passed += testImmovableFactoryReturn();
     total += 27;
 
@@ -16215,12 +16689,16 @@ extern int main()
     total += 12;
     passed += testT476AutoUniqueFieldAcceptSet();
     total += 7;
+    passed += testT479UniqueInterfaceFieldChain();
+    total += 8;
     passed += testT388AcceptSet();
     total += 12;
     passed += testT388ArrayFieldConsume();
     total += 17;
     passed += testArrowOwnedTempMember();
-    total += 40;
+    total += 42;
+    total += 22;
+    total += 15;
     passed += testT256AliasCallField();
     total += 34;
     passed += testT429AliasArithmetic();
@@ -16302,6 +16780,7 @@ extern int main()
     total += 18;
     total += 16;
     total += 16;
+    total += 16;
     total += 8;
     total += 4;
 
@@ -16316,7 +16795,10 @@ extern int main()
     total += 24;
 
     passed += testT387ReviewAcceptSet();
-    total += 38;
+    total += 58;
+    total += 7;
+    total += 12;
+    total += 4;
 
     passed += testT393LoopSinkAcceptSet();
     total += 4;
@@ -16631,6 +17113,66 @@ class T442ImmovReturnImpl : T442ImmovReturnInterface
 };
 void t442VoidEmptyReturn(int* value) { *value = 7; return {}; }
 
+int t487LeafCtors = 0;
+int t487LeafDtors = 0;
+struct T487OwnedLeaf
+{
+    int value = 37;
+    T487OwnedLeaf() { t487LeafCtors = t487LeafCtors + 1; }
+    ~T487OwnedLeaf() { t487LeafDtors = t487LeafDtors + 1; }
+};
+struct T487OwnerRecord { unique<T487OwnedLeaf> p = default; int tag = 0; };
+T487OwnerRecord t487MakeOwnerRecord()
+{
+    return { p = unique<T487OwnedLeaf>(new T487OwnedLeaf()), tag = 4 };
+}
+
+int t487TrackedCtors = 0;
+int t487TrackedDtors = 0;
+struct T487TrackedRecord
+{
+    int value = 0;
+    int keep = 9;
+    T487TrackedRecord() { t487TrackedCtors = t487TrackedCtors + 1; }
+    ~T487TrackedRecord() { t487TrackedDtors = t487TrackedDtors + 1; }
+};
+T487TrackedRecord t487MakeTrackedRecord() { return { value = 41 }; }
+
+struct T487PlainRecord { int x = 0; int y = 0; };
+using T487PlainAlias = T487PlainRecord;
+T487PlainRecord t487MakePlainRecord() { return { x = 4, y = 5 }; }
+T487PlainAlias t487MakeAliasRecord() { return { x = 8, y = 9 }; }
+struct T487DefaultRecord { int x = 7; int y = 9; };
+T487DefaultRecord t487MakeDefaultRecord() { return { x = 3 }; }
+class T487ClassRecord { int x = 0; int y = 0; };
+T487ClassRecord t487MakeClassRecord() { return { x = 4, y = 5 }; }
+struct T487GenericRecord<T> { T value = default; int tag = 0; };
+T487GenericRecord<int> t487MakeGenericRecord() { return { value = 41, tag = 2 }; }
+struct T487NestedInner { int x = 6; int y = 7; };
+struct T487NestedOuter { T487NestedInner inner = default; int tag = 0; };
+T487NestedOuter t487MakeNestedRecord() { return { inner = { x = 8 }, tag = 3 }; }
+struct T487SelfRecord
+{
+    int bias = 1;
+    int x = 0;
+    int y = 0;
+    T487SelfRecord make(int n) { return { x = n + bias, y = n + 2 }; }
+};
+namespace T487ReturnNS
+{
+    struct Record { int x = 0; int y = 0; };
+    Record make() { return { x = 8, y = 9 }; }
+}
+list<int> t487MakeList() { return { 4, 5 }; }
+array<int> t487MakeArray() { return { 4, 5 }; }
+dictionary<int, int> t487MakeDictionary() { return { 4: 5 }; }
+int t487Seq = 0;
+int t487Step(int v) { t487Seq = t487Seq * 10 + v; return v; }
+T487PlainRecord t487MakeSourceOrder() { return { y = t487Step(2), x = t487Step(1) }; }
+struct T487MoveSource { int t = 5; unique<T487OwnedLeaf> p = default; };
+struct T487MoveTarget { int k = 0; T487MoveSource b = default; };
+T487MoveTarget t487MakeReadThenMove() { T487MoveSource x = default; x.t = 6; return { k = x.t, b = move x }; }
+
 // T142: `default` as a call argument takes its value from the by-value parameter it binds.
 // Refusals (ambiguous, no by-value parameter) live in Test/errors/err_default_arg_*.cb.
 int defArgCtors = 0;
@@ -16749,6 +17291,69 @@ int testImmovable()
     delete dif;
     passed += Test("defarg_iface_value", ifValue, 7);
     passed += Test("defarg_iface_ctor_dtor_once", (defArgIfaceCtors - ifOb) * 10 + (defArgIfaceDtors - ifOd), 11);
+    return passed;
+}
+
+int testT487ReturnBrace()
+{
+    int passed = 0;
+    T487PlainRecord plain = t487MakePlainRecord();
+    passed += Test("t487_plain_named_value", plain.x * 10 + plain.y, 45);
+    T487DefaultRecord defaulted = t487MakeDefaultRecord();
+    passed += Test("t487_field_default_value", defaulted.x * 10 + defaulted.y, 39);
+    T487ClassRecord classValue = t487MakeClassRecord();
+    passed += Test("t487_cflat_class_value", classValue.x * 10 + classValue.y, 45);
+    T487GenericRecord<int> generic = t487MakeGenericRecord();
+    passed += Test("t487_generic_value", generic.value * 10 + generic.tag, 412);
+    T487PlainAlias aliasValue = t487MakeAliasRecord();
+    passed += Test("t487_alias_value", aliasValue.x * 10 + aliasValue.y, 89);
+    T487ReturnNS.Record namespaced = T487ReturnNS.make();
+    passed += Test("t487_namespace_value", namespaced.x * 10 + namespaced.y, 89);
+    T487NestedOuter nested = t487MakeNestedRecord();
+    passed += Test("t487_nested_value", nested.inner.x * 10 + nested.inner.y + nested.tag, 90);
+    T487SelfRecord self = default;
+    T487SelfRecord methodValue = self.make(7);
+    passed += Test("t487_method_self_value", methodValue.x * 10 + methodValue.y, 89);
+
+    list<int> values = t487MakeList();
+    passed += Test("t487_list_positional_value", values.get(0) * 10 + values.get(1), 45);
+    array<int> arrayValues = t487MakeArray();
+    passed += Test("t487_array_positional_value",
+        arrayValues.get(0) * 10 + arrayValues.get(1), 45);
+    dictionary<int, int> dictionaryValues = t487MakeDictionary();
+    passed += Test("t487_dictionary_key_value", dictionaryValues.get(4), 5);
+
+    t487TrackedCtors = 0;
+    t487TrackedDtors = 0;
+    int trackedValue = 0;
+    {
+        T487TrackedRecord tracked = t487MakeTrackedRecord();
+        trackedValue = tracked.value * 10 + tracked.keep;
+        passed += Test("t487_tracked_constructed_once", t487TrackedCtors * 10 + t487TrackedDtors, 10);
+    }
+    passed += Test("t487_tracked_value_and_default", trackedValue, 419);
+    passed += Test("t487_tracked_destroyed_once_at_caller", t487TrackedDtors, 1);
+
+    HeapAudit.enable();
+    int t487HeapBaseline = (int)HeapAudit.reportLeaks();
+    t487LeafCtors = 0;
+    t487LeafDtors = 0;
+    int ownerValue = 0;
+    {
+        T487OwnerRecord owner = t487MakeOwnerRecord();
+        ownerValue = owner.p->value * 10 + owner.tag;
+        passed += Test("t487_unique_owned_by_caller", t487LeafCtors * 10 + t487LeafDtors, 10);
+    }
+    passed += Test("t487_unique_value", ownerValue, 374);
+    passed += Test("t487_unique_destroyed_once", t487LeafCtors * 10 + t487LeafDtors, 11);
+    passed += Test("t487_unique_no_heap_leak",
+        (int)HeapAudit.reportLeaks() - t487HeapBaseline, 0);
+    t487Seq = 0;
+    T487PlainRecord ordered = t487MakeSourceOrder();
+    passed += Test("t487_source_order_eval", t487Seq, 21);
+    passed += Test("t487_source_order_value", ordered.x * 10 + ordered.y, 12);
+    T487MoveTarget moved = t487MakeReadThenMove();
+    passed += Test("t487_read_then_move", moved.k * 10 + moved.b.t, 66);
     return passed;
 }
 
@@ -17393,6 +17998,59 @@ int[8] gT211Arr;
 void t211AliasIndex() { gT211Arr[3] = 5; for (int i = 0; i < 1000; i = i + 1) { alias int x = gT211Arr[t211Mk()->v]; gT211Sum = gT211Sum + x; } }
 void t211PointerEscape() { for (int i = 0; i < 1000; i = i + 1) { alias int* q = t211Mk()->heap; gT211Sum = gT211Sum + *q; } }
 
+// T480: pointer fields passed as call arguments keep the owning receiver through the call only.
+int gT480Dtors = 0;
+int gT480Sum = 0;
+int gT480Bad = 0;
+int gT480CallMetric = 0;
+int gT480IndexMethodMetric = 0;
+int gT480ByValueMetric = 0;
+int gT480CallBad = 0;
+int gT480IndexMethodBad = 0;
+int gT480ByValueBad = 0;
+struct T480Res { int* heap = nullptr; T480Res() { heap = new int(4); } ~T480Res() { gT480Dtors = gT480Dtors + 1; delete heap; } int get() { return *heap; } };
+unique<T480Res> t480Mk() { return unique<T480Res>(new T480Res()); }
+T480Res t480Mk2() { return T480Res(); }
+int t480Use(int* p) { return *p; }
+void t480CallArgs() { for (int i = 0; i < 10; i = i + 1) { int a = t480Use(t480Mk()->heap); if (gT480Dtors != 2 * i + 1) gT480Bad = gT480Bad + 1; gT480Sum = gT480Sum + a; int b = t480Use((t480Mk())->heap); if (gT480Dtors != 2 * i + 2) gT480Bad = gT480Bad + 1; gT480Sum = gT480Sum + b; } }
+void t480IndexMethod() { for (int i = 0; i < 10; i = i + 1) { int a = t480Mk()->heap[0]; if (gT480Dtors != 2 * i + 1) gT480Bad = gT480Bad + 1; gT480Sum = gT480Sum + a; int b = t480Mk()->get(); if (gT480Dtors != 2 * i + 2) gT480Bad = gT480Bad + 1; gT480Sum = gT480Sum + b; } }
+void t480ByValue() { for (int i = 0; i < 10; i = i + 1) { int v = t480Use(t480Mk2().heap); if (gT480Dtors != i + 1) gT480Bad = gT480Bad + 1; gT480Sum = gT480Sum + v; } }
+
+// T482: pointer arithmetic and ternary argument reads keep the owning temp through the full expression.
+int gT482Dtors = 0;
+int gT482Sum = 0;
+int gT482Bad = 0;
+struct T482Res { int[2] values; int* heap = nullptr; T482Res() { values[0] = 6; values[1] = 7; heap = &values[0]; } ~T482Res() { gT482Dtors = gT482Dtors + 1; values[0] = -999; values[1] = -999; } };
+unique<T482Res> t482Mk() { return unique<T482Res>(new T482Res()); }
+int t482Use(int* p) { return *p; }
+void t482DerefAddStatement() { for (int i = 0; i < 10; i = i + 1) { gT482Sum = gT482Sum + *(t482Mk()->heap + 1); if (gT482Dtors != i + 1) gT482Bad = gT482Bad + 1; } }
+void t482DerefAddDeclaration() { for (int i = 0; i < 10; i = i + 1) { int v = *(t482Mk()->heap + 1) + 0; if (gT482Dtors != i + 1) gT482Bad = gT482Bad + 1; gT482Sum = gT482Sum + v; } }
+void t482DerefNestedParens() { for (int i = 0; i < 10; i = i + 1) { int v = *(((t482Mk())->heap + 1)); if (gT482Dtors != i + 1) gT482Bad = gT482Bad + 1; gT482Sum = gT482Sum + v; } }
+void t482IndexControl() { for (int i = 0; i < 10; i = i + 1) { int v = t482Mk()->heap[1]; if (gT482Dtors != i + 1) gT482Bad = gT482Bad + 1; gT482Sum = gT482Sum + v; } }
+void t482CallArgumentShapes() { for (int i = 0; i < 10; i = i + 1) { int a = t482Use(i >= 0 ? t482Mk()->heap : nullptr); if (gT482Dtors != 4 * i + 1) gT482Bad = gT482Bad + 1; gT482Sum = gT482Sum + a; int b = t482Use(i < 0 ? nullptr : t482Mk()->heap); if (gT482Dtors != 4 * i + 2) gT482Bad = gT482Bad + 1; gT482Sum = gT482Sum + b; int c = t482Use(t482Mk()->heap + 1); if (gT482Dtors != 4 * i + 3) gT482Bad = gT482Bad + 1; gT482Sum = gT482Sum + c; int d = t482Use(((t482Mk()->heap + 1))); if (gT482Dtors != 4 * i + 4) gT482Bad = gT482Bad + 1; gT482Sum = gT482Sum + d; } }
+
+// T485: nested address/deref, cast paths end owning receiver temps once.
+int gT485Dtors = 0;
+int gT485Sum = 0;
+int gT485Bad = 0;
+struct T485Res { int v = 6; int[2] values; int* heap = nullptr; T485Res() { values[0] = 6; values[1] = 7; heap = &values[0]; } ~T485Res() { gT485Dtors = gT485Dtors + 1; v = -999; values[0] = -999; values[1] = -999; } };
+unique<T485Res> t485Mk() { return unique<T485Res>(new T485Res()); }
+void t485AmpDeref() { for (int i = 0; i < 10; i = i + 1) { int v = *(&t485Mk()->v); if (gT485Dtors != i + 1) gT485Bad = gT485Bad + 1; gT485Sum = gT485Sum + v; } }
+void t485PointerAdd() { for (int i = 0; i < 10; i = i + 1) { int[2] arr; arr[0] = 10; arr[1] = 20; int* p = &arr[0] + *(&t485Mk()->v) - 6; if (gT485Dtors != i + 1) gT485Bad = gT485Bad + 1; gT485Sum = gT485Sum + *p; } }
+void t485AliasPointerAdd() { for (int i = 0; i < 10; i = i + 1) { int[2] arr; arr[0] = 10; arr[1] = 20; alias int* p = &arr[0] + *(&t485Mk()->v) - 6; if (gT485Dtors != i + 1) gT485Bad = gT485Bad + 1; gT485Sum = gT485Sum + *p; } }
+void t485CastDeref() { for (int i = 0; i < 10; i = i + 1) { int v = *(int*)(t485Mk()->heap + 1); if (gT485Dtors != i + 1) gT485Bad = gT485Bad + 1; gT485Sum = gT485Sum + v; } }
+// Escaping pointers (B1/B2/B3/B6/B8) keep their owner alive; values and dtor counts match master.
+int* gT485Saved = nullptr;
+struct T485S { int n = 0; };
+void t485Store(int* p) { gT485Saved = p; }
+int t485Store2(int* p) { gT485Saved = p; return 0; }
+int* t485Id(int* p) { return p; }
+void t485AmpStarAmp() { for (int i = 0; i < 10; i = i + 1) { int* p = &*(&t485Mk()->v); gT485Sum = gT485Sum + *p; } }
+void t485StoreAmpStarAmp() { for (int i = 0; i < 10; i = i + 1) { t485Store(&*(&t485Mk()->v)); gT485Sum = gT485Sum + *gT485Saved; } }
+void t485IdPlusZero() { for (int i = 0; i < 10; i = i + 1) { int* r = t485Id(&t485Mk()->v) + 0; gT485Sum = gT485Sum + *r; } }
+void t485AddStore2() { for (int i = 0; i < 10; i = i + 1) { int x = 1 + t485Store2(&t485Mk()->v); gT485Sum = gT485Sum + *gT485Saved + x; } }
+void t485AliasPtrMinusArrow() { for (int i = 0; i < 10; i = i + 1) { T485S s; T485S* sp = &s; alias int* r = t485Mk()->heap - sp->n; gT485Sum = gT485Sum + *r; } }
+
 int testArrowOwnedTempMember()
 {
     int passed = 0;
@@ -17471,6 +18129,88 @@ int testArrowOwnedTempMember()
     t211PointerEscape();
     passed += Test("t211_pointer_escape_value", gT211Sum, 3000);
     passed += Test("t211_pointer_escape_dtors", gT211Dtors, 1000);
+    gT480Dtors = 0; gT480Sum = 0; gT480Bad = 0;
+    t480CallArgs();
+    gT480CallMetric = gT480Dtors * 100 + gT480Sum;
+    gT480CallBad = gT480Bad;
+    gT480Dtors = 0; gT480Sum = 0; gT480Bad = 0;
+    t480IndexMethod();
+    gT480IndexMethodMetric = gT480Dtors * 100 + gT480Sum;
+    gT480IndexMethodBad = gT480Bad;
+    gT480Dtors = 0; gT480Sum = 0; gT480Bad = 0;
+    t480ByValue();
+    gT480ByValueMetric = gT480Dtors * 100 + gT480Sum;
+    gT480ByValueBad = gT480Bad;
+    bool shapesOk = gT480CallMetric == 2080 && gT480IndexMethodMetric == 2080
+        && gT480ByValueMetric == 1040;
+    passed += Test("t480_values_and_dtors", shapesOk ? 1 : 0, 1);
+    bool timingOk = gT480CallBad == 0 && gT480IndexMethodBad == 0 && gT480ByValueBad == 0;
+    passed += Test("t480_full_expression_timing", timingOk ? 1 : 0, 1);
+    gT482Dtors = 0; gT482Sum = 0; gT482Bad = 0;
+    t482DerefAddStatement();
+    passed += Test("t482_deref_statement_dtors", gT482Dtors, 10);
+    passed += Test("t482_deref_statement_value", gT482Sum, 70);
+    passed += Test("t482_deref_statement_timing", gT482Bad, 0);
+    gT482Dtors = 0; gT482Sum = 0; gT482Bad = 0;
+    t482DerefAddDeclaration();
+    passed += Test("t482_deref_declaration_dtors", gT482Dtors, 10);
+    passed += Test("t482_deref_declaration_value", gT482Sum, 70);
+    passed += Test("t482_deref_declaration_timing", gT482Bad, 0);
+    gT482Dtors = 0; gT482Sum = 0; gT482Bad = 0;
+    t482DerefNestedParens();
+    passed += Test("t482_deref_parens_dtors", gT482Dtors, 10);
+    passed += Test("t482_deref_parens_value", gT482Sum, 70);
+    passed += Test("t482_deref_parens_timing", gT482Bad, 0);
+    gT482Dtors = 0; gT482Sum = 0; gT482Bad = 0;
+    t482IndexControl();
+    passed += Test("t482_index_control_dtors", gT482Dtors, 10);
+    passed += Test("t482_index_control_value", gT482Sum, 70);
+    passed += Test("t482_index_control_timing", gT482Bad, 0);
+    gT482Dtors = 0; gT482Sum = 0; gT482Bad = 0;
+    t482CallArgumentShapes();
+    passed += Test("t482_call_args_dtors", gT482Dtors, 40);
+    passed += Test("t482_call_args_value", gT482Sum, 260);
+    passed += Test("t482_call_args_timing", gT482Bad, 0);
+    gT485Dtors = 0; gT485Sum = 0; gT485Bad = 0;
+    t485AmpDeref();
+    passed += Test("t485_amp_deref_dtors", gT485Dtors, 10);
+    passed += Test("t485_amp_deref_value", gT485Sum, 60);
+    passed += Test("t485_amp_deref_timing", gT485Bad, 0);
+    gT485Dtors = 0; gT485Sum = 0; gT485Bad = 0;
+    t485PointerAdd();
+    passed += Test("t485_pointer_add_dtors", gT485Dtors, 10);
+    passed += Test("t485_pointer_add_value", gT485Sum, 100);
+    passed += Test("t485_pointer_add_timing", gT485Bad, 0);
+    gT485Dtors = 0; gT485Sum = 0; gT485Bad = 0;
+    t485AliasPointerAdd();
+    passed += Test("t485_alias_pointer_add_dtors", gT485Dtors, 10);
+    passed += Test("t485_alias_pointer_add_value", gT485Sum, 100);
+    passed += Test("t485_alias_pointer_add_timing", gT485Bad, 0);
+    gT485Dtors = 0; gT485Sum = 0; gT485Bad = 0;
+    t485CastDeref();
+    passed += Test("t485_cast_deref_dtors", gT485Dtors, 10);
+    passed += Test("t485_cast_deref_value", gT485Sum, 70);
+    passed += Test("t485_cast_deref_timing", gT485Bad, 0);
+    gT485Dtors = 0; gT485Sum = 0; gT485Bad = 0;
+    t485AmpStarAmp();
+    passed += Test("t485_amp_star_amp_dtors", gT485Dtors, 0);
+    passed += Test("t485_amp_star_amp_value", gT485Sum, 60);
+    gT485Dtors = 0; gT485Sum = 0; gT485Bad = 0;
+    t485StoreAmpStarAmp();
+    passed += Test("t485_store_amp_star_amp_dtors", gT485Dtors, 0);
+    passed += Test("t485_store_amp_star_amp_value", gT485Sum, 60);
+    gT485Dtors = 0; gT485Sum = 0; gT485Bad = 0;
+    t485IdPlusZero();
+    passed += Test("t485_id_plus_zero_dtors", gT485Dtors, 0);
+    passed += Test("t485_id_plus_zero_value", gT485Sum, 60);
+    gT485Dtors = 0; gT485Sum = 0; gT485Bad = 0;
+    t485AddStore2();
+    passed += Test("t485_add_store2_dtors", gT485Dtors, 0);
+    passed += Test("t485_add_store2_value", gT485Sum, 70);
+    gT485Dtors = 0; gT485Sum = 0; gT485Bad = 0;
+    t485AliasPtrMinusArrow();
+    passed += Test("t485_alias_ptr_minus_arrow_dtors", gT485Dtors, 10);
+    passed += Test("t485_alias_ptr_minus_arrow_value", gT485Sum, 60);
     return passed;
 }
 
@@ -18709,6 +19449,8 @@ class T476AutoImpl : T476AutoIface
     ~T476AutoImpl() { t376ChainDtors = t376ChainDtors + 1; }
 };
 struct T476AutoIfaceBox { unique T476AutoIface i = default; };
+using T479IfaceAlias = T476AutoIface;
+struct T479IfaceAliasBox { unique T479IfaceAlias i = default; };
 struct T376Implicit
 {
     unique T376PS* p = nullptr;
@@ -19029,6 +19771,134 @@ int testT476AutoUniqueFieldAcceptSet()
     after = (i64)HeapAudit.reportLeaks() - before;
     passed += Test("t476_struct_auto_field_read_move_value_dtor_heap",
         value == 476 && sourceState && t376ChainDtors == 1 && live == 1 && after == 0, true);
+    return passed;
+}
+
+int testT479UniqueInterfaceFieldChain()
+{
+    int passed = 0;
+    int value = 0;
+    bool fieldsNull = false;
+    i64 before = 0;
+    i64 live = 0;
+    i64 after = 0;
+    HeapAudit.enable();
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T476AutoIfaceBox w = default;
+        T476AutoIfaceBox w2 = default;
+        w.i = w2.i = new T476AutoImpl();
+        value = w.i.tag();
+        fieldsNull = w2.i == nullptr;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t479_iface_field_chain_value_dtor_heap",
+        value == 476 && fieldsNull && t376ChainDtors == 1 && live == 1 && after == 0, true);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T476AutoIfaceBox w = default;
+        T476AutoIfaceBox w2 = default;
+        w.i = (w2.i = new T476AutoImpl());
+        value = w.i.tag();
+        fieldsNull = w2.i == nullptr;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t479_iface_field_chain_paren_value_dtor_heap",
+        value == 476 && fieldsNull && t376ChainDtors == 1 && live == 1 && after == 0, true);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T476AutoIfaceBox w = default;
+        T476AutoIfaceBox w2 = default;
+        T476AutoIfaceBox w3 = default;
+        w.i = w2.i = w3.i = new T476AutoImpl();
+        value = w.i.tag();
+        fieldsNull = w2.i == nullptr && w3.i == nullptr;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t479_iface_field_chain_three_value_dtor_heap",
+        value == 476 && fieldsNull && t376ChainDtors == 1 && live == 1 && after == 0, true);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T479IfaceAliasBox w = default;
+        T479IfaceAliasBox w2 = default;
+        w.i = w2.i = new T476AutoImpl();
+        value = w.i.tag();
+        fieldsNull = w2.i == nullptr;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t479_iface_field_chain_alias_value_dtor_heap",
+        value == 476 && fieldsNull && t376ChainDtors == 1 && live == 1 && after == 0, true);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        MoveBox<unique T476AutoIface> w = default;
+        MoveBox<unique T476AutoIface> w2 = default;
+        w.t = w2.t = new T476AutoImpl();
+        value = w.t.tag();
+        fieldsNull = w2.t == nullptr;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t479_iface_field_chain_generic_value_dtor_heap",
+        value == 476 && fieldsNull && t376ChainDtors == 1 && live == 1 && after == 0, true);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T476AutoIfaceBox w = default;
+        T476AutoIfaceBox w2 = default;
+        w2.i = new T476AutoImpl();
+        w.i = w2.i;
+        value = w.i.tag();
+        fieldsNull = w2.i == nullptr;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t479_iface_field_nonchain_control_value_dtor_heap",
+        value == 476 && fieldsNull && t376ChainDtors == 1 && live == 1 && after == 0, true);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T376Inner w = default;
+        T376Inner w2 = default;
+        w.p = w2.p = new T376PS(479);
+        value = w.p->v;
+        fieldsNull = w2.p == nullptr;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t479_struct_field_chain_value_dtor_heap",
+        value == 479 && fieldsNull && t376ChainDtors == 1 && live == 1 && after == 0, true);
+
+    t376ChainDtors = 0;
+    before = (i64)HeapAudit.reportLeaks();
+    {
+        T376Inner w = default;
+        T376Inner w2 = default;
+        w2.p = new T376PS(479);
+        w.p = w2.p;
+        value = w.p->v;
+        fieldsNull = w2.p == nullptr;
+        live = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks() - before;
+    passed += Test("t479_struct_field_nonchain_control_value_dtor_heap",
+        value == 479 && fieldsNull && t376ChainDtors == 1 && live == 1 && after == 0, true);
+
     return passed;
 }
 
@@ -21004,5 +21874,55 @@ int testT364NativeOperatorReturnFacts()
     passed += Test("t413_readonly_call_then_reset_dtor_count", t382ProbeDtorCount - t382DtorBase, 1);
     passed += Test("t413_readonly_call_then_reset_no_leak", (i64)HeapAudit.reportLeaks() - t382Base, 0);
 
+    t490PlainDtors = 0;
+    int t490Value = 0;
+    { T490Plain local = default; local.value = 3; t490Value = t490TakePlain(move local); }
+    passed += Test("t490_plain_move_param_value", t490Value, 3);
+    passed += Test("t490_plain_move_param_dtors", t490PlainDtors, 1);
+
+    t490PlainDtors = 0;
+    { T490Plain source = default; source.value = 4; T490Plain target = default; target = move source; t490Value = target.value; }
+    passed += Test("t490_plain_assign_move_value", t490Value, 4);
+    passed += Test("t490_plain_assign_move_dtors", t490PlainDtors, 2);
+
+    t490PlainDtors = 0;
+    { T490Plain local = default; local.value = 5; _ = move local; }
+    passed += Test("t490_plain_discard_move_dtors", t490PlainDtors, 1);
+
+    t490PlainDtors = 0;
+    { T490Plain result = t490ReturnPlain(); t490Value = result.value; }
+    passed += Test("t490_plain_return_move_value", t490Value, 6);
+    passed += Test("t490_plain_return_move_dtors", t490PlainDtors, 1);
+
+    t490PlainDtors = 0;
+    t490Value = t490RunPlainBranch(true, 7) + t490RunPlainBranch(false, 8);
+    passed += Test("t490_plain_branch_move_value", t490Value, 15);
+    passed += Test("t490_plain_branch_move_dtors", t490PlainDtors, 2);
+
+    t490PlainDtors = 0;
+    t490Value = t490RunPlainLoop();
+    passed += Test("t490_plain_loop_move_value", t490Value, 22);
+    passed += Test("t490_plain_loop_move_dtors", t490PlainDtors, 4);
+
+    t490PlainDtors = 0;
+    { T490PlainBox box = default; T490Plain source = default; source.value = 9; box.value = move source; t490Value = box.value.value; }
+    passed += Test("t490_plain_field_move_value", t490Value, 9);
+    passed += Test("t490_plain_field_move_dtors", t490PlainDtors, 2);
+
+    t490PlainDtors = 0;
+    { T490Plain[2] values = default; T490Plain source = default; source.value = 11; values[0] = move source; t490Value = values[0].value; }
+    passed += Test("t490_plain_element_move_value", t490Value, 11);
+    passed += Test("t490_plain_element_move_dtors", t490PlainDtors, 3);
+
+    t490PayloadDtors = 0;
+    t490OwnerDtors = 0;
+    { T490Owner owner = default; owner.item = new T490Payload(); t490TakeOwner(move owner); }
+    passed += Test("t490_owning_field_move_counts", t490OwnerDtors * 10 + t490PayloadDtors, 21);
+
+    expect_error("use of moved variable 'local'") {
+        T490Plain local = default;
+        t490TakePlain(move local);
+        int movedRead = local.value;
+    }
     return passed;
 }

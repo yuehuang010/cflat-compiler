@@ -7570,6 +7570,8 @@ static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
     if (s.ReturnsAlias) o["ra"] = true;
     if (s.ReturnsAliasOfByValueParam) o["rabv"] = true;
     if (s.ReturnsGlobalBorrow) o["rgb"] = true;
+    if (s.ReturnsParameterBorrow) o["rpb"] = true;
+    if (s.ReturnsSingleParameterIndex >= 0) o["rpi"] = s.ReturnsSingleParameterIndex;
     if (s.HasCFlatBody) o["cb"] = true;
     if (s.CannotUnwind) o["nu"] = true;
     if (!s.NoUnwindExternDeps.empty())
@@ -7751,8 +7753,8 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     // `alias T` parameter reference ABI; v11 adds closure capture-cleanup MOVE mode 2; v12 adds
     // const floating global admission names; v13 stores function origin metadata; v16 adds
     // const interface methods; v17 function-type pointee const masks; v18 C/C++ pointee, reference
-    // and field const folded into ConstMask).
-    root["version"]   = 20;
+    // and field const folded into ConstMask; v22 borrowed pointer-return summaries and provenance.
+    root["version"]   = 22;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
     if (CacheBuildStampEnabled()) root["cstamp"] = CompilerBuildStamp();
@@ -8243,7 +8245,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 20) return false;
+    if (!ver || *ver != 22) return false;
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != coreHash) return false;
     if (CacheBuildStampEnabled())
@@ -8464,6 +8466,9 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (auto v = fo->getBoolean("ra")) sym.ReturnsAlias = *v;
             if (auto v = fo->getBoolean("rabv")) sym.ReturnsAliasOfByValueParam = *v;
             if (auto v = fo->getBoolean("rgb")) sym.ReturnsGlobalBorrow = *v;
+            if (auto v = fo->getBoolean("rpb")) sym.ReturnsParameterBorrow = *v;
+            if (auto v = fo->getInteger("rpi"))
+                sym.ReturnsSingleParameterIndex = static_cast<int>(*v);
             if (auto v = fo->getBoolean("cb")) sym.HasCFlatBody = *v;
             if (auto v = fo->getBoolean("nu")) sym.CannotUnwind = *v;
             if (auto* nd = fo->getArray("nud"))

@@ -1099,7 +1099,7 @@ LLVMBackend::FuncPtrComponent LLVMBackend::FuncPtrComponentOf(const std::string&
         }
         else
         {
-            if (scalar == "v") { c.Known = true; c.VoidPointee = true; c.Canon = "p:v"; return c; }
+            if (scalar == "v") { c.Known = true; c.Canon = "p:v"; return c; }
             if (!scalar.empty()) { c.Known = true; c.Canon = "p:" + scalar; return c; }
         }
         // The declaring-scope key recorded where the spelling still had a scope; with none recorded
@@ -1123,12 +1123,6 @@ bool LLVMBackend::ComponentsProvablyDiffer(const FuncPtrComponent& a, const Func
         if ((a.IsArrayView || b.IsArrayView)
             && a.ConstMask >= 0 && b.ConstMask >= 0 && a.ConstMask != b.ConstMask)
             return true;
-        if (a.VoidPointee || b.VoidPointee)
-        {
-            bool aPtr = a.Canon.rfind("p:", 0) == 0;
-            bool bPtr = b.Canon.rfind("p:", 0) == 0;
-            if (aPtr && bPtr) return false;
-        }
         if (a.Canon != b.Canon) return true;
         // Same pointee, different number of '*'. Canon collapses every depth onto one "p:" token,
         // so this is the only place `int*` and `int**` are told apart - and an unrecorded depth (0)
@@ -1541,16 +1535,15 @@ std::string LLVMBackend::FuncPtrValueOwnershipReason(const LLVMBackend::NamedVar
         if (dst.FuncPtrReturnTypeName.empty() && !dst.Pointer)
             if (const auto* encoded = GetEncodedClosureType(dst.TypeName))
                 dst = *encoded;
-        // Identity, not the binder's compatibility: a void* overload binds any pointer but is not
-        // the overload the slot resolves to.
+        // Identity, not the move-only compatibility check: only an exact signature resolves here.
         auto bindsExactly = [&](const TypeAndValue& sig) {
             std::vector<FuncPtrComponent> sa, sb;
             if (sig.FuncPtrParams.size() != dst.FuncPtrParams.size() || sig.FuncPtrVariadic != dst.FuncPtrVariadic
                 || !FuncPtrSignatureOf(sig, sa) || !FuncPtrSignatureOf(dst, sb) || sa.size() != sb.size())
                 return false;
             for (size_t i = 0; i < sa.size(); i++)
-                if (!sa[i].Known || !sb[i].Known || sa[i].VoidPointee != sb[i].VoidPointee
-                    || sa[i].IsArrayView != sb[i].IsArrayView || sa[i].Canon != sb[i].Canon
+                if (!sa[i].Known || !sb[i].Known || sa[i].IsArrayView != sb[i].IsArrayView
+                    || sa[i].Canon != sb[i].Canon
                     || sa[i].StructKey != sb[i].StructKey || sa[i].PointerDepth != sb[i].PointerDepth)
                     return false;
             return FuncPtrValueOwnershipReason(sig, slot).empty();

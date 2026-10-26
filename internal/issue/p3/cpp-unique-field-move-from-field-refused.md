@@ -1,5 +1,7 @@
 # p3: move of a C++ unique field into another unique field is refused as "source must be a variable"
 
+**RULED 2026-10-24 (main session, bridge transparency - a use site must not know CFlat vs C++; maintainer may veto):** a field path IS a valid move source for a C++ class move-assignment: `h.w = move g.w;` consumes the source field path and revives the destination exactly as the CFlat twin `t.p = move s.p;` does. Buildable.
+
 Needs a ruling: is a field path a valid source for a C++ class move-assignment (`h.w = move g.w;`)?
 The CFlat twin accepts `t.p = move s.p;` (Test/errors/err_unique_field_consume_read.cb legs).
 

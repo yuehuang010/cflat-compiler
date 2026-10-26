@@ -1,0 +1,86 @@
+struct N { int id = 0; };
+struct Holder { unique N* p = nullptr; };
+unique N* globalOwner = nullptr;
+N* borrowFirstResource(N* a, N* b) { return a; }
+N* mixedReturnResource(N* p, bool c) { if (c) { return p; } return nullptr; }
+
+expect_error("cannot assign unique") {
+    void rejectLocal() {
+        unique N* h = new N();
+        unique N* owner = nullptr;
+        owner = borrowFirstResource(h, new N());
+    }
+}
+
+expect_error("cannot assign borrowed value") {
+    void rejectField() {
+        Holder box = default;
+        unique N* h = new N();
+        box.p = borrowFirstResource(h, new N());
+    }
+}
+
+expect_error("cannot assign unique") {
+    void rejectGlobal() {
+        unique N* h = new N();
+        globalOwner = borrowFirstResource(h, new N());
+    }
+}
+
+expect_error("cannot assign unique") {
+    void rejectTernaryArgument() {
+        unique N* h = new N();
+        bool useNew = true;
+        unique N* owner = nullptr;
+        owner = borrowFirstResource(h, useNew ? new N() : nullptr);
+    }
+}
+
+expect_error("cannot assign unique") {
+    void rejectTernaryNullArgument() {
+        unique N* h = new N();
+        bool useNew = false;
+        unique N* owner = nullptr;
+        owner = borrowFirstResource(h, useNew ? new N() : nullptr);
+    }
+}
+
+expect_error("cannot assign unique") {
+    void rejectMixedReturn() {
+        unique N* owner = nullptr;
+        owner = mixedReturnResource(new N(), true);
+    }
+}
+
+N* globalN = nullptr;
+N* pick<T>(N* p) {
+    if const (sizeof(T) == 4) { return globalN; }
+    else { return p; }
+}
+
+// i64 selects the parameter return; int selects the global return on this host.
+expect_error("cannot assign unique") {
+    void rejectGenericParameterReturn() {
+        unique N* owner = nullptr;
+        owner = pick<i64>(nullptr);
+    }
+}
+
+expect_error("cannot initialize unique") {
+    void rejectGenericGlobalReturn(bool choose) {
+        unique N* owner = nullptr;
+        owner = choose ? pick<int>(nullptr) : nullptr;
+    }
+}
+
+N* deadPick(N* p) {
+    if const (false) { return p; }
+    else { return globalN; }
+}
+
+expect_error("cannot initialize unique") {
+    void rejectDeadIfConstReturn(bool choose) {
+        unique N* owner = nullptr;
+        owner = choose ? deadPick(nullptr) : nullptr;
+    }
+}

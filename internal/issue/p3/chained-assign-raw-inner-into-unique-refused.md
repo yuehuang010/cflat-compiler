@@ -28,11 +28,4 @@ and declaration agree. Steer: `owner = move r.raw;` or `owner = new PS();`.
 ## T443 (2026-10-23): ternary into unique + borrowed-global call landed; open below
 Fixed: `owner = k ? raw : nullptr` (decl and assign) consumes the selected arm like if/else; `owner = pick()` is refused when
 every return of the callee is a module global (parse-tree summary, order-independent, per generic instance).
-- NEEDS RULING (part 2 of the 2026-10-21 ruling): a call returning a PARAMETER borrow stays accepted on assignment while the
-  declaration refuses it. Refusing it breaks accept legs test_move.cb:2823 (`borrowed = borrowFirstResource(h, new Resource())`),
-  :2869, :2882, :3049 (`m = mixedReturnResource(makeIdResource(51), true)`) and the alias-proof family. Change those legs, or keep
-  the parameter-borrow call accepted on assignment?
-- Gap (T443 Sol r4): the return summary counts returns in DISCARDED `if const` branches, so `N* pick<T>(N* p) { if const
-  (sizeof(T)==4) { return g; } else { return p; } }` leaves pick<int> unflagged and `owner = pick<int>(nullptr)` compiles. Fix:
-  collect live returns only, using the if-const evaluator per instance. Repros scratch/repro_keep/box1022/t443/ (generic_ifconst*.cb, ifconst_dead.cb).
 - `j_field` residual (T266) unchanged.

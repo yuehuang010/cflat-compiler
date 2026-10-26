@@ -2092,6 +2092,7 @@ struct T218OwnedArray { T218Owned[2] h; };
 T129UserCtor T218Make() { T129UserCtor r = { m = 9 }; return r; }
 T218Owned T218MakeOwned() { T218Owned r = default; r.u = unique<T218Own>(new T218Own()); return r; }
 struct T253HV { t253.Counted m; int k = 1; };
+struct T483W { T253HV h; int z = 0; };
 struct T253OV { T253HV[2] h; };
 struct T253HU { t253.Counted m; int k = 1; T253HU() { k = 2; } };
 struct T253OU { T253HU[2] h; };
@@ -2100,6 +2101,11 @@ struct T253Owned { t253.Counted m; unique<T218Own> u; int k = 1; };
 struct T253FallbackHolder { t253.Fallback f; };
 T253HV t330MakeHV() { T253HV r = default; r.m.value = 5; return r; }
 T253HV t330MakeHV9() { T253HV r = default; r.m.value = 9; return r; }
+int t483TakeHV(T253HV h) { return h.m.value; }
+T253HV t483ReturnHV() { return move t330MakeHV(); }
+T483W t483MakeW() { T483W w = { h = t330MakeHV() }; return w; }
+T253Plain t483MakePlain() { T253Plain p = default; p.value = 17; return p; }
+int t483TakePlain(T253Plain p) { return p.value; }
 // T258: a named struct-field `move` (`{ h = move x }`) of a lowered CFlat struct with C++ members.
 struct T258Holder { T253HV h; int z = 0; };
 struct T258Outer { T258Holder inner; int q = 0; };
@@ -2578,6 +2584,7 @@ int t331OverrideCalls = 0;
         return cppt331.throw_if_positive(value.value);
     }
 };
+struct T488CppFieldHolder { cppt331.Counted item = cppt331.Counted(37); };
 
 int t335SetThroughConstParam(const T217KM* p)
 {
@@ -15579,6 +15586,8 @@ extern int main()
     flexTail->data[1] = 74;
     int* flexDecay = flexTail->data;
     if (flexTail->data[0] + flexDecay[1] != 147) return 7470;
+    int* flexFirstAddress = &flexTail->data[0];
+    if (flexFirstAddress != flexTail->data || *flexFirstAddress != 73) return 7496;
     free(flexTail);
     exprSum = exprA + exprA;
     if (exprSum.sum() != 12.0) return 7465;
@@ -18566,6 +18575,42 @@ int LoweredUserDtorAssignLegs(int argc)
     }
     if (t330TrueValue != 1005 || t330FalseValue != 1009 || t253.ctors() != 4
         || t253.copies() != 0 || t253.moves() != 2 || t253.dtors() != 4) return 25404;
+    // T483: explicit moves of call results must run the C++ member move and destroy every shell.
+    t253.reset();
+    { t258A = t483TakeHV(move t330MakeHV()); }
+    if (t258A != 1005 || t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25440;
+    t253.reset();
+    { T253HV d = t483ReturnHV(); t258A = d.m.value; }
+    if (t258A != 1005 || t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25441;
+    t253.reset();
+    { T253HV d = move t483MakeW().h; t258A = d.m.value; }
+    if (t258A != 1005 || t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25442;
+    t253.reset();
+    {
+        T258Holder d = { h = move (true ? t330MakeHV() : t330MakeHV9()) };
+        t258A = d.h.m.value;
+    }
+    if (t258A != 1005 || t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25443;
+    t253.reset();
+    {
+        T258Holder d = { h = move (false ? t330MakeHV() : t330MakeHV9()) };
+        t258A = d.h.m.value;
+    }
+    if (t258A != 1009 || t253.ctors() != 2 || t253.copies() != 0 || t253.moves() != 1
+        || t253.dtors() != 2) return 25444;
+    // T483 controls: a non-move call argument keeps C++17 elision, and a plain CFlat struct stays plain.
+    t253.reset();
+    { t258A = t483TakeHV(t330MakeHV()); }
+    if (t258A != 5 || t253.ctors() != 1 || t253.copies() != 0 || t253.moves() != 0
+        || t253.dtors() != 1) return 25445;
+    t253.reset();
+    { t258A = t483TakePlain(move t483MakePlain()); }
+    if (t258A != 17 || t253.ctors() != 0 || t253.copies() != 0 || t253.moves() != 0
+        || t253.dtors() != 0) return 25446;
     // T261: a field initializer that throws unwinds the fields already built, once each.
     t261.reset();
     t258A = t261.guarded(t261Pair, 1);
@@ -19186,6 +19231,18 @@ int LoweredUserDtorAssignLegs(int argc)
         if (thrown != -13 || t331OverrideCalls != 1 || cppt331.Counted.ctors != 1
             || cppt331.Counted.copies != 0 || cppt331.Counted.moves != 1
             || cppt331.Counted.dtors != 2 || cppt331.Counted.live != 0) return 33102;
+    }
+    // T488 control: an imported C++ class field keeps its value and destructor count.
+    {
+        cppt331.Counted.reset();
+        int value = -1;
+        {
+            T488CppFieldHolder holder = default;
+            value = holder.item.value;
+        }
+        if (value != 37 || cppt331.Counted.ctors != 1 || cppt331.Counted.copies != 0
+            || cppt331.Counted.moves != 0 || cppt331.Counted.dtors != 1
+            || cppt331.Counted.live != 0) return 48801;
     }
     // T340: an immovable by-value C++ parameter reaches the CFlat body without construction.
     {

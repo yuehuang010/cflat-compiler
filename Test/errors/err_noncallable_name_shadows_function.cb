@@ -1,0 +1,34 @@
+T id<T>(T value) { return value; }
+int plainId(int value) { return value; }
+int wrap(int value) { return value; }
+
+expect_error("is a variable of type 'int' and cannot be called; it hides function") {
+    int t484LocalGeneric() { int id = 5; return id(4); }
+}
+expect_error("is a variable of type 'int' and cannot be called; it hides function") {
+    int t484LocalNonGeneric() { int plainId = 5; return plainId(4); }
+}
+expect_error("is a variable of type 'int' and cannot be called; it hides function") {
+    int t484ParamGeneric(int id) { return id(3); }
+}
+expect_error("is a variable of type 'int' and cannot be called; it hides function") {
+    int t484ParamNonGeneric(int plainId) { return plainId(3); }
+}
+expect_error("is a variable of type 'int' and cannot be called; it hides function") {
+    int t484ExplicitGeneric() { int id = 5; return id<int>(4); }
+}
+expect_error("is a variable of type 'int' and cannot be called; it hides function") {
+    int t484NestedGeneric() { int id = 5; return wrap(id(4)); }
+}
+expect_error("is a variable of type 'int' and cannot be called; it hides function") {
+    struct T484GenericField { int id = 5; int call() { return id(4); } };
+}
+expect_error("is a variable of type 'int' and cannot be called; it hides function") {
+    struct T484NonGenericField { int plainId = 5; int call() { return plainId(4); } };
+}
+expect_error("is a variable of type 'int' and cannot be called; it hides function") {
+    namespace T484GenericGlobal { int id = 5; int call() { return id(3); } };
+}
+expect_error("is a variable of type 'int' and cannot be called; it hides function") {
+    namespace T484NonGenericGlobal { int plainId = 5; int call() { return plainId(3); } };
+}

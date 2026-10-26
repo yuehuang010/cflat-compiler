@@ -258,6 +258,17 @@ expect_error("cannot initialize unique<IUniqueThing> 'fatBorrowVsNewUnique' from
     }
 }
 
+// T479: a chained assignment between unique interface LOCALS stays refused (the field chain is accepted).
+expect_error("cannot assign a borrowed value to unique interface 'chainA'") {
+    int t479LocalIfaceChain()
+    {
+        unique IUniqueThing chainA = default;
+        unique IUniqueThing chainB = default;
+        chainA = chainB = new UniqueIfaceThing();
+        return 0;
+    }
+}
+
 // Same mixed join, spelled as an ASSIGNMENT to an already-declared unique interface local rather
 // than a decl-initializer. The assign-form reject has its own wording (LValue assignment path).
 expect_error("cannot assign a borrowed value to unique interface 'mixedIfaceAssign'") {

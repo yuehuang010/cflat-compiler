@@ -1810,6 +1810,100 @@ bool LLVMBackend::SameNonLocalViewStorage(const llvm::Value* left,
         return true;
 }
 
+void LLVMBackend::DisarmNonLocalViewFieldsForEscape(const llvm::Value* storage,
+                                                     bool includeDescendants)
+{
+        if (storage == nullptr || builder == nullptr || !IsInsertBlockLive()) return;
+        struct StoragePath
+        {
+            const llvm::Value* Root = nullptr;
+            std::vector<const llvm::Value*> Indices;
+        };
+        auto normalize = [](const llvm::Value* value) {
+            StoragePath path;
+            while (value != nullptr)
+            {
+                value = value->stripPointerCasts();
+                if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+                {
+                    value = load->getPointerOperand();
+                    continue;
+                }
+                if (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
+                {
+                    std::vector<const llvm::Value*> segment;
+                    for (auto index = gep->idx_begin(); index != gep->idx_end(); ++index)
+                        segment.push_back(*index);
+                    path.Indices.insert(path.Indices.begin(), segment.begin(), segment.end());
+                    value = gep->getPointerOperand();
+                    continue;
+                }
+                break;
+            }
+            path.Root = value != nullptr ? value->stripPointerCasts() : value;
+            return path;
+        };
+        const StoragePath escapePath = normalize(storage);
+        auto* function = builder->GetInsertBlock()->getParent();
+        for (auto& state : nonLocalViewOwnershipStates_)
+        {
+            if (state.Function != function || state.RootStorage != escapePath.Root) continue;
+            const StoragePath fieldPath = normalize(state.Storage);
+            if (fieldPath.Indices.size() < escapePath.Indices.size()
+                || (!includeDescendants && fieldPath.Indices.size() != escapePath.Indices.size()))
+                continue;
+            bool matches = true;
+            for (size_t i = 0; i < escapePath.Indices.size(); ++i)
+            {
+                const auto* escapeIndex = escapePath.Indices[i];
+                const auto* fieldIndex = fieldPath.Indices[i];
+                if (escapeIndex == fieldIndex) continue;
+                const auto* escapeConstant = llvm::dyn_cast<llvm::ConstantInt>(escapeIndex);
+                const auto* fieldConstant = llvm::dyn_cast<llvm::ConstantInt>(fieldIndex);
+                if (escapeConstant != nullptr && fieldConstant != nullptr
+                    && escapeConstant->getValue() != fieldConstant->getValue())
+                {
+                    matches = false;
+                    break;
+                }
+            }
+            if (!matches) continue;
+            if (state.OwnFlag != nullptr)
+                builder->CreateStore(builder->getInt1(false), state.OwnFlag);
+            if (state.RawArrayLengthStorage != nullptr)
+                builder->CreateStore(builder->getInt64(-1), state.RawArrayLengthStorage);
+        }
+}
+
+llvm::Value* LLVMBackend::RecomputeNonLocalViewFieldStorage(
+        const NonLocalViewOwnershipState& state)
+{
+        if (state.RootStorage == nullptr || builder == nullptr) return nullptr;
+        llvm::Value* storage = state.RootStorage;
+        for (const auto& step : state.AddressPath)
+        {
+            if (step.IsLoad)
+            {
+                if (step.LoadType == nullptr) return nullptr;
+                storage = builder->CreateLoad(step.LoadType, storage, "field.view.ptr");
+                continue;
+            }
+            if (step.SourceType == nullptr) return nullptr;
+            std::vector<llvm::Value*> indices;
+            indices.reserve(step.Indices.size());
+            for (auto* index : step.Indices)
+            {
+                if (auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(index))
+                    indices.push_back(builder->CreateLoad(slot->getAllocatedType(), slot,
+                                                          "field.view.index"));
+                else
+                    indices.push_back(index);
+            }
+            storage = builder->CreateGEP(step.SourceType, storage, indices, "field.view.addr");
+        }
+        return storage;
+}
+
 // Two element-path keys ("root|path") alias when the roots and paths match, or a dynamic index
 // ('*') on either side names the same leaf field: a dynamic element may be any element.
 static bool NonLocalPathKeysAlias(const std::string& left, const std::string& right)
@@ -1848,7 +1942,8 @@ std::string LLVMBackend::NonLocalElementPathKey(const NamedVariable& nv) const
 
 void LLVMBackend::TrackNonLocalViewAssignment(llvm::Value* storage, llvm::Value* value,
         const llvm::Value* sourceStorage, bool sourceTransfersOwnership,
-        const std::string& pathKey, bool sourceKnownBorrowed)
+        const std::string& pathKey, bool sourceKnownBorrowed,
+        const NamedVariable* destination, const NamedVariable* source)
 {
         if (storage == nullptr || builder == nullptr || builder->GetInsertBlock() == nullptr)
             return;
@@ -1861,24 +1956,166 @@ void LLVMBackend::TrackNonLocalViewAssignment(llvm::Value* storage, llvm::Value*
         // A tracked borrowed source is proof; the moved value's raw flags must not override it.
         else if (sourceKnownBorrowed)
             mayBeBorrowed = true;
-        else if (const auto* raw = FindRawArrayResult(value))
+        else if (sourceTransfersOwnership)
         {
-            if (raw->Owns) mayBeBorrowed = false;
-            // A tracked move source proves the transfer; a moved global's raw flags read as not
-            // owned. A mixed join (no tracked source) keeps the raw borrowed signal.
-            else if (sourceTransfersOwnership && sourceStorage != nullptr) mayBeBorrowed = false;
-            else if (const auto* owns = llvm::dyn_cast_or_null<llvm::ConstantInt>(raw->RuntimeOwns))
-                mayBeBorrowed = owns->isZero();
-            else mayBeBorrowed = true;
+            if (const auto* raw = FindRawArrayResult(value))
+            {
+                if (raw->Owns) mayBeBorrowed = false;
+                // A tracked move source proves the transfer; a moved global's raw flags read as not
+                // owned. A mixed join (no tracked source) keeps the raw borrowed signal.
+                else if (sourceStorage != nullptr) mayBeBorrowed = false;
+                else if (const auto* owns = llvm::dyn_cast_or_null<llvm::ConstantInt>(raw->RuntimeOwns))
+                    mayBeBorrowed = owns->isZero();
+                else mayBeBorrowed = true;
+            }
         }
         llvm::Function* function = builder->GetInsertBlock()->getParent();
-        for (auto& state : nonLocalViewOwnershipStates_)
-            if (state.Function == function && SameNonLocalViewStorage(state.Storage, storage))
+        auto stateIt = std::ranges::find_if(nonLocalViewOwnershipStates_, [&](const auto& state) {
+            return state.Function == function && SameNonLocalViewStorage(state.Storage, storage);
+        });
+        if (stateIt == nonLocalViewOwnershipStates_.end())
+        {
+            nonLocalViewOwnershipStates_.push_back({ storage, function, mayBeBorrowed, pathKey });
+            stateIt = std::prev(nonLocalViewOwnershipStates_.end());
+        }
+        stateIt->MayBeBorrowed = mayBeBorrowed;
+
+        if (destination == nullptr || !destination->TypeAndValue.IsArrayView
+            || destination->FieldPathRoot.empty()) return;
+        const auto rootRef = FindVariableStorage(destination->FieldPathRoot);
+        const llvm::Value* rootStorage = rootRef.Storage;
+        auto* root = rootStorage != nullptr
+            ? FindStackVariableByStorage(rootStorage) : nullptr;
+        if (root == nullptr || root->BaseType == nullptr || !root->BaseType->isStructTy()
+            || !llvm::isa<llvm::AllocaInst>(root->Storage)) return;
+
+        stateIt->RootStorage = root->Storage;
+        stateIt->FieldMovePath = FieldMoveKey(*destination);
+        stateIt->FieldType = destination->TypeAndValue;
+        stateIt->BaseType = destination->BaseType;
+        std::vector<NonLocalViewAddressStep> sourceAddressPath;
+        const llvm::Value* pathValue = storage->stripPointerCasts();
+        bool completeAddressPath = true;
+        while (pathValue != root->Storage)
+        {
+            if (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(pathValue))
             {
-                state.MayBeBorrowed = mayBeBorrowed;
-                return;
+                NonLocalViewAddressStep step;
+                step.SourceType = gep->getSourceElementType();
+                for (auto index = gep->idx_begin(); index != gep->idx_end(); ++index)
+                    step.Indices.push_back(index->get());
+                sourceAddressPath.push_back(std::move(step));
+                pathValue = gep->getPointerOperand()->stripPointerCasts();
             }
-        nonLocalViewOwnershipStates_.push_back({ storage, function, mayBeBorrowed, pathKey });
+            else if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(pathValue))
+            {
+                NonLocalViewAddressStep step;
+                step.IsLoad = true;
+                step.LoadType = load->getType();
+                sourceAddressPath.push_back(std::move(step));
+                pathValue = load->getPointerOperand()->stripPointerCasts();
+            }
+            else
+            {
+                completeAddressPath = false;
+                break;
+            }
+        }
+        if (completeAddressPath)
+        {
+            std::ranges::reverse(sourceAddressPath);
+            if (stateIt->AddressPath.size() != sourceAddressPath.size())
+                stateIt->AddressPath.clear();
+            if (stateIt->AddressPath.empty())
+            {
+                stateIt->AddressPath = sourceAddressPath;
+                for (auto& step : stateIt->AddressPath)
+                    if (!step.IsLoad)
+                        for (auto& index : step.Indices)
+                            if (!llvm::isa<llvm::Constant>(index))
+                            {
+                                auto* indexStorage = AllocaAtEntry(index->getType(), nullptr,
+                                                                   "field.view.path.index");
+                                builder->CreateStore(index, indexStorage);
+                                index = indexStorage;
+                            }
+            }
+            else
+            {
+                for (size_t i = 0; i < sourceAddressPath.size(); ++i)
+                {
+                    if (sourceAddressPath[i].IsLoad || stateIt->AddressPath[i].IsLoad) continue;
+                    auto& storedIndices = stateIt->AddressPath[i].Indices;
+                    const auto& currentIndices = sourceAddressPath[i].Indices;
+                    if (storedIndices.size() != currentIndices.size()) continue;
+                    for (size_t j = 0; j < storedIndices.size(); ++j)
+                        if (llvm::isa<llvm::AllocaInst>(storedIndices[j]))
+                            builder->CreateStore(currentIndices[j], storedIndices[j]);
+                }
+            }
+        }
+        if (stateIt->OwnFlag == nullptr)
+        {
+            stateIt->OwnFlag = AllocaAtEntry(builder->getInt1Ty(), nullptr, "field.view.owns");
+            stateIt->RawArrayLengthStorage = AllocaAtEntry(
+                builder->getInt64Ty(), nullptr, "field.view.raw_array_count");
+            llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+            auto* lastAlloca = stateIt->OwnFlag->comesBefore(stateIt->RawArrayLengthStorage)
+                ? stateIt->RawArrayLengthStorage : stateIt->OwnFlag;
+            builder->SetInsertPoint(lastAlloca->getParent(),
+                                    std::next(lastAlloca->getIterator()));
+            builder->CreateStore(builder->getInt1(false), stateIt->OwnFlag);
+            builder->CreateStore(builder->getInt64(-1), stateIt->RawArrayLengthStorage);
+        }
+
+        llvm::Value* owns = builder->getInt1(false);
+        llvm::Value* count = builder->getInt64(-1);
+        llvm::Value* refCount = nullptr;
+        uint64_t allocAlignment = 0;
+        if (const auto* raw = FindRawArrayResult(value))
+        {
+            if (sourceTransfersOwnership)
+            {
+                owns = raw->RuntimeOwns != nullptr
+                    ? raw->RuntimeOwns : builder->getInt1(raw->Owns);
+                if (raw->Count != nullptr) count = Upconvert(raw->Count, builder->getInt64Ty());
+                allocAlignment = raw->AllocAlign;
+            }
+        }
+        else if (sourceTransfersOwnership && sourceStorage != nullptr)
+        {
+            auto sourceField = std::ranges::find_if(nonLocalViewOwnershipStates_, [&](const auto& state) {
+                return state.Function == function && state.Storage != storage
+                    && SameNonLocalViewStorage(state.Storage, sourceStorage)
+                    && state.OwnFlag != nullptr;
+            });
+            if (sourceField != nonLocalViewOwnershipStates_.end())
+            {
+                owns = builder->CreateLoad(builder->getInt1Ty(), sourceField->OwnFlag);
+                count = builder->CreateLoad(builder->getInt64Ty(), sourceField->RawArrayLengthStorage);
+                refCount = sourceField->RefCountStorage;
+                allocAlignment = sourceField->AllocAlignment;
+                builder->CreateStore(builder->getInt1(false), sourceField->OwnFlag);
+            }
+        }
+        if (source != nullptr && source->Storage != nullptr)
+        {
+            if (const auto* live = FindVariableByStorage(source->Storage))
+            {
+                if (sourceTransfersOwnership && live->RefCountStorage != nullptr)
+                {
+                    owns = builder->getInt1(true);
+                    refCount = live->RefCountStorage;
+                }
+                if (sourceTransfersOwnership && live->RawArrayLengthStorage != nullptr)
+                    count = LoadRawArrayLength(*live);
+                if (sourceTransfersOwnership) allocAlignment = live->AllocAlignment;
+            }
+        }
+        stateIt->RefCountStorage = refCount;
+        stateIt->AllocAlignment = allocAlignment;
+        builder->CreateStore(owns, stateIt->OwnFlag);
+        builder->CreateStore(count, stateIt->RawArrayLengthStorage);
 }
 
 std::optional<bool> LLVMBackend::NonLocalViewMayBeBorrowed(const llvm::Value* storage,
@@ -2631,6 +2868,10 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                             if (sourceBindingOwns && wholeBindingSource
                                 && !sourceName.empty())
                                 ClearOwnFlag(sourceName);
+                            if (auto* sourceLoad = llvm::dyn_cast_or_null<llvm::LoadInst>(
+                                    args[i].Primary);
+                                sourceLoad != nullptr && sourceLoad->getPointerOperand() == srcStorage)
+                                NoteOwnSlotLeavingLoad(sourceLoad);
                             // A field or element slot holds one scalar; only a whole binding owns a count.
                             if (args[i].FieldName.empty() && args[i].OwningStructName.empty()
                                 && !args[i].IsElementAccess)
