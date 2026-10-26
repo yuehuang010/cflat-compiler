@@ -45,7 +45,7 @@ int skipSpace(string text, int p)
 move list<EdgarFact>* scanFacts(string text)
 {
     list<EdgarFact>* facts = new list<EdgarFact>;
-    JsonNode* root = JsonParser.parse(text);
+    move JsonNode* root = JsonParser.parse(text);
     if (root == nullptr) return facts;
     IJSON units = root.getObject("units");
     if (units == nullptr) { delete root; return facts; }

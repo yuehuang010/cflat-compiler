@@ -68,7 +68,7 @@ extern int main()
     string body = fromHString(hBody);
 
     // Parse and extract the current_weather fields.
-    JsonNode* root = JsonParser.parse(body);
+    move JsonNode* root = JsonParser.parse(body);
     // wttr.in j1 shape: current_condition[0].{temp_C, FeelsLikeC, windspeedKmph, weatherDesc[0].value}
     IJSON cur = root.getArray("current_condition").getObject(0);
     string temp = cur.getString("temp_C");
@@ -81,6 +81,8 @@ extern int main()
     printf("  Conditions:   %s\n", desc.data());
     printf("  Temperature:  %s C (feels like %s C)\n", temp.data(), feels.data());
     printf("  Wind speed:   %s km/h\n", wind.data());
+
+    delete root;
 
     freeHString(hBody);
     freeHString(hUrl);

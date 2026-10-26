@@ -4008,6 +4008,40 @@ bool testCodeValueJoinAccepts()
     JoinAcc* coalData = nothing ?? py;
     result &= Test("cvj_tern_data_ptr", ternData->a, 5);
     result &= Test("cvj_coal_data_ptr", coalData->a, 6);
+    // Builtin synonyms are one pointee type, so these joins need no cast (as in assignment).
+    i32 synA = 31; int synB = 32; i16 synC = 33; short synD = 34;
+    i32* synPa = &synA; int* synPb = &synB; i32* synNone = nullptr;
+    int* synTern = c > 0 ? synPa : synPb;
+    int* synCoal = synNone ?? synPb;
+    short* synShort = c > 0 ? &synC : &synD;
+    result &= Test("cvj_syn_i32_int_tern", *synTern, 31);
+    result &= Test("cvj_syn_i32_int_coal", *synCoal, 32);
+    result &= Test("cvj_syn_i16_short", *synShort, 33);
+    // `long` is the target's C long: i32 on LLP64 Windows, i64 elsewhere.
+    if const (__WINDOWS__)
+    {
+        i32 synE = 35; long synF = 36;
+        long* synLong = c > 0 ? &synE : &synF;
+        result &= Test("cvj_syn_i32_long", (int)*synLong, 35);
+    }
+    else
+    {
+        i64 synE = 35; long synF = 36;
+        long* synLong = c > 0 ? &synE : &synF;
+        result &= Test("cvj_syn_i64_long", (int)*synLong, 35);
+    }
+
+    JoinAcc* nullArmTern = c > 0 ? px : nullptr;
+    JoinAcc* nullArmCoal = nothing ?? nullptr;
+    void* pxVoid = (void*)px;
+    JoinAcc* explicitVoidArm = c > 0 ? (JoinAcc*)pxVoid : py;
+    void* pyVoid = (void*)py;
+    void* explicitPointerArm = c > 0 ? (void*)px : pyVoid;
+    result &= Test("cvj_tern_null_arm_value", nullArmTern->a, 5);
+    result &= Test("cvj_coal_null_arm_value", nullArmCoal == nullptr ? 1 : 0, 1);
+    result &= Test("cvj_tern_explicit_void_arm", explicitVoidArm->a, 5);
+    result &= Test("cvj_tern_explicit_void_result",
+                   explicitPointerArm == (void*)px ? 1 : 0, 1);
 
     // The CALL RESULT of a function pointer whose return type is a data pointer. The callee is a
     // ledgered code value; its result is not, and joining results must stay legal.
@@ -6228,6 +6262,67 @@ bool testT283AliasDeclCopy()
     return result;
 }
 
+alias T t411Pass<T>(alias T src) { return src; }
+alias Lambda<int(int)> t411PassConcrete(alias Lambda<int(int)> src) { return src; }
+int t411Twice(int x) { return x * 2; }
+Lambda<int(int)> t411Global;
+alias Lambda<int(int)> t411GetGlobal() { return t411Global; }
+struct T411Box
+{
+    Lambda<int(int)> value = default;
+    alias Lambda<int(int)> get() { return value; }
+};
+void t411Replace(alias Lambda<int(int)> slot, Lambda<int(int)> value) { slot = value; }
+int t411Invoke(alias Lambda<int()> slot) { return slot(); }
+
+bool testT411AliasClosureReturn()
+{
+    bool result = true;
+    int k = 3;
+    Lambda<int(int)> n = (int a) => { return a + k; };
+    Lambda<int(int)> w = t411Pass<Lambda<int(int)>>(n);
+    result &= Test("t411 generic alias closure return", w(7), 10);
+    int bias = 5;
+    Lambda<int(int)> source = (int x) => { return x + bias; };
+    Lambda<int(int)> viaConcrete = t411PassConcrete(source);
+    result &= Test("t411 concrete alias closure return", viaConcrete(7), 12);
+    function<int(int)> thinSource = t411Twice;
+    function<int(int)> thinResult = t411Pass<function<int(int)>>(thinSource);
+    thinSource = nullptr;
+    result &= Test("t411 generic thin alias return", thinResult(7), 14);
+    int g = 4;
+    t411Global = (int x) => { return x + g; };
+    Lambda<int(int)> viaGlobal = t411GetGlobal();
+    result &= Test("t411 alias return of global", viaGlobal(7), 11);
+    T411Box box;
+    box.value = (int x) => { return x + bias; };
+    Lambda<int(int)> viaMember = box.get();
+    result &= Test("t411 alias return of member", viaMember(7), 12);
+    int saved = 41;
+    Lambda<int()> cap = () => { return saved; };
+    Lambda<int()> kept = t411Pass<Lambda<int()>>(cap);
+    cap = () => { return 9; };
+    result &= Test("t411 alias return copy outlives reassignment", kept(), 41);
+    Lambda<int(int)> slotA = (int x) => { return x + 1; };
+    Lambda<int(int)> slotB = (int x) => { return x - 1; };
+    t411Replace(slotA, slotB);
+    result &= Test("t411 alias param slot reassignment", slotA(7), 6);
+    int state = 0;
+    Lambda<int()> counter = () => { state++; return state; };
+    int a = counter();
+    int b = t411Invoke(counter);
+    int c = counter();
+    result &= Test("t411 capturing alias param shares state", a * 100 + b * 10 + c, 123);
+    list<Lambda<int(int)>> xs;
+    Lambda<int(int)> element = (int x) => { return x + 4; };
+    xs.add(element);
+    Lambda<int(int)> copied = xs.get(0);
+    xs.set(0, (int x) => { return x + 100; });
+    result &= Test("t411 list alias get copy survives replacement", copied(1), 5);
+    result &= Test("t411 list alias get direct call", xs.get(0)(7), 107);
+    return result;
+}
+
 int t373Read<T>(T* p) { return *p + 100; }
 extern short cbf_ext_def_ret(int value) { return (short)value; }
 extern u8 cbf_ext_def_retu(int value) { return (u8)value; }
@@ -6240,6 +6335,24 @@ int t373Select(float* p) { return 900; }
 int t373ReadChar<T>(T p) { return p[0]; }
 function<int(int*)> t373ReturnRead() { return t373Read; }
 struct T373FunctionHolder { function<int(int*)> callback = t373Read; };
+int t405ConcreteA(int value) { return 7; }
+int t405ConcreteB(int value) { return 8; }
+int t405ReadCharConcreteA(const char* p) { return p[0]; }
+int t405ReadCharConcreteB(const char* p) { return p[0] + 1; }
+int t405ApplyConcrete(function<int(int)> f) { return f(5); }
+function<int(int)> t405ReturnConcrete(bool c) { return c ? t405ConcreteA : t405ConcreteB; }
+int t405GenericA<T>(T value) { return value + 100; }
+int t405GenericB<T>(T value) { return value + 200; }
+int t405ReadCharA<T>(T p) { return p[0] + 1; }
+int t405ReadCharB<T>(T p) { return p[0] + 2; }
+int t405ApplyGeneric(function<int(int)> f) { return f(5); }
+int t405ReadPointer<T>(T* p) { return *p + 100; }
+int t405ReadPointerB<T>(T* p) { return *p + 200; }
+int t405ReadPointerConcrete(int* p) { return 7; }
+int t405ReadPointerConcreteB(int* p) { return 8; }
+function<int(int)> t405ReturnGenericFirst(bool c) { return c ? t405GenericA : t405ConcreteA; }
+function<int(int)> t405ReturnGenericSecond(bool c) { return c ? t405ConcreteA : t405GenericA; }
+function<int(int)> t405ReturnBothGeneric(bool c) { return c ? t405GenericA : t405GenericB; }
 
 bool testT373GenericFunctionNameDestinations()
 {
@@ -6272,6 +6385,112 @@ bool testT373GenericFunctionNameDestinations()
     function<int(int*)> selected = t373Select;
     result &= Test("t373 generic beats mismatching concrete overload", selected(&value), 101);
     result &= Test("t373 C callback destination", c14CallTake(t373ReadChar, "A"), 66);
+
+    // T405 accept-set: concrete function values keep their current ternary results.
+    function<int(int)> concreteDecl = true ? t405ConcreteA : t405ConcreteB;
+    result &= Test("t405 accept declaration concrete ternary", concreteDecl(5), 7);
+    function<int(int)> concreteAssign = t405ConcreteB;
+    concreteAssign = true ? t405ConcreteA : t405ConcreteB;
+    result &= Test("t405 accept assignment concrete ternary", concreteAssign(5), 7);
+    function<int(int)> concreteReturn = t405ReturnConcrete(true);
+    result &= Test("t405 accept return concrete ternary", concreteReturn(5), 7);
+    result &= Test("t405 accept function parameter concrete ternary",
+        t405ApplyConcrete(true ? t405ConcreteA : t405ConcreteB), 7);
+    Lambda<int(int)> concreteLambda = true ? t405ConcreteA : t405ConcreteB;
+    result &= Test("t405 accept Lambda concrete ternary", concreteLambda(5), 7);
+    result &= Test("t405 accept C callback concrete ternary",
+        c14CallTake(true ? t405ReadCharConcreteA : t405ReadCharConcreteB, "A"), 66);
+    function<int(int)>[2] concreteArray = { t405ConcreteA, t405ConcreteB };
+    result &= Test("t405 accept fixed-array concrete elements", concreteArray[0](5), 7);
+    function<int(int)>[] concreteView = { t405ConcreteA, t405ConcreteB };
+    result &= Test("t405 accept view concrete elements", concreteView[0](5), 7);
+    function<int(int)> concreteNested = true
+        ? (true ? t405ConcreteA : t405ConcreteB) : t405ConcreteB;
+    result &= Test("t405 accept nested concrete ternary", concreteNested(5), 7);
+    function<int(int)>? concreteMaybe = nullptr;
+    function<int(int)> concreteCoalesce = concreteMaybe ?? t405ConcreteA;
+    result &= Test("t405 accept concrete coalesce", concreteCoalesce(5), 7);
+
+    function<int(int)> genericDeclFirst = true ? t405GenericA : t405ConcreteA;
+    result &= Test("t405 generic ternary declaration first", genericDeclFirst(5), 105);
+    function<int(int)> genericDeclSecond = false ? t405ConcreteA : t405GenericA;
+    result &= Test("t405 generic ternary declaration second", genericDeclSecond(5), 105);
+    function<int(int)> genericDeclBoth = false ? t405GenericA : t405GenericB;
+    result &= Test("t405 generic ternary declaration both", genericDeclBoth(5), 205);
+    int t405PointerInput = 1;
+    function<int(int*)> genericPointerFirst = true
+        ? t405ReadPointer : t405ReadPointerConcrete;
+    result &= Test("t405 generic pointer ternary first", genericPointerFirst(&t405PointerInput), 101);
+    function<int(int*)> genericPointerSecond = false
+        ? t405ReadPointerConcrete : t405ReadPointer;
+    result &= Test("t405 generic pointer ternary second", genericPointerSecond(&t405PointerInput), 101);
+    function<int(int*)> genericPointerBoth = false
+        ? t405ReadPointer : t405ReadPointerB;
+    result &= Test("t405 generic pointer ternary both", genericPointerBoth(&t405PointerInput), 201);
+    function<int(int*)> concretePointer = true
+        ? t405ReadPointerConcrete : t405ReadPointerConcreteB;
+    result &= Test("t405 concrete pointer ternary control", concretePointer(&t405PointerInput), 7);
+
+    function<int(int)> genericAssignFirst = t405ConcreteA;
+    genericAssignFirst = true ? t405GenericA : t405ConcreteA;
+    result &= Test("t405 generic ternary assignment first", genericAssignFirst(5), 105);
+    function<int(int)> genericAssignSecond = t405ConcreteA;
+    genericAssignSecond = false ? t405ConcreteA : t405GenericA;
+    result &= Test("t405 generic ternary assignment second", genericAssignSecond(5), 105);
+    function<int(int)> genericAssignBoth = t405ConcreteA;
+    genericAssignBoth = false ? t405GenericA : t405GenericB;
+    result &= Test("t405 generic ternary assignment both", genericAssignBoth(5), 205);
+
+    function<int(int)> genericReturnFirst = t405ReturnGenericFirst(true);
+    result &= Test("t405 generic ternary return first", genericReturnFirst(5), 105);
+    function<int(int)> genericReturnSecond = t405ReturnGenericSecond(false);
+    result &= Test("t405 generic ternary return second", genericReturnSecond(5), 105);
+    function<int(int)> genericReturnBoth = t405ReturnBothGeneric(false);
+    result &= Test("t405 generic ternary return both", genericReturnBoth(5), 205);
+
+    result &= Test("t405 generic ternary function parameter first",
+        t405ApplyGeneric(true ? t405GenericA : t405ConcreteA), 105);
+    result &= Test("t405 generic ternary function parameter second",
+        t405ApplyGeneric(false ? t405ConcreteA : t405GenericA), 105);
+    result &= Test("t405 generic ternary function parameter both",
+        t405ApplyGeneric(false ? t405GenericA : t405GenericB), 205);
+
+    Lambda<int(int)> genericLambdaFirst = true ? t405GenericA : t405ConcreteA;
+    result &= Test("t405 generic ternary Lambda first", genericLambdaFirst(5), 105);
+    Lambda<int(int)> genericLambdaSecond = false ? t405ConcreteA : t405GenericA;
+    result &= Test("t405 generic ternary Lambda second", genericLambdaSecond(5), 105);
+    Lambda<int(int)> genericLambdaBoth = false ? t405GenericA : t405GenericB;
+    result &= Test("t405 generic ternary Lambda both", genericLambdaBoth(5), 205);
+
+    result &= Test("t405 generic ternary C callback first",
+        c14CallTake(true ? t405ReadCharA : t405ReadCharConcreteA, "A"), 67);
+    result &= Test("t405 generic ternary C callback second",
+        c14CallTake(false ? t405ReadCharConcreteA : t405ReadCharA, "A"), 67);
+    result &= Test("t405 generic ternary C callback both",
+        c14CallTake(false ? t405ReadCharA : t405ReadCharB, "A"), 68);
+
+    function<int(int)>[2] genericFixedFirst = { t405GenericA, t405ConcreteA };
+    result &= Test("t405 generic fixed-array element first", genericFixedFirst[0](5), 105);
+    function<int(int)>[2] genericFixedSecond = { t405ConcreteA, t405GenericA };
+    result &= Test("t405 generic fixed-array element second", genericFixedSecond[1](5), 105);
+    function<int(int)>[2] genericFixedBoth = { t405GenericA, t405GenericB };
+    result &= Test("t405 generic fixed-array elements both", genericFixedBoth[1](5), 205);
+    function<int(int)>[] genericViewFirst = { t405GenericA, t405ConcreteA };
+    result &= Test("t405 generic view element first", genericViewFirst[0](5), 105);
+    function<int(int)>[] genericViewSecond = { t405ConcreteA, t405GenericA };
+    result &= Test("t405 generic view element second", genericViewSecond[1](5), 105);
+    function<int(int)>[] genericViewBoth = { t405GenericA, t405GenericB };
+    result &= Test("t405 generic view elements both", genericViewBoth[1](5), 205);
+
+    function<int(int)> nestedGenericFirst = true
+        ? (true ? t405GenericA : t405ConcreteA) : t405ConcreteB;
+    result &= Test("t405 nested generic ternary true arm", nestedGenericFirst(5), 105);
+    function<int(int)> nestedGenericSecond = false
+        ? t405ConcreteA : (false ? t405ConcreteB : t405GenericA);
+    result &= Test("t405 nested generic ternary false arm", nestedGenericSecond(5), 105);
+    function<int(int)>? genericMaybe = nullptr;
+    function<int(int)> genericCoalesce = genericMaybe ?? t405GenericA;
+    result &= Test("t405 generic function null-coalesce RHS", genericCoalesce(5), 105);
     return result;
 }
 
@@ -6409,6 +6628,193 @@ bool testT370R2AcceptSet()
         && Test("t370 r2 triple-pointer function-type arg", deepPointerType.value, 42);
 }
 
+// T411 round 2: an inferred function value keeps the alias param, so an indirect call passes the slot.
+int t411IndirectInvoke(alias Lambda<int()> f) { return f(); }
+void t411IndirectSwap(alias Lambda<int()> f) { f = () => { return 99; }; }
+
+bool testT411IndirectAliasClosure()
+{
+    bool result = true;
+    int state = 0;
+    Lambda<int()> f = () => { state++; return state; };
+    function call = t411IndirectInvoke;
+    int a = f();
+    int b = call(f);
+    int c = f();
+    result &= Test("t411 indirect alias closure call", a * 100 + b * 10 + c, 123);
+    function swap = t411IndirectSwap;
+    swap(f);
+    result &= Test("t411 indirect alias closure mutation", f(), 99);
+    return result;
+}
+
+// T411 round 3: matching alias signatures stay interchangeable (assignment and conditional join).
+int t411IdentityA(alias Lambda<int()> f) { return f() + 1; }
+int t411IdentityB(alias Lambda<int()> f) { return f() + 2; }
+
+bool testT411AliasIdentityControls()
+{
+    bool result = true;
+    int state = 5;
+    Lambda<int()> f = () => { return state; };
+    function call = t411IdentityA;
+    function other = t411IdentityB;
+    call = other;
+    result &= Test("t411 matching alias assignment", call(f), 7);
+    bool pick = true;
+    function joined = pick ? t411IdentityA : t411IdentityB;
+    result &= Test("t411 matching alias conditional join", joined(f), 6);
+    return result;
+}
+
+// T411 round 4: two generic instantiations, one with an alias callback and one by value, must not share a key.
+int t411GenAliasFn(alias Lambda<int()> f) { return f() + 1; }
+int t411GenValueFn(Lambda<int()> f) { return f() + 2; }
+int t411GenInvoke<T>(T f, Lambda<int()> g) { return f(g); }
+
+bool testT411GenericAliasKeys()
+{
+    bool result = true;
+    Lambda<int()> f = () => { return 5; };
+    function x = t411GenAliasFn;
+    function y = t411GenValueFn;
+    result &= Test("t411 generic alias instantiation", t411GenInvoke(x, f), 6);
+    result &= Test("t411 generic value instantiation", t411GenInvoke(y, f), 7);
+    result &= Test("t411 generic alias and value combined", t411GenInvoke(x, f) * 10 + t411GenInvoke(y, f), 67);
+    return result;
+}
+
+// Spelled return-alias function types must also get their own generic key.
+struct T411RetBox { int value = default; };
+T411RetBox t411RetGlobal;
+alias T411RetBox t411RetAliasFn() { return t411RetGlobal; }
+T411RetBox t411RetValueFn() { T411RetBox v = { value = 7 }; return v; }
+int t411RetInvoke<T>(T f) { T411RetBox v = f(); return v.value; }
+
+bool testT411SpelledReturnAliasKeys()
+{
+    bool result = true;
+    t411RetGlobal.value = 5;
+    function x = t411RetAliasFn;
+    function y = t411RetValueFn;
+    result &= Test("t411 spelled return alias then value",
+        t411RetInvoke<function<alias T411RetBox()>>(x) * 10 + t411RetInvoke<function<T411RetBox()>>(y), 57);
+    result &= Test("t411 spelled return value then alias",
+        t411RetInvoke<function<T411RetBox()>>(y) * 10 + t411RetInvoke<function<alias T411RetBox()>>(x), 75);
+    return result;
+}
+
+int t414MovePlus(int x) { return x + 1; }
+int t414TakeFunction(function<int(int)> f) { return f(5); }
+int t414TakeMoveFunction(move function<int(int)> f) { return f(5); }
+function<int(int)> t414ReturnFunction(move function<int(int)> f) { return move f; }
+struct T414FunctionBox { function<int(int)> f; };
+int t414MoveOther(int x) { return x + 2; }
+int t414Reseat(function<int(int)> taken, function<int(int)>* slot)
+{
+    *slot = t414MoveOther;
+    return taken(5);
+}
+int t414ConsumeLambda(Lambda<int(int)> f)
+{
+    int value = f(5);
+    _ = move f;
+    return value;
+}
+int t414TakeMoveLambda(move Lambda<int(int)> f) { return f(5); }
+Lambda<int(int)> t414ReturnLambda(move Lambda<int(int)> f) { return move f; }
+struct T414LambdaBox { Lambda<int(int)> f; };
+bool testT414MoveSourcesNull()
+{
+    bool result = true;
+    function<int(int)> f = t414MovePlus;
+    result &= Test("t414 by-value CFlat call result", t414TakeFunction(move f), 6);
+    result &= Test("t414 by-value CFlat call nulls source", f == nullptr, true);
+    int guardedCall = f != nullptr ? f(5) : -1;
+    result &= Test("t414 moved function guarded call", guardedCall, -1);
+    // The source is nulled before the call, so the callee's reseat through another pointer survives.
+    f = t414MovePlus;
+    result &= Test("t414 reseat call result", t414Reseat(move f, &f), 6);
+    result &= Test("t414 callee reseat survives", f != nullptr ? f(5) : -1, 7);
+
+    f = t414MovePlus;
+    result &= Test("t414 move parameter result", t414TakeMoveFunction(move f), 6);
+    result &= Test("t414 move parameter nulls source", f == nullptr, true);
+
+    f = t414MovePlus;
+    function<int(int)> local = move f;
+    result &= Test("t414 local init destination", local(5), 6);
+    result &= Test("t414 local init nulls source", f == nullptr, true);
+
+    f = t414MovePlus;
+    function<int(int)> assigned = t414MovePlus;
+    assigned = move f;
+    result &= Test("t414 assignment destination", assigned(5), 6);
+    result &= Test("t414 assignment nulls source", f == nullptr, true);
+
+    f = t414MovePlus;
+    T414FunctionBox functionBox;
+    functionBox.f = move f;
+    result &= Test("t414 field destination", functionBox.f(5), 6);
+    result &= Test("t414 field store nulls source", f == nullptr, true);
+
+    f = t414MovePlus;
+    function<int(int)> returned = t414ReturnFunction(move f);
+    result &= Test("t414 return destination", returned(5), 6);
+    result &= Test("t414 return nulls source", f == nullptr, true);
+
+    int captured = 2;
+    Lambda<int(int)> lambdaCall = (int x) => { return x + captured; };
+    result &= Test("t414 capturing by-value CFlat call result", t414ConsumeLambda(move lambdaCall), 7);
+    result &= Test("t414 capturing CFlat call nulls source", lambdaCall == nullptr, true);
+    int lambdaGuarded = lambdaCall != nullptr ? lambdaCall(5) : -1;
+    result &= Test("t414 moved lambda guarded call", lambdaGuarded, -1);
+
+    Lambda<int(int)> lambdaMoveParam = (int x) => { return x + captured; };
+    result &= Test("t414 capturing move parameter result", t414TakeMoveLambda(move lambdaMoveParam), 7);
+    result &= Test("t414 capturing move parameter nulls source", lambdaMoveParam == nullptr, true);
+
+    Lambda<int(int)> lambdaLocalSource = (int x) => { return x + captured; };
+    Lambda<int(int)> lambdaLocal = move lambdaLocalSource;
+    result &= Test("t414 capturing local init destination", lambdaLocal(5), 7);
+    result &= Test("t414 capturing local init nulls source", lambdaLocalSource == nullptr, true);
+    int localGuarded = lambdaLocalSource != nullptr ? lambdaLocalSource(5) : -1;
+    result &= Test("t414 moved local lambda guarded call", localGuarded, -1);
+
+    Lambda<int(int)> lambdaAssignSource = (int x) => { return x + captured; };
+    Lambda<int(int)> lambdaAssigned = (int x) => { return x + 9; };
+    lambdaAssigned = move lambdaAssignSource;
+    result &= Test("t414 capturing assignment destination", lambdaAssigned(5), 7);
+    result &= Test("t414 capturing assignment nulls source", lambdaAssignSource == nullptr, true);
+
+    Lambda<int(int)> lambdaFieldSource = (int x) => { return x + captured; };
+    T414LambdaBox lambdaBox;
+    lambdaBox.f = move lambdaFieldSource;
+    result &= Test("t414 capturing field destination", lambdaBox.f(5), 7);
+    result &= Test("t414 capturing field store nulls source", lambdaFieldSource == nullptr, true);
+
+    Lambda<int(int)> lambdaReturnSource = (int x) => { return x + captured; };
+    Lambda<int(int)> lambdaReturned = t414ReturnLambda(move lambdaReturnSource);
+    result &= Test("t414 capturing return destination", lambdaReturned(5), 7);
+    result &= Test("t414 capturing return nulls source", lambdaReturnSource == nullptr, true);
+
+    Lambda<int(int)> noncapturing = (int x) => { return x + 1; };
+    Lambda<int(int)> noncapturingMoved = move noncapturing;
+    result &= Test("t414 noncapturing lambda destination", noncapturingMoved(5), 6);
+    result &= Test("t414 noncapturing lambda nulls source", noncapturing == nullptr, true);
+
+    string[2] capturedStrings = { "abcdefghijklmnopqrstuvwxyz0123456789ab", "second" };
+    {
+        Lambda<int(int)> owningLambda = (int x) => {
+            return x + capturedStrings[0].length() + capturedStrings[1].length();
+        };
+        Lambda<int(int)> owningMoved = move owningLambda;
+        result &= Test("t414 owning closure source null", owningLambda == nullptr, true);
+        result &= Test("t414 owning closure callable destination", owningMoved(1), 45);
+    }
+    return result;
+}
+
 extern int main(int argc, char** argv)
 {
     // The tooling regression harness passes one argument and calls this twice. The second call
@@ -6422,6 +6828,8 @@ extern int main(int argc, char** argv)
 
     int passed = 0;
     int total  = 0;
+
+    total++; passed += testT414MoveSourcesNull() ? 1 : 0;
 
     // Function pointer tests
     total++; passed += Test("global address picks int pointer", i1_pick_pointer(&i1_global), 11) ? 1 : 0;
@@ -6644,6 +7052,12 @@ extern int main(int argc, char** argv)
     total++; passed += testT282GenericBoxCopies()          ? 1 : 0;
     total++; passed += (testT282GenericDtorOnce() && Test("t282 owner dropped once", t282DtorCount, 1)) ? 1 : 0;
     total++; passed += testT283AliasDeclCopy() ? 1 : 0;
+    // T411: alias closure params are true references; alias closure returns are caller-slot borrows.
+    total++; passed += testT411AliasClosureReturn() ? 1 : 0;
+    total++; passed += testT411IndirectAliasClosure() ? 1 : 0;
+    total++; passed += testT411AliasIdentityControls() ? 1 : 0;
+    total++; passed += testT411GenericAliasKeys() ? 1 : 0;
+    total++; passed += testT411SpelledReturnAliasKeys() ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

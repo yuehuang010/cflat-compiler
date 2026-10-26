@@ -5478,6 +5478,17 @@ bool testFixedArrays()
     mdSrc[1][1] = 11;
     int[] mdFlat = mdSrc;
     result &= Test("fixed_multidim_flat_view", mdFlat[4], 11);
+    int[2] t409Fixed = { 7, 11 };
+    auto t409FixedAddress = &t409Fixed;
+    result &= Test("t409_fixed_array_address", t409FixedAddress != nullptr, true);
+    int[] t409View = t409Fixed;
+    int* t409FirstElement = &t409View[0];
+    result &= Test("t409_view_element_address", *t409FirstElement, 7);
+    CopyCell[2] t409Cells = default;
+    t409Cells[0].x = 13; t409Cells[1].x = 17;
+    CopyCell[] t409CellView = t409Cells;
+    int* t409FieldAddress = &t409CellView[1].x;
+    result &= Test("t409_view_element_field_address", *t409FieldAddress, 17);
     // A ROW bind is the supported way to get a per-row view, and it writes through.
     int[] mdRow = mdSrc[1];
     mdRow[2] = 55;

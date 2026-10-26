@@ -202,6 +202,10 @@ namespace cflat_cinterop
         // Generated wrappers only: the callee that receives a literal's decayed pointer temporary
         // or a reference-to-pointer parameter (WrapperLiteralPointerTemporaries).
         std::string calleeIdentity;
+        // Generated wrappers only: per wrapper parameter, how the callee clang SELECTED binds it
+        // (WrapperParameterBindKinds): '.' unused, 'v'/'r' by value / reference, 'V'/'R' the same
+        // for a pointer slot the wrapper dereferences (the callee reads the caller's storage).
+        std::string paramBindKinds;
         bool variadic = false;
         bool isCxx = false;
         bool isInline = false;

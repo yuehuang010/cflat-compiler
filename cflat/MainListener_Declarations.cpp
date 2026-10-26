@@ -1171,7 +1171,7 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
         for (const auto& fp : sig.FuncPtrParams) paramConsts.push_back(fp.ConstMask);
         std::string encoded = BuildEncodedClosureName(Compiler(), isThin, retName,
             sig.FuncPtrReturnPointerDepth, encParams, sig.FuncPtrReturnConstMask,
-            &paramConsts, &paramArrayViews);
+            &paramConsts, &paramArrayViews, nullptr, sig.FuncPtrReturnAlias);
         Compiler(fpSpec)->RegisterEncodedClosureType(encoded, sig);
         return encoded;
     }
@@ -1224,15 +1224,18 @@ std::string MainListener::EncodeClosureFromSig(LLVMBackend* compiler, const LLVM
         std::vector<std::pair<std::string, int>> params;
         std::vector<int> paramConsts;
         std::vector<bool> paramArrayViews;
+        std::vector<bool> paramAliases;
         for (const auto& p : sig.FuncPtrParams)
         {
             params.push_back({ p.TypeName, ReconcilePointerDepth(p.Pointer, p.PointerDepth) });
             paramConsts.push_back(p.ConstMask);
             paramArrayViews.push_back(p.IsArrayView);
+            paramAliases.push_back(p.IsAlias);
         }
         std::string encoded = BuildEncodedClosureName(compiler, sig.IsThinFnPtr(), sig.FuncPtrReturnTypeName,
             ReconcilePointerDepth(sig.FuncPtrReturnPointer, sig.FuncPtrReturnPointerDepth), params,
-            sig.FuncPtrReturnConstMask, &paramConsts, &paramArrayViews);
+            sig.FuncPtrReturnConstMask, &paramConsts, &paramArrayViews, &paramAliases,
+            sig.FuncPtrReturnAlias);
         compiler->RegisterEncodedClosureType(encoded, sig);
         return encoded;
     }
@@ -4342,6 +4345,70 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // place the sink flag reaches the emitted FunctionSymbol (no forward-scan pre-declaration).
         // Pass the if-const evaluator so a move inside a LIVE if-const branch marks the param a sink.
         ApplyOwningSinkInference(Compiler(), func, allParams, SinkIfConstEvaluator());
+
+        if (!structName.empty())
+        {
+            std::vector<std::pair<std::string, const LLVMBackend::InterfaceMethod*>> matches;
+            for (const auto& interfaceName : compiler->GetStructInterfaces(structName))
+            {
+                const auto* methods = compiler->FindInterface(interfaceName);
+                if (methods == nullptr) continue;
+                for (const auto& method : *methods)
+                {
+                    if (method.Name != name || allParams.size() != method.Parameters.size() + 1)
+                        continue;
+                    bool paramsMatch = true;
+                    for (size_t i = 0; i < method.Parameters.size(); ++i)
+                    {
+                        if (allParams[i + 1].TypeName != method.Parameters[i].TypeName
+                            || allParams[i + 1].ValuePointerDepth()
+                                != method.Parameters[i].ValuePointerDepth())
+                        {
+                            paramsMatch = false;
+                            break;
+                        }
+                    }
+                    if (paramsMatch) matches.emplace_back(interfaceName, &method);
+                }
+            }
+
+            for (const auto& [interfaceName, method] : matches)
+                for (size_t i = 0; i < method->Parameters.size(); ++i)
+                {
+                    const auto& interfaceParam = method->Parameters[i];
+                    const auto& implementationParam = allParams[i + 1];
+                    const bool byValue = !interfaceParam.Pointer && !interfaceParam.ElemPointer
+                        && !interfaceParam.IsAlias && !interfaceParam.IsRvalueRef
+                        && !interfaceParam.IsCxxRefToPointer && !interfaceParam.CxxConstRef()
+                        && !interfaceParam.IsArrayView && !interfaceParam.IsFunctionPointer;
+                    if (!compiler->InterfaceParamConsumesOwnership(interfaceParam) && byValue
+                        && compiler->IsCopyableType(interfaceParam.TypeName)
+                        && compiler->OwningSinkConsumesConcrete(implementationParam))
+                    {
+                        const std::string shownInterface = SpellType(
+                            *compiler, LLVMBackend::TypeAndValue{ .TypeName = interfaceName });
+                        const std::string paramName = implementationParam.VariableName.empty()
+                            ? interfaceParam.VariableName : implementationParam.VariableName;
+                        const std::string interfaceParamName = interfaceParam.VariableName.empty()
+                            ? paramName : interfaceParam.VariableName;
+                        LogErrorContext(func, std::format(
+                            "implementation of '{}.{}' consumes parameter '{}'; declare it "
+                            "'move {} {}' in interface '{}'",
+                            shownInterface, method->Name, paramName,
+                            SpellType(*compiler, interfaceParam), interfaceParamName,
+                            shownInterface));
+                    }
+                }
+
+            for (const auto& [_, method] : matches)
+                for (size_t i = 0; i < method->Parameters.size(); ++i)
+                {
+                    const auto& interfaceParam = method->Parameters[i];
+                    if (!compiler->InterfaceParamConsumesByType(interfaceParam)) continue;
+                    allParams[i + 1].IsOwningSink = true;
+                    allParams[i + 1].IsInterfaceSink = true;
+                }
+        }
 
         // Record unused-parameter candidates. Restricted to free, non-extern functions:
         // a method's params are constrained by interface/override conformance, and an
@@ -12824,8 +12891,16 @@ llvm::Value* MainListener::CloneClosureFromNamedSource(
         // whole union; hand the copy a value loaded with the closure type instead.
         if (rightNV.UnionFieldType != nullptr)
             cloneArg.Primary = compiler->CreateLoad(cloneArg.BaseType, rightNV.Storage);
-        else
+        else if (llvm::isa<llvm::AllocaInst>(rightNV.Storage)
+            || llvm::isa<llvm::GlobalVariable>(rightNV.Storage)
+            || llvm::isa<llvm::GetElementPtrInst>(rightNV.Storage))
             cloneArg.Storage = rightNV.Storage;
+        else
+        {
+            auto* sourceSlot = compiler->AllocaAtEntry(closureTy, nullptr, "closure.copy.source");
+            compiler->builder->CreateStore(right, sourceSlot);
+            cloneArg.Storage = sourceSlot;
+        }
         cloneArg.TypeAndValue.TypeName = "__closure_fat_ptr";
         if (auto* cloned = compiler->CreateOverloadedFunctionCall("copy", { cloneArg }))
             return cloned;

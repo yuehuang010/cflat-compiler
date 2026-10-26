@@ -536,6 +536,7 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
             fp.PointerDepth = p.ValuePointerDepth();
             fp.ConstMask = p.FunctionParamConstMask();
             fp.IsPointeeConst = (fp.ConstMask & 1) != 0;
+            fp.IsAlias = ParameterIsAliasByPointer(p);
             tv.FuncPtrParams.push_back(fp);
         }
         return tv;
@@ -761,8 +762,10 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             for (const auto& p : funcPtrType.FuncPtrParams)
             {
                 TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer; pTV.IsMove = p.IsMove;
-                paramTypes.push_back(!p.Pointer && (IsForeignNontrivialCxxClass(p.TypeName)
-                        || HasForeignNontrivialCxxField(p.TypeName))
+                pTV.IsAlias = p.IsAlias;
+                // An alias closure param takes its caller slot by address, as the callee declares it.
+                paramTypes.push_back((ParameterIsAliasByPointer(pTV) || (!p.Pointer && (IsForeignNontrivialCxxClass(p.TypeName)
+                        || HasForeignNontrivialCxxField(p.TypeName))))
                     ? cflat_llvm::PointerTo(GetType(pTV)) : GetType(pTV));
                 if (ParameterCarriesRawArrayCount(pTV))
                     paramTypes.push_back(builder->getInt64Ty());
@@ -3018,13 +3021,17 @@ bool LLVMBackend::ParameterIsAliasByPointer(const TypeAndValue& param) const
         // alias is the caller's pointer slot, not the pointer value itself.
         if (param.IsCxxRefToPointer)
             return true;
-        // `alias` on a POINTER/view/interface/closure param already names a borrow in its own
-        // representation; only the by-value shapes need the address to reach the caller's object.
+        // Pointer/view/interface params use their existing borrow representation. A closure or
+        // function-pointer alias needs the address of its caller-owned value slot.
         if (!param.IsAlias || param.Pointer || param.IsArrayView || param.IsInterface
-            || param.IsFunctionPointer || param.IsMove)
+            || param.IsMove)
             return false;
         auto* valueType = GetType(param);
-        return valueType != nullptr && !valueType->isVoidTy() && !valueType->isPointerTy();
+        const auto* encodedClosure = GetEncodedClosureType(param.TypeName);
+        const bool isFunctionPointerValue = param.IsFunctionPointer
+            || (encodedClosure != nullptr && encodedClosure->IsThinFnPtr());
+        return valueType != nullptr && !valueType->isVoidTy()
+            && (!valueType->isPointerTy() || isFunctionPointerValue);
 }
 
 std::string LLVMBackend::ComputeMangledName(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool varargs)

@@ -133,11 +133,41 @@ inline CFlatParser::PostfixExpressionContext* SolePostfixExpressionShape(
     return nullptr;
 }
 
+inline antlr4::tree::TerminalNode* BareIdentifierInExpression(
+    antlr4::tree::ParseTree* expression)
+{
+    auto* postfix = SolePostfixExpressionShape(expression);
+    if (postfix == nullptr || postfix->children.size() != 1) return nullptr;
+    auto* primary = postfix->primaryExpression();
+    auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+    return generic != nullptr ? generic->Identifier() : nullptr;
+}
+
 inline antlr4::tree::TerminalNode* GenericFunctionValueIdentifier(
     antlr4::tree::ParseTree* expression, bool allowAddressOf = true)
 {
     if (auto* identifier = dynamic_cast<antlr4::tree::TerminalNode*>(expression))
     {
+        auto bareArmIdentifier = [](antlr4::tree::ParseTree* arm)
+            -> antlr4::tree::TerminalNode* {
+            auto* postfix = SolePostfixExpressionShape(arm);
+            if (postfix == nullptr || postfix->children.size() != 1) return nullptr;
+            auto* primary = postfix->primaryExpression();
+            auto* generic = primary != nullptr ? primary->genericIdentifier() : nullptr;
+            return generic != nullptr && generic->genericTypeParameters() == nullptr
+                ? generic->Identifier() : nullptr;
+        };
+        for (auto* ancestor = identifier->parent; ancestor != nullptr;
+             ancestor = ancestor->parent)
+            if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(ancestor))
+            {
+                if ((conditional->expression() != nullptr
+                        && bareArmIdentifier(conditional->expression()) == identifier)
+                    || (conditional->conditionalExpression() != nullptr
+                        && bareArmIdentifier(conditional->conditionalExpression()) == identifier))
+                    return identifier;
+            }
+
         auto* node = identifier->parent;
         while (node != nullptr
             && dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node) == nullptr)
@@ -3116,11 +3146,12 @@ static std::string BuildEncodedClosureName(const LLVMBackend* compiler, bool isT
     const std::string& ret, int retDepth,
     const std::vector<std::pair<std::string, int>>& params,
     int retConstMask = -1, const std::vector<int>* paramConstMasks = nullptr,
-    const std::vector<bool>* paramArrayViews = nullptr)
+    const std::vector<bool>* paramArrayViews = nullptr,
+    const std::vector<bool>* paramAliases = nullptr, bool retAlias = false)
 {
     if (compiler == nullptr) return ret;
     return MangleClosureType(*compiler, isThin, ret, retDepth, params, retConstMask,
-        paramConstMasks, paramArrayViews);
+        paramConstMasks, paramArrayViews, paramAliases, retAlias);
 }
 
 
@@ -4830,14 +4861,32 @@ inline void CollectAddressAliasWholeNameStores(
     // `&param...` that is the whole source of a local pointer alias is tracked by the alias
     // passes (deref stores above, container mutators in the caller); any other `&param...` use
     // escapes to code this pass cannot see, so it counts as a write.
-    auto isAliasSource = [](CFlatParser::UnaryExpressionContext* unary) {
-        const std::string text = unary->getText();
+    auto isSimpleAliasVariable = [](CFlatParser::UnaryExpressionContext* target) {
+        if (target == nullptr || target->postfixExpression() == nullptr
+            || target->postfixExpression()->children.size() != 1) return false;
+        auto* primary = target->postfixExpression()->primaryExpression();
+        return primary != nullptr && primary->genericIdentifier() != nullptr
+            && primary->genericIdentifier()->Identifier() != nullptr
+            && primary->genericIdentifier()->genericTypeParameters() == nullptr;
+    };
+    auto isAliasSource = [&](CFlatParser::UnaryExpressionContext* unary) {
+        const size_t startToken = (size_t)unary->getStart()->getTokenIndex();
+        const size_t stopToken = (size_t)unary->getStop()->getTokenIndex();
         for (auto* parent = unary->parent; parent != nullptr; parent = parent->parent)
         {
-            if (parent->getText() != text) return false;
-            if (dynamic_cast<CFlatParser::InitializerContext*>(parent) != nullptr) return true;
+            if ((size_t)parent->getSourceInterval().a != startToken
+                || (size_t)parent->getSourceInterval().b != stopToken) return false;
+            if (dynamic_cast<CFlatParser::InitializerContext*>(parent) != nullptr)
+            {
+                auto* init = dynamic_cast<CFlatParser::InitDeclaratorContext*>(parent->parent);
+                auto* direct = init != nullptr && init->declarator() != nullptr
+                    ? init->declarator()->directDeclarator() : nullptr;
+                if (direct != nullptr && direct->Identifier() != nullptr
+                    && direct->assignmentExpression() == nullptr) return true;
+            }
             if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent->parent))
-                if (asn->assignmentExpression() == parent) return true;
+                if (asn->assignmentExpression() == parent
+                    && isSimpleAliasVariable(asn->unaryExpression())) return true;
         }
         return false;
     };
@@ -8178,7 +8227,7 @@ public:
 
     bool IsProgramLifetimeStorage(const LLVMBackend::NamedVariable& nv) const;
     static bool PointsIntoStackFrame(llvm::Value* value);
-    static bool IsFrameOwnedUniqueBorrow(const LLVMBackend* compiler, llvm::Value* value);
+    static bool IsFrameOwnedBorrowingMemberCall(const LLVMBackend* compiler, llvm::Value* value);
     void RejectLambdaReferenceCaptureEscape(
         bool destinationHasProgramLifetime,
         const LLVMBackend::NamedVariable& source,

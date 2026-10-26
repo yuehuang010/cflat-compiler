@@ -1635,6 +1635,7 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrParamAsTypeAndValue(const TypeAndV
         tv.ElemPointer = tv.Pointer && p.PointerDepth >= 2;
         if (p.ConstMask >= 0) tv.ConstMask = static_cast<uint8_t>(p.ConstMask);
         tv.IsInterface = IsInterfaceType(p.TypeName);
+        tv.IsAlias = p.IsAlias;
         tv.AllocAlignValue = p.AllocAlignValue;
         tv.IsOwningSink = p.IsOwningSink;
         tv.IsConsumeInferredSink = p.IsConsumeInferredSink;
@@ -2093,13 +2094,66 @@ std::string LLVMBackend::ImplicitOutlivingOwnerConsumeError(const NamedVariable&
             spelling, spelling, SpellType(*this, srcNV.TypeAndValue));
 }
 
+bool LLVMBackend::IsFunctionValueType(const TypeAndValue& type) const
+{
+        return type.IsFunctionPointer || type.TypeName == "__c_fn_ptr"
+            || type.TypeName == "__closure_fat_ptr" || IsEncodedClosureType(type.TypeName);
+}
+
+/*
+ * Explicit `move f` of a function value (thin or fat) into a BY-VALUE parameter: store null into
+ * the source and mark it readable-as-null. A reference sink (C++ T&& / T&, or a slot the callee
+ * binds, IsCxxReferenceSink) keeps the source. Returns true when the source was nulled.
+ */
+bool LLVMBackend::NullExplicitFunctionMoveToValue(const TypeAndValue& param, const NamedVariable& arg)
+{
+        const TypeAndValue& movedType = arg.HasOriginalArgumentType
+            ? arg.OriginalArgumentType : arg.TypeAndValue;
+        if (!arg.IsExplicitMove || !IsFunctionValueType(movedType)) return false;
+        if (param.Pointer || param.IsAlias || param.IsRvalueRef || param.CxxRefLevel >= 0
+            || arg.IsCxxReferenceSink)
+            return false;
+        const std::string name = arg.CallerName.empty() ? arg.TypeAndValue.VariableName : arg.CallerName;
+        const std::string path = FieldMoveKey(arg);
+        llvm::Value* storage = arg.Storage;
+        if (storage == nullptr && path.empty() && !arg.IsElementAccess && !name.empty())
+            storage = FindVariableStorage(name).Storage;
+        llvm::Type* valueType = arg.Primary != nullptr ? arg.Primary->getType() : GetType(movedType);
+        if (storage != nullptr && valueType != nullptr)
+            builder->CreateStore(llvm::Constant::getNullValue(valueType), storage);
+        if (path.empty() && !arg.IsElementAccess && arg.FieldName.empty()
+            && arg.OwningStructName.empty() && !name.empty())
+            MarkVariableExplicitlyMovedNull(name);
+        return true;
+}
+
 void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args,
         bool paramsCarryAllocAlign, bool calleeIsMethod, bool beforeCall, bool calleeIsCxx)
 {
         if (beforeCall) RegisterOwnedStringRvalueArguments(args);
+        auto argumentType = [&](const NamedVariable& arg) -> const TypeAndValue& {
+            return arg.HasOriginalArgumentType ? arg.OriginalArgumentType : arg.TypeAndValue;
+        };
+        auto isFunctionValue = [&](const TypeAndValue& type) { return IsFunctionValueType(type); };
+        auto isThinFunctionValue = [&](const TypeAndValue& type) {
+            if (type.IsFunctionPointer || type.TypeName == "__c_fn_ptr") return type.IsThinFnPtr();
+            const auto* encoded = GetEncodedClosureType(type.TypeName);
+            return encoded != nullptr && encoded->IsThinFnPtr();
+        };
         for (size_t i = 0; i < params.size() && i < args.size(); i++)
         {
+            const auto& movedArgType = argumentType(args[i]);
+            const bool explicitFunctionMove = args[i].IsExplicitMove
+                && isFunctionValue(movedArgType);
+            // Only a by-value sink takes the value. A reference sink (C++ T&&/T&, or a forwarded
+            // function-pointer slot) keeps the source: the callee binds the slot, and may consume it.
+            if (explicitFunctionMove)
+            {
+                // Null once, before the call: a store after it would overwrite a callee's reseat.
+                if (beforeCall) NullExplicitFunctionMoveToValue(params[i], args[i]);
+                if (isThinFunctionValue(movedArgType)) continue;
+            }
             // C++ class by-value transfer constructs a separate parameter object. The source
             // remains a live moved-from object, so never zero its storage like a CFlat sink.
             if (!params[i].Pointer && !params[i].IsAlias
@@ -2176,8 +2230,12 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 if (!beforeCall)
                 {
                     if (!sourceName.empty() && !movePath.empty())
-                        MarkVariableFieldMoved(sourceName, movePath);
-                    else if (!sourceName.empty() && !args[i].IsElementAccess)
+                    {
+                        if (!explicitFunctionMove)
+                            MarkVariableFieldMoved(sourceName, movePath);
+                    }
+                    else if (!sourceName.empty() && !args[i].IsElementAccess
+                        && !explicitFunctionMove)
                         MarkVariableMoved(sourceName);
                 }
                 continue;
@@ -2422,6 +2480,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                         }
                         else if (!source.CallerName.empty())
                         {
+                            if (explicitFunctionMove)
+                                continue;
                             if (!source.MovePathHasDynamicIndex && !source.MovePathKey.empty())
                                 MarkVariableFieldMoved(source.CallerName, source.MovePathKey);
                             else if (!source.FieldName.empty())
@@ -2503,7 +2563,10 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 {
                     if (!args[i].DeferMovedMark && !sourceName.empty() && !isFieldAccess
                         && wholeBindingSource)
-                        MarkVariableMoved(sourceName);
+                    {
+                        if (!explicitFunctionMove)
+                            MarkVariableMoved(sourceName);
+                    }
                 }
                 // Compile-time: mark the caller's storage as moved so subsequent reads are rejected.
                 // Covers pointer, owning-string, and struct move params - all cases where caller storage was zeroed.
@@ -2516,6 +2579,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     bool isStruct = llvm::isa<llvm::StructType>(srcBaseTy);
                     if (isPtr || isOwningStr || isStruct)
                     {
+                        if (explicitFunctionMove)
+                            continue;
                         if (isFieldAccess)
                             MarkVariableFieldMoved(sourceName, movePath);
                         else if (wholeBindingSource)
@@ -3367,94 +3432,12 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         if (userReceiver != nullptr && !methodInfo->IsConst)
             RefuseConstInterfaceReceiverCall(*userReceiver, ifaceName, methodName);
 
-        // An inferred body sink is not written in the interface declaration. Use it only when
-        // every known implementor of this slot has the same summary; otherwise keep the contract.
         std::vector<TypeAndValue> transferParams = methodInfo->Parameters;
-        std::vector<std::string> implementors;
-        const bool hasImplementorSet = EnumerateInterfaceImplementors(
-            ifaceName, implementors, /*allowKnownGenericClassInstances*/ true);
-        if (hasImplementorSet)
+        for (auto& param : transferParams)
         {
-            std::vector<std::string> concreteImplementors;
-            bool allGenericTemplatesResolved = true;
-            for (const auto& implementor : implementors)
-            {
-                if (gts.genericClassTemplates.count(implementor) == 0)
-                {
-                    concreteImplementors.push_back(implementor);
-                    continue;
-                }
-
-                bool foundInstantiation = false;
-                for (const auto& entry : dataStructures)
-                {
-                    const std::string& typeKey = entry.first;
-                    TypeSpelling spelling;
-                    if (!DemangleType(*this, typeKey, spelling) || spelling.base != implementor
-                        || !TypeMayProvideInterface(typeKey, ifaceName))
-                        continue;
-                    concreteImplementors.push_back(typeKey);
-                    foundInstantiation = true;
-                }
-                if (!foundInstantiation) allGenericTemplatesResolved = false;
-            }
-            std::sort(concreteImplementors.begin(), concreteImplementors.end());
-            concreteImplementors.erase(std::unique(concreteImplementors.begin(),
-                                                    concreteImplementors.end()),
-                                       concreteImplementors.end());
-            std::vector<TypeAndValue> commonSummary;
-            bool haveSummary = false;
-            bool consistent = allGenericTemplatesResolved && !concreteImplementors.empty();
-            for (const auto& implementor : concreteImplementors)
-            {
-                llvm::Function* implementation = LookupInterfaceMethodImpl(implementor, *methodInfo);
-                auto symbols = functionTable.find(methodInfo->Name);
-                const FunctionSymbol* symbol = nullptr;
-                if (implementation != nullptr && symbols != functionTable.end())
-                    for (const auto& candidate : symbols->second)
-                        if (candidate.Function == implementation)
-                        {
-                            symbol = &candidate;
-                            break;
-                        }
-                if (symbol == nullptr || symbol->Parameters.size() != methodInfo->Parameters.size() + 1)
-                {
-                    consistent = false;
-                    break;
-                }
-                if (!haveSummary)
-                {
-                    commonSummary.assign(symbol->Parameters.begin() + 1, symbol->Parameters.end());
-                    haveSummary = true;
-                    continue;
-                }
-                for (size_t i = 0; i < methodInfo->Parameters.size(); ++i)
-                {
-                    const auto& current = symbol->Parameters[i + 1];
-                    const auto& common = commonSummary[i];
-                    if (current.IsOwningSink != common.IsOwningSink
-                        || current.IsConsumeInferredSink != common.IsConsumeInferredSink
-                        || current.IsReturnInferredSink != common.IsReturnInferredSink
-                        || current.IsWriteInferredSink != common.IsWriteInferredSink)
-                    {
-                        consistent = false;
-                        break;
-                    }
-                }
-                if (!consistent) break;
-            }
-            if (consistent && haveSummary)
-                for (size_t i = 0; i < transferParams.size(); ++i)
-                {
-                    transferParams[i].IsOwningSink = transferParams[i].IsOwningSink
-                        || commonSummary[i].IsOwningSink;
-                    transferParams[i].IsConsumeInferredSink = transferParams[i].IsConsumeInferredSink
-                        || commonSummary[i].IsConsumeInferredSink;
-                    transferParams[i].IsReturnInferredSink = transferParams[i].IsReturnInferredSink
-                        || commonSummary[i].IsReturnInferredSink;
-                    transferParams[i].IsWriteInferredSink = transferParams[i].IsWriteInferredSink
-                        || commonSummary[i].IsWriteInferredSink;
-                }
+            if (!InterfaceParamConsumesOwnership(param)) continue;
+            param.IsOwningSink = true;
+            param.IsInterfaceSink = true;
         }
 
         for (size_t i = 0; i < methodInfo->Parameters.size() && i < callArgNVs.size(); i++)
@@ -3578,7 +3561,9 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                 const bool cxxObject = IsForeignNontrivialCxxClass(param.TypeName);
                 const bool cflatHolder = !cxxObject
                     && HasForeignNontrivialCxxField(param.TypeName);
-                const bool useMove = param.IsMove || nv.IsExplicitMove
+                const bool interfaceHolderCopy = transferParams[i].IsInterfaceSink
+                    && param.IsMove && cflatHolder && IsCopyableType(param.TypeName);
+                const bool useMove = (param.IsMove && !interfaceHolderCopy) || nv.IsExplicitMove
                     || nv.CxxParamLastUse || nv.IsRvalue;
                 if (!EmitCxxByValueParamConstruct(param.TypeName, temp, nv.Storage, useMove,
                                                   "into an interface by-value parameter"))

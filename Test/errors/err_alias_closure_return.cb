@@ -1,0 +1,17 @@
+// T411: an `alias` closure return must borrow caller-owned storage. A closure LOCAL of the
+// callee is frame-rooted, so returning it as `alias` stays refused (the frame-local gate).
+// Each expect_error wraps the offending return statement.
+alias Lambda<int()> t411LocalClosure()
+{
+    int value = 41;
+    Lambda<int()> local = () => { return value; };
+    expect_error("cannot return an 'alias' value that borrows frame-local storage") { return local; }
+}
+
+alias Lambda<int()> t411LocalParamCopy(alias Lambda<int()> src)
+{
+    Lambda<int()> copy = src;
+    expect_error("cannot return an 'alias' value that borrows frame-local storage") { return copy; }
+}
+
+int main() { return 0; }

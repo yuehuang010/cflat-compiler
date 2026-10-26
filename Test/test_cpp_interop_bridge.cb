@@ -503,7 +503,7 @@ int bridge_ifh_last_use(BridgeIfhHolder value, BridgeFieldHolder<cpptw.Twin> hol
 }
 interface BridgeIfhEcho
 {
-    BridgeFieldHolder<cpptw.Twin> echo(BridgeFieldHolder<cpptw.Twin> value);
+    BridgeFieldHolder<cpptw.Twin> echo(move BridgeFieldHolder<cpptw.Twin> value);
 };
 class BridgeIfhEchoImpl : BridgeIfhEcho
 {

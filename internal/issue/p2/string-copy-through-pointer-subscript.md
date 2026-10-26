@@ -19,15 +19,13 @@ struct-index GEP, and handle C++ offset-layout fields as `i8` byte-offset GEPs u
 C++ field address shape, but even that proof did not select the copy path; the two spellings
 remain out of scope after three attempts.
 
-## T392 leftovers: `(*pp)[i]` shapes the local proof does not cover
+## T413 residual: raw-new `(*pp)[i]` that cannot be proven copies and leaks
 
-T392 copies a borrowed element for `(*pp)[i]` only when `pp` is a plain local with exactly one store of a local or parameter slot and
-no store through `*pp`. Found by the T392 review (2026-10-21); these still double-free on master and on T392:
-- `pp` is a parameter (`scratch/repro_keep/box1021/t392_rev/rev_t392_opus_c12_pp_param.cb`)
-- `pp` has two possible stores (branch-dependent target)
-- a global `string** gpp`
-- a `string** pp` struct field
-A store through `*pp` (`*pp = new string[2];`, `rev_t392_opus_c20_rebind_through_pp.cb`) falls back to master behavior on purpose.
-The T392 proof also falls back to master behavior (shallow adopt) when the read is inside any loop (a later store in the body is not
-visible to the single pass) or when pp reaches a call or is stored elsewhere (a callee may rebind `*pp`); a borrowed `(*pp)[i]` read in
-those positions still double-frees as on master.
+T413 round 2 adopts `(*pp)[i]` through a single local referred slot only when every value that
+slot can hold is a raw `new` result or null: direct stores, stores through `*pp`, defined callees
+receiving `pp` / `&slot` (body scanned: stores through the parameter only), and, inside a loop,
+every later use on the parse tree. Anything else copies. That is sound against double free, but a
+raw-new array read through an unproven shape now leaks the element (raw `delete[_]` never runs
+string dtors): callee defined after the reading function or forwarding the pointer on, a slot
+that holds raw-new on one path and a borrowed address on another, a loop that passes `pp` /
+`&slot` to a call. Needs the same runtime provenance design as the global case.

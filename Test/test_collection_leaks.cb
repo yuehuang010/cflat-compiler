@@ -349,6 +349,117 @@ int t392ReadRawNewStoredThroughPtrPtr()
     delete[_] raw;
     return value;
 }
+// T413: (*pp)[i] shapes the local proof cannot prove owned; each copies the element.
+string t413MakeString() { return "abcdefghijklmnopqrstuvwxyz0123456789abcdefghij".copy(); }
+int t413ReadParamPtrPtr(string** pp) { string t = (*pp)[0]; return t.length(); }
+int t413ReadParamLeg()
+{
+    string source = t413MakeString();
+    string* ps = &source;
+    return t413ReadParamPtrPtr(&ps);
+}
+int t413ReadTwoStores(int pick)
+{
+    string left = t413MakeString();
+    string right = t413MakeString();
+    string* pleft = &left;
+    string* pright = &right;
+    string** pp = &pleft;
+    if (pick != 0) pp = &pright;
+    string t = (*pp)[0];
+    return t.length();
+}
+string** t413GlobalPP = nullptr;
+int t413ReadGlobalPtrPtr()
+{
+    string source = t413MakeString();
+    string* ps = &source;
+    t413GlobalPP = &ps;
+    string t = (*t413GlobalPP)[0];
+    return t.length();
+}
+struct T413PPHolder { string** pp = default; int read() { string t = (*pp)[0]; return t.length(); } };
+int t413ReadFieldPtrPtr()
+{
+    string source = t413MakeString();
+    string* ps = &source;
+    T413PPHolder holder = default;
+    holder.pp = &ps;
+    return holder.read();
+}
+int t413ReadLoopPtrPtr()
+{
+    string source = t413MakeString();
+    string* ps = &source;
+    string** pp = &ps;
+    int value = 0;
+    for (int i = 0; i < 1; i++) { string t = (*pp)[0]; value = t.length(); }
+    return value;
+}
+void t413TouchPtrPtr(string** pp) { }
+int t413ReadCallPtrPtr()
+{
+    string source = t413MakeString();
+    string* ps = &source;
+    string** pp = &ps;
+    t413TouchPtrPtr(pp);
+    string t = (*pp)[0];
+    return t.length();
+}
+// T413 round 2: a borrowed address stored through *pp, carried by a loop, or set by a callee is not raw-new.
+int t413ReadThroughBorrowedStore()
+{
+    string source = t413MakeString();
+    string* slot = default;
+    string** pp = &slot;
+    *pp = &source;
+    string t = (*pp)[0];
+    return t.length();
+}
+int t413ReadLoopCarriedBorrow()
+{
+    string source = t413MakeString();
+    string* slot = default;
+    string** pp = &slot;
+    int value = 0;
+    for (int i = 0; i < 2; i++)
+    {
+        if (i == 1) { string t = (*pp)[0]; value = t.length(); }
+        if (i == 0) { *pp = &source; }
+    }
+    return value;
+}
+void t413SetSlotBorrowed(string** p, string* s) { *p = s; }
+// T413 round 3: a same-named global or parameter in the loop is not the referred slot or holder.
+int t413Raw = 0;
+int t413ReadRawNewNameCollision(int pp)
+{
+    int value = 0;
+    for (int k = 0; k < 1; k++)
+    {
+        {
+            string* t413Raw = default;
+            string** pp = &t413Raw;
+            *pp = new string[2];
+            t413Raw[0] = t413MakeString();
+            string t = (*pp)[0];
+            value = t.length();
+            delete[_] t413Raw;
+        }
+        t413Raw++;
+        pp++;
+    }
+    return value;
+}
+int t413ReadCalleeBorrow()
+{
+    string source = t413MakeString();
+    string* slot = default;
+    string** pp = &slot;
+    t413SetSlotBorrowed(pp, &source);
+    string t = (*pp)[0];
+    return t.length();
+}
 void* t359SelfAssignBuffer = nullptr;
 u64 t359SelfAssignAllocations = 0;
 u64 t359SelfAssignFrees = 0;
@@ -547,6 +658,12 @@ void _classifierAddressStore(ClassifierBox box)
     *element = 99;
 }
 void _classifierPostfixStore(ClassifierBox box) { box.xs[0]++; }
+void _classifierArrayPointerAlias(ClassifierBox box)
+{
+    list<int>*[1] values;
+    values[0] = &box.xs;
+    for (int i = 0; i < 50; i++) values[0]->add(i);
+}
 // Compound assignment through an operator overload replaces the LHS: the old owner must be
 // destructed exactly once, whatever lvalue form (local, field, element, deref) the LHS takes.
 struct DrainSum
@@ -1933,6 +2050,107 @@ extern int main()
             && t392AuditAllocations == 2u && t392AuditFrees == 2u;
         total++; passed += Test("t392_raw_new_stored_later_in_loop_no_copy", clean, true);
     }
+    // T413: (*pp)[i] leftovers the T392 proof does not cover; each must copy and leak nothing.
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t392AuditAllocations = 0; t392AuditFrees = 0;
+        __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+        int value = t413ReadParamLeg();
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t392AuditAllocations == 2u && t392AuditFrees == 2u;
+        total++; passed += Test("t413_ptrptr_param_copy", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t392AuditAllocations = 0; t392AuditFrees = 0;
+        __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+        int value = t413ReadTwoStores(1);
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t392AuditAllocations == 3u && t392AuditFrees == 3u;
+        total++; passed += Test("t413_ptrptr_two_stores_copy", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t392AuditAllocations = 0; t392AuditFrees = 0;
+        __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+        int value = t413ReadGlobalPtrPtr();
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t392AuditAllocations == 2u && t392AuditFrees == 2u;
+        total++; passed += Test("t413_ptrptr_global_copy", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t392AuditAllocations = 0; t392AuditFrees = 0;
+        __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+        int value = t413ReadFieldPtrPtr();
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t392AuditAllocations == 2u && t392AuditFrees == 2u;
+        total++; passed += Test("t413_ptrptr_field_copy", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t392AuditAllocations = 0; t392AuditFrees = 0;
+        __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+        int value = t413ReadLoopPtrPtr();
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t392AuditAllocations == 2u && t392AuditFrees == 2u;
+        total++; passed += Test("t413_ptrptr_loop_copy", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t392AuditAllocations = 0; t392AuditFrees = 0;
+        __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+        int value = t413ReadCallPtrPtr();
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t392AuditAllocations == 2u && t392AuditFrees == 2u;
+        total++; passed += Test("t413_ptrptr_call_copy", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t392AuditAllocations = 0; t392AuditFrees = 0;
+        __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+        int value = t413ReadThroughBorrowedStore();
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t392AuditAllocations == 2u && t392AuditFrees == 2u;
+        total++; passed += Test("t413_ptrptr_borrowed_store_copy", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t392AuditAllocations = 0; t392AuditFrees = 0;
+        __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+        int value = t413ReadLoopCarriedBorrow();
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t392AuditAllocations == 2u && t392AuditFrees == 2u;
+        total++; passed += Test("t413_ptrptr_loop_carried_copy", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t392AuditAllocations = 0; t392AuditFrees = 0;
+        __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+        int value = t413ReadCalleeBorrow();
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t392AuditAllocations == 2u && t392AuditFrees == 2u;
+        total++; passed += Test("t413_ptrptr_callee_borrow_copy", clean, true);
+    }
+    {
+        u64 before = HeapAudit.reportLeaks();
+        t392AuditAllocations = 0; t392AuditFrees = 0;
+        __alloc_audit_hook = t392CountAlloc; __free_audit_hook = t392CountFree;
+        int value = t413ReadRawNewNameCollision(1);
+        __alloc_audit_hook = cflat_heap_audit_alloc; __free_audit_hook = cflat_heap_audit_free;
+        bool clean = HeapAudit.reportLeaks() == before && value == 46
+            && t392AuditAllocations == 2u && t392AuditFrees == 2u;
+        total++; passed += Test("t413_raw_new_name_collision_no_copy", clean, true);
+    }
     {
         u64 before = HeapAudit.reportLeaks();
         int dtorBefore = t352UniqueDtor;
@@ -2810,6 +3028,18 @@ extern int main()
         _classifierInternalGrow(box);
         total++; passed += Test("classifier internal mutator caller value", box.xs[0], 7);
         total++; passed += Test("classifier internal mutator copies", _classifierCopyCount, 1);
+    }
+    _classifierCopyCount = 0;
+    {
+        ClassifierBox box = default;
+        box.seed();
+        u64 before = HeapAudit.reportLeaks();
+        _classifierArrayPointerAlias(box);
+        bool clean = HeapAudit.reportLeaks() == before;
+        total++; passed += Test("classifier array pointer caller count", box.xs.count(), 1);
+        total++; passed += Test("classifier array pointer caller value", box.xs[0], 7);
+        total++; passed += Test("classifier array pointer copies", _classifierCopyCount, 1);
+        total++; passed += Test("classifier array pointer leak balance", clean, true);
     }
     _classifierCopyCount = 0;
     {

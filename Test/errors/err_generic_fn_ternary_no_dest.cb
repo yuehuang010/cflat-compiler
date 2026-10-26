@@ -1,0 +1,8 @@
+expect_error("generic function 't405NoDest' needs a function-type destination to deduce T") {
+    int t405NoDest<T>(T value) { return value + 1; }
+    int t405NoDestPlain(int value) { return value; }
+    extern int main() {
+        auto f = true ? t405NoDest : t405NoDestPlain;
+        return 0;
+    }
+}

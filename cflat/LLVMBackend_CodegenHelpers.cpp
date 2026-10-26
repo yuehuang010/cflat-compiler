@@ -329,7 +329,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                     && !IsCopyableType(itr_nameArg->TypeName))
                     namedVar.IsOwningStruct = true;
                 if (ResolveTypeAlias(itr_nameArg->TypeName) == "string"
-                    && itr_nameArg->IsConsumeInferredSink
+                    && (itr_nameArg->IsConsumeInferredSink || itr_nameArg->IsInterfaceSink)
                     && OwningSinkConsumesConcrete(*itr_nameArg))
                     namedVar.IsOwningString = true;
                 if (ownsCFlatExternParams && CFlatExternOwnsByValueParam(*itr_nameArg))
@@ -2203,8 +2203,9 @@ void LLVMBackend::RecordAliasReturnAddressUse(const llvm::Function* function,
             AliasReturnAddressUse{ sourceFileName, currentLine, currentColumn, interfaceName });
 }
 
-bool LLVMBackend::OwningSinkConsumesConcrete(const TypeAndValue& p)
+bool LLVMBackend::OwningSinkConsumesConcrete(const TypeAndValue& p) const
 {
+        if (p.IsInterfaceSink) return true;
         if (!p.IsOwningSink) return false;
         if (p.IsReturnInferredSink && !p.IsWriteInferredSink
             && TypeOwnsUniquePointer(p.TypeName)) return false;

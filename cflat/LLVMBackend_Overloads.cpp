@@ -78,13 +78,8 @@ bool LLVMBackend::IsImplicitIntegerPointeePointerConversion(
     const std::string fromBase = resolvedPointee(fromPointer);
     const std::string toBase = resolvedPointee(toPointer);
     // `long` is the target's C long: C headers bind it as the same-width iN, so the two match.
-    auto canonical = [](const std::string& name) {
-        if (name == "long") return CanonicalPrimitiveTypeName(longBits_ == 64 ? "i64" : "i32");
-        if (name == "ulong") return CanonicalPrimitiveTypeName(longBits_ == 64 ? "u64" : "u32");
-        return CanonicalPrimitiveTypeName(name);
-    };
     if (fromBase.empty() || toBase.empty() || fromBase == "void" || toBase == "void"
-        || canonical(fromBase) == canonical(toBase))
+        || CanonicalPointeeTypeName(fromBase) == CanonicalPointeeTypeName(toBase))
         return false;
 
     // The pointee conversion applies only when both pointers have the same indirection depth.
@@ -2528,7 +2523,9 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     {
                         std::string callbackConstFrom, callbackConstTo;
                         callbackSignatureDiffers =
-                            FuncPtrSignaturesProvablyDiffer(functionPointerArgument, *candidateParamItr);
+                            FuncPtrSignaturesProvablyDiffer(llvm::isa_and_nonnull<llvm::Function>(arg.Primary)
+                                ? AliasAlignedCallbackSig(functionPointerArgument, *candidateParamItr) : functionPointerArgument,
+                                *candidateParamItr);
                         // A pointee-const-only difference ranks below an exact twin but stays
                         // bindable, so a lone candidate still reports the discarded const.
                         callbackConstDiffers = !callbackSignatureDiffers
@@ -7492,7 +7489,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 }
                 }
             }
-            else if (!inVariadicRange && candParamItr->IsFunctionPointer)
+            else if (!inVariadicRange && candParamItr->IsFunctionPointer
+                     && !ParameterIsAliasByPointer(*candParamItr))
             {
                 // function<T> parameter - dispatch depends on whether the callee is extern C.
                 llvm::Value* val = arg.Primary ? arg.Primary : LoadArgStorage(arg);
@@ -7531,7 +7529,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 if (auto* fnVal = llvm::dyn_cast_or_null<llvm::Function>(val))
                     if (const FunctionSymbol* fnSym = FindSymbolForFunction(fnVal))
                         if (RejectAliasParamFuncPtrBind(
-                                arg.CallerName.empty() ? fnSym->UniqueName : arg.CallerName, *fnSym))
+                                arg.CallerName.empty() ? fnSym->UniqueName : arg.CallerName, *fnSym, &*candParamItr))
                             return nullptr;
                 // A resolved function value must bind to the callback's complete ABI. Local
                 // function-pointer values are loads, so they do not enter this name-only branch.
@@ -8057,8 +8055,49 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
         // Null move sources before the callee can observe or reseat an aliased slot.
         moveTransferConsumedTemps_.clear();
-        ApplyMoveParamTransfer(functionName, candidate.Parameters, matched, true,
-                               candidate.IsMethod, true, candidate.IsCxx);
+        /*
+         * A generated C++ wrapper or constructor thunk: clang's SELECTED callee decides how each
+         * function-pointer argument binds (CSigEntry::paramBindKinds). By value ('v') nulls the
+         * source before the call. A by-value slot the callee reads ('V') gets its own temp copy,
+         * so the source is nulled before the call too and a callee reseat of it survives. A
+         * reference ('r'/'R') or an unknown binding forwards the source untouched, as C++ does.
+         */
+        std::vector<LLVMBackend::NamedVariable> slotBefore;
+        const bool slotWrapper = candidate.IsCxx && candidate.UniqueName.starts_with("__cflat_");
+        if (slotWrapper)
+        {
+            // A thunk registers under its own name; a wrapper under the call name, keyed by linkage.
+            std::string bindKinds;
+            for (const std::string& key : { candidate.UniqueName, functionName })
+                if (auto sigs = cxxFunctionSignatures_.find(key);
+                    bindKinds.empty() && sigs != cxxFunctionSignatures_.end())
+                    for (auto sig = sigs->second.rbegin(); sig != sigs->second.rend(); ++sig)
+                        if (sig->linkageName == candidate.UniqueName || key == candidate.UniqueName)
+                        {
+                            bindKinds = sig->paramBindKinds;
+                            break;
+                        }
+            slotBefore = matched;
+            for (size_t i = 0; i < matched.size() && i < candidate.Parameters.size(); ++i)
+            {
+                if (!candidate.Parameters[i].IsFunctionPointer) continue;
+                const char kind = i < bindKinds.size() ? bindKinds[i] : '.';
+                if (kind == 'v') continue;
+                const bool copySlot = kind == 'V' && matched[i].IsExplicitMove
+                    && i < argList.size() && matched[i].Primary != nullptr
+                    && argList[i] == matched[i].Primary && argList[i]->getType()->isPointerTy();
+                if (copySlot)
+                {
+                    llvm::Value* temp = AllocaAtEntry(builder->getPtrTy(), nullptr, "cxx.fptr.moved");
+                    builder->CreateStore(builder->CreateLoad(builder->getPtrTy(), argList[i]), temp);
+                    argList[i] = temp;
+                    continue;
+                }
+                slotBefore[i].IsCxxReferenceSink = true;
+            }
+        }
+        ApplyMoveParamTransfer(functionName, candidate.Parameters, slotWrapper ? slotBefore : matched,
+                               true, candidate.IsMethod, true, candidate.IsCxx);
         std::vector<llvm::Value*> sinkConsumedTemps = std::move(moveTransferConsumedTemps_);
         moveTransferConsumedTemps_.clear();
 
@@ -8564,8 +8603,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // bare ptr but CFlat function<T> variables hold the {fn, env} closure fat struct.
         // Wrap via a per-signature thunk so the indirect-call path (which always prepends
         // env to the args) reaches the real C function correctly.
+        // An alias closure return is the address of the callee's closure slot, not a C pointer.
         if (candidate.ReturnType.IsFunctionPointer
             && !candidate.ReturnType.IsThinFnPtr()
+            && !resultIsAlias
             && result != nullptr
             && result->getType()->isPointerTy())
         {
@@ -8691,8 +8732,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     && ResolveTypeAlias(param.TypeName) == ResolveTypeAlias(candidate.ReturnType.TypeName))
                     param.IsReturnInferredSink = false;
         }
-        ApplyMoveParamTransfer(functionName, *transferParams, matched, true,
-                               candidate.IsMethod, false, candidate.IsCxx);
+        ApplyMoveParamTransfer(functionName, *transferParams, matched,
+                               true, candidate.IsMethod, false, candidate.IsCxx);
 
         // A temp's `unique` field handed to a PLAIN `T*` parameter. Runs AFTER the sink reject
         // above, so `unique` / `move` parameters never reach the callee-side question.
@@ -8774,14 +8815,25 @@ bool LLVMBackend::HasFunctionWithMoveFlags(std::string functionName, const std::
     }
 
 bool LLVMBackend::RejectAliasParamFuncPtrBind(const std::string& functionName,
-                                              const FunctionSymbol& sym)
+                                              const FunctionSymbol& sym,
+                                              const TypeAndValue* destSig)
 {
-        // A non-pointer `alias` param is passed as a pointer to the caller's object, but a
-        // function-pointer type has no spelling for that, so an indirect call would pass the
-        // value itself and the callee would read it as an address.
-        for (const auto& p : sym.Parameters)
+        // A non-pointer `alias` param is passed as a pointer to the caller's object. A thin
+        // destination that also declares the param alias takes that address too; any other door is refused.
+        for (size_t i = 0; i < sym.Parameters.size(); ++i)
         {
+            const auto& p = sym.Parameters[i];
             if (!ParameterIsAliasByPointer(p)) continue;
+            // Only when the thin destination keeps the plain CFlat ABI; a C-ABI thunk would not.
+            if (destSig != nullptr && destSig->IsThinFnPtr() && i < destSig->FuncPtrParams.size()
+                && destSig->FuncPtrParams[i].IsAlias)
+            {
+                TypeAndValue destRet;
+                std::vector<TypeAndValue> destParams;
+                UnpackFuncPtrSignature(*destSig, destRet, destParams);
+                AbiRecipe destRecipe;
+                if (!ThinFnPtrUsesCAbi(destRet, destParams, destRecipe)) continue;
+            }
             LogErrorMessage(
                 "function '{}' cannot be used as a function pointer: its parameter '{}' is "
                 "'{}', which is passed as a reference to the caller's object and has no "
@@ -8891,7 +8943,7 @@ llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int
         auto chosen = [&](const FunctionSymbol* sym) -> llvm::Function* {
             if (bindingFuncPtr && sym->IsCxx && sym->IsDeleted)
                 LogError("clang: attempt to use a deleted function");
-            if (bindingFuncPtr) RejectAliasParamFuncPtrBind(functionName, *sym);
+            if (bindingFuncPtr) RejectAliasParamFuncPtrBind(functionName, *sym, destSig);
             // Taking the address is as unsafe as calling it - the eventual indirect call has
             // no landing pad either.
             if (bindingFuncPtr) RejectThrowingCxxFunction(*sym, functionName);
@@ -9618,14 +9670,36 @@ void LLVMBackend::RejectOwningLocalIntoBorrowingHelper(const std::string& functi
 void LLVMBackend::MarkVariableMoved(const std::string& name)
 {
         if (name.empty()) return;
-        RecordMoveKill(name);
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
-                { it->second.IsMoved = true; return; }
+            {
+                if (StdFunctionClosureSignature(it->second.TypeAndValue.TypeName) != nullptr)
+                {
+                    if (!it->second.ExplicitlyMovedNull)
+                        ResetMovedStdFunctionSource(it->second.TypeAndValue.TypeName,
+                                                    it->second.Storage, name);
+                    return;
+                }
+                RecordMoveKill(name);
+                it->second.IsMoved = true;
+                return;
+            }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
-                { it->second.IsMoved = true; return; }
+            {
+                if (StdFunctionClosureSignature(it->second.TypeAndValue.TypeName) != nullptr)
+                {
+                    if (!it->second.ExplicitlyMovedNull)
+                        ResetMovedStdFunctionSource(it->second.TypeAndValue.TypeName,
+                                                    it->second.Storage, name);
+                    return;
+                }
+                RecordMoveKill(name);
+                it->second.IsMoved = true;
+                return;
+            }
         }
+        RecordMoveKill(name);
     }
 
 void LLVMBackend::MarkVariableMovedIntoInterface(const std::string& name)

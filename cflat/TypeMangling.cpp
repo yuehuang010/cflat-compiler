@@ -569,7 +569,7 @@ std::string MangleFunctionType(const LLVMBackend& compiler,
         result += "$";
         if (param.IsMove) result += ".m$";
         result += MangleFunctionComponent(compiler, param.TypeName,
-                                          param.Pointer, param.PointerDepth, false, param.ConstMask,
+                                          param.Pointer, param.PointerDepth, param.IsAlias, param.ConstMask,
                                           param.IsArrayView);
     }
 #ifndef NDEBUG
@@ -655,7 +655,8 @@ std::string PrintTypeSpelling(const LLVMBackend& compiler, const TypeSpelling& s
 
 std::string RemangleTypeSpelling(const LLVMBackend& compiler, const TypeSpelling& spelling)
 {
-    if (!spelling.encodedName.empty()) return spelling.encodedName;
+    // Encoded carriers keep the alias marker so alias and by-value closures stay distinct keys.
+    if (!spelling.encodedName.empty()) return (spelling.alias ? ".a$" : "") + spelling.encodedName;
     std::string result;
     if (spelling.alias) result += ".a$";
     if (spelling.constDepth > 0) result += ".c" + std::to_string(spelling.constDepth) + "$";
@@ -772,14 +773,17 @@ std::string MangleClosureType(const LLVMBackend& compiler, bool isThin,
                               const std::string& ret, int retDepth,
                               const std::vector<std::pair<std::string, int>>& params,
                               int retConstMask, const std::vector<int>* paramConstMasks,
-                              const std::vector<bool>* paramArrayViews)
+                              const std::vector<bool>* paramArrayViews,
+                              const std::vector<bool>* paramAliases,
+                              bool retAlias)
 {
     std::string result = isThin ? "cfn$." : "fatfn$.";
     result += std::to_string(params.size()) + "$"
-           + MangleFunctionComponent(compiler, ret, retDepth > 0, retDepth, false, retConstMask);
+           + MangleFunctionComponent(compiler, ret, retDepth > 0, retDepth, retAlias, retConstMask);
     for (size_t i = 0; i < params.size(); i++)
         result += "$" + MangleFunctionComponent(compiler, params[i].first, params[i].second > 0,
-            params[i].second, false,
+            params[i].second,
+            paramAliases != nullptr && i < paramAliases->size() && (*paramAliases)[i],
             paramConstMasks != nullptr && i < paramConstMasks->size() ? (*paramConstMasks)[i] : -1,
             paramArrayViews != nullptr && i < paramArrayViews->size() && (*paramArrayViews)[i]);
 #ifndef NDEBUG

@@ -80,4 +80,6 @@ std::string MangleClosureType(const LLVMBackend& compiler, bool isThin,
                               const std::string& ret, int retDepth,
                               const std::vector<std::pair<std::string, int>>& params,
                               int retConstMask = -1, const std::vector<int>* paramConstMasks = nullptr,
-                              const std::vector<bool>* paramArrayViews = nullptr);
+                              const std::vector<bool>* paramArrayViews = nullptr,
+                              const std::vector<bool>* paramAliases = nullptr,
+                              bool retAlias = false);

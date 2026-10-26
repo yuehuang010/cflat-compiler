@@ -7189,6 +7189,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.IsCxxNullptrT)          o["cnt"] = true;
     if (s.IsCxxMutableField)      o["cmf"] = true;
     if (s.IsOwningSink)           o["osk"] = true;
+    if (s.IsInterfaceSink)        o["ifs"] = true;
     if (s.IsConsumeInferredSink)  o["cis"] = true;
     if (s.IsReturnInferredSink)  o["ris"] = true;
     if (s.IsWriteInferredSink)  o["wis"] = true;
@@ -7227,6 +7228,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
             if (p.IsReturnInferredSink) po["ris"] = true;
             if (p.IsWriteInferredSink) po["wis"] = true;
             if (p.IsRvalueRef) po["rr"] = true;
+            if (p.IsAlias) po["ia"] = true;
             if (p.IsPointeeConst) po["pc"] = true;
             if (p.PointerDepth > 1) po["pd"] = static_cast<int64_t>(p.PointerDepth);
             if (!p.ResolvedTypeKey.empty()) po["rk"] = p.ResolvedTypeKey;
@@ -7284,6 +7286,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("cnt")) s.IsCxxNullptrT = *v;
     if (auto v = o.getBoolean("cmf")) s.IsCxxMutableField = *v;
     if (auto v = o.getBoolean("osk")) s.IsOwningSink = *v;
+    if (auto v = o.getBoolean("ifs")) s.IsInterfaceSink = *v;
     if (auto v = o.getBoolean("cis")) s.IsConsumeInferredSink = *v;
     if (auto v = o.getBoolean("ris")) s.IsReturnInferredSink = *v;
     if (auto v = o.getBoolean("wis")) s.IsWriteInferredSink = *v;
@@ -7323,6 +7326,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
                     if (auto v = po->getBoolean("ris")) p.IsReturnInferredSink = *v;
                     if (auto v = po->getBoolean("wis")) p.IsWriteInferredSink = *v;
                     if (auto v = po->getBoolean("rr")) p.IsRvalueRef = *v;
+                    if (auto v = po->getBoolean("ia")) p.IsAlias = *v;
                     if (auto v = po->getBoolean("pc")) p.IsPointeeConst = *v;
                     if (p.Pointer) p.PointerDepth = 1;
                     if (auto v = po->getInteger("pd")) p.PointerDepth = static_cast<int>(*v);

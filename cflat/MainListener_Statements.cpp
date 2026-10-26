@@ -1107,21 +1107,25 @@ static std::string CurrentReturnBaseTypeSpelling(const LLVMBackend* compiler)
         return SpellType(*compiler, tv);
     }
 
-// A borrowing core unique<T> member call (`operator->`, `get`; pointer return, release() excluded)
-// whose receiver storage is in this frame: `mk()->v`, `u.get()`, `u->v` on a local or by-value
-// param. The receiver's destructor frees the pointee on return, so the borrow dangles.
-bool MainListener::IsFrameOwnedUniqueBorrow(const LLVMBackend* compiler, llvm::Value* value)
+// A borrowing pointer-returning member call whose receiver slot is in this frame. The alias
+// lifetime ruling treats all such receiver borrows like core unique<T>'s get()/operator->.
+// A receiver that is itself such a call (h.inner().get()) is followed down to its slot.
+bool MainListener::IsFrameOwnedBorrowingMemberCall(const LLVMBackend* compiler, llvm::Value* value)
 {
-        auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(value);
-        if (call == nullptr || call->getCalledFunction() == nullptr || call->arg_size() == 0) return false;
-        llvm::Value* receiver = call->getArgOperand(0)->stripPointerCasts();
-        while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(receiver))
-            receiver = gep->getPointerOperand()->stripPointerCasts();
-        if (!llvm::isa<llvm::AllocaInst>(receiver)) return false;
-        const auto* sym = compiler->FindSymbolForFunction(call->getCalledFunction());
-        return sym != nullptr && sym->IsMethod && !sym->Parameters.empty()
-            && compiler->IsCoreUniqueType(sym->Parameters[0].TypeName)
-            && sym->ReturnType.Pointer && !sym->ReturnType.IsMove;
+        for (int depth = 0; depth < 16; ++depth)
+        {
+            auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(value);
+            if (call == nullptr || call->getCalledFunction() == nullptr || call->arg_size() == 0) return false;
+            const auto* sym = compiler->FindSymbolForFunction(call->getCalledFunction());
+            if (sym == nullptr || !sym->IsMethod || !sym->ReturnType.Pointer || sym->ReturnType.IsMove)
+                return false;
+            llvm::Value* receiver = call->getArgOperand(0)->stripPointerCasts();
+            while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(receiver))
+                receiver = gep->getPointerOperand()->stripPointerCasts();
+            if (llvm::isa<llvm::AllocaInst>(receiver)) return true;
+            value = receiver;
+        }
+        return false;
     }
 
 std::string MainListener::ReturnUpcastStructName(const LLVMBackend::NamedVariable& nv) {
@@ -1208,6 +1212,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         {
             lambdaExpectedType = compiler->currentFunctionReturnTV;
             returnFnPtrTV = compiler->currentFunctionReturnTV;
+            encodedAliasReturnSlot = compiler->currentFunctionReturnTV.IsAlias
+                && !compiler->currentFunctionReturnTV.Pointer;
         }
         else if (!compiler->currentFunctionReturnTV.Pointer)
         {
@@ -2078,7 +2084,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 auto* call = llvm::dyn_cast<llvm::CallBase>(value);
                 // A new-expression result (`(new R())->v`) has no owner that outlives the frame.
                 if (compiler->IsOwnedNewTemp(value)) return true;
-                if (IsFrameOwnedUniqueBorrow(compiler, value)) return true;
+                if (IsFrameOwnedBorrowingMemberCall(compiler, value)) return true;
                 if (call == nullptr || call->getCalledFunction() == nullptr) return false;
                 const auto* symbol = compiler->FindSymbolForFunction(call->getCalledFunction());
                 if (symbol == nullptr || symbol->IsCxx || symbol->ReturnType.Pointer
@@ -2404,7 +2410,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     return;
                 }
                 frameLocalPointerReturn = PointsIntoStackFrame(value)
-                    || IsFrameOwnedUniqueBorrow(compiler, value);
+                    || IsFrameOwnedBorrowingMemberCall(compiler, value);
                 frameLocalArmUnderJoin = frameLocalPointerReturn && underJoin;
                 if (!frameLocalPointerReturn && underJoin && isCflatAliasCall(value))
                     cflatAliasJoinArm = true;

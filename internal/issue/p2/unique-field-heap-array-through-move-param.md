@@ -167,3 +167,12 @@ Maintainer is not ready to rule; recorded so the next pass starts here. The 2026
      `move VrS[] VrMake` test_cpp_interop:1243)? Recommendation: keep `move T[]`, close only `move T*`.
   2. Exempt trivially destructible T? core string.cb passes `new i8[32]` to `_strOwned(move i8* buf)`. Recommendation: exempt.
   3. Spike before ruling: count `new T[n]` sites reaching a `move T*` today, split by destructible element type.
+
+## Spike 2026-10-22 (T415, log-only census) - ruling needs revisit
+
+The 2026-10-21 static rule (refuse non-trivial `new T[n]` -> `move T*` at the call site) would refuse 75 bindings in Test/
+(test_core.cb 56 - the deliberate rawCountSink/rawCountOwnerSink/rawCountDeleteSink raw-count-through-move-T* legs around
+lines 2800-2930 and 3777; test_move.cb 6; test_collection_leaks.cb 5; test_hpc.cb 3; test_cpp_interop_bridge.cb 2) plus
+core/hpc/btree.cb:1214 `_freeSubtree(n->children[i])` (array-element provenance). Those test_core legs show raw-array count
+already travels through a `move T*` param; only the unique-FIELD store in the callee loses it. Narrower alternative: option 1
+above (callee-side "stored into unique field" parameter fact, refuse at the call site only then). Maintainer pick needed.

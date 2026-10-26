@@ -1,0 +1,35 @@
+expect_error("consumes parameter 's'; declare it 'move string s'") {
+    interface T406StringConsumeIface { void consume(string s); };
+    class T406StringConsumeImpl : T406StringConsumeIface
+    {
+        void consume(string s) { _ = move s; }
+    };
+}
+
+expect_error("consumes parameter 's'; declare it 'move string s'") {
+    interface T406GenericConsumeIface<T> { void consume(T s); };
+    class T406GenericConsumeImpl<T> : T406GenericConsumeIface<T>
+    {
+        void consume(T s) { _ = move s; }
+    };
+    void trigger() {
+        T406GenericConsumeImpl<string> value = default;
+        T406GenericConsumeIface<string> iface = value;
+        string argument = "generic-string".copy();
+        iface.consume(argument);
+    }
+}
+
+expect_error("consumes parameter 'v'; declare it 'move string v'") {
+    interface T406ConcreteStringIface<T> { void take(T v); };
+    class T406ConcreteStringImpl : T406ConcreteStringIface<string>
+    {
+        string keep = default;
+        void take(string v) { keep = move v; }
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

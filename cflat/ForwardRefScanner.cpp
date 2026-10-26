@@ -1762,7 +1762,8 @@ std::string ForwardRefScanner::EncodeClosureScanner(CFlatParser::FunctionPointer
                 paramArrayViews.push_back(pIsArrayView);
             }
         return BuildEncodedClosureName(compilerLLVM, isThin, retName, ReconcilePointerDepth(retPtr, retStars),
-                                       encParams, retConst, &paramConsts, &paramArrayViews);
+                                       encParams, retConst, &paramConsts, &paramArrayViews,
+                                       nullptr, aliasReturn);
     }
 
 std::string ForwardRefScanner::EncodePlainFunctionTypeScanner(

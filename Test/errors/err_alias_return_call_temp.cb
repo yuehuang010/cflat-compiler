@@ -2,6 +2,7 @@
 // temp (`mk()->v`, `(*mk()).v`), a `new` temp, a ternary arm of one, a named local or a by-value
 // unique param, and a pointer `alias T*` / raw `T*` return of `get()` on such an owner. Every return
 // would hand back a pointee the owner's destructor frees first, so each is refused at compile time.
+import cpp "cpp_interop_basic.h";
 int gT274Dtors = 0;
 struct T274Res { int v = 3; ~T274Res() { gT274Dtors = gT274Dtors + 1; } };
 struct T274Holder { unique<T274Res> u = default; };
@@ -42,6 +43,95 @@ expect_error("cannot return the address of") {
 
 expect_error("cannot return the address of") {
     T274Res* t274RawLocal() { unique<T274Res> u = t274Mk(); return u.get(); }
+}
+
+struct T408Node { int value = 41; };
+struct T408Arrow { T408Node node = default; T408Node* operator->() { return &node; } };
+struct T408Getter { T408Node node = default; T408Node* get() { return &node; } };
+struct T408ChainInner { T408Node node = default; T408Node* operator->() { return &node; } };
+struct T408ChainOuter { T408ChainInner inner = default; T408ChainInner operator->() { return inner; } };
+struct T408Holder { T408Arrow arrow = default; };
+struct T408PointerArrow { T408Node* target = nullptr; T408Node* operator->() { return target; } };
+struct T408Generic<T> { T value = default; T* operator->() { return &value; } };
+T408Node t408GlobalNode = default;
+T408Arrow t408GlobalArrow = default;
+T408Arrow t408MakeArrow() { T408Arrow local; return local; }
+cppi.Ops t408CppGlobal = default;
+
+expect_error("borrows frame-local storage") {
+    alias int t408LocalArrow() { T408Arrow local; return local->value; }
+}
+
+expect_error("borrows frame-local storage") {
+    alias int t408LocalGetter() { T408Getter local; return local.get()->value; }
+}
+
+expect_error("borrows frame-local storage") {
+    alias int t408LocalChain() { T408ChainOuter local; return local->value; }
+}
+
+expect_error("borrows frame-local storage") {
+    alias int t408ByValue(T408Arrow local) { return local->value; }
+}
+
+expect_error("borrows frame-local storage") {
+    alias int t408Temp() { return t408MakeArrow()->value; }
+}
+
+expect_error("borrows frame-local storage") {
+    alias int t408LocalField() { T408Holder local; return local.arrow->value; }
+}
+
+expect_error("borrows frame-local storage") {
+    alias int t408LocalAlias() {
+        T408Arrow local;
+        alias int value = local->value;
+        return value;
+    }
+}
+
+expect_error("borrows frame-local storage") {
+    alias int t408LocalStoreGlobal() {
+        T408PointerArrow local;
+        local.target = &t408GlobalNode;
+        return local->value;
+    }
+}
+
+expect_error("borrows frame-local storage") {
+    alias int t408LocalStoreHeap() {
+        T408Node* heap = new T408Node();
+        T408PointerArrow local;
+        local.target = heap;
+        return local->value;
+    }
+}
+
+expect_error("borrows frame-local storage") {
+    alias int t408GenericLocal() { T408Generic<T408Node> local; return local->value; }
+}
+
+expect_error("borrows frame-local storage") {
+    alias int t408CppClassLocal() {
+        cppi.OpsBox local = default;
+        local.target = &t408CppGlobal;
+        return local->value;
+    }
+}
+
+expect_error("cannot return the address of") {
+    T408Node* t408RawPointerGetter() { T408Getter local; return local.get(); }
+}
+
+struct T408NestW { T408Node node = default; T408Node* get() { return &node; } };
+struct T408NestH { T408NestW w = default; T408NestW* inner() { return &w; } };
+expect_error("borrows frame-local storage") {
+    alias int t408NestedChain() { T408NestH h; return h.inner().get()->value; }
+}
+
+struct T408NestU { unique<T408Node> u = default; unique<T408Node>* inner() { return &u; } };
+expect_error("borrows frame-local storage") {
+    alias int t408NestedUnique() { T408NestU h; h.u = new T408Node(); return h.inner().get()->value; }
 }
 
 extern int main()

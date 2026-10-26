@@ -602,6 +602,65 @@ namespace cflat_cinterop
             return out;
         }
 
+        /*
+         * Per wrapper parameter, how the callee clang selected binds it ('.' if no call argument is
+         * that parameter): 'v' by value, 'r' by reference; upper case when the argument is the
+         * parameter dereferenced (`*static_cast<T *>(pK)`, a caller slot). A move of a function value
+         * nulls its source only for a by-value binding (T414). A parameter bound twice keeps 'r'/'R'.
+         */
+        std::string WrapperParameterBindKinds(const FunctionDecl* fd)
+        {
+            const Stmt* body = fd != nullptr ? fd->getBody() : nullptr;
+            if (body == nullptr) return {};
+            std::string kinds(fd->getNumParams(), '.');
+            auto inspect = [&](const FunctionDecl* callee, const Expr* const* args, unsigned count,
+                               unsigned skip) {
+                if (callee == nullptr) return;
+                for (unsigned i = skip; i < count; ++i)
+                {
+                    if (i - skip >= callee->getNumParams() || args[i] == nullptr) break;
+                    const Expr* e = args[i];
+                    bool slot = false;
+                    for (;;)
+                    {
+                        e = e->IgnoreParens();
+                        if (const auto* cast = llvm::dyn_cast<CastExpr>(e)) { e = cast->getSubExpr(); continue; }
+                        if (const auto* temp = llvm::dyn_cast<MaterializeTemporaryExpr>(e))
+                            { e = temp->getSubExpr(); continue; }
+                        if (const auto* deref = llvm::dyn_cast<UnaryOperator>(e);
+                            deref != nullptr && deref->getOpcode() == UO_Deref)
+                            { slot = true; e = deref->getSubExpr(); continue; }
+                        break;
+                    }
+                    const auto* ref = llvm::dyn_cast<DeclRefExpr>(e);
+                    const auto* parm = ref != nullptr ? llvm::dyn_cast<ParmVarDecl>(ref->getDecl()) : nullptr;
+                    if (parm == nullptr || parm->getDeclContext() != fd) continue;
+                    const unsigned index = parm->getFunctionScopeIndex();
+                    if (index >= kinds.size()) continue;
+                    const bool reference = callee->getParamDecl(i - skip)->getType()->isReferenceType();
+                    const char kind = slot ? (reference ? 'R' : 'V') : (reference ? 'r' : 'v');
+                    if (kinds[index] == '.' || kind == 'r' || kind == 'R') kinds[index] = kind;
+                }
+            };
+            auto visit = [&](auto&& self, const Stmt* s) -> void {
+                if (s == nullptr) return;
+                if (const auto* op = llvm::dyn_cast<CXXOperatorCallExpr>(s))
+                {
+                    const FunctionDecl* callee = op->getDirectCallee();
+                    inspect(callee, op->getArgs(), op->getNumArgs(),
+                            llvm::isa_and_nonnull<CXXMethodDecl>(callee) ? 1u : 0u);
+                }
+                else if (const auto* call = llvm::dyn_cast<CallExpr>(s))
+                    inspect(call->getDirectCallee(), call->getArgs(), call->getNumArgs(), 0);
+                else if (const auto* construct = llvm::dyn_cast<CXXConstructExpr>(s))
+                    inspect(construct->getConstructor(), construct->getArgs(), construct->getNumArgs(), 0);
+                for (const Stmt* child : s->children()) self(self, child);
+            };
+            visit(visit, body);
+            if (kinds.find_first_not_of('.') == std::string::npos) return {};
+            return kinds;
+        }
+
         // The selected callee, exactly: qualified name, specialized type, and primary pattern.
         std::string CalleeIdentity(const ASTContext& ctx, const FunctionDecl* callee)
         {
@@ -2331,6 +2390,7 @@ namespace cflat_cinterop
                                                      sig.calleeIdentity);
                     sig.resultBorrowsBraceList = WrapperResultBorrowsBraceList(
                         ctx, fd, sig.braceListElementTypes);
+                    sig.paramBindKinds = WrapperParameterBindKinds(fd);
                 }
                 // An immediate ('consteval') function is evaluated by the C++ front end and gets
                 // no runtime symbol, so binding it would only fail at link time with a mangled name.

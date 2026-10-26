@@ -1075,9 +1075,10 @@ std::string LLVMBackend::FuncPtrComponentDeclaringKey(const std::string& name) c
     }
 
 LLVMBackend::FuncPtrComponent LLVMBackend::FuncPtrComponentOf(const std::string& typeName, bool pointer,
-        int pointerDepth, const std::string& resolvedKey, bool isArrayView, int constMask) const
+        int pointerDepth, const std::string& resolvedKey, bool isArrayView, int constMask, bool isAlias) const
 {
         FuncPtrComponent c;
+        c.IsAlias = isAlias;
         c.IsArrayView = isArrayView;
         c.ConstMask = constMask;
         c.PointerDepth = pointer ? pointerDepth : 0;
@@ -1116,6 +1117,7 @@ LLVMBackend::FuncPtrComponent LLVMBackend::FuncPtrComponentOf(const std::string&
 
 bool LLVMBackend::ComponentsProvablyDiffer(const FuncPtrComponent& a, const FuncPtrComponent& b)
 {
+        if (a.IsAlias != b.IsAlias) return true;
         if (!a.Known || !b.Known) return false;
         if (a.IsArrayView != b.IsArrayView) return true;
         if ((a.IsArrayView || b.IsArrayView)
@@ -1149,10 +1151,11 @@ bool LLVMBackend::FuncPtrSignatureOf(const LLVMBackend::TypeAndValue& tv, std::v
         if (signature.FuncPtrReturnTypeName.empty()) return false;
         out.clear();
         out.push_back(FuncPtrComponentOf(signature.FuncPtrReturnTypeName, signature.FuncPtrReturnPointer,
-            signature.FuncPtrReturnPointerDepth, signature.FuncPtrReturnResolvedKey));
+            signature.FuncPtrReturnPointerDepth, signature.FuncPtrReturnResolvedKey,
+            false, -1, signature.FuncPtrReturnAlias));
         for (const auto& p : signature.FuncPtrParams)
             out.push_back(FuncPtrComponentOf(p.TypeName, p.Pointer, p.PointerDepth,
-                p.ResolvedTypeKey, p.IsArrayView, p.ConstMask));
+                p.ResolvedTypeKey, p.IsArrayView, p.ConstMask, p.IsAlias));
         return true;
     }
 
@@ -1222,6 +1225,8 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
             fp.IsWriteInferredSink = p.IsWriteInferredSink;
             fp.PointerDepth = p.ValuePointerDepth();
             fp.ConstMask = p.FunctionParamConstMask();
+            // Same predicate the callee lowers by: an alias closure/fn-ptr param is passed by address.
+            fp.IsAlias = ParameterIsAliasByPointer(p);
             fp.IsPointeeConst = (fp.ConstMask & 1) != 0;
             sig.FuncPtrParams.push_back(fp);
         }
@@ -1247,7 +1252,7 @@ bool LLVMBackend::NamedFunctionProvablyMismatchesFuncPtr(const std::string& func
         for (const auto& sym : it->second)
         {
             const auto sig = FuncPtrSigOfSymbol(sym);
-            if (!FuncPtrSignaturesProvablyDiffer(sig, param)
+            if (!FuncPtrSignaturesProvablyDiffer(AliasAlignedCallbackSig(sig, param), param)
                 || FuncPtrFewerParamsCanAdapt(sig, param))
                 return false;
         }
@@ -1262,7 +1267,7 @@ const LLVMBackend::FunctionSymbol* LLVMBackend::NamedFunctionOverloadForFuncPtr(
         for (const auto& sym : it->second)
         {
             const auto sig = FuncPtrSigOfSymbol(sym);
-            if (!sym.IsMethod && (!FuncPtrSignaturesProvablyDiffer(sig, param)
+            if (!sym.IsMethod && (!FuncPtrSignaturesProvablyDiffer(AliasAlignedCallbackSig(sig, param), param)
                 || FuncPtrFewerParamsCanAdapt(sig, param)))
                 return &sym;
         }
@@ -1482,7 +1487,10 @@ std::string LLVMBackend::FuncPtrBindReason(const LLVMBackend::TypeAndValue& fn,
             why = std::format("it takes {} parameter(s) but the slot supplies only {}",
                 sa.size() - 1, sb.size() - 1);
         for (size_t i = 0; i < sa.size() && why.empty(); i++)
-            if (ComponentsProvablyDiffer(sa[i], sb[i]))
+            if (sa[i].IsAlias != sb[i].IsAlias)
+                why = (i == 0) ? "the return is 'alias' in one signature and by value in the other"
+                    : std::format("parameter {} is 'alias' in one signature and by value in the other", i);
+            else if (ComponentsProvablyDiffer(sa[i], sb[i]))
                 why = (i == 0) ? "the return type differs" : std::format("parameter {} differs", i);
         if (why.empty() && compareReturnOwnership
             && function.FuncPtrReturnPointer && destination.FuncPtrReturnPointer
@@ -1583,11 +1591,22 @@ bool LLVMBackend::FuncPtrFewerParamsCanAdapt(const TypeAndValue& source,
         return true;
     }
 
+LLVMBackend::TypeAndValue LLVMBackend::AliasAlignedCallbackSig(const TypeAndValue& fn,
+        const TypeAndValue& dest) const
+{
+        TypeAndValue aligned = fn;
+        if (aligned.FuncPtrParams.size() == dest.FuncPtrParams.size())
+            for (size_t i = 0; i < aligned.FuncPtrParams.size(); i++)
+                if (aligned.FuncPtrParams[i].IsAlias && !dest.FuncPtrParams[i].IsAlias)
+                    aligned.FuncPtrParams[i].IsAlias = false;
+        return aligned;
+}
+
 std::string LLVMBackend::DescribeFuncPtrBindMismatch(const std::string& functionName,
         const LLVMBackend::TypeAndValue& fn, const LLVMBackend::TypeAndValue& dest,
         bool compareReturnOwnership) const
 {
-        std::string why = FuncPtrBindReason(fn, dest, compareReturnOwnership);
+        std::string why = FuncPtrBindReason(AliasAlignedCallbackSig(fn, dest), dest, compareReturnOwnership);
         if (why.empty()) return "";
         return std::format("cannot bind function '{}' to function-pointer type '{}': '{}' is "
             "'{}' - {}. A function pointer is called with no conversion site, so the signature "

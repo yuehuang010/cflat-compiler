@@ -1093,6 +1093,7 @@ void LLVMBackend::UnpackFuncPtrSignature(const TypeAndValue& fpTV, TypeAndValue&
             tv.IsReturnInferredSink = p.IsReturnInferredSink;
             tv.IsWriteInferredSink = p.IsWriteInferredSink;
             tv.IsRvalueRef = p.IsRvalueRef;
+            tv.IsAlias = p.IsAlias;
             params.push_back(std::move(tv));
         }
     }
@@ -1464,6 +1465,12 @@ llvm::Value* LLVMBackend::WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, cons
 bool LLVMBackend::ThinFnPtrUsesCAbi(const TypeAndValue& ret, const std::vector<TypeAndValue>& params,
                                     AbiRecipe& outRecipe)
 {
+        // An alias closure param is a pointer on both sides: a signature whose only lowering is
+        // such params keeps the plain CFlat ABI (no reverse-ABI thunk; the pointer passes as is).
+        std::vector<TypeAndValue> pointerParams = params;
+        for (auto& p : pointerParams)
+            if (ParameterIsAliasByPointer(p)) { p.Pointer = true; p.IsAlias = false; }
+        if (!ComputeAbiRecipe(ret, pointerParams).hasLowering) return false;
         // A signature touching a C++ class keeps its own convention (cxxIndirectRecipe).
         if (ComputeCxxReturnAbiRecipe(ret, params).hasLowering) return false;
         outRecipe = ComputeAbiRecipe(ret, params);
@@ -2386,14 +2393,30 @@ void LLVMBackend::VerifyInterfaceFields(const std::string& implName, const std::
         }
     }
 
+bool LLVMBackend::InterfaceParamConsumesOwnership(const TypeAndValue& param) const
+{
+        return param.IsMove || InterfaceParamConsumesByType(param);
+    }
+
+bool LLVMBackend::InterfaceParamConsumesByType(const TypeAndValue& param) const
+{
+        if (param.IsUnique || (!param.Pointer && IsCoreUniqueType(param.TypeName))) return true;
+        if (param.Pointer || param.ElemPointer || param.IsAlias || param.IsRvalueRef
+            || param.IsCxxRefToPointer || param.CxxConstRef() || param.IsArrayView
+            || param.IsFunctionPointer)
+            return false;
+        return !IsCopyableType(param.TypeName);
+    }
+
 bool LLVMBackend::InterfaceMethodContractConforms(const InterfaceMethod& method, const FunctionSymbol& sym) const
 {
         for (size_t i = 0; i < method.Parameters.size(); i++)
         {
             const auto& ip = method.Parameters[i];
             const auto& cp = sym.Parameters[i + 1];   // Parameters[0] is the implicit 'this'
-            bool cpMove = IsMoveOrCoreUniqueValue(cp);
-            bool ipMove = IsMoveOrCoreUniqueValue(ip);
+            bool cpMove = IsMoveOrCoreUniqueValue(cp) || cp.IsInterfaceSink
+                || OwningSinkConsumesConcrete(cp);
+            bool ipMove = InterfaceParamConsumesOwnership(ip);
             if (cpMove != ipMove) return false;
             if (cp.IsAdopt != ip.IsAdopt) return false;
             if (cp.IsBond != ip.IsBond) return false;

@@ -827,7 +827,7 @@ extern int main()
         int k = 0;
         while (k < 8)
         {
-            JsonNode* root = JsonParser.parse(
+            move JsonNode* root = JsonParser.parse(
                 "{\"full_name\":\"Ada\\tLovelace\",\"city\":\"London\",\"nested\":{\"k\":\"v\"}}");
             delete root;
             k++;
@@ -838,7 +838,7 @@ extern int main()
     // p2: JSON numbers are double/i64, not float/i32. Pre-fix `rev` came back as
     // -808991232 (i32 overflow in the parser) and `eps` as 2.0099999905 (f32).
     {
-        JsonNode* nums = JsonParser.parse(
+        move JsonNode* nums = JsonParser.parse(
             "{\"rev\": 394328000000, \"ts\": 1724284800, \"eps\": 2.01, \"neg\": -900000000000}");
         total++; passed += Test("json_i64_revenue", nums.getInt64("rev"), (i64)394328000000);
         total++; passed += Test("json_i64_negative", nums.getInt64("neg"), (i64)-900000000000);
@@ -856,7 +856,7 @@ extern int main()
     }
     // By-INDEX accessors, reached through a nested array.
     {
-        JsonNode* doc = JsonParser.parse("{\"xs\": [394328000000, 2.01]}");
+        move JsonNode* doc = JsonParser.parse("{\"xs\": [394328000000, 2.01]}");
         IJSONArray a = doc.getArray("xs");
         total++; passed += Test("json_array_i64", a.getInt64(0), (i64)394328000000);
         double ad = a.getDouble(1) - 2.01;
@@ -868,7 +868,7 @@ extern int main()
     // first token was '{', so this document parsed to a NULL node and `doc.getInt64(0)` was a
     // null dereference (SIGSEGV, no diagnostic) - it now parses any top-level JSON value.
     {
-        JsonNode* doc = JsonParser.parse("[394328000000, 2.01]");
+        move JsonNode* doc = JsonParser.parse("[394328000000, 2.01]");
         total++; passed += Test("json_toplevel_array_i64", doc.getInt64(0), (i64)394328000000);
         double td = doc.getDouble(1) - 2.01;
         if (td < 0.0) td = -td;
@@ -881,7 +881,7 @@ extern int main()
     // A top-level SCALAR is a JSON value too, and it must not be mistaken for a document with
     // fields: the by-key accessors answer their documented "absent" values on it.
     {
-        JsonNode* doc = JsonParser.parse("42");
+        move JsonNode* doc = JsonParser.parse("42");
         total++; passed += Test("json_toplevel_scalar_absent_key", doc.getInt("nope"), 0);
         delete doc;
     }

@@ -5060,8 +5060,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                 compiler->RegisterDestructor(structName, dtorFn);
         }
 
-        // Pre-register interfaces before method bodies so StructImplementsInterface() returns true
-        // for assignments inside the class itself (e.g. `IJSON result = this;` inside a class : IJSON).
+        // Resolve interfaces before method bodies so both interface assignments and ownership
+        // checks see each generic base's substituted method signatures.
         auto resolveImplsTypeArgs = [&](CFlatParser::GenericTypeParametersContext* gtp) -> std::vector<std::string>
         {
             std::vector<std::string> args;
@@ -5091,8 +5091,15 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             return args;
         };
 
+        std::vector<std::string> ifaceNames;
+        struct GenericInterfaceBase
         {
-            std::vector<std::string> earlyIfaceNames;
+            std::string TemplateName;
+            std::string InstanceName;
+            std::vector<std::string> TypeArgs;
+        };
+        std::vector<GenericInterfaceBase> genericInterfaceBases;
+        {
             for (auto* spec : ctx->baseSpecifier())
             {
                 std::string ifaceBaseName = BaseSpecifierName(spec);
@@ -5103,17 +5110,51 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     // A base clause names the TEMPLATE, so the spelling resolves through the
                     // generic key space (a bare 'IV<T>' inside namespace NS means NS.IV).
                     auto concreteTypeArgs = resolveImplsTypeArgs(spec->genericTypeParameters());
-                    ifaceName = MangledGenericName(compiler->ResolveGenericBaseAlias(ifaceBaseName),
-                                                   concreteTypeArgs);
+                    ifaceBaseName = compiler->ResolveGenericBaseAlias(ifaceBaseName);
+                    ifaceName = MangledGenericName(ifaceBaseName, concreteTypeArgs);
+                    genericInterfaceBases.push_back(
+                        GenericInterfaceBase{ ifaceBaseName, ifaceName, std::move(concreteTypeArgs) });
                 }
                 else
                 {
                     ifaceName = compiler->ResolveInterfaceName(ifaceBaseName);
                 }
-                earlyIfaceNames.push_back(ifaceName);
+                ifaceNames.push_back(ifaceName);
             }
-            if (!earlyIfaceNames.empty() && !isWinrt)
-                compiler->RegisterStructInterfaces(structName, earlyIfaceNames);
+            if (!ifaceNames.empty() && !isWinrt)
+                compiler->RegisterStructInterfaces(structName, ifaceNames);
+        }
+
+        // The class signatures have been pre-declared above, and its resolved interface list is
+        // registered now so generic interface ownership can inspect those concrete symbols.
+        for (const auto& base : genericInterfaceBases)
+        {
+            std::unordered_map<std::string, std::string> ifaceSubstitutions;
+            std::unordered_map<std::string, std::string> ifaceValueSubstitutions;
+            std::unordered_map<std::string, std::vector<std::string>> ifacePackSubstitutions;
+            const auto& ifaceTypeParams = genericInterfaceTypeParams[base.TemplateName];
+            const auto& ifaceValueParams = genericInterfaceValueParams[base.TemplateName];
+            auto ifacePackIdxIt = genericInterfacePackIndex.find(base.TemplateName);
+            size_t ifacePackIdx = ifacePackIdxIt != genericInterfacePackIndex.end()
+                ? ifacePackIdxIt->second : std::string::npos;
+            if (ifacePackIdx == std::string::npos)
+            {
+                for (size_t i = 0; i < ifaceTypeParams.size() && i < base.TypeArgs.size(); i++)
+                {
+                    if (i < ifaceValueParams.size() && !ifaceValueParams[i].empty())
+                        ifaceValueSubstitutions[ifaceTypeParams[i]] = base.TypeArgs[i];
+                    else ifaceSubstitutions[ifaceTypeParams[i]] = base.TypeArgs[i];
+                }
+            }
+            else
+            {
+                for (size_t i = 0; i < ifacePackIdx && i < base.TypeArgs.size(); i++)
+                    ifaceSubstitutions[ifaceTypeParams[i]] = base.TypeArgs[i];
+                ifacePackSubstitutions[ifaceTypeParams[ifacePackIdx]] =
+                    std::vector<std::string>(base.TypeArgs.begin() + ifacePackIdx, base.TypeArgs.end());
+            }
+            InstantiateGenericInterface(base.TemplateName, base.InstanceName, ifaceSubstitutions,
+                ifacePackSubstitutions, ifaceValueSubstitutions);
         }
 
         {
@@ -5210,54 +5251,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             }
         }
 
-        // Record interfaces and verify implementations
-        std::vector<std::string> ifaceNames;
-        for (auto* spec : ctx->baseSpecifier())
-        {
-            std::string ifaceBaseName = BaseSpecifierName(spec);
-            if (ifaceBaseName.empty()) continue;
-            std::string ifaceName = compiler->ResolveInterfaceName(ifaceBaseName);
-
-            if (spec->genericTypeParameters() != nullptr)
-            {
-                ifaceBaseName = compiler->ResolveGenericBaseAlias(ifaceBaseName);
-                auto concreteTypeArgs = resolveImplsTypeArgs(spec->genericTypeParameters());
-                ifaceName = MangledGenericName(ifaceBaseName, concreteTypeArgs);
-
-                // Build substitution maps for the interface template's type params (pack-aware)
-                std::unordered_map<std::string, std::string> ifaceSubstitutions;
-                std::unordered_map<std::string, std::string> ifaceValueSubstitutions;
-                std::unordered_map<std::string, std::vector<std::string>> ifacePackSubstitutions;
-                const auto& ifaceTypeParams = genericInterfaceTypeParams[ifaceBaseName];
-                const auto& ifaceValueParams = genericInterfaceValueParams[ifaceBaseName];
-                auto ifacePackIdxIt = genericInterfacePackIndex.find(ifaceBaseName);
-                size_t ifacePackIdx = (ifacePackIdxIt != genericInterfacePackIndex.end())
-                                      ? ifacePackIdxIt->second : std::string::npos;
-                if (ifacePackIdx == std::string::npos)
-                {
-                    for (size_t i = 0; i < ifaceTypeParams.size() && i < concreteTypeArgs.size(); i++)
-                    {
-                        if (i < ifaceValueParams.size() && !ifaceValueParams[i].empty())
-                            ifaceValueSubstitutions[ifaceTypeParams[i]] = concreteTypeArgs[i];
-                        else ifaceSubstitutions[ifaceTypeParams[i]] = concreteTypeArgs[i];
-                    }
-                }
-                else
-                {
-                    for (size_t i = 0; i < ifacePackIdx && i < concreteTypeArgs.size(); i++)
-                        ifaceSubstitutions[ifaceTypeParams[i]] = concreteTypeArgs[i];
-                    ifacePackSubstitutions[ifaceTypeParams[ifacePackIdx]] =
-                        std::vector<std::string>(concreteTypeArgs.begin() + ifacePackIdx, concreteTypeArgs.end());
-                }
-
-                InstantiateGenericInterface(ifaceBaseName, ifaceName, ifaceSubstitutions,
-                    ifacePackSubstitutions, ifaceValueSubstitutions);
-            }
-
-            ifaceNames.push_back(ifaceName);
-        }
-        // A [winrt] class emits COM runtime functions + the static vtable instead of registering
-        // a fat-ptr interface vtable. Runs after member functions/dtor so thunks can find them.
+        // A [winrt] class emits COM runtime functions + the static vtable, else the fat-ptr vtables
+        // are verified against the interface instances the method bodies resolved above.
         if (isWinrt)
         {
             compiler->EmitWinrtRuntime(structName, winrtIface, winrtVtblName);

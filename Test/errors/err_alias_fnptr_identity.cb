@@ -1,0 +1,56 @@
+// T411 round 3: an alias param and a by-value param are different function-pointer types. Assignment
+// and conditional joins between them are refused, as clang refuses incompatible function pointers.
+int aliasIdentityInvoke(alias Lambda<int()> f) { return f(); }
+int aliasIdentityByValue(Lambda<int()> f) { return f(); }
+
+expect_error("parameter 1 is 'alias' in one signature and by value in the other") {
+    int aliasIdentityAssign()
+    {
+        Lambda<int()> f = () => { return 7; };
+        function call = aliasIdentityInvoke;
+        function other = aliasIdentityByValue;
+        call = other;
+        return call(f);
+    }
+}
+
+expect_error("the arms of the conditional expression have different signatures") {
+    int aliasIdentityJoin()
+    {
+        Lambda<int()> f = () => { return 7; };
+        bool b = false;
+        function call = b ? aliasIdentityInvoke : aliasIdentityByValue;
+        return call(f);
+    }
+}
+
+extern int main()
+{
+    return 0;
+}
+
+// An alias function VALUE passed where a by-value slot is declared: refused at the call site.
+struct AliasIdentityRow { int value = default; };
+int aliasIdentityRowInvoke(alias AliasIdentityRow r) { return r.value; }
+int aliasIdentityRowCallThru(function<int(AliasIdentityRow)> g, AliasIdentityRow r) { return g(r); }
+
+expect_error("no overload of 'aliasIdentityRowCallThru' matches the given arguments") {
+    int aliasIdentityValueArg()
+    {
+        AliasIdentityRow r;
+        function call = aliasIdentityRowInvoke;
+        return aliasIdentityRowCallThru(call, r);
+    }
+}
+
+// The reverse direction: a by-value slot cannot take an alias function value.
+expect_error("parameter 1 is 'alias' in one signature and by value in the other") {
+    int aliasIdentityReverseAssign()
+    {
+        Lambda<int()> f = () => { return 7; };
+        function call = aliasIdentityInvoke;
+        function other = aliasIdentityByValue;
+        other = call;
+        return other(f);
+    }
+}

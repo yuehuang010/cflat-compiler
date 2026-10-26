@@ -228,6 +228,7 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
+import cpp "library/t414_fnmove.hpp";
 import cpp "library/cpp_t322_constretcv.hpp";
 import cpp "library/cpp_t337_constretcv_umbrella.hpp";
 import cpp "library/cpp_t217_mutable.hpp";
@@ -5409,6 +5410,16 @@ extern int main()
     cppi.ConstPointerRankDerived constRankDerived = default;
     const cppi.ConstPointerRankDerived* constDerivedPointer = &constRankDerived;
     cppi.ConstPointerRankDerived* mutableDerivedPointer = &constRankDerived;
+    cppi.ConstPointerRankValue* t410DerivedTern = true
+        ? mutableDerivedPointer : mutableRankPointer;
+    cppi.ConstPointerRankValue* t410BaseTern = false
+        ? mutableDerivedPointer : mutableRankPointer;
+    cppi.ConstPointerRankValue* t410DerivedCoal = mutableDerivedPointer ?? mutableRankPointer;
+    cppi.ConstPointerRankValue* t410BaseCoal = mutableRankPointer ?? mutableDerivedPointer;
+    if (cppi.const_derived_rank(t410DerivedTern) != 71
+        || cppi.const_derived_rank(t410BaseTern) != 71
+        || cppi.const_derived_rank(t410DerivedCoal) != 71
+        || cppi.const_derived_rank(t410BaseCoal) != 71) return 41010;
     auto constDerivedCopy = constDerivedPointer;
     if (cppi.const_derived_rank(constDerivedPointer) != 71) return 9005;
     if (cppi.const_derived_rank(mutableDerivedPointer) != 70) return 9006;
@@ -11171,6 +11182,70 @@ extern int main()
             if (capFn(1) != 37 || capFnCopy(2) != 38) return 3243;
         }
         if ((int)HeapAudit.reportLeaks() != heapBase) return 3244;
+        // T414: explicit moves null function values at C++ by-value calls and constructors.
+        {
+            function<int(int)> t414Fn = q.plus;
+            if (q.useFn(move t414Fn) != 6) return 41401;
+            if (t414Fn != nullptr) return 41402;
+            int guardedCall = t414Fn != nullptr ? t414Fn(5) : -1;
+            if (guardedCall != -1) return 41403;
+
+            t414Fn = q.plus;
+            q.ByVal t414ByVal = q.ByVal(move t414Fn);
+            if (t414ByVal.call() != 6) return 41404;
+            if (t414Fn != nullptr) return 41405;
+            guardedCall = t414Fn != nullptr ? t414Fn(5) : -1;
+            if (guardedCall != -1) return 41406;
+
+            int t414Capture = 2;
+            Lambda<int(int)> t414Lambda = (int x) => { return x + t414Capture; };
+            if (q.useStd(move t414Lambda) != 5) return 41407;
+            if (t414Lambda != nullptr) return 41408;
+
+            t414Lambda = (int x) => { return x + t414Capture; };
+            q.StdWrap t414StdWrap = q.StdWrap(move t414Lambda);
+            if (t414StdWrap.call() != 7) return 41409;
+            if (t414Lambda != nullptr) return 41410;
+
+            std.function<int(int)> t414Std = q.makeSmallStd();
+            std.function<int(int)> t414StdMoved = move t414Std;
+            if (t414StdMoved(5) != 6) return 41411;
+            if (t414Std != nullptr) return 41412;
+            std.function<int(int)> t414StdCtor = q.makeSmallStd();
+            q.StdWrap t414StdCtorWrap = q.StdWrap(move t414StdCtor);
+            if (t414StdCtorWrap.call() != 6) return 41418;
+            if (t414StdCtor != nullptr) return 41419;
+            // A wrapper forwards the slot: by-value template parameter nulls, a reference binds it.
+            t414Fn = q.plus;
+            if (q.useTplVal(move t414Fn) != 6) return 41420;
+            if (t414Fn != nullptr) return 41421;
+            t414Fn = q.plus;
+            if (q.useTplRef(move t414Fn) != 6) return 41422;
+            if (t414Fn == nullptr) return 41423;
+            q.TplRef t414TplRef = q.TplRef(move t414Fn);
+            if (t414TplRef.call() != 6) return 41424;
+            if (t414Fn == nullptr) return 41425;
+            // clang's SELECTED ctor decides: the by-value (F, int) one nulls despite an F&& sibling.
+            t414Fn = q.plus;
+            q.PickCtor t414Pick = q.PickCtor(move t414Fn, 1);
+            if (t414Pick.value != 106) return 41426;
+            if (t414Fn != nullptr) return 41427;
+            // A by-value template slot gets its own copy: the callee's reseat of the source survives.
+            t414Fn = q.plus;
+            if (q.reseatTpl(move t414Fn, (void*)&t414Fn) != 6) return 41428;
+            if (t414Fn == nullptr || t414Fn(5) != 7) return 41429;
+        }
+        if ((int)HeapAudit.reportLeaks() != heapBase) return 41413;
+        {
+            int t414Before = (int)HeapAudit.reportLeaks();
+            string t414Text = "abcdefghijklmnopqrstuvwxyz0123456789";
+            int t414One = (int)HeapAudit.reportLeaks() - t414Before;
+            Lambda<int(int)> t414Owned = (int x) => { return x + t414Text.length(); };
+            if (q.useStd(move t414Owned) != 39) return 41414;
+            if (t414Owned != nullptr) return 41415;
+            if ((int)HeapAudit.reportLeaks() - t414Before != t414One) return 41416;
+        }
+        if ((int)HeapAudit.reportLeaks() != heapBase) return 41417;
         // Escape: the holder outlives ClosureEscapeMaker's closure; clang oracle 42, 43, one live env.
         {
             cppi.ClosureHolder capEsc = ClosureEscapeMaker();
@@ -12567,9 +12642,9 @@ extern int main()
 
     cpppoly.Both* daEarly = new cpppoly.Both();
     cpppoly.BothLate* daLate = new cpppoly.BothLate();
-    cpppoly.Right* daOffsetJoin = 1 > 0 ? daEarly : daLate;
+    cpppoly.Right* daOffsetJoin = 1 > 0 ? (cpppoly.Right*)daEarly : daLate;
     if (DaTakeRight(daOffsetJoin) != 442047 || daEarly.rv != 47) return 3482;
-    cpppoly.Right* daOtherOffsetJoin = 0 > 0 ? daEarly : daLate;
+    cpppoly.Right* daOtherOffsetJoin = 0 > 0 ? (cpppoly.Right*)daEarly : daLate;
     if (DaTakeRight(daOtherOffsetJoin) != 773080 || daLate.rv != 80) return 3482;
     delete daEarly;
     delete daLate;
@@ -15853,7 +15928,7 @@ extern int main()
         // A void pointer joined with new selects the void* overload, as in clang++.
         t242vj.reset();
         void* t242VoidNull = nullptr;
-        t242vj.Ovv t242VoidCoal = t242vj.Ovv(t242VoidNull ?? new t242vj.E(5), 0);
+        t242vj.Ovv t242VoidCoal = t242vj.Ovv(t242VoidNull ?? (void*)new t242vj.E(5), 0);
         t242vj.E* t242VoidCoalKeep = (t242vj.E*)t242vj.lastArg();
         if (t242VoidCoal.r != -5 || t242vj.voidCalls() != 1 || t242vj.typedCalls() != 0
             || t242vj.live() != 1 || t242vj.news() != 1 || t242vj.deletes() != 0
@@ -15864,7 +15939,7 @@ extern int main()
         t242vj.reset();
         bool t242Choose = true;
         void* t242VoidTernNull = nullptr;
-        t242vj.Ovv t242VoidTern = t242vj.Ovv(t242Choose ? new t242vj.E(5) : t242VoidTernNull, 0);
+        t242vj.Ovv t242VoidTern = t242vj.Ovv(t242Choose ? (void*)new t242vj.E(5) : t242VoidTernNull, 0);
         t242vj.E* t242VoidTernKeep = (t242vj.E*)t242vj.lastArg();
         if (t242VoidTern.r != -5 || t242vj.voidCalls() != 1 || t242vj.typedCalls() != 0
             || t242vj.live() != 1 || t242vj.news() != 1 || t242vj.deletes() != 0
@@ -15901,13 +15976,13 @@ extern int main()
         if (t242VoidSameCoal.r != -5 || t242VoidSameTern.r != -5
             || t242vj.voidCalls() != 2 || t242vj.typedCalls() != 0) return 3814;
 
-        expect_error("has no constructor whose parameter types match") {
+        expect_error("pointee types differ; use an explicit cast on one arm") {
             bool c = true;
             t242vj.E* e = nullptr;
             t242vj.F* f = nullptr;
             t242vj.Ov bad = t242vj.Ov(c ? e : f, 0);
         }
-        expect_error("has no constructor whose parameter types match") {
+        expect_error("pointee types differ; use an explicit cast on one arm") {
             t242vj.E* e = nullptr;
             t242vj.Ov bad = t242vj.Ov(e ?? new t242vj.F(), 0);
         }

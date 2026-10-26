@@ -1,0 +1,100 @@
+import cpp "cpp_t242_join.h";
+
+struct T410JoinT { int v = 1; };
+struct T410JoinF { int v = 2; };
+struct T410JoinHolder { T410JoinT* p; };
+T410JoinT t410JoinGlobalT = default;
+T410JoinF t410JoinGlobalF = default;
+void* t410JoinGlobalVoid = nullptr;
+T410JoinT* t410JoinMakeT() { return &t410JoinGlobalT; }
+T410JoinF* t410JoinMakeF() { return &t410JoinGlobalF; }
+int t410JoinTakeT(T410JoinT* p) { return p == nullptr ? 0 : p->v; }
+
+extern int main()
+{
+    expect_error("the pointee types differ") {
+        int value = t410JoinTakeT(t410JoinGlobalVoid ?? &t410JoinGlobalT);
+    }
+    expect_error("the pointee types differ") {
+        int value = t410JoinTakeT(&t410JoinGlobalT ?? t410JoinGlobalVoid);
+    }
+    expect_error("the pointee types differ") {
+        int value = t410JoinTakeT(false ? t410JoinGlobalVoid : &t410JoinGlobalT);
+    }
+    expect_error("the pointee types differ") {
+        int value = t410JoinTakeT(true ? &t410JoinGlobalT : t410JoinGlobalVoid);
+    }
+    expect_error("the pointee types differ") {
+        int value = t410JoinTakeT(t410JoinMakeT() ?? t410JoinGlobalVoid);
+    }
+    expect_error("the pointee types differ") {
+        int value = t410JoinTakeT(true ? t410JoinMakeT() : t410JoinGlobalVoid);
+    }
+    expect_error("the pointee types differ") {
+        T410JoinT* value = t410JoinGlobalVoid ?? t410JoinMakeT();
+    }
+    expect_error("the pointee types differ") {
+        auto value = t410JoinGlobalVoid ?? t410JoinMakeT();
+    }
+    expect_error("the pointee types differ") {
+        T410JoinT* value = false ? t410JoinGlobalVoid : t410JoinMakeT();
+    }
+    expect_error("the pointee types differ") {
+        auto value = false ? t410JoinGlobalVoid : t410JoinMakeT();
+    }
+    expect_error("the pointee types differ") {
+        T410JoinT* value = &t410JoinGlobalT;
+        value = t410JoinGlobalVoid ?? t410JoinMakeT();
+    }
+    expect_error("the pointee types differ") {
+        T410JoinT* value = &t410JoinGlobalT;
+        value = false ? t410JoinGlobalVoid : t410JoinMakeT();
+    }
+    expect_error("the pointee types differ") {
+        t242vj.Ovv value = t242vj.Ovv(t410JoinGlobalVoid ?? new t242vj.E(1), 0);
+    }
+    expect_error("the pointee types differ") {
+        t242vj.Ovv value = t242vj.Ovv(false ? t410JoinGlobalVoid : new t242vj.E(1), 0);
+    }
+    expect_error("the pointee types differ") {
+        t242vj.E* e = nullptr;
+        t242vj.Ov value = t242vj.Ov(e ?? new t242vj.F(), 0);
+    }
+    expect_error("the pointee types differ") {
+        t242vj.Ov value = t242vj.Ov(true ? new t242vj.E(1) : new t242vj.F(), 0);
+    }
+    expect_error("the pointee types differ") {
+        T410JoinT* value = t410JoinMakeT() ?? t410JoinMakeF();
+    }
+    expect_error("the pointee types differ") {
+        auto value = t410JoinMakeT() ?? t410JoinMakeF();
+    }
+    expect_error("the pointee types differ") {
+        T410JoinT* value = &t410JoinGlobalT;
+        value = value ?? t410JoinMakeF();
+    }
+    expect_error("the pointee types differ") {
+        int value = t410JoinTakeT(t410JoinMakeT() ?? t410JoinMakeF());
+    }
+    expect_error("the pointee types differ") {
+        t242vj.E* e = nullptr;
+        t242vj.Ov value = t242vj.Ov(e ?? new t242vj.F(), 0);
+    }
+    expect_error("the pointee types differ") {
+        t242vj.Ov value = t242vj.Ov(false ? new t242vj.E(1) : new t242vj.F(), 0);
+    }
+    return 0;
+}
+
+expect_error("the pointee types differ") {
+    T410JoinT* t410JoinVoidReturn(void* p, T410JoinT* q) { return p ?? q; }
+}
+expect_error("the pointee types differ") {
+    T410JoinT* t410JoinUnrelatedReturn(T410JoinT* p, T410JoinF* q) { return p ?? q; }
+}
+expect_error("the pointee types differ") {
+    struct T410JoinVoidField { T410JoinT* p = t410JoinGlobalVoid ?? &t410JoinGlobalT; };
+}
+expect_error("the pointee types differ") {
+    struct T410JoinUnrelatedField { T410JoinT* p = &t410JoinGlobalT ?? &t410JoinGlobalF; };
+}

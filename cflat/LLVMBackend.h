@@ -777,6 +777,14 @@ public:
     static inline bool wcharSigned_ = true;
 #endif
 
+    // Canonical primitive pointee name: `long`/`ulong` map to the target's same-width iN/uN.
+    static std::string CanonicalPointeeTypeName(const std::string& name)
+    {
+        if (name == "long") return CanonicalPrimitiveTypeName(longBits_ == 64 ? "i64" : "i32");
+        if (name == "ulong") return CanonicalPrimitiveTypeName(longBits_ == 64 ? "u64" : "u32");
+        return CanonicalPrimitiveTypeName(name);
+    }
+
     static void SetTargetLongWidth(bool targetWindows, int platformBits,
                                    bool targetArm64, bool targetMacOS);
 
@@ -888,6 +896,8 @@ public:
         // source is nulled at the call site. Consumers still gate on the concrete type owning a
         // resource (IsOwningValueType(T) || T=="string"), so a non-owning T stays harmless.
         bool IsOwningSink = false;
+        // Interface-required ownership, separate from source-level `move` and body inference.
+        bool IsInterfaceSink = false;
         // Set alongside IsOwningSink when the sink was inferred STRUCTURALLY from a CONSUMING STORE
         // (a plain `=`/slot store or a conditional `move`), not an unconditional top-level `move`.
         // The scanner cannot resolve a struct's owns-resource/copyability during the forward pass
@@ -977,6 +987,8 @@ public:
             // True for whole-name writes and for a non-return consume path combined with a return.
             bool IsWriteInferredSink = false;
             bool IsRvalueRef = false;
+            // Alias closure/fn-ptr param: the callee takes its caller slot by address (ParameterIsAliasByPointer).
+            bool IsAlias = false;
             bool IsPointeeConst = false;  // spelled `const T*` (a C++ signature: ConstMask is -1)
             int PointerDepth = 0;   // 0 = not recorded; see FuncPtrReturnPointerDepth
             std::string ResolvedTypeKey;  // "" = not recorded; see FuncPtrReturnResolvedKey
@@ -1392,6 +1404,7 @@ public:
         bool IsCxxNullptrT = false;
         bool IsCxxMutableField = false;
         bool IsOwningSink = false;
+        bool IsInterfaceSink = false;
         bool IsConsumeInferredSink = false;
         bool IsReturnInferredSink = false;
         bool IsWriteInferredSink = false;
@@ -1425,6 +1438,7 @@ public:
             bool IsReturnInferredSink = false;
             bool IsWriteInferredSink = false;
             bool IsRvalueRef = false;
+            bool IsAlias = false;
             bool IsPointeeConst = false;
             int PointerDepth = 0;
             std::string ResolvedTypeKey;
@@ -1469,6 +1483,7 @@ public:
             s.IsCxxNullptrT = t.IsCxxNullptrT;
             s.IsCxxMutableField = t.IsCxxMutableField;
             s.IsOwningSink = t.IsOwningSink;
+            s.IsInterfaceSink = t.IsInterfaceSink;
             s.IsConsumeInferredSink = t.IsConsumeInferredSink;
             s.IsReturnInferredSink = t.IsReturnInferredSink;
             s.IsWriteInferredSink = t.IsWriteInferredSink;
@@ -1503,6 +1518,7 @@ public:
                 q.IsReturnInferredSink = p.IsReturnInferredSink;
                 q.IsWriteInferredSink = p.IsWriteInferredSink;
                 q.IsRvalueRef = p.IsRvalueRef;
+                q.IsAlias = p.IsAlias;
                 q.IsPointeeConst = p.IsPointeeConst;
                 q.PointerDepth = p.PointerDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
@@ -1547,6 +1563,7 @@ public:
             t.IsCxxNullptrT = IsCxxNullptrT;
             t.IsCxxMutableField = IsCxxMutableField;
             t.IsOwningSink = IsOwningSink;
+            t.IsInterfaceSink = IsInterfaceSink;
             t.IsConsumeInferredSink = IsConsumeInferredSink;
             t.IsReturnInferredSink = IsReturnInferredSink;
             t.IsWriteInferredSink = IsWriteInferredSink;
@@ -1581,6 +1598,7 @@ public:
                 q.IsReturnInferredSink = p.IsReturnInferredSink;
                 q.IsWriteInferredSink = p.IsWriteInferredSink;
                 q.IsRvalueRef = p.IsRvalueRef;
+                q.IsAlias = p.IsAlias;
                 q.IsPointeeConst = p.IsPointeeConst;
                 q.PointerDepth = p.PointerDepth;
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
@@ -1762,6 +1780,9 @@ public:
         // (string/owning struct/closure). Zeroing is deferred to ApplyMoveParamTransfer so the
         // callee's parameter move-ness is known first. Not part of the --init cache round-trip.
         bool IsExplicitMove = false;
+        // The generated constructor wrapper hides an underlying C++ reference parameter behind
+        // a by-value adapter; retain its selected reference category for move transfer.
+        bool IsCxxReferenceSink = false;
         // True only for a normalized C++ T&& result, not the CFlat `move` keyword.
         bool IsNormalizedCxxXvalue = false;
         // True only for a value-producing expression. Named variables, fields, elements, aliases,
@@ -4333,6 +4354,8 @@ private:
         std::vector<std::string> braceListElementSpellings;
         // RawSig::calleeIdentity (round-trips through the cache).
         std::string calleeIdentity;
+        // RawSig::paramBindKinds of a generated wrapper (round-trips through the cache).
+        std::string paramBindKinds;
         std::string name;
         std::string linkageName; // C++ ABI symbol; empty for C
         TypeAndValue ret;
@@ -6311,7 +6334,7 @@ private:
     // caller keeps its value and the param stays a borrow. This is the single copyability
     // discriminator every concrete-type consumer (call-site poison, scope-exit drop, rvalue-temp
     // ownership) consults, so the structural scanner flag and the full-info decision stay in sync.
-    bool OwningSinkConsumesConcrete(const TypeAndValue& p);
+    bool OwningSinkConsumesConcrete(const TypeAndValue& p) const;
 
     // A by-value parameter an 'alias' return can hand back (`U f(U w) { return w; }`, inferred
     // or spelled): the ABI passes it as a pointer to a CALLER-owned copy slot, so the returned
@@ -7585,6 +7608,13 @@ private:
     Operation ParseOperation(const std::string& operationText);
 
 public:
+    // Public view of ParameterRetainsArgument (conservative: unknown callees retain).
+    bool CalleeMayRetainArgument(const llvm::Function* fn, unsigned argIndex)
+    {
+        // A va_arg slot may keep a raw pointer even though it cannot take ownership.
+        if (fn == nullptr || argIndex >= fn->arg_size()) return true;
+        return ParameterRetainsArgument(fn, argIndex);
+    }
     // Fill omitted trailing C++ class-template arguments from Clang's imported declaration.
     bool HasCxxClassTemplate(const std::string& baseName) const;
     bool CompleteCxxTemplateTypeArgs(const std::string& baseName,
@@ -8359,6 +8389,10 @@ public:
     bool IsCoreArrayType(const std::string& typeName) const;
     // Answers whether this parameter/return consumes ownership: explicit move, or a by-value core unique<T>.
     bool IsMoveOrCoreUniqueValue(const TypeAndValue& t) const;
+    // Interface by-value ownership: explicit move/unique, or a non-copyable value type.
+    bool InterfaceParamConsumesOwnership(const TypeAndValue& t) const;
+    // The type-derived part of the interface rule, excluding an explicit `move` contract.
+    bool InterfaceParamConsumesByType(const TypeAndValue& t) const;
     bool IsRawPointerToCoreUnique(const NamedVariable& arg, const TypeAndValue& param) const;
     bool IsCoreUniqueToRawPointer(const NamedVariable& arg, const TypeAndValue& param) const;
     // A STACK implementor value bound to a blessed unique<IFace> parameter: it resolves so the
@@ -8877,6 +8911,8 @@ public:
     // and compile-time moved marking in their existing order.
     std::string ImplicitOutlivingOwnerConsumeError(const NamedVariable& source,
                                                    bool sourceIsMove) const;
+    bool IsFunctionValueType(const TypeAndValue& type) const;
+    bool NullExplicitFunctionMoveToValue(const TypeAndValue& param, const NamedVariable& arg);
     void ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args,
         bool paramsCarryAllocAlign = true, bool calleeIsMethod = false, bool beforeCall = false,
@@ -10598,6 +10634,8 @@ public:
     bool EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,
                                     llvm::Value* src, bool useMove, const char* context,
                                     const std::string& displayTypeName = {});
+    bool ResetMovedStdFunctionSource(const std::string& typeName, llvm::Value* sourceStorage,
+                                     const std::string& sourceName = {});
     bool EmitCxxByValueParamConstruct(const std::string& typeName, llvm::Value* dest,
                                       llvm::Value* src, bool useMove, const char* context);
     // Move a classified value member-wise (plan cflat-struct-nontrivial-cxx-fields): C++ class
@@ -11077,6 +11115,7 @@ public:
         bool Known = false;
         bool VoidPointee = false;   // `void*`: a wildcard over every pointee
         bool IsArrayView = false;
+        bool IsAlias = false;       // by-address ABI identity: an alias param or return
         int ConstMask = -1;
         std::string Canon;          // "i32", "f64", "p:v", "s", "p:s", ...
         // The ONE registered struct key this component names, when Canon is "s"/"p:s". Empty
@@ -11148,7 +11187,7 @@ public:
      */
     FuncPtrComponent FuncPtrComponentOf(const std::string& typeName, bool pointer,
         int pointerDepth = 0, const std::string& resolvedKey = "",
-        bool isArrayView = false, int constMask = -1) const;
+        bool isArrayView = false, int constMask = -1, bool isAlias = false) const;
 
     /*
      * One-sided: true only when BOTH components resolve AND name provably different types.
@@ -11170,6 +11209,9 @@ public:
      * binding may reject on. One-sided throughout: a component unresolvable on either side
      * accepts, and only a differing arity or a provably differing component rejects.
      */
+    // A named callee alias param bound to a by-value slot is refused by the alias gate, so this
+    // view clears only that flag; the reverse direction keeps its signature mismatch.
+    TypeAndValue AliasAlignedCallbackSig(const TypeAndValue& fn, const TypeAndValue& dest) const;
     bool FuncPtrSignaturesProvablyDiffer(const LLVMBackend::TypeAndValue& a,
         const LLVMBackend::TypeAndValue& b) const;
 
@@ -11541,7 +11583,8 @@ public:
      */
     // True (and reports) when the symbol has a by-reference `alias` param, which a
     // function-pointer type cannot describe.
-    bool RejectAliasParamFuncPtrBind(const std::string& functionName, const FunctionSymbol& sym);
+    bool RejectAliasParamFuncPtrBind(const std::string& functionName, const FunctionSymbol& sym,
+                                     const TypeAndValue* destSig = nullptr);
 
     llvm::Function* GetFunctionForFuncPtr(std::string functionName, int expectedParamCount = -1,
                                           const std::vector<TypeAndValue::FuncPtrParam>* expectedParams = nullptr,

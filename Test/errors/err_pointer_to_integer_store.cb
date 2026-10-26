@@ -93,10 +93,10 @@ extern int main()
     expect_error("cannot convert 'i64*' to 'int*' implicitly") {
         c_p2i_take_int(wp);
     }
-    expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+    expect_error("cannot join 'i64*' and 'int*' in a '?:': the pointee types differ; use an explicit cast on one arm") {
         bool c = true; int* bad = c ? wp : ip;
     }
-    expect_error("cannot convert 'i64*' to 'int*' implicitly") {
+    expect_error("cannot join 'i64*' and 'int*' in a '??': the pointee types differ; use an explicit cast on one arm") {
         int* bad = wp ?? ip;
     }
     expect_error("cannot convert 'i64*' to 'int*' implicitly") {
@@ -108,13 +108,13 @@ extern int main()
     expect_error("cannot convert 'int**' to 'u64**' implicitly") {
         int** source = nullptr; u64** bad = source;
     }
-    expect_error("cannot convert 'int*' to 'i64*' implicitly") {
+    expect_error("cannot join 'int*' and 'i64*' in a '?:': the pointee types differ; use an explicit cast on one arm") {
         bool c = true; i64 x = 1; int y = 2; int* bad = c ? &y : &x;
     }
-    expect_error("cannot convert 'int*' to 'i64*' implicitly") {
+    expect_error("cannot join 'int*' and 'i64*' in a '?:': the pointee types differ; use an explicit cast on one arm") {
         bool c = true; i64 x = 1; int y = 2; int* bad = nullptr; bad = c ? &y : &x;
     }
-    expect_error("cannot convert 'int*' to 'i64*' implicitly") {
+    expect_error("cannot join 'int*' and 'i64*' in a '??': the pointee types differ; use an explicit cast on one arm") {
         i64 x = 1; int* ip = nullptr; int* bad = ip ?? &x;
     }
     expect_error("cannot convert 'int*' to 'i64*' implicitly") {
@@ -159,7 +159,7 @@ extern int main()
     expect_error("cannot convert 'int*' to 'double*' implicitly") {
         int t80Declared = 1; double* t80Init = &t80Declared;
     }
-    expect_error("cannot convert 'int*' to 'double*' implicitly") {
+    expect_error("cannot join 'int*' and 'double*' in a '?:': the pointee types differ; use an explicit cast on one arm") {
         bool t80Cond = true; int t80Arm = 1; double t80Wide = 2.0;
         double* t80Chosen = t80Cond ? &t80Arm : &t80Wide;
     }
@@ -209,7 +209,7 @@ extern int main()
     expect_error("cannot convert 'i8*' to 'char*' implicitly") { char* t89A = t89I8Ptr; }
     expect_error("cannot convert 'u8*' to 'char*' implicitly") { char* t89B = nullptr; t89B = t89U8Ptr; }
     expect_error("cannot convert 'char*' to 'u8*' implicitly") { u8* t89C = t89CharPtr; }
-    expect_error("cannot convert 'i8*' to 'char*' implicitly") {
+    expect_error("cannot join 'i8*' and 'char*' in a '?:': the pointee types differ; use an explicit cast on one arm") {
         bool t89Cond = true; char* t89D = t89Cond ? t89I8Ptr : t89CharPtr;
     }
     expect_error("cannot convert 'i8*' to 'char*' implicitly") {

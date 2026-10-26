@@ -2145,6 +2145,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.IsCxxNullptrT) j["cnt"] = true;
         if (s.IsCxxMutableField) j["cmf"] = true;
         if (s.IsOwningSink)   j["osk"] = true;
+        if (s.IsInterfaceSink) j["ifs"] = true;
         if (s.IsConsumeInferredSink) j["cis"] = true;
         if (s.IsReturnInferredSink) j["ris"] = true;
         if (s.IsWriteInferredSink) j["wis"] = true;
@@ -2181,6 +2182,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
                 if (p.IsReturnInferredSink) pj["ris"] = true;
                 if (p.IsWriteInferredSink) pj["wis"] = true;
                 if (p.IsRvalueRef) pj["rr"] = true;
+                if (p.IsAlias) pj["ia"] = true;
                 if (p.IsPointeeConst) pj["pc"] = true;
                 if (p.PointerDepth > 1) pj["pd"] = p.PointerDepth;
                 if (!p.ResolvedTypeKey.empty()) pj["rk"] = p.ResolvedTypeKey;
@@ -2224,6 +2226,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsCxxNullptrT = j.value("cnt", false);
         s.IsCxxMutableField = j.value("cmf", false);
         s.IsOwningSink = j.value("osk", false);
+        s.IsInterfaceSink = j.value("ifs", false);
         s.IsConsumeInferredSink = j.value("cis", false);
         s.IsReturnInferredSink = j.value("ris", false);
         s.IsWriteInferredSink = j.value("wis", false);
@@ -2260,6 +2263,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
                     p.IsReturnInferredSink = pj.value("ris", false);
                     p.IsWriteInferredSink = pj.value("wis", false);
                     p.IsRvalueRef = pj.value("rr", false);
+                    p.IsAlias = pj.value("ia", false);
                     p.IsPointeeConst = pj.value("pc", false);
                     p.PointerDepth = pj.value("pd", p.PointerDepth);
                     p.ResolvedTypeKey = pj.value("rk", std::string{});
@@ -2379,6 +2383,7 @@ nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e, CCachePathTable* files
         if (e.resultBorrowsBraceList) j["rbl"] = true;
         if (!e.braceListElementSpellings.empty()) j["blel"] = e.braceListElementSpellings;
         if (!e.calleeIdentity.empty()) j["callee"] = e.calleeIdentity;
+        if (!e.paramBindKinds.empty()) j["pbind"] = e.paramBindKinds;
         // paramNames repeats the names already serialized into "ps" for almost every C signature.
         // Compare against the SERIALIZED slot, so "pnq" means exactly what the reader rebuilds.
         bool namesMatchSlots = !e.paramNames.empty() && e.paramNames.size() == ps.size();
@@ -2438,6 +2443,7 @@ LLVMBackend::CSigEntry LLVMBackend::SigFromJson(const SjVal& j, const CCachePath
         e.resultBorrowsBraceList = j.value("rbl", false);
         if (j.contains("blel")) e.braceListElementSpellings = j["blel"].to_string_vector();
         e.calleeIdentity = j.value("callee", std::string());
+        e.paramBindKinds = j.value("pbind", std::string());
         if (j.value("pnq", false))
         {
             if (j.contains("ps"))

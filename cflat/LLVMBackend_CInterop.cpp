@@ -2746,10 +2746,15 @@ std::string LLVMBackend::StdFunctionSpecializationForSpelling(const std::string&
             start = pos + 1;
         }
         std::vector<std::pair<std::string, int>> parts;
+        std::vector<bool> partAliases;
+        for (const auto& fp : closure.FuncPtrParams)
+            partAliases.push_back(fp.IsAlias);
         for (const auto& fp : closure.FuncPtrParams)
             parts.push_back({ fp.TypeName, fp.PointerDepth });
         const std::string encoded = MangleClosureType(*this, true, closure.FuncPtrReturnTypeName,
-                                                      closure.FuncPtrReturnPointerDepth, parts);
+                                                      closure.FuncPtrReturnPointerDepth, parts,
+                                                      -1, nullptr, nullptr, &partAliases,
+                                                      closure.FuncPtrReturnAlias);
         RegisterEncodedClosureType(encoded, closure);
         std::string functionTypeArg = encoded;
         functionTypeArg.replace(0, 3, "barefn");
@@ -2776,6 +2781,27 @@ const LLVMBackend::TypeAndValue* LLVMBackend::StdFunctionClosureSignature(
         const TypeAndValue* signature =
             GetEncodedClosureType(MangledGenericArgument(*this, resolved, 0));
         return signature != nullptr && signature->IsFunctionPointer ? signature : nullptr;
+}
+
+bool LLVMBackend::ResetMovedStdFunctionSource(const std::string& typeName,
+        llvm::Value* sourceStorage, const std::string& sourceName)
+{
+        if (StdFunctionClosureSignature(typeName) == nullptr || sourceStorage == nullptr)
+            return true;
+        auto* destructor = GetOrCreateCxxClassDestructor(typeName);
+        if (destructor != nullptr)
+            builder->CreateCall(destructor->getFunctionType(), destructor, { sourceStorage });
+        const auto* defaultCtor = FindCxxDefaultCtor(typeName);
+        if (defaultCtor == nullptr)
+        {
+            LogError(std::format("cannot reset moved C++ std.function '{}' to its empty state: "
+                                 "the default constructor is not accessible", DisplayCxxClassName(typeName)));
+            return false;
+        }
+        if (!EmitCxxStructorCall(typeName, *defaultCtor, sourceStorage, {})) return false;
+        const std::string name = sourceName.empty() ? FindVariableNameByStorage(sourceStorage) : sourceName;
+        if (!name.empty()) MarkVariableExplicitlyMovedNull(name);
+        return true;
 }
 
 bool LLVMBackend::CxxThinFunctionPointerSpelling(const TypeAndValue& type, std::string& out) const
@@ -4159,6 +4185,7 @@ bool LLVMBackend::MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
         e.resultBorrowsBraceList = r.resultBorrowsBraceList;
         e.braceListElementSpellings = r.braceListElementTypes;
         e.calleeIdentity = r.calleeIdentity;
+        e.paramBindKinds = r.paramBindKinds;
         e.retSpelling = r.retType;
         e.defaultArgs = r.defaultArgs;
         e.name     = r.name;
@@ -4431,6 +4458,7 @@ void LLVMBackend::RebindCxxCachedSignatures(std::vector<CSigEntry>& sigs)
             raw.resultBorrowsBraceList = cached.resultBorrowsBraceList;
             raw.braceListElementTypes = cached.braceListElementSpellings;
             raw.calleeIdentity = cached.calleeIdentity;
+            raw.paramBindKinds = cached.paramBindKinds;
             raw.paramNames = cached.paramNames;
             raw.defaultArgs = cached.defaultArgs;
             raw.variadic = cached.variadic;
@@ -11491,7 +11519,8 @@ bool LLVMBackend::EmitCxxXvalueTransfer(const std::string& typeName, llvm::Value
             refusal = CxxXvalueRefusal(typeName, constSource, assignment, cause);
             return false;
         }
-        return EmitCxxStructorCall(typeName, *transfer, dest, { src });
+        if (!EmitCxxStructorCall(typeName, *transfer, dest, { src })) return false;
+        return ResetMovedStdFunctionSource(typeName, src);
 }
 
 std::string LLVMBackend::CxxXvalueRefusal(const std::string& typeName, bool constSource,
@@ -11588,7 +11617,8 @@ bool LLVMBackend::EmitCxxExplicitMoveTransfer(const std::string& typeName, llvm:
                                   constSource ? " const" : "", DisplayCxxClassName(typeName), cause);
             return false;
         }
-        return EmitCxxStructorCall(typeName, *transfer, dest, { src });
+        if (!EmitCxxStructorCall(typeName, *transfer, dest, { src })) return false;
+        return ResetMovedStdFunctionSource(typeName, src, sourceName);
 }
 
 /*
@@ -18337,6 +18367,7 @@ bool LLVMBackend::TryBindCxxFunction(const std::string& functionName)
             raw.resultBorrowsBraceList = stored.resultBorrowsBraceList;
             raw.braceListElementTypes = stored.braceListElementSpellings;
             raw.calleeIdentity = stored.calleeIdentity;
+            raw.paramBindKinds = stored.paramBindKinds;
             for (const TypeAndValue& param : stored.params)
                 raw.paramNames.push_back(param.VariableName);
             raw.defaultArgs = stored.defaultArgs;
@@ -20082,17 +20113,20 @@ bool LLVMBackend::CompleteCxxTemplateTypeArgs(const std::string& baseName,
                 {
                     std::vector<std::pair<std::string, int>> fnParams;
                     std::vector<int> fnParamConsts;
+                    std::vector<bool> fnParamAliases;
                     for (const auto& fnParam : defaultType.FuncPtrParams)
                     {
                         fnParams.push_back({ fnParam.TypeName,
                             ReconcilePointerDepth(fnParam.Pointer, fnParam.PointerDepth) });
                         fnParamConsts.push_back(fnParam.ConstMask);
+                        fnParamAliases.push_back(fnParam.IsAlias);
                     }
                     std::string encoded = BuildEncodedClosureName(this, true,
                         defaultType.FuncPtrReturnTypeName,
                         ReconcilePointerDepth(defaultType.FuncPtrReturnPointer,
                                               defaultType.FuncPtrReturnPointerDepth),
-                        fnParams, defaultType.FuncPtrReturnConstMask, &fnParamConsts);
+                        fnParams, defaultType.FuncPtrReturnConstMask, &fnParamConsts, nullptr, &fnParamAliases,
+                        defaultType.FuncPtrReturnAlias);
                     RegisterEncodedClosureType(encoded, defaultType);
                     std::string roundTrip;
                     if (!CxxTemplateArgSpellingForCflatType(encoded, roundTrip)
@@ -29528,6 +29562,11 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                 indirectArgAddrs.resize(recipe.paramSlots.size(), nullptr);
                 indirectArgAddrs[i] = temp;
             }
+        // The argument values are loaded: a by-value `move f` nulls its source BEFORE the call, so
+        // a write the constructor makes to the source survives (no after-call pass nulls it).
+        if (callArgVars != nullptr)
+            for (size_t i = 0; i < callArgVars->size() && i + 1 < st.params.size(); ++i)
+                NullExplicitFunctionMoveToValue(st.params[i + 1], (*callArgVars)[i]);
         // A constructor or assignment without noexcept can throw into this frame's cleanup.
         const bool mayUnwind = CalleeMayUnwind(sym);
         if (recipe.hasLowering)
@@ -32542,7 +32581,8 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
                 deleted ? "deleted" : "not accessible from the imported header"));
             return false;
         }
-        return EmitCxxStructorCall(typeName, *ctor, dest, { src });
+        if (!EmitCxxStructorCall(typeName, *ctor, dest, { src })) return false;
+        return !useMove || ResetMovedStdFunctionSource(typeName, src);
     }
 
 bool LLVMBackend::EmitCxxByValueParamConstruct(const std::string& typeName, llvm::Value* dest,

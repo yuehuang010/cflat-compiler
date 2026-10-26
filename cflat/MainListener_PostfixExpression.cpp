@@ -7105,16 +7105,38 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     Compiler(ctx)->currentColumn = namedVar.IdentifierColumn;
                                     Compiler(ctx)->LogError(std::format("use of moved variable '{}'", moved));
                                 }
+                                else if (namedVar.FieldName.empty() && !namedVar.IsElementAccess)
+                                {
+                                    // An explicit `move f` left f null: a same-block call is a static error,
+                                    // a later unguarded one the null dataflow's (like a unique deref).
+                                    if (Compiler(ctx)->IsExplicitlyMovedNullHere(namedVar))
+                                    {
+                                        Compiler(ctx)->currentLine = namedVar.IdentifierLine;
+                                        Compiler(ctx)->currentColumn = namedVar.IdentifierColumn;
+                                        Compiler(ctx)->LogError(std::format(
+                                            "use of moved variable '{}' (it is null after the move)",
+                                            namedVar.CallerName));
+                                    }
+                                    else
+                                        Compiler(ctx)->RecordNullDerefFor(namedVar,
+                                            namedVar.IdentifierLine, namedVar.IdentifierColumn);
+                                }
                             }
                             LLVMBackend::TypeAndValue funcPtrTV =
                                 encClosure ? *encClosure : namedVar.TypeAndValue;
+                            if (encClosure == nullptr)
+                                if (auto* function = llvm::dyn_cast_or_null<llvm::Function>(namedVar.Primary))
+                                    if (const auto* symbol = Compiler(ctx)->FindSymbolForFunction(function))
+                                        funcPtrTV = Compiler(ctx)->FuncPtrSigOfSymbol(*symbol);
                             llvm::Value* funcPtr = nullptr;
                             // A union member's Storage is the union alloca (all fields alias at
                             // offset 0), so the load needs the FIELD type or it reads the union.
                             if (namedVar.Storage != nullptr && namedVar.UnionFieldType != nullptr)
                                 funcPtr = Compiler(ctx)->CreateLoad(namedVar.UnionFieldType, namedVar.Storage);
                             else if (namedVar.Storage != nullptr)
-                                funcPtr = Compiler(ctx)->CreateLoad(namedVar.Storage);
+                                funcPtr = namedVar.BaseType != nullptr
+                                    ? Compiler(ctx)->CreateLoad(namedVar.BaseType, namedVar.Storage)
+                                    : Compiler(ctx)->CreateLoad(namedVar.Storage);
                             else if (namedVar.Primary != nullptr)
                             {
                                 if (namedVar.TypeAndValue.IsAlias && !namedVar.TypeAndValue.Pointer
@@ -7197,6 +7219,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 || Compiler(ctx)->GetEncodedClosureType(argNV.TypeAndValue.TypeName) != nullptr))
                                             argValue = Compiler(ctx)->CreateLoad(
                                                 Compiler(ctx)->GetType(argNV.TypeAndValue), argNV.Primary);
+                                        // An alias closure/fn-ptr param: the callee reads its caller slot by address.
+                                        if (argParamIndex < funcPtrTV.FuncPtrParams.size()
+                                            && backend->ParameterIsAliasByPointer(argExpectedDest))
+                                            argValue = backend->LowerAliasByPointerArg(argNV, argExpectedDest);
                                         if (argValue) callArgs.push_back(argValue);
                                         argNVs.push_back(argNV);
 
@@ -11642,6 +11668,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             // A SPELLED `move` param rides the type, exactly as a named function's does.
             fp.IsMove = p.IsMove;
             fp.IsPointeeConst = (fp.ConstMask & 1) != 0;
+            fp.IsAlias = Compiler(ctx)->ParameterIsAliasByPointer(p);
             tv.FuncPtrParams.push_back(fp);
         }
         // Bound literals use the named-function bind rule on the user arity (fewer legal, more or

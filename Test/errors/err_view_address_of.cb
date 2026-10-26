@@ -1,0 +1,90 @@
+extern int t409_c_int(int* p);
+extern int t409_c_void(void* p);
+struct T409AddressViewHolder { int[] view = default; };
+struct T409AddressGlobalHolder { int[] view = default; };
+T409AddressGlobalHolder t409AddressGlobalHolder = default;
+
+expect_error("cannot take the address of array-view") {
+    void t409LocalAuto() { int[1] a = { 1 }; int[] v = a; auto p = &v; }
+}
+expect_error("cannot take the address of array-view") {
+    void t409LocalExplicit() { int[1] a = { 1 }; int[] v = a; int* p = &v; }
+}
+expect_error("cannot take the address of array-view") {
+    void t409LocalVoidCast() { int[1] a = { 1 }; int[] v = a; void* p = (void*)&v; }
+}
+expect_error("cannot take the address of array-view") {
+    int t409LocalCArg() { int[1] a = { 1 }; int[] v = a; return t409_c_int(&v); }
+}
+
+expect_error("cannot take the address of array-view") {
+    void t409ParamAuto(int[] v) { auto p = &v; }
+}
+expect_error("cannot take the address of array-view") {
+    void t409ParamExplicit(int[] v) { int* p = &v; }
+}
+expect_error("cannot take the address of array-view") {
+    void t409ParamVoidCast(int[] v) { void* p = (void*)&v; }
+}
+expect_error("cannot take the address of array-view") {
+    int t409ParamCArg(int[] v) { return t409_c_int(&v); }
+}
+
+expect_error("cannot take the address of array-view") {
+    void t409MoveAuto(move int[] v) { auto p = &v; }
+}
+expect_error("cannot take the address of array-view") {
+    void t409MoveExplicit(move int[] v) { int* p = &v; }
+}
+expect_error("cannot take the address of array-view") {
+    void t409MoveVoidCast(move int[] v) { void* p = (void*)&v; }
+}
+expect_error("cannot take the address of array-view") {
+    int t409MoveCArg(move int[] v) { return t409_c_int(&v); }
+}
+
+expect_error("cannot take the address of array-view") {
+    void t409FieldAuto(T409AddressViewHolder h) { auto p = &h.view; }
+}
+expect_error("cannot take the address of array-view") {
+    void t409FieldExplicit(T409AddressViewHolder h) { int* p = &h.view; }
+}
+expect_error("cannot take the address of array-view") {
+    void t409FieldVoidCast(T409AddressViewHolder h) { void* p = (void*)&h.view; }
+}
+expect_error("cannot take the address of array-view") {
+    int t409FieldCArg(T409AddressViewHolder h) { return t409_c_int(&h.view); }
+}
+expect_error("cannot take the address of array-view") {
+    int* t409GlobalFieldReturn() { return &t409AddressGlobalHolder.view; }
+}
+
+expect_error("cannot take the address of array-view") {
+    void t409GenericAuto<T>(T[] v) { auto p = &v; }
+    void t409InstantiateGenericAuto(int[] v) { t409GenericAuto<int>(v); }
+}
+expect_error("cannot take the address of array-view") {
+    void t409GenericExplicit<T>(T[] v) { T* p = &v; }
+    void t409InstantiateGenericExplicit(int[] v) { t409GenericExplicit<int>(v); }
+}
+expect_error("cannot take the address of array-view") {
+    void t409GenericVoidCast<T>(T[] v) { void* p = (void*)&v; }
+    void t409InstantiateGenericVoidCast(int[] v) { t409GenericVoidCast<int>(v); }
+}
+expect_error("cannot take the address of array-view") {
+    int t409GenericCArg<T>(T[] v) { return t409_c_void(&v); }
+    int t409InstantiateGenericCArg(int[] v) { return t409GenericCArg<int>(v); }
+}
+
+expect_error("cannot take the address of array-view") {
+    void t409StringAuto() { string[] v = default; auto p = &v; }
+}
+expect_error("cannot take the address of array-view") {
+    void t409StringExplicit() { string[] v = default; string* p = &v; }
+}
+expect_error("cannot take the address of array-view") {
+    void t409StringVoidCast() { string[] v = default; void* p = (void*)&v; }
+}
+expect_error("cannot take the address of array-view") {
+    int t409StringCArg() { string[] v = default; return t409_c_void(&v); }
+}

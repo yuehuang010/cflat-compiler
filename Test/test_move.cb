@@ -25,6 +25,14 @@ struct T382LocalHolder { unique T382U* pu = default; };
 struct T382LocalRoot { unique T382U* b = default; };
 struct T382RawLocalRoot { T382U* b = default; };
 T382U t382GlobalU = default;
+// T413: the call redirects root.b to the global, so the later read cannot be proven local.
+void t413SetRawLocalRoot(T382RawLocalRoot* x) { x->b = &t382GlobalU; }
+// T413 round 2: the container escapes to a global in an earlier block; the call then redirects it.
+T382RawLocalRoot* t413EscapedRoot = nullptr;
+void t413TouchEscapedRoot() { t413EscapedRoot->b = &t382GlobalU; }
+// T413 round 3: a read-only callee keeps nothing, so an earlier call does not escape the container.
+int t413InspectRawLocalRoot(T382RawLocalRoot* x) { return x->b->p->v; }
+int t413Harmless() { return 1; }
 
 struct CS
 {
@@ -15891,6 +15899,8 @@ extern int main()
     total += 15;
     passed += testT274AliasReturnAcceptSet();
     total += 7;
+    passed += testT408AliasReturnAcceptSet();
+    total += 9;
 
     passed += testT227SlotMoveSinks();
     total += 19;
@@ -15908,16 +15918,18 @@ extern int main()
     passed += testT360AliasReturnTemp();
     total += 11;
     passed += testT378StringParamConsume();
+    total += 11;
     total += 6;
     total += 3;
     total += 5;
     total += 5;
+    total += 4;
 
     passed += testT385FieldStoreMoves();
     total += 15;
 
     passed += testT364NativeOperatorReturnFacts();
-    total += 15;
+    total += 18;
     total += 16;
     total += 16;
     total += 8;
@@ -17203,6 +17215,71 @@ int testT274AliasReturnAcceptSet()
     passed += Test("t274_alias_unique_alias_param", t274AliasUniqueParam(loc), 15);
     passed += Test("t274_alias_global_unique", t274GlobalUnique(), 14);
     passed += Test("t274_alias_global_field", t274GlobalField(), 5);
+    return passed;
+}
+
+struct T408BorrowNode { int value = 0; };
+void* t408BorrowLastArrow = nullptr;
+struct T408BorrowArrow {
+    T408BorrowNode node = default;
+    T408BorrowNode* operator->() { t408BorrowLastArrow = this; return &node; }
+};
+struct T408BorrowGetter {
+    T408BorrowNode node = default;
+    T408BorrowNode* get() { return &node; }
+};
+T408BorrowArrow gT408BorrowArrow;
+alias int t408BorrowArrowAliasParam(alias T408BorrowArrow value) { return value->value; }
+alias int t408BorrowArrowPointerParam(T408BorrowArrow* value) { return value->value; }
+alias int t408BorrowGetterAliasParam(alias T408BorrowGetter value) { return value.get()->value; }
+alias int t408BorrowGetterPointerParam(T408BorrowGetter* value) { return value.get()->value; }
+alias int t408BorrowGlobalArrow() { return gT408BorrowArrow->value; }
+alias int t408BorrowNewArrow() { return (new T408BorrowArrow())->value; }
+int t408LocalArrowValue() { T408BorrowArrow value; value.node.value = 51; return value->value; }
+int t408LocalGetterValue() { T408BorrowGetter value; value.node.value = 52; return value.get()->value; }
+T408BorrowArrow t408MoveReturnArrow() { T408BorrowArrow value; value.node.value = 58; return move value; }
+
+int testT408AliasReturnAcceptSet()
+{
+    int passed = 0;
+    T408BorrowArrow aliasArg;
+    aliasArg.node.value = 53;
+    alias int aliasValue = t408BorrowArrowAliasParam(aliasArg);
+    aliasValue = 54;
+    passed += Test("t408_alias_param_arrow_mutates_owner", aliasArg.node.value, 54);
+
+    T408BorrowArrow* arrowHeap = new T408BorrowArrow();
+    arrowHeap->node.value = 55;
+    alias int pointerValue = t408BorrowArrowPointerParam(arrowHeap);
+    pointerValue = 56;
+    passed += Test("t408_heap_pointer_arrow_mutates_owner", arrowHeap->node.value, 56);
+    delete arrowHeap;
+
+    T408BorrowGetter getterAliasArg;
+    getterAliasArg.node.value = 57;
+    alias int getterAliasValue = t408BorrowGetterAliasParam(getterAliasArg);
+    getterAliasValue = 59;
+    passed += Test("t408_alias_param_getter_mutates_owner", getterAliasArg.node.value, 59);
+
+    T408BorrowGetter* getterHeap = new T408BorrowGetter();
+    getterHeap->node.value = 60;
+    alias int getterPointerValue = t408BorrowGetterPointerParam(getterHeap);
+    getterPointerValue = 61;
+    passed += Test("t408_heap_pointer_getter_mutates_owner", getterHeap->node.value, 61);
+    delete getterHeap;
+
+    gT408BorrowArrow.node.value = 62;
+    alias int globalValue = t408BorrowGlobalArrow();
+    globalValue = 63;
+    passed += Test("t408_global_arrow_mutates_owner", gT408BorrowArrow.node.value, 63);
+    alias int newValue = t408BorrowNewArrow();
+    newValue = 64;
+    passed += Test("t408_new_arrow_mutates_heap_owner", ((T408BorrowArrow*)t408BorrowLastArrow)->node.value, 64);
+    delete (T408BorrowArrow*)t408BorrowLastArrow;
+    passed += Test("t408_non_alias_local_arrow_stays_legal", t408LocalArrowValue(), 51);
+    passed += Test("t408_non_alias_local_getter_stays_legal", t408LocalGetterValue(), 52);
+    T408BorrowArrow moved = t408MoveReturnArrow();
+    passed += Test("t408_move_return_stays_legal", moved.node.value, 58);
     return passed;
 }
 
@@ -18576,7 +18653,7 @@ int testT360AliasReturnTemp()
     return passed;
 }
 
-interface T378ConsumeIface { string f(string s); };
+interface T378ConsumeIface { string f(move string s); };
 class T378ConsumeImpl : T378ConsumeIface
 {
     string f(string s) { _ = move s; return "mk-t378-iface".copy(); }
@@ -18662,11 +18739,63 @@ T378CopyableMixed t378CopyableMixedReturn(T378CopyableMixed p, int k)
     }
     return p;
 }
-interface T378GenericConsumeIface { string f(string s); };
+interface T378GenericConsumeIface { string f(move string s); };
 class T378GenericConsumeImpl<T> : T378GenericConsumeIface
 {
     string f(string s) { _ = move s; return "g1".copy(); }
 };
+
+int t406IfaceTokenDtorCount = 0;
+struct T406IfaceToken
+{
+    int value = 0;
+    T406IfaceToken(int n) { value = n; }
+    ~T406IfaceToken() { t406IfaceTokenDtorCount = t406IfaceTokenDtorCount + 1; }
+};
+struct T406IfaceOwner { unique T406IfaceToken* token = default; };
+interface T406IfaceOwnerReader { int take(T406IfaceOwner value); };
+class T406IfaceOwnerReaderImpl : T406IfaceOwnerReader
+{
+    int take(T406IfaceOwner value) { return value.token->value; }
+};
+interface T406GenericOwnerReader<T> { int take(T value); };
+class T406ConcreteGenericOwnerReader : T406GenericOwnerReader<T406IfaceOwner>
+{
+    int take(T406IfaceOwner value) { return value.token->value; }
+};
+class T406GenericOwnerReaderImpl<T> : T406GenericOwnerReader<T>
+{
+    int take(T value) { return value.token->value; }
+};
+i64 t406GenericDirectLiveAfterCall = -1;
+i64 t406GenericDispatchLiveAfterCall = -1;
+int t406GenericOwnerDirectEarly()
+{
+    int value = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        T406GenericOwnerReaderImpl<T406IfaceOwner> impl = default;
+        T406IfaceOwner owner = default;
+        owner.token = new T406IfaceToken(55);
+        value = impl.take(owner);
+        t406GenericDirectLiveAfterCall = (i64)HeapAudit.reportLeaks() - before;
+    }
+    return value;
+}
+int t406GenericOwnerDispatchLater()
+{
+    int value = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    {
+        T406GenericOwnerReaderImpl<T406IfaceOwner> impl = default;
+        T406GenericOwnerReader<T406IfaceOwner> iface = impl;
+        T406IfaceOwner owner = default;
+        owner.token = new T406IfaceToken(56);
+        value = iface.take(owner);
+        t406GenericDispatchLiveAfterCall = (i64)HeapAudit.reportLeaks() - before;
+    }
+    return value;
+}
 
 string t385ParamFieldStore(T378FieldStore* h, string s, int k, int useCopy)
 {
@@ -18923,6 +19052,61 @@ int testT378StringParamConsume()
     after = (i64)HeapAudit.reportLeaks();
     passed += Test("t378_generic_interface_consume_temp_value_and_cleanup",
                    value != 0 && after - before == 0, true);
+
+    before = (i64)HeapAudit.reportLeaks();
+    int t406TokenDtorBefore = t406IfaceTokenDtorCount;
+    int t406IfaceValue = 0;
+    i64 t406IfaceLiveAfterCall = -1;
+    {
+        T406IfaceOwnerReaderImpl impl = default;
+        T406IfaceOwnerReader iface = impl;
+        T406IfaceOwner owner = default;
+        owner.token = new T406IfaceToken(46);
+        t406IfaceValue = iface.take(owner);
+        t406IfaceLiveAfterCall = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t406_iface_noncopyable_value", t406IfaceValue, 46);
+    passed += Test("t406_iface_noncopyable_live_after_dispatch", t406IfaceLiveAfterCall, 0);
+    passed += Test("t406_iface_noncopyable_dtor_count",
+                   t406IfaceTokenDtorCount - t406TokenDtorBefore, 1);
+    passed += Test("t406_iface_noncopyable_no_leak", after - before, 0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    int t406ConcreteDtorBefore = t406IfaceTokenDtorCount;
+    int t406ConcreteIfaceValue = 0;
+    i64 t406ConcreteLiveAfterCall = -1;
+    {
+        T406ConcreteGenericOwnerReader impl = default;
+        T406GenericOwnerReader<T406IfaceOwner> iface = impl;
+        T406IfaceOwner owner = default;
+        owner.token = new T406IfaceToken(51);
+        t406ConcreteIfaceValue = iface.take(owner);
+        t406ConcreteLiveAfterCall = (i64)HeapAudit.reportLeaks() - before;
+    }
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t406_generic_concrete_iface_value", t406ConcreteIfaceValue, 51);
+    passed += Test("t406_generic_concrete_iface_live_after_dispatch",
+                   t406ConcreteLiveAfterCall, 0);
+    passed += Test("t406_generic_concrete_iface_dtor_count",
+                   t406IfaceTokenDtorCount - t406ConcreteDtorBefore, 1);
+    passed += Test("t406_generic_concrete_iface_no_leak", after - before, 0);
+
+    before = (i64)HeapAudit.reportLeaks();
+    int t406GenericDtorBefore = t406IfaceTokenDtorCount;
+    int t406GenericDirectValue = t406GenericOwnerDirectEarly();
+    int t406GenericDtorsAfterDirect = t406IfaceTokenDtorCount - t406GenericDtorBefore;
+    int t406GenericDispatchValue = t406GenericOwnerDispatchLater();
+    after = (i64)HeapAudit.reportLeaks();
+    passed += Test("t406_generic_direct_value_before_first_dispatch", t406GenericDirectValue, 55);
+    passed += Test("t406_generic_direct_live_after_call", t406GenericDirectLiveAfterCall, 0);
+    passed += Test("t406_generic_direct_dtor_before_first_dispatch",
+                   t406GenericDtorsAfterDirect, 1);
+    passed += Test("t406_generic_dispatch_value_after_direct", t406GenericDispatchValue, 56);
+    passed += Test("t406_generic_dispatch_live_after_call", t406GenericDispatchLiveAfterCall, 0);
+    passed += Test("t406_generic_total_dtors_after_dispatch",
+                   t406IfaceTokenDtorCount - t406GenericDtorBefore, 2);
+    passed += Test("t406_generic_late_no_leak", after - before, 0);
 
     before = (i64)HeapAudit.reportLeaks();
     {
@@ -19659,6 +19843,67 @@ int testT364NativeOperatorReturnFacts()
                    t382ProbeDtorCount - t382DtorBase, 1);
     passed += Test("t382_local_raw_twohop_field_no_leak",
                    (i64)HeapAudit.reportLeaks() - t382Base, 0);
+
+    // T413: a call that redirects the raw container must refuse the consume, not take the global's field.
+    expect_error("out of storage that outlives this function") {
+        T382U t413Local = default;
+        t413Local.p = new T382PS(43);
+        T382RawLocalRoot t413Root = default;
+        t413Root.b = &t413Local;
+        T382RawLocalRoot* t413Pointer = &t413Root;
+        t413SetRawLocalRoot(&t413Root);
+        unique T382PS* t413Owner = nullptr;
+        t413Owner = t413Pointer->b->p;
+    }
+    // T413 round 2: an escape in a predecessor block also kills the proof at the later call.
+    expect_error("out of storage that outlives this function") {
+        T382U t413PredLocal = default;
+        t413PredLocal.p = new T382PS(44);
+        T382RawLocalRoot t413PredRoot = default;
+        T382RawLocalRoot* t413PredPointer = &t413PredRoot;
+        t413PredPointer->b = &t413PredLocal;
+        if (passed >= 0) { t413EscapedRoot = &t413PredRoot; }
+        t413TouchEscapedRoot();
+        unique T382PS* t413PredOwner = nullptr;
+        t413PredOwner = t413PredPointer->b->p;
+    }
+    // T413 round 3: an escape six pointer copies away is still an escape.
+    expect_error("out of storage that outlives this function") {
+        T382U t413DeepLocal = default;
+        t413DeepLocal.p = new T382PS(45);
+        T382RawLocalRoot t413DeepRoot = default;
+        T382RawLocalRoot* t413DeepPointer = &t413DeepRoot;
+        t413DeepPointer->b = &t413DeepLocal;
+        T382RawLocalRoot* t413Q0 = t413DeepPointer; T382RawLocalRoot* t413Q1 = t413Q0;
+        T382RawLocalRoot* t413Q2 = t413Q1; T382RawLocalRoot* t413Q3 = t413Q2;
+        T382RawLocalRoot* t413Q4 = t413Q3; T382RawLocalRoot* t413Q5 = t413Q4;
+        if (passed >= 0) { t413EscapedRoot = t413Q5; }
+        t413TouchEscapedRoot();
+        unique T382PS* t413DeepOwner = nullptr;
+        t413DeepOwner = t413DeepPointer->b->p;
+    }
+    // T413 round 3: a read-only call before the reset store keeps the local proof across a later call.
+    t382Base = (i64)HeapAudit.reportLeaks();
+    t382DtorBase = t382ProbeDtorCount;
+    t382Value = 0;
+    {
+        T382U local = default;
+        local.p = new T382PS(7);
+        T382RawLocalRoot root = default;
+        T382RawLocalRoot* pointer = &root;
+        pointer->b = &local;
+        int seen = t413InspectRawLocalRoot(pointer);
+        pointer->b = &local;
+        if (seen > 0) { seen += t413Harmless(); }
+        {
+            unique T382PS* owner = nullptr;
+            owner = pointer->b->p;
+            t382Value = (owner == nullptr ? -1 : owner->v) * 10 + seen;
+        }
+    }
+    passed += Test("t413_readonly_call_then_reset_value", t382Value, 78);
+    passed += Test("t413_readonly_call_then_reset_dtor_count", t382ProbeDtorCount - t382DtorBase, 1);
+    passed += Test("t413_readonly_call_then_reset_no_leak", (i64)HeapAudit.reportLeaks() - t382Base, 0);
 
     return passed;
 }
