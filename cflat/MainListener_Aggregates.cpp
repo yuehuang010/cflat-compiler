@@ -380,6 +380,10 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
         if (destination != nullptr)
             fieldDestination = compiler->builder->CreateStructGEP(
                 structType, destination, index, field.VariableName);
+        // The Slot entry and the nested override must name the same field address, or the
+        // nested suspend misses the entry and the whole field object is unwound twice.
+        if (index < fieldDestinations.size())
+            fieldDestinations[index] = fieldDestination;
         if (rvalue == nullptr && (destType->isStructTy() || destType->isArrayTy()))
         {
             if (destType->isArrayTy()
@@ -1046,6 +1050,13 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         {
             structName = baseName;
         }
+        if (compiler->TrackAggregateDefinitionSite(structName, DefinitionSiteText(compiler, ctx),
+                ctx->genericTypeParameters() != nullptr))
+            LogErrorContext(ctx, std::format("redefinition of '{}'", baseName));
+        if (nameOverride.empty() || !aggregateParentScopes_.contains(structName))
+            aggregateParentScopes_[structName] = !namespaceName.empty()
+                ? namespaceName : NamespaceNameFromContext(compiler, ctx);
+        aggregateDefinitionContexts_[structName] = ctx;
         RegisterLexicalLocalTypeName(compiler, ctx, baseName);
 
         const auto rawAnnotations = ExtractAnnotations(ctx->annotationList());
@@ -2329,7 +2340,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             auto funcDef = compiler->CreateFunctionDefinition(structName, returnType, {});
 
             // A native ctor result (closure fields) is in its final slot too: fields build there.
-            const bool sretCtor = !isUnion && (compiler->NeedsCxxLoweringType(structName)
+            const bool sretCtor = !isUnion && (compiler->ReturnsViaInPlaceSret(structName)
                     || compiler->IsNativeValueConstructor(structName, returnType, {}))
                 && compiler->currentFunctionAbiRecipe.retSlot.kind
                     == LLVMBackend::AbiSlot::SRetReturn;
@@ -4935,6 +4946,13 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         {
             structName = baseName;
         }
+        if (compiler->TrackAggregateDefinitionSite(structName, DefinitionSiteText(compiler, ctx),
+                ctx->genericTypeParameters() != nullptr))
+            LogErrorContext(ctx, std::format("redefinition of '{}'", baseName));
+        if (nameOverride.empty() || !aggregateParentScopes_.contains(structName))
+            aggregateParentScopes_[structName] = !namespaceName.empty()
+                ? namespaceName : NamespaceNameFromContext(compiler, ctx);
+        aggregateDefinitionContexts_[structName] = ctx;
 
         // If this is a generic template definition (not an instantiation), store it and return.
         if (nameOverride.empty() && ctx->genericTypeParameters() != nullptr)

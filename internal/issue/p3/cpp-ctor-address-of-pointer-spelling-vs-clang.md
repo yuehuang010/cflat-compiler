@@ -16,3 +16,15 @@ takes `T*&` and no `T**` / constructor-template candidate exists. Remaining dive
 
 Needs a maintainer ruling on which reading wins when both a slot-binding and a `T**`-accepting
 candidate exist (CFlat spelling vs clang pick).
+
+## Remaining after T495 (review 2026-10-25; master refuses the same, clang accepts)
+- Forwarding-template METHOD (`template<class U> int pick(U&&)` beside `pick(int*&)`), called as `m.pick(&p)`: the
+  generated thunk fails to match int** against int** ("no overload of '__cflat_tpl_...' matches"). Clang picks the
+  template (marker 2). Fix direction: keep the pointer shape through method-wrapper matching, not only in ranking.
+  Repro shape: cflat-fix-t495-amppick scratch/rev_t495_opus_method_template.cb (kept in scratch/repro_keep/t495/).
+- Any constructor template suppresses the slot fallback even when its arity makes it nonviable:
+  `TemplateSlot(int*&)` beside `template<class U> TemplateSlot(U*, int)`, `TemplateSlot(&p)` is refused; clang returns
+  the slot ctor. Fix direction: require a viable template value candidate before choosing clang-only resolution.
+- Free-call fallback rewrites EVERY `&pointer` argument into a slot: `mixed(int*&, int**)` called `mixed(&p, &q)` is
+  refused; clang (`mixed(p, &q)`) binds p's slot and passes &q as a value. Fix direction: per-candidate argument
+  readings.

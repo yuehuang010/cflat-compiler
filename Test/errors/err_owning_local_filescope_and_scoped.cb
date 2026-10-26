@@ -1,0 +1,20 @@
+import "list.cb";
+
+class B { int v = 0; double pad[8] = default; };
+list<B*> g_items = default;
+expect_error("'m' still owns the object it was given");
+
+void early() {
+    B* m = new B();
+    lateStore(m);
+}
+
+extern int main() {
+    expect_error("'n' still owns the object it was given") {
+        B* n = new B();
+        lateStore(n);
+    }
+    return 0;
+}
+
+void lateStore(B* p) { g_items.add(p); }

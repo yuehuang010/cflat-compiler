@@ -2,6 +2,7 @@
 #pragma warning(disable: 4244 4267)
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/IR/Dominators.h>
@@ -1628,7 +1629,10 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrParamAsTypeAndValue(const TypeAndV
         size_t index) const
 {
         TypeAndValue tv;
-        tv.TypeName = p.TypeName;
+        if (p.FunctionTypeSignature != nullptr)
+            tv = *p.FunctionTypeSignature;
+        else
+            tv.TypeName = p.TypeName;
         tv.Pointer  = p.Pointer || p.IsArrayView;
         tv.IsArrayView = p.IsArrayView;
         tv.PointerDepth = p.PointerDepth;
@@ -2452,6 +2456,9 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
             const auto* encoded = GetEncodedClosureType(type.TypeName);
             return encoded != nullptr && encoded->IsThinFnPtr();
         };
+        auto isPointeeMove = [](const NamedVariable& arg) {
+            return arg.PointeeMove;
+        };
         // An implicit consume of a field of the borrowed receiver `this` is refused at the point
         // the source slot would be cleared (T447). True when reported.
         auto reportThisFieldConsume = [&](const NamedVariable& arg) {
@@ -2495,7 +2502,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                         && !movedName.empty())
                     {
                         if (!movePath.empty()) MarkVariableFieldMoved(movedName, movePath);
-                        else if (!args[i].IsElementAccess) MarkVariableMoved(movedName);
+                        else if (!args[i].IsElementAccess)
+                            MarkVariableMoved(movedName, isPointeeMove(args[i]));
                     }
                 }
                 continue;
@@ -2558,7 +2566,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     }
                     else if (!sourceName.empty() && !args[i].IsElementAccess
                         && !explicitFunctionMove)
-                        MarkVariableMoved(sourceName);
+                        MarkVariableMoved(sourceName, isPointeeMove(args[i]));
                 }
                 continue;
             }
@@ -2812,6 +2820,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                             builder->CreateStore(llvm::Constant::getNullValue(source.ValueType),
                                                  source.Storage);
                             if (!source.NullKey.empty()) RecordNullSet(source.NullKey);
+                            if (source.PointeeMove)
+                                RecordNullSet(source.CallerName, true);
                             builder->restoreIP(savedIP);
                         }
                         else if (!source.CallerName.empty())
@@ -2823,7 +2833,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                             else if (!source.FieldName.empty())
                                 MarkVariableFieldMoved(source.CallerName, source.FieldName);
                             else if (!source.IsElementAccess)
-                                MarkVariableMoved(source.CallerName);
+                                MarkVariableMoved(source.CallerName, source.PointeeMove);
                         }
                     }
                     continue;
@@ -2923,7 +2933,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                         && wholeBindingSource)
                     {
                         if (!explicitFunctionMove)
-                            MarkVariableMoved(sourceName);
+                            MarkVariableMoved(sourceName, isPointeeMove(args[i]));
                     }
                 }
                 // Compile-time: mark the caller's storage as moved so subsequent reads are rejected.
@@ -2942,7 +2952,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                         if (isFieldAccess)
                             MarkVariableFieldMoved(sourceName, movePath);
                         else if (wholeBindingSource)
-                            MarkVariableMoved(sourceName);
+                            MarkVariableMoved(sourceName, isPointeeMove(args[i]));
                     }
                 }
             }
@@ -2954,7 +2964,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 && args[i].IsExplicitMove && !sourceName.empty())
             {
                 if (!movePath.empty()) MarkVariableFieldMoved(sourceName, movePath);
-                else if (wholeBindingSource) MarkVariableMoved(sourceName);
+                else if (wholeBindingSource)
+                    MarkVariableMoved(sourceName, isPointeeMove(args[i]));
             }
         }
     }
@@ -3789,6 +3800,42 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         const InterfaceMethod* methodInfo = &(*ifaceMethods)[methodIdx];
         if (userReceiver != nullptr && !methodInfo->IsConst)
             RefuseConstInterfaceReceiverCall(*userReceiver, ifaceName, methodName);
+
+        bool receiverResolved = false;
+        if (userReceiver != nullptr && userReceiver->Storage != nullptr)
+        {
+            auto* block = builder->GetInsertBlock();
+            auto it = builder->GetInsertPoint();
+            while (it != block->begin())
+            {
+                --it;
+                auto* store = llvm::dyn_cast<llvm::StoreInst>(&*it);
+                if (store == nullptr || store->getPointerOperand() != userReceiver->Storage)
+                    continue;
+                if (const auto* box = FindInterfaceBoxByFatValue(store->getValueOperand());
+                    box != nullptr && box->InterfaceName == ifaceName)
+                {
+                    NoteThisClosureMemberCall(LookupInterfaceMethodImpl(box->SourceClassName,
+                                                                        *methodInfo));
+                    receiverResolved = true;
+                }
+                break;
+            }
+        }
+        // For a parameter or an indirect interface value, reject if a registered implementation
+        // of this slot contains the deferred copy. Unknown implementor sets remain inconclusive.
+        if (userReceiver != nullptr && !receiverResolved)
+        {
+            std::vector<std::string> implementors;
+            if (EnumerateInterfaceImplementors(ifaceName, implementors, true))
+                for (const auto& structName : implementors)
+                {
+                    const auto* callee = LookupInterfaceMethodImpl(structName, *methodInfo);
+                    const size_t siteCount = thisClosureCopySites_.size();
+                    NoteThisClosureMemberCall(callee);
+                    if (thisClosureCopySites_.size() != siteCount) break;
+                }
+        }
 
         std::vector<TypeAndValue> transferParams = methodInfo->Parameters;
         for (auto& param : transferParams)

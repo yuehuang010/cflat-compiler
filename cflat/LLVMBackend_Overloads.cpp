@@ -1590,6 +1590,107 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
             const TypeAndValue& param = spelledClassParam.TypeName.empty()
                 ? candidate.Parameters[i] : spelledClassParam;
             CxxConversionRank& out = ranks[i];
+            if (candidate.IsCxx && param.IsRvalueRef && param.Pointer && param.ElemPointer
+                && arg.IsCxxAddressOfPointerValue && arg.Storage == nullptr)
+            {
+                const TypeAndValue& got = arg.TypeAndValue;
+                const std::string gotName = got.TypeName.empty()
+                    ? arg.InferSourceTypeName : got.TypeName;
+                const bool exactShape = got.Pointer
+                    && got.ValuePointerDepth() == param.ValuePointerDepth()
+                    && !gotName.empty()
+                    && ResolveTypeAlias(gotName) == ResolveTypeAlias(param.TypeName);
+                const auto constRelation = CxxCandidatePointeeConstRelation(candidate, i, arg, param);
+                out.rank = exactShape && constRelation != CxxPointeeConstRelation::Drops
+                    ? (constRelation == CxxPointeeConstRelation::Adds ? 1 : 0)
+                    : kCxxNonViableRank;
+                out.cxxViable = out.rank != kCxxNonViableRank;
+                out.from = gotName;
+                continue;
+            }
+            if (candidate.IsCxx && param.IsCxxRefToPointer
+                && arg.IsCxxAddressOfPointerValue && arg.Storage == nullptr)
+            {
+                const TypeAndValue& got = arg.TypeAndValue;
+                const std::string gotName = got.TypeName.empty()
+                    ? arg.InferSourceTypeName : got.TypeName;
+                const bool exactPointerType = got.Pointer
+                    && got.ValuePointerDepth() == param.ValuePointerDepth()
+                    && got.ElemPointer == param.ElemPointer
+                    && ResolveTypeAlias(gotName) == ResolveTypeAlias(param.TypeName);
+                const bool voidPointerConversion = got.Pointer && !got.IsFunctionPointer
+                    && param.ValuePointerDepth() == 1 && param.TypeName == "void";
+                const bool rvalue = IsCxxRvalueReferenceArgument(arg);
+                const bool refCategoryMatches = exactPointerType
+                    ? (param.IsRvalueRef ? rvalue : (!rvalue || param.CxxConstRef()))
+                    : (param.IsRvalueRef || param.CxxConstRef());
+                const auto constRelation = CxxCandidatePointeeConstRelation(
+                    candidate, i, arg, param);
+                const bool innerConstMismatch = constRelation == CxxPointeeConstRelation::Drops
+                    || (constRelation == CxxPointeeConstRelation::Adds && got.ElemPointer);
+                if ((exactPointerType || voidPointerConversion) && refCategoryMatches
+                    && !innerConstMismatch)
+                {
+                    out.rank = exactPointerType
+                        ? (constRelation == CxxPointeeConstRelation::Adds ? 1 : 0) : 2;
+                    out.cxxViable = true;
+                    out.from = gotName;
+                    if (exactPointerType && param.ValuePointerDepth() > 0)
+                    {
+                        out.cvBase = param.TypeName;
+                        out.cv = param.PointeeConstBit() ? 1 : 0;
+                    }
+                }
+                else
+                {
+                    out.rank = kCxxNonViableRank;
+                    out.from = gotName;
+                }
+                continue;
+            }
+            if (candidate.IsCxx && param.Pointer && !param.IsAlias && !param.IsRvalueRef
+                && !param.IsCxxRefToPointer && param.ValuePointerDepth() == 1
+                && param.TypeName == "void" && !param.IsCxxNullptrT
+                && arg.IsCxxAddressOfPointerValue && arg.Storage == nullptr
+                && arg.TypeAndValue.Pointer && arg.TypeAndValue.ValuePointerDepth() >= 2
+                && !arg.TypeAndValue.IsFunctionPointer)
+            {
+                out.rank = 2;
+                out.cxxViable = true;
+                out.from = arg.TypeAndValue.TypeName;
+                out.toClass = "void";
+                continue;
+            }
+            if (candidate.IsCxx && param.Pointer && !param.IsAlias && !param.IsRvalueRef
+                && !param.IsCxxRefToPointer && param.ValuePointerDepth() >= 2
+                && arg.IsCxxAddressOfPointerValue && arg.Storage == nullptr)
+            {
+                const TypeAndValue& got = arg.TypeAndValue;
+                const std::string gotName = got.TypeName.empty()
+                    ? arg.InferSourceTypeName : got.TypeName;
+                const bool exactPointerType = got.Pointer
+                    && got.ValuePointerDepth() == param.ValuePointerDepth()
+                    && got.ElemPointer == param.ElemPointer
+                    && ResolveTypeAlias(gotName) == ResolveTypeAlias(param.TypeName);
+                const auto constRelation = CxxCandidatePointeeConstRelation(
+                    candidate, i, arg, param);
+                const bool innerConstMismatch = constRelation == CxxPointeeConstRelation::Drops
+                    || (constRelation == CxxPointeeConstRelation::Adds && got.ElemPointer);
+                if (exactPointerType && !innerConstMismatch)
+                {
+                    out.rank = constRelation == CxxPointeeConstRelation::Adds ? 1 : 0;
+                    out.cxxViable = true;
+                    out.from = gotName;
+                    out.cvBase = param.TypeName;
+                    out.cv = param.PointeeConstBit() ? 1 : 0;
+                }
+                else
+                {
+                    out.rank = kCxxNonViableRank;
+                    out.from = gotName;
+                }
+                continue;
+            }
             // Rank the implicit object parameter for imported C++ members.
             const bool memberWrapper = candidate.IsCxx
                 && candidate.UniqueName.starts_with("__cflat_udc_") && param.VariableName == "this";
@@ -5942,6 +6043,73 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         CxxPreferredOverload cxxPreferred;
         auto [matched, candidate] = ComputeOverloadFunction(resolvedCandidate, &tiedCandidates,
                                                             &cxxPreferred);
+        if (candidate.Function == nullptr && tiedCandidates.empty() && !cxxPreferred.set
+            && std::any_of(arguments.begin(), arguments.end(), [](const NamedVariable& arg) {
+                return arg.IsCxxAddressOfPointerValue && arg.Storage == nullptr
+                    && arg.TypeAndValue.IsProvenDoublePointer();
+            }))
+        {
+            std::vector<NamedVariable> slotArguments = arguments;
+            bool slotShapeAvailable = false;
+            for (NamedVariable& arg : slotArguments)
+            {
+                if (!arg.IsCxxAddressOfPointerValue || arg.Storage != nullptr
+                    || !arg.TypeAndValue.IsProvenDoublePointer() || arg.Primary == nullptr
+                    || !arg.Primary->getType()->isPointerTy())
+                    continue;
+                arg.TypeAndValue.ElemPointer = false;
+                arg.TypeAndValue.PointerDepth = 1;
+                arg.Storage = arg.Primary;
+                arg.Primary = nullptr;
+                arg.BaseType = GetType(arg.TypeAndValue);
+                arg.IsRvalue = false;
+                slotShapeAvailable = true;
+            }
+            std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> slotCandidates;
+            if (slotShapeAvailable)
+                for (const FunctionSymbol& slotCandidate : candidates)
+                {
+                    if (!slotCandidate.IsCxx) continue;
+                    auto slotMatchedArgs = MatchFunction(slotArguments, slotCandidate.Parameters,
+                        slotCandidate.Variadic, true, &slotCandidate.DefaultArguments);
+                    if (slotMatchedArgs.empty()) continue;
+                    bool hasSlotArgument = false;
+                    bool onlyReferenceSlots = true;
+                    for (size_t i = 0; i < slotMatchedArgs.size()
+                         && i < slotCandidate.Parameters.size(); ++i)
+                    {
+                        const auto& arg = slotMatchedArgs[i];
+                        if (!arg.IsCxxAddressOfPointerValue) continue;
+                        hasSlotArgument = true;
+                        const auto& param = slotCandidate.Parameters[i];
+                        onlyReferenceSlots = onlyReferenceSlots && param.IsCxxRefToPointer
+                            && !param.CxxConstRef() && !param.IsRvalueRef
+                            && param.TypeName == arg.TypeAndValue.TypeName;
+                    }
+                    if (!hasSlotArgument || !onlyReferenceSlots) continue;
+                    for (NamedVariable& arg : slotMatchedArgs)
+                        if (arg.IsCxxAddressOfPointerValue) arg.IsCxxAddressOfPointerValue = false;
+                    slotCandidates.emplace_back(std::move(slotMatchedArgs), slotCandidate);
+                }
+            if (!slotCandidates.empty())
+            {
+                std::vector<FunctionSymbol> slotTied;
+                CxxPreferredOverload slotPreferred;
+                auto [slotMatched, slotCandidate] = ComputeOverloadFunction(
+                    slotCandidates, &slotTied, &slotPreferred);
+                if (slotCandidate.Function != nullptr && slotTied.empty() && !slotPreferred.set)
+                {
+                    for (NamedVariable& arg : slotArguments)
+                        if (arg.IsCxxAddressOfPointerValue) arg.IsCxxAddressOfPointerValue = false;
+                    arguments = std::move(slotArguments);
+                    resolvedCandidate = std::move(slotCandidates);
+                    matched = std::move(slotMatched);
+                    candidate = std::move(slotCandidate);
+                    tiedCandidates.clear();
+                    cxxPreferred = {};
+                }
+            }
+        }
         const std::string inheritedOwner = matched.empty() ? std::string()
             : CxxInheritedMemberOwner(matched.front().TypeAndValue.TypeName, candidate);
         if (!inheritedOwner.empty()
@@ -6858,6 +7026,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     std::string paramDesc = i < resolvedSym.Parameters.size()
                         ? displayDiagnosticType(resolvedSym.Parameters[i].TypeName) : "<missing>";
                     std::string paramPtr = i < resolvedSym.Parameters.size() ? PointerStars(resolvedSym.Parameters[i]) : "";
+                    if (i < resolvedArgs.size()
+                        && resolvedArgs[i].IsCxxAddressOfPointerValue)
+                        argPtr += " (address-of pointer value)";
+                    if (i < resolvedSym.Parameters.size()
+                        && resolvedSym.Parameters[i].IsCxxRefToPointer)
+                        paramPtr += " (reference to pointer)";
                     msg += std::format("    [{}] arg={}{}  param={}{}\n", i, argDesc, argPtr, paramDesc, paramPtr);
                 }
             }
@@ -7408,6 +7582,36 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             // param, which for printf is 'ptr %fmt' - causing all variadic args to be
             // pushed as storage/GEP addresses instead of loaded values).
             bool inVariadicRange = candidate.Variadic && argIndex >= candidate.Parameters.size();
+
+            // A substituted generic closure type can keep its signature in TypeName alone.
+            // Check named function arguments after overload selection to report the binding error.
+            if (!inVariadicRange && IsEncodedClosureType(candParamItr->TypeName))
+            {
+                if (auto* namedFunction = llvm::dyn_cast_or_null<llvm::Function>(arg.Primary))
+                {
+                    const FunctionSymbol* selected = arg.CallerName.empty()
+                        ? nullptr : NamedFunctionOverloadForFuncPtr(arg.CallerName, *candParamItr);
+                    if (selected != nullptr)
+                    {
+                        arg.Primary = selected->Function;
+                    }
+                    else if (const FunctionSymbol* symbol = FindSymbolForFunction(namedFunction))
+                    {
+                        const TypeAndValue actual = FuncPtrSigOfSymbol(*symbol);
+                        if (FuncPtrSignaturesProvablyDiffer(
+                                AliasAlignedCallbackSig(actual, *candParamItr), *candParamItr)
+                            && !FuncPtrFewerParamsCanAdapt(actual, *candParamItr))
+                        {
+                            const std::string bindingName = arg.CallerName.empty()
+                                ? symbol->UniqueName : arg.CallerName;
+                            const std::string mismatch = DescribeFuncPtrBindMismatch(
+                                bindingName, actual, *candParamItr, /*compareReturnOwnership*/ true);
+                            if (!mismatch.empty()) LogError(mismatch);
+                        }
+                    }
+                }
+            }
+
             if (!inVariadicRange && !(candidate.IsMethod && argIndex == 0)
                 && argIndex < candidate.Parameters.size()
                 && candidate.Parameters[argIndex].Pointer
@@ -8054,10 +8258,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         if (RejectAliasParamFuncPtrBind(
                                 arg.CallerName.empty() ? fnSym->UniqueName : arg.CallerName, *fnSym, &*candParamItr))
                             return nullptr;
-                // A resolved function value must bind to the callback's complete ABI. Local
-                // function-pointer values are loads, so they do not enter this name-only branch.
+                // A named function must bind to the callback's complete ABI even when its
+                // expression already carries function-pointer type metadata.
                 if (auto* fnVal = llvm::dyn_cast_or_null<llvm::Function>(val);
-                    fnVal != nullptr && !arg.TypeAndValue.IsFunctionPointer)
+                    fnVal != nullptr)
                 {
                     if (const FunctionSymbol* fnSym = FindSymbolForFunction(fnVal))
                     {
@@ -8067,7 +8271,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         std::string bindMismatch = DescribeFuncPtrBindMismatch(
                             bindingName, actualSig, *candParamItr,
                             /*compareReturnOwnership*/ true);
-                        if (!bindMismatch.empty()) LogRawError(bindMismatch);
+                        if (!bindMismatch.empty()) LogError(bindMismatch);
                         // A single overload can bypass GetFunctionForFuncPtr's overload ranking.
                         // Keep the declarator's move-flag predicate on both thin and fat callbacks.
                         if (!HasFunctionWithMoveFlags(bindingName, candParamItr->FuncPtrParams))
@@ -9044,6 +9248,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         };
         const AbiRecipe* callRecipe = variadicCallRecipe.has_value()
             ? &*variadicCallRecipe : nullptr;
+        NoteThisClosureMemberCall(candidate.Function);
         llvm::Value* result = candidate.Recipe.hasLowering || callRecipe != nullptr
             ? EmitAbiLoweredCall(candidate, argList, cxxSretDest,
                                  cxxIndirectArgAddrs.empty() ? nullptr : &cxxIndirectArgAddrs,
@@ -9225,10 +9430,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // the ARGUMENT list describes a different value: retire its sticky channels here.
         lastOwningResult = false;
         lastAllocAlignment = 0;
-        // A core unique return owns like `move`.
+        // A unique pointer or core unique return owns like `move`.
         lastCallReturnsOwned = uniqueFieldBorrow == nullptr
             && (candidate.ReturnsOwned
                 || aliasStringTempMayOwn
+                || (!resultIsAlias && candidate.ReturnType.Pointer
+                    && candidate.ReturnType.IsUnique)
                 || (!resultIsAlias && !candidate.ReturnType.Pointer
                     && IsCoreUniqueType(candidate.ReturnType.TypeName)));
         // Ledger the owning-return result by value for the no-discard check: string / pointer /
@@ -10265,10 +10472,24 @@ void LLVMBackend::RejectOwningLocalIntoBorrowingHelper(const std::string& functi
             owningLocalBorrowingHelperArgs_.push_back({
                 callee.Function, *llvmIndex, functionName,
                 callee.Parameters[paramIndex].VariableName, arg.CallerName,
-                sourceFileName, currentLine, currentColumn });
+                sourceFileName, currentLine, currentColumn, nullptr, nullptr, nullptr,
+                !expectedError.empty() && expectedError != fileScopeExpectedError_
+                    ? activeExpectScope_ : 0 });
             return;
         }
-        if (!ParameterMayReachBorrowingContainerSink(callee.Function, *llvmIndex)) return;
+        const auto sinkSummary = BorrowingContainerSinkSummaryForParameter(
+            callee.Function, *llvmIndex);
+        if (sinkSummary.UnresolvedCallee)
+        {
+            owningLocalBorrowingHelperArgs_.push_back({
+                callee.Function, *llvmIndex, functionName,
+                callee.Parameters[paramIndex].VariableName, arg.CallerName,
+                sourceFileName, currentLine, currentColumn, nullptr, nullptr, nullptr,
+                !expectedError.empty() && expectedError != fileScopeExpectedError_
+                    ? activeExpectScope_ : 0 });
+            return;
+        }
+        if (!sinkSummary.ReachesSink()) return;
         LogErrorMessage(
             "call to '{}': '{}' still owns the object it was given, and the helper parameter '{}' "
             "stores it into a container that only BORROWS its elements and never frees them, so "
@@ -10279,7 +10500,7 @@ void LLVMBackend::RejectOwningLocalIntoBorrowingHelper(const std::string& functi
               SpellFunctionSymbol(*this, functionName), arg.CallerName });
     }
 
-void LLVMBackend::MarkVariableMoved(const std::string& name)
+void LLVMBackend::MarkVariableMoved(const std::string& name, bool pointeeMove)
 {
         if (name.empty()) return;
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
@@ -10295,6 +10516,10 @@ void LLVMBackend::MarkVariableMoved(const std::string& name)
                 }
                 RecordMoveKill(name);
                 it->second.IsMoved = true;
+                it->second.PointeeMove = pointeeMove;
+                it->second.PointeeMoveBlock = pointeeMove && builder
+                    ? builder->GetInsertBlock() : nullptr;
+                if (pointeeMove) RecordNullSet(name, true);
                 if (ShouldSkipMovedFromStructDestructor(it->second.TypeAndValue.TypeName))
                 {
                     EnsureConditionalDropFlag(it->second);
@@ -10314,6 +10539,10 @@ void LLVMBackend::MarkVariableMoved(const std::string& name)
                 }
                 RecordMoveKill(name);
                 it->second.IsMoved = true;
+                it->second.PointeeMove = pointeeMove;
+                it->second.PointeeMoveBlock = pointeeMove && builder
+                    ? builder->GetInsertBlock() : nullptr;
+                if (pointeeMove) RecordNullSet(name, true);
                 if (ShouldSkipMovedFromStructDestructor(it->second.TypeAndValue.TypeName))
                 {
                     EnsureConditionalDropFlag(it->second);
@@ -10629,13 +10858,23 @@ void LLVMBackend::MarkVariableUnmoved(const std::string& name)
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
-                { it->second.IsMoved = false; return; }
+                {
+                    it->second.IsMoved = false;
+                    it->second.PointeeMove = false;
+                    it->second.PointeeMoveBlock = nullptr;
+                    return;
+                }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
-                { it->second.IsMoved = false; return; }
+                {
+                    it->second.IsMoved = false;
+                    it->second.PointeeMove = false;
+                    it->second.PointeeMoveBlock = nullptr;
+                    return;
+                }
         }
     }
 
-void LLVMBackend::MarkVariableExplicitlyMovedNull(const std::string& name)
+void LLVMBackend::MarkVariableExplicitlyMovedNull(const std::string& name, bool pointeeMove)
 {
         if (name.empty() || !builder) return;
         llvm::BasicBlock* bb = builder->GetInsertBlock();
@@ -10647,10 +10886,12 @@ void LLVMBackend::MarkVariableExplicitlyMovedNull(const std::string& name)
                 if (it->second.AddressEscaped) return;
                 it->second.ExplicitlyMovedNull = true;
                 it->second.ExplicitNullBlock = bb;
+                it->second.PointeeMove = pointeeMove;
+                it->second.PointeeMoveBlock = pointeeMove ? bb : nullptr;
                 EnsureConditionalDropFlag(it->second);
                 if (it->second.ConditionalDropFlag != nullptr)
                     builder->CreateStore(builder->getInt1(false), it->second.ConditionalDropFlag);
-                RecordNullSet(name);
+                RecordNullSet(name, pointeeMove);
                 return;
             }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
@@ -10658,10 +10899,12 @@ void LLVMBackend::MarkVariableExplicitlyMovedNull(const std::string& name)
                 if (it->second.AddressEscaped) return;
                 it->second.ExplicitlyMovedNull = true;
                 it->second.ExplicitNullBlock = bb;
+                it->second.PointeeMove = pointeeMove;
+                it->second.PointeeMoveBlock = pointeeMove ? bb : nullptr;
                 EnsureConditionalDropFlag(it->second);
                 if (it->second.ConditionalDropFlag != nullptr)
                     builder->CreateStore(builder->getInt1(false), it->second.ConditionalDropFlag);
-                RecordNullSet(name);
+                RecordNullSet(name, pointeeMove);
                 return;
             }
         }
@@ -10677,6 +10920,8 @@ void LLVMBackend::MarkVariableNotExplicitlyMovedNull(const std::string& name)
                 {
                     it->second.ExplicitlyMovedNull = false;
                     it->second.ExplicitNullBlock = nullptr;
+                    it->second.PointeeMove = false;
+                    it->second.PointeeMoveBlock = nullptr;
                     RearmConditionalDropFlag(it->second);
                     return;
                 }
@@ -10684,6 +10929,8 @@ void LLVMBackend::MarkVariableNotExplicitlyMovedNull(const std::string& name)
                 {
                     it->second.ExplicitlyMovedNull = false;
                     it->second.ExplicitNullBlock = nullptr;
+                    it->second.PointeeMove = false;
+                    it->second.PointeeMoveBlock = nullptr;
                     RearmConditionalDropFlag(it->second);
                     return;
                 }
@@ -10713,6 +10960,8 @@ void LLVMBackend::MarkVariableAddressEscaped(const std::string& name)
                 it->second.AddressEscaped = true;
                 it->second.ExplicitlyMovedNull = false;
                 it->second.ExplicitNullBlock = nullptr;
+                it->second.PointeeMove = false;
+                it->second.PointeeMoveBlock = nullptr;
                 return;
             }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
@@ -10720,6 +10969,8 @@ void LLVMBackend::MarkVariableAddressEscaped(const std::string& name)
                 it->second.AddressEscaped = true;
                 it->second.ExplicitlyMovedNull = false;
                 it->second.ExplicitNullBlock = nullptr;
+                it->second.PointeeMove = false;
+                it->second.PointeeMoveBlock = nullptr;
                 return;
             }
         }
@@ -10729,6 +10980,21 @@ bool LLVMBackend::IsExplicitlyMovedNullHere(const NamedVariable& nv) const
 {
         return nv.ExplicitlyMovedNull && !nv.AddressEscaped && suppressExplicitNullDerefGuard_ == 0
             && builder && nv.ExplicitNullBlock == builder->GetInsertBlock();
+    }
+
+bool LLVMBackend::IsMovedDerefHere(const NamedVariable& nv) const
+{
+        return IsExplicitlyMovedNullHere(nv)
+            || (nv.PointeeMove && !nv.AddressEscaped && suppressExplicitNullDerefGuard_ == 0
+                && builder && nv.PointeeMoveBlock == builder->GetInsertBlock());
+    }
+
+std::string LLVMBackend::MovedDerefDiagnostic(const NamedVariable& nv) const
+{
+        if (nv.PointeeMove)
+            return std::format("pointee of '{}' was moved", nv.CallerName);
+        return std::format(
+            "dereference of moved variable '{}' (it is null after the move)", nv.CallerName);
     }
 
 std::string LLVMBackend::UniqueFieldNullKey(const NamedVariable& nv) const
@@ -10766,7 +11032,7 @@ void LLVMBackend::RecordNullDerefFor(const NamedVariable& nv, int line, int col)
             return;
         }
         if (nv.CallerName.empty() || nv.AddressEscaped) return;
-        if (!(nv.ExplicitlyMovedNull || nv.IsOwning
+        if (!(nv.ExplicitlyMovedNull || nv.PointeeMove || nv.IsOwning
               || nv.TypeAndValue.IsUnique
               || IsCoreUniqueType(nv.TypeAndValue.TypeName)))
             return;

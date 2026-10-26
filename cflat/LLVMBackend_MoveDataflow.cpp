@@ -88,16 +88,18 @@ void LLVMBackend::RecordMoveGenBind(const std::string& name)
 void LLVMBackend::RecordMoveUse(const std::string& name, const std::string& field, int line, int col)
 { RecordMoveEvent(movedf::EventKind::Use, name, field, line, col); }
 
-void LLVMBackend::RecordNullEvent(nulldf::EventKind kind, const std::string& name, int line, int col)
+void LLVMBackend::RecordNullEvent(nulldf::EventKind kind, const std::string& name,
+                                  int line, int col, bool pointeeMove)
 {
         if (name.empty() || !builder) return;
         llvm::BasicBlock* bb = builder->GetInsertBlock();
         if (!bb || !bb->getParent()) return;
-        nullEventLog_[bb->getParent()].push_back(nulldf::Event{ bb, kind, name, line, col });
+        nullEventLog_[bb->getParent()].push_back(
+            nulldf::Event{ bb, kind, name, line, col, pointeeMove });
     }
 
-void LLVMBackend::RecordNullSet(const std::string& name)
-{ RecordNullEvent(nulldf::EventKind::SetNull, name, 0, 0); }
+void LLVMBackend::RecordNullSet(const std::string& name, bool pointeeMove)
+{ RecordNullEvent(nulldf::EventKind::SetNull, name, 0, 0, pointeeMove); }
 
 void LLVMBackend::RecordNullClear(const std::string& name)
 { RecordNullEvent(nulldf::EventKind::ClearNull, name, 0, 0); }
@@ -214,8 +216,11 @@ void LLVMBackend::RunNullDerefDataflow(llvm::Function* F)
                 (d.line == earliest->line && d.col < earliest->col))
                 earliest = &d;
         SetSourceLocation(earliest->line, earliest->col);
-        LogError(std::format(
-            "dereference of moved variable '{}' (it is null after the move)", earliest->name));
+        if (earliest->pointeeMove)
+            LogError(std::format("pointee of '{}' was moved", earliest->name));
+        else
+            LogError(std::format(
+                "dereference of moved variable '{}' (it is null after the move)", earliest->name));
     }
 
 static std::vector<llvm::StoreInst*> StoresReachingLoadLinear(llvm::LoadInst* load,
@@ -1094,9 +1099,19 @@ LLVMBackend::MovedStateSnapshot LLVMBackend::SaveMovedState() const
         for (const auto& frame : stackNamedVariable)
         {
             for (const auto& [name, nv] : frame.functionArgument)
-                { state.moved[name] = nv.IsMoved; state.movedFields[name] = nv.MovedFields; }
+            {
+                state.moved[name] = nv.IsMoved;
+                state.pointeeMoved[name] = nv.PointeeMove;
+                state.pointeeMoveBlocks[name] = nv.PointeeMoveBlock;
+                state.movedFields[name] = nv.MovedFields;
+            }
             for (const auto& [name, nv] : frame.namedVariable)
-                { state.moved[name] = nv.IsMoved; state.movedFields[name] = nv.MovedFields; }
+            {
+                state.moved[name] = nv.IsMoved;
+                state.pointeeMoved[name] = nv.PointeeMove;
+                state.pointeeMoveBlocks[name] = nv.PointeeMoveBlock;
+                state.movedFields[name] = nv.MovedFields;
+            }
         }
         return state;
     }
@@ -1106,6 +1121,10 @@ void LLVMBackend::RestoreMovedState(const MovedStateSnapshot& state)
         auto restoreOne = [&](const std::string& name, NamedVariable& nv) {
             if (auto it = state.moved.find(name); it != state.moved.end())
                 nv.IsMoved = it->second;
+            if (auto it = state.pointeeMoved.find(name); it != state.pointeeMoved.end())
+                nv.PointeeMove = it->second;
+            if (auto it = state.pointeeMoveBlocks.find(name); it != state.pointeeMoveBlocks.end())
+                nv.PointeeMoveBlock = it->second;
             if (auto it = state.movedFields.find(name); it != state.movedFields.end())
                 nv.MovedFields = it->second;
         };
@@ -1119,8 +1138,30 @@ void LLVMBackend::RestoreMovedState(const MovedStateSnapshot& state)
 void LLVMBackend::MergeMovedStateInto(const MovedStateSnapshot& state)
 {
         auto mergeOne = [&](const std::string& name, NamedVariable& nv) {
-            if (auto it = state.moved.find(name); it != state.moved.end() && it->second)
-                nv.IsMoved = true;
+            auto incomingMoved = state.moved.find(name);
+            if (incomingMoved != state.moved.end())
+            {
+                const bool currentMoved = nv.IsMoved;
+                const bool currentPointeeMove = nv.PointeeMove;
+                llvm::BasicBlock* currentPointeeBlock = nv.PointeeMoveBlock;
+                const bool otherMoved = incomingMoved->second;
+                const bool otherPointeeMove = state.pointeeMoved.at(name);
+                llvm::BasicBlock* otherPointeeBlock = state.pointeeMoveBlocks.at(name);
+                nv.IsMoved = currentMoved || otherMoved;
+                nv.PointeeMove = nv.IsMoved
+                    && (!currentMoved || currentPointeeMove)
+                    && (!otherMoved || otherPointeeMove);
+                nv.PointeeMoveBlock = nullptr;
+                if (nv.PointeeMove)
+                {
+                    if (!currentMoved)
+                        nv.PointeeMoveBlock = otherPointeeBlock;
+                    else if (!otherMoved)
+                        nv.PointeeMoveBlock = currentPointeeBlock;
+                    else if (currentPointeeBlock == otherPointeeBlock)
+                        nv.PointeeMoveBlock = otherPointeeBlock;
+                }
+            }
             if (auto it = state.movedFields.find(name); it != state.movedFields.end())
                 nv.MovedFields = movedf::MergeFieldPaths(nv.MovedFields, it->second);
         };
@@ -1138,7 +1179,38 @@ void LLVMBackend::MergeMovedStates(const MovedStateSnapshot& thenState,
             auto t = thenState.moved.find(name);
             auto e = elseState.moved.find(name);
             if (t != thenState.moved.end() && e != elseState.moved.end())
-                nv.IsMoved = t->second || e->second;
+            {
+                const bool thenMoved = t->second;
+                const bool elseMoved = e->second;
+                const bool thenPointeeMove = thenState.pointeeMoved.at(name);
+                const bool elsePointeeMove = elseState.pointeeMoved.at(name);
+                nv.IsMoved = thenMoved || elseMoved;
+                nv.PointeeMove = nv.IsMoved
+                    && (!thenMoved || thenPointeeMove)
+                    && (!elseMoved || elsePointeeMove);
+                nv.PointeeMoveBlock = nullptr;
+                if (nv.PointeeMove)
+                {
+                    llvm::BasicBlock* thenBlock = thenState.pointeeMoveBlocks.at(name);
+                    llvm::BasicBlock* elseBlock = elseState.pointeeMoveBlocks.at(name);
+                    if (thenMoved && elseMoved)
+                    {
+                        if (thenBlock == elseBlock)
+                            nv.PointeeMoveBlock = thenBlock;
+                    }
+                    else if (thenMoved)
+                        nv.PointeeMoveBlock = thenBlock;
+                    else
+                        nv.PointeeMoveBlock = elseBlock;
+                }
+            }
+            else if (t != thenState.moved.end() || e != elseState.moved.end())
+            {
+                nv.IsMoved = (t != thenState.moved.end() && t->second)
+                    || (e != elseState.moved.end() && e->second);
+                nv.PointeeMove = false;
+                nv.PointeeMoveBlock = nullptr;
+            }
             auto tf = thenState.movedFields.find(name);
             auto ef = elseState.movedFields.find(name);
             if (tf != thenState.movedFields.end() && ef != elseState.movedFields.end())
@@ -3535,17 +3607,178 @@ bool LLVMBackend::DeferExpectationVerdict()
         || (std::none_of(pendingConstReceiverCalls_.begin(), pendingConstReceiverCalls_.end(),
                          [&](const auto& e) { return e.Owner == scope; })
             && std::none_of(thisClosureCopySites_.begin(), thisClosureCopySites_.end(),
-                            [&](const auto& e) { return e.Owner == scope; })))
+                            [&](const auto& e) { return e.Owner == scope; })
+            && std::none_of(owningLocalBorrowingHelperArgs_.begin(), owningLocalBorrowingHelperArgs_.end(),
+                            [&](const auto& e) { return e.Owner == scope; })
+            && std::none_of(deferredRawPointerCalleeStores_.begin(),
+                            deferredRawPointerCalleeStores_.end(),
+                            [&](const auto& e) { return e.Owner == scope && e.Refuse; })))
         return false;
     deferredExpectations_.push_back(activeExpectPosition_);
     RestoreExpectScope(scope);
     return true;
 }
 
+void LLVMBackend::ResolveDeferredExpectationVerdicts(bool aborted)
+{
+    if (!aborted) ResolveRawPointerCalleeStoreVerdicts();
+    std::vector<PendingConstReceiverCall> constCalls;
+    constCalls.swap(pendingConstReceiverCalls_);
+    std::vector<OwningLocalBorrowingHelperArg> helperCalls;
+    helperCalls.swap(owningLocalBorrowingHelperArgs_);
+    std::vector<ThisClosureCopySite> closureSites;
+    closureSites.swap(thisClosureCopySites_);
+    std::vector<DeferredExpectation> expectations;
+    expectations.swap(deferredExpectations_);
+
+    std::unordered_set<size_t> deferredScopes;
+    for (const auto& expectation : expectations) deferredScopes.insert(expectation.Scope);
+
+    enum class Kind { ConstReceiver, Helper, Closure, RawStore };
+    struct Candidate
+    {
+        Kind Type;
+        size_t Index;
+        std::string File;
+        size_t Line;
+        size_t Column;
+    };
+    std::unordered_map<const llvm::Function*, std::unique_ptr<llvm::DominatorTree>> dominatorTrees;
+    auto reportExpected = [&](const std::string& expected, const std::string& file,
+                              size_t line, size_t column, const auto& report)
+    {
+        expectedError = expected;
+        expectedErrorScopeDepth = SIZE_MAX;
+        activeExpectScope_ = 0;
+        try
+        {
+            ReportingFileScope fileScope(this, file, line, column);
+            report();
+        }
+        catch (const ExpectedErrorReceived&) {}
+        catch (...)
+        {
+            RestoreFileScopeExpectedError();
+            throw;
+        }
+        RestoreFileScopeExpectedError();
+    };
+
+    for (const auto& expectation : expectations)
+    {
+        std::vector<Candidate> candidates;
+        for (size_t i = 0; i < constCalls.size(); ++i)
+            if (constCalls[i].Owner == expectation.Scope)
+                candidates.push_back({ Kind::ConstReceiver, i, constCalls[i].File,
+                    constCalls[i].Line, constCalls[i].Column });
+        for (size_t i = 0; i < helperCalls.size(); ++i)
+            if (helperCalls[i].Owner == expectation.Scope)
+                candidates.push_back({ Kind::Helper, i, helperCalls[i].File,
+                    helperCalls[i].Line, helperCalls[i].Column });
+        for (size_t i = 0; i < closureSites.size(); ++i)
+            if (closureSites[i].Owner == expectation.Scope)
+                candidates.push_back({ Kind::Closure, i, closureSites[i].File,
+                    closureSites[i].Line, closureSites[i].Column });
+        // By-value owner pointers into a CFlat parameter whose store is proven once the IR is final.
+        for (size_t i = 0; i < deferredRawPointerCalleeStores_.size() && !aborted; ++i)
+        {
+            const auto& entry = deferredRawPointerCalleeStores_[i];
+            if (entry.Owner == expectation.Scope && entry.Refuse
+                && entry.Verdict == RawPointerStoreVerdict::Stores)
+                candidates.push_back({ Kind::RawStore, i, entry.File, entry.Line, entry.Column });
+        }
+        std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b)
+        {
+            if (a.File != b.File) return a.File < b.File;
+            if (a.Line != b.Line) return a.Line < b.Line;
+            if (a.Column != b.Column) return a.Column < b.Column;
+            return static_cast<int>(a.Type) < static_cast<int>(b.Type);
+        });
+
+        bool answered = false;
+        bool undecided = false;
+        for (const auto& candidate : candidates)
+        {
+            if (candidate.Type == Kind::ConstReceiver)
+            {
+                const auto& entry = constCalls[candidate.Index];
+                if (aborted) { readOnlyMethodMemo_.clear(); receiverFallbackConsults_ = 0; }
+                if (IsReadOnlyMethod(entry.Callee)) continue;
+                if (aborted && receiverFallbackConsults_ != 0) { undecided = true; continue; }
+                reportExpected(expectation.Expected, entry.File, entry.Line, entry.Column, [&]()
+                {
+                    LogError(PendingConstMessage(entry, readOnlyCauseMemo_));
+                });
+                answered = true;
+            }
+            else if (candidate.Type == Kind::Helper)
+            {
+                const auto& entry = helperCalls[candidate.Index];
+                const llvm::DominatorTree* dominatorTree = nullptr;
+                if (entry.IndirectTarget != nullptr)
+                {
+                    auto& tree = dominatorTrees[entry.IndirectCaller];
+                    if (!tree)
+                        tree = std::make_unique<llvm::DominatorTree>(
+                            *const_cast<llvm::Function*>(entry.IndirectCaller));
+                    dominatorTree = tree.get();
+                }
+                if (!OwningLocalBorrowingHelperRefuses(entry, dominatorTree)) continue;
+                reportExpected(expectation.Expected, entry.File, entry.Line, entry.Column, [&]()
+                {
+                    ReportOwningLocalBorrowingHelperRefusal(entry);
+                });
+                answered = true;
+            }
+            else if (candidate.Type == Kind::RawStore)
+            {
+                const auto& entry = deferredRawPointerCalleeStores_[candidate.Index];
+                reportExpected(expectation.Expected, entry.File, entry.Line, entry.Column, [&]()
+                {
+                    LogError(DescribeRawPointerCalleeStore(entry.ParamName));
+                });
+                answered = true;
+            }
+            else
+            {
+                const auto& site = closureSites[candidate.Index];
+                if (!ThisClosureSiteRefused(site)) continue;
+                reportExpected(expectation.Expected, site.File, site.Line, site.Column, [&]()
+                {
+                    ReportThisClosureCopySite(site);
+                });
+                answered = true;
+            }
+            if (answered) break;
+        }
+        if (answered) continue;
+
+        ReportingFileScope fileScope(this, expectation.File, expectation.Line, expectation.Column);
+        if (undecided)
+            std::cout << std::format("FAIL: expected error '{}' could not be decided: the compile stopped before every called body was emitted\n", expectation.Expected);
+        else
+            std::cout << std::format("FAIL: expected error '{}' did not occur\n", expectation.Expected);
+        if (diagnosticSink_)
+            throw CompilerAbortException{ "expected error did not occur", sourceFileName, currentLine, currentColumn };
+        FailCompilation("expected error did not occur");
+    }
+
+    if (aborted) return;
+    for (auto& entry : constCalls)
+        if (!deferredScopes.contains(entry.Owner)) pendingConstReceiverCalls_.push_back(std::move(entry));
+    for (auto& entry : helperCalls)
+        if (!deferredScopes.contains(entry.Owner)) owningLocalBorrowingHelperArgs_.push_back(std::move(entry));
+    for (auto& site : closureSites)
+        if (!deferredScopes.contains(site.Owner)) thisClosureCopySites_.push_back(std::move(site));
+    std::erase_if(deferredRawPointerCalleeStores_,
+                  [&](const auto& e) { return deferredScopes.contains(e.Owner); });
+}
+
 // `aborted`: an expected error ended the walk early. Only the deferred expectations are settled
 // (never dropped); a refusal that needed the no-body fallback cannot answer one.
 void LLVMBackend::ResolvePendingConstReceiverCalls(bool aborted)
 {
+    if (!aborted) ResolveRawPointerCalleeStoreVerdicts();
     std::vector<PendingConstReceiverCall> pending;
     pending.swap(pendingConstReceiverCalls_);
     std::vector<DeferredExpectation> expectations;
@@ -3588,6 +3821,25 @@ void LLVMBackend::ResolvePendingConstReceiverCalls(bool aborted)
             RestoreFileScopeExpectedError();
             answered = true;
         }
+        // By-value owner pointers into a CFlat parameter whose store is proven once the IR is final.
+        for (const auto& entry : deferredRawPointerCalleeStores_)
+        {
+            if (answered) break;
+            if (entry.Owner != expectation.Scope || aborted || !entry.Refuse
+                || entry.Verdict != RawPointerStoreVerdict::Stores)
+                continue;
+            expectedError = expectation.Expected;
+            expectedErrorScopeDepth = SIZE_MAX;
+            activeExpectScope_ = 0;
+            try
+            {
+                ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
+                LogError(DescribeRawPointerCalleeStore(entry.ParamName));
+            }
+            catch (const ExpectedErrorReceived&) {}
+            RestoreFileScopeExpectedError();
+            answered = true;
+        }
         if (answered) continue;
         ReportingFileScope fileScope(this, expectation.File, expectation.Line, expectation.Column);
         if (undecided)
@@ -3608,6 +3860,17 @@ void LLVMBackend::ResolvePendingConstReceiverCalls(bool aborted)
         if (deferredScopes.count(entry.Owner) != 0 || IsReadOnlyMethod(entry.Callee)) continue;
         ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
         LogError(PendingConstMessage(entry, readOnlyCauseMemo_));
+    }
+    // Module-level stored-to parameters (the record's Owner is no expect_error scope).
+    std::vector<DeferredRawPointerCalleeStore> rawEntries;
+    rawEntries.swap(deferredRawPointerCalleeStores_);
+    for (const auto& entry : rawEntries)
+    {
+        if (deferredScopes.count(entry.Owner) != 0 || !entry.Refuse
+            || entry.Verdict != RawPointerStoreVerdict::Stores)
+            continue;
+        ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
+        LogError(DescribeRawPointerCalleeStore(entry.ParamName));
     }
     std::vector<ThisClosureCopySite> sites;
     sites.swap(thisClosureCopySites_);

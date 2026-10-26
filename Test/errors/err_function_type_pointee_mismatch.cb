@@ -111,4 +111,115 @@ expect_error("no overload of 't427PickVoid2' matches the given arguments") {
     }
 }
 
-extern int main() { return 0; }
+int t500FromChar(char* p) { return 51; }
+int t500TakesCharCallback(function<int(char*)> cb) { return 52; }
+function<int(char*)> t500ReturnsCharCallback(int n) { return t500FromChar; }
+int t500GenericNested<T>(function<int(T)> cb, T value) { return 53; }
+
+expect_error("cannot bind function 't500TakesCharCallback'") {
+    void t500NestedVoidPointerMismatch() {
+        function<int(function<int(void*)>)> value = t500TakesCharCallback;
+    }
+}
+
+expect_error("cannot bind function 't500TakesCharCallback'") {
+    void t500NestedIntPointerMismatch() {
+        function<int(function<int(int*)>)> value = t500TakesCharCallback;
+    }
+}
+
+expect_error("cannot bind function 't500ReturnsCharCallback'") {
+    void t500NestedReturnMismatch() {
+        function<function<int(void*)>(int)> value = t500ReturnsCharCallback;
+    }
+}
+
+expect_error("cannot bind function 't500GenericNested") {
+    void t500GenericNestedMismatch() {
+        function<int(function<int(function<int(function<int(char*)>)>)>, function<int(function<int(char*)>)>)> value =
+            t500GenericNested<function<int(function<int(void*)>)>>;
+    }
+}
+
+int t500TakesFunctionCallback(function<int(char*)> cb) { return cb(nullptr); }
+int t500TakesLambdaCallback(Lambda<int(char*)> cb) { return cb(nullptr); }
+
+expect_error("cannot bind function 't500TakesFunctionCallback' to function-pointer type") {
+    void t500FunctionToLambdaSignatureMismatch() {
+        function<int(Lambda<int(char*)>)> value = t500TakesFunctionCallback;
+    }
+}
+
+expect_error("cannot bind function 't500TakesLambdaCallback' to function-pointer type") {
+    void t500LambdaToFunctionSignatureMismatch() {
+        function<int(function<int(char*)>)> value = t500TakesLambdaCallback;
+    }
+}
+
+Lambda<int(long)> t512Wide;
+Lambda<int(long)> t512GetWide() { return t512Wide; }
+int t512AddOne(int x) { return x + 1; }
+function<int(int)> t512GetThin() { return t512AddOne; }
+T t512RoundTrip<T>(T get) { return get; }
+T t512ReturnWide<T>() { return t512GetWide; }
+T t512ReturnThin<T>() { return t512GetThin; }
+
+extern int main()
+{
+    // Explicit generic callback arguments must check a named function's nested return signature.
+    expect_error("cannot bind function 't512GetWide'") {
+        function<Lambda<int(int)>()> slot =
+            t512RoundTrip<function<Lambda<int(int)>()>>(t512GetWide);
+    }
+    expect_error("cannot bind function 't512GetThin'") {
+        function<Lambda<int(int)>()> slot =
+            t512RoundTrip<function<Lambda<int(int)>()>>(t512GetThin);
+    }
+    expect_error("cannot bind function 't512GetWide'") {
+        function<Lambda<int(int)>()> slot =
+            t512ReturnWide<function<Lambda<int(int)>()>>();
+    }
+    expect_error("cannot bind function 't512GetThin'") {
+        function<Lambda<int(int)>()> slot =
+            t512ReturnThin<function<Lambda<int(int)>()>>();
+    }
+    return 0;
+}
+
+int t500TakesThinCallback(function<int(int)> cb) { return cb(5); }
+expect_error("cannot carry captured state") {
+    void t500CapturingLambdaThroughThinNestedSlot() {
+        int k = 3;
+        function<int(function<int(int)>)> slot = t500TakesThinCallback;
+        int r = slot((int x) => x + k);
+    }
+}
+
+expect_error("cannot bind function 't512GetWide'") {
+    void t512WideClosureReturnDeclaration() {
+        function<Lambda<int(int)>()> slot = t512GetWide;
+    }
+}
+expect_error("cannot bind function 't512GetThin'") {
+    void t512ThinReturnDeclaration() {
+        function<Lambda<int(int)>()> slot = t512GetThin;
+    }
+}
+expect_error("cannot bind function 't512GetWide'") {
+    void t512WideClosureReturnAssignment() {
+        function<Lambda<int(int)>()> slot;
+        slot = t512GetWide;
+    }
+}
+expect_error("cannot bind function 't512GetThin'") {
+    void t512ThinReturnAssignment() {
+        function<Lambda<int(int)>()> slot;
+        slot = t512GetThin;
+    }
+}
+expect_error("cannot bind function 't512GetWide'") {
+    struct T512WideClosureReturnField { function<Lambda<int(int)>()> get = t512GetWide; };
+}
+expect_error("cannot bind function 't512GetThin'") {
+    struct T512ThinReturnField { function<Lambda<int(int)>()> get = t512GetThin; };
+}

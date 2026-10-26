@@ -150,6 +150,12 @@
       "cpppoly.Shape",
       "cpppoly.Tagged"
     ],
+    "callthroughfunctionp...ainerselementuniquetfb2c6f922712c5d0": [
+      "f",
+      "n",
+      "f",
+      "n"
+    ],
     "calltoarg0arg1adoptp...rfacecannotbeadoptedc8edc9a7350dcd11": [
       "IAdoptErrorSink",
       "add",
@@ -2017,6 +2023,7 @@
     "baseinitializernames...utthebaseclassisarg1cd645a82a4640656": "base initializer names '{0}' but the base class is '{1}'",
     "builtinssourcenotfoundarg0": "builtins source not found: '{0}'.",
     "callthroughafunction...sitetopassthepointee5550b0e566872e76": "call through a function value: cannot pass a pointer as argument {0} - that parameter is a by-value slot and there is no implicit dereference. Write '*' at the call site to pass the pointee.",
+    "callthroughfunctionp...ainerselementuniquetfb2c6f922712c5d0": "call through function pointer '{0}': '{1}' still owns the object it was given, and the target stores this argument into a container that only BORROWS its elements and never frees them, so the stored element would dangle. Transfer the object with '{2}(move {3})', or declare the container's element 'unique T*'.",
     "calltoarg0adoptparam...rfacecannotbeadopted40dd336a21320a8f": "call to '{0}': adopt parameter '{1}' requires an owned interface local or a move-returning interface result; a unique local or borrowed interface cannot be adopted",
     "calltoarg0arg1adoptp...rfacecannotbeadoptedc8edc9a7350dcd11": "call to '{0}.{1}': adopt parameter '{2}' requires an owned interface local or a move-returning interface result; a unique local or borrowed interface cannot be adopted",
     "calltoarg0arg1cannot...retheparameterasarg67031961b50e1c046": "call to '{0}.{1}': cannot pass a pointer to by-value parameter '{2}' of type '{3}' - an address is not of type '{4}'. Dereference it with '{5}' at the call site, or declare the parameter as '{6}'.",

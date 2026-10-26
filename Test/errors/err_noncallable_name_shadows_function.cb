@@ -1,6 +1,8 @@
 T id<T>(T value) { return value; }
 int plainId(int value) { return value; }
 int wrap(int value) { return value; }
+int t511FreeGv(int value) { return value + 1; }
+int t511LambdaApply(function<int(int)> fn, int value) { return fn(value); }
 
 expect_error("is a variable of type 'int' and cannot be called; it hides function") {
     int t484LocalGeneric() { int id = 5; return id(4); }
@@ -31,4 +33,29 @@ expect_error("is a variable of type 'int' and cannot be called; it hides functio
 }
 expect_error("is a variable of type 'int' and cannot be called; it hides function") {
     namespace T484NonGenericGlobal { int plainId = 5; int call() { return plainId(3); } };
+}
+expect_error("is a variable of type 'int' and cannot be called; it hides function") {
+    int t504SelfInitializerCall() { int plainId = plainId(4); return plainId; }
+}
+expect_error("is a variable of type 'int' and cannot be called; it hides function") {
+    struct T504StaticMethodShadow
+    {
+        static int gv(int value) { return value + 1; }
+        int call() { int gv = 2; return gv(3); }
+    };
+}
+expect_error("is a variable of type 'int' and cannot be called; it hides function") {
+    struct T504StaticMethodStaticCallerShadow
+    {
+        static int gv(int value) { return value + 1; }
+        static int call() { int gv = 2; return gv(3); }
+    };
+}
+expect_error("is a variable of type 'int' and cannot be called; it hides function") {
+    int t511LambdaBodySelfInitializer()
+    {
+        int t511FreeGv = t511LambdaApply(
+            (int value) => { return t511FreeGv(value); }, 3);
+        return t511FreeGv;
+    }
 }

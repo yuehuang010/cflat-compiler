@@ -1,0 +1,238 @@
+// T496: floating-to-integer constructor arguments are refused in every syntax form.
+import cpp "cpp_t496_ctorf2i.hpp";
+import cpp "cpp_interop_explicit.h";
+extern int main() {
+    double t496Double = 2.75;
+    float t496Float = 4.75f;
+    expect_error("no implicit narrowing at a call") {
+        t496.ByInt* t496Value = new t496.ByInt(1.75);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.ByInt t496Value = t496.ByInt(1.75);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.ByInt(1.75).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.ByInt* t496Value = new t496.ByInt(t496Double);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.ByInt t496Value = t496.ByInt(t496Double);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.ByInt(t496Double).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.ByInt* t496Value = new t496.ByInt(3.75f);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.ByInt t496Value = t496.ByInt(3.75f);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.ByInt(3.75f).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.ByInt* t496Value = new t496.ByInt(t496Float);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.ByInt t496Value = t496.ByInt(t496Float);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.ByInt(t496Float).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.ByLong* t496Value = new t496.ByLong(1.75);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.ByLong t496Value = t496.ByLong(1.75);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.ByLong(1.75).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.ByLong* t496Value = new t496.ByLong(t496Double);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.ByLong t496Value = t496.ByLong(t496Double);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.ByLong(t496Double).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.ByLong* t496Value = new t496.ByLong(3.75f);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.ByLong t496Value = t496.ByLong(3.75f);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.ByLong(3.75f).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.ByLong* t496Value = new t496.ByLong(t496Float);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.ByLong t496Value = t496.ByLong(t496Float);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.ByLong(t496Float).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.CIntRef* t496Value = new t496.CIntRef(1.75);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.CIntRef t496Value = t496.CIntRef(1.75);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.CIntRef(1.75).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.CIntRef* t496Value = new t496.CIntRef(t496Double);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.CIntRef t496Value = t496.CIntRef(t496Double);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.CIntRef(t496Double).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.CIntRef* t496Value = new t496.CIntRef(3.75f);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.CIntRef t496Value = t496.CIntRef(3.75f);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.CIntRef(3.75f).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.CIntRef* t496Value = new t496.CIntRef(t496Float);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.CIntRef t496Value = t496.CIntRef(t496Float);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.CIntRef(t496Float).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.CLongRef* t496Value = new t496.CLongRef(1.75);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.CLongRef t496Value = t496.CLongRef(1.75);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.CLongRef(1.75).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.CLongRef* t496Value = new t496.CLongRef(t496Double);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.CLongRef t496Value = t496.CLongRef(t496Double);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.CLongRef(t496Double).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.CLongRef* t496Value = new t496.CLongRef(3.75f);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.CLongRef t496Value = t496.CLongRef(3.75f);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.CLongRef(3.75f).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.CLongRef* t496Value = new t496.CLongRef(t496Float);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.CLongRef t496Value = t496.CLongRef(t496Float);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.CLongRef(t496Float).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.RIntRef* t496Value = new t496.RIntRef(1.75);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.RIntRef t496Value = t496.RIntRef(1.75);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.RIntRef(1.75).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.RIntRef* t496Value = new t496.RIntRef(t496Double);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.RIntRef t496Value = t496.RIntRef(t496Double);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.RIntRef(t496Double).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.RIntRef* t496Value = new t496.RIntRef(3.75f);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.RIntRef t496Value = t496.RIntRef(3.75f);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.RIntRef(3.75f).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.RIntRef* t496Value = new t496.RIntRef(t496Float);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.RIntRef t496Value = t496.RIntRef(t496Float);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.RIntRef(t496Float).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.RLongRef* t496Value = new t496.RLongRef(1.75);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.RLongRef t496Value = t496.RLongRef(1.75);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.RLongRef(1.75).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.RLongRef* t496Value = new t496.RLongRef(t496Double);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.RLongRef t496Value = t496.RLongRef(t496Double);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.RLongRef(t496Double).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.RLongRef* t496Value = new t496.RLongRef(3.75f);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.RLongRef t496Value = t496.RLongRef(3.75f);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.RLongRef(3.75f).f();
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.RLongRef* t496Value = new t496.RLongRef(t496Float);
+    }
+    expect_error("no implicit narrowing at a call") {
+        t496.RLongRef t496Value = t496.RLongRef(t496Float);
+    }
+    expect_error("no implicit narrowing at a call") {
+        int t496Value = t496.RLongRef(t496Float).f();
+    }
+    double c6Double = 1.5;
+    float c6Float = 1.5f;
+    expect_error("no implicit narrowing at a call") {
+        c6r3.Rf* c6RfDouble = new c6r3.Rf(c6Double);
+    }
+    expect_error("no implicit narrowing at a call") {
+        c6r3.Rf* c6RfFloat = new c6r3.Rf(c6Float);
+    }
+    expect_error("no implicit narrowing at a call") {
+        c6r3.Rr* c6RrDouble = new c6r3.Rr(c6Double);
+    }
+    expect_error("no implicit narrowing at a call") {
+        c6r3.Rr* c6RrFloat = new c6r3.Rr(c6Float);
+    }
+    return 0;
+}

@@ -1,0 +1,3 @@
+expect_error("redefinition of 'Dup'");
+struct Dup { int value = 1; };
+struct Dup { int value = 2; };

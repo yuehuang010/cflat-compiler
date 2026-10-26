@@ -43,7 +43,7 @@
 //   An opaque union field preserves the size/alignment of an unrequested class-template
 //     specialization when the enclosing record is returned.
 //   Free C++ operator overloads are found through the operand namespace, including a nested
-//     namespace, and compound assignment falls back to '+'.
+//     namespace; compound assignments bind the written C++ operator@=.
 //   A C++ reference return bound to a CFlat pointer local with no '&', in the declaration and
 //     the assignment form, and proven to alias the referent rather than a copy.
 //   Fixed-array pointer ABI, bool and class-typed member defaults, record conversion
@@ -228,6 +228,7 @@
 //     list/dictionary values are not destroyed, unique list values are, and Box<T> stores T*.
 
 import cpp "library/cpp_interop_basic.h";
+import cpp "library/cpp_t497_compound.hpp";
 import cpp "library/t414_fnmove.hpp";
 import cpp "library/cpp_t322_constretcv.hpp";
 import cpp "library/cpp_t337_constretcv_umbrella.hpp";
@@ -280,6 +281,7 @@ import cpp "library/cpp_t22_constrained_members.hpp";
 import cpp "library/cpp_interop_demand_fail.h";
 import cpp "library/cpp_interop_anon.h";
 import cpp "library/cpp_interop_explicit.h";
+import cpp "library/cpp_t496_ctorf2i.hpp";
 import cpp "library/cpp_t253_brace_move.hpp";
 import cpp "library/cpp_t261_named_unwind.hpp";
 import cpp "library/cpp_t470_braceunwind.hpp";
@@ -348,6 +350,7 @@ void CxxDerefPointer(cpp_derefcopy.Cursor16* value, int x) { **value = x; **valu
 // C++ REFERENCE data members - an alias of the referent (M97/M98), never reseatable.
 import cpp "library/cpp_interop_ref_member.h";
 import cpp "library/cpp_interop_ref_alias.h";
+import cpp "library/cpp_t495_amppick.hpp";
 import cpp "library/cpp_interop_field.h";
 // Array elements of a C++ class.
 import cpp "library/cpp_interop_arrayelem.h";
@@ -430,6 +433,8 @@ import cpp "library/cpp_t34_traits_static.hpp";
 import cpp "library/t17_empty_return.hpp";
 import cpp "memory";
 import cpp "library/cpp_t46_smartdot.hpp";
+import cpp "library/cpp_interop_uniqueptr.h";
+import cpp "library/cpp_t492_fieldmove.hpp";
 
 std.optional<std.string> t9MakeStringOptional()
 { return std.optional<std.string>(std.string("xyz")); }
@@ -1920,6 +1925,10 @@ int T46ConstRefDot(const cpp_t46.Ptr<cpp_t46.Item>* p) { return p.get() == nullp
 int T46GenericUniqueDot<T>(T* p) { return p.get() == nullptr ? 1 : 0; }
 int T46UniqueRefDot(std.unique_ptr<cpp_t46.Item>* p) { return p.get() == nullptr ? 1 : 0; }
 int T46UniqueConstRefDot(const std.unique_ptr<cpp_t46.Item>* p) { return p.get() == nullptr ? 1 : 0; }
+struct T492UniqueHolder { unique cpuq.Widget* w = default; };
+struct T492UniqueMid { T492UniqueHolder b = default; };
+struct T492UniqueOuter { T492UniqueMid a = default; };
+struct T492CountHost { cppt492.Counted item = default; };
 // T36: pointer arithmetic over a field, a global and a parameter keeps its pointee at C++
 // template deduction (t27ptr.kind: 2 = int*, clang oracle).
 struct T36Holder { int* p = nullptr; };
@@ -2220,6 +2229,18 @@ struct T470Arg {
 int t470Take2(T470Arg w, int y) { return w.z + y; }
 int t470CallLaterNamed(int x) { return t470Take2(w: { z = 1 }, y: t470.bval(x)); }
 int t470CallLaterPositional(int x) { return t470Take2({ z = 1 }, t470.bval(x)); }
+// T508: a heap `new` brace override whose replacement throws frees the block and destroys the built object.
+struct T508Heap { t470.TC t; t470.Counted c; int z = 0; T508Heap() { z = 3; } };
+int t508HeapNew(int x) {
+    t470.TC source = default;
+    source.value = 8;
+    t470.set_throw(x);
+    T508Heap* v = new T508Heap { t = source };
+    t470.set_throw(0);
+    int r = v->t.value * 10 + v->z;
+    delete v;
+    return r;
+}
 // T313: the element block of a tag form (or `new T{...}`) whose attribute throws is freed once,
 // through the operator new/delete pair it came from: the user pair when the struct declares one.
 int t313UnNew = 0;
@@ -4352,6 +4373,130 @@ extern int main()
     if (cpp_t46.item_get_calls() != 3 || cpp_t46.item_reset_calls() != 1
         || cpp_t46.holder_get_calls() != 4 || cpp_t46.holder_reset_calls() != 1)
         return 46005;
+
+    // T492: move-assignment from a C++ field path calls operator= and consumes that path.
+    cpuq.reset_counts();
+    {
+        T492UniqueHolder dst = default; T492UniqueHolder src = default;
+        dst.w = cpuq.make(4920); src.w = cpuq.make(4921);
+        auto sourceSlot = &src.w;
+        dst.w = move src.w;
+        if (cpuq.peek(dst.w) != 4921 || !cppt492.unique_is_null(sourceSlot)
+            || cpuq.ctors() != 2 || cpuq.dtors() != 1) return 49201;
+    }
+    if (cpuq.dtors() != 2) return 49202;
+    cpuq.reset_counts();
+    {
+        T492UniqueHolder src = default;
+        src.w = cpuq.make(4923);
+        auto sourceSlot = &src.w;
+        unique cpuq.Widget* dst = default;
+        dst = move src.w;
+        if (cpuq.peek(dst) != 4923 || !cppt492.unique_is_null(sourceSlot)) return 49203;
+    }
+    if (cpuq.ctors() != 1 || cpuq.dtors() != 1) return 49204;
+    cpuq.reset_counts();
+    {
+        T492UniqueHolder dst = default; T492UniqueHolder src = default;
+        T492UniqueHolder* dstPtr = &dst;
+        src.w = cpuq.make(4925);
+        auto sourceSlot = &src.w;
+        dstPtr->w = move src.w;
+        if (cpuq.peek(dstPtr->w) != 4925 || !cppt492.unique_is_null(sourceSlot)) return 49205;
+    }
+    if (cpuq.ctors() != 1 || cpuq.dtors() != 1) return 49206;
+    cpuq.reset_counts();
+    {
+        T492UniqueHolder dst = default; T492UniqueHolder src = default;
+        T492UniqueHolder* srcPtr = &src;
+        src.w = cpuq.make(4927);
+        auto sourceSlot = &srcPtr->w;
+        dst.w = move srcPtr->w;
+        if (cpuq.peek(dst.w) != 4927 || !cppt492.unique_is_null(sourceSlot)) return 49207;
+    }
+    if (cpuq.ctors() != 1 || cpuq.dtors() != 1) return 49208;
+    cpuq.reset_counts();
+    {
+        T492UniqueHolder dst = default; T492UniqueOuter src = default;
+        src.a.b.w = cpuq.make(4929);
+        auto sourceSlot = &src.a.b.w;
+        dst.w = move src.a.b.w;
+        if (cpuq.peek(dst.w) != 4929 || !cppt492.unique_is_null(sourceSlot)) return 49209;
+    }
+    if (cpuq.ctors() != 1 || cpuq.dtors() != 1) return 49210;
+    cpuq.reset_counts();
+    {
+        T492UniqueHolder dst = default; T492UniqueHolder[2] src = default;
+        src[1].w = cpuq.make(49211);
+        auto sourceSlot = &src[1].w;
+        dst.w = move src[1].w;
+        if (cpuq.peek(dst.w) != 49211 || !cppt492.unique_is_null(sourceSlot)) return 49211;
+    }
+    if (cpuq.ctors() != 1 || cpuq.dtors() != 1) return 49212;
+    cpuq.reset_counts();
+    {
+        T492UniqueHolder dst = default; T492UniqueHolder[2] src = default;
+        int i = 1;
+        src[i].w = cpuq.make(49213);
+        auto sourceSlot = &src[i].w;
+        dst.w = move src[i].w;
+        if (cpuq.peek(dst.w) != 49213 || !cppt492.unique_is_null(sourceSlot)) return 49213;
+    }
+    if (cpuq.ctors() != 1 || cpuq.dtors() != 1) return 49214;
+    cpuq.reset_counts();
+    {
+        T492UniqueHolder self = default;
+        self.w = cpuq.make(49215);
+        auto sourceSlot = &self.w;
+        self.w = move self.w;
+        if (cpuq.peek(self.w) != 49215 || cppt492.unique_is_null(sourceSlot)
+            || cpuq.dtors() != 0) return 49215;
+    }
+    if (cpuq.ctors() != 1 || cpuq.dtors() != 1) return 49216;
+    expect_error("cannot copy-assign C++ class 'std.unique_ptr<cpuq.Widget>'") {
+        T492UniqueHolder dst = default; T492UniqueHolder src = default;
+        dst.w = src.w;
+    }
+    expect_error("use of moved variable 'src.w'") {
+        T492UniqueHolder dst = default; T492UniqueHolder src = default;
+        src.w = cpuq.make(49217);
+        dst.w = move src.w;
+        int read = cpuq.peek(src.w);
+    }
+
+    cppt492.reset();
+    {
+        T492CountHost dst = default; T492CountHost src = default;
+        dst.item.value = 49218; src.item.value = 49219;
+        auto source = &src.item;
+        cppt492.reset();
+        dst.item = move src.item;
+        if (dst.item.value != 49219 || cppt492.counted_value(source) != -1
+            || cppt492.ctors() != 0 || cppt492.copies() != 0 || cppt492.moves() != 0
+            || cppt492.copy_assigns() != 0 || cppt492.move_assigns() != 1
+            || cppt492.dtors() != 0) return 49218;
+    }
+    if (cppt492.dtors() != 2) return 49219;
+    cppt492.reset();
+    {
+        T492CountHost dst = default; T492CountHost src = default;
+        dst.item.value = 49220; src.item.value = 49221;
+        auto source = &src.item;
+        cppt492.reset();
+        dst.item = src.item;
+        if (dst.item.value != 49221 || cppt492.counted_value(source) != 49221
+            || cppt492.ctors() != 0 || cppt492.copies() != 0 || cppt492.moves() != 0
+            || cppt492.copy_assigns() != 1 || cppt492.move_assigns() != 0
+            || cppt492.dtors() != 0) return 49220;
+    }
+    if (cppt492.dtors() != 2) return 49221;
+    {
+        // `move *p` moves the pointee; `p` itself stays usable (C++: counted_value(p) reads the moved-from -1).
+        cppt492.Counted s = default; s.value = 4; auto p = &s;
+        cppt492.Counted a = default;
+        a = move *p;
+        if (cppt492.counted_value(p) != -1 || a.value != 4) return 49222;
+    }
 
     // T35: member-template names defer to the receiver.
     cpi_t35.shared_ptr<int> t35a = default; t35a.owner = 1;
@@ -7469,8 +7614,6 @@ extern int main()
     if (freeopSum.value != 5)                           return 801;
     if (!(freeopA == freeopA))                             return 802;
     if (freeopA == freeopB)                               return 803;
-    freeopA += freeopB;
-    if (freeopA.value != 5)                             return 804;
     cppi.freeops.FreeArithmetic freeopNestedA = default;
     cppi.freeops.FreeArithmetic freeopNestedB = default;
     freeopNestedA.value = 4;
@@ -7478,6 +7621,22 @@ extern int main()
     cppi.freeops.FreeArithmetic freeopNestedSum = freeopNestedA + freeopNestedB;
     if (freeopNestedSum.value != 10)                   return 805;
     if (!(freeopNestedA == freeopNestedA))                 return 806;
+
+    // Distinct compound and binary values prove the written member/free operator ran.
+    cpp_t497.MemberAssign t497Member = cpp_t497.MemberAssign(2);
+    t497Member += 3;
+    if (t497Member.value != 15)                         return 49701;
+    cpp_t497.FreeAssign t497Free = default;
+    t497Free.value = 2;
+    t497Free += 3;
+    if (t497Free.value != 15)                           return 49702;
+    int t497RightValue = 2;
+    cpp_t497.RightAssign t497Right = default;
+    t497Right.value = 3;
+    t497RightValue += t497Right;
+    if (t497RightValue != 25)                           return 49703;
+    cpp_t497.r2.mkMA() += 3;
+    if (cpp_t497.r2.getMemberHits() != 1)                return 49704;
 
     // ---- fixed-array pointer ABI and class-typed member defaults --------------------------------
     char[4] t6Text = { 'a', 'b', 'c', 0 };
@@ -8521,6 +8680,64 @@ extern int main()
     t131AddrHeap->p = &t131X;
     if (t131AddrHeapPtr != &t131X)                     return 1910;
     delete t131AddrHeap;
+
+    // T495: `&p` stays a pointer value when C++ has a viable value-taking overload.
+    int t495Y = 9; int* t495Ptr = &t495Y;
+    cppamp.CtorTemplate t495Tpl = cppamp.CtorTemplate(&t495Ptr);
+    if (t495Tpl.get() != cppamp.oracleCtorTemplateDecl()) return 1920;
+    auto t495TplAuto = cppamp.CtorTemplate(&t495Ptr);
+    if (t495TplAuto.get() != cppamp.oracleCtorTemplateAuto()) return 1921;
+    cppamp.CtorTemplate* t495TplNew = new cppamp.CtorTemplate(&t495Ptr);
+    if (t495TplNew.get() != cppamp.oracleCtorTemplateNew()) return 1922;
+    delete t495TplNew;
+    if (cppamp.CtorTemplate(&t495Ptr).get() != cppamp.oracleCtorTemplatePostfix()) return 1923;
+
+    cppamp.CtorVoid t495Void = cppamp.CtorVoid(&t495Ptr);
+    if (t495Void.get() != cppamp.oracleCtorVoidDecl()) return 1924;
+    cppamp.CtorVoid* t495VoidNew = new cppamp.CtorVoid(&t495Ptr);
+    if (t495VoidNew.get() != cppamp.oracleCtorVoidNew()) return 1925;
+    delete t495VoidNew;
+    if (cppamp.CtorBool(&t495Ptr).get() != cppamp.oracleCtorBool()) return 1926;
+    if (cppamp.CtorConstVoid(&t495Ptr).get() != cppamp.oracleCtorConstVoid()) return 1927;
+    if (cppamp.CtorPointerConst(&t495Ptr).get() != cppamp.oracleCtorPointerConst()) return 1928;
+    if (cppamp.CtorExact(&t495Ptr).get() != cppamp.oracleCtorExact()) return 1929;
+
+    if (cppamp.freeTemplate(&t495Ptr) != cppamp.oracleFreeTemplate()) return 1930;
+    if (cppamp.freeVoid(&t495Ptr) != cppamp.oracleFreeVoid()) return 1931;
+    if (cppamp.freeBool(&t495Ptr) != cppamp.oracleFreeBool()) return 1932;
+    if (cppamp.freeConstVoid(&t495Ptr) != cppamp.oracleFreeConstVoid()) return 1933;
+    if (cppamp.freePointerConst(&t495Ptr) != cppamp.oracleFreePointerConst()) return 1934;
+    if (cppamp.freeExact(&t495Ptr) != cppamp.oracleFreeExact()) return 1935;
+    cppamp.Methods t495Methods = default;
+    if (t495Methods.pickVoid(&t495Ptr) != cppamp.oracleMethodVoid()) return 1937;
+    if (t495Methods.pickBool(&t495Ptr) != cppamp.oracleMethodBool()) return 1938;
+    if (t495Methods.pickConstVoid(&t495Ptr) != cppamp.oracleMethodConstVoid()) return 1939;
+    if (t495Methods.pickPointerConst(&t495Ptr) != cppamp.oracleMethodPointerConst()) return 1940;
+    if (t495Methods.pickExact(&t495Ptr) != cppamp.oracleMethodExact()) return 1941;
+
+    // No value-taking overload: `&p` falls back to the CFlat slot binding for C++ references.
+    int t495SlotY = 9; int* t495SlotPtr = &t495SlotY;
+    cppamp.SlotOnly t495Slot = cppamp.SlotOnly(&t495SlotPtr);
+    if (t495Slot.get() != cppamp.oracleSlotCtor()) return 1942;
+    int t495SlotAutoY = 9; int* t495SlotAutoPtr = &t495SlotAutoY;
+    auto t495SlotAuto = cppamp.SlotOnly(&t495SlotAutoPtr);
+    if (t495SlotAuto.get() != cppamp.oracleSlotCtor()) return 1943;
+    int t495SlotNewY = 9; int* t495SlotNewPtr = &t495SlotNewY;
+    cppamp.SlotOnly* t495SlotNew = new cppamp.SlotOnly(&t495SlotNewPtr);
+    if (t495SlotNew.get() != cppamp.oracleSlotCtor()) return 1944;
+    delete t495SlotNew;
+    int t495SlotPostY = 9; int* t495SlotPostPtr = &t495SlotPostY;
+    if (cppamp.SlotOnly(&t495SlotPostPtr).get() != cppamp.oracleSlotCtor()) return 1945;
+    int t495FreeY = 9; int* t495FreePtr = &t495FreeY;
+    int t495FreeResult = cppamp.freeSlot(&t495FreePtr);
+    if (t495FreeResult + (t495FreePtr == nullptr ? 10 : 0) != cppamp.oracleFreeSlot()) return 1946;
+    int t495MethodY = 9; int* t495MethodPtr = &t495MethodY;
+    int t495MethodResult = t495Methods.pickSlot(&t495MethodPtr);
+    if (t495MethodResult + (t495MethodPtr == nullptr ? 10 : 0) != cppamp.oracleMethodSlot()) return 1947;
+    // A non-address argument must be viable too: Multi(void*, const char*) cannot take 7, so &p binds the slot.
+    int t495MultiY = 9; int* t495MultiPtr = &t495MultiY;
+    cppamp.Multi t495Multi = cppamp.Multi(&t495MultiPtr, 7);
+    if (t495Multi.get() + (t495MultiPtr == nullptr ? 10 : 0) != cppamp.oracleMulti()) return 1948;
 
     // ---- a C++ field whose type is a CLASS ------------------------------------------------------
     // Pre-fix every leg below failed to COMPILE ("Undefined variable ..." / "no overload of
@@ -11328,6 +11545,106 @@ extern int main()
         // Two arguments: better on one and no worse on the other wins.
         if (cppcr.RkTwo(rkInt, rkLong).chosen != 1)                  return 31813;
         if (cppcr.RkTwo(rkLong, rkInt).chosen != 2)                  return 31814;
+    }
+    {
+        // T502: unscoped enum promotions beat conversions across every call form; exact enum wins too.
+        cppcr.T502CtorUId t502UId = cppcr.T502CtorUId(cppcr.T502UGreen);
+        if (t502UId.chosen != 1) return 50200;
+        if (cppcr.T502CtorUId(cppcr.T502UGreen).chosen != 1) return 50201;
+        cppcr.T502CtorUId* t502UIdNew = new cppcr.T502CtorUId(cppcr.T502UGreen);
+        if (t502UIdNew->chosen != 1) return 50202;
+        delete t502UIdNew;
+        if (cppcr.T502FnUId(cppcr.T502UGreen) != 1) return 50203;
+        cppcr.T502ObjUId t502UIdObj = default;
+        if (t502UIdObj.method(cppcr.T502UGreen) != 1) return 50204;
+
+        cppcr.T502CtorUil t502Uil = cppcr.T502CtorUil(cppcr.T502UGreen);
+        if (t502Uil.chosen != 1) return 50205;
+        if (cppcr.T502CtorUil(cppcr.T502UGreen).chosen != 1) return 50206;
+        cppcr.T502CtorUil* t502UilNew = new cppcr.T502CtorUil(cppcr.T502UGreen);
+        if (t502UilNew->chosen != 1) return 50207;
+        delete t502UilNew;
+        if (cppcr.T502FnUil(cppcr.T502UGreen) != 1) return 50208;
+        cppcr.T502ObjUil t502UilObj = default;
+        if (t502UilObj.method(cppcr.T502UGreen) != 1) return 50209;
+
+        cppcr.T502CtorUbi t502Ubi = cppcr.T502CtorUbi(cppcr.T502UGreen);
+        if (t502Ubi.chosen != 2) return 50210;
+        if (cppcr.T502CtorUbi(cppcr.T502UGreen).chosen != 2) return 50211;
+        cppcr.T502CtorUbi* t502UbiNew = new cppcr.T502CtorUbi(cppcr.T502UGreen);
+        if (t502UbiNew->chosen != 2) return 50212;
+        delete t502UbiNew;
+        if (cppcr.T502FnUbi(cppcr.T502UGreen) != 2) return 50213;
+        cppcr.T502ObjUbi t502UbiObj = default;
+        if (t502UbiObj.method(cppcr.T502UGreen) != 2) return 50214;
+
+        cppcr.T502CtorUui t502Uui = cppcr.T502CtorUui(cppcr.T502UGreen);
+        if (t502Uui.chosen != 2) return 50215;
+        if (cppcr.T502CtorUui(cppcr.T502UGreen).chosen != 2) return 50216;
+        cppcr.T502CtorUui* t502UuiNew = new cppcr.T502CtorUui(cppcr.T502UGreen);
+        if (t502UuiNew->chosen != 2) return 50217;
+        delete t502UuiNew;
+        if (cppcr.T502FnUui(cppcr.T502UGreen) != 2) return 50218;
+        cppcr.T502ObjUui t502UuiObj = default;
+        if (t502UuiObj.method(cppcr.T502UGreen) != 2) return 50219;
+
+        cppcr.T502CtorUExact t502UExact = cppcr.T502CtorUExact(cppcr.T502UGreen);
+        if (t502UExact.chosen != 2) return 50220;
+        if (cppcr.T502CtorUExact(cppcr.T502UGreen).chosen != 2) return 50221;
+        cppcr.T502CtorUExact* t502UExactNew = new cppcr.T502CtorUExact(cppcr.T502UGreen);
+        if (t502UExactNew->chosen != 2) return 50222;
+        delete t502UExactNew;
+        if (cppcr.T502FnUExact(cppcr.T502UGreen) != 2) return 50223;
+        cppcr.T502ObjUExact t502UExactObj = default;
+        if (t502UExactObj.method(cppcr.T502UGreen) != 2) return 50224;
+
+        // Scoped enums stay exact-only; these five calls prove their exact overload remains usable.
+        cppcr.T502CtorSExact t502SExact = cppcr.T502CtorSExact(cppcr.T502SColor.Green);
+        if (t502SExact.chosen != 2) return 50225;
+        if (cppcr.T502CtorSExact(cppcr.T502SColor.Green).chosen != 2) return 50226;
+        cppcr.T502CtorSExact* t502SExactNew = new cppcr.T502CtorSExact(cppcr.T502SColor.Green);
+        if (t502SExactNew->chosen != 2) return 50227;
+        delete t502SExactNew;
+        if (cppcr.T502FnSExact(cppcr.T502SColor.Green) != 2) return 50228;
+        cppcr.T502ObjSExact t502SExactObj = default;
+        if (t502SExactObj.method(cppcr.T502SColor.Green) != 2) return 50229;
+    }
+    {
+        // T496's frozen accept set: float candidates, int-to-float, and pointer-to-bool.
+        double t496Double = 2.75;
+        if (t496.NF(1.75).f() != 2201) return 31900;
+        t496.NF t496NfLiteral = t496.NF(1.75);
+        if (t496NfLiteral.f() != 2201) return 31901;
+        t496.NF* t496NfLiteralNew = new t496.NF(1.75);
+        if (t496NfLiteralNew->f() != 2201) return 31902;
+        delete t496NfLiteralNew;
+        if (t496.NF(t496Double).f() != 2202) return 31903;
+        t496.NF t496NfLocal = t496.NF(t496Double);
+        if (t496NfLocal.f() != 2202) return 31904;
+        t496.NF* t496NfLocalNew = new t496.NF(t496Double);
+        if (t496NfLocalNew->f() != 2202) return 31905;
+        delete t496NfLocalNew;
+        int t496Int = 6;
+        if (t496.IntToFloat(5).f() != 2305) return 31910;
+        t496.IntToFloat t496FloatLiteral = t496.IntToFloat(5);
+        if (t496FloatLiteral.f() != 2305) return 31911;
+        t496.IntToFloat* t496FloatLiteralNew = new t496.IntToFloat(5);
+        if (t496FloatLiteralNew->f() != 2305) return 31912;
+        delete t496FloatLiteralNew;
+        if (t496.IntToFloat(t496Int).f() != 2306) return 31913;
+        t496.IntToFloat t496FloatLocal = t496.IntToFloat(t496Int);
+        if (t496FloatLocal.f() != 2306) return 31914;
+        t496.IntToFloat* t496FloatLocalNew = new t496.IntToFloat(t496Int);
+        if (t496FloatLocalNew->f() != 2306) return 31915;
+        delete t496FloatLocalNew;
+        int t496Target = 6;
+        int* t496Ptr = &t496Target;
+        if (t496.PtrToBool(t496Ptr).f() != 2401) return 31920;
+        t496.PtrToBool t496Bool = t496.PtrToBool(t496Ptr);
+        if (t496Bool.f() != 2401) return 31921;
+        t496.PtrToBool* t496BoolNew = new t496.PtrToBool(t496Ptr);
+        if (t496BoolNew->f() != 2401) return 31922;
+        delete t496BoolNew;
     }
     {
         // A function PARAMETER is an lvalue inside the callee.
@@ -18702,6 +19019,21 @@ int LoweredUserDtorAssignLegs(int argc)
     t258A = t470.guarded(t470CallLaterPositional, 0);
     if (t258A != 1 || t470ArgBuilt != 1 || t470Built != 1
         || t470Destroyed != 1 || t470ArgDestroyed != 1) return 25439;
+    // T508: the throwing heap override frees its block (heap audit) and destroys the built object.
+    HeapAudit.enable();
+    int t508HeapBase = (int)HeapAudit.reportLeaks();
+    t470.reset();
+    t258A = t470.guarded(t508HeapNew, 1);
+    if (t258A != -7 || t470.live() != 0 || t470.countedLive() != 0 || t470.tcLive() != 0) return 29610;
+    t470.reset();
+    t258A = t470.guarded(t508HeapNew, 0);
+    if (t258A != 83 || t470.live() != 0 || t470.countedLive() != 0 || t470.tcLive() != 0) return 29611;
+    if ((int)HeapAudit.reportLeaks() != t508HeapBase) return 29613;
+    // T508: nested replacement `Outer.u.t` with a throwing copy destroys each built object once.
+    t470.reset();
+    t258A = t470.guarded(t470NestedReplace, 1);
+    if (t258A != -7 || t470.copyAttempts() != 1 || t470.live() != 0 || t470.countedLive() != 0
+        || t470.tcLive() != 0 || t470.ctors() + t470.copies() + t470.moves() != t470.dtors()) return 29612;
     // T313: a tag-form block freed when an attribute throws (heap audit: no leak), then the user pair.
     HeapAudit.enable();
     int t313Base = (int)HeapAudit.reportLeaks();

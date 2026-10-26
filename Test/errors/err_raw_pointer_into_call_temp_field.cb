@@ -5,6 +5,36 @@ struct T426Inner { int* heap = nullptr; };
 struct T426Owner { int value = 7; int* heap = nullptr; T426Inner inner; ~T426Owner() { t426Dtors = t426Dtors + 1; } };
 using T426Ptr = int*;
 unique<T426Owner> t426Mk() { T426Owner* r = new T426Owner(); r->heap = &r->value; r->inner.heap = &r->value; return unique<T426Owner>(r); }
+int* t426Echo(int* p) { return p; }
+int* t426Id(int* p) { return p; }
+int* t426Saved = nullptr;
+void t426Use2(int* p) { t426Saved = p; }
+void t426Put(int** o, int* p) { *o = p; }
+struct T426Sink { int* q = nullptr; };
+int t426ValueDtors = 0;
+struct T426ByValue { int* heap = nullptr; T426ByValue() { heap = new int(7); } ~T426ByValue() { t426ValueDtors = t426ValueDtors + 1; delete heap; } };
+T426ByValue t426Mk2() { return T426ByValue(); }
+int* t510r5Gp = nullptr;
+void t510r5St(int* p) { t510r5Gp = p; }
+void t510r5Chain(int* p) { t510r5St(p); }
+void t510r5Local(int* p) { T426Sink s; s.q = p; t426Saved = s.q; }
+void t510r5Arr(int* p) { int*[2] arr; arr[0] = p; t426Saved = arr[0]; }
+struct T510R7Pair { int* q = nullptr; int* r = nullptr; };
+void t510r7Save(int** a) { t426Saved = a[1]; }
+void t510r7Array(int* p) { int*[2] arr; arr[0] = nullptr; arr[1] = p; t510r7Save(&arr[0]); }
+void t510r7Decay(int* p) { int*[2] arr; arr[0] = nullptr; arr[1] = p; t510r7Save(arr); }
+void t510r7Shift(T510R7Pair* s, int n) { if (n == 0) { t426Saved = s->q; return; } T510R7Pair t; t.q = s->r; t.r = s->q; t510r7Shift(&t, n - 1); }
+void t510r7Rec(int* p) { T510R7Pair s; s.r = p; t510r7Shift(&s, 1); }
+T510R7Pair* t510r7Id(T510R7Pair* s) { return s; }
+void t510r7Returned(int* p) { T510R7Pair s; s.q = p; t426Saved = t510r7Id(&s)->q; }
+void t510r9Put(int** out, int* p) { *out = p; }
+void t510r9OutThenGlobal(int* p) { int* x = nullptr; t510r9Put(&x, p); t426Saved = x; }
+void t510r9Cp(T510R7Pair* s) { s->r = s->q; }
+void t510r9CopyThenGlobal(int* p) { T510R7Pair s; s.q = p; t510r9Cp(&s); t426Saved = s.r; }
+
+expect_error("cannot bind raw pointer 'return value' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+    int* t426ReturnEcho() { return t426Echo(t426Mk()->heap); }
+}
 
 void t426StaticLocal()
 {
@@ -59,7 +89,82 @@ extern int main()
         int* p = &(t426Mk())->value;
     }
     expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        int* p = t426Echo(t426Mk()->heap);
+    }
+    expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        int* p = t426Id(t426Mk()->heap) + 1;
+    }
+    expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        int* p = nullptr;
+        p = t426Echo(t426Mk()->heap);
+    }
+    expect_error("cannot bind raw pointer 't426Saved' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        t426Saved = t426Echo(t426Mk()->heap);
+    }
+    expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        int* p = t426Echo(t426Mk2().heap);
+    }
+    expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
         int* p = t426Mk()->heap + 0;
+    }
+    expect_error("cannot pass raw pointer from an owning temporary to parameter 'p'") {
+        t426Use2(t426Echo(t426Mk()->heap));
+    }
+    expect_error("cannot pass raw pointer from an owning temporary to parameter 'p'") {
+        int* p = nullptr;
+        t426Put(&p, t426Echo(t426Mk()->heap));
+    }
+    expect_error("cannot bind raw pointer 'q'") {
+        T426Sink s;
+        s.q = t426Echo(t426Mk()->heap);
+    }
+    expect_error("cannot bind raw pointer 'array element'") {
+        int*[2] arr;
+        arr[0] = t426Echo(t426Mk()->heap);
+    }
+    expect_error("cannot bind raw pointer 'o'") {
+        int* p = nullptr;
+        int** o = &p;
+        *o = t426Echo(t426Mk()->heap);
+    }
+    expect_error("cannot bind raw pointer 'q'") {
+        T426Sink t = { q = t426Echo(t426Mk()->heap) };
+    }
+    expect_error("cannot pass raw pointer from an owning temporary to parameter 'p'") {
+        t426Use2(t426Mk2().heap);
+    }
+    expect_error("cannot pass raw pointer from an owning temporary to parameter 'p'") {
+        t510r5Chain(t426Mk2().heap);
+    }
+    expect_error("cannot pass raw pointer from an owning temporary to parameter 'p'") {
+        t510r5Local(t426Mk2().heap);
+    }
+    expect_error("cannot pass raw pointer from an owning temporary to parameter 'p'") {
+        t510r5Arr(t426Mk2().heap);
+    }
+    expect_error("cannot pass raw pointer from an owning temporary to parameter 'p'") {
+        t510r5Later(t426Mk2().heap);
+    }
+    expect_error("cannot pass raw pointer from an owning temporary to parameter 'p'") {
+        t510r7Array(t426Mk2().heap);
+    }
+    expect_error("cannot pass raw pointer from an owning temporary to parameter 'p'") {
+        t510r7Decay(t426Mk2().heap);
+    }
+    expect_error("cannot pass raw pointer from an owning temporary to parameter 'p'") {
+        t510r7Rec(t426Mk2().heap);
+    }
+    expect_error("cannot pass raw pointer from an owning temporary to parameter 'p'") {
+        t510r7Returned(t426Mk2().heap);
+    }
+    expect_error("cannot pass raw pointer from an owning temporary to parameter 'p'") {
+        t510r9OutThenGlobal(t426Mk2().heap);
+    }
+    expect_error("cannot pass raw pointer from an owning temporary to parameter 'p'") {
+        t510r9CopyThenGlobal(t426Mk2().heap);
     }
     return 0;
 }
+
+// Defined after its caller: the store verdict waits for the final IR.
+void t510r5Later(int* p) { t426Saved = p; }

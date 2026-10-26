@@ -1567,6 +1567,9 @@ void MainListener::ProcessPendingInstantiations() {
             try
             {
                 TemplateNamespaceScope nsScope(compilerLLVM, pending.templateName);
+                if (auto parent = aggregateParentScopes_.find(pending.templateName);
+                    parent != aggregateParentScopes_.end())
+                    aggregateParentScopes_[pending.mangledName] = parent->second;
                 if (isStruct)
                     ParseStructDefinition(structCtx, pending.mangledName);
                 else

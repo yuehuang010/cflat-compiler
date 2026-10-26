@@ -117,7 +117,9 @@ Windows gate: R6, R7, R11, R12, R13, R14 land after the Windows box passes. R2 i
 | P3 | - | p3/call-name-shadowing-leftovers-after-t484 | filed T484 review |
 | P3 | - | p3/function-pointer-double-pointer-address-of-named-function-accepted | filed T478 |
 | P3 | - | p3/nested-type-lookup-leftovers-after-t481 | filed T481 |
-| P3 | - | p3/returned-pointer-from-call-result-field-temp-dangles | filed T480 |
+| P3 | - | p3/returned-pointer-from-call-result-field-temp-dangles | T510 residue: unique-field select ruling, raw temp field into unique int* param double free, ternary owner, accepted leaks |
+| P3 | - | p3/ctor-lambda-this-closure-relocation | T515 residue: by-value return of a this-capturing-closure holder awaits the native return-ABI ruling |
+| P3 | - | p3/self-pointer-struct-return-not-in-place | filed T510: RULING native return ABI for dtor-bearing structs |
 | P3 | - | p3/crossed-address-of-state-leaks-call-temporary | T485 leftovers: C2 non-storing callee leak, two-owner pointer difference, pre-existing store3 EARLY FREE |
 | P3 | fix/t422-globdef | p3/global-default-spelling-zeroes-without-the-note | PARKED (T422 Luna r1 + Haiku r2): ruling conflict with runtime-constructed globals (T136/T368/mempress) - see issue head |
 | P3 | fix/t438-uniqdot | p3/cflat-unique-dot-dispatches-to-pointee-member | PARKED: needs ruling on name hiding + `->` (see issue file) (T438) |

@@ -15643,7 +15643,10 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
             if (pointer)
             {
                 type += "*";
-                if (arg.TypeAndValue.ElemPointer) type += "*";
+                // `&p` over a `T*` is a `T**` prvalue: its recorded depth is the second star.
+                if (arg.TypeAndValue.ElemPointer
+                    || (arg.IsCxxAddressOfPointerValue && arg.TypeAndValue.PointerDepth >= 2))
+                    type += "*";
             }
             if (fixedArray) type += "*";
             return type;
@@ -17273,7 +17276,8 @@ bool LLVMBackend::CxxCtorForwardsScalarReference(const std::string& typeName,
  * resolves and CxxCtorSetRequiresNarrowing stays the guard.
  */
 std::string LLVMBackend::CxxCtorSelectedNarrowingError(const std::string& typeName,
-                                                       const std::vector<NamedVariable>& argVars)
+                                                       const std::vector<NamedVariable>& argVars,
+                                                       bool floatToIntegerOnly)
 {
         if (argVars.empty()) return {};
         const CxxClassInfo* info = GetCxxClassInfoWithConstructors(typeName);
@@ -17363,6 +17367,13 @@ std::string LLVMBackend::CxxCtorSelectedNarrowingError(const std::string& typeNa
         for (size_t i = 0; i < argVars.size(); ++i)
         {
             const TypeAndValue param = referent(best->ctor->params[i + 1]);
+            if (floatToIntegerOnly)
+            {
+                const bool floatingSource = argVars[i].TypeAndValue.IsFloatingPoint() != -1
+                    || (argVars[i].BaseType != nullptr && argVars[i].BaseType->isFloatingPointTy());
+                if (!floatingSource || param.TypeName == "bool" || param.IsInteger() == -1)
+                    continue;
+            }
             const ScalarArgConversion conv = ClassifyScalarArgConversion(argVars[i], param);
             if (conv != ScalarArgConversion::Narrow && conv != ScalarArgConversion::EnumMismatch)
                 continue;
@@ -17412,7 +17423,63 @@ bool LLVMBackend::CxxConstructorNeedsClangResolution(
         bool* nullPointerCandidate) const
 {
         if (nullPointerCandidate != nullptr) *nullPointerCandidate = false;
-        if (CxxCtorForwardsScalarReference(typeName, argTypes)) return true;
+        const bool addressValue = argVars != nullptr
+            && std::any_of(argVars->begin(), argVars->end(), [](const NamedVariable& arg) {
+                return arg.IsCxxAddressOfPointerValue && arg.Storage == nullptr;
+            });
+        if (!addressValue && CxxCtorForwardsScalarReference(typeName, argTypes)) return true;
+        if (argVars != nullptr && argVars->size() == argTypes.size())
+            if (const CxxClassInfo* listed = GetCxxClassInfoWithConstructors(typeName);
+                listed != nullptr)
+            {
+                if (addressValue)
+                {
+                    bool hasTemplate = listed->hasCtorTemplate;
+                    if (auto raw = cxxRecordEntries_.find(typeName);
+                        raw != cxxRecordEntries_.end())
+                        hasTemplate = hasTemplate || !raw->second.ctorTemplates.empty();
+                    if (hasTemplate) return true;
+                    auto* self = const_cast<LLVMBackend*>(this);
+                    for (const CxxClassInfo::Structor& ctor : listed->constructors)
+                    {
+                        if (ctor.params.empty() || argVars->size() > ctor.params.size() - 1)
+                            continue;
+                        bool defaults = true;
+                        for (size_t i = argVars->size(); defaults && i < ctor.params.size() - 1; ++i)
+                            defaults = i + 1 < ctor.defaultArgs.size()
+                                && !ctor.defaultArgs[i + 1].kind.empty();
+                        if (!defaults) continue;
+                        FunctionSymbol candidate;
+                        candidate.IsCxx = true;
+                        candidate.IsMethod = true;
+                        candidate.UniqueName = ctor.linkageName;
+                        candidate.Parameters = ctor.params;
+                        candidate.Parameters[0].VariableName = "this";
+                        candidate.Parameters[0].TypeName = typeName;
+                        std::vector<NamedVariable> arguments(1);
+                        arguments[0].TypeAndValue.TypeName = typeName;
+                        arguments.insert(arguments.end(), argVars->begin(), argVars->end());
+                        auto ranks = self->RankCxxConversionSequences(arguments, candidate);
+                        if (ranks.size() != arguments.size()) continue;
+                        bool viable = true;
+                        bool readsAddressValue = false;
+                        for (size_t i = 0; i < argVars->size(); ++i)
+                        {
+                            // Every argument must be viable, not only the address-of ones (Multi(&p, 7)).
+                            viable = viable && ranks[i + 1].cxxViable;
+                            if (!(*argVars)[i].IsCxxAddressOfPointerValue
+                                || (*argVars)[i].Storage != nullptr)
+                                continue;
+                            const TypeAndValue& param = ctor.params[i + 1];
+                            readsAddressValue = readsAddressValue
+                                || !param.IsCxxRefToPointer || param.CxxConstRef()
+                                || param.IsRvalueRef;
+                        }
+                        if (viable && readsAddressValue) return true;
+                    }
+                }
+            }
+        if (addressValue) return false;
         if (selected != nullptr && !selected->isCopyCtor && !selected->isMoveCtor
             && selected->params.size() >= argTypes.size() + 1)
             for (size_t i = 0; i < argTypes.size(); ++i)
@@ -17850,7 +17917,10 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
             if (pointer)
             {
                 type += "*";
-                if (arg.TypeAndValue.ElemPointer) type += "*";
+                // `&p` over a `T*` is a `T**` prvalue: its recorded depth is the second star.
+                if (arg.TypeAndValue.ElemPointer
+                    || (arg.IsCxxAddressOfPointerValue && arg.TypeAndValue.PointerDepth >= 2))
+                    type += "*";
             }
             if (fixedArray) type += "*";
             return type;
@@ -17886,6 +17956,11 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
         }
         forwardsScalarReference = CxxCtorForwardsScalarReference(typeName, argumentTypes);
         declaredWrapperCtor = declaredWrapperCtor || forwardsScalarReference;
+        if (std::any_of(arguments.begin(), arguments.end(), [](const NamedVariable& arg) {
+                return arg.IsCxxAddressOfPointerValue && arg.Storage == nullptr;
+            }))
+            declaredWrapperCtor = declaredWrapperCtor || CxxConstructorNeedsClangResolution(
+                typeName, nullptr, argumentTypes, &arguments, /*allowExplicit*/ true, nullptr);
 
         std::vector<std::string> parameterSpellings;
         std::vector<std::string> callArguments;

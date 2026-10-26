@@ -1036,9 +1036,41 @@ void MainListener::PrepareLoopConditionalDropFlags(CFlatParser::StatementContext
         prepareLoopMoves(body);
     }
 
+// A bare-name `=` store to a moved local inside a loop/branch re-arms a runtime drop flag
+// instead of the straight-line dead-value skip (the store may run many times).
+void MainListener::PrepareMovedReassignments(antlr4::tree::ParseTree* node) {
+        auto* compiler = Compiler();
+        if (node == nullptr
+            || dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr)
+            return;
+        if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node);
+            assignment != nullptr && assignment->assignmentOperator() != nullptr
+            && assignment->assignmentOperator()->Assign() != nullptr
+            && assignment->unaryExpression() != nullptr)
+        {
+            auto* unary = assignment->unaryExpression();
+            auto* postfix = unary->postfixExpression();
+            auto* primary = postfix != nullptr && postfix->children.size() == 1
+                ? postfix->primaryExpression() : nullptr;
+            auto* identifier = primary != nullptr
+                ? primary->genericIdentifier() : nullptr;
+            if (identifier != nullptr && identifier->genericTypeParameters() == nullptr)
+                if (auto* namedVar = compiler->FindLiveNamedVariable(
+                        identifier->Identifier()->getText());
+                    namedVar != nullptr && namedVar->IsMoved
+                    && namedVar->ConditionalDropFlag == nullptr
+                    && compiler->ShouldSkipMovedFromStructDestructor(
+                        namedVar->TypeAndValue.TypeName))
+                    compiler->EnsureConditionalDropFlag(*namedVar, false);
+        }
+        for (auto* child : node->children)
+            PrepareMovedReassignments(child);
+    }
+
 void MainListener::ParseControlledBody(CFlatParser::StatementContext* body) {
         auto* compiler = Compiler(body);
         OwnershipControlScope controlScope(compiler);
+        PrepareMovedReassignments(body);
         ParseStatement(body);
         if (body != nullptr && body->compoundStatement() == nullptr)
             compiler->FlushOwnedTemps();
@@ -1417,6 +1449,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             // A generic instantiation returned as a function value (`return dbl<int>;`) is bound to its
             // instance here, the way a named function value is, before the return slot is checked.
             ResolveGenericFunctionValueOperand(returnNV, assignExpr);
+            GuardRawPointerIntoOwningTempField(returnNV, compiler->currentFunctionReturnTV,
+                true, compiler->currentFunctionReturnTV.IsAlias, "return value", errCtx);
             // A returned function-pointer VALUE must match the declared return slot (variadic-ness and bind rule).
             const auto* encodedReturnSource = returnNV.TypeAndValue.Pointer
                 ? nullptr : compiler->GetEncodedClosureType(returnNV.TypeAndValue.TypeName);
@@ -4291,6 +4325,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         llvm::FastMathFlags prevFMF = compiler->builder->getFastMathFlags();
                         ApplyVectorizeFpTier(compiler, fpTier);
                         PrepareLoopConditionalDropFlags(innerStatement);
+                        // The increment clause stores every iteration too.
+                        if (forIncrementCtx != nullptr) PrepareMovedReassignments(forIncrementCtx);
                         ParseControlledBody(innerStatement);
                         compiler->builder->setFastMathFlags(prevFMF);
                         currentVectorizeBodyLine_ = prevBody;

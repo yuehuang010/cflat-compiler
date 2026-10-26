@@ -2510,6 +2510,13 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         stream.close();
         if (verbose) std::cout << "[verbose]   walk complete\n";
 
+        // Resolve each deferred expectation against its first refusal across deferred kinds.
+        {
+            NoCurrentFunctionScope noCurrent(this);
+            SettledInterfaceInstancesScope settled(this);
+            ResolveDeferredExpectationVerdicts();
+        }
+
         // #8 on const receivers: every body (generic instantiations included) is emitted now.
         // First of the end-of-module checks: it stands in for a check made during the walk.
         ResolvePendingConstReceiverCalls();
@@ -2536,6 +2543,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             // implementor set is final and may finally be enumerated.
             SettledInterfaceInstancesScope settled(this);
             ResolveOwningLocalBorrowingHelperArgs();
+            ResolvePendingConstReceiverCalls();
             ResolveTempUniqueFieldArgEscapes();
             // Callee bodies are complete, so ParameterRetainsArgument can answer the alias scan.
             ResolveOwnedReleaseGates();
@@ -2554,8 +2562,14 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         catch (const ExpectedErrorReceived&)
         {
             // A file-scope expectation matched somewhere in imports / scan / walk. The PASS
-            // line is already printed; settle any deferred scoped verdict before reporting success.
-            ResolvePendingConstReceiverCalls(true);
+            // line is already printed; settle every deferred scoped verdict before success.
+            try
+            {
+                NoCurrentFunctionScope noCurrent(this);
+                SettledInterfaceInstancesScope settled(this);
+                ResolveDeferredExpectationVerdicts(true);
+            }
+            catch (const CompilerAbortException&) { return false; }
             return true;
         }
 
@@ -4757,8 +4771,14 @@ bool LLVMBackend::Analyze(const std::string& filePath,
             // bodies of deferred delete-site destructor wrappers (recursive containers whose
             // element type was incomplete when the container dtor was emitted).
             EmitDeferredFullDestructorBodies();
+            {
+                NoCurrentFunctionScope noCurrent(this);
+                SettledInterfaceInstancesScope settled(this);
+                ResolveDeferredExpectationVerdicts();
+            }
             // #8 on const receivers, as in Compile: every body is emitted now.
             ResolvePendingConstReceiverCalls();
+            ResolveOwningLocalBorrowingHelperArgs();
             // Same post-walk gate resolution as Compile, so IR dumps show the real releases.
             NoCurrentFunctionScope noCurrent(this);
             ResolveOwnedReleaseGates();
@@ -4771,7 +4791,12 @@ bool LLVMBackend::Analyze(const std::string& filePath,
     catch (ExpectedErrorReceived&)
     {
         // Never drop a deferred expect_error verdict, even on an aborted analysis.
-        try { ResolvePendingConstReceiverCalls(true); }
+        try
+        {
+            NoCurrentFunctionScope noCurrent(this);
+            SettledInterfaceInstancesScope settled(this);
+            ResolveDeferredExpectationVerdicts(true);
+        }
         catch (CompilerAbortException&) {}
         return false;
     }
@@ -5199,6 +5224,9 @@ void LLVMBackend::ResetForReanalysis()
     rejectedInterfaceDefSites_.clear();
     rejectedInterfaceDefMessages_.clear();
     coreInterfaceDefs_.clear();
+    aggregateDefSites_.clear();
+    coreAggregateDefs_.clear();
+    rejectedAggregateDefSites_.clear();
     scannedInterfaceImpls.clear();
     uncertainInterfaceImpls.clear();
     uncertainGenericClassInterfaceImpls_.clear();
@@ -5296,6 +5324,8 @@ void LLVMBackend::ResetForReanalysis()
     nextCastOccurrence_ = 1;
     owningTempUniqueFields_.clear();
     owningTempRawPointerFields_.clear();
+    owningTempRawPointerFieldAddresses_.clear();
+    owningTempRawPointerFieldOwners_.clear();
     launderedTempUniqueFields_.clear();
     pendingLaunderTempUniqueFields_.clear();
     dataValueCodeCasts_.clear();
@@ -5321,6 +5351,8 @@ void LLVMBackend::ResetForReanalysis()
     tempUniqueFieldArgs_.clear();
     coreUniqueGetterSource_.clear();
     deferredTempUniqueFieldEscapes_.clear();
+    deferredRawPointerCalleeStores_.clear();
+    tempUniqueFieldGates_.clear();
     lastAllocAlignment = 0;
     pendingInitAllocAlign = 0;
     lastCallReturnsAllocAlign = 0;
@@ -7210,6 +7242,8 @@ static llvm::json::Object SerializeTav(const TAV& t)
     {
         o["fp"]  = true;
         o["fpr"] = s.FuncPtrReturnTypeName;
+        if (s.FuncPtrReturnFunctionType)
+            o["fprft"] = SerializeTav(s.FuncPtrReturnFunctionType->ToTypeAndValue());
         if (s.FuncPtrReturnPointer) o["fprp"] = true;
         if (s.FuncPtrReturnOwned) o["fpro"] = true;
         if (s.FuncPtrReturnAlias) o["fpra"] = true;
@@ -7238,6 +7272,8 @@ static llvm::json::Object SerializeTav(const TAV& t)
             if (!p.ResolvedTypeKey.empty()) po["rk"] = p.ResolvedTypeKey;
             if (p.ConstMask >= 0) po["cm"] = static_cast<int64_t>(p.ConstMask);
             if (!p.AliasSpelling.empty()) po["as"] = p.AliasSpelling;
+            if (p.FunctionTypeSignature)
+                po["fts"] = SerializeTav(p.FunctionTypeSignature->ToTypeAndValue());
             fps.push_back(std::move(po));
         }
         o["fpp"] = std::move(fps);
@@ -7307,6 +7343,9 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (s.IsFunctionPointer)
     {
         if (auto v = o.getString("fpr"))   s.FuncPtrReturnTypeName = v->str();
+        if (auto* nested = o.getObject("fprft"))
+            s.FuncPtrReturnFunctionType = std::make_shared<LLVMBackend::SerializedTav>(
+                LLVMBackend::SerializedTav::From(DeserializeTav(*nested)));
         if (auto v = o.getBoolean("fprp")) s.FuncPtrReturnPointer = *v;
         if (auto v = o.getBoolean("fpro")) s.FuncPtrReturnOwned = *v;
         if (auto v = o.getBoolean("fpra")) s.FuncPtrReturnAlias = *v;
@@ -7337,6 +7376,9 @@ static TAV DeserializeTav(const llvm::json::Object& o)
                     if (auto v = po->getString("rk")) p.ResolvedTypeKey = v->str();
                     if (auto v = po->getInteger("cm")) p.ConstMask = static_cast<int>(*v);
                     if (auto v = po->getString("as")) p.AliasSpelling = v->str();
+                    if (auto* nested = po->getObject("fts"))
+                        p.FunctionTypeSignature = std::make_shared<LLVMBackend::SerializedTav>(
+                            LLVMBackend::SerializedTav::From(DeserializeTav(*nested)));
                     s.FuncPtrParams.push_back(std::move(p));
                 }
     }
@@ -7722,6 +7764,7 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
         NoCurrentFunctionScope noCurrent(this);
         EmitDeferredFullDestructorBodies();
         ResolveOwnedReleaseGates();
+        ResolveRawPointerCalleeStoreVerdicts();
         // Same return-keep answer as Compile; a gate left false would leak in a warm core.
         ResolveDeferredReturnKeepGates();
     }
@@ -8311,6 +8354,9 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     rejectedInterfaceDefSites_.clear();
     rejectedInterfaceDefMessages_.clear();
     coreInterfaceDefs_.clear();
+    aggregateDefSites_.clear();
+    coreAggregateDefs_.clear();
+    rejectedAggregateDefSites_.clear();
     scannedInterfaceImpls.clear();
     uncertainInterfaceImpls.clear();
     uncertainGenericClassInterfaceImpls_.clear();

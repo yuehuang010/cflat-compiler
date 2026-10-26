@@ -2730,6 +2730,15 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
         }
 
         // An alias of an alias names whatever the RHS already names (one hop).
+        if (IsUnparameterizedNamedTypeSpecifier(typeSpec)
+            && scanTypeSubstitutions_.find(target) == scanTypeSubstitutions_.end())
+        {
+            const std::string contextual = ResolveContextualTypeName(compiler,
+                typeSpec->getText(), compiler->ResolveQualifiedName(target), typeSpec,
+                EnclosingAggregateNamesFromContext(compiler, typeSpec),
+                NamespaceNameFromContext(compiler, typeSpec));
+            if (!contextual.empty()) target = contextual;
+        }
         target = compiler->ResolveQualifiedName(target);
         target = compiler->ResolveGenericBaseAlias(compiler->ResolveTypeAlias(target));
         std::string targetBase = target;

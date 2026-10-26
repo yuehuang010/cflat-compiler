@@ -101,6 +101,8 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
         currentCastOccurrence_ = 0;
         owningTempUniqueFields_.clear();
         owningTempRawPointerFields_.clear();
+        owningTempRawPointerFieldAddresses_.clear();
+        owningTempRawPointerFieldOwners_.clear();
         launderedTempUniqueFields_.clear();
         pendingLaunderTempUniqueFields_.clear();
         dataValueCodeCasts_.clear();
@@ -2867,7 +2869,7 @@ llvm::Function* LLVMBackend::GenerateClosureCaptureCleanup(const std::string& na
             auto* fldPtr = builder->CreateStructGEP(capTy, dstCaps, idx);
             if (llvm::isa<llvm::ArrayType>(capTy->getElementType(idx)))
                 EmitFullDestructorOverStorage(*builder, fldPtr, capTy->getElementType(idx),
-                    GetOrCreateFullDestructor(tn), tn);
+                    GetOrCreateFullDestructor(tn), tn, true);
             else if (auto* dtor = GetOrCreateFullDestructor(tn))
                 builder->CreateCall(dtor->getFunctionType(), dtor,
                     { builder->CreateBitCast(fldPtr, dtor->getArg(0)->getType()) });

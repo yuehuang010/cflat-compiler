@@ -2407,6 +2407,16 @@ static uint8_t UsingWholeWordConstMask(LLVMBackend* compiler, const std::string&
     return static_cast<uint8_t>((1u << (std::min<size_t>(depth, 6) + 1)) - 1u);
 }
 
+static std::vector<std::string> EnclosingAggregateNamesFromContext(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node);
+static std::string NamespaceNameFromContext(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node);
+static bool IsUnparameterizedNamedTypeSpecifier(CFlatParser::TypeSpecifierContext* typeSpec);
+static std::string ResolveContextualTypeName(LLVMBackend* compiler,
+    const std::string& spelled, const std::string& resolvedName,
+    CFlatParser::TypeSpecifierContext* typeSpec,
+    const std::vector<std::string>& aggregateScopes, const std::string& namespaceName);
+
 static void RegisterPureRenameAlias(LLVMBackend* compiler, CFlatParser::UsingDeclarationContext* ctx)
 {
     if (compiler == nullptr || ctx == nullptr) return;
@@ -2420,6 +2430,14 @@ static void RegisterPureRenameAlias(LLVMBackend* compiler, CFlatParser::UsingDec
         typeSpec, ctx->multiWordTypeSuffix(), false, &targetError);
     if (HasPrimitiveTypeError(targetError)) return;
     std::string target = compiler->ResolveQualifiedName(targetSpelling);
+    if (IsUnparameterizedNamedTypeSpecifier(typeSpec))
+    {
+        const std::string contextual = ResolveContextualTypeName(compiler,
+            typeSpec->getText(), target, typeSpec,
+            EnclosingAggregateNamesFromContext(compiler, typeSpec),
+            NamespaceNameFromContext(compiler, typeSpec));
+        if (!contextual.empty()) target = contextual;
+    }
     std::string alias = ctx->Identifier()->getText();
     if (alias == target || !IsBareTypeName(target)) return;
     compiler->RegisterManglingAlias(alias, target);
@@ -2567,26 +2585,20 @@ static bool HasNestedAggregatePathInContext(antlr4::tree::ParseTree* useSite,
     return hasPath(hasPath, owner, 0);
 }
 
-static bool AggregateScopeMatchesContextOwner(const std::string& scope,
-    const std::string& ownerScope)
-{
-    auto stripGenericArguments = [](const std::string& name)
-    {
-        std::string base;
-        int genericDepth = 0;
-        for (char ch : name)
-        {
-            if (ch == '$' && genericDepth == 0) break;
-            if (ch == '<') { ++genericDepth; continue; }
-            if (ch == '>' && genericDepth > 0) { --genericDepth; continue; }
-            if (genericDepth == 0) base.push_back(ch);
-        }
-        return base;
-    };
-    return stripGenericArguments(scope) == stripGenericArguments(ownerScope);
-}
+static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateTypeScopesFromContext(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node);
 
 static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesFromContext(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node)
+{
+    if (compiler == nullptr) return {};
+    auto scopes = EnclosingAggregateTypeScopesFromContext(compiler, node);
+    if (!compiler->GetCurrentNamespace().empty())
+        scopes.push_back({ compiler->GetCurrentNamespace(), nullptr });
+    return scopes;
+}
+
+static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateTypeScopesFromContext(
     LLVMBackend* compiler, antlr4::tree::ParseTree* node)
 {
     if (compiler == nullptr) return {};
@@ -2601,7 +2613,7 @@ static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesFromCo
         else if (auto* programDefinition = dynamic_cast<CFlatParser::ProgramDefinitionContext*>(parent))
             aggregates.emplace_back(programDefinition->directDeclarator()->getText(), programDefinition);
     }
-    std::string scope = compiler->GetCurrentNamespace();
+    std::string scope = NamespaceNameFromContext(compiler, node);
     std::vector<EnclosingAggregateLookupScope> scopes;
     for (auto it = aggregates.rbegin(); it != aggregates.rend(); ++it)
     {
@@ -2609,8 +2621,6 @@ static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesFromCo
         scopes.push_back({ scope, it->second });
     }
     std::reverse(scopes.begin(), scopes.end());
-    if (!compiler->GetCurrentNamespace().empty())
-        scopes.push_back({ compiler->GetCurrentNamespace(), nullptr });
     return scopes;
 }
 
@@ -2618,26 +2628,22 @@ static std::vector<std::string> EnclosingAggregateNamesFromContext(
     LLVMBackend* compiler, antlr4::tree::ParseTree* node)
 {
     if (compiler == nullptr) return {};
+    const auto scopes = EnclosingAggregateTypeScopesFromContext(compiler, node);
     std::vector<std::string> aggregateNames;
-    std::string scope = NamespaceNameFromContext(compiler, node);
-    for (auto* parent = node != nullptr ? node->parent : nullptr;
-         parent != nullptr; parent = parent->parent)
-    {
-        std::string name;
-        if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(parent))
-            name = structure->directDeclarator()->getText();
-        else if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(parent))
-            name = classDefinition->directDeclarator()->getText();
-        if (!name.empty()) aggregateNames.push_back(std::move(name));
-    }
-    std::reverse(aggregateNames.begin(), aggregateNames.end());
-    for (auto& name : aggregateNames)
-    {
-        scope += (scope.empty() ? "" : ".") + name;
-        name = scope;
-    }
-    std::reverse(aggregateNames.begin(), aggregateNames.end());
+    aggregateNames.reserve(scopes.size());
+    for (const auto& scope : scopes) aggregateNames.push_back(scope.Name);
     return aggregateNames;
+}
+
+static std::string AggregateDefinitionName(antlr4::ParserRuleContext* definition)
+{
+    if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(definition))
+        return structure->directDeclarator()->getText();
+    if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(definition))
+        return classDefinition->directDeclarator()->getText();
+    if (auto* program = dynamic_cast<CFlatParser::ProgramDefinitionContext*>(definition))
+        return program->directDeclarator()->getText();
+    return {};
 }
 
 static std::string ResolveContextualTypeName(LLVMBackend* compiler,
@@ -2651,25 +2657,17 @@ static std::string ResolveContextualTypeName(LLVMBackend* compiler,
         return compiler->IsKnownTypeName(candidate) || compiler->IsTypeArgTypeKey(candidate);
     };
     const auto typePath = NamedTypePathFromContext(typeSpec);
-    for (size_t i = 0; i < aggregateScopes.size(); i++)
+    const auto contextScopes = EnclosingAggregateTypeScopesFromContext(compiler, typeSpec);
+    for (size_t i = 0; i < contextScopes.size(); i++)
     {
-        std::string candidateScope = aggregateScopes[i];
+        if (i >= aggregateScopes.size()) break;
+        const std::string& candidateScope = aggregateScopes[i];
         if (!candidateScope.empty())
         {
             const bool declaredInAggregate =
                 HasNestedAggregatePathInContext(typeSpec, i, typePath);
-            if (i > 0 && typeSpec != nullptr && !typePath.empty())
-            {
-                const auto contextScopes = EnclosingAggregateNamesFromContext(compiler, typeSpec);
-                if (i < contextScopes.size()
-                    && !AggregateScopeMatchesContextOwner(candidateScope, contextScopes[i]))
-                {
-                    // The lexical owner of a generic instance (A.P$int.Q) is not a registered type: keep master's lookup.
-                    if (!declaredInAggregate || !isKnownType(resolvedName)
-                        || !isKnownType(contextScopes[i] + "." + spelled)) continue;
-                    candidateScope = contextScopes[i];
-                }
-            }
+            if (AggregateDefinitionName(contextScopes[i].Definition) == spelled)
+                return candidateScope;
             const std::string candidate = candidateScope + "." + spelled;
             const bool ambiguousScope = compiler->IsNamespace(candidateScope);
             if ((!ambiguousScope || declaredInAggregate)
@@ -5152,7 +5150,8 @@ inline void CollectPositionalBraceElementNames(CFlatParser::InitializerListConte
 // header) of the same function / lambda body, not the parameter of that name. The consume scans
 // are name-based; the write / return triggers must not claim a shadowing local's use.
 inline bool NameShadowedByEnclosingLocal(antlr4::tree::ParseTree* use, const std::string& name,
-        const CFlatParser::LambdaExpressionContext* functionLambda = nullptr)
+        const CFlatParser::LambdaExpressionContext* functionLambda = nullptr,
+        const antlr4::tree::ParseTree* stopAt = nullptr)
 {
     auto* useCtx = dynamic_cast<antlr4::ParserRuleContext*>(use);
     if (useCtx == nullptr || useCtx->getStart() == nullptr || name.empty()) return false;
@@ -5169,7 +5168,7 @@ inline bool NameShadowedByEnclosingLocal(antlr4::tree::ParseTree* use, const std
         }
         return false;
     };
-    for (auto* parent = use->parent; parent != nullptr; parent = parent->parent)
+    for (auto* parent = use->parent; parent != nullptr && parent != stopAt; parent = parent->parent)
     {
         if (auto* lambda = dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent))
         {
@@ -6379,6 +6378,14 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
         auto* compiler = Compiler(ctx);
         std::string scannedTypeName = ctx->directDeclarator()->getText();
         if (!namespaceName.empty()) scannedTypeName = namespaceName + "." + scannedTypeName;
+        auto trackDefinition = [&](auto* definition, const std::string& name)
+        {
+            if (compiler->TrackAggregateDefinitionSite(name, DefinitionSiteText(compiler, definition),
+                    definition->genericTypeParameters() != nullptr))
+                Compiler(definition)->LogError(std::format(
+                    "redefinition of '{}'", AggregateDefinitionName(definition)));
+        };
+        trackDefinition(ctx, scannedTypeName);
         const bool scannedCppStruct = IsGeneratedCppStruct(ctx);
         if (scannedCppStruct) compiler->RegisterCppStructName(scannedTypeName);
         // Generic template definitions are not pre-declared; they are instantiated on demand.
@@ -6387,6 +6394,23 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
         // of the instantiated type (e.g. `g_explosions.getPtr` -> `array.getPtr`).
         if (ctx->genericTypeParameters() != nullptr)
         {
+            auto scanNestedTemplateDefinitions = [&](auto&& self, auto* aggregate,
+                                                       const std::string& owner) -> void
+            {
+                for (auto* nested : MemberStructDefinitions(aggregate))
+                {
+                    const std::string name = owner + "." + nested->directDeclarator()->getText();
+                    trackDefinition(nested, name);
+                    self(self, nested, name);
+                }
+                for (auto* nested : MemberClassDefinitions(aggregate))
+                {
+                    const std::string name = owner + "." + nested->directDeclarator()->getText();
+                    trackDefinition(nested, name);
+                    self(self, nested, name);
+                }
+            };
+            scanNestedTemplateDefinitions(scanNestedTemplateDefinitions, ctx, scannedTypeName);
             if (auto* s = compiler->GetSymbolSink())
             {
                 std::string genBaseTypeName = ctx->directDeclarator()->getText();
@@ -6876,15 +6900,23 @@ private:
         int column = 0;
         // The moved path is this read's own tracked element slot (not a whole moved owner it lives in).
         bool ownSlot = false;
+        bool pointeeMove = false;
     };
     std::vector<DeferredMovedRead>* deferredMovedReads_ = nullptr;
     // Owning rvalue receivers of operator-> forwarding (`mk()->v`) registered for cleanup.
     struct ArrowOwnedTemp
     {
         llvm::Value* Storage = nullptr;
+        CFlatParser::PostfixExpressionContext* Origin = nullptr;
         CFlatParser::PostfixExpressionContext* PendingCallResult = nullptr;
+        llvm::Value* PendingCallValue = nullptr;
+        LLVMBackend::TypeAndValue PendingCallReturnType;
+        CFlatParser::AdditiveExpressionContext* PendingPointerDifference = nullptr;
+        const antlr4::tree::TerminalNode* PendingCallParen = nullptr;
         size_t ArgumentIndex = SIZE_MAX;
+        size_t PointerDifferenceOperatorIndex = SIZE_MAX;
         bool NamedArgument = false;
+        bool HasPendingCallValue = false;
     };
     std::vector<ArrowOwnedTemp> arrowOwnedTemps_;
     std::unordered_map<CFlatParser::FunctionDefinitionContext*,
@@ -7216,6 +7248,39 @@ private:
     // Struct scope stack: pushed when parsing fields/methods of a struct/class so that
     // unqualified nested type names (e.g. "Inner") resolve to "Outer.Inner".
     std::vector<std::string> structScopeStack;
+    std::unordered_map<std::string, std::string> aggregateParentScopes_;
+    std::unordered_map<std::string, antlr4::ParserRuleContext*> aggregateDefinitionContexts_;
+
+    std::vector<std::string> EnclosingAggregateScopesForType(
+        CFlatParser::TypeSpecifierContext* typeSpec)
+    {
+        auto* compiler = Compiler(typeSpec);
+        const auto contextScopes = EnclosingAggregateTypeScopesFromContext(compiler, typeSpec);
+        std::unordered_map<antlr4::ParserRuleContext*, std::string> activeByDefinition;
+        std::unordered_set<std::string> visited;
+        for (auto it = structScopeStack.rbegin(); it != structScopeStack.rend(); ++it)
+        {
+            std::string scope = *it;
+            while (!scope.empty() && visited.insert(scope).second)
+            {
+                auto definition = aggregateDefinitionContexts_.find(scope);
+                if (definition != aggregateDefinitionContexts_.end() && definition->second != nullptr)
+                    activeByDefinition.try_emplace(definition->second, scope);
+                auto parent = aggregateParentScopes_.find(scope);
+                if (parent == aggregateParentScopes_.end()) break;
+                scope = parent->second;
+            }
+        }
+
+        std::vector<std::string> scopes;
+        scopes.reserve(contextScopes.size());
+        for (const auto& contextScope : contextScopes)
+        {
+            auto active = activeByDefinition.find(contextScope.Definition);
+            scopes.push_back(active != activeByDefinition.end() ? active->second : contextScope.Name);
+        }
+        return scopes;
+    }
 
     // C++ struct definitions parsed early so their generated C++ is available to later member
     // bodies, while the current struct's fields still observe source-order completeness.
@@ -7229,6 +7294,73 @@ private:
     // Set only while a declaration parser is handling a function-body local. Pointer-form
     // `unique X*` is rewritten to the core `unique<X>` value; interface locals remain builtin.
     bool inLocalDecl_ = false;
+    struct PendingCallVisibleLocal
+    {
+        std::string Name;
+        LLVMBackend::TypeAndValue Type;
+        llvm::Function* Function = nullptr;
+        size_t ScopeDepth = 0;
+        antlr4::ParserRuleContext* Initializer = nullptr;
+    };
+    std::vector<PendingCallVisibleLocal> pendingCallVisibleLocals_;
+    const PendingCallVisibleLocal* FindPendingCallVisibleLocal(
+        LLVMBackend* backend, const std::string& name, antlr4::tree::ParseTree* use) const
+    {
+        if (backend == nullptr) return nullptr;
+        const size_t visibleDepth = backend->FindVariableScopeDepth(name);
+        for (auto it = pendingCallVisibleLocals_.rbegin(); it != pendingCallVisibleLocals_.rend(); ++it)
+        {
+            if (it->Name != name) continue;
+            if (it->Function == backend->currentFunction)
+            {
+                if (visibleDepth != SIZE_MAX && visibleDepth > it->ScopeDepth) continue;
+            }
+            else
+            {
+                bool inInitializer = false;
+                bool inLambda = false;
+                for (auto* node = use; node != nullptr; node = node->parent)
+                {
+                    if (node == it->Initializer)
+                    {
+                        inInitializer = true;
+                        break;
+                    }
+                    if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr)
+                        inLambda = true;
+                }
+                if (!inInitializer || !inLambda
+                    || NameShadowedByEnclosingLocal(use, name, nullptr, it->Initializer))
+                    continue;
+            }
+            return &*it;
+        }
+        return nullptr;
+    }
+    struct PendingCallVisibleLocalScope
+    {
+        MainListener* self = nullptr;
+        bool active = false;
+        PendingCallVisibleLocalScope(MainListener* owner, LLVMBackend* backend,
+            const std::string& name, const LLVMBackend::TypeAndValue& type,
+            antlr4::ParserRuleContext* initializer)
+        {
+            if (owner == nullptr || backend == nullptr || owner->global_scope
+                || backend->currentFunction == nullptr || backend->stackNamedVariable.empty())
+                return;
+            self = owner;
+            self->pendingCallVisibleLocals_.push_back({
+                name, type, backend->currentFunction, backend->stackNamedVariable.size() - 1,
+                initializer });
+            active = true;
+        }
+        ~PendingCallVisibleLocalScope()
+        {
+            if (active) self->pendingCallVisibleLocals_.pop_back();
+        }
+        PendingCallVisibleLocalScope(const PendingCallVisibleLocalScope&) = delete;
+        PendingCallVisibleLocalScope& operator=(const PendingCallVisibleLocalScope&) = delete;
+    };
     struct LocalDeclGuard
     {
         bool& flag;
@@ -8232,6 +8364,7 @@ public:
     // Must run while still in the body block: FlushOwnedTemps' dominance guard frees only temps
     // registered in the current block, so the caller branches to the loop latch / resume after.
     void PrepareLoopConditionalDropFlags(CFlatParser::StatementContext* body);
+    void PrepareMovedReassignments(antlr4::tree::ParseTree* node);
     void ParseControlledBody(CFlatParser::StatementContext* body);
     void MarkLoopBackEdgeCxxConstPointers(
         LLVMBackend* compiler, CFlatParser::IterationStatementContext* loop);
@@ -8604,7 +8737,8 @@ public:
         const LLVMBackend::TypeAndValue& destinationType,
         bool destinationIsLocal, bool destinationIsAlias,
         const std::string& destinationName,
-        antlr4::ParserRuleContext* ctx);
+        antlr4::ParserRuleContext* ctx,
+        bool calleeArgument = false);
 
     /*
      * The 2026-08-21 string-from-a-temporary ruling. A `string` (or string-typed field) read out
@@ -9979,7 +10113,13 @@ public:
     void CheckMovedValueRead(const LLVMBackend::NamedVariable& nv, llvm::Value* readValue);
     void CheckMovedUse(const LLVMBackend::NamedVariable& nv, std::vector<DeferredMovedRead>* deferred,
                        llvm::Value* readValue);
-    void LogMovedUse(const std::string& subject, int line, int column);
+    bool IsPointeeMoveUse(const LLVMBackend::NamedVariable& source);
+    void LogMovedUse(const std::string& subject, int line, int column, bool pointeeMove = false,
+                     bool nonDerefUse = false);
+    // Same text, reported at ctx (the position LogErrorContext gives the moved-use refusal).
+    void LogMovedUse(antlr4::ParserRuleContext* ctx, const std::string& subject, bool pointeeMove = false,
+                     bool nonDerefUse = false);
+    static std::string MovedUseMessage(const std::string& subject, bool pointeeMove, bool nonDerefUse);
 
     // Give an untyped literal argument the shape a C++ constructor overload can match on.
     // sourceTwin: the argument's own TypeAndValue that lowering reads; a typed join is mirrored there.

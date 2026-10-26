@@ -1,0 +1,154 @@
+import "unique.cb";
+struct T491R { int value = 0; ~T491R() {} };
+struct T491RawBox { T491R* raw = nullptr; };
+struct T491Holder { unique T491R* arr[2] = default; };
+struct T491UniqueSource
+{
+    unique T491R* item = nullptr;
+    T491R* getItem() { return item; }
+};
+T491R* t491BorrowResult(T491R* p) { return p; }
+unique T491R* t491GlobalArray[2] = default;
+
+expect_error("from borrowed value 'borrowed'") {
+    void t491RejectRawLocal(T491R* borrowed)
+    {
+        T491R* raw = borrowed;
+        unique T491R* arr[2] = default;
+        arr[0] = raw;
+    }
+}
+
+expect_error("from borrowed value 'borrowed'") {
+    void t491RejectParameter(T491R* borrowed)
+    {
+        unique T491R* arr[2] = default;
+        arr[0] = borrowed;
+    }
+}
+
+expect_error("from borrowed value 't491BorrowResult'") {
+    void t491RejectBorrowCall(T491R* borrowed)
+    {
+        unique T491R* arr[2] = default;
+        arr[0] = t491BorrowResult(borrowed);
+    }
+}
+
+expect_error("from borrowed value 'borrowed'") {
+    void t491RejectBorrowedStructField(T491RawBox* borrowed)
+    {
+        unique T491R* arr[2] = default;
+        arr[0] = borrowed->raw;
+    }
+}
+
+expect_error("from a borrowed value") {
+    void t491RejectUniqueFieldAccessor(T491UniqueSource* source)
+    {
+        unique T491R* arr[2] = default;
+        arr[0] = source->getItem();
+    }
+}
+
+expect_error("cannot store the address of a stack or global value into an element of unique array 'arr'") {
+    void t491RejectAddressOfLocal()
+    {
+        T491R local = default;
+        unique T491R* arr[2] = default;
+        arr[0] = &local;
+    }
+}
+
+expect_error("cannot store borrowed parameter 'p' into unique field 'T491Holder.arr'") {
+    void t491RejectUniqueArrayField(T491R* p)
+    {
+        T491Holder h = default;
+        h.arr[1] = p;
+    }
+}
+
+expect_error("cannot store borrowed parameter 'p' into unique field 'T491Holder.arr'") {
+    void t491RejectUniqueArrayFieldThroughPointer(T491R* p)
+    {
+        T491Holder h = default;
+        T491Holder* hp = &h;
+        hp->arr[0] = p;
+    }
+}
+
+expect_error("from borrowed value 'borrowed'") {
+    void t491RejectGlobalArray(T491R* borrowed)
+    {
+        t491GlobalArray[0] = borrowed;
+    }
+}
+
+expect_error("from borrowed value 't491BorrowResult'") {
+    void t491RejectGlobalArrayBorrowCall(T491R* borrowed)
+    {
+        t491GlobalArray[0] = t491BorrowResult(borrowed);
+    }
+}
+
+expect_error("from borrowed value 'borrowed'") {
+    void t491RejectChainedStore(T491R* borrowed)
+    {
+        unique T491R* first[2] = default;
+        unique T491R* second[2] = default;
+        first[0] = second[0] = borrowed;
+    }
+}
+
+// T491 review: a raw owning local hands its pointee to the element; the local is moved afterwards.
+expect_error("use of moved variable 'q'") {
+    void t491RawOwnerStoredTwice() { T491R* q = new T491R(); unique T491R* arr[2] = default; arr[0] = q; arr[1] = q; }
+}
+
+expect_error("use of moved variable 'q'") {
+    void t491RawOwnerReadAfterStore() { T491R* q = new T491R(); unique T491R* arr[2] = default; arr[0] = q; q->value = 5; }
+}
+
+expect_error("cannot consume field 'T505ParamOwner.item' out of borrowed parameter 'o'") {
+    struct T505ParamOwner { unique T491R* item = nullptr; };
+    void t505RejectByValueParamField(T505ParamOwner o)
+    {
+        unique T491R* arr[2] = default;
+        arr[0] = o.item;
+    }
+}
+
+// T505: an owning join stays valid only when every non-null arm owns its pointee.
+expect_error("cannot assign unique<T491R> 'arr' from a borrowed value") {
+    void t505RejectNewThenBorrow(T491R* p, bool c)
+    {
+        unique T491R* arr[2] = default;
+        arr[0] = c ? new T491R() : t491BorrowResult(p);
+    }
+}
+
+expect_error("cannot assign unique<T491R> 'arr' from a borrowed value") {
+    void t505RejectBorrowThenNew(T491R* p, bool c)
+    {
+        unique T491R* arr[2] = default;
+        arr[0] = c ? t491BorrowResult(p) : new T491R();
+    }
+}
+
+unique T491R* t505MakeUnique(int v) { unique T491R* r = new T491R(); r->value = v; return move r; }
+
+expect_error("cannot assign unique<T491R> 'arr' from a borrowed value") {
+    void t505RejectUniqueCallThenBorrow(T491R* p, bool c)
+    {
+        unique T491R* arr[2] = default;
+        arr[0] = c ? t505MakeUnique(11) : t491BorrowResult(p);
+    }
+}
+
+expect_error("cannot assign unique<T491R> 'arr' from a borrowed value") {
+    void t505RejectBorrowThenUniqueCall(T491R* p, bool c)
+    {
+        unique T491R* arr[2] = default;
+        arr[0] = c ? t491BorrowResult(p) : t505MakeUnique(11);
+    }
+}

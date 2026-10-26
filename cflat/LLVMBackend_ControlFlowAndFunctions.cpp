@@ -64,9 +64,13 @@ bool LLVMBackend::IsNativeValueConstructor(
     const auto data = GetDataStructure(functionName);
     const bool storesClosure = std::any_of(data.StructFields.begin(), data.StructFields.end(),
         [this](const TypeAndValue& field) {
-            return field.TypeName == "__closure_fat_ptr"
-                || IsFatEncodedClosureType(field.TypeName);
+            if (field.TypeName == "__closure_fat_ptr" || IsFatEncodedClosureType(field.TypeName))
+                return true;
+            if (field.Pointer || field.ElemPointer || field.IsArrayView || field.IsAlias)
+                return false;
+            return !ThisClosureStoringType(field.TypeName).empty();
         });
+    // A nested type only propagates this ABI when its ctor actually stores a this-closure.
     if (!storesClosure) return false;
     return arguments.empty() || arguments.front().VariableName != functionName + "__"
         || !arguments.front().Pointer;
@@ -234,6 +238,8 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         s.codeValueDataCasts  = std::move(codeValueDataCasts_);
         s.owningTempUniqueFields = std::move(owningTempUniqueFields_);
         s.owningTempRawPointerFields = std::move(owningTempRawPointerFields_);
+        s.owningTempRawPointerFieldAddresses = std::move(owningTempRawPointerFieldAddresses_);
+        s.owningTempRawPointerFieldOwners = std::move(owningTempRawPointerFieldOwners_);
         s.launderedTempUniqueFields = std::move(launderedTempUniqueFields_);
         s.pendingLaunderTempUniqueFields = std::move(pendingLaunderTempUniqueFields_);
         s.dataValueCodeCasts  = std::move(dataValueCodeCasts_);
@@ -273,6 +279,8 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         codeValueDataCasts_.clear();
         owningTempUniqueFields_.clear();
         owningTempRawPointerFields_.clear();
+        owningTempRawPointerFieldAddresses_.clear();
+        owningTempRawPointerFieldOwners_.clear();
         launderedTempUniqueFields_.clear();
         pendingLaunderTempUniqueFields_.clear();
         dataValueCodeCasts_.clear();
@@ -327,6 +335,8 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         codeValueDataCasts_     = state.codeValueDataCasts;
         owningTempUniqueFields_ = state.owningTempUniqueFields;
         owningTempRawPointerFields_ = state.owningTempRawPointerFields;
+        owningTempRawPointerFieldAddresses_ = state.owningTempRawPointerFieldAddresses;
+        owningTempRawPointerFieldOwners_ = state.owningTempRawPointerFieldOwners;
         launderedTempUniqueFields_ = state.launderedTempUniqueFields;
         pendingLaunderTempUniqueFields_ = state.pendingLaunderTempUniqueFields;
         dataValueCodeCasts_     = state.dataValueCodeCasts;
@@ -399,6 +409,38 @@ bool LLVMBackend::IsSameCoreFileDefSite(const std::string& siteA, const std::str
         const std::filesystem::path& other = installedA.empty() ? pathA : pathB;
         std::string otherTail = TailBelowCoreDir(other);
         return !otherTail.empty() && otherTail == installedRel;
+    }
+
+bool LLVMBackend::TrackAggregateDefinitionSite(const std::string& name, const std::string& site,
+                                               bool isGenericTemplate)
+{
+        if (name.empty() || site.empty()) return false;
+        const std::string rejectedKey = name + "\n" + site;
+        if (rejectedAggregateDefSites_.count(rejectedKey) != 0) return false;
+
+        auto previous = aggregateDefSites_.find(name);
+        if (previous != aggregateDefSites_.end())
+        {
+            if (previous->second == site || IsSameCoreFileDefSite(previous->second, site)) return false;
+            const bool previousWasCore = coreAggregateDefs_.count(name) != 0;
+            // A user type beside a core one keeps master's handling: a warm --init cache never
+            // recorded the core site, so refusing here would differ between cold and warm compiles.
+            if (previousWasCore && !currentSourceIsCore_)
+            {
+                if (isGenericTemplate)
+                {
+                    previous->second = site;
+                    coreAggregateDefs_.erase(name);
+                }
+                return false;
+            }
+            if (!previousWasCore && currentSourceIsCore_) return false;
+            rejectedAggregateDefSites_.insert(rejectedKey);
+            return true;
+        }
+        aggregateDefSites_.emplace(name, site);
+        if (currentSourceIsCore_) coreAggregateDefs_.insert(name);
+        return false;
     }
 
 std::string LLVMBackend::ShortenDefSiteForDisplay(const std::string& site, bool isCore) const

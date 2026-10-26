@@ -170,5 +170,108 @@ extern int main()
         function<int(int)> f = t63.call_plus_one;
         int value = t63.call_fn_rvalue_ref_template(t63.CallFnRvalueRef(f));
     }
+    // T502: enum -> long and enum -> double are both conversions, so the candidates tie.
+    expect_error("ambiguous") {
+        cppcr.T502CtorUld value = cppcr.T502CtorUld(cppcr.T502UGreen);
+    }
+    expect_error("ambiguous") {
+        int value = cppcr.T502CtorUld(cppcr.T502UGreen).chosen;
+    }
+    expect_error("ambiguous") {
+        cppcr.T502CtorUld* value = new cppcr.T502CtorUld(cppcr.T502UGreen);
+    }
+    expect_error("ambiguous call") {
+        int value = cppcr.T502FnUld(cppcr.T502UGreen);
+    }
+    expect_error("ambiguous call") {
+        cppcr.T502ObjUld object = default;
+        int value = object.method(cppcr.T502UGreen);
+    }
+
+    // T502: scoped enum values have no implicit conversion to arithmetic parameters.
+    expect_error("has no constructor whose parameter types match") {
+        cppcr.T502CtorSId value = cppcr.T502CtorSId(cppcr.T502SColor.Green);
+    }
+    expect_error("has no constructor whose parameter types match") {
+        int value = cppcr.T502CtorSId(cppcr.T502SColor.Green).chosen;
+    }
+    expect_error("has no constructor whose parameter types match") {
+        cppcr.T502CtorSId* value = new cppcr.T502CtorSId(cppcr.T502SColor.Green);
+    }
+    expect_error("no overload") {
+        int value = cppcr.T502FnSId(cppcr.T502SColor.Green);
+    }
+    expect_error("no overload") {
+        cppcr.T502ObjSId object = default;
+        int value = object.method(cppcr.T502SColor.Green);
+    }
+
+    expect_error("has no constructor whose parameter types match") {
+        cppcr.T502CtorSil value = cppcr.T502CtorSil(cppcr.T502SColor.Green);
+    }
+    expect_error("has no constructor whose parameter types match") {
+        int value = cppcr.T502CtorSil(cppcr.T502SColor.Green).chosen;
+    }
+    expect_error("has no constructor whose parameter types match") {
+        cppcr.T502CtorSil* value = new cppcr.T502CtorSil(cppcr.T502SColor.Green);
+    }
+    expect_error("no overload") {
+        int value = cppcr.T502FnSil(cppcr.T502SColor.Green);
+    }
+    expect_error("no overload") {
+        cppcr.T502ObjSil object = default;
+        int value = object.method(cppcr.T502SColor.Green);
+    }
+
+    expect_error("has no constructor whose parameter types match") {
+        cppcr.T502CtorSld value = cppcr.T502CtorSld(cppcr.T502SColor.Green);
+    }
+    expect_error("has no constructor whose parameter types match") {
+        int value = cppcr.T502CtorSld(cppcr.T502SColor.Green).chosen;
+    }
+    expect_error("has no constructor whose parameter types match") {
+        cppcr.T502CtorSld* value = new cppcr.T502CtorSld(cppcr.T502SColor.Green);
+    }
+    expect_error("no overload") {
+        int value = cppcr.T502FnSld(cppcr.T502SColor.Green);
+    }
+    expect_error("no overload") {
+        cppcr.T502ObjSld object = default;
+        int value = object.method(cppcr.T502SColor.Green);
+    }
+
+    expect_error("has no constructor whose parameter types match") {
+        cppcr.T502CtorSbi value = cppcr.T502CtorSbi(cppcr.T502SColor.Green);
+    }
+    expect_error("has no constructor whose parameter types match") {
+        int value = cppcr.T502CtorSbi(cppcr.T502SColor.Green).chosen;
+    }
+    expect_error("has no constructor whose parameter types match") {
+        cppcr.T502CtorSbi* value = new cppcr.T502CtorSbi(cppcr.T502SColor.Green);
+    }
+    expect_error("no overload") {
+        int value = cppcr.T502FnSbi(cppcr.T502SColor.Green);
+    }
+    expect_error("no overload") {
+        cppcr.T502ObjSbi object = default;
+        int value = object.method(cppcr.T502SColor.Green);
+    }
+
+    expect_error("has no constructor whose parameter types match") {
+        cppcr.T502CtorSui value = cppcr.T502CtorSui(cppcr.T502SColor.Green);
+    }
+    expect_error("has no constructor whose parameter types match") {
+        int value = cppcr.T502CtorSui(cppcr.T502SColor.Green).chosen;
+    }
+    expect_error("has no constructor whose parameter types match") {
+        cppcr.T502CtorSui* value = new cppcr.T502CtorSui(cppcr.T502SColor.Green);
+    }
+    expect_error("no overload") {
+        int value = cppcr.T502FnSui(cppcr.T502SColor.Green);
+    }
+    expect_error("no overload") {
+        cppcr.T502ObjSui object = default;
+        int value = object.method(cppcr.T502SColor.Green);
+    }
     return 0;
 }

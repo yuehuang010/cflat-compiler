@@ -1,0 +1,66 @@
+import "list.cb";
+
+class B { int v = 0; double pad[8] = default; };
+class Bag
+{
+    list<B*> items;
+    void put2(B* p) { items.add(p); }
+    void put(B* p) { put2(p); }
+};
+list<B*> g_items = default;
+void putGlobal(B* p) { g_items.add(p); }
+struct LateS { int k = 0; void Set(int v) { k = v; } };
+
+extern int main()
+{
+    expect_error("'n' still owns the object it was given") {
+        Bag bag;
+        B* n = new B();
+        bag.put(n);
+    }
+
+    expect_error("'n' still owns the object it was given") {
+        B* n = new B();
+        function<void(B*)> f = putGlobal;
+        f(n);
+    }
+
+    expect_error("call through function pointer 'f'") {
+        B* n = new B();
+        function<void(B*)> f = putGlobal;
+        f(n);
+    }
+
+    expect_error("'n' still owns the object it was given") {
+        B* n = new B();
+        lateStore1(n);
+    }
+
+    expect_error("cannot call non-const member 'Set' on 's'") {
+        const LateS s = default;
+        B* n = new B();
+        lateRead(n);
+        s.Set(1);
+        delete n;
+    }
+
+    expect_error("'n' still owns the object it was given") {
+        const LateS s = default;
+        B* n = new B();
+        lateStore(n);
+        s.Set(1);
+    }
+
+    expect_error("cannot call non-const member 'Set' on 's'") {
+        const LateS s = default;
+        s.Set(1);
+        B* n = new B();
+        lateStore(n);
+    }
+    return 0;
+}
+
+void lateStore2(B* p) { g_items.add(p); }
+void lateStore1(B* p) { lateStore2(p); }
+void lateStore(B* p) { g_items.add(p); }
+void lateRead(B* p) { printf("%d\n", p->v); }

@@ -42,6 +42,7 @@
 #include <thread>
 #include <future>
 #include <optional>
+#include <memory>
 #if defined(_WIN32)
 #include <io.h>
 #endif
@@ -938,6 +939,7 @@ public:
         // A reader of these three must therefore NOT assume IsFunctionPointer (FuncPtrSignatureOf
         // is the first such reader); a reader of IsFunctionPointer may still assume these.
         std::string FuncPtrReturnTypeName;
+        std::shared_ptr<TypeAndValue> FuncPtrReturnFunctionType;
         bool FuncPtrReturnPointer = false;
         // Return ownership is semantic metadata carried by a stored function value. It is
         // recovered from the bound function symbol and makes indirect calls follow direct calls.
@@ -996,6 +998,7 @@ public:
             // Diagnostic spelling of a named pointer alias param ("" = none). TypeName/Pointer
             // hold the resolved base and depth; printing uses this spelling plus its written stars.
             std::string AliasSpelling;
+            std::shared_ptr<TypeAndValue> FunctionTypeSignature;
         };
         std::vector<FuncPtrParam> FuncPtrParams;
 
@@ -1419,6 +1422,7 @@ public:
         std::string GuardedBy;
         bool IsFunctionPointer = false;
         std::string FuncPtrReturnTypeName;
+        std::shared_ptr<SerializedTav> FuncPtrReturnFunctionType;
         bool FuncPtrReturnPointer = false;
         bool FuncPtrReturnOwned = false;
         bool FuncPtrReturnAlias = false;
@@ -1445,6 +1449,7 @@ public:
             std::string ResolvedTypeKey;
             int ConstMask = -1;
             std::string AliasSpelling;  // "" = none; see TypeAndValue::FuncPtrParam
+            std::shared_ptr<SerializedTav> FunctionTypeSignature;
         };
         std::vector<FuncPtrParam> FuncPtrParams;
         uint64_t ConstArraySize = 0;
@@ -1498,6 +1503,8 @@ public:
             s.GuardedBy = t.GuardedBy;
             s.IsFunctionPointer = t.IsFunctionPointer;
             s.FuncPtrReturnTypeName = t.FuncPtrReturnTypeName;
+            if (t.FuncPtrReturnFunctionType)
+                s.FuncPtrReturnFunctionType = std::make_shared<SerializedTav>(From(*t.FuncPtrReturnFunctionType));
             s.FuncPtrReturnPointer = t.FuncPtrReturnPointer;
             s.FuncPtrReturnOwned = t.FuncPtrReturnOwned;
             s.FuncPtrReturnAlias = t.FuncPtrReturnAlias;
@@ -1525,6 +1532,8 @@ public:
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
                 q.ConstMask = p.ConstMask;
                 q.AliasSpelling = p.AliasSpelling;
+                if (p.FunctionTypeSignature)
+                    q.FunctionTypeSignature = std::make_shared<SerializedTav>(From(*p.FunctionTypeSignature));
                 s.FuncPtrParams.push_back(std::move(q));
             }
             s.ConstArraySize = t.ConstArraySize;
@@ -1578,6 +1587,8 @@ public:
             t.GuardedBy = GuardedBy;
             t.IsFunctionPointer = IsFunctionPointer;
             t.FuncPtrReturnTypeName = FuncPtrReturnTypeName;
+            if (FuncPtrReturnFunctionType)
+                t.FuncPtrReturnFunctionType = std::make_shared<TypeAndValue>(FuncPtrReturnFunctionType->ToTypeAndValue());
             t.FuncPtrReturnPointer = FuncPtrReturnPointer;
             t.FuncPtrReturnOwned = FuncPtrReturnOwned;
             t.FuncPtrReturnAlias = FuncPtrReturnAlias;
@@ -1605,6 +1616,8 @@ public:
                 q.ResolvedTypeKey = p.ResolvedTypeKey;
                 q.ConstMask = p.ConstMask;
                 q.AliasSpelling = p.AliasSpelling;
+                if (p.FunctionTypeSignature)
+                    q.FunctionTypeSignature = std::make_shared<TypeAndValue>(p.FunctionTypeSignature->ToTypeAndValue());
                 t.FuncPtrParams.push_back(std::move(q));
             }
             t.ConstArraySize = ConstArraySize;
@@ -1705,6 +1718,7 @@ public:
         std::string ThisFieldPath;
         // Null-state key for a joined unique-field call-sink arm.
         std::string NullKey;
+        bool PointeeMove = false;
     };
 
     struct NamedVariable
@@ -1795,6 +1809,8 @@ public:
         // True only for a value-producing expression. Named variables, fields, elements, aliases,
         // and dereferences remain lvalues even when their LLVM value has no storage of its own.
         bool IsRvalue = false;
+        // Address-of a proven pointer lvalue yields a C++ pointer prvalue (`&p`). Transient.
+        bool IsCxxAddressOfPointerValue = false;
         // CFlat brace arguments load from their construction slot instead of a call instruction.
         bool IsCFlatBraceInitTemp = false;
         // Storage is this argument's C++ prvalue temp (call, operator or ctor result), not a named slot.
@@ -1905,6 +1921,8 @@ public:
         // design; only a same-block '->'/'.'/'*'/'[]' DEREFERENCE is rejected (see MarkVariableExplicitlyMovedNull).
         bool ExplicitlyMovedNull = false;
         llvm::BasicBlock* ExplicitNullBlock = nullptr; // the block the move was recorded in - the deref guard only fires inside this same block
+        bool PointeeMove = false; // the tracked move consumed *this binding's pointee*, not the pointer binding
+        llvm::BasicBlock* PointeeMoveBlock = nullptr;
         bool AddressEscaped = false; // '&name' was taken - the pointee may have been rewritten through it, so the deref guard is latched off for good
         std::unordered_set<std::string> MovedFields; // compile-time: field names moved out of this variable via a 'move' of a sub-path (e.g. `node->left`) - the base stays usable
         // compile-time: `static` local - Storage is a module global with program lifetime, not an
@@ -2191,6 +2209,7 @@ public:
         std::string  sourceMovePathKey;
         bool         sourceMovePathHasDynamicIndex = false;
         bool         sourceIsElementAccess = false;
+        bool         sourceIsPointeeMove = false;
         bool         sourceRootIsBorrowedThisField = false;
         std::string  sourceThisFieldPath;
         std::vector<ConditionalMoveSource> conditionalMoveSources;
@@ -2586,8 +2605,24 @@ public:
     // Third cycle guard, for ParameterMayReachReturn. Same reason: a key left by either escape
     // walk must never terminate the return walk, which asks a different question again.
     std::set<std::pair<const llvm::Function*, unsigned>> mayReachReturnInProgress_;
-    // Cycle guard for the depth-1 borrowing-container sink walk. A recursive call is not
-    // followed, but this also protects a parameter value that loops through a local slot.
+    // Per-(function, parameter) summary for borrowing-container sinks. Destinations are globals
+    // or caller-supplied method receivers, with the shortest helper-call distance to the sink.
+    struct BorrowingContainerSinkSummary
+    {
+        std::optional<unsigned> GlobalDepth;
+        std::map<unsigned, unsigned> ArgumentDepths;
+        bool UnmappedOutlivingDestination = false;
+        bool UnresolvedCallee = false;
+        bool ReachesSink() const
+        {
+            return GlobalDepth.has_value() || !ArgumentDepths.empty()
+                || UnmappedOutlivingDestination;
+        }
+    };
+    std::map<std::pair<const llvm::Function*, unsigned>, BorrowingContainerSinkSummary>
+        borrowingSinkMemo_;
+    // Cycle guard for interprocedural borrowing-container summaries and for a parameter value
+    // that loops through a local slot.
     std::set<std::pair<const llvm::Function*, unsigned>> borrowingSinkInProgress_;
     // Cycle guard for the select/phi arm walk in MemoryOutlivesCall: a loop-carried phi reaches
     // itself, and re-entering it must not be read as an arm that names local memory.
@@ -2912,10 +2947,21 @@ private:
     std::vector<llvm::Value*> owningTempUniqueFields_;
 
     std::vector<llvm::Value*> owningTempRawPointerFields_;
+    std::vector<llvm::Value*> owningTempRawPointerFieldAddresses_;
+    struct OwningTempRawPointerFieldOwner
+    {
+        llvm::Value* Result = nullptr;
+        llvm::Value* Storage = nullptr;
+    };
+    std::vector<OwningTempRawPointerFieldOwner> owningTempRawPointerFieldOwners_;
 
     void RegisterOwningTempUniqueField(llvm::Value* value);
 
     void RegisterOwningTempRawPointerField(llvm::Value* value);
+    void RegisterOwningTempRawPointerFieldAddress(llvm::Value* value);
+    void RegisterOwningTempRawPointerFieldOwner(llvm::Value* result, llvm::Value* storage);
+    std::vector<llvm::Value*> FindOwningTempRawPointerFieldOwners(
+        const llvm::Value* value, int depth = 0) const;
 
     bool IsLedgeredOwningTempUniqueField(const llvm::Value* value) const;
 
@@ -2934,6 +2980,7 @@ private:
     bool JoinCarriesOwningTempUniqueField(const llvm::Value* value, int depth = 0) const;
 
     bool JoinCarriesOwningTempRawPointerField(const llvm::Value* value, int depth = 0) const;
+    bool JoinCarriesOwningTempRawPointerFieldAddress(const llvm::Value* value, int depth = 0) const;
 
     /*
      * A call RESULT that was ledgered above because the call LAUNDERED a temp's `unique` field
@@ -3023,6 +3070,55 @@ private:
             const std::string& paramName);
 
     void ResolveDeferredTempUniqueFieldEscapes();
+
+    // Does the CFlat callee's parameter store its value where it outlives the call? throughCalls
+    // also follows direct calls into CFlat bodies (cycle- and depth-bounded) and local slots.
+    bool FunctionArgumentDefinitelyStoresOutsideCall(const llvm::Function* function,
+            size_t argumentIndex, bool throughCalls);
+
+    // Three-valued answer of the through-calls walk: Unknown (a bound, an unfollowed use, an
+    // indirect callee) is never a refusal; the owner is kept alive instead.
+public:
+    enum class RawPointerStoreVerdict { None, Unknown, Stores };
+private:
+    RawPointerStoreVerdict ClassifyArgumentStoreOutsideCall(const llvm::Function* function,
+            size_t argumentIndex);
+
+    // A by-value owner's raw pointer handed to a CFlat parameter: the store verdict is taken
+    // after the walk, so a callee or a helper it calls defined later in the file is final.
+    struct DeferredRawPointerCalleeStore
+    {
+        const llvm::Function* Callee = nullptr;
+        size_t ArgIndex = 0;
+        std::string ParamName;
+        std::string File;
+        size_t Line = 0;
+        size_t Column = 0;
+        // The expect_error scope the call sits in (0 = none); answered by ResolvePendingConstReceiverCalls.
+        size_t Owner = 0;
+        // Entry store of the owner's keep gate: false (owner kept) until the verdict is None.
+        llvm::WeakVH Gate;
+        bool Resolved = false;
+        RawPointerStoreVerdict Verdict = RawPointerStoreVerdict::Unknown;
+        // False where the call site reports its own diagnostic: only None opens the gate.
+        bool Refuse = true;
+    };
+    std::vector<DeferredRawPointerCalleeStore> deferredRawPointerCalleeStores_;
+
+    void RecordDeferredRawPointerCalleeStore(const llvm::Function* callee, size_t argIndex,
+            const std::string& paramName, size_t line, size_t column,
+            const std::vector<llvm::Value*>& owners, const llvm::Value* argValue,
+            bool refuse = true);
+    // Takes each deferred verdict once every body is emitted and opens the keep gates it clears.
+    void ResolveRawPointerCalleeStoreVerdicts();
+    // Pending struct temps a field value was read from (through loads, GEPs, extracts, spills).
+    std::vector<llvm::Value*> FindPendingStructTempOwnersOf(const llvm::Value* value) const;
+    // Arms a keep gate on the owners (or the temps `value` was read from): the entry store it
+    // returns holds false until a proof patches it true. Null when no owner could be gated.
+    llvm::StoreInst* GateOwnedStructTemps(const std::vector<llvm::Value*>& owners,
+            const llvm::Value* value);
+
+    static std::string DescribeRawPointerCalleeStore(const std::string& paramName);
 
     // Every hop of a candidate launder really does hand its parameter back.
     bool LaunderCondsAllProve(const std::vector<std::pair<const llvm::Function*, unsigned>>& conds);
@@ -3386,6 +3482,15 @@ private:
         std::vector<std::pair<const llvm::Function*, unsigned>> LaunderConds;
     };
     std::vector<TempUniqueFieldArg> tempUniqueFieldArgs_;
+    // Keep gates on the owners of temp unique fields passed straight to a CFlat parameter: opened
+    // only by a None store verdict (ResolveRawPointerCalleeStoreVerdicts).
+    struct TempUniqueFieldGate
+    {
+        const llvm::Function* Callee = nullptr;
+        unsigned ArgIndex = 0;
+        llvm::WeakVH Gate;
+    };
+    std::vector<TempUniqueFieldGate> tempUniqueFieldGates_;
     // A blessed unique<X> argument reaches a raw-pointer parameter through get()/release(), so the
     // value the callee receives is not the argument NamedVariable's Primary. Map it back so the
     // temp-field diagnostics keep naming the source field.
@@ -3403,6 +3508,10 @@ private:
         std::string File;
         size_t Line = 0;
         size_t Column = 0;
+        const llvm::Function* IndirectCaller = nullptr;
+        const llvm::Value* FunctionPointerStorage = nullptr;
+        const llvm::Function* IndirectTarget = nullptr;
+        size_t Owner = 0;
     };
     std::vector<OwningLocalBorrowingHelperArg> owningLocalBorrowingHelperArgs_;
 
@@ -3816,6 +3925,10 @@ private:
     // (currentSourceIsCore_ was true when the site was recorded). Lets the redefinition guard in
     // CreateInterfaceDefinition tell a core/user name collision apart from a user/user one.
     std::unordered_set<std::string> coreInterfaceDefs_;
+    // Aggregate definition sites are transient: forward scanning and codegen both visit a type.
+    std::unordered_map<std::string, std::string> aggregateDefSites_;
+    std::unordered_set<std::string> coreAggregateDefs_;
+    std::unordered_set<std::string> rejectedAggregateDefSites_;
     // Class name -> base-clause interface names, scanned before codegen so a conversion site sees
     // classes declared LATER. STATIC-CHECK ONLY: driving vtable emission off it would cache a
     // vtable built against a still-opaque StructType (null field offsets, empty destructor).
@@ -5651,11 +5764,26 @@ private:
     bool ParameterMayReachReturn(const llvm::Function* fn, unsigned argIndex, int depth = 0,
                                  ReturnReachLeaves* leaves = nullptr);
 
-    // True only when a bare pointer parameter reaches a direct borrowing-container element sink
-    // whose receiver names memory that outlives the callee frame. Unknown answers are false.
+    // True only when a bare pointer parameter reaches a borrowing-container sink through defined
+    // helpers and the destination is a global or method receiver. Unknown answers are false.
     bool ParameterMayReachBorrowingContainerSink(const llvm::Function* fn, unsigned argIndex,
                                                  int depth = 0);
-    bool ValueMayReachBorrowingContainerSink(const llvm::Value* root, int depth);
+    BorrowingContainerSinkSummary BorrowingContainerSinkSummaryForParameter(
+        const llvm::Function* fn, unsigned argIndex, int depth = 0);
+    bool ValueMayReachBorrowingContainerSink(const llvm::Function* fn, const llvm::Value* root,
+        int depth, BorrowingContainerSinkSummary& summary);
+    void AddBorrowingContainerSinkDestination(const llvm::Function* fn, const llvm::Value* ptr,
+        unsigned depth, BorrowingContainerSinkSummary& summary) const;
+    const llvm::Function* FunctionPointerTargetFromValue(const llvm::Value* value,
+        int depth = 0, const llvm::DominatorTree* dominatorTree = nullptr) const;
+    const llvm::Function* FunctionPointerTargetFromLocal(const llvm::Value* storage,
+        int depth = 0, const llvm::DominatorTree* dominatorTree = nullptr) const;
+    bool FunctionPointerLocalHasSingleNamedTarget(const llvm::Function* caller,
+        const llvm::Value* storage, const llvm::Function* target,
+        const llvm::DominatorTree& dominatorTree) const;
+    void RecordOwningLocalFunctionPointerArg(const std::string& functionName,
+        const std::string& parameterName, unsigned paramIndex, const NamedVariable& arg,
+        const llvm::Function* target, const llvm::Value* storage);
 
     // Worklist half of ParameterMayReachReturn. Not memoized, for the same reason
     // OwningPtrProvablyEscapes is not: the query is rare and a body may still be growing.
@@ -5782,7 +5910,10 @@ private:
 
     // Re-ask the recorded questions now that every body is complete, and reject what is proven.
     void ResolveTempUniqueFieldArgEscapes();
-    void ResolveOwningLocalBorrowingHelperArgs();
+    void ResolveOwningLocalBorrowingHelperArgs(bool aborted = false);
+    bool OwningLocalBorrowingHelperRefuses(
+        const OwningLocalBorrowingHelperArg& entry, const llvm::DominatorTree* dominatorTree);
+    void ReportOwningLocalBorrowingHelperRefusal(const OwningLocalBorrowingHelperArg& entry);
 
     void RejectTempUniqueFieldArgEscape(const TempUniqueFieldArg& entry, const std::string& destKind);
 
@@ -7832,6 +7963,8 @@ public:
         std::vector<std::pair<llvm::Value*, size_t>> codeValueDataCasts;
         std::vector<llvm::Value*> owningTempUniqueFields;
         std::vector<llvm::Value*> owningTempRawPointerFields;
+        std::vector<llvm::Value*> owningTempRawPointerFieldAddresses;
+        std::vector<OwningTempRawPointerFieldOwner> owningTempRawPointerFieldOwners;
         std::vector<LaunderedTempUniqueField> launderedTempUniqueFields;
         std::vector<PendingLaunderTempUniqueField> pendingLaunderTempUniqueFields;
         std::vector<std::pair<llvm::Value*, size_t>> dataValueCodeCasts;
@@ -7894,6 +8027,10 @@ public:
      * name; the far likelier collision - a user file anywhere else - still reports.
      */
     bool IsSameCoreFileDefSite(const std::string& siteA, const std::string& siteB) const;
+
+    // Returns true once for each second aggregate definition in the same scope.
+    bool TrackAggregateDefinitionSite(const std::string& name, const std::string& site,
+                                     bool isGenericTemplate);
 
     std::string ShortenDefSiteForDisplay(const std::string& site, bool isCore) const;
 
@@ -10759,7 +10896,8 @@ public:
     // The constructor C++ selects for a clang-resolved call narrows a scalar argument: the
     // refusal (after "C++ class 'X' "), empty when nothing narrows or the ranking cannot decide.
     std::string CxxCtorSelectedNarrowingError(const std::string& typeName,
-                                              const std::vector<NamedVariable>& argVars);
+                                              const std::vector<NamedVariable>& argVars,
+                                              bool floatToIntegerOnly = false);
     /*
      * Name of the `explicit` constructor of `typeName` that WOULD have taken `argTypes` had it
      * been implicit. Empty when none exists. Drives the diagnostic at a call argument.
@@ -11278,6 +11416,10 @@ public:
         // '*' count, or 0 for "not recorded" - one-sided like Known, so an unrecorded depth on
         // either side proves nothing. Both Canon and this must be known to reject on depth.
         int PointerDepth = 0;
+        bool IsFunctionType = false;
+        bool FunctionIsThin = false;
+        bool FunctionVariadic = false;
+        std::vector<FuncPtrComponent> FunctionComponents;
     };
 
     // Resolve an alias chain (and an enum to its backing type) to whatever it ultimately names.
@@ -11342,6 +11484,9 @@ public:
     FuncPtrComponent FuncPtrComponentOf(const std::string& typeName, bool pointer,
         int pointerDepth = 0, const std::string& resolvedKey = "",
         bool isArrayView = false, int constMask = -1, bool isAlias = false) const;
+    FuncPtrComponent FuncPtrFunctionTypeComponentOf(const TypeAndValue& signature, bool pointer,
+        int pointerDepth, bool isArrayView, int constMask, bool isAlias) const;
+    FuncPtrComponent FuncPtrComponentOf(const TypeAndValue::FuncPtrParam& param) const;
 
     /*
      * One-sided: true only when BOTH components resolve AND name provably different types.
@@ -11807,7 +11952,7 @@ public:
     // Clears the bond on a local variable (called when the bonded variable is reassigned).
     void ClearVariableBond(const std::string& name);
 
-    void MarkVariableMoved(const std::string& name);
+    void MarkVariableMoved(const std::string& name, bool pointeeMove = false);
 
     // Mark a local whose ownership was boxed into an interface ('IFace x = ptr'). Distinct from
     // the generic moved flag: deleting such a source is a no-op that leaks (the interface owns the
@@ -11912,7 +12057,7 @@ public:
     // ExplicitlyMovedNull on NamedVariable). No-op once AddressEscaped latches - an escaped
     // address may have rewritten the pointee, so the deref guard can never be sound again.
     // Deliberately does not touch IsMoved: plain reads of this variable must stay legal.
-    void MarkVariableExplicitlyMovedNull(const std::string& name);
+    void MarkVariableExplicitlyMovedNull(const std::string& name, bool pointeeMove = false);
 
     // Reassigning the local makes it live again - clears the deref guard set by an explicit move.
     void MarkVariableNotExplicitlyMovedNull(const std::string& name);
@@ -11931,6 +12076,8 @@ public:
     // in-function lowering branches, so its arms are separate blocks and need no suppression).
     // This is deliberately narrower than a real null-narrowing analysis - see the field comment.
     bool IsExplicitlyMovedNullHere(const NamedVariable& nv) const;
+    bool IsMovedDerefHere(const NamedVariable& nv) const;
+    std::string MovedDerefDiagnostic(const NamedVariable& nv) const;
 
     // Cross-block half: log this dereference for the MAY-null fixpoint. Only whole-local owning
     // pointers/interfaces can ever receive a SetNull event, so nothing else is worth logging.
@@ -11974,8 +12121,9 @@ public:
     // --- Explicit-move null-state event recording (cross-block deref diagnostic). ---
     // Same block-tagging discipline as RecordMoveEvent: dropped when no block is being
     // emitted into (e.g. the ForwardRefScanner pre-pass).
-    void RecordNullEvent(nulldf::EventKind kind, const std::string& name, int line, int col);
-    void RecordNullSet(const std::string& name);
+    void RecordNullEvent(nulldf::EventKind kind, const std::string& name, int line, int col,
+                         bool pointeeMove = false);
+    void RecordNullSet(const std::string& name, bool pointeeMove = false);
     void RecordNullClear(const std::string& name);
     void RecordNullEscape(const std::string& name);
     // Any NON-dereference read. Recorded broadly on purpose: an unrecorded read is the only way
@@ -12209,6 +12357,8 @@ public:
     struct MovedStateSnapshot
     {
         std::map<std::string, bool> moved;
+        std::map<std::string, bool> pointeeMoved;
+        std::map<std::string, llvm::BasicBlock*> pointeeMoveBlocks;
         std::map<std::string, std::unordered_set<std::string>> movedFields;
     };
 
@@ -12644,11 +12794,15 @@ public:
     }
     // Its scope ended without an error: true (and disarmed) when pending #8 entries decide it.
     bool DeferExpectationVerdict();
+    void ResolveDeferredExpectationVerdicts(bool aborted = false);
     void DiscardExpectScopeEntries(size_t scope)
     {
         if (scope == 0) return;
         std::erase_if(pendingConstReceiverCalls_, [&](const auto& e) { return e.Owner == scope; });
         std::erase_if(thisClosureCopySites_, [&](const auto& e) { return e.Owner == scope; });
+        std::erase_if(owningLocalBorrowingHelperArgs_, [&](const auto& e) { return e.Owner == scope; });
+        std::erase_if(deferredRawPointerCalleeStores_,
+                      [&](const auto& e) { return e.Owner == scope; });
     }
 
     /*
@@ -12698,6 +12852,7 @@ public:
         size_t Column = 0;
         size_t Owner = 0;
         const llvm::Function* Function = nullptr;   // identity only
+        bool FromGenericAggregateBody = false;
     };
     std::vector<ThisClosureCopySite> thisClosureCopySites_;
     // Ctor functions returning their object by value: their CtorReturn site stands for every
@@ -12706,6 +12861,7 @@ public:
     bool MakeThisClosureCopySite(const std::string& typeName, ThisClosureCopyKind kind,
                                  ThisClosureCopySite& site);
     void NoteThisClosureCopySite(const std::string& typeName, ThisClosureCopyKind kind);
+    void NoteThisClosureMemberCall(const llvm::Function* callee);
     // The type itself, or one held by value in it, that stores a this-capturing closure; empty
     // when none does.
     std::string ThisClosureStoringType(const std::string& typeName) const;

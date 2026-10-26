@@ -396,6 +396,7 @@ namespace nulldf
         std::string name;
         int line = 0;
         int col = 0;
+        bool pointeeMove = false;
     };
 
     struct Divergence
@@ -403,6 +404,7 @@ namespace nulldf
         std::string name;
         int line = 0;
         int col = 0;
+        bool pointeeMove = false;
     };
 
     // A control-dependence edge is the (branch block, chosen successor) pair.
@@ -411,8 +413,13 @@ namespace nulldf
     // Kept sorted and unique by SortUnique so containment is a linear merge (see IsSubset).
     using CdSet = std::vector<CdEdge>;
 
-    // Blocks still pending as move witnesses for one name, keyed by the move's block.
-    using WitnessSet = std::unordered_set<llvm::BasicBlock*>;
+    // Keep move origin with each witness so the dereference diagnostic names the moved object.
+    struct WitnessSet
+    {
+        std::unordered_set<llvm::BasicBlock*> wholeMoves;
+        std::unordered_set<llvm::BasicBlock*> pointeeMoves;
+        bool operator==(const WitnessSet&) const = default;
+    };
     using NullState = std::map<std::string, WitnessSet>;
 
     // Functions already proven to never return (see FunctionNeverReturns). A backend-side side
@@ -650,7 +657,9 @@ namespace nulldf
     {
         switch (e.kind)
         {
-        case EventKind::SetNull:   s[e.name].insert(e.block); break;
+        case EventKind::SetNull:
+            (e.pointeeMove ? s[e.name].pointeeMoves : s[e.name].wholeMoves).insert(e.block);
+            break;
         case EventKind::ClearNull:
         case EventKind::ClearFields:
             // Re-binding a struct path also re-initializes every field path under it ("s" -> "s.p").
@@ -668,7 +677,11 @@ namespace nulldf
 
     inline void MergeInto(NullState& into, const NullState& from)
     {
-        for (const auto& [name, w] : from) into[name].insert(w.begin(), w.end());
+        for (const auto& [name, w] : from)
+        {
+            into[name].wholeMoves.insert(w.wholeMoves.begin(), w.wholeMoves.end());
+            into[name].pointeeMoves.insert(w.pointeeMoves.begin(), w.pointeeMoves.end());
+        }
     }
 
     // Forward union fixpoint carrying, per name, the set of move blocks still un-read and
@@ -748,13 +761,23 @@ namespace nulldf
                 if (e->line <= 0) continue;
                 auto wit = running.find(e->name);
                 if (wit == running.end()) continue;
-                bool guarded = true;
-                for (llvm::BasicBlock* m : wit->second)
-                    if (IsSubset(cd.Closure(bb), cd.Closure(m))) { guarded = false; break; }
-                if (guarded) continue;
+                bool foundUnguardedWitness = false;
+                bool allUnguardedWitnessesArePointeeMoves = true;
+                auto inspectWitnesses = [&](const auto& witnesses, bool isPointeeMove) {
+                    for (llvm::BasicBlock* m : witnesses)
+                        if (IsSubset(cd.Closure(bb), cd.Closure(m)))
+                        {
+                            foundUnguardedWitness = true;
+                            allUnguardedWitnessesArePointeeMoves &= isPointeeMove;
+                        }
+                };
+                inspectWitnesses(wit->second.wholeMoves, false);
+                inspectWitnesses(wit->second.pointeeMoves, true);
+                if (!foundUnguardedWitness) continue;
                 if (seen.insert(e->name + ":" + std::to_string(e->line) + ":" +
                                 std::to_string(e->col)).second)
-                    out.push_back({ e->name, e->line, e->col });
+                    out.push_back({ e->name, e->line, e->col,
+                                    allUnguardedWitnessesArePointeeMoves });
             }
         }
         return out;

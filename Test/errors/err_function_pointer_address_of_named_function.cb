@@ -32,4 +32,57 @@ expect_error("'&t478Generic<int>' is already the function value") {
     }
 }
 
+int t501OtherFunction(int x) { return x - 1; }
+int t501UseDoubleSlot(function<int(int)>** p) { return p == nullptr ? 0 : 1; }
+
+expect_error("function value 'function<int(int)>'; drop the '&'") {
+    int t501BadDoubleDecl() {
+        function<int(int)>** pp = &t478NamedFunction;
+        return pp == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("function value 'function<int(int)>'; drop the '&'") {
+    int t501BadDoubleAssign() {
+        function<int(int)>** pp = nullptr;
+        pp = &t478NamedFunction;
+        return 0;
+    }
+}
+
+expect_error("function value 'function<int(int)>'; drop the '&'") {
+    int t501BadDoubleArgument() {
+        return t501UseDoubleSlot(&t478NamedFunction);
+    }
+}
+
+expect_error("function value 'function<int(int)>'; drop the '&'") {
+    function<int(int)>** t501BadDoubleReturn() {
+        return &t478NamedFunction;
+    }
+}
+
+expect_error("function value 'function<int(int)>'; drop the '&'") {
+    struct T501DoubleField { function<int(int)>** pp = &t478NamedFunction; };
+    int t501BadDoubleField() {
+        T501DoubleField value = default;
+        return value.pp == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("function value 'function<int(int)>'; drop the '&'") {
+    struct T501DoubleBrace { function<int(int)>** pp = nullptr; };
+    int t501BadDoubleBrace() {
+        T501DoubleBrace value = { pp = &t478NamedFunction };
+        return value.pp == nullptr ? 1 : 0;
+    }
+}
+
+expect_error("function value 'function<int(int)>'; drop the '&'") {
+    int t501BadDoubleTernary(bool select) {
+        function<int(int)>** pp = select ? &t478NamedFunction : &t501OtherFunction;
+        return pp == nullptr ? 1 : 0;
+    }
+}
+
 extern int main() { return 0; }

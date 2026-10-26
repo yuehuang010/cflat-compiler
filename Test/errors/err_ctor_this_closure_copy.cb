@@ -106,8 +106,110 @@ void t407OuterOutOfScope()
 
 // A struct holding one by value without a closure field of its own returns from its ctor by value.
 struct T407D { int id = 0; Lambda<int()> f = default; T407D() { this.f = () => { return this.id; }; } };
-expect_error("the constructor of 'T407Holder' returns the object by value, which would leave its stored closure pointing at the constructor's temporary ('this' captured in T407D's constructor)") {
-    struct T407Holder { T407D d = default; int x = 0; };
+struct T407Holder { T407D d = default; int x = 0; };
+expect_error("copying 'T407Holder' would leave its stored closure") {
+    void t407CopyHolder()
+    {
+        T407Holder source = default;
+        T407Holder copy = source;
+    }
+}
+
+struct T515ListS { int id = 0; Lambda<int()> f = default; T515ListS(int i) { this.id = i; this.f = () => { return this.id; }; } };
+struct T515PlainAliasGetter
+{
+    T515ListS* value = nullptr;
+    alias T515ListS get() { return *value; }
+};
+
+void t515ListAddCopy()
+{
+    list<T515ListS> values = default;
+    T515ListS source = T515ListS(3);
+    expect_error("copying 'T515ListS' would leave its stored closure") { values.add(source); }
+}
+
+void t515ListSetCopy()
+{
+    list<T515ListS> values = default;
+    T515ListS source = T515ListS(3);
+    expect_error("copying 'T515ListS' would leave its stored closure") { values.set(0, source); }
+}
+
+void t515ListInsertCopy()
+{
+    list<T515ListS> values = default;
+    T515ListS source = T515ListS(3);
+    expect_error("copying 'T515ListS' would leave its stored closure") { values.insert(0, source); }
+}
+
+void t515ListCopy()
+{
+    list<T515ListS> values = default;
+    expect_error("copying 'T515ListS' would leave its stored closure") {
+        list<T515ListS> copy = values.copy();
+    }
+}
+
+void t515ListCopyAllocator()
+{
+    list<T515ListS> values = default;
+    expect_error("copying 'T515ListS' would leave its stored closure") {
+        list<T515ListS> copy = values.copy(__active_allocator);
+    }
+}
+
+void t515ListInterfaceCopy()
+{
+    list<T515ListS> values = default;
+    ICopyable<list<T515ListS>> copier = values;
+    expect_error("copying 'T515ListS' would leave its stored closure") {
+        list<T515ListS> copy = copier.copy();
+    }
+}
+
+void t515ListInterfaceParamCopy(ICopyable<list<T515ListS>> copier)
+{
+    expect_error("copying 'T515ListS' would leave its stored closure") {
+        list<T515ListS> copy = copier.copy();
+    }
+}
+
+void t515ListIndexElementCopy()
+{
+    list<T515ListS> values = default;
+    expect_error("copying 'T515ListS' would leave its stored closure") {
+        T515ListS copy = values[0];
+    }
+}
+
+void t515ListGetElementCopy()
+{
+    list<T515ListS> values = default;
+    expect_error("copying 'T515ListS' would leave its stored closure") {
+        T515ListS copy = values.get(0);
+    }
+}
+
+void t515PlainAliasGetterCopy()
+{
+    T515ListS source = T515ListS(3);
+    T515PlainAliasGetter getter = default;
+    getter.value = &source;
+    expect_error("copying 'T515ListS' would leave its stored closure") {
+        T515ListS copy = getter.get();
+    }
+}
+
+void t515RangeElementCopy()
+{
+    list<T515ListS> values = default;
+    expect_error("copying 'T515ListS' would leave its stored closure") {
+        for (T515ListS item in values)
+        {
+            T515ListS copy = item;
+        }
+    }
 }
 
 extern int main()

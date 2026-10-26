@@ -749,11 +749,7 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
                 && activeTypeSubstitutions.find(resolved) == activeTypeSubstitutions.end())
             {
                 auto* compiler = Compiler(entry);
-                std::vector<std::string> aggregateScopes;
-                for (auto it = structScopeStack.rbegin(); it != structScopeStack.rend(); ++it)
-                    aggregateScopes.push_back(*it);
-                if (aggregateScopes.empty())
-                    aggregateScopes = EnclosingAggregateNamesFromContext(compiler, typeSpec);
+                const auto aggregateScopes = EnclosingAggregateScopesForType(typeSpec);
                 const std::string contextual = ResolveContextualTypeName(compiler,
                     typeSpec->getText(), compiler->ResolveTypeArgBaseName(resolved),
                     typeSpec, aggregateScopes, NamespaceNameFromContext(compiler, typeSpec));
@@ -1969,9 +1965,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName, wasSubstituted);
                     if (!wasSubstituted && IsUnparameterizedNamedTypeSpecifier(typeSpec))
                     {
-                        std::vector<std::string> aggregateScopes;
-                        for (auto it = structScopeStack.rbegin(); it != structScopeStack.rend(); ++it)
-                            aggregateScopes.push_back(*it);
+                        const auto aggregateScopes = EnclosingAggregateScopesForType(typeSpec);
                         const std::string contextual = ResolveContextualTypeName(
                             Compiler(declSpecs), typeSpec->getText(), typeName,
                             typeSpec, aggregateScopes,
@@ -3458,6 +3452,7 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
         std::string target;
         uint8_t targetConstMask = 0;
         int substConstDepth = 0;
+        bool targetWasSubstituted = false;
         if (auto* nestedType = typeSpec->typeName())
         {
             auto nestedValue = ParseTypeName(nestedType, true, ctx);
@@ -3480,11 +3475,20 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
                     // A pointee-const argument (T = (const int)*) keeps its const depth through the alias.
                     substConstDepth = activeTypeSubstitutions.ConstDepth(target);
                     target = subst->second;
+                    targetWasSubstituted = true;
                 }
                 targetConstMask = compiler->ResolveTypeAliasConstMask(target);
                 if (substConstDepth > 0)
                     targetConstMask |= static_cast<uint8_t>((1u << std::min(substConstDepth, 7)) - 1u);
             }
+        }
+        if (!targetWasSubstituted && IsUnparameterizedNamedTypeSpecifier(typeSpec))
+        {
+            const std::string contextual = ResolveContextualTypeName(compiler,
+                typeSpec->getText(), compiler->ResolveQualifiedName(target), typeSpec,
+                EnclosingAggregateScopesForType(typeSpec),
+                NamespaceNameFromContext(compiler, typeSpec));
+            if (!contextual.empty()) target = contextual;
         }
         // A pointer alias (using Handle = void*) stores its trailing stars in the alias string;
         // the stars are peeled back onto the pointer flags at the resolution site (GetType /
@@ -6255,8 +6259,6 @@ cxx_dtor_ready:
                     ? ParseCxxConstRefTernaryTemp(argAssign, ctorRefDest)
                     : ParseAssignmentExpressionNamed(argAssign);
                 NormalizeCxxRvalueReferenceArgument(argAssign, nv);
-                BindCxxCtorPointerSlotAddress(argAssign, nv, typeName, ctorArguments.size(),
-                                              ctorArgs->argumentNamedExpression().size());
                 compiler->LowerNonCapturingClosureForCxx(
                     nv, compiler->StdFunctionClosureSignature(typeName));
                 if (std::string refusal = compiler->CxxClosureArgumentRefusal(
@@ -6316,6 +6318,7 @@ cxx_dtor_ready:
                 // sees the literal identity carried by nv.
                 addressVar.Primary = argValue;
                 addressVar.BaseType = argValue ? argValue->getType() : nullptr;
+                addressVar.SourceExpressionContext = argAssign;
                 // Only an address-less constant is provably a temporary here; a nameless
                 // expression with storage (ternary, reference-returning call) stays an lvalue.
                 if (llvm::isa_and_nonnull<llvm::Constant>(argValue) && nv.Storage == nullptr
@@ -6387,10 +6390,35 @@ cxx_dtor_ready:
             // A constructor template can outrank the listed pick (or the listed refusal): let
             // clang resolve `T(args)` over every constructor, and keep the listed pick otherwise.
             bool nullPointerCandidate = false;
-            const bool clangResolves =
+            bool clangResolves =
                 compiler->CxxConstructorNeedsClangResolution(
                     typeName, ctor, argTypes, &ctorArgumentAddresses, /*allowExplicit*/ true,
                     &nullPointerCandidate);
+            if (ctor == nullptr && !clangResolves
+                && !why.starts_with("matches more than one constructor overload"))
+            {
+                bool slotBound = false;
+                for (size_t i = 0; i < ctorArgumentAddresses.size(); ++i)
+                {
+                    auto& arg = ctorArgumentAddresses[i];
+                    BindCxxCtorPointerSlotAddress(arg.SourceExpressionContext, arg, typeName, i,
+                                                  ctorArgumentAddresses.size());
+                    if (arg.Storage == nullptr || !arg.IsCxxAddressOfPointerValue) continue;
+                    argTypes[i] = arg.TypeAndValue;
+                    argValues[i] = LoadNamedVariable(arg);
+                    slotBound = true;
+                }
+                if (slotBound)
+                {
+                    why.clear();
+                    ctor = compiler->SelectCxxConstructor(typeName, argTypes, why, false,
+                                                          &ctorArgumentAddresses);
+                    nullPointerCandidate = false;
+                    clangResolves = compiler->CxxConstructorNeedsClangResolution(
+                        typeName, ctor, argTypes, &ctorArgumentAddresses, /*allowExplicit*/ true,
+                        &nullPointerCandidate);
+                }
+            }
             const bool clangOnlyConstructorSet = scalarReferenceSet || nullPointerCandidate;
             hardReferenceRejection = !clangOnlyConstructorSet
                 && (why.starts_with("constructor '") || why.starts_with("no overload of '"));
@@ -6398,9 +6426,22 @@ cxx_dtor_ready:
                     compiler->CxxConstructorCopySinkError(ctor, ctorArguments);
                 !sink.empty())
                 LogErrorContext(direct, sink);
-            // Scalar table (ruling 2026-10-09): clang must not take a narrowing or other-enum argument.
             const bool narrowingRefused
                 = compiler->CxxCtorSetRequiresNarrowing(typeName, &ctorArguments);
+            if (narrowingRefused
+                && compiler->CxxCtorSetRequiresFloatToInteger(typeName, argTypes))
+            {
+                std::string floatNarrowing
+                    = compiler->CxxCtorSelectedNarrowingError(typeName, ctorArguments, true);
+                if (floatNarrowing.empty())
+                    floatNarrowing = "all viable constructors require a floating-to-integer conversion "
+                        "(no implicit narrowing at a call); cast it explicitly";
+                LogErrorContext(direct, std::format("C++ class '{}' {}; {}",
+                    compiler->DisplayCxxClassName(typeName),
+                    compiler->CxxCtorNoMatchReason(argTypes), floatNarrowing));
+                return true;
+            }
+            // Scalar table (ruling 2026-10-09): clang must not take a narrowing or other-enum argument.
             // The set keeps a non-narrowing candidate: the one C++ selects must not narrow either.
             if (!narrowingRefused && ((ctor == nullptr && !hardReferenceRejection) || clangResolves))
                 if (const std::string narrowing
@@ -6429,6 +6470,14 @@ cxx_dtor_ready:
                         argVar.Storage = ctorArgumentAddresses[ai].Storage;
                         argVar.IsExplicitMove = ctorArgumentAddresses[ai].IsExplicitMove;
                         argVar.IsRvalue = ctorArgumentAddresses[ai].IsRvalue;
+                        // A slot-bound `&p` is the lvalue p itself, so it takes the T* slot shape.
+                        if (argVar.Storage != nullptr && ctorArgumentAddresses[ai].IsCxxAddressOfPointerValue)
+                        {
+                            argVar.IsCxxAddressOfPointerValue = false;
+                            argVar.TypeAndValue.ElemPointer = false;
+                            argVar.TypeAndValue.PointerDepth = 1;
+                            argVar.BaseType = ctorArgumentAddresses[ai].BaseType;
+                        }
                     }
                     thunkArguments.push_back(std::move(argVar));
                 }
@@ -6605,7 +6654,8 @@ cxx_dtor_ready:
             }
             if (srcNV->IsMoved || srcNV->ExplicitlyMovedNull)
             {
-                LogErrorContext(moveExpr, std::format("use of moved variable '{}'", srcName));
+                LogMovedUse(moveExpr, srcName,
+                            IsPointeeMoveUse(*srcNV) && srcNV->CallerName == srcName, true);
                 return true;
             }
             compiler->SetCurrentDebugLocation(line);
@@ -6785,7 +6835,8 @@ cxx_dtor_ready:
                 {
                     if (srcNV->IsMoved || srcNV->ExplicitlyMovedNull)
                     {
-                        LogErrorContext(assign, std::format("use of moved variable '{}'", srcText));
+                        LogMovedUse(assign, srcText,
+                                    IsPointeeMoveUse(*srcNV) && srcNV->CallerName == srcText, true);
                         return true;
                     }
                     compiler->SetCurrentDebugLocation(line);
@@ -8180,6 +8231,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     typeAndValue.ConstArraySize = typeAndValue.AliasArraySize;
                 }
                 typeAndValue.VariableName = name;
+                PendingCallVisibleLocalScope pendingCallName(this, compiler, name, typeAndValue, initDecl);
 
                 // `static` local: module-global storage, initializer runs at most once. The guard
                 // opens HERE - before this declarator's IR - and closes on every path out of it.
@@ -9077,8 +9129,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                                                      : nullptr;
                                             srcNV != nullptr && (srcNV->IsMoved || srcNV->ExplicitlyMovedNull))
                                         {
-                                            LogErrorContext(moveSource, std::format(
-                                                "use of moved variable '{}'", movedName));
+                                            LogMovedUse(moveSource, movedName,
+                                                        IsPointeeMoveUse(*srcNV)
+                                                            && srcNV->CallerName == movedName,
+                                                        true);
                                             continue;
                                         }
                                         compiler->RequestStaticLocalStorage(name, typeAndValue.TypeName);
@@ -11396,6 +11450,25 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
 
                     if (right != nullptr && !bindAliasReference)
                     {
+                        // A by-value declaration from a borrow is still a copy even though the
+                        // source's LLVM value is an address; explicit moves retain their ruling.
+                        if (haveInitializerSourceNV && !typeAndValue.Pointer
+                            && !typeAndValue.IsAlias && !typeAndValue.IsArrayView
+                            && !initializerSourceNV.TypeAndValue.Pointer
+                            && !initializerSourceNV.TypeAndValue.IsArrayView
+                            && !srcIsMove && !initializerSourceNV.TypeAndValue.IsMove
+                            && right->getType()->isStructTy()
+                            && compiler->IsDataStructure(typeAndValue.TypeName)
+                            && compiler->ResolveTypeAlias(typeAndValue.TypeName)
+                                == compiler->ResolveTypeAlias(
+                                    initializerSourceNV.TypeAndValue.TypeName)
+                            && (initializerSourceNV.TypeAndValue.IsAlias
+                                || initializerSourceNV.IsAliasBorrow
+                                || initializerSourceNV.IsAliasReturnBorrow
+                                || initializerSourceNV.IsRangeForBorrow))
+                            compiler->NoteThisClosureCopySite(
+                                typeAndValue.TypeName, LLVMBackend::ThisClosureCopyKind::Copy);
+
                         // Consume the container-element-slot move signal HERE, at the point common to
                         // both the interface and non-interface init branches (each parsed the RHS in
                         // its own branch), and BEFORE CreateAssignment could parse a nested element
@@ -12717,7 +12790,8 @@ bool MainListener::IsOwningTempRawPointerFieldEscape(
         if (!nv.TypeAndValue.Pointer || nv.TypeAndValue.IsUnique) return false;
         return (nv.FromOwningTempField && nv.OwningTempParent)
             || (compilerLLVM != nullptr
-                && compilerLLVM->JoinCarriesOwningTempRawPointerField(nv.Primary));
+                && (compilerLLVM->JoinCarriesOwningTempRawPointerField(nv.Primary)
+                    || compilerLLVM->JoinCarriesOwningTempRawPointerFieldAddress(nv.Primary)));
 }
 
 void MainListener::GuardRawPointerIntoOwningTempField(
@@ -12725,14 +12799,21 @@ void MainListener::GuardRawPointerIntoOwningTempField(
         const LLVMBackend::TypeAndValue& destinationType,
         bool destinationIsLocal, bool destinationIsAlias,
         const std::string& destinationName,
-        antlr4::ParserRuleContext* ctx) {
+        antlr4::ParserRuleContext* ctx,
+        bool calleeArgument) {
         const bool destinationIsRawPointer = destinationType.Pointer
             || (destinationType.TypeName == "auto" && source.TypeAndValue.Pointer);
         if (!destinationIsLocal || destinationIsAlias || ctx == nullptr
             || !destinationIsRawPointer || destinationType.IsUnique
             || destinationType.IsAlias || destinationType.IsArrayView
+            || IsOwningTempUniqueFieldEscape(source)
             || !IsOwningTempRawPointerFieldEscape(source))
             return;
+        if (calleeArgument)
+        {
+            LogErrorContext(ctx, LLVMBackend::DescribeRawPointerCalleeStore(destinationName));
+            return;
+        }
         LogErrorContext(ctx, std::format(
             "cannot bind raw pointer '{}' to a field pointer from an owning temporary; it is "
             "destroyed at the end of the statement - declare it 'alias' to extend the temporary's lifetime",

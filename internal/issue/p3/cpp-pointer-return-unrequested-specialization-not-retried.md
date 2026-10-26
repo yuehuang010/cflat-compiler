@@ -1,7 +1,5 @@
 # P3: Remaining C++ free-operator and converting-constructor retry gaps
 
-**RULED 2026-10-24 (main session, 2026-09-09 C++ operator-parity ruling; maintainer may veto):** the compound-fallback question - for an imported C++ class, `a @= b` is NEVER rewritten to `a = a @ b`: if clang rejects `@=` (missing, deleted, private, ambiguous), CFlat refuses with the relayed cause. The fallback stays a CFlat-struct convenience only.
-
 This file now tracks only the D3 review findings not fixed in D6. The original pointer-return
 method and `operator->` retry gap is fixed in D6 by requesting an opaque pointer's unrequested
 class-template pointee when that member is projected on use. Pointer-returning member `operator*=`
@@ -26,6 +24,3 @@ expressions now preserve their declared pointer result type. See `scratch/d6_mat
 - `op3.W d = a * 3.0` still reports the incorrect `cannot cast an aggregate value` diagnostic while
   explicit `op3.W(a * 3.0)` succeeds. D6 measured the pair in `op3_convert.cb` and `op3_direct.cb`;
   aggregate converting-constructor resolution is a separate path.
-- A C++ class with only a binary `@` operator, or a deleted/private `@=` beside a public binary
-  `@`, can silently fall back to `a = a @ b` although `clang++ -std=c++20` rejects it. This is a
-  compound-fallback design question and remains unchanged pending a maintainer ruling.

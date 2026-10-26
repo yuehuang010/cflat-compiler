@@ -4756,6 +4756,120 @@ bool testT481NestedTypeLeafCollision()
     return result;
 }
 
+namespace T503A {
+    struct Mid { int value = 1; };
+    struct S {
+        struct Mid { int value = 2; int extra = 0; };
+        struct Inner {
+            Mid field = default;
+            Mid make() { Mid value = default; return value; }
+            int local() { Mid value = default; return value.value; }
+            int take(Mid value) { return value.value; }
+            int parameter() { Mid value = default; return take(value); }
+            int size() { return sizeof(Mid); }
+            struct Holder<T> { T value = default; int read() { return value.value; } };
+            int genericArgument() { Holder<Mid> value = default; return value.read(); }
+            int allocate() { auto value = new Mid(); int result = value->value; delete value; return result; }
+            int cast() { return S.choose((Mid*)nullptr); }
+        };
+        static int choose(T503A.Mid* value) { return 1; }
+        static int choose(Mid* value) { return 2; }
+    };
+}
+
+namespace T503B {
+    struct Mid { int value = 1; };
+    struct S {
+        struct Mid {
+            int value = 2;
+            int read() { auto p = new Mid(); int result = 30 + p->value; delete p; return result; }
+        };
+    };
+}
+
+namespace T503C {
+    struct P {
+        struct Mid { int value = 2; };
+        struct G<T> { int read() { Mid value = default; return value.value; } };
+        struct Q { struct G<T> { int read() { Mid value = default; return value.value; } }; };
+    };
+    struct S {
+        int read() { P.G<int> value = default; return value.read(); }
+        int generic<U>(U unused) { P.G<int> value = default; return value.read(); }
+        int twoLevel() { P.Q.G<int> value = default; return value.read(); }
+    };
+}
+
+namespace T503Free {
+    struct Mid { int value = 1; };
+    struct P {
+        struct Mid { int value = 2; };
+        struct G<T> { int read() { Mid value = default; return value.value; } };
+    };
+}
+int t503FreeGenericRead() { T503Free.P.G<int> value = default; return value.read(); }
+
+namespace T503GenericCaller {
+    struct Mid { int value = 1; };
+    struct P {
+        struct Mid { int value = 2; };
+        struct G<T> { int read() { Mid value = default; return value.value; } };
+    };
+    struct S { int read<U>(U unused) { P.G<int> value = default; return value.read(); } };
+}
+
+namespace T503D {
+    struct Mid { int value = 1; };
+    struct P<X> {
+        struct Q {
+            struct Mid { int value = 2; };
+            struct G<T> {
+                using M = Mid;
+                int newRead() { auto value = new Mid(); int result = value->value; delete value; return result; }
+                int aliasRead() { M value = default; return value.value; }
+            };
+            int read() { G<int> value = default; return value.newRead() + value.aliasRead(); }
+        };
+        int read() { Q value = default; return value.read(); }
+    };
+}
+
+namespace T503Distinct {
+    struct Dup { int value = 1; };
+    struct S { struct Dup { int value = 2; }; int read() { Dup value = default; return value.value; } };
+}
+
+bool testT503NestedTypeLookup()
+{
+    bool result = true;
+    T503A.S.Inner inner = default;
+    result &= Test("T503 enclosing aggregate method", inner.local(), 2);
+    result &= Test("T503 nested field type", inner.field.value, 2);
+    result &= Test("T503 nested return type", inner.make().value, 2);
+    result &= Test("T503 nested parameter type", inner.parameter(), 2);
+    result &= Test("T503 nested sizeof", inner.size(), 8);
+    result &= Test("T503 nested generic argument", inner.genericArgument(), 2);
+    result &= Test("T503 nested new", inner.allocate(), 2);
+    result &= Test("T503 nested cast overload", inner.cast(), 2);
+
+    T503B.S.Mid injected = default;
+    result &= Test("T503 injected nested name", injected.read(), 32);
+
+    T503C.S caller = default;
+    result &= Test("T503 generic outer nested type", caller.read(), 2);
+    result &= Test("T503 nested generic method caller", caller.generic(0), 2);
+    result &= Test("T503 two level nested generic", caller.twoLevel(), 2);
+    result &= Test("T503 nested generic free caller", t503FreeGenericRead(), 2);
+    T503GenericCaller.S genericCaller = default;
+    result &= Test("T503 nested generic generic method caller", genericCaller.read(0), 2);
+
+    T503D.P<int> genericOuter = default;
+    result &= Test("T503 generic outer nested new and alias", genericOuter.read(), 4);
+    T503Distinct.S distinct = default;
+    result &= Test("T503 distinct nested type scope", distinct.read(), 2);
+    return result;
+}
+
 struct OuterStruct {
     struct InnerStruct {
         int x = 0;
@@ -5108,6 +5222,23 @@ struct T407Kept
 int t407KeptThroughPointer(T407Kept* k) { k.id = 20; return k.f() + k.g(); }
 T407OnlyCalled t407MakeOnlyCalled(int i) { T407OnlyCalled s = T407OnlyCalled(i); return s; }
 
+int t515HolderCtors = 0;
+int t515HolderDtors = 0;
+struct T515ClosureMember
+{
+    int id = 0;
+    Lambda<int()> f = default;
+    T515ClosureMember() { t515HolderCtors++; this.f = () => { return this.id; }; }
+    T515ClosureMember(int i) { t515HolderCtors++; this.id = i; this.f = () => { return this.id; }; }
+    ~T515ClosureMember() { t515HolderDtors++; }
+};
+struct T515ClosureHolder { T515ClosureMember s = default; };
+struct T515ClosureAliasGetter
+{
+    T515ClosureMember* value = nullptr;
+    alias T515ClosureMember get() { return *value; }
+};
+
 // A name bound in an enclosing ctor lambda (local, for-init) is not a member use, so no `this`
 // capture and copies stay legal; a same-named binding out of scope leaves the member use.
 int t407OuterId = 3;
@@ -5149,6 +5280,104 @@ bool testT407ConstructorClosureCopies()
     result &= Test("t407_outer_lambda_local_global", ogCopy.f(), 7);
     T407OuterScope os = T407OuterScope();
     result &= Test("t407_outer_lambda_out_of_scope_member", os.f(), 4);
+    return result;
+}
+
+bool testT515NestedClosureHolder()
+{
+    bool result = true;
+    int constructorsBefore = t515HolderCtors;
+    int destructorsBefore = t515HolderDtors;
+    {
+        T515ClosureHolder h = default;
+        h.s.id = 8;
+        result &= Test("t515_holder_closure_embedded", h.s.f(), 8);
+        result &= Test("t515_holder_ctor_count", t515HolderCtors - constructorsBefore, 1);
+    }
+    result &= Test("t515_holder_dtor_count", t515HolderDtors - destructorsBefore, 1);
+    return result;
+}
+
+bool testT515ClosureListMove()
+{
+    bool result = true;
+    int constructorsBefore = t515HolderCtors;
+    int destructorsBefore = t515HolderDtors;
+    {
+        list<T515ClosureMember> values = default;
+        result &= Test("t515_list_default_count", values.count(), 0);
+        T515ClosureMember source = T515ClosureMember(6);
+        // Mirrors vector::push_back(move source): the stored closure observes the moved-from slot.
+        values.add(move source);
+        source.id = 12;
+        result &= Test("t515_list_get_closure_tracks_moved_source", values.get(0).f(), 12);
+        result &= Test("t515_list_index_closure_tracks_moved_source", values[0].f(), 12);
+        int iterationValue = 0;
+        for (T515ClosureMember item in values) iterationValue += item.f();
+        result &= Test("t515_list_iteration_closure", iterationValue, 12);
+        result &= Test("t515_list_count", values.count(), 1);
+        result &= Test("t515_list_ctor_count", t515HolderCtors - constructorsBefore, 1);
+    }
+    result &= Test("t515_list_dtor_count", t515HolderDtors - destructorsBefore, 3);
+    return result;
+}
+
+bool testT515ClosureAliasElementAccess()
+{
+    bool result = true;
+    int constructorsBefore = t515HolderCtors;
+    int destructorsBefore = t515HolderDtors;
+    {
+        list<T515ClosureMember> values = default;
+        T515ClosureMember source = T515ClosureMember(6);
+        values.add(move source);
+        source.id = 12;
+        alias T515ClosureMember reference = values[0];
+        reference.id = 8;
+        result &= Test("t515_list_alias_binding_updates_element", values[0].id, 8);
+        result &= Test("t515_list_alias_binding_keeps_closure", reference.f(), 12);
+        result &= Test("t515_list_index_in_place_closure", values[0].f(), 12);
+        result &= Test("t515_list_get_in_place_closure", values.get(0).f(), 12);
+        result &= Test("t515_list_alias_binding_ctor_count", t515HolderCtors - constructorsBefore, 1);
+    }
+    result &= Test("t515_list_alias_binding_dtor_count", t515HolderDtors - destructorsBefore, 3);
+    return result;
+}
+
+bool testT515ClosureRangeBindingBorrows()
+{
+    bool result = true;
+    int constructorsBefore = t515HolderCtors;
+    int destructorsBefore = t515HolderDtors;
+    {
+        list<T515ClosureMember> values = default;
+        T515ClosureMember source = T515ClosureMember(6);
+        values.add(move source);
+        for (T515ClosureMember item in values) item.id = 8;
+        result &= Test("t515_list_range_binding_borrows_element", values[0].id, 8);
+        result &= Test("t515_list_range_binding_ctor_count", t515HolderCtors - constructorsBefore, 1);
+    }
+    result &= Test("t515_list_range_binding_dtor_count", t515HolderDtors - destructorsBefore, 3);
+    return result;
+}
+
+bool testT515PlainAliasGetterBorrow()
+{
+    bool result = true;
+    int constructorsBefore = t515HolderCtors;
+    int destructorsBefore = t515HolderDtors;
+    {
+        T515ClosureMember source = T515ClosureMember(7);
+        T515ClosureAliasGetter getter = default;
+        getter.value = &source;
+        alias T515ClosureMember reference = getter.get();
+        reference.id = 8;
+        result &= Test("t515_plain_alias_getter_binding", source.id, 8);
+        result &= Test("t515_plain_alias_getter_closure", reference.f(), 8);
+        result &= Test("t515_plain_alias_getter_in_place", getter.get().f(), 8);
+        result &= Test("t515_plain_alias_getter_ctor_count", t515HolderCtors - constructorsBefore, 1);
+    }
+    result &= Test("t515_plain_alias_getter_dtor_count", t515HolderDtors - destructorsBefore, 1);
     return result;
 }
 
@@ -6285,6 +6514,7 @@ extern int main()
     total++; passed += testT481NestedTypeLookup()        ? 1 : 0;
     total++; passed += testT481NestedGenericFromCaller()  ? 1 : 0;
     total++; passed += testT481NestedTypeLeafCollision()  ? 1 : 0;
+    total++; passed += testT503NestedTypeLookup()         ? 1 : 0;
     total++; passed += testInPlaceDtor()                 ? 1 : 0;
     total++; passed += testVariadic()                    ? 1 : 0;
     total++; passed += testFixedArrays()                 ? 1 : 0;
@@ -6337,6 +6567,11 @@ extern int main()
     total++; passed += testConstFunctionType() ? 1 : 0;
     total++; passed += testT345ConstructorLambdas() ? 1 : 0;
     total++; passed += testT407ConstructorClosureCopies() ? 1 : 0;
+    total++; passed += testT515NestedClosureHolder() ? 1 : 0;
+    total++; passed += testT515ClosureListMove() ? 1 : 0;
+    total++; passed += testT515ClosureAliasElementAccess() ? 1 : 0;
+    total++; passed += testT515ClosureRangeBindingBorrows() ? 1 : 0;
+    total++; passed += testT515PlainAliasGetterBorrow() ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -9557,9 +9792,62 @@ struct T471BareGenericStatic<T>
     static int fromStatic() { return t471BareGenericStaticPick(6); }
 };
 
+int t504InitializerHelper(int value) { return value + 3; }
+int t504ValidCallInitializer() { int x0 = 2; int x = x0 + t504InitializerHelper(1); return x; }
+struct T504InitBox { int value = 0; };
+T504InitBox t504MakeInitBox() { T504InitBox box = default; box.value = 7; return box; }
+int t504StructCallInitializer() { T504InitBox local = t504MakeInitBox(); return local.value; }
+struct T511Callable { int operator()(int value) { return value + 2; } };
+using T511Apply = Lambda<int(T511Callable)>;
+int t511ApplyFunction(T511Apply fn, T511Callable value) { return fn(value); }
+int t511GenericTarget(int value) { return value + 1; }
+T t511GenericInitializer<T>(T value) { return t511GenericTarget(value); }
+int t511GenericInitializerCall()
+{
+    int t511GenericTarget = t511GenericInitializer<int>(3);
+    return t511GenericTarget;
+}
+int t511LambdaParameterShadowCall()
+{
+    T511Callable callback = default;
+    int t511GenericTarget = t511ApplyFunction(
+        (T511Callable t511GenericTarget) => { return t511GenericTarget(3); }, callback);
+    return t511GenericTarget;
+}
+int t511ApplyInt(Lambda<int(int)> fn, int value) { return fn(value); }
+int t511LambdaLocalCallableShadowCall()
+{
+    int t511GenericTarget = t511ApplyInt((int value) => {
+        T511Callable t511GenericTarget = default;
+        return t511GenericTarget(3);
+    }, 3);
+    return t511GenericTarget;
+}
+int t504SelfReadGlobal = 9;
+int t504ReadSelfInitializer() { int t504SelfReadGlobal = t504SelfReadGlobal; return t504SelfReadGlobal; }
+namespace T504NamespaceMethod
+{
+    int gv = 5;
+    struct M { int gv(int value) { return value + 20; } int call() { return gv(3); } };
+};
+namespace T504StaticMethodNS
+{
+    struct M { static int gv(int value) { return value + 30; } int call() { return gv(3); } };
+};
+
 bool testT471BareCalls()
 {
     bool result = true;
+    result &= Test("t504 valid call initializer", t504ValidCallInitializer(), 6);
+    result &= Test("t504 struct call initializer", t504StructCallInitializer(), 7);
+    result &= Test("t504 non-call self initializer", t504ReadSelfInitializer(), 9);
+    result &= Test("t511 generic initializer stays accepted", t511GenericInitializerCall(), 4);
+    result &= Test("t511 lambda parameter shadows pending local", t511LambdaParameterShadowCall(), 5);
+    result &= Test("t511 lambda local shadows pending local", t511LambdaLocalCallableShadowCall(), 5);
+    T504NamespaceMethod.M t504NamespaceValue = default;
+    result &= Test("t504 namespace variable yields to member", t504NamespaceValue.call(), 23);
+    T504StaticMethodNS.M t504StaticNamespaceValue = default;
+    result &= Test("t504 namespace static member call", t504StaticNamespaceValue.call(), 33);
     result &= Test("t484 generic no shadow", t484GenericNoShadow(3), 13);
     result &= Test("t484 non-generic no shadow", t484PlainNoShadow(3), 23);
     result &= Test("t484 qualified call with root name", T484CallNS.id(3), 33);

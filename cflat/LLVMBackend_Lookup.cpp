@@ -746,6 +746,7 @@ bool LLVMBackend::IsCxxMacroGlobalName(const std::string& name)
 
 bool LLVMBackend::IsCxxRvalueReferenceArgument(const NamedVariable& arg) const
 {
+        if (arg.IsCxxAddressOfPointerValue && arg.Storage == nullptr) return true;
         // Rvalue-ness must be PROVEN. Without argument provenance nothing is proven, and an
         // argument that has addressable storage or came back as a reference is an lvalue.
         // An imported integer-zero macro expands to an integer literal prvalue in C++.
@@ -1092,6 +1093,24 @@ LLVMBackend::FuncPtrComponent LLVMBackend::FuncPtrComponentOf(const std::string&
             c.PointerDepth = 1;
         }
 
+        const TypeAndValue* functionType = GetEncodedClosureType(resolved);
+        if (functionType == nullptr)
+            functionType = FindFunctionTypeAlias(resolved);
+        if (functionType != nullptr)
+        {
+            std::vector<FuncPtrComponent> components;
+            if (FuncPtrSignatureOf(*functionType, components))
+            {
+                c.Known = true;
+                c.IsFunctionType = true;
+                c.FunctionIsThin = functionType->IsThinFnPtr();
+                c.FunctionVariadic = functionType->FuncPtrVariadic;
+                c.FunctionComponents = std::move(components);
+                c.Canon = pointer ? "p:f" : "f";
+                return c;
+            }
+        }
+
         std::string scalar = FuncPtrScalarCanon(resolved);
         if (!pointer)
         {
@@ -1102,6 +1121,8 @@ LLVMBackend::FuncPtrComponent LLVMBackend::FuncPtrComponentOf(const std::string&
             if (scalar == "v") { c.Known = true; c.Canon = "p:v"; return c; }
             if (!scalar.empty()) { c.Known = true; c.Canon = "p:" + scalar; return c; }
         }
+        // The runtime fat-closure placeholder carries no call signature, so it is not proof of a mismatch.
+        if (resolved == "__closure_fat_ptr") return c;
         // The declaring-scope key recorded where the spelling still had a scope; with none recorded
         // the spelling is tried as an exact key (FuncPtrSigOfSymbol, already fully scoped).
         std::string key = FuncPtrStructKey(resolvedKey);
@@ -1115,6 +1136,34 @@ LLVMBackend::FuncPtrComponent LLVMBackend::FuncPtrComponentOf(const std::string&
         return c;
     }
 
+LLVMBackend::FuncPtrComponent LLVMBackend::FuncPtrFunctionTypeComponentOf(const TypeAndValue& signature,
+        bool pointer, int pointerDepth, bool isArrayView, int constMask, bool isAlias) const
+{
+        FuncPtrComponent c;
+        c.IsAlias = isAlias;
+        c.IsArrayView = isArrayView;
+        c.ConstMask = constMask;
+        c.PointerDepth = pointer ? pointerDepth : 0;
+        std::vector<FuncPtrComponent> components;
+        if (!FuncPtrSignatureOf(signature, components)) return c;
+        c.Known = true;
+        c.IsFunctionType = true;
+        c.FunctionIsThin = signature.IsThinFnPtr();
+        c.FunctionVariadic = signature.FuncPtrVariadic;
+        c.FunctionComponents = std::move(components);
+        c.Canon = pointer ? "p:f" : "f";
+        return c;
+    }
+
+LLVMBackend::FuncPtrComponent LLVMBackend::FuncPtrComponentOf(const TypeAndValue::FuncPtrParam& param) const
+{
+        if (param.FunctionTypeSignature)
+            return FuncPtrFunctionTypeComponentOf(*param.FunctionTypeSignature, param.Pointer,
+                param.PointerDepth, param.IsArrayView, param.ConstMask, param.IsAlias);
+        return FuncPtrComponentOf(param.TypeName, param.Pointer, param.PointerDepth,
+            param.ResolvedTypeKey, param.IsArrayView, param.ConstMask, param.IsAlias);
+    }
+
 bool LLVMBackend::ComponentsProvablyDiffer(const FuncPtrComponent& a, const FuncPtrComponent& b)
 {
         if (a.IsAlias != b.IsAlias) return true;
@@ -1124,6 +1173,17 @@ bool LLVMBackend::ComponentsProvablyDiffer(const FuncPtrComponent& a, const Func
             && a.ConstMask >= 0 && b.ConstMask >= 0 && a.ConstMask != b.ConstMask)
             return true;
         if (a.Canon != b.Canon) return true;
+        if (a.IsFunctionType != b.IsFunctionType) return true;
+        if (a.IsFunctionType)
+        {
+            if (a.FunctionIsThin != b.FunctionIsThin
+                || a.FunctionVariadic != b.FunctionVariadic
+                || a.FunctionComponents.size() != b.FunctionComponents.size())
+                return true;
+            for (size_t i = 0; i < a.FunctionComponents.size(); i++)
+                if (ComponentsProvablyDiffer(a.FunctionComponents[i], b.FunctionComponents[i]))
+                    return true;
+        }
         // Same pointee, different number of '*'. Canon collapses every depth onto one "p:" token,
         // so this is the only place `int*` and `int**` are told apart - and an unrecorded depth (0)
         // on either side proves nothing, exactly like an unresolvable Canon.
@@ -1144,12 +1204,16 @@ bool LLVMBackend::FuncPtrSignatureOf(const LLVMBackend::TypeAndValue& tv, std::v
                 signature = *encoded;
         if (signature.FuncPtrReturnTypeName.empty()) return false;
         out.clear();
-        out.push_back(FuncPtrComponentOf(signature.FuncPtrReturnTypeName, signature.FuncPtrReturnPointer,
-            signature.FuncPtrReturnPointerDepth, signature.FuncPtrReturnResolvedKey,
-            false, -1, signature.FuncPtrReturnAlias));
+        if (signature.FuncPtrReturnFunctionType)
+            out.push_back(FuncPtrFunctionTypeComponentOf(*signature.FuncPtrReturnFunctionType,
+                signature.FuncPtrReturnPointer, signature.FuncPtrReturnPointerDepth,
+                false, signature.FuncPtrReturnConstMask, signature.FuncPtrReturnAlias));
+        else
+            out.push_back(FuncPtrComponentOf(signature.FuncPtrReturnTypeName, signature.FuncPtrReturnPointer,
+                signature.FuncPtrReturnPointerDepth, signature.FuncPtrReturnResolvedKey,
+                false, signature.FuncPtrReturnConstMask, signature.FuncPtrReturnAlias));
         for (const auto& p : signature.FuncPtrParams)
-            out.push_back(FuncPtrComponentOf(p.TypeName, p.Pointer, p.PointerDepth,
-                p.ResolvedTypeKey, p.IsArrayView, p.ConstMask, p.IsAlias));
+            out.push_back(FuncPtrComponentOf(p));
         return true;
     }
 
@@ -1194,6 +1258,8 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
         sig.IsFunctionPointer = true;
         sig.TypeName = "__c_fn_ptr";
         sig.FuncPtrReturnTypeName = sym.ReturnType.TypeName;
+        if (sym.ReturnType.IsFunctionPointer && !sym.ReturnType.FuncPtrReturnTypeName.empty())
+            sig.FuncPtrReturnFunctionType = std::make_shared<TypeAndValue>(sym.ReturnType);
         sig.FuncPtrReturnPointer = sym.ReturnType.Pointer;
         sig.FuncPtrReturnOwned = sym.ReturnType.IsMove;
         sig.FuncPtrReturnAlias = sym.ReturnType.IsAlias;
@@ -1207,6 +1273,8 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
         {
             TypeAndValue::FuncPtrParam fp;
             fp.TypeName = p.TypeName;
+            if (p.IsFunctionPointer && !p.FuncPtrReturnTypeName.empty())
+                fp.FunctionTypeSignature = std::make_shared<TypeAndValue>(p);
             fp.Pointer = p.Pointer;
             fp.IsArrayView = p.IsArrayView;
             fp.AllocAlignValue = p.AllocAlignValue;

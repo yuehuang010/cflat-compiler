@@ -1442,6 +1442,10 @@ void helperStoresMove(list<Res*>* l, move Res* p) { l->add(move p); }
 void helperDepth2(list<Res*>* l, Res* p) { l->add(p); }
 void helperDepth1(list<Res*>* l, Res* p) { helperDepth2(l, p); }
 alias Res* helperBorrow(Res* p) { return p; }
+list<Res*> t507BorrowedItems = default;
+int t507ReadValue = 0;
+void t507PutGlobal(Res* p) { t507BorrowedItems.add(p); }
+void t507ReadOnly(Res* p) { t507ReadValue = p.id; }
 
 int testHelperShapeAcceptSet()
 {
@@ -1466,6 +1470,28 @@ int testHelperShapeAcceptSet()
 
     g_dtor = 0;
     {
+        Res* p = new Res(32);
+        function<int(Res*)> indirect = helperReads;
+        indirect = helperReads;
+        passed += Test("reassigned indirect helper read", indirect(p), 32);
+        delete p;
+    }
+    passed += Test("reassigned indirect helper read frees once", g_dtor, 1);
+
+    g_dtor = 0;
+    {
+        Res* p = new Res(33);
+        list<Res*> l;
+        function<void(list<Res*>*, Res*)> indirect = helperStores;
+        indirect = helperStores;
+        indirect(&l, p);
+        passed += Test("reassigned indirect helper store", l.get(0).id, 33);
+        delete p;
+    }
+    passed += Test("reassigned indirect helper store frees once", g_dtor, 1);
+
+    g_dtor = 0;
+    {
         Res* p = new Res(22);
         helperStoresLocal(p);
         passed += Test("helper local borrowing list keeps owner", p.id, 22);
@@ -1479,6 +1505,14 @@ int testHelperShapeAcceptSet()
         passed += Test("helper borrowed parameter stored", helperStoresFromBorrowed(owner), 23);
     }
     passed += Test("helper borrowed parameter owner frees once", g_dtor, 1);
+
+    g_dtor = 0;
+    {
+        Res* p = new Res(31);
+        passed += Test("helper chain local container keeps raw owner", helperStoresFromBorrowed(p), 31);
+        delete p;
+    }
+    passed += Test("helper chain local container frees raw owner once", g_dtor, 1);
 
     g_dtor = 0;
     {
@@ -1508,6 +1542,21 @@ int testHelperShapeAcceptSet()
         passed += Test("indirect helper stores", l.get(0).id, 26);
     }
     passed += Test("indirect helper owner frees once", g_dtor, 1);
+
+    g_dtor = 0;
+    t507ReadValue = 0;
+    {
+        Res* p = new Res(34);
+        function<void(Res*)> g2 = t507PutGlobal;
+        function<void(Res*)>* pg = &g2;
+        *pg = t507ReadOnly;
+        function<void(Res*)> f = g2;
+        f(p);
+        passed += Test("address-taken function copy calls rewritten target", t507ReadValue, 34);
+        passed += Test("address-taken function copy skips original sink", t507BorrowedItems.count(), 0);
+        delete p;
+    }
+    passed += Test("address-taken function copy frees owner once", g_dtor, 1);
 
     g_dtor = 0;
     {
@@ -1611,7 +1660,7 @@ extern int main()
     total += 11; passed += testInsert();
     total += 14; passed += testAddSiteAcceptSet();
     total += 4;  passed += testUserDefinedContainersAccept();
-    total += 20; passed += testHelperShapeAcceptSet();
+    total += 29; passed += testHelperShapeAcceptSet();
 
     // Every ownership rule above is only meaningful if nothing leaked.
     int leaks = (int)HeapAudit.reportLeaks();

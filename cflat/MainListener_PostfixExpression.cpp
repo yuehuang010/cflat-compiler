@@ -1,7 +1,9 @@
 #include "MainListener.h"
 #include <llvm/Support/SaveAndRestore.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <functional>
+#include <limits>
 
 static CFlatParser::PostfixExpressionContext* DirectPostfixArgument(
         CFlatParser::AssignmentExpressionContext* expression)
@@ -101,92 +103,20 @@ static bool IsDerefOperandChain(antlr4::tree::ParseTree* node)
     return sawDeref && valueRead;
 }
 
-static bool IsSimpleIdentifierType(LLVMBackend* compiler,
-    CFlatParser::PrimaryExpressionContext* primary, LLVMBackend::TypeAndValue& type)
+struct PointerDifferenceSite
 {
-    if (compiler == nullptr || primary == nullptr || primary->Identifier() == nullptr) return false;
-    const std::string name = primary->Identifier()->getText();
-    auto value = compiler->GetScopedLocalOrArgument(name);
-    if (value.TypeAndValue.TypeName.empty() && value.Storage == nullptr && value.Primary == nullptr
-        && compiler->HasMemberVariable(name))
-        value = compiler->GetMemberVariable(name);
-    if (value.TypeAndValue.TypeName.empty() && value.Storage == nullptr && value.Primary == nullptr)
-        value = compiler->GetGlobalVariableNV(name);
-    if (value.TypeAndValue.TypeName.empty() && value.Storage == nullptr && value.Primary == nullptr)
-        return false;
-    type = value.TypeAndValue;
-    return true;
-}
+    CFlatParser::AdditiveExpressionContext* Expression = nullptr;
+    size_t OperatorIndex = SIZE_MAX;
+};
 
-static bool IsPointerTypedArrowField(LLVMBackend* compiler,
-    CFlatParser::PostfixExpressionContext* postfix)
-{
-    if (compiler == nullptr || postfix == nullptr || postfix->primaryExpression() == nullptr
-        || postfix->memberNameToken().size() != 1 || postfix->Arrow().empty())
-        return false;
-
-    LLVMBackend::TypeAndValue baseType;
-    auto* primary = postfix->primaryExpression();
-    if (!IsSimpleIdentifierType(compiler, primary, baseType))
-    {
-        if (postfix->argumentExpressionList().size() != 1
-            || !postfix->argumentExpressionList().front()->argumentNamedExpression().empty()
-            || primary->Identifier() == nullptr)
-            return false;
-        const std::string name = primary->Identifier()->getText();
-        auto* function = compiler->GetFunction(name);
-        if (function == nullptr) return false;
-        baseType = compiler->GetFunctionReturnTypeInfo(name);
-        if (baseType.TypeName.empty()) return false;
-    }
-
-    std::string ownerType = baseType.TypeName;
-    if (baseType.Pointer) {}
-    else if (compiler->IsCoreUniqueType(ownerType))
-    {
-        const size_t open = ownerType.find('<');
-        const size_t close = ownerType.rfind('>');
-        if (open == std::string::npos || close <= open) return false;
-        const auto typeArgs = SplitTopLevelTypeArgs(ownerType.substr(open + 1, close - open - 1));
-        if (typeArgs.empty()) return false;
-        ownerType = typeArgs.front();
-    }
-    else return false;
-
-    const std::string fieldName = postfix->memberNameToken().front()->getText();
-    auto data = compiler->GetDataStructure(ownerType);
-    for (const auto& field : data.StructFields)
-        if (field.VariableName == fieldName) return field.Pointer;
-    return false;
-}
-
-static bool IsPointerTypedExpression(LLVMBackend* compiler, antlr4::tree::ParseTree* node)
-{
-    if (node == nullptr) return false;
-    if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
-    {
-        if (postfix->memberNameToken().size() == 1 && !postfix->Arrow().empty())
-            return IsPointerTypedArrowField(compiler, postfix);
-        if (postfix->argumentExpressionList().empty())
-        {
-            LLVMBackend::TypeAndValue type;
-            return IsSimpleIdentifierType(compiler, postfix->primaryExpression(), type) && type.Pointer;
-        }
-    }
-    if (IsParenthesizedExpression(node))
-    {
-        auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
-        return IsPointerTypedExpression(compiler, primary->expression());
-    }
-    if (node->children.size() == 1) return IsPointerTypedExpression(compiler, node->children[0]);
-    return false;
-}
-
-static bool IsPointerDifferenceOperand(LLVMBackend* compiler, antlr4::tree::ParseTree* node)
+// Find a possible subtraction operand by tree position; codegen confirms its actual pointer types.
+static PointerDifferenceSite FindPointerDifferenceSite(antlr4::tree::ParseTree* node)
 {
     for (antlr4::tree::ParseTree* child = node, *parent = node->parent;
          parent != nullptr; child = parent, parent = parent->parent)
     {
+        if (dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(parent) != nullptr)
+            return {};
         auto* additive = dynamic_cast<CFlatParser::AdditiveExpressionContext*>(parent);
         if (additive == nullptr || additive->children.size() < 3) continue;
         auto position = std::find(additive->children.begin(), additive->children.end(), child);
@@ -198,69 +128,78 @@ static bool IsPointerDifferenceOperand(LLVMBackend* compiler, antlr4::tree::Pars
             auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(additive->children[op]);
             if (terminal == nullptr || terminal->getSymbol()->getType() != CFlatParser::Minus)
                 continue;
-            const size_t left = op - 1;
-            const size_t right = op + 1;
-            if (operand == left && IsPointerTypedExpression(compiler, additive->children[right])) return true;
-            if (operand == right && IsPointerTypedExpression(compiler, additive->children[left])) return true;
+            if (operand <= op - 1 || operand == op + 1)
+                return { additive, op };
         }
     }
-    return false;
+    return {};
 }
 
-struct AdditiveCallArgumentPath
+struct CallArgumentPath
 {
     CFlatParser::PostfixExpressionContext* Call = nullptr;
+    antlr4::tree::TerminalNode* CallParen = nullptr;
     size_t ArgumentIndex = SIZE_MAX;
     bool NamedArgument = false;
 };
 
-static bool CallResultFlowsIntoAdditiveExpression(
-    CFlatParser::ArgumentNamedExpressionContext* argument, AdditiveCallArgumentPath* path = nullptr)
+static bool CallArgumentHasReceiver(CFlatParser::PostfixExpressionContext* call,
+    CFlatParser::ArgumentExpressionListContext* argumentList)
 {
-    auto* list = argument != nullptr
-        ? dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(argument->parent) : nullptr;
-    auto* call = list != nullptr
-        ? dynamic_cast<CFlatParser::PostfixExpressionContext*>(list->parent) : nullptr;
-    if (call == nullptr) return false;
-    AdditiveCallArgumentPath found;
-    auto arguments = list->argumentNamedExpression();
-    for (size_t i = 0; i < arguments.size(); ++i)
-        if (arguments[i] == argument)
-        {
-            found.ArgumentIndex = i;
-            found.NamedArgument = arguments[i]->Identifier() != nullptr;
-            break;
-        }
-    for (antlr4::tree::ParseTree* parent = call->parent; parent != nullptr; parent = parent->parent)
+    bool memberCallee = false;
+    for (auto* child : call->children)
     {
-        if (auto* additive = dynamic_cast<CFlatParser::AdditiveExpressionContext*>(parent))
-            if (additive->children.size() > 1)
-            {
-                found.Call = call;
-                if (path != nullptr) *path = found;
-                return true;
-            }
-        if (dynamic_cast<CFlatParser::DeclarationContext*>(parent) != nullptr
-            || dynamic_cast<CFlatParser::StatementContext*>(parent) != nullptr)
-            return false;
+        if (child == argumentList) return memberCallee;
+        if (dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(child) != nullptr)
+            memberCallee = false;
+        else if (dynamic_cast<CFlatParser::MemberNameTokenContext*>(child) != nullptr)
+            memberCallee = true;
     }
     return false;
 }
 
-// Keep a borrowed receiver registered for a direct argument or an address read by an additive call.
-static bool IsCallArgumentReadPath(antlr4::tree::ParseTree* node,
-    AdditiveCallArgumentPath* path = nullptr)
+static bool FindCallArgumentPath(antlr4::tree::ParseTree* node, CallArgumentPath* path = nullptr)
 {
-    bool crossedAddressOf = false;
+    for (antlr4::tree::ParseTree* current = node; current != nullptr; current = current->parent)
+    {
+        auto* argument = dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(current);
+        if (argument == nullptr) continue;
+        auto* list = dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(argument->parent);
+        auto* call = list != nullptr
+            ? dynamic_cast<CFlatParser::PostfixExpressionContext*>(list->parent) : nullptr;
+        if (call == nullptr) return false;
+
+        CallArgumentPath found;
+        found.Call = call;
+        for (size_t i = 1; i < call->children.size(); ++i)
+            if (call->children[i] == list)
+                if (auto* open = dynamic_cast<antlr4::tree::TerminalNode*>(call->children[i - 1]);
+                    open != nullptr && open->getSymbol()->getType() == CFlatParser::LeftParen)
+                    found.CallParen = open;
+        auto arguments = list->argumentNamedExpression();
+        for (size_t i = 0; i < arguments.size(); ++i)
+            if (arguments[i] == argument)
+            {
+                found.ArgumentIndex = i;
+                found.NamedArgument = arguments[i]->Identifier() != nullptr;
+                break;
+            }
+        if (found.ArgumentIndex == SIZE_MAX) return false;
+        if (CallArgumentHasReceiver(call, list)) ++found.ArgumentIndex;
+        if (path != nullptr) *path = found;
+        return true;
+    }
+    return false;
+}
+
+// Keep address-of call arguments registered until the callee's escape result is known.
+static bool IsCallArgumentReadPath(antlr4::tree::ParseTree* node)
+{
     for (antlr4::tree::ParseTree* child = node, *parent = node->parent; parent != nullptr;
          child = parent, parent = parent->parent)
     {
         if (dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(parent) != nullptr)
-        {
-            if (!crossedAddressOf) return true;
-            return CallResultFlowsIntoAdditiveExpression(
-                dynamic_cast<CFlatParser::ArgumentNamedExpressionContext*>(parent), path);
-        }
+            return true;
         if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(parent))
         {
             if (unary->unaryOperator() == nullptr)
@@ -270,16 +209,8 @@ static bool IsCallArgumentReadPath(antlr4::tree::ParseTree* node,
             }
             if (unary->Sizeof().empty())
             {
-                if (unary->unaryOperator()->And() != nullptr)
-                {
-                    crossedAddressOf = true;
-                    continue;
-                }
-                if (unary->unaryOperator()->Star() != nullptr)
-                {
-                    crossedAddressOf = false;
-                    continue;
-                }
+                if (unary->unaryOperator()->And() != nullptr
+                    || unary->unaryOperator()->Star() != nullptr) continue;
             }
             return false;
         }
@@ -301,7 +232,8 @@ static bool IsCallArgumentReadPath(antlr4::tree::ParseTree* node,
     return false;
 }
 
-static bool FunctionArgumentMayEscape(const llvm::Function* function, size_t argumentIndex)
+static bool FunctionArgumentMayEscape(const llvm::Function* function, size_t argumentIndex,
+                                      bool returnedValueEscapes = true)
 {
     if (function == nullptr || function->isDeclaration() || argumentIndex >= function->arg_size())
         return true;
@@ -317,16 +249,50 @@ static bool FunctionArgumentMayEscape(const llvm::Function* function, size_t arg
         {
             if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
             {
-                if (store->getValueOperand() == value) return true;
+                if (store->getValueOperand() == value)
+                {
+                    auto* local = llvm::dyn_cast<llvm::AllocaInst>(
+                        store->getPointerOperand()->stripPointerCasts());
+                    if (local == nullptr || local->getFunction() != function) return true;
+                    for (const llvm::User* localUser : local->users())
+                    {
+                        if (llvm::isa<llvm::DbgInfoIntrinsic>(localUser)) continue;
+                        if (const auto* localLoad = llvm::dyn_cast<llvm::LoadInst>(localUser))
+                        {
+                            if (localLoad->getPointerOperand() == local)
+                            {
+                                pending.push_back(localLoad);
+                                continue;
+                            }
+                        }
+                        if (const auto* localStore = llvm::dyn_cast<llvm::StoreInst>(localUser))
+                            if (localStore->getPointerOperand() == local) continue;
+                        if (const auto* intrinsic = llvm::dyn_cast<llvm::IntrinsicInst>(localUser))
+                            if (intrinsic->getIntrinsicID() == llvm::Intrinsic::lifetime_start
+                                || intrinsic->getIntrinsicID() == llvm::Intrinsic::lifetime_end)
+                                continue;
+                        return true;
+                    }
+                    continue;
+                }
                 if (store->getPointerOperand() == value) continue;
                 return true;
             }
             if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(user))
             {
-                if (load->getPointerOperand() == value) continue;
+                // A pointer read through the argument (`*pp`) is the borrowed value itself; keep following it.
+                if (load->getPointerOperand() == value)
+                {
+                    if (load->getType()->isPointerTy()) pending.push_back(load);
+                    continue;
+                }
                 return true;
             }
-            if (llvm::isa<llvm::ReturnInst>(user)) return true;
+            if (llvm::isa<llvm::ReturnInst>(user))
+            {
+                if (returnedValueEscapes) return true;
+                continue;
+            }
             if (const auto* call = llvm::dyn_cast<llvm::CallBase>(user))
             {
                 if (call->getCalledOperand() == value) return true;
@@ -353,6 +319,927 @@ static bool FunctionArgumentMayEscape(const llvm::Function* function, size_t arg
                 }
             }
             return true;
+        }
+    }
+    return false;
+}
+
+static bool StoreDestinationMayOutliveCall(const llvm::Value* address,
+                                          const llvm::Function* function)
+{
+    std::vector<const llvm::Value*> pending{ address };
+    std::unordered_set<const llvm::Value*> visited;
+    while (!pending.empty())
+    {
+        const llvm::Value* value = pending.back();
+        pending.pop_back();
+        if (!visited.insert(value).second) continue;
+        if (llvm::isa<llvm::GlobalValue>(value) || llvm::isa<llvm::Argument>(value)
+            || llvm::isa<llvm::LoadInst>(value))
+            return true;
+        if (const auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(value))
+        {
+            if (alloca->getFunction() != function) return true;
+            continue;
+        }
+        if (const auto* instruction = llvm::dyn_cast<llvm::Instruction>(value))
+        {
+            switch (instruction->getOpcode())
+            {
+            case llvm::Instruction::BitCast:
+            case llvm::Instruction::AddrSpaceCast:
+            case llvm::Instruction::GetElementPtr:
+            case llvm::Instruction::Freeze:
+                pending.push_back(instruction->getOperand(0));
+                continue;
+            case llvm::Instruction::PHI:
+            {
+                const auto* phi = llvm::cast<llvm::PHINode>(instruction);
+                for (const auto& incoming : phi->incoming_values())
+                    pending.push_back(incoming);
+                continue;
+            }
+            case llvm::Instruction::Select:
+                pending.push_back(instruction->getOperand(1));
+                pending.push_back(instruction->getOperand(2));
+                continue;
+            default:
+                continue;
+            }
+        }
+        if (const auto* expression = llvm::dyn_cast<llvm::ConstantExpr>(value))
+        {
+            switch (expression->getOpcode())
+            {
+            case llvm::Instruction::BitCast:
+            case llvm::Instruction::AddrSpaceCast:
+            case llvm::Instruction::GetElementPtr:
+                pending.push_back(expression->getOperand(0));
+                continue;
+            default:
+                continue;
+            }
+        }
+    }
+    return false;
+}
+
+// Constant index path from a root (alloca or argument) to the storage an address names. The first
+// index steps over the root pointer, so the path [] names the same storage as [0].
+using StorePath = std::vector<int64_t>;
+using StoreVerdict = LLVMBackend::RawPointerStoreVerdict;
+
+// Bounds of the walk through CFlat callees; past any of them the answer is Unknown.
+constexpr unsigned kMaxStoreWalkDepth = 64;
+constexpr size_t kMaxStoreWalkBodies = 4096;
+constexpr size_t kMaxStorePathLength = 32;
+constexpr size_t kMaxTrackedSlots = 512;
+// An index the walk cannot name (a variable subscript or a byte offset); it matches any index.
+constexpr int64_t kAnyStoreIndex = std::numeric_limits<int64_t>::min();
+
+// A value carrying the argument; rel is the part of an aggregate value that holds it.
+struct TrackedValue
+{
+    const llvm::Value* value;
+    StorePath rel;
+};
+
+// A root (local slot or a callee's pointee) whose storage at path holds the argument.
+struct TrackedSlot
+{
+    const llvm::Value* root;
+    StorePath path;
+};
+
+static StorePath CanonicalStorePath(StorePath path)
+{
+    if (path.empty()) path.push_back(0);
+    return path;
+}
+
+static bool StoreIndexMatches(int64_t a, int64_t b)
+{
+    return a == b || a == kAnyStoreIndex || b == kAnyStoreIndex;
+}
+
+static int64_t AddStoreIndex(int64_t a, int64_t b)
+{
+    return a == kAnyStoreIndex || b == kAnyStoreIndex ? kAnyStoreIndex : a + b;
+}
+
+// Two paths name overlapping storage when one is a prefix of the other.
+static bool StorePathsOverlap(const StorePath& a, const StorePath& b)
+{
+    const StorePath ca = CanonicalStorePath(a);
+    const StorePath cb = CanonicalStorePath(b);
+    for (size_t i = 0; i < std::min(ca.size(), cb.size()); ++i)
+        if (!StoreIndexMatches(ca[i], cb[i])) return false;
+    return true;
+}
+
+// The part of a slot path below an address path (value-relative); the whole value when coarser.
+static StorePath StorePathBelow(const StorePath& slot, const StorePath& at)
+{
+    const StorePath cs = CanonicalStorePath(slot);
+    const StorePath ca = CanonicalStorePath(at);
+    if (ca.size() > cs.size()) return {};
+    for (size_t i = 0; i < ca.size(); ++i)
+        if (!StoreIndexMatches(ca[i], cs[i])) return {};
+    return StorePath(cs.begin() + static_cast<long>(ca.size()), cs.end());
+}
+
+// A slot path seen from a pointer to `at` (a callee parameter). Pointer arithmetic on that
+// pointer reaches every element of the innermost array, so the last index is rebased.
+static std::optional<StorePath> StorePathFromPointer(const StorePath& slot, const StorePath& at,
+                                                     bool exact)
+{
+    const StorePath cs = CanonicalStorePath(slot);
+    const StorePath ca = CanonicalStorePath(at);
+    const size_t n = ca.size();
+    for (size_t i = 0; i + 1 < n && i < cs.size(); ++i)
+        if (!StoreIndexMatches(ca[i], cs[i])) return std::nullopt;
+    if (!exact || cs.size() < n) return StorePath{ kAnyStoreIndex };
+    StorePath rel{ cs[n - 1] == kAnyStoreIndex || ca[n - 1] == kAnyStoreIndex
+                       ? kAnyStoreIndex : cs[n - 1] - ca[n - 1] };
+    rel.insert(rel.end(), cs.begin() + static_cast<long>(n), cs.end());
+    return rel;
+}
+
+// Appends the indices of an address computed from one at `path`: its first index offsets the
+// last one of path. Past the length bound the path stays a coarser prefix (exact = false).
+static void JoinStorePath(StorePath& path, const StorePath& next, bool& exact)
+{
+    for (size_t i = 0; i < next.size() && exact; ++i)
+    {
+        if (i == 0 && !path.empty())
+            path.back() = AddStoreIndex(path.back(), next[0]);
+        else if (path.size() >= kMaxStorePathLength)
+            exact = false;
+        else
+            path.push_back(next[i]);
+    }
+}
+
+static void ExtendStorePath(const llvm::GetElementPtrInst* gep, StorePath& path, bool& exact)
+{
+    // A byte-offset GEP names no element index; every index it carries is unknown.
+    const bool byteOffset = gep->getSourceElementType()->isIntegerTy(8);
+    StorePath next;
+    for (unsigned i = 1; i < gep->getNumOperands(); ++i)
+    {
+        const auto* index = llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(i));
+        next.push_back(index == nullptr || (byteOffset && !index->isZero())
+                           ? kAnyStoreIndex : index->getSExtValue());
+    }
+    JoinStorePath(path, next, exact);
+}
+
+// Root of an address and its path; exact turns false once the path exceeds its bound.
+static const llvm::Value* AddressRootAndPath(const llvm::Value* address, StorePath& path,
+                                             bool& exact)
+{
+    std::vector<const llvm::GetElementPtrInst*> geps;
+    const llvm::Value* root = address;
+    while (true)
+    {
+        if (const auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(root))
+        {
+            geps.push_back(gep);
+            root = gep->getPointerOperand();
+        }
+        else if (llvm::isa<llvm::BitCastInst>(root) || llvm::isa<llvm::AddrSpaceCastInst>(root))
+            root = llvm::cast<llvm::Instruction>(root)->getOperand(0);
+        else
+            break;
+    }
+    path.clear();
+    exact = true;
+    for (auto it = geps.rbegin(); it != geps.rend(); ++it)
+        ExtendStorePath(*it, path, exact);
+    return root;
+}
+
+static bool IsLocalSlotOf(const llvm::Value* root, const llvm::Function* function)
+{
+    const auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(root);
+    return slot != nullptr && slot->getFunction() == function;
+}
+
+static const llvm::Function* DirectCallee(const llvm::CallBase* call)
+{
+    if (const llvm::Function* callee = call->getCalledFunction()) return callee;
+    return llvm::dyn_cast<llvm::Function>(call->getCalledOperand()->stripPointerCasts());
+}
+
+static bool FunctionArgumentMayBeReturned(const llvm::Function* function, size_t argumentIndex,
+                                          unsigned depth);
+
+// Every return hands back the parameter itself, directly or through local spill slots.
+static bool ArgumentAlwaysReturned(const llvm::Function* function, size_t argumentIndex)
+{
+    if (function == nullptr || function->isDeclaration() || argumentIndex >= function->arg_size())
+        return false;
+    const llvm::Argument* argument = function->getArg(argumentIndex);
+    std::function<bool(const llvm::Value*, unsigned)> isArgument =
+        [&](const llvm::Value* value, unsigned depth) {
+            value = value->stripPointerCasts();
+            if (value == argument) return true;
+            const auto* load = llvm::dyn_cast<llvm::LoadInst>(value);
+            const auto* spill = load != nullptr
+                ? llvm::dyn_cast<llvm::AllocaInst>(load->getPointerOperand()) : nullptr;
+            if (spill == nullptr || depth > 4) return false;
+            for (const llvm::User* user : spill->users())
+            {
+                if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+                {
+                    if (store->getPointerOperand() != spill
+                        || !isArgument(store->getValueOperand(), depth + 1))
+                        return false;
+                    continue;
+                }
+                if (llvm::isa<llvm::LoadInst>(user) || llvm::isa<llvm::DbgInfoIntrinsic>(user))
+                    continue;
+                if (const auto* intrinsic = llvm::dyn_cast<llvm::IntrinsicInst>(user))
+                    if (intrinsic->getIntrinsicID() == llvm::Intrinsic::lifetime_start
+                        || intrinsic->getIntrinsicID() == llvm::Intrinsic::lifetime_end)
+                        continue;
+                return false;
+            }
+            return true;
+        };
+    bool returns = false;
+    for (const auto& block : *function)
+    {
+        const auto* ret = llvm::dyn_cast_or_null<llvm::ReturnInst>(block.getTerminator());
+        if (ret == nullptr) continue;
+        if (ret->getReturnValue() == nullptr || !isArgument(ret->getReturnValue(), 0)) return false;
+        returns = true;
+    }
+    return returns;
+}
+
+// One callee walk state: the parameter, the value parts and the pointee paths that hold the
+// argument. Walks in progress and finished walks are keyed on it (a fixed point over states).
+struct StoreWalkKey
+{
+    const llvm::Function* callee;
+    size_t argumentIndex;
+    std::vector<StorePath> values;
+    std::vector<StorePath> slots;
+    bool operator<(const StoreWalkKey& other) const
+    {
+        return std::tie(callee, argumentIndex, values, slots)
+            < std::tie(other.callee, other.argumentIndex, other.values, other.slots);
+    }
+    bool operator==(const StoreWalkKey& other) const
+    {
+        return callee == other.callee && argumentIndex == other.argumentIndex
+            && values == other.values && slots == other.slots;
+    }
+};
+
+// A store a callee makes through one of its own parameters: parameter number and the path below
+// the pointer it was given. The caller maps it onto the operand it passed.
+using ParamStore = std::pair<unsigned, StorePath>;
+
+struct StoreWalkResult
+{
+    StoreVerdict verdict = StoreVerdict::None;
+    std::set<ParamStore> paramStores;
+};
+
+struct StoreWalkContext
+{
+    // The core deallocators: freeing a pointer never keeps it (their hooks are not walked).
+    std::vector<const llvm::Function*> deallocators;
+    std::vector<StoreWalkKey> active;
+    std::map<StoreWalkKey, StoreWalkResult> memo;
+    size_t bodies = 0;
+    size_t cycles = 0;
+};
+
+static StoreWalkResult CalleeStoresTracked(StoreWalkContext& context, const llvm::Function* callee,
+                                           size_t argumentIndex, std::vector<StorePath> values,
+                                           std::vector<StorePath> slots, unsigned depth);
+
+// One walk over a CFlat body: tracked values and slots move the argument forward until a store
+// reaches storage that outlives the call. A use it cannot follow makes the answer Unknown.
+struct StoreWalk
+{
+    StoreWalkContext& context;
+    const llvm::Function* function;
+    unsigned depth;
+    std::vector<TrackedValue> work;
+    std::vector<TrackedSlot> slots;
+    std::vector<const llvm::Value*> rescan;
+    std::set<std::pair<const llvm::Value*, StorePath>> seenValues;
+    std::set<ParamStore> paramStores;
+    bool unknown = false;
+
+    void track(const llvm::Value* value, StorePath rel);
+    void slot(const llvm::Value* root, StorePath path);
+    bool callee(const llvm::CallBase* call, const llvm::Function* nested, size_t argumentIndex,
+                std::vector<StorePath> values, std::vector<StorePath> seeds);
+    bool storeAtRoot(const llvm::Value* root, StorePath path, bool exact, unsigned hops);
+    bool storeAtAddress(const llvm::Value* address, const StorePath& below, unsigned hops);
+    bool storeTo(const llvm::Value* address, const StorePath& rel);
+    bool scanValue(const TrackedValue& tracked);
+    bool scanRoot(const llvm::Value* root);
+    StoreVerdict run();
+};
+
+void StoreWalk::track(const llvm::Value* value, StorePath rel)
+{
+    if (!seenValues.insert({ value, rel }).second) return;
+    work.push_back({ value, std::move(rel) });
+}
+
+void StoreWalk::slot(const llvm::Value* root, StorePath path)
+{
+    for (const auto& known : slots)
+        if (known.root == root && known.path == path) return;
+    if (slots.size() >= kMaxTrackedSlots)
+    {
+        unknown = true;
+        return;
+    }
+    slots.push_back({ root, std::move(path) });
+    rescan.push_back(root);
+}
+
+// A nested callee's own stores through its parameters land on the operands this call passed.
+bool StoreWalk::callee(const llvm::CallBase* call, const llvm::Function* nested,
+                       size_t argumentIndex, std::vector<StorePath> values,
+                       std::vector<StorePath> seeds)
+{
+    const StoreWalkResult result = CalleeStoresTracked(context, nested, argumentIndex,
+                                                       std::move(values), std::move(seeds), depth + 1);
+    if (result.verdict == StoreVerdict::Unknown) unknown = true;
+    if (result.verdict == StoreVerdict::Stores) return true;
+    for (const auto& [parameter, below] : result.paramStores)
+    {
+        if (parameter >= call->arg_size())
+        {
+            unknown = true;
+            continue;
+        }
+        if (storeAtAddress(call->getArgOperand(parameter), below, 0)) return true;
+    }
+    return false;
+}
+
+// Values a local pointer variable may hold: every store into it, or nothing when its address is
+// used any other way (the variable is then not followed).
+static bool LocalPointerVariableValues(const llvm::AllocaInst* variable,
+                                       std::vector<const llvm::Value*>& values)
+{
+    for (const llvm::User* user : variable->users())
+    {
+        if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+        {
+            if (store->getPointerOperand() != variable) return false;
+            values.push_back(store->getValueOperand());
+            continue;
+        }
+        if (llvm::isa<llvm::LoadInst>(user) || llvm::isa<llvm::DbgInfoIntrinsic>(user)) continue;
+        if (const auto* intrinsic = llvm::dyn_cast<llvm::IntrinsicInst>(user))
+            if (intrinsic->getIntrinsicID() == llvm::Intrinsic::lifetime_start
+                || intrinsic->getIntrinsicID() == llvm::Intrinsic::lifetime_end)
+                continue;
+        return false;
+    }
+    return true;
+}
+
+// A tainted value stored at root/path. Proven outside: a global, storage reached through a global,
+// or the top call's own parameter. A nested callee's parameter is reported to its caller; a local
+// slot keeps the value; storage the walk cannot place (heap, a call result) is Unknown.
+bool StoreWalk::storeAtRoot(const llvm::Value* root, StorePath path, bool exact, unsigned hops)
+{
+    if (IsLocalSlotOf(root, function))
+    {
+        slot(root, std::move(path));
+        return false;
+    }
+    if (llvm::isa<llvm::GlobalValue>(root)) return true;
+    if (const auto* argument = llvm::dyn_cast<llvm::Argument>(root))
+    {
+        if (argument->getParent() != function) return true;
+        if (depth == 0) return true;
+        paramStores.insert({ argument->getArgNo(), std::move(path) });
+        return false;
+    }
+    if (hops > 8)
+    {
+        unknown = true;
+        return false;
+    }
+    std::vector<const llvm::Value*> arms;
+    if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(root))
+        for (const auto& incoming : phi->incoming_values()) arms.push_back(incoming);
+    else if (const auto* select = llvm::dyn_cast<llvm::SelectInst>(root))
+        arms = { select->getTrueValue(), select->getFalseValue() };
+    else if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(root))
+    {
+        StorePath holderPath;
+        bool holderExact = true;
+        const llvm::Value* holder = AddressRootAndPath(load->getPointerOperand(), holderPath,
+                                                       holderExact);
+        // A pointer read from a local pointer variable is any value stored into it.
+        const bool variable = IsLocalSlotOf(holder, function) && holderPath.empty() && holderExact
+            && LocalPointerVariableValues(llvm::cast<llvm::AllocaInst>(holder), arms);
+        if (!variable)
+        {
+            // A pointer read through a global, or through the top call's parameter, names storage
+            // reachable after the call; one read through anything else is not placed.
+            arms.clear();
+            const llvm::Value* base = holder;
+            if (const auto* inner = llvm::dyn_cast<llvm::LoadInst>(holder))
+            {
+                StorePath innerPath;
+                bool innerExact = true;
+                const llvm::Value* innerRoot = AddressRootAndPath(inner->getPointerOperand(),
+                                                                  innerPath, innerExact);
+                std::vector<const llvm::Value*> held;
+                if (IsLocalSlotOf(innerRoot, function) && innerPath.empty() && innerExact
+                    && LocalPointerVariableValues(llvm::cast<llvm::AllocaInst>(innerRoot), held)
+                    && held.size() == 1)
+                    base = held.front()->stripPointerCasts();
+            }
+            if (llvm::isa<llvm::GlobalValue>(base)) return true;
+            if (const auto* argument = llvm::dyn_cast<llvm::Argument>(base);
+                argument != nullptr && argument->getParent() == function && depth == 0)
+                return true;
+            unknown = true;
+            return false;
+        }
+    }
+    if (arms.empty())
+    {
+        unknown = true;
+        return false;
+    }
+    for (const llvm::Value* arm : arms)
+    {
+        StorePath armPath;
+        bool armExact = true;
+        const llvm::Value* armRoot = AddressRootAndPath(arm, armPath, armExact);
+        if (armExact && exact) JoinStorePath(armPath, path, armExact);
+        else armExact = false;
+        if (storeAtRoot(armRoot, std::move(armPath), armExact, hops + 1)) return true;
+    }
+    return false;
+}
+
+// A store at `below` relative to the pointer `address` (its first index offsets that pointer).
+bool StoreWalk::storeAtAddress(const llvm::Value* address, const StorePath& below, unsigned hops)
+{
+    StorePath path;
+    bool exact = true;
+    const llvm::Value* root = AddressRootAndPath(address, path, exact);
+    if (exact) JoinStorePath(path, below, exact);
+    return storeAtRoot(root, std::move(path), exact, hops);
+}
+
+// The stored value's own part (rel) lies below the address it is stored at.
+bool StoreWalk::storeTo(const llvm::Value* address, const StorePath& rel)
+{
+    StorePath below{ 0 };
+    for (int64_t index : rel)
+    {
+        if (below.size() >= kMaxStorePathLength) break;
+        below.push_back(index);
+    }
+    return storeAtAddress(address, below, 0);
+}
+
+bool StoreWalk::scanValue(const TrackedValue& tracked)
+{
+    const llvm::Value* value = tracked.value;
+    for (const llvm::User* user : value->users())
+    {
+        if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+        {
+            if (store->getValueOperand() == value && storeTo(store->getPointerOperand(), tracked.rel))
+                return true;
+            continue;
+        }
+        if (const auto* call = llvm::dyn_cast<llvm::CallBase>(user))
+        {
+            const llvm::Function* nested = DirectCallee(call);
+            for (unsigned i = 0; i < call->arg_size(); ++i)
+            {
+                if (call->getArgOperand(i) != value) continue;
+                // An indirect callee is not followed; an extern one is trusted like a direct call.
+                if (nested == nullptr)
+                {
+                    unknown = true;
+                    continue;
+                }
+                if (nested->isDeclaration()) continue;
+                if (callee(call, nested, i, { tracked.rel }, {})) return true;
+                if (FunctionArgumentMayBeReturned(nested, i, 0)) track(call, tracked.rel);
+            }
+            continue;
+        }
+        if (const auto* instruction = llvm::dyn_cast<llvm::Instruction>(user))
+        {
+            switch (instruction->getOpcode())
+            {
+            case llvm::Instruction::BitCast:
+            case llvm::Instruction::AddrSpaceCast:
+            case llvm::Instruction::GetElementPtr:
+            case llvm::Instruction::PHI:
+            case llvm::Instruction::Select:
+            case llvm::Instruction::Freeze:
+                track(instruction, tracked.rel);
+                break;
+            case llvm::Instruction::ExtractValue:
+            case llvm::Instruction::InsertValue:
+                track(instruction, {});
+                break;
+            // The pointer leaves pointer form or memory the walk tracks: not followed.
+            case llvm::Instruction::PtrToInt:
+            case llvm::Instruction::AtomicRMW:
+            case llvm::Instruction::AtomicCmpXchg:
+            case llvm::Instruction::InsertElement:
+                unknown = true;
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+// Users of a slot root: loads carry back what overlaps them. An address kept in a local spill
+// slot, a join of addresses or a returned parameter is followed; other uses are Unknown.
+bool StoreWalk::scanRoot(const llvm::Value* root)
+{
+    struct Address
+    {
+        const llvm::Value* value;
+        StorePath path;
+        bool exact;
+        bool holder;  // a local slot that holds the address (not the address itself)
+    };
+    std::vector<Address> items{ { root, {}, true, false } };
+    std::set<std::tuple<const llvm::Value*, StorePath, bool, bool>> seenItems{ { root, {}, true, false } };
+    auto addItem = [&](const llvm::Value* value, StorePath path, bool exact, bool holder) {
+        if (seenItems.insert({ value, path, exact, holder }).second)
+            items.push_back({ value, std::move(path), exact, holder });
+    };
+    for (size_t i = 0; i < items.size(); ++i)
+    {
+        const Address item = items[i];
+        if (item.holder)
+        {
+            for (const llvm::User* user : item.value->users())
+            {
+                if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(user))
+                {
+                    if (load->getType()->isPointerTy()) addItem(load, item.path, item.exact, false);
+                    continue;
+                }
+                if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+                {
+                    if (store->getValueOperand() == item.value) unknown = true;
+                    continue;
+                }
+                const auto* call = llvm::dyn_cast<llvm::CallBase>(user);
+                if (call == nullptr || DirectCallee(call) == nullptr
+                    || !DirectCallee(call)->isDeclaration())
+                    unknown = true;
+            }
+            continue;
+        }
+        std::vector<StorePath> overlapping;
+        std::vector<StorePath> seeds;
+        for (const auto& known : slots)
+        {
+            if (known.root != root) continue;
+            if (StorePathsOverlap(known.path, item.path))
+                overlapping.push_back(item.exact ? StorePathBelow(known.path, item.path) : StorePath{});
+            if (auto seed = StorePathFromPointer(known.path, item.path, item.exact))
+                seeds.push_back(std::move(*seed));
+        }
+        for (const llvm::User* user : item.value->users())
+        {
+            if (const auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(user))
+            {
+                if (gep->getPointerOperand() != item.value)
+                {
+                    unknown = true;
+                    continue;
+                }
+                StorePath path = item.path;
+                bool exact = item.exact;
+                ExtendStorePath(gep, path, exact);
+                addItem(gep, std::move(path), exact, false);
+                continue;
+            }
+            if (llvm::isa<llvm::BitCastInst>(user) || llvm::isa<llvm::AddrSpaceCastInst>(user)
+                || llvm::isa<llvm::PHINode>(user) || llvm::isa<llvm::SelectInst>(user)
+                || llvm::isa<llvm::FreezeInst>(user))
+            {
+                if (const auto* select = llvm::dyn_cast<llvm::SelectInst>(user);
+                    select != nullptr && select->getCondition() == item.value)
+                    continue;
+                addItem(user, item.path, item.exact, false);
+                continue;
+            }
+            if (llvm::isa<llvm::ICmpInst>(user) || llvm::isa<llvm::ReturnInst>(user)) continue;
+            if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(user))
+            {
+                for (const auto& rel : overlapping)
+                {
+                    if (load->getType()->isPointerTy()) track(load, {});
+                    else if (load->getType()->isAggregateType()) track(load, rel);
+                }
+                continue;
+            }
+            if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+            {
+                if (store->getValueOperand() != item.value) continue;
+                StorePath slotPath;
+                bool slotExact = true;
+                const llvm::Value* spillRoot = AddressRootAndPath(store->getPointerOperand(), slotPath,
+                                                                  slotExact);
+                if (!IsLocalSlotOf(spillRoot, function) || !slotPath.empty() || !slotExact)
+                {
+                    unknown = true;
+                    continue;
+                }
+                addItem(spillRoot, item.path, item.exact, true);
+                continue;
+            }
+            if (const auto* transfer = llvm::dyn_cast<llvm::MemTransferInst>(user))
+            {
+                if (transfer->getRawSource() != item.value) continue;
+                for (const auto& rel : overlapping)
+                    if (storeTo(transfer->getRawDest(), rel)) return true;
+                continue;
+            }
+            if (const auto* call = llvm::dyn_cast<llvm::CallBase>(user))
+            {
+                const llvm::Function* nested = DirectCallee(call);
+                for (unsigned a = 0; a < call->arg_size(); ++a)
+                {
+                    if (call->getArgOperand(a) != item.value || seeds.empty()) continue;
+                    if (nested == nullptr)
+                    {
+                        unknown = true;
+                        continue;
+                    }
+                    if (nested->isDeclaration()) continue;
+                    if (callee(call, nested, a, {}, seeds)) return true;
+                    // The returned parameter is the same address; a maybe-returned one is not followed.
+                    if (ArgumentAlwaysReturned(nested, a))
+                        addItem(call, item.path, item.exact, false);
+                    else if (FunctionArgumentMayBeReturned(nested, a, 0))
+                        unknown = true;
+                }
+                if (call->getCalledOperand() == item.value) unknown = true;
+                continue;
+            }
+            unknown = true;
+        }
+    }
+    return false;
+}
+
+StoreVerdict StoreWalk::run()
+{
+    while (!work.empty() || !rescan.empty())
+    {
+        if (!rescan.empty())
+        {
+            const llvm::Value* root = rescan.back();
+            rescan.pop_back();
+            if (scanRoot(root)) return StoreVerdict::Stores;
+            continue;
+        }
+        TrackedValue tracked = std::move(work.back());
+        work.pop_back();
+        if (scanValue(tracked)) return StoreVerdict::Stores;
+    }
+    return unknown ? StoreVerdict::Unknown : StoreVerdict::None;
+}
+
+// A CFlat body walked from its seeds. A state already being walked (recursion with the same
+// seeds) adds nothing; a new state is walked in its own right, so a shifted seed is followed.
+static StoreWalkResult CalleeStoresTracked(StoreWalkContext& context, const llvm::Function* callee,
+                                           size_t argumentIndex, std::vector<StorePath> values,
+                                           std::vector<StorePath> slots, unsigned depth)
+{
+    if (callee == nullptr) return { StoreVerdict::Unknown, {} };
+    if (callee->isDeclaration()
+        || std::find(context.deallocators.begin(), context.deallocators.end(), callee)
+            != context.deallocators.end())
+        return { StoreVerdict::None, {} };
+    // The variadic portion keeps the variadic axiom (ParameterRetainsArgumentPastCall).
+    if (argumentIndex >= callee->arg_size())
+        return { callee->isVarArg() ? StoreVerdict::None : StoreVerdict::Unknown, {} };
+    for (auto* list : { &values, &slots })
+    {
+        std::sort(list->begin(), list->end());
+        list->erase(std::unique(list->begin(), list->end()), list->end());
+    }
+    StoreWalkKey key{ callee, argumentIndex, std::move(values), std::move(slots) };
+    if (std::find(context.active.begin(), context.active.end(), key) != context.active.end())
+    {
+        ++context.cycles;
+        return { StoreVerdict::None, {} };
+    }
+    if (auto it = context.memo.find(key); it != context.memo.end()) return it->second;
+    if (depth > kMaxStoreWalkDepth || context.bodies >= kMaxStoreWalkBodies)
+        return { StoreVerdict::Unknown, {} };
+    ++context.bodies;
+    const size_t cyclesBefore = context.cycles;
+    context.active.push_back(key);
+    StoreWalk walk{ context, callee, depth };
+    const llvm::Argument* argument = callee->getArg(argumentIndex);
+    for (const auto& rel : key.values) walk.track(argument, rel);
+    for (const auto& path : key.slots) walk.slot(argument, path);
+    StoreWalkResult result{ walk.run(), std::move(walk.paramStores) };
+    context.active.pop_back();
+    // A verdict that leaned on a walk still in progress is not final for other callers.
+    if (result.verdict == StoreVerdict::Stores || context.cycles == cyclesBefore)
+        context.memo.emplace(std::move(key), result);
+    return result;
+}
+
+// Retained owners keep the narrow walk: the parameter's own direct stores and slot reloads only.
+static bool ArgumentStoresOutsideCall(const llvm::Function* function, size_t argumentIndex)
+{
+    if (function == nullptr || function->isDeclaration() || argumentIndex >= function->arg_size())
+        return false;
+    std::vector<const llvm::Value*> pending{ function->getArg(argumentIndex) };
+    std::unordered_set<const llvm::Value*> visited;
+    while (!pending.empty())
+    {
+        const llvm::Value* value = pending.back();
+        pending.pop_back();
+        if (!visited.insert(value).second) continue;
+        for (const llvm::User* user : value->users())
+        {
+            if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+            {
+                if (store->getValueOperand() == value)
+                {
+                    if (StoreDestinationMayOutliveCall(store->getPointerOperand(), function))
+                        return true;
+                    if (const auto* local = llvm::dyn_cast<llvm::AllocaInst>(
+                            store->getPointerOperand()->stripPointerCasts());
+                        local != nullptr && local->getFunction() == function)
+                        for (const llvm::User* localUser : local->users())
+                            if (const auto* localLoad = llvm::dyn_cast<llvm::LoadInst>(localUser);
+                                localLoad != nullptr && localLoad->getPointerOperand() == local)
+                                pending.push_back(localLoad);
+                }
+                continue;
+            }
+            if (llvm::isa<llvm::CallBase>(user) || llvm::isa<llvm::LoadInst>(user)
+                || llvm::isa<llvm::ReturnInst>(user))
+                continue;
+            if (const auto* instruction = llvm::dyn_cast<llvm::Instruction>(user))
+            {
+                switch (instruction->getOpcode())
+                {
+                case llvm::Instruction::BitCast:
+                case llvm::Instruction::AddrSpaceCast:
+                case llvm::Instruction::GetElementPtr:
+                case llvm::Instruction::PHI:
+                case llvm::Instruction::Select:
+                case llvm::Instruction::Freeze:
+                    pending.push_back(instruction);
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+bool LLVMBackend::FunctionArgumentDefinitelyStoresOutsideCall(const llvm::Function* function,
+                                                              size_t argumentIndex,
+                                                              bool throughCalls)
+{
+    if (!throughCalls) return ArgumentStoresOutsideCall(function, argumentIndex);
+    return ClassifyArgumentStoreOutsideCall(function, argumentIndex) == StoreVerdict::Stores;
+}
+
+LLVMBackend::RawPointerStoreVerdict LLVMBackend::ClassifyArgumentStoreOutsideCall(
+        const llvm::Function* function, size_t argumentIndex)
+{
+    StoreWalkContext context;
+    for (const char* name : { "operator delete", "__delete_aligned" })
+        if (auto it = functionTable.find(name); it != functionTable.end())
+            for (const auto& symbol : it->second)
+                if (symbol.Function != nullptr && !symbol.IsCxx)
+                    context.deallocators.push_back(symbol.Function);
+    return CalleeStoresTracked(context, function, argumentIndex, { StorePath{} }, {}, 0).verdict;
+}
+
+static bool FunctionArgumentMayBeReturned(const llvm::Function* function, size_t argumentIndex,
+                                          unsigned depth = 0)
+{
+    if (function == nullptr || function->isDeclaration() || argumentIndex >= function->arg_size()
+        || depth >= 12)
+        return true;
+
+    std::vector<const llvm::Value*> pending{ function->getArg(argumentIndex) };
+    std::unordered_set<const llvm::Value*> visited;
+    while (!pending.empty())
+    {
+        const llvm::Value* value = pending.back();
+        pending.pop_back();
+        if (!visited.insert(value).second) continue;
+        for (const llvm::User* user : value->users())
+        {
+            if (const auto* ret = llvm::dyn_cast<llvm::ReturnInst>(user))
+            {
+                if (ret->getReturnValue() == value) return true;
+                continue;
+            }
+            if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+            {
+                if (store->getValueOperand() != value || store->getPointerOperand() == value)
+                    continue;
+                auto* local = llvm::dyn_cast<llvm::AllocaInst>(
+                    store->getPointerOperand()->stripPointerCasts());
+                if (local == nullptr || local->getFunction() != function) continue;
+                for (const llvm::User* localUser : local->users())
+                {
+                    if (llvm::isa<llvm::DbgInfoIntrinsic>(localUser)) continue;
+                    if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(localUser))
+                    {
+                        if (load->getPointerOperand() == local && load->getType()->isPointerTy())
+                        {
+                            pending.push_back(load);
+                            continue;
+                        }
+                    }
+                    if (const auto* localStore = llvm::dyn_cast<llvm::StoreInst>(localUser))
+                        if (localStore->getPointerOperand() == local) continue;
+                    if (const auto* intrinsic = llvm::dyn_cast<llvm::IntrinsicInst>(localUser))
+                        if (intrinsic->getIntrinsicID() == llvm::Intrinsic::lifetime_start
+                            || intrinsic->getIntrinsicID() == llvm::Intrinsic::lifetime_end)
+                            continue;
+                }
+                continue;
+            }
+            if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(user))
+            {
+                if (load->getPointerOperand() == value && load->getType()->isPointerTy())
+                    pending.push_back(load);
+                continue;
+            }
+            if (const auto* call = llvm::dyn_cast<llvm::CallBase>(user))
+            {
+                if (!call->getType()->isPointerTy()) continue;
+                for (unsigned i = 0; i < call->arg_size(); ++i)
+                {
+                    if (call->getArgOperand(i) != value) continue;
+                    const llvm::Function* callee = call->getCalledFunction();
+                    if (callee == nullptr)
+                        callee = llvm::dyn_cast<llvm::Function>(
+                            call->getCalledOperand()->stripPointerCasts());
+                    if (FunctionArgumentMayBeReturned(callee, i, depth + 1))
+                        pending.push_back(call);
+                }
+                continue;
+            }
+            if (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(user))
+            {
+                if (gep->getPointerOperand() == value) pending.push_back(gep);
+                continue;
+            }
+            if (const auto* select = llvm::dyn_cast<llvm::SelectInst>(user))
+            {
+                if (select->getTrueValue() == value || select->getFalseValue() == value)
+                    pending.push_back(select);
+                continue;
+            }
+            if (const auto* instruction = llvm::dyn_cast<llvm::Instruction>(user))
+            {
+                switch (instruction->getOpcode())
+                {
+                case llvm::Instruction::BitCast:
+                case llvm::Instruction::AddrSpaceCast:
+                case llvm::Instruction::PHI:
+                case llvm::Instruction::Freeze:
+                    pending.push_back(instruction);
+                    continue;
+                case llvm::Instruction::ICmp:
+                    continue;
+                default:
+                    continue;
+                }
+            }
         }
     }
     return false;
@@ -1283,6 +2170,33 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
             DiagnoseAssignmentArguments(argumentList);
         const size_t arrowTempMark = arrowOwnedTemps_.size();
         auto namedVar = ParsePostfixExpressionInner(ctx, lValue, dropTrailingChildren, use);
+        if (auto* resultCall = llvm::dyn_cast_or_null<llvm::CallBase>(namedVar.Primary);
+            resultCall != nullptr && resultCall->getType()->isPointerTy())
+        {
+            const llvm::Function* function = resultCall->getCalledFunction();
+            if (function == nullptr)
+                function = llvm::dyn_cast<llvm::Function>(
+                    resultCall->getCalledOperand()->stripPointerCasts());
+            if (function != nullptr && Compiler(ctx)->FunctionBodyIsComplete(function))
+            {
+                for (unsigned i = 0; i < resultCall->arg_size() && i < function->arg_size(); ++i)
+                {
+                    if (!Compiler(ctx)->JoinCarriesOwningTempRawPointerField(
+                            resultCall->getArgOperand(i))
+                        || FunctionArgumentMayEscape(function, i, /*returnedValueEscapes*/ false))
+                        continue;
+                    if (FunctionArgumentMayBeReturned(function, i))
+                    {
+                        Compiler(ctx)->RegisterOwningTempRawPointerField(namedVar.Primary);
+                        for (auto* storage : Compiler(ctx)->FindOwningTempRawPointerFieldOwners(
+                                 resultCall->getArgOperand(i)))
+                            Compiler(ctx)->RegisterOwningTempRawPointerFieldOwner(
+                                namedVar.Primary, storage);
+                        break;
+                    }
+                }
+            }
+        }
         if (!lValue && addressOfOperandDepth_ == 0 && namedVar.Storage != nullptr)
         {
             if (namedVar.TypeAndValue.IsArrayView)
@@ -1297,7 +2211,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
         if (arrowOwnedTemps_.size() > arrowTempMark && !namedVar.FieldName.empty())
         {
             if (addressOfOperandDepth_ != 0 && namedVar.Storage != nullptr)
-                Compiler(ctx)->RegisterOwningTempRawPointerField(namedVar.Storage);
+                Compiler(ctx)->RegisterOwningTempRawPointerFieldAddress(namedVar.Storage);
             else if (namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsUnique
                 && namedVar.Primary != nullptr)
                 Compiler(ctx)->RegisterOwningTempRawPointerField(namedVar.Primary);
@@ -1315,15 +2229,17 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                 && (valueType->isIntegerTy() || valueType->isFloatingPointTy())
                 && IsDerefOperandChain(ctx);
             const bool aliasDecl = AliasDeclarationMayOutlive(ctx, namedVar);
-            const bool pointerDifference = !aliasDecl && borrows && pointsToScalar
-                && IsPointerDifferenceOperand(Compiler(ctx), ctx);
+            const PointerDifferenceSite pointerDifferenceSite = !aliasDecl && borrows
+                && namedVar.TypeAndValue.Pointer ? FindPointerDifferenceSite(ctx) : PointerDifferenceSite{};
             const bool readInPlace = borrows && (pointsToScalar || addressDerefScalar)
-                && (pointerDifference || (IsDerefOperandChain(ctx)
-                    && !DerefResultMayOutlive(ctx, namedVar)));
-            AdditiveCallArgumentPath additiveCallPath;
-            const bool callArgumentReadPath = IsCallArgumentReadPath(ctx, &additiveCallPath);
+                && IsDerefOperandChain(ctx) && !DerefResultMayOutlive(ctx, namedVar);
+            const bool callArgumentReadPath = IsCallArgumentReadPath(ctx);
             const bool callArgument = !aliasDecl
                 && (IsDirectCallArgument(ctx) || callArgumentReadPath);
+            CallArgumentPath callArgumentPath;
+            const bool hasCallArgumentPath = FindCallArgumentPath(ctx, &callArgumentPath);
+            const bool pointerCallArgument = !IsDerefOperandChain(ctx)
+                && (borrows || addressOfOperandDepth_ != 0);
             size_t write = arrowTempMark;
             for (size_t i = arrowTempMark; i < arrowOwnedTemps_.size(); ++i)
             {
@@ -1332,11 +2248,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                 {
                     if (temp.PendingCallResult == ctx)
                     {
-                        auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(namedVar.Primary);
-                        llvm::Type* callResultType = call != nullptr ? call->getType()
-                            : (namedVar.Primary != nullptr ? namedVar.Primary->getType() : valueType);
-                        const bool scalarNumber = callResultType != nullptr
-                            && (callResultType->isIntegerTy() || callResultType->isFloatingPointTy());
+                        // A member suffix can leave the final field load in namedVar.Primary.
+                        // Use the call generated for this argument list when available.
+                        auto* callValue = temp.PendingCallValue != nullptr
+                            ? temp.PendingCallValue : namedVar.Primary;
+                        auto* call = llvm::dyn_cast_or_null<llvm::CallBase>(callValue);
                         const llvm::Function* function = call != nullptr ? call->getCalledFunction() : nullptr;
                         if (function == nullptr && call != nullptr)
                             function = llvm::dyn_cast<llvm::Function>(
@@ -1344,26 +2260,81 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                         size_t parameterIndex = temp.ArgumentIndex;
                         bool argumentEscapes = temp.NamedArgument || function == nullptr
                             || parameterIndex == SIZE_MAX;
+                        bool resultMayDeriveFromArgument = call != nullptr
+                            && call->getType()->isPointerTy()
+                            && (temp.NamedArgument || function == nullptr
+                                || parameterIndex == SIZE_MAX);
                         if (function != nullptr && parameterIndex != SIZE_MAX)
                         {
-                            const bool exactSimpleCall = call->arg_size() == 1
-                                && function->arg_size() == 1 && parameterIndex == 0;
-                            argumentEscapes = argumentEscapes || !exactSimpleCall
-                                || FunctionArgumentMayEscape(function, parameterIndex);
+                            const bool invalidArgument = call == nullptr
+                                || parameterIndex >= call->arg_size();
+                            // A body still being emitted (recursion) cannot prove either fact yet.
+                            const bool incompleteBody = !Compiler(ctx)->FunctionBodyIsComplete(function);
+                            argumentEscapes = argumentEscapes || invalidArgument || incompleteBody
+                                || FunctionArgumentMayEscape(function, parameterIndex,
+                                    /*returnedValueEscapes*/ false);
+                            resultMayDeriveFromArgument = resultMayDeriveFromArgument
+                                || invalidArgument || incompleteBody
+                                || FunctionArgumentMayBeReturned(function, parameterIndex);
                         }
-                        const bool pointerResult = callResultType != nullptr && callResultType->isPointerTy();
-                        if (!scalarNumber || pointerResult || argumentEscapes)
+                        if (call != nullptr && parameterIndex < call->arg_size()
+                            && resultMayDeriveFromArgument)
+                        {
+                            llvm::Value* sourceArgument = call->getArgOperand(parameterIndex);
+                            const bool sourceIsFieldPointer =
+                                Compiler(ctx)->JoinCarriesOwningTempRawPointerField(sourceArgument);
+                            const bool sourceIsFieldAddress =
+                                Compiler(ctx)->JoinCarriesOwningTempRawPointerFieldAddress(sourceArgument);
+                            if (sourceIsFieldPointer && !argumentEscapes)
+                            {
+                                Compiler(ctx)->RegisterOwningTempRawPointerField(namedVar.Primary);
+                                Compiler(ctx)->RegisterOwningTempRawPointerFieldOwner(
+                                    namedVar.Primary, temp.Storage);
+                                for (auto* storage : Compiler(ctx)->FindOwningTempRawPointerFieldOwners(
+                                         sourceArgument))
+                                    Compiler(ctx)->RegisterOwningTempRawPointerFieldOwner(
+                                        namedVar.Primary, storage);
+                            }
+                            if (sourceIsFieldAddress && resultMayDeriveFromArgument)
+                                argumentEscapes = true;
+                        }
+                        if (argumentEscapes)
                             Compiler(ctx)->UnregisterOwnedStructTemp(temp.Storage);
                         continue;
                     }
                     arrowOwnedTemps_[write++] = temp;
                     continue;
                 }
-                if (callArgumentReadPath && additiveCallPath.Call != nullptr && !aliasDecl)
+                if (readInPlace)
+                    continue;
+                if (pointerDifferenceSite.Expression != nullptr
+                    && (temp.Origin == ctx
+                        || temp.PendingPointerDifference == pointerDifferenceSite.Expression))
                 {
-                    temp.PendingCallResult = additiveCallPath.Call;
-                    temp.ArgumentIndex = additiveCallPath.ArgumentIndex;
-                    temp.NamedArgument = additiveCallPath.NamedArgument;
+                    temp.PendingPointerDifference = pointerDifferenceSite.Expression;
+                    temp.PointerDifferenceOperatorIndex = pointerDifferenceSite.OperatorIndex;
+                    if (pointerCallArgument && hasCallArgumentPath && !aliasDecl)
+                    {
+                        temp.PendingCallResult = callArgumentPath.Call;
+                        temp.PendingCallValue = nullptr;
+                        temp.PendingCallReturnType = {};
+                        temp.PendingCallParen = callArgumentPath.CallParen;
+                        temp.ArgumentIndex = callArgumentPath.ArgumentIndex;
+                        temp.NamedArgument = callArgumentPath.NamedArgument;
+                        temp.HasPendingCallValue = false;
+                    }
+                    arrowOwnedTemps_[write++] = temp;
+                    continue;
+                }
+                if (pointerCallArgument && hasCallArgumentPath && !aliasDecl)
+                {
+                    temp.PendingCallResult = callArgumentPath.Call;
+                    temp.PendingCallValue = nullptr;
+                    temp.PendingCallReturnType = {};
+                    temp.PendingCallParen = callArgumentPath.CallParen;
+                    temp.ArgumentIndex = callArgumentPath.ArgumentIndex;
+                    temp.NamedArgument = callArgumentPath.NamedArgument;
+                    temp.HasPendingCallValue = false;
                     arrowOwnedTemps_[write++] = temp;
                     continue;
                 }
@@ -1972,13 +2943,21 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             auto HasCFlatMemberMethod = [&](const std::string& ownerType,
                                             const std::string& methodName) {
                 auto it = Compiler(ctx)->functionTable.find(methodName);
-                if (it == Compiler(ctx)->functionTable.end()) return false;
-                return std::any_of(it->second.begin(), it->second.end(),
-                    [&](const LLVMBackend::FunctionSymbol& candidate) {
-                        return candidate.IsMethod && !candidate.IsCxx
-                            && !candidate.Parameters.empty()
-                            && candidate.Parameters.front().TypeName == ownerType;
-                    });
+                if (it != Compiler(ctx)->functionTable.end()
+                    && std::any_of(it->second.begin(), it->second.end(),
+                        [&](const LLVMBackend::FunctionSymbol& candidate) {
+                            return candidate.IsMethod && !candidate.IsCxx
+                                && !candidate.Parameters.empty()
+                                && candidate.Parameters.front().TypeName == ownerType;
+                        }))
+                    return true;
+                if (ownerType.empty()) return false;
+                auto staticIt = Compiler(ctx)->functionTable.find(ownerType + "." + methodName);
+                return staticIt != Compiler(ctx)->functionTable.end()
+                    && std::any_of(staticIt->second.begin(), staticIt->second.end(),
+                        [](const LLVMBackend::FunctionSymbol& candidate) {
+                            return !candidate.IsMethod && !candidate.IsCxx;
+                        });
             };
 
             auto ParseCallArgument = [&](auto&& parse) {
@@ -2255,6 +3234,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             size_t childIndex = 0;
             // The '(' of the call being lowered: the site key of codegen's overload choice.
             antlr4::tree::TerminalNode* callParen = nullptr;
+            auto RecordPendingCallResult = [&](const antlr4::tree::TerminalNode* paren,
+                                               llvm::Value* result)
+            {
+                if (paren == nullptr || result == nullptr) return;
+                for (auto& temp : arrowOwnedTemps_)
+                    if (temp.PendingCallResult == ctx && temp.PendingCallParen == paren)
+                    {
+                        temp.PendingCallValue = result;
+                        temp.PendingCallReturnType = Compiler(ctx)->lastCallReturnType;
+                        temp.HasPendingCallValue = true;
+                    }
+            };
 
             // A suffix consumes the primary as a receiver/callee, so the enclosing destination
             // belongs to the final postfix result, not to that primary. The one exception is a
@@ -2327,10 +3318,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 if (!nullConditionalPending)
                     Compiler(ctx)->RecordNullDerefFor(namedVar, ctx->getStart()->getLine(),
                         ctx->getStart()->getCharPositionInLine());
-                if (Compiler(ctx)->IsExplicitlyMovedNullHere(namedVar) && !nullConditionalPending)
-                    LogErrorContext(ctx, std::format(
-                        "dereference of moved variable '{}' (it is null after the move)",
-                        namedVar.CallerName));
+                if (Compiler(ctx)->IsMovedDerefHere(namedVar) && !nullConditionalPending)
+                    LogErrorContext(ctx, Compiler(ctx)->MovedDerefDiagnostic(namedVar));
                 llvm::Value* ptrVal = LoadNamedVariable(namedVar);
                 // --sanitize=ownership: guard `p->f` / `p.f` deref against a null
                 // (moved/freed) pointer. SKIP `?.` - the null-conditional operator
@@ -2432,7 +3421,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 || InPostfixSubscriptIndex(ctx) || IsDerefOperandChain(ctx)
                                 || IsCallArgumentReadPath(ctx))
                                 compiler->RegisterOwnedStructTemp(temp, recvType);
-                            arrowOwnedTemps_.push_back({ temp });
+                            arrowOwnedTemps_.push_back({ temp, ctx });
                         }
                     }
                     else if (receiver.IsParenthesizedProducedTemp
@@ -2452,7 +3441,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             && !compiler->IsOwnedStructTempSince(allTemps, thisNV.Storage))
                             compiler->RegisterOwnedStructTemp(thisNV.Storage,
                                                               receiver.TypeAndValue.TypeName);
-                        arrowOwnedTemps_.push_back({ thisNV.Storage });
+                        arrowOwnedTemps_.push_back({ thisNV.Storage, ctx });
                     }
 
                     // A core unique receiver is also a named local read: consult its merged move state.
@@ -2623,10 +3612,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 Compiler(ctx)->RecordNullDerefFor(namedVar,
                                     ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
                             if (!nullConditionalPending
-                                && Compiler(ctx)->IsExplicitlyMovedNullHere(namedVar))
-                                LogErrorContext(ctx, std::format(
-                                    "dereference of moved variable '{}' (it is null after the move)",
-                                    namedVar.CallerName));
+                                && Compiler(ctx)->IsMovedDerefHere(namedVar))
+                                LogErrorContext(ctx, Compiler(ctx)->MovedDerefDiagnostic(namedVar));
                         }
                         // [PFX-1b] Unadopted owning-POINTER receiver (`makePtr()->v = 1;`): free it
                         // at end-of-expression. SCALAR member only - see MemberIsScalarField.
@@ -3506,10 +4493,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             if (!nullConditionalPending)
                                 compiler->RecordNullDerefFor(interfaceVar, ctx->getStart()->getLine(),
                                     ctx->getStart()->getCharPositionInLine());
-                            if (compiler->IsExplicitlyMovedNullHere(interfaceVar) && !nullConditionalPending)
-                                LogErrorContext(ctx, std::format(
-                                    "dereference of moved variable '{}' (it is null after the move)",
-                                    interfaceVar.CallerName));
+                            if (compiler->IsMovedDerefHere(interfaceVar) && !nullConditionalPending)
+                                LogErrorContext(ctx, compiler->MovedDerefDiagnostic(interfaceVar));
                             const std::string& ifaceName = interfaceVar.TypeAndValue.TypeName;
                             int ifaceFieldIdx = compiler->InterfaceFieldIndex(ifaceName, primaryIdentifier);
                             if (ifaceFieldIdx >= 0 && !interfaceVar.TypeAndValue.IsInterfacePointer)
@@ -3842,7 +4827,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (namedVar.FromOwningTempField && namedVar.OwningTempParent)
                                     {
                                         if (addressOfOperandDepth_ != 0 && namedVar.Storage != nullptr)
-                                            Compiler(ctx)->RegisterOwningTempRawPointerField(namedVar.Storage);
+                                            Compiler(ctx)->RegisterOwningTempRawPointerFieldAddress(
+                                                namedVar.Storage);
                                         else if (fieldType.Pointer && !fieldType.IsUnique
                                             && namedVar.Primary != nullptr)
                                             Compiler(ctx)->RegisterOwningTempRawPointerField(namedVar.Primary);
@@ -3949,11 +4935,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         // Records WHO owns the field for the temp-source diagnostics:
                                         // the temp itself, or whatever an `alias` return borrowed from.
                                         namedVar.OwningTempParent = parentOwnsTemp;
+                                        llvm::Value* parentTempStorage = nullptr;
                                         if (parentOwnsTemp && !structVar.FromOwningTempField)
                                         {
                                             auto* tempAlloca = Compiler(ctx)->AllocaAtEntry(structVar.BaseType, nullptr, "owntemp");
                                             Compiler(ctx)->builder->CreateStore(structVar.Primary, tempAlloca);
                                             Compiler(ctx)->RegisterOwnedStructTemp(tempAlloca, parentType);
+                                            parentTempStorage = tempAlloca;
                                             // The temp owns this field: let a persist site move it out (store + zero
                                             // the source) rather than reject. Only an owning field can be moved.
                                             if (Compiler(ctx)->IsOwningValueType(fieldType.TypeName))
@@ -3969,6 +4957,19 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             namedVar.FromOwningTempField = true;
                                             if (namedVar.Primary != nullptr && !namedVar.OwningTempParent)
                                                 Compiler(ctx)->RegisterTempFieldValue(namedVar.Primary);
+                                            if (parentOwnsTemp && fieldType.Pointer && !fieldType.IsUnique
+                                                && namedVar.Primary != nullptr)
+                                            {
+                                                Compiler(ctx)->RegisterOwningTempRawPointerField(
+                                                    namedVar.Primary);
+                                                if (parentTempStorage != nullptr)
+                                                    Compiler(ctx)->RegisterOwningTempRawPointerFieldOwner(
+                                                        namedVar.Primary, parentTempStorage);
+                                                for (auto* storage : Compiler(ctx)->FindOwningTempRawPointerFieldOwners(
+                                                         structVar.Primary))
+                                                    Compiler(ctx)->RegisterOwningTempRawPointerFieldOwner(
+                                                        namedVar.Primary, storage);
+                                            }
                                             // A blessed unique<X> field VALUE is owning by its type.
                                             // Ledger the read so a later '?:' / '??' join still
                                             // carries provenance the joined value cannot.
@@ -4621,12 +5622,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 || Compiler(ctx)->HasMemberVariable(idName);
                             const bool globalVariable =
                                 Compiler(ctx)->GetGlobalVariableNV(idName).Storage != nullptr;
+                            const std::string qualifiedName =
+                                Compiler(ctx)->ResolveQualifiedName(idName);
+                            const bool namespaceVariable = qualifiedName != idName
+                                && Compiler(ctx)->GetGlobalVariableNV(qualifiedName).Storage != nullptr;
                             const bool nameIsVariable = localOrMemberVariable || globalVariable;
                             // The alias checks below also yield to a namespaced global of the name; the
                             // namespace-vs-variable decision keeps master's rule above.
                             const bool aliasNameIsVariable = nameIsVariable
-                                || Compiler(ctx)->GetGlobalVariableNV(
-                                    Compiler(ctx)->ResolveQualifiedName(idName)).Storage != nullptr;
+                                || namespaceVariable;
                             bool defaultedCxxBaseAlias = false;
                             if (followedByCall && !aliasNameIsVariable
                                 && Compiler(ctx)->IsGenericBaseAlias(idName))
@@ -4640,22 +5644,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             bool namesEnclosingMethod = false;
                             if (!localOrMemberVariable && followedByCall && !followedByDot)
                             {
-                                auto methods = Compiler(ctx)->functionTable.find(idName);
-                                if (methods != Compiler(ctx)->functionTable.end())
-                                    for (const auto& scope : EnclosingAggregateScopesForCall(
-                                             Compiler(ctx), parseTree))
-                                    {
-                                        if (scope.Definition == nullptr) continue;
-                                        namesEnclosingMethod = std::any_of(
-                                            methods->second.begin(), methods->second.end(),
-                                            [&](const LLVMBackend::FunctionSymbol& candidate) {
-                                                return candidate.IsMethod
-                                                    && !candidate.Parameters.empty()
-                                                    && candidate.Parameters.front().TypeName
-                                                        == scope.Name;
-                                            });
-                                        if (namesEnclosingMethod) break;
-                                    }
+                                for (const auto& scope : EnclosingAggregateScopesForCall(
+                                         Compiler(ctx), parseTree))
+                                {
+                                    if (scope.Definition == nullptr) continue;
+                                    namesEnclosingMethod = HasCFlatMemberMethod(scope.Name, idName);
+                                    if (namesEnclosingMethod) break;
+                                }
                             }
                             if (!namesEnclosingMethod
                                 && (Compiler(ctx)->IsNamespace(idName) || Compiler(ctx)->IsCxxNamespace(idName))
@@ -4683,8 +5678,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             }
                             else
                             {
-                                const std::string qualifiedName =
-                                    Compiler(ctx)->ResolveQualifiedName(idName);
                                 const std::string genericFunctionName =
                                     Compiler(ctx)->ResolveGenericFunctionBase(qualifiedName);
                                 const bool functionNameIsVisible =
@@ -4715,7 +5708,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         break;
                                     }
                                 }
-                                if (namesEnclosingMethod && globalVariable)
+                                if (namesEnclosingMethod)
                                     namedVar = {};
                                 else
                                 {
@@ -5252,6 +6245,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             FlushCallPostfix();
                             Compiler(ctx)->pendingCallSite_ = callParen;
                             auto* result = Compiler(ctx)->CreateOverloadedFunctionCall("operator[]", { thisNV, idxNV });
+                            RecordPendingCallResult(callParen, result);
                             Compiler(ctx)->pendingCallSite_ = nullptr;
                             if (result)
                             {
@@ -5469,10 +6463,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // is statically null - reject it, same as the '->'/'.'/'*' guards.
                             Compiler(ctx)->RecordNullDerefFor(namedVar, ctx->getStart()->getLine(),
                                 ctx->getStart()->getCharPositionInLine());
-                            if (Compiler(ctx)->IsExplicitlyMovedNullHere(namedVar))
-                                LogErrorContext(ctx, std::format(
-                                    "dereference of moved variable '{}' (it is null after the move)",
-                                    namedVar.CallerName));
+                            if (Compiler(ctx)->IsMovedDerefHere(namedVar))
+                                LogErrorContext(ctx, Compiler(ctx)->MovedDerefDiagnostic(namedVar));
                             auto ptrValue = LoadNamedVariable(namedVar);
                             // --sanitize=ownership (M1): guard `p[i]` deref of a moved-from local.
                             Compiler(ctx)->EmitOwnDerefGuard(subBaseStorage, ptrValue,
@@ -5895,7 +6887,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         {
                             const std::string bareName = bareIdentifier->Identifier()->getText();
                             auto* compiler = Compiler(ctx);
-                            if (NamesVisibleVariable(compiler, bareName))
+                            const auto* pendingLocal = FindPendingCallVisibleLocal(compiler, bareName, primaryCtx);
+                            if (pendingLocal != nullptr || NamesVisibleVariable(compiler, bareName))
                             {
                                 const size_t localScopeDepth = compiler->FindVariableScopeDepth(bareName);
                                 const bool memberVariable = compiler->HasMemberVariable(bareName);
@@ -5903,11 +6896,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 const bool namespaceVariable = qualifiedName != bareName
                                     && compiler->GetGlobalVariableNV(qualifiedName).Storage != nullptr;
                                 const bool rootVariable = compiler->GetGlobalVariableNV(bareName).Storage != nullptr;
-                                const int variableRank = localScopeDepth != SIZE_MAX ? 0
+                                const int variableRank = pendingLocal != nullptr || localScopeDepth != SIZE_MAX ? 0
                                     : memberVariable ? 1 : namespaceVariable ? 2
                                     : rootVariable ? 3 : 4;
                                 const LLVMBackend::TypeAndValue variableType =
-                                    VisibleVariableType(compiler, bareName);
+                                    pendingLocal != nullptr ? pendingLocal->Type
+                                                            : VisibleVariableType(compiler, bareName);
                                 const std::string resolvedType =
                                     compiler->ResolveTypeAlias(variableType.TypeName);
                                 const bool callableFunctionValue = variableType.IsFunctionPointer
@@ -5939,10 +6933,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         || compiler->HasCxxFunctionTemplate(name);
                                 };
                                 const auto thisVariable = compiler->GetThisPointer();
-                                const std::string thisType = thisVariable.TypeAndValue.TypeName;
-                                const bool hasImplicitMemberFunction = !thisType.empty()
-                                    && (HasCFlatMemberMethod(thisType, bareName)
-                                        || !GenericMethodTemplateKey(thisType, bareName).empty());
+                                std::string memberOwner = thisVariable.TypeAndValue.TypeName;
+                                if (memberOwner.empty())
+                                {
+                                    const auto aggregateScopes = EnclosingAggregateScopesForCall(
+                                        compiler, primaryCtx);
+                                    if (!aggregateScopes.empty()) memberOwner = aggregateScopes.front().Name;
+                                }
+                                const bool hasImplicitMemberFunction = !memberOwner.empty()
+                                    && (HasCFlatMemberMethod(memberOwner, bareName)
+                                        || !GenericMethodTemplateKey(memberOwner, bareName).empty());
                                 int nearestFunctionRank = 4;
                                 if (hasImplicitMemberFunction) nearestFunctionRank = 1;
                                 if (qualifiedName != bareName
@@ -7973,7 +8973,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 {
                                     Compiler(ctx)->currentLine = namedVar.IdentifierLine;
                                     Compiler(ctx)->currentColumn = namedVar.IdentifierColumn;
-                                    Compiler(ctx)->LogError(std::format("use of moved variable '{}'", moved));
+                                    LogMovedUse(moved, namedVar.IdentifierLine, namedVar.IdentifierColumn,
+                                                IsPointeeMoveUse(namedVar) && moved == namedVar.CallerName, true);
                                 }
                                 else if (namedVar.FieldName.empty() && !namedVar.IsElementAccess)
                                 {
@@ -8067,6 +9068,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 funcPtrTV.FuncPtrParams[argParamIndex], argParamIndex);
                                             argExpectedScope.emplace(&declExpectedType, argExpectedDest, true);
                                         }
+                                        lambdaExpectedType = {};
+                                        if (argExpectedDest.IsFunctionPointer)
+                                            lambdaExpectedType = argExpectedDest;
+                                        else if (const auto* encoded = Compiler(ctx)->GetEncodedClosureType(
+                                                     argExpectedDest.TypeName))
+                                            lambdaExpectedType = *encoded;
                                         CallArgumentScope callArgumentScope(
                                             inCallArgument_, ternaryCallArgumentDepth_);
                                         DirectViewCallArgumentScope directViewArgumentScope(
@@ -8127,6 +9134,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             return this->ParseAssignmentExpressionNamed(
                                                 namedArgument->assignmentExpression());
                                         });
+                                        for (auto* owner : backend->FindOwningTempRawPointerFieldOwners(
+                                                 argNV.Primary))
+                                            backend->UnregisterOwnedStructTemp(owner);
+                                        lambdaExpectedType = {};
                                         if (argNV.TypeAndValue.IsArrayView && argNV.Storage != nullptr)
                                         {
                                             bool borrowedView = false;
@@ -8176,6 +9187,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 || Compiler(ctx)->GetEncodedClosureType(argNV.TypeAndValue.TypeName) != nullptr))
                                             argValue = Compiler(ctx)->CreateLoad(
                                                 Compiler(ctx)->GetType(argNV.TypeAndValue), argNV.Primary);
+                                        // An encoded closure-type slot is lowered too, or a fat closure reaches a thin slot.
+                                        if (argParamIndex < funcPtrTV.FuncPtrParams.size()
+                                            && (argExpectedDest.IsFunctionPointer
+                                                || backend->GetEncodedClosureType(argExpectedDest.TypeName) != nullptr)
+                                            && !backend->ParameterIsAliasByPointer(argExpectedDest))
+                                            argValue = backend->LowerByValueArg(
+                                                argValue, argExpectedDest, argNV);
                                         // An alias closure/fn-ptr param: the callee reads its caller slot by address.
                                         if (argParamIndex < funcPtrTV.FuncPtrParams.size()
                                             && backend->ParameterIsAliasByPointer(argExpectedDest))
@@ -8193,7 +9211,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             if (auto moved = Compiler(ctx)->MovedUseSubject(argNV); !moved.empty())
                                             {
                                                 // (Same diagnostic shape as direct-call site; conservative - only fires when source storage was already moved.)
-                                                Compiler(ctx)->LogError(std::format("use of moved variable '{}'", moved));
+                                                LogMovedUse(moved, argNV.IdentifierLine, argNV.IdentifierColumn,
+                                                            IsPointeeMoveUse(argNV) && moved == argNV.CallerName, true);
                                             }
                                         }
                                     }
@@ -8222,6 +9241,22 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
                                 // Bond/move ownership-mismatch checks against the funcptr's per-param flags.
                                 size_t pcount = std::min(argNVs.size(), funcPtrTV.FuncPtrParams.size());
+                                const llvm::Function* namedFunctionTarget = nullptr;
+                                for (size_t i = 0; i < pcount; ++i)
+                                {
+                                    auto param = Compiler(ctx)->FuncPtrParamAsTypeAndValue(
+                                        funcPtrTV.FuncPtrParams[i], i);
+                                    if (!Compiler(ctx)->IsBarePointerParameter(param)
+                                        || !Compiler(ctx)->IsProvenOwningNamedLocal(argNVs[i])) continue;
+                                    if (namedFunctionTarget == nullptr)
+                                        namedFunctionTarget =
+                                            Compiler(ctx)->FunctionPointerTargetFromLocal(namedVar.Storage);
+                                    if (namedFunctionTarget != nullptr)
+                                        Compiler(ctx)->RecordOwningLocalFunctionPointerArg(
+                                            functionName, std::format("parameter {}", i + 1),
+                                            static_cast<unsigned>(i), argNVs[i], namedFunctionTarget,
+                                            namedVar.Storage);
+                                }
                                 // Pointer DEPTH: this door lowers its own argument list, so the
                                 // scorer never sees it and `f(pp)` bound an `int(T*)` slot silently.
                                 for (size_t i = 0; i < pcount; i++)
@@ -8269,6 +9304,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 callArgumentPostfix.Flush();
                                 auto result = Compiler(ctx)->CreateIndirectCall(
                                     funcPtrTV, funcPtr, callArgs, &argNVs, &rawArrayCounts);
+                                RecordPendingCallResult(callParen, result);
                                 // The result keeps the function type's return pointee const.
                                 if (result != nullptr && result->getType()->isPointerTy()
                                     && Compiler(ctx)->lastCallReturnType.ConstMask != 0)
@@ -8614,6 +9650,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         return this->ParseAssignmentExpressionNamed(
                                             namedArgument->assignmentExpression());
                                     });
+                                    for (auto* owner : Compiler(ctx)->FindOwningTempRawPointerFieldOwners(
+                                             argNV.Primary))
+                                        Compiler(ctx)->UnregisterOwnedStructTemp(owner);
                                     if (argNV.TypeAndValue.IsArrayView && argNV.Storage != nullptr)
                                     {
                                         const auto& param = ifaceArgExpectedDest;
@@ -8645,7 +9684,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         {
                                             Compiler(ctx)->currentLine = argNV.IdentifierLine;
                                             Compiler(ctx)->currentColumn = argNV.IdentifierColumn;
-                                            Compiler(ctx)->LogError(std::format("use of moved variable '{}'", moved));
+                                            LogMovedUse(moved, argNV.IdentifierLine, argNV.IdentifierColumn,
+                                                        IsPointeeMoveUse(argNV) && moved == argNV.CallerName, true);
                                         }
                                     }
                                     auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
@@ -8697,6 +9737,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         argNV.ClosureEnvProvenanceTainted;
                                     argVar.IsNormalizedCxxXvalue = argNV.IsNormalizedCxxXvalue;
                                     argVar.IsRvalue = argNV.IsRvalue;
+                                    argVar.IsCxxAddressOfPointerValue = argNV.IsCxxAddressOfPointerValue;
                                     argVar.IsCxxPrvalueTemp = argNV.IsCxxPrvalueTemp;
                                     argVar.IsCxxDirectConstruction = argNV.IsCxxDirectConstruction;
                                     argVar.CxxDirectConstructionUsesBraces =
@@ -8731,6 +9772,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // The POSITIVE depth is the argument-side proof the depth gates
                                     // read; dropped here every argument looks depth-unrecorded.
                                     argVar.TypeAndValue.PointerDepth = argNV.TypeAndValue.PointerDepth;
+                                    if (argNV.IsCxxAddressOfPointerValue)
+                                    {
+                                        argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
+                                        argVar.InferSourceTypeName = argNV.InferSourceTypeName.empty()
+                                            ? argNV.TypeAndValue.TypeName
+                                            : argNV.InferSourceTypeName;
+                                    }
                                     argVar.TypeAndValue.IsArrayView = argNV.TypeAndValue.IsArrayView;
                                     // Same for a FIXED `T[N]`: LoadNamedVariable already decayed argValue
                                     // to the element-0 address, so ConstArraySize is the only surviving
@@ -8741,6 +9789,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.TypeAndValue.ConstInnerDimensions =
                                         argNV.TypeAndValue.ConstInnerDimensions;
                                     argVar.CallerName = argNV.CallerName;
+                                    argVar.PointeeMove = argNV.IsExplicitMove && argNV.PointeeMove;
                                     // Per-field move tracking: moving `node->left` marks only that field.
                                     argVar.FieldName = argNV.FieldName;
                                     argVar.MovePathKey = argNV.MovePathKey;
@@ -8916,6 +9965,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     ncSitePtr,
                                     &interfaceVar
                                 );
+                                RecordPendingCallResult(callParen, namedVar.Primary);
                                 if (cleanupInlineOwnedReceiver && ifacePtr != nullptr)
                                 {
                                     Compiler(ctx)->SuppressCallerRelease(interfaceVar.Primary);
@@ -8961,6 +10011,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // the argument list, so a null receiver skips the arguments too.
                                 callArgumentPostfix.Flush();
                                 namedVar.Primary = Compiler(ctx)->CreateOverloadedFunctionCall(extFuncName, allArgs);
+                                RecordPendingCallResult(callParen, namedVar.Primary);
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
                                 // Mirror the interface-method path: carry the return type and
@@ -10124,6 +11175,74 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                         return parsed;
                                     });
+                                    const auto tempOwners = Compiler(ctx)->FindOwningTempRawPointerFieldOwners(
+                                        argNV.Primary);
+                                    const bool byValueTempField = argNV.FromOwningTempField
+                                        && argNV.OwningTempParent;
+                                    if (argNV.TypeAndValue.Pointer
+                                        && (!tempOwners.empty() || byValueTempField))
+                                    {
+                                        auto* callee = funcSym != nullptr ? funcSym->Function : nullptr;
+                                        const int64_t parameterIndex = declaredIdx[argIdx];
+                                        const bool analyzableCflatBody = funcSym != nullptr
+                                            && !funcSym->IsCxx && callee != nullptr
+                                            && Compiler(ctx)->FunctionBodyIsComplete(callee)
+                                            && parameterIndex >= 0
+                                            && static_cast<size_t>(parameterIndex) < callee->arg_size();
+                                        const bool cflatParameter = funcSym != nullptr && !funcSym->IsCxx
+                                            && callee != nullptr && parameterIndex >= 0
+                                            && static_cast<size_t>(parameterIndex) < callee->arg_size();
+                                        std::string sinkName = "argument";
+                                        if (cflatParameter
+                                            && static_cast<size_t>(parameterIndex) < funcSym->Parameters.size()
+                                            && !funcSym->Parameters[parameterIndex].VariableName.empty())
+                                            sinkName = funcSym->Parameters[parameterIndex].VariableName;
+                                        auto escapeType = argExpectedDest;
+                                        escapeType.IsAlias = false;
+                                        // The verdict waits for every body (a helper may be defined later);
+                                        // the owner's destruction is gated on it (kept when Unknown).
+                                        if (byValueTempField && cflatParameter && escapeType.Pointer
+                                            && !escapeType.IsUnique && !escapeType.IsArrayView
+                                            && !argNV.TypeAndValue.IsUnique
+                                            && !IsOwningTempUniqueFieldEscape(argNV))
+                                        {
+                                            Compiler(ctx)->RecordDeferredRawPointerCalleeStore(
+                                                callee, static_cast<size_t>(parameterIndex), sinkName,
+                                                namedArgument->getStart()->getLine(),
+                                                namedArgument->getStart()->getCharPositionInLine(),
+                                                tempOwners,
+                                                argNV.Primary != nullptr ? argNV.Primary : argNV.Storage);
+                                        }
+                                        else if (analyzableCflatBody
+                                            && Compiler(ctx)->FunctionArgumentDefinitelyStoresOutsideCall(
+                                                callee, static_cast<size_t>(parameterIndex), byValueTempField))
+                                        {
+                                            GuardRawPointerIntoOwningTempField(
+                                                argNV, escapeType, true, false, sinkName, namedArgument,
+                                                true);
+                                        }
+                                        else if (byValueTempField && cflatParameter)
+                                        {
+                                            // Unique / view sinks report their own diagnostic above; the gate only
+                                            // keeps the owner alive unless the final verdict is None.
+                                            Compiler(ctx)->RecordDeferredRawPointerCalleeStore(
+                                                callee, static_cast<size_t>(parameterIndex), sinkName,
+                                                namedArgument->getStart()->getLine(),
+                                                namedArgument->getStart()->getCharPositionInLine(),
+                                                tempOwners.empty() && argNV.MoveTempStructAlloca != nullptr
+                                                    ? std::vector<llvm::Value*>{ argNV.MoveTempStructAlloca }
+                                                    : tempOwners,
+                                                argNV.Primary != nullptr ? argNV.Primary : argNV.Storage, false);
+                                        }
+                                        else if (!byValueTempField
+                                            && (!analyzableCflatBody
+                                                || FunctionArgumentMayEscape(
+                                                    callee, static_cast<size_t>(parameterIndex), false)))
+                                        {
+                                            for (auto* owner : tempOwners)
+                                                Compiler(ctx)->UnregisterOwnedStructTemp(owner);
+                                        }
+                                    }
                                     NormalizeCxxReferenceNamed(namedArgument, argNV);
                                     // T235: a C++ class prvalue before a direct construction keeps it out of
                                     // the wrapper, whose by-value param would move the prvalue (clang: 0).
@@ -10189,7 +11308,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         {
                                             Compiler(ctx)->currentLine = argNV.IdentifierLine;
                                             Compiler(ctx)->currentColumn = argNV.IdentifierColumn;
-                                            Compiler(ctx)->LogError(std::format("use of moved variable '{}'", moved));
+                                            LogMovedUse(moved, argNV.IdentifierLine, argNV.IdentifierColumn,
+                                                        IsPointeeMoveUse(argNV) && moved == argNV.CallerName, true);
                                         }
                                     }
                                     // A generic instantiation named as an argument (`apply(dbl<int>)`) is the
@@ -10236,6 +11356,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.SourceExpressionContext = argumentExpression;
                                     // Propagate caller variable name for compile-time move tracking.
                                     argVar.CallerName = argNV.CallerName;
+                                    argVar.PointeeMove = argNV.IsExplicitMove && argNV.PointeeMove;
                                     // Propagate the field name (and inherited per-field move set) so that
                                     // moving a struct sub-path (`node->left`) marks only that field, not the
                                     // whole base variable - letting recursive owning-pointer-tree code compile.
@@ -10262,6 +11383,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsDirectMoveCall = argNV.IsDirectMoveCall;
                                     argVar.IsNormalizedCxxXvalue = argNV.IsNormalizedCxxXvalue;
                                     argVar.IsRvalue = argNV.IsRvalue;
+                                    argVar.IsCxxAddressOfPointerValue = argNV.IsCxxAddressOfPointerValue;
                                     argVar.IsCxxPrvalueTemp = argNV.IsCxxPrvalueTemp;
                                     argVar.IsDefaultArgument = argNV.IsDefaultArgument;
                                     argVar.CxxParamLastUse = argNV.CxxParamLastUse;
@@ -10290,6 +11412,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // The POSITIVE depth is the argument-side proof the depth gates
                                     // read; dropped here every argument looks depth-unrecorded.
                                     argVar.TypeAndValue.PointerDepth = argNV.TypeAndValue.PointerDepth;
+                                    if (argNV.IsCxxAddressOfPointerValue)
+                                    {
+                                        argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
+                                        argVar.InferSourceTypeName = argNV.InferSourceTypeName.empty()
+                                            ? argNV.TypeAndValue.TypeName
+                                            : argNV.InferSourceTypeName;
+                                    }
                                     // A C++ call may use a converting ctor only from a single pointer
                                     // whose pointee is a proven C++ record.
                                     argVar.AllowCxxClassPointerCtorConversion = cxxCallArgument
@@ -10333,7 +11462,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.InferSourceTypeName = !sourceEnum.empty()
                                         && (Compiler(ctx)->IsCxxForeignNamespace(sourceEnum)
                                             || Compiler(ctx)->IsCxxForeignTypeRegistered(sourceEnum))
-                                        ? sourceEnum : argNV.TypeAndValue.TypeName;
+                                        ? sourceEnum
+                                        : argNV.TypeAndValue.TypeName.empty()
+                                            ? argNV.InferSourceTypeName
+                                            : argNV.TypeAndValue.TypeName;
                                     argVar.CxxArithIdentity = argNV.CxxArithIdentity;
                                     if (argVar.InferSourceTypeName.empty() && argNV.BaseType != nullptr)
                                     {
@@ -10568,6 +11700,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             auto requestCxxTemplate = [&](std::string& resolvedName) {
                                 std::string owner;
                                 std::string memberName = functionName;
+                                const bool addressPointerValue = std::any_of(
+                                    arguments.begin(), arguments.end(), [](const auto& argument) {
+                                        return argument.IsCxxAddressOfPointerValue
+                                            && argument.Storage == nullptr;
+                                    });
                                 std::string receiverType = structVar.TypeAndValue.TypeName;
                                 if (receiverType.empty() && structVar.BaseType != nullptr)
                                     if (auto* st = llvm::dyn_cast<llvm::StructType>(structVar.BaseType))
@@ -10583,7 +11720,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     && !compiler->IsDataStructure(
                                         functionName.substr(0, freeFunctionDot))
                                     && (functionName.starts_with("std.")
-                                        || !compiler->HasCxxFunctionTemplate(functionName)))
+                                        || !compiler->HasCxxFunctionTemplate(functionName)
+                                        || addressPointerValue))
                                     || (compiler->IsCxxFunctionMacro(functionName)
                                         && !compiler->GetFunction(functionName));
                                 bool isTemplate = false;
@@ -10764,6 +11902,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // unless one matches exactly: its specialization may rank better.
                                     templateBesideNonTemplate = hasNonWrapper && isTemplate
                                         && owner.empty() && !hasExactNonWrapper;
+                                    if (addressPointerValue && owner.empty()
+                                        && compiler->HasCxxFunctionTemplate(functionName))
+                                        templateBesideNonTemplate = true;
                                     // Let clang rank member templates beside non-template siblings;
                                     // the unique wrapper calls the original C++ overload set.
                                     deduceBesideSpecializations = hasNonWrapper && isTemplate
@@ -11190,10 +12331,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 std::string why;
                                 compiler->TryBindRefusedCxxMember(
                                     functionName, "__ctor", ctorTypes.size());
-                                const auto* ctor = compiler->SelectCxxConstructor(
+                                auto* ctor = compiler->SelectCxxConstructor(
                                     functionName, ctorTypes, why, false, &arguments);
                                 // A scalar-reference overload set is clang's to resolve.
-                                const bool scalarReferenceSet =
+                                bool scalarReferenceSet =
                                     compiler->CxxCtorForwardsScalarReference(functionName, ctorTypes);
                                 bool hardReferenceRejection = !scalarReferenceSet
                                     && (why.starts_with("constructor '")
@@ -11208,17 +12349,46 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         && (why.starts_with("constructor '")
                                             || why.starts_with("no overload of '"));
                                 }
+                                // A constructor template can outrank the listed pick: clang
+                                // resolves `T(args)`, the listed pick stays the fallback.
+                                bool nullPointerCandidate = false;
+                                bool clangResolves = compiler->CxxConstructorNeedsClangResolution(
+                                    functionName, ctor, ctorTypes, &arguments,
+                                    /*allowExplicit*/ true, &nullPointerCandidate);
+                                if (ctor == nullptr && !clangResolves
+                                    && !why.starts_with("matches more than one constructor overload"))
+                                {
+                                    bool slotBound = false;
+                                    for (size_t i = 0; i < arguments.size(); ++i)
+                                    {
+                                        auto& arg = arguments[i];
+                                        BindCxxCtorPointerSlotAddress(
+                                            arg.SourceExpressionContext, arg, functionName, i,
+                                            arguments.size());
+                                        if (arg.Storage == nullptr || !arg.IsCxxAddressOfPointerValue)
+                                            continue;
+                                        ctorTypes[i] = arg.TypeAndValue;
+                                        ctorValues[i] = LoadNamedVariable(arg);
+                                        slotBound = true;
+                                    }
+                                    if (slotBound)
+                                    {
+                                        why.clear();
+                                        ctor = compiler->SelectCxxConstructor(
+                                            functionName, ctorTypes, why, false, &arguments);
+                                        scalarReferenceSet = compiler->CxxCtorForwardsScalarReference(
+                                            functionName, ctorTypes);
+                                        nullPointerCandidate = false;
+                                        clangResolves = compiler->CxxConstructorNeedsClangResolution(
+                                            functionName, ctor, ctorTypes, &arguments,
+                                            /*allowExplicit*/ true, &nullPointerCandidate);
+                                    }
+                                }
                                 if (const std::string refusal =
                                         compiler->CxxConstructorRvalueRefBindRefusal(
                                             functionName, arguments);
                                     !refusal.empty())
                                     LogErrorContext(ctx, refusal);
-                                // A constructor template can outrank the listed pick: clang
-                                // resolves `T(args)`, the listed pick stays the fallback.
-                                bool nullPointerCandidate = false;
-                                const bool clangResolves = compiler->CxxConstructorNeedsClangResolution(
-                                    functionName, ctor, ctorTypes, &arguments,
-                                    /*allowExplicit*/ true, &nullPointerCandidate);
                                 const bool clangOnlyConstructorSet = scalarReferenceSet
                                     || nullPointerCandidate;
                                 hardReferenceRejection = !clangOnlyConstructorSet
@@ -11228,12 +12398,25 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         compiler->CxxConstructorCopySinkError(ctor, arguments);
                                     !sink.empty())
                                     LogErrorContext(ctx, sink);
+                                bool narrowingRefused
+                                    = compiler->CxxCtorSetRequiresNarrowing(functionName, &arguments);
+                                if (narrowingRefused
+                                    && compiler->CxxCtorSetRequiresFloatToInteger(functionName, ctorTypes))
+                                {
+                                    std::string floatNarrowing
+                                        = compiler->CxxCtorSelectedNarrowingError(
+                                            functionName, arguments, true);
+                                    if (floatNarrowing.empty())
+                                        floatNarrowing = "all viable constructors require a floating-to-integer conversion "
+                                            "(no implicit narrowing at a call); cast it explicitly";
+                                    LogErrorContext(ctx, std::format("C++ class '{}' {}; {}",
+                                        compiler->DisplayCxxClassName(functionName),
+                                        compiler->CxxCtorNoMatchReason(ctorTypes), floatNarrowing));
+                                }
                                 std::string wrapperName;
                                 std::string wrapperError;
                                 // Scalar table (ruling 2026-10-09): every constructor refuses a narrowing
                                 // or other-enum argument, so clang must not pick one of them silently.
-                                bool narrowingRefused
-                                    = compiler->CxxCtorSetRequiresNarrowing(functionName, &arguments);
                                 // The one C++ selects must not narrow either; its refusal is `why`.
                                 if (!narrowingRefused
                                     && ((ctor == nullptr && !hardReferenceRejection) || clangResolves))
@@ -11525,6 +12708,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     implicitCallReceiver.GetValue() != nullptr
                                         ? &implicitCallReceiver : nullptr,
                                     lexicalAggregateScopes);
+                                RecordPendingCallResult(callParen, namedVar.Primary);
                                 markDataMutParamOwning(structVar, namedVar.Primary);
                                 globalScopeCall = false;
                                 Compiler(ctx)->pendingCallSite_ = nullptr;
@@ -11587,11 +12771,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     receiverHasPlainMethod = std::ranges::any_of(it->second, [&](const auto& sym) {
                                         return sym.IsMethod && !sym.Parameters.empty()
                                             && sym.Parameters.front().TypeName == structTypeName; });
-                                const bool hasInstanceGenericMethod = !methodTemplate.empty()
+                                const bool hasExplicitReceiverGenericMethod = !methodTemplate.empty()
                                     && !receiverHasPlainMethod
                                     && !isFunctionStatic(genericFunctionTemplates[methodTemplate])
                                     && arguments.size() > 1;
-                                if (hasInstanceGenericMethod)
+                                if (hasExplicitReceiverGenericMethod)
                                 {
                                     std::vector<LLVMBackend::NamedVariable> explicitArgs(
                                         arguments.begin() + 1, arguments.end());
@@ -11654,6 +12838,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     implicitCallReceiver.GetValue() != nullptr
                                         ? &implicitCallReceiver : nullptr,
                                     lexicalAggregateScopes);
+                                RecordPendingCallResult(callParen, namedVar.Primary);
                                 markDataMutParamOwning(structVar, namedVar.Primary);
                                 globalScopeCall = false;
                                 Compiler(ctx)->pendingCallSite_ = nullptr;

@@ -1,0 +1,78 @@
+struct T494Pointee { int value = 5; int other = 9; };
+struct T494PointeeHolder { T494Pointee value = default; };
+void t494Take(move T494Pointee value) { }
+void t494TakeP(move T494Pointee* value) { }
+bool t494PointeeCondition() { return true; }
+
+expect_error("pointee of 'p' was moved") {
+    void pointeeMoveInDeclaration()
+    {
+        T494Pointee* p = new T494Pointee();
+        T494Pointee moved = move *p;
+        int value = p->value;
+    }
+}
+
+expect_error("pointee of 'p' was moved") {
+    void pointeeMoveInBraceField()
+    {
+        T494Pointee* p = new T494Pointee();
+        T494PointeeHolder h = { value = move *p };
+        int value = p->value;
+    }
+}
+
+expect_error("pointee of 'p' was moved") {
+    void pointeeMoveInArgument()
+    {
+        T494Pointee* p = new T494Pointee();
+        t494Take(move *p);
+        int value = p->value;
+    }
+}
+
+expect_error("use of moved variable 'p'") {
+    void pointeeMoveFlagDoesNotSurviveWholeMove()
+    {
+        T494Pointee* p = new T494Pointee();
+        if (t494PointeeCondition()) {
+            T494Pointee moved = move *p;
+            return;
+        }
+        t494TakeP(p);
+        int value = p->value;
+    }
+}
+
+expect_error("pointee of 'p' was moved") {
+    void pointeeMoveJoinKeepsOrigin()
+    {
+        T494Pointee* p = new T494Pointee();
+        if (t494PointeeCondition()) {
+            T494Pointee moved = move *p;
+        } else {
+            p = new T494Pointee();
+        }
+        int value = p->value;
+    }
+}
+
+expect_error("pointee of 'p' was moved; reassign 'p' before using it") {
+    void pointeeMoveCallArgument()
+    {
+        T494Pointee* p = new T494Pointee();
+        T494Pointee moved = move *p;
+        t494TakeP(p);
+    }
+}
+
+expect_error("pointee of 'p' was moved; reassign 'p' before using it") {
+    void pointeeMoveBeforeMovingPointer()
+    {
+        T494Pointee* p = new T494Pointee();
+        T494Pointee moved = move *p;
+        T494Pointee* movedPointer = move p;
+    }
+}
+
+extern int main() { return 0; }

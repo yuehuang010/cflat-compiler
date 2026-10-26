@@ -1,0 +1,50 @@
+import cpp "cpp_interop_basic.h";
+import cpp "cpp_t497_compound.hpp";
+
+extern int main()
+{
+    // Free operator+ exists for this class, but clang has no operator+= candidate.
+    expect_error("no viable overloaded '+='") {
+        cppi.FreeArithmetic a = default;
+        cppi.FreeArithmetic b = default;
+        a += b;
+    }
+    // A free binary operator+ cannot stand in for a missing free operator+=.
+    expect_error("no viable overloaded '+='") {
+        cpp_t497.FreeBinaryOnly a = default;
+        a.value = 2;
+        a += 3;
+    }
+    // A free non-const reference still cannot bind a temporary left operand.
+    expect_error("cannot bind its left operand") { cpp_t497.makeFreeAssign() += 3; }
+    // The member ref-qualifier still rejects a temporary receiver.
+    expect_error("is &-qualified") { cpp_t497.makeRefQualifiedAssign() += 3; }
+    // A binary-only member never supplies the written compound operator.
+    expect_error("no viable overloaded '+='") { cpp_t497.BinaryOnly(1) += 2; }
+
+    // Access control makes the written operator+= unusable despite a public operator+.
+    expect_error("is a private member") {
+        cpp_t497.PrivateAssign a = cpp_t497.PrivateAssign(2);
+        a += 3;
+    }
+    // Equal-rank operator+= overloads are ambiguous to clang, not a CFlat tie-break.
+    expect_error("is ambiguous") {
+        cpp_t497.AmbiguousAssign a = cpp_t497.AmbiguousAssign(2);
+        a += 3;
+    }
+
+    // Each binary result has a distinct marker; none declares its matching compound operator.
+    expect_error("no viable overloaded '+='") { cpp_t497.BinaryOnly a = cpp_t497.BinaryOnly(1); a += 2; }
+    expect_error("no viable overloaded '-='") { cpp_t497.BinaryOnly a = cpp_t497.BinaryOnly(1); a -= 2; }
+    expect_error("no viable overloaded '*='") { cpp_t497.BinaryOnly a = cpp_t497.BinaryOnly(1); a *= 2; }
+    expect_error("no viable overloaded '/='") { cpp_t497.BinaryOnly a = cpp_t497.BinaryOnly(1); a /= 2; }
+    expect_error("no viable overloaded '%='") { cpp_t497.BinaryOnly a = cpp_t497.BinaryOnly(1); a %= 2; }
+    expect_error("no viable overloaded '&='") { cpp_t497.BinaryOnly a = cpp_t497.BinaryOnly(1); a &= 2; }
+    expect_error("no viable overloaded '|='") { cpp_t497.BinaryOnly a = cpp_t497.BinaryOnly(1); a |= 2; }
+    expect_error("no viable overloaded '^='") { cpp_t497.BinaryOnly a = cpp_t497.BinaryOnly(1); a ^= 2; }
+    expect_error("no viable overloaded '<<='") { cpp_t497.BinaryOnly a = cpp_t497.BinaryOnly(1); a <<= 2; }
+    expect_error("no viable overloaded '>>='") { cpp_t497.BinaryOnly a = cpp_t497.BinaryOnly(1); a >>= 2; }
+    // A right-operand rvalue refusal is reported as such, not deferred to the member lookup.
+    expect_error("cannot bind its right operand") { cpp_t497.rref.RightRef r = default; r += 3; }
+    return 0;
+}

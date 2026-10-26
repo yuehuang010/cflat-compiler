@@ -760,4 +760,44 @@ inline int ptrref_str(const PtrRefStr& x) { return x.seen; }
 inline int ptrref_cbool(const bool& x) { return x ? 1 : 3; }
 inline int ptrref_cbool(int& x) { return 2; }
 
+// T502: unscoped enum promotion and scoped enum rejection across call forms.
+enum T502UColor { T502UGreen = 7 };
+enum class T502SColor { Green = 7 };
+struct T502CtorUId { int chosen; T502CtorUId(int) : chosen(1) {} T502CtorUId(double) : chosen(2) {} };
+inline int T502FnUId(int) { return 1; } inline int T502FnUId(double) { return 2; }
+struct T502ObjUId { int method(int) { return 1; } int method(double) { return 2; } };
+struct T502CtorUil { int chosen; T502CtorUil(int) : chosen(1) {} T502CtorUil(long) : chosen(2) {} };
+inline int T502FnUil(int) { return 1; } inline int T502FnUil(long) { return 2; }
+struct T502ObjUil { int method(int) { return 1; } int method(long) { return 2; } };
+struct T502CtorUld { int chosen; T502CtorUld(long) : chosen(1) {} T502CtorUld(double) : chosen(2) {} };
+inline int T502FnUld(long) { return 1; } inline int T502FnUld(double) { return 2; }
+struct T502ObjUld { int method(long) { return 1; } int method(double) { return 2; } };
+struct T502CtorUbi { int chosen; T502CtorUbi(bool) : chosen(1) {} T502CtorUbi(int) : chosen(2) {} };
+inline int T502FnUbi(bool) { return 1; } inline int T502FnUbi(int) { return 2; }
+struct T502ObjUbi { int method(bool) { return 1; } int method(int) { return 2; } };
+struct T502CtorUui { int chosen; T502CtorUui(unsigned) : chosen(1) {} T502CtorUui(int) : chosen(2) {} };
+inline int T502FnUui(unsigned) { return 1; } inline int T502FnUui(int) { return 2; }
+struct T502ObjUui { int method(unsigned) { return 1; } int method(int) { return 2; } };
+struct T502CtorUExact { int chosen; T502CtorUExact(int) : chosen(1) {} T502CtorUExact(T502UColor) : chosen(2) {} };
+inline int T502FnUExact(int) { return 1; } inline int T502FnUExact(T502UColor) { return 2; }
+struct T502ObjUExact { int method(int) { return 1; } int method(T502UColor) { return 2; } };
+struct T502CtorSId { int chosen; T502CtorSId(int) : chosen(1) {} T502CtorSId(double) : chosen(2) {} };
+inline int T502FnSId(int) { return 1; } inline int T502FnSId(double) { return 2; }
+struct T502ObjSId { int method(int) { return 1; } int method(double) { return 2; } };
+struct T502CtorSil { int chosen; T502CtorSil(int) : chosen(1) {} T502CtorSil(long) : chosen(2) {} };
+inline int T502FnSil(int) { return 1; } inline int T502FnSil(long) { return 2; }
+struct T502ObjSil { int method(int) { return 1; } int method(long) { return 2; } };
+struct T502CtorSld { int chosen; T502CtorSld(long) : chosen(1) {} T502CtorSld(double) : chosen(2) {} };
+inline int T502FnSld(long) { return 1; } inline int T502FnSld(double) { return 2; }
+struct T502ObjSld { int method(long) { return 1; } int method(double) { return 2; } };
+struct T502CtorSbi { int chosen; T502CtorSbi(bool) : chosen(1) {} T502CtorSbi(int) : chosen(2) {} };
+inline int T502FnSbi(bool) { return 1; } inline int T502FnSbi(int) { return 2; }
+struct T502ObjSbi { int method(bool) { return 1; } int method(int) { return 2; } };
+struct T502CtorSui { int chosen; T502CtorSui(unsigned) : chosen(1) {} T502CtorSui(int) : chosen(2) {} };
+inline int T502FnSui(unsigned) { return 1; } inline int T502FnSui(int) { return 2; }
+struct T502ObjSui { int method(unsigned) { return 1; } int method(int) { return 2; } };
+struct T502CtorSExact { int chosen; T502CtorSExact(int) : chosen(1) {} T502CtorSExact(T502SColor) : chosen(2) {} };
+inline int T502FnSExact(int) { return 1; } inline int T502FnSExact(T502SColor) { return 2; }
+struct T502ObjSExact { int method(int) { return 1; } int method(T502SColor) { return 2; } };
+
 }

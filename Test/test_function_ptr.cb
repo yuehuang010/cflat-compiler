@@ -6885,6 +6885,118 @@ bool testT427VoidFunctionPointeeOverload()
     return Test("t427 exact void callback overload", t427SelectCallback(callback), 202) != 0;
 }
 
+int t501NamedPlusThree(int x) { return x + 3; }
+int t501GenericSlot<T>(T** pp) { return (**pp)(6); }
+
+bool testT501FunctionPointerSlotAddresses()
+{
+    bool result = true;
+    function<int(int)> byName = t501NamedPlusThree;
+    function<int(int)> byAddress = &t501NamedPlusThree;
+    function<int(int)> fnVar = t501NamedPlusThree;
+    function<int(int)>* p = &fnVar;
+    function<int(int)>** pp = &p;
+    result &= Test("t501 named function value", byName(2), 5);
+    result &= Test("t501 address of named function value", byAddress(3), 6);
+    result &= Test("t501 address of function variable slot", (*p)(4), 7);
+    result &= Test("t501 address of pointer variable slot", (**pp)(5), 8);
+    result &= Test("t501 generic pointer slot", t501GenericSlot<function<int(int)>>(pp), 9);
+    return result;
+}
+
+int t500InnerChar(char* p) { return 41; }
+int t500TakeChar(function<int(char*)> cb) { return 42; }
+int t500PickNested(function<int(char*)> cb) { return 101; }
+int t500PickNested(function<int(void*)> cb) { return 202; }
+int t500TakeLambda(Lambda<int(int)> cb) { return cb(1); }
+int t500TakeThin(function<int(int)> cb) { return cb(5); }
+int t500Twice(int x) { return x * 2; }
+function<int(char*)> t500ReturnChar(int n) { return t500InnerChar; }
+int t500GenericNested<T>(function<int(T)> cb, T value) { return 19; }
+
+bool testT500NestedFunctionAcceptSet()
+{
+    bool result = true;
+    function<int(function<int(char*)>)> overloaded = t500PickNested;
+    result &= Test("t500 exact nested overload", overloaded(default), 101);
+
+    function<int(function<int(char*)>)> named = t500TakeChar;
+    result &= Test("t500 exact nested parameter", named(t500InnerChar), 42);
+
+    function<function<int(char*)>(int)> returned = t500ReturnChar;
+    function<int(char*)> inner = returned(0);
+    result &= Test("t500 exact nested return", inner(nullptr), 41);
+
+    function<function<int(char*)>(int)> lambdaReturn = (int n) => t500InnerChar;
+    function<int(char*)> lambdaInner = lambdaReturn(0);
+    result &= Test("t500 exact nested lambda return", lambdaInner(nullptr), 41);
+
+    function<int(function<int(function<int(char*)>)>, function<int(char*)>)> generic =
+        t500GenericNested<function<int(char*)>>;
+    result &= Test("t500 exact nested generic", generic(default, t500InnerChar), 19);
+
+    function<int(function<int(function<int(function<int(char*)>)>)>, function<int(function<int(char*)>)>)> deepGeneric =
+        t500GenericNested<function<int(function<int(char*)>)>>;
+    result &= Test("t500 exact two-level generic", deepGeneric(default, default), 19);
+
+    int captured = 22;
+    Lambda<int(int)> namedLambda = (int x) => captured;
+    function<int(Lambda<int(int)>)> lambdaSlot = t500TakeLambda;
+    result &= Test("t500 exact nested Lambda value", lambdaSlot(namedLambda), 22);
+    result &= Test("t500 inline capturing Lambda argument", lambdaSlot((int x) => captured), 22);
+    function<int(function<int(int)>)> thinSlot = t500TakeThin;
+    result &= Test("t500 inline lambda through thin nested slot", thinSlot((int x) => x + 1), 6);
+    result &= Test("t500 named function into nested Lambda slot", lambdaSlot(t500Twice), 2);
+    return result;
+}
+
+Lambda<int(int)> t512Global;
+
+struct T512GetterBox { function<Lambda<int(int)>()> get = t512GetGlobal; };
+
+int t512InvokeGetter<T>(T get)
+{
+    Lambda<int(int)> value = get();
+    return value(7);
+}
+
+T t512ReturnNamedGetter<T>() { return t512GetGlobal; }
+
+bool testT512NamedClosureReturnSlots()
+{
+    bool result = true;
+    t512Global = (int x) => { return x + 4; };
+
+    function<Lambda<int(int)>()> get = t512GetGlobal;
+    Lambda<int(int)> value = get();
+    result &= Test("t512 named closure return declaration", value(7), 11);
+
+    function<alias Lambda<int(int)>()> getAlias = t512GetAliasGlobal;
+    Lambda<int(int)> aliasValue = getAlias();
+    result &= Test("t512 alias closure return", aliasValue(7), 11);
+
+    function<Lambda<int(int)>()> assigned;
+    assigned = t512GetGlobal;
+    Lambda<int(int)> assignedValue = assigned();
+    result &= Test("t512 named closure return assignment", assignedValue(7), 11);
+
+    T512GetterBox box;
+    Lambda<int(int)> fieldValue = box.get();
+    result &= Test("t512 named closure return field default", fieldValue(7), 11);
+
+    result &= Test("t512 named closure return generic argument",
+        t512InvokeGetter<function<Lambda<int(int)>()>>(t512GetGlobal), 11);
+
+    function<Lambda<int(int)>()> returned =
+        t512ReturnNamedGetter<function<Lambda<int(int)>()>>();
+    Lambda<int(int)> returnedValue = returned();
+    result &= Test("t512 named closure return generic return", returnedValue(7), 11);
+    return result;
+}
+
+Lambda<int(int)> t512GetGlobal() { return t512Global; }
+alias Lambda<int(int)> t512GetAliasGlobal() { return t512Global; }
+
 extern int main(int argc, char** argv)
 {
     // The tooling regression harness passes one argument and calls this twice. The second call
@@ -7131,6 +7243,9 @@ extern int main(int argc, char** argv)
     // T427: function-pointer values select an exact pointee signature, including overloads.
     total++; passed += testT427FunctionPointeeAcceptSet() ? 1 : 0;
     total++; passed += testT427VoidFunctionPointeeOverload() ? 1 : 0;
+    total++; passed += testT501FunctionPointerSlotAddresses() ? 1 : 0;
+    total++; passed += testT500NestedFunctionAcceptSet() ? 1 : 0;
+    total++; passed += testT512NamedClosureReturnSlots() ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

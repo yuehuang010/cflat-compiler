@@ -657,7 +657,6 @@ void _classifierContainerAliasChain(ClassifierBox box)
 void _classifierGetterMethodChain(ClassifierBox box) { box.self()->put(9); }
 void _classifierThisAlias(ClassifierBox box) { box.viaThisAlias(); }
 void _classifierFreeThis(ClassifierBox box) { box.viaFreeThis(); }
-struct ClassifierOuter { ClassifierBox inb = default; };
 void _classifierFieldAliasIncrement(ClassifierOuter o) { ClassifierBox* p = &o.inb; p->xs[0]++; }
 void _classifierAddressStore(ClassifierBox box)
 {

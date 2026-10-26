@@ -493,6 +493,55 @@ void LLVMBackend::RegisterOwningTempRawPointerField(llvm::Value* value)
         owningTempRawPointerFields_.push_back(value);
     }
 
+void LLVMBackend::RegisterOwningTempRawPointerFieldAddress(llvm::Value* value)
+{
+        if (value == nullptr) return;
+        for (auto* entry : owningTempRawPointerFieldAddresses_) if (entry == value) return;
+        owningTempRawPointerFieldAddresses_.push_back(value);
+    }
+
+void LLVMBackend::RegisterOwningTempRawPointerFieldOwner(llvm::Value* result, llvm::Value* storage)
+{
+        if (result == nullptr || storage == nullptr) return;
+        for (const auto& entry : owningTempRawPointerFieldOwners_)
+            if (entry.Result == result && entry.Storage == storage) return;
+        owningTempRawPointerFieldOwners_.push_back({ result, storage });
+    }
+
+std::vector<llvm::Value*> LLVMBackend::FindOwningTempRawPointerFieldOwners(
+        const llvm::Value* value, int depth) const
+{
+        if (value == nullptr || depth > kMaxJoinArmDepth) return {};
+        std::vector<llvm::Value*> owners;
+        auto append = [&](const llvm::Value* source) {
+            for (auto* storage : FindOwningTempRawPointerFieldOwners(source, depth + 1))
+                if (std::find(owners.begin(), owners.end(), storage) == owners.end())
+                    owners.push_back(storage);
+        };
+        for (const auto& entry : owningTempRawPointerFieldOwners_)
+            if (entry.Result == value
+                && std::find(owners.begin(), owners.end(), entry.Storage) == owners.end())
+                owners.push_back(entry.Storage);
+        if (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
+            append(gep->getPointerOperand());
+        else if (const auto* cast = llvm::dyn_cast<llvm::CastInst>(value))
+            append(cast->getOperand(0));
+        else if (const auto* extract = llvm::dyn_cast<llvm::ExtractValueInst>(value))
+            append(extract->getAggregateOperand());
+        else if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+            for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i)
+                append(phi->getIncomingValue(i));
+        else if (const NullCoalesceJoin* join = FindNullCoalesceJoin(value))
+            for (const auto& arm : join->Arms)
+                append(arm.Value);
+        else if (const auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+        {
+            append(select->getTrueValue());
+            append(select->getFalseValue());
+        }
+        return owners;
+    }
+
 bool LLVMBackend::IsLedgeredOwningTempUniqueField(const llvm::Value* value) const
 {
         for (auto* entry : owningTempUniqueFields_) if (entry == value) return true;
@@ -542,6 +591,36 @@ bool LLVMBackend::JoinCarriesOwningTempRawPointerField(const llvm::Value* value,
         if (const auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
             return JoinCarriesOwningTempRawPointerField(select->getTrueValue(), depth + 1)
                 || JoinCarriesOwningTempRawPointerField(select->getFalseValue(), depth + 1);
+        return false;
+    }
+
+bool LLVMBackend::JoinCarriesOwningTempRawPointerFieldAddress(
+    const llvm::Value* value, int depth) const
+{
+        if (value == nullptr || depth > kMaxJoinArmDepth) return false;
+        if (std::find(owningTempRawPointerFieldAddresses_.begin(),
+                      owningTempRawPointerFieldAddresses_.end(), value)
+            != owningTempRawPointerFieldAddresses_.end()) return true;
+        if (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
+            return JoinCarriesOwningTempRawPointerFieldAddress(gep->getPointerOperand(), depth + 1);
+        if (const auto* cast = llvm::dyn_cast<llvm::CastInst>(value))
+            return JoinCarriesOwningTempRawPointerFieldAddress(cast->getOperand(0), depth + 1);
+        if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+        {
+            for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+                if (JoinCarriesOwningTempRawPointerFieldAddress(
+                        phi->getIncomingValue(i), depth + 1)) return true;
+            return false;
+        }
+        if (const NullCoalesceJoin* join = FindNullCoalesceJoin(value))
+        {
+            for (const auto& arm : join->Arms)
+                if (JoinCarriesOwningTempRawPointerFieldAddress(arm.Value, depth + 1)) return true;
+            return false;
+        }
+        if (const auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+            return JoinCarriesOwningTempRawPointerFieldAddress(select->getTrueValue(), depth + 1)
+                || JoinCarriesOwningTempRawPointerFieldAddress(select->getFalseValue(), depth + 1);
         return false;
     }
 
@@ -683,6 +762,144 @@ void LLVMBackend::ResolveDeferredTempUniqueFieldEscapes()
                 LogError(DescribeLaunderedTempUniqueFieldEscape(entry.CalleeName, entry.Access,
                                                                 entry.DestDesc));
         }
+    }
+
+std::vector<llvm::Value*> LLVMBackend::FindPendingStructTempOwnersOf(const llvm::Value* value) const
+{
+        std::vector<llvm::Value*> owners;
+        auto pendingTemp = [&](const llvm::Value* v) -> llvm::Value* {
+            for (const auto& temp : pendingOwnedStructTemps)
+                if (temp.Alloca == v) return temp.Alloca;
+            return nullptr;
+        };
+        auto add = [&](llvm::Value* owner) {
+            if (owner != nullptr && std::find(owners.begin(), owners.end(), owner) == owners.end())
+                owners.push_back(owner);
+        };
+        std::vector<const llvm::Value*> pending{ value };
+        std::unordered_set<const llvm::Value*> seen;
+        while (!pending.empty() && seen.size() < 64)
+        {
+            const llvm::Value* v = pending.back();
+            pending.pop_back();
+            if (v == nullptr || !seen.insert(v).second) continue;
+            if (llvm::Value* owner = pendingTemp(v))
+            {
+                add(owner);
+                continue;
+            }
+            // A value spilled into a pending temp names it (`store %call, %owntemp`).
+            for (const llvm::User* user : v->users())
+                if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                    store != nullptr && store->getValueOperand() == v)
+                    add(pendingTemp(store->getPointerOperand()));
+            if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(v))
+                pending.push_back(load->getPointerOperand());
+            else if (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(v))
+                pending.push_back(gep->getPointerOperand());
+            else if (const auto* cast = llvm::dyn_cast<llvm::CastInst>(v))
+                pending.push_back(cast->getOperand(0));
+            else if (const auto* extract = llvm::dyn_cast<llvm::ExtractValueInst>(v))
+                pending.push_back(extract->getAggregateOperand());
+            else if (const auto* slot = llvm::dyn_cast<llvm::AllocaInst>(v))
+                for (const llvm::User* user : slot->users())
+                    if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                        store != nullptr && store->getPointerOperand() == slot)
+                        pending.push_back(store->getValueOperand());
+        }
+        return owners;
+    }
+
+llvm::StoreInst* LLVMBackend::GateOwnedStructTemps(const std::vector<llvm::Value*>& owners,
+                                                   const llvm::Value* value)
+{
+        if (!IsInsertBlockLive()) return nullptr;
+        std::vector<llvm::Value*> targets;
+        for (const auto& temp : pendingOwnedStructTemps)
+            if (temp.Alloca != nullptr
+                && std::find(owners.begin(), owners.end(), temp.Alloca) != owners.end())
+                targets.push_back(temp.Alloca);
+        if (targets.empty()) targets = FindPendingStructTempOwnersOf(value);
+        llvm::AllocaInst* gateSlot = nullptr;
+        llvm::StoreInst* gate = nullptr;
+        auto entryStore = [&](llvm::AllocaInst* slot, bool flag) {
+            llvm::IRBuilderBase::InsertPointGuard guard(*builder);
+            builder->SetInsertPoint(slot->getParent(), std::next(slot->getIterator()));
+            return builder->CreateStore(builder->getInt1(flag), slot);
+        };
+        for (auto& temp : pendingOwnedStructTemps)
+        {
+            if (temp.Alloca == nullptr
+                || std::find(targets.begin(), targets.end(), temp.Alloca) == targets.end())
+                continue;
+            if (gateSlot == nullptr)
+            {
+                gateSlot = AllocaAtEntry(builder->getInt1Ty(), nullptr, "rawptr.store.gate");
+                gate = entryStore(gateSlot, false);
+            }
+            llvm::Value* open = builder->CreateLoad(builder->getInt1Ty(), gateSlot, "rawptr.gate");
+            if (temp.LiveFlag == nullptr)
+            {
+                auto* flag = AllocaAtEntry(builder->getInt1Ty(), nullptr, "owntemp.livef");
+                entryStore(flag, true);
+                temp.LiveFlag = flag;
+            }
+            else
+                open = builder->CreateAnd(
+                    builder->CreateLoad(builder->getInt1Ty(), temp.LiveFlag, "owntemp.live"), open);
+            builder->CreateStore(open, temp.LiveFlag);
+        }
+        return gate;
+    }
+
+void LLVMBackend::RecordDeferredRawPointerCalleeStore(const llvm::Function* callee,
+        size_t argIndex, const std::string& paramName, size_t line, size_t column,
+        const std::vector<llvm::Value*>& owners, const llvm::Value* argValue, bool refuse)
+{
+        DeferredRawPointerCalleeStore entry{ callee, argIndex, paramName, sourceFileName,
+                                             line, column, activeExpectScope_ };
+        entry.Refuse = refuse;
+        // The owner's destruction waits on a gate opened only by a None verdict: an Unknown one
+        // keeps the owner alive (a leak), never a use after free.
+        entry.Gate = GateOwnedStructTemps(owners, argValue);
+        deferredRawPointerCalleeStores_.push_back(std::move(entry));
+    }
+
+void LLVMBackend::ResolveRawPointerCalleeStoreVerdicts()
+{
+        for (auto& entry : deferredRawPointerCalleeStores_)
+        {
+            if (entry.Resolved) continue;
+            entry.Verdict = ClassifyArgumentStoreOutsideCall(entry.Callee, entry.ArgIndex);
+            entry.Resolved = true;
+            if (entry.Verdict == RawPointerStoreVerdict::Unknown
+                || (entry.Verdict == RawPointerStoreVerdict::Stores && !entry.Refuse))
+                continue;
+            if (auto* init = llvm::dyn_cast_or_null<llvm::StoreInst>(entry.Gate))
+                init->setOperand(0, llvm::ConstantInt::getTrue(init->getContext()));
+        }
+        std::vector<TempUniqueFieldGate> gates;
+        gates.swap(tempUniqueFieldGates_);
+        for (const auto& gate : gates)
+        {
+            auto* init = llvm::dyn_cast_or_null<llvm::StoreInst>(gate.Gate);
+            // A Stores verdict this ledger did not refuse (a join with a local arm) keeps its
+            // frozen accept-and-destroy behaviour; only Unknown keeps the owner alive.
+            if (init == nullptr
+                || ClassifyArgumentStoreOutsideCall(gate.Callee, gate.ArgIndex)
+                    == RawPointerStoreVerdict::Unknown)
+                continue;
+            init->setOperand(0, llvm::ConstantInt::getTrue(init->getContext()));
+        }
+    }
+
+std::string LLVMBackend::DescribeRawPointerCalleeStore(const std::string& paramName)
+{
+        return std::format(
+            "cannot pass raw pointer from an owning temporary to parameter '{}': the callee "
+            "stores it in a location that outlives the call, so the owner would be destroyed "
+            "at the end of the statement; bind the whole owner to a local first",
+            paramName);
     }
 
 void LLVMBackend::RegisterDataValue(llvm::Value* value)
@@ -3538,12 +3755,21 @@ void LLVMBackend::ForgetFunctionEscapeMemo(const llvm::Function* fn)
         std::erase_if(paramRetainsPastCallMemo_, [&](const auto& kv) { return kv.first.first == fn; });
         std::erase_if(paramRetainsPastCallInProgress_, [&](const auto& k) { return k.first == fn; });
         std::erase_if(provableRetainsInProgress_, [&](const auto& k) { return k.first == fn; });
+        std::erase_if(borrowingSinkMemo_, [&](const auto& kv) { return kv.first.first == fn; });
         std::erase_if(borrowingSinkInProgress_, [&](const auto& k) { return k.first == fn; });
-        std::erase_if(owningLocalBorrowingHelperArgs_,
-                      [&](const auto& e) { return e.Callee == fn; });
+        std::erase_if(owningLocalBorrowingHelperArgs_, [&](const auto& e) {
+            return e.Callee == fn || e.IndirectCaller == fn || e.IndirectTarget == fn;
+        });
         // The record ledger holds this raw Function*, which LLVM may hand back to a later
         // Function::Create; an entry outliving its callee would be resolved against a stranger.
         std::erase_if(tempUniqueFieldArgs_, [&](const TempUniqueFieldArg& e) { return e.Callee == fn; });
+        // A gate naming this callee is opened (the owner is destroyed as before) and dropped.
+        std::erase_if(tempUniqueFieldGates_, [&](const TempUniqueFieldGate& e) {
+            if (e.Callee != fn) return false;
+            if (auto* init = llvm::dyn_cast_or_null<llvm::StoreInst>(e.Gate))
+                init->setOperand(0, llvm::ConstantInt::getTrue(init->getContext()));
+            return true;
+        });
         // Same hazard for the deferred RETURN half: a condition naming this Function* would be
         // re-asked against whatever Function::Create hands the recycled address to next.
         auto namesFn = [&](const std::pair<const llvm::Function*, unsigned>& c) { return c.first == fn; };
@@ -3572,8 +3798,10 @@ void LLVMBackend::DropModuleEscapeMemo()
         paramRetainsPastCallMemo_.clear();
         paramRetainsPastCallInProgress_.clear();
         provableRetainsInProgress_.clear();
+        borrowingSinkMemo_.clear();
         borrowingSinkInProgress_.clear();
         tempUniqueFieldArgs_.clear();
+        tempUniqueFieldGates_.clear();
         coreUniqueGetterSource_.clear();
         owningLocalBorrowingHelperArgs_.clear();
         deferredCallReleaseGates_.clear();
@@ -3632,6 +3860,15 @@ bool LLVMBackend::TernaryArmJoinsOwning(llvm::Value* arm, bool includeOwningLoca
             if (auto* constant = llvm::dyn_cast<llvm::ConstantInt>(raw->RuntimeOwns))
                 return !constant->isZero();
             return false;
+        }
+        if (auto source = coreUniqueGetterSource_.find(arm);
+            source != coreUniqueGetterSource_.end())
+        {
+            auto* sourceType = llvm::dyn_cast<llvm::StructType>(source->second->getType());
+            if (sourceType != nullptr && sourceType->hasName()
+                && IsCoreUniqueType(sourceType->getName().str())
+                && FindOwnedReturnEntry(const_cast<llvm::Value*>(source->second)) != nullptr)
+                return true;
         }
         if (IsOwningPtrTempValue(arm) || IsMovedOutPtrValue(arm)
             || RawArrayResultOwns(arm)) return true;
@@ -4316,18 +4553,241 @@ std::optional<unsigned> LLVMBackend::CFlatParameterLLVMIndex(const FunctionSymbo
 bool LLVMBackend::ParameterMayReachBorrowingContainerSink(const llvm::Function* fn,
                                                            unsigned argIndex, int depth)
 {
-        if (fn == nullptr || argIndex >= fn->arg_size() || depth > kMaxRetainDepth) return false;
-        if (!FunctionBodyIsReadable(fn)) return false;
-        auto key = std::make_pair(fn, argIndex);
-        if (!borrowingSinkInProgress_.insert(key).second) return false;
-        bool reaches = ValueMayReachBorrowingContainerSink(fn->getArg(argIndex), depth);
-        borrowingSinkInProgress_.erase(key);
-        return reaches;
+        return BorrowingContainerSinkSummaryForParameter(fn, argIndex, depth).ReachesSink();
     }
 
-bool LLVMBackend::ValueMayReachBorrowingContainerSink(const llvm::Value* root, int depth)
+LLVMBackend::BorrowingContainerSinkSummary
+LLVMBackend::BorrowingContainerSinkSummaryForParameter(const llvm::Function* fn,
+        unsigned argIndex, int depth)
 {
-        if (root == nullptr || depth > kMaxRetainDepth) return false;
+        if (fn == nullptr || argIndex >= fn->arg_size()) return {};
+        if (depth > kMaxRetainDepth)
+        {
+            BorrowingContainerSinkSummary capped;
+            capped.UnresolvedCallee = true;
+            return capped;
+        }
+        if (auto it = borrowingSinkMemo_.find({ fn, argIndex }); it != borrowingSinkMemo_.end())
+            return it->second;
+        if (!FunctionBodyIsReadable(fn)) return {};
+        auto key = std::make_pair(fn, argIndex);
+        if (!borrowingSinkInProgress_.insert(key).second)
+        {
+            BorrowingContainerSinkSummary cycle;
+            cycle.UnresolvedCallee = true;
+            return cycle;
+        }
+
+        BorrowingContainerSinkSummary summary;
+        ValueMayReachBorrowingContainerSink(fn, fn->getArg(argIndex), depth, summary);
+        borrowingSinkInProgress_.erase(key);
+        if (!summary.UnresolvedCallee) borrowingSinkMemo_.emplace(key, summary);
+        return summary;
+    }
+
+void LLVMBackend::AddBorrowingContainerSinkDestination(const llvm::Function* fn,
+        const llvm::Value* ptr, unsigned depth, BorrowingContainerSinkSummary& summary) const
+{
+        if (fn == nullptr || ptr == nullptr || depth > kMaxRetainDepth) return;
+        std::function<bool(const llvm::Value*, unsigned)> addPointerOrigin;
+        std::function<bool(const llvm::Value*, unsigned)> addSlotOrigins;
+        auto addGlobal = [&](unsigned originDepth) {
+            if (!summary.GlobalDepth || originDepth < *summary.GlobalDepth)
+                summary.GlobalDepth = originDepth;
+            return true;
+        };
+        auto addArgument = [&](const llvm::Argument* arg, unsigned originDepth) {
+            // Explicit pointer destinations have unknown lifetime across a forwarded helper call.
+            if (arg->getParent() != fn || !ArgumentIsMethodReceiver(fn, arg->getArgNo()))
+            {
+                summary.UnmappedOutlivingDestination = true;
+                return true;
+            }
+            auto [it, inserted] = summary.ArgumentDepths.emplace(arg->getArgNo(), originDepth);
+            if (!inserted && originDepth < it->second) it->second = originDepth;
+            return true;
+        };
+        addPointerOrigin = [&](const llvm::Value* value, unsigned originDepth) {
+            if (value == nullptr || originDepth > kMaxRetainDepth) return false;
+            const llvm::Value* obj = llvm::getUnderlyingObject(value);
+            if (llvm::isa<llvm::GlobalVariable>(obj)) return addGlobal(originDepth);
+            if (const auto* arg = llvm::dyn_cast<llvm::Argument>(obj))
+                return addArgument(arg, originDepth);
+            if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(obj))
+                return addSlotOrigins(load->getPointerOperand(), originDepth + 1);
+            if (llvm::isa<llvm::SelectInst>(obj) || llvm::isa<llvm::PHINode>(obj))
+            {
+                std::string destKind;
+                if (MemoryOutlivesCall(value, destKind, 0))
+                    summary.UnmappedOutlivingDestination = true;
+                return summary.UnmappedOutlivingDestination;
+            }
+            return false;
+        };
+        addSlotOrigins = [&](const llvm::Value* value, unsigned originDepth) {
+            const auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(value);
+            if (slot == nullptr || originDepth > kMaxRetainDepth || !AllocaIsLoadStoreOnly(slot))
+                return false;
+            bool found = false;
+            for (const llvm::User* user : slot->users())
+            {
+                const auto* store = llvm::dyn_cast<llvm::StoreInst>(user);
+                if (store == nullptr || store->getPointerOperand() != slot) continue;
+                found |= addPointerOrigin(store->getValueOperand(), originDepth + 1);
+            }
+            return found;
+        };
+
+        std::string destKind;
+        if (MemoryOutlivesCall(ptr, destKind, 0)) addPointerOrigin(ptr, depth);
+    }
+
+const llvm::Function* LLVMBackend::FunctionPointerTargetFromValue(const llvm::Value* value,
+        int depth, const llvm::DominatorTree* dominatorTree) const
+{
+        if (value == nullptr || depth > kMaxRetainDepth) return nullptr;
+        if (const auto* fn = llvm::dyn_cast<llvm::Function>(value)) return fn;
+        if (const auto* cast = llvm::dyn_cast<llvm::CastInst>(value))
+            return FunctionPointerTargetFromValue(cast->getOperand(0), depth + 1, dominatorTree);
+        if (const auto* expr = llvm::dyn_cast<llvm::ConstantExpr>(value))
+            if (expr->isCast())
+                return FunctionPointerTargetFromValue(expr->getOperand(0), depth + 1, dominatorTree);
+        if (const auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(value))
+        {
+            const auto indices = insert->getIndices();
+            if (indices.empty()) return nullptr;
+            return FunctionPointerTargetFromValue(indices.front() == 0
+                ? insert->getInsertedValueOperand() : insert->getAggregateOperand(),
+                depth + 1, dominatorTree);
+        }
+        if (const auto* constant = llvm::dyn_cast<llvm::Constant>(value))
+            if (const llvm::Constant* code = constant->getAggregateElement(0u))
+                return FunctionPointerTargetFromValue(code, depth + 1, dominatorTree);
+        if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+            return FunctionPointerTargetFromLocal(load->getPointerOperand(), depth + 1, dominatorTree);
+        return nullptr;
+    }
+
+const llvm::Function* LLVMBackend::FunctionPointerTargetFromLocal(const llvm::Value* storage,
+        int depth, const llvm::DominatorTree* dominatorTree) const
+{
+        const auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(storage);
+        if (slot == nullptr || depth > kMaxRetainDepth || !AllocaIsLoadStoreOnly(slot)
+            || slot->getFunction() == nullptr) return nullptr;
+        const llvm::StoreInst* targetStore = nullptr;
+        std::vector<const llvm::LoadInst*> loads;
+        for (const llvm::User* user : slot->users())
+        {
+            if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+            {
+                if (store->getPointerOperand() != slot || targetStore != nullptr) return nullptr;
+                targetStore = store;
+            }
+            else if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(user))
+            {
+                if (load->getPointerOperand() != slot) return nullptr;
+                loads.push_back(load);
+            }
+        }
+        if (targetStore == nullptr || loads.empty()) return nullptr;
+        const llvm::Function* target = FunctionPointerTargetFromValue(
+            targetStore->getValueOperand(), depth + 1, dominatorTree);
+        if (target == nullptr) return nullptr;
+        if (dominatorTree != nullptr
+            && !std::all_of(loads.begin(), loads.end(), [&](const llvm::LoadInst* load) {
+                return dominatorTree->dominates(targetStore, load);
+            })) return nullptr;
+        return target;
+    }
+
+bool LLVMBackend::FunctionPointerLocalHasSingleNamedTarget(const llvm::Function* caller,
+        const llvm::Value* storage, const llvm::Function* target,
+        const llvm::DominatorTree& dominatorTree) const
+{
+        const auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(storage);
+        if (caller == nullptr || slot == nullptr || slot->getFunction() != caller
+            || target == nullptr) return false;
+
+        std::function<bool(const llvm::Value*, llvm::SmallPtrSetImpl<const llvm::Value*>&)> onlyCalls =
+            [&](const llvm::Value* value, llvm::SmallPtrSetImpl<const llvm::Value*>& visited) {
+                if (value == nullptr || !visited.insert(value).second) return value != nullptr;
+                for (const llvm::User* user : value->users())
+                {
+                    if (const auto* call = llvm::dyn_cast<llvm::CallBase>(user))
+                    {
+                        if (call->getCalledOperand() != value) return false;
+                        continue;
+                    }
+                    if (const auto* cast = llvm::dyn_cast<llvm::CastInst>(user))
+                    {
+                        if (!onlyCalls(cast, visited)) return false;
+                        continue;
+                    }
+                    if (const auto* extract = llvm::dyn_cast<llvm::ExtractValueInst>(user))
+                    {
+                        const auto indices = extract->getIndices();
+                        if (indices.empty() || indices.front() != 0
+                            || !onlyCalls(extract, visited)) return false;
+                        continue;
+                    }
+                    return false;
+                }
+                return true;
+            };
+
+        size_t stores = 0;
+        const llvm::StoreInst* targetStore = nullptr;
+        std::vector<const llvm::LoadInst*> loads;
+        for (const llvm::User* user : slot->users())
+        {
+            if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(user))
+            {
+                if (store->getPointerOperand() != slot
+                    || FunctionPointerTargetFromValue(store->getValueOperand(), 0,
+                                                       &dominatorTree) != target)
+                    return false;
+                ++stores;
+                targetStore = store;
+                continue;
+            }
+            if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(user))
+            {
+                if (load->getPointerOperand() != slot) return false;
+                llvm::SmallPtrSet<const llvm::Value*, 16> visited;
+                if (!onlyCalls(load, visited)) return false;
+                loads.push_back(load);
+                continue;
+            }
+            return false;
+        }
+        if (stores != 1 || loads.empty()) return false;
+        return std::all_of(loads.begin(), loads.end(), [&](const llvm::LoadInst* load) {
+            return dominatorTree.dominates(targetStore, load);
+        });
+    }
+
+void LLVMBackend::RecordOwningLocalFunctionPointerArg(const std::string& functionName,
+        const std::string& parameterName, unsigned paramIndex, const NamedVariable& arg,
+        const llvm::Function* target, const llvm::Value* storage)
+{
+        if (!IsProvenOwningNamedLocal(arg) || currentFunction == nullptr
+            || FunctionPointerTargetFromLocal(storage) != target) return;
+        owningLocalBorrowingHelperArgs_.push_back({
+            target, paramIndex, functionName, parameterName, arg.CallerName,
+            sourceFileName, currentLine, currentColumn, currentFunction, storage, target,
+            !expectedError.empty() && expectedError != fileScopeExpectedError_
+                ? activeExpectScope_ : 0 });
+    }
+
+bool LLVMBackend::ValueMayReachBorrowingContainerSink(const llvm::Function* fn,
+        const llvm::Value* root, int depth, BorrowingContainerSinkSummary& summary)
+{
+        if (fn == nullptr || root == nullptr) return false;
+        if (depth > kMaxRetainDepth)
+        {
+            summary.UnresolvedCallee = true;
+            return false;
+        }
         llvm::SmallPtrSet<const llvm::Value*, 16> visited;
         llvm::SmallVector<const llvm::Value*, 16> work;
         visited.insert(root);
@@ -4356,11 +4816,52 @@ bool LLVMBackend::ValueMayReachBorrowingContainerSink(const llvm::Value* root, i
                         {
                             std::string destKind;
                             if (MemoryOutlivesCall(call->getArgOperand(0), destKind, 0))
-                                return true;
+                                AddBorrowingContainerSinkDestination(fn,
+                                    call->getArgOperand(0), 0, summary);
                         }
                     }
-                    // This is deliberately depth-1: a helper called by this function is not
-                    // summarized recursively, so two-level forwarding remains accepted.
+
+                    const llvm::Function* callee = call->getCalledFunction();
+                    if (callee != nullptr && !callee->isDeclaration())
+                    {
+                        if (!FunctionBodyIsComplete(callee))
+                        {
+                            summary.UnresolvedCallee = true;
+                            continue;
+                        }
+                        for (unsigned arg = 0; arg < call->arg_size(); ++arg)
+                        {
+                            if (call->getArgOperand(arg) != v) continue;
+                            auto calleeSummary = BorrowingContainerSinkSummaryForParameter(
+                                callee, arg, depth + 1);
+                            summary.UnresolvedCallee |= calleeSummary.UnresolvedCallee;
+                            auto addGlobal = [&](unsigned sinkDepth) {
+                                unsigned totalDepth = 1u + sinkDepth;
+                                if (static_cast<unsigned>(depth) + totalDepth
+                                    > static_cast<unsigned>(kMaxRetainDepth))
+                                {
+                                    summary.UnresolvedCallee = true;
+                                    return;
+                                }
+                                if (!summary.GlobalDepth || totalDepth < *summary.GlobalDepth)
+                                    summary.GlobalDepth = totalDepth;
+                            };
+                            if (calleeSummary.GlobalDepth) addGlobal(*calleeSummary.GlobalDepth);
+                            for (const auto& [destinationArg, sinkDepth] : calleeSummary.ArgumentDepths)
+                            {
+                                unsigned totalDepth = 1u + sinkDepth;
+                                if (static_cast<unsigned>(depth) + totalDepth
+                                        > static_cast<unsigned>(kMaxRetainDepth)
+                                    || destinationArg >= call->arg_size())
+                                {
+                                    summary.UnresolvedCallee = true;
+                                    continue;
+                                }
+                                AddBorrowingContainerSinkDestination(fn,
+                                    call->getArgOperand(destinationArg), totalDepth, summary);
+                            }
+                        }
+                    }
                     continue;
                 }
                 if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(inst))
@@ -4391,7 +4892,7 @@ bool LLVMBackend::ValueMayReachBorrowingContainerSink(const llvm::Value* root, i
                 }
             }
         }
-        return false;
+        return summary.ReachesSink();
     }
 
 bool LLVMBackend::ValueMayReachReturn(const llvm::Value* root, int depth,
@@ -4727,6 +5228,11 @@ void LLVMBackend::RecordTempUniqueFieldArgs(llvm::Value* callResult, const std::
             if (carries && entry.LaunderConds.empty() && bodyReadable
                 && ParameterProvablyRetainsArgument(callee, i, destKind))
                 RejectTempUniqueFieldArgEscape(entry, destKind);
+            // The field passed straight in: its owner is destroyed only once the store walk
+            // proves the parameter keeps nothing (Unknown keeps it alive).
+            if (carries && entry.LaunderConds.empty())
+                if (llvm::StoreInst* gate = GateOwnedStructTemps({}, matchVal))
+                    tempUniqueFieldGates_.push_back({ callee, i, gate });
             tempUniqueFieldArgs_.push_back(entry);
         }
     }
@@ -4903,22 +5409,59 @@ void LLVMBackend::ResolveTempUniqueFieldArgEscapes()
         }
     }
 
-void LLVMBackend::ResolveOwningLocalBorrowingHelperArgs()
+bool LLVMBackend::OwningLocalBorrowingHelperRefuses(
+        const OwningLocalBorrowingHelperArg& entry, const llvm::DominatorTree* dominatorTree)
+{
+        if (entry.IndirectTarget != nullptr
+            && (dominatorTree == nullptr
+                || !FunctionPointerLocalHasSingleNamedTarget(entry.IndirectCaller,
+                    entry.FunctionPointerStorage, entry.IndirectTarget, *dominatorTree)))
+            return false;
+        return BorrowingContainerSinkSummaryForParameter(entry.Callee, entry.ParamIndex).ReachesSink();
+    }
+
+void LLVMBackend::ReportOwningLocalBorrowingHelperRefusal(const OwningLocalBorrowingHelperArg& entry)
+{
+        const std::string functionName = SpellFunctionSymbol(*this, entry.FunctionName);
+        if (entry.IndirectTarget != nullptr)
+        {
+            LogErrorMessage(
+                "call through function pointer '{}': '{}' still owns the object it was given, and "
+                "the target stores this argument into a container that only BORROWS its elements "
+                "and never frees them, so the stored element would dangle. Transfer the object "
+                "with '{}(move {})', or declare the container's element 'unique T*'.",
+                { functionName, entry.ArgumentName, functionName, entry.ArgumentName });
+            return;
+        }
+        LogErrorMessage(
+            "call to '{}': '{}' still owns the object it was given, and the helper parameter "
+            "'{}' stores it into a container that only BORROWS its elements and never frees "
+            "them, so the stored element would dangle. Declare parameter '{}' as 'move' and "
+            "call '{}(move {})', or declare the container's element 'unique T*'.",
+            { functionName, entry.ArgumentName, entry.ParameterName, entry.ParameterName,
+              functionName, entry.ArgumentName });
+    }
+
+void LLVMBackend::ResolveOwningLocalBorrowingHelperArgs(bool aborted)
 {
         std::vector<OwningLocalBorrowingHelperArg> pending;
         pending.swap(owningLocalBorrowingHelperArgs_);
+        std::unordered_map<const llvm::Function*, std::unique_ptr<llvm::DominatorTree>> dominatorTrees;
         for (const auto& entry : pending)
         {
-            if (!ParameterMayReachBorrowingContainerSink(entry.Callee, entry.ParamIndex)) continue;
+            if (aborted) continue;
+            const llvm::DominatorTree* dominatorTree = nullptr;
+            if (entry.IndirectTarget != nullptr)
+            {
+                auto& tree = dominatorTrees[entry.IndirectCaller];
+                if (!tree)
+                    tree = std::make_unique<llvm::DominatorTree>(
+                        *const_cast<llvm::Function*>(entry.IndirectCaller));
+                dominatorTree = tree.get();
+            }
+            if (!OwningLocalBorrowingHelperRefuses(entry, dominatorTree)) continue;
             ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
-            LogErrorMessage(
-                "call to '{}': '{}' still owns the object it was given, and the helper parameter "
-                "'{}' stores it into a container that only BORROWS its elements and never frees "
-                "them, so the stored element would dangle. Declare parameter '{}' as 'move' and "
-                "call '{}(move {})', or declare the container's element 'unique T*'.",
-                { SpellFunctionSymbol(*this, entry.FunctionName), entry.ArgumentName,
-                  entry.ParameterName, entry.ParameterName,
-                  SpellFunctionSymbol(*this, entry.FunctionName), entry.ArgumentName });
+            ReportOwningLocalBorrowingHelperRefusal(entry);
         }
     }
 
@@ -6697,6 +7240,8 @@ void LLVMBackend::FlushOwnedTemps()
         // Same boundary destructs the owning temp, so its unique-field reads retire with it.
         owningTempUniqueFields_.clear();
         owningTempRawPointerFields_.clear();
+        owningTempRawPointerFieldAddresses_.clear();
+        owningTempRawPointerFieldOwners_.clear();
         launderedTempUniqueFields_.clear();
         pendingLaunderTempUniqueFields_.clear();
         dataValueCodeCasts_.clear();
@@ -6802,7 +7347,7 @@ void LLVMBackend::EmitConditionalFullDestructor(const NamedVariable& namedVar, l
         if (namedVar.ConditionalDropFlag == nullptr)
         {
             EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType, dtor,
-                                          namedVar.TypeAndValue.TypeName);
+                                          namedVar.TypeAndValue.TypeName, true);
             return;
         }
         auto* function = builder->GetInsertBlock()->getParent();
@@ -6813,7 +7358,7 @@ void LLVMBackend::EmitConditionalFullDestructor(const NamedVariable& namedVar, l
         builder->CreateCondBr(live, liveBlock, afterBlock);
         builder->SetInsertPoint(liveBlock);
         EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType, dtor,
-                                      namedVar.TypeAndValue.TypeName);
+                                      namedVar.TypeAndValue.TypeName, true);
         builder->CreateBr(afterBlock);
         builder->SetInsertPoint(afterBlock);
     }
@@ -6871,7 +7416,7 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
                 EnsureStringDtorRegistered();
                 if (it->second.Destructor == nullptr) return;
                 EmitFullDestructorOverStorage(*builder, namedVar.Storage, namedVar.BaseType,
-                                              it->second.Destructor, "string");
+                                              it->second.Destructor, "string", true);
                 return;
             }
             // Non-string struct local: run the full destructor (user dtor + members).
@@ -8037,6 +8582,8 @@ bool LLVMBackend::MakeThisClosureCopySite(const std::string& typeName, ThisClosu
         // Inside a generic body instantiated for the type: report at the use that instantiated it.
         if (const auto& origin = gts.activeInstantiationOrigin; origin.valid)
         {
+            site.FromGenericAggregateBody = gts.genericStructTemplates.count(origin.templateName) != 0
+                || gts.genericClassTemplates.count(origin.templateName) != 0;
             site.File = origin.file;
             site.Line = origin.line;
             site.Column = origin.column;
@@ -8054,6 +8601,22 @@ void LLVMBackend::NoteThisClosureCopySite(const std::string& typeName, ThisClosu
         if (kind == ThisClosureCopyKind::CtorReturn && site.Function != nullptr)
             byValueCtorStructs_[site.Function] = typeName;
         thisClosureCopySites_.push_back(std::move(site));
+}
+
+void LLVMBackend::NoteThisClosureMemberCall(const llvm::Function* callee)
+{
+        if (callee == nullptr || builder->GetInsertBlock() == nullptr) return;
+        for (const auto& memberSite : thisClosureCopySites_)
+        {
+            if (memberSite.Kind == ThisClosureCopyKind::CtorReturn
+                || !memberSite.FromGenericAggregateBody || memberSite.Function != callee)
+                continue;
+            ThisClosureCopySite callSite;
+            if (!MakeThisClosureCopySite(memberSite.TypeName, memberSite.Kind, callSite))
+                return;
+            thisClosureCopySites_.push_back(std::move(callSite));
+            return;
+        }
 }
 
 std::string LLVMBackend::ThisClosureStoringType(const std::string& typeName) const
@@ -8077,6 +8640,7 @@ std::string LLVMBackend::ThisClosureStoringType(const std::string& typeName) con
 
 bool LLVMBackend::ThisClosureSiteRefused(const ThisClosureCopySite& site) const
 {
+        if (site.Kind != ThisClosureCopyKind::CtorReturn && site.FromGenericAggregateBody) return false;
         if (site.Kind != ThisClosureCopyKind::CtorReturn)
             if (auto it = byValueCtorStructs_.find(site.Function); it != byValueCtorStructs_.end()
                 && !ThisClosureStoringType(it->second).empty())
