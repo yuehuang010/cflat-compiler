@@ -327,7 +327,7 @@ bool processSymbol(string symbol, string tickerJson, bool refresh, bool prices)
     string rawPath = "data/earnings/raw/" + symbol + ".json";
     string url = "https://data.sec.gov/api/xbrl/companyconcept/CIK" + cik +
                  "/us-gaap/EarningsPerShareDiluted.json";
-    string body = loadOrFetch(rawPath, url, refresh, "trade-research yuehuang010@gmail.com");
+    string body = loadOrFetch(rawPath, url, refresh, "trade-research contact@example.com");
     bool ok = body.length() > 0;
     if (ok) os.sleep_ms(150);
     if (!ok)
@@ -379,7 +379,7 @@ extern int main(int argc, char** argv)
     Directory.createAll("data/earnings/raw");
     string tickerJson = loadOrFetch("data/earnings/company_tickers.json",
         "https://www.sec.gov/files/company_tickers.json", refresh,
-        "trade-research yuehuang010@gmail.com");
+        "trade-research contact@example.com");
     bool tickerOk = tickerJson.length() > 0;
     if (tickerOk) os.sleep_ms(150);
     if (!tickerOk)

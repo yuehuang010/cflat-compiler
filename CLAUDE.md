@@ -39,7 +39,7 @@ Bash. `~/.codex/config.toml` already pins `model = "gpt-6-luna"` + `model_reason
 "high"` - no flags needed:
 
 ```bash
-codex exec --sandbox workspace-write -C /Users/felixhuang/source/cflat-compiler "<self-contained prompt>"
+codex exec --sandbox workspace-write -C ~/source/cflat-compiler "<self-contained prompt>"
 ```
 
 `-m` / `-c model_reasoning_effort=...` only to override. Prompt must be self-contained - Codex

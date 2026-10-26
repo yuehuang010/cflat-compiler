@@ -31,11 +31,18 @@ chain with `git merge-tree` / `commit-tree`, so nothing is checked out until `--
    - Report: one line per hit, `file:line`, category, the value itself masked to its first
      few characters. No file dumps.
 
+   While it runs, the main session adds the identity sweep Haiku cannot derive (pass 2 only
+   extends `internal/` hits): `git grep -n -I -F -e "$(git config user.email)" -e "$USER"
+   -- . ':!scratch/'`, plus any known host / SSH target. 2026-10-25 Haiku missed an email in
+   `example/` this way.
+
    Main session reviews the report (Haiku over-flags; the Git author line and `Co-Authored-By`
    trailers are expected, not PII). Real hits: tell the user and fix them in a commit on
    master before step 3, so the fix joins the plan. A value already pushed (present in
    `origin/master`) cannot be scrubbed by squashing - say so; do not rewrite pushed history.
-   No hits: continue.
+   Check pushed state per file: `git show origin/master:<file> | grep -c <value>`; 0 means
+   the hit came from an unpushed commit and the fix commit scrubs it from the squashed
+   history. No hits: continue.
 
 3. **Survey.** `git log --reverse --format='%h %<(200,trunc)%s' origin/master..master`.
    Group by topic, not by timebox. Past headlines:
@@ -45,7 +52,9 @@ chain with `git merge-tree` / `commit-tree`, so nothing is checked out until `--
    - C interop ABI
    - issue queue bookkeeping
 
-   Aim for 3-8 groups (chronological fallback in step 5 when topics will not separate). Put queue / resume bookkeeping commits in one final group with
+   Long ranges (~150+ commits, several fix boxes back to back) go straight to the
+   chronological fallback in step 5: 2026-10-25, 278 commits cut into 9 runs + bookkeeping,
+   dry run clean on the first try. Otherwise aim for 3-8 groups (chronological fallback in step 5 when topics will not separate). Put queue / resume bookkeeping commits in one final group with
    `"bookkeeping": true`.
 
 4. **Write the plan** to `scratch/squash_<date>/plan.json`:
@@ -93,8 +102,9 @@ chain with `git merge-tree` / `commit-tree`, so nothing is checked out until `--
 6. **Apply:** re-run with `--apply`. This creates `backup/master-pre-squash-<date>` at the old
    master and moves master with `git reset --keep`. Verify:
    - `git log --oneline origin/master..master`
-   - `git diff --quiet backup/master-pre-squash-<date> master -- . ':!internal/issue'`, which
-     must succeed (identical outside the remapped files).
+   - `git diff --quiet backup/master-pre-squash-<date> master -- . ':!<remapped file>'...`,
+     excluding every file the tool listed as "hashes remapped" (often
+     `internal/fix-issue-lessons.md` too, not only `internal/issue/`). Must succeed.
 
    The tree is unchanged, so no rebuild or suite rerun is needed.
 
