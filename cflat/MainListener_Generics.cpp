@@ -988,10 +988,12 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
                 if (tts->tupleTypePackEntry() != nullptr)
                     break;
                 std::vector<std::string> typeArgs;
+                auto elementContext = TupleTypeElementContext(tts);
                 for (auto* entry : tts->tupleTypeEntry())
                 {
                     PrimitiveTypeError argError;
-                    typeArgs.push_back(TupleEntryArgName(Compiler(declSpec), entry, &argError));
+                    typeArgs.push_back(ResolveTupleTypeElementArgName(
+                        elementContext, entry, &argError));
                     if (HasPrimitiveTypeError(argError))
                         LogErrorContext(entry, LocalizePrimitiveTypeError(Compiler(declSpec), argError));
                 }
@@ -1107,21 +1109,72 @@ bool MainListener::IsPointerOnlyTypeUse(antlr4::tree::ParseTree* typeSpecNode)
 
 bool MainListener::PendingWaitsOnStructBody(const GenericTemplateState::PendingInstantiation& pending)
 {
+        auto& c = *Compiler();
         if (!pending.pointerOnly) return false;
         if (!genericStructTemplates.count(pending.templateName) && !genericClassTemplates.count(pending.templateName))
             return false;
-        auto& c = *Compiler();
         for (const auto& arg : pending.typeArgs)
         {
-            // Only CFlat struct definitions the forward scan saw: a C++ or interop shell is never
-            // waited on, since its completion has no hook here and the record would never drain.
-            if (!c.gts.scannedTypeNames.count(arg) || c.gts.scannedInterfaceNames.count(arg))
-                continue;
+            bool cflatBodyCanComplete = c.gts.scannedTypeNames.count(arg) != 0
+                && c.gts.scannedInterfaceNames.count(arg) == 0;
+            if (!cflatBodyCanComplete)
+            {
+                TypeSpelling spelling;
+                if (DemangleType(c, arg, spelling))
+                    cflatBodyCanComplete = genericStructTemplates.count(spelling.base) != 0
+                        || genericClassTemplates.count(spelling.base) != 0;
+            }
+            // C++ and interop shells have no completion hook here, so do not wait on them.
+            if (!cflatBodyCanComplete) continue;
             auto it = c.dataStructures.find(arg);
             if (it != c.dataStructures.end() && it->second.StructType && it->second.StructType->isOpaque())
                 return true;
         }
         return false;
+}
+
+void MainListener::PrepareDeferredCoreUniqueLayout(
+    const GenericTemplateState::PendingInstantiation& pending)
+{
+        auto* compiler = Compiler();
+        if (!compiler->IsCoreUniqueTemplate(pending.templateName) || pending.typeArgs.empty()) return;
+        auto dependencyProbe = pending;
+        dependencyProbe.pointerOnly = true;
+        if (!PendingWaitsOnStructBody(dependencyProbe)) return;
+
+        auto it = compiler->dataStructures.find(pending.mangledName);
+        if (it == compiler->dataStructures.end() || it->second.StructType == nullptr)
+        {
+            compiler->CreateStructType(pending.mangledName, {});
+            it = compiler->dataStructures.find(pending.mangledName);
+        }
+        if (it == compiler->dataStructures.end() || it->second.StructType == nullptr) return;
+        if (it->second.StructType->isOpaque())
+        {
+            LLVMBackend::DeclTypeAndValue pointerField;
+            pointerField.TypeName = pending.typeArgs[0];
+            pointerField.VariableName = "_p";
+            pointerField.Pointer = true;
+            compiler->CreateStructType(pending.mangledName, { pointerField });
+        }
+
+        LLVMBackend::TypeAndValue returnType{ .TypeName = pending.mangledName };
+        if (compiler->GetFunction(pending.mangledName) == nullptr)
+            compiler->CreateFunctionDeclaration(pending.mangledName, returnType, {});
+
+        const std::string destructorName = "~" + pending.mangledName;
+        auto* destructor = compiler->GetFunction(destructorName);
+        if (destructor == nullptr)
+        {
+            LLVMBackend::TypeAndValue voidReturn{ .TypeName = "void" };
+            LLVMBackend::DeclTypeAndValue thisParam;
+            thisParam.TypeName = pending.mangledName;
+            thisParam.VariableName = pending.mangledName + "__";
+            thisParam.Pointer = true;
+            compiler->CreateFunctionDeclaration(destructorName, voidReturn, { thisParam });
+            destructor = compiler->GetFunction(destructorName);
+        }
+        if (destructor != nullptr) compiler->RegisterDestructor(pending.mangledName, destructor);
 }
 
 void MainListener::PromotePointerOnlyInstantiation(const std::string& mangledName)
@@ -1135,7 +1188,8 @@ void MainListener::DrainWaitingPointerInstance(const std::string& mangledName)
 {
         bool waiting = false;
         for (auto& pending : pendingInstantiations)
-            if (pending.mangledName == mangledName && PendingWaitsOnStructBody(pending))
+            if (pending.mangledName == mangledName && pending.pointerOnly
+                && PendingWaitsOnStructBody(pending))
             {
                 pending.pointerOnly = false;
                 waiting = true;
@@ -1179,6 +1233,7 @@ void MainListener::QueuePendingInstantiation(const std::string& templateName,
             record.originColumn = site->getStart()->getCharPositionInLine();
             record.site = site;
         }
+        PrepareDeferredCoreUniqueLayout(record);
         pendingInstantiations.push_back(std::move(record));
     }
 

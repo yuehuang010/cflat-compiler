@@ -1,0 +1,38 @@
+import cpp "cpp_t261_named_unwind.hpp";
+import cpp "cpp_interop_arrayelem.h";
+
+expect_error("union member 'member' has non-trivial C++ type 't261.Counted'; C++ class members with non-trivial special members in unions are not yet supported") {
+    union T440Direct { t261.Counted member; int tag; };
+}
+
+expect_error("union member 'items' has non-trivial C++ type 't261.Counted'; C++ class members with non-trivial special members in unions are not yet supported") {
+    union T440Array { t261.Counted[2] items; int tag; };
+}
+
+struct T440Holder { t261.Counted item; };
+expect_error("union member 'holder' has non-trivial C++ type 't261.Counted'; C++ class members with non-trivial special members in unions are not yet supported") {
+    union T440Nested { T440Holder holder; int tag; };
+}
+
+expect_error("union member 'item' has non-trivial C++ type 'cppa.CtorOnly'; C++ class members with non-trivial special members in unions are not yet supported") {
+    union T440DefaultCtor { cppa.CtorOnly item; int tag; };
+}
+
+expect_error("union member 'forward' has non-trivial C++ type 't261.Counted'; C++ class members with non-trivial special members in unions are not yet supported") {
+    union T440ForwardHolder { T440Later forward; int tag; };
+    struct T440Later { t261.Counted item; };
+}
+
+expect_error("union member 'nested' has non-trivial C++ type 't261.Counted'; C++ class members with non-trivial special members in unions are not yet supported") {
+    union T440ForwardNested { T440NestedLater nested; int tag; };
+    struct T440NestedLater { T440NestedInner inner; };
+    struct T440NestedInner { t261.Counted item; };
+}
+
+struct T440GenericHolder<T> { T item; };
+expect_error("union member 'generic' has non-trivial C++ type 't261.Counted'; C++ class members with non-trivial special members in unions are not yet supported") {
+    union T440ForwardGeneric { T440GenericHolder<T440GenericLater> generic; int tag; };
+    struct T440GenericLater { t261.Counted item; };
+}
+
+extern int main() { return 0; }

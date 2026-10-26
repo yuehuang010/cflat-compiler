@@ -5292,6 +5292,7 @@ void LLVMBackend::ResetForReanalysis()
     currentCastOccurrence_ = 0;
     nextCastOccurrence_ = 1;
     owningTempUniqueFields_.clear();
+    owningTempRawPointerFields_.clear();
     launderedTempUniqueFields_.clear();
     pendingLaunderTempUniqueFields_.clear();
     dataValueCodeCasts_.clear();

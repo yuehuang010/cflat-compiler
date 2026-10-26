@@ -3605,7 +3605,7 @@ they still apply under `=0`. Cost: the first compile after any rebuild is cold; 
 - `p2/statement-temp-escapes-via-out-param-or-global`: refuse void*/unrelated pointer joins in every context (call, decl, assign, return); explicit cast required, matches clang.
 - `p3/union-cxx-field-brace-init-constructs-nothing`: refuse non-trivial C++ class members in CFlat unions for now (NYI refusal).
 - `p3/method-on-global-receiver-consumes-field`: implicit consume of a this-field is refused in EVERY method; `move p` required. Count in-tree sites first.
-- `p3/alias-of-call-result-field-leaks-owner`: refuse a raw pointer local bound into an owning call-result temporary's field; diagnostic steers to `alias`.
+- `p3/alias-of-call-result-field-leaks-owner`: refuse a raw pointer local bound into an owning call-result temporary's field; diagnostic steers to `alias`. LANDED T426 (4cbfcc72a, 94fa8e75d): applies to ANY raw pointer read or field address of an owning temp (the compiler cannot tell where a pointer field points), incl. pointer arithmetic; this supersedes the 312d202de allowance for a non-unique pointer field of a temp (`.borrow`). Main-session interpretation - maintainer may narrow.
 - `p3/alias-return-byvalue-param-leftovers-after-b21`: refuse `alias string[]`, `alias string?`, alias of a using-alias of string (resolved on the type); generic alias T stays legal.
 - `p3/cpp-return-named-local-implicit-move-and-byvalue-elision`: C++20 parity - return of a named local / by-value param tries the && overload first.
 - `p3/chained-assign-raw-inner-into-unique-refused`: ternary into a unique behaves like if/else (declaration and assignment, selected arm consumed); borrow-returning calls refused on assignment like the declaration.

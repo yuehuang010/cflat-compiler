@@ -1,7 +1,0 @@
-# P3: C++ constructor refusal text gaps left after W11
-
-Summary: W11 (2026-09-30) keeps a C++ constructor whose body fails to instantiate as an ordinary clang candidate (revalidated with an empty body) and refuses it with the clang: text only where it is selected; refusal keyed on clang's own mangled name. Two text-only gaps remain, both pre-existing on master. T99 (2026-10-10): item 1 fixed (clang: prefix at the implicit default ctor site, leg err_cpp_default_member_init_clang_prefix.cb); item 2 open. Probes: scratch/repro_keep/w11/ (rev18 = h18.h + probes + oracle o.cpp; rev13 = h1.h + run.sh).
-
-2. A constructor TEMPLATE whose body fails names the wrong overload: `template<class U> F(U x) { U::nope; }` + `F(double)`, `rv.F<int>(i)` refuses with "the overload C++ selects, rv.F<int>(double), needs an implicit integer <-> floating conversion"; clang selects F<int>(int) and reports "type 'int' cannot be used prior to '::'" (rev13 p_F). Refusing is correct; only the text is wrong. Constructor templates are outside the W11 poison path.
-
-Status 2026-10-10 (T99): item 2 open. A probe-path prefix change at RequestGeneratedCxxWrapperUncached gave the clang text but broke ~12 pinned legs (double "clang: " at consumers), so reverted. The wrong text comes from the ctor-overload selection in LLVMBackend_CInterop.cpp (blockedWhy, "the overload C++ selects") picking F(double) as the survivor while the ctor template F<int>(int) is not considered as a failed-body candidate.

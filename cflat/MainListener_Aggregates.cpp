@@ -874,6 +874,77 @@ void MainListener::exitTranslationUnit(CFlatParser::TranslationUnitContext*)
         ProcessDeferredGenericMemberBodies();
 }
 
+std::string MainListener::FindNontrivialCxxTypeForUnionMember(
+    const LLVMBackend::DeclTypeAndValue& field,
+    std::unordered_set<std::string>& incompleteTypes)
+{
+    if (field.Pointer || field.ElemPointer || field.IsArrayView) return {};
+    auto* compiler = Compiler();
+    std::unordered_set<std::string> seen;
+    std::function<std::string(const std::string&)> findNontrivialCxxType;
+    findNontrivialCxxType = [&](const std::string& typeName) -> std::string {
+        if (compiler->HasNontrivialCxxSpecialMembersForUnion(typeName)) return typeName;
+        if (!seen.insert(typeName).second) return {};
+        auto data = compiler->dataStructures.find(typeName);
+        if (data == compiler->dataStructures.end()) return {};
+        if (data->second.StructType == nullptr || data->second.StructType->isOpaque())
+        {
+            incompleteTypes.insert(typeName);
+            return {};
+        }
+        for (const auto& nested : data->second.StructFields)
+        {
+            if (nested.Pointer || nested.ElemPointer || nested.IsArrayView
+                || nested.IsSimd || nested.IsBitfield || nested.IsPadding)
+                continue;
+            std::string found = findNontrivialCxxType(nested.TypeName);
+            if (!found.empty()) return found;
+        }
+        return {};
+    };
+    return findNontrivialCxxType(field.TypeName);
+}
+
+void MainListener::RecheckPendingNontrivialCxxUnionMembers(const std::string& completedTypeName)
+{
+    auto* compiler = Compiler();
+    for (size_t i = 0; i < pendingNontrivialCxxUnionMembers_.size();)
+    {
+        auto& pending = pendingNontrivialCxxUnionMembers_[i];
+        if (pending.IncompleteTypes.count(completedTypeName) == 0)
+        {
+            ++i;
+            continue;
+        }
+        std::unordered_set<std::string> incompleteTypes;
+        const std::string nontrivialType = FindNontrivialCxxTypeForUnionMember(
+            pending.Field, incompleteTypes);
+        if (!nontrivialType.empty())
+        {
+            const PendingNontrivialCxxUnionMember report = pending;
+            pendingNontrivialCxxUnionMembers_.erase(std::remove_if(
+                pendingNontrivialCxxUnionMembers_.begin(), pendingNontrivialCxxUnionMembers_.end(),
+                [&](const auto& item) {
+                    return item.UnionName == report.UnionName
+                        && item.UnionContext == report.UnionContext;
+                }), pendingNontrivialCxxUnionMembers_.end());
+            LogErrorContext(report.Context, std::format(
+                "union member '{}' has non-trivial C++ type '{}'; C++ class members with "
+                "non-trivial special members in unions are not yet supported",
+                report.Field.VariableName,
+                SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = nontrivialType })));
+            return;
+        }
+        if (!incompleteTypes.empty())
+        {
+            pending.IncompleteTypes = std::move(incompleteTypes);
+            ++i;
+            continue;
+        }
+        pendingNontrivialCxxUnionMembers_.erase(pendingNontrivialCxxUnionMembers_.begin() + i);
+    }
+}
+
 void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& nameOverride, const std::string& namespaceName) {
         ResolvedMembersScope memberScope_(resolvedMembers_, (const void*)ctx);
         auto* compiler = Compiler(ctx);
@@ -1077,7 +1148,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
 
         // Arm the union-member rejection for `unique` (ValidateUniqueField). Placed after the
         // nested definitions above so an inner body is never judged by the enclosing body's kind.
-        UnionFieldDeclGuard unionCtx(inUnionFieldDecl_, ctx->Union() != nullptr);
+        const bool isUnion = ctx->Union() != nullptr;
+        UnionFieldDeclGuard unionCtx(inUnionFieldDecl_, isUnion);
 
         auto declarationList = MemberDeclarations(ctx);
         std::vector<llvm::Type*> types;
@@ -1095,6 +1167,34 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
 
         // Build field list, expanding pack fields (T... fieldName -> fieldName_0, fieldName_1, ...)
         std::vector<LLVMBackend::DeclTypeAndValue> declList;
+        auto rejectNontrivialCxxUnionMember = [&](const LLVMBackend::DeclTypeAndValue& field,
+                                                   antlr4::ParserRuleContext* fieldCtx) {
+            if (!isUnion || field.Pointer || field.ElemPointer || field.IsArrayView) return;
+            std::unordered_set<std::string> incompleteTypes;
+            const std::string nontrivialType = FindNontrivialCxxTypeForUnionMember(field, incompleteTypes);
+            if (nontrivialType.empty())
+            {
+                if (!incompleteTypes.empty())
+                {
+                    auto found = std::find_if(pendingNontrivialCxxUnionMembers_.begin(),
+                        pendingNontrivialCxxUnionMembers_.end(), [&](const auto& pending) {
+                            return pending.UnionName == structName
+                                && pending.Field.VariableName == field.VariableName
+                                && pending.Context == fieldCtx
+                                && pending.UnionContext == ctx;
+                        });
+                    if (found == pendingNontrivialCxxUnionMembers_.end())
+                        pendingNontrivialCxxUnionMembers_.push_back({
+                            structName, field, fieldCtx, ctx, std::move(incompleteTypes) });
+                }
+                return;
+            }
+            LogErrorContext(fieldCtx, std::format(
+                "union member '{}' has non-trivial C++ type '{}'; C++ class members with "
+                "non-trivial special members in unions are not yet supported",
+                field.VariableName,
+                SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = nontrivialType })));
+        };
         auto rejectFixedArrayMemberPrototype = [&](CFlatParser::DeclarationContext* decl) {
             auto* specs = decl->declarationSpecifiers();
             if (specs == nullptr || decl->initDeclaratorList() == nullptr) return;
@@ -1139,7 +1239,10 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             if (packParamName.empty())
             {
                 for (auto& f : ParseDeclarationList({decl}))
+                {
+                    rejectNontrivialCxxUnionMember(f, decl);
                     declList.push_back(f);
+                }
                 continue;
             }
 
@@ -1159,6 +1262,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 for (auto& f : expanded)
                 {
                     f.VariableName = baseFieldName + "_" + std::to_string(i);
+                    rejectNontrivialCxxUnionMember(f, decl);
                     declList.push_back(f);
                 }
             }
@@ -1183,6 +1287,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 for (auto& f : ParseDeclarationList({decl}))
                 {
                     f.GuardedBy = guardianName;
+                    rejectNontrivialCxxUnionMember(f, decl);
                     declList.push_back(f);
                 }
             }
@@ -1216,7 +1321,6 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         // Build the struct body before opening the constructor function so that
         // GetFunctionType can resolve the (sized) return type.  Initializer
         // expressions are evaluated later inside the constructor body.
-        bool isUnion = (ctx->Union() != nullptr);
         if (isCppStruct && isUnion)
         {
             Compiler(ctx)->LogErrorMessage("[cpp] struct cannot be a union");
@@ -1317,6 +1421,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 structType->setBody(llvm::ArrayRef<llvm::Type*>());
             compiler->FlushPendingFunctionDeclarations();
         }
+        RecheckPendingNontrivialCxxUnionMembers(structName);
         if (compiler->IsVerbose())
             std::cout << "[verbose]     create default ctor: " << structName << "\n";
         LLVMBackend::TypeAndValue returnType{
@@ -1327,6 +1432,34 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         // instantiation pulled in by the flush can resolve calls back into this
         // type's methods to a forward declaration. See PreDeclareInstantiationMembers.
         auto functionList = MemberFunctionDefinitions(ctx);
+        bool deferUniqueDeleteBodies = false;
+        if (compiler->IsCoreUniqueType(structName))
+        {
+            TypeSpelling spelling;
+            if (DemangleType(*compiler, structName, spelling) && !spelling.args.empty())
+            {
+                auto pointee = compiler->dataStructures.find(MangleType(*compiler, spelling.args[0]));
+                deferUniqueDeleteBodies = pointee != compiler->dataStructures.end()
+                    && pointee->second.StructType != nullptr && pointee->second.StructType->isOpaque();
+            }
+        }
+        auto hasDeleteExpression = [](antlr4::ParserRuleContext* member)
+        {
+            std::function<bool(antlr4::tree::ParseTree*)> findDelete = [&](antlr4::tree::ParseTree* node)
+            {
+                if (dynamic_cast<CFlatParser::DeleteExpressionContext*>(node) != nullptr) return true;
+                if (node == nullptr) return false;
+                for (auto* child : node->children)
+                    if (findDelete(child)) return true;
+                return false;
+            };
+            return findDelete(member);
+        };
+        auto needsDeferredMemberBody = [&](antlr4::ParserRuleContext* member)
+        {
+            return GenericMemberNeedsDeferredBody(member)
+                || (deferUniqueDeleteBodies && hasDeleteExpression(member));
+        };
         if (!nameOverride.empty())
             PreDeclareInstantiationMembers(compiler, functionList, baseName, structName, returnType);
         // Flush any nested generic instantiations queued while parsing field declarations,
@@ -2330,7 +2463,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     bool suppliesNoArgCtor = !isUnion && !hasBareNoArgCtor
                         && AllParametersDefaulted(func->parameterTypeList());
                     const size_t ctorIndex = isCppStruct ? cppCtorIndex++ : SIZE_MAX;
-                    if (!nameOverride.empty() && GenericMemberNeedsDeferredBody(func))
+                    if (!nameOverride.empty() && needsDeferredMemberBody(func))
                         DeferGenericMemberBody(func, ctx, structName,
                             DeferredGenericMemberKind::Constructor, {}, suppliesNoArgCtor,
                             ctorIndex, hasExplicitNoArgCtor);
@@ -2364,7 +2497,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     Compiler()->gts.genericFunctionValueDefaults[qualifiedName] = valueDefaults;
                     genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
                 }
-                else if (!nameOverride.empty() && GenericMemberNeedsDeferredBody(func))
+                else if (!nameOverride.empty() && needsDeferredMemberBody(func))
                     DeferGenericMemberBody(func, ctx, structName,
                         DeferredGenericMemberKind::Function,
                         (funcName == "operator new" || funcName == "operator delete"
@@ -2393,7 +2526,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     if (func->declarationSpecifiers() == nullptr && getFunctionName(func) == baseName)
                         Compiler(func)->LogError(std::format(
                             "constructor '{}' is not allowed inside a lock field group", baseName));
-                    else if (!nameOverride.empty() && GenericMemberNeedsDeferredBody(func))
+                    else if (!nameOverride.empty() && needsDeferredMemberBody(func))
                         DeferGenericMemberBody(func, ctx, structName,
                             DeferredGenericMemberKind::Function);
                     else
@@ -2463,7 +2596,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             for (auto dtor : MemberDestructorDefinitions(ctx))
             {
                 global_scope = false;
-                if (!nameOverride.empty() && GenericMemberNeedsDeferredBody(dtor))
+                if (!nameOverride.empty() && needsDeferredMemberBody(dtor))
                     DeferGenericMemberBody(dtor, ctx, structName,
                         DeferredGenericMemberKind::Destructor);
                 else
@@ -4950,6 +5083,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         if (structType->isOpaque())
             structType->setBody(llvm::ArrayRef<llvm::Type*>());
         compiler->FlushPendingFunctionDeclarations();
+        RecheckPendingNontrivialCxxUnionMembers(structName);
         // Record validated type-level annotations for annotationof(Type,"Ann") queries.
         compiler->SetTypeAnnotations(structName, classAnnotations);
         if (compiler->IsVerbose())

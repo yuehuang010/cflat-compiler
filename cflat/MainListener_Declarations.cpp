@@ -542,8 +542,9 @@ void MainListener::ApplyVectorizeFpTier(LLVMBackend* compiler, VectorizeFpTier t
  * which still resolves to void* wherever CFlat needs the type itself. Shared by every
  * type-argument site, both declaration-specifier passes included.
  */
-std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryContext* entry) {
-        std::string resolved = ResolveTypeArgEntryRaw(entry);
+std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryContext* entry,
+                                               bool pointerOnly) {
+        std::string resolved = ResolveTypeArgEntryRaw(entry, pointerOnly);
         if (resolved == "void*" && entry->typeSpecifier() != nullptr && entry->pointer() == nullptr
             && entry->arrayTypeSuffix() == nullptr)
         {
@@ -553,7 +554,8 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
         return resolved;
 }
 
-std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntryContext* entry) {
+std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntryContext* entry,
+                                                  bool pointerOnly) {
         if (entry->shiftExpression() != nullptr && entry->typeSpecifier() == nullptr)
         {
             auto folded = FoldCompileTimeInt(Compiler(entry), entry->shiftExpression());
@@ -627,7 +629,7 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
             // Nested generic (e.g., Box<T>): recurse into each type argument
             std::vector<std::string> innerArgs;
             for (auto* innerEntry : innerParams->typeParameterList()->typeParameterEntry())
-                innerArgs.push_back(ResolveTypeArgEntry(innerEntry));
+                innerArgs.push_back(ResolveTypeArgEntry(innerEntry, pointerOnly));
             ResolveEnumTypeArguments(innerArgs);
             const std::string spelledInnerBase = innerBase;
             auto* innerCompiler = Compiler(innerParams);
@@ -655,7 +657,7 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
             // outer instantiation's element type resolves to nothing and codegen
             // reports "unknown type '<inner>'". Recursion above queues the deepest
             // levels first, so inner types are registered before the outer.
-            QueueGenericInstantiation(innerBase, innerArgs, resolved, entry);
+            QueueGenericInstantiation(innerBase, innerArgs, resolved, entry, pointerOnly);
             // A qualified base is an imported winmd generic - build it through the winmd path.
             if (innerBase.find('.') != std::string::npos)
                 Compiler()->InstantiateWinrtGenericInterface(innerBase, innerArgs, resolved);
@@ -785,6 +787,20 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
                         !member.empty())
                         resolved = member;
             }
+            bool nestedInTupleElement = false;
+            for (antlr4::tree::ParseTree* parent = entry; parent != nullptr; parent = parent->parent)
+                if (dynamic_cast<CFlatParser::TupleTypeEntryContext*>(parent) != nullptr)
+                {
+                    nestedInTupleElement = true;
+                    break;
+                }
+            if (nestedInTupleElement && typeSpec != nullptr
+                && typeSpec->genericIdentifier() != nullptr
+                && typeSpec->genericIdentifier()->genericTypeParameters() == nullptr
+                && !Compiler(entry)->IsKnownTypeName(resolved)
+                && !Compiler(entry)->IsTypeArgTypeKey(resolved))
+                LogErrorContext(entry, Compiler(entry)->LocalizeMessage(
+                    "unknown type '{}'", { resolved }));
             // A function-type alias (using IntFn = Lambda<int(int)>) used as a generic arg resolves
             // to the SAME encoded closure type as the direct spelling (canonicalization / gap a).
             if (!hasArrayView)
@@ -861,7 +877,7 @@ std::string MainListener::ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntry
                 if (!cxxUniqueError.empty()) LogCxxErrorContext(entry, cxxUniqueError);
                 if (!cxxUniqueType.empty()) return cxxUniqueType;
                 std::string uniqueType = MangledGenericName("unique", { uniqueBase });
-                QueueGenericInstantiation("unique", { uniqueBase }, uniqueType);
+                QueueGenericInstantiation("unique", { uniqueBase }, uniqueType, entry, pointerOnly);
                 return uniqueType;
             }
             LogErrorContext(entry, std::format(
@@ -915,6 +931,25 @@ void MainListener::QueueGenericInstantiation(const std::string& baseName,
             : ResolveGenericTemplateBaseAtScope(compiler, baseName, scope, site, baseName);
         const std::string resolvedName = resolvedBase == baseName ? mangledName
             : MangleGenericInstance(*compiler, resolvedBase, typeArgs);
+        const bool isStructOrClass = genericStructTemplates.count(resolvedBase)
+            || genericClassTemplates.count(resolvedBase);
+        // A nested generic under core unique is only a pointee until unique's destructor is emitted.
+        if (isStructOrClass && !pointerOnly && site != nullptr)
+            for (antlr4::tree::ParseTree* node = site; node != nullptr; node = node->parent)
+                if (auto* typeSpec = dynamic_cast<CFlatParser::TypeSpecifierContext*>(node))
+                {
+                    std::string ownerSpelling;
+                    auto* ownerParams = GenericSpecOf(typeSpec, ownerSpelling);
+                    if (ownerParams == nullptr) continue;
+                    const std::string ownerScope = EnclosingAggregateScopeFromContext(compiler, ownerParams);
+                    const std::string ownerBase = ResolveGenericTemplateBaseAtScope(
+                        compiler, ownerSpelling, ownerScope, ownerParams, ownerSpelling);
+                    if (compiler->IsCoreUniqueTemplate(ownerBase))
+                    {
+                        pointerOnly = true;
+                        break;
+                    }
+                }
 #ifndef NDEBUG
         TypeSpelling spelling;
         if (DemangleType(*compiler, resolvedName, spelling))
@@ -933,7 +968,6 @@ void MainListener::QueueGenericInstantiation(const std::string& baseName,
             if (!pointerOnly) PromotePointerOnlyInstantiation(resolvedName);
             return;
         }
-        bool isStructOrClass = genericStructTemplates.count(resolvedBase) || genericClassTemplates.count(resolvedBase);
         bool isInterface = genericInterfaceTemplates.count(resolvedBase);
         if (!isStructOrClass && !isInterface)
             return;
@@ -974,7 +1008,7 @@ std::string MainListener::ResolveSigComponentCodegen(
             ResolveEnumTypeArguments(innerArgs);
             Compiler(ts)->CompleteCxxTemplateTypeArgs(baseName, innerArgs);
             std::string mangled = MangledGenericName(baseName, innerArgs);
-            QueueGenericInstantiation(baseName, innerArgs, mangled, ts);
+            QueueGenericInstantiation(baseName, innerArgs, mangled, ts, outPointer);
             // A local-enum argument was deferred by the pre-scan; the signature needs the layout now.
             if (Compiler(ts)->AnyGenericTypeTemplateNamed(baseName))
                 QueueAndProcessLocalEnumInstantiation(ts->genericIdentifier()->genericTypeParameters(),
@@ -1007,6 +1041,12 @@ std::string MainListener::ResolveSigComponentConstCodegen(
     CFlatParser::MultiWordTypeSuffixContext* suffix, bool preserveAliasReferentConst,
     std::string* aliasSpelling) {
         constMask = 0;
+        if (ts != nullptr && ts->tupleTypeSpecifier() != nullptr)
+        {
+            outPointer = stars > 0;
+            return SignatureComponentAliasBase(Compiler(ts),
+                ParseTupleTypeSpecifier(ts->tupleTypeSpecifier()));
+        }
         if (ts != nullptr && ts->typeName() != nullptr)
         {
             auto nested = ParseTypeName(ts->typeName(), true, ts);
@@ -1415,6 +1455,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     }
                     else
                     {
+                        auto elementContext = TupleTypeElementContext(tts);
                         for (auto* entry : tts->tupleTypeEntry())
                         {
                             // `(T[], ...)` element is a noalias array-view member; `[N]`/`[]*` are not.
@@ -1423,47 +1464,10 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                     "tuple element; a sized 'T[N]', an unsized multi-dimensional "
                                     "'T[][]' and a pointer-to-array 'T[]*' are not");
                             PrimitiveTypeError argError;
-                            std::string argName;
-                            if (auto* nested = entry->typeSpecifier()->tupleTypeSpecifier())
-                                argName = ParseTupleTypeSpecifier(nested);
-                            else
-                                argName = CanonicalTypeSpecifierText(
-                                    entry->typeSpecifier(), entry->multiWordTypeSuffix(), false, &argError);
+                            std::string argName = ResolveTupleTypeElementArgName(
+                                elementContext, entry, &argError);
                             if (HasPrimitiveTypeError(argError))
                                 LogErrorContext(entry, LocalizePrimitiveTypeError(Compiler(), argError));
-                            int argDepth = PointerDepthOf(entry->pointer());
-                            bool argView = IsArrayViewArg(entry);
-                            // On a view the written stars decorate the ELEMENT: `(int*[], int)`.
-                            int argElemDepth = argView ? argDepth : 0;
-                            if (argView) argDepth = 0;
-                            // Apply active type substitutions (e.g. T -> int inside generic body); a
-                            // substituted arg may itself carry "*"/"[]" (e.g. T bound to "int[]").
-                            auto substIt = activeTypeSubstitutions.find(argName);
-                            if (substIt != activeTypeSubstitutions.end())
-                            {
-                                argName = substIt->second;
-                                PeelTypeArgSuffix(argName, argDepth, argView, nullptr,
-                                                  &argElemDepth);
-                            }
-                            else
-                            {
-                                // Same namespace walk as a generic type ARGUMENT (a substituted arg
-                                // is already resolved in the caller's scope - never re-resolve it).
-                                argName = Compiler(entry)->ResolveTypeArgBaseName(argName);
-                                // One key per type: `(IP, int)` folds to `(int*, int)`.
-                                FoldPointerAliasArg(Compiler(entry), argName,
-                                                    argView ? argElemDepth : argDepth);
-                            }
-                            // `T*` on a substituted VIEW decays to the element pointer, exactly as
-                            // the generic type-argument and declarator arms do.
-                            if (argView && !IsArrayViewArg(entry) && PointerDepthOf(entry->pointer()) > 0)
-                            {
-                                argView = false;
-                                argDepth = argElemDepth + PointerDepthOf(entry->pointer());
-                                argElemDepth = 0;
-                            }
-                            if (argView) argName += std::string(argElemDepth, '*') + "[]";
-                            else if (argDepth > 0) argName += std::string(argDepth, '*');
                             typeArgs.push_back(argName);
                         }
                     }
@@ -1746,7 +1750,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         bool isKnownTemplate = genericStructTemplates.count(baseName) || genericClassTemplates.count(baseName);
                         if (isKnownTemplate)
                         {
-                            QueuePendingInstantiation(baseName, typeArgs, mangledName, genParams);
+                            QueuePendingInstantiation(baseName, typeArgs, mangledName, genParams,
+                                                      IsPointerOnlyTypeUse(typeSpec));
                             instantiatedGenerics.insert(mangledName);
                             auto* c = Compiler();
                             if (!c->GetDataStructure(mangledName).StructType)
@@ -3436,6 +3441,8 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
         std::string targetDecorated = targetBase + std::string(targetPointerDepth, '*');
         for (uint64_t dim : targetArrayDims)
             targetDecorated += "[" + std::to_string(dim) + "]";
+        const bool pointerOnly = targetPointerDepth > 0
+            || (ctx->pointer() != nullptr && ctx->pointer()->Star().size() > 0);
 
         // A name that only becomes a type once its <...> arguments are supplied.
         auto IsGenericTemplateName = [&](const std::string& n) {
@@ -3453,7 +3460,7 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
             const std::string spelledBase = baseName;
             std::vector<std::string> typeArgs;
             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
-                typeArgs.push_back(ResolveTypeArgEntry(entry));
+                typeArgs.push_back(ResolveTypeArgEntry(entry, pointerOnly));
             ResolveEnumTypeArguments(typeArgs);
             const std::string enclosingScope = !structScopeStack.empty() ? structScopeStack.back()
                 : EnclosingAggregateScopeFromContext(compiler, genParams);
@@ -3479,7 +3486,7 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
             {
                 // CFlat generic: enqueue the instantiation (shell + default ctor created
                 // immediately, body emitted by the next ProcessPendingInstantiations).
-                QueueGenericInstantiation(baseName, typeArgs, mangledName, genParams);
+                QueueGenericInstantiation(baseName, typeArgs, mangledName, genParams, pointerOnly);
                 QueueAndProcessLocalEnumInstantiation(
                     genParams, baseName, typeArgs, mangledName, genParams);
             }
@@ -4557,7 +4564,8 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         const std::string receiverBody = RecordReceiverScan(compiler, func, name, returnType, allParams,
                                                             varargs, SinkIfConstEvaluator());
         auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external,
-            varargs, line, returnsOwned, !structName.empty(), returnType.CallConv, bodyLine, linkageName);
+            varargs, line, returnsOwned, !structName.empty(), returnType.CallConv, bodyLine,
+            linkageName, func->getStart()->getCharPositionInLine());
 
         // CreateFunctionDefinition returns the existing function (without setting up
         // a fresh entry block) when a matching definition was already emitted by a
@@ -5202,15 +5210,39 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseForDec
 std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclaration(CFlatParser::DeclarationContext* ctx, const std::string& namespaceName) {
         DiagnoseBraceListsUnder(ctx);
         RegisterLexicalStructNamesInDeclaration(Compiler(ctx), ctx);
+        auto* blockItem = dynamic_cast<CFlatParser::BlockItemContext*>(ctx->parent);
+        auto* blockList = blockItem != nullptr
+            ? dynamic_cast<CFlatParser::BlockItemListContext*>(blockItem->parent) : nullptr;
         // Handle enum declarations which use the enumSpecifier alternative in the grammar
         if (auto enumSpec = ctx->enumSpecifier())
         {
+            auto* id = enumSpec->Identifier();
+            if (id != nullptr && blockItem != nullptr && blockList != nullptr)
+            {
+                const std::string name = id->getText();
+                const auto prior = FindLexicalBlockBinding(blockList, blockItem, name);
+                if (prior.HasVisibleValue || LexicalBodyHasValueParameter(blockList, name))
+                    LogErrorContext(id, std::format("'{}' names a type, not a value.", name));
+            }
             ParseEnumSpecifier(enumSpec, namespaceName);
             return {};
         }
 
         auto declSpec = ctx->declarationSpecifiers();
         auto initDecl = ctx->initDeclaratorList();
+        if (blockItem != nullptr && blockList != nullptr && initDecl != nullptr)
+            for (auto* init : initDecl->initDeclarator())
+            {
+                auto* declarator = init->declarator();
+                if (declarator == nullptr || declarator->parameterTypeList() != nullptr) continue;
+                auto* id = LexicalDirectDeclaratorIdentifier(declarator->directDeclarator());
+                if (id != nullptr && Compiler(ctx)->HasLexicalLocalTypeName(id->getText())
+                    && LexicalBlockHasPriorEnum(blockList, blockItem, id->getText()))
+                {
+                    const std::string name = id->getText();
+                    LogErrorContext(id, std::format("'{}' names a type, not a value.", name));
+                }
+            }
         return ParseDeclaration(declSpec, initDecl, namespaceName);
     }
 
@@ -9201,7 +9233,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // Same escape with a dtor-LESS pointee. Skipped at global scope,
                                 // where the compile-time-constant message is the truer one.
                                 if (!global_scope)
-                                    GuardOwningTempUniqueFieldEscape(rightNV, "a local", assignmentExpression);
+                                {
+                                    GuardOwningTempUniqueFieldEscape(
+                                        rightNV, "a local", assignmentExpression);
+                                    GuardRawPointerIntoOwningTempField(rightNV, typeAndValue,
+                                        true, typeAndValue.IsAlias || bindAliasReference,
+                                        declaratorName, assignmentExpression);
+                                }
                                 srcIsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
                                 genericFuncCallerName = rightNV.CallerName;
                                 // A copy of a holder carrying a bonded closure escapes the tracking:
@@ -11635,7 +11673,15 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         alloc, typeAndValue.TypeName, localInitList);
                                 if (!emittedFreshBrace
                                     && !TryEmitContainerInitializer(alloc, typeAndValue, localInitList))
-                                    EmitFieldInitializer(alloc, typeAndValue.TypeName, localInitList);
+                                {
+                                    if (!freshBraceInit && right != nullptr
+                                        && right->getType()->isStructTy())
+                                        EmitConstructedFieldOverrides(
+                                            alloc, typeAndValue.TypeName, localInitList);
+                                    else
+                                        EmitFieldInitializer(alloc, typeAndValue.TypeName, localInitList,
+                                                             freshBraceInit);
+                                }
                             }
                         }
 
@@ -12257,6 +12303,33 @@ bool MainListener::IsOwningTempUniqueFieldEscape(const LLVMBackend::NamedVariabl
         return compilerLLVM != nullptr
             && compilerLLVM->JoinCarriesOwningTempUniqueField(nv.Primary);
     }
+
+bool MainListener::IsOwningTempRawPointerFieldEscape(
+        const LLVMBackend::NamedVariable& nv) const {
+        if (!nv.TypeAndValue.Pointer || nv.TypeAndValue.IsUnique) return false;
+        return (nv.FromOwningTempField && nv.OwningTempParent)
+            || (compilerLLVM != nullptr
+                && compilerLLVM->JoinCarriesOwningTempRawPointerField(nv.Primary));
+}
+
+void MainListener::GuardRawPointerIntoOwningTempField(
+        const LLVMBackend::NamedVariable& source,
+        const LLVMBackend::TypeAndValue& destinationType,
+        bool destinationIsLocal, bool destinationIsAlias,
+        const std::string& destinationName,
+        antlr4::ParserRuleContext* ctx) {
+        const bool destinationIsRawPointer = destinationType.Pointer
+            || (destinationType.TypeName == "auto" && source.TypeAndValue.Pointer);
+        if (!destinationIsLocal || destinationIsAlias || ctx == nullptr
+            || !destinationIsRawPointer || destinationType.IsUnique
+            || destinationType.IsAlias || destinationType.IsArrayView
+            || !IsOwningTempRawPointerFieldEscape(source))
+            return;
+        LogErrorContext(ctx, std::format(
+            "cannot bind raw pointer '{}' to a field pointer from an owning temporary; it is "
+            "destroyed at the end of the statement - declare it 'alias' to extend the temporary's lifetime",
+            destinationName));
+}
 
 bool MainListener::DeclaredOwningTempUniqueFieldRead(const LLVMBackend::NamedVariable& nv) {
         if (!nv.FromOwningTempField || !nv.OwningTempParent) return false;

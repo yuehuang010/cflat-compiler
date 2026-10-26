@@ -10,6 +10,7 @@ std::string ForwardRefScanner::ResolveTupleTypeSpecifier(
 {
         if (tupleSpec == nullptr) return {};
         auto* compiler = Compiler(tupleSpec);
+        auto elementContext = TupleTypeElementContext(tupleSpec);
         std::vector<std::string> typeArgs;
         if (auto* packEntry = tupleSpec->tupleTypePackEntry())
         {
@@ -18,16 +19,16 @@ std::string ForwardRefScanner::ResolveTupleTypeSpecifier(
                 packEntry->typeSpecifier(), packEntry->multiWordTypeSuffix(), false, &packError);
             if (HasPrimitiveTypeError(packError))
                 compiler->LogError(LocalizePrimitiveTypeError(compiler, packError));
+            if (auto it = scanTypeSubstitutions_.find(packName); it != scanTypeSubstitutions_.end())
+                packName = it->second;
             typeArgs.push_back(compiler->ResolveTypeArgBaseName(packName));
         }
         else
         {
             for (auto* entry : tupleSpec->tupleTypeEntry())
             {
-                if (auto* nested = entry->typeSpecifier()->tupleTypeSpecifier())
-                    ResolveTupleTypeSpecifier(nested);
                 PrimitiveTypeError argError;
-                typeArgs.push_back(TupleEntryArgName(compiler, entry, &argError));
+                typeArgs.push_back(ResolveTupleTypeElementArgName(elementContext, entry, &argError));
                 if (HasPrimitiveTypeError(argError))
                     compiler->LogError(LocalizePrimitiveTypeError(compiler, argError));
             }
@@ -48,6 +49,97 @@ std::string ForwardRefScanner::ResolveTupleTypeSpecifier(
         compiler->CreateFunctionDeclaration(tupleName, rt, {});
         compiler->gts.tupleTypeArgs[tupleName] = typeArgs;
         return tupleName;
+    }
+
+TupleTypeElementResolveContext ForwardRefScanner::TupleTypeElementContext(
+    antlr4::ParserRuleContext* site)
+{
+        auto* compiler = Compiler(site);
+        const std::string namespaceName = compiler->GetCurrentNamespace();
+        std::unordered_set<std::string> localTypes;
+        for (antlr4::tree::ParseTree* parent = site; parent != nullptr; parent = parent->parent)
+            if (auto* function = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent))
+            {
+                localTypes = CollectFunctionLocalEnumNames(function);
+                break;
+            }
+        return TupleTypeElementResolveContext{
+            .Compiler = compiler,
+            .Substitutions = &scanTypeSubstitutions_,
+            .Namespace = namespaceName,
+            .LocalTypes = std::move(localTypes),
+            .ResolveType = [this, namespaceName](auto* typeSpec, auto* suffix) {
+                return ResolveTupleTypeElementSpecifier(
+                    typeSpec, suffix, &scanTypeSubstitutions_, namespaceName);
+            }
+        };
+}
+
+std::string ForwardRefScanner::ResolveTupleTypeElementSpecifier(
+    CFlatParser::TypeSpecifierContext* typeSpec,
+    CFlatParser::MultiWordTypeSuffixContext* suffix,
+    const std::unordered_map<std::string, std::string>* substitutions,
+    const std::string& namespaceName)
+{
+        if (typeSpec == nullptr) return {};
+        auto* compiler = Compiler(typeSpec);
+        LLVMBackend::NamespaceScope scope(compiler, namespaceName);
+        if (typeSpec->tupleTypeSpecifier() != nullptr)
+            return ResolveTupleTypeSpecifier(typeSpec->tupleTypeSpecifier());
+        if (typeSpec->functionPointerSpecifier() != nullptr)
+            return EncodeClosureScanner(typeSpec->functionPointerSpecifier());
+        if (typeSpec->typeName() != nullptr)
+        {
+            ConstTypeSyntax shape;
+            if (ResolveConstTypeSpecifierSyntax(compiler, typeSpec, shape, substitutions,
+                    [this](auto* entry) { return ResolveForwardTypeArg(entry); },
+                    [this](auto* member) { return ResolveMemberTypeSpecifier(member); },
+                    [this](auto* tuple) { return ResolveTupleTypeSpecifier(tuple); }))
+                return compiler->ResolveTypeAlias(shape.TypeName)
+                    + std::string(shape.PointerDepth, '*');
+        }
+        std::string base;
+        if (auto* generic = GenericSpecOf(typeSpec, base))
+        {
+            std::vector<std::string> args;
+            for (auto* entry : generic->typeParameterList()->typeParameterEntry())
+                args.push_back(ResolveForwardTypeArg(entry));
+            const std::string spelledBase = base;
+            base = ResolveGenericTemplateSpellingAtUse(
+                compiler, spelledBase, args, typeSpec, spelledBase, false);
+            compiler->CompleteCxxTemplateTypeArgs(base, args);
+            return MangleGenericInstance(*compiler, base, args);
+        }
+        if (auto* member = typeSpec->memberTypeSpecifier())
+            return ResolveMemberTypeSpecifier(member);
+
+        PrimitiveTypeError error;
+        base = CanonicalTypeSpecifierText(typeSpec, suffix, false, &error);
+        if (HasPrimitiveTypeError(error))
+            compiler->LogError(LocalizePrimitiveTypeError(compiler, error));
+        bool substituted = false;
+        if (substitutions != nullptr)
+            if (auto it = substitutions->find(base); it != substitutions->end())
+            {
+                base = it->second;
+                substituted = true;
+            }
+        if (!substituted)
+        {
+            if (std::string enumName = compiler->ResolveEnumTypeName(base); !enumName.empty())
+                return enumName;
+            for (antlr4::tree::ParseTree* parent = typeSpec; parent != nullptr; parent = parent->parent)
+                if (auto* function = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent))
+                {
+                    if (CollectFunctionLocalEnumNames(function).count(base) != 0) return base;
+                    break;
+                }
+            if (std::string scannedEnum = compiler->ResolveScannedEnumTypeName(base);
+                !scannedEnum.empty())
+                return scannedEnum;
+            return compiler->ResolveTypeAlias(compiler->ResolveTypeArgBaseName(base));
+        }
+        return base;
     }
 
 std::string ForwardRefScanner::ResolveGenericTemplateBaseAtUse(
@@ -425,11 +517,14 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     else
                     {
                         // Pre-pass copy: request a foreign C++ specialization so a field or
-                        // parameter of that type has a real layout. A failure is SILENT here - the
-                        // pre-pass has not yet seen every CFlat template, so the second pass is
-                        // the only place that can tell a miss from a not-yet-declared generic.
+                        // parameter of that type has a real layout. Other failures stay silent:
+                        // only the second pass can distinguish a miss from a later CFlat template.
                         std::string cxxError;
                         compiler->TryRequestCxxType(baseName, typeArgs, mangledName, cxxError);
+                        // A define-group ODR mismatch is final even during the pre-pass; preserve
+                        // its diagnostic instead of falling through to the unknown-type error.
+                        if (cxxError.find("violates the C++ ODR") != std::string::npos)
+                            Compiler(genParams)->LogError(cxxError);
                     }
                     declType.TypeName = mangledName;
                 }
@@ -1673,6 +1768,12 @@ std::string ForwardRefScanner::ResolveSigComponentConstScanner(
     CFlatParser::MultiWordTypeSuffixContext* suffix, bool preserveAliasReferentConst,
     std::string* aliasSpelling) {
         constMask = 0;
+        if (ts != nullptr && ts->tupleTypeSpecifier() != nullptr)
+        {
+            outPointer = stars > 0;
+            return SignatureComponentAliasBase(compilerLLVM,
+                ResolveTupleTypeSpecifier(ts->tupleTypeSpecifier()));
+        }
         if (ts != nullptr && ts->typeName() != nullptr)
         {
             ConstTypeSyntax shape;
@@ -2313,14 +2414,14 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx,
                         if (tts->tupleTypePackEntry() == nullptr)
                         {
                             std::vector<std::string> typeArgs;
+                            auto elementContext = TupleTypeElementContext(tts);
                             bool allArgsResolveAsTypes = true;
                             for (auto* entry : tts->tupleTypeEntry())
                             {
                                 auto* compiler = Compiler(tts);
-                                if (auto* nested = entry->typeSpecifier()->tupleTypeSpecifier())
-                                    ResolveTupleTypeSpecifier(nested);
                                 PrimitiveTypeError argError;
-                                std::string argName = TupleEntryArgName(compiler, entry, &argError);
+                                std::string argName = ResolveTupleTypeElementArgName(
+                                    elementContext, entry, &argError);
                                 if (HasPrimitiveTypeError(argError))
                                     compiler->LogError(LocalizePrimitiveTypeError(compiler, argError));
                                 if (entry->typeSpecifier()->simdTypeSpecifier() == nullptr

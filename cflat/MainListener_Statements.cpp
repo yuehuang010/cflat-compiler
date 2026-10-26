@@ -5986,7 +5986,7 @@ void MainListener::GenerateDefaultParamOverloads(
                     {
                         auto* alloca = compiler->CreateAlloca(defaultVal->getType());
                         compiler->CreateAssignment(defaultVal, alloca);
-                        EmitFieldInitializer(alloca, params[i].TypeName, initList);
+                        EmitConstructedFieldOverrides(alloca, params[i].TypeName, initList);
                         defaultVal = compiler->CreateLoad(alloca);
                     }
                 }

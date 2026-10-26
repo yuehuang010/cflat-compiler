@@ -1,0 +1,34 @@
+struct Wrap<T> { T* v = nullptr; int size() { return 1; } };
+
+struct MethodHolder { unique<Wrap<MethodS2>> u = default; };
+expect_error("sizeof/alignof: type 'MethodS2' is incomplete") {
+    // Resolve size through the forwarded pointer before the explicit incomplete-type use.
+    int EarlyMethod(MethodHolder* h) {
+        int result = h->u->size();
+        return (int)sizeof(MethodS2) + result;
+    }
+}
+struct MethodS2 { int a = 0; };
+
+struct FieldHolder { unique<Wrap<FieldS2>> u = default; };
+expect_error("sizeof/alignof: type 'FieldS2' is incomplete") {
+    // Resolve v through the forwarded pointer before the explicit incomplete-type use.
+    int EarlyField(FieldHolder* h) {
+        FieldS2* value = h->u->v;
+        return (int)sizeof(FieldS2) + (value == nullptr ? 0 : 1);
+    }
+}
+struct FieldS2 { int a = 0; };
+
+struct ValueHolder { unique<Wrap<ValueS2>> u = default; };
+expect_error("sizeof/alignof: type 'ValueS2' is incomplete") {
+    // Exercise the same member lookup with a by-value Holder receiver.
+    int EarlyValueMethod() {
+        ValueHolder h = default;
+        int result = h.u->size();
+        return (int)sizeof(ValueS2) + result;
+    }
+}
+struct ValueS2 { int a = 0; };
+
+int main() { return 0; }

@@ -298,3 +298,6 @@ struct SubLC { int operator[](long) { return 8; } int operator[](int) const { re
 struct SubDIL : SubIL {};
 struct SubDLI : SubLI {};
 }
+
+// T434: a global-namespace function template, named as a value from CFlat.
+template <class T> T proxy_twice_tpl(T x) { return x * 2; }

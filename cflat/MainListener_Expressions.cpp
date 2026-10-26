@@ -5010,6 +5010,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     !namedVar.TypeAndValue.Pointer && compiler->IsCxxRecord(namedVar.TypeAndValue.TypeName));
                 return ParseAssignmentExpressionNamed(assignCtx);
             }();
+            if (!namedVar.TypeAndValue.IsFunctionPointer && rightNV.GenericFunctionValue
+                && rightNV.Primary == nullptr && !rightNV.CallerName.empty())
+                rightNV.Primary = compiler->GetFunctionForFuncPtr(rightNV.CallerName);
             const bool explicitMoveClosureBind = assignCtx != nullptr
                 && assignCtx->unaryExpression() != nullptr
                 && assignCtx->unaryExpression()->moveExpression() != nullptr;
@@ -6968,6 +6971,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 && (llvm::isa<llvm::AllocaInst>(destination)
                     || llvm::isa<llvm::GlobalVariable>(destination))
                 && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName)
+                && !namedVar.TypeAndValue.Pointer
                 && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx,
                     rightNV.IsElementAccess && !rightNV.MovePathHasDynamicIndex
                         && IsUniqueFieldRead(rightNV)))
@@ -7675,6 +7679,22 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 // 'return finishStore' was: insurance if LogErrorContext ever stopped throwing.
                 GuardOwningTempUniqueFieldEscape(rightNV, "a longer-lived location", ctx);
                 if (IsOwningTempUniqueFieldEscape(rightNV)) return finishStore(right);
+                const auto* destinationBinding = compiler->FindVariableByStorage(destination);
+                if (!destIsStructField && namedVar.FieldName.empty()
+                    && destinationBinding != nullptr)
+                {
+                    const std::string destinationName = !namedVar.CallerName.empty()
+                        ? namedVar.CallerName
+                        : !destinationBinding->TypeAndValue.VariableName.empty()
+                            ? destinationBinding->TypeAndValue.VariableName
+                            : destinationBinding->CallerName;
+                    GuardRawPointerIntoOwningTempField(rightNV,
+                        destinationBinding->TypeAndValue,
+                        true,
+                        namedVar.TypeAndValue.IsAlias || namedVar.IsAliasBorrow
+                            || destinationBinding->IsAliasBorrow || destIsAliasBorrowLocal,
+                        destinationName, ctx);
+                }
             }
 
             // A named owner or program-lifetime string source copies into the field. Field borrows
@@ -21828,6 +21848,15 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                         "cannot take the address of bitfield '{}' - bitfields are not byte-addressable",
                         namedVar.FieldName));
                 }
+                if (!namedVar.Storage && namedVar.IsUnresolvedGenericFunctionTemplate)
+                {
+                    auto* identifier = GenericFunctionValueIdentifier(castExpCtx, true);
+                    const std::string functionName = identifier != nullptr
+                        ? identifier->getText() : namedVar.CallerName;
+                    LogErrorContext(ctx, std::format(
+                        "cannot take the address of generic function '{}' without explicit type arguments; "
+                        "bind it to a function<...> of the wanted type so they are deduced", functionName));
+                }
                 if (!namedVar.Storage && !namedVar.CallerName.empty())
                 {
                     if (namedVar.Primary == nullptr)
@@ -22968,6 +22997,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
 std::string MainListener::ParseTupleTypeSpecifier(
     CFlatParser::TupleTypeSpecifierContext* tupleSpec) {
         auto* compiler = Compiler(tupleSpec);
+        auto elementContext = TupleTypeElementContext(tupleSpec);
         std::vector<std::string> typeArgs;
         if (tupleSpec->tupleTypePackEntry() != nullptr)
         {
@@ -22985,12 +23015,18 @@ std::string MainListener::ParseTupleTypeSpecifier(
         {
             for (auto* entry : tupleSpec->tupleTypeEntry())
             {
-                if (auto* nested = entry->typeSpecifier()->tupleTypeSpecifier())
-                    ParseTupleTypeSpecifier(nested);
                 PrimitiveTypeError argError;
-                std::string argName = TupleEntryArgName(compiler, entry, &argError);
+                std::string argName = ResolveTupleTypeElementArgName(
+                    elementContext, entry, &argError);
                 if (HasPrimitiveTypeError(argError))
                     LogErrorContext(entry, LocalizePrimitiveTypeError(compiler, argError));
+                auto* typeSpec = entry->typeSpecifier();
+                if (typeSpec != nullptr && typeSpec->genericIdentifier() != nullptr
+                    && typeSpec->genericIdentifier()->genericTypeParameters() == nullptr
+                    && !compiler->IsKnownTypeName(argName)
+                    && !compiler->IsTypeArgTypeKey(argName))
+                    LogErrorContext(entry, compiler->LocalizeMessage(
+                        "unknown type '{}'", { argName }));
                 typeArgs.push_back(std::move(argName));
             }
         }
@@ -22998,6 +23034,84 @@ std::string MainListener::ParseTupleTypeSpecifier(
         tupleTypeArgs[tupleName] = typeArgs;
         EnsureTupleInstantiated(tupleName);
         return tupleName;
+    }
+
+TupleTypeElementResolveContext MainListener::TupleTypeElementContext(
+    antlr4::ParserRuleContext* site)
+{
+        auto* compiler = Compiler(site);
+        const std::string namespaceName = compiler->GetCurrentNamespace();
+        std::unordered_set<std::string> localTypes;
+        for (antlr4::tree::ParseTree* parent = site; parent != nullptr; parent = parent->parent)
+            if (auto* function = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent))
+            {
+                localTypes = FunctionLocalEnumNames(function);
+                break;
+            }
+        return TupleTypeElementResolveContext{
+            .Compiler = compiler,
+            .Substitutions = &activeTypeSubstitutions,
+            .Namespace = namespaceName,
+            .LocalTypes = std::move(localTypes),
+            .ResolveType = [this, namespaceName](auto* typeSpec, auto* suffix) {
+                return ResolveTupleTypeElementSpecifier(
+                    typeSpec, suffix, &activeTypeSubstitutions, namespaceName);
+            }
+        };
+}
+
+std::string MainListener::ResolveTupleTypeElementSpecifier(
+    CFlatParser::TypeSpecifierContext* typeSpec,
+    CFlatParser::MultiWordTypeSuffixContext* suffix,
+    const std::unordered_map<std::string, std::string>* substitutions,
+    const std::string& namespaceName)
+{
+        if (typeSpec == nullptr) return {};
+        auto* compiler = Compiler(typeSpec);
+        LLVMBackend::NamespaceScope scope(compiler, namespaceName);
+        if (typeSpec->tupleTypeSpecifier() != nullptr)
+            return ParseTupleTypeSpecifier(typeSpec->tupleTypeSpecifier());
+        if (typeSpec->functionPointerSpecifier() != nullptr)
+            return EncodeClosureCodegen(typeSpec->functionPointerSpecifier());
+        std::string genericBase;
+        if (auto* generic = GenericSpecOf(typeSpec, genericBase))
+        {
+            std::vector<std::string> args;
+            for (auto* entry : generic->typeParameterList()->typeParameterEntry())
+                args.push_back(ResolveTypeArgEntry(entry));
+            ResolveEnumTypeArguments(args);
+            const std::string spelledBase = genericBase;
+            const std::string enclosingScope = !structScopeStack.empty() ? structScopeStack.back()
+                : EnclosingAggregateScopeFromContext(compiler, generic);
+            genericBase = ResolveGenericTemplateSpellingAtScope(
+                compiler, spelledBase, args, enclosingScope, generic, spelledBase, true);
+            compiler->CompleteCxxTemplateTypeArgs(genericBase, args);
+            std::string resolved = MangledGenericName(genericBase, args);
+            if (!compiler->AnyGenericTypeTemplateNamed(genericBase))
+            {
+                std::string cxxError;
+                if (!compiler->TryRequestCxxType(genericBase, args, resolved, cxxError)
+                    && !cxxError.empty())
+                    LogCxxErrorContext(typeSpec, cxxError);
+                resolved = compiler->ResolveTypeAlias(resolved);
+            }
+            if (!compiler->AnyGenericTypeTemplateNamed(genericBase)
+                || !QueueAndProcessLocalEnumInstantiation(
+                    generic, genericBase, args, resolved, typeSpec))
+                QueueGenericInstantiation(genericBase, args, resolved, typeSpec);
+            return resolved;
+        }
+        if (typeSpec->typeName() != nullptr)
+        {
+            ConstTypeSyntax shape;
+            if (ResolveConstTypeSyntax(compiler, typeSpec->typeName(), shape, substitutions,
+                    [this](auto* entry) { return ResolveTypeArgEntry(entry); },
+                    [this](auto* member) { return ResolveMemberTypeSpecifier(member); },
+                    [this](auto* tuple) { return ParseTupleTypeSpecifier(tuple); }))
+                return compiler->ResolveTypeAlias(shape.TypeName)
+                    + std::string(shape.PointerDepth, '*');
+        }
+        return compiler->ResolveTypeAlias(ParseTypeSpecifierName(typeSpec, suffix));
     }
 
 std::string MainListener::ParseTypeSpecifierName(
@@ -25337,8 +25451,33 @@ void MainListener::EmitFieldInitializer(
         CFlatParser::InitializerListContext* ctx,
         bool destinationIsFresh,
         const std::string* onlyField,
-        bool deferForeignReplacementDrop) {
+        bool deferForeignReplacementDrop,
+        llvm::Value* completedObjectSlot,
+        const std::string* completedObjectType) {
     auto* compiler = Compiler(ctx);
+        bool completedObjectActive = completedObjectSlot != nullptr
+            && completedObjectType != nullptr;
+        auto suspendCompletedObject = [&]() {
+            if (!completedObjectActive) return;
+            auto& entries = compiler->unwindPartial_;
+            for (auto entry = entries.rbegin(); entry != entries.rend(); ++entry)
+                if (entry->K == LLVMBackend::UnwindPartialEntry::Kind::Slot
+                    && entry->V == completedObjectSlot
+                    && entry->TypeName == *completedObjectType)
+                {
+                    entries.erase(std::next(entry).base());
+                    completedObjectActive = false;
+                    return;
+                }
+        };
+        auto resumeCompletedObject = [&]() {
+            if (completedObjectActive || completedObjectSlot == nullptr
+                || completedObjectType == nullptr)
+                return;
+            compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot,
+                                        completedObjectSlot, *completedObjectType);
+            completedObjectActive = true;
+        };
     auto spellTypeName = [&](const std::string& name) {
         return SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = name });
     };
@@ -25619,7 +25758,8 @@ void MainListener::EmitFieldInitializer(
                                                     nestedDestination, nestedField.TypeName);
                     else
                         EmitFieldInitializer(nestedDestination, nestedField.TypeName, nested,
-                                             nestedFresh);
+                                             nestedFresh, nullptr, false,
+                                             completedObjectSlot, completedObjectType);
                     continue;
                 }
 
@@ -25829,9 +25969,16 @@ void MainListener::EmitFieldInitializer(
                     "value may not be copied or moved into the aggregate (initialize the field in place)",
                     fieldName, SpellDiagnosticType(*compiler, rightNV.TypeAndValue)));
             }
-            if (loweredMoveField && EmitDeferredLoweredMoveIntoField(
+            bool emittedLoweredMove = false;
+            if (loweredMoveField)
+            {
+                suspendCompletedObject();
+                emittedLoweredMove = EmitDeferredLoweredMoveIntoField(
                     loweredMoveSlot, initField->TypeName, rightNV, fieldMoveExpr,
-                    destinationIsFresh, ownedTempMark))
+                    destinationIsFresh, ownedTempMark);
+                resumeCompletedObject();
+            }
+            if (emittedLoweredMove)
             {
                 compiler->EndCastOccurrence(savedCastOcc);
                 continue;
@@ -25892,10 +26039,30 @@ void MainListener::EmitFieldInitializer(
             }
             rightNV.CastOccurrenceId = thisCastOcc;
             compiler->EndCastOccurrence(savedCastOcc);
+            suspendCompletedObject();
             EmitOneFieldInit(structPtr, sd, typeName, fieldName, rightNV, ownedTempMark, fi,
                              destinationIsFresh, deferForeignReplacementDrop);
+            resumeCompletedObject();
         }
     }
+
+void MainListener::EmitConstructedFieldOverrides(
+        llvm::Value* structPtr,
+        const std::string& typeName,
+        CFlatParser::InitializerListContext* ctx) {
+        auto* compiler = Compiler(ctx);
+        if (compiler->HasNonTrivialDestructor(typeName))
+        {
+            // The default constructor completed, so a later override may unwind through the full object.
+            LLVMBackend::UnwindPartialScope completedObject(*compiler);
+            compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Slot,
+                                        structPtr, typeName);
+            EmitFieldInitializer(structPtr, typeName, ctx, false, nullptr, false,
+                                 structPtr, &typeName);
+            return;
+        }
+        EmitFieldInitializer(structPtr, typeName, ctx);
+}
 
 void MainListener::CoerceElementToString(
         LLVMBackend* compiler,

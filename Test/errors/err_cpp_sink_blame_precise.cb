@@ -1,4 +1,5 @@
 import cpp "cpp_interop_sink_blame.h";
+import cpp "cpp_interop_sink_blame_second.h";
 
 // A deleted-copy diagnostic is reported only when clang's error names the argument's own copy
 // constructor; any other instantiation failure keeps its own text.
@@ -21,6 +22,18 @@ extern int main()
     expect_error("member 'h' of C++ class 'sbl.Shared<int>' cannot be instantiated") {
         sbl.Shared<int> s = default;
         int a = s.h();
+    }
+    expect_error("(clang: type 'int' cannot be used prior to '::' because it has no members)") {
+        sbl2.Shared<int> s = default;
+        int a = s.h();
+    }
+    expect_error("(clang: type 'int' cannot be used prior to '::' because it has no members)") {
+        sbl2.Shared<int> s = default;
+        int b = s.h2();
+    }
+    expect_error("(clang: cannot initialize a variable of type 'int' with an lvalue of type 'const char[4]')") {
+        sbl2.Shared<int> s = default;
+        int c = s.h3();
     }
     expect_error("member 'h2' of C++ class 'sbl.Shared<int>' cannot be instantiated") {
         sbl.Shared<int> s = default;

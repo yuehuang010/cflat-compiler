@@ -1297,6 +1297,14 @@ std::string LLVMBackend::ResolveEnumTypeName(const std::string& spelled) const
         return {};
 }
 
+std::string LLVMBackend::ResolveScannedEnumTypeName(const std::string& spelled) const
+{
+        return FirstVisibleScopedKey(spelled,
+            [this](const std::string& candidate) {
+                return gts.scannedNonLocalEnumNames.count(candidate) != 0;
+            }, ScopedLookupOptions{ .ResolveFirstComponentAlias = false });
+}
+
 bool LLVMBackend::IsGenericLocalEnumKey(const std::string& key) const
 {
         // Local enum keys include their owner (`fn@line:col.Enum`); keep them out of
@@ -3479,6 +3487,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
                 }
             if (j.contains("classTemplateNames"))
                 entry.classTemplateNames = j["classTemplateNames"].to_string_vector();
+            if (j.contains("variableTemplateNames"))
+                entry.variableTemplateNames = j["variableTemplateNames"].to_string_vector();
             if (j.contains("classTemplateSpecializations"))
                 entry.classTemplateSpecializations = j["classTemplateSpecializations"].to_string_vector();
             if (j.contains("cxxGroupNamespaces"))
@@ -3933,6 +3943,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         }
         j["classTemplates"] = std::move(classTemplates);
         j["classTemplateNames"] = entry.classTemplateNames;
+        j["variableTemplateNames"] = entry.variableTemplateNames;
         j["classTemplateSpecializations"] = entry.classTemplateSpecializations;
         if (!entry.cxxGroupNamespaces.empty()) j["cxxGroupNamespaces"] = entry.cxxGroupNamespaces;
         nlohmann::json enums = nlohmann::json::array();

@@ -233,6 +233,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         s.dataValues          = std::move(dataValues_);
         s.codeValueDataCasts  = std::move(codeValueDataCasts_);
         s.owningTempUniqueFields = std::move(owningTempUniqueFields_);
+        s.owningTempRawPointerFields = std::move(owningTempRawPointerFields_);
         s.launderedTempUniqueFields = std::move(launderedTempUniqueFields_);
         s.pendingLaunderTempUniqueFields = std::move(pendingLaunderTempUniqueFields_);
         s.dataValueCodeCasts  = std::move(dataValueCodeCasts_);
@@ -271,6 +272,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         dataValues_.clear();
         codeValueDataCasts_.clear();
         owningTempUniqueFields_.clear();
+        owningTempRawPointerFields_.clear();
         launderedTempUniqueFields_.clear();
         pendingLaunderTempUniqueFields_.clear();
         dataValueCodeCasts_.clear();
@@ -324,6 +326,7 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         dataValues_             = state.dataValues;
         codeValueDataCasts_     = state.codeValueDataCasts;
         owningTempUniqueFields_ = state.owningTempUniqueFields;
+        owningTempRawPointerFields_ = state.owningTempRawPointerFields;
         launderedTempUniqueFields_ = state.launderedTempUniqueFields;
         pendingLaunderTempUniqueFields_ = state.pendingLaunderTempUniqueFields;
         dataValueCodeCasts_     = state.dataValueCodeCasts;
@@ -3053,13 +3056,20 @@ std::string LLVMBackend::SourceFileLeaf(const std::string& path)
     }
 
 void LLVMBackend::DiagnoseDuplicateFunctionBody(const std::string& functionName,
-        const std::string& mangledName, size_t line) const
+        const std::string& mangledName, size_t line, size_t column,
+        bool isMethod, bool isConstMethod) const
 {
         auto it = functionBodyOrigin_.find(mangledName);
         if (it == functionBodyOrigin_.end()) return;
-        const std::string& firstFile = it->second.first;
-        size_t firstLine = it->second.second;
-        if (line == 0 || firstLine == 0 || firstLine == line) return;
+        const FunctionBodyOrigin& first = it->second;
+        const std::string& firstFile = first.file;
+        if (line == 0 || first.line == 0) return;
+        if (line == first.line
+            && (column == std::string::npos || first.column == std::string::npos)) return;
+        const std::string currentFile = SourceFileLeaf(sourceFileName);
+        const bool sameFileLine = first.file == currentFile && first.line == line;
+        if (sameFileLine && first.column == column) return;
+        if (sameFileLine && isMethod && first.isMethod && first.isConstMethod != isConstMethod) return;
         // A namespaced extern keeps its bare C symbol, so two namespaces can collide on it.
         if (functionName != mangledName && functionName.find('.') != std::string::npos
             && mangledName.find_first_of(".$") == std::string::npos)
@@ -3067,13 +3077,13 @@ void LLVMBackend::DiagnoseDuplicateFunctionBody(const std::string& functionName,
             LogErrorMessage("extern '{}' defines the C symbol '{}', which is already defined at {}({}); "
                 "an extern function keeps its unqualified C name inside a namespace",
                 { SpellFunctionSymbol(*this, functionName), mangledName, firstFile,
-                  std::to_string(firstLine) });
+                  std::to_string(first.line) });
             return;
         }
         LogErrorMessage("redefinition of '{}' - the same overload is already defined at "
             "{}({}). Two parameter lists that differ only in a SPELLING of one type ('int' and "
             "'i32' name the same type) are one overload, not two.",
-            { SpellFunctionSymbol(*this, functionName), firstFile, std::to_string(firstLine) });
+            { SpellFunctionSymbol(*this, functionName), firstFile, std::to_string(first.line) });
     }
 
 bool LLVMBackend::OverloadSlotIsDefined(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType,
@@ -3084,12 +3094,12 @@ bool LLVMBackend::OverloadSlotIsDefined(const std::string& functionName, const L
         auto* fn = module->getFunction(mangledName);
         if (fn == nullptr || !FunctionHasDefinition(fn)) return false;
         auto it = functionBodyOrigin_.find(mangledName);
-        if (originFile) *originFile = it != functionBodyOrigin_.end() ? it->second.first : std::string();
-        if (originLine) *originLine = it != functionBodyOrigin_.end() ? it->second.second : 0;
+        if (originFile) *originFile = it != functionBodyOrigin_.end() ? it->second.file : std::string();
+        if (originLine) *originLine = it != functionBodyOrigin_.end() ? it->second.line : 0;
         return true;
     }
 
-llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external, bool varargs, size_t line, bool returnsOwned, bool isMethod, CallingConv callConv, size_t scopeLine, const std::string& linkageName)
+llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external, bool varargs, size_t line, bool returnsOwned, bool isMethod, CallingConv callConv, size_t scopeLine, const std::string& linkageName, size_t column)
 {
         // A signature parked during the scan must reach the function table before this body
         // (and its call sites) are emitted.
@@ -3172,12 +3182,15 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
             }
         }
         bool alreadyDeclared = false;
+        const bool isConstMethod = isMethod && !arguments.empty()
+            && (arguments.front().ConstMask & 1u) != 0;
 
         if (fn != nullptr)
         {
             if (FunctionHasDefinition(fn))
             {
-                DiagnoseDuplicateFunctionBody(functionName, mangledName, line);
+                DiagnoseDuplicateFunctionBody(functionName, mangledName, line, column,
+                                              isMethod, isConstMethod);
                 if (verbose) std::cout << std::format("[verbose] skipping duplicate definition of '{}'\n", functionName);
                 return fn;
             }
@@ -3191,7 +3204,8 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
 
         // The slot this definition claims. Overwritten while the proto is still body-less, so the
         // recorded origin is always the definition that actually attaches a body first.
-        functionBodyOrigin_[mangledName] = { SourceFileLeaf(currentSourceFilePath_), line };
+        functionBodyOrigin_[mangledName] = {
+            SourceFileLeaf(sourceFileName), line, column, isMethod, isConstMethod };
 
         // CFlat treats null pointer dereferences as defined behavior (hardware fault -> SEH).
         // Ensure the attribute is set even on pre-declared functions that skipped createFunctionProto.

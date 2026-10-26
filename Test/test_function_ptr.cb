@@ -6162,11 +6162,43 @@ function<T(T)> t201PickT<T>() { return t201Twice<T>; }
 Lambda<int(int)> t201RetL() { return t201Twice<int>; }
 int t201Apply(function<int(int)> f, int v) { return f(v); }
 
+namespace T434Qualified
+{
+    int plain(int x) { return x + 4; }
+    T dbl<T>(T x) { return x * 2; }
+}
+function<int(int)> t434GlobalFunction = t201Twice<int>;
+struct T434FunctionHolder { function<int(int)> fn; };
+struct T434GenericMethod
+{
+    T m<T>(T x) { return x + 3; }
+    int invoke() { return this.m<int>(4); }
+};
+
 bool testT201GenericValueSites()
 {
     bool result = true;
     bool gb = t201Twice<int>;                            // a function value is true, like a named one
     result &= Test("generic instance to bool is true", gb ? 1 : 0, 1);
+    bool assigned = false;
+    assigned = t201Twice<int>;
+    result &= Test("generic instance assignment to bool is true", assigned ? 1 : 0, 1);
+    function<int(int)> reassigned = t201Twice<int>;
+    reassigned = t201Twice<int>;
+    result &= Test("generic instance function local assignment", reassigned(5), 10);
+    T434FunctionHolder holder = default;
+    holder.fn = t201Twice<int>;
+    result &= Test("generic instance function field assignment", holder.fn(4), 8);
+    t434GlobalFunction = t201Twice<int>;
+    result &= Test("generic instance global function assignment", t434GlobalFunction(5), 10);
+    function<int(int)> qualifiedGeneric = T434Qualified.dbl<int>;
+    result &= Test("qualified generic instance value", qualifiedGeneric(4), 8);
+    result &= Test("qualified generic instance call", T434Qualified.dbl<int>(5), 10);
+    function<int(int)> qualifiedPlain = T434Qualified.plain;
+    result &= Test("qualified plain function value", qualifiedPlain(3), 7);
+    result &= Test("qualified plain function call", T434Qualified.plain(4), 8);
+    T434GenericMethod method = default;
+    result &= Test("qualified generic method call", method.invoke(), 7);
     result &= Test("generic return into function slot", t201Ret()(4), 8);
     result &= Test("generic return from generic function", t201PickT<int>()(5), 10);
     result &= Test("generic return into Lambda slot", t201RetL()(6), 12);

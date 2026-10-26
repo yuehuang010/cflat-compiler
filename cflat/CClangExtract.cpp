@@ -1462,6 +1462,7 @@ namespace cflat_cinterop
             std::unordered_set<std::string> functionPointerAbiSeen;
             std::unordered_set<const FunctionTemplateDecl*> emittedFunctionTemplates;
             std::unordered_set<std::string> emittedClassTemplateNames;
+            std::unordered_set<std::string> emittedVariableTemplateNames;
             std::unordered_map<std::string, size_t> classTemplateIndices;
             // cxxMode only: (index into out.records, index into that record's members, decl).
             struct MemberAbiWork { size_t recordIdx; size_t memberIdx; const CXXMethodDecl* md; };
@@ -2224,6 +2225,21 @@ namespace cflat_cinterop
                             if (!prior.parameters[i].hasDefault && templateInfo.parameters[i].hasDefault)
                                 prior.parameters[i] = std::move(templateInfo.parameters[i]);
                 }
+                return true;
+            }
+
+            bool VisitVarTemplateDecl(VarTemplateDecl* vtd)
+            {
+                if (!st.req.cxxMode || vtd == nullptr || vtd->isInvalidDecl()
+                    || !vtd->getDeclContext()->isFileContext())
+                    return true;
+                std::string file;
+                int line = 1, col = 0;
+                LocOfRaw(vtd, file, line, col);
+                if (st.req.requireInScope && !st.InScope(file)) return true;
+                const std::string name = CxxQualifiedName(vtd->getTemplatedDecl());
+                if (!name.empty() && st.emittedVariableTemplateNames.insert(name).second)
+                    st.out.variableTemplateNames.push_back(name);
                 return true;
             }
 

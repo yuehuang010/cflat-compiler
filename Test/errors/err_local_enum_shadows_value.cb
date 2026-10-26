@@ -87,3 +87,26 @@ int t371DtorSeen = 0;
 expect_error("'m' names a type, not a value") {
     struct T371DtorShadow { int m = 7; ~T371DtorShadow() { { enum m : int { A = 3 }; t371DtorSeen = m; } } };
 }
+
+expect_error("'n' names a type, not a value") {
+    int t441Parameter(int n) { enum n : int { A = 3 }; return 0; }
+}
+
+expect_error("'n' names a type, not a value") {
+    int t441LocalBeforeEnum() { int n = 7; enum n : int { A = 3 }; return 0; }
+}
+
+expect_error("'n' names a type, not a value") {
+    struct T441CtorParam { int v = 0; T441CtorParam(int n) { enum n : int { A = 3 }; } };
+}
+
+expect_error("'n' names a type, not a value") {
+    int t441EnumBeforeLocal() { enum n : int { A = 3 }; int n = 7; return n; }
+}
+
+expect_error("'n' names a type, not a value") {
+    int t441LambdaParameter() {
+        function<int(int)> target = (int n) => { enum n : int { A = 3 }; return 0; };
+        return target(1);
+    }
+}

@@ -3,6 +3,28 @@ import cpp "../library/cpp_interop_freeoptpl.h";
 import cpp "../library/cpp_interop_define_primary.h";
 import cpp "../library/cpp_interop_define_special.h" define "CFLAT_DEFINE_SPECIAL";
 
+// Exercise the declaration signature path in ForwardRefScanner.
+expect_error("violates the C++ ODR") {
+    int t435_param_pointer(cppd.Layout<long>* p) { return 0; }
+}
+expect_error("violates the C++ ODR") {
+    int t435_param_value(cppd.Layout<long> p) { return 0; }
+}
+expect_error("violates the C++ ODR") {
+    cppd.Layout<long> t435_return_value() {
+        cppd.Layout<long> value = default;
+        return value;
+    }
+}
+expect_error("violates the C++ ODR") {
+    cppd.Layout<long>* t435_return_pointer() { return nullptr; }
+}
+expect_error("violates the C++ ODR") {
+    struct T435MethodOwner {
+        int f(cppd.Layout<long>* p) { return 0; }
+    };
+}
+
 extern int main()
 {
     expect_error("is not a generic type") {

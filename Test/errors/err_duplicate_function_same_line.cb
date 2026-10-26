@@ -1,0 +1,23 @@
+struct T431ConstPair { int get() { return 3; } int get() const { return 7; } };
+
+expect_error("redefinition of") {
+    int t431DupLineFree() { return 1; } int t431DupLineFree() { return 2; }
+}
+
+expect_error("redefinition of") {
+    struct T431DupLineMethod { int get() { return 1; } int get() { return 2; } };
+}
+
+expect_error("redefinition of") {
+    namespace T431DupLineNamespace { int get() { return 1; } int get() { return 2; } }
+}
+
+expect_error("redefinition of") {
+    class T431DupLineClass { int get() { return 1; } int get() { return 2; } };
+}
+
+expect_error("redefinition of") {
+    struct T431DupLineGeneric<T> { T value = default; T get() { return value + 1; } T get() { return value + 2; } };
+    T431DupLineGeneric<int> value;
+    int result = value.get();
+}

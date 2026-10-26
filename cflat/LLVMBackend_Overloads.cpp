@@ -9279,6 +9279,11 @@ LLVMBackend::NamedVariable LLVMBackend::GetThisPointer()
         return {};
     }
 
+bool LLVMBackend::IsCoreUniqueTemplate(const std::string& templateName) const
+{
+        return templateName == "unique" && gts.coreGenericTemplates.count("unique") != 0;
+}
+
 bool LLVMBackend::IsCoreUniqueType(const std::string& typeName) const
 {
         std::string_view base = MangledBase(typeName);
@@ -9286,7 +9291,7 @@ bool LLVMBackend::IsCoreUniqueType(const std::string& typeName) const
             return false;
         // The parser and generic-instantiation queue ask this before the wrapper struct is
         // materialized. The reserved mangling plus the imported core template is sufficient.
-        return gts.coreGenericTemplates.count("unique") != 0;
+        return IsCoreUniqueTemplate(std::string(base));
 }
 
 bool LLVMBackend::IsCoreArrayType(const std::string& typeName) const

@@ -11662,12 +11662,11 @@ int testTempUniqueFieldBorrowAccepts()
         passed += Test("temp_uniq_borrowed_elem_live", l.get(0).t->id, 62);
     }
 
-    // A NON-unique pointer field of an owning temp: the temp's destructor does not free it, so
-    // binding it to a local is legal even though the read carries the temp provenance.
+    // A raw pointer local cannot outlive its owning call-result temp; alias keeps the temp alive.
     podKeeper = new PodItem();
     podKeeper->id = 63;
     {
-        PodItem* borrowed = makePodPair().borrow;
+        alias PodItem* borrowed = makePodPair().borrow;
         passed += Test("temp_plain_field_borrow_value", borrowed->id, 63);
     }
     delete podKeeper;
@@ -15047,10 +15046,76 @@ int testT289CallArgAcceptSet()
     return passed;
 }
 
+struct T425AddrInner { list<int> xs = default; };
+struct T425AddrBox
+{
+    list<int> xs = default;
+    T425AddrInner inner = default;
+    list<int> arr[1] = default;
+    int readThis()
+    {
+        list<int>* p = nullptr;
+        p = &xs;
+        return p->count();
+    }
+};
+
+int t425ReadAssignDirect(T425AddrBox b)
+{
+    list<int>* p = nullptr;
+    p = &b.xs;
+    return p->count();
+}
+
+int t425ReadInitDirect(T425AddrBox b)
+{
+    list<int>* p = &b.xs;
+    return p->count();
+}
+
+int t425ReadAssignNested(T425AddrBox b)
+{
+    list<int>* p = nullptr;
+    p = &b.inner.xs;
+    return p->count();
+}
+
+int t425ReadInitNested(T425AddrBox b)
+{
+    list<int>* p = &b.inner.xs;
+    return p->count();
+}
+
+int t425ReadAssignElement(T425AddrBox b)
+{
+    list<int>* p = nullptr;
+    p = &b.arr[0];
+    return p->count();
+}
+
+int t425ReadInitElement(T425AddrBox b)
+{
+    list<int>* p = &b.arr[0];
+    return p->count();
+}
+
 extern int main()
 {
     int passed = 0;
     int total  = 0;
+
+    T425AddrBox t425Addr = default;
+    t425Addr.xs.add(13);
+    t425Addr.inner.xs.add(17);
+    t425Addr.arr[0].add(19);
+    passed += Test("t425_field_address_assign", t425ReadAssignDirect(t425Addr), 1);
+    passed += Test("t425_field_address_init", t425ReadInitDirect(t425Addr), 1);
+    passed += Test("t425_nested_field_address_assign", t425ReadAssignNested(t425Addr), 1);
+    passed += Test("t425_nested_field_address_init", t425ReadInitNested(t425Addr), 1);
+    passed += Test("t425_array_element_address_assign", t425ReadAssignElement(t425Addr), 1);
+    passed += Test("t425_array_element_address_init", t425ReadInitElement(t425Addr), 1);
+    passed += Test("t425_implicit_this_field_address", t425Addr.readThis(), 1);
+    total += 7;
 
     // A named owner selected by either ternary arm transfers to the move sink; an unselected
     // owner remains live and is still released by its own scope.
@@ -15869,11 +15934,16 @@ extern int main()
     passed += testT388AcceptSet();
     total += 12;
     passed += testT388ArrayFieldConsume();
-    total += 16;
+    total += 17;
     passed += testArrowOwnedTempMember();
-    total += 34;
+    total += 40;
     passed += testT256AliasCallField();
     total += 34;
+    passed += testT429AliasArithmetic();
+    total += 28;
+    total += 12;
+    total += 6;
+    total += 13;
     passed += testT273ForInitScope();
     total += 32;
     passed += testT207RawLaunder();
@@ -16738,13 +16808,13 @@ void t211DerefDecl() { for (int i = 0; i < 1000; i = i + 1) { int k = *t211Mk()-
 void t211DerefCond() { for (int i = 0; i < 1000; i = i + 1) if (*t211Mk()->heap == 3) gT211Sum = gT211Sum + 1; }
 void t211DerefStore() { for (int i = 0; i < 1000; i = i + 1) *t211Mk()->heap = 7; }
 void t211DerefReturn() { for (int i = 0; i < 1000; i = i + 1) gT211Sum = gT211Sum + t211Read(); }
-// Bindings that outlive the statement keep the pre-existing no-free path: the value must survive.
+// A raw pointer local from an owning temp field is rejected; explicit alias extends the owner.
 void t211DerefAliasKept() { for (int i = 0; i < 1000; i = i + 1) { alias int x = *t211Mk()->heap; gT211Sum = gT211Sum + x; } }
 void t211AliasFieldKept() { for (int i = 0; i < 1000; i = i + 1) { alias int x = t211Mk()->v; gT211Sum = gT211Sum + x; } }
 // An index read inside an alias declaration is not what the alias binds: the temp dies.
 int[8] gT211Arr;
 void t211AliasIndex() { gT211Arr[3] = 5; for (int i = 0; i < 1000; i = i + 1) { alias int x = gT211Arr[t211Mk()->v]; gT211Sum = gT211Sum + x; } }
-void t211PointerEscape() { for (int i = 0; i < 1000; i = i + 1) { int* q = t211Mk()->heap; gT211Sum = gT211Sum + *q; } }
+void t211PointerEscape() { for (int i = 0; i < 1000; i = i + 1) { alias int* q = t211Mk()->heap; gT211Sum = gT211Sum + *q; } }
 
 int testArrowOwnedTempMember()
 {
@@ -16823,6 +16893,7 @@ int testArrowOwnedTempMember()
     gT211Dtors = 0; gT211Sum = 0;
     t211PointerEscape();
     passed += Test("t211_pointer_escape_value", gT211Sum, 3000);
+    passed += Test("t211_pointer_escape_dtors", gT211Dtors, 1000);
     return passed;
 }
 
@@ -16861,6 +16932,9 @@ int gT256Fallback = 7;
 int[8] gT256Arr;
 struct T256Res { int v = 3; int* heap = nullptr; ~T256Res() { gT256Dtors = gT256Dtors + 1; v = -999; } };
 unique<T256Res> t256Mk() { T256Res* r = new T256Res(); r->heap = &r->v; return unique<T256Res>(r); }
+int gT256BorrowedValue = 41;
+T256Res gT256BorrowedParent;
+T256Res* t256Borrowed() { gT256BorrowedParent.heap = &gT256BorrowedValue; return &gT256BorrowedParent; }
 struct T256Inner { int v = 3; };
 T256Inner gT256In;
 struct T256Outer { T256Inner* f = nullptr; int v = 3; ~T256Outer() { gT256ODtors = gT256ODtors + 1; v = -999; } };
@@ -16883,6 +16957,15 @@ void t256Break() { for (int i = 0; i < 1000; i = i + 1) { alias int x = t256Mk()
 void t256Continue() { for (int i = 0; i < 1000; i = i + 1) { alias int x = t256Mk()->v; if (i % 2 == 1) continue; gT256Sum = gT256Sum + x; } }
 void t256NestedBlock() { { alias int x = t256Mk()->v; gT256Sum = gT256Sum + x; } if (gT256Dtors != 1) gT256Bad = gT256Bad + 1; }
 void t256PtrAlias() { for (int i = 0; i < 1000; i = i + 1) { alias int* p = t256Mk()->heap; gT256Sum = gT256Sum + *p; } }
+void t256AddressAlias() { alias int* p = &t256Mk()->v; gT256Sum = gT256Sum + *p; }
+void t256ScalarCopy() { int v = t256Mk()->v; gT256Sum = gT256Sum + v; }
+void t256ParenthesizedScalarCopy() { int v = (t256Mk())->v; gT256Sum = gT256Sum + v; }
+void t256ParenthesizedAlias() { alias int x = (t256Mk())->v; gT256Sum = gT256Sum + x; }
+void t256ParenthesizedCompare() { bool equal = (t256Mk())->v == 3; if (equal) gT256Sum = gT256Sum + 1; }
+void t256ParenthesizedStore() { gT256Sum = (t256Mk())->v; }
+void t256ParenthesizedTernary() { int v = true ? (t256Mk())->v : 0; gT256Sum = gT256Sum + v; }
+void t256BorrowedStructPointer() { T256Res* p = t256Borrowed(); gT256Sum = gT256Sum + p->v; }
+void t256BorrowedFieldPointer() { int* p = t256Borrowed()->heap; gT256Sum = gT256Sum + *p; }
 void t256Subscript() { gT256Arr[3] = 3; for (int i = 0; i < 1000; i = i + 1) { alias int x = gT256Arr[t256Mk()->v]; gT256Sum = gT256Sum + x; } }
 void t256TwoDecls() { for (int i = 0; i < 1000; i = i + 1) { alias int x = t256Mk()->v; alias int y = t256MkO()->f->v; gT256Sum = gT256Sum + x + y; } }
 void t256StructAlias() { for (int i = 0; i < 1000; i = i + 1) { alias T256Res r = t256MkO2()->inner; gT256Sum = gT256Sum + r.v; } }
@@ -16929,6 +17012,37 @@ int testT256AliasCallField()
     t256Reset(); t256PtrAlias();
     passed += Test("t256_ptr_alias_dtors", gT256Dtors, 1000);
     passed += Test("t256_ptr_alias_value", gT256Sum, 3000);
+    HeapAudit.enable();
+    i64 addressAliasLeakBase = (i64)HeapAudit.reportLeaks();
+    t256Reset(); t256AddressAlias();
+    passed += Test("t256_address_alias_dtors", gT256Dtors, 1);
+    passed += Test("t256_address_alias_value", gT256Sum, 3);
+    passed += Test("t256_address_alias_no_leak",
+                   (i64)HeapAudit.reportLeaks() - addressAliasLeakBase, (i64)0);
+    t256Reset(); t256ScalarCopy();
+    passed += Test("t256_scalar_copy_dtors", gT256Dtors, 1);
+    passed += Test("t256_scalar_copy_value", gT256Sum, 3);
+    t256Reset(); t256ParenthesizedScalarCopy();
+    passed += Test("t256_paren_scalar_dtors", gT256Dtors, 1);
+    passed += Test("t256_paren_scalar_value", gT256Sum, 3);
+    t256Reset(); t256ParenthesizedAlias();
+    passed += Test("t256_paren_alias_dtors", gT256Dtors, 1);
+    passed += Test("t256_paren_alias_value", gT256Sum, 3);
+    t256Reset(); t256ParenthesizedCompare();
+    passed += Test("t256_paren_compare_dtors", gT256Dtors, 1);
+    passed += Test("t256_paren_compare_value", gT256Sum, 1);
+    t256Reset(); t256ParenthesizedStore();
+    passed += Test("t256_paren_store_dtors", gT256Dtors, 1);
+    passed += Test("t256_paren_store_value", gT256Sum, 3);
+    t256Reset(); t256ParenthesizedTernary();
+    passed += Test("t256_paren_ternary_dtors", gT256Dtors, 1);
+    passed += Test("t256_paren_ternary_value", gT256Sum, 3);
+    t256Reset(); t256BorrowedStructPointer();
+    passed += Test("t256_borrowed_struct_pointer_dtors", gT256Dtors, 0);
+    passed += Test("t256_borrowed_struct_pointer_value", gT256Sum, 3);
+    t256Reset(); t256BorrowedFieldPointer();
+    passed += Test("t256_borrowed_field_pointer_dtors", gT256Dtors, 0);
+    passed += Test("t256_borrowed_field_pointer_value", gT256Sum, 41);
     t256Reset(); t256Subscript();
     passed += Test("t256_subscript_dtors", gT256Dtors, 1000);
     passed += Test("t256_subscript_value", gT256Sum, 3000);
@@ -16946,6 +17060,140 @@ int testT256AliasCallField()
     t256Reset(); t256TernaryCallArm();
     passed += Test("t256_ternary_call_arm_dtors", gT256Dtors, 500);
     passed += Test("t256_ternary_call_arm_value", gT256Sum, 5000);
+    return passed;
+}
+
+int gT429Dtors = 0;
+int gT429Sum = 0;
+int gT429Bad = 0;
+int gT429LocalValue = 0;
+int gT429ParamValue = 0;
+int gT429GlobalValue = 0;
+int[2] gT429GlobalValues;
+int* gT429GlobalPointer = nullptr;
+struct T429Res
+{
+    int v = 6;
+    int[2] values;
+    int* heap = nullptr;
+    ~T429Res() { gT429Dtors = gT429Dtors + 1; values[0] = -999; values[1] = -999; }
+};
+unique<T429Res> t429Mk()
+{
+    T429Res* r = new T429Res();
+    r->values[0] = 3;
+    r->values[1] = 4;
+    r->heap = &r->values[0];
+    return unique<T429Res>(r);
+}
+struct T429AddrRes
+{
+    int v = 6;
+    int[2] values;
+    ~T429AddrRes() { gT429Dtors = gT429Dtors + 1; v = -999; values[0] = -999; values[1] = -999; }
+};
+unique<T429AddrRes> t429AddrMk()
+{
+    T429AddrRes* r = new T429AddrRes();
+    r->values[0] = 3;
+    r->values[1] = 4;
+    return unique<T429AddrRes>(r);
+}
+void t429Reset() { gT429Dtors = 0; gT429Sum = 0; gT429Bad = 0; }
+void t429PlainAlias() { for (int i = 0; i < 10; i = i + 1) { alias int* p = t429Mk()->heap; int marker = i; if (gT429Dtors != i) gT429Bad = gT429Bad + 1; gT429Sum = gT429Sum + *p; } }
+void t429PlusZero() { for (int i = 0; i < 10; i = i + 1) { alias int* p = t429Mk()->heap + 0; int marker = i; if (gT429Dtors != i) gT429Bad = gT429Bad + 1; gT429Sum = gT429Sum + *p; } }
+void t429MinusZero() { for (int i = 0; i < 10; i = i + 1) { alias int* p = t429Mk()->heap - 0; int marker = i; if (gT429Dtors != i) gT429Bad = gT429Bad + 1; gT429Sum = gT429Sum + *p; } }
+void t429AddressSubscript() { for (int i = 0; i < 10; i = i + 1) { alias int* p = &t429Mk()->heap[1]; int marker = i; if (gT429Dtors != i) gT429Bad = gT429Bad + 1; gT429Sum = gT429Sum + *p; } }
+void t429CastArithmetic() { for (int i = 0; i < 10; i = i + 1) { alias int* p = (int*)(t429Mk()->heap + 1); int marker = i; if (gT429Dtors != i) gT429Bad = gT429Bad + 1; gT429Sum = gT429Sum + *p; } }
+void t429ParenReceiver() { for (int i = 0; i < 10; i = i + 1) { alias int* p = (t429Mk())->heap + 0; int marker = i; if (gT429Dtors != i) gT429Bad = gT429Bad + 1; gT429Sum = gT429Sum + *p; } }
+void t429TernaryArm() { for (int i = 0; i < 10; i = i + 1) { alias int* p = (i % 2 == 0) ? t429Mk()->heap + 1 : nullptr; int marker = i; if (gT429Dtors != (i + 1) / 2) gT429Bad = gT429Bad + 1; if (p != nullptr) gT429Sum = gT429Sum + *p; } }
+void t429IndexOnly() { for (int i = 0; i < 10; i = i + 1) { int[2] arr; arr[0] = 8; alias int* p = &arr[t429Mk()->v - 6]; int marker = i; if (gT429Dtors != i + 1) gT429Bad = gT429Bad + 1; gT429Sum = gT429Sum + *p; } }
+void t429ScalarOffsetAfterAddress() { for (int i = 0; i < 10; i = i + 1) { int[2] arr; arr[0] = 8; alias int* p = &arr[0] + (t429Mk()->v - 6); int marker = i; if (gT429Dtors != i + 1) gT429Bad = gT429Bad + 1; gT429Sum = gT429Sum + *p; } }
+void t429ScalarOffsetAfterPointer() { for (int i = 0; i < 10; i = i + 1) { alias int* p = t429Mk()->heap + (t429Mk()->v - 5); int marker = i; if (gT429Dtors != 2 * i + 1) gT429Bad = gT429Bad + 1; gT429Sum = gT429Sum + *p; } }
+void t429AddressFieldPlus() { for (int i = 0; i < 10; i = i + 1) { alias int* p = &t429AddrMk()->v + 0; int marker = i; if (gT429Dtors != i) gT429Bad = gT429Bad + 1; gT429Sum = gT429Sum + *p; } }
+void t429AddressValuesPlus() { for (int i = 0; i < 10; i = i + 1) { alias int* p = &t429AddrMk()->values[0] + 1; int marker = i; if (gT429Dtors != i) gT429Bad = gT429Bad + 1; gT429Sum = gT429Sum + *p; } }
+void t429AddressValuesMinus() { for (int i = 0; i < 10; i = i + 1) { alias int* p = &t429AddrMk()->values[1] - 1; int marker = i; if (gT429Dtors != i) gT429Bad = gT429Bad + 1; gT429Sum = gT429Sum + *p; } }
+void t429DerefAddressValues() { for (int i = 0; i < 10; i = i + 1) { alias int x = *(&t429AddrMk()->values[0] + 1); int marker = i; if (gT429Dtors != i) gT429Bad = gT429Bad + 1; gT429Sum = gT429Sum + x; } }
+void t429NonTempArithmetic(int* value)
+{
+    int[2] localValues;
+    localValues[0] = 9;
+    alias int* local = &localValues[0];
+    alias int* localResult = local + 0;
+    gT429LocalValue = *localResult;
+    alias int* paramResult = value + 0;
+    gT429ParamValue = *paramResult;
+    gT429GlobalValues[0] = 11;
+    gT429GlobalPointer = &gT429GlobalValues[0];
+    alias int* globalResult = gT429GlobalPointer + 0;
+    gT429GlobalValue = *globalResult;
+}
+int testT429AliasArithmetic()
+{
+    int passed = 0;
+    t429Reset(); t429PlainAlias();
+    passed += Test("t429_plain_dtors", gT429Dtors, 10);
+    passed += Test("t429_plain_value", gT429Sum, 30);
+    passed += Test("t429_plain_scope", gT429Bad, 0);
+    t429Reset(); t429PlusZero();
+    passed += Test("t429_plus0_dtors", gT429Dtors, 10);
+    passed += Test("t429_plus0_value", gT429Sum, 30);
+    passed += Test("t429_plus0_scope", gT429Bad, 0);
+    t429Reset(); t429MinusZero();
+    passed += Test("t429_minus0_dtors", gT429Dtors, 10);
+    passed += Test("t429_minus0_value", gT429Sum, 30);
+    passed += Test("t429_minus0_scope", gT429Bad, 0);
+    t429Reset(); t429AddressSubscript();
+    passed += Test("t429_address_subscript_dtors", gT429Dtors, 10);
+    passed += Test("t429_address_subscript_value", gT429Sum, 40);
+    passed += Test("t429_address_subscript_scope", gT429Bad, 0);
+    t429Reset(); t429CastArithmetic();
+    passed += Test("t429_cast_arithmetic_dtors", gT429Dtors, 10);
+    passed += Test("t429_cast_arithmetic_value", gT429Sum, 40);
+    passed += Test("t429_cast_arithmetic_scope", gT429Bad, 0);
+    t429Reset(); t429ParenReceiver();
+    passed += Test("t429_paren_receiver_dtors", gT429Dtors, 10);
+    passed += Test("t429_paren_receiver_value", gT429Sum, 30);
+    passed += Test("t429_paren_receiver_scope", gT429Bad, 0);
+    t429Reset(); t429TernaryArm();
+    passed += Test("t429_ternary_arm_dtors", gT429Dtors, 5);
+    passed += Test("t429_ternary_arm_value", gT429Sum, 20);
+    passed += Test("t429_ternary_arm_scope", gT429Bad, 0);
+    t429Reset(); t429IndexOnly();
+    passed += Test("t429_index_only_dtors", gT429Dtors, 10);
+    passed += Test("t429_index_only_value", gT429Sum, 80);
+    passed += Test("t429_index_only_stmt_end", gT429Bad, 0);
+    t429Reset(); t429ScalarOffsetAfterAddress();
+    passed += Test("t429_scalar_offset_address_dtors", gT429Dtors, 10);
+    passed += Test("t429_scalar_offset_address_value", gT429Sum, 80);
+    passed += Test("t429_scalar_offset_address_stmt_end", gT429Bad, 0);
+    t429Reset(); t429ScalarOffsetAfterPointer();
+    passed += Test("t429_scalar_offset_pointer_dtors", gT429Dtors, 20);
+    passed += Test("t429_scalar_offset_pointer_value", gT429Sum, 40);
+    passed += Test("t429_scalar_offset_pointer_stmt_end", gT429Bad, 0);
+    t429Reset(); t429AddressFieldPlus();
+    passed += Test("t429_address_field_plus_dtors", gT429Dtors, 10);
+    passed += Test("t429_address_field_plus_value", gT429Sum, 60);
+    passed += Test("t429_address_field_plus_scope", gT429Bad, 0);
+    t429Reset(); t429AddressValuesPlus();
+    passed += Test("t429_address_values_plus_dtors", gT429Dtors, 10);
+    passed += Test("t429_address_values_plus_value", gT429Sum, 40);
+    passed += Test("t429_address_values_plus_scope", gT429Bad, 0);
+    t429Reset(); t429AddressValuesMinus();
+    passed += Test("t429_address_values_minus_dtors", gT429Dtors, 10);
+    passed += Test("t429_address_values_minus_value", gT429Sum, 30);
+    passed += Test("t429_address_values_minus_scope", gT429Bad, 0);
+    t429Reset(); t429DerefAddressValues();
+    passed += Test("t429_deref_address_values_dtors", gT429Dtors, 10);
+    passed += Test("t429_deref_address_values_value", gT429Sum, 40);
+    passed += Test("t429_deref_address_values_scope", gT429Bad, 0);
+    int[2] paramValues;
+    paramValues[0] = 13;
+    t429Reset(); t429NonTempArithmetic(&paramValues[0]);
+    passed += Test("t429_local_arithmetic", gT429LocalValue, 9);
+    passed += Test("t429_param_arithmetic", gT429ParamValue, 13);
+    passed += Test("t429_global_arithmetic", gT429GlobalValue, 11);
+    passed += Test("t429_non_temp_dtors", gT429Dtors, 0);
     return passed;
 }
 

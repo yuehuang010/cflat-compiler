@@ -1,0 +1,57 @@
+// Namespace-qualified non-generic names and wrong-count generic names must be rejected
+// at the same publish sites as their bare spellings.
+namespace NsB { int plain(int x) { return x + 4; } }
+namespace NsA { T dbl<T>(T x) { return x * 2; } }
+
+expect_error("'plain' is not a generic function") {
+    int useQualifiedPlainValue() { bool value = NsB.plain<int>; return value ? 1 : 0; }
+}
+
+expect_error("'plain' is not a generic function") {
+    int useQualifiedPlainCall() { return NsB.plain<int>(1); }
+}
+
+expect_error("did not instantiate the generic function template 'dbl'") {
+    int useQualifiedWrongArityValue() {
+        function<int(int)> value = NsA.dbl<int, int>;
+        return value(1);
+    }
+}
+
+expect_error("generic function 'dbl' expects 1 type argument(s), but the call provides 2") {
+    int useQualifiedWrongArityCall() { return NsA.dbl<int, int>(1); }
+}
+
+import cpp "cpp_interop_proxy_assign.h";
+
+expect_error("unresolved generic function 'nosuch'") {
+    int useCppUnknown() {
+        function<int(int)> value = nosuch<int>;
+        return value(1);
+    }
+}
+
+expect_error("C++ function template 'rk_tp' cannot be used as a function value") {
+    int useCppTemplateValue() {
+        function<int(int)> value = cpppa.rk_tp<int>;
+        return value(3);
+    }
+}
+
+expect_error("C++ function template 'proxy_twice_tpl' cannot be used as a function value") {
+    int useCppGlobalTemplateValue() {
+        function<int(int)> value = proxy_twice_tpl<int>;
+        return value(3);
+    }
+}
+
+expect_error("generic method 'm'") {
+    struct GenericMethodValue
+    {
+        T m<T>(T x) { return x + 3; }
+        int use() {
+            function<int(int)> value = m<int>;
+            return value(4);
+        }
+    };
+}

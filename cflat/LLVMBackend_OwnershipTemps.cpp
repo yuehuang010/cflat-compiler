@@ -485,6 +485,13 @@ void LLVMBackend::RegisterOwningTempUniqueField(llvm::Value* value)
         owningTempUniqueFields_.push_back(value);
     }
 
+void LLVMBackend::RegisterOwningTempRawPointerField(llvm::Value* value)
+{
+        if (value == nullptr) return;
+        for (auto* entry : owningTempRawPointerFields_) if (entry == value) return;
+        owningTempRawPointerFields_.push_back(value);
+    }
+
 bool LLVMBackend::IsLedgeredOwningTempUniqueField(const llvm::Value* value) const
 {
         for (auto* entry : owningTempUniqueFields_) if (entry == value) return true;
@@ -507,6 +514,33 @@ bool LLVMBackend::JoinCarriesOwningTempUniqueField(const llvm::Value* value, int
                 if (JoinCarriesOwningTempUniqueField(arm.Value, depth + 1)) return true;
             return false;
         }
+        return false;
+    }
+
+bool LLVMBackend::JoinCarriesOwningTempRawPointerField(const llvm::Value* value, int depth) const
+{
+        if (value == nullptr || depth > kMaxJoinArmDepth) return false;
+        if (std::find(owningTempRawPointerFields_.begin(), owningTempRawPointerFields_.end(), value)
+            != owningTempRawPointerFields_.end()) return true;
+        if (const auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
+            return JoinCarriesOwningTempRawPointerField(gep->getPointerOperand(), depth + 1);
+        if (const auto* cast = llvm::dyn_cast<llvm::CastInst>(value))
+            return JoinCarriesOwningTempRawPointerField(cast->getOperand(0), depth + 1);
+        if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+        {
+            for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+                if (JoinCarriesOwningTempRawPointerField(phi->getIncomingValue(i), depth + 1)) return true;
+            return false;
+        }
+        if (const NullCoalesceJoin* join = FindNullCoalesceJoin(value))
+        {
+            for (const auto& arm : join->Arms)
+                if (JoinCarriesOwningTempRawPointerField(arm.Value, depth + 1)) return true;
+            return false;
+        }
+        if (const auto* select = llvm::dyn_cast<llvm::SelectInst>(value))
+            return JoinCarriesOwningTempRawPointerField(select->getTrueValue(), depth + 1)
+                || JoinCarriesOwningTempRawPointerField(select->getFalseValue(), depth + 1);
         return false;
     }
 
@@ -6358,6 +6392,7 @@ void LLVMBackend::FlushOwnedTemps()
         aliasReturnTempSlots_.clear();
         // Same boundary destructs the owning temp, so its unique-field reads retire with it.
         owningTempUniqueFields_.clear();
+        owningTempRawPointerFields_.clear();
         launderedTempUniqueFields_.clear();
         pendingLaunderTempUniqueFields_.clear();
         dataValueCodeCasts_.clear();

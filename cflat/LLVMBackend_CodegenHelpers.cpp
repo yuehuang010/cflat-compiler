@@ -92,6 +92,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
         codeValueDataCasts_.clear();
         currentCastOccurrence_ = 0;
         owningTempUniqueFields_.clear();
+        owningTempRawPointerFields_.clear();
         launderedTempUniqueFields_.clear();
         pendingLaunderTempUniqueFields_.clear();
         dataValueCodeCasts_.clear();

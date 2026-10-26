@@ -8253,6 +8253,7 @@ extern int main(int argc, char** argv)
         // the non-template wins.
         bridge_check("pick template exact over conversion",
                      cpppa.rk_tp(1) * 10000 + cpppa.rk_tp(hi) * 100 + cpppa.rk_tp(hl), 707071);
+        bridge_check("pick explicit template specialization", cpppa.rk_tp<int>(3), 70);
         bridge_check("pick non-template on tie", cpppa.rk_tn(1) * 100 + cpppa.rk_tn(hi), 7373);
         if (bridge_passed - bridgeRankStartPassed != bridge_checks - bridgeRankStartChecks)
             return 3643;

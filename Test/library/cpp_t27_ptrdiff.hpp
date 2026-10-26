@@ -49,3 +49,13 @@ struct Kinds
     }
 };
 }
+
+namespace t27ptr
+{
+template<class T> int bool_kind(T) noexcept
+{
+    return std::is_same_v<T, bool> ? 1 : std::is_same_v<T, int> ? 2 : 0;
+}
+inline int bool_pick(bool) { return 1; }
+inline int bool_pick(int) { return 2; }
+}

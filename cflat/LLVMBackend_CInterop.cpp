@@ -5960,6 +5960,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                              std::vector<std::pair<std::string, std::string>>* outUsingDirectives,
                              std::vector<std::pair<std::string, std::string>>* outNamespaceAliases,
                              std::vector<std::string>* outClassTemplateNames,
+                             std::vector<std::string>* outVariableTemplateNames,
                              std::vector<std::pair<std::string, std::string>>* outClassUsings,
                              std::vector<std::string>* outClassTemplateSpecializations,
                              std::vector<cflat_cinterop::RawClassTemplate>* outClassTemplates)
@@ -6243,6 +6244,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
         if (outFunctionTemplates) *outFunctionTemplates = raw.functionTemplates;
         if (outClassTemplates) *outClassTemplates = raw.classTemplates;
         if (outClassTemplateNames) *outClassTemplateNames = raw.classTemplateNames;
+        if (outVariableTemplateNames) *outVariableTemplateNames = raw.variableTemplateNames;
         if (outClassTemplateSpecializations)
             *outClassTemplateSpecializations = raw.classTemplateSpecializations;
         if (outUsingDirectives) *outUsingDirectives = raw.usingDirectives;
@@ -7419,7 +7421,7 @@ LLVMBackend::CxxVerdictFile* LLVMBackend::GetCxxVerdictFile(const CxxRequestGrou
         else if (CxxGroupHeaderStamp(group, stamp))
         {
             const std::string requestKey = CxxTypeRequestCacheKey(group,
-                "|demand-verdicts-v2-static-init",
+                "|demand-verdicts-v3-helper-diagnostic",
                 cohortFile ? cohortSource : generatedSource, BuildCxxRequestClangArgs(group), false)
                 + (cohortFile ? "|BODY_COHORT_SET" : "|BODY_SET");
             auto [slot, fresh] = cxxVerdictFiles_.try_emplace(requestKey);
@@ -10142,10 +10144,11 @@ std::string LLVMBackend::CxxBraceElementSpelling(const CxxBraceArgument& brace,
                 else if (valueType != nullptr && valueType->isIntegerTy())
                 {
                     const unsigned bits = valueType->getIntegerBitWidth();
-                    type = llvm::dyn_cast_or_null<llvm::ConstantInt>(arg.Primary) != nullptr
-                        ? (bits > 32 ? "i64" : "int")
-                        : (bits == 1 ? "bool" : bits <= 8 ? "i8" : bits <= 16 ? "short"
-                           : bits <= 32 ? "int" : "i64");
+                    if (bits == 1) type = "bool";
+                    else if (llvm::dyn_cast_or_null<llvm::ConstantInt>(arg.Primary) != nullptr)
+                        type = bits > 32 ? "i64" : "int";
+                    else type = bits <= 8 ? "i8" : bits <= 16 ? "short"
+                        : bits <= 32 ? "int" : "i64";
                 }
                 else if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(valueType))
                     type = st->getName().str();
@@ -12121,10 +12124,11 @@ bool LLVMBackend::RequestCxxFunctionTemplate(const std::string& functionName,
                 else if (valueType != nullptr && valueType->isIntegerTy())
                 {
                     const unsigned bits = valueType->getIntegerBitWidth();
-                    type = llvm::dyn_cast_or_null<llvm::ConstantInt>(arg.Primary) != nullptr
-                        ? (bits > 32 ? "i64" : "int")
-                        : (bits == 1 ? "bool" : bits <= 8 ? "i8" : bits <= 16 ? "short"
-                           : bits <= 32 ? "int" : "i64");
+                    if (bits == 1) type = "bool";
+                    else if (llvm::dyn_cast_or_null<llvm::ConstantInt>(arg.Primary) != nullptr)
+                        type = bits > 32 ? "i64" : "int";
+                    else type = bits <= 8 ? "i8" : bits <= 16 ? "short"
+                        : bits <= 32 ? "int" : "i64";
                 }
                 else if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(valueType))
                     type = st->getName().str();
@@ -15612,10 +15616,11 @@ bool LLVMBackend::RequestCxxBraceFunction(const std::string& functionName,
                 else if (valueType != nullptr && valueType->isIntegerTy())
                 {
                     const unsigned bits = valueType->getIntegerBitWidth();
-                    type = llvm::dyn_cast_or_null<llvm::ConstantInt>(arg.Primary) != nullptr
-                        ? (bits > 32 ? "i64" : "int")
-                        : (bits == 1 ? "bool" : bits <= 8 ? "i8" : bits <= 16 ? "short"
-                           : bits <= 32 ? "int" : "i64");
+                    if (bits == 1) type = "bool";
+                    else if (llvm::dyn_cast_or_null<llvm::ConstantInt>(arg.Primary) != nullptr)
+                        type = bits > 32 ? "i64" : "int";
+                    else type = bits <= 8 ? "i8" : bits <= 16 ? "short"
+                        : bits <= 32 ? "int" : "i64";
                 }
                 else if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(valueType))
                     type = st->getName().str();
@@ -18754,6 +18759,10 @@ bool LLVMBackend::CxxDeclaringFileBelongsToOtherImportGroup(
         };
         const CxxImportGroup& candidate = cxxImportGroups_[activeCxxRequestGroup_->primary];
         if (candidate.reachableFiles.empty() || reaches(candidate)) return false;
+        for (size_t group : activeCxxRequestGroup_->specializationGroups)
+            if (group != activeCxxRequestGroup_->primary && group < cxxImportGroups_.size()
+                && reaches(cxxImportGroups_[group]))
+                return false;
         for (size_t i = 0; i < cxxImportGroups_.size(); ++i)
         {
             if (i == activeCxxRequestGroup_->primary || !reaches(cxxImportGroups_[i])) continue;
@@ -20908,8 +20917,7 @@ bool LLVMBackend::CxxTemplateDefineMismatch(const std::string& cxxBase,
         auto specializesName = [&](const CxxImportGroup& group) {
             return std::any_of(group.specializedTemplates.begin(), group.specializedTemplates.end(),
                 [&](const std::string& entry) {
-                    const size_t first = entry.find('|');
-                    return normalized(entry.substr(0, first)) == cxxBase;
+                    return normalized(entry) == cxxBase;
                 });
         };
         auto publishes = [&](const CxxImportGroup& group) {
@@ -21212,6 +21220,7 @@ bool LLVMBackend::RequestCxxTypeInOwningGroup(const std::string& cxxBase,
         {
             const bool last = k + 1 == order.size();
             std::vector<size_t> requestDeps = deps;
+            std::vector<size_t> specializationGroups;
             const auto& owner = cxxImportGroups_[order[k]];
             for (size_t i = 0; i < cxxImportGroups_.size(); ++i)
             {
@@ -21219,20 +21228,22 @@ bool LLVMBackend::RequestCxxTypeInOwningGroup(const std::string& cxxBase,
                 const bool specializesTemplate = std::any_of(
                     cxxImportGroups_[i].specializedTemplates.begin(),
                     cxxImportGroups_[i].specializedTemplates.end(), [&](std::string name) {
-                        if (size_t separator = name.find('|'); separator != std::string::npos)
-                            name.resize(separator);
                         size_t pos = 0;
                         while ((pos = name.find('.', pos)) != std::string::npos)
                         { name.replace(pos, 1, "::"); pos += 2; }
                         return name == cxxBase;
                     });
                 if (specializesTemplate)
+                {
                     requestDeps.push_back(i);
+                    specializationGroups.push_back(i);
+                }
             }
             if (activeCxxRequestGroup_ == nullptr
                 && CxxTemplateDefineMismatch(cxxBase, spelling, cflatName, order[k], deps, error))
                 return false;
             CxxRequestGroup group = MakeCxxRequestGroup(order[k], requestDeps);
+            group.specializationGroups = std::move(specializationGroups);
             if (group.headers.empty()) continue;
             llvm::TimeTraceScope groupScope("CxxRequestGroup", spelling + " -> " + group.label);
             CxxRequestGroupScope guard(*this, &group);
@@ -21664,6 +21675,7 @@ void LLVMBackend::CheckCxxNamespaceConflicts(const std::vector<CSigEntry>& sigs,
                                              const std::vector<CGlobalEntry>& globals,
                                              const std::vector<CRecordEntry>& records,
                                              const std::vector<std::string>& classTemplateNames,
+                                             const std::vector<std::string>& variableTemplateNames,
                                              const std::vector<std::pair<std::string, std::string>>& classUsings,
                                              const std::vector<cflat_cinterop::RawFunctionTemplate>& functionTemplates,
                                              const std::string& fileForLsp)
@@ -21672,7 +21684,8 @@ void LLVMBackend::CheckCxxNamespaceConflicts(const std::vector<CSigEntry>& sigs,
         const std::string* const fileKey = &*cxxNamespaceFiles_.insert(fileForLsp).first;
         cxxNamespaceEntities_.reserve(cxxNamespaceEntities_.size() + sigs.size() + enums.size() * 2
                                       + aliases.size() + globals.size() + records.size()
-                                      + classTemplateNames.size() + classUsings.size());
+                                      + classTemplateNames.size() + variableTemplateNames.size()
+                                      + classUsings.size());
         auto note = [&](const std::string& name, CxxNamespaceEntity ent) {
             if (name.find('.') == std::string::npos) return;   // namespace members only
             const std::string key = (ent.isType ? "T:" : "V:") + name;
@@ -21727,6 +21740,14 @@ void LLVMBackend::CheckCxxNamespaceConflicts(const std::vector<CSigEntry>& sigs,
             batchClasses.insert(t);
             note(t, { true, "class", "class-template:" + t, "a class template", nullptr });
             note(t, { false, "class template", "class-template:" + t, "a class template", nullptr });
+        }
+        // Variable templates share their name with class declarations and value entities in clang.
+        for (const std::string& t : variableTemplateNames)
+        {
+            note(t, { true, "variable template", "variable-template:" + t,
+                      "a variable template", nullptr });
+            note(t, { false, "variable template", "variable-template:" + t,
+                      "a variable template", nullptr });
         }
         for (const auto& ft : functionTemplates)
             if (ft.kind == cflat_cinterop::RawFunctionTemplate::Free && !ft.name.empty())
@@ -28614,6 +28635,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<cflat_cinterop::RawFunctionTemplate> hitFunctionTemplates;
         std::vector<cflat_cinterop::RawClassTemplate> hitClassTemplates;
         std::vector<std::string> hitClassTemplateNames;
+        std::vector<std::string> hitVariableTemplateNames;
         std::vector<std::string> hitClassTemplateSpecializations;
         std::vector<std::string> hitGroupNamespaces;
         std::vector<cflat_cinterop::RawFunctionPointerAbi> hitFunctionPointerAbis;
@@ -28647,6 +28669,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitFunctionTemplates = entry.functionTemplates;
                     hitClassTemplates = entry.classTemplates;
                     hitClassTemplateNames = entry.classTemplateNames;
+                    hitVariableTemplateNames = entry.variableTemplateNames;
                     hitClassTemplateSpecializations = entry.classTemplateSpecializations;
                     hitGroupNamespaces = entry.cxxGroupNamespaces;
                     hitFunctionPointerAbis = entry.functionPointerAbis;
@@ -28671,6 +28694,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitFunctionTemplates = entry.functionTemplates;
                     hitClassTemplates = entry.classTemplates;
                     hitClassTemplateNames = entry.classTemplateNames;
+                    hitVariableTemplateNames = entry.variableTemplateNames;
                     hitClassTemplateSpecializations = entry.classTemplateSpecializations;
                     hitGroupNamespaces = entry.cxxGroupNamespaces;
                     hitFunctionPointerAbis = entry.functionPointerAbis;
@@ -28721,7 +28745,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             // After the enum backings and records, so an alias maps to its CFlat name.
             if (cppMode)
                 CheckCxxNamespaceConflicts(hitSigs, hitEnums, hitTypeAliases, hitGlobals, hitRecords,
-                                           hitClassTemplateNames, hitClassUsings, hitFunctionTemplates, fileForLsp);
+                                           hitClassTemplateNames, hitVariableTemplateNames,
+                                           hitClassUsings, hitFunctionTemplates, fileForLsp);
             RegisterRecordAliases(hitAliases);
             RegisterTypeAliasSymbols(hitTypeAliases, cppMode);
             if (cppMode) RegisterCxxUsingDirectives(hitUsingDirectives);
@@ -28834,6 +28859,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     { llvm::TimeTraceScope chrStep("CHR:CheckCxxNamespaceConflicts"); CheckCxxNamespaceConflicts(diskEntry.sigs, diskEntry.enums,
                                                diskEntry.typeAliases, diskEntry.globals,
                                                diskEntry.records, diskEntry.classTemplateNames,
+                                               diskEntry.variableTemplateNames,
                                                diskEntry.classUsings, diskEntry.functionTemplates, fileForLsp); }
                 { llvm::TimeTraceScope chrStep("CHR:RegisterRecordAliases"); RegisterRecordAliases(diskEntry.recordAliases); }
                 { llvm::TimeTraceScope chrStep("CHR:RegisterTypeAliasSymbols"); RegisterTypeAliasSymbols(diskEntry.typeAliases, cppMode); }
@@ -28926,6 +28952,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<cflat_cinterop::RawFunctionTemplate> functionTemplates;
         std::vector<cflat_cinterop::RawClassTemplate> classTemplates;
         std::vector<std::string> classTemplateNames;
+        std::vector<std::string> variableTemplateNames;
         std::vector<std::string> classTemplateSpecializations;
         std::vector<std::pair<std::string, std::string>> usingDirectives;
         std::vector<std::pair<std::string, std::string>> namespaceAliases;
@@ -28967,6 +28994,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                                      &functionPointerAbis, &longDoubleWidth,
                                      &longDoubleIsIEEEDouble, &targetTriple, &functionTemplates,
                                      &usingDirectives, &namespaceAliases, &classTemplateNames,
+                                     &variableTemplateNames,
                                      &classUsings, &classTemplateSpecializations, &classTemplates))
             {
                 if (prereqFailure)
@@ -29029,6 +29057,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             entry.functionTemplates = functionTemplates;
             entry.classTemplates = classTemplates;
             entry.classTemplateNames = classTemplateNames;
+            entry.variableTemplateNames = variableTemplateNames;
             entry.classTemplateSpecializations = classTemplateSpecializations;
             entry.cxxGroupNamespaces = seededGroupNamespaces;
             entry.enums = enums;
@@ -29084,7 +29113,8 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             llvm::TimeTraceScope registerScope("CHeaderRegister", fileForLsp);
             if (cppMode)
                 { llvm::TimeTraceScope chrStep("CHR:CheckCxxNamespaceConflicts"); CheckCxxNamespaceConflicts(sigs, enums, typeAliases, globals, records,
-                                           classTemplateNames, classUsings, functionTemplates, fileForLsp); }
+                                           classTemplateNames, variableTemplateNames, classUsings,
+                                           functionTemplates, fileForLsp); }
             if (cppMode)
                 { llvm::TimeTraceScope chrStep("CHR:RegisterCxxFunctionTemplates"); RegisterCxxFunctionTemplates(functionTemplates, cxxGroupIndex, fileForLsp); }
             if (cppMode && cxxGroupIndex < cxxImportGroups_.size())
@@ -30931,7 +30961,29 @@ const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::SelectCxxConstructorList
         }
         if (!blockedWhy.empty())
         {
-            why = blockedWhy;
+            if (info->hasCtorTemplate && argVars != nullptr
+                && argVars->size() == argTypes.size())
+            {
+                std::string wrapperName;
+                std::string wrapperError;
+                auto* self = const_cast<LLVMBackend*>(this);
+                const bool requested = self->RequestCxxVariadicConstructor(
+                    typeName, *argVars, wrapperName, wrapperError);
+                if (!requested && wrapperError.starts_with("clang: "))
+                    why = wrapperError;
+                else if (!requested && !self->lastCxxWrapperNoViableAtRequest_)
+                {
+                    std::string cause = self->CxxFirstDiagnosticLine(
+                        self->lastCxxWrapperCause_);
+                    if (size_t error = cause.find("error: "); error != std::string::npos)
+                        cause.erase(0, error + 7);
+                    why = cause.empty() ? blockedWhy : "clang: " + cause;
+                }
+                else
+                    why = blockedWhy;
+            }
+            else
+                why = blockedWhy;
             return nullptr;
         }
         why = CxxCtorNoMatchReason(argTypes);

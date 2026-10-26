@@ -358,6 +358,8 @@ import cpp "library/cpp_interop_usingns_again.h";
 // Separate lines: a grouped import registers one file and never reaches the conflict check.
 import cpp "library/cpp_interop_c2_accept_a.h";
 import cpp "library/cpp_interop_c2_accept_b.h";
+import cpp "library/cpp_t436_spec_primary.hpp";
+import cpp "library/cpp_t436_spec_long.hpp";
 // Importing the exact same header twice must retain the existing entity.
 import cpp "library/cpp_interop_c2_repeat.h";
 import cpp "library/cpp_interop_c2_repeat.h";
@@ -2117,6 +2119,52 @@ int t261Lowered(int x) { T261HV hv0 = default; T261LowPair w = { a = hv0, b = t2
 T261HV t261Mk(int x) { T261HV h = default; t261.boom(x); return h; }
 struct T261WB { T261HV c; int b = 0; };
 int t261Field(int x) { T261HV h0 = default; T261WB w = { c = h0, b = t261.bval(x) }; return w.b; }
+int t430Built = 0;
+int t430Destroyed = 0;
+int t430ObjectDestroyed = 0;
+int t430DtorCount = 0;
+struct T430Owned { T430Owned() { t430Built = t430Built + 1; } ~T430Owned() { t430Destroyed = t430Destroyed + 1; } };
+struct T430Plain { unique<T430Owned> p; int value = 0; };
+struct T430Inner { unique<T430Owned> p; int k = 0; };
+struct T430Outer { T430Inner a; int b = 0; };
+struct T430Box { unique<T430Owned> p; int value = 0;
+    T430Box() { p = unique<T430Owned>(new T430Owned()); value = 5; }
+    ~T430Box() { t430ObjectDestroyed = t430ObjectDestroyed + 1; }
+};
+struct T430CxxCtor { t261.Counted a; t261.Counted b; int z = 0; T430CxxCtor() { z = 4; } };
+struct T430D { int v = 0; ~T430D() { t430DtorCount = t430DtorCount + 1; } };
+struct T430DBox { T430D d; int b = 0; T430DBox() { b = 2; } };
+int t430PlainMove(int x) {
+    unique<T430Owned> p = unique<T430Owned>(new T430Owned());
+    T430Plain w = { p = move p, value = t261.bval(x) };
+    return w.value;
+}
+T430Inner t430MakeInner() {
+    T430Inner value = default;
+    value.p = unique<T430Owned>(new T430Owned());
+    return value;
+}
+int t430NestedMove(int x) {
+    T430Inner value = default;
+    value.p = unique<T430Owned>(new T430Owned());
+    T430Outer w = { a = move value, b = t261.bval(x) };
+    return w.b;
+}
+int t430NestedReturn(int x) {
+    T430Outer w = { a = t430MakeInner(), b = t261.bval(x) };
+    return w.b;
+}
+int t430CtorLocal(int x) { T430Box box = { value = t261.bval(x) }; return box.value; }
+int t430CtorDefault(int x, T430Box box = { value = t261.bval(x) }) { return box.value; }
+int t430CtorDefaultCall(int x) { return t430CtorDefault(x); }
+int t430TakeBox(T430Box box) { return box.value; }
+int t430CtorCall(int x) { return t430TakeBox(box: { value = t261.bval(x) }); }
+int t430CxxCtorLocal(int x) {
+    t261.Counted h0 = default;
+    T430CxxCtor value = { a = h0, b = t261.mk(x) };
+    return value.z;
+}
+int t430DtorField(int x) { T430D d0 = default; T430DBox value = { d = d0, b = t261.bval(x) }; return value.b; }
 // T313: the element block of a tag form (or `new T{...}`) whose attribute throws is freed once,
 // through the operator new/delete pair it came from: the user pair when the struct declares one.
 int t313UnNew = 0;
@@ -2641,8 +2689,17 @@ string T381ReturnString()
 }
 int T381ConsumeString(string value) { return value.length(); }
 
+union T440TrivialCppUnion { t138.Plain plain; int tag; };
+// A forward by-value CFlat holder is accepted once its body completes.
+union T440ForwardTrivialUnion { T440ForwardTrivialHolder holder; int tag; };
+struct T440ForwardTrivialHolder { int value; };
+
 extern int main()
 {
+    T440TrivialCppUnion t440Trivial = { plain = { u = 47 } };
+    if (t440Trivial.plain.u != 47) return 44001;
+    T440ForwardTrivialUnion t440ForwardTrivial = { holder = { value = 48 } };
+    if (t440ForwardTrivial.holder.value != 48) return 44002;
     if (t365CppUniqueSlotCall() != 191) return 36501;
     // T217: mutable fields stay writable through const C++ storage, including constexpr globals.
     t217_constexpr.m = 7;
@@ -5110,6 +5167,12 @@ extern int main()
     if (t27ptr.arith_kind(1.0f + 1) != 2 || t27ptr.arith_kind(1.5f * 2) != 2
         || t27ptr.arith_kind(t58L + 1.0) != 3 || t27ptr.arith_kind(t58F * 2.0) != 3
         || t27ptr.pick_arith(1.0f + 1) != 2 || t27ptr.pick_arith(t58F * 2.0) != 3) return 27031;
+    // T439: constant-folded comparisons keep bool for C++ template deduction.
+    if (t27ptr.bool_kind(1e3 > 1) != 1 || t27ptr.bool_kind(1e3 == 1) != 1
+        || t27ptr.bool_kind(1e3 != 1) != 1) return 43901;
+    if (t27ptr.bool_pick(1e3 > 1) != 1 || t27ptr.bool_pick(1e3 == 1) != 1
+        || t27ptr.bool_pick(1e3 != 1) != 1) return 43902;
+    if (!(1e3 > 1) || (1e3 == 1) || !(1e3 != 1)) return 43903;
     // T276: an unscoped enum element of a brace list is spelled by its promoted type (clang
     // oracle: ee/const/mixed/Lee/Lconst/Ecode/ACe 1); a fixed narrow enum keeps its own identity.
     t276.E t276E = t276.E.e1;
@@ -17046,6 +17109,10 @@ int LoweredUserDtorAssignLegs(int argc)
     if (nsccPick.k != 8) return 31797;
     if (nscc.kPrim != 7 || nscc.kHalf != 0.5 || nscc.size_v<short> != 2
         || nscc.Red != 1 || nscc.Green != 2) return 31798;
+    // T436 explicit specialization is supplied by a second imported header.
+    t436spec.S<int> t436Primary = default; t436Primary.v = 4;
+    t436spec.S<long> t436Explicit = default; t436Explicit.v = 2; t436Explicit.w = 5;
+    if (t436Primary.v + (int)t436Explicit.w != 9) return 43602;
     // T33: a class-typed variable template is the real C++ object: range-for over STATIC
     // begin/end (views::empty<T>), `v<T>.member()` (not a class template), address identity.
     int vtvSum = 0;
@@ -18092,6 +18159,44 @@ int LoweredUserDtorAssignLegs(int argc)
     t261.reset();
     t258A = t261.guarded(t261Field, 1);
     if (t258A != -7 || t261.ctors() != 1 || t261.copies() != 1 || t261.dtors() != 2) return 25335;
+    t430Built = t430Destroyed = t430ObjectDestroyed = 0;
+    t258A = t261.guarded(t430PlainMove, 1);
+    if (t258A != -7 || t430Built != 1 || t430Destroyed != 1) return 25420;
+    t430Built = t430Destroyed = t430ObjectDestroyed = 0;
+    t258A = t261.guarded(t430NestedMove, 1);
+    if (t258A != -7 || t430Built != 1 || t430Destroyed != 1) return 25421;
+    t430Built = t430Destroyed = t430ObjectDestroyed = 0;
+    t258A = t261.guarded(t430NestedReturn, 1);
+    if (t258A != -7 || t430Built != 1 || t430Destroyed != 1) return 25422;
+    t430Built = t430Destroyed = t430ObjectDestroyed = 0;
+    t258A = t261.guarded(t430CtorLocal, 1);
+    if (t258A != -7 || t430Built != 1 || t430Destroyed != 1 || t430ObjectDestroyed != 1) return 25423;
+    t430Built = t430Destroyed = t430ObjectDestroyed = 0;
+    t258A = t261.guarded(t430CtorDefaultCall, 1);
+    if (t258A != -7 || t430Built != 1 || t430Destroyed != 1 || t430ObjectDestroyed != 1) return 25424;
+    t430Built = t430Destroyed = t430ObjectDestroyed = 0;
+    t258A = t261.guarded(t430CtorCall, 1);
+    if (t258A != -7 || t430Built != 1 || t430Destroyed != 1 || t430ObjectDestroyed != 1) return 25425;
+    t430Built = t430Destroyed = t430ObjectDestroyed = 0;
+    t258A = t261.guarded(t430CtorLocal, 0);
+    if (t258A != 0 || t430Built != 1 || t430Destroyed != 1 || t430ObjectDestroyed != 1) return 25426;
+    t430Built = t430Destroyed = t430ObjectDestroyed = 0;
+    t258A = t261.guarded(t430CtorCall, 0);
+    if (t258A != 0 || t430Built != 1 || t430Destroyed != 1 || t430ObjectDestroyed != 1) return 25427;
+    t261.reset();
+    t258A = t261.guarded(t430CxxCtorLocal, 1);
+    if (t258A != -7 || t261.ctors() != 3 || t261.copies() != 1
+        || t261.moves() != 0 || t261.dtors() != 4) return 25428;
+    t261.reset();
+    t258A = t261.guarded(t430CxxCtorLocal, 0);
+    if (t258A != 4 || t261.ctors() != 4 || t261.copies() != 1
+        || t261.moves() != 1 || t261.dtors() != 6) return 25429;
+    t430DtorCount = 0;
+    t258A = t261.guarded(t430DtorField, 1);
+    if (t258A != -7 || t430DtorCount != 3) return 25430;
+    t430DtorCount = 0;
+    t258A = t261.guarded(t430DtorField, 0);
+    if (t258A != 0 || t430DtorCount != 3) return 25431;
     // T313: a tag-form block freed when an attribute throws (heap audit: no leak), then the user pair.
     HeapAudit.enable();
     int t313Base = (int)HeapAudit.reportLeaks();

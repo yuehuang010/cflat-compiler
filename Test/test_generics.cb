@@ -32,6 +32,37 @@ int t60LocalEnumSize<T>()
 }
 int t60LocalEnumReverse<T>() { enum E : int { V = sizeof(T) }; return (int)E.V; }
 
+int t441SiblingValueFunction() { int n = 2; return n; }
+int t441SiblingEnumFunction() { enum n : int { A = 3 }; return (int)n.A; }
+int t441GenericLocalEnum<T>() { enum n : int { A = sizeof(T) }; return (int)n.A; }
+
+enum T441GlobalEnum : int { A = 3 };
+struct T441GlobalEnumField { int T441GlobalEnum = 5; int Read() { return T441GlobalEnum; } };
+int t441GlobalEnumAndField()
+{
+    T441GlobalEnumField value;
+    return value.Read() * 10 + (int)T441GlobalEnum.A;
+}
+
+struct T441MethodFieldNested
+{
+    int n = 7;
+    int Read()
+    {
+        int r = 0;
+        { enum n : int { A = 3 }; r = (int)n.A; }
+        return r + n;
+    }
+};
+int t441MethodFieldNested() { T441MethodFieldNested value; return value.Read(); }
+
+struct T441MethodFieldUse
+{
+    int n = 7;
+    int Read() { enum n : int { A = 3 }; return (int)n.A; }
+};
+int t441MethodFieldUse() { T441MethodFieldUse value; return value.Read(); }
+
 int t60LocalEnumValue<int N>() { enum E : int { V = N }; return (int)E.V; }
 int t60LocalEnumTernary<T>()
 {
@@ -73,6 +104,14 @@ bool testGenericLocalEnums()
     bool result = true;
     result &= Test("generic_local_enum_size_int", t60LocalEnumSize<int>(), 4);
     result &= Test("generic_local_enum_size_i64", t60LocalEnumSize<i64>(), 8);
+    result &= Test("t441_enum_only_member", t441SiblingEnumFunction(), 3);
+    result &= Test("t441_sibling_function_scopes", t441SiblingValueFunction() * 10
+        + t441SiblingEnumFunction(), 23);
+    result &= Test("t441_global_enum_and_field", t441GlobalEnumAndField(), 53);
+    result &= Test("t441_generic_enum_twice", t441GenericLocalEnum<int>() * 10
+        + t441GenericLocalEnum<i64>(), 48);
+    result &= Test("t441_method_field_nested", t441MethodFieldNested(), 10);
+    result &= Test("t441_method_field_use", t441MethodFieldUse(), 3);
     result &= Test("generic_local_enum_reverse_order", t60LocalEnumReverse<i64>()
         + t60LocalEnumReverse<int>(), 12);
     result &= Test("generic_local_enum_value_arg", t60LocalEnumValue<7>(), 7);
@@ -2554,6 +2593,130 @@ bool testNestedTupleTypeResolution()
             + localEnumValues.get(0).item_0.item_1
             + localEnumValues.get(0).item_1, 42);
 
+    return result;
+}
+
+int t433SumFlat((int, int) value) { return value.item_0 + value.item_1; }
+int t433CallFlat(function<int((int, int))> callback, (int, int) value)
+{
+    return callback(value);
+}
+int t433SumNested(((int, int), int) value)
+{
+    return value.item_0.item_0 + value.item_0.item_1 + value.item_1;
+}
+int t433CallNested(function<int(((int, int), int))> callback, ((int, int), int) value)
+{
+    return callback(value);
+}
+int t433FlatGeneric<T>(T x)
+{
+    (int, T) value = (3, x);
+    return value.item_0 + (int)sizeof(value);
+}
+int t433NestedGeneric<T>(T x)
+{
+    ((int, T), int) value = ((3, x), 5);
+    return value.item_0.item_0 + (int)sizeof(value.item_0);
+}
+
+struct T433CollisionFoo { int value = 1; };
+namespace T433SubstNS
+{
+    struct T433CollisionFoo { i64 a = 2; i64 b = 3; i64 c = 4; };
+    int tupleSize<T>(T value)
+    {
+        (int, T) pair = default;
+        return (int)sizeof(pair);
+    }
+}
+
+using T433AliasList = list<int>;
+int t433AliasStringOverload((T433AliasList, string) value)
+{
+    return value.item_0.get(0) + 100;
+}
+int t433AliasStringOverload(int value) { return value + 200; }
+int t433AliasIntOverload((T433AliasList, int) value)
+{
+    return value.item_0.get(0) + value.item_1 + 300;
+}
+int t433AliasIntOverload(int value) { return value + 400; }
+
+namespace T433EnumBefore
+{
+    enum Late : int { X = 7 };
+    (Late, int) make() { return (Late.X, 5); }
+}
+namespace T433EnumAfter
+{
+    (Late, int) make() { return (Late.X, 5); }
+    enum Late : int { X = 7 };
+}
+namespace T433EnumNestedAfter
+{
+    int sum()
+    {
+        ((Late, int), int) value = ((Late.X, 4), 1);
+        return (int)value.item_0.item_0 + value.item_0.item_1 + value.item_1;
+    }
+    (Late, int) make() { return (Late.X, 5); }
+    enum Late : int { X = 7 };
+}
+
+bool testT433TupleTypeResolution()
+{
+    bool result = true;
+    result &= Test("t433 function type tuple parameter",
+        t433CallFlat(t433SumFlat, (20, 22)), 42);
+    result &= Test("t433 nested function type tuple parameter",
+        t433CallNested(t433SumNested, ((20, 21), 1)), 42);
+    result &= Test("t433 generic tuple substitution int",
+        t433FlatGeneric<int>(1), 11);
+    result &= Test("t433 generic tuple substitution i64",
+        t433FlatGeneric<i64>(1), 19);
+    result &= Test("t433 nested generic tuple substitution int",
+        t433NestedGeneric<int>(1), 11);
+    result &= Test("t433 nested generic tuple substitution i64",
+        t433NestedGeneric<i64>(1), 19);
+
+    T433CollisionFoo globalFoo = default;
+    result &= Test("t433 substituted tuple keeps caller namespace",
+        T433SubstNS.tupleSize<T433CollisionFoo>(globalFoo), 8);
+
+    (list<int>, string) directStringTuple = default;
+    directStringTuple.item_0.add(5);
+    (T433AliasList, string) aliasStringTuple = directStringTuple;
+    result &= Test("t433 aliased generic tuple assignment",
+        aliasStringTuple.item_0.get(0), 5);
+    result &= Test("t433 aliased generic tuple overload",
+        t433AliasStringOverload(aliasStringTuple), 105);
+    result &= Test("t433 direct generic tuple overload identity",
+        t433AliasStringOverload(directStringTuple), 105);
+
+    (T433AliasList, int) aliasIntTuple = default;
+    aliasIntTuple.item_0.add(7);
+    aliasIntTuple.item_1 = 9;
+    (list<int>, int) directIntTuple = aliasIntTuple;
+    result &= Test("t433 aliased primitive tuple assignment",
+        directIntTuple.item_0.get(0) + directIntTuple.item_1, 16);
+    result &= Test("t433 aliased primitive tuple overload",
+        t433AliasIntOverload(directIntTuple), 316);
+
+    (list<int>, string) listString = default;
+    listString.item_0.add(41);
+    result &= Test("t433 generic tuple element", listString.item_0.get(0), 41);
+    ((list<int>, int), string) nestedListString = default;
+    nestedListString.item_0.item_0.add(3);
+    result &= Test("t433 nested generic tuple element",
+        nestedListString.item_0.item_0.get(0), 3);
+
+    (T433EnumBefore.Late, int) before = T433EnumBefore.make();
+    (T433EnumAfter.Late, int) after = T433EnumAfter.make();
+    result &= Test("t433 namespace sibling enum before use", (int)before.item_0, 7);
+    result &= Test("t433 namespace sibling enum after use", (int)after.item_0, 7);
+    result &= Test("t433 nested namespace sibling enum after use",
+        T433EnumNestedAfter.sum(), 12);
     return result;
 }
 
@@ -5769,6 +5932,42 @@ bool testMemberTypeForwardRecords()
     return true;
 }
 
+// T432: unique's pointee and its nested generic body may depend on a later record.
+int T432WrapDropCount = 0;
+struct T432Wrap<T> { T value = default; int size() { return (int)sizeof(T); } ~T432Wrap() { T432WrapDropCount++; } };
+using T432WrapPointer = T432Wrap<T432Later>*;
+struct T432UniqueHolder { unique<T432Wrap<T432Later>> value = default; };
+struct T432AliasPointerHolder { T432WrapPointer value = default; };
+struct T432NestedHolder { unique<T432Wrap<T432Wrap<T432Later>>> value = default; };
+struct T432ListHolder { list<unique<T432Wrap<T432Later>>> values = default; };
+struct T432Box<T> { T432Wrap<T>* value = default; };
+struct T432BoxHolder { T432Box<T432Later> value = default; };
+function<int(T432Wrap<T432Later>*)> T432Callback = default;
+unique<T432Wrap<T432Later>> T432Make();
+int T432Param(unique<T432Wrap<T432Later>> value);
+int T432LocalBefore() {
+    unique<T432Wrap<T432Later>> value;
+    return value.valid() ? 1 : 0;
+}
+struct T432R2Holder { unique<T432Wrap<T432R2Later>> value = default; int k = 0; };
+T432Wrap<T432R2Later>* T432R2Resource = nullptr;
+int T432R2ByValueBeforeS2() {
+    T432R2Holder holder = default;
+    return (int)sizeof(T432R2Holder);
+}
+int T432R2SizeofBeforeS2() { return (int)sizeof(T432R2Holder); }
+int T432R2HolderWithResourceBeforeS2() {
+    T432R2Holder holder = default;
+    holder.value._p = T432R2Resource;
+    T432R2Resource = nullptr;
+    return (int)sizeof(T432R2Holder);
+}
+struct T432Later { int value = 0; };
+struct T432R2Later { int value = 0; };
+unique<T432Wrap<T432Later>> T432Make() { return unique<T432Wrap<T432Later>>(new T432Wrap<T432Later>()); }
+int T432Param(unique<T432Wrap<T432Later>> value) { return value->size(); }
+int T432Read(T432Wrap<T432Later>* value) { return value->size(); }
+
 // A pointer to a generic instance over a struct declared LATER names the instance only: its body
 // (sizeof(T), methods) waits for PoLater's definition. PoTag's method is T-free, so calling it
 // before PoLater exists still works (the member access drains the instance).
@@ -5806,6 +6005,45 @@ bool testPointerOnlyLaterStruct()
     result &= Test("po_ptr_diff_before_struct", poDiff(pk3, pk), 3);
     result &= Test("po_index_member_before_struct", poIndexK(pk), 2);
     result &= Test("po_sizeof_deref_before_struct", poSizeofDeref(pk), 16);
+
+    result &= Test("t432_r2_holder_byvalue_before_s2", T432R2ByValueBeforeS2(), 16);
+    result &= Test("t432_r2_holder_sizeof_before_s2", T432R2SizeofBeforeS2(), 16);
+    T432WrapDropCount = 0;
+    T432R2Resource = new T432Wrap<T432R2Later>();
+    result &= Test("t432_r2_holder_dtor_owner_before_s2",
+                   T432R2HolderWithResourceBeforeS2(), 16);
+    result &= Test("t432_r2_holder_destroys_pointee_once", T432WrapDropCount, 1);
+    result &= Test("t432_r2_resource_cleared", T432R2Resource == nullptr, true);
+
+    // T432: these calls discriminate the late pointee body by reading sizeof(T) after its definition.
+    T432WrapDropCount = 0;
+    {
+        T432UniqueHolder value = default;
+        value.value = unique<T432Wrap<T432Later>>(new T432Wrap<T432Later>());
+        result &= Test("t432_unique_field_size_after", value.value->size(), (int)sizeof(T432Later));
+    }
+    result &= Test("t432_unique_holder_destroys_pointee_once", T432WrapDropCount, 1);
+    result &= Test("t432_unique_param_value", T432Param(T432Make()), (int)sizeof(T432Later));
+    unique<T432Wrap<T432Later>> returned = T432Make();
+    result &= Test("t432_unique_return_value", returned->size(), (int)sizeof(T432Later));
+    result &= Test("t432_unique_empty_local_before", T432LocalBefore(), 0);
+    T432NestedHolder nested = default;
+    nested.value = unique<T432Wrap<T432Wrap<T432Later>>>(new T432Wrap<T432Wrap<T432Later>>());
+    result &= Test("t432_nested_unique_value", nested.value->size(), (int)sizeof(T432Wrap<T432Later>));
+    T432ListHolder listHolder = default;
+    listHolder.values.add(unique<T432Wrap<T432Later>>(new T432Wrap<T432Later>()));
+    result &= Test("t432_list_unique_value", listHolder.values[0]->size(), (int)sizeof(T432Later));
+    T432BoxHolder boxHolder = default;
+    boxHolder.value.value = new T432Wrap<T432Later>();
+    result &= Test("t432_generic_body_pointer_value", boxHolder.value.value->size(), (int)sizeof(T432Later));
+    T432AliasPointerHolder aliasHolder = default;
+    T432Wrap<T432Later>* aliasOwned = new T432Wrap<T432Later>();
+    aliasHolder.value = aliasOwned;
+    result &= Test("t432_pointer_alias_value", aliasHolder.value->size(), (int)sizeof(T432Later));
+    delete aliasOwned;
+    T432Callback = T432Read;
+    T432Wrap<T432Later>* callbackArg = new T432Wrap<T432Later>();
+    result &= Test("t432_function_pointer_signature_value", T432Callback(callbackArg), (int)sizeof(T432Later));
     return result;
 }
 
@@ -6240,6 +6478,26 @@ bool testT384TwoLevelNestedTemplates()
     return result;
 }
 
+int t431Pick(int x) { return x + 1; } int t431Pick(double x) { return (int)x + 2; }
+struct T431MethodOverloads { int get(int x) { return x + 3; } int get(double x) { return (int)x + 5; } };
+struct T431GenericGetter<T> { T get(T x) { return x + 1; } };
+struct T431IfConst<T> { if const (is_unique(T)) { int which() { return 1; } } else if const (is_pointer(T)) { int which() { return 2; } } else { int which() { return 3; } } };
+
+bool testT431SameLineAcceptSet()
+{
+    bool result = true;
+    result &= Test("t431 same-line free overloads", t431Pick(1) + t431Pick(1.0), 5);
+    T431MethodOverloads methods;
+    result &= Test("t431 same-line method overloads", methods.get(1) + methods.get(1.0), 10);
+    T431GenericGetter<int> ints;
+    T431GenericGetter<i64> longs;
+    result &= Test("t431 generic method reuse", ints.get(4) * 100 + ints.get(5) * 10 + (int)longs.get(6), 567);
+    T431IfConst<int> value;
+    T431IfConst<int*> pointer;
+    result &= Test("t431 if const method arms", value.which() * 10 + pointer.which(), 32);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -6301,6 +6559,7 @@ extern int main()
     total++; passed += testTupleConstruct()              ? 1 : 0;
     total++; passed += testTupleReturnAndDestructure()   ? 1 : 0;
     total++; passed += testNestedTupleTypeResolution()   ? 1 : 0;
+    total++; passed += testT433TupleTypeResolution()     ? 1 : 0;
     total++; passed += testTupleArrayView()              ? 1 : 0;
     total++; passed += testITuple()                      ? 1 : 0;
     total++; passed += testImplicitStringLiteral()        ? 1 : 0;
@@ -6329,6 +6588,7 @@ extern int main()
     total++; passed += testIfConstMemberScope()          ? 1 : 0;
     total++; passed += testIfConstInterfaceScope()       ? 1 : 0;
     total++; passed += testConformanceOverloadOrder()    ? 1 : 0;
+    total++; passed += testT431SameLineAcceptSet()       ? 1 : 0;
 
     total++; passed += testGnNsStructLocal()                    ? 1 : 0;
     total++; passed += testGnNsStructParam()                    ? 1 : 0;

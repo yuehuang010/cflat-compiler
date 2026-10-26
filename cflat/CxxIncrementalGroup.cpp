@@ -1272,6 +1272,47 @@ namespace
                                 && !final.Method->isPureVirtual())
                                 work.push_back(final.Method);
             };
+            auto failedCalleeDiagnostic = [&](const clang::FunctionDecl* function) {
+                if (function == nullptr) return std::string{};
+                auto recorded = [&](const clang::FunctionDecl* callee) {
+                    if (callee == nullptr || !callee->isInvalidDecl()) return std::string{};
+                    if (auto bad = replayedPoison.find(BodyVerdictKey(callee));
+                        bad != replayedPoison.end())
+                        return bad->second;
+                    if (poisoned != nullptr)
+                        if (auto bad = poisoned->find(callee); bad != poisoned->end())
+                            return bad->second;
+                    if (causes != nullptr)
+                        if (auto cause = causes->find(callee); cause != causes->end())
+                            return cause->second;
+                    return std::string{};
+                };
+                if (function->getBody() != nullptr)
+                {
+                    CalleeWalk walk;
+                    walk.TraverseStmt(function->getBody());
+                    for (const clang::FunctionDecl* callee : walk.found)
+                        if (std::string diagnostic = recorded(callee); !diagnostic.empty())
+                            return diagnostic;
+                }
+                const clang::FunctionDecl* pattern = function->getTemplateInstantiationPattern();
+                const auto* record = llvm::dyn_cast<clang::CXXRecordDecl>(
+                    function->getDeclContext());
+                if (pattern == nullptr || pattern->getBody() == nullptr || record == nullptr)
+                    return std::string{};
+                CalleeWalk walk;
+                walk.TraverseStmt(pattern->getBody());
+                for (const clang::FunctionDecl* patternCallee : walk.found)
+                    for (const clang::CXXMethodDecl* callee : record->methods())
+                        if (const clang::FunctionDecl* source =
+                                callee->getInstantiatedFromMemberFunction();
+                            source != nullptr
+                            && source->getCanonicalDecl() == patternCallee->getCanonicalDecl())
+                            if (std::string diagnostic = recorded(callee);
+                                !diagnostic.empty())
+                                return diagnostic;
+                return std::string{};
+            };
             while (!work.empty())
             {
                 const clang::FunctionDecl* next = work.back();
@@ -1299,6 +1340,8 @@ namespace
                 sema->PerformPendingInstantiations();
                 if (trap.hasErrorOccurred())
                 {
+                    if (poisonDiagnostic.empty())
+                        poisonDiagnostic = failedCalleeDiagnostic(next);
                     if (failure.empty()) failure = next->getQualifiedNameAsString();
                     continue;
                 }
@@ -1312,6 +1355,8 @@ namespace
                     if (poisonDiagnostic.empty() && causes != nullptr)
                         if (auto cause = causes->find(next); cause != causes->end())
                             poisonDiagnostic = cause->second;
+                    if (poisonDiagnostic.empty())
+                        poisonDiagnostic = failedCalleeDiagnostic(next);
                     continue;
                 }
                 if (!next->isDefined(definition)) continue;
@@ -3150,11 +3195,17 @@ int CxxIncrementalGroup::CheckDemand(const std::string& symbol, std::string& err
                 impl_->lazy.poisonDiagnostic = original->second;
                 break;
             }
-    error = "clang: " + (!impl_->lazy.poisonDiagnostic.empty() ? impl_->lazy.poisonDiagnostic
-        : diagnostics.consumer.allText.empty()
-        ? (impl_->lazy.poisonDiagnostic.empty() ? "failed to instantiate '" + failure + "'"
-                                               : impl_->lazy.poisonDiagnostic)
+    error = "clang: " + (diagnostics.consumer.allText.empty()
+        ? (!impl_->lazy.poisonDiagnostic.empty() ? impl_->lazy.poisonDiagnostic
+                                                : "failed to instantiate '" + failure + "'")
         : diagnostics.consumer.allText);
+    for (const auto* failed : diagnostics.consumer.failedFunctions)
+    {
+        const auto cause = impl_->causes.find(failed);
+        const std::string& first = cause == impl_->causes.end() || cause->second.empty()
+            ? error.substr(7) : cause->second;
+        impl_->lazy.replayedPoison.try_emplace(BodyVerdictKey(failed), first);
+    }
     for (const auto* failed : diagnostics.consumer.failedFunctions)
     {
         auto cause = impl_->causes.find(failed);

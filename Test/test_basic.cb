@@ -542,19 +542,6 @@ int localEnumSiblingBlocks()
     return result;
 }
 
-int t371ParameterSameScope(int n)
-{
-    enum n : int { A = 3 };
-    return n + 1;
-}
-
-int t371SameScopeLocalWins()
-{
-    int n = 9;
-    enum n : int { A = 3 };
-    return n + 1;
-}
-
 int t371QualifiedEnumerator()
 {
     enum n : int { A = 3 };
@@ -786,8 +773,6 @@ bool testEnum()
     result &= Test("local_enum_switch_lambda_sizeof",
         localEnumFeatures() + localEnumFeaturesSecond(), 36);
     result &= Test("local_enum_sibling_blocks", localEnumSiblingBlocks(), 7);
-    result &= Test("t371_parameter_same_scope", t371ParameterSameScope(9), 10);
-    result &= Test("t371_same_scope_local_wins", t371SameScopeLocalWins(), 10);
     result &= Test("t371_qualified_enumerator", t371QualifiedEnumerator(), 3);
     result &= Test("t371_type_after_enum", t371TypeAfterEnum(), 3);
     result &= Test("t371_inner_value_wins", t371InnerValueWins(), 1);
@@ -6088,6 +6073,7 @@ extern int main()
     total++; passed += testPostfixInDeclaration()          ? 1 : 0;
     total++; passed += testPostfixConditional()            ? 1 : 0;
     total++; passed += testPostfixGenericInstantiation()   ? 1 : 0;
+    total++; passed += testGenericAddressValues()          ? 1 : 0;
     total++; passed += testOffsetofIntrinsic() ? 1 : 0;
     total++; passed += testCharFamilyExplicitCasts() ? 1 : 0;
     total++; passed += testConstSpellingsParse() ? 1 : 0;
@@ -8207,6 +8193,31 @@ bool testPostfixGenericInstantiation()
     { PfgBox<int> b; b.v = 5; int c = 1; long r = c++ + b.conv<long>(); int d = c; result &= Test("pfg_generic_struct_generic_method", (int)r * 10 + d, 62); }
     // The field default `pfgGenField<T>(3)` is itself instantiated inside the struct's instantiation.
     { int c = 1; int r = c++ + pfgMkDef<int>(5).v; int d = c; result &= Test("pfg_field_default_generic", r * 10 + d, 42); }
+    return result;
+}
+
+T t428AddressId<T>(T value) { return value + 1; }
+int t428AddressSelected = 0;
+int t428AddressOverload(int value) { t428AddressSelected = 1; return value + 10; }
+T t428AddressOverload<T>(T value) { t428AddressSelected = 2; return value + 20; }
+struct T428AddressMethod { static T method<T>(T value) { return value + 1; } };
+
+bool testGenericAddressValues()
+{
+    bool result = true;
+    function<int(int)> explicitAddress = &t428AddressId<int>;
+    result &= Test("t428_explicit_generic_address", explicitAddress(2), 3);
+    function<int(int)> methodAddress = &T428AddressMethod.method<int>;
+    result &= Test("t428_explicit_generic_method_address", methodAddress(2), 3);
+    function<int(int)> overloadAddress = t428AddressOverload;
+    t428AddressSelected = 0;
+    int overloadValue = overloadAddress(3);
+    result &= Test("t428_generic_overload_keeps_concrete", t428AddressSelected * 100 + overloadValue, 113);
+    {
+        int t428AddressId = 41;
+        int* localAddress = &t428AddressId;
+        result &= Test("t428_local_shadows_generic_function", *localAddress, 41);
+    }
     return result;
 }
 

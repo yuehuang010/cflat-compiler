@@ -811,6 +811,7 @@ namespace cflat_cinterop
         std::vector<RawFunctionTemplate> functionTemplates;
         std::vector<RawClassTemplate> classTemplates;
         std::vector<std::string> classTemplateNames;
+        std::vector<std::string> variableTemplateNames;
         std::vector<std::string> classTemplateSpecializations;
         std::vector<RawEnum> enums;
         std::vector<RawRecord> records;

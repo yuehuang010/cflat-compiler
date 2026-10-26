@@ -10,6 +10,9 @@ extern int main()
     expect_error("clang: type 'int' cannot be used prior to '::'") {
         int value = w1demand.Q<int>(i).v;
     }
+    expect_error("clang: type 'int' cannot be used prior to '::' because it has no members") {
+        int value = w1demand.F<int>(i).v;
+    }
     expect_error("clang: type 'int' cannot be used prior to '::'") {
         w1demand.Q<int> q = w1demand.Q<int>(i);
     }

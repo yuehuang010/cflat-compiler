@@ -20,3 +20,7 @@ follows C, the arithmetic result is double. If CFlat deliberately types `1.0` as
 
 DEFERRED 2026-10-13 (maintainer): `1.0` is float by design (doc/LANGUAGE.md, narrowest literal typing); whether C++ call
 arguments should type unsuffixed floating literals as double is deferred - no work until reopened.
+
+T439 (2026-10-23) re-measured the text-classification shapes from the retired issue
+cpp-template-deduction-identifier-with-e-read-as-double: all match clang on master except `-(1e3) + 1` at a C++ template
+call (CFlat float, clang double) - the same deferred literal-typing question as this issue.

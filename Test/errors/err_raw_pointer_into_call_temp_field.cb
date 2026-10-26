@@ -1,0 +1,65 @@
+import "unique.cb";
+
+int t426Dtors = 0;
+struct T426Inner { int* heap = nullptr; };
+struct T426Owner { int value = 7; int* heap = nullptr; T426Inner inner; ~T426Owner() { t426Dtors = t426Dtors + 1; } };
+using T426Ptr = int*;
+unique<T426Owner> t426Mk() { T426Owner* r = new T426Owner(); r->heap = &r->value; r->inner.heap = &r->value; return unique<T426Owner>(r); }
+
+void t426StaticLocal()
+{
+    expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        static int* p = t426Mk()->heap;
+    }
+}
+
+extern int main()
+{
+    expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        int* p = t426Mk()->heap;
+    }
+    expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        auto p = t426Mk()->heap;
+    }
+    expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        T426Ptr p = t426Mk()->heap;
+    }
+    expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        int* p = (t426Mk()->heap);
+    }
+    expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        int* p = (t426Mk())->heap;
+    }
+    expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        int* p = t426Mk()->inner.heap;
+    }
+    expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        int* p = t426Mk()->heap ?? nullptr;
+    }
+    expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        int* p = nullptr;
+        p = t426Mk()->heap;
+    }
+    expect_error("cannot bind raw pointer 'q' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        bool c = true;
+        int* q = c ? t426Mk()->heap : nullptr;
+    }
+    expect_error("cannot bind raw pointer 'q' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        int* q = nullptr;
+        bool c = true;
+        q = c ? t426Mk()->heap : nullptr;
+    }
+    expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        for (int i = 0; i < 1; i = i + 1) { int* p = t426Mk()->heap; }
+    }
+    expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        int* p = &t426Mk()->value;
+    }
+    expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        int* p = &(t426Mk())->value;
+    }
+    expect_error("cannot bind raw pointer 'p' to a field pointer from an owning temporary; it is destroyed at the end of the statement - declare it 'alias'") {
+        int* p = t426Mk()->heap + 0;
+    }
+    return 0;
+}

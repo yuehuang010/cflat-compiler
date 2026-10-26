@@ -55,11 +55,30 @@ static bool InTernaryArmOfDeclaration(antlr4::tree::ParseTree* node)
     return false;
 }
 
+// True when this node is evaluated as a subscript index. An index temp is read only, even when
+// the containing subscript is under `&`, so it keeps statement-end destruction.
+static bool InPostfixSubscriptIndex(antlr4::tree::ParseTree* node)
+{
+    for (antlr4::tree::ParseTree* child = node, *p = node->parent; p != nullptr;
+         child = p, p = p->parent)
+    {
+        if (dynamic_cast<CFlatParser::PostfixExpressionContext*>(p)
+            && dynamic_cast<CFlatParser::ExpressionContext*>(child))
+            return true;
+        if (dynamic_cast<CFlatParser::DeclarationContext*>(p) != nullptr
+            || dynamic_cast<CFlatParser::StatementContext*>(p) != nullptr)
+            return false;
+    }
+    return false;
+}
+
 // True when the node may be what an `alias` declaration binds (`alias int x = mk()->v;`): the
 // bound storage outlives the statement, so the receiver temp must not die here. A subscript index,
-// a ternary test or a binary operand is only read (`alias int x = gArr[mk()->v];`), so it is not.
-static bool InAliasDeclaration(antlr4::tree::ParseTree* node)
+// ternary test, or non-additive binary operand is only read, so it does not bind the alias.
+static bool InAliasDeclaration(antlr4::tree::ParseTree* node, bool* crossedAdditive = nullptr)
 {
+    if (crossedAdditive != nullptr) *crossedAdditive = false;
+    bool crossedAddressOf = false;
     for (antlr4::tree::ParseTree* child = node, *p = node->parent; p != nullptr; child = p, p = p->parent)
     {
         if (dynamic_cast<CFlatParser::PostfixExpressionContext*>(p)
@@ -71,8 +90,21 @@ static bool InAliasDeclaration(antlr4::tree::ParseTree* node)
                 return false;
             continue;
         }
+        if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(p))
+        {
+            if (unary->unaryOperator() != nullptr && unary->unaryOperator()->And() != nullptr)
+                crossedAddressOf = true;
+            continue;
+        }
+        if (dynamic_cast<CFlatParser::AdditiveExpressionContext*>(p))
+        {
+            // An address-of below this operator makes even a scalar postfix value pointer-valued.
+            // Otherwise, only pointer arithmetic can produce the value bound by the alias.
+            if (crossedAdditive != nullptr && p->children.size() > 1 && !crossedAddressOf)
+                *crossedAdditive = true;
+            continue;
+        }
         if ((dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(p)
-                || dynamic_cast<CFlatParser::AdditiveExpressionContext*>(p)
                 || dynamic_cast<CFlatParser::ShiftExpressionContext*>(p)
                 || dynamic_cast<CFlatParser::RelationalExpressionContext*>(p)
                 || dynamic_cast<CFlatParser::EqualityExpressionContext*>(p)
@@ -93,12 +125,28 @@ static bool InAliasDeclaration(antlr4::tree::ParseTree* node)
     return false;
 }
 
+static bool IsPointerOrArrayValue(const LLVMBackend::NamedVariable& value)
+{
+    const auto& type = value.TypeAndValue;
+    return type.Pointer || type.IsArrayView || type.ConstArraySize > 0 || type.AliasArraySize > 0
+        || type.IsFlexibleArrayMember;
+}
+
+static bool AliasDeclarationMayOutlive(antlr4::tree::ParseTree* node,
+    const LLVMBackend::NamedVariable& value)
+{
+    bool crossedAdditive = false;
+    return InAliasDeclaration(node, &crossedAdditive)
+        && (!crossedAdditive || IsPointerOrArrayValue(value));
+}
+
 // True when a value read through a deref may leave the statement: an alias declaration binds it,
 // a return hands it out unless the enclosing function is not an alias function, and a lambda body
 // may run after the statement. Unknown shapes answer true (the pre-existing no-free path).
-static bool DerefResultMayOutlive(antlr4::tree::ParseTree* node)
+static bool DerefResultMayOutlive(antlr4::tree::ParseTree* node,
+    const LLVMBackend::NamedVariable& value)
 {
-    if (InAliasDeclaration(node)) return true;
+    if (AliasDeclarationMayOutlive(node, value)) return true;
     for (antlr4::tree::ParseTree* p = node->parent; p != nullptr; p = p->parent)
     {
         if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(p)) return true;
@@ -852,6 +900,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
             DiagnoseAssignmentArguments(argumentList);
         const size_t arrowTempMark = arrowOwnedTemps_.size();
         auto namedVar = ParsePostfixExpressionInner(ctx, lValue, dropTrailingChildren, use);
+        if (arrowOwnedTemps_.size() > arrowTempMark && !namedVar.FieldName.empty())
+        {
+            if (addressOfOperandDepth_ != 0 && namedVar.Storage != nullptr)
+                Compiler(ctx)->RegisterOwningTempRawPointerField(namedVar.Storage);
+            else if (namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsUnique
+                && namedVar.Primary != nullptr)
+                Compiler(ctx)->RegisterOwningTempRawPointerField(namedVar.Primary);
+        }
         // A result that borrows from the receiver temp (pointer, alias) outlives the statement, so
         // those temps stay unregistered: the pre-existing behaviour, no free. The exception is a
         // pointer to a scalar that a unary `*` reads in place (`s += *mk()->heap;`): the temp dies
@@ -862,8 +918,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
             const bool borrows = namedVar.TypeAndValue.Pointer || namedVar.TypeAndValue.IsAlias
                 || namedVar.IsAliasBorrow;
             const bool readInPlace = borrows && IsDerefOperandChain(ctx)
-                && PointsToScalar(Compiler(ctx), namedVar) && !DerefResultMayOutlive(ctx);
-            const bool aliasDecl = InAliasDeclaration(ctx);
+                && PointsToScalar(Compiler(ctx), namedVar) && !DerefResultMayOutlive(ctx, namedVar);
+            const bool aliasDecl = AliasDeclarationMayOutlive(ctx, namedVar);
             if ((borrows || aliasDecl) && !readInPlace)
                 for (size_t i = arrowTempMark; i < arrowOwnedTemps_.size(); ++i)
                 {
@@ -1846,6 +1902,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             bool forceArrow) -> bool
             {
                 auto* compiler = Compiler(ctx);
+                if (!receiver.TypeAndValue.Pointer
+                    && compiler->IsCoreUniqueType(receiver.TypeAndValue.TypeName))
+                    DrainWaitingPointerInstance(receiver.TypeAndValue.TypeName);
                 if (receiver.TypeAndValue.Pointer
                     || receiver.TypeAndValue.IsInterface
                     || receiver.TypeAndValue.TypeName.empty()
@@ -1886,18 +1945,37 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // An owning rvalue receiver (`mk()->v`) is consumed by this operator-> and
                         // never reaches a scope dtor: destroy it at the end of the full expression.
                         const std::string& recvType = receiver.TypeAndValue.TypeName;
-                        // `&mk()->v` is an address that outlives the statement: never free it here.
+                        // Raw addresses keep the existing no-free path; alias addresses extend the temp.
                         // C++-lowered receivers (sret / C++ records) keep their own slot's destruction.
                         if (!receiver.TypeAndValue.IsAlias && !receiver.FromOwningTempField
-                            && addressOfOperandDepth_ == 0
                             && recvType != "string" && recvType != "__closure_fat_ptr"
                             && !compiler->IsCxxRecord(recvType) && !compiler->ReturnsViaCxxSret(recvType)
                             && compiler->IsProducedTempValue(receiver.Primary)
                             && compiler->IsOwningValueType(recvType))
                         {
-                            compiler->RegisterOwnedStructTemp(temp, recvType);
+                            if (addressOfOperandDepth_ == 0 || InAliasDeclaration(ctx)
+                                || InPostfixSubscriptIndex(ctx))
+                                compiler->RegisterOwnedStructTemp(temp, recvType);
                             arrowOwnedTemps_.push_back(temp);
                         }
+                    }
+                    else if (receiver.IsParenthesizedProducedTemp
+                        && receiver.Storage != nullptr && receiver.Primary != nullptr
+                        && !receiver.TypeAndValue.IsAlias && !receiver.FromOwningTempField
+                        && receiver.TypeAndValue.TypeName != "string"
+                        && receiver.TypeAndValue.TypeName != "__closure_fat_ptr"
+                        && !compiler->IsCxxRecord(receiver.TypeAndValue.TypeName)
+                        && !compiler->ReturnsViaCxxSret(receiver.TypeAndValue.TypeName)
+                        && compiler->IsProducedTempValue(receiver.Primary)
+                        && compiler->IsOwningValueType(receiver.TypeAndValue.TypeName))
+                    {
+                        const LLVMBackend::OwnedTempMark allTemps{};
+                        if ((addressOfOperandDepth_ == 0 || InAliasDeclaration(ctx)
+                                || InPostfixSubscriptIndex(ctx))
+                            && !compiler->IsOwnedStructTempSince(allTemps, thisNV.Storage))
+                            compiler->RegisterOwnedStructTemp(thisNV.Storage,
+                                                              receiver.TypeAndValue.TypeName);
+                        arrowOwnedTemps_.push_back(thisNV.Storage);
                     }
 
                     // A core unique receiver is also a named local read: consult its merged move state.
@@ -1907,6 +1985,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     FlushCallPostfix();
                     auto* arrowResult = compiler->CreateOverloadedFunctionCall("operator->", { thisNV });
                     if (arrowResult == nullptr) break;
+                    const auto& arrowReturnType = compiler->lastCallReturnType;
+                    if (arrowReturnType.Pointer && !arrowReturnType.ElemPointer
+                        && !arrowReturnType.IsInterface && !arrowReturnType.IsFunctionPointer)
+                        DrainWaitingPointerInstance(arrowReturnType.TypeName);
                     forwarded = true;
 
                     // operator-> is an ABI adapter, not an ownership boundary: keep the
@@ -3260,6 +3342,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                     namedVar.TypeAndValue = fieldType;
                                     namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
+                                    if (namedVar.FromOwningTempField && namedVar.OwningTempParent)
+                                    {
+                                        if (addressOfOperandDepth_ != 0 && namedVar.Storage != nullptr)
+                                            Compiler(ctx)->RegisterOwningTempRawPointerField(namedVar.Storage);
+                                        else if (fieldType.Pointer && !fieldType.IsUnique
+                                            && namedVar.Primary != nullptr)
+                                            Compiler(ctx)->RegisterOwningTempRawPointerField(namedVar.Primary);
+                                    }
                                     namedVar.GuardLockKey = guardLockKeyHeld;
                                     namedVar.ContainsBondedClosure = structVar.ContainsBondedClosure
                                         && IsBondedClosureContainer(Compiler(ctx), fieldType);
@@ -3917,15 +4007,53 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             if (!genericClassTemplates.count(baseName) && !genericStructTemplates.count(baseName)
                                 && isFollowedByCall)
                                 LogErrorContext(prevPrimary, std::format("unknown generic function '{}'", baseName));
-                            // `wrap<int>` on a non-generic `int wrap(int)` reached no generic route: refuse it when it is a
-                            // proven CFlat function, or when no C++ import could own the spelling.
                             if (!isFollowedByCall && !genericClassTemplates.count(baseName)
                                 && !genericStructTemplates.count(baseName)
-                                && !Compiler(ctx)->AnyGenericTypeTemplateNamed(baseName)
-                                && (!Compiler(ctx)->HasCxxImportGroup()
-                                    || (Compiler(ctx)->functionTable.count(baseName) != 0
-                                        && !Compiler(ctx)->HasCxxFunctionTemplate(baseName))))
-                                LogErrorContext(prevPrimary, std::format("'{}' is not a generic function", baseName));
+                                && !Compiler(ctx)->AnyGenericTypeTemplateNamed(baseName))
+                            {
+                                auto hasVisibleValue = [&]() {
+                                    const auto local = Compiler(ctx)->GetScopedLocalOrArgument(baseName);
+                                    if (local.Storage != nullptr || local.Primary != nullptr
+                                        || !local.TypeAndValue.TypeName.empty())
+                                        return true;
+                                    const auto field = Compiler(ctx)->GetMemberVariable(baseName);
+                                    if (field.Storage != nullptr || field.Primary != nullptr
+                                        || field.BitfieldStorage != nullptr)
+                                        return true;
+                                    const std::string qualified = Compiler(ctx)->ResolveQualifiedName(baseName);
+                                    return Compiler(ctx)->GetGlobalVariableNV(qualified).Storage != nullptr
+                                        || Compiler(ctx)->GetGlobalVariableNV(baseName).Storage != nullptr
+                                        || Compiler(ctx)->GetFunction(qualified) != nullptr
+                                        || Compiler(ctx)->GetFunction(baseName) != nullptr;
+                                };
+                                const auto thisVar = Compiler(ctx)->GetThisPointer();
+                                const std::string methodTemplate = !hasVisibleValue()
+                                    && !thisVar.TypeAndValue.TypeName.empty()
+                                    ? GenericMethodTemplateKey(thisVar.TypeAndValue.TypeName, baseName)
+                                    : std::string();
+                                if (!methodTemplate.empty())
+                                    LogErrorContext(prevPrimary, std::format(
+                                        "generic method '{}' cannot be used as a bare function value here",
+                                        baseName));
+
+                                const std::string qualified = Compiler(ctx)->ResolveQualifiedName(baseName);
+                                if (Compiler(ctx)->GetFunction(qualified) != nullptr
+                                    || Compiler(ctx)->GetFunction(baseName) != nullptr)
+                                    LogErrorContext(prevPrimary, std::format(
+                                        "'{}' is not a generic function", baseName));
+                                if (Compiler(ctx)->HasCxxImportGroup())
+                                {
+                                    if (Compiler(ctx)->HasCxxFunctionTemplate(baseName))
+                                        LogErrorContext(prevPrimary, std::format(
+                                            "C++ function template '{}' cannot be used as a function value; call it instead",
+                                            baseName));
+                                    LogErrorContext(prevPrimary, std::format(
+                                        "unresolved generic function '{}' after C++ lookup found no declaration",
+                                        baseName));
+                                }
+                                LogErrorContext(prevPrimary, std::format(
+                                    "'{}' is not a generic function", baseName));
+                            }
                             primaryIdentifier = mangledName;
                             namedVar = {};
                             break;
@@ -4958,15 +5086,30 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 typeArgs.push_back(ResolveTypeArgEntry(entry));
                             }
                             auto typeParamsIt = genericFunctionTypeParams.find(templateName);
-                            if (!freeGenericFunction && typeParamsIt != genericFunctionTypeParams.end())
+                            if (typeParamsIt != genericFunctionTypeParams.end())
                             {
                                 FillGenericValueDefaults(*Compiler(ctx), templateName,
                                                          typeParamsIt->second.size(), typeArgs);
-                                if (IsFollowedByCall(ctx, genParams)
-                                    && typeParamsIt->second.size() != typeArgs.size())
+                                auto packIt = Compiler(ctx)->gts.genericFunctionPackIndex.find(templateName);
+                                const size_t packIdx = packIt != Compiler(ctx)->gts.genericFunctionPackIndex.end()
+                                    ? packIt->second : std::string::npos;
+                                const bool wrongArity = packIdx == std::string::npos
+                                    ? typeParamsIt->second.size() != typeArgs.size()
+                                    : typeArgs.size() < packIdx;
+                                const std::string genericDisplayName = [&] {
+                                    const size_t dot = primaryIdentifier.rfind('.');
+                                    return dot == std::string::npos
+                                        ? primaryIdentifier : primaryIdentifier.substr(dot + 1);
+                                }();
+                                if (IsFollowedByCall(ctx, genParams) && wrongArity)
                                     LogErrorContext(genParams, std::format(
                                         "generic function '{}' expects {} type argument(s), but the call provides {}",
-                                        primaryIdentifier, typeParamsIt->second.size(), typeArgs.size()));
+                                        genericDisplayName, typeParamsIt->second.size(), typeArgs.size()));
+                                if (!IsFollowedByCall(ctx, genParams) && wrongArity)
+                                    LogErrorContext(genParams, std::format(
+                                        "'{}' did not instantiate the generic function template '{}', so it has no value; "
+                                        "check the number and spelling of its type arguments.",
+                                        primaryIdentifier + genParams->getText(), genericDisplayName));
                             }
                             std::string mangled = InstantiateGenericFunction(templateName, typeArgs);
                             if (!mangled.empty())
@@ -4990,14 +5133,33 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             && !structVar.TypeAndValue.TypeName.empty())
                             cxxTemplateName = structVar.TypeAndValue.TypeName + "." + primaryIdentifier;
                         const size_t cxxFunctionDot = cxxTemplateName.rfind('.');
+                        const bool hasCxxFunctionTemplate =
+                            Compiler(ctx)->HasCxxFunctionTemplate(cxxTemplateName);
+                        if (hasCxxFunctionTemplate && !IsFollowedByCall(ctx, genParams))
+                            LogErrorContext(genParams, std::format(
+                                "C++ function template '{}' cannot be used as a function value; call it instead",
+                                cxxTemplateName.substr(cxxTemplateName.rfind('.') == std::string::npos
+                                    ? 0 : cxxTemplateName.rfind('.') + 1)));
                         const bool unknownCxxFunctionTemplate = cxxFunctionDot != std::string::npos
                             && Compiler(ctx)->IsCxxNamespace(namespaceContext)
                             && !Compiler(ctx)->IsStdFunctionSpecialization(cxxTemplateName)
                             && !Compiler(ctx)->IsDataStructure(cxxTemplateName)
                             && !Compiler(ctx)->IsCxxForeignTypeRegistered(cxxTemplateName)
                             && IsFollowedByCall(ctx, genParams);
-                        if (Compiler(ctx)->HasCxxFunctionTemplate(cxxTemplateName)
-                            || unknownCxxFunctionTemplate)
+                        if (templateName.empty() && !hasCxxFunctionTemplate
+                            && !unknownCxxFunctionTemplate)
+                        {
+                            const std::string qualifiedCflatFunction =
+                                !namespaceContext.empty() && Compiler(ctx)->IsNamespace(namespaceContext)
+                                    ? namespaceContext + "." + primaryIdentifier
+                                    : Compiler(ctx)->ResolveQualifiedName(primaryIdentifier);
+                            if (Compiler(ctx)->GetFunction(qualifiedCflatFunction) != nullptr)
+                                LogErrorContext(genParams, std::format(
+                                    "'{}' is not a generic function",
+                                    primaryIdentifier.substr(primaryIdentifier.rfind('.') == std::string::npos
+                                        ? 0 : primaryIdentifier.rfind('.') + 1)));
+                        }
+                        if (hasCxxFunctionTemplate || unknownCxxFunctionTemplate)
                         {
                             primaryIdentifier = cxxTemplateName;
                             // The qualified name now lives in primaryIdentifier; leave namespace
@@ -5028,6 +5190,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     (valueArg ? "#" : "") + explicitArgument);
                             }
                         }
+                        if (!IsFollowedByCall(ctx, genParams)
+                            && Compiler(ctx)->HasCxxImportGroup()
+                            && templateName.empty()
+                            && !hasCxxFunctionTemplate
+                            && !Compiler(ctx)->AnyGenericTypeTemplateNamed(primaryIdentifier))
+                            LogErrorContext(genParams, std::format(
+                                "unresolved generic function '{}' after C++ lookup found no declaration",
+                                primaryIdentifier));
                         break;
                     }
                     // [PFX-4] call `(args)`: handles builtins (toFunction, va_start, ...), then the
@@ -8370,7 +8540,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                     // An empty brace has no initializerList() child. It means
                                                     // "the default-initialized value", so there is no overlay.
                                                     if (initList != nullptr)
-                                                        EmitFieldInitializer(alloca, structType, initList);
+                                                        EmitConstructedFieldOverrides(
+                                                            alloca, structType, initList);
                                                     llvm::Value* loaded = Compiler(ctx)->CreateLoad(alloca);
                                                     LLVMBackend::NamedVariable argVar;
                                                     argVar.Primary = loaded;
@@ -12884,6 +13055,12 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
             {
                 if (rejectsGenericScalarValue())
                     return {};
+                if (addressOfOperandDepth_ != 0 && !inCxxCallArgument_)
+                {
+                    namedVar.CallerName = nsGenericBase;
+                    namedVar.IsUnresolvedGenericFunctionTemplate = true;
+                    return namedVar;
+                }
                 return {};
             }
         }
@@ -13066,6 +13243,12 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
         {
             if (rejectsGenericScalarValue())
                 return {};
+            if (addressOfOperandDepth_ != 0 && !inCxxCallArgument_)
+            {
+                namedVar.CallerName = unresolvedGeneric;
+                namedVar.IsUnresolvedGenericFunctionTemplate = true;
+                return namedVar;
+            }
             if (inCxxCallArgument_ && !hasFunctionDestination)
             {
                 bool followedByCall = false;
@@ -13660,12 +13843,28 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool to
                         auto* tupleSpec = typeSpec->tupleTypeSpecifier();
                         if (tupleSpec->tupleTypePackEntry() == nullptr)
                         {
+                            bool deferForLocalEnum = false;
+                            if (localEnumNames != nullptr)
+                                for (auto* entry : tupleSpec->tupleTypeEntry())
+                                    if (TypeSpecifierNeedsFunctionLocalEnumDeferral(
+                                            entry->typeSpecifier(), *localEnumNames,
+                                            Compiler(entry),
+                                            &Compiler(entry)->gts.scannedNonLocalEnumNames,
+                                            &Compiler(entry)->gts.scannedTypeNames))
+                                    {
+                                        deferForLocalEnum = true;
+                                        break;
+                                    }
+                            if (deferForLocalEnum)
+                                continue;  // Queue after the declaration registers the local enum.
                             std::vector<std::string> typeArgs;
+                            auto elementContext = TupleTypeElementContext(typeSpec);
                             bool allArgsResolveAsTypes = true;
                             for (auto* entry : tupleSpec->tupleTypeEntry())
                             {
                                 PrimitiveTypeError argError;
-                                std::string argName = TupleEntryArgName(Compiler(entry), entry, &argError);
+                                std::string argName = ResolveTupleTypeElementArgName(
+                                    elementContext, entry, &argError);
                                 if (HasPrimitiveTypeError(argError))
                                     LogErrorContext(entry, LocalizePrimitiveTypeError(Compiler(entry), argError));
                                 if (entry->typeSpecifier()->simdTypeSpecifier() == nullptr

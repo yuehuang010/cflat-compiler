@@ -853,44 +853,95 @@ static bool FoldPointerAliasArg(const LLVMBackend* compiler, std::string& name, 
     return true;
 }
 
-static std::string TupleEntryArgName(const LLVMBackend* compiler,
-                                     CFlatParser::TupleTypeEntryContext* entry,
-                                     PrimitiveTypeError* errorOut = nullptr)
+struct TupleTypeElementResolveContext
+{
+    LLVMBackend* Compiler = nullptr;
+    const std::unordered_map<std::string, std::string>* Substitutions = nullptr;
+    std::string Namespace;
+    std::unordered_set<std::string> LocalTypes;
+    std::function<std::string(CFlatParser::TypeSpecifierContext*,
+                              CFlatParser::MultiWordTypeSuffixContext*)> ResolveType;
+};
+
+static std::string ResolveTupleTypeElementArgName(
+    const TupleTypeElementResolveContext& context,
+    CFlatParser::TupleTypeEntryContext* entry,
+    PrimitiveTypeError* errorOut = nullptr)
 {
     PrimitiveTypeError error;
-    std::string writtenName;
-    auto* typeSpec = entry->typeSpecifier();
-    auto* nestedTuple = typeSpec != nullptr ? typeSpec->tupleTypeSpecifier() : nullptr;
-    if (compiler != nullptr && nestedTuple != nullptr
-        && nestedTuple->tupleTypePackEntry() == nullptr)
+    auto* typeSpec = entry != nullptr ? entry->typeSpecifier() : nullptr;
+    std::string writtenName = CanonicalTypeSpecifierText(
+        typeSpec, entry != nullptr ? entry->multiWordTypeSuffix() : nullptr, false, &error);
+    std::string argName;
+    auto* compiler = context.Compiler;
+    bool substituted = false;
+    if (compiler != nullptr)
     {
-        std::vector<std::string> nestedArgs;
-        for (auto* nestedEntry : nestedTuple->tupleTypeEntry())
+        LLVMBackend::NamespaceScope namespaceScope(compiler, context.Namespace);
+        auto substitution = context.Substitutions != nullptr
+            ? context.Substitutions->find(writtenName)
+            : std::unordered_map<std::string, std::string>::const_iterator{};
+        if (context.Substitutions != nullptr && substitution != context.Substitutions->end())
         {
-            PrimitiveTypeError nestedError;
-            nestedArgs.push_back(TupleEntryArgName(compiler, nestedEntry, &nestedError));
-            if (!HasPrimitiveTypeError(error) && HasPrimitiveTypeError(nestedError))
-                error = nestedError;
+            argName = substitution->second;
+            substituted = true;
         }
-        writtenName = MangleGenericInstance(*compiler, "tuple", nestedArgs);
+        else if (!HasPrimitiveTypeError(error) && context.ResolveType && typeSpec != nullptr)
+            argName = context.ResolveType(typeSpec, entry->multiWordTypeSuffix());
+        else
+            argName = std::move(writtenName);
     }
     else
-        writtenName = CanonicalTypeSpecifierText(
-            typeSpec, entry->multiWordTypeSuffix(), false, &error);
+        argName = std::move(writtenName);
     if (errorOut != nullptr) *errorOut = error;
-    std::string argName = compiler != nullptr
-        ? compiler->ResolveTypeArgBaseName(writtenName) : writtenName;
+
+    // Substitutions and nested type names can already carry pointer/view suffixes.
+    int pointerDepth = PointerDepthOf(entry != nullptr ? entry->pointer() : nullptr);
+    bool isArrayView = entry != nullptr && IsArrayViewArg(entry);
+    int elementPointerDepth = isArrayView ? pointerDepth : 0;
+    if (isArrayView) pointerDepth = 0;
+    bool resolvedArrayView = argName.ends_with("[]");
+    if (resolvedArrayView) argName.resize(argName.size() - 2);
+    const int resolvedPointerDepth = PeelAliasPointerStars(argName);
+    if (resolvedArrayView)
+    {
+        isArrayView = true;
+        elementPointerDepth += resolvedPointerDepth;
+    }
+    else if (isArrayView)
+        elementPointerDepth += resolvedPointerDepth;
+    else
+        pointerDepth += resolvedPointerDepth;
+
     if (compiler != nullptr)
-        if (std::string enumName = compiler->ResolveEnumTypeName(argName); !enumName.empty())
-            argName = std::move(enumName);
-    // Stars are counted, not flagged: a `(C**, int)` element must not mangle as `(C*, int)`.
-    // On a view they decorate the ELEMENT, so `(int*[], int)` keeps its star: "int*[]".
-    int stars = PointerDepthOf(entry->pointer());
-    FoldPointerAliasArg(compiler, argName, stars);
-    if (IsArrayViewArg(entry))
-        argName += std::string(stars, '*') + "[]";
-    else if (stars > 0)
-        argName += std::string(stars, '*');
+    {
+        LLVMBackend::NamespaceScope namespaceScope(compiler, context.Namespace);
+        if (!substituted)
+        {
+            const bool namesLocalType = context.LocalTypes.count(argName) != 0;
+            std::string enumName = compiler->ResolveEnumTypeName(argName);
+            if (!enumName.empty()) argName = std::move(enumName);
+            else if (!namesLocalType)
+            {
+                std::string scannedEnum = compiler->ResolveScannedEnumTypeName(argName);
+                if (!scannedEnum.empty()) argName = std::move(scannedEnum);
+                else argName = compiler->ResolveTypeArgBaseName(argName);
+            }
+            FoldPointerAliasArg(compiler, argName,
+                isArrayView ? elementPointerDepth : pointerDepth);
+        }
+    }
+    if (isArrayView && entry != nullptr && !IsArrayViewArg(entry)
+        && PointerDepthOf(entry->pointer()) > 0)
+    {
+        isArrayView = false;
+        pointerDepth = elementPointerDepth + PointerDepthOf(entry->pointer());
+        elementPointerDepth = 0;
+    }
+    if (isArrayView)
+        argName += std::string(elementPointerDepth, '*') + "[]";
+    else if (pointerDepth > 0)
+        argName += std::string(pointerDepth, '*');
     return argName;
 }
 
@@ -1494,6 +1545,29 @@ static bool LexicalDeclaresTypeNamed(CFlatParser::DeclarationContext* decl, cons
     }
     return false;
 }
+static bool LexicalBlockHasPriorEnum(CFlatParser::BlockItemListContext* list,
+    CFlatParser::BlockItemContext* item, const std::string& name)
+{
+    if (list == nullptr || item == nullptr || name.empty()) return false;
+    for (auto* prior : list->blockItem())
+    {
+        if (prior == item) return false;
+        auto* decl = prior->declaration();
+        auto* en = decl != nullptr ? decl->enumSpecifier() : nullptr;
+        if (en != nullptr && en->Identifier() != nullptr && en->Identifier()->getText() == name)
+            return true;
+    }
+    return false;
+}
+static antlr4::tree::TerminalNode* LexicalDirectDeclaratorIdentifier(
+    CFlatParser::DirectDeclaratorContext* direct)
+{
+    if (direct == nullptr) return nullptr;
+    if (direct->Identifier() != nullptr) return direct->Identifier();
+    auto* nested = direct->declarator();
+    return nested != nullptr
+        ? LexicalDirectDeclaratorIdentifier(nested->directDeclarator()) : nullptr;
+}
 enum class LexicalBlockBindingKind { None, Value, Type };
 struct LexicalBlockBinding
 {
@@ -1584,8 +1658,11 @@ static bool LexicalBodyHasValueParameter(CFlatParser::BlockItemListContext* list
     if (compound == nullptr) return false;
     if (auto* fn = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(compound->parent))
         return LexicalFunctionHasParameter(fn, name);
+    auto* lambdaBody = dynamic_cast<CFlatParser::LambdaBodyContext*>(compound->parent);
     return LexicalLambdaHasParameter(
-        dynamic_cast<CFlatParser::LambdaExpressionContext*>(compound->parent), name);
+        lambdaBody != nullptr
+            ? dynamic_cast<CFlatParser::LambdaExpressionContext*>(lambdaBody->parent) : nullptr,
+        name);
 }
 enum class LexicalBindingEventKind
 {
@@ -5782,6 +5859,12 @@ private:
 
     LLVMBackend* Compiler(antlr4::ParserRuleContext* ctx);
     std::string ResolveTupleTypeSpecifier(CFlatParser::TupleTypeSpecifierContext* tupleSpec);
+    TupleTypeElementResolveContext TupleTypeElementContext(antlr4::ParserRuleContext* site);
+    std::string ResolveTupleTypeElementSpecifier(
+        CFlatParser::TypeSpecifierContext* typeSpec,
+        CFlatParser::MultiWordTypeSuffixContext* suffix,
+        const std::unordered_map<std::string, std::string>* substitutions,
+        const std::string& namespaceName);
 
     // The scanner cannot evaluate an `if const` condition (no active type substitutions, no
     // expression codegen), so it skips those members rather than register a not-taken signature.
@@ -6677,6 +6760,20 @@ private:
     // Set while ParseStructDefinition parses the members of a UNION body. `unique` is rejected
     // there (ValidateUniqueField): a synthesized destructor cannot know which member is active.
     bool inUnionFieldDecl_ = false;
+    struct PendingNontrivialCxxUnionMember
+    {
+        std::string UnionName;
+        LLVMBackend::DeclTypeAndValue Field;
+        antlr4::ParserRuleContext* Context = nullptr;
+        antlr4::ParserRuleContext* UnionContext = nullptr;
+        std::unordered_set<std::string> IncompleteTypes;
+    };
+    // Recheck only after one of the member's opaque by-value types completes.
+    std::vector<PendingNontrivialCxxUnionMember> pendingNontrivialCxxUnionMembers_;
+    std::string FindNontrivialCxxTypeForUnionMember(
+        const LLVMBackend::DeclTypeAndValue& field,
+        std::unordered_set<std::string>& incompleteTypes);
+    void RecheckPendingNontrivialCxxUnionMembers(const std::string& completedTypeName);
     // Carries this body's own kind and restores on exit, so a struct nested in a union - or a
     // generic instantiation parsed mid-body - is judged by its own definition, not the enclosing one.
     struct UnionFieldDeclGuard
@@ -7010,7 +7107,8 @@ private:
 
     // Recursively resolve a typeParameterEntry to its mangled string,
     // applying activeTypeSubstitutions and handling nested generics like Box<Box<T>>.
-    std::string ResolveTypeArgEntry(CFlatParser::TypeParameterEntryContext* entry);
+    std::string ResolveTypeArgEntry(CFlatParser::TypeParameterEntryContext* entry,
+                                    bool pointerOnly = false);
     // `struct G<const T>`: a template parameter is a bare name, never const-qualified (#14).
     void RefuseConstTemplateParameters(CFlatParser::GenericTypeParametersContext* params)
     {
@@ -7033,7 +7131,8 @@ private:
             && SubstitutedConstDepth(ctx, suffix) >= std::max(p.PointerDepth, 1))
             p.IsPointeeConst = true;
     }
-    std::string ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntryContext* entry);
+    std::string ResolveTypeArgEntryRaw(CFlatParser::TypeParameterEntryContext* entry,
+                                       bool pointerOnly = false);
 
     // Queue a generic instantiation for a known template (dedup via instantiatedGenerics).
     // For struct/class templates the struct shell + default-ctor declaration are created
@@ -7061,6 +7160,7 @@ private:
     // A pointer-only record waits (is not drained) while a struct argument is a CFlat struct that
     // is declared but not yet defined. Its body would otherwise name sizeof(arg) on an opaque shell.
     bool PendingWaitsOnStructBody(const GenericTemplateState::PendingInstantiation& pending);
+    void PrepareDeferredCoreUniqueLayout(const GenericTemplateState::PendingInstantiation& pending);
     // A by-value use of an already-queued instance: the pending record's body is needed now.
     void PromotePointerOnlyInstantiation(const std::string& mangledName);
     // A member is named through a receiver of this instance: a waiting record drains now.
@@ -7955,6 +8055,15 @@ public:
      * the ledger misses degrades to no diagnostic rather than to a false rejection.
      */
     bool IsOwningTempUniqueFieldEscape(const LLVMBackend::NamedVariable& nv);
+
+    bool IsOwningTempRawPointerFieldEscape(const LLVMBackend::NamedVariable& nv) const;
+
+    void GuardRawPointerIntoOwningTempField(
+        const LLVMBackend::NamedVariable& source,
+        const LLVMBackend::TypeAndValue& destinationType,
+        bool destinationIsLocal, bool destinationIsAlias,
+        const std::string& destinationName,
+        antlr4::ParserRuleContext* ctx);
 
     /*
      * The 2026-08-21 string-from-a-temporary ruling. A `string` (or string-typed field) read out
@@ -9515,6 +9624,12 @@ public:
     std::string ParseTypeSpecifierName(CFlatParser::TypeSpecifierContext* ctx,
                                        CFlatParser::MultiWordTypeSuffixContext* suffix = nullptr);
     std::string ParseTupleTypeSpecifier(CFlatParser::TupleTypeSpecifierContext* ctx);
+    TupleTypeElementResolveContext TupleTypeElementContext(antlr4::ParserRuleContext* site);
+    std::string ResolveTupleTypeElementSpecifier(
+        CFlatParser::TypeSpecifierContext* typeSpec,
+        CFlatParser::MultiWordTypeSuffixContext* suffix,
+        const std::unordered_map<std::string, std::string>* substitutions,
+        const std::string& namespaceName);
 
     // Resolves the struct type expected at a call-site field initializer argument.
     // Pass effectiveParamIdx >= 0 for positional args (already offset by implicit 'this').
@@ -9846,7 +9961,13 @@ public:
         CFlatParser::InitializerListContext* ctx,
         bool destinationIsFresh = false,
         const std::string* onlyField = nullptr,
-        bool deferForeignReplacementDrop = false);
+        bool deferForeignReplacementDrop = false,
+        llvm::Value* completedObjectSlot = nullptr,
+        const std::string* completedObjectType = nullptr);
+    void EmitConstructedFieldOverrides(
+        llvm::Value* structPtr,
+        const std::string& typeName,
+        CFlatParser::InitializerListContext* ctx);
 
     bool RejectNestedNamedBraceInitializer(
         CFlatParser::InitializerListContext* list,

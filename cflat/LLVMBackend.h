@@ -2007,6 +2007,8 @@ public:
         // An explicit generic instantiation named without a call (`dbl<int>`): CallerName is its
         // mangled name. Read only by LowerNonCapturingClosureForCxx; not cached by --init.
         bool GenericFunctionValue = false;
+        // Bare generic template recognized while evaluating an address-of operand; no IR value exists yet.
+        bool IsUnresolvedGenericFunctionTemplate = false;
         bool DeferMovedMark = false;     // operator lowering applies the move after result formation
         bool ForceOperatorConsume = false;
         std::vector<ConditionalMoveSource> ConditionalMoveSources;
@@ -2867,7 +2869,11 @@ private:
      */
     std::vector<llvm::Value*> owningTempUniqueFields_;
 
+    std::vector<llvm::Value*> owningTempRawPointerFields_;
+
     void RegisterOwningTempUniqueField(llvm::Value* value);
+
+    void RegisterOwningTempRawPointerField(llvm::Value* value);
 
     bool IsLedgeredOwningTempUniqueField(const llvm::Value* value) const;
 
@@ -2884,6 +2890,8 @@ private:
      * read really does dangle - the exclusion had to be deleted in the same change.
      */
     bool JoinCarriesOwningTempUniqueField(const llvm::Value* value, int depth = 0) const;
+
+    bool JoinCarriesOwningTempRawPointerField(const llvm::Value* value, int depth = 0) const;
 
     /*
      * A call RESULT that was ledgered above because the call LAUNDERED a temp's `unique` field
@@ -3969,6 +3977,8 @@ private:
         std::string label;
         size_t primary = static_cast<size_t>(-1);   // index into cxxImportGroups_
         std::vector<size_t> dependencyGroups;       // indices into cxxImportGroups_, sorted
+        // Imported headers that explicitly specialize the requested primary template.
+        std::vector<size_t> specializationGroups;
         // Which entries a request-cache prune may judge against this group's validity: the
         // whole header/define composition plus the include dirs, -D defines and C++ standard.
         std::string pruneScope;
@@ -4641,6 +4651,7 @@ private:
         std::vector<cflat_cinterop::RawFunctionTemplate> functionTemplates;
         std::vector<cflat_cinterop::RawClassTemplate> classTemplates;
         std::vector<std::string> classTemplateNames;
+        std::vector<std::string> variableTemplateNames;
         std::vector<std::string> classTemplateSpecializations;
         // Namespace leads a C++ header extraction seeded into its import group (signature
         // spellings, included headers). A hit replays them: they order owner-group candidates.
@@ -4707,6 +4718,7 @@ private:
     {
         return entry.sigs.size() + entry.functionTemplates.size() + entry.classTemplates.size()
              + entry.classTemplateNames.size()
+             + entry.variableTemplateNames.size()
              + entry.classTemplateSpecializations.size()
              + entry.cxxGroupNamespaces.size() + entry.enums.size() + entry.records.size()
              + entry.macros.size() + entry.funcMacros.size() + entry.globals.size()
@@ -5019,10 +5031,17 @@ private:
     std::unordered_map<std::string, std::string> compileTimeStringConstants_;
     // True while the file being scanned/walked lives under runtimeDir/core (set by CompileImportedFile).
     bool currentSourceIsCore_ = false;
-    // Where a function BODY was first attached, keyed on the MANGLED name: source file leaf and
-    // line. Read only to tell a genuine redefinition apart from the same definition arriving twice.
+    struct FunctionBodyOrigin
+    {
+        std::string file;
+        size_t line = 0;
+        size_t column = std::string::npos;
+        bool isMethod = false;
+        bool isConstMethod = false;
+    };
+    // Keyed by LLVM overload name; logical source leaf and line/column identify one body across rewalks.
     // Per-compile; cleared by ResetForReanalysis with the module it describes.
-    std::unordered_map<std::string, std::pair<std::string, size_t>> functionBodyOrigin_;
+    std::unordered_map<std::string, FunctionBodyOrigin> functionBodyOrigin_;
     std::unordered_set<std::string> isolatedCoreFunctions_;
     llvm::AllocaInst* autoVaListAlloca = nullptr;
 
@@ -7452,6 +7471,7 @@ private:
                              std::vector<std::pair<std::string, std::string>>* outUsingDirectives = nullptr,
                              std::vector<std::pair<std::string, std::string>>* outNamespaceAliases = nullptr,
                              std::vector<std::string>* outClassTemplateNames = nullptr,
+                             std::vector<std::string>* outVariableTemplateNames = nullptr,
                              std::vector<std::pair<std::string, std::string>>* outClassUsings = nullptr,
                              std::vector<std::string>* outClassTemplateSpecializations = nullptr,
                              std::vector<cflat_cinterop::RawClassTemplate>* outClassTemplates = nullptr);
@@ -7496,6 +7516,7 @@ private:
                                     const std::vector<CGlobalEntry>& globals,
                                     const std::vector<CRecordEntry>& records,
                                     const std::vector<std::string>& classTemplateNames,
+                                    const std::vector<std::string>& variableTemplateNames,
                                     const std::vector<std::pair<std::string, std::string>>& classUsings,
                                     const std::vector<cflat_cinterop::RawFunctionTemplate>& functionTemplates,
                                     const std::string& fileForLsp);
@@ -7709,6 +7730,7 @@ public:
         std::vector<llvm::Value*> dataValues;
         std::vector<std::pair<llvm::Value*, size_t>> codeValueDataCasts;
         std::vector<llvm::Value*> owningTempUniqueFields;
+        std::vector<llvm::Value*> owningTempRawPointerFields;
         std::vector<LaunderedTempUniqueField> launderedTempUniqueFields;
         std::vector<PendingLaunderTempUniqueField> pendingLaunderTempUniqueFields;
         std::vector<std::pair<llvm::Value*, size_t>> dataValueCodeCasts;
@@ -8390,6 +8412,7 @@ public:
     // used only to look up the if-const hint.
     static std::string TemplateBaseOfMangledName(const std::string& mangled);
 
+    bool IsCoreUniqueTemplate(const std::string& templateName) const;
     bool IsCoreUniqueType(const std::string& typeName) const;
     // True for a mangled instantiation of the core `array<T>` (array$<T>).
     bool IsCoreArrayType(const std::string& typeName) const;
@@ -10195,6 +10218,13 @@ public:
             const_cast<LLVMBackend*>(this)->EnsureCxxRecordProjected(typeName, false);
         return cxxNontrivialRecords_.count(typeName) != 0;
     }
+    bool HasNontrivialCxxSpecialMembersForUnion(const std::string& typeName) const
+    {
+        auto record = cxxRecordEntries_.find(typeName);
+        if (record != cxxRecordEntries_.end() && record->second.isCxx)
+            return !record->second.isTrivial;
+        return IsForeignNontrivialCxxClass(typeName);
+    }
     bool HasForeignNontrivialCxxFieldForAnalysis(const std::string& typeName) const
     {
         return HasForeignNontrivialCxxField(typeName);
@@ -10905,25 +10935,14 @@ public:
     static std::string SourceFileLeaf(const std::string& path);
 
     /*
-     * A SECOND body for a mangled name - two definitions of one overload slot. Until now the first
-     * one silently won and the second was unreachable, so `int f(int)` written twice compiled and
-     * ran the first body. Since ToUniqueString became canonical, `f(int)` and `f(i32)` reach here
-     * too: they are one overload, and before that they were two that picked each other's arguments.
-     *
-     * Reported ONLY when both origins carry a real source line AND the LINES differ. Line 0 is a
-     * compiler-generated definition (lambda bodies, trampolines, thread shims) where re-entry is
-     * routine, and a file processed twice - as the primary input and as its own import - re-attaches
-     * the same body at the same line.
-     *
-     * The line alone is the discriminator; currentSourceFilePath_ is deliberately NOT part of it,
-     * only of the message. It is not stable across the LSP re-analysis path: a bulk sweep attached
-     * cocoa.cb's `setMenuHandler` twice under two different path values and the file comparison
-     * reported the single definition as a redefinition of itself. Two DIFFERENT files holding the
-     * same overload at the same line therefore go unreported - silence is the safe direction here,
-     * being exactly what the compiler did before.
+     * A second body for a mangled name is a duplicate overload body. Same source leaf/line/column
+     * means the definition was rewalked; source leaves stay stable across LSP path aliases.
+     * Unknown columns keep same-line rewalks silent. Const and non-const methods currently share
+     * an LLVM name, so their same-line pair also keeps the existing silent behavior.
      */
     void DiagnoseDuplicateFunctionBody(const std::string& functionName,
-        const std::string& mangledName, size_t line) const;
+        const std::string& mangledName, size_t line, size_t column,
+        bool isMethod, bool isConstMethod) const;
 
     /*
      * Is this overload slot already occupied by a BODY? Answers the exact question
@@ -10939,7 +10958,7 @@ public:
         const std::vector<LLVMBackend::TypeAndValue>& arguments, bool varargs,
         std::string* originFile, size_t* originLine);
 
-    llvm::Function* CreateFunctionDefinition(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, size_t scopeLine = 0, const std::string& linkageName = {});
+    llvm::Function* CreateFunctionDefinition(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, size_t scopeLine = 0, const std::string& linkageName = {}, size_t column = std::string::npos);
 
     // True when 'name' resolves to a type in the current compilation: a scalar
     // keyword, an enum, a type alias, an interface, or a registered struct. Used by
@@ -12877,6 +12896,7 @@ public:
     // Resolve a written type spelling to the registered enum key it names (walking the enclosing
     // namespaces and one alias hop), or "" when it names no enum.
     std::string ResolveEnumTypeName(const std::string& spelled) const;
+    std::string ResolveScannedEnumTypeName(const std::string& spelled) const;
     bool IsGenericLocalEnumKey(const std::string& key) const;
     // Scan-time constant queries for the pre-pass `if const` folder. Both answer only when the
     // fact is already known without emitting IR or a diagnostic; false means "undecidable here".
@@ -13302,7 +13322,8 @@ public:
     // 275: class-template default arguments are cached for canonical specialization names (T358).
     // 276: non-type defaults store evaluated values; unsupported dependent values stay absent (T358 r2).
     // 277: user-declared defaulted trivial copy assignment is harvested as usable (T417).
-    static constexpr int kCHeaderCacheVersion = 282;
+    // 283: namespace-scope variable-template names are cached for C++ conflict checks (T436).
+    static constexpr int kCHeaderCacheVersion = 283;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. ON by

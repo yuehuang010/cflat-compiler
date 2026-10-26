@@ -1,0 +1,37 @@
+int t428AddressFree<T>(T value) { return value; }
+int t428AddressConditional<T>(T value) { return value; }
+int t428AddressAssign<T>(T value) { return value; }
+int t428AddressReturnTarget<T>(T value) { return value; }
+int t428AddressArgument<T>(T value) { return value; }
+void t428TakePointer(void* value) {}
+
+expect_error("cannot take the address of generic function 't428AddressReturnTarget'") {
+    void* t428AddressReturn() { return &t428AddressReturnTarget; }
+}
+
+namespace T428AddressNs
+{
+    int t428AddressNs<T>(T value) { return value; }
+    expect_error("cannot take the address of generic function 't428AddressNs'") {
+        void* t428AddressNsReturn() { return &t428AddressNs; }
+    }
+}
+
+extern int main()
+{
+    expect_error("cannot take the address of generic function 't428AddressFree'") {
+        void* value = &t428AddressFree;
+    }
+    expect_error("cannot take the address of generic function 't428AddressConditional'") {
+        bool condition = true;
+        void* value = condition ? &t428AddressConditional : &t428AddressConditional;
+    }
+    expect_error("cannot take the address of generic function 't428AddressAssign'") {
+        void* value = nullptr;
+        value = &t428AddressAssign;
+    }
+    expect_error("cannot take the address of generic function 't428AddressArgument'") {
+        t428TakePointer(&t428AddressArgument);
+    }
+    return 0;
+}

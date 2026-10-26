@@ -1,0 +1,4 @@
+// T436: a class and variable template with one namespace name are a C++ redefinition.
+expect_error("C++ declaration conflicts with a declaration already in scope");
+import cpp "cpp_t436_class_v.hpp";
+import cpp "cpp_t436_vartmpl_v.hpp";

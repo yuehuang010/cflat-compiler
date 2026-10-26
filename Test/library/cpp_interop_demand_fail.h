@@ -85,3 +85,10 @@ template<class T> struct Fill {
     Fill(unsigned long count) : n((int)count) {}
 };
 }
+namespace w1demand {
+template<class T> struct F {
+    int v = 0;
+    template<class U> F(U x) { U::nope; }
+    F(double x) : v(12) {}
+};
+}
