@@ -645,3 +645,12 @@ namespace cppt306
         operator cpptw::Twin() const { return cpptw::Twin(field); }
     };
 }
+
+// T453: a member by-value Twin operand used by ternary and nested constructor expressions.
+namespace cppt453
+{
+    struct Adder
+    {
+        int operator+(cpptw::Twin value) const { return value.value(); }
+    };
+}

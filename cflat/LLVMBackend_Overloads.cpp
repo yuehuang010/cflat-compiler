@@ -1356,13 +1356,24 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                     out.from = param.TypeName;
                     // An inherited member's object is a derived-to-base conversion (clang's
                     // Conversion rank), so the comparator ranks it below an exact receiver.
-                    if (!candidate.CxxInheritedOwner.empty()
-                        && candidate.CxxInheritedOwner != param.TypeName)
-                        out.toClass = candidate.CxxInheritedOwner;
+                    const std::string inheritedOwner = CxxInheritedMemberOwner(receiver, candidate);
+                    if (!inheritedOwner.empty() && inheritedOwner != param.TypeName)
+                    {
+                        out.toClass = inheritedOwner;
+                        if (CxxBaseSubobjectCount(receiver, inheritedOwner) > 1)
+                        {
+                            out.rank = kCxxNonViableRank;
+                            out.cxxViable = false;
+                        }
+                    }
                     out.implicitObjectCvNonViable = (receiverCv & ~memberCv) != 0;
                     if (out.implicitObjectCvNonViable)
+                    {
                         out.rank = kCxxNonViableRank;
-                    out.cxxViable = !out.implicitObjectCvNonViable;
+                        out.cxxViable = false;
+                    }
+                    else if (out.rank != kCxxNonViableRank)
+                        out.cxxViable = true;
                 }
                 continue;
             }
@@ -4245,11 +4256,14 @@ bool LLVMBackend::IsReferenceOrSinkParameter(const TypeAndValue& param)
 // T142: the reason a `default` argument cannot bind this parameter; empty when it can (plain by-value).
 std::string LLVMBackend::DefaultArgumentRefusal(const TypeAndValue& param)
 {
-        if (IsReferenceOrSinkParameter(param)) return "is a reference, move or owning-sink parameter";
+        const bool foreignCxxValue = !param.Pointer && !param.IsAlias && !param.IsRvalueRef
+            && !param.IsCxxRefToPointer && !param.CxxConstRef()
+            && IsForeignNontrivialCxxClass(param.TypeName);
+        if (!foreignCxxValue && IsReferenceOrSinkParameter(param))
+            return "is a reference, move or owning-sink parameter";
         if (param.IsFatInterfaceValue() || param.IsArrayView || param.IsFunctionPointer)
             return "is not a plain value parameter";
         if (!IsKnownTypeName(param.TypeName)) return "has no concrete type";
-        if (!param.Pointer && IsCxxRecord(param.TypeName)) return "is a C++ class parameter";
         return {};
 }
 
@@ -5575,6 +5589,19 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         CxxPreferredOverload cxxPreferred;
         auto [matched, candidate] = ComputeOverloadFunction(resolvedCandidate, &tiedCandidates,
                                                             &cxxPreferred);
+        const std::string inheritedOwner = matched.empty() ? std::string()
+            : CxxInheritedMemberOwner(matched.front().TypeAndValue.TypeName, candidate);
+        if (!inheritedOwner.empty()
+            && CxxBaseSubobjectCount(matched.front().TypeAndValue.TypeName, inheritedOwner) > 1)
+        {
+            const auto ranks = RankCxxConversionSequences(matched, candidate);
+            if (!ranks.empty() && ranks.front().toClass == inheritedOwner
+                && ranks.front().rank == kCxxNonViableRank)
+                LogError(std::format(
+                    "ambiguous base conversion from '{}' to base class '{}' while calling '{}'",
+                    DisplayCxxClassName(matched.front().TypeAndValue.TypeName),
+                    DisplayCxxClassName(inheritedOwner), shownFunctionName));
+        }
         // C ABI `extern` definition with a CFlat body: the callee destroys its owning by-value
         // params, so every such param takes the argument over like a declared `move` param.
         if (candidate.External && candidate.HasCFlatBody)
@@ -5754,6 +5781,40 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             "Cast the argument to the parameter type you mean.",
                             { shownFunctionName, candidateList });
             return nullptr;
+        }
+
+        if (candidate.IsCxx && candidate.Function != nullptr && !arguments.empty())
+        {
+            const size_t sourceDot = candidate.SourceName.rfind('.');
+            const std::string memberName = candidate.SourceName.substr(
+                sourceDot == std::string::npos ? 0 : sourceDot + 1);
+            if (memberName.starts_with("operator"))
+            {
+                bool instanceTemplateWrapper = false;
+                if (!candidate.IsMethod)
+                    if (auto signatures = cxxFunctionSignatures_.find(candidate.SourceName);
+                        signatures != cxxFunctionSignatures_.end())
+                        for (const auto& raw : signatures->second)
+                            if (raw.isInstanceTemplateWrapper
+                                && raw.linkageName == candidate.UniqueName)
+                            {
+                                instanceTemplateWrapper = true;
+                                break;
+                            }
+                if (candidate.IsMethod || instanceTemplateWrapper)
+                {
+                    std::string receiverType = arguments.front().TypeAndValue.TypeName;
+                    if (receiverType.empty() && !candidate.Parameters.empty())
+                        receiverType = candidate.Parameters.front().TypeName;
+                    const auto& receiver = arguments.front();
+                    if (IsCxxRecord(receiverType)
+                        && RejectInaccessibleCxxMember(
+                            receiverType, memberName,
+                            receiver.CallerName == "this" && receiver.FieldName.empty(),
+                            false, true))
+                        return nullptr;
+                }
+            }
         }
 
         RejectFailedCxxDefaultCandidate(candidate, arguments.size());
@@ -8271,14 +8332,22 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     continue;
                 }
                 auto* structTy = candidate.Recipe.paramSlots[i].structTy;
+                const bool calleeDestroysCxxParam = IsCxxParamDestroyedInCallee(pn);
                 // A C++ class prvalue (call, operator or constructor result) already sits in an owned
                 // temp of this full expression. C++17 elision binds that object as the parameter:
                 // no second object and no move, as clang does.
                 if (cxxObject && IsOwnedCxxPrvalueArgument(matched[i], structTy))
                 {
                     // A callee-destroyed parameter takes the temp's destruction from the caller.
-                    if (IsCxxParamDestroyedInCallee(pn))
-                        UnregisterOwnedStructTemp(matched[i].Storage);
+                    if (calleeDestroysCxxParam)
+                    {
+                        if (auto* storageJoin = llvm::dyn_cast_or_null<llvm::PHINode>(
+                                matched[i].Storage))
+                            for (unsigned arm = 0; arm < storageJoin->getNumIncomingValues(); ++arm)
+                                UnregisterOwnedStructTemp(storageJoin->getIncomingValue(arm));
+                        else
+                            UnregisterOwnedStructTemp(matched[i].Storage);
+                    }
                     cxxIndirectArgAddrs.resize(candidate.Recipe.paramSlots.size(), nullptr);
                     cxxIndirectArgAddrs[i] = matched[i].Storage;
                     continue;
@@ -8321,8 +8390,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     }
                 }
                 else if (!EmitCxxByValueParamConstruct(pn, temp, matched[i].Storage, useMove,
-                                                       "into a by-value parameter")) continue;
-                if (cxxObject && !IsCxxParamDestroyedInCallee(pn))
+                                                       "into a by-value parameter",
+                                                       CxxConstReceiverKind(matched[i]) != 0)) continue;
+                if (cxxObject && !calleeDestroysCxxParam)
                     RegisterOwnedStructTemp(temp, pn);
                 cxxIndirectArgAddrs.resize(candidate.Recipe.paramSlots.size(), nullptr);
                 cxxIndirectArgAddrs[i] = temp;

@@ -103,6 +103,73 @@ struct TypeManglingAccess
         return std::nullopt;
     }
 
+    static std::optional<std::pair<std::string, size_t>> NestedGenericPrefix(
+        const LLVMBackend& compiler, std::string_view text, size_t position)
+    {
+        size_t bestLength = 0;
+        std::optional<std::pair<std::string, size_t>> result;
+        const auto& g = compiler.gts;
+        auto inspect = [&](const auto& templates)
+        {
+            for (const auto& [key, params] : templates)
+            {
+                const size_t dot = key.rfind('.');
+                if (dot == std::string::npos || key.substr(0, dot).find('$') == std::string::npos
+                    || key.size() <= bestLength || params.empty())
+                    continue;
+                const std::string_view remaining = text.substr(position);
+                if (remaining.size() <= key.size() || remaining[key.size()] != '$'
+                    || !remaining.starts_with(key))
+                    continue;
+                bestLength = key.size();
+                result = std::pair<std::string, size_t>{ key, params.size() };
+            }
+        };
+        inspect(g.genericStructTypeParams);
+        inspect(g.genericInterfaceTypeParams);
+        return result;
+    }
+
+    static bool IsNestedAggregateTypeKey(const LLVMBackend& compiler, std::string_view key)
+    {
+        size_t dot = key.rfind('.');
+        while (dot != std::string_view::npos)
+        {
+            const size_t end = key.find('$', dot);
+            const std::string_view token = key.substr(dot,
+                end == std::string_view::npos ? std::string_view::npos : end - dot);
+            bool prefixMarker = token == ".p" || token == ".v" || token == ".a";
+            if (!prefixMarker && token.size() > 2 && token.starts_with(".c"))
+            {
+                prefixMarker = std::all_of(token.begin() + 2, token.end(),
+                    [](char c) { return c >= '0' && c <= '9'; });
+            }
+            if (!prefixMarker && token.size() > 1 && token.front() == '.')
+            {
+                const std::string_view digits = token.substr(1);
+                prefixMarker = std::all_of(digits.begin(), digits.end(),
+                    [](char c) { return c >= '0' && c <= '9'; });
+                if (!prefixMarker && digits.size() > 1 && digits.front() == 'n')
+                    prefixMarker = std::all_of(digits.begin() + 1, digits.end(),
+                        [](char c) { return c >= '0' && c <= '9'; });
+            }
+            if (!prefixMarker) break;
+            if (dot == 0) return false;
+            dot = key.rfind('.', dot - 1);
+        }
+        if (dot == std::string_view::npos
+            || key.substr(0, dot).find('$') == std::string_view::npos)
+            return false;
+        const std::string owner(key.substr(0, dot));
+        const std::string name(key);
+        if (compiler.dataStructures.count(owner) == 0
+            || compiler.IsCxxForeignTypeRegistered(name) || compiler.IsCxxRecord(name))
+            return false;
+        return compiler.dataStructures.count(name) != 0
+            || compiler.gts.genericStructTypeParams.count(name) != 0
+            || compiler.gts.genericInterfaceTypeParams.count(name) != 0;
+    }
+
     static bool IsRegisteredLocalEnum(const LLVMBackend& compiler,
                                       std::string_view name)
     {
@@ -379,6 +446,22 @@ TypeParseCandidates ComputeMangledCandidates(const LLVMBackend& compiler,
     if (!ParseTypePrefix(text, basePosition, prefix)) return out;
     if (basePosition >= text.size()) return out;
 
+    if (auto nested = TypeManglingAccess::NestedGenericPrefix(compiler, text, basePosition))
+    {
+        std::vector<TypeSpelling> args;
+        ParseMangledArguments(compiler, text, basePosition + nested->first.size() + 1,
+                              nested->second, std::move(args), out, nested->first, prefix, memo);
+        if (!out.empty()) return out;
+    }
+
+    if (TypeManglingAccess::IsNestedAggregateTypeKey(compiler, text.substr(basePosition)))
+    {
+        TypeSpelling nested;
+        nested.base = std::string(text.substr(basePosition));
+        AddTypeCandidate(std::move(nested), text.size(), prefix, out);
+        return out;
+    }
+
     ParseClosureCandidates(compiler, text, basePosition, prefix, out, memo);
     if (!out.empty()) return out;
 
@@ -588,6 +671,20 @@ static std::string GenericLocalEnumDisplayName(const LLVMBackend& compiler,
     return dot == std::string::npos ? enumKey : enumKey.substr(dot + 1);
 }
 
+std::string PrintTypeSpelling(const LLVMBackend& compiler, const TypeSpelling& spelling);
+
+static std::string SpellNestedTypeBase(const LLVMBackend& compiler, const std::string& base)
+{
+    if (!TypeManglingAccess::IsNestedAggregateTypeKey(compiler, base)) return base;
+    const size_t dot = base.rfind('.');
+    if (dot == std::string::npos) return base;
+    const std::string parent = base.substr(0, dot);
+    TypeSpelling parentSpelling;
+    const std::string parentName = DemangleType(compiler, parent, parentSpelling)
+        ? PrintTypeSpelling(compiler, parentSpelling) : parent;
+    return parentName + "." + base.substr(dot + 1);
+}
+
 std::string PrintTypeSpelling(const LLVMBackend& compiler, const TypeSpelling& spelling)
 {
     if (spelling.closure)
@@ -617,7 +714,8 @@ std::string PrintTypeSpelling(const LLVMBackend& compiler, const TypeSpelling& s
 
     std::string result = spelling.alias ? "alias " : "";
     const std::string localEnum = GenericLocalEnumDisplayName(compiler, spelling.base);
-    const std::string& base = localEnum.empty() ? spelling.base : localEnum;
+    const std::string nestedBase = SpellNestedTypeBase(compiler, spelling.base);
+    const std::string& base = localEnum.empty() ? nestedBase : localEnum;
     result += base == "longdouble" ? "long double" : base;
     // std.function's argument is a FUNCTION TYPE (`std.function<int(int)>`), encoded as a thin
     // callable: print the signature itself, not a nested `function<...>`.

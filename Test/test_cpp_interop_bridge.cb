@@ -1733,6 +1733,70 @@ int bridge_t306_cpp_cast_ctor_ternary_default(bool c)
     return bridge_t299_pack_result(value, baseLive);
 }
 
+int bridge_t453_cpp_nested_ternary(bool c, bool d)
+{
+    int baseLive = cpptw.live_allocations();
+    int value = 0;
+    {
+        cpptw.Twin tw = default;
+        value = cpptw.take(c ? (d ? default : bridge_t306_rettw()) : move tw);
+    }
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t453_cpp_member_ternary(bool c)
+{
+    int baseLive = cpptw.live_allocations();
+    cppt453.Adder ad = default;
+    int value = ad + (c ? default : bridge_t306_rettw());
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t453_cpp_member_nested_copy()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = 0;
+    {
+        cppt453.Adder ad = default;
+        value = cpptw.take(cpptw.Twin(ad + (cpptw.Twin)(default)));
+    }
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t453_cpp_new_holder()
+{
+    int baseLive = cpptw.live_allocations();
+    cppt306.Holder* holder = new cppt306.Holder((default));
+    int value = holder.value();
+    delete holder;
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t453_cpp_brace_holder()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = 0;
+    { cppt306.Holder holder{ default }; value = holder.value(); }
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t453_cflat_ctake(cpptw.Twin value) { return value.value(); }
+cpptw.Twin bridge_t453_ctakeret(cpptw.Twin value) { return move value; }
+
+int bridge_t453_cflat_ctake_wrap()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = cpptw.take(cpptw.Twin(bridge_t453_cflat_ctake(default)));
+    return bridge_t299_pack_result(value, baseLive);
+}
+
+int bridge_t453_cflat_ctakeret_wrap()
+{
+    int baseLive = cpptw.live_allocations();
+    int value = cpptw.take(bridge_t453_ctakeret(default));
+    return bridge_t299_pack_result(value, baseLive);
+}
+
 // T391: a local class arm into a bound by-value C++ free function leaves no live allocation (clang: 0).
 int bridge_t391_twin_live_delta(bool c)
 {
@@ -1787,6 +1851,56 @@ int bridge_t391_ternref_free_take_always_false()
         value = ternref.t391_take(false ? default : v);
     }
     return value * 100000 + ternref.t391_stats();
+}
+
+// T459: `c ? default : v` into a C++ static member taking `const T391Val&` (clang: the conditional is a prvalue).
+int bridge_t459_static_cref(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T391Val v = ternref.T391Val(7);
+        value = ternref.T391StaticHost.tref(c ? default : v);
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+
+// T459: the same arm into a constructor taking `const T391Val&`, as a declaration and as an expression.
+int bridge_t459_ctor_cref(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T391Val v = ternref.T391Val(7);
+        ternref.T391Sink sink = ternref.T391Sink(c ? default : v);
+        value = sink.value();
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+
+int bridge_t459_ctor_expr_cref(bool c)
+{
+    int value = 0;
+    ternref.t391_reset();
+    {
+        ternref.T391Val v = ternref.T391Val(7);
+        value = ternref.T391Sink(c ? default : v).value();
+    }
+    return value * 100000 + ternref.t391_stats();
+}
+
+// T459 r3: with an int constructor viable, `c ? default : int local` selects Mixed(int) (clang: 27 / 20).
+int bridge_t459_mixed_expr(bool c)
+{
+    int v = 7;
+    return ternref.T391Mixed(c ? default : v).value();
+}
+
+int bridge_t459_mixed_decl(bool c)
+{
+    int v = 7;
+    ternref.T391Mixed m = ternref.T391Mixed(c ? default : v);
+    return m.value();
 }
 
 cpptw.Twin bridge_t395_rettw() { return cpptw.Twin(7); }
@@ -6453,6 +6567,38 @@ extern int main(int argc, char** argv)
     bridge_check("bridge T306 same-type cast default/return ternary true",
         bridge_t306_cpp_cast_ternary_default(true), 1000010);
 
+    // T453: default temporaries keep their C++ target object and lifetime through joins and wrappers.
+    cpptw.reset_counts();
+    bridge_check("bridge T453 nested default/return/move ternary true true",
+        bridge_t453_cpp_nested_ternary(true, true), 2000020);
+    cpptw.reset_counts();
+    bridge_check("bridge T453 nested default/return/move ternary true false",
+        bridge_t453_cpp_nested_ternary(true, false), 2000020);
+    cpptw.reset_counts();
+    bridge_check("bridge T453 nested default/return/move ternary false false",
+        bridge_t453_cpp_nested_ternary(false, false), 1010020);
+    cpptw.reset_counts();
+    bridge_check("bridge T453 member default/return ternary false",
+        bridge_t453_cpp_member_ternary(false), 1000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T453 member default/return ternary true",
+        bridge_t453_cpp_member_ternary(true), 1000010);
+    cpptw.reset_counts();
+    bridge_check("bridge T453 nested member operator default has no extra copy",
+        bridge_t453_cpp_member_nested_copy(), 2000020);
+    cpptw.reset_counts();
+    bridge_check("bridge T453 new Holder parenthesized default argument",
+        bridge_t453_cpp_new_holder(), 1100020);
+    cpptw.reset_counts();
+    bridge_check("bridge T453 direct-list Holder default argument",
+        bridge_t453_cpp_brace_holder(), 1100020);
+    cpptw.reset_counts();
+    bridge_check("bridge T453 CFlat value wrapper default argument",
+        bridge_t453_cflat_ctake_wrap(), 2000020);
+    cpptw.reset_counts();
+    bridge_check("bridge T453 CFlat move-return wrapper default argument",
+        bridge_t453_cflat_ctakeret_wrap(), 1010020);
+
     // T306 round 3: a same-type cast around a ternary into a constructor with a defaulted trailing param.
     cpptw.reset_counts();
     bridge_check("bridge T306 r3 cast ctor ternary default false",
@@ -6467,6 +6613,17 @@ extern int main(int argc, char** argv)
     bridge_check("bridge T391 free const& default ternary false", bridge_t391_ternref_free_cref(false), 711020);
     bridge_check("bridge T391 free const& default ternary true", bridge_t391_ternref_free_cref(true), 20020);
     bridge_check("bridge T391 member const& default ternary true", bridge_t391_ternref_member_cref(true), 3020020);
+    bridge_check("bridge T391 member const& default ternary false", bridge_t391_ternref_member_cref(false), 3711020);
+    bridge_check("bridge T459 static const& default ternary false", bridge_t459_static_cref(false), 5711020);
+    bridge_check("bridge T459 static const& default ternary true", bridge_t459_static_cref(true), 5020020);
+    bridge_check("bridge T459 ctor const& default ternary false", bridge_t459_ctor_cref(false), 711020);
+    bridge_check("bridge T459 ctor const& default ternary true", bridge_t459_ctor_cref(true), 20020);
+    bridge_check("bridge T459 ctor expr const& default ternary false", bridge_t459_ctor_expr_cref(false), 711020);
+    bridge_check("bridge T459 ctor expr const& default ternary true", bridge_t459_ctor_expr_cref(true), 20020);
+    bridge_check("bridge T459 mixed ctor expr int overload false", bridge_t459_mixed_expr(false), 27);
+    bridge_check("bridge T459 mixed ctor expr int overload true", bridge_t459_mixed_expr(true), 20);
+    bridge_check("bridge T459 mixed ctor decl int overload false", bridge_t459_mixed_decl(false), 27);
+    bridge_check("bridge T459 mixed ctor decl int overload true", bridge_t459_mixed_decl(true), 20);
     bridge_check("bridge T391 free by-value default ternary false", bridge_t391_ternref_free_take(false), 711020);
     bridge_check("bridge T391 free by-value default ternary true", bridge_t391_ternref_free_take(true), 20020);
     bridge_check("bridge T391 free by-value always-false ternary",

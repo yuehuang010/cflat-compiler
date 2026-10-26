@@ -150,3 +150,72 @@ namespace t420r2overload
         inline int take(cpptw::Twin value) { return 200 + value.value(); }
     }
 }
+
+namespace t461cv
+{
+    struct CV
+    {
+        int value;
+        explicit CV(int n) : value(n) {}
+        CV(CV& other) : value(other.value + 100) {}
+        CV(const CV& other) : value(other.value + 200) {}
+        ~CV() {}
+    };
+    inline int take(CV value) { return value.value; }
+    template<class T> inline int template_take(T value) { return value.value; }
+    struct Host { int member_take(CV value) { return value.value; } };
+    struct Sink
+    {
+        int result;
+        Sink(CV value) : result(value.value) {}
+    };
+    struct Box
+    {
+        CV item;
+        explicit Box(int n) : item(n) {}
+    };
+    inline const CV& const_ref(const CV& value) { return value; }
+
+    struct OnlyConst
+    {
+        int value;
+        explicit OnlyConst(int n) : value(n) {}
+        OnlyConst(const OnlyConst& other) : value(other.value + 200) {}
+        ~OnlyConst() {}
+    };
+    inline int take_only_const(OnlyConst value) { return value.value; }
+    struct OnlyConstHost { int member_take(OnlyConst value) { return value.value; } };
+    struct OnlyConstSink
+    {
+        int result;
+        OnlyConstSink(OnlyConst value) : result(value.value) {}
+    };
+
+    struct OnlyNonConst
+    {
+        int value;
+        explicit OnlyNonConst(int n) : value(n) {}
+        OnlyNonConst(OnlyNonConst& other) : value(other.value + 100) {}
+        ~OnlyNonConst() {}
+    };
+    inline int take_only_nonconst(OnlyNonConst value) { return value.value; }
+    struct OnlyNonConstHost { int member_take(OnlyNonConst value) { return value.value; } };
+    struct OnlyNonConstSink
+    {
+        int result;
+        OnlyNonConstSink(OnlyNonConst value) : result(value.value) {}
+    };
+}
+
+namespace t461r2
+{
+    struct TemplateCtor
+    {
+        int value;
+        explicit TemplateCtor(int n) : value(n) {}
+        TemplateCtor(TemplateCtor& other) : value(other.value + 100) {}
+        template<class U> TemplateCtor(const U& other) : value(other.value + 50) {}
+        ~TemplateCtor() {}
+    };
+    inline int take_template(TemplateCtor value) { return value.value; }
+}

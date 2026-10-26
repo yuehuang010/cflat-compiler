@@ -1703,6 +1703,8 @@ public:
         bool MovePathHasDynamicIndex = false;
         bool RootIsBorrowedThisField = false;
         std::string ThisFieldPath;
+        // Null-state key for a joined unique-field call-sink arm.
+        std::string NullKey;
     };
 
     struct NamedVariable
@@ -3277,6 +3279,7 @@ private:
     // elements are destroyed in reverse; see RegisterOwnedBraceListTemp.
     struct PendingOwnedStructTemp { llvm::Value* Alloca; std::string TypeName; llvm::BasicBlock* Block; llvm::Value* LiveFlag = nullptr; uint64_t ArrayCount = 0; };
     std::vector<PendingOwnedStructTemp> pendingOwnedStructTemps;
+    std::vector<llvm::Value*> cxxDefaultTernaryStorageJoins_;
     // Receiver temps of the alias declarator in progress (see MarkAliasDeclTemps). They stay on the
     // ledger until settled, so an initializer call that throws still unwinds them.
     struct AliasDeclTemp { llvm::Value* Alloca; };
@@ -3730,6 +3733,7 @@ private:
     {
         std::string targetBase;
         std::vector<std::string> params;
+        std::vector<uint64_t> paramPackFlags;
         std::vector<std::string> paramDefaults;
         std::vector<std::string> args;
         std::string alias;
@@ -4634,6 +4638,7 @@ private:
         bool isCxxAliasTemplate = false;
         std::string cxxAliasPattern;
         std::vector<std::string> cxxAliasParams;
+        std::vector<uint64_t> cxxAliasParamPackFlags;
         std::string cxxAliasTargetBase;
         std::vector<std::string> cxxAliasArgs;
         std::vector<std::string> cxxAliasParamDefaults;
@@ -5265,6 +5270,8 @@ private:
     // True when a by-value C++ class argument already is a prvalue temp of this full expression
     // (owned, of the parameter's struct type): C++17 elision binds it, no copy or move.
     bool IsOwnedCxxPrvalueArgument(const NamedVariable& arg, llvm::Type* structTy) const;
+    void RegisterCxxDefaultTernaryStorageJoin(llvm::Value* storageJoin);
+    bool IsCxxDefaultTernaryStorageJoin(llvm::Value* storageJoin) const;
 
     // Carry produced-temp identity through a value join, including nested ternaries.
     void PropagateProducedTempValue(llvm::Value* from, llvm::Value* to);
@@ -6804,9 +6811,10 @@ private:
                                              size_t parameterIndex, size_t arity) const;
     bool IsCxxConstructorParameterByValue(const std::string& typeName,
                                            size_t parameterIndex, size_t arity) const;
+    // constRef: select the unique `const T&` parameter instead of the by-value one (T459).
     bool GetUniqueCxxConstructorValueParameter(const std::string& typeName,
                                                size_t parameterIndex, size_t arity,
-                                               TypeAndValue& out) const;
+                                               TypeAndValue& out, bool constRef = false) const;
     bool HasCxxForwardingReferenceTemplate(const std::string& qualifiedName) const;
     bool IsCxxNamespacePath(const std::string& name) const;
     // Broader fallback for namespace paths whose declarations were not harvested at import.
@@ -6919,7 +6927,8 @@ private:
                                           bool copyListInit,
                                           std::string& wrapperName,
                                           std::string& error,
-                                          bool allowIncremental = true);
+                                          bool allowIncremental = true,
+                                          std::vector<size_t>* forwardedElementIndices = nullptr);
     // copyInit: the wrapper copy-initializes (`T t = arg;`), so an explicit constructor is
     // never a candidate - the form every IMPLICIT conversion site must use.
     // Converts each scalar argument of a generated constructor thunk call into the thunk's own
@@ -10213,7 +10222,8 @@ public:
                                                   const std::string& memberName);
     bool RejectInaccessibleCxxMember(const std::string& typeName, const std::string& memberName,
                                      bool accessedThroughCurrentObject = false,
-                                     bool deferElementCopySink = false);
+                                     bool deferElementCopySink = false,
+                                     bool protectedOnly = false);
     // A C++ class identity spelled for a user-facing message (a specialization key is mangled).
     std::string DisplayCxxClassName(const std::string& typeName) const;
     // True when C++ lookup on this class may find an operator the import never registered: a
@@ -10225,6 +10235,10 @@ public:
     bool CxxHasDeletedAssignment(const std::string& typeName, bool useMove) const;
     bool CxxProtectedAccessAllowed(const std::string& typeName,
                                    bool accessedThroughCurrentObject) const;
+    size_t CxxBaseSubobjectCount(const std::string& derivedType,
+                                 const std::string& baseType) const;
+    std::string CxxInheritedMemberOwner(const std::string& receiverType,
+                                        const FunctionSymbol& candidate) const;
 
     /*
      * M4b - foreign NONTRIVIAL C++ class lifetime.
@@ -10615,7 +10629,8 @@ public:
     bool HasNonPublicCxxDefaultCtor(const std::string& typeName) const;
     bool CxxDefaultCtorAmbiguous(const std::string& typeName) const;
     bool CxxDefaultCtorAmbiguityError(const std::string& typeName, std::string& error);
-    const CxxClassInfo::Structor* FindCxxCopyCtor(const std::string& typeName) const;
+    const CxxClassInfo::Structor* FindCxxCopyCtor(const std::string& typeName,
+                                                   bool constSource = false) const;
     const CxxClassInfo::Structor* FindCxxMoveCtor(const std::string& typeName) const;
     const CxxClassInfo::Structor* TryBindCxxGeneratedMoveCtor(const std::string& typeName);
     /*
@@ -10705,11 +10720,13 @@ public:
     // Returns false after LogError when the needed constructor is missing or inaccessible.
     bool EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,
                                     llvm::Value* src, bool useMove, const char* context,
-                                    const std::string& displayTypeName = {});
+                                    const std::string& displayTypeName = {},
+                                    bool constSource = false);
     bool ResetMovedStdFunctionSource(const std::string& typeName, llvm::Value* sourceStorage,
                                      const std::string& sourceName = {});
     bool EmitCxxByValueParamConstruct(const std::string& typeName, llvm::Value* dest,
-                                      llvm::Value* src, bool useMove, const char* context);
+                                      llvm::Value* src, bool useMove, const char* context,
+                                      bool constSource = false);
     // Move a classified value member-wise (plan cflat-struct-nontrivial-cxx-fields): C++ class
     // members run their move constructor and stay destructible in `src`; every other member is
     // relocated and nulled in `src`. Elements [skipBefore, skipAfter) bytes bound a top-level
@@ -13361,7 +13378,10 @@ public:
     // 276: non-type defaults store evaluated values; unsupported dependent values stay absent (T358 r2).
     // 277: user-declared defaulted trivial copy assignment is harvested as usable (T417).
     // 283: namespace-scope variable-template names are cached for C++ conflict checks (T436).
-    static constexpr int kCHeaderCacheVersion = 283;
+    // 284: C++ alias-template parameter-pack flags are cached per parameter (T458 r2).
+    // 285: reserved for T460. 286: [cpp] struct wrapper spellings use an injective CFlat-name
+    // encoding (T464).
+    static constexpr int kCHeaderCacheVersion = 286;
     static std::string CompilerBuildStamp();
     // THE switch for "the compiler build is part of cache entry validity": header/request
     // entries record and check "cstamp", and demand companion keys fold the stamp. ON by

@@ -36,6 +36,7 @@
 
 #include "platform/GeneratedParser.h"
 #include "LLVMBackend.h"
+#include "CppStructName.h"
 #include "MainListener.h"
 #include "GrammarTreeListener.h"
 #include <filesystem>
@@ -1002,18 +1003,20 @@ void LLVMBackend::SetSourceLocation(size_t line, size_t column)
 void LLVMBackend::LogErrorMessage(std::string englishTemplate,
                                   std::vector<std::string> arguments) const
 {
-        EmitError(diagnosticLocalization_.Localize(englishTemplate, arguments),
-                  DiagnosticLocalization::FormatSourceTemplate(englishTemplate, arguments));
+        EmitError(cflat_cinterop::DemangleGeneratedCflatStructNames(
+                      diagnosticLocalization_.Localize(englishTemplate, arguments)),
+                  cflat_cinterop::DemangleGeneratedCflatStructNames(
+                      DiagnosticLocalization::FormatSourceTemplate(englishTemplate, arguments)));
 }
 
 void LLVMBackend::LogError(std::string message) const
 {
-        EmitError(std::move(message));
+        EmitError(cflat_cinterop::DemangleGeneratedCflatStructNames(message));
 }
 
 void LLVMBackend::LogRawError(std::string message) const
 {
-        EmitError(std::move(message));
+        EmitError(cflat_cinterop::DemangleGeneratedCflatStructNames(message));
 }
 
 bool LLVMBackend::ReportArrayViewInstantiationFailure(const std::string& formedType) const
@@ -2660,10 +2663,35 @@ bool LLVMBackend::IsOwnedCxxPrvalueArgument(const NamedVariable& arg, llvm::Type
 {
         // A `move x` names a slot, and a named source is never in the pending list.
         if (!arg.IsRvalue || (arg.IsExplicitMove && !arg.IsCxxPrvalueTemp)) return false;
-        auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(arg.Storage);
-        if (slot == nullptr || slot->getAllocatedType() != structTy) return false;
-        return std::any_of(pendingOwnedStructTemps.begin(), pendingOwnedStructTemps.end(),
-                           [&](const PendingOwnedStructTemp& e) { return e.Alloca == slot; });
+        auto isOwnedSlot = [&](llvm::Value* value) {
+            auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(value);
+            return slot != nullptr && slot->getAllocatedType() == structTy
+                && std::any_of(pendingOwnedStructTemps.begin(), pendingOwnedStructTemps.end(),
+                    [&](const PendingOwnedStructTemp& e) { return e.Alloca == slot; });
+        };
+        if (isOwnedSlot(arg.Storage)) return true;
+        auto* storageJoin = llvm::dyn_cast_or_null<llvm::PHINode>(arg.Storage);
+        if (storageJoin == nullptr || !IsCxxDefaultTernaryStorageJoin(storageJoin)
+            || !storageJoin->getType()->isPointerTy() || storageJoin->getNumIncomingValues() == 0)
+            return false;
+        for (unsigned i = 0; i < storageJoin->getNumIncomingValues(); ++i)
+            if (!isOwnedSlot(storageJoin->getIncomingValue(i))) return false;
+        return true;
+}
+
+void LLVMBackend::RegisterCxxDefaultTernaryStorageJoin(llvm::Value* storageJoin)
+{
+        if (storageJoin != nullptr
+            && std::find(cxxDefaultTernaryStorageJoins_.begin(), cxxDefaultTernaryStorageJoins_.end(),
+                         storageJoin) == cxxDefaultTernaryStorageJoins_.end())
+            cxxDefaultTernaryStorageJoins_.push_back(storageJoin);
+}
+
+bool LLVMBackend::IsCxxDefaultTernaryStorageJoin(llvm::Value* storageJoin) const
+{
+        return storageJoin != nullptr
+            && std::find(cxxDefaultTernaryStorageJoins_.begin(), cxxDefaultTernaryStorageJoins_.end(),
+                         storageJoin) != cxxDefaultTernaryStorageJoins_.end();
 }
 
 bool LLVMBackend::IsProducedTempValue(llvm::Value* value) const
@@ -6352,6 +6380,7 @@ void LLVMBackend::DiscardOwnedTempsSince(const OwnedTempMark& mark)
         addrIntoTempValues_.clear();
         ptrToIntOfTemps_.clear();
         nullConditionalTempResults_.clear();
+        cxxDefaultTernaryStorageJoins_.clear();
         rawArrayResults_.clear();
         nonLocalViewOwnershipStates_.clear();
         valueElementTypeNames_.clear();
@@ -6434,6 +6463,7 @@ void LLVMBackend::FlushOwnedTemps()
         addrIntoTempValues_.clear();
         ptrToIntOfTemps_.clear();
         nullConditionalTempResults_.clear();
+        cxxDefaultTernaryStorageJoins_.clear();
         rawArrayResults_.clear();
         valueElementTypeNames_.clear();
         fatInterfaceValueTypeNames_.clear();

@@ -1,28 +1,33 @@
-# Empty template argument list `<>`: leftovers after N63
+# CFlat alias of a C++ class template used as a constructor
 
-N63 landed `X<>` as the all-defaulted instantiation (ruling 2026-10-02: `std.barrier<>` allowed, bare name
-stays legal; native `Box<>` without defaults refused, `<>` on a non-generic refused). A round-4 review
-(probes were in cflat-fix-n63 scratch/rv4/) left three edge cases. None is a regression vs master, where
-every `<>` was refused.
+The original T458 empty-list findings were closed in this round or did not
+reproduce on current HEAD/master. The one remaining note is the separate CFlat
+alias case below.
 
-1. Native non-generic inside a namespace accepts `<>` when written unqualified:
-   `namespace ns { struct Plain { int x = 0; }; int f() { Plain<> x = default; return 0; } }` compiles
-   (also field, global, pointer param/return inside `ns`). `ns.Plain<>` is refused correctly.
-   Cause: MainListener_Declarations.cpp (~943) tests `IsDataStructure(ResolveTypeAlias(baseName))` on
-   the unscoped name; resolve the scoped native type first.
-2. C++ namespace alias + `<>` false rejection, order dependent:
-   `namespace n63 { template<class T = int> struct Box { T value = 7; }; } namespace wrap { namespace nested = n63; }`
-   then `wrap.nested.Box x = default; auto y = wrap.nested.Box<>();` -> "'n63.Box' is not a generic type".
-   Cause: LLVMBackend::IsCxxTemplateSpecializationOf compares spelling prefixes; the recorded spelling can
-   be the alias spelling while the expression path checks the resolved namespace. Compare canonical
-   record identity instead.
-3. Alias template with a required parameter borrows the target's defaults:
-   `template<class T> using Required = n63::Box<T>;` and `template<class T> using FixedRequired = n63::Box<int>;`
-   accept `req.Required<>` / `req.FixedRequired<>`; clang: "too few template arguments for alias template".
-   Cause: ApplyCxxAliasPattern (LLVMBackend_Interfaces.cpp ~418-500) runs before the empty-list check
-   and drops/ignores the unbound alias parameter.
+## Repro
 
-Also seen (not N63): a CFlat alias of a C++ template `using G = dz.Gate; G g = G(1)` -> "the function 'G'
-is not known", bare and explicit.
+```cflat
+import cpp "cpp_interop_tpl.h";
+using G = cppt.dflt.Gate;
+extern int main()
+{
+    G value = G(1);
+    return value.arrive();
+}
+```
 
-- 2026-10-14 (T162 review, PRE-EXISTING): after `rq.D<> x = rq.D<int>(8)`, passing `x` to `dv(D<int>)` fails "no overload matches"; clang accepts. Repro scratch/repro_keep/t162/.
+Current HEAD/master reports `the function 'G' is not known`. The explicit empty
+form `G<> value = G<>(1);` reports `unknown generic function 'G'`.
+
+## Root cause
+
+This is a CFlat type alias naming a C++ class template base. The failure occurs
+while resolving the CFlat alias as a constructor call. It does not use the C++
+alias-template pattern path changed for T458, and the type is not a native
+CFlat non-generic declaration.
+
+## Fix direction
+
+Resolve a CFlat type alias that names a C++ class template to its class-template
+constructor path before function lookup. This remains separate from empty
+C++ alias-template argument validation.

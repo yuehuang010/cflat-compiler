@@ -108,11 +108,11 @@ Windows gate: R6, R7, R11, R12, R13, R14 land after the Windows box passes. R2 i
 | P3 | fix/t422-globdef | p3/global-default-spelling-zeroes-without-the-note | PARKED (T422 Luna r1 + Haiku r2): ruling conflict with runtime-constructed globals (T136/T368/mempress) - see issue head |
 | P3 | fix/t427-fnpointee | p3/function-type-unrelated-pointee-param-accepted | PARKED (T427): exact function-type pointee match conflicts with the deliberate int*/void* crossing leg - see issue head |
 | P3 | fix/t438-uniqdot | p3/cflat-unique-dot-dispatches-to-pointee-member | PARKED: needs ruling on name hiding + `->` (see issue file) (T438) |
-| P3 | fix/t453-defterm | p3/cpp-default-ternary-arg-leftovers | Opus review r1 (T453) |
-| P3 | fix/t456-diamond | p3/cpp-inherited-operator-diamond-and-protected-access | Luna r2 (T456) |
-| P3 | fix/t458-emptytargs | p3/cpp-template-empty-argument-list-leftovers | Windows gate (T458) |
-| P3 | fix/t459-memternref | p3/cpp-member-constref-default-ternary-prvalue | Haiku r2 (T459, Luna stopped) |
-| P3 | fix/t460-builtinamb | p3/cpp-free-operator-conversion-vs-builtin-ambiguity | Luna r1 (T460) |
+| P3 | fix/t460-builtinamb | p3/cpp-free-operator-conversion-vs-builtin-ambiguity | Windows gate (Sol r3 enum ADL fixed in r5) (T460) |
+| P3 | fix/t469-cppalias | p3/cpp-template-empty-argument-list-leftovers | Windows gate (r2 namespace-call fix) (T469) |
+| P3 | fix/t470-braceunwind | p3/named-brace-init-partial-unwind | Luna r1 (T470) |
+| P3 | fix/t471-barecall | p3/trailing-const-leftovers-after-c08 | Luna r1 (T471) |
+| P3 | fix/t472-viewleak | p3/owned-view-overwrite-and-unsunk-field-leak | Luna r1 (T472) |
 | R16 (parked) | fix/t396-viewalias | p2/view-mixed-join-sunk-through-pointer-param-alias | Sol r2b: 4 INCOMPLETE, needs path-sensitive provenance |
 
 ## Backlog (p3/p4 and plans; groups from earlier builds, unchanged)

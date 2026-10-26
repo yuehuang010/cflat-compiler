@@ -1067,6 +1067,15 @@ int t259Loop(bool f)
     return n;
 }
 
+// T466 r2: `??` field arms reached through pointer parameters or `this` are cleared at the call.
+void t466SinkThroughPointers(UniqueBox* o, UniqueBox* q) { sinkResourceMove(o->item ?? q->item); }
+struct T466FieldPair
+{
+    unique Resource* p = nullptr;
+    unique Resource* r = nullptr;
+    void sinkJoin() { sinkResourceMove(this.p ?? this.r); }
+};
+
 int testUniqueField()
 {
     int passed = 0;
@@ -1207,6 +1216,83 @@ int testUniqueField()
         passed += Test("unique_field_consume_reinit_no_early_free", dtorCount, 0);
     }
     passed += Test("unique_field_consume_reinit_freed_once", dtorCount, 2);
+
+    // T466 r2: the fallback arm through pointer parameters / `this` is freed once (master rc 133).
+    dtorCount = 0;
+    {
+        UniqueBox a = default;
+        UniqueBox b = default;
+        b.item = new Resource();
+        t466SinkThroughPointers(&a, &b);
+        passed += Test("t466_coalesce_call_pointer_roots_freed_at_call", dtorCount, 1);
+    }
+    passed += Test("t466_coalesce_call_pointer_roots_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    {
+        T466FieldPair fp = default;
+        fp.r = new Resource();
+        fp.sinkJoin();
+        passed += Test("t466_coalesce_call_this_fields_freed_at_call", dtorCount, 1);
+    }
+    passed += Test("t466_coalesce_call_this_fields_freed_once", dtorCount, 1);
+
+    // T466 accept-set: consuming one possible `??` field keeps an unrelated field live.
+    dtorCount = 0;
+    {
+        UniqueBox a = default;
+        UniqueBox b = default;
+        UniqueBox c = default;
+        a.item = new Resource();
+        b.item = new Resource();
+        c.item = new Resource();
+        c.item->id = 30;
+        sinkResourceMove(a.item ?? b.item);
+        passed += Test("t466_coalesce_call_unrelated_sibling_live", c.item->id, 30);
+        passed += Test("t466_coalesce_call_selected_freed_at_call", dtorCount, 1);
+    }
+    passed += Test("t466_coalesce_call_sibling_resources_freed_once", dtorCount, 3);
+
+    // T466: the fallback arm transfers ownership too when the left field is null.
+    dtorCount = 0;
+    {
+        UniqueBox a = default;
+        UniqueBox b = default;
+        b.item = new Resource();
+        sinkResourceMove(a.item ?? b.item);
+        passed += Test("t466_coalesce_call_fallback_freed_at_call", dtorCount, 1);
+    }
+    passed += Test("t466_coalesce_call_fallback_freed_once", dtorCount, 1);
+
+    // T466 accept-set: assigning a fresh value revives a field after a conditional call-sink move.
+    dtorCount = 0;
+    {
+        UniqueBox a = default;
+        UniqueBox b = default;
+        a.item = new Resource();
+        b.item = new Resource();
+        sinkResourceMove(a.item ?? b.item);
+        a.item = new Resource();
+        a.item->id = 40;
+        passed += Test("t466_coalesce_call_reinit_live", a.item->id, 40);
+        passed += Test("t466_coalesce_call_reinit_old_freed_at_call", dtorCount, 1);
+    }
+    passed += Test("t466_coalesce_call_reinit_resources_freed_once", dtorCount, 3);
+
+    // T466: a live alias observes the whole-struct move, and only the owning binding destroys it.
+    dtorCount = 0;
+    {
+        UniqueBox s = default;
+        UniqueBox u = default;
+        s.item = new Resource();
+        s.item->id = 11;
+        u.item = new Resource();
+        u.item->id = 12;
+        alias UniqueBox r = s;
+        s = move u;
+        passed += Test("t466_alias_struct_move_releases_old_once", dtorCount, 1);
+        passed += Test("t466_alias_struct_move_visible_through_alias", r.item->id, 12);
+    }
+    passed += Test("t466_alias_struct_move_resources_freed_once", dtorCount, 2);
 
     // T230 guard - a consume on one branch leaves the other branch's read of the field legal.
     dtorCount = 0;
@@ -15662,6 +15748,7 @@ extern int main()
     total += 18;  // T230 legs in testUniqueField
     total += 19;  // T230 r3 legs in testUniqueField
     total += 22;  // T259 legs in testUniqueField
+    total += 15;  // T466 legs in testUniqueField
 
     passed += testUniqueAssignmentOwnership();
     total += 23;

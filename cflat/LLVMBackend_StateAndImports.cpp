@@ -3105,7 +3105,8 @@ nlohmann::json LLVMBackend::TypeAliasToJson(const CTypeAliasEntry& a, CCachePath
                 {"ln", a.line}, {"co", a.col}, {"ar", a.isAnonymousRecord},
                 {"qn", a.qualifiedName}, {"cs", a.cxxSpecialization},
                 {"iat", a.isCxxAliasTemplate}, {"cap", a.cxxAliasPattern},
-                {"can", a.cxxAliasParams}, {"catb", a.cxxAliasTargetBase},
+                {"can", a.cxxAliasParams}, {"capf", a.cxxAliasParamPackFlags},
+                {"catb", a.cxxAliasTargetBase},
                 {"caa", a.cxxAliasArgs}, {"cad", a.cxxAliasParamDefaults}};
         PathToJson(j, a.file, files);
         return j;
@@ -3125,6 +3126,7 @@ LLVMBackend::CTypeAliasEntry LLVMBackend::TypeAliasFromJson(const SjVal& j, cons
         a.isCxxAliasTemplate = j.value("iat", false);
         a.cxxAliasPattern = j.value("cap", std::string{});
         if (j.contains("can")) a.cxxAliasParams = j["can"].to_string_vector();
+        if (j.contains("capf")) a.cxxAliasParamPackFlags = j["capf"].to_u64_vector();
         a.cxxAliasTargetBase = j.value("catb", std::string{});
         if (j.contains("caa")) a.cxxAliasArgs = j["caa"].to_string_vector();
         if (j.contains("cad")) a.cxxAliasParamDefaults = j["cad"].to_string_vector();

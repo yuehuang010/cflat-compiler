@@ -19,6 +19,7 @@ T closureIdentity<T>(T value) { return value; }
 T countPack<T...>() { return (T)sizeof(T); }
 int zeroValueGeneric<T>() { T value = default; return 7; }
 int doubleValue(int x) { return x * 2; }
+namespace parenNs { T parenId<T>(T value) { return value; } }
 
 int t60LocalEnumSize<T>()
 {
@@ -152,6 +153,15 @@ bool testGenericFunctions()
     function<int(int)> source = doubleValue;
     function<int(int)> closureResult = closureIdentity<function<int(int)>>(source);
     result &= Test("generic_function_closure_arg", closureResult(6), 12);
+    // A parenthesized callee calls the function it names, deducing from the arguments.
+    int parenArg = 7;
+    function<int(int)> parenFnValue = doubleValue;
+    result &= Test("generic_paren_callee", (forwardFunction)(4), 5);
+    result &= Test("generic_paren_callee_double", ((forwardFunction))(4), 5);
+    result &= Test("generic_paren_callee_local_arg", (forwardFunction)(parenArg), 8);
+    result &= Test("generic_paren_callee_namespaced", (parenNs.parenId)(5), 5);
+    result &= Test("generic_paren_callee_nongeneric", (doubleValue)(6), 12);
+    result &= Test("generic_paren_callee_fn_value", (parenFnValue)(8), 16);
     result &= Test("generic_function_pack", countPack<int, int, int>(), 3);
     FunctionImpl<int> impl = default;
     impl.Set(9);
@@ -3092,12 +3102,24 @@ auto pick<T>(T a, T b) { return a > b ? a : b; }
 // sizeof(litFirst(7, 2)) == 1. Declared arguments keep binding T over a literal.
 T litFirst<T>(T a, T b) { return a; }
 T litSecond<T>(T a, T b) { return b; }
+T litUnary<T>(T a) { return a; }
 struct LitBox<T> { T v; };
 LitBox<T> litBox<T>(T a) { LitBox<T> b = { v = a }; return b; }
 struct LitHolder
 {
     static T litPick<T>(T a, T b) { return b; }
 };
+struct LitInferHolder
+{
+    T get<T>(T value) { return value; }
+};
+// T467 r2: a non-generic method overload keeps priority over the inferred generic one.
+struct LitOverloadHolder
+{
+    int get(int value) { return value + 100; }
+    T get<T>(T value) { return value; }
+};
+T litListFirst<T>(list<T> values) { return values.get(0); }
 
 bool testGenericArgInference()
 {
@@ -3114,6 +3136,13 @@ bool testGenericArgInference()
     result &= Test("lit_sz_70000",      (int)sizeof(litFirst(70000, 2)), 4);
     result &= Test("lit_sz_neg",        (int)sizeof(litFirst(-7, 2)), 4);
     result &= Test("lit_sz_paren",      (int)sizeof(litFirst((300), 2)), 4);
+    bool litCondition = true;
+    result &= Test("lit_sz_ternary", (int)sizeof(litFirst(litCondition ? 1 : 2, 3)) * 100
+        + litFirst(litCondition ? 1 : 2, 3), 401);
+    result &= Test("lit_sz_unary_neg_paren", (int)sizeof(litUnary(-(7))) * 100
+        + litUnary(-(7)), 393);
+    result &= Test("lit_sz_unary_pos_paren", (int)sizeof(litUnary(+(7))) * 100
+        + litUnary(+(7)), 407);
     result &= Test("lit_sz_u_suffix",   (int)sizeof(litFirst(7u, 2u)), 4);
     // Wider default: long for a literal past int, double for a floating literal, float for 1.5f.
     result &= Test("lit_sz_long",       (int)sizeof(litFirst(5000000000, 2)), 8);
@@ -3135,6 +3164,15 @@ bool testGenericArgInference()
     result &= Test("lit_method_val",    LitHolder.litPick(300, 2), 2);
     result &= Test("lit_method_sz",     (int)sizeof(LitHolder.litPick(7, 2)), 4);
     result &= Test("lit_box_sz",        (int)sizeof(litBox(7).v), 4);
+    LitInferHolder holder = default;
+    result &= Test("lit_instance_method_sz", (int)sizeof(holder.get(3)) * 100
+        + holder.get(3), 403);
+    LitOverloadHolder overloadHolder = default;
+    result &= Test("lit_instance_method_nongeneric_wins", overloadHolder.get(3), 103);
+    list<int> litValues = default;
+    litValues.add(9);
+    result &= Test("lit_list_param_sz", (int)sizeof(litListFirst(litValues)) * 100
+        + litListFirst(litValues), 409);
     return result;
 }
 
@@ -6478,6 +6516,108 @@ bool testT384TwoLevelNestedTemplates()
     return result;
 }
 
+struct T465AliasGenericOuter<T>
+{
+    struct Inner<U> { U value = default; };
+    using II = Inner<short>;
+    int Run() { II value = default; value.value = 5; return value.value + (int)sizeof(II); }
+};
+class T465AliasGenericClassOuter<T>
+{
+    class Inner<U> { U value = default; };
+    using II = Inner<short>;
+    int Run() { II value = default; value.value = 5; return value.value + (int)sizeof(II); }
+};
+struct T465AliasPlainOuter
+{
+    struct Inner<U> { U value = default; };
+    using II = Inner<short>;
+    int Run() { II value = default; value.value = 5; return value.value + (int)sizeof(II); }
+};
+
+struct T465LatePlainOuter
+{
+    struct Mid
+    {
+        int Run() { Inner<int> value = Inner<int>(); value.value = 19; return value.value; }
+    };
+    struct Inner<T> { T value = default; };
+    Mid mid = default;
+};
+struct T465LateGenericOuter<TO>
+{
+    struct Mid
+    {
+        int Run() { Inner<int> value = Inner<int>(); value.value = 23; return value.value; }
+    };
+    struct Inner<T> { T value = default; };
+    Mid mid = default;
+};
+struct T465ConstructOuter
+{
+    struct Inner<T> { T value = default; };
+    struct Mid
+    {
+        int Run() { Inner<int> value = Inner<int>(); value.value = 13; return value.value; }
+    };
+    Mid mid = default;
+};
+namespace T465SizeNs
+{
+    struct Outer { struct Mid { int value = default; }; };
+    int Run() { return (int)sizeof(Outer.Mid); }
+}
+struct T465FieldHolder { int B = default; int Mid = default; };
+namespace T465LookupCollision
+{
+    struct A { struct B { int value = default; }; };
+    struct S
+    {
+        struct A { struct B { i64 x = default; i64 y = default; }; };
+        int DeclSize() { A.B value = default; return (int)sizeof(value); }
+        int TypeSize() { return (int)sizeof(A.B); }
+        A.B field = default;
+        // T465 r3: a local or parameter named like the scope wins in sizeof (a field read).
+        int LocalHidesType() { T465FieldHolder A = default; return (int)sizeof(A.B); }
+        int ParamHidesType(T465FieldHolder A) { return (int)sizeof(A.B); }
+    };
+    struct Outer { struct Mid { i64 a = default; i64 b = default; }; };
+    int LocalHidesNamespaceType() { T465FieldHolder Outer = default; return (int)sizeof(Outer.Mid); }
+}
+namespace T465OuterNamespace
+{
+    struct Outer { struct Mid { int value = default; }; };
+    namespace B { int Run() { return (int)sizeof(Outer.Mid); } }
+}
+
+bool testT465NestedTemplates()
+{
+    bool result = true;
+    T465AliasGenericOuter<int> genericAlias = default;
+    result &= Test("t465 alias in generic outer", genericAlias.Run(), 7);
+    T465AliasGenericClassOuter<int> genericClassAlias = default;
+    result &= Test("t465 class alias in generic outer", genericClassAlias.Run(), 7);
+    T465AliasPlainOuter plainAlias = default;
+    result &= Test("t465 alias in plain outer", plainAlias.Run(), 7);
+    T465LatePlainOuter latePlain = default;
+    result &= Test("t465 late template in plain outer", latePlain.mid.Run(), 19);
+    T465LateGenericOuter<long> lateGeneric = default;
+    result &= Test("t465 late template in generic outer", lateGeneric.mid.Run(), 23);
+    T465ConstructOuter construct = default;
+    result &= Test("t465 nested template construction", construct.mid.Run(), 13);
+    result &= Test("t465 sizeof nested type in namespace", T465SizeNs.Run(), 4);
+    T465LookupCollision.S collision = default;
+    int nestedSize = 2 * (int)sizeof(i64);
+    result &= Test("t465 struct scope declaration before namespace", collision.DeclSize(), nestedSize);
+    result &= Test("t465 struct scope sizeof before namespace", collision.TypeSize(), nestedSize);
+    result &= Test("t465 struct scope field before namespace", (int)sizeof(collision), nestedSize);
+    result &= Test("t465 outward namespace sizeof", T465OuterNamespace.B.Run(), 4);
+    result &= Test("t465 local hides scoped type in sizeof", collision.LocalHidesType(), 4);
+    result &= Test("t465 param hides scoped type in sizeof", collision.ParamHidesType(default), 4);
+    result &= Test("t465 local hides namespace type in sizeof", T465LookupCollision.LocalHidesNamespaceType(), 4);
+    return result;
+}
+
 int t431Pick(int x) { return x + 1; } int t431Pick(double x) { return (int)x + 2; }
 struct T431MethodOverloads { int get(int x) { return x + 3; } int get(double x) { return (int)x + 5; } };
 struct T431GenericGetter<T> { T get(T x) { return x + 1; } };
@@ -6673,6 +6813,7 @@ extern int main()
     total++; passed += testT374NestedTemplateFields()                  ? 1 : 0;
     total++; passed += testT383AliasShadowsNestedTemplate()            ? 1 : 0;
     total++; passed += testT384TwoLevelNestedTemplates()                ? 1 : 0;
+    total++; passed += testT465NestedTemplates()                        ? 1 : 0;
     total++; passed += testPointerOnlyLaterStruct()                  ? 1 : 0;
     total++; passed += testConstGenerics()                           ? 1 : 0;
     total++; passed += testConstGenericList()                        ? 1 : 0;

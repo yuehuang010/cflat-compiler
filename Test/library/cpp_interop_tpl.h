@@ -2672,3 +2672,41 @@ inline int count_copy_long() { return Stats<long>::copy; }
 inline int count_move_long() { return Stats<long>::move; }
 inline int count_dtor_long() { return Stats<long>::dtor; }
 }
+
+namespace n63
+{
+template <class T = int> struct Box
+{
+    T value;
+    Box(T v = T(7)) : value(v) {}
+};
+}
+namespace wrap { namespace nested = n63; }
+namespace req
+{
+template <class T> using Required = n63::Box<T>;
+template <class T> using FixedRequired = n63::Box<int>;
+template <class T = long> using Defaulted = n63::Box<T>;
+}
+namespace rq
+{
+template <class T = int> struct D
+{
+    T value;
+    D(T v = 8) : value(v) {}
+};
+}
+inline int dv(rq::D<int> value) { return 101 + value.value; }
+inline int dv(rq::D<long>) { return 303; }
+inline int dv(int) { return 202; }
+
+namespace t458
+{
+template <class T = int> struct Box
+{
+    T value;
+    Box(T v = T(7)) : value(v) {}
+};
+template <class... Ts> using P0 = Box<>;
+template <class T = int, class... Ts> using PD = Box<T>;
+}

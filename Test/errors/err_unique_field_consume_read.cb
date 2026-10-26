@@ -514,6 +514,45 @@ expect_error("cannot consume owning value 't367GlobalPointer' out of storage tha
     }
 }
 
+int t466MoveP(move P* p) { int value = p->v; delete p; return value; }
+int t466BorrowP(P* p) { return p->v; }
+
+// T466 item 3: the branch-local move precedes the sibling borrow in the same expression.
+expect_error("use of moved variable 's.p'") {
+    void ternaryFieldMoveThenSiblingRead()
+    {
+        S s = default;
+        s.p = new P();
+        int c = 0;
+        int value = t466MoveP(c ? new P() : s.p) + t466BorrowP(s.p);
+    }
+}
+
+// T466 item 5: a move-sink call can select either arm of a `??` field join.
+expect_error("dereference of moved variable 'a.p'") {
+    void coalesceCallJoinLeftArmThenRead()
+    {
+        S a = default;
+        S b = default;
+        a.p = new P();
+        b.p = new P();
+        mvP(a.p ?? b.p);
+        int value = a.p->v;
+    }
+}
+
+expect_error("dereference of moved variable 'b.p'") {
+    void coalesceCallJoinRightArmThenRead()
+    {
+        S a = default;
+        S b = default;
+        a.p = new P();
+        b.p = new P();
+        mvP(a.p ?? b.p);
+        int value = b.p->v;
+    }
+}
+
 extern int main()
 {
     return 0;

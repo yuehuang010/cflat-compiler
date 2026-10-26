@@ -44,4 +44,23 @@ struct T391Host
     int tref(const T391Val& v) { return 30 + v.value(); }
     int take(T391Val v) { return 40 + v.value(); }
 };
+// T459: static member and constructor parameters taking `const T391Val&`.
+struct T391StaticHost
+{
+    static int tref(const T391Val& v) { return 50 + v.value(); }
+};
+struct T391Sink
+{
+    int stored;
+    explicit T391Sink(const T391Val& v) : stored(v.value()) {}
+    int value() const { return stored; }
+};
+// T459 r3: a const T391Val& constructor beside an int one; `c ? default : int local` selects the int one.
+struct T391Mixed
+{
+    int x;
+    T391Mixed(const T391Val& v) : x(10 + v.value()) {}
+    T391Mixed(int n) : x(20 + n) {}
+    int value() const { return x; }
+};
 }

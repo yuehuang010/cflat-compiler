@@ -454,6 +454,19 @@ int t120LocalEnumFunctionSignature() { enum T120SigCol : i64 { A = 3 }; function
 struct T120ShadowType { int value = default; };
 int t120FileStructWithLocalEnumShadow() { int r = (int)sizeof(T120Box<T120ShadowType>); { enum T120ShadowType : char { A = 1 }; r = r + (int)T120ShadowType.A * 100; } return r; }
 
+struct T462PointerStruct { int value = 0; };
+enum T462PointerFileEnum : int { Value = 13 };
+int t462ReadPointer<T>(T p) { return (int)*p; }
+int t462LocalEnumPointerBox() { enum K : int { A = 13 }; K value = K.A; K* p = &value; T120Box<K*> b = default; b.value = p; return (int)sizeof(b) * 1000 + (int)*b.value; }
+int t462LocalEnumViewBox() { enum K : int { A = 13 }; K[2] values = { 7, 13 }; T120Box<K[]> b = default; b.value = values; return (int)sizeof(b) * 1000 + (int)b.value[1]; }
+int t462LocalEnumPointerPointerBox() { enum K : int { A = 13 }; K value = K.A; K* q = &value; K** p = &q; T120Box<K**> b = default; b.value = p; return (int)sizeof(b) * 1000 + (int)**b.value; }
+int t462LocalEnumPointerFirst() { enum K : char { A = 17 }; K value = K.A; K* p = &value; T120Box<K*> b = default; b.value = p; return (int)sizeof(b) * 1000 + (int)*b.value; }
+int t462LocalEnumPointerSecond() { enum K : i64 { A = 400 }; K value = K.A; K* p = &value; T120Box<K*> b = default; b.value = p; return (int)sizeof(b) * 1000 + (int)*b.value; }
+int t462LocalEnumGenericCall() { enum K : int { A = 13 }; K value = K.A; K* p = &value; return t462ReadPointer<K*>(p); }
+int t462LocalEnumConstPointerBox() { enum K : int { A = 13 }; K value = K.A; const(K)* p = &value; T120Box<const(K)*> b = default; b.value = p; return (int)sizeof(b) * 1000 + (int)*b.value; }
+int t462FileEnumPointerBox() { T462PointerFileEnum value = T462PointerFileEnum.Value; T462PointerFileEnum* p = &value; T120Box<T462PointerFileEnum*> b = default; b.value = p; return (int)sizeof(b) * 1000 + (int)*b.value; }
+int t462StructPointerBox() { T462PointerStruct value = default; value.value = 13; T462PointerStruct* p = &value; T120Box<T462PointerStruct*> b = default; b.value = p; return (int)sizeof(b) * 1000 + b.value[0].value; }
+
 int t120NamespaceBox()
 {
     T120Box<T120Ns.Col> b;
@@ -812,6 +825,16 @@ bool testEnum()
     result &= Test("t120_local_enum_static_call", t120LocalEnumStaticCall(), 8);
     result &= Test("t120_local_enum_function_signature", t120LocalEnumFunctionSignature(), 3);
     result &= Test("t120_file_struct_with_local_enum_shadow", t120FileStructWithLocalEnumShadow(), 104);
+
+    result &= Test("t462_local_enum_generic_pointer", t462LocalEnumPointerBox(), 8013);
+    result &= Test("t462_local_enum_generic_view", t462LocalEnumViewBox(), 8013);
+    result &= Test("t462_local_enum_generic_double_pointer", t462LocalEnumPointerPointerBox(), 8013);
+    result &= Test("t462_local_enum_same_name_first_pointer", t462LocalEnumPointerFirst(), 8017);
+    result &= Test("t462_local_enum_same_name_second_pointer", t462LocalEnumPointerSecond(), 8400);
+    result &= Test("t462_local_enum_generic_function_pointer", t462LocalEnumGenericCall(), 13);
+    result &= Test("t462_local_enum_const_pointer_control", t462LocalEnumConstPointerBox(), 8013);
+    result &= Test("t462_file_enum_pointer_control", t462FileEnumPointerBox(), 8013);
+    result &= Test("t462_struct_pointer_control", t462StructPointerBox(), 8013);
 
     // A narrow unsigned base must zero-extend, a narrow signed base must sign-extend.
     WideU8 big = WideU8.WU8_BIG;

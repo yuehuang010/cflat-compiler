@@ -559,8 +559,81 @@ static unsigned LiteralDefaultBits(const std::string& name)
         return 0;
 }
 
+static std::string GenericLiteralExpressionIdentity(antlr4::tree::ParseTree* node)
+{
+        if (node == nullptr) return {};
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+        {
+            if (primary->Constant() != nullptr)
+                return LLVMBackend::LiteralIdentityForOverload(primary->Constant()->getText());
+            if (node->children.size() == 3)
+            {
+                auto* left = dynamic_cast<antlr4::tree::TerminalNode*>(node->children[0]);
+                auto* right = dynamic_cast<antlr4::tree::TerminalNode*>(node->children[2]);
+                if (left != nullptr && right != nullptr
+                    && left->getSymbol()->getType() == CFlatParser::LeftParen
+                    && right->getSymbol()->getType() == CFlatParser::RightParen)
+                    return GenericLiteralExpressionIdentity(node->children[1]);
+            }
+        }
+        if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node);
+            unary != nullptr && unary->children.size() == 2)
+        {
+            auto* op = dynamic_cast<CFlatParser::UnaryOperatorContext*>(unary->children[0]);
+            auto* operand = dynamic_cast<antlr4::tree::ParseTree*>(unary->children[1]);
+            if (op != nullptr && op->children.size() == 1 && operand != nullptr)
+            {
+                auto* token = dynamic_cast<antlr4::tree::TerminalNode*>(op->children[0]);
+                if (token != nullptr && (token->getSymbol()->getType() == CFlatParser::Plus
+                    || token->getSymbol()->getType() == CFlatParser::Minus))
+                {
+                    std::string identity = GenericLiteralExpressionIdentity(operand);
+                    if (identity == "bool" || identity == "char" || identity == "i8"
+                        || identity == "u8" || identity == "short" || identity == "i16"
+                        || identity == "u16")
+                        identity = "int";
+                    return identity;
+                }
+            }
+        }
+        if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node);
+            conditional != nullptr && conditional->children.size() == 5)
+        {
+            auto* question = dynamic_cast<antlr4::tree::TerminalNode*>(conditional->children[1]);
+            auto* colon = dynamic_cast<antlr4::tree::TerminalNode*>(conditional->children[3]);
+            if (question != nullptr && colon != nullptr
+                && question->getSymbol()->getType() == CFlatParser::Question
+                && colon->getSymbol()->getType() == CFlatParser::Colon)
+            {
+                const std::string left = GenericLiteralExpressionIdentity(conditional->children[2]);
+                const std::string right = GenericLiteralExpressionIdentity(conditional->children[4]);
+                if (left.empty() || right.empty()) return {};
+                if (left == right) return left;
+                const bool leftFloat = left == "float" || left == "double" || left == "longdouble";
+                const bool rightFloat = right == "float" || right == "double" || right == "longdouble";
+                if (leftFloat || rightFloat)
+                {
+                    if (left == "longdouble" || right == "longdouble") return "longdouble";
+                    if (left == "double" || right == "double") return "double";
+                    if (leftFloat && rightFloat) return "float";
+                    return leftFloat ? left : right;
+                }
+                const unsigned leftBits = LiteralDefaultBits(left);
+                const unsigned rightBits = LiteralDefaultBits(right);
+                if (leftBits != 0 && rightBits != 0 && leftBits != rightBits)
+                    return leftBits > rightBits ? left : right;
+                return {};
+            }
+        }
+        if (node->children.size() == 1
+            && dynamic_cast<antlr4::RuleContext*>(node->children[0]) != nullptr)
+            return GenericLiteralExpressionIdentity(node->children[0]);
+        return {};
+}
+
 std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& funcName,
-                                               const std::vector<LLVMBackend::NamedVariable>& args) {
+                                               const std::vector<LLVMBackend::NamedVariable>& args,
+                                               CFlatParser::ArgumentExpressionListContext* argList) {
         auto templateIt = genericFunctionTemplates.find(funcName);
         if (templateIt == genericFunctionTemplates.end()) return {};
 
@@ -579,9 +652,15 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
         std::unordered_map<std::string, bool> declaredBinding;
         // True while a binding came from an unsuffixed literal's default type (not a declared name).
         std::unordered_map<std::string, bool> literalBinding;
+        std::vector<CFlatParser::ArgumentNamedExpressionContext*> argumentExpressions;
+        if (argList != nullptr) argumentExpressions = argList->argumentNamedExpression();
+        const size_t argumentOffset = args.size() >= argumentExpressions.size()
+            ? args.size() - argumentExpressions.size() : 0;
         for (size_t i = 0; i < paramDecls.size() && i < args.size(); i++)
         {
             std::string paramTypeName;
+            std::string nestedParamTypeName;
+            std::string nestedGenericBase;
             int paramStars = 0;
             bool paramView = false;
             for (auto* ds : paramDecls[i]->declarationSpecifiers()->declarationSpecifier())
@@ -591,7 +670,22 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                 auto* gid = ts->genericIdentifier();
                 if (gid->Identifier())
                 {
-                    paramTypeName = gid->Identifier()->getText();
+                    if (gid->genericTypeParameters() == nullptr)
+                        paramTypeName = gid->Identifier()->getText();
+                    else if (auto* genericParams = GenericSpecOf(ts, nestedGenericBase);
+                             genericParams != nullptr
+                             && genericParams->typeParameterList()->typeParameterEntry().size() == 1)
+                    {
+                        auto* entry = genericParams->typeParameterList()->typeParameterEntry().front();
+                        auto* nestedType = entry->typeSpecifier();
+                        auto* nestedId = nestedType != nullptr ? nestedType->genericIdentifier() : nullptr;
+                        if (nestedId != nullptr && nestedId->Identifier() != nullptr
+                            && nestedId->genericTypeParameters() == nullptr
+                            && entry->pointer() == nullptr && entry->arrayTypeSuffix() == nullptr
+                            && entry->Identifier() == nullptr && entry->Const() == nullptr
+                            && entry->Ellipsis() == nullptr)
+                            nestedParamTypeName = nestedId->Identifier()->getText();
+                    }
                     // The parameter's OWN decoration ('T[] v', 'T*[] v', 'T* p') is not part of
                     // the binding: it is stripped off the argument's spelling below.
                     paramStars = PointerDepthOf(ds->pointer());
@@ -601,7 +695,8 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
             }
             for (const auto& tp : typeParams)
             {
-                if (paramTypeName != tp)
+                const bool nestedTypeBinding = paramTypeName.empty() && nestedParamTypeName == tp;
+                if (paramTypeName != tp && !nestedTypeBinding)
                     continue;
                 const auto& tv = args[i].TypeAndValue;
                 const auto& sourceTV = args[i].HasOriginalArgumentType
@@ -610,11 +705,29 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                 // the side channel; the reference-kind flags are propagated either way.
                 std::string base = tv.TypeName.empty() ? args[i].InferSourceTypeName : tv.TypeName;
                 bool declared = false;
+                bool fromLiteral = false;
                 std::string argType;
+                std::string literalIdentity = args[i].LiteralIdentity;
+                if (literalIdentity.empty() && i >= argumentOffset
+                    && i - argumentOffset < argumentExpressions.size())
+                    if (auto* assignment = argumentExpressions[i - argumentOffset]->assignmentExpression())
+                        literalIdentity = GenericLiteralExpressionIdentity(assignment);
                 // A function value's ABI carrier is __closure_fat_ptr / __c_fn_ptr, but C++-style
                 // T deduction binds its declared function type. Re-encode the original signature
                 // with the same key explicit Lambda<> / function<> arguments use.
-                if (paramStars == 0 && !paramView && !sourceTV.Pointer
+                if (nestedTypeBinding)
+                {
+                    TypeSpelling argumentSpelling;
+                    const std::string resolvedPatternBase =
+                        compilerLLVM->ResolveGenericTemplateBase(nestedGenericBase);
+                    if (base.empty() || !DemangleType(*compilerLLVM, base, argumentSpelling)
+                        || MangledBase(base) != resolvedPatternBase
+                        || argumentSpelling.args.size() != 1)
+                        break;
+                    argType = MangleType(*compilerLLVM, argumentSpelling.args.front());
+                    declared = true;
+                }
+                else if (paramStars == 0 && !paramView && !sourceTV.Pointer
                     && sourceTV.IsFunctionPointer && !sourceTV.FuncPtrReturnTypeName.empty())
                 {
                     argType = EncodeClosureFromSig(compilerLLVM, sourceTV);
@@ -628,6 +741,14 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                         argType = sourceTV.TypeName;
                         declared = true;
                     }
+                }
+                // Literal-valued expressions can carry a narrowed LLVM type. Bind their C++
+                // default type before the generic LLVM-type fallback below treats it as declared.
+                if (!nestedTypeBinding && argType.empty() && !literalIdentity.empty()
+                    && !paramView && paramStars == 0)
+                {
+                    argType = literalIdentity;
+                    fromLiteral = true;
                 }
                 if (argType.empty() && !base.empty())
                 {
@@ -708,15 +829,6 @@ std::string MainListener::TryInferAndInstantiateFromArgs(const std::string& func
                         argType = JoinConstTypeArgument("char*", 1);
                         declared = true;
                     }
-                // An unsuffixed literal infers its C++ default type (300 is int, 1.5 is double,
-                // 'a' is char), not its narrowed LLVM width (i16 / float / i8). Plain 'T' only:
-                // a 'T*' or 'T[]' parameter keeps the BaseType fallback below.
-                bool fromLiteral = false;
-                if (argType.empty() && !args[i].LiteralIdentity.empty() && !paramView && paramStars == 0)
-                {
-                    argType = args[i].LiteralIdentity;
-                    fromLiteral = true;
-                }
                 // Free-function calls drop TypeName for signed-int args. Fall back to the LLVM
                 // BaseType so literals infer; NOT for a view, whose opaque pointer recovers as
                 // a bogus 'i8' ELEMENT name that then fails the element-match gate.
@@ -1065,8 +1177,9 @@ std::string MainListener::MangledGenericName(const std::string& baseName,
 void MainListener::ResolveEnumTypeArguments(std::vector<std::string>& typeArgs)
 {
         for (auto& arg : typeArgs)
-            if (std::string enumKey = Compiler()->ResolveEnumTypeName(arg); !enumKey.empty())
-                arg = std::move(enumKey);
+            ResolveEnumTypeArgumentBase(arg, [this](const std::string& base) {
+                return Compiler()->ResolveEnumTypeName(base);
+            });
 }
 
 const std::unordered_set<std::string>& MainListener::FunctionLocalEnumNames(

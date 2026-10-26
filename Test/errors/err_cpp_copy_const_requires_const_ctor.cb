@@ -1,0 +1,27 @@
+import cpp "cpp_interop_lastuse.h";
+
+extern int main()
+{
+    expect_error("no copy constructor accepts a const source") {
+        const t461cv.OnlyNonConst x = t461cv.OnlyNonConst(7);
+        t461cv.take_only_nonconst(x);
+    }
+    expect_error("no copy constructor accepts a const source") {
+        const t461cv.OnlyNonConst x = t461cv.OnlyNonConst(7);
+        t461cv.OnlyNonConstHost h = default;
+        h.member_take(x);
+    }
+    expect_error("no copy constructor accepts a const source") {
+        const t461cv.OnlyNonConst x = t461cv.OnlyNonConst(7);
+        t461cv.OnlyNonConstSink sink = t461cv.OnlyNonConstSink(x);
+    }
+    expect_error("no copy constructor accepts a const source") {
+        const t461cv.OnlyNonConst x = t461cv.OnlyNonConst(7);
+        t461cv.OnlyNonConst copy = x;
+    }
+    expect_error("no instantiation of C++ function template 't461cv.template_take'") {
+        const t461cv.OnlyNonConst x = t461cv.OnlyNonConst(7);
+        t461cv.template_take(x);
+    }
+    return 0;
+}

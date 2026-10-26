@@ -40,6 +40,7 @@
 
 #include "platform/GeneratedParser.h"
 #include "LLVMBackend.h"
+#include "CppStructName.h"
 #include "CxxIncrementalGroup.h"
 #include "MainListener.h"
 #include "GrammarTreeListener.h"
@@ -5397,6 +5398,7 @@ void LLVMBackend::CollectTypeAliases(const cflat_cinterop::ExtractResult& raw,
             entry.cxxAliasArgs = t.cxxAliasArgs;
             entry.cxxAliasParamDefaults = t.cxxAliasParamDefaults;
             entry.cxxAliasParams = t.cxxAliasParams;
+            entry.cxxAliasParamPackFlags = t.cxxAliasParamPackFlags;
             entry.file = t.file;
             entry.line = t.line;
             entry.col = t.col;
@@ -5591,7 +5593,8 @@ void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& a
                 if (!a.cxxAliasTargetBase.empty())
                 {
                     CxxAliasPattern pattern{ a.cxxAliasTargetBase, a.cxxAliasParams,
-                                             a.cxxAliasParamDefaults, a.cxxAliasArgs,
+                                             a.cxxAliasParamPackFlags, a.cxxAliasParamDefaults,
+                                             a.cxxAliasArgs,
                                              a.qualifiedName.empty() ? a.name : a.qualifiedName };
                     if (!a.qualifiedName.empty()) RegisterCxxAliasPattern(a.qualifiedName, pattern);
                     if (a.name != a.qualifiedName) RegisterCxxAliasPattern(a.name, pattern);
@@ -6775,9 +6778,7 @@ bool LLVMBackend::CxxSpellingForCflatType(const std::string& cflatType, std::str
             out = lazy->second;
         else if (IsCppStructName(base))
         {
-            out = "__cflat_user::" + base;
-            for (size_t pos = 0; (pos = out.find('.', pos)) != std::string::npos; pos += 2)
-                out.replace(pos, 1, "__");
+            out = cflat_cinterop::GeneratedCflatStructCxxName(base);
         }
         else if (auto dot = base.find('.'); dot != std::string::npos
                  && cxxForeignNamespaces_.count(base.substr(0, dot)) != 0
@@ -6872,10 +6873,8 @@ void LLVMBackend::GeneratedCxxDefinitionsFor(
                 outIncompleteTypes.insert(type);
                 if (seenForwardDeclarations.insert(type).second)
                 {
-                    std::string cxxName = "__cflat_user::" + type;
-                    for (size_t pos = 0;
-                         (pos = cxxName.find('.', pos)) != std::string::npos; pos += 2)
-                        cxxName.replace(pos, 1, "__");
+                    const std::string cxxName =
+                        cflat_cinterop::GeneratedCflatStructCxxName(type);
                     const size_t last = cxxName.rfind("::");
                     const std::string shortName = last == std::string::npos
                         ? cxxName : cxxName.substr(last + 2);
@@ -9484,7 +9483,7 @@ bool LLVMBackend::IsCxxConstructorParameterByValue(const std::string& typeName,
 bool LLVMBackend::GetUniqueCxxConstructorValueParameter(const std::string& typeName,
                                                         size_t parameterIndex,
                                                         size_t arity,
-                                                        TypeAndValue& out) const
+                                                        TypeAndValue& out, bool constRef) const
 {
         const auto* info = GetCxxClassInfoWithConstructors(typeName);
         if (info == nullptr || info->hasCtorTemplate) return false;
@@ -9507,14 +9506,18 @@ bool LLVMBackend::GetUniqueCxxConstructorValueParameter(const std::string& typeN
                 }
             if (!arityFits) continue;
             const auto& parameter = ctor.params[parameterIndex + 1];
-            if (parameter.IsAlias || parameter.IsRvalueRef || parameter.CxxConstRef())
+            // A const reference is an alias too; the class's own copy ctor is no target.
+            if ((parameter.IsAlias && !constRef) || parameter.IsRvalueRef
+                || parameter.CxxConstRef() != constRef
+                || (constRef && parameter.TypeName == typeName))
                 continue;
             if (match != nullptr) return false;
             match = &ctor;
         }
         if (match == nullptr) return false;
         out = match->params[parameterIndex + 1];
-        return !out.TypeName.empty() && !out.Pointer;
+        // A const reference is spelled as a pointer here; the caller reads only its class name.
+        return !out.TypeName.empty() && (constRef || !out.Pointer);
 }
 
 static bool CxxTemplateHasForwardingReferenceParameter(
@@ -17027,10 +17030,12 @@ static bool CxxHeaderHasIncludeGuard(const std::string& contents)
 bool LLVMBackend::RequestCxxDirectBraceConstructor(
         const std::string& typeName, const std::vector<NamedVariable>& elements,
         const std::string& initializerList, bool copyListInit, std::string& wrapperName,
-        std::string& error, bool allowIncremental)
+        std::string& error, bool allowIncremental,
+        std::vector<size_t>* forwardedElementIndices)
 {
         error.clear();
         wrapperName.clear();
+        if (forwardedElementIndices != nullptr) forwardedElementIndices->clear();
         std::string ownerSpelling;
         if (!CxxSpellingForCflatType(typeName, ownerSpelling))
         {
@@ -17070,7 +17075,10 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             });
         allowIncremental = allowIncremental && headersGuarded;
         std::vector<std::string> parameterTypes{ ownerSpelling + " *" };
+        std::vector<std::string> elementParameters(elements.size());
+        std::vector<size_t> elementParameterTypes(elements.size(), 0);
         std::string init = initializerList;
+        size_t nextParameter = 1;
         for (size_t i = 0; i < elements.size(); ++i)
         {
             std::string spelling;
@@ -17082,6 +17090,24 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
                 return false;
             }
             if (type.Pointer && spelling.find('*') == std::string::npos) spelling += " *";
+            if (elements[i].IsDefaultArgument)
+            {
+                if (type.Pointer || type.IsAlias || type.IsRvalueRef
+                    || !IsCxxRecord(type.TypeName))
+                {
+                    error = "a deferred C++ brace default requires a by-value class target";
+                    return false;
+                }
+                const std::string marker = "__cflat_arg_" + std::to_string(i) + "__";
+                size_t at = 0;
+                const std::string replacement = spelling + "{}";
+                while ((at = init.find(marker, at)) != std::string::npos)
+                {
+                    init.replace(at, marker.size(), replacement);
+                    at += replacement.size();
+                }
+                continue;
+            }
             const bool pointerValue = type.Pointer
                 && (!type.IsAlias || type.IsCxxRefToPointer) && !type.IsFunctionPointer;
             const bool pointerXvalue = pointerValue && IsCxxRvalueReferenceArgument(elements[i]);
@@ -17099,12 +17125,16 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             // A class element binds by reference: clang copies an lvalue, moves an rvalue.
             else if (!type.Pointer && IsCxxRecord(type.TypeName))
                 spelling += elements[i].IsRvalue || elements[i].IsExplicitMove ? " &&" : " const &";
+            elementParameters[i] = "p" + std::to_string(nextParameter++);
+            elementParameterTypes[i] = parameterTypes.size();
             parameterTypes.push_back(std::move(spelling));
+            if (forwardedElementIndices != nullptr) forwardedElementIndices->push_back(i);
         }
         for (size_t i = 0; i < elements.size(); ++i)
         {
+            if (elements[i].IsDefaultArgument) continue;
             const std::string marker = "__cflat_arg_" + std::to_string(i) + "__";
-            const std::string param = "p" + std::to_string(i + 1);
+            const std::string& param = elementParameters[i];
             const auto& type = elements[i].TypeAndValue;
             const bool pointerValue = type.Pointer
                 && (!type.IsAlias || type.IsCxxRefToPointer) && !type.IsFunctionPointer;
@@ -17125,7 +17155,7 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             // constant-expression narrowing rule (`short{1}` fits) instead of the variable one.
             std::string constant = elements[i].CxxImportedLiteral;
             if (constant.empty())
-                constant = DirectBraceConstantText(elements[i], parameterTypes[i + 1],
+                constant = DirectBraceConstantText(elements[i], parameterTypes[elementParameterTypes[i]],
                     IsNullPointerConstantArgument(elements[i], true));
             if (!constant.empty())
             {
@@ -17965,7 +17995,11 @@ bool LLVMBackend::RequestCxxVariadicConstructor(
                     spelling += " &&";
                 }
                 else
+                {
+                    if (CxxConstReceiverKind(arg) != 0 && !spelling.starts_with("const "))
+                        spelling = "const " + spelling;
                     spelling += " &";
+                }
             }
             else if (!arg.TypeAndValue.Pointer && IsCxxRecord(arg.TypeAndValue.TypeName)
                      && IsCxxRvalueReferenceArgument(arg))
@@ -18680,9 +18714,8 @@ std::string LLVMBackend::GeneratedCxxPrefixForSpelling(const std::string& cxxSpe
         for (const auto& entry : generatedCxxRecords_)
         {
             const std::string& typeName = entry.first;
-            std::string cxxName = "__cflat_user::" + typeName;
-            for (size_t pos = 0; (pos = cxxName.find('.', pos)) != std::string::npos; pos += 2)
-                cxxName.replace(pos, 1, "__");
+            const std::string cxxName =
+                cflat_cinterop::GeneratedCflatStructCxxName(typeName);
             if (cxxSpelling.find(cxxName) != std::string::npos)
                 generatedNames.push_back(typeName);
         }
@@ -24899,7 +24932,8 @@ std::string LLVMBackend::DisplayCxxClassName(const std::string& typeName) const
 bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
                                               const std::string& memberName,
                                               bool accessedThroughCurrentObject,
-                                              bool deferElementCopySink)
+                                              bool deferElementCopySink,
+                                              bool protectedOnly)
 {
         EnsureCxxMemberProjected(typeName, memberName);
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
@@ -24930,6 +24964,7 @@ bool LLVMBackend::RejectInaccessibleCxxMember(const std::string& typeName,
                             { memberName, DisplayCxxClassName(typeName) });
             return true;
         }
+        if (protectedOnly) return false;
         if (auto m = info->refusedMembers.find(memberName); m != info->refusedMembers.end())
         {
             const std::string refusal = m->second;
@@ -25055,6 +25090,74 @@ bool LLVMBackend::CxxProtectedAccessAllowed(const std::string& typeName,
         return FindCxxBaseOffset(cppStructAccessContext_, typeName, offset, inaccessible)
             && !inaccessible;
     }
+
+size_t LLVMBackend::CxxBaseSubobjectCount(const std::string& derivedType,
+                                          const std::string& baseType) const
+{
+        if (derivedType.empty() || baseType.empty()) return 0;
+        const CxxClassInfo* derived = GetCxxClassInfo(derivedType);
+        if (derived == nullptr || !derived->layoutRefusal.empty()) return 0;
+        std::unordered_set<std::string> subobjects;
+        std::vector<std::string> active;
+        std::function<void(const std::string&, const std::string&)> visit =
+            [&](const std::string& current, const std::string& identity) {
+            if (current == baseType)
+            {
+                subobjects.insert(identity);
+                return;
+            }
+            if (std::find(active.begin(), active.end(), current) != active.end()) return;
+            const CxxClassInfo* info = GetCxxClassInfo(current);
+            if (info == nullptr || !info->layoutRefusal.empty()) return;
+            active.push_back(current);
+            for (const CxxClassInfo::BaseRef& base : info->bases)
+            {
+                const std::string name = ResolveCxxBaseIdentity(base);
+                if (name.empty()) continue;
+                // Repeated routes to a virtual base share one subobject; later non-virtual
+                // edges still distinguish separate descendants within that virtual base.
+                const std::string nextIdentity = base.isVirtual
+                    ? "virtual:" + name
+                    : identity + "/" + current + "->" + name;
+                visit(name, nextIdentity);
+            }
+            active.pop_back();
+        };
+        visit(derivedType, "object:" + derivedType);
+        return std::min<size_t>(2, subobjects.size());
+}
+
+std::string LLVMBackend::CxxInheritedMemberOwner(const std::string& receiverType,
+                                                  const FunctionSymbol& candidate) const
+{
+        if (!candidate.IsCxx || !candidate.IsMethod || candidate.UniqueName.empty()) return {};
+        auto declaresCandidate = [&](const std::string& owner) {
+            const CxxClassInfo* info = GetCxxClassInfo(owner);
+            return info != nullptr
+                && std::any_of(info->directMethods.begin(), info->directMethods.end(),
+                    [&](const CxxClassInfo::Method& method) {
+                        return !method.raw.isUsingShadow
+                            && method.raw.linkageName == candidate.UniqueName;
+                    });
+        };
+        if (!candidate.CxxInheritedOwner.empty()
+            && candidate.CxxInheritedOwner != receiverType
+            && declaresCandidate(candidate.CxxInheritedOwner))
+            return candidate.CxxInheritedOwner;
+        const CxxClassInfo* receiver = GetCxxClassInfo(receiverType);
+        const bool usingCandidate = receiver != nullptr
+            && std::any_of(receiver->directMethods.begin(), receiver->directMethods.end(),
+                [&](const CxxClassInfo::Method& method) {
+                    return method.raw.isUsingShadow
+                        && method.raw.linkageName == candidate.UniqueName;
+                });
+        if (!usingCandidate) return {};
+        for (const auto& [owner, info] : cxxClasses_)
+            if (owner != receiverType && IsCxxBaseOf(owner, receiverType)
+                && declaresCandidate(owner))
+                return owner;
+        return {};
+}
 
 /*
  * Publish one imported C++ class's callable surface.
@@ -26924,7 +27027,7 @@ bool LLVMBackend::IsCppStructName(const std::string& structName) const
 
 /*
  * A C++ identity naming a [cpp] struct as a template argument spells it as clang sees it
- * (`std.weak_ptr$__cflat_user.ns__Self`). Publish it under the CFlat spelling the program
+ * (`std.weak_ptr$__cflat_user.<encoded ns.Self>`). Publish it under the CFlat spelling the program
  * writes (`std.weak_ptr$ns.Self`) so both name ONE registration. The struct's own record
  * (`__cflat_user.Self`, no '$' before it) is left alone.
  */
@@ -26945,37 +27048,12 @@ std::string LLVMBackend::CanonicalGeneratedCxxIdentity(const std::string& identi
             while (end < out.size()
                    && (std::isalnum((unsigned char)out[end]) || out[end] == '_'))
                 ++end;
-            // Decode by the generator's own encoding (CppStructCxxName: '.' -> "__"), never by
-            // guessing separators: `ns_.Self` encodes as `ns___Self`, and "__" splitting misreads it.
             const std::string token = out.substr(start, end - start);
+            // The encoding is injective: decode once, then require a registered [cpp] struct.
             std::string decoded;
-            int matches = 0;
-            // Allocation-free compare of the encoding of `known` against the token.
-            auto encodesToToken = [&](const std::string& known) {
-                size_t i = 0;
-                for (char c : known)
-                {
-                    if (c == '.')
-                    {
-                        if (token.compare(i, 2, "__") != 0) return false;
-                        i += 2;
-                    }
-                    else if (i >= token.size() || token[i++] != c) return false;
-                }
-                return i == token.size();
-            };
-            for (const std::string& known : cppStructNames_)
-                if (encodesToToken(known)) { decoded = known; ++matches; }
-            // Two registered names encoding alike (`ns_.Self` / `ns._Self`): keep master's "__" split.
-            if (matches > 1)
-            {
-                std::string split = token;
-                for (size_t dot = 0; (dot = split.find("__", dot)) != std::string::npos; ++dot)
-                    split.replace(dot, 2, ".");
-                matches = IsCppStructName(split) ? 1 : 0;
-                decoded = split;
-            }
-            if (matches != 1 || pos == 0 || out[pos - 1] != '$')
+            const bool known = cflat_cinterop::DecodeGeneratedCflatStructIdentifier(token, decoded)
+                && IsCppStructName(decoded);
+            if (!known || pos == 0 || out[pos - 1] != '$')
             {
                 pos = end;
                 continue;
@@ -29755,7 +29833,8 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                     || (*callArgVars)[argIndex].CxxParamLastUse;
                 if (!EmitCxxCopyOrMoveConstruct(pn, temp, (*callArgVars)[argIndex].Storage,
                                                 useMove,
-                                                "into a by-value constructor parameter"))
+                                                "into a by-value constructor parameter", {},
+                                                CxxConstReceiverKind((*callArgVars)[argIndex]) != 0))
                     continue;
                 if (!IsCxxParamDestroyedInCallee(pn)) RegisterOwnedStructTemp(temp, pn);
                 if ((*callArgVars)[argIndex].CxxParamLastUse
@@ -29968,14 +30047,22 @@ bool LLVMBackend::EmitCxxArrayDefaultConstruction(const std::string& typeName, l
         return true;
     }
 
-const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::FindCxxCopyCtor(const std::string& typeName) const
+const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::FindCxxCopyCtor(
+        const std::string& typeName, bool constSource) const
 {
         const_cast<LLVMBackend*>(this)->EnsureCxxMemberProjected(typeName, "__ctor");
         const CxxClassInfo* info = GetCxxClassInfo(typeName);
         if (info == nullptr) return nullptr;
+        const CxxClassInfo::Structor* mutableCopy = nullptr;
+        const CxxClassInfo::Structor* constCopy = nullptr;
         for (const auto& c : info->constructors)
-            if (c.isCopyCtor) return &c;
-        return nullptr;
+            if (c.isCopyCtor)
+            {
+                const bool takesConst = c.params.size() > 1 && c.params[1].CxxConstRef();
+                if (takesConst && constCopy == nullptr) constCopy = &c;
+                else if (!takesConst && mutableCopy == nullptr) mutableCopy = &c;
+            }
+        return constSource ? constCopy : mutableCopy != nullptr ? mutableCopy : constCopy;
     }
 
 const LLVMBackend::CxxClassInfo::Structor* LLVMBackend::FindCxxMoveCtor(const std::string& typeName) const
@@ -32747,7 +32834,8 @@ bool LLVMBackend::EmitLoweredMemberwiseAssign(const std::string& typeName, llvm:
 
 bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::Value* dest,
                                              llvm::Value* src, bool useMove, const char* context,
-                                             const std::string& displayTypeName)
+                                             const std::string& displayTypeName,
+                                             bool constSource)
 {
         if (dest == nullptr || src == nullptr) return false;
         if (IsLoweredCFlatOnlyStruct(typeName))
@@ -32760,14 +32848,19 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
         // C++ falls back from move to COPY construction when the class declares no move
         // constructor. It never falls back the other way: silently moving where a copy was
         // written would leave the source consumed behind the user's back.
+        NamedVariable sourceObject;
+        sourceObject.Storage = src;
+        sourceObject.TypeAndValue.TypeName = typeName;
+        constSource = constSource || CxxConstReceiverKind(sourceObject) != 0;
+        sourceObject.IsTopLevelConst = constSource;
         const CxxClassInfo::Structor* ctor = useMove ? FindCxxMoveCtor(typeName) : nullptr;
-        if (ctor == nullptr) ctor = FindCxxCopyCtor(typeName);
+        if (ctor == nullptr) ctor = FindCxxCopyCtor(typeName, constSource);
         // A class first constructed through a generated wrapper (a CFlat closure into
         // std::function) never ran constructor selection: bind its one-argument ctors now.
         if (ctor == nullptr && TryBindRefusedCxxMember(typeName, "__ctor", 1))
         {
             ctor = useMove ? FindCxxMoveCtor(typeName) : nullptr;
-            if (ctor == nullptr) ctor = FindCxxCopyCtor(typeName);
+            if (ctor == nullptr) ctor = FindCxxCopyCtor(typeName, constSource);
         }
         if (ctor == nullptr && useMove) ctor = TryBindCxxGeneratedMoveCtor(typeName);
         if (ctor == nullptr)
@@ -32803,6 +32896,46 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
                     useMove ? "move" : "copy"));
                 return false;
             }
+            if (constSource && FindCxxCopyCtor(typeName) != nullptr)
+            {
+                // The listed copy-ctor set omits some clang-valid one-argument constructors.
+                // Ask clang lazily when const-source copy selection found no listed candidate.
+                NamedVariable constCopySource = sourceObject;
+                constCopySource.IsTopLevelConst = true;
+                std::string wrapperName;
+                std::string wrapperError;
+                if (RequestCxxVariadicConstructor(typeName, { constCopySource }, wrapperName,
+                                                  wrapperError, /*copyInit*/ true))
+                {
+                    llvm::Function* wrapper = nullptr;
+                    if (auto symbols = functionTable.find(wrapperName);
+                        symbols != functionTable.end())
+                        for (const FunctionSymbol& symbol : symbols->second)
+                            if (symbol.External && symbol.UniqueName == wrapperName
+                                && symbol.Function != nullptr)
+                            {
+                                wrapper = symbol.Function;
+                                break;
+                            }
+                    if (wrapper != nullptr)
+                    {
+                        builder->CreateCall(wrapper->getFunctionType(), wrapper, { dest, src });
+                        return true;
+                    }
+                    LogError(std::format(
+                        "cannot copy C++ class '{}' {}: clang selected a const-source constructor "
+                        "but its generated wrapper could not be called",
+                        displayTypeName.empty() ? DisplayCxxClassName(typeName) : displayTypeName,
+                        context));
+                    return false;
+                }
+                LogError(std::format(
+                    "cannot copy C++ class '{}' {} from a const source: no copy constructor "
+                    "accepts a const source",
+                    displayTypeName.empty() ? DisplayCxxClassName(typeName) : displayTypeName,
+                    context));
+                return false;
+            }
             const bool deleted = info != nullptr && info->hasDeletedCopyCtor;
             LogError(std::format(
                 "cannot {} C++ class '{}' {}: its {} constructor is {} - "
@@ -32819,10 +32952,11 @@ bool LLVMBackend::EmitCxxCopyOrMoveConstruct(const std::string& typeName, llvm::
 
 bool LLVMBackend::EmitCxxByValueParamConstruct(const std::string& typeName, llvm::Value* dest,
                                                 llvm::Value* src, bool useMove,
-                                                const char* context)
+                                                const char* context, bool constSource)
 {
         if (IsForeignNontrivialCxxClass(typeName))
-            return EmitCxxCopyOrMoveConstruct(typeName, dest, src, useMove, context);
+            return EmitCxxCopyOrMoveConstruct(typeName, dest, src, useMove, context, {},
+                                              constSource);
         if (!HasForeignNontrivialCxxField(typeName)) return false;
         if (!useMove)
         {

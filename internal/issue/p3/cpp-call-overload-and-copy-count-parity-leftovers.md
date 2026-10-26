@@ -3,11 +3,6 @@
 Values follow the T418 encoding (value*1e7 + ctor/copy/move/ca/ma/dtor/live digits) or the probe's own
 value/copies pair; every cell measured against clang++ -std=c++20 by the Sol reviewer of T416/T418/T420.
 
-Wrong overload (copy ctor const-ness):
-- A direct free call with a `const` class local selects `CV(CV&)` instead of `CV(const CV&)`: 107 vs clang 207.
-- An incoming `const` by-value C++ class parameter is copy-constructed through the non-const copy ctor:
-  n=107 vs clang 207.
-
 Refusals clang accepts:
 - A global as a `?:` leaf into a C++ call (`take(c ? default : g)`): refused, clang 701.
 - `default_competing` (two overloads both viable for `default`): refused on master.

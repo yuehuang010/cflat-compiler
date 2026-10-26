@@ -4949,7 +4949,17 @@ namespace cflat_cinterop
                 // EVERY parameter, type and non-type alike, and in declaration order: the pattern
                 // binds use-site arguments positionally, so a skipped `int N` shifts the rest.
                 for (const NamedDecl* param : *atd->getTemplateParameters())
+                {
                     t.cxxAliasParams.push_back(param->getNameAsString());
+                    bool isPack = false;
+                    if (const auto* typeParam = dyn_cast<TemplateTypeParmDecl>(param))
+                        isPack = typeParam->isParameterPack();
+                    else if (const auto* nonTypeParam = dyn_cast<NonTypeTemplateParmDecl>(param))
+                        isPack = nonTypeParam->isParameterPack();
+                    else if (const auto* templateParam = dyn_cast<TemplateTemplateParmDecl>(param))
+                        isPack = templateParam->isParameterPack();
+                    t.cxxAliasParamPackFlags.push_back(isPack ? 1 : 0);
+                }
                 HarvestAliasTemplatePattern(ctx, atd, alias, t);
                 st.out.typedefs.push_back(std::move(t));
                 return true;

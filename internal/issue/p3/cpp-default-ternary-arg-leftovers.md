@@ -1,44 +1,21 @@
-# Default ternary argument leftovers
+# C++ member operator with a same-type cast of `default` as the right operand leaks
 
-Active after T306 round 2. These cases remain out of scope for that round. Master comparisons
-and clang++ C++20 values were measured 2026-10-16 with
-`bash scratch/rev_t306_opus_probe.sh` and the unrebuilt master executable.
+Left after T453 (2026-10-24). `ad + (cpptw.Twin)(default)` where `cppt453.Adder` has a by-value member
+`operator+(cpptw::Twin)` (fixture Test/library/cpp_interop_twin.h, namespace cppt453). Counters encoded as
+value*1e7 + ctor/copy/move/copy-assign/move-assign/dtor digits + live delta (bridge_t299_pack_result):
 
-## Nested ternary refusal
+- clang++ -std=c++20: 1000010 (one ctor, no copy/move, one dtor, nothing live).
+- master before T453: 1110021 (extra copy and move, one allocation leaked).
+- after T453: 1010011 (copy gone; the default slot is still moved into the by-value parameter and one
+  allocation leaks).
 
-```cflat
-cpptw.Twin tw = default;
-value = cpptw.take(c ? (d ? default : rettw()) : move tw);
-```
+Repro: scratch/repro_keep/box1022/t453/a2.cb (compile with -i Test/library). The nested form
+`cpptw.take(cpptw.Twin(ad + (cpptw.Twin)(default)))` matches clang (bridge leg "nested member operator default").
 
-Both master and round 2 refuse at an ownership join. Master points at the inner ternary and says
-`default` does not free its value; round 2 points at the outer join and says `move tw` only uses
-an existing value and does not free it. The round-2 message is inaccurate because `move tw`
-transfers the selected value. The clang values/counters for `c,d = true,true`, `true,false`, and
-`false,false` are `2000020`, `2000020`, and `1010020`.
+Root cause (T453 r2): the cast now returns the default slot as an rvalue (ParseCastExpressionImpl,
+MainListener_Expressions.cpp ~20663), but the direct member-operand path classifies the stored rvalue as an
+xvalue and marks it explicit-move for the by-value operator argument (MainListener_Expressions.cpp ~18188 and
+~18938), so the parameter is move-constructed from the slot and the slot itself is never destroyed.
 
-## Member operator+ copy
-
-```cflat
-rv.Adder ad = default;
-value = cpptw.take(cpptw.Twin(ad + (cpptw.Twin)(default)));
-```
-
-Master measures `2100021` (one live owner remains), round 1 and round 2 measure `2100030` (one
-extra copy), and clang++ measures `2000020`. The parenthesized default is a by-value member
-`operator+` argument nested in a constructor argument.
-
-## Other refused shapes
-
-| CFlat shape | Master and round 2 | clang++ C++20 |
-|---|---|---:|
-| `ctake(c ? default : rettw())`, either condition | ownership-join refusal | `1000010` |
-| `ad + (c ? default : rettw())`, either condition | ownership-join refusal | `1000010` |
-| `new cppt306.Holder((default))` | no known target type | `1100020` |
-| `cppt306.Holder h = { default };` | no known target type | `1100020` |
-| `cpptw.take(cpptw.Twin(ctake(default)))` (CFlat `ctake(default)` wrapped) | T142: no by-value parameter | `2000020` |
-| `cpptw.take(ctakeret(default))` (CFlat `ctakeret(default)` wrapped) | T142: no by-value parameter | `1010020` |
-
-Keep these refusals until their argument target and ownership slot can be proven. Correct the
-nested-join diagnostic at the same time as any fix; do not broaden the round-2 cast/constructor
-shape predicate to admit nested joins.
+Fix direction: treat a default temp reaching a by-value C++ operator parameter as a prvalue - construct the
+parameter in place (or hand the slot over as the parameter) instead of moving from it.

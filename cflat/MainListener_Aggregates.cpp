@@ -1,4 +1,5 @@
 #include "MainListener.h"
+#include "CppStructName.h"
 
 namespace
 {
@@ -21,24 +22,12 @@ bool ShouldWarnImplicitFieldNarrowing(llvm::Value* value, llvm::Type* destinatio
 
 std::string CppStructCxxName(const std::string& name)
 {
-    std::string out = "__cflat_user::" + name;
-    for (size_t pos = 0; (pos = out.find('.', pos)) != std::string::npos; )
-    {
-        out.replace(pos, 1, "__");
-        pos += 2;
-    }
-    return out;
+    return cflat_cinterop::GeneratedCflatStructCxxName(name);
 }
 
 std::string CppStructThunkStem(const std::string& name)
 {
-    std::string out = name;
-    for (size_t pos = 0; (pos = out.find('.', pos)) != std::string::npos; )
-    {
-        out.replace(pos, 1, "__");
-        pos += 2;
-    }
-    return out;
+    return cflat_cinterop::GeneratedCflatStructIdentifier(name);
 }
 }
 
@@ -115,11 +104,23 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                 auto field = std::find_if(fields.begin(), fields.end(), [&](const auto& value) {
                     return value.VariableName == fieldName;
                 });
+                bool hasExpressionElement = false;
+                for (auto* element : fi->initializerList()->fieldInit())
+                    if (element != nullptr && element->Identifier() == nullptr
+                        && !element->assignmentExpression().empty())
+                    {
+                        hasExpressionElement = true;
+                        break;
+                    }
+                const bool ctorArrayOverride = hasExpressionElement && field != fields.end()
+                    && field->ConstArraySize > 0 && !field->Pointer && !field->ElemPointer
+                    && !field->IsArrayView && !compiler->IsCxxRecord(field->TypeName)
+                    && !compiler->HasForeignNontrivialCxxField(field->TypeName)
+                    && CflatStructNeedsCtorConstruction(field->TypeName);
                 if (field != fields.end()
-                    && (explicitNoArgConstructors_.count(field->TypeName) != 0
-                        || (field->ConstArraySize > 0 && !field->Pointer && !field->ElemPointer
-                            && !field->IsArrayView && !compiler->IsCxxRecord(field->TypeName)
-                            && CflatStructNeedsCtorConstruction(field->TypeName))))
+                    && ((explicitNoArgConstructors_.count(field->TypeName) != 0
+                            && !ctorArrayOverride)
+                        || (ctorArrayOverride && destination == nullptr)))
                     continue;
             }
             // `f = {}` on a plain CFlat struct field: the seed builds it once, like an omitted field.
@@ -340,7 +341,9 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                 || fi->Identifier()->getText() != field.VariableName
                 || fi->initializerList() == nullptr)
                 continue;
-            EmitFieldInitializer(destination, structName, braceOverrides, true,
+            const bool fieldAlreadyBuilt = field.ConstArraySize > 0 && !field.Pointer
+                && !field.ElemPointer && !field.IsArrayView;
+            EmitFieldInitializer(destination, structName, braceOverrides, !fieldAlreadyBuilt,
                                  &field.VariableName);
             return;
         }
@@ -481,13 +484,63 @@ bool MainListener::CanFreshBraceInitializeAggregate(
         return false;
     auto data = compiler->GetDataStructure(typeName);
     if (data.StructType == nullptr || data.IsUnion) return false;
+    auto containsCtorArrayOverride = [&](auto&& self, const std::string& targetType,
+                                         CFlatParser::InitializerListContext* targetList,
+                                         unsigned depth) -> bool {
+        if (targetList == nullptr || depth >= 32) return false;
+        auto targetData = compiler->GetDataStructure(targetType);
+        if (targetData.StructType == nullptr || targetData.IsUnion) return false;
+        for (auto* fi : targetList->fieldInit())
+        {
+            if (fi == nullptr || fi->Identifier() == nullptr || fi->initializerList() == nullptr)
+                continue;
+            const std::string fieldName = fi->Identifier()->getText();
+            auto field = std::find_if(targetData.StructFields.begin(), targetData.StructFields.end(),
+                [&](const auto& value) { return value.VariableName == fieldName; });
+            if (field == targetData.StructFields.end()) continue;
+            const bool ctorArray = field->ConstArraySize > 0 && !field->Pointer
+                && !field->ElemPointer && !field->IsArrayView
+                && !compiler->IsCxxRecord(field->TypeName)
+                && !compiler->HasForeignNontrivialCxxField(field->TypeName)
+                && CflatStructNeedsCtorConstruction(field->TypeName);
+            if (ctorArray)
+            {
+                for (auto* element : fi->initializerList()->fieldInit())
+                {
+                    if (element != nullptr && element->Identifier() == nullptr
+                        && !element->assignmentExpression().empty())
+                        return true;
+                    if (FieldInitIsBraceElement(element)
+                        && self(self, field->TypeName, element->initializerList(), depth + 1))
+                        return true;
+                }
+            }
+            else if (field->ConstArraySize > 0 && !field->Pointer && !field->ElemPointer
+                && !field->IsArrayView && !compiler->IsCxxRecord(field->TypeName))
+            {
+                for (auto* element : fi->initializerList()->fieldInit())
+                    if (FieldInitIsBraceElement(element)
+                        && self(self, field->TypeName, element->initializerList(), depth + 1))
+                        return true;
+            }
+            if (!field->Pointer && !field->ElemPointer && !field->IsAlias
+                && !field->IsArrayView && !field->IsFunctionPointer
+                && !compiler->IsCxxRecord(field->TypeName)
+                && field->ConstArraySize == 0 && field->ConstInnerDimensions.empty()
+                && self(self, field->TypeName, fi->initializerList(), depth + 1))
+                return true;
+        }
+        return false;
+    };
+    const bool hasCtorArrayOverride = containsCtorArrayOverride(
+        containsCtorArrayOverride, typeName, list, 0);
     // A named `f = {}` needs the seed to build f once; the value-then-override path would build it twice.
     const bool hasEmptyFieldBrace = std::any_of(fieldInits.begin(), fieldInits.end(),
         [](auto* fi) { return fi != nullptr && fi->Identifier() != nullptr
             && fi->initializerList() == nullptr && fi->assignmentExpression().empty(); });
     const bool immovableCtor = explicitNoArgConstructors_.count(typeName) != 0
         && compiler->IsImmovableCFlatStruct(typeName);
-    if (!force && !hasEmptyFieldBrace && !immovableCtor
+    if (!force && !hasEmptyFieldBrace && !hasCtorArrayOverride && !immovableCtor
         && !compiler->IsImmovableCFlatStruct(typeName)
         && !compiler->HasForeignNontrivialCxxField(typeName)) return false;
     return true;
@@ -1148,15 +1201,49 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             std::cout << "[verbose]     parse decl list: " << structName << "\n";
 
         LLVMBackend::AliasScopeGuard aliasScope(compiler);
+        for (auto* nestedStruct : MemberStructDefinitions(ctx))
+            if (nestedStruct->genericTypeParameters() != nullptr)
+                ParseStructDefinition(nestedStruct, {}, structName);
+        for (auto* nestedClass : MemberClassDefinitions(ctx))
+            if (nestedClass->genericTypeParameters() != nullptr)
+                ParseClassDefinition(nestedClass, {}, structName);
         CollectAggregateAliases(ctx, structName);
+        for (auto* nestedStruct : MemberStructDefinitions(ctx))
+            if (nestedStruct->genericTypeParameters() != nullptr)
+            {
+                const std::string key = structName + "." + nestedStruct->directDeclarator()->getText();
+                auto it = genericStructTemplates.find(key);
+                if (it != genericStructTemplates.end() && it->second == nestedStruct)
+                    genericLexicalAliasScopes_[key] = compiler->aliasScopeStack_;
+            }
+        for (auto* nestedClass : MemberClassDefinitions(ctx))
+            if (nestedClass->genericTypeParameters() != nullptr)
+            {
+                const std::string key = structName + "." + nestedClass->directDeclarator()->getText();
+                auto it = genericClassTemplates.find(key);
+                if (it != genericClassTemplates.end() && it->second == nestedClass)
+                    genericLexicalAliasScopes_[key] = compiler->aliasScopeStack_;
+            }
         compiler->SaveAggregateAliasScope(structName);
         RecordAggregateValueMembers(structName, ResolveAggregateMembers(ctx));
 
         // Process nested struct/class definitions before fields so their types are available
         for (auto* nestedStruct : MemberStructDefinitions(ctx))
-            ParseStructDefinition(nestedStruct, {}, structName);
+        {
+            const std::string key = structName + "." + nestedStruct->directDeclarator()->getText();
+            auto it = genericStructTemplates.find(key);
+            if (nestedStruct->genericTypeParameters() == nullptr
+                || it == genericStructTemplates.end() || it->second != nestedStruct)
+                ParseStructDefinition(nestedStruct, {}, structName);
+        }
         for (auto* nestedClass : MemberClassDefinitions(ctx))
-            ParseClassDefinition(nestedClass, {}, structName);
+        {
+            const std::string key = structName + "." + nestedClass->directDeclarator()->getText();
+            auto it = genericClassTemplates.find(key);
+            if (nestedClass->genericTypeParameters() == nullptr
+                || it == genericClassTemplates.end() || it->second != nestedClass)
+                ParseClassDefinition(nestedClass, {}, structName);
+        }
 
         // Push scope so unqualified nested type names resolve (e.g. Inner -> Outer.Inner)
         structScopeStack.push_back(structName);
@@ -4943,15 +5030,49 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             std::cout << "[verbose]     parse decl list: " << structName << "\n";
 
         LLVMBackend::AliasScopeGuard aliasScope(compiler);
+        for (auto* nestedStruct : MemberStructDefinitions(ctx))
+            if (nestedStruct->genericTypeParameters() != nullptr)
+                ParseStructDefinition(nestedStruct, {}, structName);
+        for (auto* nestedClass : MemberClassDefinitions(ctx))
+            if (nestedClass->genericTypeParameters() != nullptr)
+                ParseClassDefinition(nestedClass, {}, structName);
         CollectAggregateAliases(ctx, structName);
+        for (auto* nestedStruct : MemberStructDefinitions(ctx))
+            if (nestedStruct->genericTypeParameters() != nullptr)
+            {
+                const std::string key = structName + "." + nestedStruct->directDeclarator()->getText();
+                auto it = genericStructTemplates.find(key);
+                if (it != genericStructTemplates.end() && it->second == nestedStruct)
+                    genericLexicalAliasScopes_[key] = compiler->aliasScopeStack_;
+            }
+        for (auto* nestedClass : MemberClassDefinitions(ctx))
+            if (nestedClass->genericTypeParameters() != nullptr)
+            {
+                const std::string key = structName + "." + nestedClass->directDeclarator()->getText();
+                auto it = genericClassTemplates.find(key);
+                if (it != genericClassTemplates.end() && it->second == nestedClass)
+                    genericLexicalAliasScopes_[key] = compiler->aliasScopeStack_;
+            }
         compiler->SaveAggregateAliasScope(structName);
         RecordAggregateValueMembers(structName, ResolveAggregateMembers(ctx));
 
         // Process nested struct/class definitions before fields so their types are available
         for (auto* nestedStruct : MemberStructDefinitions(ctx))
-            ParseStructDefinition(nestedStruct, {}, structName);
+        {
+            const std::string key = structName + "." + nestedStruct->directDeclarator()->getText();
+            auto it = genericStructTemplates.find(key);
+            if (nestedStruct->genericTypeParameters() == nullptr
+                || it == genericStructTemplates.end() || it->second != nestedStruct)
+                ParseStructDefinition(nestedStruct, {}, structName);
+        }
         for (auto* nestedClass : MemberClassDefinitions(ctx))
-            ParseClassDefinition(nestedClass, {}, structName);
+        {
+            const std::string key = structName + "." + nestedClass->directDeclarator()->getText();
+            auto it = genericClassTemplates.find(key);
+            if (nestedClass->genericTypeParameters() == nullptr
+                || it == genericClassTemplates.end() || it->second != nestedClass)
+                ParseClassDefinition(nestedClass, {}, structName);
+        }
 
         // Push scope so unqualified nested type names resolve (e.g. Inner -> Outer.Inner)
         structScopeStack.push_back(structName);

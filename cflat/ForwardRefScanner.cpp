@@ -531,6 +531,17 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     }
                     else
                     {
+                        if (typeArgs.empty())
+                        {
+                            const std::string resolvedType = compiler->ResolveTypeAlias(
+                                compiler->ResolveQualifiedName(baseName));
+                            if (!compiler->AnyGenericTypeTemplateNamed(baseName)
+                                && compiler->IsDataStructure(resolvedType)
+                                && !compiler->IsCxxRecord(resolvedType)
+                                && !compiler->IsCxxForeignTypeRegistered(resolvedType))
+                                Compiler(genParams)->LogError(
+                                    std::format("'{}' is not a generic type", spelledBase));
+                        }
                         // Pre-pass copy: request a foreign C++ specialization so a field or
                         // parameter of that type has a real layout. Other failures stay silent:
                         // only the second pass can distinguish a miss from a later CFlat template.
@@ -615,6 +626,16 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     // A std::nullptr_t alias keeps its identity; alias expansion spells it void*.
                     if (compiler->IsCxxNullptrTAlias(specText)) declType.IsCxxNullptrT = true;
                     declType.TypeName = compiler->ResolveQualifiedName(specText);
+                    if (IsUnparameterizedNamedTypeSpecifier(typeSpec)
+                        && scanTypeSubstitutions_.find(
+                            typeSpec->getText()) == scanTypeSubstitutions_.end())
+                    {
+                        const auto aggregateScopes = EnclosingAggregateNamesFromContext(compiler, typeSpec);
+                        const std::string contextual = ResolveContextualTypeName(compiler,
+                            typeSpec->getText(), declType.TypeName, typeSpec, aggregateScopes,
+                            NamespaceNameFromContext(compiler, typeSpec));
+                        if (!contextual.empty()) declType.TypeName = contextual;
+                    }
                     // Resolve type aliases (e.g. user-defined aliases)
                     declType.ConstMask |= compiler->ResolveTypeAliasConstMask(declType.TypeName);
                     if (typeSpec->memberTypeSpecifier() != nullptr) declType.ConstMask |= memberMask;
@@ -1645,17 +1666,15 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
             // Namespace enums are collected before this scan but their backing types are not
             // registered until ScanExternalDeclaration. Local enum arguments are deferred.
             if (!substituted)
-            {
-                if (std::string enumKey = Compiler(entry)->ResolveEnumTypeName(resolved);
-                    !enumKey.empty())
-                    resolved = std::move(enumKey);
-                else if (std::string scannedEnum = Compiler(entry)->FirstVisibleScopedKey(
-                             resolved, [compiler = Compiler(entry)](const std::string& candidate) {
-                                 return compiler->gts.scannedNonLocalEnumNames.count(candidate) != 0;
-                             }, ScopedLookupOptions{ .ResolveFirstComponentAlias = false });
-                         !scannedEnum.empty())
-                    resolved = std::move(scannedEnum);
-            }
+                ResolveEnumTypeArgumentBase(resolved, [this, entry](const std::string& base) {
+                    if (std::string enumKey = Compiler(entry)->ResolveEnumTypeName(base);
+                        !enumKey.empty())
+                        return enumKey;
+                    return Compiler(entry)->FirstVisibleScopedKey(
+                        base, [compiler = Compiler(entry)](const std::string& candidate) {
+                            return compiler->gts.scannedNonLocalEnumNames.count(candidate) != 0;
+                        }, ScopedLookupOptions{ .ResolveFirstComponentAlias = false });
+                });
             if (entry->pointer() == nullptr && entry->arrayTypeSuffix() == nullptr
                 && entry->Identifier() == nullptr && typeSpec != nullptr
                 && ((typeSpec->genericIdentifier() != nullptr

@@ -2055,6 +2055,13 @@ struct T312O { T312E[2] h; };
 struct T312O2 { T312O[2] a; };
 T312E t312Gx = default;
 struct T312FD { T312E[2] h = { t312Gx, t312Gx }; };
+struct T312RootFD { T312FD f; };
+int t468Alloc = 0;
+int t468Live = 0;
+struct T468R { int z = 0; T468R() { t468Alloc = t468Alloc + 1; t468Live = t468Live + 1; } ~T468R() { t468Live = t468Live - 1; } };
+struct T468U { unique<T468R> u; int k = 1; T468U() { k = 2; u = unique<T468R>(new T468R()); } };
+struct T468UO { T468U[2] h; };
+struct T468UO2 { T468UO[2] a; };
 // T336: by-value CFlat brace-argument ownership coverage.
 struct T336Plain { T312E e; };
 struct T336Array3 { T312E[3] h; };
@@ -2377,9 +2384,12 @@ int T228ThrowWrapper(int x)
     return s.t.get();
 }
 T73Holder t73Global = default;
-// T94 B: a [cpp] struct in a namespace whose name ends in '_'. The generated identity for ns_.Self
-// is ns___Self; it must decode back to ns_.Self, not ns._Self (clang++ oracle: 0).
+// T94 B: a [cpp] struct in a namespace whose name ends in '_'. Its generated identity must decode
+// back to ns_.Self, not ns._Self (clang++ oracle: 0).
 namespace t94u_ { [cpp] struct Self : std.enable_shared_from_this<Self> { int value = default; }; }
+// T464 replaces the legacy spelling noted above with an injective component encoding.
+namespace t464_ns_ { [cpp] struct Self : std.enable_shared_from_this<Self> { int value = default; }; }
+namespace t464_ns { [cpp] struct _Self : std.enable_shared_from_this<_Self> { int value = default; }; }
 char* t75Pick(char* s) { return s; }
 
 struct T90Traits<T>
@@ -2695,11 +2705,23 @@ string T381ReturnString()
     return base.length() == 0 ? "lit" : base;
 }
 int T381ConsumeString(string value) { return value.length(); }
+namespace T465CppNamespaceSizeof
+{
+    int Value() { return (int)sizeof(std.string); }
+}
 
 union T440TrivialCppUnion { t138.Plain plain; int tag; };
 // A forward by-value CFlat holder is accepted once its body completes.
 union T440ForwardTrivialUnion { T440ForwardTrivialHolder holder; int tag; };
 struct T440ForwardTrivialHolder { int value; };
+[cpp] struct T456ProtectedUse : cppsopd.T456ProtectedDerived
+{
+    int useMinus(int rhs) { return (*this) - rhs; }
+    int useTilde() { return ~(*this); }
+    int useSubscript(int rhs) { return (*this)[rhs]; }
+    int useCall(int rhs) { return (*this)(rhs); }
+    int useCompound(int rhs) { *this += rhs; return this.value; }
+};
 
 extern int main()
 {
@@ -2707,6 +2729,7 @@ extern int main()
     if (t440Trivial.plain.u != 47) return 44001;
     T440ForwardTrivialUnion t440ForwardTrivial = { holder = { value = 48 } };
     if (t440ForwardTrivial.holder.value != 48) return 44002;
+    if (T465CppNamespaceSizeof.Value() != (int)sizeof(std.string)) return 46501;
     if (t365CppUniqueSlotCall() != 191) return 36501;
     // T217: mutable fields stay writable through const C++ storage, including constexpr globals.
     t217_constexpr.m = 7;
@@ -10373,6 +10396,23 @@ extern int main()
     cppsopd.T221OpMulti t221OpMulti = default;
     if (t221OpMulti - 2 != 1002)                                              return 4411;
     if (cppsopd.T221StaticMulti.s(2) != 5002)                                 return 4412;
+    cppsopd.T456Diamond t456Diamond = default;
+    if (t456Diamond.own(2) != 3013)                                           return 45601;
+    if (t456Diamond + 2 != 4013)                                              return 45602;
+    cppsopd.T456One t456Single = default;
+    if (t456Single.f(2) != 1002 || t456Single - 2 != 2002)                   return 45603;
+    cppsopd.T456PublicDerived t456Public = default;
+    if (t456Public * 2 != 5002)                                               return 45604;
+    T456ProtectedUse t456ProtectedUse = default;
+    if (t456ProtectedUse.useMinus(2) != 6002)                                 return 45605;
+    if (t456ProtectedUse.useTilde() != 6100)                                  return 45606;
+    if (t456ProtectedUse.useSubscript(1) != 6201)                             return 45607;
+    if (t456ProtectedUse.useCompound(3) != 3)                                 return 45611;
+    if (t456ProtectedUse.useCall(2) != 6202)                                  return 45608;
+    cppsopd.T456ProtectedFreeBinary t456ProtectedFreeBinary = default;
+    if (t456ProtectedFreeBinary + 2.5 != 61)                                  return 45609;
+    cppsopd.T456ProtectedFreeUnary t456ProtectedFreeUnary = default;
+    if (+t456ProtectedFreeUnary != 63)                                        return 45610;
     // A class template specialization target; copy-assign from the temporary adds 10 to tag.
     cppexp.ConvBox<int> convBox = 3;
     if (convBox.v != 3 || convBox.tag != 1)                                    return 2247;
@@ -16436,6 +16476,19 @@ extern int main()
     std.weak_ptr<t94u_.Self> t94Weak = t94Own->weak_from_this();
     if (t94Weak.use_count() != 1)                                              return 94106;
     if (t94Weak.lock()->value != 41)                                           return 94107;
+    // T464: both CFlat names must keep distinct wrapper and weak_ptr identities.
+    t464_ns_.Self t464First = default;
+    t464_ns._Self t464Second = default;
+    t464First.value = 17;
+    t464Second.value = 29;
+    std.shared_ptr<t464_ns_.Self> t464FirstOwner = std.make_shared<t464_ns_.Self>();
+    t464FirstOwner->value = 41;
+    std.weak_ptr<t464_ns_.Self> t464FirstWeak = t464FirstOwner->weak_from_this();
+    std.shared_ptr<t464_ns._Self> t464SecondOwner = std.make_shared<t464_ns._Self>();
+    t464SecondOwner->value = 43;
+    std.weak_ptr<t464_ns._Self> t464SecondWeak = t464SecondOwner->weak_from_this();
+    if (t464First.value != 17 || t464Second.value != 29)                    return 46401;
+    if (t464FirstWeak.lock()->value != 41 || t464SecondWeak.lock()->value != 43) return 46402;
     // T85: unrelated primitive pointees are refused (err_cpp_unrelated_pointee.cb). An overload set
     // falls to the void* or template candidate as clang does; the accept-set rows stay accepted.
     int t85Int = 1;
@@ -17067,6 +17120,49 @@ int T418TemplateCompeting(bool c)
     { t418.Host h = default; t418.Val x = t418.Val(7); t418.Val y = t418.Val(2); value = h.pick2(c ? default : x, c ? default : y); }
     return value;  // copies stay master's (one extra per arm, pre-existing); the guard is acceptance
 }
+
+int T461LocalFree() { const t461cv.CV x = t461cv.CV(7); return t461cv.take(x); }
+int T461LocalMember() { const t461cv.CV x = t461cv.CV(7); t461cv.Host h = default; return h.member_take(x); }
+int T461LocalCtor() { const t461cv.CV x = t461cv.CV(7); t461cv.Sink s = t461cv.Sink(x); return s.result; }
+int T461LocalTemplate() { const t461cv.CV x = t461cv.CV(7); return t461cv.template_take(x); }
+int T461LocalCopy() { const t461cv.CV x = t461cv.CV(7); t461cv.CV y = x; return y.value; }
+
+int T461ParamFree(const t461cv.CV x) { return t461cv.take(x); }
+int T461ParamMember(const t461cv.CV x) { t461cv.Host h = default; return h.member_take(x); }
+int T461ParamCtor(const t461cv.CV x) { t461cv.Sink s = t461cv.Sink(x); return s.result; }
+int T461ParamTemplate(const t461cv.CV x) { return t461cv.template_take(x); }
+int T461ParamCopy(const t461cv.CV x) { t461cv.CV y = x; return y.value; }
+
+int T461FieldFree() { const t461cv.Box box = t461cv.Box(7); return t461cv.take(box.item); }
+int T461FieldMember() { const t461cv.Box box = t461cv.Box(7); t461cv.Host h = default; return h.member_take(box.item); }
+int T461FieldCtor() { const t461cv.Box box = t461cv.Box(7); t461cv.Sink s = t461cv.Sink(box.item); return s.result; }
+int T461FieldTemplate() { const t461cv.Box box = t461cv.Box(7); return t461cv.template_take(box.item); }
+int T461FieldCopy() { const t461cv.Box box = t461cv.Box(7); t461cv.CV y = box.item; return y.value; }
+
+int T461RefParamFree(const t461cv.CV* x) { return t461cv.take(*x); }
+int T461RefParamMember(const t461cv.CV* x) { t461cv.Host h = default; return h.member_take(*x); }
+int T461RefParamCtor(const t461cv.CV* x) { t461cv.Sink s = t461cv.Sink(*x); return s.result; }
+int T461RefParamTemplate(const t461cv.CV* x) { return t461cv.template_take(*x); }
+int T461RefParamCopy(const t461cv.CV* x) { t461cv.CV y = *x; return y.value; }
+
+int T461RefReturnFree() { t461cv.CV x = t461cv.CV(7); return t461cv.take(t461cv.const_ref(x)); }
+int T461RefReturnMember() { t461cv.CV x = t461cv.CV(7); t461cv.Host h = default; return h.member_take(t461cv.const_ref(x)); }
+int T461RefReturnCtor() { t461cv.CV x = t461cv.CV(7); t461cv.Sink s = t461cv.Sink(t461cv.const_ref(x)); return s.result; }
+int T461RefReturnTemplate() { t461cv.CV x = t461cv.CV(7); return t461cv.template_take(t461cv.const_ref(x)); }
+int T461RefReturnCopy() { t461cv.CV x = t461cv.CV(7); t461cv.CV y = t461cv.const_ref(x); return y.value; }
+
+int T461MutableFree() { t461cv.CV x = t461cv.CV(7); return t461cv.take(x); }
+int T461MutableMember() { t461cv.CV x = t461cv.CV(7); t461cv.Host h = default; return h.member_take(x); }
+int T461MutableCtor() { t461cv.CV x = t461cv.CV(7); t461cv.Sink s = t461cv.Sink(x); return s.result; }
+int T461MutableTemplate() { t461cv.CV x = t461cv.CV(7); return t461cv.template_take(x); }
+int T461MutableCopy() { t461cv.CV x = t461cv.CV(7); t461cv.CV y = x; return y.value; }
+
+int T461OnlyConstFree() { const t461cv.OnlyConst x = t461cv.OnlyConst(7); return t461cv.take_only_const(x); }
+int T461OnlyConstMember() { const t461cv.OnlyConst x = t461cv.OnlyConst(7); t461cv.OnlyConstHost h = default; return h.member_take(x); }
+int T461OnlyConstCtor() { const t461cv.OnlyConst x = t461cv.OnlyConst(7); t461cv.OnlyConstSink s = t461cv.OnlyConstSink(x); return s.result; }
+int T461OnlyConstTemplate() { const t461cv.OnlyConst x = t461cv.OnlyConst(7); return t461cv.template_take(x); }
+int T461OnlyConstCopy() { const t461cv.OnlyConst x = t461cv.OnlyConst(7); t461cv.OnlyConst y = x; return y.value; }
+int T461R2TemplateCtor() { const t461r2.TemplateCtor x = t461r2.TemplateCtor(7); return t461r2.take_template(x); }
 int T420Pack(int value, int baseLive)
 {
     return value * 10000000 + cpptw.ctor_count() * 1000000 + cpptw.copy_count() * 100000
@@ -17949,8 +18045,7 @@ int LoweredUserDtorAssignLegs(int argc)
         if (t312Expr.a[0].h[0].w != 7 || t312Expr.a[0].h[1].w != 7) return 12935;
         if (t312Expr.a[1].h[0].w != 0) return 12935;
     }
-    // Known gap vs clang (2/4): element-expression default-then-replace, p3 nested-user-ctor-aggregate-builds-elements-twice.
-    if (t312Ct != 4 || t312Dt != 6) return 12936;
+    if (t312Ct != 2 || t312Dt != 4) return 12936;
     // Guard (passes on master too): field default `E[2] h = { gx, gx }` copy-initializes from gx, no E()
     // runs and each copy is destroyed once, as in clang.
     t312Ct = 0; t312Dt = 0;
@@ -17958,6 +18053,39 @@ int LoweredUserDtorAssignLegs(int argc)
         T312FD t312Fd;
     }
     if (t312Ct != 0 || t312Dt != 2) return 12937;
+    t312Ct = 0; t312Dt = 0;
+    {
+        T312O t468Expr1 = { h = { t312X, t312X } };
+        if (t468Expr1.h[0].w != 7 || t468Expr1.h[1].w != 7
+            || t312Ct != 0 || t312Dt != 0) return 46801;
+    }
+    if (t312Ct != 0 || t312Dt != 2) return 46802;
+    t312Ct = 0; t312Dt = 0;
+    {
+        T312O t468Partial = { h = { t312X } };
+        if (t468Partial.h[0].w != 7 || t468Partial.h[1].w != 0
+            || t312Ct != 1 || t312Dt != 0) return 46803;
+    }
+    if (t312Ct != 1 || t312Dt != 2) return 46804;
+    t312Ct = 0; t312Dt = 0;
+    {
+        T312RootFD t468DefaultOverride = { f = { h = { t312Gx, t312Gx } } };
+        if (t468DefaultOverride.f.h[0].w != 0 || t468DefaultOverride.f.h[1].w != 0
+            || t312Ct != 0 || t312Dt != 0) return 46805;
+    }
+    if (t312Ct != 0 || t312Dt != 2) return 46806;
+    u64 t468HeapBase = HeapAudit.reportLeaks();
+    t468Alloc = 0;
+    {
+        T468U y = default;
+        t468Alloc = 0;
+        {
+            T468UO2 t468UniqueMove = { a = { { h = { move y, {} } } } };
+            if (t468Alloc != 3 || t468Live != 4) return 46807;
+        }
+        if (t468Alloc != 3 || t468Live != 0) return 46808;
+    }
+    if (t468Live != 0 || HeapAudit.reportLeaks() != t468HeapBase) return 46809;
     // T336: a by-value brace argument owns its temporary through the call's full-expression.
     t312Ct = 0; t312Dt = 0;
     int t336SingleValue = t336TakeO({ h = { { w = 11 }, { w = 12 } } });
@@ -18660,6 +18788,13 @@ int LoweredUserDtorAssignLegs(int argc)
         delete pdN;
     }
     if (cppexp.conv_dtor_count() != 1) return 13074;
+    // T463: a parenthesized callee in a class-initializing declaration is the bare call (same counts as pdA).
+    cppexp.conv_reset();
+    {
+        cppexp.ConvCnt pdCallee = (cppexp.conv_mk)(7);
+        if (pdCallee.v != 7 || cppexp.conv_ctor_count() != 1 || cppexp.conv_dtor_count() != 0) return 13075;
+    }
+    if (cppexp.conv_dtor_count() != 1) return 13075;
     // T224: the nested candidate's return moves nothing; the caller's destructor runs once.
     cppunw.reset();
     {
@@ -18995,6 +19130,46 @@ int LoweredUserDtorAssignLegs(int argc)
     if (T418TemplateSingle(true) != 10) return 41815;
     if (T418TemplateCompeting(false) != 82) return 41816;
     if (T418TemplateCompeting(true) != 10) return 41817;
+    // T461: +200 identifies the const copy constructor; +100 identifies the non-const one.
+    if (T461LocalFree() != 207) return 46101;
+    if (T461LocalMember() != 207) return 46102;
+    if (T461LocalCtor() != 207) return 46103;
+    if (T461LocalTemplate() != 207) return 46104;
+    if (T461LocalCopy() != 207) return 46105;
+    if (T461ParamFree(t461cv.CV(7)) != 207) return 46106;
+    if (T461ParamMember(t461cv.CV(7)) != 207) return 46107;
+    if (T461ParamCtor(t461cv.CV(7)) != 207) return 46108;
+    if (T461ParamTemplate(t461cv.CV(7)) != 207) return 46109;
+    if (T461ParamCopy(t461cv.CV(7)) != 207) return 46110;
+    if (T461FieldFree() != 207) return 46111;
+    if (T461FieldMember() != 207) return 46112;
+    if (T461FieldCtor() != 207) return 46113;
+    if (T461FieldTemplate() != 207) return 46114;
+    if (T461FieldCopy() != 207) return 46115;
+    {
+        t461cv.CV refSource = t461cv.CV(7);
+        if (T461RefParamFree(&refSource) != 207) return 46116;
+        if (T461RefParamMember(&refSource) != 207) return 46117;
+        if (T461RefParamCtor(&refSource) != 207) return 46118;
+        if (T461RefParamTemplate(&refSource) != 207) return 46119;
+        if (T461RefParamCopy(&refSource) != 207) return 46120;
+    }
+    if (T461RefReturnFree() != 207) return 46121;
+    if (T461RefReturnMember() != 207) return 46122;
+    if (T461RefReturnCtor() != 207) return 46123;
+    if (T461RefReturnTemplate() != 207) return 46124;
+    if (T461RefReturnCopy() != 207) return 46125;
+    if (T461MutableFree() != 107) return 46126;
+    if (T461MutableMember() != 107) return 46127;
+    if (T461MutableCtor() != 107) return 46128;
+    if (T461MutableTemplate() != 107) return 46129;
+    if (T461MutableCopy() != 107) return 46130;
+    if (T461OnlyConstFree() != 207) return 46131;
+    if (T461OnlyConstMember() != 207) return 46132;
+    if (T461OnlyConstCtor() != 207) return 46133;
+    if (T461OnlyConstTemplate() != 207) return 46134;
+    if (T461OnlyConstCopy() != 207) return 46135;
+    if (T461R2TemplateCtor() != 57) return 46136;
     if (T420Field(false) != 1100020) return 42001;
     if (T420Field(true) != 2000020) return 42002;
     if (T420Move(false) != 1010020 || T420MovedValue != -1) return 42003;

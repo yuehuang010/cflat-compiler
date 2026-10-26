@@ -140,3 +140,30 @@ extern int main()
 {
     return 0;
 }
+
+// T463: a visible variable that is not callable shadows a generic function of the same name, so
+// `(name)(args)` is refused as the unknown type it is, not re-read as a call of the function.
+T shadowFn<T>(T value) { return value; }
+
+expect_error("unknown type 'shadowFn'") {
+    int test_local_shadow()
+    {
+        int shadowFn = 7;
+        return (shadowFn)(3);
+    }
+}
+
+expect_error("unknown type 'shadowFn'") {
+    int test_param_shadow(int shadowFn)
+    {
+        return (shadowFn)(3);
+    }
+}
+
+expect_error("unknown type 'shadowFn'") {
+    struct ShadowField
+    {
+        int shadowFn = 5;
+        int get() { return (shadowFn)(3); }
+    };
+}

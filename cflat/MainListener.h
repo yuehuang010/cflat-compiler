@@ -826,6 +826,20 @@ static int PeelAliasPointerStars(std::string& name)
     return depth;
 }
 
+// Resolve an enum base without its generic-argument pointer/view suffix, then restore that suffix.
+template <class ResolveBase>
+static bool ResolveEnumTypeArgumentBase(std::string& argument, ResolveBase&& resolveBase)
+{
+    const bool isArrayView = argument.ends_with("[]");
+    size_t baseEnd = argument.size() - (isArrayView ? 2 : 0);
+    while (baseEnd > 0 && argument[baseEnd - 1] == '*') --baseEnd;
+    if (baseEnd == 0) return false;
+    std::string resolved = resolveBase(argument.substr(0, baseEnd));
+    if (resolved.empty()) return false;
+    argument = std::move(resolved) + argument.substr(baseEnd);
+    return true;
+}
+
 // Function signatures store pointer shape separately from the base type name.
 static std::string SignatureComponentAliasBase(const LLVMBackend* compiler, std::string name)
 {
@@ -2468,6 +2482,91 @@ struct EnclosingAggregateLookupScope
     antlr4::ParserRuleContext* Definition = nullptr;
 };
 
+static std::string NamespaceNameFromContext(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node)
+{
+    std::vector<CFlatParser::NamespaceDefinitionContext*> namespaces;
+    for (auto* parent = node; parent != nullptr; parent = parent->parent)
+        if (auto* ns = dynamic_cast<CFlatParser::NamespaceDefinitionContext*>(parent))
+            namespaces.push_back(ns);
+    std::string name;
+    for (auto it = namespaces.rbegin(); it != namespaces.rend(); ++it)
+        for (auto* id : (*it)->Identifier())
+            name += (name.empty() ? "" : ".") + id->getText();
+    return name.empty() && compiler != nullptr ? compiler->GetCurrentNamespace() : name;
+}
+
+static bool IsUnparameterizedNamedTypeSpecifier(CFlatParser::TypeSpecifierContext* typeSpec)
+{
+    if (typeSpec == nullptr) return false;
+    if (auto* qualified = typeSpec->qualifiedGenericIdentifier(); qualified != nullptr)
+        return qualified->genericTypeParameters() == nullptr;
+    if (auto* generic = typeSpec->genericIdentifier(); generic != nullptr)
+        return generic->genericTypeParameters() == nullptr;
+    return false;
+}
+
+static std::vector<std::string> NamedTypePathFromContext(CFlatParser::TypeSpecifierContext* typeSpec)
+{
+    std::vector<std::string> path;
+    if (!IsUnparameterizedNamedTypeSpecifier(typeSpec)) return path;
+    if (auto* qualified = typeSpec->qualifiedGenericIdentifier())
+    {
+        path.push_back(qualified->Identifier()->getText());
+        for (auto* member : qualified->memberNameToken()) path.push_back(member->getText());
+    }
+    else if (auto* generic = typeSpec->genericIdentifier())
+        path.push_back(generic->Identifier()->getText());
+    return path;
+}
+
+static bool HasNestedAggregatePathInContext(antlr4::tree::ParseTree* useSite,
+    size_t aggregateIndex, const std::vector<std::string>& path)
+{
+    if (path.empty()) return false;
+    antlr4::tree::ParseTree* owner = nullptr;
+    for (auto* parent = useSite != nullptr ? useSite->parent : nullptr;
+         parent != nullptr; parent = parent->parent)
+    {
+        if (dynamic_cast<CFlatParser::StructDefinitionContext*>(parent) == nullptr
+            && dynamic_cast<CFlatParser::ClassDefinitionContext*>(parent) == nullptr)
+            continue;
+        if (aggregateIndex-- == 0)
+        {
+            owner = parent;
+            break;
+        }
+    }
+    if (owner == nullptr) return false;
+    auto hasPath = [&](auto&& self, antlr4::tree::ParseTree* aggregate, size_t part) -> bool
+    {
+        std::vector<CFlatParser::AggregateMemberContext*> members;
+        if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(aggregate))
+            members = structure->aggregateMember();
+        else if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(aggregate))
+            members = classDefinition->aggregateMember();
+        for (auto* member : members)
+        {
+            if (part + 1 == path.size())
+                if (auto* alias = member->usingDeclaration(); alias != nullptr
+                    && alias->Identifier() != nullptr
+                    && alias->Identifier()->getText() == path[part])
+                    return true;
+            antlr4::tree::ParseTree* nested = member->structDefinition();
+            if (nested == nullptr) nested = member->classDefinition();
+            if (nested == nullptr) continue;
+            auto* direct = dynamic_cast<CFlatParser::StructDefinitionContext*>(nested);
+            auto* classDirect = dynamic_cast<CFlatParser::ClassDefinitionContext*>(nested);
+            const std::string nestedName = direct != nullptr
+                ? direct->directDeclarator()->getText() : classDirect->directDeclarator()->getText();
+            if (nestedName != path[part]) continue;
+            if (part + 1 == path.size() || self(self, nested, part + 1)) return true;
+        }
+        return false;
+    };
+    return hasPath(hasPath, owner, 0);
+}
+
 static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesFromContext(
     LLVMBackend* compiler, antlr4::tree::ParseTree* node)
 {
@@ -2492,6 +2591,76 @@ static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesFromCo
     if (!compiler->GetCurrentNamespace().empty())
         scopes.push_back({ compiler->GetCurrentNamespace(), nullptr });
     return scopes;
+}
+
+static std::vector<std::string> EnclosingAggregateNamesFromContext(
+    LLVMBackend* compiler, antlr4::tree::ParseTree* node)
+{
+    if (compiler == nullptr) return {};
+    std::vector<std::string> aggregateNames;
+    std::string scope = NamespaceNameFromContext(compiler, node);
+    for (auto* parent = node != nullptr ? node->parent : nullptr;
+         parent != nullptr; parent = parent->parent)
+    {
+        std::string name;
+        if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(parent))
+            name = structure->directDeclarator()->getText();
+        else if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(parent))
+            name = classDefinition->directDeclarator()->getText();
+        if (!name.empty()) aggregateNames.push_back(std::move(name));
+    }
+    std::reverse(aggregateNames.begin(), aggregateNames.end());
+    for (auto& name : aggregateNames)
+    {
+        scope += (scope.empty() ? "" : ".") + name;
+        name = scope;
+    }
+    std::reverse(aggregateNames.begin(), aggregateNames.end());
+    return aggregateNames;
+}
+
+static std::string ResolveContextualTypeName(LLVMBackend* compiler,
+    const std::string& spelled, const std::string& resolvedName,
+    CFlatParser::TypeSpecifierContext* typeSpec,
+    const std::vector<std::string>& aggregateScopes, const std::string& namespaceName)
+{
+    if (compiler == nullptr || spelled.empty()) return {};
+    auto isKnownType = [compiler](const std::string& candidate)
+    {
+        return compiler->IsKnownTypeName(candidate) || compiler->IsTypeArgTypeKey(candidate);
+    };
+    const auto typePath = NamedTypePathFromContext(typeSpec);
+    for (size_t i = 0; i < aggregateScopes.size(); i++)
+    {
+        const auto& scope = aggregateScopes[i];
+        if (!scope.empty())
+        {
+            const std::string candidate = scope + "." + spelled;
+            const bool ambiguousScope = compiler->IsNamespace(scope);
+            if ((!ambiguousScope || HasNestedAggregatePathInContext(typeSpec, i, typePath))
+                && isKnownType(candidate))
+                return candidate;
+        }
+    }
+    const size_t memberDot = spelled.find('.');
+    if (memberDot != std::string::npos)
+    {
+        const std::string owner = spelled.substr(0, memberDot);
+        for (std::string scope = namespaceName; !scope.empty(); )
+        {
+            const std::string ownerCandidate = scope + "." + owner;
+            if (isKnownType(ownerCandidate))
+            {
+                const std::string candidate = scope + "." + spelled;
+                if (isKnownType(candidate)) return candidate;
+            }
+            const size_t dot = scope.rfind('.');
+            if (dot == std::string::npos) break;
+            scope.resize(dot);
+        }
+    }
+    if (isKnownType(resolvedName)) return {};
+    return {};
 }
 
 static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesFromName(
@@ -2808,8 +2977,9 @@ static bool ResolveCanonicalTypeSpecifier(
                 out.GenericArgs.push_back(resolveTypeArg
                     ? resolveTypeArg(entry) : entry->getText());
             for (auto& arg : out.GenericArgs)
-                if (std::string enumKey = compiler->ResolveEnumTypeName(arg); !enumKey.empty())
-                    arg = std::move(enumKey);
+                ResolveEnumTypeArgumentBase(arg, [compiler](const std::string& base) {
+                    return compiler->ResolveEnumTypeName(base);
+                });
             const std::string spelledBase = out.GenericBase;
             out.GenericBase = ResolveGenericTemplateSpellingAtScope(
                 compiler, spelledBase, out.GenericArgs,
@@ -7181,6 +7351,41 @@ private:
         CxxCallArgumentScope(bool& s, bool active) : slot(s), saved(s) { slot = active; }
         ~CxxCallArgumentScope() { slot = saved; }
     };
+    struct CxxCallArgumentExpectedTypeScope {
+        LLVMBackend::TypeAndValue& slot;
+        LLVMBackend::TypeAndValue saved;
+        CxxCallArgumentExpectedTypeScope(LLVMBackend::TypeAndValue& s,
+                                         LLVMBackend::TypeAndValue active)
+            : slot(s), saved(s) { slot = std::move(active); }
+        ~CxxCallArgumentExpectedTypeScope() { slot = std::move(saved); }
+    };
+    struct CxxCallArgumentParseStateScope {
+        LLVMBackend* backend;
+        llvm::Value* savedRetTemp;
+        llvm::Value* savedRetValue;
+        llvm::Value* savedSretDest;
+        std::string savedSretType;
+        bool savedSretForFixedArray;
+        explicit CxxCallArgumentParseStateScope(LLVMBackend* b)
+            : backend(b), savedRetTemp(b->lastCxxRetTemp_), savedRetValue(b->lastCxxRetValue_),
+              savedSretDest(b->pendingCxxSretDest_), savedSretType(b->pendingCxxSretTypeName_),
+              savedSretForFixedArray(b->pendingCxxSretForFixedArray_)
+        {
+            backend->lastCxxRetTemp_ = nullptr;
+            backend->lastCxxRetValue_ = nullptr;
+            backend->pendingCxxSretDest_ = nullptr;
+            backend->pendingCxxSretTypeName_.clear();
+            backend->pendingCxxSretForFixedArray_ = false;
+        }
+        ~CxxCallArgumentParseStateScope()
+        {
+            backend->lastCxxRetTemp_ = savedRetTemp;
+            backend->lastCxxRetValue_ = savedRetValue;
+            backend->pendingCxxSretDest_ = savedSretDest;
+            backend->pendingCxxSretTypeName_ = std::move(savedSretType);
+            backend->pendingCxxSretForFixedArray_ = savedSretForFixedArray;
+        }
+    };
 
     // A destination type describes the WHOLE expression, never one operand of it: `string s =
     // "n=" + (() => 2)()` must not type the literal 'string' (measured: module verification
@@ -7539,7 +7744,8 @@ public:
     // Infer type arguments for a generic function from call argument types and instantiate it.
     // Handles simple positional matching: where parameter type == type param name, bind to arg TypeName.
     std::string TryInferAndInstantiateFromArgs(const std::string& funcName,
-                                               const std::vector<LLVMBackend::NamedVariable>& args);
+                                               const std::vector<LLVMBackend::NamedVariable>& args,
+                                               CFlatParser::ArgumentExpressionListContext* argList = nullptr);
 
     // Infer a bare function template's arguments from a function-pointer destination.
     std::string TryInferAndInstantiateFromFuncPtr(const std::string& funcName,
@@ -7642,6 +7848,13 @@ public:
     void CollectAggregateAliases(TCtx* ctx, const std::string& aggregateName)
     {
         auto* compiler = Compiler(ctx);
+        struct AggregateNameScope
+        {
+            std::vector<std::string>& scopes;
+            AggregateNameScope(std::vector<std::string>& target, const std::string& name)
+                : scopes(target) { scopes.push_back(name); }
+            ~AggregateNameScope() { scopes.pop_back(); }
+        } aggregateNameScope(structScopeStack, aggregateName);
         const auto& members = ResolveAggregateMembers(ctx);
         std::unordered_set<std::string> typeParams;
         if (auto* generic = ctx->genericTypeParameters())
@@ -8512,7 +8725,7 @@ public:
      * owner's address, so a store through it correctly drops the outer's old value.
      */
     static bool IsAliasBorrowLocalBinding(const LLVMBackend::NamedVariable& nv);
-    static bool DestinationIsAliasBorrowLocal(LLVMBackend* compiler, llvm::Value* destination);
+    static bool DestinationIsAliasBorrowLocal(const LLVMBackend::NamedVariable& destination);
 
     // Records where a borrow binding was created, so a rebind can prove it runs on every path.
     static void RecordAliasBorrowDeclBlock(LLVMBackend* compiler, LLVMBackend::NamedVariable& nv);
@@ -8525,8 +8738,8 @@ public:
      * stands and the new value LEAKS, which is the safe direction - the alternative destroys a
      * value the real owner still frees on the path that did not rebind.
      */
-    static void RetireAliasBorrowOnRebind(LLVMBackend* compiler, llvm::Value* destination,
-                                         llvm::BasicBlock* assignmentBlock);
+    static void RetireAliasBorrowOnRebind(LLVMBackend* compiler,
+        const LLVMBackend::NamedVariable& destination, llvm::BasicBlock* assignmentBlock);
 
     /*
      * Same hazard as RejectAliasStoreIntoField with an owning LOCAL/GLOBAL destination (`other = k`)
@@ -9708,6 +9921,29 @@ public:
 
     LLVMBackend::NamedVariable ParseCastExpression(CFlatParser::CastExpressionContext* ctx, bool lvalue = false,
                                                    ResultUse use = ResultUse::Value);
+    // Parser over re-parsed call text. Owned by the listener so the tree outlives the call that made it.
+    struct CallFragmentParse
+    {
+        antlr4::ANTLRInputStream input;
+        CFlatLexer lexer;
+        antlr4::CommonTokenStream tokens;
+        CFlatParser parser;
+        explicit CallFragmentParse(const std::string& text)
+            : input(text), lexer(&input), tokens(&lexer), parser(&tokens) {}
+    };
+    std::deque<std::unique_ptr<CallFragmentParse>> callFragmentParses_;
+    // `(name)(args)` is a call, not a conversion to type `name`. Decided from the current scope; every
+    // caller that would read the cast name as a type asks this first.
+    bool CastIsCallSpelling(CFlatParser::CastExpressionContext* ctx);
+    std::string CastCallFragment(CFlatParser::CastExpressionContext* ctx);
+    CFlatParser::AssignmentExpressionContext* CastCallInitializer(CFlatParser::AssignmentExpressionContext* assign);
+    CallFragmentParse* NewCallFragment(LLVMBackend* compiler, const std::string& text);
+    bool TryReparseCastAsCall(CFlatParser::CastExpressionContext* ctx, bool lvalue, ResultUse use,
+                              LLVMBackend::NamedVariable& out);
+    bool TryReparseParenthesizedGenericCallee(CFlatParser::PostfixExpressionContext* ctx, bool lValue,
+                                              ResultUse use, LLVMBackend::NamedVariable& out);
+    bool ReparseFragmentAsCast(LLVMBackend* compiler, const std::string& fragment, bool lvalue,
+                               ResultUse use, LLVMBackend::NamedVariable& out);
     LLVMBackend::NamedVariable ParseCastExpressionImpl(CFlatParser::CastExpressionContext* ctx, bool lvalue,
                                                        ResultUse use);
 
@@ -10664,6 +10900,9 @@ public:
     bool IsCxxDeferrableDefaultTernary(antlr4::ParserRuleContext* ctx, std::string& placeType);
     bool IsCxxInertCallArgument(antlr4::ParserRuleContext* ctx, bool condition = false);
     bool IsCxxTernaryArgument(antlr4::ParserRuleContext* ctx);
+    // T459: `c ? default : place` into a `const T&` class parameter joins a temporary of that class.
+    LLVMBackend::NamedVariable ParseCxxConstRefTernaryTemp(CFlatParser::AssignmentExpressionContext* ctx,
+        const LLVMBackend::TypeAndValue& dest);
     // T418: builds the deferred argument (selector + place leaves) for the C++ wrapper to evaluate.
     bool BuildCxxDeferredDefaultTernary(antlr4::ParserRuleContext* ctx, const std::string& defaultType,
         LLVMBackend::NamedVariable& out);

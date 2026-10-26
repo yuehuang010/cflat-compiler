@@ -2,6 +2,25 @@
 // cannot call it through the name, as clang reports ('get' is a private member).
 import cpp "cpp_interop_strop.h";
 
+expect_error("member 'operator-' of C++ class 'cppsopd.T456ProtectedDerived' is protected") {
+    [cpp] struct T456FieldThisMinus : cppsopd.T456ProtectedDerived {
+        cppsopd.T456ProtectedDerived other;
+        int m() { return this.other - 2; }
+    };
+}
+expect_error("member 'operator[]' of C++ class 'cppsopd.T456ProtectedDerived' is protected") {
+    [cpp] struct T456FieldThisSubscript : cppsopd.T456ProtectedDerived {
+        cppsopd.T456ProtectedDerived other;
+        int m() { return this.other[1]; }
+    };
+}
+expect_error("member 'operator()' of C++ class 'cppsopd.T456ProtectedDerived' is protected") {
+    [cpp] struct T456FieldThisCall : cppsopd.T456ProtectedDerived {
+        cppsopd.T456ProtectedDerived other;
+        int m() { return this.other(2); }
+    };
+}
+
 extern int main()
 {
     expect_error("member 'get' of C++ class 'cppsopd.T221PrivateNamedUsing' is private") {
@@ -10,6 +29,54 @@ extern int main()
     }
     expect_error("member 's' of C++ class 'cppsopd.T221StaticPrivate' is private") {
         long sp = cppsopd.T221StaticPrivate.s(1);
+    }
+    expect_error("ambiguous base") {
+        cppsopd.T456Diamond d = default;
+        int value = d.f(2);
+    }
+    expect_error("ambiguous base") {
+        cppsopd.T456Diamond d = default;
+        int value = d - 2;
+    }
+    expect_error("member 'operator-' of C++ class 'cppsopd.T456ProtectedDerived' is protected") {
+        cppsopd.T456ProtectedDerived d = default;
+        int value = d - 2;
+    }
+    expect_error("member 'operator~' of C++ class 'cppsopd.T456ProtectedDerived' is protected") {
+        cppsopd.T456ProtectedDerived d = default;
+        int value = ~d;
+    }
+    expect_error("member 'operator[]' of C++ class 'cppsopd.T456ProtectedDerived' is protected") {
+        cppsopd.T456ProtectedDerived d = default;
+        int value = d[1];
+    }
+    expect_error("member 'operator()' of C++ class 'cppsopd.T456ProtectedDerived' is protected") {
+        cppsopd.T456ProtectedDerived d = default;
+        int value = d(2);
+    }
+    expect_error("member 'operator==' of C++ class 'cppsopd.T456ProtectedDerived' is protected") {
+        cppsopd.T456ProtectedDerived d = default;
+        bool value = d == 3;
+    }
+    expect_error("member 'operator==' of C++ class 'cppsopd.T456ProtectedDerived' is protected") {
+        cppsopd.T456ProtectedDerived d = default;
+        bool value = d != 3;
+    }
+    expect_error("member 'operator==' of C++ class 'cppsopd.T456ProtectedDerived' is protected") {
+        cppsopd.T456ProtectedDerived d = default;
+        bool value = 3 == d;
+    }
+    expect_error("member 'operator<=>' of C++ class 'cppsopd.T456ProtectedDerived' is protected") {
+        cppsopd.T456ProtectedDerived d = default;
+        bool value = d < 3;
+    }
+    expect_error("member 'operator+=' of C++ class 'cppsopd.T456ProtectedDerived' is protected") {
+        cppsopd.T456ProtectedDerived d = default;
+        d += 3;
+    }
+    expect_error("member 'operator+' of C++ class 'cppsopd.T456ProtectedFreeBinary' is protected") {
+        cppsopd.T456ProtectedFreeBinary p = default;
+        int value = p + 2;
     }
     return 0;
 }

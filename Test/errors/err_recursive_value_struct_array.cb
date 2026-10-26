@@ -29,6 +29,17 @@ expect_error("'Inner' names a non-generic type in the enclosing aggregate; templ
     };
 }
 
+int T465TakeInt(int value) { return value; }
+struct T465DiagOuter<T>
+{
+    struct In { T value = default; };
+    int Run() { In value = default; return T465TakeInt(value); }
+};
+expect_error("arg=T465DiagOuter<int>.In") {
+    T465DiagOuter<int> value = default;
+    int unused = value.Run();
+}
+
 // A fixed array of the containing type is still by-value recursive storage.
 expect_error("field 'RecursiveArray.arr'");
 struct RecursiveArray { RecursiveArray[4] arr; };

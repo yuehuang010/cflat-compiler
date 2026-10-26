@@ -18,5 +18,12 @@ extern int main()
     expect_error("takes 1 template argument(s), but 2 were given") {
         alna.OneParam<int,9> extra = default;
     }
+    // Clang requires alias-template arguments even when the pattern never uses the parameter.
+    expect_error("requires at least 1 template argument(s)") {
+        req.Required<> missing = default;
+    }
+    expect_error("requires at least 1 template argument(s)") {
+        req.FixedRequired<> unused = default;
+    }
     return 0;
 }

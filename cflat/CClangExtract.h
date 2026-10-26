@@ -550,6 +550,7 @@ namespace cflat_cinterop
         bool isCxxAliasTemplate = false;
         std::string cxxAliasPattern;
         std::vector<std::string> cxxAliasParams;
+        std::vector<uint64_t> cxxAliasParamPackFlags;
         // The alias template's target as a STRUCTURED pattern: a dotted target base plus its
         // argument list as written, so a fixed/reordered/partial argument survives the hop.
         std::string cxxAliasTargetBase;

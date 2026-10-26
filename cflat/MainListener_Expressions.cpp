@@ -376,6 +376,16 @@ static bool ParseTreeContainsTernary(antlr4::tree::ParseTree* node)
     return false;
 }
 
+static bool ParseTreeContainsDefault(antlr4::tree::ParseTree* node)
+{
+    if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(node))
+        return terminal->getSymbol()->getType() == CFlatParser::Default;
+    if (node == nullptr) return false;
+    for (auto* child : node->children)
+        if (ParseTreeContainsDefault(child)) return true;
+    return false;
+}
+
 bool MainListener::AllowBondedClosureFieldStore(
         LLVMBackend* compiler,
         LLVMBackend::NamedVariable& destination,
@@ -6845,6 +6855,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     int rhsDepth = 0;
                     bool rhsElemPointer = false;
                     OperandPointerDepth(rightNV, right, rhsDepth, rhsElemPointer);
+                    // `*this op= x` in a derived [cpp] struct: the protected member check sees the
+                    // current object, as the binary operand path reports it.
+                    const std::string& lhsSource = namedVar.CallerName.empty()
+                        ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
+                    const std::string lhsThisCaller = lhsSource == "this" ? lhsSource : std::string();
+                    const std::string lhsThisField = lhsSource == "this" ? namedVar.FieldName : std::string();
                     auto emitCompound = [&]() {
                         return TryBinaryOperatorOverload(
                             left, operatorText, right, ctx, namedVar.BaseType,
@@ -6852,7 +6868,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                             rightNV.Storage, false, true, false, rhsIsRvalue,
                             namedVar.TypeAndValue.TypeName,
                             rightNV.TypeAndValue.TypeName,
-                            0, false, {}, {}, false, {}, {}, false, {}, {},
+                            0, false, lhsThisCaller, lhsThisField, false, {}, {}, false, {}, {},
                             rightNV.TypeAndValue.PointeeConstBit()
                                 && rightNV.TypeAndValue.Pointer, {}, rightNV.CxxArithIdentity,
                                 rightNV.IsExplicitMove, false,
@@ -6944,7 +6960,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                             rightNV.Storage, false, true, false, rhsIsRvalue,
                             namedVar.TypeAndValue.TypeName,
                             rightNV.TypeAndValue.TypeName,
-                            0, false, {}, {}, false, {}, {}, false, {}, {},
+                            0, false, lhsThisCaller, lhsThisField, false, {}, {}, false, {}, {},
                             rightNV.TypeAndValue.PointeeConstBit()
                                 && rightNV.TypeAndValue.Pointer, {}, rightNV.CxxArithIdentity,
                                 rightNV.IsExplicitMove, false,
@@ -7343,7 +7359,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
             // borrow retires afterwards where that is provable (see RetireAliasBorrowOnRebind).
             const bool destIsAliasBorrowLocal = operatorText == "="
                 && !destIsStructField && namedVar.FieldName.empty()
-                && DestinationIsAliasBorrowLocal(compiler, destination);
+                && DestinationIsAliasBorrowLocal(namedVar);
 
             auto* uniqueArrayElementGep = rightNV.IsElementAccess
                 ? llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(rightNV.Storage) : nullptr;
@@ -7764,7 +7780,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                     if (compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName) != nullptr)
                         compiler->DropValue(namedVar);
                 compiler->builder->CreateStore(right, destination);
-                RetireAliasBorrowOnRebind(compiler, destination, assignmentBlock);
+                RetireAliasBorrowOnRebind(compiler, namedVar, assignmentBlock);
                 auto* srcGep = compiler->builder->CreateStructGEP(
                     rightNV.MoveTempStructType, rightNV.MoveTempStructAlloca, rightNV.MoveTempFieldIndex, "movedfld");
                 compiler->builder->CreateStore(
@@ -8008,7 +8024,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 if (!destIsAliasBorrowLocal)
                     emitOwningDestinationDrop();
                 compiler->builder->CreateStore(toStore, destination);
-                RetireAliasBorrowOnRebind(compiler, destination, assignmentBlock);
+                RetireAliasBorrowOnRebind(compiler, namedVar, assignmentBlock);
                 if (kind == AssignSourceKind::Move)
                 {
                     compiler->builder->CreateStore(
@@ -8312,7 +8328,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(
                 // ownership is a runtime property (_len owned bit), so auto copy/move is unsafe for string.
                 if (!destIsAliasBorrowLocal && !coreUniqueInterfaceResetValue)
                     emitOwningDestinationDrop();
-                RetireAliasBorrowOnRebind(compiler, destination, assignmentBlock);
+                RetireAliasBorrowOnRebind(compiler, namedVar, assignmentBlock);
             }
 
             // `unique T* field` reassignment: free the old pointee before overwriting it, or it
@@ -9174,7 +9190,7 @@ bool MainListener::IsSameTypeCastOfDefault(antlr4::ParserRuleContext* ctx,
         {
             if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
                 cast != nullptr && cast->castTypeName() != nullptr
-                    && cast->castExpression() != nullptr)
+                    && cast->castExpression() != nullptr && !CastIsCallSpelling(cast))
             {
                 const auto castType = ParseCastTypeName(cast->castTypeName(), false, cast);
                 return !castType.Pointer && !castType.ElemPointer && !castType.IsArrayView
@@ -9243,53 +9259,29 @@ bool MainListener::IsTernaryArmOfCallArgument(antlr4::ParserRuleContext* ctx)
 
 bool MainListener::HasDefaultOnlyTernaryArm(antlr4::ParserRuleContext* ctx) const
 {
-        auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(ctx);
-        auto* conditional = assignment != nullptr && assignment->assignmentOperator() == nullptr
-            ? assignment->conditionalExpression() : nullptr;
-        if (conditional != nullptr && conditional->Question() != nullptr)
-            return IsDefaultOnlyExpression(conditional->expression())
-                || IsDefaultOnlyExpression(conditional->conditionalExpression());
-        if (ctx == nullptr || ctx->getStart() == nullptr || ctx->getStop() == nullptr
-            || ctx->getStart()->getType() != CFlatParser::LeftParen
-            || ctx->getStop()->getType() != CFlatParser::RightParen)
-            return false;
-
-        for (auto* node = dynamic_cast<antlr4::tree::ParseTree*>(ctx); node != nullptr; )
-        {
-            if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node);
-                conditional != nullptr && conditional->Question() != nullptr)
-                return IsDefaultOnlyExpression(conditional->expression())
-                    || IsDefaultOnlyExpression(conditional->conditionalExpression());
+        auto containsDefaultTernary = [&](auto&& self, antlr4::tree::ParseTree* node) -> bool {
+            if (node == nullptr) return false;
+            if (auto* ternary = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node);
+                ternary != nullptr && ternary->Question() != nullptr)
+                return IsDefaultOnlyExpression(ternary->expression())
+                    || IsDefaultOnlyExpression(ternary->conditionalExpression())
+                    || self(self, ternary->expression())
+                    || self(self, ternary->conditionalExpression());
 
             auto* rule = dynamic_cast<antlr4::ParserRuleContext*>(node);
             if (rule == nullptr) return false;
-            // A typeName cast around the ternary: `(T)(c ? default : x)`. The join checks the arm type.
-            if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
+            if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(rule);
                 cast != nullptr && cast->castTypeName() != nullptr && cast->castExpression() != nullptr)
-            {
-                node = cast->castExpression();
-                continue;
-            }
+                return self(self, cast->castExpression());
             if (rule->children.size() == 1)
-            {
-                node = rule->children.front();
-                continue;
-            }
-            if (rule->children.size() == 3)
-            {
-                auto* left = dynamic_cast<antlr4::tree::TerminalNode*>(rule->children[0]);
-                auto* right = dynamic_cast<antlr4::tree::TerminalNode*>(rule->children[2]);
-                if (left != nullptr && right != nullptr
-                    && left->getSymbol()->getType() == CFlatParser::LeftParen
-                    && right->getSymbol()->getType() == CFlatParser::RightParen)
-                {
-                    node = rule->children[1];
-                    continue;
-                }
-            }
+                return self(self, rule->children.front());
+            if (rule->children.size() == 3
+                && IsParenTerminal(rule->children[0], CFlatParser::LeftParen)
+                && IsParenTerminal(rule->children[2], CFlatParser::RightParen))
+                return self(self, rule->children[1]);
             return false;
-        }
-        return false;
+        };
+        return containsDefaultTernary(containsDefaultTernary, ctx);
 }
 
 /*
@@ -9436,6 +9428,42 @@ bool MainListener::IsCxxDeferrableDefaultTernary(antlr4::ParserRuleContext* ctx,
             return false;
         }
         return true;
+}
+
+/*
+ * T459: the arms build the temporary in place when the join consumes it. An unconsumed join keeps
+ * the ordinary parse, which is what every other `?:` argument gets.
+ */
+LLVMBackend::NamedVariable MainListener::ParseCxxConstRefTernaryTemp(
+        CFlatParser::AssignmentExpressionContext* ctx, const LLVMBackend::TypeAndValue& dest)
+{
+        auto* backend = Compiler();
+        auto* objectType = backend->GetType(LLVMBackend::TypeAndValue{ .TypeName = dest.TypeName });
+        auto* slot = backend->AllocaAtEntry(objectType, nullptr, "cxx.ctor.arg.default");
+        llvm::SaveAndRestore<llvm::Value*> destScope(backend->pendingCxxTernaryDeclDest_, slot);
+        llvm::SaveAndRestore<std::string> typeScope(backend->pendingCxxTernaryDeclTypeName_, dest.TypeName);
+        backend->pendingCxxTernaryDeclConsumed_ = false;
+        backend->pendingCxxTernaryDeclFailed_ = false;
+        auto parsed = ParseAssignmentExpressionNamed(ctx);
+        const bool consumed = backend->pendingCxxTernaryDeclConsumed_ && !backend->pendingCxxTernaryDeclFailed_;
+        backend->pendingCxxTernaryDeclConsumed_ = false;
+        backend->pendingCxxTernaryDeclFailed_ = false;
+        if (!consumed) return parsed;
+        parsed = {};
+        parsed.TypeAndValue = LLVMBackend::TypeAndValue{ .TypeName = dest.TypeName };
+        parsed.BaseType = objectType;
+        parsed.Primary = backend->CreateLoad(objectType, slot);
+        parsed.Primary->setName("cxx.ctor.arg.value");
+        parsed.Storage = slot;
+        parsed.IsRvalue = true;
+        parsed.IsCxxPrvalueTemp = true;
+        // A call-argument join already owns the slot; a second entry would destroy it twice.
+        const bool owned = std::any_of(backend->pendingOwnedStructTemps.begin(),
+            backend->pendingOwnedStructTemps.end(), [&](const auto& t) { return t.Alloca == slot; });
+        if (!owned) backend->RegisterOwnedStructTemp(slot, dest.TypeName);
+        backend->lastCxxRetTemp_ = slot;
+        backend->lastCxxRetValue_ = parsed.Primary;
+        return parsed;
 }
 
 bool MainListener::IsCxxTernaryArgument(antlr4::ParserRuleContext* ctx)
@@ -11198,12 +11226,16 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         const bool cxxByValueCallArgumentJoin = cxxTernaryDecl && inCallArgument_
             && ternaryDepth.IsOutermost()
             && (IsDefaultOnlyExpression(expressionTrueCtx)
-                || IsDefaultOnlyExpression(expressionFalseCtx))
+                || IsDefaultOnlyExpression(expressionFalseCtx)
+                || HasDefaultOnlyTernaryArm(expressionTrueCtx)
+                || HasDefaultOnlyTernaryArm(expressionFalseCtx))
             && IsWholeCxxCallArgumentShape(ctx, outerExpected);
         const bool cxxCallArgumentJoin = cxxTernaryDecl && inCallArgument_
             && inCxxCallArgument_ && ternaryDepth.IsOutermost()
             && (IsDefaultOnlyExpression(expressionTrueCtx)
-                || IsDefaultOnlyExpression(expressionFalseCtx))
+                || IsDefaultOnlyExpression(expressionFalseCtx)
+                || HasDefaultOnlyTernaryArm(expressionTrueCtx)
+                || HasDefaultOnlyTernaryArm(expressionFalseCtx))
             && IsWholeCxxCallArgumentShape(ctx, outerExpected);
 
         auto parseTernaryDefaultArm = [&](antlr4::ParserRuleContext* arm, auto&& parse) {
@@ -12595,6 +12627,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             cxxStoragePhi->addIncoming(falseStorage, falseEnd);
             cxxLvalueStorageJoin = cxxStoragePhi;
         }
+        if (cxxRecordJoin && HasDefaultOnlyTernaryArm(ctx)
+            && llvm::isa_and_nonnull<llvm::PHINode>(cxxLvalueStorageJoin))
+            compiler->RegisterCxxDefaultTernaryStorageJoin(cxxLvalueStorageJoin);
         const bool collapsedLvalueJoin = collapseStorageJoin && cxxLvalueStorageJoin != nullptr;
         // The shared temporary holds the selected arm: the join is its loaded value. Like a lowered
         // call result it is a produced value the consumer owns, not a registered temporary.
@@ -13679,7 +13714,13 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             // Both arms named one raw pointer shape: the '??' join carries it like a '?:' join.
             JoinTernaryPointerShape(result, lhsTv, rhsShape);
             JoinTernaryClassPointee(result, lhsTv, rhsShape);
-            if (inCallArgument_ && joined != nullptr && joined->getType()->isPointerTy()
+            bool joinedIsCoreUniqueStruct = false;
+            if (joined != nullptr)
+                if (auto* st = llvm::dyn_cast<llvm::StructType>(joined->getType());
+                    st != nullptr && st->hasName())
+                    joinedIsCoreUniqueStruct = compiler->IsCoreUniqueType(st->getName().str());
+            if (inCallArgument_ && joined != nullptr
+                && (joined->getType()->isPointerTy() || joinedIsCoreUniqueStruct)
                 && lhsBr != nullptr && rhsBr != nullptr)
             {
                 auto collectMoveSinkArm = [&](const LLVMBackend::TypedValue& shape,
@@ -13728,6 +13769,34 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 };
                 collectMoveSinkArm(lhsTv, lhs, lhsStorage, lhsBr->getParent());
                 collectMoveSinkArm(rhsShape, rhs, rhsStorage, rhsBr->getParent());
+                // The `??` join ledger retains local field arms whose raw-pointer source shape
+                // was lost while lowering the coalesce value.
+                if (const auto* fieldJoin = compiler->FindUniqueFieldReadJoin(joined))
+                    for (const auto& source : fieldJoin->Sources)
+                    {
+                        // Pointer / `this` roots carry no NullKey: still clear the arm at run time.
+                        if (source.Storage == nullptr || source.Block == nullptr) continue;
+                        auto existing = std::find_if(result.conditionalMoveSources.begin(),
+                            result.conditionalMoveSources.end(), [&](const auto& moveSource) {
+                                return moveSource.Storage == source.Storage;
+                            });
+                        if (existing != result.conditionalMoveSources.end())
+                        {
+                            if (!existing->BorrowedPointer)
+                            {
+                                existing->MoveParamSinkArgument = true;
+                                existing->NullKey = source.NullKey;
+                            }
+                            continue;
+                        }
+                        result.conditionalMoveSources.push_back({});
+                        auto& moveSource = result.conditionalMoveSources.back();
+                        moveSource.Storage = source.Storage;
+                        moveSource.ValueType = joined->getType();
+                        moveSource.ArmBlock = source.Block;
+                        moveSource.MoveParamSinkArgument = true;
+                        moveSource.NullKey = source.NullKey;
+                    }
             }
             result.isAlias = lhsAlias || rhsAlias;
             return result;
@@ -13743,7 +13812,9 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             && !outerExpected.IsRvalueRef
             && compiler->IsForeignNontrivialCxxClass(outerExpected.TypeName)
             && (IsDefaultOnlyExpression(ctx->expression())
-                || IsDefaultOnlyExpression(ctx->conditionalExpression()))
+                || IsDefaultOnlyExpression(ctx->conditionalExpression())
+                || HasDefaultOnlyTernaryArm(ctx->expression())
+                || HasDefaultOnlyTernaryArm(ctx->conditionalExpression()))
             && IsWholeCxxCallArgumentShape(ctx, outerExpected);
         auto* cxxCallTernaryType = cxxCallDefaultTernary
             ? compiler->GetType(outerExpected) : nullptr;
@@ -16573,9 +16644,42 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
             for (size_t i = 1; i < nextCtxs.size(); i++)
             {
                 Compiler(ctx)->lastCallReturnsOwned = false;
-                auto rv = ParseCxxFoldOperand(Compiler(ctx), [&] {
-                    return ParseMultiplicativeExpression(nextCtxs[i], ResultUse::Value);
-                });
+                auto parseRightOperand = [&] {
+                    return ParseCxxFoldOperand(Compiler(ctx), [&] {
+                        return ParseMultiplicativeExpression(nextCtxs[i], ResultUse::Value);
+                    });
+                };
+                auto rv = [&] {
+                    LLVMBackend::TypedValue parsed;
+                    if (ParseTreeContainsDefault(nextCtxs[i]))
+                    {
+                        CxxCallArgumentParseStateScope argumentState(Compiler(ctx));
+                        parsed = parseRightOperand();
+                        auto* temp = llvm::dyn_cast_or_null<llvm::AllocaInst>(
+                            Compiler(ctx)->lastCxxRetTemp_);
+                        auto* resultType = llvm::dyn_cast_or_null<llvm::StructType>(
+                            parsed.value != nullptr ? parsed.value->getType() : nullptr);
+                        if (temp != nullptr && parsed.value == Compiler(ctx)->lastCxxRetValue_
+                            && resultType != nullptr && resultType->hasName()
+                            && Compiler(ctx)->IsForeignNontrivialCxxClass(resultType->getName().str())
+                            && temp->getAllocatedType() == resultType)
+                        {
+                            parsed.receiverStorage = temp;
+                            parsed.isRvalue = true;
+                            LLVMBackend::NamedVariable tempProbe;
+                            tempProbe.Primary = parsed.value;
+                            tempProbe.Storage = temp;
+                            tempProbe.BaseType = resultType;
+                            tempProbe.TypeAndValue.TypeName = resultType->getName().str();
+                            if (!Compiler(ctx)->IsOwnedTempValue(tempProbe))
+                                Compiler(ctx)->RegisterOwnedStructTemp(temp,
+                                    resultType->getName().str());
+                        }
+                    }
+                    else
+                        parsed = parseRightOperand();
+                    return parsed;
+                }();
                 NormalizeCxxReferenceOperand(ctx, rv);
                 llvm::Value* rvalue = rv.value;
                 bool ru = rv.isUnsigned;
@@ -17495,6 +17599,11 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
             thisNV.TypeAndValue.IsCxxPointeeVolatile = volatileOperand;
             thisNV.IsCxxUnaryOperatorReceiver = true;
             thisNV.CxxPinnedMemberNames = cxxPinnedMembers;
+            if (operandSource != nullptr && operandSource->CallerName == "this")
+            {
+                thisNV.CallerName = operandSource->CallerName;
+                thisNV.FieldName = operandSource->FieldName;
+            }
             thisNV.Primary = tempAlloca;
             // An lvalue receiver lets C++ pick the non-const overload.
             if (tempAlloca == operandStorage) thisNV.Storage = operandStorage;
@@ -19778,6 +19887,21 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                 {
                     llvm::Value* storage = rhsStorage;
                     if (storage == nullptr)
+                        if (auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(rvalue))
+                            if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(
+                                    load->getPointerOperand());
+                                slot != nullptr && compiler->FindVariableByStorage(slot) == nullptr)
+                            {
+                                storage = slot;
+                                rightNV.IsRvalue = true;
+                                rightNV.IsCxxPrvalueTemp = true;
+                                LLVMBackend::NamedVariable tempProbe = rightNV;
+                                tempProbe.Storage = slot;
+                                if (!compiler->IsOwnedTempValue(tempProbe))
+                                    compiler->RegisterOwnedStructTemp(slot,
+                                        rightNV.TypeAndValue.TypeName);
+                            }
+                    if (storage == nullptr)
                     {
                         storage = compiler->CreateAlloca(rst);
                         compiler->CreateAssignment(rvalue, storage);
@@ -19864,6 +19988,14 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     rightNV.TypeAndValue.TypeName = enumKey;
                     rightNV.TypeAndValue.EnumBacking = compiler->GetEnumBackingType(enumKey);
                 }
+            }
+            rightNV.IsRvalue = rhsIsRvalue;
+            if (rhsIsRvalue && !rhsExplicitMove && rightNV.Storage != nullptr
+                && compiler->IsForeignNontrivialCxxClass(rightNV.TypeAndValue.TypeName))
+            {
+                LLVMBackend::NamedVariable tempProbe = rightNV;
+                tempProbe.Primary = rvalue;
+                if (compiler->IsOwnedTempValue(tempProbe)) rightNV.IsCxxPrvalueTemp = true;
             }
             rightNV.TernaryTempAlreadyRegistered = inCallArgument_
                 && rvalue != nullptr && llvm::isa<llvm::PHINode>(rvalue)
@@ -20145,6 +20277,11 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             thisNV.TypeAndValue.Pointer  = true;
             thisNV.TypeAndValue.IsCxxMutableField = lhsMutableFieldReceiver;
             thisNV.Primary = tempAlloca;
+            if (lhsCallerName == "this")
+            {
+                thisNV.CallerName = lhsCallerName;
+                thisNV.FieldName = lhsFieldName;
+            }
             if (tempAlloca != lhsStorage && !lhsIsRvalue) thisNV.ConstReceiverStorage = lhsStorage;
             thisNV.TernaryTempAlreadyRegistered = receiverTempAlreadyRegistered;
             // The caller's own storage is an lvalue: a ref-qualified C++ member ranks it as one.
@@ -20432,8 +20569,126 @@ void MainListener::ResolveValuelessCastOperand(CFlatParser::CastExpressionContex
         }
     }
 
+// The name of `(name)(args)`: a bare or namespace-qualified spelling with no type arguments, or null.
+static CFlatParser::TypeSpecifierContext* CastCalleeSpelling(CFlatParser::CastExpressionContext* ctx)
+{
+        auto* castName = ctx->castTypeName();
+        if (castName == nullptr || ctx->castExpression() == nullptr || ctx->children.size() != 4
+            || castName->typeQualifier() != nullptr || castName->abstractDeclarator() != nullptr
+            || castName->typeSpecifier().size() != 1) return nullptr;
+        auto* spec = castName->typeSpecifier()[0];
+        if (auto* generic = spec->genericIdentifier())
+            return generic->genericTypeParameters() == nullptr ? spec : nullptr;
+        if (auto* qualified = spec->qualifiedGenericIdentifier())
+            return qualified->genericTypeParameters() == nullptr ? spec : nullptr;
+        return nullptr;
+}
+
+static bool CallFragmentIsWhole(CFlatParser& parser)
+{
+        return parser.getNumberOfSyntaxErrors() == 0
+            && parser.getCurrentToken()->getType() == cflat::kTokenEOF;
+}
+
+// `(name)(args)` is a call when `name` is a function, or a visible variable that is callable. A visible
+// variable decides first: a non-callable one shadows any function of its name, so the cast keeps its
+// own "unknown type" diagnostic, as on master.
+bool MainListener::CastIsCallSpelling(CFlatParser::CastExpressionContext* ctx)
+{
+        auto* spec = CastCalleeSpelling(ctx);
+        if (spec == nullptr) return false;
+        auto* compiler = Compiler(ctx);
+        const std::string name = spec->getText();
+        if (compiler->IsKnownTypeName(name)) return false;
+        if (NamesVisibleVariable(compiler, name))
+            return compiler->IsFunctionValueType(VisibleVariableType(compiler, name));
+        const std::string resolved = compiler->ResolveQualifiedName(name);
+        return compiler->functionTable.count(name) != 0 || compiler->functionTable.count(resolved) != 0
+            || genericFunctionTemplates.count(name) != 0 || genericFunctionTemplates.count(resolved) != 0
+            || genericFunctionTemplates.count(compiler->ResolveGenericFunctionBase(name)) != 0;
+}
+
+// The text of `(name)(args)` with the header parentheses blanked, placed at the original line and
+// column of every token. Empty when the cast does not have the call shape.
+std::string MainListener::CastCallFragment(CFlatParser::CastExpressionContext* ctx)
+{
+        auto* spec = CastCalleeSpelling(ctx);
+        auto* closeNode = dynamic_cast<antlr4::tree::TerminalNode*>(ctx->children[2]);
+        antlr4::CharStream* chars = ctx->start->getInputStream();
+        if (spec == nullptr || closeNode == nullptr || chars == nullptr
+            || ctx->castExpression()->stop == nullptr) return {};
+        antlr4::Token* open = ctx->start;
+        antlr4::Token* nameTok = spec->getStart();
+        antlr4::Token* nameLast = spec->getStop();
+        antlr4::Token* close = closeNode->getSymbol();
+        // Keep line breaks in the blanked header, so every token keeps its line.
+        auto blank = [](const std::string& s) {
+            std::string blanked;
+            for (char c : s) blanked += c == '\n' ? '\n' : ' ';
+            return blanked;
+        };
+        std::string fragment(open->getLine() - 1, '\n');
+        fragment.append(open->getCharPositionInLine(), ' ');
+        fragment += blank(chars->getText(antlr4::misc::Interval(open->getStartIndex(),
+            nameTok->getStartIndex() - 1)));
+        fragment += chars->getText(antlr4::misc::Interval(nameTok->getStartIndex(),
+            nameLast->getStopIndex()));
+        fragment += blank(chars->getText(antlr4::misc::Interval(nameLast->getStopIndex() + 1,
+            close->getStopIndex())));
+        fragment += chars->getText(antlr4::misc::Interval(close->getStopIndex() + 1,
+            ctx->castExpression()->stop->getStopIndex()));
+        return fragment;
+}
+
+// The initializer as the call it spells: `R r = (makeR)(7);` becomes the tree of `makeR(7)`, so the
+// C++ class-initialization routes that read a call see the same shape as the bare spelling.
+CFlatParser::AssignmentExpressionContext* MainListener::CastCallInitializer(
+    CFlatParser::AssignmentExpressionContext* assign)
+{
+        if (assign == nullptr) return nullptr;
+        auto* cast = tryGetCastExpression(assign);
+        if (cast == nullptr || cast->stop != assign->stop || !CastIsCallSpelling(cast)) return assign;
+        const std::string text = CastCallFragment(cast);
+        if (text.empty()) return assign;
+        auto* parse = NewCallFragment(Compiler(assign), text);
+        auto* call = parse->parser.assignmentExpression();
+        return CallFragmentIsWhole(parse->parser) ? call : assign;
+}
+
+MainListener::CallFragmentParse* MainListener::NewCallFragment(LLVMBackend* compiler, const std::string& text)
+{
+        auto parse = std::make_unique<CallFragmentParse>(text);
+        parse->lexer.removeErrorListeners();
+        parse->parser.removeErrorListeners();
+        parse->parser.setErrorHandler(std::make_shared<CFlatErrorStrategy>(compiler->MakeDiagnosticLocalizer()));
+        callFragmentParses_.push_back(std::move(parse));
+        return callFragmentParses_.back().get();
+}
+
+bool MainListener::TryReparseCastAsCall(CFlatParser::CastExpressionContext* ctx, bool lvalue,
+                                        ResultUse use, LLVMBackend::NamedVariable& out)
+{
+        if (!CastIsCallSpelling(ctx)) return false;
+        const std::string fragment = CastCallFragment(ctx);
+        return !fragment.empty() && ReparseFragmentAsCast(Compiler(ctx), fragment, lvalue, use, out);
+}
+
+// Parses `fragment` as one cast-expression and emits it. A syntax error returns false and emits nothing.
+bool MainListener::ReparseFragmentAsCast(LLVMBackend* compiler, const std::string& fragment, bool lvalue,
+                                         ResultUse use, LLVMBackend::NamedVariable& out)
+{
+        auto* parse = NewCallFragment(compiler, fragment);
+        auto* call = parse->parser.castExpression();
+        if (!CallFragmentIsWhole(parse->parser)) return false;
+        NormalizeForInitTree(parse->parser, call);
+        out = ParseCastExpression(call, lvalue, use);
+        return true;
+}
+
 LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastExpressionContext* ctx, bool lvalue,
                                                    ResultUse use) {
+        LLVMBackend::NamedVariable rerouted;
+        if (TryReparseCastAsCall(ctx, lvalue, use, rerouted)) return rerouted;
         auto result = ParseCastExpressionImpl(ctx, lvalue, use);
         // An explicit cast to a pointer gives it exactly the spelled qualification: it may drop or
         // add const at any level (R7 A).
@@ -20527,7 +20782,7 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                             && postfix->children.size() == 4 ? postfix : nullptr;
                     if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node);
                         cast != nullptr && cast->castTypeName() != nullptr
-                            && cast->castExpression() != nullptr)
+                            && cast->castExpression() != nullptr && !CastIsCallSpelling(cast))
                     {
                         const auto nestedType = ParseCastTypeName(cast->castTypeName(), false, cast);
                         if (nestedType.Pointer || nestedType.ElemPointer || nestedType.IsArrayView
@@ -20609,6 +20864,12 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                 && !namedVar.IsExplicitMove
                 && compiler->IsCxxRecord(castSourceType))
             {
+                // `default` has storage, but its same-type cast is still a prvalue no-op.
+                if (IsSameTypeCastOfDefault(ctx, destTypeName.TypeName))
+                {
+                    namedVar.IsRvalue = true;
+                    return namedVar;
+                }
                 // A same-type cast of an lvalue is a prvalue copy in C++; consuming destinations
                 // keep their existing elision path, while expression uses need their own object.
                 if (namedVar.IsRvalue || namedVar.Storage == nullptr
@@ -20616,7 +20877,8 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpressionImpl(CFlatParser::Ca
                     return namedVar;
 
                 if (auto* outerCast = dynamic_cast<CFlatParser::CastExpressionContext*>(ctx->parent);
-                    outerCast != nullptr && outerCast->castTypeName() != nullptr)
+                    outerCast != nullptr && outerCast->castTypeName() != nullptr
+                    && !CastIsCallSpelling(outerCast))
                 {
                     auto outerType = ParseCastTypeName(outerCast->castTypeName(), false, outerCast);
                     if (IsRedundantCastOfSource(destTypeName, outerType))
@@ -21190,6 +21452,18 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeNameParts(
                             LocalizePrimitiveTypeError(compilerLLVM, canonicalError));
                     typeValue.TypeName = canonical.TypeName;
                     typeValue.ConstMask |= canonical.ConstMask;
+                    if (IsUnparameterizedNamedTypeSpecifier(typeSpec)
+                        && activeTypeSubstitutions.count(
+                            typeSpec->getText()) == 0)
+                    {
+                        std::vector<std::string> aggregateScopes;
+                        for (auto it = structScopeStack.rbegin(); it != structScopeStack.rend(); ++it)
+                            aggregateScopes.push_back(*it);
+                        const std::string contextual = ResolveContextualTypeName(compilerLLVM,
+                            typeSpec->getText(), typeValue.TypeName, typeSpec, aggregateScopes,
+                            NamespaceNameFromContext(compilerLLVM, typeSpec));
+                        if (!contextual.empty()) typeValue.TypeName = contextual;
+                    }
                     if (canonical.PointerDepth > 0)
                     {
                         typeValue.Pointer = true;
@@ -22993,7 +23267,13 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                     if (specList != nullptr)
                     {
                         const std::string spelling = specList->getText();
-                        resolvesAsType = spelling.find('<') == std::string::npos
+                        // A visible local, parameter or this-field named by the first component wins,
+                        // as in C++: `sizeof(X.Y)` is then a field read, not a scoped type.
+                        const std::string sizeofHead = spelling.substr(0, spelling.find('.'));
+                        const bool sizeofHeadIsVariable = spelling.find('.') != std::string::npos
+                            && (compiler->FindLiveNamedVariable(sizeofHead) != nullptr
+                                || compiler->FindImplicitThisField(sizeofHead, nullptr, nullptr) != nullptr);
+                        resolvesAsType = spelling.find('<') == std::string::npos && !sizeofHeadIsVariable
                             && (compiler->IsKnownTypeName(spelling)
                                 || compiler->IsTypeArgTypeKey(spelling)
                                 || activeTypeSubstitutions.count(spelling) != 0
@@ -23065,11 +23345,35 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpressionImpl(CFlatParser::U
                             }
                             if (resolvesAsType) break;
                         }
-                        if (!resolvesAsType && spelling.find('.') != std::string::npos)
+                        if (!resolvesAsType && spelling.find('.') != std::string::npos && !sizeofHeadIsVariable)
                         {
-                            const std::string candidate = compiler->ResolveQualifiedName(spelling);
+                            std::string candidate = compiler->ResolveQualifiedName(spelling, true);
+                            std::vector<std::string> aggregateScopes;
+                            for (auto it = structScopeStack.rbegin(); it != structScopeStack.rend(); ++it)
+                                aggregateScopes.push_back(*it);
+                            if (aggregateScopes.empty())
+                                aggregateScopes = EnclosingAggregateNamesFromContext(compiler, typeNameCtx);
+                            CFlatParser::TypeSpecifierContext* contextualTypeSpec = nullptr;
+                            if (auto* specifiers = typeNameCtx->specifierQualifierList())
+                                for (auto* specifier : specifiers->typeSpecifier())
+                                    if (IsUnparameterizedNamedTypeSpecifier(specifier))
+                                    {
+                                        contextualTypeSpec = specifier;
+                                        break;
+                                    }
+                            const std::string contextual = ResolveContextualTypeName(compiler, spelling,
+                                candidate, contextualTypeSpec, aggregateScopes,
+                                NamespaceNameFromContext(compiler, typeNameCtx));
+                            if (!contextual.empty())
+                            {
+                                candidate = contextual;
+                                resolvesAsType = true;
+                            }
+                            else
+                                resolvesAsType = compiler->IsKnownTypeName(candidate)
+                                    || compiler->IsTypeArgTypeKey(candidate);
                             const size_t scope = candidate.rfind('.');
-                            if (scope != std::string::npos
+                            if (!resolvesAsType && scope != std::string::npos
                                 && compiler->IsCxxNamespacePath(candidate.substr(0, scope)))
                             {
                                 std::string cxxError;
@@ -26053,14 +26357,12 @@ void MainListener::EmitFieldInitializer(
                         && CflatStructNeedsCtorConstruction(nestedField.TypeName);
                     if (constructedCflatElements && positionalArray && allPositionalElements)
                     {
-                        // The containing aggregate already ran each element's user constructor.
-                        // Replace those live elements in place (braced overrides like a scalar
-                        // user-ctor field, expression elements destroy-then-store) instead of
-                        // rebuilding the whole array over them.
+                        // Existing aggregates replace live elements; fresh ones construct each
+                        // selected element directly and default only the unlisted tail.
                         EmitPositionalFixedArrayIntoSlot(
                             std::format("{}.{}", typeName, fieldName),
                             nestedField, nested, nestedDestination,
-                            /*updateExistingElements*/ true);
+                            /*updateExistingElements*/ !destinationIsFresh);
                         continue;
                     }
                     if (foreignCxxArray && positionalArray)
@@ -28341,8 +28643,33 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                         return {};
                     }
                     // A C++ constructor argument is a C++ call argument (T55 usual arithmetic for ?:).
+                    LLVMBackend::TypeAndValue argExpected;
+                    const bool hasDefaultArg = IsDefaultOnlyExpression(argAssign)
+                        || HasDefaultOnlyTernaryArm(argAssign);
+                    if (hasDefaultArg)
+                        compiler->GetUniqueCxxConstructorValueParameter(typeName, argIndex,
+                            ctorArgNodes.size(), argExpected);
+                    std::optional<DeclExpectedTypeScope> argExpectedScope;
+                    if (!argExpected.TypeName.empty())
+                        argExpectedScope.emplace(&declExpectedType, argExpected, true);
+                    CxxCallArgumentExpectedTypeScope cxxArgumentExpected(
+                        cxxCallArgumentExpectedType_, argExpected);
+                    CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_);
                     CxxCallArgumentScope cxxNewArgumentScope(inCxxCallArgument_, true);
-                    auto nv = ParseAssignmentExpressionNamed(argAssign);
+                    auto nv = [&] {
+                        CxxCallArgumentParseStateScope argumentState(compiler);
+                        auto parsed = ParseAssignmentExpressionNamed(argAssign);
+                        llvm::Value* retTemp = compiler->lastCxxRetTemp_;
+                        llvm::Value* retValue = compiler->lastCxxRetValue_;
+                        if (retTemp != nullptr
+                            && (parsed.Storage == retTemp || parsed.Primary == retValue))
+                        {
+                            parsed.Storage = retTemp;
+                            parsed.IsRvalue = true;
+                            parsed.IsCxxPrvalueTemp = !parsed.IsExplicitMove;
+                        }
+                        return parsed;
+                    }();
                     NormalizeCxxRvalueReferenceArgument(argAssign, nv);
                     BindCxxCtorPointerSlotAddress(argAssign, nv, typeName, ctorArgVars.size(),
                                                   ctorArgNodes.size());
@@ -29121,7 +29448,7 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
             auto* castCtx = tryGetCastExpression(ctx->expression());
             while (castCtx != nullptr
                    && castCtx->castTypeName() != nullptr
-                   && castCtx->castExpression() != nullptr)
+                   && castCtx->castExpression() != nullptr && !CastIsCallSpelling(castCtx))
             {
                 if (!sawCast)
                 {

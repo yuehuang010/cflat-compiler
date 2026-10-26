@@ -2515,9 +2515,12 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                                 || source.ArmBlock == nullptr
                                 || cflat_llvm::GetTerminatorOrNull(source.ArmBlock) == nullptr)
                                 continue;
-                            llvm::IRBuilder<> armBuilder(source.ArmBlock->getTerminator());
-                            armBuilder.CreateStore(llvm::Constant::getNullValue(source.ValueType),
-                                                   source.Storage);
+                            auto savedIP = builder->saveIP();
+                            builder->SetInsertPoint(source.ArmBlock->getTerminator());
+                            builder->CreateStore(llvm::Constant::getNullValue(source.ValueType),
+                                                 source.Storage);
+                            if (!source.NullKey.empty()) RecordNullSet(source.NullKey);
+                            builder->restoreIP(savedIP);
                         }
                         else if (!source.CallerName.empty())
                         {
@@ -3619,7 +3622,8 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                 const bool useMove = (param.IsMove && !interfaceHolderCopy) || nv.IsExplicitMove
                     || nv.CxxParamLastUse || nv.IsRvalue;
                 if (!EmitCxxByValueParamConstruct(param.TypeName, temp, nv.Storage, useMove,
-                                                  "into an interface by-value parameter"))
+                                                  "into an interface by-value parameter",
+                                                  CxxConstReceiverKind(nv) != 0))
                     continue;
                 if (cxxObject && !IsCxxParamDestroyedInCallee(param.TypeName))
                     RegisterOwnedStructTemp(temp, param.TypeName);

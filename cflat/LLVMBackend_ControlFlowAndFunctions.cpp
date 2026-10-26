@@ -728,7 +728,8 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                     || (*argNVs)[i].CxxParamLastUse || (*argNVs)[i].IsRvalue;
                 if (!EmitCxxByValueParamConstruct(params[i].TypeName, temp,
                                                    (*argNVs)[i].Storage, useMove,
-                                                   "into a by-value function parameter"))
+                                                   "into a by-value function parameter",
+                                                   CxxConstReceiverKind((*argNVs)[i]) != 0))
                     continue;
                 const bool cflatHolder = !IsForeignNontrivialCxxClass(params[i].TypeName)
                     && HasForeignNontrivialCxxField(params[i].TypeName);

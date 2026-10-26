@@ -634,6 +634,19 @@ bool LLVMBackend::ApplyCxxAliasPattern(std::string& base, std::vector<std::strin
                        return SpellsPackExpansion(patternArg, pattern->params.back());
                    });
             const size_t fixedCount = packParam ? pattern->params.size() - 1 : pattern->params.size();
+            for (size_t i = 0; args.empty() && i < fixedCount; ++i)
+            {
+                if (i < pattern->paramPackFlags.size() && pattern->paramPackFlags[i] != 0)
+                    continue;
+                const bool hasDefault = i < pattern->paramDefaults.size()
+                    && !pattern->paramDefaults[i].empty();
+                if (i < args.size() || hasDefault) continue;
+                if (error != nullptr)
+                    *error = std::format(
+                        "the C++ alias template '{}' requires at least {} template argument(s), "
+                        "but {} were given", pattern->alias, i + 1, args.size());
+                return false;
+            }
             if (!packParam && args.size() > pattern->params.size())
             {
                 if (error != nullptr)

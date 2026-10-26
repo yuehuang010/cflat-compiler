@@ -230,6 +230,42 @@ struct TinyIterVec {
     TinyIter end() { TinyIter r; r.p = d + 5; return r; }
 };
 
+// T456: inherited member lookup keeps distinct base subobjects and access checks.
+struct T456Shared {
+    int slot = 0;
+    int f(int x) const { return 1000 + slot + x; }
+    int operator-(int x) const { return 2000 + slot + x; }
+};
+struct T456NX1 : T456Shared {
+    int ownValue = 11;
+    int own(int x) const { return 3000 + ownValue + x; }
+    int operator+(int x) const { return 4000 + ownValue + x; }
+};
+struct T456NX2 : T456Shared {};
+struct T456Diamond : T456NX1, T456NX2 {
+    using T456NX1::f;
+    using T456NX1::operator-;
+    using T456NX1::own;
+    using T456NX1::operator+;
+};
+struct T456One : T456NX1 {};
+struct T456PublicBase { int operator*(int x) const { return 5000 + x; } };
+struct T456PublicDerived : T456PublicBase {};
+int t456EqCalls = 0;
+int t456CmpCalls = 0;
+struct T456ProtectedBase {
+    int value = 0;
+protected:
+    int operator-(int x) const { return 6000 + x; }
+    int operator~() const { return 6100; }
+    int operator[](int x) const { return 6200 + x; }
+    int operator()(int x) const { return 6200 + x; }
+    bool operator==(int x) const { ++t456EqCalls; return x == 3; }
+    int operator<=>(int x) const { ++t456CmpCalls; return value - x; }
+    T456ProtectedBase& operator+=(int x) { value += x; return *this; }
+};
+struct T456ProtectedDerived : T456ProtectedBase {};
+
 // T221: using-declarations expose base overloads while preserving C++ name lookup.
 struct T221OpBase {
     long operator-(long rhs) const { return 1000 + (int)rhs; }
@@ -352,4 +388,18 @@ inline T455FreeTracked&& t455FreeRref() {
 }
 inline T455FreeTracked t455FreePrvalue() { return T455FreeTracked{}; }
 inline void resetT455Free() { t455FreeLast = 0; t455FreeDtors = 0; }
+
+// Free operators win over protected inherited members when overload ranking selects them.
+struct T456ProtectedFreeBinary {
+protected:
+    int operator+(int) const { return 60; }
+};
+inline int operator+(const T456ProtectedFreeBinary&, double) { return 61; }
+
+struct T456ProtectedFreeUnaryBase {
+protected:
+    int operator+() const { return 62; }
+};
+struct T456ProtectedFreeUnary : T456ProtectedFreeUnaryBase {};
+inline int operator+(const T456ProtectedFreeUnary&) { return 63; }
 }

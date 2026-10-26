@@ -3706,6 +3706,27 @@ extern int main()
         if (n63GatePointerArrive(&explicitGate) != 1)                       return 2780;
         auto inferredGate = cppt.dflt.Gate<>(1);
         if (inferredGate.arrive() != 0 || cppt.dflt.done_calls() != 2)      return 2781;
+        // T458 accept-set: alias namespace spelling and explicit empty arguments share Box<int>.
+        wrap.nested.Box aliasBare = default;
+        aliasBare.value = 3;
+        auto aliasEmpty = wrap.nested.Box<>();
+        wrap.nested.Box<> aliasExplicit = default;
+        n63.Box<> explicitEmpty = default;
+        n63.Box bareDefault = default;
+        req.Defaulted<> defaultedAlias = default;
+        aliasExplicit.value = 16;
+        explicitEmpty.value = 13;
+        bareDefault.value = 14;
+        defaultedAlias.value = 15;
+        if (aliasBare.value != 3 || aliasEmpty.value != 7 || aliasExplicit.value != 16
+            || explicitEmpty.value != 13
+            || bareDefault.value != 14 || defaultedAlias.value != 15) return 46001;
+        t458.P0<> t458P0 = default;
+        if (t458P0.value != 7)                                             return 46003;
+        t458.PD<> t458PD = default;
+        if (t458PD.value != 7)                                             return 46004;
+        rq.D<> t162Empty = rq.D<int>(8);
+        if (dv(t162Empty) != 109)                                          return 46002;
         // `T[]` template argument (make_unique<int[]> / unique_ptr<int[]> shape); master: "has an
         // explicit type argument that cannot be spelled in C++", then the [[no_unique_address]]
         // Deleter<int[]> field refused the record.

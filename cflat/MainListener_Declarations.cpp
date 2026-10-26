@@ -48,6 +48,49 @@ static bool SubtreeContainsCall(antlr4::tree::ParseTree* node)
         return false;
     }
 
+static bool IsTernaryArmOfBinaryOperand(antlr4::ParserRuleContext* arm)
+{
+        CFlatParser::ConditionalExpressionContext* ternary = nullptr;
+        for (auto* parent = arm != nullptr ? arm->parent : nullptr; parent != nullptr;
+             parent = parent->parent)
+            if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(parent);
+                conditional != nullptr && conditional->Question() != nullptr)
+            {
+                ternary = conditional;
+                break;
+            }
+        if (ternary == nullptr) return false;
+        for (auto* parent = ternary->parent; parent != nullptr; parent = parent->parent)
+        {
+            if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(parent);
+                postfix != nullptr && postfix->children.size() > 1)
+                return false;
+            if (auto* p = dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(parent);
+                p != nullptr && p->castExpression().size() > 1) return true;
+            if (auto* p = dynamic_cast<CFlatParser::AdditiveExpressionContext*>(parent);
+                p != nullptr && p->multiplicativeExpression().size() > 1) return true;
+            if (auto* p = dynamic_cast<CFlatParser::ShiftExpressionContext*>(parent);
+                p != nullptr && p->additiveExpression().size() > 1) return true;
+            if (auto* p = dynamic_cast<CFlatParser::RelationalExpressionContext*>(parent);
+                p != nullptr && p->shiftExpression().size() > 1) return true;
+            if (auto* p = dynamic_cast<CFlatParser::EqualityExpressionContext*>(parent);
+                p != nullptr && p->typeCheckExpression().size() > 1) return true;
+            if (auto* p = dynamic_cast<CFlatParser::AndExpressionContext*>(parent);
+                p != nullptr && p->equalityExpression().size() > 1) return true;
+            if (auto* p = dynamic_cast<CFlatParser::ExclusiveOrExpressionContext*>(parent);
+                p != nullptr && p->andExpression().size() > 1) return true;
+            if (auto* p = dynamic_cast<CFlatParser::InclusiveOrExpressionContext*>(parent);
+                p != nullptr && p->exclusiveOrExpression().size() > 1) return true;
+            if (auto* p = dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(parent);
+                p != nullptr && p->inclusiveOrExpression().size() > 1) return true;
+            if (auto* p = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(parent);
+                p != nullptr && p->logicalAndExpression().size() > 1) return true;
+            if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent);
+                assignment != nullptr && assignment->assignmentOperator() != nullptr) return true;
+        }
+        return false;
+    }
+
 // A subscript may be a C++ operator[] call, so a unary over one keeps the call route.
 static bool SubtreeContainsCallOrSubscript(antlr4::tree::ParseTree* node)
 {
@@ -1703,10 +1746,11 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         std::vector<std::string> requiredParams;
                         if (NativeTemplateNeedsTypeArgs(baseName, requiredParams))
                             RejectMissingNativeTemplateTypeArgs(genParams, spelledBase, requiredParams);
-                        const std::string resolvedType = Compiler(declSpecs)->ResolveTypeAlias(baseName);
+                        const std::string resolvedType = Compiler(declSpecs)->ResolveTypeAlias(
+                            Compiler(declSpecs)->ResolveQualifiedName(baseName));
                         if (!Compiler(declSpecs)->AnyGenericTypeTemplateNamed(baseName)
                             && Compiler(declSpecs)->IsDataStructure(resolvedType)
-                            && !Compiler(declSpecs)->IsCxxRecord(baseName)
+                            && !Compiler(declSpecs)->IsCxxRecord(resolvedType)
                             && !Compiler(declSpecs)->IsCxxForeignTypeRegistered(resolvedType))
                             LogErrorContext(genParams,
                                 std::format("'{}' is not a generic type", spelledBase));
@@ -1897,13 +1941,16 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // A std::nullptr_t alias keeps its identity; alias expansion spells it void*.
                     if (Compiler(declSpecs)->IsCxxNullptrTAlias(typeName)) declType.IsCxxNullptrT = true;
                     typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName, wasSubstituted);
-                    // If still unresolved, try qualifying with the enclosing struct scope (e.g. Inner -> Outer.Inner).
-                    // The !wasSubstituted guard is DEFENSIVE and inert today: removing it changed no leg or probe.
-                    if (!wasSubstituted && !structScopeStack.empty() && !Compiler(declSpecs)->IsDataStructure(typeName))
+                    if (!wasSubstituted && IsUnparameterizedNamedTypeSpecifier(typeSpec))
                     {
-                        std::string qualified = structScopeStack.back() + "." + typeName;
-                        if (Compiler(declSpecs)->IsDataStructure(qualified))
-                            typeName = qualified;
+                        std::vector<std::string> aggregateScopes;
+                        for (auto it = structScopeStack.rbegin(); it != structScopeStack.rend(); ++it)
+                            aggregateScopes.push_back(*it);
+                        const std::string contextual = ResolveContextualTypeName(
+                            Compiler(declSpecs), typeSpec->getText(), typeName,
+                            typeSpec, aggregateScopes,
+                            NamespaceNameFromContext(Compiler(declSpecs), typeSpec));
+                        if (!contextual.empty()) typeName = contextual;
                     }
                     // Resolve type aliases (e.g. user-defined aliases)
                     declType.ConstMask |= Compiler(declSpecs)->ResolveTypeAliasConstMask(typeName);
@@ -3040,14 +3087,18 @@ llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndVa
                         if (inPlace) return nullptr;
                         auto* value = compiler->CreateLoad(llvmType, slot);
                         // A direct default argument is an owned prvalue; carry its slot for ABI lowering.
-                        if (inCallArgument_ && expressionContext != nullptr
-                            && ((IsDirectCallArgument(expressionContext)
-                                 || IsCallArgumentThroughParens(expressionContext))
+                        const bool binaryCxxTernaryArm = expressionContext != nullptr
+                            && compiler->IsForeignNontrivialCxxClass(resolved.TypeName)
+                            && IsTernaryArmOfBinaryOperand(expressionContext);
+                        const bool callArgument = inCallArgument_ && expressionContext != nullptr
+                            && (IsDirectCallArgument(expressionContext)
+                                || IsCallArgumentThroughParens(expressionContext)
                                 || (inCxxCallArgument_
                                     && compiler->IsForeignNontrivialCxxClass(resolved.TypeName)
-                                    // A ternary arm with no known destination stays unowned: its join refuses.
+                                    // A typed C++ ternary arm owns its default temporary.
                                     && (!cxxCallArgumentExpectedType_.TypeName.empty()
-                                        || !IsTernaryArmOfCallArgument(expressionContext)))))
+                                        || !IsTernaryArmOfCallArgument(expressionContext))));
+                        if (callArgument || binaryCxxTernaryArm)
                             if (auto* temp = llvm::dyn_cast_or_null<llvm::AllocaInst>(slot))
                             {
                                 compiler->RegisterOwnedStructTemp(temp, resolved.TypeName);
@@ -5581,8 +5632,8 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         const bool hasCxxConstructors = compiler->IsForeignCxxClassWithConstructors(typeName);
         auto* initializer = initDeclarator->initializer();
         // Redundant parentheses take the bare initializer's route (in-place elision).
-        auto* assign = UnwrapInitializerParens(
-            initializer != nullptr ? initializer->assignmentExpression() : nullptr);
+        auto* assign = CastCallInitializer(UnwrapInitializerParens(
+            initializer != nullptr ? initializer->assignmentExpression() : nullptr));
         auto* declarationBraceList = initDeclarator->initializerList();
         if (declarationBraceList == nullptr && initializer != nullptr
             && initializer->LeftBrace() != nullptr)
@@ -5773,7 +5824,7 @@ cxx_dtor_ready:
             bool valid = true;
             auto appendFields = [&](auto&& self,
                                     const std::vector<CFlatParser::FieldInitContext*>& fields,
-                                    std::string& out) -> void {
+                                    std::string& out, bool topLevel) -> void {
                 for (size_t i = 0; i < fields.size() && valid; ++i)
                 {
                     auto* element = fields[i];
@@ -5781,7 +5832,7 @@ cxx_dtor_ready:
                     if (element->initializerList() != nullptr)
                     {
                         out += "{";
-                        self(self, element->initializerList()->fieldInit(), out);
+                        self(self, element->initializerList()->fieldInit(), out, false);
                         out += "}";
                         continue;
                     }
@@ -5794,17 +5845,53 @@ cxx_dtor_ready:
                         break;
                     }
                     auto* expression = element->assignmentExpression(0);
-                    CxxCallArgumentScope cxxBraceElementScope(inCxxCallArgument_, true);
-                    auto elementNV = ParseAssignmentExpressionNamed(expression);
-                    NormalizeCxxRvalueReferenceArgument(expression, elementNV);
+                    LLVMBackend::TypeAndValue argExpected;
+                    if (topLevel && (IsDefaultOnlyExpression(expression)
+                        || HasDefaultOnlyTernaryArm(expression)))
+                        compiler->GetUniqueCxxConstructorValueParameter(typeName, braceElements.size(),
+                            declarationBraceList->fieldInit().size(), argExpected);
+                    const bool deferredDefault = topLevel && IsDefaultOnlyExpression(expression)
+                        && !argExpected.TypeName.empty() && !argExpected.Pointer
+                        && !argExpected.IsAlias && !argExpected.IsRvalueRef;
+                    std::optional<DeclExpectedTypeScope> argExpectedScope;
+                    if (!argExpected.TypeName.empty())
+                        argExpectedScope.emplace(&declExpectedType, argExpected, true);
+                    CxxCallArgumentExpectedTypeScope cxxArgumentExpected(
+                        cxxCallArgumentExpectedType_, argExpected);
+                    LLVMBackend::NamedVariable elementNV;
+                    if (deferredDefault)
+                    {
+                        elementNV.TypeAndValue = argExpected;
+                        elementNV.IsDefaultArgument = true;
+                    }
+                    else
+                    {
+                        CallArgumentScope callArgumentScope(inCallArgument_, ternaryCallArgumentDepth_);
+                        CxxCallArgumentScope cxxBraceElementScope(inCxxCallArgument_, true);
+                        elementNV = [&] {
+                            CxxCallArgumentParseStateScope argumentState(compiler);
+                            auto parsed = ParseAssignmentExpressionNamed(expression);
+                            llvm::Value* retTemp = compiler->lastCxxRetTemp_;
+                            llvm::Value* retValue = compiler->lastCxxRetValue_;
+                            if (retTemp != nullptr
+                                && (parsed.Storage == retTemp || parsed.Primary == retValue))
+                            {
+                                parsed.Storage = retTemp;
+                                parsed.IsRvalue = true;
+                                parsed.IsCxxPrvalueTemp = !parsed.IsExplicitMove;
+                            }
+                            return parsed;
+                        }();
+                        NormalizeCxxRvalueReferenceArgument(expression, elementNV);
+                    }
                     llvm::Value* elementValue = elementNV.Primary
                         ? elementNV.Primary : LoadNamedVariable(elementNV);
-                    if (elementValue == nullptr)
+                    if (elementValue == nullptr && !deferredDefault)
                     {
                         valid = false;
                         break;
                     }
-                    if (elementNV.TypeAndValue.TypeName.empty())
+                    if (!deferredDefault && elementNV.TypeAndValue.TypeName.empty())
                     {
                         bool suffixedLiteral = false;
                         if (elementNV.LiteralIdentity.empty())
@@ -5815,10 +5902,15 @@ cxx_dtor_ready:
                     }
                     elementNV.Primary = elementValue;
                     elementNV.TypeAndValue.VariableName.clear();
-                    elementNV.BaseType = elementValue->getType();
+                    elementNV.BaseType = elementValue != nullptr ? elementValue->getType() : nullptr;
                     // A C++ class element keeps its storage: the thunk binds it by reference and
                     // clang copies (lvalue) or moves (rvalue, `move x`) it into the list.
-                    if (elementNV.TypeAndValue.Pointer)
+                    if (deferredDefault)
+                    {
+                        elementNV.Primary = nullptr;
+                        elementNV.BaseType = nullptr;
+                    }
+                    else if (elementNV.TypeAndValue.Pointer)
                     {
                         elementNV.CxxImportedLiteral = compiler->CxxImportedConstantLiteral(elementNV);
                     }
@@ -5834,15 +5926,16 @@ cxx_dtor_ready:
                     ProcessPlusPlus();
                 }
             };
-            appendFields(appendFields, declarationBraceList->fieldInit(), braceExpression);
+            appendFields(appendFields, declarationBraceList->fieldInit(), braceExpression, true);
             braceExpression += "}";
             if (!valid) return true;
             std::string wrapperName;
             std::string constructorError;
+            std::vector<size_t> forwardedBraceElements;
             if (!compiler->RequestCxxDirectBraceConstructor(
                     typeName, braceElements, braceExpression,
                     initializer != nullptr && initializer->LeftBrace() != nullptr,
-                    wrapperName, constructorError))
+                    wrapperName, constructorError, true, &forwardedBraceElements))
             {
                 if (constructorError.empty())
                     constructorError = std::format(
@@ -5858,9 +5951,10 @@ cxx_dtor_ready:
             self.TypeAndValue.Pointer = true;
             self.IsRvalue = true;
             std::vector<LLVMBackend::NamedVariable> wrapperArguments;
-            wrapperArguments.reserve(braceElements.size() + 1);
+            wrapperArguments.reserve(forwardedBraceElements.size() + 1);
             wrapperArguments.push_back(self);
-            wrapperArguments.insert(wrapperArguments.end(), braceElements.begin(), braceElements.end());
+            for (size_t index : forwardedBraceElements)
+                wrapperArguments.push_back(braceElements[index]);
             compiler->SetCurrentDebugLocation(line);
             compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
             return true;
@@ -6112,7 +6206,19 @@ cxx_dtor_ready:
                 // A C++ constructor argument is a C++ call argument: `?:` arms use the usual
                 // arithmetic conversions (T55), so `rv.C(k ? 5 : 6)` deduces int like clang.
                 CxxCallArgumentScope cxxCtorArgumentScope(inCxxCallArgument_, true);
-                auto nv = ParseAssignmentExpressionNamed(argAssign);
+                // T459: a `?:` with a `default` arm into a `const T&` parameter joins a temporary of the class.
+                LLVMBackend::TypeAndValue ctorRefDest;
+                // Armed only when the place arm is that class: `int` beside the const T& ctor selects int.
+                std::string ctorRefPlaceType;
+                const bool ctorRefTernary = IsCxxDeferrableDefaultTernary(argAssign, ctorRefPlaceType)
+                    && compiler->GetUniqueCxxConstructorValueParameter(
+                        typeName, ctorArguments.size(), ctorArgs->argumentNamedExpression().size(),
+                        ctorRefDest, /*constRef*/ true)
+                    && ctorRefPlaceType == ctorRefDest.TypeName
+                    && compiler->IsForeignNontrivialCxxClass(ctorRefDest.TypeName);
+                auto nv = ctorRefTernary
+                    ? ParseCxxConstRefTernaryTemp(argAssign, ctorRefDest)
+                    : ParseAssignmentExpressionNamed(argAssign);
                 NormalizeCxxRvalueReferenceArgument(argAssign, nv);
                 BindCxxCtorPointerSlotAddress(argAssign, nv, typeName, ctorArguments.size(),
                                               ctorArgs->argumentNamedExpression().size());
@@ -6657,7 +6763,8 @@ cxx_dtor_ready:
                     else
                         compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, srcNV->Storage,
                             implicitLastUse, std::format("into local '{}'", name).c_str(),
-                            declType.DiagnosticTypeName);
+                            declType.DiagnosticTypeName,
+                            compiler->CxxConstReceiverKind(*srcNV) != 0);
                     if (implicitLastUse) compiler->MarkVariableMoved(srcText);
                     return true;
                 }
@@ -6673,7 +6780,8 @@ cxx_dtor_ready:
         const std::string pfText = pf != nullptr ? pf->getText() : std::string();
         auto* castInitContext = tryGetCastExpression(assign);
         bool castInit = false;
-        if (castInitContext != nullptr && castInitContext->castTypeName() != nullptr)
+        if (castInitContext != nullptr && castInitContext->castTypeName() != nullptr
+            && !CastIsCallSpelling(castInitContext))
         {
             const auto castType = ParseCastTypeName(castInitContext->castTypeName(), false, castInitContext);
             castInit = !castType.Pointer && !castType.ElemPointer && !castType.IsArrayView
@@ -6760,7 +6868,8 @@ cxx_dtor_ready:
                     else
                         compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, rightNV.Storage,
                             /*useMove*/ true, std::format("into local '{}'", name).c_str(),
-                            declType.DiagnosticTypeName);
+                            declType.DiagnosticTypeName,
+                            compiler->CxxConstReceiverKind(rightNV) != 0);
                     if (auto* source = IsBareIdentifierText(sourceName)
                             ? compiler->FindLiveNamedVariable(sourceName) : nullptr;
                         source != nullptr && source->Storage == rightNV.Storage)
@@ -6784,7 +6893,8 @@ cxx_dtor_ready:
                 compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, rightNV.Storage,
                                                      useMove,
                                                      std::format("into local '{}'", name).c_str(),
-                                                     declType.DiagnosticTypeName);
+                                                     declType.DiagnosticTypeName,
+                                                     compiler->CxxConstReceiverKind(rightNV) != 0);
                 return true;
             }
             if (sameType && compiler->lastCxxRetTemp_ != nullptr)
@@ -6792,7 +6902,8 @@ cxx_dtor_ready:
                 compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, compiler->lastCxxRetTemp_,
                                                      /*useMove*/ true,
                                                      std::format("into local '{}'", name).c_str(),
-                                                     declType.DiagnosticTypeName);
+                                                     declType.DiagnosticTypeName,
+                                                     compiler->CxxConstReceiverKind(rightNV) != 0);
                 return true;
             }
             const bool sameCflatValue = rightNV.TypeAndValue.TypeName == typeName
@@ -6883,7 +6994,8 @@ cxx_dtor_ready:
             compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, rightNV.Primary,
                                                  /*useMove*/ false,
                                                  std::format("into local '{}'", name).c_str(),
-                                                 declType.DiagnosticTypeName);
+                                                 declType.DiagnosticTypeName,
+                                                 compiler->CxxConstReceiverKind(rightNV) != 0);
             return true;
         }
         if (consumed || ternaryConsumed)
@@ -6905,7 +7017,8 @@ cxx_dtor_ready:
             compiler->SetCurrentDebugLocation(line);
             compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, rightNV.Storage,
                 rightNV.IsRvalue || rightNV.CxxParamLastUse,
-                std::format("into local '{}'", name).c_str(), declType.DiagnosticTypeName);
+                std::format("into local '{}'", name).c_str(), declType.DiagnosticTypeName,
+                compiler->CxxConstReceiverKind(rightNV) != 0);
             return true;
         }
         /*
@@ -6933,7 +7046,8 @@ cxx_dtor_ready:
             compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, rightNV.Storage,
                                                  /*useMove*/ false,
                                                  std::format("into local '{}'", name).c_str(),
-                                                 declType.DiagnosticTypeName);
+                                                 declType.DiagnosticTypeName,
+                                                 compiler->CxxConstReceiverKind(rightNV) != 0);
             return true;
         }
         // Only the OUTERMOST call's temporary may be moved into the slot: a value assembled from
@@ -6951,7 +7065,8 @@ cxx_dtor_ready:
                 compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, compiler->lastCxxRetTemp_,
                                                      /*useMove*/ true,
                                                      std::format("into local '{}'", name).c_str(),
-                                                     declType.DiagnosticTypeName);
+                                                     declType.DiagnosticTypeName,
+                                                     compiler->CxxConstReceiverKind(rightNV) != 0);
             else
                 compiler->builder->CreateStore(rightNV.Primary, slot);
             return true;
@@ -7050,7 +7165,8 @@ bool MainListener::TryDeclareForeignCxxAutoLocal(CFlatParser::DirectDeclaratorCo
             compiler->EmitCxxCopyOrMoveConstruct(typeName, slot, sourceNV.Storage,
                                                  explicitMove || implicitLastUse || onlyMovable
                                                      || rvalueJoin,
-                                                 std::format("into local '{}'", name).c_str());
+                                                 std::format("into local '{}'", name).c_str(), {},
+                                                 compiler->CxxConstReceiverKind(sourceNV) != 0);
         if (explicitMove || implicitLastUse)
         {
             auto* named = IsBareIdentifierText(srcName) ? compiler->FindLiveNamedVariable(srcName)
@@ -14059,35 +14175,38 @@ bool MainListener::IsAliasBorrowLocalBinding(const LLVMBackend::NamedVariable& n
                 && !nv.CallerName.empty() && nv.Storage != nullptr);
 }
 
-bool MainListener::DestinationIsAliasBorrowLocal(LLVMBackend* compiler, llvm::Value* destination) {
-        if (compiler == nullptr || destination == nullptr) return false;
-        if (!llvm::isa<llvm::AllocaInst>(destination) && !llvm::isa<llvm::GlobalVariable>(destination))
+bool MainListener::DestinationIsAliasBorrowLocal(
+        const LLVMBackend::NamedVariable& destination) {
+        if (!llvm::isa_and_nonnull<llvm::AllocaInst>(destination.Storage)
+            && !llvm::isa_and_nonnull<llvm::GlobalVariable>(destination.Storage))
             return false;
-        const auto* bind = compiler->FindVariableByStorage(destination);
+        if (destination.TypeAndValue.IsAlias) return false;
         // A local that adopted an alias-return temp owns its old value iff its drop flag is set,
         // so the flag-gated drop-old must run.
-        return bind != nullptr && IsAliasBorrowLocalBinding(*bind) && bind->ConditionalDropFlag == nullptr;
+        return IsAliasBorrowLocalBinding(destination)
+            && destination.ConditionalDropFlag == nullptr;
     }
 
-void MainListener::RetireAliasBorrowOnRebind(LLVMBackend* compiler, llvm::Value* destination,
-        llvm::BasicBlock* assignmentBlock) {
-        if (compiler == nullptr || destination == nullptr || compiler->builder == nullptr) return;
+void MainListener::RetireAliasBorrowOnRebind(LLVMBackend* compiler,
+        const LLVMBackend::NamedVariable& destination, llvm::BasicBlock* assignmentBlock) {
+        if (compiler == nullptr || destination.Storage == nullptr || compiler->builder == nullptr) return;
         if (assignmentBlock == nullptr) return;
-        for (auto& frame : compiler->stackNamedVariable)
-            for (auto& [varName, nv] : frame.namedVariable)
-            {
-                if (nv.Storage != destination || !IsAliasBorrowLocalBinding(nv)) continue;
-                // Retire ONLY when this store sits in the block the binding was declared in: every
-                // path that reaches scope exit then ran it, so the local really owns what it holds.
-                if (nv.AliasBorrowDeclBlock != assignmentBlock
-                    || nv.AliasBorrowDeclFunction != assignmentBlock->getParent())
-                    return;
-                nv.IsAliasBorrow = false;
-                nv.IsAliasReturnBorrow = false;
-                nv.AliasBorrowDeclBlock = nullptr;
-                nv.AliasBorrowDeclFunction = nullptr;
-                return;
-            }
+        // A declared `alias` is a reference to its referent and stays borrowed after stores.
+        if (destination.TypeAndValue.IsAlias) return;
+        const std::string name = !destination.TypeAndValue.VariableName.empty()
+            ? destination.TypeAndValue.VariableName : destination.CallerName;
+        auto* live = compiler->FindLiveNamedVariable(name);
+        if (live == nullptr || live->Storage != destination.Storage
+            || !IsAliasBorrowLocalBinding(*live)) return;
+        // Retire ONLY when this store sits in the block the binding was declared in: every
+        // path that reaches scope exit then ran it, so the local really owns what it holds.
+        if (live->AliasBorrowDeclBlock != assignmentBlock
+            || live->AliasBorrowDeclFunction != assignmentBlock->getParent())
+            return;
+        live->IsAliasBorrow = false;
+        live->IsAliasReturnBorrow = false;
+        live->AliasBorrowDeclBlock = nullptr;
+        live->AliasBorrowDeclFunction = nullptr;
     }
 
 bool MainListener::RejectAliasBorrowAdoption(

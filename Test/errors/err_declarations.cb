@@ -258,3 +258,20 @@ expect_error("conflicting declaration of extern 'WriteFile': the linkage name is
 expect_error("conflicting declaration of extern 'fopen': the linkage name is already declared as 'void*(char*, char*)', but this declaration is 'int(int)'. Rename your extern, or call the existing one - for file I/O use os.windows.fopen/fread/fwrite/fclose.") {
     extern int fopen(int x);
 }
+
+namespace t458NativePlain
+{
+    struct Plain { int value = 0; };
+    expect_error("is not a generic type") { Plain<> global = default; }
+    expect_error("is not a generic type") {
+        struct Holder { Plain<> field = default; };
+    }
+    expect_error("is not a generic type") {
+        int local() { Plain<> value = default; return 0; }
+    }
+    expect_error("is not a generic type") { int take(Plain<>* value) { return 0; } }
+    expect_error("is not a generic type") { Plain<>* give() { return nullptr; } }
+}
+expect_error("is not a generic type") {
+    t458NativePlain.Plain<> qualified = default;
+}
