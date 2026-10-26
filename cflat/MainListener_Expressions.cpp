@@ -16955,6 +16955,8 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
             llvm::Value* lvalue = lv.value;
             llvm::Value* lhsStorage = lv.receiverStorage;
             bool lhsIsRvalue = lv.isRvalue;
+            bool lhsIsAlias = lv.isAlias;
+            LLVMBackend::TypeAndValue lhsAliasType = lv.sourceType;
             llvm::Type* lhsRefType = nullptr;
             std::string lhsSourceTypeName = lv.sourceTypeName;
             std::string lhsArithIdentity = lv.cxxArithIdentity;
@@ -17087,6 +17089,8 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                     lvalue = Compiler(ctx)->CreateGEP(elemType, lvalue, rvalue, "ptrarith");
                     lhsStorage = nullptr;
                     lhsIsRvalue = true;
+                    lhsIsAlias = false;
+                    lhsAliasType = {};
                     lhsRefType = nullptr;
                     lhsNativeArithmeticTypeName.clear();
                     // A chained `1 + p + n` keeps the type the earlier step produced; only the
@@ -17124,6 +17128,8 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                     lvalue = Compiler(ctx)->CreateGEP(rv.elemType, rvalue, lvalue, "ptrarith");
                     lhsStorage = nullptr;
                     lhsIsRvalue = true;
+                    lhsIsAlias = false;
+                    lhsAliasType = {};
                     lhsRefType = nullptr;
                     lhsNativeArithmeticTypeName.clear();
                     lhsSourceTypeName.clear();
@@ -17171,7 +17177,8 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                                                                rv.hasSourceType && rv.sourceType.IsCxxNullptrT,
                                                                false, lvalue == lv.value && lv.cxxPointeeConst,
                                                                lvalue == lv.value ? lv.cxxObjectCv : 0,
-                                                               rv.cxxObjectCv);
+                                                               rv.cxxObjectCv,
+                                                               lhsIsAlias);
 
                 // char* + char* concatenation: TryBinaryOperatorOverload dispatches off a struct lvalue
                     // and can't reach raw i8*; both must qualify as c-strings so int* + int* still errors.
@@ -17216,12 +17223,33 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                         CarryCxxOperatorResult(ctx, overload, i + 1 < nextCtxs.size(), lvalue,
                                                lhsStorage, lhsIsRvalue, lhsRefType,
                                                lhsSourceTypeName);
+                        const auto& returnType = Compiler(ctx)->lastCallReturnType;
+                        lhsIsAlias = returnType.IsAlias && !returnType.Pointer
+                            && !Compiler(ctx)->IsCxxRecord(returnType.TypeName);
+                        if (lhsIsAlias)
+                        {
+                            lhsAliasType = returnType;
+                            lhsStorage = overload;
+                            lhsIsRvalue = false;
+                            lhsRefType = nullptr;
+                            lhsSourceTypeName = returnType.TypeName;
+                            if (lvalue != nullptr && lvalue->getType()->isPointerTy())
+                            {
+                                auto* aliasValueType = Compiler(ctx)->GetType(returnType);
+                                if (aliasValueType != nullptr && aliasValueType->isStructTy())
+                                    lvalue = Compiler(ctx)->CreateLoad(aliasValueType, overload);
+                            }
+                        }
+                        else
+                            lhsAliasType = {};
                     }
                     else
                     {
                         lvalue = Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
                         lhsStorage = nullptr;
                         lhsIsRvalue = true;
+                        lhsIsAlias = false;
+                        lhsAliasType = {};
                         lhsRefType = nullptr;
                         lhsSourceTypeName.clear();
                         lhsNativeArithmeticTypeName = lvalue != nullptr
@@ -17315,9 +17343,14 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
             result.isPointerArithmeticResult = hasPointerArithmeticResultType;
             result.receiverStorage = lhsStorage;
             result.cxxRefValueType = lhsRefType;
-            result.isAlias = lhsRefType != nullptr && !lhsSourceTypeName.empty();
+            result.isAlias = lhsIsAlias || (lhsRefType != nullptr && !lhsSourceTypeName.empty());
             result.storage = result.isAlias ? lhsStorage : nullptr;
             result.sourceTypeName = lhsSourceTypeName;
+            if (lhsIsAlias)
+            {
+                result.sourceType = lhsAliasType;
+                result.hasSourceType = true;
+            }
             result.cxxArithIdentity = lhsArithIdentity;
             if (!lhsNativeArithmeticTypeName.empty())
             {
@@ -18645,7 +18678,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         const std::string& rhsArithIdentity,
         bool rhsExplicitMove, bool lhsExplicitMove,
         bool lhsCxxNullptrT, bool rhsCxxNullptrT, bool lhsMaterializedPrvalue,
-        bool lhsCxxPointeeConst, int lhsObjectCv, int rhsObjectCv) {
+        bool lhsCxxPointeeConst, int lhsObjectCv, int rhsObjectCv, bool lhsIsAlias) {
         auto* compiler = Compiler(ctx);
         if (!lvalue) return nullptr;
         // An ADL request for this expression was ambiguous and refused: nested rewrites stay silent.
@@ -20504,6 +20537,11 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     }
                     rightNV.Storage = storage;
                 }
+                else if (rhsStorage != nullptr && !rhsIsRvalue && !rhsExplicitMove)
+                {
+                    rightNV.Storage = rhsStorage;
+                    rightNV.IsBorrowed = true;
+                }
             }
             else if (rvalue && rvalue->getType()->isPointerTy())
             {
@@ -20866,7 +20904,10 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
              * pointer, so it never reaches this branch and still gets its copy.
              */
             llvm::Value* tempAlloca = nullptr;
-            if (!lhsIsRvalue && lhsStorage != nullptr
+            if (lhsIsAlias && !compiler->IsCxxRecord(typeName)
+                && lhsPointerDepth == 0 && lhsStorage != nullptr)
+                tempAlloca = lhsStorage;
+            else if (!lhsIsRvalue && lhsStorage != nullptr
                 && (compiler->IsCxxRecord(typeName)
                     || compiler->generatedCxxRecords_.count(typeName) != 0))
                 tempAlloca = lhsStorage;
@@ -25899,6 +25940,24 @@ std::string MainListener::CodeValueCastAdvice(const LLVMBackend::TypeAndValue& d
         return CodeValueDestSpelling(dest);
     }
 
+// A bare function name is initially resolved to one overload; rebind it before slot checks or stores.
+void MainListener::BindNamedFunctionToFuncPtrSlot(LLVMBackend* compiler,
+        LLVMBackend::NamedVariable& value, const LLVMBackend::TypeAndValue& slot,
+        antlr4::ParserRuleContext* site)
+{
+        auto* function = llvm::dyn_cast_or_null<llvm::Function>(value.Primary);
+        if (function == nullptr || value.CallerName.empty()) return;
+        if (!slot.IsFunctionPointer) return;
+        if (compiler->NamedFunctionOverloadForFuncPtr(value.CallerName, slot) == nullptr
+            && compiler->HasOverloadSetForFunction(function))
+            LogErrorContext(site, std::format("no overload of '{}' matches function type '{}'",
+                value.CallerName, compiler->FuncPtrSpellingOf(slot)));
+        if (auto* bound = compiler->GetFunctionForFuncPtr(value.CallerName,
+                static_cast<int>(slot.FuncPtrParams.size()), &slot.FuncPtrParams,
+                &slot, /*compareReturnOwnership*/ true))
+            value.Primary = bound;
+}
+
 llvm::Value* MainListener::ParseFieldDefaultInitializer(
         const std::string& structName,
         const LLVMBackend::TypeAndValue& field,
@@ -25913,6 +25972,47 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
             compiler->pendingInitAllocAlign = field.AllocAlignValue;
         DeclExpectedTypeScope fieldExpectedScope(&declExpectedType, field, true);
         auto nv = ParseAssignmentExpressionNamed(ae);
+        if (!structName.empty())
+            if (auto* identifier = GenericFunctionValueIdentifier(ae);
+                identifier != nullptr && llvm::isa_and_nonnull<llvm::Function>(nv.Primary))
+            {
+                const auto* resolved = compiler->FindSymbolForFunction(
+                    llvm::cast<llvm::Function>(nv.Primary));
+                if (resolved != nullptr && !resolved->IsMethod)
+                {
+                    const std::string& memberName = identifier->getText();
+                    const std::string staticMemberName = structName + "." + memberName;
+                    auto staticMembers = compiler->functionTable.find(staticMemberName);
+                    const bool hasStaticMember = staticMembers != compiler->functionTable.end()
+                        && std::any_of(staticMembers->second.begin(), staticMembers->second.end(),
+                            [](const auto& symbol) { return !symbol.IsMethod; });
+                    if (hasStaticMember && field.IsFunctionPointer)
+                    {
+                        nv.Primary = compiler->GetFunctionForFuncPtr(staticMemberName,
+                            static_cast<int>(field.FuncPtrParams.size()), &field.FuncPtrParams,
+                            &field, /*compareReturnOwnership*/ true);
+                        nv.CallerName = staticMemberName;
+                    }
+                    else
+                    {
+                        bool memberMethodFound = false;
+                        for (const auto& [_, overloads] : compiler->functionTable)
+                            for (const auto& symbol : overloads)
+                                if (symbol.IsMethod && symbol.SourceName == memberName
+                                    && !symbol.Parameters.empty()
+                                    && symbol.Parameters.front().TypeName == structName
+                                    && symbol.Parameters.front().Pointer)
+                                {
+                                    memberMethodFound = true;
+                                    break;
+                                }
+                        if (memberMethodFound)
+                            LogErrorContext(ae,
+                                "reference to non-static member function must be called");
+                    }
+                }
+            }
+        BindNamedFunctionToFuncPtrSlot(compiler, nv, field, ae);
         if (field.IsFunctionPointer)
             if (auto* namedFunction = llvm::dyn_cast_or_null<llvm::Function>(nv.Primary))
             {
@@ -27366,7 +27466,8 @@ void MainListener::EmitFieldInitializer(
                 && llvm::isa_and_nonnull<llvm::Function>(rightNV.Primary) && !rightNV.CallerName.empty())
             {
                 if (auto* correctFn = compiler->GetFunctionForFuncPtr(rightNV.CallerName,
-                        (int)initField->FuncPtrParams.size(), &initField->FuncPtrParams, initField))
+                        (int)initField->FuncPtrParams.size(), &initField->FuncPtrParams,
+                        initField, /*compareReturnOwnership*/ true))
                     rightNV.Primary = correctFn;
             }
             // Variadic-ness and the bind rule are part of a function-pointer field's type, as for a declaration.
@@ -27811,6 +27912,7 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                 else
                     nv = ParseAssignmentExpressionNamed(assignment);
             }
+            BindNamedFunctionToFuncPtrSlot(compiler, nv, fixedElemTV, assignment);
             if (std::string why = compiler->FuncPtrValueOwnershipReason(nv, fixedElemTV); !why.empty())
                 LogErrorContext(assignment, std::format(
                     "incompatible function pointer initializer: {}", why));
@@ -28263,7 +28365,7 @@ void MainListener::EmitGlobalFixedArrayInit(
         CFlatParser::InitializerListContext* initList,
         bool positionalArray,
         CFlatParser::DirectDeclaratorContext* direct,
-        antlr4::ParserRuleContext* errCtx) {
+        antlr4::ParserRuleContext* errCtx, bool threadLocal) {
         auto* compiler = Compiler(errCtx);
         if (RejectNestedNamedBraceInitializer(initList,
                 "nested named brace initializer is not supported in global fixed-array elements")) return;
@@ -28433,14 +28535,28 @@ void MainListener::EmitGlobalFixedArrayInit(
             return;
         }
 
-        auto* globalArr = compiler->CreateGlobalVariable(tv, arrConst);
+        auto* globalArr = compiler->CreateGlobalVariable(tv, arrConst, threadLocal);
         const size_t pendingConstructionsBefore = pendingGlobalDefaultConstructions_.size()
             + pendingGlobalCxxConstructions_.size();
+        // `S*[2] a = {&tls, ...}`: a thread_local address is per thread, so the array starts zero and
+        // the value is stored at its turn in the ordered (module or per-thread) initializer.
+        if (globalArr != nullptr && !globalArr->isDeclaration() && globalArr->hasInitializer()
+            && ConstantNamesThreadLocal(globalArr->getInitializer()))
+        {
+            llvm::Constant* value = globalArr->getInitializer();
+            globalArr->setInitializer(llvm::Constant::getNullValue(globalArr->getValueType()));
+            LLVMBackend::DeclTypeAndValue declTv;
+            static_cast<LLVMBackend::TypeAndValue&>(declTv) = tv;
+            declTv.threadLocal = threadLocal;
+            QueuePendingGlobalConstruction(pendingGlobalCxxConstructions_, {globalArr, declTv, direct});
+            pendingGlobalCxxConstructions_.back().StoreValue = value;
+        }
         // Every element is value-initialized at startup (a zero constant is only the storage).
         if (cxxEmptyBraceElems && globalArr != nullptr)
         {
             LLVMBackend::DeclTypeAndValue declTv;
             static_cast<LLVMBackend::TypeAndValue&>(declTv) = tv;
+            declTv.threadLocal = threadLocal;
             QueuePendingGlobalConstruction(pendingGlobalCxxConstructions_, {globalArr, declTv, direct, false, true, true});
         }
         // A native struct with a default (field defaults or a CFlat constructor): `T[N] g = {};`
@@ -28451,6 +28567,7 @@ void MainListener::EmitGlobalFixedArrayInit(
         {
             LLVMBackend::DeclTypeAndValue declTv;
             static_cast<LLVMBackend::TypeAndValue&>(declTv) = tv;
+            declTv.threadLocal = threadLocal;
             QueuePendingGlobalConstruction(pendingGlobalDefaultConstructions_, {globalArr, declTv, direct});
         }
 
@@ -28900,6 +29017,7 @@ void MainListener::EmitArrayViewInferredInit(
                 DeclExpectedTypeScope elementExpectedScope(&declExpectedType, elemTV, true);
                 nv = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
             }
+            BindNamedFunctionToFuncPtrSlot(compiler, nv, elemTV, fi);
             if (std::string why = compiler->FuncPtrValueOwnershipReason(nv, elemTV); !why.empty())
                 LogErrorContext(fi, std::format(
                     "incompatible function pointer initializer: {}", why));

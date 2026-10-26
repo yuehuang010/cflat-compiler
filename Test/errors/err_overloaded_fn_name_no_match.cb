@@ -6,6 +6,36 @@ void n65TakeDouble(function<void(double)> callback) {}
 void n65TakeVoidPointer(function<void(void*)> callback) {}
 int n65DerefOverload(int value) { return value; }
 int n65DerefOverload(double value) { return 50; }
+int n65AutoOverload(int value) { return value; }
+int n65AutoOverload(float value) { return (int)value; }
+
+expect_error("no overload of 'n65NoMatch' matches function type 'void(double)'") {
+    struct N65FieldNoMatch { function<void(double)> callback = n65NoMatch; };
+}
+
+expect_error("cannot deduce 'auto' from overloaded function name") {
+    T t514R2AutoMixed<T>(T value) { return value; }
+    int t514R2AutoMixed(int* value) { return *value + 1; }
+    void t514R2AutoMixedUse() { int value = 40; auto callback = t514R2AutoMixed; }
+}
+
+expect_error("reference to non-static member function must be called") {
+    int t514R2Hidden(int value) { return value + 1; }
+    struct T514R2MethodHidesFree {
+        int t514R2Hidden(int value) { return value + 2; }
+        function<int(int)> callback = t514R2Hidden;
+    };
+}
+
+expect_error("cannot deduce 'auto' from uninstantiated generic function") {
+    T t514R2Uninstantiated<T>(T value) { return value; }
+    void t514R2UninstantiatedUse() { auto callback = t514R2Uninstantiated; }
+}
+
+expect_error("auto is not supported for file-scope variables") {
+    int t514R2FileFunction(int value) { return value + 1; }
+    auto t514R2FileAuto = t514R2FileFunction;
+}
 
 extern int main()
 {
@@ -17,6 +47,13 @@ extern int main()
     }
     expect_error("reference to overloaded function could not be resolved") {
         int value = (*n65DerefOverload)(2);
+    }
+    expect_error("cannot deduce 'auto' from overloaded function name") {
+        auto callback = n65AutoOverload;
+        int value = callback(2);
+    }
+    expect_error("no overload of 'n65NoMatch' matches function type 'void(double)'") {
+        function<void(double)>[] callbacks = { n65NoMatch };
     }
     return 0;
 }

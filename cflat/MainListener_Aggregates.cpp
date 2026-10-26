@@ -2347,6 +2347,29 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             // T407: a by-value ctor result is copied out of the ctor's frame (decided at module end).
             if (!isUnion && !sretCtor)
                 compiler->NoteThisClosureCopySite(structName, LLVMBackend::ThisClosureCopyKind::CtorReturn);
+            // A field default naming a member (field or method) runs against the object under
+            // construction, so that default is built in place below.
+            bool usesImplicitMember = false;
+            auto namesMember = [&](const std::string& memberName) {
+                const bool fieldName = std::any_of(declList.begin(), declList.end(),
+                    [&](const auto& field) { return field.VariableName == memberName; });
+                const bool methodName = std::any_of(functionList.begin(),
+                    functionList.end(), [&](auto* function) {
+                        return getFunctionName(function) == memberName;
+                    });
+                return fieldName || methodName;
+            };
+            // A brace default ('P p { v = a }', 'int b { rd() }') names members the same way.
+            for (const auto& typeValue : declList)
+            {
+                if (typeValue.Initializer != nullptr
+                    && typeValue.Initializer->assignmentExpression() != nullptr)
+                    usesImplicitMember = usesImplicitMember || FieldDefaultNamesMember(
+                        typeValue.Initializer->assignmentExpression(), namesMember);
+                usesImplicitMember = usesImplicitMember || FieldDefaultNamesMember(
+                    FieldDefaultBraceList(typeValue), namesMember);
+            }
+
             if (isUnion)
             {
                 EmitUnionDefaultConstructorBody(ctx, structName, structType, declList);
@@ -2363,15 +2386,12 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             }
             else
             {
-                std::vector<llvm::Value*> initializers;
-                std::vector<char> initializerUnsigned;
-                // A field initializer that unwinds destroys the fields already built.
-                LLVMBackend::UnwindPartialScope partialFields(*compiler);
-                for (auto& typeValue : declList)
-                {
+                // Field default computation and conversion, shared by both paths below.
+                auto computeFieldDefault = [&](size_t fieldIndex, bool& fieldSrcUnsigned) {
+                    auto& typeValue = declList[fieldIndex];
                     auto initializer = typeValue.Initializer;
                     llvm::Value* rvalue = nullptr;
-                    bool fieldSrcUnsigned = false;
+                    fieldSrcUnsigned = false;
                     auto* braceList = FieldDefaultBraceList(typeValue);
                     if (braceList != nullptr || FieldHasEmptyCxxBraceInitializer(typeValue))
                     {
@@ -2429,36 +2449,24 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                             rvalue = GenerateDefaultValue(typeValue);
                         }
                     }
-                    initializers.push_back(rvalue);
-                    initializerUnsigned.push_back(fieldSrcUnsigned ? 1 : 0);
                     compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Value,
                                                 rvalue, typeValue.TypeName);
-                }
-
-                // Seed with zero (not undef) so fields lacking an explicit initializer read as
-                // 0/null after `= default` / `= {}` instead of leaking stack garbage. Fields that
-                // do have an initializer are overwritten by CreateInsertValue below, so a
-                // fully-initialized struct optimizes to the same IR as the old undef seed.
-                llvm::Value* structVal = llvm::Constant::getNullValue(structType);
-
-                LLVMBackend::TypeAndValue myStruct;
-                myStruct.TypeName = structName;
-                myStruct.VariableName = "_" + structName;
-
-                unsigned int structIndex = 0;
-
-                for (auto rvalue : initializers)
-                {
+                    return rvalue;
+                };
+                // Resolves one field's value to its declared type; nullptr leaves the field zero.
+                auto resolveFieldValue = [&](size_t fieldIndex, llvm::Value* rvalue,
+                                             bool fieldSrcUnsigned) -> llvm::Value* {
+                    auto& typeValue = declList[fieldIndex];
                     llvm::Value* const firstPassValue = rvalue;
-                    auto* destType = structType->getTypeAtIndex(structIndex);
+                    auto* destType = structType->getTypeAtIndex((unsigned)fieldIndex);
                     // No explicit initializer on a struct-typed field - call its default ctor.
                     if (rvalue == nullptr && (destType->isStructTy() || destType->isArrayTy()))
                     {
-                        std::string fieldTypeName = declList[structIndex].TypeName;
+                        std::string fieldTypeName = typeValue.TypeName;
                         // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
                         // here would call a same-named sibling type's ctor (layer 3).
                         if (destType->isArrayTy())
-                            rvalue = GenerateDefaultValue(declList[structIndex]);
+                            rvalue = GenerateDefaultValue(typeValue);
                         else if (compiler->GetFunction(fieldTypeName))
                             rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
                         else
@@ -2466,55 +2474,108 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     }
                     // Synthesized bitfield storage slot: always zero so packed
                     // bitfields read as 0 after `S s = default;`.
-                    if (rvalue == nullptr && declList[structIndex].IsBitfieldStorage)
+                    if (rvalue == nullptr && typeValue.IsBitfieldStorage)
                     {
                         rvalue = llvm::Constant::getNullValue(destType);
                     }
-                    if (rvalue != nullptr)
+                    if (rvalue == nullptr)
+                        return nullptr;
+                    rvalue = compiler->Upconvert(rvalue, destType, fieldSrcUnsigned);
+                    if (rvalue->getType() != destType)
                     {
-                        rvalue = compiler->Upconvert(rvalue, destType,
-                            structIndex < initializerUnsigned.size() && initializerUnsigned[structIndex] != 0);
-                        if (rvalue->getType() != destType)
+                        if (destType->isStructTy())
                         {
-                            if (destType->isStructTy())
-                            {
-                                // Initializer type doesn't match struct field type (e.g. integer 0 used for
-                                // a struct-typed generic field).  Call the field's default constructor when
-                                // one is available; otherwise zero-initialize the aggregate.
-                                std::string fieldTypeName = declList[structIndex].TypeName;
-                                // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
-                                // here would call a same-named sibling type's ctor (layer 3).
-                                if (compiler->GetFunction(fieldTypeName))
-                                    rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
-                                else
-                                    rvalue = llvm::Constant::getNullValue(destType);
-                            }
+                            // Initializer type doesn't match struct field type (e.g. integer 0 used for
+                            // a struct-typed generic field).  Call the field's default constructor when
+                            // one is available; otherwise zero-initialize the aggregate.
+                            std::string fieldTypeName = typeValue.TypeName;
+                            // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
+                            // here would call a same-named sibling type's ctor (layer 3).
+                            if (compiler->GetFunction(fieldTypeName))
+                                rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
                             else
-                            {
-                                // Narrowing field initializer (e.g. u8 r = 255 has i32 literal).
-                compiler->RefuseImplicitFloatToInt(rvalue, destType, declList[structIndex].IsUnsignedInteger() != -1);
-                if (ShouldWarnImplicitFieldNarrowing(
-                                        rvalue, destType, declList[structIndex].TypeName))
-                                    compiler->LogWarning(std::format(
-                                        "implicit narrowing to '{}' in field '{}' - use an explicit cast",
-                                        SpellType(*compiler, declList[structIndex]),
-                                        declList[structIndex].VariableName));
-                                rvalue = compiler->CreateCast(rvalue, destType, false,
-                                    declList[structIndex].IsUnsignedInteger() != -1);
-                            }
+                                rvalue = llvm::Constant::getNullValue(destType);
                         }
-                        structVal = compiler->CreateInsertValue(structVal, rvalue, structIndex);
-                        if (rvalue != firstPassValue)
-                            compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Value,
-                                                        rvalue, declList[structIndex].TypeName);
+                        else
+                        {
+                            // Narrowing field initializer (e.g. u8 r = 255 has i32 literal).
+                            compiler->RefuseImplicitFloatToInt(rvalue, destType, typeValue.IsUnsignedInteger() != -1);
+                            if (ShouldWarnImplicitFieldNarrowing(
+                                    rvalue, destType, typeValue.TypeName))
+                                compiler->LogWarning(std::format(
+                                    "implicit narrowing to '{}' in field '{}' - use an explicit cast",
+                                    SpellType(*compiler, typeValue),
+                                    typeValue.VariableName));
+                            rvalue = compiler->CreateCast(rvalue, destType, false,
+                                typeValue.IsUnsignedInteger() != -1);
+                        }
+                    }
+                    if (rvalue != firstPassValue)
+                        compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Value,
+                                                    rvalue, typeValue.TypeName);
+                    return rvalue;
+                };
+
+                // A field initializer that unwinds destroys the fields already built.
+                LLVMBackend::UnwindPartialScope partialFields(*compiler);
+                if (usesImplicitMember)
+                {
+                    // A default naming a member runs against the object under construction, as an
+                    // explicit ctor does: each field is stored in declaration order, so later
+                    // defaults and methods see earlier fields and writes through `this` persist.
+                    llvm::Value* fieldDefaultsThis = compiler->AllocaAtEntry(
+                        structType, nullptr, structName + "__field_defaults");
+                    compiler->builder->CreateStore(llvm::Constant::getNullValue(structType),
+                                                   fieldDefaultsThis);
+                    LLVMBackend::TypeAndValue thisTv;
+                    thisTv.TypeName = structName;
+                    thisTv.VariableName = structName + "__";
+                    thisTv.Pointer = true;
+                    compiler->RegisterThisPointer(thisTv, fieldDefaultsThis, structType);
+                    for (size_t fieldIndex = 0; fieldIndex < declList.size(); ++fieldIndex)
+                    {
+                        bool fieldSrcUnsigned = false;
+                        llvm::Value* rvalue = computeFieldDefault(fieldIndex, fieldSrcUnsigned);
+                        rvalue = resolveFieldValue(fieldIndex, rvalue, fieldSrcUnsigned);
+                        if (rvalue != nullptr)
+                            compiler->builder->CreateStore(rvalue,
+                                compiler->builder->CreateStructGEP(structType, fieldDefaultsThis,
+                                                                   (unsigned)fieldIndex));
+                    }
+                    partialFields.Release();
+
+                    // close constructor.
+                    compiler->CreateReturnCall(
+                        compiler->builder->CreateLoad(structType, fieldDefaultsThis));
+                }
+                else
+                {
+                    std::vector<llvm::Value*> initializers;
+                    std::vector<char> initializerUnsigned;
+                    for (size_t fieldIndex = 0; fieldIndex < declList.size(); ++fieldIndex)
+                    {
+                        bool fieldSrcUnsigned = false;
+                        initializers.push_back(computeFieldDefault(fieldIndex, fieldSrcUnsigned));
+                        initializerUnsigned.push_back(fieldSrcUnsigned ? 1 : 0);
                     }
 
-                    structIndex++;
-                }
-                partialFields.Release();
+                    // Seed with zero (not undef) so fields lacking an explicit initializer read as
+                    // 0/null after `= default` / `= {}` instead of leaking stack garbage. Fields that
+                    // do have an initializer are overwritten by CreateInsertValue below, so a
+                    // fully-initialized struct optimizes to the same IR as the old undef seed.
+                    llvm::Value* structVal = llvm::Constant::getNullValue(structType);
+                    for (size_t fieldIndex = 0; fieldIndex < initializers.size(); ++fieldIndex)
+                    {
+                        llvm::Value* rvalue = resolveFieldValue(fieldIndex, initializers[fieldIndex],
+                            initializerUnsigned[fieldIndex] != 0);
+                        if (rvalue != nullptr)
+                            structVal = compiler->CreateInsertValue(structVal, rvalue, (unsigned)fieldIndex);
+                    }
+                    partialFields.Release();
 
-                // close constructor.
-                compiler->CreateReturnCall(structVal);
+                    // close constructor.
+                    compiler->CreateReturnCall(structVal);
+                }
             }
 
             // Pop the stack
@@ -6167,6 +6228,13 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
         else
             thisAlloca = compiler->AllocaAtEntry(structLLVMType, nullptr, structName + "__");
 
+        // Field defaults run inside this constructor and use the object under construction as this.
+        LLVMBackend::TypeAndValue thisTv;
+        thisTv.TypeName = structName;
+        thisTv.VariableName = structName + "__";
+        thisTv.Pointer = true;
+        compiler->RegisterThisPointer(thisTv, thisAlloca, structLLVMType);
+
         // An unwind out of a field initializer destroys the fields already built; one out of
         // the body destroys every member but never runs the user ~T (construction never ended).
         LLVMBackend::UnwindPartialScope partialCtor(*compiler);
@@ -6397,13 +6465,6 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
         partialCtor.Release();
         compiler->NoteUnwindPartial(LLVMBackend::UnwindPartialEntry::Kind::Members, thisAlloca,
                                     structName);
-
-        // Register the alloca as the implicit 'this' pointer so member field access works
-        LLVMBackend::TypeAndValue thisTv;
-        thisTv.TypeName = structName;
-        thisTv.VariableName = structName + "__";
-        thisTv.Pointer = true;
-        compiler->RegisterThisPointer(thisTv, thisAlloca, structLLVMType);
 
         // Parse user-written constructor body; its own const fields are still being built.
         {

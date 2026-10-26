@@ -18516,7 +18516,9 @@ void t485AliasPtrMinusArrow() { for (int i = 0; i < 10; i = i + 1) { T485S s; T4
 int gT498Dtors = 0;
 int gT498Q = 0;
 int* gT498Saved = nullptr;
-struct T498Res { int v = 6; int[2] values; int* heap = nullptr; T498Res() { values[0] = 6; values[1] = 7; heap = &values[0]; } ~T498Res() { gT498Dtors = gT498Dtors + 1; values[0] = -999; values[1] = -999; v = -999; } };
+// heap points into a global pool, not the object itself (see T510Res).
+int[4096] gT498Pool; int gT498PoolNext = 0;
+struct T498Res { int v = 6; int* heap = nullptr; T498Res() { heap = &gT498Pool[gT498PoolNext]; gT498PoolNext = (gT498PoolNext + 2) % 4096; heap[0] = 6; heap[1] = 7; } ~T498Res() { gT498Dtors = gT498Dtors + 1; heap[0] = -999; heap[1] = -999; v = -999; } };
 unique<T498Res> t498Mk() { return unique<T498Res>(new T498Res()); }
 int* t498Store3(int* p) { gT498Saved = p; return p; }
 int* t498StoreSecond(int* a, int* p) { gT498Saved = p; return p; }
@@ -18534,7 +18536,9 @@ int t498SavedValueIfLive() { if (gT498Dtors != 0 || gT498Saved == nullptr) retur
 int gT510Dtors = 0;
 int gT510Global = 50;
 int* gT510Saved = nullptr;
-struct T510Res { int[2] values; int* heap = nullptr; T510Res() { values[0] = 7; values[1] = 8; heap = &values[0]; } ~T510Res() { gT510Dtors = gT510Dtors + 1; values[0] = -999; values[1] = -999; } };
+// heap points into a global pool, not the object itself: `new T()` copies a constructed value (self-pointer p3 ruling).
+int[4096] gT510Pool; int gT510PoolNext = 0;
+struct T510Res { int* heap = nullptr; T510Res() { heap = &gT510Pool[gT510PoolNext]; gT510PoolNext = (gT510PoolNext + 2) % 4096; heap[0] = 7; heap[1] = 8; } ~T510Res() { gT510Dtors = gT510Dtors + 1; heap[0] = -999; heap[1] = -999; } };
 unique<T510Res> t510Mk() { return unique<T510Res>(new T510Res()); }
 T510Res t510Mk2() { return T510Res(); }
 int* t510Echo(int* p) { return p; }
@@ -18613,8 +18617,8 @@ void t510R9Cp(T510R6Box* s) { s->r = s->q; }
 int t510R9CopyHelper(int* p) { T510R6Box s; s.q = p; t510R9Cp(&s); return *s.r; }
 int t510R9LocalList(int* p) { list<int*> l; l.add(p); return *l[0]; }
 int t510R9HeapBox(int* p) { T510R6Box* b = new T510R6Box(); b->q = p; int r = *b->q; delete b; return r; }
-long gT510R9Bits = 0;
-int t510R9Bits(int* p) { gT510R9Bits = (long)p; return *p; }
+i64 gT510R9Bits = 0;
+int t510R9Bits(int* p) { gT510R9Bits = (i64)p; return *p; }
 struct T510R9Outer { T510R6Own hh = default; };
 T510R9Outer t510R9MkOuter() { T510R9Outer o; return o; }
 struct T510R9Arr { int*[2] arr = default; T510R9Arr() { arr[0] = new int(7); arr[1] = nullptr; } ~T510R9Arr() { gT510Dtors = gT510Dtors + 1; delete arr[0]; } };
@@ -18813,8 +18817,8 @@ int gT509SibDtors = 0;
 int* gT509SibPtr = nullptr;
 struct T509SibB { int[4] buf; int* p = nullptr; T509SibB() { buf[0] = 5; p = &buf[0]; } ~T509SibB() { gT509SibDtors = gT509SibDtors + 1; } };
 unique<T509SibB> t509MkSib() { return unique<T509SibB>(new T509SibB()); }
-void t509SibStore(int* p, long n) { gT509SibPtr = p; }
-struct T509SibHolder { int* q = nullptr; long keep(int* p, long n) { q = p; return n; } };
+void t509SibStore(int* p, i64 n) { gT509SibPtr = p; }
+struct T509SibHolder { int* q = nullptr; long keep(int* p, i64 n) { q = p; return (long)n; } };
 unique<T506Res> t509Wrap(int* p)
 {
     if (p != nullptr) gT509WrapSeen = *p;
@@ -18826,9 +18830,9 @@ int t506Read(int* p) { return *p; }
 int t506Outer(int x) { return x; }
 int* t509Borrow(int* p) { return p; }
 long gT509StoredDiff = 0;
-long t509Outer(long value) { return value; }
-void t509StoreLong(long value) { gT509StoredDiff = value; }
-long t509Twice(long value) { return value * 2; }
+long t509Outer(i64 value) { return (long)value; }
+void t509StoreLong(i64 value) { gT509StoredDiff = (long)value; }
+long t509Twice(i64 value) { return (long)(value * 2); }
 
 int testArrowOwnedTempMember()
 {

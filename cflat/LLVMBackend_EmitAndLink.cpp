@@ -10,6 +10,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/StructuralHash.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/ADT/SetVector.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/Bitcode/BitcodeReader.h>
@@ -2690,6 +2691,66 @@ void LLVMBackend::AdoptCxxCompanionBitcode(const std::string& bitcode,
  *      before the importing module's, declaration order within a module).
  * After this the array has a single element, so how the loader walks it no longer matters.
  */
+/*
+ * A 'thread_local' whose default does not fold names its module's ordered, guarded
+ * '__cflat_tls_init' in 'cflat.tls_init' metadata (MainListener::EmitPendingGlobalCxxConstructions).
+ * Every use of the global calls it first, so each thread builds the module's thread_locals in
+ * declaration order before its first access (C++ dynamic TLS init).
+ */
+void LLVMBackend::InsertThreadLocalLazyInits()
+{
+    std::vector<std::pair<llvm::GlobalVariable*, llvm::Function*>> lazy;
+    for (auto& global : module->globals())
+        if (auto* node = global.getMetadata("cflat.tls_init"); node != nullptr
+            && global.isThreadLocal() && node->getNumOperands() == 1)
+            if (auto* value = llvm::dyn_cast_or_null<llvm::ValueAsMetadata>(node->getOperand(0)))
+                if (auto* initFn = llvm::dyn_cast<llvm::Function>(value->getValue());
+                    initFn != nullptr && !initFn->isDeclaration())
+                    lazy.emplace_back(&global, initFn);
+    for (auto [global, initFn] : lazy)
+    {
+        llvm::SmallSetVector<llvm::Instruction*, 16> users;
+        llvm::SmallPtrSet<llvm::User*, 32> seen;
+        llvm::SmallVector<llvm::User*, 16> work(global->user_begin(), global->user_end());
+        while (!work.empty())
+        {
+            auto* user = work.pop_back_val();
+            if (!seen.insert(user).second) continue;
+            if (auto* inst = llvm::dyn_cast<llvm::Instruction>(user))
+                users.insert(inst);
+            else if (llvm::isa<llvm::Constant>(user) && !llvm::isa<llvm::GlobalValue>(user))
+                work.append(user->user_begin(), user->user_end());
+        }
+        for (auto* inst : users)
+        {
+            auto* function = inst->getFunction();
+            if (function == initFn || function->isDeclaration()) continue;
+            // Before the use itself, like clang's per-access TLS wrapper; a PHI's use sits on its edge.
+            llvm::SmallVector<llvm::Instruction*, 2> points;
+            if (auto* phi = llvm::dyn_cast<llvm::PHINode>(inst))
+            {
+                for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i)
+                    if (auto* incoming = phi->getIncomingValue(i); incoming == global
+                        || (llvm::isa<llvm::ConstantExpr>(incoming)
+                            && seen.count(llvm::cast<llvm::User>(incoming))))
+                        points.push_back(phi->getIncomingBlock(i)->getTerminator());
+            }
+            else
+                points.push_back(inst);
+            for (auto* point : points)
+            {
+                llvm::IRBuilder<> call(point);
+                if (auto* subprogram = function->getSubprogram())
+                    call.SetCurrentDebugLocation(point->getDebugLoc()
+                        ? point->getDebugLoc()
+                        : llvm::DebugLoc(llvm::DILocation::get(*context, subprogram->getLine(), 0,
+                            subprogram)));
+                call.CreateCall(initFn->getFunctionType(), initFn);
+            }
+        }
+    }
+}
+
 void LLVMBackend::FinalizeGlobalConstructorOrder()
 {
     auto* ctorsVar = module->getGlobalVariable("llvm.global_ctors");

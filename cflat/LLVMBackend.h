@@ -4391,6 +4391,8 @@ public:
      */
     std::vector<llvm::Function*> cflatGlobalCxxInitFns_;
     void FinalizeGlobalConstructorOrder();
+    // Calls each per-thread lazy initializer before every use of its global.
+    void InsertThreadLocalLazyInits();
     // Ownership control-frame kinds (EnterOwnershipControlRegion / ReanchorOwnFlagJoinsOutOf).
     static constexpr uint8_t OwnFlagLoopFrame = 1;
     static constexpr uint8_t OwnFlagSwitchFrame = 2;
@@ -5943,6 +5945,7 @@ private:
     // cflat-level facts about an emitted function, by llvm::Function identity. A miss answers the
     // conservative way for its caller (not owning / not `move`).
     const FunctionSymbol* FindSymbolForFunction(const llvm::Function* fn) const;
+    bool HasOverloadSetForFunction(const llvm::Function* fn) const;
     bool IsRegisteredClosureCopyFunction(const llvm::Function* fn) const;
 
     bool CalleeReturnsOwned(const llvm::Function* fn) const;
@@ -8345,6 +8348,8 @@ public:
     // Creates __shim_<name>(original params..., i8* env) that ignores env and calls original.
     // Env-last ABI makes this bitcast-compatible with a bare C function pointer.
     llvm::Function* GetOrCreateFunctionShim(llvm::Function* original);
+    llvm::Function* GetOrCreateThinCallableAdapter(llvm::Function* target,
+        const TypeAndValue& slotSig, size_t targetParamCount, bool targetHasEnv);
 
     // Wraps a bare C function pointer as a closure {thunk, env=cfnptr}. The env slot carries
     // the real C fn ptr; the thunk reads env back, bitcasts to C signature, and tail-calls through it.
@@ -11607,13 +11612,13 @@ public:
     // The reason half of the bind rule above, without the subject. Empty when fn can bind dest.
     std::string FuncPtrBindReason(const LLVMBackend::TypeAndValue& fn,
         const LLVMBackend::TypeAndValue& dest, bool compareReturnOwnership = false) const;
-    // T287: the ownership half of the bind rule for a function-pointer VALUE (lambda literal, variable)
-    // crossing a declared slot: owning return into a borrowed return, and each parameter's 'move'.
+    // T287/T514: check both pointer return-ownership directions and each parameter's 'move'
+    // modifier when a function-pointer VALUE crosses a strict slot.
     // Empty when they agree. Shared by the declarator, assignment and call-argument paths.
     std::string FuncPtrValueOwnershipReason(const LLVMBackend::TypeAndValue& source,
-        const LLVMBackend::TypeAndValue& slot);
+        const LLVMBackend::TypeAndValue& slot, bool compareReturnOwnership = true);
     std::string FuncPtrValueOwnershipReason(const LLVMBackend::NamedVariable& source,
-        const LLVMBackend::TypeAndValue& slot);
+        const LLVMBackend::TypeAndValue& slot, bool compareReturnOwnership = true);
 
     /*
      * Value-site check (declaration initializer, assignment, return, brace/field initializer): the

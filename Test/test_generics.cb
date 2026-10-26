@@ -1967,6 +1967,130 @@ bool testGenericInstanceMethods()
     return result;
 }
 
+int t517ScopeFreeHit = 0;
+void t517ScopeInner<T>(T value) { t517ScopeFreeHit = (int)value + 1000; }
+void t517ScopeOuter<T>(T value) { t517ScopeInner<T>(value); }
+
+struct T517GenericStructOwner<C>
+{
+    C marker = default;
+    int hit = 0;
+    void t517StructInner<U>(U value) { hit = (int)value + 100; }
+    void t517ScopeInner<U>(U value) { hit = (int)value + 100; }
+    void outerUnique<U>(U value) { t517StructInner<U>(value); }
+    void outerCollision<U>(U value) { t517ScopeInner<U>(value); }
+    void outerThis<U>(U value) { this->t517ScopeInner<U>(value); }
+};
+
+class T517GenericClassOwner<C>
+{
+    C marker = default;
+    int hit = 0;
+    void t517ClassInner<U>(U value) { hit = (int)value + 100; }
+    void t517ScopeInner<U>(U value) { hit = (int)value + 100; }
+    void outerUnique<U>(U value) { t517ClassInner<U>(value); }
+    void outerCollision<U>(U value) { t517ScopeInner<U>(value); }
+    void outerThis<U>(U value) { this->t517ScopeInner<U>(value); }
+    int result() { return hit; }
+};
+
+class T517PlainClassOwner
+{
+    int hit = 0;
+    void t517PlainInner<U>(U value) { hit = (int)value + 100; }
+    void outer<U>(U value) { t517PlainInner<U>(value); }
+    int result() { return hit; }
+};
+
+int t517StaticOwnerHit = 0;
+class T517StaticGenericOwner<C>
+{
+    static void t517ScopeInner<U>(U value) { t517StaticOwnerHit = (int)value + 100; }
+    void outer<U>(U value) { t517ScopeInner<U>(value); }
+    static void outerStatic<U>(U value) { t517ScopeInner<U>(value); }
+};
+
+int t517LambdaFreeHit = 0;
+void t517LambdaInner<T>(T value) { t517LambdaFreeHit = (int)value + 1000; }
+class T517LambdaOwner<C>
+{
+    int hit = 0;
+    void t517LambdaInner<U>(U value) { hit = (int)value + 100; }
+    void outer<U>(U value)
+    {
+        auto call = (int x) => { t517LambdaInner<U>(x); };
+        call((int)value);
+    }
+    int result() { return hit; }
+};
+
+int t517GlobalShadowName = 0;
+class T517GlobalVarOwner<C>
+{
+    int hit = 0;
+    void t517GlobalShadowName<U>(U value) { hit = (int)value + 100; }
+    void outer<U>(U value) { t517GlobalShadowName<U>(value); }
+    int result() { return hit; }
+};
+
+bool testT517BareGenericMethodScope()
+{
+    bool result = true;
+    t517ScopeFreeHit = 0;
+
+    T517GenericStructOwner<int> structUnique = default;
+    structUnique.outerUnique<int>(4);
+    result &= Test("T517 generic struct bare unique method", structUnique.hit, 104);
+
+    T517GenericStructOwner<int> structCollision = default;
+    structCollision.outerCollision<int>(4);
+    result &= Test("T517 generic struct bare method wins", structCollision.hit, 104);
+    result &= Test("T517 generic struct hides free generic", t517ScopeFreeHit, 0);
+    structCollision.outerThis<int>(5);
+    result &= Test("T517 generic struct explicit this", structCollision.hit, 105);
+
+    T517GenericClassOwner<int> classUnique = default;
+    classUnique.outerUnique<int>(4);
+    result &= Test("T517 generic class bare unique method", classUnique.result(), 104);
+
+    T517GenericClassOwner<int> classCollision = default;
+    classCollision.outerCollision<int>(4);
+    result &= Test("T517 generic class bare method wins", classCollision.result(), 104);
+    result &= Test("T517 generic class hides free generic", t517ScopeFreeHit, 0);
+    classCollision.outerThis<int>(5);
+    result &= Test("T517 generic class explicit this", classCollision.result(), 105);
+
+    T517PlainClassOwner plain = default;
+    plain.outer<int>(6);
+    result &= Test("T517 plain class generic method", plain.result(), 106);
+
+    T517StaticGenericOwner<int> staticOwner = default;
+    t517StaticOwnerHit = 0;
+    t517ScopeFreeHit = 0;
+    staticOwner.outer<int>(4);
+    result &= Test("T517 bare static method from instance", t517StaticOwnerHit, 104);
+    result &= Test("T517 bare static method hides free generic", t517ScopeFreeHit, 0);
+    t517StaticOwnerHit = 0;
+    t517ScopeFreeHit = 0;
+    T517StaticGenericOwner<int>.outerStatic<int>(5);
+    result &= Test("T517 bare static method from static method", t517StaticOwnerHit, 105);
+    result &= Test("T517 static method hides free generic", t517ScopeFreeHit, 0);
+
+    T517LambdaOwner<int> lambdaOwner = default;
+    t517LambdaFreeHit = 0;
+    lambdaOwner.outer<int>(6);
+    result &= Test("T517 bare method inside lambda", lambdaOwner.result(), 106);
+    result &= Test("T517 lambda method hides free generic", t517LambdaFreeHit, 0);
+
+    T517GlobalVarOwner<int> globalVarOwner = default;
+    globalVarOwner.outer<int>(4);
+    result &= Test("T517 member wins over global variable", globalVarOwner.result(), 104);
+
+    t517ScopeOuter<int>(7);
+    result &= Test("T517 free generic neighbor", t517ScopeFreeHit, 1007);
+    return result;
+}
+
 // =============================================================
 // Generic type constraint tests (where T : IInterface)
 // =============================================================
@@ -6677,6 +6801,7 @@ extern int main()
     total++; passed += testTemplateFunctions()           ? 1 : 0;
     total++; passed += testNewPrimitiveInitializers()    ? 1 : 0;
     total++; passed += testGenericInstanceMethods()      ? 1 : 0;
+    total++; passed += testT517BareGenericMethodScope()   ? 1 : 0;
     total++; passed += testGenericStaticMethods()        ? 1 : 0;
     total++; passed += testBasicStructConstraint()       ? 1 : 0;
     total++; passed += testAlternativeConcreteType()     ? 1 : 0;

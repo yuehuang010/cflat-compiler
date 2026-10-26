@@ -7050,6 +7050,9 @@ private:
         // `S[N] g = default;` / `= {}` whose element fold failed at the declaration: the retry folds
         // only, and a failing retry keeps the zero constant (no runtime construction, no note).
         bool FoldOnly = false;
+        // A constant initializer naming a thread_local's address (`S* p = &s`) is not a link-time
+        // constant; the global starts zero and this value is stored at its turn in the init order.
+        llvm::Constant* StoreValue = nullptr;
         // Declaration order across BOTH queues (native and C++), so one module initializer runs
         // the constructions in the order the globals were declared.
         size_t Sequence = 0;
@@ -7060,9 +7063,16 @@ private:
     // is nontrivial: the call cannot be a constant initializer, so it runs from a module ctor.
     std::vector<PendingGlobalDefaultConstruction> pendingGlobalCxxConstructions_;
     size_t pendingGlobalSequence_ = 0;
+    // Set by GenerateDefaultValue when a file-scope struct default did not fold; the declarator
+    // reads and clears it to queue the construction for the module initializer.
+    bool globalDefaultDeferred_ = false;
+    static bool ConstantNamesThreadLocal(const llvm::Constant* constant);
     void QueuePendingGlobalConstruction(std::vector<PendingGlobalDefaultConstruction>& queue,
         PendingGlobalDefaultConstruction item);
     bool HasGlobalCxxFieldDefaultConstruction(const LLVMBackend::TypeAndValue& typeValue);
+    // True when a field default parse tree names one of the members isMember accepts.
+    static bool FieldDefaultNamesMember(antlr4::tree::ParseTree* node,
+        const std::function<bool(const std::string&)>& isMember);
     void EmitGlobalCxxFieldDefaultConstruction(llvm::Value* slot, llvm::Type* type,
         const LLVMBackend::TypeAndValue& typeValue, antlr4::ParserRuleContext* context);
 
@@ -7933,6 +7943,8 @@ private:
 
     // Constant value of a type's default construction, or nullptr when it is not constant.
     llvm::Constant* TryFoldGlobalDefaultConstruction(const LLVMBackend::DeclTypeAndValue& typeValue);
+    // True when the default construction only writes zeros (the zero image already holds it).
+    bool DefaultConstructionIsZero(const LLVMBackend::DeclTypeAndValue& typeValue);
     llvm::Constant* TryFoldGlobalDefaultConstruction(
         const LLVMBackend::DeclTypeAndValue& typeValue, FoldConstructedValueState& foldState);
     llvm::Constant* SplatConstantOverFixedArray(llvm::Constant* elemConst, llvm::Type* arrType);
@@ -10255,7 +10267,9 @@ public:
         bool lhsCxxPointeeConst = false,
         // CxxOperandObjectCv of each operand: a reference parameter is judged against the
         // operand's own cv as a call argument is. Every C++-reachable caller passes both.
-        int lhsObjectCv = 0, int rhsObjectCv = 0);
+        int lhsObjectCv = 0, int rhsObjectCv = 0,
+        // An alias-returned native struct is already an addressable receiver, not a value to copy.
+        bool lhsIsAlias = false);
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
                                                            ResultUse use = ResultUse::Value);
@@ -10522,6 +10536,9 @@ public:
      * `program` emitters (ParseProgramDefinition and ParseImportedProgramDefinition). The guard has
      * to be in all five or the same spelling survives through another declaration kind.
      */
+    void BindNamedFunctionToFuncPtrSlot(LLVMBackend* compiler,
+        LLVMBackend::NamedVariable& value, const LLVMBackend::TypeAndValue& slot,
+        antlr4::ParserRuleContext* site);
     // A scalar initializer of a C++ class field runs the converting constructor: built into
     // intoSlot when given (constructedInPlace set), else into a temporary whose value is returned.
     llvm::Value* ParseFieldDefaultInitializer(
@@ -10811,7 +10828,7 @@ public:
         CFlatParser::InitializerListContext* initList,
         bool positionalArray,
         CFlatParser::DirectDeclaratorContext* direct,
-        antlr4::ParserRuleContext* errCtx);
+        antlr4::ParserRuleContext* errCtx, bool threadLocal = false);
 
     // Fold an evaluated size expression to a compile-time unsigned integer. Handles literals,
     // loads of a global int with a constant initializer (cflat `const int N = ...`), integer

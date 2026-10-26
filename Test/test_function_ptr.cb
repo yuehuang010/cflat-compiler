@@ -5,6 +5,7 @@ import "dictionary.cb";
 import "library/c_variadic_fnptr.h";
 import "library/c_variadic_aggregate.c";
 import "library/cinterop.c";
+import "thread.cb";
 
 // ── Named functions used throughout ──────────────────────────────────────────
 
@@ -2137,6 +2138,98 @@ bool testT399CallableReturnAndFieldAcceptSet()
     return result;
 }
 
+// Slot signatures select the intended overload in fields and arrays; the decoy needs an ABI-only count.
+struct T514Pl { int value = 0; };
+int t514Select(move long* p) { return 133; }
+int t514Select(T514Pl* p) { return p->value + 1; }
+int t514AddOne(int x) { return x + 1; }
+T t514Double<T>(T x) { return x * 2; }
+namespace T514Names { int addOne(int x) { return x + 1; } }
+function<int(T514Pl*)> t514MakeSelected() { return t514Select; }
+
+struct T514DefaultField { function<int(T514Pl*)> f = t514Select; };
+struct T514DesignatedField { function<int(T514Pl*)> f; };
+
+int t514R2DtorCount = 0;
+struct T514R2Payload
+{
+    int value = 0;
+    ~T514R2Payload() { t514R2DtorCount += 1; }
+};
+T514R2Payload t514R2BorrowedGlobal;
+T514R2Payload* t514R2Borrowed(int value)
+{
+    t514R2BorrowedGlobal.value = value;
+    return &t514R2BorrowedGlobal;
+}
+move T514R2Payload* t514R2Owned(int value)
+{
+    T514R2Payload* result = new T514R2Payload();
+    result->value = value;
+    return result;
+}
+struct T514R2BorrowedField { function<T514R2Payload*(int)> f = t514R2Borrowed; };
+struct T514R2OwnedField { function<move T514R2Payload*(int)> f = t514R2Owned; };
+T t514R2Identity<T>(T value) { return value; }
+int t514R2Identity(int* value) { return 999; }
+
+bool testT514FunctionNameBindings()
+{
+    bool result = true;
+    T514Pl p = default;
+    p.value = 40;
+
+    T514DefaultField defaultField = default;
+    result &= Test("t514 overloaded field default", defaultField.f(&p), 41);
+
+    function<int(T514Pl*)>[] view = { t514Select };
+    result &= Test("t514 overloaded inferred view", view[0](&p), 41);
+
+    function<int(T514Pl*)>[1] fixed = { t514Select };
+    result &= Test("t514 overloaded fixed array", fixed[0](&p), 41);
+
+    T514DesignatedField designated = { f = t514Select };
+    result &= Test("t514 overloaded designated field", designated.f(&p), 41);
+
+    function<int(T514Pl*)> declared = t514Select;
+    result &= Test("t514 overloaded declarator", declared(&p), 41);
+
+    function<int(T514Pl*)> returned = t514MakeSelected();
+    result &= Test("t514 overloaded return", returned(&p), 41);
+
+    // Unambiguous names decay to callable auto values; the shadowing case below stays an int.
+    auto plain = t514AddOne;
+    result &= Test("t514 auto function name", plain(4), 5);
+
+    auto generic = t514Double<int>;
+    result &= Test("t514 auto generic function", generic(5), 10);
+
+    auto qualified = T514Names.addOne;
+    result &= Test("t514 auto qualified function", qualified(4), 5);
+
+    int t514AddOne = 10;
+    auto shadowed = t514AddOne;
+    result &= Test("t514 auto local shadows function", shadowed, 10);
+
+    T514R2BorrowedField borrowedField = default;
+    result &= Test("t514r2 matching borrowed return slot value", borrowedField.f(41)->value, 41);
+    function<T514R2Payload*(int)>[] borrowedView = { t514R2Borrowed };
+    result &= Test("t514r2 matching borrowed view value", borrowedView[0](42)->value, 42);
+
+    t514R2DtorCount = 0;
+    T514R2OwnedField ownedField = default;
+    T514R2Payload* owned = ownedField.f(43);
+    result &= Test("t514r2 matching owned return slot value", owned->value, 43);
+    delete owned;
+    result &= Test("t514r2 matching owned return slot dtor", t514R2DtorCount, 1);
+
+    int identityValue = 40;
+    function<int*(int*)> genericSlot = t514R2Identity;
+    result &= Test("t514r2 generic plus plain slot selects generic", genericSlot(&identityValue) == &identityValue ? 1 : 0, 1);
+
+    return result;
+}
+
 // ── Non-capturing lambda across the C ABI ────────────────────────────────────
 // A C function pointer is a bare code address with no env slot. The closure ABI is
 // env-last, so the invoker of a *non-capturing* lambda is directly callable as a
@@ -2144,6 +2237,306 @@ bool testT399CallableReturnAndFieldAcceptSet()
 // lambda or a Lambda<> variable still cannot cross the C ABI (see err_lambda_to_c_funcptr).
 
 extern void qsort(void* base, u64 num, u64 size, Lambda<int(void*, void*)> cmp);
+
+int t514R3StaticSelect(int x) { return x; }
+struct T514R3StaticFirst
+{
+    static int t514R3StaticSelect(int x) { return x + 1; }
+    function<int(int)> f = t514R3StaticSelect;
+};
+struct T514R3StaticLate
+{
+    function<int(int)> f = t514R3StaticSelect;
+    static int t514R3StaticSelect(int x) { return x + 1; }
+};
+
+int t514R3FieldSelect(int x) { return 133; }
+int t514R3FieldAddOne(int x) { return x + 1; }
+struct T514R3FieldDefault
+{
+    function<int(int)> t514R3FieldSelect = t514R3FieldAddOne;
+    function<int(int)> f = t514R3FieldSelect;
+};
+int t514R3FieldCall(int x) { return x; }
+int t514R3FieldCallAddOne(int x) { return x + 1; }
+struct T514R3FieldCallDefault
+{
+    function<int(int)> t514R3FieldCall = t514R3FieldCallAddOne;
+    int value = t514R3FieldCall(40);
+};
+
+int t514R3MethodBefore(int x) { return x; }
+struct T514R3MethodBeforeDefault
+{
+    int t514R3MethodBefore(int x) { return x + 1; }
+    int value = t514R3MethodBefore(40);
+};
+int t514R3MethodAfter(int x) { return x; }
+struct T514R3MethodAfterDefault
+{
+    int value = t514R3MethodAfter(40);
+    int t514R3MethodAfter(int x) { return x + 1; }
+};
+
+int t514R4Global = 5;
+struct T514R4Shadow
+{
+    int t514R4Global = 41;
+    int b = t514R4Global;
+};
+struct T514R4Constant
+{
+    int a = 7;
+    int b = t514R4Read();
+    int t514R4Read() { return a + 34; }
+};
+struct T514R4Writes
+{
+    int a = 0;
+    int b = t514R4Bump();
+    int t514R4Bump() { a = 5; return 1; }
+};
+struct T514R4Dtor
+{
+    int v = 7;
+    ~T514R4Dtor() { }
+};
+struct T514R4DtorField
+{
+    T514R4Dtor d;
+    int b = t514R4Read();
+    int t514R4Read() { return d.v + 34; }
+};
+struct T514R4Long
+{
+    long a = 7;
+    int b = t514R4Read();
+    int t514R4Read() { return (int)a + 34; }
+};
+struct T514R4Generic<T>
+{
+    T a = 7;
+    T b = t514R4Read();
+    T t514R4Read() { return a + 34; }
+};
+struct T514R4Outer
+{
+    T514R4Constant inner = default;
+};
+
+// r5: file-scope instances whose member defaults read other members (folding fails, so the
+// construction runs from the module initializer) and brace field defaults naming members.
+struct T514R5Pt { int v = 0; };
+struct T514R5Member
+{
+    int a = 7;
+    int b = a + 34;
+    int rd() { return a + 34; }
+    int c = rd();
+};
+struct T514R5Brace
+{
+    int a = 7;
+    T514R5Pt p { v = a + 34 };
+    T514R5Pt q { v = a + 30 + 4 };
+    int rd() { return a + 34; }
+    T514R5Pt m { v = rd() };
+};
+struct T514R5Const { int b = 41; };
+T514R5Member t514R5Global = default;
+T514R5Member t514R5GlobalBrace = {};
+T514R5Brace t514R5Field = default;
+T514R5Const t514R5ConstGlobal = default;
+T514R5Member[2] t514R5Arr = default;
+
+// r7: a thread_local whose default does not fold is constructed per thread on first use.
+struct T514R7Explicit { int a = 7; int b = a + 34; T514R7Explicit() {} };
+struct T514R7Nested { T514R7Explicit i; };
+struct T514R7FnP { function<int(int)> f; };
+struct T514R7Param { int a = 7; T514R7FnP p { f = (int a) => a + 34 }; };
+struct T514R7Local { int a = 7; T514R7FnP p { f = (int v) => { int a = v; return a + 34; } }; };
+struct T514R7Text { const char* t; };
+struct T514R7String { int a = 7; T514R7Text p { t = "a" }; };
+int t514R7Seed = 41;
+int t514R7Calls = 0;
+int t514R7Read() { t514R7Calls += 1; return t514R7Seed; }
+struct T514R7Dynamic { int b = t514R7Read(); };
+thread_local T514R5Member t514R7Member = default;
+thread_local T514R7Explicit t514R7Explicit = default;
+thread_local T514R7Nested t514R7NestedTl = default;
+thread_local T514R7Param t514R7ParamTl = default;
+thread_local T514R7Local t514R7LocalTl = default;
+thread_local T514R7String t514R7StringTl = default;
+thread_local T514R7Dynamic t514R7DynamicTl = default;
+thread_local T514R5Member[2] t514R7Arr = default;
+// r9: address arrays of a thread_local are stored at their declaration's turn - after an earlier
+// plain global, and inside the module's one per-thread guard (recursion sees the zero image).
+int t514R9Count = 0;
+int t514R9Next() { t514R9Count += 1; return t514R9Count; }
+struct T514R9Seq { int v = t514R9Next(); };
+T514R9Seq t514R9Plain = default;
+thread_local T514R9Seq t514R9Tl = default;
+T514R9Seq*[2] t514R9Addrs = {&t514R9Tl, &t514R9Tl};
+int t514R9Rd();
+struct T514R9Rec { int b = t514R9Rd(); };
+thread_local T514R9Rec t514R9RecTl = default;
+thread_local T514R9Rec*[2] t514R9RecAddrs = {&t514R9RecTl, &t514R9RecTl};
+int t514R9Rd() { return t514R9RecAddrs[0] == nullptr ? 11 : 22; }
+// r8: a module's dynamic thread_locals are built in declaration order on the first use of ANY
+// of them; a global holding a thread_local's address is stored at run time.
+int t514R8Count = 0;
+int t514R8Next() { t514R8Count += 1; return t514R8Count; }
+struct T514R8Seq { int v = t514R8Next(); };
+thread_local T514R8Seq t514R8First = default;
+thread_local T514R8Seq t514R8Second = default;
+T514R7Dynamic* t514R8Address = &t514R7DynamicTl;
+T514R7Dynamic*[2] t514R8Addresses = {&t514R7DynamicTl, &t514R7DynamicTl};
+thread_local T514R7Dynamic* t514R8TlAddress = &t514R7DynamicTl;
+thread_local int[2] t514R8TlInts = {1, 2};
+int t514R7Worker(void* p)
+{
+    int* out = (int*)p;
+    *out = t514R7Member.b + t514R7DynamicTl.b + t514R7Explicit.b;
+    if (t514R8TlAddress != &t514R7DynamicTl || t514R8TlInts[0] != 1) *out = 0;
+    t514R7Member.b = 8;
+    return 0;
+}
+
+int t514R3DtorCount = 0;
+struct T514R3Payload
+{
+    int value = 0;
+    ~T514R3Payload() { t514R3DtorCount += 1; }
+};
+move T514R3Payload* t514R3MakeOwned(int value)
+{
+    T514R3Payload* result = new T514R3Payload();
+    result->value = value;
+    return result;
+}
+move T514R3Payload* t514R3MakeOwnedZero()
+{
+    T514R3Payload* result = new T514R3Payload();
+    result->value = 41;
+    return result;
+}
+
+bool testT514R3FieldDefaultsAndOwnedSlots()
+{
+    bool result = true;
+    T514R3StaticFirst first = default;
+    result &= Test("t514r3 static member hides free function", first.f(40), 41);
+    T514R3StaticLate late = default;
+    result &= Test("t514r3 later static member hides free function", late.f(40), 41);
+
+    T514R3FieldDefault field = default;
+    result &= Test("t514r3 member function field hides free function", field.f(40), 41);
+    T514R3FieldCallDefault fieldCall = default;
+    result &= Test("t514r3 member function field call default", fieldCall.value, 41);
+    T514R3MethodBeforeDefault methodBefore = default;
+    result &= Test("t514r3 method call default before method", methodBefore.value, 41);
+    T514R3MethodAfterDefault methodAfter = default;
+    result &= Test("t514r3 method call default after method", methodAfter.value, 41);
+
+    T514R4Shadow shadow = default;
+    result &= Test("t514r4 field default reads earlier field named like a global", shadow.b, 41);
+    T514R4Constant constant = default;
+    result &= Test("t514r4 member reads constant field default", constant.b, 41);
+    T514R4Constant constantBrace = {};
+    result &= Test("t514r4 member reads constant field brace default", constantBrace.b, 41);
+    T514R4Constant* constantNew = new T514R4Constant();
+    result &= Test("t514r4 member reads constant field new default", constantNew->b, 41);
+    delete constantNew;
+    T514R4Outer outer = default;
+    result &= Test("t514r4 nested member reads constant field default", outer.inner.b, 41);
+    T514R4Writes writes = default;
+    result &= Test("t514r4 member write to earlier field persists", writes.a * 10 + writes.b, 51);
+    T514R4DtorField dtorField = default;
+    result &= Test("t514r4 member reads destructor-bearing field default", dtorField.b, 41);
+    T514R4Long longField = default;
+    result &= Test("t514r4 member reads long constant field default", longField.b, 41);
+    T514R4Generic<int> generic = default;
+    result &= Test("t514r4 generic member reads constant field default", generic.b, 41);
+
+    t514R3DtorCount = 0;
+    Lambda<move T514R3Payload*(int)> named = t514R3MakeOwned;
+    T514R3Payload* namedResult = named(41);
+    result &= Test("t514r3 named owned function in Lambda slot", namedResult->value, 41);
+    delete namedResult;
+    result &= Test("t514r3 named owned function destructor", t514R3DtorCount, 1);
+
+    t514R3DtorCount = 0;
+    function<move T514R3Payload*(int)> zeroParam = t514R3MakeOwnedZero;
+    T514R3Payload* zeroResult = zeroParam(3);
+    result &= Test("t514r3 zero parameter owned function adaptation", zeroResult->value, 41);
+    delete zeroResult;
+    result &= Test("t514r3 zero parameter owned function destructor", t514R3DtorCount, 1);
+
+    t514R3DtorCount = 0;
+    function<move T514R3Payload*(int)> lambda = (int value) => {
+        T514R3Payload* item = new T514R3Payload();
+        item->value = value;
+        return item;
+    };
+    T514R3Payload* lambdaResult = lambda(41);
+    result &= Test("t514r3 owned lambda in function slot", lambdaResult->value, 41);
+    delete lambdaResult;
+    result &= Test("t514r3 owned lambda destructor", t514R3DtorCount, 1);
+
+    t514R3DtorCount = 0;
+    int increment = 1;
+    Lambda<move T514R3Payload*(int)> captured = (int value) => {
+        T514R3Payload* item = new T514R3Payload();
+        item->value = value + increment;
+        return item;
+    };
+    T514R3Payload* capturedResult = captured(40);
+    result &= Test("t514r3 captured owned lambda value", capturedResult->value, 41);
+    delete capturedResult;
+    result &= Test("t514r3 captured owned lambda destructor", t514R3DtorCount, 1);
+
+    result &= Test("t514r5 global member default reads member", t514R5Global.b, 41);
+    result &= Test("t514r5 global member default method call", t514R5Global.c, 41);
+    result &= Test("t514r5 global brace member default", t514R5GlobalBrace.b, 41);
+    result &= Test("t514r5 global brace field default", t514R5Field.p.v + t514R5Field.q.v, 82);
+    result &= Test("t514r5 global brace method field default", t514R5Field.m.v, 41);
+    result &= Test("t514r5 global constant default", t514R5ConstGlobal.b, 41);
+    result &= Test("t514r5 global array member default", t514R5Arr[1].c, 41);
+    t514R5Global.a = 10;
+    result &= Test("t514r5 global member write persists", t514R5Global.a + t514R5Global.b, 51);
+
+    result &= Test("t514r7 thread_local member default", t514R7Member.b + t514R7Member.c, 82);
+    result &= Test("t514r7 thread_local explicit ctor member default", t514R7Explicit.b, 41);
+    result &= Test("t514r7 thread_local nested explicit ctor default", t514R7NestedTl.i.b, 41);
+    result &= Test("t514r7 thread_local lambda parameter shadows member", t514R7ParamTl.p.f(7), 41);
+    result &= Test("t514r7 thread_local lambda local shadows member", t514R7LocalTl.p.f(7), 41);
+    result &= Test("t514r7 thread_local string field default", t514R7StringTl.p.t[0] == 97 ? 41 : 1, 41);
+    result &= Test("t514r7 thread_local array member default", t514R7Arr[1].c, 41);
+    // The r8 address globals reach the module's thread_local init before main (clang: 41 too).
+    t514R7Seed = 30;
+    result &= Test("t514r7 thread_local dynamic default built once before first use", t514R7DynamicTl.b, 41);
+    int callsBefore = t514R7Calls;
+    result &= Test("t514r9 address array after earlier plain global", t514R9Plain.v * 10 + t514R9Addrs[0].v, 12);
+    result &= Test("t514r9 thread_local address array under the module guard", t514R9RecTl.b, 11);
+    result &= Test("t514r9 thread_local address array stored", t514R9RecAddrs[1] == &t514R9RecTl ? 41 : 0, 41);
+    int secondFirst = t514R8Second.v;
+    result &= Test("t514r8 thread_local declaration order on first use", secondFirst * 10 + t514R8First.v, 21);
+    result &= Test("t514r8 global address of thread_local", t514R8Address == &t514R7DynamicTl ? t514R8Address.b : 0, 41);
+    result &= Test("t514r8 global array of thread_local addresses", t514R8Addresses[1] == &t514R7DynamicTl ? 41 : 0, 41);
+    result &= Test("t514r8 thread_local address of thread_local", t514R8TlAddress.b, 41);
+    t514R8TlInts[0] = 7;
+    t514R7Member.b = 9;
+    t514R7Seed = 20;
+    int fromThread = 0;
+    Thread worker;
+    worker.start(t514R7Worker, &fromThread);
+    worker.join();
+    result &= Test("t514r7 thread_local built per thread", fromThread, 41 + 20 + 41);
+    result &= Test("t514r7 thread_local main copy kept", t514R7Member.b, 9);
+    result &= Test("t514r8 thread_local brace array kept per thread", t514R8TlInts[0], 7);
+    result &= Test("t514r7 thread_local dynamic default once per thread", t514R7Calls - callsBefore, 1);
+    return result;
+}
 
 bool testNonCapturingLambdaToCFuncPtr()
 {
@@ -7084,6 +7477,8 @@ extern int main(int argc, char** argv)
     total++; passed += testFuncPtrMoveSignature()      ? 1 : 0;
     total++; passed += testT208FunctionArgAcceptSet()  ? 1 : 0;
     total++; passed += testT399CallableReturnAndFieldAcceptSet() ? 1 : 0;
+    total++; passed += testT514FunctionNameBindings() ? 1 : 0;
+    total++; passed += testT514R3FieldDefaultsAndOwnedSlots() ? 1 : 0;
     total++; passed += testT373GenericFunctionNameDestinations() ? 1 : 0;
     total++; passed += testT380GenericFunctionNameAcceptSet() ? 1 : 0;
     total++; passed += testT380R2GenericFunctionConsumers() ? 1 : 0;

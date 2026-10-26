@@ -8406,6 +8406,22 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 {
                     value = arg.Primary;
                 }
+                // A generic-substituted thin function<> parameter keeps only its encoded name. A
+                // named function bound to it needs the same C-ABI entry a spelled function<> gets.
+                if (!inVariadicRange && !candParamItr->Pointer && llvm::isa_and_nonnull<llvm::Function>(value))
+                {
+                    const std::string encodedName = ResolveTypeAlias(candParamItr->TypeName);
+                    if (const TypeAndValue* thinSig = IsThinEncodedClosureType(encodedName)
+                            ? GetEncodedClosureType(encodedName) : nullptr)
+                    {
+                        if (!arg.CallerName.empty())
+                            if (auto* correctFn = GetFunctionForFuncPtr(arg.CallerName,
+                                    (int)thinSig->FuncPtrParams.size(), &thinSig->FuncPtrParams, thinSig,
+                                    /*compareReturnOwnership*/ true))
+                                value = correctFn;
+                        value = MakeThinFnPtrValue(value, *thinSig);
+                    }
+                }
 
                 if (!inVariadicRange)
                 {

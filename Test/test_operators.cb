@@ -1161,6 +1161,7 @@ extern int main()
     if (byValueAliasTempLegs() != 68) return 59;
     if (sameVarAcceptLegs() != 16) return 62;
     if (byValueAliasOperatorLegs() != 11) return 61;
+    if (t412AliasReturnOperatorLeg() != 4) return 75;
     if (cppUnwindThroughHelperLegs() != 0) return 60;
 
     if (t484CallableVariableLegs() != 2) return 63;
@@ -2270,6 +2271,41 @@ int byValueAliasOperatorLegs()
     passed += Test("alias minus named matches direct call", baTOperatorSignature(4, false), baTOperatorSignature(4, true));
     passed += Test("alias minus named signature", baTOperatorSignature(4, false), 5050101);
     passed += Test("alias unary temporary exact counts", baTOperatorSignature(5, false), 170101);
+    return passed;
+}
+int t412AliasDtorCount = 0;
+struct T412AliasValue
+{
+    unique<int> value = default;
+    T412AliasValue operator+(T412AliasValue other) { return other; }
+    ~T412AliasValue() { t412AliasDtorCount++; }
+};
+T412AliasValue t412AliasGlobal = default;
+alias T412AliasValue t412Alias() { return t412AliasGlobal; }
+int t412AliasReturnOperatorLeg()
+{
+    int passed = 0;
+    t412AliasDtorCount = 0;
+    t412AliasGlobal.value = new int(7);
+    int value = 0;
+    bool rightStillOwns = false;
+    int afterResult = 0;
+    int afterRight = 0;
+    {
+        T412AliasValue right = default;
+        right.value = new int(5);
+        {
+            T412AliasValue result = t412Alias() + right;
+            value = *result.value;
+        }
+        rightStillOwns = right.value.get() != nullptr;
+        afterResult = t412AliasDtorCount;
+    }
+    afterRight = t412AliasDtorCount;
+    passed += Test("T412 alias receiver operator value", value, 5);
+    passed += Test("T412 alias receiver preserves right borrow", rightStillOwns, true);
+    passed += Test("T412 alias receiver result destructor", afterResult, 0);
+    passed += Test("T412 alias receiver right destructor", afterRight, 1);
     return passed;
 }
 // Same-variable accept set (ruling 2026-10-13): one modification per variable, or modifications

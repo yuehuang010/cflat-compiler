@@ -170,6 +170,13 @@ expect_error("it returns an owning 'move' pointer but the slot's return is borro
     }
 }
 
+expect_error("'t514MakeOwned' is 'move T514DiagPayload*(int)'") {
+    struct T514DiagPayload { int value = 0; };
+    move T514DiagPayload* t514MakeOwned(int x) { return new T514DiagPayload(); }
+    void t514TakeBorrowed(function<T514DiagPayload*(int)> f) { }
+    void t514CallBorrowed() { t514TakeBorrowed(t514MakeOwned); }
+}
+
 // A thin lambda literal whose parameter is 'move' cannot bind a borrowed slot (declarator, then call argument).
 expect_error("differs in 'move' modifier") {
     void t287CallDecl() {
@@ -298,3 +305,69 @@ expect_error("differs in 'move' modifier") {
     int t399VariadicOverload(T399VariadicPick* p, ...) { return 2; }
     function<int(T399VariadicPick*)> t399VariadicReturn() { return t399VariadicOverload; }
 }
+
+expect_error("it returns a borrowed pointer but the slot's return is owning") {
+    struct T514R2BorrowFieldPayload { int value = 0; };
+    T514R2BorrowFieldPayload* t514R2BorrowField(int x) { return nullptr; }
+    struct T514R2BorrowFieldHolder {
+        function<move T514R2BorrowFieldPayload*(int)> callback = t514R2BorrowField;
+    };
+}
+
+expect_error("it returns a borrowed pointer but the slot's return is owning") {
+    struct T514R2DesignatedPayload { int value = 0; };
+    T514R2DesignatedPayload* t514R2BorrowDesignated(int x) { return nullptr; }
+    struct T514R2DesignatedHolder { function<move T514R2DesignatedPayload*(int)> callback; };
+    void t514R2DesignatedInit() {
+        T514R2DesignatedHolder holder = { callback = t514R2BorrowDesignated };
+    }
+}
+
+expect_error("it returns a borrowed pointer but the slot's return is owning") {
+    struct T514R2ViewPayload { int value = 0; };
+    T514R2ViewPayload* t514R2BorrowView(int x) { return nullptr; }
+    void t514R2BorrowViewInit() {
+        function<move T514R2ViewPayload*(int)>[] callbacks = { t514R2BorrowView };
+    }
+}
+
+expect_error("it returns a borrowed pointer but the slot's return is owning") {
+    struct T514R2FixedPayload { int value = 0; };
+    T514R2FixedPayload* t514R2BorrowFixed(int x) { return nullptr; }
+    void t514R2BorrowFixedInit() {
+        function<move T514R2FixedPayload*(int)>[1] callbacks = { t514R2BorrowFixed };
+    }
+}
+
+expect_error("it returns a borrowed pointer but the slot's return is owning") {
+    struct T514R2DeclPayload { int value = 0; };
+    T514R2DeclPayload* t514R2BorrowDecl(int x) { return nullptr; }
+    void t514R2BorrowDeclInit() {
+        function<move T514R2DeclPayload*(int)> callback = t514R2BorrowDecl;
+    }
+}
+
+expect_error("it returns a borrowed pointer but the slot's return is owning") {
+    struct T514R2AssignPayload { int value = 0; };
+    T514R2AssignPayload* t514R2BorrowAssign(int x) { return nullptr; }
+    void t514R2BorrowAssignInit() {
+        function<move T514R2AssignPayload*(int)> callback = nullptr;
+        callback = t514R2BorrowAssign;
+    }
+}
+
+expect_error("it returns a borrowed pointer but the slot's return is owning") {
+    struct T514R2ArgPayload { int value = 0; };
+    T514R2ArgPayload* t514R2BorrowArg(int x) { return nullptr; }
+    void t514R2TakeArg(function<move T514R2ArgPayload*(int)> callback) { }
+    void t514R2CallArg() { t514R2TakeArg(t514R2BorrowArg); }
+}
+
+expect_error("it returns a borrowed pointer but the slot's return is owning") {
+    struct T514R2ReturnPayload { int value = 0; };
+    T514R2ReturnPayload* t514R2BorrowReturn(int x) { return nullptr; }
+    function<move T514R2ReturnPayload*(int)> t514R2ReturnBorrowed() {
+        return t514R2BorrowReturn;
+    }
+}
+

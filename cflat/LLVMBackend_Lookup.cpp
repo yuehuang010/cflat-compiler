@@ -1306,6 +1306,39 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfBoundFunction(const std::stri
         return {};
     }
 
+bool LLVMBackend::HasOverloadSetForFunction(const llvm::Function* fn) const
+{
+        const FunctionSymbol* resolved = FindSymbolForFunction(fn);
+        if (resolved == nullptr || resolved->IsMethod) return false;
+        for (const auto& entry : functionTable)
+        {
+            const auto& overloads = entry.second;
+            if (std::none_of(overloads.begin(), overloads.end(), [&](const auto& sym) {
+                    return &sym == resolved;
+                }))
+                continue;
+            const auto& name = entry.first;
+            if (gts.genericFunctionTemplates.contains(name)
+                && (gts.coreGenericTemplates.count(name) == 0
+                    || IsExplicitCoreFunction(name, true)))
+                return true;
+            std::vector<const FunctionSymbol*> distinct;
+            for (const auto& sym : overloads)
+            {
+                if (sym.IsMethod) continue;
+                const bool duplicate = std::any_of(distinct.begin(), distinct.end(), [&](const auto* prior) {
+                    return (sym.Function != nullptr && sym.Function == prior->Function)
+                        || (sym.Function == nullptr && prior->Function == nullptr
+                            && sym.UniqueName == prior->UniqueName);
+                });
+                if (!duplicate && distinct.size() < 2) distinct.push_back(&sym);
+                if (distinct.size() > 1) return true;
+            }
+            return false;
+        }
+        return false;
+    }
+
 bool LLVMBackend::NamedFunctionProvablyMismatchesFuncPtr(const std::string& functionName,
         const TypeAndValue& param) const
 {
@@ -1367,8 +1400,13 @@ std::string LLVMBackend::FuncPtrSpellingOf(const LLVMBackend::TypeAndValue& tv) 
         const std::string familyName = signature.IsThinFnPtr() ? "function<" : "Lambda<";
         if (signature.DiagnosticTypeName.starts_with(familyName)
             && signature.DiagnosticTypeName.ends_with(">"))
-            return signature.DiagnosticTypeName.substr(familyName.size(),
+        {
+            std::string spelling = signature.DiagnosticTypeName.substr(familyName.size(),
                 signature.DiagnosticTypeName.size() - familyName.size() - 1);
+            if (signature.FuncPtrReturnOwned && !spelling.starts_with("move "))
+                spelling = "move " + spelling;
+            return spelling;
+        }
         // One '*' per recorded level, so a depth mismatch is visible as `int**` vs `int*` rather
         // than as two identical-looking spellings; recorded pointee const prints whole-word.
         auto component = [&](const std::string& name, bool pointer, int depth,
@@ -1388,8 +1426,11 @@ std::string LLVMBackend::FuncPtrSpellingOf(const LLVMBackend::TypeAndValue& tv) 
             }
             return SpellType(*this, type);
         };
-        std::string s = component(signature.FuncPtrReturnTypeName, signature.FuncPtrReturnPointer,
-            signature.FuncPtrReturnPointerDepth, signature.FuncPtrReturnConstMask, false) + "(";
+        std::string returnSpelling = component(signature.FuncPtrReturnTypeName,
+            signature.FuncPtrReturnPointer, signature.FuncPtrReturnPointerDepth,
+            signature.FuncPtrReturnConstMask, false);
+        if (signature.FuncPtrReturnOwned) returnSpelling = "move " + returnSpelling;
+        std::string s = returnSpelling + "(";
         for (size_t i = 0; i < signature.FuncPtrParams.size(); i++)
         {
             if (i > 0) s += ", ";
@@ -1556,16 +1597,19 @@ std::string LLVMBackend::FuncPtrBindReason(const LLVMBackend::TypeAndValue& fn,
                 why = (i == 0) ? "the return type differs" : std::format("parameter {} differs", i);
         if (why.empty() && compareReturnOwnership
             && function.FuncPtrReturnPointer && destination.FuncPtrReturnPointer
-            && function.FuncPtrReturnOwned && !destination.FuncPtrReturnOwned)
-            why = "it returns an owning 'move' pointer but the slot's return is borrowed (declare the "
-                  "slot's return 'move')";
+            && function.FuncPtrReturnOwned != destination.FuncPtrReturnOwned)
+            why = function.FuncPtrReturnOwned
+                ? "it returns an owning 'move' pointer but the slot's return is borrowed (declare the "
+                  "slot's return 'move')"
+                : "it returns a borrowed pointer but the slot's return is owning ('move'); remove "
+                  "'move' from the slot's return";
         return why;
     }
 
 // T287: the ownership half of the bind rule, for a function-pointer VALUE. A named function gets
 // the same two facts from FuncPtrBindReason; a lambda literal or variable carries them on its type.
 std::string LLVMBackend::FuncPtrValueOwnershipReason(const LLVMBackend::TypeAndValue& source,
-        const LLVMBackend::TypeAndValue& slot)
+        const LLVMBackend::TypeAndValue& slot, bool compareReturnOwnership)
 {
         TypeAndValue src = source, dst = slot;
         if (src.FuncPtrReturnTypeName.empty() && !src.Pointer)
@@ -1575,10 +1619,13 @@ std::string LLVMBackend::FuncPtrValueOwnershipReason(const LLVMBackend::TypeAndV
             if (const auto* encoded = GetEncodedClosureType(dst.TypeName))
                 dst = *encoded;
         if (!dst.IsFunctionPointer) return "";
-        if (src.FuncPtrReturnPointer && dst.FuncPtrReturnPointer
-            && src.FuncPtrReturnOwned && !dst.FuncPtrReturnOwned)
-            return "it returns an owning 'move' pointer but the slot's return is borrowed (declare the "
-                   "slot's return 'move')";
+        if (compareReturnOwnership && src.FuncPtrReturnPointer && dst.FuncPtrReturnPointer
+            && src.FuncPtrReturnOwned != dst.FuncPtrReturnOwned)
+            return src.FuncPtrReturnOwned
+                ? "it returns an owning 'move' pointer but the slot's return is borrowed (declare the "
+                  "slot's return 'move')"
+                : "it returns a borrowed pointer but the slot's return is owning ('move'); remove "
+                  "'move' from the slot's return";
         // Different arities are the adaptation rule's business (FuncPtrFewerParamsCanAdapt), not 'move'.
         if (src.FuncPtrParams.size() != dst.FuncPtrParams.size()) return "";
         for (size_t i = 0; i < dst.FuncPtrParams.size(); i++)
@@ -1589,14 +1636,14 @@ std::string LLVMBackend::FuncPtrValueOwnershipReason(const LLVMBackend::TypeAndV
     }
 
 std::string LLVMBackend::FuncPtrValueOwnershipReason(const LLVMBackend::NamedVariable& value,
-        const LLVMBackend::TypeAndValue& slot)
+        const LLVMBackend::TypeAndValue& slot, bool compareReturnOwnership)
 {
         TypeAndValue source = value.TypeAndValue;
         const FunctionSymbol* symbol = nullptr;
         if (auto* fn = llvm::dyn_cast_or_null<llvm::Function>(value.Primary))
             if ((symbol = FindSymbolForFunction(fn)))
                 source = FuncPtrSigOfSymbol(*symbol);
-        std::string reason = FuncPtrValueOwnershipReason(source, slot);
+        std::string reason = FuncPtrValueOwnershipReason(source, slot, compareReturnOwnership);
         // Primary is the first-declared overload; one that binds the slot exactly (same arity, types
         // and 'move' modifiers) clears the name, since that is the overload the slot resolves to.
         TypeAndValue dst = slot;
@@ -1614,7 +1661,7 @@ std::string LLVMBackend::FuncPtrValueOwnershipReason(const LLVMBackend::NamedVar
                     || sa[i].Canon != sb[i].Canon
                     || sa[i].StructKey != sb[i].StructKey || sa[i].PointerDepth != sb[i].PointerDepth)
                     return false;
-            return FuncPtrValueOwnershipReason(sig, slot).empty();
+            return FuncPtrValueOwnershipReason(sig, slot, compareReturnOwnership).empty();
         };
         if (!reason.empty() && symbol != nullptr)
             if (auto it = functionTable.find(symbol->SourceName); it != functionTable.end())
@@ -1638,7 +1685,7 @@ bool LLVMBackend::FuncPtrFewerParamsCanAdapt(const TypeAndValue& source,
         if (!slotSig.IsFunctionPointer || slotSig.IsThinFnPtr()
             || sourceSig.FuncPtrParams.size() >= slotSig.FuncPtrParams.size()
             || sourceSig.FuncPtrVariadic || slotSig.FuncPtrVariadic
-            || !FuncPtrBindReason(sourceSig, slotSig).empty())
+            || !FuncPtrBindReason(sourceSig, slotSig, true).empty())
             return false;
         for (size_t i = 0; i < sourceSig.FuncPtrParams.size(); ++i)
         {
@@ -1695,7 +1742,7 @@ std::string LLVMBackend::DescribeFuncPtrValueMismatch(const LLVMBackend::TypeAnd
             return why;
         if (!slotSignature.IsFunctionPointer || !valueSignature.IsFunctionPointer)
             return "";
-        std::string why = FuncPtrBindReason(valueSignature, slotSignature);
+        std::string why = FuncPtrBindReason(valueSignature, slotSignature, true);
         if (why.empty() && valueSignature.TypeName == "__closure_fat_ptr"
             && valueSignature.FuncPtrParams.size() < slotSignature.FuncPtrParams.size())
             why = std::format("it takes {} parameter(s) but the slot supplies {}; a Lambda<> value may carry captured state, and "
@@ -1731,7 +1778,7 @@ std::string LLVMBackend::DescribeFuncPtrValueMismatch(const LLVMBackend::TypeAnd
 std::string LLVMBackend::DescribeLambdaBindMismatch(const LLVMBackend::TypeAndValue& lambda,
         const LLVMBackend::TypeAndValue& slot) const
 {
-        std::string why = FuncPtrBindReason(lambda, slot);
+        std::string why = FuncPtrBindReason(lambda, slot, true);
         if (why.empty()) return "";
         return std::format("cannot bind this lambda of type '{}' to function-pointer type '{}' - {}. "
             "A lambda's parameters must match the slot it is bound to; it may take fewer parameters "

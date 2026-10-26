@@ -2637,6 +2637,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
 
     // Clang's own initializers are in llvm.global_ctors only after the link above, so the
     // single-driver rewrite that fixes construction order has to run here, not earlier.
+    InsertThreadLocalLazyInits();
     FinalizeGlobalConstructorOrder();
     StampProgramTargetAttributes();
 

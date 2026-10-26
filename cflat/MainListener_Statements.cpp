@@ -1461,7 +1461,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     || returnIsNamedFunction))
             {
                 if (std::string why = compiler->FuncPtrValueOwnershipReason(
-                        returnNV, returnFnPtrTV); !why.empty())
+                        returnNV, returnFnPtrTV, !returnIsNamedFunction); !why.empty())
                     LogErrorContext(errCtx, std::format(
                         "incompatible function pointer return: {}", why));
                 if (!returnIsNamedFunction || returnNV.TypeAndValue.IsFunctionPointer

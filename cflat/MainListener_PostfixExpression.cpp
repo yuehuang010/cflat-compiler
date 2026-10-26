@@ -5407,6 +5407,38 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 isFollowedByCall = next != nullptr && next->getSymbol()->getType() == CFlatParser::LeftParen;
                                 break;
                             }
+                            // Class-scope lookup finds an unqualified generic method before a
+                            // same-named namespace template or global variable. Locals and fields
+                            // still shadow the member.
+                            if (isFollowedByCall)
+                            {
+                                auto* compiler = Compiler(ctx);
+                                const auto local = compiler->GetScopedLocalOrArgument(baseName);
+                                const auto field = compiler->GetMemberVariable(baseName);
+                                const bool hasVisibleValue = local.Storage != nullptr || local.Primary != nullptr
+                                    || !local.TypeAndValue.TypeName.empty()
+                                    || field.Storage != nullptr || field.Primary != nullptr
+                                    || field.BitfieldStorage != nullptr;
+                                const auto thisVar = compiler->GetThisPointer();
+                                const std::string methodOwner = !thisVar.TypeAndValue.TypeName.empty()
+                                    ? thisVar.TypeAndValue.TypeName : enclosingScope;
+                                const std::string methodTemplate = hasVisibleValue
+                                    ? std::string()
+                                    : GenericMethodTemplateKey(methodOwner, baseName);
+                                if (!methodTemplate.empty())
+                                {
+                                    const bool isStaticMethod =
+                                        isFunctionStatic(genericFunctionTemplates[methodTemplate]);
+                                    if (isStaticMethod || !thisVar.TypeAndValue.TypeName.empty())
+                                    {
+                                        gfKey = methodTemplate;
+                                        isGenericFunc = true;
+                                        structVar = isStaticMethod ? LLVMBackend::NamedVariable{} : thisVar;
+                                        interfaceVar = {};
+                                        namedVar = {};
+                                    }
+                                }
+                            }
                             if (!isGenericFunc && isGenericType)
                             {
                                 mangledName = MangleGenericInstance(*Compiler(), genericTypeBase, typeArgs);
@@ -13506,6 +13538,9 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
                 if (auto* gi = primary->genericIdentifier(); gi != nullptr && primary->DoubleColon() == nullptr)
                 {
                     std::string name = gi->Identifier()->getText();
+                    bool localBinding = lambdaParamNames.count(name) || shadowed.count(name);
+                    if (!localBinding && !seenNames.count(name))
+                        localBinding = LambdaLocallyBindsName(rootLambda, primary, name);
                     // NOTE: functionTable / dataStructures are deliberately NOT excluded
                     // here. A local variable or parameter shadows a same-named function,
                     // method, or struct, so the enclosing-scope binding lookup below is the
@@ -13517,11 +13552,7 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
                     // excluded either, for the same reason: a local shadows a same-named global
                     // (CFlat or C/C++-imported), and the body resolves the local first, so the
                     // capture must too. A plain global reference has no local/arg binding.
-                    if (!seenNames.count(name)
-                        && !lambdaParamNames.count(name)
-                        && !shadowed.count(name)
-                        // Walk up through the root lambda: an enclosing lambda's local also binds it.
-                        && !LambdaLocallyBindsName(rootLambda, primary, name))
+                    if (!seenNames.count(name) && !localBinding)
                     {
                         bool resolvedOuterBinding = false;
                         auto binding = compiler->GetScopedLocalOrArgument(name);
@@ -13557,7 +13588,28 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
                                 captures.push_back(ci);
                             }
                         }
-                        if (!resolvedOuterBinding && compiler->HasMemberVariable(name))
+                        bool ownerGenericMethodCall = false;
+                        if (!localBinding && !resolvedOuterBinding)
+                            if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(primary->parent))
+                                for (size_t i = 0; i + 1 < postfix->children.size(); ++i)
+                                    if (postfix->children[i] == primary)
+                                    {
+                                        auto* open = dynamic_cast<antlr4::tree::TerminalNode*>(postfix->children[i + 1]);
+                                        if (open != nullptr
+                                            && open->getSymbol()->getType() == CFlatParser::LeftParen)
+                                        {
+                                            const auto thisPtr = compiler->GetThisPointer();
+                                            const std::string owner = !thisPtr.TypeAndValue.TypeName.empty()
+                                                ? thisPtr.TypeAndValue.TypeName
+                                                : EnclosingAggregateScopeFromContext(compiler, primary);
+                                            const std::string method = GenericMethodTemplateKey(owner, name);
+                                            ownerGenericMethodCall = !method.empty()
+                                                && !isFunctionStatic(genericFunctionTemplates[method]);
+                                        }
+                                        break;
+                                    }
+                        if (!resolvedOuterBinding
+                            && (compiler->HasMemberVariable(name) || ownerGenericMethodCall))
                             captureThis();
                     }
                 }
@@ -13694,7 +13746,6 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
 
         // Scan body for captures from the enclosing function scope BEFORE saving builder state.
         auto captures = CollectLambdaCaptures(ctx->lambdaBody(), lambdaParamNames, compiler);
-
         // A by-value capture of an owning value type is DEEP-COPIED into the env, which then OWNS
         // it (its cleanup fn frees it exactly once); the invoker's unpacked local only BORROWS it.
         // Both the deep-copy-at-store and the borrow-in-body decisions key off this one predicate.
@@ -13911,10 +13962,11 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
         straightLineReturned_ = false;
 
-        // Unpack captured variables from env (the trailing param) into the invoker's scope.
+        // The env is the last explicit param; an owned pointer return adds a hidden count after it.
         if (!captures.empty() && closureStructTy)
         {
-            auto* envArg    = fn->getArg((unsigned)fn->arg_size() - 1);
+            const unsigned trailingReturnCount = compiler->ReturnCarriesRawArrayCount(returnType) ? 1u : 0u;
+            auto* envArg = fn->getArg(static_cast<unsigned>(fn->arg_size()) - 1u - trailingReturnCount);
             auto* closurePtr = compiler->builder->CreateBitCast(
                 envArg, cflat_llvm::PointerTo(closureStructTy), "closure");
 
@@ -15384,13 +15436,15 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                     for (const auto& symbol : it->second)
                         if (!symbol.IsMethod
                             && compiler->DescribeFuncPtrBindMismatch(name,
-                                compiler->FuncPtrSigOfSymbol(symbol), functionDestination).empty())
+                                compiler->FuncPtrSigOfSymbol(symbol), functionDestination,
+                                /*compareReturnOwnership*/ true).empty())
                             return true;
                     return false;
                 };
                 auto bindConcrete = [&]() {
                     namedVar.Primary = compiler->GetFunctionForFuncPtr(
-                        name, -1, nullptr, &functionDestination);
+                        name, -1, nullptr, &functionDestination,
+                        /*compareReturnOwnership*/ true);
                     namedVar.CallerName = name;
                     namedVar.IdentifierLine = (int)node->getSymbol()->getLine();
                     namedVar.IdentifierColumn = (int)node->getSymbol()->getCharPositionInLine();
@@ -15401,7 +15455,8 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                     && std::any_of(concreteIt->second.begin(), concreteIt->second.end(), [&](const auto& symbol) {
                            return !symbol.IsMethod
                                && compiler->DescribeFuncPtrBindMismatch(name,
-                                   compiler->FuncPtrSigOfSymbol(symbol), functionDestination).empty()
+                                   compiler->FuncPtrSigOfSymbol(symbol), functionDestination,
+                                   /*compareReturnOwnership*/ true).empty()
                                && signatureExact(compiler->FuncPtrSigOfSymbol(symbol));
                        }))
                 {
@@ -15422,7 +15477,8 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                         const bool bindable = std::any_of(instantiated->second.begin(),
                             instantiated->second.end(), [&](const auto& symbol) {
                                 return compiler->DescribeFuncPtrBindMismatch(mangled,
-                                    compiler->FuncPtrSigOfSymbol(symbol), functionDestination).empty();
+                                    compiler->FuncPtrSigOfSymbol(symbol), functionDestination,
+                                    /*compareReturnOwnership*/ true).empty();
                             });
                         if (!bindable)
                         {
@@ -15430,7 +15486,8 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                             {
                                 if (symbol.IsMethod) continue;
                                 const std::string mismatch = compiler->DescribeFuncPtrBindMismatch(
-                                    mangled, compiler->FuncPtrSigOfSymbol(symbol), functionDestination);
+                                    mangled, compiler->FuncPtrSigOfSymbol(symbol), functionDestination,
+                                    /*compareReturnOwnership*/ true);
                                 if (mismatch.empty()) continue;
                                 LogErrorContext(node, mismatch);
                                 return {};
@@ -15438,7 +15495,8 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                         }
                     }
                     namedVar.Primary = compiler->GetFunctionForFuncPtr(
-                        mangled, -1, nullptr, &functionDestination);
+                        mangled, -1, nullptr, &functionDestination,
+                        /*compareReturnOwnership*/ true);
                     namedVar.CallerName = mangled;
                     namedVar.GenericFunctionValue = true;
                     namedVar.IdentifierLine = (int)node->getSymbol()->getLine();

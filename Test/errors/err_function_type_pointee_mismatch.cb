@@ -156,8 +156,8 @@ expect_error("cannot bind function 't500TakesLambdaCallback' to function-pointer
     }
 }
 
-Lambda<int(long)> t512Wide;
-Lambda<int(long)> t512GetWide() { return t512Wide; }
+Lambda<int(double)> t512Wide;
+Lambda<int(double)> t512GetWide() { return t512Wide; }
 int t512AddOne(int x) { return x + 1; }
 function<int(int)> t512GetThin() { return t512AddOne; }
 T t512RoundTrip<T>(T get) { return get; }

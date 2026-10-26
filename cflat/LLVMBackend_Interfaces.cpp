@@ -1018,7 +1018,7 @@ llvm::Function* LLVMBackend::GetOrCreateFunctionShim(llvm::Function* original)
             callArgs.push_back(shim->getArg(i));
         }
         if (returnCarriesRawArrayCount)
-            callArgs.push_back(shim->getArg(originalParamCount + 1));
+            callArgs.push_back(shim->getArg(originalParamCount));
 
         if (origTy->getReturnType()->isVoidTy())
         {
@@ -1035,6 +1035,92 @@ llvm::Function* LLVMBackend::GetOrCreateFunctionShim(llvm::Function* original)
             b.CreateRet(call);
         }
         return shim;
+    }
+
+llvm::Function* LLVMBackend::GetOrCreateThinCallableAdapter(llvm::Function* target,
+        const TypeAndValue& slotSig, size_t targetParamCount, bool targetHasEnv)
+{
+        if (target == nullptr) return nullptr;
+        TypeAndValue ret;
+        std::vector<TypeAndValue> params;
+        UnpackFuncPtrSignature(slotSig, ret, params);
+        if (!ReturnCarriesRawArrayCount(ret) || targetParamCount > params.size()) return nullptr;
+
+        auto* wrapperType = GetFunctionType(ret, params, false, false);
+        if (wrapperType->getReturnType() != target->getReturnType()) return nullptr;
+
+        std::string name = "__cflat_thin_adapter_" + target->getName().str() + "_"
+            + std::to_string(targetParamCount) + (targetHasEnv ? "_env_" : "_")
+            + FuncPtrSpellingOf(slotSig);
+        for (char& ch : name)
+            if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '_' && ch != '$') ch = '_';
+        if (auto* existing = module->getFunction(name))
+            return existing->getFunctionType() == wrapperType ? existing : nullptr;
+
+        auto* wrapper = llvm::Function::Create(wrapperType, llvm::GlobalValue::InternalLinkage,
+                                               name, module.get());
+        auto* entry = llvm::BasicBlock::Create(*context, "entry", wrapper);
+        llvm::IRBuilder<> b(entry);
+
+        std::vector<unsigned> valueArgs(params.size());
+        std::vector<unsigned> countArgs(params.size(), UINT_MAX);
+        unsigned wrapperArg = 0;
+        for (size_t i = 0; i < params.size(); ++i)
+        {
+            valueArgs[i] = wrapperArg++;
+            if (ParameterCarriesRawArrayCount(params[i]))
+                countArgs[i] = wrapperArg++;
+        }
+        const unsigned returnCountArg = wrapperArg;
+        if (ReturnCarriesRawArrayCount(ret)) ++wrapperArg;
+        if (wrapperArg != wrapper->arg_size())
+        {
+            wrapper->eraseFromParent();
+            return nullptr;
+        }
+
+        std::vector<llvm::Value*> callArgs;
+        for (size_t i = 0; i < targetParamCount; ++i)
+        {
+            callArgs.push_back(wrapper->getArg(valueArgs[i]));
+            if (countArgs[i] != UINT_MAX)
+                callArgs.push_back(wrapper->getArg(countArgs[i]));
+        }
+        if (targetHasEnv)
+        {
+            if (callArgs.size() >= target->arg_size())
+            {
+                wrapper->eraseFromParent();
+                return nullptr;
+            }
+            auto* envType = target->getFunctionType()->getParamType(callArgs.size());
+            auto* envPtrType = llvm::dyn_cast<llvm::PointerType>(envType);
+            if (envPtrType == nullptr)
+            {
+                wrapper->eraseFromParent();
+                return nullptr;
+            }
+            callArgs.push_back(llvm::ConstantPointerNull::get(envPtrType));
+        }
+        if (ReturnCarriesRawArrayCount(ret))
+            callArgs.push_back(wrapper->getArg(returnCountArg));
+
+        if (callArgs.size() != target->arg_size())
+        {
+            wrapper->eraseFromParent();
+            return nullptr;
+        }
+        for (size_t i = 0; i < callArgs.size(); ++i)
+            if (callArgs[i]->getType() != target->getFunctionType()->getParamType(i))
+            {
+                wrapper->eraseFromParent();
+                return nullptr;
+            }
+
+        auto* call = b.CreateCall(target->getFunctionType(), target, callArgs);
+        if (call->getType()->isVoidTy()) b.CreateRetVoid();
+        else b.CreateRet(call);
+        return wrapper;
     }
 
 llvm::Function* LLVMBackend::GetOrCreateCFuncPtrThunk(llvm::FunctionType* cFnTy,
@@ -1639,6 +1725,30 @@ llvm::Value* LLVMBackend::MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue
                         return llvm::UndefValue::get(BuildThinFnPtrType(fpTV));
                 }
             }
+            if (fn == original && symbol != nullptr && !symbol->External
+                && ReturnCarriesRawArrayCount(ret))
+            {
+                const TypeAndValue source = FuncPtrSigOfSymbol(*symbol);
+                bool canAdapt = source.FuncPtrParams.size() < params.size()
+                    && FuncPtrBindReason(source, fpTV, true).empty();
+                for (size_t i = 0; canAdapt && i < source.FuncPtrParams.size(); ++i)
+                    if (source.FuncPtrParams[i].IsMove != params[i].IsMove
+                        || (source.FuncPtrParams[i].AllocAlignValue != 0
+                            && params[i].AllocAlignValue != 0
+                            && source.FuncPtrParams[i].AllocAlignValue != params[i].AllocAlignValue))
+                        canAdapt = false;
+                if (canAdapt)
+                {
+                    auto* adapter = GetOrCreateThinCallableAdapter(original, fpTV,
+                        source.FuncPtrParams.size(), false);
+                    if (adapter == nullptr)
+                    {
+                        LogError("cannot adapt this owned-return function to the function-pointer slot");
+                        return llvm::UndefValue::get(BuildThinFnPtrType(fpTV));
+                    }
+                    fn = adapter;
+                }
+            }
         }
         return builder->CreateBitCast(fn, BuildThinFnPtrType(fpTV), "thinfn");
     }
@@ -1665,6 +1775,17 @@ llvm::Value* LLVMBackend::CoerceClosureFatToThin(llvm::Value* fatVal, const Type
             auto* thunk = GetOrCreateReverseAbiFunctionThunk(body, plan, {}, false, true);
             if (thunk == nullptr)
                 return llvm::UndefValue::get(BuildThinFnPtrType(thinTV));
+            return builder->CreateBitCast(thunk, BuildThinFnPtrType(thinTV), "thinfn");
+        }
+        if (auto* body = llvm::dyn_cast<llvm::Function>(code->stripPointerCasts());
+            body != nullptr && ReturnCarriesRawArrayCount(ret))
+        {
+            auto* thunk = GetOrCreateThinCallableAdapter(body, thinTV, params.size(), true);
+            if (thunk == nullptr)
+            {
+                LogError("cannot adapt this owned-return closure to the function-pointer slot");
+                return llvm::UndefValue::get(BuildThinFnPtrType(thinTV));
+            }
             return builder->CreateBitCast(thunk, BuildThinFnPtrType(thinTV), "thinfn");
         }
         return builder->CreateBitCast(code, BuildThinFnPtrType(thinTV), "thinfn");
@@ -1955,7 +2076,7 @@ llvm::Value* LLVMBackend::CoerceToFuncPtrReturn(llvm::Value* val, const TypeAndV
             {
                 int expectedCount = (int)retTV.FuncPtrParams.size();
                 if (auto* correctFn = GetFunctionForFuncPtr(returnNV.CallerName, expectedCount,
-                        &retTV.FuncPtrParams, &retTV))
+                        &retTV.FuncPtrParams, &retTV, /*compareReturnOwnership*/ true))
                     val = correctFn;
             }
             // A single named function has no overload to re-select, but its signature is part of
@@ -1966,7 +2087,8 @@ llvm::Value* LLVMBackend::CoerceToFuncPtrReturn(llvm::Value* val, const TypeAndV
                 const TypeAndValue onlySig = FuncPtrSigOfSymbol(overloads->second.front());
                 if (std::string why = DescribeFuncPtrVariadicMismatch(retTV, onlySig); !why.empty())
                     LogRawError(why);
-                else if (std::string why2 = DescribeFuncPtrBindMismatch(returnNV.CallerName, onlySig, retTV);
+                else if (std::string why2 = DescribeFuncPtrBindMismatch(
+                             returnNV.CallerName, onlySig, retTV, /*compareReturnOwnership*/ true);
                          !why2.empty())
                     LogRawError(why2);
             }

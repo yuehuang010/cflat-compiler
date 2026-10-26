@@ -30,3 +30,11 @@ globally for raw-pointer-field structs: core unique<T> ctor crash, duplicate des
 heap-use-after-free in list.add (Test/test_move.cb --asan -g). Needs a ruling on the native return ABI
 (scope: dtor-bearing only vs every struct with a user ctor) and a planned rollout, not a point fix.
 Acceptance: the repro prints d=1 c=14; test_move --asan -g clean.
+
+## `new T()` also copies (2026-10-25)
+
+`new T()` constructs T in the constructor's frame and copies the value into the heap allocation, so a constructor that
+stores `&this->field` leaves the heap object pointing into a dead frame (clang constructs in place). The T498Res/T510Res
+test_move fixtures relied on this and read stale stack memory (passed on arm64 by luck, garbage on Windows); e747344da
+moved them to global pools. The same ruling (in-place construction for dtor-bearing / self-pointing structs) covers
+`new T()`.
