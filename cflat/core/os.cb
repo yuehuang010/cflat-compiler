@@ -10,7 +10,7 @@ if const (__WINDOWS__) {
 // os.cb is imported before cruntime.cb in the chain, so cruntime's malloc/free
 // externs are not yet visible when the os.* bodies below compile. Declare them
 // here; they share the one linkage symbol with cruntime's identical decls.
-extern void* malloc(i64 size);
+extern void* malloc(win_usize size);
 extern void  free(void* ptr);
 
 // ===========================================================================
@@ -527,8 +527,8 @@ namespace os
         } else if const (__MACOS__) {
             if (id != 0) { return -1; }   // single synthetic domain
             i64 val = 0;
-            win_size len = (win_size)8;
-            win_int rc = os.posix.sysctlbyname("hw.memsize", &val, &len, nullptr, (win_size)0);
+            win_usize len = (win_usize)8;
+            win_int rc = os.posix.sysctlbyname("hw.memsize", &val, &len, nullptr, (win_usize)0);
             if (rc != 0) { return -1; }
             return val;
         } else {

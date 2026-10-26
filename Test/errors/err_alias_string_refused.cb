@@ -19,8 +19,39 @@ expect_error("'alias' applies to pointer types only") {
     alias string refusedGlobal = default;
 }
 
+using T445AliasString = string;
+using T445AliasStringChain = T445AliasString;
+namespace T445AliasNs { using Text = string; using Chain = Text; }
+
+expect_error("'alias' applies to pointer types only") {
+    alias string[] refusedViewReturn(string[] source) { return source; }
+}
+
+expect_error("'alias' applies to pointer types only") {
+    int refusedNullableParam(alias string? source) { return 0; }
+}
+
+expect_error("'alias' applies to pointer types only") {
+    struct RefusedAliasField { alias T445AliasStringChain value = default; };
+}
+
+expect_error("'alias' applies to pointer types only") {
+    int refusedNamespaceParam(alias T445AliasNs.Chain source) { return 0; }
+}
+
+expect_error("'alias' applies to pointer types only") {
+    function<alias string()> refusedCallback = default;
+}
+
+expect_error("'alias' applies to pointer types only") {
+    function<alias T445AliasString()> refusedUsingCallback = default;
+}
+
 extern int main()
 {
+    expect_error("'alias' applies to pointer types only") {
+        alias T445AliasString refusedUsingLocal = "x";
+    }
     expect_error("'alias' applies to pointer types only") {
         alias string refusedLocal = "x";
     }

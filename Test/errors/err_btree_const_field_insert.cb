@@ -1,0 +1,16 @@
+import "hpc/btree.cb";
+
+struct T451ConstFieldValue
+{
+    const int id = 0;
+    int extra = 0;
+    T451ConstFieldValue(int n) { id = n; }
+};
+
+expect_error("btree<K, V>.insert(): value type V has a const field and cannot be assigned");
+extern int main()
+{
+    btree<int, T451ConstFieldValue> tree = default;
+    tree.insert(1, T451ConstFieldValue(7));
+    return 0;
+}

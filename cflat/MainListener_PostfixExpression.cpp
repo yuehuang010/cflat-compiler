@@ -1441,6 +1441,12 @@ void MainListener::MaterializeDefaultArgument(antlr4::ParserRuleContext* ctx, LL
     const LLVMBackend::TypeAndValue& dest, bool directLoweredSret)
 {
         argNV.IsDefaultArgument = true;
+        if (!dest.Pointer && !dest.IsAlias
+            && Compiler(ctx)->IsImmovableCFlatStruct(dest.TypeName))
+            LogErrorContext(ctx, std::format(
+                "parameter '{}': cannot pass a value of type '{}' to a by-value or 'move' "
+                "parameter - the type is [immovable], so its value may not be transferred",
+                dest.VariableName, SpellType(*Compiler(ctx), dest)));
         if (argNV.TypeAndValue.TypeName.empty())
         {
                 argNV.TypeAndValue.TypeName = dest.TypeName;
@@ -1551,6 +1557,17 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 }
                 NormalizeCxxRvalueReferenceArgument(ctx, parsed);
                 return parsed;
+            };
+
+            auto AttachImmovableCFlatSretResult = [&](LLVMBackend::NamedVariable& value) {
+                if (value.Primary == nullptr || value.TypeAndValue.Pointer
+                    || value.TypeAndValue.IsAlias
+                    || !Compiler(ctx)->IsImmovableCFlatStruct(value.TypeAndValue.TypeName)
+                    || value.Primary != Compiler(ctx)->lastCxxRetValue_
+                    || Compiler(ctx)->lastCxxRetTemp_ == nullptr)
+                    return;
+                value.Storage = Compiler(ctx)->lastCxxRetTemp_;
+                value.IsRvalue = true;
             };
 
             auto flattenCxxDirectConstructionArguments = [](
@@ -1949,7 +1966,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // C++-lowered receivers (sret / C++ records) keep their own slot's destruction.
                         if (!receiver.TypeAndValue.IsAlias && !receiver.FromOwningTempField
                             && recvType != "string" && recvType != "__closure_fat_ptr"
-                            && !compiler->IsCxxRecord(recvType) && !compiler->ReturnsViaCxxSret(recvType)
+                            && !compiler->IsCxxRecord(recvType) && !compiler->ReturnsViaInPlaceSret(recvType)
                             && compiler->IsProducedTempValue(receiver.Primary)
                             && compiler->IsOwningValueType(recvType))
                         {
@@ -1965,7 +1982,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         && receiver.TypeAndValue.TypeName != "string"
                         && receiver.TypeAndValue.TypeName != "__closure_fat_ptr"
                         && !compiler->IsCxxRecord(receiver.TypeAndValue.TypeName)
-                        && !compiler->ReturnsViaCxxSret(receiver.TypeAndValue.TypeName)
+                        && !compiler->ReturnsViaInPlaceSret(receiver.TypeAndValue.TypeName)
                         && compiler->IsProducedTempValue(receiver.Primary)
                         && compiler->IsOwningValueType(receiver.TypeAndValue.TypeName))
                     {
@@ -3524,6 +3541,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // of `.b` is the field `a`, whose own root is still `w`.
                                     namedVar.FieldPathRoot = structVar.FieldPathRoot.empty()
                                         ? structVar.TypeAndValue.VariableName : structVar.FieldPathRoot;
+                                    namedVar.RootIsBorrowedThisField = structVar.IsThisReceiver
+                                        || structVar.RootIsBorrowedThisField;
+                                    if (namedVar.RootIsBorrowedThisField)
+                                        namedVar.ThisFieldPath = structVar.ThisFieldPath.empty()
+                                            ? primaryIdentifier
+                                            : structVar.ThisFieldPath + "." + primaryIdentifier;
                                     namedVar.FieldPathThroughPointer = structVar.FieldPathThroughPointer
                                         || structVar.TypeAndValue.Pointer;
                                     namedVar.FieldPathHasPointerDereference =
@@ -4707,6 +4730,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // Remember the BASE's view-ness before the element branches clear it; the
                         // element slot of a user `T[]` view is LIVE storage, unlike a container's.
                         bool baseWasArrayView = namedVar.TypeAndValue.IsArrayView;
+                        // An element reached through a pointer field lives outside the receiver;
+                        // only a fixed-array field's slot stays a this-field path (T447).
+                        const bool subscriptKeepsThisField = hasFixedArrayShape(namedVar);
 
                         // Widen the index to the pointer width (i64) with the extension that
                         // matches its declared signedness. LLVM treats GEP indices as signed
@@ -4935,6 +4961,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // A subscript result is an element (container slot); only folded indices
                         // contribute to a field move path.
                         namedVar.IsElementAccess = true;
+                        if (!subscriptKeepsThisField)
+                        {
+                            namedVar.RootIsBorrowedThisField = false;
+                            namedVar.ThisFieldPath.clear();
+                        }
                         receiverWasFixedArray = false;
                         // Positive provenance for the ownership arms: only an addressable element
                         // of a `T[]` view qualifies (a simd lane has no Storage).
@@ -8134,6 +8165,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 if (namedVar.Primary)
                                     namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
                                 PrepareAliasCallResult(ctx, namedVar);
+                                AttachImmovableCFlatSretResult(namedVar);
                                 interfaceVar = {};
                                 structVar = {};
                                 ClassifyPostfixCallResult(ctx, namedVar, structVar, interfaceVar);
@@ -9333,6 +9365,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsCxxMacroJoin = argNV.IsCxxMacroJoin;
                                     argVar.TernaryTempAlreadyRegistered = argNV.TernaryTempAlreadyRegistered;
                                     argVar.ConditionalMoveSources = argNV.ConditionalMoveSources;
+                                    argVar.RootIsBorrowedThisField = argNV.RootIsBorrowedThisField;
+                                    argVar.ThisFieldPath = argNV.ThisFieldPath;
+                                    argVar.SourceExpressionContext = argumentExpression;
                                     // Propagate caller variable name for compile-time move tracking.
                                     argVar.CallerName = argNV.CallerName;
                                     // Propagate the field name (and inherited per-field move set) so that
@@ -10624,6 +10659,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // A direct call produces a fresh temporary; preserve that value
                                 // category for a foreign C++ rvalue-reference parameter.
                                 PrepareAliasCallResult(primaryCtx, namedVar, true);
+                                AttachImmovableCFlatSretResult(namedVar);
                                 if (namedVar.Primary != nullptr && structVar.ContainsBondedClosure
                                     && (namedVar.TypeAndValue.IsFunctionPointer
                                         || Compiler(primaryCtx)->GetEncodedClosureType(

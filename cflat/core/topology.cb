@@ -382,8 +382,8 @@ if const (__WINDOWS__) {
         // exposes hw.* topology counts as C ints; false if the name is absent.
         bool _sysctl_i32(const char* name, i32* out) {
             i32 val = 0;
-            win_size len = 4;
-            win_int rc = os.posix.sysctlbyname(name, &val, &len, nullptr, (win_size)0);
+            win_usize len = 4;
+            win_int rc = os.posix.sysctlbyname(name, &val, &len, nullptr, (win_usize)0);
             if (rc != 0) { return false; }
             out[0] = val;
             return true;

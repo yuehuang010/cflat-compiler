@@ -4214,6 +4214,32 @@ std.optional<i64> t177_optional_branch_return(bool choose)
     else return std.optional<int>(6);
 }
 std.optional<i64> t177_optional_generic_return<T>(T value) { return value; }
+t162.ReturnConv<int> t446_cm_local()
+{
+    t162.ReturnConv<long> source = t162.ReturnConv<long>(7);
+    return source;
+}
+t162.ReturnConv<int> t446_cm_param(t162.ReturnConv<long> source) { return source; }
+t162.ReturnDst t446_dstm_local()
+{
+    t162.ReturnSrc source = t162.ReturnSrc(5);
+    return source;
+}
+t162.ReturnDst t446_dstm_paren()
+{
+    t162.ReturnSrc source = t162.ReturnSrc(5);
+    return (source);
+}
+t162.ReturnDst t446_dstm_explicit_move()
+{
+    t162.ReturnSrc source = t162.ReturnSrc(5);
+    return move source;
+}
+t162.ReturnSrc t446_same_type_local()
+{
+    t162.ReturnSrc source = t162.ReturnSrc(5);
+    return source;
+}
 std.pair<i64, int> t177_pair_return() { return std.pair<int, int>(3, 4); }
 std.tuple<i64, int> t177_tuple_return() { return std.tuple<int, int>(3, 4); }
 std.complex<double> t177_complex_return() { return std.complex<float>(3.0f, 4.0f); }
@@ -4269,6 +4295,62 @@ extern int main(int argc, char** argv)
     }
     bridge_check("T177 unique ptr derived destructor", cppinl.Base.derived_dtors, 1);
     bridge_check("T177 unique ptr base destructor", cppinl.Base.base_dtors, 1);
+
+    t162.reset();
+    int t446Value = 0;
+    {
+        t162.ReturnConv<int> value = t446_cm_local();
+        t446Value = value.value;
+    }
+    if (t446Value != 207 || t162.Stats<int>.ctor != 0 || t162.Stats<int>.conversion != 0
+        || t162.Stats<int>.copy != 0 || t162.Stats<int>.move != 1 || t162.Stats<int>.dtor != 1
+        || t162.Stats<long>.ctor != 1 || t162.Stats<long>.copy != 0
+        || t162.Stats<long>.move != 0 || t162.Stats<long>.dtor != 1) return 44601;
+
+    t162.reset();
+    {
+        t162.ReturnConv<int> value = t446_cm_param(t162.ReturnConv<long>(7));
+        t446Value = value.value;
+    }
+    if (t446Value != 207 || t162.Stats<int>.ctor != 0 || t162.Stats<int>.conversion != 0
+        || t162.Stats<int>.copy != 1 || t162.Stats<int>.move != 1 || t162.Stats<int>.dtor != 2
+        || t162.Stats<long>.ctor != 1 || t162.Stats<long>.copy != 0
+        || t162.Stats<long>.move != 0 || t162.Stats<long>.dtor != 1) return 44602;
+
+    t162.ReturnStats.reset();
+    {
+        t162.ReturnDst value = t446_dstm_local();
+        t446Value = value.value;
+    }
+    if (t446Value != 7 || t162.ReturnStats.srcCtor != 1 || t162.ReturnStats.srcCopy != 0
+        || t162.ReturnStats.srcMove != 0 || t162.ReturnStats.srcDtor != 1
+        || t162.ReturnStats.lvalueCtor != 0 || t162.ReturnStats.rvalueCtor != 1) return 44603;
+
+    t162.ReturnStats.reset();
+    {
+        t162.ReturnDst value = t446_dstm_paren();
+        t446Value = value.value;
+    }
+    if (t446Value != 7 || t162.ReturnStats.srcCtor != 1 || t162.ReturnStats.srcCopy != 0
+        || t162.ReturnStats.srcMove != 0 || t162.ReturnStats.srcDtor != 1
+        || t162.ReturnStats.lvalueCtor != 0 || t162.ReturnStats.rvalueCtor != 1) return 44604;
+
+    t162.ReturnStats.reset();
+    {
+        t162.ReturnDst value = t446_dstm_explicit_move();
+        t446Value = value.value;
+    }
+    if (t446Value != 7 || t162.ReturnStats.srcCtor != 1 || t162.ReturnStats.srcCopy != 0
+        || t162.ReturnStats.srcMove != 0 || t162.ReturnStats.srcDtor != 1
+        || t162.ReturnStats.lvalueCtor != 0 || t162.ReturnStats.rvalueCtor != 1) return 44605;
+
+    t162.ReturnStats.reset();
+    {
+        t162.ReturnSrc value = t446_same_type_local();
+        t446Value = value.value;
+    }
+    if (t446Value != 5 || t162.ReturnStats.srcCtor != 1 || t162.ReturnStats.srcCopy != 0
+        || t162.ReturnStats.srcMove != 1 || t162.ReturnStats.srcDtor != 2) return 44606;
 
     cpptw.reset_counts();
     bridge_opaque_return_discard_direct(31);

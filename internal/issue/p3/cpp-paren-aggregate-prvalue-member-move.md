@@ -8,6 +8,3 @@ Fix direction: a prvalue class argument to an aggregate or constructor wrapper m
 parameter or member slot (guaranteed elision), not materialized and moved. Needs a design pass over wrapper argument
 passing; not a one-site change.
 
-- (T252 review 1, pre-existing) explicit `move` of a C++ aggregate lvalue into a ctor call binds the copy ctor:
-  `new r.CM(move l)` / `r.CM l3 = r.CM(move l2)` with `CM { Cnt c; int k = 9; }` gives copies=1 moves=0
-  (clang 0 / 1). Repro scratch/repro_keep/t252_rev/cases/c12.cb (header r.h).

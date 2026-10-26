@@ -7566,6 +7566,7 @@ static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
     if (!s.IsNoexcept)  o["nx"] = true;
     if (s.ReturnsAlias) o["ra"] = true;
     if (s.ReturnsAliasOfByValueParam) o["rabv"] = true;
+    if (s.ReturnsGlobalBorrow) o["rgb"] = true;
     if (s.HasCFlatBody) o["cb"] = true;
     if (s.CannotUnwind) o["nu"] = true;
     if (!s.NoUnwindExternDeps.empty())
@@ -8459,6 +8460,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (auto* ab = fo->getObject("cxxabi")) sym.CxxAbi = DeserializeCxxAbi(*ab);
             if (auto v = fo->getBoolean("ra")) sym.ReturnsAlias = *v;
             if (auto v = fo->getBoolean("rabv")) sym.ReturnsAliasOfByValueParam = *v;
+            if (auto v = fo->getBoolean("rgb")) sym.ReturnsGlobalBorrow = *v;
             if (auto v = fo->getBoolean("cb")) sym.HasCFlatBody = *v;
             if (auto v = fo->getBoolean("nu")) sym.CannotUnwind = *v;
             if (auto* nd = fo->getArray("nud"))

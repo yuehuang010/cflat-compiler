@@ -1387,6 +1387,12 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 // Pointer depth from a pointer alias (using Handle = void*); peeled off the
                 // resolved alias string below and combined with the declarator's stars.
                 int aliasPtrDepth = 0;
+                bool typeNameWasSubstituted = false;
+                bool typeNameIsGenericDerivedAlias = false;
+                typeNameIsGenericDerivedAlias =
+                    Compiler(declSpecs)->IsGenericDerivedTypeAlias(typeSpec->getText())
+                    || Compiler(declSpecs)->IsGenericDerivedTypeAlias(
+                        Compiler(declSpecs)->ResolveQualifiedName(typeSpec->getText()));
                 // Star count contributed by an active type SUBSTITUTION (T bound to "C**" -> 2).
                 // Real depth, not a flag, so the declarator combination below can prove a total.
                 int substArgPtrDepth = 0;
@@ -1518,10 +1524,21 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                 LogErrorContext(returnQualifier, "function return qualifier must be 'move' or 'alias'");
                         }
                         const bool aliasReturn = returnQualifierText == "alias";
+                        const std::string returnTypeSpelling = CanonicalTypeSpecifierText(
+                            fpSpec->typeSpecifier(), fpSpec->multiWordTypeSuffix(), false);
+                        const bool returnTypeWasSubstituted =
+                            activeTypeSubstitutions.find(returnTypeSpelling) != activeTypeSubstitutions.end();
+                        const bool returnTypeIsGenericDerivedAlias =
+                            Compiler(declSpecs)->IsGenericDerivedTypeAlias(returnTypeSpelling);
                         int retConst = 0;
                         declType.FuncPtrReturnTypeName = ResolveSigComponentConstCodegen(
                             fpSpec->typeSpecifier(), retPtr, retStars, retConst,
                             fpSpec->multiWordTypeSuffix(), aliasReturn);
+                        if (aliasReturn && !returnTypeWasSubstituted && !returnTypeIsGenericDerivedAlias
+                            && retStars == 0
+                            && Compiler(declSpecs)->ResolveTypeAlias(declType.FuncPtrReturnTypeName) == "string")
+                            LogErrorContext(fpSpec,
+                                "'alias' applies to pointer types only; 'string' is a primitive");
                         declType.FuncPtrReturnConstMask = retConst;
                         declType.FuncPtrReturnOwned = returnQualifierText == "move";
                         declType.FuncPtrReturnAlias = aliasReturn;
@@ -1851,6 +1868,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // A substituted name is ALREADY resolved in the caller's scope; re-resolving it
                     // here rebinds it to the template's declaring namespace (layer 3).
                     bool wasSubstituted = substIt != activeTypeSubstitutions.end();
+                    typeNameWasSubstituted = wasSubstituted;
                     if (substIt != activeTypeSubstitutions.end())
                     {
                         // A substituted type may carry a "*" (pointer), "[]" (noalias array-view),
@@ -1890,6 +1908,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // Resolve type aliases (e.g. user-defined aliases)
                     declType.ConstMask |= Compiler(declSpecs)->ResolveTypeAliasConstMask(typeName);
                     if (memberType != nullptr) declType.ConstMask |= memberMask;
+                    typeNameIsGenericDerivedAlias =
+                        Compiler(declSpecs)->IsGenericDerivedTypeAlias(typeName);
                     typeName = Compiler(declSpecs)->ResolveTypeAlias(typeName);
                     // `Owner.name` naming a member type (`Plain.Id`, `T.value_type` in a body).
                     if (!wasSubstituted && typeSpec->qualifiedGenericIdentifier() != nullptr
@@ -2130,17 +2150,11 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         declType.Pointer = true;
                     }
                 }
-                // `alias` qualifies pointers only (ruling 2026-10-15): a spelled `alias string` is refused in
-                // every position; a generic `alias T` with T=string is not (probe-only ruling).
-                if (declType.IsAlias && declType.TypeName == "string" && !declType.Pointer && !hasExplicitPointer)
-                {
-                    bool spelledString = false;
-                    for (auto* spec : declSpecList)
-                        if (spec->typeSpecifier() != nullptr && spec->typeSpecifier()->getText() == "string")
-                            spelledString = true;
-                    if (spelledString)
-                        LogErrorContext(declSpec, "'alias' applies to pointer types only; 'string' is a primitive");
-                }
+                // `alias` qualifies pointers only. An unresolved template parameter stays generic
+                // through this check, even when its instantiation later binds it to `string`.
+                if (declType.IsAlias && !typeNameWasSubstituted && !typeNameIsGenericDerivedAlias
+                    && declType.TypeName == "string" && declType.PointerDepth == 0)
+                    LogErrorContext(declSpec, "'alias' applies to pointer types only; 'string' is a primitive");
                 // Direct `unique` on a local/param (D4/D5): it qualifies a single-indirection pointer
                 // or an interface only (D1). A field is validated separately by ValidateUniqueField.
                 if (hasUniqueSpecifier
@@ -3093,6 +3107,11 @@ MainListener::MainListener(CFlatParser* parser, LLVMBackend* compilerLLVM, const
         this->parser = parser;
         this->compilerLLVM = compilerLLVM;
         this->sourceFileName = filename;
+        savedContextualErrorReporter_ = compilerLLVM->contextualErrorReporter;
+        compilerLLVM->contextualErrorReporter = [this](antlr4::ParserRuleContext* ctx,
+                                                        std::string message) {
+            LogErrorContext(ctx, std::move(message));
+        };
         savedDrainWaitingInstance_ = compilerLLVM->gts.drainWaitingInstance;
         compilerLLVM->gts.drainWaitingInstance = [this](const std::string& name) { DrainWaitingPointerInstance(name); };
         // The forward-ref scan for this file is complete, so every struct's fields are
@@ -3147,6 +3166,7 @@ bool MainListener::NativeTemplateNeedsTypeArgs(const std::string& spelledBase,
 MainListener::~MainListener()
 {
         compilerLLVM->gts.drainWaitingInstance = savedDrainWaitingInstance_;
+        compilerLLVM->contextualErrorReporter = std::move(savedContextualErrorReporter_);
 }
 
 void MainListener::RejectMissingNativeTemplateTypeArgs(antlr4::ParserRuleContext* site,
@@ -3326,6 +3346,15 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
                 "alias '{}' is already defined in this scope", { alias }));
 
         auto* typeSpec = ctx->typeSpecifier();
+        bool genericDerived = false;
+        if (typeSpec != nullptr && typeSpec->functionPointerSpecifier() == nullptr)
+        {
+            const std::string targetSpelling = CanonicalTypeSpecifierText(
+                typeSpec, ctx->multiWordTypeSuffix(), false);
+            genericDerived = activeTypeSubstitutions.find(targetSpelling) != activeTypeSubstitutions.end()
+                || compiler->IsGenericDerivedTypeAlias(targetSpelling)
+                || compiler->IsGenericDerivedTypeAlias(compiler->ResolveQualifiedName(targetSpelling));
+        }
         if (typeSpec != nullptr)
             RegisterLexicalLocalTypeName(compiler, ctx, alias);
         ValidateConstAfterPointerStar(ctx->pointer(),
@@ -3510,7 +3539,7 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
                     return;
                 }
             }
-            compiler->RegisterTypeAlias(alias, mangledName + suffix, targetConstMask);
+            compiler->RegisterTypeAlias(alias, mangledName + suffix, targetConstMask, genericDerived);
             if (auto* s = compiler->GetSymbolSink())
                 s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
@@ -3543,7 +3572,7 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
             targetDecorated = enumKey + std::string(targetPointerDepth, '*');
             for (uint64_t dim : targetArrayDims)
                 targetDecorated += "[" + std::to_string(dim) + "]";
-            compiler->RegisterTypeAlias(alias, targetDecorated + suffix, targetConstMask);
+            compiler->RegisterTypeAlias(alias, targetDecorated + suffix, targetConstMask, genericDerived);
             return;
         }
 
@@ -3565,7 +3594,7 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
                     alias, targetDecorated, alias));
                 return;
             }
-            compiler->RegisterTypeAlias(alias, targetDecorated + suffix, targetConstMask);
+            compiler->RegisterTypeAlias(alias, targetDecorated + suffix, targetConstMask, genericDerived);
             if (auto* s = compiler->GetSymbolSink())
                 s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
@@ -4249,6 +4278,13 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             return;
         }
         auto returnType = this->getFunctionReturnType(func);
+        if (returnType.external && !returnType.Pointer && !returnType.IsAlias
+            && !returnType.IsArrayView
+            && compiler->IsImmovableCFlatStruct(returnType.TypeName))
+            LogErrorContext(func, std::format(
+                "extern function '{}' cannot return [immovable] CFlat struct '{}' by value "
+                "through the C ABI",
+                name, SpellType(*compiler, returnType)));
         CFlatParser::ParameterTypeListContext* paramTypeList = func->parameterTypeList();
         auto params = this->ParseParameterTypeList(paramTypeList);
         if (cppOverrideContext
@@ -4791,6 +4827,9 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                     sym.ReturnsOwned = returnsOwned;
                     sym.ReturnsAlias = returnType.IsAlias;
                     sym.ReturnsAliasOfByValueParam = aliasOfByValueParam;
+                    // Per instance: a generic free function's instances register here, not in ForwardRefScanner.
+                    if (!returnType.external && returnType.Pointer && ReturnsOnlyModuleGlobals(func, allParams))
+                        sym.ReturnsGlobalBorrow = true;
                     break;
                 }
             }
@@ -7174,7 +7213,7 @@ llvm::Value* MainListener::EmitStructDefaultInto(llvm::Value* destination,
     const bool nativeCtorSret = compiler->IsNativeValueConstructor(
         typeName, LLVMBackend::TypeAndValue{ .TypeName = typeName }, {});
     const bool arm = destination != nullptr
-        && (compiler->ReturnsViaCxxSret(typeName) || nativeCtorSret);
+        && (compiler->ReturnsViaInPlaceSret(typeName) || nativeCtorSret);
     if (arm)
     {
         compiler->pendingCxxSretDest_ = destination;
@@ -7872,6 +7911,14 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         declName, elem, elem, elem));
                 }
 
+                if (typeAndValue.external && !typeAndValue.Pointer && !typeAndValue.IsAlias
+                    && !typeAndValue.IsArrayView
+                    && compiler->IsImmovableCFlatStruct(typeAndValue.TypeName))
+                    LogErrorContext(direct, std::format(
+                        "extern function '{}' cannot return [immovable] CFlat struct '{}' by value "
+                        "through the C ABI",
+                        declName, SpellType(*compiler, typeAndValue)));
+
                 compiler->CreateFunctionDeclaration(declName, typeAndValue, allParams, typeAndValue.external, ellipsis, false, false, typeAndValue.CallConv, linkName);
 
                 // Register the declaration in the symbol index so extern-bound C
@@ -8075,6 +8122,17 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // Field-path provenance of the RHS, kept past rightNV's scope so the decl-init
                 // consume arm can ask whether the source roots at a borrowed by-value parameter.
                 LLVMBackend::NamedVariable srcFieldPathNV;
+                auto captureThisFieldSource = [&](const LLVMBackend::NamedVariable& source) {
+                    srcFieldPathNV.RootIsBorrowedThisField = source.RootIsBorrowedThisField;
+                    srcFieldPathNV.ThisFieldPath = source.ThisFieldPath;
+                    srcFieldPathNV.ConditionalMoveSources = source.ConditionalMoveSources;
+                    srcFieldPathNV.TypeAndValue.TypeName = source.TypeAndValue.TypeName;
+                    srcFieldPathNV.TypeAndValue.IsUnique = source.TypeAndValue.IsUnique;
+                    srcFieldPathNV.TypeAndValue.Pointer = source.TypeAndValue.Pointer;
+                    srcFieldPathNV.TypeAndValue.ElemPointer = source.TypeAndValue.ElemPointer;
+                    srcFieldPathNV.TypeAndValue.IsMove = source.TypeAndValue.IsMove;
+                    srcFieldPathNV.IsExplicitMove = source.IsExplicitMove;
+                };
                 bool srcIsOwningMove = false;       // RHS is an owning pointer (move param or alias thereof via cast)
                 std::string srcOwningName;          // name of the original owning source, for nulling on transfer
                 // RHS is a plain read of a live OWNING local (or of another such copy). See
@@ -8127,8 +8185,14 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // The initializer's RESULT VALUE, before any decl-site coercion. Ownership
                 // adoption is answered from this by value identity, never from a sticky flag.
                 llvm::Value* srcPrimary = nullptr;
+                bool srcIsUniquePointerJoin = false;
+                // The adopted '?:' join, kept before the unique ctor reassigns `right`.
+                llvm::Value* uniquePointerJoin = nullptr;
                 // A direct auto initializer can adopt this sret slot as its local storage.
                 llvm::Value* srcCxxRetTemp = nullptr;
+                // A direct immovable CFlat call is armed before parsing so its sret result lands
+                // in the local's eventual storage instead of a temporary that must be copied.
+                llvm::Value* armedImmovableSretStorage = nullptr;
                 // The default construction of a classified struct (`T x;`, `T x = default;`)
                 // returned through sret: the local adopts that slot instead of a bitwise copy.
                 bool srcCxxRetTempFromDefault = false;
@@ -8433,6 +8497,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             // For interface declarations, preserve NamedVariable type info
                             // so we can do the class->interface fat-struct upcast when needed.
                             auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
+                            captureThisFieldSource(rightNV);
                             ApplyCallResultBorrowProvenance(compiler, rightNV);
                             interfaceSourceNV = rightNV;
                             haveInterfaceSourceNV = true;
@@ -8661,7 +8726,126 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && !typeAndValue.IsAlias && !global_scope)
                                     trivialCxxMoveSite_ = TopLevelMoveExpression(assignmentExpression);
                                 const auto staticInitMark = compiler->MarkOwnedTemps();
-                                auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
+                                const bool armImmovableCall = !global_scope && !isStaticLocal
+                                    && !typeAndValue.Pointer && !typeAndValue.IsAlias
+                                    && typeAndValue.ConstArraySize == 0
+                                    && typeAndValue.AliasArraySize == 0
+                                    && typeAndValue.ArraySize == nullptr
+                                    && compiler->IsImmovableCFlatStruct(typeAndValue.TypeName)
+                                    && FieldInitializerIsSingleCall(assignmentExpression)
+                                    && compiler->pendingCxxSretDest_ == nullptr;
+                                const bool armImmovableTernary = !global_scope && !isStaticLocal
+                                    && !typeAndValue.Pointer && !typeAndValue.IsAlias
+                                    && typeAndValue.ConstArraySize == 0
+                                    && typeAndValue.AliasArraySize == 0
+                                    && typeAndValue.ArraySize == nullptr
+                                    && compiler->IsImmovableCFlatStruct(typeAndValue.TypeName)
+                                    && SoleTernaryExpression(assignmentExpression) != nullptr
+                                    && compiler->pendingCxxTernaryDeclDest_ == nullptr;
+                                auto* immovableCallSlot = armImmovableCall
+                                    ? compiler->AllocaAtEntry(compiler->GetType(typeAndValue), nullptr,
+                                        std::format("{}.immovable.sret", name))
+                                    : nullptr;
+                                auto* immovableTernarySlot = armImmovableTernary
+                                    ? compiler->AllocaAtEntry(compiler->GetType(typeAndValue), nullptr,
+                                        std::format("{}.immovable.ternary", name))
+                                    : nullptr;
+                                LLVMBackend::NamedVariable rightNV;
+                                bool immovableCallBuiltInPlace = false;
+                                bool immovableTernaryBuiltInPlace = false;
+                                bool immovableTernaryFailed = false;
+                                {
+                                    struct RestorePendingTernary
+                                    {
+                                        LLVMBackend* compiler;
+                                        llvm::Value* destination;
+                                        std::string typeName;
+                                        bool consumed;
+                                        bool failed;
+                                        bool active;
+                                        RestorePendingTernary(LLVMBackend* c, llvm::Value* dest,
+                                                              const std::string& type)
+                                            : compiler(c), destination(c->pendingCxxTernaryDeclDest_),
+                                              typeName(c->pendingCxxTernaryDeclTypeName_),
+                                              consumed(c->pendingCxxTernaryDeclConsumed_),
+                                              failed(c->pendingCxxTernaryDeclFailed_), active(dest != nullptr)
+                                        {
+                                            if (!active) return;
+                                            compiler->pendingCxxTernaryDeclDest_ = dest;
+                                            compiler->pendingCxxTernaryDeclTypeName_ = type;
+                                            compiler->pendingCxxTernaryDeclConsumed_ = false;
+                                            compiler->pendingCxxTernaryDeclFailed_ = false;
+                                        }
+                                        bool Consumed() const
+                                        { return active && compiler->pendingCxxTernaryDeclConsumed_; }
+                                        bool Failed() const
+                                        { return active && compiler->pendingCxxTernaryDeclFailed_; }
+                                        ~RestorePendingTernary()
+                                        {
+                                            if (!active) return;
+                                            compiler->pendingCxxTernaryDeclDest_ = destination;
+                                            compiler->pendingCxxTernaryDeclTypeName_ = typeName;
+                                            compiler->pendingCxxTernaryDeclConsumed_ = consumed;
+                                            compiler->pendingCxxTernaryDeclFailed_ = failed;
+                                        }
+                                    } restoreTernary(compiler, immovableTernarySlot,
+                                                       typeAndValue.TypeName);
+                                    struct RestorePendingSret
+                                    {
+                                        LLVMBackend* compiler;
+                                        llvm::Value* destination;
+                                        std::string typeName;
+                                        ~RestorePendingSret()
+                                        {
+                                            compiler->pendingCxxSretDest_ = destination;
+                                            compiler->pendingCxxSretTypeName_ = typeName;
+                                        }
+                                    } restore{ compiler, compiler->pendingCxxSretDest_,
+                                               compiler->pendingCxxSretTypeName_ };
+                                    if (immovableCallSlot != nullptr)
+                                    {
+                                        compiler->pendingCxxSretDest_ = immovableCallSlot;
+                                        compiler->pendingCxxSretTypeName_ = typeAndValue.TypeName;
+                                    }
+                                    rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
+                                    immovableCallBuiltInPlace = immovableCallSlot != nullptr
+                                        && compiler->pendingCxxSretDest_ == nullptr;
+                                    immovableTernaryBuiltInPlace = restoreTernary.Consumed();
+                                    immovableTernaryFailed = restoreTernary.Failed();
+                                }
+                                if (immovableCallBuiltInPlace)
+                                {
+                                    armedImmovableSretStorage = immovableCallSlot;
+                                    srcCxxRetTemp = immovableCallSlot;
+                                    rightNV = {};
+                                    rightNV.TypeAndValue = typeAndValue;
+                                    rightNV.TypeAndValue.VariableName.clear();
+                                    rightNV.Primary = compiler->CreateLoad(
+                                        compiler->GetType(typeAndValue), immovableCallSlot);
+                                    rightNV.Storage = immovableCallSlot;
+                                    rightNV.BaseType = immovableCallSlot->getType();
+                                    rightNV.IsRvalue = true;
+                                }
+                                if (immovableTernaryFailed)
+                                    LogErrorContext(assignmentExpression, std::format(
+                                        "cannot initialize from a value of type '{}': the type is [immovable], "
+                                        "so the value may not be copied or moved into a new owner (initialize in "
+                                        "place, or borrow with 'alias' or a pointer)",
+                                        SpellDiagnosticType(*compiler, typeAndValue)));
+                                if (immovableTernaryBuiltInPlace)
+                                {
+                                    armedImmovableSretStorage = immovableTernarySlot;
+                                    srcCxxRetTemp = immovableTernarySlot;
+                                    rightNV = {};
+                                    rightNV.TypeAndValue = typeAndValue;
+                                    rightNV.TypeAndValue.VariableName.clear();
+                                    rightNV.Primary = compiler->CreateLoad(
+                                        compiler->GetType(typeAndValue), immovableTernarySlot);
+                                    rightNV.Storage = immovableTernarySlot;
+                                    rightNV.BaseType = immovableTernarySlot->getType();
+                                    rightNV.IsRvalue = true;
+                                }
+                                captureThisFieldSource(rightNV);
                                 const bool explicitMoveClosureInit =
                                     assignmentExpression->unaryExpression() != nullptr
                                     && assignmentExpression->unaryExpression()->moveExpression() != nullptr;
@@ -8697,7 +8881,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 if (compiler->lastCxxRetTemp_ != nullptr
                                     && rightNV.Storage == compiler->lastCxxRetTemp_
                                     && !rightNV.TypeAndValue.Pointer
-                                    && compiler->ReturnsViaCxxSret(
+                                    && compiler->ReturnsViaInPlaceSret(
                                         rightNV.TypeAndValue.TypeName))
                                     srcCxxRetTemp = compiler->lastCxxRetTemp_;
                                 // A native constructor or classified CFlat-only call result can
@@ -8719,7 +8903,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && !global_scope
                                     && llvm::isa_and_nonnull<llvm::AllocaInst>(rightNV.Storage)
                                     && !rightNV.TypeAndValue.Pointer
-                                    && compiler->ReturnsViaCxxSret(
+                                    && compiler->ReturnsViaInPlaceSret(
                                         rightNV.TypeAndValue.TypeName)
                                     && compiler->IsOwnedTempValue(rightNV))
                                     srcCxxRetTemp = rightNV.Storage;
@@ -8952,6 +9136,18 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && rightNV.Primary == nullptr && !rightNV.CallerName.empty())
                                     rightNV.Primary = compiler->GetFunctionForFuncPtr(rightNV.CallerName);
                                 right = LoadNamedVariable(rightNV);
+                                const bool uniquePointerDestination =
+                                    (typeAndValue.IsUnique && typeAndValue.Pointer
+                                        && !typeAndValue.ElemPointer && !typeAndValue.IsArrayView)
+                                    || (compiler->IsCoreUniqueType(typeAndValue.TypeName)
+                                        && !typeAndValue.Pointer && !typeAndValue.IsArrayView
+                                        && !compiler->IsInterfaceType(MangledGenericArgument(
+                                            *compiler, typeAndValue.TypeName)));
+                                if (uniquePointerDestination)
+                                {
+                                    srcIsUniquePointerJoin = compiler->CanAdoptUniquePointerJoin(right);
+                                    if (srcIsUniquePointerJoin) uniquePointerJoin = right;
+                                }
                                 bool uniqueFieldAssignmentResult = initializer
                                     && !global_scope && assignmentExpression != nullptr
                                     && assignmentExpression->assignmentOperator() != nullptr
@@ -8970,7 +9166,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     if (RejectConsumeOfBorrowedByValueParamField(
                                             compiler, rightNV, assignmentExpression))
                                         return allocList;
-                                    EmitImplicitUniqueFieldMove(rightNV, right, nullptr, {});
+                                    EmitImplicitUniqueFieldMove(
+                                        rightNV, right, nullptr, {}, assignmentExpression);
                                     rightNV.IsOwning = true;
                                     rightNV.IsBorrowed = false;
                                     rightNV.BorrowedOrigin.clear();
@@ -9263,6 +9460,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcFieldPathNV.MovePathHasDynamicIndex = rightNV.MovePathHasDynamicIndex;
                                 srcFieldPathNV.FieldPathText = rightNV.FieldPathText;
                                 srcFieldPathNV.FieldPathRoot = rightNV.FieldPathRoot;
+                                srcFieldPathNV.RootIsBorrowedThisField =
+                                    rightNV.RootIsBorrowedThisField;
+                                srcFieldPathNV.ThisFieldPath = rightNV.ThisFieldPath;
+                                srcFieldPathNV.ConditionalMoveSources =
+                                    rightNV.ConditionalMoveSources;
                                 srcFieldPathNV.FieldPathHasPointerDereference =
                                     rightNV.FieldPathHasPointerDereference;
                                 srcFieldPathNV.FieldPathPointerFrameLocal =
@@ -9861,11 +10063,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     || compiler->IsOwnedNewTemp(right)
                                     || compiler->IsOwningPtrTempValue(right)
                                     || compiler->IsMovedOutPtrValue(right)
+                                    || srcIsUniquePointerJoin
                                     || movedArmOwns(movedArmOwns, initializer)
                                     || (initializer != nullptr
                                         && initializer->getText().find("move") != std::string::npos
                                         && compiler->IsMovedOutPtrValue(right));
                                 initializerIsBorrowed = initializerIsBorrowed || !initializerOwns;
+                                if (srcIsUniquePointerJoin) initializerIsBorrowed = false;
                                 // A raw pointer binding can retain its original borrow bit after
                                 // an owning rebind. The move dataflow ledger is authoritative for
                                 // that case, so do not make the core constructor reject a fresh owner.
@@ -9955,6 +10159,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                                            typeAndValue.TypeName, right);
                                     right = compiler->CreateOverloadedFunctionCall(
                                         typeAndValue.TypeName, { ctorArg }, true);
+                                    // After the core ctor, so its alignment diagnostic keeps precedence.
+                                    RejectRawHeapArrayIntoUniqueLocal(
+                                        initializerSourceNV, typeAndValue, name, initDecl);
                                     compiler->lastOwningResult = false;
                                     compiler->lastCallReturnsOwned = false;
                                 }
@@ -10741,7 +10948,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     }
                     auto alloc = compiler->CreateLocalVariable(typeAndValue,
                         right ? right->getType() : nullptr, arraySize, line,
-                        typeAndValue.UserAlignValue, nrvoStorage);
+                        typeAndValue.UserAlignValue,
+                        nrvoStorage != nullptr ? nrvoStorage : armedImmovableSretStorage);
                     compiler->GetOrCreateStackVariable(name).IsTopLevelConst
                         = DeclSpecHasConst(declSpec) && typeAndValue.IsFunctionPointer;
                     // A const integer local with a constant initializer folds (array dims, value generic args).
@@ -10774,7 +10982,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         && !initializerHasTopLevelMove
                         && (srcInferredTypeName == typeAndValue.TypeName
                             || srcCxxRetTempFromDefault)
-                        && compiler->ReturnsViaCxxSret(typeAndValue.TypeName);
+                        && compiler->ReturnsViaInPlaceSret(typeAndValue.TypeName);
                     if (loweredSretResult)
                     {
                         // The user copy() call already built the initializer value in its sret temp.
@@ -11778,7 +11986,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                          * own release paths and keep the channel's plain reading.
                          */
                         auto* initAssignExprOwn = initializer ? initializer->assignmentExpression() : nullptr;
-                        bool initResultOwns = (compiler->lastOwningResult
+                        bool initResultOwns = srcIsUniquePointerJoin || (compiler->lastOwningResult
                             && (!typeAndValue.Pointer
                                 || (initAssignExprOwn != nullptr
                                     && (AsDirectNew(initAssignExprOwn) != nullptr
@@ -11841,6 +12049,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             compiler->lastOwningResult = false;
                             compiler->lastAllocAlignment = 0;
                         }
+                        if (srcIsUniquePointerJoin)
+                            compiler->ConsumeOwningLocalJoinArms(uniquePointerJoin, true, alloc);
                         if (typeAndValue.IsArrayView)
                             if (const auto* raw = compiler->FindRawArrayResult(srcPrimary);
                                 raw != nullptr && raw->RuntimeOwns != nullptr
@@ -12087,6 +12297,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         if (initializer && destUniqueLoc
                             && !srcIsMove && !srcIsNullLiteral)
                         {
+                            const auto& consumeSourceNV = haveInitializerSourceNV
+                                ? initializerSourceNV : srcFieldPathNV;
+                            if (RejectImplicitThisFieldConsume(
+                                    compiler, consumeSourceNV, false, initDecl))
+                                return allocList;
                             auto& nv = compiler->GetOrCreateStackVariable(name);
                             if (!nv.IsOwning && !nv.IsNewAllocated)
                             {
@@ -12424,6 +12639,27 @@ void MainListener::RejectRawHeapArrayIntoUniqueField(
             "hold the array in a local or a container", name));
     }
 
+void MainListener::RejectRawHeapArrayIntoUniqueLocal(
+        const LLVMBackend::NamedVariable& source,
+        const LLVMBackend::TypeAndValue& localType,
+        const std::string& localName,
+        antlr4::ParserRuleContext* ctx) {
+        const bool uniquePointer = compilerLLVM != nullptr
+            && ((localType.IsUnique && localType.Pointer && !localType.ElemPointer)
+                || (compilerLLVM->IsCoreUniqueType(localType.TypeName)
+                    && !localType.Pointer
+                    && !compilerLLVM->IsInterfaceType(MangledGenericArgument(
+                        *compilerLLVM, localType.TypeName))));
+        // A counted call result (a `move` return) is not a raw local's `new T[n]` provenance.
+        if (compilerLLVM == nullptr || !uniquePointer || localType.IsArrayView
+            || !compilerLLVM->HasRawNewArrayProvenance(source)
+            || compilerLLVM->FindRawArrayResult(source.Primary) != nullptr)
+            return;
+        LogErrorContext(ctx, std::format(
+            "cannot store a heap array in unique local '{}': unique<T> does not own "
+            "arrays - use 'array<T>'", localName));
+    }
+
 bool MainListener::IsOwningUniqueInterfaceField(const LLVMBackend::TypeAndValue& tv) {
         return tv.IsUnique
             && tv.IsInterface && !tv.Pointer
@@ -12543,8 +12779,10 @@ void MainListener::RejectUniqueTempFieldToField(const LLVMBackend::NamedVariable
  */
 void MainListener::EmitImplicitUniqueFieldMove(LLVMBackend::NamedVariable& rightNV,
                                       llvm::Value* right, llvm::Value* destination,
-                                      const std::string& destIfaceName) {
+                                      const std::string& destIfaceName,
+                                      antlr4::ParserRuleContext* ctx) {
         if (compilerLLVM == nullptr || right == nullptr) return;
+        if (RejectImplicitThisFieldConsume(compilerLLVM, rightNV, false, ctx)) return;
         // A joined field read has no single Storage. Clear each source in its own predecessor,
         // before the destination drop at the join, so the selected arm transfers ownership and a
         // runtime self-join sees a null old destination rather than freeing its live value.
@@ -14050,6 +14288,10 @@ bool MainListener::RejectOwningValueCopyIntoField(
             && (!rightNV.FieldName.empty() || !rightNV.OwningStructName.empty()
                 || llvm::isa_and_nonnull<llvm::GetElementPtrInst>(rightNV.Storage));
         if (coreUniqueFieldRead) return false;
+        // An immovable call result keeps its sret temp as Storage: a fresh value, not an alias.
+        if (rightNV.IsRvalue && !rightNV.TypeAndValue.Pointer
+            && compiler->IsImmovableCFlatStruct(rightNV.TypeAndValue.TypeName))
+            return false;
         if (!(right && right->getType()->isStructTy()
             && !rightNV.TypeAndValue.Pointer
             && !rightNV.TypeAndValue.IsArrayView

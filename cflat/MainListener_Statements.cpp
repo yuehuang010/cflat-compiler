@@ -124,6 +124,56 @@ namespace {
 
 using LoopConstKind = std::function<int(const LLVMBackend::NamedVariable&)>;
 
+bool IsImplicitMoveReturnLocal(LLVMBackend* compiler,
+                               CFlatParser::AssignmentExpressionContext* expression,
+                               const LLVMBackend::NamedVariable& source,
+                               const std::string& targetType,
+                               bool explicitMove)
+{
+        if (explicitMove || expression == nullptr || source.TypeAndValue.Pointer
+            || source.TypeAndValue.IsAlias
+            || !compiler->IsCxxRecord(compiler->ResolveTypeAlias(source.TypeAndValue.TypeName))
+            || !compiler->IsCxxRecord(compiler->ResolveTypeAlias(targetType)))
+            return false;
+
+        // The parse shape proves a bare identifier (with only parentheses around it). Match its
+        // already-resolved storage to the local/parameter lookup; fields, globals and aliases differ.
+        auto* identifier = BareIdentifierInExpression(UnwrapInitializerParens(expression));
+        if (identifier == nullptr) return false;
+        const auto local = compiler->GetScopedLocalOrArgument(identifier->getText());
+        const bool sameResolvedValue = local.Storage != nullptr
+            ? local.Storage == source.Storage
+            : local.Primary != nullptr && local.Primary == source.Primary;
+        return sameResolvedValue && !local.IsStaticLocal && !local.TypeAndValue.IsAlias
+            && !local.IsAliasBorrow && !local.IsAliasReturnBorrow && !local.IsBorrowed
+            && !local.IsBorrowedOwningValue && !local.IsRangeForBorrow
+            && !local.IsClosureRefCapture && !local.IsClosureValueCapture;
+}
+
+LLVMBackend::CxxConvertingCtorResult ConvertThroughCxxReturnCtor(
+    LLVMBackend* compiler, LLVMBackend::NamedVariable& converted,
+    const LLVMBackend::NamedVariable& source,
+    CFlatParser::AssignmentExpressionContext* expression,
+    const std::string& targetType, llvm::Value* intoSlot, std::string& refusal,
+    bool explicitMove)
+{
+        if (IsImplicitMoveReturnLocal(compiler, expression, source, targetType, explicitMove))
+        {
+            converted = source;
+            converted.IsRvalue = true;
+            // A return xvalue is still backed by the named local's storage. Clearing the caller
+            // spelling makes the constructor wrapper preserve the explicit value category above.
+            converted.CallerName.clear();
+            const auto verdict = compiler->ConvertThroughCxxConvertingCtor(
+                converted, targetType, intoSlot, refusal);
+            if (verdict == LLVMBackend::CxxConvertingCtorResult::Converted)
+                return verdict;
+        }
+
+        converted = source;
+        return compiler->ConvertThroughCxxConvertingCtor(converted, targetType, intoSlot, refusal);
+}
+
 // A loop body is emitted once, before its back-edge exists; collect const-pointee stores first
 // so receiver lookup joins the back-edge state at the loop header.
 
@@ -1162,22 +1212,12 @@ void MainListener::LogInterfaceReturnDangle(antlr4::ParserRuleContext* ctx, cons
 void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                                         CFlatParser::AssignmentExpressionContext* assignExpr,
                                         const std::string& retText,
-                                        bool defaultValue) {
+                                        bool defaultValue,
+                                        CFlatParser::ReturnBraceInitializerContext* braceInitializer) {
         auto* compiler = Compiler(errCtx);
-        // [immovable]: a CFlat struct returns by value through a first-class aggregate, not a sret slot,
-        // so every by-value return of it is refused. C++ records are checked after the operand parse.
-        if (!compiler->currentFunctionReturnTV.Pointer && !compiler->currentFunctionReturnTV.IsAlias
-            && !compiler->IsCxxRecord(compiler->currentFunctionReturnTypeName)
-            && compiler->IsImmovableType(compiler->currentFunctionReturnTypeName))
-        {
-            LogErrorContext(errCtx, std::format(
-                "cannot return a value of [immovable] type '{}' by value - the value would be moved "
-                "out of its construction site (return a pointer, or construct it in the caller)",
-                SpellDiagnosticType(*compiler, compiler->currentFunctionReturnTV)));
-            return;
-        }
         // T407: a by-value native struct return relocates the object; decided at module end.
-        if (!compiler->currentFunctionReturnTV.Pointer && !compiler->currentFunctionReturnTV.IsAlias)
+        if (!compiler->currentFunctionReturnTV.Pointer && !compiler->currentFunctionReturnTV.IsAlias
+            && !compiler->IsImmovableCFlatStruct(compiler->currentFunctionReturnTypeName))
             compiler->NoteThisClosureCopySite(compiler->currentFunctionReturnTypeName,
                                               LLVMBackend::ThisClosureCopyKind::Return);
         if (defaultValue && !compiler->currentFunctionReturnTV.Pointer
@@ -1255,7 +1295,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && compiler->currentFunctionAbiRecipe.retSlot.kind == LLVMBackend::AbiSlot::SRetReturn
             && !compiler->currentFunctionReturnTV.Pointer
             && !compiler->currentFunctionReturnTV.IsAlias
-            && compiler->ReturnsViaCxxSret(compiler->currentFunctionReturnTypeName);
+            && compiler->ReturnsViaInPlaceSret(compiler->currentFunctionReturnTypeName);
         llvm::Value* cxxSretDest = nullptr;
         if (cxxSretReturn && compiler->currentFunction != nullptr)
         {
@@ -1263,6 +1303,33 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             if (compiler->currentFunction->arg_size() <= sretIndex)
                 LogErrorContext(errCtx, "cannot return C++ class: the hidden sret slot is missing");
             cxxSretDest = compiler->currentFunction->getArg(sretIndex);
+        }
+        bool cflatReturnBraceConstructed = false;
+        if (braceInitializer != nullptr)
+        {
+            if (!compiler->IsImmovableCFlatStruct(compiler->currentFunctionReturnTypeName)
+                || !cxxSretReturn || cxxSretDest == nullptr)
+            {
+                LogErrorContext(errCtx,
+                    "a return brace initializer requires an immovable CFlat struct return");
+                return;
+            }
+            const std::string& typeName = compiler->currentFunctionReturnTypeName;
+            auto* fieldList = braceInitializer->initializerList();
+            if (!EmitFreshBraceInitializeAggregate(cxxSretDest, typeName, fieldList, true))
+            {
+                llvm::Value* defaultResult = EmitStructDefaultInto(cxxSretDest, typeName);
+                if (defaultResult != nullptr)
+                {
+                    LogErrorContext(errCtx, std::format(
+                        "cannot construct immovable return type '{}' directly in its return slot",
+                        SpellDiagnosticType(*compiler, compiler->currentFunctionReturnTV)));
+                    return;
+                }
+                if (fieldList != nullptr && !fieldList->fieldInit().empty())
+                    EmitFieldInitializer(cxxSretDest, typeName, fieldList, false);
+            }
+            cflatReturnBraceConstructed = true;
         }
         const bool cxxReturnTernary = cxxSretReturn && assignExpr != nullptr
             && SoleTernaryExpression(assignExpr) != nullptr;
@@ -1276,7 +1343,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         // retargeted to the return slot after the parse (below).
         const bool loweredCflatReturn = cxxSretReturn
             && !compiler->IsForeignNontrivialCxxReturnClass(compiler->currentFunctionReturnTypeName);
-        if (cxxReturnTernary && !loweredCflatReturn)
+        if (cxxReturnTernary && (!loweredCflatReturn
+                || compiler->IsImmovableCFlatStruct(compiler->currentFunctionReturnTypeName)))
         {
             compiler->pendingCxxTernaryDeclDest_ = cxxSretDest;
             compiler->pendingCxxTernaryDeclTypeName_ = compiler->currentFunctionReturnTypeName;
@@ -1334,7 +1402,19 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             }
             // [immovable] C++ record: C++17 elision builds a fresh prvalue in the sret slot, so only a place
             // operand (variable, field, element, deref) is refused; a fresh one stays legal.
-            if (cxxSretReturn && !compiler->currentFunctionReturnTV.Pointer && !compiler->currentFunctionReturnTV.IsAlias
+            if (compiler->IsImmovableCFlatStruct(compiler->currentFunctionReturnTypeName)
+                && !compiler->currentFunctionReturnTV.Pointer && !compiler->currentFunctionReturnTV.IsAlias
+                && !defaultValue && braceInitializer == nullptr && !returnNV.TypeAndValue.Pointer
+                && (returnNV.IsExplicitMove || !compiler->IsImmovableFreshOperand(returnNV)))
+            {
+                LogErrorContext(errCtx, std::format(
+                    "cannot return a value of [immovable] type '{}' by value - the value would be moved "
+                    "out of its construction site (return a pointer, or construct it in the caller)",
+                    SpellDiagnosticType(*compiler, compiler->currentFunctionReturnTV)));
+                return;
+            }
+            if (cxxSretReturn && compiler->IsCxxRecord(compiler->currentFunctionReturnTypeName)
+                && !compiler->currentFunctionReturnTV.Pointer && !compiler->currentFunctionReturnTV.IsAlias
                 && !returnNV.TypeAndValue.Pointer && compiler->IsImmovableType(compiler->currentFunctionReturnTypeName)
                 && (returnNV.IsExplicitMove || !compiler->IsImmovableFreshOperand(returnNV)))
             {
@@ -1545,7 +1625,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 compiler->FlushOwnedTemps();
                 compiler->CreateReturnCall(nullptr);
             };
-            if (cxxReturnCallConstructed || cxxReturnTernaryConstructed)
+            if (cxxReturnCallConstructed || cxxReturnTernaryConstructed || cflatReturnBraceConstructed)
             {
                 finishLoweredReturn();
                 return;
@@ -1726,6 +1806,11 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             };
             if (cxxReturnTernaryFailed)
             {
+                if (compiler->IsImmovableCFlatStruct(compiler->currentFunctionReturnTypeName))
+                    LogErrorContext(errCtx, std::format(
+                        "cannot return a value of [immovable] type '{}' by value - the value would be moved "
+                        "out of its construction site (return a pointer, or construct it in the caller)",
+                        SpellDiagnosticType(*compiler, compiler->currentFunctionReturnTV)));
                 LogErrorContext(errCtx, std::format(
                     "cannot return C++ class '{}' from this conditional expression",
                     compiler->DisplayCxxClassName(CurrentReturnTypeSpelling(compiler))));
@@ -1898,8 +1983,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 std::string refusal;
                 LLVMBackend::NamedVariable converted = returnNV;
                 compiler->SetCurrentDebugLocation(errCtx->getStart()->getLine());
-                const auto verdict = compiler->ConvertThroughCxxConvertingCtor(
-                    converted, typeName, cxxSretDest, refusal);
+                const auto verdict = ConvertThroughCxxReturnCtor(
+                    compiler, converted, returnNV, assignExpr, typeName, cxxSretDest, refusal,
+                    explicitMove);
                 if (verdict == LLVMBackend::CxxConvertingCtorResult::Converted)
                 {
                     finishCxxSretReturn();
@@ -2437,6 +2523,18 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             right = compiler->AdjustCxxPointerForStore(
                 compiler->currentFunctionReturnTV, returnNV.TypeAndValue, right,
                 "the return value");
+        const bool owningPointerReturn = compiler->currentFunctionReturnTV.IsUnique
+            || (compiler->IsCoreUniqueType(compiler->currentFunctionReturnTV.TypeName)
+                && !compiler->currentFunctionReturnTV.Pointer)
+            || compiler->currentFunctionReturnTV.IsMove;
+        const bool owningValueReturn = !compiler->currentFunctionReturnTV.Pointer
+            && compiler->IsOwningValueType(compiler->currentFunctionReturnTV.TypeName)
+            && !compiler->IsCopyableType(compiler->currentFunctionReturnTV.TypeName);
+        // An `alias` return borrows the slot; only a by-value owning return transfers (T447).
+        const bool aliasReturnBorrows = aliasRefReturn || compiler->currentFunctionReturnTV.IsAlias;
+        if ((owningPointerReturn || owningValueReturn) && !aliasReturnBorrows
+            && RejectImplicitThisFieldConsume(compiler, returnNV, false, errCtx))
+            return;
         if (coreUniqueRawReturn)
             returnNV.TypeAndValue = compiler->currentFunctionReturnTV;
 
@@ -2454,6 +2552,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         if (rawPointerReturn)
         {
             const bool returnedNull = llvm::isa<llvm::ConstantPointerNull>(right);
+            if (!returnedNull
+                && RejectImplicitThisFieldConsume(compiler, returnNV, false, errCtx))
+                return;
             const bool sourceBorrowed = returnNV.IsBorrowed
                 || returnNV.IsAliasBorrow
                 || returnNV.TypeAndValue.IsAlias
@@ -2651,8 +2752,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 auto convertedSource = returnNV;
                 std::string refusal;
                 compiler->SetCurrentDebugLocation(errCtx->getStart()->getLine());
-                const auto verdict = compiler->ConvertThroughCxxConvertingCtor(
-                    convertedSource, targetType, convertedSlot, refusal);
+                const auto verdict = ConvertThroughCxxReturnCtor(
+                    compiler, convertedSource, returnNV, assignExpr, targetType, convertedSlot,
+                    refusal, TopLevelMoveExpression(assignExpr) != nullptr);
                 if (verdict == LLVMBackend::CxxConvertingCtorResult::Converted)
                 {
                     right = compiler->builder->CreateLoad(returnTy, convertedSlot);
@@ -3811,6 +3913,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         ParseBlockItemList(blockItems);
                     compiler->CreateBlockBreak(nullptr, true);
                 }
+                else if (auto* brace = jump->returnBraceInitializer())
+                    EmitReturnExpression(jump, nullptr, brace->getText(), false, brace);
                 else
                 {
                     auto express = jump->expression();
@@ -6048,7 +6152,7 @@ void MainListener::GenerateDefaultParamOverloads(
                 // A C++-lowered result (a struct with a C++ field) is built straight into this
                 // wrapper's own sret slot: a bit-copy of a temporary would dangle self-pointers.
                 const auto& recipe = compiler->currentFunctionAbiRecipe;
-                const bool sretWrapper = compiler->ReturnsViaCxxSret(returnType.TypeName)
+                const bool sretWrapper = compiler->ReturnsViaInPlaceSret(returnType.TypeName)
                     && recipe.hasLowering && recipe.retSlot.kind == LLVMBackend::AbiSlot::SRetReturn
                     && compiler->currentFunction != nullptr;
                 if (sretWrapper)

@@ -1,0 +1,141 @@
+struct T447ConsumePS { int v = 0; T447ConsumePS(int x) { v = x; } ~T447ConsumePS() {} };
+void t447_consume_sink(move T447ConsumePS* value) { }
+
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447ConsumeAssignImplicit {
+        unique T447ConsumePS* p = default;
+        void bad() { unique T447ConsumePS* o = nullptr; o = p; }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447ConsumeAssignDot {
+        unique T447ConsumePS* p = default;
+        void bad() { unique T447ConsumePS* o = nullptr; o = this.p; }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447ConsumeAssignArrow {
+        unique T447ConsumePS* p = default;
+        void bad() { unique T447ConsumePS* o = nullptr; o = this->p; }
+    };
+}
+
+expect_error("cannot initialize unique<T447ConsumePS> 'o' from borrowed value") {
+    struct T447ConsumeDeclImplicit {
+        unique T447ConsumePS* p = default;
+        void bad() { unique T447ConsumePS* o = p; }
+    };
+}
+expect_error("cannot initialize unique<T447ConsumePS> 'o' from borrowed value") {
+    struct T447ConsumeDeclDot {
+        unique T447ConsumePS* p = default;
+        void bad() { unique T447ConsumePS* o = this.p; }
+    };
+}
+expect_error("cannot initialize unique<T447ConsumePS> 'o' from borrowed value") {
+    struct T447ConsumeDeclArrow {
+        unique T447ConsumePS* p = default;
+        void bad() { unique T447ConsumePS* o = this->p; }
+    };
+}
+
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447ConsumeReturnImplicit {
+        unique T447ConsumePS* p = default;
+        unique T447ConsumePS* bad() { return p; }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447ConsumeReturnDot {
+        unique T447ConsumePS* p = default;
+        unique T447ConsumePS* bad() { return this.p; }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447ConsumeReturnArrow {
+        unique T447ConsumePS* p = default;
+        unique T447ConsumePS* bad() { return this->p; }
+    };
+}
+
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447ConsumeSinkImplicit {
+        unique T447ConsumePS* p = default;
+        void bad() { t447_consume_sink(p); }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447ConsumeSinkDot {
+        unique T447ConsumePS* p = default;
+        void bad() { t447_consume_sink(this.p); }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447ConsumeSinkArrow {
+        unique T447ConsumePS* p = default;
+        void bad() { t447_consume_sink(this->p); }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447ConsumeSinkTernary {
+        unique T447ConsumePS* p = default;
+        unique T447ConsumePS* q = default;
+        void bad(bool c) { t447_consume_sink(c ? p : q); }
+    };
+}
+
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447ConsumeTernaryImplicit {
+        unique T447ConsumePS* p = default;
+        unique T447ConsumePS* q = default;
+        void bad(bool c) { unique T447ConsumePS* o = nullptr; o = c ? p : q; }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447ConsumeTernaryDot {
+        unique T447ConsumePS* p = default;
+        unique T447ConsumePS* q = default;
+        void bad(bool c) { unique T447ConsumePS* o = nullptr; o = c ? this.p : this.q; }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447ConsumeTernaryArrow {
+        unique T447ConsumePS* p = default;
+        unique T447ConsumePS* q = default;
+        void bad(bool c) { unique T447ConsumePS* o = nullptr; o = c ? this->p : this->q; }
+    };
+}
+
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447ConsumeBraceDestImplicit { unique T447ConsumePS* q = default; };
+    struct T447ConsumeBraceImplicit {
+        unique T447ConsumePS* p = default;
+        void bad() { T447ConsumeBraceDestImplicit out = { q = p }; }
+    };
+}
+expect_error("cannot store 'this.p' into unique field") {
+    struct T447ConsumeBraceDestDot { unique T447ConsumePS* q = default; };
+    struct T447ConsumeBraceDot {
+        unique T447ConsumePS* p = default;
+        void bad() { T447ConsumeBraceDestDot out = { q = this.p }; }
+    };
+}
+expect_error("cannot store 'this.p' into unique field") {
+    struct T447ConsumeBraceDestArrow { unique T447ConsumePS* q = default; };
+    struct T447ConsumeBraceArrow {
+        unique T447ConsumePS* p = default;
+        void bad() { T447ConsumeBraceDestArrow out = { q = this->p }; }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447ConsumeArrayOtherElement {
+        unique T447ConsumePS*[2] p;
+        void bad() { p[0] = p[1]; }
+    };
+}
+expect_error("cannot consume owning field 'p' out of the borrowed receiver 'this'") {
+    struct T447ConsumeArrayDynamicElement {
+        unique T447ConsumePS*[2] p;
+        void bad(int i, int j) { p[i] = p[j]; }
+    };
+}

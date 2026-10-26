@@ -57,3 +57,33 @@ inline const T335ConstMutableHolder t335ConstMutableHolder{{3}};
 
 struct T335AnonymousUnion { union { mutable int m; int n; }; };
 inline const T335AnonymousUnion t335AnonymousUnion{1};
+
+struct T450Inner
+{
+    mutable int mark = 0;
+    int operator+(int) { return 31; } int operator+(int) const { return 42; }
+    int operator+=(int) { mark = 131; return 131; }
+    int operator+=(int) const { mark = 142; return 142; }
+    int operator-() { return 231; } int operator-() const { return 242; }
+    int operator[](int) { return 331; } int operator[](int) const { return 342; }
+    int operator()(int) { return 431; } int operator()(int) const { return 442; }
+    int operator==(int) { return 531; } int operator==(int) const { return 542; }
+};
+
+struct T450Item
+{
+    mutable int mark = 0;
+    int pick() { return 11; } int pick() const { return 22; }
+    int operator+(int) { return 31; } int operator+(int) const { return 42; }
+    int operator+=(int) { mark = 131; return 131; }
+    int operator+=(int) const { mark = 142; return 142; }
+    int operator-() { return 231; } int operator-() const { return 242; }
+    int operator[](int) { return 331; } int operator[](int) const { return 342; }
+    int operator()(int) { return 431; } int operator()(int) const { return 442; }
+    int operator==(int) { return 531; } int operator==(int) const { return 542; }
+    T450Inner inner{};
+};
+
+struct T450Holder { T450Item normal; mutable T450Item mut; const T450Item fixed; };
+inline const T450Holder t450ConstHolder{};
+inline T450Holder t450MutableHolder{};

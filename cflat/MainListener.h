@@ -4082,6 +4082,14 @@ template <> struct RuleIndexOf<CFlatParser::AssignmentExpressionContext>
 { static constexpr size_t value = CFlatParser::RuleAssignmentExpression; };
 template <> struct RuleIndexOf<CFlatParser::InitDeclaratorContext>
 { static constexpr size_t value = CFlatParser::RuleInitDeclarator; };
+template <> struct RuleIndexOf<CFlatParser::CompoundStatementContext>
+{ static constexpr size_t value = CFlatParser::RuleCompoundStatement; };
+template <> struct RuleIndexOf<CFlatParser::ParameterDeclarationContext>
+{ static constexpr size_t value = CFlatParser::RuleParameterDeclaration; };
+template <> struct RuleIndexOf<CFlatParser::StructDefinitionContext>
+{ static constexpr size_t value = CFlatParser::RuleStructDefinition; };
+template <> struct RuleIndexOf<CFlatParser::ClassDefinitionContext>
+{ static constexpr size_t value = CFlatParser::RuleClassDefinition; };
 
 template <typename Ctx>
 inline Ctx* AsRuleCtx(antlr4::tree::ParseTree* node)
@@ -4465,6 +4473,132 @@ static ValueStructReturnKind ClassifyValueStructReturns(
     }
     if (borrowed == 0) return ValueStructReturnKind::NotApplicable;
     return other == 0 ? ValueStructReturnKind::AllBorrowedParam : ValueStructReturnKind::Mixed;
+}
+
+// Nodes that open a declaration scope: a name declared under one is visible only inside it.
+static bool IsDeclScopeNode(antlr4::tree::ParseTree* node)
+{
+    return AsRuleCtx<CFlatParser::CompoundStatementContext>(node) != nullptr
+        || AsRuleCtx<CFlatParser::IterationStatementContext>(node) != nullptr
+        || AsRuleCtx<CFlatParser::SelectionStatementContext>(node) != nullptr
+        || AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node) != nullptr
+        || AsRuleCtx<CFlatParser::LambdaExpressionContext>(node) != nullptr
+        || AsRuleCtx<CFlatParser::ParameterDeclarationContext>(node) != nullptr
+        || AsRuleCtx<CFlatParser::StructDefinitionContext>(node) != nullptr
+        || AsRuleCtx<CFlatParser::ClassDefinitionContext>(node) != nullptr;
+}
+
+// Implicit-this fields of a struct body: declarators outside every nested scope (method bodies,
+// parameter lists, nested aggregates). A field is visible across the whole struct, so no order test.
+static void CollectFieldNames(antlr4::tree::ParseTree* node, std::unordered_set<std::string>& out)
+{
+    if (node == nullptr) return;
+    if (auto* d = dynamic_cast<CFlatParser::DirectDeclaratorContext*>(node))
+        out.insert(getDirectDeclName(d));
+    for (auto* child : node->children)
+        if (!IsDeclScopeNode(child)) CollectFieldNames(child, out);
+}
+
+// Locals a use can see: a declarator whose every enclosing scope also encloses the use, declared
+// before it. 'enclosing' holds the use's ancestors. A 'for (T x in ...)' variable is visible in its loop.
+static void CollectVisibleLocals(antlr4::tree::ParseTree* node,
+                                 const std::unordered_set<antlr4::tree::ParseTree*>& enclosing,
+                                 size_t usePos, std::unordered_set<std::string>& out)
+{
+    if (node == nullptr) return;
+    if (auto* d = dynamic_cast<CFlatParser::DirectDeclaratorContext*>(node))
+    {
+        bool visible = d->getStart()->getTokenIndex() < usePos;
+        for (auto* p = d->parent; visible && p != nullptr; p = p->parent)
+            if (IsDeclScopeNode(p) && enclosing.count(p) == 0) visible = false;
+        if (visible) out.insert(getDirectDeclName(d));
+    }
+    if (auto* loop = AsRuleCtx<CFlatParser::IterationStatementContext>(node))
+        if (loop->Identifier() != nullptr && enclosing.count(loop) != 0)
+            out.insert(loop->Identifier()->getText());
+    for (auto* child : node->children)
+        CollectVisibleLocals(child, enclosing, usePos, out);
+}
+
+static bool IsIdentifierText(const std::string& s)
+{
+    return !s.empty() && (std::isalpha(static_cast<unsigned char>(s[0])) || s[0] == '_')
+        && std::all_of(s.begin(), s.end(), [](char ch) {
+            return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_'; });
+}
+
+// The head of an 'a' or 'a.b.c' path; empty when the text is not such a path.
+static std::string DottedPathHead(const std::string& text)
+{
+    std::string head;
+    size_t start = 0;
+    for (size_t i = 0; i <= text.size(); ++i)
+    {
+        if (i < text.size() && text[i] != '.') continue;
+        const std::string segment = text.substr(start, i - start);
+        if (!IsIdentifierText(segment)) return {};
+        if (start == 0) head = segment;
+        start = i + 1;
+    }
+    return head;
+}
+
+// Parse-tree summary for the borrowed-GLOBAL refusal: does every own 'return' name a module
+// global at that return? A returned name, or the head of a dotted path (`return Ns.q;`), is a
+// global unless a parameter, an implicit-this field, or a local declared in an enclosing block
+// before the return binds it there. 'nullptr' is not one. A base struct can hide an inherited
+// field, so it yields no summary. Source-only, so definition order cannot matter.
+inline bool ReturnsOnlyModuleGlobals(CFlatParser::FunctionDefinitionContext* func,
+                                     const std::vector<LLVMBackend::TypeAndValue>& allParams)
+{
+    if (func == nullptr || func->compoundStatement() == nullptr) return false;
+    std::vector<CFlatParser::ExpressionContext*> returns;
+    CollectOwnReturnExpressions(func->compoundStatement(), returns);
+    if (returns.empty()) return false;
+
+    antlr4::tree::ParseTree* structNode = nullptr;
+    for (antlr4::tree::ParseTree* p = func->parent; p != nullptr; p = p->parent)
+    {
+        if (auto* s = dynamic_cast<CFlatParser::StructDefinitionContext*>(p))
+        {
+            if (!s->baseSpecifier().empty()) return false;
+            structNode = s;
+            break;
+        }
+        if (auto* c = dynamic_cast<CFlatParser::ClassDefinitionContext*>(p))
+        {
+            if (!c->baseSpecifier().empty()) return false;
+            structNode = c;
+            break;
+        }
+    }
+    std::unordered_set<std::string> bound;
+    if (structNode != nullptr) CollectFieldNames(structNode, bound);
+    for (const auto& p : allParams)
+        bound.insert(p.VariableName);
+    for (auto* expr : returns)
+    {
+        const std::string head = DottedPathHead(BareSourceText(expr));
+        if (head.empty() || head == "nullptr" || bound.count(head) != 0) return false;
+        std::unordered_set<antlr4::tree::ParseTree*> enclosing;
+        for (antlr4::tree::ParseTree* p = expr; p != nullptr; p = p->parent)
+            enclosing.insert(p);
+        std::unordered_set<std::string> locals;
+        CollectVisibleLocals(func, enclosing, expr->getStart()->getTokenIndex(), locals);
+        if (locals.count(head) != 0) return false;
+    }
+    return true;
+}
+
+// Set the summary on every overload with this exact parameter list (overloads of one name).
+inline void MarkReturnsGlobalBorrow(std::vector<LLVMBackend::FunctionSymbol>& overloads,
+                                    const std::vector<LLVMBackend::TypeAndValue>& allParams)
+{
+    for (auto& sym : overloads)
+        if (sym.ReturnType.Pointer && sym.Parameters.size() == allParams.size()
+            && std::equal(allParams.begin(), allParams.end(), sym.Parameters.begin(),
+                [](const auto& a, const auto& b) { return a.TypeName == b.TypeName && a.Pointer == b.Pointer; }))
+            sym.ReturnsGlobalBorrow = true;
 }
 
 // Arrow-normalized form of a lock expression's source text: 'p->m' becomes 'p.m'. The mode
@@ -6373,6 +6507,7 @@ private:
     };
     CFlatParser* parser;
     LLVMBackend* compilerLLVM;
+    std::function<void(antlr4::ParserRuleContext*, std::string)> savedContextualErrorReporter_;
     std::string sourceFileName;
     std::string importNamespace_;
     unsigned addressOfOperandDepth_ = 0;
@@ -7740,7 +7875,8 @@ public:
     void EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                               CFlatParser::AssignmentExpressionContext* assignExpr,
                               const std::string& retText,
-                              bool defaultValue = false);
+                              bool defaultValue = false,
+                              CFlatParser::ReturnBraceInitializerContext* braceInitializer = nullptr);
 
     void ParseStatement(CFlatParser::StatementContext* statement);
 
@@ -8133,6 +8269,11 @@ public:
         const LLVMBackend::TypeAndValue& fieldType,
         const std::string& fieldName,
         antlr4::ParserRuleContext* ctx);
+    void RejectRawHeapArrayIntoUniqueLocal(
+        const LLVMBackend::NamedVariable& source,
+        const LLVMBackend::TypeAndValue& localType,
+        const std::string& localName,
+        antlr4::ParserRuleContext* ctx);
 
     /*
      * The fat-interface counterpart of IsOwningUniquePointerField: a field that PROVABLY owns a
@@ -8205,7 +8346,8 @@ public:
      * no compile-time proof can rule out for a runtime index, free nothing.
      */
     void EmitImplicitUniqueFieldMove(LLVMBackend::NamedVariable& rightNV, llvm::Value* right,
-                                     llvm::Value* destination, const std::string& destIfaceName);
+                                     llvm::Value* destination, const std::string& destIfaceName,
+                                     antlr4::ParserRuleContext* ctx);
 
     /*
      * Reject an allocation-alignment disagreement storing into a struct field. The alignment of an
@@ -10243,6 +10385,18 @@ public:
     bool RejectImplicitConsumeOfOutlivingOwner(
         LLVMBackend* compiler, const LLVMBackend::NamedVariable& srcNV,
         bool srcIsMove, antlr4::ParserRuleContext* ctx);
+    bool RejectImplicitThisFieldConsume(
+        LLVMBackend* compiler, const LLVMBackend::NamedVariable& srcNV,
+        bool srcIsMove, antlr4::ParserRuleContext* ctx);
+    // Slot key of the `=` destination being lowered; `item = item;` is no transfer out.
+    std::string thisFieldAssignDestPath_;
+    // Field path + constant index path; empty (never exempt) for a dynamic index or non-this slot.
+    static std::string ThisFieldSlotKey(const LLVMBackend::NamedVariable& nv)
+    {
+        if (!nv.RootIsBorrowedThisField || nv.ThisFieldPath.empty() || nv.MovePathHasDynamicIndex)
+            return {};
+        return nv.ThisFieldPath + "|" + nv.MovePathKey;
+    }
     // Each source arm of a '?:' / '??' join that feeds a unique field store gets the same refusal
     // its plain form gets (a field of a borrowed by-value parameter). True when refused.
     bool RejectJoinedSourceIntoUniqueField(

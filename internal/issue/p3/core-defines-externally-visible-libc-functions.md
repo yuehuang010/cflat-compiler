@@ -1,20 +1,15 @@
-# Core defines externally visible C library functions (printf, puts, scanf, ...)
+# Core stdio bodies interpose on C and C++ objects
 
-**RULED 2026-10-21:** mark CFlat definitions of libc names `nobuiltin` (LLVM calls the CFlat body); users may still override libc names. See fix-issue-lessons.md digest.
+**RULED 2026-10-21:** CFlat definitions of libc names are marked `nobuiltin`, so LLVM calls the
+CFlat body; users may still override libc names. This ruling does not rename core bodies or make
+them internal.
 
-Ruling 2026-09-30 (maintainer): core must not define externally visible functions; a USER program may
-define a C library name (C linkage) and it must win (see p2/o2-builtin-folding item 1).
+`cflat/core/cruntime.cb` defines 19 C-linkage bodies for hook-aware stdio: printf, sprintf,
+snprintf, vprintf, vsprintf, vsnprintf, puts, putchar, putn, fputs, fputc, putc, fprintf, fgets,
+scanf, getchar, getc, sscanf, and fscanf.
 
-Today cflat/core/cruntime.cb defines 19 C-linkage bodies that interpose libc for the whole link:
-printf, sprintf, snprintf, vprintf, vsprintf, vsnprintf, puts, putchar, putn, fputs, fputc, putc,
-fprintf, fgets, scanf, getchar, getc, sscanf, fscanf (`extern int printf(...) { ... }`, ~191-486).
-They are the hook-aware / VT-correct stdio used by CFlat code (stdout capture for --run and
-program.onStdout, per the comments).
+A separately compiled `.c` object or a C++ header inline that calls `printf` still resolves to the
+core definition instead of host libc. This object-file interposition remains outside the T444
+ruling.
 
-Consequences: a linked `.c` object or C++ import calling printf lands in core's body; a user program
-defining its own printf collides with core's definition instead of simply winning.
-
-Fix direction: give the core bodies internal linkage (or a `__cflat_` name) and bind CFlat-source calls
-of these names to them; C/C++ objects then get real libc. Decide first whether C/C++ code must keep
-the stdout hook under --run (today it does by accident of interposition) - that is the one behaviour
-this changes. Sweep core for any other C-linkage body.
+T444: nobuiltin landed; C-object interposition unchanged

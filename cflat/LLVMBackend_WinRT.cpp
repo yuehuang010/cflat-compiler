@@ -2094,6 +2094,27 @@ std::string LLVMBackend::ImplicitOutlivingOwnerConsumeError(const NamedVariable&
             spelling, spelling, SpellType(*this, srcNV.TypeAndValue));
 }
 
+std::string LLVMBackend::ImplicitThisFieldConsumeError(const NamedVariable& srcNV,
+        bool srcIsMove) const
+{
+        if (srcIsMove || srcNV.IsExplicitMove) return {};
+        std::string fieldPath;
+        if (srcNV.RootIsBorrowedThisField)
+            fieldPath = srcNV.ThisFieldPath;
+        if (fieldPath.empty())
+            for (const auto& source : srcNV.ConditionalMoveSources)
+                if (source.RootIsBorrowedThisField && !source.ThisFieldPath.empty())
+                {
+                    fieldPath = source.ThisFieldPath;
+                    break;
+                }
+        if (fieldPath.empty()) return {};
+        return std::format(
+            "cannot consume owning field '{}' out of the borrowed receiver 'this' - write "
+            "'move {}' to take the value and leave the field empty",
+            fieldPath, fieldPath);
+}
+
 bool LLVMBackend::IsFunctionValueType(const TypeAndValue& type) const
 {
         return type.IsFunctionPointer || type.TypeName == "__c_fn_ptr"
@@ -2140,6 +2161,17 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
             if (type.IsFunctionPointer || type.TypeName == "__c_fn_ptr") return type.IsThinFnPtr();
             const auto* encoded = GetEncodedClosureType(type.TypeName);
             return encoded != nullptr && encoded->IsThinFnPtr();
+        };
+        // An implicit consume of a field of the borrowed receiver `this` is refused at the point
+        // the source slot would be cleared (T447). True when reported.
+        auto reportThisFieldConsume = [&](const NamedVariable& arg) {
+            const std::string error = ImplicitThisFieldConsumeError(arg, false);
+            if (error.empty()) return false;
+            if (arg.SourceExpressionContext != nullptr && contextualErrorReporter)
+                contextualErrorReporter(arg.SourceExpressionContext, error);
+            else
+                LogError(error);
+            return true;
         };
         for (size_t i = 0; i < params.size() && i < args.size(); i++)
         {
@@ -2463,6 +2495,15 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 if (!args[i].ConditionalMoveSources.empty()
                     && (isOwningSink || (params[i].IsMove && anyMoveParamCallArm)))
                 {
+                    const bool nullsThisFieldArm = std::any_of(
+                        args[i].ConditionalMoveSources.begin(), args[i].ConditionalMoveSources.end(),
+                        [&](const auto& source) {
+                            return source.RootIsBorrowedThisField
+                                && (isOwningSink
+                                    || (source.MoveParamSinkArgument && !source.BorrowedPointer));
+                        });
+                    if (beforeCall && nullsThisFieldArm && reportThisFieldConsume(args[i]))
+                        continue;
                     for (const auto& source : args[i].ConditionalMoveSources)
                     {
                         if (!isOwningSink
@@ -2498,6 +2539,18 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     // A unique<T> wrapper releases its pointee while lowering the raw-pointer
                     // argument. Do not clear the wrapper before that release call runs.
                     if (foreignCxxPointerSink && !args[i].TypeAndValue.Pointer)
+                        continue;
+                    // The source slot is cleared below: that is the consume a this-field refuses.
+                    const bool nullsFatData = params[i].IsFatInterfaceValue()
+                        && args[i].TypeAndValue.IsFatInterfaceValue()
+                        && (args[i].IsOwning || IsVariableOwning(sourceName))
+                        && srcStorage != nullptr;
+                    const bool nullsSlot = srcStorage != nullptr && !isInterfaceBorrow
+                        && (llvm::isa_and_nonnull<llvm::PointerType>(srcBaseTy)
+                            || (params[i].TypeName == "string" && args[i].IsOwningString)
+                            || llvm::isa_and_nonnull<llvm::StructType>(srcBaseTy));
+                    if ((nullsFatData || nullsSlot) && sourceIsOwning
+                        && reportThisFieldConsume(args[i]))
                         continue;
                     // Clear the source before the callee can observe or reseat an aliased slot.
                     if (params[i].IsFatInterfaceValue()
@@ -3468,7 +3521,7 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         const bool cxxSretReturn = !methodInfo->ReturnType.Pointer
             && !methodInfo->ReturnType.IsAlias
             && !methodInfo->ReturnType.IsArrayView
-            && ReturnsViaCxxSret(methodInfo->ReturnType.TypeName);
+            && ReturnsViaInPlaceSret(methodInfo->ReturnType.TypeName);
         std::vector<TypeAndValue> interfaceRecipeParams;
         TypeAndValue receiver;
         receiver.TypeName = ifaceName;

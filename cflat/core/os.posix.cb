@@ -14,13 +14,18 @@ if const (__PLATFORM__ == 64) {
     using win_size    = i32;
     using win_usize   = u32;
 }
+if const (__MACOS__) {
+    using win_nfds = u32;
+} else {
+    using win_nfds = ulong;
+}
 
 namespace os.posix
 {
     // Low-level I/O. fd 0 = stdin, 1 = stdout, 2 = stderr. write/read return the
     // byte count (ssize_t) or -1 on error.
-    extern win_size write(i32 fd, const void* buf, win_size count);
-    extern win_size read(i32 fd, void* buf, win_size count);
+    extern win_size write(i32 fd, const void* buf, win_usize count);
+    extern win_size read(i32 fd, void* buf, win_usize count);
 
     // C stdio formatting (libc). cflat defines its OWN printf/sprintf/vsnprintf/etc.
     // (hook-aware, in cruntime.cb), so binding the public `vsnprintf` name here would
@@ -32,7 +37,7 @@ namespace os.posix
     //   __vsnprintf_chk(s, maxlen, flag, slen, fmt, ap): flag=0 (plain, no fortify
     //     %n restriction), slen=maxlen so the bounds check never trips spuriously.
     //   __vfprintf_chk(fp, flag, fmt, ap): flag=0.
-    extern win_int __vsnprintf_chk(char* buf, win_size maxlen, win_int flag, win_size slen, const char* fmt, va_list ap);
+    extern win_int __vsnprintf_chk(char* buf, win_usize maxlen, win_int flag, win_usize slen, const char* fmt, va_list ap);
     extern win_int __isoc99_vsscanf(const char* buf, const char* fmt, va_list ap);
     extern win_int __vfprintf_chk(void* stream, win_int flag, const char* fmt, va_list ap);
     extern win_int __isoc99_vfscanf(void* stream, const char* fmt, va_list ap);
@@ -126,7 +131,7 @@ namespace os.posix
     // and topology is read via sysctlbyname.
     if const (__MACOS__) {
         extern win_int pthread_set_qos_class_self_np(i32 qos_class, i32 relative_priority);
-        extern win_int sysctlbyname(const char* name, void* oldp, win_size* oldlenp, void* newp, win_size newlen);
+        extern win_int sysctlbyname(const char* name, void* oldp, win_usize* oldlenp, void* newp, win_usize newlen);
         // QOS_CLASS_* from <sys/qos.h>.
         int QOS_CLASS_USER_INTERACTIVE = 0x21;
         int QOS_CLASS_USER_INITIATED   = 0x19;
@@ -135,12 +140,12 @@ namespace os.posix
         int QOS_CLASS_BACKGROUND       = 0x09;
         int QOS_CLASS_UNSPECIFIED      = 0;
     } else {
-        extern win_int pthread_setaffinity_np(void* thread, win_size cpusetsize, const void* cpuset);
+        extern win_int pthread_setaffinity_np(void* thread, win_usize cpusetsize, const void* cpuset);
         // Process-wide affinity (pid 0 == calling thread; NOTE it affects only the
         // CALLING thread on Linux, not the whole process). cpu_set_t is a fixed
         // 128-byte bitmap, same shape thread_set_affinity already builds.
-        extern win_int sched_setaffinity(i32 pid, win_size cpusetsize, const void* mask);
-        extern win_int sched_getaffinity(i32 pid, win_size cpusetsize, void* mask);
+        extern win_int sched_setaffinity(i32 pid, win_usize cpusetsize, const void* mask);
+        extern win_int sched_getaffinity(i32 pid, win_usize cpusetsize, void* mask);
         // Raw syscall escape hatch (glibc wrapper; no libnuma dependency). Used for
         // set_mempolicy(238)/mbind(237) - neither has a glibc-name binding without
         // libnuma. Fixed 6-arg arity covers both (mbind's max); unused trailing
@@ -155,7 +160,7 @@ namespace os.posix
     // We carry each behind a void* heap pointer because pthread_mutex_t (40B) and
     // pthread_cond_t (48B) do not fit in the pointer-sized inline storage the Win32
     // SRWLOCK / CONDITION_VARIABLE used.
-    extern void*   calloc(win_size count, win_size size);
+    extern void*   calloc(win_usize count, win_usize size);
     extern void    free(void* ptr);
     // Pointer-sized atomic CAS/load, used to publish a lazily allocated lock
     // exactly once under concurrent first-touch. Compiler-intercepted (name
@@ -164,7 +169,7 @@ namespace os.posix
     extern i64     __atomic_i64_load(i64* ptr);
     // Over-aligned allocation: alignment must be a power of two and a multiple of
     // sizeof(void*). Returns 0 on success and writes the block to *memptr.
-    extern win_int posix_memalign(void** memptr, win_size alignment, win_size size);
+    extern win_int posix_memalign(void** memptr, win_usize alignment, win_usize size);
     extern win_int pthread_mutex_lock(void* m);
     extern win_int pthread_mutex_unlock(void* m);
     extern win_int pthread_mutex_destroy(void* m);
@@ -285,7 +290,7 @@ namespace os.posix
 
     // === sysconf - runtime system configuration ===
     // glibc _SC_* name constants (see bits/confname.h).
-    extern win_size sysconf(i32 name);
+    extern long sysconf(i32 name);
     // _SC_* name constants differ between glibc and Darwin. Darwin has no
     // _SC_LEVEL*_CACHE_LINESIZE, so sysconf(_SC_LEVEL3_CACHE_LINESIZE) returns -1
     // there and callers fall back to their default block size (harmless).
@@ -299,9 +304,9 @@ namespace os.posix
     int _SC_LEVEL3_CACHE_LINESIZE = 196;  // glibc: L3 cache line size (0 if unknown)
 
     // === mmap - anonymous virtual memory ===
-    extern void*   mmap(void* addr, win_size length, i32 prot, i32 flags, i32 fd, i64 offset);
-    extern win_int munmap(void* addr, win_size length);
-    extern win_int mprotect(void* addr, win_size length, i32 prot);
+    extern void*   mmap(void* addr, win_usize length, i32 prot, i32 flags, i32 fd, i64 offset);
+    extern win_int munmap(void* addr, win_usize length);
+    extern win_int mprotect(void* addr, win_usize length, i32 prot);
     int PROT_NONE        = 0;
     int PROT_READ        = 1;
     int PROT_RW          = 3;     // PROT_READ | PROT_WRITE
@@ -317,7 +322,7 @@ namespace os.posix
     // Flush a mapped range's dirty pages to the backing file (msync). MS_SYNC
     // differs by platform: Linux 4, Darwin 0x10 (MS_ASYNC/MS_INVALIDATE agree
     // at 1/2 but MS_SYNC does not - same shape as the MAP_ANON split above).
-    extern win_int msync(void* addr, win_size length, i32 flags);
+    extern win_int msync(void* addr, win_usize length, i32 flags);
     if const (__MACOS__) { int MS_SYNC = 0x10; }
     else                 { int MS_SYNC = 4; }
 
@@ -327,7 +332,7 @@ namespace os.posix
     if const (__MACOS__) {
         // Nothing: Darwin has no THP/madvise-hugepage lever.
     } else {
-        extern win_int madvise(void* addr, win_size length, i32 advice);
+        extern win_int madvise(void* addr, win_usize length, i32 advice);
         int MADV_HUGEPAGE = 14;
     }
 
@@ -376,8 +381,8 @@ namespace os.posix
     // so binding the public names is safe, no collision).
     extern void*    fopen(const char* path, const char* mode);
     extern win_int  fclose(void* stream);
-    extern win_size fread(char* buf, win_size size, win_size count, void* stream);
-    extern win_size fwrite(const char* buf, win_size size, win_size count, void* stream);
+    extern win_usize fread(char* buf, win_usize size, win_usize count, void* stream);
+    extern win_usize fwrite(const char* buf, win_usize size, win_usize count, void* stream);
     extern win_int  feof(void* stream);
     extern win_int  fseek(void* stream, long offset, win_int origin);
     extern long     ftell(void* stream);
@@ -387,7 +392,7 @@ namespace os.posix
     extern win_int  unlink(const char* path);
     extern win_int  rmdir(const char* path);
     extern win_int  mkdir(const char* path, win_int mode);       // POSIX mkdir takes a mode
-    extern char*      getcwd(char* buf, win_size size);
+    extern char*      getcwd(char* buf, win_usize size);
     extern win_int  chdir(const char* path);
     extern win_int  rename(const char* oldp, const char* newp);  // replaces dst atomically
     extern win_int  close(i32 fd);
@@ -470,8 +475,8 @@ namespace os.posix
     else                 { int TERMIOS_BUF_SIZE = 64; }
     extern win_int tcgetattr(i32 fd, void* termios_p);
     extern win_int tcsetattr(i32 fd, i32 actions, void* termios_p);
-    extern win_int ioctl(i32 fd, win_size request, void* arg);
-    extern win_int poll(void* fds, win_size nfds, i32 timeout_ms);
+    extern win_int ioctl(i32 fd, ulong request, void* arg);
+    extern win_int poll(void* fds, win_nfds nfds, i32 timeout_ms);
     int TCSANOW    = 0;
     // TIOCGWINSZ ioctl number: Linux 0x5413; Darwin _IOR('t',104,winsize) = 0x40087468.
     if const (__MACOS__) { int TIOCGWINSZ = 0x40087468; }
@@ -524,7 +529,7 @@ namespace os.posix
         i32* fdp  = (i32*)base;
         fdp[0] = fd;
         pfd[2] = 0x1;             // events = POLLIN
-        return os.posix.poll(&pfd[0], (win_size)1, timeoutMs);
+        return os.posix.poll(&pfd[0], (win_nfds)1, timeoutMs);
     }
 
     // Read one byte from fd, or -1 if none / EOF.
@@ -585,13 +590,13 @@ namespace os.posix
     // match the Winsock handle model. addr/hints are passed as void* so this
     // namespace need not know the sockaddr/addrinfo struct layouts.
     extern i32      socket(i32 af, i32 type, i32 protocol);
-    extern i32      bind(i32 fd, void* addr, i32 addrlen);
+    extern i32      bind(i32 fd, void* addr, u32 addrlen);
     extern i32      listen(i32 fd, i32 backlog);
-    extern i32      accept(i32 fd, void* addr, i32* addrlen);
-    extern i32      connect(i32 fd, void* addr, i32 addrlen);
-    extern win_size send(i32 fd, const char* buf, win_size len, i32 flags);
-    extern win_size recv(i32 fd, i8* buf, win_size len, i32 flags);
-    extern i32      setsockopt(i32 fd, i32 level, i32 optname, const char* optval, i32 optlen);
+    extern i32      accept(i32 fd, void* addr, u32* addrlen);
+    extern i32      connect(i32 fd, void* addr, u32 addrlen);
+    extern win_size send(i32 fd, const char* buf, win_usize len, i32 flags);
+    extern win_size recv(i32 fd, i8* buf, win_usize len, i32 flags);
+    extern i32      setsockopt(i32 fd, i32 level, i32 optname, const char* optval, u32 optlen);
     extern u16      htons(u16 hostshort);
     extern u32      inet_addr(const char* cp);
     extern i32      getaddrinfo(const char* host, const char* svc, void* hints, void** res);

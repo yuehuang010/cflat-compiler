@@ -10,5 +10,3 @@ Test/test_cpp_interop.cb (T310 block) and Test/errors/err_cpp_hidden_ctor_tie.cb
 9. By-value equal-rank widening tie `rv.takeW(h)` (W(long)/W(double)/W(char), short h) reports
    "no overload of 'rv.takeW'"; clang reports "conversion from 'short' to 'W' is ambiguous". The
    refusal is right; the text differs.
-10. Same-named free functions in two namespaces (`t140::takeK` and `rv::takeK(t132::K)` in one TU):
-   `t140.takeK(0)` fails to bind ("clang: no viable conversion from 'int'"); alone it returns 1.

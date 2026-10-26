@@ -1426,7 +1426,7 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                     pt.ConstInnerDimensions.clear();
                 }
                 // A narrow string literal is `const char[N]`: `const char*` is its identity after
-                // array-to-pointer, and the deprecated drop to `char*` binds worse.
+                // array-to-pointer; `char*` is non-viable (accepted only when no candidate is viable, as clang).
                 if (arg.IsStringLiteral)
                 {
                     if (CxxArrayReferenceSpelling(candidate, i))
@@ -1446,9 +1446,18 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                     }
                     if (param.TypeName == "char")
                     {
+                        const std::string parameterSpelling = CxxReferenceParameterSpelling(candidate, i);
+                        const bool targetPointeeConst = param.PointeeConstBit()
+                            || parameterSpelling.rfind("const ", 0) == 0;
+                        if (!targetPointeeConst)
+                        {
+                            out.rank = kCxxNonViableRank;
+                            out.from = "char";
+                            continue;
+                        }
                         out.rank = 0;
                         out.cvBase = "char";
-                        out.cv = CxxReferenceParameterSpelling(candidate, i).rfind("const ", 0) == 0 ? 0 : 1;
+                        out.cv = 0;
                         out.cxxViable = true;
                         out.from = "char";
                     }
@@ -1566,6 +1575,8 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 {
                     out.rank = kCxxNonViableRank;
                     out.from = pointee;
+                    out.cxxViable = false;
+                    continue;
                 }
                 else if (param.TypeName == "void")
                 {
@@ -1602,7 +1613,8 @@ std::vector<LLVMBackend::CxxConversionRank> LLVMBackend::RankCxxConversionSequen
                 && param.TypeName == "bool" && !IsCxxNullTypedArgument(arg)
                 && !IsNullPointerConstantArgument(arg, candidate.IsCxx)
                 && (arg.TypeAndValue.Pointer || arg.TypeAndValue.ElemPointer
-                    || arg.TypeAndValue.IsFunctionPointer || arg.IsStringLiteral
+                    || arg.TypeAndValue.IsFunctionPointer
+                    || llvm::isa_and_nonnull<llvm::Function>(arg.Primary) || arg.IsStringLiteral
                     || fixedArrayArgument))
             {
                 out.rank = 2;
@@ -3446,6 +3458,13 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     && !CxxReferenceAllowsNullPointerConversion(*candidateParamItr,
                         CxxReferenceParameterSpelling(candidate, paramIndex)))
                     result = -1;
+                const bool functionDesignator = arg.TypeAndValue.IsFunctionPointer
+                    || llvm::isa_and_nonnull<llvm::Function>(arg.Primary);
+                if (candidate.IsCxx && candidateParamItr != candidate.Parameters.end()
+                    && candidateParamItr->TypeName == "bool" && !candidateParamItr->Pointer
+                    && !candidateParamItr->IsAlias && !candidateParamItr->IsRvalueRef
+                    && functionDesignator)
+                    result = 1;
                 if (!stringLiteralFitsArrayReference(candidate, paramIndex, arg))
                     result = -1;
                 // Native floating pair (double and long double lower alike): exact 0, float -> double a
@@ -3728,11 +3747,28 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 return f.UniqueName.starts_with("__cflat_tpl_") || IsCxxTemplateSpecializationSymbol(f);
             };
             std::set<const Result*> dominated;
+            auto hasKnownNonViableArgument = [&](const Ranked* r) {
+                const auto rankIt = cxxRanks.find(r->pair);
+                return rankIt != cxxRanks.end()
+                    && std::any_of(rankIt->second.begin(), rankIt->second.end(),
+                        [](const CxxConversionRank& rank) {
+                            return rank.rank == kCxxNonViableRank
+                                || rank.implicitObjectCvNonViable;
+                        });
+            };
+            // A C++ candidate with one proven non-viable argument is not in the viable set. Keep
+            // the legacy fallback only when every admitted candidate is proven non-viable.
+            if (std::any_of(viable.begin(), viable.end(), [&](const Ranked* r) {
+                    return !hasKnownNonViableArgument(r);
+                }))
+                for (const Ranked* r : viable)
+                    if (hasKnownNonViableArgument(r)) dominated.insert(r->pair);
             for (const Ranked* a : viable)
                 for (const Ranked* b : viable)
                 {
                     bool crossing = false;
-                    if (a == b) continue;
+                    if (a == b || dominated.count(a->pair) != 0
+                        || dominated.count(b->pair) != 0) continue;
                     const int order = CompareCxxConversionRanks(cxxRanks[a->pair], cxxRanks[b->pair],
                                                                 crossing);
                     if (order == -1
@@ -7315,7 +7351,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 argList.push_back(temporary);
             }
             else if (!inVariadicRange && candidate.IsCxx
-                     && (arg.TypeAndValue.Pointer || arg.IsStringLiteral
+                     && (arg.TypeAndValue.Pointer || arg.TypeAndValue.IsFunctionPointer
+                         || llvm::isa_and_nonnull<llvm::Function>(arg.Primary) || arg.IsStringLiteral
                          || (!arg.TypeAndValue.IsArrayView
                              && (arg.TypeAndValue.ConstArraySize > 0
                                  || llvm::isa_and_nonnull<llvm::ArrayType>(arg.BaseType))))
@@ -8153,7 +8190,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         const bool cxxClassReturn = candidate.Recipe.hasLowering
             && candidate.Recipe.retSlot.kind == AbiSlot::SRetReturn
             && !candidate.ReturnType.Pointer
-            && ReturnsViaCxxSret(candidate.ReturnType.TypeName);
+            && ReturnsViaInPlaceSret(candidate.ReturnType.TypeName);
         const bool nativeValueConstructor = candidate.Recipe.hasLowering
             && candidate.Recipe.retSlot.kind == AbiSlot::SRetReturn
             && IsNativeValueConstructor(functionName, candidate.ReturnType,
@@ -8476,7 +8513,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                                  calleeMayUnwind, callRecipe)
             : (cxxVirtualCallee != nullptr
                 ? emitVirtualCall()
-                : CreateFunctionCall(candidate.Function, argList, calleeMayUnwind));
+                : CreateFunctionCall(candidate.Function, argList, calleeMayUnwind,
+                                     candidate.HasCFlatDefinition()));
         RecordOpaqueReturnCall(result, candidate.ReturnType.TypeName, functionName);
         unwindCallConsumedTemps_.clear();
         bool aliasStringTempMayOwn = !candidate.IsCxx && !candidate.External
@@ -9190,6 +9228,8 @@ LLVMBackend::NamedVariable LLVMBackend::GetMemberVariable(const std::string& nam
         }
         namedVar.BaseType = namedVar.Primary->getType();
         namedVar.TypeAndValue = structField;
+        namedVar.RootIsBorrowedThisField = true;
+        namedVar.ThisFieldPath = name;
         // Preserve unique-field provenance across a later cast so a bare
         // self-field read (`(Res*)p` inside a method) stays a tracked alias.
         bool isUniqueField = (structField.IsUnique && structField.Pointer)
@@ -9263,6 +9303,7 @@ LLVMBackend::NamedVariable LLVMBackend::GetThisPointer()
                 thisVar.CallerName = "this";
                 thisVar.TypeAndValue.TypeName = structName;
                 thisVar.TypeAndValue.Pointer = true;
+                thisVar.IsThisReceiver = true;
                 return thisVar;
             }
 
@@ -9274,6 +9315,7 @@ LLVMBackend::NamedVariable LLVMBackend::GetThisPointer()
             thisVar.CallerName = "this";
             thisVar.TypeAndValue.TypeName = structName;
             thisVar.TypeAndValue.Pointer = true;
+            thisVar.IsThisReceiver = true;
             return thisVar;
         }
         return {};

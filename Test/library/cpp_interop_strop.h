@@ -295,3 +295,61 @@ private:
     using T221StaticBaseLong::s;
 };
 }
+
+namespace cppsopd {
+inline int t455MemberLast = 0;
+inline int t455MemberDtors = 0;
+struct T455MemberTracked {
+    T455MemberTracked() = default;
+    ~T455MemberTracked() { ++t455MemberDtors; }
+    void operator-=(int) & { t455MemberLast = 1; }
+    void operator-=(int) && { t455MemberLast = 2; }
+    void operator-=(int) const & { t455MemberLast = 3; }
+    void operator+=(int) & { t455MemberLast = 4; }
+    void operator+=(int) && { t455MemberLast = 5; }
+    void operator+=(int) const & { t455MemberLast = 6; }
+};
+inline T455MemberTracked&& t455MemberRref() {
+    static T455MemberTracked value;
+    return static_cast<T455MemberTracked&&>(value);
+}
+inline T455MemberTracked t455MemberPrvalue() { return T455MemberTracked{}; }
+inline void resetT455Member() { t455MemberLast = 0; t455MemberDtors = 0; }
+
+inline int t455FreeLast = 0;
+inline int t455FreeDtors = 0;
+struct T455FreeTracked {
+    T455FreeTracked() = default;
+    ~T455FreeTracked() { ++t455FreeDtors; }
+};
+inline int operator-=(T455FreeTracked&, int) {
+    t455FreeLast = 11;
+    return 11;
+}
+inline int operator-=(T455FreeTracked&&, int) {
+    t455FreeLast = 12;
+    return 12;
+}
+inline int operator-=(const T455FreeTracked&, int) {
+    t455FreeLast = 13;
+    return 13;
+}
+inline int operator+=(T455FreeTracked&, int) {
+    t455FreeLast = 14;
+    return 14;
+}
+inline int operator+=(T455FreeTracked&&, int) {
+    t455FreeLast = 15;
+    return 15;
+}
+inline int operator+=(const T455FreeTracked&, int) {
+    t455FreeLast = 16;
+    return 16;
+}
+inline T455FreeTracked&& t455FreeRref() {
+    static T455FreeTracked value;
+    return static_cast<T455FreeTracked&&>(value);
+}
+inline T455FreeTracked t455FreePrvalue() { return T455FreeTracked{}; }
+inline void resetT455Free() { t455FreeLast = 0; t455FreeDtors = 0; }
+}

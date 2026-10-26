@@ -1369,7 +1369,7 @@ class stack<T>
 {
     T item = default;
     void push(T value) { item = value; }
-    T peek() { return item; }
+    T peek() { return move item; }
 };
 
 namespace mylib
@@ -1378,7 +1378,7 @@ namespace mylib
     {
         T item = default;
         void add(T value) { item = value; }
-        T get() { return item; }
+        T get() { return move item; }
     };
 }
 

@@ -1553,7 +1553,8 @@ llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, st
         // A virtual member is reached through the pointer loaded out of the receiver's vptr; the
         // SIGNATURE still comes from the declaration, which carries clang's own arrangement.
         auto* ci = CreateCallOrInvoke(candidate.Function->getFunctionType(),
-            calleeOverride != nullptr ? calleeOverride : candidate.Function, loweredArgs, mayUnwind);
+            calleeOverride != nullptr ? calleeOverride : candidate.Function, loweredArgs, mayUnwind,
+            "", candidate.HasCFlatDefinition());
         ci->setCallingConv(candidate.Function->getCallingConv());
         ApplyAbiCallAttributes(ci, recipe);
 
@@ -1657,7 +1658,8 @@ llvm::Value* LLVMBackend::PromoteVariadicArgument(llvm::Value* value)
 }
 
 llvm::Value* LLVMBackend::CreateFunctionCall(llvm::Function* func, const std::vector<llvm::Value*>& arg,
-                                            bool mayUnwind)
+                                            bool mayUnwind,
+                                            bool calleeHasCFlatDefinition)
 {
         // Perform Default Argument Promotions for Variadic arguments
         std::vector<llvm::Value*> callArgs;
@@ -1682,7 +1684,8 @@ llvm::Value* LLVMBackend::CreateFunctionCall(llvm::Function* func, const std::ve
                 callArgs.push_back(Upconvert(arg[i], func->getArg(i)));
         }
 
-        auto* ci = CreateCallOrInvoke(func->getFunctionType(), func, callArgs, mayUnwind);
+        auto* ci = CreateCallOrInvoke(func->getFunctionType(), func, callArgs, mayUnwind, "",
+                                      calleeHasCFlatDefinition);
         ci->setCallingConv(func->getCallingConv());
         return ci;
     }
@@ -2500,7 +2503,8 @@ const LLVMBackend::NamedVariable* LLVMBackend::FindOwningLocalCopyJoinArm(const 
         return nullptr;
     }
 
-void LLVMBackend::ConsumeOwningLocalJoinArms(llvm::Value* joined)
+void LLVMBackend::ConsumeOwningLocalJoinArms(llvm::Value* joined, bool markMovedSources,
+                                              llvm::Value* destination)
 {
         if (joined == nullptr || !joined->getType()->isPointerTy()) return;
         const NullCoalesceJoin* coalesce = FindNullCoalesceJoin(joined);
@@ -2514,6 +2518,7 @@ void LLVMBackend::ConsumeOwningLocalJoinArms(llvm::Value* joined)
             if (load == nullptr || load->getType() != joined->getType() || IsMovedOutPtrValue(arms[i]))
                 continue;
             llvm::Value* slot = load->getPointerOperand();
+            if (slot == destination) continue;
             const NamedVariable* owner = FindVariableByStorage(slot);
             if (owner == nullptr || !owner->IsOwning || owner->IsBorrowed || owner->IsAliasBorrow
                 || owner->TypeAndValue.IsAlias || owner->BorrowsOwningLocal
@@ -2529,7 +2534,8 @@ void LLVMBackend::ConsumeOwningLocalJoinArms(llvm::Value* joined)
                 current), slot);
             // The '??' LHS is taken whenever it is non-null, so its compile-time move is exact; a
             // ternary or RHS arm may stay live, so only its runtime slot is nulled.
-            if (coalesceLhs != nullptr && arms[i] == coalesceLhs) MarkVariableMoved(name);
+            if (markMovedSources || (coalesceLhs != nullptr && arms[i] == coalesceLhs))
+                MarkVariableMoved(name);
         }
     }
 

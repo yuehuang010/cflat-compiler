@@ -1368,6 +1368,7 @@ public:
         std::unordered_map<std::string, std::string> typeAliases;
         std::unordered_map<std::string, uint8_t> typeAliasConstMasks;
         std::unordered_map<std::string, TypeAndValue> functionTypeAliases;
+        std::unordered_set<std::string> genericDerivedTypeAliases;
     };
 
     struct AnnotationValue
@@ -1700,6 +1701,8 @@ public:
         std::string DeferredDiagnostic;
         std::string MovePathKey;
         bool MovePathHasDynamicIndex = false;
+        bool RootIsBorrowedThisField = false;
+        std::string ThisFieldPath;
     };
 
     struct NamedVariable
@@ -1792,6 +1795,7 @@ public:
         bool IsCFlatBraceInitTemp = false;
         // Storage is this argument's C++ prvalue temp (call, operator or ctor result), not a named slot.
         bool IsCxxPrvalueTemp = false;
+        bool IsCxxSameTypeCastCopy = false;
         // Direct foreign C++ construction deferred into a generated call wrapper.
         bool IsCxxDirectConstruction = false;
         bool CxxDirectConstructionUsesBraces = false;
@@ -2031,6 +2035,11 @@ public:
         // Root VARIABLE of a field path ("w" for `w.a.b`). TypeAndValue.ParentVariableName names
         // only the IMMEDIATE parent, which on a nested path is an intermediate field, not a variable.
         std::string FieldPathRoot;
+        // Positive provenance is set only after lookup resolves a field against `this`.
+        bool IsThisReceiver = false;
+        bool RootIsBorrowedThisField = false;
+        std::string ThisFieldPath;
+        antlr4::ParserRuleContext* SourceExpressionContext = nullptr;
         // Answered at the field-access site, where the root's binding is RESOLVED: that root is the
         // current function's borrowed (non-`move`) by-value struct parameter. Re-asking downstream by
         // NAME cannot distinguish the parameter from an inner local that shadows it.
@@ -2144,6 +2153,7 @@ public:
         bool         isArrayView = false;   // value came from a thin `int[]` view (pointer arithmetic is banned on it)
         bool         isAlias    = false;    // value is a borrow from an alias result or join
         bool         isRvalue = false;      // value-producing expression; named lvalues keep this false
+        bool         isCxxSameTypeCastCopy = false; // transient provenance for a C++ conditional join
         bool         isExplicitMove = false; // written 'move x' operand; transient, read by operator calls
         bool         isPointerArithmeticResult = false; // `p + n` / `p - n` pointer result
         llvm::Value* storage    = nullptr;  // lvalue storage for an addressable alias result/join
@@ -2177,6 +2187,8 @@ public:
         std::string  sourceMovePathKey;
         bool         sourceMovePathHasDynamicIndex = false;
         bool         sourceIsElementAccess = false;
+        bool         sourceRootIsBorrowedThisField = false;
+        std::string  sourceThisFieldPath;
         std::vector<ConditionalMoveSource> conditionalMoveSources;
 
         TypedValue() = default;
@@ -2353,7 +2365,10 @@ public:
         // Inferred 'alias': every return hands back a by-value parameter (ClassifyValueStructReturns),
         // so the result is always one of the caller's alias-return copy slots.
         bool ReturnsAliasOfByValueParam = false;
-        bool IsMethod = false;     // true when registered as a struct/class method (has implicit self pointer)
+        // Parse-tree summary: every 'return' names a module global (`return gRaw;`). Set by
+        // the forward-ref scan so a caller's refusal does not depend on definition order.
+        bool ReturnsGlobalBorrow = false;
+        bool IsMethod = false;    // true when registered as a struct/class method (has implicit self pointer)
         bool IsCxx = false;        // declaration came from a C++ header
         bool IsCoreLibraryFunction = false; // implicit core origin; explicit C/C++ imports remain declarations
         bool IsDeleted = false;    // retained as a C++ overload candidate, rejected if selected
@@ -2371,6 +2386,7 @@ public:
             const TypeAndValue& self = Parameters.front();
             return self.Pointer && (self.ConstMask & 1u) != 0 && self.VariableName == self.TypeName + "__";
         }
+        bool HasCFlatDefinition() const { return !IsCxx && (!External || HasCFlatBody); }
         bool IsNoexcept = true;    // potentially throwing C++ calls are gated until EH support
         bool IsCInteropAlias = false;
         bool IsCInteropDeclaration = false;
@@ -2430,6 +2446,7 @@ public:
 
     public:
     TypeAndValue lastCallReturnType;        // set by CreateOverloadedFunctionCall for post-call TypeAndValue queries
+    std::function<void(antlr4::ParserRuleContext*, std::string)> contextualErrorReporter;
     bool lastCallReturnsOwned = false;       // set when the last call returned an owned heap string or pointer
     bool lastOwningResult = false;           // set by ParseNewExpression/ParseMoveExpression; consumed by ParseDeclaration
     // Set by ParseMoveExpression when the move source is a container element SLOT (`move _data[i]`,
@@ -5337,7 +5354,9 @@ private:
      * borrow, a suppressed join, an entry that is not a freeable owning pointer - fails here and
      * forces the join to be treated as mixed, i.e. suppressed and leaked rather than freed.
      */
-    bool TernaryArmJoinsOwning(llvm::Value* arm);
+    bool TernaryArmJoinsOwning(llvm::Value* arm, bool includeOwningLocal = false);
+    // True when every non-null arm is owned by a local slot, move, or owned temporary.
+    bool CanAdoptUniquePointerJoin(llvm::Value* joined);
 
     /*
      * True when `value` is a by-value struct of an OWNING-VALUE type (a `unique` field, directly or
@@ -5393,7 +5412,8 @@ private:
      * runtime owned bit already makes a borrowed arm's release a no-op, and every string arm is
      * deep-copied into an independent buffer before the join (see AdoptTernaryStringArm).
      */
-    bool PropagateTernaryOwnership(llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined);
+    bool PropagateTernaryOwnership(llvm::Value* trueValue, llvm::Value* falseValue,
+                                   llvm::Value* joined, bool includeOwningLocal = false);
 
     // Sentinel ledgered as a '?:' join's "interface" when its two arms disagree (e.g. a
     // derived-typed move joined with a parent-typed move): no single name is correct, so
@@ -6546,7 +6566,8 @@ private:
      */
     llvm::CallBase* CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::Value* callee,
                                        llvm::ArrayRef<llvm::Value*> args, bool mayUnwind,
-                                       const llvm::Twine& name = "");
+                                       const llvm::Twine& name = "",
+                                       bool calleeHasCFlatDefinition = false);
     bool emittingUnwindCleanup_ = false;
     // Shared Itanium unwind cleanup chain of the active function: one exception slot + resume
     // block, and emitted cleanup regions keyed by a content hash (continuation included) so
@@ -7825,10 +7846,11 @@ public:
     static bool IsPrimitiveTypeName(const std::string& name);
 
     void RegisterTypeAlias(const std::string& alias, const std::string& target,
-                           uint8_t constMask = 0);
+                           uint8_t constMask = 0, bool genericDerived = false);
     void RegisterFunctionTypeAlias(const std::string& alias, const TypeAndValue& target);
 
     std::string ResolveTypeAlias(const std::string& name) const;
+    bool IsGenericDerivedTypeAlias(const std::string& name) const;
     uint8_t ResolveTypeAliasConstMask(const std::string& name) const;
     /*
      * `Owner.name` in type position: the member type `name` of record `owner` - a CFlat
@@ -8940,6 +8962,8 @@ public:
     // and compile-time moved marking in their existing order.
     std::string ImplicitOutlivingOwnerConsumeError(const NamedVariable& source,
                                                    bool sourceIsMove) const;
+    std::string ImplicitThisFieldConsumeError(const NamedVariable& source,
+                                               bool sourceIsMove) const;
     bool IsFunctionValueType(const TypeAndValue& type) const;
     bool NullExplicitFunctionMoveToValue(const TypeAndValue& param, const NamedVariable& arg);
     void ApplyMoveParamTransfer(const std::string& functionName,
@@ -10300,6 +10324,18 @@ public:
     bool ReturnsViaCxxSret(const std::string& typeName) const
     {
         return IsForeignNontrivialCxxReturnClass(typeName) || NeedsCxxLoweringType(typeName);
+    }
+    bool IsImmovableCFlatStruct(const std::string& typeName) const
+    {
+        const std::string resolved = ResolveTypeAlias(typeName);
+        auto found = dataStructures.find(resolved);
+        return found != dataStructures.end() && !found->second.IsUnion
+            && !IsCxxRecord(resolved) && generatedCxxRecords_.count(resolved) == 0
+            && IsImmovableType(resolved);
+    }
+    bool ReturnsViaInPlaceSret(const std::string& typeName) const
+    {
+        return ReturnsViaCxxSret(typeName) || IsImmovableCFlatStruct(typeName);
     }
     // countCtorTemplates=false answers as if constructor templates were invisible, the surface
     // a class-typed implicit argument conversion still keys on.
@@ -12283,7 +12319,8 @@ public:
     // The class name of a by-value aggregate argument that a C or C++ `...` slot cannot carry, or "".
     std::string AggregateVariadicArgumentType(const NamedVariable& arg) const;
     llvm::Value* CreateFunctionCall(llvm::Function* func, const std::vector<llvm::Value*>& arg,
-                                    bool mayUnwind = false);
+                                    bool mayUnwind = false,
+                                    bool calleeHasCFlatDefinition = false);
 
     bool ParameterCarriesRawArrayCount(const TypeAndValue& param) const;
     bool ReturnCarriesRawArrayCount(const TypeAndValue& returnType) const;
@@ -12665,7 +12702,8 @@ public:
     std::vector<llvm::Value*> JoinArmValues(const llvm::Value* joined) const;
     // A unique-field store of `joined` consumes each owning-local arm as a bare local store does:
     // that slot is nulled only when the join yielded it, so the field alone owns the object.
-    void ConsumeOwningLocalJoinArms(llvm::Value* joined);
+    void ConsumeOwningLocalJoinArms(llvm::Value* joined, bool markMovedSources = false,
+                                    llvm::Value* destination = nullptr);
 
     std::string FindVariableNameByStorage(const llvm::Value* slot) const;
 

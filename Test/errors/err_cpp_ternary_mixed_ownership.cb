@@ -53,6 +53,16 @@ expect_error("'?:' arms differ in ownership: 'a + b' is an owning value and 'a.c
     }
 }
 
+expect_error("'?:' arms differ in ownership: 'a + b' is an owning value and 'b' is a borrow") {
+    void cppNamedBorrowReverse(bool c)
+    {
+        cppas.Life a = cppas.Life(3);
+        cppas.Life b = cppas.Life(4);
+        cppas.Life target = cppas.Life(0);
+        target = c ? b : a + b;
+    }
+}
+
 // T306 round 3: a default-only arm refuses at the ownership join unless the other arm IS the
 // destination class. Shapes: no unique constructor target, a derived arm under a cast, and a
 // converting cast whose other arm is a different class.

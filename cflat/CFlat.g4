@@ -738,9 +738,14 @@ jumpStatement
         'continue'
         | 'break'
         | 'return' Default
+        | 'return' returnBraceInitializer
         | 'return' expression?
         | 'return' compoundStatement
     ) ';'
+    ;
+
+returnBraceInitializer
+    : '{' initializerList ','? '}'
     ;
 
 expectErrorStatement

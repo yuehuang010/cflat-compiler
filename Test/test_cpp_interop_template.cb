@@ -4660,6 +4660,52 @@ extern int main()
         cppsopd.tinyRefCompound() += 1;
         if (cppsopd.tinyRefCompoundLast != 6) return 5283;
 
+        // T455: explicit move keeps the && member overload on trivial C++ records.
+        cppsopd.TinyRefCompound rc_55900 = default;
+        (move rc_55900) -= 1;
+        if (cppsopd.tinyRefCompoundLast != 4) return 55900;
+        cppsopd.TinyRefCompound rc_55901 = default;
+        (move rc_55901) += 1;
+        if (cppsopd.tinyRefCompoundLast != 6) return 55901;
+
+        // T455: an rvalue-reference member receiver keeps its identity and is not destroyed.
+        cppsopd.resetT455Member();
+        cppsopd.t455MemberRref() -= 1;
+        if (cppsopd.t455MemberLast != 2 || cppsopd.t455MemberDtors != 0) return 55902;
+        cppsopd.resetT455Member();
+        cppsopd.t455MemberRref() += 1;
+        if (cppsopd.t455MemberLast != 5 || cppsopd.t455MemberDtors != 0) return 55903;
+
+        // T455: free F&& operators receive moved locals and keep their mutations on that object.
+        cppsopd.resetT455Free();
+        {
+            cppsopd.T455FreeTracked f_55904 = default;
+            (move f_55904) -= 1;
+        }
+        if (cppsopd.t455FreeLast != 12 || cppsopd.t455FreeDtors != 1) return 55904;
+        cppsopd.resetT455Free();
+        {
+            cppsopd.T455FreeTracked f_55906 = default;
+            (move f_55906) += 1;
+        }
+        if (cppsopd.t455FreeLast != 15 || cppsopd.t455FreeDtors != 1) return 55905;
+
+        // T455: free operators bind T&& returns without creating an extra owned temporary.
+        cppsopd.resetT455Free();
+        cppsopd.t455FreeRref() -= 1;
+        if (cppsopd.t455FreeLast != 12 || cppsopd.t455FreeDtors != 0) return 55908;
+        cppsopd.resetT455Free();
+        cppsopd.t455FreeRref() += 1;
+        if (cppsopd.t455FreeLast != 15 || cppsopd.t455FreeDtors != 0) return 55909;
+
+        // T455: prvalue free receivers are destroyed once at the end of their full expression.
+        cppsopd.resetT455Free();
+        cppsopd.t455FreePrvalue() -= 1;
+        if (cppsopd.t455FreeLast != 12 || cppsopd.t455FreeDtors != 1) return 55910;
+        cppsopd.resetT455Free();
+        cppsopd.t455FreePrvalue() += 1;
+        if (cppsopd.t455FreeLast != 15 || cppsopd.t455FreeDtors != 1) return 55911;
+
         // T329: a C++ alias template with a PARAMETER PACK (`using ISeq = Seq<I...>`). Pre-fix
         // it was refused as "takes 1 template argument(s), but 3 were given".
         alnv.ISeq<0,1,2> seqLocal = default;

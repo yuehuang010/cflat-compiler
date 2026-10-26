@@ -3349,10 +3349,36 @@ void LLVMBackend::SuppressCallerRelease(llvm::Value* value)
         UnregisterOwnedPtrTemp(value);
 }
 
-bool LLVMBackend::TernaryArmJoinsOwning(llvm::Value* arm)
+bool LLVMBackend::TernaryArmJoinsOwning(llvm::Value* arm, bool includeOwningLocal)
 {
         if (arm == nullptr) return false;
         if (auto* c = llvm::dyn_cast<llvm::Constant>(arm); c != nullptr && c->isNullValue()) return true;
+        if (includeOwningLocal)
+        {
+            if (IsMovedBorrowedPtrValue(arm) || FindRawArrayResult(arm) != nullptr)
+                return false;
+            const auto nestedArms = JoinArmValues(arm);
+            if (!nestedArms.empty())
+            {
+                for (auto* nestedArm : nestedArms)
+                    if (!TernaryArmJoinsOwning(nestedArm, true)) return false;
+                return true;
+            }
+            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(arm))
+                if (llvm::isa<llvm::AllocaInst>(load->getPointerOperand()))
+                    if (const auto* local = FindVariableByStorage(load->getPointerOperand()))
+                    {
+                        const bool rawArray = local->AllocatedByRawNewArray
+                            && (local->RawArrayLength != nullptr
+                                || local->RawArrayLengthStorage != nullptr);
+                        if (rawArray) return false;
+                        if (local->TypeAndValue.Pointer && local->IsOwning
+                            && !local->IsBorrowed && !local->IsAliasBorrow
+                            && !local->TypeAndValue.IsAlias && !local->BorrowsOwningLocal
+                            && !local->IsRangeForBorrow)
+                            return true;
+                    }
+        }
         if (const auto* raw = FindRawArrayResult(arm);
             raw != nullptr && !raw->Owns && raw->RuntimeOwns != nullptr)
         {
@@ -3403,6 +3429,31 @@ bool LLVMBackend::TernaryArmJoinsOwning(llvm::Value* arm)
         if (IsInterfaceFatValue(arm) || IsOwningValueStructValue(arm))
             return FindOwnedReturnEntry(arm) != nullptr;
         return false;
+    }
+
+bool LLVMBackend::CanAdoptUniquePointerJoin(llvm::Value* joined)
+{
+        if (joined == nullptr || !joined->getType()->isPointerTy()) return false;
+        const auto arms = JoinArmValues(joined);
+        if (arms.empty()) return false;
+        bool hasValueArm = false;
+        for (auto* arm : arms)
+        {
+            if (arm == nullptr) return false;
+            if (auto* constant = llvm::dyn_cast<llvm::Constant>(arm);
+                constant != nullptr && constant->isNullValue())
+                continue;
+            hasValueArm = true;
+            if (IsMovedBorrowedPtrValue(arm) || FindRawArrayResult(arm) != nullptr
+                || !TernaryArmJoinsOwning(arm, true))
+                return false;
+            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(arm))
+                if (const auto* local = FindVariableByStorage(load->getPointerOperand());
+                    local != nullptr && local->AllocatedByRawNewArray
+                    && (local->RawArrayLength != nullptr || local->RawArrayLengthStorage != nullptr))
+                    return false;
+        }
+        return hasValueArm;
     }
 
 bool LLVMBackend::IsOwningValueStructValue(llvm::Value* value)
@@ -3471,14 +3522,18 @@ void LLVMBackend::PropagateMovedBorrowedPtrValue(llvm::Value* trueValue, llvm::V
             RegisterMovedBorrowedThroughField(joined);
     }
 
-bool LLVMBackend::PropagateTernaryOwnership(llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined)
+bool LLVMBackend::PropagateTernaryOwnership(llvm::Value* trueValue, llvm::Value* falseValue,
+                                            llvm::Value* joined, bool includeOwningLocal)
 {
         if (joined == nullptr) return false;
         bool owningStructJoin = IsOwningValueStructValue(joined);
         bool strictJoin = joined->getType()->isPointerTy() || IsInterfaceFatValue(joined)
             || owningStructJoin;
+        auto armJoinsOwning = [&](llvm::Value* arm) {
+            return TernaryArmJoinsOwning(arm, includeOwningLocal);
+        };
         bool mixedPtrJoin = strictJoin
-            && (!TernaryArmJoinsOwning(trueValue) || !TernaryArmJoinsOwning(falseValue));
+            && (!armJoinsOwning(trueValue) || !armJoinsOwning(falseValue));
         // Diagnostic lookup: a suppressed arm must still hand its FnName to the join, or a
         // discarded nested mixed ternary stops being reported.
         if (FindOwnedReturnEntryForDiagnostic(trueValue) != nullptr)
@@ -3494,7 +3549,7 @@ bool LLVMBackend::PropagateTernaryOwnership(llvm::Value* trueValue, llvm::Value*
             // identity is used to reject a direct interface receiver, whose selected PHI arm
             // cannot be proven safe to release after dispatch.
             bool interfaceArmOwnershipDisagrees = IsInterfaceFatValue(joined)
-                && TernaryArmJoinsOwning(trueValue) != TernaryArmJoinsOwning(falseValue);
+                && armJoinsOwning(trueValue) != armJoinsOwning(falseValue);
             if (owningStructJoin || interfaceArmOwnershipDisagrees)
                 RegisterNonOwningStructJoin(joined);
             return true;
@@ -7508,11 +7563,17 @@ llvm::BasicBlock* LLVMBackend::ChainUnwindCleanup(UnwindChainState& chain, llvm:
 
 llvm::CallBase* LLVMBackend::CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::Value* callee,
                                                 llvm::ArrayRef<llvm::Value*> args, bool mayUnwind,
-                                                const llvm::Twine& name)
+                                                const llvm::Twine& name,
+                                                bool calleeHasCFlatDefinition)
 {
+        auto markCFlatBodyCall = [calleeHasCFlatDefinition](llvm::CallBase* call) {
+            if (calleeHasCFlatDefinition) call->addFnAttr(llvm::Attribute::NoBuiltin);
+            return call;
+        };
         if (!mayUnwind || !cppInteropUsed_ || emittingUnwindCleanup_ || !IsInsertBlockLive()
             || currentFunction == nullptr)
-            return builder->CreateCall(fnTy, callee, args, name);        // A synthesized helper emitted out of line (a struct copy) owes only its partial
+            return markCFlatBodyCall(builder->CreateCall(fnTy, callee, args, name));
+        // A synthesized helper emitted out of line (a struct copy) owes only its partial
         // construction; the scope walk and statement temps belong to currentFunction.
         llvm::Function* fn = builder->GetInsertBlock()->getParent();
         const bool ownFrame = fn == currentFunction;
@@ -7520,13 +7581,14 @@ llvm::CallBase* LLVMBackend::CreateCallOrInvoke(llvm::FunctionType* fnTy, llvm::
         if (personality == nullptr
             || (fn->hasPersonalityFn() && fn->getPersonalityFn() != personality)
             || !FrameOwesUnwindCleanup())
-            return builder->CreateCall(fnTy, callee, args, name);
+            return markCFlatBodyCall(builder->CreateCall(fnTy, callee, args, name));
 
         UnwindChainState& chain = ChainStateFor(fn);
 
         auto* padBB = llvm::BasicBlock::Create(*context, "unwind.cleanup", fn);
         auto* contBB = llvm::BasicBlock::Create(*context, "invoke.cont", fn);
         auto* invoke = builder->CreateInvoke(fnTy, callee, contBB, padBB, args, name);
+        if (calleeHasCFlatDefinition) invoke->addFnAttr(llvm::Attribute::NoBuiltin);
         if (!fn->hasPersonalityFn()) fn->setPersonalityFn(personality);
 
         const llvm::DebugLoc savedLoc = builder->getCurrentDebugLocation();

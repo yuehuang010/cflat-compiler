@@ -814,7 +814,13 @@ bool LLVMBackend::IsCxxMutableFieldAccess(llvm::Value* fieldAddress) const
 int LLVMBackend::CxxConstReceiverKind(const NamedVariable& receiver) const
 {
         const TypeAndValue& t = receiver.TypeAndValue;
-        if (t.IsCxxMutableField && !t.Pointer && !t.IsCxxRefToPointer) return 0;
+        if (t.IsCxxMutableField && !t.IsCxxRefToPointer && !t.CxxConstRef())
+        {
+            // A mutable POINTER field makes the pointer writable, never its const pointee.
+            const TypeAndValue* field = FindDeclaredFieldTypeAndValueForStorage(receiver.Storage);
+            const bool pointerField = field != nullptr && field->Pointer;
+            if (!t.PointeeConstBit() || (field != nullptr && !pointerField)) return 0;
+        }
         const bool functionPointer = t.IsFunctionPointer
             || (receiver.HasOriginalArgumentType && receiver.OriginalArgumentType.IsFunctionPointer);
         if (receiver.IsTopLevelConst && (!t.Pointer || functionPointer)) return 1;
@@ -825,7 +831,8 @@ int LLVMBackend::CxxConstReceiverKind(const NamedVariable& receiver) const
             {
                 if (IsCxxConstReferent(v)) return 3;
                 auto* global = llvm::dyn_cast<llvm::GlobalVariable>(llvm::getUnderlyingObject(v));
-                if (IsConstHeaderGlobal(global)) return 2;
+                // A mutable field of a const global is writable: the field access decides.
+                if (IsConstHeaderGlobal(global) && !IsCxxMutableFieldAccess(v)) return 2;
             }
         }
         // An object stored by value inside const storage (a const field, an element or field of a

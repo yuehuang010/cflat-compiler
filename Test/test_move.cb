@@ -2009,6 +2009,194 @@ int testT266RawFieldAssign()
     return passed;
 }
 
+int testT443TernaryUniquePointerOwnership()
+{
+    int passed = 0;
+
+    dtorCount = 0;
+    {
+        Resource* raw = new Resource();
+        raw->id = 4431;
+        unique Resource* owner = identityBool(true) ? raw : nullptr;
+        passed += Test("t443_decl_raw_null_value", owner->id, 4431);
+    }
+    passed += Test("t443_decl_raw_null_one_dtor", dtorCount, 1);
+
+    // CONTROL (passes on master too): same-scope teardown hides a missing transfer.
+    dtorCount = 0;
+    {
+        Resource* raw = new Resource();
+        raw->id = 4432;
+        unique Resource* owner = nullptr;
+        owner = identityBool(true) ? raw : nullptr;
+        passed += Test("t443_assign_raw_null_value", owner->id, 4432);
+    }
+    passed += Test("t443_assign_raw_null_one_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* raw = new Resource();
+        raw->id = 4433;
+        unique Resource* owner = identityBool(true) ? raw : new Resource();
+        passed += Test("t443_decl_raw_new_value", owner->id, 4433);
+    }
+    passed += Test("t443_decl_raw_new_one_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* raw = new Resource();
+        raw->id = 4434;
+        unique Resource* owner = nullptr;
+        owner = identityBool(false) ? raw : new Resource();
+        passed += Test("t443_assign_new_raw_value", owner->id, 0);
+    }
+    passed += Test("t443_assign_new_raw_two_dtors", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        Resource* left = new Resource();
+        left->id = 4435;
+        Resource* right = new Resource();
+        right->id = 4436;
+        unique Resource* owner = identityBool(true) ? left : right;
+        passed += Test("t443_decl_two_raw_value", owner->id, 4435);
+    }
+    passed += Test("t443_decl_two_raw_two_dtors", dtorCount, 2);
+
+    // CONTROL (passes on master too): same-scope teardown hides a missing transfer.
+    dtorCount = 0;
+    {
+        Resource* left = new Resource();
+        left->id = 4437;
+        Resource* right = new Resource();
+        right->id = 4438;
+        unique Resource* owner = nullptr;
+        owner = identityBool(false) ? left : right;
+        passed += Test("t443_assign_two_raw_value", owner->id, 4438);
+    }
+    passed += Test("t443_assign_two_raw_two_dtors", dtorCount, 2);
+
+    // CONTROL (passes on master too): same-scope teardown hides a missing transfer.
+    dtorCount = 0;
+    {
+        unique Resource* source = new Resource();
+        source->id = 4439;
+        unique Resource* owner = identityBool(true) ? move source : nullptr;
+        passed += Test("t443_decl_move_null_value", owner->id, 4439);
+    }
+    passed += Test("t443_decl_move_null_one_dtor", dtorCount, 1);
+
+    // CONTROL (passes on master too): same-scope teardown hides a missing transfer.
+    dtorCount = 0;
+    {
+        unique Resource* source = new Resource();
+        source->id = 4440;
+        unique Resource* owner = nullptr;
+        owner = identityBool(true) ? move source : nullptr;
+        passed += Test("t443_assign_move_null_value", owner->id, 4440);
+    }
+    passed += Test("t443_assign_move_null_one_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* raw = new Resource();
+        raw->id = 4441;
+        Resource* fallback = new Resource();
+        unique Resource* owner = identityBool(true) ? (raw ?? fallback) : nullptr;
+        passed += Test("t443_decl_coalesce_value", owner->id, 4441);
+    }
+    passed += Test("t443_decl_coalesce_two_dtors", dtorCount, 2);
+
+    // CONTROL (passes on master too): same-scope teardown hides a missing transfer.
+    dtorCount = 0;
+    {
+        Resource* raw = nullptr;
+        Resource* fallback = new Resource();
+        fallback->id = 4442;
+        unique Resource* owner = nullptr;
+        owner = identityBool(true) ? (raw ?? fallback) : nullptr;
+        passed += Test("t443_assign_coalesce_value", owner->id, 4442);
+    }
+    passed += Test("t443_assign_coalesce_one_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* raw = new Resource();
+        raw->id = 4443;
+        unique Resource* owner = identityBool(true) ? raw : (Resource*)0;
+        passed += Test("t443_decl_cast_null_value", owner->id, 4443);
+    }
+    passed += Test("t443_decl_cast_null_one_dtor", dtorCount, 1);
+
+    // CONTROL (passes on master too): same-scope teardown hides a missing transfer.
+    dtorCount = 0;
+    {
+        Resource* raw = new Resource();
+        raw->id = 4444;
+        unique Resource* owner = nullptr;
+        owner = identityBool(true) ? raw : (Resource*)0;
+        passed += Test("t443_assign_cast_null_value", owner->id, 4444);
+    }
+    passed += Test("t443_assign_cast_null_one_dtor", dtorCount, 1);
+
+    /*
+     * REGRESSION LEGS: the owner lives in a NESTED scope that closes before the raw source's
+     * scope. The selected value is released at the inner close (count 1 there). On master the
+     * assign forms miss that release; the decl forms are refused outright (borrowed value).
+     */
+    dtorCount = 0;
+    {
+        Resource* raw = new Resource();
+        raw->id = 4454;
+        {
+            unique Resource* owner = nullptr;
+            owner = identityBool(true) ? raw : nullptr;
+            passed += Test("t443_nested_assign_raw_value", owner->id, 4454);
+        }
+        passed += Test("t443_nested_assign_raw_inner_dtor", dtorCount, 1);
+    }
+    passed += Test("t443_nested_assign_raw_outer_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* raw = new Resource();
+        raw->id = 4455;
+        {
+            unique Resource* owner = nullptr;
+            owner = identityBool(false) ? raw : new Resource();
+            passed += Test("t443_nested_assign_new_value", owner->id, 0);
+        }
+        passed += Test("t443_nested_assign_new_inner_dtor", dtorCount, 1);
+    }
+    passed += Test("t443_nested_assign_new_outer_dtor", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        Resource* raw = new Resource();
+        raw->id = 4456;
+        {
+            unique Resource* owner = identityBool(true) ? raw : nullptr;
+            passed += Test("t443_nested_decl_raw_value", owner->id, 4456);
+        }
+        passed += Test("t443_nested_decl_raw_inner_dtor", dtorCount, 1);
+    }
+    passed += Test("t443_nested_decl_raw_outer_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* raw = new Resource();
+        raw->id = 4457;
+        {
+            unique Resource* owner = identityBool(false) ? raw : new Resource();
+            passed += Test("t443_nested_decl_new_value", owner->id, 0);
+        }
+        passed += Test("t443_nested_decl_new_inner_dtor", dtorCount, 1);
+    }
+    passed += Test("t443_nested_decl_new_outer_dtor", dtorCount, 2);
+
+    return passed;
+}
+
 int testFieldOwnership()
 {
     int passed = 0;
@@ -12643,8 +12831,8 @@ struct RfldMHolder
 {
     OaiBox b;
     int n = 0;
-    OaiBox get()      { return b; }
-    OaiBox getThis()  { return this.b; }
+    OaiBox get()      { return move b; }
+    OaiBox getThis()  { return move this.b; }
     // A LOCAL shadowing the field: name resolution reaches the local first, so this must take the
     // movableLocalReturn path and leave the FIELD untouched.
     OaiBox getShadow() { OaiBox b; b = oaiMake(56); return b; }
@@ -12652,7 +12840,7 @@ struct RfldMHolder
 };
 
 struct RfldMInner { OaiBox b; };
-struct RfldMNest  { RfldMInner inner; OaiBox get() { return inner.b; } };
+struct RfldMNest  { RfldMInner inner; OaiBox get() { return move inner.b; } };
 struct RfldMCopy  { OaiCopyBox b; OaiCopyBox get() { return b; } };
 struct RfldSNest  { OaiSBox inner; string get() { return inner.s; } };
 
@@ -15484,6 +15672,9 @@ extern int main()
     passed += testT266RawFieldAssign();
     total += 16;
 
+    passed += testT443TernaryUniquePointerOwnership();
+    total += 36;
+
     passed += testT266RoundThree();
     total += 6;
 
@@ -15687,6 +15878,8 @@ extern int main()
     total += 8;
     passed += testImmovable();
     total += 26;
+    passed += testImmovableFactoryReturn();
+    total += 27;
 
     int c = 1;
     conditionalNewCount = 0;
@@ -15929,6 +16122,8 @@ extern int main()
     total += 7;
     passed += testChainedRawShapes();
     total += 8;
+    passed += testT447ExplicitMoveThisField();
+    total++;
     passed += testT376ChainedUniqueField();
     total += 12;
     passed += testT388AcceptSet();
@@ -15964,6 +16159,20 @@ extern int main()
     total += 1;
     passed += testT216RebindReturn();
     total += 6;
+    passed += testT445AliasUsingStringPointer();
+    total += 1;
+    passed += testT445GenericAliasCallback();
+    total += 1;
+    passed += testT445GenericStructUsing();
+    total += 1;
+    passed += testT445GenericFunctionUsing();
+    total += 1;
+    passed += testT445GenericMethodUsing();
+    total += 1;
+    passed += testT445GenericUsingAliasChain();
+    total += 1;
+    passed += testT445GenericUsingFnPtr();
+    total += 1;
 
     passed += testT212AliasReturnAcceptSet();
     total += 15;
@@ -16294,6 +16503,44 @@ struct ImmHolder { ImmPin* p = nullptr; int y = 0; };
 struct ImmOuter { ImmPin pin; };
 struct ImmArr { ImmPin items[2]; };
 struct ImmPlain { int v = 0; };
+int immReturnCtorCount = 0;
+int immReturnDtorCount = 0;
+void* immReturnSeenThis = nullptr;
+[immovable] struct ImmReturnTracked
+{
+    int value = 0;
+    ImmReturnTracked() { immReturnCtorCount = immReturnCtorCount + 1; immReturnSeenThis = this; }
+    ~ImmReturnTracked() { immReturnDtorCount = immReturnDtorCount + 1; }
+};
+ImmReturnTracked immReturnBrace() { return { value = 41 }; }
+ImmReturnTracked immReturnTrackedMake(int value) { return { value = value }; }
+ImmReturnTracked immReturnDefault() { return default; }
+ImmReturnTracked immReturnChain() { return immReturnDefault(); }
+ImmReturnTracked immReturnChoice(bool choose) { return choose ? immReturnBrace() : default; }
+int immReturnTake(ImmReturnTracked value) { return value.value; }
+
+int t442PlainCtorCount = 0;
+void* t442PlainSeenThis = nullptr;
+[immovable] struct T442ImmovPlain
+{
+    int value = 0;
+    T442ImmovPlain() { t442PlainCtorCount = t442PlainCtorCount + 1; t442PlainSeenThis = this; }
+};
+T442ImmovPlain t442PlainMake(int value) { return { value = value }; }
+struct T442PlainHolder { T442ImmovPlain q; int y = 0; };
+struct T442TrackedHolder { ImmReturnTracked q; int y = 0; };
+interface T442ImmovReturnInterface
+{
+    T442ImmovPlain getPlain(int value);
+    ImmReturnTracked getTracked(int value);
+};
+class T442ImmovReturnImpl : T442ImmovReturnInterface
+{
+    int bias = 1;
+    T442ImmovPlain getPlain(int value) { return { value = value + bias }; }
+    ImmReturnTracked getTracked(int value) { return { value = value + bias }; }
+};
+void t442VoidEmptyReturn(int* value) { *value = 7; return {}; }
 
 // T142: `default` as a call argument takes its value from the by-value parameter it binds.
 // Refusals (ambiguous, no by-value parameter) live in Test/errors/err_default_arg_*.cb.
@@ -16413,6 +16660,247 @@ int testImmovable()
     delete dif;
     passed += Test("defarg_iface_value", ifValue, 7);
     passed += Test("defarg_iface_ctor_dtor_once", (defArgIfaceCtors - ifOb) * 10 + (defArgIfaceDtors - ifOd), 11);
+    return passed;
+}
+
+// T442 round 4: `?:` field initializers and nested `?:` assignments build or move each value once.
+T442TrackedHolder t442FieldTernaryReturn(bool pick)
+{
+    return { q = pick ? immReturnTrackedMake(8) : immReturnTrackedMake(9), y = 1 };
+}
+int t442FieldTernaryReturnTracked(bool pick)
+{
+    immReturnCtorCount = 0; immReturnDtorCount = 0; immReturnSeenThis = nullptr;
+    int code = 0;
+    {
+        T442TrackedHolder holder = t442FieldTernaryReturn(pick);
+        code = holder.q.value * 1000 + (immReturnSeenThis == (void*)&holder.q ? 100 : 0)
+            + immReturnCtorCount * 10;
+    }
+    return code + immReturnDtorCount;
+}
+int t442FieldTernaryTracked(bool pick)
+{
+    immReturnCtorCount = 0; immReturnDtorCount = 0; immReturnSeenThis = nullptr;
+    int code = 0;
+    {
+        T442TrackedHolder holder = { q = pick ? immReturnTrackedMake(8) : immReturnTrackedMake(9), y = 1 };
+        code = holder.q.value * 1000 + (immReturnSeenThis == (void*)&holder.q ? 100 : 0)
+            + immReturnCtorCount * 10;
+    }
+    return code + immReturnDtorCount;
+}
+int t442FieldTernaryPlain(bool pick)
+{
+    t442PlainCtorCount = 0; t442PlainSeenThis = nullptr;
+    T442PlainHolder holder = { q = pick ? t442PlainMake(1) : t442PlainMake(2), y = 1 };
+    return holder.q.value * 1000 + (t442PlainSeenThis == (void*)&holder.q ? 100 : 0)
+        + t442PlainCtorCount * 10;
+}
+int t442NestedAssignTracked(bool c, bool b)
+{
+    immReturnCtorCount = 0; immReturnDtorCount = 0;
+    int value = 0;
+    int afterAssign = 0;
+    {
+        ImmReturnTracked slot = immReturnTrackedMake(1);
+        slot = c ? (b ? immReturnTrackedMake(2) : immReturnTrackedMake(3)) : immReturnTrackedMake(4);
+        value = slot.value;
+        afterAssign = immReturnDtorCount;
+    }
+    return value * 1000 + immReturnCtorCount * 100 + afterAssign * 10 + immReturnDtorCount;
+}
+
+int testImmovableFactoryReturn()
+{
+    int passed = 0;
+    void* expectedThis = nullptr;
+    int dtorDuringScope = -1;
+    int fieldValue = 0;
+
+    immReturnCtorCount = 0; immReturnDtorCount = 0; immReturnSeenThis = nullptr;
+    {
+        ImmReturnTracked value = { value = 9 };
+        expectedThis = &value;
+        dtorDuringScope = immReturnDtorCount;
+        fieldValue = value.value;
+    }
+    passed += Test("imm_return_local_brace_address_and_lifetime",
+        (immReturnSeenThis == expectedThis ? 10000 : 0) + immReturnCtorCount * 1000
+            + dtorDuringScope * 100 + immReturnDtorCount * 10 + fieldValue,
+        11019);
+
+    immReturnCtorCount = 0; immReturnDtorCount = 0; immReturnSeenThis = nullptr;
+    {
+        ImmReturnTracked value = immReturnBrace();
+        expectedThis = &value;
+        dtorDuringScope = immReturnDtorCount;
+        fieldValue = value.value;
+    }
+    passed += Test("imm_return_brace_address_and_lifetime",
+        (immReturnSeenThis == expectedThis ? 10000 : 0) + immReturnCtorCount * 1000
+            + dtorDuringScope * 100 + immReturnDtorCount * 10 + fieldValue,
+        11051);
+
+    immReturnCtorCount = 0; immReturnDtorCount = 0; immReturnSeenThis = nullptr;
+    {
+        ImmReturnTracked value = immReturnDefault();
+        expectedThis = &value;
+        dtorDuringScope = immReturnDtorCount;
+    }
+    passed += Test("imm_return_default_address_and_lifetime",
+        (immReturnSeenThis == expectedThis ? 10000 : 0) + immReturnCtorCount * 1000
+            + dtorDuringScope * 100 + immReturnDtorCount * 10,
+        11010);
+
+    immReturnCtorCount = 0; immReturnDtorCount = 0; immReturnSeenThis = nullptr;
+    {
+        ImmReturnTracked value = immReturnChain();
+        expectedThis = &value;
+        dtorDuringScope = immReturnDtorCount;
+    }
+    passed += Test("imm_return_chained_factory_address_and_lifetime",
+        (immReturnSeenThis == expectedThis ? 10000 : 0) + immReturnCtorCount * 1000
+            + dtorDuringScope * 100 + immReturnDtorCount * 10,
+        11010);
+
+    immReturnCtorCount = 0; immReturnDtorCount = 0; immReturnSeenThis = nullptr;
+    {
+        ImmReturnTracked value = immReturnChoice(true);
+        expectedThis = &value;
+        dtorDuringScope = immReturnDtorCount;
+        fieldValue = value.value;
+    }
+    passed += Test("imm_return_ternary_call_address_and_lifetime",
+        (immReturnSeenThis == expectedThis ? 10000 : 0) + immReturnCtorCount * 1000
+            + dtorDuringScope * 100 + immReturnDtorCount * 10 + fieldValue,
+        11051);
+
+    immReturnCtorCount = 0; immReturnDtorCount = 0; immReturnSeenThis = nullptr;
+    {
+        ImmReturnTracked value = immReturnChoice(false);
+        expectedThis = &value;
+        dtorDuringScope = immReturnDtorCount;
+    }
+    passed += Test("imm_return_ternary_default_address_and_lifetime",
+        (immReturnSeenThis == expectedThis ? 10000 : 0) + immReturnCtorCount * 1000
+            + dtorDuringScope * 100 + immReturnDtorCount * 10,
+        11010);
+
+    immReturnCtorCount = 0; immReturnDtorCount = 0; immReturnSeenThis = nullptr;
+    fieldValue = immReturnBrace().value;
+    passed += Test("imm_return_field_temp_destroyed_once",
+        fieldValue * 100 + immReturnCtorCount * 10 + immReturnDtorCount, 4111);
+
+    immReturnCtorCount = 0; immReturnDtorCount = 0; immReturnSeenThis = nullptr;
+    int takenValue = immReturnTake(immReturnBrace());
+    passed += Test("imm_return_by_value_argument_destroyed_once",
+        takenValue * 100 + immReturnCtorCount * 10 + immReturnDtorCount, 4111);
+
+    int emptyReturnValue = 0;
+    t442VoidEmptyReturn(&emptyReturnValue);
+    passed += Test("t442_void_empty_return_block", emptyReturnValue, 7);
+
+    T442ImmovReturnImpl impl;
+    T442ImmovReturnInterface iface = impl;
+    t442PlainCtorCount = 0; t442PlainSeenThis = nullptr;
+    T442ImmovPlain ifacePlain = iface.getPlain(5);
+    passed += Test("t442_iface_plain_return_value_address_ctor",
+        ifacePlain.value * 1000 + (t442PlainSeenThis == (void*)&ifacePlain ? 100 : 0)
+            + t442PlainCtorCount, 6101);
+
+    immReturnCtorCount = 0; immReturnDtorCount = 0; immReturnSeenThis = nullptr;
+    int ifaceTrackedOk = 0;
+    {
+        ImmReturnTracked ifaceTracked = iface.getTracked(5);
+        ifaceTrackedOk = ifaceTracked.value == 6 && immReturnSeenThis == (void*)&ifaceTracked
+            && immReturnCtorCount == 1 && immReturnDtorCount == 0 ? 1 : 0;
+    }
+    ifaceTrackedOk = ifaceTrackedOk && immReturnDtorCount == 1 ? 1 : 0;
+    passed += Test("t442_iface_tracked_return_value_address_lifetime", ifaceTrackedOk, 1);
+
+    t442PlainCtorCount = 0; t442PlainSeenThis = nullptr;
+    {
+        bool choose = true;
+        T442ImmovPlain value = choose ? t442PlainMake(1) : t442PlainMake(2);
+        passed += Test("t442_plain_ternary_decl_value_address_ctor",
+            value.value * 1000 + (t442PlainSeenThis == (void*)&value ? 100 : 0)
+                + t442PlainCtorCount, 1101);
+    }
+
+    immReturnCtorCount = 0; immReturnDtorCount = 0; immReturnSeenThis = nullptr;
+    int trackedTernaryOk = 0;
+    {
+        bool choose = false;
+        ImmReturnTracked value = choose ? immReturnTrackedMake(1) : immReturnTrackedMake(2);
+        trackedTernaryOk = value.value == 2 && immReturnSeenThis == (void*)&value
+            && immReturnCtorCount == 1 && immReturnDtorCount == 0 ? 1 : 0;
+    }
+    trackedTernaryOk = trackedTernaryOk && immReturnDtorCount == 1 ? 1 : 0;
+    passed += Test("t442_tracked_ternary_decl_value_address_lifetime", trackedTernaryOk, 1);
+
+    t442PlainCtorCount = 0; t442PlainSeenThis = nullptr;
+    {
+        T442PlainHolder holder = { q = t442PlainMake(6), y = 1 };
+        passed += Test("t442_plain_field_init_value_address_ctor",
+            holder.q.value * 1000 + holder.y * 100
+                + (t442PlainSeenThis == (void*)&holder.q ? 10 : 0) + t442PlainCtorCount, 6111);
+    }
+
+    immReturnCtorCount = 0; immReturnDtorCount = 0; immReturnSeenThis = nullptr;
+    int trackedFieldOk = 0;
+    {
+        T442TrackedHolder holder = { q = immReturnTrackedMake(7), y = 1 };
+        trackedFieldOk = holder.q.value == 7 && holder.y == 1
+            && immReturnSeenThis == (void*)&holder.q && immReturnCtorCount == 1
+            && immReturnDtorCount == 0 ? 1 : 0;
+    }
+    trackedFieldOk = trackedFieldOk && immReturnDtorCount == 1 ? 1 : 0;
+    passed += Test("t442_tracked_field_init_value_address_lifetime", trackedFieldOk, 1);
+
+    t442PlainCtorCount = 0; t442PlainSeenThis = nullptr;
+    {
+        T442ImmovPlain value = t442PlainMake(1);
+        value = t442PlainMake(2);
+        passed += Test("t442_plain_factory_assignment_value_ctor",
+            value.value * 100 + t442PlainCtorCount, 202);
+    }
+
+    immReturnCtorCount = 0; immReturnDtorCount = 0;
+    int trackedAssignValue = 0;
+    int trackedAssignDtorAfter = 0;
+    {
+        ImmReturnTracked value = immReturnTrackedMake(1);
+        value = immReturnTrackedMake(2);
+        trackedAssignValue = value.value;
+        trackedAssignDtorAfter = immReturnDtorCount;
+    }
+    passed += Test("t442_tracked_factory_assignment_destroys_old_once",
+        trackedAssignValue * 1000 + immReturnCtorCount * 100 + trackedAssignDtorAfter * 10
+            + immReturnDtorCount, 2212);
+
+    immReturnCtorCount = 0; immReturnDtorCount = 0;
+    int trackedTernaryAssignValue = 0;
+    int trackedTernaryAssignDtorAfter = 0;
+    {
+        bool choose = true;
+        ImmReturnTracked value = immReturnTrackedMake(3);
+        value = choose ? immReturnTrackedMake(4) : immReturnTrackedMake(5);
+        trackedTernaryAssignValue = value.value;
+        trackedTernaryAssignDtorAfter = immReturnDtorCount;
+    }
+    passed += Test("t442_tracked_ternary_assignment_destroys_old_once",
+        trackedTernaryAssignValue * 1000 + immReturnCtorCount * 100
+            + trackedTernaryAssignDtorAfter * 10 + immReturnDtorCount, 4212);
+    passed += Test("t442_tracked_field_ternary_true_arm_lifetime", t442FieldTernaryTracked(true), 8111);
+    passed += Test("t442_tracked_field_ternary_false_arm_lifetime", t442FieldTernaryTracked(false), 9111);
+    passed += Test("t442_tracked_field_ternary_return_true_arm", t442FieldTernaryReturnTracked(true), 8111);
+    passed += Test("t442_tracked_field_ternary_return_false_arm", t442FieldTernaryReturnTracked(false), 9111);
+    passed += Test("t442_plain_field_ternary_true_arm_address_ctor", t442FieldTernaryPlain(true), 1110);
+    passed += Test("t442_plain_field_ternary_false_arm_address_ctor", t442FieldTernaryPlain(false), 2110);
+    passed += Test("t442_tracked_nested_assignment_true_true", t442NestedAssignTracked(true, true), 2212);
+    passed += Test("t442_tracked_nested_assignment_true_false", t442NestedAssignTracked(true, false), 3212);
+    passed += Test("t442_tracked_nested_assignment_outer_false", t442NestedAssignTracked(false, true), 4212);
     return passed;
 }
 
@@ -17745,6 +18233,108 @@ int testT216RebindReturn()
     return passed;
 }
 
+using T445StringAlias = string;
+string t445StringValue = "x";
+alias T445StringAlias* t445StringPointer() { return &t445StringValue; }
+
+int testT445AliasUsingStringPointer()
+{
+    function<alias T445StringAlias*()> callback = t445StringPointer;
+    alias T445StringAlias* p = callback();
+    return Test("t445_alias_using_string_pointer", p->length(), 1);
+}
+
+string t445GenericCallbackValue = "ab";
+alias T t445GenericCallbackGet<T>() { return t445GenericCallbackValue; }
+
+int t445InvokeGenericAliasCallback<T>()
+{
+    function<alias T()> callback = t445GenericCallbackGet<T>;
+    T result = callback();
+    return result == "ab" ? 1 : 0;
+}
+
+int testT445GenericAliasCallback()
+{
+    return Test("t445_generic_alias_callback", t445InvokeGenericAliasCallback<string>(), 1);
+}
+
+struct T445GenericStructUsing<T>
+{
+    using S = T;
+    T value = default;
+    alias S get() { return value; }
+};
+
+int testT445GenericStructUsing()
+{
+    T445GenericStructUsing<string> box;
+    box.value = "ab";
+    string result = box.get();
+    return Test("t445_generic_struct_using_alias_value", result, "ab");
+}
+
+int t445GenericFunctionUsing<T>(T value)
+{
+    using S = T;
+    alias S borrowed = value;
+    return borrowed.length();
+}
+
+int testT445GenericFunctionUsing()
+{
+    string value = "ab";
+    return Test("t445_generic_function_using_alias_value",
+        t445GenericFunctionUsing<string>(value), 2);
+}
+
+struct T445GenericMethodUsing<T>
+{
+    T value = default;
+    int getLength()
+    {
+        using S = T;
+        alias S borrowed = value;
+        return borrowed.length();
+    }
+};
+
+int testT445GenericMethodUsing()
+{
+    T445GenericMethodUsing<string> box;
+    box.value = "abc";
+    return Test("t445_generic_method_using_alias_value", box.getLength(), 3);
+}
+
+int t445GenericUsingAliasChain<T>(T value)
+{
+    using S = T;
+    using Q = S;
+    alias Q borrowed = value;
+    return borrowed.length();
+}
+
+int testT445GenericUsingAliasChain()
+{
+    string value = "abcd";
+    return Test("t445_generic_using_alias_chain_value",
+        t445GenericUsingAliasChain<string>(value), 4);
+}
+
+int t445GenericUsingFnPtr<T>()
+{
+    using S = T;
+    function<alias S()> callback = default;
+    alias S borrowed = t445GenericCallbackValue;
+    return borrowed.length();
+}
+
+int testT445GenericUsingFnPtr()
+{
+    return Test("t445_generic_using_function_pointer_value",
+        t445GenericUsingFnPtr<string>(), 2);
+}
+
 // T227: a `??` operand bound to a NON-move borrow keeps the owning field live (the join must not
 // move it out), and a raw copy of an OWNING local is a borrow, so the owner stays the sole owner
 // along every accepted path. The refusals live in Test/errors/err_move_owning_local_copy_into_sink.cb.
@@ -18036,10 +18626,33 @@ struct T376Implicit
     {
         unique T376PS* owner = nullptr;
         p = new T376PS(102);
-        owner = p;
+        owner = move p;
         return owner == nullptr || p != nullptr ? -1 : owner->v;
     }
 };
+
+struct T447GlobalReceiver
+{
+    unique T376PS* p = default;
+    int takeExplicit()
+    {
+        unique T376PS* owner = nullptr;
+        owner = move p;
+        return owner == nullptr ? -1 : owner->v;
+    }
+};
+T447GlobalReceiver t447GlobalReceiver = default;
+
+int testT447ExplicitMoveThisField()
+{
+    t376ChainDtors = 0;
+    i64 before = (i64)HeapAudit.reportLeaks();
+    t447GlobalReceiver.p = new T376PS(447);
+    int value = t447GlobalReceiver.takeExplicit();
+    i64 after = (i64)HeapAudit.reportLeaks() - before;
+    return Test("t447_explicit_move_this_field_global_receiver",
+        value == 447 && t447GlobalReceiver.p == nullptr && t376ChainDtors == 1 && after == 0, true);
+}
 
 int testT376ChainedUniqueField()
 {

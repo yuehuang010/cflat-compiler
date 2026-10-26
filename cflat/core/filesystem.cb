@@ -591,7 +591,7 @@ class Path
         char* buf = new char[4096];
         char* result = os.realpath(path.data(), buf);
         if (result == nullptr) { delete[] buf; return path.copy(); }
-        return _strOwned(buf, strlen(buf));
+        return _strOwned(buf, (int)strlen(buf));
     }
 
     // Return the system temporary directory path (no trailing separator).
@@ -612,7 +612,7 @@ class Path
     {
         char* buf = new char[300];
         if (!os.make_temp_file(prefix.data(), buf, 300)) { delete[] buf; return ""; }
-        return _strOwned(buf, strlen(buf));
+        return _strOwned(buf, (int)strlen(buf));
     }
 };
 
@@ -690,7 +690,7 @@ class Directory
             delete[] buf;
             return "";
         }
-        return _strOwned(buf, strlen(buf));
+        return _strOwned(buf, (int)strlen(buf));
     }
 
     // Set the process current working directory to path.

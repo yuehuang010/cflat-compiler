@@ -25,9 +25,14 @@ Global inner `owner = gRaw = new PS()` stays refused (a global is never a consum
 `r.raw = new PS(); owner = r.raw;` is refused exactly like `unique PS* owner = r.raw;` and the chained form - assignment
 and declaration agree. Steer: `owner = move r.raw;` or `owner = new PS();`.
 
-## T266 (2026-10-15): two-statement `owner = r.raw` refused (direct, implicit-this, global, ternary arm)
-Still accepted on master and after T266 while the DECLARATION refuses them (assignment = declaration ruling):
-`owner = pick()` where pick returns a borrowed global (but a plain-field accessor returning a raw pointer is adopted by
-design - test_move plain_field_borrow_adopt_value has the same shape), and `owner = k ? raw_local : nullptr`; also
-`j_field` residual. NEEDS RULING: must assignment match the declaration for call results that return a borrow?
-Repros: scratch/repro_keep/t266_rev/.
+## T443 (2026-10-23): ternary into unique + borrowed-global call landed; open below
+Fixed: `owner = k ? raw : nullptr` (decl and assign) consumes the selected arm like if/else; `owner = pick()` is refused when
+every return of the callee is a module global (parse-tree summary, order-independent, per generic instance).
+- NEEDS RULING (part 2 of the 2026-10-21 ruling): a call returning a PARAMETER borrow stays accepted on assignment while the
+  declaration refuses it. Refusing it breaks accept legs test_move.cb:2823 (`borrowed = borrowFirstResource(h, new Resource())`),
+  :2869, :2882, :3049 (`m = mixedReturnResource(makeIdResource(51), true)`) and the alias-proof family. Change those legs, or keep
+  the parameter-borrow call accepted on assignment?
+- Gap (T443 Sol r4): the return summary counts returns in DISCARDED `if const` branches, so `N* pick<T>(N* p) { if const
+  (sizeof(T)==4) { return g; } else { return p; } }` leaves pick<int> unflagged and `owner = pick<int>(nullptr)` compiles. Fix:
+  collect live returns only, using the if-const evaluator per instance. Repros scratch/repro_keep/box1022/t443/ (generic_ifconst*.cb, ifconst_dead.cb).
+- `j_field` residual (T266) unchanged.

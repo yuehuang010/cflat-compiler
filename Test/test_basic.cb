@@ -6905,6 +6905,9 @@ bool testPointerArrays()
 {
     bool result = true;
 
+    function<win_usize((const char)*)> t449Strlen = strlen;
+    result &= Test("t449 strlen size_t signature and value", (i64)t449Strlen("abc"), (i64)3);
+
     (const char)*[3] words;
     words[0] = "alpha";
     words[1] = "beta";

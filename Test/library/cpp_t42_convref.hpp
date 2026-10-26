@@ -165,3 +165,37 @@ struct T339Box {
 inline T339Box t339_make_box() { return T339Box(7); }
 inline T339Box t339_outer_box(T339Box value) { return T339Box(value.id() + 2); }
 }
+
+namespace cpi_t42 {
+inline int t454_born = 0, t454_copies = 0, t454_moves = 0, t454_dead = 0;
+inline int t454_chosen = 0;
+inline void t454_reset() {
+    t454_born = t454_copies = t454_moves = t454_dead = t454_chosen = 0;
+}
+struct T454Box {
+    int value;
+    explicit T454Box(int v) : value(v) { ++t454_born; }
+    T454Box(const T454Box& other) : value(other.value) { ++t454_born; ++t454_copies; }
+    T454Box(T454Box&& other) noexcept : value(other.value) {
+        ++t454_born; ++t454_moves; other.value = -1;
+    }
+    ~T454Box() { ++t454_dead; }
+    int id() const { return value; }
+    void mutate() { value = 99; }
+};
+inline T454Box t454_make_box() { return T454Box(7); }
+inline T454Box t454_make_box_2() { return T454Box(9); }
+inline void t454_take(const T454Box&) { t454_chosen = 1; }
+inline void t454_take(T454Box&&) { t454_chosen = 2; }
+inline void t454_take_value(T454Box) { t454_chosen = 3; }
+
+inline int t454_trivial_chosen = 0;
+struct T454TrivialBox {
+    int value;
+    int id() const { return value; }
+    void mutate() { value = 99; }
+};
+inline T454TrivialBox t454_make_trivial_box() { return T454TrivialBox{7}; }
+inline void t454_take_trivial(const T454TrivialBox&) { t454_trivial_chosen = 1; }
+inline void t454_take_trivial(T454TrivialBox&&) { t454_trivial_chosen = 2; }
+}

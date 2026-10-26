@@ -111,7 +111,7 @@ i32 _wsa_listen(void* sock, i32 backlog) {
 }
 void* _wsa_accept(void* sock, _SockAddrIn* addr, i32* len) {
     os.posix.ignore_sigpipe();   // accepted sockets send too; keep EPIPE non-fatal
-    i32 fd = os.posix.accept((i32)(i64)sock, (void*)addr, len);
+    i32 fd = os.posix.accept((i32)(i64)sock, (void*)addr, (u32*)len);
     if (fd < 0) return (void*)(i64)-1;
     return (void*)(i64)fd;
 }

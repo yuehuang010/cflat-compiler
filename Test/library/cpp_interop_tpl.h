@@ -1110,6 +1110,31 @@ namespace ptrbool
         TemplateCtor(bool) : value(20) {}
         TemplateCtor(std::nullptr_t) : value(10) {}
     };
+
+    inline int t452_c1(char*) { return 1; }
+    inline int t452_c1(bool) { return 3; }
+    inline int t452_identity(int x) { return x; }
+    inline int t452_f2(const void*) { return 4; }
+    inline int t452_f2(bool) { return 3; }
+    inline int t452_only_bool(bool) { return 3; }
+
+    struct T452Wrap { T452Wrap(void*) {} };
+    inline int t452_w1(T452Wrap) { return 1; }
+    inline int t452_w1(int*) { return 2; }
+    inline int t452_vw(int*) { return 1; }
+    inline int t452_vw(T452Wrap) { return 2; }
+    inline int t452_nw(std::nullptr_t) { return 5; }
+    inline int t452_nw(T452Wrap) { return 1; }
+
+    inline int t452_double(float*, int) { return 1; }
+    inline int t452_double(bool, long) { return 2; }
+    inline int t452_string(char*, int) { return 1; }
+    inline int t452_string(bool, long) { return 2; }
+    struct T452DoubleMember
+    {
+        int pick(float*, int) { return 1; }
+        int pick(bool, long) { return 2; }
+    };
 }
 
 namespace td
@@ -2578,6 +2603,45 @@ template <class T> struct Conv {
     Conv(const Conv& other) : value(other.value) { ++Stats<T>::copy; }
     Conv(Conv&& other) : value(other.value) { ++Stats<T>::move; }
     ~Conv() { ++Stats<T>::dtor; }
+};
+
+template <class T> struct ReturnConv {
+    int value;
+    ReturnConv(int x) : value(x) { ++Stats<T>::ctor; }
+    template <class U> ReturnConv(const ReturnConv<U>& other) : value(other.value + 100) {
+        ++Stats<T>::conversion;
+    }
+    template <class U> ReturnConv(ReturnConv<U>&& other) : value(other.value + 200) {
+        ++Stats<T>::move;
+    }
+    ReturnConv(const ReturnConv& other) : value(other.value) { ++Stats<T>::copy; }
+    ~ReturnConv() { ++Stats<T>::dtor; }
+};
+
+struct ReturnStats {
+    inline static int srcCtor = 0;
+    inline static int srcCopy = 0;
+    inline static int srcMove = 0;
+    inline static int srcDtor = 0;
+    inline static int lvalueCtor = 0;
+    inline static int rvalueCtor = 0;
+    static void reset() {
+        srcCtor = srcCopy = srcMove = srcDtor = lvalueCtor = rvalueCtor = 0;
+    }
+};
+
+struct ReturnSrc {
+    int value;
+    ReturnSrc(int x) : value(x) { ++ReturnStats::srcCtor; }
+    ReturnSrc(const ReturnSrc& other) : value(other.value) { ++ReturnStats::srcCopy; }
+    ReturnSrc(ReturnSrc&& other) : value(other.value) { ++ReturnStats::srcMove; }
+    ~ReturnSrc() { ++ReturnStats::srcDtor; }
+};
+
+struct ReturnDst {
+    int value;
+    ReturnDst(const ReturnSrc& source) : value(source.value + 1) { ++ReturnStats::lvalueCtor; }
+    ReturnDst(ReturnSrc&& source) : value(source.value + 2) { ++ReturnStats::rvalueCtor; }
 };
 
 template <class T> struct Explicit {

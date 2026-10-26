@@ -1,27 +1,27 @@
 // C runtime bindings - extern declarations and wrappers for standard C library functions
 
 // === Memory Functions ===
-// size_t is pointer-sized (win_size: i64 on Win64, i32 on Win32).
+// size_t is pointer-sized and unsigned (win_usize: u64 on Win64, u32 on Win32).
 // Allocate `size` bytes of uninitialized memory; returns nullptr on failure.
-extern void* malloc(win_size size);
+extern void* malloc(win_usize size);
 // Free a block previously returned by malloc/calloc/realloc.
 extern void  free(void* ptr);
 // Allocate `count`*`size` zero-initialized bytes.
-extern void* calloc(win_size count, win_size size);
+extern void* calloc(win_usize count, win_usize size);
 // Resize a previously allocated block, preserving existing contents.
-extern void* realloc(void* ptr, win_size size);
+extern void* realloc(void* ptr, win_usize size);
 // Allocate `size` bytes aligned to `alignment`.
 if const (__WINDOWS__) {
     // MSVC CRT pair.
-    extern void* _aligned_malloc(win_size size, win_size alignment);
+    extern void* _aligned_malloc(win_usize size, win_usize alignment);
     extern void  _aligned_free(void* ptr);
 } else {
     // POSIX: posix_memalign (alignment must be a power of two >= sizeof(void*)).
     // Aligned blocks are released with plain free(), so _aligned_free == free.
-    extern win_int posix_memalign(void** memptr, win_size alignment, win_size size);
-    void* _aligned_malloc(win_size size, win_size alignment) {
+    extern win_int posix_memalign(void** memptr, win_usize alignment, win_usize size);
+    void* _aligned_malloc(win_usize size, win_usize alignment) {
         void* p = nullptr;
-        win_size a = alignment < (win_size)8 ? (win_size)8 : alignment;
+        win_usize a = alignment < (win_usize)8 ? (win_usize)8 : alignment;
         if (posix_memalign(&p, a, size) != 0) return nullptr;
         return p;
     }
@@ -30,11 +30,11 @@ if const (__WINDOWS__) {
 
 // === File stream I/O (portable C stdio: one linkage name on Win CRT and libc) ===
 // Declared here (cruntime is the canonical home for portable stdio); filesystem.cb
-// calls these un-namespaced. Types mirror os.posix.cb (win_size == i64 on 64-bit).
+// calls these un-namespaced. size_t fields use win_usize; C long offsets use long.
 extern void*    fopen(const char* path, const char* mode);
 extern win_int  fclose(void* stream);
-extern win_size fread(char* buf, win_size size, win_size count, void* stream);
-extern win_size fwrite(const char* buf, win_size size, win_size count, void* stream);
+extern win_usize fread(char* buf, win_usize size, win_usize count, void* stream);
+extern win_usize fwrite(const char* buf, win_usize size, win_usize count, void* stream);
 extern win_int  feof(void* stream);
 // C spells both offsets `long`: 32-bit on Windows/LLP64, 64-bit on LP64.
 extern win_int  fseek(void* stream, long offset, win_int origin);
@@ -44,14 +44,14 @@ extern long     ftell(void* stream);
 // vs libc entry-point NAME differs). These share the one linkage symbol with the
 // identical decls left in os.windows.cb / os.posix.cb for the later prune pass.
 if const (__WINDOWS__) {
-    extern win_int __stdio_common_vsprintf(u64 options, char* buf, win_size bufSize, const char* fmt, void* locale, va_list ap);
-    extern win_int __stdio_common_vsscanf(u64 options, const char* buf, win_size bufSize, const char* fmt, void* locale, va_list ap);
+    extern win_int __stdio_common_vsprintf(u64 options, char* buf, win_usize bufSize, const char* fmt, void* locale, va_list ap);
+    extern win_int __stdio_common_vsscanf(u64 options, const char* buf, win_usize bufSize, const char* fmt, void* locale, va_list ap);
     extern win_int __stdio_common_vfprintf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
 } else {
     // POSIX: __vsnprintf_chk (both), the glibc ISO-C99/chk variants, and the Darwin
     // public names. Wrapper BODIES pick per-platform via if const; unreferenced
     // decls (e.g. __isoc99_* on Darwin) emit no symbol. Mirrors os.posix.cb.
-    extern win_int __vsnprintf_chk(char* buf, win_size maxlen, win_int flag, win_size slen, const char* fmt, va_list ap);
+    extern win_int __vsnprintf_chk(char* buf, win_usize maxlen, win_int flag, win_usize slen, const char* fmt, va_list ap);
     extern win_int __isoc99_vsscanf(const char* buf, const char* fmt, va_list ap);
     extern win_int __vfprintf_chk(void* stream, win_int flag, const char* fmt, va_list ap);
     extern win_int __isoc99_vfscanf(void* stream, const char* fmt, va_list ap);
@@ -62,12 +62,10 @@ if const (__WINDOWS__) {
 
 // Win32: callers always pass i64; these wrappers truncate to i32 before calling the CRT.
 if const (__PLATFORM__ == 32) {
-    // i64-arg malloc wrapper: truncates to win_size before calling the CRT.
-    void* malloc(i64 bytes)          { return malloc((win_size)bytes); }
-    // i64-arg calloc wrapper: truncates both args to win_size.
-    void* calloc(i64 cnt, i64 sz)   { return calloc((win_size)cnt, (win_size)sz); }
-    // i64-arg realloc wrapper: truncates size to win_size.
-    void* realloc(void* p, i64 sz)  { return realloc(p, (win_size)sz); }
+    // i64-arg wrappers truncate to the target size_t before calling the CRT.
+    void* malloc(i64 bytes)          { return malloc((win_usize)bytes); }
+    void* calloc(i64 cnt, i64 sz)   { return calloc((win_usize)cnt, (win_usize)sz); }
+    void* realloc(void* p, i64 sz)  { return realloc(p, (win_usize)sz); }
 }
 
 // Per-thread state for the 'program' construct: stdout/stdin hooks, format buffer,
@@ -99,10 +97,10 @@ thread_local __ProgramTLS __prog_tls = default;
 // initial buffer is silently dropped.
 win_int __vsprintf_safe(u64 options, char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap) {
     if const (__WINDOWS__) {
-        return __stdio_common_vsprintf(options | (u64)2, buf, (win_size)bufSize, fmt, locale, ap);
+        return __stdio_common_vsprintf(options | (u64)2, buf, (win_usize)bufSize, fmt, locale, ap);
     } else {
         // __vsnprintf_chk(s, maxlen, flag=0, slen=maxlen, fmt, ap): plain, bounds never trip.
-        return __vsnprintf_chk(buf, (win_size)bufSize, 0, (win_size)bufSize, fmt, ap);
+        return __vsnprintf_chk(buf, (win_usize)bufSize, 0, (win_usize)bufSize, fmt, ap);
     }
 }
 
@@ -155,7 +153,7 @@ int __cstr_len(const char* s) {
 // Thin wrapper over the Windows CRT vsscanf backend; casts bufSize to win_size.
 win_int __vsscanf_safe(u64 options, const char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap) {
     if const (__WINDOWS__) {
-        return __stdio_common_vsscanf(options, buf, (win_size)bufSize, fmt, locale, ap);
+        return __stdio_common_vsscanf(options, buf, (win_usize)bufSize, fmt, locale, ap);
     } else if const (__MACOS__) {
         return vsscanf(buf, fmt, ap);
     } else {
@@ -220,10 +218,10 @@ extern i32 sprintf(char* buf, const char* fmt, ...) {
 }
 
 // snprintf - format into `buf` bounded by `bufSize`; returns chars that would be written.
-extern int snprintf(char* buf, i64 bufSize, const char* fmt, ...) {
+extern int snprintf(char* buf, win_usize bufSize, const char* fmt, ...) {
     va_list ap;
     va_start(ap);
-    int result = __vsprintf_safe(0, buf, bufSize, fmt, nullptr, ap);
+    int result = __vsprintf_safe(0, buf, (i64)bufSize, fmt, nullptr, ap);
     va_end(ap);
     return result;
 }
@@ -252,8 +250,8 @@ extern int vsprintf(char* buf, const char* fmt, va_list ap) {
 }
 
 // vsnprintf - like snprintf but takes a pre-started va_list; bounded by `bufSize`.
-extern int vsnprintf(char* buf, i64 bufSize, const char* fmt, va_list ap) {
-    return __vsprintf_safe(0, buf, bufSize, fmt, nullptr, ap);
+extern int vsnprintf(char* buf, win_usize bufSize, const char* fmt, va_list ap) {
+    return __vsprintf_safe(0, buf, (i64)bufSize, fmt, nullptr, ap);
 }
 
 // === Stdout convenience output (hook-aware, VT-correct) ===
@@ -329,7 +327,7 @@ extern int fprintf(void* stream, const char* fmt, ...) {
 // Used by the fgets fallback to read one character from any stream.
 extern int fgetc(void* stream);
 // Copy `n` bytes from src to dest (regions must not overlap).
-extern void* memcpy(void* dest, const void* src, i64 n);
+extern void* memcpy(void* dest, const void* src, win_usize n);
 
 // Internal: return next character from the hook line-buffer, refilling via the hook
 // when the current line is exhausted.  Returns -1 on EOF (hook returned nullptr).
@@ -493,19 +491,19 @@ extern int fscanf(void* stream, const char* fmt, ...) {
 
 // === String Functions ===
 // Length in bytes of a NUL-terminated string.
-extern i32 strlen(const char* s);
+extern win_usize strlen(const char* s);
 // Compare two strings lexicographically; 0 if equal.
 extern int strcmp(const char* a, const char* b);
 // Compare at most `n` bytes of two strings; 0 if equal in that range.
-extern int strncmp(const char* a, const char* b, i64 n);
+extern int strncmp(const char* a, const char* b, win_usize n);
 // Copy src (including NUL) into dest; returns dest.
 extern char* strcpy(char* dest, const char* src);
 // Copy at most `n` bytes of src into dest; returns dest.
-extern char* strncpy(char* dest, const char* src, i64 n);
+extern char* strncpy(char* dest, const char* src, win_usize n);
 // Append src onto the end of dest; returns dest.
 extern char* strcat(char* dest, const char* src);
 // Append at most `n` bytes of src onto dest; returns dest.
-extern char* strncat(char* dest, const char* src, i64 n);
+extern char* strncat(char* dest, const char* src, win_usize n);
 // Find the first occurrence of byte `c` in `s`; nullptr if absent.
 extern const char* strchr(const char* s, int c);
 // Find the last occurrence of byte `c` in `s`; nullptr if absent.
@@ -515,13 +513,13 @@ extern const char* strstr(const char* haystack, const char* needle);
 // Tokenize `str` by any byte in `delim`, returning the next token (stateful).
 extern char* strtok(char* str, const char* delim);
 // Copy `n` bytes from src to dest (regions must not overlap).
-extern void* memcpy(void* dest, const void* src, i64 n);
+extern void* memcpy(void* dest, const void* src, win_usize n);
 // Copy `n` bytes from src to dest, handling overlapping regions.
-extern void* memmove(void* dest, const void* src, i64 n);
+extern void* memmove(void* dest, const void* src, win_usize n);
 // Fill `n` bytes at `s` with byte value `c`.
-extern void* memset(void* s, int c, i64 n);
+extern void* memset(void* s, int c, win_usize n);
 // Compare `n` bytes of two buffers; 0 if equal.
-extern int memcmp(const void* a, const void* b, i64 n);
+extern int memcmp(const void* a, const void* b, win_usize n);
 
 // === Character Classification ===
 // Nonzero if `c` is an alphabetic character.

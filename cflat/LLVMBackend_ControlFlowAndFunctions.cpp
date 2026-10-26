@@ -643,7 +643,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         auto prepareCxxSret = [&](const TypeAndValue& retTV)
             -> std::pair<llvm::Type*, llvm::Value*> {
             if (retTV.Pointer || retTV.IsAlias
-                || !ReturnsViaCxxSret(retTV.TypeName))
+                || !ReturnsViaInPlaceSret(retTV.TypeName))
                 return { nullptr, nullptr };
             auto* structTy = GetType(retTV);
             if (structTy == nullptr || !structTy->isStructTy()) return { nullptr, nullptr };
@@ -1633,7 +1633,7 @@ LLVMBackend::AbiRecipe LLVMBackend::ComputeCxxReturnAbiRecipe(
 {
         AbiRecipe recipe;
         const bool cxxReturn = !retType.Pointer && !retType.IsAlias
-            && ReturnsViaCxxSret(retType.TypeName);
+            && ReturnsViaInPlaceSret(retType.TypeName);
         bool cxxParam = false;
         for (const auto& param : params)
             if (!param.Pointer && !param.IsAlias
@@ -2351,7 +2351,7 @@ void LLVMBackend::RepairOpaqueReturnIndirectCalls()
                 opaqueReturnIndirectCalls_.push_back(std::move(entry));
                 continue;
             }
-            if (!ReturnsViaCxxSret(entry.typeName)) continue;   // completed trivially: as emitted
+            if (!ReturnsViaInPlaceSret(entry.typeName)) continue; // completed trivially: as emitted
             // The function value's invoker takes the slot first (see CreateIndirectCall).
             std::vector<llvm::Type*> params = call->getFunctionType()->params();
             params.insert(params.begin(), cflat_llvm::PointerTo(structTy));
@@ -2865,7 +2865,7 @@ llvm::Type* LLVMBackend::BuildThinFnPtrType(const TypeAndValue& tv) const
             paramTypes.push_back(cflat_llvm::PointerTo(builder->getInt64Ty()));
         llvm::Type* returnType = GetFunctionReturnABIType(retTV);
         if (!retTV.Pointer && !retTV.IsAlias && !retTV.IsArrayView
-            && ReturnsViaCxxSret(retTV.TypeName))
+            && ReturnsViaInPlaceSret(retTV.TypeName))
         {
             auto* structTy = GetType(retTV);
             if (structTy != nullptr && structTy->isStructTy())
@@ -3211,8 +3211,7 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
         // Ensure the attribute is set even on pre-declared functions that skipped createFunctionProto.
         fn->addFnAttr(llvm::Attribute::NullPointerIsValid);
 
-        // A user C definition replaces the matching libc function for every call in this module.
-        // Keep LLVM's libcall simplifier from substituting the host library implementation.
+        // Cached core calls may predate a user CFlat definition that replaces a libc function.
         if (external && !CurrentSourceIsCoreLibrary())
         {
             llvm::Triple triple = module->getTargetTriple().str().empty()

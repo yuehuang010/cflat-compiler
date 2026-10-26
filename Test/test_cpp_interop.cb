@@ -232,6 +232,7 @@ import cpp "library/t414_fnmove.hpp";
 import cpp "library/cpp_t322_constretcv.hpp";
 import cpp "library/cpp_t337_constretcv_umbrella.hpp";
 import cpp "library/cpp_t217_mutable.hpp";
+import cpp "library/cpp_t450_round2.hpp";
 import "library/cpp_t103_nullctor_c.h";
 import cpp "library/cpp_t103_nullctor.hpp";
 import cpp "library/cpp_t110_varlink.hpp";
@@ -365,6 +366,7 @@ import cpp "library/cpp_interop_c2_repeat.h";
 import cpp "library/cpp_interop_c2_repeat.h";
 // A C++ CONSTRUCTOR parameter declared `T&` binds the argument's address.
 import cpp "library/cpp_interop_ctorref.h";
+import cpp "library/cpp_interop_tpl.h";
 import cpp "library/cpp_interop_varctor.h";
 import cpp "library/cpp_interop_freeoptpl.h";
 import cpp "library/cpp_interop_fixedarray.hpp";
@@ -2537,6 +2539,11 @@ cpi_t42.T339Box T339ReturnCastBox() {
     return (cpi_t42.T339Box)cpi_t42.t339_make_box();
 }
 
+cpi_t42.T454Box T454ReturnCastBox() {
+    cpi_t42.T454Box b = cpi_t42.t454_make_box();
+    return (cpi_t42.T454Box)b;
+}
+
 int t340ImmovableCalls = 0;
 int t340ThrowCalls = 0;
 int t340MixedCalls = 0;
@@ -2761,6 +2768,51 @@ extern int main()
     if (t335ConstMutableHolder.child.m != 11) return 33514;
     t335AnonymousUnion.m = 11;
     if (t335AnonymousUnion.m != 11) return 33515;
+
+    // T450: operator receivers inherit mutable-field constness, including nested subobjects.
+    if (t450ConstHolder.mut + 1 != 31)
+        return 45001;
+    if (t450ConstHolder.mut.inner + 1 != 31)
+        return 45002;
+    t450ConstHolder.mut += 1;
+    if (t450ConstHolder.mut.mark != 131) return 45003;
+    t450ConstHolder.normal += 1;
+    if (t450ConstHolder.normal.mark != 142) return 45004;
+    t450ConstHolder.fixed += 1;
+    if (t450ConstHolder.fixed.mark != 142) return 45005;
+    t450ConstHolder.mut.inner += 1;
+    if (t450ConstHolder.mut.inner.mark != 131) return 45006;
+    t450MutableHolder.fixed += 1;
+    if (t450MutableHolder.fixed.mark != 142) return 45007;
+    if (-t450ConstHolder.mut != 231) return 45008;
+    if (-t450ConstHolder.mut.inner != 231) return 45009;
+    if ((t450ConstHolder.mut == 1) != 531) return 45010;
+    if ((t450ConstHolder.mut.inner == 1) != 531) return 45011;
+
+    // Reversed equality must select the non-const operator on a mutable field (mark 1).
+    bool t450R2Eq = 1 == t450r2Holder.eq;
+    if (!t450R2Eq || t450r2Holder.eq.mark != 1) return 45012;
+    // The spaceship rewrite preserves mutable-field cv in both operand orders (mark 3).
+    bool t450R2Less = t450r2Holder.spaceship < 1;
+    if (!t450R2Less || t450r2Holder.spaceship.mark != 3) return 45013;
+    bool t450R2ReverseLess = 1 < t450r2Holder.spaceship;
+    if (t450R2ReverseLess || t450r2Holder.spaceship.mark != 3) return 45014;
+    // A free T& overload wins for the mutable field; the ordinary field stays const.
+    if (t450r2Holder.freeMut + 1 != 31) return 45015;
+    if (t450r2Holder.freeNorm + 1 != 42) return 45016;
+    // A mutable pointer field does not remove constness from its pointed-to object.
+    if (pp.mcp->pick() != 22) return 45017;
+    // These pointer slots are writable even though their pointed-to objects are const.
+    T450R2Pick* t450R2LocalPointer = t450r2Array;
+    t450R2LocalPointer += 1;
+    if (t450R2LocalPointer != &t450r2Array[1]) return 45018;
+    gpm += 1;
+    if (gpm != &t450r2PickArray[1]) return 45019;
+    pp.mcp += 1;
+    if (pp.mcp != &t450r2PickArray[1]) return 45020;
+    // ADL function-template free operators keep the first operand's mutable-field cv.
+    if (t450r2_tpl.templateHolder.m + 1 != 51) return 45021;
+    if (t450r2_tpl.templateHolder.n + 1 != 62) return 45022;
 
     // T136: the file-scope objects above are constructed at startup, before any other code runs.
     if (t135.t136CtorCount() != 9 || t136GlobalBrace.n != 0 || t136GlobalEq.n != 0
@@ -4077,6 +4129,17 @@ extern int main()
         cppnewagg.resetCounts();
         cppnewagg.CM* a252o = new cppnewagg.CM(a252n->c, 4);
         if (cppnewagg.made != 0 || cppnewagg.copies != 1 || a252o->c.v != 5 || a252o->k != 4) return 98956;
+        // T457: the move marker must reach implicit C++ move-ctor selection for aggregate lvalues.
+        cppnewagg.CM a457LocalSource = cppnewagg.CM(cppnewagg.Cnt(21), 22);
+        cppnewagg.resetCounts();
+        cppnewagg.CM a457LocalMoved = cppnewagg.CM(move a457LocalSource);
+        if (cppnewagg.made != 0 || cppnewagg.copies != 0 || cppnewagg.moves != 1
+            || a457LocalMoved.c.v != 21 || a457LocalMoved.k != 22) return 98965;
+        cppnewagg.CM a457HeapSource = cppnewagg.CM(cppnewagg.Cnt(31), 32);
+        cppnewagg.resetCounts();
+        cppnewagg.CM* a457HeapMoved = new cppnewagg.CM(move a457HeapSource);
+        if (cppnewagg.made != 0 || cppnewagg.copies != 0 || cppnewagg.moves != 1
+            || a457HeapMoved->c.v != 31 || a457HeapMoved->k != 32) return 98966;
     }
     // T257 accept-set: preserve nontrivial copy/move, alias, default-new, and array-new behavior.
     {
@@ -8809,6 +8872,22 @@ extern int main()
     if (ptrRankMember.pick(ptrRankP) != 317 || ptrRankOperator(ptrRankP) != 517)
                                                                             return 1971;
 
+    // T452: imported C++ overload ranking for pointer/function bool and converting constructors.
+    if (ptrbool.t452_c1("x") != 3) return 4520;
+    if (ptrbool.t452_f2(ptrbool.t452_identity) != 3) return 4521;
+    if (ptrbool.t452_only_bool(ptrbool.t452_identity) != 3) return 4522;
+    int t452Value = 7;
+    void* t452VoidPointer = (void*)&t452Value;
+    if (ptrbool.t452_w1(t452VoidPointer) != 1) return 4523;
+    if (ptrbool.t452_vw(t452VoidPointer) != 2) return 4524;
+    if (ptrbool.t452_nw(t452VoidPointer) != 1) return 4525;
+    double t452DoubleValue = 1.0;
+    double* t452DoublePointer = &t452DoubleValue;
+    if (ptrbool.t452_double(t452DoublePointer, 1) != 2) return 4526;
+    if (ptrbool.t452_string("x", 1) != 2) return 4527;
+    ptrbool.T452DoubleMember t452Member = default;
+    if (t452Member.pick(t452DoublePointer, 1) != 2) return 4528;
+
     // M103: a scalar reaching a C++ class through the ctor thunk (the class has a ctor template)
     // binds `const T&` / `T&&` to CALLER storage. Pre-fix each read a dead, clobbered thunk slot.
     cppcr.ThkUser thkU = cppcr.ThkUser(0);
@@ -10178,6 +10257,101 @@ extern int main()
             || cpi_t42.t339_copies != 0 || cpi_t42.t339_moves != 1) return 33907;
     }
     if (cpi_t42.t339_dead != 2)                                               return 33907;
+
+    // T454: same-type casts of C++ lvalues produce independent prvalue temporaries.
+    cpi_t42.t454_reset();
+    {
+        cpi_t42.T454Box b = cpi_t42.t454_make_box();
+        cpi_t42.t454_take((cpi_t42.T454Box)b);
+        if (b.id() != 7 || cpi_t42.t454_born != 2 || cpi_t42.t454_copies != 1
+            || cpi_t42.t454_moves != 0 || cpi_t42.t454_dead != 1
+            || cpi_t42.t454_chosen != 2) return 45401;
+    }
+    if (cpi_t42.t454_dead != 2)                                               return 45401;
+    cpi_t42.t454_reset();
+    {
+        cpi_t42.T454Box b = cpi_t42.t454_make_box();
+        ((cpi_t42.T454Box)b).mutate();
+        if (b.id() != 7 || cpi_t42.t454_born != 2 || cpi_t42.t454_copies != 1
+            || cpi_t42.t454_moves != 0 || cpi_t42.t454_dead != 1) return 45402;
+    }
+    if (cpi_t42.t454_dead != 2)                                               return 45402;
+    cpi_t42.t454_reset();
+    {
+        cpi_t42.T454Box b = cpi_t42.t454_make_box();
+        cpi_t42.t454_take_value((cpi_t42.T454Box)b);
+        if (b.id() != 7 || cpi_t42.t454_born != 2 || cpi_t42.t454_copies != 1
+            || cpi_t42.t454_moves != 0 || cpi_t42.t454_dead != 1
+            || cpi_t42.t454_chosen != 3) return 45403;
+    }
+    if (cpi_t42.t454_dead != 2)                                               return 45403;
+    cpi_t42.t454_reset();
+    {
+        cpi_t42.T454Box b = cpi_t42.t454_make_box();
+        cpi_t42.T454Box c = (cpi_t42.T454Box)b;
+        if (b.id() != 7 || c.id() != 7 || cpi_t42.t454_born != 2
+            || cpi_t42.t454_copies != 1 || cpi_t42.t454_moves != 0
+            || cpi_t42.t454_dead != 0) return 45404;
+    }
+    if (cpi_t42.t454_dead != 2)                                               return 45404;
+    cpi_t42.t454_reset();
+    {
+        cpi_t42.T454Box c = T454ReturnCastBox();
+        if (c.id() != 7 || cpi_t42.t454_born != 2 || cpi_t42.t454_copies != 1
+            || cpi_t42.t454_moves != 0 || cpi_t42.t454_dead != 1) return 45405;
+    }
+    if (cpi_t42.t454_dead != 2)                                               return 45405;
+    cpi_t42.t454_reset();
+    {
+        cpi_t42.T454Box b = cpi_t42.t454_make_box();
+        cpi_t42.T454Box other = cpi_t42.t454_make_box_2();
+        cpi_t42.t454_take(true ? (cpi_t42.T454Box)b : other);
+        if (b.id() != 7 || cpi_t42.t454_born != 3 || cpi_t42.t454_copies != 1
+            || cpi_t42.t454_moves != 0 || cpi_t42.t454_dead != 1
+            || cpi_t42.t454_chosen != 2) return 45406;
+    }
+    if (cpi_t42.t454_dead != 3)                                               return 45406;
+    cpi_t42.t454_reset();
+    {
+        cpi_t42.T454Box b = cpi_t42.t454_make_box();
+        cpi_t42.T454Box other = cpi_t42.t454_make_box_2();
+        cpi_t42.t454_take(true ? (cpi_t42.T454Box)b : (cpi_t42.T454Box)other);
+        if (b.id() != 7 || cpi_t42.t454_born != 3 || cpi_t42.t454_copies != 1
+            || cpi_t42.t454_moves != 0 || cpi_t42.t454_dead != 1
+            || cpi_t42.t454_chosen != 2) return 45407;
+    }
+    if (cpi_t42.t454_dead != 3)                                               return 45407;
+    cpi_t42.t454_reset();
+    {
+        cpi_t42.T454Box b = cpi_t42.t454_make_box();
+        cpi_t42.t454_take((cpi_t42.T454Box)(cpi_t42.T454Box)b);
+        if (b.id() != 7 || cpi_t42.t454_born != 2 || cpi_t42.t454_copies != 1
+            || cpi_t42.t454_moves != 0 || cpi_t42.t454_dead != 1
+            || cpi_t42.t454_chosen != 2) return 45408;
+    }
+    if (cpi_t42.t454_dead != 2)                                               return 45408;
+    cpi_t42.t454_reset();
+    {
+        cpi_t42.T454Box b = cpi_t42.t454_make_box();
+        cpi_t42.T454Box c = true ? (cpi_t42.T454Box)b : cpi_t42.t454_make_box();
+        if (b.id() != 7 || c.id() != 7 || cpi_t42.t454_born != 2
+            || cpi_t42.t454_copies != 1 || cpi_t42.t454_moves != 0
+            || cpi_t42.t454_dead != 0) return 45409;
+    }
+    if (cpi_t42.t454_dead != 2)                                               return 45409;
+    cpi_t42.t454_trivial_chosen = 0;
+    {
+        cpi_t42.T454TrivialBox b = cpi_t42.t454_make_trivial_box();
+        cpi_t42.t454_take_trivial((cpi_t42.T454TrivialBox)b);
+        if (b.id() != 7 || cpi_t42.t454_trivial_chosen != 2) return 45410;
+    }
+    cpi_t42.t454_trivial_chosen = 0;
+    {
+        cpi_t42.T454TrivialBox b = cpi_t42.t454_make_trivial_box();
+        ((cpi_t42.T454TrivialBox)b).mutate();
+        if (b.id() != 7) return 45411;
+    }
+
     cppsopd.T221OpUsingOnly t221OpOnly = default;
     if (t221OpOnly - 2 != 1002)                                                return 4401;
     cppsopd.T221NamedUsingOnly t221Named = default;

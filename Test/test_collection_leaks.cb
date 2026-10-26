@@ -29,6 +29,13 @@ import "spsc_queue.cb";
 import "diagnostic/heap_audit.cb";
 import "test_helper.cb";
 
+struct T451ConstFieldValue
+{
+    const int id = 0;
+    int extra = 0;
+    T451ConstFieldValue(int n) { id = n; }
+};
+
 // T352: moved owning fields must be destroyed by every discard path. The counters prove the
 // destructor ran; HeapAudit proves each buffer or allocation was released exactly once.
 int t352UniqueDtor = 0;
@@ -5117,6 +5124,21 @@ extern int main()
     // erases to force merges/rebalances, since a mishandled split is a fill-factor-specific
     // double free. btree<K, unique IFace> owns its fat-pointer values the same way.
     {
+        // Read-only use of a const-field value type must not instantiate assignment paths.
+        {
+            btree<int, T451ConstFieldValue> t = default;
+            total++; passed += Test("T451 btree const lookup absent", t.contains(1), false);
+            total++; passed += Test("T451 btree const lookup default", t.get(1).id, 0);
+        }
+
+        // Frozen T451 accept-set: assignable values still support insert and read-back.
+        {
+            btree<int, int> t = default;
+            bool inserted = t.insert(7, 42);
+            total++; passed += Test("T451 btree assignable insert accept", inserted, true);
+            total++; passed += Test("T451 btree assignable get accept", t.get(7), 42);
+        }
+
         // unique values: freed on remove / overwrite / clear / teardown, exactly once each.
         g_shapeDtor = 0;
         {

@@ -313,9 +313,9 @@ namespace os.windows
     // Close a C stdio file stream.
     extern win_int  fclose(void* stream);
     // Read 'count' items of 'size' bytes from a stream into buf.
-    extern win_size fread(char* buf, win_size size, win_size count, void* stream);
+    extern win_usize fread(char* buf, win_usize size, win_usize count, void* stream);
     // Write 'count' items of 'size' bytes from buf to a stream.
-    extern win_size fwrite(const char* buf, win_size size, win_size count, void* stream);
+    extern win_usize fwrite(const char* buf, win_usize size, win_usize count, void* stream);
     // Read a line (up to size-1 bytes) from a stream into buf.
     extern char*      fgets(char* buf, win_int size, void* stream);
     // Return nonzero once a stream has reached end-of-file.
@@ -500,7 +500,7 @@ namespace os.windows
     // UCRT primitive backing printf/fprintf-family formatting to a stream.
     extern win_int  __stdio_common_vfprintf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
     // UCRT primitive backing sprintf-family formatting into a buffer.
-    extern win_int  __stdio_common_vsprintf(u64 options, char* buf, win_size bufSize, const char* fmt, void* locale, va_list ap);
+    extern win_int  __stdio_common_vsprintf(u64 options, char* buf, win_usize bufSize, const char* fmt, void* locale, va_list ap);
     // UCRT primitive backing sscanf-family parsing from a buffer.
-    extern win_int  __stdio_common_vsscanf(u64 options, const char* buf, win_size bufSize, const char* fmt, void* locale, va_list ap);
+    extern win_int  __stdio_common_vsscanf(u64 options, const char* buf, win_usize bufSize, const char* fmt, void* locale, va_list ap);
 }

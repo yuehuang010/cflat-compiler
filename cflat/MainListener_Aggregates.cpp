@@ -186,7 +186,7 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                 structType, destination, (unsigned)fieldIndex, field.VariableName);
         // A native ctor that may capture `this` builds the child in its field slot too
         // (one ctor call or `= default`), never a temporary copied in.
-        const bool nativeFieldCtor = !compiler->ReturnsViaCxxSret(field.TypeName)
+        const bool nativeFieldCtor = !compiler->ReturnsViaInPlaceSret(field.TypeName)
             && field.Initializer != nullptr && FieldDefaultBraceList(field) == nullptr
             && !FieldHasEmptyCxxBraceInitializer(field)
             && compiler->IsNativeValueConstructor(field.TypeName,
@@ -195,7 +195,7 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
                 || FieldInitializerIsSingleCall(field.Initializer->assignmentExpression()));
         const bool armFieldSret = fieldDestination != nullptr && !field.Pointer
             && !field.IsAlias && !field.IsArrayView && field.ConstArraySize == 0
-            && (nativeFieldCtor || (compiler->ReturnsViaCxxSret(field.TypeName)
+            && (nativeFieldCtor || (compiler->ReturnsViaInPlaceSret(field.TypeName)
             && (FieldDefaultBraceList(field) != nullptr || field.Initializer == nullptr
                 || FieldHasEmptyCxxBraceInitializer(field)
                 || FieldInitializerIsSingleCall(field.Initializer->assignmentExpression()))));
@@ -376,7 +376,7 @@ llvm::Value* MainListener::EmitAggregateFieldInitialization(
             {
                 const bool armFieldSret = fieldDestination != nullptr && !field.Pointer
                     && !field.IsAlias && !field.IsArrayView
-                    && compiler->ReturnsViaCxxSret(field.TypeName);
+                    && compiler->ReturnsViaInPlaceSret(field.TypeName);
                 if (armFieldSret)
                 {
                     compiler->pendingCxxSretDest_ = fieldDestination;
@@ -474,7 +474,8 @@ bool MainListener::CanFreshBraceInitializeAggregate(
         [](auto* fi) { return fi != nullptr && fi->Identifier() != nullptr; });
     if (!hasNamedField) return false;
     auto* compiler = Compiler(list);
-    if (explicitNoArgConstructors_.count(typeName) != 0
+    if ((explicitNoArgConstructors_.count(typeName) != 0
+            && !compiler->IsImmovableCFlatStruct(typeName))
         || compiler->IsCxxRecord(typeName)
         || compiler->GetFunction(typeName) == nullptr)
         return false;
@@ -484,7 +485,11 @@ bool MainListener::CanFreshBraceInitializeAggregate(
     const bool hasEmptyFieldBrace = std::any_of(fieldInits.begin(), fieldInits.end(),
         [](auto* fi) { return fi != nullptr && fi->Identifier() != nullptr
             && fi->initializerList() == nullptr && fi->assignmentExpression().empty(); });
-    if (!force && !hasEmptyFieldBrace && !compiler->HasForeignNontrivialCxxField(typeName)) return false;
+    const bool immovableCtor = explicitNoArgConstructors_.count(typeName) != 0
+        && compiler->IsImmovableCFlatStruct(typeName);
+    if (!force && !hasEmptyFieldBrace && !immovableCtor
+        && !compiler->IsImmovableCFlatStruct(typeName)
+        && !compiler->HasForeignNontrivialCxxField(typeName)) return false;
     return true;
 }
 
@@ -500,6 +505,16 @@ bool MainListener::EmitFreshBraceInitializeAggregate(
     auto data = compiler->GetDataStructure(typeName);
     auto fields = data.StructFields;
     auto* structType = data.StructType;
+    if (explicitNoArgConstructors_.count(typeName) != 0
+        && compiler->IsImmovableCFlatStruct(typeName))
+    {
+        if (EmitStructDefaultInto(destination, typeName) != nullptr)
+            LogErrorContext(list, std::format(
+                "cannot construct immovable type '{}' directly in its destination",
+                SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName })));
+        EmitFieldInitializer(destination, typeName, list, false);
+        return true;
+    }
     // Keep already-built omitted fields live while the explicit field expressions run.
     LLVMBackend::UnwindPartialScope building(*compiler);
     EmitAggregateFieldInitialization(typeName, structType, fields, fields.size(), destination,
@@ -6064,7 +6079,7 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                     {
                         const bool armFieldSret = fieldPtr != nullptr && !field.Pointer
                             && !field.IsAlias && !field.IsArrayView && field.ConstArraySize == 0
-                            && (compiler->ReturnsViaCxxSret(field.TypeName)
+                            && (compiler->ReturnsViaInPlaceSret(field.TypeName)
                                 || compiler->IsNativeValueConstructor(field.TypeName,
                                     LLVMBackend::TypeAndValue{ .TypeName = field.TypeName }, {}))
                             && FieldInitializerIsSingleCall(assignExpr);

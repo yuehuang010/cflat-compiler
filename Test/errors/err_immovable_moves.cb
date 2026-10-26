@@ -1,10 +1,12 @@
-// [immovable] (T90): every operation that transfers a value of the type is refused at the operation.
+// [immovable] (T90): transfers from existing places are refused at the operation.
 // Each leg is a scoped expect_error block whose substring names the operation. Construction in place,
 // pointers, aliases and `new` stay legal (positive legs in Test/test_move.cb). Matches the
 // accept-set and the operation table in scratch/briefs/t90_report.md.
 
 [immovable] struct Node { int x = 0; };
 struct Outer { Node n; int y = 0; };
+struct NodeContainer { Node value; };
+Node globalNode = default;
 
 void takeValue(Node n) { }
 void takeMove(move Node n) { }
@@ -17,12 +19,12 @@ expect_error("cannot return a value of [immovable] type 'Node' by value") {
     Node retLocal() { Node n = default; return n; }
 }
 
-expect_error("cannot return a value of [immovable] type 'Node' by value") {
-    Node retFresh() { return default; }
+expect_error("cannot pass a value of type 'Node' to a by-value or 'move' parameter") {
+    void passValue() { Node a = default; takeValue(a); }
 }
 
 expect_error("cannot pass a value of type 'Node' to a by-value or 'move' parameter") {
-    void passValue() { Node a = default; takeValue(a); }
+    void passDefault() { takeValue(default); }
 }
 
 expect_error("cannot 'move' a value of type 'Node': the type is [immovable]") {
@@ -60,4 +62,54 @@ expect_error("the type is [immovable]") {
 
 expect_error("the type is [immovable]") {
     void holeTernary() { Node a = default; Node d = default; bool t = true; Node e = t ? a : d; }
+}
+
+expect_error("cannot return a value of [immovable] type 'Node' by value") {
+    Node retParam(Node value) { return value; }
+}
+
+expect_error("cannot return a value of [immovable] type 'Node' by value") {
+    Node retDeref(Node* value) { return *value; }
+}
+
+expect_error("cannot return a value of [immovable] type 'Node' by value") {
+    Node retGlobal() { return globalNode; }
+}
+
+expect_error("cannot return a value of [immovable] type 'Node' by value") {
+    Node retField(NodeContainer value) { return value.value; }
+}
+
+expect_error("extern function 't442ExternProto' cannot return [immovable] CFlat struct 'Node' by value through the C ABI") {
+    extern Node t442ExternProto();
+}
+
+expect_error("extern function 't442ExternDefinition' cannot return [immovable] CFlat struct 'Node' by value through the C ABI") {
+    extern Node t442ExternDefinition() { return default; }
+}
+
+expect_error("the type is [immovable]") {
+    void t442DefaultArgTypeSpelling() { takeValue(default); }
+}
+
+Node t442MixedMake(int value) { return { x = value }; }
+expect_error("the type is [immovable]") {
+    void t442MixedTernaryDecl(bool choose) {
+        Node place = default;
+        Node result = choose ? t442MixedMake(1) : place;
+    }
+}
+
+expect_error("cannot return a value of [immovable] type 'Node' by value") {
+    Node t442MixedReturn(bool choose) {
+        Node place = default;
+        return choose ? t442MixedMake(1) : place;
+    }
+}
+
+expect_error("cannot initialize field 'n' from a value of type 'Node': the type is [immovable]") {
+    void t442MixedFieldTernary(bool choose) {
+        Node place = default;
+        Outer o = { n = choose ? t442MixedMake(1) : place, y = 3 };
+    }
 }

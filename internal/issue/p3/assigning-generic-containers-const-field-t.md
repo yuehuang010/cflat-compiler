@@ -1,9 +1,12 @@
-# hpc/btree.cb and com.cb HResult<T> reject a T with a const field
+# hpc/btree.cb rejects a KEY type K with a const field
 
-Summary: after const phase 2 (R5a) the core containers relocate by construct_at and guard assigning methods with
-`if const (is_assignable(T))`. Two generics were left: hpc/btree.cb shifts and stores into live default-initialized
-fixed-array slots (genuine assignment), and com.cb `HResult<T>.succeed` assigns a field. Instantiating either with a
-struct that has a const field fails with #13 "cannot assign a whole '{}': field '{}' is const". No test covers them.
+Summary: T451 (2026-10-23) fixed the value side - com.cb `HResult<T>.succeed` constructs in place, and btree's V-assigning
+methods are guarded by `if const (is_assignable(V))` + compile_error, so `btree<K, ConstFieldV>` instantiates and lookups work.
+Still open: `btree<CK, int>` where CK has a const field (with operator< and copy()) fails to compile even for `contains`:
+"cannot assign a whole 'CK': field 'id' is const" at cflat/core/hpc/btree.cb `_storeKey` (`n->keys[i] = key.copy()`).
+Key-slot writers without an is_assignable(K) guard: `_storeKey`, `_clearKey`, `_insertChildAt`, `_splitChild`, `_leafOpenSlot`,
+remove, merge/borrow.
+Repro: scratch/repro_keep/box1022/t451/rev_t451_opus_constkey.cb.
 
-Fix direction: btree - placement-construct into slots that are destroyed or uninitialized (design change to its node
-layout), or guard insert with is_assignable and a compile_error; HResult - construct the field in place.
+Fix direction: guard the key-slot writers with `if const (is_assignable(K))` + compile_error like the V side (lookups must
+still compile), or placement-construct keys into destroyed/uninitialized slots (node layout change).

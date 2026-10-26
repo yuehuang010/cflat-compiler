@@ -2396,7 +2396,7 @@ class Window : INativeHost
         void* f = this.fontFor(fontId);
         if (f != nullptr) oldF = SelectObject(dc, f);
         SIZE px = default;
-        GetTextExtentPoint32A(dc, (char*)s, strlen((char*)s), &px);
+        GetTextExtentPoint32A(dc, (char*)s, (int)strlen((char*)s), &px);
         if (oldF != nullptr) SelectObject(dc, oldF);
         ReleaseDC(this.hwnd, dc);
         sz.w = ((int)px.cx + this.dipX() - 1) / this.dipX();

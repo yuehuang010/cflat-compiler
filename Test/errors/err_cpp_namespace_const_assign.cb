@@ -3,6 +3,7 @@
 import cpp "cpp_interop_basic.h";
 import cpp "cpp_interop_basic.cpp";
 import cpp "cpp_t217_mutable.hpp";
+import cpp "cpp_t450_round2.hpp";
 
 extern int main()
 {
@@ -132,5 +133,9 @@ extern int main()
     }
     expect_error("cannot assign to 't335ConstInheritedOuter.m.k': it is a const C++ object") {
         t335ConstInheritedOuter.m.k = 11;
+    }
+    // A const pointer slot stays read-only even when its pointee has a const operator+=.
+    expect_error("cannot assign to 'gpc': it is a const C++ object") {
+        gpc += 1;
     }
 }

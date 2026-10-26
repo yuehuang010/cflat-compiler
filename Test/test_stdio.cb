@@ -11,7 +11,7 @@
 // and callable: puts, putchar, putn, fputs, fprintf, sscanf.
 import "test_helper.cb";
 
-extern i32 strlen(const char* s);
+extern win_usize strlen(const char* s);
 
 extern int main()
 {

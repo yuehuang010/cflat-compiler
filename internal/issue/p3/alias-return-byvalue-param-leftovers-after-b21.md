@@ -39,7 +39,3 @@ RULED 2026-10-01 (maintainer): item 5 RATIFIED - an extern "C" callee owns its b
 - (item 3, btree `*p = namedAlias`) ON HOLD: no btree work until the maintainer reopens it. Leave the named-local form
   accepted as today.
 
-## T267 (landed 2026-10-15): spelled `alias string` refused in every position
-Still accepted, NEEDS RULING: `alias string[]`, `alias string?`, and `using S = string; alias S x;` (refusal keys on the
-spelled `string` keyword so a generic `alias T` with T=string stays legal; the alias-string diagnostics are now covered by
-generic-form legs).

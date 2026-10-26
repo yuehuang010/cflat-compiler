@@ -67,10 +67,16 @@ struct HResult<T>
     // True when the carried HRESULT indicates failure.
     bool failed() { return this.hr < 0; }
 
-    // Fill this result in place. `succeed(v)` sets S_OK + value; `fail(hr)` sets a failure.
+    // Fill this result in place; construct_at supports value types with const fields.
+    // `succeed(v)` sets S_OK + value; `fail(hr)` sets a failure.
     // Methods (not free functions) so T is the enclosing type's parameter - this sidesteps a
     // monomorphizer gap when a generic function's T appears only in its return type.
-    void succeed(T v) { this.hr = 0; this.value = v; }
+    void succeed(T v)
+    {
+        this.hr = 0;
+        _ = move this.value;
+        construct_at(&this.value, move v);
+    }
     void fail(i32 e)  { this.hr = e; }
 };
 

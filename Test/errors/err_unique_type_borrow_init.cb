@@ -17,6 +17,112 @@ void resetFromBorrow(Resource* borrowed)
     }
 }
 
+Resource* borrowedGlobal = nullptr;
+Resource* pickBorrowedGlobal() { return borrowedGlobal; }
+
+expect_error("use of moved variable 'raw'") {
+    int ternaryAssignMoveThenRead()
+    {
+        Resource* raw = new Resource();
+        unique Resource* owner = nullptr;
+        owner = true ? raw : nullptr;
+        return raw->id;
+    }
+}
+
+expect_error("cannot initialize unique<Resource> 'owner' from borrowed value 'pickBorrowedGlobal'") {
+    void assignBorrowedGlobalReturn()
+    {
+        borrowedGlobal = new Resource();
+        unique Resource* owner = nullptr;
+        owner = pickBorrowedGlobal();
+    }
+}
+
+// Callee defined AFTER its caller: the refusal must not depend on definition order.
+Resource* forwardBorrowedGlobal = nullptr;
+expect_error("cannot initialize unique<Resource> 'owner' from borrowed value 'pickForwardGlobal'") {
+    void assignForwardBorrowedGlobalReturn()
+    {
+        unique Resource* owner = nullptr;
+        owner = pickForwardGlobal();
+    }
+}
+Resource* pickForwardGlobal() { return forwardBorrowedGlobal; }
+
+expect_error("cannot store a heap array in unique local 'owner': unique<T> does not own arrays") {
+    void assignRawHeapArrayThroughLocal()
+    {
+        Resource* raw = nullptr;
+        raw = true ? new Resource[3] : nullptr;
+        unique Resource* owner = nullptr;
+        owner = raw;
+    }
+}
+
+// Free generic callee: the refusal must hold per instantiation (second instance adopts the global).
+Resource* genericBorrowedGlobal = nullptr;
+Resource* pickGenericTwo<T>(T k) { return genericBorrowedGlobal; }
+expect_error("cannot initialize unique<Resource> 'owner' from borrowed value 'pickGenericTwo'") {
+    void assignGenericTwoBorrowedGlobalReturn()
+    {
+        Resource* seeded = pickGenericTwo<int>(1);
+        unique Resource* owner = nullptr;
+        owner = pickGenericTwo<bool>(true);
+    }
+}
+
+T* pickGenericOnce<T>() { return genericBorrowedGlobal; }
+expect_error("cannot initialize unique<Resource> 'owner' from borrowed value 'pickGenericOnce'") {
+    void assignGenericOnceBorrowedGlobalReturn()
+    {
+        unique Resource* owner = nullptr;
+        owner = pickGenericOnce<Resource>();
+    }
+}
+
+// Namespace-qualified module global: 'Ns.q' names a global, not a local.
+namespace BorrowNs { Resource* qualifiedBorrowedGlobal = nullptr; }
+Resource* pickQualifiedGlobal() { return BorrowNs.qualifiedBorrowedGlobal; }
+expect_error("cannot initialize unique<Resource> 'owner' from borrowed value 'pickQualifiedGlobal'") {
+    void assignQualifiedBorrowedGlobalReturn()
+    {
+        unique Resource* owner = nullptr;
+        owner = pickQualifiedGlobal();
+    }
+}
+
+// An expired block-local of the same name does not mask the module global at the return.
+Resource* blockShadowGlobal = nullptr;
+Resource* pickBlockShadow()
+{
+    { int blockShadowGlobal = 3; }
+    return blockShadowGlobal;
+}
+expect_error("cannot initialize unique<Resource> 'owner' from borrowed value 'pickBlockShadow'") {
+    void assignBlockShadowBorrowedGlobalReturn()
+    {
+        unique Resource* owner = nullptr;
+        owner = pickBlockShadow();
+    }
+}
+
+// A same-named local in ANOTHER method does not mask the module global in this one.
+Resource* methodBorrowedGlobal = nullptr;
+struct BorrowBox
+{
+    void other() { int methodBorrowedGlobal = 3; }
+    Resource* pickMember() { return methodBorrowedGlobal; }
+};
+expect_error("cannot initialize unique<Resource> 'owner' from borrowed value 'pickMember'") {
+    void assignMethodBorrowedGlobalReturn()
+    {
+        BorrowBox box = default;
+        unique Resource* owner = nullptr;
+        owner = box.pickMember();
+    }
+}
+
 extern int main()
 {
     Resource* resource = new Resource();

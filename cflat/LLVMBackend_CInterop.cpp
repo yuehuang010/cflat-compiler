@@ -29782,7 +29782,7 @@ bool LLVMBackend::EmitCxxStructorCall(const std::string& typeName,
                                indirectArgAddrs.empty() ? nullptr : &indirectArgAddrs,
                                nullptr, nullptr, mayUnwind);
         else
-            CreateFunctionCall(fn, args, mayUnwind);
+            CreateFunctionCall(fn, args, mayUnwind, sym.HasCFlatDefinition());
         if (callArgVars != nullptr && !callArgVars->empty())
         {
             NamedVariable self;
@@ -31161,11 +31161,11 @@ LLVMBackend::CxxArgConversion LLVMBackend::ClassifyCxxImplicitArgument(
                     && !param.ElemPointer && !cxxByValueParam
                 ? CxxArgConversion::NonConstLvalueRef : CxxArgConversion::Convertible;
         }
-        // A class pointer needs an explicit opt-in and a class value/reference target; pointer
-        // parameters keep their normal pointer-conversion path.
+        // A class pointer needs an explicit opt-in; raw void* remains an ordinary data pointer.
         const bool classPointerArg = arg.TypeAndValue.Pointer
             && !IsCxxNullTypedArgument(arg)
-            && ((arg.TypeAndValue.TypeName.empty() && !IsProvenPrimitiveSinglePointerArg(arg))
+            && ((arg.TypeAndValue.TypeName.empty() && arg.InferSourceTypeName != "void"
+                 && !IsProvenPrimitiveSinglePointerArg(arg))
                 || IsCxxRecord(arg.TypeAndValue.TypeName)
                 || dataStructures.count(arg.TypeAndValue.TypeName) != 0
                 || arg.TypeAndValue.IsFunctionPointer || arg.TypeAndValue.IsArrayView);

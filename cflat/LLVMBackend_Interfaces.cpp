@@ -192,12 +192,16 @@ bool LLVMBackend::IsPrimitiveTypeName(const std::string& name)
     }
 
 void LLVMBackend::RegisterTypeAlias(const std::string& alias, const std::string& target,
-                                    uint8_t constMask)
+                                    uint8_t constMask, bool genericDerived)
 {
         if (!aliasScopeStack_.empty())
         {
             aliasScopeStack_.back().typeAliases[alias] = target;
             aliasScopeStack_.back().typeAliasConstMasks[alias] = constMask;
+            if (genericDerived)
+                aliasScopeStack_.back().genericDerivedTypeAliases.insert(alias);
+            else
+                aliasScopeStack_.back().genericDerivedTypeAliases.erase(alias);
             return;
         }
         RegisterScopedName(typeAliases, alias, target);
@@ -244,6 +248,30 @@ std::string LLVMBackend::ResolveTypeAlias(const std::string& name) const
                         return it->second;
             }
         return name;
+    }
+
+bool LLVMBackend::IsGenericDerivedTypeAlias(const std::string& name) const
+{
+        for (const auto& frame : std::ranges::reverse_view(aliasScopeStack_))
+            if (frame.typeAliases.count(name) != 0)
+                return frame.genericDerivedTypeAliases.count(name) != 0;
+
+        if (!aggregateAliasScopes_.empty())
+            if (size_t dot = name.rfind('.'); dot != std::string::npos && dot > 0 && dot + 1 < name.size()
+                && aggregateAliasMemberNames_.count(name.substr(dot + 1)) != 0)
+            {
+                const std::string member = name.substr(dot + 1);
+                std::string owner = name.substr(0, dot);
+                auto frame = aggregateAliasScopes_.find(owner);
+                if (frame == aggregateAliasScopes_.end())
+                {
+                    owner = ResolveQualifiedName(ResolveTypeAlias(owner));
+                    frame = aggregateAliasScopes_.find(owner);
+                }
+                if (frame != aggregateAliasScopes_.end() && frame->second.typeAliases.count(member) != 0)
+                    return frame->second.genericDerivedTypeAliases.count(member) != 0;
+            }
+        return false;
     }
 
 uint8_t LLVMBackend::ResolveTypeAliasConstMask(const std::string& name) const
@@ -1111,7 +1139,7 @@ llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& 
         std::vector<TypeAndValue> params;
         UnpackFuncPtrSignature(fpTV, ret, params);
         const bool cxxSretReturn = !ret.Pointer && !ret.IsAlias
-            && !ret.IsArrayView && ReturnsViaCxxSret(ret.TypeName);
+            && !ret.IsArrayView && ReturnsViaInPlaceSret(ret.TypeName);
         const AbiRecipe& recipe = symbol.Recipe;
         auto* naturalTy = cxxSretReturn
             ? BuildExternFunctionType(ret, params, false, recipe)
@@ -1257,7 +1285,7 @@ llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
         llvm::Value* sret = nullptr;
         const bool cxxSretReturn = plan.recipe.retSlot.kind == AbiSlot::SRetReturn
             && !plan.ret.Pointer && !plan.ret.IsAlias
-            && ReturnsViaCxxSret(plan.ret.TypeName);
+            && ReturnsViaInPlaceSret(plan.ret.TypeName);
         if (plan.recipe.retSlot.kind == AbiSlot::SRetReturn)
         {
             const unsigned sretIndex = SRetArgIndex(plan.recipe);
@@ -1432,7 +1460,7 @@ llvm::Value* LLVMBackend::WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, cons
         retTV.IsAlias  = fpTV.FuncPtrReturnAlias;
         llvm::Type* returnType = GetType(retTV);
         if (!retTV.Pointer && !retTV.IsAlias
-            && ReturnsViaCxxSret(retTV.TypeName))
+            && ReturnsViaInPlaceSret(retTV.TypeName))
         {
             auto* structTy = GetType(retTV);
             if (structTy != nullptr && structTy->isStructTy())

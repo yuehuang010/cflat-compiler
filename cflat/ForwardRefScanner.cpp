@@ -315,6 +315,10 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     auto* declSpecWithSuffix = LastDeclarationTypeSpecifier(
                         declSpecs->declarationSpecifier());
                     if (declSpecWithSuffix == nullptr) declSpecWithSuffix = declSpec;
+                    const bool typeNameIsGenericDerivedAlias =
+                        compiler->IsGenericDerivedTypeAlias(typeSpec->getText())
+                        || compiler->IsGenericDerivedTypeAlias(
+                            compiler->ResolveQualifiedName(typeSpec->getText()));
                     // Soft keywords are parsed as Identifiers in typeSpecifier context.
                     // in typeSpecifier context
                     if (typeSpec->getText() == "move")
@@ -379,10 +383,21 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                             const std::string returnQualifierText = returnQualifier != nullptr
                                 ? returnQualifier->getText() : "";
                             const bool aliasReturn = returnQualifierText == "alias";
+                            const std::string returnTypeSpelling = CanonicalTypeSpecifierText(
+                                fpSpec->typeSpecifier(), fpSpec->multiWordTypeSuffix(), false);
+                            const bool returnTypeWasSubstituted =
+                                scanTypeSubstitutions_.find(returnTypeSpelling) != scanTypeSubstitutions_.end();
+                            const bool returnTypeIsGenericDerivedAlias =
+                                compiler->IsGenericDerivedTypeAlias(returnTypeSpelling);
                             int retConst = 0;
                             declType.FuncPtrReturnTypeName = ResolveSigComponentConstScanner(
                                 fpSpec->typeSpecifier(), retPtr, retStars, retConst,
                                 fpSpec->multiWordTypeSuffix(), aliasReturn);
+                            if (aliasReturn && !returnTypeWasSubstituted && !returnTypeIsGenericDerivedAlias
+                                && retStars == 0
+                                && compiler->ResolveTypeAlias(declType.FuncPtrReturnTypeName) == "string")
+                                compiler->LogError(
+                                    "'alias' applies to pointer types only; 'string' is a primitive");
                             declType.FuncPtrReturnConstMask = retConst;
                             declType.FuncPtrReturnOwned = returnQualifierText == "move";
                             declType.FuncPtrReturnAlias = aliasReturn;
@@ -763,6 +778,11 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         declType.Pointer = true;
                     }
                 }
+                // Mirror the main pass: aliases of scalar string, views, and nullable string are
+                // refused after using aliases have resolved; real pointer aliases remain legal.
+                if (declType.IsAlias && !typeNameIsGenericDerivedAlias
+                    && declType.TypeName == "string" && declType.PointerDepth == 0)
+                    compiler->LogError("'alias' applies to pointer types only; 'string' is a primitive");
                 break;
             }
             else if (storageSpec)
@@ -944,6 +964,9 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
                                     && a.Pointer == b.Pointer; }))
                             sym.ReturnsAliasOfByValueParam = true;
         }
+        if (!returnType.external && returnType.Pointer && ReturnsOnlyModuleGlobals(func, allParams))
+            if (auto it = compiler->functionTable.find(name); it != compiler->functionTable.end())
+                MarkReturnsGlobalBorrow(it->second, allParams);
 
         // Populate RequiredLocks from the function's lock clause and any extra locks
         // inherited from a positional lock group (extraRequiredLocks).
@@ -2550,6 +2573,15 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
                 "alias '{}' is already defined in this scope", { alias }));
 
         auto* typeSpec = ctx->typeSpecifier();
+        bool genericDerived = false;
+        if (typeSpec != nullptr && typeSpec->functionPointerSpecifier() == nullptr)
+        {
+            const std::string targetSpelling = CanonicalTypeSpecifierText(
+                typeSpec, ctx->multiWordTypeSuffix(), false);
+            genericDerived = scanTypeSubstitutions_.find(targetSpelling) != scanTypeSubstitutions_.end()
+                || compiler->IsGenericDerivedTypeAlias(targetSpelling)
+                || compiler->IsGenericDerivedTypeAlias(compiler->ResolveQualifiedName(targetSpelling));
+        }
 
         // Function-type alias (using Cb = function<R(Args)>): store the resolved signature so the
         // alias name expands to a closure type wherever it is used (pre-registered here so a
@@ -2644,7 +2676,7 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
                 std::string cxxError;
                 compiler->TryRequestCxxType(resolvedBaseName, args, mangledName, cxxError);
             }
-            compiler->RegisterTypeAlias(alias, mangledName + suffix, targetConstMask);
+            compiler->RegisterTypeAlias(alias, mangledName + suffix, targetConstMask, genericDerived);
             return;
         }
 
@@ -2678,13 +2710,13 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
             targetDecorated = enumKey + std::string(targetPointerDepth, '*');
             for (uint64_t dim : targetArrayDims)
                 targetDecorated += "[" + std::to_string(dim) + "]";
-            compiler->RegisterTypeAlias(alias, targetDecorated + suffix, targetConstMask);
+            compiler->RegisterTypeAlias(alias, targetDecorated + suffix, targetConstMask, genericDerived);
             return;
         }
 
         if (compiler->IsInterfaceType(targetBase) || compiler->dataStructures.count(targetBase) > 0
             || LLVMBackend::IsPrimitiveTypeName(targetBase) || compiler->IsWinrtFullName(targetBase))
-            compiler->RegisterTypeAlias(alias, targetDecorated + suffix, targetConstMask);
+            compiler->RegisterTypeAlias(alias, targetDecorated + suffix, targetConstMask, genericDerived);
         else if (provisionalAliasNs_.has_value())
         {
             // A template member alias naming a record declared later in the file: the name scan
@@ -2694,7 +2726,7 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
                 : compiler->gts.scannedTypeNames.count(targetBase) != 0 ? targetBase : std::string{};
             if (!known.empty())
                 compiler->RegisterTypeAlias(alias, known + targetDecorated.substr(targetBase.size()) + suffix,
-                                            targetConstMask);
+                                            targetConstMask, genericDerived);
         }
     }
 
