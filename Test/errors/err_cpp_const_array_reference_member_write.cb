@@ -2,6 +2,10 @@ import cpp "cpp_interop_t104_refparam.hpp";
 
 extern int main()
 {
+    expect_error("ConstArrayRef") {
+        t104.ConstArrayRef missing = {};
+    }
+
     t104.ConstArrayRef value = t104.constArrayRef();
     expect_error("const") { value.r[0] = 9; }
     expect_error("const") { value.r[0] += 2; }

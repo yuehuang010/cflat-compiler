@@ -1708,6 +1708,10 @@ llvm::Value* LLVMBackend::EmitAbiLoweredCall(const FunctionSymbol& candidate, st
             "", candidate.HasCFlatDefinition());
         ci->setCallingConv(candidate.Function->getCallingConv());
         ApplyAbiCallAttributes(ci, recipe);
+        if (candidate.Function->hasRetAttribute(llvm::Attribute::SExt))
+            ci->addRetAttr(llvm::Attribute::SExt);
+        if (candidate.Function->hasRetAttribute(llvm::Attribute::ZExt))
+            ci->addRetAttr(llvm::Attribute::ZExt);
 
         if (recipe.retSlot.kind == AbiSlot::SRetReturn)
         {
@@ -1838,6 +1842,10 @@ llvm::Value* LLVMBackend::CreateFunctionCall(llvm::Function* func, const std::ve
         auto* ci = CreateCallOrInvoke(func->getFunctionType(), func, callArgs, mayUnwind, "",
                                       calleeHasCFlatDefinition);
         ci->setCallingConv(func->getCallingConv());
+        if (func->hasRetAttribute(llvm::Attribute::SExt))
+            ci->addRetAttr(llvm::Attribute::SExt);
+        if (func->hasRetAttribute(llvm::Attribute::ZExt))
+            ci->addRetAttr(llvm::Attribute::ZExt);
         return ci;
     }
 

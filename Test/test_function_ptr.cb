@@ -6818,6 +6818,7 @@ struct T411Box
 };
 void t411Replace(alias Lambda<int(int)> slot, Lambda<int(int)> value) { slot = value; }
 int t411Invoke(alias Lambda<int()> slot) { return slot(); }
+short fpabiR2Ga(alias Lambda<int()> cb) { return (short)(cb() * 3); }
 
 bool testT411AliasClosureReturn()
 {
@@ -6864,6 +6865,16 @@ bool testT411AliasClosureReturn()
     xs.set(0, (int x) => { return x + 100; });
     result &= Test("t411 list alias get copy survives replacement", copied(1), 5);
     result &= Test("t411 list alias get direct call", xs.get(0)(7), 107);
+    return result;
+}
+
+bool testFpabiR2AliasClosureNarrowReturn()
+{
+    bool result = true;
+    int k = 7;
+    Lambda<int()> cbk = () => { return k; };
+    function q = fpabiR2Ga;
+    result &= Test("fpabi r2 alias closure short return", (int)q(cbk), 21);
     return result;
 }
 
@@ -7748,6 +7759,7 @@ extern int main(int argc, char** argv)
     total++; passed += testT283AliasDeclCopy() ? 1 : 0;
     // T411: alias closure params are true references; alias closure returns are caller-slot borrows.
     total++; passed += testT411AliasClosureReturn() ? 1 : 0;
+    total++; passed += testFpabiR2AliasClosureNarrowReturn() ? 1 : 0;
     total++; passed += testT411IndirectAliasClosure() ? 1 : 0;
     total++; passed += testT411AliasIdentityControls() ? 1 : 0;
     total++; passed += testT411GenericAliasKeys() ? 1 : 0;

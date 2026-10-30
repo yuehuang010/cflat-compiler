@@ -44,6 +44,33 @@ struct PtrRef {
     int get() const { return *p; }
 };
 
+// Aggregate-only reference members for designated and positional brace initialization.
+struct BraceConstRef { const int& r; };
+struct BraceRvalRef { int&& r; };
+inline int refmemLifetimeCtors = 0;
+inline int refmemLifetimeCopies = 0;
+inline int refmemLifetimeMoves = 0;
+inline int refmemLifetimeDtors = 0;
+struct RefMemLifetimeValue {
+    int v;
+    explicit RefMemLifetimeValue(int value) : v(value) { ++refmemLifetimeCtors; }
+    RefMemLifetimeValue(const RefMemLifetimeValue& other) : v(other.v) { ++refmemLifetimeCopies; }
+    RefMemLifetimeValue(RefMemLifetimeValue&& other) : v(other.v) { ++refmemLifetimeMoves; }
+    ~RefMemLifetimeValue() { ++refmemLifetimeDtors; }
+};
+struct RefMemLifetimeConstRef { const RefMemLifetimeValue& c; };
+struct RefMemLifetimeRvalueRef { RefMemLifetimeValue&& c; };
+inline void reset_refmem_lifetime_counts() {
+    refmemLifetimeCtors = refmemLifetimeCopies = refmemLifetimeMoves = refmemLifetimeDtors = 0;
+}
+inline int refmem_lifetime_ctor_count() { return refmemLifetimeCtors; }
+inline int refmem_lifetime_copy_count() { return refmemLifetimeCopies; }
+inline int refmem_lifetime_move_count() { return refmemLifetimeMoves; }
+inline int refmem_lifetime_dtor_count() { return refmemLifetimeDtors; }
+struct BraceRefInner { int& r; int v; double d; };
+struct BraceRefOuter { BraceRefInner m; int k; };
+struct BraceRefDeep { BraceRefOuter o; };
+
 // A reference member in a BASE class: this pair goes down the flattened field walk instead.
 struct RefBase {
     int& r;

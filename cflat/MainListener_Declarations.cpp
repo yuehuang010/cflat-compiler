@@ -5470,7 +5470,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             return;  // auto functions do not participate in default-param overload generation in v1
         }
 
-        GenerateDefaultParamOverloads(name, returnType, params, varargs, line);
+        GenerateDefaultParamOverloads(name, returnType, params, varargs, line, !structName.empty());
     }
 
 std::vector<LLVMBackend::AnnotationValue> MainListener::ParseAnnotationList(CFlatParser::AnnotationListContext* annList) {
@@ -6223,10 +6223,35 @@ bool MainListener::TryDeclareForeignCxxLocal(CFlatParser::InitDeclaratorContext*
         const auto declarationBraceFields = hasNonemptyDeclarationBrace
             ? declarationBraceList->fieldInit()
             : std::vector<CFlatParser::FieldInitContext*>{};
-        if (hasNonemptyDeclarationBrace
-            && std::any_of(declarationBraceFields.begin(), declarationBraceFields.end(), [](auto* field) {
-                   return field->Identifier() != nullptr || field->Colon() != nullptr;
-               }))
+        const bool hasCxxFieldDesignators = hasNonemptyDeclarationBrace
+            && std::any_of(declarationBraceFields.begin(), declarationBraceFields.end(),
+                [](auto* field) { return field->Identifier() != nullptr; });
+        const bool hasKeyedInitializers = hasNonemptyDeclarationBrace
+            && std::any_of(declarationBraceFields.begin(), declarationBraceFields.end(),
+                [](auto* field) { return field->Colon() != nullptr; });
+        auto cxxAggregateHasReferenceMember = [&](auto&& self, const std::string& ownerTypeName) -> bool {
+            if (!compiler->IsForeignCxxAggregateClass(ownerTypeName)) return false;
+            const auto record = compiler->GetDataStructure(ownerTypeName);
+            for (const auto& field : record.StructFields)
+            {
+                std::string spelling;
+                bool isReference = false;
+                if (compiler->CxxRecordFieldTypeSpelling(
+                        ownerTypeName, field.VariableName, spelling, &isReference)
+                    && isReference)
+                    return true;
+                const std::string fieldTypeName = compiler->ResolveTypeAlias(field.TypeName);
+                if (!field.Pointer && !field.ElemPointer
+                    && compiler->IsForeignCxxAggregateClass(fieldTypeName)
+                    && self(self, fieldTypeName))
+                    return true;
+            }
+            return false;
+        };
+        const bool hasCxxReferenceMember = hasCxxFieldDesignators
+            && cxxAggregateHasReferenceMember(cxxAggregateHasReferenceMember, typeName);
+        if (hasKeyedInitializers || (hasCxxFieldDesignators
+            && !hasCxxReferenceMember))
             return false;
         // Depending on the initializer alternative selected by ANTLR, `default` may be exposed
         // as the rule token or as a single assignment-expression child.
@@ -6377,27 +6402,81 @@ cxx_dtor_ready:
         {
             BranchPostfixScope braceElementPostfix(this);
             std::vector<LLVMBackend::NamedVariable> braceElements;
+            std::vector<std::string> braceElementTargetTypes;
             std::string braceExpression = "{";
             bool valid = true;
             auto appendFields = [&](auto&& self,
                                     const std::vector<CFlatParser::FieldInitContext*>& fields,
-                                    std::string& out, bool topLevel) -> void {
+                                    std::string& out, bool topLevel,
+                                    const std::string& ownerTypeName) -> void {
+                if (!topLevel)
+                {
+                    auto unsupported = std::find_if(fields.begin(), fields.end(),
+                        [&](auto* field) {
+                            return field->Colon() != nullptr
+                                || (field->Identifier() != nullptr
+                                    && !cxxAggregateHasReferenceMember(
+                                        cxxAggregateHasReferenceMember, ownerTypeName));
+                        });
+                    if (unsupported != fields.end())
+                    {
+                        LogErrorContext(*unsupported,
+                            "named and keyed brace initializers cannot initialize a C++ class");
+                        valid = false;
+                        return;
+                    }
+                }
+                const auto ownerData = compiler->GetDataStructure(ownerTypeName);
+                size_t positionalFieldIndex = 0;
                 for (size_t i = 0; i < fields.size() && valid; ++i)
                 {
                     auto* element = fields[i];
                     if (i != 0) out += ", ";
+                    const LLVMBackend::DeclTypeAndValue* targetField = nullptr;
+                    std::string targetSpelling;
+                    bool targetIsReference = false;
+                    if (element->Identifier() != nullptr)
+                    {
+                        auto field = std::find_if(ownerData.StructFields.begin(),
+                            ownerData.StructFields.end(), [&](const auto& value) {
+                                return value.VariableName == element->Identifier()->getText();
+                            });
+                        if (field != ownerData.StructFields.end()) targetField = &*field;
+                        out += "." + element->Identifier()->getText() + " = ";
+                    }
+                    else if (positionalFieldIndex < ownerData.StructFields.size())
+                        targetField = &ownerData.StructFields[positionalFieldIndex++];
+                    if (targetField != nullptr)
+                        compiler->CxxRecordFieldTypeSpelling(
+                            ownerTypeName, targetField->VariableName, targetSpelling,
+                            &targetIsReference);
+                    if (element->Colon() != nullptr)
+                    {
+                        LogErrorContext(element,
+                            "keyed brace initializers cannot initialize a C++ class");
+                        valid = false;
+                        break;
+                    }
                     if (element->initializerList() != nullptr)
                     {
                         out += "{";
-                        self(self, element->initializerList()->fieldInit(), out, false);
+                        const std::string nestedType = targetField != nullptr
+                            ? targetField->TypeName : std::string();
+                        self(self, element->initializerList()->fieldInit(), out, false,
+                             nestedType);
                         out += "}";
                         continue;
                     }
-                    if (element->Identifier() != nullptr || element->Colon() != nullptr
-                        || element->assignmentExpression().size() != 1)
+                    if (element->LeftBrace() != nullptr
+                        && element->assignmentExpression().empty())
+                    {
+                        out += "{}";
+                        continue;
+                    }
+                    if (element->assignmentExpression().size() != 1)
                     {
                         LogErrorContext(element,
-                            "named and keyed brace initializers cannot initialize a C++ class");
+                            "C++ brace initializer requires one field value");
                         valid = false;
                         break;
                     }
@@ -6467,23 +6546,33 @@ cxx_dtor_ready:
                         elementNV.Primary = nullptr;
                         elementNV.BaseType = nullptr;
                     }
-                    else if (elementNV.TypeAndValue.Pointer)
+                    else if (elementNV.TypeAndValue.Pointer && !targetIsReference)
                     {
                         elementNV.CxxImportedLiteral = compiler->CxxImportedConstantLiteral(elementNV);
                     }
-                    else if (!compiler->IsCxxRecord(elementNV.TypeAndValue.TypeName))
+                    else if (!compiler->IsCxxRecord(elementNV.TypeAndValue.TypeName)
+                        && !targetIsReference)
                     {
                         elementNV.CxxImportedLiteral = compiler->CxxImportedConstantLiteral(elementNV);
                         compiler->RecordCxxConstantBraceElement(elementNV, elementValue);
                         elementNV.Storage = nullptr;
                         elementNV.IsRvalue = true;
                     }
+                    // Only storage present on the owned-temp ledger is extended below; a named
+                    // C++ lvalue reference therefore keeps its existing owner.
+                    if (targetIsReference && !deferredDefault
+                        && compiler->IsCxxRecord(elementNV.TypeAndValue.TypeName)
+                        && elementNV.Storage != nullptr)
+                        compiler->DeferAliasDeclStructTemp(elementNV.Storage);
                     out += "__cflat_arg_" + std::to_string(braceElements.size()) + "__";
                     braceElements.push_back(std::move(elementNV));
+                    braceElementTargetTypes.push_back(std::move(targetSpelling));
                     ProcessPlusPlus();
                 }
             };
-            appendFields(appendFields, declarationBraceList->fieldInit(), braceExpression, true);
+            const size_t braceReferenceTempMark = compiler->MarkAliasDeclTemps();
+            appendFields(appendFields, declarationBraceList->fieldInit(), braceExpression, true,
+                         typeName);
             braceExpression += "}";
             if (!valid) return true;
             std::string wrapperName;
@@ -6492,7 +6581,8 @@ cxx_dtor_ready:
             if (!compiler->RequestCxxDirectBraceConstructor(
                     typeName, braceElements, braceExpression,
                     initializer != nullptr && initializer->LeftBrace() != nullptr,
-                    wrapperName, constructorError, true, &forwardedBraceElements))
+                    wrapperName, constructorError, true, &forwardedBraceElements,
+                    &braceElementTargetTypes))
             {
                 if (constructorError.empty())
                     constructorError = std::format(
@@ -6512,6 +6602,9 @@ cxx_dtor_ready:
             wrapperArguments.push_back(self);
             for (size_t index : forwardedBraceElements)
                 wrapperArguments.push_back(braceElements[index]);
+            // Settle before wrapper-call flushing so the reference-bound prvalue uses the
+            // same scope cleanup as a reference local.
+            compiler->SettleAliasDeclTemps(braceReferenceTempMark, true);
             compiler->SetCurrentDebugLocation(line);
             compiler->CreateOverloadedFunctionCall(wrapperName, wrapperArguments);
             return true;

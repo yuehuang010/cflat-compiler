@@ -6139,7 +6139,8 @@ void MainListener::GenerateDefaultParamOverloads(
         const LLVMBackend::DeclTypeAndValue& returnType,
         const std::vector<LLVMBackend::DeclTypeAndValue>& params,
         bool varargs,
-        size_t line) {
+        size_t line,
+        bool isMethod) {
         auto* compiler = Compiler();
         int firstDefault = -1;
         for (int i = 0; i < (int)params.size(); i++)
@@ -6180,7 +6181,8 @@ void MainListener::GenerateDefaultParamOverloads(
                     name, clashFile, clashLine));
             }
 
-            auto wrapperFn = compiler->CreateFunctionDefinition(name, returnType, wrapperParams, false, false, line);
+            auto wrapperFn = compiler->CreateFunctionDefinition(
+                name, returnType, wrapperParams, false, false, line, false, isMethod);
             compiler->InitializeBlock(&wrapperFn->front(), false);
             // Fresh straight-line for the wrapper body; restore the enclosing walk's flag on exit.
             ReturnFlagGuard wrapperReturnFlagGuard(&straightLineReturned_);

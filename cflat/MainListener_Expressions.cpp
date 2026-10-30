@@ -28210,6 +28210,13 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
         llvm::Value* intoSlot,
         bool* constructedInPlace) {
         auto* compiler = Compiler(ae);
+        const std::string fieldDefaultOwner = structName;
+        llvm::SaveAndRestore<std::string> fieldDefaultOwnerScope(
+            fieldDefaultAggregateOwner_, fieldDefaultOwner);
+        std::string fieldOwner = lambdaEnclosingAggregateOwner_;
+        if (!fieldDefaultOwner.empty()) fieldOwner = fieldDefaultOwner;
+        llvm::SaveAndRestore<std::string> fieldOwnerScope(
+            lambdaEnclosingAggregateOwner_, std::move(fieldOwner));
         const auto fieldInitTemps = compiler->MarkOwnedTemps();
         if (field.AllocAlignValue > LLVMBackend::kDefaultNewAlign
             && AsDirectNew(ae) != nullptr)

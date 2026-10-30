@@ -9969,6 +9969,262 @@ namespace MtplRound2NS
         int call() { return gv(3); }
     };
 };
+namespace NestRound1NS
+{
+    struct Outer
+    {
+        static int gv<T>(T value) { return (int)value + 1; }
+        struct StaticCaller { static int call() { return gv(3); } };
+        struct ExplicitCaller { static int call() { return gv<int>(3); } };
+        struct InstanceCaller { int call() { return gv(3); } };
+        struct LambdaCaller
+        {
+            int call()
+            {
+                function<int(int)> f = (int value) => { return gv(value); };
+                return f(3);
+            }
+        };
+        struct Middle { struct DeepCaller { static int call() { return gv(3); } }; };
+        struct InnerPlain
+        {
+            static int gv(int value) { return 200 + value; }
+            static int call() { return gv(3); }
+        };
+        struct InnerTemplate
+        {
+            static int gv<T>(T value) { return 200 + (int)value; }
+            static int call() { return gv(3); }
+        };
+        struct InnerInstanceMethod
+        {
+            int gv(int value) { return 70; }
+            int call() { return gv(3); }
+        };
+        struct ParamShadow { static int call(function<int(int)> gv) { return gv(3); } };
+        struct LocalShadow
+        {
+            static int call()
+            {
+                function<int(int)> gv = (int value) => { return 40 + value; };
+                return gv(3);
+            }
+        };
+    };
+    struct PlainOuter
+    {
+        static int gv(int value) { return value + 1; }
+        struct I { static int call() { return gv(3); } };
+    };
+};
+struct NestGenericOuter<U>
+{
+    static int gv<T>(T value) { return (int)value + 1; }
+    struct I { static int call() { return gv(3); } };
+};
+struct NestGenericOuterUsesU<U>
+{
+    static int gv<T>(T value) { return (int)sizeof(U) * 10 + (int)value; }
+    struct I { static int call() { return gv(3); } };
+};
+struct NestR6ZeroArgStatic<U>
+{
+    static int h() { return 1; }
+    static int tm(int value) { return h() + value; }
+};
+struct NestR6ZeroArgInstance<U>
+{
+    static int h() { return 1; }
+    int tm(int value) { return h() + value; }
+};
+struct NestR6ZeroArgLate<U>
+{
+    static int tm(int value) { return h() + value; }
+    static int h() { return 1; }
+};
+struct NestGenericOuterUsesULambda<U>
+{
+    static int gv<T>(T value) { return (int)sizeof(U) * 10 + (int)value; }
+    struct I
+    {
+        static int call()
+        {
+            function<int()> f = () => { return gv(3); };
+            return f();
+        }
+    };
+};
+int nest2CollisionHelper(int value) { return value + 1; }
+struct Nest2GenericOuter<U>
+{
+    static int nest2CollisionHelper(int value) { return value + 100; }
+    static int ownerStaticLambda()
+    {
+        function<int()> f = () => { return nest2CollisionHelper(4); };
+        return f();
+    }
+    int ownerInstanceLambda()
+    {
+        function<int()> f = () => { return nest2CollisionHelper(5); };
+        return f();
+    }
+    struct I
+    {
+        int value = nest2CollisionHelper(4);
+        static int call() { return nest2CollisionHelper(2); }
+        static int readField() { I i; return i.value; }
+        static int lambdaCall()
+        {
+            function<int()> f = () => { return nest2CollisionHelper(7); };
+            return f();
+        }
+    };
+};
+struct Nest2GenericLater<U>
+{
+    static int h(int value) { return h2(value) + 100; }
+    static int h2(int value)
+    {
+        if (value <= 0) return (int)sizeof(U);
+        return h2(value - 1) + 1;
+    }
+    struct I { int value = h(4); static int read() { I i; return i.value; } };
+};
+struct Nest2GenericCtor<U>
+{
+    static int h(int value) { return value + 100; }
+    struct I { int value = h(4); I() { } static int read() { I i; return i.value; } };
+};
+struct Nest2ZeroArgOuter<U>
+{
+    static int h() { return 2; }
+    struct I
+    {
+        int value = h();
+        static int call() { return h(); }
+        static int read() { I i; return i.value; }
+    };
+};
+class Nest2GenericClass<U>
+{
+    static int nest2CollisionHelper(int value) { return value + 100; }
+    struct I { int value = nest2CollisionHelper(4); static int readField() { I i; return i.value; } };
+};
+int nest3GenericH(int value) { return 1; }
+struct Nest3GenericStaticDefaults<U>
+{
+    static int ownerCall() { return lateDefault(2); }
+    static int lateDefault(int a, int b = 3) { return a * b + (int)sizeof(U); }
+    static int nest3GenericH(int a, int b = 3) { return a * b + (int)sizeof(U); }
+    struct I
+    {
+        int value = nest3GenericH(2);
+        static int go() { I i = default; return nest3GenericH(2) + i.value; }
+    };
+};
+struct Nest3GenericInstanceDefaults<U>
+{
+    static int go() { Nest3GenericInstanceDefaults<U> value = default; return value.h(2); }
+    int h(int a, int b = 3) { return a * b + (int)sizeof(U); }
+};
+struct Nest3GenericNestedInstance<U>
+{
+    struct I
+    {
+        static int go() { I i = default; return i.h(2); }
+        int h(int a, int b = 3) { return a * b + (int)sizeof(U); }
+    };
+};
+int nest3InnerH(int value) { return 1; }
+struct Nest3GenericInnerShadow<U>
+{
+    struct I
+    {
+        static int nest3InnerH(int value) { return 3; }
+        int value = nest3InnerH(0);
+        static int go() { I i = default; return nest3InnerH(0) * 10 + i.value; }
+    };
+};
+int nest3DeepH(int value) { return 1; }
+struct Nest3GenericDeepInnerShadow<U>
+{
+    struct I
+    {
+        struct K
+        {
+            static int nest3DeepH(int value) { return 3; }
+            int value = nest3DeepH(0);
+            static int go() { K k = default; return nest3DeepH(0) * 10 + k.value; }
+        };
+    };
+};
+int nest3ClassH(int value) { return 1; }
+class Nest3GenericClassOuter<U>
+{
+    static int ownerCall() { return nest3ClassH(2); }
+    static int nest3ClassH(int a, int b = 3) { return a * b + (int)sizeof(U); }
+    class I
+    {
+        static int nest3ClassH(int value) { return 3; }
+        int value = nest3ClassH(0);
+        static int go() { I i = default; return nest3ClassH(0) * 10 + i.value; }
+    };
+};
+struct Nest4InstanceDefault
+{
+    int k = 10;
+    int h(int a, int b = 2) { return a + b + k; }
+    int bareCall() { return h(1); }
+    int explicitThisCall() { return this.h(1); }
+    static int staticH(int a, int b = 2) { return a + b + 10; }
+    static int staticCall() { return staticH(1); }
+};
+struct Nest4GenericInstanceDefault<T>
+{
+    int k = 10;
+    int h(int a, int b = 2) { return a + b + k; }
+    int bareCall() { return h(1); }
+};
+struct Nest4TwoDefaults
+{
+    int k = 10;
+    int h(int a, int b = 2, int c = 3) { return a + b + c + k; }
+    int bareCall() { return h(1); }
+};
+int nest4Collision(int a) { return a + 1000; }
+struct Nest4MemberWins
+{
+    int k = 10;
+    int nest4Collision(int a, int b = 2) { return a + b + k; }
+    int bareCall() { return nest4Collision(1); }
+};
+struct Nest4LambdaDefault
+{
+    int k = 10;
+    int h(int a, int b = 2) { return a + b + k; }
+    int lambdaCall()
+    {
+        Lambda<int()> f = () => { return h(1); };
+        return f();
+    }
+};
+class NestGenericClassOuterUsesU<U>
+{
+    static int gv<T>(T value) { return (int)sizeof(U) * 10 + (int)value; }
+    struct I { static int call() { return gv(3); } };
+};
+class NestGenericClassOuterUsesULambda<U>
+{
+    static int gv<T>(T value) { return (int)sizeof(U) * 10 + (int)value; }
+    class I
+    {
+        static int call()
+        {
+            function<int()> f = () => { return gv(3); };
+            return f();
+        }
+    };
+};
 struct MtplGenericMemberOverload
 {
     int gv(double value) { return 2; }
@@ -10010,6 +10266,104 @@ bool testT471BareCalls()
     result &= Test("mtpl static generic bare member call", mtplStatic.call(), 13);
     result &= Test("mtpl static generic qualified member call",
         MtplStaticGenericNS.qualifiedCall(), 13);
+    result &= Test("nest outer static template from nested static method",
+        NestRound1NS.Outer.StaticCaller.call(), 4);
+    result &= Test("nest explicit outer static template from nested method",
+        NestRound1NS.Outer.ExplicitCaller.call(), 4);
+    NestRound1NS.Outer.InstanceCaller nestInstance = default;
+    result &= Test("nest outer static template from nested instance method",
+        nestInstance.call(), 4);
+    NestRound1NS.Outer.LambdaCaller nestLambda = default;
+    result &= Test("nest outer static template from nested lambda",
+        nestLambda.call(), 4);
+    result &= Test("nest outer static template through two nested scopes",
+        NestRound1NS.Outer.Middle.DeepCaller.call(), 4);
+    result &= Test("nest generic outer static template",
+        NestGenericOuter<int>.I.call(), 4);
+    result &= Test("nest generic zero-arg sibling static method",
+        NestR6ZeroArgStatic<i64>.tm(4), 5);
+    NestR6ZeroArgInstance<i64> nestR6ZeroArgInstance = default;
+    result &= Test("nest generic instance call to zero-arg sibling static method",
+        nestR6ZeroArgInstance.tm(4), 5);
+    result &= Test("nest generic zero-arg sibling declared after caller",
+        NestR6ZeroArgLate<i64>.tm(4), 5);
+    result &= Test("nest generic outer template uses current instantiation",
+        NestGenericOuterUsesU<i64>.I.call() + NestGenericOuterUsesU<char>.I.call(), 96);
+    result &= Test("nest generic outer template through lambda uses current instantiation",
+        NestGenericOuterUsesULambda<i64>.I.call() + NestGenericOuterUsesULambda<char>.I.call(), 96);
+    result &= Test("nest2 generic outer nested bare static call",
+        Nest2GenericOuter<long>.I.call(), 102);
+    result &= Test("nest2 generic outer nested field default",
+        Nest2GenericOuter<long>.I.readField(), 104);
+    result &= Test("nest2 generic outer static method lambda",
+        Nest2GenericOuter<long>.ownerStaticLambda(), 104);
+    Nest2GenericOuter<long> nest2GenericOuter = default;
+    result &= Test("nest2 generic outer instance method lambda",
+        nest2GenericOuter.ownerInstanceLambda(), 105);
+    result &= Test("nest2 generic outer nested method lambda",
+        Nest2GenericOuter<long>.I.lambdaCall(), 107);
+    result &= Test("nest2 generic outer later static dependency",
+        Nest2GenericLater<i64>.I.read() + Nest2GenericLater<char>.I.read() - 200, 17);
+    result &= Test("nest2 generic outer field default with user constructor",
+        Nest2GenericCtor<long>.I.read() + Nest2GenericCtor<long>.I.read() - 200, 8);
+    result &= Test("nest2 generic outer zero argument method",
+        Nest2ZeroArgOuter<long>.I.call(), 2);
+    result &= Test("nest2 generic outer zero argument field default",
+        Nest2ZeroArgOuter<long>.I.read(), 2);
+    result &= Test("nest2 generic class nested field default",
+        Nest2GenericClass<long>.I.readField(), 104);
+    // The free helper returns 1; 42 proves both calls use the outer static for i64 and char.
+    result &= Test("nest3 generic nested static defaults",
+        Nest3GenericStaticDefaults<i64>.I.go() + Nest3GenericStaticDefaults<char>.I.go(), 42);
+    // This is a forward call to a later static whose second parameter is omitted.
+    result &= Test("nest3 generic owner later static default",
+        Nest3GenericStaticDefaults<i64>.ownerCall(), 14);
+    // An explicit receiver isolates default-wrapper registration from bare-call lookup.
+    result &= Test("nest3 generic instance default with explicit receiver",
+        Nest3GenericInstanceDefaults<i64>.go(), 14);
+    // The concrete nested type has no scanner pass; its later instance wrapper must be declared.
+    result &= Test("nest3 nested instance default in generic outer",
+        Nest3GenericNestedInstance<i64>.I.go(), 14);
+    // 33 is inner h(3) * 10 + field h(3); the free helper returns 1.
+    result &= Test("nest3 generic inner member hides free function in field default",
+        Nest3GenericInnerShadow<i64>.I.go(), 33);
+    // A second nesting level exercises the same parent-chain predeclaration path.
+    result &= Test("nest3 deeply nested member hides free function in field default",
+        Nest3GenericDeepInnerShadow<i64>.I.K.go(), 33);
+    // 47 combines the outer defaulted static (14) with the inner field shadow case (33).
+    result &= Test("nest3 generic class default and inner shadow",
+        Nest3GenericClassOuter<i64>.ownerCall() + Nest3GenericClassOuter<i64>.I.go(), 47);
+    Nest4InstanceDefault nest4Instance = default;
+    result &= Test("nest4 bare instance call keeps explicit argument", nest4Instance.bareCall(), 13);
+    result &= Test("nest4 explicit this default call", nest4Instance.explicitThisCall(), 13);
+    result &= Test("nest4 explicit object default call", nest4Instance.h(1), 13);
+    result &= Test("nest4 bare static default call", Nest4InstanceDefault.staticCall(), 13);
+    Nest4GenericInstanceDefault<int> nest4Generic = default;
+    result &= Test("nest4 generic bare instance default call",
+        nest4Generic.bareCall(), 13);
+    Nest4TwoDefaults nest4TwoDefaults = default;
+    result &= Test("nest4 bare call with two defaults", nest4TwoDefaults.bareCall(), 16);
+    Nest4MemberWins nest4MemberWins = default;
+    result &= Test("nest4 member default hides same-name free function", nest4MemberWins.bareCall(), 13);
+    Nest4LambdaDefault nest4Lambda = default;
+    result &= Test("nest4 lambda captures implicit this for default call", nest4Lambda.lambdaCall(), 13);
+    result &= Test("nest generic class outer template uses current instantiation",
+        NestGenericClassOuterUsesU<i64>.I.call() + NestGenericClassOuterUsesU<char>.I.call(), 96);
+    result &= Test("nest generic class outer template through lambda uses current instantiation",
+        NestGenericClassOuterUsesULambda<i64>.I.call() + NestGenericClassOuterUsesULambda<char>.I.call(), 96);
+    result &= Test("nest inner plain method hides outer template",
+        NestRound1NS.Outer.InnerPlain.call(), 203);
+    result &= Test("nest inner template hides outer template",
+        NestRound1NS.Outer.InnerTemplate.call(), 203);
+    NestRound1NS.Outer.InnerInstanceMethod nestInnerMethod = default;
+    result &= Test("nest inner instance method call uses its receiver",
+        nestInnerMethod.call(), 70);
+    result &= Test("nest parameter shadows outer template",
+        NestRound1NS.Outer.ParamShadow.call((int value) => { return 30 + value; }), 33);
+    result &= Test("nest local shadows outer template",
+        NestRound1NS.Outer.LocalShadow.call(), 43);
+    result &= Test("nest outer static plain method remains callable",
+        NestRound1NS.PlainOuter.I.call(), 4);
     MtplRound2NS.StaticPlainInt mtplStaticPlainInt = default;
     result &= Test("mtpl static plain int beats static template",
         mtplStaticPlainInt.call(), 2);

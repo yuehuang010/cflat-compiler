@@ -6,3 +6,47 @@ expect_error("call to non-static member function 'm' without an object argument"
     };
     int m(int k) { return k + 20; }
 }
+
+expect_error("no overload of 'gv' matches the given arguments") {
+    struct T471NestedNonStaticTemplate
+    {
+        int gv<T>(T value) { return (int)value + 1; }
+        struct I { static int call() { return gv(3); } };
+    };
+}
+
+expect_error("call to non-static member function 'gv' without an object argument") {
+    struct T471InnerInstanceHidesTemplate
+    {
+        static int gv<T>(T value) { return (int)value + 1; }
+        struct I
+        {
+            int gv(int value) { return 70; }
+            static int call() { return gv(3); }
+        };
+    };
+}
+
+expect_error("call to non-static member function 'gv' without an object argument") {
+    struct T471MiddleInstanceHidesTemplate
+    {
+        static int gv<T>(T value) { return (int)value + 1; }
+        struct M
+        {
+            int gv(int value) { return 70; }
+            struct D { static int call() { return gv(3); } };
+        };
+    };
+}
+
+expect_error("no overload of 'gv' matches the given arguments") {
+    struct T471MiddleFieldHidesTemplate
+    {
+        static int gv<T>(T value) { return (int)value + 1; }
+        struct M
+        {
+            int gv = 0;
+            struct D { static int call() { return gv(3); } };
+        };
+    };
+}

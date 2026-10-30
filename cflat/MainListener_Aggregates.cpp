@@ -3,6 +3,14 @@
 
 namespace
 {
+struct AggregateTypeScopeGuard
+{
+    std::vector<std::string>& scopes;
+    AggregateTypeScopeGuard(std::vector<std::string>& scopes, const std::string& name)
+        : scopes(scopes) { scopes.push_back(name); }
+    ~AggregateTypeScopeGuard() { scopes.pop_back(); }
+};
+
 bool ShouldWarnImplicitFieldNarrowing(llvm::Value* value, llvm::Type* destinationType,
                                       const std::string& destinationTypeName)
 {
@@ -1082,6 +1090,19 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         {
             structName = baseName;
         }
+        auto hasInstantiatedGenericAncestor = [&](std::string scope)
+        {
+            while (!scope.empty())
+            {
+                if (instantiatedGenerics.count(scope) != 0) return true;
+                auto parent = aggregateParentScopes_.find(scope);
+                if (parent == aggregateParentScopes_.end() || parent->second == scope) break;
+                scope = parent->second;
+            }
+            return false;
+        };
+        const bool predeclareConcreteMembers = !nameOverride.empty()
+            || hasInstantiatedGenericAncestor(namespaceName);
         // Mid-definition marker: nested flushes below must not drain a pointer-only record that
         // names this struct, since its destructor and methods are not registered yet.
         struct BeingDefinedScope
@@ -1292,6 +1313,55 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             }
         compiler->SaveAggregateAliasScope(structName);
         RecordAggregateValueMembers(structName, ResolveAggregateMembers(ctx));
+
+        // Nested bodies need the concrete owner's generic templates and static signatures.
+        {
+            GlobalScopeGuard scopeGuard(global_scope);
+            for (auto* func : MemberFunctionDefinitions(ctx))
+            {
+                if (func->genericTypeParameters() == nullptr
+                    || (!FunctionDeclaresReturnType(func) && getFunctionName(func) == baseName))
+                    continue;
+                global_scope = false;
+                if (func->genericTypeParameters()->typeParameterList()
+                    ->typeParameterEntry().empty())
+                    LogErrorContext(func->genericTypeParameters(),
+                        "generic definition needs at least one type parameter");
+                RefuseConstTemplateParameters(func->genericTypeParameters());
+                const std::string key = structName + "." + getFunctionName(func);
+                genericFunctionTemplates[key] = func;
+                Compiler()->gts.genericTemplateNamespace[key] = Compiler()->GetCurrentNamespace();
+                std::vector<std::string> valueParams;
+                std::vector<std::string> valueDefaults;
+                auto typeParams = ParseGenericTypeParameters(
+                    func->genericTypeParameters(), &valueParams, &valueDefaults);
+                genericFunctionTypeParams[key] = std::move(typeParams);
+                genericFunctionValueParams[key] = std::move(valueParams);
+                Compiler()->gts.genericFunctionValueDefaults[key] = std::move(valueDefaults);
+                genericFunctionConstraints[key] = ParseWhereClause(func->whereClause());
+                const auto entries = func->genericTypeParameters()->typeParameterList()
+                    ->typeParameterEntry();
+                const bool hasPack = !entries.empty() && entries.back()->Ellipsis() != nullptr;
+                Compiler()->gts.genericFunctionPackIndex[key] = hasPack
+                    ? genericFunctionTypeParams[key].size() - 1 : std::string::npos;
+            }
+        }
+
+        if (predeclareConcreteMembers)
+        {
+            for (auto* nestedStruct : MemberStructDefinitions(ctx))
+                if (nestedStruct->genericTypeParameters() == nullptr)
+                    compiler->CreateStructType(structName + "."
+                        + nestedStruct->directDeclarator()->getText(), {});
+            for (auto* nestedClass : MemberClassDefinitions(ctx))
+                if (nestedClass->genericTypeParameters() == nullptr)
+                    compiler->CreateStructType(structName + "."
+                        + nestedClass->directDeclarator()->getText(), {});
+            LLVMBackend::TypeAndValue outerType{ .TypeName = structName };
+            AggregateTypeScopeGuard typeScope(structScopeStack, structName);
+            PreDeclareInstantiationMembers(compiler, MemberFunctionDefinitions(ctx),
+                baseName, structName, outerType, true);
+        }
 
         // Process nested struct/class definitions before fields so their types are available
         for (auto* nestedStruct : MemberStructDefinitions(ctx))
@@ -1628,8 +1698,9 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             return GenericMemberNeedsDeferredBody(member)
                 || (deferUniqueDeleteBodies && hasDeleteExpression(member));
         };
-        if (!nameOverride.empty())
-            PreDeclareInstantiationMembers(compiler, functionList, baseName, structName, returnType);
+        if (predeclareConcreteMembers)
+            PreDeclareInstantiationMembers(compiler, functionList, baseName, structName, returnType,
+                false, true);
         // Flush any nested generic instantiations queued while parsing field declarations,
         // so their constructors exist before this struct's default constructor calls them.
         {
@@ -2708,24 +2779,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 // monomorphized body resolves the owner's fields like any other member.
                 if (func->genericTypeParameters() != nullptr)
                 {
-                    if (func->genericTypeParameters()->typeParameterList()
-                        ->typeParameterEntry().empty())
-                        LogErrorContext(func->genericTypeParameters(),
-                            "generic definition needs at least one type parameter");
-                    RefuseConstTemplateParameters(func->genericTypeParameters());
-                    std::string qualifiedName = structName + "." + funcName;
-                    genericFunctionTemplates[qualifiedName] = func;
-                    // Declaring NAMESPACE of the owner, recorded not derived: the key's last dot
-                    // separates the owner, not a namespace, so only this tells the two apart.
-                    Compiler()->gts.genericTemplateNamespace[qualifiedName] = Compiler()->GetCurrentNamespace();
-                    std::vector<std::string> valueParams;
-                    std::vector<std::string> valueDefaults;
-                    genericFunctionTypeParams[qualifiedName] =
-                        ParseGenericTypeParameters(func->genericTypeParameters(), &valueParams,
-                                                   &valueDefaults);
-                    genericFunctionValueParams[qualifiedName] = valueParams;
-                    Compiler()->gts.genericFunctionValueDefaults[qualifiedName] = valueDefaults;
-                    genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
+                    continue;
                 }
                 else if (!nameOverride.empty() && needsDeferredMemberBody(func))
                     DeferGenericMemberBody(func, ctx, structName,
@@ -5050,6 +5104,19 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         {
             structName = baseName;
         }
+        auto hasInstantiatedGenericAncestor = [&](std::string scope)
+        {
+            while (!scope.empty())
+            {
+                if (instantiatedGenerics.count(scope) != 0) return true;
+                auto parent = aggregateParentScopes_.find(scope);
+                if (parent == aggregateParentScopes_.end() || parent->second == scope) break;
+                scope = parent->second;
+            }
+            return false;
+        };
+        const bool predeclareConcreteMembers = !nameOverride.empty()
+            || hasInstantiatedGenericAncestor(namespaceName);
         // Mid-definition marker, as in ParseStructDefinition: nested flushes must not drain a
         // pointer-only record that names this class while its body is still being parsed.
         struct BeingDefinedScope
@@ -5200,6 +5267,55 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             }
         compiler->SaveAggregateAliasScope(structName);
         RecordAggregateValueMembers(structName, ResolveAggregateMembers(ctx));
+
+        // Nested bodies need the concrete owner's generic templates and static signatures.
+        {
+            GlobalScopeGuard scopeGuard(global_scope);
+            for (auto* func : MemberFunctionDefinitions(ctx))
+            {
+                if (func->genericTypeParameters() == nullptr
+                    || (!FunctionDeclaresReturnType(func) && getFunctionName(func) == baseName))
+                    continue;
+                global_scope = false;
+                if (func->genericTypeParameters()->typeParameterList()
+                    ->typeParameterEntry().empty())
+                    LogErrorContext(func->genericTypeParameters(),
+                        "generic definition needs at least one type parameter");
+                RefuseConstTemplateParameters(func->genericTypeParameters());
+                const std::string key = structName + "." + getFunctionName(func);
+                genericFunctionTemplates[key] = func;
+                Compiler()->gts.genericTemplateNamespace[key] = Compiler()->GetCurrentNamespace();
+                std::vector<std::string> valueParams;
+                std::vector<std::string> valueDefaults;
+                auto typeParams = ParseGenericTypeParameters(
+                    func->genericTypeParameters(), &valueParams, &valueDefaults);
+                genericFunctionTypeParams[key] = std::move(typeParams);
+                genericFunctionValueParams[key] = std::move(valueParams);
+                Compiler()->gts.genericFunctionValueDefaults[key] = std::move(valueDefaults);
+                genericFunctionConstraints[key] = ParseWhereClause(func->whereClause());
+                const auto entries = func->genericTypeParameters()->typeParameterList()
+                    ->typeParameterEntry();
+                const bool hasPack = !entries.empty() && entries.back()->Ellipsis() != nullptr;
+                Compiler()->gts.genericFunctionPackIndex[key] = hasPack
+                    ? genericFunctionTypeParams[key].size() - 1 : std::string::npos;
+            }
+        }
+
+        if (predeclareConcreteMembers)
+        {
+            for (auto* nestedStruct : MemberStructDefinitions(ctx))
+                if (nestedStruct->genericTypeParameters() == nullptr)
+                    compiler->CreateStructType(structName + "."
+                        + nestedStruct->directDeclarator()->getText(), {});
+            for (auto* nestedClass : MemberClassDefinitions(ctx))
+                if (nestedClass->genericTypeParameters() == nullptr)
+                    compiler->CreateStructType(structName + "."
+                        + nestedClass->directDeclarator()->getText(), {});
+            LLVMBackend::TypeAndValue outerType{ .TypeName = structName };
+            AggregateTypeScopeGuard typeScope(structScopeStack, structName);
+            PreDeclareInstantiationMembers(compiler, MemberFunctionDefinitions(ctx),
+                baseName, structName, outerType, true);
+        }
 
         // Process nested struct/class definitions before fields so their types are available
         for (auto* nestedStruct : MemberStructDefinitions(ctx))
@@ -5377,8 +5493,9 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         // instantiation pulled in by the flush can resolve calls back into this
         // type's methods to a forward declaration. See PreDeclareInstantiationMembers.
         auto functionList = MemberFunctionDefinitions(ctx);
-        if (!nameOverride.empty())
-            PreDeclareInstantiationMembers(compiler, functionList, baseName, structName, returnType);
+        if (predeclareConcreteMembers)
+            PreDeclareInstantiationMembers(compiler, functionList, baseName, structName, returnType,
+                false, true);
         // Flush any nested generic instantiations queued while parsing field declarations,
         // so their constructors exist before this class's default constructor calls them.
         {
@@ -5603,19 +5720,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                 // monomorphized body resolves the owner's fields like any other member.
                 if (func->genericTypeParameters() != nullptr)
                 {
-                    std::string qualifiedName = structName + "." + funcName;
-                    genericFunctionTemplates[qualifiedName] = func;
-                    // Declaring NAMESPACE of the owner, recorded not derived: the key's last dot
-                    // separates the owner, not a namespace, so only this tells the two apart.
-                    Compiler()->gts.genericTemplateNamespace[qualifiedName] = Compiler()->GetCurrentNamespace();
-                    std::vector<std::string> valueParams;
-                    std::vector<std::string> valueDefaults;
-                    genericFunctionTypeParams[qualifiedName] =
-                        ParseGenericTypeParameters(func->genericTypeParameters(), &valueParams,
-                                                   &valueDefaults);
-                    genericFunctionValueParams[qualifiedName] = valueParams;
-                    Compiler()->gts.genericFunctionValueDefaults[qualifiedName] = valueDefaults;
-                    genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
+                    continue;
                 }
                 else if (!nameOverride.empty() && GenericMemberNeedsDeferredBody(func))
                     DeferGenericMemberBody(func, ctx, structName,

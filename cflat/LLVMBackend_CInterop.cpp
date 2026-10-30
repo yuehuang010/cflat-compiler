@@ -17448,11 +17448,119 @@ static bool CxxHeaderHasIncludeGuard(const std::string& contents)
             && !first.second.empty() && first.second == second.second;
 }
 
+static bool CxxBraceFieldIsReference(const std::string& spelling)
+{
+        const size_t last = spelling.find_last_not_of(" \t\r\n");
+        if (last != std::string::npos && spelling[last] == '&') return true;
+
+        for (size_t open = 0; open < spelling.size(); ++open)
+        {
+            if (spelling[open] != '(') continue;
+            int depth = 1;
+            size_t close = open + 1;
+            for (; close < spelling.size() && depth != 0; ++close)
+            {
+                if (spelling[close] == '(') ++depth;
+                else if (spelling[close] == ')') --depth;
+            }
+            if (depth != 0) break;
+            --close;
+            const size_t suffix = close + 1;
+            if (suffix < spelling.size()
+                && (spelling[suffix] == '(' || spelling[suffix] == '[')
+                && spelling.find('&', open + 1) < close)
+                return true;
+            open = close;
+        }
+        return false;
+}
+
+static bool CxxBraceFieldIsRvalueReference(const std::string& spelling)
+{
+        const size_t last = spelling.find_last_not_of(" \t\r\n");
+        if (last == std::string::npos) return false;
+        if (spelling[last] == '&' && last > 0)
+        {
+            const size_t previous = spelling.find_last_not_of(" \t\r\n", last - 1);
+            if (previous != std::string::npos && spelling[previous] == '&') return true;
+        }
+        for (size_t open = 0; open < spelling.size(); ++open)
+        {
+            if (spelling[open] != '(') continue;
+            int depth = 1;
+            size_t close = open + 1;
+            for (; close < spelling.size() && depth != 0; ++close)
+            {
+                if (spelling[close] == '(') ++depth;
+                else if (spelling[close] == ')') --depth;
+            }
+            if (depth != 0) break;
+            --close;
+            const size_t suffix = close + 1;
+            if (suffix < spelling.size()
+                && (spelling[suffix] == '(' || spelling[suffix] == '['))
+            {
+                const size_t reference = spelling.find("&&", open + 1);
+                if (reference != std::string::npos && reference + 1 < close) return true;
+            }
+            open = close;
+        }
+        return false;
+}
+
+static std::string CxxNamedParameter(const std::string& spelling,
+                                     const std::string& parameterName)
+{
+        for (size_t open = 0; open < spelling.size(); ++open)
+        {
+            if (spelling[open] != '(') continue;
+            int depth = 1;
+            size_t close = open + 1;
+            for (; close < spelling.size() && depth != 0; ++close)
+            {
+                if (spelling[close] == '(') ++depth;
+                else if (spelling[close] == ')') --depth;
+            }
+            if (depth != 0) break;
+            --close;
+            const size_t suffix = close + 1;
+            if (suffix < spelling.size()
+                && (spelling[suffix] == '(' || spelling[suffix] == '['))
+            {
+                const size_t reference = spelling.rfind('&', close);
+                if (reference != std::string::npos && reference > open)
+                    return spelling.substr(0, reference + 1) + " " + parameterName
+                        + spelling.substr(reference + 1);
+            }
+            open = close;
+        }
+        return spelling + " " + parameterName;
+}
+
+bool LLVMBackend::CxxRecordFieldTypeSpelling(const std::string& typeName,
+                                              const std::string& fieldName,
+                                              std::string& spelling,
+                                              bool* isReference) const
+{
+        spelling.clear();
+        if (isReference != nullptr) *isReference = false;
+        const std::string resolvedType = ResolveTypeAlias(typeName);
+        auto record = cxxRecordEntries_.find(resolvedType);
+        if (record == cxxRecordEntries_.end()) return false;
+        auto field = std::find_if(record->second.fields.begin(), record->second.fields.end(),
+            [&](const CRecordFieldEntry& candidate) { return candidate.name == fieldName; });
+        if (field == record->second.fields.end()) return false;
+        spelling = field->ctype;
+        if (isReference != nullptr) *isReference = CxxBraceFieldIsReference(spelling);
+        return !spelling.empty();
+}
+
 bool LLVMBackend::RequestCxxDirectBraceConstructor(
         const std::string& typeName, const std::vector<NamedVariable>& elements,
         const std::string& initializerList, bool copyListInit, std::string& wrapperName,
         std::string& error, bool allowIncremental,
-        std::vector<size_t>* forwardedElementIndices)
+        std::vector<size_t>* forwardedElementIndices,
+        const std::vector<std::string>* elementTargetTypes)
 {
         error.clear();
         wrapperName.clear();
@@ -17529,6 +17637,17 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
                 }
                 continue;
             }
+            const std::string targetType = elementTargetTypes != nullptr
+                && i < elementTargetTypes->size() ? (*elementTargetTypes)[i] : std::string();
+            if (CxxBraceFieldIsReference(targetType))
+            {
+                spelling = targetType;
+                elementParameters[i] = "p" + std::to_string(nextParameter++);
+                elementParameterTypes[i] = parameterTypes.size();
+                parameterTypes.push_back(std::move(spelling));
+                if (forwardedElementIndices != nullptr) forwardedElementIndices->push_back(i);
+                continue;
+            }
             const bool pointerValue = type.Pointer
                 && (!type.IsAlias || type.IsCxxRefToPointer) && !type.IsFunctionPointer;
             const bool pointerXvalue = pointerValue && IsCxxRvalueReferenceArgument(elements[i]);
@@ -17556,6 +17675,37 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
             if (elements[i].IsDefaultArgument) continue;
             const std::string marker = "__cflat_arg_" + std::to_string(i) + "__";
             const std::string& param = elementParameters[i];
+            const std::string targetType = elementTargetTypes != nullptr
+                && i < elementTargetTypes->size() ? (*elementTargetTypes)[i] : std::string();
+            if (CxxBraceFieldIsReference(targetType))
+            {
+                std::string replacement = param;
+                if (CxxBraceFieldIsRvalueReference(targetType))
+                {
+                    const size_t last = targetType.find_last_not_of(" \t\r\n");
+                    const size_t first = last != std::string::npos && last > 0
+                        ? targetType.find_last_not_of(" \t\r\n", last - 1) : std::string::npos;
+                    if (last != std::string::npos && first != std::string::npos
+                        && targetType[last] == '&' && targetType[first] == '&')
+                    {
+                        std::string castType = targetType.substr(0, first);
+                        while (!castType.empty()
+                            && (castType.back() == ' ' || castType.back() == '\t'
+                                || castType.back() == '\r' || castType.back() == '\n'))
+                            castType.pop_back();
+                        replacement = "static_cast<" + castType + " &&>(" + param + ")";
+                    }
+                    else
+                        replacement = "static_cast<decltype(" + param + ")>(" + param + ")";
+                }
+                size_t at = 0;
+                while ((at = init.find(marker, at)) != std::string::npos)
+                {
+                    init.replace(at, marker.size(), replacement);
+                    at += replacement.size();
+                }
+                continue;
+            }
             const auto& type = elements[i].TypeAndValue;
             const bool pointerValue = type.Pointer
                 && (!type.IsAlias || type.IsCxxRefToPointer) && !type.IsFunctionPointer;
@@ -17572,8 +17722,8 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
                 }
                 continue;
             }
-            // A compile-time constant element goes in as a typed constant, so clang applies the
-            // constant-expression narrowing rule (`short{1}` fits) instead of the variable one.
+            // A compile-time value element goes in as a typed constant so clang applies list
+            // narrowing rules. Reference elements above must use the caller-owned parameter.
             std::string constant = elements[i].CxxImportedLiteral;
             if (constant.empty())
                 constant = DirectBraceConstantText(elements[i], parameterTypes[elementParameterTypes[i]],
@@ -17617,7 +17767,7 @@ bool LLVMBackend::RequestCxxDirectBraceConstructor(
         for (size_t i = 0; i < parameterTypes.size(); ++i)
         {
             if (i != 0) source += ", ";
-            source += parameterTypes[i] + " p" + std::to_string(i);
+            source += CxxNamedParameter(parameterTypes[i], "p" + std::to_string(i));
         }
         // `::new`: a class-scope operator new would hide the global placement form.
         source += ") { " + copyCheck + "::new ((void*)p0) " + ownerSpelling + init

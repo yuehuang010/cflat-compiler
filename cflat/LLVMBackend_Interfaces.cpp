@@ -1373,6 +1373,7 @@ llvm::Function* LLVMBackend::GetOrCreateReverseAbiFunctionThunk(
         // A C++ exception thrown by the CFlat body must unwind through the thunk to a C++ catch.
         thunk->setUWTableKind(llvm::UWTableKind::Default);
         ApplyAbiAttributes(thunk, plan.recipe);
+        ApplyNarrowIntExtAttrs(thunk, plan.ret, plan.params, &plan.recipe);
 
         auto* entry = llvm::BasicBlock::Create(*context, "entry", thunk);
         auto savedIP = builder->saveIP();
@@ -1592,16 +1593,32 @@ llvm::Value* LLVMBackend::WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, cons
 bool LLVMBackend::ThinFnPtrUsesCAbi(const TypeAndValue& ret, const std::vector<TypeAndValue>& params,
                                     AbiRecipe& outRecipe)
 {
-        // An alias closure param is a pointer on both sides: a signature whose only lowering is
-        // such params keeps the plain CFlat ABI (no reverse-ABI thunk; the pointer passes as is).
+        // An alias closure param is a pointer on both sides, so it does not itself need ABI lowering.
         std::vector<TypeAndValue> pointerParams = params;
+        bool hasAliasByPointerParam = false;
         for (auto& p : pointerParams)
-            if (ParameterIsAliasByPointer(p)) { p.Pointer = true; p.IsAlias = false; }
-        if (!ComputeAbiRecipe(ret, pointerParams).hasLowering) return false;
+            if (ParameterIsAliasByPointer(p))
+            {
+                p.Pointer = true;
+                p.IsAlias = false;
+                hasAliasByPointerParam = true;
+            }
+        const AbiRecipe cRecipe = ComputeAbiRecipe(ret, pointerParams);
+        const NarrowIntExtPolicy extPolicy = GetNarrowIntExtPolicy();
+        TypeAndValue returnShape = ret;
+        if (returnShape.EnumBacking.empty() && !returnShape.TypeName.empty())
+            returnShape.EnumBacking = GetEnumBackingType(returnShape.TypeName);
+        const int returnBits = returnShape.TypeName == "bool" ? 1 : returnShape.IsInteger();
+        // A narrow return needs an ABI thunk even when both signatures use the same LLVM type.
+        // An alias closure signature stays on the CFlat ABI even with a narrow return.
+        const bool narrowReturnNeedsExt = !hasAliasByPointerParam && !ret.Pointer && !ret.IsAlias
+            && returnBits > 0 && returnBits < 32
+            && (extPolicy == NarrowIntExtPolicy::All
+                || (extPolicy == NarrowIntExtPolicy::BoolOnly && ret.TypeName == "bool"));
+        if (!cRecipe.hasLowering && !narrowReturnNeedsExt) return false;
         // A signature touching a C++ class keeps its own convention (cxxIndirectRecipe).
         if (ComputeCxxReturnAbiRecipe(ret, params).hasLowering) return false;
         outRecipe = ComputeAbiRecipe(ret, params);
-        if (!outRecipe.hasLowering) return false;
         // Raw-array counts are part of this signature: an explicit i64 after each counted
         // parameter, and a trailing pointer for a counted return (caller and thunk both read it).
         for (size_t i = 0; i < params.size() && i < outRecipe.paramSlots.size(); ++i)
@@ -1741,6 +1758,25 @@ llvm::Value* LLVMBackend::MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue
                     fn = GetOrCreateReverseAbiFunctionThunk(original, plan);
                     if (fn == nullptr)
                         return llvm::UndefValue::get(BuildThinFnPtrType(fpTV));
+                }
+                else
+                {
+                    // A registered C++ callback recipe can be ABI-natural while a thin CFlat
+                    // function pointer still needs C ABI extension attributes (for example i16).
+                    AbiRecipe cAbi;
+                    if (ThinFnPtrUsesCAbi(ret, params, cAbi))
+                    {
+                        if (symbol != nullptr && symbol->External && symbol->Recipe.hasLowering)
+                            fn = GetOrCreateNativeExternCAbiEntry(
+                                original, *symbol, ret, params, cAbi);
+                        else if (symbol == nullptr || !symbol->External)
+                        {
+                            CxxFunctionPointerAbiPlan cPlan{ ret, params, cAbi };
+                            fn = GetOrCreateReverseAbiFunctionThunk(original, cPlan);
+                        }
+                        if (fn == nullptr)
+                            return llvm::UndefValue::get(BuildThinFnPtrType(fpTV));
+                    }
                 }
             }
             else
@@ -2278,7 +2314,7 @@ llvm::Function* LLVMBackend::GetOrCreateThinToFatForwarder(const TypeAndValue& r
                 loweredExt.emplace_back(lowIdx, params[i]);
             lowIdx += SlotLLVMParamCount(s);
         }
-        ApplyNarrowIntExtCallAttrs(call, loweredExt);
+        ApplyNarrowIntExtCallAttrs(call, loweredExt, &ret);
         if (natural->getReturnType()->isVoidTy())
             b.CreateRetVoid();
         else if (sretSlot != nullptr)

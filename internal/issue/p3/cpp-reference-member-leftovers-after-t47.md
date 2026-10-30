@@ -1,19 +1,24 @@
-# C++ reference-member leftovers after T47: named aggregate init, const array-reference writes, const C& return ranking
+# C++ reference-member leftovers after REFMEM
 
-Found by T47 reviews 1-3 (2026-10-09). All are pre-existing on master 68bfae05f. Repros are in scratch/repro_keep/t47/.
+T47 items: designated init of a C++ aggregate with reference members, literal/rvalue/C++-class-prvalue binding with clang's
+lifetime extension, `{ r = move x }`, and nested aggregates landed in REFMEM (791f1281e). The const array-reference write
+(T104) and const C& result ranking already matched clang on master. All below are pre-existing (master behaves the same);
+clang++ -std=c++20 is the oracle. Repros: scratch/repro_keep/refmem/ and scratch/repro_keep/t47/.
 
-1. Named (designated) aggregate initialization of a C++ record with reference members is refused. The positional braces form works. The clang designated equivalent passes. Repro: rev_t47_named.cb, with rev_t47_oracle.cpp as the oracle.
-2. A write through a `const int(&)[3]` member (`h.a[0] = 5`) is accepted; clang refuses it. Repro: rev_t47_r3_constarraywrite.cb/.cpp.
-3. Overload choice between `f(C&)` and `f(const C&)` for a `const C&` call result picks `C&` (exit 22); clang picks `const C&`. Repro: rev_t47_r2_constcopy.cb, with rev_t47_r2_axes.cpp as the oracle.
+1. Wrong code: a reference member in a BASE class, positional init: `struct B { int& r; }; struct D : B { int v; };`
+   `D d = { { x }, 5 }` does not make d.r alias x (master and REFMEM exit 1, clang 0).
+   Attempt REFBASE (branch fix/refbase, b1f84a38e, parked 2026-10-28; review in its worktree scratch/briefs/refbase_review1.md)
+   fixed single/multi/nested bases but regressed an empty base clause `{ { }, x, 5 }` (`{}` parses without initializerList(),
+   so it is not seen as a base -> dangling ref) and mapped derived fields as elementIndex - baseCount, wrong when a later base
+   is brace-elided. Next: one flattened-field cursor (braced base clause advances by the base's flattened field count, elided
+   clause by 1) and detect a braced clause by its `{` token.
+2. A function-reference member is refused: "'__c_fn_ptr' has no C++ spelling" (the wrapper parameter spelling for function
+   references exists but is unreachable).
+3. Refused contexts (clear diagnostics; clang accepts): designated C++ aggregate with reference members as a global, as
+   `return { r = x }`, as a call argument `f({ r = x })`, as a CFlat struct field initializer; named fields inside array
+   elements (`{ a = { { r = x, v = 1 }, ... } }`); a bare `nullptr` element ("brace-list element type '' has no C++ spelling").
+4. Call-argument C++ temporaries are destroyed in construction order; clang destroys them in reverse:
+   `int z = pick(C(1), C(2)).v;` -> order 12, clang 21.
 
-Fix direction: item 1 is in the designated-initializer path for C++ records. Items 2 and 3 should carry `const` provenance from the referent type: the array element for item 2, and the call result into overload ranking for item 3.
-
-## T104 run (2026-10-10)
-
-Item 2 passes in this worktree. The new const-array write error leg rejects the store on both cold and warm
-header caches; the master executable accepts it. Item 3 (C3, const C& call result overload) is OPEN and its code was reverted. A candidate-loop guard (class reference
-parameter vs const-referent argument, LLVMBackend_Overloads.cpp) returned 2 for the call result, matching clang, but its
-parameter-side `!Pointer` term excludes class reference params (they carry Pointer=1); dropping that term makes the ctor wrapper
-`__cflat_ctor_*` for std::error_code(int, const error_category&) reject its param (wrapper spelling loses const:
-`std::error_category &`), regressing std/std_11_errors_regex. Fix the ctor wrapper param spelling first, then re-apply
-the guard. Probe: scratch/m104a.cb. Item 1 (designated aggregate initialization) was not attempted and remains active.
+Fix direction: item 1 in the positional brace wrapper's base-subobject lowering (reference target metadata for base fields);
+item 4 in the full-expression temp ledger flush order.

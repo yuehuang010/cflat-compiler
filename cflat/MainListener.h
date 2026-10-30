@@ -2541,6 +2541,7 @@ struct EnclosingAggregateLookupScope
 {
     std::string Name;
     antlr4::ParserRuleContext* Definition = nullptr;
+    bool NameIsResolved = false;
 };
 
 static std::string NamespaceNameFromContext(
@@ -2742,22 +2743,7 @@ static std::string ResolveContextualTypeName(LLVMBackend* compiler,
 static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesForCall(
     LLVMBackend* compiler, antlr4::tree::ParseTree* node)
 {
-    auto scopes = EnclosingAggregateScopesFromContext(compiler, node);
-    if (compiler == nullptr || scopes.empty()) return scopes;
-    const auto* function = compiler->GetCurrentFunctionSymbol();
-    if (function == nullptr) return scopes;
-
-    std::string owner;
-    if (function->IsMethod && !function->Parameters.empty())
-        owner = function->Parameters.front().TypeName;
-    if (owner.empty())
-    {
-        const size_t dot = function->SourceName.rfind('.');
-        if (dot != std::string::npos) owner = function->SourceName.substr(0, dot);
-    }
-    if (!owner.empty() && compiler->IsDataStructure(owner))
-        scopes.front().Name = owner;
-    return scopes;
+    return EnclosingAggregateScopesFromContext(compiler, node);
 }
 
 static std::vector<EnclosingAggregateLookupScope> EnclosingAggregateScopesFromName(
@@ -7458,6 +7444,8 @@ private:
     // and the last lambda's TypeAndValue (side-channel from ParsePrimaryExpression to ParsePostfixExpression).
     LLVMBackend::TypeAndValue lambdaExpectedType;
     LLVMBackend::TypeAndValue lastLambdaType;
+    std::string lambdaEnclosingAggregateOwner_;
+    std::string fieldDefaultAggregateOwner_;
     // Destination type of the initializer/assignment being evaluated, for ANY type - not just a
     // function pointer. An immediately-invoked lambda literal reads its return type from here
     // instead of inheriting the enclosing literal's. Empty (and never "auto") when no context.
@@ -8443,6 +8431,9 @@ public:
     // Template key for a generic method called on a receiver ("Holder" + "get" -> "Holder.get"),
     // or "" when the receiver's type declares no such template.
     std::string GenericMethodTemplateKey(const std::string& receiverType, const std::string& methodName);
+    std::string LexicalAggregateMemberOwner(LLVMBackend* compiler,
+        const std::vector<EnclosingAggregateLookupScope>& aggregateScopes, const std::string& memberName,
+        const std::string& preferredOwner, antlr4::ParserRuleContext* callContext);
 
     // True when the child right after `child` is a '.' - i.e. the primary is used as a member
     // qualifier (`Holder<i64>.sget(...)`) rather than being called or indexed.
@@ -8817,7 +8808,8 @@ public:
         const LLVMBackend::DeclTypeAndValue& returnType,
         const std::vector<LLVMBackend::DeclTypeAndValue>& params,
         bool varargs,
-        size_t line);
+        size_t line,
+        bool isMethod = false);
 
     // Tri-state evaluate an `if const` condition for the active instantiation WITHOUT emitting
     // code: 1 (taken), 0 (not taken), -1 (not a compile-time constant / cannot decide). A valid
@@ -11771,7 +11763,9 @@ public:
         const std::vector<CFlatParser::FunctionDefinitionContext*>& functionList,
         const std::string& baseName,
         const std::string& structName,
-        const LLVMBackend::TypeAndValue& returnType);
+        const LLVMBackend::TypeAndValue& returnType,
+        bool staticOnly = false,
+        bool skipStatic = false);
 
     // The program-owned inbox/outbox channel is always arena_channel<IMessage>.
     static std::string ArenaChannelTypeName(const LLVMBackend& compiler)

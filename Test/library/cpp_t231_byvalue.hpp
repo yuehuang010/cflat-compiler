@@ -19,6 +19,32 @@ public:
     inline ~Cnt() noexcept { v = -99; ++dtors; }
     int v;
 };
+class FpabiR2NT
+{
+public:
+    static inline volatile int selectSecond = 0;
+    inline explicit FpabiR2NT(int x) noexcept : v(x) {}
+    inline FpabiR2NT(const FpabiR2NT& o) noexcept : v(o.v) {}
+    inline ~FpabiR2NT() noexcept {}
+    int v;
+};
+
+using FpabiR3ShortFn = short (*)(int);
+using FpabiR3CharFn = char (*)(int);
+using FpabiR3UCharFn = unsigned char (*)(int);
+using FpabiR3BoolFn = bool (*)(int);
+inline FpabiR3ShortFn fpabiR3SavedShort = nullptr;
+inline int fpabiR3CallShort(FpabiR3ShortFn f, int x) { return (int)f(x); }
+inline void fpabiR3StoreShort(FpabiR3ShortFn f) { fpabiR3SavedShort = f; }
+inline int fpabiR3CallSavedShort(int x) { return (int)fpabiR3SavedShort(x); }
+inline int fpabiR3ReturnedWhich = 0;
+inline short fpabiR3CppShort(int x) { fpabiR3ReturnedWhich = 8; return (short)x; }
+inline FpabiR3ShortFn fpabiR3GetShort() { return fpabiR3CppShort; }
+inline int fpabiR3GetReturnedWhich() { return fpabiR3ReturnedWhich; }
+inline int fpabiR3CallChar(FpabiR3CharFn f, int x) { return (int)f(x); }
+inline int fpabiR3CallUChar(FpabiR3UCharFn f, int x) { return (int)f(x); }
+inline int fpabiR3CallBool(FpabiR3BoolFn f, int x) { return f(x) ? 1 : 0; }
+
 // By-value free result and by-value free parameter.
 inline Cnt make(int x) noexcept { return Cnt(x); }
 inline int readc(Cnt x) noexcept { return x.v; }

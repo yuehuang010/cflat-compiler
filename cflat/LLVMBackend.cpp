@@ -5110,6 +5110,7 @@ void LLVMBackend::ResetForReanalysis()
 {
     JoinCHeaderDiskCacheWriters();
     EndActiveRoot();
+    lexicalAggregateMemberNameCache_.clear();
     ownFlagControlPath_.clear();
     ownFlagControlKind_.clear();
     nextOwnFlagControlFrameId_ = 1;

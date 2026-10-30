@@ -1600,13 +1600,19 @@ void MainListener::PreDeclareInstantiationMembers(
         const std::vector<CFlatParser::FunctionDefinitionContext*>& functionList,
         const std::string& baseName,
         const std::string& structName,
-        const LLVMBackend::TypeAndValue& returnType) {
+        const LLVMBackend::TypeAndValue& returnType,
+        bool staticOnly,
+        bool skipStatic) {
         for (auto func : functionList)
         {
             if (IsReturnBlockFunction(func)) continue;
             if (func->genericTypeParameters() != nullptr) continue;
 
             std::string funcName = getFunctionName(func, compiler);
+            const bool isStaticFunc = isFunctionStatic(func);
+            if ((staticOnly && (!FunctionDeclaresReturnType(func) || !isStaticFunc))
+                || (skipStatic && isStaticFunc))
+                continue;
 
             // Constructor overload - pre-declare without this* parameter.
             // A zero-arg ctor has a null parameterTypeList; ParseParameterTypeList
@@ -1630,7 +1636,6 @@ void MainListener::PreDeclareInstantiationMembers(
                                 || funcName == "operator delete"
                                 || funcName == "operator string"
                                 || funcName == "operator bool");
-            bool isStaticFunc = isFunctionStatic(func);
             bool isStaticLike = isOperatorFunc || isStaticFunc;
             std::string declName = isStaticLike ? (structName + "." + funcName) : funcName;
 
@@ -1669,6 +1674,23 @@ void MainListener::PreDeclareInstantiationMembers(
                         ReturnsParameterBorrow(func, declAllParams, returnIfConst),
                         ReturnsSingleParameterIndex(func, declAllParams, returnIfConst));
                 }
+
+            // Generic instantiations bypass ForwardRefScanner, so declare default wrappers now.
+            int firstDefault = -1;
+            for (int i = 0; i < static_cast<int>(declParams.size()); ++i)
+                if (declParams[i].DefaultValue != nullptr)
+                {
+                    firstDefault = i;
+                    break;
+                }
+            for (int cutoff = firstDefault; firstDefault >= 0
+                && cutoff < static_cast<int>(declAllParams.size()); ++cutoff)
+            {
+                std::vector<LLVMBackend::TypeAndValue> wrapperParams(
+                    declAllParams.begin(), declAllParams.begin() + cutoff);
+                compiler->CreateFunctionDeclaration(declName, declReturnType,
+                    wrapperParams, false, false, false, !isStaticLike);
+            }
         }
     }
 

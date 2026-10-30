@@ -221,3 +221,16 @@ long long t77_c_short(struct T77Big s, short v) { return (long long)v * 2 + s.a;
 unsigned long long t77_c_ushort(struct T77Big s, unsigned short v) { return (unsigned long long)v + (unsigned long long)s.a; }
 t77_sfn  t77_get_short(void)  { return t77_c_short; }
 t77_ufn  t77_get_ushort(void) { return t77_c_ushort; }
+
+typedef short (*t77_cb_short)(struct T77Big);
+typedef char (*t77_cb_char)(struct T77Big);
+typedef unsigned char (*t77_cb_uchar)(struct T77Big);
+typedef unsigned short (*t77_cb_ushort)(struct T77Big);
+typedef _Bool (*t77_cb_bool)(struct T77Big);
+long long t77_call_cb_short(t77_cb_short f, struct T77Big b) { return f(b); }
+long long t77_call_cb_char(t77_cb_char f, struct T77Big b) { return f(b); }
+long long t77_call_cb_uchar(t77_cb_uchar f, struct T77Big b) { return f(b); }
+long long t77_call_cb_ushort(t77_cb_ushort f, struct T77Big b) { return f(b); }
+long long t77_call_cb_bool(t77_cb_bool f, struct T77Big b) { return f(b); }
+typedef short (*t77_cb_short_int)(int);
+long long t77_call_cb_short_int(t77_cb_short_int f, int value) { return f(value); }

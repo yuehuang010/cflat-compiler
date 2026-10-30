@@ -3961,6 +3961,8 @@ private:
     std::unordered_set<std::string> companionFunctionNames_;
 
     std::vector<StackState> stackNamedVariable;
+    std::unordered_map<const antlr4::ParserRuleContext*, std::unordered_set<std::string>>
+        lexicalAggregateMemberNameCache_;
     uint64_t nextDeclSequence = 1;
     // Per-llvm::Function move-event log (move-dataflow). Appended in emission
     // order; consumed and cleared by RunMoveDataflow. Cleared by ResetForReanalysis.
@@ -7436,7 +7438,12 @@ private:
                                           std::string& wrapperName,
                                           std::string& error,
                                           bool allowIncremental = true,
-                                          std::vector<size_t>* forwardedElementIndices = nullptr);
+                                          std::vector<size_t>* forwardedElementIndices = nullptr,
+                                          const std::vector<std::string>* elementTargetTypes = nullptr);
+    bool CxxRecordFieldTypeSpelling(const std::string& typeName,
+                                    const std::string& fieldName,
+                                    std::string& spelling,
+                                    bool* isReference = nullptr) const;
     // copyInit: the wrapper copy-initializes (`T t = arg;`), so an explicit constructor is
     // never a candidate - the form every IMPLICIT conversion site must use.
     // Converts each scalar argument of a generated constructor thunk call into the thunk's own
@@ -11524,10 +11531,10 @@ public:
     // Which sub-32-bit integers the target ABI makes the caller extend (clang parity).
     enum class NarrowIntExtPolicy { None, BoolOnly, All };
     NarrowIntExtPolicy GetNarrowIntExtPolicy() const;
-    // Call-site signext/zeroext on an indirect (thin function<>) call; `params` pairs an LLVM
-    // argument index with its CFlat parameter type.
+    // Call-site signext/zeroext on a thin function<> call; params pair lowered indices with types.
     void ApplyNarrowIntExtCallAttrs(llvm::CallBase* call,
-                                    const std::vector<std::pair<unsigned, TypeAndValue>>& params);
+                                    const std::vector<std::pair<unsigned, TypeAndValue>>& params,
+                                    const TypeAndValue* returnType = nullptr);
 
     // Number of LLVM params a param slot lowers to (CoercePair -> 2, everything else -> 1).
     static unsigned SlotLLVMParamCount(const AbiSlot& s);

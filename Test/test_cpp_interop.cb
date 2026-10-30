@@ -431,6 +431,18 @@ import cpp "library/cpp_t46_smartdot.hpp";
 import cpp "library/cpp_interop_uniqueptr.h";
 import cpp "library/cpp_t492_fieldmove.hpp";
 
+int fpabiR2Which = 0;
+short fpabiR2H(cppbv.FpabiR2NT n) { fpabiR2Which = 1; return (short)n.v; }
+short fpabiR2H2(cppbv.FpabiR2NT n) { fpabiR2Which = 2; return (short)(n.v + 1); }
+
+int fpabiR3Which = 0;
+short fpabiR3H(int x) { fpabiR3Which = 1; return (short)x; }
+short fpabiR3H2(int x) { fpabiR3Which = 2; return (short)(x + 1); }
+char fpabiR3Char(int x) { fpabiR3Which = 5; return (char)x; }
+u8 fpabiR3UChar(int x) { fpabiR3Which = 6; return (u8)x; }
+bool fpabiR3Bool(int x) { fpabiR3Which = 7; return x != 0; }
+struct FpabiR3FnBox { function<short(int)> f = default; };
+
 std.optional<std.string> t9MakeStringOptional()
 { return std.optional<std.string>(std.string("xyz")); }
 
@@ -2975,8 +2987,93 @@ int T513V14Probe(bool k, int input)
     return t513V14Value * 10000 + t513V10Stats();
 }
 
+int t47RefmemChurn(int a)
+{
+    int[8] slots = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    for (int i = 0; i < 8; i++) slots[i] = a + i;
+    return slots[7];
+}
+
+using T47RefMemConstAlias = cppref.BraceConstRef;
+
+int t47RefmemEarlyReturn()
+{
+    int before = cppref.refmem_lifetime_dtor_count();
+    cppref.RefMemLifetimeConstRef holder = { c = cppref.RefMemLifetimeValue(5) };
+    int inside = cppref.refmem_lifetime_dtor_count() - before;
+    return inside * 100 + (holder.c.v == 5 ? 0 : 1);
+}
+
 extern int main()
 {
+    // FPABI r3: C++ function-pointer parameters require C ABI entries for thin CFlat callbacks.
+    int fpabiR3Input = 0x14001;
+    int fpabiR3Named = cppbv.fpabiR3CallShort(fpabiR3H, fpabiR3Input);
+    if (fpabiR3Named != 16385 || fpabiR3Which != 1) return 52611;
+
+    cppbv.FpabiR2NT.selectSecond = 0;
+    function<short(int)> fpabiR3Local =
+        cppbv.FpabiR2NT.selectSecond > 5 ? fpabiR3H2 : fpabiR3H;
+    int fpabiR3Expected = cppbv.FpabiR2NT.selectSecond > 5 ? 16386 : 16385;
+    int fpabiR3ExpectedWhich = cppbv.FpabiR2NT.selectSecond > 5 ? 2 : 1;
+    fpabiR3Which = 0;
+    int fpabiR3LocalValue = cppbv.fpabiR3CallShort(fpabiR3Local, fpabiR3Input);
+    if (fpabiR3LocalValue != fpabiR3Expected || fpabiR3Which != fpabiR3ExpectedWhich)
+        return 52612;
+
+    FpabiR3FnBox fpabiR3Box = { f = fpabiR3Local };
+    fpabiR3Which = 0;
+    int fpabiR3FieldValue = cppbv.fpabiR3CallShort(fpabiR3Box.f, fpabiR3Input);
+    if (fpabiR3FieldValue != fpabiR3Expected || fpabiR3Which != fpabiR3ExpectedWhich)
+        return 52613;
+
+    function<short(int)> fpabiR3Lambda = (int x) => {
+        fpabiR3Which = 4;
+        return (short)x;
+    };
+    fpabiR3Which = 0;
+    int fpabiR3LambdaValue = cppbv.fpabiR3CallShort(fpabiR3Lambda, fpabiR3Input);
+    if (fpabiR3LambdaValue != 16385 || fpabiR3Which != 4) return 52614;
+
+    fpabiR3Which = 0;
+    int fpabiR3DirectLambdaValue = cppbv.fpabiR3CallShort(
+        (int x) => { fpabiR3Which = 4; return (short)x; }, fpabiR3Input);
+    if (fpabiR3DirectLambdaValue != 16385 || fpabiR3Which != 4) return 52615;
+
+    cppbv.fpabiR3StoreShort(fpabiR3Local);
+    fpabiR3Which = 0;
+    int fpabiR3StoredValue = cppbv.fpabiR3CallSavedShort(fpabiR3Input);
+    if (fpabiR3StoredValue != fpabiR3Expected || fpabiR3Which != fpabiR3ExpectedWhich)
+        return 52616;
+
+    function<short(int)> fpabiR3Returned = cppbv.fpabiR3GetShort();
+    int fpabiR3ReturnedValue = fpabiR3Returned(fpabiR3Input);
+    if (fpabiR3ReturnedValue != 16385 || cppbv.fpabiR3GetReturnedWhich() != 8)
+        return 52617;
+
+    fpabiR3Which = 0;
+    int fpabiR3CharValue = cppbv.fpabiR3CallChar(fpabiR3Char, 0x181);
+    if (fpabiR3CharValue != -127 || fpabiR3Which != 5) return 52618;
+    fpabiR3Which = 0;
+    int fpabiR3UCharValue = cppbv.fpabiR3CallUChar(fpabiR3UChar, 0x181);
+    if (fpabiR3UCharValue != 129 || fpabiR3Which != 6) return 52619;
+    fpabiR3Which = 0;
+    int fpabiR3BoolValue = cppbv.fpabiR3CallBool(fpabiR3Bool, 1);
+    if (fpabiR3BoolValue != 1 || fpabiR3Which != 7) return 52620;
+
+    // FPABI r2: the thin pointer keeps the natural signature around this nontrivial C++ class.
+    cppbv.FpabiR2NT fpabiR2Value = cppbv.FpabiR2NT(0x14001);
+    function<short(cppbv.FpabiR2NT)> fpabiR2Callback =
+        cppbv.FpabiR2NT.selectSecond > 5 ? fpabiR2H2 : fpabiR2H;
+    fpabiR2Which = 0;
+    short fpabiR2First = fpabiR2Callback(fpabiR2Value);
+    if (fpabiR2First != 16385 || fpabiR2Which != 1) return 52601;
+    cppbv.FpabiR2NT.selectSecond = 6;
+    fpabiR2Callback = cppbv.FpabiR2NT.selectSecond > 5 ? fpabiR2H2 : fpabiR2H;
+    fpabiR2Which = 0;
+    short fpabiR2Second = fpabiR2Callback(fpabiR2Value);
+    if (fpabiR2Second != 16386 || fpabiR2Which != 2) return 52602;
+
     T440TrivialCppUnion t440Trivial = { plain = { u = 47 } };
     if (t440Trivial.plain.u != 47) return 44001;
     T440ForwardTrivialUnion t440ForwardTrivial = { holder = { value = 48 } };
@@ -8939,6 +9036,169 @@ extern int main()
     // ---- C++ reference data members -------------------------------------------------------------
     // Before the fix every leg below except the RefDerived ones failed to COMPILE: a reference
     // member set a layout refusal, so the record was laid out with no fields at all.
+    // T47 accept-set: named initialization of an ordinary C++ aggregate keeps its values.
+    cppi.Pair t47PlainDesignated = { a = 2, b = 3 };
+    if (t47PlainDesignated.a * 10 + t47PlainDesignated.b != 23) return 47701;
+
+    // T47: scalar references bind to the original lvalue in named and positional brace forms.
+    int t47NamedRefValue = 7;
+    cppi.ReferenceField t47NamedRef = { value = t47NamedRefValue };
+    t47NamedRef.value = 8;
+    if (t47NamedRefValue != 8 || t47NamedRef.value != 8) return 47702;
+
+    int t47NamedDirectValue = 9;
+    cppi.ReferenceField t47NamedDirect { value = t47NamedDirectValue };
+    t47NamedDirect.value = 10;
+    if (t47NamedDirectValue != 10 || t47NamedDirect.value != 10) return 47703;
+
+    int t47PositionalRefValue = 11;
+    cppi.ReferenceField t47PositionalRef = { t47PositionalRefValue };
+    t47PositionalRef.value = 12;
+    if (t47PositionalRefValue != 12 || t47PositionalRef.value != 12) return 47704;
+
+    int t47PositionalDirectValue = 13;
+    cppi.ReferenceField t47PositionalDirect { t47PositionalDirectValue };
+    t47PositionalDirect.value = 14;
+    if (t47PositionalDirectValue != 14 || t47PositionalDirect.value != 14) return 47705;
+
+    // T47: array, pointer, and class references retain the identity of their named lvalue.
+    int t47ArrayOriginal = t104.constArray[1];
+    t104.ConstArrayRef t47ArrayRef = { r = t104.constArray };
+    t104.constArray[1] = 15;
+    if (t47ArrayRef.r[1] != 15) return 47706;
+    t104.constArray[1] = t47ArrayOriginal;
+
+    int t47PtrFirst = 16;
+    int t47PtrSecond = 17;
+    int* t47Ptr = &t47PtrFirst;
+    cppalias.PtrRef t47PointerRef = { p = t47Ptr };
+    t47PointerRef.p = &t47PtrSecond;
+    if (t47Ptr != &t47PtrSecond) return 47707;
+
+    int t47GnOriginal = cppalias.gn_value();
+    cppalias.gn = 18;
+    cppalias.BoxRef t47ClassRef = { b = cppalias.gbox };
+    t47ClassRef.b.set(19);
+    if (cppalias.gn_value() != 19 || t47ClassRef.b.get() != 19) return 47708;
+    cppalias.gn = t47GnOriginal;
+
+    // T47 r2 F1: literal-bound reference temporaries remain in the caller through stack use.
+    cppref.BraceConstRef t47LiteralNamed = { r = 5 };
+    if (t47RefmemChurn(100) != 107 || t47LiteralNamed.r != 5) return 47709;
+
+    cppref.BraceConstRef t47LiteralA = { r = 5 };
+    cppref.BraceConstRef t47LiteralB = { r = 6 };
+    if (t47RefmemChurn(100) != 107) return 47710;
+    if (&t47LiteralA.r == &t47LiteralB.r || t47LiteralA.r != 5 || t47LiteralB.r != 6)
+        return 47711;
+
+    cppref.BraceConstRef t47LiteralPos = { 5 };
+    if (t47RefmemChurn(100) != 107 || t47LiteralPos.r != 5) return 47712;
+    cppref.BraceRvalRef t47RvalLiteralNamed = { r = 5 };
+    if (t47RefmemChurn(100) != 107 || t47RvalLiteralNamed.r != 5) return 47713;
+    cppref.BraceRvalRef t47RvalLiteralPos = { 5 };
+    if (t47RefmemChurn(100) != 107 || t47RvalLiteralPos.r != 5) return 47714;
+
+    // T47 r2 F1 syntax and spelling neighbors: direct-list and aliased declarations.
+    cppref.BraceConstRef t47DirectConstNamed { r = 5 };
+    if (t47RefmemChurn(100) != 107 || t47DirectConstNamed.r != 5) return 47715;
+    cppref.BraceConstRef t47DirectConstPos { 5 };
+    if (t47RefmemChurn(100) != 107 || t47DirectConstPos.r != 5) return 47716;
+    cppref.BraceRvalRef t47DirectRvalNamed { r = 5 };
+    if (t47RefmemChurn(100) != 107 || t47DirectRvalNamed.r != 5) return 47717;
+    cppref.BraceRvalRef t47DirectRvalPos { 5 };
+    if (t47RefmemChurn(100) != 107 || t47DirectRvalPos.r != 5) return 47718;
+    T47RefMemConstAlias t47LiteralAlias = { r = 5 };
+    if (t47RefmemChurn(100) != 107 || t47LiteralAlias.r != 5) return 47719;
+
+    // T47 r2 F2: `move x` is an xvalue when bound to an int&& reference member.
+    int t47RvalX = 5;
+    int* t47RvalSaved = &t47RvalX;
+    cppref.BraceRvalRef t47RvalNamedMove = { r = move t47RvalX };
+    t47RvalNamedMove.r = 9;
+    if (*t47RvalSaved != 9 || t47RvalNamedMove.r != 9) return 47720;
+    int t47RvalPosX = 6;
+    int* t47RvalPosSaved = &t47RvalPosX;
+    cppref.BraceRvalRef t47RvalPosMove = { move t47RvalPosX };
+    t47RvalPosMove.r = 10;
+    if (*t47RvalPosSaved != 10 || t47RvalPosMove.r != 10) return 47721;
+
+    // T47 r2 F3: the top-level aggregate reaches reference members through nested fields.
+    int t47NestedX = 5;
+    cppref.BraceRefOuter t47Nested = { m = { r = t47NestedX, v = 2 }, k = 7 };
+    t47Nested.m.r = 9;
+    if (t47NestedX != 9 || t47Nested.m.v != 2 || t47Nested.m.d != 0.0 || t47Nested.k != 7)
+        return 47722;
+    int t47DeepX = 6;
+    cppref.BraceRefDeep t47Deep = { o = { m = { r = t47DeepX, v = 3 }, k = 8 } };
+    t47Deep.o.m.r = 10;
+    if (t47DeepX != 10 || t47Deep.o.m.v != 3 || t47Deep.o.m.d != 0.0 || t47Deep.o.k != 8)
+        return 47723;
+
+    // T47 r3 F4: class prvalues bound to C++ reference members live through the aggregate local.
+    cppref.reset_refmem_lifetime_counts();
+    int t47ClassRefInside = -1; int t47ClassRefValue = 0;
+    {
+        cppref.RefMemLifetimeConstRef t47ClassRefNamed = {
+            c = cppref.RefMemLifetimeValue(3) };
+        t47ClassRefInside = cppref.refmem_lifetime_dtor_count();
+        t47RefmemChurn(99);
+        t47ClassRefValue = t47ClassRefNamed.c.v;
+    }
+    if (t47ClassRefInside != 0 || cppref.refmem_lifetime_dtor_count() != 1
+        || t47ClassRefValue != 3 || cppref.refmem_lifetime_ctor_count() != 1
+        || cppref.refmem_lifetime_copy_count() != 0 || cppref.refmem_lifetime_move_count() != 0)
+        return 47724;
+
+    cppref.reset_refmem_lifetime_counts();
+    t47ClassRefInside = -1; t47ClassRefValue = 0;
+    {
+        cppref.RefMemLifetimeConstRef t47ClassRefPositional = {
+            cppref.RefMemLifetimeValue(4) };
+        t47ClassRefInside = cppref.refmem_lifetime_dtor_count();
+        t47RefmemChurn(99);
+        t47ClassRefValue = t47ClassRefPositional.c.v;
+    }
+    if (t47ClassRefInside != 0 || cppref.refmem_lifetime_dtor_count() != 1
+        || t47ClassRefValue != 4 || cppref.refmem_lifetime_ctor_count() != 1
+        || cppref.refmem_lifetime_copy_count() != 0 || cppref.refmem_lifetime_move_count() != 0)
+        return 47725;
+
+    cppref.reset_refmem_lifetime_counts();
+    t47ClassRefInside = -1; t47ClassRefValue = 0;
+    {
+        cppref.RefMemLifetimeRvalueRef t47ClassRvalueNamed = {
+            c = cppref.RefMemLifetimeValue(6) };
+        t47ClassRefInside = cppref.refmem_lifetime_dtor_count();
+        t47RefmemChurn(99);
+        t47ClassRefValue = t47ClassRvalueNamed.c.v;
+    }
+    if (t47ClassRefInside != 0 || cppref.refmem_lifetime_dtor_count() != 1
+        || t47ClassRefValue != 6 || cppref.refmem_lifetime_ctor_count() != 1
+        || cppref.refmem_lifetime_copy_count() != 0 || cppref.refmem_lifetime_move_count() != 0)
+        return 47726;
+
+    cppref.reset_refmem_lifetime_counts();
+    t47ClassRefInside = -1; t47ClassRefValue = 0;
+    {
+        cppref.RefMemLifetimeRvalueRef t47ClassRvaluePositional = {
+            cppref.RefMemLifetimeValue(7) };
+        t47ClassRefInside = cppref.refmem_lifetime_dtor_count();
+        t47RefmemChurn(99);
+        t47ClassRefValue = t47ClassRvaluePositional.c.v;
+    }
+    if (t47ClassRefInside != 0 || cppref.refmem_lifetime_dtor_count() != 1
+        || t47ClassRefValue != 7 || cppref.refmem_lifetime_ctor_count() != 1
+        || cppref.refmem_lifetime_copy_count() != 0 || cppref.refmem_lifetime_move_count() != 0)
+        return 47727;
+
+    cppref.reset_refmem_lifetime_counts();
+    int t47EarlyReturnValue = t47RefmemEarlyReturn();
+    if (t47EarlyReturnValue != 0 || cppref.refmem_lifetime_dtor_count() != 1
+        || cppref.refmem_lifetime_ctor_count() != 1 || cppref.refmem_lifetime_copy_count() != 0
+        || cppref.refmem_lifetime_move_count() != 0)
+        return 47728;
+
     int refmemX = 5;
     cppref.RefHolder refmemH = cppref.make_ref(&refmemX);      // by-value return of the record
     if (refmemH.get() != 5)                             return 1850;

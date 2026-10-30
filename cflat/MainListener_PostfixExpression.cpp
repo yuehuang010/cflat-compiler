@@ -5,6 +5,213 @@
 #include <functional>
 #include <limits>
 
+static std::string ParentAggregateOwnerName(const std::string& owner)
+{
+    size_t parentDot = std::string::npos;
+    int genericDepth = 0;
+    for (size_t i = 0; i < owner.size(); i++)
+    {
+        if (owner[i] == '<') ++genericDepth;
+        else if (owner[i] == '>' && genericDepth > 0) --genericDepth;
+        else if (owner[i] == '.' && genericDepth == 0) parentDot = i;
+    }
+    return parentDot == std::string::npos ? std::string{} : owner.substr(0, parentDot);
+}
+
+static std::string DeclaredIdentifier(CFlatParser::DeclaratorContext* declarator)
+{
+    auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+    while (direct != nullptr)
+    {
+        if (direct->Identifier() != nullptr) return direct->Identifier()->getText();
+        declarator = direct->declarator();
+        direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+    }
+    return {};
+}
+
+static bool DeclarationDeclaresNonStaticMember(CFlatParser::DeclarationContext* declaration,
+        const std::string& name)
+{
+    if (declaration == nullptr || declaration->initDeclaratorList() == nullptr
+        || declaration->declarationSpecifiers() == nullptr)
+        return false;
+    for (auto* specifier : declaration->declarationSpecifiers()->declarationSpecifier())
+        if (specifier != nullptr && specifier->storageClassSpecifier() != nullptr)
+            return false;
+    for (auto* item : declaration->initDeclaratorList()->initDeclarator())
+        if (item != nullptr && DeclaredIdentifier(item->declarator()) == name)
+            return true;
+    return false;
+}
+
+std::string MainListener::LexicalAggregateMemberOwner(LLVMBackend* compiler,
+        const std::vector<EnclosingAggregateLookupScope>& aggregateScopes, const std::string& memberName,
+        const std::string& preferredOwner, antlr4::ParserRuleContext* callContext)
+{
+    auto addDeclarationNames = [](CFlatParser::DeclarationContext* declaration,
+                                  std::unordered_set<std::string>& names)
+    {
+        if (declaration == nullptr || declaration->initDeclaratorList() == nullptr) return;
+        for (auto* item : declaration->initDeclaratorList()->initDeclarator())
+            if (item != nullptr)
+                if (std::string name = DeclaredIdentifier(item->declarator()); !name.empty())
+                    names.insert(std::move(name));
+    };
+
+    auto definitionHasMember = [&](const EnclosingAggregateLookupScope& scope)
+    {
+        if (scope.Definition == nullptr) return false;
+        auto [cached, inserted] = compiler->lexicalAggregateMemberNameCache_.try_emplace(scope.Definition);
+        if (inserted)
+        {
+            auto collectMembers = [&](const auto& members)
+            {
+                for (auto* member : members)
+                {
+                    if (member->declaration() != nullptr)
+                        addDeclarationNames(member->declaration(), cached->second);
+                    if (auto* function = member->functionDefinition(); function != nullptr)
+                        cached->second.insert(getFunctionName(function));
+                    if (auto* lockGroup = member->lockFieldGroup(); lockGroup != nullptr)
+                    {
+                        for (auto* declaration : lockGroup->declaration())
+                            addDeclarationNames(declaration, cached->second);
+                        for (auto* function : lockGroup->functionDefinition())
+                            cached->second.insert(getFunctionName(function));
+                    }
+                }
+            };
+            if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(scope.Definition))
+                collectMembers(structure->aggregateMember());
+            else if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(scope.Definition))
+                collectMembers(classDefinition->aggregateMember());
+        }
+        return cached->second.find(memberName) != cached->second.end();
+    };
+
+    auto hasGenericAggregateAncestor = [](const EnclosingAggregateLookupScope& scope)
+    {
+        for (antlr4::tree::ParseTree* node = scope.Definition; node != nullptr; node = node->parent)
+        {
+            if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(node);
+                structure != nullptr && structure->genericTypeParameters() != nullptr)
+                return true;
+            if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(node);
+                classDefinition != nullptr && classDefinition->genericTypeParameters() != nullptr)
+                return true;
+        }
+        return false;
+    };
+
+    auto registeredOwnerDeclaresMember = [&](const std::string& owner)
+    {
+        if (owner.empty()) return false;
+        if (!GenericMethodTemplateKey(owner, memberName).empty()) return true;
+        const std::string qualifiedName = owner + "." + memberName;
+        if (auto methods = compiler->functionTable.find(qualifiedName);
+            methods != compiler->functionTable.end() && !methods->second.empty())
+            return true;
+        if (auto methods = compiler->functionTable.find(memberName);
+            methods != compiler->functionTable.end()
+            && std::any_of(methods->second.begin(), methods->second.end(), [&](const auto& method)
+            {
+                return method.IsMethod && !method.Parameters.empty()
+                    && method.Parameters.front().TypeName == owner;
+            }))
+            return true;
+        const auto data = compiler->dataStructures.find(owner);
+        if (data == compiler->dataStructures.end()) return false;
+        return std::any_of(data->second.StructFields.begin(), data->second.StructFields.end(),
+                [&](const auto& field) { return field.VariableName == memberName; })
+            || std::any_of(data->second.Bitfields.begin(), data->second.Bitfields.end(),
+                [&](const auto& field) { return field.Name == memberName; });
+    };
+
+    if (aggregateScopes.empty()) return preferredOwner;
+    const bool anyScopeDeclaresMember = registeredOwnerDeclaresMember(preferredOwner)
+        || std::any_of(aggregateScopes.begin(), aggregateScopes.end(), [&](const auto& scope)
+        {
+            return definitionHasMember(scope) || registeredOwnerDeclaresMember(scope.Name);
+        });
+    if (!anyScopeDeclaresMember) return preferredOwner;
+
+    std::vector<EnclosingAggregateLookupScope> resolvedScopes = aggregateScopes;
+    bool nearestScopeIsGeneric = false;
+    for (auto scope = aggregateScopes.rbegin(); scope != aggregateScopes.rend(); ++scope)
+    {
+        if (scope->Definition == nullptr) continue;
+        if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(scope->Definition))
+            nearestScopeIsGeneric = structure->genericTypeParameters() != nullptr;
+        else if (auto* classDefinition = dynamic_cast<CFlatParser::ClassDefinitionContext*>(scope->Definition))
+            nearestScopeIsGeneric = classDefinition->genericTypeParameters() != nullptr;
+        break;
+    }
+    auto ownerFromFunction = [&](const LLVMBackend::FunctionSymbol* function)
+    {
+        if (function == nullptr) return std::string{};
+        std::string owner;
+        if (function->IsMethod && !function->Parameters.empty())
+            owner = function->Parameters.front().TypeName;
+        if (owner.empty())
+        {
+            const size_t dot = function->SourceName.rfind('.');
+            if (dot != std::string::npos) owner = function->SourceName.substr(0, dot);
+        }
+        return !owner.empty() && (compiler->IsDataStructure(owner) || nearestScopeIsGeneric)
+            ? owner : std::string{};
+    };
+    std::string currentOwner = fieldDefaultAggregateOwner_;
+    const bool fieldDefaultOwnerKnown = !currentOwner.empty();
+    if (currentOwner.empty()) currentOwner = lambdaEnclosingAggregateOwner_;
+    if (currentOwner.empty()) currentOwner = ownerFromFunction(compiler->GetCurrentFunctionSymbol());
+    if (!currentOwner.empty() && (fieldDefaultOwnerKnown || compiler->IsDataStructure(currentOwner)
+        || nearestScopeIsGeneric))
+    {
+        std::string owner = currentOwner;
+        for (size_t i = 0; i < resolvedScopes.size(); i++)
+        {
+            auto& scope = resolvedScopes[i];
+            if (scope.Definition == nullptr || owner.empty()) continue;
+            scope.Name = owner;
+            scope.NameIsResolved = true;
+            owner = ParentAggregateOwnerName(owner);
+        }
+    }
+
+    auto declaresMember = [&](const std::string& owner, const EnclosingAggregateLookupScope* scope)
+    {
+        if (owner.empty()) return false;
+        const auto data = compiler->dataStructures.find(owner);
+        const bool ownerRegistered = data != compiler->dataStructures.end();
+        if (!currentOwner.empty() && !ownerRegistered && (scope == nullptr || !scope->NameIsResolved)
+            && scope != nullptr && hasGenericAggregateAncestor(*scope)
+            && definitionHasMember(*scope))
+            LogErrorContext(callContext != nullptr ? callContext : scope->Definition,
+                std::format("cannot resolve '{}' through an uninstantiated generic aggregate", memberName));
+        if (registeredOwnerDeclaresMember(owner)) return true;
+        return scope != nullptr && definitionHasMember(*scope);
+    };
+
+    std::string resolvedPreferredOwner = preferredOwner;
+    if (!resolvedScopes.empty() && resolvedScopes.front().Definition != nullptr
+        && (preferredOwner.empty() || (!aggregateScopes.empty()
+            && preferredOwner == aggregateScopes.front().Name)))
+        resolvedPreferredOwner = resolvedScopes.front().Name;
+    const bool preferredIsFrontScope = !resolvedScopes.empty()
+        && resolvedPreferredOwner == resolvedScopes.front().Name;
+    if (!preferredIsFrontScope && declaresMember(resolvedPreferredOwner,
+            !resolvedScopes.empty() ? &resolvedScopes.front() : nullptr))
+        return resolvedPreferredOwner;
+    for (size_t i = 0; i < resolvedScopes.size(); i++)
+    {
+        const auto& scope = resolvedScopes[i];
+        if (declaresMember(scope.Name, &scope))
+            return scope.Name;
+    }
+    return preferredOwner;
+}
+
 static CFlatParser::PostfixExpressionContext* DirectPostfixArgument(
         CFlatParser::AssignmentExpressionContext* expression)
 {
@@ -5643,8 +5850,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     || field.Storage != nullptr || field.Primary != nullptr
                                     || field.BitfieldStorage != nullptr;
                                 const auto thisVar = compiler->GetThisPointer();
-                                const std::string methodOwner = !thisVar.TypeAndValue.TypeName.empty()
+                                std::string methodOwner = !thisVar.TypeAndValue.TypeName.empty()
                                     ? thisVar.TypeAndValue.TypeName : enclosingScope;
+                                std::vector<EnclosingAggregateLookupScope> lexicalAggregateScopes;
+                                for (const auto& scope : EnclosingAggregateScopesForCall(compiler, prevPrimary))
+                                    if (scope.Definition != nullptr)
+                                        lexicalAggregateScopes.push_back(scope);
+                                if (!hasVisibleValue)
+                                    methodOwner = LexicalAggregateMemberOwner(
+                                        compiler, lexicalAggregateScopes, baseName, methodOwner, ctx);
                                 const std::string methodTemplate = hasVisibleValue
                                     ? std::string()
                                     : GenericMethodTemplateKey(methodOwner, baseName);
@@ -5899,13 +6113,17 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             bool namesEnclosingMethod = false;
                             if (!localOrMemberVariable && followedByCall && !followedByDot)
                             {
-                                for (const auto& scope : EnclosingAggregateScopesForCall(
-                                         Compiler(ctx), parseTree))
-                                {
-                                    if (scope.Definition == nullptr) continue;
-                                    namesEnclosingMethod = HasCFlatMemberMethod(scope.Name, idName);
-                                    if (namesEnclosingMethod) break;
-                                }
+                                auto* compiler = Compiler(ctx);
+                                const auto scopes = EnclosingAggregateScopesForCall(compiler, parseTree);
+                                const auto thisVar = compiler->GetThisPointer();
+                                const std::string preferredOwner =
+                                    !thisVar.TypeAndValue.TypeName.empty()
+                                    ? thisVar.TypeAndValue.TypeName
+                                    : EnclosingAggregateScopeFromContext(compiler, parseTree);
+                                const std::string owner = LexicalAggregateMemberOwner(
+                                    compiler, scopes, idName, preferredOwner,
+                                    dynamic_cast<antlr4::ParserRuleContext*>(parseTree));
+                                namesEnclosingMethod = HasCFlatMemberMethod(owner, idName);
                             }
                             if (!namesEnclosingMethod
                                 && (Compiler(ctx)->IsNamespace(idName) || Compiler(ctx)->IsCxxNamespace(idName))
@@ -7192,12 +7410,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 };
                                 const auto thisVariable = compiler->GetThisPointer();
                                 std::string memberOwner = thisVariable.TypeAndValue.TypeName;
+                                const auto aggregateScopes = EnclosingAggregateScopesForCall(
+                                    compiler, primaryCtx);
                                 if (memberOwner.empty())
-                                {
-                                    const auto aggregateScopes = EnclosingAggregateScopesForCall(
-                                        compiler, primaryCtx);
-                                    if (!aggregateScopes.empty()) memberOwner = aggregateScopes.front().Name;
-                                }
+                                    memberOwner = EnclosingAggregateScopeFromContext(compiler, primaryCtx);
+                                memberOwner = LexicalAggregateMemberOwner(
+                                    compiler, aggregateScopes, bareName, memberOwner, primaryCtx);
                                 const bool hasImplicitMemberFunction = !memberOwner.empty()
                                     && (HasCFlatMemberMethod(memberOwner, bareName)
                                         || !GenericMethodTemplateKey(memberOwner, bareName).empty());
@@ -7235,13 +7453,20 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // `offsetof` is an ordinary identifier. Only an unshadowed bare call
                         // uses the intrinsic path; declarations and C++ macros keep normal lookup.
                         auto* compiler = Compiler(ctx);
+                        const bool hasResolvedFunction = functionName == "offsetof" && [&]
+                        {
+                            const std::string resolvedFunctionName =
+                                compiler->ResolveQualifiedName(functionName);
+                            return compiler->GetFunction(resolvedFunctionName) != nullptr
+                                || genericFunctionTemplates.count(resolvedFunctionName) != 0;
+                        }();
                         const bool offsetofShadowed = namedVar.Storage != nullptr || namedVar.Primary != nullptr
                             || structVar.BaseType != nullptr
                             || compiler->GetScopedLocalOrArgument("offsetof").Storage != nullptr
                             || compiler->GetFunctionArgument("offsetof").GetValue() != nullptr
                             || compiler->HasMemberVariable("offsetof")
                             || compiler->GetGlobalVariableNV("offsetof").Storage != nullptr
-                            || compiler->GetFunction("offsetof") != nullptr;
+                            || hasResolvedFunction;
                         if (functionName == "offsetof" && !offsetofShadowed
                             && ctx->children.size() == 4 && argumentList.size() == 1
                             && functionArgCounter == 0)
@@ -10595,6 +10820,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             BraceArgumentUnwindScope braceArgumentUnwind{ releaseBraceArgumentUnwinds };
                             LLVMBackend::NamedVariable implicitCallReceiver;
                             std::vector<std::string> lexicalAggregateScopes;
+                            std::vector<EnclosingAggregateLookupScope> lexicalAggregateOwnerScopes;
                             if (structVar.BaseType)
                             {
                                 // LoadNamedVariable is not called for receivers, so check here.
@@ -10623,11 +10849,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
                             }
                             if (!globalScopeCall && !callWasQualified && !structVar.BaseType
-                                && Compiler(ctx)->currentFunction != nullptr)
+                                && (Compiler(ctx)->currentFunction != nullptr
+                                    || !fieldDefaultAggregateOwner_.empty()))
                                 for (const auto& scope : EnclosingAggregateScopesForCall(
                                          Compiler(ctx), ctx))
                                     if (scope.Definition != nullptr)
+                                    {
                                         lexicalAggregateScopes.push_back(scope.Name);
+                                        lexicalAggregateOwnerScopes.push_back(scope);
+                                    }
 
                             // [PFX-7-slot] Resolved before [PFX-7] because the '?.' guard below must
                             // skip a COM slot call, which owns its own '?.'/HResult lowering.
@@ -13592,13 +13822,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     && (implicitCallReceiver.GetValue() != nullptr
                                         || !lexicalAggregateScopes.empty());
                                 bool implicitReceiverGenericMethod = false;
-                                if (bareImplicitCall && methodOwner.empty())
+                                if (bareImplicitCall && bareIdentifier != nullptr
+                                    && bareIdentifier->Identifier() != nullptr)
                                 {
                                     methodName = bareIdentifier->Identifier()->getText();
-                                    methodOwner = implicitCallReceiver.GetValue() != nullptr
-                                        ? implicitCallReceiver.TypeAndValue.TypeName
-                                        : lexicalAggregateScopes.front();
-                                    structTypeName = methodOwner;
+                                    if (methodOwner.empty())
+                                        methodOwner = implicitCallReceiver.GetValue() != nullptr
+                                            ? implicitCallReceiver.TypeAndValue.TypeName
+                                            : lexicalAggregateScopes.front();
                                     const auto pending = FindPendingCallVisibleLocal(
                                         Compiler(primaryCtx), methodName, primaryCtx);
                                     const auto local = Compiler(primaryCtx)->GetScopedLocalOrArgument(methodName);
@@ -13609,7 +13840,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         || field.Storage != nullptr || field.Primary != nullptr
                                         || field.BitfieldStorage != nullptr;
                                     if (!hasLexicalValue)
+                                    {
+                                        methodOwner = LexicalAggregateMemberOwner(
+                                            Compiler(primaryCtx), lexicalAggregateOwnerScopes,
+                                            methodName, methodOwner, primaryCtx);
                                         implicitReceiverGenericMethod = true;
+                                    }
+                                    structTypeName = methodOwner;
                                 }
                                 std::string methodTemplate = GenericMethodTemplateKey(methodOwner, methodName);
                                 if (methodTemplate.empty()) implicitReceiverGenericMethod = false;
@@ -13617,6 +13854,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // A viable non-generic overload keeps priority; a same-named but
                                 // incompatible overload must not hide the member template.
                                 bool receiverHasViablePlainMethod = false;
+                                bool receiverHasViableStaticMethod = false;
                                 auto checkPlainMethods = [&](const auto& candidates)
                                 {
                                     for (const auto& sym : candidates)
@@ -13649,10 +13887,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             std::vector<LLVMBackend::NamedVariable>,
                                             LLVMBackend::FunctionSymbol>> oneCandidate = {
                                                 { std::move(matchedArguments), sym } };
-                                        if (!Compiler(primaryCtx)->ComputeOverloadFunction(
-                                                oneCandidate).second.Parameters.empty())
+                                        const auto winningCandidate = Compiler(primaryCtx)
+                                            ->ComputeOverloadFunction(oneCandidate).second;
+                                        const bool candidateViable =
+                                            winningCandidate.UniqueName == sym.UniqueName;
+                                        if (candidateViable)
                                         {
                                             receiverHasViablePlainMethod = true;
+                                            receiverHasViableStaticMethod = sameOwnerStaticMethod;
                                             break;
                                         }
                                     }
@@ -13665,6 +13907,89 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (auto it = Compiler(primaryCtx)->functionTable.find(qualifiedMethodName);
                                         it != Compiler(primaryCtx)->functionTable.end())
                                         checkPlainMethods(it->second);
+                                bool currentFunctionOwnsMethodOwner = false;
+                                if (bareImplicitCall && receiverHasViableStaticMethod)
+                                {
+                                    bool nearestAggregateIsGeneric = false;
+                                    for (auto scope = lexicalAggregateOwnerScopes.rbegin();
+                                         scope != lexicalAggregateOwnerScopes.rend(); ++scope)
+                                    {
+                                        if (scope->Definition == nullptr) continue;
+                                        if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(
+                                                scope->Definition))
+                                            nearestAggregateIsGeneric = structure->genericTypeParameters() != nullptr;
+                                        else if (auto* classDefinition = dynamic_cast<
+                                                CFlatParser::ClassDefinitionContext*>(scope->Definition))
+                                            nearestAggregateIsGeneric = classDefinition->genericTypeParameters() != nullptr;
+                                        break;
+                                    }
+                                    if (nearestAggregateIsGeneric)
+                                    {
+                                        if (const auto* currentFunction =
+                                                Compiler(primaryCtx)->GetCurrentFunctionSymbol())
+                                        {
+                                            std::string currentOwner;
+                                            if (currentFunction->IsMethod && !currentFunction->Parameters.empty())
+                                                currentOwner = currentFunction->Parameters.front().TypeName;
+                                            else
+                                                currentOwner = ParentAggregateOwnerName(currentFunction->SourceName);
+                                            for (; !currentOwner.empty();
+                                                 currentOwner = ParentAggregateOwnerName(currentOwner))
+                                                currentFunctionOwnsMethodOwner = currentFunctionOwnsMethodOwner
+                                                    || currentOwner == methodOwner;
+                                        }
+                                        for (std::string lambdaOwner = lambdaEnclosingAggregateOwner_;
+                                             !lambdaOwner.empty();
+                                             lambdaOwner = ParentAggregateOwnerName(lambdaOwner))
+                                            currentFunctionOwnsMethodOwner = currentFunctionOwnsMethodOwner
+                                                || lambdaOwner == methodOwner;
+                                    }
+                                }
+                                // Route a generic owner's plain static call through its specialized key.
+                                if (currentFunctionOwnsMethodOwner)
+                                    resolvedFuncName = qualifiedMethodName;
+                                if (bareImplicitCall && !fieldDefaultAggregateOwner_.empty()
+                                    && !receiverHasViablePlainMethod)
+                                {
+                                    std::string scopeOwner = fieldDefaultAggregateOwner_;
+                                    for (const auto& scope : lexicalAggregateOwnerScopes)
+                                    {
+                                        if (scope.Definition == nullptr) continue;
+                                        if (scopeOwner == methodOwner)
+                                        {
+                                            bool instanceField = false;
+                                            auto checkFields = [&](const auto& members)
+                                            {
+                                                for (auto* member : members)
+                                                {
+                                                    if (DeclarationDeclaresNonStaticMember(
+                                                            member->declaration(), methodName))
+                                                        instanceField = true;
+                                                    if (auto* lockGroup = member->lockFieldGroup())
+                                                        for (auto* declaration : lockGroup->declaration())
+                                                            if (DeclarationDeclaresNonStaticMember(
+                                                                    declaration, methodName))
+                                                                instanceField = true;
+                                                }
+                                            };
+                                            if (auto* structure = dynamic_cast<CFlatParser::StructDefinitionContext*>(
+                                                    scope.Definition);
+                                                structure != nullptr
+                                                && structure->genericTypeParameters() != nullptr)
+                                                checkFields(structure->aggregateMember());
+                                            else if (auto* classDefinition = dynamic_cast<
+                                                    CFlatParser::ClassDefinitionContext*>(scope.Definition);
+                                                classDefinition != nullptr
+                                                && classDefinition->genericTypeParameters() != nullptr)
+                                                checkFields(classDefinition->aggregateMember());
+                                            if (instanceField)
+                                                LogErrorContext(primaryCtx, std::format(
+                                                    "cannot call non-static member '{}' without an object.", methodName));
+                                            break;
+                                        }
+                                        scopeOwner = ParentAggregateOwnerName(scopeOwner);
+                                    }
+                                }
                                 const bool staticMethod = !methodTemplate.empty()
                                     && isFunctionStatic(genericFunctionTemplates[methodTemplate]);
                                 if (bareImplicitCall && implicitCallReceiver.GetValue() == nullptr
@@ -13732,6 +14057,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                                 }
                                     }
                                 }
+                                else if (!fieldDefaultAggregateOwner_.empty() && bareImplicitCall
+                                    && implicitCallReceiver.GetValue() == nullptr
+                                    && receiverHasViablePlainMethod)
+                                    resolvedFuncName = qualifiedMethodName;
                                 if (implicitReceiverMethodInstantiated)
                                 {
                                     arguments.insert(arguments.begin(), implicitCallReceiver);
@@ -14496,7 +14825,7 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
                                 captures.push_back(ci);
                             }
                         }
-                        bool ownerGenericMethodCall = false;
+                        bool ownerInstanceMethodCall = false;
                         if (!localBinding && !resolvedOuterBinding)
                             if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(primary->parent))
                                 for (size_t i = 0; i + 1 < postfix->children.size(); ++i)
@@ -14510,14 +14839,31 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
                                             const std::string owner = !thisPtr.TypeAndValue.TypeName.empty()
                                                 ? thisPtr.TypeAndValue.TypeName
                                                 : EnclosingAggregateScopeFromContext(compiler, primary);
-                                            const std::string method = GenericMethodTemplateKey(owner, name);
-                                            ownerGenericMethodCall = !method.empty()
-                                                && !isFunctionStatic(genericFunctionTemplates[method]);
+                                            auto hasInstanceMethod = [&](const std::string& key)
+                                            {
+                                                auto methods = compiler->functionTable.find(key);
+                                                return methods != compiler->functionTable.end()
+                                                    && std::any_of(methods->second.begin(), methods->second.end(),
+                                                        [&](const auto& method) {
+                                                            return method.IsMethod
+                                                                && !method.Parameters.empty()
+                                                                && method.Parameters.front().Pointer
+                                                                && method.Parameters.front().TypeName == owner;
+                                                        });
+                                            };
+                                            ownerInstanceMethodCall = hasInstanceMethod(name)
+                                                || hasInstanceMethod(owner + "." + name);
+                                            if (!ownerInstanceMethodCall)
+                                            {
+                                                const std::string method = GenericMethodTemplateKey(owner, name);
+                                                ownerInstanceMethodCall = !method.empty()
+                                                    && !isFunctionStatic(genericFunctionTemplates[method]);
+                                            }
                                         }
                                         break;
                                     }
                         if (!resolvedOuterBinding
-                            && (compiler->HasMemberVariable(name) || ownerGenericMethodCall))
+                            && (compiler->HasMemberVariable(name) || ownerInstanceMethodCall))
                             captureThis();
                     }
                 }
@@ -14533,6 +14879,31 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
 
 LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::LambdaExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
+        std::string lambdaAggregateOwner = lambdaEnclosingAggregateOwner_;
+        if (lambdaAggregateOwner.empty()
+            && !EnclosingAggregateScopesFromContext(compiler, ctx).empty())
+        {
+            if (const auto* enclosingFunction = compiler->GetCurrentFunctionSymbol())
+            {
+                std::string owner;
+                if (enclosingFunction->IsMethod && !enclosingFunction->Parameters.empty())
+                    owner = enclosingFunction->Parameters.front().TypeName;
+                if (owner.empty())
+                {
+                    owner = ParentAggregateOwnerName(enclosingFunction->SourceName);
+                }
+                if (!owner.empty() && compiler->IsDataStructure(owner))
+                    lambdaAggregateOwner = std::move(owner);
+            }
+        }
+        struct LambdaAggregateOwnerScope
+        {
+            std::string& Owner;
+            std::string Saved;
+            LambdaAggregateOwnerScope(std::string& owner, std::string value)
+                : Owner(owner), Saved(owner) { Owner = std::move(value); }
+            ~LambdaAggregateOwnerScope() { Owner = std::move(Saved); }
+        } lambdaAggregateOwnerScope(lambdaEnclosingAggregateOwner_, std::move(lambdaAggregateOwner));
         LexicalLocalTypeScope lexicalLocalTypeScope(compiler);
         if (ctx->trailingConst() != nullptr)
             LogErrorContext(ctx->trailingConst(),
@@ -16039,9 +16410,15 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
                 && FindPendingCallVisibleLocal(compiler, name, bareCallPrimary) == nullptr)
             {
                 const auto thisVar = compiler->GetThisPointer();
-                const std::string methodOwner = !thisVar.TypeAndValue.TypeName.empty()
+                const std::string preferredOwner = !thisVar.TypeAndValue.TypeName.empty()
                     ? thisVar.TypeAndValue.TypeName
                     : EnclosingAggregateScopeFromContext(compiler, bareCallPrimary);
+                std::vector<EnclosingAggregateLookupScope> lexicalAggregateScopes;
+                for (const auto& scope : EnclosingAggregateScopesForCall(compiler, bareCallPrimary))
+                    if (scope.Definition != nullptr)
+                        lexicalAggregateScopes.push_back(scope);
+                const std::string methodOwner = LexicalAggregateMemberOwner(
+                    compiler, lexicalAggregateScopes, name, preferredOwner, bareCallPrimary);
                 const std::string methodTemplate = GenericMethodTemplateKey(methodOwner, name);
                 if (!methodTemplate.empty()
                     && (thisVar.GetValue() != nullptr

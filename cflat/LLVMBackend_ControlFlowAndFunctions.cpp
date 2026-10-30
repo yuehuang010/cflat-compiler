@@ -1038,9 +1038,13 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                         }
                         lowIdx += SlotLLVMParamCount(s);
                     }
-                    ApplyNarrowIntExtCallAttrs(callBase, loweredExt);
+                    ApplyNarrowIntExtCallAttrs(callBase, loweredExt, &retTV);
                 }
-                else ApplyNarrowIntExtCallAttrs(callBase, extParams);
+                else
+                {
+                    // No C-ABI thunk is guaranteed here; keep only the natural parameter attrs.
+                    ApplyNarrowIntExtCallAttrs(callBase, extParams, nullptr);
+                }
             }
             // No body to prove the callee borrows: keep `?:` / `??` arm temps it may retain.
             DropRetainedJoinArmPtrTemps(result, ownershipTarget);
@@ -2213,18 +2217,25 @@ LLVMBackend::NarrowIntExtPolicy LLVMBackend::GetNarrowIntExtPolicy() const
         return NarrowIntExtPolicy::All;
 }
 
-// Call-site signext/zeroext for an INDIRECT call through a thin `function<>`. A function pointer
-// carries no callee attributes, so a clang -O2 C callee that trusts caller-extended arguments
-// would read garbage without them. Only params get the attribute: extending an argument is
-// always safe for a CFlat callee too, whereas a call-site RETURN attribute would assert an
-// extension a CFlat callee never performs. `paramLlvmIndex` pairs an LLVM argument index with
-// its CFlat parameter type.
+// Call-site signext/zeroext for a thin `function<>` C ABI call. The return slot and each narrow
+// parameter use the C signature's target policy; paramLlvmIndex maps lowered indices to types.
 void LLVMBackend::ApplyNarrowIntExtCallAttrs(llvm::CallBase* call,
-        const std::vector<std::pair<unsigned, TypeAndValue>>& params)
+        const std::vector<std::pair<unsigned, TypeAndValue>>& params,
+        const TypeAndValue* returnType)
 {
         const NarrowIntExtPolicy policy = GetNarrowIntExtPolicy();
         if (policy == NarrowIntExtPolicy::None)
             return;
+        if (returnType != nullptr && !returnType->Pointer && !returnType->IsAlias)
+        {
+            TypeAndValue t = *returnType;
+            if (t.EnumBacking.empty()) t.EnumBacking = GetEnumBackingType(t.TypeName);
+            llvm::Type* ty = call->getType();
+            if (ty->isIntegerTy() && ty->getIntegerBitWidth() < 32
+                && (policy == NarrowIntExtPolicy::All || t.TypeName == "bool"))
+                call->addRetAttr((t.IsUnsignedInteger() != -1 || t.TypeName == "bool")
+                    ? llvm::Attribute::ZExt : llvm::Attribute::SExt);
+        }
         for (auto [idx, t] : params)
         {
             if (t.Pointer || t.IsAlias || idx >= call->arg_size()) continue;
